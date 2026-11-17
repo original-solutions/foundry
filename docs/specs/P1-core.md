@@ -204,7 +204,7 @@ P2 adds a lease per project on GitHub, so that claiming issues and merging can n
 
 - The daemon binds to the machine's Tailscale address and to localhost. It refuses to start bound to anything else.
 - A new machine joins with a one-time code shown in the UI of a machine already in the fleet. Joining gives it a key of its own, and each machine's key can be revoked from the UI.
-- The gateway key is a shared setting, stored in the OS keychain on macOS and in a file readable only by the service user on Linux. It is never written to a log or shown in the UI after it is entered.
+- The gateway key and the gateway's management key are shared settings, stored in the OS keychain on macOS and in a file readable only by the service user on Linux. They are never written to a log or shown in the UI after they are entered.
 - Hook calls are accepted only on localhost and only with the per-session token the daemon put in that session's settings file.
 - Sessions run with the permissions of the service user. Isolation stronger than that is P4.
 
@@ -241,13 +241,17 @@ P2 adds a lease per project on GitHub, so that claiming issues and merging can n
 
 ## Checked before the plan is written
 
-These are assumptions the design rests on. Each gets a short probe before implementation is planned, and the spec is corrected if one fails.
+These are the assumptions the design rests on, with what a check of each found on 2026-11-17.
 
-1. Claude Code's hooks report every transition in the state table, including "waiting for you", when it runs interactively in a PTY.
-2. A settings file passed on the command line is enough to register hooks for one session, with no change to the user's own Claude Code settings.
-3. A detached holder process survives a `launchd` restart of the daemon on macOS and a `systemd` restart on Linux.
-4. Claude Code runs as root on a Linux machine with the permission mode the factory needs. The mel-dev host refused `--dangerously-skip-permissions` as root on 2026-11-05.
-5. The gateway's management API can be read from every machine with the shared key, or needs its own key.
+| # | Assumption | Result |
+|---|---|---|
+| 1 | Claude Code's hooks report the state transitions when it runs interactively in a PTY | Confirmed on 2.1.322 for `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop` and `SessionEnd` (with a `reason`). `Notification`, which drives "waiting for you", was not exercised and is covered by the contract test |
+| 2 | A settings file passed with `--settings` registers hooks for one session, with no change to the user's own settings | Confirmed |
+| 3 | A detached holder survives a `launchd` or `systemd` restart of the daemon | Not checked. The service issue in the plan owns it |
+| 4 | Claude Code runs as root on Linux with the permission mode the factory needs | Known to fail: mel-dev refused `--dangerously-skip-permissions` as root on 2026-11-05. `foundryd` runs as a non-root service user on Linux |
+| 5 | The gateway's management API can be read with the shared key | No. It takes its own management key, so that key is a second shared secret |
+
+One thing the check found that the design did not expect: in a folder Claude Code has not seen, it opens with a trust prompt whose default answer is "No, exit". `sessions` marks each worktree as trusted in Claude Code's own state before it starts a session there, and the contract test starts in a fresh folder to prove it.
 
 ## Acceptance criteria
 
