@@ -1,9 +1,10 @@
-//! `foundryd`: the command line. Each command is wired to its module by the plan task that builds
-//! it; until then it exits 2.
+//! `foundryd`: the command line. Each command calls the module that owns it, whose stub exits 2
+//! until its plan task fills it.
 
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use foundryd::{join, not_built, service};
 
 #[derive(Parser)]
 #[command(name = "foundryd", version, about)]
@@ -31,20 +32,13 @@ enum Command {
     },
 }
 
-impl Command {
-    fn name(&self) -> &'static str {
-        match self {
-            Command::Run => "run",
-            Command::Install => "install",
-            Command::Uninstall => "uninstall",
-            Command::Status => "status",
-            Command::Join { .. } => "join",
-        }
-    }
-}
-
 fn main() -> ExitCode {
-    let cli = Cli::parse();
-    eprintln!("foundryd {}: not built yet", cli.command.name());
-    ExitCode::from(2)
+    match Cli::parse().command {
+        // The plan gives `run` and `status` to no task yet.
+        Command::Run => not_built("run"),
+        Command::Status => not_built("status"),
+        Command::Install => service::install(),
+        Command::Uninstall => service::uninstall(),
+        Command::Join { address, code } => join::join(&address, &code),
+    }
 }

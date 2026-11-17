@@ -1,4 +1,5 @@
-# Runs the provision and gate commands from .dw/config.yml on Linux. The factory gates on macOS.
+# Runs the provision and gate commands on Linux. The factory gates on macOS. The steps mirror
+# factory.provision and factory.gate in .dw/config.yml: change both together.
 name: check
 
 on:
@@ -6,8 +7,13 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
+# A new push to a pull request cancels its older run. Each push to main has a group of its own, so
+# every commit on main is checked to the end.
 concurrency:
-  group: check-${{ github.ref }}
+  group: check-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: true
 
 jobs:
@@ -15,6 +21,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-node@v5
         with:

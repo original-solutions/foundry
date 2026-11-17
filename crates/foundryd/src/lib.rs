@@ -1,5 +1,7 @@
 //! The Foundry daemon. Each module has one job; `main.rs` is only the command line.
 
+use std::process::ExitCode;
+
 pub mod api;
 pub mod attention;
 pub mod coordinator;
@@ -15,3 +17,10 @@ pub mod sync;
 pub mod terminals;
 pub mod update;
 pub mod workspaces;
+
+/// Says `command` is not built yet and returns exit code 2. A command's stub returns this until
+/// the plan task that owns it replaces the stub.
+pub fn not_built(command: &str) -> ExitCode {
+    eprintln!("foundryd {command}: not built yet");
+    ExitCode::from(2)
+}
