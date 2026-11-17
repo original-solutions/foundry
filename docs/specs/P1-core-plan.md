@@ -74,7 +74,7 @@ Dependencies are in brackets. Tasks with no dependency between them can build at
 
 - **Files:** `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, every crate in the file structure with a stub file for every module, `web/` as a minimal Vite and React app, `.github/workflows/check.yml`.
 - **Produces:** a workspace that passes the gate, with every dependency the later tasks need already declared and every module file already registered, so later tasks fill their own files and do not edit shared ones. `foundryd --version` prints the crate version. The other commands (`run`, `install`, `uninstall`, `status`, `join`) exist and exit 2 with "not built yet". `web/` has `build` and `check` scripts, and `foundryd` embeds `web/dist`.
-- **Tests:** an integration test runs the binary with `--version` and matches the version in `Cargo.toml`. CI runs the provision and gate commands on macOS and Linux.
+- **Tests:** an integration test runs the binary with `--version` and matches the version in `Cargo.toml`. Each other command exits 2 and prints "not built yet". CI runs the provision and gate commands on Linux for pull requests and pushes to `main`; the factory gates on macOS, so the two cover both systems.
 
 ### 2. Shared types [1]
 
