@@ -1,0 +1,280 @@
+# P1: Core
+
+Product: Foundry, a dark software factory that also runs manual sessions.
+
+Status: draft for Tom's review, written 2026-11-17 from a brainstorm in chat. Nothing is built.
+
+## Why
+
+Three factories came before this one. Rust softfac drove a separate T3 Code server over an undocumented socket. t3fac moved the factory inside a fork of T3 Code. factory-on-paradev drives Paradev through its CLI. Each one depends on a host app it does not control, and each has stopped building because the host's state changed underneath it. On 2026-11-17 the runner skipped a whole repo for three hours because a project had been detached inside Paradev.
+
+Foundry owns the agent session itself. There is no host app. It replaces Paradev and T3 Code.
+
+## The whole product, in four pieces
+
+| Piece | What it adds | When it is done |
+|---|---|---|
+| P1 Core (this spec) | The daemon on every machine, workspaces, terminals, agent sessions, load, placement, sync, a moving coordinator, a minimal UI | Manual sessions run on any machine and Paradev is no longer needed for them |
+| P2 Factory | GitHub accounts, projects with instructors, the label state machine, claims, dependencies, the gate, the review loop to 5 out of 5, the merge setting and merge queue, project leases, the ledger, attention items | The current runner is turned off |
+| P3 Full UI | The Paradev-like layout, diffs, the PR view, run history, a scoreboard, the Tauri wrapper | The browser tab is no longer the main way in |
+| P4 Later | A phone app, sandboxed runs on rented machines, Linear, machines started on demand, a preview per PR | |
+
+Each piece gets its own spec and plan. This spec covers P1 only. "Decisions already made for later pieces" at the end records what the brainstorm settled for P2, so it is not lost.
+
+## Goal
+
+One Rust binary, `foundryd`, runs on every machine and the machines find each other over Tailscale. From a browser on any of them Tom can create a workspace on a machine he picks, or let Foundry pick one by load, and work in a terminal running Claude Code through the model gateway. Every machine, workspace and session shows its state at all times.
+
+Exit criterion: for one week Tom runs his manual agent sessions in Foundry on at least two machines and does not open Paradev for them.
+
+## Scope
+
+In:
+
+- `foundryd` as a background service on macOS and Linux.
+- Machines joining each other over Tailscale.
+- Projects as a repo URL and a name.
+- Workspaces: a git worktree and branch on one machine, with setup commands.
+- Terminals: PTYs that outlive the UI and the daemon.
+- Agent sessions: Claude Code in a terminal, with the gateway address and key set.
+- Session state from Claude Code's hooks.
+- Load, memory, disk and session counts per machine, with limits.
+- Placement by headroom, with a visible wait queue.
+- Sync of every machine's records to every other machine.
+- A coordinator role that moves by a priority order.
+- An attention list.
+- A minimal web UI: a sidebar of machines and workspaces, and the terminal.
+- Self-update from a tag, with rollback.
+
+Out, and where it goes:
+
+- GitHub accounts, issues, labels, gates, reviews, merging, leases, the ledger: P2.
+- Diffs, the PR view, run history, the desktop wrapper: P3.
+- File editing in the app: never. Code changes go through a terminal.
+- Plugins, automations, tasks, pages: never.
+- Containers or VMs per run, machines started on demand, moving a live session between machines: P4.
+- Logins per user. Access is anyone on the tailnet until a second person needs the app.
+
+## Decisions
+
+| # | Question | Decision |
+|---|---|---|
+| D1 | Language | Rust, built with Cargo. One binary per machine, no runtime to install |
+| D2 | Form of the app | A web UI served by the daemon. A thin desktop wrapper comes in P3 |
+| D3 | UI libraries | React, Tailwind, Radix, TanStack Query and Router, xterm.js with its serialize add-on. Chosen to match what Paradev ships |
+| D4 | Daemon to UI | One WebSocket carrying JSON events and terminal bytes. No tRPC, because that needs a TypeScript server |
+| D5 | How a session is hosted | A real terminal running interactive Claude Code. No headless mode. A session Tom cannot open and look at does not exist |
+| D6 | Session state | From Claude Code's hooks calling the local daemon, never from reading the screen |
+| D7 | Topology | Every machine is a worker. One is the acting coordinator. The role moves by a priority order when the coordinator disappears |
+| D8 | Who owns a record | The machine a workspace, terminal or session lives on. No two machines write the same record |
+| D9 | Models | Every session goes through the gateway (`ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN`), so every machine behaves like the `ccp` alias |
+| D10 | Local data | SQLite on each machine |
+| D11 | Network | Tailscale only. The daemon never listens on a public interface |
+
+## Architecture
+
+```
+   browser ──────────────► any machine's foundryd (serves the UI)
+                                   │
+        ┌──────────────────────────┼──────────────────────────┐
+        ▼                          ▼                          ▼
+   foundryd                   foundryd                   foundryd
+   this Mac                   trilogy-mac                a VPS
+   worker                     worker + acting            worker
+                              coordinator
+        │                          │                          │
+   holder ─ PTY ─ claude      holder ─ PTY ─ claude      holder ─ PTY ─ shell
+        └────────── every machine syncs its records to every other ─────────┘
+                                   │
+                          model gateway :8317
+```
+
+Units, each with one job:
+
+| Unit | Job | Depends on |
+|---|---|---|
+| `holder` | Owns one PTY and its child process. Keeps a scrollback buffer. Speaks a small protocol on a Unix socket | Nothing but the OS |
+| `terminals` | Starts holders, reattaches to them after a restart, relays bytes | `holder` |
+| `sessions` | Starts Claude Code in a terminal, receives hook calls, keeps each session's state | `terminals` |
+| `workspaces` | Bare clones, worktrees, branches, setup commands, archiving | git, `terminals` |
+| `machine` | Reads load, memory, disk. Applies the machine's limits | The OS |
+| `placement` | Picks a machine for a workspace, or queues it with a reason | `machine` records from sync |
+| `sync` | Sends this machine's records to peers, accepts theirs | The store |
+| `coordinator` | Decides which machine holds the role. Owns shared settings | `sync` |
+| `store` | SQLite, one database per machine | |
+| `api` | The WebSocket and HTTP the UI talks to | All of the above |
+| `attention` | The list of things a person should look at | All of the above |
+| `web` | The UI | `api` |
+
+### Terminals
+
+- Each terminal is a PTY owned by a `holder` process. `foundryd` starts the holder detached, so the terminal survives the UI closing and the daemon restarting for an update.
+- The holder keeps the last 10,000 lines of scrollback and the current screen.
+- After a restart `foundryd` finds its holders by their sockets in the data directory and reattaches.
+- A UI that opens a terminal first gets the saved screen and scrollback, then live bytes.
+- Terminal bytes are not synced between machines. They stream from the owning machine, relayed through the machine the browser is connected to.
+- When the child exits, the holder keeps the exit code and the final screen until the terminal is closed in the UI.
+
+### Sessions
+
+- A session is a terminal whose child is `claude`, started in the workspace's worktree with the gateway variables set.
+- `foundryd` passes Claude Code a settings file that registers hooks. Each hook calls the local daemon with the session's id.
+- States a session can show:
+
+| State | Meaning | Set by |
+|---|---|---|
+| starting | The process has been launched and has not reported yet | Launch |
+| working | The agent is running a turn | A prompt was submitted or a tool is running |
+| waiting for you | The agent needs a permission answer or other input | The notification hook |
+| idle | The turn ended and the agent waits for the next prompt | The stop hook |
+| finished | The session ended normally | The session-end hook, or exit code 0 |
+| failed | The process died or exited non-zero | The holder |
+| stuck | Working, with no terminal output and no hook event for 10 minutes | A timer in `sessions` |
+| unreachable | The owning machine is offline | `sync` |
+
+- A shell terminal has only running, exited and unreachable.
+- The exact hook-to-state mapping is pinned by a contract test against the real Claude Code (see Testing). If a Claude Code update changes the hooks, that test fails and no live session does.
+
+### State is always visible
+
+This is a rule for every piece, not only P1: nothing runs without the UI showing that it runs and what state it is in.
+
+- Every session and terminal shows its state in the sidebar and on its tab.
+- Every machine shows online or offline, load per core, free memory, free disk and its session count.
+- A machine that has not been heard from for 15 seconds is offline, and its workspaces and sessions show as unreachable. They are never hidden.
+- The gateway's health is on screen, including whether any account is cooling down, read from its management API.
+- Anything that needs a person is an item in the attention list, with what happened and what to do.
+
+## Workspaces
+
+### Projects
+
+- A project is a repo URL and a name, stored as a shared setting.
+- Each machine keeps one bare clone per project and makes worktrees from it.
+- A machine clones a project the first time it hosts a workspace for it. Adding a machine needs no setup per repo.
+- In P1 a machine clones with whatever git credentials it already has. Credentials handed out by the coordinator come with GitHub accounts in P2.
+- A project may name setup commands, read from the repo's `.dw/config.yml` `provision` key when the file has one. This is the same step the gate uses in P2.
+
+### Creating a workspace
+
+1. Tom picks a project, a base branch, a name, and a machine or "let Foundry choose".
+2. The worker fetches, then makes a worktree on a new branch from the base.
+3. It runs the setup commands in a terminal inside the workspace. A failed setup stays visible there and raises an attention item. The workspace is still usable, so the failure can be fixed by hand.
+4. The workspace opens with one agent session. Shells and more sessions can be added.
+
+Branch names are `<name>` as typed, made safe for git. Worktrees live under the data directory at `worktrees/<project>/<branch>`.
+
+### Archiving
+
+- Archiving stops the workspace's terminals, removes the worktree and keeps the branch.
+- It refuses when the worktree has uncommitted or unpushed work, and says which. Tom can confirm to archive anyway.
+- A workspace on an offline machine shows as unreachable. If its branch was pushed, Tom can open a new workspace from that branch on another machine.
+
+## Placement
+
+- Each worker records CPU load per core, free memory, free disk and its session count every 5 seconds.
+- Load is the whole machine's, not only Foundry's work, so another program filling a machine counts.
+- Each machine has limits, set in shared settings: maximum sessions, maximum load per core, minimum free disk.
+- "Let Foundry choose" picks, among online machines under all their limits, the one with the lowest load per core. Ties go to the one with fewer sessions.
+- When no machine qualifies, the request waits in a queue shown in the UI with each machine's reason, for example `trilogy-mac: load 1.8 over limit 1.0`. It is placed as soon as a machine qualifies.
+- A machine Tom picks by name is used even over its limits, after a warning.
+
+## Sync and the coordinator
+
+### Records
+
+- Each machine writes only its own records: its workspaces, terminals, session states and load.
+- Every record has an owner machine id and a version that only goes up.
+- A machine sends changes to every peer over a WebSocket it opens to them. A receiver accepts a record only from its owner, and only when the version is newer than what it has.
+- A machine that was away asks each peer for everything newer than its last known version per owner.
+- Every machine therefore holds a full copy of the fleet's state, and any machine can serve the UI.
+
+### The coordinator role
+
+- Shared settings are the machine list, the priority order, projects and machine limits. They are changed only through the acting coordinator, which gives each change the next number in one sequence and sends it to everyone.
+- The acting coordinator is the highest-priority machine that a machine can reach. Each machine works this out from who it can reach, and the UI shows which machine holds the role.
+- When the coordinator disappears, the next machine in the order takes the role within 15 seconds, using its synced copy.
+- When a higher-priority machine comes back, it catches up first, then takes the role.
+- If the network splits, each side may have its own acting coordinator for a while. In P1 the only harm is two edits to the same shared setting. The later edit wins when the sides rejoin, and an attention item says a setting was overwritten and shows both values.
+- Sessions are never affected by a change of coordinator. They belong to their machines.
+
+P2 adds a lease per project on GitHub, so that claiming issues and merging can never happen from two machines at once. P1 has nothing that needs it.
+
+## Security
+
+- The daemon binds to the machine's Tailscale address and to localhost. It refuses to start bound to anything else.
+- A new machine joins with a one-time code shown in the UI of a machine already in the fleet. Joining gives it a key of its own, and each machine's key can be revoked from the UI.
+- The gateway key is a shared setting, stored in the OS keychain on macOS and in a file readable only by the service user on Linux. It is never written to a log or shown in the UI after it is entered.
+- Hook calls are accepted only on localhost and only with the per-session token the daemon put in that session's settings file.
+- Sessions run with the permissions of the service user. Isolation stronger than that is P4.
+
+## Updates
+
+- A release is a `v*` tag. A machine installs a newer tag on its own and restarts. Holders are separate processes, so terminals survive.
+- The rollback from factory-on-paradev carries over: a version that starts three times without becoming healthy puts the previous version back and refuses that tag until a higher one exists.
+- Sync messages carry a protocol version. A newer machine speaks the older form to an older peer, so a fleet can update one machine at a time.
+- The holder's protocol is versioned separately and changes rarely, since a running holder cannot be updated without ending its terminal.
+
+## Attention items in P1
+
+| Item | Raised when | Clears when |
+|---|---|---|
+| Machine offline | No word from it for 15 seconds | It is heard from |
+| Session stuck | Working with no output or hook event for 10 minutes | Output or an event arrives, or the session ends |
+| Session waiting for you | The agent needs input | It gets it |
+| Session failed | The process died or exited non-zero | The terminal is closed |
+| Setup failed | A setup command exited non-zero | The workspace is archived or setup is run again and passes |
+| Gateway unhealthy | The gateway does not answer, or every account is cooling down | It answers with an account free |
+| Disk low | Free disk is under the machine's limit | It is back over |
+| Placement waiting | A request has waited over 5 minutes | It is placed or cancelled |
+| Setting overwritten | Two sides of a split edited the same setting | Tom dismisses it |
+| Update refused | A tag was rolled back | A higher tag installs |
+
+## Testing
+
+- Unit tests for the pure parts: placement, the session state rules, the record version rules, the coordinator order.
+- Integration tests that start three daemons on one machine with network links the test can cut. They cover: a peer leaving and returning, the coordinator dying, a split with edits on both sides, a daemon restart with live terminals.
+- A fake agent that stands in for Claude Code in those tests. It is a small program that calls the hooks in a scripted order, so no test spends model calls.
+- One contract test against the real Claude Code that starts a session, sends one prompt and checks each hook arrives with the fields the daemon reads. It runs on every Claude Code update and before every release. This is the lesson from softfac, whose hand-written T3 socket messages could break on any T3 update.
+- A holder test that kills the daemon mid-output and checks the reattached terminal has lost no bytes.
+- Tests come first. No production change lands without a failing test before it.
+
+## Checked before the plan is written
+
+These are assumptions the design rests on. Each gets a short probe before implementation is planned, and the spec is corrected if one fails.
+
+1. Claude Code's hooks report every transition in the state table, including "waiting for you", when it runs interactively in a PTY.
+2. A settings file passed on the command line is enough to register hooks for one session, with no change to the user's own Claude Code settings.
+3. A detached holder process survives a `launchd` restart of the daemon on macOS and a `systemd` restart on Linux.
+4. Claude Code runs as root on a Linux machine with the permission mode the factory needs. The mel-dev host refused `--dangerously-skip-permissions` as root on 2026-11-05.
+5. The gateway's management API can be read from every machine with the shared key, or needs its own key.
+
+## Acceptance criteria
+
+1. `foundryd` installed on two Macs and one Linux machine shows all three in the UI of each, with live load, memory, disk and session counts.
+2. A workspace created with "let Foundry choose" lands on the machine with the lowest load per core among those under their limits.
+3. With every machine over a limit, the request waits in the queue with each machine's reason, and is placed within 10 seconds of a machine qualifying.
+4. A session started in a workspace runs Claude Code through the gateway, checked by the environment of the running process.
+5. Closing the browser and restarting `foundryd` loses no session. Reopening the terminal shows the screen as it was and continues live.
+6. Each state in the session table is reached and shown in a scripted run with the fake agent.
+7. A session that needs input raises a "waiting for you" item within 5 seconds.
+8. Stopping the coordinator's daemon moves the role to the next machine within 15 seconds, and sessions on the other machines keep running throughout.
+9. A machine taken off the network shows as offline on the others within 15 seconds, with its sessions shown as unreachable.
+10. A machine back from two hours offline shows the full current state within 30 seconds of rejoining.
+11. Archiving a workspace with uncommitted work is refused with the list of what is uncommitted.
+12. A release tag is installed by all three machines without ending any terminal.
+
+## Decisions already made for later pieces
+
+Settled in the brainstorm on 2026-11-17. They belong to P2 and P3 and are recorded here until those specs exist.
+
+- **GitHub accounts.** Several accounts are connected to the app. Each project uses the one that owns its repo. The coordinator holds the credentials and gives a worker the right one for each run. Instructors stay a list per project.
+- **The unattended loop.** Claim, build with the `/factory` skill, run the gate on a fresh checkout, then run the review gate and fix until it scores 5 out of 5. A cap on rounds ends in the `stuck` state.
+- **Review independence, from `wow.md`.** The builder never reviews its own work. Each review is a fresh session with only the spec and the diff. Findings go back to the same builder session. A moved head is gated again. A merge names the exact head that was scored.
+- **Merge setting per project.** Either wait for a person, which is the default, or squash-merge when the gate is green and the review is 5 out of 5.
+- **Merge queue per project.** One merge at a time: update the PR onto the current base, gate that result, merge. A failure goes back to the PR's session.
+- **Project lease.** A machine acts on a project only while it holds that project's lease, a ref under `refs/factory/` in the repo updated by compare-and-swap push, with a holder and an expiry. The acting coordinator holds the leases in the normal case.
+- **Any machine can run a gate.**
+- **Reconcile against GitHub every pass.** A merged PR or a closed issue ends the run.
+- **Kept from the earlier factories.** The label state machine, dependency links, the JSONL run ledger and `retro`, attention items, questions posted to the issue, PR comments fed back to the session, Linear in P4.
+- **Phone.** The same web UI over Tailscale first, a native app in P4.

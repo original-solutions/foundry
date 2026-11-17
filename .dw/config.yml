@@ -1,0 +1,12 @@
+# Read by the /factory skill and the factory runner. One GitHub issue in, one draft pull request out.
+factory:
+  instructors: [tomkaczocha, rawphp]
+  base: main
+  provision:
+    - cargo fetch --locked
+  gate:
+    - cargo fmt --all --check
+    - cargo clippy --workspace --all-targets --locked -- -D warnings
+    - cargo test --workspace --locked
+  limits: { minutes: 180, gate_retries: 2 }
+  autonomy: pr
