@@ -34,7 +34,12 @@ fn every_other_command_exits_2_and_says_not_built_yet() {
         let out = foundryd(args);
         let stderr = String::from_utf8_lossy(&out.stderr);
 
-        assert_eq!(out.status.code(), Some(2), "{args:?} exit: {:?}", out.status);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{args:?} exit: {:?}",
+            out.status
+        );
         assert!(
             stderr.contains("not built yet"),
             "{args:?} stderr: {stderr}"
