@@ -8,7 +8,7 @@
 
 **Spec:** [P1-core.md](P1-core.md). Each issue below names the spec sections it implements. The builder reads both.
 
-**How this plan is executed:** each task is one GitHub issue on `original-solutions/foundry`, filed with the `factory-issue` skill and built by the factory. An issue is labelled `factory:ready` only when the issues it depends on have merged. The plan therefore gives each task its files, its interfaces and its acceptance tests, and leaves the code to the builder, which works test-first.
+**How this plan is executed:** each task is one GitHub issue on `original-solutions/foundry`, filed with the `factory-issue` skill and built by the factory. Every issue is linked to the issues it depends on and all are labelled `factory:ready` together. The factory holds an issue until its blockers are closed. The plan therefore gives each task its files, its interfaces and its acceptance tests, and leaves the code to the builder, which works test-first.
 
 ## Global constraints
 
@@ -20,7 +20,7 @@
 - Every model call goes through the gateway: `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN` are set on every session.
 - Secrets never reach a log or an API response.
 - Timings from the spec: load every 5 seconds, offline after 15 seconds, stuck after 10 minutes, coordinator takeover within 15 seconds, scrollback 10,000 lines.
-- No production change without a failing test first. The gate is `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`.
+- No production change without a failing test first. The gate is `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`, `npm --prefix web run check`.
 - No test spends model calls, except the one contract test, which is ignored unless `FOUNDRY_CONTRACT=1`.
 - No `unsafe` without a `// SAFETY:` comment (`clippy::undocumented_unsafe_blocks = "deny"`).
 
@@ -72,9 +72,9 @@ Dependencies are in brackets. Tasks with no dependency between them can build at
 
 ### 1. Workspace scaffold
 
-- **Files:** `Cargo.toml`, `rust-toolchain.toml`, `crates/foundryd/src/main.rs`, `.github/workflows/check.yml`.
-- **Produces:** a workspace that passes the gate, and `foundryd --version` printing the crate version.
-- **Tests:** an integration test runs the binary with `--version` and matches the version in `Cargo.toml`. CI runs the three gate commands on macOS and Linux.
+- **Files:** `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, every crate in the file structure with a stub file for every module, `web/` as a minimal Vite and React app, `.github/workflows/check.yml`.
+- **Produces:** a workspace that passes the gate, with every dependency the later tasks need already declared and every module file already registered, so later tasks fill their own files and do not edit shared ones. `foundryd --version` prints the crate version. The other commands (`run`, `install`, `uninstall`, `status`, `join`) exist and exit 2 with "not built yet". `web/` has `build` and `check` scripts, and `foundryd` embeds `web/dist`.
+- **Tests:** an integration test runs the binary with `--version` and matches the version in `Cargo.toml`. CI runs the provision and gate commands on macOS and Linux.
 
 ### 2. Shared types [1]
 
@@ -142,8 +142,8 @@ Dependencies are in brackets. Tasks with no dependency between them can build at
 ### 11. Minimal web UI [10]
 
 - **Spec:** Scope (minimal UI), D2, D3.
-- **Files:** `web/*`, `crates/foundryd/build.rs`, `crates/foundryd/src/api/assets.rs`.
-- **Produces:** a sidebar listing machines with their numbers and state, and under each its workspaces, terminals and sessions with their states; a main pane with xterm.js attached to the selected terminal; a dialog to create a workspace with the machine picker; an archive action. The build embeds `web/dist` in the binary, and the gate gains `npm ci` and `npm run check` in `web/`.
+- **Files:** `web/*`.
+- **Produces:** a sidebar listing machines with their numbers and state, and under each its workspaces, terminals and sessions with their states; a main pane with xterm.js attached to the selected terminal; a dialog to create a workspace with the machine picker; an archive action. The scaffold already embeds `web/dist` and the gate already runs `npm --prefix web run check`.
 - **Tests:** component tests for the sidebar from a fixed state and for each session state's label. One browser test against a real daemon with the fake agent: create a workspace, see the session reach idle, type in a shell and read the output, reload the page and see the same screen (acceptance 5).
 
 ### 12. Sync [3]
@@ -181,7 +181,7 @@ Dependencies are in brackets. Tasks with no dependency between them can build at
 - **Produces:** a terminal socket opened on machine A for a terminal owned by machine B, carried over the A to B peer link.
 - **Tests:** in the fleet harness, input typed through A reaches a `cat` child on B and its output returns. Cutting the link closes the socket with a reason, and healing it gives the snapshot again.
 
-### 17. Attention list and gateway health [6, 9, 12, 14]
+### 17. Attention list and gateway health [6, 9, 11, 12, 14]
 
 - **Spec:** Attention items in P1, State is always visible (gateway).
 - **Files:** `crates/foundryd/src/attention.rs`, `crates/foundryd/src/gateway.rs`, `web/src/attention/*`.
@@ -209,7 +209,7 @@ Dependencies are in brackets. Tasks with no dependency between them can build at
 6, 8, 9 ── 10 ── 11
 3 ── 12 ── 13 ── 14 ── 15
 10, 12 ── 16
-6, 9, 12, 14 ── 17
+6, 9, 11, 12, 14 ── 17
 5, 12 ── 18
 ```
 

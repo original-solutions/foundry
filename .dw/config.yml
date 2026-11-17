@@ -3,10 +3,13 @@ factory:
   instructors: [tomkaczocha, rawphp]
   base: main
   provision:
+    - npm --prefix web ci
+    - npm --prefix web run build
     - cargo fetch --locked
   gate:
     - cargo fmt --all --check
     - cargo clippy --workspace --all-targets --locked -- -D warnings
     - cargo test --workspace --locked
+    - npm --prefix web run check
   limits: { minutes: 180, gate_retries: 2 }
   autonomy: pr
