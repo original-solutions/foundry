@@ -1,9 +1,7 @@
 use std::collections::BTreeMap;
 
 use foundry_proto::ids::{MachineId, ProjectId, SessionId, TerminalId, WorkspaceId};
-use foundry_proto::record::{
-    AnyRecord, MachineSample, Record, Session, Terminal, Workspace,
-};
+use foundry_proto::record::{AnyRecord, MachineSample, Record, Session, Terminal, Workspace};
 use foundry_proto::settings::{Limits, Machine, SharedSettings};
 use foundry_proto::state::{SessionState, TerminalState};
 use tempfile::TempDir;
@@ -128,7 +126,11 @@ fn a_record_from_its_owner_is_stored_for_every_kind() {
     let (_dir, mut store) = open();
     let owner = MachineId::random();
     for record in every_kind(owner, 1) {
-        assert_eq!(store.apply(&record, owner).unwrap(), Applied::Stored, "{record:?}");
+        assert_eq!(
+            store.apply(&record, owner).unwrap(),
+            Applied::Stored,
+            "{record:?}"
+        );
     }
     assert_eq!(everything(&store).len(), 4);
 }
@@ -139,7 +141,11 @@ fn a_record_from_a_machine_that_is_not_its_owner_is_not_owner_and_stores_nothing
     let owner = MachineId::random();
     let other = MachineId::random();
     for record in every_kind(owner, 1) {
-        assert_eq!(store.apply(&record, other).unwrap(), Applied::NotOwner, "{record:?}");
+        assert_eq!(
+            store.apply(&record, other).unwrap(),
+            Applied::NotOwner,
+            "{record:?}"
+        );
     }
     assert!(everything(&store).is_empty());
     assert!(store.versions().unwrap().is_empty());
@@ -155,7 +161,11 @@ fn a_record_that_takes_over_another_owners_record_is_not_owner_and_changes_nothi
     }
     let before = everything(&store);
     for record in [workspace(thief, 9), terminal(thief, 9), session(thief, 9)] {
-        assert_eq!(store.apply(&record, thief).unwrap(), Applied::NotOwner, "{record:?}");
+        assert_eq!(
+            store.apply(&record, thief).unwrap(),
+            Applied::NotOwner,
+            "{record:?}"
+        );
     }
     assert_eq!(everything(&store), before);
     assert!(!store.versions().unwrap().contains_key(&thief));
@@ -172,7 +182,11 @@ fn an_equal_or_lower_version_is_stale_and_changes_nothing() {
     for version in [5, 4, 0] {
         for record in every_kind(owner, version) {
             let changed = deleted(record);
-            assert_eq!(store.apply(&changed, owner).unwrap(), Applied::Stale, "{changed:?}");
+            assert_eq!(
+                store.apply(&changed, owner).unwrap(),
+                Applied::Stale,
+                "{changed:?}"
+            );
         }
     }
     assert_eq!(everything(&store), before);
@@ -229,7 +243,10 @@ fn a_deleted_record_that_arrives_first_is_kept_so_an_older_live_one_cannot_reviv
     let owner = MachineId::random();
     let tombstone = deleted(workspace(owner, 8));
     assert_eq!(store.apply(&tombstone, owner).unwrap(), Applied::Stored);
-    assert_eq!(store.apply(&workspace(owner, 3), owner).unwrap(), Applied::Stale);
+    assert_eq!(
+        store.apply(&workspace(owner, 3), owner).unwrap(),
+        Applied::Stale
+    );
     assert_eq!(store.since(owner, 0).unwrap(), vec![tombstone]);
 }
 
@@ -376,7 +393,10 @@ fn migrations_run_on_an_empty_file() {
     let mut store = Store::open(&path).unwrap();
     assert_eq!(store.schema_version().unwrap(), MIGRATIONS.len());
     let owner = MachineId::random();
-    assert_eq!(store.apply(&workspace(owner, 1), owner).unwrap(), Applied::Stored);
+    assert_eq!(
+        store.apply(&workspace(owner, 1), owner).unwrap(),
+        Applied::Stored
+    );
     assert!(store.apply_settings(settings(1)).unwrap());
 }
 
@@ -394,14 +414,21 @@ fn migrations_run_on_every_earlier_schema_and_keep_what_it_held() {
                 .unwrap();
         }
         let mut store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), MIGRATIONS.len(), "from {earlier}");
+        assert_eq!(
+            store.schema_version().unwrap(),
+            MIGRATIONS.len(),
+            "from {earlier}"
+        );
         let kept: i64 = store
             .conn
             .query_row("SELECT x FROM kept_by_the_test", [], |row| row.get(0))
             .unwrap();
         assert_eq!(kept, 42, "from {earlier}");
         let owner = MachineId::random();
-        assert_eq!(store.apply(&sample(owner, 1), owner).unwrap(), Applied::Stored);
+        assert_eq!(
+            store.apply(&sample(owner, 1), owner).unwrap(),
+            Applied::Stored
+        );
     }
 }
 
@@ -437,7 +464,9 @@ fn no_column_in_the_schema_holds_a_time() {
     for table in tables {
         let mut columns = store
             .conn
-            .prepare(&format!("SELECT name, type FROM pragma_table_info('{table}')"))
+            .prepare(&format!(
+                "SELECT name, type FROM pragma_table_info('{table}')"
+            ))
             .unwrap();
         let columns: Vec<(String, String)> = columns
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
@@ -464,7 +493,11 @@ fn every_query_that_orders_orders_by_version() {
     for (at, _) in source.match_indices("ORDER BY") {
         found += 1;
         let rest = source[at + "ORDER BY".len()..].trim_start();
-        assert!(rest.starts_with("version"), "orders by {}", &rest[..rest.len().min(40)]);
+        assert!(
+            rest.starts_with("version"),
+            "orders by {}",
+            &rest[..rest.len().min(40)]
+        );
     }
     assert!(found > 0, "since() orders its result");
 }
