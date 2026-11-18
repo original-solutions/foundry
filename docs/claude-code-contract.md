@@ -41,7 +41,7 @@ Every field each hook carried on 2.1.322. Only the two above are read; the rest 
 
 The hooks are the seven `sessions` registers; Claude Code calls no others. The state is what `next_state` makes of them, in order, from `starting`.
 
-The test asserts each row's hooks arrive, that `Notification` comes before `PostToolUse` when a permission is answered yes, and that none arrives after a denial or an Esc. The exact order of the other rows is printed, not asserted.
+The test asserts each row exactly: these hooks, in this order, and no other of the seven by the end of the step. A step that ends on a key press waits 15 seconds after it before it checks.
 
 | Step | Hooks, in order | State after |
 |---|---|---|

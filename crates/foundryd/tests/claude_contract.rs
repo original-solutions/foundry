@@ -5,9 +5,9 @@
 //! --model <model>` in a PTY with the gateway variables set. The test then runs one shell
 //! command, answers a permission with yes, denies one, interrupts a turn with Esc while its tool
 //! runs, and exits with `/exit`. It checks that no trust prompt shows, that each hook `sessions`
-//! registers arrives with the fields it reads, and that the denial and the interrupt post none of
-//! them, and prints every hook that arrived in each step. `docs/claude-code-contract.md` records
-//! what it found.
+//! registers arrives with the fields it reads, and that each step posts exactly the hooks the doc
+//! lists for it, in order: none after the denial or the Esc. It prints every hook of each step.
+//! `docs/claude-code-contract.md` records what it found.
 //!
 //! It spends model calls, so it is ignored and runs only with `FOUNDRY_CONTRACT=1`, `claude` on
 //! `PATH`, and `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN` set:
@@ -112,6 +112,7 @@ fn claude_code_posts_the_hooks_sessions_reads() {
         session.tail()
     );
     run.report("start", 0);
+    run.expect("start", 0, &["SessionStart"]);
 
     // One shell command, which the default permission mode runs without asking.
     let mark = posted.len();
@@ -121,6 +122,8 @@ fn claude_code_posts_the_hooks_sessions_reads() {
     run.wait_for(mark, "PostToolUse", TURN);
     run.wait_for(mark, "Stop", TURN);
     run.report("shell command", mark);
+    let turn = ["UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"];
+    run.expect("shell command", mark, &turn);
 
     // A write the default permission mode asks about, answered yes.
     let mark = posted.len();
@@ -137,6 +140,14 @@ fn claude_code_posts_the_hooks_sessions_reads() {
         "the allowed write did not run"
     );
     run.report("permission answered yes", mark);
+    let answered_turn = [
+        "UserPromptSubmit",
+        "PreToolUse",
+        "Notification",
+        "PostToolUse",
+        "Stop",
+    ];
+    run.expect("permission answered yes", mark, &answered_turn);
 
     // A write the default permission mode asks about, denied.
     let mark = posted.len();
@@ -144,10 +155,10 @@ fn claude_code_posts_the_hooks_sessions_reads() {
         "Create a file named denied.txt in the current folder containing the word no, \
          with your Write tool. Do nothing else.",
     );
-    let asked = run.wait_for(mark, "Notification", TURN);
+    run.wait_for(mark, "Notification", TURN);
     let seen = session.screen().len();
     session.answer(b"3");
-    let after = run.watch(asked + 1);
+    run.watch();
     run.report("permission denied", mark);
     assert!(
         shows(&session.screen()[seen..], "User rejected"),
@@ -155,12 +166,8 @@ fn claude_code_posts_the_hooks_sessions_reads() {
         session.tail()
     );
     assert!(!folder.join("denied.txt").exists(), "the denied write ran");
-    assert_eq!(
-        after,
-        Vec::<String>::new(),
-        "a denial posted a registered hook; update docs/claude-code-contract.md\n{}",
-        session.tail()
-    );
+    let asked = ["UserPromptSubmit", "PreToolUse", "Notification"];
+    run.expect("permission denied", mark, &asked);
 
     // A turn interrupted with Esc while its tool runs: the tool's output file shows it runs.
     // Not `sleep`, which Claude Code refuses to run on its own before any hook.
@@ -187,22 +194,16 @@ fn claude_code_posts_the_hooks_sessions_reads() {
         std::thread::sleep(Duration::from_millis(100));
     }
     std::thread::sleep(Duration::from_secs(2));
-    let pressed = posted.len();
     let seen = session.screen().len();
     session.send(b"\x1b");
-    let after = run.watch(pressed);
+    run.watch();
     run.report("turn interrupted", mark);
     assert!(
         shows(&session.screen()[seen..], "Interrupted"),
         "Esc did not interrupt the tool:\n{}",
         session.tail()
     );
-    assert_eq!(
-        after,
-        Vec::<String>::new(),
-        "an interrupt posted a registered hook; update docs/claude-code-contract.md\n{}",
-        session.tail()
-    );
+    run.expect("turn interrupted", mark, &asked);
 
     // Exit.
     let mark = posted.len();
@@ -210,9 +211,10 @@ fn claude_code_posts_the_hooks_sessions_reads() {
     run.wait_for(mark, "SessionEnd", TURN);
     let code = session.exit_code(Duration::from_secs(30));
     run.report("exit", mark);
+    run.expect("exit", mark, &["SessionEnd"]);
     assert_eq!(code, Some(0), "Claude Code exits 0 after /exit");
 
-    // Each hook `sessions` registers arrived, and `sessions` reads it as that hook.
+    // Each hook `sessions` registers arrived, and `sessions` reads it as a hook it acts on.
     let hooks = posted.all();
     for name in registered["hooks"].as_object().unwrap().keys() {
         let payload = hooks
@@ -344,11 +346,21 @@ impl Run<'_> {
         })
     }
 
-    /// Waits [`WATCH`] for any hooks a key press brings, and names those that arrived from
-    /// `from` on.
-    fn watch(&self, from: usize) -> Vec<String> {
+    /// Waits [`WATCH`] for any hooks a key press brings.
+    fn watch(&self) {
         std::thread::sleep(WATCH);
-        names(&self.posted.all()[from..])
+    }
+
+    /// Fails the test unless the hooks from `from` on are exactly `want`, in order: the row of
+    /// `step` in `docs/claude-code-contract.md`.
+    fn expect(&self, step: &str, from: usize, want: &[&str]) {
+        let got = names(&self.posted.all()[from..]);
+        assert_eq!(
+            got,
+            want,
+            "{step} posted other hooks than docs/claude-code-contract.md says; update it\n{}",
+            self.session.tail()
+        );
     }
 
     /// Prints the hooks that arrived from `from` on, with the fields each had.
