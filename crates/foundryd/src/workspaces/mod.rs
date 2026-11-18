@@ -8,12 +8,19 @@
 //! workspace. A setup that fails leaves the workspace as it is: the terminal shows what failed
 //! and exits with the failing command's code.
 //!
-//! Archiving refuses while there is uncommitted or unpushed work, unless forced. Uncommitted work is a changed, deleted or new file that git does not
-//! ignore; ignored files, such as build output, go with the worktree. Unpushed work is a commit
-//! on the branch, or on whatever the worktree has checked out, that no remote branch has. An
-//! archive checks, closes the workspace's terminals, checks again for what they wrote as they
-//! were hung up, removes the worktree and keeps the branch. A refusal at the first check changes
-//! nothing; a refusal at the second leaves the terminals closed and the worktree as it is.
+//! A create never touches what it did not make: it refuses a name whose branch or folder is
+//! already there, makes the branch itself, and when it fails takes back only that branch, while
+//! it still points where it was made, and the worktree in a folder that was not there before.
+//!
+//! Archiving refuses while there is uncommitted or unpushed work, unless forced. Uncommitted
+//! work is a changed, deleted or new file that git does not ignore; ignored files, such as build
+//! output, go with the worktree. Unpushed work is a commit on the branch, or on whatever the
+//! worktree has checked out, that no remote branch has. A checked-out submodule is refused too,
+//! as its own work cannot be checked from here. An archive checks, closes the workspace's
+//! terminals, checks again for what they wrote as they were hung up, removes the worktree and
+//! keeps the branch. A refusal at the first check changes nothing; a refusal at the second
+//! leaves the terminals closed and the worktree as it is. Only a forced archive passes `--force`
+//! to git, so without it git refuses whatever the checks missed.
 //!
 //! Every branch is made by [`safe_branch`] and every path reaches git after `--`, so a name as
 //! typed never reads as an option and never leaves the project's folder of worktrees.
@@ -61,7 +68,10 @@ pub enum WorkspaceError {
     UnknownProject(ProjectId),
     #[error("workspace {0} is not a live workspace of this machine")]
     Unknown(WorkspaceId),
-    #[error("branch {0} already exists in this project; give the workspace another name")]
+    #[error(
+        "a branch or worktree named {0} already exists in this project; give the workspace \
+         another name"
+    )]
     BranchExists(String),
     #[error(transparent)]
     Dirty(Dirty),
@@ -94,11 +104,14 @@ pub struct Dirty {
     /// Commits on the branch or the worktree's checked-out `HEAD` that no remote branch has,
     /// each as its short hash and subject.
     pub unpushed: Vec<String>,
+    /// Submodules checked out in the worktree, as paths relative to it. Their own uncommitted
+    /// and unpushed work cannot be checked from here and would go with the worktree.
+    pub submodules: Vec<String>,
 }
 
 impl Dirty {
     fn is_empty(&self) -> bool {
-        self.uncommitted.is_empty() && self.unpushed.is_empty()
+        self.uncommitted.is_empty() && self.unpushed.is_empty() && self.submodules.is_empty()
     }
 }
 
@@ -112,6 +125,10 @@ impl fmt::Display for Dirty {
         }
         if !self.unpushed.is_empty() {
             write!(f, "{sep} unpushed commits {}", self.unpushed.join(", "))?;
+            sep = ";";
+        }
+        if !self.submodules.is_empty() {
+            write!(f, "{sep} submodules {}", self.submodules.join(", "))?;
         }
         Ok(())
     }
@@ -267,7 +284,7 @@ impl Inner {
         let clone = self.clone_for(project, &repo).await?;
         self.git(&clone, "fetch", ["--quiet", "origin"]).await?;
         // Compared as the disk compares names: where it ignores case, `Fix` and `fix` are one
-        // ref file and one folder.
+        // ref file and one folder. A folder already there is someone's, whatever its branch.
         let branches = self
             .git(
                 &clone,
@@ -275,9 +292,31 @@ impl Inner {
                 ["--format=%(refname:lstrip=2)", "refs/heads/"],
             )
             .await?;
-        if branches.lines().any(|b| fold(b) == fold(&branch)) {
+        if branches.lines().any(|b| fold(b) == fold(&branch))
+            || tokio::fs::try_exists(&worktree).await?
+        {
             return Err(WorkspaceError::BranchExists(branch));
         }
+        let start = self
+            .git(
+                &clone,
+                "rev-parse",
+                [
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/remotes/origin/{base}^{{commit}}"),
+                ],
+            )
+            .await?
+            .trim()
+            .to_owned();
+        // Git refuses a branch that is already there, by any spelling it reads as the same.
+        self.git(
+            &clone,
+            "branch",
+            ["--quiet", "--no-track", "--", &branch, &start],
+        )
+        .await?;
         let made = async {
             self.git(
                 &clone,
@@ -285,12 +324,9 @@ impl Inner {
                 [
                     OsStr::new("add"),
                     OsStr::new("--quiet"),
-                    OsStr::new("--no-track"),
-                    OsStr::new("-b"),
-                    OsStr::new(&branch),
                     OsStr::new("--"),
                     worktree.as_os_str(),
-                    OsStr::new(&format!("refs/remotes/origin/{base}")),
+                    OsStr::new(&branch),
                 ],
             )
             .await?;
@@ -305,7 +341,7 @@ impl Inner {
         }
         .await;
         if let Err(e) = made {
-            self.undo(&clone, &worktree, &branch).await;
+            self.undo(&clone, &worktree, &branch, &start).await;
             return Err(e);
         }
         // Still under the lock, so an archive cannot run before the setup's terminal is known.
@@ -343,19 +379,7 @@ impl Inner {
                 // What the terminals wrote as they were hung up counts too.
                 self.refuse_dirty(&clone, &worktree, &body.branch).await?;
             }
-            // Checked just now, with nothing of the workspace left running. `--force` also takes
-            // a worktree holding submodules, which git refuses otherwise.
-            self.git(
-                &clone,
-                "worktree",
-                [
-                    OsStr::new("remove"),
-                    OsStr::new("--force"),
-                    OsStr::new("--"),
-                    worktree.as_os_str(),
-                ],
-            )
-            .await?;
+            self.remove_worktree(&clone, &worktree, force).await?;
         } else {
             // Removed by hand: git forgets it, so its branch can be checked out again.
             self.git(&clone, "worktree", ["prune"]).await?;
@@ -363,23 +387,40 @@ impl Inner {
         self.write(body, true).await
     }
 
-    /// Takes back what a create that failed made of its worktree and branch, as far as it got.
-    /// The branch is new and nothing of anyone's is on it. Each step that finds nothing to undo
-    /// fails, and that is fine.
-    async fn undo(&self, clone: &Path, worktree: &Path, branch: &str) {
-        let remove = [
-            OsStr::new("remove"),
-            OsStr::new("--force"),
-            OsStr::new("--"),
-            worktree.as_os_str(),
-        ];
-        let _ = self.git(clone, "worktree", remove).await;
-        let _ = self.git(clone, "worktree", ["prune"]).await;
-        let _ = self.git(clone, "branch", ["-D", "--", branch]).await;
+    /// `git worktree remove`, passing `--force` only when `force`. Without it git refuses a
+    /// worktree with anything uncommitted in it, or with a submodule checked out.
+    async fn remove_worktree(
+        &self,
+        clone: &Path,
+        worktree: &Path,
+        force: bool,
+    ) -> Result<String, WorkspaceError> {
+        let mut args = vec![OsStr::new("remove")];
+        if force {
+            args.push(OsStr::new("--force"));
+        }
+        args.extend([OsStr::new("--"), worktree.as_os_str()]);
+        self.git(clone, "worktree", args).await
     }
 
-    /// [`WorkspaceError::Dirty`] when the worktree has uncommitted files, or the branch or the
-    /// worktree's `HEAD` has commits no remote branch has.
+    /// Takes back what a create that failed made after it made `branch` at `start`. The
+    /// worktree's folder was not there before this create, under the project's lock, so
+    /// whatever is in it now is this create's and holds nothing of anyone's. The branch goes only
+    /// while it still points at `start`. Each step that finds nothing to undo fails, and that is
+    /// fine.
+    async fn undo(&self, clone: &Path, worktree: &Path, branch: &str, start: &str) {
+        if matches!(tokio::fs::try_exists(worktree).await, Ok(true)) {
+            let _ = self.remove_worktree(clone, worktree, true).await;
+        }
+        let _ = self.git(clone, "worktree", ["prune"]).await;
+        let reference = format!("refs/heads/{branch}");
+        let _ = self
+            .git(clone, "update-ref", ["-d", &reference, start])
+            .await;
+    }
+
+    /// [`WorkspaceError::Dirty`] when the worktree has uncommitted files or a checked-out
+    /// submodule, or the branch or the worktree's `HEAD` has commits no remote branch has.
     async fn refuse_dirty(
         &self,
         clone: &Path,
@@ -388,14 +429,30 @@ impl Inner {
     ) -> Result<(), WorkspaceError> {
         let branch = format!("refs/heads/{branch}");
         let present = tokio::fs::try_exists(worktree).await?;
-        let (uncommitted, dir, heads) = if present {
+        let (uncommitted, submodules, dir, heads) = if present {
+            let submodules = self
+                .git(
+                    worktree,
+                    "submodule",
+                    [
+                        "foreach",
+                        "--quiet",
+                        "--recursive",
+                        r#"printf '%s\n' "$displaypath""#,
+                    ],
+                )
+                .await?
+                .lines()
+                .map(str::to_owned)
+                .collect();
             (
                 self.uncommitted(worktree).await?,
+                submodules,
                 worktree,
                 vec!["HEAD", &branch],
             )
         } else {
-            (Vec::new(), clone, vec![branch.as_str()])
+            (Vec::new(), Vec::new(), clone, vec![branch.as_str()])
         };
         let unpushed = self
             .git(
@@ -413,6 +470,7 @@ impl Inner {
         let dirty = Dirty {
             uncommitted,
             unpushed,
+            submodules,
         };
         if dirty.is_empty() {
             Ok(())
