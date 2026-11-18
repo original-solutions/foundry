@@ -6,7 +6,8 @@
 //!
 //! A machine already in the fleet shows a one-time [`Code`] ([`Keys::new_code`]). The new
 //! machine runs `foundryd join <address> <code>`, which posts the code with its id and public
-//! key to that machine's [`router`]. The code works once and for [`CODE_VALID_FOR`].
+//! key to that machine's [`router`]. The code works once and for [`CODE_VALID_FOR`]. The code
+//! travels as plain HTTP, so `join` sends it only to a Tailscale or loopback address.
 //!
 //! Every peer link proves both machines' keys before sync takes it. The dialing end names
 //! itself with a fresh challenge; the accepting end answers with its own challenge and a
@@ -28,7 +29,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -128,51 +129,102 @@ fn home() -> Option<PathBuf> {
 /// table, and returns this machine's id. The identity in `secrets` is
 /// made if there is none and never replaced, so joining again, or retrying a join whose answer
 /// was lost, is the same machine.
+///
+/// The code and the answer travel as plain HTTP, which only Tailscale encrypts and
+/// authenticates, so `address` must be or resolve to a Tailscale address (or loopback); any
+/// other is refused before anything is kept or sent. A name with several such addresses is
+/// tried at each in turn until one is reached. This blocks on the network and the secret store.
 pub fn join_at(
     address: &str,
     port: u16,
     code: &str,
     secrets: &dyn Secrets,
 ) -> Result<MachineId, JoinError> {
+    let targets = join_targets(address, port)?;
     let identity = Identity::load_or_create(secrets)?;
     let request = JoinRequest {
         code: code.to_owned(),
         machine: identity.machine,
         key: identity.key_pair()?.public(),
     };
-    let url = join_url(address, port);
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(10)))
         .build()
         .into();
-    let answer: JoinAnswer = match agent.post(&url).send_json(&request) {
-        Ok(mut response) => {
-            response
-                .body_mut()
-                .read_json()
-                .map_err(|_| JoinError::NotAdmitted {
-                    url: url.clone(),
-                    status: 200,
-                })?
+    let mut answered = None;
+    for target in targets {
+        let url = format!("http://{target}{JOIN_PATH}");
+        let answer = post_join(&agent, &url, &request);
+        let reached = !matches!(answer, Err(JoinError::Unreachable { .. }));
+        answered = Some((url, answer));
+        if reached {
+            break;
         }
-        Err(ureq::Error::StatusCode(403)) => return Err(JoinError::BadCode),
-        Err(ureq::Error::StatusCode(409)) => return Err(JoinError::Taken(identity.machine)),
-        Err(ureq::Error::StatusCode(status)) => {
-            return Err(JoinError::NotAdmitted { url, status });
-        }
-        Err(error) => {
-            return Err(JoinError::Unreachable {
-                url,
-                reason: error.to_string(),
-            });
-        }
-    };
+    }
+    let (url, answer) = answered.expect("join_targets never returns an empty list");
+    let answer = answer?;
     if answer.machine == identity.machine {
         // Only this machine speaks for its own id.
         return Err(JoinError::AnsweredAsThisMachine(url));
     }
     hold_key(secrets, answer.machine, answer.key)?;
     Ok(identity.machine)
+}
+
+/// Posts `request` to the join route at `url`.
+fn post_join(
+    agent: &ureq::Agent,
+    url: &str,
+    request: &JoinRequest,
+) -> Result<JoinAnswer, JoinError> {
+    match agent.post(url).send_json(request) {
+        Ok(mut response) => response
+            .body_mut()
+            .read_json()
+            .map_err(|_| JoinError::NotAdmitted {
+                url: url.to_owned(),
+                status: 200,
+            }),
+        Err(ureq::Error::StatusCode(403)) => Err(JoinError::BadCode),
+        Err(ureq::Error::StatusCode(409)) => Err(JoinError::Taken(request.machine)),
+        Err(ureq::Error::StatusCode(status)) => Err(JoinError::NotAdmitted {
+            url: url.to_owned(),
+            status,
+        }),
+        Err(error) => Err(JoinError::Unreachable {
+            url: url.to_owned(),
+            reason: error.to_string(),
+        }),
+    }
+}
+
+/// The Tailscale and loopback addresses `address` names or resolves to, at `port` unless it
+/// names one. [`JoinError::NotTailscale`] when it has none.
+fn join_targets(address: &str, port: u16) -> Result<Vec<SocketAddr>, JoinError> {
+    let authority = join_authority(address, port);
+    let resolved = authority
+        .to_socket_addrs()
+        .map_err(|error| JoinError::Unreachable {
+            url: format!("http://{authority}{JOIN_PATH}"),
+            reason: error.to_string(),
+        })?;
+    let targets: Vec<SocketAddr> = resolved.filter(|target| joinable(target.ip())).collect();
+    if targets.is_empty() {
+        return Err(JoinError::NotTailscale(address.to_owned()));
+    }
+    Ok(targets)
+}
+
+/// Whether a join may be sent to `ip`: one in Tailscale's ranges, 100.64.0.0/10 and
+/// fd7a:115c:a1e0::/48, or loopback (spec D11: machines meet over Tailscale only).
+fn joinable(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let [first, second, ..] = ip.octets();
+            ip.is_loopback() || (first == 100 && second & 0xc0 == 64)
+        }
+        IpAddr::V6(ip) => ip.is_loopback() || ip.segments()[..3] == [0xfd7a, 0x115c, 0xa1e0],
+    }
 }
 
 /// Puts the admitting machine's key in the key table kept in `secrets`, by
@@ -247,21 +299,21 @@ fn write_table(machines: &BTreeMap<MachineId, Entry>) -> String {
     serde_json::to_string(machines).expect("a key table of UUIDs and strings always serializes")
 }
 
-/// The URL to post a join code to: `address` is an IP address, a bracketed IPv6 address or a
-/// host name, with or without a port.
-fn join_url(address: &str, port: u16) -> String {
+/// The host and port to post a join code to: `address` is an IP address, a bracketed IPv6
+/// address or a host name, with or without a port.
+fn join_authority(address: &str, port: u16) -> String {
     let unbracketed = address
         .strip_prefix('[')
         .and_then(|a| a.strip_suffix(']'))
         .unwrap_or(address);
     if let Ok(socket) = address.parse::<SocketAddr>() {
-        format!("http://{socket}{JOIN_PATH}")
+        socket.to_string()
     } else if let Ok(ip) = unbracketed.parse::<IpAddr>() {
-        format!("http://{}{JOIN_PATH}", SocketAddr::new(ip, port))
+        SocketAddr::new(ip, port).to_string()
     } else if address.contains(':') {
-        format!("http://{address}{JOIN_PATH}")
+        address.to_owned()
     } else {
-        format!("http://{address}:{port}{JOIN_PATH}")
+        format!("{address}:{port}")
     }
 }
 
@@ -290,6 +342,11 @@ pub enum JoinError {
     NotAdmitted { url: String, status: u16 },
     #[error("{url} could not be reached: {reason}")]
     Unreachable { url: String, reason: String },
+    #[error(
+        "{0} is not a Tailscale address and resolves to none; join over Tailscale \
+         (100.64.0.0/10 or fd7a:115c:a1e0::/48), since a join code travels unencrypted"
+    )]
+    NotTailscale(String),
     #[error("the secret {0} is not in the expected form")]
     Unreadable(&'static str),
     #[error("the system gave no random numbers")]
@@ -476,6 +533,9 @@ impl Shown {
 impl Keys {
     /// This machine's identity and key table, kept in `secrets`, with no codes outstanding.
     /// A machine with no identity yet is given one, and its own entry is always its own key.
+    ///
+    /// Blocks on the secret store: a keychain prompt, or up to [`secrets::LOCK_WAIT`] on
+    /// another process's lock. Call it from a blocking context, not an async task.
     pub fn open(secrets: Arc<dyn Secrets>) -> Result<Self, JoinError> {
         let identity = Identity::load_or_create(&*secrets)?;
         let signer = identity.key_pair()?;
@@ -541,6 +601,9 @@ impl Keys {
     /// Uses up `code` to admit `machine` with public key `key`, by [`admit_into`]'s rule on
     /// the stored table. The machine that used a code may send it again while it is valid, as
     /// a join whose answer was lost does. A code is used up only once the key is saved.
+    ///
+    /// Blocks on the secret store, as [`Keys::open`] does, and behind any other change to the
+    /// key table in this process.
     pub fn redeem(&self, code: &str, machine: MachineId, key: &PublicKey) -> Result<(), JoinError> {
         let typed = code.trim().to_ascii_uppercase();
         let saving = self.saving();
@@ -569,6 +632,9 @@ impl Keys {
     }
 
     /// Revokes `machine`: its key is forgotten and every link with it is refused.
+    ///
+    /// Blocks on the secret store, as [`Keys::open`] does, and behind any other change to the
+    /// key table in this process.
     pub fn revoke(&self, machine: MachineId) -> Result<(), JoinError> {
         let saving = self.saving();
         self.change(&saving, |machines| {
@@ -1724,6 +1790,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_acceptors_signature_cannot_pass_as_a_dialers_proof() {
+        let (h, a) = pair();
+        let (to_h_host, to_a_host) = (host(&h, &[a.me()]), host(&a, &[h.me()]));
+        // A stranger opens a link to H as A, and keeps H's challenge.
+        let mut to_h = to_h_host.raw();
+        let opening = Handshake::Challenge {
+            machine: a.me(),
+            nonce: nonce().unwrap(),
+        };
+        send(&to_h, &opening).await;
+        let Handshake::Answer {
+            nonce: h_challenge, ..
+        } = read(&mut to_h).await
+        else {
+            panic!("H did not answer");
+        };
+        // It dials A as H, with H's challenge as its own, and A signs it as the accepting end.
+        let mut to_a = to_a_host.raw();
+        let relayed = Handshake::Challenge {
+            machine: h.me(),
+            nonce: h_challenge,
+        };
+        send(&to_a, &relayed).await;
+        let Handshake::Answer { proof, .. } = read(&mut to_a).await else {
+            panic!("A did not answer");
+        };
+        // A's accepting signature, offered to H as A's dialing proof.
+        send(&to_h, &Handshake::Proof { proof }).await;
+        let _ = to_h.send.send(hello(a.me())).await;
+        closed(&mut to_h).await;
+        assert!(!to_h_host.peers.online().contains(&a.me()));
+    }
+
+    #[tokio::test]
     async fn a_link_proved_by_hand_is_served() {
         let (h, a) = pair();
         let host = host(&h, &[a.me()]);
@@ -2056,33 +2156,72 @@ mod tests {
 
     #[test]
     fn a_join_address_may_name_its_port() {
-        assert_eq!(
-            join_url("100.64.0.1", 7433),
-            "http://100.64.0.1:7433/api/join"
-        );
-        assert_eq!(
-            join_url("100.64.0.1:7777", 7433),
-            "http://100.64.0.1:7777/api/join"
-        );
-        assert_eq!(
-            join_url("fd7a:115c:a1e0::1", 7433),
-            "http://[fd7a:115c:a1e0::1]:7433/api/join"
-        );
-        assert_eq!(
-            join_url("[fd7a:115c:a1e0::1]", 7433),
-            "http://[fd7a:115c:a1e0::1]:7433/api/join"
-        );
-        assert_eq!(
-            join_url("[fd7a:115c:a1e0::1]:7777", 7433),
-            "http://[fd7a:115c:a1e0::1]:7777/api/join"
-        );
-        assert_eq!(
-            join_url("trilogy-mac", 7433),
-            "http://trilogy-mac:7433/api/join"
-        );
-        assert_eq!(
-            join_url("trilogy-mac:80", 7433),
-            "http://trilogy-mac:80/api/join"
-        );
+        for (address, authority) in [
+            ("100.64.0.1", "100.64.0.1:7433"),
+            ("100.64.0.1:7777", "100.64.0.1:7777"),
+            ("fd7a:115c:a1e0::1", "[fd7a:115c:a1e0::1]:7433"),
+            ("[fd7a:115c:a1e0::1]", "[fd7a:115c:a1e0::1]:7433"),
+            ("[fd7a:115c:a1e0::1]:7777", "[fd7a:115c:a1e0::1]:7777"),
+            ("trilogy-mac", "trilogy-mac:7433"),
+            ("trilogy-mac:80", "trilogy-mac:80"),
+        ] {
+            assert_eq!(join_authority(address, 7433), authority);
+        }
+    }
+
+    #[test]
+    fn only_tailscale_and_loopback_addresses_are_joinable() {
+        for (ip, ok) in [
+            ("100.64.0.0", true),
+            ("100.127.255.255", true),
+            ("100.63.255.255", false),
+            ("100.128.0.0", false),
+            ("127.0.0.1", true),
+            ("192.168.1.20", false),
+            ("::1", true),
+            ("fd7a:115c:a1e0::1", true),
+            ("fd7a:115c:a1e0:ffff::1", true),
+            ("fd7a:115c:a1e1::1", false),
+            ("2001:db8::1", false),
+        ] {
+            assert_eq!(joinable(ip.parse().unwrap()), ok, "{ip}");
+        }
+    }
+
+    #[test]
+    fn a_join_to_an_address_outside_tailscale_is_refused_and_keeps_nothing() {
+        for address in [
+            "192.0.2.1",
+            "198.51.100.7:7433",
+            "100.128.0.1",
+            "[2001:db8::1]",
+            "fd7a:115c:a1e1::1",
+        ] {
+            let secrets = MemorySecrets::default();
+            let joined = join_at(address, DEFAULT_PORT, "CODE", &secrets);
+            assert!(
+                matches!(&joined, Err(JoinError::NotTailscale(a)) if a == address),
+                "{address}: {joined:?}"
+            );
+            assert_eq!(secrets.get(IDENTITY_SECRET).unwrap(), None, "{address}");
+            assert_eq!(secrets.get(KEYS_SECRET).unwrap(), None, "{address}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_host_name_is_resolved_and_joined_at_its_loopback_address() {
+        let host = machine_keys();
+        let port = serve(host.clone()).await;
+        let code = host.new_code().unwrap().to_string();
+        // Where localhost resolves to ::1 first (macOS), nothing listens there, so this also
+        // shows a join moving on to the next address.
+        let joined = tokio::task::spawn_blocking(move || {
+            let secrets = MemorySecrets::default();
+            join_at(&format!("localhost:{port}"), DEFAULT_PORT, &code, &secrets)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(host.state(joined), KeyState::Active);
     }
 }

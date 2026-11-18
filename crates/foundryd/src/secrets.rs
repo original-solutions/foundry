@@ -12,8 +12,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::{Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
+use nix::errno::Errno;
 use nix::fcntl::{Flock, FlockArg};
+
+/// How long a set or an update waits for another process to let go of the secrets lock before
+/// it gives up with [`SecretsError::Locked`].
+pub const LOCK_WAIT: Duration = Duration::from_secs(5);
 
 /// Named secrets, such as the gateway key or this machine's key.
 pub trait Secrets: Send + Sync {
@@ -42,6 +48,12 @@ pub enum SecretsError {
     Unreadable { path: PathBuf },
     #[error("the secrets file {}: {source}", path.display())]
     Io { path: PathBuf, source: io::Error },
+    #[error(
+        "another process has held the secrets lock {} for over {} s; try again",
+        path.display(),
+        LOCK_WAIT.as_secs()
+    )]
+    Locked { path: PathBuf },
     #[error("the keychain could not {action} the secret {name}: {reason}")]
     Keychain {
         action: &'static str,
@@ -86,9 +98,10 @@ impl FileSecrets {
         PathBuf::from(name)
     }
 
-    /// Takes the lock every set and update holds. It is released when the value is dropped.
+    /// Takes the lock every set and update holds, waiting at most [`LOCK_WAIT`]. It is released
+    /// when the value is dropped.
     fn lock(&self) -> Result<Flock<File>, SecretsError> {
-        lock_file(&self.beside(".lock")).map_err(|e| self.io(e))
+        lock_file(&self.beside(".lock"), LOCK_WAIT)
     }
 
     /// Every secret in the file, or none when there is no file yet.
@@ -181,23 +194,61 @@ impl Secrets for FileSecrets {
 
 /// An exclusive lock on the file at `path`, made 0600 with its directory if needed, held until
 /// the value is dropped. It is a `flock`, so it holds between processes, and between two opens
-/// of the file in one process.
-fn lock_file(path: &Path) -> io::Result<Flock<File>> {
+/// of the file in one process. A lock another holder keeps for longer than `wait` gives
+/// [`SecretsError::Locked`], so a stuck process stalls nobody for long.
+fn lock_file(path: &Path, wait: Duration) -> Result<Flock<File>, SecretsError> {
+    let io = |source: io::Error| SecretsError::Io {
+        path: path.to_owned(),
+        source,
+    };
     if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
+        fs::create_dir_all(dir).map_err(io)?;
     }
-    let file = OpenOptions::new()
+    let mut file = OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(false)
         .mode(0o600)
-        .open(path)?;
-    Flock::lock(file, FlockArg::LockExclusive).map_err(|(_, errno)| errno.into())
+        .open(path)
+        .map_err(io)?;
+    let deadline = Instant::now() + wait;
+    loop {
+        match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+            Ok(locked) => return Ok(locked),
+            Err((held, Errno::EWOULDBLOCK)) => {
+                if Instant::now() >= deadline {
+                    return Err(SecretsError::Locked {
+                        path: path.to_owned(),
+                    });
+                }
+                file = held;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err((_, errno)) => return Err(io(errno.into())),
+        }
+    }
+}
+
+/// An update of one secret in a store with no lock of its own: under the lock file `lock`,
+/// `edit` is given what `get` reads and what it returns is passed to `set`.
+#[cfg(any(target_os = "macos", test))]
+fn update_locked(
+    lock: &Path,
+    edit: Edit<'_>,
+    get: impl FnOnce() -> Result<Option<String>, SecretsError>,
+    set: impl FnOnce(String) -> Result<(), SecretsError>,
+) -> Result<(), SecretsError> {
+    let _locked = lock_file(lock, LOCK_WAIT)?;
+    match edit(get()?) {
+        Some(value) => set(value),
+        None => Ok(()),
+    }
 }
 
 /// Secrets as generic passwords in the login keychain, one per name, under `service`. The
 /// keychain has no lock of its own, so a set or an update holds an exclusive lock on the file
-/// `lock` from its read to its write.
+/// `lock` from its read to its write. A read or write that brings up a keychain prompt holds
+/// that lock until someone answers it; another process gives up after [`LOCK_WAIT`].
 #[cfg(target_os = "macos")]
 pub struct Keychain {
     service: String,
@@ -239,19 +290,19 @@ impl Secrets for Keychain {
     }
 
     fn update(&self, name: &str, edit: Edit<'_>) -> Result<(), SecretsError> {
-        let _locked = lock_file(&self.lock).map_err(|source| SecretsError::Io {
-            path: self.lock.clone(),
-            source,
-        })?;
-        let Some(value) = edit(self.get(name)?) else {
-            return Ok(());
-        };
-        security_framework::passwords::set_generic_password(&self.service, name, value.as_bytes())
+        let store = |value: String| {
+            security_framework::passwords::set_generic_password(
+                &self.service,
+                name,
+                value.as_bytes(),
+            )
             .map_err(|error| SecretsError::Keychain {
                 action: "store",
                 name: name.to_owned(),
                 reason: error.to_string(),
             })
+        };
+        update_locked(&self.lock, edit, || self.get(name), store)
     }
 }
 
@@ -458,6 +509,64 @@ mod tests {
                 }),
             )
             .unwrap();
+        assert_eq!(secrets.get("gateway").unwrap().as_deref(), Some("sk-one"));
+    }
+
+    #[test]
+    fn a_locked_update_over_a_store_with_no_lock_loses_no_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("secrets.lock");
+        // Each read and each write locks only itself, as one keychain call does.
+        let store = Mutex::new(0u32);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    for _ in 0..25 {
+                        let add_one = |n: Option<String>| {
+                            Some((n.unwrap().parse::<u32>().unwrap() + 1).to_string())
+                        };
+                        let get = || {
+                            let n = *store.lock().unwrap();
+                            std::thread::yield_now();
+                            Ok(Some(n.to_string()))
+                        };
+                        let set = |n: String| {
+                            *store.lock().unwrap() = n.parse().unwrap();
+                            Ok(())
+                        };
+                        update_locked(&lock, Box::new(add_one), get, set).unwrap();
+                    }
+                });
+            }
+        });
+        assert_eq!(*store.lock().unwrap(), 100);
+    }
+
+    #[test]
+    fn a_lock_held_past_the_wait_gives_locked_and_changes_nothing() {
+        let (dir, secrets) = file();
+        secrets.set("gateway", "sk-one").unwrap();
+        let held = lock_file(&dir.path().join("secrets.json.lock"), LOCK_WAIT).unwrap();
+        let started = Instant::now();
+        let failed = secrets.update("gateway", Box::new(|_| Some("sk-two".into())));
+        assert!(started.elapsed() >= LOCK_WAIT);
+        let error = failed.unwrap_err();
+        assert!(matches!(error, SecretsError::Locked { .. }), "{error:?}");
+        assert!(!error.to_string().contains("sk-"), "{error}");
+        drop(held);
+        assert_eq!(secrets.get("gateway").unwrap().as_deref(), Some("sk-one"));
+    }
+
+    #[test]
+    fn a_lock_let_go_within_the_wait_is_taken() {
+        let (dir, secrets) = file();
+        let held = lock_file(&dir.path().join("secrets.json.lock"), LOCK_WAIT).unwrap();
+        let letting_go = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(held);
+        });
+        secrets.set("gateway", "sk-one").unwrap();
+        letting_go.join().unwrap();
         assert_eq!(secrets.get("gateway").unwrap().as_deref(), Some("sk-one"));
     }
 
