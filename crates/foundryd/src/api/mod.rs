@@ -2,3 +2,5 @@
 
 pub mod assets;
 pub mod terminals;
+#[cfg(test)]
+mod tests;
