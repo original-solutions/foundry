@@ -340,11 +340,16 @@ impl Inner {
                 ],
             )
             .await?;
+            // Git may store the name in another spelling of the same text: on macOS it keeps
+            // Unicode composed. The record takes git's, so every later path and ref this module
+            // builds from it is spelled as git lists it.
+            let head = self.git(&worktree, "symbolic-ref", ["HEAD"]).await?;
+            let stored = head.trim().strip_prefix("refs/heads/").unwrap_or(&branch);
             let body = Workspace {
                 id,
                 project,
                 name: name.to_owned(),
-                branch: branch.clone(),
+                branch: stored.to_owned(),
                 base: base.to_owned(),
             };
             self.write(body, false).await
@@ -418,16 +423,39 @@ impl Inner {
     /// Takes back what a create that failed made after it made `branch` at `start`. The
     /// worktree's folder was not there before this create, under the project's lock, so
     /// whatever is in it now is this create's and holds nothing of anyone's. The branch goes only
-    /// while it still points at `start`. Each step that finds nothing to undo fails, and that is
-    /// fine.
+    /// while it still points at `start`. A step that finds nothing to undo fails, and that is
+    /// fine; one that leaves something behind is logged.
     async fn undo(&self, clone: &Path, worktree: &Path, branch: &str, start: &str) {
-        if matches!(tokio::fs::try_exists(worktree).await, Ok(true)) {
-            let _ = self.remove_worktree(clone, worktree, true).await;
+        if matches!(tokio::fs::try_exists(worktree).await, Ok(true))
+            && let Err(error) = self.remove_worktree(clone, worktree, true).await
+        {
+            tracing::warn!(
+                worktree = %worktree.display(),
+                %error,
+                "a failed create left its worktree behind"
+            );
         }
         let reference = format!("refs/heads/{branch}");
-        let _ = self
+        if let Err(error) = self
             .git(clone, "update-ref", ["-d", &reference, start])
-            .await;
+            .await
+            && self.has_ref(clone, &reference).await.unwrap_or(true)
+        {
+            tracing::warn!(%reference, %error, "a failed create left its branch behind");
+        }
+    }
+
+    /// Whether `reference` names a commit in `clone`.
+    async fn has_ref(&self, clone: &Path, reference: &str) -> Result<bool, WorkspaceError> {
+        match self
+            .git(clone, "rev-parse", ["--verify", "--quiet", reference])
+            .await
+        {
+            Ok(_) => Ok(true),
+            // What `--verify --quiet` gives for a ref that is not there.
+            Err(WorkspaceError::Git { ref stderr, .. }) if stderr.is_empty() => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     /// The path git lists, and the commit it keeps as `HEAD`, for a worktree registered at
@@ -472,7 +500,13 @@ impl Inner {
         worktree: &Path,
         branch: &str,
     ) -> Result<(), WorkspaceError> {
-        let mut heads = vec![format!("refs/heads/{branch}")];
+        // The branch can be renamed or deleted inside the workspace; the worktree's HEAD still
+        // holds what was on it.
+        let reference = format!("refs/heads/{branch}");
+        let mut heads = Vec::new();
+        if self.has_ref(clone, &reference).await? {
+            heads.push(reference);
+        }
         let present = tokio::fs::try_exists(worktree).await?;
         if present {
             let head = self
@@ -502,6 +536,7 @@ impl Inner {
         } else {
             (Vec::new(), Vec::new())
         };
+        // With no head left to check, git lists nothing.
         let unpushed = self
             .git(
                 clone,
@@ -596,10 +631,18 @@ impl Inner {
 
     /// The project's bare clone, made with `origin` set to `repo` when this machine has none.
     /// It is made under another name and renamed when ready, so a clone that stopped half way
-    /// is never taken for a made one.
+    /// is never taken for a made one. A clone already there has `origin` set to `repo` when the
+    /// shared settings have moved the project to another repo.
     async fn clone_for(&self, project: ProjectId, repo: &str) -> Result<PathBuf, WorkspaceError> {
         let clone = self.clone_path(project);
         if tokio::fs::try_exists(&clone).await? {
+            let origin = self
+                .git(&clone, "config", ["--get", "remote.origin.url"])
+                .await?;
+            if origin.trim_end_matches('\n') != repo {
+                self.git(&clone, "remote", ["set-url", "--", "origin", repo])
+                    .await?;
+            }
             return Ok(clone);
         }
         let clones = self.data.join("clones");
@@ -646,12 +689,9 @@ impl Inner {
         let me = self.me;
         self.with_store(move |store| {
             Ok(store
-                .since(me, 0)?
-                .into_iter()
-                .find_map(|record| match record {
-                    AnyRecord::Workspace(r) if r.body.id == id && !r.deleted => Some(r.body),
-                    _ => None,
-                }))
+                .workspace(id)?
+                .filter(|r| r.owner == me && !r.deleted)
+                .map(|r| r.body))
         })
         .await?
         .ok_or(WorkspaceError::Unknown(id))
@@ -662,14 +702,10 @@ impl Inner {
         let me = self.me;
         self.with_store(move |store| {
             Ok(store
-                .since(me, 0)?
+                .terminals_in(me, id)?
                 .into_iter()
-                .filter_map(|record| match record {
-                    AnyRecord::Terminal(r) if r.body.workspace == id && !r.deleted => {
-                        Some(r.body.id)
-                    }
-                    _ => None,
-                })
+                .filter(|r| !r.deleted)
+                .map(|r| r.body.id)
                 .collect())
         })
         .await

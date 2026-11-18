@@ -1269,3 +1269,180 @@ async fn a_decomposed_name_keeps_its_detached_commits() {
     assert!(dirty.unpushed[0].ends_with(" detached"), "{dirty:?}");
     assert!(worktree.exists());
 }
+
+#[tokio::test]
+async fn a_workspace_whose_branch_was_renamed_or_deleted_still_checks_its_work() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup.create(&remote, "main", "fix").await;
+    let worktree = setup.worktree(remote.project, "fix");
+    // Inside the workspace, its branch is renamed, as before opening a pull request.
+    git(&worktree, &["branch", "-m", "fix", "fix-renamed"]);
+    std::fs::write(worktree.join("loose.txt"), "mine").unwrap();
+    let err = setup.workspaces.archive(id, false).await.unwrap_err();
+    let WorkspaceError::Dirty(dirty) = err else {
+        panic!("{err}");
+    };
+    assert_eq!(dirty.uncommitted, ["loose.txt"]);
+
+    // Or another branch is checked out and the workspace's own is deleted.
+    std::fs::remove_file(worktree.join("loose.txt")).unwrap();
+    git(&worktree, &["checkout", "-q", "-b", "elsewhere"]);
+    git(&worktree, &["branch", "-q", "-D", "fix-renamed"]);
+    git(
+        &worktree,
+        &["commit", "-q", "--allow-empty", "-m", "on elsewhere"],
+    );
+    let err = setup.workspaces.archive(id, false).await.unwrap_err();
+    let WorkspaceError::Dirty(dirty) = err else {
+        panic!("{err}");
+    };
+    assert_eq!(dirty.unpushed.len(), 1, "{dirty:?}");
+    assert!(dirty.unpushed[0].ends_with(" on elsewhere"), "{dirty:?}");
+
+    // With no branch, no folder and no entry left, there is nothing to check.
+    git(&worktree, &["push", "-q", "origin", "elsewhere"]);
+    std::fs::remove_dir_all(&worktree).unwrap();
+    git(&setup.clone_of(remote.project), &["worktree", "prune"]);
+    setup.workspaces.archive(id, false).await.unwrap();
+    assert!(setup.record(id).unwrap().deleted);
+}
+
+#[tokio::test]
+async fn a_decomposed_name_removed_by_hand_keeps_its_detached_commits() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let name = "\u{1112}\u{1161}\u{11ab}";
+    let id = setup.create(&remote, "main", name).await;
+    // The record names the branch as git stores it, which on macOS is the composed form.
+    let clone = setup.clone_of(remote.project);
+    let branches = git(
+        &clone,
+        &[
+            "for-each-ref",
+            "--format=%(refname:lstrip=2)",
+            "refs/heads/",
+        ],
+    );
+    let branch = setup.body(id).branch;
+    assert!(branches.lines().any(|b| b == branch), "{branches}");
+
+    let worktree = setup.workspaces.worktree(id).await.unwrap();
+    git(&worktree, &["checkout", "-q", "--detach"]);
+    git(
+        &worktree,
+        &["commit", "-q", "--allow-empty", "-m", "detached"],
+    );
+    std::fs::remove_dir_all(&worktree).unwrap();
+
+    let err = setup.workspaces.archive(id, false).await.unwrap_err();
+    let WorkspaceError::Dirty(dirty) = err else {
+        panic!("{err}");
+    };
+    assert_eq!(dirty.unpushed.len(), 1, "{dirty:?}");
+    assert!(dirty.unpushed[0].ends_with(" detached"), "{dirty:?}");
+
+    // Forced, git forgets the worktree, so its branch can be checked out again.
+    setup.workspaces.archive(id, true).await.unwrap();
+    let again = setup.data.path().join("again");
+    git(
+        &clone,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--",
+            again.to_str().unwrap(),
+            &branch,
+        ],
+    );
+}
+
+#[tokio::test]
+async fn a_project_whose_repo_changed_is_fetched_from_the_new_repo() {
+    let setup = Setup::new();
+    let old = setup.project(&[("README.md", "old\n")]);
+    setup.create(&old, "main", "before").await;
+    let new = setup.project(&[("NEW.md", "new\n")]);
+    {
+        let mut store = setup.store.lock().unwrap();
+        let mut settings = store.settings().unwrap();
+        settings.seq += 1;
+        let project = settings
+            .projects
+            .iter_mut()
+            .find(|p| p.id == old.project)
+            .unwrap();
+        project.repo = new.bare.to_string_lossy().into_owned();
+        assert!(store.apply_settings(settings).unwrap());
+    }
+
+    setup.create(&old, "main", "after").await;
+    assert!(setup.worktree(old.project, "after").join("NEW.md").exists());
+    let clone = setup.clone_of(old.project);
+    let url = git(&clone, &["config", "--get", "remote.origin.url"]);
+    assert_eq!(url.trim(), new.bare.to_str().unwrap());
+}
+
+#[tokio::test]
+async fn an_archive_whose_last_write_fails_is_still_live_and_can_be_archived_again() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup.create(&remote, "main", "kept").await;
+    let worktree = setup.worktree(remote.project, "kept");
+
+    // The store cannot make its journal in a folder it may not write.
+    let mode = |m| {
+        std::fs::set_permissions(setup.data.path(), std::fs::Permissions::from_mode(m)).unwrap()
+    };
+    mode(0o500);
+    let err = setup.workspaces.archive(id, false).await;
+    mode(0o700);
+    assert!(matches!(err, Err(WorkspaceError::Store(_))), "{err:?}");
+    assert!(!setup.record(id).unwrap().deleted);
+    assert!(!worktree.exists());
+
+    setup.workspaces.archive(id, false).await.unwrap();
+    assert!(setup.record(id).unwrap().deleted);
+    let clone = setup.clone_of(remote.project);
+    let branches = git(
+        &clone,
+        &["for-each-ref", "--format=%(refname)", "refs/heads/"],
+    );
+    assert!(
+        branches.lines().any(|b| b == "refs/heads/kept"),
+        "{branches}"
+    );
+}
+
+#[tokio::test]
+async fn a_workspace_another_machine_owns_is_not_this_machines() {
+    let setup = Setup::new();
+    let peer = MachineId::random();
+    let id = WorkspaceId::random();
+    let record = AnyRecord::Workspace(Record {
+        owner: peer,
+        version: 1,
+        deleted: false,
+        body: Workspace {
+            id,
+            project: ProjectId::random(),
+            name: "theirs".into(),
+            branch: "theirs".into(),
+            base: "main".into(),
+        },
+    });
+    setup.store.lock().unwrap().apply(&record, peer).unwrap();
+
+    let err = setup.workspaces.worktree(id).await.unwrap_err();
+    assert!(
+        matches!(err, WorkspaceError::Unknown(w) if w == id),
+        "{err}"
+    );
+    let err = setup.workspaces.archive(id, true).await.unwrap_err();
+    assert!(
+        matches!(err, WorkspaceError::Unknown(w) if w == id),
+        "{err}"
+    );
+}
