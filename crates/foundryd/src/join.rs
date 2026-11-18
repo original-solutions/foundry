@@ -167,23 +167,43 @@ pub fn join_at(
             });
         }
     };
+    if answer.machine == identity.machine {
+        // Only this machine speaks for its own id.
+        return Err(JoinError::NotAdmitted { url, status: 200 });
+    }
     hold_key(secrets, answer.machine, answer.key)?;
     Ok(identity.machine)
 }
 
-/// Puts `machine`'s key in the key table kept in `secrets`, so this machine's links with it
-/// are served from the daemon's next start. A machine held revoked, or with another key, is
-/// left as it is and named in the error.
+/// Puts the admitting machine's key in the key table kept in `secrets`, by
+/// [`admit_into`]'s rule, so this machine's links with it are served from the daemon's next
+/// start.
 fn hold_key(secrets: &dyn Secrets, machine: MachineId, key: PublicKey) -> Result<(), JoinError> {
     let mut machines = read_table(secrets)?;
-    match machines.get(&machine) {
-        None => {}
-        Some(Entry::Active { key: held }) if *held == key => return Ok(()),
-        Some(_) => return Err(JoinError::Taken(machine)),
-    }
-    machines.insert(machine, Entry::Active { key });
+    admit_into(&mut machines, machine, &key).map_err(|error| match error {
+        JoinError::Taken(machine) => JoinError::HostRefusedHere(machine),
+        other => other,
+    })?;
     secrets.set(KEYS_SECRET, &write_table(&machines))?;
     Ok(())
+}
+
+/// The one rule for admitting a machine to a key table: a machine not held is added, one
+/// held with the same key is left as it is, and one held revoked or with another key is
+/// refused, so nothing replaces a key or a revocation.
+fn admit_into(
+    machines: &mut BTreeMap<MachineId, Entry>,
+    machine: MachineId,
+    key: &PublicKey,
+) -> Result<(), JoinError> {
+    match machines.get(&machine) {
+        None => {
+            machines.insert(machine, Entry::Active { key: key.clone() });
+            Ok(())
+        }
+        Some(Entry::Active { key: held }) if held == key => Ok(()),
+        Some(_) => Err(JoinError::Taken(machine)),
+    }
 }
 
 fn read_table(secrets: &dyn Secrets) -> Result<BTreeMap<MachineId, Entry>, JoinError> {
@@ -224,6 +244,11 @@ pub enum JoinError {
          under the same id"
     )]
     Taken(MachineId),
+    #[error(
+        "machine {0} admitted this one, but this machine holds it revoked or with another key \
+         and will not link with it"
+    )]
+    HostRefusedHere(MachineId),
     #[error("the public key sent is not an Ed25519 public key")]
     BadKey,
     #[error("{url} could not admit this machine (HTTP {status}); ask for a new code")]
@@ -394,7 +419,7 @@ impl Shown {
 
 impl Keys {
     /// This machine's identity and key table, kept in `secrets`, with no codes outstanding.
-    /// A machine with no identity yet is given one, and its own key is always in its table.
+    /// A machine with no identity yet is given one, and its own entry is always its own key.
     pub fn open(secrets: Arc<dyn Secrets>) -> Result<Self, JoinError> {
         let identity = Identity::load_or_create(&*secrets)?;
         let signer = identity.key_pair()?;
@@ -411,11 +436,16 @@ impl Keys {
                 saving: Mutex::new(()),
             }),
         };
-        if keys.state(keys.me()) == KeyState::NoKey {
+        let own = keys.public_key();
+        let holds_own = matches!(
+            keys.held().machines.get(&identity.machine),
+            Some(Entry::Active { key }) if *key == own
+        );
+        if !holds_own {
             let saving = keys.saving();
-            let key = keys.public_key();
             keys.change(&saving, |machines| {
-                machines.insert(identity.machine, Entry::Active { key });
+                machines.insert(identity.machine, Entry::Active { key: own });
+                Ok(())
             })?;
         }
         Ok(keys)
@@ -452,47 +482,28 @@ impl Keys {
         Ok(Code(code))
     }
 
-    /// Uses up `code` to admit `machine` with public key `key`. The machine that used a code
-    /// may send it again while it is valid, as a join whose answer was lost does. A machine
-    /// already in the table, or revoked, cannot be claimed by a code. A code is used up only
-    /// once the key is saved.
+    /// Uses up `code` to admit `machine` with public key `key`, by [`admit_into`]'s rule on
+    /// the stored table. The machine that used a code may send it again while it is valid, as
+    /// a join whose answer was lost does. A code is used up only once the key is saved.
     pub fn redeem(&self, code: &str, machine: MachineId, key: &PublicKey) -> Result<(), JoinError> {
         let typed = code.trim().to_ascii_uppercase();
         let saving = self.saving();
-        {
+        let used_by = {
             let mut held = self.held();
             held.forget_expired_codes();
-            let found = held
-                .codes
+            held.codes
                 .iter()
-                .position(|shown| same(shown.code.as_bytes(), typed.as_bytes()))
-                .ok_or(JoinError::BadCode)?;
-            let used_by = held.codes[found].used_by;
-            let holds = held.machines.get(&machine).cloned();
-            match (used_by, holds) {
-                (Some(user), Some(Entry::Active { key: kept }))
-                    if user == machine && kept == *key =>
-                {
-                    return Ok(());
-                }
-                (Some(_), _) => return Err(JoinError::BadCode),
-                // Already admitted with this key: a retry whose first code expired. The new
-                // code is spent all the same.
-                (None, Some(Entry::Active { key: kept })) if kept == *key => {
-                    held.codes[found].used_by = Some(machine);
-                    return Ok(());
-                }
-                (None, Some(_)) => return Err(JoinError::Taken(machine)),
-                (None, None) => {}
-            }
+                .find(|shown| same(shown.code.as_bytes(), typed.as_bytes()))
+                .ok_or(JoinError::BadCode)?
+                .used_by
+        };
+        if used_by.is_some_and(|user| user != machine) {
+            return Err(JoinError::BadCode);
         }
         if key.verifier().is_none() {
             return Err(JoinError::BadKey);
         }
-        let entry = Entry::Active { key: key.clone() };
-        self.change(&saving, |machines| {
-            machines.insert(machine, entry);
-        })?;
+        self.change(&saving, |machines| admit_into(machines, machine, key))?;
         if let Some(shown) = self
             .held()
             .codes
@@ -509,6 +520,7 @@ impl Keys {
         let saving = self.saving();
         self.change(&saving, |machines| {
             machines.insert(machine, Entry::Revoked);
+            Ok(())
         })
     }
 
@@ -625,16 +637,18 @@ impl Keys {
         lock(&self.inner.saving)
     }
 
-    /// Applies `edit` to the key table as stored now, saves it, then holds it. Taking the
-    /// `saving` guard makes every change hold the lock, so no two saves undo each other, and
-    /// starting from the stored table keeps what `foundryd join` saved from another process.
+    /// Applies `edit` to the key table as stored now, saves it, then holds it; an edit that
+    /// refuses saves nothing. The stored table is the one source of truth: every decision
+    /// about a machine is made by an edit on it, never on the table held in memory, which
+    /// can lag what `foundryd join` saved from another process. Taking the `saving` guard
+    /// makes every change in this process hold the lock, so no two of them undo each other.
     fn change(
         &self,
         _saving: &MutexGuard<'_, ()>,
-        edit: impl FnOnce(&mut BTreeMap<MachineId, Entry>),
+        edit: impl FnOnce(&mut BTreeMap<MachineId, Entry>) -> Result<(), JoinError>,
     ) -> Result<(), JoinError> {
         let mut machines = read_table(&*self.inner.secrets)?;
-        edit(&mut machines);
+        edit(&mut machines)?;
         self.inner
             .secrets
             .set(KEYS_SECRET, &write_table(&machines))?;
