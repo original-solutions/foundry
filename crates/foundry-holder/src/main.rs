@@ -218,3 +218,85 @@ fn bind(path: &Path) -> Result<UnixListener, String> {
     umask(old);
     bound.map_err(|e| format!("socket {}: {e}", path.display()))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::process::ExitStatusExt as _;
+    use std::process::ExitStatus;
+    use std::time::{Duration, Instant};
+
+    use nix::sys::signal::Signal;
+
+    use super::*;
+
+    fn args(dir: &Path) -> Args {
+        Args {
+            socket: dir.join("t.sock"),
+            cwd: dir.to_path_buf(),
+            env_file: dir.join("env.json"),
+            argv: vec!["sleep".into(), "30".into()],
+        }
+    }
+
+    fn exit_within(child: &mut Child, limit: Duration) -> Option<ExitStatus> {
+        let deadline = Instant::now() + limit;
+        while Instant::now() < deadline {
+            if let Some(status) = child.try_wait().expect("try_wait") {
+                return Some(status);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        None
+    }
+
+    #[test]
+    fn a_starter_that_is_gone_leaves_nothing_running() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let args = args(dir.path());
+        let lock_path = args.socket.with_extension("lock");
+        let _lock = lock(&lock_path).expect("lock");
+        let (_pty, _listener, mut child) = open(&args, &[]).expect("open");
+        let (reader, writer) = std::io::pipe().expect("pipe");
+        drop(reader);
+
+        let serve = tell_ready(writer, &args.socket, &lock_path, &child);
+
+        let status = exit_within(&mut child, Duration::from_secs(5));
+        if status.is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert!(!serve, "the holder serves though its starter never heard it");
+        assert_eq!(
+            status.and_then(|s| s.signal()),
+            Some(Signal::SIGHUP as i32),
+            "the child is not hung up"
+        );
+        assert!(!args.socket.exists(), "the socket is left behind");
+        assert!(!lock_path.exists(), "the lock file is left behind");
+    }
+
+    #[test]
+    fn a_starter_that_listens_hears_ready_and_the_child_runs_on() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let args = args(dir.path());
+        let lock_path = args.socket.with_extension("lock");
+        let _lock = lock(&lock_path).expect("lock");
+        let (_pty, _listener, mut child) = open(&args, &[]).expect("open");
+        let (mut reader, writer) = std::io::pipe().expect("pipe");
+
+        let serve = tell_ready(writer, &args.socket, &lock_path, &child);
+
+        let mut said = String::new();
+        let read = reader.read_to_string(&mut said);
+        let running = child.try_wait().expect("try_wait").is_none();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(serve, "the holder does not serve though its starter heard it");
+        assert!(read.is_ok(), "the ready pipe is not closed after the message");
+        assert_eq!(said, READY);
+        assert!(running, "the child is ended though the starter heard it");
+        assert!(args.socket.exists(), "the socket is removed");
+        assert!(lock_path.exists(), "the lock file is removed");
+    }
+}
