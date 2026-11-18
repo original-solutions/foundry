@@ -274,6 +274,10 @@ fn redact(text: &str) -> String {
     out
 }
 
+fn redacted(texts: &[String]) -> Vec<String> {
+    texts.iter().map(|t| redact(t)).collect()
+}
+
 /// `settings` as the UI is shown them: each project's repo with [`redact`] applied.
 fn shown(mut settings: SharedSettings) -> SharedSettings {
     for project in &mut settings.projects {
@@ -361,9 +365,9 @@ impl IntoResponse for ApiError {
             Self::Workspace(WorkspaceError::Dirty(dirty)) => {
                 let body = serde_json::json!({
                     "error": redact(&dirty.to_string()),
-                    "uncommitted": dirty.uncommitted,
-                    "unpushed": dirty.unpushed,
-                    "submodules": dirty.submodules,
+                    "uncommitted": redacted(&dirty.uncommitted),
+                    "unpushed": redacted(&dirty.unpushed),
+                    "submodules": redacted(&dirty.submodules),
                 });
                 return (StatusCode::CONFLICT, Json(body)).into_response();
             }
