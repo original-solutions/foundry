@@ -601,6 +601,65 @@ async fn ten_minutes_of_silence_since_the_last_hook_or_output_is_stuck_and_one_b
     tokio::time::resume();
 }
 
+/// Makes the next `n` writes of session records fail, as a busy store would.
+fn fail_next_writes(f: &Fixture, n: usize) {
+    f.sessions
+        .inner
+        .fail_writes
+        .store(n, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[tokio::test]
+async fn an_exit_whose_record_cannot_be_written_is_written_once_the_store_answers() {
+    let f = Fixture::new("- wait_input\n- exit: 0\n").await;
+    let id = f.start().await;
+    fail_next_writes(&f, 3);
+
+    f.enter(id).await;
+
+    f.until_state(id, SessionState::Finished).await;
+    until("its files to go", || f.files_gone(id)).await;
+    assert_eq!(
+        f.sessions
+            .inner
+            .fail_writes
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "every failure was met and tried past"
+    );
+}
+
+#[tokio::test]
+async fn a_stall_whose_record_cannot_be_written_is_written_once_the_store_answers() {
+    let f = Fixture::new(
+        "
+- hook: {event: SessionStart}
+- hook: {event: UserPromptSubmit}
+- wait_input
+",
+    )
+    .await;
+    let id = f.start().await;
+    f.until_state(id, SessionState::Working).await;
+    // Let the agent's own output reach the follower before the clock stops.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    tokio::time::pause();
+    settle().await;
+    fail_next_writes(&f, 2);
+    tokio::time::advance(STUCK_AFTER + Duration::from_secs(1)).await;
+    // Each step moves the clock past the wait before the next try.
+    for _ in 0..200 {
+        if f.state(id) == Some(SessionState::Stuck) {
+            break;
+        }
+        settle().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+    }
+    assert_eq!(f.state(id), Some(SessionState::Stuck));
+    tokio::time::resume();
+}
+
 #[tokio::test]
 async fn the_gateway_key_is_in_the_childs_environment_and_in_no_log_line_or_file() {
     let logs = logs();

@@ -112,6 +112,9 @@ struct Inner {
     /// Held while a worktree is marked trusted, so two starts never overwrite each other.
     trust: Mutex<()>,
     live: Mutex<HashMap<SessionId, Arc<Live>>>,
+    /// Tests: how many of the next writes fail, as a busy store would.
+    #[cfg(test)]
+    fail_writes: std::sync::atomic::AtomicUsize,
 }
 
 /// A session this daemon started.
@@ -149,6 +152,8 @@ impl Sessions {
                 config,
                 trust: Mutex::new(()),
                 live: Mutex::default(),
+                #[cfg(test)]
+                fail_writes: std::sync::atomic::AtomicUsize::new(0),
             }),
         }
     }
@@ -363,6 +368,21 @@ impl Inner {
     /// Writes `body` as this machine's newest record of its session, on the blocking pool so a
     /// busy store never stalls an async worker.
     async fn write(&self, body: Session) -> Result<(), SessionError> {
+        #[cfg(test)]
+        {
+            use std::sync::atomic::Ordering::SeqCst;
+            if self
+                .fail_writes
+                .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return Err(StoreError::Sqlite(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                    None,
+                ))
+                .into());
+            }
+        }
         let me = self.me;
         self.on_store(move |store| {
             let record = Record {

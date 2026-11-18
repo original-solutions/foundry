@@ -132,6 +132,17 @@ const MERGE_TRIES: usize = 3;
 /// Claude Code writes the file too, so just before the rename the file is read again, and a merge
 /// made from bytes that have changed is made again from the new ones, up to [`MERGE_TRIES`] times.
 pub fn mark_trusted(claude_json: &Path, worktree: &Path) -> Result<(), SessionError> {
+    mark_trusted_with(claude_json, worktree, |_| {})
+}
+
+/// [`mark_trusted`], calling `before_rename` with the try's number (from 1) after the merged
+/// file is written and before it is read again: a test's stand-in for Claude Code writing the
+/// file at that moment.
+fn mark_trusted_with(
+    claude_json: &Path,
+    worktree: &Path,
+    mut before_rename: impl FnMut(usize),
+) -> Result<(), SessionError> {
     let io = |what: String| move |source| SessionError::Io { what, source };
     let key = std::fs::canonicalize(worktree)
         .map_err(io(format!("{}: resolve the worktree", worktree.display())))?;
@@ -208,6 +219,7 @@ pub fn mark_trusted(claude_json: &Path, worktree: &Path) -> Result<(), SessionEr
             file.sync_all()?;
             // `mode` above is cut by the umask; the file's own mode is what is kept.
             std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(mode))?;
+            before_rename(attempt);
             // Claude Code rewrites the file too. When it did while this merge was made, the
             // rename would undo its write, so the merge is made again from the new bytes.
             // The last try goes ahead: the window left is the time between this read and the
@@ -463,6 +475,63 @@ mod tests {
             got["projects"][key.to_str().unwrap()]["hasTrustDialogAccepted"],
             true
         );
+    }
+
+    fn only_the_file_is_left(dir: &Path) {
+        let mut names: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(names, [".claude.json"], "no temp file is left");
+    }
+
+    #[test]
+    fn a_file_changed_while_merging_is_merged_again_and_keeps_the_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let file = dir.path().join(".claude.json");
+        std::fs::write(&file, json!({"keep": 1}).to_string()).unwrap();
+
+        mark_trusted_with(&file, worktree.path(), |attempt| {
+            if attempt == 1 {
+                std::fs::write(&file, json!({"keep": 1, "added": 2}).to_string()).unwrap();
+            }
+        })
+        .unwrap();
+
+        let key = std::fs::canonicalize(worktree.path()).unwrap();
+        let got = read(&file);
+        assert_eq!(got["keep"], 1);
+        assert_eq!(got["added"], 2, "the write made during the merge");
+        assert_eq!(
+            got["projects"][key.to_str().unwrap()]["hasTrustDialogAccepted"],
+            true
+        );
+        only_the_file_is_left(dir.path());
+    }
+
+    #[test]
+    fn a_file_that_changes_on_every_try_still_gets_the_mark_after_the_last_try() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let file = dir.path().join(".claude.json");
+        std::fs::write(&file, json!({"keep": 1}).to_string()).unwrap();
+        let mut tries = 0;
+
+        mark_trusted_with(&file, worktree.path(), |attempt| {
+            tries = attempt;
+            std::fs::write(&file, json!({"keep": 1, "n": attempt}).to_string()).unwrap();
+        })
+        .unwrap();
+
+        assert_eq!(tries, MERGE_TRIES);
+        let key = std::fs::canonicalize(worktree.path()).unwrap();
+        assert_eq!(
+            read(&file)["projects"][key.to_str().unwrap()]["hasTrustDialogAccepted"],
+            true
+        );
+        only_the_file_is_left(dir.path());
     }
 
     #[test]
