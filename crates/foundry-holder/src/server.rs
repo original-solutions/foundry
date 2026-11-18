@@ -2,7 +2,8 @@
 //!
 //! One task owns all state. It never waits on a client: each frame is encoded once and appended to
 //! every attached client's outbox, which that client's writer takes whole, and a client with more
-//! than [`MAX_BACKLOG`] bytes unsent is cut off in both directions and its backlog freed.
+//! than [`MAX_BACKLOG`] bytes unsent, on top of its last snapshot, is cut off in both directions
+//! and its backlog freed.
 //! A child is therefore never blocked by a slow reader, and memory stays bounded with or without
 //! clients.
 
