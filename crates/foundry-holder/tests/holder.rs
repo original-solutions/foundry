@@ -411,8 +411,9 @@ async fn killing_the_starter_leaves_the_child_running() {
         .chain(args)
         .map(|arg| format!("'{arg}'"))
         .collect();
-    // The marker is made once the holder's starter has exited 0, which it does only after it
-    // heard the holder was ready. A holder whose starter is killed before that gives up.
+    // The marker is made once the holder's starter has exited 0, which it does only after it read
+    // the ready message, so the holder is serving by then. Killing the starter any earlier could
+    // reach a holder that has not written it yet, and that holder would give up.
     let heard = dir.path().join("heard");
     let mut starter = Command::new("sh")
         .arg("-c")
