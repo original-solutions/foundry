@@ -39,7 +39,8 @@ const RECONNECT_AT_MOST: Duration = Duration::from_secs(30);
 /// How long a holder has to answer a request before the request fails.
 const ANSWER_WITHIN: Duration = Duration::from_secs(10);
 
-/// How long a holder has to serve its socket before the start fails and the holder is killed.
+/// How long a holder has to serve its socket before the start fails. The process started is
+/// killed, but the holder it forked may still come up, so the terminal stays live to be closed.
 const START_WITHIN: Duration = Duration::from_secs(30);
 
 /// A socket that refuses connections this many times, this far apart, has no holder behind it.
@@ -290,9 +291,24 @@ impl Inner {
         self.write(body.clone(), false).await?;
         let socket = self.socket(id);
         let env_file = self.dir.join(format!("{id}.env"));
-        let started = self.launch(&socket, cwd, &env_file, argv, env).await;
+        let started = tokio::time::timeout(
+            START_WITHIN,
+            self.launch(&socket, cwd, &env_file, argv, env),
+        )
+        .await;
         // The holder deletes the env file once read. One it never read may hold secrets.
         let _ = std::fs::remove_file(&env_file);
+        let Ok(started) = started else {
+            // The starter is killed, but the holder it forked may still serve the socket later.
+            // So the terminal stays live with its record not deleted: its watcher records it
+            // exited while no socket is there, and a close still ends a holder that came up late.
+            self.adopt(body, socket);
+            let reason = format!(
+                "the holder did not start within {} seconds",
+                START_WITHIN.as_secs()
+            );
+            return Err(TerminalError::Start { id, reason });
+        };
         if let Err(reason) = started {
             let ended = Terminal {
                 state: TerminalState::Exited,
@@ -423,9 +439,8 @@ impl Inner {
         }
     }
 
-    /// Runs the holder, which returns once its socket is served. A holder that has not served
-    /// it within [`START_WITHIN`] is killed. The error is the holder's own reason, which never quotes the
-    /// env file's contents.
+    /// Runs the holder, which returns once its socket is served. Dropping this kills the process
+    /// it runs. The error is the holder's own reason, which never quotes the env file's contents.
     async fn launch(
         &self,
         socket: &Path,
@@ -440,7 +455,7 @@ impl Inner {
             .create(&self.dir)
             .map_err(|e| format!("{}: {e}", self.dir.display()))?;
         pty::write_env_file(env_file, env).map_err(|e| format!("env file: {e}"))?;
-        let started = tokio::process::Command::new(&self.holder)
+        let output = tokio::process::Command::new(&self.holder)
             .arg("--socket")
             .arg(socket)
             .arg("--cwd")
@@ -451,15 +466,8 @@ impl Inner {
             .args(argv)
             .stdin(Stdio::null())
             .kill_on_drop(true)
-            .output();
-        let output = tokio::time::timeout(START_WITHIN, started)
+            .output()
             .await
-            .map_err(|_| {
-                format!(
-                    "the holder did not start within {} seconds",
-                    START_WITHIN.as_secs()
-                )
-            })?
             .map_err(|e| format!("cannot run {}: {e}", self.holder.display()))?;
         if output.status.success() {
             return Ok(());
@@ -1730,24 +1738,43 @@ mod tests {
         assert!(held(&store, setup.me, id).unwrap().deleted);
     }
 
-    /// A holder that never says it is ready fails the start in bounded time and is killed.
-    /// The env file goes, and no record or live terminal is left for it.
+    /// A start whose holder does not serve its socket in time fails in bounded time, and the
+    /// process it ran is killed. The holder that process forked can still come up later, so the
+    /// terminal stays: recorded exited while it has no socket, and closing it ends that holder.
     #[tokio::test(start_paused = true)]
-    async fn a_holder_that_never_gets_ready_fails_the_start_in_time_and_is_killed() {
+    async fn a_holder_not_ready_in_time_fails_the_start_and_one_that_comes_up_late_can_be_closed() {
         let setup = Setup::new();
-        let late = setup.cwd.path().join("late");
+        let (forked, late) = (
+            setup.cwd.path().join("forked"),
+            setup.cwd.path().join("late"),
+        );
+        // The process run hangs. The holder it forked comes up a second later, as the real
+        // holder's detached grandchild would, with an env file of its own.
         let fake = setup.cwd.path().join("fake-holder");
         std::fs::write(
             &fake,
             format!(
-                "#!/bin/sh\nsleep 1\ntouch '{}'\nsleep 600\n",
-                late.display()
+                "#!/bin/sh\n\
+                 (sleep 1; echo '{{}}' > \"$2.late-env\"; \
+                  exec '{holder}' --socket \"$2\" --cwd /tmp --env-file \"$2.late-env\" -- sleep 60) \
+                  >/dev/null 2>&1 &\n\
+                 touch '{forked}'\nsleep 1\ntouch '{late}'\nsleep 600\n",
+                holder = holder().display(),
+                forked = forked.display(),
+                late = late.display(),
             ),
         )
         .unwrap();
         set_mode(&fake, 0o755);
         let (terminals, store) = setup.daemon_with(fake);
         let env = [("ANTHROPIC_AUTH_TOKEN".to_string(), "sk-hung".to_string())];
+        // Paused time jumps ahead once the runtime is idle. Keeping it busy until the process
+        // run has forked lets the start's time limit run out only after that.
+        tokio::spawn(async move {
+            while !forked.exists() {
+                tokio::task::yield_now().await;
+            }
+        });
         let error = tokio::time::timeout(
             WAIT * 10,
             terminals.start(WorkspaceId::random(), setup.cwd.path(), &argv("true"), &env),
@@ -1759,12 +1786,30 @@ mod tests {
             panic!("expected a start error, got {error:?}");
         };
         assert!(reason.contains("did not start within"), "{reason}");
+        assert!(!error.to_string().contains("sk-hung"), "{error}");
+        // From here the holder that comes up late answers in real time.
+        tokio::time::resume();
+        assert!(
+            !setup.dir().join(format!("{id}.env")).exists(),
+            "the env file is removed"
+        );
+        until("the record to say exited", || {
+            held(&store, setup.me, id).unwrap().body.state == TerminalState::Exited
+        })
+        .await;
+        let record = held(&store, setup.me, id).unwrap();
+        assert_eq!(record.body.exit_code, None);
+        assert!(!record.deleted, "the terminal is kept for a close");
+
+        // Paused time does not pause the processes: the one run, left alive, would make `late`.
+        until("the late holder's socket", || setup.socket(id).exists()).await;
+        assert!(!late.exists(), "the process run was left running");
+        terminals.close(id).await.unwrap();
         assert!(held(&store, setup.me, id).unwrap().deleted);
-        assert!(terminals.inner.entry(id).is_err(), "nothing is left live");
-        assert!(setup.left().is_empty(), "left behind: {:?}", setup.left());
-        // Paused time does not pause the fake: a holder left running would make `late`.
-        std::thread::sleep(Duration::from_millis(1500));
-        assert!(!late.exists(), "the holder was left running");
+        assert!(
+            !setup.socket(id).exists(),
+            "the close ended the holder that came up late"
+        );
     }
 
     /// Typing into a terminal whose child has exited is no error: the holder drops the input,
