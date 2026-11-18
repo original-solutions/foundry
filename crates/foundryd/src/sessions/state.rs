@@ -140,9 +140,40 @@ mod tests {
     #[test]
     fn session_start_moves_starting_to_idle_and_changes_nothing_else() {
         assert_eq!(next_state(Starting, Event::Hook(Hook::SessionStart)), Idle);
-        for state in [Working, WaitingForYou, Idle, Stuck] {
+        for state in [Working, WaitingForYou, Idle] {
             assert_eq!(next_state(state, Event::Hook(Hook::SessionStart)), state);
         }
+    }
+
+    #[test]
+    fn any_hook_clears_stuck() {
+        // The spec: stuck clears when output or an event arrives.
+        for hook in [Hook::SessionStart, Hook::Other] {
+            assert_eq!(next_state(Stuck, Event::Hook(hook)), Working, "{hook:?}");
+        }
+    }
+
+    #[test]
+    fn a_session_end_that_is_a_clear_is_not_an_end() {
+        let payload = |reason: Option<&str>| {
+            let mut v = serde_json::json!({"hook_event_name": "SessionEnd"});
+            if let Some(reason) = reason {
+                v["reason"] = reason.into();
+            }
+            Hook::from_payload(&v)
+        };
+        assert_eq!(payload(Some("clear")), Some(Hook::Other));
+        for reason in [None, Some("logout"), Some("other"), Some("prompt_input_exit")] {
+            assert_eq!(payload(reason), Some(Hook::SessionEnd), "{reason:?}");
+        }
+        let named = |name: &str| Hook::from_payload(&serde_json::json!({"hook_event_name": name}));
+        assert_eq!(named("Stop"), Some(Hook::Stop));
+        assert_eq!(named("Whatever"), Some(Hook::Other));
+        assert_eq!(Hook::from_payload(&serde_json::json!({"a": 1})), None);
+        assert_eq!(
+            Hook::from_payload(&serde_json::json!({"hook_event_name": 7})),
+            None
+        );
     }
 
     #[test]
@@ -183,8 +214,8 @@ mod tests {
     }
 
     #[test]
-    fn an_other_hook_changes_nothing() {
-        for state in STATES {
+    fn an_other_hook_changes_nothing_but_stuck() {
+        for state in STATES.into_iter().filter(|s| *s != Stuck) {
             assert_eq!(next_state(state, Event::Hook(Hook::Other)), state);
         }
     }

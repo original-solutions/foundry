@@ -216,7 +216,7 @@ mod tests {
 
     #[test]
     fn settings_register_the_seven_events_each_with_one_command() {
-        let settings = settings_json(URL, TOKEN);
+        let settings = settings_json(Path::new(CURL));
         let hooks = settings["hooks"].as_object().unwrap();
         let mut names: Vec<&str> = hooks.keys().map(String::as_str).collect();
         names.sort_unstable();
@@ -245,15 +245,93 @@ mod tests {
         }
     }
 
+    const CURL: &str = "/data/sessions/67e55044-10b1-426f-9247-bb680e5fe0c8.curl";
+
     #[test]
-    fn the_hook_command_posts_stdin_quietly_and_never_blocks_the_agent() {
-        let settings = settings_json(URL, TOKEN);
-        let want = format!(
-            "curl -sS -m 5 -X POST -H 'Content-Type: application/json' \
-             -H 'Authorization: Bearer {TOKEN}' --data-binary @- '{URL}' >/dev/null 2>&1 || true"
-        );
+    fn the_hook_command_posts_stdin_through_a_curl_config_quietly_and_never_blocks_the_agent() {
+        let settings = settings_json(Path::new(CURL));
+        let want =
+            format!("curl -sS -m 5 -K '{CURL}' -X POST --data-binary @- >/dev/null 2>&1 || true");
         for event in ["SessionStart", "PreToolUse", "SessionEnd"] {
             assert_eq!(command(&settings, event), want);
+        }
+    }
+
+    #[test]
+    fn the_settings_hold_neither_the_token_nor_a_bearer_header() {
+        let text = settings_json(Path::new(CURL)).to_string();
+        assert!(!text.contains(TOKEN) && !text.contains("Bearer"), "{text}");
+    }
+
+    #[test]
+    fn a_path_is_quoted_so_sh_reads_it_back_whatever_it_holds() {
+        for path in ["/a/b", "/a b/c", "/it's/x", "/'''/'", "/a\"b$c`d`/e"] {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("printf %s {}", shell_quote(path)))
+                .output()
+                .unwrap();
+            assert_eq!(String::from_utf8(out.stdout).unwrap(), path);
+        }
+    }
+
+    #[test]
+    fn the_hook_command_quotes_a_config_path_with_a_space_and_a_quote() {
+        let settings = settings_json(Path::new("/home/me/it's here/sessions/x.curl"));
+        let command = command(&settings, "Stop");
+        assert!(
+            command.contains(r"-K '/home/me/it'\''s here/sessions/x.curl' "),
+            "{command}"
+        );
+    }
+
+    #[test]
+    fn the_curl_config_holds_the_headers_and_the_url_and_is_written_new_with_mode_0600() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions").join("s.curl");
+
+        write_curl_config(&path, URL, TOKEN).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!(
+                "header = \"Content-Type: application/json\"\n\
+                 header = \"Authorization: Bearer {TOKEN}\"\n\
+                 url = \"{URL}\"\n"
+            )
+        );
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(path.parent().unwrap()), 0o700);
+        assert!(
+            write_curl_config(&path, URL, TOKEN).is_err(),
+            "a second write"
+        );
+    }
+
+    #[test]
+    fn trust_marks_made_at_once_through_one_lock_are_all_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(".claude.json");
+        std::fs::write(&file, json!({"keep": 1}).to_string()).unwrap();
+        let lock = std::sync::Mutex::new(());
+        let worktrees: Vec<_> = (0..8).map(|_| tempfile::tempdir().unwrap()).collect();
+
+        std::thread::scope(|scope| {
+            for worktree in &worktrees {
+                let (lock, file) = (&lock, &file);
+                scope.spawn(move || mark_trusted_locked(lock, file, worktree.path()).unwrap());
+            }
+        });
+
+        let got = read(&file);
+        assert_eq!(got["keep"], 1);
+        for worktree in &worktrees {
+            let key = std::fs::canonicalize(worktree.path()).unwrap();
+            assert_eq!(
+                got["projects"][key.to_str().unwrap()]["hasTrustDialogAccepted"],
+                true,
+                "{key:?}"
+            );
         }
     }
 
@@ -261,7 +339,7 @@ mod tests {
     fn settings_are_written_new_with_mode_0600_in_a_0700_folder() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sessions").join("s.json");
-        let value = settings_json(URL, TOKEN);
+        let value = settings_json(Path::new(CURL));
 
         write_settings(&path, &value).unwrap();
 
@@ -302,14 +380,14 @@ mod tests {
             }
         });
         std::fs::write(&file, before.to_string()).unwrap();
-        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o640)).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o646)).unwrap();
 
         mark_trusted(&file, worktree.path()).unwrap();
 
         let mut want = before.clone();
         want["projects"][key]["hasTrustDialogAccepted"] = json!(true);
         assert_eq!(read(&file), want);
-        assert_eq!(mode(&file), 0o640, "the file's mode is kept");
+        assert_eq!(mode(&file), 0o646, "the file's mode is kept");
         let left: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
         assert_eq!(left.len(), 1, "no temporary file is left behind");
     }

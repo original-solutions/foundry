@@ -66,10 +66,15 @@ struct Fixture {
 
 impl Fixture {
     async fn new(script: &str) -> Self {
-        // A Unix socket path is at most about 100 bytes, which the system's own temporary
-        // folder on macOS would take most of.
+        Self::with_prefix(script, "fs").await
+    }
+
+    /// `prefix` starts the data directory's name. A Unix socket path is at most about 100
+    /// bytes, which the system's own temporary folder on macOS would take most of, so the
+    /// folder is made under `/tmp`.
+    async fn with_prefix(script: &str, prefix: &str) -> Self {
         let data = tempfile::Builder::new()
-            .prefix("fs")
+            .prefix(prefix)
             .tempdir_in("/tmp")
             .unwrap();
         let script_path = data.path().join("script.yaml");
@@ -128,6 +133,10 @@ impl Fixture {
         self.data.path().join("sessions").join(format!("{id}.json"))
     }
 
+    fn curl_file(&self, id: SessionId) -> PathBuf {
+        self.data.path().join("sessions").join(format!("{id}.curl"))
+    }
+
     fn url(&self, id: impl std::fmt::Display) -> String {
         format!("http://127.0.0.1:{}/hooks/{id}", self.port)
     }
@@ -154,15 +163,16 @@ impl Fixture {
         .await;
     }
 
-    /// The session's hook token, as the settings file hands it to Claude Code.
+    /// The session's hook token, as the curl config file hands it to curl.
     fn token(&self, id: SessionId) -> String {
-        let settings: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(self.settings_file(id)).unwrap()).unwrap();
-        let command = settings["hooks"]["SessionStart"][0]["hooks"][0]["command"]
-            .as_str()
-            .unwrap();
-        let after = command.split("Bearer ").nth(1).unwrap();
-        after.split('\'').next().unwrap().to_string()
+        let config = std::fs::read_to_string(self.curl_file(id)).unwrap();
+        let after = config.split("Bearer ").nth(1).unwrap();
+        after.split('"').next().unwrap().to_string()
+    }
+
+    /// Whether the session has left no file of its own behind.
+    fn files_gone(&self, id: SessionId) -> bool {
+        !self.settings_file(id).exists() && !self.curl_file(id).exists()
     }
 
     /// Types a line into the session's terminal.
@@ -201,6 +211,20 @@ fn record(store: &Mutex<Store>, me: MachineId, id: SessionId) -> Option<Record<S
             _ => None,
         })
         .next_back()
+}
+
+/// Every record held for session `id`.
+fn records_of(store: &Mutex<Store>, me: MachineId, id: SessionId) -> Vec<Record<Session>> {
+    let store = store.lock().unwrap();
+    store
+        .since(me, 0)
+        .unwrap()
+        .into_iter()
+        .filter_map(|record| match record {
+            AnyRecord::Session(r) if r.body.id == id => Some(r),
+            _ => None,
+        })
+        .collect()
 }
 
 fn session_records(store: &Mutex<Store>, me: MachineId) -> usize {
@@ -287,6 +311,7 @@ const WALK: &str = r"
 async fn every_row_of_the_state_table_is_reached_with_the_fake_agent() {
     let f = Fixture::new(WALK).await;
     let id = f.start().await;
+    let token = f.token(id);
     assert_eq!(f.state(id), Some(SessionState::Starting));
 
     for want in [
@@ -303,7 +328,12 @@ async fn every_row_of_the_state_table_is_reached_with_the_fake_agent() {
 
     // The last line lets the agent exit 0, and the settings file goes once the exit is seen.
     f.enter(id).await;
-    until("the exit to be seen", || !f.settings_file(id).exists()).await;
+    until("the exit to be seen", || f.files_gone(id)).await;
+    assert_eq!(f.state(id), Some(SessionState::Finished));
+
+    // The session has ended: a late hook with its own token is refused like an unknown one.
+    let body = r#"{"hook_event_name":"UserPromptSubmit"}"#;
+    assert_eq!(post(f.url(id), Some(token), body).await, 403);
     assert_eq!(f.state(id), Some(SessionState::Finished));
 }
 
@@ -314,7 +344,7 @@ async fn a_child_that_exits_non_zero_is_failed() {
 
     f.until_state(id, SessionState::Failed).await;
 
-    until("the exit to be seen", || !f.settings_file(id).exists()).await;
+    until("the exit to be seen", || f.files_gone(id)).await;
     assert_eq!(f.state(id), Some(SessionState::Failed));
 }
 
@@ -477,8 +507,33 @@ async fn a_hook_from_a_non_loopback_address_is_refused_and_changes_nothing() {
     f.until_state(id, SessionState::Working).await;
 }
 
+/// Lets every task that can run, run, without moving the paused clock.
+async fn settle() {
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// A hook call from loopback with the session's token, made straight at the handler.
+async fn loopback_hook(f: &Fixture, id: SessionId, body: &'static str) -> StatusCode {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "authorization",
+        HeaderValue::from_str(&format!("Bearer {}", f.token(id))).unwrap(),
+    );
+    hooks::hook(
+        State(f.sessions.inner.clone()),
+        ConnectInfo("127.0.0.1:40000".parse::<SocketAddr>().unwrap()),
+        UrlPath(id.to_string()),
+        headers,
+        Bytes::from_static(body.as_bytes()),
+    )
+    .await
+}
+
 #[tokio::test]
-async fn ten_minutes_of_silence_while_working_is_stuck_and_one_byte_of_output_clears_it() {
+async fn ten_minutes_of_silence_since_the_last_hook_or_output_is_stuck_and_one_byte_clears_it() {
     let f = Fixture::new(
         "
 - hook: {event: SessionStart}
@@ -492,28 +547,58 @@ async fn ten_minutes_of_silence_while_working_is_stuck_and_one_byte_of_output_cl
     let terminal = f.record(id).unwrap().body.terminal;
     // Let the agent's own output reach the follower before the clock stops.
     tokio::time::sleep(Duration::from_millis(300)).await;
+    let minutes = |m: u64| Duration::from_secs(m * 60);
 
     tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(9 * 60)).await;
-    for _ in 0..100 {
-        tokio::task::yield_now().await;
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    assert_eq!(f.state(id), Some(SessionState::Working), "after 9 minutes");
+    tokio::time::advance(minutes(9)).await;
+    settle().await;
+    assert_eq!(f.state(id), Some(SessionState::Working), "9 minutes");
 
-    tokio::time::advance(Duration::from_secs(60 + 1)).await;
+    // A hook restarts the count: 9 more minutes is 18 since the start, and not stuck.
+    let body = r#"{"hook_event_name":"PreToolUse","tool_name":"Bash"}"#;
+    assert_eq!(loopback_hook(&f, id, body).await, StatusCode::NO_CONTENT);
+    settle().await;
+    tokio::time::advance(minutes(9)).await;
+    settle().await;
+    assert_eq!(f.state(id), Some(SessionState::Working), "9 since the hook");
+
+    tokio::time::advance(minutes(1) + Duration::from_secs(1)).await;
     until_paused("the session to be stuck", || {
         f.state(id) == Some(SessionState::Stuck)
     })
     .await;
-    tokio::time::resume();
 
     // The terminal echoes the typed byte: output, and no hook.
+    tokio::time::resume();
     f.terminals
         .input(terminal, Bytes::from_static(b"x"))
         .await
         .unwrap();
     f.until_state(id, SessionState::Working).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // The count restarts at that byte, and the timer is armed again after the recovery.
+    tokio::time::pause();
+    settle().await;
+    tokio::time::advance(minutes(9)).await;
+    settle().await;
+    tokio::time::resume();
+    f.terminals
+        .input(terminal, Bytes::from_static(b"y"))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::time::pause();
+    settle().await;
+    tokio::time::advance(minutes(9)).await;
+    settle().await;
+    assert_eq!(f.state(id), Some(SessionState::Working), "9 since the byte");
+    tokio::time::advance(minutes(1) + Duration::from_secs(1)).await;
+    until_paused("the session to be stuck again", || {
+        f.state(id) == Some(SessionState::Stuck)
+    })
+    .await;
+    tokio::time::resume();
 }
 
 #[tokio::test]
@@ -531,6 +616,14 @@ async fn the_gateway_key_is_in_the_childs_environment_and_in_no_log_line_or_file
     let id = f.start().await;
     let held = f.record(id).unwrap();
     let token = f.token(id);
+    // The script fires SessionStart first. The store keeps the newest record only, so this is
+    // the one record there is: it carries the real terminal, never the nil placeholder.
+    let records = records_of(&f.store, f.me, id);
+    assert!(!records.is_empty());
+    assert!(
+        records.iter().all(|r| r.body.terminal.0 != uuid::Uuid::nil()),
+        "{records:?}"
+    );
 
     let (snapshot, mut output) = f.terminals.attach(held.body.terminal).await.unwrap();
     let want_key = format!("ANTHROPIC_AUTH_TOKEN={}", f.key);
@@ -566,6 +659,7 @@ async fn the_gateway_key_is_in_the_childs_environment_and_in_no_log_line_or_file
     assert!(!logged.contains(&f.key), "the gateway key is logged");
     assert!(!logged.contains(&token), "the hook token is logged");
     let settings = std::fs::read_to_string(f.settings_file(id)).unwrap();
+    assert!(!settings.contains(&token), "the hook token is in the settings file");
     assert!(
         !settings.contains(&f.key),
         "the gateway key is in the settings file"
@@ -643,6 +737,175 @@ async fn a_command_that_cannot_start_fails_the_start_and_leaves_no_session_or_se
         .map(|dir| dir.flatten().count())
         .unwrap_or(0);
     assert_eq!(settings, 0, "a settings file is left");
+}
+
+#[tokio::test]
+async fn a_clear_does_not_end_the_session() {
+    // Claude Code sends SessionEnd with reason "clear", then SessionStart with source "clear",
+    // and keeps running.
+    let f = Fixture::new(
+        "
+- hook: {event: SessionStart}
+- hook: {event: UserPromptSubmit}
+- hook: {event: SessionEnd, reason: clear}
+- hook: {event: SessionStart, source: clear}
+- hook: {event: UserPromptSubmit}
+- print: DONE
+- wait_input
+",
+    )
+    .await;
+    let id = f.start().await;
+    let terminal = f.record(id).unwrap().body.terminal;
+    let (snapshot, mut output) = f.terminals.attach(terminal).await.unwrap();
+
+    // Every hook is posted and answered before the agent prints.
+    read_until(&snapshot.bytes, &mut output, |seen| seen.contains("DONE")).await;
+
+    assert_eq!(f.state(id), Some(SessionState::Working));
+}
+
+#[tokio::test]
+async fn a_session_end_that_is_not_a_clear_still_ends_it() {
+    let f = Fixture::new("- wait_input\n").await;
+    let id = f.start().await;
+    let body = r#"{"hook_event_name":"SessionEnd","reason":"logout"}"#;
+
+    assert_eq!(post(f.url(id), Some(f.token(id)), body).await, 204);
+
+    assert_eq!(f.state(id), Some(SessionState::Finished));
+}
+
+#[tokio::test]
+async fn closing_the_terminal_ends_the_session_and_removes_its_files() {
+    let f = Fixture::new("- wait_input\n").await;
+    let id = f.start().await;
+    let terminal = f.record(id).unwrap().body.terminal;
+
+    f.terminals.close(terminal).await.unwrap();
+
+    until("the session to end", || {
+        matches!(
+            f.state(id),
+            Some(SessionState::Failed | SessionState::Finished)
+        )
+    })
+    .await;
+    assert_eq!(f.state(id), Some(SessionState::Failed));
+    until("its files to go", || f.files_gone(id)).await;
+}
+
+#[tokio::test]
+async fn two_starts_at_once_both_get_their_worktree_trusted() {
+    let f = Fixture::new("- wait_input\n").await;
+    let other = tempfile::tempdir().unwrap();
+
+    let (a, b) = tokio::join!(
+        f.sessions
+            .start(WorkspaceId::random(), f.worktree.path(), MODEL),
+        f.sessions
+            .start(WorkspaceId::random(), other.path(), MODEL),
+    );
+    a.unwrap();
+    b.unwrap();
+
+    let claude: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(f.claude_json()).unwrap()).unwrap();
+    for worktree in [f.worktree.path(), other.path()] {
+        let key = std::fs::canonicalize(worktree).unwrap();
+        assert_eq!(
+            claude["projects"][key.to_str().unwrap()]["hasTrustDialogAccepted"],
+            true,
+            "{key:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn another_sessions_token_is_refused_and_changes_nothing() {
+    let f = Fixture::new("- wait_input\n").await;
+    let a = f.start().await;
+    let b = f.start().await;
+    let (before_a, before_b) = (f.record(a).unwrap(), f.record(b).unwrap());
+    let (token_a, token_b) = (f.token(a), f.token(b));
+    assert_ne!(token_a, token_b);
+    let body = r#"{"hook_event_name":"UserPromptSubmit"}"#;
+
+    assert_eq!(post(f.url(b), Some(token_a), body).await, 403);
+    assert_eq!(post(f.url(a), Some(token_b), body).await, 403);
+
+    assert_eq!(f.record(a).unwrap(), before_a);
+    assert_eq!(f.record(b).unwrap(), before_b);
+}
+
+#[tokio::test]
+async fn a_start_the_caller_stops_waiting_for_still_finishes() {
+    let f = Fixture::new(
+        "
+- wait_input
+- hook: {event: SessionStart}
+- wait_input
+",
+    )
+    .await;
+    let settings_dir = f.data.path().join("sessions");
+
+    // The caller gives up as soon as the settings file exists, which is before the terminal.
+    tokio::select! {
+        biased;
+        () = async {
+            while std::fs::read_dir(&settings_dir).map_or(0, |d| d.flatten().count()) == 0 {
+                tokio::task::yield_now().await;
+            }
+        } => {}
+        started = f.sessions.start(WorkspaceId::random(), f.worktree.path(), MODEL) => {
+            panic!("the start finished before the caller gave up: {started:?}");
+        }
+    }
+
+    until("the session's record", || session_records(&f.store, f.me) > 0).await;
+    let held = {
+        let store = f.store.lock().unwrap();
+        store
+            .since(f.me, 0)
+            .unwrap()
+            .into_iter()
+            .find_map(|r| match r {
+                AnyRecord::Session(r) => Some(r),
+                _ => None,
+            })
+            .unwrap()
+    };
+    assert!(f.terminals.attach(held.body.terminal).await.is_ok());
+
+    f.enter(held.body.id).await;
+    f.until_state(held.body.id, SessionState::Idle).await;
+}
+
+#[tokio::test]
+async fn hooks_reach_the_daemon_when_the_data_dir_has_a_space_and_a_quote_in_its_path() {
+    let f = Fixture::with_prefix("- hook: {event: SessionStart}\n- wait_input\n", "f s'q ").await;
+    let id = f.start().await;
+
+    f.until_state(id, SessionState::Idle).await;
+}
+
+#[tokio::test]
+async fn the_hook_token_is_in_a_private_curl_config_and_not_in_the_settings_or_the_command() {
+    let f = Fixture::new("- wait_input\n").await;
+    let id = f.start().await;
+    let token = f.token(id);
+
+    let config = std::fs::read_to_string(f.curl_file(id)).unwrap();
+    assert!(config.contains(&format!("header = \"Authorization: Bearer {token}\"")));
+    assert!(config.contains(&format!("url = \"{}\"", f.url(id))));
+    assert_eq!(
+        std::fs::metadata(f.curl_file(id)).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let settings = std::fs::read_to_string(f.settings_file(id)).unwrap();
+    assert!(!settings.contains(&token) && !settings.contains("Bearer"), "{settings}");
+    assert!(settings.contains(&f.curl_file(id).display().to_string()), "{settings}");
 }
 
 /// The text every tracing event is written to, once a test has called [`logs`].
