@@ -181,12 +181,9 @@ impl Attached {
     }
 
     /// Reads until the holder closes the connection.
+    /// Reads until the holder closes the connection. A frame cut off by the close is not counted.
     async fn read_to_end(&mut self) {
-        while let Some(reply) = timeout(WAIT, protocol::read_reply(&mut self.stream))
-            .await
-            .expect("no reply in time")
-            .unwrap()
-        {
+        while let Some(reply) = read_or_end(&mut self.stream).await {
             self.take(reply);
         }
     }
@@ -204,6 +201,32 @@ impl Attached {
             .await
             .unwrap();
     }
+}
+
+/// The next reply, or `None` once the holder has closed the connection, whether between frames or
+/// part way through one.
+async fn read_or_end(stream: &mut UnixStream) -> Option<Reply> {
+    match timeout(WAIT, protocol::read_reply(stream))
+        .await
+        .expect("the holder neither replied nor closed the connection")
+    {
+        Ok(reply) => reply,
+        Err(protocol::Error::Io(_)) => None,
+        Err(e) => panic!("{e}"),
+    }
+}
+
+/// Writes requests until the holder's side of the connection is gone. False if it never goes.
+async fn writes_fail(stream: &mut UnixStream) -> bool {
+    let deadline = Instant::now() + WAIT;
+    while Instant::now() < deadline {
+        let input = Request::Input(Bytes::from_static(b"x"));
+        if protocol::write_request(stream, &input).await.is_err() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    false
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -485,6 +508,36 @@ fn arguments_that_do_not_parse_still_delete_the_env_file() {
     let output = run_starter(holder_command(&dir, &socket, &[], &[("SECRET", "x")]));
     assert!(!output.status.success());
     assert!(!dir.path().join("env.json").exists());
+
+    // The `--env-file=<path>` form, with an unknown flag so the arguments do not parse.
+    let env_file = dir.path().join("env.json");
+    pty::write_env_file(&env_file, &[]).unwrap();
+    let output = run_starter({
+        let mut command = Command::new(env!("CARGO_BIN_EXE_foundry-holder"));
+        command
+            .arg(format!("--env-file={}", env_file.display()))
+            .arg("--no-such-flag");
+        command
+    });
+    assert!(!output.status.success());
+    assert!(!env_file.exists());
+}
+
+#[test]
+fn an_env_file_named_only_in_the_childs_command_is_left_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let other = dir.path().join("child-file");
+    std::fs::write(&other, "keep").unwrap();
+    let output = run_starter({
+        let mut command = Command::new(env!("CARGO_BIN_EXE_foundry-holder"));
+        command
+            .args(["--socket", "/tmp/unused", "--"])
+            .arg("--env-file")
+            .arg(&other);
+        command
+    });
+    assert!(!output.status.success());
+    assert!(other.exists());
 }
 
 #[test]
@@ -587,7 +640,7 @@ async fn a_request_in_another_version_is_refused_with_a_reason() {
         ),
         other => panic!("expected a refusal, got {other:?}"),
     }
-    assert!(protocol::read_reply(&mut stream).await.unwrap().is_none());
+    assert!(read_or_end(&mut stream).await.is_none());
     assert_eq!(holder.status().await, ChildStatus::Running);
 }
 
@@ -601,13 +654,93 @@ async fn input_over_the_pending_limit_is_refused_not_dropped() {
         Reply::Refused(reason) => assert!(reason.contains("input"), "{reason}"),
         other => panic!("expected a refusal, got {other:?}"),
     }
-    assert!(
-        protocol::read_reply(&mut client.stream)
-            .await
-            .unwrap()
-            .is_none()
-    );
+    assert!(read_or_end(&mut client.stream).await.is_none());
     assert_eq!(holder.status().await, ChildStatus::Running);
+}
+
+#[tokio::test]
+async fn input_is_refused_once_what_the_child_has_not_read_passes_the_limit() {
+    // The child never reads, so input piles up in the holder past what the terminal takes. Raw
+    // mode, because a canonical terminal discards input past its line limit instead.
+    let holder = Holder::start(&["sh", "-c", "stty raw -echo; printf R; sleep 60"], &[]);
+    holder.attach().await.read_until(b"R").await;
+    let mut stream = holder.connect().await;
+    let three_mb = Bytes::from(vec![b'a'; 3 * 1024 * 1024]);
+    protocol::write_request(&mut stream, &Request::Input(three_mb.clone()))
+        .await
+        .unwrap();
+    protocol::write_request(&mut stream, &Request::Input(three_mb))
+        .await
+        .unwrap();
+    match next(&mut stream).await {
+        Reply::Refused(reason) => assert!(reason.contains("input"), "{reason}"),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert!(read_or_end(&mut stream).await.is_none());
+}
+
+#[tokio::test]
+async fn nothing_a_client_sends_after_its_refusal_reaches_the_child() {
+    let holder = Holder::start(&["sh", "-c", "stty raw -echo; printf R; cat"], &[]);
+    let mut observer = holder.attach().await;
+    observer.read_until(b"R").await;
+
+    let mut sender = holder.connect().await;
+    let paste = Bytes::from(vec![b'a'; protocol::MAX_PENDING_INPUT + 1]);
+    protocol::write_request(&mut sender, &Request::Input(paste))
+        .await
+        .unwrap();
+    let _ =
+        protocol::write_request(&mut sender, &Request::Input(Bytes::from_static(b"MARK"))).await;
+    match next(&mut sender).await {
+        Reply::Refused(_) => {}
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert!(read_or_end(&mut sender).await.is_none());
+
+    holder
+        .send(Request::Input(Bytes::from_static(b"END")))
+        .await;
+    observer.read_until(b"END").await;
+    assert!(
+        !contains(&observer.seen, b"MARK"),
+        "input after a refusal reached the child"
+    );
+}
+
+#[tokio::test]
+async fn clients_that_stop_reading_are_cut_off_and_let_go() {
+    let holder = Holder::start(
+        &[
+            "sh",
+            "-c",
+            "stty -echo; printf R; read x; head -c 200000000 /dev/zero | tr '\\0' a",
+        ],
+        &[],
+    );
+    let mut driver = holder.attach().await;
+    driver.read_until(b"R").await;
+    drop(driver);
+    let mut stalled = Vec::new();
+    for _ in 0..4 {
+        stalled.push(holder.attach().await);
+    }
+    let rss = PeakRss::watch(holder_pid(&holder.socket));
+    holder.send(Request::Input(Bytes::from_static(b"\n"))).await;
+    assert_eq!(holder.wait_for_exit(Duration::from_secs(180)).await, 0);
+    let peak_mb = rss.stop();
+    assert!(
+        peak_mb < 50,
+        "four stalled clients took the holder to {peak_mb} MB"
+    );
+
+    // Each was disconnected both ways, so what it sends now fails rather than vanishing.
+    for client in &mut stalled {
+        assert!(
+            writes_fail(&mut client.stream).await,
+            "a cut-off client can still write"
+        );
+    }
 }
 
 /// The pid of the detached holder serving `socket`, found by its command line.
