@@ -337,23 +337,39 @@ pub(crate) mod tests {
         }
     }
 
+    fn with_version(record: &AnyRecord, owner: MachineId, version: u64) -> AnyRecord {
+        let mut json = serde_json::to_value(record).unwrap();
+        json["owner"] = serde_json::json!(owner);
+        json["version"] = serde_json::json!(version);
+        serde_json::from_value(json).unwrap()
+    }
+
     #[test]
-    fn any_record_supersedes_by_the_same_rule_as_record() {
-        let older = workspace();
-        let newer = Record {
-            version: older.version + 1,
-            ..older.clone()
-        };
-        let other_owner = Record {
-            owner: MachineId::random(),
-            version: older.version + 9,
-            ..older.clone()
-        };
-        let older = AnyRecord::Workspace(older);
-        assert!(AnyRecord::Workspace(newer.clone()).supersedes(&older));
-        assert!(!older.supersedes(&AnyRecord::Workspace(newer)));
-        assert!(!older.supersedes(&older.clone()));
-        assert!(!AnyRecord::Workspace(other_owner).supersedes(&older));
+    fn any_record_supersedes_by_the_same_rule_as_record_for_every_kind() {
+        for older in every_kind() {
+            let owner = older.owner();
+            let older = with_version(&older, owner, 7);
+            let newer = with_version(&older, owner, 8);
+            let other_owner = with_version(&older, MachineId::random(), 9);
+            assert!(newer.supersedes(&older), "{newer:?}");
+            assert!(!older.supersedes(&newer), "{older:?}");
+            assert!(!older.supersedes(&older.clone()), "{older:?}");
+            assert!(!other_owner.supersedes(&older), "{other_owner:?}");
+            assert!(!older.supersedes(&other_owner), "{older:?}");
+        }
+    }
+
+    #[test]
+    fn a_sample_with_a_non_finite_load_cannot_be_written() {
+        for load in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut record = machine_sample();
+            record.body.load_per_core = load;
+            assert!(serde_json::to_string(&record).is_err(), "{load}");
+            assert!(
+                serde_json::to_string(&AnyRecord::MachineSample(record)).is_err(),
+                "{load}"
+            );
+        }
     }
 
     #[test]

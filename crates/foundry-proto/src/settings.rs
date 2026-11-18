@@ -50,7 +50,6 @@ pub struct Limits {
 pub(crate) mod tests {
     use super::*;
     use crate::assert_round_trip;
-    use crate::ids::{MachineId, ProjectId};
 
     pub(crate) fn settings() -> SharedSettings {
         let mac = MachineId::random();
@@ -149,5 +148,15 @@ pub(crate) mod tests {
             serde_json::from_str::<SharedSettings>(&json).unwrap(),
             expected
         );
+    }
+
+    #[test]
+    fn a_non_finite_load_limit_cannot_be_written() {
+        let mut settings = settings();
+        let mac = settings.machines[0].id;
+        for load in [f64::NAN, f64::INFINITY] {
+            settings.limits.get_mut(&mac).unwrap().max_load_per_core = load;
+            assert!(serde_json::to_string(&settings).is_err(), "{load}");
+        }
     }
 }
