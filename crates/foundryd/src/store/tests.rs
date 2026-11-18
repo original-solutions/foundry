@@ -260,6 +260,12 @@ fn since_gives_one_owners_records_above_a_version_in_version_order() {
     store.apply(&workspace(owner, 4), owner).unwrap();
     store.apply(&terminal(owner, 6), owner).unwrap();
     store.apply(&sample(other, 50), other).unwrap();
+    // Without the index the rows come back in the order they went in (9, 4, 6), so only
+    // the query itself can put them in version order.
+    store
+        .conn
+        .execute("DROP INDEX records_by_owner", [])
+        .unwrap();
 
     assert_eq!(
         store.since(owner, 0).unwrap(),
@@ -270,6 +276,7 @@ fn since_gives_one_owners_records_above_a_version_in_version_order() {
         vec![terminal(owner, 6), session(owner, 9)]
     );
     assert!(store.since(owner, 9).unwrap().is_empty());
+    assert!(store.since(owner, u64::MAX).unwrap().is_empty());
     assert_eq!(store.since(other, 0).unwrap(), vec![sample(other, 50)]);
     assert!(store.since(MachineId::random(), 0).unwrap().is_empty());
 }
@@ -366,6 +373,11 @@ fn settings_with_a_higher_seq_are_accepted() {
 #[test]
 fn settings_with_a_lower_or_equal_seq_are_refused() {
     let (_dir, mut store) = open();
+    assert!(
+        !store.apply_settings(settings(0)).unwrap(),
+        "seq 0 on an empty store"
+    );
+    assert_eq!(store.settings().unwrap(), SharedSettings::default());
     assert!(store.apply_settings(settings(5)).unwrap());
     for seq in [5, 4, 0] {
         let mut older = settings(seq);
@@ -383,6 +395,9 @@ fn a_version_sqlite_cannot_hold_is_an_error_that_stores_nothing() {
     let error = store.apply(&workspace(owner, u64::MAX), owner).unwrap_err();
     assert!(error.to_string().contains(&u64::MAX.to_string()), "{error}");
     assert!(everything(&store).is_empty());
+    let error = store.apply_settings(settings(u64::MAX)).unwrap_err();
+    assert!(error.to_string().contains(&u64::MAX.to_string()), "{error}");
+    assert_eq!(store.settings().unwrap(), SharedSettings::default());
 }
 
 #[test]
@@ -446,6 +461,30 @@ fn reopening_a_current_file_runs_no_migration_again() {
     assert_eq!(store.since(owner, 0).unwrap(), vec![workspace(owner, 2)]);
 }
 
+/// A rollback starts the build before a newer one that already migrated the file, so a
+/// file with steps this build does not know still opens and works.
+#[test]
+fn a_file_a_newer_build_migrated_still_opens() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("foundry.db");
+    let owner = MachineId::random();
+    {
+        let mut store = Store::open(&path).unwrap();
+        store.apply(&workspace(owner, 1), owner).unwrap();
+        store
+            .conn
+            .pragma_update(None, "user_version", MIGRATIONS.len() as i64 + 1)
+            .unwrap();
+    }
+    let mut store = Store::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), MIGRATIONS.len() + 1);
+    assert_eq!(
+        store.apply(&workspace(owner, 2), owner).unwrap(),
+        Applied::Stored
+    );
+    assert_eq!(store.since(owner, 0).unwrap(), vec![workspace(owner, 2)]);
+}
+
 /// Review focus 3: clocks on two machines can disagree by minutes, so nothing in the
 /// schema holds a time a query could order by. Records order only by their version.
 #[test]
@@ -488,13 +527,13 @@ fn no_column_in_the_schema_holds_a_time() {
 /// orders by a version.
 #[test]
 fn every_query_that_orders_orders_by_version() {
-    let source = include_str!("mod.rs");
+    let source = include_str!("mod.rs").to_uppercase();
     let mut found = 0;
     for (at, _) in source.match_indices("ORDER BY") {
         found += 1;
         let rest = source[at + "ORDER BY".len()..].trim_start();
         assert!(
-            rest.starts_with("version"),
+            rest.starts_with("VERSION"),
             "orders by {}",
             &rest[..rest.len().min(40)]
         );
