@@ -1,1 +1,368 @@
-//! Load, memory and disk samples, and the machine limits. Filled by plan task 8.
+//! Load, memory and disk samples, and the machine limits.
+//!
+//! Every 5 seconds this machine writes one [`MachineSample`] record of its own: the whole
+//! machine's load per core, its free memory, the free disk on the volume holding the data
+//! directory, and its live session count. The record's version is the sample's `at_version`.
+//! [`over_limits`] says which of a machine's limits a sample is at or over, one [`Reason`]
+//! per limit.
+
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use foundry_proto::ids::MachineId;
+use foundry_proto::record::{MachineSample, Record};
+use foundry_proto::settings::Limits;
+use sysinfo::LoadAvg;
+
+use crate::store::{Store, StoreError};
+
+/// How often this machine writes its sample.
+pub const SAMPLE_EVERY: Duration = Duration::from_secs(5);
+
+#[derive(Debug, thiserror::Error)]
+pub enum MachineError {
+    #[error("machine: the load average could not be read: {0}")]
+    Load(sysinfo::Error),
+    #[error("machine: memory and cores could not be read: {0}")]
+    System(sysinfo::Error),
+    #[error("machine: free disk could not be read for {path}: {source}")]
+    Disk { path: PathBuf, source: nix::Error },
+    #[error(transparent)]
+    Store(#[from] StoreError),
+}
+
+/// A limit a machine is at or over.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Reason {
+    pub machine: MachineId,
+    pub over: Over,
+}
+
+/// Which limit, with the sample's value and the limit's.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Over {
+    Sessions { sessions: u32, limit: u32 },
+    Load { load_per_core: f64, limit: f64 },
+    Disk { free_disk: u64, limit: u64 },
+}
+
+impl Reason {
+    /// The reason as the UI shows it, such as `trilogy-mac: load 1.8 over limit 1.0`.
+    pub fn text(&self, _machine_name: &str) -> String {
+        todo!()
+    }
+}
+
+/// The 1-minute load divided by the logical cores.
+pub fn load_per_core(_load: &LoadAvg, _logical_cores: usize) -> f64 {
+    todo!()
+}
+
+/// Bytes free to an unprivileged writer on the volume holding `path`.
+pub fn free_disk(_path: &Path) -> Result<u64, MachineError> {
+    todo!()
+}
+
+/// Reads this machine's load, memory and the free disk for `data_dir`, with `sessions`.
+pub fn read(_data_dir: &Path, _sessions: u32) -> Result<MachineSample, MachineError> {
+    todo!()
+}
+
+/// Reads a sample, counting the live sessions `me` owns in `store`, and stores it as `me`'s
+/// sample record under its next own version. Returns the record written.
+pub fn write_sample(
+    _store: &mut Store,
+    _me: MachineId,
+    _data_dir: &Path,
+) -> Result<Record<MachineSample>, MachineError> {
+    todo!()
+}
+
+/// Writes a sample every [`SAMPLE_EVERY`], the first at once. A sample that cannot be read or
+/// stored is logged and the next one is tried on time.
+pub async fn run(_store: Arc<Mutex<Store>>, _me: MachineId, _data_dir: PathBuf) {
+    todo!()
+}
+
+/// One reason for each of `limits` that `sample` is at or over, in the order sessions, load,
+/// disk. A machine qualifies for a new session only when this is empty.
+pub fn over_limits(_sample: &Record<MachineSample>, _limits: &Limits) -> Vec<Reason> {
+    todo!()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use foundry_proto::ids::{SessionId, TerminalId, WorkspaceId};
+    use foundry_proto::record::{AnyRecord, Session};
+    use foundry_proto::state::SessionState;
+
+    fn sample(sessions: u32, load_per_core: f64, free_disk: u64) -> Record<MachineSample> {
+        Record {
+            owner: MachineId::random(),
+            version: 9,
+            deleted: false,
+            body: MachineSample {
+                load_per_core,
+                free_memory: 8_000_000_000,
+                free_disk,
+                sessions,
+            },
+        }
+    }
+
+    fn limits() -> Limits {
+        Limits {
+            max_sessions: 4,
+            max_load_per_core: 1.0,
+            min_free_disk: 10_000_000_000,
+        }
+    }
+
+    fn texts(sample: &Record<MachineSample>, limits: &Limits) -> Vec<String> {
+        over_limits(sample, limits)
+            .iter()
+            .map(|r| r.text("trilogy-mac"))
+            .collect()
+    }
+
+    #[test]
+    fn load_per_core_is_the_one_minute_load_over_logical_cores() {
+        let load = LoadAvg {
+            one: 3.6,
+            five: 8.0,
+            fifteen: 12.0,
+        };
+        assert!((load_per_core(&load, 2) - 1.8).abs() < 1e-9);
+        assert!((load_per_core(&load, 8) - 0.45).abs() < 1e-9);
+    }
+
+    #[test]
+    fn free_disk_is_read_for_the_volume_holding_the_data_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let ours = free_disk(dir.path()).unwrap();
+
+        // `df -P` reports the same volume's space available to unprivileged writers, in
+        // 1024-byte blocks. Other programs write meanwhile, so allow some drift.
+        let out = std::process::Command::new("df")
+            .arg("-Pk")
+            .arg(dir.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let text = String::from_utf8(out.stdout).unwrap();
+        let line = text.lines().nth(1).expect("df prints one volume");
+        let available: u64 = line.split_whitespace().nth(3).unwrap().parse().unwrap();
+        let df = available * 1024;
+        assert!(
+            ours.abs_diff(df) < 512 * 1024 * 1024,
+            "free_disk {ours} and df {df} disagree"
+        );
+    }
+
+    #[test]
+    fn free_disk_fails_for_a_missing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = free_disk(&dir.path().join("missing")).unwrap_err();
+        assert!(err.to_string().contains("missing"), "{err}");
+    }
+
+    #[test]
+    fn read_gives_this_machines_numbers() {
+        let dir = tempfile::tempdir().unwrap();
+        let sample = read(dir.path(), 3).unwrap();
+        assert!(sample.load_per_core.is_finite() && sample.load_per_core >= 0.0);
+        assert!(sample.free_memory > 0);
+        assert!(sample.free_disk > 0);
+        assert_eq!(sample.sessions, 3);
+    }
+
+    #[test]
+    fn under_every_limit_gives_no_reason() {
+        assert!(over_limits(&sample(3, 0.9, 10_000_000_000), &limits()).is_empty());
+    }
+
+    #[test]
+    fn each_limit_gives_its_own_reason_text() {
+        assert_eq!(
+            texts(&sample(0, 1.8, 50_000_000_000), &limits()),
+            ["trilogy-mac: load 1.8 over limit 1.0"]
+        );
+        assert_eq!(
+            texts(&sample(5, 0.2, 50_000_000_000), &limits()),
+            ["trilogy-mac: sessions 5 over limit 4"]
+        );
+        assert_eq!(
+            texts(&sample(0, 0.2, 4_200_000_000), &limits()),
+            ["trilogy-mac: free disk 4.2 GB under limit 10.0 GB"]
+        );
+    }
+
+    #[test]
+    fn a_maximum_is_reached_at_its_value() {
+        // A machine at its maximum sessions has no room for another.
+        assert_eq!(
+            texts(&sample(4, 1.0, 10_000_000_000), &limits()),
+            [
+                "trilogy-mac: sessions 4 at limit 4",
+                "trilogy-mac: load 1.0 at limit 1.0",
+            ]
+        );
+    }
+
+    #[test]
+    fn every_limit_over_gives_every_reason_for_that_machine() {
+        let sample = sample(6, 2.25, 1_500_000_000);
+        let reasons = over_limits(&sample, &limits());
+        assert_eq!(
+            reasons,
+            [
+                Reason {
+                    machine: sample.owner,
+                    over: Over::Sessions {
+                        sessions: 6,
+                        limit: 4
+                    },
+                },
+                Reason {
+                    machine: sample.owner,
+                    over: Over::Load {
+                        load_per_core: 2.25,
+                        limit: 1.0
+                    },
+                },
+                Reason {
+                    machine: sample.owner,
+                    over: Over::Disk {
+                        free_disk: 1_500_000_000,
+                        limit: 10_000_000_000
+                    },
+                },
+            ]
+        );
+        assert_eq!(
+            texts(&sample, &limits()),
+            [
+                "trilogy-mac: sessions 6 over limit 4",
+                "trilogy-mac: load 2.25 over limit 1.0",
+                "trilogy-mac: free disk 1.5 GB under limit 10.0 GB",
+            ]
+        );
+    }
+
+    fn put_session(store: &mut Store, owner: MachineId, state: SessionState, deleted: bool) {
+        let version = store.own_next_version().unwrap();
+        let record = AnyRecord::Session(Record {
+            owner,
+            version,
+            deleted,
+            body: Session {
+                id: SessionId::random(),
+                workspace: WorkspaceId::random(),
+                terminal: TerminalId::random(),
+                model: "claude-opus-5-5".into(),
+                state,
+            },
+        });
+        store.apply(&record, owner).unwrap();
+    }
+
+    fn held_sample(store: &Store, me: MachineId) -> Option<Record<MachineSample>> {
+        store
+            .since(me, 0)
+            .unwrap()
+            .into_iter()
+            .find_map(|r| match r {
+                AnyRecord::MachineSample(r) => Some(r),
+                _ => None,
+            })
+    }
+
+    #[test]
+    fn write_sample_stores_this_machines_sample_with_its_live_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path().join("foundry.db")).unwrap();
+        let me = MachineId::random();
+        let peer = MachineId::random();
+        for state in [
+            SessionState::Starting,
+            SessionState::Working,
+            SessionState::WaitingForYou,
+            SessionState::Idle,
+            SessionState::Stuck,
+            SessionState::Finished,
+            SessionState::Failed,
+        ] {
+            put_session(&mut store, me, state, false);
+        }
+        put_session(&mut store, me, SessionState::Working, true);
+        put_session(&mut store, peer, SessionState::Working, false);
+        let last_session_version = store.versions().unwrap()[&me];
+
+        let written = write_sample(&mut store, me, dir.path()).unwrap();
+
+        assert_eq!(written.owner, me);
+        assert!(!written.deleted);
+        assert!(written.version > last_session_version);
+        assert_eq!(written.body.sessions, 5);
+        assert!(written.body.free_disk > 0);
+        assert!(written.body.free_memory > 0);
+        assert_eq!(held_sample(&store, me), Some(written));
+    }
+
+    async fn settle() {
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn held_version(store: &Arc<Mutex<Store>>, me: MachineId) -> Option<u64> {
+        held_sample(&store.lock().unwrap(), me).map(|r| r.version)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_writes_a_sample_every_5_seconds() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(
+            Store::open(dir.path().join("foundry.db")).unwrap(),
+        ));
+        let me = MachineId::random();
+        let task = tokio::spawn(run(store.clone(), me, dir.path().to_path_buf()));
+
+        settle().await;
+        let first = held_version(&store, me).expect("a sample at once");
+
+        tokio::time::advance(Duration::from_millis(4_900)).await;
+        settle().await;
+        assert_eq!(held_version(&store, me), Some(first));
+
+        tokio::time::advance(Duration::from_millis(100)).await;
+        settle().await;
+        let second = held_version(&store, me).expect("still a sample");
+        assert!(second > first, "{second} after {first}");
+
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_keeps_sampling_after_a_failed_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(
+            Store::open(dir.path().join("foundry.db")).unwrap(),
+        ));
+        let me = MachineId::random();
+        let data = dir.path().join("data");
+        let task = tokio::spawn(run(store.clone(), me, data.clone()));
+
+        settle().await;
+        assert_eq!(held_version(&store, me), None);
+
+        std::fs::create_dir(&data).unwrap();
+        tokio::time::advance(SAMPLE_EVERY).await;
+        settle().await;
+        assert!(held_version(&store, me).is_some());
+
+        task.abort();
+    }
+}
