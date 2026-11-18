@@ -124,7 +124,7 @@ Dependencies are in brackets. Tasks with no dependency between them can build at
 
 - **Spec:** Placement (first three bullets), State is always visible.
 - **Files:** `crates/foundryd/src/machine.rs`.
-- **Produces:** a `MachineSample { load_per_core, free_memory, free_disk, sessions, at_version }` record written every 5 seconds, and `over_limits(sample, limits) -> Vec<Reason>`.
+- **Produces:** a `Record<MachineSample { load_per_core, free_memory, free_disk, sessions }>` written every 5 seconds, whose record `version` is the sample's `at_version`, and `over_limits(&Record<MachineSample>, &Limits) -> Vec<Reason>`, each reason's text from `Reason::text(machine_name)`.
 - **Tests:** load per core is the 1-minute load divided by logical cores. Free disk is read for the volume holding the data directory. Each limit gives its own reason text in the spec's form, `trilogy-mac: load 1.8 over limit 1.0`.
 
 ### 9. Workspaces [5]
