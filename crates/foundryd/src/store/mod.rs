@@ -134,12 +134,25 @@ impl Store {
     /// an error: `since` never silently skips a stored row. Reading such rows after a
     /// rollback belongs to sync (task 12) and rollback (task 18).
     pub fn since(&self, owner: MachineId, version: u64) -> Result<Vec<AnyRecord>, StoreError> {
+        self.since_limited(owner, version, usize::MAX)
+    }
+
+    /// The first `limit` records [`since`](Self::since) would give, read without the rest, so
+    /// a long catch-up can be read one batch at a time. Only the rows it gives are parsed.
+    pub fn since_limited(
+        &self,
+        owner: MachineId,
+        version: u64,
+        limit: usize,
+    ) -> Result<Vec<AnyRecord>, StoreError> {
         // Nothing stored is above i64::MAX, so a larger `version` correctly finds nothing.
         let version = i64::try_from(version).unwrap_or(i64::MAX);
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let mut query = self.conn.prepare(
-            "SELECT record FROM records WHERE owner = ?1 AND version > ?2 ORDER BY version",
+            "SELECT record FROM records WHERE owner = ?1 AND version > ?2 ORDER BY version \
+             LIMIT ?3",
         )?;
-        let rows = query.query_map(params![owner.to_string(), version], |row| {
+        let rows = query.query_map(params![owner.to_string(), version, limit], |row| {
             row.get::<_, String>(0)
         })?;
         let mut records = Vec::new();

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use foundry_proto::ids::MachineId;
+use foundry_proto::ids::{MachineId, WorkspaceId};
 use foundry_proto::messages::{PROTOCOL, PeerMessage};
 use foundry_proto::record::AnyRecord;
 use foundry_proto::settings::Machine;
@@ -16,6 +16,7 @@ use foundryd::sync::ws::{WsDialer, router};
 use foundryd::sync::{BATCH, Conn, Dialer, OFFLINE_AFTER, Peers};
 use futures::future::BoxFuture;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TryRecvError;
 use tokio::time::{Instant, timeout};
 
 use crate::*;
@@ -42,11 +43,62 @@ async fn next(conn: &mut Conn) -> Option<serde_json::Value> {
 }
 
 fn hello(protocol: u16, machine: MachineId) -> PeerMessage {
+    hello_holding(protocol, machine, BTreeMap::new())
+}
+
+fn hello_holding(
+    protocol: u16,
+    machine: MachineId,
+    versions: BTreeMap<MachineId, u64>,
+) -> PeerMessage {
     PeerMessage::Hello {
         protocol,
         machine,
-        versions: BTreeMap::new(),
+        versions,
     }
+}
+
+/// An empty records message: a peer's heartbeat.
+fn heartbeat() -> String {
+    serde_json::to_string(&PeerMessage::Records {
+        protocol: PROTOCOL,
+        records: Vec::new(),
+    })
+    .unwrap()
+}
+
+/// The versions of the records in the next `messages` messages on `conn`, in the order sent.
+async fn versions_sent(conn: &mut Conn, messages: usize) -> Vec<u64> {
+    let mut versions = Vec::new();
+    for _ in 0..messages {
+        let message = next(conn).await.expect("the link stays open");
+        if message["type"] == "records" {
+            let records: Vec<AnyRecord> =
+                serde_json::from_value(message["records"].clone()).unwrap();
+            versions.extend(records.iter().map(AnyRecord::version));
+        }
+    }
+    versions
+}
+
+/// Talks on `conn` every second for `long`, reading whatever arrives, and says whether the
+/// link stayed open the whole time.
+async fn keep_talking(conn: &mut Conn, long: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < long {
+        if conn.send.send(heartbeat()).await.is_err() {
+            return false;
+        }
+        loop {
+            match conn.recv.try_recv() {
+                Ok(_) => {}
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return false,
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    true
 }
 
 fn populated(fleet: &Fleet, state: SessionState) -> Vec<Ids> {
@@ -146,7 +198,7 @@ async fn a_cut_off_machine_shows_offline_on_the_others_within_15_seconds_with_it
     .await;
 
     for daemon in &fleet.daemons[..2] {
-        let state = daemon.peers.state().unwrap();
+        let state = daemon.peers.state().await.unwrap();
         let mut seen = 0;
         for record in &state {
             match record {
@@ -181,7 +233,7 @@ async fn a_cut_off_machine_shows_offline_on_the_others_within_15_seconds_with_it
         fleet.daemons.iter().all(|d| d.peers.online().len() == 3)
     })
     .await;
-    let state = fleet.daemons[0].peers.state().unwrap();
+    let state = fleet.daemons[0].peers.state().await.unwrap();
     assert!(state.iter().all(|record| match record {
         AnyRecord::Session(r) => r.body.state == SessionState::Working,
         _ => true,
@@ -551,12 +603,12 @@ async fn a_machine_with_an_unreadable_record_of_its_own_stays_online() {
             start.elapsed()
         );
     }
-    let state = a.peers.state().expect("the other owners still show");
+    let state = a.peers.state().await.expect("the other owners still show");
     assert!(state.iter().any(|record| record.owner() == b.id));
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_batch_the_receiver_cannot_read_ends_the_link_and_nothing_after_it_is_taken() {
+async fn after_a_batch_it_cannot_read_a_link_takes_nothing_more_and_the_peer_shows_offline() {
     let newer = MachineId::random();
     let fleet = Fleet::start_with(1, &[newer]);
     let a = &fleet.daemons[0];
@@ -565,6 +617,12 @@ async fn a_batch_the_receiver_cannot_read_ends_the_link_and_nothing_after_it_is_
     let mut conn = raw_link(&a.peers);
     send(&conn, &hello(PROTOCOL, newer)).await;
     next(&mut conn).await.expect("a hello back");
+    assert!(keep_talking(&mut conn, Duration::from_secs(2)).await);
+    assert!(
+        a.peers.online().contains(&newer),
+        "online while its messages are taken"
+    );
+
     let mut unreadable = serde_json::to_value(session(
         ids.session,
         ids.workspace,
@@ -576,24 +634,25 @@ async fn a_batch_the_receiver_cannot_read_ends_the_link_and_nothing_after_it_is_
     let batch =
         serde_json::json!({ "type": "records", "protocol": PROTOCOL, "records": [unreadable] });
     conn.send.send(batch.to_string()).await.unwrap();
-    let _ = conn
-        .send
-        .send(
-            serde_json::to_string(&PeerMessage::Records {
-                protocol: PROTOCOL,
-                records: vec![workspace(ids.workspace, false)(newer, 2)],
-            })
-            .unwrap(),
-        )
-        .await;
+    send(
+        &conn,
+        &PeerMessage::Records {
+            protocol: PROTOCOL,
+            records: vec![workspace(ids.workspace, false)(newer, 2)],
+        },
+    )
+    .await;
 
-    let start = Instant::now();
-    while next(&mut conn).await.is_some() {
-        assert!(
-            start.elapsed() < Duration::from_secs(5),
-            "the link is still open"
-        );
-    }
+    // The peer keeps talking. The link stays open, so it is not dialed again and its catch-up
+    // is not sent again, but nothing it says counts as hearing from it.
+    assert!(
+        keep_talking(&mut conn, OFFLINE_AFTER * 2).await,
+        "the link stays open"
+    );
+    assert!(
+        !a.peers.online().contains(&newer),
+        "a peer whose records are refused shows offline"
+    );
     let is_newer = |record: &AnyRecord| record.owner() == newer;
     assert_eq!(
         a.held(is_newer),
@@ -609,7 +668,7 @@ async fn a_large_catch_up_is_sent_in_batches() {
     let a = &fleet.daemons[0];
     let total = BATCH * 2 + 1;
     for _ in 0..total {
-        a.write(workspace(foundry_proto::ids::WorkspaceId::random(), false));
+        a.write(workspace(WorkspaceId::random(), false));
     }
 
     let mut conn = raw_link(&a.peers);
@@ -653,14 +712,15 @@ async fn a_hello_naming_this_machine_or_no_hello_at_all_is_refused() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_record_the_store_cannot_take_ends_the_link_and_nothing_after_it_is_taken() {
+async fn after_a_record_the_store_cannot_take_a_link_takes_nothing_more_and_the_peer_shows_offline()
+{
     let peer = MachineId::random();
     let fleet = Fleet::start_with(1, &[peer]);
     let a = &fleet.daemons[0];
     let (first, refused, after) = (
-        foundry_proto::ids::WorkspaceId::random(),
-        foundry_proto::ids::WorkspaceId::random(),
-        foundry_proto::ids::WorkspaceId::random(),
+        WorkspaceId::random(),
+        WorkspaceId::random(),
+        WorkspaceId::random(),
     );
 
     let mut conn = raw_link(&a.peers);
@@ -679,14 +739,23 @@ async fn a_record_the_store_cannot_take_ends_the_link_and_nothing_after_it_is_ta
         },
     )
     .await;
+    send(
+        &conn,
+        &PeerMessage::Records {
+            protocol: PROTOCOL,
+            records: vec![workspace(after, false)(peer, 3)],
+        },
+    )
+    .await;
 
-    let start = Instant::now();
-    while next(&mut conn).await.is_some() {
-        assert!(
-            start.elapsed() < Duration::from_secs(5),
-            "the link is still open"
-        );
-    }
+    assert!(
+        keep_talking(&mut conn, OFFLINE_AFTER * 2).await,
+        "the link stays open"
+    );
+    assert!(
+        !a.peers.online().contains(&peer),
+        "a peer whose records are refused shows offline"
+    );
     let held =
         |id| move |record: &AnyRecord| matches!(record, AnyRecord::Workspace(w) if w.body.id == id);
     assert!(
@@ -718,4 +787,107 @@ async fn a_link_to_a_peer_that_stops_reading_is_closed() {
         let _ = conn.send.send(serde_json::to_string(&empty).unwrap()).await;
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn catch_up_sends_only_the_versions_above_the_one_the_peer_holds() {
+    let peer = MachineId::random();
+    let fleet = Fleet::start_with(1, &[peer]);
+    let a = &fleet.daemons[0];
+    let written: Vec<u64> = (0..4)
+        .map(|_| a.write(workspace(WorkspaceId::random(), false)).version())
+        .collect();
+
+    let mut conn = raw_link(&a.peers);
+    send(
+        &conn,
+        &hello_holding(PROTOCOL, peer, [(a.id, written[1])].into()),
+    )
+    .await;
+    assert_eq!(versions_sent(&mut conn, 4).await, written[2..]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_dialed_peer_is_sent_only_the_versions_above_the_one_it_holds() {
+    let (me, peer) = (MachineId::random(), MachineId::random());
+    let (daemon, mut tap) = tapped(&[me, peer], false);
+    let written: Vec<u64> = (0..4)
+        .map(|_| {
+            daemon
+                .write(workspace(WorkspaceId::random(), false))
+                .version()
+        })
+        .collect();
+
+    let (_, mut conn) = dialed(&mut tap, Duration::from_secs(5)).await;
+    next(&mut conn).await.expect("the dialer says hello first");
+    send(
+        &conn,
+        &hello_holding(PROTOCOL, peer, [(me, written[1])].into()),
+    )
+    .await;
+    assert_eq!(versions_sent(&mut conn, 4).await, written[2..]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_slow_catch_up_keeps_hearing_the_peer() {
+    let slow = MachineId::random();
+    let fleet = Fleet::start_with(1, &[slow]);
+    let a = &fleet.daemons[0];
+
+    let mut conn = raw_link(&a.peers);
+    send(&conn, &hello(PROTOCOL, slow)).await;
+    // The peer talks every second but reads nothing for a minute, so the link's buffer toward
+    // it fills with a's heartbeats.
+    for _ in 0..60 {
+        let _ = conn.send.try_send(heartbeat());
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    // Then a has six batches to send and the peer takes one message every 10 seconds, so the
+    // catch-up spends far longer than the offline limit waiting on the peer.
+    for _ in 0..BATCH * 6 {
+        a.write(workspace(WorkspaceId::random(), false));
+    }
+    for second in 0..60 {
+        let _ = conn.send.try_send(heartbeat());
+        if second % 10 == 0 {
+            let _ = conn.recv.try_recv();
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(
+            a.peers.online().contains(&slow),
+            "the peer shows offline {second} s into a slow catch-up"
+        );
+    }
+}
+
+/// Runs on real time: a store held by another thread must not stop the runtime's timers.
+#[tokio::test]
+async fn a_busy_store_never_stalls_the_async_workers() {
+    let peer = MachineId::random();
+    let fleet = Fleet::start_with(1, &[peer]);
+    let a = &fleet.daemons[0];
+    let mut conn = raw_link(&a.peers);
+    send(&conn, &hello(PROTOCOL, peer)).await;
+    next(&mut conn).await.expect("a hello back");
+
+    // Held past several ticks of every loop that reads the store, so a call made on an async
+    // worker would stall it for two seconds or more.
+    let store = a.store.clone();
+    let held = std::thread::spawn(move || {
+        let _store = lock(&store);
+        std::thread::sleep(Duration::from_millis(3000));
+    });
+    let start = std::time::Instant::now();
+    let mut worst = Duration::ZERO;
+    while start.elapsed() < Duration::from_millis(3500) {
+        let before = std::time::Instant::now();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        worst = worst.max(before.elapsed());
+    }
+    held.join().unwrap();
+    assert!(
+        worst < Duration::from_secs(1),
+        "a 20 ms sleep took {worst:?} while the store was busy"
+    );
 }

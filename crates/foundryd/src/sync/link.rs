@@ -5,104 +5,144 @@
 //! a newer machine speaks the older form to an older peer. With one protocol so far, the forms
 //! differ only in the number; a later protocol that changes a message's shape converts it to
 //! the older shape where [`records_message`] builds it.
+//!
+//! Past the hellos, sending and reading run side by side, so a send that waits on a slow peer
+//! never stops this end hearing it.
 
 use foundry_proto::ids::MachineId;
 use foundry_proto::messages::{PROTOCOL, PeerMessage};
 use foundry_proto::record::AnyRecord;
-use tokio::time::{Instant, sleep_until, timeout, timeout_at};
+use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::time::{Instant, timeout, timeout_at};
 
 use std::time::Duration;
 
-use super::{BATCH, Conn, Inner, OFFLINE_AFTER, TICK, lock};
+use super::{BATCH, Conn, Inner, OFFLINE_AFTER, TICK, on_store};
 use crate::store::Applied;
 
 /// How often a link repeats the warning that this machine's records cannot be read.
 const WARN_EVERY: Duration = Duration::from_secs(60);
 
 /// Runs a link until it closes, the peer is silent for [`OFFLINE_AFTER`], the peer is not (or
-/// is no longer) in the machine list, or the peer sends a message this machine cannot take.
+/// is no longer) in the machine list, or the peer takes nothing for [`OFFLINE_AFTER`].
 /// `dialed` is the machine this end dialed, or `None` for a link a peer opened.
-pub(super) async fn run(inner: &Inner, mut conn: Conn, dialed: Option<MachineId>) {
-    let Some(open) = hello(inner, &mut conn, dialed).await else {
+pub(super) async fn run(inner: &Inner, conn: Conn, dialed: Option<MachineId>) {
+    let Conn { send, mut recv } = conn;
+    let Some(open) = hello(inner, &send, &mut recv, dialed).await else {
         return;
     };
+    tokio::select! {
+        () = sending(inner, &send, &open) => {}
+        () = reading(inner, &mut recv, open.peer) => {}
+    }
+}
+
+/// Sends this machine's new records every [`TICK`] until the peer leaves the machine list or
+/// stops taking them.
+async fn sending(inner: &Inner, send: &Sender<String>, open: &Open) {
     let mut sent = open.sent;
     let mut warned: Option<Instant> = None;
-    let mut last_heard = Instant::now();
     let mut every = tokio::time::interval(TICK);
     loop {
-        tokio::select! {
-            _ = every.tick() => {
-                if !listed(inner, open.peer) {
-                    tracing::info!("sync: {} left the machine list; link closed", open.peer);
-                    return;
-                }
-                if !send_own(inner, &conn, &open, &mut sent, &mut warned).await {
-                    return;
-                }
-            }
-            text = conn.recv.recv() => {
-                let Some(text) = text else {
-                    return;
-                };
-                last_heard = Instant::now();
-                inner.heard_from(open.peer);
-                if !receive(inner, open.peer, &text) {
-                    return;
-                }
-            }
-            _ = sleep_until(last_heard + OFFLINE_AFTER) => {
-                tracing::debug!("sync: {} has been silent for {OFFLINE_AFTER:?}", open.peer);
+        every.tick().await;
+        if !listed(inner, open.peer).await {
+            tracing::info!("sync: {} left the machine list; link closed", open.peer);
+            return;
+        }
+        if !send_own(inner, send, open, &mut sent, &mut warned).await {
+            return;
+        }
+    }
+}
+
+/// Takes the peer's messages until the link closes or the peer is silent for
+/// [`OFFLINE_AFTER`]. Each message taken counts as hearing from the peer.
+///
+/// After a message this machine cannot take (one it cannot read, or a record the store
+/// refuses), the link stays open but takes nothing more from the peer and no longer counts it
+/// as heard, so the peer shows offline and its sessions unreachable within [`OFFLINE_AFTER`].
+/// Records arrive in version order, so the store keeps a prefix and loses nothing: a build
+/// that can take the record asks for everything past it in the hello of its next link. Ending
+/// the link instead would only have the peer dial again and resend the same refused records.
+async fn reading(inner: &Inner, recv: &mut Receiver<String>, peer: MachineId) {
+    let mut refused = false;
+    loop {
+        let text = match timeout(OFFLINE_AFTER, recv.recv()).await {
+            Ok(Some(text)) => text,
+            Ok(None) => return,
+            Err(_) => {
+                tracing::debug!("sync: {peer} has been silent for {OFFLINE_AFTER:?}");
                 return;
+            }
+        };
+        if refused {
+            continue;
+        }
+        match receive(inner, peer, &text).await {
+            Ok(()) => inner.heard_from(peer),
+            Err(error) => {
+                tracing::warn!(
+                    "sync: {error}; nothing more is taken from {peer} on this link, and it \
+                     shows offline until a link takes its records"
+                );
+                refused = true;
             }
         }
     }
 }
 
-/// Sends this machine's records above `sent` in messages of at most [`BATCH`], moving `sent`
-/// past each one sent, and says whether the link is still open. With nothing new, or when the
-/// records cannot be read, it sends one empty message: the heartbeat goes out either way, so a
-/// read error never makes this machine look offline.
+/// Sends this machine's records above `sent`, reading and sending one message of at most
+/// [`BATCH`] at a time and moving `sent` past each one sent, and says whether the link is
+/// still open. When nothing was sent, it sends one empty message: the heartbeat goes out
+/// either way, so a read error never makes this machine look offline.
 ///
-/// While a record of this machine's own cannot be read (one a newer build wrote before a
-/// rollback), nothing of its own above `sent` goes to this peer: the store reads all of them
-/// or none. The peer then shows this machine online with the records it had before. The
-/// warning says so once a minute until the row is fixed; reading around such a row needs a
-/// store change and belongs with rollback (task 18).
+/// A record of this machine's own that cannot be read (one a newer build wrote before a
+/// rollback) stops the send at the batch that holds it: the batches below it go, and nothing
+/// from that batch on goes to this peer, which then shows this machine online with the records
+/// it had before. The warning says so once a minute until the row is fixed; reading around
+/// such a row belongs with rollback (task 18).
 async fn send_own(
     inner: &Inner,
-    conn: &Conn,
+    send: &Sender<String>,
     open: &Open,
     sent: &mut u64,
     warned: &mut Option<Instant>,
 ) -> bool {
-    let records = match lock(&inner.store).since(inner.me, *sent) {
-        Ok(records) => records,
-        Err(error) => {
-            if warned.is_none_or(|at| at.elapsed() >= WARN_EVERY) {
-                tracing::warn!(
-                    "sync: this machine's records above version {sent} cannot be read, so {} \
-                     is not sent them: {error}",
-                    open.peer
-                );
-                *warned = Some(Instant::now());
+    let mut sent_any = false;
+    loop {
+        let (me, above) = (inner.me, *sent);
+        let batch = match on_store(&inner.store, move |store| {
+            store.since_limited(me, above, BATCH)
+        })
+        .await
+        {
+            Ok(batch) => batch,
+            Err(error) => {
+                if warned.is_none_or(|at| at.elapsed() >= WARN_EVERY) {
+                    tracing::warn!(
+                        "sync: this machine's records above version {above} cannot be read, \
+                         so {} is not sent them: {error}",
+                        open.peer
+                    );
+                    *warned = Some(Instant::now());
+                }
+                break;
             }
-            Vec::new()
-        }
-    };
-    if records.is_empty() {
-        return send(conn, &records_message(open, Vec::new())).await;
-    }
-    for batch in records.chunks(BATCH) {
-        let newest = batch.last().map(AnyRecord::version);
-        if !send(conn, &records_message(open, batch.to_vec())).await {
+        };
+        let Some(newest) = batch.last().map(AnyRecord::version) else {
+            break;
+        };
+        let full = batch.len() == BATCH;
+        if !send_message(send, &records_message(open, batch)).await {
             return false;
         }
-        if let Some(version) = newest {
-            *sent = version;
+        *sent = newest;
+        sent_any = true;
+        if !full {
+            break;
         }
     }
-    true
+    sent_any || send_message(send, &records_message(open, Vec::new())).await
 }
 
 fn records_message(open: &Open, records: Vec<AnyRecord>) -> PeerMessage {
@@ -122,12 +162,18 @@ struct Open {
 }
 
 /// Exchanges hellos, and refuses a peer that is not in the machine list, is this machine, or
-/// is not the machine that was dialed.
-async fn hello(inner: &Inner, conn: &mut Conn, dialed: Option<MachineId>) -> Option<Open> {
-    if dialed.is_some() && !send(conn, &own_hello(inner, PROTOCOL)?).await {
+/// is not the machine that was dialed. A hello does not count as hearing from the peer: that
+/// waits for a message this machine takes.
+async fn hello(
+    inner: &Inner,
+    send: &Sender<String>,
+    recv: &mut Receiver<String>,
+    dialed: Option<MachineId>,
+) -> Option<Open> {
+    if dialed.is_some() && !send_message(send, &own_hello(inner, PROTOCOL).await?).await {
         return None;
     }
-    let text = timeout_at(Instant::now() + OFFLINE_AFTER, conn.recv.recv())
+    let text = timeout_at(Instant::now() + OFFLINE_AFTER, recv.recv())
         .await
         .ok()??;
     let Ok(PeerMessage::Hello {
@@ -141,17 +187,16 @@ async fn hello(inner: &Inner, conn: &mut Conn, dialed: Option<MachineId>) -> Opt
     };
     let allowed = match dialed {
         Some(expected) => machine == expected,
-        None => machine != inner.me && listed(inner, machine),
+        None => machine != inner.me && listed(inner, machine).await,
     };
     if !allowed {
         tracing::warn!("sync: refused a link from {machine}: not a peer of this machine");
         return None;
     }
     let speak = protocol.min(PROTOCOL);
-    if dialed.is_none() && !send(conn, &own_hello(inner, speak)?).await {
+    if dialed.is_none() && !send_message(send, &own_hello(inner, speak).await?).await {
         return None;
     }
-    inner.heard_from(machine);
     Some(Open {
         peer: machine,
         speak,
@@ -159,8 +204,8 @@ async fn hello(inner: &Inner, conn: &mut Conn, dialed: Option<MachineId>) -> Opt
     })
 }
 
-fn own_hello(inner: &Inner, protocol: u16) -> Option<PeerMessage> {
-    match lock(&inner.store).versions() {
+async fn own_hello(inner: &Inner, protocol: u16) -> Option<PeerMessage> {
+    match on_store(&inner.store, |store| store.versions()).await {
         Ok(versions) => Some(PeerMessage::Hello {
             protocol,
             machine: inner.me,
@@ -173,8 +218,8 @@ fn own_hello(inner: &Inner, protocol: u16) -> Option<PeerMessage> {
     }
 }
 
-fn listed(inner: &Inner, machine: MachineId) -> bool {
-    match lock(&inner.store).settings() {
+async fn listed(inner: &Inner, machine: MachineId) -> bool {
+    match on_store(&inner.store, |store| store.settings()).await {
         Ok(settings) => settings.machines.iter().any(|m| m.id == machine),
         Err(error) => {
             tracing::warn!("sync: cannot read the machine list: {error}");
@@ -185,7 +230,7 @@ fn listed(inner: &Inner, machine: MachineId) -> bool {
 
 /// Sends `message`, and says whether the link is still open. A message that cannot be
 /// written as JSON is skipped. A peer that takes nothing for [`OFFLINE_AFTER`] ends the link.
-async fn send(conn: &Conn, message: &PeerMessage) -> bool {
+async fn send_message(send: &Sender<String>, message: &PeerMessage) -> bool {
     let text = match serde_json::to_string(message) {
         Ok(text) => text,
         Err(error) => {
@@ -193,40 +238,31 @@ async fn send(conn: &Conn, message: &PeerMessage) -> bool {
             return true;
         }
     };
-    matches!(
-        timeout(OFFLINE_AFTER, conn.send.send(text)).await,
-        Ok(Ok(()))
-    )
+    matches!(timeout(OFFLINE_AFTER, send.send(text)).await, Ok(Ok(())))
 }
 
-/// Takes the records in a message from `peer`, each only if `peer` owns it and it is newer,
-/// and says whether to keep the link. A message that cannot be read, or a record that cannot
-/// be stored, ends the link and nothing after it is taken: records arrive in version order, so
-/// the store then holds a prefix, and the next hello asks for everything past it again.
-fn receive(inner: &Inner, peer: MachineId, text: &str) -> bool {
-    match serde_json::from_str::<PeerMessage>(text) {
-        Ok(PeerMessage::Records { records, .. }) => {
-            let mut store = lock(&inner.store);
-            for record in &records {
-                match store.apply(record, peer) {
-                    Ok(Applied::NotOwner) => tracing::warn!(
-                        "sync: {peer} sent a record owned by {}; refused",
-                        record.owner()
-                    ),
-                    Ok(Applied::Stored | Applied::Stale) => {}
-                    Err(error) => {
-                        tracing::warn!("sync: a record from {peer} not stored: {error}");
-                        return false;
-                    }
-                }
-            }
-            true
-        }
+/// Takes the records in a message from `peer`, each only if `peer` owns it and it is newer.
+/// A message that cannot be read, or a record that cannot be stored, is an error, and nothing
+/// after it is taken: the store then holds a prefix of the peer's records.
+async fn receive(inner: &Inner, peer: MachineId, text: &str) -> Result<(), String> {
+    let records = match serde_json::from_str::<PeerMessage>(text) {
+        Ok(PeerMessage::Records { records, .. }) => records,
         // Shared settings move only through the coordinator, which owns how they are sent.
-        Ok(PeerMessage::Settings { .. }) | Ok(PeerMessage::Hello { .. }) => true,
-        Err(error) => {
-            tracing::warn!("sync: a message from {peer} could not be read: {error}");
-            false
+        Ok(PeerMessage::Settings { .. }) | Ok(PeerMessage::Hello { .. }) => return Ok(()),
+        Err(error) => return Err(format!("a message from {peer} could not be read: {error}")),
+    };
+    on_store(&inner.store, move |store| {
+        for record in &records {
+            match store.apply(record, peer) {
+                Ok(Applied::NotOwner) => tracing::warn!(
+                    "sync: {peer} sent a record owned by {}; refused",
+                    record.owner()
+                ),
+                Ok(Applied::Stored | Applied::Stale) => {}
+                Err(error) => return Err(format!("a record from {peer} not stored: {error}")),
+            }
         }
-    }
+        Ok(())
+    })
+    .await
 }

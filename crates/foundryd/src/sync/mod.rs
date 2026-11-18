@@ -8,7 +8,11 @@
 //! store's rule), so a record relayed by anyone else is refused.
 //!
 //! A machine not heard from for [`OFFLINE_AFTER`] is offline, and [`Peers::state`] shows its
-//! sessions and terminals as unreachable.
+//! sessions and terminals as unreachable. A machine is heard from when this machine takes a
+//! message from it, so one whose records this machine refuses also shows offline.
+//!
+//! Every store call runs on the blocking pool ([`on_store`]), so a slow disk or a busy store
+//! never stalls an async worker.
 //!
 //! Each machine dials every peer and also serves the link each peer dials, so a pair runs two
 //! links and each carries records both ways. That is deliberate: a pair stays in sync when
@@ -126,7 +130,7 @@ impl Peers {
         let mut every = tokio::time::interval(REDIAL);
         loop {
             every.tick().await;
-            let machines = match lock(&self.inner.store).settings() {
+            let machines = match on_store(&self.inner.store, |store| store.settings()).await {
                 Ok(settings) => settings.machines,
                 Err(error) => {
                     tracing::warn!("sync: cannot read the machine list: {error}");
@@ -169,16 +173,19 @@ impl Peers {
     /// owner shown as unreachable. An owner with a record this build cannot read, one a newer
     /// build wrote before a rollback, is left out with a warning so every other owner still
     /// shows.
-    pub fn state(&self) -> Result<Vec<AnyRecord>, StoreError> {
+    pub async fn state(&self) -> Result<Vec<AnyRecord>, StoreError> {
         let online = self.online();
-        let store = lock(&self.inner.store);
-        let mut records = Vec::new();
-        for owner in store.versions()?.into_keys() {
-            match store.since(owner, 0) {
-                Ok(held) => records.extend(held),
-                Err(error) => tracing::warn!("sync: records of {owner} not shown: {error}"),
+        let records = on_store(&self.inner.store, |store| {
+            let mut records = Vec::new();
+            for owner in store.versions()?.into_keys() {
+                match store.since(owner, 0) {
+                    Ok(held) => records.extend(held),
+                    Err(error) => tracing::warn!("sync: records of {owner} not shown: {error}"),
+                }
             }
-        }
+            Ok::<_, StoreError>(records)
+        })
+        .await?;
         Ok(records
             .into_iter()
             .map(|record| as_seen(record, &online))
@@ -233,4 +240,20 @@ impl Drop for Task {
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Runs `work` with the store on the blocking pool, as [`crate::machine::run`] does, so a
+/// slow disk or a busy store never stalls an async worker. A panic in `work` is raised again
+/// here.
+async fn on_store<T: Send + 'static>(
+    store: &Arc<Mutex<Store>>,
+    work: impl FnOnce(&mut Store) -> T + Send + 'static,
+) -> T {
+    let store = Arc::clone(store);
+    match tokio::task::spawn_blocking(move || work(&mut lock(&store))).await {
+        Ok(value) => value,
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        // The runtime is shutting down, and drops the task that waits here with it.
+        Err(_) => std::future::pending().await,
+    }
 }
