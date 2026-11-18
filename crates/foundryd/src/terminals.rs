@@ -421,10 +421,13 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt as _;
     use std::time::{Duration, Instant};
 
+    use foundry_holder::protocol::{MAX_PENDING_INPUT, Request};
     use foundry_proto::record::{AnyRecord, Record};
     use foundry_proto::state::TerminalState;
+    use futures::StreamExt as _;
     use tempfile::TempDir;
 
     use super::*;
@@ -472,38 +475,68 @@ mod tests {
 
         /// A daemon's terminals over its own connection to the store, as after a restart.
         fn daemon(&self) -> (Terminals, Arc<Mutex<Store>>) {
+            self.daemon_with(holder())
+        }
+
+        fn daemon_with(&self, holder: PathBuf) -> (Terminals, Arc<Mutex<Store>>) {
             let store = Arc::new(Mutex::new(
                 Store::open(self.data.path().join("foundry.db")).unwrap(),
             ));
-            let terminals = Terminals::new(self.me, store.clone(), self.data.path(), holder());
+            let terminals = Terminals::new(self.me, store.clone(), self.data.path(), holder);
             (terminals, store)
         }
 
-        fn socket(&self, id: TerminalId) -> PathBuf {
-            self.data
-                .path()
-                .join("terminals")
-                .join(format!("{id}.sock"))
+        fn dir(&self) -> PathBuf {
+            self.data.path().join("terminals")
         }
 
-        fn argv(script: &str) -> Vec<String> {
-            vec!["/bin/sh".into(), "-c".into(), script.into()]
+        fn socket(&self, id: TerminalId) -> PathBuf {
+            self.dir().join(format!("{id}.sock"))
+        }
+
+        fn left(&self) -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(self.dir())
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        }
+
+        async fn start(&self, terminals: &Terminals, script: &str) -> TerminalId {
+            terminals
+                .start(WorkspaceId::random(), self.cwd.path(), &argv(script), &[])
+                .await
+                .unwrap()
+        }
+
+        /// Ends a holder behind the daemon's back and waits for its socket to go.
+        async fn end_holder(&self, id: TerminalId) {
+            let mut stream = UnixStream::connect(self.socket(id)).await.unwrap();
+            protocol::write_request(&mut stream, &Request::Close)
+                .await
+                .unwrap();
+            until("the holder's socket to go", || !self.socket(id).exists()).await;
         }
     }
 
     impl Drop for Setup {
         fn drop(&mut self) {
             use std::io::Write as _;
-            let Ok(entries) = std::fs::read_dir(self.data.path().join("terminals")) else {
+            let Ok(entries) = std::fs::read_dir(self.dir()) else {
                 return;
             };
             for entry in entries.flatten() {
                 if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(entry.path()) {
-                    let close = foundry_holder::protocol::Request::Close.encode();
-                    let _ = stream.write_all(&close);
+                    let _ = stream.write_all(&Request::Close.encode());
                 }
             }
         }
+    }
+
+    fn argv(script: &str) -> Vec<String> {
+        vec!["/bin/sh".into(), "-c".into(), script.into()]
     }
 
     /// The newest record held for terminal `id`.
@@ -529,16 +562,13 @@ mod tests {
     }
 
     /// Reads the stream into `seen` until `done` holds for what has been seen.
-    async fn read_until(
-        stream: &mut BoxStream<'static, Bytes>,
-        seen: &mut Vec<u8>,
-        done: impl Fn(&[u8]) -> bool,
-    ) {
+    async fn read_until(stream: &mut Output, seen: &mut Vec<u8>, done: impl Fn(&[u8]) -> bool) {
         let deadline = Instant::now() + WAIT;
         while !done(seen) {
             let left = deadline.saturating_duration_since(Instant::now());
             match tokio::time::timeout(left, stream.next()).await {
-                Ok(Some(bytes)) => seen.extend_from_slice(&bytes),
+                Ok(Some(Ok(bytes))) => seen.extend_from_slice(&bytes),
+                Ok(Some(Err(e))) => panic!("{e}; seen: {:?}", String::from_utf8_lossy(seen)),
                 Ok(None) => panic!(
                     "the stream ended; seen: {:?}",
                     String::from_utf8_lossy(seen)
@@ -574,7 +604,7 @@ mod tests {
 
     /// Prints 0 to `COUNT_TO - 1`, one a line, pausing after every tenth, then waits.
     fn counter() -> Vec<String> {
-        Setup::argv(&format!(
+        argv(&format!(
             "i=0; while [ $i -lt {COUNT_TO} ]; do echo $i; i=$((i+1)); [ $((i % 10)) -eq 0 ] && sleep 0.02; done; sleep 60"
         ))
     }
@@ -598,10 +628,7 @@ mod tests {
             (id, snapshot.start, seen)
         });
         drop(first);
-        assert_eq!(
-            start, 0,
-            "a new terminal's snapshot starts at its first byte"
-        );
+        assert_eq!(start, 0, "a new terminal's snapshot starts at its first byte");
         let first_count = counts(&seen).len() as u32;
         assert!(first_count < COUNT_TO, "the counter must still be running");
 
@@ -628,14 +655,42 @@ mod tests {
                 "the snapshot ends before the bytes seen"
             );
             seen.extend_from_slice(&snapshot.bytes[skip..]);
-            let last = format!("{}\n", COUNT_TO - 1);
+            let last = format!("{}\r\n", COUNT_TO - 1);
             read_until(&mut stream, &mut seen, |seen| {
-                contains(seen, last.replace('\n', "\r\n").as_bytes())
+                contains(seen, last.as_bytes())
             })
             .await;
             assert_eq!(counts(&seen), (0..COUNT_TO).collect::<Vec<_>>());
             terminals.close(id).await.unwrap();
         });
+    }
+
+    /// Once the scrollback has dropped its oldest lines, the snapshot's start is the offset of
+    /// its first kept byte, so a client can line it up with what it already has.
+    #[tokio::test]
+    async fn a_snapshot_after_the_scrollback_dropped_lines_starts_at_its_first_kept_byte() {
+        let setup = Setup::new();
+        let (terminals, _) = setup.daemon();
+        let last = 10_499;
+        let id = setup
+            .start(&terminals, &format!("seq 0 {last}; sleep 60"))
+            .await;
+        let (_, mut stream) = terminals.attach(id).await.unwrap();
+        let mut seen = Vec::new();
+        let tail = format!("\n{last}\r\n");
+        read_until(&mut stream, &mut seen, |seen| {
+            contains(seen, tail.as_bytes())
+        })
+        .await;
+
+        let (snapshot, _) = terminals.attach(id).await.unwrap();
+        let kept = counts(&snapshot.bytes);
+        let first = kept[0];
+        assert!(first > 0, "the scrollback kept every line");
+        assert_eq!(kept, (first..=last).collect::<Vec<_>>());
+        let before: u64 = (0..first).map(|n| n.to_string().len() as u64 + 2).sum();
+        assert_eq!(snapshot.start, before);
+        terminals.close(id).await.unwrap();
     }
 
     #[tokio::test]
@@ -647,7 +702,7 @@ mod tests {
             .start(
                 workspace,
                 setup.cwd.path(),
-                &Setup::argv("echo last words; sleep 0.5; exit 3"),
+                &argv("echo last words; sleep 0.5; exit 3"),
                 &[],
             )
             .await
@@ -677,10 +732,13 @@ mod tests {
             !exited.deleted,
             "an exited terminal is kept until it is closed"
         );
-        let rest: Vec<Bytes> = tokio::time::timeout(WAIT, stream.collect())
+        let rest: Vec<_> = tokio::time::timeout(WAIT, stream.collect())
             .await
             .expect("the stream ends once the child has exited");
-        let _ = rest;
+        assert!(
+            rest.iter().all(Result::is_ok),
+            "an exit ends the stream with no error: {rest:?}"
+        );
 
         // A daemon started again still shows the final screen, and writes no new record.
         drop(terminals);
@@ -690,57 +748,29 @@ mod tests {
         assert!(contains(&snapshot.bytes, b"last words"));
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(held(&store, setup.me, id).unwrap(), exited);
+
+        // Its holder gone too, a daemon started again keeps the exit code it had.
+        drop(terminals);
+        setup.end_holder(id).await;
+        let (terminals, store) = setup.daemon();
+        terminals.reattach_all().await.unwrap();
+        assert_eq!(held(&store, setup.me, id).unwrap(), exited);
         terminals.close(id).await.unwrap();
+        assert!(held(&store, setup.me, id).unwrap().deleted);
     }
 
     #[tokio::test]
-    async fn a_holder_whose_socket_is_gone_is_recorded_as_exited_with_an_unknown_code() {
+    async fn a_holder_whose_socket_is_gone_at_restart_is_recorded_exited_and_can_be_closed() {
         let setup = Setup::new();
         let (terminals, store) = setup.daemon();
-        let gone = terminals
-            .start(
-                WorkspaceId::random(),
-                setup.cwd.path(),
-                &Setup::argv("sleep 60"),
-                &[],
-            )
-            .await
-            .unwrap();
-        let stale = terminals
-            .start(
-                WorkspaceId::random(),
-                setup.cwd.path(),
-                &Setup::argv("sleep 60"),
-                &[],
-            )
-            .await
-            .unwrap();
+        let gone = setup.start(&terminals, "sleep 60").await;
+        let stale = setup.start(&terminals, "sleep 60").await;
         drop(terminals);
 
         // While no daemon runs, one holder ends and takes its socket with it, and the other
         // dies without removing its socket, which no one is then listening on.
-        let mut stream = UnixStream::connect(setup.socket(gone)).await.unwrap();
-        foundry_holder::protocol::write_request(
-            &mut stream,
-            &foundry_holder::protocol::Request::Close,
-        )
-        .await
-        .unwrap();
-        until("the closed holder's socket to go", || {
-            !setup.socket(gone).exists()
-        })
-        .await;
-        let mut stream = UnixStream::connect(setup.socket(stale)).await.unwrap();
-        foundry_holder::protocol::write_request(
-            &mut stream,
-            &foundry_holder::protocol::Request::Close,
-        )
-        .await
-        .unwrap();
-        until("the second holder's socket to go", || {
-            !setup.socket(stale).exists()
-        })
-        .await;
+        setup.end_holder(gone).await;
+        setup.end_holder(stale).await;
         drop(std::os::unix::net::UnixListener::bind(setup.socket(stale)).unwrap());
         assert!(setup.socket(stale).exists());
 
@@ -752,21 +782,40 @@ mod tests {
             assert_eq!(record.body.exit_code, None, "{id}");
             assert!(!record.deleted, "{id}");
         }
+        for id in [gone, stale] {
+            terminals.close(id).await.unwrap();
+            assert!(held(&store, setup.me, id).unwrap().deleted, "{id}");
+        }
+        assert!(!setup.socket(stale).exists(), "the stale socket is removed");
+    }
+
+    #[tokio::test]
+    async fn a_holder_that_ends_while_the_daemon_runs_is_recorded_exited_and_can_be_closed() {
+        let setup = Setup::new();
+        let (terminals, store) = setup.daemon();
+        let id = setup.start(&terminals, "sleep 60").await;
+        setup.end_holder(id).await;
+        until("the record to say exited", || {
+            held(&store, setup.me, id).unwrap().body.state == TerminalState::Exited
+        })
+        .await;
+        let record = held(&store, setup.me, id).unwrap();
+        assert_eq!(record.body.exit_code, None);
+        assert!(!record.deleted);
+        terminals.close(id).await.unwrap();
+        assert!(held(&store, setup.me, id).unwrap().deleted);
     }
 
     #[tokio::test]
     async fn input_and_resize_reach_the_child_in_order() {
         let setup = Setup::new();
         let (terminals, _) = setup.daemon();
-        let id = terminals
+        let id = setup
             .start(
-                WorkspaceId::random(),
-                setup.cwd.path(),
-                &Setup::argv("stty -echo; read a; read b; echo \"got $a $b\"; stty size; sleep 60"),
-                &[],
+                &terminals,
+                "stty -echo; read a; read b; echo \"got $a $b\"; stty size; sleep 60",
             )
-            .await
-            .unwrap();
+            .await;
         let (snapshot, mut stream) = terminals.attach(id).await.unwrap();
         let mut seen = snapshot.bytes.to_vec();
         terminals.resize(id, 101, 41).await.unwrap();
@@ -785,6 +834,66 @@ mod tests {
         terminals.close(id).await.unwrap();
     }
 
+    /// The holder refuses input that would take what the child has not read over its limit.
+    /// That input is an error here, not lost in silence, and later input still reaches it.
+    #[tokio::test]
+    async fn input_the_holder_refuses_is_an_error_and_later_input_still_arrives() {
+        let setup = Setup::new();
+        let (terminals, _) = setup.daemon();
+        let id = setup
+            .start(
+                &terminals,
+                "stty -echo; sleep 1; read -r line; echo \"read ${#line}\"; sleep 60",
+            )
+            .await;
+        let (snapshot, mut stream) = terminals.attach(id).await.unwrap();
+        let mut seen = snapshot.bytes.to_vec();
+        let flood = Bytes::from(vec![b'x'; MAX_PENDING_INPUT + 1]);
+        let error = terminals.input(id, flood).await.unwrap_err();
+        assert!(
+            matches!(error, TerminalError::Refused { id: refused, .. } if refused == id),
+            "{error:?}"
+        );
+        terminals
+            .input(id, Bytes::from_static(b"abc\n"))
+            .await
+            .unwrap();
+        read_until(&mut stream, &mut seen, |seen| contains(seen, b"read 3")).await;
+        terminals.close(id).await.unwrap();
+        until("the holder's socket to go", || !setup.socket(id).exists()).await;
+    }
+
+    /// A client too slow for the output is cut off by the holder. Its stream says so with an
+    /// error, which an exit never gives, so the caller knows to attach again.
+    #[tokio::test]
+    async fn a_client_cut_off_for_falling_behind_gets_an_error_not_an_end() {
+        let setup = Setup::new();
+        let (terminals, store) = setup.daemon();
+        let id = setup
+            .start(
+                &terminals,
+                "head -c 30000000 /dev/zero | tr '\\0' x; sleep 60",
+            )
+            .await;
+        let (_, stream) = terminals.attach(id).await.unwrap();
+        // Not reading lets this client's backlog in the holder pass its limit.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let items: Vec<_> = tokio::time::timeout(WAIT, stream.collect())
+            .await
+            .expect("the stream ends once the holder cuts the client off");
+        let (last, before) = items.split_last().expect("some output arrived");
+        assert!(before.iter().all(Result::is_ok));
+        assert!(
+            matches!(last, Err(TerminalError::Detached(cut)) if *cut == id),
+            "{last:?}"
+        );
+        assert_eq!(
+            held(&store, setup.me, id).unwrap().body.state,
+            TerminalState::Running
+        );
+        terminals.close(id).await.unwrap();
+    }
+
     #[tokio::test]
     async fn the_child_gets_the_env_and_the_env_file_is_gone() {
         let setup = Setup::new();
@@ -794,30 +903,26 @@ mod tests {
             .start(
                 WorkspaceId::random(),
                 setup.cwd.path(),
-                &Setup::argv("echo \"[$FOUNDRY_TEST_VALUE] $(pwd)\"; sleep 60"),
+                &argv("echo \"[$FOUNDRY_TEST_VALUE] $(pwd)\"; sleep 60"),
                 &env,
             )
             .await
             .unwrap();
         let (snapshot, mut stream) = terminals.attach(id).await.unwrap();
         let mut seen = snapshot.bytes.to_vec();
-        read_until(&mut stream, &mut seen, |seen| contains(seen, b"]")).await;
-        assert!(
-            contains(&seen, b"[from the env]"),
-            "{:?}",
-            String::from_utf8_lossy(&seen)
-        );
         let cwd = setup.cwd.path().canonicalize().unwrap();
         read_until(&mut stream, &mut seen, |seen| {
             contains(seen, cwd.to_string_lossy().as_bytes())
         })
         .await;
-        let left: Vec<_> = std::fs::read_dir(setup.data.path().join("terminals"))
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(left, vec![format!("{id}.sock")], "only the socket is left");
+        assert!(
+            contains(&seen, b"[from the env]"),
+            "{:?}",
+            String::from_utf8_lossy(&seen)
+        );
+        assert_eq!(setup.left(), vec![format!("{id}.sock")], "only the socket is left");
+        let mode = std::fs::metadata(setup.dir()).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "the terminals directory is this user's only");
         terminals.close(id).await.unwrap();
     }
 
@@ -825,19 +930,11 @@ mod tests {
     async fn close_ends_the_holder_and_deletes_the_record() {
         let setup = Setup::new();
         let (terminals, store) = setup.daemon();
-        let id = terminals
-            .start(
-                WorkspaceId::random(),
-                setup.cwd.path(),
-                &Setup::argv("sleep 60"),
-                &[],
-            )
-            .await
-            .unwrap();
+        let id = setup.start(&terminals, "sleep 60").await;
         terminals.close(id).await.unwrap();
         let record = held(&store, setup.me, id).unwrap();
         assert!(record.deleted);
-        until("the holder's socket to go", || !setup.socket(id).exists()).await;
+        assert!(!setup.socket(id).exists(), "close waits for the holder to end");
         assert!(matches!(
             terminals.attach(id).await,
             Err(TerminalError::Unknown(gone)) if gone == id
@@ -862,29 +959,72 @@ mod tests {
         ));
     }
 
+    /// The caller of `start` going away, as an HTTP handler does when its client hangs up,
+    /// leaves the terminal started and live, not running with nothing attached to it.
+    #[tokio::test]
+    async fn a_start_whose_caller_goes_away_still_finishes() {
+        let setup = Setup::new();
+        let (terminals, store) = setup.daemon();
+        let started = terminals.start(
+            WorkspaceId::random(),
+            setup.cwd.path(),
+            &argv("sleep 60"),
+            &[],
+        );
+        // Polled until the holder is being started, then dropped.
+        let _ = tokio::time::timeout(Duration::from_millis(5), started).await;
+        let id = {
+            let store = store.lock().unwrap();
+            let records = store.since(setup.me, 0).unwrap();
+            let [AnyRecord::Terminal(record)] = records.as_slice() else {
+                panic!("expected one terminal record, got {records:?}");
+            };
+            record.body.id
+        };
+        until("the holder's socket", || setup.socket(id).exists()).await;
+        until("the terminal to be live", || terminals.inner.entry(id).is_ok()).await;
+        terminals.close(id).await.unwrap();
+        assert!(held(&store, setup.me, id).unwrap().deleted);
+    }
+
     #[tokio::test]
     async fn a_command_that_cannot_start_is_an_error_and_leaves_no_live_record() {
         let setup = Setup::new();
-        let (terminals, store) = setup.daemon();
         let secret = "sk-not-for-any-message";
-        let error = terminals
-            .start(
-                WorkspaceId::random(),
-                setup.cwd.path(),
-                &["/no/such/program".to_string()],
-                &[("ANTHROPIC_AUTH_TOKEN".to_string(), secret.to_string())],
-            )
-            .await
-            .unwrap_err();
-        let TerminalError::Start { id, ref reason } = error else {
-            panic!("expected a start error, got {error:?}");
-        };
-        assert!(reason.contains("/no/such/program"), "{reason}");
-        assert!(!error.to_string().contains(secret), "{error}");
-        assert!(held(&store, setup.me, id).unwrap().deleted);
-        let left = std::fs::read_dir(setup.data.path().join("terminals"))
-            .unwrap()
-            .count();
-        assert_eq!(left, 0, "no env file or socket is left");
+        let env = [("ANTHROPIC_AUTH_TOKEN".to_string(), secret.to_string())];
+        for (holder, argv, says) in [
+            (holder(), vec!["/no/such/program".to_string()], "/no/such/program"),
+            (
+                PathBuf::from("/no/such/foundry-holder"),
+                argv("true"),
+                "/no/such/foundry-holder",
+            ),
+        ] {
+            let (terminals, store) = setup.daemon_with(holder);
+            let error = terminals
+                .start(WorkspaceId::random(), setup.cwd.path(), &argv, &env)
+                .await
+                .unwrap_err();
+            let TerminalError::Start { id, ref reason } = error else {
+                panic!("expected a start error, got {error:?}");
+            };
+            assert!(reason.contains(says), "{reason}");
+            assert!(!error.to_string().contains(secret), "{error}");
+            assert!(held(&store, setup.me, id).unwrap().deleted);
+            assert!(setup.left().is_empty(), "left behind: {:?}", setup.left());
+        }
+    }
+
+    /// An env file a daemon that stopped part way through `start` left behind may hold
+    /// secrets. The next daemon removes it before it starts anything.
+    #[tokio::test]
+    async fn reattach_all_removes_env_files_left_behind() {
+        let setup = Setup::new();
+        std::fs::create_dir_all(setup.dir()).unwrap();
+        let left = setup.dir().join(format!("{}.env", TerminalId::random()));
+        std::fs::write(&left, br#"{"ANTHROPIC_AUTH_TOKEN":"sk-left"}"#).unwrap();
+        let (terminals, _) = setup.daemon();
+        terminals.reattach_all().await.unwrap();
+        assert!(!left.exists());
     }
 }
