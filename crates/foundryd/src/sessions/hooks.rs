@@ -10,16 +10,19 @@ use axum::http::{HeaderMap, StatusCode, header::AUTHORIZATION};
 use foundry_proto::ids::SessionId;
 
 use super::state::{Event, Hook};
-use super::{Inner, RETRY_AFTER, RETRY_AT_MOST};
+use super::{Backoff, Inner, Live};
 
-/// How long a hook whose record cannot be written is tried again for, with a growing wait.
-/// Inside the 5 seconds the hook command waits, so curl still gets the answer.
+/// How long a hook whose record cannot be written is tried again for, with a growing wait. No
+/// try starts after it, so the answer usually reaches the hook command within the 5 seconds it
+/// waits; a store that is slow to answer can make it later.
 const KEEP_TRYING_FOR: Duration = Duration::from_secs(3);
 
 /// Takes one hook call. Only loopback callers, and only with the session's own token, change
 /// anything: a caller from another address, an unknown session and a wrong token all get 403,
 /// and none of them is told which it was. Warnings name the session or the peer address, never
 /// a token. A hook the store does not take is tried again for [`KEEP_TRYING_FOR`], then is 500.
+/// The hook is applied in a task of its own: a caller that stops waiting drops this request,
+/// and that must not stop a write between the record and the state kept in memory.
 pub(super) async fn hook(
     State(inner): State<Arc<Inner>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -51,21 +54,33 @@ pub(super) async fn hook(
     let Some(hook) = hook else {
         return StatusCode::BAD_REQUEST;
     };
+    tokio::spawn(async move { apply(&inner, &live, hook).await })
+        .await
+        .unwrap_or_else(|error| {
+            tracing::error!(session = %session, %error, "hook not recorded");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+/// Applies `hook` to the session, trying again for [`KEEP_TRYING_FOR`] while the store does not
+/// take it, and gives the answer for the hook command.
+async fn apply(inner: &Inner, live: &Arc<Live>, hook: Hook) -> StatusCode {
     let give_up_at = tokio::time::Instant::now() + KEEP_TRYING_FOR;
-    let mut backoff = RETRY_AFTER;
+    let mut backoff = Backoff::new();
     loop {
-        match inner.event(&live, Event::Hook(hook)).await {
+        let error = match inner.event(live, Event::Hook(hook)).await {
             Ok(_) => return StatusCode::NO_CONTENT,
-            Err(error) if tokio::time::Instant::now() + backoff < give_up_at => {
-                tracing::warn!(session = %session, %error, "hook not recorded; trying again");
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(RETRY_AT_MOST);
-            }
-            Err(error) => {
-                tracing::error!(session = %session, %error, "hook not recorded");
-                return StatusCode::INTERNAL_SERVER_ERROR;
-            }
+            Err(error) => error,
+        };
+        let wait = backoff.next_wait();
+        if tokio::time::Instant::now() + wait >= give_up_at {
+            tracing::error!(session = %live.id, %error, "hook not recorded");
+            return StatusCode::INTERNAL_SERVER_ERROR;
         }
+        if backoff.first_failure() {
+            tracing::warn!(session = %live.id, %error, "hook not recorded; trying again");
+        }
+        tokio::time::sleep(wait).await;
     }
 }
 

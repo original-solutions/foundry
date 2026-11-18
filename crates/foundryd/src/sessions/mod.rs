@@ -42,11 +42,46 @@ mod tests;
 pub const STUCK_AFTER: Duration = Duration::from_secs(10 * 60);
 
 /// How long to wait before trying again after a failure: the output follower attaching again,
-/// the exit being read, the exit or a stall being recorded. Each wait is twice the one before,
-/// up to [`RETRY_AT_MOST`].
+/// the exit being read, the exit, a stall or a hook being recorded. Each wait is twice the one
+/// before, up to [`RETRY_AT_MOST`].
 const RETRY_AFTER: Duration = Duration::from_millis(100);
 /// The longest wait between two tries.
 const RETRY_AT_MOST: Duration = Duration::from_secs(10);
+
+/// The waits of one retry loop: [`RETRY_AFTER`], then each twice the one before, up to
+/// [`RETRY_AT_MOST`]. It also tells the loop which failure is its first, so each loop warns
+/// once.
+struct Backoff {
+    wait: Duration,
+    failed: bool,
+}
+
+impl Backoff {
+    fn new() -> Self {
+        Self {
+            wait: RETRY_AFTER,
+            failed: false,
+        }
+    }
+
+    /// Notes a failure, and says whether it is the loop's first.
+    fn first_failure(&mut self) -> bool {
+        !std::mem::replace(&mut self.failed, true)
+    }
+
+    /// The wait before the next try. The one after is twice as long, up to [`RETRY_AT_MOST`].
+    fn next_wait(&mut self) -> Duration {
+        let wait = self.wait;
+        self.wait = (wait * 2).min(RETRY_AT_MOST);
+        wait
+    }
+
+    /// Starts again as a new loop: the waits from [`RETRY_AFTER`], and the next failure is a
+    /// first.
+    fn reset(&mut self) {
+        *self = Self::new();
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
@@ -115,6 +150,9 @@ struct Inner {
     /// Tests: how many of the next writes fail, as a busy store would.
     #[cfg(test)]
     fail_writes: std::sync::atomic::AtomicUsize,
+    /// Tests: how many of the next reads of a terminal's exit fail.
+    #[cfg(test)]
+    fail_exit_reads: std::sync::atomic::AtomicUsize,
 }
 
 /// A session this daemon started.
@@ -154,6 +192,8 @@ impl Sessions {
                 live: Mutex::default(),
                 #[cfg(test)]
                 fail_writes: std::sync::atomic::AtomicUsize::new(0),
+                #[cfg(test)]
+                fail_exit_reads: std::sync::atomic::AtomicUsize::new(0),
             }),
         }
     }
@@ -369,19 +409,8 @@ impl Inner {
     /// busy store never stalls an async worker.
     async fn write(&self, body: Session) -> Result<(), SessionError> {
         #[cfg(test)]
-        {
-            use std::sync::atomic::Ordering::SeqCst;
-            if self
-                .fail_writes
-                .try_update(SeqCst, SeqCst, |n| n.checked_sub(1))
-                .is_ok()
-            {
-                return Err(StoreError::Sqlite(rusqlite::Error::SqliteFailure(
-                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
-                    None,
-                ))
-                .into());
-            }
+        if take_one(&self.fail_writes) {
+            return Err(busy().into());
         }
         let me = self.me;
         self.on_store(move |store| {
@@ -424,6 +453,10 @@ impl Inner {
         terminal: TerminalId,
         cursor: &mut u64,
     ) -> Result<Option<Option<i32>>, SessionError> {
+        #[cfg(test)]
+        if take_one(&self.fail_exit_reads) {
+            return Err(busy().into());
+        }
         let (me, from) = (self.me, *cursor);
         let (newest, exit) = self
             .on_store(move |store| {
@@ -449,12 +482,12 @@ impl Inner {
 /// Follows the session's terminal: each chunk of output is an [`Event::Output`], and the end of
 /// the child is an [`Event::Exited`].
 async fn follow(inner: Arc<Inner>, live: Arc<Live>, terminal: TerminalId, mut cursor: u64) {
-    let mut backoff = RETRY_AFTER;
+    let mut backoff = Backoff::new();
     loop {
         match inner.terminals.attach(terminal).await {
             // What the terminal already held is not new output.
             Ok((_, mut output)) => {
-                backoff = RETRY_AFTER;
+                backoff.reset();
                 loop {
                     match output.next().await {
                         Some(Ok(bytes)) => {
@@ -481,45 +514,49 @@ async fn follow(inner: Arc<Inner>, live: Arc<Live>, terminal: TerminalId, mut cu
     }
 }
 
-/// Waits `backoff` before attaching again to a terminal that dropped the follower.
-async fn retry(backoff: &mut Duration, terminal: TerminalId, error: TerminalError) {
+/// Waits before attaching again to a terminal that dropped the follower.
+async fn retry(backoff: &mut Backoff, terminal: TerminalId, error: TerminalError) {
     match error {
         // The holder cut this client off. Attaching again is the answer.
-        TerminalError::Detached(_) => *backoff = RETRY_AFTER,
+        TerminalError::Detached(_) => backoff.reset(),
         other => {
-            tracing::warn!(terminal = %terminal, error = %other, "session output not followed; trying again");
+            if backoff.first_failure() {
+                tracing::warn!(terminal = %terminal, error = %other, "session output not followed; trying again");
+            }
         }
     }
-    tokio::time::sleep(*backoff).await;
-    *backoff = (*backoff * 2).min(RETRY_AT_MOST);
+    tokio::time::sleep(backoff.next_wait()).await;
 }
 
 /// Waits for the terminal's exit to be recorded, then reports it.
 async fn exited(inner: &Inner, live: &Arc<Live>, terminal: TerminalId, cursor: &mut u64) {
+    // Until the exit is recorded, the store is asked again every `RETRY_AFTER`. A read that
+    // fails waits longer each time.
+    let mut backoff = Backoff::new();
     let code = loop {
-        match inner.exit_of(terminal, cursor).await {
+        let wait = match inner.exit_of(terminal, cursor).await {
             Ok(Some(code)) => break code,
-            Ok(None) => {}
+            Ok(None) => RETRY_AFTER,
             Err(error) => {
-                tracing::warn!(terminal = %terminal, %error, "terminal exit not read; trying again");
+                if backoff.first_failure() {
+                    tracing::warn!(terminal = %terminal, %error, "terminal exit not read; trying again");
+                }
+                backoff.next_wait()
             }
-        }
-        tokio::time::sleep(RETRY_AFTER).await;
+        };
+        tokio::time::sleep(wait).await;
     };
     // The end is not given up on: a session left running after its child is gone is wrong for
     // good. It stops once the session is no longer live.
-    let mut backoff = RETRY_AFTER;
-    let mut warned = false;
+    let mut backoff = Backoff::new();
     while let Err(error) = inner.event(live, Event::Exited(code)).await {
         if !inner.is_live(live) {
             return;
         }
-        if !warned {
-            warned = true;
+        if backoff.first_failure() {
             tracing::warn!(session = %live.id, %error, "session exit not recorded; trying again");
         }
-        tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(RETRY_AT_MOST);
+        tokio::time::sleep(backoff.next_wait()).await;
     }
 }
 
@@ -543,20 +580,18 @@ async fn watch_for_stuck(inner: Arc<Inner>, live: Arc<Live>) {
             () = tokio::time::sleep_until(last + STUCK_AFTER) => {
                 // Does nothing unless the session is working. A write that fails is tried
                 // again until it holds or something arrives, which moves the count on.
-                let (mut warned, mut moved, mut backoff) = (false, false, RETRY_AFTER);
+                let (mut moved, mut backoff) = (false, Backoff::new());
                 while let Err(error) = inner.event(&live, Event::Stalled).await {
-                    if !warned {
-                        warned = true;
+                    if backoff.first_failure() {
                         tracing::warn!(session = %live.id, %error, "session stall not recorded; trying again");
                     }
                     tokio::select! {
-                        () = tokio::time::sleep(backoff) => {}
+                        () = tokio::time::sleep(backoff.next_wait()) => {}
                         _ = activity.changed() => {
                             moved = true;
                             break;
                         }
                     }
-                    backoff = (backoff * 2).min(RETRY_AT_MOST);
                 }
                 if moved {
                     continue;
@@ -572,6 +607,24 @@ async fn watch_for_stuck(inner: Arc<Inner>, live: Arc<Live>) {
             }
         }
     }
+}
+
+/// Tests: takes one from `count` when it is above zero, and says whether it did.
+#[cfg(test)]
+fn take_one(count: &std::sync::atomic::AtomicUsize) -> bool {
+    use std::sync::atomic::Ordering::SeqCst;
+    count
+        .try_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+        .is_ok()
+}
+
+/// Tests: the error a busy store gives.
+#[cfg(test)]
+fn busy() -> StoreError {
+    StoreError::Sqlite(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+        None,
+    ))
 }
 
 fn is_final(state: SessionState) -> bool {

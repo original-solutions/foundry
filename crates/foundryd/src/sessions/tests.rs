@@ -695,6 +695,70 @@ async fn a_hook_the_store_never_takes_is_500_before_the_hook_command_gives_up() 
 }
 
 #[tokio::test]
+async fn a_hook_whose_caller_stops_waiting_mid_write_still_keeps_memory_and_record_alike() {
+    let f = Fixture::new("- hook: {event: SessionStart}\n- wait_input\n").await;
+    let id = f.start().await;
+    f.until_state(id, SessionState::Idle).await;
+
+    // Hold the store, so the hook's write waits on it.
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let store = f.store.clone();
+    let holder = std::thread::spawn(move || {
+        let _held = store.lock().unwrap();
+        locked_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    });
+    locked_rx.recv().unwrap();
+
+    // curl gives up and the request is dropped while the write waits.
+    let body = r#"{"hook_event_name":"UserPromptSubmit"}"#;
+    let gave_up =
+        tokio::time::timeout(Duration::from_millis(300), loopback_hook(&f, id, body)).await;
+    assert!(
+        gave_up.is_err(),
+        "the hook was answered while the store was held"
+    );
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    f.until_state(id, SessionState::Working).await;
+
+    // The next Stop moves the state on from Working, so it is written.
+    let body = r#"{"hook_event_name":"Stop"}"#;
+    assert_eq!(loopback_hook(&f, id, body).await, StatusCode::NO_CONTENT);
+    assert_eq!(f.state(id), Some(SessionState::Idle));
+}
+
+#[tokio::test]
+async fn an_exit_that_cannot_be_read_is_tried_again_with_a_growing_wait_and_one_warning() {
+    let logs = logs();
+    let f = Fixture::new("- wait_input\n- exit: 0\n").await;
+    let id = f.start().await;
+    let terminal = f.record(id).unwrap().body.terminal;
+    f.sessions
+        .inner
+        .fail_exit_reads
+        .store(4, std::sync::atomic::Ordering::SeqCst);
+
+    let entered = Instant::now();
+    f.enter(id).await;
+
+    f.until_state(id, SessionState::Finished).await;
+    // Four failed reads wait 100, 200, 400 and 800 ms before the next try.
+    assert!(
+        entered.elapsed() >= Duration::from_millis(1500),
+        "{:?}",
+        entered.elapsed()
+    );
+    let logs = String::from_utf8_lossy(&logs.lock().unwrap()).into_owned();
+    let warnings = logs
+        .lines()
+        .filter(|l| l.contains("terminal exit not read") && l.contains(&terminal.to_string()))
+        .count();
+    assert_eq!(warnings, 1, "{logs}");
+}
+
+#[tokio::test]
 async fn the_gateway_key_is_in_the_childs_environment_and_in_no_log_line_or_file() {
     let logs = logs();
     let f = Fixture::new(
