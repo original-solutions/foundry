@@ -63,17 +63,17 @@ impl Reason {
             Over::Load {
                 load_per_core,
                 limit,
-            } => format!(
-                "load {} {} limit {}",
-                shown(load_per_core, limit),
-                at_or_over(load_per_core == limit),
-                decimal(limit)
-            ),
-            Over::Disk { free_disk, limit } => format!(
-                "free disk {} GB under limit {} GB",
-                shown(gigabytes(free_disk), gigabytes(limit)),
-                decimal(gigabytes(limit))
-            ),
+            } => {
+                let (value, shown_limit) = apart(load_per_core, limit);
+                format!(
+                    "load {value} {} limit {shown_limit}",
+                    at_or_over(load_per_core == limit)
+                )
+            }
+            Over::Disk { free_disk, limit } => {
+                let (value, shown_limit) = apart(gigabytes(free_disk), gigabytes(limit));
+                format!("free disk {value} GB under limit {shown_limit} GB")
+            }
         };
         format!("{machine_name}: {what}")
     }
@@ -88,20 +88,19 @@ fn gigabytes(bytes: u64) -> f64 {
     bytes as f64 / 1e9
 }
 
-/// `value` as [`decimal`] shows it, with more decimals when that would print it equal to a
-/// `limit` it differs from, so a reason never reads `load 1.0 over limit 1.0`.
-fn shown(value: f64, limit: f64) -> String {
-    let text = decimal(value);
-    if value != limit && text == decimal(limit) {
-        trimmed(format!("{value:.4}"))
-    } else {
-        text
+/// `value` and `limit` at the fewest decimals, two at least, that print them apart, so a
+/// reason never reads `load 1.0 over limit 1.0` or shows a value across the limit it is on
+/// the other side of. Trailing zeros are dropped down to one decimal: `1.8`, `1.0`, `2.25`.
+fn apart(value: f64, limit: f64) -> (String, String) {
+    // Byte counts in GB differ by 1e-9 at least, and 17 decimals reach past what an f64 load holds.
+    for places in 2..=17 {
+        let shown = (format!("{value:.places$}"), format!("{limit:.places$}"));
+        if shown.0 != shown.1 {
+            return (trimmed(shown.0), trimmed(shown.1));
+        }
     }
-}
-
-/// At most two decimals and at least one: `1.8`, `1.0`, `2.25`.
-fn decimal(value: f64) -> String {
-    trimmed(format!("{value:.2}"))
+    let equal = trimmed(format!("{value:.2}"));
+    (equal.clone(), equal)
 }
 
 /// `text`, a number with decimals, without trailing zeros but with at least one decimal.
