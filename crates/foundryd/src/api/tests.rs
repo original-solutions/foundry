@@ -92,6 +92,16 @@ struct Daemon {
 impl Daemon {
     /// A daemon whose sessions act out the fake agent `script`.
     async fn new(script: &str) -> Self {
+        Self::start(script, built("foundry-holder"), &[]).await
+    }
+
+    /// A daemon that answers to the DNS names `names` besides `localhost`.
+    async fn named(names: &[&str]) -> Self {
+        Self::start(TURN, built("foundry-holder"), names).await
+    }
+
+    /// A daemon whose terminals start the holder at `holder`.
+    async fn start(script: &str, holder: PathBuf, names: &[&str]) -> Self {
         // A Unix socket path is at most about 100 bytes, which the system's own temporary
         // folder on macOS would take most of.
         let data = tempfile::Builder::new()
@@ -104,12 +114,7 @@ impl Daemon {
         let store = Arc::new(Mutex::new(
             Store::open(data.path().join("foundry.db")).unwrap(),
         ));
-        let terminals = Arc::new(Terminals::new(
-            me,
-            store.clone(),
-            data.path(),
-            built("foundry-holder"),
-        ));
+        let terminals = Arc::new(Terminals::new(me, store.clone(), data.path(), holder));
         let workspaces = Arc::new(Workspaces::new(
             me,
             store.clone(),
@@ -141,13 +146,14 @@ impl Daemon {
         ));
         let hook_router = sessions.router();
         let peers = Peers::new(me, store.clone(), Arc::new(NoDial));
-        let api = Api {
-            store: store.clone(),
+        let api = Api::new(
+            store.clone(),
             peers,
-            terminals: terminals.clone(),
+            terminals.clone(),
             workspaces,
             sessions,
-        };
+            names.iter().map(|n| (*n).to_owned()).collect(),
+        );
         let listener = bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let servers = vec![
@@ -465,7 +471,11 @@ async fn binding_to_loopback_serves() {
 // --- callers ---
 
 #[test]
-fn a_host_is_trusted_only_when_it_names_this_machine_on_loopback_or_tailscale() {
+fn a_host_is_trusted_only_when_it_names_this_machine() {
+    let names = vec![
+        "trilogy-mac".to_owned(),
+        "trilogy-mac.tail1234.ts.net".to_owned(),
+    ];
     for host in [
         "127.0.0.1:7433",
         "[::1]:7433",
@@ -474,21 +484,62 @@ fn a_host_is_trusted_only_when_it_names_this_machine_on_loopback_or_tailscale() 
         "100.100.1.2:7433",
         "[fd7a:115c:a1e0::5]:7433",
         "trilogy-mac:7433",
+        "TRILOGY-MAC.:7433",
         "trilogy-mac.tail1234.ts.net:7433",
         "trilogy-mac.tail1234.ts.net.",
     ] {
-        assert!(trusted_host(host), "{host} is refused");
+        assert!(trusted_host(host, &names), "{host} is refused");
     }
     for host in [
         "evil.example:7433",
         "evil.example",
+        "foo:7433",
+        "vps.tail1234.ts.net",
+        "other.tail1234.ts.net:7433",
         "8.8.8.8:7433",
         "[2001:db8::1]:7433",
         "ts.net.evil.example",
         "",
     ] {
-        assert!(!trusted_host(host), "{host} is trusted");
+        assert!(!trusted_host(host, &names), "{host} is trusted");
     }
+    assert!(trusted_host("localhost", &[]));
+    assert!(!trusted_host("trilogy-mac", &[]), "no names are listed");
+}
+
+#[tokio::test]
+async fn only_a_name_the_machine_lists_is_trusted_in_a_host() {
+    let alone = Daemon::new(TURN).await;
+    let named = Daemon::named(&["foo", "vps.tail1234.ts.net"]).await;
+    for host in ["foo:7433", "vps.tail1234.ts.net"] {
+        let origin = format!("http://{host}");
+        let reply = alone
+            .raw(
+                "GET",
+                "/api/state",
+                &[("Host", host), ("Origin", &origin)],
+                None,
+            )
+            .await;
+        assert_eq!(reply.status, 403, "{host}: {}", reply.body);
+        let reply = named
+            .raw(
+                "GET",
+                "/api/state",
+                &[("Host", host), ("Origin", &origin)],
+                None,
+            )
+            .await;
+        assert_eq!(reply.status, 200, "{host}: {}", reply.body);
+    }
+    let reply = named
+        .raw("GET", "/api/state", &[("Host", "FOO.:7433")], None)
+        .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    let reply = named
+        .raw("GET", "/api/state", &[("Host", "bar:7433")], None)
+        .await;
+    assert_eq!(reply.status, 403, "{}", reply.body);
 }
 
 #[tokio::test]
