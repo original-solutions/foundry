@@ -1,5 +1,6 @@
 //! The `foundry-holder` binary, driven over its socket the way `foundryd` drives it.
 
+use std::fs::File;
 use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::process::CommandExt as _;
@@ -13,6 +14,8 @@ use bytes::Bytes;
 use foundry_holder::protocol::{self, ChildStatus, Reply, Request};
 use foundry_holder::pty;
 use foundry_holder::scrollback::MAX_BYTES;
+use nix::errno::Errno;
+use nix::fcntl::{Flock, FlockArg};
 use tempfile::TempDir;
 use tokio::net::UnixStream;
 use tokio::time::timeout;
@@ -221,6 +224,17 @@ async fn writes_fail(stream: &mut UnixStream) -> bool {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     false
+}
+
+/// The lock file a holder serving `socket` keeps while it runs.
+fn lock_file(socket: &Path) -> PathBuf {
+    socket.with_extension("lock")
+}
+
+/// Takes the lock on `path` without waiting, as `foundryd` checks it.
+fn try_lock(path: &Path) -> Result<Flock<File>, Errno> {
+    let file = File::open(path).unwrap();
+    Flock::lock(file, FlockArg::LockExclusiveNonblock).map_err(|(_, e)| e)
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -609,6 +623,71 @@ async fn close_ends_the_child_and_removes_the_socket() {
         assert!(Instant::now() < deadline, "the terminal did not close");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+#[tokio::test]
+async fn a_running_holder_holds_its_lock_file_until_it_closes() {
+    let holder = Holder::start(&["sh", "-c", "sleep 60"], &[]);
+    let lock = lock_file(&holder.socket);
+    let mode = std::fs::metadata(&lock).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600, "lock file mode {mode:o}");
+    assert_eq!(try_lock(&lock).err(), Some(Errno::EWOULDBLOCK));
+
+    holder.send(Request::Close).await;
+    let deadline = Instant::now() + WAIT;
+    while holder.socket.exists() || lock.exists() {
+        assert!(Instant::now() < deadline, "the lock file was not removed");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[test]
+fn a_holder_whose_lock_is_held_fails_to_start_and_names_the_lock_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("h.sock");
+    let lock = lock_file(&socket);
+    std::fs::write(&lock, b"").unwrap();
+    let _held = try_lock(&lock).unwrap();
+    let output = run_starter(holder_command(&dir, &socket, &["sh", "-c", "sleep 60"], &[]));
+    // Closes a holder that started after all.
+    let holder = Holder { dir, socket };
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains(&lock.display().to_string()), "{stderr}");
+    assert!(!holder.socket.exists());
+    assert!(lock.exists(), "the lock file of the holder that has it is left alone");
+}
+
+/// The lock goes with the holder however it dies, and the child, which outlives it here, never
+/// has it.
+#[tokio::test]
+async fn a_killed_holder_lets_go_of_its_lock_even_while_its_child_runs() {
+    let holder = Holder::start(
+        &["sh", "-c", "trap '' HUP; echo pid-$$; exec sleep 60"],
+        &[],
+    );
+    let mut client = holder.attach().await;
+    client.read_until(b"\n").await;
+    let text = String::from_utf8_lossy(&client.seen).to_string();
+    let child = text
+        .split("pid-")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|n| n.parse().ok())
+        .map(nix::unistd::Pid::from_raw)
+        .unwrap_or_else(|| panic!("no pid in {text:?}"));
+    let lock = lock_file(&holder.socket);
+
+    let pid = nix::unistd::Pid::from_raw(holder_pid(&holder.socket));
+    nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL).unwrap();
+    let deadline = Instant::now() + WAIT;
+    while try_lock(&lock).is_err() {
+        assert!(Instant::now() < deadline, "the lock outlived the holder");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let child_ran = nix::sys::signal::kill(child, None).is_ok();
+    let _ = nix::sys::signal::kill(child, nix::sys::signal::Signal::SIGKILL);
+    assert!(child_ran, "the child was still running when the lock was free");
 }
 
 #[tokio::test]
