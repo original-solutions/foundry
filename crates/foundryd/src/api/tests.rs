@@ -910,6 +910,53 @@ async fn archive_with_uncommitted_work_is_refused_listing_it() {
 }
 
 #[tokio::test]
+async fn a_start_racing_an_archive_leaves_no_live_terminal_in_the_archived_workspace() {
+    let daemon = Daemon::new(TURN).await;
+    let project = daemon.project();
+    for round in 0..10 {
+        let workspace = daemon
+            .create_workspace(project, &format!("race {round}"))
+            .await;
+        let shells = format!("/api/workspaces/{workspace}/shells");
+        let sessions = format!("/api/workspaces/{workspace}/sessions");
+        let archive = format!("/api/workspaces/{workspace}/archive");
+        let model = Some(serde_json::json!({"model": MODEL}));
+        let (a, b, c, archived) = tokio::join!(
+            daemon.call("POST", &shells, None),
+            daemon.call("POST", &shells, None),
+            daemon.call("POST", &sessions, model),
+            daemon.call("POST", &archive, Some(serde_json::json!({"force": true}))),
+        );
+        assert_eq!(archived.status, 204, "round {round}: {}", archived.body);
+        for reply in [a, b, c] {
+            assert!(
+                [201, 404].contains(&reply.status),
+                "round {round}: {}",
+                reply.body
+            );
+        }
+        let live: Vec<_> = daemon
+            .records()
+            .into_iter()
+            .filter_map(|r| match r {
+                AnyRecord::Terminal(t)
+                    if t.body.workspace == workspace
+                        && !t.deleted
+                        && t.body.state != TerminalState::Exited =>
+                {
+                    Some(t.body.id)
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            live.is_empty(),
+            "round {round}: terminals {live:?} are live in an archived workspace"
+        );
+    }
+}
+
+#[tokio::test]
 async fn an_action_on_what_is_not_here_is_not_found() {
     let daemon = Daemon::new(TURN).await;
     let workspace = WorkspaceId::random();
