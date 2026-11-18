@@ -148,18 +148,24 @@ impl Terminals {
         tokio::spawn(async move { inner.start(workspace, &cwd, &argv, &env).await }).await?
     }
 
-    /// The terminal's kept screen and scrollback, then its live bytes.
+    /// The terminal's kept screen and scrollback, then its live bytes. A holder that does not
+    /// send the snapshot within [`ANSWER_WITHIN`] fails the attach.
     pub async fn attach(&self, id: TerminalId) -> Result<(Snapshot, Output), TerminalError> {
         let entry = self.inner.entry(id)?;
         let mut stream = entry.connect().await?;
-        protocol::write_request(&mut stream, &Request::Attach)
-            .await
-            .map_err(|e| TerminalError::holder(id, e))?;
-        let snapshot = match protocol::read_reply(&mut stream).await {
-            Ok(Some(Reply::Snapshot { start, bytes })) => Snapshot { start, bytes },
-            Ok(Some(Reply::Refused(reason))) => return Err(TerminalError::Refused { id, reason }),
-            Ok(_) => return Err(TerminalError::Detached(id)),
-            Err(e) => return Err(TerminalError::holder(id, e)),
+        let answered = tokio::time::timeout(ANSWER_WITHIN, async {
+            protocol::write_request(&mut stream, &Request::Attach).await?;
+            protocol::read_reply(&mut stream).await
+        })
+        .await;
+        let snapshot = match answered {
+            Ok(Ok(Some(Reply::Snapshot { start, bytes }))) => Snapshot { start, bytes },
+            Ok(Ok(Some(Reply::Refused(reason)))) => {
+                return Err(TerminalError::Refused { id, reason });
+            }
+            Ok(Ok(_)) => return Err(TerminalError::Detached(id)),
+            Ok(Err(e)) => return Err(TerminalError::holder(id, e)),
+            Err(_) => return Err(TerminalError::holder(id, no_answer())),
         };
         let output = futures::stream::unfold(Some(stream), move |stream| async move {
             let mut stream = stream?;
@@ -1120,8 +1126,165 @@ mod tests {
         let record = held(&store, setup.me, id).unwrap();
         assert_eq!(record.body.exit_code, None);
         assert!(!record.deleted);
+        assert!(
+            matches!(terminals.attach(id).await, Err(TerminalError::Gone(gone)) if gone == id),
+            "attaching to a terminal whose holder is gone says so"
+        );
         terminals.close(id).await.unwrap();
         assert!(held(&store, setup.me, id).unwrap().deleted);
+    }
+
+    /// A holder that refuses an attach, or refuses part way through the stream, gives the
+    /// client its refusal, not an end that reads as an exit or a cut-off to attach again after.
+    #[tokio::test]
+    async fn a_holder_that_refuses_an_attach_gives_the_refusal() {
+        let setup = Setup::new();
+        let (terminals, _) = setup.daemon();
+        let id = TerminalId::random();
+        // Live with no watcher, so every connection to the stand-in is one of these attaches.
+        terminals.inner.insert(
+            Terminal {
+                id,
+                workspace: WorkspaceId::random(),
+                state: TerminalState::Running,
+                exit_code: None,
+            },
+            setup.socket(id),
+        );
+        let holder = stand_in(
+            setup.socket(id),
+            vec![
+                (
+                    vec![Reply::Refused("version 9 is not supported".into())],
+                    true,
+                ),
+                (
+                    vec![
+                        Reply::Snapshot {
+                            start: 0,
+                            bytes: Bytes::from_static(b"kept"),
+                        },
+                        Reply::Output(Bytes::from_static(b"live")),
+                        Reply::Refused("input too large".into()),
+                    ],
+                    true,
+                ),
+            ],
+        );
+
+        let refused = terminals.attach(id).await.err();
+        assert!(
+            matches!(
+                &refused,
+                Some(TerminalError::Refused { id: r, reason }) if *r == id && reason == "version 9 is not supported"
+            ),
+            "{refused:?}"
+        );
+
+        let (snapshot, stream) = terminals.attach(id).await.unwrap();
+        assert_eq!(&snapshot.bytes[..], b"kept");
+        let items: Vec<_> = tokio::time::timeout(WAIT, stream.collect())
+            .await
+            .expect("the stream ends after the refusal");
+        let [Ok(live), Err(TerminalError::Refused { id: r, reason })] = items.as_slice() else {
+            panic!("expected the live bytes then the refusal, got {items:?}");
+        };
+        assert_eq!(&live[..], b"live");
+        assert_eq!((*r, reason.as_str()), (id, "input too large"));
+        holder.abort();
+    }
+
+    /// A holder that reports it could not learn the child's exit code (`UNKNOWN_EXIT`) leaves
+    /// the record with no exit code, not a made-up one.
+    #[tokio::test]
+    async fn an_exit_whose_code_the_holder_does_not_know_is_recorded_with_none() {
+        let setup = Setup::new();
+        let (terminals, store) = setup.daemon();
+        let id = put_running(&store, setup.me);
+        let holder = stand_in(
+            setup.socket(id),
+            vec![(
+                vec![
+                    Reply::Snapshot {
+                        start: 0,
+                        bytes: Bytes::new(),
+                    },
+                    Reply::Status(ChildStatus::Exited(UNKNOWN_EXIT)),
+                ],
+                false,
+            )],
+        );
+        terminals.reattach_all().await.unwrap();
+        until("the record to say exited", || {
+            held(&store, setup.me, id).unwrap().body.state == TerminalState::Exited
+        })
+        .await;
+        assert_eq!(held(&store, setup.me, id).unwrap().body.exit_code, None);
+        holder.abort();
+    }
+
+    /// A store that fails part way through `reattach_all` stops it with that error. Run again
+    /// once the store takes writes, it finishes the rest, leaves alone what it already made
+    /// live, and a further run writes nothing new.
+    #[tokio::test]
+    async fn reattach_all_stopped_by_the_store_finishes_when_run_again() {
+        let setup = Setup::new();
+        let (first, store) = setup.daemon();
+        let live = setup.start(&first, "sleep 60").await;
+        drop(first);
+        // Running records with no holder, written after the live one, so they come after it.
+        let gone = [put_running(&store, setup.me), put_running(&store, setup.me)];
+        let running = held(&store, setup.me, live).unwrap();
+
+        let (terminals, store) = setup.daemon();
+        set_mode(setup.data.path(), 0o500);
+        let error = terminals.reattach_all().await.unwrap_err();
+        assert!(matches!(error, TerminalError::Store(_)), "{error:?}");
+        let watched = terminals
+            .inner
+            .entry(live)
+            .expect("the terminal before the failure is live");
+        // A run again skips a terminal already live, so it keeps one entry and one watcher.
+        let kept = |id, entry: &Arc<Entry>| {
+            let now = terminals.inner.entry(id).unwrap();
+            assert!(Arc::ptr_eq(&now, entry), "{id} was made live again");
+        };
+        for id in gone {
+            assert!(terminals.inner.entry(id).is_err(), "{id} was made live");
+            assert_eq!(
+                held(&store, setup.me, id).unwrap().body.state,
+                TerminalState::Running,
+                "{id}"
+            );
+        }
+
+        set_mode(setup.data.path(), 0o700);
+        terminals.reattach_all().await.unwrap();
+        let exited = gone.map(|id| {
+            let record = held(&store, setup.me, id).unwrap();
+            assert_eq!(record.body.state, TerminalState::Exited, "{id}");
+            assert_eq!(record.body.exit_code, None, "{id}");
+            assert!(!record.deleted, "{id}");
+            record
+        });
+        assert_eq!(held(&store, setup.me, live).unwrap(), running);
+        kept(live, &watched);
+        let ended = gone.map(|id| terminals.inner.entry(id).unwrap());
+
+        terminals.reattach_all().await.unwrap();
+        for (id, record) in gone.into_iter().zip(exited) {
+            assert_eq!(held(&store, setup.me, id).unwrap(), record, "{id}");
+        }
+        assert_eq!(held(&store, setup.me, live).unwrap(), running);
+        kept(live, &watched);
+        for (id, entry) in gone.into_iter().zip(&ended) {
+            kept(id, entry);
+        }
+
+        for id in [live, gone[0], gone[1]] {
+            terminals.close(id).await.unwrap();
+            assert!(held(&store, setup.me, id).unwrap().deleted, "{id}");
+        }
     }
 
     #[tokio::test]
@@ -1398,14 +1561,25 @@ mod tests {
     }
 
     /// A holder that takes a request and never answers fails it in bounded time, rather than
-    /// holding the terminal's control connection for ever.
+    /// holding the caller or the terminal's control connection for ever.
     #[tokio::test(start_paused = true)]
-    async fn a_holder_that_does_not_answer_fails_input_and_close_in_time() {
+    async fn a_holder_that_does_not_answer_fails_attach_input_and_close_in_time() {
         let setup = Setup::new();
         let (terminals, store) = setup.daemon();
         let id = put_running(&store, setup.me);
         let holder = stand_in(setup.socket(id), vec![]);
         terminals.reattach_all().await.unwrap();
+        let attached = tokio::time::timeout(WAIT, terminals.attach(id))
+            .await
+            .expect("attach gives up before the test does");
+        let Err(TerminalError::Holder {
+            source: protocol::Error::Io(e),
+            ..
+        }) = attached
+        else {
+            panic!("expected attach to time out, got {:?}", attached.err());
+        };
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut);
         for result in [
             terminals.input(id, Bytes::from_static(b"x")).await,
             terminals.close(id).await,
