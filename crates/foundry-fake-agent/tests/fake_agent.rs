@@ -15,7 +15,8 @@ impl Scratch {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("fake-agent-{name}-{}-{nanos}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("fake-agent-{name}-{}-{nanos}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         Scratch(dir)
     }
@@ -150,7 +151,10 @@ fn print_env_prints_a_set_variable_and_says_an_unset_one_is_unset() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("FAKE_AGENT_SET=value-1"), "{stdout}");
-    assert!(stdout.contains("FAKE_AGENT_UNSET_VARIABLE unset"), "{stdout}");
+    assert!(
+        stdout.contains("FAKE_AGENT_UNSET_VARIABLE unset"),
+        "{stdout}"
+    );
     assert!(stdout.contains("ARG=--model"), "{stdout}");
     assert!(stdout.contains("ARG=fake-model"), "{stdout}");
 }
