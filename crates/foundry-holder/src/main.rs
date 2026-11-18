@@ -164,8 +164,10 @@ fn hold(args: Args, env: Vec<(String, String)>, mut ready: PipeWriter) -> i32 {
     }
 }
 
-/// Serves the socket once the starter has heard it is ready, and returns the holder's exit code.
-/// The only way into `server::run`, so a holder whose starter is gone never serves.
+/// Serves the socket once the ready message is written to the starter, and returns the holder's
+/// exit code. The only way into `server::run`, so a holder whose starter has exited never serves.
+/// A write that succeeds shows only that the starter had not exited yet: one killed after the
+/// write and before it reads leaves this holder serving.
 fn serve(
     ready: PipeWriter,
     listener: UnixListener,
@@ -320,7 +322,11 @@ mod tests {
             {
                 return Pid::from_raw(pid);
             }
-            assert!(Instant::now() < deadline, "{} never written", path.display());
+            assert!(
+                Instant::now() < deadline,
+                "{} never written",
+                path.display()
+            );
             std::thread::sleep(Duration::from_millis(20));
         }
     }
@@ -371,14 +377,17 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut args = args(dir.path());
         let background = dir.path().join("background");
-        // The job starts before the trap, so SIGHUP ends it; the shell ignores SIGHUP. The shell
-        // never exits, so the hangup a session leader's exit sends cannot end the job either: only
-        // a signal to the whole group can. The pid is written after the trap is set.
+        // The job starts before the trap, so SIGHUP ends it; the shell ignores SIGHUP and exits 0
+        // once the job ends. A signal to the shell alone leaves the job running or kills the
+        // shell, and only a killed shell, as session leader, makes the kernel hang up the job. So
+        // the job gone and the shell exiting 0 show the hangup went to the whole group. The pid is
+        // written after the trap is set. Stderr goes nowhere: a shell that reports a killed job on
+        // the terminal cannot exit until someone reads it, and nobody here does.
         args.argv = vec![
             "sh".into(),
             "-c".into(),
             format!(
-                "sleep 30 & trap '' HUP; echo $! > '{}'; wait",
+                "exec 2>/dev/null; sleep 30 & trap '' HUP; echo $! > '{}'; wait",
                 background.display()
             )
             .into(),
@@ -396,10 +405,21 @@ mod tests {
         if !hung_up {
             let _ = nix::sys::signal::kill(job, Signal::SIGKILL);
         }
-        let _ = child.kill();
-        let _ = child.wait();
-        assert!(!serve, "the holder serves though its starter never heard it");
+        let status = exit_within(&mut child, Duration::from_secs(5));
+        if status.is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert!(
+            !serve,
+            "the holder serves though its starter never heard it"
+        );
         assert!(hung_up, "a process in the child's group is still running");
+        assert_eq!(
+            status.and_then(|s| s.code()),
+            Some(0),
+            "the child was not left to exit once its job was hung up: {status:?}"
+        );
     }
 
     #[test]
