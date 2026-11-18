@@ -26,8 +26,8 @@
 //! A browser can still be made to call it from any page it has open, so every request must
 //! name this machine in its `Host`: a loopback or Tailscale address, `localhost`, or a DNS name
 //! in [`Api::names`] ([`trusted_host`]). No other name is trusted, so a page on a name an
-//! attacker's DNS points at this machine is refused. And a request a browser sends from another site, which it marks with an
-//! `Origin` that is not the `Host`, is refused. Without that, any web page could open a
+//! attacker's DNS points at this machine is refused. A request a browser sends from another
+//! site, which it marks with an `Origin` that is not the `Host`, is refused too. Without that, any web page could open a
 //! terminal socket and type into a shell.
 //!
 //! No response holds a secret: records and settings carry none, and the password or token in
@@ -83,6 +83,9 @@ pub struct Api {
     /// its MagicDNS short name and its `<name>.<tailnet>.ts.net` name. The daemon fills it;
     /// empty means only addresses and `localhost` are trusted in a `Host`.
     pub names: Vec<String>,
+    /// Held by an archive and by a shell or session start for their whole work, so a start
+    /// cannot land between an archive's listing of the workspace's terminals and its delete.
+    lifecycle: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Api {
@@ -101,6 +104,7 @@ impl Api {
             workspaces,
             sessions,
             names,
+            lifecycle: Arc::default(),
         }
     }
 }
@@ -585,6 +589,7 @@ async fn archive_workspace(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let id = parse_id(&id, "workspace", WorkspaceId)?;
+    let _held = api.lifecycle.lock().await;
     let archive = if body.is_empty() {
         Archive::default()
     } else {
@@ -616,6 +621,7 @@ async fn start_session(
     Body(start): Body<Start>,
 ) -> Result<Response, ApiError> {
     let id = parse_id(&id, "workspace", WorkspaceId)?;
+    let _held = api.lifecycle.lock().await;
     let worktree = api.workspaces.worktree(id).await?;
     let session = api.sessions.start(id, &worktree, &start.model).await?;
     Ok(created(session))
@@ -632,6 +638,7 @@ fn shell() -> Vec<String> {
 
 async fn start_shell(State(api): State<Api>, Path(id): Path<String>) -> Result<Response, ApiError> {
     let id = parse_id(&id, "workspace", WorkspaceId)?;
+    let _held = api.lifecycle.lock().await;
     let worktree = api.workspaces.worktree(id).await?;
     let terminal = api.terminals.start(id, &worktree, &shell(), &[]).await?;
     Ok(created(terminal))
