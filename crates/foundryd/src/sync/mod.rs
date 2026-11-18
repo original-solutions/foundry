@@ -53,6 +53,11 @@ pub const OFFLINE_AFTER: Duration = Duration::from_secs(15);
 /// keeps the machine online on the other end.
 const TICK: Duration = Duration::from_secs(1);
 
+/// How long a link that refused a peer's message stays open before it ends, so the next link's
+/// hello asks again for everything past what is stored. A record that can never be stored
+/// then costs one resend per link each time, not one a second.
+pub const RETRY_REFUSED: Duration = Duration::from_secs(60);
+
 /// How long to wait before dialing a peer again after a link ends or a dial fails, and how
 /// often the machine list is read for peers added or removed.
 const REDIAL: Duration = Duration::from_secs(1);

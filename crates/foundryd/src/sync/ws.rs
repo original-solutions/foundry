@@ -73,7 +73,9 @@ fn url(address: &str, port: u16) -> String {
     }
 }
 
-/// Carries text frames between `socket` and the returned [`Conn`] until either closes.
+/// Carries text frames between `socket` and the returned [`Conn`] until either closes. The
+/// two directions run side by side, so a frame that waits on a slow peer never stops this end
+/// reading it, and the socket is dropped as soon as the link closes, even mid-send.
 fn pump<S, M, E>(socket: S, text: fn(M) -> Option<String>, frame: fn(String) -> M) -> Conn
 where
     S: Stream<Item = Result<M, E>> + Sink<M> + Send + 'static,
@@ -83,30 +85,27 @@ where
     let (conn, Conn { send, mut recv }) = Conn::pair();
     let (mut sink, mut stream) = socket.split();
     tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                out = recv.recv() => match out {
-                    Some(out) => {
-                        if sink.send(frame(out)).await.is_err() {
-                            return;
-                        }
-                    }
-                    None => {
-                        let _ = sink.close().await;
-                        return;
-                    }
-                },
-                incoming = stream.next() => match incoming {
-                    Some(Ok(message)) => {
-                        if let Some(incoming) = text(message)
-                            && send.send(incoming).await.is_err()
-                        {
-                            return;
-                        }
-                    }
-                    _ => return,
-                },
+        let outgoing = async {
+            while let Some(out) = recv.recv().await {
+                if sink.send(frame(out)).await.is_err() {
+                    return;
+                }
             }
+            let _ = sink.close().await;
+        };
+        let incoming = async {
+            while let Some(Ok(message)) = stream.next().await {
+                if let Some(incoming) = text(message)
+                    && send.send(incoming).await.is_err()
+                {
+                    return;
+                }
+            }
+        };
+        tokio::select! {
+            () = outgoing => {}
+            () = incoming => {}
+            () = send.closed() => {}
         }
     });
     conn
@@ -114,7 +113,80 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use std::time::Duration;
+
+    use futures::channel::mpsc as socket;
+
     use super::*;
+
+    /// A socket the test drives: what the peer sends arrives on `incoming`, and what this end
+    /// sends goes to `outgoing`, which holds one frame until the test reads it.
+    struct Socket {
+        incoming: socket::UnboundedReceiver<Result<String, ()>>,
+        outgoing: socket::Sender<String>,
+    }
+
+    impl Stream for Socket {
+        type Item = Result<String, ()>;
+        fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            Pin::new(&mut self.get_mut().incoming).poll_next(cx)
+        }
+    }
+
+    impl Sink<String> for Socket {
+        type Error = socket::SendError;
+        fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Pin::new(&mut self.get_mut().outgoing).poll_ready(cx)
+        }
+        fn start_send(self: Pin<&mut Self>, item: String) -> Result<(), Self::Error> {
+            Pin::new(&mut self.get_mut().outgoing).start_send(item)
+        }
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Pin::new(&mut self.get_mut().outgoing).poll_flush(cx)
+        }
+        fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Pin::new(&mut self.get_mut().outgoing).poll_close(cx)
+        }
+    }
+
+    /// A pump over a socket whose sends never drain, with the frames this end sent kept so
+    /// they are never read.
+    fn stuck_pump() -> (
+        Conn,
+        socket::UnboundedSender<Result<String, ()>>,
+        socket::Receiver<String>,
+    ) {
+        let (peer, incoming) = socket::unbounded();
+        let (outgoing, sent) = socket::channel(0);
+        let conn = pump(Socket { incoming, outgoing }, Some, |text| text);
+        (conn, peer, sent)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_pump_reads_the_peer_while_a_send_waits() {
+        let (mut conn, peer, _sent) = stuck_pump();
+        for i in 0..3 {
+            conn.send.send(format!("out {i}")).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        peer.unbounded_send(Ok("in".into())).unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(5), conn.recv.recv()).await;
+        assert_eq!(got, Ok(Some("in".to_owned())));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_pump_drops_its_socket_once_the_link_closes_while_a_send_waits() {
+        let (conn, peer, _sent) = stuck_pump();
+        for i in 0..3 {
+            conn.send.send(format!("out {i}")).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        drop(conn);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(peer.is_closed(), "the socket is still held");
+    }
 
     #[test]
     fn a_peer_url_brackets_an_ipv6_address() {

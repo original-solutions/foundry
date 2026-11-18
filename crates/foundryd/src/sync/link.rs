@@ -17,7 +17,7 @@ use tokio::time::{Instant, timeout, timeout_at};
 
 use std::time::Duration;
 
-use super::{BATCH, Conn, Inner, OFFLINE_AFTER, TICK, on_store};
+use super::{BATCH, Conn, Inner, OFFLINE_AFTER, RETRY_REFUSED, TICK, on_store};
 use crate::store::Applied;
 
 /// How often a link repeats the warning that this machine's records cannot be read.
@@ -59,13 +59,14 @@ async fn sending(inner: &Inner, send: &Sender<String>, open: &Open) {
 /// [`OFFLINE_AFTER`]. Each message taken counts as hearing from the peer.
 ///
 /// After a message this machine cannot take (one it cannot read, or a record the store
-/// refuses), the link stays open but takes nothing more from the peer and no longer counts it
-/// as heard, so the peer shows offline and its sessions unreachable within [`OFFLINE_AFTER`].
-/// Records arrive in version order, so the store keeps a prefix and loses nothing: a build
-/// that can take the record asks for everything past it in the hello of its next link. Ending
-/// the link instead would only have the peer dial again and resend the same refused records.
+/// refuses), the link takes nothing more from the peer and no longer counts it as heard, so
+/// the peer shows offline and its sessions unreachable within [`OFFLINE_AFTER`]. Records
+/// arrive in version order, so the store keeps a prefix and loses nothing. The link stays open
+/// for [`RETRY_REFUSED`], then ends, so the next link's hello asks again for everything past
+/// that prefix: a passing store error clears then, and a record this build can never take is
+/// resent once per link rather than once a second.
 async fn reading(inner: &Inner, recv: &mut Receiver<String>, peer: MachineId) {
-    let mut refused = false;
+    let mut refused: Option<Instant> = None;
     loop {
         let text = match timeout(OFFLINE_AFTER, recv.recv()).await {
             Ok(Some(text)) => text,
@@ -75,17 +76,22 @@ async fn reading(inner: &Inner, recv: &mut Receiver<String>, peer: MachineId) {
                 return;
             }
         };
-        if refused {
+        if let Some(at) = refused {
+            if at.elapsed() >= RETRY_REFUSED {
+                tracing::info!("sync: link to {peer} closed to ask again for what it refused");
+                return;
+            }
             continue;
         }
         match receive(inner, peer, &text).await {
             Ok(()) => inner.heard_from(peer),
             Err(error) => {
                 tracing::warn!(
-                    "sync: {error}; nothing more is taken from {peer} on this link, and it \
-                     shows offline until a link takes its records"
+                    "sync: {error}; nothing more is taken from {peer} on this link, which \
+                     closes in {RETRY_REFUSED:?} to ask again, and it shows offline until a link \
+                     takes its records"
                 );
-                refused = true;
+                refused = Some(Instant::now());
             }
         }
     }

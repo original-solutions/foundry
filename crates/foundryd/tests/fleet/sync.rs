@@ -13,7 +13,7 @@ use foundry_proto::record::AnyRecord;
 use foundry_proto::settings::Machine;
 use foundry_proto::state::{SessionState, TerminalState};
 use foundryd::sync::ws::{WsDialer, router};
-use foundryd::sync::{BATCH, Conn, Dialer, OFFLINE_AFTER, Peers};
+use foundryd::sync::{BATCH, Conn, Dialer, OFFLINE_AFTER, Peers, RETRY_REFUSED};
 use futures::future::BoxFuture;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
@@ -659,6 +659,30 @@ async fn after_a_batch_it_cannot_read_a_link_takes_nothing_more_and_the_peer_sho
         None,
         "nothing past the unreadable batch is taken"
     );
+
+    // The refusing link ends a while later, so the next link's hello asks again from what is
+    // stored, and a record that can be stored now is taken.
+    assert!(
+        !keep_talking(&mut conn, RETRY_REFUSED).await,
+        "the refusing link ends"
+    );
+    let mut conn = raw_link(&a.peers);
+    send(&conn, &hello(PROTOCOL, newer)).await;
+    next(&mut conn).await.expect("a hello back");
+    send(
+        &conn,
+        &PeerMessage::Records {
+            protocol: PROTOCOL,
+            records: vec![workspace(ids.workspace, false)(newer, 1)],
+        },
+    )
+    .await;
+    assert!(keep_talking(&mut conn, Duration::from_secs(2)).await);
+    assert!(
+        a.held(is_newer).is_some(),
+        "the next link takes what can be stored"
+    );
+    assert!(a.peers.online().contains(&newer));
 }
 
 #[tokio::test(start_paused = true)]
