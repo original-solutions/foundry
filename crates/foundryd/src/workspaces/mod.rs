@@ -283,12 +283,10 @@ impl Inner {
         let id = WorkspaceId::random();
         let lock = self.lock(project);
         let _held = lock.lock().await;
-        let (clone, moved) = self.clone_for(project, &repo).await?;
-        // After a move, the old repo's branches must not choose a base or count as pushed.
-        // Otherwise a remote branch deleted since is kept, so work merged and then deleted on
-        // the remote still counts as pushed.
-        let prune = if moved { "--prune" } else { "--no-prune" };
-        self.git(&clone, "fetch", ["--quiet", prune, "origin"])
+        let clone = self.clone_for(project, &repo).await?;
+        // A remote branch deleted since the last fetch is kept, so work merged and then deleted
+        // on the remote still counts as pushed.
+        self.git(&clone, "fetch", ["--quiet", "--no-prune", "origin"])
             .await?;
         // Compared as the disk compares names: where it ignores case, `Fix` and `fix` are one
         // ref file and one folder. A folder already there is someone's, whatever its branch.
@@ -636,24 +634,31 @@ impl Inner {
 
     /// The project's bare clone, made with `origin` set to `repo` when this machine has none.
     /// It is made under another name and renamed when ready, so a clone that stopped half way
-    /// is never taken for a made one. A clone already there has `origin` set to `repo` when the
-    /// shared settings have moved the project to another repo, and then says it moved.
-    async fn clone_for(
-        &self,
-        project: ProjectId,
-        repo: &str,
-    ) -> Result<(PathBuf, bool), WorkspaceError> {
+    /// is never taken for a made one. A clone already there that the shared settings have moved
+    /// to another repo forgets the old repo's branches, so none of them chooses a base or counts
+    /// as pushed, and then has `origin` set to `repo`. The URL changes last, so a move that
+    /// stops part way is made again by the next create.
+    async fn clone_for(&self, project: ProjectId, repo: &str) -> Result<PathBuf, WorkspaceError> {
         let clone = self.clone_path(project);
         if tokio::fs::try_exists(&clone).await? {
             let origin = self
                 .git(&clone, "config", ["--get", "remote.origin.url"])
                 .await?;
-            let moved = origin.trim_end_matches('\n') != repo;
-            if moved {
+            if origin.trim_end_matches('\n') != repo {
+                let old = self
+                    .git(
+                        &clone,
+                        "for-each-ref",
+                        ["--format=%(refname)", "refs/remotes/origin/"],
+                    )
+                    .await?;
+                for reference in old.lines() {
+                    self.git(&clone, "update-ref", ["-d", reference]).await?;
+                }
                 self.git(&clone, "remote", ["set-url", "--", "origin", repo])
                     .await?;
             }
-            return Ok((clone, moved));
+            return Ok(clone);
         }
         let clones = self.data.join("clones");
         tokio::fs::create_dir_all(&clones).await?;
@@ -676,7 +681,7 @@ impl Inner {
         self.git(&partial, "remote", ["add", "--", "origin", repo])
             .await?;
         tokio::fs::rename(&partial, &clone).await?;
-        Ok((clone, false))
+        Ok(clone)
     }
 
     fn clone_path(&self, project: ProjectId) -> PathBuf {

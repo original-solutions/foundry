@@ -1385,6 +1385,26 @@ async fn a_project_whose_repo_changed_is_fetched_from_the_new_repo() {
         assert!(store.apply_settings(settings).unwrap());
     }
 
+    // The first fetch after the move fails; the old repo's branches are gone all the same.
+    let away = new.bare.with_extension("away");
+    std::fs::rename(&new.bare, &away).unwrap();
+    let err = setup
+        .workspaces
+        .create(old.project, "main", "after")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            WorkspaceError::Git {
+                command: "fetch",
+                ..
+            }
+        ),
+        "{err}"
+    );
+    std::fs::rename(&away, &new.bare).unwrap();
+
     setup.create(&old, "main", "after").await;
     assert!(setup.worktree(old.project, "after").join("NEW.md").exists());
     let clone = setup.clone_of(old.project);
