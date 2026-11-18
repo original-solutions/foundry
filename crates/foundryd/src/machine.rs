@@ -380,6 +380,11 @@ mod tests {
             texts(&sample(0, 0.2, 9_999_995_904), &limits()),
             ["trilogy-mac: free disk 9.999996 GB under limit 10.0 GB"]
         );
+        // One byte under the limit.
+        assert_eq!(
+            texts(&sample(0, 0.2, 9_999_999_999), &limits()),
+            ["trilogy-mac: free disk 9.999999999 GB under limit 10.0 GB"]
+        );
         // Both numbers are widened, so the value never reads above a limit it is under.
         let gib_limit = Limits {
             min_free_disk: 21_474_836_480,
@@ -534,6 +539,25 @@ mod tests {
         settle().await;
         let second = held_version(&store, me).expect("still a sample");
         assert!(second > first, "{second} after {first}");
+
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_writes_one_sample_not_a_burst_after_a_stall() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(
+            Store::open(dir.path().join("foundry.db")).unwrap(),
+        ));
+        let me = MachineId::random();
+        let task = tokio::spawn(run(store.clone(), me, dir.path().to_path_buf()));
+        settle().await;
+        let first = held_version(&store, me).expect("a sample at once");
+
+        // Three samples late, as after the machine sleeps. Each write takes one version.
+        tokio::time::advance(SAMPLE_EVERY * 3).await;
+        settle().await;
+        assert_eq!(held_version(&store, me), Some(first + 1));
 
         task.abort();
     }
