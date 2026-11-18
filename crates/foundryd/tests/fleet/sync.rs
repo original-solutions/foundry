@@ -542,8 +542,15 @@ async fn a_machine_with_an_unreadable_record_of_its_own_stays_online() {
     )
     .unwrap();
 
-    tokio::time::sleep(OFFLINE_AFTER * 4).await;
-    assert!(b.peers.online().contains(&a.id), "a is still heard from");
+    let start = Instant::now();
+    while start.elapsed() < OFFLINE_AFTER * 4 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            b.peers.online().contains(&a.id),
+            "a is offline on b {:?} after its row became unreadable",
+            start.elapsed()
+        );
+    }
     let state = a.peers.state().expect("the other owners still show");
     assert!(state.iter().any(|record| record.owner() == b.id));
 }
@@ -643,4 +650,72 @@ async fn a_hello_naming_this_machine_or_no_hello_at_all_is_refused() {
         None,
         "no hello within the offline limit"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_record_the_store_cannot_take_ends_the_link_and_nothing_after_it_is_taken() {
+    let peer = MachineId::random();
+    let fleet = Fleet::start_with(1, &[peer]);
+    let a = &fleet.daemons[0];
+    let (first, refused, after) = (
+        foundry_proto::ids::WorkspaceId::random(),
+        foundry_proto::ids::WorkspaceId::random(),
+        foundry_proto::ids::WorkspaceId::random(),
+    );
+
+    let mut conn = raw_link(&a.peers);
+    send(&conn, &hello(PROTOCOL, peer)).await;
+    next(&mut conn).await.expect("a hello back");
+    // The store holds versions only up to i64::MAX, so the middle record cannot be stored.
+    send(
+        &conn,
+        &PeerMessage::Records {
+            protocol: PROTOCOL,
+            records: vec![
+                workspace(first, false)(peer, 1),
+                workspace(refused, false)(peer, u64::MAX),
+                workspace(after, false)(peer, 2),
+            ],
+        },
+    )
+    .await;
+
+    let start = Instant::now();
+    while next(&mut conn).await.is_some() {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the link is still open"
+        );
+    }
+    let held =
+        |id| move |record: &AnyRecord| matches!(record, AnyRecord::Workspace(w) if w.body.id == id);
+    assert!(
+        a.held(held(first)).is_some(),
+        "the records before it are kept"
+    );
+    assert_eq!(a.held(held(after)), None, "nothing after it is taken");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_link_to_a_peer_that_stops_reading_is_closed() {
+    let deaf = MachineId::random();
+    let fleet = Fleet::start_with(1, &[deaf]);
+    let a = &fleet.daemons[0];
+
+    let conn = raw_link(&a.peers);
+    send(&conn, &hello(PROTOCOL, deaf)).await;
+    let empty = PeerMessage::Records {
+        protocol: PROTOCOL,
+        records: Vec::new(),
+    };
+    let start = Instant::now();
+    // The peer keeps talking, so it is never silent, but it never reads what a sends.
+    while !conn.send.is_closed() {
+        assert!(
+            start.elapsed() < OFFLINE_AFTER + Duration::from_secs(64 + 2),
+            "the link is still open"
+        );
+        let _ = conn.send.send(serde_json::to_string(&empty).unwrap()).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 }
