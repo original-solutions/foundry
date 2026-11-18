@@ -203,17 +203,12 @@ impl Attached {
     }
 }
 
-/// The next reply, or `None` once the holder has closed the connection, whether between frames or
-/// part way through one.
+/// The next reply, or `None` once the holder has closed the connection.
 async fn read_or_end(stream: &mut UnixStream) -> Option<Reply> {
-    match timeout(WAIT, protocol::read_reply(stream))
+    timeout(WAIT, protocol::read_reply(stream))
         .await
         .expect("the holder neither replied nor closed the connection")
-    {
-        Ok(reply) => reply,
-        Err(protocol::Error::Io(_)) => None,
-        Err(e) => panic!("{e}"),
-    }
+        .unwrap()
 }
 
 /// Writes requests until the holder's side of the connection is gone. False if it never goes.
@@ -706,6 +701,36 @@ async fn nothing_a_client_sends_after_its_refusal_reaches_the_child() {
         !contains(&observer.seen, b"MARK"),
         "input after a refusal reached the child"
     );
+}
+
+#[tokio::test]
+async fn a_client_that_hangs_up_without_reading_is_let_go() {
+    let holder = Holder::start(
+        &[
+            "sh",
+            "-c",
+            "head -c 20000000 /dev/zero | tr '\\0' a; sleep 60",
+        ],
+        &[],
+    );
+    // Wait for a full scrollback, so the snapshot is far more than the socket buffers hold.
+    let deadline = Instant::now() + WAIT;
+    while holder.attach().await.snapshot.len() < MAX_BYTES {
+        assert!(Instant::now() < deadline, "the scrollback never filled");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let mut stream = holder.connect().await;
+    protocol::write_request(&mut stream, &Request::Attach)
+        .await
+        .unwrap();
+    tokio::io::AsyncWriteExt::shutdown(&mut stream)
+        .await
+        .unwrap();
+    tokio::time::sleep(protocol::CLOSE_GRACE + Duration::from_secs(1)).await;
+    // The holder gave up on the snapshot it could not deliver, so the frame ends early.
+    assert_eq!(read_or_end(&mut stream).await, None);
+    assert_eq!(holder.status().await, ChildStatus::Running);
 }
 
 #[tokio::test]

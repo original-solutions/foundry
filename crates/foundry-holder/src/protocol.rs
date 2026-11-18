@@ -403,6 +403,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_connection_that_ends_part_way_through_a_frame_has_ended() {
+        let (mut client, mut server) = tokio::io::duplex(64);
+        let mut frame = Reply::Output(Bytes::from_static(b"cut off")).encode();
+        frame.truncate(frame.len() - 3);
+        tokio::io::AsyncWriteExt::write_all(&mut server, &frame)
+            .await
+            .unwrap();
+        drop(server);
+        assert_eq!(read_reply(&mut client).await.unwrap(), None);
+    }
+
+    #[tokio::test]
     async fn an_oversized_frame_is_refused_before_it_is_read() {
         let (mut client, mut server) = tokio::io::duplex(64);
         let len = u32::try_from(MAX_FRAME + 1).unwrap();
