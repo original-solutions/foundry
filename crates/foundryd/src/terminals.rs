@@ -1347,6 +1347,7 @@ mod tests {
             assert!(reason.contains(says), "{reason}");
             assert!(!error.to_string().contains(secret), "{error}");
             assert!(held(&store, setup.me, id).unwrap().deleted);
+            assert!(terminals.inner.entry(id).is_err(), "nothing is left live");
             assert!(setup.left().is_empty(), "left behind: {:?}", setup.left());
         }
     }
@@ -1533,7 +1534,14 @@ mod tests {
         };
         assert_eq!(reason, "no pty");
         set_mode(setup.data.path(), 0o700);
-        assert!(!held(&store, setup.me, id).unwrap().deleted);
+        // Once the store takes writes again, the record says what happened.
+        until("the record to say exited", || {
+            held(&store, setup.me, id).unwrap().body.state == TerminalState::Exited
+        })
+        .await;
+        let record = held(&store, setup.me, id).unwrap();
+        assert_eq!(record.body.exit_code, None);
+        assert!(!record.deleted);
         terminals.close(id).await.unwrap();
         assert!(held(&store, setup.me, id).unwrap().deleted);
     }
