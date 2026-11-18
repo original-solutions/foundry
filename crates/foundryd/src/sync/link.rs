@@ -11,8 +11,13 @@ use foundry_proto::messages::{PROTOCOL, PeerMessage};
 use foundry_proto::record::AnyRecord;
 use tokio::time::{Instant, sleep_until, timeout, timeout_at};
 
+use std::time::Duration;
+
 use super::{BATCH, Conn, Inner, OFFLINE_AFTER, TICK, lock};
 use crate::store::Applied;
+
+/// How often a link repeats the warning that this machine's records cannot be read.
+const WARN_EVERY: Duration = Duration::from_secs(60);
 
 /// Runs a link until it closes, the peer is silent for [`OFFLINE_AFTER`], the peer is not (or
 /// is no longer) in the machine list, or the peer sends a message this machine cannot take.
@@ -22,7 +27,7 @@ pub(super) async fn run(inner: &Inner, mut conn: Conn, dialed: Option<MachineId>
         return;
     };
     let mut sent = open.sent;
-    let mut warned = false;
+    let mut warned: Option<Instant> = None;
     let mut last_heard = Instant::now();
     let mut every = tokio::time::interval(TICK);
     loop {
@@ -57,21 +62,30 @@ pub(super) async fn run(inner: &Inner, mut conn: Conn, dialed: Option<MachineId>
 /// Sends this machine's records above `sent` in messages of at most [`BATCH`], moving `sent`
 /// past each one sent, and says whether the link is still open. With nothing new, or when the
 /// records cannot be read, it sends one empty message: the heartbeat goes out either way, so a
-/// read error never makes this machine look offline. The first read error on a link is a
-/// warning; later ones are not repeated.
+/// read error never makes this machine look offline.
+///
+/// While a record of this machine's own cannot be read (one a newer build wrote before a
+/// rollback), nothing of its own above `sent` goes to this peer: the store reads all of them
+/// or none. The peer then shows this machine online with the records it had before. The
+/// warning says so once a minute until the row is fixed; reading around such a row needs a
+/// store change and belongs with rollback (task 18).
 async fn send_own(
     inner: &Inner,
     conn: &Conn,
     open: &Open,
     sent: &mut u64,
-    warned: &mut bool,
+    warned: &mut Option<Instant>,
 ) -> bool {
     let records = match lock(&inner.store).since(inner.me, *sent) {
         Ok(records) => records,
         Err(error) => {
-            if !*warned {
-                tracing::warn!("sync: cannot read this machine's records: {error}");
-                *warned = true;
+            if warned.is_none_or(|at| at.elapsed() >= WARN_EVERY) {
+                tracing::warn!(
+                    "sync: this machine's records above version {sent} cannot be read, so {} \
+                     is not sent them: {error}",
+                    open.peer
+                );
+                *warned = Some(Instant::now());
             }
             Vec::new()
         }
