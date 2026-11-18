@@ -283,8 +283,13 @@ impl Inner {
         let id = WorkspaceId::random();
         let lock = self.lock(project);
         let _held = lock.lock().await;
-        let clone = self.clone_for(project, &repo).await?;
-        self.git(&clone, "fetch", ["--quiet", "origin"]).await?;
+        let (clone, moved) = self.clone_for(project, &repo).await?;
+        // After a move, the old repo's branches must not choose a base or count as pushed.
+        // Otherwise a remote branch deleted since is kept, so work merged and then deleted on
+        // the remote still counts as pushed.
+        let prune = if moved { "--prune" } else { "--no-prune" };
+        self.git(&clone, "fetch", ["--quiet", prune, "origin"])
+            .await?;
         // Compared as the disk compares names: where it ignores case, `Fix` and `fix` are one
         // ref file and one folder. A folder already there is someone's, whatever its branch.
         let branches = self
@@ -632,18 +637,23 @@ impl Inner {
     /// The project's bare clone, made with `origin` set to `repo` when this machine has none.
     /// It is made under another name and renamed when ready, so a clone that stopped half way
     /// is never taken for a made one. A clone already there has `origin` set to `repo` when the
-    /// shared settings have moved the project to another repo.
-    async fn clone_for(&self, project: ProjectId, repo: &str) -> Result<PathBuf, WorkspaceError> {
+    /// shared settings have moved the project to another repo, and then says it moved.
+    async fn clone_for(
+        &self,
+        project: ProjectId,
+        repo: &str,
+    ) -> Result<(PathBuf, bool), WorkspaceError> {
         let clone = self.clone_path(project);
         if tokio::fs::try_exists(&clone).await? {
             let origin = self
                 .git(&clone, "config", ["--get", "remote.origin.url"])
                 .await?;
-            if origin.trim_end_matches('\n') != repo {
+            let moved = origin.trim_end_matches('\n') != repo;
+            if moved {
                 self.git(&clone, "remote", ["set-url", "--", "origin", repo])
                     .await?;
             }
-            return Ok(clone);
+            return Ok((clone, moved));
         }
         let clones = self.data.join("clones");
         tokio::fs::create_dir_all(&clones).await?;
@@ -666,7 +676,7 @@ impl Inner {
         self.git(&partial, "remote", ["add", "--", "origin", repo])
             .await?;
         tokio::fs::rename(&partial, &clone).await?;
-        Ok(clone)
+        Ok((clone, false))
     }
 
     fn clone_path(&self, project: ProjectId) -> PathBuf {

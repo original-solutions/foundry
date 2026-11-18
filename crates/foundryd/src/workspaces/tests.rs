@@ -1362,7 +1362,15 @@ async fn a_decomposed_name_removed_by_hand_keeps_its_detached_commits() {
 async fn a_project_whose_repo_changed_is_fetched_from_the_new_repo() {
     let setup = Setup::new();
     let old = setup.project(&[("README.md", "old\n")]);
-    setup.create(&old, "main", "before").await;
+    old.push("only-old", &[("OLD.md", "old\n")]);
+    let before = setup.create(&old, "main", "before").await;
+    // A commit that only the old repo has.
+    let before_tree = setup.worktree(old.project, "before");
+    git(
+        &before_tree,
+        &["commit", "-q", "--allow-empty", "-m", "only in old"],
+    );
+    git(&before_tree, &["push", "-q", "origin", "before"]);
     let new = setup.project(&[("NEW.md", "new\n")]);
     {
         let mut store = setup.store.lock().unwrap();
@@ -1382,6 +1390,25 @@ async fn a_project_whose_repo_changed_is_fetched_from_the_new_repo() {
     let clone = setup.clone_of(old.project);
     let url = git(&clone, &["config", "--get", "remote.origin.url"]);
     assert_eq!(url.trim(), new.bare.to_str().unwrap());
+
+    // The old repo's branches no longer back a base or count as pushed.
+    let err = setup
+        .workspaces
+        .create(old.project, "only-old", "stale")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, WorkspaceError::UnknownBase(b) if b == "only-old"),
+        "{err}"
+    );
+    let err = setup.workspaces.archive(before, false).await.unwrap_err();
+    let WorkspaceError::Dirty(dirty) = err else {
+        panic!("{err}");
+    };
+    assert!(
+        dirty.unpushed.iter().any(|c| c.ends_with(" only in old")),
+        "{dirty:?}"
+    );
 }
 
 #[tokio::test]
@@ -1445,4 +1472,53 @@ async fn a_workspace_another_machine_owns_is_not_this_machines() {
         matches!(err, WorkspaceError::Unknown(w) if w == id),
         "{err}"
     );
+}
+
+#[tokio::test]
+async fn an_archive_stopped_by_a_terminal_that_will_not_close_keeps_the_workspace() {
+    use std::io::{Read as _, Write as _};
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup.create(&remote, "main", "stuck").await;
+    let worktree = setup.worktree(remote.project, "stuck");
+    let first = setup.sleeper(id, &worktree).await;
+    let second = setup.sleeper(id, &worktree).await;
+
+    // The second terminal's holder refuses to close, once.
+    let dir = setup.data.path().join("terminals");
+    let socket = dir.join(format!("{second}.sock"));
+    let real = dir.join(format!("{second}-real.sock"));
+    std::fs::rename(&socket, &real).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let stand_in = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0u8; 64];
+        let _ = stream.read(&mut request).unwrap();
+        stream
+            .write_all(&foundry_holder::protocol::Reply::Refused("busy".into()).encode())
+            .unwrap();
+    });
+
+    let err = setup.workspaces.archive(id, false).await.unwrap_err();
+    stand_in.join().unwrap();
+    assert!(
+        matches!(&err, WorkspaceError::Terminal(TerminalError::Refused { id, .. }) if *id == second),
+        "{err}"
+    );
+    assert!(!setup.record(id).unwrap().deleted);
+    assert!(worktree.exists());
+    let closed: HashMap<_, _> = setup
+        .terminals_of(id)
+        .into_iter()
+        .map(|t| (t.body.id, t.deleted))
+        .collect();
+    assert_eq!(closed, HashMap::from([(first, true), (second, false)]));
+
+    // Once it answers again, the archive goes through.
+    std::fs::remove_file(&socket).unwrap();
+    std::fs::rename(&real, &socket).unwrap();
+    setup.workspaces.archive(id, false).await.unwrap();
+    assert!(setup.record(id).unwrap().deleted);
+    assert!(!worktree.exists());
+    assert!(setup.terminals_of(id).iter().all(|t| t.deleted));
 }
