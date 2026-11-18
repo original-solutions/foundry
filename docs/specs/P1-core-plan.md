@@ -103,7 +103,7 @@ Dependencies are in brackets. Tasks with no dependency between them can build at
 
 - **Spec:** Terminals.
 - **Files:** `crates/foundryd/src/terminals.rs`.
-- **Produces:** `Terminals::start(workspace, argv, env) -> TerminalId`, `attach(id) -> (Snapshot, Stream<Bytes>)`, `input`, `resize`, `close`, `reattach_all()` run at start, and a `Terminal` record kept current in the store.
+- **Produces:** `Terminals::new(me, store, data_dir, holder)`, where `holder` is the path of the `foundry-holder` binary. `start(workspace, cwd, argv, env) -> TerminalId`. `attach(id) -> (Snapshot { start, bytes }, Stream<Result<Bytes, TerminalError>>)`: the stream ends cleanly only after the child exits, and `TerminalError::Detached` means the holder cut the client off, so attach again. `input`, `resize`, `close`. `reattach_all()`, run at start before any `start`. A `Terminal` record kept current in the store.
 - **Tests:** a terminal started, then the daemon's task dropped and `reattach_all` run on a new one: the stream continues with no byte lost or repeated, checked with a child that prints a counter. A holder whose socket is gone is recorded as exited with an unknown code. A terminal record's state follows running to exited.
 
 ### 6. Sessions and the fake agent [5]
