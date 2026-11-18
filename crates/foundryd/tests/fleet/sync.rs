@@ -357,3 +357,22 @@ async fn two_daemons_linked_over_websockets_converge() {
     })
     .await;
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_link_to_a_peer_silent_for_15_seconds_is_closed() {
+    let quiet = MachineId::random();
+    let fleet = Fleet::start_with(1, &[quiet]);
+    let a = &fleet.daemons[0];
+
+    let mut conn = raw_link(&a.peers);
+    send(&conn, &hello(PROTOCOL, quiet)).await;
+    let start = Instant::now();
+    while next(&mut conn).await.is_some() {
+        assert!(
+            start.elapsed() <= OFFLINE_AFTER + Duration::from_secs(1),
+            "the link is still open after {:?} of silence",
+            start.elapsed()
+        );
+    }
+    assert!(start.elapsed() >= OFFLINE_AFTER - Duration::from_secs(1));
+}
