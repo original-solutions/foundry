@@ -24,9 +24,10 @@ use clap::Parser;
 use foundry_holder::pty::{self, Pty};
 use nix::errno::Errno;
 use nix::fcntl::{Flock, FlockArg};
+use nix::sys::signal::{Signal, killpg};
 use nix::sys::stat::{Mode, umask};
 use nix::sys::wait::waitpid;
-use nix::unistd::{ForkResult, dup2_stderr, dup2_stdin, dup2_stdout, fork, setsid};
+use nix::unistd::{ForkResult, Pid, dup2_stderr, dup2_stdin, dup2_stdout, fork, setsid};
 
 /// What the holder writes to its starter once the socket is served.
 const READY: &str = "ready";
@@ -154,18 +155,50 @@ fn hold(args: Args, env: Vec<(String, String)>, mut ready: PipeWriter) -> i32 {
     drop(env);
     match started {
         Ok((_lock, pty, listener, child)) => {
-            let _ = ready.write_all(READY.as_bytes());
-            drop(ready);
-            match server::run(listener, &args.socket, &lock_path, pty, child) {
-                Ok(()) => 0,
-                Err(_) => 1,
-            }
+            serve(ready, listener, &args.socket, &lock_path, pty, child)
         }
         Err(reason) => {
             let _ = ready.write_all(reason.as_bytes());
             1
         }
     }
+}
+
+/// Serves the socket once the ready message is written to the starter, and returns the holder's
+/// exit code. The only way into `server::run`, so a holder whose starter has exited never serves.
+/// A write that succeeds shows only that the starter had not exited yet: one killed after the
+/// write and before it reads leaves this holder serving.
+fn serve(
+    ready: PipeWriter,
+    listener: UnixListener,
+    socket: &Path,
+    lock: &Path,
+    pty: Pty,
+    child: Child,
+) -> i32 {
+    if !tell_ready(ready, socket, lock, &child) {
+        return 1;
+    }
+    match server::run(listener, socket, lock, pty, child) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+/// Tells the starter the socket is served, and says whether to serve it. A starter that cannot
+/// hear it is gone, and whoever started it has stopped waiting, so nothing may run on: the child's
+/// process group is hung up, as `Close` does, and the socket goes, then the lock file the caller
+/// still holds.
+fn tell_ready(mut ready: PipeWriter, socket: &Path, lock: &Path, child: &Child) -> bool {
+    if ready.write_all(READY.as_bytes()).is_ok() {
+        return true;
+    }
+    if let Ok(group) = i32::try_from(child.id()) {
+        let _ = killpg(Pid::from_raw(group), Signal::SIGHUP);
+    }
+    let _ = std::fs::remove_file(socket);
+    let _ = std::fs::remove_file(lock);
+    false
 }
 
 /// Opens the PTY, binds the socket and starts the child on the PTY.
@@ -217,4 +250,205 @@ fn bind(path: &Path) -> Result<UnixListener, String> {
     let bound = UnixListener::bind(path);
     umask(old);
     bound.map_err(|e| format!("socket {}: {e}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::process::ExitStatusExt as _;
+    use std::process::ExitStatus;
+    use std::time::{Duration, Instant};
+
+    use nix::sys::signal::Signal;
+
+    use super::*;
+
+    fn args(dir: &Path) -> Args {
+        Args {
+            socket: dir.join("t.sock"),
+            cwd: dir.to_path_buf(),
+            env_file: dir.join("env.json"),
+            argv: vec!["sleep".into(), "30".into()],
+        }
+    }
+
+    fn exit_within(child: &mut Child, limit: Duration) -> Option<ExitStatus> {
+        let deadline = Instant::now() + limit;
+        while Instant::now() < deadline {
+            if let Some(status) = child.try_wait().expect("try_wait") {
+                return Some(status);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        None
+    }
+
+    #[test]
+    fn a_starter_that_is_gone_leaves_nothing_running() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let args = args(dir.path());
+        let lock_path = args.socket.with_extension("lock");
+        let _lock = lock(&lock_path).expect("lock");
+        let (_pty, _listener, mut child) = open(&args, &[]).expect("open");
+        let (reader, writer) = std::io::pipe().expect("pipe");
+        drop(reader);
+
+        let serve = tell_ready(writer, &args.socket, &lock_path, &child);
+
+        let status = exit_within(&mut child, Duration::from_secs(5));
+        if status.is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert!(
+            !serve,
+            "the holder serves though its starter never heard it"
+        );
+        assert_eq!(
+            status.and_then(|s| s.signal()),
+            Some(Signal::SIGHUP as i32),
+            "the child is not hung up"
+        );
+        assert!(!args.socket.exists(), "the socket is left behind");
+        assert!(!lock_path.exists(), "the lock file is left behind");
+    }
+
+    /// The pid a shell child wrote to `path`, once it is there.
+    fn pid_in(path: &Path) -> Pid {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(pid) = std::fs::read_to_string(path)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+            {
+                return Pid::from_raw(pid);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{} never written",
+                path.display()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn gone_within(pid: Pid, limit: Duration) -> bool {
+        let deadline = Instant::now() + limit;
+        while Instant::now() < deadline {
+            if nix::sys::signal::kill(pid, None) == Err(Errno::ESRCH) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    #[test]
+    fn a_holder_whose_starter_is_gone_exits_1_without_serving() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let args = args(dir.path());
+        let lock_path = args.socket.with_extension("lock");
+        let lock = lock(&lock_path).expect("lock");
+        let (pty, listener, child) = open(&args, &[]).expect("open");
+        let pid = Pid::from_raw(i32::try_from(child.id()).expect("pid"));
+        let (reader, writer) = std::io::pipe().expect("pipe");
+        drop(reader);
+
+        let (done, outcome) = std::sync::mpsc::channel();
+        let (socket, lock_file) = (args.socket.clone(), lock_path.clone());
+        std::thread::spawn(move || {
+            let _lock = lock;
+            let _ = done.send(serve(writer, listener, &socket, &lock_file, pty, child));
+        });
+        let code = outcome.recv_timeout(Duration::from_secs(5));
+
+        if code.is_err() {
+            let _ = nix::sys::signal::kill(pid, Signal::SIGKILL);
+        }
+        let _ = waitpid(pid, None);
+        assert_eq!(
+            code.ok(),
+            Some(1),
+            "the holder serves though its starter never heard it"
+        );
+    }
+
+    #[test]
+    fn a_starter_that_is_gone_hangs_up_the_childs_whole_group() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut args = args(dir.path());
+        let background = dir.path().join("background");
+        // The job starts before the trap, so SIGHUP ends it; the shell ignores SIGHUP and exits 0
+        // once the job ends. A signal to the shell alone leaves the job running or kills the
+        // shell, and only a killed shell, as session leader, makes the kernel hang up the job. So
+        // the job gone and the shell exiting 0 show the hangup went to the whole group. The pid is
+        // written after the trap is set. Stderr goes nowhere: a shell that reports a killed job on
+        // the terminal cannot exit until someone reads it, and nobody here does.
+        args.argv = vec![
+            "sh".into(),
+            "-c".into(),
+            format!(
+                "exec 2>/dev/null; sleep 30 & trap '' HUP; echo $! > '{}'; wait",
+                background.display()
+            )
+            .into(),
+        ];
+        let lock_path = args.socket.with_extension("lock");
+        let _lock = lock(&lock_path).expect("lock");
+        let (_pty, _listener, mut child) = open(&args, &[]).expect("open");
+        let job = pid_in(&background);
+        let (reader, writer) = std::io::pipe().expect("pipe");
+        drop(reader);
+
+        let serve = tell_ready(writer, &args.socket, &lock_path, &child);
+
+        let hung_up = gone_within(job, Duration::from_secs(5));
+        if !hung_up {
+            let _ = nix::sys::signal::kill(job, Signal::SIGKILL);
+        }
+        let status = exit_within(&mut child, Duration::from_secs(5));
+        if status.is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert!(
+            !serve,
+            "the holder serves though its starter never heard it"
+        );
+        assert!(hung_up, "a process in the child's group is still running");
+        assert_eq!(
+            status.and_then(|s| s.code()),
+            Some(0),
+            "the child was not left to exit once its job was hung up: {status:?}"
+        );
+    }
+
+    #[test]
+    fn a_starter_that_listens_hears_ready_and_the_child_runs_on() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let args = args(dir.path());
+        let lock_path = args.socket.with_extension("lock");
+        let _lock = lock(&lock_path).expect("lock");
+        let (_pty, _listener, mut child) = open(&args, &[]).expect("open");
+        let (mut reader, writer) = std::io::pipe().expect("pipe");
+
+        let serve = tell_ready(writer, &args.socket, &lock_path, &child);
+
+        let mut said = String::new();
+        let read = reader.read_to_string(&mut said);
+        let running = child.try_wait().expect("try_wait").is_none();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            serve,
+            "the holder does not serve though its starter heard it"
+        );
+        assert!(
+            read.is_ok(),
+            "the ready pipe is not closed after the message"
+        );
+        assert_eq!(said, READY);
+        assert!(running, "the child is ended though the starter heard it");
+        assert!(args.socket.exists(), "the socket is removed");
+        assert!(lock_path.exists(), "the lock file is removed");
+    }
 }
