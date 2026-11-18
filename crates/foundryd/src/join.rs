@@ -32,7 +32,8 @@ use std::io;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::time::{Duration, SystemTime};
 
 use axum::extract::State;
@@ -347,6 +348,12 @@ pub enum JoinError {
          (100.64.0.0/10 or fd7a:115c:a1e0::/48), since a join code travels unencrypted"
     )]
     NotTailscale(String),
+    #[error(
+        "no other change to the key table has got through for {} s; one may be stuck on the \
+         secret store; try again",
+        secrets::LOCK_WAIT.as_secs()
+    )]
+    Busy,
     #[error("the secret {0} is not in the expected form")]
     Unreadable(&'static str),
     #[error("the system gave no random numbers")]
@@ -503,6 +510,8 @@ struct KeysInner {
     /// Held across each change to the key table and its save, so saves land in order and a
     /// slow secret store never holds up a link's check.
     saving: Mutex<()>,
+    /// How many times `saving` has been taken: what a change waiting on it counts as progress.
+    taken: AtomicU64,
 }
 
 struct Held {
@@ -534,8 +543,9 @@ impl Keys {
     /// This machine's identity and key table, kept in `secrets`, with no codes outstanding.
     /// A machine with no identity yet is given one, and its own entry is always its own key.
     ///
-    /// Blocks on the secret store: a keychain prompt, or up to [`secrets::LOCK_WAIT`] on
-    /// another process's lock. Call it from a blocking context, not an async task.
+    /// Blocks on the secret store: a keychain prompt, or another process's lock until
+    /// [`secrets::LOCK_WAIT`] passes with no change getting through. Call it from a blocking
+    /// context, not an async task.
     pub fn open(secrets: Arc<dyn Secrets>) -> Result<Self, JoinError> {
         let identity = Identity::load_or_create(&*secrets)?;
         let signer = identity.key_pair()?;
@@ -550,6 +560,7 @@ impl Keys {
                     machines,
                 }),
                 saving: Mutex::new(()),
+                taken: AtomicU64::new(0),
             }),
         };
         let own = keys.public_key();
@@ -558,7 +569,7 @@ impl Keys {
             Some(Entry::Active { key }) if *key == own
         );
         if !holds_own {
-            let saving = keys.saving();
+            let saving = keys.saving()?;
             keys.change(&saving, |machines| {
                 machines.insert(identity.machine, Entry::Active { key: own });
                 Ok(())
@@ -606,7 +617,7 @@ impl Keys {
     /// key table in this process.
     pub fn redeem(&self, code: &str, machine: MachineId, key: &PublicKey) -> Result<(), JoinError> {
         let typed = code.trim().to_ascii_uppercase();
-        let saving = self.saving();
+        let saving = self.saving()?;
         let used_by = {
             let mut held = self.held();
             held.forget_expired_codes();
@@ -636,7 +647,7 @@ impl Keys {
     /// Blocks on the secret store, as [`Keys::open`] does, and behind any other change to the
     /// key table in this process.
     pub fn revoke(&self, machine: MachineId) -> Result<(), JoinError> {
-        let saving = self.saving();
+        let saving = self.saving()?;
         self.change(&saving, |machines| {
             machines.insert(machine, Entry::Revoked);
             Ok(())
@@ -751,9 +762,38 @@ impl Keys {
         }
     }
 
-    /// The lock every change to the key table holds from its read to its save.
-    fn saving(&self) -> MutexGuard<'_, ()> {
-        lock(&self.inner.saving)
+    /// The lock every change to the key table holds from its read to its save. It waits until
+    /// [`secrets::LOCK_WAIT`] passes with no other change taking it, as [`Keys::saving_within`]
+    /// says.
+    fn saving(&self) -> Result<MutexGuard<'_, ()>, JoinError> {
+        self.saving_within(secrets::LOCK_WAIT)
+    }
+
+    /// The `saving` lock. A change waiting behind others that keep taking it waits on; one
+    /// that sees nobody take it for `wait`, as when a holder is stuck on a keychain prompt,
+    /// gives [`JoinError::Busy`].
+    fn saving_within(&self, wait: Duration) -> Result<MutexGuard<'_, ()>, JoinError> {
+        let mut seen = self.inner.taken.load(Ordering::SeqCst);
+        let mut deadline = std::time::Instant::now() + wait;
+        loop {
+            let guard = match self.inner.saving.try_lock() {
+                Ok(guard) => Some(guard),
+                Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+                Err(TryLockError::WouldBlock) => None,
+            };
+            if let Some(guard) = guard {
+                self.inner.taken.fetch_add(1, Ordering::SeqCst);
+                return Ok(guard);
+            }
+            let now = self.inner.taken.load(Ordering::SeqCst);
+            if now != seen {
+                seen = now;
+                deadline = std::time::Instant::now() + wait;
+            } else if std::time::Instant::now() >= deadline {
+                return Err(JoinError::Busy);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// Applies `edit` to the key table as stored now, saves it, then holds it; an edit that
@@ -1398,6 +1438,61 @@ mod tests {
                 None => Ok(()),
             }
         }
+    }
+
+    #[test]
+    fn a_change_waiting_past_the_wait_behind_another_gives_busy_and_changes_nothing() {
+        let keys = machine_keys();
+        let machine = MachineId::random();
+        let held = keys.saving().unwrap();
+        std::thread::scope(|scope| {
+            let started = std::time::Instant::now();
+            let revoked = scope.spawn(|| keys.revoke(machine)).join().unwrap();
+            assert!(started.elapsed() >= secrets::LOCK_WAIT);
+            assert!(matches!(revoked, Err(JoinError::Busy)), "{revoked:?}");
+        });
+        drop(held);
+        assert_eq!(keys.state(machine), KeyState::NoKey);
+        keys.revoke(machine).unwrap();
+        assert_eq!(keys.state(machine), KeyState::Revoked);
+    }
+
+    #[test]
+    fn a_change_behind_others_that_keep_getting_through_waits_on() {
+        let keys = machine_keys();
+        let held = keys.saving().unwrap();
+        std::thread::scope(|scope| {
+            let waiting = scope.spawn(|| keys.saving_within(Duration::from_millis(500)).map(drop));
+            // Past the wait in all, but each step counts as another change taking the lock.
+            for _ in 0..8 {
+                std::thread::sleep(Duration::from_millis(200));
+                keys.inner.taken.fetch_add(1, Ordering::SeqCst);
+            }
+            drop(held);
+            waiting.join().unwrap().unwrap();
+        });
+    }
+
+    #[test]
+    fn taking_the_saving_lock_counts_as_progress_for_waiters() {
+        let keys = machine_keys();
+        let before = keys.inner.taken.load(Ordering::SeqCst);
+        drop(keys.saving().unwrap());
+        assert!(keys.inner.taken.load(Ordering::SeqCst) > before);
+    }
+
+    #[test]
+    fn a_change_let_through_within_the_wait_goes_ahead() {
+        let keys = machine_keys();
+        let machine = MachineId::random();
+        let held = keys.saving().unwrap();
+        std::thread::scope(|scope| {
+            let revoking = scope.spawn(|| keys.revoke(machine));
+            std::thread::sleep(Duration::from_millis(300));
+            drop(held);
+            revoking.join().unwrap().unwrap();
+        });
+        assert_eq!(keys.state(machine), KeyState::Revoked);
     }
 
     #[test]

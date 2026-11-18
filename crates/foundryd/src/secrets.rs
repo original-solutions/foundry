@@ -12,13 +12,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::{Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use nix::errno::Errno;
 use nix::fcntl::{Flock, FlockArg};
 
-/// How long a set or an update waits for another process to let go of the secrets lock before
-/// it gives up with [`SecretsError::Locked`].
+/// How long a set or an update waits on the secrets lock with no other change getting through
+/// before it gives up with [`SecretsError::Locked`]. A waiter behind holders that keep finishing
+/// waits on; one behind a holder that is stuck (on a keychain prompt, say) gives up.
 pub const LOCK_WAIT: Duration = Duration::from_secs(5);
 
 /// Named secrets, such as the gateway key or this machine's key.
@@ -49,7 +50,8 @@ pub enum SecretsError {
     #[error("the secrets file {}: {source}", path.display())]
     Io { path: PathBuf, source: io::Error },
     #[error(
-        "another process has held the secrets lock {} for over {} s; try again",
+        "no change has got through the secrets lock {} for {} s; another process may be stuck \
+         holding it; try again",
         path.display(),
         LOCK_WAIT.as_secs()
     )]
@@ -98,8 +100,8 @@ impl FileSecrets {
         PathBuf::from(name)
     }
 
-    /// Takes the lock every set and update holds, waiting at most [`LOCK_WAIT`]. It is released
-    /// when the value is dropped.
+    /// Takes the lock every set and update holds, waiting until [`LOCK_WAIT`] passes with no
+    /// other holder taking it. It is released when the value is dropped.
     fn lock(&self) -> Result<Flock<File>, SecretsError> {
         lock_file(&self.beside(".lock"), LOCK_WAIT)
     }
@@ -194,8 +196,10 @@ impl Secrets for FileSecrets {
 
 /// An exclusive lock on the file at `path`, made 0600 with its directory if needed, held until
 /// the value is dropped. It is a `flock`, so it holds between processes, and between two opens
-/// of the file in one process. A lock another holder keeps for longer than `wait` gives
-/// [`SecretsError::Locked`], so a stuck process stalls nobody for long.
+/// of the file in one process. Each holder stamps the file's modified time as it takes it, and
+/// a waiter counts a new stamp as progress: it gives [`SecretsError::Locked`] only once `wait`
+/// passes with no new holder, so a stuck process stalls nobody for long and busy ones fail
+/// nobody.
 fn lock_file(path: &Path, wait: Duration) -> Result<Flock<File>, SecretsError> {
     let io = |source: io::Error| SecretsError::Io {
         path: path.to_owned(),
@@ -211,12 +215,21 @@ fn lock_file(path: &Path, wait: Duration) -> Result<Flock<File>, SecretsError> {
         .mode(0o600)
         .open(path)
         .map_err(io)?;
-    let deadline = Instant::now() + wait;
+    let stamp = |file: &File| file.metadata().and_then(|m| m.modified()).ok();
+    let mut seen = stamp(&file);
+    let mut deadline = Instant::now() + wait;
     loop {
         match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
-            Ok(locked) => return Ok(locked),
+            Ok(locked) => {
+                locked.set_modified(SystemTime::now()).map_err(io)?;
+                return Ok(locked);
+            }
             Err((held, Errno::EWOULDBLOCK)) => {
-                if Instant::now() >= deadline {
+                let now = stamp(&held);
+                if now != seen {
+                    seen = now;
+                    deadline = Instant::now() + wait;
+                } else if Instant::now() >= deadline {
                     return Err(SecretsError::Locked {
                         path: path.to_owned(),
                     });
@@ -555,6 +568,34 @@ mod tests {
         assert!(!error.to_string().contains("sk-"), "{error}");
         drop(held);
         assert_eq!(secrets.get("gateway").unwrap().as_deref(), Some("sk-one"));
+    }
+
+    #[test]
+    fn a_waiter_behind_holders_that_keep_taking_the_lock_waits_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.lock");
+        let held = lock_file(&path, LOCK_WAIT).unwrap();
+        std::thread::scope(|scope| {
+            let waiting = scope.spawn(|| lock_file(&path, Duration::from_millis(500)).map(drop));
+            // Past the wait in all, but each step stamps the lock as a new holder taking it does.
+            for _ in 0..8 {
+                std::thread::sleep(Duration::from_millis(200));
+                held.set_modified(SystemTime::now()).unwrap();
+            }
+            drop(held);
+            waiting.join().unwrap().unwrap();
+        });
+    }
+
+    #[test]
+    fn taking_the_lock_stamps_it_as_progress_for_waiters() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.lock");
+        drop(lock_file(&path, LOCK_WAIT).unwrap());
+        let first = fs::metadata(&path).unwrap().modified().unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        drop(lock_file(&path, LOCK_WAIT).unwrap());
+        assert_ne!(fs::metadata(&path).unwrap().modified().unwrap(), first);
     }
 
     #[test]
