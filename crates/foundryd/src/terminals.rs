@@ -39,6 +39,9 @@ const RECONNECT_AT_MOST: Duration = Duration::from_secs(30);
 /// How long a holder has to answer a request before the request fails.
 const ANSWER_WITHIN: Duration = Duration::from_secs(10);
 
+/// How long a holder has to serve its socket before the start fails and the holder is killed.
+const START_WITHIN: Duration = Duration::from_secs(30);
+
 /// A socket that refuses connections this many times, this far apart, has no holder behind it.
 /// One refusal alone can be a holder whose queue of new connections is full.
 const REFUSALS_FOR_GONE: u32 = 3;
@@ -420,8 +423,9 @@ impl Inner {
         }
     }
 
-    /// Runs the holder, which returns once its socket is served. The error is the holder's own
-    /// reason, which never quotes the env file's contents.
+    /// Runs the holder, which returns once its socket is served. A holder that has not served
+    /// it within [`START_WITHIN`] is killed. The error is the holder's own reason, which never quotes the
+    /// env file's contents.
     async fn launch(
         &self,
         socket: &Path,
@@ -436,7 +440,7 @@ impl Inner {
             .create(&self.dir)
             .map_err(|e| format!("{}: {e}", self.dir.display()))?;
         pty::write_env_file(env_file, env).map_err(|e| format!("env file: {e}"))?;
-        let output = tokio::process::Command::new(&self.holder)
+        let started = tokio::process::Command::new(&self.holder)
             .arg("--socket")
             .arg(socket)
             .arg("--cwd")
@@ -446,8 +450,16 @@ impl Inner {
             .arg("--")
             .args(argv)
             .stdin(Stdio::null())
-            .output()
+            .kill_on_drop(true)
+            .output();
+        let output = tokio::time::timeout(START_WITHIN, started)
             .await
+            .map_err(|_| {
+                format!(
+                    "the holder did not start within {} seconds",
+                    START_WITHIN.as_secs()
+                )
+            })?
             .map_err(|e| format!("cannot run {}: {e}", self.holder.display()))?;
         if output.status.success() {
             return Ok(());
@@ -1716,6 +1728,43 @@ mod tests {
         assert!(!record.deleted);
         terminals.close(id).await.unwrap();
         assert!(held(&store, setup.me, id).unwrap().deleted);
+    }
+
+    /// A holder that never says it is ready fails the start in bounded time and is killed.
+    /// The env file goes, and no record or live terminal is left for it.
+    #[tokio::test(start_paused = true)]
+    async fn a_holder_that_never_gets_ready_fails_the_start_in_time_and_is_killed() {
+        let setup = Setup::new();
+        let late = setup.cwd.path().join("late");
+        let fake = setup.cwd.path().join("fake-holder");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\nsleep 1\ntouch '{}'\nsleep 600\n",
+                late.display()
+            ),
+        )
+        .unwrap();
+        set_mode(&fake, 0o755);
+        let (terminals, store) = setup.daemon_with(fake);
+        let env = [("ANTHROPIC_AUTH_TOKEN".to_string(), "sk-hung".to_string())];
+        let error = tokio::time::timeout(
+            WAIT * 10,
+            terminals.start(WorkspaceId::random(), setup.cwd.path(), &argv("true"), &env),
+        )
+        .await
+        .expect("start gives up before the test does")
+        .unwrap_err();
+        let TerminalError::Start { id, ref reason } = error else {
+            panic!("expected a start error, got {error:?}");
+        };
+        assert!(reason.contains("did not start within"), "{reason}");
+        assert!(held(&store, setup.me, id).unwrap().deleted);
+        assert!(terminals.inner.entry(id).is_err(), "nothing is left live");
+        assert!(setup.left().is_empty(), "left behind: {:?}", setup.left());
+        // Paused time does not pause the fake: a holder left running would make `late`.
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(!late.exists(), "the holder was left running");
     }
 
     /// Typing into a terminal whose child has exited is no error: the holder drops the input,
