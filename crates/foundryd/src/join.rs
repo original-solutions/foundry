@@ -102,7 +102,10 @@ pub fn join(address: &str, code: &str) -> ExitCode {
     };
     match join_at(address, port, code, &*secrets::for_this_machine(&home)) {
         Ok(machine) => {
-            println!("joined the fleet as machine {machine}");
+            println!(
+                "joined the fleet as machine {machine}; if foundryd is already running here, \
+                 restart it to link with the machine that admitted this one"
+            );
             ExitCode::SUCCESS
         }
         Err(error) => {
@@ -169,10 +172,16 @@ pub fn join_at(
 }
 
 /// Puts `machine`'s key in the key table kept in `secrets`, so this machine's links with it
-/// are served from its next start. A key already held for it is left as it is.
+/// are served from the daemon's next start. A machine held revoked, or with another key, is
+/// left as it is and named in the error.
 fn hold_key(secrets: &dyn Secrets, machine: MachineId, key: PublicKey) -> Result<(), JoinError> {
     let mut machines = read_table(secrets)?;
-    machines.entry(machine).or_insert(Entry::Active { key });
+    match machines.get(&machine) {
+        None => {}
+        Some(Entry::Active { key: held }) if *held == key => return Ok(()),
+        Some(_) => return Err(JoinError::Taken(machine)),
+    }
+    machines.insert(machine, Entry::Active { key });
     secrets.set(KEYS_SECRET, &write_table(&machines))?;
     Ok(())
 }
@@ -453,22 +462,26 @@ impl Keys {
         {
             let mut held = self.held();
             held.forget_expired_codes();
-            let shown = held
+            let found = held
                 .codes
                 .iter()
-                .find(|shown| same(shown.code.as_bytes(), typed.as_bytes()))
+                .position(|shown| same(shown.code.as_bytes(), typed.as_bytes()))
                 .ok_or(JoinError::BadCode)?;
-            let used_by = shown.used_by;
-            let holds = held.machines.get(&machine);
+            let used_by = held.codes[found].used_by;
+            let holds = held.machines.get(&machine).cloned();
             match (used_by, holds) {
-                (Some(user), Some(Entry::Active { key: held }))
-                    if user == machine && held == key =>
+                (Some(user), Some(Entry::Active { key: kept }))
+                    if user == machine && kept == *key =>
                 {
                     return Ok(());
                 }
                 (Some(_), _) => return Err(JoinError::BadCode),
-                // Already admitted with this key: a retry whose first code expired.
-                (None, Some(Entry::Active { key: held })) if held == key => return Ok(()),
+                // Already admitted with this key: a retry whose first code expired. The new
+                // code is spent all the same.
+                (None, Some(Entry::Active { key: kept })) if kept == *key => {
+                    held.codes[found].used_by = Some(machine);
+                    return Ok(());
+                }
                 (None, Some(_)) => return Err(JoinError::Taken(machine)),
                 (None, None) => {}
             }
@@ -492,7 +505,7 @@ impl Keys {
     }
 
     /// Revokes `machine`: its key is forgotten and every link with it is refused.
-    pub fn revoke(&self, machine: MachineId) -> Result<(), SecretsError> {
+    pub fn revoke(&self, machine: MachineId) -> Result<(), JoinError> {
         let saving = self.saving();
         self.change(&saving, |machines| {
             machines.insert(machine, Entry::Revoked);
@@ -612,14 +625,15 @@ impl Keys {
         lock(&self.inner.saving)
     }
 
-    /// Applies `edit` to a copy of the key table, saves the copy, then holds it. Taking the
-    /// `saving` guard makes every change hold the lock, so no two saves undo each other.
+    /// Applies `edit` to the key table as stored now, saves it, then holds it. Taking the
+    /// `saving` guard makes every change hold the lock, so no two saves undo each other, and
+    /// starting from the stored table keeps what `foundryd join` saved from another process.
     fn change(
         &self,
         _saving: &MutexGuard<'_, ()>,
         edit: impl FnOnce(&mut BTreeMap<MachineId, Entry>),
-    ) -> Result<(), SecretsError> {
-        let mut machines = self.held().machines.clone();
+    ) -> Result<(), JoinError> {
+        let mut machines = read_table(&*self.inner.secrets)?;
         edit(&mut machines);
         self.inner
             .secrets
@@ -788,8 +802,9 @@ async fn forward(from: &mut Receiver<String>, to: &Sender<String>) {
 }
 
 /// The route a joining machine posts its code to. It answers with this machine's id and
-/// public key when the machine is admitted, 403 to a code that is wrong, used or expired, 409 to a machine already known or
-/// revoked, and 400 to a key that is not an Ed25519 public key.
+/// public key when the machine is admitted, 403 to a code that is wrong, used or expired, 409
+/// to a machine revoked or held with another key, and 400 to a key that is not an Ed25519
+/// public key.
 pub fn router(keys: Keys) -> Router {
     Router::new()
         .route(JOIN_PATH, post(redeem))
