@@ -363,6 +363,28 @@ mod tests {
             texts(&sample(0, 0.2, 9_999_000_000), &limits()),
             ["trilogy-mac: free disk 9.999 GB under limit 10.0 GB"]
         );
+        // A 10-core Mac's load moves in steps of 1/2048: 20481/2048 over 10 cores.
+        assert_eq!(
+            texts(
+                &sample(0, 20481.0 / 2048.0 / 10.0, 50_000_000_000),
+                &limits()
+            ),
+            ["trilogy-mac: load 1.00005 over limit 1.0"]
+        );
+        // One 4096-byte block under the limit.
+        assert_eq!(
+            texts(&sample(0, 0.2, 9_999_995_904), &limits()),
+            ["trilogy-mac: free disk 9.999996 GB under limit 10.0 GB"]
+        );
+        // Both numbers are widened, so the value never reads above a limit it is under.
+        let gib_limit = Limits {
+            min_free_disk: 21_474_836_480,
+            ..limits()
+        };
+        assert_eq!(
+            texts(&sample(0, 0.2, 21_470_500_000), &gib_limit),
+            ["trilogy-mac: free disk 21.471 GB under limit 21.475 GB"]
+        );
     }
 
     #[test]
