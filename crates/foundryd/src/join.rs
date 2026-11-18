@@ -169,7 +169,7 @@ pub fn join_at(
     };
     if answer.machine == identity.machine {
         // Only this machine speaks for its own id.
-        return Err(JoinError::NotAdmitted { url, status: 200 });
+        return Err(JoinError::AnsweredAsThisMachine(url));
     }
     hold_key(secrets, answer.machine, answer.key)?;
     Ok(identity.machine)
@@ -188,14 +188,17 @@ fn hold_key(secrets: &dyn Secrets, machine: MachineId, key: PublicKey) -> Result
     Ok(())
 }
 
-/// The one rule for admitting a machine to a key table: a machine not held is added, one
-/// held with the same key is left as it is, and one held revoked or with another key is
-/// refused, so nothing replaces a key or a revocation.
+/// The one rule for admitting a machine to a key table: a key that is not Ed25519 is refused,
+/// a machine not held is added, one held with the same key is left as it is, and one held
+/// revoked or with another key is refused, so nothing replaces a key or a revocation.
 fn admit_into(
     machines: &mut BTreeMap<MachineId, Entry>,
     machine: MachineId,
     key: &PublicKey,
 ) -> Result<(), JoinError> {
+    if key.verifier().is_none() {
+        return Err(JoinError::BadKey);
+    }
     match machines.get(&machine) {
         None => {
             machines.insert(machine, Entry::Active { key: key.clone() });
@@ -249,6 +252,11 @@ pub enum JoinError {
          and will not link with it"
     )]
     HostRefusedHere(MachineId),
+    #[error(
+        "{0} answered with this machine's own id; this machine's identity may be a copy of \
+         that machine's"
+    )]
+    AnsweredAsThisMachine(String),
     #[error("the public key sent is not an Ed25519 public key")]
     BadKey,
     #[error("{url} could not admit this machine (HTTP {status}); ask for a new code")]
@@ -500,9 +508,6 @@ impl Keys {
         if used_by.is_some_and(|user| user != machine) {
             return Err(JoinError::BadCode);
         }
-        if key.verifier().is_none() {
-            return Err(JoinError::BadKey);
-        }
         self.change(&saving, |machines| admit_into(machines, machine, key))?;
         if let Some(shown) = self
             .held()
@@ -638,9 +643,10 @@ impl Keys {
     }
 
     /// Applies `edit` to the key table as stored now, saves it, then holds it; an edit that
-    /// refuses saves nothing. The stored table is the one source of truth: every decision
-    /// about a machine is made by an edit on it, never on the table held in memory, which
-    /// can lag what `foundryd join` saved from another process. Taking the `saving` guard
+    /// refuses saves nothing. The stored table is the one source of truth for changes: every
+    /// change is decided by an edit on it, never on the table held in memory, which can lag
+    /// what `foundryd join` saved from another process. Links are checked against the table
+    /// held in memory, which this refreshes and a restart reloads. Taking the `saving` guard
     /// makes every change in this process hold the lock, so no two of them undo each other.
     fn change(
         &self,
