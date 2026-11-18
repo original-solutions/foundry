@@ -66,6 +66,8 @@ fn git(dir: &Path, args: &[&str]) -> String {
             "commit.gpgsign=false",
             "-c",
             "init.defaultBranch=main",
+            "-c",
+            "protocol.file.allow=always",
         ])
         .args(args)
         .current_dir(dir)
@@ -289,10 +291,10 @@ fn a_name_is_made_safe_for_git() {
     for (name, branch) in [
         ("fix-login", "fix-login"),
         ("fix login", "fix-login"),
-        ("Fix Login", "fix-login"),
+        ("Fix Login", "Fix-Login"),
         ("  fix   login  ", "fix-login"),
         ("café ☕ täst", "café-täst"),
-        ("CAFÉ", "café"),
+        ("CAFÉ", "CAFÉ"),
         ("../../escape", "escape"),
         ("-rf", "rf"),
         ("--force", "force"),
@@ -302,7 +304,7 @@ fn a_name_is_made_safe_for_git() {
         ("@{u}", "u"),
         (".hidden", "hidden"),
         ("trailing.", "trailing"),
-        ("HEAD", "head"),
+        ("HEAD", "HEAD-workspace"),
         ("", "workspace"),
         ("...", "workspace"),
         ("-", "workspace"),
@@ -748,7 +750,7 @@ async fn a_name_that_differs_only_in_case_from_a_branch_is_refused() {
     let setup = Setup::new();
     let remote = setup.project(&[("README.md", "hello\n")]);
     let first = setup.create(&remote, "main", "Fix Login").await;
-    assert_eq!(setup.body(first).branch, "fix-login");
+    assert_eq!(setup.body(first).branch, "Fix-Login");
 
     let err = setup
         .workspaces
@@ -756,9 +758,25 @@ async fn a_name_that_differs_only_in_case_from_a_branch_is_refused() {
         .await
         .unwrap_err();
     assert!(
-        matches!(&err, WorkspaceError::BranchExists(b) if b == "fix-login"),
+        matches!(&err, WorkspaceError::BranchExists(b) if b == "FIX-login"),
         "{err}"
     );
+
+    // A disk that ignores case folds a final sigma to sigma, and a long s to s.
+    setup.create(&remote, "main", "λόγος").await;
+    let err = setup
+        .workspaces
+        .create(remote.project, "main", "ΛΌΓΟΣ")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, WorkspaceError::BranchExists(_)), "{err}");
+    setup.create(&remote, "main", "six").await;
+    let err = setup
+        .workspaces
+        .create(remote.project, "main", "ſix")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, WorkspaceError::BranchExists(_)), "{err}");
 
     // A branch made by hand in the clone counts too, whatever its case.
     let clone = setup.clone_of(remote.project);
@@ -868,4 +886,136 @@ async fn a_fetch_that_hangs_fails_in_time_and_frees_the_project() {
     );
     // The project's lock was let go: an archive of it goes through.
     setup.workspaces.archive(id, false).await.unwrap();
+}
+
+/// Stands in front of terminal `id`'s holder: the next request to it writes `late.txt` into
+/// `worktree`, as a child would while it is hung up, then the connection ends as the holder's
+/// does on close. The real holder keeps running under another name in the same folder, so
+/// `Setup` still closes it.
+fn writes_on_close(setup: &Setup, id: TerminalId, worktree: &Path) -> std::thread::JoinHandle<()> {
+    use std::io::Read as _;
+    let dir = setup.data.path().join("terminals");
+    let socket = dir.join(format!("{id}.sock"));
+    std::fs::rename(&socket, dir.join(format!("{id}-real.sock"))).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let late = worktree.join("late.txt");
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let mut request = [0u8; 64];
+            if stream.read(&mut request).unwrap_or(0) > 0 {
+                std::fs::write(&late, "written while hung up").unwrap();
+                return;
+            }
+        }
+    })
+}
+
+#[tokio::test]
+async fn work_written_while_the_terminals_close_is_refused_and_kept() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup.create(&remote, "main", "racing").await;
+    let worktree = setup.worktree(remote.project, "racing");
+    let terminal = setup.sleeper(id, &worktree).await;
+    let stand_in = writes_on_close(&setup, terminal, &worktree);
+
+    let err = setup.workspaces.archive(id, false).await.unwrap_err();
+    stand_in.join().unwrap();
+    let WorkspaceError::Dirty(dirty) = err else {
+        panic!("{err}");
+    };
+    assert_eq!(dirty.uncommitted, ["late.txt"]);
+    assert!(worktree.join("late.txt").exists());
+    assert!(!setup.record(id).unwrap().deleted);
+}
+
+#[tokio::test]
+async fn a_clean_worktree_with_a_submodule_archives_without_force() {
+    let setup = Setup::new();
+    let library = setup.project(&[("lib.txt", "lib\n")]);
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    git(
+        &remote.src,
+        &[
+            "submodule",
+            "add",
+            "-q",
+            library.bare.to_str().unwrap(),
+            "lib",
+        ],
+    );
+    git(&remote.src, &["commit", "-q", "-m", "add lib"]);
+    git(&remote.src, &["push", "-q", "origin", "main"]);
+    let id = setup.create(&remote, "main", "with lib").await;
+    let worktree = setup.worktree(remote.project, "with-lib");
+    git(&worktree, &["submodule", "update", "-q", "--init"]);
+    assert!(worktree.join("lib").join("lib.txt").exists());
+
+    // Work inside the submodule is uncommitted work of the workspace.
+    std::fs::write(worktree.join("lib").join("lib.txt"), "changed\n").unwrap();
+    let err = setup.workspaces.archive(id, false).await.unwrap_err();
+    let WorkspaceError::Dirty(dirty) = err else {
+        panic!("{err}");
+    };
+    assert_eq!(dirty.uncommitted, ["lib"]);
+
+    git(&worktree.join("lib"), &["checkout", "-q", "--", "lib.txt"]);
+    setup.workspaces.archive(id, false).await.unwrap();
+    assert!(!worktree.exists());
+}
+
+#[tokio::test]
+async fn two_archives_at_once_archive_once() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup.create(&remote, "main", "twice").await;
+    let (a, b) = tokio::join!(
+        setup.workspaces.archive(id, false),
+        setup.workspaces.archive(id, false),
+    );
+    let unknown = [&a, &b]
+        .iter()
+        .filter(|r| matches!(r, Err(WorkspaceError::Unknown(w)) if *w == id))
+        .count();
+    assert_eq!(unknown, 1, "{a:?} {b:?}");
+    assert!(a.is_ok() || b.is_ok(), "{a:?} {b:?}");
+    let records = setup.store.lock().unwrap().since(setup.me, 0).unwrap();
+    let deleted = records
+        .iter()
+        .filter(|r| matches!(r, AnyRecord::Workspace(w) if w.body.id == id && w.deleted))
+        .count();
+    assert_eq!(deleted, 1);
+    // One write for the create and one for the archive.
+    let versions = setup.store.lock().unwrap().versions().unwrap();
+    assert_eq!(versions.get(&setup.me), Some(&2));
+}
+
+#[tokio::test]
+async fn a_create_that_cannot_record_its_workspace_leaves_no_branch_behind() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    setup.create(&remote, "main", "first").await;
+
+    // The store cannot make its journal in a folder it may not write.
+    let mode = |m| {
+        std::fs::set_permissions(setup.data.path(), std::fs::Permissions::from_mode(m)).unwrap()
+    };
+    mode(0o500);
+    let err = setup
+        .workspaces
+        .create(remote.project, "main", "second")
+        .await;
+    mode(0o700);
+    assert!(matches!(err, Err(WorkspaceError::Store(_))), "{err:?}");
+
+    let clone = setup.clone_of(remote.project);
+    let branches = git(
+        &clone,
+        &["for-each-ref", "--format=%(refname)", "refs/heads/"],
+    );
+    assert!(!branches.contains("second"), "{branches}");
+    assert!(!setup.worktree(remote.project, "second").exists());
+    setup.create(&remote, "main", "second").await;
 }
