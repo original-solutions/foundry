@@ -49,13 +49,40 @@ struct Args {
 }
 
 fn main() -> ExitCode {
-    match start(Args::parse()) {
+    let args = match Args::try_parse() {
+        Ok(args) => args,
+        Err(e) => {
+            // The env file may hold secrets, so it goes even when nothing else was understood.
+            if let Some(path) = env_file_arg() {
+                let _ = std::fs::remove_file(path);
+            }
+            e.exit()
+        }
+    };
+    match start(args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(reason) => {
             eprintln!("foundry-holder: {reason}");
             ExitCode::FAILURE
         }
     }
+}
+
+/// The `--env-file` value from the raw arguments, for when they do not parse.
+fn env_file_arg() -> Option<PathBuf> {
+    let mut args = std::env::args_os().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            return None;
+        }
+        if arg == "--env-file" {
+            return args.next().map(PathBuf::from);
+        }
+        if let Some(path) = arg.to_str().and_then(|a| a.strip_prefix("--env-file=")) {
+            return Some(PathBuf::from(path));
+        }
+    }
+    None
 }
 
 /// Runs in the starter's process. Returns once the detached holder serves the socket.

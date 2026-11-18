@@ -1,8 +1,10 @@
 //! The holder's loop: read the PTY into the scrollback, serve the socket, record the exit.
 //!
-//! One task owns all state. It never waits on a client: output goes to each attached client
-//! through a bounded queue, and a client whose queue is full is disconnected. A child is therefore
-//! never blocked by a slow reader, and memory stays bounded with or without clients.
+//! One task owns all state. It never waits on a client: each frame is encoded once and appended to
+//! every attached client's outbox, which that client's writer takes whole, and a client with more
+//! than [`MAX_BACKLOG`] bytes unsent is disconnected.
+//! A child is therefore never blocked by a slow reader, and memory stays bounded with or without
+//! clients.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -11,26 +13,28 @@ use std::os::fd::AsFd as _;
 use std::os::unix::net::UnixListener as StdUnixListener;
 use std::path::Path;
 use std::process::Child;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use bytes::Bytes;
-use foundry_holder::protocol::{self, ChildStatus, Reply, Request};
+use foundry_holder::protocol::{
+    self, ChildStatus, MAX_PENDING_INPUT, Reply, Request, UNKNOWN_EXIT,
+};
 use foundry_holder::pty::{self, Pty};
 use foundry_holder::scrollback::{MAX_BYTES, Scrollback};
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
+use tokio::io::AsyncWriteExt as _;
 use tokio::io::unix::AsyncFd;
+use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 
 const READ_CHUNK: usize = 64 * 1024;
 
-/// Replies queued for one client before it counts as too slow and is disconnected. It can attach
-/// again and gets the snapshot.
-const CLIENT_QUEUE: usize = 64;
-
-/// Typed input held while the child is not reading it. Input over this is dropped.
-const MAX_PENDING_INPUT: usize = 1024 * 1024;
+/// Bytes queued for one client, a full snapshot included, before it counts as too slow and is
+/// disconnected. It can attach again and gets the snapshot.
+const MAX_BACKLOG: usize = 2 * MAX_BYTES;
 
 /// Serves until a client sends `Close`, then removes the socket.
 pub fn run(listener: StdUnixListener, socket: &Path, pty: Pty, child: Child) -> io::Result<()> {
@@ -44,12 +48,86 @@ pub fn run(listener: StdUnixListener, socket: &Path, pty: Pty, child: Child) -> 
 
 enum Event {
     Request(u64, Request),
+    /// The client sent a frame the holder cannot read.
+    Unreadable(u64, String),
     Gone(u64),
 }
 
 struct Client {
-    replies: mpsc::Sender<Reply>,
+    outbox: Arc<Outbox>,
     attached: bool,
+}
+
+impl Client {
+    /// Queues an encoded frame. False when the client is too far behind.
+    fn queue(&self, frame: &[u8]) -> bool {
+        let mut state = self.outbox.lock();
+        if state.unsent.len() + state.writing + frame.len() > MAX_BACKLOG {
+            return false;
+        }
+        state.unsent.extend_from_slice(frame);
+        self.outbox.ready.notify_one();
+        true
+    }
+}
+
+impl Drop for Client {
+    /// The writer sends what is queued, then closes the connection.
+    fn drop(&mut self) {
+        self.outbox.lock().closed = true;
+        self.outbox.ready.notify_one();
+    }
+}
+
+/// Frames waiting for one client's writer, as one buffer, so memory is what is queued and a fast
+/// client gets many frames per write.
+#[derive(Default)]
+struct Outbox {
+    state: Mutex<OutboxState>,
+    ready: Notify,
+}
+
+#[derive(Default)]
+struct OutboxState {
+    unsent: Vec<u8>,
+    /// Bytes the writer has taken and not finished writing.
+    writing: usize,
+    closed: bool,
+}
+
+impl Outbox {
+    fn lock(&self) -> MutexGuard<'_, OutboxState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Writes until the client is dropped and everything queued is sent. Dropping the write half
+    /// at the end shuts the connection down.
+    async fn write_to(&self, mut wr: OwnedWriteHalf) {
+        loop {
+            let (chunk, closed) = {
+                let mut state = self.lock();
+                let chunk = std::mem::take(&mut state.unsent);
+                state.writing = chunk.len();
+                (chunk, state.closed)
+            };
+            if !chunk.is_empty() {
+                if wr.write_all(&chunk).await.is_err() {
+                    return;
+                }
+                self.lock().writing = 0;
+            } else if closed {
+                return;
+            } else {
+                self.ready.notified().await;
+            }
+        }
+    }
+}
+
+#[derive(PartialEq)]
+enum Flow {
+    Continue,
+    Close,
 }
 
 #[derive(Default)]
@@ -71,7 +149,7 @@ async fn serve(listener: StdUnixListener, pty: Pty, mut child: Child) -> io::Res
 
     let (exit_tx, mut exit_rx) = oneshot::channel();
     std::thread::spawn(move || {
-        let code = child.wait().map_or(-1, pty::exit_code);
+        let code = child.wait().map_or(UNKNOWN_EXIT, pty::exit_code);
         let _ = exit_tx.send(code);
     });
 
@@ -104,7 +182,7 @@ async fn serve(listener: StdUnixListener, pty: Pty, mut child: Child) -> io::Res
             }
             code = &mut exit_rx, if term.exit.is_none() => {
                 drain(master.get_ref(), &mut buf, &mut term);
-                term.exited(code.unwrap_or(-1));
+                term.exited(code.unwrap_or(UNKNOWN_EXIT));
             }
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => {
@@ -115,13 +193,18 @@ async fn serve(listener: StdUnixListener, pty: Pty, mut child: Child) -> io::Res
                 Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
             },
             Some(event) = events.recv() => match event {
-                Event::Request(_, Request::Close) => {
-                    if term.exit.is_none() {
-                        let _ = killpg(group, Signal::SIGHUP);
+                // A client already dropped (too slow, or refused) is not heard any more.
+                Event::Request(id, _) | Event::Unreadable(id, _)
+                    if !term.clients.contains_key(&id) => {}
+                Event::Request(id, request) => {
+                    if term.handle(id, request, master.get_ref()) == Flow::Close {
+                        if term.exit.is_none() {
+                            let _ = killpg(group, Signal::SIGHUP);
+                        }
+                        return Ok(());
                     }
-                    return Ok(());
                 }
-                Event::Request(id, request) => term.handle(id, request, master.get_ref()),
+                Event::Unreadable(id, reason) => term.refuse(id, reason),
                 Event::Gone(id) => {
                     term.clients.remove(&id);
                 }
@@ -132,50 +215,54 @@ async fn serve(listener: StdUnixListener, pty: Pty, mut child: Child) -> io::Res
 
 impl Terminal {
     fn connect(&mut self, id: u64, stream: UnixStream, events: mpsc::Sender<Event>) {
-        let (mut rd, mut wr) = stream.into_split();
-        let (replies, mut queue) = mpsc::channel::<Reply>(CLIENT_QUEUE);
+        let (mut rd, wr) = stream.into_split();
+        let outbox = Arc::new(Outbox::default());
         self.clients.insert(
             id,
             Client {
-                replies,
+                outbox: outbox.clone(),
                 attached: false,
             },
         );
-        // Ends when the client is dropped from `clients` or stops reading; dropping the write
-        // half shuts the connection down.
+        tokio::spawn(async move { outbox.write_to(wr).await });
         tokio::spawn(async move {
-            while let Some(reply) = queue.recv().await {
-                if protocol::write_reply(&mut wr, &reply).await.is_err() {
-                    break;
-                }
-            }
-        });
-        tokio::spawn(async move {
-            while let Ok(Some(request)) = protocol::read_request(&mut rd).await {
-                if events.send(Event::Request(id, request)).await.is_err() {
+            loop {
+                let event = match protocol::read_request(&mut rd).await {
+                    Ok(Some(request)) => Event::Request(id, request),
+                    Ok(None) => Event::Gone(id),
+                    Err(e) => Event::Unreadable(id, e.to_string()),
+                };
+                let last = !matches!(event, Event::Request(..));
+                if events.send(event).await.is_err() || last {
                     return;
                 }
             }
-            let _ = events.send(Event::Gone(id)).await;
         });
     }
 
-    fn handle(&mut self, id: u64, request: Request, master: &File) {
+    fn handle(&mut self, id: u64, request: Request, master: &File) -> Flow {
         match request {
             Request::Attach => {
                 if let Some(client) = self.clients.get_mut(&id) {
                     client.attached = true;
                 }
-                self.send(id, Reply::Snapshot(Bytes::from(self.scrollback.snapshot())));
+                let snapshot = Reply::Snapshot {
+                    start: self.scrollback.start(),
+                    bytes: Bytes::from(self.scrollback.snapshot()),
+                };
+                self.send(id, snapshot);
                 if let Some(code) = self.exit {
                     self.send(id, Reply::Status(ChildStatus::Exited(code)));
                 }
             }
-            Request::Input(bytes) => {
-                if self.exit.is_none() && self.input.len() + bytes.len() <= MAX_PENDING_INPUT {
-                    self.input.extend_from_slice(&bytes);
-                }
+            Request::Input(_) if self.exit.is_some() => {}
+            Request::Input(bytes) if self.input.len() + bytes.len() > MAX_PENDING_INPUT => {
+                self.refuse(
+                    id,
+                    format!("input refused: over {MAX_PENDING_INPUT} bytes the child has not read"),
+                );
             }
+            Request::Input(bytes) => self.input.extend_from_slice(&bytes),
             Request::Resize { cols, rows } => {
                 if cols > 0 && rows > 0 {
                     let _ = pty::set_size(master.as_fd(), cols, rows);
@@ -188,33 +275,39 @@ impl Terminal {
                 };
                 self.send(id, Reply::Status(status));
             }
-            Request::Close => {}
+            Request::Close => return Flow::Close,
         }
+        Flow::Continue
+    }
+
+    /// Tells the client why, then drops it, which closes its connection.
+    fn refuse(&mut self, id: u64, reason: String) {
+        self.send(id, Reply::Refused(reason));
+        self.clients.remove(&id);
     }
 
     fn output(&mut self, data: &[u8]) {
         self.scrollback.push(data);
         if self.clients.values().any(|c| c.attached) {
-            let bytes = Bytes::copy_from_slice(data);
-            self.broadcast(|| Reply::Output(bytes.clone()));
+            self.broadcast(&Reply::Output(Bytes::copy_from_slice(data)));
         }
     }
 
     fn exited(&mut self, code: i32) {
         self.exit = Some(code);
         self.input.clear();
-        self.broadcast(|| Reply::Status(ChildStatus::Exited(code)));
+        self.broadcast(&Reply::Status(ChildStatus::Exited(code)));
     }
 
-    /// Sends to every attached client and drops each one that cannot take it now.
-    fn broadcast(&mut self, reply: impl Fn() -> Reply) {
-        self.clients
-            .retain(|_, c| !c.attached || c.replies.try_send(reply()).is_ok());
+    /// Queues for every attached client and drops each one that is too far behind.
+    fn broadcast(&mut self, reply: &Reply) {
+        let frame = reply.encode();
+        self.clients.retain(|_, c| !c.attached || c.queue(&frame));
     }
 
     fn send(&mut self, id: u64, reply: Reply) {
         if let Some(client) = self.clients.get(&id)
-            && client.replies.try_send(reply).is_err()
+            && !client.queue(&reply.encode())
         {
             self.clients.remove(&id);
         }

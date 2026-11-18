@@ -4,6 +4,11 @@
 //! the body. A connection carries any number of requests. After `Attach` it also carries the
 //! snapshot, the live output and, once the child exits, its status.
 //!
+//! The holder answers a frame it cannot read, another version included, with `Refused` and closes
+//! the connection. That frame carries the holder's own version byte, so a newer client learns which
+//! version to speak. A connection the holder closes with no `Refused` belonged to a client too slow
+//! to keep up with the output: it can attach again.
+//!
 //! A running holder cannot be updated without ending its terminal, so this protocol changes
 //! rarely, and every frame names the version it speaks.
 
@@ -16,6 +21,19 @@ pub const VERSION: u8 = 1;
 /// The largest frame either side accepts, version and kind bytes included.
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
 
+/// Typed input the holder keeps while the child is not reading it. An `Input` that would take it
+/// over this is refused and its connection closed, so input is never dropped from the middle of a
+/// stream.
+pub const MAX_PENDING_INPUT: usize = 4 * 1024 * 1024;
+
+/// The code `Exited` carries when the holder could not learn the child's exit status.
+pub const UNKNOWN_EXIT: i32 = -1;
+
+// A full scrollback fits in one Snapshot frame (kind, version and start offset included), and
+// the largest input the holder keeps fits in one Input frame.
+const _: () = assert!(crate::scrollback::MAX_BYTES + 10 <= MAX_FRAME);
+const _: () = assert!(MAX_PENDING_INPUT + 2 <= MAX_FRAME);
+
 const ATTACH: u8 = 1;
 const INPUT: u8 = 2;
 const RESIZE: u8 = 3;
@@ -24,13 +42,14 @@ const CLOSE: u8 = 5;
 const SNAPSHOT: u8 = 0x81;
 const OUTPUT: u8 = 0x82;
 const STATUS_REPLY: u8 = 0x84;
+const REFUSED: u8 = 0x85;
 
 /// What a client asks of the holder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
     /// Send the snapshot, then live output, on this connection.
     Attach,
-    /// Bytes typed into the terminal.
+    /// Bytes typed into the terminal. See [`MAX_PENDING_INPUT`].
     Input(Bytes),
     Resize {
         cols: u16,
@@ -45,17 +64,25 @@ pub enum Request {
 /// What the holder sends a client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reply {
-    /// The kept screen and scrollback, the first reply to `Attach`.
-    Snapshot(Bytes),
+    /// The kept screen and scrollback, the first reply to `Attach`. `start` is the offset of its
+    /// first byte in everything the child has written, so the live output that follows starts at
+    /// `start + bytes.len()`. A client that reattaches skips what it already has, or sees a gap.
+    Snapshot {
+        start: u64,
+        bytes: Bytes,
+    },
     /// Live output, after the snapshot.
     Output(Bytes),
     Status(ChildStatus),
+    /// Why the holder is closing this connection.
+    Refused(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChildStatus {
     Running,
-    /// The exit code, or 128 plus the signal number when a signal ended the child.
+    /// The exit code, 128 plus the signal number when a signal ended the child, or
+    /// [`UNKNOWN_EXIT`].
     Exited(i32),
 }
 
@@ -110,21 +137,25 @@ impl Request {
 impl Reply {
     /// The whole frame, length prefix included.
     pub fn encode(&self) -> Vec<u8> {
-        match self {
-            Reply::Snapshot(bytes) => frame(SNAPSHOT, bytes),
-            Reply::Output(bytes) => frame(OUTPUT, bytes),
-            Reply::Status(ChildStatus::Running) => frame(STATUS_REPLY, &[0]),
-            Reply::Status(ChildStatus::Exited(code)) => {
-                frame(STATUS_REPLY, &[&[1][..], &code.to_be_bytes()].concat())
-            }
-        }
+        let (kind, head, body) = self.parts();
+        let mut frame = Vec::with_capacity(6 + head.len() + body.len());
+        frame.extend_from_slice(&header(kind, head.len() + body.len()));
+        frame.extend_from_slice(&head);
+        frame.extend_from_slice(body);
+        frame
     }
 
     /// Decodes a frame's payload: everything after the length prefix.
     pub fn decode(payload: &[u8]) -> Result<Self, Error> {
         let (kind, body) = open(payload)?;
         match kind {
-            SNAPSHOT => Ok(Reply::Snapshot(Bytes::copy_from_slice(body))),
+            SNAPSHOT => match body.split_first_chunk::<8>() {
+                Some((start, bytes)) => Ok(Reply::Snapshot {
+                    start: u64::from_be_bytes(*start),
+                    bytes: Bytes::copy_from_slice(bytes),
+                }),
+                None => Err(Error::Malformed("snapshot")),
+            },
             OUTPUT => Ok(Reply::Output(Bytes::copy_from_slice(body))),
             STATUS_REPLY => match body {
                 [0] => Ok(Reply::Status(ChildStatus::Running)),
@@ -133,7 +164,23 @@ impl Reply {
                 ])))),
                 _ => Err(Error::Malformed("status")),
             },
+            REFUSED => String::from_utf8(body.to_vec())
+                .map(Reply::Refused)
+                .map_err(|_| Error::Malformed("refusal")),
             other => Err(Error::Kind(other)),
+        }
+    }
+
+    /// The kind, a short head and the body, so a large body is copied once into its frame.
+    fn parts(&self) -> (u8, Vec<u8>, &[u8]) {
+        match self {
+            Reply::Snapshot { start, bytes } => (SNAPSHOT, start.to_be_bytes().to_vec(), bytes),
+            Reply::Output(bytes) => (OUTPUT, Vec::new(), bytes),
+            Reply::Status(ChildStatus::Running) => (STATUS_REPLY, vec![0], &[]),
+            Reply::Status(ChildStatus::Exited(code)) => {
+                (STATUS_REPLY, [&[1][..], &code.to_be_bytes()].concat(), &[])
+            }
+            Reply::Refused(reason) => (REFUSED, Vec::new(), reason.as_bytes()),
         }
     }
 }
@@ -162,18 +209,18 @@ pub async fn write_request<W: AsyncWrite + Unpin>(
     Ok(w.flush().await?)
 }
 
-pub async fn write_reply<W: AsyncWrite + Unpin>(w: &mut W, reply: &Reply) -> Result<(), Error> {
-    w.write_all(&reply.encode()).await?;
-    Ok(w.flush().await?)
-}
-
 fn frame(kind: u8, body: &[u8]) -> Vec<u8> {
-    let len = u32::try_from(body.len() + 2).expect("a frame body fits in u32");
     let mut frame = Vec::with_capacity(body.len() + 6);
-    frame.extend_from_slice(&len.to_be_bytes());
-    frame.extend_from_slice(&[VERSION, kind]);
+    frame.extend_from_slice(&header(kind, body.len()));
     frame.extend_from_slice(body);
     frame
+}
+
+/// The length prefix, version and kind of a frame with a body of `body_len` bytes.
+fn header(kind: u8, body_len: usize) -> [u8; 6] {
+    let len = u32::try_from(body_len + 2).expect("a frame body fits in u32");
+    let [a, b, c, d] = len.to_be_bytes();
+    [a, b, c, d, VERSION, kind]
 }
 
 fn open(payload: &[u8]) -> Result<(u8, &[u8]), Error> {
@@ -300,29 +347,6 @@ mod tests {
             assert_eq!(reply.encode(), bytes, "{reply:?}");
             assert_eq!(Reply::decode(&bytes[4..]).unwrap(), reply);
         }
-    }
-
-    #[tokio::test]
-    async fn a_written_reply_is_the_encoded_frame() {
-        let reply = Reply::Snapshot {
-            start: 3,
-            bytes: Bytes::from(vec![7u8; 100_000]),
-        };
-        let (mut client, mut server) = tokio::io::duplex(1 << 20);
-        write_reply(&mut server, &reply).await.unwrap();
-        drop(server);
-        let mut written = Vec::new();
-        tokio::io::AsyncReadExt::read_to_end(&mut client, &mut written)
-            .await
-            .unwrap();
-        assert_eq!(written, reply.encode());
-    }
-
-    #[test]
-    fn a_full_scrollback_fits_in_one_snapshot_frame() {
-        let header = 2 + 8;
-        assert!(crate::scrollback::MAX_BYTES + header <= MAX_FRAME);
-        assert!(MAX_PENDING_INPUT + 2 <= MAX_FRAME);
     }
 
     #[test]

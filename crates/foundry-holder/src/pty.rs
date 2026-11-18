@@ -46,6 +46,12 @@ impl Pty {
         let (program, args) = argv
             .split_first()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no command to run"))?;
+        if !cwd.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("cwd {} is not a directory", cwd.display()),
+            ));
+        }
         let mut command = Command::new(program);
         command
             .args(args)
@@ -100,10 +106,15 @@ pub fn exit_code(status: ExitStatus) -> i32 {
 pub fn read_env_file(path: &Path) -> io::Result<Vec<(String, String)>> {
     let text = std::fs::read(path)?;
     std::fs::remove_file(path)?;
+    // The parser's message can quote a value from the file, so only its position is reported.
     let vars: BTreeMap<String, String> = serde_json::from_slice(&text).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("not a JSON object of strings: {e}"),
+            format!(
+                "not a JSON object of strings (line {}, column {})",
+                e.line(),
+                e.column()
+            ),
         )
     })?;
     Ok(vars.into_iter().collect())

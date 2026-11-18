@@ -1,8 +1,8 @@
 //! The current screen and the last 10,000 lines of scrollback.
 //!
-//! The holder is not a terminal emulator. It keeps the raw bytes the PTY produced, trimmed from the
-//! front, and a client replays them into its own emulator (xterm.js) to get the same screen and
-//! history back.
+//! The holder is not a terminal emulator. It keeps the tail of the raw bytes the PTY produced, cut
+//! at a line, and a client replays them into its own emulator (xterm.js) to rebuild the screen and
+//! history. Terminal modes set before the kept tail began are not replayed.
 
 use std::collections::VecDeque;
 
@@ -74,6 +74,11 @@ impl Scrollback {
         while self.newlines.len() > self.max_lines {
             self.drop_to_next_line();
         }
+    }
+
+    /// The offset of the oldest kept byte in everything pushed.
+    pub fn start(&self) -> u64 {
+        self.start
     }
 
     /// Everything kept, oldest first.
