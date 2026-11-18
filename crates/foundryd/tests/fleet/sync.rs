@@ -2,17 +2,20 @@
 //! silent machine reads as offline with its sessions unreachable.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::io;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use foundry_proto::ids::MachineId;
 use foundry_proto::messages::{PROTOCOL, PeerMessage};
 use foundry_proto::record::AnyRecord;
-use foundry_proto::settings::{Machine, SharedSettings};
+use foundry_proto::settings::Machine;
 use foundry_proto::state::{SessionState, TerminalState};
-use foundryd::store::Store;
 use foundryd::sync::ws::{WsDialer, router};
-use foundryd::sync::{Conn, OFFLINE_AFTER, Peers};
+use foundryd::sync::{BATCH, Conn, Dialer, OFFLINE_AFTER, Peers};
+use futures::future::BoxFuture;
+use tokio::sync::mpsc;
 use tokio::time::{Instant, timeout};
 
 use crate::*;
@@ -187,8 +190,7 @@ async fn a_cut_off_machine_shows_offline_on_the_others_within_15_seconds_with_it
 
 #[tokio::test(start_paused = true)]
 async fn a_workspace_archived_while_a_returning_peer_holds_its_old_copy_stays_archived() {
-    let stray = MachineId::random();
-    let fleet = Fleet::start_with(3, &[stray]);
+    let fleet = Fleet::start(3);
     let a = &fleet.daemons[0];
     let ids = Ids::random();
     let live = a.write(workspace(ids.workspace, false));
@@ -206,9 +208,10 @@ async fn a_workspace_archived_while_a_returning_peer_holds_its_old_copy_stays_ar
         assert_eq!(daemon.held(is_it), Some(archived.clone()));
     }
 
-    // A peer that still sends the old copy changes nothing.
-    let mut conn = raw_link(&a.peers);
-    send(&conn, &hello(PROTOCOL, stray)).await;
+    // The old copy, sent again by its own owner to the returning peer, changes nothing.
+    let returned = &fleet.daemons[2];
+    let mut conn = raw_link(&returned.peers);
+    send(&conn, &hello(PROTOCOL, a.id)).await;
     next(&mut conn).await.expect("a hello back");
     send(
         &conn,
@@ -309,39 +312,18 @@ async fn two_daemons_linked_over_websockets_converge() {
         .map(|l| l.local_addr().unwrap().port())
         .collect();
     let ids = [MachineId::random(), MachineId::random()];
-    let settings = SharedSettings {
-        seq: 1,
-        machines: ids
-            .iter()
-            .enumerate()
-            .map(|(i, id)| Machine {
-                id: *id,
-                name: format!("machine-{i}"),
-                address: "127.0.0.1".into(),
-            })
-            .collect(),
-        priority: ids.to_vec(),
-        ..SharedSettings::default()
-    };
+    let mut settings = settings_for(&ids);
+    for machine in &mut settings.machines {
+        machine.address = "127.0.0.1".into();
+    }
 
     let mut daemons = Vec::new();
     for (i, listener) in listeners.into_iter().enumerate() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut store = Store::open(dir.path().join("foundry.db")).unwrap();
-        store.apply_settings(settings.clone()).unwrap();
-        let store = Arc::new(Mutex::new(store));
         // Each daemon dials the port the other one serves on.
         let dialer = WsDialer { port: ports[1 - i] };
-        let peers = Peers::new(ids[i], store.clone(), Arc::new(dialer));
-        tokio::spawn(axum::serve(listener, router(peers.clone())).into_future());
-        let running = peers.clone();
-        tokio::spawn(async move { running.run().await });
-        daemons.push(Daemon {
-            id: ids[i],
-            store,
-            peers,
-            _dir: dir,
-        });
+        let daemon = Daemon::start(ids[i], &settings, Arc::new(dialer));
+        tokio::spawn(axum::serve(listener, router(daemon.peers.clone())).into_future());
+        daemons.push(daemon);
     }
     for daemon in &daemons {
         populate(daemon, Ids::random(), SessionState::Idle);
@@ -375,4 +357,290 @@ async fn a_link_to_a_peer_silent_for_15_seconds_is_closed() {
         );
     }
     assert!(start.elapsed() >= OFFLINE_AFTER - Duration::from_secs(1));
+}
+
+/// A dialer that hands the test the far end of every link it dials, so the test can answer as
+/// the dialed machine. With `hang_first`, its first dial never finishes.
+struct TapDialer {
+    dials: mpsc::UnboundedSender<(Machine, Conn)>,
+    hang_first: AtomicBool,
+}
+
+impl Dialer for TapDialer {
+    fn dial(&self, peer: &Machine) -> BoxFuture<'static, io::Result<Conn>> {
+        if self.hang_first.swap(false, Ordering::SeqCst) {
+            return Box::pin(futures::future::pending());
+        }
+        let (mine, theirs) = Conn::pair();
+        let _ = self.dials.send((peer.clone(), theirs));
+        Box::pin(async move { Ok(mine) })
+    }
+}
+
+/// A daemon for the first of `ids` that dials the others through a [`TapDialer`].
+fn tapped(
+    ids: &[MachineId],
+    hang_first: bool,
+) -> (Daemon, mpsc::UnboundedReceiver<(Machine, Conn)>) {
+    let (dials, tap) = mpsc::unbounded_channel();
+    let dialer = TapDialer {
+        dials,
+        hang_first: AtomicBool::new(hang_first),
+    };
+    let daemon = Daemon::start(ids[0], &settings_for(ids), Arc::new(dialer));
+    (daemon, tap)
+}
+
+/// The next link the daemon dials, within `limit`.
+async fn dialed(
+    tap: &mut mpsc::UnboundedReceiver<(Machine, Conn)>,
+    limit: Duration,
+) -> (Machine, Conn) {
+    timeout(limit, tap.recv())
+        .await
+        .expect("a dial within the limit")
+        .expect("the daemon is running")
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_dialed_peer_speaking_an_older_protocol_is_sent_the_older_message_form() {
+    let (me, old) = (MachineId::random(), MachineId::random());
+    let (daemon, mut tap) = tapped(&[me, old], false);
+    populate(&daemon, Ids::random(), SessionState::Idle);
+    let older = PROTOCOL - 1;
+
+    let (_, mut conn) = dialed(&mut tap, Duration::from_secs(5)).await;
+    let first = next(&mut conn).await.expect("the dialer says hello first");
+    assert_eq!(first["type"], "hello");
+    send(&conn, &hello(older, old)).await;
+    let mut records = 0;
+    for _ in 0..4 {
+        let message = next(&mut conn).await.expect("the link stays open");
+        assert_eq!(message["protocol"], older, "{message}");
+        if message["type"] == "records" {
+            records += message["records"].as_array().unwrap().len();
+        }
+    }
+    assert_eq!(records, 4, "the catch-up arrived in the older form");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_dialed_address_that_answers_as_another_machine_is_refused() {
+    let (me, dialed_one, other) = (
+        MachineId::random(),
+        MachineId::random(),
+        MachineId::random(),
+    );
+    let (daemon, mut tap) = tapped(&[me, dialed_one, other], false);
+    populate(&daemon, Ids::random(), SessionState::Idle);
+
+    loop {
+        let (machine, mut conn) = dialed(&mut tap, Duration::from_secs(5)).await;
+        if machine.id != dialed_one {
+            continue;
+        }
+        next(&mut conn).await.expect("the dialer says hello first");
+        send(&conn, &hello(PROTOCOL, other)).await;
+        assert_eq!(next(&mut conn).await, None, "closed with nothing sent");
+        break;
+    }
+    assert!(!daemon.peers.online().contains(&other));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_dial_that_never_finishes_is_given_up_and_tried_again() {
+    let (me, peer) = (MachineId::random(), MachineId::random());
+    let (_daemon, mut tap) = tapped(&[me, peer], true);
+
+    let (machine, _conn) = dialed(&mut tap, Duration::from_secs(10)).await;
+    assert_eq!(machine.id, peer);
+}
+
+#[tokio::test(start_paused = true)]
+async fn machines_added_to_or_changed_in_the_list_are_dialed_and_old_entries_are_not() {
+    let (me, x, y) = (
+        MachineId::random(),
+        MachineId::random(),
+        MachineId::random(),
+    );
+    let (daemon, mut tap) = tapped(&[me, x], false);
+    let (first, _) = dialed(&mut tap, Duration::from_secs(5)).await;
+    assert_eq!(first.id, x);
+    let old_address = first.address.clone();
+
+    let mut settings = settings_for(&[me, x, y]);
+    settings.seq = 2;
+    settings.machines[1].address = "100.64.9.9".into();
+    daemon.set_settings(settings);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    while tap.try_recv().is_ok() {}
+
+    let mut seen = Vec::new();
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(5) {
+        if let Ok(Some((machine, _))) = timeout(Duration::from_secs(1), tap.recv()).await {
+            seen.push(machine);
+        }
+    }
+    assert!(
+        seen.iter().any(|m| m.id == y),
+        "the added machine is dialed"
+    );
+    assert!(
+        seen.iter().any(|m| m.id == x && m.address == "100.64.9.9"),
+        "the changed machine is dialed at its new address"
+    );
+    assert!(
+        seen.iter().all(|m| m.address != old_address),
+        "the old address is not dialed again: {seen:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_machine_removed_from_the_list_is_dropped_on_every_link() {
+    let fleet = Fleet::start(2);
+    let (a, b) = (&fleet.daemons[0], &fleet.daemons[1]);
+    populated(&fleet, SessionState::Idle);
+    until(Duration::from_secs(10), "first sync", || fleet.converged()).await;
+
+    let mut settings = settings_for(&[a.id]);
+    settings.seq = 2;
+    a.set_settings(settings);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let later = b.write(sample(9));
+    tokio::time::sleep(Duration::from_secs(20)).await;
+
+    let later = serde_json::to_string(&later).unwrap();
+    assert!(
+        !a.dump().contains(&later),
+        "a removed machine's records are not taken"
+    );
+    assert!(!a.peers.online().contains(&b.id));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_machine_with_an_unreadable_record_of_its_own_stays_online() {
+    let fleet = Fleet::start(2);
+    let (a, b) = (&fleet.daemons[0], &fleet.daemons[1]);
+    let ids = populated(&fleet, SessionState::Idle);
+    until(Duration::from_secs(10), "first sync", || fleet.converged()).await;
+
+    // A row a newer build wrote, in a state this build does not know, then rolled back.
+    let version = lock(&a.store).own_next_version().unwrap();
+    let mut row = serde_json::to_value(session(
+        ids[0].session,
+        ids[0].workspace,
+        ids[0].terminal,
+        SessionState::Idle,
+    )(a.id, version))
+    .unwrap();
+    row["body"]["state"] = serde_json::json!("dreaming");
+    let db = rusqlite::Connection::open(&a.db).unwrap();
+    db.execute(
+        "UPDATE records SET version = ?1, record = ?2 WHERE kind = 'session' AND id = ?3",
+        rusqlite::params![version as i64, row.to_string(), ids[0].session.to_string()],
+    )
+    .unwrap();
+
+    tokio::time::sleep(OFFLINE_AFTER * 4).await;
+    assert!(b.peers.online().contains(&a.id), "a is still heard from");
+    let state = a.peers.state().expect("the other owners still show");
+    assert!(state.iter().any(|record| record.owner() == b.id));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_batch_the_receiver_cannot_read_ends_the_link_and_nothing_after_it_is_taken() {
+    let newer = MachineId::random();
+    let fleet = Fleet::start_with(1, &[newer]);
+    let a = &fleet.daemons[0];
+    let ids = Ids::random();
+
+    let mut conn = raw_link(&a.peers);
+    send(&conn, &hello(PROTOCOL, newer)).await;
+    next(&mut conn).await.expect("a hello back");
+    let mut unreadable = serde_json::to_value(session(
+        ids.session,
+        ids.workspace,
+        ids.terminal,
+        SessionState::Idle,
+    )(newer, 1))
+    .unwrap();
+    unreadable["body"]["state"] = serde_json::json!("dreaming");
+    let batch =
+        serde_json::json!({ "type": "records", "protocol": PROTOCOL, "records": [unreadable] });
+    conn.send.send(batch.to_string()).await.unwrap();
+    let _ = conn
+        .send
+        .send(
+            serde_json::to_string(&PeerMessage::Records {
+                protocol: PROTOCOL,
+                records: vec![workspace(ids.workspace, false)(newer, 2)],
+            })
+            .unwrap(),
+        )
+        .await;
+
+    let start = Instant::now();
+    while next(&mut conn).await.is_some() {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the link is still open"
+        );
+    }
+    let is_newer = |record: &AnyRecord| record.owner() == newer;
+    assert_eq!(
+        a.held(is_newer),
+        None,
+        "nothing past the unreadable batch is taken"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_large_catch_up_is_sent_in_batches() {
+    let peer = MachineId::random();
+    let fleet = Fleet::start_with(1, &[peer]);
+    let a = &fleet.daemons[0];
+    let total = BATCH * 2 + 1;
+    for _ in 0..total {
+        a.write(workspace(foundry_proto::ids::WorkspaceId::random(), false));
+    }
+
+    let mut conn = raw_link(&a.peers);
+    send(&conn, &hello(PROTOCOL, peer)).await;
+    let mut received = 0;
+    while received < total {
+        let message = next(&mut conn).await.expect("the link stays open");
+        if message["type"] == "records" {
+            let n = message["records"].as_array().unwrap().len();
+            assert!(n <= BATCH, "a message of {n} records");
+            received += n;
+        }
+    }
+    assert_eq!(received, total);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_hello_naming_this_machine_or_no_hello_at_all_is_refused() {
+    let fleet = Fleet::start(1);
+    let a = &fleet.daemons[0];
+    populate(a, Ids::random(), SessionState::Idle);
+
+    let mut conn = raw_link(&a.peers);
+    send(&conn, &hello(PROTOCOL, a.id)).await;
+    assert_eq!(next(&mut conn).await, None, "a hello as this machine");
+
+    let mut conn = raw_link(&a.peers);
+    conn.send.send("{}".into()).await.unwrap();
+    assert_eq!(
+        next(&mut conn).await,
+        None,
+        "a first message that is not a hello"
+    );
+
+    let mut conn = raw_link(&a.peers);
+    assert_eq!(
+        next(&mut conn).await,
+        None,
+        "no hello within the offline limit"
+    );
 }

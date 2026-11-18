@@ -10,6 +10,7 @@ mod sync;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -25,15 +26,43 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-/// One machine's daemon: its store and its peer links.
+/// One machine's daemon: its store and its peer links, running until it is dropped.
 pub struct Daemon {
     pub id: MachineId,
     pub store: Arc<Mutex<Store>>,
     pub peers: Peers,
+    pub db: PathBuf,
+    run: JoinHandle<()>,
     _dir: TempDir,
 }
 
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        self.run.abort();
+    }
+}
+
 impl Daemon {
+    /// Starts a daemon for machine `id` holding `settings`, dialing its peers with `dialer`.
+    pub fn start(id: MachineId, settings: &SharedSettings, dialer: Arc<dyn Dialer>) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("foundry.db");
+        let mut store = Store::open(&db).unwrap();
+        assert!(store.apply_settings(settings.clone()).unwrap());
+        let store = Arc::new(Mutex::new(store));
+        let peers = Peers::new(id, store.clone(), dialer);
+        let running = peers.clone();
+        let run = tokio::spawn(async move { running.run().await });
+        Self {
+            id,
+            store,
+            peers,
+            db,
+            run,
+            _dir: dir,
+        }
+    }
+
     /// Writes one of this machine's own records under its next version and returns it.
     pub fn write(&self, make: impl FnOnce(MachineId, u64) -> AnyRecord) -> AnyRecord {
         let mut store = lock(&self.store);
@@ -43,27 +72,53 @@ impl Daemon {
         record
     }
 
-    /// Every record held, from every owner, in a stable order.
-    pub fn dump(&self) -> Vec<String> {
-        let store = lock(&self.store);
-        let mut records: Vec<String> = Vec::new();
-        for owner in store.versions().unwrap().into_keys() {
-            for record in store.since(owner, 0).unwrap() {
-                records.push(serde_json::to_string(&record).unwrap());
-            }
-        }
-        records.sort();
-        records
+    /// Replaces the shared settings this daemon holds.
+    pub fn set_settings(&self, settings: SharedSettings) {
+        assert!(lock(&self.store).apply_settings(settings).unwrap());
     }
 
-    /// The copy held of a record of `kind` and `id`, if any.
-    pub fn held(&self, find: impl Fn(&AnyRecord) -> bool) -> Option<AnyRecord> {
+    /// Every record held, from every owner.
+    fn all(&self) -> Vec<AnyRecord> {
         let store = lock(&self.store);
         let owners: Vec<MachineId> = store.versions().unwrap().into_keys().collect();
         owners
             .into_iter()
             .flat_map(|owner| store.since(owner, 0).unwrap())
-            .find(|record| find(record))
+            .collect()
+    }
+
+    /// Every record held, as JSON, in a stable order.
+    pub fn dump(&self) -> Vec<String> {
+        let mut records: Vec<String> = self
+            .all()
+            .iter()
+            .map(|record| serde_json::to_string(record).unwrap())
+            .collect();
+        records.sort();
+        records
+    }
+
+    /// The first record held that `find` accepts.
+    pub fn held(&self, find: impl Fn(&AnyRecord) -> bool) -> Option<AnyRecord> {
+        self.all().into_iter().find(|record| find(record))
+    }
+}
+
+/// Settings listing `ids`, each named `machine-<i>` with its own address.
+pub fn settings_for(ids: &[MachineId]) -> SharedSettings {
+    SharedSettings {
+        seq: 1,
+        machines: ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| Machine {
+                id: *id,
+                name: format!("machine-{i}"),
+                address: format!("100.64.0.{}", i + 1),
+            })
+            .collect(),
+        priority: ids.to_vec(),
+        ..SharedSettings::default()
     }
 }
 
@@ -71,15 +126,6 @@ impl Daemon {
 pub struct Fleet {
     pub daemons: Vec<Daemon>,
     net: Arc<Net>,
-    runs: Vec<JoinHandle<()>>,
-}
-
-impl Drop for Fleet {
-    fn drop(&mut self) {
-        for run in &self.runs {
-            run.abort();
-        }
-    }
 }
 
 impl Fleet {
@@ -92,45 +138,22 @@ impl Fleet {
     /// so a test can speak for them over a raw link.
     pub fn start_with(n: usize, extra: &[MachineId]) -> Self {
         let ids: Vec<MachineId> = (0..n).map(|_| MachineId::random()).collect();
-        let settings = SharedSettings {
-            seq: 1,
-            machines: ids
-                .iter()
-                .chain(extra)
-                .enumerate()
-                .map(|(i, id)| Machine {
-                    id: *id,
-                    name: format!("machine-{i}"),
-                    address: format!("100.64.0.{}", i + 1),
-                })
-                .collect(),
-            priority: ids.clone(),
-            ..SharedSettings::default()
-        };
+        let listed: Vec<MachineId> = ids.iter().chain(extra).copied().collect();
+        let settings = settings_for(&listed);
         let net = Arc::new(Net::default());
-        let mut daemons = Vec::new();
-        let mut runs = Vec::new();
-        for id in ids {
-            let dir = tempfile::tempdir().unwrap();
-            let mut store = Store::open(dir.path().join("foundry.db")).unwrap();
-            assert!(store.apply_settings(settings.clone()).unwrap());
-            let store = Arc::new(Mutex::new(store));
-            let dialer = NetDialer {
-                from: id,
-                net: net.clone(),
-            };
-            let peers = Peers::new(id, store.clone(), Arc::new(dialer));
-            lock(&net.peers).insert(id, peers.clone());
-            let running = peers.clone();
-            runs.push(tokio::spawn(async move { running.run().await }));
-            daemons.push(Daemon {
-                id,
-                store,
-                peers,
-                _dir: dir,
-            });
-        }
-        Self { daemons, net, runs }
+        let daemons = ids
+            .into_iter()
+            .map(|id| {
+                let dialer = NetDialer {
+                    from: id,
+                    net: net.clone(),
+                };
+                let daemon = Daemon::start(id, &settings, Arc::new(dialer));
+                lock(&net.peers).insert(id, daemon.peers.clone());
+                daemon
+            })
+            .collect();
+        Self { daemons, net }
     }
 
     /// Cuts every link to and from daemon `i`, and refuses new ones until it is healed.
