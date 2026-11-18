@@ -1139,6 +1139,48 @@ mod tests {
         assert!(!setup.socket(stale).exists(), "the stale socket is removed");
     }
 
+    /// A socket that refuses connections while its lock is held is a busy holder, not a gone
+    /// one: nothing lets go of it or records an exit until the lock is free.
+    #[tokio::test]
+    async fn a_refusing_socket_whose_lock_is_held_is_not_taken_for_gone() {
+        use nix::fcntl::{Flock, FlockArg};
+
+        let setup = Setup::new();
+        let (terminals, store) = setup.daemon();
+        let id = put_running(&store, setup.me);
+        std::fs::create_dir_all(setup.dir()).unwrap();
+        let socket = setup.socket(id);
+        drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+        let lock_path = socket.with_extension("lock");
+        let lock = Flock::lock(
+            std::fs::File::create(&lock_path).unwrap(),
+            FlockArg::LockExclusiveNonblock,
+        )
+        .map_err(|(_, e)| e)
+        .unwrap();
+
+        terminals.reattach_all().await.unwrap();
+        let error = terminals.close(id).await.unwrap_err();
+        assert!(matches!(error, TerminalError::Holder { .. }), "{error:?}");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(socket.exists(), "the socket is left");
+        assert!(terminals.inner.entry(id).is_ok(), "the terminal stays live");
+        let record = held(&store, setup.me, id).unwrap();
+        assert!(!record.deleted);
+        assert_eq!(record.body.state, TerminalState::Running);
+
+        drop(lock);
+        until("the record to say exited", || {
+            held(&store, setup.me, id).unwrap().body.state == TerminalState::Exited
+        })
+        .await;
+        assert_eq!(held(&store, setup.me, id).unwrap().body.exit_code, None);
+        terminals.close(id).await.unwrap();
+        assert!(held(&store, setup.me, id).unwrap().deleted);
+        assert!(!socket.exists(), "the stale socket is removed");
+        assert!(!lock_path.exists(), "its lock file is removed");
+    }
+
     #[tokio::test]
     async fn a_holder_that_ends_while_the_daemon_runs_is_recorded_exited_and_can_be_closed() {
         let setup = Setup::new();
@@ -1429,8 +1471,8 @@ mod tests {
         );
         assert_eq!(
             setup.left(),
-            vec![format!("{id}.sock")],
-            "only the socket is left"
+            vec![format!("{id}.lock"), format!("{id}.sock")],
+            "only the socket and its holder's lock are left"
         );
         let mode = std::fs::metadata(setup.dir()).unwrap().permissions().mode();
         assert_eq!(
@@ -1847,8 +1889,8 @@ mod tests {
         assert!(!record.deleted);
         assert_eq!(
             setup.left(),
-            vec![format!("{id}.sock")],
-            "only the socket is left"
+            vec![format!("{id}.lock"), format!("{id}.sock")],
+            "only the socket and its holder's lock are left"
         );
         let (snapshot, _) = terminals.attach(id).await.unwrap();
         assert_eq!(snapshot.start, 0, "the holder that came up is attached to");

@@ -565,6 +565,7 @@ fn a_missing_working_directory_is_named_as_such() {
     assert!(!output.status.success());
     assert!(stderr.contains("cwd /no/such/dir"), "{stderr}");
     assert!(!socket.exists());
+    assert!(!lock_file(&socket).exists());
 }
 
 #[tokio::test]
@@ -698,6 +699,7 @@ async fn a_command_that_cannot_start_fails_the_starter() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("/no/such/program"));
     assert!(!socket.exists());
+    assert!(!lock_file(&socket).exists());
 }
 
 #[tokio::test]
