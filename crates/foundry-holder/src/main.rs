@@ -155,18 +155,31 @@ fn hold(args: Args, env: Vec<(String, String)>, mut ready: PipeWriter) -> i32 {
     drop(env);
     match started {
         Ok((_lock, pty, listener, child)) => {
-            if !tell_ready(ready, &args.socket, &lock_path, &child) {
-                return 1;
-            }
-            match server::run(listener, &args.socket, &lock_path, pty, child) {
-                Ok(()) => 0,
-                Err(_) => 1,
-            }
+            serve(ready, listener, &args.socket, &lock_path, pty, child)
         }
         Err(reason) => {
             let _ = ready.write_all(reason.as_bytes());
             1
         }
+    }
+}
+
+/// Serves the socket once the starter has heard it is ready, and returns the holder's exit code.
+/// The only way into `server::run`, so a holder whose starter is gone never serves.
+fn serve(
+    ready: PipeWriter,
+    listener: UnixListener,
+    socket: &Path,
+    lock: &Path,
+    pty: Pty,
+    child: Child,
+) -> i32 {
+    if !tell_ready(ready, socket, lock, &child) {
+        return 1;
+    }
+    match server::run(listener, socket, lock, pty, child) {
+        Ok(()) => 0,
+        Err(_) => 1,
     }
 }
 
@@ -295,6 +308,98 @@ mod tests {
         );
         assert!(!args.socket.exists(), "the socket is left behind");
         assert!(!lock_path.exists(), "the lock file is left behind");
+    }
+
+    /// The pid a shell child wrote to `path`, once it is there.
+    fn pid_in(path: &Path) -> Pid {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(pid) = std::fs::read_to_string(path)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+            {
+                return Pid::from_raw(pid);
+            }
+            assert!(Instant::now() < deadline, "{} never written", path.display());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn gone_within(pid: Pid, limit: Duration) -> bool {
+        let deadline = Instant::now() + limit;
+        while Instant::now() < deadline {
+            if nix::sys::signal::kill(pid, None) == Err(Errno::ESRCH) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    #[test]
+    fn a_holder_whose_starter_is_gone_exits_1_without_serving() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let args = args(dir.path());
+        let lock_path = args.socket.with_extension("lock");
+        let lock = lock(&lock_path).expect("lock");
+        let (pty, listener, child) = open(&args, &[]).expect("open");
+        let pid = Pid::from_raw(i32::try_from(child.id()).expect("pid"));
+        let (reader, writer) = std::io::pipe().expect("pipe");
+        drop(reader);
+
+        let (done, outcome) = std::sync::mpsc::channel();
+        let (socket, lock_file) = (args.socket.clone(), lock_path.clone());
+        std::thread::spawn(move || {
+            let _lock = lock;
+            let _ = done.send(serve(writer, listener, &socket, &lock_file, pty, child));
+        });
+        let code = outcome.recv_timeout(Duration::from_secs(5));
+
+        if code.is_err() {
+            let _ = nix::sys::signal::kill(pid, Signal::SIGKILL);
+        }
+        let _ = waitpid(pid, None);
+        assert_eq!(
+            code.ok(),
+            Some(1),
+            "the holder serves though its starter never heard it"
+        );
+    }
+
+    #[test]
+    fn a_starter_that_is_gone_hangs_up_the_childs_whole_group() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut args = args(dir.path());
+        let background = dir.path().join("background");
+        // The job starts before the trap, so SIGHUP ends it; the shell ignores SIGHUP. The shell
+        // never exits, so the hangup a session leader's exit sends cannot end the job either: only
+        // a signal to the whole group can. The pid is written after the trap is set.
+        args.argv = vec![
+            "sh".into(),
+            "-c".into(),
+            format!(
+                "sleep 30 & trap '' HUP; echo $! > '{}'; wait",
+                background.display()
+            )
+            .into(),
+        ];
+        let lock_path = args.socket.with_extension("lock");
+        let _lock = lock(&lock_path).expect("lock");
+        let (_pty, _listener, mut child) = open(&args, &[]).expect("open");
+        let job = pid_in(&background);
+        let (reader, writer) = std::io::pipe().expect("pipe");
+        drop(reader);
+
+        let serve = tell_ready(writer, &args.socket, &lock_path, &child);
+
+        let hung_up = gone_within(job, Duration::from_secs(5));
+        if !hung_up {
+            let _ = nix::sys::signal::kill(job, Signal::SIGKILL);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(!serve, "the holder serves though its starter never heard it");
+        assert!(hung_up, "a process in the child's group is still running");
     }
 
     #[test]
