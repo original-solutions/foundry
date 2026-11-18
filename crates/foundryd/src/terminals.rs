@@ -1,9 +1,11 @@
 //! Starts holders, reattaches to them after a restart, and relays their bytes.
 //!
 //! Each terminal is a `foundry-holder` process serving a socket at
-//! `<data dir>/terminals/<id>.sock`. The holder outlives this daemon, so a daemon that starts
-//! again finds its terminals through their records in the store and their sockets, and attaches
-//! to them again with [`Terminals::reattach_all`].
+//! `<data dir>/terminals/<id>.sock` and holding a lock on `<id>.lock` beside it for as long as it
+//! runs. A socket that refuses connections is a gone holder only when that lock is free: on macOS
+//! a holder whose queue of new connections is full refuses too. The holder outlives this daemon,
+//! so a daemon that starts again finds its terminals through their records in the store and
+//! their sockets, and attaches to them again with [`Terminals::reattach_all`].
 //!
 //! Each terminal's record is kept current: running once it is started, exited when the holder
 //! reports the child's exit or when its socket is gone, and deleted once it is closed. A record
@@ -26,6 +28,8 @@ use foundry_proto::record::{AnyRecord, Record, Terminal};
 use foundry_proto::state::TerminalState;
 use futures::StreamExt as _;
 use futures::stream::BoxStream;
+use nix::errno::Errno;
+use nix::fcntl::{Flock, FlockArg};
 use tokio::net::UnixStream;
 use tokio::task::AbortHandle;
 
@@ -42,11 +46,6 @@ const ANSWER_WITHIN: Duration = Duration::from_secs(10);
 /// How long a holder has to serve its socket before the process started for it is killed.
 /// Unless a holder serves the socket by then, the start fails.
 const START_WITHIN: Duration = Duration::from_secs(30);
-
-/// A socket that refuses connections this many times, this far apart, has no holder behind it.
-/// One refusal alone can be a holder whose queue of new connections is full.
-const REFUSALS_FOR_GONE: u32 = 3;
-const REFUSAL_RETRY: Duration = Duration::from_millis(100);
 
 #[derive(Debug, thiserror::Error)]
 pub enum TerminalError {
@@ -513,13 +512,15 @@ impl Entry {
     }
 
     /// Sends `Close` and waits for the holder to end the connection as it exits. A holder that
-    /// is gone is done; a stale socket it left is removed.
+    /// is gone is done; a stale socket it left is removed, with its lock file, which `connect`
+    /// found free.
     async fn hang_up(&self) -> Result<(), TerminalError> {
         let mut stream = match connect(&self.socket).await {
             Ok(stream) => stream,
             Err(Unreachable::Gone { stale }) => {
                 if stale {
                     let _ = tokio::fs::remove_file(&self.socket).await;
+                    let _ = tokio::fs::remove_file(lock_file(&self.socket)).await;
                 }
                 return Ok(());
             }
@@ -590,29 +591,48 @@ fn no_answer() -> io::Error {
 
 /// Why a holder's socket could not be connected to.
 enum Unreachable {
-    /// No holder serves it: the socket is missing, or `stale`, a file nothing listens on.
+    /// No holder serves it: the socket is missing, or `stale`, a file that refuses connections
+    /// and whose lock no holder holds.
     Gone { stale: bool },
-    /// Something else, which may pass.
+    /// Something else, which may pass, such as a busy holder that refuses.
     Failed(io::Error),
 }
 
 async fn connect(socket: &Path) -> Result<UnixStream, Unreachable> {
-    let mut refusals = 0;
-    loop {
-        match UnixStream::connect(socket).await {
-            Ok(stream) => return Ok(stream),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                return Err(Unreachable::Gone { stale: false });
+    match UnixStream::connect(socket).await {
+        Ok(stream) => Ok(stream),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Err(Unreachable::Gone { stale: false }),
+        Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
+            match holder_runs(&lock_file(socket)) {
+                Ok(false) => Err(Unreachable::Gone { stale: true }),
+                Ok(true) => Err(Unreachable::Failed(io::Error::new(
+                    e.kind(),
+                    "the holder refused the connection while it runs: it is busy",
+                ))),
+                Err(e) => Err(Unreachable::Failed(e)),
             }
-            Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
-                refusals += 1;
-                if refusals == REFUSALS_FOR_GONE {
-                    return Err(Unreachable::Gone { stale: true });
-                }
-                tokio::time::sleep(REFUSAL_RETRY).await;
-            }
-            Err(e) => return Err(Unreachable::Failed(e)),
         }
+        Err(e) => Err(Unreachable::Failed(e)),
+    }
+}
+
+/// The file the holder serving `socket` keeps locked for as long as it runs.
+fn lock_file(socket: &Path) -> PathBuf {
+    socket.with_extension("lock")
+}
+
+/// Whether a holder holds the lock at `path`, found without waiting. No file is no holder:
+/// holders started before the lock was kept have none.
+fn holder_runs(path: &Path) -> io::Result<bool> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+        Ok(_free) => Ok(false),
+        Err((_, Errno::EWOULDBLOCK)) => Ok(true),
+        Err((_, e)) => Err(e.into()),
     }
 }
 

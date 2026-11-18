@@ -18,7 +18,7 @@ use std::io::{PipeWriter, Read as _, Write as _};
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Child, ExitCode};
 
 use clap::Parser;
 use foundry_holder::pty::{self, Pty};
@@ -142,13 +142,12 @@ fn hold(args: Args, env: Vec<(String, String)>, mut ready: PipeWriter) -> i32 {
     let lock_path = args.socket.with_extension("lock");
     let started = quiet_stdio().and_then(|()| {
         let lock = lock(&lock_path)?;
-        let pty = Pty::open(COLS, ROWS).map_err(|e| format!("pty: {e}"))?;
-        let listener = bind(&args.socket)?;
-        match pty.spawn(&args.argv, &args.cwd, &env) {
-            Ok(child) => Ok((lock, pty, listener, child)),
-            Err(e) => {
-                let _ = std::fs::remove_file(&args.socket);
-                Err(e.to_string())
+        match open(&args, &env) {
+            Ok((pty, listener, child)) => Ok((lock, pty, listener, child)),
+            Err(reason) => {
+                // Removed while still held, so no holder that is running loses its file.
+                let _ = std::fs::remove_file(&lock_path);
+                Err(reason)
             }
         }
     });
@@ -165,6 +164,19 @@ fn hold(args: Args, env: Vec<(String, String)>, mut ready: PipeWriter) -> i32 {
         Err(reason) => {
             let _ = ready.write_all(reason.as_bytes());
             1
+        }
+    }
+}
+
+/// Opens the PTY, binds the socket and starts the child on the PTY.
+fn open(args: &Args, env: &[(String, String)]) -> Result<(Pty, UnixListener, Child), String> {
+    let pty = Pty::open(COLS, ROWS).map_err(|e| format!("pty: {e}"))?;
+    let listener = bind(&args.socket)?;
+    match pty.spawn(&args.argv, &args.cwd, env) {
+        Ok(child) => Ok((pty, listener, child)),
+        Err(e) => {
+            let _ = std::fs::remove_file(&args.socket);
+            Err(e.to_string())
         }
     }
 }
