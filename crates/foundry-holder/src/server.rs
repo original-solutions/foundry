@@ -33,9 +33,10 @@ use tokio::task::AbortHandle;
 
 const READ_CHUNK: usize = 64 * 1024;
 
-/// Bytes queued for one client, a full snapshot included, before it counts as too slow and is
-/// disconnected. It can attach again and gets the snapshot.
-const MAX_BACKLOG: usize = 2 * MAX_BYTES;
+/// Output one client may have unsent, beyond its snapshot, before it counts as too slow and is
+/// disconnected. It can attach again and gets the snapshot. Small, so each stalled connection
+/// costs the holder little.
+const MAX_BACKLOG: usize = 4 * 1024 * 1024;
 
 /// Serves until a client sends `Close`, then removes the socket.
 pub fn run(listener: StdUnixListener, socket: &Path, pty: Pty, child: Child) -> io::Result<()> {
@@ -60,13 +61,15 @@ struct Client {
     /// `None` once the writer is left to finish on its own.
     writer: Option<AbortHandle>,
     attached: bool,
+    /// Bytes it may have unsent: [`MAX_BACKLOG`], plus its snapshot once attached.
+    allowance: usize,
 }
 
 impl Client {
     /// Queues an encoded frame. False when the client is too far behind.
     fn queue(&self, frame: &[u8]) -> bool {
         let mut state = self.outbox.lock();
-        if state.unsent.len() + state.writing + frame.len() > MAX_BACKLOG {
+        if state.unsent.len() + state.writing + frame.len() > self.allowance {
             return false;
         }
         state.unsent.extend_from_slice(frame);
@@ -264,6 +267,7 @@ impl Terminal {
                 reader: reader.abort_handle(),
                 writer: Some(writer.abort_handle()),
                 attached: false,
+                allowance: MAX_BACKLOG,
             },
         );
     }
@@ -271,14 +275,16 @@ impl Terminal {
     fn handle(&mut self, id: u64, request: Request, master: &File) -> Flow {
         match request {
             Request::Attach => {
-                if let Some(client) = self.clients.get_mut(&id) {
-                    client.attached = true;
-                }
                 let snapshot = Reply::Snapshot {
                     start: self.scrollback.start(),
                     bytes: Bytes::from(self.scrollback.snapshot()),
                 };
-                self.send(id, snapshot);
+                let frame = snapshot.encode();
+                if let Some(client) = self.clients.get_mut(&id) {
+                    client.attached = true;
+                    client.allowance = MAX_BACKLOG + frame.len();
+                }
+                self.send_frame(id, &frame);
                 if let Some(code) = self.exit {
                     self.send(id, Reply::Status(ChildStatus::Exited(code)));
                 }
@@ -336,8 +342,12 @@ impl Terminal {
     }
 
     fn send(&mut self, id: u64, reply: Reply) {
+        self.send_frame(id, &reply.encode());
+    }
+
+    fn send_frame(&mut self, id: u64, frame: &[u8]) {
         if let Some(client) = self.clients.get(&id)
-            && !client.queue(&reply.encode())
+            && !client.queue(frame)
         {
             self.clients.remove(&id);
         }
