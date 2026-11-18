@@ -296,7 +296,7 @@ impl Inner {
             .await?;
         if branches.lines().any(|b| fold(b) == fold(&branch))
             || tokio::fs::try_exists(&worktree).await?
-            || self.registered_head(&clone, &worktree).await?.is_some()
+            || self.registered(&clone, &worktree).await?.is_some()
         {
             return Err(WorkspaceError::BranchExists(branch));
         }
@@ -311,7 +311,13 @@ impl Inner {
                 ],
             )
             .await
-            .map_err(|_| WorkspaceError::UnknownBase(base.to_owned()))?
+            .map_err(|e| match e {
+                // What `--verify --quiet` gives for a ref that is not there.
+                WorkspaceError::Git { ref stderr, .. } if stderr.is_empty() => {
+                    WorkspaceError::UnknownBase(base.to_owned())
+                }
+                e => e,
+            })?
             .trim()
             .to_owned();
         // Git refuses a branch that is already there, by any spelling it reads as the same.
@@ -384,10 +390,11 @@ impl Inner {
                 self.refuse_dirty(&clone, &worktree, &body.branch).await?;
             }
             self.remove_worktree(&clone, &worktree, force).await?;
-        } else if self.registered_head(&clone, &worktree).await?.is_some() {
+        } else if let Some((listed, _)) = self.registered(&clone, &worktree).await? {
             // Removed by hand: git forgets this worktree, and only this one, so its branch can be
-            // checked out again.
-            self.remove_worktree(&clone, &worktree, force).await?;
+            // checked out again. Named as git listed it, since git cannot resolve a path whose
+            // folders are gone.
+            self.remove_worktree(&clone, &listed, force).await?;
         }
         self.write(body, true).await
     }
@@ -423,16 +430,17 @@ impl Inner {
             .await;
     }
 
-    /// The commit git keeps as `HEAD` for a worktree registered at `worktree`, whether or not its
-    /// folder is still there. `None` when no worktree is registered there.
-    async fn registered_head(
+    /// The path git lists, and the commit it keeps as `HEAD`, for a worktree registered at
+    /// `worktree`, whether or not its folder is still there. `None` when none is registered
+    /// there.
+    async fn registered(
         &self,
         clone: &Path,
         worktree: &Path,
-    ) -> Result<Option<String>, WorkspaceError> {
-        let list = self
-            .git(clone, "worktree", ["list", "--porcelain", "-z"])
-            .await?;
+    ) -> Result<Option<(PathBuf, String)>, WorkspaceError> {
+        // Line by line: the paths that matter end in `<project>/<branch>`, and neither part can
+        // hold a line break.
+        let list = self.git(clone, "worktree", ["list", "--porcelain"]).await?;
         // Every worktree of a clone sits at `worktrees/<project>/<branch>`, so the last two
         // parts name it, however git spelled the folders above.
         let tail = |p: &Path| {
@@ -441,22 +449,23 @@ impl Inner {
                 p.parent().and_then(Path::file_name).map(OsStr::to_owned),
             )
         };
-        let mut here = false;
-        for line in list.split('\0') {
+        let mut here = None;
+        for line in list.lines() {
             if let Some(path) = line.strip_prefix("worktree ") {
-                here = tail(Path::new(path)) == tail(worktree);
+                here = (tail(Path::new(path)) == tail(worktree)).then(|| PathBuf::from(path));
             } else if let Some(head) = line.strip_prefix("HEAD ")
-                && here
+                && let Some(path) = here.take()
             {
-                return Ok(Some(head.to_owned()));
+                return Ok(Some((path, head.to_owned())));
             }
         }
         Ok(None)
     }
 
     /// [`WorkspaceError::Dirty`] when the worktree has uncommitted files or a checked-out
-    /// submodule, or the branch or the worktree's `HEAD` has commits no remote branch has. The
-    /// `HEAD` is the one git keeps for the worktree, so it counts even when its folder is gone.
+    /// submodule, or the branch or the worktree's `HEAD` has commits no remote branch has. With
+    /// the folder there, the `HEAD` is read inside it, which git resolves however the path is
+    /// spelled; with it gone, it is the one git keeps for the worktree.
     async fn refuse_dirty(
         &self,
         clone: &Path,
@@ -464,8 +473,15 @@ impl Inner {
         branch: &str,
     ) -> Result<(), WorkspaceError> {
         let mut heads = vec![format!("refs/heads/{branch}")];
-        heads.extend(self.registered_head(clone, worktree).await?);
         let present = tokio::fs::try_exists(worktree).await?;
+        if present {
+            let head = self
+                .git(worktree, "rev-parse", ["--verify", "HEAD"])
+                .await?;
+            heads.push(head.trim().to_owned());
+        } else if let Some((_, head)) = self.registered(clone, worktree).await? {
+            heads.push(head);
+        }
         let (uncommitted, submodules) = if present {
             let submodules = self
                 .git(
