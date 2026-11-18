@@ -162,14 +162,14 @@ Dependencies are in brackets. Tasks with no dependency between them can build at
 - **Produces:** `foundryd join <address> <code>`; a one-time code valid for 10 minutes; a key per machine checked on every peer link; revoking a machine; `Secrets::get` and `set` over the macOS keychain or a 0600 file.
 - **Tests:** a code works once and not after 10 minutes. A peer with a revoked key is refused and shown as revoked. A link with no key is refused. The Linux secrets file is created 0600 and a wider mode is refused at read.
 
-### 14. Coordinator [12, 13]
+### 14. Coordinator [12, 13, 20]
 
 - **Spec:** The coordinator role.
 - **Files:** `crates/foundryd/src/coordinator.rs`.
 - **Produces:** a pure `acting(priority, reachable) -> MachineId`; settings edits accepted only on the acting coordinator, numbered in one sequence and sent to all; a returning higher-priority machine that catches up before it takes the role.
 - **Tests:** in the fleet harness, stopping the coordinator moves the role within 15 seconds while a session on another machine keeps producing output (acceptance 8). An edit sent to a machine that is not acting is forwarded. After a split with one edit on each side, the later edit holds and a "setting overwritten" item shows both values.
 
-### 15. Placement [8, 12, 14]
+### 15. Placement [8, 12, 14, 20]
 
 - **Spec:** Placement.
 - **Files:** `crates/foundryd/src/placement.rs`.
@@ -183,14 +183,14 @@ Dependencies are in brackets. Tasks with no dependency between them can build at
 - **Produces:** a terminal socket opened on machine A for a terminal owned by machine B, carried over the A to B peer link.
 - **Tests:** in the fleet harness, input typed through A reaches a `cat` child on B and its output returns. Cutting the link closes the socket with a reason, and healing it gives the snapshot again.
 
-### 17. Attention list and gateway health [6, 9, 11, 12, 14]
+### 17. Attention list and gateway health [6, 9, 11, 12, 14, 20]
 
 - **Spec:** Attention items in P1, State is always visible (gateway).
 - **Files:** `crates/foundryd/src/attention.rs`, `crates/foundryd/src/gateway.rs`, `web/src/attention/*`.
 - **Produces:** each of the ten items in the spec's table raised and cleared by its rule, the list in the UI, and a gateway reader that uses the management key.
 - **Tests:** one test per row of the table for the raise and one for the clear. A "waiting for you" item appears within 5 seconds of the hook (acceptance 7). A gateway that refuses the connection, and one with every account cooling down, each raise the item.
 
-### 18. Service and self-update [5, 12]
+### 18. Service and self-update [5, 12, 20]
 
 - **Spec:** Updates, Checked before the plan is written (rows 3 and 4).
 - **Files:** `crates/foundryd/src/service.rs`, `crates/foundryd/src/update.rs`, `docs/install.md`.
