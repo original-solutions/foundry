@@ -19,6 +19,9 @@ pub struct Record<T> {
 
 impl<T> Record<T> {
     /// True only when `self` comes from the same owner as `other` with a higher version.
+    ///
+    /// Versions count every write by an owner, so the caller must already know both are
+    /// copies of the same record, matched by the body's id.
     pub fn supersedes(&self, other: &Self) -> bool {
         self.owner == other.owner && self.version > other.version
     }
@@ -42,6 +45,8 @@ pub struct Workspace {
 pub struct Terminal {
     pub id: TerminalId,
     pub workspace: WorkspaceId,
+    /// Never `Unreachable` as written by the owner: a receiver shows that when the owner is
+    /// offline, without changing the record.
     pub state: TerminalState,
     /// The child's exit code once it has exited, when known.
     pub exit_code: Option<i32>,
@@ -54,13 +59,15 @@ pub struct Session {
     pub workspace: WorkspaceId,
     pub terminal: TerminalId,
     pub model: String,
+    /// Never `Unreachable` as written by the owner: a receiver shows that when the owner is
+    /// offline, without changing the record.
     pub state: SessionState,
 }
 
 /// The owner machine's load, memory, disk and session count.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MachineSample {
-    /// The 1-minute load divided by logical cores.
+    /// The 1-minute load divided by logical cores. Always finite: JSON has no NaN.
     pub load_per_core: f64,
     /// Bytes.
     pub free_memory: u64,
@@ -77,6 +84,37 @@ pub enum AnyRecord {
     Terminal(Record<Terminal>),
     Session(Record<Session>),
     MachineSample(Record<MachineSample>),
+}
+
+impl AnyRecord {
+    pub fn owner(&self) -> MachineId {
+        match self {
+            Self::Workspace(r) => r.owner,
+            Self::Terminal(r) => r.owner,
+            Self::Session(r) => r.owner,
+            Self::MachineSample(r) => r.owner,
+        }
+    }
+
+    pub fn version(&self) -> u64 {
+        match self {
+            Self::Workspace(r) => r.version,
+            Self::Terminal(r) => r.version,
+            Self::Session(r) => r.version,
+            Self::MachineSample(r) => r.version,
+        }
+    }
+
+    /// [`Record::supersedes`] for two records of the same kind. Never true across kinds.
+    pub fn supersedes(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Workspace(a), Self::Workspace(b)) => a.supersedes(b),
+            (Self::Terminal(a), Self::Terminal(b)) => a.supersedes(b),
+            (Self::Session(a), Self::Session(b)) => a.supersedes(b),
+            (Self::MachineSample(a), Self::MachineSample(b)) => a.supersedes(b),
+            _ => false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -268,9 +306,8 @@ pub(crate) mod tests {
             (
                 wire(
                     "machine_sample",
-                    format!(
-                        r#"{{"load_per_core":0.5,"free_memory":1,"free_disk":2,"sessions":3}}"#
-                    ),
+                    r#"{"load_per_core":0.5,"free_memory":1,"free_disk":2,"sessions":3}"#
+                        .to_string(),
                 ),
                 AnyRecord::MachineSample(Record {
                     owner: MachineId(id(owner)),

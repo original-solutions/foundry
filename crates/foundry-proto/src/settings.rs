@@ -40,6 +40,7 @@ pub struct Project {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Limits {
     pub max_sessions: u32,
+    /// Always finite: JSON has no NaN.
     pub max_load_per_core: f64,
     /// Bytes.
     pub min_free_disk: u64,
