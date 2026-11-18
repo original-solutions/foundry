@@ -648,7 +648,10 @@ fn a_holder_whose_lock_is_held_fails_to_start_and_names_the_lock_file() {
     let socket = dir.path().join("h.sock");
     let lock = lock_file(&socket);
     std::fs::write(&lock, b"").unwrap();
-    let _held = try_lock(&lock).unwrap();
+    // Shared, so only a request for the exclusive lock fails on it.
+    let _held = Flock::lock(File::open(&lock).unwrap(), FlockArg::LockSharedNonblock)
+        .map_err(|(_, e)| e)
+        .unwrap();
     let output = run_starter(holder_command(
         &dir,
         &socket,

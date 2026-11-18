@@ -1159,25 +1159,32 @@ mod tests {
         assert!(!setup.socket(stale).exists(), "the stale socket is removed");
     }
 
+    /// A running record whose holder left a socket nothing listens on, with a lock file beside
+    /// it that no one holds. Gives the terminal, its socket and its lock file.
+    fn refusing_terminal(setup: &Setup, store: &Mutex<Store>) -> (TerminalId, PathBuf, PathBuf) {
+        let id = put_running(store, setup.me);
+        std::fs::create_dir_all(setup.dir()).unwrap();
+        let socket = setup.socket(id);
+        drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+        let lock = lock_file(&socket);
+        std::fs::File::create(&lock).unwrap();
+        (id, socket, lock)
+    }
+
+    fn take_lock(path: &Path, arg: FlockArg) -> Flock<std::fs::File> {
+        Flock::lock(std::fs::File::open(path).unwrap(), arg)
+            .map_err(|(_, e)| e)
+            .unwrap()
+    }
+
     /// A socket that refuses connections while its lock is held is a busy holder, not a gone
     /// one: nothing lets go of it or records an exit until the lock is free.
     #[tokio::test]
     async fn a_refusing_socket_whose_lock_is_held_is_not_taken_for_gone() {
-        use nix::fcntl::{Flock, FlockArg};
-
         let setup = Setup::new();
         let (terminals, store) = setup.daemon();
-        let id = put_running(&store, setup.me);
-        std::fs::create_dir_all(setup.dir()).unwrap();
-        let socket = setup.socket(id);
-        drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
-        let lock_path = socket.with_extension("lock");
-        let lock = Flock::lock(
-            std::fs::File::create(&lock_path).unwrap(),
-            FlockArg::LockExclusiveNonblock,
-        )
-        .map_err(|(_, e)| e)
-        .unwrap();
+        let (id, socket, lock_path) = refusing_terminal(&setup, &store);
+        let lock = take_lock(&lock_path, FlockArg::LockExclusiveNonblock);
 
         terminals.reattach_all().await.unwrap();
         let error = terminals.close(id).await.unwrap_err();
@@ -1199,6 +1206,53 @@ mod tests {
         assert!(held(&store, setup.me, id).unwrap().deleted);
         assert!(!socket.exists(), "the stale socket is removed");
         assert!(!lock_path.exists(), "its lock file is removed");
+    }
+
+    /// A lock file that cannot be checked says nothing about its holder, so the refusal is a
+    /// failure that is tried again, never a gone holder.
+    #[tokio::test]
+    async fn a_refusing_socket_whose_lock_cannot_be_checked_is_not_taken_for_gone() {
+        let setup = Setup::new();
+        let (terminals, store) = setup.daemon();
+        let (id, socket, lock) = refusing_terminal(&setup, &store);
+        set_mode(&lock, 0o000);
+
+        terminals.reattach_all().await.unwrap();
+        let error = terminals.close(id).await.unwrap_err();
+        assert!(matches!(error, TerminalError::Holder { .. }), "{error:?}");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(socket.exists(), "the socket is left");
+        assert!(lock.exists(), "the lock file is left");
+        assert!(terminals.inner.entry(id).is_ok(), "the terminal stays live");
+        let record = held(&store, setup.me, id).unwrap();
+        assert!(!record.deleted);
+        assert_eq!(record.body.state, TerminalState::Running);
+
+        set_mode(&lock, 0o600);
+        terminals.close(id).await.unwrap();
+        assert!(held(&store, setup.me, id).unwrap().deleted);
+        assert!(!socket.exists(), "the stale socket is removed");
+        assert!(!lock.exists(), "its lock file is removed");
+    }
+
+    /// Only a holder takes its lock exclusively. A shared lock, such as another check of the
+    /// same file at the same moment, is no holder.
+    #[tokio::test]
+    async fn a_shared_lock_beside_a_refusing_socket_is_no_holder() {
+        let setup = Setup::new();
+        let (terminals, store) = setup.daemon();
+        let (id, socket, lock) = refusing_terminal(&setup, &store);
+        let _check = take_lock(&lock, FlockArg::LockSharedNonblock);
+
+        terminals.reattach_all().await.unwrap();
+        assert_eq!(
+            held(&store, setup.me, id).unwrap().body.state,
+            TerminalState::Exited
+        );
+        terminals.close(id).await.unwrap();
+        assert!(held(&store, setup.me, id).unwrap().deleted);
+        assert!(!socket.exists(), "the stale socket is removed");
+        assert!(!lock.exists(), "its lock file is removed");
     }
 
     #[tokio::test]
