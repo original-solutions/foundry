@@ -649,14 +649,22 @@ fn a_holder_whose_lock_is_held_fails_to_start_and_names_the_lock_file() {
     let lock = lock_file(&socket);
     std::fs::write(&lock, b"").unwrap();
     let _held = try_lock(&lock).unwrap();
-    let output = run_starter(holder_command(&dir, &socket, &["sh", "-c", "sleep 60"], &[]));
+    let output = run_starter(holder_command(
+        &dir,
+        &socket,
+        &["sh", "-c", "sleep 60"],
+        &[],
+    ));
     // Closes a holder that started after all.
     let holder = Holder { dir, socket };
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success());
     assert!(stderr.contains(&lock.display().to_string()), "{stderr}");
     assert!(!holder.socket.exists());
-    assert!(lock.exists(), "the lock file of the holder that has it is left alone");
+    assert!(
+        lock.exists(),
+        "the lock file of the holder that has it is left alone"
+    );
 }
 
 /// The lock goes with the holder however it dies, and the child, which outlives it here, never
@@ -688,7 +696,10 @@ async fn a_killed_holder_lets_go_of_its_lock_even_while_its_child_runs() {
     }
     let child_ran = nix::sys::signal::kill(child, None).is_ok();
     let _ = nix::sys::signal::kill(child, nix::sys::signal::Signal::SIGKILL);
-    assert!(child_ran, "the child was still running when the lock was free");
+    assert!(
+        child_ran,
+        "the child was still running when the lock was free"
+    );
 }
 
 #[tokio::test]
