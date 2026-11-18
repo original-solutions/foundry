@@ -227,7 +227,15 @@ mod tests {
     #[test]
     fn every_reply_round_trips() {
         for reply in [
-            Reply::Snapshot(Bytes::from_static(b"screen\r\n")),
+            Reply::Snapshot {
+                start: 0,
+                bytes: Bytes::new(),
+            },
+            Reply::Snapshot {
+                start: u64::MAX - 1,
+                bytes: Bytes::from_static(b"screen\r\n"),
+            },
+            Reply::Refused("holder protocol version 9 is not supported".into()),
             Reply::Output(Bytes::from_static(b"\x1b[31mred\x1b[0m")),
             Reply::Status(ChildStatus::Running),
             Reply::Status(ChildStatus::Exited(0)),
@@ -237,6 +245,84 @@ mod tests {
             let frame = reply.encode();
             assert_eq!(Reply::decode(&frame[4..]).unwrap(), reply);
         }
+    }
+
+    /// The wire format a running holder speaks for its whole life. These bytes never change
+    /// within a version.
+    #[test]
+    fn version_1_frames_are_pinned_byte_for_byte() {
+        let requests: [(Request, &[u8]); 5] = [
+            (Request::Attach, &[0, 0, 0, 2, 1, 1]),
+            (
+                Request::Input(Bytes::from_static(b"ab")),
+                &[0, 0, 0, 4, 1, 2, b'a', b'b'],
+            ),
+            (
+                Request::Resize {
+                    cols: 132,
+                    rows: 43,
+                },
+                &[0, 0, 0, 6, 1, 3, 0, 132, 0, 43],
+            ),
+            (Request::Status, &[0, 0, 0, 2, 1, 4]),
+            (Request::Close, &[0, 0, 0, 2, 1, 5]),
+        ];
+        for (request, bytes) in requests {
+            assert_eq!(request.encode(), bytes, "{request:?}");
+            assert_eq!(Request::decode(&bytes[4..]).unwrap(), request);
+        }
+        let replies: [(Reply, &[u8]); 5] = [
+            (
+                Reply::Snapshot {
+                    start: 258,
+                    bytes: Bytes::from_static(b"hi"),
+                },
+                &[0, 0, 0, 12, 1, 0x81, 0, 0, 0, 0, 0, 0, 1, 2, b'h', b'i'],
+            ),
+            (
+                Reply::Output(Bytes::from_static(b"x")),
+                &[0, 0, 0, 3, 1, 0x82, b'x'],
+            ),
+            (
+                Reply::Status(ChildStatus::Running),
+                &[0, 0, 0, 3, 1, 0x84, 0],
+            ),
+            (
+                Reply::Status(ChildStatus::Exited(7)),
+                &[0, 0, 0, 7, 1, 0x84, 1, 0, 0, 0, 7],
+            ),
+            (
+                Reply::Refused("no".into()),
+                &[0, 0, 0, 4, 1, 0x85, b'n', b'o'],
+            ),
+        ];
+        for (reply, bytes) in replies {
+            assert_eq!(reply.encode(), bytes, "{reply:?}");
+            assert_eq!(Reply::decode(&bytes[4..]).unwrap(), reply);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_written_reply_is_the_encoded_frame() {
+        let reply = Reply::Snapshot {
+            start: 3,
+            bytes: Bytes::from(vec![7u8; 100_000]),
+        };
+        let (mut client, mut server) = tokio::io::duplex(1 << 20);
+        write_reply(&mut server, &reply).await.unwrap();
+        drop(server);
+        let mut written = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut client, &mut written)
+            .await
+            .unwrap();
+        assert_eq!(written, reply.encode());
+    }
+
+    #[test]
+    fn a_full_scrollback_fits_in_one_snapshot_frame() {
+        let header = 2 + 8;
+        assert!(crate::scrollback::MAX_BYTES + header <= MAX_FRAME);
+        assert!(MAX_PENDING_INPUT + 2 <= MAX_FRAME);
     }
 
     #[test]
@@ -260,6 +346,14 @@ mod tests {
         ));
         assert!(matches!(
             Reply::decode(&[VERSION]),
+            Err(Error::Malformed(_))
+        ));
+        assert!(matches!(
+            Reply::decode(&[VERSION, 0x81, 0, 0, 0]),
+            Err(Error::Malformed(_))
+        ));
+        assert!(matches!(
+            Reply::decode(&[VERSION, 0x85, 0xff]),
             Err(Error::Malformed(_))
         ));
     }

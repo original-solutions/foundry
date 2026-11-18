@@ -1,9 +1,10 @@
 //! The `foundry-holder` binary, driven over its socket the way `foundryd` drives it.
 
 use std::io::Write as _;
+use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -11,6 +12,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use foundry_holder::protocol::{self, ChildStatus, Reply, Request};
 use foundry_holder::pty;
+use foundry_holder::scrollback::MAX_BYTES;
 use tempfile::TempDir;
 use tokio::net::UnixStream;
 use tokio::time::timeout;
@@ -27,8 +29,12 @@ impl Holder {
     fn start(argv: &[&str], env: &[(&str, &str)]) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("h.sock");
-        let status = holder_command(&dir, &socket, argv, env).status().unwrap();
-        assert!(status.success(), "foundry-holder exited {status}");
+        let output = run_starter(holder_command(&dir, &socket, argv, env));
+        assert!(
+            output.status.success(),
+            "foundry-holder failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         Holder { dir, socket }
     }
 
@@ -67,12 +73,13 @@ impl Holder {
         protocol::write_request(&mut stream, &Request::Attach)
             .await
             .unwrap();
-        let snapshot = match next(&mut stream).await {
-            Reply::Snapshot(bytes) => bytes.to_vec(),
+        let (start, snapshot) = match next(&mut stream).await {
+            Reply::Snapshot { start, bytes } => (start, bytes.to_vec()),
             other => panic!("expected a snapshot first, got {other:?}"),
         };
         Attached {
             stream,
+            start,
             seen: snapshot.clone(),
             snapshot,
             exit: None,
@@ -99,6 +106,19 @@ fn holder_command(dir: &TempDir, socket: &Path, argv: &[&str], env: &[(&str, &st
     let mut command = Command::new(env!("CARGO_BIN_EXE_foundry-holder"));
     command.args(holder_args(dir, socket, argv, env));
     command
+}
+
+/// Runs the starter with its output captured, as `foundryd` does. It must return once the holder
+/// is ready: a holder that kept the starter's stdout or stderr would hold them open for the
+/// terminal's whole life.
+fn run_starter(mut command: Command) -> Output {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(command.output());
+    });
+    rx.recv_timeout(WAIT)
+        .expect("the starter did not return: the holder kept its stdout or stderr open")
+        .unwrap()
 }
 
 /// Writes the env file and returns the holder's arguments after the program name.
@@ -132,6 +152,8 @@ async fn next(stream: &mut UnixStream) -> Reply {
 
 struct Attached {
     stream: UnixStream,
+    /// Stream offset of the snapshot's first byte.
+    start: u64,
     snapshot: Vec<u8>,
     seen: Vec<u8>,
     exit: Option<i32>,
@@ -154,7 +176,23 @@ impl Attached {
     }
 
     async fn read_one(&mut self) {
-        match next(&mut self.stream).await {
+        let reply = next(&mut self.stream).await;
+        self.take(reply);
+    }
+
+    /// Reads until the holder closes the connection.
+    async fn read_to_end(&mut self) {
+        while let Some(reply) = timeout(WAIT, protocol::read_reply(&mut self.stream))
+            .await
+            .expect("no reply in time")
+            .unwrap()
+        {
+            self.take(reply);
+        }
+    }
+
+    fn take(&mut self, reply: Reply) {
+        match reply {
             Reply::Output(bytes) => self.seen.extend_from_slice(&bytes),
             Reply::Status(ChildStatus::Exited(code)) => self.exit = Some(code),
             other => panic!("unexpected {other:?} on an attached stream"),
@@ -185,17 +223,20 @@ async fn output_is_delivered_byte_for_byte() {
     let payload: Vec<u8> = (0..64).flat_map(|_| 0u8..=255).collect();
     let file = dir.path().join("payload.bin");
     std::fs::write(&file, &payload).unwrap();
-    let script = format!("stty raw -echo; read go; cat '{}'", file.display());
+    let script = format!(
+        "stty raw -echo; printf R; read go; cat '{}'",
+        file.display()
+    );
     let holder = Holder::start(&["sh", "-c", &script], &[]);
 
     let mut client = holder.attach().await;
-    // The terminal is raw once the child has set it, so the go line is not echoed or translated.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // R is printed once the terminal is raw, so the go line is neither echoed nor translated.
+    client.read_until(b"R").await;
     client
         .send(Request::Input(Bytes::from_static(b"go\n")))
         .await;
     assert_eq!(client.read_until_exit().await, 0);
-    assert_eq!(client.seen, payload);
+    assert_eq!(&client.seen[position(&client.seen, b"R") + 1..], payload);
 }
 
 #[tokio::test]
@@ -224,45 +265,72 @@ async fn scrollback_holds_10000_lines_and_drops_the_oldest() {
         .flat_map(|n| format!("{n}\r\n").into_bytes())
         .collect();
     assert_eq!(client.snapshot, expected);
+    let dropped: usize = (1..=50).map(|n| format!("{n}\r\n").len()).sum();
+    assert_eq!(client.start, dropped as u64);
 }
 
 #[tokio::test]
 async fn a_flood_with_no_client_attached_finishes_in_bounded_memory() {
+    // No newlines, so the byte cap, not the line cap, is what bounds the scrollback.
     let holder = Holder::start(
-        &[
-            "sh",
-            "-c",
-            "yes 0123456789abcdefghijklmnopqrstuvwxyz | head -c 200000000",
-        ],
+        &["sh", "-c", "head -c 200000000 /dev/zero | tr '\\0' a"],
         &[],
     );
-    let pid = holder_pid(&holder.socket);
-    let peak_kb = Arc::new(AtomicU64::new(0));
-    let done = Arc::new(AtomicBool::new(false));
-    let sampler = {
-        let (peak_kb, done) = (peak_kb.clone(), done.clone());
-        std::thread::spawn(move || {
-            while !done.load(Ordering::Relaxed) {
-                if let Some(kb) = rss_kb(pid) {
-                    peak_kb.fetch_max(kb, Ordering::Relaxed);
-                }
-                std::thread::sleep(Duration::from_millis(25));
-            }
-        })
-    };
+    let rss = PeakRss::watch(holder_pid(&holder.socket));
     let code = holder.wait_for_exit(Duration::from_secs(180)).await;
-    if let Some(kb) = rss_kb(pid) {
-        peak_kb.fetch_max(kb, Ordering::Relaxed);
-    }
-    done.store(true, Ordering::Relaxed);
-    sampler.join().unwrap();
+    let peak_mb = rss.stop();
 
     assert_eq!(code, 0);
-    let peak_mb = peak_kb.load(Ordering::Relaxed) / 1024;
-    assert!(peak_mb > 0, "the holder's memory was never read");
     assert!(peak_mb < 50, "the holder peaked at {peak_mb} MB");
     let client = holder.attach().await;
-    assert!(client.snapshot.len() <= 16 * 1024 * 1024);
+    assert!(!client.snapshot.is_empty());
+    assert!(client.snapshot.len() <= MAX_BYTES);
+    assert!(client.snapshot.iter().all(|&b| b == b'a'));
+    assert_eq!(client.start + client.snapshot.len() as u64, 200_000_000);
+}
+
+#[tokio::test]
+async fn a_client_that_stops_reading_is_dropped_without_blocking_the_child() {
+    let lines = 20_000_000;
+    let script = format!("stty -echo; printf R; read x; seq 1 {lines}");
+    let holder = Holder::start(&["sh", "-c", &script], &[]);
+    let mut driver = holder.attach().await;
+    driver.read_until(b"R").await;
+    drop(driver);
+
+    let mut stalled = holder.attach().await;
+    let rss = PeakRss::watch(holder_pid(&holder.socket));
+    holder.send(Request::Input(Bytes::from_static(b"\n"))).await;
+    let code = holder.wait_for_exit(Duration::from_secs(180)).await;
+    let peak_mb = rss.stop();
+    assert_eq!(code, 0);
+    assert!(peak_mb < 50, "the holder peaked at {peak_mb} MB");
+
+    // What the stalled client got is the start of the stream with nothing skipped, then EOF.
+    stalled.read_to_end().await;
+    assert_eq!(stalled.start, 0);
+    assert_eq!(stalled.exit, None, "the stalled client was never dropped");
+    let expected = counter_stream(b"R", stalled.seen.len());
+    assert_eq!(stalled.seen.len(), expected.len());
+    assert!(
+        stalled.seen == expected,
+        "the stalled client's stream has a gap"
+    );
+
+    let fresh = holder.attach().await;
+    assert!(fresh.snapshot.ends_with(format!("{lines}\r\n").as_bytes()));
+}
+
+/// `prefix` then `seq 1 ..` as a terminal shows it, cut to `len` bytes.
+fn counter_stream(prefix: &[u8], len: usize) -> Vec<u8> {
+    let mut stream = prefix.to_vec();
+    let mut n = 1u64;
+    while stream.len() < len {
+        stream.extend_from_slice(format!("{n}\r\n").as_bytes());
+        n += 1;
+    }
+    stream.truncate(len);
+    stream
 }
 
 #[tokio::test]
@@ -322,6 +390,33 @@ async fn after_the_child_exits_status_gives_the_code_and_attach_the_final_screen
 }
 
 #[tokio::test]
+async fn a_child_killed_by_a_signal_exits_128_plus_the_signal() {
+    let holder = Holder::start(&["sh", "-c", "kill -9 $$"], &[]);
+    assert_eq!(holder.wait_for_exit(WAIT).await, 137);
+}
+
+#[tokio::test]
+async fn the_exit_is_reported_after_all_the_output_before_it() {
+    for _ in 0..5 {
+        let holder = Holder::start(
+            &[
+                "sh",
+                "-c",
+                "stty -echo; printf R; read x; head -c 60000 /dev/zero | tr '\\0' a; exit 3",
+            ],
+            &[],
+        );
+        let mut client = holder.attach().await;
+        client.read_until(b"R").await;
+        client.send(Request::Input(Bytes::from_static(b"\n"))).await;
+        assert_eq!(client.read_until_exit().await, 3);
+        let after = &client.seen[position(&client.seen, b"R") + 1..];
+        assert_eq!(after.len(), 60_000);
+        assert!(after.iter().all(|&b| b == b'a'));
+    }
+}
+
+#[tokio::test]
 async fn the_env_file_is_deleted_once_read_and_reaches_the_child() {
     let holder = Holder::start(
         &["sh", "-c", "echo \"foo=$FOUNDRY_TEST_FOO\"; sleep 60"],
@@ -330,6 +425,74 @@ async fn the_env_file_is_deleted_once_read_and_reaches_the_child() {
     assert!(!holder.env_file().exists());
     let mut client = holder.attach().await;
     client.read_until(b"foo=bar baz").await;
+}
+
+#[test]
+fn an_env_file_that_does_not_parse_is_deleted_and_never_echoed() {
+    for (bad, secret) in [
+        (r#""sk-secret-value""#, "sk-secret-value"),
+        (r#"{"PIN": 482913}"#, "482913"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("h.sock");
+        let command = holder_command(&dir, &socket, &["sh", "-c", "sleep 60"], &[]);
+        let env_file = dir.path().join("env.json");
+        std::fs::write(&env_file, bad).unwrap();
+        let output = run_starter(command);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success());
+        assert!(stderr.contains("env file"), "{stderr}");
+        assert!(!stderr.contains(secret), "{stderr}");
+        assert!(!env_file.exists());
+        assert!(!socket.exists());
+    }
+}
+
+#[test]
+fn arguments_that_do_not_parse_still_delete_the_env_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("h.sock");
+    // No command after `--`.
+    let output = run_starter(holder_command(&dir, &socket, &[], &[("SECRET", "x")]));
+    assert!(!output.status.success());
+    assert!(!dir.path().join("env.json").exists());
+}
+
+#[test]
+fn a_missing_working_directory_is_named_as_such() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("h.sock");
+    let mut args = holder_args(&dir, &socket, &["sh", "-c", "sleep 60"], &[]);
+    let cwd = args.iter().position(|a| a == "--cwd").unwrap() + 1;
+    args[cwd] = "/no/such/dir".to_string();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_foundry-holder"));
+    command.args(args);
+    let output = run_starter(command);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains("cwd /no/such/dir"), "{stderr}");
+    assert!(!socket.exists());
+}
+
+#[tokio::test]
+async fn the_socket_is_closed_to_other_users_whatever_the_umask() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("h.sock");
+    let args = holder_args(&dir, &socket, &["sh", "-c", "sleep 60"], &[]);
+    let mut command = Command::new("sh");
+    command
+        .arg("-c")
+        .arg("umask 000; exec \"$0\" \"$@\"")
+        .arg(env!("CARGO_BIN_EXE_foundry-holder"))
+        .args(args);
+    let output = run_starter(command);
+    assert!(output.status.success());
+    let holder = Holder { dir, socket };
+    let mode = std::fs::metadata(&holder.socket)
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600, "socket mode {mode:o}");
 }
 
 #[tokio::test]
@@ -373,12 +536,49 @@ async fn close_ends_the_child_and_removes_the_socket() {
 async fn a_command_that_cannot_start_fails_the_starter() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("h.sock");
-    let output = holder_command(&dir, &socket, &["/no/such/program"], &[])
-        .output()
-        .unwrap();
+    let output = run_starter(holder_command(&dir, &socket, &["/no/such/program"], &[]));
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("/no/such/program"));
     assert!(!socket.exists());
+}
+
+#[tokio::test]
+async fn a_request_in_another_version_is_refused_with_a_reason() {
+    let holder = Holder::start(&["sh", "-c", "sleep 60"], &[]);
+    let mut stream = holder.connect().await;
+    let mut frame = Request::Status.encode();
+    frame[4] = protocol::VERSION + 1;
+    tokio::io::AsyncWriteExt::write_all(&mut stream, &frame)
+        .await
+        .unwrap();
+    match next(&mut stream).await {
+        Reply::Refused(reason) => assert!(
+            reason.contains(&format!("version {}", protocol::VERSION + 1)),
+            "{reason}"
+        ),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert!(protocol::read_reply(&mut stream).await.unwrap().is_none());
+    assert_eq!(holder.status().await, ChildStatus::Running);
+}
+
+#[tokio::test]
+async fn input_over_the_pending_limit_is_refused_not_dropped() {
+    let holder = Holder::start(&["sh", "-c", "sleep 60"], &[]);
+    let mut client = holder.attach().await;
+    let paste = Bytes::from(vec![b'a'; protocol::MAX_PENDING_INPUT + 1]);
+    client.send(Request::Input(paste)).await;
+    match next(&mut client.stream).await {
+        Reply::Refused(reason) => assert!(reason.contains("input"), "{reason}"),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert!(
+        protocol::read_reply(&mut client.stream)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(holder.status().await, ChildStatus::Running);
 }
 
 /// The pid of the detached holder serving `socket`, found by its command line.
@@ -394,6 +594,50 @@ fn holder_pid(socket: &Path) -> i32 {
         .and_then(|line| line.split_whitespace().next())
         .and_then(|pid| pid.parse().ok())
         .expect("the holder is not running")
+}
+
+/// Samples a process's resident memory until stopped.
+struct PeakRss {
+    pid: i32,
+    peak_kb: Arc<AtomicU64>,
+    done: Arc<AtomicBool>,
+    sampler: std::thread::JoinHandle<()>,
+}
+
+impl PeakRss {
+    fn watch(pid: i32) -> Self {
+        let peak_kb = Arc::new(AtomicU64::new(0));
+        let done = Arc::new(AtomicBool::new(false));
+        let sampler = {
+            let (peak_kb, done) = (peak_kb.clone(), done.clone());
+            std::thread::spawn(move || {
+                while !done.load(Ordering::Relaxed) {
+                    if let Some(kb) = rss_kb(pid) {
+                        peak_kb.fetch_max(kb, Ordering::Relaxed);
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+            })
+        };
+        PeakRss {
+            pid,
+            peak_kb,
+            done,
+            sampler,
+        }
+    }
+
+    /// The peak in MB. Fails the test when the memory was never read.
+    fn stop(self) -> u64 {
+        if let Some(kb) = rss_kb(self.pid) {
+            self.peak_kb.fetch_max(kb, Ordering::Relaxed);
+        }
+        self.done.store(true, Ordering::Relaxed);
+        self.sampler.join().unwrap();
+        let kb = self.peak_kb.load(Ordering::Relaxed);
+        assert!(kb > 0, "the holder's memory was never read");
+        kb / 1024
+    }
 }
 
 fn rss_kb(pid: i32) -> Option<u64> {
