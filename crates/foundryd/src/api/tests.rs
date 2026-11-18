@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use foundry_proto::ids::{MachineId, ProjectId, SessionId, TerminalId, WorkspaceId};
-use foundry_proto::messages::UiMessage;
+use foundry_proto::messages::{PROTOCOL, PeerMessage, UiMessage};
 use foundry_proto::record::AnyRecord;
 use foundry_proto::settings::{Machine, Project};
 use foundry_proto::state::{SessionState, TerminalState};
@@ -85,6 +85,8 @@ struct Daemon {
     key: String,
     store: Arc<Mutex<Store>>,
     terminals: Arc<Terminals>,
+    workspaces: Arc<Workspaces>,
+    peers: Peers,
     addr: SocketAddr,
     servers: Vec<tokio::task::JoinHandle<()>>,
 }
@@ -148,9 +150,9 @@ impl Daemon {
         let peers = Peers::new(me, store.clone(), Arc::new(NoDial));
         let api = Api::new(
             store.clone(),
-            peers,
+            peers.clone(),
             terminals.clone(),
-            workspaces,
+            workspaces.clone(),
             sessions,
             names.iter().map(|n| (*n).to_owned()).collect(),
         );
@@ -177,6 +179,8 @@ impl Daemon {
             key,
             store,
             terminals,
+            workspaces,
+            peers,
             addr,
             servers,
         }
@@ -219,6 +223,21 @@ impl Daemon {
         settings.seq += 1;
         settings.projects.push(project);
         assert!(store.apply_settings(settings).unwrap());
+    }
+
+    /// A machine in the shared settings, so a link from it is accepted.
+    fn add_machine(&self) -> MachineId {
+        let id = MachineId::random();
+        let mut store = self.store.lock().unwrap();
+        let mut settings = store.settings().unwrap();
+        settings.seq += 1;
+        settings.machines.push(Machine {
+            id,
+            name: "peer".into(),
+            address: "100.64.0.9".into(),
+        });
+        assert!(store.apply_settings(settings).unwrap());
+        id
     }
 
     fn host(&self) -> String {
@@ -735,10 +754,10 @@ async fn cat(daemon: &Daemon) -> TerminalId {
         .unwrap()
 }
 
-/// Reads binary frames until their bytes together contain `wanted`.
-async fn read_until(socket: &mut Socket, wanted: &str) -> String {
+/// Reads binary frames until `done` says their bytes together are enough, and returns them.
+async fn read_while(socket: &mut Socket, wanted: &str, done: impl Fn(&str) -> bool) -> String {
     let mut got = Vec::new();
-    while !String::from_utf8_lossy(&got).contains(wanted) {
+    while !done(&String::from_utf8_lossy(&got)) {
         let frame = tokio::time::timeout(WAIT, socket.next())
             .await
             .unwrap_or_else(|_| {
@@ -754,6 +773,11 @@ async fn read_until(socket: &mut Socket, wanted: &str) -> String {
         }
     }
     String::from_utf8_lossy(&got).into_owned()
+}
+
+/// Reads binary frames until their bytes together contain `wanted`.
+async fn read_until(socket: &mut Socket, wanted: &str) -> String {
+    read_while(socket, wanted, |got| got.contains(wanted)).await
 }
 
 #[tokio::test]
@@ -773,12 +797,10 @@ async fn a_terminal_socket_echoes_typed_input_from_cat() {
         .await
         .unwrap();
     // The PTY echoes the line as it is typed, then cat writes it back.
-    let text = read_until(&mut socket, "hello foundry").await;
-    let text = if text.matches("hello foundry").count() < 2 {
-        format!("{text}{}", read_until(&mut socket, "hello foundry").await)
-    } else {
-        text
-    };
+    let text = read_while(&mut socket, "hello foundry twice", |got| {
+        got.matches("hello foundry").count() >= 2
+    })
+    .await;
     assert!(text.matches("hello foundry").count() >= 2, "{text:?}");
 }
 
@@ -791,23 +813,27 @@ async fn a_terminal_socket_starts_with_the_earlier_output() {
         .input(id, bytes::Bytes::from_static(b"before attach\n"))
         .await
         .unwrap();
-    // Until the holder has it, a snapshot may not.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let (mut socket, _) =
-        tokio_tungstenite::connect_async(daemon.ws_url(&format!("/api/terminals/{id}")))
+    // Until the holder has the input, a snapshot may not hold it: attach again until it does.
+    let url = daemon.ws_url(&format!("/api/terminals/{id}"));
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let (mut socket, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        let first = tokio::time::timeout(WAIT, socket.next())
             .await
+            .unwrap()
+            .unwrap()
             .unwrap();
-    let first = tokio::time::timeout(WAIT, socket.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    match first {
-        Message::Binary(bytes) => assert!(
-            String::from_utf8_lossy(&bytes).contains("before attach"),
-            "the snapshot is {bytes:?}"
-        ),
-        other => panic!("the first frame is not the snapshot: {other:?}"),
+        let Message::Binary(bytes) = first else {
+            panic!("the first frame is not the snapshot: {first:?}");
+        };
+        if String::from_utf8_lossy(&bytes).contains("before attach") {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the snapshot never held the output: {bytes:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -895,12 +921,7 @@ async fn archive_with_uncommitted_work_is_refused_listing_it() {
     let daemon = Daemon::new(TURN).await;
     let project = daemon.project();
     let workspace = daemon.create_workspace(project, "dirty").await;
-    let worktree = daemon
-        .data
-        .path()
-        .join("worktrees")
-        .join(project.to_string())
-        .join("dirty");
+    let worktree = daemon.workspaces.worktree(workspace).await.unwrap();
     std::fs::write(worktree.join("notes.txt"), "work\n").unwrap();
 
     let path = format!("/api/workspaces/{workspace}/archive");
@@ -1192,6 +1213,292 @@ async fn a_field_a_request_does_not_know_is_refused() {
     );
 }
 
+// --- callers on every route ---
+
+/// The headers a browser sends to open a WebSocket.
+const UPGRADE: [(&str, &str); 4] = [
+    ("Connection", "Upgrade"),
+    ("Upgrade", "websocket"),
+    ("Sec-WebSocket-Version", "13"),
+    ("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="),
+];
+
+#[tokio::test]
+async fn every_route_refuses_another_site_and_another_host_and_does_nothing() {
+    let daemon = Daemon::new(TURN).await;
+    let project = daemon.project();
+    let workspace = daemon.create_workspace(project, "guarded").await;
+    let worktree = daemon.workspaces.worktree(workspace).await.unwrap();
+    let live = cat(&daemon).await;
+    let records_before = daemon.records();
+    let host = daemon.host();
+    let same_site = format!("http://{host}");
+    let archive = format!("/api/workspaces/{workspace}/archive");
+    let sessions = format!("/api/workspaces/{workspace}/sessions");
+    let shells = format!("/api/workspaces/{workspace}/shells");
+    let socket = format!("/api/terminals/{live}");
+    let close = format!("/api/terminals/{live}/close");
+    let create = serde_json::json!({"project": project, "base": "main", "name": "intruder"});
+    let force = serde_json::json!({"force": true});
+    let model = serde_json::json!({"model": MODEL});
+    let routes: Vec<(&str, &str, Option<serde_json::Value>, bool)> = vec![
+        ("GET", "/api/state", None, false),
+        ("GET", "/api/events", None, true),
+        ("GET", &socket, None, true),
+        ("POST", &close, None, false),
+        ("POST", "/api/workspaces", Some(create), false),
+        ("POST", &archive, Some(force), false),
+        ("POST", &sessions, Some(model), false),
+        ("POST", &shells, None, false),
+    ];
+    for (method, path, body, upgrade) in routes {
+        for (name, value) in [
+            ("Origin", "http://evil.example"),
+            ("Host", "evil.example:7433"),
+        ] {
+            let mut headers = vec![("Host", host.as_str()), ("Origin", same_site.as_str())];
+            headers.retain(|(n, _)| *n != name);
+            headers.push((name, value));
+            // A rebound page's Origin is its own name, whatever else is wrong.
+            if name == "Host" {
+                headers.retain(|(n, _)| *n != "Origin");
+            }
+            if upgrade {
+                headers.extend(UPGRADE);
+            }
+            let reply = daemon.raw(method, path, &headers, body.clone()).await;
+            assert_eq!(
+                reply.status, 403,
+                "{method} {path} with {name} {value}: {}",
+                reply.body
+            );
+        }
+    }
+    assert_eq!(
+        daemon.records(),
+        records_before,
+        "a refused request changed a record"
+    );
+    assert!(worktree.exists(), "a refused archive removed the worktree");
+    let (mut socket, _) = tokio_tungstenite::connect_async(daemon.ws_url(&socket))
+        .await
+        .unwrap();
+    socket
+        .send(Message::binary(&b"still here\n"[..]))
+        .await
+        .unwrap();
+    read_until(&mut socket, "still here").await;
+}
+
+// --- events ---
+
+/// Every frame an events socket sends within `span`.
+async fn frames_within(socket: &mut Socket, span: Duration) -> Vec<UiMessage> {
+    let mut frames = Vec::new();
+    let end = tokio::time::Instant::now() + span;
+    while let Ok(Some(frame)) = tokio::time::timeout_at(end, socket.next()).await {
+        if let Message::Text(text) = frame.unwrap() {
+            frames.push(serde_json::from_str(text.as_str()).unwrap());
+        }
+    }
+    frames
+}
+
+#[tokio::test]
+async fn events_send_the_state_again_when_a_peer_comes_online() {
+    let daemon = Daemon::new(TURN).await;
+    let peer = daemon.add_machine();
+    let (mut socket, _) = daemon.events().await;
+    // Settings changed before the socket opened are already in its state.
+    assert!(
+        frames_within(&mut socket, 3 * EVENTS_EVERY)
+            .await
+            .is_empty()
+    );
+
+    let (mine, theirs) = Conn::pair();
+    let peers = daemon.peers.clone();
+    tokio::spawn(async move { peers.accept(theirs).await });
+    let hello = PeerMessage::Hello {
+        protocol: PROTOCOL,
+        machine: peer,
+        versions: Default::default(),
+    };
+    mine.send
+        .send(serde_json::to_string(&hello).unwrap())
+        .await
+        .unwrap();
+    // A message the daemon takes is hearing from the peer.
+    let heartbeat = PeerMessage::Records {
+        protocol: PROTOCOL,
+        records: Vec::new(),
+    };
+    mine.send
+        .send(serde_json::to_string(&heartbeat).unwrap())
+        .await
+        .unwrap();
+    loop {
+        if matches!(next_message(&mut socket).await, UiMessage::State { .. }) {
+            break;
+        }
+    }
+    assert!(daemon.peers.online().contains(&peer));
+    // Going offline takes OFFLINE_AFTER (15 s) of real time, which is not waited for here.
+}
+
+#[tokio::test]
+async fn events_send_a_change_once() {
+    let daemon = Daemon::new(TURN).await;
+    let project = daemon.project();
+    let (mut socket, _) = daemon.events().await;
+    let workspace = daemon.create_workspace(project, "once").await;
+    let seen = until_seen(&mut socket, |seen| {
+        seen.iter()
+            .any(|r| matches!(r, AnyRecord::Workspace(w) if w.body.id == workspace))
+    })
+    .await;
+    let version = seen
+        .iter()
+        .find_map(|r| match r {
+            AnyRecord::Workspace(w) if w.body.id == workspace => Some(w.version),
+            _ => None,
+        })
+        .unwrap();
+    for frame in frames_within(&mut socket, 3 * EVENTS_EVERY).await {
+        match frame {
+            UiMessage::Record { record, .. } => assert!(
+                !matches!(&record, AnyRecord::Workspace(w) if w.body.id == workspace),
+                "the workspace record was sent again at version {version}: {record:?}"
+            ),
+            UiMessage::Settings { .. } => {}
+            UiMessage::State { .. } => panic!("the state was sent again"),
+        }
+    }
+}
+
+// --- terminals, more ---
+
+/// The next text frame of a terminal socket, past the binary output.
+async fn next_control(socket: &mut Socket) -> serde_json::Value {
+    loop {
+        let frame = tokio::time::timeout(WAIT, socket.next())
+            .await
+            .expect("a control frame arrives in time")
+            .expect("the socket stays open")
+            .unwrap();
+        if let Message::Text(text) = frame {
+            return serde_json::from_str(text.as_str()).unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_resize_reaches_the_terminal() {
+    let daemon = Daemon::new(TURN).await;
+    let project = daemon.project();
+    let workspace = daemon.create_workspace(project, "resize").await;
+    let shell: TerminalId = daemon
+        .call("POST", &format!("/api/workspaces/{workspace}/shells"), None)
+        .await
+        .id();
+    let (mut socket, _) =
+        tokio_tungstenite::connect_async(daemon.ws_url(&format!("/api/terminals/{shell}")))
+            .await
+            .unwrap();
+    socket
+        .send(Message::text(r#"{"type":"resize","cols":100,"rows":30}"#))
+        .await
+        .unwrap();
+    socket
+        .send(Message::binary(&b"stty size\n"[..]))
+        .await
+        .unwrap();
+    // The echo of the command holds no digits; only the answer does.
+    read_until(&mut socket, "30 100").await;
+}
+
+#[tokio::test]
+async fn input_the_terminal_refuses_is_an_error_frame_and_the_socket_stays_open() {
+    let daemon = Daemon::new(TURN).await;
+    let id = cat(&daemon).await;
+    let (mut socket, _) =
+        tokio_tungstenite::connect_async(daemon.ws_url(&format!("/api/terminals/{id}")))
+            .await
+            .unwrap();
+    let flood = vec![b'x'; foundry_holder::protocol::MAX_PENDING_INPUT + 1];
+    socket.send(Message::binary(flood)).await.unwrap();
+    let control = next_control(&mut socket).await;
+    assert_eq!(control["type"], "error", "{control}");
+    assert!(control["error"].is_string(), "{control}");
+    socket
+        .send(Message::binary(&b"still open\n"[..]))
+        .await
+        .unwrap();
+    read_until(&mut socket, "still open").await;
+}
+
+#[tokio::test]
+async fn a_client_cut_off_for_falling_behind_is_closed_with_1013() {
+    let daemon = Daemon::new(TURN).await;
+    let cwd = daemon.data.path().to_path_buf();
+    let id = daemon
+        .terminals
+        .start(
+            WorkspaceId::random(),
+            &cwd,
+            &[
+                "/bin/sh".to_owned(),
+                "-c".to_owned(),
+                "head -c 30000000 /dev/zero | tr '\\0' x; sleep 60".to_owned(),
+            ],
+            &[],
+        )
+        .await
+        .unwrap();
+    let (mut socket, _) =
+        tokio_tungstenite::connect_async(daemon.ws_url(&format!("/api/terminals/{id}")))
+            .await
+            .unwrap();
+    // Not reading lets this client's backlog in the holder pass its limit.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    loop {
+        let frame = tokio::time::timeout(WAIT, socket.next())
+            .await
+            .expect("the socket closes once the holder cuts the client off");
+        match frame {
+            Some(Ok(Message::Close(Some(close)))) => {
+                assert_eq!(u16::from(close.code), 1013, "{close:?}");
+                break;
+            }
+            Some(Ok(_)) => {}
+            other => panic!("the socket ended without a close frame: {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn ids_that_do_not_parse_and_a_base_that_is_not_there_are_answered_in_json() {
+    let daemon = Daemon::new(TURN).await;
+    let project = daemon.project();
+    for path in [
+        "/api/workspaces/not-an-id/shells",
+        "/api/terminals/not-an-id/close",
+    ] {
+        let reply = daemon.call("POST", path, None).await;
+        assert_eq!(reply.status, 404, "{path}: {}", reply.body);
+        assert!(reply.json()["error"].is_string(), "{path}: {}", reply.body);
+    }
+    let reply = daemon
+        .call(
+            "POST",
+            "/api/workspaces",
+            Some(serde_json::json!({"project": project, "base": "nope", "name": "x"})),
+        )
+        .await;
+    assert_eq!(reply.status, 422, "{}", reply.body);
+    assert!(reply.json()["error"].is_string(), "{}", reply.body);
+}
+
 // --- secrets ---
 
 #[test]
@@ -1263,10 +1570,16 @@ async fn no_response_contains_a_secret() {
         name: "private".into(),
         repo: format!("https://x-access-token:{repo_secret}@example.invalid/o/r.git"),
     });
-    let (mut socket, _) = tokio_tungstenite::connect_async(daemon.ws_url("/api/events"))
-        .await
-        .unwrap();
+    // Its first frame, the state, is read here; it holds the first secret project only.
+    let (mut socket, _) = daemon.events().await;
     let mut said = Vec::new();
+    // A project added once the socket is open reaches it as a Settings frame.
+    let late_secret = format!("late-secret-{}", uuid::Uuid::new_v4());
+    daemon.add_project(Project {
+        id: ProjectId::random(),
+        name: "late".into(),
+        repo: format!("https://deploy:{late_secret}@example.invalid/o/late.git"),
+    });
 
     let reply = daemon
         .call(
@@ -1292,15 +1605,23 @@ async fn no_response_contains_a_secret() {
     said.push(daemon.call("GET", "/api/state", None).await.body);
     // Every frame the events socket sent, up to the session going idle.
     let mut seen = Vec::new();
+    let mut settings_frames = 0;
     while !session_states(&seen, session).contains(&SessionState::Idle) {
         let text = next_text(&mut socket).await;
         match serde_json::from_str(&text).unwrap() {
             UiMessage::Record { record, .. } => seen.push(record),
             UiMessage::State { records, .. } => seen.extend(records),
-            UiMessage::Settings { .. } => {}
+            UiMessage::Settings { settings, .. } => {
+                settings_frames += 1;
+                assert!(settings.projects.iter().any(|p| p.name == "late"));
+            }
         }
         said.push(text);
     }
+    assert!(
+        settings_frames > 0,
+        "no Settings frame carried the late project"
+    );
     for (method, path) in [
         ("POST", format!("/api/workspaces/{workspace}/archive")),
         ("POST", "/api/workspaces".to_owned()),
@@ -1310,11 +1631,11 @@ async fn no_response_contains_a_secret() {
     }
 
     let said = said.join("\n");
-    for secret in tokens
-        .iter()
-        .map(String::as_str)
-        .chain([daemon.key.as_str(), repo_secret.as_str()])
-    {
+    for secret in tokens.iter().map(String::as_str).chain([
+        daemon.key.as_str(),
+        repo_secret.as_str(),
+        late_secret.as_str(),
+    ]) {
         assert!(!said.contains(secret), "a response holds a secret");
     }
 }
