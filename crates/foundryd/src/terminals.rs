@@ -603,13 +603,15 @@ async fn connect(socket: &Path) -> Result<UnixStream, Unreachable> {
         Ok(stream) => Ok(stream),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Err(Unreachable::Gone { stale: false }),
         Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
-            match holder_runs(&lock_file(socket)) {
-                Ok(false) => Err(Unreachable::Gone { stale: true }),
-                Ok(true) => Err(Unreachable::Failed(io::Error::new(
+            let lock = lock_file(socket);
+            match tokio::task::spawn_blocking(move || holder_runs(&lock)).await {
+                Ok(Ok(false)) => Err(Unreachable::Gone { stale: true }),
+                Ok(Ok(true)) => Err(Unreachable::Failed(io::Error::new(
                     e.kind(),
                     "the holder refused the connection while it runs: it is busy",
                 ))),
-                Err(e) => Err(Unreachable::Failed(e)),
+                Ok(Err(e)) => Err(Unreachable::Failed(e)),
+                Err(e) => Err(Unreachable::Failed(io::Error::other(e))),
             }
         }
         Err(e) => Err(Unreachable::Failed(e)),
@@ -622,14 +624,15 @@ fn lock_file(socket: &Path) -> PathBuf {
 }
 
 /// Whether a holder holds the lock at `path`, found without waiting. No file is no holder:
-/// holders started before the lock was kept have none.
+/// holders started before the lock was kept have none. The check asks for the lock shared,
+/// which only a holder's exclusive lock refuses, so two checks at once never see each other.
 fn holder_runs(path: &Path) -> io::Result<bool> {
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(e),
     };
-    match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+    match Flock::lock(file, FlockArg::LockSharedNonblock) {
         Ok(_free) => Ok(false),
         Err((_, Errno::EWOULDBLOCK)) => Ok(true),
         Err((_, e)) => Err(e.into()),
