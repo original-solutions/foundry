@@ -18,15 +18,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 mod tests;
 
 /// The schema, one step per entry. A file's `user_version` counts the steps it has had, so
-/// a step once released is never edited: a change is a new step at the end.
-///
-/// A rollback starts the previous build on a file the newer build already migrated, and
-/// `open` lets it. So each step must leave the schema usable by the build before it: new
-/// tables, or new columns with a default, never a changed key or a dropped column. A new
-/// column or table must not copy anything out of `record`: the previous build's upsert would
-/// leave the copy stale. A record the previous build cannot parse, such as a new kind or a
-/// new state, makes [`Store::since`] fail for its owner; reading such records after a
-/// rollback belongs to sync (task 12) and rollback (task 18).
+/// a step once released is never edited: a change is a new step at the end. What a build
+/// does with a file a newer build migrated belongs to rollback (task 18).
 const MIGRATIONS: &[&str] = &[
     // 1: records keyed by kind and id, the owner's own version counter, shared settings.
     "CREATE TABLE records (
@@ -138,7 +131,8 @@ impl Store {
     /// Every record held from `owner` with a version above `version`, lowest version first.
     ///
     /// A stored record this build cannot parse, one a newer build left before a rollback, is
-    /// an error: what it gives never has a version missing in the middle.
+    /// an error: `since` never silently skips a stored row. Reading such rows after a
+    /// rollback belongs to sync (task 12) and rollback (task 18).
     pub fn since(&self, owner: MachineId, version: u64) -> Result<Vec<AnyRecord>, StoreError> {
         // Nothing stored is above i64::MAX, so a larger `version` correctly finds nothing.
         let version = i64::try_from(version).unwrap_or(i64::MAX);

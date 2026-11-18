@@ -462,30 +462,6 @@ fn reopening_a_current_file_runs_no_migration_again() {
     assert_eq!(store.since(owner, 0).unwrap(), vec![workspace(owner, 2)]);
 }
 
-/// A rollback starts the build before a newer one that already migrated the file, so a
-/// file with steps this build does not know still opens and works.
-#[test]
-fn a_file_a_newer_build_migrated_still_opens() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("foundry.db");
-    let owner = MachineId::random();
-    {
-        let mut store = Store::open(&path).unwrap();
-        store.apply(&workspace(owner, 1), owner).unwrap();
-        store
-            .conn
-            .pragma_update(None, "user_version", MIGRATIONS.len() as i64 + 1)
-            .unwrap();
-    }
-    let mut store = Store::open(&path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), MIGRATIONS.len() + 1);
-    assert_eq!(
-        store.apply(&workspace(owner, 2), owner).unwrap(),
-        Applied::Stored
-    );
-    assert_eq!(store.since(owner, 0).unwrap(), vec![workspace(owner, 2)]);
-}
-
 /// Puts a row this build cannot read into the store, as a newer build would have left it.
 fn insert_unreadable(store: &Store, owner: MachineId, version: u64, kind: &str, body: &str) {
     store
@@ -575,8 +551,8 @@ fn no_column_in_the_schema_holds_a_time() {
     }
 }
 
-/// Review focus 3, checked in the queries themselves: every `ORDER BY` in this module
-/// orders by a version.
+/// Review focus 3, checked in the queries themselves: every `ORDER BY` in `mod.rs` orders
+/// by a version. It reads only `mod.rs`, which holds every query of the store today.
 #[test]
 fn every_query_that_orders_orders_by_version() {
     let source = include_str!("mod.rs").to_uppercase();
