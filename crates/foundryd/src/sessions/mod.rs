@@ -1,1 +1,645 @@
-//! Launches Claude Code, receives its hooks, keeps session state and the stuck timer. Filled by plan task 6.
+//! Launches Claude Code in a terminal, receives its hooks and keeps each session's state.
+//!
+//! [`Sessions::start`] writes a settings file that registers hooks posting to this daemon's
+//! loopback port with a per-session token, marks the worktree trusted for Claude Code, and
+//! starts `claude --settings <file>` in a terminal with the gateway variables set. From then
+//! on the session's state comes from three sources, combined by [`state::next_state`]: the
+//! hooks ([`Sessions::router`]), the terminal's output, and the child's exit. A session that
+//! is working with no hook and no output for [`STUCK_AFTER`] is stuck.
+//!
+//! A session's record is written whenever its state changes, under the session's own lock, so
+//! one session's writes never cross. The gateway key reaches the child's environment only: it
+//! is in no file and no log line, and [`Gateway`]'s `Debug` hides it.
+
+use std::collections::HashMap;
+use std::fmt;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
+
+use axum::Router;
+use axum::routing::post;
+use foundry_proto::ids::{MachineId, SessionId, TerminalId, WorkspaceId};
+use foundry_proto::record::{AnyRecord, Record, Session};
+use foundry_proto::state::{SessionState, TerminalState};
+use futures::StreamExt as _;
+use tokio::sync::watch;
+use tokio::task::AbortHandle;
+use tokio::time::Instant;
+
+use crate::store::{Store, StoreError};
+use crate::terminals::{TerminalError, Terminals};
+use state::{Event, next_state};
+
+pub mod claude;
+mod hooks;
+pub mod state;
+#[cfg(test)]
+mod tests;
+
+/// A working session with no output and no hook for this long is stuck.
+pub const STUCK_AFTER: Duration = Duration::from_secs(10 * 60);
+
+/// How long to wait before trying again after a failure: the output follower attaching again,
+/// the exit being read, the exit, a stall or a hook being recorded. Each wait is twice the one
+/// before, up to [`RETRY_AT_MOST`].
+const RETRY_AFTER: Duration = Duration::from_millis(100);
+/// The longest wait between two tries.
+const RETRY_AT_MOST: Duration = Duration::from_secs(10);
+
+/// The waits of one retry loop: [`RETRY_AFTER`], then each twice the one before, up to
+/// [`RETRY_AT_MOST`]. It also tells the loop which failure is its first, so each loop warns
+/// once.
+struct Backoff {
+    wait: Duration,
+    failed: bool,
+}
+
+impl Backoff {
+    fn new() -> Self {
+        Self {
+            wait: RETRY_AFTER,
+            failed: false,
+        }
+    }
+
+    /// Notes a failure, and says whether it is the loop's first.
+    fn first_failure(&mut self) -> bool {
+        !std::mem::replace(&mut self.failed, true)
+    }
+
+    /// The wait before the next try. The one after is twice as long, up to [`RETRY_AT_MOST`].
+    fn next_wait(&mut self) -> Duration {
+        let wait = self.wait;
+        self.wait = (wait * 2).min(RETRY_AT_MOST);
+        wait
+    }
+
+    /// Starts again as a new loop: the waits from [`RETRY_AFTER`], and the next failure is a
+    /// first.
+    fn reset(&mut self) {
+        *self = Self::new();
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SessionError {
+    #[error(transparent)]
+    Terminal(#[from] TerminalError),
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    #[error("sessions: {what}: {source}")]
+    Io {
+        /// A path and the step that failed.
+        what: String,
+        source: io::Error,
+    },
+    #[error("sessions: Claude Code's state file {} cannot be used: {reason}", path.display())]
+    ClaudeState { path: PathBuf, reason: String },
+    #[error("sessions: a step run apart from its caller did not finish: {0}")]
+    Interrupted(#[from] tokio::task::JoinError),
+}
+
+/// The model gateway a session's Claude Code talks to.
+#[derive(Clone)]
+pub struct Gateway {
+    /// `ANTHROPIC_BASE_URL` in the child.
+    pub base_url: String,
+    /// `ANTHROPIC_AUTH_TOKEN` in the child. Never logged, never written to a file.
+    pub key: String,
+}
+
+impl fmt::Debug for Gateway {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Gateway")
+            .field("base_url", &self.base_url)
+            .field("key", &"<redacted>")
+            .finish()
+    }
+}
+
+/// How sessions start Claude Code.
+#[derive(Clone, Debug)]
+pub struct Config {
+    /// The command that starts Claude Code, e.g. `["claude"]`. The settings and the model are
+    /// added to it.
+    pub claude: Vec<String>,
+    /// Claude Code's state file, where a worktree is marked trusted.
+    pub claude_json: PathBuf,
+    /// The loopback port [`Sessions::router`] is served on.
+    pub hook_port: u16,
+    pub gateway: Gateway,
+}
+
+/// This machine's sessions.
+pub struct Sessions {
+    inner: Arc<Inner>,
+}
+
+struct Inner {
+    me: MachineId,
+    store: Arc<Mutex<Store>>,
+    terminals: Arc<Terminals>,
+    /// Where settings files live, `<data dir>/sessions`.
+    dir: PathBuf,
+    config: Config,
+    /// Held while a worktree is marked trusted, so two starts never overwrite each other.
+    trust: Mutex<()>,
+    live: Mutex<HashMap<SessionId, Arc<Live>>>,
+    /// Tests: how many of the next writes fail, as a busy store would.
+    #[cfg(test)]
+    fail_writes: std::sync::atomic::AtomicUsize,
+    /// Tests: how many of the next reads of a terminal's exit fail.
+    #[cfg(test)]
+    fail_exit_reads: std::sync::atomic::AtomicUsize,
+}
+
+/// A session this daemon started.
+struct Live {
+    id: SessionId,
+    /// What the session's hooks present as a bearer token.
+    token: String,
+    settings: PathBuf,
+    /// The curl config that holds the token, beside the settings file.
+    curl: PathBuf,
+    /// The body of the session's newest record. Held across each write of the record, so one
+    /// session's writes never cross.
+    body: tokio::sync::Mutex<Session>,
+    /// When a hook or output last arrived, for the stuck timer.
+    activity: watch::Sender<Instant>,
+    tasks: Mutex<Vec<AbortHandle>>,
+}
+
+impl Sessions {
+    /// The sessions of machine `me`, whose settings files live under `data_dir`, started in
+    /// `terminals` as `config` says.
+    pub fn new(
+        me: MachineId,
+        store: Arc<Mutex<Store>>,
+        terminals: Arc<Terminals>,
+        data_dir: &Path,
+        config: Config,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                me,
+                store,
+                terminals,
+                dir: data_dir.join("sessions"),
+                config,
+                trust: Mutex::new(()),
+                live: Mutex::default(),
+                #[cfg(test)]
+                fail_writes: std::sync::atomic::AtomicUsize::new(0),
+                #[cfg(test)]
+                fail_exit_reads: std::sync::atomic::AtomicUsize::new(0),
+            }),
+        }
+    }
+
+    /// Starts Claude Code with `model` in a new terminal in `worktree`, the worktree of
+    /// `workspace`: the workspaces module owns where that is, so the caller passes it. The
+    /// start finishes even when the caller stops waiting. A start that fails leaves no
+    /// terminal, no settings file and no record.
+    pub async fn start(
+        &self,
+        workspace: WorkspaceId,
+        worktree: &Path,
+        model: &str,
+    ) -> Result<SessionId, SessionError> {
+        let inner = self.inner.clone();
+        let (worktree, model) = (worktree.to_path_buf(), model.to_string());
+        tokio::spawn(async move { inner.start(workspace, &worktree, &model).await }).await?
+    }
+
+    /// `POST /hooks/{session}`, the endpoint a session's hooks post to.
+    ///
+    /// It must be served with `into_make_service_with_connect_info::<SocketAddr>()`: it
+    /// refuses a caller that is not on loopback, and without the connect info every call is
+    /// refused, as the extractor fails.
+    pub fn router(&self) -> Router {
+        Router::new()
+            .route("/hooks/{session}", post(hooks::hook))
+            .with_state(self.inner.clone())
+    }
+}
+
+impl Drop for Sessions {
+    /// Stops this daemon's follower and timer tasks. The terminals keep running.
+    fn drop(&mut self) {
+        for live in lock(&self.inner.live).values() {
+            for task in lock(&live.tasks).drain(..) {
+                task.abort();
+            }
+        }
+    }
+}
+
+impl Inner {
+    async fn start(
+        self: Arc<Self>,
+        workspace: WorkspaceId,
+        worktree: &Path,
+        model: &str,
+    ) -> Result<SessionId, SessionError> {
+        let id = SessionId::random();
+        let token = format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        );
+        let settings = self.dir.join(format!("{id}.json"));
+        let curl = self.dir.join(format!("{id}.curl"));
+        let url = format!("http://127.0.0.1:{}/hooks/{id}", self.config.hook_port);
+        let written = {
+            let (settings, curl, token) = (settings.clone(), curl.clone(), token.clone());
+            blocking(move || {
+                claude::write_curl_config(&curl, &url, &token)?;
+                claude::write_settings(&settings, &claude::settings_json(&curl))
+            })
+            .await
+        };
+        if let Err(error) = written.and_then(|r| r) {
+            self.remove_files(&settings, &curl).await;
+            return Err(error);
+        }
+        let trusted = {
+            let (me, json, worktree) = (
+                self.clone(),
+                self.config.claude_json.clone(),
+                worktree.to_path_buf(),
+            );
+            blocking(move || claude::mark_trusted_locked(&me.trust, &json, &worktree)).await
+        };
+        if let Err(error) = trusted.and_then(|r| r) {
+            self.remove_files(&settings, &curl).await;
+            return Err(error);
+        }
+
+        let (activity, _) = watch::channel(Instant::now());
+        let live = Arc::new(Live {
+            id,
+            token,
+            settings: settings.clone(),
+            curl: curl.clone(),
+            body: tokio::sync::Mutex::new(Session {
+                id,
+                workspace,
+                terminal: TerminalId(uuid::Uuid::nil()),
+                model: model.to_string(),
+                state: SessionState::Starting,
+            }),
+            activity,
+            tasks: Mutex::default(),
+        });
+        // Locked before the session can be found, and kept until its record is written: a hook
+        // the child posts before `Terminals::start` returns waits here, and is applied on top
+        // of `Starting`.
+        let mut body = live.body.lock().await;
+        lock(&self.live).insert(id, live.clone());
+
+        let started = self.launch(&settings, workspace, worktree, model).await;
+        let (terminal, floor) = match started {
+            Ok(started) => started,
+            Err(error) => {
+                lock(&self.live).remove(&id);
+                drop(body);
+                self.remove_files(&settings, &curl).await;
+                return Err(error);
+            }
+        };
+        body.terminal = terminal;
+        if let Err(error) = self.write(body.clone()).await {
+            lock(&self.live).remove(&id);
+            drop(body);
+            let _ = self.terminals.close(terminal).await;
+            self.remove_files(&settings, &curl).await;
+            return Err(error);
+        }
+        drop(body);
+
+        let tasks = [
+            tokio::spawn(follow(self.clone(), live.clone(), terminal, floor)).abort_handle(),
+            tokio::spawn(watch_for_stuck(self.clone(), live.clone())).abort_handle(),
+        ];
+        lock(&live.tasks).extend(tasks);
+        tracing::info!(session = %id, workspace = %workspace, model, "session started");
+        Ok(id)
+    }
+
+    /// Starts the terminal, and gives it with the highest version this machine has written
+    /// before it, from which the terminal's later records are read.
+    async fn launch(
+        &self,
+        settings: &Path,
+        workspace: WorkspaceId,
+        worktree: &Path,
+        model: &str,
+    ) -> Result<(TerminalId, u64), SessionError> {
+        let me = self.me;
+        let floor = self
+            .on_store(move |store| Ok(store.versions()?.get(&me).copied().unwrap_or(0)))
+            .await?;
+        let mut argv = self.config.claude.clone();
+        argv.extend([
+            "--settings".into(),
+            settings.to_string_lossy().into_owned(),
+            "--model".into(),
+            model.to_string(),
+        ]);
+        let env = [
+            (
+                "ANTHROPIC_BASE_URL".to_string(),
+                self.config.gateway.base_url.clone(),
+            ),
+            (
+                "ANTHROPIC_AUTH_TOKEN".to_string(),
+                self.config.gateway.key.clone(),
+            ),
+        ];
+        let terminal = self
+            .terminals
+            .start(workspace, worktree, &argv, &env)
+            .await?;
+        Ok((terminal, floor))
+    }
+
+    fn live(&self, id: SessionId) -> Option<Arc<Live>> {
+        lock(&self.live).get(&id).cloned()
+    }
+
+    fn is_live(&self, live: &Arc<Live>) -> bool {
+        self.live(live.id).is_some_and(|l| Arc::ptr_eq(&l, live))
+    }
+
+    /// Applies `event` to the session and gives its state after. The record is written when
+    /// the state changed. An event for a session whose start failed does nothing.
+    async fn event(&self, live: &Arc<Live>, event: Event) -> Result<SessionState, SessionError> {
+        let mut body = live.body.lock().await;
+        if !self.is_live(live) {
+            return Ok(body.state);
+        }
+        if matches!(event, Event::Hook(_) | Event::Output) {
+            live.activity.send_replace(Instant::now());
+        }
+        let next = next_state(body.state, event);
+        if next != body.state {
+            let changed = Session {
+                state: next,
+                ..body.clone()
+            };
+            self.write(changed.clone()).await?;
+            *body = changed;
+        }
+        if is_final(next) {
+            // Wakes the stuck timer, which ends.
+            live.activity.send_replace(Instant::now());
+            if matches!(event, Event::Exited(_)) {
+                // The child is gone: nothing more can come from it, so a late hook is refused
+                // like one for an unknown session.
+                lock(&self.live).remove(&live.id);
+                self.remove_files(&live.settings, &live.curl).await;
+            }
+        }
+        Ok(next)
+    }
+
+    /// Writes `body` as this machine's newest record of its session, on the blocking pool so a
+    /// busy store never stalls an async worker.
+    async fn write(&self, body: Session) -> Result<(), SessionError> {
+        #[cfg(test)]
+        if take_one(&self.fail_writes) {
+            return Err(busy().into());
+        }
+        let me = self.me;
+        self.on_store(move |store| {
+            let record = Record {
+                owner: me,
+                version: store.own_next_version()?,
+                deleted: false,
+                body,
+            };
+            store.apply(&AnyRecord::Session(record), me)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn on_store<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(&mut Store) -> Result<T, StoreError> + Send + 'static,
+    ) -> Result<T, SessionError> {
+        let store = self.store.clone();
+        Ok(blocking(move || work(&mut lock(&store))).await??)
+    }
+
+    /// Removes a session's settings file and curl config. Missing is fine, and nothing else can
+    /// be done about a failure.
+    async fn remove_files(&self, settings: &Path, curl: &Path) {
+        let paths = [settings.to_path_buf(), curl.to_path_buf()];
+        let _ = blocking(move || {
+            for path in paths {
+                let _ = std::fs::remove_file(path);
+            }
+        })
+        .await;
+    }
+
+    /// The exit of `terminal`, once its record says it exited or was deleted: the code, when
+    /// known. Reads only what is above `cursor`, and moves it.
+    async fn exit_of(
+        &self,
+        terminal: TerminalId,
+        cursor: &mut u64,
+    ) -> Result<Option<Option<i32>>, SessionError> {
+        #[cfg(test)]
+        if take_one(&self.fail_exit_reads) {
+            return Err(busy().into());
+        }
+        let (me, from) = (self.me, *cursor);
+        let (newest, exit) = self
+            .on_store(move |store| {
+                let mut newest = from;
+                let mut exit = None;
+                for record in store.since(me, from)? {
+                    newest = newest.max(record.version());
+                    if let AnyRecord::Terminal(r) = record
+                        && r.body.id == terminal
+                        && (r.body.state == TerminalState::Exited || r.deleted)
+                    {
+                        exit = Some(r.body.exit_code);
+                    }
+                }
+                Ok((newest, exit))
+            })
+            .await?;
+        *cursor = newest;
+        Ok(exit)
+    }
+}
+
+/// Follows the session's terminal: each chunk of output is an [`Event::Output`], and the end of
+/// the child is an [`Event::Exited`].
+async fn follow(inner: Arc<Inner>, live: Arc<Live>, terminal: TerminalId, mut cursor: u64) {
+    let mut backoff = Backoff::new();
+    loop {
+        match inner.terminals.attach(terminal).await {
+            // What the terminal already held is not new output.
+            Ok((_, mut output)) => {
+                backoff.reset();
+                loop {
+                    match output.next().await {
+                        Some(Ok(bytes)) => {
+                            if !bytes.is_empty() {
+                                report(&inner, &live, Event::Output).await;
+                            }
+                        }
+                        // The child exited.
+                        None => return exited(&inner, &live, terminal, &mut cursor).await,
+                        Some(Err(error)) => {
+                            retry(&mut backoff, terminal, error).await;
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                if matches!(error, TerminalError::Gone(_) | TerminalError::Unknown(_)) {
+                    return exited(&inner, &live, terminal, &mut cursor).await;
+                }
+                retry(&mut backoff, terminal, error).await;
+            }
+        }
+    }
+}
+
+/// Waits before attaching again to a terminal that dropped the follower.
+async fn retry(backoff: &mut Backoff, terminal: TerminalId, error: TerminalError) {
+    match error {
+        // The holder cut this client off. Attaching again is the answer.
+        TerminalError::Detached(_) => backoff.reset(),
+        other => {
+            if backoff.first_failure() {
+                tracing::warn!(terminal = %terminal, error = %other, "session output not followed; trying again");
+            }
+        }
+    }
+    tokio::time::sleep(backoff.next_wait()).await;
+}
+
+/// Waits for the terminal's exit to be recorded, then reports it.
+async fn exited(inner: &Inner, live: &Arc<Live>, terminal: TerminalId, cursor: &mut u64) {
+    // Until the exit is recorded, the store is asked again every `RETRY_AFTER`. A read that
+    // fails waits longer each time.
+    let mut backoff = Backoff::new();
+    let code = loop {
+        let wait = match inner.exit_of(terminal, cursor).await {
+            Ok(Some(code)) => break code,
+            Ok(None) => RETRY_AFTER,
+            Err(error) => {
+                if backoff.first_failure() {
+                    tracing::warn!(terminal = %terminal, %error, "terminal exit not read; trying again");
+                }
+                backoff.next_wait()
+            }
+        };
+        tokio::time::sleep(wait).await;
+    };
+    // The end is not given up on: a session left running after its child is gone is wrong for
+    // good. It stops once the session is no longer live.
+    let mut backoff = Backoff::new();
+    while let Err(error) = inner.event(live, Event::Exited(code)).await {
+        if !inner.is_live(live) {
+            return;
+        }
+        if backoff.first_failure() {
+            tracing::warn!(session = %live.id, %error, "session exit not recorded; trying again");
+        }
+        tokio::time::sleep(backoff.next_wait()).await;
+    }
+}
+
+/// Applies `event`, logging a store error: nothing else can be done with it here.
+async fn report(inner: &Inner, live: &Arc<Live>, event: Event) {
+    if let Err(error) = inner.event(live, event).await {
+        tracing::warn!(session = %live.id, %error, "session state not recorded");
+    }
+}
+
+/// Turns a working session that is silent for [`STUCK_AFTER`] into a stuck one. Runs on the
+/// tokio clock, so a paused clock fakes it, and ends once the session is final.
+async fn watch_for_stuck(inner: Arc<Inner>, live: Arc<Live>) {
+    let mut activity = live.activity.subscribe();
+    loop {
+        if is_final(live.body.lock().await.state) {
+            return;
+        }
+        let last = *activity.borrow_and_update();
+        tokio::select! {
+            () = tokio::time::sleep_until(last + STUCK_AFTER) => {
+                // Does nothing unless the session is working. A write that fails is tried
+                // again until it holds or something arrives, which moves the count on.
+                let (mut moved, mut backoff) = (false, Backoff::new());
+                while let Err(error) = inner.event(&live, Event::Stalled).await {
+                    if backoff.first_failure() {
+                        tracing::warn!(session = %live.id, %error, "session stall not recorded; trying again");
+                    }
+                    tokio::select! {
+                        () = tokio::time::sleep(backoff.next_wait()) => {}
+                        _ = activity.changed() => {
+                            moved = true;
+                            break;
+                        }
+                    }
+                }
+                if moved {
+                    continue;
+                }
+                if activity.changed().await.is_err() {
+                    return;
+                }
+            }
+            changed = activity.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Tests: takes one from `count` when it is above zero, and says whether it did.
+#[cfg(test)]
+fn take_one(count: &std::sync::atomic::AtomicUsize) -> bool {
+    use std::sync::atomic::Ordering::SeqCst;
+    count
+        .try_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+        .is_ok()
+}
+
+/// Tests: the error a busy store gives.
+#[cfg(test)]
+fn busy() -> StoreError {
+    StoreError::Sqlite(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+        None,
+    ))
+}
+
+fn is_final(state: SessionState) -> bool {
+    matches!(state, SessionState::Finished | SessionState::Failed)
+}
+
+/// Runs `work` on the blocking pool, so file and store work never stalls an async worker.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, SessionError> {
+    Ok(tokio::task::spawn_blocking(work).await?)
+}
+
+/// Locks `mutex`, taking the value a panicked holder of the lock left: every value kept under
+/// these locks is whole between statements.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
