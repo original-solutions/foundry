@@ -449,7 +449,11 @@ async fn a_base_the_remote_does_not_have_is_refused_and_makes_no_workspace() {
         .create(remote.project, "no-such-branch", "x")
         .await
         .unwrap_err();
-    assert!(matches!(err, WorkspaceError::Git { .. }), "{err}");
+    assert!(
+        matches!(&err, WorkspaceError::UnknownBase(b) if b == "no-such-branch"),
+        "{err}"
+    );
+    assert!(err.to_string().contains("no-such-branch"), "{err}");
     assert!(!setup.worktree(remote.project, "x").exists());
     let records = setup.store.lock().unwrap().since(setup.me, 0).unwrap();
     assert!(records.is_empty(), "{records:?}");
@@ -953,18 +957,23 @@ async fn a_worktree_with_a_submodule_is_refused_unless_forced() {
     assert!(worktree.join("lib").join("lib.txt").exists());
 
     // A commit made in the submodule and never pushed lives only in this worktree's git
-    // folder. The archive cannot see into it, so it names the submodule and leaves it be.
+    // folder, though the workspace's own branch, with the new pointer, is pushed. The archive
+    // cannot see into the submodule, so it names it and leaves it be.
     git(
         &worktree.join("lib"),
         &["commit", "-q", "--allow-empty", "-m", "only in lib"],
     );
+    git(&worktree, &["commit", "-q", "-am", "bump lib"]);
+    git(&worktree, &["push", "-q", "origin", "HEAD"]);
     let terminal = setup.sleeper(id, &worktree).await;
     let err = setup.workspaces.archive(id, false).await.unwrap_err();
     let WorkspaceError::Dirty(dirty) = err else {
         panic!("{err}");
     };
+    assert!(dirty.uncommitted.is_empty(), "{dirty:?}");
+    assert!(dirty.unpushed.is_empty(), "{dirty:?}");
     assert_eq!(dirty.submodules, ["lib"]);
-    assert!(dirty.to_string().contains("lib"), "{dirty}");
+    assert!(dirty.to_string().contains("submodules lib"), "{dirty}");
     assert!(worktree.join("lib").join("lib.txt").exists());
     let terminals = setup.terminals_of(id);
     assert_eq!(terminals[0].body.id, terminal);
@@ -975,6 +984,11 @@ async fn a_worktree_with_a_submodule_is_refused_unless_forced() {
 
     setup.workspaces.archive(id, true).await.unwrap();
     assert!(!worktree.exists());
+
+    // A submodule never checked out holds nothing, so it does not hold up an archive.
+    let other = setup.create(&remote, "main", "without lib").await;
+    setup.workspaces.archive(other, false).await.unwrap();
+    assert!(!setup.worktree(remote.project, "without-lib").exists());
 }
 
 #[tokio::test]
@@ -1073,24 +1087,35 @@ async fn a_name_whose_folder_is_taken_is_refused_and_the_folder_is_untouched() {
 async fn a_name_the_disk_reads_as_another_never_touches_its_work() {
     let setup = Setup::new();
     let remote = setup.project(&[("README.md", "hello\n")]);
-    // The same word, composed and decomposed. A disk that ignores the difference, as macOS
-    // does, reads both as one folder; git there reads both as one branch.
-    let composed = "caf\u{e9}-\u{d55c}\u{ae00}";
-    let decomposed = "cafe\u{301}-\u{1112}\u{1161}\u{11ab}\u{1100}\u{1173}\u{11af}";
+    // The same word, composed and decomposed: every character a letter, so safe_branch keeps
+    // both as they are. A disk that ignores the difference, as macOS does, reads both as one
+    // folder.
+    let composed = "\u{d55c}\u{ae00}";
+    let decomposed = "\u{1112}\u{1161}\u{11ab}\u{1100}\u{1173}\u{11af}";
+    assert_eq!(safe_branch(composed), composed);
+    assert_eq!(safe_branch(decomposed), decomposed);
     let first = setup.create(&remote, "main", composed).await;
-    let branch = setup.body(first).branch;
-    let worktree = setup.worktree(remote.project, &branch);
+    let worktree = setup.worktree(remote.project, composed);
     std::fs::write(worktree.join("precious.txt"), "mine").unwrap();
     git(
         &worktree,
         &["commit", "-q", "--allow-empty", "-m", "first work"],
     );
 
-    // Refused where the two are one name; a workspace of its own where they are not.
-    let _ = setup
+    let second = setup
         .workspaces
         .create(remote.project, "main", decomposed)
         .await;
+    if cfg!(target_os = "macos") {
+        assert!(
+            matches!(&second, Err(WorkspaceError::BranchExists(_))),
+            "{second:?}"
+        );
+        let records = setup.store.lock().unwrap().since(setup.me, 0).unwrap();
+        assert_eq!(records.len(), 1, "{records:?}");
+    } else {
+        second.unwrap();
+    }
 
     assert_eq!(
         std::fs::read_to_string(worktree.join("precious.txt")).unwrap(),
@@ -1103,10 +1128,53 @@ async fn a_name_the_disk_reads_as_another_never_touches_its_work() {
             "log",
             "-1",
             "--format=%s",
-            &format!("refs/heads/{branch}"),
+            &format!("refs/heads/{composed}"),
             "--",
         ],
     );
     assert_eq!(log.trim(), "first work");
     assert!(!setup.record(first).unwrap().deleted);
+}
+
+#[tokio::test]
+async fn a_worktree_removed_by_hand_keeps_its_detached_commits_through_a_failed_create() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup.create(&remote, "main", "moved").await;
+    let worktree = setup.worktree(remote.project, "moved");
+    git(&worktree, &["checkout", "-q", "--detach"]);
+    git(
+        &worktree,
+        &["commit", "-q", "--allow-empty", "-m", "only on its head"],
+    );
+    std::fs::remove_dir_all(&worktree).unwrap();
+
+    // A create that fails takes back its own worktree and branch, and nothing of this one's.
+    let mode = |m| {
+        std::fs::set_permissions(setup.data.path(), std::fs::Permissions::from_mode(m)).unwrap()
+    };
+    mode(0o500);
+    let err = setup
+        .workspaces
+        .create(remote.project, "main", "other")
+        .await;
+    mode(0o700);
+    assert!(matches!(err, Err(WorkspaceError::Store(_))), "{err:?}");
+
+    // The commit only the removed worktree's HEAD held is still unpushed work.
+    let err = setup.workspaces.archive(id, false).await.unwrap_err();
+    let WorkspaceError::Dirty(dirty) = err else {
+        panic!("{err}");
+    };
+    assert_eq!(dirty.unpushed.len(), 1, "{dirty:?}");
+    assert!(
+        dirty.unpushed[0].ends_with(" only on its head"),
+        "{dirty:?}"
+    );
+
+    setup.workspaces.archive(id, true).await.unwrap();
+    let clone = setup.clone_of(remote.project);
+    let worktrees = git(&clone, &["worktree", "list", "--porcelain"]);
+    assert!(!worktrees.contains("/moved\n"), "{worktrees}");
 }
