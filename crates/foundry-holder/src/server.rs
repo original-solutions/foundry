@@ -33,9 +33,9 @@ use tokio::task::AbortHandle;
 
 const READ_CHUNK: usize = 64 * 1024;
 
-/// Output one client may have unsent, beyond its snapshot, before it counts as too slow and is
-/// disconnected. It can attach again and gets the snapshot. Small, so each stalled connection
-/// costs the holder little.
+/// Output one client may have unsent, on top of the size of the last snapshot it was sent, before it
+/// counts as too slow and is disconnected. It can attach again and gets the snapshot. Small, so each
+/// stalled connection costs the holder little.
 const MAX_BACKLOG: usize = 4 * 1024 * 1024;
 
 /// Serves until a client sends `Close`, then removes the socket.
@@ -77,8 +77,8 @@ impl Client {
         true
     }
 
-    /// Stops reading the client and lets its writer send what is queued, with `last` in place of
-    /// it when given, then close the connection.
+    /// Stops reading the client and gives its writer [`protocol::CLOSE_GRACE`] to send what is
+    /// queued, with `last` in place of it when given, then close the connection.
     fn finish(mut self, last: Option<Reply>) {
         let mut state = self.outbox.lock();
         if let Some(reply) = last {
@@ -87,13 +87,19 @@ impl Client {
         state.closed = true;
         drop(state);
         self.outbox.ready.notify_one();
-        self.writer = None;
+        // A client that does not read could hold the writer, and what it has queued, for ever.
+        if let Some(writer) = self.writer.take() {
+            tokio::spawn(async move {
+                tokio::time::sleep(protocol::CLOSE_GRACE).await;
+                writer.abort();
+            });
+        }
     }
 }
 
 impl Drop for Client {
-    /// Cuts the connection off in both directions, unless `finish` left the writer to close it,
-    /// and frees what was queued for it.
+    /// Cuts the connection off in both directions and frees what was queued for it, unless
+    /// `finish` gave the writer its grace period.
     fn drop(&mut self) {
         self.reader.abort();
         if let Some(writer) = &self.writer {
@@ -123,7 +129,8 @@ impl Outbox {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Writes until the client is dropped and everything queued is sent. Dropping the write half
+    /// Writes until `finish` has closed the outbox and everything queued is sent, or a write fails,
+    /// or the task is aborted. Dropping the write half
     /// at the end shuts the connection down.
     async fn write_to(&self, mut wr: OwnedWriteHalf) {
         loop {
@@ -314,7 +321,6 @@ impl Terminal {
         Flow::Continue
     }
 
-    /// Tells the client why, then drops it, which closes its connection.
     /// Tells the client why in place of anything still queued for it, and closes the connection.
     fn refuse(&mut self, id: u64, reason: String) {
         if let Some(client) = self.clients.remove(&id) {

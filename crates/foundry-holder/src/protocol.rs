@@ -7,8 +7,10 @@
 //! The holder answers a frame it cannot read, another version included, with `Refused` and closes
 //! the connection. That frame carries the holder's own version byte, so a newer client learns which
 //! version to speak. A connection the holder closes with no `Refused` belonged to a client too slow
-//! to keep up with the output. The holder stops reading such a connection when it closes it, so
-//! requests the client sent just before may not have been applied. It can attach again.
+//! to keep up with the output, or one that hung up. The holder stops reading such a connection when
+//! it closes it, so requests the client sent just before may not have been applied, and the close
+//! can land part way through a frame. [`read_reply`] reports any end of the connection as `None`.
+//! A client that was too slow can attach again.
 //!
 //! A running holder cannot be updated without ending its terminal, so this protocol changes
 //! rarely, and every frame names the version it speaks.
@@ -26,6 +28,10 @@ pub const MAX_FRAME: usize = 16 * 1024 * 1024;
 /// over this is refused and its connection closed, so input is never dropped from the middle of a
 /// stream.
 pub const MAX_PENDING_INPUT: usize = 4 * 1024 * 1024;
+
+/// How long the holder lets a connection it is closing, after a `Refused` or after the client hung
+/// up, take what is still queued for it before it cuts the connection off.
+pub const CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The code `Exited` carries when the holder could not learn the child's exit status.
 pub const UNKNOWN_EXIT: i32 = -1;
@@ -186,7 +192,7 @@ impl Reply {
     }
 }
 
-/// Reads one request. `None` when the peer closed the connection between frames.
+/// Reads one request. `None` when the connection ended, a request cut off by the end included.
 pub async fn read_request<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<Request>, Error> {
     read_payload(r)
         .await?
@@ -194,7 +200,7 @@ pub async fn read_request<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<Requ
         .transpose()
 }
 
-/// Reads one reply. `None` when the holder closed the connection between frames.
+/// Reads one reply. `None` when the connection ended, a reply cut off by the end included.
 pub async fn read_reply<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<Reply>, Error> {
     read_payload(r)
         .await?
@@ -234,18 +240,34 @@ fn open(payload: &[u8]) -> Result<(u8, &[u8]), Error> {
 
 async fn read_payload<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<Vec<u8>>, Error> {
     let mut len = [0u8; 4];
-    match r.read_exact(&mut len).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e.into()),
+    if !read_or_end(r, &mut len).await? {
+        return Ok(None);
     }
     let len = u32::from_be_bytes(len) as usize;
     if len > MAX_FRAME {
         return Err(Error::TooLarge(len));
     }
     let mut payload = vec![0; len];
-    r.read_exact(&mut payload).await?;
+    if !read_or_end(r, &mut payload).await? {
+        return Ok(None);
+    }
     Ok(Some(payload))
+}
+
+/// Fills `buf`. False when the connection ended first, by a close or a reset.
+async fn read_or_end<R: AsyncRead + Unpin>(r: &mut R, buf: &mut [u8]) -> Result<bool, Error> {
+    match r.read_exact(buf).await {
+        Ok(_) => Ok(true),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 #[cfg(test)]

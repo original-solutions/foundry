@@ -180,7 +180,6 @@ impl Attached {
         self.take(reply);
     }
 
-    /// Reads until the holder closes the connection.
     /// Reads until the holder closes the connection. A frame cut off by the close is not counted.
     async fn read_to_end(&mut self) {
         while let Some(reply) = read_or_end(&mut self.stream).await {
