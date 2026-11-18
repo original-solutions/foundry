@@ -282,6 +282,45 @@ fn since_gives_one_owners_records_above_a_version_in_version_order() {
 }
 
 #[test]
+fn since_limited_gives_at_most_limit_records_lowest_versions_first() {
+    let (_dir, mut store) = open();
+    let owner = MachineId::random();
+    store.apply(&session(owner, 9), owner).unwrap();
+    store.apply(&workspace(owner, 4), owner).unwrap();
+    store.apply(&terminal(owner, 6), owner).unwrap();
+
+    assert_eq!(
+        store.since_limited(owner, 0, 2).unwrap(),
+        vec![workspace(owner, 4), terminal(owner, 6)]
+    );
+    assert_eq!(
+        store.since_limited(owner, 6, 2).unwrap(),
+        vec![session(owner, 9)]
+    );
+    assert!(store.since_limited(owner, 0, 0).unwrap().is_empty());
+    assert!(store.since_limited(owner, 9, 2).unwrap().is_empty());
+}
+
+/// A row this build cannot read past the limit does not stop the rows below it.
+#[test]
+fn since_limited_reads_only_the_rows_it_gives() {
+    let (_dir, mut store) = open();
+    let owner = MachineId::random();
+    store.apply(&workspace(owner, 1), owner).unwrap();
+    store.apply(&terminal(owner, 2), owner).unwrap();
+    insert_unreadable(&store, owner, 3, "printer", "{}");
+
+    assert_eq!(
+        store.since_limited(owner, 0, 2).unwrap(),
+        vec![workspace(owner, 1), terminal(owner, 2)]
+    );
+    assert!(matches!(
+        store.since_limited(owner, 2, 2),
+        Err(StoreError::Json(_))
+    ));
+}
+
+#[test]
 fn versions_gives_the_highest_version_held_per_owner() {
     let (_dir, mut store) = open();
     assert!(store.versions().unwrap().is_empty());
