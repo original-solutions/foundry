@@ -1543,4 +1543,79 @@ mod tests {
         terminals.close(id).await.unwrap();
         assert!(held(&store, setup.me, id).unwrap().deleted);
     }
+
+    /// Typing into a terminal whose child has exited is no error: the holder drops the input,
+    /// as a finished terminal does.
+    #[tokio::test]
+    async fn input_to_a_child_that_has_exited_is_dropped_with_no_error() {
+        let setup = Setup::new();
+        let (terminals, store) = setup.daemon();
+        let id = setup.start(&terminals, "exit 0").await;
+        until("the record to say exited", || {
+            held(&store, setup.me, id).unwrap().body.state == TerminalState::Exited
+        })
+        .await;
+        terminals.input(id, Bytes::from_static(b"x")).await.unwrap();
+        terminals.resize(id, 100, 30).await.unwrap();
+        terminals.close(id).await.unwrap();
+    }
+
+    /// A socket the watcher cannot connect to for a reason other than the holder being gone
+    /// is tried again, not taken for an exit.
+    #[tokio::test]
+    async fn a_watcher_that_cannot_connect_for_now_tries_again() {
+        let setup = Setup::new();
+        let (terminals, store) = setup.daemon();
+        let id = put_running(&store, setup.me);
+        let holder = stand_in(
+            setup.socket(id),
+            vec![(
+                vec![
+                    Reply::Snapshot {
+                        start: 0,
+                        bytes: Bytes::new(),
+                    },
+                    Reply::Status(ChildStatus::Exited(6)),
+                ],
+                false,
+            )],
+        );
+        // Connecting needs write permission on the socket, so this is refused, not gone.
+        set_mode(&setup.socket(id), 0o000);
+        terminals.reattach_all().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            held(&store, setup.me, id).unwrap().body.state,
+            TerminalState::Running
+        );
+        set_mode(&setup.socket(id), 0o600);
+        until("the record to say exited", || {
+            held(&store, setup.me, id).unwrap().body.state == TerminalState::Exited
+        })
+        .await;
+        assert_eq!(held(&store, setup.me, id).unwrap().body.exit_code, Some(6));
+        holder.abort();
+    }
+
+    /// Two closes at once: one closes the terminal and the other finds it already closed.
+    #[tokio::test]
+    async fn of_two_closes_at_once_one_closes_and_the_other_is_unknown() {
+        let setup = Setup::new();
+        let (terminals, store) = setup.daemon();
+        let id = setup.start(&terminals, "sleep 60").await;
+        let (first, second) = tokio::join!(terminals.close(id), terminals.close(id));
+        let results = [first, second];
+        assert_eq!(
+            results.iter().filter(|r| r.is_ok()).count(),
+            1,
+            "{results:?}"
+        );
+        assert!(
+            results
+                .iter()
+                .any(|r| matches!(r, Err(TerminalError::Unknown(gone)) if *gone == id)),
+            "{results:?}"
+        );
+        assert!(held(&store, setup.me, id).unwrap().deleted);
+    }
 }
