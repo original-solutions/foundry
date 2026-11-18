@@ -8,8 +8,8 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use foundry_proto::ids::MachineId;
-use foundry_proto::record::AnyRecord;
+use foundry_proto::ids::{MachineId, WorkspaceId};
+use foundry_proto::record::{AnyRecord, Record, Terminal, Workspace};
 use foundry_proto::settings::SharedSettings;
 use rusqlite::types::Type;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -158,6 +158,49 @@ impl Store {
         let mut records = Vec::new();
         for json in rows {
             records.push(serde_json::from_str(&json?)?);
+        }
+        Ok(records)
+    }
+
+    /// The workspace record with `id`, deleted or not, read by its key without the rest.
+    pub fn workspace(&self, id: WorkspaceId) -> Result<Option<Record<Workspace>>, StoreError> {
+        let json: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT record FROM records WHERE kind = 'workspace' AND id = ?1",
+                params![id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(json) = json else {
+            return Ok(None);
+        };
+        match serde_json::from_str(&json)? {
+            AnyRecord::Workspace(record) => Ok(Some(record)),
+            // Rows are stored under their own kind, so a workspace row holds a workspace.
+            _ => Ok(None),
+        }
+    }
+
+    /// The terminal records held from `owner` in workspace `workspace`, deleted ones included,
+    /// lowest version first. Only those rows are parsed.
+    pub fn terminals_in(
+        &self,
+        owner: MachineId,
+        workspace: WorkspaceId,
+    ) -> Result<Vec<Record<Terminal>>, StoreError> {
+        let mut query = self.conn.prepare(
+            "SELECT record FROM records WHERE owner = ?1 AND kind = 'terminal' \
+             AND json_extract(record, '$.body.workspace') = ?2 ORDER BY version",
+        )?;
+        let rows = query.query_map(params![owner.to_string(), workspace.to_string()], |row| {
+            row.get::<_, String>(0)
+        })?;
+        let mut records = Vec::new();
+        for json in rows {
+            if let AnyRecord::Terminal(record) = serde_json::from_str(&json?)? {
+                records.push(record);
+            }
         }
         Ok(records)
     }

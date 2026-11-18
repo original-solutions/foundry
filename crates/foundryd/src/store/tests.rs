@@ -320,6 +320,75 @@ fn since_limited_reads_only_the_rows_it_gives() {
     ));
 }
 
+/// One workspace is read by its key: a row this build cannot read elsewhere does not stop it.
+#[test]
+fn workspace_gives_one_workspace_by_its_id_deleted_or_not() {
+    let (_dir, mut store) = open();
+    let owner = MachineId::random();
+    let AnyRecord::Workspace(live) = workspace(owner, 1) else {
+        unreachable!()
+    };
+    let id = live.body.id;
+    assert_eq!(store.workspace(id).unwrap(), None);
+
+    store.apply(&workspace(owner, 1), owner).unwrap();
+    // A terminal under the same id is another record.
+    let mut same_id = terminal(owner, 2);
+    if let AnyRecord::Terminal(r) = &mut same_id {
+        r.body.id = TerminalId(id.0);
+    }
+    store.apply(&same_id, owner).unwrap();
+    insert_unreadable(&store, owner, 3, "printer", "{}");
+    assert_eq!(store.workspace(id).unwrap(), Some(live.clone()));
+
+    store.apply(&deleted(workspace(owner, 4)), owner).unwrap();
+    let held = store.workspace(id).unwrap().unwrap();
+    assert!(held.deleted);
+    assert_eq!(held.version, 4);
+    assert_eq!(
+        store
+            .workspace(WorkspaceId(uuid::Uuid::from_u128(99)))
+            .unwrap(),
+        None
+    );
+}
+
+/// The terminals of one workspace are read without the owner's other records, deleted ones
+/// included, lowest version first.
+#[test]
+fn terminals_in_gives_one_workspaces_terminals_from_one_owner() {
+    let (_dir, mut store) = open();
+    let owner = MachineId::random();
+    let other = MachineId::random();
+    let in_workspace = |id: u128, workspace: u128, owner: MachineId, version: u64| {
+        let AnyRecord::Terminal(mut r) = terminal(owner, version) else {
+            unreachable!()
+        };
+        r.body.id = TerminalId(uuid::Uuid::from_u128(id));
+        r.body.workspace = WorkspaceId(uuid::Uuid::from_u128(workspace));
+        r
+    };
+    let first = in_workspace(10, 1, owner, 1);
+    let elsewhere = in_workspace(11, 2, owner, 2);
+    let mut second = in_workspace(12, 1, owner, 3);
+    second.deleted = true;
+    let not_owned = in_workspace(13, 1, other, 1);
+    for r in [&first, &elsewhere, &second] {
+        store.apply(&AnyRecord::Terminal(r.clone()), owner).unwrap();
+    }
+    store
+        .apply(&AnyRecord::Terminal(not_owned.clone()), other)
+        .unwrap();
+    store.apply(&workspace(owner, 4), owner).unwrap();
+    insert_unreadable(&store, owner, 5, "printer", "{}");
+
+    let one = WorkspaceId(uuid::Uuid::from_u128(1));
+    assert_eq!(store.terminals_in(owner, one).unwrap(), vec![first, second]);
+    assert_eq!(store.terminals_in(other, one).unwrap(), vec![not_owned]);
+    let none = WorkspaceId(uuid::Uuid::from_u128(98));
+    assert!(store.terminals_in(owner, none).unwrap().is_empty());
+}
+
 #[test]
 fn versions_gives_the_highest_version_held_per_owner() {
     let (_dir, mut store) = open();
