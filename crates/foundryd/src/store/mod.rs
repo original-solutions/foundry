@@ -22,7 +22,11 @@ mod tests;
 ///
 /// A rollback starts the previous build on a file the newer build already migrated, and
 /// `open` lets it. So each step must leave the schema usable by the build before it: new
-/// tables, or new columns with a default, never a changed key or a dropped column.
+/// tables, or new columns with a default, never a changed key or a dropped column. A new
+/// column or table must not copy anything out of `record`: the previous build's upsert would
+/// leave the copy stale. A new kind of record needs no step, as [`Store::since`] reads only
+/// the kinds its build knows; a new field in a known kind must be one the previous build can
+/// read without.
 const MIGRATIONS: &[&str] = &[
     // 1: records keyed by kind and id, the owner's own version counter, shared settings.
     "CREATE TABLE records (
@@ -132,11 +136,15 @@ impl Store {
     }
 
     /// Every record held from `owner` with a version above `version`, lowest version first.
+    /// Records of a kind this build does not know, left by a newer build, are not read.
     pub fn since(&self, owner: MachineId, version: u64) -> Result<Vec<AnyRecord>, StoreError> {
         // Nothing stored is above i64::MAX, so a larger `version` correctly finds nothing.
         let version = i64::try_from(version).unwrap_or(i64::MAX);
         let mut query = self.conn.prepare(
-            "SELECT record FROM records WHERE owner = ?1 AND version > ?2 ORDER BY version",
+            "SELECT record FROM records
+             WHERE owner = ?1 AND version > ?2
+               AND kind IN ('workspace', 'terminal', 'session', 'machine_sample')
+             ORDER BY version",
         )?;
         let rows = query.query_map(params![owner.to_string(), version], |row| {
             row.get::<_, String>(0)
