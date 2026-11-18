@@ -228,19 +228,22 @@ impl Daemon {
         headers: &[(&str, &str)],
         body: Option<serde_json::Value>,
     ) -> Reply {
+        let mut headers = headers.to_vec();
+        if body.is_some() {
+            headers.push(("Content-Type", "application/json"));
+        }
+        let body = body.map(|b| b.to_string()).unwrap_or_default();
+        self.send(method, path, &headers, &body).await
+    }
+
+    /// `method path` with exactly `headers` and `body`, and a Content-Length of the body's.
+    async fn send(&self, method: &str, path: &str, headers: &[(&str, &str)], body: &str) -> Reply {
         let mut stream = tokio::net::TcpStream::connect(self.addr).await.unwrap();
-        let body = body.map(|b| b.to_string());
         let mut request = format!("{method} {path} HTTP/1.1\r\nConnection: close\r\n");
         for (name, value) in headers {
             request.push_str(&format!("{name}: {value}\r\n"));
         }
-        match &body {
-            Some(body) => request.push_str(&format!(
-                "Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-                body.len()
-            )),
-            None => request.push_str("Content-Length: 0\r\n\r\n"),
-        }
+        request.push_str(&format!("Content-Length: {}\r\n\r\n{body}", body.len()));
         stream.write_all(request.as_bytes()).await.unwrap();
         let mut response = Vec::new();
         tokio::time::timeout(WAIT, stream.read_to_end(&mut response))
@@ -899,6 +902,156 @@ async fn a_name_already_taken_is_a_conflict() {
         .await;
     assert_eq!(reply.status, 409, "{}", reply.body);
     assert!(reply.json()["error"].as_str().unwrap().contains("twice"));
+}
+
+// --- errors ---
+
+#[tokio::test]
+async fn every_error_is_json_with_the_status_of_its_cause() {
+    let daemon = Daemon::new(TURN).await;
+    let project = daemon.project();
+    let workspace = daemon.create_workspace(project, "errors").await;
+    let host = daemon.host();
+    let host = host.as_str();
+    let json = ("Content-Type", "application/json");
+    let archive = format!("/api/workspaces/{workspace}/archive");
+    let cases: Vec<(&str, Reply, u16)> = vec![
+        (
+            "a missing field",
+            daemon
+                .send(
+                    "POST",
+                    "/api/workspaces",
+                    &[("Host", host), json],
+                    r#"{"base":"main"}"#,
+                )
+                .await,
+            422,
+        ),
+        (
+            "no Content-Type",
+            daemon
+                .send(
+                    "POST",
+                    "/api/workspaces",
+                    &[("Host", host)],
+                    r#"{"base":"main"}"#,
+                )
+                .await,
+            415,
+        ),
+        (
+            "malformed JSON",
+            daemon
+                .send(
+                    "POST",
+                    "/api/workspaces",
+                    &[("Host", host), json],
+                    "{not json",
+                )
+                .await,
+            400,
+        ),
+        (
+            "a session start with no model",
+            daemon
+                .send(
+                    "POST",
+                    &format!("/api/workspaces/{workspace}/sessions"),
+                    &[("Host", host), json],
+                    "{}",
+                )
+                .await,
+            422,
+        ),
+        (
+            "an archive body that is not JSON",
+            daemon
+                .send("POST", &archive, &[("Host", host), json], "force")
+                .await,
+            400,
+        ),
+        (
+            "an unknown route",
+            daemon
+                .send("GET", "/api/nothing", &[("Host", host)], "")
+                .await,
+            404,
+        ),
+        (
+            "a wrong method",
+            daemon
+                .send("GET", "/api/workspaces", &[("Host", host)], "")
+                .await,
+            405,
+        ),
+        (
+            "the events path without an upgrade",
+            daemon
+                .send("GET", "/api/events", &[("Host", host)], "")
+                .await,
+            400,
+        ),
+        (
+            "a terminal path without an upgrade",
+            daemon
+                .send(
+                    "GET",
+                    &format!("/api/terminals/{}", cat(&daemon).await),
+                    &[("Host", host)],
+                    "",
+                )
+                .await,
+            400,
+        ),
+    ];
+    for (what, reply, status) in cases {
+        assert_eq!(reply.status, status, "{what}: {}", reply.body);
+        let body: serde_json::Value = serde_json::from_str(&reply.body)
+            .unwrap_or_else(|e| panic!("{what}: the body is not JSON ({e}): {:?}", reply.body));
+        assert!(body["error"].is_string(), "{what}: {}", reply.body);
+    }
+}
+
+#[tokio::test]
+async fn an_archive_with_no_body_is_archived_whatever_its_content_type() {
+    let daemon = Daemon::new(TURN).await;
+    let project = daemon.project();
+    let workspace = daemon.create_workspace(project, "bodiless").await;
+    let host = daemon.host();
+    let reply = daemon
+        .send(
+            "POST",
+            &format!("/api/workspaces/{workspace}/archive"),
+            &[
+                ("Host", host.as_str()),
+                ("Content-Type", "application/json"),
+            ],
+            "",
+        )
+        .await;
+    assert_eq!(reply.status, 204, "{}", reply.body);
+}
+
+#[tokio::test]
+async fn a_field_a_request_does_not_know_is_refused() {
+    let daemon = Daemon::new(TURN).await;
+    let project = daemon.project();
+    let reply = daemon
+        .call(
+            "POST",
+            "/api/workspaces",
+            Some(serde_json::json!({
+                "project": project, "base": "main", "name": "x", "machine": "elsewhere"
+            })),
+        )
+        .await;
+    assert_eq!(reply.status, 422, "{}", reply.body);
+    assert!(reply.json()["error"].is_string(), "{}", reply.body);
+    assert!(
+        daemon.records().is_empty(),
+        "a refused create made a workspace"
+    );
 }
 
 // --- secrets ---
