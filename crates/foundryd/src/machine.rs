@@ -321,12 +321,13 @@ mod tests {
     fn read_divides_the_load_by_this_machines_logical_cores() {
         let dir = tempfile::tempdir().unwrap();
         let cores = std::thread::available_parallelism().unwrap().get() as f64;
-        let expected = System::load_average().unwrap().one / cores;
+        let one_minute = System::load_average().unwrap().one;
         let sample = read(dir.path(), 0).unwrap();
+        // Compared in whole-machine load, so a wrong divisor shows even on an idle machine.
         // The load average moves a little between the two reads.
         assert!(
-            (sample.load_per_core - expected).abs() < 0.1,
-            "load per core {} but the 1-minute load over {cores} cores is {expected}",
+            (sample.load_per_core * cores - one_minute).abs() < 0.25,
+            "load per core {} times {cores} cores is not the 1-minute load {one_minute}",
             sample.load_per_core
         );
     }
@@ -341,6 +342,10 @@ mod tests {
         assert_eq!(
             texts(&sample(0, 1.8, 50_000_000_000), &limits()),
             ["trilogy-mac: load 1.8 over limit 1.0"]
+        );
+        assert_eq!(
+            texts(&sample(0, 1.837, 50_000_000_000), &limits()),
+            ["trilogy-mac: load 1.84 over limit 1.0"]
         );
         assert_eq!(
             texts(&sample(5, 0.2, 50_000_000_000), &limits()),
