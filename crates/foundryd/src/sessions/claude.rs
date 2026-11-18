@@ -33,12 +33,16 @@ pub fn shell_quote(text: &str) -> String {
 /// its stdin with the URL and headers in the curl config file `curl_config`, so the token is
 /// in a private file and never in a command line, which other users on the machine can read.
 ///
+/// `-q` comes first so curl reads no `~/.curlrc`, and the config turns every proxy off, so
+/// neither the user's curl settings nor a proxy variable in the session's environment can send
+/// the token anywhere but this daemon.
+///
 /// The command's stdout goes to /dev/null, because Claude Code adds the stdout of some hooks
 /// to the model's context. It ends in `|| true`, because a hook that exits 2 blocks the tool
 /// call, and posting must never block the agent.
 pub fn settings_json(curl_config: &Path) -> Value {
     let command = format!(
-        "curl -sS -m 5 -K {} -X POST --data-binary @- >/dev/null 2>&1 || true",
+        "curl -q -sS -m 5 -K {} -X POST --data-binary @- >/dev/null 2>&1 || true",
         shell_quote(&curl_config.to_string_lossy())
     );
     let hooks: Map<String, Value> = EVENTS
@@ -88,16 +92,17 @@ pub fn write_settings(path: &Path, value: &Value) -> Result<(), SessionError> {
     write_new_private(path, value.to_string().as_bytes())
 }
 
-/// Writes the curl config a session's hooks read: the headers, with the bearer `token`, and
-/// the `url` to post to. Same file rules as [`write_settings`]. `url` and `token` sit inside
-/// double quotes, so they must hold none: a hex token and `http://127.0.0.1:<port>/hooks/<uuid>`
-/// never do.
+/// Writes the curl config a session's hooks read: the headers, with the bearer `token`, the
+/// `url` to post to, and no proxy for any host. Same file rules as [`write_settings`]. `url`
+/// and `token` sit inside double quotes, so they must hold none: a hex token and
+/// `http://127.0.0.1:<port>/hooks/<uuid>` never do.
 pub fn write_curl_config(path: &Path, url: &str, token: &str) -> Result<(), SessionError> {
     debug_assert!(!url.contains(['"', '\\', '\n']) && !token.contains(['"', '\\', '\n']));
     let config = format!(
         "header = \"Content-Type: application/json\"\n\
          header = \"Authorization: Bearer {token}\"\n\
-         url = \"{url}\"\n"
+         url = \"{url}\"\n\
+         noproxy = \"*\"\n"
     );
     write_new_private(path, config.as_bytes())
 }
@@ -121,6 +126,8 @@ const MERGE_TRIES: usize = 3;
 
 /// Marks `worktree` as trusted in Claude Code's state file: `projects.<worktree>.
 /// hasTrustDialogAccepted` is `true`. Without it Claude Code asks, with "No, exit" the default.
+///
+/// The mark stays after the session ends: a worktree is used by session after session.
 ///
 /// The key is the canonical path of `worktree`, which Claude Code looks up. A file that already
 /// trusts the folder is not written at all, as Claude Code rewrites it all the time. Otherwise
@@ -317,8 +324,9 @@ mod tests {
     #[test]
     fn the_hook_command_posts_stdin_through_a_curl_config_quietly_and_never_blocks_the_agent() {
         let settings = settings_json(Path::new(CURL));
-        let want =
-            format!("curl -sS -m 5 -K '{CURL}' -X POST --data-binary @- >/dev/null 2>&1 || true");
+        let want = format!(
+            "curl -q -sS -m 5 -K '{CURL}' -X POST --data-binary @- >/dev/null 2>&1 || true"
+        );
         for event in ["SessionStart", "PreToolUse", "SessionEnd"] {
             assert_eq!(command(&settings, event), want);
         }
@@ -328,6 +336,99 @@ mod tests {
     fn the_settings_hold_neither_the_token_nor_a_bearer_header() {
         let text = settings_json(Path::new(CURL)).to_string();
         assert!(!text.contains(TOKEN) && !text.contains("Bearer"), "{text}");
+    }
+
+    /// Runs a session's hook command through `sh`, with its curl config pointing at a listener
+    /// on loopback. A `~/.curlrc` adds a header and names a proxy, and every proxy variable names
+    /// it too; nothing listens there. Gives the request the listener got, if any.
+    fn hook_request_with_a_curlrc_and_proxies_set() -> Option<String> {
+        use std::io::{Read as _, Write as _};
+        let dir = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let curl = dir.path().join("sessions").join("s.curl");
+        let url = format!("http://127.0.0.1:{port}/hooks/67e55044-10b1-426f-9247-bb680e5fe0c8");
+        write_curl_config(&curl, &url, TOKEN).unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        // Nothing listens on port 9, the discard port, on loopback.
+        let proxy = "http://127.0.0.1:9";
+        std::fs::write(
+            home.join(".curlrc"),
+            format!("proxy = \"{proxy}\"\nheader = \"X-From-Curlrc: 1\"\n"),
+        )
+        .unwrap();
+
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(command(&settings_json(&curl), "Stop"))
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap())
+            .env("HOME", &home)
+            .envs(["ALL_PROXY", "all_proxy", "HTTP_PROXY", "http_proxy"].map(|k| (k, proxy)))
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(br#"{"hook_event_name":"Stop"}"#)
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let request = loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                        .unwrap();
+                    let mut seen = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    while !String::from_utf8_lossy(&seen).contains(r#""Stop"}"#) {
+                        let n = stream.read(&mut chunk).unwrap();
+                        assert!(n > 0, "the request ended early");
+                        seen.extend_from_slice(&chunk[..n]);
+                    }
+                    stream
+                        .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                        .unwrap();
+                    break Some(String::from_utf8_lossy(&seen).into_owned());
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    // curl gave up without calling: give a late connection a moment, then stop.
+                    if child.try_wait().unwrap().is_some() {
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                        if let Ok((_, _)) = listener.accept() {
+                            panic!("a connection came after curl exited");
+                        }
+                        break None;
+                    }
+                    assert!(std::time::Instant::now() < deadline, "curl did not finish");
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => panic!("accept: {e}"),
+            }
+        };
+        assert!(child.wait().unwrap().success(), "the hook command fails");
+        request
+    }
+
+    #[test]
+    fn the_hook_command_reads_no_curlrc_and_uses_no_proxy() {
+        let request = hook_request_with_a_curlrc_and_proxies_set()
+            .expect("the hook reached the daemon straight, not through a proxy");
+        assert!(
+            request.starts_with("POST /hooks/67e55044-10b1-426f-9247-bb680e5fe0c8 HTTP/1.1\r\n"),
+            "{request}"
+        );
+        assert!(
+            request.contains(&format!("Authorization: Bearer {TOKEN}\r\n")),
+            "{request}"
+        );
+        assert!(!request.contains("X-From-Curlrc"), "{request}");
     }
 
     #[test]
@@ -364,7 +465,8 @@ mod tests {
             format!(
                 "header = \"Content-Type: application/json\"\n\
                  header = \"Authorization: Bearer {TOKEN}\"\n\
-                 url = \"{URL}\"\n"
+                 url = \"{URL}\"\n\
+                 noproxy = \"*\"\n"
             )
         );
         assert_eq!(mode(&path), 0o600);

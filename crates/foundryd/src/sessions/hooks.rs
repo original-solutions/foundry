@@ -2,19 +2,24 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{HeaderMap, StatusCode, header::AUTHORIZATION};
 use foundry_proto::ids::SessionId;
 
-use super::Inner;
 use super::state::{Event, Hook};
+use super::{Inner, RETRY_AFTER, RETRY_AT_MOST};
+
+/// How long a hook whose record cannot be written is tried again for, with a growing wait.
+/// Inside the 5 seconds the hook command waits, so curl still gets the answer.
+const KEEP_TRYING_FOR: Duration = Duration::from_secs(3);
 
 /// Takes one hook call. Only loopback callers, and only with the session's own token, change
 /// anything: a caller from another address, an unknown session and a wrong token all get 403,
 /// and none of them is told which it was. Warnings name the session or the peer address, never
-/// a token.
+/// a token. A hook the store does not take is tried again for [`KEEP_TRYING_FOR`], then is 500.
 pub(super) async fn hook(
     State(inner): State<Arc<Inner>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -46,11 +51,20 @@ pub(super) async fn hook(
     let Some(hook) = hook else {
         return StatusCode::BAD_REQUEST;
     };
-    match inner.event(&live, Event::Hook(hook)).await {
-        Ok(_) => StatusCode::NO_CONTENT,
-        Err(error) => {
-            tracing::error!(session = %session, %error, "hook not recorded");
-            StatusCode::INTERNAL_SERVER_ERROR
+    let give_up_at = tokio::time::Instant::now() + KEEP_TRYING_FOR;
+    let mut backoff = RETRY_AFTER;
+    loop {
+        match inner.event(&live, Event::Hook(hook)).await {
+            Ok(_) => return StatusCode::NO_CONTENT,
+            Err(error) if tokio::time::Instant::now() + backoff < give_up_at => {
+                tracing::warn!(session = %session, %error, "hook not recorded; trying again");
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(RETRY_AT_MOST);
+            }
+            Err(error) => {
+                tracing::error!(session = %session, %error, "hook not recorded");
+                return StatusCode::INTERNAL_SERVER_ERROR;
+            }
         }
     }
 }

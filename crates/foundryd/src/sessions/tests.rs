@@ -661,6 +661,40 @@ async fn a_stall_whose_record_cannot_be_written_is_written_once_the_store_answer
 }
 
 #[tokio::test]
+async fn a_hook_whose_record_cannot_be_written_at_first_is_written_and_answered_204() {
+    let f = Fixture::new("- wait_input\n").await;
+    let id = f.start().await;
+    fail_next_writes(&f, 2);
+
+    let body = r#"{"hook_event_name":"UserPromptSubmit"}"#;
+    assert_eq!(post(f.url(id), Some(f.token(id)), body).await, 204);
+
+    assert_eq!(f.state(id), Some(SessionState::Working));
+}
+
+#[tokio::test]
+async fn a_hook_the_store_never_takes_is_500_before_the_hook_command_gives_up() {
+    let f = Fixture::new("- wait_input\n").await;
+    let id = f.start().await;
+    let before = f.record(id).unwrap();
+    fail_next_writes(&f, usize::MAX);
+
+    let body = r#"{"hook_event_name":"UserPromptSubmit"}"#;
+    let asked = Instant::now();
+    let answer = tokio::time::timeout(WAIT, post(f.url(id), Some(f.token(id)), body)).await;
+    assert_eq!(answer.expect("an answer"), 500);
+
+    // The hook command waits 5 seconds for an answer.
+    assert!(
+        asked.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        asked.elapsed()
+    );
+    fail_next_writes(&f, 0);
+    assert_eq!(f.record(id).unwrap(), before);
+}
+
+#[tokio::test]
 async fn the_gateway_key_is_in_the_childs_environment_and_in_no_log_line_or_file() {
     let logs = logs();
     let f = Fixture::new(
@@ -801,6 +835,84 @@ async fn a_command_that_cannot_start_fails_the_start_and_leaves_no_session_or_se
         .map(|dir| dir.flatten().count())
         .unwrap_or(0);
     assert_eq!(settings, 0, "a settings file is left");
+}
+
+#[tokio::test]
+async fn a_start_whose_record_cannot_be_written_closes_its_terminal_and_leaves_nothing_behind() {
+    let f = Fixture::new("- wait_input\n").await;
+    fail_next_writes(&f, 1);
+
+    let error = f
+        .sessions
+        .start(WorkspaceId::random(), f.worktree.path(), MODEL)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, SessionError::Store(_)), "{error:?}");
+    assert_eq!(session_records(&f.store, f.me), 0);
+    let settings = std::fs::read_dir(f.data.path().join("sessions"))
+        .map(|dir| dir.flatten().count())
+        .unwrap_or(0);
+    assert_eq!(settings, 0, "a settings or curl file is left");
+    assert!(
+        lock(&f.sessions.inner.live).is_empty(),
+        "the session is live"
+    );
+    // The terminal was started, then closed: its holder ends and removes its socket.
+    until("the terminal's holder to go", || {
+        std::fs::read_dir(f.data.path().join("terminals"))
+            .map(|dir| dir.flatten().count())
+            .unwrap_or(0)
+            == 0
+    })
+    .await;
+}
+
+/// Reads the terminal until `marker` is printed. Under load this reader can fall behind and be
+/// cut off by the holder too; it then attaches again, and the new snapshot holds what it missed.
+async fn until_printed(f: &Fixture, terminal: TerminalId, marker: &str) {
+    let deadline = Instant::now() + WAIT;
+    'attach: loop {
+        let (snapshot, mut output) = f.terminals.attach(terminal).await.unwrap();
+        let mut tail = snapshot.bytes.to_vec();
+        loop {
+            tail.drain(..tail.len().saturating_sub(64));
+            if String::from_utf8_lossy(&tail).contains(marker) {
+                return;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            match tokio::time::timeout(left, output.next()).await {
+                Ok(Some(Ok(bytes))) => tail.extend_from_slice(&bytes),
+                Ok(Some(Err(TerminalError::Detached(_)))) => continue 'attach,
+                other => panic!("no {marker:?} in the output: {other:?}"),
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_follower_the_holder_cuts_off_attaches_again_and_still_sees_the_exit() {
+    // More output than the holder keeps for one client that does not read.
+    let big = "x".repeat(6 * 1024 * 1024);
+    let f = Fixture::new(&format!(
+        "- wait_input\n- print: {big}\n- print: AFTER-BIG\n- wait_input\n- exit: 0\n"
+    ))
+    .await;
+    let id = f.start().await;
+    let terminal = f.record(id).unwrap().body.terminal;
+    let live = f.sessions.inner.live(id).unwrap();
+
+    // While the session's body is held, the follower blocks on the first output it reports and
+    // reads no more, so its backlog in the holder passes the limit and the holder cuts it off.
+    let held = live.body.lock().await;
+    f.enter(id).await;
+    until_printed(&f, terminal, "AFTER-BIG").await;
+    drop(held);
+
+    f.enter(id).await;
+
+    f.until_state(id, SessionState::Finished).await;
+    until("its files to go", || f.files_gone(id)).await;
 }
 
 #[tokio::test]
