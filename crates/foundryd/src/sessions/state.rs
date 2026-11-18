@@ -1,3 +1,88 @@
+//! The rules that turn what a session's agent does into the session's state. Pure: no clock,
+//! no I/O, so every row of the spec's state table is a unit test.
+
+use foundry_proto::state::SessionState;
+
+/// A Claude Code hook event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hook {
+    SessionStart,
+    UserPromptSubmit,
+    PreToolUse,
+    PostToolUse,
+    Notification,
+    Stop,
+    SessionEnd,
+    /// Any event the session state does not depend on.
+    Other,
+}
+
+impl Hook {
+    /// The hook a `hook_event_name` names. An unknown name is [`Hook::Other`].
+    pub fn from_name(name: &str) -> Self {
+        match name {
+            "SessionStart" => Self::SessionStart,
+            "UserPromptSubmit" => Self::UserPromptSubmit,
+            "PreToolUse" => Self::PreToolUse,
+            "PostToolUse" => Self::PostToolUse,
+            "Notification" => Self::Notification,
+            "Stop" => Self::Stop,
+            "SessionEnd" => Self::SessionEnd,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// Something that happened to a session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Event {
+    /// The agent posted a hook.
+    Hook(Hook),
+    /// The terminal wrote output.
+    Output,
+    /// Nothing was heard from a working session for the stuck time.
+    Stalled,
+    /// The child exited with this code, or none known.
+    Exited(Option<i32>),
+}
+
+/// The state after `event`. The owner never produces `Unreachable`: only a receiver shows it,
+/// and a state that is `Unreachable` on the way in is left alone.
+pub fn next_state(state: SessionState, event: Event) -> SessionState {
+    use SessionState::{
+        Failed, Finished, Idle, Starting, Stuck, Unreachable, WaitingForYou, Working,
+    };
+    match state {
+        Unreachable | Failed => return state,
+        // Finished is final, except that the child can still turn out to have exited badly.
+        Finished => {
+            return match event {
+                Event::Exited(code) if code != Some(0) => Failed,
+                _ => Finished,
+            };
+        }
+        _ => {}
+    }
+    match event {
+        Event::Exited(Some(0)) => Finished,
+        Event::Exited(_) => Failed,
+        Event::Hook(hook) => match hook {
+            Hook::SessionEnd => Finished,
+            // It also fires on /clear, resume and compact, sometimes mid-turn.
+            Hook::SessionStart if state == Starting => Idle,
+            Hook::UserPromptSubmit | Hook::PreToolUse | Hook::PostToolUse => Working,
+            // Claude Code also notifies after 60 seconds idle: an idle session is not waiting
+            // on a permission answer.
+            Hook::Notification if matches!(state, Starting | Working | Stuck) => WaitingForYou,
+            Hook::Stop => Idle,
+            Hook::SessionStart | Hook::Notification | Hook::Other => state,
+        },
+        Event::Output if state == Stuck => Working,
+        Event::Stalled if state == Working => Stuck,
+        Event::Output | Event::Stalled => state,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use SessionState::*;
@@ -156,7 +241,7 @@ mod tests {
 
     #[test]
     fn the_owner_never_produces_unreachable() {
-        for state in STATES {
+        for state in STATES.into_iter().filter(|s| *s != Unreachable) {
             for event in events() {
                 assert_ne!(next_state(state, event), Unreachable, "{state:?} {event:?}");
             }

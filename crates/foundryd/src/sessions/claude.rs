@@ -1,6 +1,196 @@
+//! What Claude Code reads: the settings file that registers the hooks, and the state file where
+//! a folder is marked trusted so the trust prompt does not stop a session.
+
+use std::ffi::OsString;
+use std::io::{self, Write as _};
+use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
+use std::path::{Path, PathBuf};
+
+use serde_json::{Map, Value, json};
+
+use super::SessionError;
+
+/// The events registered. Claude Code calls each with the event as JSON on stdin.
+const EVENTS: [&str; 7] = [
+    "SessionStart",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+    "Notification",
+    "Stop",
+    "SessionEnd",
+];
+
+/// The events that take a tool matcher.
+const TOOL_EVENTS: [&str; 2] = ["PreToolUse", "PostToolUse"];
+
+/// The settings that register a command hook for each event, posting the event to `url` with
+/// `token`.
+///
+/// The command's stdout goes to /dev/null, because Claude Code adds the stdout of some hooks
+/// to the model's context. It ends in `|| true`, because a hook that exits 2 blocks the tool
+/// call, and posting must never block the agent. `url` and `token` sit inside single quotes, so
+/// they must have none: a hex token and `http://127.0.0.1:<port>/hooks/<uuid>` never do.
+pub fn settings_json(url: &str, token: &str) -> Value {
+    debug_assert!(!url.contains('\'') && !token.contains('\''));
+    let command = format!(
+        "curl -sS -m 5 -X POST -H 'Content-Type: application/json' \
+         -H 'Authorization: Bearer {token}' --data-binary @- '{url}' >/dev/null 2>&1 || true"
+    );
+    let hooks: Map<String, Value> = EVENTS
+        .iter()
+        .map(|event| {
+            let mut entry = json!({"hooks": [{"type": "command", "command": command}]});
+            if TOOL_EVENTS.contains(event) {
+                entry["matcher"] = json!("*");
+            }
+            ((*event).to_string(), json!([entry]))
+        })
+        .collect();
+    json!({ "hooks": hooks })
+}
+
+/// Writes `value` to a new file at `path`, readable by this user only, in a folder made
+/// readable by this user only. An existing file is an error.
+pub fn write_settings(path: &Path, value: &Value) -> Result<(), SessionError> {
+    let io = |step: &str| {
+        let what = format!("{}: {step}", path.display());
+        move |source| SessionError::Io { what, source }
+    };
+    if let Some(dir) = path.parent() {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .map_err(io("create the folder"))?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(io("create the file"))?;
+    file.write_all(value.to_string().as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(io("write the file"))
+}
+
+/// Marks `worktree` as trusted in Claude Code's state file: `projects.<worktree>.
+/// hasTrustDialogAccepted` is `true`. Without it Claude Code asks, with "No, exit" the default.
+///
+/// The key is the canonical path of `worktree`, which Claude Code looks up. A file that already
+/// trusts the folder is not written at all, as Claude Code rewrites it all the time. Otherwise
+/// every other key stays, and the file is replaced by a rename so Claude Code never reads half
+/// of it; a symlinked file has its target replaced and stays a link. A file that is not JSON,
+/// or whose `projects` or entry is not an object, is an error and is left alone. The error
+/// names the file and never quotes it, as it can hold credentials.
+pub fn mark_trusted(claude_json: &Path, worktree: &Path) -> Result<(), SessionError> {
+    let io = |what: String| move |source| SessionError::Io { what, source };
+    let key = std::fs::canonicalize(worktree)
+        .map_err(io(format!("{}: resolve the worktree", worktree.display())))?;
+    let key = key.to_str().ok_or_else(|| SessionError::Io {
+        what: format!("{}: the worktree path is not UTF-8", worktree.display()),
+        source: io::ErrorKind::InvalidData.into(),
+    })?;
+    let unusable = |reason: String| SessionError::ClaudeState {
+        path: claude_json.to_path_buf(),
+        reason,
+    };
+    let trusted =
+        |state: &Value| state["projects"][key]["hasTrustDialogAccepted"] == Value::Bool(true);
+
+    // A symlink is followed to the file it names, so the link stays.
+    let target = match std::fs::canonicalize(claude_json) {
+        Ok(target) => target,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => claude_json.to_path_buf(),
+        Err(e) => return Err(io(format!("{}: resolve", claude_json.display()))(e)),
+    };
+    let existing = match std::fs::read(&target) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(io(format!("{}: read", target.display()))(e)),
+    };
+    let write_err = |step: &str| io(format!("{}: {step}", target.display()));
+
+    let Some(bytes) = existing else {
+        let state = json!({"projects": {key: {"hasTrustDialogAccepted": true}}});
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&target)
+            .map_err(write_err("create"))?;
+        return file
+            .write_all(state.to_string().as_bytes())
+            .and_then(|()| file.sync_all())
+            .map_err(write_err("write"));
+    };
+
+    let mut state: Value = serde_json::from_slice(&bytes).map_err(|e| {
+        unusable(format!(
+            "not valid JSON (line {}, column {})",
+            e.line(),
+            e.column()
+        ))
+    })?;
+    if trusted(&state) {
+        return Ok(());
+    }
+    let root = state
+        .as_object_mut()
+        .ok_or_else(|| unusable("the top level is not an object".into()))?;
+    let projects = root
+        .entry("projects")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| unusable("`projects` is not an object".into()))?;
+    let entry = projects
+        .entry(key)
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| unusable("the entry for the worktree is not an object".into()))?;
+    entry.insert("hasTrustDialogAccepted".into(), Value::Bool(true));
+
+    let mode = std::fs::metadata(&target)
+        .map_err(write_err("read the mode"))?
+        .permissions()
+        .mode()
+        & 0o7777;
+    let dir = target.parent().unwrap_or(Path::new("."));
+    let temp = dir.join(format!(".claude.json.foundry-{}.tmp", uuid::Uuid::new_v4()));
+    let written = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(&temp)?;
+        file.write_all(serde_json::to_string_pretty(&state)?.as_bytes())?;
+        file.sync_all()?;
+        // `mode` above is cut by the umask; the file's own mode is what is kept.
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(mode))?;
+        std::fs::rename(&temp, &target)
+    })();
+    written.map_err(|source| {
+        let _ = std::fs::remove_file(&temp);
+        SessionError::Io {
+            what: format!("{}: replace", target.display()),
+            source,
+        }
+    })
+}
+
+/// Where Claude Code keeps its state: `$CLAUDE_CONFIG_DIR/.claude.json` when that is set and
+/// not empty, else `$HOME/.claude.json`. Takes the two variables' values.
+pub fn claude_json(config_dir: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
+    let set = |v: Option<OsString>| v.filter(|v| !v.is_empty()).map(PathBuf::from);
+    set(config_dir)
+        .or_else(|| set(home))
+        .map(|dir| dir.join(".claude.json"))
+}
+
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::{PermissionsExt as _, symlink};
+    use std::os::unix::fs::symlink;
 
     use serde_json::{Value, json};
 
@@ -159,7 +349,10 @@ mod tests {
         mark_trusted(&file, worktree.path()).unwrap();
 
         assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
-        assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), before);
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().modified().unwrap(),
+            before
+        );
     }
 
     #[test]

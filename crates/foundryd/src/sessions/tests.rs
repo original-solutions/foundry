@@ -16,7 +16,6 @@ use foundry_proto::ids::{MachineId, SessionId, WorkspaceId};
 use foundry_proto::record::{AnyRecord, Record, Session};
 use foundry_proto::settings::Machine;
 use foundry_proto::state::SessionState;
-use futures::StreamExt as _;
 use futures::future::BoxFuture;
 use tempfile::TempDir;
 
@@ -233,11 +232,7 @@ async fn until_paused(what: &str, mut done: impl FnMut() -> bool) {
 }
 
 /// Reads `snapshot` then the stream until `done` holds for what has been seen.
-async fn read_until(
-    snapshot: &[u8],
-    stream: &mut Output,
-    done: impl Fn(&str) -> bool,
-) -> String {
+async fn read_until(snapshot: &[u8], stream: &mut Output, done: impl Fn(&str) -> bool) -> String {
     let mut seen = snapshot.to_vec();
     let deadline = Instant::now() + WAIT;
     while !done(&String::from_utf8_lossy(&seen)) {
@@ -413,7 +408,10 @@ async fn a_hook_with_a_wrong_token_or_for_an_unknown_session_is_403_and_changes_
     assert_eq!(post(f.url(id), Some(format!("{token}0")), body).await, 403);
     let unknown = SessionId::random();
     assert_eq!(post(f.url(unknown), Some(token.clone()), body).await, 403);
-    assert_eq!(post(f.url("not-a-uuid"), Some(token.clone()), body).await, 403);
+    assert_eq!(
+        post(f.url("not-a-uuid"), Some(token.clone()), body).await,
+        403
+    );
 
     let after = f.record(id).unwrap();
     assert_eq!(after, before);
@@ -428,7 +426,10 @@ async fn a_right_token_with_a_body_that_is_not_a_hook_is_400_and_changes_nothing
     let token = f.token(id);
 
     assert_eq!(post(f.url(id), Some(token.clone()), "not json").await, 400);
-    assert_eq!(post(f.url(id), Some(token.clone()), r#"{"a":1}"#).await, 400);
+    assert_eq!(
+        post(f.url(id), Some(token.clone()), r#"{"a":1}"#).await,
+        400
+    );
     assert_eq!(
         post(f.url(id), Some(token.clone()), r#"{"hook_event_name":7}"#).await,
         400
@@ -469,7 +470,10 @@ async fn a_hook_from_a_non_loopback_address_is_refused_and_changes_nothing() {
     assert_eq!(f.record(id).unwrap(), before);
 
     // The same call from loopback, plain or as an IPv4-mapped IPv6 address, is taken.
-    assert_eq!(call("[::ffff:127.0.0.1]:40000").await, StatusCode::NO_CONTENT);
+    assert_eq!(
+        call("[::ffff:127.0.0.1]:40000").await,
+        StatusCode::NO_CONTENT
+    );
     f.until_state(id, SessionState::Working).await;
 }
 
@@ -537,7 +541,12 @@ async fn the_gateway_key_is_in_the_childs_environment_and_in_no_log_line_or_file
 
     // A refused hook and a failed start, the two ways a key could leak into a log.
     assert_eq!(
-        post(f.url(id), Some("wrong".into()), r#"{"hook_event_name":"Stop"}"#).await,
+        post(
+            f.url(id),
+            Some("wrong".into()),
+            r#"{"hook_event_name":"Stop"}"#
+        )
+        .await,
         403
     );
     std::fs::write(f.claude_json(), "not json").unwrap();
@@ -557,13 +566,19 @@ async fn the_gateway_key_is_in_the_childs_environment_and_in_no_log_line_or_file
     assert!(!logged.contains(&f.key), "the gateway key is logged");
     assert!(!logged.contains(&token), "the hook token is logged");
     let settings = std::fs::read_to_string(f.settings_file(id)).unwrap();
-    assert!(!settings.contains(&f.key), "the gateway key is in the settings file");
+    assert!(
+        !settings.contains(&f.key),
+        "the gateway key is in the settings file"
+    );
     let gateway = Gateway {
         base_url: "http://x".into(),
         key: f.key.clone(),
     };
     let shown = format!("{gateway:?}");
-    assert!(!shown.contains(&f.key) && shown.contains("<redacted>"), "{shown}");
+    assert!(
+        !shown.contains(&f.key) && shown.contains("<redacted>"),
+        "{shown}"
+    );
 }
 
 #[tokio::test]
@@ -578,7 +593,10 @@ async fn a_start_with_an_unusable_claude_json_fails_and_leaves_nothing_behind() 
         .await
         .unwrap_err();
 
-    assert!(matches!(error, SessionError::ClaudeState { .. }), "{error:?}");
+    assert!(
+        matches!(error, SessionError::ClaudeState { .. }),
+        "{error:?}"
+    );
     assert!(!format!("{error} {error:?}").contains("SECRET-VALUE"));
     assert_eq!(std::fs::read_to_string(f.claude_json()).unwrap(), text);
     let sockets = std::fs::read_dir(f.data.path().join("terminals"))
@@ -605,7 +623,13 @@ async fn a_command_that_cannot_start_fails_the_start_and_leaves_no_session_or_se
             key: "k".into(),
         },
     };
-    f.sessions = Sessions::new(f.me, f.store.clone(), f.terminals.clone(), f.data.path(), config);
+    f.sessions = Sessions::new(
+        f.me,
+        f.store.clone(),
+        f.terminals.clone(),
+        f.data.path(),
+        config,
+    );
 
     let error = f
         .sessions
