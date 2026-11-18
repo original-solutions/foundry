@@ -373,7 +373,7 @@ impl Inner {
             use std::sync::atomic::Ordering::SeqCst;
             if self
                 .fail_writes
-                .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+                .try_update(SeqCst, SeqCst, |n| n.checked_sub(1))
                 .is_ok()
             {
                 return Err(StoreError::Sqlite(rusqlite::Error::SqliteFailure(
