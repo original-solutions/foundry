@@ -1258,6 +1258,21 @@ mod tests {
         assert!(!lock.exists(), "its lock file is removed");
     }
 
+    /// The holder and foundryd each name the lock file, so a real holder must hold the file
+    /// `lock_file` names. A holder that kept its lock anywhere else would read as gone.
+    #[tokio::test]
+    async fn a_running_holder_holds_the_lock_file_foundryd_checks() {
+        let setup = Setup::new();
+        let (terminals, _) = setup.daemon();
+        let id = setup.start(&terminals, "sleep 60").await;
+        let lock = lock_file(&setup.socket(id));
+        assert!(
+            holder_runs(&lock).unwrap(),
+            "{} is not held",
+            lock.display()
+        );
+    }
+
     #[tokio::test]
     async fn a_holder_that_ends_while_the_daemon_runs_is_recorded_exited_and_can_be_closed() {
         let setup = Setup::new();
