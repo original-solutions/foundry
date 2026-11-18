@@ -1,5 +1,50 @@
 //! Shared settings and their sequence number.
 
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
+
+use crate::ids::{MachineId, ProjectId};
+
+/// Settings every machine shares, changed only through the acting coordinator.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SharedSettings {
+    /// The coordinator's sequence number for this edit. Higher wins.
+    pub seq: u64,
+    pub machines: Vec<Machine>,
+    /// Machines in the order they take the coordinator role, first first.
+    pub priority: Vec<MachineId>,
+    pub projects: Vec<Project>,
+    pub limits: BTreeMap<MachineId, Limits>,
+}
+
+/// A machine in the fleet.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Machine {
+    pub id: MachineId,
+    pub name: String,
+    /// Its Tailscale address.
+    pub address: String,
+}
+
+/// A repo and a name.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Project {
+    pub id: ProjectId,
+    pub name: String,
+    /// The URL to clone.
+    pub repo: String,
+}
+
+/// The limits placement keeps a machine under.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Limits {
+    pub max_sessions: u32,
+    pub max_load_per_core: f64,
+    /// Bytes.
+    pub min_free_disk: u64,
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;

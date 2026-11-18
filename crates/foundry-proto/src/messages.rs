@@ -1,5 +1,77 @@
 //! Peer and UI messages, each carrying a protocol number.
 
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
+
+use crate::ids::MachineId;
+use crate::record::AnyRecord;
+use crate::settings::SharedSettings;
+
+/// The protocol number this build speaks.
+pub const PROTOCOL: u16 = 1;
+
+/// A message between two machines' daemons, tagged by `type`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PeerMessage {
+    /// Opens a link: who is speaking and the highest version it holds per owner.
+    Hello {
+        protocol: u16,
+        machine: MachineId,
+        versions: BTreeMap<MachineId, u64>,
+    },
+    /// Records the receiver may not have yet.
+    Records {
+        protocol: u16,
+        records: Vec<AnyRecord>,
+    },
+    /// The shared settings as the sender holds them.
+    Settings {
+        protocol: u16,
+        settings: SharedSettings,
+    },
+}
+
+impl PeerMessage {
+    pub fn protocol(&self) -> u16 {
+        match self {
+            Self::Hello { protocol, .. }
+            | Self::Records { protocol, .. }
+            | Self::Settings { protocol, .. } => *protocol,
+        }
+    }
+}
+
+/// A message from the daemon to the UI, tagged by `type`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum UiMessage {
+    /// The full state, sent when the UI connects.
+    State {
+        protocol: u16,
+        records: Vec<AnyRecord>,
+        settings: SharedSettings,
+    },
+    /// One record changed.
+    Record { protocol: u16, record: AnyRecord },
+    /// The shared settings changed.
+    Settings {
+        protocol: u16,
+        settings: SharedSettings,
+    },
+}
+
+impl UiMessage {
+    pub fn protocol(&self) -> u16 {
+        match self {
+            Self::State { protocol, .. }
+            | Self::Record { protocol, .. }
+            | Self::Settings { protocol, .. } => *protocol,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

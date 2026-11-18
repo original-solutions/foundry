@@ -1,5 +1,41 @@
 //! Session and terminal states.
 
+use serde::{Deserialize, Serialize};
+
+/// The states an agent session can show, from the spec's state table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionState {
+    /// Launched and has not reported yet.
+    Starting,
+    /// The agent is running a turn.
+    Working,
+    /// The agent needs a permission answer or other input.
+    WaitingForYou,
+    /// The turn ended and the agent waits for the next prompt.
+    Idle,
+    /// The session ended normally.
+    Finished,
+    /// The process died or exited non-zero.
+    Failed,
+    /// Working, with no output and no hook event for 10 minutes.
+    Stuck,
+    /// The owning machine is offline.
+    Unreachable,
+}
+
+/// The states a shell terminal can show.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalState {
+    /// The child process is running.
+    Running,
+    /// The child process has exited.
+    Exited,
+    /// The owning machine is offline.
+    Unreachable,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

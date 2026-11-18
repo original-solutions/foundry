@@ -1,5 +1,84 @@
 //! Records with an owner and a version, and their bodies.
 
+use serde::{Deserialize, Serialize};
+
+use crate::ids::{MachineId, ProjectId, SessionId, TerminalId, WorkspaceId};
+use crate::state::{SessionState, TerminalState};
+
+/// A body written only by its owner machine, under a version that only goes up.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Record<T> {
+    /// The machine that writes this record. No other machine may.
+    pub owner: MachineId,
+    /// The owner's version for this write. Records are ordered by this, never by time.
+    pub version: u64,
+    /// True once the record is removed, such as an archived workspace.
+    pub deleted: bool,
+    pub body: T,
+}
+
+impl<T> Record<T> {
+    /// True only when `self` comes from the same owner as `other` with a higher version.
+    pub fn supersedes(&self, other: &Self) -> bool {
+        self.owner == other.owner && self.version > other.version
+    }
+}
+
+/// A git worktree and branch on its owner machine.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Workspace {
+    pub id: WorkspaceId,
+    pub project: ProjectId,
+    /// The name as typed.
+    pub name: String,
+    /// The branch made from the name.
+    pub branch: String,
+    /// The branch the workspace was made from.
+    pub base: String,
+}
+
+/// A PTY in a workspace.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Terminal {
+    pub id: TerminalId,
+    pub workspace: WorkspaceId,
+    pub state: TerminalState,
+    /// The child's exit code once it has exited, when known.
+    pub exit_code: Option<i32>,
+}
+
+/// Claude Code running in a terminal.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Session {
+    pub id: SessionId,
+    pub workspace: WorkspaceId,
+    pub terminal: TerminalId,
+    pub model: String,
+    pub state: SessionState,
+}
+
+/// The owner machine's load, memory, disk and session count.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MachineSample {
+    /// The 1-minute load divided by logical cores.
+    pub load_per_core: f64,
+    /// Bytes.
+    pub free_memory: u64,
+    /// Bytes free on the volume holding the data directory.
+    pub free_disk: u64,
+    pub sessions: u32,
+}
+
+/// Any kind of record, tagged by `kind`, so one message can carry several kinds.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AnyRecord {
+    Workspace(Record<Workspace>),
+    Terminal(Record<Terminal>),
+    Session(Record<Session>),
+    MachineSample(Record<MachineSample>),
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
