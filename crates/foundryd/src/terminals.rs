@@ -2,8 +2,9 @@
 //!
 //! Each terminal is a `foundry-holder` process serving a socket at
 //! `<data dir>/terminals/<id>.sock` and holding a lock on `<id>.lock` beside it for as long as it
-//! runs. A socket that refuses connections is a gone holder only when that lock is free: on macOS
-//! a holder whose queue of new connections is full refuses too. The holder outlives this daemon,
+//! runs. A socket that refuses connections is a gone holder at once only when that lock is free:
+//! on macOS a holder whose queue of new connections is full refuses too. With no lock file, as a
+//! holder started before the lock was kept has, it is gone only after a few refusals. The holder outlives this daemon,
 //! so a daemon that starts again finds its terminals through their records in the store and
 //! their sockets, and attaches to them again with [`Terminals::reattach_all`].
 //!
@@ -47,9 +48,9 @@ const ANSWER_WITHIN: Duration = Duration::from_secs(10);
 /// Unless a holder serves the socket by then, the start fails.
 const START_WITHIN: Duration = Duration::from_secs(30);
 
-/// How many times a connection is tried while the holder refuses it and holds its lock, and how
-/// long apart. A running holder refuses only while its queue of new connections is full, which
-/// empties in moments.
+/// How many times a refused connection is tried while the holder's lock is held or missing, and
+/// how long apart. A running holder refuses only while its queue of new connections is full,
+/// which empties in moments.
 const BUSY_TRIES: u32 = 3;
 const BUSY_RETRY: Duration = Duration::from_millis(100);
 
@@ -598,14 +599,15 @@ fn no_answer() -> io::Error {
 /// Why a holder's socket could not be connected to.
 enum Unreachable {
     /// No holder serves it: the socket is missing, or `stale`, a file that refuses connections
-    /// and whose lock no holder holds.
+    /// and whose lock no holder holds, or that has no lock file and refused every try.
     Gone { stale: bool },
     /// Something else, which may pass, such as a busy holder that refuses.
     Failed(io::Error),
 }
 
 /// Connects to the holder serving `socket`. A refusal while the holder's lock is held is a busy
-/// holder, tried [`BUSY_TRIES`] times in all; only a free lock makes a refusal a gone holder.
+/// holder, tried [`BUSY_TRIES`] times in all. A free lock makes a refusal a gone holder at once;
+/// with no lock file, a refusal is gone only once every try is refused.
 async fn connect(socket: &Path) -> Result<UnixStream, Unreachable> {
     let mut tries = 1;
     loop {
@@ -618,13 +620,14 @@ async fn connect(socket: &Path) -> Result<UnixStream, Unreachable> {
             Err(e) => return Err(Unreachable::Failed(e)),
         };
         let lock = lock_file(socket);
-        match tokio::task::spawn_blocking(move || holder_runs(&lock)).await {
-            Ok(Ok(false)) => return Err(Unreachable::Gone { stale: true }),
-            Ok(Ok(true)) if tries < BUSY_TRIES => {
+        match tokio::task::spawn_blocking(move || holder_lock(&lock)).await {
+            Ok(Ok(HolderLock::Free)) => return Err(Unreachable::Gone { stale: true }),
+            Ok(Ok(HolderLock::Held | HolderLock::Missing)) if tries < BUSY_TRIES => {
                 tries += 1;
                 tokio::time::sleep(BUSY_RETRY).await;
             }
-            Ok(Ok(true)) => {
+            Ok(Ok(HolderLock::Missing)) => return Err(Unreachable::Gone { stale: true }),
+            Ok(Ok(HolderLock::Held)) => {
                 return Err(Unreachable::Failed(io::Error::new(
                     e.kind(),
                     "the holder refused the connection while it runs: it is busy",
@@ -641,18 +644,28 @@ fn lock_file(socket: &Path) -> PathBuf {
     socket.with_extension("lock")
 }
 
-/// Whether a holder holds the lock at `path`, found without waiting. No file is no holder:
-/// holders started before the lock was kept have none. The check asks for the lock shared,
-/// which only a holder's exclusive lock refuses, so two checks at once never see each other.
-fn holder_runs(path: &Path) -> io::Result<bool> {
+/// What a holder's lock file says about it.
+#[derive(Debug, PartialEq)]
+enum HolderLock {
+    /// A holder runs and holds it.
+    Held,
+    /// No holder holds it.
+    Free,
+    /// There is no lock file, as for a holder started before holders kept one.
+    Missing,
+}
+
+/// Reads the lock at `path` without waiting. The check asks for the lock shared, which only a
+/// holder's exclusive lock refuses, so two checks at once never see each other.
+fn holder_lock(path: &Path) -> io::Result<HolderLock> {
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(HolderLock::Missing),
         Err(e) => return Err(e),
     };
     match Flock::lock(file, FlockArg::LockSharedNonblock) {
-        Ok(_free) => Ok(false),
-        Err((_, Errno::EWOULDBLOCK)) => Ok(true),
+        Ok(_free) => Ok(HolderLock::Free),
+        Err((_, Errno::EWOULDBLOCK)) => Ok(HolderLock::Held),
         Err((_, e)) => Err(e.into()),
     }
 }
@@ -1276,10 +1289,26 @@ mod tests {
         assert!(!lock.exists(), "its lock file is removed");
     }
 
+    /// Connects to `socket`, which refuses now, and has a holder serve it again after the first
+    /// refusal and before the first retry. The clock is paused, so that order holds however
+    /// loaded the machine is.
+    async fn connect_as_it_serves_again(
+        dir: &Path,
+        socket: &Path,
+    ) -> Result<UnixStream, Unreachable> {
+        let path = socket.to_path_buf();
+        let connecting = tokio::spawn(async move { connect(&path).await });
+        tokio::time::sleep(BUSY_RETRY / 2).await;
+        // Bound beside the socket and renamed over it, so a connect never finds it missing.
+        let serving = dir.join("serving.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&serving).unwrap();
+        std::fs::rename(&serving, socket).unwrap();
+        connecting.await.unwrap()
+    }
+
     /// A running holder whose queue of new connections is full refuses for a moment. The
     /// connection is tried again while its lock is held, so it gets through once the queue
-    /// empties rather than failing the request. The clock is paused, so the holder serves again
-    /// after the first refusal and before the first retry, however loaded the machine is.
+    /// empties rather than failing the request.
     #[tokio::test(start_paused = true)]
     async fn a_busy_holder_that_refuses_is_connected_to_when_it_serves_again() {
         let dir = tempfile::tempdir().unwrap();
@@ -1289,15 +1318,23 @@ mod tests {
         std::fs::File::create(&lock_path).unwrap();
         let _lock = take_lock(&lock_path, FlockArg::LockExclusiveNonblock);
 
-        let path = socket.clone();
-        let connecting = tokio::spawn(async move { connect(&path).await });
-        tokio::time::sleep(BUSY_RETRY / 2).await;
-        // Bound beside the socket and renamed over it, so a connect never finds it missing.
-        let serving = dir.path().join("serving.sock");
-        let _listener = std::os::unix::net::UnixListener::bind(&serving).unwrap();
-        std::fs::rename(&serving, &socket).unwrap();
-        let connected = connecting.await.unwrap();
+        let connected = connect_as_it_serves_again(dir.path(), &socket).await;
         assert!(connected.is_ok(), "a busy holder's refusal is tried again");
+    }
+
+    /// A holder started before holders kept a lock file has none, so a refusal cannot be told
+    /// from a gone holder at once. It is tried again like a busy one before it counts as gone.
+    #[tokio::test(start_paused = true)]
+    async fn a_holder_with_no_lock_file_that_refuses_is_connected_to_when_it_serves_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("t.sock");
+        drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+
+        let connected = connect_as_it_serves_again(dir.path(), &socket).await;
+        assert!(
+            connected.is_ok(),
+            "a refusal with no lock file is tried again"
+        );
     }
 
     /// The holder and foundryd each name the lock file, so a real holder must hold the file
@@ -1308,9 +1345,10 @@ mod tests {
         let (terminals, _) = setup.daemon();
         let id = setup.start(&terminals, "sleep 60").await;
         let lock = lock_file(&setup.socket(id));
-        assert!(
-            holder_runs(&lock).unwrap(),
-            "{} is not held",
+        assert_eq!(
+            holder_lock(&lock).unwrap(),
+            HolderLock::Held,
+            "{}",
             lock.display()
         );
     }
