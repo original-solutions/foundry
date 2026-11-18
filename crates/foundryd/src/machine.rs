@@ -7,7 +7,7 @@
 //! per limit.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use foundry_proto::ids::MachineId;
@@ -65,13 +65,13 @@ impl Reason {
                 limit,
             } => format!(
                 "load {} {} limit {}",
-                decimal(load_per_core),
+                shown(load_per_core, limit),
                 at_or_over(load_per_core == limit),
                 decimal(limit)
             ),
             Over::Disk { free_disk, limit } => format!(
                 "free disk {} GB under limit {} GB",
-                decimal(gigabytes(free_disk)),
+                shown(gigabytes(free_disk), gigabytes(limit)),
                 decimal(gigabytes(limit))
             ),
         };
@@ -88,9 +88,24 @@ fn gigabytes(bytes: u64) -> f64 {
     bytes as f64 / 1e9
 }
 
+/// `value` as [`decimal`] shows it, with more decimals when that would print it equal to a
+/// `limit` it differs from, so a reason never reads `load 1.0 over limit 1.0`.
+fn shown(value: f64, limit: f64) -> String {
+    let text = decimal(value);
+    if value != limit && text == decimal(limit) {
+        trimmed(format!("{value:.4}"))
+    } else {
+        text
+    }
+}
+
 /// At most two decimals and at least one: `1.8`, `1.0`, `2.25`.
 fn decimal(value: f64) -> String {
-    let text = format!("{value:.2}");
+    trimmed(format!("{value:.2}"))
+}
+
+/// `text`, a number with decimals, without trailing zeros but with at least one decimal.
+fn trimmed(text: String) -> String {
     let text = text.trim_end_matches('0');
     if text.ends_with('.') {
         format!("{text}0")
@@ -176,14 +191,11 @@ pub async fn run(store: Arc<Mutex<Store>>, me: MachineId, data_dir: PathBuf) {
     every.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         every.tick().await;
-        let written = match store.lock() {
-            Ok(mut store) => write_sample(&mut store, me, &data_dir),
-            Err(_) => {
-                tracing::error!("machine sample not written: the store lock is poisoned");
-                return;
-            }
-        };
-        if let Err(error) = written {
+        // A task that panicked while holding the store leaves it consistent: SQLite rolls back
+        // a transaction that was not committed. Stopping here would freeze this machine's last
+        // sample while it still looks online.
+        let mut store = store.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Err(error) = write_sample(&mut store, me, &data_dir) {
             tracing::warn!(%error, "machine sample not written");
         }
     }
@@ -225,7 +237,6 @@ mod tests {
     use super::*;
     use foundry_proto::ids::{SessionId, TerminalId, WorkspaceId};
     use foundry_proto::record::Session;
-    use std::sync::PoisonError;
 
     fn sample(sessions: u32, load_per_core: f64, free_disk: u64) -> Record<MachineSample> {
         Record {
