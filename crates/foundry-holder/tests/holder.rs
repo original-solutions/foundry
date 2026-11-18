@@ -291,9 +291,10 @@ async fn a_flood_with_no_client_attached_finishes_in_bounded_memory() {
 
 #[tokio::test]
 async fn a_client_that_stops_reading_is_dropped_without_blocking_the_child() {
-    let lines = 20_000_000;
-    let script = format!("stty -echo; printf R; read x; seq 1 {lines}");
-    let holder = Holder::start(&["sh", "-c", &script], &[]);
+    // A counter the stalled client's stream is checked against, then 200 MB to push the holder.
+    let script =
+        "stty -echo; printf R; read x; seq 1 999999; head -c 200000000 /dev/zero | tr '\\0' a";
+    let holder = Holder::start(&["sh", "-c", script], &[]);
     let mut driver = holder.attach().await;
     driver.read_until(b"R").await;
     drop(driver);
@@ -310,26 +311,46 @@ async fn a_client_that_stops_reading_is_dropped_without_blocking_the_child() {
     stalled.read_to_end().await;
     assert_eq!(stalled.start, 0);
     assert_eq!(stalled.exit, None, "the stalled client was never dropped");
-    let expected = counter_stream(b"R", stalled.seen.len());
-    assert_eq!(stalled.seen.len(), expected.len());
+    let counter = counter_stream(b"R", 999_999);
+    let mut expected = counter.clone();
+    expected.resize(stalled.seen.len().max(counter.len()), b'a');
+    expected.truncate(stalled.seen.len());
     assert!(
         stalled.seen == expected,
         "the stalled client's stream has a gap"
     );
 
     let fresh = holder.attach().await;
-    assert!(fresh.snapshot.ends_with(format!("{lines}\r\n").as_bytes()));
+    assert!(fresh.snapshot.iter().all(|&b| b == b'a'));
+    assert_eq!(
+        fresh.start + fresh.snapshot.len() as u64,
+        counter.len() as u64 + 200_000_000
+    );
 }
 
-/// `prefix` then `seq 1 ..` as a terminal shows it, cut to `len` bytes.
-fn counter_stream(prefix: &[u8], len: usize) -> Vec<u8> {
+#[tokio::test]
+async fn a_client_that_keeps_reading_gets_every_byte_of_many_small_writes() {
+    // seq writes each line on its own, so the holder sees a million small reads.
+    let holder = Holder::start(
+        &["sh", "-c", "stty -echo; printf R; read x; seq 1 999999"],
+        &[],
+    );
+    let mut client = holder.attach().await;
+    client.read_until(b"R").await;
+    client.send(Request::Input(Bytes::from_static(b"\n"))).await;
+    assert_eq!(client.read_until_exit().await, 0);
+    assert!(
+        client.seen == counter_stream(b"R", 999_999),
+        "the stream differs from the counter"
+    );
+}
+
+/// `prefix` then `seq 1 <last>` as a terminal shows it.
+fn counter_stream(prefix: &[u8], last: u64) -> Vec<u8> {
     let mut stream = prefix.to_vec();
-    let mut n = 1u64;
-    while stream.len() < len {
+    for n in 1..=last {
         stream.extend_from_slice(format!("{n}\r\n").as_bytes());
-        n += 1;
     }
-    stream.truncate(len);
     stream
 }
 
