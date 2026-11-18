@@ -7,7 +7,8 @@
 //! The holder answers a frame it cannot read, another version included, with `Refused` and closes
 //! the connection. That frame carries the holder's own version byte, so a newer client learns which
 //! version to speak. A connection the holder closes with no `Refused` belonged to a client too slow
-//! to keep up with the output: it can attach again.
+//! to keep up with the output. The holder stops reading such a connection when it closes it, so
+//! requests the client sent just before may not have been applied. It can attach again.
 //!
 //! A running holder cannot be updated without ending its terminal, so this protocol changes
 //! rarely, and every frame names the version it speaks.

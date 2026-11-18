@@ -2,7 +2,7 @@
 //!
 //! One task owns all state. It never waits on a client: each frame is encoded once and appended to
 //! every attached client's outbox, which that client's writer takes whole, and a client with more
-//! than [`MAX_BACKLOG`] bytes unsent is disconnected.
+//! than [`MAX_BACKLOG`] bytes unsent is cut off in both directions and its backlog freed.
 //! A child is therefore never blocked by a slow reader, and memory stays bounded with or without
 //! clients.
 
@@ -29,6 +29,7 @@ use tokio::io::unix::AsyncFd;
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::task::AbortHandle;
 
 const READ_CHUNK: usize = 64 * 1024;
 
@@ -55,6 +56,9 @@ enum Event {
 
 struct Client {
     outbox: Arc<Outbox>,
+    reader: AbortHandle,
+    /// `None` once the writer is left to finish on its own.
+    writer: Option<AbortHandle>,
     attached: bool,
 }
 
@@ -69,13 +73,29 @@ impl Client {
         self.outbox.ready.notify_one();
         true
     }
+
+    /// Stops reading the client and lets its writer send what is queued, with `last` in place of
+    /// it when given, then close the connection.
+    fn finish(mut self, last: Option<Reply>) {
+        let mut state = self.outbox.lock();
+        if let Some(reply) = last {
+            state.unsent = reply.encode();
+        }
+        state.closed = true;
+        drop(state);
+        self.outbox.ready.notify_one();
+        self.writer = None;
+    }
 }
 
 impl Drop for Client {
-    /// The writer sends what is queued, then closes the connection.
+    /// Cuts the connection off in both directions, unless `finish` left the writer to close it,
+    /// and frees what was queued for it.
     fn drop(&mut self) {
-        self.outbox.lock().closed = true;
-        self.outbox.ready.notify_one();
+        self.reader.abort();
+        if let Some(writer) = &self.writer {
+            writer.abort();
+        }
     }
 }
 
@@ -205,8 +225,11 @@ async fn serve(listener: StdUnixListener, pty: Pty, mut child: Child) -> io::Res
                     }
                 }
                 Event::Unreadable(id, reason) => term.refuse(id, reason),
+                // The client stopped sending; it may still read what is queued for it.
                 Event::Gone(id) => {
-                    term.clients.remove(&id);
+                    if let Some(client) = term.clients.remove(&id) {
+                        client.finish(None);
+                    }
                 }
             },
         }
@@ -217,15 +240,11 @@ impl Terminal {
     fn connect(&mut self, id: u64, stream: UnixStream, events: mpsc::Sender<Event>) {
         let (mut rd, wr) = stream.into_split();
         let outbox = Arc::new(Outbox::default());
-        self.clients.insert(
-            id,
-            Client {
-                outbox: outbox.clone(),
-                attached: false,
-            },
-        );
-        tokio::spawn(async move { outbox.write_to(wr).await });
-        tokio::spawn(async move {
+        let writer = tokio::spawn({
+            let outbox = outbox.clone();
+            async move { outbox.write_to(wr).await }
+        });
+        let reader = tokio::spawn(async move {
             loop {
                 let event = match protocol::read_request(&mut rd).await {
                     Ok(Some(request)) => Event::Request(id, request),
@@ -238,6 +257,15 @@ impl Terminal {
                 }
             }
         });
+        self.clients.insert(
+            id,
+            Client {
+                outbox,
+                reader: reader.abort_handle(),
+                writer: Some(writer.abort_handle()),
+                attached: false,
+            },
+        );
     }
 
     fn handle(&mut self, id: u64, request: Request, master: &File) -> Flow {
@@ -281,9 +309,11 @@ impl Terminal {
     }
 
     /// Tells the client why, then drops it, which closes its connection.
+    /// Tells the client why in place of anything still queued for it, and closes the connection.
     fn refuse(&mut self, id: u64, reason: String) {
-        self.send(id, Reply::Refused(reason));
-        self.clients.remove(&id);
+        if let Some(client) = self.clients.remove(&id) {
+            client.finish(Some(Reply::Refused(reason)));
+        }
     }
 
     fn output(&mut self, data: &[u8]) {
