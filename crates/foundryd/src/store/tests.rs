@@ -505,21 +505,23 @@ fn insert_unreadable(store: &Store, owner: MachineId, version: u64, kind: &str, 
         .unwrap();
 }
 
-/// A rollback can leave rows only the newer build can read. `since` stops before the first
-/// one, so what it gives is never a stream with a gap a catching-up peer would step over.
+/// A row this build cannot read can only come from a newer build before a rollback. `since`
+/// says so with an error instead of giving the owner's records with a version missing.
+/// Reading such rows after a rollback belongs to sync (task 12) and rollback (task 18).
 #[test]
-fn since_stops_before_a_kind_this_build_does_not_know() {
+fn since_fails_on_a_kind_this_build_does_not_know() {
     let (_dir, mut store) = open();
     let owner = MachineId::random();
     store.apply(&workspace(owner, 1), owner).unwrap();
     insert_unreadable(&store, owner, 2, "printer", "{}");
     store.apply(&session(owner, 3), owner).unwrap();
-    assert_eq!(store.since(owner, 0).unwrap(), vec![workspace(owner, 1)]);
+    assert!(matches!(store.since(owner, 0), Err(StoreError::Json(_))));
+    assert!(matches!(store.since(owner, 1), Err(StoreError::Json(_))));
     assert_eq!(store.since(owner, 2).unwrap(), vec![session(owner, 3)]);
 }
 
 #[test]
-fn since_stops_before_a_known_kind_with_a_state_this_build_does_not_know() {
+fn since_fails_on_a_known_kind_with_a_state_this_build_does_not_know() {
     let (_dir, mut store) = open();
     let owner = MachineId::random();
     store.apply(&workspace(owner, 1), owner).unwrap();
@@ -531,7 +533,7 @@ fn since_stops_before_a_known_kind_with_a_state_this_build_does_not_know() {
     body["state"] = serde_json::json!("dreaming");
     insert_unreadable(&store, owner, 2, "session", &body.to_string());
     store.apply(&terminal(owner, 3), owner).unwrap();
-    assert_eq!(store.since(owner, 0).unwrap(), vec![workspace(owner, 1)]);
+    assert!(matches!(store.since(owner, 0), Err(StoreError::Json(_))));
     assert_eq!(store.since(owner, 2).unwrap(), vec![terminal(owner, 3)]);
 }
 
