@@ -23,7 +23,7 @@ use crate::sessions::{self, Gateway, Sessions};
 use crate::store::Store;
 use crate::sync::{Conn, Dialer, Peers};
 use crate::terminals::Terminals;
-use crate::workspaces::Workspaces;
+use crate::workspaces::{Dirty, Workspaces};
 
 const WAIT: Duration = Duration::from_secs(20);
 const MODEL: &str = "test-model";
@@ -1213,6 +1213,44 @@ fn credentials_in_a_url_are_hidden() {
     }
     assert_eq!(redact("git@github.com:o/r.git"), "git@github.com:o/r.git");
     assert_eq!(redact("no url here"), "no url here");
+}
+
+/// The status and body `error` answers with.
+async fn answered(error: ApiError) -> (u16, String) {
+    let response = error.into_response();
+    let status = response.status().as_u16();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, String::from_utf8(body.to_vec()).unwrap())
+}
+
+#[tokio::test]
+async fn an_error_response_hides_the_credentials_in_every_text_it_holds() {
+    let url = "https://x-access-token:SECRET@host/r.git";
+    let (status, body) = answered(ApiError::Workspace(WorkspaceError::Git {
+        command: "fetch",
+        stderr: format!("fatal: unable to access '{url}/'"),
+    }))
+    .await;
+    assert_eq!(status, 500);
+    assert!(body.contains("host/r.git"), "{body}");
+    assert!(!body.contains("SECRET"), "{body}");
+
+    let (status, body) = answered(ApiError::Workspace(WorkspaceError::Dirty(Dirty {
+        uncommitted: vec![format!("notes {url}")],
+        unpushed: vec![format!("abc123 push to {url}")],
+        submodules: vec![format!("sub {url}")],
+    })))
+    .await;
+    assert_eq!(status, 409);
+    assert!(!body.contains("SECRET"), "{body}");
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    for list in ["uncommitted", "unpushed", "submodules"] {
+        let items = body[list].as_array().unwrap();
+        assert_eq!(items.len(), 1, "{list}");
+        assert!(items[0].as_str().unwrap().contains("***@host"), "{list}");
+    }
 }
 
 #[tokio::test]
