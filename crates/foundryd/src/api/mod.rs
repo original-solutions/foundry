@@ -18,7 +18,9 @@
 //!   {id}`.
 //! - `POST /api/terminals/{id}/close`: `204`.
 //!
-//! An error is `{"error": "..."}` with a status that says what kind it was.
+//! An error is `{"error": "..."}` with a status that says what kind it was, a request axum
+//! refuses (a body that is not the JSON wanted, an unknown route or method, a socket path asked
+//! for without an upgrade) included.
 //!
 //! The server is bound by [`bind`], which refuses any address but loopback and Tailscale's.
 //! A browser can still be made to call it from any page it has open, so every request must
@@ -39,8 +41,11 @@ use std::time::Duration;
 
 use axum::Json;
 use axum::Router;
+use axum::body::Bytes;
+use axum::extract::rejection::JsonRejection;
+use axum::extract::ws::rejection::WebSocketUpgradeRejection;
 use axum::extract::ws::{self, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, Request, State};
+use axum::extract::{FromRequest, Path, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -86,8 +91,21 @@ pub fn router(api: Api) -> Router {
         .route("/api/workspaces/{id}/archive", post(archive_workspace))
         .route("/api/workspaces/{id}/sessions", post(start_session))
         .route("/api/workspaces/{id}/shells", post(start_shell))
+        .fallback(no_route)
+        .method_not_allowed_fallback(wrong_method)
         .layer(middleware::from_fn(same_site))
         .with_state(api)
+}
+
+async fn no_route() -> Response {
+    error(StatusCode::NOT_FOUND, "no such route".to_owned())
+}
+
+async fn wrong_method() -> Response {
+    error(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "this route does not take that method".to_owned(),
+    )
 }
 
 // --- binding ---
@@ -237,6 +255,36 @@ enum ApiError {
     Session(SessionError),
     Terminal(TerminalError),
     Store(StoreError),
+    /// A request axum refused before a handler ran: a body that is not the JSON wanted, or a
+    /// socket path asked for without an upgrade. Keeps axum's status.
+    Rejected(StatusCode, String),
+}
+
+impl From<JsonRejection> for ApiError {
+    fn from(e: JsonRejection) -> Self {
+        Self::Rejected(e.status(), e.body_text())
+    }
+}
+
+impl From<WebSocketUpgradeRejection> for ApiError {
+    fn from(e: WebSocketUpgradeRejection) -> Self {
+        Self::Rejected(e.status(), e.body_text())
+    }
+}
+
+/// A JSON body of type `T`, whose refusal is answered as `{"error": "..."}`.
+struct Body<T>(T);
+
+impl<T, S> FromRequest<S> for Body<T>
+where
+    Json<T>: FromRequest<S, Rejection = JsonRejection>,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(request: Request, state: &S) -> Result<Self, ApiError> {
+        Ok(Self(Json::<T>::from_request(request, state).await?.0))
+    }
 }
 
 impl From<WorkspaceError> for ApiError {
@@ -304,6 +352,7 @@ impl IntoResponse for ApiError {
             Self::NotFound(message) => (StatusCode::NOT_FOUND, message.clone()),
             Self::Terminal(e) => (terminal_status(e), e.to_string()),
             Self::Store(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            Self::Rejected(status, message) => (*status, message.clone()),
         };
         let message = redact(&message);
         if status.is_server_error() {
@@ -372,12 +421,15 @@ async fn state(State(api): State<Api>) -> Result<Json<UiMessage>, ApiError> {
     Ok(Json(full_state(&api).await?.0))
 }
 
-async fn events(State(api): State<Api>, upgrade: WebSocketUpgrade) -> Response {
-    upgrade.on_upgrade(move |socket| async move {
+async fn events(
+    State(api): State<Api>,
+    upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
+) -> Result<Response, ApiError> {
+    Ok(upgrade?.on_upgrade(move |socket| async move {
         if let Err(error) = send_events(&api, socket).await {
             tracing::warn!("api: events socket ended: {}", redact(&error.to_string()));
         }
-    })
+    }))
 }
 
 /// What the events socket has sent: the highest version per owner, the settings' `seq` and
@@ -471,6 +523,7 @@ async fn send(socket: &mut WebSocket, message: &UiMessage) -> bool {
 // --- actions ---
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Create {
     project: ProjectId,
     base: String,
@@ -479,7 +532,7 @@ struct Create {
 
 async fn create_workspace(
     State(api): State<Api>,
-    Json(create): Json<Create>,
+    Body(create): Body<Create>,
 ) -> Result<Response, ApiError> {
     let id = api
         .workspaces
@@ -489,6 +542,7 @@ async fn create_workspace(
 }
 
 #[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct Archive {
     #[serde(default)]
     force: bool,
@@ -497,15 +551,30 @@ struct Archive {
 async fn archive_workspace(
     State(api): State<Api>,
     Path(id): Path<String>,
-    archive: Option<Json<Archive>>,
+    body: Bytes,
 ) -> Result<Response, ApiError> {
     let id = parse_id(&id, "workspace", WorkspaceId)?;
-    let Json(archive) = archive.unwrap_or_default();
+    let archive = if body.is_empty() {
+        Archive::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|e| {
+            let status = if e.is_data() {
+                StatusCode::UNPROCESSABLE_ENTITY
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            ApiError::Rejected(
+                status,
+                format!("the body is not what an archive takes: {e}"),
+            )
+        })?
+    };
     api.workspaces.archive(id, archive.force).await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Start {
     model: String,
 }
@@ -513,7 +582,7 @@ struct Start {
 async fn start_session(
     State(api): State<Api>,
     Path(id): Path<String>,
-    Json(start): Json<Start>,
+    Body(start): Body<Start>,
 ) -> Result<Response, ApiError> {
     let id = parse_id(&id, "workspace", WorkspaceId)?;
     let worktree = api.workspaces.worktree(id).await?;

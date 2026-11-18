@@ -10,6 +10,7 @@
 //! when the holder cut this client off for falling behind (attach again), and 1011 with the
 //! reason for any other end. A terminal that is not live here is `404` before the upgrade.
 
+use axum::extract::ws::rejection::WebSocketUpgradeRejection;
 use axum::extract::ws::{self, CloseFrame, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::response::Response;
@@ -32,8 +33,9 @@ enum Control {
 pub(super) async fn socket(
     State(api): State<Api>,
     Path(id): Path<String>,
-    upgrade: WebSocketUpgrade,
+    upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Result<Response, ApiError> {
+    let upgrade = upgrade?;
     let id = parse_id(&id, "terminal", TerminalId)?;
     let (snapshot, output) = api.terminals.attach(id).await?;
     Ok(upgrade.on_upgrade(move |socket| relay(api, id, snapshot, output, socket)))
