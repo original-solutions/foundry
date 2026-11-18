@@ -179,12 +179,12 @@ pub fn join_at(
 /// [`admit_into`]'s rule, so this machine's links with it are served from the daemon's next
 /// start.
 fn hold_key(secrets: &dyn Secrets, machine: MachineId, key: PublicKey) -> Result<(), JoinError> {
-    let mut machines = read_table(secrets)?;
-    admit_into(&mut machines, machine, &key).map_err(|error| match error {
-        JoinError::Taken(machine) => JoinError::HostRefusedHere(machine),
-        other => other,
+    change_table(secrets, |machines| {
+        admit_into(machines, machine, &key).map_err(|error| match error {
+            JoinError::Taken(machine) => JoinError::HostRefusedHere(machine),
+            other => other,
+        })
     })?;
-    secrets.set(KEYS_SECRET, &write_table(&machines))?;
     Ok(())
 }
 
@@ -210,10 +210,37 @@ fn admit_into(
 }
 
 fn read_table(secrets: &dyn Secrets) -> Result<BTreeMap<MachineId, Entry>, JoinError> {
-    match secrets.get(KEYS_SECRET)? {
+    parse_table(secrets.get(KEYS_SECRET)?)
+}
+
+fn parse_table(stored: Option<String>) -> Result<BTreeMap<MachineId, Entry>, JoinError> {
+    match stored {
         None => Ok(BTreeMap::new()),
         Some(text) => serde_json::from_str(&text).map_err(|_| JoinError::Unreadable(KEYS_SECRET)),
     }
+}
+
+/// Applies `edit` to the key table stored in `secrets` and saves it, in one locked
+/// [`Secrets::update`], so a change from another process (the daemon, `foundryd join`) is
+/// never lost; an edit that refuses saves nothing. Returns the table saved.
+fn change_table(
+    secrets: &dyn Secrets,
+    edit: impl FnOnce(&mut BTreeMap<MachineId, Entry>) -> Result<(), JoinError>,
+) -> Result<BTreeMap<MachineId, Entry>, JoinError> {
+    let mut changed = None;
+    secrets.update(
+        KEYS_SECRET,
+        Box::new(|stored| {
+            let result = parse_table(stored).and_then(|mut machines| {
+                edit(&mut machines)?;
+                Ok(machines)
+            });
+            let save = result.as_ref().ok().map(write_table);
+            changed = Some(result);
+            save
+        }),
+    )?;
+    changed.expect("an update always calls its edit")
 }
 
 fn write_table(machines: &BTreeMap<MachineId, Entry>) -> String {
@@ -327,10 +354,32 @@ struct Identity {
 
 impl Identity {
     /// The identity kept in `secrets`, made and kept there first if there is none.
+    /// Made in one locked [`Secrets::update`], so two processes starting at once keep one.
     fn load_or_create(secrets: &dyn Secrets) -> Result<Self, JoinError> {
-        if let Some(text) = secrets.get(IDENTITY_SECRET)? {
-            return serde_json::from_str(&text).map_err(|_| JoinError::Unreadable(IDENTITY_SECRET));
-        }
+        let mut found = None;
+        secrets.update(
+            IDENTITY_SECRET,
+            Box::new(|stored| {
+                let (identity, save) = match stored {
+                    Some(text) => (
+                        serde_json::from_str(&text)
+                            .map_err(|_| JoinError::Unreadable(IDENTITY_SECRET)),
+                        None,
+                    ),
+                    None => match Self::create() {
+                        Ok((identity, text)) => (Ok(identity), Some(text)),
+                        Err(error) => (Err(error), None),
+                    },
+                };
+                found = Some(identity);
+                save
+            }),
+        )?;
+        found.expect("an update always calls its edit")
+    }
+
+    /// A new identity, and its text as kept.
+    fn create() -> Result<(Self, String), JoinError> {
         let pkcs8 =
             Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).map_err(|_| JoinError::Random)?;
         let identity = Self {
@@ -339,8 +388,7 @@ impl Identity {
         };
         let text =
             serde_json::to_string(&identity).map_err(|_| JoinError::Unreadable(IDENTITY_SECRET))?;
-        secrets.set(IDENTITY_SECRET, &text)?;
-        Ok(identity)
+        Ok((identity, text))
     }
 
     fn key_pair(&self) -> Result<Signer, JoinError> {
@@ -646,18 +694,15 @@ impl Keys {
     /// refuses saves nothing. The stored table is the one source of truth for changes: every
     /// change is decided by an edit on it, never on the table held in memory, which can lag
     /// what `foundryd join` saved from another process. Links are checked against the table
-    /// held in memory, which this refreshes and a restart reloads. Taking the `saving` guard
-    /// makes every change in this process hold the lock, so no two of them undo each other.
+    /// held in memory, which this refreshes and a restart reloads. The read and the save are
+    /// one locked [`Secrets::update`], so a change from another process is never lost; the
+    /// `saving` guard keeps this process's changes, and the tables they hold, in order.
     fn change(
         &self,
         _saving: &MutexGuard<'_, ()>,
         edit: impl FnOnce(&mut BTreeMap<MachineId, Entry>) -> Result<(), JoinError>,
     ) -> Result<(), JoinError> {
-        let mut machines = read_table(&*self.inner.secrets)?;
-        edit(&mut machines)?;
-        self.inner
-            .secrets
-            .set(KEYS_SECRET, &write_table(&machines))?;
+        let machines = change_table(&*self.inner.secrets, edit)?;
         self.held().machines = machines;
         Ok(())
     }
@@ -915,7 +960,7 @@ mod tests {
     use tokio::time::timeout;
 
     use super::*;
-    use crate::secrets::{MemorySecrets, Secrets, SecretsError};
+    use crate::secrets::{Edit, FileSecrets, MemorySecrets, Secrets, SecretsError};
     use crate::store::Store;
     use crate::sync::{Conn, Dialer, Peers};
 
@@ -958,6 +1003,12 @@ mod tests {
                 });
             }
             self.inner.set(name, value)
+        }
+        fn update(&self, name: &str, edit: Edit<'_>) -> Result<(), SecretsError> {
+            match edit(self.get(name)?) {
+                Some(value) => self.set(name, &value),
+                None => Ok(()),
+            }
         }
     }
 
@@ -1274,6 +1325,71 @@ mod tests {
                 }
             }
             self.inner.set(name, value)
+        }
+        fn update(&self, name: &str, edit: Edit<'_>) -> Result<(), SecretsError> {
+            match edit(self.get(name)?) {
+                Some(value) => self.set(name, &value),
+                None => Ok(()),
+            }
+        }
+    }
+
+    #[test]
+    fn a_revocation_and_a_join_saved_at_once_by_two_processes_both_stay() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.json");
+        // Each side has its own store over one file, as the daemon and `foundryd join` do.
+        let daemon = Keys::open(Arc::new(FileSecrets::new(&path))).unwrap();
+        let revoked: Vec<MachineId> = (0..40).map(|_| MachineId::random()).collect();
+        let joined: Vec<(MachineId, PublicKey)> = (0..40)
+            .map(|_| (MachineId::random(), machine_keys().public_key()))
+            .collect();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for machine in &revoked {
+                    daemon.revoke(*machine).unwrap();
+                }
+            });
+            scope.spawn(|| {
+                let join = FileSecrets::new(&path);
+                for (machine, key) in &joined {
+                    hold_key(&join, *machine, key.clone()).unwrap();
+                }
+            });
+        });
+        let table = read_table(&FileSecrets::new(&path)).unwrap();
+        for machine in &revoked {
+            assert!(
+                matches!(table.get(machine), Some(Entry::Revoked)),
+                "lost the revocation of {machine}"
+            );
+        }
+        for (machine, key) in &joined {
+            assert!(
+                matches!(table.get(machine), Some(Entry::Active { key: held }) if held == key),
+                "lost the key of {machine}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_processes_making_this_machines_identity_at_once_make_one() {
+        for _ in 0..20 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("secrets.json");
+            let start = std::sync::Barrier::new(2);
+            let [a, b] = std::thread::scope(|scope| {
+                let make = || {
+                    let secrets = FileSecrets::new(&path);
+                    start.wait();
+                    Identity::load_or_create(&secrets).unwrap().machine
+                };
+                let (a, b) = (scope.spawn(make), scope.spawn(make));
+                [a.join().unwrap(), b.join().unwrap()]
+            });
+            assert_eq!(a, b);
+            let kept = Identity::load_or_create(&FileSecrets::new(&path)).unwrap();
+            assert_eq!(kept.machine, a);
         }
     }
 

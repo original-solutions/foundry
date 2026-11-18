@@ -21,7 +21,15 @@ pub trait Secrets: Send + Sync {
     fn get(&self, name: &str) -> Result<Option<String>, SecretsError>;
     /// Sets the secret called `name`, replacing any value it had.
     fn set(&self, name: &str, value: &str) -> Result<(), SecretsError>;
+    /// Changes the secret called `name` in one step: `edit` is given its value now and returns
+    /// the value to set, or `None` to leave the store as it is. No other change to the store,
+    /// from this process or another, lands between the read and the write.
+    fn update(&self, name: &str, edit: Edit<'_>) -> Result<(), SecretsError>;
 }
+
+/// What [`Secrets::update`] does to a secret: given its value now, the value to set, or `None`
+/// to set nothing.
+pub type Edit<'a> = Box<dyn FnOnce(Option<String>) -> Option<String> + 'a>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SecretsError {
@@ -42,13 +50,13 @@ pub enum SecretsError {
     },
 }
 
-/// The secret store this machine uses: the login keychain on macOS, and on Linux the file
-/// `secrets.json` in `home`, readable only by the service user.
+/// The secret store this machine uses: the login keychain on macOS, its updates locked by
+/// the file `secrets.lock` in `home`, and on Linux the file `secrets.json` in `home`, readable
+/// only by the service user.
 pub fn for_this_machine(home: &Path) -> Arc<dyn Secrets> {
     #[cfg(target_os = "macos")]
     {
-        let _ = home;
-        Arc::new(Keychain::new("foundry"))
+        Arc::new(Keychain::new("foundry", home.join("secrets.lock")))
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -59,9 +67,9 @@ pub fn for_this_machine(home: &Path) -> Arc<dyn Secrets> {
 /// Secrets in one JSON file that only its owner may read or write. The file is created 0600,
 /// and one that others can read or write is refused, at read and before a write.
 ///
-/// A set holds an exclusive lock on the file `<path>.lock` from its read to its write, so two
-/// stores over one file, in one process or two (the daemon and `foundryd join`), never lose
-/// each other's secrets.
+/// A set or an update holds an exclusive lock on the file `<path>.lock` from its read to its
+/// write, so two stores over one file, in one process or two (the daemon and `foundryd join`),
+/// never lose each other's secrets.
 pub struct FileSecrets {
     path: PathBuf,
 }
@@ -78,20 +86,9 @@ impl FileSecrets {
         PathBuf::from(name)
     }
 
-    /// Takes the lock every set holds, creating the directory and the lock file if needed.
-    /// The lock is released when the returned value is dropped.
+    /// Takes the lock every set and update holds. It is released when the value is dropped.
     fn lock(&self) -> Result<Flock<File>, SecretsError> {
-        if let Some(dir) = self.path.parent() {
-            fs::create_dir_all(dir).map_err(|e| self.io(e))?;
-        }
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(self.beside(".lock"))
-            .map_err(|e| self.io(e))?;
-        Flock::lock(file, FlockArg::LockExclusive).map_err(|(_, errno)| self.io(errno.into()))
+        lock_file(&self.beside(".lock")).map_err(|e| self.io(e))
     }
 
     /// Every secret in the file, or none when there is no file yet.
@@ -167,24 +164,52 @@ impl Secrets for FileSecrets {
     }
 
     fn set(&self, name: &str, value: &str) -> Result<(), SecretsError> {
+        let value = value.to_owned();
+        self.update(name, Box::new(|_| Some(value)))
+    }
+
+    fn update(&self, name: &str, edit: Edit<'_>) -> Result<(), SecretsError> {
         let _locked = self.lock()?;
         let mut secrets = self.read()?;
-        secrets.insert(name.to_owned(), value.to_owned());
+        let Some(value) = edit(secrets.get(name).cloned()) else {
+            return Ok(());
+        };
+        secrets.insert(name.to_owned(), value);
         self.write(&secrets)
     }
 }
 
-/// Secrets as generic passwords in the login keychain, one per name, under `service`.
+/// An exclusive lock on the file at `path`, made 0600 with its directory if needed, held until
+/// the value is dropped. It is a `flock`, so it holds between processes, and between two opens
+/// of the file in one process.
+fn lock_file(path: &Path) -> io::Result<Flock<File>> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)?;
+    Flock::lock(file, FlockArg::LockExclusive).map_err(|(_, errno)| errno.into())
+}
+
+/// Secrets as generic passwords in the login keychain, one per name, under `service`. The
+/// keychain has no lock of its own, so a set or an update holds an exclusive lock on the file
+/// `lock` from its read to its write.
 #[cfg(target_os = "macos")]
 pub struct Keychain {
     service: String,
+    lock: PathBuf,
 }
 
 #[cfg(target_os = "macos")]
 impl Keychain {
-    pub fn new(service: impl Into<String>) -> Self {
+    pub fn new(service: impl Into<String>, lock: impl Into<PathBuf>) -> Self {
         Self {
             service: service.into(),
+            lock: lock.into(),
         }
     }
 }
@@ -209,6 +234,18 @@ impl Secrets for Keychain {
     }
 
     fn set(&self, name: &str, value: &str) -> Result<(), SecretsError> {
+        let value = value.to_owned();
+        self.update(name, Box::new(|_| Some(value)))
+    }
+
+    fn update(&self, name: &str, edit: Edit<'_>) -> Result<(), SecretsError> {
+        let _locked = lock_file(&self.lock).map_err(|source| SecretsError::Io {
+            path: self.lock.clone(),
+            source,
+        })?;
+        let Some(value) = edit(self.get(name)?) else {
+            return Ok(());
+        };
         security_framework::passwords::set_generic_password(&self.service, name, value.as_bytes())
             .map_err(|error| SecretsError::Keychain {
                 action: "store",
@@ -231,6 +268,14 @@ impl Secrets for MemorySecrets {
 
     fn set(&self, name: &str, value: &str) -> Result<(), SecretsError> {
         self.lock().insert(name.to_owned(), value.to_owned());
+        Ok(())
+    }
+
+    fn update(&self, name: &str, edit: Edit<'_>) -> Result<(), SecretsError> {
+        let mut secrets = self.lock();
+        if let Some(value) = edit(secrets.get(name).cloned()) {
+            secrets.insert(name.to_owned(), value);
+        }
         Ok(())
     }
 }
@@ -365,6 +410,69 @@ mod tests {
     }
 
     #[test]
+    fn two_stores_updating_one_secret_at_once_lose_no_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.json");
+        let writers: Vec<_> = (0..4)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let secrets = FileSecrets::new(path);
+                    for _ in 0..25 {
+                        let add_one = |count: Option<String>| {
+                            let count: u32 = count.map_or(0, |c| c.parse().unwrap());
+                            Some((count + 1).to_string())
+                        };
+                        secrets.update("count", Box::new(add_one)).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        let count = FileSecrets::new(&path).get("count").unwrap();
+        assert_eq!(count.as_deref(), Some("100"));
+    }
+
+    #[test]
+    fn an_update_that_sets_nothing_leaves_the_store_as_it_was() {
+        let (dir, secrets) = file();
+        secrets
+            .update(
+                "gateway",
+                Box::new(|value| {
+                    assert_eq!(value, None);
+                    None
+                }),
+            )
+            .unwrap();
+        assert!(!dir.path().join("secrets.json").exists());
+        secrets.set("gateway", "sk-one").unwrap();
+        secrets
+            .update(
+                "gateway",
+                Box::new(|value| {
+                    assert_eq!(value.as_deref(), Some("sk-one"));
+                    None
+                }),
+            )
+            .unwrap();
+        assert_eq!(secrets.get("gateway").unwrap().as_deref(), Some("sk-one"));
+    }
+
+    #[test]
+    fn the_in_memory_fake_updates_what_it_holds() {
+        let secrets = MemorySecrets::default();
+        secrets.update("n", Box::new(|_| Some("1".into()))).unwrap();
+        secrets
+            .update("n", Box::new(|n| Some(format!("{}2", n.unwrap()))))
+            .unwrap();
+        secrets.update("n", Box::new(|_| None)).unwrap();
+        assert_eq!(secrets.get("n").unwrap().as_deref(), Some("12"));
+    }
+
+    #[test]
     fn the_in_memory_fake_keeps_what_is_set() {
         let secrets = MemorySecrets::default();
         assert_eq!(secrets.get("gateway").unwrap(), None);
@@ -378,12 +486,21 @@ mod tests {
     #[test]
     #[ignore]
     fn the_keychain_keeps_what_is_set() {
-        let secrets = Keychain::new("foundry-test");
+        let dir = tempfile::tempdir().unwrap();
+        let secrets = Keychain::new("foundry-test", dir.path().join("secrets.lock"));
         let name = format!("probe-{}", uuid::Uuid::new_v4());
         assert_eq!(secrets.get(&name).unwrap(), None);
         secrets.set(&name, "sk-one").unwrap();
         secrets.set(&name, "sk-two").unwrap();
         assert_eq!(secrets.get(&name).unwrap().as_deref(), Some("sk-two"));
+        secrets
+            .update(
+                &name,
+                Box::new(|value| Some(format!("{}!", value.unwrap()))),
+            )
+            .unwrap();
+        assert_eq!(secrets.get(&name).unwrap().as_deref(), Some("sk-two!"));
+        assert!(dir.path().join("secrets.lock").exists());
         security_framework::passwords::delete_generic_password("foundry-test", &name).unwrap();
     }
 }
