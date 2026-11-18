@@ -9,7 +9,9 @@
 //!   several times between two reads is sent once, at its newest version.
 //! - `GET /api/terminals/{id}`, a WebSocket: see [`terminals`].
 //! - `POST /api/workspaces` `{project, base, name}`: makes a workspace on this machine, `201
-//!   {id}`.
+//!   {id}`. When the workspace is made but its setup could not be started, it is still `201`,
+//!   with an `error` beside the `id` saying so: the workspace exists, and the id is how to
+//!   reach it.
 //! - `POST /api/workspaces/{id}/archive` `{force}` (the body is optional): `204`, or `409` with
 //!   the uncommitted files, unpushed commits and submodules that hold it up.
 //! - `POST /api/workspaces/{id}/sessions` `{model}`: starts Claude Code in the workspace, `201
@@ -569,11 +571,27 @@ async fn create_workspace(
     State(api): State<Api>,
     Body(create): Body<Create>,
 ) -> Result<Response, ApiError> {
-    let id = api
+    match api
         .workspaces
         .create(create.project, &create.base, &create.name)
-        .await?;
-    Ok(created(id))
+        .await
+    {
+        Ok(id) => Ok(created(id)),
+        // The workspace exists, so the caller needs its id: a retry would only find the name
+        // taken.
+        Err(WorkspaceError::SetupNotStarted { workspace, source }) => {
+            let message = redact(&format!(
+                "workspace {workspace} was made, but its setup could not be started: {source}"
+            ));
+            tracing::warn!("api: {message}");
+            Ok((
+                StatusCode::CREATED,
+                Json(serde_json::json!({ "id": workspace.to_string(), "error": message })),
+            )
+                .into_response())
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 #[derive(Deserialize, Default)]
