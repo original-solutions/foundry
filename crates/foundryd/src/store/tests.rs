@@ -486,28 +486,53 @@ fn a_file_a_newer_build_migrated_still_opens() {
     assert_eq!(store.since(owner, 0).unwrap(), vec![workspace(owner, 2)]);
 }
 
-/// A rollback can leave rows of a kind only the newer build knows. The older build gives
-/// the owner's other records and leaves those rows alone.
-#[test]
-fn since_skips_a_kind_this_build_does_not_know() {
-    let (_dir, mut store) = open();
-    let owner = MachineId::random();
-    store.apply(&workspace(owner, 1), owner).unwrap();
-    store.apply(&session(owner, 3), owner).unwrap();
+/// Puts a row this build cannot read into the store, as a newer build would have left it.
+fn insert_unreadable(store: &Store, owner: MachineId, version: u64, kind: &str, body: &str) {
     store
         .conn
         .execute(
-            "INSERT INTO records (kind, id, owner, version, record) VALUES ('printer', 'p1', ?1, 2, ?2)",
+            "INSERT INTO records (kind, id, owner, version, record) VALUES (?1, ?2, ?3, ?4, ?5)",
             rusqlite::params![
+                kind,
+                format!("unreadable-{version}"),
                 owner.to_string(),
-                format!(r#"{{"kind":"printer","owner":"{owner}","version":2,"deleted":false,"body":{{}}}}"#)
+                version as i64,
+                format!(
+                    r#"{{"kind":"{kind}","owner":"{owner}","version":{version},"deleted":false,"body":{body}}}"#
+                )
             ],
         )
         .unwrap();
-    assert_eq!(
-        store.since(owner, 0).unwrap(),
-        vec![workspace(owner, 1), session(owner, 3)]
-    );
+}
+
+/// A rollback can leave rows only the newer build can read. `since` stops before the first
+/// one, so what it gives is never a stream with a gap a catching-up peer would step over.
+#[test]
+fn since_stops_before_a_kind_this_build_does_not_know() {
+    let (_dir, mut store) = open();
+    let owner = MachineId::random();
+    store.apply(&workspace(owner, 1), owner).unwrap();
+    insert_unreadable(&store, owner, 2, "printer", "{}");
+    store.apply(&session(owner, 3), owner).unwrap();
+    assert_eq!(store.since(owner, 0).unwrap(), vec![workspace(owner, 1)]);
+    assert_eq!(store.since(owner, 2).unwrap(), vec![session(owner, 3)]);
+}
+
+#[test]
+fn since_stops_before_a_known_kind_with_a_state_this_build_does_not_know() {
+    let (_dir, mut store) = open();
+    let owner = MachineId::random();
+    store.apply(&workspace(owner, 1), owner).unwrap();
+    let mut body = serde_json::to_value(match session(owner, 2) {
+        AnyRecord::Session(r) => r.body,
+        _ => unreachable!(),
+    })
+    .unwrap();
+    body["state"] = serde_json::json!("dreaming");
+    insert_unreadable(&store, owner, 2, "session", &body.to_string());
+    store.apply(&terminal(owner, 3), owner).unwrap();
+    assert_eq!(store.since(owner, 0).unwrap(), vec![workspace(owner, 1)]);
+    assert_eq!(store.since(owner, 2).unwrap(), vec![terminal(owner, 3)]);
 }
 
 /// Review focus 3: clocks on two machines can disagree by minutes, so nothing in the
