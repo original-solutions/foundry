@@ -1416,4 +1416,105 @@ mod tests {
             Err(TerminalError::Unknown(_))
         ));
     }
+
+    /// The watcher's exit write waits for a busy store while the terminal is closed. Close
+    /// waits for that write, so its deleted record is the newest and the terminal stays closed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the test holds the store to keep the exit write waiting"
+    )]
+    async fn close_waits_for_an_exit_write_in_flight_so_its_deleted_record_is_newest() {
+        let setup = Setup::new();
+        let (terminals, store) = setup.daemon();
+        let id = setup.start(&terminals, "stty -echo; read x; exit 2").await;
+        let busy = store.lock().unwrap();
+        terminals
+            .input(id, Bytes::from_static(b"\n"))
+            .await
+            .unwrap();
+        // The child exits and the watcher's write of it waits for the store.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let closing = tokio::spawn(terminals.inner.clone().close(id));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            terminals.inner.entry(id).is_ok(),
+            "close lets the terminal go before the exit write in flight is done"
+        );
+        drop(busy);
+        closing.await.unwrap().unwrap();
+        let newest = held(&store, setup.me, id).unwrap();
+        assert!(newest.deleted, "{newest:?}");
+        assert_eq!(newest.body.exit_code, Some(2));
+    }
+
+    /// An exit the store could not take is written once it can, not dropped.
+    #[tokio::test]
+    async fn an_exit_the_store_could_not_record_is_recorded_once_it_can() {
+        let setup = Setup::new();
+        let (terminals, store) = setup.daemon();
+        let id = setup.start(&terminals, "stty -echo; read x; exit 4").await;
+        // SQLite cannot make its journal in a read-only directory, so every write fails.
+        set_mode(setup.data.path(), 0o500);
+        terminals
+            .input(id, Bytes::from_static(b"\n"))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            held(&store, setup.me, id).unwrap().body.state,
+            TerminalState::Running
+        );
+        set_mode(setup.data.path(), 0o700);
+        until("the record to say exited", || {
+            held(&store, setup.me, id).unwrap().body.state == TerminalState::Exited
+        })
+        .await;
+        assert_eq!(held(&store, setup.me, id).unwrap().body.exit_code, Some(4));
+        terminals.close(id).await.unwrap();
+    }
+
+    /// A close whose record the store could not take leaves the terminal live, so the close
+    /// can be tried again.
+    #[tokio::test]
+    async fn a_close_the_store_could_not_record_can_be_tried_again() {
+        let setup = Setup::new();
+        let (terminals, store) = setup.daemon();
+        let id = setup.start(&terminals, "sleep 60").await;
+        set_mode(setup.data.path(), 0o500);
+        let error = terminals.close(id).await.unwrap_err();
+        assert!(matches!(error, TerminalError::Store(_)), "{error:?}");
+        assert!(terminals.inner.entry(id).is_ok(), "the terminal stays live");
+        set_mode(setup.data.path(), 0o700);
+        terminals.close(id).await.unwrap();
+        assert!(held(&store, setup.me, id).unwrap().deleted);
+    }
+
+    /// A start that fails while the store cannot take the failure still says why it failed,
+    /// and leaves a terminal that can be closed rather than a running record nothing reaches.
+    #[tokio::test]
+    async fn a_failed_start_the_store_could_not_record_can_still_be_closed() {
+        let setup = Setup::new();
+        // A holder that makes the data directory read-only, then fails.
+        let fake = setup.cwd.path().join("fake-holder");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\nchmod 500 \"$(dirname \"$(dirname \"$2\")\")\"\necho 'foundry-holder: no pty' >&2\nexit 1\n",
+        )
+        .unwrap();
+        set_mode(&fake, 0o755);
+        let (terminals, store) = setup.daemon_with(fake);
+        let error = terminals
+            .start(WorkspaceId::random(), setup.cwd.path(), &argv("true"), &[])
+            .await
+            .unwrap_err();
+        let TerminalError::Start { id, ref reason } = error else {
+            panic!("expected a start error, got {error:?}");
+        };
+        assert_eq!(reason, "no pty");
+        set_mode(setup.data.path(), 0o700);
+        assert!(!held(&store, setup.me, id).unwrap().deleted);
+        terminals.close(id).await.unwrap();
+        assert!(held(&store, setup.me, id).unwrap().deleted);
+    }
 }
