@@ -42,7 +42,9 @@ impl Dialer for WsDialer {
     }
 }
 
-/// The route that serves links peers open to this machine.
+/// The route that serves links peers open to this machine. A link names its machine in the
+/// hello and nothing proves it yet: mount this only where the machine keys of joining
+/// (task 13) are checked, or on an address only fleet machines can reach.
 pub fn router(peers: Peers) -> Router {
     Router::new()
         .route(PEER_PATH, get(upgrade))

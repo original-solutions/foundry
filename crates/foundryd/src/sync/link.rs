@@ -2,43 +2,38 @@
 //!
 //! The dialing end says hello first. The accepting end waits for that hello and answers in
 //! the lower of the two protocol numbers, and from then on each end sends in that protocol, so
-//! a newer machine speaks the older form to an older peer.
+//! a newer machine speaks the older form to an older peer. With one protocol so far, the forms
+//! differ only in the number; a later protocol that changes a message's shape converts it to
+//! the older shape where [`records_message`] builds it.
 
 use foundry_proto::ids::MachineId;
 use foundry_proto::messages::{PROTOCOL, PeerMessage};
 use foundry_proto::record::AnyRecord;
 use tokio::time::{Instant, sleep_until, timeout, timeout_at};
 
-use super::{Conn, Inner, OFFLINE_AFTER, TICK, lock};
+use super::{BATCH, Conn, Inner, OFFLINE_AFTER, TICK, lock};
 use crate::store::Applied;
 
-/// Runs a link until it closes, the peer is silent for [`OFFLINE_AFTER`], or the peer is not
-/// one this machine links with. `dialed` is the machine this end dialed, or `None` for a link
-/// a peer opened.
+/// Runs a link until it closes, the peer is silent for [`OFFLINE_AFTER`], the peer is not (or
+/// is no longer) in the machine list, or the peer sends a message this machine cannot take.
+/// `dialed` is the machine this end dialed, or `None` for a link a peer opened.
 pub(super) async fn run(inner: &Inner, mut conn: Conn, dialed: Option<MachineId>) {
     let Some(open) = hello(inner, &mut conn, dialed).await else {
         return;
     };
     let mut sent = open.sent;
+    let mut warned = false;
     let mut last_heard = Instant::now();
     let mut every = tokio::time::interval(TICK);
     loop {
         tokio::select! {
             _ = every.tick() => {
-                let records = match lock(&inner.store).since(inner.me, sent) {
-                    Ok(records) => records,
-                    Err(error) => {
-                        tracing::warn!("sync: cannot read this machine's records: {error}");
-                        continue;
-                    }
-                };
-                let newest = records.last().map(AnyRecord::version);
-                let message = PeerMessage::Records { protocol: open.speak, records };
-                if !send(&conn, &message).await {
+                if !listed(inner, open.peer) {
+                    tracing::info!("sync: {} left the machine list; link closed", open.peer);
                     return;
                 }
-                if let Some(version) = newest {
-                    sent = version;
+                if !send_own(inner, &conn, &open, &mut sent, &mut warned).await {
+                    return;
                 }
             }
             text = conn.recv.recv() => {
@@ -47,13 +42,59 @@ pub(super) async fn run(inner: &Inner, mut conn: Conn, dialed: Option<MachineId>
                 };
                 last_heard = Instant::now();
                 inner.heard_from(open.peer);
-                receive(inner, open.peer, &text);
+                if !receive(inner, open.peer, &text) {
+                    return;
+                }
             }
             _ = sleep_until(last_heard + OFFLINE_AFTER) => {
                 tracing::debug!("sync: {} has been silent for {OFFLINE_AFTER:?}", open.peer);
                 return;
             }
         }
+    }
+}
+
+/// Sends this machine's records above `sent` in messages of at most [`BATCH`], moving `sent`
+/// past each one sent, and says whether the link is still open. With nothing new, or when the
+/// records cannot be read, it sends one empty message: the heartbeat goes out either way, so a
+/// read error never makes this machine look offline. The first read error on a link is a
+/// warning; later ones are not repeated.
+async fn send_own(
+    inner: &Inner,
+    conn: &Conn,
+    open: &Open,
+    sent: &mut u64,
+    warned: &mut bool,
+) -> bool {
+    let records = match lock(&inner.store).since(inner.me, *sent) {
+        Ok(records) => records,
+        Err(error) => {
+            if !*warned {
+                tracing::warn!("sync: cannot read this machine's records: {error}");
+                *warned = true;
+            }
+            Vec::new()
+        }
+    };
+    if records.is_empty() {
+        return send(conn, &records_message(open, Vec::new())).await;
+    }
+    for batch in records.chunks(BATCH) {
+        let newest = batch.last().map(AnyRecord::version);
+        if !send(conn, &records_message(open, batch.to_vec())).await {
+            return false;
+        }
+        if let Some(version) = newest {
+            *sent = version;
+        }
+    }
+    true
+}
+
+fn records_message(open: &Open, records: Vec<AnyRecord>) -> PeerMessage {
+    PeerMessage::Records {
+        protocol: open.speak,
+        records,
     }
 }
 
@@ -144,8 +185,11 @@ async fn send(conn: &Conn, message: &PeerMessage) -> bool {
     )
 }
 
-/// Takes the records in a message from `peer`, each only if `peer` owns it and it is newer.
-fn receive(inner: &Inner, peer: MachineId, text: &str) {
+/// Takes the records in a message from `peer`, each only if `peer` owns it and it is newer,
+/// and says whether to keep the link. A message that cannot be read, or a record that cannot
+/// be stored, ends the link and nothing after it is taken: records arrive in version order, so
+/// the store then holds a prefix, and the next hello asks for everything past it again.
+fn receive(inner: &Inner, peer: MachineId, text: &str) -> bool {
     match serde_json::from_str::<PeerMessage>(text) {
         Ok(PeerMessage::Records { records, .. }) => {
             let mut store = lock(&inner.store);
@@ -156,13 +200,19 @@ fn receive(inner: &Inner, peer: MachineId, text: &str) {
                         record.owner()
                     ),
                     Ok(Applied::Stored | Applied::Stale) => {}
-                    Err(error) => tracing::warn!("sync: a record from {peer} not stored: {error}"),
+                    Err(error) => {
+                        tracing::warn!("sync: a record from {peer} not stored: {error}");
+                        return false;
+                    }
                 }
             }
+            true
         }
         // Shared settings move only through the coordinator, which owns how they are sent.
-        Ok(PeerMessage::Settings { .. }) => {}
-        Ok(PeerMessage::Hello { .. }) => {}
-        Err(error) => tracing::warn!("sync: a message from {peer} could not be read: {error}"),
+        Ok(PeerMessage::Settings { .. }) | Ok(PeerMessage::Hello { .. }) => true,
+        Err(error) => {
+            tracing::warn!("sync: a message from {peer} could not be read: {error}");
+            false
+        }
     }
 }

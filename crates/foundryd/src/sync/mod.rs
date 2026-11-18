@@ -9,6 +9,18 @@
 //!
 //! A machine not heard from for [`OFFLINE_AFTER`] is offline, and [`Peers::state`] shows its
 //! sessions and terminals as unreachable.
+//!
+//! Each machine dials every peer and also serves the link each peer dials, so a pair runs two
+//! links and each carries records both ways. That is deliberate: a pair stays in sync when
+//! only one of them can reach the other. The second copy of a record is stale and changes
+//! nothing.
+//!
+//! A link trusts the machine id its peer names in the hello, checked only against the machine
+//! list. Proving that id with a machine key belongs to joining (task 13).
+//!
+//! Sending stops at the highest version sent, so a machine's own records must be stored in
+//! the order of their versions: a writer takes [`Store::own_next_version`] and applies the
+//! record while holding the store's lock once.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -40,6 +52,12 @@ const TICK: Duration = Duration::from_secs(1);
 /// How long to wait before dialing a peer again after a link ends or a dial fails, and how
 /// often the machine list is read for peers added or removed.
 const REDIAL: Duration = Duration::from_secs(1);
+
+/// The most records one message carries. A larger catch-up goes out as several messages.
+pub const BATCH: usize = 500;
+
+/// How long a dial may take before it is given up and tried again.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How many messages a link buffers each way.
 const BUFFER: usize = 64;
@@ -100,8 +118,9 @@ impl Peers {
     }
 
     /// Keeps a link open to every other machine in the machine list, redialing a link that
-    /// ends, until the returned future is dropped. A machine added to the list is dialed and
-    /// a machine removed from it is dropped within [`REDIAL`].
+    /// ends, until the returned future is dropped. A machine added to the list is dialed
+    /// within [`REDIAL`]. A machine removed from it is no longer dialed, and every link to it,
+    /// dialed or served, closes within a second.
     pub async fn run(&self) {
         let mut links: BTreeMap<MachineId, (Machine, Task)> = BTreeMap::new();
         let mut every = tokio::time::interval(REDIAL);
@@ -147,13 +166,18 @@ impl Peers {
     }
 
     /// Every record held, from every owner, with the sessions and terminals of an offline
-    /// owner shown as unreachable.
+    /// owner shown as unreachable. An owner with a record this build cannot read, one a newer
+    /// build wrote before a rollback, is left out with a warning so every other owner still
+    /// shows.
     pub fn state(&self) -> Result<Vec<AnyRecord>, StoreError> {
         let online = self.online();
         let store = lock(&self.inner.store);
         let mut records = Vec::new();
         for owner in store.versions()?.into_keys() {
-            records.extend(store.since(owner, 0)?);
+            match store.since(owner, 0) {
+                Ok(held) => records.extend(held),
+                Err(error) => tracing::warn!("sync: records of {owner} not shown: {error}"),
+            }
         }
         Ok(records
             .into_iter()
@@ -163,9 +187,10 @@ impl Peers {
 
     async fn dial_forever(self, peer: Machine) {
         loop {
-            match self.inner.dialer.dial(&peer).await {
-                Ok(conn) => link::run(&self.inner, conn, Some(peer.id)).await,
-                Err(error) => tracing::debug!("sync: cannot reach {}: {error}", peer.name),
+            match tokio::time::timeout(DIAL_TIMEOUT, self.inner.dialer.dial(&peer)).await {
+                Ok(Ok(conn)) => link::run(&self.inner, conn, Some(peer.id)).await,
+                Ok(Err(error)) => tracing::debug!("sync: cannot reach {}: {error}", peer.name),
+                Err(_) => tracing::debug!("sync: dialing {} timed out", peer.name),
             }
             tokio::time::sleep(REDIAL).await;
         }
