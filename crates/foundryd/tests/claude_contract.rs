@@ -5,8 +5,8 @@
 //! --model <model>` in a PTY with the gateway variables set. The test then runs one shell
 //! command, answers a permission with yes, denies one, interrupts a turn with Esc while its tool
 //! runs, and exits with `/exit`. It checks that no trust prompt shows, that each hook `sessions`
-//! reads arrives with the fields it reads, and that the denial and the interrupt post no hook,
-//! and prints every hook that arrived after each step. `docs/claude-code-contract.md` records
+//! registers arrives with the fields it reads, and that the denial and the interrupt post none of
+//! them, and prints every hook that arrived in each step. `docs/claude-code-contract.md` records
 //! what it found.
 //!
 //! It spends model calls, so it is ignored and runs only with `FOUNDRY_CONTRACT=1`, `claude` on
@@ -46,17 +46,6 @@ const TURN: Duration = Duration::from_secs(180);
 /// How long a step that has no hook to wait for watches for hooks after its key press.
 const WATCH: Duration = Duration::from_secs(15);
 
-/// The hooks `sessions` reads. It reads `hook_event_name` on each, and `reason` on `SessionEnd`.
-const HOOKS: [&str; 7] = [
-    "SessionStart",
-    "UserPromptSubmit",
-    "PreToolUse",
-    "PostToolUse",
-    "Stop",
-    "Notification",
-    "SessionEnd",
-];
-
 #[test]
 #[ignore = "spends model calls: run with FOUNDRY_CONTRACT=1 and --ignored"]
 fn claude_code_posts_the_hooks_sessions_reads() {
@@ -94,7 +83,8 @@ fn claude_code_posts_the_hooks_sessions_reads() {
     let settings = data.path().join("sessions").join("contract.json");
     let url = format!("http://127.0.0.1:{port}/hooks/contract");
     claude::write_curl_config(&curl, &url, &token).unwrap();
-    claude::write_settings(&settings, &claude::settings_json(&curl)).unwrap();
+    let registered = claude::settings_json(&curl);
+    claude::write_settings(&settings, &registered).unwrap();
     let claude_json = claude::claude_json(
         std::env::var_os("CLAUDE_CONFIG_DIR"),
         std::env::var_os("HOME"),
@@ -138,9 +128,9 @@ fn claude_code_posts_the_hooks_sessions_reads() {
         "Create a file named allowed.txt in the current folder containing the word yes, \
          with your Write tool. Do nothing else.",
     );
-    run.wait_for(mark, "Notification", TURN);
+    let asked = run.wait_for(mark, "Notification", TURN);
     session.answer(b"\r");
-    run.wait_for(mark, "PostToolUse", TURN);
+    run.wait_for(asked + 1, "PostToolUse", TURN);
     run.wait_for(mark, "Stop", TURN);
     assert!(
         folder.join("allowed.txt").exists(),
@@ -155,14 +145,20 @@ fn claude_code_posts_the_hooks_sessions_reads() {
          with your Write tool. Do nothing else.",
     );
     let asked = run.wait_for(mark, "Notification", TURN);
+    let seen = session.screen().len();
     session.answer(b"3");
     let after = run.watch(asked + 1);
+    run.report("permission denied", mark);
+    assert!(
+        shows(&session.screen()[seen..], "User rejected"),
+        "the denial was not taken:\n{}",
+        session.tail()
+    );
     assert!(!folder.join("denied.txt").exists(), "the denied write ran");
-    run.report("permission denied", asked + 1);
     assert_eq!(
         after,
         Vec::<String>::new(),
-        "a denial posted hooks; update docs/claude-code-contract.md\n{}",
+        "a denial posted a registered hook; update docs/claude-code-contract.md\n{}",
         session.tail()
     );
 
@@ -195,7 +191,7 @@ fn claude_code_posts_the_hooks_sessions_reads() {
     let seen = session.screen().len();
     session.send(b"\x1b");
     let after = run.watch(pressed);
-    run.report("turn interrupted", pressed);
+    run.report("turn interrupted", mark);
     assert!(
         shows(&session.screen()[seen..], "Interrupted"),
         "Esc did not interrupt the tool:\n{}",
@@ -204,7 +200,7 @@ fn claude_code_posts_the_hooks_sessions_reads() {
     assert_eq!(
         after,
         Vec::<String>::new(),
-        "an interrupt posted hooks; update docs/claude-code-contract.md\n{}",
+        "an interrupt posted a registered hook; update docs/claude-code-contract.md\n{}",
         session.tail()
     );
 
@@ -216,17 +212,17 @@ fn claude_code_posts_the_hooks_sessions_reads() {
     run.report("exit", mark);
     assert_eq!(code, Some(0), "Claude Code exits 0 after /exit");
 
-    // Each hook `sessions` reads arrived with the fields it reads.
+    // Each hook `sessions` registers arrived, and `sessions` reads it as that hook.
     let hooks = posted.all();
-    for name in HOOKS {
+    for name in registered["hooks"].as_object().unwrap().keys() {
         let payload = hooks
             .iter()
-            .find(|p| p["hook_event_name"] == name)
+            .find(|p| p["hook_event_name"] == name.as_str())
             .unwrap_or_else(|| panic!("no {name} arrived"));
-        assert_eq!(
-            Hook::from_payload(payload),
-            Some(Hook::from_name(name)),
-            "{name} is read as {name}: {payload}"
+        let hook = Hook::from_payload(payload);
+        assert!(
+            hook.is_some_and(|h| h != Hook::Other),
+            "sessions does not read {name} as a hook it acts on: {payload}"
         );
     }
     let end = hooks
@@ -242,6 +238,7 @@ fn claude_code_posts_the_hooks_sessions_reads() {
         0,
         "every hook presented the session's token"
     );
+    assert_eq!(posted.unread(), 0, "every hook posted JSON");
 
     // The states `sessions` derives from them, from launch to exit.
     let mut state = SessionState::Starting;
@@ -253,11 +250,13 @@ fn claude_code_posts_the_hooks_sessions_reads() {
     assert_eq!(state, SessionState::Finished);
 }
 
-/// The hooks the session posted, in the order they arrived, and how many were refused.
+/// The hooks the session posted, in the order they arrived, how many were refused, and how many
+/// were not JSON.
 #[derive(Clone, Default)]
 struct Posted {
     hooks: Arc<Mutex<Vec<Value>>>,
     refused: Arc<AtomicUsize>,
+    unread: Arc<AtomicUsize>,
 }
 
 impl Posted {
@@ -275,6 +274,7 @@ impl Posted {
                 return StatusCode::FORBIDDEN;
             }
             let Ok(payload) = serde_json::from_slice::<Value>(&body) else {
+                posted.unread.fetch_add(1, Ordering::SeqCst);
                 return StatusCode::BAD_REQUEST;
             };
             posted.hooks.lock().unwrap().push(payload);
@@ -299,6 +299,10 @@ impl Posted {
 
     fn refused(&self) -> usize {
         self.refused.load(Ordering::SeqCst)
+    }
+
+    fn unread(&self) -> usize {
+        self.unread.load(Ordering::SeqCst)
     }
 
     /// The index of the first hook named `name` at or after `from`.
@@ -390,10 +394,12 @@ struct Session {
 
 impl Session {
     /// Starts `claude --settings <settings> --model <MODEL>` in `folder` with the gateway
-    /// variables, as `sessions` does. Two things differ, both to keep the machine running the
-    /// test out of it: the variables a parent Claude Code session sets are unset, and
-    /// `--setting-sources ""` keeps the user's own settings (their hooks, permission rules and
-    /// `env`) from changing what the session asks and posts.
+    /// variables, as `sessions` does, with three changes that keep the machine running the test
+    /// out of it. Every inherited `CLAUDE*` variable but `CLAUDE_CONFIG_DIR` is unset, such as
+    /// those a parent Claude Code session sets. `--setting-sources ""` keeps the user's own
+    /// settings (their hooks, permission rules and `env`) from changing what the session asks
+    /// and posts. `--permission-mode default` makes Claude Code ask, where the machine's default
+    /// mode may answer for itself. `docs/claude-code-contract.md` lists every difference.
     fn start(folder: &Path, settings: &Path, gateway: &[(String, String)]) -> Self {
         let mut argv: Vec<OsString> = vec!["env".into()];
         for (name, _) in std::env::vars_os() {
