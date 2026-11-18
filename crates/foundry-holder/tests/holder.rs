@@ -702,6 +702,21 @@ async fn nothing_a_client_sends_after_its_refusal_reaches_the_child() {
     );
 }
 
+/// Waits until the child's 20 MB flood is all in the holder, so the scrollback is full (a snapshot
+/// far more than the socket buffers hold) and no more output will follow it.
+async fn wait_for_quiet_flood(holder: &Holder) {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let client = holder.attach().await;
+        if client.start + client.snapshot.len() as u64 == 20_000_000 {
+            assert_eq!(client.snapshot.len(), MAX_BYTES);
+            return;
+        }
+        assert!(Instant::now() < deadline, "the flood never finished");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 #[tokio::test]
 async fn a_client_that_hangs_up_still_gets_what_was_queued_for_it() {
     let holder = Holder::start(
@@ -712,11 +727,7 @@ async fn a_client_that_hangs_up_still_gets_what_was_queued_for_it() {
         ],
         &[],
     );
-    let deadline = Instant::now() + WAIT;
-    while holder.attach().await.snapshot.len() < MAX_BYTES {
-        assert!(Instant::now() < deadline, "the scrollback never filled");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    wait_for_quiet_flood(&holder).await;
 
     let mut stream = holder.connect().await;
     protocol::write_request(&mut stream, &Request::Attach)
@@ -742,12 +753,7 @@ async fn a_client_that_hangs_up_without_reading_is_let_go() {
         ],
         &[],
     );
-    // Wait for a full scrollback, so the snapshot is far more than the socket buffers hold.
-    let deadline = Instant::now() + WAIT;
-    while holder.attach().await.snapshot.len() < MAX_BYTES {
-        assert!(Instant::now() < deadline, "the scrollback never filled");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    wait_for_quiet_flood(&holder).await;
 
     let mut stream = holder.connect().await;
     protocol::write_request(&mut stream, &Request::Attach)
