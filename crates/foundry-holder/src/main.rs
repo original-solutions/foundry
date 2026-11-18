@@ -4,18 +4,26 @@
 //! with no controlling terminal, outside the process group of whatever started it. The holder
 //! starts the child on a new PTY and serves the socket. The process that ran the command exits 0
 //! once the socket is ready, or 1 with the reason on stderr.
+//!
+//! For as long as it runs, the holder keeps an exclusive lock on the file beside the socket with
+//! the extension `lock`. The kernel lets go of it when the holder dies, however it dies, so a
+//! socket that refuses connections while its lock is held belongs to a holder that is busy, not
+//! gone.
 
 mod server;
 
 use std::ffi::OsString;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::{PipeWriter, Read as _, Write as _};
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Child, ExitCode};
 
 use clap::Parser;
 use foundry_holder::pty::{self, Pty};
+use nix::errno::Errno;
+use nix::fcntl::{Flock, FlockArg};
 use nix::sys::stat::{Mode, umask};
 use nix::sys::wait::waitpid;
 use nix::unistd::{ForkResult, dup2_stderr, dup2_stdin, dup2_stdout, fork, setsid};
@@ -129,25 +137,26 @@ fn detach(args: Args, env: Vec<(String, String)>, mut ready: PipeWriter) -> i32 
     }
 }
 
-/// The holder itself.
+/// The holder itself. The lock is kept until it returns.
 fn hold(args: Args, env: Vec<(String, String)>, mut ready: PipeWriter) -> i32 {
+    let lock_path = args.socket.with_extension("lock");
     let started = quiet_stdio().and_then(|()| {
-        let pty = Pty::open(COLS, ROWS).map_err(|e| format!("pty: {e}"))?;
-        let listener = bind(&args.socket)?;
-        match pty.spawn(&args.argv, &args.cwd, &env) {
-            Ok(child) => Ok((pty, listener, child)),
-            Err(e) => {
-                let _ = std::fs::remove_file(&args.socket);
-                Err(e.to_string())
+        let lock = lock(&lock_path)?;
+        match open(&args, &env) {
+            Ok((pty, listener, child)) => Ok((lock, pty, listener, child)),
+            Err(reason) => {
+                // Removed while still held, so no holder that is running loses its file.
+                let _ = std::fs::remove_file(&lock_path);
+                Err(reason)
             }
         }
     });
     drop(env);
     match started {
-        Ok((pty, listener, child)) => {
+        Ok((_lock, pty, listener, child)) => {
             let _ = ready.write_all(READY.as_bytes());
             drop(ready);
-            match server::run(listener, &args.socket, pty, child) {
+            match server::run(listener, &args.socket, &lock_path, pty, child) {
                 Ok(()) => 0,
                 Err(_) => 1,
             }
@@ -155,6 +164,19 @@ fn hold(args: Args, env: Vec<(String, String)>, mut ready: PipeWriter) -> i32 {
         Err(reason) => {
             let _ = ready.write_all(reason.as_bytes());
             1
+        }
+    }
+}
+
+/// Opens the PTY, binds the socket and starts the child on the PTY.
+fn open(args: &Args, env: &[(String, String)]) -> Result<(Pty, UnixListener, Child), String> {
+    let pty = Pty::open(COLS, ROWS).map_err(|e| format!("pty: {e}"))?;
+    let listener = bind(&args.socket)?;
+    match pty.spawn(&args.argv, &args.cwd, env) {
+        Ok(child) => Ok((pty, listener, child)),
+        Err(e) => {
+            let _ = std::fs::remove_file(&args.socket);
+            Err(e.to_string())
         }
     }
 }
@@ -170,6 +192,23 @@ fn quiet_stdio() -> Result<(), String> {
         .and_then(|()| dup2_stdout(&null))
         .and_then(|()| dup2_stderr(&null))
         .map_err(|e| format!("stdio: {e}"))
+}
+
+/// Takes the lock that says this holder runs, without waiting. The file is this user's only, and
+/// the descriptor is closed on exec, so the child never holds the lock.
+fn lock(path: &Path) -> Result<Flock<File>, String> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| format!("lock {}: {e}", path.display()))?;
+    Flock::lock(file, FlockArg::LockExclusiveNonblock).map_err(|(_, e)| match e {
+        Errno::EWOULDBLOCK => format!("lock {}: another holder holds it", path.display()),
+        e => format!("lock {}: {e}", path.display()),
+    })
 }
 
 /// Binds the socket readable and writable by this user only: it gives full control of a shell.

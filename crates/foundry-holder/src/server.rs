@@ -39,13 +39,21 @@ const READ_CHUNK: usize = 64 * 1024;
 /// stalled connection costs the holder little.
 const MAX_BACKLOG: usize = 4 * 1024 * 1024;
 
-/// Serves until a client sends `Close`, then removes the socket.
-pub fn run(listener: StdUnixListener, socket: &Path, pty: Pty, child: Child) -> io::Result<()> {
+/// Serves until a client sends `Close`, then removes the socket and, after it, the lock file the
+/// caller still holds, so the socket never outlasts the file that says whether it is served.
+pub fn run(
+    listener: StdUnixListener,
+    socket: &Path,
+    lock: &Path,
+    pty: Pty,
+    child: Child,
+) -> io::Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
     let result = runtime.block_on(serve(listener, pty, child));
     let _ = std::fs::remove_file(socket);
+    let _ = std::fs::remove_file(lock);
     result
 }
 
