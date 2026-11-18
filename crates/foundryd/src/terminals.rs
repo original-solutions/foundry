@@ -11,6 +11,7 @@
 //! that `reattach_all` finds with no socket and marks exited.
 
 use std::collections::HashMap;
+use std::io;
 use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -30,8 +31,18 @@ use tokio::task::AbortHandle;
 
 use crate::store::{Store, StoreError};
 
-/// How long a watcher waits before it connects again to a holder that dropped its connection.
+/// How long the watcher waits before it attaches again to a holder that dropped it, and the
+/// most it waits after repeated failures.
 const RECONNECT_AFTER: Duration = Duration::from_millis(200);
+const RECONNECT_AT_MOST: Duration = Duration::from_secs(30);
+
+/// How long a holder has to answer a request before the request fails.
+const ANSWER_WITHIN: Duration = Duration::from_secs(10);
+
+/// A socket that refuses connections this many times, this far apart, has no holder behind it.
+/// One refusal alone can be a holder whose queue of new connections is full.
+const REFUSALS_FOR_GONE: u32 = 3;
+const REFUSAL_RETRY: Duration = Duration::from_millis(100);
 
 #[derive(Debug, thiserror::Error)]
 pub enum TerminalError {
@@ -41,6 +52,13 @@ pub enum TerminalError {
     Start { id: TerminalId, reason: String },
     #[error("terminal {id}: the holder refused the request: {reason}")]
     Refused { id: TerminalId, reason: String },
+    #[error(
+        "terminal {0}: the holder ended this connection before the child exited, because the \
+         client fell behind or the terminal was closed; attach again"
+    )]
+    Detached(TerminalId),
+    #[error("terminal {0}: the holder is gone")]
+    Gone(TerminalId),
     #[error("terminal {id}: {source}")]
     Holder {
         id: TerminalId,
@@ -48,6 +66,8 @@ pub enum TerminalError {
     },
     #[error(transparent)]
     Store(#[from] StoreError),
+    #[error("terminals: a step run apart from its caller did not finish: {0}")]
+    Interrupted(#[from] tokio::task::JoinError),
 }
 
 impl TerminalError {
@@ -69,48 +89,180 @@ pub struct Snapshot {
     pub bytes: Bytes,
 }
 
+/// A terminal's live bytes after its [`Snapshot`]. It ends after the child exits. Any other end
+/// is an error item first: [`TerminalError::Detached`] when the holder cut this client off.
+pub type Output = BoxStream<'static, Result<Bytes, TerminalError>>;
+
 /// This machine's terminals.
 pub struct Terminals {
-    shared: Arc<Shared>,
-    dir: PathBuf,
-    holder: PathBuf,
+    inner: Arc<Inner>,
 }
 
-struct Shared {
+struct Inner {
     me: MachineId,
     store: Arc<Mutex<Store>>,
+    dir: PathBuf,
+    holder: PathBuf,
     live: Mutex<HashMap<TerminalId, Arc<Entry>>>,
 }
 
-/// A terminal whose holder this daemon is attached to.
+/// A terminal whose record is not deleted: its holder runs, or it ended and the terminal is not
+/// closed yet.
 struct Entry {
+    id: TerminalId,
     socket: PathBuf,
-    /// The body of the terminal's newest record.
-    body: Mutex<Terminal>,
-    /// The connection input, resize and close are sent on, so they reach the holder in order.
+    /// The body of the terminal's newest record. Held across each write of the record, so one
+    /// terminal's writes never cross.
+    body: tokio::sync::Mutex<Terminal>,
+    /// The connection input and resize are sent on, so they reach the holder in order.
     control: tokio::sync::Mutex<Option<UnixStream>>,
     watcher: Mutex<Option<AbortHandle>>,
 }
 
 impl Terminals {
     /// The terminals of machine `me`, whose sockets live under `data_dir`, started with the
-    /// `foundry-holder` binary at `holder`. None is attached until [`Self::reattach_all`].
+    /// `foundry-holder` binary at `holder`. None is live until [`Self::reattach_all`].
     pub fn new(me: MachineId, store: Arc<Mutex<Store>>, data_dir: &Path, holder: PathBuf) -> Self {
         Self {
-            shared: Arc::new(Shared {
+            inner: Arc::new(Inner {
                 me,
                 store,
+                dir: data_dir.join("terminals"),
+                holder,
                 live: Mutex::default(),
             }),
-            dir: data_dir.join("terminals"),
-            holder,
         }
     }
 
     /// Starts `argv` in `cwd` with `env` set over the daemon's own environment, in a new
-    /// terminal of `workspace`.
+    /// terminal of `workspace`. The start finishes even when the caller stops waiting.
     pub async fn start(
         &self,
+        workspace: WorkspaceId,
+        cwd: &Path,
+        argv: &[String],
+        env: &[(String, String)],
+    ) -> Result<TerminalId, TerminalError> {
+        let inner = self.inner.clone();
+        let (cwd, argv, env) = (cwd.to_path_buf(), argv.to_vec(), env.to_vec());
+        tokio::spawn(async move { inner.start(workspace, &cwd, &argv, &env).await }).await?
+    }
+
+    /// The terminal's kept screen and scrollback, then its live bytes.
+    pub async fn attach(&self, id: TerminalId) -> Result<(Snapshot, Output), TerminalError> {
+        let entry = self.inner.entry(id)?;
+        let mut stream = entry.connect().await?;
+        protocol::write_request(&mut stream, &Request::Attach)
+            .await
+            .map_err(|e| TerminalError::holder(id, e))?;
+        let snapshot = match protocol::read_reply(&mut stream).await {
+            Ok(Some(Reply::Snapshot { start, bytes })) => Snapshot { start, bytes },
+            Ok(Some(Reply::Refused(reason))) => return Err(TerminalError::Refused { id, reason }),
+            Ok(_) => return Err(TerminalError::Detached(id)),
+            Err(e) => return Err(TerminalError::holder(id, e)),
+        };
+        let output = futures::stream::unfold(Some(stream), move |stream| async move {
+            let mut stream = stream?;
+            loop {
+                let item = match protocol::read_reply(&mut stream).await {
+                    Ok(Some(Reply::Output(bytes))) => Ok(bytes),
+                    Ok(Some(Reply::Status(ChildStatus::Running) | Reply::Snapshot { .. })) => {
+                        continue;
+                    }
+                    // The holder sends every byte before it reports the exit.
+                    Ok(Some(Reply::Status(ChildStatus::Exited(_)))) => return None,
+                    Ok(Some(Reply::Refused(reason))) => Err(TerminalError::Refused { id, reason }),
+                    Ok(None) => Err(TerminalError::Detached(id)),
+                    Err(e) => Err(TerminalError::holder(id, e)),
+                };
+                let more = item.is_ok().then_some(stream);
+                return Some((item, more));
+            }
+        });
+        Ok((snapshot, output.boxed()))
+    }
+
+    /// Bytes typed into the terminal. Input the holder refuses, because the child has left too
+    /// much unread, is [`TerminalError::Refused`]; none of it reaches the child.
+    pub async fn input(&self, id: TerminalId, bytes: Bytes) -> Result<(), TerminalError> {
+        self.inner.entry(id)?.send(&Request::Input(bytes)).await
+    }
+
+    pub async fn resize(&self, id: TerminalId, cols: u16, rows: u16) -> Result<(), TerminalError> {
+        self.inner
+            .entry(id)?
+            .send(&Request::Resize { cols, rows })
+            .await
+    }
+
+    /// Ends the terminal: hangs up its child, waits for its holder to end and deletes its
+    /// record. A holder that is already gone is no error. The close finishes even when the
+    /// caller stops waiting.
+    pub async fn close(&self, id: TerminalId) -> Result<(), TerminalError> {
+        let inner = self.inner.clone();
+        tokio::spawn(async move { inner.close(id).await }).await?
+    }
+
+    /// Makes live every terminal this machine's records name and that is not closed, and
+    /// watches each holder that still runs. A running terminal whose socket is gone is
+    /// recorded as exited with an unknown code. Run once at start, before any [`Self::start`]:
+    /// it also removes env files a stopped daemon left behind.
+    pub async fn reattach_all(&self) -> Result<(), TerminalError> {
+        self.inner.remove_env_files();
+        let (store, me) = (self.inner.store.clone(), self.inner.me);
+        let held = tokio::task::spawn_blocking(move || -> Result<Vec<Terminal>, StoreError> {
+            let records = lock(&store).since(me, 0)?;
+            Ok(records
+                .into_iter()
+                .filter_map(|record| match record {
+                    AnyRecord::Terminal(r) if !r.deleted => Some(r.body),
+                    _ => None,
+                })
+                .collect())
+        })
+        .await??;
+        for body in held {
+            if self.inner.entry(body.id).is_ok() {
+                continue;
+            }
+            let socket = self.inner.socket(body.id);
+            match connect(&socket).await {
+                Err(Unreachable::Gone { .. }) => {
+                    let body = if body.state == TerminalState::Running {
+                        let ended = Terminal {
+                            state: TerminalState::Exited,
+                            exit_code: None,
+                            ..body
+                        };
+                        self.inner.write(ended.clone(), false).await?;
+                        ended
+                    } else {
+                        body
+                    };
+                    self.inner.insert(body, socket);
+                }
+                // A holder that answers, or may yet: the watcher finds out which.
+                Ok(_) | Err(Unreachable::Failed(_)) => self.inner.adopt(body, socket),
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Terminals {
+    /// Stops watching. The holders keep running.
+    fn drop(&mut self) {
+        for entry in lock(&self.inner.live).values() {
+            if let Some(watcher) = lock(&entry.watcher).take() {
+                watcher.abort();
+            }
+        }
+    }
+}
+
+impl Inner {
+    async fn start(
+        self: Arc<Self>,
         workspace: WorkspaceId,
         cwd: &Path,
         argv: &[String],
@@ -124,8 +276,8 @@ impl Terminals {
             exit_code: None,
         };
         // Written first, so a daemon that stops before the holder is up leaves a record that
-        // `reattach_all` closes.
-        self.shared.write(&body, false)?;
+        // `reattach_all` finds with no socket.
+        self.write(body.clone(), false).await?;
         let socket = self.socket(id);
         let env_file = self.dir.join(format!("{id}.env"));
         let started = self.launch(&socket, cwd, &env_file, argv, env).await;
@@ -136,114 +288,127 @@ impl Terminals {
                 state: TerminalState::Exited,
                 ..body
             };
-            self.shared.write(&ended, true)?;
+            self.write(ended, true).await?;
             return Err(TerminalError::Start { id, reason });
         }
         self.adopt(body, socket);
         Ok(id)
     }
 
-    /// The terminal's kept screen and scrollback, then its live bytes. The stream ends when
-    /// the child exits or the holder goes away.
-    pub async fn attach(
-        &self,
-        id: TerminalId,
-    ) -> Result<(Snapshot, BoxStream<'static, Bytes>), TerminalError> {
-        let entry = self.shared.entry(id)?;
-        let mut stream = UnixStream::connect(&entry.socket)
-            .await
-            .map_err(|e| TerminalError::holder(id, e))?;
-        protocol::write_request(&mut stream, &Request::Attach)
-            .await
-            .map_err(|e| TerminalError::holder(id, e))?;
-        let snapshot = match protocol::read_reply(&mut stream).await {
-            Ok(Some(Reply::Snapshot { start, bytes })) => Snapshot { start, bytes },
-            Ok(Some(Reply::Refused(reason))) => return Err(TerminalError::Refused { id, reason }),
-            Ok(_) => {
-                let reason = "the holder sent no snapshot".to_string();
-                return Err(TerminalError::Refused { id, reason });
-            }
-            Err(e) => return Err(TerminalError::holder(id, e)),
-        };
-        let output = futures::stream::unfold(Some(stream), |stream| async move {
-            let mut stream = stream?;
-            loop {
-                match protocol::read_reply(&mut stream).await {
-                    Ok(Some(Reply::Output(bytes))) => return Some((bytes, Some(stream))),
-                    Ok(Some(Reply::Status(ChildStatus::Running) | Reply::Snapshot { .. })) => {}
-                    // The holder sends every byte before it reports the exit.
-                    _ => return None,
-                }
-            }
-        });
-        Ok((snapshot, output.boxed()))
-    }
-
-    /// Bytes typed into the terminal.
-    pub async fn input(&self, id: TerminalId, bytes: Bytes) -> Result<(), TerminalError> {
-        self.control(id, &Request::Input(bytes)).await
-    }
-
-    pub async fn resize(&self, id: TerminalId, cols: u16, rows: u16) -> Result<(), TerminalError> {
-        self.control(id, &Request::Resize { cols, rows }).await
-    }
-
-    /// Ends the terminal: hangs up its child, stops its holder and deletes its record. A holder
-    /// that is already gone is no error.
-    pub async fn close(&self, id: TerminalId) -> Result<(), TerminalError> {
-        let entry = self
-            .shared
-            .lock_live()
-            .remove(&id)
-            .ok_or(TerminalError::Unknown(id))?;
+    async fn close(self: Arc<Self>, id: TerminalId) -> Result<(), TerminalError> {
+        let entry = self.entry(id)?;
+        {
+            // No input or resize goes to the holder while it is hung up.
+            let _control = entry.control.lock().await;
+            entry.hang_up().await?;
+        }
+        {
+            let mut live = lock(&self.live);
+            match live.get(&id) {
+                Some(held) if Arc::ptr_eq(held, &entry) => live.remove(&id),
+                // Another close got here first.
+                _ => return Err(TerminalError::Unknown(id)),
+            };
+        }
         if let Some(watcher) = lock(&entry.watcher).take() {
             watcher.abort();
         }
-        let _ = send(&entry, id, &Request::Close).await;
-        let body = Terminal {
+        let mut body = entry.body.lock().await;
+        let ended = Terminal {
             state: TerminalState::Exited,
-            ..lock(&entry.body).clone()
+            ..body.clone()
         };
-        self.shared.write(&body, true)?;
-        Ok(())
-    }
-
-    /// Attaches to every holder this machine's records name. A running terminal whose socket
-    /// is gone is recorded as exited with an unknown code. Run once at start.
-    pub async fn reattach_all(&self) -> Result<(), TerminalError> {
-        let held: Vec<Terminal> = {
-            let store = lock(&self.shared.store);
-            store
-                .since(self.shared.me, 0)?
-                .into_iter()
-                .filter_map(|record| match record {
-                    AnyRecord::Terminal(r) if !r.deleted => Some(r.body),
-                    _ => None,
-                })
-                .collect()
-        };
-        for body in held {
-            if self.shared.lock_live().contains_key(&body.id) {
-                continue;
-            }
-            let socket = self.socket(body.id);
-            if UnixStream::connect(&socket).await.is_ok() {
-                // The watcher records an exit the holder reports.
-                self.adopt(body, socket);
-            } else if body.state == TerminalState::Running {
-                let ended = Terminal {
-                    state: TerminalState::Exited,
-                    exit_code: None,
-                    ..body
-                };
-                self.shared.write(&ended, false)?;
-            }
-        }
+        self.write(ended.clone(), true).await?;
+        *body = ended;
         Ok(())
     }
 
     fn socket(&self, id: TerminalId) -> PathBuf {
         self.dir.join(format!("{id}.sock"))
+    }
+
+    fn entry(&self, id: TerminalId) -> Result<Arc<Entry>, TerminalError> {
+        lock(&self.live)
+            .get(&id)
+            .cloned()
+            .ok_or(TerminalError::Unknown(id))
+    }
+
+    fn is_live(&self, entry: &Arc<Entry>) -> bool {
+        lock(&self.live)
+            .get(&entry.id)
+            .is_some_and(|held| Arc::ptr_eq(held, entry))
+    }
+
+    /// Makes `body`'s terminal live with no watcher.
+    fn insert(&self, body: Terminal, socket: PathBuf) -> Arc<Entry> {
+        let entry = Arc::new(Entry {
+            id: body.id,
+            socket,
+            body: tokio::sync::Mutex::new(body),
+            control: tokio::sync::Mutex::new(None),
+            watcher: Mutex::new(None),
+        });
+        lock(&self.live).insert(entry.id, entry.clone());
+        entry
+    }
+
+    /// Makes `body`'s terminal live and watches its holder for the child's exit.
+    fn adopt(self: &Arc<Self>, body: Terminal, socket: PathBuf) {
+        let entry = self.insert(body, socket);
+        let watcher = tokio::spawn(watch(self.clone(), entry.clone()));
+        *lock(&entry.watcher) = Some(watcher.abort_handle());
+    }
+
+    /// Writes `body` as this machine's newest record of its terminal, on the blocking pool so a
+    /// busy store never stalls an async worker.
+    async fn write(&self, body: Terminal, deleted: bool) -> Result<(), TerminalError> {
+        let (store, me) = (self.store.clone(), self.me);
+        tokio::task::spawn_blocking(move || -> Result<(), StoreError> {
+            let mut store = lock(&store);
+            let record = Record {
+                owner: me,
+                version: store.own_next_version()?,
+                deleted,
+                body,
+            };
+            store.apply(&AnyRecord::Terminal(record), me)?;
+            Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    /// Records that a live terminal's child has exited, once. A terminal closed meanwhile keeps
+    /// its deleted record.
+    async fn exited(&self, entry: &Arc<Entry>, code: Option<i32>) {
+        let mut body = entry.body.lock().await;
+        if body.state == TerminalState::Exited || !self.is_live(entry) {
+            return;
+        }
+        let ended = Terminal {
+            state: TerminalState::Exited,
+            exit_code: code,
+            ..body.clone()
+        };
+        match self.write(ended.clone(), false).await {
+            Ok(()) => *body = ended,
+            Err(error) => {
+                tracing::warn!(terminal = %entry.id, %error, "terminal exit not recorded")
+            }
+        }
+    }
+
+    /// Removes every env file in the terminals directory. Only a `start` in progress has one.
+    fn remove_env_files(&self) {
+        let Ok(files) = std::fs::read_dir(&self.dir) else {
+            return;
+        };
+        for file in files.flatten() {
+            if file.path().extension().is_some_and(|e| e == "env") {
+                let _ = std::fs::remove_file(file.path());
+            }
+        }
     }
 
     /// Runs the holder, which returns once its socket is served. The error is the holder's own
@@ -286,135 +451,196 @@ impl Terminals {
             None => said.to_string(),
         })
     }
-
-    /// Keeps `body`'s terminal live and watches its holder for the child's exit.
-    fn adopt(&self, body: Terminal, socket: PathBuf) {
-        let id = body.id;
-        let entry = Arc::new(Entry {
-            socket,
-            body: Mutex::new(body),
-            control: tokio::sync::Mutex::new(None),
-            watcher: Mutex::new(None),
-        });
-        self.shared.lock_live().insert(id, entry.clone());
-        let watcher = tokio::spawn(watch(self.shared.clone(), id, entry.socket.clone()));
-        *lock(&entry.watcher) = Some(watcher.abort_handle());
-    }
-
-    async fn control(&self, id: TerminalId, request: &Request) -> Result<(), TerminalError> {
-        let entry = self.shared.entry(id)?;
-        send(&entry, id, request).await
-    }
 }
 
-impl Drop for Terminals {
-    /// Stops watching. The holders keep running.
-    fn drop(&mut self) {
-        for entry in self.shared.lock_live().values() {
-            if let Some(watcher) = lock(&entry.watcher).take() {
-                watcher.abort();
+impl Entry {
+    async fn connect(&self) -> Result<UnixStream, TerminalError> {
+        match connect(&self.socket).await {
+            Ok(stream) => Ok(stream),
+            Err(Unreachable::Gone { .. }) => Err(TerminalError::Gone(self.id)),
+            Err(Unreachable::Failed(e)) => Err(TerminalError::holder(self.id, e)),
+        }
+    }
+
+    /// Sends `request` on the control connection, then asks for the status, so a request the
+    /// holder refuses is an error here rather than lost. A connection that fails is dropped,
+    /// and the next request opens a new one.
+    async fn send(&self, request: &Request) -> Result<(), TerminalError> {
+        let mut control = self.control.lock().await;
+        let mut stream = match control.take() {
+            Some(stream) => stream,
+            None => self.connect().await?,
+        };
+        let answer = tokio::time::timeout(ANSWER_WITHIN, async {
+            protocol::write_request(&mut stream, request).await?;
+            protocol::write_request(&mut stream, &Request::Status).await?;
+            loop {
+                match protocol::read_reply(&mut stream).await? {
+                    Some(Reply::Status(_)) => return Ok(None),
+                    Some(Reply::Refused(reason)) => return Ok(Some(reason)),
+                    Some(_) => {}
+                    None => return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into()),
+                }
             }
+        })
+        .await;
+        match answer {
+            Ok(Ok(None)) => {
+                *control = Some(stream);
+                Ok(())
+            }
+            Ok(Ok(Some(reason))) => Err(TerminalError::Refused {
+                id: self.id,
+                reason,
+            }),
+            Ok(Err(e)) => Err(TerminalError::Holder {
+                id: self.id,
+                source: e,
+            }),
+            Err(_) => Err(TerminalError::holder(self.id, no_answer())),
+        }
+    }
+
+    /// Sends `Close` and waits for the holder to end the connection as it exits. A holder that
+    /// is gone is done; a stale socket it left is removed.
+    async fn hang_up(&self) -> Result<(), TerminalError> {
+        let mut stream = match connect(&self.socket).await {
+            Ok(stream) => stream,
+            Err(Unreachable::Gone { stale }) => {
+                if stale {
+                    let _ = std::fs::remove_file(&self.socket);
+                }
+                return Ok(());
+            }
+            Err(Unreachable::Failed(e)) => return Err(TerminalError::holder(self.id, e)),
+        };
+        let answer = tokio::time::timeout(ANSWER_WITHIN, async {
+            protocol::write_request(&mut stream, &Request::Close).await?;
+            loop {
+                match protocol::read_reply(&mut stream).await? {
+                    None => return Ok::<_, protocol::Error>(None),
+                    Some(Reply::Refused(reason)) => return Ok(Some(reason)),
+                    Some(_) => {}
+                }
+            }
+        })
+        .await;
+        match answer {
+            Ok(Ok(None)) => Ok(()),
+            Ok(Ok(Some(reason))) => Err(TerminalError::Refused {
+                id: self.id,
+                reason,
+            }),
+            Ok(Err(e)) => Err(TerminalError::Holder {
+                id: self.id,
+                source: e,
+            }),
+            Err(_) => Err(TerminalError::holder(self.id, no_answer())),
         }
     }
 }
 
-impl Shared {
-    fn lock_live(&self) -> MutexGuard<'_, HashMap<TerminalId, Arc<Entry>>> {
-        lock(&self.live)
-    }
+fn no_answer() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!(
+            "the holder did not answer within {} seconds",
+            ANSWER_WITHIN.as_secs()
+        ),
+    )
+}
 
-    fn entry(&self, id: TerminalId) -> Result<Arc<Entry>, TerminalError> {
-        self.lock_live()
-            .get(&id)
-            .cloned()
-            .ok_or(TerminalError::Unknown(id))
-    }
+/// Why a holder's socket could not be connected to.
+enum Unreachable {
+    /// No holder serves it: the socket is missing, or `stale`, a file nothing listens on.
+    Gone { stale: bool },
+    /// Something else, which may pass.
+    Failed(io::Error),
+}
 
-    /// Writes `body` as this machine's newest record of its terminal.
-    fn write(&self, body: &Terminal, deleted: bool) -> Result<(), StoreError> {
-        let mut store = lock(&self.store);
-        let record = Record {
-            owner: self.me,
-            version: store.own_next_version()?,
-            deleted,
-            body: body.clone(),
-        };
-        store.apply(&AnyRecord::Terminal(record), self.me)?;
-        Ok(())
-    }
-
-    /// Records that a live terminal's child has exited, once. A terminal closed meanwhile keeps
-    /// its deleted record.
-    fn exited(&self, id: TerminalId, code: Option<i32>) {
-        let live = self.lock_live();
-        let Some(entry) = live.get(&id) else {
-            return;
-        };
-        let mut body = lock(&entry.body);
-        if body.state == TerminalState::Exited {
-            return;
-        }
-        let ended = Terminal {
-            state: TerminalState::Exited,
-            exit_code: code,
-            ..body.clone()
-        };
-        match self.write(&ended, false) {
-            Ok(()) => *body = ended,
-            Err(error) => tracing::warn!(terminal = %id, %error, "terminal exit not recorded"),
+async fn connect(socket: &Path) -> Result<UnixStream, Unreachable> {
+    let mut refusals = 0;
+    loop {
+        match UnixStream::connect(socket).await {
+            Ok(stream) => return Ok(stream),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Err(Unreachable::Gone { stale: false });
+            }
+            Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
+                refusals += 1;
+                if refusals == REFUSALS_FOR_GONE {
+                    return Err(Unreachable::Gone { stale: true });
+                }
+                tokio::time::sleep(REFUSAL_RETRY).await;
+            }
+            Err(e) => return Err(Unreachable::Failed(e)),
         }
     }
 }
 
-/// Sends `request` on the entry's control connection. The holder may have dropped a held
-/// connection since its last use, so a failed write is tried once more on a new one.
-async fn send(entry: &Entry, id: TerminalId, request: &Request) -> Result<(), TerminalError> {
-    let mut control = entry.control.lock().await;
-    if let Some(stream) = control.as_mut()
-        && protocol::write_request(stream, request).await.is_ok()
-    {
-        return Ok(());
-    }
-    *control = None;
-    let mut stream = UnixStream::connect(&entry.socket)
-        .await
-        .map_err(|e| TerminalError::holder(id, e))?;
-    protocol::write_request(&mut stream, request)
-        .await
-        .map_err(|e| TerminalError::holder(id, e))?;
-    *control = Some(stream);
-    Ok(())
+/// What one attached connection to a holder ended with.
+enum Followed {
+    Exited(Option<i32>),
+    /// The holder ended the connection with the child still running: it cut this client off.
+    Ended,
+    Trouble(String),
 }
 
 /// Stays attached to a terminal's holder until it reports the child's exit or its socket is
-/// gone, and records which. A holder that drops the connection while running is attached again.
-async fn watch(shared: Arc<Shared>, id: TerminalId, socket: PathBuf) {
+/// gone, and records which. A holder that drops the connection is attached to again; one that
+/// refuses or cannot be reached is tried again less and less often, and said so once.
+async fn watch(inner: Arc<Inner>, entry: Arc<Entry>) {
+    let mut wait = RECONNECT_AFTER;
+    let mut warned = false;
     loop {
-        let Ok(mut stream) = UnixStream::connect(&socket).await else {
-            shared.exited(id, None);
-            return;
-        };
-        if protocol::write_request(&mut stream, &Request::Attach)
-            .await
-            .is_ok()
-        {
-            loop {
-                match protocol::read_reply(&mut stream).await {
-                    Ok(Some(Reply::Status(ChildStatus::Exited(code)))) => {
-                        shared.exited(id, (code != UNKNOWN_EXIT).then_some(code));
-                        return;
-                    }
-                    Ok(Some(_)) => {}
-                    Ok(None) | Err(_) => break,
+        let trouble = match connect(&entry.socket).await {
+            Err(Unreachable::Gone { .. }) => {
+                inner.exited(&entry, None).await;
+                return;
+            }
+            Err(Unreachable::Failed(e)) => Some(e.to_string()),
+            Ok(stream) => match follow(stream).await {
+                Followed::Exited(code) => {
+                    inner.exited(&entry, code).await;
+                    return;
                 }
+                Followed::Ended => None,
+                Followed::Trouble(trouble) => Some(trouble),
+            },
+        };
+        match trouble {
+            None => wait = RECONNECT_AFTER,
+            Some(trouble) => {
+                if !warned {
+                    tracing::warn!(terminal = %entry.id, %trouble, "terminal holder not watched; trying again");
+                    warned = true;
+                }
+                wait = (wait * 2).min(RECONNECT_AT_MOST);
             }
         }
-        tokio::time::sleep(RECONNECT_AFTER).await;
+        tokio::time::sleep(wait).await;
+    }
+}
+
+async fn follow(mut stream: UnixStream) -> Followed {
+    if let Err(e) = protocol::write_request(&mut stream, &Request::Attach).await {
+        return Followed::Trouble(e.to_string());
+    }
+    loop {
+        match protocol::read_reply(&mut stream).await {
+            Ok(Some(Reply::Status(ChildStatus::Exited(code)))) => {
+                return Followed::Exited((code != UNKNOWN_EXIT).then_some(code));
+            }
+            Ok(Some(Reply::Refused(reason))) => return Followed::Trouble(reason),
+            Ok(Some(_)) => {}
+            Ok(None) => return Followed::Ended,
+            Err(e) => return Followed::Trouble(e.to_string()),
+        }
     }
 }
 
 /// Locks `mutex`, taking the value a panicked holder of the lock left: every value kept under
-/// these locks is whole between statements.
+/// these locks is whole between statements, and SQLite rolls back a transaction a panic cut.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -427,7 +653,6 @@ mod tests {
     use foundry_holder::protocol::{MAX_PENDING_INPUT, Request};
     use foundry_proto::record::{AnyRecord, Record};
     use foundry_proto::state::TerminalState;
-    use futures::StreamExt as _;
     use tempfile::TempDir;
 
     use super::*;
@@ -628,7 +853,10 @@ mod tests {
             (id, snapshot.start, seen)
         });
         drop(first);
-        assert_eq!(start, 0, "a new terminal's snapshot starts at its first byte");
+        assert_eq!(
+            start, 0,
+            "a new terminal's snapshot starts at its first byte"
+        );
         let first_count = counts(&seen).len() as u32;
         assert!(first_count < COUNT_TO, "the counter must still be running");
 
@@ -672,11 +900,20 @@ mod tests {
         let setup = Setup::new();
         let (terminals, _) = setup.daemon();
         let last = 10_499;
+        // The child waits for a line, so the first attach sees its output from the start.
         let id = setup
-            .start(&terminals, &format!("seq 0 {last}; sleep 60"))
+            .start(
+                &terminals,
+                &format!("stty -echo; read go; seq 0 {last}; sleep 60"),
+            )
             .await;
-        let (_, mut stream) = terminals.attach(id).await.unwrap();
-        let mut seen = Vec::new();
+        let (snapshot, mut stream) = terminals.attach(id).await.unwrap();
+        assert_eq!(snapshot.start, 0);
+        let mut seen = snapshot.bytes.to_vec();
+        terminals
+            .input(id, Bytes::from_static(b"\n"))
+            .await
+            .unwrap();
         let tail = format!("\n{last}\r\n");
         read_until(&mut stream, &mut seen, |seen| {
             contains(seen, tail.as_bytes())
@@ -688,8 +925,12 @@ mod tests {
         let first = kept[0];
         assert!(first > 0, "the scrollback kept every line");
         assert_eq!(kept, (first..=last).collect::<Vec<_>>());
-        let before: u64 = (0..first).map(|n| n.to_string().len() as u64 + 2).sum();
-        assert_eq!(snapshot.start, before);
+        let start = usize::try_from(snapshot.start).unwrap();
+        assert_eq!(
+            seen.get(start..start + snapshot.bytes.len()),
+            Some(&snapshot.bytes[..]),
+            "the snapshot is the stream's bytes from its start"
+        );
         terminals.close(id).await.unwrap();
     }
 
@@ -920,9 +1161,17 @@ mod tests {
             "{:?}",
             String::from_utf8_lossy(&seen)
         );
-        assert_eq!(setup.left(), vec![format!("{id}.sock")], "only the socket is left");
+        assert_eq!(
+            setup.left(),
+            vec![format!("{id}.sock")],
+            "only the socket is left"
+        );
         let mode = std::fs::metadata(setup.dir()).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o700, "the terminals directory is this user's only");
+        assert_eq!(
+            mode & 0o777,
+            0o700,
+            "the terminals directory is this user's only"
+        );
         terminals.close(id).await.unwrap();
     }
 
@@ -934,7 +1183,10 @@ mod tests {
         terminals.close(id).await.unwrap();
         let record = held(&store, setup.me, id).unwrap();
         assert!(record.deleted);
-        assert!(!setup.socket(id).exists(), "close waits for the holder to end");
+        assert!(
+            !setup.socket(id).exists(),
+            "close waits for the holder to end"
+        );
         assert!(matches!(
             terminals.attach(id).await,
             Err(TerminalError::Unknown(gone)) if gone == id
@@ -965,12 +1217,8 @@ mod tests {
     async fn a_start_whose_caller_goes_away_still_finishes() {
         let setup = Setup::new();
         let (terminals, store) = setup.daemon();
-        let started = terminals.start(
-            WorkspaceId::random(),
-            setup.cwd.path(),
-            &argv("sleep 60"),
-            &[],
-        );
+        let sleep = argv("sleep 60");
+        let started = terminals.start(WorkspaceId::random(), setup.cwd.path(), &sleep, &[]);
         // Polled until the holder is being started, then dropped.
         let _ = tokio::time::timeout(Duration::from_millis(5), started).await;
         let id = {
@@ -982,7 +1230,10 @@ mod tests {
             record.body.id
         };
         until("the holder's socket", || setup.socket(id).exists()).await;
-        until("the terminal to be live", || terminals.inner.entry(id).is_ok()).await;
+        until("the terminal to be live", || {
+            terminals.inner.entry(id).is_ok()
+        })
+        .await;
         terminals.close(id).await.unwrap();
         assert!(held(&store, setup.me, id).unwrap().deleted);
     }
@@ -993,7 +1244,11 @@ mod tests {
         let secret = "sk-not-for-any-message";
         let env = [("ANTHROPIC_AUTH_TOKEN".to_string(), secret.to_string())];
         for (holder, argv, says) in [
-            (holder(), vec!["/no/such/program".to_string()], "/no/such/program"),
+            (
+                holder(),
+                vec!["/no/such/program".to_string()],
+                "/no/such/program",
+            ),
             (
                 PathBuf::from("/no/such/foundry-holder"),
                 argv("true"),
