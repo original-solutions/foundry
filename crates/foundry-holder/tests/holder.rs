@@ -411,23 +411,30 @@ async fn killing_the_starter_leaves_the_child_running() {
         .chain(args)
         .map(|arg| format!("'{arg}'"))
         .collect();
+    // The marker is made once the holder's starter has exited 0, which it does only after it read
+    // the ready message, so the holder is serving by then. Killing the starter any earlier could
+    // reach a holder that has not written it yet, and that holder would give up.
+    let heard = dir.path().join("heard");
     let mut starter = Command::new("sh")
         .arg("-c")
-        .arg(format!("{} && sleep 60", quoted.join(" ")))
+        .arg(format!(
+            "{} && touch '{}' && sleep 60",
+            quoted.join(" "),
+            heard.display()
+        ))
         .process_group(0)
         .spawn()
         .unwrap();
     let deadline = Instant::now() + WAIT;
-    while !socket.exists() {
+    while !heard.exists() {
         assert!(
             Instant::now() < deadline,
-            "the holder never made its socket"
+            "the starter never heard the holder was ready"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let holder = Holder { dir, socket };
-    // Wait until the starter is back to its own sleep, then kill its whole process group.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // The starter is back to its own sleep: kill its whole process group.
     let group = nix::unistd::Pid::from_raw(i32::try_from(starter.id()).unwrap());
     nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL).unwrap();
     starter.wait().unwrap();
