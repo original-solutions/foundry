@@ -573,6 +573,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use std::io;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -583,137 +584,239 @@ mod tests {
     use tokio::time::timeout;
 
     use super::*;
-    use crate::secrets::{MemorySecrets, Secrets};
+    use crate::secrets::{MemorySecrets, Secrets, SecretsError};
     use crate::store::Store;
     use crate::sync::{Conn, Dialer, Peers};
 
-    fn keys() -> (Arc<MemorySecrets>, Keys) {
-        let secrets = Arc::new(MemorySecrets::default());
-        let keys = Keys::load(secrets.clone()).unwrap();
-        (secrets, keys)
+    /// A machine's keys over a fresh in-memory secret store.
+    fn machine_keys() -> Keys {
+        Keys::open(Arc::new(MemorySecrets::default())).unwrap()
     }
 
-    /// A machine that joined through `keys` with a fresh code.
-    fn joined(keys: &Keys) -> Identity {
-        let code = keys.new_code();
-        keys.redeem(&code.to_string()).unwrap()
+    /// `host` admits `peer` with a fresh code, as `foundryd join` does.
+    fn admit(host: &Keys, peer: &Keys) {
+        let code = host.new_code().unwrap().to_string();
+        host.redeem(&code, peer.me(), &peer.public_key()).unwrap();
     }
+
+    /// Two machines that hold each other's key, as they will once keys reach every machine.
+    fn pair() -> (Keys, Keys) {
+        let (a, b) = (machine_keys(), machine_keys());
+        admit(&a, &b);
+        admit(&b, &a);
+        (a, b)
+    }
+
+    /// A secret store whose writes fail while `failing` is set.
+    #[derive(Default)]
+    struct Flaky {
+        inner: MemorySecrets,
+        failing: AtomicBool,
+    }
+
+    impl Secrets for Flaky {
+        fn get(&self, name: &str) -> Result<Option<String>, SecretsError> {
+            self.inner.get(name)
+        }
+        fn set(&self, name: &str, value: &str) -> Result<(), SecretsError> {
+            if self.failing.load(Ordering::SeqCst) {
+                return Err(SecretsError::Keychain {
+                    action: "store",
+                    name: name.to_owned(),
+                    reason: "test".into(),
+                });
+            }
+            self.inner.set(name, value)
+        }
+    }
+
+    // ---- codes and keys ----
 
     #[tokio::test(start_paused = true)]
     async fn a_code_works_once() {
-        let (_, keys) = keys();
-        let code = keys.new_code().to_string();
-        let identity = keys.redeem(&code).unwrap();
-        assert_eq!(keys.check(identity.machine, Some(&identity.key)), Ok(()));
-        assert!(matches!(keys.redeem(&code), Err(JoinError::BadCode)));
+        let (host, peer, other) = (machine_keys(), machine_keys(), machine_keys());
+        let code = host.new_code().unwrap().to_string();
+        host.redeem(&code, peer.me(), &peer.public_key()).unwrap();
+        assert_eq!(host.state(peer.me()), KeyState::Active);
+        let again = host.redeem(&code, other.me(), &other.public_key());
+        assert!(matches!(again, Err(JoinError::BadCode)), "{again:?}");
+        assert_eq!(host.state(other.me()), KeyState::NoKey);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_machine_that_used_a_code_may_send_it_again_when_the_answer_was_lost() {
+        let (host, peer) = (machine_keys(), machine_keys());
+        let code = host.new_code().unwrap().to_string();
+        host.redeem(&code, peer.me(), &peer.public_key()).unwrap();
+        host.redeem(&code, peer.me(), &peer.public_key()).unwrap();
+        assert_eq!(host.state(peer.me()), KeyState::Active);
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_code_works_for_ten_minutes_and_not_after() {
-        let (_, keys) = keys();
-        let early = keys.new_code().to_string();
-        let late = keys.new_code().to_string();
+        let (host, early, late) = (machine_keys(), machine_keys(), machine_keys());
+        let early_code = host.new_code().unwrap().to_string();
+        let late_code = host.new_code().unwrap().to_string();
         tokio::time::advance(CODE_VALID_FOR - Duration::from_secs(1)).await;
-        assert!(keys.redeem(&early).is_ok());
+        host.redeem(&early_code, early.me(), &early.public_key())
+            .unwrap();
         tokio::time::advance(Duration::from_secs(1)).await;
-        assert!(matches!(keys.redeem(&late), Err(JoinError::BadCode)));
+        let expired = host.redeem(&late_code, late.me(), &late.public_key());
+        assert!(matches!(expired, Err(JoinError::BadCode)), "{expired:?}");
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_code_typed_in_lower_case_with_spaces_around_it_works() {
-        let (_, keys) = keys();
-        let code = keys.new_code().to_string();
-        assert!(keys.redeem(&format!(" {} ", code.to_lowercase())).is_ok());
+        let (host, peer) = (machine_keys(), machine_keys());
+        let code = host.new_code().unwrap().to_string();
+        let typed = format!(" {} ", code.to_lowercase());
+        host.redeem(&typed, peer.me(), &peer.public_key()).unwrap();
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_code_never_issued_is_refused() {
-        let (_, keys) = keys();
-        keys.new_code();
-        assert!(matches!(keys.redeem("ABCDEFGHJK"), Err(JoinError::BadCode)));
-        assert!(matches!(keys.redeem(""), Err(JoinError::BadCode)));
+        let (host, peer) = (machine_keys(), machine_keys());
+        host.new_code().unwrap();
+        for wrong in ["ABCDEFGHJK", ""] {
+            let refused = host.redeem(wrong, peer.me(), &peer.public_key());
+            assert!(matches!(refused, Err(JoinError::BadCode)), "{wrong}");
+        }
     }
 
     #[tokio::test(start_paused = true)]
-    async fn codes_and_keys_differ_each_time() {
-        let (_, keys) = keys();
-        assert_ne!(keys.new_code().to_string(), keys.new_code().to_string());
-        let (a, b) = (joined(&keys), joined(&keys));
-        assert_ne!(a.machine, b.machine);
-        assert_eq!(keys.check(a.machine, Some(&b.key)), Err(Refused::WrongKey));
+    async fn codes_and_machines_differ_each_time() {
+        let host = machine_keys();
+        let codes: Vec<String> = (0..20)
+            .map(|_| host.new_code().unwrap().to_string())
+            .collect();
+        for code in &codes {
+            assert_eq!(code.len(), 10, "{code}");
+            assert!(code.bytes().all(|b| CODE_LETTERS.contains(&b)), "{code}");
+        }
+        let distinct: std::collections::BTreeSet<_> = codes.iter().collect();
+        assert_eq!(distinct.len(), codes.len());
+        let (a, b) = (machine_keys(), machine_keys());
+        assert_ne!(a.me(), b.me());
+        assert_ne!(a.public_key().0, b.public_key().0);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_machine_is_refused_without_a_key_with_a_wrong_one_or_unknown() {
-        let (_, keys) = keys();
-        let identity = joined(&keys);
-        let other = joined(&keys);
-        assert_eq!(keys.check(identity.machine, None), Err(Refused::NoKey));
-        assert_eq!(
-            keys.check(identity.machine, Some(&other.key)),
-            Err(Refused::WrongKey)
-        );
-        assert_eq!(
-            keys.check(MachineId::random(), Some(&identity.key)),
-            Err(Refused::Unknown)
-        );
-        assert_eq!(keys.state(MachineId::random()), KeyState::NoKey);
+    async fn a_code_cannot_claim_a_machine_this_one_already_holds() {
+        let (host, peer, thief) = (machine_keys(), machine_keys(), machine_keys());
+        admit(&host, &peer);
+        for taken in [peer.me(), host.me()] {
+            let code = host.new_code().unwrap().to_string();
+            let claimed = host.redeem(&code, taken, &thief.public_key());
+            assert!(matches!(claimed, Err(JoinError::Taken(_))), "{claimed:?}");
+        }
+        host.revoke(peer.me()).unwrap();
+        let code = host.new_code().unwrap().to_string();
+        let rejoined = host.redeem(&code, peer.me(), &peer.public_key());
+        assert!(matches!(rejoined, Err(JoinError::Taken(_))), "{rejoined:?}");
+        assert_eq!(host.state(peer.me()), KeyState::Revoked);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_revoked_machine_is_refused_and_shown_as_revoked() {
-        let (_, keys) = keys();
-        let identity = joined(&keys);
-        assert_eq!(keys.state(identity.machine), KeyState::Active);
-        keys.revoke(identity.machine).unwrap();
-        assert_eq!(keys.state(identity.machine), KeyState::Revoked);
-        assert_eq!(
-            keys.check(identity.machine, Some(&identity.key)),
-            Err(Refused::Revoked)
-        );
+    async fn a_revoked_machine_is_shown_as_revoked() {
+        let (host, peer) = (machine_keys(), machine_keys());
+        admit(&host, &peer);
+        assert_eq!(host.state(peer.me()), KeyState::Active);
+        host.revoke(peer.me()).unwrap();
+        assert_eq!(host.state(peer.me()), KeyState::Revoked);
+        assert_eq!(host.state(MachineId::random()), KeyState::NoKey);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn keys_and_revocations_survive_a_restart() {
-        let (secrets, keys) = keys();
-        let kept = joined(&keys);
-        let revoked = joined(&keys);
-        keys.revoke(revoked.machine).unwrap();
-        let again = Keys::load(secrets).unwrap();
-        assert_eq!(again.check(kept.machine, Some(&kept.key)), Ok(()));
-        assert_eq!(again.state(revoked.machine), KeyState::Revoked);
+    async fn a_machine_keeps_its_identity_keys_and_revocations_across_a_restart() {
+        let secrets = Arc::new(MemorySecrets::default());
+        let host = Keys::open(secrets.clone()).unwrap();
+        let (kept, revoked) = (machine_keys(), machine_keys());
+        admit(&host, &kept);
+        admit(&host, &revoked);
+        host.revoke(revoked.me()).unwrap();
+        let again = Keys::open(secrets).unwrap();
+        assert_eq!(again.me(), host.me());
+        assert_eq!(again.public_key().0, host.public_key().0);
+        assert_eq!(again.state(again.me()), KeyState::Active);
+        assert_eq!(again.state(kept.me()), KeyState::Active);
+        assert_eq!(again.state(revoked.me()), KeyState::Revoked);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_key_or_code_never_shows_in_debug_output() {
-        let (secrets, keys) = keys();
-        let code = keys.new_code();
+    async fn the_first_machine_holds_its_own_key() {
+        let founder = machine_keys();
+        assert_eq!(founder.state(founder.me()), KeyState::Active);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_save_admits_nobody_and_leaves_the_code_unspent() {
+        let flaky = Arc::new(Flaky::default());
+        let host = Keys::open(flaky.clone()).unwrap();
+        let peer = machine_keys();
+        let code = host.new_code().unwrap().to_string();
+        flaky.failing.store(true, Ordering::SeqCst);
+        let failed = host.redeem(&code, peer.me(), &peer.public_key());
+        assert!(matches!(failed, Err(JoinError::Secrets(_))), "{failed:?}");
+        assert_eq!(host.state(peer.me()), KeyState::NoKey);
+        flaky.failing.store(false, Ordering::SeqCst);
+        host.redeem(&code, peer.me(), &peer.public_key()).unwrap();
+        assert_eq!(host.state(peer.me()), KeyState::Active);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_save_leaves_a_machine_unrevoked() {
+        let flaky = Arc::new(Flaky::default());
+        let host = Keys::open(flaky.clone()).unwrap();
+        let peer = machine_keys();
+        admit(&host, &peer);
+        flaky.failing.store(true, Ordering::SeqCst);
+        assert!(host.revoke(peer.me()).is_err());
+        assert_eq!(host.state(peer.me()), KeyState::Active);
+        let reopened = Keys::open(flaky.clone()).unwrap();
+        assert_eq!(reopened.state(peer.me()), KeyState::Active);
+    }
+
+    #[test]
+    fn machines_admitted_at_the_same_time_are_all_kept() {
+        let secrets = Arc::new(MemorySecrets::default());
+        let host = Keys::open(secrets.clone()).unwrap();
+        let peers: Vec<Keys> = (0..16).map(|_| machine_keys()).collect();
+        let codes: Vec<String> = peers
+            .iter()
+            .map(|_| host.new_code().unwrap().to_string())
+            .collect();
+        std::thread::scope(|scope| {
+            for (peer, code) in peers.iter().zip(&codes) {
+                let host = host.clone();
+                scope.spawn(move || host.redeem(code, peer.me(), &peer.public_key()).unwrap());
+            }
+        });
+        let reopened = Keys::open(secrets).unwrap();
+        for peer in &peers {
+            assert_eq!(reopened.state(peer.me()), KeyState::Active);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_private_key_or_code_never_shows_in_debug_output() {
+        let secrets = Arc::new(MemorySecrets::default());
+        let keys = Keys::open(secrets.clone()).unwrap();
+        let code = keys.new_code().unwrap();
         assert!(!format!("{code:?}").contains(&code.to_string()));
-        let identity = keys.redeem(&code.to_string()).unwrap();
-        let stored = secrets.get(KEYS_SECRET).unwrap().unwrap();
-        let key: serde_json::Value = serde_json::from_str(&stored).unwrap();
-        let key = key[identity.machine.to_string()]["key"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        assert!(key.len() >= 32, "{key}");
-        assert!(!format!("{identity:?}").contains(&key));
-        assert!(!format!("{:?}", identity.key).contains(&key));
+        let stored: serde_json::Value =
+            serde_json::from_str(&secrets.get(IDENTITY_SECRET).unwrap().unwrap()).unwrap();
+        let private = stored["key"].as_str().unwrap().to_owned();
+        assert!(private.len() >= 64, "{private}");
+        let identity = Identity::load_or_create(&*secrets).unwrap();
+        assert!(!format!("{identity:?}").contains(&private));
+        let table = secrets.get(KEYS_SECRET).unwrap().unwrap();
+        assert!(
+            !table.contains(&private),
+            "the key table holds a private key"
+        );
     }
 
     // ---- peer links ----
-
-    /// A dialer that hands out the near end of a fresh pair and keeps the far end for the test.
-    #[derive(Default)]
-    struct Pairs(Mutex<Vec<Conn>>);
-
-    impl Dialer for Pairs {
-        fn dial(&self, _peer: &Machine) -> BoxFuture<'static, io::Result<Conn>> {
-            let (near, far) = Conn::pair();
-            self.0.lock().unwrap().push(far);
-            Box::pin(async move { Ok(near) })
-        }
-    }
 
     fn machine(id: MachineId) -> Machine {
         Machine {
@@ -737,6 +840,70 @@ mod tests {
         (dir, peers)
     }
 
+    /// A dialer that hands out the near end of a fresh pair and keeps the far end for the test.
+    #[derive(Default)]
+    struct Pairs(Mutex<Vec<Conn>>);
+
+    impl Dialer for Pairs {
+        fn dial(&self, _peer: &Machine) -> BoxFuture<'static, io::Result<Conn>> {
+            let (near, far) = Conn::pair();
+            self.0.lock().unwrap().push(far);
+            Box::pin(async move { Ok(near) })
+        }
+    }
+
+    /// A dialer whose links are served by another machine's [`Keys::accept`].
+    struct Direct {
+        keys: Keys,
+        peers: Peers,
+    }
+
+    impl Dialer for Direct {
+        fn dial(&self, _peer: &Machine) -> BoxFuture<'static, io::Result<Conn>> {
+            let (near, far) = Conn::pair();
+            let (keys, peers) = (self.keys.clone(), self.peers.clone());
+            tokio::spawn(async move { keys.accept(&peers, far).await });
+            Box::pin(async move { Ok(near) })
+        }
+    }
+
+    /// `host` serving links, with `others` in its machine list.
+    struct Host {
+        keys: Keys,
+        peers: Peers,
+        _dir: tempfile::TempDir,
+    }
+
+    fn host(keys: &Keys, others: &[MachineId]) -> Host {
+        let (dir, peers) = peers(keys.me(), others);
+        Host {
+            keys: keys.clone(),
+            peers,
+            _dir: dir,
+        }
+    }
+
+    impl Host {
+        /// `from` dialing this host through its [`KeyedDialer`].
+        async fn dialed_by(&self, from: &Keys) -> io::Result<Conn> {
+            let direct = Direct {
+                keys: self.keys.clone(),
+                peers: self.peers.clone(),
+            };
+            KeyedDialer::new(Arc::new(direct), from.clone())
+                .dial(&machine(self.keys.me()))
+                .await
+        }
+
+        /// A raw link into this host, for a test that speaks the handshake itself.
+        fn raw(&self) -> Conn {
+            let (near, far) = Conn::pair();
+            let (keys, peers) = (self.keys.clone(), self.peers.clone());
+            tokio::spawn(async move { keys.accept(&peers, far).await });
+            near
+        }
+    }
+
     fn hello(machine: MachineId) -> String {
         serde_json::to_string(&PeerMessage::Hello {
             protocol: PROTOCOL,
@@ -746,17 +913,8 @@ mod tests {
         .unwrap()
     }
 
-    /// Opens a link to `keys`' machine as a peer that sends `first`, then a hello naming
-    /// `named`, and returns the peer's end.
-    async fn open(keys: &Keys, peers: &Peers, first: Option<String>, named: MachineId) -> Conn {
-        let (near, far) = Conn::pair();
-        let (keys, peers) = (keys.clone(), peers.clone());
-        tokio::spawn(async move { keys.accept(&peers, near).await });
-        if let Some(first) = first {
-            far.send.send(first).await.unwrap();
-        }
-        far.send.send(hello(named)).await.unwrap();
-        far
+    fn is_hello(text: &str) -> bool {
+        matches!(serde_json::from_str(text), Ok(PeerMessage::Hello { .. }))
     }
 
     /// The next message on `conn`, or `None` once the link is closed.
@@ -766,111 +924,217 @@ mod tests {
             .expect("the link neither answered nor closed")
     }
 
-    /// Waits for the link to close, skipping heartbeats.
+    /// Waits up to 5 seconds for the link to close, skipping what it carries.
     async fn closed(conn: &mut Conn) {
-        while next(conn).await.is_some() {}
+        timeout(Duration::from_secs(5), async {
+            while conn.recv.recv().await.is_some() {}
+        })
+        .await
+        .expect("the link is still open");
     }
 
-    fn is_hello(text: &str) -> bool {
-        matches!(serde_json::from_str(text), Ok(PeerMessage::Hello { .. }))
+    /// Sends a hello and waits for the host's, so the link is known to be served.
+    async fn served(conn: &mut Conn, me: MachineId) {
+        conn.send.send(hello(me)).await.unwrap();
+        let answer = next(conn).await.expect("the link was refused");
+        assert!(is_hello(&answer), "{answer}");
+    }
+
+    fn send(conn: &Conn, message: &Handshake) -> impl Future<Output = ()> + '_ {
+        let text = serde_json::to_string(message).unwrap();
+        async move { conn.send.send(text).await.unwrap() }
+    }
+
+    async fn read(conn: &mut Conn) -> Handshake {
+        serde_json::from_str(&next(conn).await.expect("the link closed")).unwrap()
     }
 
     #[tokio::test]
-    async fn a_link_with_a_good_key_is_served() {
-        let (_, keys) = keys();
-        let peer = joined(&keys);
-        let me = MachineId::random();
-        let (_dir, peers) = peers(me, &[peer.machine]);
-        let mut far = open(&keys, &peers, Some(key_message(&peer)), peer.machine).await;
-        let answer = next(&mut far).await.expect("the link was refused");
-        assert!(is_hello(&answer), "{answer}");
+    async fn a_link_between_machines_that_hold_each_others_keys_is_served() {
+        let (h, p) = pair();
+        let host = host(&h, &[p.me()]);
+        let mut conn = host.dialed_by(&p).await.unwrap();
+        served(&mut conn, p.me()).await;
+        let heartbeat = next(&mut conn).await.expect("the link closed");
+        assert!(!is_hello(&heartbeat), "{heartbeat}");
     }
 
     #[tokio::test]
     async fn a_link_with_no_key_is_refused() {
-        let (_, keys) = keys();
-        let peer = joined(&keys);
-        let (_dir, peers) = peers(MachineId::random(), &[peer.machine]);
-        let mut far = open(&keys, &peers, None, peer.machine).await;
-        assert_eq!(next(&mut far).await, None);
+        let (h, p) = pair();
+        let host = host(&h, &[p.me()]);
+        let mut conn = host.raw();
+        conn.send.send(hello(p.me())).await.unwrap();
+        closed(&mut conn).await;
+        assert!(!host.peers.online().contains(&p.me()));
     }
 
     #[tokio::test]
-    async fn a_link_with_a_revoked_key_is_refused() {
-        let (_, keys) = keys();
-        let peer = joined(&keys);
-        keys.revoke(peer.machine).unwrap();
-        let (_dir, peers) = peers(MachineId::random(), &[peer.machine]);
-        let mut far = open(&keys, &peers, Some(key_message(&peer)), peer.machine).await;
-        assert_eq!(next(&mut far).await, None);
-        assert!(!peers.online().contains(&peer.machine));
+    async fn a_link_from_a_revoked_machine_is_refused_and_it_shows_as_revoked() {
+        let (h, p) = pair();
+        h.revoke(p.me()).unwrap();
+        let host = host(&h, &[p.me()]);
+        assert!(host.dialed_by(&p).await.is_err());
+        assert_eq!(h.state(p.me()), KeyState::Revoked);
+        assert!(!host.peers.online().contains(&p.me()));
     }
 
     #[tokio::test]
-    async fn a_key_that_proves_one_machine_cannot_open_a_link_as_another() {
-        let (_, keys) = keys();
-        let (a, b) = (joined(&keys), joined(&keys));
-        let (_dir, peers) = peers(MachineId::random(), &[a.machine, b.machine]);
-        let mut far = open(&keys, &peers, Some(key_message(&a)), b.machine).await;
-        assert_eq!(next(&mut far).await, None);
+    async fn a_link_from_a_machine_this_one_holds_no_key_for_is_refused() {
+        let (h, p) = (machine_keys(), machine_keys());
+        admit(&p, &h);
+        let host = host(&h, &[p.me()]);
+        assert!(host.dialed_by(&p).await.is_err());
     }
 
     #[tokio::test]
-    async fn an_open_link_closes_when_its_machine_is_revoked() {
-        let (_, keys) = keys();
-        let peer = joined(&keys);
-        let (_dir, peers) = peers(MachineId::random(), &[peer.machine]);
-        let mut far = open(&keys, &peers, Some(key_message(&peer)), peer.machine).await;
-        assert!(next(&mut far).await.is_some());
-        let heartbeat = next(&mut far)
-            .await
-            .expect("the link closed before the revoke");
-        assert!(!is_hello(&heartbeat), "{heartbeat}");
-        keys.revoke(peer.machine).unwrap();
-        closed(&mut far).await;
+    async fn a_link_whose_proof_is_signed_with_another_key_is_refused() {
+        let (h, p) = pair();
+        let impostor = machine_keys();
+        let host = host(&h, &[p.me()]);
+        let mut conn = host.raw();
+        send(
+            &conn,
+            &Handshake::Challenge {
+                machine: p.me(),
+                nonce: nonce().unwrap(),
+            },
+        )
+        .await;
+        let Handshake::Answer { nonce, .. } = read(&mut conn).await else {
+            panic!("no answer");
+        };
+        let proof = impostor.sign(&link_message(DIALING, p.me(), h.me(), &nonce));
+        send(&conn, &Handshake::Proof { proof }).await;
+        conn.send.send(hello(p.me())).await.unwrap();
+        closed(&mut conn).await;
     }
 
     #[tokio::test]
-    async fn a_dialed_link_opens_with_this_machines_key() {
-        let (_, keys) = keys();
-        let me = joined(&keys);
+    async fn a_proof_a_machine_gave_one_peer_cannot_open_a_link_to_another() {
+        // H holds A and R; A holds R and dials it. R, revoked on H, tries to pass as A.
+        let (h, a, r) = (machine_keys(), machine_keys(), machine_keys());
+        admit(&h, &a);
+        admit(&h, &r);
+        admit(&a, &h);
+        admit(&a, &r);
+        admit(&r, &a);
+        h.revoke(r.me()).unwrap();
+        let host = host(&h, &[a.me(), r.me()]);
+
+        // R opens a link to H naming A, and keeps H's challenge.
+        let mut to_h = host.raw();
+        send(
+            &to_h,
+            &Handshake::Challenge {
+                machine: a.me(),
+                nonce: nonce().unwrap(),
+            },
+        )
+        .await;
+        let Handshake::Answer { nonce: h_nonce, .. } = read(&mut to_h).await else {
+            panic!("H did not answer");
+        };
+
+        // A dials R, and R answers with H's challenge so that A signs it.
         let inner = Arc::new(Pairs::default());
-        let dialer = KeyedDialer::new(inner.clone(), me.clone(), keys.clone());
-        let peer = MachineId::random();
-        let _conn = dialer.dial(&machine(peer)).await.unwrap();
-        let mut far = inner.0.lock().unwrap().pop().unwrap();
-        let first = next(&mut far).await.unwrap();
-        assert_eq!(first, key_message(&me));
+        let dialer = KeyedDialer::new(inner.clone(), a.clone());
+        let dialing = tokio::spawn(async move { dialer.dial(&machine(r.me())).await.map(drop) });
+        let mut at_r = inner_far(&inner).await;
+        let Handshake::Challenge { nonce: a_nonce, .. } = read(&mut at_r).await else {
+            panic!("A sent no challenge");
+        };
+        let r_proof = r.sign(&link_message(ACCEPTING, r.me(), a.me(), &a_nonce));
+        send(
+            &at_r,
+            &Handshake::Answer {
+                machine: r.me(),
+                nonce: h_nonce,
+                proof: r_proof,
+            },
+        )
+        .await;
+        let Handshake::Proof { proof: a_proof } = read(&mut at_r).await else {
+            panic!("A sent no proof");
+        };
+        dialing.await.unwrap().unwrap();
+
+        // R hands A's proof to H.
+        send(&to_h, &Handshake::Proof { proof: a_proof }).await;
+        to_h.send.send(hello(a.me())).await.unwrap();
+        closed(&mut to_h).await;
+        assert!(!host.peers.online().contains(&a.me()));
+    }
+
+    /// The far end of the link `pairs` hands out once it has dialed.
+    async fn inner_far(pairs: &Pairs) -> Conn {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(far) = pairs.0.lock().unwrap().pop() {
+                    return far;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("nothing was dialed")
     }
 
     #[tokio::test]
-    async fn a_revoked_machine_is_not_dialed() {
-        let (_, keys) = keys();
-        let me = joined(&keys);
-        let peer = joined(&keys);
-        keys.revoke(peer.machine).unwrap();
+    async fn a_dialed_machine_that_cannot_prove_its_key_is_dropped() {
+        let (a, b) = pair();
+        let impostor = machine_keys();
         let inner = Arc::new(Pairs::default());
-        let dialer = KeyedDialer::new(inner.clone(), me, keys);
-        assert!(dialer.dial(&machine(peer.machine)).await.is_err());
-        assert!(
-            inner.0.lock().unwrap().is_empty(),
-            "the revoked machine was dialed"
-        );
+        let dialer = KeyedDialer::new(inner.clone(), a.clone());
+        let b_id = b.me();
+        let dialing = tokio::spawn(async move { dialer.dial(&machine(b_id)).await.map(drop) });
+        let mut far = inner_far(&inner).await;
+        let Handshake::Challenge { nonce, .. } = read(&mut far).await else {
+            panic!("no challenge");
+        };
+        let proof = impostor.sign(&link_message(ACCEPTING, b_id, a.me(), &nonce));
+        send(
+            &far,
+            &Handshake::Answer {
+                machine: b_id,
+                nonce: nonce.clone(),
+                proof,
+            },
+        )
+        .await;
+        assert!(dialing.await.unwrap().is_err());
     }
 
     #[tokio::test]
-    async fn a_dialed_link_closes_when_its_machine_is_revoked() {
-        let (_, keys) = keys();
-        let me = joined(&keys);
-        let peer = joined(&keys);
+    async fn a_machine_this_one_holds_no_active_key_for_is_not_dialed() {
+        let (a, b) = pair();
+        let unknown = machine_keys();
+        a.revoke(b.me()).unwrap();
         let inner = Arc::new(Pairs::default());
-        let dialer = KeyedDialer::new(inner.clone(), me, keys.clone());
-        let mut conn = dialer.dial(&machine(peer.machine)).await.unwrap();
-        let mut far = inner.0.lock().unwrap().pop().unwrap();
-        next(&mut far).await.unwrap();
-        far.send.send("from the peer".into()).await.unwrap();
-        assert_eq!(next(&mut conn).await.as_deref(), Some("from the peer"));
-        keys.revoke(peer.machine).unwrap();
+        let dialer = KeyedDialer::new(inner.clone(), a);
+        for peer in [b.me(), unknown.me()] {
+            assert!(dialer.dial(&machine(peer)).await.is_err());
+        }
+        assert!(inner.0.lock().unwrap().is_empty(), "a machine was dialed");
+    }
+
+    #[tokio::test]
+    async fn an_open_link_closes_when_the_dialing_machine_is_revoked() {
+        let (h, p) = pair();
+        let host = host(&h, &[p.me()]);
+        let mut conn = host.dialed_by(&p).await.unwrap();
+        served(&mut conn, p.me()).await;
+        h.revoke(p.me()).unwrap();
+        closed(&mut conn).await;
+    }
+
+    #[tokio::test]
+    async fn an_open_link_closes_when_the_dialed_machine_is_revoked() {
+        let (h, p) = pair();
+        let host = host(&h, &[p.me()]);
+        let mut conn = host.dialed_by(&p).await.unwrap();
+        served(&mut conn, p.me()).await;
+        p.revoke(h.me()).unwrap();
         closed(&mut conn).await;
     }
 
@@ -885,32 +1149,52 @@ mod tests {
 
     async fn join_over_http(
         port: u16,
-        code: String,
-    ) -> (Arc<MemorySecrets>, Result<Identity, JoinError>) {
-        let secrets = Arc::new(MemorySecrets::default());
-        let saved = secrets.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            join_at(&format!("127.0.0.1:{port}"), DEFAULT_PORT, &code, &*saved)
+        code: &str,
+        secrets: Arc<MemorySecrets>,
+    ) -> Result<MachineId, JoinError> {
+        let code = code.to_owned();
+        tokio::task::spawn_blocking(move || {
+            join_at(&format!("127.0.0.1:{port}"), DEFAULT_PORT, &code, &*secrets)
         })
         .await
-        .unwrap();
-        (secrets, result)
+        .unwrap()
     }
 
     #[tokio::test]
-    async fn a_machine_joins_with_a_code_and_keeps_its_key() {
-        let (_, keys) = keys();
-        let port = serve(keys.clone()).await;
-        let code = keys.new_code().to_string();
-        let (secrets, joined) = join_over_http(port, code.clone()).await;
-        let joined = joined.unwrap();
-        let held = identity(&*secrets).unwrap().expect("no identity kept");
-        assert_eq!(held.machine, joined.machine);
-        assert_eq!(keys.check(held.machine, Some(&held.key)), Ok(()));
+    async fn a_machine_joins_with_a_code_and_keeps_its_own_identity() {
+        let host = machine_keys();
+        let port = serve(host.clone()).await;
+        let code = host.new_code().unwrap().to_string();
+        let secrets = Arc::new(MemorySecrets::default());
+        let joined = join_over_http(port, &code, secrets.clone()).await.unwrap();
+        let me = Keys::open(secrets.clone()).unwrap();
+        assert_eq!(me.me(), joined);
+        assert_eq!(host.state(joined), KeyState::Active);
 
-        let (secrets, again) = join_over_http(port, code).await;
-        assert!(matches!(again, Err(JoinError::BadCode)), "{again:?}");
-        assert!(identity(&*secrets).unwrap().is_none());
+        // A retry after a lost answer is the same machine, admitted again.
+        assert_eq!(
+            join_over_http(port, &code, secrets.clone()).await.unwrap(),
+            joined
+        );
+        assert_eq!(Keys::open(secrets).unwrap().me(), joined);
+
+        let other = Arc::new(MemorySecrets::default());
+        let refused = join_over_http(port, &code, other).await;
+        assert!(matches!(refused, Err(JoinError::BadCode)), "{refused:?}");
+    }
+
+    #[tokio::test]
+    async fn a_host_that_cannot_store_the_key_is_not_reported_as_unreachable() {
+        let flaky = Arc::new(Flaky::default());
+        let host = Keys::open(flaky.clone()).unwrap();
+        let port = serve(host.clone()).await;
+        let code = host.new_code().unwrap().to_string();
+        flaky.failing.store(true, Ordering::SeqCst);
+        let failed = join_over_http(port, &code, Arc::new(MemorySecrets::default())).await;
+        assert!(
+            matches!(failed, Err(JoinError::NotAdmitted { .. })),
+            "{failed:?}"
+        );
     }
 
     #[test]
@@ -926,6 +1210,14 @@ mod tests {
         assert_eq!(
             join_url("fd7a:115c:a1e0::1", 7433),
             "http://[fd7a:115c:a1e0::1]:7433/api/join"
+        );
+        assert_eq!(
+            join_url("[fd7a:115c:a1e0::1]", 7433),
+            "http://[fd7a:115c:a1e0::1]:7433/api/join"
+        );
+        assert_eq!(
+            join_url("[fd7a:115c:a1e0::1]:7777", 7433),
+            "http://[fd7a:115c:a1e0::1]:7777/api/join"
         );
         assert_eq!(
             join_url("trilogy-mac", 7433),

@@ -283,10 +283,56 @@ mod tests {
         let (dir, secrets) = file();
         secrets.set("gateway", "sk-one").unwrap();
         let path = dir.path().join("secrets.json");
-        fs::write(&path, r#"{"gateway": ["sk-leaked"]}"#).unwrap();
+        // serde_json quotes a string of the wrong type in its error.
+        let leaked = "\"sk-leaked\"";
+        assert!(
+            serde_json::from_str::<BTreeMap<String, String>>(leaked)
+                .unwrap_err()
+                .to_string()
+                .contains("sk-leaked")
+        );
+        fs::write(&path, leaked).unwrap();
         let error = secrets.get("gateway").unwrap_err();
         assert!(!error.to_string().contains("sk-leaked"), "{error}");
         assert!(!format!("{error:?}").contains("sk-leaked"), "{error:?}");
+    }
+
+    #[test]
+    fn a_missing_directory_is_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a/b/secrets.json");
+        FileSecrets::new(&path).set("gateway", "sk-one").unwrap();
+        assert_eq!(mode(&path), 0o600);
+    }
+
+    #[test]
+    fn two_stores_over_one_file_lose_none_of_each_others_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.json");
+        let writers: Vec<_> = (0..4)
+            .map(|w| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    // Each writer is its own store, as the daemon and `foundryd join` are.
+                    let secrets = FileSecrets::new(path);
+                    for i in 0..25 {
+                        secrets.set(&format!("w{w}-{i}"), "x").unwrap();
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        let secrets = FileSecrets::new(&path);
+        for w in 0..4 {
+            for i in 0..25 {
+                assert!(
+                    secrets.get(&format!("w{w}-{i}")).unwrap().is_some(),
+                    "w{w}-{i}"
+                );
+            }
+        }
     }
 
     #[test]
