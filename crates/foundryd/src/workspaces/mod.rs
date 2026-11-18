@@ -73,6 +73,8 @@ pub enum WorkspaceError {
          another name"
     )]
     BranchExists(String),
+    #[error("the project's remote has no branch {0}")]
+    UnknownBase(String),
     #[error(transparent)]
     Dirty(Dirty),
     #[error("git {command} failed: {stderr}")]
@@ -243,7 +245,7 @@ impl Workspaces {
 
     /// Closes the workspace's terminals, removes its worktree and keeps its branch. Unless
     /// `force`, refuses with [`WorkspaceError::Dirty`] while there is uncommitted or unpushed
-    /// work, and changes nothing. Work that appears while the terminals close is refused with
+    /// work or a checked-out submodule, and changes nothing. Work that appears while the terminals close is refused with
     /// [`WorkspaceError::Dirty`] too, and then the terminals are already closed. The archive
     /// finishes even when the caller stops waiting.
     pub async fn archive(&self, id: WorkspaceId, force: bool) -> Result<(), WorkspaceError> {
@@ -294,6 +296,7 @@ impl Inner {
             .await?;
         if branches.lines().any(|b| fold(b) == fold(&branch))
             || tokio::fs::try_exists(&worktree).await?
+            || self.registered_head(&clone, &worktree).await?.is_some()
         {
             return Err(WorkspaceError::BranchExists(branch));
         }
@@ -307,7 +310,8 @@ impl Inner {
                     &format!("refs/remotes/origin/{base}^{{commit}}"),
                 ],
             )
-            .await?
+            .await
+            .map_err(|_| WorkspaceError::UnknownBase(base.to_owned()))?
             .trim()
             .to_owned();
         // Git refuses a branch that is already there, by any spelling it reads as the same.
@@ -380,9 +384,10 @@ impl Inner {
                 self.refuse_dirty(&clone, &worktree, &body.branch).await?;
             }
             self.remove_worktree(&clone, &worktree, force).await?;
-        } else {
-            // Removed by hand: git forgets it, so its branch can be checked out again.
-            self.git(&clone, "worktree", ["prune"]).await?;
+        } else if self.registered_head(&clone, &worktree).await?.is_some() {
+            // Removed by hand: git forgets this worktree, and only this one, so its branch can be
+            // checked out again.
+            self.remove_worktree(&clone, &worktree, force).await?;
         }
         self.write(body, true).await
     }
@@ -412,24 +417,56 @@ impl Inner {
         if matches!(tokio::fs::try_exists(worktree).await, Ok(true)) {
             let _ = self.remove_worktree(clone, worktree, true).await;
         }
-        let _ = self.git(clone, "worktree", ["prune"]).await;
         let reference = format!("refs/heads/{branch}");
         let _ = self
             .git(clone, "update-ref", ["-d", &reference, start])
             .await;
     }
 
+    /// The commit git keeps as `HEAD` for a worktree registered at `worktree`, whether or not its
+    /// folder is still there. `None` when no worktree is registered there.
+    async fn registered_head(
+        &self,
+        clone: &Path,
+        worktree: &Path,
+    ) -> Result<Option<String>, WorkspaceError> {
+        let list = self
+            .git(clone, "worktree", ["list", "--porcelain", "-z"])
+            .await?;
+        // Every worktree of a clone sits at `worktrees/<project>/<branch>`, so the last two
+        // parts name it, however git spelled the folders above.
+        let tail = |p: &Path| {
+            (
+                p.file_name().map(OsStr::to_owned),
+                p.parent().and_then(Path::file_name).map(OsStr::to_owned),
+            )
+        };
+        let mut here = false;
+        for line in list.split('\0') {
+            if let Some(path) = line.strip_prefix("worktree ") {
+                here = tail(Path::new(path)) == tail(worktree);
+            } else if let Some(head) = line.strip_prefix("HEAD ")
+                && here
+            {
+                return Ok(Some(head.to_owned()));
+            }
+        }
+        Ok(None)
+    }
+
     /// [`WorkspaceError::Dirty`] when the worktree has uncommitted files or a checked-out
-    /// submodule, or the branch or the worktree's `HEAD` has commits no remote branch has.
+    /// submodule, or the branch or the worktree's `HEAD` has commits no remote branch has. The
+    /// `HEAD` is the one git keeps for the worktree, so it counts even when its folder is gone.
     async fn refuse_dirty(
         &self,
         clone: &Path,
         worktree: &Path,
         branch: &str,
     ) -> Result<(), WorkspaceError> {
-        let branch = format!("refs/heads/{branch}");
+        let mut heads = vec![format!("refs/heads/{branch}")];
+        heads.extend(self.registered_head(clone, worktree).await?);
         let present = tokio::fs::try_exists(worktree).await?;
-        let (uncommitted, submodules, dir, heads) = if present {
+        let (uncommitted, submodules) = if present {
             let submodules = self
                 .git(
                     worktree,
@@ -445,23 +482,18 @@ impl Inner {
                 .lines()
                 .map(str::to_owned)
                 .collect();
-            (
-                self.uncommitted(worktree).await?,
-                submodules,
-                worktree,
-                vec!["HEAD", &branch],
-            )
+            (self.uncommitted(worktree).await?, submodules)
         } else {
-            (Vec::new(), Vec::new(), clone, vec![branch.as_str()])
+            (Vec::new(), Vec::new())
         };
         let unpushed = self
             .git(
-                dir,
+                clone,
                 "log",
-                ["--format=%h %s"]
+                ["--format=%h %s".to_owned()]
                     .into_iter()
                     .chain(heads)
-                    .chain(["--not", "--remotes", "--"]),
+                    .chain(["--not", "--remotes", "--"].map(String::from)),
             )
             .await?
             .lines()
