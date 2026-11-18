@@ -334,8 +334,8 @@ impl Reply {
         serde_json::from_str(&self.body).unwrap_or_else(|e| panic!("{e}: {}", self.body))
     }
 
-    fn id<T: std::str::FromStr<Err: std::fmt::Debug>>(&self) -> T {
-        self.json()["id"].as_str().unwrap().parse().unwrap()
+    fn id<T: serde::de::DeserializeOwned>(&self) -> T {
+        serde_json::from_value(self.json()["id"].clone()).unwrap()
     }
 }
 
@@ -434,11 +434,19 @@ async fn binding_to_every_address_fails_naming_the_rule() {
             .await
             .expect_err("bound to an address that is not allowed")
             .to_string();
-        for part in ["loopback", "Tailscale", "100.64.0.0/10", "fd7a:115c:a1e0::/48"] {
+        for part in [
+            "loopback",
+            "Tailscale",
+            "100.64.0.0/10",
+            "fd7a:115c:a1e0::/48",
+        ] {
             assert!(error.contains(part), "{error:?} does not name {part}");
         }
         let ip = addr.parse::<SocketAddr>().unwrap().ip();
-        assert!(error.contains(&ip.to_string()), "{error:?} does not name {ip}");
+        assert!(
+            error.contains(&ip.to_string()),
+            "{error:?} does not name {ip}"
+        );
     }
 }
 
@@ -487,13 +495,23 @@ async fn a_request_from_another_site_is_refused() {
     let same = format!("http://{host}");
 
     let reply = daemon
-        .raw("GET", "/api/state", &[("Host", &host), ("Origin", &same)], None)
+        .raw(
+            "GET",
+            "/api/state",
+            &[("Host", &host), ("Origin", &same)],
+            None,
+        )
         .await;
     assert_eq!(reply.status, 200, "{}", reply.body);
 
     for origin in ["http://evil.example", "null", "http://127.0.0.1:1"] {
         let reply = daemon
-            .raw("GET", "/api/state", &[("Host", &host), ("Origin", origin)], None)
+            .raw(
+                "GET",
+                "/api/state",
+                &[("Host", &host), ("Origin", origin)],
+                None,
+            )
             .await;
         assert_eq!(reply.status, 403, "Origin {origin}: {}", reply.body);
         assert!(reply.body.contains("site"), "{}", reply.body);
@@ -538,10 +556,9 @@ async fn a_request_naming_another_host_is_refused() {
 #[tokio::test]
 async fn a_socket_opened_from_another_site_is_refused() {
     let daemon = Daemon::new(TURN).await;
-    let mut request = tungstenite::client::IntoClientRequest::into_client_request(
-        daemon.ws_url("/api/events"),
-    )
-    .unwrap();
+    let mut request =
+        tungstenite::client::IntoClientRequest::into_client_request(daemon.ws_url("/api/events"))
+            .unwrap();
     request
         .headers_mut()
         .insert("Origin", "http://evil.example".parse().unwrap());
@@ -637,9 +654,8 @@ async fn events_send_a_deleted_record() {
         .await;
     assert_eq!(reply.status, 204, "{}", reply.body);
     until_seen(&mut socket, |seen| {
-        seen.iter().any(
-            |r| matches!(r, AnyRecord::Workspace(w) if w.body.id == workspace && w.deleted),
-        )
+        seen.iter()
+            .any(|r| matches!(r, AnyRecord::Workspace(w) if w.body.id == workspace && w.deleted))
     })
     .await;
 }
@@ -680,9 +696,10 @@ async fn read_until(socket: &mut Socket, wanted: &str) -> String {
 async fn a_terminal_socket_echoes_typed_input_from_cat() {
     let daemon = Daemon::new(TURN).await;
     let id = cat(&daemon).await;
-    let (mut socket, _) = tokio_tungstenite::connect_async(daemon.ws_url(&format!("/api/terminals/{id}")))
-        .await
-        .unwrap();
+    let (mut socket, _) =
+        tokio_tungstenite::connect_async(daemon.ws_url(&format!("/api/terminals/{id}")))
+            .await
+            .unwrap();
     socket
         .send(Message::text(r#"{"type":"resize","cols":100,"rows":30}"#))
         .await
@@ -712,9 +729,10 @@ async fn a_terminal_socket_starts_with_the_earlier_output() {
         .unwrap();
     // Until the holder has it, a snapshot may not.
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let (mut socket, _) = tokio_tungstenite::connect_async(daemon.ws_url(&format!("/api/terminals/{id}")))
-        .await
-        .unwrap();
+    let (mut socket, _) =
+        tokio_tungstenite::connect_async(daemon.ws_url(&format!("/api/terminals/{id}")))
+            .await
+            .unwrap();
     let first = tokio::time::timeout(WAIT, socket.next())
         .await
         .unwrap()
@@ -733,9 +751,10 @@ async fn a_terminal_socket_starts_with_the_earlier_output() {
 async fn a_terminal_socket_closes_once_the_child_exits() {
     let daemon = Daemon::new(TURN).await;
     let id = cat(&daemon).await;
-    let (mut socket, _) = tokio_tungstenite::connect_async(daemon.ws_url(&format!("/api/terminals/{id}")))
-        .await
-        .unwrap();
+    let (mut socket, _) =
+        tokio_tungstenite::connect_async(daemon.ws_url(&format!("/api/terminals/{id}")))
+            .await
+            .unwrap();
     // Ctrl-D at the start of a line ends cat.
     socket.send(Message::binary(&b"\x04"[..])).await.unwrap();
     loop {
@@ -744,7 +763,10 @@ async fn a_terminal_socket_closes_once_the_child_exits() {
             .expect("the socket closes in time");
         match frame {
             Some(Ok(Message::Close(Some(close)))) => {
-                assert_eq!(close.code, tungstenite::protocol::frame::coding::CloseCode::Normal);
+                assert_eq!(
+                    close.code,
+                    tungstenite::protocol::frame::coding::CloseCode::Normal
+                );
                 break;
             }
             Some(Ok(Message::Close(None))) | None => panic!("closed with no reason"),
@@ -786,9 +808,10 @@ async fn a_shell_is_started_in_the_worktree_and_closed() {
     });
     assert!(running, "no running terminal {shell} in {workspace}");
 
-    let (mut socket, _) = tokio_tungstenite::connect_async(daemon.ws_url(&format!("/api/terminals/{shell}")))
-        .await
-        .unwrap();
+    let (mut socket, _) =
+        tokio_tungstenite::connect_async(daemon.ws_url(&format!("/api/terminals/{shell}")))
+            .await
+            .unwrap();
     socket.send(Message::binary(&b"pwd\n"[..])).await.unwrap();
     read_until(&mut socket, "shells").await;
 
@@ -796,9 +819,10 @@ async fn a_shell_is_started_in_the_worktree_and_closed() {
         .call("POST", &format!("/api/terminals/{shell}/close"), None)
         .await;
     assert_eq!(reply.status, 204, "{}", reply.body);
-    let deleted = daemon.records().into_iter().any(
-        |r| matches!(r, AnyRecord::Terminal(t) if t.body.id == shell && t.deleted),
-    );
+    let deleted = daemon
+        .records()
+        .into_iter()
+        .any(|r| matches!(r, AnyRecord::Terminal(t) if t.body.id == shell && t.deleted));
     assert!(deleted, "the closed terminal's record is not deleted");
 }
 
@@ -818,7 +842,10 @@ async fn archive_with_uncommitted_work_is_refused_listing_it() {
     let path = format!("/api/workspaces/{workspace}/archive");
     let reply = daemon.call("POST", &path, None).await;
     assert_eq!(reply.status, 409, "{}", reply.body);
-    assert_eq!(reply.json()["uncommitted"], serde_json::json!(["notes.txt"]));
+    assert_eq!(
+        reply.json()["uncommitted"],
+        serde_json::json!(["notes.txt"])
+    );
     assert!(worktree.exists());
 
     let reply = daemon
@@ -839,7 +866,10 @@ async fn an_action_on_what_is_not_here_is_not_found() {
         ),
         (format!("/api/workspaces/{workspace}/shells"), None),
         (format!("/api/workspaces/{workspace}/archive"), None),
-        (format!("/api/terminals/{}/close", TerminalId::random()), None),
+        (
+            format!("/api/terminals/{}/close", TerminalId::random()),
+            None,
+        ),
     ] {
         let reply = daemon.call("POST", &path, body).await;
         assert_eq!(reply.status, 404, "{path}: {}", reply.body);
@@ -885,7 +915,10 @@ fn credentials_in_a_url_are_hidden() {
     ] {
         let shown = redact(text);
         assert!(!shown.contains(secret), "{shown}");
-        assert!(shown.contains("github.com") || shown.contains("host/r.git"), "{shown}");
+        assert!(
+            shown.contains("github.com") || shown.contains("host/r.git"),
+            "{shown}"
+        );
     }
     assert_eq!(redact("git@github.com:o/r.git"), "git@github.com:o/r.git");
     assert_eq!(redact("no url here"), "no url here");
@@ -924,6 +957,9 @@ async fn no_response_contains_a_secret() {
         .await;
     said.push(reply.body.clone());
     let session: SessionId = reply.id();
+    // Read now: the curl configs go when the session ends.
+    let tokens = daemon.hook_tokens();
+    assert!(!tokens.is_empty(), "no hook token found to check");
     said.push(daemon.call("GET", "/api/state", None).await.body);
     // Every frame the events socket sent, up to the session going idle.
     let mut seen = Vec::new();
@@ -944,8 +980,6 @@ async fn no_response_contains_a_secret() {
         said.push(daemon.call(method, &path, None).await.body);
     }
 
-    let tokens = daemon.hook_tokens();
-    assert!(!tokens.is_empty(), "no hook token found to check");
     let said = said.join("\n");
     for secret in tokens
         .iter()
