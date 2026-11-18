@@ -16,6 +16,11 @@
 //! revoked, is neither dialed nor served, and an open link to one closes within [`RECHECK`] of
 //! its revocation.
 //!
+//! The proofs show who is at each end when the link opens; they do not protect what the link
+//! carries after. That rests on the network the daemon binds to, Tailscale, which encrypts
+//! every packet and ties each address to one machine. A machine address that is not on it is
+//! not safe for a peer link.
+//!
 //! The key table is held in this machine's secret store. It holds only public keys, so it can
 //! be carried to every other machine; carrying it, and the new machine's place in the machine
 //! list, belongs with the shared settings.
@@ -27,7 +32,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -116,7 +121,8 @@ fn home() -> Option<PathBuf> {
 }
 
 /// Posts `code` with this machine's id and public key to the machine at `address` (`port`
-/// unless the address names one), and returns this machine's id. The identity in `secrets` is
+/// unless the address names one), keeps the admitting machine's key in this machine's key
+/// table, and returns this machine's id. The identity in `secrets` is
 /// made if there is none and never replaced, so joining again, or retrying a join whose answer
 /// was lost, is the same machine.
 pub fn join_at(
@@ -136,16 +142,50 @@ pub fn join_at(
         .timeout_global(Some(Duration::from_secs(10)))
         .build()
         .into();
-    match agent.post(&url).send_json(&request) {
-        Ok(_) => Ok(identity.machine),
-        Err(ureq::Error::StatusCode(403)) => Err(JoinError::BadCode),
-        Err(ureq::Error::StatusCode(409)) => Err(JoinError::Taken(identity.machine)),
-        Err(ureq::Error::StatusCode(status)) => Err(JoinError::NotAdmitted { url, status }),
-        Err(error) => Err(JoinError::Unreachable {
-            url,
-            reason: error.to_string(),
-        }),
+    let answer: JoinAnswer = match agent.post(&url).send_json(&request) {
+        Ok(mut response) => {
+            response
+                .body_mut()
+                .read_json()
+                .map_err(|_| JoinError::NotAdmitted {
+                    url: url.clone(),
+                    status: 200,
+                })?
+        }
+        Err(ureq::Error::StatusCode(403)) => return Err(JoinError::BadCode),
+        Err(ureq::Error::StatusCode(409)) => return Err(JoinError::Taken(identity.machine)),
+        Err(ureq::Error::StatusCode(status)) => {
+            return Err(JoinError::NotAdmitted { url, status });
+        }
+        Err(error) => {
+            return Err(JoinError::Unreachable {
+                url,
+                reason: error.to_string(),
+            });
+        }
+    };
+    hold_key(secrets, answer.machine, answer.key)?;
+    Ok(identity.machine)
+}
+
+/// Puts `machine`'s key in the key table kept in `secrets`, so this machine's links with it
+/// are served from its next start. A key already held for it is left as it is.
+fn hold_key(secrets: &dyn Secrets, machine: MachineId, key: PublicKey) -> Result<(), JoinError> {
+    let mut machines = read_table(secrets)?;
+    machines.entry(machine).or_insert(Entry::Active { key });
+    secrets.set(KEYS_SECRET, &write_table(&machines))?;
+    Ok(())
+}
+
+fn read_table(secrets: &dyn Secrets) -> Result<BTreeMap<MachineId, Entry>, JoinError> {
+    match secrets.get(KEYS_SECRET)? {
+        None => Ok(BTreeMap::new()),
+        Some(text) => serde_json::from_str(&text).map_err(|_| JoinError::Unreadable(KEYS_SECRET)),
     }
+}
+
+fn write_table(machines: &BTreeMap<MachineId, Entry>) -> String {
+    serde_json::to_string(machines).expect("a key table of UUIDs and strings always serializes")
 }
 
 /// The URL to post a join code to: `address` is an IP address, a bracketed IPv6 address or a
@@ -171,8 +211,8 @@ pub enum JoinError {
     #[error("the code is wrong, used or expired; ask for a new one")]
     BadCode,
     #[error(
-        "machine {0} is already known to the fleet, or was revoked; a revoked machine joins \
-         again only with a new identity"
+        "machine {0} is revoked, or held with another key; a revoked machine cannot join again \
+         under the same id"
     )]
     Taken(MachineId),
     #[error("the public key sent is not an Ed25519 public key")]
@@ -327,7 +367,20 @@ struct Held {
 struct Shown {
     code: String,
     at: Instant,
+    /// Also kept because `at` stops while the machine sleeps.
+    wall: SystemTime,
     used_by: Option<MachineId>,
+}
+
+impl Shown {
+    /// Whether the code is still valid. Either clock passing [`CODE_VALID_FOR`] ends it, and
+    /// so does a wall clock now before the showing.
+    fn valid(&self) -> bool {
+        self.at.elapsed() < CODE_VALID_FOR
+            && SystemTime::now()
+                .duration_since(self.wall)
+                .is_ok_and(|age| age < CODE_VALID_FOR)
+    }
 }
 
 impl Keys {
@@ -336,12 +389,7 @@ impl Keys {
     pub fn open(secrets: Arc<dyn Secrets>) -> Result<Self, JoinError> {
         let identity = Identity::load_or_create(&*secrets)?;
         let signer = identity.key_pair()?;
-        let machines = match secrets.get(KEYS_SECRET)? {
-            None => BTreeMap::new(),
-            Some(text) => {
-                serde_json::from_str(&text).map_err(|_| JoinError::Unreadable(KEYS_SECRET))?
-            }
-        };
+        let machines = read_table(&*secrets)?;
         let keys = Self {
             inner: Arc::new(KeysInner {
                 me: identity.machine,
@@ -355,9 +403,9 @@ impl Keys {
             }),
         };
         if keys.state(keys.me()) == KeyState::NoKey {
-            let _saving = lock(&keys.inner.saving);
+            let saving = keys.saving();
             let key = keys.public_key();
-            keys.change(|machines| {
+            keys.change(&saving, |machines| {
                 machines.insert(identity.machine, Entry::Active { key });
             })?;
         }
@@ -389,6 +437,7 @@ impl Keys {
         held.codes.push(Shown {
             code: code.clone(),
             at: Instant::now(),
+            wall: SystemTime::now(),
             used_by: None,
         });
         Ok(Code(code))
@@ -400,7 +449,7 @@ impl Keys {
     /// once the key is saved.
     pub fn redeem(&self, code: &str, machine: MachineId, key: &PublicKey) -> Result<(), JoinError> {
         let typed = code.trim().to_ascii_uppercase();
-        let _saving = lock(&self.inner.saving);
+        let saving = self.saving();
         {
             let mut held = self.held();
             held.forget_expired_codes();
@@ -418,6 +467,8 @@ impl Keys {
                     return Ok(());
                 }
                 (Some(_), _) => return Err(JoinError::BadCode),
+                // Already admitted with this key: a retry whose first code expired.
+                (None, Some(Entry::Active { key: held })) if held == key => return Ok(()),
                 (None, Some(_)) => return Err(JoinError::Taken(machine)),
                 (None, None) => {}
             }
@@ -426,7 +477,7 @@ impl Keys {
             return Err(JoinError::BadKey);
         }
         let entry = Entry::Active { key: key.clone() };
-        self.change(|machines| {
+        self.change(&saving, |machines| {
             machines.insert(machine, entry);
         })?;
         if let Some(shown) = self
@@ -442,8 +493,8 @@ impl Keys {
 
     /// Revokes `machine`: its key is forgotten and every link with it is refused.
     pub fn revoke(&self, machine: MachineId) -> Result<(), SecretsError> {
-        let _saving = lock(&self.inner.saving);
-        self.change(|machines| {
+        let saving = self.saving();
+        self.change(&saving, |machines| {
             machines.insert(machine, Entry::Revoked);
         })
     }
@@ -556,17 +607,23 @@ impl Keys {
         }
     }
 
-    /// Applies `edit` to a copy of the key table, saves the copy, then holds it. The caller
-    /// holds the `saving` lock.
+    /// The lock every change to the key table holds from its read to its save.
+    fn saving(&self) -> MutexGuard<'_, ()> {
+        lock(&self.inner.saving)
+    }
+
+    /// Applies `edit` to a copy of the key table, saves the copy, then holds it. Taking the
+    /// `saving` guard makes every change hold the lock, so no two saves undo each other.
     fn change(
         &self,
+        _saving: &MutexGuard<'_, ()>,
         edit: impl FnOnce(&mut BTreeMap<MachineId, Entry>),
     ) -> Result<(), SecretsError> {
         let mut machines = self.held().machines.clone();
         edit(&mut machines);
-        // A key table always serializes: its keys are UUIDs and its values plain strings.
-        let text = serde_json::to_string(&machines).unwrap_or_default();
-        self.inner.secrets.set(KEYS_SECRET, &text)?;
+        self.inner
+            .secrets
+            .set(KEYS_SECRET, &write_table(&machines))?;
         self.held().machines = machines;
         Ok(())
     }
@@ -578,8 +635,7 @@ impl Keys {
 
 impl Held {
     fn forget_expired_codes(&mut self) {
-        self.codes
-            .retain(|shown| shown.at.elapsed() < CODE_VALID_FOR);
+        self.codes.retain(Shown::valid);
     }
 }
 
@@ -622,8 +678,7 @@ async fn read(recv: &mut Receiver<String>) -> Option<Handshake> {
 
 /// Sends a handshake message, and says whether the link is still open.
 async fn write(send: &Sender<String>, message: &Handshake) -> bool {
-    // A handshake message is ids and hex strings, which always serialize.
-    let text = serde_json::to_string(message).unwrap_or_default();
+    let text = serde_json::to_string(message).expect("ids and hex strings always serialize");
     matches!(timeout(OFFLINE_AFTER, send.send(text)).await, Ok(Ok(())))
 }
 
@@ -732,13 +787,20 @@ async fn forward(from: &mut Receiver<String>, to: &Sender<String>) {
     }
 }
 
-/// The route a joining machine posts its code to. It answers 204 when the machine is
-/// admitted, 403 to a code that is wrong, used or expired, 409 to a machine already known or
+/// The route a joining machine posts its code to. It answers with this machine's id and
+/// public key when the machine is admitted, 403 to a code that is wrong, used or expired, 409 to a machine already known or
 /// revoked, and 400 to a key that is not an Ed25519 public key.
 pub fn router(keys: Keys) -> Router {
     Router::new()
         .route(JOIN_PATH, post(redeem))
         .with_state(keys)
+}
+
+/// The admitting machine's answer: who it is and its public key.
+#[derive(Serialize, Deserialize)]
+struct JoinAnswer {
+    machine: MachineId,
+    key: PublicKey,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -749,13 +811,17 @@ struct JoinRequest {
 }
 
 async fn redeem(State(keys): State<Keys>, Json(request): Json<JoinRequest>) -> Response {
+    let answer = JoinAnswer {
+        machine: keys.me(),
+        key: keys.public_key(),
+    };
     // Saving the key table can wait on the keychain or the disk.
     let redeemed = tokio::task::spawn_blocking(move || {
         keys.redeem(&request.code, request.machine, &request.key)
     })
     .await;
     match redeemed {
-        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Ok(())) => Json(answer).into_response(),
         Ok(Err(error @ JoinError::BadCode)) => {
             (StatusCode::FORBIDDEN, error.to_string()).into_response()
         }
