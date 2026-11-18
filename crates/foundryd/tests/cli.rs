@@ -22,12 +22,11 @@ fn version_prints_the_crate_version() {
 
 #[test]
 fn every_other_command_exits_2_and_says_not_built_yet() {
-    let commands: [(&str, &[&str]); 5] = [
+    let commands: [(&str, &[&str]); 4] = [
         ("run", &["run"]),
         ("install", &["install"]),
         ("uninstall", &["uninstall"]),
         ("status", &["status"]),
-        ("join", &["join", "100.64.0.1:7777", "123456"]),
     ];
 
     for (name, args) in commands {
