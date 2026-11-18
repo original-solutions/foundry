@@ -258,14 +258,12 @@ async fn a_client_that_attaches_late_gets_the_earlier_output_first() {
 
 #[tokio::test]
 async fn scrollback_holds_10000_lines_and_drops_the_oldest() {
-    let holder = Holder::start(&["sh", "-c", "seq 1 10050"], &[]);
+    let holder = Holder::start(&["sh", "-c", &format!("{NO_OPOST}; seq 1 10050")], &[]);
     assert_eq!(holder.wait_for_exit(WAIT).await, 0);
     let client = holder.attach().await;
-    let expected: Vec<u8> = (51..=10_050)
-        .flat_map(|n| format!("{n}\r\n").into_bytes())
-        .collect();
-    assert_eq!(client.snapshot, expected);
-    let dropped: usize = (1..=50).map(|n| format!("{n}\r\n").len()).sum();
+    let counter = counter_stream(b"", 10_050);
+    let dropped = counter_stream(b"", 50).len();
+    assert_eq!(client.snapshot, &counter[dropped..]);
     assert_eq!(client.start, dropped as u64);
 }
 
@@ -292,8 +290,9 @@ async fn a_flood_with_no_client_attached_finishes_in_bounded_memory() {
 #[tokio::test]
 async fn a_client_that_stops_reading_is_dropped_without_blocking_the_child() {
     // A counter the stalled client's stream is checked against, then 200 MB to push the holder.
-    let script =
-        "stty -echo; printf R; read x; seq 1 999999; head -c 200000000 /dev/zero | tr '\\0' a";
+    let script = &format!(
+        "{NO_OPOST} -echo; printf R; read x; seq 1 999999; head -c 200000000 /dev/zero | tr '\\0' a"
+    );
     let holder = Holder::start(&["sh", "-c", script], &[]);
     let mut driver = holder.attach().await;
     driver.read_until(b"R").await;
@@ -332,7 +331,11 @@ async fn a_client_that_stops_reading_is_dropped_without_blocking_the_child() {
 async fn a_client_that_keeps_reading_gets_every_byte_of_many_small_writes() {
     // seq writes each line on its own, so the holder sees a million small reads.
     let holder = Holder::start(
-        &["sh", "-c", "stty -echo; printf R; read x; seq 1 999999"],
+        &[
+            "sh",
+            "-c",
+            &format!("{NO_OPOST} -echo; printf R; read x; seq 1 999999"),
+        ],
         &[],
     );
     let mut client = holder.attach().await;
@@ -345,11 +348,16 @@ async fn a_client_that_keeps_reading_gets_every_byte_of_many_small_writes() {
     );
 }
 
-/// `prefix` then `seq 1 <last>` as a terminal shows it.
+/// Turns off the terminal's output processing for tests that compare output to an exact stream.
+/// The kernel's newline translation is not the holder's, and under load macOS's sometimes writes
+/// `\r\r\n` for one newline.
+const NO_OPOST: &str = "stty -opost";
+
+/// `prefix` then `seq 1 <last>`, with output processing off.
 fn counter_stream(prefix: &[u8], last: u64) -> Vec<u8> {
     let mut stream = prefix.to_vec();
     for n in 1..=last {
-        stream.extend_from_slice(format!("{n}\r\n").as_bytes());
+        stream.extend_from_slice(format!("{n}\n").as_bytes());
     }
     stream
 }
