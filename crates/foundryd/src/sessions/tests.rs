@@ -955,6 +955,29 @@ async fn until_printed(f: &Fixture, terminal: TerminalId, marker: &str) {
 }
 
 #[tokio::test]
+async fn a_hook_applied_after_its_session_left_the_live_map_writes_nothing() {
+    // As for a hook that waited on the body lock while the start failed and dropped the
+    // session: it must not write a record for a session the caller was told failed.
+    let f = Fixture::new("- wait_input\n").await;
+    let id = f.start().await;
+    let before = f.record(id).unwrap();
+    let records = session_records(&f.store, f.me);
+    let live = f.sessions.inner.live(id).unwrap();
+    lock(&f.sessions.inner.live).remove(&id);
+
+    let state = f
+        .sessions
+        .inner
+        .event(&live, Event::Hook(state::Hook::UserPromptSubmit))
+        .await
+        .unwrap();
+
+    assert_eq!(state, SessionState::Starting);
+    assert_eq!(session_records(&f.store, f.me), records);
+    assert_eq!(f.record(id).unwrap(), before);
+}
+
+#[tokio::test]
 async fn a_follower_the_holder_cuts_off_attaches_again_and_still_sees_the_exit() {
     // More output than the holder keeps for one client that does not read.
     let big = "x".repeat(6 * 1024 * 1024);
