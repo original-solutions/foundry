@@ -493,6 +493,7 @@ dependencies = [
  "foundry-proto",
  "futures",
  "nix",
+ "ring",
  "rusqlite",
  "rust-embed",
  "security-framework",

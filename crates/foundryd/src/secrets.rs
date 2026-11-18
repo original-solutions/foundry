@@ -9,7 +9,11 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::{Mutex, PoisonError};
+
+use nix::fcntl::{Flock, FlockArg};
 
 /// Named secrets, such as the gateway key or this machine's key.
 pub trait Secrets: Send + Sync {
@@ -54,18 +58,40 @@ pub fn for_this_machine(home: &Path) -> Arc<dyn Secrets> {
 
 /// Secrets in one JSON file that only its owner may read or write. The file is created 0600,
 /// and one that others can read or write is refused, at read and before a write.
+///
+/// A set holds an exclusive lock on the file `<path>.lock` from its read to its write, so two
+/// stores over one file, in one process or two (the daemon and `foundryd join`), never lose
+/// each other's secrets.
 pub struct FileSecrets {
     path: PathBuf,
-    /// Held across a read and the write that follows it, so two sets never lose one another.
-    writing: Mutex<()>,
 }
 
 impl FileSecrets {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self {
-            path: path.into(),
-            writing: Mutex::new(()),
+        Self { path: path.into() }
+    }
+
+    /// `<path><suffix>`, beside the secrets file.
+    fn beside(&self, suffix: &str) -> PathBuf {
+        let mut name = self.path.clone().into_os_string();
+        name.push(suffix);
+        PathBuf::from(name)
+    }
+
+    /// Takes the lock every set holds, creating the directory and the lock file if needed.
+    /// The lock is released when the returned value is dropped.
+    fn lock(&self) -> Result<Flock<File>, SecretsError> {
+        if let Some(dir) = self.path.parent() {
+            fs::create_dir_all(dir).map_err(|e| self.io(e))?;
         }
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(self.beside(".lock"))
+            .map_err(|e| self.io(e))?;
+        Flock::lock(file, FlockArg::LockExclusive).map_err(|(_, errno)| self.io(errno.into()))
     }
 
     /// Every secret in the file, or none when there is no file yet.
@@ -98,13 +124,9 @@ impl FileSecrets {
 
     /// Writes `secrets` to a new 0600 file beside the old one, then moves it into place, so
     /// a crash leaves either the old file or the new one.
+    /// The caller holds [`FileSecrets::lock`], so no other writer uses the temporary file.
     fn write(&self, secrets: &BTreeMap<String, String>) -> Result<(), SecretsError> {
-        if let Some(dir) = self.path.parent() {
-            fs::create_dir_all(dir).map_err(|e| self.io(e))?;
-        }
-        let mut name = self.path.clone().into_os_string();
-        name.push(".tmp");
-        let temporary = PathBuf::from(name);
+        let temporary = self.beside(".tmp");
         // A leftover temporary file keeps its own mode when opened, so it is removed first.
         match fs::remove_file(&temporary) {
             Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(self.io(error)),
@@ -121,7 +143,14 @@ impl FileSecrets {
             .map_err(|e| self.io(e))?;
         file.write_all(text.as_bytes()).map_err(|e| self.io(e))?;
         file.sync_all().map_err(|e| self.io(e))?;
-        fs::rename(&temporary, &self.path).map_err(|e| self.io(e))
+        fs::rename(&temporary, &self.path).map_err(|e| self.io(e))?;
+        // The rename is durable only once the directory that records it is.
+        if let Some(dir) = self.path.parent() {
+            File::open(dir)
+                .and_then(|dir| dir.sync_all())
+                .map_err(|e| self.io(e))?;
+        }
+        Ok(())
     }
 
     fn io(&self, source: io::Error) -> SecretsError {
@@ -138,7 +167,7 @@ impl Secrets for FileSecrets {
     }
 
     fn set(&self, name: &str, value: &str) -> Result<(), SecretsError> {
-        let _writing = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
+        let _locked = self.lock()?;
         let mut secrets = self.read()?;
         secrets.insert(name.to_owned(), value.to_owned());
         self.write(&secrets)

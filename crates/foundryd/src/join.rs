@@ -1,17 +1,24 @@
 //! One-time join codes and machine keys.
 //!
+//! Every machine has an identity of its own: an id and an Ed25519 key pair, made the first
+//! time it is needed and kept in its secret store. The private key never leaves the machine;
+//! other machines hold only its public key, in their key table.
+//!
 //! A machine already in the fleet shows a one-time [`Code`] ([`Keys::new_code`]). The new
-//! machine runs `foundryd join <address> <code>`, which posts the code to that machine's
-//! [`router`]. The code works once and for [`CODE_VALID_FOR`]; redeeming it gives the new
-//! machine an id and a key of its own ([`Identity`]), which it keeps in its secret store.
+//! machine runs `foundryd join <address> <code>`, which posts the code with its id and public
+//! key to that machine's [`router`]. The code works once and for [`CODE_VALID_FOR`].
 //!
-//! Every peer link proves its machine's key. A dialed link sends this machine's key first
-//! ([`KeyedDialer`]), and [`Keys::accept`] takes a link only when that key is the one held for
-//! the machine its hello names and the machine is not revoked. A revoked machine is never
-//! dialed, and an open link to one closes within [`RECHECK`].
+//! Every peer link proves both machines' keys before sync takes it. The dialing end names
+//! itself with a fresh challenge; the accepting end answers with its own challenge and a
+//! signature over the dialer's; the dialer answers with a signature over the acceptor's. Each
+//! signature covers its role, both machine ids and the other end's fresh challenge, so a proof
+//! given on one link opens no other. A machine whose key this one does not hold, or has
+//! revoked, is neither dialed nor served, and an open link to one closes within [`RECHECK`] of
+//! its revocation.
 //!
-//! The key table is held in this machine's secret store. Carrying it, and the new machine's
-//! place in the machine list, to every other machine belongs with the shared settings.
+//! The key table is held in this machine's secret store. It holds only public keys, so it can
+//! be carried to every other machine; carrying it, and the new machine's place in the machine
+//! list, belongs with the shared settings.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -31,10 +38,11 @@ use foundry_proto::ids::MachineId;
 use foundry_proto::messages::PeerMessage;
 use foundry_proto::settings::Machine;
 use futures::future::BoxFuture;
+use ring::rand::{SecureRandom, SystemRandom};
+use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{Instant, timeout};
-use uuid::Uuid;
 
 use crate::secrets::{self, Secrets, SecretsError};
 use crate::sync::{Conn, Dialer, OFFLINE_AFTER, Peers};
@@ -51,16 +59,25 @@ pub const JOIN_PATH: &str = "/api/join";
 /// The port a machine's daemon listens on when `FOUNDRY_PORT` is not set.
 pub const DEFAULT_PORT: u16 = 7433;
 
-/// The secret that holds the key table: every machine's key, or that it is revoked.
+/// The secret that holds the key table: every machine's public key, or that it is revoked.
 const KEYS_SECRET: &str = "machine-keys";
 
-/// The secret that holds this machine's own id and key.
+/// The secret that holds this machine's own id and private key.
 const IDENTITY_SECRET: &str = "machine";
 
 /// Letters and digits a person cannot misread: no 0, O, 1 or I. 32 of them, so one random
 /// byte modulo 32 picks each without bias.
 const CODE_LETTERS: &[u8; 32] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+
+/// Letters in a join code: 50 random bits.
 const CODE_LENGTH: usize = 10;
+
+/// Random bytes in a link challenge.
+const NONCE_LENGTH: usize = 32;
+
+/// The roles a link proof is signed in, so an acceptor's proof never passes as a dialer's.
+const ACCEPTING: &str = "accepting";
+const DIALING: &str = "dialing";
 
 /// `foundryd join <address> <code>`.
 pub fn join(address: &str, code: &str) -> ExitCode {
@@ -79,8 +96,8 @@ pub fn join(address: &str, code: &str) -> ExitCode {
         return ExitCode::FAILURE;
     };
     match join_at(address, port, code, &*secrets::for_this_machine(&home)) {
-        Ok(identity) => {
-            println!("joined the fleet as machine {}", identity.machine);
+        Ok(machine) => {
+            println!("joined the fleet as machine {machine}");
             ExitCode::SUCCESS
         }
         Err(error) => {
@@ -98,60 +115,54 @@ fn home() -> Option<PathBuf> {
     }
 }
 
-/// Posts `code` to the machine at `address` (`port` unless the address names one), and keeps
-/// the identity it answers with in `secrets`.
+/// Posts `code` with this machine's id and public key to the machine at `address` (`port`
+/// unless the address names one), and returns this machine's id. The identity in `secrets` is
+/// made if there is none and never replaced, so joining again, or retrying a join whose answer
+/// was lost, is the same machine.
 pub fn join_at(
     address: &str,
     port: u16,
     code: &str,
     secrets: &dyn Secrets,
-) -> Result<Identity, JoinError> {
+) -> Result<MachineId, JoinError> {
+    let identity = Identity::load_or_create(secrets)?;
+    let request = JoinRequest {
+        code: code.to_owned(),
+        machine: identity.machine,
+        key: identity.key_pair()?.public(),
+    };
     let url = join_url(address, port);
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(10)))
         .build()
         .into();
-    let request = JoinRequest {
-        code: code.to_owned(),
-    };
-    let identity: Identity = match agent.post(&url).send_json(&request) {
-        Ok(mut response) => response
-            .body_mut()
-            .read_json()
-            .map_err(|_| JoinError::BadAnswer(url.clone()))?,
-        Err(ureq::Error::StatusCode(403)) => return Err(JoinError::BadCode),
-        Err(error) => {
-            return Err(JoinError::Unreachable {
-                url,
-                reason: error.to_string(),
-            });
-        }
-    };
-    let text = serde_json::to_string(&identity).map_err(|_| JoinError::BadAnswer(url))?;
-    secrets.set(IDENTITY_SECRET, &text)?;
-    Ok(identity)
+    match agent.post(&url).send_json(&request) {
+        Ok(_) => Ok(identity.machine),
+        Err(ureq::Error::StatusCode(403)) => Err(JoinError::BadCode),
+        Err(ureq::Error::StatusCode(409)) => Err(JoinError::Taken(identity.machine)),
+        Err(ureq::Error::StatusCode(status)) => Err(JoinError::NotAdmitted { url, status }),
+        Err(error) => Err(JoinError::Unreachable {
+            url,
+            reason: error.to_string(),
+        }),
+    }
 }
 
-/// The URL to post a join code to: `address` is an IP address or a host name, with or
-/// without a port.
+/// The URL to post a join code to: `address` is an IP address, a bracketed IPv6 address or a
+/// host name, with or without a port.
 fn join_url(address: &str, port: u16) -> String {
+    let unbracketed = address
+        .strip_prefix('[')
+        .and_then(|a| a.strip_suffix(']'))
+        .unwrap_or(address);
     if let Ok(socket) = address.parse::<SocketAddr>() {
-        return format!("http://{socket}{JOIN_PATH}");
-    }
-    match address.parse::<IpAddr>() {
-        Ok(ip) => format!("http://{}{JOIN_PATH}", SocketAddr::new(ip, port)),
-        Err(_) if address.contains(':') => format!("http://{address}{JOIN_PATH}"),
-        Err(_) => format!("http://{address}:{port}{JOIN_PATH}"),
-    }
-}
-
-/// This machine's id and key, if it has joined a fleet.
-pub fn identity(secrets: &dyn Secrets) -> Result<Option<Identity>, JoinError> {
-    match secrets.get(IDENTITY_SECRET)? {
-        None => Ok(None),
-        Some(text) => serde_json::from_str(&text)
-            .map(Some)
-            .map_err(|_| JoinError::Unreadable(IDENTITY_SECRET)),
+        format!("http://{socket}{JOIN_PATH}")
+    } else if let Ok(ip) = unbracketed.parse::<IpAddr>() {
+        format!("http://{}{JOIN_PATH}", SocketAddr::new(ip, port))
+    } else if address.contains(':') {
+        format!("http://{address}{JOIN_PATH}")
+    } else {
+        format!("http://{address}:{port}{JOIN_PATH}")
     }
 }
 
@@ -159,26 +170,35 @@ pub fn identity(secrets: &dyn Secrets) -> Result<Option<Identity>, JoinError> {
 pub enum JoinError {
     #[error("the code is wrong, used or expired; ask for a new one")]
     BadCode,
+    #[error(
+        "machine {0} is already known to the fleet, or was revoked; a revoked machine joins \
+         again only with a new identity"
+    )]
+    Taken(MachineId),
+    #[error("the public key sent is not an Ed25519 public key")]
+    BadKey,
+    #[error("{url} could not admit this machine (HTTP {status}); ask for a new code")]
+    NotAdmitted { url: String, status: u16 },
     #[error("{url} could not be reached: {reason}")]
     Unreachable { url: String, reason: String },
-    #[error("{0} answered with something that is not an identity")]
-    BadAnswer(String),
     #[error("the secret {0} is not in the expected form")]
     Unreadable(&'static str),
+    #[error("the system gave no random numbers")]
+    Random,
     #[error(transparent)]
     Secrets(#[from] SecretsError),
 }
 
-/// Why a machine's link is refused. None of these names the key.
+/// Why a machine's link is refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Refused {
-    #[error("it sent no key")]
+    #[error("it proved no key")]
     NoKey,
     #[error("this machine holds no key for it")]
     Unknown,
     #[error("it is revoked")]
     Revoked,
-    #[error("its key is wrong")]
+    #[error("its proof does not match its key")]
     WrongKey,
 }
 
@@ -191,37 +211,71 @@ pub enum KeyState {
     NoKey,
 }
 
-/// A machine's key. Its value is never shown in debug output.
+/// A machine's Ed25519 public key, as hex.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PublicKey(String);
+
+impl PublicKey {
+    fn verifier(&self) -> Option<UnparsedPublicKey<Vec<u8>>> {
+        let bytes = unhex(&self.0).filter(|b| b.len() == ED25519_PUBLIC_KEY_LENGTH)?;
+        Some(UnparsedPublicKey::new(&ED25519, bytes))
+    }
+}
+
+const ED25519_PUBLIC_KEY_LENGTH: usize = 32;
+
+/// This machine's private key, as hex PKCS#8. It is never shown in debug output.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct MachineKey(String);
+struct PrivateKey(String);
 
-impl MachineKey {
-    fn random() -> Self {
-        Self(format!(
-            "{}{}",
-            Uuid::new_v4().simple(),
-            Uuid::new_v4().simple()
-        ))
-    }
-
-    /// Compares in time that does not depend on where the keys differ.
-    fn matches(&self, other: &Self) -> bool {
-        same(self.0.as_bytes(), other.0.as_bytes())
-    }
-}
-
-impl fmt::Debug for MachineKey {
+impl fmt::Debug for PrivateKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("MachineKey(..)")
+        f.write_str("PrivateKey(..)")
     }
 }
 
-/// A machine's id and key, as joining gives them.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Identity {
-    pub machine: MachineId,
-    pub key: MachineKey,
+/// This machine's id and private key.
+#[derive(Debug, Serialize, Deserialize)]
+struct Identity {
+    machine: MachineId,
+    key: PrivateKey,
+}
+
+impl Identity {
+    /// The identity kept in `secrets`, made and kept there first if there is none.
+    fn load_or_create(secrets: &dyn Secrets) -> Result<Self, JoinError> {
+        if let Some(text) = secrets.get(IDENTITY_SECRET)? {
+            return serde_json::from_str(&text).map_err(|_| JoinError::Unreadable(IDENTITY_SECRET));
+        }
+        let pkcs8 =
+            Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).map_err(|_| JoinError::Random)?;
+        let identity = Self {
+            machine: MachineId::random(),
+            key: PrivateKey(hex(pkcs8.as_ref())),
+        };
+        let text =
+            serde_json::to_string(&identity).map_err(|_| JoinError::Unreadable(IDENTITY_SECRET))?;
+        secrets.set(IDENTITY_SECRET, &text)?;
+        Ok(identity)
+    }
+
+    fn key_pair(&self) -> Result<Signer, JoinError> {
+        unhex(&self.key.0)
+            .and_then(|pkcs8| Ed25519KeyPair::from_pkcs8(&pkcs8).ok())
+            .map(Signer)
+            .ok_or(JoinError::Unreadable(IDENTITY_SECRET))
+    }
+}
+
+/// This machine's key pair.
+struct Signer(Ed25519KeyPair);
+
+impl Signer {
+    fn public(&self) -> PublicKey {
+        PublicKey(hex(self.0.public_key().as_ref()))
+    }
 }
 
 /// A one-time join code, shown to a person. It is never shown in debug output.
@@ -239,21 +293,24 @@ impl fmt::Debug for Code {
     }
 }
 
-/// What this machine holds for another: its key, or that it is revoked.
+/// What this machine holds for another: its public key, or that it is revoked.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 enum Entry {
-    Active { key: MachineKey },
+    Active { key: PublicKey },
     Revoked,
 }
 
-/// The join codes this machine has shown and the keys of the machines it admits.
+/// This machine's identity, the join codes it has shown and the keys of the machines it
+/// admits.
 #[derive(Clone)]
 pub struct Keys {
     inner: Arc<KeysInner>,
 }
 
 struct KeysInner {
+    me: MachineId,
+    signer: Signer,
     secrets: Arc<dyn Secrets>,
     held: Mutex<Held>,
     /// Held across each change to the key table and its save, so saves land in order and a
@@ -262,21 +319,33 @@ struct KeysInner {
 }
 
 struct Held {
-    codes: Vec<(String, Instant)>,
+    codes: Vec<Shown>,
     machines: BTreeMap<MachineId, Entry>,
 }
 
+/// A code shown, and the machine that used it.
+struct Shown {
+    code: String,
+    at: Instant,
+    used_by: Option<MachineId>,
+}
+
 impl Keys {
-    /// The key table kept in `secrets`, with no codes outstanding.
-    pub fn load(secrets: Arc<dyn Secrets>) -> Result<Self, JoinError> {
+    /// This machine's identity and key table, kept in `secrets`, with no codes outstanding.
+    /// A machine with no identity yet is given one, and its own key is always in its table.
+    pub fn open(secrets: Arc<dyn Secrets>) -> Result<Self, JoinError> {
+        let identity = Identity::load_or_create(&*secrets)?;
+        let signer = identity.key_pair()?;
         let machines = match secrets.get(KEYS_SECRET)? {
             None => BTreeMap::new(),
             Some(text) => {
                 serde_json::from_str(&text).map_err(|_| JoinError::Unreadable(KEYS_SECRET))?
             }
         };
-        Ok(Self {
+        let keys = Self {
             inner: Arc::new(KeysInner {
+                me: identity.machine,
+                signer,
                 secrets,
                 held: Mutex::new(Held {
                     codes: Vec::new(),
@@ -284,51 +353,96 @@ impl Keys {
                 }),
                 saving: Mutex::new(()),
             }),
-        })
+        };
+        if keys.state(keys.me()) == KeyState::NoKey {
+            let _saving = lock(&keys.inner.saving);
+            let key = keys.public_key();
+            keys.change(|machines| {
+                machines.insert(identity.machine, Entry::Active { key });
+            })?;
+        }
+        Ok(keys)
+    }
+
+    /// This machine's id.
+    pub fn me(&self) -> MachineId {
+        self.inner.me
+    }
+
+    /// This machine's public key.
+    pub fn public_key(&self) -> PublicKey {
+        self.inner.signer.public()
     }
 
     /// A new code that works once within [`CODE_VALID_FOR`].
-    pub fn new_code(&self) -> Code {
-        let random = Uuid::new_v4();
-        let bytes = random.as_bytes();
-        // Bytes 6 and 8 carry the UUID's version and variant bits, so they are skipped.
-        let code: String = [0, 1, 2, 3, 4, 5, 9, 10, 11, 12]
+    pub fn new_code(&self) -> Result<Code, JoinError> {
+        let mut bytes = [0; CODE_LENGTH];
+        SystemRandom::new()
+            .fill(&mut bytes)
+            .map_err(|_| JoinError::Random)?;
+        let code: String = bytes
             .iter()
-            .take(CODE_LENGTH)
-            .map(|&i| char::from(CODE_LETTERS[usize::from(bytes[i]) % CODE_LETTERS.len()]))
+            .map(|&b| char::from(CODE_LETTERS[usize::from(b) % CODE_LETTERS.len()]))
             .collect();
         let mut held = self.held();
         held.forget_expired_codes();
-        held.codes.push((code.clone(), Instant::now()));
-        Code(code)
+        held.codes.push(Shown {
+            code: code.clone(),
+            at: Instant::now(),
+            used_by: None,
+        });
+        Ok(Code(code))
     }
 
-    /// Uses up `code` and admits a new machine with a key of its own.
-    pub fn redeem(&self, code: &str) -> Result<Identity, JoinError> {
+    /// Uses up `code` to admit `machine` with public key `key`. The machine that used a code
+    /// may send it again while it is valid, as a join whose answer was lost does. A machine
+    /// already in the table, or revoked, cannot be claimed by a code. A code is used up only
+    /// once the key is saved.
+    pub fn redeem(&self, code: &str, machine: MachineId, key: &PublicKey) -> Result<(), JoinError> {
         let typed = code.trim().to_ascii_uppercase();
+        let _saving = lock(&self.inner.saving);
         {
             let mut held = self.held();
             held.forget_expired_codes();
-            let found = held
+            let shown = held
                 .codes
                 .iter()
-                .position(|(code, _)| same(code.as_bytes(), typed.as_bytes()))
+                .find(|shown| same(shown.code.as_bytes(), typed.as_bytes()))
                 .ok_or(JoinError::BadCode)?;
-            held.codes.remove(found);
+            let used_by = shown.used_by;
+            let holds = held.machines.get(&machine);
+            match (used_by, holds) {
+                (Some(user), Some(Entry::Active { key: held }))
+                    if user == machine && held == key =>
+                {
+                    return Ok(());
+                }
+                (Some(_), _) => return Err(JoinError::BadCode),
+                (None, Some(_)) => return Err(JoinError::Taken(machine)),
+                (None, None) => {}
+            }
         }
-        let identity = Identity {
-            machine: MachineId::random(),
-            key: MachineKey::random(),
-        };
-        let key = identity.key.clone();
+        if key.verifier().is_none() {
+            return Err(JoinError::BadKey);
+        }
+        let entry = Entry::Active { key: key.clone() };
         self.change(|machines| {
-            machines.insert(identity.machine, Entry::Active { key });
+            machines.insert(machine, entry);
         })?;
-        Ok(identity)
+        if let Some(shown) = self
+            .held()
+            .codes
+            .iter_mut()
+            .find(|shown| same(shown.code.as_bytes(), typed.as_bytes()))
+        {
+            shown.used_by = Some(machine);
+        }
+        Ok(())
     }
 
     /// Revokes `machine`: its key is forgotten and every link with it is refused.
     pub fn revoke(&self, machine: MachineId) -> Result<(), SecretsError> {
+        let _saving = lock(&self.inner.saving);
         self.change(|machines| {
             machines.insert(machine, Entry::Revoked);
         })
@@ -343,58 +457,97 @@ impl Keys {
         }
     }
 
-    /// Whether `key` proves `machine`.
-    pub fn check(&self, machine: MachineId, key: Option<&MachineKey>) -> Result<(), Refused> {
-        let key = key.ok_or(Refused::NoKey)?;
-        match self.held().machines.get(&machine) {
-            None => Err(Refused::Unknown),
-            Some(Entry::Revoked) => Err(Refused::Revoked),
-            Some(Entry::Active { key: held }) if held.matches(key) => Ok(()),
-            Some(Entry::Active { .. }) => Err(Refused::WrongKey),
+    /// Whether a link with `machine` may open or stay open.
+    fn admitted(&self, machine: MachineId) -> Result<(), Refused> {
+        match self.state(machine) {
+            KeyState::Active => Ok(()),
+            KeyState::Revoked => Err(Refused::Revoked),
+            KeyState::NoKey => Err(Refused::Unknown),
         }
     }
 
-    /// Serves a link a peer opened, as [`Peers::accept`] does, once its first message proves
-    /// the key of the machine its hello names. The link closes when that machine is revoked.
+    /// Whether `proof` is `machine`'s signature over `message`.
+    fn verify(&self, machine: MachineId, message: &[u8], proof: &str) -> Result<(), Refused> {
+        let key = match self.held().machines.get(&machine) {
+            None => return Err(Refused::Unknown),
+            Some(Entry::Revoked) => return Err(Refused::Revoked),
+            Some(Entry::Active { key }) => key.clone(),
+        };
+        let verifier = key.verifier().ok_or(Refused::WrongKey)?;
+        let proof = unhex(proof).ok_or(Refused::WrongKey)?;
+        verifier
+            .verify(message, &proof)
+            .map_err(|_| Refused::WrongKey)
+    }
+
+    /// This machine's signature over `message`, as hex.
+    fn sign(&self, message: &[u8]) -> String {
+        hex(self.inner.signer.0.sign(message).as_ref())
+    }
+
+    /// Serves a link a peer opened, as [`Peers::accept`] does, once both ends have proved
+    /// their keys and the peer's hello names the machine it proved. The link closes when that
+    /// machine is revoked.
     pub async fn accept(&self, peers: &Peers, conn: Conn) {
         let Conn { send, mut recv } = conn;
-        let Some((machine, key, hello)) = self.admit(&mut recv).await else {
+        let Some((machine, hello)) = self.admit(&send, &mut recv).await else {
             return;
         };
         let (near, far) = Conn::pair();
         if near.send.send(hello).await.is_err() {
             return;
         }
-        let keys = self.clone();
-        let admitted = move || match keys.check(machine, Some(&key)) {
-            Ok(()) => true,
-            Err(refused) => {
-                tracing::info!("join: link from {machine} closed: {refused}");
-                false
-            }
-        };
         tokio::select! {
             () = peers.accept(far) => {}
-            () = relay(Conn { send, recv }, near, admitted) => {}
+            () = relay(Conn { send, recv }, near, self.clone(), machine) => {}
         }
     }
 
-    /// Reads the key message and the hello that follows it, and returns the machine they
-    /// prove, its key and the hello to pass on.
-    async fn admit(&self, recv: &mut Receiver<String>) -> Option<(MachineId, MachineKey, String)> {
-        let first = timeout(OFFLINE_AFTER, recv.recv()).await.ok()??;
-        let Ok(KeyMessage { machine, key }) = serde_json::from_str(&first) else {
+    /// The accepting end of the handshake. Returns the machine proved and its hello.
+    async fn admit(
+        &self,
+        send: &Sender<String>,
+        recv: &mut Receiver<String>,
+    ) -> Option<(MachineId, String)> {
+        let me = self.me();
+        let Some(Handshake::Challenge {
+            machine,
+            nonce: theirs,
+        }) = read(recv).await
+        else {
             tracing::warn!("join: refused a link: {}", Refused::NoKey);
             return None;
         };
-        if let Err(refused) = self.check(machine, Some(&key)) {
+        let refuse = |refused: Refused| {
             tracing::warn!("join: refused a link from {machine}: {refused}");
+        };
+        if let Err(refused) = self.admitted(machine) {
+            refuse(refused);
+            return None;
+        }
+        let ours = nonce().ok()?;
+        let answer = Handshake::Answer {
+            machine: me,
+            nonce: ours.clone(),
+            proof: self.sign(&link_message(ACCEPTING, me, machine, &theirs)),
+        };
+        if !write(send, &answer).await {
+            return None;
+        }
+        let Some(Handshake::Proof { proof }) = read(recv).await else {
+            refuse(Refused::NoKey);
+            return None;
+        };
+        if let Err(refused) =
+            self.verify(machine, &link_message(DIALING, machine, me, &ours), &proof)
+        {
+            refuse(refused);
             return None;
         }
         let hello = timeout(OFFLINE_AFTER, recv.recv()).await.ok()??;
         match serde_json::from_str(&hello) {
             Ok(PeerMessage::Hello { machine: named, .. }) if named == machine => {
-                Some((machine, key, hello))
+                Some((machine, hello))
             }
             _ => {
                 tracing::warn!("join: refused a link from {machine}: its hello names another");
@@ -403,12 +556,12 @@ impl Keys {
         }
     }
 
-    /// Applies `edit` to a copy of the key table, saves the copy, then holds it.
+    /// Applies `edit` to a copy of the key table, saves the copy, then holds it. The caller
+    /// holds the `saving` lock.
     fn change(
         &self,
         edit: impl FnOnce(&mut BTreeMap<MachineId, Entry>),
     ) -> Result<(), SecretsError> {
-        let _saving = lock(&self.inner.saving);
         let mut machines = self.held().machines.clone();
         edit(&mut machines);
         // A key table always serializes: its keys are UUIDs and its values plain strings.
@@ -426,77 +579,126 @@ impl Keys {
 impl Held {
     fn forget_expired_codes(&mut self) {
         self.codes
-            .retain(|(_, shown)| shown.elapsed() < CODE_VALID_FOR);
+            .retain(|shown| shown.at.elapsed() < CODE_VALID_FOR);
     }
 }
 
-/// The first message on a link: who is dialing and its key.
-#[derive(Serialize, Deserialize)]
-#[serde(tag = "type", rename = "key")]
-struct KeyMessage {
-    machine: MachineId,
-    key: MachineKey,
+/// The messages a link opens with, before the hello.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum Handshake {
+    /// Dialer to acceptor: who is dialing, and a challenge for the acceptor to sign.
+    Challenge { machine: MachineId, nonce: String },
+    /// Acceptor to dialer: who answered, its signature over the dialer's challenge, and a
+    /// challenge for the dialer to sign.
+    Answer {
+        machine: MachineId,
+        nonce: String,
+        proof: String,
+    },
+    /// Dialer to acceptor: its signature over the acceptor's challenge.
+    Proof { proof: String },
 }
 
-fn key_message(identity: &Identity) -> String {
-    // A machine id and a plain string always serialize.
-    serde_json::to_string(&KeyMessage {
-        machine: identity.machine,
-        key: identity.key.clone(),
-    })
-    .unwrap_or_default()
+/// What a link proof signs: the signer's role, the signer, the machine it proves itself to
+/// and that machine's challenge.
+fn link_message(role: &str, signer: MachineId, verifier: MachineId, nonce: &str) -> Vec<u8> {
+    format!("foundry link proof\n{role}\n{signer}\n{verifier}\n{nonce}").into_bytes()
 }
 
-/// Opens links with `dialer`, sending this machine's key first. A revoked machine is not
-/// dialed, and a link to one closes within [`RECHECK`] of its revocation.
+/// A fresh challenge, as hex.
+fn nonce() -> Result<String, ring::error::Unspecified> {
+    let mut bytes = [0; NONCE_LENGTH];
+    SystemRandom::new().fill(&mut bytes)?;
+    Ok(hex(&bytes))
+}
+
+/// The next handshake message, or `None` when the link closes, stays silent for
+/// [`OFFLINE_AFTER`] or sends something else.
+async fn read(recv: &mut Receiver<String>) -> Option<Handshake> {
+    let text = timeout(OFFLINE_AFTER, recv.recv()).await.ok()??;
+    serde_json::from_str(&text).ok()
+}
+
+/// Sends a handshake message, and says whether the link is still open.
+async fn write(send: &Sender<String>, message: &Handshake) -> bool {
+    // A handshake message is ids and hex strings, which always serialize.
+    let text = serde_json::to_string(message).unwrap_or_default();
+    matches!(timeout(OFFLINE_AFTER, send.send(text)).await, Ok(Ok(())))
+}
+
+/// Opens links with `dialer` and proves both ends' keys before handing a link on. A machine
+/// this one holds no active key for is not dialed, and a link to one closes within
+/// [`RECHECK`] of its revocation.
 pub struct KeyedDialer {
     dialer: Arc<dyn Dialer>,
-    me: Identity,
     keys: Keys,
 }
 
 impl KeyedDialer {
-    pub fn new(dialer: Arc<dyn Dialer>, me: Identity, keys: Keys) -> Self {
-        Self { dialer, me, keys }
+    pub fn new(dialer: Arc<dyn Dialer>, keys: Keys) -> Self {
+        Self { dialer, keys }
     }
 }
 
 impl Dialer for KeyedDialer {
     fn dial(&self, peer: &Machine) -> BoxFuture<'static, io::Result<Conn>> {
-        if self.keys.state(peer.id) == KeyState::Revoked {
-            let refused = io::Error::new(
+        let (id, name) = (peer.id, peer.name.clone());
+        let refused = move |refused: Refused| {
+            io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                format!("{} is revoked", peer.name),
-            );
-            return Box::pin(async move { Err(refused) });
+                format!("{name} ({id}) refused: {refused}"),
+            )
+        };
+        if let Err(no) = self.keys.admitted(id) {
+            let error = refused(no);
+            return Box::pin(async move { Err(error) });
         }
         let dialing = self.dialer.dial(peer);
-        let message = key_message(&self.me);
-        let (keys, id) = (self.keys.clone(), peer.id);
+        let keys = self.keys.clone();
         Box::pin(async move {
-            let conn = dialing.await?;
-            conn.send
-                .send(message)
-                .await
-                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "the link closed"))?;
-            let (near, far) = Conn::pair();
-            let admitted = move || {
-                let revoked = keys.state(id) == KeyState::Revoked;
-                if revoked {
-                    tracing::info!("join: link to {id} closed: {}", Refused::Revoked);
-                }
-                !revoked
+            let mut conn = dialing.await?;
+            let closed = || io::Error::new(io::ErrorKind::BrokenPipe, "the link closed");
+            let me = keys.me();
+            let ours =
+                nonce().map_err(|_| io::Error::other("the system gave no random numbers"))?;
+            let challenge = Handshake::Challenge {
+                machine: me,
+                nonce: ours.clone(),
             };
-            tokio::spawn(relay(conn, near, admitted));
+            if !write(&conn.send, &challenge).await {
+                return Err(closed());
+            }
+            let Some(Handshake::Answer {
+                machine,
+                nonce: theirs,
+                proof,
+            }) = read(&mut conn.recv).await
+            else {
+                return Err(refused(Refused::NoKey));
+            };
+            if machine != id {
+                return Err(refused(Refused::WrongKey));
+            }
+            keys.verify(id, &link_message(ACCEPTING, id, me, &ours), &proof)
+                .map_err(&refused)?;
+            let proof = Handshake::Proof {
+                proof: keys.sign(&link_message(DIALING, me, id, &theirs)),
+            };
+            if !write(&conn.send, &proof).await {
+                return Err(closed());
+            }
+            let (near, far) = Conn::pair();
+            tokio::spawn(relay(conn, near, keys, id));
             Ok(far)
         })
     }
 }
 
-/// Carries messages both ways between `outer` and `inner` until either closes or
-/// `admitted` says no, checked every [`RECHECK`]. The two directions run side by side, so a
+/// Carries messages both ways between `outer` and `inner` until either closes or `keys` no
+/// longer admits `peer`, checked every [`RECHECK`]. The two directions run side by side, so a
 /// send that waits on one end never stops the other.
-async fn relay(outer: Conn, inner: Conn, admitted: impl Fn() -> bool) {
+async fn relay(outer: Conn, inner: Conn, keys: Keys, peer: MachineId) {
     let Conn {
         send: out_send,
         recv: mut out_recv,
@@ -509,7 +711,8 @@ async fn relay(outer: Conn, inner: Conn, admitted: impl Fn() -> bool) {
         let mut every = tokio::time::interval(RECHECK);
         loop {
             every.tick().await;
-            if !admitted() {
+            if let Err(refused) = keys.admitted(peer) {
+                tracing::info!("join: link with {peer} closed: {refused}");
                 return;
             }
         }
@@ -529,8 +732,9 @@ async fn forward(from: &mut Receiver<String>, to: &Sender<String>) {
     }
 }
 
-/// The route a joining machine posts its code to. It answers 403 to a code that is wrong,
-/// used or expired.
+/// The route a joining machine posts its code to. It answers 204 when the machine is
+/// admitted, 403 to a code that is wrong, used or expired, 409 to a machine already known or
+/// revoked, and 400 to a key that is not an Ed25519 public key.
 pub fn router(keys: Keys) -> Router {
     Router::new()
         .route(JOIN_PATH, post(redeem))
@@ -540,14 +744,26 @@ pub fn router(keys: Keys) -> Router {
 #[derive(Serialize, Deserialize)]
 struct JoinRequest {
     code: String,
+    machine: MachineId,
+    key: PublicKey,
 }
 
 async fn redeem(State(keys): State<Keys>, Json(request): Json<JoinRequest>) -> Response {
     // Saving the key table can wait on the keychain or the disk.
-    match tokio::task::spawn_blocking(move || keys.redeem(&request.code)).await {
-        Ok(Ok(identity)) => Json(identity).into_response(),
-        Ok(Err(JoinError::BadCode)) => {
-            (StatusCode::FORBIDDEN, JoinError::BadCode.to_string()).into_response()
+    let redeemed = tokio::task::spawn_blocking(move || {
+        keys.redeem(&request.code, request.machine, &request.key)
+    })
+    .await;
+    match redeemed {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(error @ JoinError::BadCode)) => {
+            (StatusCode::FORBIDDEN, error.to_string()).into_response()
+        }
+        Ok(Err(error @ JoinError::Taken(_))) => {
+            (StatusCode::CONFLICT, error.to_string()).into_response()
+        }
+        Ok(Err(error @ JoinError::BadKey)) => {
+            (StatusCode::BAD_REQUEST, error.to_string()).into_response()
         }
         Ok(Err(error)) => {
             tracing::warn!("join: a machine could not be admitted: {error}");
@@ -564,6 +780,20 @@ async fn redeem(State(keys): State<Keys>, Json(request): Json<JoinRequest>) -> R
 /// Compares two byte strings in time that depends only on their lengths.
 fn same(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0, |differ, (x, y)| differ | (x ^ y)) == 0
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn unhex(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).ok())
+        .collect()
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -940,9 +1170,9 @@ mod tests {
         assert!(is_hello(&answer), "{answer}");
     }
 
-    fn send(conn: &Conn, message: &Handshake) -> impl Future<Output = ()> + '_ {
+    async fn send(conn: &Conn, message: &Handshake) {
         let text = serde_json::to_string(message).unwrap();
-        async move { conn.send.send(text).await.unwrap() }
+        conn.send.send(text).await.unwrap();
     }
 
     async fn read(conn: &mut Conn) -> Handshake {
@@ -1039,7 +1269,8 @@ mod tests {
         // A dials R, and R answers with H's challenge so that A signs it.
         let inner = Arc::new(Pairs::default());
         let dialer = KeyedDialer::new(inner.clone(), a.clone());
-        let dialing = tokio::spawn(async move { dialer.dial(&machine(r.me())).await.map(drop) });
+        let r_id = r.me();
+        let dialing = tokio::spawn(async move { dialer.dial(&machine(r_id)).await.map(drop) });
         let mut at_r = inner_far(&inner).await;
         let Handshake::Challenge { nonce: a_nonce, .. } = read(&mut at_r).await else {
             panic!("A sent no challenge");
