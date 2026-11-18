@@ -21,7 +21,8 @@ impl<T> Record<T> {
     /// True only when `self` comes from the same owner as `other` with a higher version.
     ///
     /// Versions count every write by an owner, so the caller must already know both are
-    /// copies of the same record, matched by the body's id.
+    /// copies of the same record: the same kind and body id, or for a machine sample, the
+    /// same owner.
     pub fn supersedes(&self, other: &Self) -> bool {
         self.owner == other.owner && self.version > other.version
     }
@@ -45,8 +46,8 @@ pub struct Workspace {
 pub struct Terminal {
     pub id: TerminalId,
     pub workspace: WorkspaceId,
-    /// Never `Unreachable` as written by the owner: a receiver shows that when the owner is
-    /// offline, without changing the record.
+    /// The owner never writes `Unreachable`. Only a receiver shows it, while the owner is
+    /// offline.
     pub state: TerminalState,
     /// The child's exit code once it has exited, when known.
     pub exit_code: Option<i32>,
@@ -59,15 +60,16 @@ pub struct Session {
     pub workspace: WorkspaceId,
     pub terminal: TerminalId,
     pub model: String,
-    /// Never `Unreachable` as written by the owner: a receiver shows that when the owner is
-    /// offline, without changing the record.
+    /// The owner never writes `Unreachable`. Only a receiver shows it, while the owner is
+    /// offline.
     pub state: SessionState,
 }
 
 /// The owner machine's load, memory, disk and session count.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MachineSample {
-    /// The 1-minute load divided by logical cores. Always finite: JSON has no NaN.
+    /// The 1-minute load divided by logical cores. A NaN or infinite value fails to serialize.
+    #[serde(serialize_with = "crate::serialize_finite")]
     pub load_per_core: f64,
     /// Bytes.
     pub free_memory: u64,

@@ -6,6 +6,18 @@ pub mod record;
 pub mod settings;
 pub mod state;
 
+/// Serializes a finite `f64`, and refuses NaN and infinity, which JSON cannot carry:
+/// serde_json would write them as `null`, and the receiver would reject the whole message.
+pub(crate) fn serialize_finite<S: serde::Serializer>(value: &f64, s: S) -> Result<S::Ok, S::Error> {
+    if value.is_finite() {
+        s.serialize_f64(*value)
+    } else {
+        Err(serde::ser::Error::custom(format!(
+            "{value} cannot be sent: JSON has no non-finite numbers"
+        )))
+    }
+}
+
 /// Serializes `value` to JSON, reads it back and checks nothing changed.
 #[cfg(test)]
 pub(crate) fn assert_round_trip<T>(value: &T)
