@@ -231,10 +231,11 @@ fn lock_file(socket: &Path) -> PathBuf {
     socket.with_extension("lock")
 }
 
-/// Takes the lock on `path` without waiting, as `foundryd` checks it.
+/// Takes the lock on `path` shared and without waiting, as `foundryd` checks it: only a
+/// holder's exclusive lock refuses it.
 fn try_lock(path: &Path) -> Result<Flock<File>, Errno> {
     let file = File::open(path).unwrap();
-    Flock::lock(file, FlockArg::LockExclusiveNonblock).map_err(|(_, e)| e)
+    Flock::lock(file, FlockArg::LockSharedNonblock).map_err(|(_, e)| e)
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -649,9 +650,7 @@ fn a_holder_whose_lock_is_held_fails_to_start_and_names_the_lock_file() {
     let lock = lock_file(&socket);
     std::fs::write(&lock, b"").unwrap();
     // Shared, so only a request for the exclusive lock fails on it.
-    let _held = Flock::lock(File::open(&lock).unwrap(), FlockArg::LockSharedNonblock)
-        .map_err(|(_, e)| e)
-        .unwrap();
+    let _held = try_lock(&lock).unwrap();
     let output = run_starter(holder_command(
         &dir,
         &socket,
