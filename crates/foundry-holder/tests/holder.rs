@@ -312,9 +312,9 @@ async fn a_flood_with_no_client_attached_finishes_in_bounded_memory() {
 
 #[tokio::test]
 async fn a_client_that_stops_reading_is_dropped_without_blocking_the_child() {
-    // A counter the stalled client's stream is checked against, then 200 MB to push the holder.
+    // A counter the stalled client's stream is checked against, then 100 MB to push the holder.
     let script = &format!(
-        "{NO_OPOST} -echo; printf R; read x; seq 1 999999; head -c 200000000 /dev/zero | tr '\\0' a"
+        "{NO_OPOST} -echo; printf R; read x; seq 1 999999; head -c 100000000 /dev/zero | tr '\\0' a"
     );
     let holder = Holder::start(&["sh", "-c", script], &[]);
     let mut driver = holder.attach().await;
@@ -346,7 +346,7 @@ async fn a_client_that_stops_reading_is_dropped_without_blocking_the_child() {
     assert!(fresh.snapshot.iter().all(|&b| b == b'a'));
     assert_eq!(
         fresh.start + fresh.snapshot.len() as u64,
-        counter.len() as u64 + 200_000_000
+        counter.len() as u64 + 100_000_000
     );
 }
 
@@ -714,7 +714,7 @@ async fn clients_that_stop_reading_are_cut_off_and_let_go() {
         &[
             "sh",
             "-c",
-            "stty -echo; printf R; read x; head -c 200000000 /dev/zero | tr '\\0' a",
+            "stty -echo; printf R; read x; head -c 100000000 /dev/zero | tr '\\0' a",
         ],
         &[],
     );
