@@ -19,6 +19,10 @@ mod tests;
 
 /// The schema, one step per entry. A file's `user_version` counts the steps it has had, so
 /// a step once released is never edited: a change is a new step at the end.
+///
+/// A rollback starts the previous build on a file the newer build already migrated, and
+/// `open` lets it. So each step must leave the schema usable by the build before it: new
+/// tables, or new columns with a default, never a changed key or a dropped column.
 const MIGRATIONS: &[&str] = &[
     // 1: records keyed by kind and id, the owner's own version counter, shared settings.
     "CREATE TABLE records (
