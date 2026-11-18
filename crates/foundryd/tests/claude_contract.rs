@@ -176,8 +176,8 @@ fn claude_code_posts_the_hooks_sessions_reads() {
         "Run the shell command `ping -c 60 127.0.0.1 > ping.txt` with your Bash tool, in the \
          foreground. Do nothing else.",
     );
-    // Whether the default permission mode asks about the command is Claude Code's call, so it
-    // is answered yes if it asks.
+    // The dialog is answered yes once it is up. Its `Notification` is part of the step's row
+    // below, so a Claude Code that stops asking about the command fails the test there.
     let ran = || folder.join("ping.txt").exists();
     let until = Instant::now() + TURN;
     let mut answered = false;

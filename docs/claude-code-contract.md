@@ -39,7 +39,7 @@ Every field each hook carried on 2.1.322. Only the two above are read; the rest 
 
 ## Which hooks arrive after each step
 
-The hooks are the seven `sessions` registers; Claude Code calls no others. The state is what `next_state` makes of them, in order, from `starting`.
+The hooks are the seven `sessions` registers; the test sees no others. The state is what `next_state` makes of them, in order, from `starting`.
 
 The test asserts each row exactly: these hooks, in this order, and no other of the seven by the end of the step. A step that ends on a key press waits 15 seconds after it before it checks.
 
