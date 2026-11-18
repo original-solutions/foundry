@@ -4,7 +4,7 @@
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use foundryd::{join, not_built, service};
+use foundryd::{daemon, join, service, status};
 
 #[derive(Parser)]
 #[command(name = "foundryd", version, about)]
@@ -34,9 +34,8 @@ enum Command {
 
 fn main() -> ExitCode {
     match Cli::parse().command {
-        // The plan gives `run` and `status` to no task yet.
-        Command::Run => not_built("run"),
-        Command::Status => not_built("status"),
+        Command::Run => daemon::run(),
+        Command::Status => status::status(),
         Command::Install => service::install(),
         Command::Uninstall => service::uninstall(),
         Command::Join { address, code } => join::join(&address, &code),
