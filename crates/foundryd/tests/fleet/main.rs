@@ -211,15 +211,19 @@ async fn forward(
     let is_cut = |cut: &BTreeSet<MachineId>| ends.iter().any(|id| cut.contains(id));
     loop {
         tokio::select! {
-            message = from_a.recv() => match message {
-                Some(m) if to_b.send(m).await.is_ok() => {}
-                _ => return,
-            },
-            message = from_b.recv() => match message {
-                Some(m) if to_a.send(m).await.is_ok() => {}
-                _ => return,
-            },
-            _ = cut.wait_for(is_cut) => return,
+            message = from_a.recv() => {
+                let Some(m) = message else { return };
+                if to_b.send(m).await.is_err() {
+                    return;
+                }
+            }
+            message = from_b.recv() => {
+                let Some(m) = message else { return };
+                if to_a.send(m).await.is_err() {
+                    return;
+                }
+            }
+            _ = async { cut.wait_for(is_cut).await.is_ok() } => return,
         }
     }
 }
