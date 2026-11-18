@@ -703,6 +703,36 @@ async fn nothing_a_client_sends_after_its_refusal_reaches_the_child() {
 }
 
 #[tokio::test]
+async fn a_client_that_hangs_up_still_gets_what_was_queued_for_it() {
+    let holder = Holder::start(
+        &[
+            "sh",
+            "-c",
+            "head -c 20000000 /dev/zero | tr '\\0' a; sleep 60",
+        ],
+        &[],
+    );
+    let deadline = Instant::now() + WAIT;
+    while holder.attach().await.snapshot.len() < MAX_BYTES {
+        assert!(Instant::now() < deadline, "the scrollback never filled");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let mut stream = holder.connect().await;
+    protocol::write_request(&mut stream, &Request::Attach)
+        .await
+        .unwrap();
+    tokio::io::AsyncWriteExt::shutdown(&mut stream)
+        .await
+        .unwrap();
+    match next(&mut stream).await {
+        Reply::Snapshot { bytes, .. } => assert_eq!(bytes.len(), MAX_BYTES),
+        other => panic!("expected the snapshot, got {other:?}"),
+    }
+    assert_eq!(read_or_end(&mut stream).await, None);
+}
+
+#[tokio::test]
 async fn a_client_that_hangs_up_without_reading_is_let_go() {
     let holder = Holder::start(
         &[

@@ -424,6 +424,42 @@ mod tests {
         assert_eq!(read_request(&mut server).await.unwrap(), None);
     }
 
+    /// A reader whose connection was reset after `before` bytes.
+    struct Reset {
+        before: Vec<u8>,
+    }
+
+    impl AsyncRead for Reset {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.before.is_empty() {
+                return std::task::Poll::Ready(Err(std::io::ErrorKind::ConnectionReset.into()));
+            }
+            let n = self.before.len().min(buf.remaining());
+            buf.put_slice(&self.before[..n]);
+            self.before.drain(..n);
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reset_connection_has_ended() {
+        let frame = Request::Input(Bytes::from_static(b"abc")).encode();
+        for before in [&frame[..0], &frame[..2], &frame[..7]] {
+            let mut reply_side = Reset {
+                before: before.to_vec(),
+            };
+            assert_eq!(read_reply(&mut reply_side).await.unwrap(), None);
+            let mut request_side = Reset {
+                before: before.to_vec(),
+            };
+            assert_eq!(read_request(&mut request_side).await.unwrap(), None);
+        }
+    }
+
     #[tokio::test]
     async fn a_connection_that_ends_part_way_through_a_frame_has_ended() {
         let (mut client, mut server) = tokio::io::duplex(64);
