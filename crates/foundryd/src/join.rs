@@ -1169,7 +1169,7 @@ mod tests {
         ] {
             let kept = hold_key(&*secrets, machine, key);
             assert!(
-                matches!(kept, Err(JoinError::Taken(m)) if m == machine),
+                matches!(kept, Err(JoinError::HostRefusedHere(m)) if m == machine),
                 "{kept:?}"
             );
             assert_eq!(secrets.get(KEYS_SECRET).unwrap(), before);
@@ -1294,7 +1294,93 @@ mod tests {
         assert_eq!(active, 1);
     }
 
-    // ---- peer links ----
+    #[tokio::test(start_paused = true)]
+    async fn a_code_cannot_claim_a_machine_another_process_stored() {
+        let secrets = Arc::new(MemorySecrets::default());
+        let daemon = Keys::open(secrets.clone()).unwrap();
+        let (held, revoked, thief, newcomer) = (
+            machine_keys(),
+            machine_keys(),
+            machine_keys(),
+            machine_keys(),
+        );
+        // Another process on this machine keeps one key and revokes another machine.
+        hold_key(&*secrets, held.me(), held.public_key()).unwrap();
+        Keys::open(secrets.clone())
+            .unwrap()
+            .revoke(revoked.me())
+            .unwrap();
+        let before = secrets.get(KEYS_SECRET).unwrap();
+        let code = daemon.new_code().unwrap().to_string();
+        for (machine, key) in [
+            (held.me(), thief.public_key()),
+            (revoked.me(), revoked.public_key()),
+        ] {
+            let claimed = daemon.redeem(&code, machine, &key);
+            assert!(
+                matches!(claimed, Err(JoinError::Taken(m)) if m == machine),
+                "{claimed:?}"
+            );
+            assert_eq!(secrets.get(KEYS_SECRET).unwrap(), before);
+        }
+        daemon
+            .redeem(&code, newcomer.me(), &newcomer.public_key())
+            .unwrap();
+        let reopened = Keys::open(secrets).unwrap();
+        assert_eq!(reopened.state(held.me()), KeyState::Active);
+        assert_eq!(reopened.state(revoked.me()), KeyState::Revoked);
+        assert_eq!(reopened.state(newcomer.me()), KeyState::Active);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_change_to_an_unreadable_stored_table_is_refused_and_spends_no_code() {
+        let secrets = Arc::new(MemorySecrets::default());
+        let keys = Keys::open(secrets.clone()).unwrap();
+        let (peer, newcomer) = (machine_keys(), machine_keys());
+        admit(&keys, &peer);
+        let table = secrets.get(KEYS_SECRET).unwrap().unwrap();
+        let code = keys.new_code().unwrap().to_string();
+        secrets.set(KEYS_SECRET, "not json").unwrap();
+        let revoked = keys.revoke(peer.me());
+        assert!(
+            matches!(revoked, Err(JoinError::Unreadable(KEYS_SECRET))),
+            "{revoked:?}"
+        );
+        let redeemed = keys.redeem(&code, newcomer.me(), &newcomer.public_key());
+        assert!(
+            matches!(redeemed, Err(JoinError::Unreadable(KEYS_SECRET))),
+            "{redeemed:?}"
+        );
+        assert_eq!(
+            secrets.get(KEYS_SECRET).unwrap().as_deref(),
+            Some("not json")
+        );
+        secrets.set(KEYS_SECRET, &table).unwrap();
+        keys.redeem(&code, newcomer.me(), &newcomer.public_key())
+            .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_machine_always_holds_its_own_key_for_itself() {
+        let secrets = Arc::new(MemorySecrets::default());
+        let me = Keys::open(secrets.clone()).unwrap();
+        let stranger = machine_keys();
+        let foreign: BTreeMap<MachineId, Entry> = [(
+            me.me(),
+            Entry::Active {
+                key: stranger.public_key(),
+            },
+        )]
+        .into();
+        secrets.set(KEYS_SECRET, &write_table(&foreign)).unwrap();
+        let reopened = Keys::open(secrets.clone()).unwrap();
+        let stored: serde_json::Value =
+            serde_json::from_str(&secrets.get(KEYS_SECRET).unwrap().unwrap()).unwrap();
+        assert_eq!(
+            stored[me.me().to_string()]["key"].as_str(),
+            Some(reopened.public_key().0.as_str())
+        );
+    }
 
     fn machine(id: MachineId) -> Machine {
         Machine {
@@ -1745,6 +1831,49 @@ mod tests {
         join_over_http(port, &code, Arc::new(MemorySecrets::default()))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_answer_naming_this_machine_is_refused_and_kept_out_of_its_table() {
+        let secrets = Arc::new(MemorySecrets::default());
+        let me = Keys::open(secrets.clone()).unwrap();
+        let stranger = machine_keys();
+        let answer = JoinAnswer {
+            machine: me.me(),
+            key: stranger.public_key(),
+        };
+        let answer = serde_json::to_value(&answer).unwrap();
+        let app = Router::new().route(
+            JOIN_PATH,
+            post(move || {
+                let answer = answer.clone();
+                async move { Json(answer) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let before = secrets.get(KEYS_SECRET).unwrap();
+        let joined = join_over_http(port, "ABCDEFGHJK", secrets.clone()).await;
+        assert!(
+            matches!(joined, Err(JoinError::NotAdmitted { .. })),
+            "{joined:?}"
+        );
+        assert_eq!(secrets.get(KEYS_SECRET).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn a_host_this_machine_holds_revoked_is_named_in_the_join_error() {
+        let h = machine_keys();
+        let port = serve(h.clone()).await;
+        let secrets = Arc::new(MemorySecrets::default());
+        Keys::open(secrets.clone()).unwrap().revoke(h.me()).unwrap();
+        let code = h.new_code().unwrap().to_string();
+        let joined = join_over_http(port, &code, secrets).await;
+        assert!(
+            matches!(joined, Err(JoinError::HostRefusedHere(m)) if m == h.me()),
+            "{joined:?}"
+        );
     }
 
     #[tokio::test]
