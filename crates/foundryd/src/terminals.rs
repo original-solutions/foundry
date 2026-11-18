@@ -183,7 +183,8 @@ impl Terminals {
     }
 
     /// Bytes typed into the terminal. Input the holder refuses, because the child has left too
-    /// much unread, is [`TerminalError::Refused`]; none of it reaches the child.
+    /// much unread, is [`TerminalError::Refused`]; none of it reaches the child. Input to a
+    /// child that has exited is dropped with no error, as typing into a finished terminal is.
     pub async fn input(&self, id: TerminalId, bytes: Bytes) -> Result<(), TerminalError> {
         self.inner.entry(id)?.send(&Request::Input(bytes)).await
     }
@@ -286,9 +287,13 @@ impl Inner {
         if let Err(reason) = started {
             let ended = Terminal {
                 state: TerminalState::Exited,
-                ..body
+                ..body.clone()
             };
-            self.write(ended, true).await?;
+            if let Err(error) = self.write(ended, true).await {
+                // Its record still says running, so it stays live for a close to delete.
+                tracing::warn!(terminal = %id, %error, "failed terminal start not recorded");
+                self.insert(body, socket);
+            }
             return Err(TerminalError::Start { id, reason });
         }
         self.adopt(body, socket);
@@ -302,24 +307,24 @@ impl Inner {
             let _control = entry.control.lock().await;
             entry.hang_up().await?;
         }
-        {
-            let mut live = lock(&self.live);
-            match live.get(&id) {
-                Some(held) if Arc::ptr_eq(held, &entry) => live.remove(&id),
-                // Another close got here first.
-                _ => return Err(TerminalError::Unknown(id)),
-            };
-        }
-        if let Some(watcher) = lock(&entry.watcher).take() {
-            watcher.abort();
-        }
+        // Taken before the entry is let go, so an exit write already under way finishes first
+        // and the deleted record is the newest. A write that fails leaves the terminal live, so
+        // the close can be tried again.
         let mut body = entry.body.lock().await;
+        if !self.is_live(&entry) {
+            // Another close got here first.
+            return Err(TerminalError::Unknown(id));
+        }
         let ended = Terminal {
             state: TerminalState::Exited,
             ..body.clone()
         };
         self.write(ended.clone(), true).await?;
         *body = ended;
+        lock(&self.live).remove(&id);
+        if let Some(watcher) = lock(&entry.watcher).take() {
+            watcher.abort();
+        }
         Ok(())
     }
 
@@ -380,11 +385,11 @@ impl Inner {
     }
 
     /// Records that a live terminal's child has exited, once. A terminal closed meanwhile keeps
-    /// its deleted record.
-    async fn exited(&self, entry: &Arc<Entry>, code: Option<i32>) {
+    /// its deleted record. False when the record could not be written.
+    async fn exited(&self, entry: &Arc<Entry>, code: Option<i32>) -> bool {
         let mut body = entry.body.lock().await;
         if body.state == TerminalState::Exited || !self.is_live(entry) {
-            return;
+            return true;
         }
         let ended = Terminal {
             state: TerminalState::Exited,
@@ -392,9 +397,13 @@ impl Inner {
             ..body.clone()
         };
         match self.write(ended.clone(), false).await {
-            Ok(()) => *body = ended,
+            Ok(()) => {
+                *body = ended;
+                true
+            }
             Err(error) => {
-                tracing::warn!(terminal = %entry.id, %error, "terminal exit not recorded")
+                tracing::warn!(terminal = %entry.id, %error, "terminal exit not recorded yet");
+                false
             }
         }
     }
@@ -471,34 +480,10 @@ impl Entry {
             Some(stream) => stream,
             None => self.connect().await?,
         };
-        let answer = tokio::time::timeout(ANSWER_WITHIN, async {
-            protocol::write_request(&mut stream, request).await?;
-            protocol::write_request(&mut stream, &Request::Status).await?;
-            loop {
-                match protocol::read_reply(&mut stream).await? {
-                    Some(Reply::Status(_)) => return Ok(None),
-                    Some(Reply::Refused(reason)) => return Ok(Some(reason)),
-                    Some(_) => {}
-                    None => return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into()),
-                }
-            }
-        })
-        .await;
-        match answer {
-            Ok(Ok(None)) => {
-                *control = Some(stream);
-                Ok(())
-            }
-            Ok(Ok(Some(reason))) => Err(TerminalError::Refused {
-                id: self.id,
-                reason,
-            }),
-            Ok(Err(e)) => Err(TerminalError::Holder {
-                id: self.id,
-                source: e,
-            }),
-            Err(_) => Err(TerminalError::holder(self.id, no_answer())),
-        }
+        self.ask(&mut stream, &[request, &Request::Status], Answer::Status)
+            .await?;
+        *control = Some(stream);
+        Ok(())
     }
 
     /// Sends `Close` and waits for the holder to end the connection as it exits. A holder that
@@ -514,30 +499,57 @@ impl Entry {
             }
             Err(Unreachable::Failed(e)) => return Err(TerminalError::holder(self.id, e)),
         };
-        let answer = tokio::time::timeout(ANSWER_WITHIN, async {
-            protocol::write_request(&mut stream, &Request::Close).await?;
+        self.ask(&mut stream, &[&Request::Close], Answer::End).await
+    }
+
+    /// Writes `requests` and reads until the holder gives `answer`. A refusal, a broken
+    /// connection or no answer within [`ANSWER_WITHIN`] is an error.
+    async fn ask(
+        &self,
+        stream: &mut UnixStream,
+        requests: &[&Request],
+        answer: Answer,
+    ) -> Result<(), TerminalError> {
+        let answered = tokio::time::timeout(ANSWER_WITHIN, async {
+            for request in requests {
+                protocol::write_request(stream, request).await?;
+            }
             loop {
-                match protocol::read_reply(&mut stream).await? {
-                    None => return Ok::<_, protocol::Error>(None),
-                    Some(Reply::Refused(reason)) => return Ok(Some(reason)),
-                    Some(_) => {}
+                match (protocol::read_reply(stream).await?, answer) {
+                    (Some(Reply::Refused(reason)), _) => return Ok(Some(reason)),
+                    (Some(Reply::Status(_)), Answer::Status) | (None, Answer::End) => {
+                        return Ok(None);
+                    }
+                    (Some(_), _) => {}
+                    (None, Answer::Status) => {
+                        return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
+                    }
                 }
             }
         })
         .await;
-        match answer {
+        match answered {
             Ok(Ok(None)) => Ok(()),
             Ok(Ok(Some(reason))) => Err(TerminalError::Refused {
                 id: self.id,
                 reason,
             }),
-            Ok(Err(e)) => Err(TerminalError::Holder {
+            Ok(Err(source)) => Err(TerminalError::Holder {
                 id: self.id,
-                source: e,
+                source,
             }),
             Err(_) => Err(TerminalError::holder(self.id, no_answer())),
         }
     }
+}
+
+/// What ends a request to a holder.
+#[derive(Clone, Copy)]
+enum Answer {
+    /// A status reply.
+    Status,
+    /// The holder ending the connection.
+    End,
 }
 
 fn no_answer() -> io::Error {
@@ -588,21 +600,31 @@ enum Followed {
 
 /// Stays attached to a terminal's holder until it reports the child's exit or its socket is
 /// gone, and records which. A holder that drops the connection is attached to again; one that
-/// refuses or cannot be reached is tried again less and less often, and said so once.
+/// refuses or cannot be reached is tried again less and less often, and said so once. So is an
+/// exit the store could not take.
 async fn watch(inner: Arc<Inner>, entry: Arc<Entry>) {
     let mut wait = RECONNECT_AFTER;
     let mut warned = false;
+    let mut exit = None;
     loop {
+        if let Some(code) = exit {
+            if inner.exited(&entry, code).await {
+                return;
+            }
+            wait = (wait * 2).min(RECONNECT_AT_MOST);
+            tokio::time::sleep(wait).await;
+            continue;
+        }
         let trouble = match connect(&entry.socket).await {
             Err(Unreachable::Gone { .. }) => {
-                inner.exited(&entry, None).await;
-                return;
+                exit = Some(None);
+                continue;
             }
             Err(Unreachable::Failed(e)) => Some(e.to_string()),
             Ok(stream) => match follow(stream).await {
                 Followed::Exited(code) => {
-                    inner.exited(&entry, code).await;
-                    return;
+                    exit = Some(code);
+                    continue;
                 }
                 Followed::Ended => None,
                 Followed::Trouble(trouble) => Some(trouble),
@@ -1278,14 +1300,16 @@ mod tests {
         let started = terminals.start(WorkspaceId::random(), setup.cwd.path(), &sleep, &[]);
         // Polled until the holder is being started, then dropped.
         let _ = tokio::time::timeout(Duration::from_millis(5), started).await;
-        let id = {
-            let store = store.lock().unwrap();
-            let records = store.since(setup.me, 0).unwrap();
-            let [AnyRecord::Terminal(record)] = records.as_slice() else {
-                panic!("expected one terminal record, got {records:?}");
-            };
-            record.body.id
+        let mut records = Vec::new();
+        until("the start's record", || {
+            records = store.lock().unwrap().since(setup.me, 0).unwrap();
+            !records.is_empty()
+        })
+        .await;
+        let [AnyRecord::Terminal(record)] = records.as_slice() else {
+            panic!("expected one terminal record, got {records:?}");
         };
+        let id = record.body.id;
         until("the holder's socket", || setup.socket(id).exists()).await;
         until("the terminal to be live", || {
             terminals.inner.entry(id).is_ok()
@@ -1407,14 +1431,10 @@ mod tests {
         let (terminals, store) = setup.daemon();
         let id = setup.start(&terminals, "sleep 60").await;
         let _ = tokio::time::timeout(Duration::from_millis(1), terminals.close(id)).await;
-        until("the record to be deleted", || {
-            held(&store, setup.me, id).unwrap().deleted
+        until("the record to be deleted and the terminal let go", || {
+            held(&store, setup.me, id).unwrap().deleted && terminals.inner.entry(id).is_err()
         })
         .await;
-        assert!(matches!(
-            terminals.inner.entry(id),
-            Err(TerminalError::Unknown(_))
-        ));
     }
 
     /// The watcher's exit write waits for a busy store while the terminal is closed. Close
