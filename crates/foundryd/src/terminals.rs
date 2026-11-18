@@ -650,7 +650,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt as _;
     use std::time::{Duration, Instant};
 
-    use foundry_holder::protocol::{MAX_PENDING_INPUT, Request};
+    use foundry_holder::protocol::MAX_PENDING_INPUT;
     use foundry_proto::record::{AnyRecord, Record};
     use foundry_proto::state::TerminalState;
     use tempfile::TempDir;
@@ -749,6 +749,8 @@ mod tests {
     impl Drop for Setup {
         fn drop(&mut self) {
             use std::io::Write as _;
+            // A test that made the data directory read-only gives it back, so it can be removed.
+            set_mode(self.data.path(), 0o700);
             let Ok(entries) = std::fs::read_dir(self.dir()) else {
                 return;
             };
@@ -758,6 +760,61 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn set_mode(path: &Path, mode: u32) {
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+    }
+
+    /// Writes a running record for a terminal no `Terminals` started, as a holder from an
+    /// earlier daemon would have.
+    fn put_running(store: &Mutex<Store>, me: MachineId) -> TerminalId {
+        let id = TerminalId::random();
+        let mut store = store.lock().unwrap();
+        let record = Record {
+            owner: me,
+            version: store.own_next_version().unwrap(),
+            deleted: false,
+            body: Terminal {
+                id,
+                workspace: WorkspaceId::random(),
+                state: TerminalState::Running,
+                exit_code: None,
+            },
+        };
+        store.apply(&AnyRecord::Terminal(record), me).unwrap();
+        id
+    }
+
+    /// A stand-in holder serving `socket`. Each connection that sends a request gets the next
+    /// of `answers`: its replies, then the connection is closed when the flag says so. Once
+    /// the answers run out, connections are held open and never answered. A connection that
+    /// sends nothing, such as a probe, takes no answer.
+    fn stand_in(socket: PathBuf, answers: Vec<(Vec<Reply>, bool)>) -> tokio::task::JoinHandle<()> {
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            let mut answers = answers.into_iter();
+            let mut held = Vec::new();
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                if !matches!(protocol::read_request(&mut stream).await, Ok(Some(_))) {
+                    continue;
+                }
+                let Some((replies, close)) = answers.next() else {
+                    held.push(stream);
+                    continue;
+                };
+                for reply in replies {
+                    tokio::io::AsyncWriteExt::write_all(&mut stream, &reply.encode())
+                        .await
+                        .unwrap();
+                }
+                if !close {
+                    held.push(stream);
+                }
+            }
+        })
     }
 
     fn argv(script: &str) -> Vec<String> {
@@ -1281,5 +1338,82 @@ mod tests {
         let (terminals, _) = setup.daemon();
         terminals.reattach_all().await.unwrap();
         assert!(!left.exists());
+    }
+
+    /// The holder cuts the watcher off, then refuses it, then reports the exit. The watcher
+    /// attaches again after each and records the exit code, not an exit at the first drop.
+    #[tokio::test]
+    async fn the_watcher_attaches_again_after_the_holder_drops_or_refuses_it() {
+        let setup = Setup::new();
+        let (terminals, store) = setup.daemon();
+        let id = put_running(&store, setup.me);
+        let snapshot = || Reply::Snapshot {
+            start: 0,
+            bytes: Bytes::new(),
+        };
+        let holder = stand_in(
+            setup.socket(id),
+            vec![
+                (vec![snapshot()], true),
+                (
+                    vec![Reply::Refused("version 9 is not supported".into())],
+                    true,
+                ),
+                (
+                    vec![snapshot(), Reply::Status(ChildStatus::Exited(5))],
+                    false,
+                ),
+            ],
+        );
+        terminals.reattach_all().await.unwrap();
+        until("the record to say exited", || {
+            held(&store, setup.me, id).unwrap().body.state == TerminalState::Exited
+        })
+        .await;
+        assert_eq!(held(&store, setup.me, id).unwrap().body.exit_code, Some(5));
+        holder.abort();
+    }
+
+    /// A holder that takes a request and never answers fails it in bounded time, rather than
+    /// holding the terminal's control connection for ever.
+    #[tokio::test(start_paused = true)]
+    async fn a_holder_that_does_not_answer_fails_input_and_close_in_time() {
+        let setup = Setup::new();
+        let (terminals, store) = setup.daemon();
+        let id = put_running(&store, setup.me);
+        let holder = stand_in(setup.socket(id), vec![]);
+        terminals.reattach_all().await.unwrap();
+        for result in [
+            terminals.input(id, Bytes::from_static(b"x")).await,
+            terminals.close(id).await,
+        ] {
+            let Err(TerminalError::Holder {
+                source: protocol::Error::Io(e),
+                ..
+            }) = result
+            else {
+                panic!("expected the holder to time out, got {result:?}");
+            };
+            assert_eq!(e.kind(), io::ErrorKind::TimedOut);
+        }
+        assert!(terminals.inner.entry(id).is_ok(), "the terminal stays live");
+        holder.abort();
+    }
+
+    /// The caller of `close` going away leaves the terminal closed, not half closed.
+    #[tokio::test]
+    async fn a_close_whose_caller_goes_away_still_finishes() {
+        let setup = Setup::new();
+        let (terminals, store) = setup.daemon();
+        let id = setup.start(&terminals, "sleep 60").await;
+        let _ = tokio::time::timeout(Duration::from_millis(1), terminals.close(id)).await;
+        until("the record to be deleted", || {
+            held(&store, setup.me, id).unwrap().deleted
+        })
+        .await;
+        assert!(matches!(
+            terminals.inner.entry(id),
+            Err(TerminalError::Unknown(_))
+        ));
     }
 }
