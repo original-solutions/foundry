@@ -464,10 +464,6 @@ async fn follow(inner: Arc<Inner>, live: Arc<Live>, terminal: TerminalId, mut cu
                         }
                         // The child exited.
                         None => return exited(&inner, &live, terminal, &mut cursor).await,
-                        // The terminal was closed: its record is deleted, which is its end.
-                        Some(Err(TerminalError::Unknown(_))) => {
-                            return exited(&inner, &live, terminal, &mut cursor).await;
-                        }
                         Some(Err(error)) => {
                             retry(&mut backoff, terminal, error).await;
                             break;
@@ -547,19 +543,20 @@ async fn watch_for_stuck(inner: Arc<Inner>, live: Arc<Live>) {
             () = tokio::time::sleep_until(last + STUCK_AFTER) => {
                 // Does nothing unless the session is working. A write that fails is tried
                 // again until it holds or something arrives, which moves the count on.
-                let (mut warned, mut moved) = (false, false);
+                let (mut warned, mut moved, mut backoff) = (false, false, RETRY_AFTER);
                 while let Err(error) = inner.event(&live, Event::Stalled).await {
                     if !warned {
                         warned = true;
                         tracing::warn!(session = %live.id, %error, "session stall not recorded; trying again");
                     }
                     tokio::select! {
-                        () = tokio::time::sleep(RETRY_AFTER) => {}
+                        () = tokio::time::sleep(backoff) => {}
                         _ = activity.changed() => {
                             moved = true;
                             break;
                         }
                     }
+                    backoff = (backoff * 2).min(RETRY_AT_MOST);
                 }
                 if moved {
                     continue;
