@@ -121,6 +121,11 @@ struct Setup {
 
 impl Setup {
     fn new() -> Self {
+        Self::with(holder(), GIT_WITHIN)
+    }
+
+    /// Terminals started with the holder binary at `holder`, and git calls given `git_within`.
+    fn with(holder: PathBuf, git_within: Duration) -> Self {
         // A Unix socket path is at most about 100 bytes, which the system's own temporary
         // folder on macOS would take most of.
         let data = tempfile::Builder::new()
@@ -131,8 +136,14 @@ impl Setup {
         let store = Arc::new(Mutex::new(
             Store::open(data.path().join("foundry.db")).unwrap(),
         ));
-        let terminals = Arc::new(Terminals::new(me, store.clone(), data.path(), holder()));
-        let workspaces = Workspaces::new(me, store.clone(), data.path(), terminals.clone());
+        let terminals = Arc::new(Terminals::new(me, store.clone(), data.path(), holder));
+        let workspaces = Workspaces::with_git_within(
+            me,
+            store.clone(),
+            data.path(),
+            terminals.clone(),
+            git_within,
+        );
         Setup {
             data,
             remotes: tempfile::tempdir().unwrap(),
@@ -236,6 +247,12 @@ impl Setup {
         }
     }
 
+    /// A terminal in workspace `id` whose child sleeps until it is hung up.
+    async fn sleeper(&self, id: WorkspaceId, cwd: &Path) -> TerminalId {
+        let argv = ["/bin/sh", "-c", "sleep 3127"].map(String::from);
+        self.terminals.start(id, cwd, &argv, &[]).await.unwrap()
+    }
+
     /// Everything the terminal's child wrote, as kept after it exited.
     async fn screen(&self, id: TerminalId) -> String {
         let (snapshot, _) = self.terminals.attach(id).await.unwrap();
@@ -272,8 +289,10 @@ fn a_name_is_made_safe_for_git() {
     for (name, branch) in [
         ("fix-login", "fix-login"),
         ("fix login", "fix-login"),
+        ("Fix Login", "fix-login"),
         ("  fix   login  ", "fix-login"),
         ("café ☕ täst", "café-täst"),
+        ("CAFÉ", "café"),
         ("../../escape", "escape"),
         ("-rf", "rf"),
         ("--force", "force"),
@@ -283,7 +302,7 @@ fn a_name_is_made_safe_for_git() {
         ("@{u}", "u"),
         (".hidden", "hidden"),
         ("trailing.", "trailing"),
-        ("HEAD", "HEAD-workspace"),
+        ("HEAD", "head"),
         ("", "workspace"),
         ("...", "workspace"),
         ("-", "workspace"),
@@ -294,9 +313,9 @@ fn a_name_is_made_safe_for_git() {
 
 #[test]
 fn a_long_name_is_cut_on_a_character() {
-    let branch = safe_branch(&"é".repeat(300));
-    assert!(branch.len() <= 100, "{} bytes", branch.len());
-    assert!(branch.chars().all(|c| c == 'é'));
+    // Three bytes a character, so a cut at 100 bytes falls inside one.
+    let branch = safe_branch(&"日".repeat(60));
+    assert_eq!(branch, "日".repeat(33));
 }
 
 #[test]
@@ -338,6 +357,7 @@ async fn an_awkward_name_becomes_a_branch_and_its_worktree_is_made() {
             git(&worktree, &["branch", "--show-current"]).trim(),
             body.branch
         );
+        assert_eq!(setup.workspaces.worktree(id).await.unwrap(), worktree);
     }
     // Nothing was made outside the project's own folder of worktrees.
     assert_eq!(
@@ -508,9 +528,14 @@ async fn a_repo_with_no_config_or_no_provision_runs_no_setup() {
 #[tokio::test]
 async fn archive_with_uncommitted_files_or_unpushed_commits_is_refused_listing_each() {
     let setup = Setup::new();
-    let remote = setup.project(&[("README.md", "hello\n"), ("keep.txt", "keep\n")]);
+    let remote = setup.project(&[
+        ("README.md", "hello\n"),
+        ("keep.txt", "keep\n"),
+        ("old.txt", "old\n"),
+    ]);
     let id = setup.create(&remote, "main", "dirty").await;
     let worktree = setup.worktree(remote.project, "dirty");
+    let terminal = setup.sleeper(id, &worktree).await;
 
     std::fs::write(worktree.join("committed.txt"), "c").unwrap();
     git(&worktree, &["add", "committed.txt"]);
@@ -518,12 +543,16 @@ async fn archive_with_uncommitted_files_or_unpushed_commits_is_refused_listing_e
     std::fs::write(worktree.join("README.md"), "changed\n").unwrap();
     std::fs::write(worktree.join("new file.txt"), "new").unwrap();
     std::fs::remove_file(worktree.join("keep.txt")).unwrap();
+    git(&worktree, &["mv", "old.txt", "moved.txt"]);
 
     let err = setup.workspaces.archive(id, false).await.unwrap_err();
     let WorkspaceError::Dirty(dirty) = err else {
         panic!("{err}");
     };
-    assert_eq!(dirty.uncommitted, ["README.md", "keep.txt", "new file.txt"]);
+    assert_eq!(
+        dirty.uncommitted,
+        ["README.md", "keep.txt", "moved.txt", "new file.txt"]
+    );
     assert_eq!(dirty.unpushed.len(), 1, "{:?}", dirty.unpushed);
     assert!(dirty.unpushed[0].ends_with(" not pushed yet"), "{dirty:?}");
     let text = dirty.to_string();
@@ -531,8 +560,86 @@ async fn archive_with_uncommitted_files_or_unpushed_commits_is_refused_listing_e
         assert!(text.contains(part), "{text}");
     }
 
+    // A refusal changes nothing: the worktree and its running terminal are left as they were.
     assert!(worktree.join("new file.txt").exists());
     assert!(!setup.record(id).unwrap().deleted);
+    let terminals = setup.terminals_of(id);
+    assert_eq!(terminals.len(), 1);
+    assert_eq!(terminals[0].body.id, terminal);
+    assert!(!terminals[0].deleted);
+    assert_eq!(terminals[0].body.state, TerminalState::Running);
+}
+
+#[tokio::test]
+async fn an_unpushed_commit_alone_is_refused() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup.create(&remote, "main", "ahead").await;
+    let worktree = setup.worktree(remote.project, "ahead");
+    git(
+        &worktree,
+        &["commit", "-q", "--allow-empty", "-m", "only here"],
+    );
+
+    let err = setup.workspaces.archive(id, false).await.unwrap_err();
+    let WorkspaceError::Dirty(dirty) = err else {
+        panic!("{err}");
+    };
+    assert!(dirty.uncommitted.is_empty(), "{dirty:?}");
+    assert_eq!(dirty.unpushed.len(), 1, "{dirty:?}");
+    assert!(dirty.unpushed[0].ends_with(" only here"), "{dirty:?}");
+    assert!(worktree.exists());
+}
+
+#[tokio::test]
+async fn an_uncommitted_file_alone_is_refused() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup.create(&remote, "main", "loose").await;
+    let worktree = setup.worktree(remote.project, "loose");
+    std::fs::write(worktree.join("draft.txt"), "d").unwrap();
+
+    let err = setup.workspaces.archive(id, false).await.unwrap_err();
+    let WorkspaceError::Dirty(dirty) = err else {
+        panic!("{err}");
+    };
+    assert_eq!(dirty.uncommitted, ["draft.txt"]);
+    assert!(dirty.unpushed.is_empty(), "{dirty:?}");
+    assert!(worktree.join("draft.txt").exists());
+}
+
+#[tokio::test]
+async fn a_commit_on_a_detached_head_is_unpushed_work() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup.create(&remote, "main", "detached").await;
+    let worktree = setup.worktree(remote.project, "detached");
+    git(&worktree, &["checkout", "-q", "--detach"]);
+    git(
+        &worktree,
+        &["commit", "-q", "--allow-empty", "-m", "off the branch"],
+    );
+
+    let err = setup.workspaces.archive(id, false).await.unwrap_err();
+    let WorkspaceError::Dirty(dirty) = err else {
+        panic!("{err}");
+    };
+    assert_eq!(dirty.unpushed.len(), 1, "{dirty:?}");
+    assert!(dirty.unpushed[0].ends_with(" off the branch"), "{dirty:?}");
+    assert!(worktree.exists());
+}
+
+#[tokio::test]
+async fn ignored_files_do_not_hold_up_archive() {
+    let setup = Setup::new();
+    let remote = setup.project(&[(".gitignore", "build/\n")]);
+    let id = setup.create(&remote, "main", "built").await;
+    let worktree = setup.worktree(remote.project, "built");
+    std::fs::create_dir_all(worktree.join("build")).unwrap();
+    std::fs::write(worktree.join("build").join("out.bin"), "o").unwrap();
+
+    setup.workspaces.archive(id, false).await.unwrap();
+    assert!(!worktree.exists());
 }
 
 #[tokio::test]
@@ -578,16 +685,7 @@ async fn archive_stops_the_workspaces_terminals() {
     let remote = setup.project(&[("README.md", "hello\n")]);
     let id = setup.create(&remote, "main", "busy").await;
     let worktree = setup.worktree(remote.project, "busy");
-    let terminal = setup
-        .terminals
-        .start(
-            id,
-            &worktree,
-            &["/bin/sh".into(), "-c".into(), "sleep 3127".into()],
-            &[],
-        )
-        .await
-        .unwrap();
+    let terminal = setup.sleeper(id, &worktree).await;
 
     setup.workspaces.archive(id, false).await.unwrap();
 
@@ -607,11 +705,22 @@ async fn a_worktree_removed_by_hand_still_archives() {
 
     setup.workspaces.archive(id, false).await.unwrap();
     assert!(setup.record(id).unwrap().deleted);
-    // The branch is free of its worktree, so a new one can be made from it.
-    setup.create(&remote, "main", "gone again").await;
+    // Git no longer lists the removed worktree, so its branch can be checked out again.
     let clone = setup.clone_of(remote.project);
     let worktrees = git(&clone, &["worktree", "list", "--porcelain"]);
     assert!(!worktrees.contains("/gone\n"), "{worktrees}");
+    let again = setup.data.path().join("again");
+    git(
+        &clone,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--",
+            again.to_str().unwrap(),
+            "gone",
+        ],
+    );
 }
 
 #[tokio::test]
@@ -632,4 +741,131 @@ async fn an_unknown_or_archived_workspace_cannot_be_archived() {
         matches!(err, WorkspaceError::Unknown(w) if w == id),
         "{err}"
     );
+}
+
+#[tokio::test]
+async fn a_name_that_differs_only_in_case_from_a_branch_is_refused() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let first = setup.create(&remote, "main", "Fix Login").await;
+    assert_eq!(setup.body(first).branch, "fix-login");
+
+    let err = setup
+        .workspaces
+        .create(remote.project, "main", "FIX login")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, WorkspaceError::BranchExists(b) if b == "fix-login"),
+        "{err}"
+    );
+
+    // A branch made by hand in the clone counts too, whatever its case.
+    let clone = setup.clone_of(remote.project);
+    git(&clone, &["branch", "Other", "refs/remotes/origin/main"]);
+    let err = setup
+        .workspaces
+        .create(remote.project, "main", "other")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, WorkspaceError::BranchExists(b) if b == "other"),
+        "{err}"
+    );
+    let log = git(
+        &clone,
+        &["log", "-1", "--format=%H", "refs/heads/Other", "--"],
+    );
+    let main = git(&clone, &["rev-parse", "refs/remotes/origin/main"]);
+    assert_eq!(log, main);
+}
+
+#[tokio::test]
+async fn the_worktree_of_an_unknown_workspace_is_refused() {
+    let setup = Setup::new();
+    let unknown = WorkspaceId::random();
+    let err = setup.workspaces.worktree(unknown).await.unwrap_err();
+    assert!(
+        matches!(err, WorkspaceError::Unknown(w) if w == unknown),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn two_creates_at_once_share_one_clone() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let (a, b) = tokio::join!(
+        setup.workspaces.create(remote.project, "main", "one"),
+        setup.workspaces.create(remote.project, "main", "two"),
+    );
+    a.unwrap();
+    b.unwrap();
+    assert_eq!(
+        names_in(&setup.clones()),
+        [format!("{}.git", remote.project)]
+    );
+
+    let (a, b) = tokio::join!(
+        setup.workspaces.create(remote.project, "main", "same"),
+        setup.workspaces.create(remote.project, "main", "same"),
+    );
+    let refused = [&a, &b]
+        .iter()
+        .filter(|r| matches!(r, Err(WorkspaceError::BranchExists(b)) if b == "same"))
+        .count();
+    assert_eq!(refused, 1, "{a:?} {b:?}");
+    assert!(a.is_ok() || b.is_ok(), "{a:?} {b:?}");
+}
+
+#[tokio::test]
+async fn a_setup_that_cannot_start_leaves_the_workspace_and_names_it() {
+    let setup = Setup::with(PathBuf::from("/no/such/foundry-holder"), GIT_WITHIN);
+    let config = "factory:\n  provision:\n    - echo hi\n";
+    let remote = setup.project(&[(".dw/config.yml", config)]);
+    let err = setup
+        .workspaces
+        .create(remote.project, "main", "no holder")
+        .await
+        .unwrap_err();
+    let WorkspaceError::SetupNotStarted { workspace, .. } = err else {
+        panic!("{err}");
+    };
+    assert!(!setup.record(workspace).unwrap().deleted);
+    assert!(setup.worktree(remote.project, "no-holder").exists());
+}
+
+#[tokio::test]
+async fn a_fetch_that_hangs_fails_in_time_and_frees_the_project() {
+    let setup = Setup::with(holder(), Duration::from_secs(1));
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup.create(&remote, "main", "before").await;
+    // The remote side now takes longer to answer than git is given.
+    let clone = setup.clone_of(remote.project);
+    git(
+        &clone,
+        &[
+            "config",
+            "remote.origin.uploadpack",
+            "sleep 4.73; git-upload-pack",
+        ],
+    );
+
+    let started = Instant::now();
+    let err = setup
+        .workspaces
+        .create(remote.project, "main", "after")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, WorkspaceError::Git { command: "fetch", stderr } if stderr.contains("did not finish")),
+        "{err}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "{:?}",
+        started.elapsed()
+    );
+    // The project's lock was let go: an archive of it goes through.
+    setup.workspaces.archive(id, false).await.unwrap();
 }
