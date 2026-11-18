@@ -75,8 +75,6 @@ impl UiMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ids::MachineId;
-    use crate::record::AnyRecord;
     use crate::record::tests::{machine_sample, session, terminal, workspace};
     use crate::settings::tests::settings;
     use crate::{assert_round_trip, parse_error};
@@ -160,9 +158,89 @@ mod tests {
 
     #[test]
     fn a_message_keeps_the_protocol_it_was_sent_with() {
-        let json = r#"{"type":"records","protocol":7,"records":[]}"#;
-        let message: PeerMessage = serde_json::from_str(json).unwrap();
-        assert_eq!(message.protocol(), 7);
+        let peer: PeerMessage =
+            serde_json::from_str(r#"{"type":"records","protocol":7,"records":[]}"#).unwrap();
+        assert_eq!(peer.protocol(), 7);
+        let ui: UiMessage = serde_json::from_str(
+            r#"{"type":"settings","protocol":9,"settings":{"seq":0,"machines":[],"priority":[],"projects":[],"limits":{}}}"#,
+        )
+        .unwrap();
+        assert_eq!(ui.protocol(), 9);
+    }
+
+    #[test]
+    fn every_message_reads_from_its_wire_form() {
+        let machine = "67e55044-10b1-426f-9247-bb680e5fe0c8";
+        let settings = r#"{"seq":0,"machines":[],"priority":[],"projects":[],"limits":{}}"#;
+        let sample = format!(
+            r#"{{"kind":"machine_sample","owner":"{machine}","version":1,"deleted":false,"body":{{"load_per_core":0.5,"free_memory":1,"free_disk":2,"sessions":0}}}}"#
+        );
+        let record: AnyRecord = serde_json::from_str(&sample).unwrap();
+        let id = MachineId(machine.parse().unwrap());
+        let peer = [
+            (
+                format!(
+                    r#"{{"type":"hello","protocol":1,"machine":"{machine}","versions":{{"{machine}":4}}}}"#
+                ),
+                PeerMessage::Hello {
+                    protocol: 1,
+                    machine: id,
+                    versions: [(id, 4)].into(),
+                },
+            ),
+            (
+                format!(r#"{{"type":"records","protocol":1,"records":[{sample}]}}"#),
+                PeerMessage::Records {
+                    protocol: 1,
+                    records: vec![record.clone()],
+                },
+            ),
+            (
+                format!(r#"{{"type":"settings","protocol":1,"settings":{settings}}}"#),
+                PeerMessage::Settings {
+                    protocol: 1,
+                    settings: SharedSettings::default(),
+                },
+            ),
+        ];
+        for (json, expected) in peer {
+            assert_eq!(
+                serde_json::from_str::<PeerMessage>(&json).expect(&json),
+                expected
+            );
+        }
+        let ui = [
+            (
+                format!(
+                    r#"{{"type":"state","protocol":1,"records":[{sample}],"settings":{settings}}}"#
+                ),
+                UiMessage::State {
+                    protocol: 1,
+                    records: vec![record.clone()],
+                    settings: SharedSettings::default(),
+                },
+            ),
+            (
+                format!(r#"{{"type":"record","protocol":1,"record":{sample}}}"#),
+                UiMessage::Record {
+                    protocol: 1,
+                    record: record.clone(),
+                },
+            ),
+            (
+                format!(r#"{{"type":"settings","protocol":1,"settings":{settings}}}"#),
+                UiMessage::Settings {
+                    protocol: 1,
+                    settings: SharedSettings::default(),
+                },
+            ),
+        ];
+        for (json, expected) in ui {
+            assert_eq!(
+                serde_json::from_str::<UiMessage>(&json).expect(&json),
+                expected
+            );
+        }
     }
 
     #[test]

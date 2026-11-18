@@ -107,7 +107,46 @@ pub(crate) mod tests {
         json["added_later"] = serde_json::json!([]);
         json["machines"][0]["added_later"] = serde_json::json!({});
         json["projects"][0]["added_later"] = serde_json::json!(0);
+        let mac = settings.machines[0].id.to_string();
+        json["limits"][&mac]["added_later"] = serde_json::json!(null);
         let back: SharedSettings = serde_json::from_value(json).unwrap();
         assert_eq!(back, settings);
+    }
+
+    #[test]
+    fn settings_read_from_their_wire_form() {
+        let mac = "67e55044-10b1-426f-9247-bb680e5fe0c8";
+        let project = "11111111-1111-4111-8111-111111111111";
+        let json = format!(
+            r#"{{"seq":3,"machines":[{{"id":"{mac}","name":"m","address":"100.64.0.1"}}],"priority":["{mac}"],"projects":[{{"id":"{project}","name":"p","repo":"r"}}],"limits":{{"{mac}":{{"max_sessions":2,"max_load_per_core":1.5,"min_free_disk":10}}}}}}"#
+        );
+        let mac = MachineId(mac.parse().unwrap());
+        let expected = SharedSettings {
+            seq: 3,
+            machines: vec![Machine {
+                id: mac,
+                name: "m".into(),
+                address: "100.64.0.1".into(),
+            }],
+            priority: vec![mac],
+            projects: vec![Project {
+                id: ProjectId(project.parse().unwrap()),
+                name: "p".into(),
+                repo: "r".into(),
+            }],
+            limits: [(
+                mac,
+                Limits {
+                    max_sessions: 2,
+                    max_load_per_core: 1.5,
+                    min_free_disk: 10,
+                },
+            )]
+            .into(),
+        };
+        assert_eq!(
+            serde_json::from_str::<SharedSettings>(&json).unwrap(),
+            expected
+        );
     }
 }

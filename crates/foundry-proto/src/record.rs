@@ -82,8 +82,6 @@ pub enum AnyRecord {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::ids::{MachineId, ProjectId, SessionId, TerminalId, WorkspaceId};
-    use crate::state::{SessionState, TerminalState};
     use crate::{assert_round_trip, parse_error};
 
     pub(crate) fn workspace() -> Record<Workspace> {
@@ -167,6 +165,15 @@ pub(crate) mod tests {
         assert_round_trip(&record);
     }
 
+    fn every_kind() -> Vec<AnyRecord> {
+        vec![
+            AnyRecord::Workspace(workspace()),
+            AnyRecord::Terminal(terminal()),
+            AnyRecord::Session(session()),
+            AnyRecord::MachineSample(machine_sample()),
+        ]
+    }
+
     #[test]
     fn an_unknown_field_is_ignored() {
         let record = workspace();
@@ -175,12 +182,153 @@ pub(crate) mod tests {
         json["body"]["also_added_later"] = serde_json::json!("x");
         let back: Record<Workspace> = serde_json::from_value(json).unwrap();
         assert_eq!(back, record);
+    }
 
-        let any = AnyRecord::Session(session());
-        let mut json = serde_json::to_value(&any).unwrap();
-        json["added_later"] = serde_json::json!(1);
-        let back: AnyRecord = serde_json::from_value(json).unwrap();
-        assert_eq!(back, any);
+    #[test]
+    fn an_unknown_field_in_any_kind_of_record_or_its_body_is_ignored() {
+        for record in every_kind() {
+            let mut json = serde_json::to_value(&record).unwrap();
+            json["added_later"] = serde_json::json!(1);
+            json["body"]["also_added_later"] = serde_json::json!({ "x": [1, 2] });
+            let back: AnyRecord = serde_json::from_value(json).unwrap();
+            assert_eq!(back, record);
+        }
+    }
+
+    #[test]
+    fn every_kind_of_record_reads_from_its_wire_form() {
+        let owner = "67e55044-10b1-426f-9247-bb680e5fe0c8";
+        let a = "11111111-1111-4111-8111-111111111111";
+        let b = "22222222-2222-4222-8222-222222222222";
+        let c = "33333333-3333-4333-8333-333333333333";
+        let id = |s: &str| s.parse::<uuid::Uuid>().unwrap();
+        let wire = |kind: &str, body: String| {
+            format!(
+                r#"{{"kind":"{kind}","owner":"{owner}","version":5,"deleted":false,"body":{body}}}"#
+            )
+        };
+        let cases = [
+            (
+                wire(
+                    "workspace",
+                    format!(
+                        r#"{{"id":"{a}","project":"{b}","name":"n","branch":"b","base":"main"}}"#
+                    ),
+                ),
+                AnyRecord::Workspace(Record {
+                    owner: MachineId(id(owner)),
+                    version: 5,
+                    deleted: false,
+                    body: Workspace {
+                        id: WorkspaceId(id(a)),
+                        project: ProjectId(id(b)),
+                        name: "n".into(),
+                        branch: "b".into(),
+                        base: "main".into(),
+                    },
+                }),
+            ),
+            (
+                wire(
+                    "terminal",
+                    format!(r#"{{"id":"{a}","workspace":"{b}","state":"exited","exit_code":-1}}"#),
+                ),
+                AnyRecord::Terminal(Record {
+                    owner: MachineId(id(owner)),
+                    version: 5,
+                    deleted: false,
+                    body: Terminal {
+                        id: TerminalId(id(a)),
+                        workspace: WorkspaceId(id(b)),
+                        state: TerminalState::Exited,
+                        exit_code: Some(-1),
+                    },
+                }),
+            ),
+            (
+                wire(
+                    "session",
+                    format!(
+                        r#"{{"id":"{a}","workspace":"{b}","terminal":"{c}","model":"m","state":"waiting_for_you"}}"#
+                    ),
+                ),
+                AnyRecord::Session(Record {
+                    owner: MachineId(id(owner)),
+                    version: 5,
+                    deleted: false,
+                    body: Session {
+                        id: SessionId(id(a)),
+                        workspace: WorkspaceId(id(b)),
+                        terminal: TerminalId(id(c)),
+                        model: "m".into(),
+                        state: SessionState::WaitingForYou,
+                    },
+                }),
+            ),
+            (
+                wire(
+                    "machine_sample",
+                    format!(
+                        r#"{{"load_per_core":0.5,"free_memory":1,"free_disk":2,"sessions":3}}"#
+                    ),
+                ),
+                AnyRecord::MachineSample(Record {
+                    owner: MachineId(id(owner)),
+                    version: 5,
+                    deleted: false,
+                    body: MachineSample {
+                        load_per_core: 0.5,
+                        free_memory: 1,
+                        free_disk: 2,
+                        sessions: 3,
+                    },
+                }),
+            ),
+        ];
+        for (json, expected) in cases {
+            let parsed: AnyRecord = serde_json::from_str(&json).expect(&json);
+            assert_eq!(parsed, expected, "{json}");
+        }
+    }
+
+    #[test]
+    fn any_record_gives_its_owner_and_version() {
+        for record in every_kind() {
+            let json = serde_json::to_value(&record).unwrap();
+            assert_eq!(record.owner().to_string(), json["owner"].as_str().unwrap());
+            assert_eq!(record.version(), json["version"].as_u64().unwrap());
+        }
+    }
+
+    #[test]
+    fn any_record_supersedes_by_the_same_rule_as_record() {
+        let older = workspace();
+        let newer = Record {
+            version: older.version + 1,
+            ..older.clone()
+        };
+        let other_owner = Record {
+            owner: MachineId::random(),
+            version: older.version + 9,
+            ..older.clone()
+        };
+        let older = AnyRecord::Workspace(older);
+        assert!(AnyRecord::Workspace(newer.clone()).supersedes(&older));
+        assert!(!older.supersedes(&AnyRecord::Workspace(newer)));
+        assert!(!older.supersedes(&older.clone()));
+        assert!(!AnyRecord::Workspace(other_owner).supersedes(&older));
+    }
+
+    #[test]
+    fn a_record_of_another_kind_never_supersedes() {
+        let workspace = workspace();
+        let mut session = session();
+        session.owner = workspace.owner;
+        session.version = workspace.version + 1;
+        let workspace = AnyRecord::Workspace(workspace);
+        let session = AnyRecord::Session(session);
+        assert!(!session.supersedes(&workspace));
+        assert!(!workspace.supersedes(&session));
     }
 
     #[test]
