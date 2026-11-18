@@ -1081,6 +1081,20 @@ async fn a_name_whose_folder_is_taken_is_refused_and_the_folder_is_untouched() {
         "{branches}"
     );
     assert!(!setup.record(first).unwrap().deleted);
+
+    // With the folder gone too, git still has the worktree registered: still refused.
+    std::fs::remove_dir_all(&worktree).unwrap();
+    let err = setup
+        .workspaces
+        .create(remote.project, "main", "fix")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, WorkspaceError::BranchExists(b) if b == "fix"),
+        "{err}"
+    );
+    let worktrees = git(&clone, &["worktree", "list", "--porcelain"]);
+    assert!(worktrees.contains("/fix\n"), "{worktrees}");
 }
 
 #[tokio::test]
@@ -1177,4 +1191,81 @@ async fn a_worktree_removed_by_hand_keeps_its_detached_commits_through_a_failed_
     let clone = setup.clone_of(remote.project);
     let worktrees = git(&clone, &["worktree", "list", "--porcelain"]);
     assert!(!worktrees.contains("/moved\n"), "{worktrees}");
+}
+
+#[tokio::test]
+async fn archiving_one_removed_worktree_leaves_the_others_entries() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let a = setup.create(&remote, "main", "a").await;
+    let b = setup.create(&remote, "main", "b").await;
+    let b_tree = setup.worktree(remote.project, "b");
+    git(&b_tree, &["checkout", "-q", "--detach"]);
+    git(
+        &b_tree,
+        &["commit", "-q", "--allow-empty", "-m", "only on b"],
+    );
+    std::fs::remove_dir_all(setup.worktree(remote.project, "a")).unwrap();
+    std::fs::remove_dir_all(&b_tree).unwrap();
+
+    setup.workspaces.archive(a, false).await.unwrap();
+    let clone = setup.clone_of(remote.project);
+    let worktrees = git(&clone, &["worktree", "list", "--porcelain"]);
+    assert!(worktrees.contains("/b\n"), "{worktrees}");
+    let err = setup.workspaces.archive(b, false).await.unwrap_err();
+    let WorkspaceError::Dirty(dirty) = err else {
+        panic!("{err}");
+    };
+    assert_eq!(dirty.unpushed.len(), 1, "{dirty:?}");
+    assert!(dirty.unpushed[0].ends_with(" only on b"), "{dirty:?}");
+}
+
+#[tokio::test]
+async fn a_worktree_whose_folders_and_entry_are_gone_still_archives() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let first = setup.create(&remote, "main", "first").await;
+    let second = setup.create(&remote, "main", "second").await;
+    // The whole project folder goes, so git cannot find either worktree by our spelling of its
+    // path, which on macOS runs through the /tmp link.
+    std::fs::remove_dir_all(
+        setup
+            .data
+            .path()
+            .join("worktrees")
+            .join(remote.project.to_string()),
+    )
+    .unwrap();
+    setup.workspaces.archive(first, false).await.unwrap();
+    assert!(setup.record(first).unwrap().deleted);
+
+    // And when git has forgotten it too, there is nothing left to remove.
+    let clone = setup.clone_of(remote.project);
+    git(&clone, &["worktree", "prune"]);
+    setup.workspaces.archive(second, true).await.unwrap();
+    assert!(setup.record(second).unwrap().deleted);
+}
+
+#[tokio::test]
+async fn a_decomposed_name_keeps_its_detached_commits() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    // Every character a letter, so safe_branch keeps the decomposed form; git on macOS keeps
+    // the composed one for the same folder.
+    let name = "\u{1112}\u{1161}\u{11ab}";
+    let id = setup.create(&remote, "main", name).await;
+    let worktree = setup.workspaces.worktree(id).await.unwrap();
+    git(&worktree, &["checkout", "-q", "--detach"]);
+    git(
+        &worktree,
+        &["commit", "-q", "--allow-empty", "-m", "detached"],
+    );
+
+    let err = setup.workspaces.archive(id, false).await.unwrap_err();
+    let WorkspaceError::Dirty(dirty) = err else {
+        panic!("{err}");
+    };
+    assert_eq!(dirty.unpushed.len(), 1, "{dirty:?}");
+    assert!(dirty.unpushed[0].ends_with(" detached"), "{dirty:?}");
+    assert!(worktree.exists());
 }
