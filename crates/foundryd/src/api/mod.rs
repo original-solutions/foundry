@@ -24,8 +24,9 @@
 //!
 //! The server is bound by [`bind`], which refuses any address but loopback and Tailscale's.
 //! A browser can still be made to call it from any page it has open, so every request must
-//! name this machine in its `Host` the way only a loopback or Tailscale caller does
-//! ([`trusted_host`]), and a request a browser sends from another site, which it marks with an
+//! name this machine in its `Host`: a loopback or Tailscale address, `localhost`, or a DNS name
+//! in [`Api::names`] ([`trusted_host`]). No other name is trusted, so a page on a name an
+//! attacker's DNS points at this machine is refused. And a request a browser sends from another site, which it marks with an
 //! `Origin` that is not the `Host`, is refused. Without that, any web page could open a
 //! terminal socket and type into a shell.
 //!
@@ -78,6 +79,30 @@ pub struct Api {
     pub terminals: Arc<Terminals>,
     pub workspaces: Arc<Workspaces>,
     pub sessions: Arc<Sessions>,
+    /// The DNS names this machine answers to besides `localhost` and its addresses, such as
+    /// its MagicDNS short name and its `<name>.<tailnet>.ts.net` name. The daemon fills it;
+    /// empty means only addresses and `localhost` are trusted in a `Host`.
+    pub names: Vec<String>,
+}
+
+impl Api {
+    pub fn new(
+        store: Arc<Mutex<Store>>,
+        peers: Peers,
+        terminals: Arc<Terminals>,
+        workspaces: Arc<Workspaces>,
+        sessions: Arc<Sessions>,
+        names: Vec<String>,
+    ) -> Self {
+        Self {
+            store,
+            peers,
+            terminals,
+            workspaces,
+            sessions,
+            names,
+        }
+    }
 }
 
 /// Every route of the API. Serve it on a listener from [`bind`].
@@ -93,7 +118,7 @@ pub fn router(api: Api) -> Router {
         .route("/api/workspaces/{id}/shells", post(start_shell))
         .fallback(no_route)
         .method_not_allowed_fallback(wrong_method)
-        .layer(middleware::from_fn(same_site))
+        .layer(middleware::from_fn_with_state(api.clone(), same_site))
         .with_state(api)
 }
 
@@ -156,11 +181,11 @@ pub async fn bind(addr: SocketAddr) -> Result<TcpListener, BindError> {
 
 // --- callers ---
 
-/// True when `host`, a `Host` header, names this machine the way a caller on loopback or on
-/// Tailscale does: an [`allowed`] address, `localhost`, a MagicDNS name under `.ts.net`, or a
-/// name with no dot, as MagicDNS gives a machine. A page whose own name was pointed at this
-/// machine's address names that, and is refused.
-fn trusted_host(host: &str) -> bool {
+/// True when `host`, a `Host` header, names this machine: an [`allowed`] address, `localhost`,
+/// or one of `names` (ASCII case-insensitive, one trailing dot ignored). Any other name is
+/// refused, a MagicDNS-looking one included: a page whose own name was pointed at this
+/// machine's address, by a search domain or LLMNR, names that.
+fn trusted_host(host: &str, names: &[String]) -> bool {
     let name = match host.strip_prefix('[') {
         Some(rest) => match rest.split_once(']') {
             Some((ip, _)) => ip,
@@ -175,21 +200,27 @@ fn trusted_host(host: &str) -> bool {
         return allowed(ip);
     }
     let name = name.strip_suffix('.').unwrap_or(name).to_ascii_lowercase();
-    !name.is_empty() && (name == "localhost" || name.ends_with(".ts.net") || !name.contains('.'))
+    !name.is_empty()
+        && (name == "localhost"
+            || names.iter().any(|own| {
+                own.strip_suffix('.')
+                    .unwrap_or(own)
+                    .eq_ignore_ascii_case(&name)
+            }))
 }
 
 /// Refuses a request whose `Host` is not [`trusted_host`], and one a browser sent from another
 /// site: an `Origin` whose host and port are not the `Host`.
-async fn same_site(request: Request, next: Next) -> Response {
+async fn same_site(State(api): State<Api>, request: Request, next: Next) -> Response {
     let headers = request.headers();
     let host = headers
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if !trusted_host(host) {
+    if !trusted_host(host, &api.names) {
         return refuse(format!(
-            "foundryd answers only to a loopback or Tailscale address or name; the request \
-             names {host:?}"
+            "foundryd answers only to a loopback or Tailscale address or one of its own names; \
+             the request names {host:?}"
         ));
     }
     if let Some(origin) = headers.get(header::ORIGIN) {
