@@ -1,3 +1,154 @@
-//! `foundry-holder --socket <path> --cwd <dir> --env-file <path> -- <argv>`. Filled by plan task 4.
+//! `foundry-holder --socket <path> --cwd <dir> --env-file <path> -- <argv>`.
+//!
+//! Reads and deletes the env file, then forks twice so the holder runs in a session of its own
+//! with no controlling terminal, outside the process group of whatever started it. The holder
+//! starts the child on a new PTY and serves the socket. The process that ran the command exits 0
+//! once the socket is ready, or 1 with the reason on stderr.
 
-fn main() {}
+mod server;
+
+use std::ffi::OsString;
+use std::fs::OpenOptions;
+use std::io::{PipeWriter, Read as _, Write as _};
+use std::os::unix::net::UnixListener;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+
+use clap::Parser;
+use foundry_holder::pty::{self, Pty};
+use nix::sys::stat::{Mode, umask};
+use nix::sys::wait::waitpid;
+use nix::unistd::{ForkResult, dup2_stderr, dup2_stdin, dup2_stdout, fork, setsid};
+
+/// What the holder writes to its starter once the socket is served.
+const READY: &str = "ready";
+
+/// The size a terminal starts at, until a client resizes it.
+const COLS: u16 = 80;
+const ROWS: u16 = 24;
+
+#[derive(Parser)]
+#[command(
+    name = "foundry-holder",
+    version,
+    about = "Owns one PTY and its child, and serves it on a Unix socket."
+)]
+struct Args {
+    /// The Unix socket to serve. It must not exist yet.
+    #[arg(long)]
+    socket: PathBuf,
+    /// The child's working directory.
+    #[arg(long)]
+    cwd: PathBuf,
+    /// A JSON object of variables set for the child over the holder's own. Deleted once read.
+    #[arg(long)]
+    env_file: PathBuf,
+    /// The command to run.
+    #[arg(last = true, required = true)]
+    argv: Vec<OsString>,
+}
+
+fn main() -> ExitCode {
+    match start(Args::parse()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(reason) => {
+            eprintln!("foundry-holder: {reason}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Runs in the starter's process. Returns once the detached holder serves the socket.
+fn start(args: Args) -> Result<(), String> {
+    let env = pty::read_env_file(&args.env_file)
+        .map_err(|e| format!("env file {}: {e}", args.env_file.display()))?;
+    let (mut ready_rx, ready_tx) = std::io::pipe().map_err(|e| format!("pipe: {e}"))?;
+    // SAFETY: no thread has been started, so the child is a copy of a single-threaded process
+    // and may run any code.
+    match unsafe { fork() }.map_err(|e| format!("fork: {e}"))? {
+        ForkResult::Parent { child } => {
+            drop(ready_tx);
+            waitpid(child, None).map_err(|e| format!("wait: {e}"))?;
+            let mut said = String::new();
+            let _ = ready_rx.read_to_string(&mut said);
+            match said.as_str() {
+                READY => Ok(()),
+                "" => Err("the holder stopped before it was ready".into()),
+                reason => Err(reason.into()),
+            }
+        }
+        ForkResult::Child => {
+            drop(ready_rx);
+            std::process::exit(detach(args, env, ready_tx))
+        }
+    }
+}
+
+/// The first fork: a new session, then a second fork so the holder is not a session leader and
+/// can never gain a controlling terminal.
+fn detach(args: Args, env: Vec<(String, String)>, mut ready: PipeWriter) -> i32 {
+    if let Err(e) = setsid() {
+        let _ = write!(ready, "setsid: {e}");
+        return 1;
+    }
+    // SAFETY: still single-threaded, as in `start`.
+    match unsafe { fork() } {
+        Ok(ForkResult::Parent { .. }) => 0,
+        Ok(ForkResult::Child) => hold(args, env, ready),
+        Err(e) => {
+            let _ = write!(ready, "fork: {e}");
+            1
+        }
+    }
+}
+
+/// The holder itself.
+fn hold(args: Args, env: Vec<(String, String)>, mut ready: PipeWriter) -> i32 {
+    let started = quiet_stdio().and_then(|()| {
+        let pty = Pty::open(COLS, ROWS).map_err(|e| format!("pty: {e}"))?;
+        let listener = bind(&args.socket)?;
+        match pty.spawn(&args.argv, &args.cwd, &env) {
+            Ok(child) => Ok((pty, listener, child)),
+            Err(e) => {
+                let _ = std::fs::remove_file(&args.socket);
+                Err(e.to_string())
+            }
+        }
+    });
+    drop(env);
+    match started {
+        Ok((pty, listener, child)) => {
+            let _ = ready.write_all(READY.as_bytes());
+            drop(ready);
+            match server::run(listener, &args.socket, pty, child) {
+                Ok(()) => 0,
+                Err(_) => 1,
+            }
+        }
+        Err(reason) => {
+            let _ = ready.write_all(reason.as_bytes());
+            1
+        }
+    }
+}
+
+/// Points stdio at /dev/null, so the holder keeps none of its starter's pipes or terminal open.
+fn quiet_stdio() -> Result<(), String> {
+    let null = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/null")
+        .map_err(|e| format!("/dev/null: {e}"))?;
+    dup2_stdin(&null)
+        .and_then(|()| dup2_stdout(&null))
+        .and_then(|()| dup2_stderr(&null))
+        .map_err(|e| format!("stdio: {e}"))
+}
+
+/// Binds the socket readable and writable by this user only: it gives full control of a shell.
+fn bind(path: &Path) -> Result<UnixListener, String> {
+    let old = umask(Mode::from_bits_truncate(0o177));
+    let bound = UnixListener::bind(path);
+    umask(old);
+    bound.map_err(|e| format!("socket {}: {e}", path.display()))
+}
