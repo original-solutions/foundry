@@ -346,12 +346,15 @@ async fn a_client_that_stops_reading_is_dropped_without_blocking_the_child() {
 
 #[tokio::test]
 async fn a_client_that_keeps_reading_gets_every_byte_of_many_small_writes() {
-    // seq writes each line on its own, so the holder sees a million small reads.
+    // seq writes each line on its own, so the holder sees many small reads. Even framed one line
+    // at a time the stream stays under the holder's 4 MiB backlog, so the client is never cut off
+    // however far behind it reads. A child that floods faster than a client reads, past that
+    // backlog, has the client cut off by design.
     let holder = Holder::start(
         &[
             "sh",
             "-c",
-            &format!("{NO_OPOST} -echo; printf R; read x; seq 1 999999"),
+            &format!("{NO_OPOST} -echo; printf R; read x; seq 1 200000"),
         ],
         &[],
     );
@@ -360,7 +363,7 @@ async fn a_client_that_keeps_reading_gets_every_byte_of_many_small_writes() {
     client.send(Request::Input(Bytes::from_static(b"\n"))).await;
     assert_eq!(client.read_until_exit().await, 0);
     assert!(
-        client.seen == counter_stream(b"R", 999_999),
+        client.seen == counter_stream(b"R", 200_000),
         "the stream differs from the counter"
     );
 }
@@ -707,9 +710,16 @@ async fn nothing_a_client_sends_after_its_refusal_reaches_the_child() {
 async fn wait_for_quiet_flood(holder: &Holder) {
     let deadline = Instant::now() + WAIT;
     loop {
-        let client = holder.attach().await;
-        if client.start + client.snapshot.len() as u64 == 20_000_000 {
-            assert_eq!(client.snapshot.len(), MAX_BYTES);
+        let mut stream = holder.connect().await;
+        protocol::write_request(&mut stream, &Request::Attach)
+            .await
+            .unwrap();
+        // Attached mid-flood, a client can fall too far behind and be cut off before its snapshot
+        // arrives. Then it tries again.
+        if let Some(Reply::Snapshot { start, bytes }) = read_or_end(&mut stream).await
+            && start + bytes.len() as u64 == 20_000_000
+        {
+            assert_eq!(bytes.len(), MAX_BYTES);
             return;
         }
         assert!(Instant::now() < deadline, "the flood never finished");
