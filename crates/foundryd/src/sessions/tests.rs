@@ -621,7 +621,9 @@ async fn the_gateway_key_is_in_the_childs_environment_and_in_no_log_line_or_file
     let records = records_of(&f.store, f.me, id);
     assert!(!records.is_empty());
     assert!(
-        records.iter().all(|r| r.body.terminal.0 != uuid::Uuid::nil()),
+        records
+            .iter()
+            .all(|r| r.body.terminal.0 != uuid::Uuid::nil()),
         "{records:?}"
     );
 
@@ -659,7 +661,10 @@ async fn the_gateway_key_is_in_the_childs_environment_and_in_no_log_line_or_file
     assert!(!logged.contains(&f.key), "the gateway key is logged");
     assert!(!logged.contains(&token), "the hook token is logged");
     let settings = std::fs::read_to_string(f.settings_file(id)).unwrap();
-    assert!(!settings.contains(&token), "the hook token is in the settings file");
+    assert!(
+        !settings.contains(&token),
+        "the hook token is in the settings file"
+    );
     assert!(
         !settings.contains(&f.key),
         "the gateway key is in the settings file"
@@ -803,8 +808,7 @@ async fn two_starts_at_once_both_get_their_worktree_trusted() {
     let (a, b) = tokio::join!(
         f.sessions
             .start(WorkspaceId::random(), f.worktree.path(), MODEL),
-        f.sessions
-            .start(WorkspaceId::random(), other.path(), MODEL),
+        f.sessions.start(WorkspaceId::random(), other.path(), MODEL),
     );
     a.unwrap();
     b.unwrap();
@@ -863,7 +867,10 @@ async fn a_start_the_caller_stops_waiting_for_still_finishes() {
         }
     }
 
-    until("the session's record", || session_records(&f.store, f.me) > 0).await;
+    until("the session's record", || {
+        session_records(&f.store, f.me) > 0
+    })
+    .await;
     let held = {
         let store = f.store.lock().unwrap();
         store
@@ -900,12 +907,22 @@ async fn the_hook_token_is_in_a_private_curl_config_and_not_in_the_settings_or_t
     assert!(config.contains(&format!("header = \"Authorization: Bearer {token}\"")));
     assert!(config.contains(&format!("url = \"{}\"", f.url(id))));
     assert_eq!(
-        std::fs::metadata(f.curl_file(id)).unwrap().permissions().mode() & 0o777,
+        std::fs::metadata(f.curl_file(id))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
         0o600
     );
     let settings = std::fs::read_to_string(f.settings_file(id)).unwrap();
-    assert!(!settings.contains(&token) && !settings.contains("Bearer"), "{settings}");
-    assert!(settings.contains(&f.curl_file(id).display().to_string()), "{settings}");
+    assert!(
+        !settings.contains(&token) && !settings.contains("Bearer"),
+        "{settings}"
+    );
+    assert!(
+        settings.contains(&f.curl_file(id).display().to_string()),
+        "{settings}"
+    );
 }
 
 /// The text every tracing event is written to, once a test has called [`logs`].
