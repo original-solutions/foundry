@@ -24,9 +24,8 @@ mod tests;
 /// `open` lets it. So each step must leave the schema usable by the build before it: new
 /// tables, or new columns with a default, never a changed key or a dropped column. A new
 /// column or table must not copy anything out of `record`: the previous build's upsert would
-/// leave the copy stale. A new kind of record needs no step, as [`Store::since`] reads only
-/// the kinds its build knows; a new field in a known kind must be one the previous build can
-/// read without.
+/// leave the copy stale. A record the previous build cannot parse, such as a new kind or a
+/// new state, needs no step: [`Store::since`] stops before it.
 const MIGRATIONS: &[&str] = &[
     // 1: records keyed by kind and id, the owner's own version counter, shared settings.
     "CREATE TABLE records (
@@ -136,22 +135,37 @@ impl Store {
     }
 
     /// Every record held from `owner` with a version above `version`, lowest version first.
-    /// Records of a kind this build does not know, left by a newer build, are not read.
+    ///
+    /// It stops before the first record this build cannot parse, one a newer build stored
+    /// before a rollback, and gives the records below it. What it gives is therefore never
+    /// missing a version in the middle, so a peer that takes the highest version it got as
+    /// its mark for `owner` cannot step over a record it never received.
     pub fn since(&self, owner: MachineId, version: u64) -> Result<Vec<AnyRecord>, StoreError> {
         // Nothing stored is above i64::MAX, so a larger `version` correctly finds nothing.
         let version = i64::try_from(version).unwrap_or(i64::MAX);
         let mut query = self.conn.prepare(
-            "SELECT record FROM records
-             WHERE owner = ?1 AND version > ?2
-               AND kind IN ('workspace', 'terminal', 'session', 'machine_sample')
-             ORDER BY version",
+            "SELECT kind, version, record FROM records WHERE owner = ?1 AND version > ?2 ORDER BY version",
         )?;
         let rows = query.query_map(params![owner.to_string(), version], |row| {
-            row.get::<_, String>(0)
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
         })?;
         let mut records = Vec::new();
-        for json in rows {
-            records.push(serde_json::from_str(&json?)?);
+        for row in rows {
+            let (kind, version, json) = row?;
+            match serde_json::from_str(&json) {
+                Ok(record) => records.push(record),
+                Err(error) => {
+                    tracing::warn!(
+                        %owner, kind, version, %error,
+                        "store: a record this build cannot read; catch-up for its owner stops before it"
+                    );
+                    break;
+                }
+            }
         }
         Ok(records)
     }
