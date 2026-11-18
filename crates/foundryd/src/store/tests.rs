@@ -423,6 +423,7 @@ fn migrations_run_on_every_earlier_schema_and_keep_what_it_held() {
         {
             let mut conn = rusqlite::Connection::open(&path).unwrap();
             migrate(&mut conn, earlier).unwrap();
+            assert_eq!(user_version(&conn).unwrap(), earlier);
             conn.execute("CREATE TABLE kept_by_the_test (x INTEGER)", [])
                 .unwrap();
             conn.execute("INSERT INTO kept_by_the_test VALUES (42)", [])
@@ -483,6 +484,30 @@ fn a_file_a_newer_build_migrated_still_opens() {
         Applied::Stored
     );
     assert_eq!(store.since(owner, 0).unwrap(), vec![workspace(owner, 2)]);
+}
+
+/// A rollback can leave rows of a kind only the newer build knows. The older build gives
+/// the owner's other records and leaves those rows alone.
+#[test]
+fn since_skips_a_kind_this_build_does_not_know() {
+    let (_dir, mut store) = open();
+    let owner = MachineId::random();
+    store.apply(&workspace(owner, 1), owner).unwrap();
+    store.apply(&session(owner, 3), owner).unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO records (kind, id, owner, version, record) VALUES ('printer', 'p1', ?1, 2, ?2)",
+            rusqlite::params![
+                owner.to_string(),
+                format!(r#"{{"kind":"printer","owner":"{owner}","version":2,"deleted":false,"body":{{}}}}"#)
+            ],
+        )
+        .unwrap();
+    assert_eq!(
+        store.since(owner, 0).unwrap(),
+        vec![workspace(owner, 1), session(owner, 3)]
+    );
 }
 
 /// Review focus 3: clocks on two machines can disagree by minutes, so nothing in the
