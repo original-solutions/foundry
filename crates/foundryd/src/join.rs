@@ -1870,10 +1870,22 @@ mod tests {
         let before = secrets.get(KEYS_SECRET).unwrap();
         let joined = join_over_http(port, "ABCDEFGHJK", secrets.clone()).await;
         assert!(
-            matches!(joined, Err(JoinError::NotAdmitted { .. })),
+            matches!(joined, Err(JoinError::AnsweredAsThisMachine(_))),
             "{joined:?}"
         );
         assert_eq!(secrets.get(KEYS_SECRET).unwrap(), before);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_host_key_that_is_not_ed25519_is_never_held() {
+        let secrets = Arc::new(MemorySecrets::default());
+        Keys::open(secrets.clone()).unwrap();
+        let before = secrets.get(KEYS_SECRET).unwrap();
+        for bad in ["", "ab", "zz"] {
+            let held = hold_key(&*secrets, MachineId::random(), PublicKey(bad.into()));
+            assert!(matches!(held, Err(JoinError::BadKey)), "{bad:?}: {held:?}");
+            assert_eq!(secrets.get(KEYS_SECRET).unwrap(), before);
+        }
     }
 
     #[tokio::test]
