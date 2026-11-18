@@ -185,6 +185,11 @@ impl Daemon {
     /// A project in the shared settings whose remote, a local bare repo, has one commit on
     /// `main`.
     fn project(&self) -> ProjectId {
+        self.project_with(&[])
+    }
+
+    /// [`Self::project`] whose commit also holds `files`, as (path, text).
+    fn project_with(&self, files: &[(&str, &str)]) -> ProjectId {
         let project = ProjectId::random();
         let root = self.remotes.path().join(project.to_string());
         std::fs::create_dir_all(&root).unwrap();
@@ -192,7 +197,12 @@ impl Daemon {
         git(&root, &["clone", "-q", "remote.git", "src"]);
         let src = root.join("src");
         std::fs::write(src.join("README"), "demo\n").unwrap();
-        git(&src, &["add", "README"]);
+        for (path, text) in files {
+            let path = src.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, text).unwrap();
+        }
+        git(&src, &["add", "."]);
         git(&src, &["commit", "-q", "-m", "first"]);
         git(&src, &["push", "-q", "origin", "main"]);
         self.add_project(Project {
@@ -984,6 +994,36 @@ async fn an_action_on_what_is_not_here_is_not_found() {
         )
         .await;
     assert_eq!(reply.status, 422, "{}", reply.body);
+}
+
+#[tokio::test]
+async fn a_workspace_whose_setup_did_not_start_is_still_answered_with_its_id() {
+    // Terminals cannot start: there is no holder to run.
+    let daemon = Daemon::start(TURN, PathBuf::from("/nonexistent/foundry-holder"), &[]).await;
+    let project = daemon.project_with(&[(
+        ".dw/config.yml",
+        "factory:\n  provision:\n    - echo provisioned\n",
+    )]);
+    let reply = daemon
+        .call(
+            "POST",
+            "/api/workspaces",
+            Some(serde_json::json!({"project": project, "base": "main", "name": "setup"})),
+        )
+        .await;
+    assert_eq!(reply.status, 201, "{}", reply.body);
+    assert!(reply.json()["error"].is_string(), "{}", reply.body);
+    let workspace: WorkspaceId = reply.id();
+    let state = daemon.call("GET", "/api/state", None).await;
+    match serde_json::from_str::<UiMessage>(&state.body).unwrap() {
+        UiMessage::State { records, .. } => assert!(
+            records.iter().any(
+                |r| matches!(r, AnyRecord::Workspace(w) if w.body.id == workspace && !w.deleted)
+            ),
+            "the workspace {workspace} is not in the state"
+        ),
+        other => panic!("not the state: {other:?}"),
+    }
 }
 
 #[tokio::test]
