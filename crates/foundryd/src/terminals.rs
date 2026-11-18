@@ -39,8 +39,8 @@ const RECONNECT_AT_MOST: Duration = Duration::from_secs(30);
 /// How long a holder has to answer a request before the request fails.
 const ANSWER_WITHIN: Duration = Duration::from_secs(10);
 
-/// How long a holder has to serve its socket before the start fails. The process started is
-/// killed, but the holder it forked may still come up, so the terminal stays live to be closed.
+/// How long a holder has to serve its socket before the process started for it is killed.
+/// Unless a holder serves the socket by then, the start fails.
 const START_WITHIN: Duration = Duration::from_secs(30);
 
 /// A socket that refuses connections this many times, this far apart, has no holder behind it.
@@ -219,7 +219,7 @@ impl Terminals {
     /// recorded as exited with an unknown code. Run once at start, before any [`Self::start`]:
     /// it also removes env files a stopped daemon left behind.
     pub async fn reattach_all(&self) -> Result<(), TerminalError> {
-        self.inner.remove_env_files();
+        self.inner.remove_env_files().await?;
         let (store, me) = (self.inner.store.clone(), self.inner.me);
         let held = tokio::task::spawn_blocking(move || -> Result<Vec<Terminal>, StoreError> {
             let records = lock(&store).since(me, 0)?;
@@ -291,24 +291,19 @@ impl Inner {
         self.write(body.clone(), false).await?;
         let socket = self.socket(id);
         let env_file = self.dir.join(format!("{id}.env"));
-        let started = tokio::time::timeout(
-            START_WITHIN,
-            self.launch(&socket, cwd, &env_file, argv, env),
-        )
-        .await;
-        // The holder deletes the env file once read. One it never read may hold secrets.
-        let _ = std::fs::remove_file(&env_file);
-        let Ok(started) = started else {
-            // The starter is killed, but the holder it forked may still serve the socket later.
-            // So the terminal stays live with its record not deleted: its watcher records it
-            // exited while no socket is there, and a close still ends a holder that came up late.
-            self.adopt(body, socket);
-            let reason = format!(
+        let launched = self.launch(&socket, cwd, &env_file, argv, env);
+        let started = match tokio::time::timeout(START_WITHIN, launched).await {
+            Ok(started) => started,
+            // The process run is killed. A holder it forked that already serves the socket
+            // is a started terminal; one that does not is a failed start.
+            Err(_) if connect(&socket).await.is_ok() => Ok(()),
+            Err(_) => Err(format!(
                 "the holder did not start within {} seconds",
                 START_WITHIN.as_secs()
-            );
-            return Err(TerminalError::Start { id, reason });
+            )),
         };
+        // The holder deletes the env file once read. One it never read may hold secrets.
+        let _ = tokio::fs::remove_file(&env_file).await;
         if let Err(reason) = started {
             let ended = Terminal {
                 state: TerminalState::Exited,
@@ -428,15 +423,21 @@ impl Inner {
     }
 
     /// Removes every env file in the terminals directory. Only a `start` in progress has one.
-    fn remove_env_files(&self) {
-        let Ok(files) = std::fs::read_dir(&self.dir) else {
-            return;
-        };
-        for file in files.flatten() {
-            if file.path().extension().is_some_and(|e| e == "env") {
-                let _ = std::fs::remove_file(file.path());
+    /// Runs on the blocking pool, as every other file step here does.
+    async fn remove_env_files(&self) -> Result<(), TerminalError> {
+        let dir = self.dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let Ok(files) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for file in files.flatten() {
+                if file.path().extension().is_some_and(|e| e == "env") {
+                    let _ = std::fs::remove_file(file.path());
+                }
             }
-        }
+        })
+        .await?;
+        Ok(())
     }
 
     /// Runs the holder, which returns once its socket is served. Dropping this kills the process
@@ -449,12 +450,17 @@ impl Inner {
         argv: &[String],
         env: &[(String, String)],
     ) -> Result<(), String> {
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&self.dir)
-            .map_err(|e| format!("{}: {e}", self.dir.display()))?;
-        pty::write_env_file(env_file, env).map_err(|e| format!("env file: {e}"))?;
+        let (dir, file, vars) = (self.dir.clone(), env_file.to_path_buf(), env.to_vec());
+        tokio::task::spawn_blocking(move || {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&dir)
+                .map_err(|e| format!("{}: {e}", dir.display()))?;
+            pty::write_env_file(&file, &vars).map_err(|e| format!("env file: {e}"))
+        })
+        .await
+        .map_err(|e| e.to_string())??;
         let output = tokio::process::Command::new(&self.holder)
             .arg("--socket")
             .arg(socket)
@@ -513,7 +519,7 @@ impl Entry {
             Ok(stream) => stream,
             Err(Unreachable::Gone { stale }) => {
                 if stale {
-                    let _ = std::fs::remove_file(&self.socket);
+                    let _ = tokio::fs::remove_file(&self.socket).await;
                 }
                 return Ok(());
             }
@@ -1738,77 +1744,184 @@ mod tests {
         assert!(held(&store, setup.me, id).unwrap().deleted);
     }
 
+    /// Writes a fake holder that runs `script` and then hangs, as a starter that never exits
+    /// would. It touches `forked` once `script` is done. `$2` in the script is the socket.
+    fn hanging_holder(setup: &Setup, script: &str, forked: &Path) -> PathBuf {
+        let fake = setup.cwd.path().join("fake-holder");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\n{script}\ntouch '{}'\nsleep 600\n",
+                forked.display()
+            ),
+        )
+        .unwrap();
+        set_mode(&fake, 0o755);
+        fake
+    }
+
+    /// Starts a terminal whose fake holder is `fake`, running a paused clock forward only once
+    /// `forked` exists: paused time jumps ahead whenever the runtime is idle, so this lets the
+    /// start's time limit run out only after the fake has done its part. Real time resumes
+    /// after, so a real holder answers in time.
+    async fn start_past_the_limit(
+        terminals: &Terminals,
+        setup: &Setup,
+        forked: PathBuf,
+        env: &[(String, String)],
+    ) -> Result<TerminalId, TerminalError> {
+        let busy = tokio::spawn(async move {
+            while !forked.exists() {
+                tokio::task::yield_now().await;
+            }
+        });
+        let started = tokio::time::timeout(
+            WAIT * 10,
+            terminals.start(WorkspaceId::random(), setup.cwd.path(), &argv("true"), env),
+        )
+        .await
+        .expect("start gives up before the test does");
+        busy.abort();
+        tokio::time::resume();
+        started
+    }
+
     /// A start whose holder does not serve its socket in time fails in bounded time, and the
-    /// process it ran is killed. The holder that process forked can still come up later, so the
-    /// terminal stays: recorded exited while it has no socket, and closing it ends that holder.
+    /// process it ran is killed. The env file goes, and no record or live terminal is left.
     #[tokio::test(start_paused = true)]
-    async fn a_holder_not_ready_in_time_fails_the_start_and_one_that_comes_up_late_can_be_closed() {
+    async fn a_holder_not_serving_when_the_time_limit_runs_out_fails_the_start_and_is_killed() {
         let setup = Setup::new();
         let (forked, late) = (
             setup.cwd.path().join("forked"),
             setup.cwd.path().join("late"),
         );
-        // The process run hangs. The holder it forked comes up a second later, as the real
-        // holder's detached grandchild would, with an env file of its own.
-        let fake = setup.cwd.path().join("fake-holder");
+        let fake = hanging_holder(&setup, "", &forked);
+        // The fake makes `late` a second after it is ready to hang, unless it is killed.
         std::fs::write(
             &fake,
-            format!(
-                "#!/bin/sh\n\
-                 (sleep 1; echo '{{}}' > \"$2.late-env\"; \
-                  exec '{holder}' --socket \"$2\" --cwd /tmp --env-file \"$2.late-env\" -- sleep 60) \
-                  >/dev/null 2>&1 &\n\
-                 touch '{forked}'\nsleep 1\ntouch '{late}'\nsleep 600\n",
-                holder = holder().display(),
-                forked = forked.display(),
-                late = late.display(),
+            std::fs::read_to_string(&fake).unwrap().replace(
+                "sleep 600",
+                &format!("sleep 1\ntouch '{}'\nsleep 600", late.display()),
             ),
         )
         .unwrap();
-        set_mode(&fake, 0o755);
         let (terminals, store) = setup.daemon_with(fake);
         let env = [("ANTHROPIC_AUTH_TOKEN".to_string(), "sk-hung".to_string())];
-        // Paused time jumps ahead once the runtime is idle. Keeping it busy until the process
-        // run has forked lets the start's time limit run out only after that.
-        tokio::spawn(async move {
-            while !forked.exists() {
-                tokio::task::yield_now().await;
-            }
-        });
-        let error = tokio::time::timeout(
-            WAIT * 10,
-            terminals.start(WorkspaceId::random(), setup.cwd.path(), &argv("true"), &env),
-        )
-        .await
-        .expect("start gives up before the test does")
-        .unwrap_err();
+        let error = start_past_the_limit(&terminals, &setup, forked, &env)
+            .await
+            .unwrap_err();
         let TerminalError::Start { id, ref reason } = error else {
             panic!("expected a start error, got {error:?}");
         };
         assert!(reason.contains("did not start within"), "{reason}");
         assert!(!error.to_string().contains("sk-hung"), "{error}");
-        // From here the holder that comes up late answers in real time.
-        tokio::time::resume();
-        assert!(
-            !setup.dir().join(format!("{id}.env")).exists(),
-            "the env file is removed"
-        );
-        until("the record to say exited", || {
-            held(&store, setup.me, id).unwrap().body.state == TerminalState::Exited
-        })
-        .await;
         let record = held(&store, setup.me, id).unwrap();
-        assert_eq!(record.body.exit_code, None);
-        assert!(!record.deleted, "the terminal is kept for a close");
-
-        // Paused time does not pause the processes: the one run, left alive, would make `late`.
-        until("the late holder's socket", || setup.socket(id).exists()).await;
+        assert!(record.deleted, "{record:?}");
+        assert!(terminals.inner.entry(id).is_err(), "nothing is left live");
+        assert!(setup.left().is_empty(), "left behind: {:?}", setup.left());
+        tokio::time::sleep(Duration::from_millis(1500)).await;
         assert!(!late.exists(), "the process run was left running");
+    }
+
+    /// A holder already serving its socket when the time limit runs out, with the process that
+    /// started it not yet done, is a started terminal: the start says so, and it is watched.
+    #[tokio::test(start_paused = true)]
+    async fn a_holder_serving_when_the_time_limit_runs_out_is_a_started_terminal() {
+        let setup = Setup::new();
+        let forked = setup.cwd.path().join("forked");
+        let fake = hanging_holder(
+            &setup,
+            &format!(
+                "echo '{{}}' > \"$2.own-env\"\n\
+                 '{}' --socket \"$2\" --cwd /tmp --env-file \"$2.own-env\" -- sleep 60",
+                holder().display()
+            ),
+            &forked,
+        );
+        let (terminals, store) = setup.daemon_with(fake);
+        let id = start_past_the_limit(&terminals, &setup, forked, &[])
+            .await
+            .unwrap();
+        let record = held(&store, setup.me, id).unwrap();
+        assert_eq!(record.body.state, TerminalState::Running);
+        assert!(!record.deleted);
+        assert_eq!(
+            setup.left(),
+            vec![format!("{id}.sock")],
+            "only the socket is left"
+        );
+        let (snapshot, _) = terminals.attach(id).await.unwrap();
+        assert_eq!(snapshot.start, 0, "the holder that came up is attached to");
         terminals.close(id).await.unwrap();
         assert!(held(&store, setup.me, id).unwrap().deleted);
-        assert!(
-            !setup.socket(id).exists(),
-            "the close ended the holder that came up late"
+        assert!(!setup.socket(id).exists(), "the close ended the holder");
+    }
+
+    /// A close that cannot reach a holder whose socket is there, for a reason other than the
+    /// holder being gone, fails and keeps the terminal, rather than letting go of a holder
+    /// that still runs.
+    #[tokio::test]
+    async fn a_close_that_cannot_reach_a_running_holder_keeps_the_terminal() {
+        let setup = Setup::new();
+        let (terminals, store) = setup.daemon();
+        let id = setup.start(&terminals, "sleep 60").await;
+        // Connecting needs write permission on the socket, so this is refused, not gone.
+        set_mode(&setup.socket(id), 0o000);
+        let error = terminals.close(id).await.unwrap_err();
+        assert!(matches!(error, TerminalError::Holder { .. }), "{error:?}");
+        assert!(terminals.inner.entry(id).is_ok(), "the terminal stays live");
+        let record = held(&store, setup.me, id).unwrap();
+        assert!(!record.deleted);
+        assert_eq!(record.body.state, TerminalState::Running);
+        set_mode(&setup.socket(id), 0o600);
+        terminals.close(id).await.unwrap();
+        assert!(held(&store, setup.me, id).unwrap().deleted);
+        assert!(!setup.socket(id).exists());
+    }
+
+    /// A start whose first record the store cannot take launches nothing, so no holder runs
+    /// that no record points to.
+    #[tokio::test]
+    async fn a_start_the_store_cannot_record_launches_nothing() {
+        let setup = Setup::new();
+        std::fs::create_dir_all(setup.dir()).unwrap();
+        let (terminals, store) = setup.daemon();
+        set_mode(setup.data.path(), 0o500);
+        let error = terminals
+            .start(
+                WorkspaceId::random(),
+                setup.cwd.path(),
+                &argv("sleep 60"),
+                &[],
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, TerminalError::Store(_)), "{error:?}");
+        set_mode(setup.data.path(), 0o700);
+        assert!(setup.left().is_empty(), "left behind: {:?}", setup.left());
+        assert!(store.lock().unwrap().since(setup.me, 0).unwrap().is_empty());
+        assert!(lock(&terminals.inner.live).is_empty());
+    }
+
+    /// Dropping a `Terminals` while its runtime runs on, as a daemon replaced in process would,
+    /// stops its watchers: an exit after the drop is left for the next `reattach_all`.
+    #[tokio::test]
+    async fn dropping_terminals_stops_its_watchers() {
+        let setup = Setup::new();
+        let (terminals, store) = setup.daemon();
+        let id = setup.start(&terminals, "sleep 60").await;
+        drop(terminals);
+        setup.end_holder(id).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            held(&store, setup.me, id).unwrap().body.state,
+            TerminalState::Running
+        );
+        let (terminals, store) = setup.daemon();
+        terminals.reattach_all().await.unwrap();
+        assert_eq!(
+            held(&store, setup.me, id).unwrap().body.state,
+            TerminalState::Exited
         );
     }
 
