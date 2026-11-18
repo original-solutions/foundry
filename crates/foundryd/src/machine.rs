@@ -11,9 +11,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use foundry_proto::ids::MachineId;
-use foundry_proto::record::{MachineSample, Record};
+use foundry_proto::record::{AnyRecord, MachineSample, Record};
 use foundry_proto::settings::Limits;
-use sysinfo::LoadAvg;
+use foundry_proto::state::SessionState;
+use nix::sys::statvfs::statvfs;
+use sysinfo::{CpuRefreshKind, LoadAvg, MemoryRefreshKind, RefreshKind, System};
+use tokio::time::MissedTickBehavior;
 
 use crate::store::{Store, StoreError};
 
@@ -49,54 +52,179 @@ pub enum Over {
 
 impl Reason {
     /// The reason as the UI shows it, such as `trilogy-mac: load 1.8 over limit 1.0`.
-    pub fn text(&self, _machine_name: &str) -> String {
-        todo!()
+    pub fn text(&self, machine_name: &str) -> String {
+        let what = match self.over {
+            Over::Sessions { sessions, limit } => {
+                format!(
+                    "sessions {sessions} {} limit {limit}",
+                    at_or_over(sessions == limit)
+                )
+            }
+            Over::Load {
+                load_per_core,
+                limit,
+            } => format!(
+                "load {} {} limit {}",
+                decimal(load_per_core),
+                at_or_over(load_per_core == limit),
+                decimal(limit)
+            ),
+            Over::Disk { free_disk, limit } => format!(
+                "free disk {} GB under limit {} GB",
+                decimal(gigabytes(free_disk)),
+                decimal(gigabytes(limit))
+            ),
+        };
+        format!("{machine_name}: {what}")
+    }
+}
+
+fn at_or_over(at: bool) -> &'static str {
+    if at { "at" } else { "over" }
+}
+
+/// Decimal gigabytes, as disk sizes are sold and shown.
+fn gigabytes(bytes: u64) -> f64 {
+    bytes as f64 / 1e9
+}
+
+/// At most two decimals and at least one: `1.8`, `1.0`, `2.25`.
+fn decimal(value: f64) -> String {
+    let text = format!("{value:.2}");
+    let text = text.trim_end_matches('0');
+    if text.ends_with('.') {
+        format!("{text}0")
+    } else {
+        text.to_string()
     }
 }
 
 /// The 1-minute load divided by the logical cores.
-pub fn load_per_core(_load: &LoadAvg, _logical_cores: usize) -> f64 {
-    todo!()
+pub fn load_per_core(load: &LoadAvg, logical_cores: usize) -> f64 {
+    load.one / logical_cores.max(1) as f64
 }
 
 /// Bytes free to an unprivileged writer on the volume holding `path`.
-pub fn free_disk(_path: &Path) -> Result<u64, MachineError> {
-    todo!()
+pub fn free_disk(path: &Path) -> Result<u64, MachineError> {
+    let stat = statvfs(path).map_err(|source| MachineError::Disk {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    // The field types differ by platform: u32 or u64 on macOS, u64 on Linux.
+    #[allow(clippy::useless_conversion)]
+    let (blocks, block_size) = (
+        u64::from(stat.blocks_available()),
+        u64::from(stat.fragment_size()),
+    );
+    Ok(blocks.saturating_mul(block_size))
 }
 
 /// Reads this machine's load, memory and the free disk for `data_dir`, with `sessions`.
-pub fn read(_data_dir: &Path, _sessions: u32) -> Result<MachineSample, MachineError> {
-    todo!()
+pub fn read(data_dir: &Path, sessions: u32) -> Result<MachineSample, MachineError> {
+    let system = System::new_with_specifics(
+        RefreshKind::nothing()
+            .with_cpu(CpuRefreshKind::nothing())
+            .with_memory(MemoryRefreshKind::nothing().with_ram()),
+    )
+    .map_err(MachineError::System)?;
+    let load = System::load_average().map_err(MachineError::Load)?;
+    Ok(MachineSample {
+        load_per_core: load_per_core(&load, system.cpus().len()),
+        free_memory: system.available_memory(),
+        free_disk: free_disk(data_dir)?,
+        sessions,
+    })
 }
 
 /// Reads a sample, counting the live sessions `me` owns in `store`, and stores it as `me`'s
 /// sample record under its next own version. Returns the record written.
 pub fn write_sample(
-    _store: &mut Store,
-    _me: MachineId,
-    _data_dir: &Path,
+    store: &mut Store,
+    me: MachineId,
+    data_dir: &Path,
 ) -> Result<Record<MachineSample>, MachineError> {
-    todo!()
+    let body = read(data_dir, live_sessions(store, me)?)?;
+    let record = Record {
+        owner: me,
+        version: store.own_next_version()?,
+        deleted: false,
+        body,
+    };
+    store.apply(&AnyRecord::MachineSample(record.clone()), me)?;
+    Ok(record)
+}
+
+/// Sessions `me` owns that are not removed and have not finished or failed.
+fn live_sessions(store: &Store, me: MachineId) -> Result<u32, MachineError> {
+    let live = store
+        .since(me, 0)?
+        .into_iter()
+        .filter(|record| match record {
+            AnyRecord::Session(r) => {
+                !r.deleted && !matches!(r.body.state, SessionState::Finished | SessionState::Failed)
+            }
+            _ => false,
+        })
+        .count();
+    Ok(u32::try_from(live).unwrap_or(u32::MAX))
 }
 
 /// Writes a sample every [`SAMPLE_EVERY`], the first at once. A sample that cannot be read or
 /// stored is logged and the next one is tried on time.
-pub async fn run(_store: Arc<Mutex<Store>>, _me: MachineId, _data_dir: PathBuf) {
-    todo!()
+pub async fn run(store: Arc<Mutex<Store>>, me: MachineId, data_dir: PathBuf) {
+    let mut every = tokio::time::interval(SAMPLE_EVERY);
+    every.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    loop {
+        every.tick().await;
+        let written = match store.lock() {
+            Ok(mut store) => write_sample(&mut store, me, &data_dir),
+            Err(_) => {
+                tracing::error!("machine sample not written: the store lock is poisoned");
+                return;
+            }
+        };
+        if let Err(error) = written {
+            tracing::warn!(%error, "machine sample not written");
+        }
+    }
 }
 
 /// One reason for each of `limits` that `sample` is at or over, in the order sessions, load,
 /// disk. A machine qualifies for a new session only when this is empty.
-pub fn over_limits(_sample: &Record<MachineSample>, _limits: &Limits) -> Vec<Reason> {
-    todo!()
+pub fn over_limits(sample: &Record<MachineSample>, limits: &Limits) -> Vec<Reason> {
+    let body = &sample.body;
+    let mut over = Vec::new();
+    if body.sessions >= limits.max_sessions {
+        over.push(Over::Sessions {
+            sessions: body.sessions,
+            limit: limits.max_sessions,
+        });
+    }
+    if body.load_per_core >= limits.max_load_per_core {
+        over.push(Over::Load {
+            load_per_core: body.load_per_core,
+            limit: limits.max_load_per_core,
+        });
+    }
+    if body.free_disk < limits.min_free_disk {
+        over.push(Over::Disk {
+            free_disk: body.free_disk,
+            limit: limits.min_free_disk,
+        });
+    }
+    over.into_iter()
+        .map(|over| Reason {
+            machine: sample.owner,
+            over,
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use foundry_proto::ids::{SessionId, TerminalId, WorkspaceId};
-    use foundry_proto::record::{AnyRecord, Session};
-    use foundry_proto::state::SessionState;
+    use foundry_proto::record::Session;
 
     fn sample(sessions: u32, load_per_core: f64, free_disk: u64) -> Record<MachineSample> {
         Record {
