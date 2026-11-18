@@ -100,7 +100,10 @@ impl Remote {
             std::fs::write(path, text).unwrap();
         }
         git(&self.src, &["add", "-A"]);
-        git(&self.src, &["commit", "-q", "--allow-empty", "-m", "change"]);
+        git(
+            &self.src,
+            &["commit", "-q", "--allow-empty", "-m", "change"],
+        );
         git(&self.src, &["push", "-q", "origin", branch]);
     }
 }
@@ -337,9 +340,18 @@ async fn an_awkward_name_becomes_a_branch_and_its_worktree_is_made() {
         );
     }
     // Nothing was made outside the project's own folder of worktrees.
-    assert_eq!(names_in(setup.data.path().join("worktrees").as_path()).len(), 1);
     assert_eq!(
-        names_in(&setup.data.path().join("worktrees").join(remote.project.to_string())),
+        names_in(setup.data.path().join("worktrees").as_path()).len(),
+        1
+    );
+    assert_eq!(
+        names_in(
+            &setup
+                .data
+                .path()
+                .join("worktrees")
+                .join(remote.project.to_string())
+        ),
         ["café-täst", "escape", "fix-login", "rf-force"]
     );
 }
@@ -355,7 +367,10 @@ async fn a_second_workspace_of_a_project_reuses_its_clone_and_fetches() {
     remote.push("next", &[("NEXT.md", "two\n")]);
     let id = setup.create(&remote, "next", "second").await;
 
-    assert_eq!(names_in(&setup.clones()), [format!("{}.git", remote.project)]);
+    assert_eq!(
+        names_in(&setup.clones()),
+        [format!("{}.git", remote.project)]
+    );
     assert_eq!(
         std::fs::read_to_string(clone.join("marker")).unwrap(),
         "kept"
@@ -421,7 +436,8 @@ async fn a_base_the_remote_does_not_have_is_refused_and_makes_no_workspace() {
 #[tokio::test]
 async fn setup_commands_run_in_a_terminal_in_the_worktree() {
     let setup = Setup::new();
-    let config = "factory:\n  provision:\n    - echo first > first.txt\n    - echo second > second.txt\n";
+    let config =
+        "factory:\n  provision:\n    - echo first > first.txt\n    - echo second > second.txt\n";
     let remote = setup.project(&[(".dw/config.yml", config)]);
     let id = setup.create(&remote, "main", "with setup").await;
 
@@ -452,7 +468,10 @@ async fn a_failing_setup_command_is_reported_and_the_workspace_stays_usable() {
 
     let worktree = setup.worktree(remote.project, "bad-setup");
     assert!(worktree.join("one.txt").exists());
-    assert!(!worktree.join("two.txt").exists(), "setup stops at the failure");
+    assert!(
+        !worktree.join("two.txt").exists(),
+        "setup stops at the failure"
+    );
     assert!(!setup.record(id).unwrap().deleted);
     // Usable: work can be committed on the workspace's branch.
     git(&worktree, &["add", "one.txt"]);
@@ -561,7 +580,12 @@ async fn archive_stops_the_workspaces_terminals() {
     let worktree = setup.worktree(remote.project, "busy");
     let terminal = setup
         .terminals
-        .start(id, &worktree, &["/bin/sh".into(), "-c".into(), "sleep 3127".into()], &[])
+        .start(
+            id,
+            &worktree,
+            &["/bin/sh".into(), "-c".into(), "sleep 3127".into()],
+            &[],
+        )
         .await
         .unwrap();
 
@@ -595,11 +619,17 @@ async fn an_unknown_or_archived_workspace_cannot_be_archived() {
     let setup = Setup::new();
     let unknown = WorkspaceId::random();
     let err = setup.workspaces.archive(unknown, true).await.unwrap_err();
-    assert!(matches!(err, WorkspaceError::Unknown(w) if w == unknown), "{err}");
+    assert!(
+        matches!(err, WorkspaceError::Unknown(w) if w == unknown),
+        "{err}"
+    );
 
     let remote = setup.project(&[("README.md", "hello\n")]);
     let id = setup.create(&remote, "main", "once").await;
     setup.workspaces.archive(id, false).await.unwrap();
     let err = setup.workspaces.archive(id, true).await.unwrap_err();
-    assert!(matches!(err, WorkspaceError::Unknown(w) if w == id), "{err}");
+    assert!(
+        matches!(err, WorkspaceError::Unknown(w) if w == id),
+        "{err}"
+    );
 }
