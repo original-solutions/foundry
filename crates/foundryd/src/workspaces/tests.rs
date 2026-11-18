@@ -931,7 +931,7 @@ async fn work_written_while_the_terminals_close_is_refused_and_kept() {
 }
 
 #[tokio::test]
-async fn a_clean_worktree_with_a_submodule_archives_without_force() {
+async fn a_worktree_with_a_submodule_is_refused_unless_forced() {
     let setup = Setup::new();
     let library = setup.project(&[("lib.txt", "lib\n")]);
     let remote = setup.project(&[("README.md", "hello\n")]);
@@ -952,16 +952,28 @@ async fn a_clean_worktree_with_a_submodule_archives_without_force() {
     git(&worktree, &["submodule", "update", "-q", "--init"]);
     assert!(worktree.join("lib").join("lib.txt").exists());
 
-    // Work inside the submodule is uncommitted work of the workspace.
-    std::fs::write(worktree.join("lib").join("lib.txt"), "changed\n").unwrap();
+    // A commit made in the submodule and never pushed lives only in this worktree's git
+    // folder. The archive cannot see into it, so it names the submodule and leaves it be.
+    git(
+        &worktree.join("lib"),
+        &["commit", "-q", "--allow-empty", "-m", "only in lib"],
+    );
+    let terminal = setup.sleeper(id, &worktree).await;
     let err = setup.workspaces.archive(id, false).await.unwrap_err();
     let WorkspaceError::Dirty(dirty) = err else {
         panic!("{err}");
     };
-    assert_eq!(dirty.uncommitted, ["lib"]);
+    assert_eq!(dirty.submodules, ["lib"]);
+    assert!(dirty.to_string().contains("lib"), "{dirty}");
+    assert!(worktree.join("lib").join("lib.txt").exists());
+    let terminals = setup.terminals_of(id);
+    assert_eq!(terminals[0].body.id, terminal);
+    assert!(
+        !terminals[0].deleted,
+        "a refusal leaves the terminals running"
+    );
 
-    git(&worktree.join("lib"), &["checkout", "-q", "--", "lib.txt"]);
-    setup.workspaces.archive(id, false).await.unwrap();
+    setup.workspaces.archive(id, true).await.unwrap();
     assert!(!worktree.exists());
 }
 
@@ -1018,4 +1030,83 @@ async fn a_create_that_cannot_record_its_workspace_leaves_no_branch_behind() {
     assert!(!branches.contains("second"), "{branches}");
     assert!(!setup.worktree(remote.project, "second").exists());
     setup.create(&remote, "main", "second").await;
+}
+
+#[tokio::test]
+async fn a_name_whose_folder_is_taken_is_refused_and_the_folder_is_untouched() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let first = setup.create(&remote, "main", "fix").await;
+    let worktree = setup.worktree(remote.project, "fix");
+    // Inside the workspace, its branch is renamed, as before opening a pull request.
+    git(&worktree, &["branch", "-m", "fix", "fix-renamed"]);
+    std::fs::write(worktree.join("precious.txt"), "mine").unwrap();
+
+    let err = setup
+        .workspaces
+        .create(remote.project, "main", "fix")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, WorkspaceError::BranchExists(b) if b == "fix"),
+        "{err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("precious.txt")).unwrap(),
+        "mine"
+    );
+    let clone = setup.clone_of(remote.project);
+    let worktrees = git(&clone, &["worktree", "list", "--porcelain"]);
+    assert!(worktrees.contains("/fix\n"), "{worktrees}");
+    let branches = git(
+        &clone,
+        &["for-each-ref", "--format=%(refname)", "refs/heads/"],
+    );
+    assert!(
+        !branches.lines().any(|b| b == "refs/heads/fix"),
+        "{branches}"
+    );
+    assert!(!setup.record(first).unwrap().deleted);
+}
+
+#[tokio::test]
+async fn a_name_the_disk_reads_as_another_never_touches_its_work() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    // The same word, composed and decomposed. A disk that ignores the difference, as macOS
+    // does, reads both as one folder; git there reads both as one branch.
+    let composed = "caf\u{e9}-\u{d55c}\u{ae00}";
+    let decomposed = "cafe\u{301}-\u{1112}\u{1161}\u{11ab}\u{1100}\u{1173}\u{11af}";
+    let first = setup.create(&remote, "main", composed).await;
+    let branch = setup.body(first).branch;
+    let worktree = setup.worktree(remote.project, &branch);
+    std::fs::write(worktree.join("precious.txt"), "mine").unwrap();
+    git(
+        &worktree,
+        &["commit", "-q", "--allow-empty", "-m", "first work"],
+    );
+
+    // Refused where the two are one name; a workspace of its own where they are not.
+    let _ = setup
+        .workspaces
+        .create(remote.project, "main", decomposed)
+        .await;
+
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("precious.txt")).unwrap(),
+        "mine"
+    );
+    let clone = setup.clone_of(remote.project);
+    let log = git(
+        &clone,
+        &[
+            "log",
+            "-1",
+            "--format=%s",
+            &format!("refs/heads/{branch}"),
+            "--",
+        ],
+    );
+    assert_eq!(log.trim(), "first work");
+    assert!(!setup.record(first).unwrap().deleted);
 }
