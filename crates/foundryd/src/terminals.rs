@@ -290,9 +290,10 @@ impl Inner {
                 ..body.clone()
             };
             if let Err(error) = self.write(ended, true).await {
-                // Its record still says running, so it stays live for a close to delete.
+                // Its record still says running. It stays live for a close to delete, and its
+                // watcher finds no socket and records the exit once the store takes it.
                 tracing::warn!(terminal = %id, %error, "failed terminal start not recorded");
-                self.insert(body, socket);
+                self.adopt(body, socket);
             }
             return Err(TerminalError::Start { id, reason });
         }
@@ -385,27 +386,20 @@ impl Inner {
     }
 
     /// Records that a live terminal's child has exited, once. A terminal closed meanwhile keeps
-    /// its deleted record. False when the record could not be written.
-    async fn exited(&self, entry: &Arc<Entry>, code: Option<i32>) -> bool {
+    /// its deleted record.
+    async fn exited(&self, entry: &Arc<Entry>, code: Option<i32>) -> Result<(), TerminalError> {
         let mut body = entry.body.lock().await;
         if body.state == TerminalState::Exited || !self.is_live(entry) {
-            return true;
+            return Ok(());
         }
         let ended = Terminal {
             state: TerminalState::Exited,
             exit_code: code,
             ..body.clone()
         };
-        match self.write(ended.clone(), false).await {
-            Ok(()) => {
-                *body = ended;
-                true
-            }
-            Err(error) => {
-                tracing::warn!(terminal = %entry.id, %error, "terminal exit not recorded yet");
-                false
-            }
-        }
+        self.write(ended.clone(), false).await?;
+        *body = ended;
+        Ok(())
     }
 
     /// Removes every env file in the terminals directory. Only a `start` in progress has one.
@@ -608,8 +602,12 @@ async fn watch(inner: Arc<Inner>, entry: Arc<Entry>) {
     let mut exit = None;
     loop {
         if let Some(code) = exit {
-            if inner.exited(&entry, code).await {
+            let Err(error) = inner.exited(&entry, code).await else {
                 return;
+            };
+            if !warned {
+                tracing::warn!(terminal = %entry.id, %error, "terminal exit not recorded yet; trying again");
+                warned = true;
             }
             wait = (wait * 2).min(RECONNECT_AT_MOST);
             tokio::time::sleep(wait).await;
