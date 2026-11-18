@@ -22,12 +22,11 @@ fn version_prints_the_crate_version() {
 
 #[test]
 fn every_other_command_exits_2_and_says_not_built_yet() {
-    let commands: [(&str, &[&str]); 5] = [
+    let commands: [(&str, &[&str]); 4] = [
         ("run", &["run"]),
         ("install", &["install"]),
         ("uninstall", &["uninstall"]),
         ("status", &["status"]),
-        ("join", &["join", "100.64.0.1:7777", "123456"]),
     ];
 
     for (name, args) in commands {
@@ -45,4 +44,17 @@ fn every_other_command_exits_2_and_says_not_built_yet() {
             "{args:?} stderr: {stderr}"
         );
     }
+}
+
+#[test]
+fn join_with_a_port_that_is_not_a_number_exits_1_and_names_it() {
+    let out = Command::new(env!("CARGO_BIN_EXE_foundryd"))
+        .args(["join", "100.64.0.1", "ABCDEFGHJK"])
+        .env("FOUNDRY_PORT", "not-a-port")
+        .output()
+        .expect("foundryd runs");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(out.status.code(), Some(1), "exit: {:?}", out.status);
+    assert!(stderr.contains("FOUNDRY_PORT"), "stderr: {stderr}");
 }
