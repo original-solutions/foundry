@@ -152,12 +152,23 @@ pub fn read(data_dir: &Path, sessions: u32) -> Result<MachineSample, MachineErro
 
 /// Reads a sample, counting the live sessions `me` owns in `store`, and stores it as `me`'s
 /// sample record under its next own version. Returns the record written.
+///
+/// The machine is read before the store is taken, so a slow volume holds up no other user
+/// of the store. It blocks, so async callers run it on the blocking pool, as [`run`] does.
 pub fn write_sample(
-    store: &mut Store,
+    store: &Mutex<Store>,
     me: MachineId,
     data_dir: &Path,
 ) -> Result<Record<MachineSample>, MachineError> {
-    let body = read(data_dir, live_sessions(store, me)?)?;
+    let machine = read(data_dir, 0)?;
+    // A task that panicked while holding the store leaves it consistent: SQLite rolls back
+    // a transaction that was not committed. Stopping here would freeze this machine's last
+    // sample while it still looks online.
+    let mut store = store.lock().unwrap_or_else(PoisonError::into_inner);
+    let body = MachineSample {
+        sessions: live_sessions(&store, me)?,
+        ..machine
+    };
     let record = Record {
         owner: me,
         version: store.own_next_version()?,
@@ -183,19 +194,19 @@ fn live_sessions(store: &Store, me: MachineId) -> Result<u32, MachineError> {
     Ok(u32::try_from(live).unwrap_or(u32::MAX))
 }
 
-/// Writes a sample every [`SAMPLE_EVERY`], the first at once. A sample that cannot be read or
-/// stored is logged and the next one is tried on time.
+/// Writes a sample every [`SAMPLE_EVERY`], the first at once, each on the blocking pool so a
+/// slow disk read or a busy store never stalls an async worker. A sample that cannot be read
+/// or stored is logged and the next one is tried on time.
 pub async fn run(store: Arc<Mutex<Store>>, me: MachineId, data_dir: PathBuf) {
     let mut every = tokio::time::interval(SAMPLE_EVERY);
     every.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         every.tick().await;
-        // A task that panicked while holding the store leaves it consistent: SQLite rolls back
-        // a transaction that was not committed. Stopping here would freeze this machine's last
-        // sample while it still looks online.
-        let mut store = store.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Err(error) = write_sample(&mut store, me, &data_dir) {
-            tracing::warn!(%error, "machine sample not written");
+        let (store, data_dir) = (store.clone(), data_dir.clone());
+        match tokio::task::spawn_blocking(move || write_sample(&store, me, &data_dir)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => tracing::warn!(%error, "machine sample not written"),
+            Err(error) => tracing::warn!(%error, "machine sample not written"),
         }
     }
 }
@@ -496,8 +507,9 @@ mod tests {
         put_session(&mut store, me, SessionState::Working, true);
         put_session(&mut store, peer, SessionState::Working, false);
         let last_session_version = store.versions().unwrap()[&me];
+        let store = Mutex::new(store);
 
-        let written = write_sample(&mut store, me, dir.path()).unwrap();
+        let written = write_sample(&store, me, dir.path()).unwrap();
 
         assert_eq!(written.owner, me);
         assert!(!written.deleted);
@@ -505,13 +517,70 @@ mod tests {
         assert_eq!(written.body.sessions, 5);
         assert!(written.body.free_disk > 0);
         assert!(written.body.free_memory > 0);
-        assert_eq!(held_sample(&store, me), Some(written));
+        assert_eq!(
+            held_sample(&store.lock().unwrap(), me),
+            Some(written.clone())
+        );
+
+        // The sample just stored is this machine's record too, and is not a session.
+        let again = write_sample(&store, me, dir.path()).unwrap();
+        assert!(again.version > written.version);
+        assert_eq!(again.body.sessions, 5);
+    }
+
+    #[test]
+    fn write_sample_reads_the_machine_before_taking_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(
+            Store::open(dir.path().join("foundry.db")).unwrap(),
+        ));
+        let (held, release) = (std::sync::mpsc::channel(), std::sync::mpsc::channel::<()>());
+        let holder = store.clone();
+        let holding = std::thread::spawn(move || {
+            let _guard = holder.lock().unwrap();
+            held.0.send(()).unwrap();
+            release.1.recv().unwrap();
+        });
+        held.1.recv().unwrap();
+
+        // A missing data directory fails the disk read. Read first, that fails at once;
+        // with the store taken first, it would wait for the holder.
+        let (done, result) = std::sync::mpsc::channel();
+        let missing = dir.path().join("missing");
+        let writer = store.clone();
+        std::thread::spawn(move || {
+            done.send(write_sample(&writer, MachineId::random(), &missing).is_err())
+                .unwrap();
+        });
+        let failed = result.recv_timeout(Duration::from_secs(5));
+
+        release.0.send(()).unwrap();
+        holding.join().unwrap();
+        assert_eq!(failed, Ok(true), "the disk read waited for the store");
     }
 
     async fn settle() {
         for _ in 0..20 {
             tokio::task::yield_now().await;
         }
+    }
+
+    /// Each pass runs on the blocking pool, so wait in real time, up to 5 s, for the sample
+    /// held to differ from `before`, and give what is held then.
+    async fn sample_after(
+        store: &Arc<Mutex<Store>>,
+        me: MachineId,
+        before: Option<u64>,
+    ) -> Option<u64> {
+        for _ in 0..1_000 {
+            let held = held_version(store, me);
+            if held != before {
+                return held;
+            }
+            tokio::task::yield_now().await;
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        held_version(store, me)
     }
 
     fn held_version(store: &Arc<Mutex<Store>>, me: MachineId) -> Option<u64> {
@@ -528,16 +597,18 @@ mod tests {
         let me = MachineId::random();
         let task = tokio::spawn(run(store.clone(), me, dir.path().to_path_buf()));
 
-        settle().await;
-        let first = held_version(&store, me).expect("a sample at once");
+        let first = sample_after(&store, me, None)
+            .await
+            .expect("a sample at once");
 
         tokio::time::advance(Duration::from_millis(4_900)).await;
         settle().await;
         assert_eq!(held_version(&store, me), Some(first));
 
         tokio::time::advance(Duration::from_millis(100)).await;
-        settle().await;
-        let second = held_version(&store, me).expect("still a sample");
+        let second = sample_after(&store, me, Some(first))
+            .await
+            .expect("still a sample");
         assert!(second > first, "{second} after {first}");
 
         task.abort();
@@ -551,13 +622,17 @@ mod tests {
         ));
         let me = MachineId::random();
         let task = tokio::spawn(run(store.clone(), me, dir.path().to_path_buf()));
-        settle().await;
-        let first = held_version(&store, me).expect("a sample at once");
+        let first = sample_after(&store, me, None)
+            .await
+            .expect("a sample at once");
 
         // Three samples late, as after the machine sleeps. Each write takes one version.
         tokio::time::advance(SAMPLE_EVERY * 3).await;
-        settle().await;
-        assert_eq!(held_version(&store, me), Some(first + 1));
+        assert_eq!(sample_after(&store, me, Some(first)).await, Some(first + 1));
+        assert_eq!(
+            sample_after(&store, me, Some(first + 1)).await,
+            Some(first + 1)
+        );
 
         task.abort();
     }
@@ -572,13 +647,12 @@ mod tests {
         let data = dir.path().join("data");
         let task = tokio::spawn(run(store.clone(), me, data.clone()));
 
-        settle().await;
-        assert_eq!(held_version(&store, me), None);
+        // The first pass fails on the missing directory. Waiting out the 5 s also lets it end.
+        assert_eq!(sample_after(&store, me, None).await, None);
 
         std::fs::create_dir(&data).unwrap();
         tokio::time::advance(SAMPLE_EVERY).await;
-        settle().await;
-        assert!(held_version(&store, me).is_some());
+        assert!(sample_after(&store, me, None).await.is_some());
 
         task.abort();
     }
@@ -600,13 +674,47 @@ mod tests {
 
         let me = MachineId::random();
         let task = tokio::spawn(run(store.clone(), me, dir.path().to_path_buf()));
-        settle().await;
-        let first = held_version(&store, me).expect("a sample at once");
+        let first = sample_after(&store, me, None)
+            .await
+            .expect("a sample at once");
 
         tokio::time::advance(SAMPLE_EVERY).await;
-        settle().await;
-        assert!(held_version(&store, me) > Some(first));
+        assert!(sample_after(&store, me, Some(first)).await > Some(first));
 
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn run_leaves_the_runtime_free_while_the_store_is_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(
+            Store::open(dir.path().join("foundry.db")).unwrap(),
+        ));
+        let ((held, holding_now), holds) = (std::sync::mpsc::channel(), Duration::from_secs(1));
+        let holder = store.clone();
+        let holding = std::thread::spawn(move || {
+            let _guard = holder.lock().unwrap();
+            held.send(()).unwrap();
+            std::thread::sleep(holds);
+        });
+        holding_now.recv().unwrap();
+
+        let task = tokio::spawn(run(
+            store.clone(),
+            MachineId::random(),
+            dir.path().to_path_buf(),
+        ));
+        // This test's runtime has one thread. A pass that waits for the store on it stalls
+        // this 20 ms sleep until the holder lets go.
+        let started = std::time::Instant::now();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let slept = started.elapsed();
+
+        holding.join().unwrap();
+        task.abort();
+        assert!(
+            slept < holds / 2,
+            "the runtime stalled {slept:?} while the sampler waited for the store"
+        );
     }
 }
