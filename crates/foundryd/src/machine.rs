@@ -225,6 +225,7 @@ mod tests {
     use super::*;
     use foundry_proto::ids::{SessionId, TerminalId, WorkspaceId};
     use foundry_proto::record::Session;
+    use std::sync::PoisonError;
 
     fn sample(sessions: u32, load_per_core: f64, free_disk: u64) -> Record<MachineSample> {
         Record {
@@ -307,6 +308,20 @@ mod tests {
     }
 
     #[test]
+    fn read_divides_the_load_by_this_machines_logical_cores() {
+        let dir = tempfile::tempdir().unwrap();
+        let cores = std::thread::available_parallelism().unwrap().get() as f64;
+        let expected = System::load_average().unwrap().one / cores;
+        let sample = read(dir.path(), 0).unwrap();
+        // The load average moves a little between the two reads.
+        assert!(
+            (sample.load_per_core - expected).abs() < 0.1,
+            "load per core {} but the 1-minute load over {cores} cores is {expected}",
+            sample.load_per_core
+        );
+    }
+
+    #[test]
     fn under_every_limit_gives_no_reason() {
         assert!(over_limits(&sample(3, 0.9, 10_000_000_000), &limits()).is_empty());
     }
@@ -324,6 +339,18 @@ mod tests {
         assert_eq!(
             texts(&sample(0, 0.2, 4_200_000_000), &limits()),
             ["trilogy-mac: free disk 4.2 GB under limit 10.0 GB"]
+        );
+    }
+
+    #[test]
+    fn a_value_never_prints_equal_to_a_limit_it_is_over_or_under() {
+        assert_eq!(
+            texts(&sample(0, 1.004, 50_000_000_000), &limits()),
+            ["trilogy-mac: load 1.004 over limit 1.0"]
+        );
+        assert_eq!(
+            texts(&sample(0, 0.2, 9_999_000_000), &limits()),
+            ["trilogy-mac: free disk 9.999 GB under limit 10.0 GB"]
         );
     }
 
@@ -446,7 +473,8 @@ mod tests {
     }
 
     fn held_version(store: &Arc<Mutex<Store>>, me: MachineId) -> Option<u64> {
-        held_sample(&store.lock().unwrap(), me).map(|r| r.version)
+        let store = store.lock().unwrap_or_else(PoisonError::into_inner);
+        held_sample(&store, me).map(|r| r.version)
     }
 
     #[tokio::test(start_paused = true)]
@@ -490,6 +518,33 @@ mod tests {
         tokio::time::advance(SAMPLE_EVERY).await;
         settle().await;
         assert!(held_version(&store, me).is_some());
+
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_keeps_sampling_after_another_task_panics_holding_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(
+            Store::open(dir.path().join("foundry.db")).unwrap(),
+        ));
+        let holder = store.clone();
+        std::thread::spawn(move || {
+            let _guard = holder.lock().unwrap();
+            panic!("a bug elsewhere, holding the store");
+        })
+        .join()
+        .unwrap_err();
+        assert!(store.is_poisoned());
+
+        let me = MachineId::random();
+        let task = tokio::spawn(run(store.clone(), me, dir.path().to_path_buf()));
+        settle().await;
+        let first = held_version(&store, me).expect("a sample at once");
+
+        tokio::time::advance(SAMPLE_EVERY).await;
+        settle().await;
+        assert!(held_version(&store, me) > Some(first));
 
         task.abort();
     }
