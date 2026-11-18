@@ -8,12 +8,12 @@
 //! workspace. A setup that fails leaves the workspace as it is: the terminal shows what failed
 //! and exits with the failing command's code.
 //!
-//! Archiving refuses while there is uncommitted or unpushed work, unless forced, and changes
-//! nothing when it refuses. Uncommitted work is a changed, deleted or new file that git does not
+//! Archiving refuses while there is uncommitted or unpushed work, unless forced. Uncommitted work is a changed, deleted or new file that git does not
 //! ignore; ignored files, such as build output, go with the worktree. Unpushed work is a commit
 //! on the branch, or on whatever the worktree has checked out, that no remote branch has. An
-//! archive closes the workspace's terminals, checks again, removes the worktree and keeps the
-//! branch.
+//! archive checks, closes the workspace's terminals, checks again for what they wrote as they
+//! were hung up, removes the worktree and keeps the branch. A refusal at the first check changes
+//! nothing; a refusal at the second leaves the terminals closed and the worktree as it is.
 //!
 //! Every branch is made by [`safe_branch`] and every path reaches git after `--`, so a name as
 //! typed never reads as an option and never leaves the project's folder of worktrees.
@@ -119,14 +119,13 @@ impl fmt::Display for Dirty {
 
 impl std::error::Error for Dirty {}
 
-/// `name` made into a git branch that is also one path part: letters, lower-cased, and digits of
-/// any script, `_`, `-` and single `.` are kept, anything else becomes `-`, a run of `-` becomes
-/// one, `-` and `.` are cut from both ends, and the result is at most [`BRANCH_AT_MOST`] bytes.
-/// A name with nothing left is `workspace`. Lower case keeps two names that differ only in case
-/// from sharing a folder, and a ref, on a disk that ignores case.
+/// `name` made into a git branch that is also one path part: letters and digits of any script,
+/// `_`, `-` and single `.` are kept, anything else becomes `-`, a run of `-` becomes one, `-` and
+/// `.` are cut from both ends, and the result is at most [`BRANCH_AT_MOST`] bytes. A name with
+/// nothing left is `workspace`, and `HEAD`, which git keeps for itself, is `HEAD-workspace`.
 pub fn safe_branch(name: &str) -> String {
     let mut branch = String::with_capacity(name.len());
-    for c in name.chars().flat_map(char::to_lowercase) {
+    for c in name.chars() {
         let c = if c.is_alphanumeric() || matches!(c, '_' | '-' | '.') {
             c
         } else {
@@ -146,11 +145,20 @@ pub fn safe_branch(name: &str) -> String {
     if let Some(stem) = branch.strip_suffix(".lock") {
         branch = format!("{stem}-lock");
     }
-    if branch.is_empty() {
-        "workspace".into()
-    } else {
-        branch
+    match branch.as_str() {
+        "" => "workspace".into(),
+        "HEAD" => "HEAD-workspace".into(),
+        _ => branch,
     }
+}
+
+/// `s` as a disk that ignores case compares it: each character upper-cased, then lower-cased,
+/// so `Fix` and `fix`, a final sigma and a sigma, or a long s and an s, come out the same.
+fn fold(s: &str) -> String {
+    s.chars()
+        .flat_map(char::to_uppercase)
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 /// This machine's workspaces.
@@ -218,9 +226,9 @@ impl Workspaces {
 
     /// Closes the workspace's terminals, removes its worktree and keeps its branch. Unless
     /// `force`, refuses with [`WorkspaceError::Dirty`] while there is uncommitted or unpushed
-    /// work, and changes nothing. Work that appears while the terminals close is refused too,
-    /// though the terminals are closed by then. The archive finishes even when the caller stops
-    /// waiting.
+    /// work, and changes nothing. Work that appears while the terminals close is refused with
+    /// [`WorkspaceError::Dirty`] too, and then the terminals are already closed. The archive
+    /// finishes even when the caller stops waiting.
     pub async fn archive(&self, id: WorkspaceId, force: bool) -> Result<(), WorkspaceError> {
         let inner = self.inner.clone();
         tokio::spawn(async move { inner.archive(id, force).await }).await?
@@ -258,7 +266,8 @@ impl Inner {
         let _held = lock.lock().await;
         let clone = self.clone_for(project, &repo).await?;
         self.git(&clone, "fetch", ["--quiet", "origin"]).await?;
-        // Compared without case: on a disk that ignores case, `Fix` and `fix` are one ref file.
+        // Compared as the disk compares names: where it ignores case, `Fix` and `fix` are one
+        // ref file and one folder.
         let branches = self
             .git(
                 &clone,
@@ -266,32 +275,39 @@ impl Inner {
                 ["--format=%(refname:lstrip=2)", "refs/heads/"],
             )
             .await?;
-        if branches.lines().any(|b| b.to_lowercase() == branch) {
+        if branches.lines().any(|b| fold(b) == fold(&branch)) {
             return Err(WorkspaceError::BranchExists(branch));
         }
-        self.git(
-            &clone,
-            "worktree",
-            [
-                OsStr::new("add"),
-                OsStr::new("--quiet"),
-                OsStr::new("--no-track"),
-                OsStr::new("-b"),
-                OsStr::new(&branch),
-                OsStr::new("--"),
-                worktree.as_os_str(),
-                OsStr::new(&format!("refs/remotes/origin/{base}")),
-            ],
-        )
-        .await?;
-        let body = Workspace {
-            id,
-            project,
-            name: name.to_owned(),
-            branch,
-            base: base.to_owned(),
-        };
-        self.write(body, false).await?;
+        let made = async {
+            self.git(
+                &clone,
+                "worktree",
+                [
+                    OsStr::new("add"),
+                    OsStr::new("--quiet"),
+                    OsStr::new("--no-track"),
+                    OsStr::new("-b"),
+                    OsStr::new(&branch),
+                    OsStr::new("--"),
+                    worktree.as_os_str(),
+                    OsStr::new(&format!("refs/remotes/origin/{base}")),
+                ],
+            )
+            .await?;
+            let body = Workspace {
+                id,
+                project,
+                name: name.to_owned(),
+                branch: branch.clone(),
+                base: base.to_owned(),
+            };
+            self.write(body, false).await
+        }
+        .await;
+        if let Err(e) = made {
+            self.undo(&clone, &worktree, &branch).await;
+            return Err(e);
+        }
         // Still under the lock, so an archive cannot run before the setup's terminal is known.
         if let Some(argv) = setup(&worktree).await {
             self.terminals
@@ -323,21 +339,43 @@ impl Inner {
             }
         }
         if tokio::fs::try_exists(&worktree).await? {
-            // What the terminals wrote as they were hung up counts too. Without `--force`, git
-            // itself refuses a worktree that changes after this check.
-            let mut remove = vec![OsStr::new("remove")];
-            if force {
-                remove.push(OsStr::new("--force"));
-            } else {
+            if !force {
+                // What the terminals wrote as they were hung up counts too.
                 self.refuse_dirty(&clone, &worktree, &body.branch).await?;
             }
-            remove.extend([OsStr::new("--"), worktree.as_os_str()]);
-            self.git(&clone, "worktree", remove).await?;
+            // Checked just now, with nothing of the workspace left running. `--force` also takes
+            // a worktree holding submodules, which git refuses otherwise.
+            self.git(
+                &clone,
+                "worktree",
+                [
+                    OsStr::new("remove"),
+                    OsStr::new("--force"),
+                    OsStr::new("--"),
+                    worktree.as_os_str(),
+                ],
+            )
+            .await?;
         } else {
             // Removed by hand: git forgets it, so its branch can be checked out again.
             self.git(&clone, "worktree", ["prune"]).await?;
         }
         self.write(body, true).await
+    }
+
+    /// Takes back what a create that failed made of its worktree and branch, as far as it got.
+    /// The branch is new and nothing of anyone's is on it. Each step that finds nothing to undo
+    /// fails, and that is fine.
+    async fn undo(&self, clone: &Path, worktree: &Path, branch: &str) {
+        let remove = [
+            OsStr::new("remove"),
+            OsStr::new("--force"),
+            OsStr::new("--"),
+            worktree.as_os_str(),
+        ];
+        let _ = self.git(clone, "worktree", remove).await;
+        let _ = self.git(clone, "worktree", ["prune"]).await;
+        let _ = self.git(clone, "branch", ["-D", "--", branch]).await;
     }
 
     /// [`WorkspaceError::Dirty`] when the worktree has uncommitted files, or the branch or the
