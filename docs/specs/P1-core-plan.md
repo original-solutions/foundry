@@ -47,6 +47,8 @@ crates/
   foundry-fake-agent/          bin used only by tests
   foundryd/
     src/main.rs                clap commands: run, install, uninstall, status, join
+    src/daemon.rs              `run`: starts every long-running module
+    src/status.rs              `status`: asks the local daemon and prints what it says
     src/store/                 SQLite schema, migrations, record upsert
     src/terminals.rs           start and reattach holders, relay bytes
     src/sessions/              launch, hooks endpoint, state rules, stuck timer
@@ -139,7 +141,7 @@ Dependencies are in brackets. Tasks with no dependency between them can build at
 - **Produces:** `GET /api/state` (the full synced state as JSON), a WebSocket at `/api/events` that sends every record change, a WebSocket at `/api/terminals/<id>` carrying the snapshot then bytes both ways, and `POST` routes to create and archive a workspace, start a session or shell, and close a terminal. The server refuses to bind to any address that is not loopback or in Tailscale's range.
 - **Tests:** a client connected to `/api/events` sees a workspace appear and its session change state. A terminal socket echoes typed input from a `cat` child. Binding to `0.0.0.0` fails with an error that names the rule. No response contains a secret.
 
-### 11. Minimal web UI [10]
+### 11. Minimal web UI [10, 20]
 
 - **Spec:** Scope (minimal UI), D2, D3.
 - **Files:** `web/*`.
@@ -195,6 +197,14 @@ Dependencies are in brackets. Tasks with no dependency between them can build at
 - **Produces:** `foundryd install` and `uninstall` for a launchd agent on macOS and a systemd unit under a non-root user on Linux, both set so a restart does not kill holders; versions under `versions/<v>` with a `current` link; install of a newer `v*` tag; rollback after three starts without becoming healthy.
 - **Tests:** the unit files are checked as text for the settings that spare child processes. Three starts that never report healthy point `current` back and record the refused tag. A refused tag is skipped while it is the highest. A manual check, written in `docs/install.md` and run on a Mac and a Linux machine before release: restart the service with a session open and see it continue (acceptance 5 and 12).
 
+### 20. Daemon start and status [5, 6, 8, 9, 10, 12]
+
+- **Spec:** Architecture, State is always visible, Updates.
+- **Files:** `crates/foundryd/src/daemon.rs`, `crates/foundryd/src/status.rs`.
+- **Produces:** `daemon::run() -> ExitCode`, which takes a lock on the data directory, opens the store, runs `reattach_all`, then starts the hooks endpoint, machine sampling, sync and the API server, and stops cleanly on SIGTERM or SIGINT while leaving holders running. The data directory is `FOUNDRY_HOME`, else `~/.local/share/foundry`. The port is `FOUNDRY_PORT`, else 7433. `status::status() -> ExitCode`, which reads `GET /api/state` from the local daemon on loopback and prints each machine with its state and numbers and each session with its state.
+- **Later modules:** a long-running module built after this task (coordinator, placement, attention, gateway, update) adds one start call to the list marked `// services` in `daemon::run`. That line is the one shared edit the plan allows.
+- **Tests:** a second `run` on the same data directory exits 1 and names the lock. After SIGTERM the daemon exits 0 and a terminal's child is still running. A daemon started again shows that terminal as running. `status` against a running daemon prints this machine and exits 0. `status` with no daemon exits 1 and says none is running. The scaffold's test that `run` and `status` say "not built yet" is changed to cover only the commands still unbuilt.
+
 ### 19. Acceptance run [all]
 
 - Not a factory issue. Foundry is installed on this Mac, trilogy-mac and one Linux machine, and each of the twelve acceptance criteria in the spec is checked by hand and recorded in `docs/acceptance/P1.md`.
@@ -206,7 +216,8 @@ Dependencies are in brackets. Tasks with no dependency between them can build at
    │          ├─ 8
    └─ 4 ──────┘ (5 needs 3 and 4)
 5 ── 9
-6, 8, 9 ── 10 ── 11
+6, 8, 9 ── 10
+5, 6, 8, 9, 10, 12 ── 20 ── 11
 3 ── 12 ── 13 ── 14 ── 15
 10, 12 ── 16
 6, 9, 11, 12, 14 ── 17
