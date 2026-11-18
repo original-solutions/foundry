@@ -1113,11 +1113,62 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_machine_already_admitted_may_use_a_new_code_with_the_same_key() {
-        let (host, peer) = (machine_keys(), machine_keys());
+    async fn a_machine_already_admitted_may_use_a_new_code_with_the_same_key_and_spends_it() {
+        let (host, peer, other) = (machine_keys(), machine_keys(), machine_keys());
         admit(&host, &peer);
-        admit(&host, &peer);
+        let code = host.new_code().unwrap().to_string();
+        host.redeem(&code, peer.me(), &peer.public_key()).unwrap();
         assert_eq!(host.state(peer.me()), KeyState::Active);
+        let spent = host.redeem(&code, other.me(), &other.public_key());
+        assert!(matches!(spent, Err(JoinError::BadCode)), "{spent:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_key_table_change_keeps_what_another_process_saved_meanwhile() {
+        let secrets = Arc::new(MemorySecrets::default());
+        let daemon = Keys::open(secrets.clone()).unwrap();
+        let (h, m) = (machine_keys(), machine_keys());
+        admit(&daemon, &m);
+        // `foundryd join` in another process keeps its host's key in the same store.
+        hold_key(&*secrets, h.me(), h.public_key()).unwrap();
+        daemon.revoke(m.me()).unwrap();
+        assert_eq!(daemon.state(h.me()), KeyState::Active);
+        let reopened = Keys::open(secrets).unwrap();
+        assert_eq!(reopened.state(h.me()), KeyState::Active);
+        assert_eq!(reopened.state(m.me()), KeyState::Revoked);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn joining_never_replaces_a_key_or_revocation_already_held() {
+        let secrets = Arc::new(MemorySecrets::default());
+        let me = Keys::open(secrets.clone()).unwrap();
+        let (held, revoked, stranger) = (machine_keys(), machine_keys(), machine_keys());
+        admit(&me, &held);
+        admit(&me, &revoked);
+        me.revoke(revoked.me()).unwrap();
+        hold_key(&*secrets, held.me(), held.public_key()).unwrap();
+        let before = secrets.get(KEYS_SECRET).unwrap();
+        for (machine, key) in [
+            (held.me(), stranger.public_key()),
+            (revoked.me(), revoked.public_key()),
+        ] {
+            let kept = hold_key(&*secrets, machine, key);
+            assert!(
+                matches!(kept, Err(JoinError::Taken(m)) if m == machine),
+                "{kept:?}"
+            );
+            assert_eq!(secrets.get(KEYS_SECRET).unwrap(), before);
+        }
+        secrets.set(KEYS_SECRET, "not json").unwrap();
+        let unreadable = hold_key(&*secrets, stranger.me(), stranger.public_key());
+        assert!(matches!(
+            unreadable,
+            Err(JoinError::Unreadable(KEYS_SECRET))
+        ));
+        assert_eq!(
+            secrets.get(KEYS_SECRET).unwrap().as_deref(),
+            Some("not json")
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1198,12 +1249,19 @@ mod tests {
         let (x, y) = (machine_keys(), machine_keys());
         let code = host.new_code().unwrap().to_string();
         gated.armed.store(true, Ordering::SeqCst);
+        let started = AtomicBool::new(false);
         let results = std::thread::scope(|scope| {
             let first = scope.spawn(|| host.redeem(&code, x.me(), &x.public_key()));
             while gated.waiting.load(Ordering::SeqCst) == 0 {
                 std::thread::yield_now();
             }
-            let second = scope.spawn(|| host.redeem(&code, y.me(), &y.public_key()));
+            let second = scope.spawn(|| {
+                started.store(true, Ordering::SeqCst);
+                host.redeem(&code, y.me(), &y.public_key())
+            });
+            while !started.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
             std::thread::sleep(Duration::from_millis(200));
             *gated.open.0.lock().unwrap() = true;
             gated.open.1.notify_all();
