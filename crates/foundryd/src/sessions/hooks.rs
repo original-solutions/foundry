@@ -40,16 +40,13 @@ pub(super) async fn hook(
         tracing::warn!(session = %session, "hook refused: no such session or wrong token");
         return StatusCode::FORBIDDEN;
     }
-    let name = serde_json::from_slice::<serde_json::Value>(&body)
+    let hook = serde_json::from_slice::<serde_json::Value>(&body)
         .ok()
-        .and_then(|v| v.get("hook_event_name")?.as_str().map(str::to_owned));
-    let Some(name) = name else {
+        .and_then(|payload| Hook::from_payload(&payload));
+    let Some(hook) = hook else {
         return StatusCode::BAD_REQUEST;
     };
-    match inner
-        .event(&live, Event::Hook(Hook::from_name(&name)))
-        .await
-    {
+    match inner.event(&live, Event::Hook(hook)).await {
         Ok(_) => StatusCode::NO_CONTENT,
         Err(error) => {
             tracing::error!(session = %session, %error, "hook not recorded");

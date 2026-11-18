@@ -31,6 +31,19 @@ impl Hook {
             _ => Self::Other,
         }
     }
+
+    /// The hook a posted payload is, or `None` when it names none. `SessionEnd` with reason
+    /// `clear` is [`Hook::Other`]: Claude Code sends it, then `SessionStart` with source
+    /// `clear`, and keeps running.
+    pub fn from_payload(payload: &serde_json::Value) -> Option<Self> {
+        let hook = Self::from_name(payload.get("hook_event_name")?.as_str()?);
+        let cleared = payload.get("reason").and_then(|r| r.as_str()) == Some("clear");
+        Some(if hook == Self::SessionEnd && cleared {
+            Self::Other
+        } else {
+            hook
+        })
+    }
 }
 
 /// Something that happened to a session.
@@ -70,6 +83,8 @@ pub fn next_state(state: SessionState, event: Event) -> SessionState {
             Hook::SessionEnd => Finished,
             // It also fires on /clear, resume and compact, sometimes mid-turn.
             Hook::SessionStart if state == Starting => Idle,
+            // Any event clears stuck, as output does.
+            Hook::SessionStart | Hook::Other if state == Stuck => Working,
             Hook::UserPromptSubmit | Hook::PreToolUse | Hook::PostToolUse => Working,
             // Claude Code also notifies after 60 seconds idle: an idle session is not waiting
             // on a permission answer.
@@ -163,7 +178,12 @@ mod tests {
             Hook::from_payload(&v)
         };
         assert_eq!(payload(Some("clear")), Some(Hook::Other));
-        for reason in [None, Some("logout"), Some("other"), Some("prompt_input_exit")] {
+        for reason in [
+            None,
+            Some("logout"),
+            Some("other"),
+            Some("prompt_input_exit"),
+        ] {
             assert_eq!(payload(reason), Some(Hook::SessionEnd), "{reason:?}");
         }
         let named = |name: &str| Hook::from_payload(&serde_json::json!({"hook_event_name": name}));

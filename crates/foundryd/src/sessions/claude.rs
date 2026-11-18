@@ -24,18 +24,22 @@ const EVENTS: [&str; 7] = [
 /// The events that take a tool matcher.
 const TOOL_EVENTS: [&str; 2] = ["PreToolUse", "PostToolUse"];
 
-/// The settings that register a command hook for each event, posting the event to `url` with
-/// `token`.
+/// `text` in single quotes for `sh`, each `'` in it written as `'\''`.
+pub fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', r"'\''"))
+}
+
+/// The settings that register a command hook for each event. The command posts the event on
+/// its stdin with the URL and headers in the curl config file `curl_config`, so the token is
+/// in a private file and never in a command line, which other users on the machine can read.
 ///
 /// The command's stdout goes to /dev/null, because Claude Code adds the stdout of some hooks
 /// to the model's context. It ends in `|| true`, because a hook that exits 2 blocks the tool
-/// call, and posting must never block the agent. `url` and `token` sit inside single quotes, so
-/// they must have none: a hex token and `http://127.0.0.1:<port>/hooks/<uuid>` never do.
-pub fn settings_json(url: &str, token: &str) -> Value {
-    debug_assert!(!url.contains('\'') && !token.contains('\''));
+/// call, and posting must never block the agent.
+pub fn settings_json(curl_config: &Path) -> Value {
     let command = format!(
-        "curl -sS -m 5 -X POST -H 'Content-Type: application/json' \
-         -H 'Authorization: Bearer {token}' --data-binary @- '{url}' >/dev/null 2>&1 || true"
+        "curl -sS -m 5 -K {} -X POST --data-binary @- >/dev/null 2>&1 || true",
+        shell_quote(&curl_config.to_string_lossy())
     );
     let hooks: Map<String, Value> = EVENTS
         .iter()
@@ -50,9 +54,20 @@ pub fn settings_json(url: &str, token: &str) -> Value {
     json!({ "hooks": hooks })
 }
 
-/// Writes `value` to a new file at `path`, readable by this user only, in a folder made
-/// readable by this user only. An existing file is an error.
-pub fn write_settings(path: &Path, value: &Value) -> Result<(), SessionError> {
+/// Creates a new file at `path`, readable by this user only, holding `bytes`. An existing file
+/// is an error.
+fn create_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+/// Writes `bytes` to a new private file at `path`, in a folder made private too.
+fn write_new_private(path: &Path, bytes: &[u8]) -> Result<(), SessionError> {
     let io = |step: &str| {
         let what = format!("{}: {step}", path.display());
         move |source| SessionError::Io { what, source }
@@ -64,16 +79,45 @@ pub fn write_settings(path: &Path, value: &Value) -> Result<(), SessionError> {
             .create(dir)
             .map_err(io("create the folder"))?;
     }
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(io("create the file"))?;
-    file.write_all(value.to_string().as_bytes())
-        .and_then(|()| file.sync_all())
-        .map_err(io("write the file"))
+    create_private(path, bytes).map_err(io("write the file"))
 }
+
+/// Writes `value` to a new file at `path`, readable by this user only, in a folder made
+/// readable by this user only. An existing file is an error.
+pub fn write_settings(path: &Path, value: &Value) -> Result<(), SessionError> {
+    write_new_private(path, value.to_string().as_bytes())
+}
+
+/// Writes the curl config a session's hooks read: the headers, with the bearer `token`, and
+/// the `url` to post to. Same file rules as [`write_settings`]. `url` and `token` sit inside
+/// double quotes, so they must hold none: a hex token and `http://127.0.0.1:<port>/hooks/<uuid>`
+/// never do.
+pub fn write_curl_config(path: &Path, url: &str, token: &str) -> Result<(), SessionError> {
+    debug_assert!(!url.contains(['"', '\\', '\n']) && !token.contains(['"', '\\', '\n']));
+    let config = format!(
+        "header = \"Content-Type: application/json\"\n\
+         header = \"Authorization: Bearer {token}\"\n\
+         url = \"{url}\"\n"
+    );
+    write_new_private(path, config.as_bytes())
+}
+
+/// [`mark_trusted`] while holding `lock`, so two marks made by this process never read the file
+/// at the same time and one overwrite the other.
+pub fn mark_trusted_locked(
+    lock: &std::sync::Mutex<()>,
+    claude_json: &Path,
+    worktree: &Path,
+) -> Result<(), SessionError> {
+    let _held = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    mark_trusted(claude_json, worktree)
+}
+
+/// How often a merge is redone from the file's new bytes when Claude Code wrote the file while
+/// it was being merged.
+const MERGE_TRIES: usize = 3;
 
 /// Marks `worktree` as trusted in Claude Code's state file: `projects.<worktree>.
 /// hasTrustDialogAccepted` is `true`. Without it Claude Code asks, with "No, exit" the default.
@@ -84,6 +128,9 @@ pub fn write_settings(path: &Path, value: &Value) -> Result<(), SessionError> {
 /// of it; a symlinked file has its target replaced and stays a link. A file that is not JSON,
 /// or whose `projects` or entry is not an object, is an error and is left alone. The error
 /// names the file and never quotes it, as it can hold credentials.
+///
+/// Claude Code writes the file too, so just before the rename the file is read again, and a merge
+/// made from bytes that have changed is made again from the new ones, up to [`MERGE_TRIES`] times.
 pub fn mark_trusted(claude_json: &Path, worktree: &Path) -> Result<(), SessionError> {
     let io = |what: String| move |source| SessionError::Io { what, source };
     let key = std::fs::canonicalize(worktree)
@@ -105,78 +152,86 @@ pub fn mark_trusted(claude_json: &Path, worktree: &Path) -> Result<(), SessionEr
         Err(e) if e.kind() == io::ErrorKind::NotFound => claude_json.to_path_buf(),
         Err(e) => return Err(io(format!("{}: resolve", claude_json.display()))(e)),
     };
-    let existing = match std::fs::read(&target) {
-        Ok(bytes) => Some(bytes),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-        Err(e) => return Err(io(format!("{}: read", target.display()))(e)),
+    let read = || match std::fs::read(&target) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(io(format!("{}: read", target.display()))(e)),
     };
     let write_err = |step: &str| io(format!("{}: {step}", target.display()));
 
-    let Some(bytes) = existing else {
-        let state = json!({"projects": {key: {"hasTrustDialogAccepted": true}}});
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&target)
-            .map_err(write_err("create"))?;
-        return file
-            .write_all(state.to_string().as_bytes())
-            .and_then(|()| file.sync_all())
-            .map_err(write_err("write"));
-    };
+    for attempt in 1..=MERGE_TRIES {
+        let Some(bytes) = read()? else {
+            let state = json!({"projects": {key: {"hasTrustDialogAccepted": true}}});
+            return create_private(&target, state.to_string().as_bytes())
+                .map_err(write_err("create"));
+        };
 
-    let mut state: Value = serde_json::from_slice(&bytes).map_err(|e| {
-        unusable(format!(
-            "not valid JSON (line {}, column {})",
-            e.line(),
-            e.column()
-        ))
-    })?;
-    if trusted(&state) {
-        return Ok(());
-    }
-    let root = state
-        .as_object_mut()
-        .ok_or_else(|| unusable("the top level is not an object".into()))?;
-    let projects = root
-        .entry("projects")
-        .or_insert_with(|| json!({}))
-        .as_object_mut()
-        .ok_or_else(|| unusable("`projects` is not an object".into()))?;
-    let entry = projects
-        .entry(key)
-        .or_insert_with(|| json!({}))
-        .as_object_mut()
-        .ok_or_else(|| unusable("the entry for the worktree is not an object".into()))?;
-    entry.insert("hasTrustDialogAccepted".into(), Value::Bool(true));
-
-    let mode = std::fs::metadata(&target)
-        .map_err(write_err("read the mode"))?
-        .permissions()
-        .mode()
-        & 0o7777;
-    let dir = target.parent().unwrap_or(Path::new("."));
-    let temp = dir.join(format!(".claude.json.foundry-{}.tmp", uuid::Uuid::new_v4()));
-    let written = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(mode)
-            .open(&temp)?;
-        file.write_all(serde_json::to_string_pretty(&state)?.as_bytes())?;
-        file.sync_all()?;
-        // `mode` above is cut by the umask; the file's own mode is what is kept.
-        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(mode))?;
-        std::fs::rename(&temp, &target)
-    })();
-    written.map_err(|source| {
-        let _ = std::fs::remove_file(&temp);
-        SessionError::Io {
-            what: format!("{}: replace", target.display()),
-            source,
+        let mut state: Value = serde_json::from_slice(&bytes).map_err(|e| {
+            unusable(format!(
+                "not valid JSON (line {}, column {})",
+                e.line(),
+                e.column()
+            ))
+        })?;
+        if trusted(&state) {
+            return Ok(());
         }
-    })
+        let root = state
+            .as_object_mut()
+            .ok_or_else(|| unusable("the top level is not an object".into()))?;
+        let projects = root
+            .entry("projects")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .ok_or_else(|| unusable("`projects` is not an object".into()))?;
+        let entry = projects
+            .entry(key)
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .ok_or_else(|| unusable("the entry for the worktree is not an object".into()))?;
+        entry.insert("hasTrustDialogAccepted".into(), Value::Bool(true));
+
+        let mode = std::fs::metadata(&target)
+            .map_err(write_err("read the mode"))?
+            .permissions()
+            .mode()
+            & 0o7777;
+        let dir = target.parent().unwrap_or(Path::new("."));
+        let temp = dir.join(format!(".claude.json.foundry-{}.tmp", uuid::Uuid::new_v4()));
+        let written = (|| {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(mode)
+                .open(&temp)?;
+            file.write_all(serde_json::to_string_pretty(&state)?.as_bytes())?;
+            file.sync_all()?;
+            // `mode` above is cut by the umask; the file's own mode is what is kept.
+            std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(mode))?;
+            // Claude Code rewrites the file too. When it did while this merge was made, the
+            // rename would undo its write, so the merge is made again from the new bytes.
+            // The last try goes ahead: the window left is the time between this read and the
+            // rename.
+            if attempt < MERGE_TRIES && read().ok().flatten().as_deref() != Some(bytes.as_slice()) {
+                return Ok(false);
+            }
+            std::fs::rename(&temp, &target).map(|()| true)
+        })();
+        match written {
+            Ok(true) => return Ok(()),
+            Ok(false) => {
+                let _ = std::fs::remove_file(&temp);
+            }
+            Err(source) => {
+                let _ = std::fs::remove_file(&temp);
+                return Err(SessionError::Io {
+                    what: format!("{}: replace", target.display()),
+                    source,
+                });
+            }
+        }
+    }
+    unreachable!("the last try returns")
 }
 
 /// Where Claude Code keeps its state: `$CLAUDE_CONFIG_DIR/.claude.json` when that is set and

@@ -41,9 +41,11 @@ mod tests;
 /// A working session with no output and no hook for this long is stuck.
 pub const STUCK_AFTER: Duration = Duration::from_secs(10 * 60);
 
-/// How long the output follower waits before it attaches again to a terminal that dropped it,
-/// and how long it waits for a terminal's exit record to appear.
+/// How long to wait before trying again after a failure: the output follower attaching again,
+/// the exit being read, the exit or a stall being recorded. Each wait is twice the one before,
+/// up to [`RETRY_AT_MOST`].
 const RETRY_AFTER: Duration = Duration::from_millis(100);
+/// The longest wait between two tries.
 const RETRY_AT_MOST: Duration = Duration::from_secs(10);
 
 #[derive(Debug, thiserror::Error)]
@@ -107,6 +109,8 @@ struct Inner {
     /// Where settings files live, `<data dir>/sessions`.
     dir: PathBuf,
     config: Config,
+    /// Held while a worktree is marked trusted, so two starts never overwrite each other.
+    trust: Mutex<()>,
     live: Mutex<HashMap<SessionId, Arc<Live>>>,
 }
 
@@ -116,6 +120,8 @@ struct Live {
     /// What the session's hooks present as a bearer token.
     token: String,
     settings: PathBuf,
+    /// The curl config that holds the token, beside the settings file.
+    curl: PathBuf,
     /// The body of the session's newest record. Held across each write of the record, so one
     /// session's writes never cross.
     body: tokio::sync::Mutex<Session>,
@@ -141,6 +147,7 @@ impl Sessions {
                 terminals,
                 dir: data_dir.join("sessions"),
                 config,
+                trust: Mutex::new(()),
                 live: Mutex::default(),
             }),
         }
@@ -198,17 +205,30 @@ impl Inner {
             uuid::Uuid::new_v4().simple()
         );
         let settings = self.dir.join(format!("{id}.json"));
+        let curl = self.dir.join(format!("{id}.curl"));
         let url = format!("http://127.0.0.1:{}/hooks/{id}", self.config.hook_port);
-        {
-            let (settings, value) = (settings.clone(), claude::settings_json(&url, &token));
-            blocking(move || claude::write_settings(&settings, &value)).await??;
+        let written = {
+            let (settings, curl, token) = (settings.clone(), curl.clone(), token.clone());
+            blocking(move || {
+                claude::write_curl_config(&curl, &url, &token)?;
+                claude::write_settings(&settings, &claude::settings_json(&curl))
+            })
+            .await
+        };
+        if let Err(error) = written.and_then(|r| r) {
+            self.remove_files(&settings, &curl).await;
+            return Err(error);
         }
         let trusted = {
-            let (json, worktree) = (self.config.claude_json.clone(), worktree.to_path_buf());
-            blocking(move || claude::mark_trusted(&json, &worktree)).await
+            let (me, json, worktree) = (
+                self.clone(),
+                self.config.claude_json.clone(),
+                worktree.to_path_buf(),
+            );
+            blocking(move || claude::mark_trusted_locked(&me.trust, &json, &worktree)).await
         };
         if let Err(error) = trusted.and_then(|r| r) {
-            self.remove_settings(&settings).await;
+            self.remove_files(&settings, &curl).await;
             return Err(error);
         }
 
@@ -217,6 +237,7 @@ impl Inner {
             id,
             token,
             settings: settings.clone(),
+            curl: curl.clone(),
             body: tokio::sync::Mutex::new(Session {
                 id,
                 workspace,
@@ -239,7 +260,7 @@ impl Inner {
             Err(error) => {
                 lock(&self.live).remove(&id);
                 drop(body);
-                self.remove_settings(&settings).await;
+                self.remove_files(&settings, &curl).await;
                 return Err(error);
             }
         };
@@ -248,7 +269,7 @@ impl Inner {
             lock(&self.live).remove(&id);
             drop(body);
             let _ = self.terminals.close(terminal).await;
-            self.remove_settings(&settings).await;
+            self.remove_files(&settings, &curl).await;
             return Err(error);
         }
         drop(body);
@@ -326,12 +347,14 @@ impl Inner {
             self.write(changed.clone()).await?;
             *body = changed;
         }
-        let ended = matches!(next, SessionState::Finished | SessionState::Failed);
-        if ended {
+        if is_final(next) {
             // Wakes the stuck timer, which ends.
             live.activity.send_replace(Instant::now());
             if matches!(event, Event::Exited(_)) {
-                self.remove_settings(&live.settings).await;
+                // The child is gone: nothing more can come from it, so a late hook is refused
+                // like one for an unknown session.
+                lock(&self.live).remove(&live.id);
+                self.remove_files(&live.settings, &live.curl).await;
             }
         }
         Ok(next)
@@ -362,10 +385,16 @@ impl Inner {
         Ok(blocking(move || work(&mut lock(&store))).await??)
     }
 
-    /// Removes a settings file. Missing is fine, and nothing else can be done about a failure.
-    async fn remove_settings(&self, path: &Path) {
-        let path = path.to_path_buf();
-        let _ = blocking(move || std::fs::remove_file(path)).await;
+    /// Removes a session's settings file and curl config. Missing is fine, and nothing else can
+    /// be done about a failure.
+    async fn remove_files(&self, settings: &Path, curl: &Path) {
+        let paths = [settings.to_path_buf(), curl.to_path_buf()];
+        let _ = blocking(move || {
+            for path in paths {
+                let _ = std::fs::remove_file(path);
+            }
+        })
+        .await;
     }
 
     /// The exit of `terminal`, once its record says it exited or was deleted: the code, when
@@ -415,32 +444,30 @@ async fn follow(inner: Arc<Inner>, live: Arc<Live>, terminal: TerminalId, mut cu
                         }
                         // The child exited.
                         None => return exited(&inner, &live, terminal, &mut cursor).await,
+                        // The terminal was closed: its record is deleted, which is its end.
+                        Some(Err(TerminalError::Unknown(_))) => {
+                            return exited(&inner, &live, terminal, &mut cursor).await;
+                        }
                         Some(Err(error)) => {
-                            if !retry(&mut backoff, terminal, error).await {
-                                return;
-                            }
+                            retry(&mut backoff, terminal, error).await;
                             break;
                         }
                     }
                 }
             }
             Err(error) => {
-                if matches!(error, TerminalError::Gone(_)) {
+                if matches!(error, TerminalError::Gone(_) | TerminalError::Unknown(_)) {
                     return exited(&inner, &live, terminal, &mut cursor).await;
                 }
-                if !retry(&mut backoff, terminal, error).await {
-                    return;
-                }
+                retry(&mut backoff, terminal, error).await;
             }
         }
     }
 }
 
-/// Waits `backoff` before attaching again and says whether to. A terminal that was closed, or
-/// whose end is known, is not attached again.
-async fn retry(backoff: &mut Duration, terminal: TerminalId, error: TerminalError) -> bool {
+/// Waits `backoff` before attaching again to a terminal that dropped the follower.
+async fn retry(backoff: &mut Duration, terminal: TerminalId, error: TerminalError) {
     match error {
-        TerminalError::Unknown(_) => return false,
         // The holder cut this client off. Attaching again is the answer.
         TerminalError::Detached(_) => *backoff = RETRY_AFTER,
         other => {
@@ -449,7 +476,6 @@ async fn retry(backoff: &mut Duration, terminal: TerminalId, error: TerminalErro
     }
     tokio::time::sleep(*backoff).await;
     *backoff = (*backoff * 2).min(RETRY_AT_MOST);
-    true
 }
 
 /// Waits for the terminal's exit to be recorded, then reports it.
@@ -464,7 +490,21 @@ async fn exited(inner: &Inner, live: &Arc<Live>, terminal: TerminalId, cursor: &
         }
         tokio::time::sleep(RETRY_AFTER).await;
     };
-    report(inner, live, Event::Exited(code)).await;
+    // The end is not given up on: a session left running after its child is gone is wrong for
+    // good. It stops once the session is no longer live.
+    let mut backoff = RETRY_AFTER;
+    let mut warned = false;
+    while let Err(error) = inner.event(live, Event::Exited(code)).await {
+        if !inner.is_live(live) {
+            return;
+        }
+        if !warned {
+            warned = true;
+            tracing::warn!(session = %live.id, %error, "session exit not recorded; trying again");
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(RETRY_AT_MOST);
+    }
 }
 
 /// Applies `event`, logging a store error: nothing else can be done with it here.
@@ -485,8 +525,25 @@ async fn watch_for_stuck(inner: Arc<Inner>, live: Arc<Live>) {
         let last = *activity.borrow_and_update();
         tokio::select! {
             () = tokio::time::sleep_until(last + STUCK_AFTER) => {
-                // Does nothing unless the session is working.
-                report(&inner, &live, Event::Stalled).await;
+                // Does nothing unless the session is working. A write that fails is tried
+                // again until it holds or something arrives, which moves the count on.
+                let (mut warned, mut moved) = (false, false);
+                while let Err(error) = inner.event(&live, Event::Stalled).await {
+                    if !warned {
+                        warned = true;
+                        tracing::warn!(session = %live.id, %error, "session stall not recorded; trying again");
+                    }
+                    tokio::select! {
+                        () = tokio::time::sleep(RETRY_AFTER) => {}
+                        _ = activity.changed() => {
+                            moved = true;
+                            break;
+                        }
+                    }
+                }
+                if moved {
+                    continue;
+                }
                 if activity.changed().await.is_err() {
                     return;
                 }
