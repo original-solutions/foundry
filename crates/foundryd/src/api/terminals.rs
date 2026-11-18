@@ -8,7 +8,9 @@
 //!
 //! The socket closes with code 1000 once the child has exited and its last byte is sent, 1013
 //! when the holder cut this client off for falling behind (attach again), and 1011 with the
-//! reason for any other end. A terminal that is not live here is `404` before the upgrade.
+//! reason for any other end. A client that attaches again after a 1013 gets the whole kept
+//! screen again as its first frame, so it must reset its screen before writing that frame. A
+//! terminal that is not live here is `404` before the upgrade.
 
 use axum::extract::ws::rejection::WebSocketUpgradeRejection;
 use axum::extract::ws::{self, CloseFrame, WebSocket, WebSocketUpgrade};
