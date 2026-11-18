@@ -24,9 +24,10 @@ use clap::Parser;
 use foundry_holder::pty::{self, Pty};
 use nix::errno::Errno;
 use nix::fcntl::{Flock, FlockArg};
+use nix::sys::signal::{Signal, killpg};
 use nix::sys::stat::{Mode, umask};
 use nix::sys::wait::waitpid;
-use nix::unistd::{ForkResult, dup2_stderr, dup2_stdin, dup2_stdout, fork, setsid};
+use nix::unistd::{ForkResult, Pid, dup2_stderr, dup2_stdin, dup2_stdout, fork, setsid};
 
 /// What the holder writes to its starter once the socket is served.
 const READY: &str = "ready";
@@ -154,8 +155,9 @@ fn hold(args: Args, env: Vec<(String, String)>, mut ready: PipeWriter) -> i32 {
     drop(env);
     match started {
         Ok((_lock, pty, listener, child)) => {
-            let _ = ready.write_all(READY.as_bytes());
-            drop(ready);
+            if !tell_ready(ready, &args.socket, &lock_path, &child) {
+                return 1;
+            }
             match server::run(listener, &args.socket, &lock_path, pty, child) {
                 Ok(()) => 0,
                 Err(_) => 1,
@@ -166,6 +168,22 @@ fn hold(args: Args, env: Vec<(String, String)>, mut ready: PipeWriter) -> i32 {
             1
         }
     }
+}
+
+/// Tells the starter the socket is served, and says whether to serve it. A starter that cannot
+/// hear it is gone, and whoever started it has stopped waiting, so nothing may run on: the child's
+/// process group is hung up, as `Close` does, and the socket goes, then the lock file the caller
+/// still holds.
+fn tell_ready(mut ready: PipeWriter, socket: &Path, lock: &Path, child: &Child) -> bool {
+    if ready.write_all(READY.as_bytes()).is_ok() {
+        return true;
+    }
+    if let Ok(group) = i32::try_from(child.id()) {
+        let _ = killpg(Pid::from_raw(group), Signal::SIGHUP);
+    }
+    let _ = std::fs::remove_file(socket);
+    let _ = std::fs::remove_file(lock);
+    false
 }
 
 /// Opens the PTY, binds the socket and starts the child on the PTY.
@@ -266,7 +284,10 @@ mod tests {
             let _ = child.kill();
             let _ = child.wait();
         }
-        assert!(!serve, "the holder serves though its starter never heard it");
+        assert!(
+            !serve,
+            "the holder serves though its starter never heard it"
+        );
         assert_eq!(
             status.and_then(|s| s.signal()),
             Some(Signal::SIGHUP as i32),
@@ -292,8 +313,14 @@ mod tests {
         let running = child.try_wait().expect("try_wait").is_none();
         let _ = child.kill();
         let _ = child.wait();
-        assert!(serve, "the holder does not serve though its starter heard it");
-        assert!(read.is_ok(), "the ready pipe is not closed after the message");
+        assert!(
+            serve,
+            "the holder does not serve though its starter heard it"
+        );
+        assert!(
+            read.is_ok(),
+            "the ready pipe is not closed after the message"
+        );
         assert_eq!(said, READY);
         assert!(running, "the child is ended though the starter heard it");
         assert!(args.socket.exists(), "the socket is removed");
