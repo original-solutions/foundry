@@ -1376,6 +1376,25 @@ async fn events_send_a_change_once() {
     }
 }
 
+#[tokio::test]
+async fn events_send_a_settings_change_once() {
+    let daemon = Daemon::new(TURN).await;
+    let (mut socket, _) = daemon.events().await;
+    let project = daemon.project();
+    loop {
+        if let UiMessage::Settings { settings, .. } = next_message(&mut socket).await {
+            assert!(settings.projects.iter().any(|p| p.id == project));
+            break;
+        }
+    }
+    for frame in frames_within(&mut socket, 3 * EVENTS_EVERY).await {
+        assert!(
+            !matches!(frame, UiMessage::Settings { .. } | UiMessage::State { .. }),
+            "the settings were sent again: {frame:?}"
+        );
+    }
+}
+
 // --- terminals, more ---
 
 /// The next text frame of a terminal socket, past the binary output.
