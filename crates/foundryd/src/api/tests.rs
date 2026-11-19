@@ -1058,6 +1058,69 @@ async fn work_on_one_workspace_does_not_wait_for_another() {
 }
 
 #[tokio::test]
+async fn work_queued_behind_finished_work_still_holds_the_workspace() {
+    let daemon = Daemon::new(TURN).await;
+    let workspace = WorkspaceId::random();
+    let release_first = hung_up_holding(&daemon.api, workspace).await;
+    let (release_second, second_released) = tokio::sync::oneshot::channel::<()>();
+    let (second_holding, second_held) = tokio::sync::oneshot::channel::<()>();
+    let second = tokio::spawn({
+        let api = daemon.api.clone();
+        async move {
+            let work = async move {
+                let _ = second_holding.send(());
+                let _ = second_released.await;
+                Ok(())
+            };
+            locked(&api, workspace, work).await.is_ok()
+        }
+    });
+    // The second is queued; the first ends and hands it the lock.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    release_first.send(()).unwrap();
+    tokio::time::timeout(WAIT, second_held)
+        .await
+        .expect("the second piece of work takes the lock in time")
+        .unwrap();
+    let third = locked(&daemon.api, workspace, async { Ok(()) });
+    tokio::pin!(third);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), &mut third)
+            .await
+            .is_err(),
+        "a third piece of work ran while the second held the workspace"
+    );
+    release_second.send(()).unwrap();
+    assert!(second.await.unwrap());
+    let ran = tokio::time::timeout(WAIT, third)
+        .await
+        .expect("the third piece of work runs once the second ends");
+    assert!(ran.is_ok());
+}
+
+#[tokio::test]
+async fn work_that_panics_leaves_its_workspace_free_and_forgotten() {
+    let daemon = Daemon::new(TURN).await;
+    let workspace = WorkspaceId::random();
+    let api = daemon.api.clone();
+    let panicked = tokio::spawn(async move {
+        let work = async { panic!("the work fails") };
+        let _: Result<(), ApiError> = locked(&api, workspace, work).await;
+    })
+    .await
+    .unwrap_err();
+    assert!(panicked.is_panic());
+    assert!(
+        daemon.api.lifecycle.lock().unwrap().is_empty(),
+        "the lock of work that panicked is still in the map"
+    );
+    let ran = tokio::time::timeout(WAIT, locked(&daemon.api, workspace, async { Ok(()) }))
+        .await
+        .expect("the workspace is free after a panic");
+    assert!(ran.is_ok());
+}
+
+#[tokio::test]
 async fn an_action_on_what_is_not_here_is_not_found() {
     let daemon = Daemon::new(TURN).await;
     let workspace = WorkspaceId::random();
