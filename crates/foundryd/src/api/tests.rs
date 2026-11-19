@@ -1075,8 +1075,23 @@ async fn work_queued_behind_finished_work_still_holds_the_workspace() {
             locked(&api, workspace, work).await.is_ok()
         }
     });
-    // The second is queued; the first ends and hands it the lock.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // The second is queued (the map's clone, then two for each of the first and the second)
+    // before the first ends and hands it the lock.
+    tokio::time::timeout(WAIT, async {
+        while daemon
+            .api
+            .lifecycle
+            .lock()
+            .unwrap()
+            .get(&workspace)
+            .map(Arc::strong_count)
+            != Some(5)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the second piece of work queues in time");
     release_first.send(()).unwrap();
     tokio::time::timeout(WAIT, second_held)
         .await
