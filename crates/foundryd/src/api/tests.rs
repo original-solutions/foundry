@@ -87,6 +87,7 @@ struct Daemon {
     terminals: Arc<Terminals>,
     workspaces: Arc<Workspaces>,
     peers: Peers,
+    api: Api,
     addr: SocketAddr,
     servers: Vec<tokio::task::JoinHandle<()>>,
 }
@@ -158,6 +159,7 @@ impl Daemon {
         );
         let listener = bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let served = api.clone();
         let servers = vec![
             tokio::spawn(async move {
                 axum::serve(
@@ -168,7 +170,7 @@ impl Daemon {
                 .unwrap();
             }),
             tokio::spawn(async move {
-                axum::serve(listener, router(api)).await.unwrap();
+                axum::serve(listener, router(served)).await.unwrap();
             }),
         ];
         Daemon {
@@ -181,6 +183,7 @@ impl Daemon {
             terminals,
             workspaces,
             peers,
+            api,
             addr,
             servers,
         }
@@ -985,6 +988,73 @@ async fn a_start_racing_an_archive_leaves_no_live_terminal_in_the_archived_works
             "round {round}: terminals {live:?} are live in an archived workspace"
         );
     }
+}
+
+/// Starts `work` on `workspace` under its lifecycle lock, from a caller that hangs up (is
+/// aborted) once the work has the lock. The work runs until `release` is sent.
+async fn hung_up_holding(api: &Api, workspace: WorkspaceId) -> tokio::sync::oneshot::Sender<()> {
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    let (holding, held) = tokio::sync::oneshot::channel::<()>();
+    let caller = tokio::spawn({
+        let api = api.clone();
+        async move {
+            let work = async move {
+                let _ = holding.send(());
+                let _ = released.await;
+                Ok(())
+            };
+            let _ = locked(&api, workspace, work).await;
+        }
+    });
+    tokio::time::timeout(WAIT, held)
+        .await
+        .expect("the work takes the lock in time")
+        .expect("the work runs");
+    caller.abort();
+    let _ = caller.await;
+    release
+}
+
+#[tokio::test]
+async fn a_caller_hanging_up_leaves_its_workspace_held_until_the_work_ends() {
+    let daemon = Daemon::new(TURN).await;
+    let workspace = WorkspaceId::random();
+    let release = hung_up_holding(&daemon.api, workspace).await;
+    let next = locked(&daemon.api, workspace, async { Ok(()) });
+    tokio::pin!(next);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), &mut next)
+            .await
+            .is_err(),
+        "a second piece of work on the workspace ran while the first still held it"
+    );
+    release.send(()).unwrap();
+    let ran = tokio::time::timeout(WAIT, next)
+        .await
+        .expect("the second piece of work runs once the first ends");
+    assert!(ran.is_ok());
+}
+
+#[tokio::test]
+async fn work_on_one_workspace_does_not_wait_for_another() {
+    let daemon = Daemon::new(TURN).await;
+    let release = hung_up_holding(&daemon.api, WorkspaceId::random()).await;
+    let ran = tokio::time::timeout(
+        WAIT,
+        locked(&daemon.api, WorkspaceId::random(), async { Ok(()) }),
+    )
+    .await
+    .expect("work on another workspace does not wait");
+    assert!(ran.is_ok());
+    release.send(()).unwrap();
+    // Once nothing holds or waits for a workspace, its lock is forgotten.
+    tokio::time::timeout(WAIT, async {
+        while !daemon.api.lifecycle.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("every lock no one holds is forgotten");
 }
 
 #[tokio::test]
