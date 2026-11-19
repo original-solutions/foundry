@@ -1608,6 +1608,7 @@ async fn input_the_terminal_refuses_is_an_error_frame_and_the_socket_stays_open(
 async fn a_client_cut_off_for_falling_behind_is_closed_with_1013() {
     let daemon = Daemon::new(TURN).await;
     let cwd = daemon.data.path().to_path_buf();
+    let written = cwd.join("written");
     let id = daemon
         .terminals
         .start(
@@ -1616,7 +1617,7 @@ async fn a_client_cut_off_for_falling_behind_is_closed_with_1013() {
             &[
                 "/bin/sh".to_owned(),
                 "-c".to_owned(),
-                "head -c 30000000 /dev/zero | tr '\\0' x; sleep 60".to_owned(),
+                "head -c 30000000 /dev/zero | tr '\\0' x; touch written; sleep 60".to_owned(),
             ],
             &[],
         )
@@ -1626,8 +1627,16 @@ async fn a_client_cut_off_for_falling_behind_is_closed_with_1013() {
         tokio_tungstenite::connect_async(daemon.ws_url(&format!("/api/terminals/{id}")))
             .await
             .unwrap();
-    // Not reading lets this client's backlog in the holder pass its limit.
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Not reading until the child has written all of it lets this client's backlog in the
+    // holder pass its limit, however slowly the child writes: what lies between the holder and
+    // this client holds far less than the 30 MB.
+    tokio::time::timeout(WAIT, async {
+        while !written.exists() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the child writes all its output in time");
     loop {
         let frame = tokio::time::timeout(WAIT, socket.next())
             .await
