@@ -88,7 +88,7 @@ pub struct Api {
     /// A lock per workspace, held by an archive and by a shell or session start for their
     /// whole work ([`locked`]), so a start cannot land between an archive's listing of the
     /// workspace's terminals and its delete. A workspace no one holds or waits for has none.
-    lifecycle: Arc<Mutex<BTreeMap<WorkspaceId, Arc<tokio::sync::Mutex<()>>>>>,
+    lifecycle: Locks,
 }
 
 impl Api {
@@ -442,6 +442,9 @@ async fn on_store<T: Send + 'static>(
     }
 }
 
+/// The lifecycle locks, one per workspace someone holds or waits for.
+type Locks = Arc<Mutex<BTreeMap<WorkspaceId, Arc<tokio::sync::Mutex<()>>>>>;
+
 /// Runs `work` holding `workspace`'s lifecycle lock, on a task of its own, so the lock is held
 /// until the work ends even when the caller hangs up and its request is dropped.
 async fn locked<T: Send + 'static>(
@@ -449,30 +452,50 @@ async fn locked<T: Send + 'static>(
     workspace: WorkspaceId,
     work: impl Future<Output = Result<T, ApiError>> + Send + 'static,
 ) -> Result<T, ApiError> {
-    let locks = Arc::clone(&api.lifecycle);
-    let lock = Arc::clone(
-        locks
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .entry(workspace)
-            .or_default(),
-    );
+    let (lock, user) = {
+        let mut locks = api.lifecycle.lock().unwrap_or_else(PoisonError::into_inner);
+        let lock = Arc::clone(locks.entry(workspace).or_default());
+        let user = User {
+            locks: Arc::clone(&api.lifecycle),
+            workspace,
+            lock: Some(Arc::clone(&lock)),
+        };
+        (lock, user)
+    };
     let task = tokio::spawn(async move {
-        let held = lock.lock().await;
-        let result = work.await;
-        drop(held);
-        let mut locks = locks.lock().unwrap_or_else(PoisonError::into_inner);
-        // A count of two is the map and this task: no one else holds or waits for it.
-        if Arc::strong_count(&lock) == 2 {
-            locks.remove(&workspace);
-        }
-        result
+        // Dropped in the reverse order: the guard first, then the user.
+        let _user = user;
+        let _held = lock.lock_owned().await;
+        work.await
     });
     match task.await {
         Ok(result) => result,
         Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
         // The runtime is shutting down, and drops the task that waits here with it.
         Err(_) => std::future::pending().await,
+    }
+}
+
+/// One holder or waiter of a workspace's lock. When the last one goes, its work panicking
+/// included, the lock is dropped from the map.
+struct User {
+    locks: Locks,
+    workspace: WorkspaceId,
+    lock: Option<Arc<tokio::sync::Mutex<()>>>,
+}
+
+impl Drop for User {
+    fn drop(&mut self) {
+        let mut locks = self.locks.lock().unwrap_or_else(PoisonError::into_inner);
+        // Users are made under the map's lock, and a user's guard is dropped before the user,
+        // so the last user out sees the map's own clone as the only one left.
+        self.lock = None;
+        if locks
+            .get(&self.workspace)
+            .is_some_and(|lock| Arc::strong_count(lock) == 1)
+        {
+            locks.remove(&self.workspace);
+        }
     }
 }
 
