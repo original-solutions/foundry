@@ -85,9 +85,10 @@ pub struct Api {
     /// its MagicDNS short name and its `<name>.<tailnet>.ts.net` name. The daemon fills it;
     /// empty means only addresses and `localhost` are trusted in a `Host`.
     pub names: Vec<String>,
-    /// Held by an archive and by a shell or session start for their whole work, so a start
-    /// cannot land between an archive's listing of the workspace's terminals and its delete.
-    lifecycle: Arc<tokio::sync::Mutex<()>>,
+    /// A lock per workspace, held by an archive and by a shell or session start for their
+    /// whole work ([`locked`]), so a start cannot land between an archive's listing of the
+    /// workspace's terminals and its delete. A workspace no one holds or waits for has none.
+    lifecycle: Arc<Mutex<BTreeMap<WorkspaceId, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl Api {
@@ -441,6 +442,40 @@ async fn on_store<T: Send + 'static>(
     }
 }
 
+/// Runs `work` holding `workspace`'s lifecycle lock, on a task of its own, so the lock is held
+/// until the work ends even when the caller hangs up and its request is dropped.
+async fn locked<T: Send + 'static>(
+    api: &Api,
+    workspace: WorkspaceId,
+    work: impl Future<Output = Result<T, ApiError>> + Send + 'static,
+) -> Result<T, ApiError> {
+    let locks = Arc::clone(&api.lifecycle);
+    let lock = Arc::clone(
+        locks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(workspace)
+            .or_default(),
+    );
+    let task = tokio::spawn(async move {
+        let held = lock.lock().await;
+        let result = work.await;
+        drop(held);
+        let mut locks = locks.lock().unwrap_or_else(PoisonError::into_inner);
+        // A count of two is the map and this task: no one else holds or waits for it.
+        if Arc::strong_count(&lock) == 2 {
+            locks.remove(&workspace);
+        }
+        result
+    });
+    match task.await {
+        Ok(result) => result,
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        // The runtime is shutting down, and drops the task that waits here with it.
+        Err(_) => std::future::pending().await,
+    }
+}
+
 // --- state and events ---
 
 /// The full state as [`UiMessage::State`], and the highest version it holds per owner. The
@@ -611,8 +646,7 @@ async fn archive_workspace(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let id = parse_id(&id, "workspace", WorkspaceId)?;
-    let _held = api.lifecycle.lock().await;
-    let archive = if body.is_empty() {
+    let archive: Archive = if body.is_empty() {
         Archive::default()
     } else {
         serde_json::from_slice(&body).map_err(|e| {
@@ -627,7 +661,9 @@ async fn archive_workspace(
             )
         })?
     };
-    api.workspaces.archive(id, archive.force).await?;
+    let workspaces = Arc::clone(&api.workspaces);
+    let work = async move { Ok(workspaces.archive(id, archive.force).await?) };
+    locked(&api, id, work).await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
@@ -643,10 +679,14 @@ async fn start_session(
     Body(start): Body<Start>,
 ) -> Result<Response, ApiError> {
     let id = parse_id(&id, "workspace", WorkspaceId)?;
-    let _held = api.lifecycle.lock().await;
-    let worktree = api.workspaces.worktree(id).await?;
-    let session = api.sessions.start(id, &worktree, &start.model).await?;
-    Ok(created(session))
+    let work = {
+        let api = api.clone();
+        async move {
+            let worktree = api.workspaces.worktree(id).await?;
+            Ok(api.sessions.start(id, &worktree, &start.model).await?)
+        }
+    };
+    Ok(created(locked(&api, id, work).await?))
 }
 
 /// The shell a new terminal runs: the daemon's `$SHELL`, else `/bin/sh`, as a login shell.
@@ -660,10 +700,14 @@ fn shell() -> Vec<String> {
 
 async fn start_shell(State(api): State<Api>, Path(id): Path<String>) -> Result<Response, ApiError> {
     let id = parse_id(&id, "workspace", WorkspaceId)?;
-    let _held = api.lifecycle.lock().await;
-    let worktree = api.workspaces.worktree(id).await?;
-    let terminal = api.terminals.start(id, &worktree, &shell(), &[]).await?;
-    Ok(created(terminal))
+    let work = {
+        let api = api.clone();
+        async move {
+            let worktree = api.workspaces.worktree(id).await?;
+            Ok(api.terminals.start(id, &worktree, &shell(), &[]).await?)
+        }
+    };
+    Ok(created(locked(&api, id, work).await?))
 }
 
 async fn close_terminal(
