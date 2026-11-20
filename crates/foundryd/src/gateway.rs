@@ -423,11 +423,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_gateway_that_answers_with_an_account_free_clears_gateway_unhealthy() {
-        let machine = Machine::new(Some(KEY));
-        let reader = Arc::new(Reader::new(Some(refusing()), machine.secrets.clone()));
-        reader.read_once().await;
-        assert_eq!(reader.items(&machine.fleet()).len(), 1);
-
+        let machine = Machine::new(None);
         let url = gateway(serde_json::json!([
             cooling(600),
             account(serde_json::json!([])),
@@ -436,8 +432,119 @@ mod tests {
         .await;
         let reader = Arc::new(Reader::new(Some(url), machine.secrets.clone()));
         reader.read_once().await;
+        assert_eq!(reader.items(&machine.fleet()).len(), 1);
+
+        // The same reader, once the key is set: the gateway answers with accounts free.
+        machine.secrets.set(GATEWAY_MANAGEMENT, KEY).unwrap();
+        reader.read_once().await;
         assert_eq!(reader.health(), Some(Health::Healthy));
         assert!(reader.items(&machine.fleet()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_gateway_that_takes_the_connection_and_never_answers_is_unhealthy() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let held = tokio::spawn(async move {
+            let mut open = Vec::new();
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                open.push(socket);
+            }
+        });
+        let read = tokio::task::spawn_blocking(move || read(&url, KEY));
+        let health = tokio::time::timeout(ANSWER_WITHIN + Duration::from_secs(3), read)
+            .await
+            .expect("the read gave up in time")
+            .unwrap();
+        held.abort();
+        assert!(matches!(health, Health::Unanswered(_)), "{health:?}");
+    }
+
+    /// A secret store that counts its reads, and fails them while `fail` is set.
+    struct Counting {
+        inner: FileSecrets,
+        reads: std::sync::atomic::AtomicUsize,
+        fail: std::sync::atomic::AtomicBool,
+    }
+
+    impl Secrets for Counting {
+        fn get(&self, name: &str) -> Result<Option<String>, SecretsError> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(SecretsError::Keychain {
+                    action: "read",
+                    name: name.to_owned(),
+                    reason: "denied".into(),
+                });
+            }
+            self.inner.get(name)
+        }
+        fn set(&self, name: &str, value: &str) -> Result<(), SecretsError> {
+            self.inner.set(name, value)
+        }
+        fn update(&self, name: &str, edit: crate::secrets::Edit<'_>) -> Result<(), SecretsError> {
+            self.inner.update(name, edit)
+        }
+    }
+
+    fn counting(home: &tempfile::TempDir) -> Arc<Counting> {
+        Arc::new(Counting {
+            inner: FileSecrets::new(home.path().join("secrets.json")),
+            reads: Default::default(),
+            fail: Default::default(),
+        })
+    }
+
+    fn reads(secrets: &Counting) -> usize {
+        secrets.reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn the_key_is_read_once_and_again_only_after_the_gateway_refuses_it() {
+        let home = tempfile::tempdir().unwrap();
+        let secrets = counting(&home);
+        secrets.set(GATEWAY_MANAGEMENT, KEY).unwrap();
+        let url = gateway(serde_json::json!([account(serde_json::json!([]))])).await;
+        let reader = Arc::new(Reader::new(Some(url.clone()), secrets.clone()));
+        for _ in 0..3 {
+            reader.read_once().await;
+        }
+        assert_eq!(reader.health(), Some(Health::Healthy));
+        assert_eq!(reads(&secrets), 1);
+
+        secrets
+            .set(GATEWAY_MANAGEMENT, "a-wrong-key-0123456789")
+            .unwrap();
+        let reader = Arc::new(Reader::new(Some(url), secrets.clone()));
+        reader.read_once().await;
+        assert!(
+            matches!(reader.health(), Some(Health::KeyRefused(401))),
+            "{:?}",
+            reader.health()
+        );
+        secrets.set(GATEWAY_MANAGEMENT, KEY).unwrap();
+        reader.read_once().await;
+        assert_eq!(reader.health(), Some(Health::Healthy));
+        assert_eq!(reads(&secrets), 3);
+    }
+
+    #[tokio::test]
+    async fn a_key_the_store_cannot_read_is_not_asked_for_again() {
+        let home = tempfile::tempdir().unwrap();
+        let secrets = counting(&home);
+        secrets
+            .fail
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let reader = Arc::new(Reader::new(Some(refusing()), secrets.clone()));
+        for _ in 0..3 {
+            reader.read_once().await;
+        }
+        assert_eq!(reader.health(), Some(Health::KeyUnreadable));
+        assert_eq!(reads(&secrets), 1);
+        let machine = Machine::new(None);
+        let items = reader.items(&machine.fleet());
+        assert!(one(&items).todo.contains("restart"), "{}", items[0].todo);
     }
 
     #[tokio::test]

@@ -825,6 +825,23 @@ mod tests {
     }
 
     #[test]
+    fn a_machine_over_its_session_or_load_limit_is_not_low_on_disk() {
+        let mut world = World::new();
+        let peer = world.peer;
+        limit_disk(&mut world, peer, 10 * GB);
+        let body = MachineSample {
+            load_per_core: 3.0,
+            free_memory: 8 * GB,
+            free_disk: 100 * GB,
+            sessions: 9,
+            update_refused: None,
+        };
+        let record = world.record(peer, false, body);
+        world.put(AnyRecord::MachineSample(record));
+        assert!(world.of(Kind::DiskLow).is_empty(), "{:?}", world.items());
+    }
+
+    #[test]
     fn a_machine_with_no_limits_is_never_low_on_disk() {
         let mut world = World::new();
         world.sample(world.peer, 1, None);
@@ -855,19 +872,79 @@ mod tests {
     }
 
     #[test]
-    fn an_overwritten_setting_raises_setting_overwritten_without_its_value() {
+    fn an_overwritten_setting_raises_setting_overwritten_with_both_values_and_no_password() {
         let mut world = World::new();
-        let (key, _) = overwrite_project(&mut world);
+        let (key, project) = overwrite_project(&mut world);
+        let lost = Project {
+            name: "foundry-old".into(),
+            repo: "https://github.com/o/old.git".into(),
+            ..project
+        };
+        world.settings.overwritten.get_mut(&key).unwrap().lost = Some(SettingValue::Project(lost));
         let items = world.of(Kind::SettingOverwritten);
         assert_eq!(items.len(), 1, "{items:?}");
         let item = &items[0];
         assert_eq!(item.id, format!("setting_overwritten:{key}"));
         assert_eq!(item.machine, world.peer);
         assert!(item.what.contains("the project foundry"), "{}", item.what);
-        let text = serde_json::to_string(item).unwrap();
         assert!(
-            !text.contains("hunter2") && !text.contains("github.com"),
-            "{text}"
+            item.what
+                .contains("kept foundry (https://***@github.com/o/foundry.git)"),
+            "{}",
+            item.what
+        );
+        assert!(
+            item.what
+                .contains("replaced foundry-old (https://github.com/o/old.git)"),
+            "{}",
+            item.what
+        );
+        let text = serde_json::to_string(item).unwrap();
+        assert!(!text.contains("hunter2"), "{text}");
+    }
+
+    #[test]
+    fn an_overwritten_value_that_was_removed_or_is_limits_or_an_order_reads_plainly() {
+        let mut world = World::new();
+        let (me, peer) = (world.me, world.peer);
+        let limits = Limits {
+            max_sessions: 4,
+            max_load_per_core: 1.5,
+            min_free_disk: 10 * GB,
+        };
+        world.settings.overwritten.insert(
+            SettingKey::Limits(peer),
+            Overwritten {
+                kept: Some(SettingValue::Limits(limits)),
+                lost: None,
+                lost_stamp: Stamp { seq: 2, by: me },
+            },
+        );
+        world.settings.overwritten.insert(
+            SettingKey::Priority,
+            Overwritten {
+                kept: Some(SettingValue::Priority(vec![me, peer])),
+                lost: Some(SettingValue::Priority(vec![peer, me])),
+                lost_stamp: Stamp { seq: 2, by: peer },
+            },
+        );
+        let items = world.of(Kind::SettingOverwritten);
+        let limits = items.iter().find(|i| i.id.contains("limits")).unwrap();
+        assert!(
+            limits.what.contains(
+                "kept at most 4 sessions, load per core under 1.5, 10.0 GB free disk; \
+                 replaced removed"
+            ),
+            "{}",
+            limits.what
+        );
+        let order = items.iter().find(|i| i.id.ends_with("priority")).unwrap();
+        assert!(
+            order
+                .what
+                .contains("kept this-mac, trilogy-mac; replaced trilogy-mac, this-mac"),
+            "{}",
+            order.what
         );
     }
 
@@ -993,6 +1070,67 @@ mod tests {
             )
         }
 
+        /// `peer` says hello and sends nothing, so it is heard from for [`OFFLINE_AFTER`], then
+        /// its link drops.
+        async fn hear(&self, peer: MachineId) {
+            let (ours, theirs) = Conn::pair();
+            let accepting = tokio::spawn({
+                let peers = self.peers.clone();
+                async move { peers.accept(ours).await }
+            });
+            let hello = PeerMessage::Hello {
+                protocol: PROTOCOL,
+                machine: peer,
+                versions: BTreeMap::new(),
+            };
+            let nothing = PeerMessage::Records {
+                protocol: PROTOCOL,
+                records: Vec::new(),
+            };
+            for message in [hello, nothing] {
+                theirs
+                    .send
+                    .send(serde_json::to_string(&message).unwrap())
+                    .await
+                    .unwrap();
+            }
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while !self.peers.online().contains(&peer) {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the peer was not heard"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            drop(theirs);
+            accepting.await.unwrap();
+        }
+
+        /// Stores every record `world` holds, as their owners sent them.
+        fn hold(&self, world: &World) {
+            let mut store = self.store.lock().unwrap();
+            for record in &world.records {
+                store.apply(record, record.owner()).unwrap();
+            }
+        }
+
+        async fn kinds(&self) -> Vec<(String, String)> {
+            let (status, body) = self.call("GET", "/api/attention").await;
+            assert_eq!(status, 200, "{body}");
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            json["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|i| {
+                    (
+                        i["kind"].as_str().unwrap().to_owned(),
+                        i["machine"].as_str().unwrap().to_owned(),
+                    )
+                })
+                .collect()
+        }
+
         fn overwritten(&self) -> BTreeMap<SettingKey, Overwritten> {
             self.store.lock().unwrap().settings().unwrap().overwritten
         }
@@ -1034,6 +1172,60 @@ mod tests {
             assert_eq!(item["machine"], served.me.to_string());
         }
         assert!(!body.contains("hunter2"), "{body}");
+    }
+
+    /// A world whose peer has a session waiting for you, a failed setup and a refused tag.
+    fn busy_peer(world: &mut World) {
+        let peer = world.peer;
+        world.session(peer, SessionState::WaitingForYou);
+        let setup = TerminalId::random();
+        let workspace = world.workspace(peer, Some(setup));
+        world.terminal(peer, setup, workspace, Some(Some(1)), false);
+        world.sample(peer, 100 * GB, Some("v0.2.0"));
+    }
+
+    #[tokio::test]
+    async fn a_peers_records_raise_its_items_on_this_machine() {
+        let mut world = World::new();
+        busy_peer(&mut world);
+        let (peer, machines) = (world.peer, world.settings.machines.clone());
+        let served = Served::new(|_, settings| settings.machines = machines).await;
+        served.hold(&world);
+        served.hear(peer).await;
+
+        let peer = peer.to_string();
+        let kinds = served.kinds().await;
+        for kind in ["session_waiting", "setup_failed", "update_refused"] {
+            assert!(
+                kinds.contains(&(kind.to_owned(), peer.clone())),
+                "{kind}: {kinds:?}"
+            );
+        }
+        assert!(
+            kinds.iter().all(|(kind, _)| kind != "machine_offline"),
+            "{kinds:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_offline_machines_sessions_and_setup_raise_nothing_but_machine_offline() {
+        let mut world = World::new();
+        busy_peer(&mut world);
+        let (peer, machines) = (world.peer, world.settings.machines.clone());
+        let served = Served::new(|_, settings| settings.machines = machines).await;
+        served.hold(&world);
+
+        let peer = peer.to_string();
+        let mut kinds: Vec<&str> = Vec::new();
+        let held = served.kinds().await;
+        for (kind, machine) in &held {
+            if *machine == peer {
+                kinds.push(kind);
+            }
+        }
+        kinds.sort_unstable();
+        // The refused tag is the sample's, which an offline machine keeps.
+        assert_eq!(kinds, ["machine_offline", "update_refused"], "{held:?}");
     }
 
     #[tokio::test]
@@ -1091,39 +1283,9 @@ mod tests {
             settings.priority = vec![peer, me];
         })
         .await;
-        // The peer says hello and sends nothing, so it is heard from and acts, then its link
-        // drops: the dismissal has nowhere to go.
-        let (ours, theirs) = Conn::pair();
-        let accepting = tokio::spawn({
-            let peers = served.peers.clone();
-            async move { peers.accept(ours).await }
-        });
-        let hello = PeerMessage::Hello {
-            protocol: PROTOCOL,
-            machine: peer,
-            versions: BTreeMap::new(),
-        };
-        let nothing = PeerMessage::Records {
-            protocol: PROTOCOL,
-            records: Vec::new(),
-        };
-        for message in [hello, nothing] {
-            theirs
-                .send
-                .send(serde_json::to_string(&message).unwrap())
-                .await
-                .unwrap();
-        }
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while !served.peers.online().contains(&peer) {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the peer was not heard"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        drop(theirs);
-        accepting.await.unwrap();
+        // The peer is heard from, so it acts, then its link drops: the dismissal has nowhere
+        // to go.
+        served.hear(peer).await;
 
         let key = served.overwritten().into_keys().next().unwrap();
         let (status, body) = served
