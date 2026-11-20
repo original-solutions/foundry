@@ -323,8 +323,8 @@ pub fn numbered(held: &SharedSettings, edit: &Edit, me: MachineId) -> SharedSett
     next
 }
 
-/// One copy of the settings from two, setting by setting: the higher stamp's value holds. A
-/// setting both copies edited where neither had seen the other's edit also gets a "setting
+/// One copy of the settings from two, setting by setting: the higher stamp's value holds, and of
+/// a setting neither copy has stamped, the value of the copy with the higher `seq`. A setting both copies edited where neither had seen the other's edit also gets a "setting
 /// overwritten" item holding both values, stamped as the edit that held, or as the dismissal of
 /// an earlier item about that setting when that is later. `seen` is the higher of each.
 ///
@@ -342,8 +342,11 @@ pub fn merge(a: &SharedSettings, b: &SharedSettings) -> SharedSettings {
         let a_holds = match sa.cmp(&sb) {
             std::cmp::Ordering::Greater => true,
             std::cmp::Ordering::Less => false,
-            // One edit, or two copies no edit has stamped: pick by the value, the same way on
-            // every machine.
+            // A setting no edit has stamped on either side: the copy with the higher `seq`
+            // holds, as before stamps existed.
+            std::cmp::Ordering::Equal if sa == Stamp::NONE && a.seq != b.seq => a.seq > b.seq,
+            // One edit, or two unstamped copies at one `seq`: pick by the value, the same way
+            // on every machine.
             std::cmp::Ordering::Equal => rank(&va) >= rank(&vb),
         };
         let (held, lost, stamp, lost_stamp) = if a_holds {
