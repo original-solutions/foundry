@@ -831,10 +831,11 @@ async fn a_snapshot_in_pieces_slower_in_total_than_the_offline_limit_arrives_who
             format!(r#"{{"type":"snapshot","start":4,"bytes":"{hex}","last":{last}}}"#),
         )
     };
+    let (heard, mut sent) = mpsc::unbounded_channel();
     let (peers, owner, _dir) = opener(FakeOwner {
         answer: vec![piece("61", false), piece("62", false), piece("63", true)],
         hold: true,
-        heard: None,
+        heard: Some(heard),
     });
     let (snapshot, _remote) = peers
         .open_terminal(owner, TerminalId::random())
@@ -842,6 +843,18 @@ async fn a_snapshot_in_pieces_slower_in_total_than_the_offline_limit_arrives_who
         .unwrap();
     assert_eq!(snapshot.start, 4);
     assert_eq!(&snapshot.bytes[..], b"abc");
+    // The owner ends a relay it hears nothing on for the offline limit, so the opener beats
+    // while the snapshot arrives, not only after.
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    let mut beats = 0;
+    while let Ok(text) = sent.try_recv() {
+        beats += usize::from(text == r#"{"type":"beat"}"#);
+    }
+    assert!(
+        beats >= 10,
+        "{beats} beats while the snapshot took {:?}",
+        gap * 3
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -911,8 +924,10 @@ async fn input_b_refuses_is_reported_and_the_relay_stays_open() {
     let (a, b) = (&fleet.daemons[0], &fleet.daemons[1]);
     let on_b = Held::new(b.id, b.store.clone());
     b.peers.serve_terminals(on_b.terminals.clone());
-    let id = on_b.start(&["sh", "-c", "stty -echo; sleep 60"]).await;
+    let script = "stty -echo; echo ready; read l; echo got-$l; sleep 60";
+    let id = on_b.start(&["sh", "-c", script]).await;
     let (_snapshot, mut remote) = a.peers.open_terminal(b.id, id).await.unwrap();
+    remote_until(&mut remote, "ready", 1).await;
     let too_much = foundry_holder::protocol::MAX_PENDING_INPUT + 1;
     remote
         .input(Bytes::from(vec![b'x'; too_much]))
@@ -929,7 +944,9 @@ async fn input_b_refuses_is_reported_and_the_relay_stays_open() {
     .await
     .expect("an answer to the input");
     assert!(matches!(event, Event::Refused(_)), "{event:?}");
-    remote.input(Bytes::from_static(b"y")).await.unwrap();
+    // None of the refused input reached the child, and the relay still carries the next line.
+    remote.input(Bytes::from_static(b"y\n")).await.unwrap();
+    remote_until(&mut remote, "got-y", 1).await;
 }
 
 #[tokio::test]
