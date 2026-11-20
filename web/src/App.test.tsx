@@ -426,6 +426,8 @@ describe("App", () => {
       "Open",
       "Open beside",
       "Changes in fix login",
+      "New session in fix login",
+      "New shell in fix login",
       "Clear",
       "Clear 2 ended in fix login",
     ]);
@@ -526,6 +528,107 @@ describe("App", () => {
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(calls).toEqual([]);
     expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("acts on a pick from the palette: Tab lists what can be done with it, typing narrows the list and Enter does it", async () => {
+    mockActions();
+    await open("/terminals/t1", live);
+    fireEvent.keyDown(window, { key: "k", metaKey: true });
+    const dialog = await screen.findByRole("dialog", { name: "Jump to" });
+    const input = within(dialog).getByRole("combobox");
+    fireEvent.change(input, { target: { value: "login shell" } });
+    fireEvent.keyDown(input, { key: "Tab" });
+
+    expect(within(dialog).getByRole("listbox", { name: "Actions for fix login / shell" })).toBeDefined();
+    expect(input.getAttribute("aria-label")).toBe("Actions for fix login / shell");
+    expect((input as HTMLInputElement).value).toBe("");
+    expect(within(dialog).getAllByRole("option").map((o) => o.textContent)).toEqual([
+      "Open",
+      "Open beside",
+      "Changes in fix login",
+      "New session in fix login",
+      "New shell in fix login",
+      "End shell…",
+    ]);
+
+    fireEvent.change(input, { target: { value: "chan" } });
+    expect(within(dialog).getAllByRole("option").map((o) => o.textContent)).toEqual(["Changes in fix login"]);
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    expect(await screen.findByRole("dialog", { name: /changes in fix login/i })).toBeDefined();
+    expect(screen.queryByRole("dialog", { name: "Jump to" })).toBeNull();
+  });
+
+  it("goes back from a pick's actions to the list as it was on Escape or on Backspace in an empty box", async () => {
+    await open("/terminals/t1", live);
+    fireEvent.keyDown(window, { key: "k", metaKey: true });
+    const dialog = await screen.findByRole("dialog", { name: "Jump to" });
+    const input = within(dialog).getByRole("combobox");
+    fireEvent.change(input, { target: { value: "login" } });
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+    const picked = input.getAttribute("aria-activedescendant");
+
+    fireEvent.keyDown(input, { key: "Tab" });
+    expect(within(dialog).getByRole("listbox", { name: /^Actions for/ })).toBeDefined();
+    fireEvent.keyDown(input, { key: "Escape" });
+    expect(screen.getByRole("dialog", { name: "Jump to" })).toBe(dialog);
+    expect((input as HTMLInputElement).value).toBe("login");
+    expect(input.getAttribute("aria-activedescendant")).toBe(picked);
+
+    fireEvent.keyDown(input, { key: "Tab" });
+    fireEvent.keyDown(input, { key: "Backspace" });
+    expect(within(dialog).getByRole("listbox", { name: "Sessions and shells" })).toBeDefined();
+
+    fireEvent.keyDown(input, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  });
+
+  it("opens a row's actions from its button, where a session offers its steps and ending it asks first", async () => {
+    const calls = mockActions();
+    await open("/", live);
+    fireEvent.keyDown(window, { key: "k", metaKey: true });
+    const dialog = await screen.findByRole("dialog", { name: "Jump to" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Actions for fix login / sonnet" }));
+
+    // Nothing is open, so there is nothing to open beside.
+    expect(within(dialog).getAllByRole("option").map((o) => o.textContent)).toEqual([
+      "Open",
+      "Steps",
+      "Changes in fix login",
+      "New session in fix login",
+      "New shell in fix login",
+      "End sonnet…",
+    ]);
+    fireEvent.click(within(dialog).getByRole("option", { name: "End sonnet…" }));
+
+    const ask = await screen.findByRole("dialog", { name: "End sonnet?" });
+    expect(ask.textContent).toMatch(/middle of a turn/);
+    expect(screen.queryByRole("dialog", { name: "Jump to" })).toBeNull();
+    expect(calls).toEqual([]);
+  });
+
+  it("starts a new session in a terminal's workspace from its actions, through the new-session dialog", async () => {
+    const calls = mockActions(json(201, { id: "s9" }));
+    await open("/terminals/t1", live);
+    fireEvent.contextMenu(within(screen.getByRole("group", { name: "fix login" })).getByRole("link", { name: /^shell/ }));
+    fireEvent.click(within(await screen.findByRole("menu")).getByRole("menuitem", { name: "New session in fix login" }));
+
+    const ask = await screen.findByRole("dialog", { name: "New session in fix login" });
+    fireEvent.click(within(ask).getByRole("button", { name: "Start" }));
+    await waitFor(() => expect(calls).toEqual([{ url: "/api/workspaces/w1/sessions", method: "POST", body: { model: "opus" } }]));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  });
+
+  it("starts a new shell in a terminal's workspace from its actions and opens it", async () => {
+    const calls = mockActions(json(201, { id: "t9" }));
+    const router = await open("/terminals/t1", live);
+    fireEvent.keyDown(window, { key: "k", metaKey: true });
+    const dialog = await screen.findByRole("dialog", { name: "Jump to" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Actions for fix login / sonnet" }));
+    fireEvent.click(within(dialog).getByRole("option", { name: "New shell in fix login" }));
+
+    await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t9"));
+    expect(calls).toEqual([{ url: "/api/workspaces/w1/shells", method: "POST", body: undefined }]);
   });
 
   it("opens the open terminal's workspace changes from its header, and the header then shows their size", async () => {

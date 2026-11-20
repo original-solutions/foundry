@@ -4,6 +4,7 @@ import { Board } from "./Board";
 import { ChangesPanel } from "./ChangesPanel";
 import { CreateWorkspace } from "./CreateWorkspace";
 import { JumpPalette } from "./JumpPalette";
+import { NewSession } from "./NewSession";
 import { Sidebar } from "./Sidebar";
 import { StepsPanel, type StepsOf } from "./StepsPanel";
 import { TabStrip } from "./TabStrip";
@@ -51,8 +52,9 @@ import { AlertsButton, useAlerts } from "./AlertsBell";
  * The browser tab shows the fleet's state in its title and icon, and the sidebar's bell turns on
  * desktop alerts for a session that finishes its turn or needs you.
  *
- * Right-clicking (or long-pressing) a terminal anywhere it is listed, or the header's More button,
- * opens its menu: open, open beside, steps, changes, and ending it. Ending a terminal that still
+ * Right-clicking (or long-pressing) a terminal anywhere it is listed, the header's More button, or
+ * Tab on it in the palette, lists what can be done with it: open, open beside, steps, changes, a
+ * new session or shell in its workspace, and ending it. Ending a terminal that still
  * runs asks first; one that already ended is cleared at once, as are all of a workspace's ended
  * ones from its row. When the open terminal is gone, its neighbouring tab shows.
  *
@@ -79,6 +81,8 @@ function Layout() {
   const [finding, setFinding] = useState(0);
   /** The workspace whose changes are open. */
   const [changesOf, setChangesOf] = useState<string>();
+  /** The workspace a new session is being asked for from a terminal's actions. */
+  const [sessionIn, setSessionIn] = useState<{ id: string; name: string }>();
   /** The session of a workspace just made, until it shows up and is opened. */
   const [landing, setLanding] = useState<string>();
   const navigate = useNavigate();
@@ -206,6 +210,10 @@ function Layout() {
       }}
       onChanges={openChanges}
       onFind={() => setFinding((n) => n + 1)}
+      onNewSession={(id, name) => {
+        setDrawer(false);
+        setSessionIn({ id, name });
+      }}
     >
       <div className="flex h-dvh overflow-hidden bg-neutral-950 text-neutral-100">
         <div className={`${place} shrink-0`}>
@@ -308,6 +316,7 @@ function Layout() {
           name={create.name}
           onCreated={setLanding}
         />
+        {sessionIn && <NewSession key={sessionIn.id} workspace={sessionIn.id} name={sessionIn.name} onClose={() => setSessionIn(undefined)} />}
       </div>
     </TerminalActions>
   );
