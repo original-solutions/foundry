@@ -1,7 +1,9 @@
 //! Raises and clears attention items: what needs a person, with what happened and what to do.
 //!
-//! An item is not stored. It is read from what holds now, so it is raised as soon as its rule
-//! holds and cleared as soon as it no longer does:
+//! An item is not stored. It is read from what holds now, so it is raised once its rule holds
+//! and cleared once it no longer does. One read of the list is kept for [`KEPT_FOR`] and
+//! answers every poll in that time, so the records are read at most once a second however
+//! many tabs poll:
 //!
 //! | Item | Raised while | Read from |
 //! |---|---|---|
@@ -28,6 +30,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -39,6 +42,7 @@ use foundry_proto::record::{AnyRecord, Terminal};
 use foundry_proto::settings::{Edit, SettingKey, SettingValue, SharedSettings};
 use foundry_proto::state::{SessionState, TerminalState};
 use serde::Serialize;
+use tokio::time::Instant;
 
 use crate::coordinator::{Coordinator, CoordinatorError};
 use crate::machine::{Over, over_limits};
@@ -46,6 +50,11 @@ use crate::secrets::redact;
 use crate::sessions::STUCK_AFTER;
 use crate::store::{Store, StoreError};
 use crate::sync::{OFFLINE_AFTER, Peers, on_store};
+
+/// How long one read of the list answers every poll. A read loads every record held, so the
+/// polls of every open tab share it. With the UI's 2 second poll an item still shows within
+/// 3 seconds of what raised it.
+pub const KEPT_FOR: Duration = Duration::from_secs(1);
 
 /// What an item is about, one per row of the spec's table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -342,6 +351,9 @@ pub struct Attention {
     peers: Peers,
     coordinator: Arc<Coordinator>,
     sources: Vec<Arc<dyn Source>>,
+    /// The last read of the list and when it was made. A poll holds this for the length of its
+    /// read, so polls that arrive together wait for one read instead of each making their own.
+    kept: tokio::sync::Mutex<Option<(Instant, Vec<Item>)>>,
 }
 
 impl Attention {
@@ -357,6 +369,7 @@ impl Attention {
             peers,
             coordinator,
             sources: Vec::new(),
+            kept: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -366,10 +379,24 @@ impl Attention {
         self
     }
 
-    /// Every item that stands now, ordered by kind and then id. Records are read as
-    /// [`Peers::state`] shows them, so an offline machine's sessions and terminals are
-    /// unreachable and raise nothing but its "machine offline" item.
+    /// Every item that stands, ordered by kind and then id, from a read at most [`KEPT_FOR`]
+    /// old. A read that fails is not kept.
     pub async fn items(&self) -> Result<Vec<Item>, StoreError> {
+        let mut kept = self.kept.lock().await;
+        if let Some((at, items)) = kept.as_ref()
+            && at.elapsed() < KEPT_FOR
+        {
+            return Ok(items.clone());
+        }
+        let items = self.read().await?;
+        *kept = Some((Instant::now(), items.clone()));
+        Ok(items)
+    }
+
+    /// Reads the list now. Records are read as [`Peers::state`] shows them, so an offline
+    /// machine's sessions and terminals are unreachable and raise nothing but its "machine
+    /// offline" item.
+    async fn read(&self) -> Result<Vec<Item>, StoreError> {
         let online = self.peers.online();
         let records = self.peers.state().await?;
         let settings = on_store(&self.store, |store| store.settings()).await?;
@@ -405,28 +432,34 @@ async fn list(State(attention): State<Arc<Attention>>) -> Response {
 }
 
 async fn dismiss(State(attention): State<Arc<Attention>>, Path(id): Path<String>) -> Response {
-    let items = match attention.items().await {
-        Ok(items) => items,
-        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-    };
-    let Some(item) = items.iter().find(|item| item.id == id) else {
-        return error(StatusCode::NOT_FOUND, format!("no attention item {id:?}"));
-    };
-    let setting = match id
+    let missing = || error(StatusCode::NOT_FOUND, format!("no attention item {id:?}"));
+    // A "setting overwritten" item stands while the settings hold its key, so the settings
+    // alone say whether it does. Only an id of another kind is looked up in the list.
+    let key = id
         .strip_prefix("setting_overwritten:")
-        .map(str::parse::<SettingKey>)
-    {
-        Some(Ok(setting)) if item.kind == Kind::SettingOverwritten => setting,
-        _ => {
-            return error(
+        .and_then(|key| key.parse::<SettingKey>().ok());
+    let Some(setting) = key else {
+        return match attention.items().await {
+            Ok(items) if items.iter().any(|item| item.id == id) => error(
                 StatusCode::CONFLICT,
                 "only a \"setting overwritten\" item can be dismissed; this one clears on its own"
                     .to_owned(),
-            );
-        }
+            ),
+            Ok(_) => missing(),
+            Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
     };
+    match on_store(&attention.store, |store| store.settings()).await {
+        Ok(settings) if settings.overwritten.contains_key(&setting) => {}
+        Ok(_) => return missing(),
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
     match attention.coordinator.edit(Edit::Dismiss { setting }).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            // The read kept from before the edit still holds the item.
+            *attention.kept.lock().await = None;
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => {
             let status = match e {
                 CoordinatorError::NotLinked(_)
@@ -452,6 +485,7 @@ fn error(status: StatusCode, message: String) -> Response {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use foundry_proto::ids::{ProjectId, SessionId, WorkspaceId};
@@ -1011,11 +1045,14 @@ mod tests {
         }
     }
 
-    /// A source that raises one item, as a later module would.
-    struct Fixed;
+    /// A source that raises one item, as a later module would, and counts how often it is
+    /// read: once for every read of the records.
+    #[derive(Default)]
+    struct Fixed(AtomicUsize);
 
     impl Source for Fixed {
         fn items(&self, fleet: &Fleet) -> Vec<Item> {
+            self.0.fetch_add(1, Ordering::SeqCst);
             vec![fleet.item(
                 Kind::GatewayUnhealthy,
                 fleet.me,
@@ -1032,6 +1069,7 @@ mod tests {
         store: Arc<Mutex<Store>>,
         peers: Peers,
         attention: Arc<Attention>,
+        source: Arc<Fixed>,
         addr: std::net::SocketAddr,
         _server: tokio::task::JoinHandle<()>,
     }
@@ -1049,9 +1087,10 @@ mod tests {
             let peers = Peers::new(me, store.clone(), Arc::new(NoDial));
             let coordinator = Arc::new(Coordinator::new(me, store.clone(), peers.clone()));
             peers.coordinate(coordinator.clone());
+            let source = Arc::new(Fixed::default());
             let attention = Arc::new(
                 Attention::new(me, store.clone(), peers.clone(), coordinator)
-                    .with_source(Arc::new(Fixed)),
+                    .with_source(source.clone()),
             );
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
@@ -1065,6 +1104,7 @@ mod tests {
                 store,
                 peers,
                 attention,
+                source,
                 addr,
                 _server: server,
             }
@@ -1152,6 +1192,11 @@ mod tests {
                 .collect()
         }
 
+        /// How many times the records were read to make the list.
+        fn reads(&self) -> usize {
+            self.source.0.load(Ordering::SeqCst)
+        }
+
         fn overwritten(&self) -> BTreeMap<SettingKey, Overwritten> {
             self.store.lock().unwrap().settings().unwrap().overwritten
         }
@@ -1193,6 +1238,28 @@ mod tests {
             assert_eq!(item["machine"], served.me.to_string());
         }
         assert!(!body.contains("hunter2"), "{body}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reads_within_the_time_a_read_is_kept_share_one_read_of_the_records() {
+        let mut world = World::new();
+        let (peer, machines) = (world.peer, world.settings.machines.clone());
+        let served = Served::new(|_, settings| settings.machines = machines).await;
+        let refused = |items: Vec<Item>| items.iter().any(|i| i.kind == Kind::UpdateRefused);
+
+        // Two tabs polling at once, then a third poll just after.
+        let (first, second) = tokio::join!(served.attention.items(), served.attention.items());
+        assert_eq!(first.unwrap(), second.unwrap());
+        world.sample(peer, 100 * GB, Some("v0.2.0"));
+        served.hold(&world);
+        tokio::time::advance(KEPT_FOR - Duration::from_millis(1)).await;
+        assert!(!refused(served.attention.items().await.unwrap()));
+        assert_eq!(served.reads(), 1);
+
+        // Once the read is no longer kept, the next poll reads again and sees what changed.
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(refused(served.attention.items().await.unwrap()));
+        assert_eq!(served.reads(), 2);
     }
 
     /// A world whose peer has a session waiting for you, a failed setup and a refused tag.
@@ -1253,6 +1320,12 @@ mod tests {
     async fn dismissing_a_setting_overwritten_item_removes_it_from_the_settings() {
         let served = Served::new(with_overwritten).await;
         let key = served.overwritten().into_keys().next().unwrap();
+        // The list was read a moment ago, as the UI that shows the item has.
+        let items = served.attention.items().await.unwrap();
+        assert!(
+            items.iter().any(|i| i.kind == Kind::SettingOverwritten),
+            "{items:?}"
+        );
         let (status, body) = served
             .call(
                 "POST",
@@ -1261,11 +1334,26 @@ mod tests {
             .await;
         assert_eq!(status, 204, "{body}");
         assert!(served.overwritten().is_empty());
+        // The read kept from before the dismissal is not shown again.
         let items = served.attention.items().await.unwrap();
         assert!(
             items.iter().all(|i| i.kind != Kind::SettingOverwritten),
             "{items:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn dismissing_a_setting_overwritten_item_reads_the_settings_and_no_records() {
+        let served = Served::new(with_overwritten).await;
+        let key = served.overwritten().into_keys().next().unwrap();
+        let (status, body) = served
+            .call(
+                "POST",
+                &format!("/api/attention/setting_overwritten:{key}/dismiss"),
+            )
+            .await;
+        assert_eq!(status, 204, "{body}");
+        assert_eq!(served.reads(), 0);
     }
 
     #[tokio::test]
