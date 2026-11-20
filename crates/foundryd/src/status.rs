@@ -1,10 +1,156 @@
-//! Asks the local daemon for its state and prints it. Filled by plan task 20.
+//! `foundryd status`: asks the local daemon for its state and prints each machine with its
+//! numbers and each of its sessions.
 
+use std::collections::BTreeSet;
+use std::fmt::Write as _;
+use std::io;
 use std::process::ExitCode;
+use std::time::Duration;
+
+use foundry_proto::ids::MachineId;
+use foundry_proto::messages::UiMessage;
+use foundry_proto::record::{AnyRecord, MachineSample, Record};
+use foundry_proto::settings::SharedSettings;
+use foundry_proto::state::{SessionState, TerminalState};
+
+/// How long the daemon has to answer.
+const ANSWER_WITHIN: Duration = Duration::from_secs(5);
 
 /// `foundryd status`.
 pub fn status() -> ExitCode {
-    crate::not_built("status")
+    let port = match crate::daemon::port() {
+        Ok(port) => port,
+        Err(error) => {
+            eprintln!("foundryd status: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match fetch(port) {
+        Ok(UiMessage::State {
+            records, settings, ..
+        }) => {
+            print!("{}", render(&records, &settings));
+            ExitCode::SUCCESS
+        }
+        Ok(_) => {
+            eprintln!("foundryd status: the daemon on 127.0.0.1:{port} did not send its state");
+            ExitCode::FAILURE
+        }
+        Err(error) => {
+            eprintln!("foundryd status: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `GET /api/state` from the daemon on loopback at `port`.
+fn fetch(port: u16) -> Result<UiMessage, String> {
+    let url = format!("http://127.0.0.1:{port}/api/state");
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(ANSWER_WITHIN))
+        .build()
+        .into();
+    match agent.get(&url).call() {
+        Ok(mut response) => response
+            .body_mut()
+            .read_json()
+            .map_err(|error| format!("the answer from {url} is not the state: {error}")),
+        Err(ureq::Error::StatusCode(status)) => Err(format!("{url} answered {status}")),
+        Err(ureq::Error::Io(error)) if error.kind() == io::ErrorKind::ConnectionRefused => {
+            Err(format!("no daemon is running on 127.0.0.1:{port}"))
+        }
+        Err(ureq::Error::ConnectionFailed) => {
+            Err(format!("no daemon is running on 127.0.0.1:{port}"))
+        }
+        Err(error) => Err(format!("cannot read {url}: {error}")),
+    }
+}
+
+/// Every machine and its sessions as plain text: machines in the settings' order, then any
+/// other machine that has a sample, by id.
+pub fn render(records: &[AnyRecord], settings: &SharedSettings) -> String {
+    let mut machines: Vec<MachineId> = settings.machines.iter().map(|m| m.id).collect();
+    let listed: BTreeSet<MachineId> = machines.iter().copied().collect();
+    let others: BTreeSet<MachineId> = records
+        .iter()
+        .filter_map(|record| match record {
+            AnyRecord::MachineSample(sample) if !listed.contains(&sample.owner) => {
+                Some(sample.owner)
+            }
+            _ => None,
+        })
+        .collect();
+    machines.extend(others);
+
+    let mut out = String::new();
+    for id in machines {
+        let name = settings
+            .machines
+            .iter()
+            .find(|m| m.id == id)
+            .map_or_else(|| id.to_string(), |m| m.name.clone());
+        machine_lines(&mut out, &name, id, records);
+    }
+    out
+}
+
+/// The machine's line, then a line for each of its sessions that is not deleted.
+fn machine_lines(out: &mut String, name: &str, id: MachineId, records: &[AnyRecord]) {
+    let offline = records.iter().any(|record| match record {
+        AnyRecord::Session(r) => r.owner == id && r.body.state == SessionState::Unreachable,
+        AnyRecord::Terminal(r) => r.owner == id && r.body.state == TerminalState::Unreachable,
+        _ => false,
+    });
+    let state = if offline { "offline" } else { "online" };
+    let newest: Option<&Record<MachineSample>> = records
+        .iter()
+        .filter_map(|record| match record {
+            AnyRecord::MachineSample(sample) if sample.owner == id => Some(sample),
+            _ => None,
+        })
+        .max_by_key(|sample| sample.version);
+    let numbers = match newest {
+        Some(sample) => {
+            let body = &sample.body;
+            let plural = if body.sessions == 1 { "" } else { "s" };
+            format!(
+                "load {:.2}/core  memory {:.1} GB free  disk {:.1} GB free  {} session{plural}",
+                body.load_per_core,
+                gigabytes(body.free_memory),
+                gigabytes(body.free_disk),
+                body.sessions
+            )
+        }
+        None => "no sample yet".to_owned(),
+    };
+    let _ = writeln!(out, "{name}  {state}  {numbers}");
+    for record in records {
+        if let AnyRecord::Session(r) = record
+            && r.owner == id
+            && !r.deleted
+        {
+            let _ = writeln!(
+                out,
+                "  session {}  {}  {}",
+                r.body.id,
+                wire_name(r.body.state),
+                r.body.model
+            );
+        }
+    }
+}
+
+/// Decimal gigabytes.
+fn gigabytes(bytes: u64) -> f64 {
+    bytes as f64 / 1e9
+}
+
+/// A state as it is on the wire, such as `waiting_for_you`.
+fn wire_name(state: SessionState) -> String {
+    serde_json::to_value(state)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| format!("{state:?}"))
 }
 
 #[cfg(test)]

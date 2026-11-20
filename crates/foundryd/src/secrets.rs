@@ -5,10 +5,12 @@
 //! reaches an error message: errors name the secret or the file, never what it holds.
 
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::{Mutex, PoisonError};
@@ -64,10 +66,26 @@ pub enum SecretsError {
     },
 }
 
+/// The secret the model gateway's key is held under: sessions send it as
+/// `ANTHROPIC_AUTH_TOKEN`.
+pub const GATEWAY: &str = "gateway";
+
+/// The secret the gateway's management key is held under.
+pub const GATEWAY_MANAGEMENT: &str = "gateway-management";
+
 /// The secret store this machine uses: the login keychain on macOS, its updates locked by
 /// the file `secrets.lock` in `home`, and on Linux the file `secrets.json` in `home`, readable
-/// only by the service user.
+/// only by the service user. `FOUNDRY_SECRETS=file` picks the file on every OS, which is how
+/// tests keep out of the keychain.
 pub fn for_this_machine(home: &Path) -> Arc<dyn Secrets> {
+    store_for(home, std::env::var_os("FOUNDRY_SECRETS").as_deref())
+}
+
+/// [`for_this_machine`] given the value of `FOUNDRY_SECRETS`.
+fn store_for(home: &Path, choice: Option<&OsStr>) -> Arc<dyn Secrets> {
+    if choice == Some(OsStr::new("file")) {
+        return Arc::new(FileSecrets::new(home.join("secrets.json")));
+    }
     #[cfg(target_os = "macos")]
     {
         Arc::new(Keychain::new("foundry", home.join("secrets.lock")))
@@ -76,6 +94,74 @@ pub fn for_this_machine(home: &Path) -> Arc<dyn Secrets> {
     {
         Arc::new(FileSecrets::new(home.join("secrets.json")))
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SetError {
+    #[error("{name} is not a secret to set here; the names are {GATEWAY} and {GATEWAY_MANAGEMENT}")]
+    UnknownName { name: String },
+    #[error("no value on stdin for {name}")]
+    NoValue { name: String },
+    #[error("cannot read stdin for {name}: {source}")]
+    Stdin { name: String, source: io::Error },
+    #[error(transparent)]
+    Secrets(#[from] SecretsError),
+}
+
+/// `foundryd secret set <name>`: reads one line from stdin and stores it in this machine's
+/// secret store. It never prints the value.
+pub fn set_command(name: &str) -> ExitCode {
+    let result = match crate::daemon::home() {
+        Some(home) => set_from(
+            &*for_this_machine(&home),
+            name,
+            io::BufReader::new(io::stdin()),
+        ),
+        None => {
+            eprintln!("foundryd secret set: set FOUNDRY_HOME or HOME");
+            return ExitCode::FAILURE;
+        }
+    };
+    match result {
+        Ok(()) => {
+            println!("foundryd secret set {name}: stored; restart foundryd so new sessions use it");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("foundryd secret set: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Stores the first line of `input` as the secret `name`, without its line ending. Only the
+/// gateway secrets can be set: the name is checked before `input` is read, so any other name
+/// leaves the store untouched, and the machine's own identity and key table stay out of reach.
+pub fn set_from(
+    secrets: &dyn Secrets,
+    name: &str,
+    mut input: impl BufRead,
+) -> Result<(), SetError> {
+    if name != GATEWAY && name != GATEWAY_MANAGEMENT {
+        return Err(SetError::UnknownName {
+            name: name.to_owned(),
+        });
+    }
+    let mut line = String::new();
+    input
+        .read_line(&mut line)
+        .map_err(|source| SetError::Stdin {
+            name: name.to_owned(),
+            source,
+        })?;
+    let line = line.strip_suffix('\n').unwrap_or(&line);
+    let value = line.strip_suffix('\r').unwrap_or(line);
+    if value.is_empty() {
+        return Err(SetError::NoValue {
+            name: name.to_owned(),
+        });
+    }
+    Ok(secrets.set(name, value)?)
 }
 
 /// Secrets in one JSON file that only its owner may read or write. The file is created 0600,
