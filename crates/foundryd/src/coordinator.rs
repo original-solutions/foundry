@@ -154,6 +154,9 @@ impl Coordinator {
         edit: Edit,
     ) -> Result<(), CoordinatorError> {
         loop {
+            // Read before the settings: a copy is counted only once it is merged, so any copy
+            // counted here is in the settings read next, and the acting machine reflects it.
+            let sender_spoke = from.is_some_and(|from| self.heard_since(from, arrived));
             let held = self.held().await?;
             let acting = acting(&held.priority, &self.peers.online());
             let waited = arrived.elapsed();
@@ -161,10 +164,7 @@ impl Coordinator {
                 if self.caught_up(&held) || waited >= OFFLINE_AFTER {
                     return self.number(edit).await;
                 }
-            } else if Some(acting) != from
-                || waited >= OFFLINE_AFTER
-                || self.heard_since(acting, arrived)
-            {
+            } else if Some(acting) != from || waited >= OFFLINE_AFTER || sender_spoke {
                 let message = PeerMessage::Edit {
                     protocol: PROTOCOL,
                     edit: edit.clone(),
