@@ -2146,6 +2146,33 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn every_action_the_release_workflow_runs_is_pinned_to_a_commit() {
+        // Every job builds or handles the archives that publish signs, not only publish itself.
+        let workflow = include_str!("../../../.github/workflows/release.yml");
+
+        let unpinned: Vec<&str> = workflow
+            .lines()
+            .filter_map(|l| {
+                l.trim_start()
+                    .trim_start_matches("- ")
+                    .strip_prefix("uses: ")
+            })
+            .filter(|action| {
+                let reference = action
+                    .split_whitespace()
+                    .next()
+                    .and_then(|a| a.split_once('@'))
+                    .map(|(_, r)| r);
+                !reference
+                    .is_some_and(|r| r.len() == 40 && r.bytes().all(|b| b.is_ascii_hexdigit()))
+            })
+            .collect();
+
+        assert!(workflow.contains("uses: "));
+        assert_eq!(unpinned, Vec::<&str>::new());
+    }
+
     /// Bytes from hex, for fixtures.
     fn unhex(hex: &str) -> Vec<u8> {
         (0..hex.len())
