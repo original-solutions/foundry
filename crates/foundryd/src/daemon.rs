@@ -34,6 +34,7 @@ use crate::store::{Store, StoreError};
 use crate::sync::Peers;
 use crate::sync::ws::{self, WsDialer};
 use crate::terminals::{TerminalError, Terminals};
+use crate::update;
 use crate::workspaces::Workspaces;
 
 /// How long the runtime waits for tasks that will not stop once the daemon has decided to
@@ -135,6 +136,9 @@ fn start() -> Result<(), DaemonError> {
         )
         .with_writer(io::stderr)
         .try_init();
+    if !update::starting(&home) {
+        return Ok(());
+    }
     let runtime = tokio::runtime::Runtime::new().map_err(io_error("cannot start the runtime"))?;
     let result = runtime.block_on(serve(home, port));
     runtime.shutdown_timeout(EXIT_WITHIN);
@@ -278,6 +282,7 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
     }));
     services.spawn(named("the API server", serve_on(listener, app.clone())));
     services.spawn(named("the Tailscale address watch", tailscale.watch()));
+    services.spawn(named("updates", update::run(home.clone())));
 
     tokio::select! {
         _ = terminate.recv() => tracing::info!("SIGTERM: stopping; terminals keep running"),

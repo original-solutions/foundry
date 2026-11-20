@@ -1,3 +1,405 @@
+//! `foundryd install` and `foundryd uninstall`: the launchd agent on macOS and the systemd
+//! unit on Linux. Both keep the daemon running, start it again when it stops, and leave the
+//! holders (and so every terminal) alone when the daemon stops.
+
+use std::fs::{self, DirBuilder, OpenOptions};
+use std::io::{self, Write as _};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode};
+use std::time::{Duration, Instant};
+
+use nix::unistd::{Uid, User};
+
+use crate::{daemon, update};
+
+/// The launchd label, and so the plist's name.
+const LABEL: &str = "io.github.original-solutions.foundryd";
+
+/// The systemd unit's name.
+const UNIT_NAME: &str = "foundryd.service";
+
+/// Where `sudo` puts the unit.
+const UNIT_PATH: &str = "/etc/systemd/system/foundryd.service";
+
+/// The variables copied from the installing shell when they are set and not empty.
+const FROM_SHELL: [&str; 4] = [
+    "PATH",
+    "FOUNDRY_GATEWAY_URL",
+    "FOUNDRY_PORT",
+    "CLAUDE_CONFIG_DIR",
+];
+
+/// The binary that holds a terminal's child; it sits beside `foundryd`.
+const HOLDER: &str = "foundry-holder";
+
+/// How long `install` waits for launchd to let go of an agent it was told to remove.
+const BOOTOUT_WAIT: Duration = Duration::from_secs(10);
+
+/// Why an install or uninstall failed.
+#[derive(Debug, thiserror::Error)]
+enum ServiceError {
+    #[error("set FOUNDRY_HOME or HOME to say where the data directory is")]
+    NoHome,
+    #[error("HOME is not set")]
+    NoUserHome,
+    #[error(
+        "run it as the user that will run the service, not root: Claude Code refuses its permission mode as root"
+    )]
+    Root,
+    #[error("cannot tell which user this is")]
+    NoUser,
+    #[error("{0} is missing: it must sit beside foundryd")]
+    NoHolder(PathBuf),
+    #[error("{what}: {source}")]
+    Io { what: String, source: io::Error },
+    #[error("{0}")]
+    Command(String),
+    #[error("this operating system has no supported service manager; only macOS and Linux do")]
+    Unsupported,
+}
+
+/// Labels an I/O error with what was being done.
+fn io_error(what: impl Into<String>) -> impl FnOnce(io::Error) -> ServiceError {
+    let what = what.into();
+    move |source| ServiceError::Io { what, source }
+}
+
+/// The variables the service runs with: `FOUNDRY_HOME` always, the others as `lookup` gives
+/// them. `lookup` is the installing shell's environment.
+fn environment(lookup: impl Fn(&str) -> Option<String>, home: &Path) -> Vec<(String, String)> {
+    let mut vars = vec![("FOUNDRY_HOME".to_string(), home.display().to_string())];
+    for name in FROM_SHELL {
+        if let Some(value) = lookup(name).filter(|value| !value.is_empty()) {
+            vars.push((name.to_string(), value));
+        }
+    }
+    vars
+}
+
+/// Escapes text for an XML string.
+fn xml(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+/// The launchd agent. `AbandonProcessGroup` keeps launchd from killing the holders when it
+/// stops the daemon.
+fn plist(program: &Path, env: &[(String, String)], log: &Path) -> String {
+    let program = xml(&program.display().to_string());
+    let log = xml(&log.display().to_string());
+    let vars: String = env
+        .iter()
+        .map(|(key, value)| {
+            format!(
+                "\t\t<key>{}</key>\n\t\t<string>{}</string>\n",
+                xml(key),
+                xml(value)
+            )
+        })
+        .collect();
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+<plist version=\"1.0\">\n\
+<dict>\n\
+\t<key>Label</key>\n\t<string>{LABEL}</string>\n\
+\t<key>ProgramArguments</key>\n\t<array>\n\t\t<string>{program}</string>\n\t\t<string>run</string>\n\t</array>\n\
+\t<key>EnvironmentVariables</key>\n\t<dict>\n{vars}\t</dict>\n\
+\t<key>RunAtLoad</key>\n\t<true/>\n\
+\t<key>KeepAlive</key>\n\t<true/>\n\
+\t<key>AbandonProcessGroup</key>\n\t<true/>\n\
+\t<key>ThrottleInterval</key>\n\t<integer>10</integer>\n\
+\t<key>StandardOutPath</key>\n\t<string>{log}</string>\n\
+\t<key>StandardErrorPath</key>\n\t<string>{log}</string>\n\
+</dict>\n\
+</plist>\n"
+    )
+}
+
+/// Quotes text for a systemd value inside double quotes.
+fn systemd(text: &str) -> String {
+    text.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('%', "%%")
+}
+
+/// The systemd unit. It runs as `user`, never root, and `KillMode=process` keeps systemd from
+/// killing the holders when it stops the daemon.
+fn unit(program: &Path, env: &[(String, String)], user: &str) -> Result<String, ServiceError> {
+    if user == "root" {
+        return Err(ServiceError::Root);
+    }
+    let program = systemd(&program.display().to_string());
+    let vars: String = env
+        .iter()
+        .map(|(key, value)| format!("Environment=\"{}\"\n", systemd(&format!("{key}={value}"))))
+        .collect();
+    Ok(format!(
+        "[Unit]\n\
+Description=Foundry daemon\n\
+After=network-online.target\n\
+Wants=network-online.target\n\
+\n\
+[Service]\n\
+User={user}\n\
+ExecStart=\"{program}\" run\n\
+{vars}\
+Restart=always\n\
+RestartSec=10\n\
+KillMode=process\n\
+\n\
+[Install]\n\
+WantedBy=multi-user.target\n"
+    ))
+}
+
+/// Copies `from` to `to` and makes it executable.
+fn copy_executable(from: &Path, to: &Path) -> io::Result<()> {
+    fs::copy(from, to)?;
+    fs::set_permissions(to, fs::Permissions::from_mode(0o755))
+}
+
+/// Puts `exe` and the holder beside it in `versions/<version>` and points `current` there.
+/// A copy is made in a stage directory and renamed in. When `exe` already runs from that
+/// directory nothing is copied.
+fn place(home: &Path, exe: &Path, version: &str) -> io::Result<()> {
+    let from = exe.parent().unwrap_or(Path::new("."));
+    let holder = from.join(HOLDER);
+    if !holder.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "{} is missing: it must sit beside foundryd",
+                holder.display()
+            ),
+        ));
+    }
+    let versions = home.join("versions");
+    let target = versions.join(version);
+    let in_place = match (fs::canonicalize(from), fs::canonicalize(&target)) {
+        (Ok(from), Ok(target)) => from == target,
+        _ => false,
+    };
+    if !in_place {
+        let stage = versions.join(format!(".staging-{version}"));
+        let _ = fs::remove_dir_all(&stage);
+        fs::create_dir_all(&stage)?;
+        copy_executable(exe, &stage.join("foundryd"))?;
+        copy_executable(&holder, &stage.join(HOLDER))?;
+        let _ = fs::remove_dir_all(&target);
+        fs::rename(&stage, &target)?;
+    }
+    update::point_current(home, version)
+}
+
+/// Makes the data directory, readable only by this user, when it is missing.
+fn make_home(home: &Path) -> Result<(), ServiceError> {
+    DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(home)
+        .map_err(io_error(format!("cannot make {}", home.display())))
+}
+
+/// Runs a command and fails with what it said on stderr, trimmed.
+fn run_command(command: &mut Command) -> Result<(), ServiceError> {
+    let name = command.get_program().to_string_lossy().into_owned();
+    let out = command
+        .output()
+        .map_err(|error| ServiceError::Command(format!("cannot run {name}: {error}")))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    Err(ServiceError::Command(format!(
+        "{name} failed: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    )))
+}
+
+/// `gui/<uid>/<label>`, the launchd name of the agent.
+fn launchd_target() -> String {
+    format!("gui/{}/{LABEL}", Uid::current())
+}
+
+/// Where the launchd agent's plist lives.
+fn plist_path() -> Result<PathBuf, ServiceError> {
+    let home = std::env::var_os("HOME").ok_or(ServiceError::NoUserHome)?;
+    Ok(PathBuf::from(home)
+        .join("Library/LaunchAgents")
+        .join(format!("{LABEL}.plist")))
+}
+
+/// Stops and removes the agent. A failure is ignored: it may not be loaded.
+fn bootout() {
+    let _ = Command::new("launchctl")
+        .args(["bootout", &launchd_target()])
+        .output();
+}
+
+fn install_macos(home: &Path) -> Result<String, ServiceError> {
+    let user_home = PathBuf::from(std::env::var_os("HOME").ok_or(ServiceError::NoUserHome)?);
+    let log = user_home.join("Library/Logs/foundry/foundryd.log");
+    let path = plist_path()?;
+    let program = home.join("current/foundryd");
+    let text = plist(
+        &program,
+        &environment(|n| std::env::var(n).ok(), home),
+        &log,
+    );
+    for dir in [path.parent(), log.parent()].into_iter().flatten() {
+        fs::create_dir_all(dir).map_err(io_error(format!("cannot make {}", dir.display())))?;
+    }
+    fs::write(&path, text).map_err(io_error(format!("cannot write {}", path.display())))?;
+    bootout();
+    let started = Instant::now();
+    while started.elapsed() < BOOTOUT_WAIT {
+        let loaded = Command::new("launchctl")
+            .args(["print", &launchd_target()])
+            .output()
+            .is_ok_and(|out| out.status.success());
+        if !loaded {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    run_command(Command::new("launchctl").args([
+        "bootstrap",
+        &format!("gui/{}", Uid::current()),
+        &path.display().to_string(),
+    ]))?;
+    Ok(format!(
+        "Installed the launchd agent {}\nIt runs {} and logs to {}",
+        path.display(),
+        program.display(),
+        log.display()
+    ))
+}
+
+fn install_linux(home: &Path) -> Result<String, ServiceError> {
+    if Uid::current().is_root() {
+        return Err(ServiceError::Root);
+    }
+    let user = User::from_uid(Uid::current())
+        .ok()
+        .flatten()
+        .ok_or(ServiceError::NoUser)?
+        .name;
+    let program = home.join("current/foundryd");
+    let text = unit(
+        &program,
+        &environment(|n| std::env::var(n).ok(), home),
+        &user,
+    )?;
+    let file = home.join(UNIT_NAME);
+    OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o644)
+        .open(&file)
+        .and_then(|mut f| f.write_all(text.as_bytes()))
+        .map_err(io_error(format!("cannot write {}", file.display())))?;
+    Ok(format!(
+        "Wrote the systemd unit {file}\nInstall and start it with:\n  sudo install -m 644 {file} {UNIT_PATH}\n  sudo systemctl daemon-reload\n  sudo systemctl enable foundryd\n  sudo systemctl restart foundryd",
+        file = file.display()
+    ))
+}
+
+fn do_install() -> Result<String, ServiceError> {
+    let home = daemon::home().ok_or(ServiceError::NoHome)?;
+    if !cfg!(any(target_os = "macos", target_os = "linux")) {
+        return Err(ServiceError::Unsupported);
+    }
+    if cfg!(target_os = "linux") && Uid::current().is_root() {
+        return Err(ServiceError::Root);
+    }
+    make_home(&home)?;
+    let exe = std::env::current_exe().map_err(io_error("cannot find this program"))?;
+    let version = env!("CARGO_PKG_VERSION");
+    place(&home, &exe, version).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound && error.to_string().contains(HOLDER) {
+            ServiceError::NoHolder(exe.with_file_name(HOLDER))
+        } else {
+            ServiceError::Io {
+                what: format!("cannot place version {version}"),
+                source: error,
+            }
+        }
+    })?;
+    let done = if cfg!(target_os = "macos") {
+        install_macos(&home)?
+    } else {
+        install_linux(&home)?
+    };
+    Ok(format!(
+        "Placed version {version} in {}\n{done}",
+        home.join("versions").display()
+    ))
+}
+
+/// Removes `path`; one that is already gone is fine.
+fn remove(path: &Path) -> Result<(), ServiceError> {
+    match fs::remove_file(path) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => {
+            Err(io_error(format!("cannot remove {}", path.display()))(error))
+        }
+        _ => Ok(()),
+    }
+}
+
+fn do_uninstall() -> Result<String, ServiceError> {
+    let home = daemon::home().ok_or(ServiceError::NoHome)?;
+    let kept = format!(
+        "The data directory {} and its versions are kept.",
+        home.display()
+    );
+    if cfg!(target_os = "macos") {
+        let path = plist_path()?;
+        bootout();
+        remove(&path)?;
+        Ok(format!(
+            "Removed the launchd agent {}\n{kept}",
+            path.display()
+        ))
+    } else if cfg!(target_os = "linux") {
+        let file = home.join(UNIT_NAME);
+        remove(&file)?;
+        Ok(format!(
+            "Removed {}\nStop and remove the service with:\n  sudo systemctl disable --now foundryd\n  sudo rm {UNIT_PATH}\n  sudo systemctl daemon-reload\n{kept}",
+            file.display()
+        ))
+    } else {
+        Err(ServiceError::Unsupported)
+    }
+}
+
+/// Prints the result and turns it into the exit code.
+fn report(command: &str, result: Result<String, ServiceError>) -> ExitCode {
+    match result {
+        Ok(text) => {
+            println!("{text}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("foundryd {command}: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `foundryd install`.
+pub fn install() -> ExitCode {
+    report("install", do_install())
+}
+
+/// `foundryd uninstall`.
+pub fn uninstall() -> ExitCode {
+    report("uninstall", do_uninstall())
+}
 
 #[cfg(test)]
 mod tests {
@@ -202,6 +604,10 @@ mod tests {
             .output()
             .unwrap();
 
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
     }
 }
