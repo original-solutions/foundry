@@ -29,7 +29,7 @@ use futures::StreamExt as _;
 use serde::Deserialize;
 
 use super::{Api, ApiError, error, parse_id, redact};
-use crate::sync::relay::{self, RelayError, Remote};
+use crate::sync::relay::{self, Closed, RelayError, Remote};
 use crate::terminals::{Output, Snapshot, TerminalError};
 
 /// The longest close reason a WebSocket close frame carries, in bytes.
@@ -86,7 +86,7 @@ enum Said {
     Output(Bytes),
     /// Input the terminal refused; the socket stays open.
     Refused(String),
-    Close(u16, String),
+    Close(Closed),
 }
 
 impl End {
@@ -94,16 +94,13 @@ impl End {
         match self {
             Self::Here(output) => match output.next().await {
                 Some(Ok(bytes)) => Said::Output(bytes),
-                None => Said::Close(1000, "exited".to_owned()),
-                Some(Err(error @ TerminalError::Detached(_))) => {
-                    Said::Close(1013, error.to_string())
-                }
-                Some(Err(error)) => Said::Close(1011, error.to_string()),
+                None => Said::Close(Closed::exited()),
+                Some(Err(error)) => Said::Close(Closed::of(&error)),
             },
             Self::There(remote) => match remote.next().await {
                 relay::Event::Output(bytes) => Said::Output(bytes),
                 relay::Event::Refused(reason) => Said::Refused(reason),
-                relay::Event::Closed(closed) => Said::Close(closed.code, closed.reason),
+                relay::Event::Closed(closed) => Said::Close(closed),
             },
         }
     }
@@ -131,13 +128,12 @@ fn here(done: Result<(), TerminalError>) -> Option<Said> {
     match done {
         Ok(()) => None,
         Err(TerminalError::Refused { reason, .. }) => Some(Said::Refused(reason)),
-        Err(error) => Some(Said::Close(1011, error.to_string())),
+        Err(error) => Some(Said::Close(Closed::of(&error))),
     }
 }
 
-fn there(done: Result<(), relay::Closed>) -> Option<Said> {
-    done.err()
-        .map(|closed| Said::Close(closed.code, closed.reason))
+fn there(done: Result<(), Closed>) -> Option<Said> {
+    done.err().map(Said::Close)
 }
 
 /// Sends the snapshot, then carries output to the UI and input to the terminal until either
@@ -172,7 +168,7 @@ async fn carry(api: Api, id: TerminalId, snapshot: Snapshot, mut end: End, mut s
                     .send(ws::Message::Text(text.to_string().into()))
                     .await
             }
-            Said::Close(code, reason) => return close(socket, code, reason).await,
+            Said::Close(closed) => return close(socket, closed.code, closed.reason).await,
         };
         if sent.is_err() {
             return;

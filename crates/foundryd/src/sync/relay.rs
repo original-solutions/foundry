@@ -7,11 +7,13 @@
 //! until either end goes. Terminal bytes never ride the record link, where they would queue
 //! behind a catch-up and could starve its heartbeats.
 //!
-//! A link carries text only, so each message is a JSON [`Frame`] with bytes as hex. B sends
-//! the snapshot first, then output and refusals of input, and last a close with the code A's
-//! terminal socket closes with. A sends input and resizes. Both ends send a beat every
-//! [`TICK`], and an end that hears nothing for [`OFFLINE_AFTER`] takes the link as down, so a
-//! link that dies without closing still ends.
+//! A link carries text only, so each message is a JSON [`Frame`] with bytes as hex, in pieces
+//! of at most [`CHUNK`] so no frame comes near a WebSocket's frame limit. B sends the snapshot
+//! first, then output and refusals of input, and last a close with the code A's terminal socket
+//! closes with; it then waits for A to close the link, so that close is never lost to a link
+//! torn down under it. A sends input and resizes. Both ends send a beat every [`TICK`], and an
+//! end that hears nothing for [`OFFLINE_AFTER`] takes the link as down, so a link that dies
+//! without closing still ends.
 
 use std::io;
 
@@ -30,24 +32,36 @@ use crate::terminals::{Snapshot, TerminalError};
 
 /// The close codes of the terminal socket (see [`crate::api::terminals`]): the child exited,
 /// attach again, and any other end.
-const EXITED: u16 = 1000;
-const AGAIN: u16 = 1013;
-const FAILED: u16 = 1011;
+pub const EXITED: u16 = 1000;
+pub const AGAIN: u16 = 1013;
+pub const FAILED: u16 = 1011;
+
+/// The most bytes one frame carries, before hex doubles them. A snapshot or input larger than
+/// this goes in several frames, the last one marked.
+const CHUNK: usize = 1024 * 1024;
+
+/// The most bytes one snapshot or one input is put back together from: the holder's own frame
+/// limit, which nothing larger could pass.
+const MOST: usize = foundry_holder::protocol::MAX_FRAME;
 
 /// One message on a relay link.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Frame {
-    /// Owner to opener, first: the kept screen and scrollback.
-    Snapshot { start: u64, bytes: String },
+    /// Owner to opener, first: a piece of the kept screen and scrollback.
+    Snapshot {
+        start: u64,
+        bytes: String,
+        last: bool,
+    },
     /// Owner to opener: live output.
     Output { bytes: String },
     /// Owner to opener: input the terminal refused. The relay stays open.
     Refused { reason: String },
     /// Owner to opener, last: the code and reason the terminal socket closes with.
     Closed { code: u16, reason: String },
-    /// Opener to owner: typed input.
-    Input { bytes: String },
+    /// Opener to owner: a piece of one typed input.
+    Input { bytes: String, last: bool },
     /// Opener to owner.
     Resize { cols: u16, rows: u16 },
     /// Either way, every [`TICK`].
@@ -65,11 +79,34 @@ pub enum RelayError {
     Refused(String),
 }
 
-/// How a relay ended: the code and reason the terminal socket closes with.
+/// How a terminal socket ends: its close code and reason.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Closed {
     pub code: u16,
     pub reason: String,
+}
+
+impl Closed {
+    /// The child exited and every byte was sent.
+    pub fn exited() -> Self {
+        Self {
+            code: EXITED,
+            reason: "exited".to_owned(),
+        }
+    }
+
+    /// How a terminal error ends the socket: attach again when the holder cut the client off,
+    /// failed otherwise.
+    pub fn of(error: &TerminalError) -> Self {
+        let code = match error {
+            TerminalError::Detached(_) => AGAIN,
+            _ => FAILED,
+        };
+        Self {
+            code,
+            reason: error.to_string(),
+        }
+    }
 }
 
 /// What a relayed terminal says next.
@@ -120,7 +157,9 @@ impl Peers {
 
     /// Opens terminal `id` of machine `owner` over a relay link: its snapshot, then the
     /// [`Remote`] that carries it. The link is dialed as the record links are, so a machine cut
-    /// off from this one is [`RelayError::Down`].
+    /// off from this one, or one silent past [`OFFLINE_AFTER`], is [`RelayError::Down`]. An
+    /// owner that closes the link without answering, as a build older than relays does, has
+    /// refused it.
     pub async fn open_terminal(
         &self,
         owner: MachineId,
@@ -154,20 +193,34 @@ impl Peers {
         }
         // The owner's attach answers within its own limit, which is shorter than this.
         let deadline = Instant::now() + OFFLINE_AFTER;
+        let mut kept = Vec::new();
         let snapshot = loop {
-            let Ok(Some(text)) = timeout_at(deadline, recv.recv()).await else {
-                return Err(down());
+            let text = match timeout_at(deadline, recv.recv()).await {
+                Ok(Some(text)) => text,
+                Ok(None) => {
+                    return Err(RelayError::Refused(format!(
+                        "{} closed the relay without answering; it may run an older build",
+                        peer.name
+                    )));
+                }
+                Err(_) => return Err(down()),
             };
             match serde_json::from_str(&text) {
-                Ok(Frame::Snapshot { start, bytes }) => match unhex(&bytes) {
-                    Some(bytes) => break Snapshot { start, bytes },
-                    None => {
+                Ok(Frame::Snapshot { start, bytes, last }) => {
+                    let Some(bytes) = unhex(&bytes).filter(|b| kept.len() + b.len() <= MOST) else {
                         return Err(RelayError::Refused(format!(
                             "{} sent a snapshot that cannot be read",
                             peer.name
                         )));
+                    };
+                    kept.extend_from_slice(&bytes);
+                    if last {
+                        break Snapshot {
+                            start,
+                            bytes: Bytes::from(kept),
+                        };
                     }
-                },
+                }
                 Ok(Frame::Closed { reason, .. }) => return Err(RelayError::Refused(reason)),
                 _ => {}
             }
@@ -221,9 +274,17 @@ impl Remote {
         }
     }
 
-    /// Sends typed input. An error is how the relay ends: the link is down.
+    /// Sends typed input, in pieces the owner puts back together. An error is how the relay
+    /// ends: the link is down.
     pub async fn input(&self, bytes: Bytes) -> Result<(), Closed> {
-        self.send(&Frame::Input { bytes: hex(&bytes) }).await
+        for (piece, last) in pieces(&bytes) {
+            self.send(&Frame::Input {
+                bytes: hex(piece),
+                last,
+            })
+            .await?;
+        }
+        Ok(())
     }
 
     pub async fn resize(&self, cols: u16, rows: u16) -> Result<(), Closed> {
@@ -244,50 +305,48 @@ impl Remote {
 /// are each answered with a close that says why.
 pub(super) async fn serve(inner: &Inner, machine: MachineId, terminal: TerminalId, conn: Conn) {
     let Conn { send, mut recv } = conn;
-    let closed = |code, reason: String| Frame::Closed { code, reason };
+    let failed = |reason: String| Closed {
+        code: FAILED,
+        reason,
+    };
     if machine == inner.me || !listed(inner, machine).await {
         tracing::warn!("sync: refused a relay from {machine}: not a peer of this machine");
         let reason = format!("machine {machine} is not a peer of this machine");
-        send_text(&send, &closed(FAILED, reason)).await;
-        return;
+        return finish(&send, &mut recv, failed(reason)).await;
     }
     let Some(terminals) = lock(&inner.terminals).clone() else {
         let reason = "this machine serves no terminals".to_owned();
-        send_text(&send, &closed(FAILED, reason)).await;
-        return;
+        return finish(&send, &mut recv, failed(reason)).await;
     };
     let (snapshot, mut output) = match terminals.attach(terminal).await {
         Ok(attached) => attached,
-        Err(error) => {
-            send_text(&send, &closed(code(&error), error.to_string())).await;
+        Err(error) => return finish(&send, &mut recv, Closed::of(&error)).await,
+    };
+    for (piece, last) in pieces(&snapshot.bytes) {
+        let frame = Frame::Snapshot {
+            start: snapshot.start,
+            bytes: hex(piece),
+            last,
+        };
+        if !send_text(&send, &frame).await {
             return;
         }
-    };
-    let first = Frame::Snapshot {
-        start: snapshot.start,
-        bytes: hex(&snapshot.bytes),
-    };
-    if !send_text(&send, &first).await {
-        return;
     }
     let _beat = beat(send.clone());
     let mut heard = Instant::now();
+    let mut typed = Vec::new();
     loop {
         tokio::select! {
             item = output.next() => {
-                let frame = match item {
-                    Some(Ok(bytes)) => Frame::Output { bytes: hex(&bytes) },
-                    None => {
-                        send_text(&send, &closed(EXITED, "exited".to_owned())).await;
-                        return;
-                    }
-                    Some(Err(error)) => {
-                        send_text(&send, &closed(code(&error), error.to_string())).await;
-                        return;
-                    }
+                let bytes = match item {
+                    Some(Ok(bytes)) => bytes,
+                    None => return finish(&send, &mut recv, Closed::exited()).await,
+                    Some(Err(error)) => return finish(&send, &mut recv, Closed::of(&error)).await,
                 };
-                if !send_text(&send, &frame).await {
-                    return;
+                for (piece, _) in pieces(&bytes) {
+                    if !send_text(&send, &Frame::Output { bytes: hex(piece) }).await {
+                        return;
+                    }
                 }
             }
             text = timeout_at(heard + OFFLINE_AFTER, recv.recv()) => {
@@ -297,14 +356,18 @@ pub(super) async fn serve(inner: &Inner, machine: MachineId, terminal: TerminalI
                 };
                 heard = Instant::now();
                 let done = match serde_json::from_str(&text) {
-                    Ok(Frame::Input { bytes }) => match unhex(&bytes) {
-                        Some(bytes) => terminals.input(terminal, bytes).await,
-                        None => {
+                    Ok(Frame::Input { bytes, last }) => {
+                        let Some(bytes) = unhex(&bytes).filter(|b| typed.len() + b.len() <= MOST)
+                        else {
                             let reason = format!("{machine} sent input that cannot be read");
-                            send_text(&send, &closed(FAILED, reason)).await;
-                            return;
+                            return finish(&send, &mut recv, failed(reason)).await;
+                        };
+                        typed.extend_from_slice(&bytes);
+                        if !last {
+                            continue;
                         }
-                    },
+                        terminals.input(terminal, Bytes::from(std::mem::take(&mut typed))).await
+                    }
                     Ok(Frame::Resize { cols, rows }) => terminals.resize(terminal, cols, rows).await,
                     // A beat, or a frame this build does not know.
                     _ => Ok(()),
@@ -316,21 +379,26 @@ pub(super) async fn serve(inner: &Inner, machine: MachineId, terminal: TerminalI
                             return;
                         }
                     }
-                    Err(error) => {
-                        send_text(&send, &closed(FAILED, error.to_string())).await;
-                        return;
-                    }
+                    Err(error) => return finish(&send, &mut recv, Closed::of(&error)).await,
                 }
             }
         }
     }
 }
 
-/// The close code for a terminal error: attach again after the holder cut the client off.
-fn code(error: &TerminalError) -> u16 {
-    match error {
-        TerminalError::Detached(_) => AGAIN,
-        _ => FAILED,
+/// Sends the close that ends a relay, then waits, at most [`OFFLINE_AFTER`], for the opener to
+/// close the link. Returning at once would let a keyed link's forwarder, or the WebSocket under
+/// it, be dropped with the close still queued, and the opener would read a link gone down.
+async fn finish(send: &Sender<String>, recv: &mut Receiver<String>, closed: Closed) {
+    let frame = Frame::Closed {
+        code: closed.code,
+        reason: closed.reason,
+    };
+    if send_text(send, &frame).await {
+        let _ = timeout(OFFLINE_AFTER, async {
+            while recv.recv().await.is_some() {}
+        })
+        .await;
     }
 }
 
@@ -357,13 +425,27 @@ fn beat(send: Sender<String>) -> Task {
     }))
 }
 
-/// Sends `message` as JSON, and says whether the link is still open. A peer that takes
-/// nothing for [`OFFLINE_AFTER`] ends the link.
+/// Sends `message` as JSON, and says whether the link is still open. A message that cannot be
+/// written as JSON is skipped. A peer that takes nothing for [`OFFLINE_AFTER`] ends the link.
 async fn send_text(send: &Sender<String>, message: &impl Serialize) -> bool {
-    let Ok(text) = serde_json::to_string(message) else {
-        return true;
+    let text = match serde_json::to_string(message) {
+        Ok(text) => text,
+        Err(error) => {
+            tracing::warn!("sync: a relay message could not be written: {error}");
+            return true;
+        }
     };
     matches!(timeout(OFFLINE_AFTER, send.send(text)).await, Ok(Ok(())))
+}
+
+/// `bytes` in pieces of at most [`CHUNK`], each with whether it is the last. Empty bytes are
+/// one empty last piece.
+fn pieces(bytes: &[u8]) -> impl Iterator<Item = (&[u8], bool)> {
+    let count = bytes.len().div_ceil(CHUNK).max(1);
+    (0..count).map(move |i| {
+        let end = bytes.len().min((i + 1) * CHUNK);
+        (&bytes[i * CHUNK..end], i + 1 == count)
+    })
 }
 
 const DIGITS: &[u8; 16] = b"0123456789abcdef";
@@ -408,5 +490,43 @@ mod tests {
     fn hex_that_is_odd_or_not_hex_is_refused() {
         assert_eq!(unhex("abc"), None);
         assert_eq!(unhex("zz"), None);
+    }
+
+    /// The holder keeps up to 8 MiB of screen, which as one hex frame would pass the 16 MiB a
+    /// WebSocket frame may hold.
+    #[test]
+    fn a_full_snapshot_goes_in_frames_well_under_a_websockets_limit_and_comes_back_whole() {
+        let screen: Vec<u8> = (0..8 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        let mut back = Vec::new();
+        let mut lasts = Vec::new();
+        for (piece, last) in pieces(&screen) {
+            let frame = Frame::Snapshot {
+                start: 7,
+                bytes: hex(piece),
+                last,
+            };
+            let text = serde_json::to_string(&frame).unwrap();
+            assert!(
+                text.len() < 4 * 1024 * 1024,
+                "a frame of {} bytes",
+                text.len()
+            );
+            back.extend_from_slice(&unhex(&hex(piece)).unwrap());
+            lasts.push(last);
+        }
+        assert_eq!(back, screen);
+        assert_eq!(lasts.iter().filter(|last| **last).count(), 1);
+        assert_eq!(lasts.last(), Some(&true));
+    }
+
+    #[test]
+    fn empty_bytes_are_one_empty_last_piece() {
+        assert_eq!(pieces(b"").collect::<Vec<_>>(), vec![(&b""[..], true)]);
+        assert_eq!(
+            pieces(&[0; CHUNK])
+                .map(|(p, l)| (p.len(), l))
+                .collect::<Vec<_>>(),
+            vec![(CHUNK, true)]
+        );
     }
 }
