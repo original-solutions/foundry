@@ -23,8 +23,10 @@
 //!
 //! - `GET /api/attention`: `{"items": [...]}`, each an [`Item`].
 //! - `POST /api/attention/{id}/dismiss`: dismisses a "setting overwritten" item through the
-//!   coordinator, `204`. Any other item is `409`; an id that names no item is `404`. An edit
-//!   that fails answers with its error, which names no setting's value.
+//!   coordinator, `204` once the dismissal is numbered. Any other item is `409`; an id that
+//!   names no item is `404`. A dismissal the acting coordinator refuses is `502`, and one it
+//!   does not answer in time `504`; a failed one answers with its error, which names no
+//!   setting's value.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -513,9 +515,11 @@ async fn dismiss(State(attention): State<Arc<Attention>>, Path(id): Path<String>
         Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
     match attention.coordinator.edit(Edit::Dismiss { setting }).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
             let status = match e {
+                CoordinatorError::Refused { .. } => StatusCode::BAD_GATEWAY,
+                CoordinatorError::NoAnswer { .. } => StatusCode::GATEWAY_TIMEOUT,
                 CoordinatorError::NotLinked(_)
                 | CoordinatorError::Older { .. }
                 | CoordinatorError::Unsettled { .. } => StatusCode::SERVICE_UNAVAILABLE,

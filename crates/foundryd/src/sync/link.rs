@@ -13,8 +13,11 @@
 //! Once a coordinator is set ([`super::Peers::coordinate`]), each end of a link that speaks
 //! [`EDITS_SINCE`] or later sends the shared settings it holds first after the hellos, before
 //! any record, and again whenever their `seq` changes; a machine is therefore never heard from
-//! on such a link before its settings are taken. Settings and edits a link receives go to the coordinator, which merges them;
-//! with none set they are ignored.
+//! on such a link before its settings are taken. Settings and edits a link receives go to the
+//! coordinator, which merges them or numbers the edit, and an answer to an edit this machine
+//! sent goes to the coordinator that waits for it; with none set they are ignored. A link in
+//! protocol 4 or later ([`foundry_proto::messages::ANSWERS_SINCE`]) carries an edit's id and its
+//! answer; an older one carries neither.
 
 use foundry_proto::ids::MachineId;
 use foundry_proto::messages::{EDITS_SINCE, PROTOCOL, PeerMessage};
@@ -119,8 +122,8 @@ async fn send_settings(
 /// for [`RETRY_REFUSED`], then ends, so the next link's hello asks again for everything past
 /// that prefix: a passing store error clears then, and a record this build can never take is
 /// resent once per link rather than once a second. Shared settings and edits do not depend on
-/// records, so a refused link still takes them: the peer has already been told an edit was
-/// sent.
+/// records, so a refused link still takes them: an edit is answered, and the peer has already
+/// been told one was sent.
 async fn reading(inner: &Inner, recv: &mut Receiver<String>, peer: MachineId) {
     let mut refused: Option<Instant> = None;
     loop {
@@ -134,8 +137,11 @@ async fn reading(inner: &Inner, recv: &mut Receiver<String>, peer: MachineId) {
         };
         if let Some(at) = refused {
             // Taken before the link closes, so the message that closes it is not lost.
-            if let Ok(message @ (PeerMessage::Settings { .. } | PeerMessage::Edit { .. })) =
-                serde_json::from_str::<PeerMessage>(&text)
+            if let Ok(
+                message @ (PeerMessage::Settings { .. }
+                | PeerMessage::Edit { .. }
+                | PeerMessage::Answer { .. }),
+            ) = serde_json::from_str::<PeerMessage>(&text)
                 && let Err(error) = take(inner, peer, message).await
             {
                 tracing::warn!("sync: {error}");
@@ -328,8 +334,8 @@ pub(super) async fn send_text(send: &Sender<String>, text: String) -> bool {
 /// A message that cannot be read, or a record that cannot be stored, is an error, and nothing
 /// after it is taken: the store then holds a prefix of the peer's records.
 ///
-/// Shared settings are merged by the coordinator, and an edit handed to it to number or pass
-/// on; with no coordinator set both are ignored.
+/// Shared settings are merged by the coordinator, an edit is handed to it to number or pass
+/// on, and an answer to the edit it waits on; with no coordinator set all three are ignored.
 async fn receive(inner: &Inner, peer: MachineId, text: &str) -> Result<(), String> {
     match serde_json::from_str::<PeerMessage>(text) {
         Ok(message) => take(inner, peer, message).await,
@@ -350,9 +356,15 @@ async fn take(inner: &Inner, peer: MachineId, message: PeerMessage) -> Result<()
             }
             return Ok(());
         }
-        PeerMessage::Edit { edit, .. } => {
+        PeerMessage::Edit { id, edit, .. } => {
             if let Some(coordinator) = inner.coordinator() {
-                coordinator.take_edit(peer, edit);
+                coordinator.take_edit(peer, id, edit);
+            }
+            return Ok(());
+        }
+        PeerMessage::Answer { id, outcome, .. } => {
+            if let Some(coordinator) = inner.coordinator() {
+                coordinator.take_answer(id, outcome);
             }
             return Ok(());
         }
