@@ -119,7 +119,8 @@ pub trait Dialer: Send + Sync + 'static {
 pub enum Unsent {
     /// No link to the machine is open.
     NotLinked,
-    /// The open links to the machine speak this protocol, older than [`ANSWERS_SINCE`].
+    /// The open links to the machine speak this protocol, older than the edit needs: see
+    /// [`Peers::send_edit`].
     Older(u16),
     /// The edit cannot be written as JSON.
     Unwritable(serde_json::Error),
@@ -246,28 +247,35 @@ impl Peers {
         *lock(&self.inner.coordinator) = Some(Arc::downgrade(&coordinator));
     }
 
-    /// Sends `edit` to `machine` under `id` on an open record link that speaks
-    /// [`ANSWERS_SINCE`] or later, in that link's protocol, and returns the number of the link
-    /// it went on. It says why when no link took it.
+    /// Sends `edit` to `machine` on an open record link, in that link's protocol, and returns the
+    /// number of the link it went on. With an `id` it goes only on a link that speaks
+    /// [`ANSWERS_SINCE`] or later, which carries the id and its answer. With none, which is how an
+    /// edit that reached this machine from an older one is passed on, it goes on a link that
+    /// speaks [`EDITS_SINCE`] or later, and is never answered. It says why when no link took it.
     pub async fn send_edit(
         &self,
         machine: MachineId,
-        id: EditId,
+        id: Option<EditId>,
         edit: &Edit,
     ) -> Result<u64, Unsent> {
+        let since = if id.is_some() {
+            ANSWERS_SINCE
+        } else {
+            EDITS_SINCE
+        };
         let links: Vec<(u64, Link)> = lock(&self.inner.links)
             .get(&machine)
             .map(|open| open.iter().map(|(n, link)| (*n, link.clone())).collect())
             .unwrap_or_default();
         let mut unsent = Unsent::NotLinked;
         for (number, Link { speak, send }) in links {
-            if speak < ANSWERS_SINCE {
+            if speak < since {
                 unsent = Unsent::Older(speak);
                 continue;
             }
             let message = PeerMessage::Edit {
                 protocol: speak,
-                id: Some(id),
+                id,
                 edit: edit.clone(),
             };
             let text = serde_json::to_string(&message).map_err(Unsent::Unwritable)?;

@@ -52,7 +52,7 @@ pub(super) async fn run(
     let _opened = inner.opened(open.peer, open.speak, send.clone());
     tokio::select! {
         () = sending(inner, &send, &open) => {}
-        () = reading(inner, &mut recv, open.peer) => {}
+        () = reading(inner, &mut recv, open.peer, open.speak) => {}
     }
 }
 
@@ -121,10 +121,10 @@ async fn send_settings(
 /// arrive in version order, so the store keeps a prefix and loses nothing. The link stays open
 /// for [`RETRY_REFUSED`], then ends, so the next link's hello asks again for everything past
 /// that prefix: a passing store error clears then, and a record this build can never take is
-/// resent once per link rather than once a second. Shared settings and edits do not depend on
-/// records, so a refused link still takes them: an edit is answered, and the peer has already
-/// been told one was sent.
-async fn reading(inner: &Inner, recv: &mut Receiver<String>, peer: MachineId) {
+/// resent once per link rather than once a second. Shared settings, edits and answers do not
+/// depend on records, so a refused link still takes them: an edit sent on it is still numbered,
+/// and the answer to one still arrives.
+async fn reading(inner: &Inner, recv: &mut Receiver<String>, peer: MachineId, speak: u16) {
     let mut refused: Option<Instant> = None;
     loop {
         let text = match timeout(OFFLINE_AFTER, recv.recv()).await {
@@ -142,7 +142,7 @@ async fn reading(inner: &Inner, recv: &mut Receiver<String>, peer: MachineId) {
                 | PeerMessage::Edit { .. }
                 | PeerMessage::Answer { .. }),
             ) = serde_json::from_str::<PeerMessage>(&text)
-                && let Err(error) = take(inner, peer, message).await
+                && let Err(error) = take(inner, peer, speak, message).await
             {
                 tracing::warn!("sync: {error}");
             }
@@ -152,7 +152,7 @@ async fn reading(inner: &Inner, recv: &mut Receiver<String>, peer: MachineId) {
             }
             continue;
         }
-        match receive(inner, peer, &text).await {
+        match receive(inner, peer, speak, &text).await {
             Ok(()) => inner.heard_from(peer),
             Err(error) => {
                 tracing::warn!(
@@ -336,21 +336,27 @@ pub(super) async fn send_text(send: &Sender<String>, text: String) -> bool {
 ///
 /// Shared settings are merged by the coordinator, an edit is handed to it to number or pass
 /// on, and an answer to the edit it waits on; with no coordinator set all three are ignored.
-async fn receive(inner: &Inner, peer: MachineId, text: &str) -> Result<(), String> {
+async fn receive(inner: &Inner, peer: MachineId, speak: u16, text: &str) -> Result<(), String> {
     match serde_json::from_str::<PeerMessage>(text) {
-        Ok(message) => take(inner, peer, message).await,
+        Ok(message) => take(inner, peer, speak, message).await,
         Err(error) => Err(format!("a message from {peer} could not be read: {error}")),
     }
 }
 
-/// Takes one message from `peer`, as [`receive`] says.
-async fn take(inner: &Inner, peer: MachineId, message: PeerMessage) -> Result<(), String> {
+/// Takes one message from `peer`, which sent it on a link in protocol `speak`, as [`receive`]
+/// says.
+async fn take(
+    inner: &Inner,
+    peer: MachineId,
+    speak: u16,
+    message: PeerMessage,
+) -> Result<(), String> {
     let records = match message {
         PeerMessage::Records { records, .. } => records,
         PeerMessage::Settings { settings, .. } => {
             if let Some(coordinator) = inner.coordinator() {
                 coordinator
-                    .take_settings(peer, settings)
+                    .take_settings(peer, speak, settings)
                     .await
                     .map_err(|error| format!("settings from {peer} not stored: {error}"))?;
             }
