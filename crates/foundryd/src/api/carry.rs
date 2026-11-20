@@ -99,25 +99,6 @@ pub(super) async fn carry(State(api): State<Api>, request: Request, next: Next) 
     }
 }
 
-/// `POST`s `body` as JSON to `path` on machine `owner`, and gives its answer as the layer gives
-/// a call it carries.
-pub(super) async fn carried(
-    api: &Api,
-    owner: MachineId,
-    path: &str,
-    body: &serde_json::Value,
-) -> Response {
-    let body = body.to_string();
-    match api
-        .peers
-        .call(owner, path, Some("application/json"), body.as_bytes())
-        .await
-    {
-        Ok(answer) => answered(answer),
-        Err(refused) => not_carried(&refused),
-    }
-}
-
 /// `answer` with `warning` beside its fields, when it is a `201` with a JSON object.
 fn warned(answer: Answer, warning: Option<String>) -> Answer {
     let Some(warning) = warning.filter(|_| answer.status == 201) else {
@@ -178,7 +159,7 @@ fn answered(answer: Answer) -> Response {
 }
 
 /// The answer to a call that its owner did not answer.
-fn not_carried(refused: &CallError) -> Response {
+pub(super) fn not_carried(refused: &CallError) -> Response {
     let status = match refused {
         CallError::NotListed(_) => StatusCode::NOT_FOUND,
         CallError::Offline(_) | CallError::Older(_) | CallError::Down(_) => {

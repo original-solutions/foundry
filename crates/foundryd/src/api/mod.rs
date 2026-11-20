@@ -78,7 +78,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use foundry_proto::ids::{MachineId, ProjectId, TerminalId, WorkspaceId};
+use foundry_proto::ids::{MachineId, ProjectId, SessionId, TerminalId, WorkspaceId};
 use foundry_proto::messages::{PROTOCOL, UiMessage};
 use foundry_proto::settings::{SettingValue, SharedSettings};
 use serde::Deserialize;
@@ -89,6 +89,7 @@ use crate::secrets::redact;
 use crate::sessions::{SessionError, Sessions};
 use crate::store::{Store, StoreError};
 use crate::sync::Peers;
+use crate::sync::call::CallError;
 use crate::terminals::{TerminalError, Terminals};
 use crate::workspaces::{WorkspaceError, Workspaces};
 
@@ -748,12 +749,18 @@ async fn choose(api: &Api, create: Create) -> Result<Response, ApiError> {
     if !settings.projects.iter().any(|p| p.id == create.project) {
         return Err(WorkspaceError::UnknownProject(create.project).into());
     }
-    match api.placements.pick(api).await? {
-        Ok(machine) => {
-            let (status, mut answer) =
-                create_on(api, machine, create.project, &create.base, &create.name).await;
+    let placements = Arc::clone(&api.placements);
+    match placements
+        .create(api, create.project, &create.base, &create.name)
+        .await?
+    {
+        Ok(sent) => {
+            let (status, mut answer) = match sent.answer {
+                Ok(answer) => answer,
+                Err(lost) => read(carry::not_carried(&lost)).await,
+            };
             if let Some(fields) = answer.as_object_mut() {
-                fields.insert("machine".to_owned(), serde_json::json!(machine));
+                fields.insert("machine".to_owned(), serde_json::json!(sent.machine));
             }
             Ok((status, Json(answer)).into_response())
         }
@@ -776,49 +783,73 @@ async fn choose(api: &Api, create: Create) -> Result<Response, ApiError> {
 }
 
 /// Makes a workspace on `machine`: here, or carried there as a create naming it is. Gives the
-/// status and body answered.
+/// status and body answered, or why the call was not answered.
 pub(crate) async fn create_on(
     api: &Api,
     machine: MachineId,
     project: ProjectId,
     base: &str,
     name: &str,
-) -> (StatusCode, serde_json::Value) {
+) -> Result<(StatusCode, serde_json::Value), CallError> {
     if machine == api.peers.me() {
-        return match create_here(api, project, base, name).await {
+        return Ok(match create_here(api, project, base, name).await {
             Ok(answer) => answer,
             Err(e) => read(e.into_response()).await,
-        };
+        });
     }
     let body =
         serde_json::json!({"project": project, "base": base, "name": name, "machine": machine});
-    read(carry::carried(api, machine, "/api/workspaces", &body).await).await
+    call_on(api, machine, "/api/workspaces", &body).await
 }
 
 /// Starts a session with `model` and `prompt` in `machine`'s workspace `workspace`: here, or
-/// carried there. Gives the status and body answered.
+/// carried there. Gives the status and body answered, or why the call was not answered.
 pub(crate) async fn start_on(
     api: &Api,
     machine: MachineId,
     workspace: WorkspaceId,
     model: &str,
     prompt: Option<&str>,
-) -> (StatusCode, serde_json::Value) {
-    let start = Start {
-        model: model.to_owned(),
-        prompt: prompt.map(str::to_owned),
-    };
+) -> Result<(StatusCode, serde_json::Value), CallError> {
     if machine == api.peers.me() {
-        let started =
-            start_session(State(api.clone()), Path(workspace.to_string()), Body(start)).await;
-        return read(started.into_response()).await;
+        if let Some(said) = &api.sessions_refused {
+            return Ok((
+                StatusCode::SERVICE_UNAVAILABLE,
+                serde_json::json!({ "error": said }),
+            ));
+        }
+        let started = start_here(api, workspace, model.to_owned(), prompt.map(str::to_owned));
+        return Ok(match started.await {
+            Ok(session) => (
+                StatusCode::CREATED,
+                serde_json::json!({ "id": session.to_string() }),
+            ),
+            Err(e) => read(e.into_response()).await,
+        });
     }
     let path = format!("/api/workspaces/{workspace}/sessions");
-    let body = match start.prompt {
-        Some(prompt) => serde_json::json!({"model": start.model, "prompt": prompt}),
-        None => serde_json::json!({"model": start.model}),
+    let body = match prompt {
+        Some(prompt) => serde_json::json!({"model": model, "prompt": prompt}),
+        None => serde_json::json!({"model": model}),
     };
-    read(carry::carried(api, machine, &path, &body).await).await
+    call_on(api, machine, &path, &body).await
+}
+
+/// `POST`s `body` as JSON to `path` on machine `owner`, as the carry layer does.
+async fn call_on(
+    api: &Api,
+    owner: MachineId,
+    path: &str,
+    body: &serde_json::Value,
+) -> Result<(StatusCode, serde_json::Value), CallError> {
+    let body = body.to_string();
+    let answer = api
+        .peers
+        .call(owner, path, Some("application/json"), body.as_bytes())
+        .await?;
+    let status = StatusCode::from_u16(answer.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    let answer = serde_json::from_slice(&answer.body).unwrap_or(serde_json::Value::Null);
+    Ok((status, answer))
 }
 
 /// A response's status and its body as JSON, `null` when it has none.
@@ -899,19 +930,27 @@ async fn start_session(
     }
     let id = parse_id(&id, "workspace", WorkspaceId)?;
     check_prompt(start.prompt.as_deref())?;
+    let session = start_here(&api, id, start.model, start.prompt).await?;
+    Ok(created(session))
+}
+
+/// Starts Claude Code with `model` and `prompt` in workspace `id` of this machine.
+async fn start_here(
+    api: &Api,
+    id: WorkspaceId,
+    model: String,
+    prompt: Option<String>,
+) -> Result<SessionId, ApiError> {
     let sessions = Arc::clone(&api.sessions);
-    let session = api
-        .workspaces
+    api.workspaces
         .start_in(id, move |worktree| async move {
-            let prompt = start.prompt.as_deref();
             Ok::<_, ApiError>(
                 sessions
-                    .start_with(id, &worktree, &start.model, prompt)
+                    .start_with(id, &worktree, &model, prompt.as_deref())
                     .await?,
             )
         })
-        .await?;
-    Ok(created(session))
+        .await
 }
 
 /// The shell a new terminal runs: the daemon's `$SHELL`, else `/bin/sh`, as a login shell.

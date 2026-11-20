@@ -18,9 +18,14 @@
 //! - `POST /api/placements/{id}/cancel`: `204`, and the request is never placed. One being
 //!   placed now is `409`; an id this machine holds no request for is `404`.
 //!
-//! A request waiting longer than [`WAITING_ALERT_AFTER`] raises a "placement waiting" attention
-//! item, through this queue's [`Source`]. The item clears once the request is placed or
-//! cancelled.
+//! A machine just sent a create takes no other until its next sample, which counts the new
+//! session; one that cannot take the call (offline, older, its link down) is passed over the
+//! same way, and the next roomiest is tried.
+//!
+//! A placement whose create or session start fails stays listed with its error and is not tried
+//! again; cancelling it dismisses it. A request held longer than [`WAITING_ALERT_AFTER`], waiting
+//! or failed, raises a "placement waiting" attention item, through this queue's [`Source`]. The
+//! item clears once the request is placed or cancelled.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -41,6 +46,7 @@ use crate::api::{self, Api};
 use crate::attention::{Fleet, Item, Kind, Source};
 use crate::machine::{self, Over, over_limits};
 use crate::store::{Store, StoreError};
+use crate::sync::call::CallError;
 use crate::sync::{lock, on_store};
 
 /// How often the waiting requests are tried again. A machine samples every 5 seconds, so a
@@ -162,8 +168,8 @@ pub struct Want {
 pub enum Outcome {
     /// The workspace was made and its session started.
     Placed,
-    /// The picked machine could not be reached and nothing was sent: the request waits again.
-    Retry,
+    /// No machine took it: the request waits again, with new reasons when there are any.
+    Wait(Option<Vec<String>>),
     /// The create or the session start failed, saying why. The request stays listed with it,
     /// and is not tried again.
     Failed(String),
@@ -239,7 +245,8 @@ impl Samples {
                     }
                 }
                 // A record this build cannot read, one a newer build wrote before a rollback,
-                // skips that owner's records up to it, as the attention list does.
+                // is passed over with that owner's other records up to the newest held; the
+                // owner's next sample is read as usual.
                 Err(error @ StoreError::Json(_)) => {
                     tracing::warn!("placement: records of {owner} not read: {error}");
                 }
@@ -251,11 +258,21 @@ impl Samples {
     }
 }
 
-/// What a pick reads: each machine's newest sample, the settings and who is online.
+/// A machine left out of picks until a sample newer than `version` arrives: it was just given
+/// a create its sample does not count yet, or it could not take the call, saying `why`.
+struct Bench {
+    version: u64,
+    why: Option<String>,
+}
+
+/// What a pick reads: each machine's newest sample, the settings, who is online, and the
+/// machines left out until their next sample.
 struct View {
     samples: Vec<Record<MachineSample>>,
     settings: SharedSettings,
     online: BTreeSet<MachineId>,
+    /// Each benched machine and why, as a reason's text after its name.
+    benched: BTreeMap<MachineId, String>,
 }
 
 impl View {
@@ -267,11 +284,54 @@ impl View {
             .map_or_else(|| machine.to_string(), |m| m.name.clone())
     }
 
+    /// The samples of the machines a pick may take.
+    fn candidates(&self) -> Vec<Record<MachineSample>> {
+        self.samples
+            .iter()
+            .filter(|s| !self.benched.contains_key(&s.owner))
+            .cloned()
+            .collect()
+    }
+
+    fn version(&self, machine: MachineId) -> u64 {
+        self.samples
+            .iter()
+            .find(|s| s.owner == machine)
+            .map_or(0, |s| s.version)
+    }
+
+    /// Each reason, then each benched machine's, as the UI shows them.
     fn texts(&self, reasons: &[Reason]) -> Vec<String> {
+        let benched = self
+            .benched
+            .iter()
+            .map(|(machine, why)| format!("{}: {why}", self.name(*machine)));
         reasons
             .iter()
             .map(|reason| reason.text(&self.name(reason.machine)))
+            .chain(benched)
             .collect()
+    }
+}
+
+/// A create sent to the machine picked for it, and what that machine answered.
+pub(crate) struct Sent {
+    pub machine: MachineId,
+    /// The machine's name, for messages.
+    pub name: String,
+    pub answer: Result<(StatusCode, serde_json::Value), CallError>,
+}
+
+/// What a reason says of a machine that refused a call before it was sent, or `None` when the
+/// call may have run there.
+fn unreachable(refused: &CallError) -> Option<String> {
+    match refused {
+        CallError::Lost(_) => None,
+        CallError::NotListed(_) => Some("not in the machine list".to_owned()),
+        CallError::Offline(_) => Some("offline".to_owned()),
+        CallError::Older(_) => Some("runs an older Foundry, which cannot take a create".to_owned()),
+        CallError::Down(_) => Some("its link is down".to_owned()),
+        CallError::Refused(reason) => Some(format!("refused the call: {reason}")),
     }
 }
 
@@ -280,6 +340,7 @@ pub struct Queue {
     me: MachineId,
     requests: Mutex<Vec<Request>>,
     samples: Arc<Mutex<Samples>>,
+    benched: Mutex<BTreeMap<MachineId, Bench>>,
 }
 
 impl Queue {
@@ -288,16 +349,46 @@ impl Queue {
             me,
             requests: Mutex::default(),
             samples: Arc::default(),
+            benched: Mutex::default(),
         }
     }
 
-    /// Picks a machine now, or gives the reasons none fits as the UI shows them.
-    pub(crate) async fn pick(
+    /// Sends a create of `name` from `base` in `project` to the roomiest machine that takes the
+    /// call, or gives the reasons no machine qualifies, as the UI shows them. A machine that
+    /// refuses the call before it is sent is benched and the next is tried; the machine sent
+    /// the create is benched too, as its sample does not count the new workspace's session yet.
+    pub(crate) async fn create(
         &self,
         api: &Api,
-    ) -> Result<Result<MachineId, Vec<String>>, StoreError> {
-        let view = self.view(api).await?;
-        Ok(place(&view.samples, &view.settings.limits, &view.online).map_err(|r| view.texts(&r)))
+        project: ProjectId,
+        base: &str,
+        name: &str,
+    ) -> Result<Result<Sent, Vec<String>>, StoreError> {
+        // Each machine is tried once per call, even when a new sample takes it off the bench.
+        let mut tried = BTreeSet::new();
+        loop {
+            let view = self.view(api).await?;
+            let mut candidates = view.candidates();
+            candidates.retain(|s| !tried.contains(&s.owner));
+            let machine = match place(&candidates, &view.settings.limits, &view.online) {
+                Ok(machine) => machine,
+                Err(reasons) => return Ok(Err(view.texts(&reasons))),
+            };
+            tried.insert(machine);
+            let version = view.version(machine);
+            let answer = api::create_on(api, machine, project, base, name).await;
+            let why = answer.as_ref().err().and_then(unreachable);
+            let refused = why.is_some();
+            lock(&self.benched).insert(machine, Bench { version, why });
+            // Benched, so the next pass picks another machine or gives the reasons.
+            if !refused {
+                return Ok(Ok(Sent {
+                    machine,
+                    name: view.name(machine),
+                    answer,
+                }));
+            }
+        }
     }
 
     /// What to warn of when a person names `machine` for a workspace: each limit its newest
@@ -333,7 +424,8 @@ impl Queue {
     }
 
     /// Each listed machine's newest sample, in the list's order, and this machine's when it is
-    /// not listed; only the records written since the last read are loaded.
+    /// not listed; only the records written since the last read are loaded. A benched machine
+    /// whose newest sample is newer than its bench is benched no longer.
     async fn view(&self, api: &Api) -> Result<View, StoreError> {
         let online = api.peers.online();
         let samples = Arc::clone(&self.samples);
@@ -347,11 +439,30 @@ impl Queue {
         if !order.contains(&self.me) {
             order.push(self.me);
         }
-        let samples = order.iter().filter_map(|id| newest.remove(id)).collect();
+        let samples: Vec<Record<MachineSample>> =
+            order.iter().filter_map(|id| newest.remove(id)).collect();
+        let mut benched = lock(&self.benched);
+        benched.retain(|machine, bench| {
+            samples
+                .iter()
+                .find(|s| s.owner == *machine)
+                .is_some_and(|s| s.version <= bench.version)
+        });
+        let benched = benched
+            .iter()
+            .map(|(machine, bench)| {
+                let why = bench
+                    .why
+                    .clone()
+                    .unwrap_or_else(|| "given a workspace since its last sample".to_owned());
+                (*machine, why)
+            })
+            .collect();
         Ok(View {
             samples,
             settings,
             online,
+            benched,
         })
     }
 
@@ -415,10 +526,15 @@ impl Queue {
     pub fn drop_all(&self) -> usize {
         let dropped = std::mem::take(&mut *lock(&self.requests));
         for request in &dropped {
-            tracing::warn!(
-                "placement: the daemon stops, so the request for {} is dropped",
-                request.want.name
-            );
+            let name = &request.want.name;
+            if request.phase == Phase::Placing {
+                tracing::warn!(
+                    "placement: the daemon stops while {name} is being placed; its workspace \
+                     may exist without its session"
+                );
+            } else {
+                tracing::warn!("placement: the daemon stops, so the request for {name} is dropped");
+            }
         }
         dropped.len()
     }
@@ -453,7 +569,13 @@ impl Queue {
             Outcome::Placed => {
                 requests.remove(at);
             }
-            Outcome::Retry => requests[at].phase = Phase::Waiting,
+            Outcome::Wait(reasons) => {
+                let request = &mut requests[at];
+                request.phase = Phase::Waiting;
+                if let Some(reasons) = reasons {
+                    request.reasons = reasons;
+                }
+            }
             Outcome::Failed(error) => {
                 tracing::warn!("placement: {error}");
                 let request = &mut requests[at];
@@ -463,70 +585,78 @@ impl Queue {
         }
     }
 
-    fn set_reasons(&self, id: Uuid, reasons: Vec<String>) {
-        if let Some(request) = lock(&self.requests)
-            .iter_mut()
-            .find(|r| r.id == id && r.phase == Phase::Waiting)
-        {
-            request.reasons = reasons;
-        }
-    }
-
     /// Tries each waiting request once, in the order they came.
     async fn retry(&self, api: &Api) -> Result<(), StoreError> {
-        let mut view = self.view(api).await?;
         for id in self.waiting() {
-            match place(&view.samples, &view.settings.limits, &view.online) {
-                Err(reasons) => self.set_reasons(id, view.texts(&reasons)),
-                Ok(machine) => {
-                    let Some(want) = self.begin(id) else {
-                        continue;
-                    };
-                    let name = view.name(machine);
-                    tracing::info!("placement: placing {} on {name}", want.name);
-                    let outcome = make(api, machine, &name, &want).await;
-                    if matches!(outcome, Outcome::Placed) {
-                        tracing::info!("placement: {} is placed on {name}", want.name);
-                    }
-                    self.finish(id, outcome);
-                    // Its sample does not count the new session yet, so it takes no other
-                    // request until its next one.
-                    view.samples.retain(|s| s.owner != machine);
+            let Some(want) = self.begin(id) else {
+                continue;
+            };
+            let sent = match self.create(api, want.project, &want.base, &want.name).await {
+                Ok(sent) => sent,
+                Err(error) => {
+                    self.finish(id, Outcome::Wait(None));
+                    return Err(error);
                 }
-            }
+            };
+            let outcome = match sent {
+                Err(reasons) => Outcome::Wait(Some(reasons)),
+                Ok(sent) => {
+                    let outcome = start(api, &want, sent).await;
+                    if matches!(outcome, Outcome::Placed) {
+                        tracing::info!("placement: {} is placed", want.name);
+                    }
+                    outcome
+                }
+            };
+            self.finish(id, outcome);
         }
         Ok(())
     }
 }
 
-/// Makes `want` on `machine`, named `name`: the workspace, then its session.
-async fn make(api: &Api, machine: MachineId, name: &str, want: &Want) -> Outcome {
-    let (status, made) = api::create_on(api, machine, want.project, &want.base, &want.name).await;
-    // A call refused before it was sent changed nothing there, so the request can wait again.
-    if status == StatusCode::SERVICE_UNAVAILABLE {
-        return Outcome::Retry;
-    }
-    let workspace = made["id"]
+/// Starts `want`'s session in the workspace `sent` made, or says why it was not placed.
+async fn start(api: &Api, want: &Want, sent: Sent) -> Outcome {
+    let Sent {
+        machine,
+        name,
+        answer,
+    } = sent;
+    let made = match answer {
+        Ok((StatusCode::CREATED, made)) => made,
+        Ok((_, refused)) => {
+            return Outcome::Failed(format!(
+                "{} could not be made on {name}: {}",
+                want.name,
+                said(&refused)
+            ));
+        }
+        Err(lost) => {
+            return Outcome::Failed(format!(
+                "{} may have been made on {name}, but no answer came: {lost}",
+                want.name
+            ));
+        }
+    };
+    let Some(workspace) = made["id"]
         .as_str()
         .and_then(|id| id.parse().ok())
-        .map(WorkspaceId);
-    let Some(workspace) = workspace.filter(|_| status == StatusCode::CREATED) else {
+        .map(WorkspaceId)
+    else {
         return Outcome::Failed(format!(
-            "{} could not be made on {name}: {}",
-            want.name,
-            said(&made)
+            "{} was made on {name}, but its id could not be read",
+            want.name
         ));
     };
-    let (status, started) =
-        api::start_on(api, machine, workspace, &want.model, want.prompt.as_deref()).await;
-    if status != StatusCode::CREATED {
-        return Outcome::Failed(format!(
-            "{} was made on {name}, but its session did not start: {}",
-            want.name,
-            said(&started)
-        ));
-    }
-    Outcome::Placed
+    let why =
+        match api::start_on(api, machine, workspace, &want.model, want.prompt.as_deref()).await {
+            Ok((StatusCode::CREATED, _)) => return Outcome::Placed,
+            Ok((_, refused)) => said(&refused),
+            Err(refused) => refused.to_string(),
+        };
+    Outcome::Failed(format!(
+        "{} was made on {name}, but its session did not start: {why}",
+        want.name
+    ))
 }
 
 fn said(answer: &serde_json::Value) -> String {
@@ -540,24 +670,28 @@ impl Source for Queue {
     fn items(&self, fleet: &Fleet) -> Vec<Item> {
         lock(&self.requests)
             .iter()
-            .filter(|r| r.phase != Phase::Failed && r.started.elapsed() >= WAITING_ALERT_AFTER)
+            .filter(|r| r.started.elapsed() >= WAITING_ALERT_AFTER)
             .map(|r| {
-                let minutes = r.started.elapsed().as_secs() / 60;
-                let why = if r.reasons.is_empty() {
-                    "no machine has sent a sample".to_owned()
-                } else {
-                    r.reasons.join("; ")
-                };
-                fleet.item(
-                    Kind::PlacementWaiting,
-                    r.id,
-                    self.me,
-                    format!(
-                        "{} has waited {minutes} minutes for a machine: {why}",
-                        r.want.name
+                let name = &r.want.name;
+                let (what, todo) = match &r.error {
+                    Some(error) => (
+                        format!("{name} was not placed: {error}"),
+                        "See to it, then dismiss the request from the waiting list",
                     ),
-                    "Free a machine or raise its limits, or cancel the request".to_owned(),
-                )
+                    None => {
+                        let minutes = r.started.elapsed().as_secs() / 60;
+                        let why = if r.reasons.is_empty() {
+                            "no machine has sent a sample".to_owned()
+                        } else {
+                            r.reasons.join("; ")
+                        };
+                        (
+                            format!("{name} has waited {minutes} minutes for a machine: {why}"),
+                            "Free a machine or raise its limits, or cancel the request",
+                        )
+                    }
+                };
+                fleet.item(Kind::PlacementWaiting, r.id, self.me, what, todo.to_owned())
             })
             .collect()
     }

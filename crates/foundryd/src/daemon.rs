@@ -274,10 +274,13 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
         std::env::var("FOUNDRY_GATEWAY_URL").ok(),
         secrets.clone(),
     ));
-    let attention = Arc::new(
-        Attention::new(me, store.clone(), peers.clone(), coordinator.clone())
-            .with_source(gateway_reader.clone())
-            .with_source(api.placements.clone()),
+    let attention = attention(
+        me,
+        &store,
+        &peers,
+        coordinator.clone(),
+        gateway_reader.clone(),
+        &api.placements,
     );
     let placing = api.clone();
     let attention_routes = attention
@@ -333,6 +336,22 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
     // The requests waiting for a machine live only in memory: a restart drops each, logged.
     placing.placements.drop_all();
     stopped
+}
+
+/// This machine's attention list: the fleet's items, the gateway's and the placement queue's.
+fn attention(
+    me: foundry_proto::ids::MachineId,
+    store: &Arc<Mutex<Store>>,
+    peers: &Peers,
+    coordinator: Arc<crate::coordinator::Coordinator>,
+    gateway: Arc<gateway::Reader>,
+    placements: &Arc<placement::Queue>,
+) -> Arc<Attention> {
+    Arc::new(
+        Attention::new(me, store.clone(), peers.clone(), coordinator)
+            .with_source(gateway)
+            .with_source(placements.clone()),
+    )
 }
 
 /// Runs `service` and names it once it ends, so the daemon can say which one stopped.
