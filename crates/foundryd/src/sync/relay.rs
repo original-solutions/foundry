@@ -157,9 +157,10 @@ impl Peers {
 
     /// Opens terminal `id` of machine `owner` over a relay link: its snapshot, then the
     /// [`Remote`] that carries it. The link is dialed as the record links are, so a machine cut
-    /// off from this one, or one silent past [`OFFLINE_AFTER`], is [`RelayError::Down`]. An
-    /// owner that closes the link without answering, as a build older than relays does, has
-    /// refused it.
+    /// off from this one, or one silent past [`OFFLINE_AFTER`], is [`RelayError::Down`], as is
+    /// a link that closes once the owner has started answering. An owner this machine hears
+    /// from on its record link that closes the link without answering, as a build older than
+    /// relays does, has refused it.
     pub async fn open_terminal(
         &self,
         owner: MachineId,
@@ -191,20 +192,25 @@ impl Peers {
         if !send_text(&send, &open).await {
             return Err(down());
         }
-        // The owner's attach answers within its own limit, which is shorter than this.
-        let deadline = Instant::now() + OFFLINE_AFTER;
+        // The owner's attach answers within its own limit, which is shorter than this, and each
+        // piece of the snapshot gives the next as long again: the limit is on silence, not on
+        // the whole transfer.
+        let mut deadline = Instant::now() + OFFLINE_AFTER;
         let mut kept = Vec::new();
+        let mut answered = false;
         let snapshot = loop {
             let text = match timeout_at(deadline, recv.recv()).await {
                 Ok(Some(text)) => text,
-                Ok(None) => {
+                Ok(None) if !answered && self.online().contains(&owner) => {
                     return Err(RelayError::Refused(format!(
                         "{} closed the relay without answering; it may run an older build",
                         peer.name
                     )));
                 }
-                Err(_) => return Err(down()),
+                Ok(None) | Err(_) => return Err(down()),
             };
+            answered = true;
+            deadline = Instant::now() + OFFLINE_AFTER;
             match serde_json::from_str(&text) {
                 Ok(Frame::Snapshot { start, bytes, last }) => {
                     let Some(bytes) = unhex(&bytes).filter(|b| kept.len() + b.len() <= MOST) else {
