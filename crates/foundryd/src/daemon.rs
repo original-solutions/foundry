@@ -443,11 +443,20 @@ fn new_addresses(
         .collect()
 }
 
-/// The Tailscale CLI: `FOUNDRY_TAILSCALE` when set, which is how tests keep the daemon away
-/// from the real one, else by [`choose_cli`].
+/// The Tailscale CLI, by [`choose_cli`]. In a debug build `FOUNDRY_TAILSCALE` names it, which
+/// is how tests keep the daemon away from the real one. A release build ignores it, so what
+/// the daemon listens on always comes from Tailscale itself.
 fn tailscale_cli() -> PathBuf {
-    choose_cli(std::env::var_os("FOUNDRY_TAILSCALE"), KNOWN_CLIS)
+    cli_for(std::env::var_os("FOUNDRY_TAILSCALE"))
 }
+
+/// The CLI this build asks for a `FOUNDRY_TAILSCALE` value.
+fn cli_for(set: Option<OsString>) -> PathBuf {
+    choose_cli(set, TAILSCALE_OVERRIDE, KNOWN_CLIS)
+}
+
+/// Whether this build takes `FOUNDRY_TAILSCALE`: only a debug build.
+const TAILSCALE_OVERRIDE: bool = cfg!(debug_assertions);
 
 /// Where the Tailscale CLI is when it is not on a service's `PATH`: on macOS inside the app,
 /// which does not put it on `PATH`, then Homebrew's, which launchd's `PATH` leaves out. On
@@ -462,10 +471,10 @@ const KNOWN_CLIS: &[&str] = if cfg!(target_os = "macos") {
     &[]
 };
 
-/// The CLI to ask: `set` when it is not empty, else the first of `known` that is there, else
-/// `tailscale` on `PATH`.
-fn choose_cli(set: Option<OsString>, known: &[&str]) -> PathBuf {
-    if let Some(cli) = set.filter(|cli| !cli.is_empty()) {
+/// The CLI to ask: `set` when `taken` (the build takes the override) and it is not empty,
+/// else the first of `known` that is there, else `tailscale` on `PATH`.
+fn choose_cli(set: Option<OsString>, taken: bool, known: &[&str]) -> PathBuf {
+    if let Some(cli) = set.filter(|cli| taken && !cli.is_empty()) {
         return PathBuf::from(cli);
     }
     known
@@ -1024,7 +1033,10 @@ mod tests {
     #[cfg(debug_assertions)]
     #[test]
     fn this_debug_build_takes_foundry_tailscale() {
-        assert!(TAILSCALE_OVERRIDE);
+        assert_eq!(
+            cli_for(os("/opt/fake/tailscale")),
+            PathBuf::from("/opt/fake/tailscale")
+        );
     }
 
     /// A release build does not. The gate runs debug builds only; run
@@ -1032,7 +1044,7 @@ mod tests {
     #[cfg(not(debug_assertions))]
     #[test]
     fn this_release_build_ignores_foundry_tailscale() {
-        assert!(!TAILSCALE_OVERRIDE);
+        assert_eq!(cli_for(os("/opt/fake/tailscale")), cli_for(None));
     }
 
     #[test]
