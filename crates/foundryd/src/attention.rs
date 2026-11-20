@@ -516,18 +516,21 @@ async fn dismiss(State(attention): State<Arc<Attention>>, Path(id): Path<String>
     }
     match attention.coordinator.edit(Edit::Dismiss { setting }).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => {
-            let status = match e {
-                CoordinatorError::Refused { .. } => StatusCode::BAD_GATEWAY,
-                CoordinatorError::NoAnswer { .. } => StatusCode::GATEWAY_TIMEOUT,
-                CoordinatorError::NotLinked(_)
-                | CoordinatorError::Older { .. }
-                | CoordinatorError::Unsettled { .. } => StatusCode::SERVICE_UNAVAILABLE,
-                CoordinatorError::Unwritable(_) | CoordinatorError::Store(_) => {
-                    StatusCode::INTERNAL_SERVER_ERROR
-                }
-            };
-            error(status, e.to_string())
+        Err(e) => error(dismissal_status(&e), e.to_string()),
+    }
+}
+
+/// The status a dismissal that failed answers with.
+fn dismissal_status(error: &CoordinatorError) -> StatusCode {
+    match error {
+        CoordinatorError::Refused { .. } => StatusCode::BAD_GATEWAY,
+        // Sent, so it may have been numbered: not the 503 of an edit that changed nothing.
+        CoordinatorError::NoAnswer { .. } => StatusCode::GATEWAY_TIMEOUT,
+        CoordinatorError::NotLinked(_)
+        | CoordinatorError::Older { .. }
+        | CoordinatorError::Unsettled { .. } => StatusCode::SERVICE_UNAVAILABLE,
+        CoordinatorError::Unwritable(_) | CoordinatorError::Store(_) => {
+            StatusCode::INTERNAL_SERVER_ERROR
         }
     }
 }
@@ -554,6 +557,49 @@ mod tests {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     use super::*;
+
+    #[test]
+    fn only_an_edit_that_may_have_been_numbered_is_504_and_a_refusal_is_502() {
+        let id = MachineId::random();
+        let cases = [
+            (CoordinatorError::NotLinked(id), 503),
+            (
+                CoordinatorError::Older {
+                    acting: id,
+                    speaks: 3,
+                },
+                503,
+            ),
+            (
+                CoordinatorError::Unsettled {
+                    from: id,
+                    acting: id,
+                },
+                503,
+            ),
+            (
+                CoordinatorError::Refused {
+                    reason: "no".into(),
+                },
+                502,
+            ),
+            (CoordinatorError::NoAnswer { acting: id }, 504),
+            (
+                CoordinatorError::Unwritable(serde_json::from_str::<u8>("x").unwrap_err()),
+                500,
+            ),
+            (
+                CoordinatorError::Store(StoreError::TooLarge {
+                    what: "x",
+                    value: 1,
+                }),
+                500,
+            ),
+        ];
+        for (error, status) in cases {
+            assert_eq!(dismissal_status(&error).as_u16(), status, "{error}");
+        }
+    }
     use crate::sync::{Conn, Dialer};
 
     const GB: u64 = 1_000_000_000;
