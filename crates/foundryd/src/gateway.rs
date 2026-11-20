@@ -9,12 +9,12 @@
 //!
 //! The key is read from the secret store once and kept. It is read again only while it is not
 //! set, so a key set with `foundryd secret set` counts from the next read, and after the
-//! gateway refuses it, when it is sent again only once it has changed. A store that cannot read it (a denied keychain prompt, say) is not asked
+//! gateway refuses it, when it is sent again once it has changed or after [`RETRY_REFUSED`]. A store that cannot read it (a denied keychain prompt, say) is not asked
 //! again until the daemon restarts, so it never prompts every few seconds. Neither the key nor a
 //! password in the URL reaches an item or a log line.
 
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use tokio::time::MissedTickBehavior;
@@ -24,6 +24,11 @@ use crate::secrets::{GATEWAY_MANAGEMENT, Secrets, SecretsError, redact};
 
 /// How often the gateway is read.
 pub const READ_EVERY: Duration = Duration::from_secs(10);
+
+/// How long a refused key waits before it is sent again unchanged. CLIProxyAPI bans an address
+/// after five refused keys and forgets a refusal after two idle hours, so this never adds up to
+/// a ban, and a gateway fixed to take the key is seen within it.
+pub const RETRY_REFUSED: Duration = Duration::from_secs(3 * 60 * 60);
 
 /// How long the gateway has to answer a read.
 pub const ANSWER_WITHIN: Duration = Duration::from_secs(5);
@@ -141,7 +146,9 @@ pub fn read(url: &str, key: &str) -> Health {
             let status = response.status().as_u16();
             match response.body_mut().read_json::<Refusal>() {
                 Ok(refusal) => {
-                    let reason: String = refusal.error.chars().take(REASON_AT_MOST).collect();
+                    // Hidden before the cut, so a secret across it cannot show in part.
+                    let hidden = redact(&refusal.error).replace(key, "***");
+                    let reason: String = hidden.chars().take(REASON_AT_MOST).collect();
                     format!("it answered {status}: {reason}")
                 }
                 Err(_) => format!("it answered {status}"),
@@ -183,9 +190,13 @@ enum Key {
     /// Not read yet, or not set when last read: read it next time.
     Unread,
     Held(String),
-    /// The gateway refused this key. It is read again each time, and sent again only once it
-    /// has changed, since CLIProxyAPI bans an address after five refused keys.
-    Refused(String),
+    /// The gateway refused this key at `at`. It is read again each time and sent again once it
+    /// has changed, or unchanged after [`RETRY_REFUSED`], since CLIProxyAPI bans an address
+    /// after five refused keys.
+    Refused {
+        key: String,
+        at: Instant,
+    },
     /// The secret store could not read it; not asked again.
     Unreadable,
 }
@@ -195,6 +206,8 @@ pub struct Reader {
     url: Option<String>,
     secrets: Arc<dyn Secrets>,
     key: Mutex<Key>,
+    /// [`RETRY_REFUSED`], shorter in tests.
+    retry_refused: Duration,
     /// `None` until the first read ends.
     health: Mutex<Option<Health>>,
 }
@@ -206,6 +219,7 @@ impl Reader {
             url,
             secrets,
             key: Mutex::new(Key::Unread),
+            retry_refused: RETRY_REFUSED,
             health: Mutex::new(None),
         }
     }
@@ -236,17 +250,21 @@ impl Reader {
         let key = match &*held {
             Key::Held(key) => Ok(Some(key.clone())),
             Key::Unreadable => return Health::KeyUnreadable,
-            Key::Unread | Key::Refused(_) => self.secrets.get(GATEWAY_MANAGEMENT),
+            Key::Unread | Key::Refused { .. } => self.secrets.get(GATEWAY_MANAGEMENT),
         };
-        if let (Key::Refused(refused), Ok(Some(key))) = (&*held, &key)
+        if let (Key::Refused { key: refused, at }, Ok(Some(key))) = (&*held, &key)
             && refused == key
+            && at.elapsed() < self.retry_refused
         {
             return Health::KeyRefused;
         }
         let health = check(self.url.as_deref(), key.as_ref().map(Option::as_deref));
         *held = match (key, &health) {
             (_, Health::KeyUnreadable) => Key::Unreadable,
-            (Ok(Some(key)), Health::KeyRefused) => Key::Refused(key),
+            (Ok(Some(key)), Health::KeyRefused) => Key::Refused {
+                key,
+                at: Instant::now(),
+            },
             (Ok(Some(key)), _) if !key.is_empty() => Key::Held(key),
             _ => Key::Unread,
         };
@@ -310,7 +328,10 @@ impl Source for Reader {
                     "The gateway at {} refused the management key: it answered 401",
                     self.shown_url()
                 ),
-                format!("Run `foundryd secret set {GATEWAY_MANAGEMENT}` with the right key"),
+                format!(
+                    "Run `foundryd secret set {GATEWAY_MANAGEMENT}` with the right key; if the \
+                     gateway was fixed to take this one, restart foundryd"
+                ),
             ),
             Some(Health::Unanswered(why)) => (
                 format!("The gateway at {} does not answer: {why}", self.shown_url()),
