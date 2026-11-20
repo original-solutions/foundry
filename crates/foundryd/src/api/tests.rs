@@ -2265,6 +2265,20 @@ async fn a_carried_create_naming_another_machine_is_refused_and_never_carried_on
             .all(|r| !matches!(r, AnyRecord::Workspace(_)))
     );
 
+    let body = serde_json::json!({"project": project, "base": "main", "name": "unnamed"});
+    let reply = carried(&daemon, "/api/workspaces", Some(body)).await;
+    assert_eq!(
+        reply.status, 421,
+        "a carried create names its owner: {}",
+        reply.body
+    );
+    assert!(
+        daemon
+            .records()
+            .iter()
+            .all(|r| !matches!(r, AnyRecord::Workspace(_)))
+    );
+
     let body = serde_json::json!({"project": project, "base": "main", "name": "here", "machine": daemon.me});
     let reply = carried(&daemon, "/api/workspaces", Some(body)).await;
     assert_eq!(reply.status, 201, "{}", reply.body);

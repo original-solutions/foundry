@@ -297,18 +297,23 @@ fn refusal(status: u16, message: String) -> (u16, Bytes) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_beat_on_a_call_link_reads_as_the_relays_beat_is_written() {
-        let beat: Frame = serde_json::from_str(r#"{"type":"beat"}"#).unwrap();
-        assert!(matches!(beat, Frame::Beat));
+    #[tokio::test]
+    async fn the_beat_the_owner_sends_reads_as_a_call_links_beat() {
+        let (send, mut recv) = tokio::sync::mpsc::channel(4);
+        let _beat = beat(send);
+        let text = recv.recv().await.unwrap();
+        assert!(
+            matches!(serde_json::from_str(&text), Ok(Frame::Beat)),
+            "{text}"
+        );
     }
 
     /// A proxy in the daemon's environment, or a redirect, would take a carried call off
-    /// this machine.
+    /// this machine. The builder starts with a proxy, as one read from the environment would.
     #[test]
     fn the_loopback_call_uses_no_proxy_follows_no_redirect_and_has_a_limit() {
-        let agent = loopback_agent();
-        let config = agent.config();
+        let proxy = ureq::Proxy::new("http://127.0.0.1:9").unwrap();
+        let config = loopback(ureq::Agent::config_builder().proxy(Some(proxy))).build();
         assert!(config.proxy().is_none());
         assert_eq!(config.max_redirects(), 0);
         assert_eq!(config.timeouts().global, Some(CALL_LIMIT));

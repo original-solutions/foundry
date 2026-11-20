@@ -488,7 +488,7 @@ async fn a_call_through_keys_accept_reaches_the_owners_api_and_its_answer_return
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_call_to_a_peer_whose_link_speaks_an_older_protocol_is_refused_before_any_link() {
+async fn a_call_to_a_peer_on_an_older_link_or_on_no_link_is_refused_before_any_link() {
     let old = MachineId::random();
     let fleet = Fleet::start_with(1, &[old]);
     let a = &fleet.daemons[0];
@@ -521,6 +521,19 @@ async fn a_call_to_a_peer_whose_link_speaks_an_older_protocol_is_refused_before_
         other => panic!("not refused as older: {other:?}"),
     }
     drop(near);
+    until(WAIT, "the old peer's link closes", || {
+        a.peers.older().is_empty()
+    })
+    .await;
+    assert!(
+        a.peers.online().contains(&old),
+        "still heard from within the offline limit"
+    );
+    // With no record link open, nothing says the peer can take a call: none is sent.
+    match a.peers.call(old, "/api/workspaces", None, b"{}").await {
+        Err(CallError::Down(name)) => assert_eq!(name, "machine-1"),
+        other => panic!("not refused as down: {other:?}"),
+    }
 }
 
 /// A spawned task that is stopped when this is dropped.
