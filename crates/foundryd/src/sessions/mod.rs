@@ -49,9 +49,6 @@ pub const STUCK_AFTER: Duration = Duration::from_secs(10 * 60);
 /// the exit being read, the exit, a stall or a hook being recorded. Each wait is twice the one
 /// before, up to [`RETRY_AT_MOST`].
 const RETRY_AFTER: Duration = Duration::from_millis(100);
-/// How long after `SessionStart` a first prompt waits when the only sign that Claude Code takes
-/// input came before it, from an earlier screen. The input box draws about 0.2 s after the hook.
-const EARLIER_SIGN_GRACE: Duration = Duration::from_secs(1);
 /// The longest wait between two tries.
 const RETRY_AT_MOST: Duration = Duration::from_secs(10);
 
@@ -601,7 +598,7 @@ async fn follow(
 /// trust prompt, turns bracketed paste on too, and the paste's Enter would answer it, so the
 /// prompt is typed on a sign that comes after `SessionStart`. A sign seen only before it, which
 /// is also what a hook that reaches the daemon after the box's sign looks like, counts
-/// [`EARLIER_SIGN_GRACE`] after `SessionStart`, by when the box is drawn.
+/// [`claude::EARLIER_SIGN_GRACE`] after `SessionStart`, by when the box is drawn.
 struct FirstPrompt {
     /// The keys that type it, until they are sent.
     keys: Option<Bytes>,
@@ -663,7 +660,7 @@ impl FirstPrompt {
             Sign::BeforeStart => {
                 let until = *self
                     .grace_until
-                    .get_or_insert_with(|| Instant::now() + EARLIER_SIGN_GRACE);
+                    .get_or_insert_with(|| Instant::now() + claude::EARLIER_SIGN_GRACE);
                 Instant::now() >= until
             }
         };

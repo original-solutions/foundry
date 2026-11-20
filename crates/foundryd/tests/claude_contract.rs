@@ -116,15 +116,22 @@ fn claude_code_posts_the_hooks_sessions_reads() {
     // prompt, typed when `sessions` types one: a paste and Enter the moment Claude Code turns
     // bracketed paste on after `SessionStart`, with no wait for the screen to settle. Its
     // newline stays in the one prompt.
-    let until = Instant::now() + STARTUP;
+    // The sign must come soon after `SessionStart`: a sign `sessions` saw only before the hook
+    // counts after `EARLIER_SIGN_GRACE`, which must leave the box time to draw.
+    let seen_start = Instant::now();
     while !claude::turns_paste_on(&mut Vec::new(), &session.screen()) {
         assert!(
-            Instant::now() < until,
-            "Claude Code did not turn bracketed paste on:\n{}",
+            seen_start.elapsed() < claude::EARLIER_SIGN_GRACE / 2,
+            "Claude Code did not turn bracketed paste on within {:?} of SessionStart:\n{}",
+            claude::EARLIER_SIGN_GRACE / 2,
             session.tail()
         );
         std::thread::sleep(Duration::from_millis(10));
     }
+    eprintln!(
+        "bracketed paste on {:?} after SessionStart was seen",
+        seen_start.elapsed()
+    );
     run.report("start", 0);
     run.expect("start", 0, &["SessionStart"]);
     let mark = posted.len();
