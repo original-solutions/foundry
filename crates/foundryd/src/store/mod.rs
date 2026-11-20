@@ -27,6 +27,11 @@ mod tests;
 /// refuse a write the previous build makes: the previous build still reads and writes them.
 /// Rows a newer build stored that the previous build cannot parse are another matter: see
 /// [`Store::since`].
+///
+/// The newer build comes back to the same file, and its step does not run again. The rows
+/// the previous build wrote meanwhile have nothing in the added columns and nothing in the
+/// added tables, so the newer build accepts both and a step never fills in existing rows.
+/// The test `every_later_migration_step_only_adds` holds each step after the first to this.
 const MIGRATIONS: &[&str] = &[
     // 1: records keyed by kind and id, the owner's own version counter, shared settings.
     "CREATE TABLE records (
