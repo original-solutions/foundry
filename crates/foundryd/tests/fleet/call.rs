@@ -487,53 +487,78 @@ async fn a_call_through_keys_accept_reaches_the_owners_api_and_its_answer_return
     assert!(body.contains(&terminal.to_string()), "{body}");
 }
 
+/// Counts the links it is asked to open, and opens none.
+struct Counted(Arc<std::sync::atomic::AtomicUsize>);
+
+impl foundryd::sync::Dialer for Counted {
+    fn dial(
+        &self,
+        _: &foundry_proto::settings::Machine,
+    ) -> futures::future::BoxFuture<'static, std::io::Result<Conn>> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async { Err(std::io::Error::other("no links in this test")) })
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_call_to_a_peer_on_an_older_link_or_on_no_link_is_refused_before_any_link() {
-    let old = MachineId::random();
-    let fleet = Fleet::start_with(1, &[old]);
-    let a = &fleet.daemons[0];
+    let (me, old) = (MachineId::random(), MachineId::random());
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path().join("foundry.db")).unwrap();
+    assert!(store.apply_settings(settings_for(&[me, old])).unwrap());
+    let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let peers = Peers::new(
+        me,
+        Arc::new(Mutex::new(store)),
+        Arc::new(Counted(dials.clone())),
+    );
     let (near, far) = Conn::pair();
-    let peers = a.peers.clone();
-    tokio::spawn(async move { peers.accept(far).await });
-    let hello = PeerMessage::Hello {
-        protocol: 2,
-        machine: old,
-        versions: Default::default(),
-    };
-    near.send
-        .send(serde_json::to_string(&hello).unwrap())
-        .await
-        .unwrap();
-    let empty = PeerMessage::Records {
-        protocol: 2,
-        records: Vec::new(),
-    };
-    near.send
-        .send(serde_json::to_string(&empty).unwrap())
-        .await
-        .unwrap();
+    let accepting = peers.clone();
+    tokio::spawn(async move { accepting.accept(far).await });
+    for message in [
+        PeerMessage::Hello {
+            protocol: 2,
+            machine: old,
+            versions: Default::default(),
+        },
+        PeerMessage::Records {
+            protocol: 2,
+            records: Vec::new(),
+        },
+    ] {
+        near.send
+            .send(serde_json::to_string(&message).unwrap())
+            .await
+            .unwrap();
+    }
     until(WAIT, "the old peer is heard from", || {
-        a.peers.online().contains(&old)
+        peers.online().contains(&old)
     })
     .await;
-    match a.peers.call(old, "/api/workspaces", None, b"{}").await {
+    match peers.call(old, "/api/workspaces", None, b"{}").await {
         Err(CallError::Older(name)) => assert_eq!(name, "machine-1"),
         other => panic!("not refused as older: {other:?}"),
     }
+
     drop(near);
     until(WAIT, "the old peer's link closes", || {
-        a.peers.older().is_empty()
+        peers.older().is_empty()
     })
     .await;
     assert!(
-        a.peers.online().contains(&old),
+        peers.online().contains(&old),
         "still heard from within the offline limit"
     );
     // With no record link open, nothing says the peer can take a call: none is sent.
-    match a.peers.call(old, "/api/workspaces", None, b"{}").await {
+    match peers.call(old, "/api/workspaces", None, b"{}").await {
         Err(CallError::Down(name)) => assert_eq!(name, "machine-1"),
         other => panic!("not refused as down: {other:?}"),
     }
+    assert_eq!(
+        dials.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a link was dialed"
+    );
 }
 
 /// A spawned task that is stopped when this is dropped.
