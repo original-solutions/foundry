@@ -263,8 +263,9 @@ impl Workspaces {
         Ok(self.inner.worktree(body.project, &body.branch))
     }
 
-    /// Deals with each worktree under `worktrees/<project>/` that no live workspace of this
-    /// machine names, as a create that died before writing its record leaves. One that passes
+    /// Deals with each worktree under `worktrees/<project>/`, for each project in the shared
+    /// settings, that no live workspace record in the store names, of this machine or of any
+    /// other owner, as a create that died before writing its record leaves. One that passes
     /// the checks of an unforced archive is removed without `--force` and its branch kept; any
     /// other, or one git will not remove, is left as it is and logged with what holds it. A
     /// worktree whose folder is gone is checked by the `HEAD` git keeps for it. Branches are
@@ -422,40 +423,34 @@ impl Inner {
     }
 
     async fn sweep(&self) -> Result<(), WorkspaceError> {
-        let mut clones = match tokio::fs::read_dir(self.data.join("clones")).await {
-            Ok(clones) => clones,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(e.into()),
-        };
-        let me = self.me;
-        let live: Vec<Workspace> = self
-            .with_store(move |store| {
-                Ok(store
-                    .since(me, 0)?
+        // Every owner's records count: the machine's identity can be made again while its data
+        // directory stays, and a record only ever keeps a worktree. Projects come from the
+        // settings, as a create's do, so a store made again, which holds none, removes nothing.
+        let (projects, live) = self
+            .with_store(|store| {
+                let projects: Vec<ProjectId> = store
+                    .settings()?
+                    .projects
                     .into_iter()
-                    .filter_map(|record| match record {
-                        AnyRecord::Workspace(r) if !r.deleted => Some(r.body),
-                        _ => None,
-                    })
-                    .collect())
+                    .map(|p| p.id)
+                    .collect();
+                let mut live = Vec::new();
+                for owner in store.versions()?.into_keys() {
+                    live.extend(store.since(owner, 0)?.into_iter().filter_map(
+                        |record| match record {
+                            AnyRecord::Workspace(r) if !r.deleted => Some(r.body),
+                            _ => None,
+                        },
+                    ));
+                }
+                Ok((projects, live))
             })
             .await?;
-        while let Some(entry) = clones.next_entry().await? {
-            // Only `<project>.git`, as `clone_path` spells it, is a clone; one made half way is
-            // `<project>.partial`.
-            let name = entry.file_name();
-            let Some(project) = name
-                .to_str()
-                .and_then(|name| name.strip_suffix(".git"))
-                .and_then(|id| {
-                    uuid::Uuid::parse_str(id)
-                        .ok()
-                        .filter(|uuid| uuid.to_string() == id)
-                })
-                .map(ProjectId)
-            else {
+        for project in projects {
+            let clone = self.clone_path(project);
+            if !tokio::fs::try_exists(&clone).await? {
                 continue;
-            };
+            }
             let branches: Vec<&str> = live
                 .iter()
                 .filter(|w| w.project == project)
@@ -463,7 +458,7 @@ impl Inner {
                 .collect();
             if let Err(error) = self.sweep_project(project, &branches).await {
                 tracing::warn!(
-                    clone = %entry.path().display(),
+                    clone = %clone.display(),
                     %error,
                     "the clone's worktrees could not be listed to find what a failed create left"
                 );
@@ -481,7 +476,12 @@ impl Inner {
             .git(&clone, "worktree", ["list", "--porcelain", "-z"])
             .await?;
         let project_folder = project.to_string();
-        for (listed, branch) in worktrees_in(&list) {
+        for Listed {
+            path: listed,
+            branch,
+            ..
+        } in worktrees_in(&list)
+        {
             // Only what a create makes, `worktrees/<project>/<branch>`, and never the clone.
             let parent = listed.parent();
             if parent.and_then(Path::file_name) != Some(OsStr::new(&project_folder))
@@ -615,9 +615,9 @@ impl Inner {
         clone: &Path,
         worktree: &Path,
     ) -> Result<Option<(PathBuf, String)>, WorkspaceError> {
-        // Line by line: the paths that matter end in `<project>/<branch>`, and neither part can
-        // hold a line break.
-        let list = self.git(clone, "worktree", ["list", "--porcelain"]).await?;
+        let list = self
+            .git(clone, "worktree", ["list", "--porcelain", "-z"])
+            .await?;
         // Every worktree of a clone sits at `worktrees/<project>/<branch>`, so the last two
         // parts name it, however git spelled the folders above.
         let tail = |p: &Path| {
@@ -626,17 +626,12 @@ impl Inner {
                 p.parent().and_then(Path::file_name).map(OsStr::to_owned),
             )
         };
-        let mut here = None;
-        for line in list.lines() {
-            if let Some(path) = line.strip_prefix("worktree ") {
-                here = (tail(Path::new(path)) == tail(worktree)).then(|| PathBuf::from(path));
-            } else if let Some(head) = line.strip_prefix("HEAD ")
-                && let Some(path) = here.take()
-            {
-                return Ok(Some((path, head.to_owned())));
-            }
-        }
-        Ok(None)
+        Ok(worktrees_in(&list).into_iter().find_map(|listed| {
+            let head = listed
+                .head
+                .filter(|_| tail(&listed.path) == tail(worktree))?;
+            Some((listed.path, head))
+        }))
     }
 
     /// [`WorkspaceError::Dirty`] when the worktree has uncommitted files or a checked-out
@@ -928,17 +923,32 @@ async fn setup(worktree: &Path) -> Option<Vec<String>> {
     }
 }
 
-/// Each worktree in the output of `git worktree list --porcelain -z`, as its path and the branch
-/// it has checked out, if any.
-fn worktrees_in(list: &str) -> Vec<(PathBuf, Option<String>)> {
-    let mut found: Vec<(PathBuf, Option<String>)> = Vec::new();
+/// One worktree as `git worktree list --porcelain -z` gives it.
+struct Listed {
+    path: PathBuf,
+    /// The commit git keeps as its `HEAD`; a bare clone has none.
+    head: Option<String>,
+    /// The branch it has checked out; none when its `HEAD` is detached.
+    branch: Option<String>,
+}
+
+/// Each worktree in the output of `git worktree list --porcelain -z`. Its fields end in a NUL,
+/// so no path, whatever it holds, is read as another field.
+fn worktrees_in(list: &str) -> Vec<Listed> {
+    let mut found: Vec<Listed> = Vec::new();
     for field in list.split('\0') {
         if let Some(path) = field.strip_prefix("worktree ") {
-            found.push((PathBuf::from(path), None));
-        } else if let Some(branch) = field.strip_prefix("branch refs/heads/")
-            && let Some((_, checked_out)) = found.last_mut()
-        {
-            *checked_out = Some(branch.to_owned());
+            found.push(Listed {
+                path: PathBuf::from(path),
+                head: None,
+                branch: None,
+            });
+        } else if let Some(listed) = found.last_mut() {
+            if let Some(head) = field.strip_prefix("HEAD ") {
+                listed.head = Some(head.to_owned());
+            } else if let Some(branch) = field.strip_prefix("branch refs/heads/") {
+                listed.branch = Some(branch.to_owned());
+            }
         }
     }
     found
