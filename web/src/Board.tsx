@@ -8,6 +8,9 @@ import { changesQuery } from "./ChangesPanel";
 import { splitPath, totals } from "./changes";
 import type { MachineView } from "./fleet";
 import { jumpKey, SearchIcon } from "./JumpPalette";
+import type { Project } from "./api";
+import { Composer } from "./Composer";
+import { useCreateWorkspace } from "./CreateWorkspace";
 import { plural, type Glyph } from "./labels";
 import { glyphText, StateGlyph } from "./StateGlyph";
 import { Named, Now } from "./Now";
@@ -65,17 +68,27 @@ const edge: Record<Glyph, string> = {
  * since its base. A card's terminals open from it; its changes open the changes sheet. A fleet with
  * no workspaces yet opens on the first-run page instead (`Launchpad`).
  *
+ * At the top, a one-line box gives Claude its next task (`Composer`), beside the way to jump.
  * A switch beside the counts turns it into a timeline of every session's turns on one clock.
  */
 export function Board({
   machines,
+  projects,
   onJump,
   onChanges,
   onSteps,
+  onCreated,
+  onMore,
   traced,
 }: {
   machines: MachineView[];
+  /** The fleet's projects, which a new task is started in. */
+  projects: Project[];
   onJump: () => void;
+  /** Called with the session a new task started, so the layout lands in it. */
+  onCreated: (session: string) => void;
+  /** Opens the full new-workspace dialog with this name. */
+  onMore: (name: string) => void;
   onChanges: (workspace: string) => void;
   /** Opens a terminal with its steps column. */
   onSteps: (terminal: string) => void;
@@ -93,14 +106,14 @@ export function Board({
   const sessions = workspaces.reduce((n, w) => n + w.sessions.length, 0);
   const shells = workspaces.reduce((n, w) => n + w.shells.length, 0);
   const counts = `${plural(sessions, "session")} · ${plural(shells, "shell")} · ${plural(workspaces.length, "workspace")} · ${plural(machines.length, "machine")}`;
-  const search = <JumpBar onJump={onJump} />;
+  const launch = useCreateWorkspace();
 
   const several = machines.length > 1;
   return (
     <div className="absolute inset-0 overflow-y-auto">
       <div className="mx-auto flex max-w-7xl flex-col gap-7 px-6 pt-6 pb-16">
         <div className="flex flex-col gap-2">
-          {search}
+          <Composer mode="bar" id="board-task" projects={projects} workspaces={workspaces} launch={launch} onCreated={onCreated} onMore={onMore} onJump={onJump} doneLabel="Clear" />
           <div className="flex items-center gap-3 px-1">
             <p className="min-w-0 flex-1 text-xs text-neutral-500">{counts}</p>
             <ViewSwitch view={view} onPick={pick} />

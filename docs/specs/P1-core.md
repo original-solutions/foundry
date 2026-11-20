@@ -181,6 +181,8 @@ A P3 diff view, built early on a read the daemon already had. `GET /api/workspac
 
 A P3 overview on the same read. With no terminal open, the UI shows every workspace as a card in three lanes by its most urgent terminal: needs you (waiting, stuck or failed), working (working or starting) and quiet. A card lists its terminals with their states and what the workspace changed since its base. A card reads the changes only while it is on screen: when it comes on screen, when one of its terminals changes state, and every half minute while an agent in it works. A quiet card is not read on a timer, so a fleet of dozens of workspaces does not keep git running. A workspace whose changes cannot be read from this machine says so.
 
+Above the lanes, one line takes the next task, beside the way to jump. Once used it opens into the first run's composer: the task names the workspace (numbered when its project already has that branch; a typed name the project has is refused), Start makes it on this machine and lands in its session already at work.
+
 ### First run
 
 A fleet with no workspaces opens on one question, what Claude should work on, and a box to answer it in, instead of an empty board. The task names the workspace and its branch as it is typed (its first words, editable); the project, base and model sit under the box. Start makes the workspace on this machine and starts its session with the task as its first prompt, then opens it. Under the box, the three states a task shows first (working, needs you, ready) are explained with their glyphs. Nothing shows before the daemon's state has arrived, so the page never flashes a first run at a fleet that has workspaces.

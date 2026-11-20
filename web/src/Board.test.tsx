@@ -2,7 +2,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createMemoryHistory, createRootRoute, createRoute, createRouter, RouterProvider } from "@tanstack/react-router";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createContext, useContext } from "react";
+import { createContext, useContext, type ComponentProps } from "react";
 import type { AnyRecord, Changes, SessionState } from "./api";
 import { archiveOf } from "./Archive";
 import { Board, BOARD_BUSY_EVERY } from "./Board";
@@ -94,9 +94,21 @@ afterEach(() => {
 
 const Machines = createContext<MachineView[]>([]);
 
-async function show(machines: MachineView[], onChanges = vi.fn()) {
+async function show(machines: MachineView[], onChanges = vi.fn(), props: Partial<ComponentProps<typeof Board>> = {}) {
   function Shown() {
-    return <Board machines={useContext(Machines)} onJump={() => {}} onChanges={onChanges} onSteps={() => {}} traced={new Set()} />;
+    return (
+      <Board
+        machines={useContext(Machines)}
+        projects={settings().projects}
+        onJump={() => {}}
+        onChanges={onChanges}
+        onSteps={() => {}}
+        onCreated={() => {}}
+        onMore={() => {}}
+        traced={new Set()}
+        {...props}
+      />
+    );
   }
   const root = createRootRoute({ component: Shown });
   const router = createRouter({
@@ -262,5 +274,77 @@ describe("Board", () => {
     fireEvent.click(screen.getByRole("radio", { name: "Board" }));
     expect(screen.getByRole("region", { name: "Working" })).toBeDefined();
     expect(localStorage.getItem("foundry.home")).toBe("board");
+  });
+});
+
+describe("The task bar", () => {
+  const bar = () => screen.getByRole("textbox", { name: "New task" });
+  const start = () => screen.getByRole("button", { name: /^Start/ }) as HTMLButtonElement;
+  /** Answers the board's reads as before, and the create's two posts, keeping what each post sent. */
+  function creating() {
+    const posts: { url: string; body: unknown }[] = [];
+    answers["/api/workspaces"] = () => json(201, { id: "w9" });
+    answers["/api/workspaces/w9/sessions"] = () => json(201, { id: "s9" });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init: RequestInit = {}) => {
+        if (init.method === "POST") posts.push({ url, body: JSON.parse(String(init.body)) });
+        else reads.push(url);
+        return answers[url]();
+      }),
+    );
+    return posts;
+  }
+
+  it("is one line with a way to jump until it is used, then shows where the task will run", async () => {
+    const jump = vi.fn();
+    await show(fleet(records(), settings()), vi.fn(), { onJump: jump });
+
+    expect(bar().getAttribute("placeholder")).toBe("Give Claude a new task…");
+    expect(screen.queryByRole("radio", { name: "demo" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Jump to a session or shell" }));
+    expect(jump).toHaveBeenCalled();
+
+    fireEvent.focus(bar());
+    expect(screen.getByRole("radio", { name: "demo" })).toBeDefined();
+    expect(start().disabled).toBe(true);
+    fireEvent.blur(bar());
+    expect(screen.queryByRole("radio", { name: "demo" })).toBeNull();
+
+    fireEvent.change(bar(), { target: { value: "Add a footer" } });
+    fireEvent.blur(bar());
+    expect(screen.getByLabelText("Branch").textContent).toBe("add-a-footer");
+  });
+
+  it("makes a workspace for the task and starts Claude on it, then hands over the session", async () => {
+    const posts = creating();
+    const created = vi.fn();
+    await show(fleet(records(), settings()), vi.fn(), { onCreated: created });
+
+    fireEvent.focus(bar());
+    fireEvent.change(bar(), { target: { value: "Add a footer.\nKeep it small." } });
+    fireEvent.keyDown(bar(), { key: "Enter", metaKey: true });
+
+    await waitFor(() => expect(created).toHaveBeenCalledWith("s9"));
+    expect(posts).toEqual([
+      { url: "/api/workspaces", body: { project: "p1", base: "main", name: "add a footer" } },
+      { url: "/api/workspaces/w9/sessions", body: { model: "opus", prompt: "Add a footer.\nKeep it small." } },
+    ]);
+  });
+
+  it("numbers a name the project already has a workspace for, and refuses a typed one", async () => {
+    const posts = creating();
+    await show(fleet(records(), settings()));
+
+    fireEvent.focus(bar());
+    fireEvent.change(bar(), { target: { value: "Fix login" } });
+    expect(screen.getByLabelText("Branch").textContent).toBe("fix-login-2");
+
+    fireEvent.change(screen.getByLabelText("Workspace name"), { target: { value: "Tidy README" } });
+    expect(screen.getByText("demo already has a workspace on tidy-readme. Pick another name.")).toBeDefined();
+    expect(start().disabled).toBe(true);
+    fireEvent.keyDown(bar(), { key: "Enter", metaKey: true });
+    await act(async () => {});
+    expect(posts).toEqual([]);
   });
 });

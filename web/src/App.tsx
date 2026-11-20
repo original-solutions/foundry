@@ -305,11 +305,14 @@ function Layout() {
                 );
               })}
               {!terminalId && onMachines && <Machines machines={machines} history={samples} here={here} connected={connected} onJump={openJump} />}
-              {firstRun && <Launchpad projects={state.settings.projects} launch={launch} onCreated={setLanding} onMore={openCreate} onMenu={() => setDrawer(true)} />}
+              {firstRun && <Launchpad projects={state.settings.projects} workspaces={workspaces} launch={launch} onCreated={setLanding} onMore={openCreate} onMenu={() => setDrawer(true)} />}
               {board && state.synced && (
                 <Board
                   machines={machines}
+                  projects={state.settings.projects}
                   onJump={openJump}
+                  onCreated={setLanding}
+                  onMore={openCreate}
                   onChanges={openChanges}
                   traced={traced}
                   onSteps={(id) => {

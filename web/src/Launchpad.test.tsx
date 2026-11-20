@@ -2,7 +2,8 @@ import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import type { ComponentProps } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useCreateWorkspace } from "./CreateWorkspace";
-import { Launchpad, taskName } from "./Launchpad";
+import { taskName } from "./Composer";
+import { Launchpad } from "./Launchpad";
 import { primaryButton } from "./Modal";
 import { settings } from "./test-fixtures";
 import { json, mockFetch, renderApp } from "./test-utils";
@@ -14,7 +15,7 @@ const projects = [...settings().projects, { id: "p2", name: "other", repo: "/tmp
 /** The launchpad with the create the layout holds for it. */
 function Harness(props: Partial<ComponentProps<typeof Launchpad>>) {
   const launch = useCreateWorkspace();
-  return <Launchpad projects={projects} launch={launch} onCreated={() => {}} onMore={() => {}} onMenu={() => {}} {...props} />;
+  return <Launchpad projects={projects} workspaces={[]} launch={launch} onCreated={() => {}} onMore={() => {}} onMenu={() => {}} {...props} />;
 }
 
 const promptBox = () => screen.getByLabelText("What should Claude work on?");
