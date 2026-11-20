@@ -4,13 +4,14 @@ import { totals } from "./changes";
 import type { Located } from "./fleet";
 import { jumpKey, SearchIcon } from "./JumpPalette";
 import { StatePill } from "./StateGlyph";
+import { StepsIcon } from "./StepsPanel";
 
 /** The key that opens a terminal beside the open one, or closes the split. */
 export const splitKey = jumpKey === "⌘K" ? "⌘\\" : "Ctrl \\";
 
 /**
  * The bar above a terminal: which workspace and terminal it is, the machine it runs on and its
- * state, and the way into the workspace's changes. On a narrow screen it holds the button that
+ * state, and the ways into the workspace's changes and the session's steps. On a narrow screen it holds the button that
  * opens the sidebar as a drawer. On a wide one it opens another terminal beside this one, or, in
  * a split, closes its own side. In a split the side with the keyboard has a lit edge; the other
  * is dimmed.
@@ -21,6 +22,8 @@ export function TerminalHeader({
   onMenu,
   onJump,
   onChanges,
+  onSteps,
+  stepsOpen = false,
   onSplit,
   onClosePane,
   beside = false,
@@ -31,6 +34,9 @@ export function TerminalHeader({
   onJump: () => void;
   /** Opens the changes of the terminal's workspace. */
   onChanges: (workspace: string) => void;
+  /** Shows or hides the steps column, which follows the terminal with the keyboard. */
+  onSteps?: () => void;
+  stepsOpen?: boolean;
   /** Offered when nothing is beside: picks a terminal to show beside this one. */
   onSplit?: () => void;
   /** Offered in a split: closes this side, leaving the other. */
@@ -73,6 +79,19 @@ export function TerminalHeader({
           </div>
           <StatePill glyph={located.glyph} label={located.label} />
           <ChangesButton workspace={located.workspace.id} onClick={() => onChanges(located.workspace.id)} />
+          {onSteps && (
+            <button
+              type="button"
+              aria-label="Steps"
+              aria-pressed={stepsOpen}
+              title="Every prompt, tool and question of this session, turn by turn"
+              onClick={onSteps}
+              className={`flex shrink-0 items-center gap-1.5 rounded border px-2 py-0.5 text-xs ${stepsOpen ? "border-sky-400/50 bg-sky-400/10 text-sky-200" : "border-neutral-700 text-neutral-300 hover:border-neutral-500 hover:text-neutral-100"}`}
+            >
+              <StepsIcon className="size-3.5" />
+              <span className="sr-only sm:not-sr-only">Steps</span>
+            </button>
+          )}
         </>
       ) : (
         <span className="flex-1 text-neutral-500">Terminal</span>

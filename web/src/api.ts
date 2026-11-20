@@ -69,7 +69,14 @@ export interface Blockers {
 }
 
 /** A request the daemon refused, with the text it gave. */
-export class ApiError extends Error {}
+export class ApiError extends Error {
+  /** The HTTP status the daemon answered with, when it answered. */
+  readonly status?: number;
+  constructor(message: string, status?: number) {
+    super(message);
+    this.status = status;
+  }
+}
 
 async function post(path: string, body?: unknown): Promise<{ status: number; json: Record<string, unknown> }> {
   const response = await fetch(path, {
@@ -88,7 +95,7 @@ async function post(path: string, body?: unknown): Promise<{ status: number; jso
 }
 
 function refused(status: number, json: Record<string, unknown>): ApiError {
-  return new ApiError(typeof json.error === "string" ? json.error : `request failed (${status})`);
+  return new ApiError(typeof json.error === "string" ? json.error : `request failed (${status})`, status);
 }
 
 /** Makes a workspace. `error` beside the id means it exists but its setup did not start. */
@@ -166,6 +173,26 @@ export interface Brief {
 }
 /** Briefs by session id: only this machine's sessions, since this daemon started. */
 export type Briefs = Record<string, Brief>;
+
+/** One step on a session's trail: a prompt, a tool call, a question, or the end of a turn (`done`, no text). `at` is when its hook arrived, in ms since the epoch. */
+export interface Mark {
+  kind: Step["kind"] | "done";
+  text: string;
+  at: number;
+}
+
+/** Every step session `id` took since its daemon started, oldest first. Only this machine's sessions; any other is a 404. */
+export async function sessionTrail(id: string): Promise<Mark[]> {
+  const response = await fetch(`/api/sessions/${id}/trail`);
+  let json: Record<string, unknown> = {};
+  try {
+    json = (await response.json()) as Record<string, unknown>;
+  } catch {
+    // Not JSON: the status says what went wrong.
+  }
+  if (!response.ok) throw refused(response.status, json);
+  return (json.steps ?? []) as Mark[];
+}
 
 export async function sessionBriefs(): Promise<Briefs> {
   const response = await fetch("/api/briefs");

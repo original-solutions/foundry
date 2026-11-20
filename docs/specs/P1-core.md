@@ -182,6 +182,10 @@ A P3 overview on the same read. With no terminal open, the UI shows every worksp
 
 A session is named by what it was asked. The daemon keeps, in memory and for its own sessions only, each session's first prompt since it started or was cleared (slash commands left out) and the newest step of its turn: the prompt, the tool about to run with what it acts on, or the question a notification asks. `GET /api/briefs` returns them by session id. Nothing is written to a record, so briefs do not sync and a peer's sessions show their model alone. Each text is one line of at most 120 characters, with the gateway key, every session token, token-shaped words and URL passwords hidden. The UI shows the first prompt beside the model wherever a session is listed, and the newest step under it while the session works, waits or is stuck.
 
+### Steps
+
+A P3 run history on the same hooks. The daemon also keeps each of its sessions' trail: every prompt, tool call and question, and the end of each turn, the newest 200, with the time each hook arrived (for showing; the order is the order they arrived). `GET /api/sessions/{id}/trail` returns one session's trail, cut and hidden as briefs are; a session of another machine is `404`. The UI shows it in a Steps column beside the open terminal (the whole screen on a narrow one), opened from the terminal header: one card per turn, earlier turns folded to their prompt, what they did and how long they took, the newest open and growing while the session works.
+
 ## Placement
 
 - Each worker records CPU load per core, free memory, free disk and its session count every 5 seconds.

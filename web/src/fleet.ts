@@ -135,6 +135,8 @@ export function fleet(records: AnyRecord[], settings: SharedSettings, briefs: Br
 export interface Located {
   machine: MachineView;
   workspace: WorkspaceView;
+  /** The session it runs, when it is a session's terminal. */
+  session?: string;
   name: string;
   /** A session's first prompt. */
   title?: string;
@@ -146,7 +148,7 @@ export function locate(machines: MachineView[], id: string): Located | undefined
   for (const machine of machines) {
     for (const workspace of machine.workspaces) {
       const row = rows(workspace).find((r) => r.terminal === id);
-      if (row) return { machine, workspace, name: row.name, title: row.title, label: row.label, glyph: row.glyph };
+      if (row) return { machine, workspace, session: row.session, name: row.name, title: row.title, label: row.label, glyph: row.glyph };
     }
   }
   return undefined;
@@ -155,6 +157,8 @@ export function locate(machines: MachineView[], id: string): Located | undefined
 /** One terminal of a workspace as the sidebar lists it. */
 export interface Row {
   terminal: string;
+  /** The session it runs, when it is a session's terminal. */
+  session?: string;
   name: string;
   /** A session's first prompt, which tells two sessions of one model apart. */
   title?: string;
@@ -171,7 +175,7 @@ export function rows(workspace: WorkspaceView): Row[] {
   return [
     ...workspace.sessions.map((s) => {
       const glyph = sessionGlyph[s.state];
-      return { terminal: s.terminal, name: s.model, title: s.title, now: busy.includes(glyph) ? s.now : undefined, label: sessionLabel[s.state], glyph };
+      return { terminal: s.terminal, session: s.id, name: s.model, title: s.title, now: busy.includes(glyph) ? s.now : undefined, label: sessionLabel[s.state], glyph };
     }),
     ...workspace.shells.map((t) => ({ terminal: t.id, name: "shell", label: terminalLabel(t.state, t.exitCode), glyph: terminalGlyph(t.state, t.exitCode) })),
   ];

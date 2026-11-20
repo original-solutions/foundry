@@ -1,9 +1,12 @@
 //! What a session is for and what it is doing, read from its hooks' payloads: the first prompt
-//! it was given, and the newest prompt, tool call or question. Kept in memory for the session's
-//! life and never written to a record, so it does not sync and does not outlive the daemon.
+//! it was given, the newest prompt, tool call or question, and the trail of every step it took,
+//! the newest [`TRAIL_LONGEST`] of them. Kept in memory for the session's life and never written
+//! to a record, so it does not sync and does not outlive the daemon.
 //!
 //! Prompts and commands can hold anything a person typed, so every text is cut to one short
 //! line, the secrets this daemon knows are hidden, and so is any word shaped like a token.
+
+use std::collections::VecDeque;
 
 use serde::Serialize;
 
@@ -12,6 +15,8 @@ const LONGEST: usize = 120;
 /// The shortest run of letters, digits, `-` and `_` taken for a token when it mixes letters and
 /// digits.
 const TOKEN_LENGTH: usize = 24;
+/// The most steps a trail keeps; past it, the oldest go.
+pub const TRAIL_LONGEST: usize = 200;
 /// What a hidden secret or token shows as.
 pub const HIDDEN: &str = "•••";
 
@@ -22,6 +27,19 @@ pub struct Brief {
     pub title: Option<String>,
     /// The newest step of the turn, until the turn ends.
     pub now: Option<Step>,
+    /// Every step it took, oldest first, in the order its hooks arrived. Served on its own, so
+    /// the briefs of a busy fleet stay small.
+    #[serde(skip)]
+    pub trail: VecDeque<Mark>,
+}
+
+/// One step on a session's trail, and when its hook arrived, in milliseconds since the Unix
+/// epoch. The time is for showing; the trail's order is the order the hooks arrived in.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Mark {
+    pub kind: StepKind,
+    pub text: String,
+    pub at: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -39,36 +57,62 @@ pub enum StepKind {
     Tool,
     /// Claude Code asks the person something, as its notification says.
     Ask,
+    /// The turn ended. Only on a trail, with no text.
+    Done,
 }
 
 impl Brief {
-    /// Takes in one hook payload. `secrets` are hidden wherever they appear.
-    pub fn note(&mut self, payload: &serde_json::Value, secrets: &[&str]) {
+    /// Takes in one hook payload that arrived at `at`, in milliseconds since the Unix epoch.
+    /// `secrets` are hidden wherever they appear.
+    pub fn note(&mut self, payload: &serde_json::Value, secrets: &[&str], at: u64) {
         let field = |name: &str| payload.get(name).and_then(|v| v.as_str());
         let step = |kind, text: &str| {
             let text = shown(text, secrets);
             (!text.is_empty()).then_some(Step { kind, text })
         };
-        match field("hook_event_name").unwrap_or_default() {
-            "SessionStart" if field("source") == Some("clear") => *self = Self::default(),
+        let taken = match field("hook_event_name").unwrap_or_default() {
+            "SessionStart" if field("source") == Some("clear") => {
+                self.title = None;
+                self.now = None;
+                None
+            }
             "UserPromptSubmit" => {
                 let prompt = field("prompt").unwrap_or_default();
                 if self.title.is_none() && !prompt.trim_start().starts_with('/') {
                     self.title = step(StepKind::Prompt, prompt).map(|s| s.text);
                 }
                 self.now = step(StepKind::Prompt, prompt);
+                self.now.clone()
             }
             "PreToolUse" => {
-                let text = tool(payload);
-                self.now = step(StepKind::Tool, &text);
+                self.now = step(StepKind::Tool, &tool(payload));
+                self.now.clone()
             }
-            "Notification" => {
-                if let Some(message) = field("message") {
+            "Notification" => match field("message") {
+                Some(message) => {
                     self.now = step(StepKind::Ask, message);
+                    self.now.clone()
                 }
+                None => None,
+            },
+            "Stop" => {
+                self.now = None;
+                Some(Step {
+                    kind: StepKind::Done,
+                    text: String::new(),
+                })
             }
-            "Stop" | "SessionEnd" => self.now = None,
-            _ => {}
+            "SessionEnd" => {
+                self.now = None;
+                None
+            }
+            _ => None,
+        };
+        if let Some(Step { kind, text }) = taken {
+            if self.trail.len() == TRAIL_LONGEST {
+                self.trail.pop_front();
+            }
+            self.trail.push_back(Mark { kind, text, at });
         }
     }
 }
@@ -160,7 +204,7 @@ mod tests {
     fn noted(payloads: &[serde_json::Value]) -> Brief {
         let mut brief = Brief::default();
         for p in payloads {
-            brief.note(p, &["sk-gateway"]);
+            brief.note(p, &["sk-gateway"], 0);
         }
         brief
     }
@@ -295,5 +339,77 @@ mod tests {
         let brief = noted(&[prompt("   ")]);
         assert_eq!(brief.title, None);
         assert_eq!(brief.now, None);
+    }
+    fn trail(brief: &Brief) -> Vec<(StepKind, &str)> {
+        brief
+            .trail
+            .iter()
+            .map(|m| (m.kind, m.text.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn the_trail_keeps_every_step_and_turn_end_in_order_with_its_time() {
+        let mut brief = Brief::default();
+        let ask = json!({"hook_event_name": "Notification", "message": "Claude needs your permission to use Bash"});
+        let payloads = [
+            prompt("fix the bug"),
+            tool_use("Read", json!({"file_path": "/w/tidy/a.rs"})),
+            json!({"hook_event_name": "PostToolUse", "tool_name": "Read"}),
+            ask,
+            tool_use("Bash", json!({"command": "cargo test"})),
+            json!({"hook_event_name": "Stop"}),
+            prompt("thanks"),
+        ];
+        for (at, p) in payloads.iter().enumerate() {
+            brief.note(p, &[], 1000 + at as u64);
+        }
+        assert_eq!(
+            trail(&brief),
+            [
+                (StepKind::Prompt, "fix the bug"),
+                (StepKind::Tool, "Read a.rs"),
+                (StepKind::Ask, "Claude needs your permission to use Bash"),
+                (StepKind::Tool, "$ cargo test"),
+                (StepKind::Done, ""),
+                (StepKind::Prompt, "thanks"),
+            ]
+        );
+        let at: Vec<u64> = brief.trail.iter().map(|m| m.at).collect();
+        assert_eq!(at, [1000, 1001, 1003, 1004, 1005, 1006]);
+    }
+
+    #[test]
+    fn the_trail_hides_secrets_and_keeps_only_the_newest_steps() {
+        let mut brief = Brief::default();
+        brief.note(&prompt("use sk-gateway"), &["sk-gateway"], 0);
+        assert_eq!(trail(&brief), [(StepKind::Prompt, "use •••")]);
+        for n in 0..TRAIL_LONGEST {
+            brief.note(
+                &tool_use("Bash", json!({"command": format!("echo {n}")})),
+                &[],
+                0,
+            );
+        }
+        assert_eq!(brief.trail.len(), TRAIL_LONGEST);
+        assert_eq!(trail(&brief)[0], (StepKind::Tool, "$ echo 0"));
+        assert_eq!(
+            trail(&brief)[TRAIL_LONGEST - 1],
+            (StepKind::Tool, &*format!("$ echo {}", TRAIL_LONGEST - 1))
+        );
+    }
+
+    #[test]
+    fn clear_keeps_the_trail_and_the_brief_is_sent_without_it() {
+        let start = json!({"hook_event_name": "SessionStart", "source": "clear"});
+        let brief = noted(&[prompt("one"), start, prompt("two")]);
+        assert_eq!(
+            trail(&brief),
+            [(StepKind::Prompt, "one"), (StepKind::Prompt, "two")]
+        );
+        assert_eq!(
+            serde_json::to_value(&brief).unwrap(),
+            json!({"title": "two", "now": {"kind": "prompt", "text": "two"}})
+        );
     }
 }

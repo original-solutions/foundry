@@ -400,6 +400,25 @@ describe("App", () => {
     expect(within(header).getByRole("button", { name: /changes/i }).textContent).toContain("+4");
   });
 
+  it("opens the open session's steps beside its terminal, follows the terminal you open, and closes", async () => {
+    const calls = mockActions(json(200, { steps: [{ kind: "prompt", text: "fix the login bug", at: Date.now() }, { kind: "tool", text: "Edit src/login.ts", at: Date.now() }] }));
+    const router = await open("/terminals/t1", live);
+    fireEvent.click(within(screen.getByLabelText("Open terminal")).getByRole("button", { name: "Steps" }));
+
+    const steps = screen.getByRole("complementary", { name: "Steps" });
+    expect(await within(steps).findByText("src/login.ts", { exact: false })).toBeDefined();
+    expect(calls[0].url).toBe("/api/sessions/s1/trail");
+    expect(within(screen.getByLabelText("Open terminal")).getByRole("button", { name: "Steps" }).getAttribute("aria-pressed")).toBe("true");
+
+    await router.navigate({ to: "/terminals/$terminalId", params: { terminalId: "t2" } });
+    const shell = () => screen.getByRole("complementary", { name: "Steps" });
+    await waitFor(() => expect(within(shell()).getByText(/shell has no hooks/i)).toBeDefined());
+    expect(within(screen.getByLabelText("Open terminal")).getByRole("button", { name: "Steps" })).toBeDefined();
+
+    fireEvent.click(within(shell()).getByRole("button", { name: "Close steps" }));
+    expect(screen.queryByRole("complementary", { name: "Steps" })).toBeNull();
+  });
+
   it("opens a workspace's changes from its row in the sidebar", async () => {
     mockFetch(json(200, { base: "main", commits: [], files: [] }));
     await open("/", live);

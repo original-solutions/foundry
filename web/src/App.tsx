@@ -5,6 +5,7 @@ import { ChangesPanel } from "./ChangesPanel";
 import { CreateWorkspace } from "./CreateWorkspace";
 import { JumpPalette } from "./JumpPalette";
 import { Sidebar } from "./Sidebar";
+import { StepsPanel, type StepsOf } from "./StepsPanel";
 import { TabStrip } from "./TabStrip";
 import { beside, follow, type Split } from "./split";
 import { loadTabs, saveTabs, withoutTab, withTab } from "./tabs";
@@ -32,6 +33,10 @@ import { AlertsButton, useAlerts } from "./AlertsBell";
  *
  * A workspace's changes since its base open as a sheet from the header or the workspace's row.
  *
+ * The header's Steps button shows, in a column at the right (the whole screen on a narrow one),
+ * every prompt, tool call and question of the session with the keyboard, turn by turn. It follows
+ * whichever terminal is open until it is closed.
+ *
  * Each session is named by its first prompt, and a busy one says what it is doing, from the
  * daemon's briefs of its hooks.
  *
@@ -54,12 +59,19 @@ function Layout() {
   const [split, setSplit] = useState<Split>();
   /** The new-workspace dialog: open, and the name it starts with. */
   const [create, setCreate] = useState({ open: false, name: "" });
+  /** Whether the steps column is shown. */
+  const [stepsOpen, setStepsOpen] = useState(false);
   /** The workspace whose changes are open. */
   const [changesOf, setChangesOf] = useState<string>();
   /** The session of a workspace just made, until it shows up and is opened. */
   const [landing, setLanding] = useState<string>();
   const navigate = useNavigate();
   const located = terminalId ? locate(machines, terminalId) : undefined;
+  const stepsOf: StepsOf | undefined = !located
+    ? undefined
+    : located.session
+      ? { kind: "session", id: located.session, name: located.name, title: located.title, glyph: located.glyph, label: located.label }
+      : { kind: "shell", name: located.name };
 
   const gone = useMemo(() => new Set(state.records.flatMap((r) => (r.kind === "terminal" && r.deleted ? [r.body.id] : []))), [state.records]);
   const [kept, setKept] = useState(loadTabs);
@@ -209,6 +221,8 @@ function Layout() {
                   onMenu={() => setDrawer(true)}
                   onJump={openJump}
                   onChanges={openChanges}
+                  onSteps={id === terminalId ? () => setStepsOpen(!stepsOpen) : undefined}
+                  stepsOpen={stepsOpen}
                   onSplit={pair ? undefined : () => setJump("beside")}
                   onClosePane={pair ? () => closePane(id) : undefined}
                   beside={id !== terminalId}
@@ -232,6 +246,7 @@ function Layout() {
           {!terminalId && <Board machines={machines} onJump={openJump} onCreate={() => openCreate()} onChanges={openChanges} />}
         </div>
       </main>
+      {stepsOpen && stepsOf && <StepsPanel key={located?.session ?? terminalId} of={stepsOf} onClose={() => setStepsOpen(false)} />}
       <ChangesPanel workspace={machines.flatMap((m) => m.workspaces).find((w) => w.id === changesOf)} onClose={() => setChangesOf(undefined)} />
       <JumpPalette
         machines={machines}

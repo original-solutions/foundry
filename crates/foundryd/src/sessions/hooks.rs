@@ -71,7 +71,10 @@ fn note(inner: &Inner, live: &Live, payload: &serde_json::Value) {
         .collect();
     let mut secrets: Vec<&str> = tokens.iter().map(String::as_str).collect();
     secrets.push(&inner.config.gateway.key);
-    lock(&live.brief).note(payload, &secrets);
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+    lock(&live.brief).note(payload, &secrets, at);
 }
 
 /// Applies `hook` to the session, trying again for [`KEEP_TRYING_FOR`] while the store does not

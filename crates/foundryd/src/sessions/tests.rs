@@ -1234,6 +1234,13 @@ async fn a_sessions_brief_names_its_first_prompt_and_its_newest_step_with_its_se
     assert_eq!(brief.title.as_deref(), Some("fix it with ••• and •••"));
     assert_eq!(brief.now.as_ref().map(|s| s.text.as_str()), Some("$ ls"));
     assert_eq!(briefs[&other], brief::Brief::default());
+
+    let trail = f.sessions.trail(id).expect("a trail for a live session");
+    let texts: Vec<&str> = trail.iter().map(|m| m.text.as_str()).collect();
+    assert_eq!(texts, ["fix it with ••• and •••", "$ ls"]);
+    assert!(trail.iter().all(|m| m.at > 0), "{trail:?}");
+    assert_eq!(f.sessions.trail(other), Some(vec![]));
+    assert_eq!(f.sessions.trail(SessionId::random()), None);
 }
 
 #[tokio::test]

@@ -234,6 +234,14 @@ impl Sessions {
             .map(|live| (live.id, lock(&live.brief).clone()))
             .collect()
     }
+
+    /// Every step session `id` took since this daemon started, oldest first, or `None` when it
+    /// is not one of this daemon's sessions.
+    pub fn trail(&self, id: SessionId) -> Option<Vec<brief::Mark>> {
+        let live = lock(&self.inner.live).get(&id).cloned()?;
+        let trail = lock(&live.brief).trail.iter().cloned().collect();
+        Some(trail)
+    }
 }
 
 impl Drop for Sessions {

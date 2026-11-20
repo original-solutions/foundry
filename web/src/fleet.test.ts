@@ -206,9 +206,9 @@ describe("locate", () => {
     expect(away && [away.machine.name, away.workspace.name, away.label, away.glyph]).toEqual(["laptop", "docs", "Unreachable", "away"]);
   });
 
-  it("lists a workspace's terminals as rows, sessions first, each with its name, label and glyph", () => {
+  it("lists a workspace's terminals as rows, sessions first, each with its session, name, label and glyph", () => {
     expect(rows(machines[0].workspaces[0])).toEqual([
-      { terminal: "t1", name: "sonnet", label: "Waiting for you", glyph: "waiting" },
+      { terminal: "t1", session: "s1", name: "sonnet", label: "Waiting for you", glyph: "waiting" },
       { terminal: "sh1", name: "shell", label: "Exited 2", glyph: "failed" },
     ]);
   });
