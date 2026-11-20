@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, Read, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -297,7 +297,8 @@ impl Secrets for FileSecrets {
     }
 }
 
-/// An exclusive lock on the file at `path`, made 0600 with its directory if needed, held until
+/// An exclusive lock on the file at `path`, made 0600 with its directory (0700, as `foundryd
+/// run` wants the data directory) if needed, held until
 /// the value is dropped. It is a `flock`, so it holds between processes, and between two opens
 /// of the file in one process. Each holder stamps the file's modified time as it takes it, and
 /// a waiter counts a new stamp as progress: it gives [`SecretsError::Locked`] only once `wait`
@@ -309,7 +310,11 @@ fn lock_file(path: &Path, wait: Duration) -> Result<Flock<File>, SecretsError> {
         source,
     };
     if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir).map_err(io)?;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .map_err(io)?;
     }
     let mut file = OpenOptions::new()
         .write(true)
@@ -764,6 +769,19 @@ mod tests {
         store.set("gateway", "sk-one").unwrap();
         let held = FileSecrets::new(dir.path().join("secrets.json"));
         assert_eq!(held.get("gateway").unwrap().as_deref(), Some("sk-one"));
+    }
+
+    /// `foundryd secret set` can run before the first `foundryd run`, which refuses a data
+    /// directory other users can reach.
+    #[test]
+    fn a_set_makes_a_missing_data_directory_private() {
+        let parent = tempfile::tempdir().unwrap();
+        let home = parent.path().join("a/home");
+        FileSecrets::new(home.join("secrets.json"))
+            .set("gateway", "sk-one")
+            .unwrap();
+        assert_eq!(mode(&home), 0o700);
+        assert_eq!(mode(&parent.path().join("a")), 0o700);
     }
 
     #[test]

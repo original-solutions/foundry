@@ -115,11 +115,15 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        // `run` refuses a data directory other users can reach, and the temporary one is
+        // made with the default mode.
+        let home = tempfile::Builder::new()
+            .prefix("fd")
+            .tempdir_in("/tmp")
+            .unwrap();
+        fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700)).unwrap();
         Self {
-            home: tempfile::Builder::new()
-                .prefix("fd")
-                .tempdir_in("/tmp")
-                .unwrap(),
+            home,
             user: tempfile::tempdir().unwrap(),
             port: free_port(),
             shell: PathBuf::from("/bin/sh"),

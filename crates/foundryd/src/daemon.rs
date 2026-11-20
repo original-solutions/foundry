@@ -52,6 +52,12 @@ enum DaemonError {
     Io { what: String, source: io::Error },
     #[error("another daemon holds the lock {}", .0.display())]
     Locked(PathBuf),
+    #[error(
+        "the data directory {} is open to other users (mode {mode:o}); run `chmod 700 {}`",
+        .home.display(),
+        .home.display()
+    )]
+    HomeOpen { home: PathBuf, mode: u32 },
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]
@@ -136,16 +142,27 @@ fn start() -> Result<(), DaemonError> {
 }
 
 /// Makes the data directory, readable only by this user, as the terminals' directory is. A
-/// directory that already exists (`foundryd join` and `foundryd secret set` can make it
-/// first, wider) is tightened to 0700.
+/// directory that already exists is never changed: it may be shared, or the user's home. One
+/// that other users can reach (`foundryd join` and `foundryd secret set` make it with the
+/// default mode) is refused, naming the `chmod` that fixes it.
 fn make_home(home: &Path) -> Result<(), DaemonError> {
-    let what = || format!("cannot make {} private", home.display());
     DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(home)
         .map_err(io_error(format!("cannot make {}", home.display())))?;
-    std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o700)).map_err(io_error(what()))
+    let mode = std::fs::metadata(home)
+        .map_err(io_error(format!("cannot read {}", home.display())))?
+        .permissions()
+        .mode()
+        & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(DaemonError::HomeOpen {
+            home: home.to_owned(),
+            mode,
+        });
+    }
+    Ok(())
 }
 
 /// Takes an exclusive lock on `<home>/daemon.lock`, so two daemons never share a data
@@ -643,18 +660,34 @@ mod tests {
         assert_eq!(mode & 0o777, 0o700);
     }
 
+    /// A directory that exists may be shared or the user's own home: it is never chmodded.
     #[test]
-    fn a_wider_data_directory_made_by_another_command_is_tightened() {
+    fn a_wider_existing_data_directory_is_refused_and_left_as_it_is() {
         use std::os::unix::fs::PermissionsExt as _;
         let parent = tempfile::tempdir().unwrap();
         let home = parent.path().join("home");
         std::fs::create_dir(&home).unwrap();
-        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for wider in [0o755, 0o750, 0o701] {
+            std::fs::set_permissions(&home, std::fs::Permissions::from_mode(wider)).unwrap();
+
+            let error = make_home(&home).unwrap_err().to_string();
+
+            assert!(error.contains(&home.display().to_string()), "{error}");
+            assert!(error.contains("chmod 700"), "{error}");
+            let mode = std::fs::metadata(&home).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, wider, "{wider:o}");
+        }
+    }
+
+    #[test]
+    fn an_existing_private_data_directory_is_used() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let parent = tempfile::tempdir().unwrap();
+        let home = parent.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
 
         make_home(&home).unwrap();
-
-        let mode = std::fs::metadata(&home).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o700);
     }
 
     const KEY: &str = "sk-distinct-0123456789";
