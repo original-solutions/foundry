@@ -665,6 +665,8 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::time::Instant;
 
+    use nix::errno::Errno;
+
     use super::*;
 
     /// A data directory with versions 0.1.0 and 0.2.0 on disk, `current` on 0.2.0 and a
@@ -1271,7 +1273,7 @@ mod tests {
     }
 
     #[test]
-    fn a_binary_that_cannot_be_started_is_retried_not_refused() {
+    fn a_binary_the_system_cannot_execute_is_refused() {
         let home = installed_home();
 
         let error = check_with(
@@ -1280,15 +1282,32 @@ mod tests {
             LIMIT,
             || Ok(tags(&["v0.2.0"])),
             |_, stage| {
-                // Its interpreter does not exist, so the system cannot start it.
+                // Its interpreter does not exist, so the system says ENOENT.
                 fs::write(stage.join("foundryd"), "#!/no/such/interpreter\n").unwrap();
                 fs::write(stage.join("foundry-holder"), "holder").unwrap();
                 Ok(())
             },
         );
 
-        assert!(matches!(error, Err(UpdateError::Fetch(_))), "{error:?}");
-        assert_eq!(state(home.path()).unwrap().refused, None);
+        assert!(matches!(error, Err(UpdateError::WrongVersion { .. })), "{error:?}");
+        assert_eq!(state(home.path()).unwrap().refused.as_deref(), Some("v0.2.0"));
+    }
+
+    #[test]
+    fn only_errors_that_say_the_file_cannot_be_executed_are_unrunnable() {
+        for code in [libc_code(Errno::ENOEXEC), libc_code(Errno::ENOENT), libc_code(Errno::EACCES)] {
+            assert!(unrunnable(&io::Error::from_raw_os_error(code)), "{code}");
+        }
+        for code in [libc_code(Errno::EAGAIN), libc_code(Errno::ENOMEM), libc_code(Errno::ETXTBSY)] {
+            assert!(!unrunnable(&io::Error::from_raw_os_error(code)), "{code}");
+        }
+        assert!(!unrunnable(&io::Error::other("no code")));
+        #[cfg(target_os = "macos")]
+        assert!(unrunnable(&io::Error::from_raw_os_error(86)));
+    }
+
+    fn libc_code(errno: Errno) -> i32 {
+        errno as i32
     }
 
     #[test]
@@ -1357,12 +1376,12 @@ mod tests {
         let home = trial_home();
         let exe = home.path().join("versions/0.2.0/foundryd");
         script(&exe, "foundryd 0.2.0");
-        HEALTHY.store(false, Ordering::Relaxed);
+        let flag = AtomicBool::new(false);
 
-        let on = became_healthy(home.path(), &exe, "0.2.0");
+        let on = became_healthy(&flag, home.path(), &exe, "0.2.0");
 
         assert!(on);
-        assert!(HEALTHY.load(Ordering::Relaxed));
+        assert!(flag.load(Ordering::Relaxed));
         assert_eq!(state(home.path()).unwrap().trial, None);
     }
 
@@ -1371,12 +1390,12 @@ mod tests {
         let home = trial_home();
         let exe = home.path().join("elsewhere");
         script(&exe, "foundryd 0.2.0");
-        HEALTHY.store(false, Ordering::Relaxed);
+        let flag = AtomicBool::new(false);
 
-        let on = became_healthy(home.path(), &exe, "0.2.0");
+        let on = became_healthy(&flag, home.path(), &exe, "0.2.0");
 
         assert!(!on);
-        assert!(HEALTHY.load(Ordering::Relaxed));
+        assert!(flag.load(Ordering::Relaxed));
         assert!(state(home.path()).unwrap().trial.is_some());
     }
 
@@ -1391,6 +1410,12 @@ mod tests {
         assert!(on_trial(home.path(), &inside, "0.2.0"));
         assert!(!on_trial(home.path(), &elsewhere, "0.2.0"));
         assert!(!on_trial(home.path(), &inside, "0.1.0"));
+        // `current` is on 0.1.0 and the trial is of 0.2.0: not this process's trial.
+        let other = trial_home();
+        point_current(other.path(), "0.1.0").unwrap();
+        let old = other.path().join("versions/0.1.0/foundryd");
+        script(&old, "foundryd 0.1.0");
+        assert!(!on_trial(other.path(), &old, "0.1.0"));
         let bare = installed_home();
         let exe = bare.path().join("versions/0.1.0/foundryd");
         script(&exe, "foundryd 0.1.0");
@@ -1419,5 +1444,144 @@ mod tests {
             .filter(|name| name.starts_with(".staging"))
             .collect();
         assert!(left.is_empty(), "{left:?}");
+    }
+
+    fn exe_in(home: &Path, version: &str) -> PathBuf {
+        let exe = home.join("versions").join(version).join("foundryd");
+        script(&exe, &format!("foundryd {version}"));
+        exe
+    }
+
+    #[test]
+    fn begin_skips_a_process_that_does_not_run_from_current_and_writes_nothing() {
+        let home = trial_home();
+        for _ in 0..3 {
+            start_with(home.path(), "0.2.0").unwrap();
+        }
+        let elsewhere = home.path().join("elsewhere");
+        script(&elsewhere, "foundryd 0.2.0");
+        let before = fs::read(home.path().join("update.json")).unwrap();
+
+        let begun = begin(home.path(), &elsewhere, "0.2.0").unwrap();
+
+        assert_eq!(begun, Begin::Skip);
+        assert_eq!(fs::read(home.path().join("update.json")).unwrap(), before);
+        assert_eq!(current(home.path()), PathBuf::from("versions/0.2.0"));
+    }
+
+    #[test]
+    fn begin_counts_a_trial_run_from_current_and_asks_for_the_watchdog() {
+        let home = trial_home();
+        let exe = exe_in(home.path(), "0.2.0");
+
+        let begun = begin(home.path(), &exe, "0.2.0").unwrap();
+
+        assert_eq!(begun, Begin::Run { watch: true });
+        assert_eq!(state(home.path()).unwrap().trial.unwrap().starts, 1);
+    }
+
+    #[test]
+    fn begin_runs_without_the_watchdog_when_there_is_no_trial() {
+        let home = installed_home();
+        let exe = exe_in(home.path(), "0.1.0");
+
+        let begun = begin(home.path(), &exe, "0.1.0").unwrap();
+
+        assert_eq!(begun, Begin::Run { watch: false });
+        assert!(!home.path().join("update.json").exists());
+    }
+
+    #[test]
+    fn begin_rolls_back_a_trial_at_its_cap() {
+        let home = trial_home();
+        let exe = exe_in(home.path(), "0.2.0");
+        for _ in 0..3 {
+            begin(home.path(), &exe, "0.2.0").unwrap();
+        }
+
+        let begun = begin(home.path(), &exe, "0.2.0").unwrap();
+
+        assert_eq!(begun, Begin::RolledBack { to: "0.1.0".into() });
+        assert_eq!(current(home.path()), PathBuf::from("versions/0.1.0"));
+    }
+
+    /// Runs `run_with` on a paused clock; `checks` counts the update checks it makes.
+    fn spawn_run(
+        home: &Path,
+        exe: PathBuf,
+        flag: &'static AtomicBool,
+        checks: &'static std::sync::atomic::AtomicUsize,
+    ) -> tokio::task::JoinHandle<()> {
+        let home = home.to_path_buf();
+        tokio::spawn(async move {
+            run_with(home, Ok(exe), "0.2.0", flag, HEALTHY_AFTER, move || {
+                checks.fetch_add(1, Ordering::Relaxed);
+                Ok(None)
+            })
+            .await;
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_marks_a_trial_healthy_after_the_wait_and_then_checks_for_updates() {
+        static FLAG: AtomicBool = AtomicBool::new(false);
+        static CHECKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let home = trial_home();
+        let exe = exe_in(home.path(), "0.2.0");
+        let task = spawn_run(home.path(), exe, &FLAG, &CHECKS);
+
+        tokio::time::sleep(HEALTHY_AFTER / 2).await;
+        assert!(!FLAG.load(Ordering::Relaxed));
+        assert!(state(home.path()).unwrap().trial.is_some());
+        tokio::time::sleep(HEALTHY_AFTER).await;
+        for _ in 0..200 {
+            if CHECKS.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(FLAG.load(Ordering::Relaxed));
+        assert_eq!(state(home.path()).unwrap().trial, None);
+        assert!(CHECKS.load(Ordering::Relaxed) > 0);
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_from_elsewhere_sets_the_flag_but_never_checks() {
+        static FLAG: AtomicBool = AtomicBool::new(false);
+        static CHECKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let home = trial_home();
+        let elsewhere = home.path().join("elsewhere");
+        script(&elsewhere, "foundryd 0.2.0");
+        let task = spawn_run(home.path(), elsewhere, &FLAG, &CHECKS);
+
+        tokio::time::sleep(HEALTHY_AFTER + CHECK_EVERY * 2).await;
+        std::thread::sleep(Duration::from_millis(100));
+
+        assert!(FLAG.load(Ordering::Relaxed));
+        assert_eq!(CHECKS.load(Ordering::Relaxed), 0);
+        assert!(state(home.path()).unwrap().trial.is_some());
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_with_no_executable_path_still_sets_the_flag() {
+        static FLAG: AtomicBool = AtomicBool::new(false);
+        let home = trial_home();
+        let task = tokio::spawn(run_with(
+            home.path().to_path_buf(),
+            Err(io::Error::other("no exe")),
+            "0.2.0",
+            &FLAG,
+            HEALTHY_AFTER,
+            || Ok(None),
+        ));
+
+        tokio::time::sleep(HEALTHY_AFTER + Duration::from_secs(1)).await;
+
+        assert!(FLAG.load(Ordering::Relaxed));
+        task.abort();
     }
 }

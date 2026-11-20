@@ -677,14 +677,51 @@ mod tests {
     }
 
     #[test]
-    fn going_back_is_said_and_going_forward_is_not() {
-        let note = went_back_note(Some("0.2.0"), "0.1.0").unwrap();
+    fn place_says_which_tag_a_go_back_left_refused_and_nothing_going_forward() {
+        let home = tempfile::tempdir().unwrap();
+        let (one, two) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        binaries(one.path(), "one");
+        binaries(two.path(), "two");
 
-        assert_eq!(
-            note,
-            "Went back from 0.2.0 to 0.1.0; v0.2.0 is refused until a higher tag ships."
-        );
-        assert_eq!(went_back_note(Some("0.1.0"), "0.2.0"), None);
-        assert_eq!(went_back_note(None, "0.1.0"), None);
+        let first = place(home.path(), &one.path().join("foundryd"), "0.1.0").unwrap();
+        let forward = place(home.path(), &two.path().join("foundryd"), "0.2.0").unwrap();
+        let back = place(home.path(), &one.path().join("foundryd"), "0.1.0").unwrap();
+
+        assert_eq!(first, None);
+        assert_eq!(forward, None);
+        assert_eq!(back.as_deref(), Some("v0.2.0"));
+    }
+
+    #[test]
+    fn place_reports_a_higher_refusal_that_was_already_held() {
+        let home = tempfile::tempdir().unwrap();
+        let (three, two) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        binaries(three.path(), "three");
+        binaries(two.path(), "two");
+        place(home.path(), &three.path().join("foundryd"), "0.3.0").unwrap();
+        fs::write(
+            home.path().join("update.json"),
+            r#"{"trial":null,"refused":"v0.4.0"}"#,
+        )
+        .unwrap();
+
+        let back = place(home.path(), &two.path().join("foundryd"), "0.2.0").unwrap();
+
+        assert_eq!(back.as_deref(), Some("v0.4.0"));
+    }
+
+    #[test]
+    fn stage_passes_the_refused_tag_on() {
+        let home = tempfile::tempdir().unwrap();
+        fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let (two, one) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        binaries(two.path(), "two");
+        binaries(one.path(), "one");
+
+        let first = stage(home.path(), &two.path().join("foundryd"), "0.2.0").unwrap();
+        let back = stage(home.path(), &one.path().join("foundryd"), "0.1.0").unwrap();
+
+        assert_eq!(first, None);
+        assert_eq!(back.as_deref(), Some("v0.2.0"));
     }
 }
