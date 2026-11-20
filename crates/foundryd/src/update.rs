@@ -441,8 +441,9 @@ fn watch_until_healthy(flag: &AtomicBool) -> bool {
     healthy
 }
 
-/// Ends the trial when it is of `running`: this version has stayed up.
-fn mark_healthy(home: &Path, running: &str) {
+/// Ends the trial when it is of `running`: this version has stayed up. False when the state
+/// could not be read or saved, so the caller tries again.
+fn mark_healthy(home: &Path, running: &str) -> bool {
     let result = lock(home).and_then(|_lock| {
         let mut state = state(home)?;
         if state.trial.as_ref().is_some_and(|t| t.version == running) {
@@ -452,8 +453,10 @@ fn mark_healthy(home: &Path, running: &str) {
         Ok(())
     });
     if let Err(error) = result {
-        tracing::warn!("cannot mark {running} healthy: {error}");
+        tracing::warn!("cannot mark {running} healthy, trying again at the next check: {error}");
+        return false;
     }
+    true
 }
 
 /// True when `version` is lower than `before`, the version `current` named.
@@ -592,6 +595,13 @@ fn install_tag(
         judge_version_check(result, tag, version)
     };
     let record = || {
+        // Checked again under the lock: a hand install may have moved `current` while the
+        // release was downloaded, and its version and refusal must stand.
+        if current_version(home).as_deref() != Some(running) {
+            return Err(io::Error::other(format!(
+                "current no longer names {running}: a hand install moved it, so {tag} waits"
+            )));
+        }
         // A trial of the new version, and no refusal: this tag is the highest there is.
         save(
             home,
@@ -637,8 +647,13 @@ fn judge_version_check(
 
 /// The release tags on GitHub, read with the machine's own `gh` login.
 fn list_tags() -> Result<Vec<String>, UpdateError> {
+    list_tags_with(OsStr::new("gh"))
+}
+
+/// [`list_tags`] with the `gh` program given.
+fn list_tags_with(gh: &OsStr) -> Result<Vec<String>, UpdateError> {
     let out = run_bounded(
-        Command::new("gh").args([
+        Command::new(gh).args([
             "release",
             "list",
             "--repo",
@@ -655,7 +670,11 @@ fn list_tags() -> Result<Vec<String>, UpdateError> {
         LIST_LIMIT,
     )
     .map_err(|error| UpdateError::Fetch(error.to_string()))?;
-    Ok(out.lines().map(|line| line.trim().to_string()).collect())
+    Ok(out
+        .lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect())
 }
 
 /// The asset a release holds for this machine.
@@ -710,6 +729,11 @@ fn check_with(
     list: impl FnOnce() -> Result<Vec<String>, UpdateError>,
     fetch: impl FnOnce(&str, &Path) -> Result<(), UpdateError>,
 ) -> Result<Option<String>, UpdateError> {
+    // A hand install moved `current` away from this daemon: the service starts that version
+    // at its next restart, so this one installs nothing over it.
+    if current_version(home).as_deref() != Some(running) {
+        return Ok(None);
+    }
     let tags = list()?;
     let refused = state(home)
         .map_err(io_error("cannot read the update state"))?
@@ -739,17 +763,14 @@ fn check_with(
 }
 
 /// What the daemon does once it has run for a minute: tells the watchdog through `flag`, and
-/// when it runs from `current` ends its trial. False means updates are off for this process.
+/// says whether it runs from `current`. False means updates are off for this process.
 fn became_healthy(flag: &AtomicBool, home: &Path, exe: &Path, running: &str) -> bool {
     flag.store(true, Ordering::Relaxed);
-    if !from_current(home, exe, running) {
-        return false;
-    }
-    mark_healthy(home, running);
-    true
+    from_current(home, exe, running)
 }
 
-/// Marks this version healthy after a minute, then looks for a newer tag every ten minutes.
+/// Marks this version healthy after a minute (again at each check until the mark is saved),
+/// then looks for a newer tag every ten minutes.
 /// After installing one it stops the daemon with SIGTERM, so the service starts the new
 /// `current`. Never returns: a daemon that is not run from `current` just waits.
 pub async fn run(home: PathBuf) {
@@ -760,8 +781,6 @@ pub async fn run(home: PathBuf) {
         std::env::current_exe(),
         running,
         &HEALTHY,
-        HEALTHY_AFTER,
-        CHECK_EVERY,
         move || check_with(&work, running, VERSION_LIMIT, list_tags, download),
         || {
             if let Err(error) = raise(Signal::SIGTERM) {
@@ -772,21 +791,17 @@ pub async fn run(home: PathBuf) {
     .await;
 }
 
-/// [`run`] with its inputs given: this process's path, the flag the watchdog reads, the wait
-/// before it is healthy, the wait between checks, one update check, and what stops the
-/// daemon once a check has installed a tag.
-#[allow(clippy::too_many_arguments)]
+/// [`run`] with its inputs given: this process's path, the flag the watchdog reads, one
+/// update check, and what stops the daemon once a check has installed a tag.
 async fn run_with(
     home: PathBuf,
     exe: io::Result<PathBuf>,
     running: &'static str,
     flag: &AtomicBool,
-    healthy_after: Duration,
-    check_every: Duration,
     check: impl Fn() -> Result<Option<String>, UpdateError> + Clone + Send + 'static,
     stop: impl Fn(),
 ) {
-    tokio::time::sleep(healthy_after).await;
+    tokio::time::sleep(HEALTHY_AFTER).await;
     // The flag is set whatever `exe` is, so a failed lookup never lets the watchdog kill a
     // healthy daemon.
     flag.store(true, Ordering::Relaxed);
@@ -798,7 +813,14 @@ async fn run_with(
         );
         pending::<()>().await;
     }
+    let mut marked = false;
     loop {
+        if !marked {
+            let home = home.clone();
+            marked = tokio::task::spawn_blocking(move || mark_healthy(&home, running))
+                .await
+                .unwrap_or(false);
+        }
         match tokio::task::spawn_blocking(check.clone()).await {
             Ok(Ok(Some(tag))) => {
                 tracing::info!("installed {tag}: stopping so the service starts it");
@@ -809,7 +831,7 @@ async fn run_with(
             Ok(Err(error)) => tracing::warn!("update check failed, trying again later: {error}"),
             Err(error) => tracing::warn!("update check stopped: {error}"),
         }
-        tokio::time::sleep(check_every).await;
+        tokio::time::sleep(CHECK_EVERY).await;
     }
 }
 
@@ -1542,7 +1564,7 @@ mod tests {
     }
 
     #[test]
-    fn became_healthy_from_current_clears_the_trial_and_says_updates_are_on() {
+    fn became_healthy_from_current_sets_the_flag_and_says_updates_are_on() {
         let home = trial_home();
         let exe = home.path().join("versions/0.2.0/foundryd");
         script(&exe, "foundryd 0.2.0");
@@ -1552,7 +1574,6 @@ mod tests {
 
         assert!(on);
         assert!(flag.load(Ordering::Relaxed));
-        assert_eq!(state(home.path()).unwrap().trial, None);
     }
 
     #[test]
@@ -1677,8 +1698,6 @@ mod tests {
 
     use std::sync::atomic::AtomicUsize;
 
-    const TICK: Duration = Duration::from_secs(10);
-
     fn nothing() -> Result<Option<String>, UpdateError> {
         Ok(None)
     }
@@ -1702,8 +1721,6 @@ mod tests {
             exe,
             "0.2.0",
             flag,
-            HEALTHY_AFTER,
-            TICK,
             move || {
                 checks.fetch_add(1, Ordering::Relaxed);
                 result()
@@ -1743,7 +1760,7 @@ mod tests {
         assert!(FLAG.load(Ordering::Relaxed));
         assert_eq!(state(home.path()).unwrap().trial, None);
         assert_eq!(CHECKS.load(Ordering::Relaxed), 1);
-        tokio::time::sleep(TICK + Duration::from_secs(1)).await;
+        tokio::time::sleep(CHECK_EVERY + Duration::from_secs(1)).await;
         reach(&CHECKS, 2).await;
         assert_eq!(CHECKS.load(Ordering::Relaxed), 2);
         assert_eq!(STOPS.load(Ordering::Relaxed), 0);
@@ -1761,7 +1778,7 @@ mod tests {
 
         tokio::time::sleep(HEALTHY_AFTER + Duration::from_secs(1)).await;
         reach(&STOPS, 1).await;
-        tokio::time::sleep(TICK * 3).await;
+        tokio::time::sleep(CHECK_EVERY * 3).await;
         std::thread::sleep(Duration::from_millis(100));
 
         assert_eq!(STOPS.load(Ordering::Relaxed), 1);
@@ -1785,7 +1802,7 @@ mod tests {
             nothing,
         );
 
-        tokio::time::sleep(HEALTHY_AFTER + TICK * 3).await;
+        tokio::time::sleep(HEALTHY_AFTER + CHECK_EVERY * 3).await;
         std::thread::sleep(Duration::from_millis(100));
 
         assert!(FLAG.load(Ordering::Relaxed));
@@ -2132,12 +2149,133 @@ mod tests {
         tokio::time::sleep(HEALTHY_AFTER + Duration::from_secs(1)).await;
         reach(&CHECKS, 1).await;
         assert_eq!(CHECKS.load(Ordering::Relaxed), 1);
-        tokio::time::sleep(TICK).await;
+        tokio::time::sleep(CHECK_EVERY).await;
         reach(&CHECKS, 2).await;
 
         assert_eq!(CHECKS.load(Ordering::Relaxed), 2);
         assert_eq!(STOPS.load(Ordering::Relaxed), 0);
         assert!(!task.is_finished());
         task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_healthy_mark_that_cannot_be_saved_is_tried_again_at_the_next_check() {
+        static FLAG: AtomicBool = AtomicBool::new(false);
+        static CHECKS: AtomicUsize = AtomicUsize::new(0);
+        static STOPS: AtomicUsize = AtomicUsize::new(0);
+        let home = trial_home();
+        let exe = exe_in(home.path(), "0.2.0");
+        // A directory where `save` writes its temporary file: every save fails.
+        let blocker = home.path().join("update.json.tmp");
+        fs::create_dir(&blocker).unwrap();
+        let task = spawn_run(home.path(), Ok(exe), &FLAG, (&CHECKS, &STOPS), nothing);
+
+        tokio::time::sleep(HEALTHY_AFTER + Duration::from_secs(1)).await;
+        reach(&CHECKS, 1).await;
+        assert!(state(home.path()).unwrap().trial.is_some());
+        fs::remove_dir(&blocker).unwrap();
+        tokio::time::sleep(CHECK_EVERY).await;
+        reach(&CHECKS, 2).await;
+
+        assert_eq!(state(home.path()).unwrap().trial, None);
+        task.abort();
+    }
+
+    #[test]
+    fn check_with_installs_nothing_once_a_hand_install_moved_current() {
+        let home = installed_home();
+        fs::create_dir_all(home.path().join("versions/0.0.9")).unwrap();
+        point_current(home.path(), "0.0.9").unwrap();
+
+        let found = check_with(
+            home.path(),
+            "0.1.0",
+            LIMIT,
+            || Ok(tags(&["v0.2.0"])),
+            |_, _| panic!("nothing is fetched"),
+        )
+        .unwrap();
+
+        assert_eq!(found, None);
+        assert_eq!(current(home.path()), PathBuf::from("versions/0.0.9"));
+    }
+
+    #[test]
+    fn a_hand_install_during_the_download_stands_and_the_tag_waits() {
+        let home = installed_home();
+        let path = home.path().to_path_buf();
+
+        let error = check_with(
+            home.path(),
+            "0.1.0",
+            LIMIT,
+            || Ok(tags(&["v0.2.0"])),
+            |_, stage| {
+                release(stage, "0.2.0");
+                fs::create_dir_all(path.join("versions/0.0.9")).unwrap();
+                point_current(&path, "0.0.9").unwrap();
+                placed_by_hand(&path, "0.0.9", Some("0.1.0")).unwrap();
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("hand install"), "{error}");
+        assert_eq!(current(home.path()), PathBuf::from("versions/0.0.9"));
+        let state = state(home.path()).unwrap();
+        assert_eq!(state.trial, None);
+        assert_eq!(state.refused.as_deref(), Some("v0.1.0"));
+    }
+
+    #[test]
+    fn list_tags_reads_the_published_tags_with_gh() {
+        let work = tempfile::tempdir().unwrap();
+        let args = work.path().join("args");
+        let gh = work.path().join("gh");
+        fs::write(
+            &gh,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf 'v0.2.0\\nv0.1.0\\n\\n'\n",
+                args.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let listed = list_tags_with(gh.as_os_str()).unwrap();
+
+        assert_eq!(listed, tags(&["v0.2.0", "v0.1.0"]));
+        let said = fs::read_to_string(&args).unwrap();
+        let said: Vec<&str> = said.lines().collect();
+        assert_eq!(
+            said,
+            [
+                "release",
+                "list",
+                "--repo",
+                REPO,
+                "--exclude-drafts",
+                "--exclude-pre-releases",
+                "--limit",
+                "100",
+                "--json",
+                "tagName",
+                "--jq",
+                ".[].tagName"
+            ]
+        );
+    }
+
+    #[test]
+    fn list_tags_passes_a_failed_gh_on_as_a_fetch_error() {
+        let work = tempfile::tempdir().unwrap();
+        let gh = work.path().join("gh");
+        fs::write(&gh, "#!/bin/sh\necho 'not logged in' >&2\nexit 1\n").unwrap();
+        fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let error = list_tags_with(gh.as_os_str()).unwrap_err();
+
+        assert!(matches!(error, UpdateError::Fetch(_)), "{error}");
+        assert!(error.to_string().contains("not logged in"), "{error}");
     }
 }
