@@ -6,6 +6,13 @@
 //! and only once the branch is on `origin`: a branch never pushed has no pull request, and a
 //! name another branch once had is not looked up. A `gh` that is missing, signed out, slow or
 //! offline makes the pull request unknown, never an error: the git half is still answered.
+//!
+//! GitHub finds pull requests by branch name, and a new workspace can reuse the name of an old
+//! branch that still has one. So a pull request counts as the workspace's only when its head
+//! commit is one of the branch's own commits: on the worktree's `HEAD` and not on its base. That
+//! holds after the branch moves past the head by more commits, and fails for an old branch's
+//! head, which this clone either does not have on `HEAD` or has only through the base it merged
+//! into. A head this machine has not seen yet is not claimed.
 
 use std::ffi::OsString;
 use std::process::Stdio;
@@ -19,8 +26,12 @@ use super::{WorkspaceError, Workspaces};
 /// How long one `gh` call may run before it is stopped and the pull request is unknown.
 const GH_WITHIN: Duration = Duration::from_secs(20);
 
-/// The fields asked of `gh pr list`, read by [`pull_request_from`].
-const FIELDS: &str = "number,title,url,state,isDraft,reviewDecision,statusCheckRollup";
+/// The fields asked of `gh pr list`, read by [`pull_requests_from`].
+const FIELDS: &str = "number,title,url,state,isDraft,reviewDecision,statusCheckRollup,headRefOid";
+
+/// How many pull requests from the branch's name are asked for, newest first, to find the
+/// workspace's own among those of older branches with the same name.
+const PRS_AT_MOST: &str = "20";
 
 /// Where a workspace's branch stands past this machine.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -30,7 +41,8 @@ pub struct Shipping {
     pub pushed: bool,
     /// Commits on the worktree's `HEAD` that no remote branch has.
     pub unpushed: u64,
-    /// The newest pull request from the branch, when GitHub was asked and has one.
+    /// The newest pull request whose head is one of the branch's own commits, when GitHub was
+    /// asked and has one.
     pub pr: Option<PullRequest>,
     /// Whether GitHub was asked and could not answer, so `pr` says nothing.
     pub unreachable: bool,
@@ -99,8 +111,16 @@ impl Workspaces {
             .parse()
             .unwrap_or(0);
         let (pr, unreachable) = if pushed {
-            match self.inner.gh_pull_request(&worktree, &body.branch).await {
-                Some(pr) => (pr, false),
+            match self.inner.gh_pull_requests(&worktree, &body.branch).await {
+                Some(listed) if listed.is_empty() => (None, false),
+                Some(listed) => {
+                    let own = self.inner.own_commits(&worktree, &body.base).await?;
+                    let pr = listed
+                        .into_iter()
+                        .find(|(head, _)| own.iter().any(|c| c == head))
+                        .map(|(_, pr)| pr);
+                    (pr, false)
+                }
                 None => (None, true),
             }
         } else {
@@ -117,16 +137,50 @@ impl Workspaces {
 }
 
 impl super::Inner {
-    /// The newest pull request whose head is `branch`, asked of GitHub with `gh` in `worktree`:
-    /// `Some(None)` when it has none, `None` when `gh` could not answer.
-    async fn gh_pull_request(
+    /// The commits on `worktree`'s `HEAD` since it left `origin/<base>`, full hashes. With the
+    /// base gone from the remote there is nothing to tell them from the base's, so none.
+    async fn own_commits(
+        &self,
+        worktree: &std::path::Path,
+        base: &str,
+    ) -> Result<Vec<String>, WorkspaceError> {
+        let Ok(from) = self
+            .git(
+                worktree,
+                "merge-base",
+                ["HEAD", &format!("refs/remotes/origin/{base}")],
+            )
+            .await
+        else {
+            return Ok(Vec::new());
+        };
+        let listed = self
+            .git(
+                worktree,
+                "rev-list",
+                [format!("{}..HEAD", from.trim()), "--".to_owned()],
+            )
+            .await?;
+        Ok(listed.lines().map(str::to_owned).collect())
+    }
+
+    /// The pull requests whose head branch is named `branch`, newest first, each with its head
+    /// commit, asked of GitHub with `gh` in `worktree`: `None` when `gh` could not answer.
+    async fn gh_pull_requests(
         &self,
         worktree: &std::path::Path,
         branch: &str,
-    ) -> Option<Option<PullRequest>> {
+    ) -> Option<Vec<(String, PullRequest)>> {
         let run = tokio::process::Command::new(&self.gh)
             .args([
-                "pr", "list", "--state", "all", "--limit", "1", "--json", FIELDS,
+                "pr",
+                "list",
+                "--state",
+                "all",
+                "--limit",
+                PRS_AT_MOST,
+                "--json",
+                FIELDS,
             ])
             .arg("--head")
             .arg(branch)
@@ -150,7 +204,7 @@ impl super::Inner {
             }
             Err(_) => return None,
         };
-        pull_request_from(&String::from_utf8_lossy(&out.stdout))
+        pull_requests_from(&String::from_utf8_lossy(&out.stdout))
     }
 }
 
@@ -174,6 +228,8 @@ struct Listed {
     review_decision: Option<String>,
     #[serde(default)]
     status_check_rollup: Option<Vec<Check>>,
+    #[serde(default)]
+    head_ref_oid: String,
 }
 
 /// One check run (`status`, `conclusion`) or commit status (`state`).
@@ -187,13 +243,14 @@ struct Check {
     state: Option<String>,
 }
 
-/// The first pull request `gh pr list --json` printed: `Some(None)` for an empty list, `None`
-/// for output that is not such a list.
-fn pull_request_from(out: &str) -> Option<Option<PullRequest>> {
+/// The pull requests `gh pr list --json` printed, in its order, each with its head commit;
+/// `None` for output that is not such a list.
+fn pull_requests_from(out: &str) -> Option<Vec<(String, PullRequest)>> {
     let listed: Vec<Listed> = serde_json::from_str(out).ok()?;
-    let Some(first) = listed.into_iter().next() else {
-        return Some(None);
-    };
+    listed.into_iter().map(pull_request).collect()
+}
+
+fn pull_request(first: Listed) -> Option<(String, PullRequest)> {
     let state = match first.state.as_str() {
         "OPEN" => PrState::Open,
         "MERGED" => PrState::Merged,
@@ -206,15 +263,18 @@ fn pull_request_from(out: &str) -> Option<Option<PullRequest>> {
         Some("REVIEW_REQUIRED") => Review::Required,
         _ => Review::None,
     };
-    Some(Some(PullRequest {
-        number: first.number,
-        title: first.title,
-        url: first.url,
-        state,
-        draft: first.is_draft,
-        checks: rolled_up(&first.status_check_rollup.unwrap_or_default()),
-        review,
-    }))
+    Some((
+        first.head_ref_oid,
+        PullRequest {
+            number: first.number,
+            title: first.title,
+            url: first.url,
+            state,
+            draft: first.is_draft,
+            checks: rolled_up(&first.status_check_rollup.unwrap_or_default()),
+            review,
+        },
+    ))
 }
 
 fn rolled_up(checks: &[Check]) -> Checks {
@@ -253,15 +313,28 @@ mod tests {
     use super::*;
 
     fn pr(json: &str) -> PullRequest {
-        pull_request_from(json).unwrap().unwrap()
+        pull_requests_from(json).unwrap().remove(0).1
     }
 
     #[test]
     fn an_empty_list_is_no_pull_request_and_other_output_is_unknown() {
-        assert_eq!(pull_request_from("[]\n"), Some(None));
-        assert_eq!(pull_request_from(""), None);
-        assert_eq!(pull_request_from("no pull requests found"), None);
-        assert_eq!(pull_request_from(r#"[{"number":1,"state":"WEIRD"}]"#), None);
+        assert_eq!(pull_requests_from("[]\n"), Some(Vec::new()));
+        assert_eq!(pull_requests_from(""), None);
+        assert_eq!(pull_requests_from("no pull requests found"), None);
+        assert_eq!(
+            pull_requests_from(r#"[{"number":1,"state":"WEIRD"}]"#),
+            None
+        );
+    }
+
+    #[test]
+    fn every_pull_request_is_read_in_order_with_its_head_commit() {
+        let read = pull_requests_from(
+            r#"[{"number":9,"state":"MERGED","headRefOid":"aaa"},{"number":4,"state":"OPEN","headRefOid":"bbb"}]"#,
+        )
+        .unwrap();
+        let heads: Vec<_> = read.iter().map(|(h, p)| (h.as_str(), p.number)).collect();
+        assert_eq!(heads, [("aaa", 9), ("bbb", 4)]);
     }
 
     #[test]

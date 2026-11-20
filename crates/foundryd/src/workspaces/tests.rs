@@ -2942,9 +2942,13 @@ async fn a_pushed_branch_shows_its_pull_request_and_what_is_not_pushed_yet() {
     let worktree = setup.worktree(remote.project, "shipped");
     git(&worktree, &["commit", "-q", "--allow-empty", "-m", "done"]);
     git(&worktree, &["push", "-q", "origin", "HEAD"]);
+    let done = git(&worktree, &["rev-parse", "HEAD"]);
     let (workspaces, asked) = with_gh(
         &setup,
-        r#"[{"number":7,"title":"Ship it","url":"https://github.com/o/r/pull/7","state":"MERGED","isDraft":false,"reviewDecision":"APPROVED","statusCheckRollup":[]}]"#,
+        &format!(
+            r#"[{{"number":7,"title":"Ship it","url":"https://github.com/o/r/pull/7","state":"MERGED","isDraft":false,"reviewDecision":"APPROVED","statusCheckRollup":[],"headRefOid":"{}"}}]"#,
+            done.trim()
+        ),
     );
 
     let read = workspaces.shipping(id).await.unwrap();
@@ -2958,7 +2962,74 @@ async fn a_pushed_branch_shows_its_pull_request_and_what_is_not_pushed_yet() {
     assert!(args.trim_end().ends_with("--head shipped"), "{args}");
 
     git(&worktree, &["commit", "-q", "--allow-empty", "-m", "after"]);
-    assert_eq!(workspaces.shipping(id).await.unwrap().unpushed, 1);
+    let moved_past = workspaces.shipping(id).await.unwrap();
+    assert_eq!(moved_past.unpushed, 1);
+    assert_eq!(
+        moved_past.pr.map(|pr| pr.number),
+        Some(7),
+        "a pull request whose head the branch has moved past is still its own"
+    );
+}
+
+#[tokio::test]
+async fn a_pull_request_from_another_branch_of_the_same_name_is_never_shown() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup.create(&remote, "main", "namesake").await;
+    let worktree = setup.worktree(remote.project, "namesake");
+    git(&worktree, &["commit", "-q", "--allow-empty", "-m", "mine"]);
+    git(&worktree, &["push", "-q", "origin", "HEAD"]);
+    let mine = git(&worktree, &["rev-parse", "HEAD"]).trim().to_owned();
+    let in_base = git(&worktree, &["rev-parse", "refs/remotes/origin/main"])
+        .trim()
+        .to_owned();
+    let unknown = "0123456789abcdef0123456789abcdef01234567";
+    let listed = |number: u64, state: &str, head: &str| {
+        format!(
+            r#"{{"number":{number},"title":"PR {number}","url":"https://github.com/o/r/pull/{number}","state":"{state}","isDraft":false,"reviewDecision":"","statusCheckRollup":[],"headRefOid":"{head}"}}"#
+        )
+    };
+
+    let (others, asked) = with_gh(
+        &setup,
+        &format!(
+            "[{},{}]",
+            listed(32, "MERGED", unknown),
+            listed(31, "CLOSED", &in_base)
+        ),
+    );
+    let read = others.shipping(id).await.unwrap();
+    assert_eq!(
+        read.pr, None,
+        "an old branch's pull request is not this one's"
+    );
+    assert!(!read.unreachable);
+    let args = std::fs::read_to_string(&asked).unwrap();
+    let limit: u64 = args
+        .split_whitespace()
+        .skip_while(|a| *a != "--limit")
+        .nth(1)
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+    assert!(
+        limit > 1,
+        "only the newest pull request was asked for: {args}"
+    );
+
+    let (behind, _) = with_gh(
+        &setup,
+        &format!(
+            "[{},{}]",
+            listed(32, "MERGED", unknown),
+            listed(40, "OPEN", &mine)
+        ),
+    );
+    let read = behind.shipping(id).await.unwrap();
+    assert_eq!(
+        read.pr.map(|pr| (pr.number, pr.state)),
+        Some((40, PrState::Open)),
+        "its own pull request is found behind a newer one of the same name"
+    );
 }
 
 #[tokio::test]
