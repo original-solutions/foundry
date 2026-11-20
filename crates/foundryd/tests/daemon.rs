@@ -138,6 +138,20 @@ impl Fixture {
             path_first: None,
             daemon: None,
         }
+        .with_tailscale_stopped()
+    }
+
+    /// Puts a stand-in for the Tailscale CLI in the daemon's `HOME`, so no test asks the real
+    /// one. It answers as a stopped Tailscale does, and notes its arguments in `tailscale-asked`.
+    fn with_tailscale_stopped(self) -> Self {
+        let cli = self.user.path().join("tailscale");
+        fs::write(
+            &cli,
+            "#!/bin/sh\necho \"$@\" > \"$(dirname \"$0\")/tailscale-asked\"\necho 'Tailscale is stopped (fake).' >&2\nexit 1\n",
+        )
+        .unwrap();
+        fs::set_permissions(&cli, fs::Permissions::from_mode(0o755)).unwrap();
+        self
     }
 
     /// `foundryd args` on this data directory and `port`, with the gateway URL the test set,
@@ -149,6 +163,7 @@ impl Fixture {
             .env("FOUNDRY_HOME", self.home.path())
             .env("FOUNDRY_PORT", port.to_string())
             .env("FOUNDRY_SECRETS", "file")
+            .env("FOUNDRY_TAILSCALE", self.user.path().join("tailscale"))
             .env("HOME", self.user.path())
             .env("SHELL", &self.shell)
             .env_remove("CLAUDE_CONFIG_DIR");
@@ -411,6 +426,28 @@ fn after_sigterm_the_daemon_exits_0_and_a_terminal_child_still_runs() {
 
     let (status, body) = fixture.call("POST", &format!("/api/terminals/{terminal}/close"), None);
     assert_eq!(status, 204, "{body}");
+    assert_eq!(fixture.stop(), Some(0));
+}
+
+/// Tailscale stopped, logged out or missing: the daemon asks it, still serves loopback, and
+/// says why it serves nothing else in one warning.
+#[test]
+fn with_tailscale_stopped_the_daemon_serves_loopback_and_warns_once_why() {
+    let mut fixture = Fixture::new();
+    fixture.start();
+
+    let asked = fs::read_to_string(fixture.user.path().join("tailscale-asked")).unwrap();
+    assert_eq!(asked.trim(), "ip");
+    let log = fixture.log();
+    let warnings: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("WARN") && line.contains("Tailscale"))
+        .collect();
+    assert_eq!(warnings.len(), 1, "{log}");
+    assert!(
+        warnings[0].contains("Tailscale is stopped (fake)."),
+        "{log}"
+    );
     assert_eq!(fixture.stop(), Some(0));
 }
 

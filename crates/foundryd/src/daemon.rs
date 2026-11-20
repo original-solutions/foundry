@@ -972,6 +972,63 @@ mod tests {
         assert!(warnings[1].contains("logged out"), "{warnings:?}");
     }
 
+    #[test]
+    fn foundry_tailscale_names_the_cli_when_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let known = dir.path().join("known");
+        std::fs::write(&known, "").unwrap();
+        let known = known.to_str().unwrap();
+
+        assert_eq!(
+            choose_cli(os("/opt/fake/tailscale"), &[known]),
+            PathBuf::from("/opt/fake/tailscale")
+        );
+    }
+
+    #[test]
+    fn without_foundry_tailscale_the_first_known_cli_that_is_there_is_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        let there = dir.path().join("there");
+        let also = dir.path().join("also");
+        std::fs::write(&there, "").unwrap();
+        std::fs::write(&also, "").unwrap();
+        let known = [
+            missing.to_str().unwrap(),
+            there.to_str().unwrap(),
+            also.to_str().unwrap(),
+        ];
+
+        assert_eq!(choose_cli(None, &known), there);
+        assert_eq!(choose_cli(os(""), &known), there);
+    }
+
+    #[test]
+    fn with_no_known_cli_there_tailscale_on_path_is_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+
+        assert_eq!(
+            choose_cli(None, &[missing.to_str().unwrap()]),
+            PathBuf::from("tailscale")
+        );
+    }
+
+    /// A service's `PATH` under launchd holds neither the app's CLI nor Homebrew's.
+    #[test]
+    fn on_macos_the_app_cli_comes_first_then_homebrew_s() {
+        let expected: &[&str] = if cfg!(target_os = "macos") {
+            &[
+                "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+                "/opt/homebrew/bin/tailscale",
+                "/usr/local/bin/tailscale",
+            ]
+        } else {
+            &[]
+        };
+        assert_eq!(KNOWN_CLIS, expected);
+    }
+
     /// Writes an executable stand-in for the Tailscale CLI that runs `body`.
     fn fake_cli(dir: &Path, body: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
