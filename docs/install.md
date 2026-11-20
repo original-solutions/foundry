@@ -56,8 +56,6 @@ This copies both binaries to `<home>/versions/<version>/`, points `<home>/curren
 
 The log is `~/Library/Logs/foundry/foundryd.log`.
 
-To change an environment variable, set it in your shell and run `<home>/current/foundryd install`. It replaces the agent.
-
 ## Linux
 
 Run `install` as the user that will run the service. Never as root: Claude Code refuses its permission mode as root, and `install` refuses to run as root.
@@ -76,6 +74,16 @@ sudo systemctl restart foundryd
 ```
 
 The unit runs as your user. Read the log with `journalctl -u foundryd`.
+
+## Change a setting
+
+`install` writes the service from the current shell alone. To change a variable, export every one the service needs again first: `FOUNDRY_HOME` if you use it, `FOUNDRY_GATEWAY_URL`, and any of `PATH`, `FOUNDRY_PORT` and `CLAUDE_CONFIG_DIR` you set. Then run:
+
+```sh
+<home>/current/foundryd install
+```
+
+On macOS this replaces the agent. On Linux it rewrites the unit; run the `sudo` lines it prints.
 
 ## Updates
 
@@ -99,7 +107,7 @@ To go back to an older version by hand, run `install` from that version's folder
 <home>/versions/<version>/foundryd install
 ```
 
-The newer version is then refused, as after a rollback. The refusal holds until a higher tag ships. On Linux, run the `sudo systemctl restart foundryd` line it prints so the service starts the older version.
+`install` says it went back. The newer version is then refused, as after a rollback. Export the same variables first, as in the section above, because `install` rewrites the service from your shell. The refusal holds until a higher tag ships. On Linux, run the `sudo systemctl restart foundryd` line it prints so the service starts the older version.
 
 ## Uninstall
 

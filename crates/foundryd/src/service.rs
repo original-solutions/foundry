@@ -204,6 +204,14 @@ fn place(home: &Path, exe: &Path, version: &str) -> Result<(), UpdateError> {
     update::place_version(home, version, copy, record)
 }
 
+/// The line `install` prints when it put back a version lower than the one `current` named.
+fn went_back_note(before: Option<&str>, version: &str) -> Option<String> {
+    let before = before.filter(|_| update::lowered(before, version))?;
+    Some(format!(
+        "Went back from {before} to {version}; v{before} is refused until a higher tag ships."
+    ))
+}
+
 /// Makes the data directory as `foundryd run` does (and refuses one other users can reach),
 /// then places this version.
 fn stage(home: &Path, exe: &Path, version: &str) -> Result<(), ServiceError> {
@@ -308,14 +316,18 @@ fn do_install() -> Result<String, ServiceError> {
     }
     let exe = std::env::current_exe().map_err(io_error("cannot find this program"))?;
     let version = env!("CARGO_PKG_VERSION");
+    let before = update::current_version(&home);
     stage(&home, &exe, version)?;
     let done = if cfg!(target_os = "macos") {
         install_macos(&home)?
     } else {
         install_linux(&home)?
     };
+    let back = went_back_note(before.as_deref(), version)
+        .map(|note| format!("{note}\n"))
+        .unwrap_or_default();
     Ok(format!(
-        "Placed version {version} in {}\n{done}",
+        "Placed version {version} in {}\n{back}{done}",
         home.join("versions").display()
     ))
 }

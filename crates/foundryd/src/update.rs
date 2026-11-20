@@ -121,7 +121,7 @@ fn drain(pipe: Option<impl std::io::Read + Send + 'static>) -> std::thread::Join
 }
 
 /// Runs `command` and returns its stdout. It is killed and reaped when it outlives `limit`.
-/// Every child process of the daemon and of `install` goes through here.
+/// Every child process of the updater and of `install` goes through here.
 pub(crate) fn run_bounded(command: &mut Command, limit: Duration) -> Result<String, RunError> {
     let name = command_name(command);
     let mut child = command
@@ -316,21 +316,27 @@ fn watch(healthy: &AtomicBool, deadline: Duration, poll: Duration) -> bool {
     true
 }
 
+/// True when this process runs from `current` and a trial of `running` is on.
+fn on_trial(home: &Path, exe: &Path, running: &str) -> bool {
+    from_current(home, exe, running)
+        && state(home).is_ok_and(|s| s.trial.is_some_and(|t| t.version == running))
+}
+
 /// Called by `foundryd run` before it does anything else. False means this version was
 /// rolled back and the process must exit with success so the service starts the previous one.
 /// A start that goes on while a trial of this version is on gets a watchdog: if the daemon is
 /// not healthy by [`TRIAL_DEADLINE`] the process exits, so a hang counts as a failed start.
 pub fn starting(home: &Path) -> bool {
     let running = env!("CARGO_PKG_VERSION");
-    let from_current = std::env::current_exe()
-        .map(|exe| from_current(home, &exe, running))
-        .unwrap_or(false);
-    if !from_current {
+    let Ok(exe) = std::env::current_exe() else {
+        return true;
+    };
+    if !from_current(home, &exe, running) {
         return true;
     }
     match start_with(home, running) {
         Ok(Start::Run) => {
-            if state(home).is_ok_and(|s| s.trial.is_some_and(|t| t.version == running)) {
+            if on_trial(home, &exe, running) {
                 std::thread::spawn(|| {
                     if !watch(&HEALTHY, TRIAL_DEADLINE, Duration::from_secs(1)) {
                         tracing::error!(
@@ -370,13 +376,21 @@ fn mark_healthy(home: &Path, running: &str) {
     }
 }
 
+/// True when `version` is lower than `before`, the version `current` named.
+pub fn lowered(before: Option<&str>, version: &str) -> bool {
+    before.is_some_and(|before| parse(before).is_some() && parse(before) > parse(version))
+}
+
 /// Records a hand install of `version` over `before` (the version `current` named). It ends
-/// any trial, and when `version` is lower it refuses `v<before>` as an automatic rollback
+/// a trial of any other version, and when `version` is lower it refuses `v<before>` as an automatic rollback
 /// does, so the updater does not undo the install until a higher tag ships.
 pub fn placed_by_hand(home: &Path, version: &str, before: Option<&str>) -> io::Result<()> {
     let mut state = state(home)?;
-    state.trial = None;
-    if let Some(before) = before.filter(|b| parse(b) > parse(version) && parse(b).is_some()) {
+    // Installing the version that is on trial again must not stop its rollback.
+    if state.trial.as_ref().is_some_and(|t| t.version != version) {
+        state.trial = None;
+    }
+    if let Some(before) = before.filter(|b| lowered(Some(b), version)) {
         let held = state
             .refused
             .as_deref()
@@ -461,6 +475,7 @@ fn install_tag(
     home: &Path,
     tag: &str,
     running: &str,
+    version_limit: Duration,
     fetch: impl FnOnce(&str, &Path) -> Result<(), UpdateError>,
 ) -> Result<(), UpdateError> {
     let version = tag
@@ -475,11 +490,17 @@ fn install_tag(
             version: version.to_string(),
             printed,
         };
-        let printed = run_bounded(
+        // A binary that cannot run at all, or runs past the limit, says nothing about the
+        // release: that is tried again. One that ran and failed, or said the wrong thing, is
+        // a bad asset.
+        let printed = match run_bounded(
             Command::new(stage.join("foundryd")).arg("--version"),
-            VERSION_LIMIT,
-        )
-        .map_err(|error| wrong(error.to_string()))?;
+            version_limit,
+        ) {
+            Ok(printed) => printed,
+            Err(error @ RunError::Failed { .. }) => return Err(wrong(error.to_string())),
+            Err(error) => return Err(UpdateError::Fetch(error.to_string())),
+        };
         if printed != format!("foundryd {version}\n") {
             return Err(wrong(printed.trim().to_string()));
         }
@@ -561,10 +582,13 @@ fn download(tag: &str, stage: &Path) -> Result<(), UpdateError> {
 }
 
 /// One look for a newer tag. `Some` is the tag that was installed. A release whose files are
-/// bad is refused, so it is not downloaded again; any other failure is tried again later.
+/// bad (a missing binary, or one that ran and failed or printed the wrong version) is refused,
+/// so it is not downloaded again; any other failure, including a version check that cannot run
+/// or times out, is tried again later.
 fn check_with(
     home: &Path,
     running: &str,
+    version_limit: Duration,
     list: impl FnOnce() -> Result<Vec<String>, UpdateError>,
     fetch: impl FnOnce(&str, &Path) -> Result<(), UpdateError>,
 ) -> Result<Option<String>, UpdateError> {
@@ -575,7 +599,7 @@ fn check_with(
     let Some(tag) = pick(&tags, running, refused.as_deref()) else {
         return Ok(None);
     };
-    match install_tag(home, &tag, running, fetch) {
+    match install_tag(home, &tag, running, version_limit, fetch) {
         Ok(()) => Ok(Some(tag)),
         Err(error @ (UpdateError::WrongVersion { .. } | UpdateError::Missing(_))) => {
             let refuse = state(home).and_then(|mut state| {
@@ -591,27 +615,34 @@ fn check_with(
     }
 }
 
+/// What the daemon does once it has run for a minute: tells the watchdog, and when it runs
+/// from `current` ends its trial. False means updates are off for this process.
+fn became_healthy(home: &Path, exe: &Path, running: &str) -> bool {
+    HEALTHY.store(true, Ordering::Relaxed);
+    if !from_current(home, exe, running) {
+        return false;
+    }
+    mark_healthy(home, running);
+    true
+}
+
 /// Marks this version healthy after a minute, then looks for a newer tag every ten minutes.
 /// After installing one it stops the daemon with SIGTERM, so the service starts the new
 /// `current`. Never returns: a daemon that is not run from `current` just waits.
 pub async fn run(home: PathBuf) {
     let running = env!("CARGO_PKG_VERSION");
     tokio::time::sleep(HEALTHY_AFTER).await;
-    HEALTHY.store(true, Ordering::Relaxed);
-    let from_current = std::env::current_exe()
-        .map(|exe| from_current(&home, &exe, running))
-        .unwrap_or(false);
-    if !from_current {
+    let on = std::env::current_exe().is_ok_and(|exe| became_healthy(&home, &exe, running));
+    if !on {
         tracing::info!(
             "updates are off: this daemon is not run from {}",
             home.join("current").display()
         );
         pending::<()>().await;
     }
-    mark_healthy(&home, running);
     loop {
         let work = home.clone();
-        let check = move || check_with(&work, running, list_tags, download);
+        let check = move || check_with(&work, running, VERSION_LIMIT, list_tags, download);
         match tokio::task::spawn_blocking(check).await {
             Ok(Ok(Some(tag))) => {
                 tracing::info!("installed {tag}: stopping so the service starts it");
@@ -1249,18 +1280,15 @@ mod tests {
             LIMIT,
             || Ok(tags(&["v0.2.0"])),
             |_, stage| {
-                // No interpreter line and not a binary: the system cannot start it.
-                fs::write(stage.join("foundryd"), "").unwrap();
+                // Its interpreter does not exist, so the system cannot start it.
+                fs::write(stage.join("foundryd"), "#!/no/such/interpreter\n").unwrap();
                 fs::write(stage.join("foundry-holder"), "holder").unwrap();
                 Ok(())
             },
         );
 
-        // An empty file cannot be executed; whichever way the system says so, it is a failure
-        // to run, which is retried. A binary that ran and said the wrong thing is refused.
-        assert!(error.is_err());
-        let refused = state(home.path()).unwrap().refused;
-        assert!(refused.is_none() || matches!(error, Err(UpdateError::WrongVersion { .. })));
+        assert!(matches!(error, Err(UpdateError::Fetch(_))), "{error:?}");
+        assert_eq!(state(home.path()).unwrap().refused, None);
     }
 
     #[test]
@@ -1280,7 +1308,10 @@ mod tests {
         );
 
         assert!(matches!(error, Err(UpdateError::WrongVersion { .. })));
-        assert_eq!(state(home.path()).unwrap().refused.as_deref(), Some("v0.2.0"));
+        assert_eq!(
+            state(home.path()).unwrap().refused.as_deref(),
+            Some("v0.2.0")
+        );
     }
 
     #[test]
@@ -1306,7 +1337,10 @@ mod tests {
 
         placed_by_hand(home.path(), "0.2.0", Some("0.3.0")).unwrap();
 
-        assert_eq!(state(home.path()).unwrap().refused.as_deref(), Some("v0.3.0"));
+        assert_eq!(
+            state(home.path()).unwrap().refused.as_deref(),
+            Some("v0.3.0")
+        );
     }
 
     #[test]
