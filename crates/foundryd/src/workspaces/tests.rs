@@ -2205,6 +2205,36 @@ fn worktrees_in_reads_the_porcelain_list_line_by_line() {
     );
 }
 
+/// The sweep has one deadline for all of it. A project it cannot get through in time, here
+/// one whose lock is held, stops it with a WARN line naming the clone, and start goes on.
+#[tokio::test]
+async fn sweep_stops_at_its_deadline_and_logs_the_clone_it_stopped_in() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let leftover = setup.leftover(&remote, "crashed").await;
+    let lock = setup.workspaces.inner.lock(remote.project);
+    let _held = lock.lock().await;
+    let (_guard, logs) = logs();
+
+    let started = Instant::now();
+    setup
+        .workspaces
+        .inner
+        .sweep(Duration::from_millis(200))
+        .await
+        .unwrap();
+
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert!(leftover.exists());
+    let text = text_of(&logs);
+    let line = text
+        .lines()
+        .find(|l| l.contains(&format!("{}.git", remote.project)))
+        .unwrap_or_else(|| panic!("no line names the clone: {text}"));
+    assert!(line.contains("WARN"), "{line}");
+    assert!(line.contains("next start"), "{line}");
+}
+
 #[tokio::test]
 async fn sweep_logs_a_clone_it_cannot_read_and_goes_on_to_the_next() {
     let setup = Setup::new();

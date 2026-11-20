@@ -23,9 +23,10 @@
 //! to git, so without it git refuses whatever the checks missed.
 //!
 //! A create that dies after making its worktree and before writing its record leaves a worktree
-//! no record names. At start, [`Workspaces::sweep`] removes each such worktree that an unforced
-//! archive would remove and that holds nothing git ignores, so git can give back all of it,
-//! keeping its branch, and leaves and logs any other.
+//! no record names. At start, [`Workspaces::sweep`] removes each worktree no live record names,
+//! whatever left it, that an unforced archive would remove and that holds nothing git ignores,
+//! so git can give back all of it, keeping its branch, and leaves and logs any other. It stops at
+//! one deadline, and what it did not reach waits for the next start.
 //!
 //! Every branch is made by [`safe_branch`] and every path reaches git after `--`, so a name as
 //! typed never reads as an option and never leaves the project's folder of worktrees.
@@ -56,6 +57,10 @@ const BRANCH_AT_MOST: usize = 100;
 /// whole repo, so this is generous; it is there so a remote that stops answering cannot hold a
 /// project's lock for good.
 const GIT_WITHIN: Duration = Duration::from_secs(10 * 60);
+
+/// How long the sweep at start may run in all, so a git call that hangs cannot hold the daemon's
+/// start for [`GIT_WITHIN`] per worktree.
+const SWEEP_WITHIN: Duration = Duration::from_secs(60);
 
 /// Runs each command given after it in turn, says which one failed and exits with its code.
 const SETUP: &str = r#"for command do
@@ -265,16 +270,18 @@ impl Workspaces {
     }
 
     /// Deals with each worktree under `worktrees/<project>/`, for each project in the shared
-    /// settings, that no live workspace record in the store names, as a create that died before
-    /// writing its record leaves. One that passes the checks of an unforced archive and holds no
-    /// file git ignores, which such a create never leaves, is removed without `--force` and its
-    /// branch kept; any other, or one git will not remove, is left as it is and logged with what
+    /// settings, that no live workspace record in the store names, whatever left it: a create
+    /// that died before writing its record leaves one. One that passes the checks of an
+    /// unforced archive and holds no file git ignores, which such a create never leaves, is
+    /// removed without `--force` and its branch kept; any other, or one git will not remove, is left as it is and logged with what
     /// holds it. One named only by another owner's record is left and logged too. A worktree
     /// whose folder is gone is checked by the `HEAD` git keeps for it. Branches are never
     /// touched. A store that cannot be read skips the sweep, and a clone that cannot be read or
-    /// whose worktrees cannot be listed is passed over, each with a log line.
+    /// whose worktrees cannot be listed is passed over, each with a log line. After
+    /// [`SWEEP_WITHIN`] in all it stops where it is, says which clone it stopped in, and leaves
+    /// the rest for the next start.
     pub async fn sweep(&self) -> Result<(), WorkspaceError> {
-        self.inner.sweep().await
+        self.inner.sweep(SWEEP_WITHIN).await
     }
 }
 
@@ -425,10 +432,13 @@ impl Inner {
         self.write(body, true).await
     }
 
-    async fn sweep(&self) -> Result<(), WorkspaceError> {
+    async fn sweep(&self, within: Duration) -> Result<(), WorkspaceError> {
+        let deadline = tokio::time::Instant::now() + within;
         // Every owner's records count: the machine's identity can be made again while its data
         // directory stays, and a record only ever keeps a worktree. Projects come from the
-        // settings, as a create's do, so a store made again, which holds none, removes nothing.
+        // settings, as a create's do, so a store made again removes nothing until settings reach
+        // it. Once they do, it removes the clean worktrees of live workspaces whose records it
+        // does not hold yet; each holds nothing git cannot give back, and its branch is kept.
         let read = self
             .with_store(|store| {
                 let projects: Vec<ProjectId> = store
@@ -452,13 +462,13 @@ impl Inner {
             Err(error) => {
                 tracing::warn!(
                     %error,
-                    "the store could not be read, so the sweep for worktrees a failed create \
-                     left is skipped this start"
+                    "the store could not be read, so the sweep for worktrees no live workspace \
+                     record names is skipped this start"
                 );
                 return Ok(());
             }
         };
-        for project in projects {
+        for (at, &project) in projects.iter().enumerate() {
             let clone = self.clone_path(project);
             match tokio::fs::try_exists(&clone).await {
                 Ok(true) => {}
@@ -467,7 +477,7 @@ impl Inner {
                     tracing::warn!(
                         clone = %clone.display(),
                         %error,
-                        "the clone could not be read to find what a failed create left"
+                        "the clone could not be read to sweep its worktrees"
                     );
                     continue;
                 }
@@ -478,15 +488,27 @@ impl Inner {
                     .map(|(_, w)| w.branch.as_str())
                     .collect()
             };
-            if let Err(error) = self
-                .sweep_project(project, &branches(true), &branches(false))
-                .await
-            {
-                tracing::warn!(
+            let swept = tokio::time::timeout_at(
+                deadline,
+                self.sweep_project(project, &branches(true), &branches(false)),
+            )
+            .await;
+            match swept {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!(
                     clone = %clone.display(),
                     %error,
-                    "the clone's worktrees could not be listed to find what a failed create left"
-                );
+                    "the clone's worktrees could not be listed to sweep them"
+                ),
+                Err(_) => {
+                    tracing::warn!(
+                        clone = %clone.display(),
+                        projects_after = projects.len() - at - 1,
+                        "the sweep ran out of time in this clone; it and the projects after it \
+                         are swept at the next start"
+                    );
+                    break;
+                }
             }
         }
         Ok(())
@@ -546,8 +568,8 @@ impl Inner {
                     match self.remove_worktree(&clone, &listed, false).await {
                         Ok(_) => tracing::info!(
                             %worktree,
-                            "removed a worktree no workspace names, left by a failed create; its \
-                             branch is kept"
+                            "removed a worktree no live workspace record names; its branch is \
+                             kept"
                         ),
                         Err(error) => tracing::warn!(
                             %worktree,
