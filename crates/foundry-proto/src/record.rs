@@ -39,6 +39,10 @@ pub struct Workspace {
     pub branch: String,
     /// The branch the workspace was made from.
     pub base: String,
+    /// The terminal its setup commands run in, once started. `None` for a workspace with no
+    /// setup, and in a record from a peer that does not write it.
+    #[serde(default)]
+    pub setup: Option<TerminalId>,
 }
 
 /// A PTY in a workspace.
@@ -76,6 +80,10 @@ pub struct MachineSample {
     /// Bytes free on the volume holding the data directory.
     pub free_disk: u64,
     pub sessions: u32,
+    /// The tag this machine's updater refused after rolling it back, like `v0.2.0`, while the
+    /// version installed is not above it. `None` in a sample from a peer that does not write it.
+    #[serde(default)]
+    pub update_refused: Option<String>,
 }
 
 /// Any kind of record, tagged by `kind`, so one message can carry several kinds.
@@ -135,6 +143,7 @@ pub(crate) mod tests {
                 name: "fix login".into(),
                 branch: "fix-login".into(),
                 base: "main".into(),
+                setup: Some(TerminalId::random()),
             },
         }
     }
@@ -178,6 +187,7 @@ pub(crate) mod tests {
                 free_memory: 8 * 1024 * 1024 * 1024,
                 free_disk: 512 * 1024 * 1024 * 1024,
                 sessions: 4,
+                update_refused: Some("v0.2.0".into()),
             },
         }
     }
@@ -196,6 +206,28 @@ pub(crate) mod tests {
         assert_round_trip(&AnyRecord::Terminal(terminal()));
         assert_round_trip(&AnyRecord::Session(session()));
         assert_round_trip(&AnyRecord::MachineSample(machine_sample()));
+    }
+
+    #[test]
+    fn a_workspace_with_no_setup_and_a_sample_with_no_refused_tag_round_trip() {
+        let mut workspace = workspace();
+        workspace.body.setup = None;
+        assert_round_trip(&workspace);
+        let mut sample = machine_sample();
+        sample.body.update_refused = None;
+        assert_round_trip(&sample);
+    }
+
+    #[test]
+    fn a_setup_terminal_and_a_refused_tag_are_written_under_their_names() {
+        let workspace = workspace();
+        let json = serde_json::to_value(&workspace).unwrap();
+        assert_eq!(
+            json["body"]["setup"],
+            serde_json::json!(workspace.body.setup.unwrap())
+        );
+        let json = serde_json::to_value(machine_sample()).unwrap();
+        assert_eq!(json["body"]["update_refused"], "v0.2.0");
     }
 
     #[test]
@@ -265,6 +297,7 @@ pub(crate) mod tests {
                         name: "n".into(),
                         branch: "b".into(),
                         base: "main".into(),
+                        setup: None,
                     },
                 }),
             ),
@@ -320,6 +353,7 @@ pub(crate) mod tests {
                         free_memory: 1,
                         free_disk: 2,
                         sessions: 3,
+                        update_refused: None,
                     },
                 }),
             ),

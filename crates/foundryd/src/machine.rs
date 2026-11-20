@@ -2,7 +2,8 @@
 //!
 //! Every 5 seconds this machine writes one [`MachineSample`] record of its own: the whole
 //! machine's load per core, its free memory, the free disk on the volume holding the data
-//! directory, and its live session count. The record's version is the sample's `at_version`.
+//! directory, its live session count, and the tag its updater refused while the version
+//! installed is not above it. The record's version is the sample's `at_version`.
 //! [`over_limits`] says which of a machine's limits a sample is at or over, one [`Reason`]
 //! per limit.
 
@@ -19,6 +20,7 @@ use sysinfo::{CpuRefreshKind, LoadAvg, MemoryRefreshKind, RefreshKind, System};
 use tokio::time::MissedTickBehavior;
 
 use crate::store::{Store, StoreError};
+use crate::update;
 
 /// How often this machine writes its sample.
 pub const SAMPLE_EVERY: Duration = Duration::from_secs(5);
@@ -147,6 +149,7 @@ pub fn read(data_dir: &Path, sessions: u32) -> Result<MachineSample, MachineErro
         free_memory: system.available_memory(),
         free_disk: free_disk(data_dir)?,
         sessions,
+        update_refused: None,
     })
 }
 
@@ -161,12 +164,14 @@ pub fn write_sample(
     data_dir: &Path,
 ) -> Result<Record<MachineSample>, MachineError> {
     let machine = read(data_dir, 0)?;
+    let update_refused = update_refused(data_dir);
     // A task that panicked while holding the store leaves it consistent: SQLite rolls back
     // a transaction that was not committed. Stopping here would freeze this machine's last
     // sample while it still looks online.
     let mut store = store.lock().unwrap_or_else(PoisonError::into_inner);
     let body = MachineSample {
         sessions: live_sessions(&store, me)?,
+        update_refused,
         ..machine
     };
     let record = Record {
@@ -177,6 +182,21 @@ pub fn write_sample(
     };
     store.apply(&AnyRecord::MachineSample(record.clone()), me)?;
     Ok(record)
+}
+
+/// The tag the updater in `home` refused, like `v0.2.0`, while the version `current` names is
+/// not above it: a higher version installed clears it. An `update.json` that cannot be read is
+/// logged and reports nothing, so it never stops a sample.
+pub fn update_refused(home: &Path) -> Option<String> {
+    let refused = match update::state(home) {
+        Ok(state) => state.refused?,
+        Err(error) => {
+            tracing::warn!("the refused tag cannot be read: {error}");
+            return None;
+        }
+    };
+    let version = refused.strip_prefix('v').unwrap_or(&refused);
+    (!update::lowered(update::current_version(home).as_deref(), version)).then_some(refused)
 }
 
 /// Sessions `me` owns that are not removed and have not finished or failed.
@@ -258,6 +278,7 @@ mod tests {
                 free_memory: 8_000_000_000,
                 free_disk,
                 sessions,
+                update_refused: None,
             },
         }
     }
@@ -526,6 +547,68 @@ mod tests {
         let again = write_sample(&store, me, dir.path()).unwrap();
         assert!(again.version > written.version);
         assert_eq!(again.body.sessions, 5);
+    }
+
+    /// Writes `update.json` with `refused` and points `current` at `installed`, as the updater
+    /// leaves them.
+    fn updated(home: &Path, refused: Option<&str>, installed: Option<&str>) {
+        let state = serde_json::json!({ "refused": refused });
+        std::fs::write(home.join("update.json"), state.to_string()).unwrap();
+        if let Some(version) = installed {
+            crate::update::point_current(home, version).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_refused_tag_is_reported_while_the_version_installed_is_not_above_it() {
+        for installed in [Some("0.1.0"), Some("0.2.0"), None] {
+            let home = tempfile::tempdir().unwrap();
+            updated(home.path(), Some("v0.2.0"), installed);
+            assert_eq!(
+                update_refused(home.path()).as_deref(),
+                Some("v0.2.0"),
+                "{installed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_higher_version_installed_clears_the_refused_tag() {
+        let home = tempfile::tempdir().unwrap();
+        updated(home.path(), Some("v0.2.0"), Some("0.2.1"));
+        assert_eq!(update_refused(home.path()), None);
+    }
+
+    #[test]
+    fn no_refusal_and_no_update_state_report_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(update_refused(home.path()), None);
+        updated(home.path(), None, Some("0.1.0"));
+        assert_eq!(update_refused(home.path()), None);
+    }
+
+    #[test]
+    fn an_unreadable_update_state_reports_nothing_and_the_sample_is_still_written() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("update.json"), "not json").unwrap();
+        assert_eq!(update_refused(dir.path()), None);
+        let store = Mutex::new(Store::open(dir.path().join("foundry.db")).unwrap());
+        let written = write_sample(&store, MachineId::random(), dir.path()).unwrap();
+        assert_eq!(written.body.update_refused, None);
+    }
+
+    #[test]
+    fn every_sample_carries_the_refused_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Mutex::new(Store::open(dir.path().join("foundry.db")).unwrap());
+        let me = MachineId::random();
+        updated(dir.path(), Some("v0.2.0"), Some("0.1.0"));
+        let written = write_sample(&store, me, dir.path()).unwrap();
+        assert_eq!(written.body.update_refused.as_deref(), Some("v0.2.0"));
+
+        updated(dir.path(), Some("v0.2.0"), Some("0.3.0"));
+        let written = write_sample(&store, me, dir.path()).unwrap();
+        assert_eq!(written.body.update_refused, None);
     }
 
     #[test]

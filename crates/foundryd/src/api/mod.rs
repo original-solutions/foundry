@@ -246,8 +246,9 @@ fn trusted_host(host: &str, names: &[String]) -> bool {
 }
 
 /// Refuses a request whose `Host` is not [`trusted_host`], and one a browser sent from another
-/// site: an `Origin` whose host and port are not the `Host`.
-async fn same_site(State(api): State<Api>, request: Request, next: Next) -> Response {
+/// site: an `Origin` whose host and port are not the `Host`. The daemon puts it on every route
+/// the UI calls that [`router`] does not hold.
+pub(crate) async fn same_site(State(api): State<Api>, request: Request, next: Next) -> Response {
     let headers = request.headers();
     let host = headers
         .get(header::HOST)

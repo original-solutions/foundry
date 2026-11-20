@@ -25,8 +25,9 @@ export async function renderApp(ui: ReactNode) {
 export type Call = { url: string; method: string; body: unknown };
 
 /**
- * Stubs `fetch` to give `answers` in order, and returns the requests it was sent. The layout's read
- * of session briefs gets none and is left out, so a test sees only the requests it makes.
+ * Stubs `fetch` to give `answers` in order, and returns the requests it was sent. The layout's reads
+ * of session briefs and of the attention list get none and are left out, so a test sees only the
+ * requests it makes.
  */
 export function mockFetch(...answers: Response[]): Call[] {
   const calls: Call[] = [];
@@ -34,6 +35,7 @@ export function mockFetch(...answers: Response[]): Call[] {
     "fetch",
     vi.fn(async (url: string, init: RequestInit = {}) => {
       if (url === "/api/briefs") return json(200, {});
+      if (url === "/api/attention") return json(200, { items: [] });
       calls.push({ url, method: init.method ?? "GET", body: init.body ? JSON.parse(String(init.body)) : undefined });
       const next = answers.shift();
       if (!next) throw new Error("unexpected request");
