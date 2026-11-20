@@ -147,6 +147,7 @@ pub fn read(data_dir: &Path, sessions: u32) -> Result<MachineSample, MachineErro
         free_memory: system.available_memory(),
         free_disk: free_disk(data_dir)?,
         sessions,
+        update_refused: None,
     })
 }
 
@@ -258,6 +259,7 @@ mod tests {
                 free_memory: 8_000_000_000,
                 free_disk,
                 sessions,
+                update_refused: None,
             },
         }
     }

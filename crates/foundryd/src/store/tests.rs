@@ -25,6 +25,7 @@ fn workspace(owner: MachineId, version: u64) -> AnyRecord {
             name: "fix login".into(),
             branch: "fix-login".into(),
             base: "main".into(),
+            setup: None,
         },
     })
 }
@@ -68,6 +69,7 @@ fn sample(owner: MachineId, version: u64) -> AnyRecord {
             free_memory: 1 << 30,
             free_disk: 1 << 35,
             sessions: 2,
+            update_refused: None,
         },
     })
 }

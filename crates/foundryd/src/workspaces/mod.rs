@@ -474,6 +474,7 @@ impl Inner {
                 name: name.to_owned(),
                 branch: stored.to_owned(),
                 base: base.to_owned(),
+                setup: None,
             };
             self.write(body, false).await
         }

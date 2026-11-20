@@ -39,6 +39,10 @@ pub struct Workspace {
     pub branch: String,
     /// The branch the workspace was made from.
     pub base: String,
+    /// The terminal its setup commands run in, once started. `None` for a workspace with no
+    /// setup, and in a record from a peer that does not write it.
+    #[serde(default)]
+    pub setup: Option<TerminalId>,
 }
 
 /// A PTY in a workspace.
@@ -76,6 +80,10 @@ pub struct MachineSample {
     /// Bytes free on the volume holding the data directory.
     pub free_disk: u64,
     pub sessions: u32,
+    /// The tag this machine's updater refused after rolling it back, like `v0.2.0`, while the
+    /// version installed is not above it. `None` in a sample from a peer that does not write it.
+    #[serde(default)]
+    pub update_refused: Option<String>,
 }
 
 /// Any kind of record, tagged by `kind`, so one message can carry several kinds.

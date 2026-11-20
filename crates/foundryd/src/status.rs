@@ -188,6 +188,7 @@ mod tests {
                 free_memory: 12_300_000_000,
                 free_disk: 120_500_000_000,
                 sessions,
+                update_refused: None,
             },
         })
     }

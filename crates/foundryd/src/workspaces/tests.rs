@@ -1478,6 +1478,7 @@ async fn a_workspace_another_machine_owns_is_not_this_machines() {
             name: "theirs".into(),
             branch: "theirs".into(),
             base: "main".into(),
+            setup: None,
         },
     });
     setup.store.lock().unwrap().apply(&record, peer).unwrap();
