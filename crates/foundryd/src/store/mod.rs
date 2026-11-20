@@ -182,6 +182,25 @@ impl Store {
         }
     }
 
+    /// The workspace records not deleted, from every owner, lowest version first. Only
+    /// workspace rows are parsed, so a row of another kind this build cannot read does not stop
+    /// it.
+    pub fn live_workspaces(&self) -> Result<Vec<Record<Workspace>>, StoreError> {
+        let mut query = self
+            .conn
+            .prepare("SELECT record FROM records WHERE kind = 'workspace' ORDER BY version")?;
+        let rows = query.query_map([], |row| row.get::<_, String>(0))?;
+        let mut records = Vec::new();
+        for json in rows {
+            if let AnyRecord::Workspace(record) = serde_json::from_str(&json?)?
+                && !record.deleted
+            {
+                records.push(record);
+            }
+        }
+        Ok(records)
+    }
+
     /// The terminal records held from `owner` in workspace `workspace`, deleted ones included,
     /// lowest version first. Only those rows are parsed.
     pub fn terminals_in(

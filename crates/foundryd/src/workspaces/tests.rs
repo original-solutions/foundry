@@ -2152,6 +2152,59 @@ async fn sweep_skips_and_logs_when_a_record_cannot_be_read() {
     );
 }
 
+/// A row of another kind this build cannot read says nothing about which worktrees are
+/// named, so the sweep still runs.
+#[tokio::test]
+async fn sweep_runs_when_only_a_row_of_another_kind_cannot_be_read() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let leftover = setup.leftover(&remote, "crashed").await;
+    let conn = rusqlite::Connection::open(setup.data.path().join("foundry.db")).unwrap();
+    conn.execute(
+        "INSERT INTO records (kind, id, owner, version, record) VALUES (?1, ?2, ?3, 1, ?4)",
+        rusqlite::params![
+            "terminal",
+            TerminalId::random().to_string(),
+            MachineId::random().to_string(),
+            r#"{"kind":"from-a-newer-build"}"#,
+        ],
+    )
+    .unwrap();
+
+    setup.workspaces.sweep().await.unwrap();
+
+    assert!(!leftover.exists());
+}
+
+/// `git worktree list --porcelain` before git 2.36 has no `-z`: one field per line, and a blank
+/// line after each worktree.
+#[test]
+fn worktrees_in_reads_the_porcelain_list_line_by_line() {
+    let list = "worktree /data/clones/p.git\nbare\n\n\
+                worktree /data/worktrees/p/fix-login\nHEAD abc123\nbranch refs/heads/fix-login\n\n\
+                worktree /data/worktrees/p/detached\nHEAD def456\ndetached\n\n";
+    let found: Vec<_> = worktrees_in(list)
+        .into_iter()
+        .map(|l| (l.path, l.head, l.branch))
+        .collect();
+    assert_eq!(
+        found,
+        vec![
+            (PathBuf::from("/data/clones/p.git"), None, None),
+            (
+                PathBuf::from("/data/worktrees/p/fix-login"),
+                Some("abc123".to_owned()),
+                Some("fix-login".to_owned())
+            ),
+            (
+                PathBuf::from("/data/worktrees/p/detached"),
+                Some("def456".to_owned()),
+                None
+            ),
+        ]
+    );
+}
+
 #[tokio::test]
 async fn sweep_logs_a_clone_it_cannot_read_and_goes_on_to_the_next() {
     let setup = Setup::new();

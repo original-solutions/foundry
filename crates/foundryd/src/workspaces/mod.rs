@@ -437,19 +437,16 @@ impl Inner {
                     .into_iter()
                     .map(|p| p.id)
                     .collect();
-                let mut live = Vec::new();
-                for owner in store.versions()?.into_keys() {
-                    live.extend(store.since(owner, 0)?.into_iter().filter_map(
-                        |record| match record {
-                            AnyRecord::Workspace(r) if !r.deleted => Some((r.owner, r.body)),
-                            _ => None,
-                        },
-                    ));
-                }
+                let live: Vec<_> = store
+                    .live_workspaces()?
+                    .into_iter()
+                    .map(|r| (r.owner, r.body))
+                    .collect();
                 Ok((projects, live))
             })
             .await;
-        // Without every record, a live workspace's worktree could look like a leftover.
+        // Without every workspace record, a live workspace's worktree could look like a
+        // leftover.
         let (projects, live) = match read {
             Ok(read) => read,
             Err(error) => {
@@ -507,7 +504,7 @@ impl Inner {
         let _held = lock.lock().await;
         let clone = self.clone_path(project);
         let list = self
-            .git(&clone, "worktree", ["list", "--porcelain", "-z"])
+            .git(&clone, "worktree", ["list", "--porcelain"])
             .await?;
         let project_folder = project.to_string();
         for Listed {
@@ -695,9 +692,7 @@ impl Inner {
         clone: &Path,
         worktree: &Path,
     ) -> Result<Option<(PathBuf, String)>, WorkspaceError> {
-        let list = self
-            .git(clone, "worktree", ["list", "--porcelain", "-z"])
-            .await?;
+        let list = self.git(clone, "worktree", ["list", "--porcelain"]).await?;
         // Every worktree of a clone sits at `worktrees/<project>/<branch>`, so the last two
         // parts name it, however git spelled the folders above.
         let tail = |p: &Path| {
@@ -1003,7 +998,7 @@ async fn setup(worktree: &Path) -> Option<Vec<String>> {
     }
 }
 
-/// One worktree as `git worktree list --porcelain -z` gives it.
+/// One worktree as `git worktree list --porcelain` gives it.
 struct Listed {
     path: PathBuf,
     /// The commit git keeps as its `HEAD`; a bare clone has none.
@@ -1012,11 +1007,12 @@ struct Listed {
     branch: Option<String>,
 }
 
-/// Each worktree in the output of `git worktree list --porcelain -z`. Its fields end in a NUL,
-/// so no path, whatever it holds, is read as another field.
+/// Each worktree in the output of `git worktree list --porcelain`, one field per line. `-z`
+/// would need git 2.36. The paths that matter end in `<project>/<branch>`, and neither part
+/// can hold a line break.
 fn worktrees_in(list: &str) -> Vec<Listed> {
     let mut found: Vec<Listed> = Vec::new();
-    for field in list.split('\0') {
+    for field in list.lines() {
         if let Some(path) = field.strip_prefix("worktree ") {
             found.push(Listed {
                 path: PathBuf::from(path),

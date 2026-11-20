@@ -389,6 +389,41 @@ fn terminals_in_gives_one_workspaces_terminals_from_one_owner() {
     assert!(store.terminals_in(owner, none).unwrap().is_empty());
 }
 
+/// The workspaces not deleted, from every owner, read without the other kinds: a row of
+/// another kind this build cannot read does not stop it.
+#[test]
+fn live_workspaces_gives_every_owners_workspaces_not_deleted_and_reads_no_other_kind() {
+    let (_dir, mut store) = open();
+    let owner = MachineId::random();
+    let other = MachineId::random();
+    let numbered = |id: u128, owner: MachineId, version: u64| {
+        let AnyRecord::Workspace(mut r) = workspace(owner, version) else {
+            unreachable!()
+        };
+        r.body.id = WorkspaceId(uuid::Uuid::from_u128(id));
+        r
+    };
+    assert!(store.live_workspaces().unwrap().is_empty());
+
+    let mine = numbered(20, owner, 1);
+    let mut archived = numbered(21, owner, 2);
+    archived.deleted = true;
+    let theirs = numbered(22, other, 3);
+    for r in [&mine, &archived] {
+        store
+            .apply(&AnyRecord::Workspace(r.clone()), owner)
+            .unwrap();
+    }
+    store
+        .apply(&AnyRecord::Workspace(theirs.clone()), other)
+        .unwrap();
+    store.apply(&terminal(owner, 4), owner).unwrap();
+    store.apply(&session(other, 5), other).unwrap();
+    insert_unreadable(&store, owner, 6, "printer", "{}");
+
+    assert_eq!(store.live_workspaces().unwrap(), vec![mine, theirs]);
+}
+
 #[test]
 fn versions_gives_the_highest_version_held_per_owner() {
     let (_dir, mut store) = open();
