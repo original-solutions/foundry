@@ -16,27 +16,33 @@ export const shapes: Record<Glyph, string> = {
   away: "#.#...#.#", // only the corners: out of reach
 };
 
-/** The glyph's colour, also used for its words where they share a line. */
+/**
+ * The glyph's colour, also used for its words where they share a line. Colour means "look here":
+ * only a state that needs you (waiting, stuck, failed) or is moving (working) has one. A resting
+ * state is grey, so a fleet at rest reads calm and the one that works or waits stands out. Green
+ * is left to what you can do (actions) and what was added (diffs).
+ */
 export const glyphText: Record<Glyph, string> = {
   starting: "text-neutral-300",
   working: "text-sky-400",
   waiting: "text-amber-400",
-  ready: "text-emerald-400",
+  ready: "text-neutral-400",
   done: "text-neutral-400",
   failed: "text-red-400",
   stuck: "text-orange-400",
   away: "text-neutral-500",
 };
 
-const pillBg: Record<Glyph, string> = {
-  starting: "bg-neutral-700/60",
-  working: "bg-sky-400/15",
-  waiting: "bg-amber-400/15",
-  ready: "bg-emerald-400/10",
-  done: "bg-neutral-700/60",
-  failed: "bg-red-500/15",
-  stuck: "bg-orange-400/15",
-  away: "bg-neutral-800",
+/** The same colours as a fill, for a card's edge and a machine's bar of states. */
+export const glyphFill: Record<Glyph, string> = {
+  starting: "bg-neutral-400",
+  working: "bg-sky-400",
+  waiting: "bg-amber-400",
+  ready: "bg-neutral-500",
+  done: "bg-neutral-600",
+  failed: "bg-red-400",
+  stuck: "bg-orange-400",
+  away: "bg-neutral-700",
 };
 
 /** How far each cell sits from the centre, in rings: the ripple's delay. */
@@ -76,15 +82,5 @@ export function StateGlyph({ glyph, still = false }: { glyph: Glyph; still?: boo
         );
       })}
     </svg>
-  );
-}
-
-/** The state as a pill: its glyph and its label. */
-export function StatePill({ glyph, label }: { glyph: Glyph; label: string }) {
-  return (
-    <span className={`inline-flex shrink-0 items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-medium ${pillBg[glyph]} ${glyphText[glyph]}`}>
-      <StateGlyph glyph={glyph} />
-      <span>{label}</span>
-    </span>
   );
 }

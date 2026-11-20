@@ -1,8 +1,12 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ILink, ILinkProvider } from "@xterm/xterm";
+import type { Changes } from "./api";
+import { nextSteps } from "./next";
 import { TerminalPane } from "./TerminalPane";
 import type { Glyph } from "./labels";
-import { FakeSocket } from "./test-utils";
+import { expectFieldLook, FakeSocket, json } from "./test-utils";
 
 // jsdom cannot run xterm.js, so a stand-in records what the pane does to its screen.
 const screenOps = vi.hoisted(() => ({
@@ -12,6 +16,8 @@ const screenOps = vi.hoisted(() => ({
   term: null as { cols: number; rows: number } | null,
   options: null as Record<string, unknown> | null,
   focused: false,
+  provider: null as ILinkProvider | null,
+  rows: [] as string[],
 }));
 
 vi.mock("@xterm/xterm", () => ({
@@ -24,6 +30,19 @@ vi.mock("@xterm/xterm", () => ({
     }
     loadAddon() {}
     open() {}
+    registerLinkProvider(provider: ILinkProvider) {
+      screenOps.provider = provider;
+      return { dispose() {} };
+    }
+    // Rows of one-cell characters, none wrapped.
+    buffer = {
+      active: {
+        getLine: (y: number) => {
+          const text = screenOps.rows[y];
+          return text === undefined ? undefined : { isWrapped: false, length: text.length, getCell: (x: number) => ({ getChars: () => text[x], getWidth: () => 1 }) };
+        },
+      },
+    };
     focus() {
       screenOps.focused = true;
     }
@@ -62,6 +81,8 @@ beforeEach(() => {
   screenOps.resized = null;
   screenOps.term = null;
   screenOps.focused = false;
+  screenOps.provider = null;
+  screenOps.rows = [];
   FakeSocket.install();
   vi.stubGlobal(
     "ResizeObserver",
@@ -79,8 +100,11 @@ afterEach(() => {
 });
 
 // An options object, not a defaulted parameter: a default would turn an explicit `undefined` into `true`.
-function mount(id = "t1", { running, glyph }: { running: boolean | undefined; glyph?: Glyph } = { running: true }) {
-  const view = render(<TerminalPane id={id} running={running} name="opus" glyph={glyph} />);
+function mount(id = "t1", { running, glyph, here = true }: { running: boolean | undefined; glyph?: Glyph; here?: boolean } = { running: true }) {
+  const client = new QueryClient();
+  const view = render(<TerminalPane id={id} running={running} name="opus" glyph={glyph} here={here} />, {
+    wrapper: ({ children }) => <QueryClientProvider client={client}>{children}</QueryClientProvider>,
+  });
   return { socket: FakeSocket.last(), view };
 }
 
@@ -132,14 +156,14 @@ describe("TerminalPane", () => {
     expect(screenOps.ops).toEqual(["reset", "write:a", "reset", "write:a again"]);
   });
 
-  it("says the terminal exited on 1000 and does not attach again", () => {
+  it("says the terminal ended on 1000, in the sidebar's word, and does not attach again", () => {
     const { socket } = mount();
     act(() => socket.open());
 
     act(() => socket.end(1000, "exited"));
     act(() => vi.advanceTimersByTime(60_000));
 
-    expect(screen.getByText(/exited/i)).toBeDefined();
+    expect(screen.getByText("Ended")).toBeDefined();
     expect(FakeSocket.all).toHaveLength(1);
   });
 
@@ -368,6 +392,7 @@ describe("TerminalPane", () => {
       act(() => socket.open());
 
       const box = screen.getByRole("textbox", { name: "Message opus" });
+      expectFieldLook(box);
       fireEvent.change(box, { target: { value: "say hi" } });
       fireEvent.click(screen.getByRole("button", { name: "Send" }));
 
@@ -402,6 +427,41 @@ describe("TerminalPane", () => {
       expect(screen.queryByRole("button", { name: "Answer 1" })).toBeNull();
     });
 
+    it("leads with an idle session's next steps, and one types its prompt and presses Enter", async () => {
+      vi.useRealTimers();
+      const dirty = { base: "main", commits: [], files: [{ path: "a.md", from: null, status: "modified", added: 1, removed: 0, uncommitted: true, patch: null }] };
+      const quiet = { branch: "b", pushed: false, unpushed: 0, pr: null, unreachable: false };
+      vi.stubGlobal("fetch", vi.fn(async (url: string) => json(200, url === "/api/workspaces/w1/changes" ? dirty : quiet)));
+      render(
+        <QueryClientProvider client={new QueryClient()}>
+          <TerminalPane id="t1" running name="opus" glyph="ready" here workspace="w1" />
+        </QueryClientProvider>,
+      );
+      const socket = FakeSocket.last();
+      act(() => socket.open());
+
+      fireEvent.click(await screen.findByRole("button", { name: "Commit 1 file" }));
+
+      expect(sent(socket)).toEqual([`\x1b[200~${nextSteps(dirty as Changes)[0].prompt}\x1b[201~`, "\r"]);
+    });
+
+    it("offers no next steps while the session works, nor for a terminal on another machine", () => {
+      vi.stubGlobal("fetch", vi.fn(async () => Promise.reject(new Error("unexpected request"))));
+      const client = new QueryClient();
+      const { rerender } = render(
+        <QueryClientProvider client={client}>
+          <TerminalPane id="t1" running name="opus" glyph="working" here workspace="w1" />
+        </QueryClientProvider>,
+      );
+      rerender(
+        <QueryClientProvider client={client}>
+          <TerminalPane id="t1" running name="opus" glyph="ready" here={false} workspace="w1" />
+        </QueryClientProvider>,
+      );
+      expect(screen.queryByRole("group", { name: "Next for opus" })).toBeNull();
+      expect(fetch).not.toHaveBeenCalled();
+    });
+
     it("goes away once the terminal is no longer running", () => {
       mount("t1", { running: false });
       expect(screen.queryByRole("toolbar")).toBeNull();
@@ -411,6 +471,222 @@ describe("TerminalPane", () => {
       vi.stubGlobal("matchMedia", (query: string) => ({ matches: query === "(pointer: coarse)" }));
       mount();
       expect(screenOps.focused).toBe(false);
+    });
+  });
+
+  describe("handing it files", () => {
+    const sent = (socket: FakeSocket) => socket.sent.filter((d) => typeof d !== "string").map((d) => new TextDecoder().decode(d as Uint8Array));
+    const shot = () => new File(["png"], "shot.png", { type: "image/png" });
+    const files = (...list: File[]) => ({ types: ["Files"], files: list, items: list.map(() => ({ kind: "file" })) });
+    const keeps = () => {
+      let n = 0;
+      const fetch = vi.fn(async (url: string) => json(201, { path: `/data/t1.files/${new URL(url, "http://x").searchParams.get("name")}${n++ ? `-${n}` : ""}` }));
+      vi.stubGlobal("fetch", fetch);
+      return fetch;
+    };
+    const pane = () => screen.getByTestId("terminal-pane");
+
+    it("shows where a dragged file goes, and dropping it sends it and types its path for you to finish, without Enter", async () => {
+      const fetch = keeps();
+      const { socket } = mount();
+      act(() => socket.open());
+
+      fireEvent.dragEnter(pane(), { dataTransfer: files(shot()) });
+      expect(screen.getByText("Drop to hand opus this file")).toBeTruthy();
+      await act(async () => {
+        fireEvent.drop(pane(), { dataTransfer: files(shot()) });
+      });
+
+      expect(fetch).toHaveBeenCalledWith("/api/terminals/t1/files?name=shot.png", expect.objectContaining({ method: "POST" }));
+      expect(sent(socket)).toEqual(["\x1b[200~/data/t1.files/shot.png \x1b[201~"]);
+      expect(screen.queryByText("Drop to hand opus this file")).toBeNull();
+    });
+
+    it("types every path of several files dropped at once, in order", async () => {
+      keeps();
+      const { socket } = mount();
+      act(() => socket.open());
+
+      await act(async () => {
+        fireEvent.drop(pane(), { dataTransfer: files(shot(), new File(["a"], "notes.txt")) });
+      });
+
+      expect(sent(socket)).toEqual(["\x1b[200~/data/t1.files/shot.png /data/t1.files/notes.txt-2 \x1b[201~"]);
+    });
+
+    it("sends a pasted screenshot the same way, and leaves pasted text to the terminal", async () => {
+      const fetch = keeps();
+      const { socket } = mount();
+      act(() => socket.open());
+
+      await act(async () => {
+        fireEvent.paste(pane(), { clipboardData: { files: [shot()], getData: () => "" } });
+      });
+      expect(sent(socket)).toEqual(["\x1b[200~/data/t1.files/shot.png \x1b[201~"]);
+
+      fireEvent.paste(pane(), { clipboardData: { files: [], getData: () => "hello" } });
+      expect(fetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not send a file over 25 MB, and says why", async () => {
+      const fetch = keeps();
+      const { socket } = mount();
+      act(() => socket.open());
+      const big = new File(["x"], "video.mov");
+      Object.defineProperty(big, "size", { value: 25 * 1024 * 1024 + 1 });
+
+      await act(async () => {
+        fireEvent.drop(pane(), { dataTransfer: files(big) });
+      });
+
+      expect(fetch).not.toHaveBeenCalled();
+      expect(sent(socket)).toEqual([]);
+      expect(screen.getByText("video.mov is over 25 MB; nothing was sent")).toBeTruthy();
+    });
+
+    it("says what the daemon refused, and types nothing", async () => {
+      vi.stubGlobal("fetch", vi.fn(async () => json(500, { error: "the file could not be kept: disk full" })));
+      const { socket } = mount();
+      act(() => socket.open());
+
+      await act(async () => {
+        fireEvent.drop(pane(), { dataTransfer: files(shot()) });
+      });
+
+      expect(sent(socket)).toEqual([]);
+      expect(screen.getByText("Could not send shot.png: the file could not be kept: disk full")).toBeTruthy();
+    });
+
+    it("takes no files for a terminal on another machine, and says so instead of letting the browser open the file", () => {
+      const fetch = keeps();
+      mount("t1", { running: true, here: false });
+
+      fireEvent.dragEnter(pane(), { dataTransfer: files(shot()) });
+      expect(screen.getByText("Files go only to terminals on this machine")).toBeTruthy();
+      const drop = new Event("drop", { bubbles: true, cancelable: true });
+      Object.assign(drop, { dataTransfer: files(shot()) });
+      pane().dispatchEvent(drop);
+
+      expect(drop.defaultPrevented).toBe(true);
+      expect(fetch).not.toHaveBeenCalled();
+    });
+
+    it("on a phone, the key bar's clip picks files to send", async () => {
+      keeps();
+      const { socket } = mount();
+      act(() => socket.open());
+
+      const picker = screen.getByLabelText("Attach files for opus");
+      await act(async () => {
+        fireEvent.change(picker, { target: { files: [shot()] } });
+      });
+
+      expect(sent(socket)).toEqual(["\x1b[200~/data/t1.files/shot.png \x1b[201~"]);
+    });
+  });
+
+  describe("what Claude prints can be opened", () => {
+    const patch = "@@ -1,2 +1,2 @@\n-export const version = \"1.3.0\";\n+export const version = \"1.4.0\";\n same";
+    const changes = {
+      base: "main",
+      commits: [],
+      files: [{ path: "src/version.ts", from: null, status: "modified", added: 1, removed: 1, uncommitted: true, patch }],
+    };
+    /** The links the pane finds on screen row `y` (0-based), as xterm asks for them. */
+    const linksOn = (y: number) =>
+      new Promise<ILink[] | undefined>((done) => {
+        screenOps.provider!.provideLinks(y + 1, done);
+      });
+    const click = (modifiers: Partial<MouseEvent> = {}) => ({ clientX: 100, clientY: 100, metaKey: false, ctrlKey: false, ...modifiers }) as MouseEvent;
+    const open = (onFile = vi.fn(), here = true) => {
+      vi.useRealTimers();
+      const fetch = vi.fn(async (url: string) => (url === "/api/workspaces/w1/changes" ? json(200, changes) : json(404, {})));
+      vi.stubGlobal("fetch", fetch);
+      render(
+        <QueryClientProvider client={new QueryClient()}>
+          <TerminalPane id="t1" running name="opus" glyph="ready" here={here} changesOf="w1" onFile={onFile} />
+        </QueryClientProvider>,
+      );
+      return { fetch, onFile };
+    };
+
+    it("finds a web address on a line, and Cmd- or Ctrl-click opens it in a new tab; a plain click selects as before", async () => {
+      const opened = vi.fn();
+      vi.stubGlobal("open", opened);
+      open();
+      screenOps.rows = ["● Opened https://github.com/o/r/pull/12."];
+
+      const [link] = (await linksOn(0))!;
+      expect(link.text).toBe("https://github.com/o/r/pull/12");
+      expect(link.range).toEqual({ start: { x: 10, y: 1 }, end: { x: 39, y: 1 } });
+
+      link.activate(click(), link.text);
+      expect(opened).not.toHaveBeenCalled();
+      link.activate(click({ metaKey: true }), link.text);
+      link.activate(click({ ctrlKey: true }), link.text);
+      expect(opened).toHaveBeenCalledTimes(2);
+      expect(opened).toHaveBeenCalledWith("https://github.com/o/r/pull/12", "_blank", "noopener,noreferrer");
+    });
+
+    it("opens a link a program marks (OSC 8) only when it is a web address, and only on Cmd- or Ctrl-click", () => {
+      const opened = vi.fn();
+      vi.stubGlobal("open", opened);
+      open();
+      const marked = screenOps.options!.linkHandler as { activate: (event: MouseEvent, text: string) => void };
+
+      marked.activate(click({ metaKey: true }), "javascript:alert(1)");
+      marked.activate(click({ metaKey: true }), "file:///etc/passwd");
+      marked.activate(click({ ctrlKey: true }), "data:text/html,<script>1</script>");
+      marked.activate(click(), "https://example.com/x");
+      expect(opened).not.toHaveBeenCalled();
+
+      marked.activate(click({ metaKey: true }), "https://example.com/x");
+      marked.activate(click({ ctrlKey: true }), "http://localhost:3000/");
+      expect(opened.mock.calls).toEqual([
+        ["https://example.com/x", "_blank", "noopener,noreferrer"],
+        ["http://localhost:3000/", "_blank", "noopener,noreferrer"],
+      ]);
+    });
+
+    it("finds a file its workspace changed, shows its diff while the pointer rests on it, and Cmd-click opens it in Changes", async () => {
+      const { onFile } = open();
+      screenOps.rows = ["● Update(src/version.ts)"];
+
+      const [link] = (await linksOn(0))!;
+      expect(link.text).toBe("src/version.ts");
+
+      act(() => link.hover!(click(), link.text));
+      const peek = screen.getByRole("tooltip");
+      expect(peek.textContent).toContain("src/version.ts");
+      expect(peek.textContent).toContain("+1");
+      expect(peek.textContent).toContain("uncommitted");
+      expect(peek.textContent).toContain('export const version = "1.4.0";');
+      expect(peek.textContent).toContain("click to open in Changes");
+
+      act(() => link.leave!(click(), link.text));
+      expect(screen.queryByRole("tooltip")).toBeNull();
+
+      act(() => link.activate(click({ metaKey: true }), link.text));
+      expect(onFile).toHaveBeenCalledWith("src/version.ts");
+    });
+
+    it("asks for the workspace's changes only for a line that names a file, and reads them once for many lines", async () => {
+      const { fetch } = open();
+      screenOps.rows = ["Done.", "edited src/version.ts", "and README.md"];
+
+      expect(await linksOn(0)).toEqual([]);
+      expect(fetch).not.toHaveBeenCalled();
+      await linksOn(1);
+      await linksOn(2);
+      expect(fetch.mock.calls.map(([url]) => url)).toEqual(["/api/workspaces/w1/changes"]);
+    });
+
+    it("links no files for a terminal on another machine, whose changes this daemon cannot read", async () => {
+      const { fetch } = open(vi.fn(), false);
+      screenOps.rows = ["edited src/version.ts at https://example.com"];
+
+      expect((await linksOn(0))!.map((l) => l.text)).toEqual(["https://example.com"]);
+      expect(fetch).not.toHaveBeenCalled();
     });
   });
 });

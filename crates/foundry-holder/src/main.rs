@@ -262,6 +262,17 @@ mod tests {
 
     use super::*;
 
+    /// `bind` sets the umask of the whole process for a moment, and a directory another test makes
+    /// meanwhile has no search bit, so nothing can be opened in it. These tests share one process,
+    /// so each holds this for as long as it runs.
+    static UMASK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn turn() -> std::sync::MutexGuard<'static, ()> {
+        UMASK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn args(dir: &Path) -> Args {
         Args {
             socket: dir.join("t.sock"),
@@ -284,6 +295,7 @@ mod tests {
 
     #[test]
     fn a_starter_that_is_gone_leaves_nothing_running() {
+        let _turn = turn();
         let dir = tempfile::tempdir().expect("tempdir");
         let args = args(dir.path());
         let lock_path = args.socket.with_extension("lock");
@@ -344,6 +356,7 @@ mod tests {
 
     #[test]
     fn a_holder_whose_starter_is_gone_exits_1_without_serving() {
+        let _turn = turn();
         let dir = tempfile::tempdir().expect("tempdir");
         let args = args(dir.path());
         let lock_path = args.socket.with_extension("lock");
@@ -374,6 +387,7 @@ mod tests {
 
     #[test]
     fn a_starter_that_is_gone_hangs_up_the_childs_whole_group() {
+        let _turn = turn();
         let dir = tempfile::tempdir().expect("tempdir");
         let mut args = args(dir.path());
         let background = dir.path().join("background");
@@ -424,6 +438,7 @@ mod tests {
 
     #[test]
     fn a_starter_that_listens_hears_ready_and_the_child_runs_on() {
+        let _turn = turn();
         let dir = tempfile::tempdir().expect("tempdir");
         let args = args(dir.path());
         let lock_path = args.socket.with_extension("lock");
