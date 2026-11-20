@@ -1740,6 +1740,47 @@ async fn ids_that_do_not_parse_and_a_base_that_is_not_there_are_answered_in_json
 // --- secrets ---
 
 #[test]
+fn a_projects_repo_inside_an_overwritten_item_is_shown_redacted() {
+    use foundry_proto::settings::{Overwritten, SettingKey, SettingValue, SharedSettings};
+    let project = |name: &str, secret: &str| Project {
+        id: ProjectId(uuid::Uuid::from_u128(7)),
+        name: name.into(),
+        repo: format!("https://x-access-token:{secret}@example.invalid/o/{name}.git"),
+    };
+    let settings = SharedSettings {
+        projects: vec![project("kept", "kept-secret")],
+        overwritten: [
+            (
+                SettingKey::Project(ProjectId(uuid::Uuid::from_u128(7))),
+                Overwritten {
+                    kept: Some(SettingValue::Project(project("kept", "kept-secret"))),
+                    lost: Some(SettingValue::Project(project("lost", "lost-secret"))),
+                },
+            ),
+            (
+                SettingKey::Project(ProjectId(uuid::Uuid::from_u128(8))),
+                Overwritten {
+                    kept: None,
+                    lost: Some(SettingValue::Project(project("gone", "gone-secret"))),
+                },
+            ),
+        ]
+        .into(),
+        ..SharedSettings::default()
+    };
+    let said = serde_json::to_string(&shown(settings)).unwrap();
+    for secret in ["kept-secret", "lost-secret", "gone-secret"] {
+        assert!(!said.contains(secret), "{said}");
+    }
+    for name in ["kept", "lost", "gone"] {
+        assert!(
+            said.contains(&format!("example.invalid/o/{name}.git")),
+            "{said}"
+        );
+    }
+}
+
+#[test]
 fn credentials_in_a_url_are_hidden() {
     for (text, secret) in [
         (
