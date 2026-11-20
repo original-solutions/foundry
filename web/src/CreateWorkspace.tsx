@@ -1,7 +1,7 @@
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { Dialog } from "radix-ui";
-import { ApiError, createWorkspace, listMachines, startSession, type Project } from "./api";
+import { ApiError, createWorkspace, listMachines, placementsKey, startSession, type Project } from "./api";
 import { safeBranch, sameBranch } from "./branch";
 import { FirstPrompt, promptOf } from "./FirstPrompt";
 import type { WorkspaceView } from "./fleet";
@@ -13,7 +13,7 @@ class SessionNotStarted extends ApiError {}
 
 type Step = "branch" | "session";
 
-/** What the form asks for. `machine` is absent for this machine. */
+/** What the form asks for. `machine` is absent for this machine, and "choose" to let Foundry pick one. */
 interface CreateInput {
   project: string;
   base: string;
@@ -39,24 +39,32 @@ interface Props {
 /**
  * The new-workspace dialog: a name, which shows the branch it makes as you type, then the project,
  * base, model and machine. Create makes the workspace, starts a session in it and hands the
- * session to `onCreated`, so the layout lands in it.
+ * session to `onCreated`, so the layout lands in it. Letting Foundry choose the machine sends the
+ * model and first prompt along: when no machine qualifies the request waits, the dialog closes and
+ * the waiting list shows it, and Foundry starts the session once it is placed.
  */
 export function CreateWorkspace({ projects, workspaces, open, onOpenChange, name = "", onCreated }: Props) {
   const [step, setStep] = useState<Step>("branch");
+  const client = useQueryClient();
   const create = useMutation({
-    mutationFn: async (input: CreateInput) => {
+    mutationFn: async (input: CreateInput): Promise<{ session: string | null; warning: string | null }> => {
       setStep("branch");
-      const workspace = await createWorkspace({ project: input.project, base: input.base, name: input.name, machine: input.machine });
+      const session = input.machine === "choose" ? { model: input.model, prompt: input.prompt } : {};
+      const workspace = await createWorkspace({ project: input.project, base: input.base, name: input.name, machine: input.machine, ...session });
+      if ("request" in workspace) {
+        await client.invalidateQueries({ queryKey: placementsKey });
+        return { session: null, warning: null };
+      }
       setStep("session");
       // The workspace is usable when its setup did not start, so its session is started all the same.
-      let session: string;
+      let started: string;
       try {
-        session = await startSession(workspace.id, input.model, input.prompt);
+        started = await startSession(workspace.id, input.model, input.prompt);
       } catch (error) {
-        const setup = workspace.error ? ` Also: ${workspace.error}` : "";
-        throw new SessionNotStarted(`The workspace was made, but its session did not start: ${error instanceof Error ? error.message : error}.${setup}`);
+        const also = [workspace.error, workspace.warning].filter(Boolean).map((said) => ` Also: ${said}`).join("");
+        throw new SessionNotStarted(`The workspace was made, but its session did not start: ${error instanceof Error ? error.message : error}.${also}`);
       }
-      return { session, warning: workspace.error ?? null };
+      return { session: started, warning: [workspace.error, workspace.warning].filter(Boolean).join(" ") || null };
     },
   });
   const change = (next: boolean) => {
@@ -76,7 +84,7 @@ export function CreateWorkspace({ projects, workspaces, open, onOpenChange, name
           create.mutate(input, {
             // Given per call, so a call the dialog was reset from cannot close it.
             onSuccess: ({ session, warning }) => {
-              onCreated?.(session);
+              if (session) onCreated?.(session);
               if (!warning) onOpenChange(false);
             },
           })
@@ -221,6 +229,7 @@ function Form({ projects, workspaces, initialName, create, step, onSubmit }: For
           Machine
           <select name="machine" className={field} value={machine} onChange={(e) => setMachine(e.target.value)}>
             <option value="">This machine</option>
+            {listed.data && <option value="choose">Let Foundry choose</option>}
             {others.map((m) => (
               <option key={m.id} value={m.id} disabled={!m.online}>
                 {m.online ? m.name : `${m.name} (offline)`}

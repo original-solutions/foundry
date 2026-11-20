@@ -122,8 +122,14 @@ describe("AttentionList", () => {
   });
 
   it("shows an item of a kind this build does not know by its kind", async () => {
+    lists = [[{ ...waiting, id: "lease_lost:p1", kind: "lease_lost", terminal: null }]];
+    await renderApp(<AttentionList />);
+    expect(await screen.findByText("lease_lost")).toBeTruthy();
+  });
+
+  it("names a placement waiting item", async () => {
     lists = [[{ ...waiting, id: "placement_waiting:r1", kind: "placement_waiting", terminal: null }]];
     await renderApp(<AttentionList />);
-    expect(await screen.findByText("placement_waiting")).toBeTruthy();
+    expect(await screen.findByText("Placement waiting")).toBeTruthy();
   });
 });

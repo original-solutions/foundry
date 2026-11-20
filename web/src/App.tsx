@@ -18,6 +18,7 @@ import { useBriefs } from "./useBriefs";
 import { useFleet } from "./useFleet";
 import { AlertsButton, useAlerts } from "./AlertsBell";
 import { AttentionList } from "./attention/AttentionList";
+import { WaitingList } from "./placement/WaitingList";
 
 /**
  * The sidebar, and the terminal the URL names (`/terminals/$terminalId`) under its header filling
@@ -310,6 +311,7 @@ function Layout() {
           onCreated={setLanding}
         />
         <AttentionList />
+        <WaitingList />
       </div>
     </TerminalActions>
   );
