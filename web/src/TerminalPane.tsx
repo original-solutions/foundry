@@ -28,8 +28,8 @@ const STEADY_AFTER = 10_000;
  * on another machine, and keeps trying. Each attach's first frame is the whole kept screen, so
  * the screen is reset before it is written.
  *
- * A pane behind another tab (`active` false) stays attached, so showing it again is instant and
- * keeps its scroll position; it takes the keyboard each time it is shown, except on a touch
+ * A pane behind another tab (`active` false) stays attached while it is one of the few used last
+ * (`ATTACHED_MAX`), so showing it again is instant and keeps its scroll position; it takes the keyboard each time it is shown, except on a touch
  * screen, where focus would raise the on-screen keyboard over what you came to read. There a
  * key bar (`name` and `glyph` say whose and in what state) carries the keys a phone lacks and
  * a box to write a message in.

@@ -8,7 +8,7 @@ import { Sidebar } from "./Sidebar";
 import { StepsPanel, type StepsOf } from "./StepsPanel";
 import { TabStrip } from "./TabStrip";
 import { beside, follow, type Split } from "./split";
-import { loadTabs, saveTabs, withoutTab, withTab } from "./tabs";
+import { loadTabs, saveTabs, touched, withoutTab, withTab } from "./tabs";
 import { TerminalHeader } from "./TerminalHeader";
 import { TerminalPane } from "./TerminalPane";
 import { fleet, locate, terminalRunning } from "./fleet";
@@ -22,8 +22,9 @@ import { AlertsButton, useAlerts } from "./AlertsBell";
  * open, then the terminal, with the sidebar as a drawer the header opens. Cmd+K (or Ctrl+K outside
  * the terminal, where the shell keeps it) opens the jump palette over everything.
  *
- * Every terminal opened becomes a tab above the header. A tab shown since the page loaded keeps
- * its pane attached behind the others, so going back to it is instant.
+ * Every terminal opened becomes a tab above the header. The few tabs used last (and both sides of
+ * a split) keep their pane attached behind the others, so going back to one is instant; an older
+ * tab attaches again when shown and gets its screen and scrollback back from the holder.
  *
  * With nothing open, the board shows every workspace as a card with its live states and changes.
  *
@@ -80,7 +81,7 @@ function Layout() {
 
   const gone = useMemo(() => new Set(state.records.flatMap((r) => (r.kind === "terminal" && r.deleted ? [r.body.id] : []))), [state.records]);
   const [kept, setKept] = useState(loadTabs);
-  /** Tabs whose pane is attached: the ones shown since the page loaded. */
+  /** Tabs whose pane is attached, most recent first: the last few shown, and both sides of a split. */
   const [attached, setAttached] = useState<string[]>([]);
   /** The state each tab had when it was last shown. */
   const [seen, setSeen] = useState<Record<string, string>>({});
@@ -89,9 +90,10 @@ function Layout() {
   const [opened, setOpened] = useState<string>();
   if (terminalId !== opened) {
     setOpened(terminalId);
-    setSplit(follow(split, opened, terminalId));
+    const next = follow(split, opened, terminalId);
+    setSplit(next);
     if (terminalId && !gone.has(terminalId)) setKept(withTab(kept, terminalId));
-    if (terminalId) setAttached(withTab(attached, terminalId));
+    if (terminalId) setAttached(touched(attached, terminalId, next ? [next.left, next.right] : []));
   }
   if (terminalId && located && seen[terminalId] !== located.label) setSeen({ ...seen, [terminalId]: located.label });
   if (kept.some((id) => gone.has(id))) setKept(kept.filter((id) => !gone.has(id)));
@@ -253,7 +255,8 @@ function Layout() {
           </div>
         )}
         <div className="relative min-h-0 flex-1">
-          {attached.map((id) => {
+          {/* In a fixed order, so a pane's element never moves when it is used. */}
+          {[...attached].sort().map((id) => {
             const side = pair && (id === pair.left ? "left" : id === pair.right ? "right" : undefined);
             const place = side === "left" ? "inset-y-0 left-0 right-0 md:right-1/2" : side === "right" ? "inset-y-0 right-0 left-0 md:left-1/2 md:border-l md:border-neutral-800" : "inset-0";
             const seen = id === terminalId ? "" : side ? "invisible md:visible" : "invisible";

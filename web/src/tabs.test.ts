@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { loadTabs, saveTabs, withoutTab, withTab } from "./tabs";
+import { ATTACHED_MAX, loadTabs, saveTabs, touched, withoutTab, withTab } from "./tabs";
 
 afterEach(() => localStorage.clear());
 
@@ -25,5 +25,18 @@ describe("tabs", () => {
     expect(loadTabs()).toEqual([]);
     localStorage.setItem("foundry.tabs", JSON.stringify([1, "t3", null]));
     expect(loadTabs()).toEqual(["t3"]);
+  });
+
+  it("keeps the panes used last attached, most recent first, up to the cap", () => {
+    expect(ATTACHED_MAX).toBe(6);
+    expect(touched([], "t1")).toEqual(["t1"]);
+    expect(touched(["t1", "t2"], "t2")).toEqual(["t2", "t1"]);
+    expect(touched(["t6", "t5", "t4", "t3", "t2", "t1"], "t7")).toEqual(["t7", "t6", "t5", "t4", "t3", "t2"]);
+    expect(touched(["t3", "t2", "t1"], "t4", [], 3)).toEqual(["t4", "t3", "t2"]);
+  });
+
+  it("never drops a pane shown in a split, however long ago it was used", () => {
+    expect(touched(["t3", "t2", "t1"], "t4", ["t4", "t1"], 3)).toEqual(["t4", "t3", "t1"]);
+    expect(touched(["t3", "t2", "t1"], "t4", ["t4", "t1"], 2)).toEqual(["t4", "t1"]);
   });
 });

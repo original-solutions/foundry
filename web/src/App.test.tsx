@@ -500,6 +500,53 @@ describe("App", () => {
     expect(router.state.location.pathname).toBe("/terminals/t3");
   });
 
+  const many: UiMessage & { type: "state" } = {
+    ...live,
+    records: [...live.records, ...["t3", "t4", "t5", "t6", "t7", "t8"].map((id) => terminal(ME, id, "w1", "running"))],
+  };
+  const live_ = (id: string) => sockets(`/api/terminals/${id}`).filter((s) => s.readyState !== FakeSocket.CLOSED);
+  const visit = async (router: Awaited<ReturnType<typeof open>>, id: string) => {
+    await act(() => router.navigate({ to: "/terminals/$terminalId", params: { terminalId: id } }));
+    expect(router.state.location.pathname).toBe(`/terminals/${id}`);
+  };
+
+  it("keeps only the six terminals used last attached, and one you go back to attaches again with its tab intact", async () => {
+    const router = await open("/terminals/t1", many);
+    for (const id of ["t2", "t3", "t4", "t5", "t6", "t7"]) await visit(router, id);
+
+    expect(screen.getAllByRole("tab")).toHaveLength(7);
+    expect(screen.queryByTestId("pane-t1")).toBeNull();
+    expect(live_("t1")).toHaveLength(0);
+    for (const id of ["t2", "t3", "t4", "t5", "t6", "t7"]) expect(live_(id)).toHaveLength(1);
+
+    const events = sockets("/api/events").at(-1)!;
+    const idle: UiMessage = { type: "record", protocol: 1, record: session(ME, "s1", "w1", "t1", "idle", { model: "sonnet", version: 2 }) };
+    act(() => events.deliver(JSON.stringify(idle)));
+    const tab = screen.getByRole("tab", { name: /fix login \/ sonnet/ });
+    expect(tab.getAttribute("data-changed")).toBe("true");
+    expect(within(tab).getByText("Idle")).toBeDefined();
+
+    await visit(router, "t1");
+    expect(sockets("/api/terminals/t1")).toHaveLength(2);
+    expect(live_("t1")).toHaveLength(1);
+    expect(live_("t2")).toHaveLength(0);
+    expect(screen.getByRole("tab", { name: /fix login \/ sonnet/ }).getAttribute("data-changed")).toBeNull();
+  });
+
+  it("never detaches the other side of a split, however many terminals pass through the focused side", async () => {
+    const router = await open("/terminals/t1", many);
+    fireEvent.keyDown(window, { key: "\\", metaKey: true });
+    const picker = await screen.findByRole("dialog", { name: /^Open beside/ });
+    fireEvent.keyDown(within(picker).getByRole("combobox"), { key: "Enter" });
+    await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t2"));
+    for (const id of ["t3", "t4", "t5", "t6", "t7", "t8"]) await visit(router, id);
+
+    expect(within(screen.getByLabelText("Terminal beside")).getByText("sonnet")).toBeDefined();
+    expect(live_("t1")).toHaveLength(1);
+    expect(sockets("/api/terminals/t1")).toHaveLength(1);
+    expect(screen.getAllByTestId(/^pane-/)).toHaveLength(6);
+  });
+
   it("toggles the split with Cmd+\\: a picker opens it, the same keys close it", async () => {
     await open("/terminals/t1", live);
     fireEvent.keyDown(window, { key: "\\", metaKey: true });
