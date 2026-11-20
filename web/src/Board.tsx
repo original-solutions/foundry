@@ -1,8 +1,12 @@
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutationState, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate } from "@tanstack/react-router";
 import { ARCHIVE_ICON, TerminalMenu, useTerminalActions } from "./TerminalMenu";
 import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { glance, lanes, topFiles, type Card, type Lane } from "./lanes";
+import { button, pressed } from "./Modal";
+import { StepChips } from "./NextSteps";
+import { nextSteps } from "./next";
+import { shipLanes, useStaged, type ShipLane } from "./staged";
 import { useLeaving } from "./Archive";
 import { changesQuery } from "./ChangesPanel";
 import { ShipLine, shippingQuery } from "./Shipping";
@@ -14,20 +18,39 @@ import { Composer, useCreateWorkspace } from "./Composer";
 import { plural, type Glyph } from "./labels";
 import { glyphText, StateGlyph } from "./StateGlyph";
 import { Named, Now } from "./Now";
-import { Said } from "./Said";
+import { reply, Said } from "./Said";
 import { BOARD_BUSY_EVERY, pollEvery } from "./poll";
-import { Ship } from "./Ship";
 import { Timeline } from "./Timeline";
 
 /** Which view of the fleet the home shows, kept for this browser. The machines view has its own URL. */
-type View = "board" | "timeline" | "ship";
+type View = "board" | "timeline";
 const VIEW_KEY = "foundry.home";
 function loadView(): View {
   try {
-    const kept = localStorage.getItem(VIEW_KEY);
-    return kept === "timeline" || kept === "ship" ? kept : "board";
+    return localStorage.getItem(VIEW_KEY) === "timeline" ? "timeline" : "board";
   } catch {
     return "board";
+  }
+}
+
+/** How the board groups its cards, kept for this browser: by what they need, or by how far their work has shipped. */
+type Group = "attention" | "shipping";
+const GROUP_KEY = "foundry.group";
+function loadGroup(): Group {
+  try {
+    const kept = localStorage.getItem(GROUP_KEY);
+    if (kept === "attention" || kept === "shipping") return kept;
+    // The ship view this browser kept before it became the board's shipping grouping.
+    return localStorage.getItem(VIEW_KEY) === "ship" ? "shipping" : "attention";
+  } catch {
+    return "attention";
+  }
+}
+function saveGroup(group: Group) {
+  try {
+    localStorage.setItem(GROUP_KEY, group);
+  } catch {
+    // Not kept: the grouping still changes.
   }
 }
 /** Keeps `view` as the home's view for next time. */
@@ -45,6 +68,7 @@ export { BOARD_BUSY_EVERY };
 const ROWS_SHOWN = 4;
 
 const laneTitle: Record<Lane, string> = { needs: "Needs you", working: "Working", quiet: "Quiet" };
+const laneHint: Record<Lane, string> = { needs: "Waiting for you, stuck or failed", working: "An agent is working or starting", quiet: "Nothing is happening" };
 const laneTone: Record<Lane, string> = { needs: "text-amber-300", working: "text-sky-300", quiet: "text-neutral-400" };
 const laneGlyph: Record<Lane, Glyph> = { needs: "waiting", working: "working", quiet: "ready" };
 
@@ -68,7 +92,9 @@ const edge: Record<Glyph, string> = {
  *
  * At the top, a one-line box gives Claude its next task (`Composer`), beside the way to jump.
  * A switch beside the counts turns it into a timeline of every session's turns on one clock, or
- * into the fleet's work on its way to main (`Ship`).
+ * the machines. Above the lanes, the cards can be grouped instead by how far each workspace's work
+ * has gone on its way to main (`useStaged`), counted and summed; either way an idle session of this
+ * machine is offered the step that takes its work further, under it on its card.
  *
  * On a phone it is the home: a line above the task box says what needs you, what works and what
  * rests, and a bar at the bottom (`PhoneNav`) takes the switch's place and opens the workspaces.
@@ -111,6 +137,24 @@ export function Board({
   const launch = useCreateWorkspace();
   const board = lanes(machines);
   const needs = board.find((l) => l.lane === "needs")?.cards.length ?? 0;
+  const [group, setGroup] = useState(loadGroup);
+  const regroup = (next: Group) => {
+    setGroup(next);
+    saveGroup(next);
+  };
+  const leaving = new Set(
+    useMutationState({
+      filters: { mutationKey: ["archive"], predicate: (m) => m.state.status === "pending" || (m.state.status === "success" && m.state.data === null) },
+      select: (m) => String(m.options.mutationKey?.[1]),
+    }),
+  );
+  const here = useTerminalActions()?.here;
+  const staged = useStaged(
+    board.flatMap((l) => l.cards),
+    here,
+    view === "board" && group === "shipping",
+    leaving,
+  );
 
   const several = machines.length > 1;
   return (
@@ -130,16 +174,28 @@ export function Board({
           </div>
           {view === "timeline" ? (
             <Timeline machines={machines} traced={traced} onSteps={onSteps} />
-          ) : view === "ship" ? (
-            <Ship machines={machines} onChanges={onChanges} />
           ) : (
-            board.map(({ lane, cards }) => (
-              <LaneSection key={lane} lane={lane} count={cards.length}>
-                {cards.map((card) => (
-                  <WorkspaceCard key={card.workspace.id} card={card} showMachine={several} onChanges={onChanges} />
-                ))}
-              </LaneSection>
-            ))
+            <>
+              <GroupBar group={group} onPick={regroup} staged={staged} />
+              {group === "shipping"
+                ? staged.lanes.map(({ lane, cards }) => {
+                    const { name, hint, tone } = shipLanes.find((l) => l.lane === lane)!;
+                    return (
+                      <LaneSection key={lane} title={name} hint={hint} tone={tone} icon={<StageMark lane={lane} />} count={cards.length}>
+                        {cards.map((card) => (
+                          <WorkspaceCard key={`${card.workspace.id}:${lane}`} card={card} showMachine={several} onChanges={onChanges} arrived={staged.arrived[card.workspace.id] === lane} />
+                        ))}
+                      </LaneSection>
+                    );
+                  })
+                : board.map(({ lane, cards }) => (
+                    <LaneSection key={lane} title={laneTitle[lane]} hint={laneHint[lane]} tone={laneTone[lane]} icon={<StateGlyph glyph={laneGlyph[lane]} still />} count={cards.length}>
+                      {cards.map((card) => (
+                        <WorkspaceCard key={card.workspace.id} card={card} showMachine={several} onChanges={onChanges} />
+                      ))}
+                    </LaneSection>
+                  ))}
+            </>
           )}
         </div>
       </div>
@@ -148,16 +204,76 @@ export function Board({
   );
 }
 
-function LaneSection({ lane, count, children }: { lane: Lane; count: number; children: React.ReactNode }) {
+/**
+ * The board's grouping, above its lanes: by what each workspace needs (attention), or by how far
+ * its work has gone on its way to main (shipping), with the work summed while grouped that way.
+ */
+function GroupBar({ group, onPick, staged }: { group: Group; onPick: (group: Group) => void; staged: ReturnType<typeof useStaged> }) {
+  const { sum, reading } = staged;
+  // The work on its way to main, counted stage by stage as a scoreboard, then summed.
+  return (
+    <div className="-mb-3 flex flex-wrap items-center gap-x-3 gap-y-1.5 px-1">
+      <div role="group" aria-label="Group cards by" className="flex shrink-0 items-center gap-1.5 text-xs text-neutral-500">
+        <span className="pr-0.5">Group by</span>
+        {(
+          [
+            ["attention", "Attention", "What each workspace needs: you, its agents, or nothing"],
+            ["shipping", "Shipping", "How far each workspace's work has gone: only here, pushed, in review, merged"],
+          ] as const
+        ).map(([value, name, title]) => (
+          <button key={value} type="button" title={title} aria-pressed={group === value} onClick={() => onPick(value)} className={`${button} ${pressed} border-neutral-700 text-neutral-300`}>
+            {name}
+          </button>
+        ))}
+      </div>
+      {group === "shipping" && (
+        <p className="min-w-0 text-xs text-neutral-400">
+          {sum.workspaces === 0 ? (
+            reading > 0 ? (
+              "Reading where each workspace's work stands…"
+            ) : (
+              "No workspace has changed anything yet."
+            )
+          ) : (
+            <>
+              {shipLanes.slice(0, 4).map(({ lane, name, tone }, i) => {
+                const count = staged.lanes.find((l) => l.lane === lane)?.cards.length ?? 0;
+                return (
+                  <span key={lane} className="whitespace-nowrap">
+                    {i > 0 && <span className="px-1 text-neutral-600">›</span>}
+                    <span className={`font-semibold tabular-nums ${count ? tone : "text-neutral-600"}`}>{count}</span> {name.toLowerCase()}
+                  </span>
+                );
+              })}
+              {" · "}
+              <span className="font-mono">
+                <span className="text-emerald-400">+{sum.added.toLocaleString()}</span> <span className={sum.removed ? "text-red-400" : "text-neutral-600"}>−{sum.removed.toLocaleString()}</span>
+              </span>
+              {" · "}
+              {plural(sum.commits, "commit")}
+              {reading > 0 && <span className="text-neutral-500"> · reading {reading} more…</span>}
+            </>
+          )}
+        </p>
+      )}
+    </div>
+  );
+}
+
+/** A shipping lane's mark: a short bar in its colour, solid once the work left the machine. */
+function StageMark({ lane }: { lane: ShipLane }) {
+  const outline = lane === "here" || lane === "none" || lane === "unread";
+  return <span aria-hidden="true" className={`block h-2.5 w-2.5 rounded-sm border-2 border-current ${outline ? "" : "bg-current"}`} />;
+}
+
+function LaneSection({ title, hint, tone, icon, count, children }: { title: string; hint: string; tone: string; icon: React.ReactNode; count: number; children: React.ReactNode }) {
   const id = useId();
   return (
     <section aria-labelledby={id} className="flex flex-col gap-3">
-      <div className="flex items-center gap-2 px-1">
-        <span className={laneTone[lane]}>
-          <StateGlyph glyph={laneGlyph[lane]} still />
-        </span>
-        <h2 id={id} className={`text-xs font-semibold tracking-wider uppercase ${laneTone[lane]}`}>
-          {laneTitle[lane]}
+      <div className="flex items-center gap-2 px-1" title={hint}>
+        <span className={tone}>{icon}</span>
+        <h2 id={id} className={`text-xs font-semibold tracking-wider uppercase ${tone}`}>
+          {title}
         </h2>
         <span className="rounded-full bg-neutral-800 px-1.5 text-[11px] text-neutral-400">{count}</span>
         <span aria-hidden="true" className="h-px flex-1 bg-neutral-800" />
@@ -181,18 +297,21 @@ function useOnScreen<T extends Element>() {
   return [ref, onScreen] as const;
 }
 
-function WorkspaceCard({ card, showMachine, onChanges }: { card: Card; showMachine: boolean; onChanges: (workspace: string) => void }) {
+function WorkspaceCard({ card, showMachine, onChanges, arrived = false }: { card: Card; showMachine: boolean; onChanges: (workspace: string) => void; arrived?: boolean }) {
   const id = useId();
   const [ref, onScreen] = useOnScreen<HTMLElement>();
   const { workspace, machine, rows, lead } = card;
   const shown = rows.slice(0, ROWS_SHOWN);
   const terminals = useTerminalActions();
   const leaving = useLeaving(workspace.id);
+  // The session offered the next step: the first idle one, on this machine, which can type into it.
+  const idle = terminals?.here === machine.id && !leaving ? rows.find((r) => r.session && r.glyph === "ready") : undefined;
   return (
     <article
       ref={ref}
       aria-labelledby={id}
-      className="group/card relative flex flex-col overflow-hidden rounded-xl border border-neutral-800 bg-neutral-900/60 transition-colors hover:border-neutral-700"
+      data-arrived={arrived || undefined}
+      className={`group/card relative flex flex-col overflow-hidden rounded-xl border border-neutral-800 bg-neutral-900/60 transition-colors hover:border-neutral-700 ${arrived ? "motion-safe:animate-arrive" : ""}`}
     >
       <span aria-hidden="true" className={`absolute inset-y-0 left-0 w-1 ${lead ? edge[lead.glyph] : "bg-neutral-800"}`} />
       <header className="flex flex-col gap-0.5 px-4 pt-3 pb-2">
@@ -252,6 +371,7 @@ function WorkspaceCard({ card, showMachine, onChanges }: { card: Card; showMachi
               </Link>
             </TerminalMenu>
             {row.said && <Said said={row.said} name={row.name} terminal={row.terminal} canReply={row.glyph === "ready"} />}
+            {row === idle && <CardSteps key={rows.map((r) => r.glyph).join(" ")} workspace={workspace.id} row={row} />}
           </li>
         ))}
         {rows.length > shown.length && <li className="px-2 py-1 text-xs text-neutral-500">+{rows.length - shown.length} more</li>}
@@ -268,6 +388,23 @@ function WorkspaceCard({ card, showMachine, onChanges }: { card: Card; showMachi
         />
       )}
     </article>
+  );
+}
+
+/**
+ * The step that takes the workspace's work further (commit, push and open a pull request, fix
+ * failing checks, answer a review), offered to its idle session `row` and typed into its terminal.
+ * Drawn from the reads the card's footer and pull request line already made; it asks for nothing.
+ */
+function CardSteps({ workspace, row }: { workspace: string; row: Card["rows"][number] }) {
+  const { data: changes } = useQuery({ ...changesQuery(workspace), enabled: false });
+  const { data: shipping } = useQuery({ ...shippingQuery(workspace), enabled: false });
+  const steps = changes ? nextSteps(changes, shipping) : [];
+  if (steps.length === 0) return null;
+  return (
+    <div className="pt-1 pb-1.5 pl-9">
+      <StepChips steps={steps} name={row.name} send={(prompt) => reply(row.terminal, prompt)} look="card" />
+    </div>
   );
 }
 
@@ -372,11 +509,10 @@ export function JumpBar({ onJump }: { onJump: () => void }) {
 const views = [
   { view: "board", name: "Board", icon: <BoardIcon /> },
   { view: "timeline", name: "Timeline", icon: <TimelineIcon /> },
-  { view: "ship", name: "Ship", icon: <ShipIcon /> },
   { view: "machines", name: "Machines", icon: <MachinesIcon /> },
 ] as const;
 
-/** The switch between the home's views of the fleet: its workspaces, its turns, its work on the way to main and its machines. */
+/** The switch between the home's views of the fleet: its workspaces, its turns and its machines. */
 export function ViewSwitch({ view, onPick }: { view: View | "machines"; onPick: (view: View | "machines") => void }) {
   return (
     <div role="radiogroup" aria-label="View" className="flex shrink-0 gap-0.5 rounded-lg border border-neutral-800 bg-neutral-900 p-0.5 text-xs">
@@ -404,7 +540,7 @@ export function ViewSwitch({ view, onPick }: { view: View | "machines"; onPick: 
 export function PhoneNav({ view, onPick, needs, onMenu }: { view: View | "machines"; onPick: (view: View | "machines") => void; needs: number; onMenu: () => void }) {
   const item = "relative flex flex-col items-center gap-1 pt-2 pb-1.5 text-[11px] font-medium transition-colors";
   return (
-    <nav aria-label="Home" className="grid shrink-0 grid-cols-5 border-t border-neutral-800 bg-neutral-900 pb-[env(safe-area-inset-bottom)] md:hidden">
+    <nav aria-label="Home" className="grid shrink-0 grid-cols-4 border-t border-neutral-800 bg-neutral-900 pb-[env(safe-area-inset-bottom)] md:hidden">
       {views.map((v) => {
         const on = view === v.view;
         const count = v.view === "board" && needs > 0;
@@ -453,17 +589,6 @@ function BoardIcon() {
     <svg viewBox="0 0 16 16" className="size-3.5" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
       <rect x="2" y="2.5" width="5" height="11" rx="1" />
       <rect x="9" y="2.5" width="5" height="6.5" rx="1" />
-    </svg>
-  );
-}
-
-function ShipIcon() {
-  return (
-    <svg viewBox="0 0 16 16" className="size-3.5" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-      <circle cx="4" cy="3.5" r="1.5" />
-      <circle cx="4" cy="12" r="1.5" />
-      <circle cx="12" cy="12" r="1.5" />
-      <path d="M4 5v5.5M12 10.5V7a2.5 2.5 0 0 0-2.5-2.5H7m1.5-1.5L7 4.5 8.5 6" />
     </svg>
   );
 }

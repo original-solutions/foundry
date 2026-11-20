@@ -20,6 +20,11 @@ const looks = {
     row: "flex shrink-0 items-center gap-1.5",
     chip: "h-7 rounded-full px-2.5 text-xs",
   },
+  // Under the session's row on a board card.
+  card: {
+    row: "flex flex-wrap items-center gap-1.5",
+    chip: "h-7 rounded-full px-2.5 text-xs",
+  },
   // At the head of a phone's key bar, a thumb's size.
   keys: {
     row: "contents",
@@ -43,6 +48,16 @@ export function NextSteps({ workspace, name, send, look }: { workspace: string; 
     retry: false,
     refetchInterval: (query) => pollEvery(CHECKS_EVERY, query.state.data?.pr?.state === "open" && query.state.data.pr.checks === "pending")(query),
   });
+  const steps = changes ? nextSteps(changes, shipping) : [];
+  return <StepChips steps={steps} name={name} send={send} look={look} />;
+}
+
+/**
+ * The steps `steps` as chips, each sent to session `name` as a prompt by `send`. A step pressed
+ * stays down until the chips are mounted afresh (the session started working, so callers key or
+ * unmount them) or for `SENT_FOR`; one that did not reach it says so. Nothing shows for no steps.
+ */
+export function StepChips({ steps, name, send, look }: { steps: NextStep[]; name: string; send: (prompt: string) => Promise<void> | void; look: keyof typeof looks }) {
   const [sent, setSent] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
   useEffect(() => {
@@ -50,7 +65,6 @@ export function NextSteps({ workspace, name, send, look }: { workspace: string; 
     const timer = setTimeout(() => setSent(null), SENT_FOR);
     return () => clearTimeout(timer);
   }, [sent]);
-  const steps = changes ? nextSteps(changes, shipping) : [];
   if (steps.length === 0) return null;
   const pick = async (step: NextStep) => {
     setSent(step.label);

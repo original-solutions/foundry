@@ -3,7 +3,7 @@ import type { Changes, Shipping } from "./api";
 /** How far a workspace's work has gone on its way to its base: only on its machine, on GitHub, in a pull request, merged. */
 export type Stage = "here" | "pushed" | "review" | "merged";
 
-/** The stages in order, as the ship view's columns name them. */
+/** The stages in order, as the board names its lanes when grouped by shipping. */
 export const stages: { stage: Stage; name: string; hint: string }[] = [
   { stage: "here", name: "Only here", hint: "Edits or commits GitHub does not have yet" },
   { stage: "pushed", name: "Pushed", hint: "The branch is on GitHub, with no open pull request" },

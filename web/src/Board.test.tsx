@@ -3,13 +3,14 @@ import { createMemoryHistory, createRootRoute, createRoute, createRouter, Router
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createContext, useContext, type ComponentProps } from "react";
-import type { AnyRecord, Changes, SessionState } from "./api";
+import type { AnyRecord, Changes, SessionState, Shipping } from "./api";
 import { archiveOf } from "./Archive";
 import { Board, BOARD_BUSY_EVERY } from "./Board";
 import { fleet, type MachineView } from "./fleet";
-import { ME, sample, session, settings, terminal, workspace } from "./test-fixtures";
+import { ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
 import { RETRY_EVERY } from "./poll";
-import { json } from "./test-utils";
+import { TerminalActions } from "./TerminalMenu";
+import { FakeSocket, json } from "./test-utils";
 
 const file = (path: string, added: number, removed: number, uncommitted = false) => ({
   path,
@@ -94,11 +95,12 @@ afterEach(() => {
 
 const Machines = createContext<MachineView[]>([]);
 
-async function show(machines: MachineView[], onChanges = vi.fn(), props: Partial<ComponentProps<typeof Board>> = {}) {
+async function show(machines: MachineView[], onChanges = vi.fn(), props: Partial<ComponentProps<typeof Board>> = {}, served = false) {
   function Shown() {
-    return (
+    const machines = useContext(Machines);
+    const board = (
       <Board
-        machines={useContext(Machines)}
+        machines={machines}
         projects={settings().projects}
         onJump={() => {}}
         onChanges={onChanges}
@@ -108,6 +110,14 @@ async function show(machines: MachineView[], onChanges = vi.fn(), props: Partial
         onMenu={() => {}}
         {...props}
       />
+    );
+    if (!served) return board;
+    // Served by a daemon, as in the app: the board knows its machine and can act on its terminals.
+    const noop = () => {};
+    return (
+      <TerminalActions machines={machines} onOpen={noop} onBeside={noop} onSteps={noop} onChanges={noop} onFind={noop} onNewSession={noop}>
+        {board}
+      </TerminalActions>
     );
   }
   const root = createRootRoute({ component: Shown });
@@ -281,9 +291,123 @@ describe("Board", () => {
     expect(await screen.findByRole("region", { name: "Timeline" })).toBeDefined();
     expect(screen.queryByRole("region", { name: "Working" })).toBeNull();
     expect(localStorage.getItem("foundry.home")).toBe("timeline");
+    // Three views: the board, the timeline and the machines; where work stands is a grouping of the board.
+    expect(within(screen.getByRole("radiogroup", { name: "View" })).getAllByRole("radio").map((r) => r.textContent)).toEqual(["Board", "Timeline", "Machines"]);
     fireEvent.click(screen.getByRole("radio", { name: "Board" }));
     expect(screen.getByRole("region", { name: "Working" })).toBeDefined();
     expect(localStorage.getItem("foundry.home")).toBe("board");
+  });
+});
+
+describe("Grouped by shipping", () => {
+  const commit = (hash: string, subject: string) => ({ hash, subject });
+  const shipping = (extra: Partial<Shipping> = {}): Shipping => ({ branch: "b", pushed: false, unpushed: 0, pr: null, unreachable: false, ...extra });
+  const pr = (number: number, state: "open" | "merged", checks: "failing" | "passing") => ({ number, title: `PR ${number}`, url: `https://github.com/o/r/pull/${number}`, state, draft: false, checks, review: "none" as const });
+  const fleetOf = (draft: SessionState = "idle"): AnyRecord[] => [
+    sample(ME, 1),
+    sample(OTHER, 1),
+    workspace(ME, "w1", "draft login"),
+    terminal(ME, "t1", "w1"),
+    session(ME, "s1", "w1", "t1", draft),
+    workspace(ME, "w2", "push docs"),
+    terminal(ME, "t2", "w2"),
+    session(ME, "s2", "w2", "t2", "working"),
+    workspace(ME, "w3", "fix footer"),
+    terminal(ME, "t3", "w3"),
+    session(ME, "s3", "w3", "t3", "idle"),
+    workspace(ME, "w4", "rename api"),
+    terminal(ME, "t4", "w4"),
+    workspace(ME, "w5", "say hi"),
+    terminal(ME, "t5", "w5"),
+    workspace(OTHER, "w6", "far off"),
+    terminal(OTHER, "t6", "w6"),
+  ];
+  const lane = (name: string) => screen.getByRole("region", { name });
+
+  beforeEach(() => {
+    FakeSocket.all = [];
+    vi.stubGlobal("WebSocket", FakeSocket);
+    answers["/api/machine"] = () => json(200, { id: ME });
+    answers["/api/workspaces/w1/changes"] = () => json(200, { base: "main", commits: [commit("aaa1111", "Draft the login form")], files: [file("src/login.ts", 40, 2), file("README.md", 3, 0, true)] } satisfies Changes);
+    answers["/api/workspaces/w1/pr"] = () => json(200, shipping({ unpushed: 1 }));
+    answers["/api/workspaces/w2/changes"] = () => json(200, { base: "main", commits: [commit("bbb2222", "Document the API")], files: [file("docs/api.md", 12, 1)] } satisfies Changes);
+    answers["/api/workspaces/w2/pr"] = () => json(200, shipping({ pushed: true }));
+    answers["/api/workspaces/w3/changes"] = () => json(200, { base: "main", commits: [commit("ccc3333", "Show the version")], files: [file("src/footer.tsx", 5, 1)] } satisfies Changes);
+    answers["/api/workspaces/w3/pr"] = () => json(200, shipping({ pushed: true, pr: pr(12, "open", "failing") }));
+    answers["/api/workspaces/w4/changes"] = () => json(200, { base: "main", commits: [commit("ddd4444", "Rename the API")], files: [file("src/api.ts", 9, 9)] } satisfies Changes);
+    answers["/api/workspaces/w4/pr"] = () => json(200, shipping({ pushed: true, pr: pr(9, "merged", "passing") }));
+    answers["/api/workspaces/w5/changes"] = () => json(200, { base: "main", commits: [], files: [] } satisfies Changes);
+    answers["/api/workspaces/w5/pr"] = () => json(200, shipping());
+  });
+
+  it("puts the cards in lanes by how far their work has gone, counts each, and sums the fleet's work", async () => {
+    await show(fleet(fleetOf(), settings()), vi.fn(), {}, true);
+    const toggle = screen.getByRole("button", { name: "Shipping" });
+    expect(toggle.getAttribute("aria-pressed")).toBe("false");
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute("aria-pressed")).toBe("true");
+    expect(localStorage.getItem("foundry.group")).toBe("shipping");
+    await waitFor(() => expect(within(lane("Merged")).getByRole("article", { name: "rename api" })).toBeDefined());
+    expect(within(lane("Only here")).getByRole("article", { name: "draft login" })).toBeDefined();
+    expect(within(lane("Pushed")).getByRole("article", { name: "push docs" })).toBeDefined();
+    expect(within(lane("In review")).getByRole("article", { name: "fix footer" })).toBeDefined();
+    expect(within(lane("Nothing yet")).getByRole("article", { name: "say hi" })).toBeDefined();
+    // Another machine's workspace keeps its card, said to be unread from here, and where its branch stands is never asked.
+    expect(within(lane("Not read from here")).getByRole("article", { name: "far off" })).toBeDefined();
+    expect(reads).not.toContain("/api/workspaces/w6/pr");
+    // The lanes of the need view are gone while grouped by shipping.
+    expect(screen.queryByRole("region", { name: "Quiet" })).toBeNull();
+    const sum = screen.getByText((_, el) => el?.tagName === "P" && /only here/.test(el.textContent ?? ""));
+    expect(sum.textContent).toContain("1 only here›1 pushed›1 in review›1 merged");
+    expect(sum.textContent).toContain("+69 −13");
+    expect(sum.textContent).toContain("4 commits");
+    // The pull request reads on the card as anywhere else, failing checks and all.
+    expect(within(card("fix footer")).getByText("Checks failing")).toBeDefined();
+
+    fireEvent.click(screen.getByRole("button", { name: "Attention" }));
+    expect(screen.getByRole("region", { name: "Working" })).toBeDefined();
+    expect(screen.queryByRole("region", { name: "Merged" })).toBeNull();
+    expect(localStorage.getItem("foundry.group")).toBe("attention");
+  });
+
+  it("opens grouped by shipping for a browser that kept the old ship view, which is no longer a view of its own", async () => {
+    localStorage.setItem("foundry.home", "ship");
+    await show(fleet(fleetOf(), settings()), vi.fn(), {}, true);
+    await waitFor(() => expect(within(lane("Merged")).getByRole("article", { name: "rename api" })).toBeDefined());
+    expect(screen.getByRole("button", { name: "Shipping" }).getAttribute("aria-pressed")).toBe("true");
+    expect(screen.queryByRole("radio", { name: "Ship" })).toBeNull();
+    expect(within(screen.getByRole("navigation", { name: "Home" })).queryByRole("button", { name: "Ship" })).toBeNull();
+  });
+
+  it("offers an idle session the step that takes its work further, under it on its card, and types it into its terminal", async () => {
+    await show(fleet(fleetOf(), settings()), vi.fn(), {}, true);
+    const draft = card("draft login");
+    const step = await within(draft).findByRole("button", { name: "Commit 1 file" });
+    expect(within(draft).getByRole("group", { name: "Next for opus" })).toBeDefined();
+    fireEvent.click(step);
+    const socket = FakeSocket.all.at(-1)!;
+    expect(socket.url).toContain("/api/terminals/t1");
+    act(() => socket.open());
+    expect(new TextDecoder().decode(socket.sent[0] as Uint8Array)).toContain("Commit the uncommitted changes");
+    // Failing checks are offered red to the idle session whose pull request has them.
+    expect(await within(card("fix footer")).findByRole("button", { name: "Fix failing checks" })).toBeDefined();
+    // A working session is not interrupted, and another machine's is not offered anything.
+    await waitFor(() => expect(within(card("push docs")).getByText("Document the API")).toBeDefined());
+    expect(within(card("push docs")).queryByRole("group", { name: /Next for/ })).toBeNull();
+    expect(within(card("far off")).queryByRole("group", { name: /Next for/ })).toBeNull();
+  });
+
+  it("moves a card to its new lane when one of its terminals changes state, and lights it up once there", async () => {
+    localStorage.setItem("foundry.group", "shipping");
+    const { update } = await show(fleet(fleetOf("working"), settings()), vi.fn(), {}, true);
+    await waitFor(() => expect(within(lane("Only here")).getByRole("article", { name: "draft login" })).toBeDefined());
+    answers["/api/workspaces/w1/changes"] = () => json(200, { base: "main", commits: [commit("aaa1111", "Draft the login form")], files: [file("src/login.ts", 40, 2)] } satisfies Changes);
+    answers["/api/workspaces/w1/pr"] = () => json(200, shipping({ pushed: true }));
+    update(fleet(fleetOf("idle"), settings()));
+    await waitFor(() => expect(within(lane("Pushed")).getByRole("article", { name: "draft login" })).toBeDefined());
+    expect(within(lane("Pushed")).getByRole("article", { name: "draft login" }).dataset.arrived).toBe("true");
+    expect(within(lane("Pushed")).getByRole("article", { name: "push docs" }).dataset.arrived).toBeUndefined();
+    expect(reads.filter((u) => u === "/api/workspaces/w3/pr").length).toBe(1);
   });
 });
 
