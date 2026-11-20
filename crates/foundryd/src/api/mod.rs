@@ -65,7 +65,7 @@ use axum::extract::rejection::JsonRejection;
 use axum::extract::ws::rejection::WebSocketUpgradeRejection;
 use axum::extract::ws::{self, WebSocket, WebSocketUpgrade};
 use axum::extract::{FromRequest, Path, Request, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -609,14 +609,21 @@ struct Create {
 
 async fn create_workspace(
     State(api): State<Api>,
+    headers: HeaderMap,
     Body(create): Body<Create>,
 ) -> Result<Response, ApiError> {
     // A create naming another machine is carried there before this runs ([`carry`]), so one
-    // that reaches here was carried in, and is never carried on.
-    if let Some(machine) = create.machine.filter(|m| *m != api.peers.me()) {
+    // that reaches here naming another was carried in, and is never carried on. One carried in
+    // names this machine, as the caller's carry layer sends it.
+    let me = api.peers.me();
+    let carried = headers.contains_key(crate::sync::call::CARRIED);
+    if create.machine.is_some_and(|m| m != me) || (carried && create.machine != Some(me)) {
+        let named = create
+            .machine
+            .map_or_else(|| "no machine".to_owned(), |m| format!("machine {m}"));
         return Ok(error(
             StatusCode::MISDIRECTED_REQUEST,
-            format!("this call names machine {machine}, not this one, and is not carried on"),
+            format!("this call names {named}, not this one, and is not carried on"),
         ));
     }
     match api

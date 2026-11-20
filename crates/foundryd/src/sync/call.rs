@@ -13,11 +13,10 @@
 //! has passed, so a call that follows on from this one, such as starting a session in the
 //! workspace it made, finds what it made already here.
 //!
-//! A call goes only to a machine in the machine list and heard from within [`OFFLINE_AFTER`],
-//! and not to one whose open record links all speak a protocol older than [`CALLS_SINCE`]; each
-//! of those is refused before a link opens, so the refusal changes nothing anywhere. An older
-//! machine with no record link open at that moment is sent the call, closes the link without
-//! answering, and the call is [`CallError::Lost`]. No end ever logs a body.
+//! A call goes only to a machine in the machine list, heard from within [`OFFLINE_AFTER`], with
+//! an open record link that speaks [`CALLS_SINCE`] or later; any other is refused before a link
+//! opens, so the refusal changes nothing anywhere and an older machine is never sent one. No end
+//! ever logs a body.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -123,8 +122,11 @@ impl Peers {
         if !self.online().contains(&owner) {
             return Err(CallError::Offline(peer.name));
         }
-        if self.speaks_before(owner, CALLS_SINCE) {
-            return Err(CallError::Older(peer.name));
+        match self.speaks(owner) {
+            Some(speak) if speak >= CALLS_SINCE => {}
+            Some(_) => return Err(CallError::Older(peer.name)),
+            // Nothing says the machine can take a call until a record link agrees a protocol.
+            None => return Err(CallError::Down(peer.name)),
         }
         let open = PeerMessage::Call {
             protocol: PROTOCOL,
@@ -165,12 +167,11 @@ impl Peers {
         Ok(Answer { status, body })
     }
 
-    /// Whether every open record link to `machine` speaks a protocol older than `since`. A
-    /// machine with no open link says nothing, so it is not taken as older.
-    fn speaks_before(&self, machine: MachineId, since: u16) -> bool {
+    /// The newest protocol an open record link to `machine` speaks, or `None` with no link open.
+    fn speaks(&self, machine: MachineId) -> Option<u16> {
         lock(&self.inner.links)
             .get(&machine)
-            .is_some_and(|open| open.values().all(|link| link.speak < since))
+            .and_then(|open| open.values().map(|link| link.speak).max())
     }
 
     /// Waits until this machine holds `owner`'s records up to `version`, at most
@@ -233,17 +234,17 @@ pub(super) async fn serve(inner: &Inner, machine: MachineId, call: Call, conn: C
     last_word(&send, &mut recv, &answer).await;
 }
 
-/// The client a carried call is made to this machine's API with: no proxy, whatever the
-/// environment says, and no redirect, so the call never leaves this machine, and at most
-/// [`CALL_LIMIT`].
-fn loopback_agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
+/// `builder` as the client a carried call is made to this machine's API with: no proxy,
+/// whatever the environment says, and no redirect, so the call never leaves this machine, and at
+/// most [`CALL_LIMIT`].
+fn loopback(
+    builder: ureq::config::ConfigBuilder<ureq::typestate::AgentScope>,
+) -> ureq::config::ConfigBuilder<ureq::typestate::AgentScope> {
+    builder
         .http_status_as_error(false)
         .proxy(None)
         .max_redirects(0)
         .timeout_global(Some(CALL_LIMIT))
-        .build()
-        .into()
 }
 
 /// Makes the call to this machine's API at `api` and gives back its status and body. The
@@ -255,7 +256,8 @@ async fn run(
     body: Bytes,
 ) -> (u16, Bytes) {
     let made = tokio::task::spawn_blocking(move || {
-        let mut request = loopback_agent()
+        let agent: ureq::Agent = loopback(ureq::Agent::config_builder()).build().into();
+        let mut request = agent
             .post(format!("http://{api}{path}"))
             .header(CARRIED, "1");
         if let Some(content_type) = content_type {
