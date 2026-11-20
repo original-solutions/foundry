@@ -24,7 +24,8 @@
 //!
 //! A create that dies after making its worktree and before writing its record leaves a worktree
 //! no record names. At start, [`Workspaces::sweep`] removes each such worktree that an unforced
-//! archive would remove, keeping its branch, and leaves and logs any other.
+//! archive would remove and that holds nothing git ignores, so git can give back all of it,
+//! keeping its branch, and leaves and logs any other.
 //!
 //! Every branch is made by [`safe_branch`] and every path reaches git after `--`, so a name as
 //! typed never reads as an option and never leaves the project's folder of worktrees.
@@ -264,12 +265,14 @@ impl Workspaces {
     }
 
     /// Deals with each worktree under `worktrees/<project>/`, for each project in the shared
-    /// settings, that no live workspace record in the store names, of this machine or of any
-    /// other owner, as a create that died before writing its record leaves. One that passes
-    /// the checks of an unforced archive is removed without `--force` and its branch kept; any
-    /// other, or one git will not remove, is left as it is and logged with what holds it. A
-    /// worktree whose folder is gone is checked by the `HEAD` git keeps for it. Branches are
-    /// never touched. A clone whose worktrees cannot be listed is logged and passed over.
+    /// settings, that no live workspace record in the store names, as a create that died before
+    /// writing its record leaves. One that passes the checks of an unforced archive and holds no
+    /// file git ignores, which such a create never leaves, is removed without `--force` and its
+    /// branch kept; any other, or one git will not remove, is left as it is and logged with what
+    /// holds it. One named only by another owner's record is left and logged too. A worktree
+    /// whose folder is gone is checked by the `HEAD` git keeps for it. Branches are never
+    /// touched. A store that cannot be read skips the sweep, and a clone whose worktrees cannot
+    /// be listed is passed over, each with a log line.
     pub async fn sweep(&self) -> Result<(), WorkspaceError> {
         self.inner.sweep().await
     }
@@ -426,7 +429,7 @@ impl Inner {
         // Every owner's records count: the machine's identity can be made again while its data
         // directory stays, and a record only ever keeps a worktree. Projects come from the
         // settings, as a create's do, so a store made again, which holds none, removes nothing.
-        let (projects, live) = self
+        let read = self
             .with_store(|store| {
                 let projects: Vec<ProjectId> = store
                     .settings()?
@@ -438,25 +441,41 @@ impl Inner {
                 for owner in store.versions()?.into_keys() {
                     live.extend(store.since(owner, 0)?.into_iter().filter_map(
                         |record| match record {
-                            AnyRecord::Workspace(r) if !r.deleted => Some(r.body),
+                            AnyRecord::Workspace(r) if !r.deleted => Some((r.owner, r.body)),
                             _ => None,
                         },
                     ));
                 }
                 Ok((projects, live))
             })
-            .await?;
+            .await;
+        // Without every record, a live workspace's worktree could look like a leftover.
+        let (projects, live) = match read {
+            Ok(read) => read,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "the store could not be read, so the sweep for worktrees a failed create \
+                     left is skipped this start"
+                );
+                return Ok(());
+            }
+        };
         for project in projects {
             let clone = self.clone_path(project);
             if !tokio::fs::try_exists(&clone).await? {
                 continue;
             }
-            let branches: Vec<&str> = live
-                .iter()
-                .filter(|w| w.project == project)
-                .map(|w| w.branch.as_str())
-                .collect();
-            if let Err(error) = self.sweep_project(project, &branches).await {
+            let branches = |mine: bool| -> Vec<&str> {
+                live.iter()
+                    .filter(|(owner, w)| w.project == project && (*owner == self.me) == mine)
+                    .map(|(_, w)| w.branch.as_str())
+                    .collect()
+            };
+            if let Err(error) = self
+                .sweep_project(project, &branches(true), &branches(false))
+                .await
+            {
                 tracing::warn!(
                     clone = %clone.display(),
                     %error,
@@ -467,8 +486,14 @@ impl Inner {
         Ok(())
     }
 
-    /// [`Workspaces::sweep`] for one project's clone, whose live workspaces are on `live`.
-    async fn sweep_project(&self, project: ProjectId, live: &[&str]) -> Result<(), WorkspaceError> {
+    /// [`Workspaces::sweep`] for one project's clone, whose live workspaces of this machine are
+    /// on `mine` and of other owners on `others`, by branch.
+    async fn sweep_project(
+        &self,
+        project: ProjectId,
+        mine: &[&str],
+        others: &[&str],
+    ) -> Result<(), WorkspaceError> {
         let lock = self.lock(project);
         let _held = lock.lock().await;
         let clone = self.clone_path(project);
@@ -493,26 +518,43 @@ impl Inner {
             let Some(folder) = listed.file_name().and_then(OsStr::to_str) else {
                 continue;
             };
-            if self
-                .named(project, &listed, folder, branch.as_deref(), live)
-                .await
-            {
+            let worktree = listed.display();
+            let branch = branch.as_deref();
+            if self.named(project, &listed, folder, branch, mine).await {
                 continue;
             }
-            let worktree = listed.display();
-            match self.refuse_dirty(&clone, &listed, folder).await {
-                Ok(()) => match self.remove_worktree(&clone, &listed, false).await {
-                    Ok(_) => tracing::info!(
-                        %worktree,
-                        "removed a worktree no workspace names, left by a failed create; its \
-                         branch is kept"
-                    ),
-                    Err(error) => tracing::warn!(
-                        %worktree,
-                        %error,
-                        "a worktree no workspace names could not be removed and is left as it is"
-                    ),
-                },
+            if self.named(project, &listed, folder, branch, others).await {
+                tracing::warn!(
+                    %worktree,
+                    "a worktree only another machine's workspace record names is left as it is"
+                );
+                continue;
+            }
+            let checked = match self.refuse_dirty(&clone, &listed, folder).await {
+                Ok(()) => self.ignored(&listed).await,
+                Err(error) => Err(error),
+            };
+            match checked {
+                Ok(ignored) if ignored.is_empty() => {
+                    match self.remove_worktree(&clone, &listed, false).await {
+                        Ok(_) => tracing::info!(
+                            %worktree,
+                            "removed a worktree no workspace names, left by a failed create; its \
+                             branch is kept"
+                        ),
+                        Err(error) => tracing::warn!(
+                            %worktree,
+                            %error,
+                            "a worktree no workspace names could not be removed and is left as it is"
+                        ),
+                    }
+                }
+                Ok(ignored) => tracing::warn!(
+                    %worktree,
+                    ?ignored,
+                    "a worktree no workspace names holds files git ignores, which a failed \
+                     create never leaves, and is left as it is"
+                ),
                 Err(WorkspaceError::Dirty(dirty)) => tracing::warn!(
                     %worktree,
                     uncommitted = ?dirty.uncommitted,
@@ -528,6 +570,34 @@ impl Inner {
             }
         }
         Ok(())
+    }
+
+    /// Files and folders in `worktree` that git ignores, sorted; none when its folder is gone.
+    /// Git cannot give them back once the worktree is removed.
+    async fn ignored(&self, worktree: &Path) -> Result<Vec<String>, WorkspaceError> {
+        if !tokio::fs::try_exists(worktree).await? {
+            return Ok(Vec::new());
+        }
+        let out = self
+            .git(
+                worktree,
+                "ls-files",
+                [
+                    "-z",
+                    "--others",
+                    "--ignored",
+                    "--exclude-standard",
+                    "--directory",
+                ],
+            )
+            .await?;
+        let mut paths: Vec<String> = out
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .map(str::to_owned)
+            .collect();
+        paths.sort();
+        Ok(paths)
     }
 
     /// Whether a live workspace of `project`, one of whose branches is on `live`, names the
