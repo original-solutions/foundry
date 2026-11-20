@@ -1425,4 +1425,30 @@ mod tests {
         assert_eq!(own.unwrap(), forwarded.unwrap());
         assert_eq!(coordinator.held().await.unwrap().seq, before + 1);
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_forwarded_edit_whose_settings_cannot_be_read_until_the_limit_ends_as_a_store_error()
+    {
+        let (dir, coordinator) = alone();
+        lock(&coordinator.store)
+            .apply_settings(SharedSettings {
+                seq: 1,
+                ..SharedSettings::default()
+            })
+            .unwrap();
+        rusqlite::Connection::open(dir.path().join("foundry.db"))
+            .unwrap()
+            .execute("UPDATE settings SET settings = 'unreadable'", [])
+            .unwrap();
+        let error = coordinator
+            .edit_from(
+                Some(MachineId::random()),
+                Instant::now(),
+                EditId::random(),
+                set_project(7, "unread"),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, CoordinatorError::Store(_)), "{error}");
+    }
 }

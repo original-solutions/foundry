@@ -1648,7 +1648,7 @@ async fn an_edit_forwarded_on_a_link_before_answers_is_numbered_and_never_answer
     assert!(answers_sent(&said).is_empty());
 }
 
-// --- review fixes ---
+// --- forwarded edits: refusals, copies, ids and read errors ---
 
 #[tokio::test(start_paused = true)]
 async fn a_peer_that_cannot_carry_numbered_ids_does_not_keep_raising_the_number() {
@@ -1801,6 +1801,20 @@ async fn an_edit_without_an_id_goes_on_to_an_acting_machine_before_answers() {
         .unwrap();
     assert!(sent.get("id").is_none(), "{sent}");
     assert_eq!(sent["protocol"], ANSWERS_SINCE - 1);
+
+    // It is passed on once: the acting machine's link closes and a new one opens, and nothing
+    // is sent again, as nobody would answer it.
+    _beat_a.abort();
+    drop(ca);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let (ca, said_again) = recorded(raw_link_speaking(daemon, acting, ANSWERS_SINCE - 1).await);
+    say(&ca, &settings_message(daemon.settings())).await;
+    let _beat_again = beating(ca.clone());
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let count = |said: &Mutex<Vec<serde_json::Value>>| {
+        lock(said).iter().filter(|m| m["type"] == "edit").count()
+    };
+    assert_eq!(count(&said_a) + count(&said_again), 1);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1863,4 +1877,187 @@ async fn an_answer_on_a_link_that_refused_a_message_is_still_taken() {
         .unwrap()
         .unwrap_err();
     assert!(matches!(error, CoordinatorError::Refused { .. }), "{error}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_id_refused_is_refused_again_when_it_is_sent_again() {
+    let (fleet, _, conn, said) = acting_with_a_peer().await;
+    let daemon = &fleet.daemons[0];
+    let db = rusqlite::Connection::open(&daemon.db).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER refuse BEFORE UPDATE ON settings \
+         BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+    )
+    .unwrap();
+    let edit = edit_with(EditId::random(), set_project(7, "refused once"));
+    say(&conn, &edit).await;
+    until(Duration::from_secs(2), "the edit is refused", || {
+        answers_sent(&said).len() == 1
+    })
+    .await;
+
+    // The store takes writes again, but the sender was told the edit is refused.
+    db.execute_batch("DROP TRIGGER refuse").unwrap();
+    say(&conn, &edit).await;
+    until(
+        Duration::from_secs(2),
+        "the edit sent again is answered",
+        || answers_sent(&said).len() == 2,
+    )
+    .await;
+    let answers = answers_sent(&said);
+    assert!(
+        matches!(answers[0].1, Outcome::Refused { .. }),
+        "{answers:?}"
+    );
+    assert_eq!(answers[0], answers[1]);
+    assert_eq!(project_named(&daemon.settings(), 7), None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_write_after_the_edit_was_sent_does_not_end_the_wait_once_the_role_moves_here() {
+    let peer = MachineId::random();
+    let fleet = Fleet::start_coordinated_with(1, &[peer]);
+    let daemon = &fleet.daemons[0];
+    let (conn, said) = recorded(raw_link(daemon, peer).await);
+    let theirs = ordered_by(&daemon.settings(), peer, vec![peer, daemon.id]);
+    say(&conn, &settings_message(theirs)).await;
+    let beat = beating(conn.clone());
+    acting_becomes(&daemon.coordinator(), peer, WAIT).await;
+    let editing = tokio::spawn({
+        let coordinator = daemon.coordinator();
+        async move { coordinator.edit(set_project(7, "written later")).await }
+    });
+    until(Duration::from_secs(2), "the edit is sent", || {
+        !edits_sent(&said).is_empty()
+    })
+    .await;
+
+    // The peer goes quiet, so the role moves here while the store refuses writes.
+    beat.abort();
+    let db = rusqlite::Connection::open(&daemon.db).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER refuse BEFORE UPDATE ON settings \
+         BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+    )
+    .unwrap();
+    tokio::time::sleep(OFFLINE_AFTER + Duration::from_secs(2)).await;
+    assert!(!editing.is_finished(), "ended by the failed write");
+    db.execute_batch("DROP TRIGGER refuse").unwrap();
+    tokio::time::timeout(Duration::from_secs(2), editing)
+        .await
+        .expect("numbered once the store takes writes")
+        .unwrap()
+        .expect("a failed write after the send is not the end");
+    assert_eq!(
+        project_named(&daemon.settings(), 7).as_deref(),
+        Some("written later")
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_same_id_from_two_machines_is_answered_to_each() {
+    let (p1, p2, quiet) = (
+        MachineId::random(),
+        MachineId::random(),
+        MachineId::random(),
+    );
+    let fleet = Fleet::start_coordinated_with(1, &[p1, p2, quiet]);
+    let daemon = &fleet.daemons[0];
+    let (c1, said1) = recorded(raw_link(daemon, p1).await);
+    let (c2, said2) = recorded(raw_link(daemon, p2).await);
+    say(&c1, &settings_message(daemon.settings())).await;
+    say(&c2, &settings_message(daemon.settings())).await;
+    let _b1 = beating(c1.clone());
+    let _b2 = beating(c2.clone());
+    // `quiet` never sends its settings, so edits wait to catch up.
+    let _quiet = beat(raw_link(daemon, quiet).await);
+    until(WAIT, "every peer is online", || {
+        let online = daemon.peers.online();
+        [p1, p2, quiet].iter().all(|p| online.contains(p))
+    })
+    .await;
+
+    let edit = edit_with(EditId::random(), set_project(7, "from two"));
+    say(&c1, &edit).await;
+    say(&c2, &edit).await;
+    tokio::time::sleep(OFFLINE_AFTER + Duration::from_secs(5)).await;
+    let (a1, a2) = (answers_sent(&said1), answers_sent(&said2));
+    assert_eq!(a1.len(), 1, "{a1:?}");
+    assert_eq!(a2.len(), 1, "{a2:?}");
+    assert_eq!(a1, a2, "one id, one number");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_forwarded_edit_whose_settings_cannot_be_read_for_a_moment_is_still_numbered() {
+    let (peer, quiet) = (MachineId::random(), MachineId::random());
+    let fleet = Fleet::start_coordinated_with(1, &[peer, quiet]);
+    let daemon = &fleet.daemons[0];
+    let (conn, said) = recorded(raw_link(daemon, peer).await);
+    say(&conn, &settings_message(daemon.settings())).await;
+    let _beating = beating(conn.clone());
+    let _quiet = beat(raw_link(daemon, quiet).await);
+    until(WAIT, "both peers are online", || {
+        let online = daemon.peers.online();
+        online.contains(&peer) && online.contains(&quiet)
+    })
+    .await;
+    let id = EditId::random();
+    say(&conn, &edit_with(id, set_project(7, "read later"))).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let db = rusqlite::Connection::open(&daemon.db).unwrap();
+    let held: String = db
+        .query_row("SELECT settings FROM settings", [], |row| row.get(0))
+        .unwrap();
+    db.execute("UPDATE settings SET settings = 'unreadable'", [])
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    db.execute("UPDATE settings SET settings = ?1", [held])
+        .unwrap();
+
+    tokio::time::sleep(OFFLINE_AFTER).await;
+    let answers = answers_sent(&said);
+    assert!(
+        matches!(answers[..], [(got, Outcome::Numbered { .. })] if got == id),
+        "{answers:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_edit_a_machine_that_acted_before_numbered_is_answered_with_its_stamp_and_not_numbered_again()
+ {
+    let (before, forwarder) = (MachineId::random(), MachineId::random());
+    let fleet = Fleet::start_coordinated_with(1, &[before, forwarder]);
+    let daemon = &fleet.daemons[0];
+    let cb = drained(raw_link(daemon, before).await);
+    let (cf, said) = recorded(raw_link(daemon, forwarder).await);
+    let id = EditId::random();
+    let stamp = Stamp {
+        seq: daemon.settings().seq + 1,
+        by: before,
+    };
+    let mut theirs = daemon.settings();
+    theirs.seq += 1;
+    theirs.numbered.insert(id, stamp);
+    say(&cb, &settings_message(theirs)).await;
+    say(&cf, &settings_message(daemon.settings())).await;
+    let _bb = beating(cb.clone());
+    let _bf = beating(cf.clone());
+    until(WAIT, "the copy with the id is taken", || {
+        daemon.settings().numbered.contains_key(&id)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(daemon.coordinator().acting().await.unwrap(), daemon.id);
+    let seq = daemon.settings().seq;
+
+    say(&cf, &edit_with(id, set_project(7, "numbered before"))).await;
+    until(Duration::from_secs(2), "the edit is answered", || {
+        !answers_sent(&said).is_empty()
+    })
+    .await;
+    assert_eq!(answers_sent(&said), [(id, Outcome::Numbered { stamp })]);
+    assert_eq!(daemon.settings().seq, seq, "numbered again");
+    assert_eq!(project_named(&daemon.settings(), 7), None);
 }

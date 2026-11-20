@@ -557,49 +557,6 @@ mod tests {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     use super::*;
-
-    #[test]
-    fn only_an_edit_that_may_have_been_numbered_is_504_and_a_refusal_is_502() {
-        let id = MachineId::random();
-        let cases = [
-            (CoordinatorError::NotLinked(id), 503),
-            (
-                CoordinatorError::Older {
-                    acting: id,
-                    speaks: 3,
-                },
-                503,
-            ),
-            (
-                CoordinatorError::Unsettled {
-                    from: id,
-                    acting: id,
-                },
-                503,
-            ),
-            (
-                CoordinatorError::Refused {
-                    reason: "no".into(),
-                },
-                502,
-            ),
-            (CoordinatorError::NoAnswer { acting: id }, 504),
-            (
-                CoordinatorError::Unwritable(serde_json::from_str::<u8>("x").unwrap_err()),
-                500,
-            ),
-            (
-                CoordinatorError::Store(StoreError::TooLarge {
-                    what: "x",
-                    value: 1,
-                }),
-                500,
-            ),
-        ];
-        for (error, status) in cases {
-            assert_eq!(dismissal_status(&error).as_u16(), status, "{error}");
-        }
-    }
     use crate::sync::{Conn, Dialer};
 
     const GB: u64 = 1_000_000_000;
@@ -1601,6 +1558,49 @@ mod tests {
                 .call("POST", &format!("/api/attention/{id}/dismiss"))
                 .await;
             assert_eq!(status, 404, "{id}: {body}");
+        }
+    }
+
+    #[test]
+    fn only_an_edit_that_may_have_been_numbered_is_504_and_a_refusal_is_502() {
+        let id = MachineId::random();
+        let cases = [
+            (CoordinatorError::NotLinked(id), 503),
+            (
+                CoordinatorError::Older {
+                    acting: id,
+                    speaks: 3,
+                },
+                503,
+            ),
+            (
+                CoordinatorError::Unsettled {
+                    from: id,
+                    acting: id,
+                },
+                503,
+            ),
+            (
+                CoordinatorError::Refused {
+                    reason: "no".into(),
+                },
+                502,
+            ),
+            (CoordinatorError::NoAnswer { acting: id }, 504),
+            (
+                CoordinatorError::Unwritable(serde_json::from_str::<u8>("x").unwrap_err()),
+                500,
+            ),
+            (
+                CoordinatorError::Store(StoreError::TooLarge {
+                    what: "x",
+                    value: 1,
+                }),
+                500,
+            ),
+        ];
+        for (error, status) in cases {
+            assert_eq!(dismissal_status(&error).as_u16(), status, "{error}");
         }
     }
 
