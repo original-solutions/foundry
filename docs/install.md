@@ -109,6 +109,8 @@ To go back to an older version by hand, run `install` from that version's folder
 
 `install` says it went back and names the refused tag. The newer version is then refused, as after a rollback. Export the same variables first, as in the section above, because `install` rewrites the service from your shell. The refusal holds until a higher tag ships. On Linux, run the `sudo systemctl restart foundryd` line it prints so the service starts the older version.
 
+A rollback, automatic or by hand, runs the previous version on the same data, `<home>/store.sqlite` included, so every schema change keeps that file usable by the version before it (the rule on `MIGRATIONS` in `crates/foundryd/src/store/mod.rs`).
+
 ## Uninstall
 
 ```sh
