@@ -75,11 +75,15 @@ pub const GATEWAY_MANAGEMENT: &str = "gateway-management";
 
 /// The secret store this machine uses: the login keychain on macOS, its updates locked by
 /// the file `secrets.lock` in `home`, and on Linux the file `secrets.json` in `home`, readable
-/// only by the service user. `FOUNDRY_SECRETS=file` picks the file on every OS, which is how
-/// tests keep out of the keychain.
+/// only by the service user. In a debug build `FOUNDRY_SECRETS=file` picks the file on every
+/// OS, which is how tests keep out of the keychain. A release build ignores it.
 pub fn for_this_machine(home: &Path) -> Arc<dyn Secrets> {
     store_for(home, std::env::var_os("FOUNDRY_SECRETS").as_deref())
 }
+
+/// Whether this build takes `FOUNDRY_SECRETS`: only a debug build, so a release Mac always
+/// keeps its identity and keys in the keychain.
+const OVERRIDE: bool = cfg!(debug_assertions);
 
 /// Which secret store a machine uses.
 #[derive(Debug, PartialEq, Eq)]
@@ -88,10 +92,10 @@ enum Store {
     Keychain,
 }
 
-/// The store for a `FOUNDRY_SECRETS` value: the file for exactly `file`, else this OS's
-/// default, the keychain on macOS and the file elsewhere.
-fn choose(choice: Option<&OsStr>) -> Store {
-    if choice == Some(OsStr::new("file")) || !cfg!(target_os = "macos") {
+/// The store for a `FOUNDRY_SECRETS` value: the file for exactly `file` when `taken` (the build
+/// takes the override), else this OS's default, the keychain on macOS and the file elsewhere.
+fn choose(choice: Option<&OsStr>, taken: bool) -> Store {
+    if (taken && choice == Some(OsStr::new("file"))) || !cfg!(target_os = "macos") {
         Store::File
     } else {
         Store::Keychain
@@ -100,7 +104,7 @@ fn choose(choice: Option<&OsStr>) -> Store {
 
 /// [`for_this_machine`] given the value of `FOUNDRY_SECRETS`.
 fn store_for(home: &Path, choice: Option<&OsStr>) -> Arc<dyn Secrets> {
-    match choose(choice) {
+    match choose(choice, OVERRIDE) {
         Store::File => Arc::new(FileSecrets::new(home.join("secrets.json"))),
         #[cfg(target_os = "macos")]
         Store::Keychain => Arc::new(Keychain::new("foundry", home.join("secrets.lock"))),
@@ -765,14 +769,32 @@ mod tests {
     #[test]
     fn only_the_exact_word_file_chooses_the_file_store() {
         use std::ffi::OsStr;
-        assert_eq!(choose(Some(OsStr::new("file"))), Store::File);
-        let os_default = if cfg!(target_os = "macos") {
+        assert_eq!(choose(Some(OsStr::new("file")), true), Store::File);
+        for choice in [None, Some(OsStr::new("keychain")), Some(OsStr::new("File"))] {
+            assert_eq!(choose(choice, true), os_default(), "{choice:?}");
+        }
+    }
+
+    /// A release build has no override, so a variable copied from the tests into a service
+    /// file cannot move a Mac off its keychain and give it a new identity.
+    #[test]
+    fn a_release_build_ignores_foundry_secrets() {
+        use std::ffi::OsStr;
+        for choice in [None, Some(OsStr::new("file"))] {
+            assert_eq!(choose(choice, false), os_default(), "{choice:?}");
+        }
+    }
+
+    #[test]
+    fn only_a_debug_build_takes_the_override() {
+        assert_eq!(OVERRIDE, cfg!(debug_assertions));
+    }
+
+    fn os_default() -> Store {
+        if cfg!(target_os = "macos") {
             Store::Keychain
         } else {
             Store::File
-        };
-        for choice in [None, Some(OsStr::new("keychain")), Some(OsStr::new("File"))] {
-            assert_eq!(choose(choice), os_default, "{choice:?}");
         }
     }
 

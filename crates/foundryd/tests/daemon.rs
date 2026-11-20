@@ -7,18 +7,20 @@ use std::fs;
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use foundry_proto::ids::{MachineId, ProjectId, TerminalId};
 use foundry_proto::messages::{PROTOCOL, PeerMessage, UiMessage};
-use foundry_proto::record::AnyRecord;
+use foundry_proto::record::{AnyRecord, MachineSample, Record};
 use foundry_proto::settings::{Machine, Project, SharedSettings};
 use foundry_proto::state::TerminalState;
-use foundryd::join::Keys;
+use foundryd::join::{KeyedDialer, Keys};
 use foundryd::secrets::{FileSecrets, Secrets};
 use foundryd::store::Store;
+use foundryd::sync::Dialer as _;
+use foundryd::sync::ws::WsDialer;
 use futures::{SinkExt as _, StreamExt as _};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
@@ -42,6 +44,22 @@ fn wait_for<T>(what: &str, mut check: impl FnMut() -> Option<T>) -> T {
             return found;
         }
         assert!(Instant::now() < end, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// How `child` exited, or `None` once `wait` passes, when it is killed and reaped.
+fn exit_within(child: &mut Child, wait: Duration) -> Option<ExitStatus> {
+    let end = Instant::now() + wait;
+    loop {
+        if let Some(exit) = child.try_wait().unwrap() {
+            return Some(exit);
+        }
+        if Instant::now() > end {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
 }
@@ -316,18 +334,7 @@ fn run_twice_on_one_data_directory_exits_1_and_names_the_lock() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let end = Instant::now() + WAIT;
-    let exit = loop {
-        if let Some(exit) = second.try_wait().unwrap() {
-            break Some(exit);
-        }
-        if Instant::now() > end {
-            let _ = second.kill();
-            let _ = second.wait();
-            break None;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    };
+    let exit = exit_within(&mut second, WAIT);
     let exit = exit.expect("the second daemon kept running instead of refusing the lock");
     let mut stderr = String::new();
     std::io::Read::read_to_string(&mut second.stderr.take().unwrap(), &mut stderr).unwrap();
@@ -599,6 +606,141 @@ async fn the_daemon_dials_a_peer_through_the_key_handshake() {
     assert_eq!(said["type"], "challenge", "first frame: {first}");
 }
 
+/// A secret read that never returns, as a keychain prompt nobody answers does: the secret
+/// store's file is a FIFO the test holds open and never writes to.
+#[test]
+fn sigterm_stops_a_daemon_stuck_reading_its_secrets_at_start() {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut fixture = Fixture::new();
+    let secrets = fixture.home.path().join("secrets.json");
+    nix::unistd::mkfifo(&secrets, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+    let daemon = fixture
+        .command(fixture.port, &["run"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    fixture.daemon = Some(daemon);
+
+    // A writer opens only once the daemon has the FIFO open to read, and holding it open
+    // keeps that read waiting.
+    let _writer = wait_for("the daemon to read its secrets", || {
+        fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits())
+            .open(&secrets)
+            .ok()
+    });
+    std::thread::sleep(Duration::from_millis(200));
+
+    let mut child = fixture.daemon.take().unwrap();
+    kill(
+        Pid::from_raw(i32::try_from(child.id()).unwrap()),
+        Signal::SIGTERM,
+    )
+    .unwrap();
+    assert!(
+        exit_within(&mut child, Duration::from_secs(10)).is_some(),
+        "SIGTERM did not stop a daemon waiting on its secrets"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_daemons_peer_route_takes_a_keyed_peer_and_syncs_its_records() {
+    let mut fixture = Fixture::new();
+    let other = tempfile::tempdir().unwrap();
+    let peer = Keys::open(Arc::new(FileSecrets::new(
+        other.path().join("secrets.json"),
+    )))
+    .unwrap();
+    let peer_id = peer.me();
+    let daemon = {
+        let mine = Keys::open(Arc::new(FileSecrets::new(
+            fixture.home.path().join("secrets.json"),
+        )))
+        .unwrap();
+        let code = mine.new_code().unwrap();
+        mine.redeem(&code.to_string(), peer_id, &peer.public_key())
+            .unwrap();
+        let code = peer.new_code().unwrap();
+        peer.redeem(&code.to_string(), mine.me(), &mine.public_key())
+            .unwrap();
+        Machine {
+            id: mine.me(),
+            name: "daemon".into(),
+            address: "127.0.0.1".into(),
+        }
+    };
+    fixture.seed(|settings| {
+        settings.machines.push(Machine {
+            id: peer_id,
+            name: "peer".into(),
+            address: "127.0.0.2".into(),
+        });
+    });
+    fixture.start();
+
+    let dialer = KeyedDialer::new(Arc::new(WsDialer { port: fixture.port }), peer);
+    let mut conn = tokio::time::timeout(Duration::from_secs(20), dialer.dial(&daemon))
+        .await
+        .expect("the handshake did not finish")
+        .expect("the daemon refused a peer that proved its key");
+    let hello = PeerMessage::Hello {
+        protocol: PROTOCOL,
+        machine: peer_id,
+        versions: Default::default(),
+    };
+    conn.send
+        .send(serde_json::to_string(&hello).unwrap())
+        .await
+        .unwrap();
+    let answered = tokio::time::timeout(Duration::from_secs(20), async {
+        while let Some(text) = conn.recv.recv().await {
+            if let Ok(PeerMessage::Hello { machine, .. }) = serde_json::from_str(&text) {
+                return Some(machine);
+            }
+        }
+        None
+    })
+    .await
+    .expect("the daemon did not answer the hello");
+    assert_eq!(answered, Some(daemon.id));
+
+    let sample = AnyRecord::MachineSample(Record {
+        owner: peer_id,
+        version: 1,
+        deleted: false,
+        body: MachineSample {
+            load_per_core: 0.25,
+            free_memory: 1 << 30,
+            free_disk: 1 << 35,
+            sessions: 3,
+        },
+    });
+    let records = PeerMessage::Records {
+        protocol: PROTOCOL,
+        records: vec![sample],
+    };
+    conn.send
+        .send(serde_json::to_string(&records).unwrap())
+        .await
+        .unwrap();
+
+    tokio::task::block_in_place(|| {
+        wait_for("the peer's record in /api/state", || {
+            fixture
+                .state()?
+                .into_iter()
+                .any(|record| {
+                    matches!(&record, AnyRecord::MachineSample(r)
+                        if r.owner == peer_id && r.body.sessions == 3)
+                })
+                .then_some(())
+        });
+    });
+}
+
 #[test]
 fn a_port_already_in_use_exits_1_and_names_the_address() {
     let fixture = Fixture::new();
@@ -612,18 +754,7 @@ fn a_port_already_in_use_exits_1_and_names_the_address() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let end = Instant::now() + WAIT;
-    let exit = loop {
-        if let Some(exit) = daemon.try_wait().unwrap() {
-            break Some(exit);
-        }
-        if Instant::now() > end {
-            let _ = daemon.kill();
-            let _ = daemon.wait();
-            break None;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    };
+    let exit = exit_within(&mut daemon, WAIT);
     let exit = exit.expect("the daemon kept running on a port that is taken");
     let mut stderr = String::new();
     std::io::Read::read_to_string(&mut daemon.stderr.take().unwrap(), &mut stderr).unwrap();

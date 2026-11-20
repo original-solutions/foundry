@@ -173,13 +173,11 @@ fn lock(home: &Path) -> Result<Flock<File>, DaemonError> {
 
 /// Builds every module, starts them and waits for a signal or for one to end.
 async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
-    let mut terminate =
-        signal(SignalKind::terminate()).map_err(io_error("cannot watch SIGTERM"))?;
-    let mut interrupt = signal(SignalKind::interrupt()).map_err(io_error("cannot watch SIGINT"))?;
-
     let store = Arc::new(Mutex::new(Store::open(home.join("store.sqlite"))?));
     let secrets = secrets::for_this_machine(&home);
-    // Both read the secret store, which can block on a keychain prompt.
+    // Both read the secret store, which can block on a keychain prompt. SIGTERM and SIGINT
+    // are not watched until startup is done, so until then they stop the daemon as usual.
+    tracing::info!("reading the secret store; on macOS this waits on any keychain prompt");
     let keys = {
         let secrets = secrets.clone();
         tokio::task::spawn_blocking(move || Keys::open(secrets)).await??
@@ -243,6 +241,9 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
         app = refuse_sessions(app, missing);
     }
 
+    let mut terminate =
+        signal(SignalKind::terminate()).map_err(io_error("cannot watch SIGTERM"))?;
+    let mut interrupt = signal(SignalKind::interrupt()).map_err(io_error("cannot watch SIGINT"))?;
     let local = loopback(port);
     let listener = api::bind(local).await?;
     tracing::info!("listening on {local}");
@@ -379,25 +380,37 @@ fn loopback(port: u16) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], port))
 }
 
-/// The addresses to listen on besides loopback: each of `found` that is a Tailscale
-/// address, once.
-fn listen_on(port: u16, found: impl IntoIterator<Item = IpAddr>) -> Vec<SocketAddr> {
+/// The addresses to listen on besides loopback, each once: every address in `found`, given
+/// with its interface's name, that is in Tailscale's range on a tunnel interface. A carrier or
+/// hotspot can hand out an address in that range on an ordinary interface, where anyone on
+/// that network could reach the API.
+fn listen_on(port: u16, found: impl IntoIterator<Item = (String, IpAddr)>) -> Vec<SocketAddr> {
     let mut addrs = Vec::new();
-    for ip in found {
+    for (interface, ip) in found {
         let addr = SocketAddr::new(ip, port);
-        if api::allowed(ip) && !ip.is_loopback() && !addrs.contains(&addr) {
+        if tunnel(&interface) && api::allowed(ip) && !ip.is_loopback() && !addrs.contains(&addr) {
             addrs.push(addr);
         }
     }
     addrs
 }
 
-/// The addresses of this machine's interfaces.
-fn interface_addresses() -> BTreeSet<IpAddr> {
+/// Whether `interface` is one Tailscale makes: `tailscale0` on Linux, a `utun` on macOS.
+fn tunnel(interface: &str) -> bool {
+    interface.starts_with("tailscale") || interface.starts_with("utun")
+}
+
+/// The addresses of this machine's interfaces, each with its interface's name.
+fn interface_addresses() -> BTreeSet<(String, IpAddr)> {
     match sysinfo::Networks::new_with_refreshed_list() {
         Ok(networks) => networks
-            .values()
-            .flat_map(|network| network.ip_networks().iter().map(|ip| ip.addr))
+            .iter()
+            .flat_map(|(name, network)| {
+                network
+                    .ip_networks()
+                    .iter()
+                    .map(move |ip| (name.to_string_lossy().into_owned(), ip.addr))
+            })
             .collect(),
         Err(error) => {
             tracing::warn!("cannot list this machine's addresses: {error}");
@@ -409,7 +422,7 @@ fn interface_addresses() -> BTreeSet<IpAddr> {
 /// The addresses in `found` to listen on that are not in `served` yet, by [`listen_on`]'s rule.
 fn new_addresses(
     port: u16,
-    found: impl IntoIterator<Item = IpAddr>,
+    found: impl IntoIterator<Item = (String, IpAddr)>,
     served: &BTreeSet<SocketAddr>,
 ) -> Vec<SocketAddr> {
     listen_on(port, found)
@@ -558,17 +571,22 @@ mod tests {
         assert!(error.contains("not-a-port"), "{error}");
     }
 
+    /// An interface's address as [`interface_addresses`] gives it.
+    fn on(interface: &str, text: &str) -> (String, IpAddr) {
+        (interface.into(), ip(text))
+    }
+
     #[test]
     fn the_daemon_listens_on_tailscale_addresses_only_each_once() {
         let found = [
-            ip("192.168.1.20"),
-            ip("100.101.102.103"),
-            ip("fd7a:115c:a1e0::1"),
-            ip("127.0.0.1"),
-            ip("0.0.0.0"),
-            ip("fe80::1"),
-            ip("8.8.8.8"),
-            ip("100.101.102.103"),
+            on("en0", "192.168.1.20"),
+            on("utun4", "100.101.102.103"),
+            on("utun4", "fd7a:115c:a1e0::1"),
+            on("lo0", "127.0.0.1"),
+            on("utun4", "0.0.0.0"),
+            on("utun4", "fe80::1"),
+            on("utun4", "8.8.8.8"),
+            on("utun4", "100.101.102.103"),
         ];
         let listening: Vec<SocketAddr> = listen_on(7433, found);
 
@@ -583,7 +601,29 @@ mod tests {
 
     #[test]
     fn with_no_tailscale_there_is_nothing_besides_loopback_to_listen_on() {
-        assert!(listen_on(9000, [ip("10.0.0.5"), ip("127.0.0.1")]).is_empty());
+        assert!(listen_on(9000, [on("en0", "10.0.0.5"), on("lo0", "127.0.0.1")]).is_empty());
+    }
+
+    /// A carrier-grade NAT or phone hotspot hands out addresses in Tailscale's range on an
+    /// ordinary interface, where anyone on that network could reach the API.
+    #[test]
+    fn a_tailscale_range_address_off_a_tunnel_interface_is_not_listened_on() {
+        let found = [
+            on("en0", "100.72.10.5"),
+            on("wlan0", "100.72.10.6"),
+            on("eth0", "fd7a:115c:a1e0::2"),
+            on("bridge100", "100.72.10.7"),
+        ];
+        assert!(listen_on(7433, found).is_empty());
+    }
+
+    #[test]
+    fn tailscale_tunnels_on_linux_and_macos_are_listened_on() {
+        let found = [on("tailscale0", "100.64.0.1"), on("utun3", "100.64.0.2")];
+        assert_eq!(
+            listen_on(7433, found),
+            vec![addr("100.64.0.1:7433"), addr("100.64.0.2:7433")]
+        );
     }
 
     #[test]
@@ -696,12 +736,12 @@ mod tests {
     fn only_tailscale_addresses_not_yet_served_are_new() {
         let served: BTreeSet<SocketAddr> = [addr("100.101.102.103:7433")].into();
         let found = [
-            ip("100.101.102.103"),
-            ip("100.64.0.9"),
-            ip("192.168.1.20"),
-            ip("fd7a:115c:a1e0::1"),
-            ip("127.0.0.1"),
-            ip("100.64.0.9"),
+            on("utun4", "100.101.102.103"),
+            on("utun4", "100.64.0.9"),
+            on("en0", "192.168.1.20"),
+            on("utun4", "fd7a:115c:a1e0::1"),
+            on("lo0", "127.0.0.1"),
+            on("utun4", "100.64.0.9"),
         ];
 
         assert_eq!(
@@ -714,7 +754,14 @@ mod tests {
     fn with_everything_served_nothing_is_new() {
         let served: BTreeSet<SocketAddr> = [addr("100.64.0.9:7433")].into();
 
-        assert!(new_addresses(7433, [ip("10.0.0.5"), ip("100.64.0.9")], &served).is_empty());
+        assert!(
+            new_addresses(
+                7433,
+                [on("en0", "10.0.0.5"), on("utun4", "100.64.0.9")],
+                &served
+            )
+            .is_empty()
+        );
     }
 
     /// What the stub router answers, so a request that got through is told from a refusal.
