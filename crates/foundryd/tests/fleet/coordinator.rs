@@ -13,7 +13,7 @@ use foundry_proto::settings::{
 };
 use foundry_proto::state::TerminalState;
 use foundryd::coordinator::Coordinator;
-use foundryd::sync::{Conn, OFFLINE_AFTER};
+use foundryd::sync::{Conn, OFFLINE_AFTER, RETRY_REFUSED};
 use foundryd::terminals::Terminals;
 use futures::StreamExt as _;
 use tokio::sync::mpsc;
@@ -945,5 +945,78 @@ async fn an_edit_on_a_link_that_refused_a_message_is_still_taken() {
     assert_eq!(
         project_named(&settings, 7).as_deref(),
         Some("after a refusal")
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_link_that_refused_a_message_takes_settings_and_the_edit_that_arrives_as_it_closes() {
+    let peer = MachineId::random();
+    let fleet = Fleet::start_coordinated_with(1, &[peer]);
+    let daemon = &fleet.daemons[0];
+    let conn = drained(raw_link(daemon, peer).await);
+    say(&conn, &settings_message(daemon.settings())).await;
+    until(WAIT, "the peer is online", || {
+        daemon.peers.online().contains(&peer)
+    })
+    .await;
+    conn.send("not a message".to_owned()).await.unwrap();
+
+    // A copy that holds an edit the peer numbered is still merged.
+    let mut theirs = daemon.settings();
+    theirs.seq += 5;
+    theirs.projects.push(project(8, "from the peer"));
+    theirs.stamps.insert(
+        StampKey::Setting(SettingKey::Project(project(8, "").id)),
+        Stamp {
+            seq: theirs.seq,
+            by: peer,
+        },
+    );
+    theirs.seen.insert(peer, theirs.seq);
+    say(&conn, &settings_message(theirs)).await;
+    holds_project(daemon, 8, Duration::from_secs(2)).await;
+
+    // The first message past the retry limit closes the link, and is an edit: it is taken.
+    let beat = beating(conn.clone());
+    tokio::time::sleep(RETRY_REFUSED - Duration::from_millis(500)).await;
+    beat.abort();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    say(&conn, &edit_message(set_project(7, "as it closes"))).await;
+    let settings = holds_project(daemon, 7, Duration::from_secs(2)).await;
+    assert_eq!(project_named(&settings, 7).as_deref(), Some("as it closes"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_edit_forwarded_by_the_machine_that_acts_goes_back_once_its_next_copy_arrives() {
+    let peer = MachineId::random();
+    let fleet = Fleet::start_coordinated_with(1, &[peer]);
+    let daemon = &fleet.daemons[0];
+    let (conn, said) = recorded(raw_link(daemon, peer).await);
+    let theirs = ordered_by(&daemon.settings(), peer, vec![peer, daemon.id]);
+    say(&conn, &settings_message(theirs.clone())).await;
+    let _beating = beating(conn.clone());
+    acting_becomes(&daemon.coordinator(), peer, WAIT).await;
+
+    let edit = set_project(7, "handed back");
+    say(&conn, &edit_message(edit.clone())).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        !lock(&said).iter().any(|m| m["type"] == "edit"),
+        "sent back before the peer's views were known"
+    );
+    // The peer's next copy, taken after the edit, shows it still acts.
+    let mut next = theirs;
+    next.seq += 1;
+    say(&conn, &settings_message(next)).await;
+    until(
+        Duration::from_secs(2),
+        "the edit goes back to the peer",
+        || lock(&said).iter().any(|m| m["type"] == "edit"),
+    )
+    .await;
+    assert_eq!(
+        project_named(&daemon.settings(), 7),
+        None,
+        "numbered while not acting"
     );
 }
