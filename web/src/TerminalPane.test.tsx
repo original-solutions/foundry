@@ -296,6 +296,22 @@ describe("TerminalPane", () => {
     expect(FakeSocket.last()).not.toBe(steady);
   });
 
+  it("leaves the old terminal alone once the selection changes, even when its close arrives late", () => {
+    const { socket: old, view } = mount("t1");
+    act(() => old.end(1006));
+
+    view.rerender(<TerminalPane id="t2" running />);
+    const next = FakeSocket.last();
+    expect(next.url).toMatch(/\/api\/terminals\/t2$/);
+    act(() => next.open());
+    // FakeSocket.close() fires nothing, so fire the close a browser would send after the cleanup's close().
+    act(() => old.end(1005));
+    act(() => vi.advanceTimersByTime(60_000));
+
+    expect(FakeSocket.all.filter((s) => /\/t1$/.test(s.url))).toHaveLength(1);
+    expect(screen.queryByText(/reconnecting|trying again/i)).toBeNull();
+  });
+
   it("closes the old socket and attaches the new terminal when the selection changes", () => {
     const { socket, view } = mount("t1");
     act(() => socket.open());
