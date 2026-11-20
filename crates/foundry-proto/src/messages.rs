@@ -103,6 +103,11 @@ mod tests {
                 protocol: PROTOCOL,
                 settings: settings(),
             },
+            PeerMessage::Relay {
+                protocol: PROTOCOL,
+                machine: MachineId::random(),
+                terminal: TerminalId::random(),
+            },
         ]
     }
 
@@ -177,6 +182,7 @@ mod tests {
         );
         let record: AnyRecord = serde_json::from_str(&sample).unwrap();
         let id = MachineId(machine.parse().unwrap());
+        let terminal = "1b4e28ba-2fa1-11d2-883f-0016d3cca427";
         let peer = [
             (
                 format!(
@@ -200,6 +206,16 @@ mod tests {
                 PeerMessage::Settings {
                     protocol: 1,
                     settings: SharedSettings::default(),
+                },
+            ),
+            (
+                format!(
+                    r#"{{"type":"relay","protocol":1,"machine":"{machine}","terminal":"{terminal}"}}"#
+                ),
+                PeerMessage::Relay {
+                    protocol: 1,
+                    machine: id,
+                    terminal: TerminalId(terminal.parse().unwrap()),
                 },
             ),
         ];
