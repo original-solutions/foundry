@@ -14,8 +14,9 @@
 //! [`Coordinator`] runs this on a machine. Record links hand it every copy of the settings a
 //! peer sends and every edit forwarded to this machine ([`crate::sync::Peers::coordinate`]).
 //! A machine that comes to act numbers nothing until it has taken a copy from every other
-//! machine it can reach, so a returning machine catches up before it edits; an edit that
-//! reaches it before then waits, at most [`OFFLINE_AFTER`].
+//! machine it can reach, except one linked only in a protocol that carries no settings, so a
+//! returning machine catches up before it edits; an edit that reaches it before then waits,
+//! at most [`OFFLINE_AFTER`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -242,9 +243,12 @@ impl Coordinator {
     /// Whether this machine holds what it needs to number: a copy from every other machine it
     /// can reach, and, in its first [`OFFLINE_AFTER`], from every machine `held` lists, so a
     /// machine that has just started and hears from no one yet does not number on an old copy.
+    /// A machine linked only in a protocol older than edits sends no copy, so none is needed
+    /// from it.
     fn caught_up(&self, held: &SharedSettings, online: &BTreeSet<MachineId>) -> bool {
+        let older = self.peers.older();
         let taken = lock(&self.taken);
-        let has = |id: &MachineId| *id == self.me || taken.contains_key(id);
+        let has = |id: &MachineId| *id == self.me || taken.contains_key(id) || older.contains(id);
         let reachable = online.iter().all(has);
         let listed = held.machines.iter().all(|m| has(&m.id));
         reachable && (listed || self.started.elapsed() >= OFFLINE_AFTER)

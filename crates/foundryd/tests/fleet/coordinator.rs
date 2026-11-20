@@ -319,6 +319,30 @@ async fn an_acting_machine_on_the_older_protocol_is_sent_no_edit_and_no_settings
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn an_acting_machine_numbers_at_once_with_a_peer_on_the_older_protocol_online() {
+    let older = MachineId::random();
+    let fleet = Fleet::start_coordinated_with(1, &[older]);
+    let daemon = &fleet.daemons[0];
+    let conn = drained(raw_link_speaking(daemon, older, EDITS_SINCE - 1).await);
+    let _beating = beating(conn);
+    until(WAIT, "the older peer is online", || {
+        daemon.peers.online().contains(&older)
+    })
+    .await;
+    assert_eq!(daemon.coordinator().acting().await.unwrap(), daemon.id);
+
+    // The older peer never sends settings, so there is no copy of its to wait for.
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        daemon.coordinator().edit(set_project(7, "p")),
+    )
+    .await
+    .expect("the edit waited for settings the older peer cannot send")
+    .unwrap();
+    assert_eq!(project_named(&daemon.settings(), 7).as_deref(), Some("p"));
+}
+
 // --- splits ---
 
 #[tokio::test(start_paused = true)]

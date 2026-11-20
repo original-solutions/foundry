@@ -259,6 +259,16 @@ impl Peers {
         Err(unsent)
     }
 
+    /// The machines with an open record link whose every open link speaks a protocol older than
+    /// [`EDITS_SINCE`]: they send no shared settings and take no edits.
+    pub fn older(&self) -> BTreeSet<MachineId> {
+        lock(&self.inner.links)
+            .iter()
+            .filter(|(_, open)| open.values().all(|link| link.speak < EDITS_SINCE))
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
     /// The machines heard from within [`OFFLINE_AFTER`], and this machine.
     pub fn online(&self) -> BTreeSet<MachineId> {
         let now = Instant::now();
