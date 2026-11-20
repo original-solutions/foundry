@@ -481,6 +481,27 @@ async fn setup_commands_run_in_a_terminal_in_the_worktree() {
 }
 
 #[tokio::test]
+async fn the_workspace_record_names_the_terminal_its_setup_runs_in() {
+    let setup = Setup::new();
+    let config = "factory:\n  provision:\n    - exit 3\n";
+    let remote = setup.project(&[(".dw/config.yml", config)]);
+    let id = setup.create(&remote, "main", "named setup").await;
+
+    let terminal = setup.setup_ended(id).await;
+    assert_eq!(setup.body(id).setup, Some(terminal.id));
+}
+
+#[tokio::test]
+async fn a_workspace_with_no_setup_names_no_setup_terminal() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup.create(&remote, "main", "no setup").await;
+
+    assert_eq!(setup.body(id).setup, None);
+    assert!(setup.terminals_of(id).is_empty());
+}
+
+#[tokio::test]
 async fn a_failing_setup_command_is_reported_and_the_workspace_stays_usable() {
     let setup = Setup::new();
     let config = "factory:\n  provision:\n    - echo one > one.txt\n    - exit 3\n    - echo two > two.txt\n";
