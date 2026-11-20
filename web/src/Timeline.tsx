@@ -1,15 +1,14 @@
-import { keepPreviousData, useQueries } from "@tanstack/react-query";
-import { useState } from "react";
+import { useQueries, useQueryClient } from "@tanstack/react-query";
+import { useEffect, useRef, useState } from "react";
 import { sessionTrail } from "./api";
 import { rows, type MachineView } from "./fleet";
-import type { Glyph } from "./labels";
+import { addsSteps, busy, plural, type Glyph } from "./labels";
 import { Named } from "./Now";
+import { pollEvery } from "./poll";
 import { glyphText, StateGlyph } from "./StateGlyph";
 import { STEPS_EVERY, useNow } from "./StepsPanel";
 import { bars, heading, placed, RANGES, sum, ticks, type Bar } from "./spans";
 import { ago, kindOf, tally, took } from "./trail";
-
-const busy: Glyph[] = ["starting", "working", "waiting", "stuck"];
 
 /** A turn still going, coloured as its session's state; a finished one is quiet. */
 const openLook: Partial<Record<Glyph, string>> = {
@@ -20,8 +19,6 @@ const openLook: Partial<Record<Glyph, string>> = {
 const doneLook = "bg-sky-400/25 border-sky-400/50 hover:bg-sky-400/40";
 
 const windowName: Record<string, string> = { "15m": "the last 15 minutes", "1h": "the last hour", "4h": "the last 4 hours", "12h": "the last 12 hours" };
-
-const plural = (n: number, one: string) => `${n} ${one}${n === 1 ? "" : "s"}`;
 
 /** The window the timeline was last set to, kept for this browser. */
 const RANGE_KEY = "foundry.timeline";
@@ -50,8 +47,9 @@ interface Lane {
  * for each question it asked (a grey one for a reminder between turns). A turn still going runs to the "now" edge in its session's colour.
  * Pointing at a bar says what the turn was and did; clicking it opens the terminal with its
  * steps. Read from the trails of the sessions this machine's daemon keeps them for (`traced`, the
- * ones it has briefs of), so a peer's session is never asked; a busy one is read again every few
- * seconds.
+ * ones it has briefs of), so a peer's session is never asked. A trail is read as the steps column
+ * reads it, under the same entry: again whenever its session changes state, and every few seconds
+ * while it starts or works.
  */
 export function Timeline({ machines, traced, onSteps }: { machines: MachineView[]; traced: Set<string>; onSteps: (terminal: string) => void }) {
   const [range, setRange] = useState(loadRange);
@@ -65,13 +63,13 @@ export function Timeline({ machines, traced, onSteps }: { machines: MachineView[
     queries: sessions.map((s) => ({
       enabled: traced.has(s.session),
       // The steps column's key, so the two share what they read.
-      queryKey: ["trail", s.session, s.label],
+      queryKey: ["trail", s.session],
       queryFn: () => sessionTrail(s.session),
-      placeholderData: keepPreviousData,
       retry: false,
-      refetchInterval: (q: { state: { status: string } }) => (busy.includes(s.glyph) && q.state.status !== "error" ? STEPS_EVERY : false),
+      refetchInterval: pollEvery(STEPS_EVERY, addsSteps.includes(s.glyph)),
     })),
   });
+  useRereadOnChange(sessions.map((s) => `${s.session}=${s.label}`).join("\n"));
   const from = now - range.ms;
   const lanes: Lane[] = sessions
     .map((s, i) => ({ ...s, bars: bars(trails[i].data ?? [], busy.includes(s.glyph), now).filter((b) => placed(b, from, now)) }))
@@ -163,6 +161,23 @@ export function Timeline({ machines, traced, onSteps }: { machines: MachineView[
       )}
     </section>
   );
+}
+
+/**
+ * Reads a session's trail again when its state changes (a hook arrived), given as `id=label`
+ * lines; a session seen for the first time is read by its query already.
+ */
+function useRereadOnChange(states: string) {
+  const client = useQueryClient();
+  const last = useRef(new Map<string, string>());
+  useEffect(() => {
+    const next = new Map(states ? states.split("\n").map((line) => line.split("=", 2) as [string, string]) : []);
+    for (const [id, label] of next) {
+      const before = last.current.get(id);
+      if (before !== undefined && before !== label) void client.invalidateQueries({ queryKey: ["trail", id], exact: true });
+    }
+    last.current = next;
+  }, [states, client]);
 }
 
 function LaneRow({

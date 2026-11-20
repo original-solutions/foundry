@@ -205,9 +205,7 @@ export async function sessionTrail(id: string): Promise<Mark[]> {
 
 /** The id of the machine whose daemon serves the UI: the only one that can end its terminals. */
 export async function thisMachine(): Promise<string> {
-  const response = await fetch("/api/machine");
-  if (!response.ok) throw new ApiError(`machine failed (${response.status})`);
-  return ((await response.json()) as { id: string }).id;
+  return String((await get("/api/machine")).id);
 }
 
 /** The read of which machine serves the UI; it does not change while the page is open. */

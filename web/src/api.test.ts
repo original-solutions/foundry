@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ApiError, sessionBriefs, sessionTrail, workspaceChanges } from "./api";
+import { ApiError, sessionBriefs, sessionTrail, thisMachine, workspaceChanges } from "./api";
 import { json } from "./test-utils";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -10,6 +10,7 @@ const reads = [
   ["briefs", () => sessionBriefs()],
   ["trail", () => sessionTrail("s1")],
   ["changes", () => workspaceChanges("w1")],
+  ["machine", () => thisMachine()],
 ] as const;
 
 describe("the reads", () => {
@@ -39,5 +40,7 @@ describe("the reads", () => {
     expect(await sessionTrail("s1")).toEqual([{ kind: "done", text: "", at: 1 }]);
     answer(json(200, { base: "main", commits: [], files: [] }));
     expect(await workspaceChanges("w1")).toEqual({ base: "main", commits: [], files: [] });
+    answer(json(200, { id: "m1" }));
+    expect(await thisMachine()).toBe("m1");
   });
 });
