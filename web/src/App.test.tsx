@@ -913,6 +913,8 @@ describe("App", () => {
       settings: settings({ machines: [{ id: ME, name: "studio", address: "127.0.0.1" }, { id: OTHER, name: "attic", address: "10.0.0.2" }] }),
     });
     expect(within(screen.getByRole("article", { name: "remote job" })).queryByRole("button", { name: /^Archive/ })).toBeNull();
+    // On the board every sidebar workspace is one line; its actions show once it is unfolded.
+    for (const name of ["remote job", "fix login"]) fireEvent.click(within(screen.getByRole("group", { name })).getByRole("button", { name }));
     expect(within(screen.getByRole("group", { name: "remote job" })).queryByRole("button", { name: "Archive" })).toBeNull();
     expect(within(screen.getByRole("group", { name: "fix login" })).getByRole("button", { name: "Archive" })).toBeDefined();
   });
@@ -1116,6 +1118,7 @@ describe("App", () => {
     mockFetch(json(200, { base: "main", commits: [], files: [] }));
     await open("/", live);
     const row = screen.getByRole("group", { name: "fix login" });
+    fireEvent.click(within(row).getByRole("button", { name: "fix login" }));
     fireEvent.click(within(row).getByRole("button", { name: "Changes" }));
     const panel = await screen.findByRole("dialog", { name: "Changes in fix login" });
     await waitFor(() => expect(panel.textContent).toMatch(/no changes since main/i));

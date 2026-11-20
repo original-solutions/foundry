@@ -6,7 +6,7 @@ import { jumpKey, SearchIcon } from "./JumpPalette";
 import { Named, Now } from "./Now";
 import { startShell } from "./api";
 import { couldNot, words } from "./labels";
-import { loadFolded, saveFolded } from "./fold";
+import { loadUnfolded, saveUnfolded } from "./fold";
 import { byUrgency, machineNumbers, machineStats, rows, type MachineView, type Row, type WorkspaceView } from "./fleet";
 import { glyphText, StateGlyph } from "./StateGlyph";
 import { ended } from "./ends";
@@ -63,25 +63,39 @@ const TYPEAHEAD_MS = 600;
  * next one it starts. A workspace's actions show while the keyboard is in it, the Tab after it.
  */
 export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJump, onChanges, alerts, onKeys, onRail }: Props) {
-  const [folded, setFolded] = useState(() => new Set(loadFolded()));
+  // A workspace is one line of its states unless it is unfolded: the board already shows every
+  // terminal, so the list stays an index. The workspace you are in unfolds, and folds again when
+  // you leave it; one you unfold yourself stays open.
+  const [unfolded, setUnfolded] = useState(() => new Set(loadUnfolded()));
+  const present = new Set(machines.flatMap((m) => m.workspaces.map((w) => w.id)));
+  // Keep only workspaces still listed, so archived ones do not pile up in storage.
+  const keep = (next: Set<string>) => saveUnfolded([...next].filter((id) => present.has(id)));
   const fold = (ids: string[], on: boolean) =>
-    setFolded((old) => {
+    setUnfolded((old) => {
       const next = new Set(old);
       for (const id of ids) {
-        if (on) next.add(id);
-        else next.delete(id);
+        if (on) next.delete(id);
+        else next.add(id);
       }
-      // Keep only workspaces still listed, so archived ones do not pile up in storage.
-      const listed = new Set(machines.flatMap((m) => m.workspaces.map((w) => w.id)));
-      saveFolded([...next].filter((id) => listed.has(id)));
+      keep(next);
       return next;
     });
+  const inside = selected === undefined ? undefined : machines.flatMap((m) => m.workspaces).find((w) => rows(w).some((r) => r.terminal === selected))?.id;
+  const [was, setWas] = useState<string>();
+  if (inside !== was) {
+    setWas(inside);
+    const next = new Set(unfolded);
+    if (was !== undefined) next.delete(was);
+    if (inside !== undefined) next.add(inside);
+    setUnfolded(next);
+    keep(next);
+  }
 
   // The one Tab stop: the one the keyboard was last in, while it is listed, else the open
   // terminal, else the first workspace.
   const [focused, setFocused] = useState<string>();
   const listed = machines.flatMap((m) =>
-    m.workspaces.flatMap((w) => [w.id, ...(folded.has(w.id) ? stripOf(rows(w), selected) : rows(w)).map((r) => r.terminal)]),
+    m.workspaces.flatMap((w) => [w.id, ...(!unfolded.has(w.id) ? stripOf(rows(w), selected) : rows(w)).map((r) => r.terminal)]),
   );
   const stop = [focused, selected].find((id) => id !== undefined && listed.includes(id)) ?? listed[0];
   const typed = useRef({ text: "", at: 0 });
@@ -99,10 +113,10 @@ export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJ
     else if (event.key === "Home") to = all[0];
     else if (event.key === "End") to = all.at(-1);
     else if (event.key === "ArrowRight") {
-      if (isWorkspace && workspace && folded.has(workspace)) fold([workspace], false);
+      if (isWorkspace && workspace && !unfolded.has(workspace)) fold([workspace], false);
       else if (isWorkspace || here.dataset.strip !== undefined) to = all[at + 1];
     } else if (event.key === "ArrowLeft") {
-      if (isWorkspace && workspace && !folded.has(workspace)) fold([workspace], true);
+      if (isWorkspace && workspace && unfolded.has(workspace)) fold([workspace], true);
       else if (!isWorkspace) to = all.find((e) => e.dataset.stop === workspace);
     } else if (event.key.length === 1 && event.key !== " ") {
       const now = Date.now();
@@ -162,7 +176,7 @@ export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJ
       </div>
       {machines.map((machine) => {
         const ids = machine.workspaces.map((w) => w.id);
-        const allFolded = ids.length > 0 && ids.every((id) => folded.has(id));
+        const allFolded = ids.length > 0 && ids.every((id) => !unfolded.has(id));
         return (
           <section key={machine.id} aria-label={machine.name} className="space-y-2">
             <div className="px-1">
@@ -202,7 +216,7 @@ export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJ
                   key={workspace.id}
                   workspace={workspace}
                   machine={machine.id}
-                  folded={folded.has(workspace.id)}
+                  folded={!unfolded.has(workspace.id)}
                   onFold={(on) => fold([workspace.id], on)}
                   selected={selected}
                   onNavigate={onNavigate}

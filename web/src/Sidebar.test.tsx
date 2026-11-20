@@ -1,4 +1,5 @@
 import { fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { fleet } from "./fleet";
 import { Sidebar } from "./Sidebar";
@@ -36,6 +37,9 @@ function machines() {
 
 const props = { onCreate: () => {} };
 
+/** Unfolds a workspace by its name, as a click on it does. */
+const unfold = (name: string) => fireEvent.click(screen.getByRole("button", { name }));
+
 afterEach(() => {
   vi.unstubAllGlobals();
   localStorage.clear();
@@ -69,6 +73,7 @@ describe("Sidebar", () => {
         <Sidebar machines={view} {...props} />
       </TerminalActions>,
     );
+    unfold("fix login");
 
     const group = screen.getByRole("group", { name: "fix login" });
     expect(within(group).getByText(/fix-login/)).toBeDefined();
@@ -98,6 +103,7 @@ describe("Sidebar", () => {
       s2: { title: "write the release notes", now: null },
     };
     await renderApp(<Sidebar machines={fleet(records, settings(), briefs)} {...props} />);
+    unfold("fix login");
 
     const group = screen.getByRole("group", { name: "fix login" });
     const working = within(group).getByRole("link", { name: /opus 1 fix the login bug.*Working/ });
@@ -124,6 +130,7 @@ describe("Sidebar", () => {
   it("starts a shell in the workspace from New shell", async () => {
     const calls = mockFetch(json(201, { id: "t9" }));
     await renderApp(<Sidebar machines={machines()} {...props} />);
+    unfold("fix login");
 
     fireEvent.click(within(screen.getByRole("group", { name: "fix login" })).getByRole("button", { name: "New shell" }));
 
@@ -133,6 +140,7 @@ describe("Sidebar", () => {
   it("shows the daemon's words when a shell is refused", async () => {
     mockFetch(json(409, { error: "at the terminal limit" }));
     await renderApp(<Sidebar machines={machines()} {...props} />);
+    unfold("fix login");
 
     const group = screen.getByRole("group", { name: "fix login" });
     fireEvent.click(within(group).getByRole("button", { name: "New shell" }));
@@ -140,15 +148,12 @@ describe("Sidebar", () => {
     expect((await within(group).findByRole("alert")).textContent).toBe("Could not start a shell: at the terminal limit.");
   });
 
-  it("folds a workspace to one line of its states, the most urgent first, and remembers the fold", async () => {
+  it("shows a workspace as one line of its states, the most urgent first, until it is unfolded, and remembers the unfold", async () => {
     const { unmount } = await renderApp(<Sidebar machines={machines()} {...props} />);
     const group = screen.getByRole("group", { name: "fix login" });
     const toggle = within(group).getByRole("button", { name: "fix login" });
-    expect(toggle.getAttribute("aria-expanded")).toBe("true");
-
-    fireEvent.click(toggle);
-
     expect(toggle.getAttribute("aria-expanded")).toBe("false");
+
     const strip = within(group).getAllByRole("link");
     expect(strip.map((l) => l.getAttribute("aria-label"))).toEqual([
       "model-2 Needs you",
@@ -161,20 +166,67 @@ describe("Sidebar", () => {
     expect(strip[0].getAttribute("href")).toBe("/terminals/st2");
     expect(within(group).getByText("+5")).toBeDefined();
     expect(within(group).queryByRole("button", { name: "New shell" })).toBeNull();
-    expect(JSON.parse(localStorage.getItem("foundry.folded") ?? "[]")).toEqual(["w1"]);
+
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    expect(within(group).getAllByRole("link")).toHaveLength(11);
+    expect(JSON.parse(localStorage.getItem("foundry.unfolded") ?? "[]")).toEqual(["w1"]);
 
     unmount();
     await renderApp(<Sidebar machines={machines()} {...props} />);
     const again = within(screen.getByRole("group", { name: "fix login" })).getByRole("button", { name: "fix login" });
-    expect(again.getAttribute("aria-expanded")).toBe("false");
-    fireEvent.click(again);
     expect(again.getAttribute("aria-expanded")).toBe("true");
-    expect(within(screen.getByRole("group", { name: "fix login" })).getAllByRole("link")).toHaveLength(11);
+    fireEvent.click(again);
+    expect(again.getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it("opens the workspace you are in, and folds it again when you leave it", async () => {
+    const view = fleet(
+      [
+        workspace(ME, "w1", "alpha"),
+        terminal(ME, "t1", "w1"),
+        session(ME, "s1", "w1", "t1", "idle"),
+        workspace(ME, "w2", "beta"),
+        terminal(ME, "sh2", "w2", "running"),
+        workspace(ME, "w3", "gamma"),
+        terminal(ME, "sh3", "w3", "running"),
+      ],
+      settings(),
+    );
+    function Moving() {
+      const [selected, setSelected] = useState<string>();
+      return (
+        <>
+          <button onClick={() => setSelected("t1")}>go alpha</button>
+          <button onClick={() => setSelected("sh2")}>go beta</button>
+          <button onClick={() => setSelected(undefined)}>go board</button>
+          <Sidebar machines={view} selected={selected} {...props} />
+        </>
+      );
+    }
+    await renderApp(<Moving />);
+    const open = (name: string) => screen.getByRole("button", { name }).getAttribute("aria-expanded");
+    // The board: every workspace is one line, as the board itself has the detail.
+    expect([open("alpha"), open("beta"), open("gamma")]).toEqual(["false", "false", "false"]);
+
+    unfold("gamma");
+    fireEvent.click(screen.getByRole("button", { name: "go alpha" }));
+    expect([open("alpha"), open("beta"), open("gamma")]).toEqual(["true", "false", "true"]);
+
+    fireEvent.click(screen.getByRole("button", { name: "go beta" }));
+    expect([open("alpha"), open("beta"), open("gamma")]).toEqual(["false", "true", "true"]);
+
+    // Folding the one you are in holds while you stay in it.
+    unfold("beta");
+    expect(open("beta")).toBe("false");
+
+    fireEvent.click(screen.getByRole("button", { name: "go board" }));
+    expect([open("alpha"), open("beta"), open("gamma")]).toEqual(["false", "false", "true"]);
   });
 
   it("keeps the open terminal in a folded workspace's line even when more urgent ones fill it", async () => {
-    localStorage.setItem("foundry.folded", JSON.stringify(["w1"]));
     await renderApp(<Sidebar machines={machines()} selected="sh1" {...props} />);
+    unfold("fix login");
 
     const strip = within(screen.getByRole("group", { name: "fix login" })).getAllByRole("link");
     expect(strip).toHaveLength(6);
@@ -182,17 +234,17 @@ describe("Sidebar", () => {
     expect(strip[5].getAttribute("aria-current")).toBe("true");
   });
 
-  it("folds and unfolds every workspace of a machine at once", async () => {
+  it("unfolds and folds every workspace of a machine at once", async () => {
     await renderApp(<Sidebar machines={machines()} {...props} />);
     const studio = screen.getByRole("region", { name: "studio" });
 
-    fireEvent.click(within(studio).getByRole("button", { name: "Fold all" }));
-    for (const name of ["fix login", "empty"]) {
-      expect(within(studio).getByRole("button", { name }).getAttribute("aria-expanded")).toBe("false");
-    }
     fireEvent.click(within(studio).getByRole("button", { name: "Unfold all" }));
     for (const name of ["fix login", "empty"]) {
       expect(within(studio).getByRole("button", { name }).getAttribute("aria-expanded")).toBe("true");
+    }
+    fireEvent.click(within(studio).getByRole("button", { name: "Fold all" }));
+    for (const name of ["fix login", "empty"]) {
+      expect(within(studio).getByRole("button", { name }).getAttribute("aria-expanded")).toBe("false");
     }
   });
   describe("with the keyboard", () => {
@@ -214,6 +266,8 @@ describe("Sidebar", () => {
 
     it("is one Tab stop, and the arrows walk its workspaces and terminals", async () => {
       await renderApp(<Sidebar machines={pair()} {...props} />);
+      unfold("alpha");
+      unfold("beta");
 
       const stops = () => [...document.querySelectorAll("[data-stop]")].filter((e) => (e as HTMLElement).tabIndex === 0);
       expect(stops()).toEqual([ws("alpha")]);
@@ -238,6 +292,7 @@ describe("Sidebar", () => {
 
     it("folds with Left, unfolds with Right, and Left from a terminal goes to its workspace", async () => {
       await renderApp(<Sidebar machines={pair()} {...props} />);
+      unfold("alpha");
 
       link("/terminals/sh1").focus();
       press("ArrowLeft");
