@@ -76,6 +76,15 @@ fn exit_within(child: &mut Child, wait: Duration) -> Option<ExitStatus> {
     }
 }
 
+#[test]
+fn free_ports_are_below_every_ephemeral_range_and_never_repeat() {
+    let ports: Vec<u16> = (0..20).map(|_| free_port()).collect();
+
+    assert!(ports.iter().all(|port| *port < 32768), "{ports:?}");
+    let distinct: std::collections::HashSet<&u16> = ports.iter().collect();
+    assert_eq!(distinct.len(), ports.len(), "{ports:?}");
+}
+
 /// A port nothing listens on now.
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
