@@ -2,6 +2,7 @@ import { useMutation } from "@tanstack/react-query";
 import { useState, type ReactElement } from "react";
 import { Dialog } from "radix-ui";
 import { startSession } from "./api";
+import { couldNot } from "./labels";
 import { FirstPrompt, promptOf } from "./FirstPrompt";
 import { button, field, Modal } from "./Modal";
 
@@ -58,7 +59,7 @@ export function NewSession({
         <FirstPrompt id={`first-prompt-${workspace}`} value={prompt} onChange={setPrompt} />
         {start.isError && (
           <p role="alert" className="text-red-400">
-            {start.error.message}
+            {couldNot(`start a session in ${name}`, start.error)}
           </p>
         )}
         <div className="flex justify-end gap-2">

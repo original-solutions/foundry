@@ -646,7 +646,7 @@ describe("App", () => {
     const idle: UiMessage = { type: "record", protocol: 1, record: session(ME, "s1", "w1", "t1", "idle", { model: "sonnet", version: 2 }) };
     act(() => events.deliver(JSON.stringify(idle)));
     expect(tab().getAttribute("data-changed")).toBe("true");
-    expect(within(tab()).getByText("Idle")).toBeDefined();
+    expect(within(tab()).getByText("Ready")).toBeDefined();
 
     fireEvent.click(tab());
     await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t1"));
@@ -692,7 +692,7 @@ describe("App", () => {
     await open("/terminals/t1", ended);
     const sidebar = screen.getByRole("group", { name: "fix login" });
 
-    fireEvent.contextMenu(within(sidebar).getByRole("link", { name: /^shell 2 Exited 0/ }));
+    fireEvent.contextMenu(within(sidebar).getByRole("link", { name: /^shell 2 Ended/ }));
     const menu = await screen.findByRole("menu");
     expect(within(menu).getAllByRole("menuitem").map((item) => item.textContent)).toEqual([
       "Open",
@@ -749,10 +749,10 @@ describe("App", () => {
   it("says why a terminal could not be ended", async () => {
     mockActions(json(404, { error: "no such terminal" }));
     await open("/terminals/t1", ended);
-    fireEvent.contextMenu(within(screen.getByRole("group", { name: "fix login" })).getByRole("link", { name: /^shell 3 Exited 2/ }));
+    fireEvent.contextMenu(within(screen.getByRole("group", { name: "fix login" })).getByRole("link", { name: /^shell 3 Failed · exit 2/ }));
     fireEvent.click(within(await screen.findByRole("menu")).getByRole("menuitem", { name: "Clear" }));
 
-    expect((await screen.findByRole("alert")).textContent).toMatch(/no such terminal/);
+    expect((await screen.findByRole("alert")).textContent).toMatch(/^Could not clear the terminal: no such terminal\./);
   });
 
   it("offers no ending for another machine's terminals, which only that machine can end", async () => {
@@ -837,7 +837,7 @@ describe("App", () => {
 
     // The press opened the menu under the pointer; its release lands on an item it never pressed.
     for (const name of ["Clear", "Clear 2 ended in fix login"]) {
-      fireEvent.contextMenu(within(sidebar).getByRole("link", { name: /^shell 2 Exited 0/ }));
+      fireEvent.contextMenu(within(sidebar).getByRole("link", { name: /^shell 2 Ended/ }));
       fireEvent.pointerUp(within(await screen.findByRole("menu")).getByRole("menuitem", { name }));
     }
     fireEvent.contextMenu(within(sidebar).getByRole("link", { name: /^sonnet/ }));
@@ -1113,7 +1113,7 @@ describe("App", () => {
     act(() => events.deliver(JSON.stringify(idle)));
     const tab = screen.getByRole("tab", { name: /^sonnet/ });
     expect(tab.getAttribute("data-changed")).toBe("true");
-    expect(within(tab).getByText("Idle")).toBeDefined();
+    expect(within(tab).getByText("Ready")).toBeDefined();
 
     await visit(router, "t1");
     expect(sockets("/api/terminals/t1")).toHaveLength(2);

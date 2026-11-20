@@ -126,7 +126,7 @@ export function SendBar({ notes, sessions, onSent }: { notes: Note[]; sessions: 
       </footer>
     ) : null;
 
-  const why = !taker ? "No session in this workspace to take them." : !taker.ready ? `${taker.name} is ${taker.label.toLowerCase()}. Send when it is idle.` : undefined;
+  const why = !taker ? "No session in this workspace to take them." : !taker.ready ? `${taker.name} is ${taker.label.toLowerCase()}. Send when it is ready.` : undefined;
   return (
     <footer className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-2 border-t border-sky-400/30 bg-neutral-900/95 px-4 py-2.5 pb-[max(0.625rem,env(safe-area-inset-bottom))] text-xs motion-safe:animate-sheet-in">
       <span className="flex items-center gap-2 text-neutral-200">

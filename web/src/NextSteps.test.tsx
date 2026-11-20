@@ -84,7 +84,7 @@ describe("NextSteps", () => {
 describe("offersNext", () => {
   const machine = { id: "machine-1", name: "mac", status: "online" as const, sample: null, workspaces: [] };
   const workspace = { id: "w1", name: "say hi", branch: "say-hi", project: "p", sessions: [], shells: [] };
-  const at = (over: Partial<Located>): Located => ({ machine, workspace, session: "s1", name: "opus", label: "Idle", glyph: "ready", ...over });
+  const at = (over: Partial<Located>): Located => ({ machine, workspace, session: "s1", name: "opus", label: "Ready", glyph: "ready", ...over });
 
   it("is for an idle session of this machine only", () => {
     expect(offersNext(at({}), "machine-1")).toBe(true);

@@ -156,14 +156,14 @@ describe("TerminalPane", () => {
     expect(screenOps.ops).toEqual(["reset", "write:a", "reset", "write:a again"]);
   });
 
-  it("says the terminal exited on 1000 and does not attach again", () => {
+  it("says the terminal ended on 1000, in the sidebar's word, and does not attach again", () => {
     const { socket } = mount();
     act(() => socket.open());
 
     act(() => socket.end(1000, "exited"));
     act(() => vi.advanceTimersByTime(60_000));
 
-    expect(screen.getByText(/exited/i)).toBeDefined();
+    expect(screen.getByText("Ended")).toBeDefined();
     expect(FakeSocket.all).toHaveLength(1);
   });
 

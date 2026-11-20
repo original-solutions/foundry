@@ -83,8 +83,8 @@ describe("ArchiveDialog", () => {
     const stops = within(dialog).getByRole("region", { name: "Stops" });
     expect(within(stops).getAllByRole("listitem").map((li) => li.textContent)).toEqual([
       expect.stringMatching(/opus.*fix the login bug.*Working.*mid-turn/),
-      expect.stringMatching(/sonnet.*Idle/),
-      expect.stringMatching(/shell.*Exited 0/),
+      expect.stringMatching(/sonnet.*Ready/),
+      expect.stringMatching(/shell.*Ended/),
     ]);
     expect(posts(calls)).toEqual([]);
   });
@@ -106,7 +106,7 @@ describe("ArchiveDialog", () => {
   it("still archives when its changes cannot be read, and says they could not be", async () => {
     const calls = stub(() => json(500, { error: "git broke" }), new Response(null, { status: 204 }));
     const dialog = await show();
-    expect(await within(dialog).findByText(/could not be read/)).toBeDefined();
+    expect(await within(dialog).findByText(/can.t be read from here/)).toBeDefined();
     fireEvent.click(within(dialog).getByRole("button", { name: "Archive" }));
     await waitFor(() => expect(posts(calls)).toHaveLength(1));
   });
@@ -151,7 +151,7 @@ describe("ArchiveDialog", () => {
 
     fireEvent.click(within(dialog).getByRole("button", { name: "Archive" }));
 
-    expect((await within(dialog).findByRole("alert")).textContent).toContain("disk on fire");
+    expect((await within(dialog).findByRole("alert")).textContent).toBe("Could not archive fix login: disk on fire.");
   });
 
   it("sends nothing on Cancel", async () => {

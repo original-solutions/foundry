@@ -80,7 +80,7 @@ describe("the jump palette's preview", () => {
   it("shows the highlighted session's state, what it was asked, what Claude said, its last turn and its workspace's changes", async () => {
     const { dialog } = await open();
     const peek = within(dialog).getByRole("region", { name: "Preview of fix login / opus" });
-    expect(within(peek).getByText("Idle")).toBeDefined();
+    expect(within(peek).getByText("Ready")).toBeDefined();
     expect(within(peek).getByText("“Fix the login redirect”")).toBeDefined();
     expect(within(peek).getByText(/The redirect now keeps the query string/)).toBeDefined();
     expect(await within(peek).findByText("1 command · 1 edit")).toBeDefined();
@@ -110,7 +110,7 @@ describe("the jump palette's preview", () => {
     const { dialog, input } = await open();
     fireEvent.keyDown(input, { key: "ArrowDown" });
     const peek = within(dialog).getByRole("region", { name: "Preview of fix login / shell" });
-    expect(within(peek).getByText("Exited 1")).toBeDefined();
+    expect(within(peek).getByText("Failed · exit 1")).toBeDefined();
     expect(within(peek).getByText(/A shell has no steps/)).toBeDefined();
   });
 

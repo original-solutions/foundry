@@ -83,7 +83,7 @@ describe("ChangesPanel", () => {
   it("shows why the changes could not be read", async () => {
     const { panel } = await opened(json(404, { error: "workspace w1 is not a live workspace of this machine" }));
     const alert = await within(panel).findByRole("alert");
-    expect(alert.textContent).toContain("not a live workspace of this machine");
+    expect(alert.textContent).toBe("Could not read the changes: workspace w1 is not a live workspace of this machine.");
   });
 
   it("marks a file viewed: it folds, the count moves on, and this browser keeps it", async () => {
@@ -200,7 +200,7 @@ describe("ChangesPanel", () => {
       const { panel } = await opened(json(200, two), json(404, { error: "commit abc1234 is not on this workspace's branch" }));
       const story = await within(panel).findByRole("region", { name: "Commits" });
       fireEvent.click(within(story).getByRole("button", { name: /add login form/ }));
-      expect((await within(panel).findByRole("alert")).textContent).toContain("is not on this workspace's branch");
+      expect((await within(panel).findByRole("alert")).textContent).toBe("Could not read commit abc1234: commit abc1234 is not on this workspace's branch.");
       fireEvent.click(within(story).getByRole("button", { name: /all changes/i }));
       expect(await within(panel).findByRole("region", { name: "logo.png" })).toBeDefined();
     });

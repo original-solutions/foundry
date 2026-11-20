@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { workspaceShipping, type PullRequest, type Shipping } from "./api";
-import { plural } from "./labels";
+import { plural, words } from "./labels";
 import { pollEvery } from "./poll";
 
 /** The read every place that shows where a branch stands shares, one cache entry per workspace. */
@@ -153,7 +153,7 @@ export function ShipLine({
           type="button"
           onClick={onArchive}
           aria-label={`Archive ${name}: its pull request merged`}
-          title="Its pull request merged: see what stays and what stops, then archive"
+          title={`Its pull request merged. ${words.archive}`}
           className="shrink-0 rounded-md border border-violet-400/40 bg-violet-400/10 px-2 py-0.5 font-medium text-violet-200 transition-colors hover:bg-violet-400/20"
         >
           Archive

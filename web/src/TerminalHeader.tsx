@@ -5,6 +5,7 @@ import { findKey } from "./FindBar";
 import { totals } from "./changes";
 import type { Located } from "./fleet";
 import { machineQuery } from "./api";
+import { words } from "./labels";
 import { jumpKey, SearchIcon } from "./JumpPalette";
 import { button, pressed } from "./Modal";
 import { NextSteps, offersNext } from "./NextSteps";
@@ -191,7 +192,7 @@ function ChangesButton({ workspace, onClick }: { workspace: string; onClick: () 
     <button
       type="button"
       onClick={onClick}
-      title="Changes since the base branch"
+      title={words.changes}
       className={`flex shrink-0 items-center gap-1.5 ${button}`}
     >
       <svg viewBox="0 0 16 16" className="size-3.5" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">

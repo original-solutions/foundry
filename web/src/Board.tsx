@@ -15,7 +15,7 @@ import type { MachineView } from "./fleet";
 import { jumpKey, SearchIcon } from "./JumpPalette";
 import type { Project } from "./api";
 import { Composer, useCreateWorkspace } from "./Composer";
-import { plural, type Glyph } from "./labels";
+import { plural, words, type Glyph } from "./labels";
 import { glyphFill, glyphText, StateGlyph } from "./StateGlyph";
 import { Named, Now } from "./Now";
 import { reply, Said } from "./Said";
@@ -68,7 +68,7 @@ export { BOARD_BUSY_EVERY };
 const ROWS_SHOWN = 4;
 
 const laneTitle: Record<Lane, string> = { needs: "Needs you", working: "Working", quiet: "Quiet" };
-const laneHint: Record<Lane, string> = { needs: "Waiting for you, stuck or failed", working: "An agent is working or starting", quiet: "Nothing is happening" };
+const laneHint: Record<Lane, string> = { needs: "Asked you something, stuck or failed", working: "An agent is working or starting", quiet: "Nothing is happening" };
 const laneTone: Record<Lane, string> = { needs: "text-amber-300", working: "text-sky-300", quiet: "text-neutral-400" };
 const laneGlyph: Record<Lane, Glyph> = { needs: "waiting", working: "working", quiet: "ready" };
 
@@ -322,7 +322,7 @@ function WorkspaceCard({ card, showMachine, onChanges, arrived = false }: { card
             <button
               type="button"
               aria-label={`Archive ${workspace.name}`}
-              title="Archive: see what stays and what stops, then stop its terminals and remove the worktree"
+              title={words.archive}
               onClick={() => terminals.archive(workspace.id)}
               className="-my-1 grid size-6 shrink-0 place-items-center self-center rounded text-neutral-500 hover:bg-neutral-800 hover:text-neutral-100 pointer-fine:opacity-0 pointer-fine:group-focus-within/card:opacity-100 pointer-fine:group-hover/card:opacity-100"
             >
@@ -430,9 +430,9 @@ function ChangesFooter({ card, onScreen, onOpen }: { card: Card; onScreen: boole
 
   let body: React.ReactNode;
   if (leaving) body = <span className="text-neutral-500">Archiving…</span>;
-  else if (error) body = <span className="text-neutral-500">Changes not readable from here</span>;
+  else if (error) body = <span className="text-neutral-500">{words.unreadable}</span>;
   else if (!data) body = <span className="text-neutral-600">Reading changes…</span>;
-  else if (data.files.length === 0 && data.commits.length === 0) body = <span className="text-neutral-500">No changes yet</span>;
+  else if (data.files.length === 0 && data.commits.length === 0) body = <span className="text-neutral-500">{words.noChanges}</span>;
   else {
     const t = totals(data);
     const top = topFiles(data, 3);
@@ -471,7 +471,7 @@ function ChangesFooter({ card, onScreen, onOpen }: { card: Card; onScreen: boole
       type="button"
       onClick={onOpen}
       aria-label={`Changes in ${card.workspace.name}`}
-      title={error ? String(error.message) : "Changes since the base branch"}
+      title={error ? String(error.message) : words.changes}
       className="mt-auto flex flex-col gap-1.5 border-t border-neutral-800 bg-neutral-950/40 px-4 py-2.5 text-left text-xs transition-colors hover:bg-neutral-800/50"
     >
       {body}

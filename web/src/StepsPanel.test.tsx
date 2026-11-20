@@ -19,7 +19,7 @@ const trail: Mark[] = [
   { kind: "ask", text: "Claude needs your permission to use Bash", at: at + 52_000 },
 ];
 
-const session: StepsOf = { kind: "session", id: "s1", name: "opus", glyph: "waiting", label: "Waiting for you" };
+const session: StepsOf = { kind: "session", id: "s1", name: "opus", glyph: "waiting", label: "Needs you" };
 
 async function opened(of: StepsOf, ...answers: Response[]) {
   const onClose = vi.fn();
@@ -36,7 +36,7 @@ describe("StepsPanel", () => {
     const steps = within(turn).getAllByRole("listitem").map((li) => li.textContent);
     expect(steps[0]).toContain("Edit src/login.test.ts");
     expect(steps[1]).toContain("Claude needs your permission to use Bash");
-    expect(turn.textContent).toContain("Waiting for you");
+    expect(turn.textContent).toContain("Needs you");
   });
 
   it("folds an earlier turn to its prompt, what it did and how long it took, and opens it on a click", async () => {
@@ -51,7 +51,7 @@ describe("StepsPanel", () => {
   });
 
   it("says when a session has taken no steps yet", async () => {
-    const { panel } = await opened({ ...session, glyph: "ready", label: "Idle" }, json(200, { steps: [] }));
+    const { panel } = await opened({ ...session, glyph: "ready", label: "Ready" }, json(200, { steps: [] }));
     await waitFor(() => expect(panel.textContent).toMatch(/no steps yet/i));
   });
 

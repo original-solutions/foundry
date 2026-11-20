@@ -10,9 +10,9 @@ import type { SessionState } from "./api";
 const states: [SessionState, string][] = [
   ["starting", "Starting"],
   ["working", "Working"],
-  ["waiting_for_you", "Waiting for you"],
-  ["idle", "Idle"],
-  ["finished", "Finished"],
+  ["waiting_for_you", "Needs you"],
+  ["idle", "Ready"],
+  ["finished", "Ended"],
   ["failed", "Failed"],
   ["stuck", "Stuck"],
   ["unreachable", "Unreachable"],
@@ -78,7 +78,7 @@ describe("Sidebar", () => {
       expect(link.getAttribute("href")).toBe(`/terminals/st${i}`);
     });
     expect(within(group).getByRole("link", { name: /Running/ }).getAttribute("href")).toBe("/terminals/sh1");
-    expect(within(group).getByRole("link", { name: /Exited 1/ }).getAttribute("href")).toBe("/terminals/sh2");
+    expect(within(group).getByRole("link", { name: /Failed · exit 1/ }).getAttribute("href")).toBe("/terminals/sh2");
     expect(within(group).getAllByRole("link", { name: /Unreachable/ })).toHaveLength(2);
     for (const name of ["New session", "New shell"]) {
       expect(within(group).getByRole("button", { name })).toBeDefined();
@@ -103,13 +103,13 @@ describe("Sidebar", () => {
     const working = within(group).getByRole("link", { name: /opus 1 fix the login bug.*Working/ });
     expect(within(working).getByText("Edit src/login.ts")).toBeDefined();
     expect(working.getAttribute("title")).toBe("opus 1: fix the login bug");
-    expect(within(group).getByRole("link", { name: /opus 2 write the release notes.*Idle/ })).toBeDefined();
+    expect(within(group).getByRole("link", { name: /opus 2 write the release notes.*Ready/ })).toBeDefined();
   });
 
   it("highlights the selected terminal", async () => {
     await renderApp(<Sidebar machines={machines()} selected="sh2" {...props} />);
 
-    expect(screen.getByRole("link", { name: /Exited 1/ }).getAttribute("aria-current")).toBe("true");
+    expect(screen.getByRole("link", { name: /Failed · exit 1/ }).getAttribute("aria-current")).toBe("true");
     expect(screen.getByRole("link", { name: /Running/ }).getAttribute("aria-current")).toBeNull();
   });
 
@@ -137,7 +137,7 @@ describe("Sidebar", () => {
     const group = screen.getByRole("group", { name: "fix login" });
     fireEvent.click(within(group).getByRole("button", { name: "New shell" }));
 
-    expect((await within(group).findByRole("alert")).textContent).toContain("at the terminal limit");
+    expect((await within(group).findByRole("alert")).textContent).toBe("Could not start a shell: at the terminal limit.");
   });
 
   it("folds a workspace to one line of its states, the most urgent first, and remembers the fold", async () => {
@@ -151,10 +151,10 @@ describe("Sidebar", () => {
     expect(toggle.getAttribute("aria-expanded")).toBe("false");
     const strip = within(group).getAllByRole("link");
     expect(strip.map((l) => l.getAttribute("aria-label"))).toEqual([
-      "model-2 Waiting for you",
+      "model-2 Needs you",
       "model-6 Stuck",
       "model-5 Failed",
-      "shell 2 Exited 1",
+      "shell 2 Failed · exit 1",
       "model-1 Working",
       "model-0 Starting",
     ]);

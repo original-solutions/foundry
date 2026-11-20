@@ -40,7 +40,7 @@ describe("Rail", () => {
     expect(login.getAttribute("data-open")).toBe("true");
     expect(within(rail).getByRole("group", { name: "many" }).getAttribute("data-open")).toBeNull();
     // Another machine's workspaces are under its name, its state as plain as this one's.
-    expect(within(within(rail).getByRole("group", { name: "on the laptop" })).getByRole("link").getAttribute("aria-label")).toBe("on the laptop / opus: Waiting for you");
+    expect(within(within(rail).getByRole("group", { name: "on the laptop" })).getByRole("link").getAttribute("aria-label")).toBe("on the laptop / opus: Needs you");
     expect(within(rail).getByRole("link", { name: /^laptop/ }).getAttribute("href")).toBe("/machines");
   });
 

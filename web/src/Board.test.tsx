@@ -183,7 +183,7 @@ describe("Board", () => {
     expect(within(login).getByText("abc1234")).toBeDefined();
     expect(within(login).getByText("Check the session on login")).toBeDefined();
     await waitFor(() => expect(within(card("tidy readme")).getByText("No changes yet")).toBeDefined());
-    await waitFor(() => expect(within(card("far away")).getByText(/not readable from here/i)).toBeDefined());
+    await waitFor(() => expect(within(card("far away")).getByText(/can.t be read from here/i)).toBeDefined());
   });
 
   it("opens a workspace's changes from its card", async () => {
@@ -232,7 +232,7 @@ describe("Board", () => {
     answers["/api/workspaces/w1/changes"] = () => json(500, { error: "git hiccup" });
     const allWorking = records().map((r) => (r.kind === "session" ? { ...r, body: { ...r.body, state: "working" as const } } : r));
     await show(fleet(allWorking, settings()));
-    await waitFor(() => expect(within(card("far away")).getByText(/not readable from here/i)).toBeDefined());
+    await waitFor(() => expect(within(card("far away")).getByText(/can.t be read from here/i)).toBeDefined());
     const twoMinutes = 120_000;
     await act(() => vi.advanceTimersByTimeAsync(twoMinutes + 100));
     expect(readsOf("w1")).toBe(1 + Math.floor(twoMinutes / Math.max(BOARD_BUSY_EVERY, RETRY_EVERY)));
@@ -351,7 +351,7 @@ describe("Grouped by shipping", () => {
     expect(within(lane("Only here")).getByRole("article", { name: "draft login" })).toBeDefined();
     expect(within(lane("Pushed")).getByRole("article", { name: "push docs" })).toBeDefined();
     expect(within(lane("In review")).getByRole("article", { name: "fix footer" })).toBeDefined();
-    expect(within(lane("Nothing yet")).getByRole("article", { name: "say hi" })).toBeDefined();
+    expect(within(lane("No changes yet")).getByRole("article", { name: "say hi" })).toBeDefined();
     // Another machine's workspace keeps its card, said to be unread from here, and where its branch stands is never asked.
     expect(within(lane("Not read from here")).getByRole("article", { name: "far off" })).toBeDefined();
     expect(reads).not.toContain("/api/workspaces/w6/pr");

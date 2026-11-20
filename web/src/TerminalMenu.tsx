@@ -2,6 +2,7 @@ import { useMutation, useQuery } from "@tanstack/react-query";
 import { ContextMenu, Dialog, DropdownMenu } from "radix-ui";
 import { createContext, Fragment, useContext, useEffect, useRef, useState, type ComponentType, type PointerEvent, type ReactElement, type ReactNode } from "react";
 import { closeTerminal, machineQuery, startShell } from "./api";
+import { couldNot } from "./labels";
 import { ArchiveDialog } from "./Archive";
 import { ended, endOf } from "./ends";
 import { locate, type Located, type MachineView } from "./fleet";
@@ -62,12 +63,12 @@ export function TerminalActions({ children, ...actions }: Actions & { children: 
   }, [archived]);
   const clearing = useMutation({
     mutationFn: (ids: string[]) => Promise.all(ids.map(closeTerminal)),
-    onError: (error) => setFailed(`Could not end it: ${error.message}`),
+    onError: (error, ids) => setFailed(couldNot(ids.length === 1 ? "clear the terminal" : `clear ${ids.length} ended terminals`, error)),
   });
   const shell = useMutation({
     mutationFn: startShell,
     onSuccess: actions.onOpen,
-    onError: (error) => setFailed(`Could not start a shell: ${error.message}`),
+    onError: (error) => setFailed(couldNot("start a shell", error)),
   });
   const { data: here } = useQuery(machineQuery);
   const context: Context = {
@@ -312,12 +313,12 @@ export function useTerminalActions(): Context | undefined {
 function EndDialog({ id, found, onDone }: { id: string; found: Located; onDone: () => void }) {
   const end = useMutation({ mutationFn: () => closeTerminal(id), onSuccess: onDone });
   const what = !found.session
-    ? "Whatever runs in it is hung up and the terminal closes."
+    ? "Whatever runs in it stops and the terminal closes."
     : found.glyph === "working"
-      ? "It is in the middle of a turn: Claude Code is hung up and the turn stops where it is."
+      ? "It is in the middle of a turn: the turn stops where it is and Claude Code closes."
       : found.glyph === "waiting"
-        ? "It is waiting for your answer: Claude Code is hung up without one."
-        : "Claude Code is hung up and its terminal closes.";
+        ? "It is waiting for your answer: Claude Code closes without one."
+        : "Claude Code closes, and so does its terminal.";
   return (
     <Modal open onOpenChange={(open) => !open && onDone()} title={`End ${found.name}?`} description={`${what} The workspace, its worktree and its branch stay.`}>
       <p className="mt-3 flex min-w-0 items-center gap-2 rounded border border-neutral-800 bg-neutral-950 px-2 py-1.5 text-xs text-neutral-300">
@@ -329,7 +330,7 @@ function EndDialog({ id, found, onDone }: { id: string; found: Located; onDone: 
       </p>
       {end.isError && (
         <p role="alert" className="mt-2 text-xs text-red-400">
-          {end.error.message}
+          {couldNot(`end ${found.name}`, end.error)}
         </p>
       )}
       <div className="mt-4 flex justify-end gap-2">

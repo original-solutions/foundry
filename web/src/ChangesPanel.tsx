@@ -4,7 +4,7 @@ import { Fragment, useEffect, useRef, useState, type KeyboardEvent, type ReactNo
 import { workspaceChanges, workspaceCommit, type Changes, type Commit, type FileChange } from "./api";
 import { diffLines, splitPath, totals } from "./changes";
 import type { SessionView } from "./fleet";
-import { plural } from "./labels";
+import { couldNot, plural } from "./labels";
 import { anchor, onLine, type Anchor, type Note } from "./notes";
 import { lineName, NoteBox, NoteRow, SendBar } from "./LineNotes";
 import { button } from "./Modal";
@@ -221,7 +221,7 @@ function Sheet({ workspace, file, onClose, notes, onNotes }: SheetProps) {
         {error ? (
           <div className="p-4">
             <p role="alert" className="rounded border border-red-500/30 bg-red-500/10 px-3 py-2 text-red-300">
-              {error.message}
+              {couldNot("read the changes", error)}
             </p>
           </div>
         ) : isPending ? (
@@ -242,7 +242,7 @@ function Sheet({ workspace, file, onClose, notes, onNotes }: SheetProps) {
                   <CommitHead commit={story[picked]} n={picked + 1} of={story.length} changes={commit.data} onPick={(d) => pick(picked + d)} />
                   {commit.error ? (
                     <p role="alert" className="rounded border border-red-500/30 bg-red-500/10 px-3 py-2 text-red-300">
-                      {commit.error.message}
+                      {couldNot(`read commit ${story[picked].hash}`, commit.error)}
                     </p>
                   ) : commit.isPending ? (
                     <p className="px-1 text-neutral-500">Reading the commit…</p>

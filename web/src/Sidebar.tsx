@@ -5,6 +5,7 @@ import { button } from "./Modal";
 import { jumpKey, SearchIcon } from "./JumpPalette";
 import { Named, Now } from "./Now";
 import { startShell } from "./api";
+import { couldNot, words } from "./labels";
 import { loadFolded, saveFolded } from "./fold";
 import { byUrgency, machineNumbers, machineStats, rows, type MachineView, type Row, type WorkspaceView } from "./fleet";
 import { glyphText, StateGlyph } from "./StateGlyph";
@@ -294,16 +295,16 @@ function Workspace({ workspace, machine, folded, onFold, selected, onNavigate, o
             </span>
             <div className="flex shrink-0 items-center gap-0.5 pointer-fine:hidden pointer-fine:group-focus-within/ws:flex pointer-fine:group-hover/ws:flex">
               {onChanges && (
-                <Action label="Changes" title="What this workspace changed since its base" onClick={() => onChanges(workspace.id)}>
+                <Action label="Changes" title={words.changes} onClick={() => onChanges(workspace.id)}>
                   <path d="M8 2.5v6M5 5.5h6M5 12.5h6" />
                 </Action>
               )}
               {terminals && (
-                <Action label="New session" title="New Claude Code session" onClick={() => terminals.onNewSession(workspace.id, workspace.name)}>
+                <Action label="New session" title="Start Claude Code in this workspace" onClick={() => terminals.onNewSession(workspace.id, workspace.name)}>
                   <path d="M8 2.5l1.3 3.2 3.2 1.3-3.2 1.3L8 11.5 6.7 8.3 3.5 7l3.2-1.3z" />
                 </Action>
               )}
-              <Action label="New shell" title="New shell" onClick={() => shell.mutate()} disabled={shell.isPending}>
+              <Action label="New shell" title="Open a shell in this workspace" onClick={() => shell.mutate()} disabled={shell.isPending}>
                 <path d="M3.5 4.5l3 3-3 3M8 11.5h4.5" />
               </Action>
               {terminals && over.length > 0 && (
@@ -312,7 +313,7 @@ function Workspace({ workspace, machine, folded, onFold, selected, onNavigate, o
                 </Action>
               )}
               {terminals?.here === machine && (
-                <Action label="Archive" title="Archive: stop its terminals, remove the worktree, keep the branch" onClick={() => terminals.archive(workspace.id)}>
+                <Action label="Archive" title={words.archive} onClick={() => terminals.archive(workspace.id)}>
                   <path d={ARCHIVE_ICON} />
                 </Action>
               )}
@@ -320,7 +321,7 @@ function Workspace({ workspace, machine, folded, onFold, selected, onNavigate, o
           </div>
           {shell.error && (
             <p role="alert" className="pl-6 text-xs text-red-400">
-              {shell.error.message}
+              {couldNot("start a shell", shell.error)}
             </p>
           )}
           {list.length > 0 && (

@@ -14,7 +14,7 @@ export type ShipLane = Stage | "none" | "unread";
 /** Each lane's name, what it holds, and its colour: work only here is at risk, pushed is safe, in review is on its way, merged is done. */
 export const shipLanes: { lane: ShipLane; name: string; hint: string; tone: string }[] = [
   ...stages.map((s) => ({ lane: s.stage, name: s.name, hint: s.hint, tone: { here: "text-amber-300", pushed: "text-sky-300", review: "text-emerald-400", merged: "text-violet-300" }[s.stage] })),
-  { lane: "none", name: "Nothing yet", hint: "No edits or commits since its base", tone: "text-neutral-400" },
+  { lane: "none", name: "No changes yet", hint: "No edits or commits since it left its base branch", tone: "text-neutral-400" },
   { lane: "unread", name: "Not read from here", hint: "Another machine's workspace, or one whose changes could not be read", tone: "text-neutral-500" },
 ];
 

@@ -6,7 +6,7 @@ import { changesQuery } from "./ChangesPanel";
 import { totals } from "./changes";
 import { locate, rows, type MachineView, type WorkspaceView } from "./fleet";
 import type { Destination } from "./jump";
-import { addsSteps, type Glyph } from "./labels";
+import { addsSteps, words, type Glyph } from "./labels";
 import { topFiles } from "./lanes";
 import { Now } from "./Now";
 import { BOARD_BUSY_EVERY, pollEvery } from "./poll";
@@ -226,9 +226,9 @@ function Changed({ workspace, glyphs, read }: { workspace: string; glyphs: Glyph
   });
   let body: React.ReactNode;
   if (leaving) body = <p className="text-xs text-neutral-500">Archiving…</p>;
-  else if (error) body = <p className="text-xs text-neutral-500">Not readable from here.</p>;
+  else if (error) body = <p className="text-xs text-neutral-500">{words.unreadable}.</p>;
   else if (!data) body = <p className="text-xs text-neutral-600">Reading…</p>;
-  else if (data.files.length === 0 && data.commits.length === 0) body = <p className="text-xs text-neutral-500">Nothing yet.</p>;
+  else if (data.files.length === 0 && data.commits.length === 0) body = <p className="text-xs text-neutral-500">{words.noChanges}.</p>;
   else {
     const t = totals(data);
     const top = topFiles(data, 4);

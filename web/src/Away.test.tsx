@@ -109,7 +109,7 @@ describe("Away", () => {
     await waitFor(() => expect(within(panel()).getByText("· 1 turn · 2 commands · 1 edit")).toBeDefined());
     expect(within(panel()).getByText("12m")).toBeDefined();
     const items = within(panel()).getAllByRole("button", { name: /^Open / });
-    expect(items.map((b) => b.getAttribute("aria-label"))).toEqual(["Open sonnet in fix login: Waiting for you", "Open opus in fix login: Idle"]);
+    expect(items.map((b) => b.getAttribute("aria-label"))).toEqual(["Open sonnet in fix login: Needs you", "Open opus in fix login: Ready"]);
     // The question it waits on, and what Claude said at the end of the turn.
     expect(within(items[0]).getByText("Delete old.md?")).toBeDefined();
     expect(within(items[1]).getByText(/The form is in\./)).toBeDefined();

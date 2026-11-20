@@ -3,6 +3,7 @@ import { useNavigate } from "@tanstack/react-router";
 import { Dialog } from "radix-ui";
 import { useEffect, useMemo, useRef, useState, type MutableRefObject } from "react";
 import { startShell } from "./api";
+import { couldNot } from "./labels";
 import { locate, type MachineView } from "./fleet";
 import { destinations, newWorkspace, search, type Destination } from "./jump";
 import { Peek, useWide } from "./Peek";
@@ -298,7 +299,7 @@ function Panel({
       {shell.isPending && <p className="border-t border-neutral-800 px-4 py-2 text-xs text-neutral-400">Starting a shell…</p>}
       {shell.isError && (
         <p role="alert" className="border-t border-neutral-800 px-4 py-2 text-xs text-red-400">
-          {shell.error.message}
+          {couldNot("start a shell", shell.error)}
         </p>
       )}
       <div className="hidden gap-4 border-t border-neutral-800 px-4 py-2 text-[11px] text-neutral-500 sm:flex">

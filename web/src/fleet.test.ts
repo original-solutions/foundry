@@ -247,22 +247,22 @@ describe("locate", () => {
       machine: "studio",
       workspace: "fix login",
       name: "sonnet",
-      label: "Waiting for you",
+      label: "Needs you",
       glyph: "waiting",
     });
   });
 
   it("finds a shell, named shell, with its exit code in the label", () => {
     const found = locate(machines, "sh1");
-    expect(found && [found.name, found.label, found.glyph]).toEqual(["shell", "Exited 2", "failed"]);
+    expect(found && [found.name, found.label, found.glyph]).toEqual(["shell", "Failed · exit 2", "failed"]);
     const away = locate(machines, "sh2");
     expect(away && [away.machine.name, away.workspace.name, away.label, away.glyph]).toEqual(["laptop", "docs", "Unreachable", "away"]);
   });
 
   it("lists a workspace's terminals as rows, sessions first, each with its session, name, label and glyph", () => {
     expect(rows(machines[0].workspaces[0])).toEqual([
-      { terminal: "t1", session: "s1", name: "sonnet", label: "Waiting for you", glyph: "waiting" },
-      { terminal: "sh1", name: "shell", label: "Exited 2", glyph: "failed" },
+      { terminal: "t1", session: "s1", name: "sonnet", label: "Needs you", glyph: "waiting" },
+      { terminal: "sh1", name: "shell", label: "Failed · exit 2", glyph: "failed" },
     ]);
   });
 

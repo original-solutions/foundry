@@ -5,7 +5,7 @@ import { archiveWorkspace, type Blockers, type FileChange } from "./api";
 import { changesQuery } from "./ChangesPanel";
 import { splitPath } from "./changes";
 import { rows, type WorkspaceView } from "./fleet";
-import { plural, type Glyph } from "./labels";
+import { couldNot, plural, words, type Glyph } from "./labels";
 import { button, Modal } from "./Modal";
 import { Named } from "./Now";
 import { glyphText, StateGlyph } from "./StateGlyph";
@@ -77,7 +77,7 @@ export function ArchiveDialog({ workspace, onClose, onArchived }: { workspace: W
       <div className="mt-4 flex max-h-[min(60dvh,32rem)] flex-col gap-4 overflow-y-auto">
         <Part title={`Kept on ${workspace.branch}`} tone="text-emerald-400" icon="M4 2.5v11M4 5.5c0 2 1.5 3 4 3h1.5M11.5 8.5a1.5 1.5 0 1 0 3 0 1.5 1.5 0 0 0-3 0">
           {changes.isError ? (
-            <p className="text-xs text-neutral-500">What it changed could not be read from here.</p>
+            <p className="text-xs text-neutral-500">{words.unreadable}.</p>
           ) : !changes.data ? (
             <p className="text-xs text-neutral-600">Reading what it changed…</p>
           ) : changes.data.commits.length === 0 ? (
@@ -134,7 +134,7 @@ export function ArchiveDialog({ workspace, onClose, onArchived }: { workspace: W
       </div>
       {archive.isError && (
         <p role="alert" className="mt-3 text-xs text-red-400">
-          {archive.error.message}
+          {couldNot(`archive ${workspace.name}`, archive.error)}
         </p>
       )}
       <div className="mt-5 flex justify-end gap-2">
