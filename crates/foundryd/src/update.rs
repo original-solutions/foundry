@@ -842,6 +842,8 @@ mod tests {
     use std::time::Instant;
 
     use nix::errno::Errno;
+    use ring::rand::SystemRandom;
+    use ring::signature::{Ed25519KeyPair, KeyPair};
 
     use super::*;
 
@@ -2065,43 +2067,129 @@ mod tests {
     }
 
     #[test]
-    fn download_fetches_this_machines_asset_with_gh_and_unpacks_both_binaries() {
-        let work = tempfile::tempdir().unwrap();
-        let packed = work.path().join("packed");
-        fs::create_dir_all(&packed).unwrap();
-        release(&packed, "0.2.0");
-        let archive = work.path().join("release.tar.gz");
-        run_bounded(
-            Command::new("tar")
-                .arg("-czf")
-                .arg(&archive)
-                .arg("-C")
-                .arg(&packed)
-                .args(BINARIES),
-            LIMIT,
-        )
-        .unwrap();
-        let args = work.path().join("args");
-        let gh = work.path().join("gh");
-        fs::write(
-            &gh,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{args}'\nwhile [ $# -gt 0 ]; do\n  case \"$1\" in\n    --pattern) name=\"$2\"; shift ;;\n    --dir) dir=\"$2\"; shift ;;\n  esac\n  shift\ndone\ncp '{archive}' \"$dir/$name\"\n",
-                args = args.display(),
-                archive = archive.display()
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
-        let stage = work.path().join("stage");
-        fs::create_dir_all(&stage).unwrap();
+    fn the_release_key_is_the_one_the_release_workflow_signs_with() {
+        let hex: String = RELEASE_KEY.iter().map(|b| format!("{b:02x}")).collect();
 
-        download_with(gh.as_os_str(), "v0.2.0", &stage).unwrap();
-
-        let said = fs::read_to_string(&args).unwrap();
-        let said: Vec<&str> = said.lines().collect();
         assert_eq!(
-            said,
+            hex,
+            "1884d7afeb3f7af2805f1727358a10baa8688264fd531685d116b9bec30b45e1"
+        );
+    }
+
+    /// A fresh Ed25519 key, as the release workflow's would be.
+    fn signing_key() -> Ed25519KeyPair {
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap()
+    }
+
+    /// A release on GitHub, as the fake `gh` in `work/gh` serves it from `work/served`.
+    struct Served {
+        work: tempfile::TempDir,
+    }
+
+    impl Served {
+        /// A real archive of `version`'s two binaries under this machine's asset name, and a
+        /// `gh` that copies each `--pattern` asset there is into `--dir`, saying nothing about
+        /// one that is not, as `gh release download` does.
+        fn release(version: &str) -> Self {
+            let work = tempfile::tempdir().unwrap();
+            let packed = work.path().join("packed");
+            let served = work.path().join("served");
+            fs::create_dir_all(&packed).unwrap();
+            fs::create_dir_all(&served).unwrap();
+            release(&packed, version);
+            run_bounded(
+                Command::new("tar")
+                    .arg("-czf")
+                    .arg(served.join(asset()))
+                    .arg("-C")
+                    .arg(&packed)
+                    .args(BINARIES),
+                LIMIT,
+            )
+            .unwrap();
+            let gh = work.path().join("gh");
+            fs::write(
+                &gh,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{args}'\nnames=''\nwhile [ $# -gt 0 ]; do\n  case \"$1\" in\n    --pattern) names=\"$names $2\"; shift ;;\n    --dir) dir=\"$2\"; shift ;;\n  esac\n  shift\ndone\nfor name in $names; do\n  if [ -f '{served}'/\"$name\" ]; then cp '{served}'/\"$name\" \"$dir/$name\"; fi\ndone\n",
+                    args = work.path().join("args").display(),
+                    served = served.display()
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+            Served { work }
+        }
+
+        /// Serves a signature of the archive made with `key`.
+        fn signed_by(self, key: &Ed25519KeyPair) -> Self {
+            let served = self.work.path().join("served");
+            let archive = fs::read(served.join(asset())).unwrap();
+            fs::write(
+                served.join(format!("{}.sig", asset())),
+                key.sign(&archive).as_ref(),
+            )
+            .unwrap();
+            self
+        }
+
+        fn gh(&self) -> PathBuf {
+            self.work.path().join("gh")
+        }
+
+        /// The arguments the fake `gh` was last called with.
+        fn said(&self) -> Vec<String> {
+            fs::read_to_string(self.work.path().join("args"))
+                .unwrap()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+    }
+
+    /// What `versions/` holds, by name.
+    fn versions(home: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(home.join("versions"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// One look for a newer tag that fetches `v0.2.0` from `served` and checks it with `key`.
+    fn check_served(
+        home: &Path,
+        served: &Served,
+        key: &[u8],
+    ) -> Result<Option<String>, UpdateError> {
+        check_with(
+            home,
+            "0.1.0",
+            LIMIT,
+            || Ok(tags(&["v0.2.0"])),
+            |tag, stage| download_with(served.gh().as_os_str(), key, tag, stage),
+        )
+    }
+
+    #[test]
+    fn download_fetches_this_machines_asset_and_its_signature_with_gh_and_unpacks_both_binaries() {
+        let key = signing_key();
+        let served = Served::release("0.2.0").signed_by(&key);
+        let stage = tempfile::tempdir().unwrap();
+
+        download_with(
+            served.gh().as_os_str(),
+            key.public_key().as_ref(),
+            "v0.2.0",
+            stage.path(),
+        )
+        .unwrap();
+
+        let sig = format!("{}.sig", asset());
+        assert_eq!(
+            served.said(),
             [
                 "release",
                 "download",
@@ -2110,14 +2198,92 @@ mod tests {
                 REPO,
                 "--pattern",
                 &asset(),
+                "--pattern",
+                &sig,
                 "--dir",
-                stage.to_str().unwrap()
+                stage.path().to_str().unwrap()
             ]
         );
         for name in BINARIES {
-            assert!(stage.join(name).is_file(), "{name}");
+            assert!(stage.path().join(name).is_file(), "{name}");
         }
-        assert!(!stage.join(asset()).exists());
+        assert!(!stage.path().join(asset()).exists());
+        assert!(!stage.path().join(sig).exists());
+    }
+
+    #[test]
+    fn download_unpacks_nothing_when_the_signature_does_not_verify() {
+        let served = Served::release("0.2.0").signed_by(&signing_key());
+        let stage = tempfile::tempdir().unwrap();
+
+        let error = download_with(
+            served.gh().as_os_str(),
+            signing_key().public_key().as_ref(),
+            "v0.2.0",
+            stage.path(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, UpdateError::BadSignature(_)), "{error}");
+        for name in BINARIES {
+            assert!(!stage.path().join(name).exists(), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_release_signed_with_another_key_is_refused_and_nothing_is_placed() {
+        let home = installed_home();
+        let served = Served::release("0.2.0").signed_by(&signing_key());
+        let trusted = signing_key();
+
+        let error = check_served(home.path(), &served, trusted.public_key().as_ref()).unwrap_err();
+
+        let said = error.to_string();
+        assert!(
+            said.contains("v0.2.0") && said.contains("signature did not verify"),
+            "{said}"
+        );
+        assert_eq!(versions(home.path()), ["0.1.0"]);
+        assert_eq!(current(home.path()), PathBuf::from("versions/0.1.0"));
+        assert_eq!(
+            state(home.path()).unwrap().refused.as_deref(),
+            Some("v0.2.0")
+        );
+        let again = check_served(home.path(), &served, trusted.public_key().as_ref());
+        assert_eq!(again.unwrap(), None);
+    }
+
+    #[test]
+    fn a_release_with_no_signature_is_tried_again_and_nothing_is_placed() {
+        let home = installed_home();
+        let served = Served::release("0.2.0");
+        let key = signing_key();
+
+        let error = check_served(home.path(), &served, key.public_key().as_ref()).unwrap_err();
+
+        assert!(matches!(error, UpdateError::Fetch(_)), "{error}");
+        assert_eq!(versions(home.path()), ["0.1.0"]);
+        assert_eq!(current(home.path()), PathBuf::from("versions/0.1.0"));
+        assert_eq!(state(home.path()).unwrap().refused, None);
+    }
+
+    #[test]
+    fn a_release_with_a_valid_signature_places_both_binaries() {
+        let home = installed_home();
+        let key = signing_key();
+        let served = Served::release("0.2.0").signed_by(&key);
+
+        let installed = check_served(home.path(), &served, key.public_key().as_ref()).unwrap();
+
+        assert_eq!(installed.as_deref(), Some("v0.2.0"));
+        assert_eq!(versions(home.path()), ["0.1.0", "0.2.0"]);
+        for name in BINARIES {
+            assert!(
+                home.path().join("versions/0.2.0").join(name).is_file(),
+                "{name}"
+            );
+        }
+        assert_eq!(current(home.path()), PathBuf::from("versions/0.2.0"));
     }
 
     #[test]
@@ -2127,7 +2293,7 @@ mod tests {
         fs::write(&gh, "#!/bin/sh\necho 'release not found' >&2\nexit 1\n").unwrap();
         fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
 
-        let error = download_with(gh.as_os_str(), "v0.2.0", work.path()).unwrap_err();
+        let error = download_with(gh.as_os_str(), &RELEASE_KEY, "v0.2.0", work.path()).unwrap_err();
 
         assert!(matches!(error, UpdateError::Fetch(_)), "{error}");
         assert!(error.to_string().contains("release not found"), "{error}");
