@@ -192,6 +192,9 @@ impl Peers {
         if !send_text(&send, &open).await {
             return Err(down());
         }
+        // Beat from now on: the owner ends a relay it hears nothing on, and a large snapshot
+        // over a slow link takes longer than that.
+        let beating = beat(send.clone());
         // The owner's attach answers within its own limit, which is shorter than this, and each
         // piece of the snapshot gives the next as long again: the limit is on silence, not on
         // the whole transfer.
@@ -232,7 +235,7 @@ impl Peers {
             }
         };
         let remote = Remote {
-            _beat: beat(send.clone()),
+            _beat: beating,
             send,
             recv,
             heard: Instant::now(),
