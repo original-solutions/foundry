@@ -267,7 +267,6 @@ impl Coordinator {
         let reason = match result {
             Ok(stamp) => return Some(Outcome::Numbered { stamp }),
             Err(CoordinatorError::Refused { reason }) => reason,
-            Err(CoordinatorError::Store(_)) => format!("{me} could not store it"),
             Err(CoordinatorError::Unwritable(_)) => {
                 format!("{me} could not write it to pass it on")
             }
@@ -275,9 +274,12 @@ impl Coordinator {
                 format!("{me} could not send it to {acting}, the acting coordinator")
             }
             // Whether it was numbered is unknown: the forwarder's own limit reports it. The
-            // rest cannot happen for a forwarded edit.
+            // only store failure that is a refusal is a failed write with nothing else waiting
+            // on the id, and `run_edit` makes that one `Refused`. The rest cannot happen for a
+            // forwarded edit.
             Err(
-                CoordinatorError::NoAnswer { .. }
+                CoordinatorError::Store(_)
+                | CoordinatorError::NoAnswer { .. }
                 | CoordinatorError::NotLinked(_)
                 | CoordinatorError::Older { .. },
             ) => return None,
@@ -326,8 +328,10 @@ impl Coordinator {
         let mut sent: Option<(MachineId, u64)> = None;
         // Every machine it was sent to.
         let mut sent_to: BTreeSet<MachineId> = BTreeSet::new();
-        // The last store error, and whether a refusal was ignored, logged once each.
-        let mut logged: Option<String> = None;
+        // The last read error and the last write error, and whether a refusal was ignored,
+        // logged once each: a read that goes right does not clear a write that keeps failing.
+        let mut read_logged: Option<String> = None;
+        let mut write_logged: Option<String> = None;
         let mut ignored = false;
         loop {
             let answered = lock(&self.answers)
@@ -347,27 +351,39 @@ impl Coordinator {
                 _ => {}
             }
             // The error to report when the limit passes with nothing settled.
-            let mut failed: Option<StoreError> = None;
-            match self.look(from, arrived, &mut logged).await {
+            let mut failed: Option<(StoreError, bool)> = None;
+            match self.look(from, arrived).await {
                 // A read that fails ends only this machine's own edit that was never sent.
                 Err(error) if from.is_none() && sent.is_none() => return Err(error.into()),
-                Err(error) => failed = Some(error),
+                Err(error) => failed = Some((error, false)),
                 Ok(look) => {
+                    read_logged = None;
                     if let Some(stamp) = look.held.numbered.get(&id) {
                         return Ok(*stamp);
                     }
                     match look.next {
-                        // A write that fails ends an edit that was never sent, forwarded or
-                        // not. The numbering machine cannot know another did not number it, so
-                        // it does not try: the sender's rule above stops a second machine's
-                        // refusal being taken as final.
+                        // The only store failure that is a refusal is a failed write, on an
+                        // edit that was never sent, with no other task here waiting on the id
+                        // (it may be numbering it): then nothing else can have numbered it.
+                        // Another failure ends only this machine's own edit that was never
+                        // sent; otherwise it is logged and tried again.
                         Next::Number => match self.number(Some(id), &edit).await {
                             Ok(stamp) => return Ok(stamp),
-                            Err(CoordinatorError::Store(error)) if sent.is_none() => {
-                                return Err(error.into());
+                            Err(failure) => {
+                                if failure.write
+                                    && from.is_some()
+                                    && sent.is_none()
+                                    && self.waiting_on(id) == 1
+                                {
+                                    return Err(CoordinatorError::Refused {
+                                        reason: format!("{} could not store it", self.me),
+                                    });
+                                }
+                                if from.is_none() && sent.is_none() {
+                                    return Err(failure.error.into());
+                                }
+                                failed = Some((failure.error, failure.write));
                             }
-                            Err(CoordinatorError::Store(error)) => failed = Some(error),
-                            Err(error) => return Err(error),
                         },
                         Next::Send(acting) => {
                             let on_its_way = sent.is_some_and(|(to, link)| {
@@ -411,11 +427,16 @@ impl Coordinator {
                     }
                 }
             }
-            if let Some(error) = failed {
+            if let Some((error, write)) = failed {
                 let text = error.to_string();
+                let logged = if write {
+                    &mut write_logged
+                } else {
+                    &mut read_logged
+                };
                 if logged.as_ref() != Some(&text) {
                     tracing::warn!("coordinator: {text}; looking again");
-                    logged = Some(text);
+                    *logged = Some(text);
                 }
                 if arrived.elapsed() >= KEEP_FORWARDED {
                     return Err(match sent {
@@ -429,15 +450,10 @@ impl Coordinator {
     }
 
     /// One look at an edit that waits: reads the settings, and says what it does next and who
-    /// acts. A read that fails is logged once, in `logged`. This is the one place that decides
+    /// acts. This is the one place that decides
     /// where an edit goes, for an edit with an id ([`Coordinator::run_edit`]) and one without
     /// ([`Coordinator::pass_on`]).
-    async fn look(
-        &self,
-        from: Option<MachineId>,
-        arrived: Instant,
-        logged: &mut Option<String>,
-    ) -> Result<Look, StoreError> {
+    async fn look(&self, from: Option<MachineId>, arrived: Instant) -> Result<Look, StoreError> {
         let (held, sender_spoke) = self.view(from, arrived).await?;
         let online = self.peers.online();
         let waited = arrived.elapsed();
@@ -452,8 +468,6 @@ impl Coordinator {
             waited,
         );
         let acting = acting(&held.priority, &online);
-        // A good read ends a run of the same failed one.
-        *logged = None;
         Ok(Look {
             held,
             next,
@@ -478,7 +492,7 @@ impl Coordinator {
         let _released = released;
         let mut logged: Option<String> = None;
         loop {
-            match self.look(Some(peer), arrived, &mut logged).await {
+            match self.look(Some(peer), arrived).await {
                 Err(error) => {
                     let text = error.to_string();
                     if logged.as_ref() != Some(&text) {
@@ -490,8 +504,15 @@ impl Coordinator {
                     }
                 }
                 Ok(look) => {
+                    logged = None;
                     match look.next {
-                        Next::Number => return self.number(None, &edit).await.map(|_| ()),
+                        Next::Number => {
+                            return self
+                                .number(None, &edit)
+                                .await
+                                .map(|_| ())
+                                .map_err(|failure| failure.error.into());
+                        }
                         Next::Send(acting) => match self.peers.send_edit(acting, None, &edit).await
                         {
                             Ok(_) => return Ok(()),
@@ -525,12 +546,13 @@ impl Coordinator {
     }
 
     /// Gives the edit the next number, on the copy held at that moment, unless that copy
-    /// already holds a stamp for its `id`, which is returned.
-    async fn number(&self, id: Option<EditId>, edit: &Edit) -> Result<Stamp, CoordinatorError> {
+    /// already holds a stamp for its `id`, which is returned. A stamp stored for `id` ends any
+    /// refusal remembered for it.
+    async fn number(&self, id: Option<EditId>, edit: &Edit) -> Result<Stamp, Unnumbered> {
         let me = self.me;
         let edit = edit.clone();
         let stamp = on_store(&self.store, move |store| {
-            let held = store.settings()?;
+            let held = store.settings().map_err(Unnumbered::read)?;
             if let Some(stamp) = id.and_then(|id| held.numbered.get(&id)) {
                 return Ok(*stamp);
             }
@@ -542,11 +564,21 @@ impl Coordinator {
             if let Some(id) = id {
                 remember(&mut next, id, stamp);
             }
-            store.apply_settings(next)?;
-            Ok::<_, StoreError>(stamp)
+            store.apply_settings(next).map_err(Unnumbered::write)?;
+            Ok(stamp)
         })
         .await?;
+        if let Some(id) = id {
+            lock(&self.refused).remove(&id);
+        }
         Ok(stamp)
+    }
+
+    /// How many edits on this machine wait on `id`.
+    fn waiting_on(&self, id: EditId) -> usize {
+        lock(&self.answers)
+            .get(&id)
+            .map_or(0, |(waiting, _)| *waiting)
     }
 
     /// The settings held, and whether a copy of them was taken from `from` after `arrived`,
@@ -630,6 +662,26 @@ impl Queued {
 impl Drop for Queued {
     fn drop(&mut self) {
         lock(&self.coordinator.forwarding).remove(&(self.peer, self.id));
+    }
+}
+
+/// Why [`Coordinator::number`] stored no stamp: the store's error, and whether it came from the
+/// write, after the read found no stamp for the id, or from the read.
+struct Unnumbered {
+    error: StoreError,
+    write: bool,
+}
+
+impl Unnumbered {
+    fn read(error: StoreError) -> Self {
+        Self {
+            error,
+            write: false,
+        }
+    }
+
+    fn write(error: StoreError) -> Self {
+        Self { error, write: true }
     }
 }
 
