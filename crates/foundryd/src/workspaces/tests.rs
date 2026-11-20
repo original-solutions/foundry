@@ -1543,6 +1543,266 @@ async fn an_archive_stopped_by_a_terminal_that_will_not_close_keeps_the_workspac
     assert!(setup.terminals_of(id).iter().all(|t| t.deleted));
 }
 
+// --- the lifecycle lock ---
+
+/// Starts a terminal whose child sleeps in workspace `id` through [`Workspaces::start_in`].
+async fn start_sleeper(
+    workspaces: &Workspaces,
+    id: WorkspaceId,
+) -> Result<TerminalId, WorkspaceError> {
+    let terminals = workspaces.inner.terminals.clone();
+    workspaces
+        .start_in(id, move |worktree| async move {
+            let argv = ["/bin/sh", "-c", "sleep 3127"].map(String::from);
+            Ok(terminals.start(id, &worktree, &argv, &[]).await?)
+        })
+        .await
+}
+
+#[tokio::test]
+async fn a_start_racing_an_archive_leaves_no_live_terminal_in_the_archived_workspace() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    for round in 0..10 {
+        let id = setup
+            .create(&remote, "main", &format!("race {round}"))
+            .await;
+        let (a, b, archived) = tokio::join!(
+            start_sleeper(&setup.workspaces, id),
+            start_sleeper(&setup.workspaces, id),
+            setup.workspaces.archive(id, true),
+        );
+        archived.unwrap_or_else(|e| panic!("round {round}: {e}"));
+        for started in [a, b] {
+            assert!(
+                matches!(started, Ok(_) | Err(WorkspaceError::Unknown(_))),
+                "round {round}: {started:?}"
+            );
+        }
+        let live: Vec<_> = setup
+            .terminals_of(id)
+            .into_iter()
+            .filter(|t| !t.deleted && t.body.state != TerminalState::Exited)
+            .map(|t| t.body.id)
+            .collect();
+        assert!(
+            live.is_empty(),
+            "round {round}: terminals {live:?} are live in an archived workspace"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_start_in_an_archived_workspace_is_refused_and_starts_nothing() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup.create(&remote, "main", "gone").await;
+    setup.workspaces.archive(id, false).await.unwrap();
+    let started = start_sleeper(&setup.workspaces, id).await;
+    assert!(
+        matches!(started, Err(WorkspaceError::Unknown(w)) if w == id),
+        "{started:?}"
+    );
+    assert!(setup.terminals_of(id).is_empty());
+}
+
+#[tokio::test]
+async fn an_archive_waits_for_a_start_whose_caller_hung_up() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup.create(&remote, "main", "held").await;
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    let (holding, held) = tokio::sync::oneshot::channel::<PathBuf>();
+    let caller = {
+        let workspaces = Workspaces {
+            inner: setup.workspaces.inner.clone(),
+        };
+        tokio::spawn(async move {
+            workspaces
+                .start_in(id, move |worktree| async move {
+                    let _ = holding.send(worktree);
+                    let _ = released.await;
+                    Ok::<_, WorkspaceError>(())
+                })
+                .await
+        })
+    };
+    let worktree = tokio::time::timeout(WAIT, held)
+        .await
+        .expect("the start takes the lock in time")
+        .expect("the start runs");
+    assert_eq!(worktree, setup.worktree(remote.project, "held"));
+    caller.abort();
+    let _ = caller.await;
+
+    let archive = setup.workspaces.archive(id, false);
+    tokio::pin!(archive);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), &mut archive)
+            .await
+            .is_err(),
+        "the archive ran while a start still held the workspace"
+    );
+    assert!(worktree.exists());
+    release.send(()).unwrap();
+    tokio::time::timeout(WAIT, archive)
+        .await
+        .expect("the archive runs once the start ends")
+        .unwrap();
+    assert!(!worktree.exists());
+}
+
+/// Runs `work` on `workspace` under its lifecycle lock, from a caller that hangs up (is
+/// aborted) once the work has the lock. The work runs until `release` is sent.
+async fn hung_up_holding(
+    workspaces: &Workspaces,
+    workspace: WorkspaceId,
+) -> tokio::sync::oneshot::Sender<()> {
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    let (holding, held) = tokio::sync::oneshot::channel::<()>();
+    let caller = tokio::spawn({
+        let workspaces = Workspaces {
+            inner: workspaces.inner.clone(),
+        };
+        async move {
+            let work = async move {
+                let _ = holding.send(());
+                let _ = released.await;
+                Ok::<_, WorkspaceError>(())
+            };
+            let _ = workspaces.locked(workspace, work).await;
+        }
+    });
+    tokio::time::timeout(WAIT, held)
+        .await
+        .expect("the work takes the lock in time")
+        .expect("the work runs");
+    caller.abort();
+    let _ = caller.await;
+    release
+}
+
+/// Work that does nothing, for [`Workspaces::locked`].
+async fn nothing() -> Result<(), WorkspaceError> {
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_caller_hanging_up_leaves_its_workspace_held_until_the_work_ends() {
+    let setup = Setup::new();
+    let workspace = WorkspaceId::random();
+    let release = hung_up_holding(&setup.workspaces, workspace).await;
+    let next = setup.workspaces.locked(workspace, nothing());
+    tokio::pin!(next);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), &mut next)
+            .await
+            .is_err(),
+        "a second piece of work on the workspace ran while the first still held it"
+    );
+    release.send(()).unwrap();
+    let ran = tokio::time::timeout(WAIT, next)
+        .await
+        .expect("the second piece of work runs once the first ends");
+    assert!(ran.is_ok());
+}
+
+#[tokio::test]
+async fn work_on_one_workspace_does_not_wait_for_another() {
+    let setup = Setup::new();
+    let release = hung_up_holding(&setup.workspaces, WorkspaceId::random()).await;
+    let ran = tokio::time::timeout(
+        WAIT,
+        setup.workspaces.locked(WorkspaceId::random(), nothing()),
+    )
+    .await
+    .expect("work on another workspace does not wait");
+    assert!(ran.is_ok());
+    release.send(()).unwrap();
+    // Once nothing holds or waits for a workspace, its lock is forgotten.
+    tokio::time::timeout(WAIT, async {
+        while !lock(&setup.workspaces.inner.lifecycle).is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("every lock no one holds is forgotten");
+}
+
+#[tokio::test]
+async fn work_queued_behind_finished_work_still_holds_the_workspace() {
+    let setup = Setup::new();
+    let workspace = WorkspaceId::random();
+    let release_first = hung_up_holding(&setup.workspaces, workspace).await;
+    let (release_second, second_released) = tokio::sync::oneshot::channel::<()>();
+    let (second_holding, second_held) = tokio::sync::oneshot::channel::<()>();
+    let second = tokio::spawn({
+        let workspaces = Workspaces {
+            inner: setup.workspaces.inner.clone(),
+        };
+        async move {
+            let work = async move {
+                let _ = second_holding.send(());
+                let _ = second_released.await;
+                Ok::<_, WorkspaceError>(())
+            };
+            workspaces.locked(workspace, work).await.is_ok()
+        }
+    });
+    // The second is queued (the map's clone, then two for each of the first and the second)
+    // before the first ends and hands it the lock.
+    tokio::time::timeout(WAIT, async {
+        while lock(&setup.workspaces.inner.lifecycle)
+            .get(&workspace)
+            .map(Arc::strong_count)
+            != Some(5)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the second piece of work queues in time");
+    release_first.send(()).unwrap();
+    tokio::time::timeout(WAIT, second_held)
+        .await
+        .expect("the second piece of work takes the lock in time")
+        .unwrap();
+    let third = setup.workspaces.locked(workspace, nothing());
+    tokio::pin!(third);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), &mut third)
+            .await
+            .is_err(),
+        "a third piece of work ran while the second held the workspace"
+    );
+    release_second.send(()).unwrap();
+    assert!(second.await.unwrap());
+    let ran = tokio::time::timeout(WAIT, third)
+        .await
+        .expect("the third piece of work runs once the second ends");
+    assert!(ran.is_ok());
+}
+
+#[tokio::test]
+async fn work_that_panics_leaves_its_workspace_free_and_forgotten() {
+    let setup = Setup::new();
+    let workspace = WorkspaceId::random();
+    let work = async { panic!("the work fails") };
+    let failed: Result<(), WorkspaceError> = setup.workspaces.locked(workspace, work).await;
+    assert!(
+        matches!(&failed, Err(WorkspaceError::Interrupted(e)) if e.is_panic()),
+        "{failed:?}"
+    );
+    assert!(
+        lock(&setup.workspaces.inner.lifecycle).is_empty(),
+        "the lock of work that panicked is still in the map"
+    );
+    let ran = tokio::time::timeout(WAIT, setup.workspaces.locked(workspace, nothing()))
+        .await
+        .expect("the workspace is free after a panic");
+    assert!(ran.is_ok());
+}
+
 impl Setup {
     /// What a create that died after `git worktree add` and before its record leaves: a branch
     /// `branch` at `main` and its worktree, with no workspace record.
