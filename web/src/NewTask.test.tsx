@@ -2,7 +2,7 @@ import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { useState, type ComponentProps } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { fleet } from "./fleet";
-import { field, inlineField } from "./Modal";
+import { field, fieldLook, inlineField } from "./Modal";
 import { NewTask } from "./NewTask";
 import { ME, session, settings, terminal, workspace } from "./test-fixtures";
 import { json, mockFetch, renderApp, type Call } from "./test-utils";
@@ -193,7 +193,7 @@ describe("NewTask", () => {
   });
 
   it("keeps a visible focus on every shared field look", () => {
-    for (const look of [field, inlineField]) {
+    for (const look of [field, inlineField, fieldLook]) {
       const classes = look.split(" ");
       expect(classes).not.toContain("outline-none");
       expect(classes.some((c) => c.startsWith("focus:"))).toBe(true);

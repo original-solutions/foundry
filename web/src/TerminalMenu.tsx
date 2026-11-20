@@ -6,7 +6,7 @@ import { couldNot } from "./labels";
 import { ArchiveDialog } from "./Archive";
 import { ended, endOf } from "./ends";
 import { locate, type Located, type MachineView } from "./fleet";
-import { button, Modal } from "./Modal";
+import { button, dangerButton, Modal } from "./Modal";
 import { StateGlyph } from "./StateGlyph";
 
 interface Actions {
@@ -339,7 +339,7 @@ function EndDialog({ id, found, onDone }: { id: string; found: Located; onDone: 
           type="button"
           onClick={() => end.mutate()}
           disabled={end.isPending}
-          className="rounded bg-red-400 px-3 py-0.5 text-xs font-semibold text-neutral-950 hover:bg-red-300 disabled:opacity-50"
+          className={dangerButton}
         >
           End
         </button>

@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { News } from "./AlertsBell";
 import type { MachineView } from "./fleet";
 import { needsYou } from "./labels";
+import { fieldLook } from "./Modal";
 import { arrive, current, TOAST_MS, type Live, type Toast } from "./news";
 import { Now } from "./Now";
 import { reply } from "./Said";
@@ -171,7 +172,7 @@ function Card({ live, canReply, onOpen, onGone }: { live: Live; canReply: boolea
               disabled={sending}
               enterKeyHint="send"
               onChange={(event) => setDraft(event.target.value)}
-              className="h-8 min-w-0 flex-1 rounded-md border border-neutral-700 bg-neutral-950 px-2 text-base text-neutral-100 placeholder:text-neutral-500 focus:border-sky-400/70 focus:outline-none pointer-fine:h-7 pointer-fine:text-xs"
+              className={`${fieldLook} h-8 min-w-0 flex-1 rounded-md px-2 text-base pointer-fine:h-7 pointer-fine:text-xs`}
             />
             <button
               type="submit"

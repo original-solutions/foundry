@@ -10,6 +10,7 @@
 //!   cannot read, one a newer build wrote before a rollback, leaves out its owner's changes up
 //!   to it, with a warning, and the socket goes on.
 //! - `GET /api/terminals/{id}`, a WebSocket: see [`terminals`].
+//! - `GET /api/machine`: `{id}`, the machine that serves the UI, see [`machine`].
 //! - `GET /api/machines`: `{me, machines: [{id, name, online}]}`, this machine's id and each
 //!   machine in the machine list, in its order, with whether it is online.
 //! - `POST /api/workspaces` `{project, base, name, machine}`: makes a workspace, `201 {id}`, on
@@ -18,8 +19,9 @@
 //!   `id` saying so: the workspace exists, and the id is how to reach it.
 //! - `POST /api/workspaces/{id}/archive` `{force}` (the body is optional): `204`, or `409` with
 //!   the uncommitted files, unpushed commits and submodules that hold it up.
-//! - `POST /api/workspaces/{id}/sessions` `{model}`: starts Claude Code in the workspace, `201
-//!   {id}`.
+//! - `POST /api/workspaces/{id}/sessions` `{model, prompt}` (`prompt` is optional): starts
+//!   Claude Code in the workspace, on `prompt` as its first prompt when one is given, `201 {id}`.
+//!   A blank prompt is none; one with a NUL or over 20,000 characters is `422`.
 //! - `POST /api/workspaces/{id}/shells`: starts the daemon's `$SHELL` in the workspace, `201
 //!   {id}`.
 //! - `POST /api/terminals/{id}/close`: `204`.
@@ -31,6 +33,10 @@
 //!   its path, see [`files`].
 //! - `GET /api/workspaces/{id}/changes`: what the workspace changed since its base, see
 //!   [`changes`]. Only a workspace of this machine; any other is `404`.
+//! - `GET /api/workspaces/{id}/commits/{hash}`: what one commit on the workspace's branch
+//!   changed, see [`changes`]. Only a workspace of this machine.
+//! - `GET /api/workspaces/{id}/pr`: whether the workspace's branch is on `origin`, what is only
+//!   on this machine, and its pull request, see [`pr`]. Only a workspace of this machine.
 //! - `GET /api/briefs`: what each session of this machine is for and doing, see [`briefs`].
 //! - `GET /api/sessions/{id}/trail`: every step a session of this machine took, see [`trail`].
 //!

@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { fieldLook } from "./Modal";
 import { socketUrl } from "./socket";
 
 /**
@@ -84,7 +85,7 @@ export function Said({ said, name, terminal, canReply }: { said: string; name: s
               e.stopPropagation();
               close();
             }}
-            className="h-8 min-w-0 flex-1 rounded-md border border-neutral-700 bg-neutral-950 px-2 text-base pointer-fine:h-7 pointer-fine:text-xs text-neutral-100 placeholder:text-neutral-500 focus:border-sky-400/70 focus:outline-none"
+            className={`${fieldLook} h-8 min-w-0 flex-1 rounded-md px-2 text-base pointer-fine:h-7 pointer-fine:text-xs`}
           />
           <button
             type="submit"

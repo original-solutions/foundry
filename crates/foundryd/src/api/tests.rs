@@ -1402,19 +1402,24 @@ async fn every_route_refuses_another_site_and_another_host_and_does_nothing() {
     let trail = format!("/api/sessions/{}/trail", SessionId::random());
     let changes = format!("/api/workspaces/{workspace}/changes");
     let shipping = format!("/api/workspaces/{workspace}/pr");
+    let commit = format!("/api/workspaces/{workspace}/commits/0000000");
+    let files = format!("/api/terminals/{live}/files?name=x.txt");
     let routes: Vec<(&str, &str, Option<serde_json::Value>, bool)> = vec![
         ("GET", "/api/state", None, false),
         ("GET", "/api/events", None, true),
         ("GET", &socket, None, true),
         ("POST", &close, None, false),
+        ("POST", &files, Some(serde_json::json!("sent")), false),
         ("POST", "/api/workspaces", Some(create), false),
         ("POST", &archive, Some(force), false),
         ("POST", &sessions, Some(model), false),
         ("POST", &shells, None, false),
         ("GET", "/api/briefs", None, false),
         ("GET", "/api/machine", None, false),
+        ("GET", "/api/machines", None, false),
         ("GET", &trail, None, false),
         ("GET", &changes, None, false),
+        ("GET", &commit, None, false),
         ("GET", &shipping, None, false),
     ];
     for (method, path, body, upgrade) in routes {
@@ -1446,6 +1451,12 @@ async fn every_route_refuses_another_site_and_another_host_and_does_nothing() {
         "a refused request changed a record"
     );
     assert!(worktree.exists(), "a refused archive removed the worktree");
+    let sent = daemon
+        .data
+        .path()
+        .join("terminals")
+        .join(format!("{live}.files"));
+    assert!(!sent.exists(), "a refused file was kept");
     let (mut socket, _) = tokio_tungstenite::connect_async(daemon.ws_url(&socket))
         .await
         .unwrap();

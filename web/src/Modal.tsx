@@ -7,8 +7,16 @@ export const pressed = "aria-pressed:border-sky-400/50 aria-pressed:bg-sky-400/1
 /** The shared button for the one action a form is for. */
 export const primaryButton =
   "rounded border border-emerald-400 bg-emerald-400 px-2 py-0.5 text-xs font-semibold text-neutral-950 hover:border-emerald-300 hover:bg-emerald-300 disabled:opacity-50";
-/** The shared field look: a dark box whose border lightens on focus, beside the browser's focus ring. */
-const box = "rounded border border-neutral-600 bg-neutral-950 text-neutral-100 placeholder:text-neutral-600 focus:border-neutral-400";
+/** `primaryButton` for an action that destroys something: ending a terminal, archiving work that would be lost. */
+export const dangerButton =
+  "rounded border border-red-400 bg-red-400 px-2 py-0.5 text-xs font-semibold text-neutral-950 hover:border-red-300 hover:bg-red-300 disabled:opacity-50";
+/**
+ * The shared field look, without a shape or a size: a dark box whose border lightens on focus,
+ * beside the browser's focus ring. A field shaped its own way (a reply beside a send button, a
+ * pill) is built from it, so every field keeps one focus treatment.
+ */
+export const fieldLook = "border border-neutral-600 bg-neutral-950 text-neutral-100 placeholder:text-neutral-600 focus:border-neutral-400";
+const box = `rounded ${fieldLook}`;
 export const field = `mt-1 w-full ${box} px-2 py-1 text-sm`;
 /** `field` inside a line of small text. */
 export const inlineField = `${box} px-1.5 py-0.5 font-mono`;

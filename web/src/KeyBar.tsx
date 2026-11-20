@@ -1,6 +1,7 @@
 import { useState, type ReactNode } from "react";
 import { keyData, keysFor } from "./keys";
 import type { Glyph } from "./labels";
+import { fieldLook } from "./Modal";
 
 /**
  * The touch screen's way to drive a terminal: a row of the keys a phone keyboard lacks (with
@@ -97,7 +98,7 @@ export function KeyBar({
           autoCapitalize={shell ? "off" : "sentences"}
           autoCorrect={shell ? "off" : "on"}
           spellCheck={!shell}
-          className="h-10 min-w-0 flex-1 rounded-full border border-neutral-800 bg-neutral-900 px-4 text-[16px] text-neutral-100 placeholder:text-neutral-500 focus:border-sky-500/60 focus:outline-none"
+          className={`${fieldLook} h-10 min-w-0 flex-1 rounded-full px-4 text-[16px]`}
         />
         <button
           type="submit"

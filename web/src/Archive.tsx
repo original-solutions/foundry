@@ -6,7 +6,7 @@ import { changesQuery } from "./ChangesPanel";
 import { splitPath } from "./changes";
 import { rows, type WorkspaceView } from "./fleet";
 import { couldNot, plural, words, type Glyph } from "./labels";
-import { button, Modal } from "./Modal";
+import { button, dangerButton, Modal, primaryButton } from "./Modal";
 import { Named } from "./Now";
 import { glyphText, StateGlyph } from "./StateGlyph";
 
@@ -143,11 +143,7 @@ export function ArchiveDialog({ workspace, onClose, onArchived }: { workspace: W
           type="button"
           onClick={() => archive.mutate(blockers !== null)}
           disabled={archive.isPending}
-          className={
-            risky
-              ? "rounded bg-red-400 px-3 py-0.5 text-xs font-semibold text-neutral-950 hover:bg-red-300 disabled:opacity-50"
-              : "rounded bg-neutral-100 px-3 py-0.5 text-xs font-semibold text-neutral-950 hover:bg-neutral-300 disabled:opacity-50"
-          }
+          className={risky ? dangerButton : primaryButton}
         >
           {blockers ? "Archive anyway" : "Archive"}
         </button>

@@ -2,7 +2,8 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createMemoryHistory, createRootRoute, createRoute, createRouter, RouterProvider } from "@tanstack/react-router";
 import { render } from "@testing-library/react";
 import type { ReactNode } from "react";
-import { vi } from "vitest";
+import { expect, vi } from "vitest";
+import { fieldLook } from "./Modal";
 
 /** Renders `ui` inside a query client and a router that knows the terminal route, so links resolve. Gives back the query client too. */
 export async function renderApp(ui: ReactNode) {
@@ -23,6 +24,13 @@ export async function renderApp(ui: ReactNode) {
 }
 
 export type Call = { url: string; method: string; body: unknown };
+
+/** Fails unless `element` is built from the shared field look, so it keeps its focus border and the browser's focus ring. */
+export function expectFieldLook(element: HTMLElement) {
+  const classes = element.className.split(" ");
+  expect(classes).toEqual(expect.arrayContaining(fieldLook.split(" ")));
+  expect(classes).not.toContain("focus:outline-none");
+}
 
 /**
  * Stubs `fetch` to give `answers` in order, and returns the requests it was sent. The layout's read

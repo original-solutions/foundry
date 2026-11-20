@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { UiMessage } from "./api";
 import { apply, emptyState } from "./fleet";
+import { reloadIfStale } from "./fresh";
 import { remember, type History } from "./samples";
 import { Backoff, socketUrl } from "./socket";
 
@@ -21,7 +22,8 @@ export interface Link {
 /**
  * The synced state from `/api/events`, reconnecting with a short backoff after a close, and each
  * machine's samples as they arrived while this page was open (up to `SAMPLES_WINDOW`), and the
- * link: lost from a close until the daemon sends something again.
+ * link: lost from a close until the daemon sends something again. Each time the socket opens
+ * again, the page reloads if the daemon now serves a newer bundle (`reloadIfStale`).
  */
 export function useFleet() {
   const [state, setState] = useState(emptyState);
@@ -36,11 +38,16 @@ export function useFleet() {
     let socket: WebSocket | undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const backoff = new Backoff();
+    let opened = false;
 
     const open = () => {
       timer = undefined;
       socket = new WebSocket(socketUrl("/api/events"));
-      socket.onopen = () => setConnected(true);
+      socket.onopen = () => {
+        setConnected(true);
+        if (opened) void reloadIfStale();
+        opened = true;
+      };
       socket.onmessage = (event) => {
         // The backoff resets only once the daemon has sent something, so a socket that opens and
         // fails at once is not retried every 500 ms.

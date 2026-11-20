@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Changes } from "./api";
 import { ChangesPanel } from "./ChangesPanel";
 import { loadViewed, saveViewed, seen } from "./review";
-import { FakeSocket, json, mockFetch, renderApp } from "./test-utils";
+import { expectFieldLook, FakeSocket, json, mockFetch, renderApp } from "./test-utils";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -221,6 +221,7 @@ describe("ChangesPanel", () => {
       const file = await within(panel).findByRole("region", { name: "src/login.ts" });
       fireEvent.click(within(file).getByRole("button", { name: "Comment on line 6" }));
       const box = within(file).getByRole("textbox", { name: "Comment on line 6" });
+      expectFieldLook(box);
       fireEvent.change(box, { target: { value: "call it total" } });
       fireEvent.keyDown(box, { key: "Enter", metaKey: true });
       return { ...view, panel, file };

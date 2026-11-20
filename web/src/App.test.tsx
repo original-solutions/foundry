@@ -5,7 +5,7 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { machineQuery, type Briefs, type Changes, type Shipping, type UiMessage } from "./api";
 import { router, routeTree } from "./App";
-import { button, pressed } from "./Modal";
+import { button, dangerButton, pressed } from "./Modal";
 import { keep, KEEP_AFTER, recall } from "./memory";
 import { nextSteps } from "./next";
 import { ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
@@ -824,6 +824,7 @@ describe("App", () => {
     const dialog = await screen.findByRole("dialog", { name: "End sonnet?" });
     expect(dialog.textContent).toMatch(/middle of a turn/);
     expect(calls).toEqual([]);
+    expect(within(dialog).getByRole("button", { name: "End" }).className).toBe(dangerButton);
     fireEvent.click(within(dialog).getByRole("button", { name: "End" }));
     await waitFor(() => expect(calls).toEqual([{ url: "/api/terminals/t1/close", method: "POST", body: undefined }]));
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());

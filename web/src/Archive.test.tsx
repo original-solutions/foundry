@@ -1,8 +1,9 @@
-import { fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Changes } from "./api";
 import { ArchiveDialog } from "./Archive";
 import { fleet, type WorkspaceView } from "./fleet";
+import { dangerButton, primaryButton } from "./Modal";
 import { ME, session, settings, terminal, workspace } from "./test-fixtures";
 import { json, renderApp, type Call } from "./test-utils";
 
@@ -103,6 +104,21 @@ describe("ArchiveDialog", () => {
     await waitFor(() => expect(kept.textContent).toMatch(/No commits since main/));
   });
 
+  it("confirms with the shared danger button while work would be lost or cut, and the shared primary one otherwise", async () => {
+    stub(() => json(200, changes));
+    let dialog = await show();
+    expect(await within(dialog).findByText("README.md")).toBeDefined();
+    expect(within(dialog).getByRole("button", { name: "Archive" }).className).toBe(dangerButton);
+    cleanup();
+
+    stub(() => json(200, { ...changes, files: [file("src/login.ts", 30, 4)] }));
+    const quiet = fleet([workspace(ME, "w1", "fix login"), terminal(ME, "t1", "w1"), session(ME, "s1", "w1", "t1", "idle")], settings())[0].workspaces[0];
+    await renderApp(<ArchiveDialog workspace={quiet} onClose={vi.fn()} onArchived={vi.fn()} />);
+    dialog = await screen.findByRole("dialog", { name: "Archive fix login?" });
+    expect(await within(dialog).findByText("Every change is committed.")).toBeDefined();
+    expect(within(dialog).getByRole("button", { name: "Archive" }).className).toBe(primaryButton);
+  });
+
   it("still archives when its changes cannot be read, and says they could not be", async () => {
     const calls = stub(() => json(500, { error: "git broke" }), new Response(null, { status: 204 }));
     const dialog = await show();
@@ -138,6 +154,7 @@ describe("ArchiveDialog", () => {
     expect(held.textContent).toContain("src/a.rs");
     expect(held.textContent).toContain("abc123 wip");
     expect(held.textContent).toContain("vendor/x");
+    expect(within(dialog).getByRole("button", { name: "Archive anyway" }).className).toBe(dangerButton);
 
     fireEvent.click(within(dialog).getByRole("button", { name: "Archive anyway" }));
 

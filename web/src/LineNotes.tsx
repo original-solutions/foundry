@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import type { SessionView } from "./fleet";
-import { button, primaryButton } from "./Modal";
+import { button, fieldLook, primaryButton } from "./Modal";
 import { review, takers, type Note } from "./notes";
 import { busy, plural } from "./labels";
 import { reply } from "./Said";
@@ -29,7 +29,7 @@ export function NoteBox({ name, initial, onSave, onCancel }: { name: string; ini
               save();
             }
           }}
-          className="block w-full resize-y rounded border border-neutral-700 bg-neutral-900 px-2 py-1.5 text-base text-neutral-100 placeholder:text-neutral-500 focus:border-sky-400/70 focus:outline-none pointer-fine:text-xs"
+          className={`${fieldLook} block w-full resize-y rounded px-2 py-1.5 text-base pointer-fine:text-xs`}
         />
         <div className="mt-2 flex items-center justify-end gap-2">
           <span className="mr-auto hidden text-[11px] text-neutral-500 pointer-fine:inline">⌘↵ to add · Esc to cancel</span>

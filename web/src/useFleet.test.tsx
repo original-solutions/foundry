@@ -4,6 +4,9 @@ import type { UiMessage } from "./api";
 import { sample, settings, workspace, ME } from "./test-fixtures";
 import { FakeSocket } from "./test-utils";
 import { useFleet } from "./useFleet";
+import { reloadIfStale } from "./fresh";
+
+vi.mock("./fresh", () => ({ reloadIfStale: vi.fn(async () => {}) }));
 
 function Probe() {
   const { state, connected } = useFleet();
@@ -82,6 +85,18 @@ describe("useFleet", () => {
     act(() => second.open());
     act(() => second.deliver(stateMessage([])));
     expect(screen.getByText("connected 0 records")).toBeDefined();
+  });
+
+  it("checks for a newer bundle each time the socket opens again, never on the first open", () => {
+    vi.mocked(reloadIfStale).mockClear();
+    render(<Probe />);
+    act(() => FakeSocket.last().open());
+    expect(reloadIfStale).not.toHaveBeenCalled();
+
+    act(() => FakeSocket.last().end(1006));
+    act(() => vi.advanceTimersByTime(500));
+    act(() => FakeSocket.last().open());
+    expect(reloadIfStale).toHaveBeenCalledOnce();
   });
 
   it("backs off while sockets open and close before sending anything", () => {

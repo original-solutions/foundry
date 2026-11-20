@@ -6,7 +6,7 @@ import type { Changes } from "./api";
 import { nextSteps } from "./next";
 import { TerminalPane } from "./TerminalPane";
 import type { Glyph } from "./labels";
-import { FakeSocket, json } from "./test-utils";
+import { expectFieldLook, FakeSocket, json } from "./test-utils";
 
 // jsdom cannot run xterm.js, so a stand-in records what the pane does to its screen.
 const screenOps = vi.hoisted(() => ({
@@ -392,6 +392,7 @@ describe("TerminalPane", () => {
       act(() => socket.open());
 
       const box = screen.getByRole("textbox", { name: "Message opus" });
+      expectFieldLook(box);
       fireEvent.change(box, { target: { value: "say hi" } });
       fireEvent.click(screen.getByRole("button", { name: "Send" }));
 

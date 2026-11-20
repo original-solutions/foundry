@@ -5,6 +5,7 @@ import { fleet } from "./fleet";
 import { MAX_TOASTS, TOAST_MS } from "./news";
 import { useAlerts } from "./AlertsBell";
 import { Toasts } from "./Toasts";
+import { expectFieldLook } from "./test-utils";
 import { ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
 
 const sent: { id: string; text: string }[] = [];
@@ -156,6 +157,7 @@ describe("Toasts", () => {
     move(fleetAt({ s1: "idle" }));
     refuse = true;
     const box = within(card("fix login: opus finished its turn")).getByRole("textbox", { name: "Reply to opus" });
+    expectFieldLook(box);
     fireEvent.change(box, { target: { value: "hello" } });
     await act(async () => {
       fireEvent.submit(box);

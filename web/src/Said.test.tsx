@@ -1,7 +1,7 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Said } from "./Said";
-import { FakeSocket } from "./test-utils";
+import { expectFieldLook, FakeSocket } from "./test-utils";
 
 const answer = "Done. I fixed the login check.\n\nAll 12 tests pass.";
 
@@ -19,7 +19,7 @@ describe("Said", () => {
     fireEvent.click(quote);
     expect(quote.getAttribute("aria-expanded")).toBe("true");
     expect(quote.className).not.toContain("line-clamp-3");
-    expect(screen.getByRole("textbox", { name: "Reply to opus" })).toBeDefined();
+    expectFieldLook(screen.getByRole("textbox", { name: "Reply to opus" }));
   });
 
   it("types a reply into the session's terminal and presses Enter, then closes", async () => {
