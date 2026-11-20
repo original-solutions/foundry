@@ -1,10 +1,10 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createMemoryHistory, createRootRoute, createRoute, createRouter, RouterProvider } from "@tanstack/react-router";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createContext, useContext } from "react";
 import type { AnyRecord, Changes, SessionState } from "./api";
-import { Board } from "./Board";
+import { Board, BOARD_BUSY_EVERY } from "./Board";
 import { fleet, type MachineView } from "./fleet";
 import { ME, sample, session, settings, terminal, workspace } from "./test-fixtures";
 import { json } from "./test-utils";
@@ -35,9 +35,35 @@ const records = (state: SessionState = "working"): AnyRecord[] => [
 
 const answers: Record<string, () => Response> = {};
 let reads: string[] = [];
+const readsOf = (workspace: string) => reads.filter((u) => u.includes(`/${workspace}/`)).length;
+
+/** The cards the board watches, and whether a card starts on screen. */
+let watched: { element: Element; seen: (entries: Partial<IntersectionObserverEntry>[]) => void }[] = [];
+let startOnScreen = true;
+class FakeObserver {
+  constructor(private seen: (entries: Partial<IntersectionObserverEntry>[]) => void) {}
+  observe(element: Element) {
+    watched.push({ element, seen: this.seen });
+    if (startOnScreen) this.seen([{ target: element, isIntersecting: true }]);
+  }
+  unobserve() {}
+  disconnect() {
+    watched = watched.filter((w) => w.seen !== this.seen);
+  }
+}
+/** Scrolls the card for `name` onto or off the screen. */
+function scroll(name: string, onScreen: boolean) {
+  const element = card(name);
+  act(() => {
+    for (const w of watched.filter((w) => w.element === element)) w.seen([{ target: element, isIntersecting: onScreen }]);
+  });
+}
 
 beforeEach(() => {
   reads = [];
+  watched = [];
+  startOnScreen = true;
+  vi.stubGlobal("IntersectionObserver", FakeObserver);
   answers["/api/workspaces/w1/changes"] = () =>
     json(200, {
       base: "main",
@@ -55,7 +81,10 @@ beforeEach(() => {
   );
 });
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.useRealTimers();
+  vi.unstubAllGlobals();
+});
 
 const Machines = createContext<MachineView[]>([]);
 
@@ -133,5 +162,41 @@ describe("Board", () => {
     const before = reads.filter((u) => u.includes("/w1/")).length;
     update(fleet(records("failed"), settings()));
     await waitFor(() => expect(reads.filter((u) => u.includes("/w1/")).length).toBe(before + 1));
+  });
+
+  it("reads a card's changes only once the card is on screen", async () => {
+    startOnScreen = false;
+    await show(fleet(records(), settings()));
+    await act(async () => {});
+    expect(reads).toEqual([]);
+    expect(within(card("fix login")).getByText(/reading changes/i)).toBeDefined();
+    scroll("fix login", true);
+    await waitFor(() => expect(within(card("fix login")).getByText("+34")).toBeDefined());
+    expect(readsOf("w1")).toBe(1);
+    expect(readsOf("w2")).toBe(0);
+  });
+
+  it("reads a card again on a timer only while an agent in it works, and never a quiet one", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    await show(fleet(records("working"), settings()));
+    await waitFor(() => expect(within(card("tidy readme")).getByText("No changes yet")).toBeDefined());
+    const working = readsOf("w1");
+    const waiting = readsOf("w2");
+    const twoMinutes = 120_000;
+    await act(() => vi.advanceTimersByTimeAsync(twoMinutes + 100));
+    expect(readsOf("w1")).toBe(working + Math.floor(twoMinutes / BOARD_BUSY_EVERY));
+    expect(readsOf("w2")).toBe(waiting);
+  });
+
+  it("reads a card whose terminal changed state off screen when it comes back on screen, not before", async () => {
+    const { update } = await show(fleet(records("waiting_for_you"), settings()));
+    await waitFor(() => expect(within(card("fix login")).getByText("+34")).toBeDefined());
+    const before = readsOf("w1");
+    scroll("fix login", false);
+    update(fleet(records("failed"), settings()));
+    await act(async () => {});
+    expect(readsOf("w1")).toBe(before);
+    scroll("fix login", true);
+    await waitFor(() => expect(readsOf("w1")).toBe(before + 1));
   });
 });

@@ -1,6 +1,6 @@
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
-import { useEffect, useId, useRef } from "react";
+import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { lanes, topFiles, type Card, type Lane } from "./lanes";
 import { changesQuery } from "./ChangesPanel";
 import { splitPath, totals } from "./changes";
@@ -9,9 +9,12 @@ import { jumpKey, SearchIcon } from "./JumpPalette";
 import type { Glyph } from "./labels";
 import { glyphText, StateGlyph } from "./StateGlyph";
 
-/** How often a card reads its workspace's changes while an agent in it works, and otherwise. */
-export const BOARD_BUSY_EVERY = 5_000;
-export const BOARD_QUIET_EVERY = 30_000;
+/**
+ * How often a card on screen reads its workspace's changes while an agent in it works. A quiet
+ * card is read when it comes on screen and when one of its terminals changes state, never on a
+ * timer: each read runs git several times, and a fleet has dozens of workspaces.
+ */
+export const BOARD_BUSY_EVERY = 30_000;
 
 /** A card shows this many terminals, then says how many more. */
 const ROWS_SHOWN = 4;
@@ -122,12 +125,28 @@ function LaneSection({ lane, count, children }: { lane: Lane; count: number; chi
   );
 }
 
+/** Whether the element is on screen, or near it; always true where the browser cannot tell. */
+function useOnScreen<T extends Element>() {
+  const ref = useRef<T>(null);
+  const [onScreen, setOnScreen] = useState(() => typeof IntersectionObserver === "undefined");
+  useLayoutEffect(() => {
+    const element = ref.current;
+    if (!element || typeof IntersectionObserver === "undefined") return;
+    const observer = new IntersectionObserver((entries) => setOnScreen(entries[entries.length - 1].isIntersecting), { rootMargin: "200px" });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+  return [ref, onScreen] as const;
+}
+
 function WorkspaceCard({ card, showMachine, onChanges }: { card: Card; showMachine: boolean; onChanges: (workspace: string) => void }) {
   const id = useId();
+  const [ref, onScreen] = useOnScreen<HTMLElement>();
   const { workspace, machine, rows, lead } = card;
   const shown = rows.slice(0, ROWS_SHOWN);
   return (
     <article
+      ref={ref}
       aria-labelledby={id}
       className="relative flex flex-col overflow-hidden rounded-xl border border-neutral-800 bg-neutral-900/60 transition-colors hover:border-neutral-700"
     >
@@ -170,31 +189,37 @@ function WorkspaceCard({ card, showMachine, onChanges }: { card: Card; showMachi
         {rows.length > shown.length && <li className="px-2 py-1 text-xs text-neutral-500">+{rows.length - shown.length} more</li>}
         {rows.length === 0 && <li className="px-2 py-1 text-xs text-neutral-500">No terminals</li>}
       </ul>
-      <ChangesFooter card={card} onOpen={() => onChanges(workspace.id)} />
+      <ChangesFooter card={card} onScreen={onScreen} onOpen={() => onChanges(workspace.id)} />
     </article>
   );
 }
 
 /**
- * What the workspace changed since its base, read as the sheet reads it: often while an agent in
- * it works, now and then otherwise, and again whenever one of its terminals changes state, so the
- * end of a turn shows what the turn wrote. A workspace the daemon cannot read here says so and is
- * not asked again.
+ * What the workspace changed since its base, read as the sheet reads it, but only while the card
+ * is on screen: when it comes on screen, whenever one of its terminals changes state (so the end
+ * of a turn shows what the turn wrote), and every `BOARD_BUSY_EVERY` while an agent in it works.
+ * A state change off screen is read when the card comes back. A workspace the daemon cannot read
+ * here says so and is not asked again on a timer.
  */
-function ChangesFooter({ card, onOpen }: { card: Card; onOpen: () => void }) {
+function ChangesFooter({ card, onScreen, onOpen }: { card: Card; onScreen: boolean; onOpen: () => void }) {
   const busy = card.rows.some((r) => r.glyph === "working");
-  const { data, error, refetch } = useQuery({
-    ...changesQuery(card.workspace.id),
+  const workspace = card.workspace.id;
+  const client = useQueryClient();
+  const { data, error } = useQuery({
+    ...changesQuery(workspace),
+    enabled: onScreen,
+    staleTime: BOARD_BUSY_EVERY,
     retry: false,
-    refetchInterval: (query) => (query.state.status === "error" ? false : busy ? BOARD_BUSY_EVERY : BOARD_QUIET_EVERY),
+    refetchInterval: (q) => (busy && q.state.status !== "error" ? BOARD_BUSY_EVERY : false),
   });
   const states = card.rows.map((r) => `${r.terminal}:${r.glyph}`).join(" ");
   const last = useRef(states);
   useEffect(() => {
     if (last.current === states) return;
     last.current = states;
-    void refetch();
-  }, [states, refetch]);
+    // Read now if on screen; otherwise marked out of date, and read when it comes on screen.
+    void client.invalidateQueries({ queryKey: changesQuery(workspace).queryKey, exact: true });
+  }, [states, client, workspace]);
 
   let body: React.ReactNode;
   if (error) body = <span className="text-neutral-500">Changes not readable from here</span>;

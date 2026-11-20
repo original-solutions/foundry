@@ -176,7 +176,7 @@ A P3 diff view, built early on a read the daemon already had. `GET /api/workspac
 
 ### The board
 
-A P3 overview on the same read. With no terminal open, the UI shows every workspace as a card in three lanes by its most urgent terminal: needs you (waiting, stuck or failed), working (working or starting) and quiet. A card lists its terminals with their states and what the workspace changed since its base. It reads the changes every few seconds while an agent in it works, now and then otherwise, and again when one of its terminals changes state. A workspace whose changes cannot be read from this machine says so.
+A P3 overview on the same read. With no terminal open, the UI shows every workspace as a card in three lanes by its most urgent terminal: needs you (waiting, stuck or failed), working (working or starting) and quiet. A card lists its terminals with their states and what the workspace changed since its base. A card reads the changes only while it is on screen: when it comes on screen, when one of its terminals changes state, and every half minute while an agent in it works. A quiet card is not read on a timer, so a fleet of dozens of workspaces does not keep git running. A workspace whose changes cannot be read from this machine says so.
 
 ## Placement
 
