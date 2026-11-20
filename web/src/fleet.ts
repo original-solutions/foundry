@@ -1,4 +1,5 @@
 import type { AnyRecord, MachineSample, SessionState, SharedSettings, TerminalState, UiMessage } from "./api";
+import { sessionLabel, sessionTone, terminalLabel, terminalTone, type Tone } from "./labels";
 
 export interface FleetState {
   records: AnyRecord[];
@@ -117,6 +118,27 @@ export function fleet(records: AnyRecord[], settings: SharedSettings): MachineVi
       workspaces,
     };
   });
+}
+
+/** Where terminal `id` sits in the fleet, with the name and state the sidebar gives it. */
+export interface Located {
+  machine: MachineView;
+  workspace: WorkspaceView;
+  name: string;
+  label: string;
+  tone: Tone;
+}
+
+export function locate(machines: MachineView[], id: string): Located | undefined {
+  for (const machine of machines) {
+    for (const workspace of machine.workspaces) {
+      const session = workspace.sessions.find((s) => s.terminal === id);
+      if (session) return { machine, workspace, name: session.model, label: sessionLabel[session.state], tone: sessionTone[session.state] };
+      const shell = workspace.shells.find((t) => t.id === id);
+      if (shell) return { machine, workspace, name: "shell", label: terminalLabel(shell.state, shell.exitCode), tone: terminalTone(shell.state, shell.exitCode) };
+    }
+  }
+  return undefined;
 }
 
 /** The numbers line of `foundryd status`. */

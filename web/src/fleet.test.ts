@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { AnyRecord, UiMessage } from "./api";
-import { apply, emptyState, fleet, machineNumbers, terminalRunning } from "./fleet";
+import { apply, emptyState, fleet, locate, machineNumbers, terminalRunning } from "./fleet";
 import { ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
 
 const full = (records: AnyRecord[]): UiMessage => ({ type: "state", protocol: 1, records, settings: settings() });
@@ -155,5 +155,42 @@ describe("terminalRunning", () => {
     expect(terminalRunning(state, "gone")).toBe(false);
     expect(terminalRunning(state, "away")).toBe(false);
     expect(terminalRunning(state, "never")).toBe(false);
+  });
+});
+
+describe("locate", () => {
+  const machines = fleet(
+    [
+      sample(ME, 1),
+      workspace(ME, "w1", "fix login"),
+      terminal(ME, "t1", "w1", "running"),
+      session(ME, "s1", "w1", "t1", "waiting_for_you", { model: "sonnet" }),
+      terminal(ME, "sh1", "w1", "exited", { exit_code: 2 }),
+      workspace(OTHER, "w2", "docs"),
+      terminal(OTHER, "sh2", "w2", "unreachable"),
+    ],
+    settings({ machines: [{ id: ME, name: "studio", address: "" }, { id: OTHER, name: "laptop", address: "" }] }),
+  );
+
+  it("finds a session's terminal with its workspace, machine, name and state", () => {
+    const found = locate(machines, "t1");
+    expect(found && { machine: found.machine.name, workspace: found.workspace.name, name: found.name, label: found.label, tone: found.tone }).toEqual({
+      machine: "studio",
+      workspace: "fix login",
+      name: "sonnet",
+      label: "Waiting for you",
+      tone: "attention",
+    });
+  });
+
+  it("finds a shell, named shell, with its exit code in the label", () => {
+    const found = locate(machines, "sh1");
+    expect(found && [found.name, found.label, found.tone]).toEqual(["shell", "Exited 2", "bad"]);
+    const away = locate(machines, "sh2");
+    expect(away && [away.machine.name, away.workspace.name, away.label, away.tone]).toEqual(["laptop", "docs", "Unreachable", "away"]);
+  });
+
+  it("finds nothing for a terminal that is not listed", () => {
+    expect(locate(machines, "nope")).toBeUndefined();
   });
 });
