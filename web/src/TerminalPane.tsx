@@ -88,7 +88,6 @@ export function TerminalPane({ id, running }: { id: string; running: boolean | u
         if (stopped) return;
         if (opened && event.code === 1000) return setStatus("Exited");
         if (opened && event.code === 1011) return setStatus(event.reason || "The terminal ended with an error");
-        if (gone()) return;
         if (opened && event.code === 1013) return again(200);
         if (!attached) {
           missedSince ??= Date.now();
