@@ -576,10 +576,9 @@ async fn the_daemon_dials_a_peer_through_the_key_handshake() {
         });
     });
     // The daemon listens on 127.0.0.1 and Tailscale addresses only, so this port is free here.
-    let Ok(listener) = tokio::net::TcpListener::bind(("::1", fixture.port)).await else {
-        eprintln!("skipped: ::1 is not available on this machine");
-        return;
-    };
+    let listener = tokio::net::TcpListener::bind(("::1", fixture.port))
+        .await
+        .expect("::1 must be bindable for this test: it plays the peer at address ::1");
     fixture.start();
 
     let first = tokio::time::timeout(Duration::from_secs(20), async {
@@ -598,4 +597,40 @@ async fn the_daemon_dials_a_peer_through_the_key_handshake() {
 
     let said: serde_json::Value = serde_json::from_str(&first).unwrap();
     assert_eq!(said["type"], "challenge", "first frame: {first}");
+}
+
+#[test]
+fn a_port_already_in_use_exits_1_and_names_the_address() {
+    let fixture = Fixture::new();
+    let taken = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = taken.local_addr().unwrap().port();
+
+    let mut daemon = fixture
+        .command(port, &["run"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let end = Instant::now() + WAIT;
+    let exit = loop {
+        if let Some(exit) = daemon.try_wait().unwrap() {
+            break Some(exit);
+        }
+        if Instant::now() > end {
+            let _ = daemon.kill();
+            let _ = daemon.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let exit = exit.expect("the daemon kept running on a port that is taken");
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(&mut daemon.stderr.take().unwrap(), &mut stderr).unwrap();
+
+    assert_eq!(exit.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains(&format!("127.0.0.1:{port}")),
+        "stderr: {stderr}"
+    );
 }

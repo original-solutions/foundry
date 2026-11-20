@@ -548,7 +548,7 @@ mod tests {
     }
 
     #[test]
-    fn the_daemon_listens_on_loopback_first_then_tailscale_addresses() {
+    fn the_daemon_listens_on_tailscale_addresses_only_each_once() {
         let found = [
             ip("192.168.1.20"),
             ip("100.101.102.103"),
@@ -564,7 +564,6 @@ mod tests {
         assert_eq!(
             listening,
             vec![
-                "127.0.0.1:7433".parse().unwrap(),
                 "100.101.102.103:7433".parse().unwrap(),
                 "[fd7a:115c:a1e0::1]:7433".parse().unwrap(),
             ]
@@ -572,11 +571,13 @@ mod tests {
     }
 
     #[test]
-    fn with_no_tailscale_the_daemon_listens_on_loopback_only() {
-        assert_eq!(
-            listen_on(9000, [ip("10.0.0.5")]),
-            vec!["127.0.0.1:9000".parse().unwrap()]
-        );
+    fn with_no_tailscale_there_is_nothing_besides_loopback_to_listen_on() {
+        assert!(listen_on(9000, [ip("10.0.0.5"), ip("127.0.0.1")]).is_empty());
+    }
+
+    #[test]
+    fn loopback_is_127_0_0_1_on_the_port() {
+        assert_eq!(loopback(9000), addr("127.0.0.1:9000"));
     }
 
     #[test]
@@ -584,6 +585,20 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         let parent = tempfile::tempdir().unwrap();
         let home = parent.path().join("a/b");
+
+        make_home(&home).unwrap();
+
+        let mode = std::fs::metadata(&home).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+    }
+
+    #[test]
+    fn a_wider_data_directory_made_by_another_command_is_tightened() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let parent = tempfile::tempdir().unwrap();
+        let home = parent.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         make_home(&home).unwrap();
 
@@ -669,7 +684,7 @@ mod tests {
     #[test]
     fn only_tailscale_addresses_not_yet_served_are_new() {
         let served: BTreeSet<SocketAddr> =
-            [addr("127.0.0.1:7433"), addr("100.101.102.103:7433")].into();
+            [addr("100.101.102.103:7433")].into();
         let found = [
             ip("100.101.102.103"),
             ip("100.64.0.9"),
@@ -687,9 +702,9 @@ mod tests {
 
     #[test]
     fn with_everything_served_nothing_is_new() {
-        let served: BTreeSet<SocketAddr> = [addr("127.0.0.1:7433")].into();
+        let served: BTreeSet<SocketAddr> = [addr("100.64.0.9:7433")].into();
 
-        assert!(new_addresses(7433, [ip("10.0.0.5")], &served).is_empty());
+        assert!(new_addresses(7433, [ip("10.0.0.5"), ip("100.64.0.9")], &served).is_empty());
     }
 
     /// What the stub router answers, so a request that got through is told from a refusal.
@@ -732,13 +747,18 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn session_starts_are_refused_with_what_is_missing_and_nothing_else_is() {
-        let port = serve_stub(refuse_sessions(stub(), "set FOUNDRY_GATEWAY_URL".into())).await;
+        let missing = Missing {
+            said: "set FOUNDRY_GATEWAY_URL".into(),
+            log: "log-only detail /data/secrets.json".into(),
+        };
+        let port = serve_stub(refuse_sessions(stub(), missing)).await;
         let base = format!("http://127.0.0.1:{port}");
 
         let (status, body) = ask("POST", &format!("{base}/api/workspaces/x/sessions"));
         assert_eq!(status, 503);
         let body: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(body["error"], "set FOUNDRY_GATEWAY_URL");
+        assert!(!body.to_string().contains("log-only"), "{body}");
 
         let shells = ask("POST", &format!("{base}/api/workspaces/x/shells"));
         assert_eq!(shells, (200, "stub shells".into()));
