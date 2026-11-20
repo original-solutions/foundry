@@ -51,14 +51,14 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-function mount(id = "t1") {
-  render(<TerminalPane id={id} />);
-  return FakeSocket.last();
+function mount(id = "t1", running: boolean | undefined = true) {
+  const view = render(<TerminalPane id={id} running={running} />);
+  return { socket: FakeSocket.last(), view };
 }
 
 describe("TerminalPane", () => {
   it("attaches to the terminal's socket, sends its size, and writes the kept screen over a reset", () => {
-    const socket = mount("t 1/x");
+    const { socket } = mount("t 1/x");
     expect(socket.url).toMatch(/\/api\/terminals\/t%201%2Fx$/);
 
     act(() => socket.open());
@@ -70,7 +70,7 @@ describe("TerminalPane", () => {
   });
 
   it("sends typed keys as bytes", () => {
-    const socket = mount();
+    const { socket } = mount();
     act(() => socket.open());
 
     act(() => screenOps.typed?.("ls\r"));
@@ -79,7 +79,7 @@ describe("TerminalPane", () => {
   });
 
   it("attaches again after a 1013 and resets for the screen it is sent again", () => {
-    const first = mount();
+    const { socket: first } = mount();
     act(() => first.open());
     act(() => first.deliver(bytes("a")));
 
@@ -94,7 +94,7 @@ describe("TerminalPane", () => {
   });
 
   it("says the terminal exited on 1000 and does not attach again", () => {
-    const socket = mount();
+    const { socket } = mount();
     act(() => socket.open());
 
     act(() => socket.end(1000, "exited"));
@@ -105,7 +105,7 @@ describe("TerminalPane", () => {
   });
 
   it("shows the reason of a 1011 and does not attach again", () => {
-    const socket = mount();
+    const { socket } = mount();
     act(() => socket.open());
 
     act(() => socket.end(1011, "holder gone"));
@@ -116,7 +116,7 @@ describe("TerminalPane", () => {
   });
 
   it("reconnects after the socket drops, as when the daemon restarts, and says so meanwhile", () => {
-    const socket = mount();
+    const { socket } = mount();
     act(() => socket.open());
 
     act(() => socket.end(1006));
@@ -130,7 +130,7 @@ describe("TerminalPane", () => {
   });
 
   it("keeps trying a terminal it cannot attach yet, and says so", () => {
-    const socket = mount();
+    const { socket } = mount();
 
     act(() => socket.end(1006));
     expect(screen.getByText(/not attached yet/i)).toBeDefined();
@@ -140,11 +140,65 @@ describe("TerminalPane", () => {
   });
 
   it("shows input the terminal refused", () => {
-    const socket = mount();
+    const { socket } = mount();
     act(() => socket.open());
 
     act(() => socket.deliver(JSON.stringify({ type: "error", error: "terminal has exited" })));
 
     expect(screen.getByText("terminal has exited")).toBeDefined();
+  });
+
+  it("keeps reconnecting after a drop for as long as its terminal is listed as running", () => {
+    const { socket } = mount();
+    act(() => socket.open());
+    act(() => socket.end(1006));
+
+    // The daemon is down for a minute: every attach fails before it opens.
+    for (let second = 0; second < 60; second += 5) {
+      act(() => vi.advanceTimersByTime(5_000));
+      act(() => FakeSocket.last().end(1006));
+    }
+    const count = FakeSocket.all.length;
+    act(() => vi.advanceTimersByTime(5_000));
+
+    expect(FakeSocket.all.length).toBeGreaterThan(count);
+    expect(screen.getByText(/reconnecting/i)).toBeDefined();
+  });
+
+  it("stops trying once its terminal is no longer listed as running, and says so", () => {
+    const { socket, view } = mount();
+    act(() => socket.open());
+
+    view.rerender(<TerminalPane id="t1" running={false} />);
+    act(() => socket.end(1013));
+    act(() => vi.advanceTimersByTime(60_000));
+
+    expect(FakeSocket.all).toHaveLength(1);
+    expect(screen.getByText(/no longer running/i)).toBeDefined();
+  });
+
+  it("gives up on a terminal it never attached to after about ten seconds", () => {
+    mount();
+
+    for (let i = 0; i < 20; i++) {
+      act(() => FakeSocket.last().end(1006));
+      act(() => vi.advanceTimersByTime(5_000));
+    }
+    const count = FakeSocket.all.length;
+    act(() => vi.advanceTimersByTime(60_000));
+
+    expect(FakeSocket.all).toHaveLength(count);
+    expect(count).toBeLessThan(10);
+    expect(screen.getByText(/not available here/i)).toBeDefined();
+  });
+
+  it("closes the old socket and attaches the new terminal when the selection changes", () => {
+    const { socket, view } = mount("t1");
+    act(() => socket.open());
+
+    view.rerender(<TerminalPane id="t2" running />);
+
+    expect(socket.readyState).toBe(FakeSocket.CLOSED);
+    expect(FakeSocket.last().url).toMatch(/\/api\/terminals\/t2$/);
   });
 });

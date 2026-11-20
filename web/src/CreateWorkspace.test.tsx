@@ -88,4 +88,40 @@ describe("CreateWorkspace", () => {
     expect(screen.queryByRole("button", { name: "Create" })).toBeNull();
     expect(screen.getByRole("button", { name: "Close" })).toBeDefined();
   });
+
+  it("offers Create again when the dialog is opened after a session that did not start", async () => {
+    mockFetch(json(201, { id: "w1" }), json(500, { error: "agent missing" }));
+    await renderApp(<CreateWorkspace projects={projects} />);
+
+    await fill("x");
+    fireEvent.click(screen.getByRole("button", { name: "Create" }));
+    await screen.findByRole("alert");
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+
+    fireEvent.click(screen.getByRole("button", { name: "New workspace" }));
+    expect(screen.getByRole("button", { name: "Create" })).toBeDefined();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("is a fresh dialog when reopened while an earlier create was still on its way", async () => {
+    let answer: (response: Response) => void = () => {};
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => new Promise<Response>((resolve) => (answer = resolve))),
+    );
+    await renderApp(<CreateWorkspace projects={projects} />);
+
+    await fill("x");
+    fireEvent.click(screen.getByRole("button", { name: "Create" }));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    fireEvent.click(screen.getByRole("button", { name: "New workspace" }));
+    answer(json(201, { id: "w1" }));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(screen.getByRole("button", { name: "Create" })).toBeDefined();
+    expect(screen.getByRole("button", { name: "Cancel" })).toBeDefined();
+  });
 });
+

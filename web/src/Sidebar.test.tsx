@@ -63,7 +63,7 @@ describe("Sidebar", () => {
     expect(within(group).getByRole("link", { name: /Running/ }).getAttribute("href")).toBe("/terminals/sh1");
     expect(within(group).getByRole("link", { name: /Exited 1/ }).getAttribute("href")).toBe("/terminals/sh2");
     expect(within(group).getAllByRole("link", { name: /Unreachable/ })).toHaveLength(2);
-    for (const name of ["New shell", "Archive"]) {
+    for (const name of ["New session", "New shell", "Archive"]) {
       expect(within(group).getByRole("button", { name })).toBeDefined();
     }
     expect(screen.getByRole("group", { name: "empty" })).toBeDefined();

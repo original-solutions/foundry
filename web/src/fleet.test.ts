@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { AnyRecord, UiMessage } from "./api";
-import { apply, emptyState, fleet, machineNumbers } from "./fleet";
+import { apply, emptyState, fleet, machineNumbers, terminalRunning } from "./fleet";
 import { ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
 
 const full = (records: AnyRecord[]): UiMessage => ({ type: "state", protocol: 1, records, settings: settings() });
@@ -119,5 +119,29 @@ describe("machineNumbers", () => {
     expect(machineNumbers({ load_per_core: 1, free_memory: 0, free_disk: 0, sessions: 1 })).toContain("1 session");
     expect(machineNumbers({ load_per_core: 1, free_memory: 0, free_disk: 0, sessions: 1 })).not.toContain("1 sessions");
     expect(machineNumbers(null)).toBe("no sample yet");
+  });
+});
+
+describe("terminalRunning", () => {
+  it("does not know before the first state arrives", () => {
+    expect(terminalRunning(emptyState, "t1")).toBeUndefined();
+    expect(terminalRunning(apply(emptyState, one(terminal(ME, "t1", "w1"))), "t1")).toBeUndefined();
+  });
+
+  it("is true only for a listed terminal that runs and is not deleted", () => {
+    const state = apply(
+      emptyState,
+      full([
+        terminal(ME, "run", "w1", "running"),
+        terminal(ME, "done", "w1", "exited", { exit_code: 0 }),
+        terminal(ME, "gone", "w1", "running", { deleted: true }),
+        terminal(OTHER, "away", "w1", "unreachable"),
+      ]),
+    );
+    expect(terminalRunning(state, "run")).toBe(true);
+    expect(terminalRunning(state, "done")).toBe(false);
+    expect(terminalRunning(state, "gone")).toBe(false);
+    expect(terminalRunning(state, "away")).toBe(false);
+    expect(terminalRunning(state, "never")).toBe(false);
   });
 });

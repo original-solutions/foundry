@@ -68,4 +68,21 @@ describe("ArchiveButton", () => {
 
     expect((await within(dialog).findByRole("alert")).textContent).toContain("disk on fire");
   });
+
+  it("asks afresh after a refusal is cancelled, without force", async () => {
+    const calls = mockFetch(json(409, { error: "held", uncommitted: ["src/a.rs"], unpushed: [], submodules: [] }), new Response(null, { status: 204 }));
+    await renderApp(<ArchiveButton workspace="w1" name="e2e work" />);
+
+    const dialog = await archive();
+    await waitFor(() => expect(dialog.textContent).toContain("src/a.rs"));
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+
+    const again = await archive();
+    expect(again.textContent).not.toContain("src/a.rs");
+    expect(within(again).queryByRole("button", { name: "Archive anyway" })).toBeNull();
+    await waitFor(() => expect(calls).toHaveLength(2));
+    expect(calls[1].body).toEqual({ force: false });
+  });
 });
+
