@@ -192,4 +192,85 @@ describe("Sidebar", () => {
       expect(within(studio).getByRole("button", { name }).getAttribute("aria-expanded")).toBe("true");
     }
   });
+  describe("with the keyboard", () => {
+    const pair = () =>
+      fleet(
+        [
+          workspace(ME, "w1", "alpha"),
+          terminal(ME, "t1", "w1"),
+          session(ME, "s1", "w1", "t1", "idle"),
+          terminal(ME, "sh1", "w1", "running"),
+          workspace(ME, "w2", "beta"),
+          terminal(ME, "sh2", "w2", "running"),
+        ],
+        settings(),
+      );
+    const ws = (name: string) => screen.getByRole("button", { name });
+    const link = (href: string) => document.querySelector<HTMLElement>(`a[href="${href}"]`)!;
+    const press = (key: string) => fireEvent.keyDown(document.activeElement!, { key });
+
+    it("is one Tab stop, and the arrows walk its workspaces and terminals", async () => {
+      await renderApp(<Sidebar machines={pair()} {...props} />);
+
+      const stops = () => [...document.querySelectorAll("[data-stop]")].filter((e) => (e as HTMLElement).tabIndex === 0);
+      expect(stops()).toEqual([ws("alpha")]);
+      expect(link("/terminals/t1").tabIndex).toBe(-1);
+
+      ws("alpha").focus();
+      press("ArrowDown");
+      expect(document.activeElement).toBe(link("/terminals/t1"));
+      press("ArrowDown");
+      expect(document.activeElement).toBe(link("/terminals/sh1"));
+      press("ArrowDown");
+      expect(document.activeElement).toBe(ws("beta"));
+      press("ArrowUp");
+      expect(document.activeElement).toBe(link("/terminals/sh1"));
+      // The one focused last is the Tab stop, so Tab comes back to it.
+      expect(stops()).toEqual([link("/terminals/sh1")]);
+      press("End");
+      expect(document.activeElement).toBe(link("/terminals/sh2"));
+      press("Home");
+      expect(document.activeElement).toBe(ws("alpha"));
+    });
+
+    it("folds with Left, unfolds with Right, and Left from a terminal goes to its workspace", async () => {
+      await renderApp(<Sidebar machines={pair()} {...props} />);
+
+      link("/terminals/sh1").focus();
+      press("ArrowLeft");
+      expect(document.activeElement).toBe(ws("alpha"));
+      press("ArrowLeft");
+      expect(ws("alpha").getAttribute("aria-expanded")).toBe("false");
+      press("ArrowRight");
+      expect(ws("alpha").getAttribute("aria-expanded")).toBe("true");
+      press("ArrowRight");
+      expect(document.activeElement).toBe(link("/terminals/t1"));
+    });
+
+    it("jumps to the next one whose name starts with what is typed", async () => {
+      await renderApp(<Sidebar machines={pair()} {...props} />);
+
+      ws("alpha").focus();
+      press("b");
+      expect(document.activeElement).toBe(ws("beta"));
+      press("o");
+      // "bo" matches nothing, so the keyboard stays.
+      expect(document.activeElement).toBe(ws("beta"));
+    });
+
+    it("makes the open terminal the Tab stop", async () => {
+      await renderApp(<Sidebar machines={pair()} selected="sh2" {...props} />);
+
+      expect(link("/terminals/sh2").tabIndex).toBe(0);
+      expect(ws("alpha").tabIndex).toBe(-1);
+    });
+
+    it("offers the list of keys", async () => {
+      const onKeys = vi.fn();
+      await renderApp(<Sidebar machines={pair()} {...props} onKeys={onKeys} />);
+
+      fireEvent.click(screen.getByRole("button", { name: /Keyboard/ }));
+      expect(onKeys).toHaveBeenCalled();
+    });
+  });
 });

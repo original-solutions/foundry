@@ -1,7 +1,7 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { SessionState } from "./api";
-import { AlertsButton, useAlerts } from "./AlertsBell";
+import { AlertsButton, Announcer, useAlerts } from "./AlertsBell";
 import { fleet } from "./fleet";
 import { ME, sample, session, settings, terminal, workspace } from "./test-fixtures";
 
@@ -24,8 +24,13 @@ const world = (state: SessionState) =>
   fleet([sample(ME, 1), workspace(ME, "w1", "tidy"), terminal(ME, "t1", "w1"), session(ME, "s1", "w1", "t1", state)], settings());
 
 function Harness({ state, onOpen }: { state: SessionState; onOpen: (terminal: string) => void }) {
-  const alerts = useAlerts(world(state), true, onOpen);
-  return <AlertsButton {...alerts} />;
+  const { spoken, ...alerts } = useAlerts(world(state), true, onOpen);
+  return (
+    <>
+      <AlertsButton {...alerts} />
+      <Announcer spoken={spoken} />
+    </>
+  );
 }
 
 let focused: boolean;
@@ -109,5 +114,32 @@ describe("useAlerts", () => {
     expect(document.title).toBe("(1) Foundry · 1 needs you");
     const icon = document.head.querySelector<HTMLLinkElement>("link[rel=icon]");
     expect(decodeURIComponent(icon?.href ?? "")).toContain("#fbbf24");
+  });
+});
+
+describe("Announcer", () => {
+  it("tells a screen reader when a session needs you or finishes, whatever the alerts are set to", () => {
+    const { rerender } = render(<Harness state="working" onOpen={() => {}} />);
+    const status = document.querySelector("[data-announcer]")!;
+    expect(status.textContent).toBe("");
+
+    rerender(<Harness state="waiting_for_you" onOpen={() => {}} />);
+    expect(status.textContent).toBe("tidy: opus is waiting for you");
+
+    rerender(<Harness state="working" onOpen={() => {}} />);
+    rerender(<Harness state="idle" onOpen={() => {}} />);
+    expect(status.textContent).toBe("tidy: opus finished its turn");
+  });
+
+  it("says the same thing again when it happens again", () => {
+    const { rerender } = render(<Harness state="working" onOpen={() => {}} />);
+    rerender(<Harness state="idle" onOpen={() => {}} />);
+    const first = document.querySelector("[data-announcer]")!.textContent;
+    rerender(<Harness state="working" onOpen={() => {}} />);
+    rerender(<Harness state="idle" onOpen={() => {}} />);
+
+    const second = document.querySelector("[data-announcer]")!.textContent;
+    expect(second?.trim()).toBe(first?.trim());
+    expect(second).not.toBe(first);
   });
 });

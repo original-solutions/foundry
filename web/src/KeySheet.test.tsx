@@ -1,0 +1,41 @@
+import { fireEvent, render, screen } from "@testing-library/react";
+import { useState } from "react";
+import { describe, expect, it } from "vitest";
+import { KeySheet, useHelpKey } from "./KeySheet";
+
+function Harness() {
+  const [open, setOpen] = useState(false);
+  useHelpKey(() => setOpen(true));
+  return (
+    <>
+      <input aria-label="Task" />
+      <div className="xterm">
+        <textarea aria-label="Terminal input" />
+      </div>
+      <KeySheet open={open} onOpenChange={setOpen} />
+    </>
+  );
+}
+
+describe("KeySheet", () => {
+  it("opens on ? and lists the keys, grouped by where they work", () => {
+    render(<Harness />);
+
+    fireEvent.keyDown(document.body, { key: "?" });
+
+    const sheet = screen.getByRole("dialog", { name: "Keyboard" });
+    for (const what of ["Jump to a terminal or workspace, or give Claude a new task", "Find in the open terminal", "Move between workspaces and terminals", "Next file"]) {
+      expect(sheet.textContent).toContain(what);
+    }
+    expect(screen.getByRole("heading", { name: "The workspaces list" })).toBeDefined();
+  });
+
+  it("leaves ? alone while typing, in a field or in a terminal", () => {
+    render(<Harness />);
+
+    fireEvent.keyDown(screen.getByLabelText("Task"), { key: "?" });
+    fireEvent.keyDown(screen.getByLabelText("Terminal input"), { key: "?" });
+
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+});

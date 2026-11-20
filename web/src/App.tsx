@@ -23,7 +23,8 @@ import { useShortcut } from "./shortcut";
 import { useBriefs } from "./useBriefs";
 import { machineQuery } from "./api";
 import { useFleet } from "./useFleet";
-import { AlertsButton, useAlerts } from "./AlertsBell";
+import { AlertsButton, Announcer, useAlerts } from "./AlertsBell";
+import { KeySheet, useHelpKey } from "./KeySheet";
 
 /**
  * The sidebar, and the terminal the URL names (`/terminals/$terminalId`) under its header filling
@@ -66,7 +67,11 @@ import { AlertsButton, useAlerts } from "./AlertsBell";
  * daemon's briefs of its hooks.
  *
  * The browser tab shows the fleet's state in its title and icon, and the sidebar's bell turns on
- * desktop alerts for a session that finishes its turn or needs you.
+ * desktop alerts for a session that finishes its turn or needs you; a screen reader hears the same
+ * news whatever the bell is set to.
+ *
+ * ? (outside a field or the terminal) or the sidebar's Keyboard button lists every key the app
+ * answers. The sidebar's list is one Tab stop that the arrows walk.
  *
  * Right-clicking (or long-pressing) a terminal anywhere it is listed, the header's More button, or
  * Tab on it in the palette, lists what can be done with it: open, open beside, steps, changes, a
@@ -162,7 +167,10 @@ function Layout() {
 
   const changed = new Set(tabs.flatMap((t) => (seen[t.terminal] !== undefined && seen[t.terminal] !== t.label ? [t.terminal] : [])));
   const show = (id: string) => void navigate({ to: "/terminals/$terminalId", params: { terminalId: id } });
-  const alerts = useAlerts(machines, state.synced, show);
+  const { spoken, ...alerts } = useAlerts(machines, state.synced, show);
+  /** Whether the list of keys is open. */
+  const [keysOpen, setKeysOpen] = useState(false);
+  useHelpKey(() => setKeysOpen(true));
   /** Ends the split by closing side `id`; the other side keeps or takes the keyboard. */
   const closePane = (id: string) => {
     setSplit(undefined);
@@ -251,6 +259,7 @@ function Layout() {
               onJump={openJump}
               onChanges={openChanges}
               alerts={<AlertsButton {...alerts} />}
+              onKeys={() => setKeysOpen(true)}
             />
           </div>
           <main className="flex min-w-0 flex-1 flex-col">
@@ -346,6 +355,8 @@ function Layout() {
           task={create.task}
           onCreated={setLanding}
         />
+        <KeySheet open={keysOpen} onOpenChange={setKeysOpen} />
+        <Announcer spoken={spoken} />
         {sessionIn && <NewSession key={sessionIn.id} workspace={sessionIn.id} name={sessionIn.name} onClose={() => setSessionIn(undefined)} onStarted={setLanding} />}
       </div>
     </TerminalActions>

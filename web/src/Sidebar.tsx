@@ -1,6 +1,6 @@
 import { useMutation } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
-import { useState, type ReactNode } from "react";
+import { useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { button } from "./Modal";
 import { jumpKey, SearchIcon } from "./JumpPalette";
 import { Named, Now } from "./Now";
@@ -37,9 +37,28 @@ interface Props {
   onChanges?: (workspace: string) => void;
   /** Shown first among the header's buttons: the alerts bell. */
   alerts?: ReactNode;
+  /** Opens the list of keys. */
+  onKeys?: () => void;
 }
 
-export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJump, onChanges, alerts }: Props) {
+/** The terminals a folded workspace shows on its line: the most urgent first, and the open one always. */
+function stripOf(list: Row[], selected?: string): Row[] {
+  const ordered = byUrgency(list);
+  const shown = ordered.slice(0, STRIP);
+  const open = ordered.slice(STRIP).find((r) => r.terminal === selected);
+  return open ? [...shown.slice(0, STRIP - 1), open] : shown;
+}
+
+/** What a typed name has to start with: the letters typed within this long of each other. */
+const TYPEAHEAD_MS = 600;
+
+/**
+ * The machines, each with its workspaces and their terminals. The list is one Tab stop: the
+ * arrows move between workspaces and terminals (Left folds or goes up to the workspace, Right
+ * unfolds or goes in), Home and End go to the ends, and typing a name's first letters goes to the
+ * next one it starts. A workspace's actions show while the keyboard is in it, the Tab after it.
+ */
+export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJump, onChanges, alerts, onKeys }: Props) {
   const [folded, setFolded] = useState(() => new Set(loadFolded()));
   const fold = (ids: string[], on: boolean) =>
     setFolded((old) => {
@@ -54,8 +73,50 @@ export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJ
       return next;
     });
 
+  // The one Tab stop: the one the keyboard was last in, while it is listed, else the open
+  // terminal, else the first workspace.
+  const [focused, setFocused] = useState<string>();
+  const listed = machines.flatMap((m) =>
+    m.workspaces.flatMap((w) => [w.id, ...(folded.has(w.id) ? stripOf(rows(w), selected) : rows(w)).map((r) => r.terminal)]),
+  );
+  const stop = [focused, selected].find((id) => id !== undefined && listed.includes(id)) ?? listed[0];
+  const typed = useRef({ text: "", at: 0 });
+
+  const keys = (event: KeyboardEvent<HTMLElement>) => {
+    const here = event.target instanceof HTMLElement ? event.target.closest<HTMLElement>("[data-stop]") : null;
+    if (!here || event.metaKey || event.ctrlKey || event.altKey) return;
+    const all = [...event.currentTarget.querySelectorAll<HTMLElement>("[data-stop]")];
+    const at = all.indexOf(here);
+    const workspace = here.dataset.workspace;
+    const isWorkspace = here.dataset.stop === workspace;
+    let to: HTMLElement | undefined;
+    if (event.key === "ArrowDown") to = all[at + 1];
+    else if (event.key === "ArrowUp") to = all[at - 1];
+    else if (event.key === "Home") to = all[0];
+    else if (event.key === "End") to = all.at(-1);
+    else if (event.key === "ArrowRight") {
+      if (isWorkspace && workspace && folded.has(workspace)) fold([workspace], false);
+      else if (isWorkspace || here.dataset.strip !== undefined) to = all[at + 1];
+    } else if (event.key === "ArrowLeft") {
+      if (isWorkspace && workspace && !folded.has(workspace)) fold([workspace], true);
+      else if (!isWorkspace) to = all.find((e) => e.dataset.stop === workspace);
+    } else if (event.key.length === 1 && event.key !== " ") {
+      const now = Date.now();
+      const text = (now - typed.current.at < TYPEAHEAD_MS ? typed.current.text : "") + event.key.toLowerCase();
+      typed.current = { text, at: now };
+      // A new first letter looks past this one, so typing it again goes on to the next.
+      const from = text.length === 1 ? at + 1 : at;
+      const order = [...all.slice(from), ...all.slice(0, from)];
+      to = order.find((e) => (e.dataset.name ?? "").toLowerCase().startsWith(text));
+      if (!to) return;
+    } else return;
+    event.preventDefault();
+    to?.focus();
+  };
+  const tab = (id: string) => ({ tabIndex: id === stop ? 0 : -1, onFocus: () => setFocused(id) });
+
   return (
-    <nav id="sidebar" aria-label="Workspaces" className="flex h-full w-full shrink-0 flex-col gap-4 overflow-y-auto bg-neutral-900 p-3 text-sm text-neutral-100 md:w-80">
+    <nav id="sidebar" aria-label="Workspaces" onKeyDown={keys} className="flex h-full w-full shrink-0 flex-col gap-4 overflow-y-auto bg-neutral-900 p-3 text-sm text-neutral-100 md:w-80">
       <div className="flex items-center justify-between gap-2">
         <h1 className="text-lg font-semibold">
           <Link to="/" onClick={onNavigate} title="The board" className="flex items-center gap-1.5 rounded">
@@ -131,12 +192,24 @@ export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJ
                   selected={selected}
                   onNavigate={onNavigate}
                   onChanges={onChanges}
+                  tab={tab}
                 />
               ))}
             </div>
           </section>
         );
       })}
+      {onKeys && (
+        <button
+          type="button"
+          onClick={onKeys}
+          title="Every key Foundry answers"
+          className="mt-auto flex items-center gap-1.5 self-start rounded px-1 text-xs text-neutral-500 hover:text-neutral-200 pointer-coarse:hidden"
+        >
+          Keyboard
+          <kbd className="rounded border border-neutral-700 px-1 font-sans text-[11px] leading-4">?</kbd>
+        </button>
+      )}
     </nav>
   );
 }
@@ -168,9 +241,11 @@ interface WorkspaceProps {
   selected?: string;
   onNavigate?: () => void;
   onChanges?: (workspace: string) => void;
+  /** A stop's place in the list's one Tab stop, by its id (see `Sidebar`). */
+  tab: (id: string) => { tabIndex: number; onFocus: () => void };
 }
 
-function Workspace({ workspace, machine, folded, onFold, selected, onNavigate, onChanges }: WorkspaceProps) {
+function Workspace({ workspace, machine, folded, onFold, selected, onNavigate, onChanges, tab }: WorkspaceProps) {
   const shell = useMutation({ mutationFn: () => startShell(workspace.id) });
   const terminals = useTerminalActions();
   const list = rows(workspace);
@@ -183,6 +258,10 @@ function Workspace({ workspace, machine, folded, onFold, selected, onNavigate, o
           type="button"
           aria-expanded={!folded}
           onClick={() => onFold(!folded)}
+          data-stop={workspace.id}
+          data-workspace={workspace.id}
+          data-name={workspace.name}
+          {...tab(workspace.id)}
           title={folded ? "Unfold" : "Fold"}
           className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
         >
@@ -191,7 +270,7 @@ function Workspace({ workspace, machine, folded, onFold, selected, onNavigate, o
           </svg>
           <span className="truncate font-medium">{workspace.name}</span>
         </button>
-        {folded && <Strip list={list} selected={selected} onNavigate={onNavigate} />}
+        {folded && <Strip list={list} workspace={workspace.id} selected={selected} onNavigate={onNavigate} tab={tab} />}
       </div>
       {!folded && (
         <>
@@ -233,7 +312,7 @@ function Workspace({ workspace, machine, folded, onFold, selected, onNavigate, o
           {list.length > 0 && (
             <ul className="ml-[11px] mt-0.5 border-l border-neutral-800 pl-1.5">
               {list.map((row) => (
-                <Item key={row.terminal} row={row} selected={selected} onNavigate={onNavigate} />
+                <Item key={row.terminal} row={row} workspace={workspace.id} selected={selected} onNavigate={onNavigate} tab={tab} />
               ))}
             </ul>
           )}
@@ -247,11 +326,8 @@ function Workspace({ workspace, machine, folded, onFold, selected, onNavigate, o
  * A folded workspace's states on its own line, the most urgent first, each a link to its
  * terminal. The open terminal always keeps a place, so the sidebar still shows where you are.
  */
-function Strip({ list, selected, onNavigate }: { list: Row[]; selected?: string; onNavigate?: () => void }) {
-  const ordered = byUrgency(list);
-  let shown = ordered.slice(0, STRIP);
-  const open = ordered.slice(STRIP).find((r) => r.terminal === selected);
-  if (open) shown = [...shown.slice(0, STRIP - 1), open];
+function Strip({ list, workspace, selected, onNavigate, tab }: { list: Row[]; workspace: string; selected?: string; onNavigate?: () => void; tab: WorkspaceProps["tab"] }) {
+  const shown = stripOf(list, selected);
   const rest = list.length - shown.length;
   return (
     <span className="flex shrink-0 items-center gap-0.5">
@@ -264,6 +340,11 @@ function Strip({ list, selected, onNavigate }: { list: Row[]; selected?: string;
             title={`${row.name}: ${row.label}`}
             aria-current={row.terminal === selected ? "true" : undefined}
             onClick={onNavigate}
+            data-stop={row.terminal}
+            data-workspace={workspace}
+            data-strip=""
+            data-name={row.name}
+            {...tab(row.terminal)}
             className={`grid size-5 place-items-center rounded hover:bg-neutral-700 ${row.terminal === selected ? "bg-neutral-700" : ""}`}
           >
             <StateGlyph glyph={row.glyph} />
@@ -292,7 +373,7 @@ function Action({ label, title, onClick, disabled, children }: { label: string; 
   );
 }
 
-function Item({ row, selected, onNavigate }: { row: Row; selected?: string; onNavigate?: () => void }) {
+function Item({ row, workspace, selected, onNavigate, tab }: { row: Row; workspace: string; selected?: string; onNavigate?: () => void; tab: WorkspaceProps["tab"] }) {
   const current = row.terminal === selected;
   const ended = row.glyph === "done" || row.glyph === "away";
   return (
@@ -303,6 +384,10 @@ function Item({ row, selected, onNavigate }: { row: Row; selected?: string; onNa
           params={{ terminalId: row.terminal }}
           aria-current={current ? "true" : undefined}
           onClick={onNavigate}
+          data-stop={row.terminal}
+          data-workspace={workspace}
+          data-name={row.title ? `${row.name} ${row.title}` : row.name}
+          {...tab(row.terminal)}
           title={row.title ? `${row.name}: ${row.title}` : undefined}
           className={`flex items-start gap-2 rounded px-2 py-1.5 hover:bg-neutral-800 md:py-1 ${current ? "bg-neutral-800 text-neutral-50" : ended ? "text-neutral-500" : ""}`}
         >

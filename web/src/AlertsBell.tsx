@@ -11,6 +11,7 @@ const supported = () => typeof Notification === "function";
  * icon is the fleet's most urgent glyph (rippling while an agent works, still under reduced
  * motion). With alerts turned on, a session that finishes its turn or needs you raises a desktop
  * notification while the page does not have focus; a click on it opens that session's terminal.
+ * Whatever the alerts are set to, the same news is `spoken`, for `Announcer` to tell a screen reader.
  */
 export function useAlerts(machines: MachineView[], synced: boolean, onOpen: (terminal: string) => void) {
   const [on, setOn] = useState(loadAlertsOn);
@@ -23,10 +24,16 @@ export function useAlerts(machines: MachineView[], synced: boolean, onOpen: (ter
   });
 
   const seen = useRef<Seen>(undefined);
+  const [spoken, setSpoken] = useState("");
   useEffect(() => {
     if (!synced) return;
     const next = alertsFor(seen.current, machines);
     seen.current = next.seen;
+    if (next.alerts.length > 0) {
+      const news = next.alerts.map((a) => `${a.title}: ${a.body}`).join(". ");
+      // The same news again is said again: a live region speaks only when its text changes.
+      setSpoken((last) => (last.trim() === news && !last.endsWith("\u00a0") ? `${news}\u00a0` : news));
+    }
     if (status !== "on" || document.hasFocus()) return;
     for (const alert of next.alerts) {
       try {
@@ -81,7 +88,19 @@ export function useAlerts(machines: MachineView[], synced: boolean, onOpen: (ter
     saveAlertsOn(true);
   };
 
-  return { status, onToggle: () => void toggle() };
+  return { status, onToggle: () => void toggle(), spoken };
+}
+
+/**
+ * Says `spoken` to a screen reader, politely, without showing it. A bare live region, not a
+ * status role, so the page's visible status lines stay the only ones.
+ */
+export function Announcer({ spoken }: { spoken: string }) {
+  return (
+    <p aria-live="polite" aria-atomic="true" data-announcer="" className="sr-only">
+      {spoken}
+    </p>
+  );
 }
 
 const hint: Record<Exclude<AlertsStatus, "unsupported">, string> = {
