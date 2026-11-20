@@ -8,7 +8,7 @@ use std::fs::{DirBuilder, File, OpenOptions};
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
@@ -135,13 +135,17 @@ fn start() -> Result<(), DaemonError> {
     result
 }
 
-/// Makes the data directory, readable only by this user, as the terminals' directory is.
+/// Makes the data directory, readable only by this user, as the terminals' directory is. A
+/// directory that already exists (`foundryd join` and `foundryd secret set` can make it
+/// first, wider) is tightened to 0700.
 fn make_home(home: &Path) -> Result<(), DaemonError> {
+    let what = || format!("cannot make {} private", home.display());
     DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(home)
-        .map_err(io_error(format!("cannot make {}", home.display())))
+        .map_err(io_error(format!("cannot make {}", home.display())))?;
+    std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o700)).map_err(io_error(what()))
 }
 
 /// Takes an exclusive lock on `<home>/daemon.lock`, so two daemons never share a data
@@ -201,7 +205,7 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
                 base_url: String::new(),
                 key: String::new(),
             };
-            (placeholder, Some(missing.said))
+            (placeholder, Some(missing))
         }
     };
     let claude_json = sessions::claude::claude_json(
@@ -239,8 +243,9 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
         app = refuse_sessions(app, missing);
     }
 
-    let loopback = api::bind(SocketAddr::from(([127, 0, 0, 1], port))).await?;
-    tracing::info!("listening on {}", SocketAddr::from(([127, 0, 0, 1], port)));
+    let local = loopback(port);
+    let listener = api::bind(local).await?;
+    tracing::info!("listening on {local}");
     let mut tailscale = Tailscale::new(port, app.clone());
     tailscale.scan(true).await;
     let mut services: JoinSet<&'static str> = JoinSet::new();
@@ -253,7 +258,7 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
         let peers = peers.clone();
         async move { peers.run().await }
     }));
-    services.spawn(named("the API server", serve_on(loopback, app.clone())));
+    services.spawn(named("the API server", serve_on(listener, app.clone())));
     services.spawn(named("the Tailscale address watch", tailscale.watch()));
 
     tokio::select! {
@@ -332,11 +337,12 @@ fn gateway(
     }
 }
 
-/// Answers a request to start a session with `missing` as a 503, and passes every other
-/// request on. For a daemon with no gateway: shells and sync still work.
-fn refuse_sessions(router: Router, missing: String) -> Router {
+/// Answers a request to start a session with what `missing` said as a 503, and passes every
+/// other request on. For a daemon with no gateway: shells and sync still work.
+fn refuse_sessions(router: Router, missing: Missing) -> Router {
+    let said = missing.said;
     router.layer(middleware::from_fn(move |request: Request, next: Next| {
-        let missing = missing.clone();
+        let missing = said.clone();
         async move {
             if starts_session(request.method(), request.uri().path()) {
                 let body = serde_json::json!({ "error": missing });
@@ -368,10 +374,15 @@ fn host_names() -> Vec<String> {
         .collect()
 }
 
-/// The addresses to listen on: loopback first, then each of `found` that is a Tailscale
+/// The loopback address the daemon always listens on.
+fn loopback(port: u16) -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], port))
+}
+
+/// The addresses to listen on besides loopback: each of `found` that is a Tailscale
 /// address, once.
 fn listen_on(port: u16, found: impl IntoIterator<Item = IpAddr>) -> Vec<SocketAddr> {
-    let mut addrs = vec![SocketAddr::from(([127, 0, 0, 1], port))];
+    let mut addrs = Vec::new();
     for ip in found {
         let addr = SocketAddr::new(ip, port);
         if api::allowed(ip) && !ip.is_loopback() && !addrs.contains(&addr) {
@@ -415,7 +426,7 @@ const RESCAN: Duration = Duration::from_secs(5);
 struct Tailscale {
     port: u16,
     app: Router,
-    /// The addresses being served.
+    /// The Tailscale addresses being served.
     served: BTreeSet<SocketAddr>,
     /// The addresses that failed to bind, so each is warned about once.
     failed: BTreeSet<SocketAddr>,
@@ -427,7 +438,7 @@ impl Tailscale {
         Self {
             port,
             app,
-            served: [SocketAddr::from(([127, 0, 0, 1], port))].into(),
+            served: BTreeSet::new(),
             failed: BTreeSet::new(),
             servers: JoinSet::new(),
         }
@@ -460,7 +471,7 @@ impl Tailscale {
                 }
             }
         }
-        if first && self.served.len() == 1 {
+        if first && self.served.is_empty() {
             tracing::warn!(
                 "no Tailscale address is bound yet, so peers cannot reach this machine until one appears"
             );
@@ -683,8 +694,7 @@ mod tests {
 
     #[test]
     fn only_tailscale_addresses_not_yet_served_are_new() {
-        let served: BTreeSet<SocketAddr> =
-            [addr("100.101.102.103:7433")].into();
+        let served: BTreeSet<SocketAddr> = [addr("100.101.102.103:7433")].into();
         let found = [
             ip("100.101.102.103"),
             ip("100.64.0.9"),
