@@ -404,7 +404,7 @@ pub fn uninstall() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt};
 
     use super::*;
 
@@ -577,8 +577,11 @@ mod tests {
         fs::write(dir.join("foundryd"), "daemon").unwrap();
         fs::write(dir.join("foundry-holder"), "holder").unwrap();
 
+        let inode = fs::metadata(dir.join("foundryd")).unwrap().ino();
+
         place(home.path(), &dir.join("foundryd"), "0.1.0").unwrap();
 
+        assert_eq!(fs::metadata(dir.join("foundryd")).unwrap().ino(), inode);
         assert_eq!(fs::read_to_string(dir.join("foundryd")).unwrap(), "daemon");
         assert_eq!(
             fs::read_link(home.path().join("current")).unwrap(),
@@ -609,5 +612,52 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&out.stdout)
         );
+    }
+
+    fn binaries(dir: &Path, daemon: &str) {
+        fs::write(dir.join("foundryd"), daemon).unwrap();
+        fs::write(dir.join("foundry-holder"), "holder").unwrap();
+    }
+
+    #[test]
+    fn a_hand_install_of_an_older_version_refuses_the_newer_one() {
+        let home = tempfile::tempdir().unwrap();
+        let (newer, older) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        binaries(newer.path(), "two");
+        binaries(older.path(), "one");
+
+        place(home.path(), &newer.path().join("foundryd"), "0.2.0").unwrap();
+        place(home.path(), &older.path().join("foundryd"), "0.1.0").unwrap();
+
+        let state = update::state(home.path()).unwrap();
+        assert_eq!(state.refused.as_deref(), Some("v0.2.0"));
+        assert_eq!(state.trial, None);
+    }
+
+    #[test]
+    fn a_data_directory_other_users_can_reach_is_refused_and_nothing_is_written() {
+        let home = tempfile::tempdir().unwrap();
+        fs::set_permissions(home.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let src = tempfile::tempdir().unwrap();
+        binaries(src.path(), "daemon");
+
+        let error = stage(home.path(), &src.path().join("foundryd"), "0.1.0").unwrap_err();
+
+        assert!(error.to_string().contains("chmod"), "{error}");
+        assert!(!home.path().join("versions").exists());
+        assert!(!home.path().join("current").exists());
+    }
+
+    #[test]
+    fn a_private_data_directory_is_made_and_filled() {
+        let parent = tempfile::tempdir().unwrap();
+        let home = parent.path().join("new/home");
+        let src = tempfile::tempdir().unwrap();
+        binaries(src.path(), "daemon");
+
+        stage(&home, &src.path().join("foundryd"), "0.1.0").unwrap();
+
+        assert_eq!(fs::metadata(&home).unwrap().permissions().mode() & 0o777, 0o700);
+        assert!(home.join("current/foundryd").is_file());
     }
 }

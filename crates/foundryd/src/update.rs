@@ -416,6 +416,8 @@ pub async fn run(home: PathBuf) {
 mod tests {
     use std::fs;
     use std::os::unix::fs::symlink;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Instant;
 
     use super::*;
 
@@ -687,14 +689,285 @@ mod tests {
     }
 
     #[test]
-    fn installed_is_true_only_when_current_points_at_the_running_version() {
+    fn from_current_needs_current_to_name_the_version_and_the_exe_to_be_reached_through_it() {
+        let home = installed_home();
+        let inside = home.path().join("versions/0.1.0/foundryd");
+        script(&inside, "foundryd 0.1.0");
+        let elsewhere = home.path().join("elsewhere");
+        script(&elsewhere, "foundryd 0.1.0");
+
+        assert!(from_current(home.path(), &home.path().join("current/foundryd"), "0.1.0"));
+        assert!(from_current(home.path(), &inside, "0.1.0"));
+        assert!(!from_current(home.path(), &elsewhere, "0.1.0"));
+        assert!(!from_current(home.path(), &inside, "0.2.0"));
+        assert!(!from_current(tempfile::tempdir().unwrap().path(), &inside, "0.1.0"));
+    }
+
+    #[test]
+    fn a_rollback_that_fails_part_way_rolls_back_on_the_next_start() {
+        let home = trial_home();
+        for _ in 0..3 {
+            start_with(home.path(), "0.2.0").unwrap();
+        }
+        let obstacle = home.path().join("current.new");
+        fs::create_dir_all(obstacle.join("inside")).unwrap();
+
+        assert!(start_with(home.path(), "0.2.0").is_err());
+        assert_eq!(current(home.path()), PathBuf::from("versions/0.2.0"));
+        fs::remove_dir_all(&obstacle).unwrap();
+        let next = start_with(home.path(), "0.2.0").unwrap();
+
+        assert_eq!(next, Start::RolledBack { to: "0.1.0".into() });
+        assert_eq!(current(home.path()), PathBuf::from("versions/0.1.0"));
+        let state = state(home.path()).unwrap();
+        assert_eq!(state.refused.as_deref(), Some("v0.2.0"));
+        assert_eq!(state.trial, None);
+    }
+
+    #[test]
+    fn the_watchdog_gives_up_when_the_daemon_is_never_healthy() {
+        let flag = AtomicBool::new(false);
+
+        let started = Instant::now();
+        let healthy = watch(&flag, Duration::from_millis(60), Duration::from_millis(5));
+
+        assert!(!healthy);
+        assert!(started.elapsed() >= Duration::from_millis(60));
+    }
+
+    #[test]
+    fn the_watchdog_returns_as_soon_as_the_daemon_is_healthy() {
+        let flag = AtomicBool::new(true);
+
+        let started = Instant::now();
+        let healthy = watch(&flag, Duration::from_secs(30), Duration::from_millis(5));
+
+        assert!(healthy);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_hand_install_of_an_older_version_refuses_the_newer_one_until_a_higher_tag() {
+        let home = tempfile::tempdir().unwrap();
+        for version in ["0.1.0", "0.2.0"] {
+            fs::create_dir_all(home.path().join("versions").join(version)).unwrap();
+        }
+        point_current(home.path(), "0.2.0").unwrap();
+        save(
+            home.path(),
+            &State {
+                trial: Some(Trial {
+                    version: "0.2.0".into(),
+                    previous: "0.1.0".into(),
+                    starts: 1,
+                }),
+                refused: None,
+            },
+        )
+        .unwrap();
+        let before = current_version(home.path());
+        assert_eq!(before.as_deref(), Some("0.2.0"));
+
+        point_current(home.path(), "0.1.0").unwrap();
+        placed_by_hand(home.path(), "0.1.0", before.as_deref()).unwrap();
+
+        let state = state(home.path()).unwrap();
+        assert_eq!(state.trial, None);
+        assert_eq!(state.refused.as_deref(), Some("v0.2.0"));
+        let list = tags(&["v0.1.0", "v0.2.0"]);
+        assert_eq!(pick(&list, "0.1.0", state.refused.as_deref()), None);
+        let list = tags(&["v0.1.0", "v0.2.0", "v0.3.0"]);
+        assert_eq!(
+            pick(&list, "0.1.0", state.refused.as_deref()).as_deref(),
+            Some("v0.3.0")
+        );
+    }
+
+    #[test]
+    fn a_hand_install_of_a_higher_version_refuses_nothing_and_clears_the_trial() {
+        let home = trial_home();
+
+        placed_by_hand(home.path(), "0.3.0", Some("0.2.0")).unwrap();
+
+        let state = state(home.path()).unwrap();
+        assert_eq!(state.trial, None);
+        assert_eq!(state.refused, None);
+    }
+
+    #[test]
+    fn a_hand_install_keeps_a_higher_refusal() {
+        let home = tempfile::tempdir().unwrap();
+        save(
+            home.path(),
+            &State {
+                trial: None,
+                refused: Some("v0.5.0".into()),
+            },
+        )
+        .unwrap();
+
+        placed_by_hand(home.path(), "0.1.0", Some("0.2.0")).unwrap();
+
+        assert_eq!(state(home.path()).unwrap().refused.as_deref(), Some("v0.5.0"));
+    }
+
+    #[test]
+    fn current_version_reads_the_link() {
         let home = installed_home();
 
-        assert!(installed(home.path(), "0.1.0"));
-        assert!(!installed(home.path(), "0.2.0"));
-        assert!(!installed(tempfile::tempdir().unwrap().path(), "0.1.0"));
-        let other = tempfile::tempdir().unwrap();
-        symlink("elsewhere", other.path().join("current")).unwrap();
-        assert!(!installed(other.path(), "0.1.0"));
+        assert_eq!(current_version(home.path()).as_deref(), Some("0.1.0"));
+        assert_eq!(current_version(tempfile::tempdir().unwrap().path()), None);
+    }
+
+    #[test]
+    fn a_command_that_outlives_its_deadline_is_killed_and_named() {
+        let started = Instant::now();
+
+        let error = run_bounded(
+            Command::new("sleep").arg("31.7"),
+            Duration::from_millis(300),
+        )
+        .unwrap_err();
+
+        assert!(started.elapsed() < Duration::from_secs(20), "{:?}", started.elapsed());
+        assert!(matches!(error, RunError::TimedOut { .. }), "{error}");
+        assert!(error.to_string().contains("sleep 31.7"), "{error}");
+        let table = Command::new("ps").args(["-axo", "stat,command"]).output().unwrap();
+        let table = String::from_utf8_lossy(&table.stdout);
+        let left: Vec<_> = table.lines().filter(|l| l.contains("sleep 31.7")).collect();
+        assert!(left.is_empty(), "still there: {left:?}");
+    }
+
+    #[test]
+    fn a_command_that_finishes_gives_its_output_and_one_that_fails_gives_its_stderr() {
+        let out = run_bounded(Command::new("echo").arg("hi"), Duration::from_secs(10)).unwrap();
+        assert_eq!(out, "hi\n");
+
+        let error = run_bounded(
+            Command::new("sh").args(["-c", "echo no good >&2; exit 3"]),
+            Duration::from_secs(10),
+        )
+        .unwrap_err();
+        assert!(matches!(error, RunError::Failed { .. }), "{error}");
+        assert!(error.to_string().contains("no good"), "{error}");
+
+        let error = run_bounded(
+            &mut Command::new("/no/such/program"),
+            Duration::from_secs(10),
+        )
+        .unwrap_err();
+        assert!(matches!(error, RunError::Spawn { .. }), "{error}");
+    }
+
+    fn release(stage: &Path, version: &str) {
+        script(&stage.join("foundryd"), &format!("foundryd {version}"));
+        script(&stage.join("foundry-holder"), "holder");
+    }
+
+    #[test]
+    fn check_with_does_nothing_for_a_refused_tag_that_is_the_highest() {
+        let home = installed_home();
+        save(
+            home.path(),
+            &State {
+                trial: None,
+                refused: Some("v0.2.0".into()),
+            },
+        )
+        .unwrap();
+
+        let done = check_with(
+            home.path(),
+            "0.1.0",
+            || Ok(tags(&["v0.1.0", "v0.2.0"])),
+            |_, _| panic!("a refused tag was fetched"),
+        )
+        .unwrap();
+
+        assert_eq!(done, None);
+        assert_eq!(current(home.path()), PathBuf::from("versions/0.1.0"));
+    }
+
+    #[test]
+    fn check_with_installs_a_higher_tag_and_clears_the_refusal() {
+        let home = installed_home();
+        save(
+            home.path(),
+            &State {
+                trial: None,
+                refused: Some("v0.2.0".into()),
+            },
+        )
+        .unwrap();
+
+        let done = check_with(
+            home.path(),
+            "0.1.0",
+            || Ok(tags(&["v0.1.0", "v0.2.0", "v0.3.0"])),
+            |tag, stage| {
+                assert_eq!(tag, "v0.3.0");
+                release(stage, "0.3.0");
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(done.as_deref(), Some("v0.3.0"));
+        assert_eq!(current(home.path()), PathBuf::from("versions/0.3.0"));
+        let state = state(home.path()).unwrap();
+        assert_eq!(state.refused, None);
+        assert_eq!(state.trial.unwrap().version, "0.3.0");
+    }
+
+    #[test]
+    fn check_with_refuses_a_tag_whose_asset_is_bad_so_it_is_not_fetched_again() {
+        for bad in ["wrong version", "no holder"] {
+            let home = installed_home();
+
+            let result = check_with(
+                home.path(),
+                "0.1.0",
+                || Ok(tags(&["v0.2.0"])),
+                |_, stage| {
+                    if bad == "wrong version" {
+                        release(stage, "0.9.9");
+                    } else {
+                        script(&stage.join("foundryd"), "foundryd 0.2.0");
+                    }
+                    Ok(())
+                },
+            );
+
+            assert!(result.is_err(), "{bad}");
+            assert_eq!(state(home.path()).unwrap().refused.as_deref(), Some("v0.2.0"), "{bad}");
+            let again = check_with(
+                home.path(),
+                "0.1.0",
+                || Ok(tags(&["v0.2.0"])),
+                |_, _| panic!("fetched again"),
+            );
+            assert_eq!(again.unwrap(), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn check_with_retries_after_a_failed_list_or_fetch() {
+        let home = installed_home();
+
+        let listed = check_with(
+            home.path(),
+            "0.1.0",
+            || Err(UpdateError::Fetch("offline".into())),
+            |_, _| panic!("fetched"),
+        );
+        let fetched = check_with(
+            home.path(),
+            "0.1.0",
+            || Ok(tags(&["v0.2.0"])),
+            |_, _| Err(UpdateError::Fetch("offline".into())),
+        );
+
+        assert!(listed.is_err() && fetched.is_err());
+        assert_eq!(state(home.path()).unwrap().refused, None);
     }
 }
