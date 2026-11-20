@@ -817,12 +817,12 @@ mod tests {
         assert_eq!(store(Some(OsStr::new("file"))), Store::File);
     }
 
-    /// The same in a release build, which ignores it. The gate runs debug builds only; run
-    /// `cargo test --release -p foundryd --lib secrets` to check this one.
+    /// The same in a release build, which ignores it. CI runs this one in a release build.
     #[cfg(not(debug_assertions))]
     #[test]
     fn this_release_build_ignores_foundry_secrets() {
         use std::ffi::OsStr;
+        assert!(!OVERRIDE);
         assert_eq!(store(Some(OsStr::new("file"))), os_default());
     }
 
