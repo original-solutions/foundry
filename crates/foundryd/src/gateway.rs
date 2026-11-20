@@ -555,7 +555,7 @@ mod tests {
         let reader = Arc::new(Reader::new(Some(url), secrets.clone()));
         reader.read_once().await;
         assert!(
-            matches!(reader.health(), Some(Health::KeyRefused(401))),
+            matches!(reader.health(), Some(Health::KeyRefused)),
             "{:?}",
             reader.health()
         );
@@ -563,6 +563,87 @@ mod tests {
         reader.read_once().await;
         assert_eq!(reader.health(), Some(Health::Healthy));
         assert_eq!(reads(&secrets), 3);
+    }
+
+    /// A gateway that answers every read with `status` and `body`, and counts the reads.
+    async fn answering(
+        status: StatusCode,
+        body: serde_json::Value,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = hits.clone();
+        let app = Router::new().route(
+            "/v0/management/auth-files",
+            get(move || {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let body = body.clone();
+                async move { (status, axum::Json(body)).into_response() }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), hits)
+    }
+
+    #[tokio::test]
+    async fn a_refused_key_is_not_sent_again_until_it_changes() {
+        let (url, hits) = answering(
+            StatusCode::UNAUTHORIZED,
+            serde_json::json!({ "error": "invalid management key" }),
+        )
+        .await;
+        let machine = Machine::new(Some("a-wrong-key-0123456789"));
+        let reader = Arc::new(Reader::new(Some(url), machine.secrets.clone()));
+        for _ in 0..3 {
+            reader.read_once().await;
+        }
+        assert_eq!(reader.health(), Some(Health::KeyRefused));
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        machine
+            .secrets
+            .set(GATEWAY_MANAGEMENT, "another-key-0123456789")
+            .unwrap();
+        reader.read_once().await;
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_gateway_that_refuses_for_another_reason_says_why() {
+        for reason in [
+            "remote management disabled",
+            "IP banned due to too many failed attempts. Try again in 29m",
+        ] {
+            let (url, _) = answering(
+                StatusCode::FORBIDDEN,
+                serde_json::json!({ "error": reason }),
+            )
+            .await;
+            let machine = Machine::new(Some(KEY));
+            let items = machine.items(Some(url)).await;
+            let item = one(&items);
+            assert!(item.what.contains("it answered 403"), "{}", item.what);
+            assert!(item.what.contains(reason), "{}", item.what);
+            assert!(
+                !item.what.contains("refused the management key"),
+                "{}",
+                item.what
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_gateways_answer_never_shows_the_key() {
+        let echo = format!("bad key {KEY} for https://tom:hunter2@gw");
+        let (url, _) = answering(
+            StatusCode::BAD_GATEWAY,
+            serde_json::json!({ "error": echo }),
+        )
+        .await;
+        let machine = Machine::new(Some(KEY));
+        let text = serde_json::to_string(one(&machine.items(Some(url)).await)).unwrap();
+        assert!(!text.contains(KEY) && !text.contains("hunter2"), "{text}");
     }
 
     #[tokio::test]
