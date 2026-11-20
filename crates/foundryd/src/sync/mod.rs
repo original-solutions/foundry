@@ -183,7 +183,7 @@ impl Peers {
     /// Serves a link a peer opened whose first message, `first`, has already been read from
     /// `conn`, until it ends. A link that opens with a [`PeerMessage::Relay`] goes to the
     /// relay; every other link carries records, and takes `first` as its hello.
-    pub async fn accept_opened(&self, conn: Conn, first: PeerMessage) {
+    pub(crate) async fn accept_opened(&self, conn: Conn, first: PeerMessage) {
         match first {
             PeerMessage::Relay {
                 machine, terminal, ..
