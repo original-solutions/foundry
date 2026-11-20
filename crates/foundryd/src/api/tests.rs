@@ -2676,8 +2676,16 @@ async fn choose_with_no_machine_qualifying_waits_with_a_reason_per_machine_and_i
     let sessions = daemon.sessions_in(made.id);
     assert_eq!(sessions.len(), 1, "{sessions:?}");
     assert_eq!(sessions[0].model, MODEL);
-    let listed = daemon.call("GET", "/api/placements", None).await;
-    assert_eq!(listed.json()["requests"], serde_json::json!([]));
+    // The request leaves the list once its session start has answered.
+    let placed = tokio::time::Instant::now();
+    loop {
+        let listed = daemon.call("GET", "/api/placements", None).await.json();
+        if listed["requests"] == serde_json::json!([]) {
+            break;
+        }
+        assert!(placed.elapsed() < WAIT, "still listed: {listed}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 #[tokio::test]
@@ -2820,10 +2828,7 @@ async fn a_machine_given_a_request_takes_no_other_until_its_next_sample() {
         {
             break;
         }
-        assert!(
-            qualified.elapsed() < Duration::from_secs(10),
-            "first is not placed"
-        );
+        assert!(qualified.elapsed() < WAIT, "first is not placed");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     // No new sample: the one that let "first" in does not count its session.

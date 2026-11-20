@@ -751,10 +751,15 @@ async fn choose(api: &Api, create: Create) -> Result<Response, ApiError> {
     }
     let placements = Arc::clone(&api.placements);
     match placements
-        .create(api, create.project, &create.base, &create.name)
+        .create(api, create.project, &create.base, &create.name, || true)
         .await?
     {
         Ok(sent) => {
+            // The caller starts the session in a workspace made, as after any create.
+            let made = matches!(sent.answer, Ok((StatusCode::CREATED, _)));
+            placements
+                .settle(api, sent.machine, sent.pending, made)
+                .await;
             let (status, mut answer) = match sent.answer {
                 Ok(answer) => answer,
                 Err(lost) => read(carry::not_carried(&lost)).await,
