@@ -98,6 +98,19 @@ function refused(status: number, json: Record<string, unknown>): ApiError {
   return new ApiError(typeof json.error === "string" ? json.error : `request failed (${status})`, status);
 }
 
+/** Reads `path`: its JSON body, or the daemon's refusal as an `ApiError` with its status. */
+async function get(path: string): Promise<Record<string, unknown>> {
+  const response = await fetch(path);
+  let json: Record<string, unknown> = {};
+  try {
+    json = (await response.json()) as Record<string, unknown>;
+  } catch {
+    // Not JSON: the status says what went wrong.
+  }
+  if (!response.ok) throw refused(response.status, json);
+  return json;
+}
+
 /** Makes a workspace. `error` beside the id means it exists but its setup did not start. */
 export async function createWorkspace(input: { project: string; base: string; name: string }): Promise<{ id: string; error?: string }> {
   const { status, json } = await post("/api/workspaces", input);
@@ -142,28 +155,29 @@ export interface FileChange {
   patch: string | null;
 }
 
-/** What a workspace changed since it left its base: commits on its branch and every changed file. */
+/** A commit on a workspace's branch: its short hash and the first line of its message. */
+export interface Commit {
+  hash: string;
+  subject: string;
+}
+
+/** What a workspace changed since it left its base: commits on its branch, newest first, and every changed file. */
 export interface Changes {
   base: string;
-  commits: string[];
+  commits: Commit[];
   files: FileChange[];
 }
 
 export async function workspaceChanges(workspace: string): Promise<Changes> {
-  const response = await fetch(`/api/workspaces/${workspace}/changes`);
-  let json: Record<string, unknown> = {};
-  try {
-    json = (await response.json()) as Record<string, unknown>;
-  } catch {
-    // Not JSON: the status says what went wrong.
-  }
-  if (!response.ok) throw refused(response.status, json);
-  return json as unknown as Changes;
+  return (await get(`/api/workspaces/${workspace}/changes`)) as unknown as Changes;
 }
 
 /** The newest step of a session's turn: a prompt, a tool about to run, or a question for you. */
 export interface Step {
   kind: "prompt" | "tool" | "ask";
+  /** Claude Code's name for the tool ("Bash", "Edit", an MCP tool's name…); only on a `tool` step. */
+  tool?: string;
+  /** The line to show, such as `$ cargo test` or `Edit src/a.rs`. For display only. */
   text: string;
 }
 /** What a session is for (its first prompt) and doing, from its hooks. */
@@ -177,25 +191,17 @@ export type Briefs = Record<string, Brief>;
 /** One step on a session's trail: a prompt, a tool call, a question, or the end of a turn (`done`, no text). `at` is when its hook arrived, in ms since the epoch. */
 export interface Mark {
   kind: Step["kind"] | "done";
+  /** Claude Code's name for the tool; only on a `tool` step. */
+  tool?: string;
   text: string;
   at: number;
 }
 
 /** Every step session `id` took since its daemon started, oldest first. Only this machine's sessions; any other is a 404. */
 export async function sessionTrail(id: string): Promise<Mark[]> {
-  const response = await fetch(`/api/sessions/${id}/trail`);
-  let json: Record<string, unknown> = {};
-  try {
-    json = (await response.json()) as Record<string, unknown>;
-  } catch {
-    // Not JSON: the status says what went wrong.
-  }
-  if (!response.ok) throw refused(response.status, json);
-  return (json.steps ?? []) as Mark[];
+  return ((await get(`/api/sessions/${id}/trail`)).steps ?? []) as Mark[];
 }
 
 export async function sessionBriefs(): Promise<Briefs> {
-  const response = await fetch("/api/briefs");
-  if (!response.ok) throw new ApiError(`briefs failed (${response.status})`);
-  return (await response.json()) as Briefs;
+  return (await get("/api/briefs")) as Briefs;
 }

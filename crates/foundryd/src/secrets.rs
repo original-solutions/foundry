@@ -24,6 +24,33 @@ use nix::fcntl::{Flock, FlockArg};
 /// waits on; one behind a holder that is stuck (on a keychain prompt, say) gives up.
 pub const LOCK_WAIT: Duration = Duration::from_secs(5);
 
+/// `text` with the user and password of every URL in it hidden: `https://user:token@host`
+/// becomes `https://***@host`. A git address with no scheme, `git@host:repo`, holds no secret
+/// and is left as it is.
+pub fn redact(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("://") {
+        let (before, after) = rest.split_at(at + 3);
+        out.push_str(before);
+        let authority = after
+            .find(|c: char| {
+                matches!(c, '/' | '?' | '#') || c.is_whitespace() || c == '\'' || c == '"'
+            })
+            .unwrap_or(after.len());
+        match after[..authority].rfind('@') {
+            Some(user_end) => {
+                out.push_str("***");
+                out.push_str(&after[user_end..authority]);
+            }
+            None => out.push_str(&after[..authority]),
+        }
+        rest = &after[authority..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Named secrets, such as the gateway key or this machine's key.
 pub trait Secrets: Send + Sync {
     /// The secret called `name`, or `None` when none is set.

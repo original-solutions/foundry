@@ -59,7 +59,7 @@ mod changes;
 #[cfg(test)]
 mod tests;
 
-pub use changes::{Changes, FileChange, FileStatus};
+pub use changes::{Changes, Commit, FileChange, FileStatus};
 
 /// The longest branch [`safe_branch`] makes, in bytes.
 const BRANCH_AT_MOST: usize = 100;
@@ -868,7 +868,7 @@ impl Inner {
                 .lines()
                 .map(str::to_owned)
                 .collect();
-            (self.uncommitted(worktree).await?, submodules)
+            (self.uncommitted(worktree, None).await?, submodules)
         } else {
             (Vec::new(), Vec::new())
         };
@@ -899,11 +899,16 @@ impl Inner {
     }
 
     /// Paths in `worktree` that are changed, deleted or new, not committed and not ignored,
-    /// sorted.
-    async fn uncommitted(&self, worktree: &Path) -> Result<Vec<String>, WorkspaceError> {
+    /// sorted. Read with git's index at `index` in place of the worktree's own, when given.
+    async fn uncommitted(
+        &self,
+        worktree: &Path,
+        index: Option<&Path>,
+    ) -> Result<Vec<String>, WorkspaceError> {
         let out = self
-            .git(
+            .git_on(
                 worktree,
+                index,
                 "status",
                 ["--porcelain=v1", "-z", "--untracked-files=all"],
             )
@@ -938,8 +943,27 @@ impl Inner {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        self.git_on(dir, None, command, args).await
+    }
+
+    /// [`Inner::git`] with git's index at `index` in place of the worktree's own, when given.
+    async fn git_on<I, S>(
+        &self,
+        dir: &Path,
+        index: Option<&Path>,
+        command: &'static str,
+        args: I,
+    ) -> Result<String, WorkspaceError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
         let failed = |stderr: String| WorkspaceError::Git { command, stderr };
-        let run = tokio::process::Command::new("git")
+        let mut run = tokio::process::Command::new("git");
+        if let Some(index) = index {
+            run.env("GIT_INDEX_FILE", index);
+        }
+        let run = run
             .arg(command)
             .args(args)
             .current_dir(dir)

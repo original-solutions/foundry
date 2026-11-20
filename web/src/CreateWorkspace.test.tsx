@@ -3,6 +3,7 @@ import { useState, type ComponentProps } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CreateWorkspace } from "./CreateWorkspace";
 import { fleet } from "./fleet";
+import { bigField, field, inlineField, primaryButton } from "./Modal";
 import { ME, settings, workspace } from "./test-fixtures";
 import { json, mockFetch, renderApp } from "./test-utils";
 
@@ -69,6 +70,29 @@ describe("CreateWorkspace", () => {
     fireEvent.click(screen.getByRole("radio", { name: /other/ }));
     expect((screen.getByRole("button", { name: "Create and open" }) as HTMLButtonElement).disabled).toBe(false);
     expect(calls).toEqual([]);
+  });
+
+  it("wears the shared primary button look on its one action", async () => {
+    await renderApp(<Harness />);
+    await fill("e2e work");
+    const create = screen.getByRole("button", { name: "Create and open" });
+    expect(primaryButton.split(" ").filter((c) => !create.classList.contains(c))).toEqual([]);
+  });
+
+  it("builds its Name and Base inputs from the shared field look", async () => {
+    await renderApp(<Harness />);
+    await fill("e2e work");
+    const missing = (el: Element, look: string) => look.split(" ").filter((c) => !el.classList.contains(c));
+    expect(missing(screen.getByLabelText("Name"), bigField)).toEqual([]);
+    expect(missing(screen.getByLabelText("Base"), inlineField)).toEqual([]);
+  });
+
+  it("keeps a visible focus on every shared field look", () => {
+    for (const look of [field, bigField, inlineField]) {
+      const classes = look.split(" ");
+      expect(classes).not.toContain("outline-none");
+      expect(classes.some((c) => c.startsWith("focus:"))).toBe(true);
+    }
   });
 
   it("lists each project with how many workspaces it has open, the first one picked", async () => {

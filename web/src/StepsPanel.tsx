@@ -1,17 +1,17 @@
-import { keepPreviousData, useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { ApiError, sessionTrail, type Mark } from "./api";
-import type { Glyph } from "./labels";
+import { addsSteps, busy, type Glyph } from "./labels";
+import { pollEvery } from "./poll";
 import { StateGlyph } from "./StateGlyph";
 import { ago, kindOf, tally, took, turns, type StepKind, type Turn } from "./trail";
 
-/** How often an open panel reads a busy session's trail again. */
+/** How often an open panel reads a working session's trail again. */
 export const STEPS_EVERY = 2000;
 
 /** What the panel shows the steps of: a session, or a shell, which has none. */
 export type StepsOf = { kind: "session"; id: string; name: string; title?: string; glyph: Glyph; label: string } | { kind: "shell"; name: string };
 
-const busy: Glyph[] = ["starting", "working", "waiting", "stuck"];
 
 const chip: Record<StepKind, { mark: string; tone: string }> = {
   command: { mark: "$", tone: "bg-emerald-400/15 text-emerald-300" },
@@ -57,14 +57,20 @@ function Note({ children }: { children: React.ReactNode }) {
 }
 
 function Trail({ session }: { session: Extract<StepsOf, { kind: "session" }> }) {
-  const live = busy.includes(session.glyph);
+  const client = useQueryClient();
   const { data, error, isPending } = useQuery({
-    queryKey: ["trail", session.id, session.label],
+    queryKey: ["trail", session.id],
     queryFn: () => sessionTrail(session.id),
-    placeholderData: keepPreviousData,
-    refetchInterval: (q) => (live && q.state.status !== "error" ? STEPS_EVERY : false),
+    refetchInterval: pollEvery(STEPS_EVERY, addsSteps.includes(session.glyph)),
     retry: false,
   });
+  // A state change means a hook arrived: read the trail again under the same entry.
+  const last = useRef(session.label);
+  useEffect(() => {
+    if (last.current === session.label) return;
+    last.current = session.label;
+    void client.invalidateQueries({ queryKey: ["trail", session.id], exact: true });
+  }, [session.label, session.id, client]);
   const now = useNow();
   const scroller = useRef<HTMLDivElement>(null);
   const pinned = useRef(true);

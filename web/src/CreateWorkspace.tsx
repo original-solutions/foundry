@@ -4,7 +4,8 @@ import { Dialog } from "radix-ui";
 import { ApiError, createWorkspace, startSession, type Project } from "./api";
 import { safeBranch, sameBranch } from "./branch";
 import type { WorkspaceView } from "./fleet";
-import { button, field, Modal } from "./Modal";
+import { plural } from "./labels";
+import { bigField, button, field, inlineField, Modal, primaryButton } from "./Modal";
 
 /** The workspace was made, but its session did not start. */
 class SessionNotStarted extends ApiError {}
@@ -126,7 +127,7 @@ function Form({ projects, workspaces, initialName, create, step, onSubmit }: For
           value={name}
           onChange={(e) => setName(e.target.value)}
           placeholder="What are you working on?"
-          className="w-full rounded-lg border border-neutral-700 bg-neutral-950 px-3 py-2.5 text-base text-neutral-100 outline-none placeholder:text-neutral-600 focus:border-neutral-400"
+          className={bigField}
         />
         <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-neutral-500">
           <BranchIcon className="size-3.5 shrink-0" />
@@ -146,7 +147,7 @@ function Form({ projects, workspaces, initialName, create, step, onSubmit }: For
               value={base}
               onChange={(e) => setBase(e.target.value)}
               size={Math.max(base.length, 4)}
-              className="rounded border border-neutral-700 bg-neutral-950 px-1.5 py-0.5 font-mono text-neutral-200 outline-none focus:border-neutral-400"
+              className={inlineField}
             />
           </label>
         </div>
@@ -171,7 +172,7 @@ function Form({ projects, workspaces, initialName, create, step, onSubmit }: For
               return (
                 <label
                   key={p.id}
-                  title={`${count} workspace${count === 1 ? "" : "s"} open`}
+                  title={`${plural(count, "workspace")} open`}
                   className={`flex cursor-pointer items-center gap-2 rounded-lg border px-3 py-1.5 has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-neutral-400 ${
                     on ? "border-neutral-300 bg-neutral-100 text-neutral-900" : "border-neutral-700 text-neutral-300 hover:border-neutral-500"
                   }`}
@@ -223,7 +224,7 @@ function Form({ projects, workspaces, initialName, create, step, onSubmit }: For
           <button
             type="submit"
             disabled={projects.length === 0 || create.isPending || Boolean(taken)}
-            className="rounded bg-emerald-400 px-3 py-1 text-xs font-semibold text-neutral-950 hover:bg-emerald-300 disabled:opacity-40"
+            className={primaryButton}
           >
             Create and open
           </button>

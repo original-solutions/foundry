@@ -4,6 +4,7 @@ import { findKey } from "./FindBar";
 import { totals } from "./changes";
 import type { Located } from "./fleet";
 import { jumpKey, SearchIcon } from "./JumpPalette";
+import { button, pressed } from "./Modal";
 import { StatePill } from "./StateGlyph";
 import { StepsIcon } from "./StepsPanel";
 
@@ -92,7 +93,7 @@ export function TerminalHeader({
               aria-pressed={stepsOpen}
               title="Every prompt, tool and question of this session, turn by turn"
               onClick={onSteps}
-              className={`flex shrink-0 items-center gap-1.5 rounded border px-2 py-0.5 text-xs ${stepsOpen ? "border-sky-400/50 bg-sky-400/10 text-sky-200" : "border-neutral-700 text-neutral-300 hover:border-neutral-500 hover:text-neutral-100"}`}
+              className={`flex shrink-0 items-center gap-1.5 ${button} ${pressed}`}
             >
               <StepsIcon className="size-3.5" />
               <span className="sr-only sm:not-sr-only">Steps</span>
@@ -170,7 +171,7 @@ function ChangesButton({ workspace, onClick }: { workspace: string; onClick: () 
       type="button"
       onClick={onClick}
       title="Changes since the base branch"
-      className="flex shrink-0 items-center gap-1.5 rounded border border-neutral-700 px-2 py-0.5 text-xs text-neutral-300 hover:border-neutral-500 hover:text-neutral-100"
+      className={`flex shrink-0 items-center gap-1.5 ${button}`}
     >
       <svg viewBox="0 0 16 16" className="size-3.5" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
         <path d="M8 2.5v6M5 5.5h6M5 12.5h6" strokeLinecap="round" />

@@ -2,30 +2,29 @@
 //!
 //! The changes are the worktree as it is on disk, committed or not, against the commit where its
 //! branch left `origin/<base>`, plus each new file git does not ignore. A read changes nothing in
-//! the worktree, its index or its refs. A new file is read only when it is a plain file, never
-//! through a symlink, so a link the agent made cannot show a file outside the worktree.
+//! the worktree, its index or its refs, and takes no lock. It works on its own copy of the index,
+//! so it never takes git's index lock, which an agent's own git command in the worktree needs.
+//! It does not take the workspace's lifecycle lock, so it never holds up a start or an archive:
+//! a read an archive overtakes finds the worktree gone and fails as the workspace being gone.
+//! A new file is read only when it is a plain file, never through a symlink, so a link the agent
+//! made cannot show a file outside the worktree.
 
 use std::collections::BTreeSet;
-use std::path::Path;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
 
 use foundry_proto::ids::WorkspaceId;
 use serde::Serialize;
 
 use super::{Inner, WorkspaceError, Workspaces};
 
-/// How long a whole read may take before it is stopped and fails, so a git that hangs cannot
-/// hold the workspace's lifecycle lock.
-const READ_WITHIN: Duration = Duration::from_secs(20);
-
 /// The longest diff kept for one file, in bytes. A longer one is listed with its counts only.
 pub(crate) const FILE_AT_MOST: usize = 256 * 1024;
 
 /// The most diff text one read sends, in bytes. Files past it are listed with counts only.
-const ALL_AT_MOST: usize = 4 * 1024 * 1024;
+pub(crate) const ALL_AT_MOST: usize = 4 * 1024 * 1024;
 
 /// The most new files read for their text. Any more are listed by name only.
-const NEW_READ_AT_MOST: usize = 500;
+pub(crate) const NEW_READ_AT_MOST: usize = 500;
 
 /// The most commits listed.
 const COMMITS_AT_MOST: usize = 200;
@@ -35,11 +34,17 @@ const COMMITS_AT_MOST: usize = 200;
 pub struct Changes {
     /// The branch the workspace was made from.
     pub base: String,
-    /// Commits on the worktree's `HEAD` that its base does not have, newest first, each as its
-    /// short hash and subject.
-    pub commits: Vec<String>,
+    /// Commits on the worktree's `HEAD` that its base does not have, newest first.
+    pub commits: Vec<Commit>,
     /// Each changed path, sorted by path.
     pub files: Vec<FileChange>,
+}
+
+/// One commit, by its short hash and its subject.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Commit {
+    pub hash: String,
+    pub subject: String,
 }
 
 /// One changed path.
@@ -54,8 +59,8 @@ pub struct FileChange {
     pub removed: Option<u64>,
     /// Whether some of the change is not committed yet.
     pub uncommitted: bool,
-    /// The hunks, from the first `@@` line, or `None` when the file is binary, a symlink or too
-    /// large to send.
+    /// The hunks, from the first `@@` line, or `None` when the file is binary, a symlink, changed
+    /// type or is too large to send.
     pub patch: Option<String>,
 }
 
@@ -71,25 +76,17 @@ pub enum FileStatus {
 }
 
 impl Workspaces {
-    /// What live workspace `id` has changed since it left its base, read under the workspace's
-    /// lifecycle lock so an archive never removes the worktree mid-read.
+    /// What live workspace `id` has changed since it left its base. Each git call is bounded
+    /// as every git call here is. A read that fails with the worktree gone, as when an archive
+    /// removes it mid-read, is [`WorkspaceError::Unknown`]: there is nothing here to read.
     pub async fn changes(&self, id: WorkspaceId) -> Result<Changes, WorkspaceError> {
-        let inner = self.inner.clone();
-        self.locked(id, async move {
-            let body = inner.live(id).await?;
-            let worktree = inner.worktree(body.project, &body.branch);
-            match tokio::time::timeout(READ_WITHIN, inner.changes(&worktree, &body.base)).await {
-                Ok(changes) => changes,
-                Err(_) => Err(WorkspaceError::Git {
-                    command: "diff",
-                    stderr: format!(
-                        "reading the changes did not finish within {} s and was stopped",
-                        READ_WITHIN.as_secs()
-                    ),
-                }),
-            }
-        })
-        .await
+        let body = self.inner.live(id).await?;
+        let worktree = self.inner.worktree(body.project, &body.branch);
+        let read = self.inner.changes(&worktree, &body.base).await;
+        if read.is_err() && !tokio::fs::try_exists(&worktree).await.unwrap_or(true) {
+            return Err(WorkspaceError::Unknown(id));
+        }
+        read
     }
 }
 
@@ -120,12 +117,25 @@ impl Inner {
             )
             .await?
             .lines()
-            .map(str::to_owned)
+            .map(|line| {
+                let (hash, subject) = line.split_once(' ').unwrap_or((line, ""));
+                Commit {
+                    hash: hash.to_owned(),
+                    subject: subject.to_owned(),
+                }
+            })
             .collect();
+        // Git refreshes the index as it compares the worktree with it, and a `diff` writes what
+        // it refreshed under the index's lock whatever `GIT_OPTIONAL_LOCKS` says. So the read
+        // works on its own copy, and an agent's git command in the worktree never finds the
+        // lock taken.
+        let copy = IndexCopy::of(self, worktree).await?;
+        let index = Some(copy.0.as_path());
         let diff = ["--no-color", "--no-ext-diff", "--no-textconv", "-M"];
         let names = self
-            .git(
+            .git_on(
                 worktree,
+                index,
                 "diff",
                 diff.iter()
                     .copied()
@@ -133,8 +143,9 @@ impl Inner {
             )
             .await?;
         let counts = self
-            .git(
+            .git_on(
                 worktree,
+                index,
                 "diff",
                 diff.iter()
                     .copied()
@@ -142,24 +153,36 @@ impl Inner {
             )
             .await?;
         let patches = self
-            .git(
+            .git_on(
                 worktree,
+                index,
                 "diff",
                 diff.iter().copied().chain([from.as_str(), "--"]),
             )
             .await?;
-        let uncommitted: BTreeSet<String> = self.uncommitted(worktree).await?.into_iter().collect();
+        let uncommitted: BTreeSet<String> = self
+            .uncommitted(worktree, index)
+            .await?
+            .into_iter()
+            .collect();
 
         let mut files = Vec::new();
         let mut left = ALL_AT_MOST;
         let counts = numstat(&counts);
         let patches = split_patches(&patches);
-        for (i, (status, path, old)) in name_status(&names).into_iter().enumerate() {
+        // `--name-status` and `--numstat` list each path once; the patch has two pieces for a
+        // path whose type changed, so its pieces are walked on their own.
+        let mut piece = 0;
+        for (i, (status, path, old, typechange)) in name_status(&names).into_iter().enumerate() {
             let (added, removed) = counts.get(i).copied().unwrap_or((None, None));
-            let patch = patches
-                .get(i)
-                .and_then(|p| hunks(p))
-                .filter(|p| p.len() <= FILE_AT_MOST && p.len() <= left);
+            let patch = if typechange {
+                piece += 2;
+                None
+            } else {
+                piece += 1;
+                patches.get(piece - 1).and_then(|p| hunks(p))
+            }
+            .filter(|p| p.len() <= FILE_AT_MOST && p.len() <= left);
             left -= patch.as_ref().map_or(0, String::len);
             files.push(FileChange {
                 uncommitted: uncommitted.contains(&path)
@@ -216,6 +239,27 @@ impl Inner {
     }
 }
 
+/// A copy of a worktree's index, beside it, for one read; removed when dropped.
+struct IndexCopy(PathBuf);
+
+impl IndexCopy {
+    async fn of(inner: &Inner, worktree: &Path) -> Result<IndexCopy, WorkspaceError> {
+        let index = inner
+            .git(worktree, "rev-parse", ["--git-path", "index"])
+            .await?;
+        let index = worktree.join(index.trim_end_matches('\n'));
+        let copy = index.with_file_name(format!("index.foundry-read-{}", uuid::Uuid::new_v4()));
+        tokio::fs::copy(&index, &copy).await?;
+        Ok(IndexCopy(copy))
+    }
+}
+
+impl Drop for IndexCopy {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 enum New {
     Text(String),
     Binary,
@@ -254,8 +298,10 @@ fn as_added(text: &str) -> (u64, String) {
     (lines.len() as u64, patch)
 }
 
-/// `git diff --name-status -z`: each path's status, path and the path it came from.
-fn name_status(out: &str) -> Vec<(FileStatus, String, Option<String>)> {
+/// `git diff --name-status -z`: each path's status, path, the path it came from, and whether its
+/// type changed (a link made a file, or the other way), which git shows as `M`'s status here
+/// and as a delete and an add in a patch.
+fn name_status(out: &str) -> Vec<(FileStatus, String, Option<String>, bool)> {
     let mut parts = out.split('\0').filter(|p| !p.is_empty());
     let mut files = Vec::new();
     while let Some(code) = parts.next() {
@@ -269,10 +315,10 @@ fn name_status(out: &str) -> Vec<(FileStatus, String, Option<String>)> {
             let (Some(old), Some(new)) = (parts.next(), parts.next()) else {
                 break;
             };
-            files.push((status, new.to_owned(), Some(old.to_owned())));
+            files.push((status, new.to_owned(), Some(old.to_owned()), false));
         } else {
             let Some(path) = parts.next() else { break };
-            files.push((status, path.to_owned(), None));
+            files.push((status, path.to_owned(), None, code.starts_with('T')));
         }
     }
     files
@@ -334,18 +380,20 @@ mod tests {
 
     #[test]
     fn name_status_reads_renames_with_both_paths() {
-        let out = "M\0a.txt\0R087\0old name.txt\0new name.txt\0D\0gone\0A\0new\0";
+        let out = "M\0a.txt\0R087\0old name.txt\0new name.txt\0D\0gone\0A\0new\0T\0link\0";
         assert_eq!(
             name_status(out),
             [
-                (FileStatus::Modified, "a.txt".into(), None),
+                (FileStatus::Modified, "a.txt".into(), None, false),
                 (
                     FileStatus::Renamed,
                     "new name.txt".into(),
-                    Some("old name.txt".into())
+                    Some("old name.txt".into()),
+                    false
                 ),
-                (FileStatus::Deleted, "gone".into(), None),
-                (FileStatus::Added, "new".into(), None),
+                (FileStatus::Deleted, "gone".into(), None, false),
+                (FileStatus::Added, "new".into(), None, false),
+                (FileStatus::Modified, "link".into(), None, true),
             ]
         );
     }

@@ -1234,6 +1234,8 @@ async fn a_sessions_brief_names_its_first_prompt_and_its_newest_step_with_its_se
     assert_eq!(brief.title.as_deref(), Some("fix it with ••• and •••"));
     assert_eq!(brief.now.as_ref().map(|s| s.text.as_str()), Some("$ ls"));
     assert_eq!(briefs[&other], brief::Brief::default());
+    // The trail is served on its own: the briefs carry none of it.
+    assert!(brief.trail.is_empty(), "{:?}", brief.trail);
 
     let trail = f.sessions.trail(id).expect("a trail for a live session");
     let texts: Vec<&str> = trail.iter().map(|m| m.text.as_str()).collect();
