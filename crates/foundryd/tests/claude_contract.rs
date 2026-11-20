@@ -3,7 +3,7 @@
 //! One session, started the way `sessions` starts one: the daemon's own settings file and curl
 //! config, its trust mark on a folder Claude Code has never seen, and `claude --settings <file>
 //! --model <model>` in a PTY with the gateway variables set. The test then runs one shell
-//! command, answers a permission with yes, denies one, interrupts a turn with Esc while its tool
+//! command from a first prompt typed as `sessions` types one, answers a permission with yes, denies one, interrupts a turn with Esc while its tool
 //! runs, and exits with `/exit`. It checks that no trust prompt shows, that each hook `sessions`
 //! registers arrives with the fields it reads, and that each step posts exactly the hooks the doc
 //! lists for it, in order: none after the denial or the Esc. It prints every hook of each step.
@@ -114,16 +114,35 @@ fn claude_code_posts_the_hooks_sessions_reads() {
     run.report("start", 0);
     run.expect("start", 0, &["SessionStart"]);
 
-    // One shell command, which the default permission mode runs without asking.
+    // One shell command, which the default permission mode runs without asking, as the first
+    // prompt, typed the way `sessions` types one: a paste and Enter once Claude Code has turned
+    // bracketed paste on. Its newline stays in the one prompt.
     let mark = posted.len();
-    session.prompt(
-        "Run the shell command `echo foundry-contract` with your Bash tool. Do nothing else.",
+    let screen = session.screen();
+    assert!(
+        screen
+            .windows(claude::TAKES_INPUT.len())
+            .any(|w| w == claude::TAKES_INPUT),
+        "Claude Code did not turn bracketed paste on:\n{}",
+        session.tail()
     );
+    let first =
+        "Run the shell command `echo foundry-contract` with your Bash tool.\nDo nothing else.";
+    session.send(&claude::typed_prompt(first));
     run.wait_for(mark, "PostToolUse", TURN);
     run.wait_for(mark, "Stop", TURN);
     run.report("shell command", mark);
     let turn = ["UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"];
     run.expect("shell command", mark, &turn);
+    let submitted = posted.all()[mark..]
+        .iter()
+        .find(|p| p["hook_event_name"] == "UserPromptSubmit")
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        submitted["prompt"], first,
+        "the first prompt arrived changed: {submitted}"
+    );
 
     // A write the default permission mode asks about, answered yes.
     let mark = posted.len();

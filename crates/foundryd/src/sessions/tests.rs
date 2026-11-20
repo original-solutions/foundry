@@ -435,7 +435,8 @@ async fn args_and_prompts(
     let (snapshot, mut output) = f.terminals.attach(terminal).await.unwrap();
     let prompts = |seen: &str| -> Vec<String> {
         seen.lines()
-            .filter_map(|l| l.trim_end().strip_prefix("PROMPT="))
+            // The sign that the agent takes input may come first on the line.
+            .filter_map(|l| l.trim_end().split_once("PROMPT=").map(|(_, json)| json))
             .map(|json| serde_json::from_str(json).unwrap())
             .collect()
     };
@@ -480,6 +481,10 @@ async fn a_first_prompt_is_in_no_argument_and_is_typed_as_one_prompt_once_the_ag
     let want = "-v fix the login,\nthen say \"done\" [201~\n and stop";
     assert_eq!(prompts, [want]);
     // Its hook reports it as any typed prompt.
+    until("the prompt's hook", || {
+        f.sessions.trail(id).is_some_and(|t| !t.is_empty())
+    })
+    .await;
     let trail = f.sessions.trail(id).unwrap();
     let texts: Vec<&str> = trail.iter().map(|m| m.text.as_str()).collect();
     assert_eq!(

@@ -1,5 +1,6 @@
-//! What Claude Code reads: the settings file that registers the hooks, and the state file where
-//! a folder is marked trusted so the trust prompt does not stop a session.
+//! What Claude Code reads: the settings file that registers the hooks, the state file where
+//! a folder is marked trusted so the trust prompt does not stop a session, and the keys that
+//! type a session's first prompt.
 
 use std::ffi::OsString;
 use std::io::{self, Write as _};
@@ -23,6 +24,20 @@ const EVENTS: [&str; 7] = [
 
 /// The events that take a tool matcher.
 const TOOL_EVENTS: [&str; 2] = ["PreToolUse", "PostToolUse"];
+
+/// What Claude Code writes once its input box takes keys: it turns bracketed paste on. The
+/// `SessionStart` hook comes before the box is drawn, so it is not the sign.
+pub const TAKES_INPUT: &[u8] = b"\x1b[?2004h";
+
+/// The keys that give Claude Code `prompt` as one prompt, as a person who pastes it and
+/// presses Enter: a bracketed paste, so its newlines stay in the prompt, then Enter. An escape
+/// in `prompt` is dropped, so it cannot end the paste early and type the rest as keys.
+pub fn typed_prompt(prompt: &str) -> Vec<u8> {
+    let mut keys = b"\x1b[200~".to_vec();
+    keys.extend(prompt.bytes().filter(|&b| b != 0x1b));
+    keys.extend_from_slice(b"\x1b[201~\r");
+    keys
+}
 
 /// `text` in single quotes for `sh`, each `'` in it written as `'\''`.
 pub fn shell_quote(text: &str) -> String {
@@ -286,6 +301,14 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string()
+    }
+
+    #[test]
+    fn a_prompt_is_typed_as_one_bracketed_paste_then_enter_with_no_escape_in_it() {
+        assert_eq!(
+            typed_prompt("fix it\nthen \u{1b}[201~\rstop é"),
+            "\u{1b}[200~fix it\nthen [201~\rstop é\u{1b}[201~\r".as_bytes()
+        );
     }
 
     #[test]

@@ -2,7 +2,9 @@
 //!
 //! [`Sessions::start`] writes a settings file that registers hooks posting to this daemon's
 //! loopback port with a per-session token, marks the worktree trusted for Claude Code, and
-//! starts `claude --settings <file>` in a terminal with the gateway variables set. From then
+//! starts `claude --settings <file>` in a terminal with the gateway variables set. A first
+//! prompt is typed into the terminal once Claude Code takes input, so it is in no process's
+//! arguments, which every user on the machine can read. From then
 //! on the session's state comes from three sources, combined by [`state::next_state`]: the
 //! hooks ([`Sessions::router`]), the terminal's output, and the child's exit. A session that
 //! is working with no hook and no output for [`STUCK_AFTER`] is stuck.
@@ -20,6 +22,7 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::routing::post;
+use bytes::Bytes;
 use foundry_proto::ids::{MachineId, SessionId, TerminalId, WorkspaceId};
 use foundry_proto::record::{AnyRecord, Record, Session};
 use foundry_proto::state::{SessionState, TerminalState};
@@ -214,9 +217,10 @@ impl Sessions {
         self.start_with(workspace, worktree, model, None).await
     }
 
-    /// [`Sessions::start`], with `prompt` as Claude Code's first prompt: it is given as the
-    /// last argument, after `--`, so Claude Code starts on it and its hooks report it as any
-    /// typed prompt. A blank prompt is no prompt.
+    /// [`Sessions::start`], with `prompt` as Claude Code's first prompt. It is typed into the
+    /// terminal as a paste and Enter once Claude Code takes input ([`claude::TAKES_INPUT`]), so
+    /// its hooks report it as any typed prompt and it is never on a command line. A blank
+    /// prompt is no prompt.
     pub async fn start_with(
         &self,
         workspace: WorkspaceId,
@@ -342,9 +346,7 @@ impl Inner {
         let mut body = live.body.lock().await;
         lock(&self.live).insert(id, live.clone());
 
-        let started = self
-            .launch(&settings, workspace, worktree, model, prompt)
-            .await;
+        let started = self.launch(&settings, workspace, worktree, model).await;
         let (terminal, floor) = match started {
             Ok(started) => started,
             Err(error) => {
@@ -364,8 +366,10 @@ impl Inner {
         }
         drop(body);
 
+        let prompt = prompt.map(|p| Bytes::from(claude::typed_prompt(p)));
         let tasks = [
-            tokio::spawn(follow(self.clone(), live.clone(), terminal, floor)).abort_handle(),
+            tokio::spawn(follow(self.clone(), live.clone(), terminal, floor, prompt))
+                .abort_handle(),
             tokio::spawn(watch_for_stuck(self.clone(), live.clone())).abort_handle(),
         ];
         lock(&live.tasks).extend(tasks);
@@ -381,7 +385,6 @@ impl Inner {
         workspace: WorkspaceId,
         worktree: &Path,
         model: &str,
-        prompt: Option<&str>,
     ) -> Result<(TerminalId, u64), SessionError> {
         let me = self.me;
         let floor = self
@@ -394,9 +397,6 @@ impl Inner {
             "--model".into(),
             model.to_string(),
         ]);
-        if let Some(prompt) = prompt {
-            argv.extend(["--".into(), prompt.to_string()]);
-        }
         let env = [
             (
                 "ANTHROPIC_BASE_URL".to_string(),
@@ -529,17 +529,27 @@ impl Inner {
 }
 
 /// Follows the session's terminal: each chunk of output is an [`Event::Output`], and the end of
-/// the child is an [`Event::Exited`].
-async fn follow(inner: Arc<Inner>, live: Arc<Live>, terminal: TerminalId, mut cursor: u64) {
+/// the child is an [`Event::Exited`]. `prompt`, the keys of a first prompt, is typed once the
+/// output shows Claude Code takes input.
+async fn follow(
+    inner: Arc<Inner>,
+    live: Arc<Live>,
+    terminal: TerminalId,
+    mut cursor: u64,
+    mut prompt: Option<Bytes>,
+) {
     let mut backoff = Backoff::new();
     loop {
         match inner.terminals.attach(terminal).await {
-            // What the terminal already held is not new output.
-            Ok((_, mut output)) => {
+            // What the terminal already held is not new output, but it may show the sign.
+            Ok((snapshot, mut output)) => {
                 backoff.reset();
+                let mut seen = Vec::new();
+                hand_over(&inner, terminal, &mut prompt, &mut seen, &snapshot.bytes).await;
                 loop {
                     match output.next().await {
                         Some(Ok(bytes)) => {
+                            hand_over(&inner, terminal, &mut prompt, &mut seen, &bytes).await;
                             if !bytes.is_empty() {
                                 report(&inner, &live, Event::Output).await;
                             }
@@ -560,6 +570,33 @@ async fn follow(inner: Arc<Inner>, live: Arc<Live>, terminal: TerminalId, mut cu
                 retry(&mut backoff, terminal, error).await;
             }
         }
+    }
+}
+
+/// Types `prompt` into `terminal` once `output`, the terminal's next bytes, shows Claude Code
+/// takes input, and leaves it `None`. `seen` keeps the end of the bytes before, so a sign cut
+/// between two reads is still found. A prompt the holder refuses is lost: the session goes on
+/// without it, as it would with keys typed into a full terminal.
+async fn hand_over(
+    inner: &Inner,
+    terminal: TerminalId,
+    prompt: &mut Option<Bytes>,
+    seen: &mut Vec<u8>,
+    output: &[u8],
+) {
+    if prompt.is_none() {
+        return;
+    }
+    seen.extend_from_slice(output);
+    let sign = claude::TAKES_INPUT;
+    if !seen.windows(sign.len()).any(|w| w == sign) {
+        seen.drain(..seen.len().saturating_sub(sign.len() - 1));
+        return;
+    }
+    if let Some(keys) = prompt.take()
+        && let Err(error) = inner.terminals.input(terminal, keys).await
+    {
+        tracing::warn!(terminal = %terminal, %error, "the first prompt was not typed");
     }
 }
 
