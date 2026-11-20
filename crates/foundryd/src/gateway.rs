@@ -9,7 +9,7 @@
 //!
 //! The key is read from the secret store once and kept. It is read again only while it is not
 //! set, so a key set with `foundryd secret set` counts from the next read, and after the
-//! gateway refuses it. A store that cannot read it (a denied keychain prompt, say) is not asked
+//! gateway refuses it, when it is sent again only once it has changed. A store that cannot read it (a denied keychain prompt, say) is not asked
 //! again until the daemon restarts, so it never prompts every few seconds. Neither the key nor a
 //! password in the URL reaches an item or a log line.
 
@@ -39,8 +39,8 @@ pub enum Health {
     KeyUnreadable,
     /// It did not answer with its accounts, for this reason.
     Unanswered(String),
-    /// It refused the management key with this status.
-    KeyRefused(u16),
+    /// It refused the management key: it answered 401.
+    KeyRefused,
     /// It answered with no account that is not disabled.
     NoAccounts,
     /// Every account that is not disabled is cooling down. `free_in` is how long until the
@@ -105,12 +105,22 @@ fn judged(files: &[AuthFile]) -> Health {
     }
 }
 
+/// The most of the gateway's own reason an item shows.
+const REASON_AT_MOST: usize = 200;
+
+/// The part of an error answer from the gateway this reads.
+#[derive(Deserialize)]
+struct Refusal {
+    error: String,
+}
+
 /// Reads the gateway at `url` with the management key `key`. Blocks for up to
 /// [`ANSWER_WITHIN`].
 pub fn read(url: &str, key: &str) -> Health {
     let endpoint = format!("{}/v0/management/auth-files", url.trim_end_matches('/'));
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(ANSWER_WITHIN))
+        .http_status_as_error(false)
         .build()
         .into();
     let answer = agent
@@ -118,12 +128,25 @@ pub fn read(url: &str, key: &str) -> Health {
         .header("Authorization", format!("Bearer {key}"))
         .call();
     let why = match answer {
-        Ok(mut response) => match response.body_mut().read_json::<AuthFiles>() {
-            Ok(answer) => return judged(&answer.files),
-            Err(_) => "its answer is not a list of accounts".to_owned(),
-        },
-        Err(ureq::Error::StatusCode(status @ (401 | 403))) => return Health::KeyRefused(status),
-        Err(ureq::Error::StatusCode(status)) => format!("it answered {status}"),
+        Ok(response) if response.status() == 401 => return Health::KeyRefused,
+        Ok(mut response) if response.status().is_success() => {
+            match response.body_mut().read_json::<AuthFiles>() {
+                Ok(answer) => return judged(&answer.files),
+                Err(_) => "its answer is not a list of accounts".to_owned(),
+            }
+        }
+        // CLIProxyAPI says why in `error`: remote management disabled, an address banned
+        // after failed keys, and so on.
+        Ok(mut response) => {
+            let status = response.status().as_u16();
+            match response.body_mut().read_json::<Refusal>() {
+                Ok(refusal) => {
+                    let reason: String = refusal.error.chars().take(REASON_AT_MOST).collect();
+                    format!("it answered {status}: {reason}")
+                }
+                Err(_) => format!("it answered {status}"),
+            }
+        }
         Err(error) => error.to_string(),
     };
     Health::Unanswered(redact(&why).replace(key, "***"))
@@ -157,9 +180,12 @@ pub fn check(url: Option<&str>, key: Result<Option<&str>, &SecretsError>) -> Hea
 
 /// The management key as the reader holds it.
 enum Key {
-    /// Not read yet, not set when last read, or refused by the gateway: read it next time.
+    /// Not read yet, or not set when last read: read it next time.
     Unread,
     Held(String),
+    /// The gateway refused this key. It is read again each time, and sent again only once it
+    /// has changed, since CLIProxyAPI bans an address after five refused keys.
+    Refused(String),
     /// The secret store could not read it; not asked again.
     Unreadable,
 }
@@ -210,12 +236,17 @@ impl Reader {
         let key = match &*held {
             Key::Held(key) => Ok(Some(key.clone())),
             Key::Unreadable => return Health::KeyUnreadable,
-            Key::Unread => self.secrets.get(GATEWAY_MANAGEMENT),
+            Key::Unread | Key::Refused(_) => self.secrets.get(GATEWAY_MANAGEMENT),
         };
+        if let (Key::Refused(refused), Ok(Some(key))) = (&*held, &key)
+            && refused == key
+        {
+            return Health::KeyRefused;
+        }
         let health = check(self.url.as_deref(), key.as_ref().map(Option::as_deref));
         *held = match (key, &health) {
             (_, Health::KeyUnreadable) => Key::Unreadable,
-            (_, Health::KeyRefused(_)) => Key::Unread,
+            (Ok(Some(key)), Health::KeyRefused) => Key::Refused(key),
             (Ok(Some(key)), _) if !key.is_empty() => Key::Held(key),
             _ => Key::Unread,
         };
@@ -274,9 +305,9 @@ impl Source for Reader {
                 ),
                 "See the daemon log for why, fix it, then restart foundryd".to_owned(),
             ),
-            Some(Health::KeyRefused(status)) => (
+            Some(Health::KeyRefused) => (
                 format!(
-                    "The gateway at {} refused the management key: it answered {status}",
+                    "The gateway at {} refused the management key: it answered 401",
                     self.shown_url()
                 ),
                 format!("Run `foundryd secret set {GATEWAY_MANAGEMENT}` with the right key"),
