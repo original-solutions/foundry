@@ -1,7 +1,7 @@
 import { act, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { UiMessage } from "./api";
-import { settings, workspace, ME } from "./test-fixtures";
+import { sample, settings, workspace, ME } from "./test-fixtures";
 import { FakeSocket } from "./test-utils";
 import { useFleet } from "./useFleet";
 
@@ -27,7 +27,23 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+function SamplesProbe() {
+  const { samples } = useFleet();
+  const trace = samples[ME];
+  return <p>{trace ? `${trace.points.length} points, ${trace.heard === undefined ? "not heard" : "heard"}` : "no samples"}</p>;
+}
+
 describe("useFleet", () => {
+  it("keeps each machine's samples as they arrive, and a newer one than the first means it was heard", () => {
+    render(<SamplesProbe />);
+    const socket = FakeSocket.last();
+    act(() => socket.open());
+    act(() => socket.deliver(stateMessage([sample(ME, 3)])));
+    expect(screen.getByText("1 points, not heard")).toBeDefined();
+    act(() => socket.deliver(JSON.stringify({ type: "record", protocol: 1, record: sample(ME, 4) } satisfies UiMessage)));
+    expect(screen.getByText("2 points, heard")).toBeDefined();
+  });
+
   it("opens /api/events and shows the state it is sent", () => {
     render(<Probe />);
     const socket = FakeSocket.last();

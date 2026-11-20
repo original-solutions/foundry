@@ -88,8 +88,15 @@ export function Sidebar({ machines, onCreate, selected, connected, onNavigate, o
             <div className="px-1">
               <div className="flex items-center gap-2">
                 <span aria-hidden="true" className={`size-1.5 shrink-0 rounded-full ${statusDot[machine.status]}`} />
-                <h2 className="min-w-0 truncate font-semibold" title={machine.id}>
-                  {machine.name}
+                <h2 className="min-w-0 truncate font-semibold">
+                  <Link
+                    to="/machines"
+                    onClick={onNavigate}
+                    title={`${machine.id}: its load, memory, disk and workspaces`}
+                    className="rounded hover:underline hover:decoration-neutral-600 hover:underline-offset-4"
+                  >
+                    {machine.name}
+                  </Link>
                 </h2>
                 <span className={`text-xs ${statusColour[machine.status]}`}>{machine.status}</span>
                 {ids.length > 0 && (

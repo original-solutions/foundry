@@ -1,9 +1,11 @@
-import { createRootRoute, createRoute, createRouter, useNavigate, useParams } from "@tanstack/react-router";
+import { useQuery } from "@tanstack/react-query";
+import { createRootRoute, createRoute, createRouter, useNavigate, useParams, useRouterState } from "@tanstack/react-router";
 import { useEffect, useLayoutEffect, useMemo, useState } from "react";
 import { Board } from "./Board";
 import { ChangesPanel } from "./ChangesPanel";
 import { CreateWorkspace } from "./CreateWorkspace";
 import { JumpPalette } from "./JumpPalette";
+import { Machines } from "./Machines";
 import { NewSession } from "./NewSession";
 import { Sidebar } from "./Sidebar";
 import { StepsPanel, type StepsOf } from "./StepsPanel";
@@ -16,6 +18,7 @@ import { TerminalActions } from "./TerminalMenu";
 import { fleet, locate, terminalRunning } from "./fleet";
 import { useShortcut } from "./shortcut";
 import { useBriefs } from "./useBriefs";
+import { machineQuery } from "./api";
 import { useFleet } from "./useFleet";
 import { AlertsButton, useAlerts } from "./AlertsBell";
 
@@ -32,6 +35,11 @@ import { AlertsButton, useAlerts } from "./AlertsBell";
  * With nothing open, the board shows every workspace as a card with its live states and changes,
  * or, switched to its timeline, every session's turns on one clock; a turn opens its terminal
  * with the steps column.
+ *
+ * The machines view (`/machines`, from the board's switch or a machine's name in the sidebar)
+ * shows every machine as a card: its status, when it was last heard, its load drawn over the last
+ * ten minutes from the samples this page has seen, its free memory and disk, its terminals by
+ * state and its workspaces.
  *
  * A workspace made from the new-workspace dialog (the sidebar, the board or the palette opens
  * it) is landed in: once its session shows up, its terminal opens, with the setup shell as a tab
@@ -64,9 +72,11 @@ import { AlertsButton, useAlerts } from "./AlertsBell";
  * the side that has it. On a narrow screen only that side shows.
  */
 function Layout() {
-  const { state, connected } = useFleet();
+  const { state, connected, samples } = useFleet();
   const { terminalId } = useParams({ strict: false });
+  const onMachines = useRouterState({ select: (s) => s.location.pathname === "/machines" });
   const briefs = useBriefs(state.records);
+  const { data: here } = useQuery(machineQuery);
   const traced = useMemo(() => new Set(Object.keys(briefs)), [briefs]);
   const machines = useMemo(() => fleet(state.records, state.settings, briefs), [state.records, state.settings, briefs]);
   const [drawer, setDrawer] = useState(false);
@@ -193,7 +203,7 @@ function Layout() {
   useShortcut("f", terminalId ? () => setFinding((n) => n + 1) : undefined);
   useShortcut("\\", terminalId ? () => (split ? setSplit(undefined) : setJump("beside")) : undefined);
 
-  const place = !terminalId ? "flex w-full md:w-auto" : drawer ? "fixed inset-0 z-30 flex md:static md:z-auto" : "hidden md:flex";
+  const place = !terminalId && !onMachines ? "flex w-full md:w-auto" : drawer ? "fixed inset-0 z-30 flex md:static md:z-auto" : "hidden md:flex";
   return (
     <TerminalActions
       machines={machines}
@@ -229,7 +239,7 @@ function Layout() {
             alerts={<AlertsButton {...alerts} />}
           />
         </div>
-        <main className={`${terminalId ? "flex" : "hidden md:flex"} min-w-0 flex-1 flex-col`}>
+        <main className={`${terminalId || onMachines ? "flex" : "hidden md:flex"} min-w-0 flex-1 flex-col`}>
           <TabStrip
             machines={machines}
             tabs={kept}
@@ -282,7 +292,8 @@ function Layout() {
                 </div>
               );
             })}
-            {!terminalId && (
+            {!terminalId && onMachines && <Machines machines={machines} history={samples} here={here} connected={connected} onJump={openJump} />}
+            {!terminalId && !onMachines && (
               <Board
                 machines={machines}
                 onJump={openJump}
@@ -325,7 +336,8 @@ function Layout() {
 const rootRoute = createRootRoute({ component: Layout });
 const indexRoute = createRoute({ getParentRoute: () => rootRoute, path: "/" });
 const terminalRoute = createRoute({ getParentRoute: () => rootRoute, path: "/terminals/$terminalId" });
+const machinesRoute = createRoute({ getParentRoute: () => rootRoute, path: "/machines" });
 
-export const routeTree = rootRoute.addChildren([indexRoute, terminalRoute]);
+export const routeTree = rootRoute.addChildren([indexRoute, terminalRoute, machinesRoute]);
 export const router = createRouter({ routeTree });
 

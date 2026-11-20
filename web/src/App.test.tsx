@@ -294,6 +294,30 @@ describe("App", () => {
     expect(await screen.findByRole("dialog", { name: /changes in fix login/i })).toBeDefined();
   });
 
+  it("opens the machines view from the board's switch or a machine's name in the sidebar, and its samples draw as they arrive", async () => {
+    mockActions();
+    const router = await open("/", live);
+    fireEvent.click(screen.getByRole("radio", { name: "Machines" }));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/machines"));
+    const card = await screen.findByRole("article", { name: "studio" });
+    expect(screen.queryByRole("region", { name: "Working" })).toBeNull();
+    expect(within(card).getByText("This machine")).toBeDefined();
+    // A newer sample adds a point to the load line, and the machine was heard.
+    const events = sockets("/api/events").at(-1)!;
+    act(() => events.deliver(JSON.stringify({ type: "record", protocol: 1, record: sample(ME, 2, { load: 0.9 }) })));
+    expect(within(card).getByRole("img", { name: /load per core/i }).querySelector("polyline")?.getAttribute("points")?.split(" ")).toHaveLength(2);
+    expect(within(card).getByText(/heard just now/)).toBeDefined();
+
+    fireEvent.click(screen.getByRole("radio", { name: "Timeline" }));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/"));
+    expect(await screen.findByRole("region", { name: "Timeline" })).toBeDefined();
+
+    const name = within(screen.getByRole("navigation")).getByRole("link", { name: "studio" });
+    fireEvent.click(name);
+    await waitFor(() => expect(router.state.location.pathname).toBe("/machines"));
+    expect(screen.getByRole("region", { name: "Machines" })).toBeDefined();
+  });
+
   it("starts a new shell from the palette and opens it", async () => {
     const calls = mockActions(json(201, { id: "t9" }));
     const router = await open("/", live);

@@ -1,5 +1,5 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Link } from "@tanstack/react-router";
+import { Link, useNavigate } from "@tanstack/react-router";
 import { TerminalMenu } from "./TerminalMenu";
 import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { lanes, topFiles, type Card, type Lane } from "./lanes";
@@ -13,7 +13,7 @@ import { Named, Now } from "./Now";
 import { pollEvery } from "./poll";
 import { Timeline } from "./Timeline";
 
-/** Which view of the fleet the home shows, kept for this browser. */
+/** Which view of the fleet the home shows, kept for this browser. The machines view has its own URL. */
 type View = "board" | "timeline";
 const VIEW_KEY = "foundry.home";
 function loadView(): View {
@@ -21,6 +21,14 @@ function loadView(): View {
     return localStorage.getItem(VIEW_KEY) === "timeline" ? "timeline" : "board";
   } catch {
     return "board";
+  }
+}
+/** Keeps `view` as the home's view for next time. */
+export function saveView(view: View) {
+  try {
+    localStorage.setItem(VIEW_KEY, view);
+  } catch {
+    // Not kept: the view still changes.
   }
 }
 
@@ -76,29 +84,17 @@ export function Board({
   traced: Set<string>;
 }) {
   const [view, setView] = useState(loadView);
-  const pick = (next: View) => {
+  const navigate = useNavigate();
+  const pick = (next: View | "machines") => {
+    if (next === "machines") return void navigate({ to: "/machines" });
     setView(next);
-    try {
-      localStorage.setItem(VIEW_KEY, next);
-    } catch {
-      // Not kept: the view still changes.
-    }
+    saveView(next);
   };
   const workspaces = machines.flatMap((m) => m.workspaces);
   const sessions = workspaces.reduce((n, w) => n + w.sessions.length, 0);
   const shells = workspaces.reduce((n, w) => n + w.shells.length, 0);
   const counts = `${plural(sessions, "session")} · ${plural(shells, "shell")} · ${plural(workspaces.length, "workspace")} · ${plural(machines.length, "machine")}`;
-  const search = (
-    <button
-      type="button"
-      onClick={onJump}
-      className="group flex w-full items-center gap-3 rounded-xl border border-neutral-700/70 bg-neutral-900 px-4 py-3 text-left text-base text-neutral-400 shadow-lg shadow-black/40 transition-colors hover:border-neutral-500 hover:text-neutral-200"
-    >
-      <SearchIcon className="size-5 shrink-0 text-neutral-500 group-hover:text-neutral-300" />
-      <span className="flex-1">Jump to a session or shell…</span>
-      <kbd className="rounded border border-neutral-700 px-1.5 py-0.5 text-xs text-neutral-400">{jumpKey}</kbd>
-    </button>
-  );
+  const search = <JumpBar onJump={onJump} />;
 
   if (workspaces.length === 0) {
     return (
@@ -124,21 +120,7 @@ export function Board({
           {search}
           <div className="flex items-center gap-3 px-1">
             <p className="min-w-0 flex-1 text-xs text-neutral-500">{counts}</p>
-            <div role="radiogroup" aria-label="View" className="flex shrink-0 gap-0.5 rounded-lg border border-neutral-800 bg-neutral-900 p-0.5 text-xs">
-              {(["board", "timeline"] as const).map((v) => (
-                <button
-                  key={v}
-                  type="button"
-                  role="radio"
-                  aria-checked={view === v}
-                  onClick={() => pick(v)}
-                  className={`flex items-center gap-1.5 rounded-md px-2.5 py-1 font-medium transition-colors ${view === v ? "bg-neutral-700 text-neutral-50" : "text-neutral-400 hover:text-neutral-200"}`}
-                >
-                  {v === "board" ? <BoardIcon /> : <TimelineIcon />}
-                  {v === "board" ? "Board" : "Timeline"}
-                </button>
-              ))}
-            </div>
+            <ViewSwitch view={view} onPick={pick} />
           </div>
         </div>
         {view === "timeline" ? (
@@ -330,6 +312,58 @@ function ChangesFooter({ card, onScreen, onOpen }: { card: Card; onScreen: boole
     >
       {body}
     </button>
+  );
+}
+
+/** The search bar at the top of the home views: a button that opens the jump palette. */
+export function JumpBar({ onJump }: { onJump: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onJump}
+      className="group flex w-full items-center gap-3 rounded-xl border border-neutral-700/70 bg-neutral-900 px-4 py-3 text-left text-base text-neutral-400 shadow-lg shadow-black/40 transition-colors hover:border-neutral-500 hover:text-neutral-200"
+    >
+      <SearchIcon className="size-5 shrink-0 text-neutral-500 group-hover:text-neutral-300" />
+      <span className="flex-1">Jump to a session or shell…</span>
+      <kbd className="rounded border border-neutral-700 px-1.5 py-0.5 text-xs text-neutral-400">{jumpKey}</kbd>
+    </button>
+  );
+}
+
+const views = [
+  { view: "board", name: "Board", icon: <BoardIcon /> },
+  { view: "timeline", name: "Timeline", icon: <TimelineIcon /> },
+  { view: "machines", name: "Machines", icon: <MachinesIcon /> },
+] as const;
+
+/** The switch between the home's views of the fleet: its workspaces, its turns and its machines. */
+export function ViewSwitch({ view, onPick }: { view: View | "machines"; onPick: (view: View | "machines") => void }) {
+  return (
+    <div role="radiogroup" aria-label="View" className="flex shrink-0 gap-0.5 rounded-lg border border-neutral-800 bg-neutral-900 p-0.5 text-xs">
+      {views.map((v) => (
+        <button
+          key={v.view}
+          type="button"
+          role="radio"
+          aria-checked={view === v.view}
+          onClick={() => onPick(v.view)}
+          className={`flex items-center gap-1.5 rounded-md px-2.5 py-1 font-medium transition-colors ${view === v.view ? "bg-neutral-700 text-neutral-50" : "text-neutral-400 hover:text-neutral-200"}`}
+        >
+          {v.icon}
+          {v.name}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function MachinesIcon() {
+  return (
+    <svg viewBox="0 0 16 16" className="size-3.5" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" aria-hidden="true">
+      <rect x="2" y="3" width="12" height="4" rx="1" />
+      <rect x="2" y="9" width="12" height="4" rx="1" />
+      <path d="M4.5 5h.01M4.5 11h.01" />
+    </svg>
   );
 }
 
