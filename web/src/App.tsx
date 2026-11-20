@@ -4,8 +4,9 @@ import { useEffect, useLayoutEffect, useMemo, useState } from "react";
 import { Board } from "./Board";
 import { ChangesPanel } from "./ChangesPanel";
 import { LinkBanner, Unreachable } from "./Connection";
-import { CreateWorkspace } from "./CreateWorkspace";
+import { CreateWorkspace, useCreateWorkspace } from "./CreateWorkspace";
 import { JumpPalette } from "./JumpPalette";
+import { Launchpad } from "./Launchpad";
 import { Machines } from "./Machines";
 import { NewSession } from "./NewSession";
 import { Sidebar } from "./Sidebar";
@@ -36,6 +37,10 @@ import { AlertsButton, useAlerts } from "./AlertsBell";
  * With nothing open, the board shows every workspace as a card with its live states and changes,
  * or, switched to its timeline, every session's turns on one clock; a turn opens its terminal
  * with the steps column.
+ *
+ * A fleet with no workspaces opens on one question, what Claude should work on, and a box to
+ * answer it in: the task names the workspace and its branch, Start makes it and lands in its
+ * session already at work, and the three states it will show are explained under it.
  *
  * The machines view (`/machines`, from the board's switch or a machine's name in the sidebar)
  * shows every machine as a card: its status, when it was last heard, its load drawn over the last
@@ -101,6 +106,8 @@ function Layout() {
   const [sessionIn, setSessionIn] = useState<{ id: string; name: string }>();
   /** The session of a workspace just made, until it shows up and is opened. */
   const [landing, setLanding] = useState<string>();
+  /** The first-run page's create, held here so it outlives the page when its workspace arrives first. */
+  const launch = useCreateWorkspace();
   const navigate = useNavigate();
   const located = terminalId ? locate(machines, terminalId) : undefined;
   const stepsOf: StepsOf | undefined = !located
@@ -212,8 +219,13 @@ function Layout() {
   // Never had the daemon's state: say so, rather than show an empty fleet.
   if (!state.synced && link.lostAt !== undefined) return <Unreachable link={link} />;
   const stale = link.lostAt !== undefined;
+  const workspaces = machines.flatMap((m) => m.workspaces);
+  // A fleet with no workspaces opens on the first-run page, kept while its create is under way or
+  // its workspace was made but its session failed, so what happened stays on screen.
+  const firstRun = !terminalId && !onMachines && state.synced && (workspaces.length === 0 || launch.create.isPending || (launch.made && launch.create.isError));
+  const board = !terminalId && !onMachines && !firstRun;
 
-  const place = !terminalId && !onMachines ? "flex w-full md:w-auto" : drawer ? "fixed inset-0 z-30 flex md:static md:z-auto" : "hidden md:flex";
+  const place = board ? "flex w-full md:w-auto" : drawer ? "fixed inset-0 z-30 flex md:static md:z-auto" : "hidden md:flex";
   return (
     <TerminalActions
       machines={machines}
@@ -244,13 +256,13 @@ function Layout() {
               onCreate={() => openCreate()}
               selected={terminalId}
               onNavigate={close}
-              onClose={terminalId ? close : undefined}
+              onClose={terminalId || firstRun ? close : undefined}
               onJump={openJump}
               onChanges={openChanges}
               alerts={<AlertsButton {...alerts} />}
             />
           </div>
-          <main className={`${terminalId || onMachines ? "flex" : "hidden md:flex"} min-w-0 flex-1 flex-col`}>
+          <main className={`${board ? "hidden md:flex" : "flex"} min-w-0 flex-1 flex-col`}>
             <TabStrip
               machines={machines}
               tabs={kept}
@@ -304,11 +316,11 @@ function Layout() {
                 );
               })}
               {!terminalId && onMachines && <Machines machines={machines} history={samples} here={here} connected={connected} onJump={openJump} />}
-              {!terminalId && !onMachines && (
+              {firstRun && <Launchpad projects={state.settings.projects} launch={launch} onCreated={setLanding} onMore={openCreate} onMenu={() => setDrawer(true)} />}
+              {board && state.synced && (
                 <Board
                   machines={machines}
                   onJump={openJump}
-                  onCreate={() => openCreate()}
                   onChanges={openChanges}
                   traced={traced}
                   onSteps={(id) => {
@@ -333,7 +345,7 @@ function Layout() {
         />
         <CreateWorkspace
           projects={state.settings.projects}
-          workspaces={machines.flatMap((m) => m.workspaces)}
+          workspaces={workspaces}
           open={create.open}
           onOpenChange={(open) => setCreate((c) => ({ ...c, open }))}
           name={create.name}

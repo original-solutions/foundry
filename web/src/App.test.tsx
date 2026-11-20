@@ -395,6 +395,37 @@ describe("App", () => {
     expect(screen.getAllByRole("tab")[0].getAttribute("aria-selected")).toBe("true");
   });
 
+  it("opens a fleet with no workspaces on what Claude should work on, and starting a task lands in its session", async () => {
+    const calls = mockActions(json(201, { id: "w9" }), json(201, { id: "s9" }));
+    const router = await open("/", { type: "state", protocol: 1, records: [sample(ME, 1)], settings: settings() });
+
+    expect(screen.queryByText(/0 workspaces/)).toBeNull();
+    fireEvent.change(screen.getByLabelText("What should Claude work on?"), { target: { value: "Add search to the board." } });
+    fireEvent.click(screen.getByRole("button", { name: "Start" }));
+    await waitFor(() => expect(calls).toHaveLength(2));
+    expect(calls[0].body).toEqual({ project: "p1", base: "main", name: "add search to the board" });
+
+    const events = sockets("/api/events").at(-1)!;
+    const arrive = (record: ReturnType<typeof workspace>) => act(() => events.deliver(JSON.stringify({ type: "record", protocol: 1, record })));
+    arrive(workspace(ME, "w9", "add search to the board"));
+    arrive(terminal(ME, "t9", "w9", "running"));
+    arrive(session(ME, "s9", "w9", "t9", "working"));
+
+    await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t9"));
+  });
+
+  it("shows no first-run page before the daemon's state arrives", async () => {
+    const fresh = createRouter({ routeTree, history: createMemoryHistory({ initialEntries: ["/"] }) });
+    await fresh.load();
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <RouterProvider router={fresh} />
+      </QueryClientProvider>,
+    );
+    expect(screen.queryByLabelText("What should Claude work on?")).toBeNull();
+    expect(screen.queryByText(/0 workspaces/)).toBeNull();
+  });
+
   it("offers a new workspace named from what you typed in the palette", async () => {
     await open("/", live);
     fireEvent.keyDown(window, { key: "k", metaKey: true });

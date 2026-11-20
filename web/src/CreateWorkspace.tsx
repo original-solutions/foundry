@@ -25,15 +25,24 @@ interface Props {
   onCreated?: (session: string) => void;
 }
 
+/** What a new workspace is made from: its project, base and name, then its session's model and first prompt. */
+export interface CreateInput {
+  project: string;
+  base: string;
+  name: string;
+  model: string;
+  prompt?: string;
+}
+
 /**
- * The new-workspace dialog: a name, which shows the branch it makes as you type, then the project,
- * base, model and machine. Create makes the workspace, starts a session in it and hands the
- * session to `onCreated`, so the layout lands in it.
+ * Makes a workspace, then starts a session in it, saying which `step` it is on. `made` is true
+ * once the workspace exists, even when its session then failed to start, since a second try
+ * would only find its name taken.
  */
-export function CreateWorkspace({ projects, workspaces, open, onOpenChange, name = "", onCreated }: Props) {
+export function useCreateWorkspace() {
   const [step, setStep] = useState<Step>("branch");
   const create = useMutation({
-    mutationFn: async (input: { project: string; base: string; name: string; model: string; prompt?: string }) => {
+    mutationFn: async (input: CreateInput) => {
       setStep("branch");
       const workspace = await createWorkspace({ project: input.project, base: input.base, name: input.name });
       setStep("session");
@@ -48,6 +57,20 @@ export function CreateWorkspace({ projects, workspaces, open, onOpenChange, name
       return { session, warning: workspace.error ?? null };
     },
   });
+  const made = create.isSuccess || create.error instanceof SessionNotStarted;
+  return { create, step, made };
+}
+
+/** A create in hand: the mutation, its step and whether the workspace exists yet. */
+export type Launch = ReturnType<typeof useCreateWorkspace>;
+
+/**
+ * The new-workspace dialog: a name, which shows the branch it makes as you type, then the project,
+ * base, model and machine. Create makes the workspace, starts a session in it and hands the
+ * session to `onCreated`, so the layout lands in it.
+ */
+export function CreateWorkspace({ projects, workspaces, open, onOpenChange, name = "", onCreated }: Props) {
+  const { create, step } = useCreateWorkspace();
   const change = (next: boolean) => {
     onOpenChange(next);
     create.reset();
@@ -87,7 +110,7 @@ interface FormProps {
     data: { warning: string | null } | undefined;
   };
   step: Step;
-  onSubmit: (input: { project: string; base: string; name: string; model: string; prompt?: string }) => void;
+  onSubmit: (input: CreateInput) => void;
 }
 
 /** Mounted while the dialog is open, so each opening starts from what it was given. */
@@ -239,7 +262,7 @@ function Form({ projects, workspaces, initialName, create, step, onSubmit }: For
   );
 }
 
-function BranchIcon({ className }: { className?: string }) {
+export function BranchIcon({ className }: { className?: string }) {
   return (
     <svg viewBox="0 0 16 16" className={className} fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
       <circle cx="4.5" cy="3.5" r="1.5" />

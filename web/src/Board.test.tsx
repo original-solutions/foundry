@@ -95,7 +95,7 @@ const Machines = createContext<MachineView[]>([]);
 
 async function show(machines: MachineView[], onChanges = vi.fn()) {
   function Shown() {
-    return <Board machines={useContext(Machines)} onJump={() => {}} onCreate={() => {}} onChanges={onChanges} onSteps={() => {}} traced={new Set()} />;
+    return <Board machines={useContext(Machines)} onJump={() => {}} onChanges={onChanges} onSteps={() => {}} traced={new Set()} />;
   }
   const root = createRootRoute({ component: Shown });
   const router = createRouter({

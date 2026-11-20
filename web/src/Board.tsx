@@ -61,22 +61,20 @@ const edge: Record<Glyph, string> = {
 /**
  * The view with nothing open: every workspace in the fleet as a card, in lanes by what it needs
  * (you, its agents, or nothing), each with its terminals' live states and what it has changed
- * since its base. A card's terminals open from it; its changes open the changes sheet. With no
- * workspaces yet it is a search bar and the way to start one.
+ * since its base. A card's terminals open from it; its changes open the changes sheet. A fleet with
+ * no workspaces yet opens on the first-run page instead (`Launchpad`).
  *
  * A switch beside the counts turns it into a timeline of every session's turns on one clock.
  */
 export function Board({
   machines,
   onJump,
-  onCreate,
   onChanges,
   onSteps,
   traced,
 }: {
   machines: MachineView[];
   onJump: () => void;
-  onCreate: () => void;
   onChanges: (workspace: string) => void;
   /** Opens a terminal with its steps column. */
   onSteps: (terminal: string) => void;
@@ -95,22 +93,6 @@ export function Board({
   const shells = workspaces.reduce((n, w) => n + w.shells.length, 0);
   const counts = `${plural(sessions, "session")} · ${plural(shells, "shell")} · ${plural(workspaces.length, "workspace")} · ${plural(machines.length, "machine")}`;
   const search = <JumpBar onJump={onJump} />;
-
-  if (workspaces.length === 0) {
-    return (
-      <div className="absolute inset-0 flex flex-col items-center justify-center gap-5 px-6 pb-[12vh]">
-        <p className="text-sm text-neutral-500">{counts}</p>
-        <div className="w-full max-w-xl">{search}</div>
-        <p className="text-xs text-neutral-600">
-          Type a workspace, model, state or machine. Or{" "}
-          <button type="button" onClick={onCreate} className="text-neutral-400 underline decoration-neutral-700 underline-offset-4 hover:text-neutral-200">
-            start a new workspace
-          </button>
-          .
-        </p>
-      </div>
-    );
-  }
 
   const several = machines.length > 1;
   return (
