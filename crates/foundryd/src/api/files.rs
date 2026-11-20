@@ -39,7 +39,8 @@ pub(super) async fn keep(
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Response, ApiError> {
     let id = parse_id(&id, "terminal", TerminalId)?;
-    let folder = api.terminals.files(id)?;
+    // A terminal that is not live is refused before its body is looked at.
+    api.terminals.files(id)?;
     let bytes = match body {
         Ok(bytes) => bytes,
         Err(e) if e.status() == StatusCode::PAYLOAD_TOO_LARGE => {
@@ -51,9 +52,10 @@ pub(super) async fn keep(
         Err(e) => return Err(ApiError::Rejected(e.status(), e.body_text())),
     };
     let name = plain_name(&named.name);
-    let kept = tokio::task::spawn_blocking(move || write_new(&folder, &name, &bytes))
-        .await
-        .map_err(|e| ApiError::Rejected(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let kept = api
+        .terminals
+        .keep_file(id, move |folder| write_new(folder, &name, &bytes))
+        .await?;
     match kept {
         Ok(path) => Ok((
             StatusCode::CREATED,

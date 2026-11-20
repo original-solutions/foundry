@@ -1,5 +1,6 @@
 import type { FileChange } from "./api";
 import { diffLines, type DiffLine } from "./changes";
+import { readStoredJson, storeJson } from "./storage";
 
 /**
  * What a file looked like when you marked it viewed: a fingerprint of its whole change, and one of
@@ -91,12 +92,8 @@ function isSeen(value: unknown): value is Seen {
 }
 
 function loadAll(): Record<string, Record<string, unknown>> {
-  try {
-    const kept: unknown = JSON.parse(localStorage.getItem(KEY) ?? "{}");
-    return typeof kept === "object" && kept !== null && !Array.isArray(kept) ? (kept as Record<string, Record<string, unknown>>) : {};
-  } catch {
-    return {};
-  }
+  const kept = readStoredJson(KEY);
+  return typeof kept === "object" && kept !== null && !Array.isArray(kept) ? (kept as Record<string, Record<string, unknown>>) : {};
 }
 
 /** What this browser viewed in a workspace, or nothing when storage is empty, blocked or holds something else. */
@@ -115,9 +112,6 @@ export function saveViewed(workspace: string, viewed: Viewed, files: FileChange[
   if (Object.keys(kept).length > 0) all[workspace] = kept;
   const names = Object.keys(all);
   for (const old of names.slice(0, Math.max(0, names.length - WORKSPACES_KEPT))) delete all[old];
-  try {
-    localStorage.setItem(KEY, JSON.stringify(all));
-  } catch {
-    // Storage blocked or full: what you viewed lasts while the sheet is open.
-  }
+  // When not kept, what you viewed lasts while the sheet is open.
+  storeJson(KEY, all);
 }

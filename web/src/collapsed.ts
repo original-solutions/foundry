@@ -1,3 +1,5 @@
+import { readStored, store } from "./storage";
+
 /** Whether the sidebar is collapsed to a rail, kept in this browser only. */
 const KEY = "foundry.rail";
 
@@ -6,21 +8,14 @@ export const RAIL_BELOW = 1024;
 
 /** The choice made in this browser, or, with none, a rail on a window narrower than `RAIL_BELOW`. */
 export function loadRail(width: number): boolean {
-  try {
-    const kept = localStorage.getItem(KEY);
-    if (kept === "1" || kept === "0") return kept === "1";
-  } catch {
-    // Storage blocked: go by the width.
-  }
+  const kept = readStored(KEY);
+  if (kept === "1" || kept === "0") return kept === "1";
   return width < RAIL_BELOW;
 }
 
 export function saveRail(on: boolean) {
-  try {
-    localStorage.setItem(KEY, on ? "1" : "0");
-  } catch {
-    // Storage blocked: the choice lasts for this page only.
-  }
+  // When not kept, the choice lasts for this page only.
+  store(KEY, on ? "1" : "0");
 }
 
 /** The key that collapses or expands the sidebar. */

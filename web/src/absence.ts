@@ -2,6 +2,7 @@ import type { AnyRecord, Mark } from "./api";
 import { rows, type MachineView, type Row } from "./fleet";
 import { needsYou, urgency } from "./labels";
 import { turns } from "./trail";
+import { readStoredJson, storeJson, unstore } from "./storage";
 
 /** How long the page must be hidden before coming back says what happened meanwhile. */
 export const AWAY_MS = 2 * 60_000;
@@ -71,21 +72,14 @@ export function since(trail: Mark[], from: number): { turns: number; steps: Mark
 
 /** The moment kept for this browser, taken out so it is used once; `undefined` when there is none or it cannot be read. */
 export function takeLeft(): Left | undefined {
-  try {
-    const kept = localStorage.getItem(AWAY_KEY);
-    localStorage.removeItem(AWAY_KEY);
-    if (!kept) return undefined;
-    const parsed = JSON.parse(kept) as Partial<Left>;
-    return typeof parsed.at === "number" && parsed.versions && typeof parsed.versions === "object" ? { at: parsed.at, versions: parsed.versions } : undefined;
-  } catch {
-    return undefined;
-  }
+  const kept = readStoredJson(AWAY_KEY);
+  unstore(AWAY_KEY);
+  if (!kept || typeof kept !== "object") return undefined;
+  const parsed = kept as Partial<Left>;
+  return typeof parsed.at === "number" && parsed.versions && typeof parsed.versions === "object" ? { at: parsed.at, versions: parsed.versions } : undefined;
 }
 
 export function keepLeft(left: Left) {
-  try {
-    localStorage.setItem(AWAY_KEY, JSON.stringify(left));
-  } catch {
-    // Not kept: coming back to this page still says what happened; a reopened tab does not.
-  }
+  // When not kept, coming back to this page still says what happened; a reopened tab does not.
+  storeJson(AWAY_KEY, left);
 }

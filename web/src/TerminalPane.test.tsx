@@ -628,6 +628,26 @@ describe("TerminalPane", () => {
       expect(opened).toHaveBeenCalledWith("https://github.com/o/r/pull/12", "_blank", "noopener,noreferrer");
     });
 
+    it("opens a link a program marks (OSC 8) only when it is a web address, and only on Cmd- or Ctrl-click", () => {
+      const opened = vi.fn();
+      vi.stubGlobal("open", opened);
+      open();
+      const marked = screenOps.options!.linkHandler as { activate: (event: MouseEvent, text: string) => void };
+
+      marked.activate(click({ metaKey: true }), "javascript:alert(1)");
+      marked.activate(click({ metaKey: true }), "file:///etc/passwd");
+      marked.activate(click({ ctrlKey: true }), "data:text/html,<script>1</script>");
+      marked.activate(click(), "https://example.com/x");
+      expect(opened).not.toHaveBeenCalled();
+
+      marked.activate(click({ metaKey: true }), "https://example.com/x");
+      marked.activate(click({ ctrlKey: true }), "http://localhost:3000/");
+      expect(opened.mock.calls).toEqual([
+        ["https://example.com/x", "_blank", "noopener,noreferrer"],
+        ["http://localhost:3000/", "_blank", "noopener,noreferrer"],
+      ]);
+    });
+
     it("finds a file its workspace changed, shows its diff while the pointer rests on it, and Cmd-click opens it in Changes", async () => {
       const { onFile } = open();
       screenOps.rows = ["● Update(src/version.ts)"];

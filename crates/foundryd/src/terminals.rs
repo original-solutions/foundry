@@ -225,6 +225,28 @@ impl Terminals {
         Ok(self.inner.files(entry.id))
     }
 
+    /// Runs `write` on live terminal `id`'s files folder (see [`Self::files`]) and gives back
+    /// what it returns. A close waits for a write under way, then removes the folder with what
+    /// was written; a write that comes after the close is refused, so it never makes the folder
+    /// again with nothing left to remove it.
+    pub async fn keep_file<F>(
+        &self,
+        id: TerminalId,
+        write: F,
+    ) -> Result<io::Result<PathBuf>, TerminalError>
+    where
+        F: FnOnce(&Path) -> io::Result<PathBuf> + Send + 'static,
+    {
+        let entry = self.inner.entry(id)?;
+        // A close holds the body from before it lets the entry go until the folder is removed.
+        let _body = entry.body.lock().await;
+        if !self.inner.is_live(&entry) {
+            return Err(TerminalError::Unknown(id));
+        }
+        let folder = self.inner.files(id);
+        Ok(tokio::task::spawn_blocking(move || write(&folder)).await?)
+    }
+
     /// Ends the terminal: hangs up its child, waits for its holder to end and deletes its
     /// record. A holder that is already gone is no error. The close finishes even when the
     /// caller stops waiting.
@@ -1728,6 +1750,103 @@ mod tests {
             terminals.files(id),
             Err(TerminalError::Unknown(gone)) if gone == id
         ));
+    }
+
+    #[tokio::test]
+    async fn a_file_kept_after_its_terminal_closed_is_refused_and_leaves_no_folder() {
+        let setup = Setup::new();
+        let (terminals, _store) = setup.daemon();
+        let id = setup.start(&terminals, "sleep 60").await;
+        // Looked up while the terminal is live, as an upload does before its body arrives.
+        let files = terminals.files(id).unwrap();
+        terminals.close(id).await.unwrap();
+
+        let kept = terminals
+            .keep_file(id, |folder| {
+                std::fs::create_dir_all(folder)?;
+                std::fs::write(folder.join("shot.png"), b"png")?;
+                Ok(folder.join("shot.png"))
+            })
+            .await;
+        assert!(matches!(kept, Err(TerminalError::Unknown(gone)) if gone == id));
+        assert!(
+            !files.exists(),
+            "a closed terminal's folder is not made again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_close_waits_for_a_file_being_kept_and_removes_it_with_the_folder() {
+        let setup = Setup::new();
+        let (terminals, _store) = setup.daemon();
+        let id = setup.start(&terminals, "sleep 60").await;
+        let terminals = Arc::new(terminals);
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let keeping = tokio::spawn({
+            let terminals = terminals.clone();
+            async move {
+                terminals
+                    .keep_file(id, move |folder| {
+                        started_tx.send(()).unwrap();
+                        go_rx.recv().unwrap();
+                        std::fs::create_dir_all(folder)?;
+                        std::fs::write(folder.join("shot.png"), b"png")?;
+                        Ok(folder.join("shot.png"))
+                    })
+                    .await
+            }
+        });
+        tokio::task::spawn_blocking(move || started_rx.recv().unwrap())
+            .await
+            .unwrap();
+        let closing = tokio::spawn({
+            let terminals = terminals.clone();
+            async move { terminals.close(id).await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!closing.is_finished(), "the close waits for the file");
+
+        go_tx.send(()).unwrap();
+        let kept = keeping.await.unwrap().unwrap().unwrap();
+        closing.await.unwrap().unwrap();
+        assert!(!kept.exists(), "the file goes with the terminal");
+        assert!(!terminals.inner.files(id).exists());
+    }
+
+    #[tokio::test]
+    async fn a_file_that_waited_behind_a_close_is_refused_and_leaves_no_folder() {
+        let setup = Setup::new();
+        let (terminals, _store) = setup.daemon();
+        let id = setup.start(&terminals, "sleep 60").await;
+        let terminals = Arc::new(terminals);
+        // Held here so the close and then the write queue up behind it, in that order.
+        let entry = terminals.inner.entry(id).unwrap();
+        let held = entry.body.lock().await;
+        let closing = tokio::spawn({
+            let terminals = terminals.clone();
+            async move { terminals.close(id).await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let keeping = tokio::spawn({
+            let terminals = terminals.clone();
+            async move {
+                terminals
+                    .keep_file(id, |folder| {
+                        std::fs::create_dir_all(folder)?;
+                        Ok(folder.join("late.png"))
+                    })
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!closing.is_finished() && !keeping.is_finished());
+
+        drop(held);
+        closing.await.unwrap().unwrap();
+        let kept = keeping.await.unwrap();
+        assert!(matches!(kept, Err(TerminalError::Unknown(gone)) if gone == id));
+        assert!(!terminals.inner.files(id).exists());
     }
 
     /// The caller of `start` going away, as an HTTP handler does when its client hangs up,

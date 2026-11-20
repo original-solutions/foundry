@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { AnyRecord, SharedSettings } from "./api";
 import type { FleetState } from "./fleet";
+import { readStoredJson, storeJson } from "./storage";
 
 /** Where this browser keeps the fleet the daemon last sent. */
 export const MEMORY_KEY = "foundry.last";
@@ -23,22 +24,16 @@ export interface Remembered {
  */
 export function keep(state: FleetState, at: number) {
   if (!state.synced) return;
-  try {
-    localStorage.setItem(MEMORY_KEY, JSON.stringify({ v: VERSION, at, records: state.records, settings: state.settings }));
-  } catch {
-    // Storage blocked or full: the next load waits for the daemon, as it did before.
-  }
+  // When not kept, the next load waits for the daemon, as it did before.
+  storeJson(MEMORY_KEY, { v: VERSION, at, records: state.records, settings: state.settings });
 }
 
 /** The fleet this browser last saw, or nothing when none was kept or it is not one this page reads. */
 export function recall(): Remembered | undefined {
-  try {
-    const kept = JSON.parse(localStorage.getItem(MEMORY_KEY) ?? "null") as { v?: unknown; at?: unknown; records?: unknown; settings?: unknown } | null;
-    if (kept?.v !== VERSION || typeof kept.at !== "number" || !Array.isArray(kept.records) || typeof kept.settings !== "object" || !kept.settings) return undefined;
-    return { at: kept.at, records: kept.records as AnyRecord[], settings: kept.settings as SharedSettings };
-  } catch {
-    return undefined;
-  }
+  const read = readStoredJson(MEMORY_KEY);
+  const kept = read && typeof read === "object" ? (read as { v?: unknown; at?: unknown; records?: unknown; settings?: unknown }) : undefined;
+  if (kept?.v !== VERSION || typeof kept.at !== "number" || !Array.isArray(kept.records) || typeof kept.settings !== "object" || !kept.settings) return undefined;
+  return { at: kept.at, records: kept.records as AnyRecord[], settings: kept.settings as SharedSettings };
 }
 
 /**

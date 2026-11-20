@@ -22,45 +22,31 @@ import { BOARD_BUSY_EVERY, pollEvery } from "./poll";
 import { Timeline } from "./Timeline";
 import { Machines } from "./Machines";
 import type { History } from "./samples";
+import { readStored, store } from "./storage";
 
 /** Which of the board and the timeline the home shows, kept for this browser. The machines view has its own URL. */
 type View = "board" | "timeline";
 const VIEW_KEY = "foundry.home";
 function loadView(): View {
-  try {
-    return localStorage.getItem(VIEW_KEY) === "timeline" ? "timeline" : "board";
-  } catch {
-    return "board";
-  }
+  return readStored(VIEW_KEY) === "timeline" ? "timeline" : "board";
 }
 
 /** How the board groups its cards, kept for this browser: by what they need, or by how far their work has shipped. */
 type Group = "attention" | "shipping";
 const GROUP_KEY = "foundry.group";
 function loadGroup(): Group {
-  try {
-    const kept = localStorage.getItem(GROUP_KEY);
-    if (kept === "attention" || kept === "shipping") return kept;
-    // The ship view this browser kept before it became the board's shipping grouping.
-    return localStorage.getItem(VIEW_KEY) === "ship" ? "shipping" : "attention";
-  } catch {
-    return "attention";
-  }
+  const kept = readStored(GROUP_KEY);
+  if (kept === "attention" || kept === "shipping") return kept;
+  // The ship view this browser kept before it became the board's shipping grouping.
+  return readStored(VIEW_KEY) === "ship" ? "shipping" : "attention";
 }
+/** Keeps `group` for next time; when not kept, the grouping still changes. */
 function saveGroup(group: Group) {
-  try {
-    localStorage.setItem(GROUP_KEY, group);
-  } catch {
-    // Not kept: the grouping still changes.
-  }
+  store(GROUP_KEY, group);
 }
-/** Keeps `view` as the home's view for next time. */
+/** Keeps `view` as the home's view for next time; when not kept, the view still changes. */
 function saveView(view: View) {
-  try {
-    localStorage.setItem(VIEW_KEY, view);
-  } catch {
-    // Not kept: the view still changes.
-  }
+  store(VIEW_KEY, view);
 }
 
 export { BOARD_BUSY_EVERY };

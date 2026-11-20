@@ -9,6 +9,7 @@ import { glyphText, StateGlyph } from "./StateGlyph";
 import { STEPS_EVERY, useNow } from "./StepsPanel";
 import { bars, heading, placed, RANGES, sum, ticks, type Bar } from "./spans";
 import { ago, kindOf, tally, took } from "./trail";
+import { readStored, store } from "./storage";
 
 /** A turn still going, coloured as its session's state; a finished one is quiet. */
 const openLook: Partial<Record<Glyph, string>> = {
@@ -23,11 +24,8 @@ const windowName: Record<string, string> = { "15m": "the last 15 minutes", "1h":
 /** The window the timeline was last set to, kept for this browser. */
 const RANGE_KEY = "foundry.timeline";
 function loadRange(): (typeof RANGES)[number] {
-  try {
-    return RANGES.find((r) => r.key === localStorage.getItem(RANGE_KEY)) ?? RANGES[1];
-  } catch {
-    return RANGES[1];
-  }
+  const kept = readStored(RANGE_KEY);
+  return RANGES.find((r) => r.key === kept) ?? RANGES[1];
 }
 
 interface Lane {
@@ -84,11 +82,8 @@ export function Timeline({ machines, traced, onSteps }: { machines: MachineView[
   const where = windowName[range.key];
   const pick = (next: (typeof RANGES)[number]) => {
     setRange(next);
-    try {
-      localStorage.setItem(RANGE_KEY, next.key);
-    } catch {
-      // Not kept: the window still changes.
-    }
+    // When not kept, the window still changes.
+    store(RANGE_KEY, next.key);
   };
 
   return (

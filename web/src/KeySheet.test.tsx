@@ -30,6 +30,29 @@ describe("KeySheet", () => {
     expect(screen.getByRole("heading", { name: "The workspaces list" })).toBeDefined();
   });
 
+  it("lists the keys of the task box, the palette's actions, find, a commit, a comment, a reply and the rail", () => {
+    render(<Harness />);
+    fireEvent.keyDown(document.body, { key: "?" });
+
+    const sheet = screen.getByRole("dialog", { name: "Keyboard" });
+    for (const what of [
+      "Start the task",
+      "Leave the board's empty task line",
+      "Back from what can be done to the list",
+      "The older match",
+      "The newer match",
+      "Earlier or later commit; before the first, all changes",
+      "Add the comment on a line",
+      "Drop the comment being written",
+      "Send the reply",
+      "Close the reply box",
+      "Move along the collapsed rail",
+      "Close what is on top: a dialog, sheet, drawer or card",
+    ]) {
+      expect(sheet.textContent).toContain(what);
+    }
+  });
+
   it("leaves ? alone while typing, in a field or in a terminal", () => {
     render(<Harness />);
 

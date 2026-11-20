@@ -1,9 +1,10 @@
 import { Link } from "@tanstack/react-router";
-import { useEffect, useId, useState } from "react";
+import { useId } from "react";
 import { byUrgency, rows, type MachineView } from "./fleet";
 import { plural, urgency, type Glyph } from "./labels";
 import { heardAgo, scaled, span, spanWords, type History, type Point } from "./samples";
 import { glyphFill, glyphText, StateGlyph } from "./StateGlyph";
+import { useNow } from "./StepsPanel";
 
 const statusText = { online: "text-neutral-400", offline: "text-red-400", unknown: "text-neutral-400" };
 const statusDot = { online: "bg-emerald-400", offline: "bg-red-400", unknown: "bg-neutral-500" };
@@ -24,16 +25,6 @@ const stateWord: Record<Glyph, string> = {
 const loadTone = (load: number) => (load >= 1 ? "text-red-400" : load >= 0.7 ? "text-amber-400" : "text-neutral-200");
 const gb = (bytes: number) => `${(bytes / 1e9).toFixed(1)} GB`;
 
-/** This browser's clock, moved on every second, for "heard 4 s ago" and the lines' sliding window. */
-function useNow() {
-  const [now, setNow] = useState(Date.now);
-  useEffect(() => {
-    const timer = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(timer);
-  }, []);
-  return now;
-}
-
 interface Props {
   machines: MachineView[];
   /** Each machine's samples since this page opened. */
@@ -51,7 +42,8 @@ interface Props {
  * under the head it shares with the board and the timeline.
  */
 export function Machines({ machines, history, here, connected }: Props) {
-  const now = useNow();
+  // Moved on every second, for "heard 4 s ago" and the lines' sliding window.
+  const now = useNow(1000);
   return (
     <section aria-label="Machines" className="flex flex-col gap-6">
       {!connected && (

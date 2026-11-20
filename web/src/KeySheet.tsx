@@ -12,7 +12,15 @@ const groups: { where: string; keys: [string[], string][] }[] = [
       [[mod, "F"], "Find in the open terminal"],
       [[mod, "\\"], "Open a terminal beside this one, or close the split"],
       [[mod, "B"], "Collapse the workspaces list to a rail of states, or expand it"],
+      [["Esc"], "Close what is on top: a dialog, sheet, drawer or card"],
       [["?"], "This list"],
+    ],
+  },
+  {
+    where: "The task box",
+    keys: [
+      [[mod, "Enter"], "Start the task"],
+      [["Esc"], "Leave the board's empty task line"],
     ],
   },
   {
@@ -23,6 +31,8 @@ const groups: { where: string; keys: [string[], string][] }[] = [
       [["Home", "End"], "The first or the last"],
       [["a–z"], "The next one whose name starts with what you type"],
       [["Enter"], "Open the terminal, or fold the workspace"],
+      [["↑", "↓"], "Move along the collapsed rail"],
+      [["Home", "End"], "The first or the last on the rail"],
     ],
   },
   {
@@ -30,7 +40,18 @@ const groups: { where: string; keys: [string[], string][] }[] = [
     keys: [
       [["Enter"], "Open"],
       [["Shift", "Enter"], "Open beside the open terminal"],
+      [["↑", "↓"], "Move through the list"],
       [["Tab"], "What can be done with the picked terminal"],
+      [["Shift", "Tab"], "Back from what can be done to the list"],
+      [["⌫"], "Back to the list too, from an empty box"],
+    ],
+  },
+  {
+    where: "Find in a terminal",
+    keys: [
+      [["Enter"], "The older match"],
+      [["Shift", "Enter"], "The newer match"],
+      [["Esc"], "Close find"],
     ],
   },
   {
@@ -39,6 +60,16 @@ const groups: { where: string; keys: [string[], string][] }[] = [
       [["j"], "Next file"],
       [["k"], "Previous file"],
       [["v"], "Mark the file viewed, and go to the next one not viewed"],
+      [["[", "]"], "Earlier or later commit; before the first, all changes"],
+      [[mod, "Enter"], "Add the comment on a line"],
+      [["Esc"], "Drop the comment being written"],
+    ],
+  },
+  {
+    where: "A reply box, on a card or a toast",
+    keys: [
+      [["Enter"], "Send the reply"],
+      [["Esc"], "Close the reply box; on a toast, dismiss the toast"],
     ],
   },
 ];
