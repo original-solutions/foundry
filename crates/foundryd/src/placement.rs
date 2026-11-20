@@ -1058,6 +1058,66 @@ mod tests {
         assert!(queue.items(&fleet(me)).is_empty());
     }
 
+    /// A view of `samples`, each machine limited to one session.
+    fn one_session_each(samples: Vec<Record<MachineSample>>) -> View {
+        let owners: Vec<MachineId> = samples.iter().map(|s| s.owner).collect();
+        let mut settings = SharedSettings::default();
+        for owner in &owners {
+            settings.limits.insert(
+                *owner,
+                Limits {
+                    max_sessions: 1,
+                    ..limits()
+                },
+            );
+        }
+        View {
+            samples,
+            settings,
+            online: all(&owners),
+        }
+    }
+
+    fn sampled(owner: MachineId, version: u64) -> Record<MachineSample> {
+        Record {
+            version,
+            ..sample(owner, 0, 0.1)
+        }
+    }
+
+    #[test]
+    fn a_create_counts_as_a_session_on_its_machine_until_it_is_dropped_unsettled() {
+        let m = MachineId::random();
+        let queue = Queue::new(m);
+        let view = one_session_each(vec![sampled(m, 3)]);
+        let (picked, reservation) = queue.pick(&view, &BTreeSet::new()).unwrap();
+        assert_eq!(picked, m);
+        assert!(
+            queue.pick(&view, &BTreeSet::new()).is_err(),
+            "its last session taken twice"
+        );
+        // The request went away mid-create: nothing settles it.
+        drop(reservation);
+        assert!(queue.pick(&view, &BTreeSet::new()).is_ok());
+    }
+
+    #[test]
+    fn a_kept_create_counts_until_the_second_sample_newer_than_it() {
+        let m = MachineId::random();
+        let queue = Queue::new(m);
+        let (_, reservation) = queue
+            .pick(&one_session_each(vec![sampled(m, 3)]), &BTreeSet::new())
+            .unwrap();
+        reservation.keep_until(5);
+        for version in [5, 6] {
+            // Not newer, then newer but maybe written before the session started.
+            let view = one_session_each(vec![sampled(m, version)]);
+            assert!(queue.pick(&view, &BTreeSet::new()).is_err(), "at {version}");
+        }
+        let view = one_session_each(vec![sampled(m, 7)]);
+        assert!(queue.pick(&view, &BTreeSet::new()).is_ok());
+    }
+
     #[test]
     fn stopping_drops_every_request() {
         let queue = Queue::new(MachineId::random());

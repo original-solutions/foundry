@@ -3109,6 +3109,21 @@ async fn a_machine_given_a_request_takes_no_other_until_its_next_sample() {
         waiting["reasons"],
         serde_json::json!(["studio: sessions 1 at limit 1"])
     );
+
+    // The first newer sample may have been written before that session started.
+    daemon.sample(daemon.me, 0, 0.1);
+    tokio::time::sleep(crate::placement::RETRY_EVERY * 3).await;
+    assert!(
+        daemon.workspace_named("second").is_none(),
+        "over the limit of 1"
+    );
+    // The second is believed: this machine says it has room again.
+    daemon.sample(daemon.me, 0, 0.1);
+    let believed = tokio::time::Instant::now();
+    while daemon.workspace_named("second").is_none() {
+        assert!(believed.elapsed() < WAIT, "second is never placed");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 #[tokio::test]
@@ -3118,6 +3133,18 @@ async fn a_machine_with_no_limits_takes_every_choose_and_a_create_it_refuses_hol
     daemon.list_me("studio");
     daemon.sample(daemon.me, 0, 0.1);
     for (name, status) in [("one", 201), ("two", 201), ("one", 409), ("three", 201)] {
+        let reply = daemon
+            .call("POST", "/api/workspaces", Some(choose(project, name)))
+            .await;
+        assert_eq!(reply.status, status, "{name}: {}", reply.body);
+        assert_eq!(reply.json()["machine"], serde_json::json!(daemon.me));
+    }
+    // With room for two sessions, the refused create takes neither.
+    daemon.limit(daemon.me, 2, 1.0);
+    daemon.sample(daemon.me, 0, 0.1);
+    daemon.sample(daemon.me, 0, 0.1);
+    daemon.sample(daemon.me, 0, 0.1);
+    for (name, status) in [("four", 201), ("four", 409), ("five", 201)] {
         let reply = daemon
             .call("POST", "/api/workspaces", Some(choose(project, name)))
             .await;
@@ -3191,6 +3218,22 @@ async fn a_machine_that_cannot_take_the_call_is_passed_over_for_one_that_can() {
             "studio: load 1.5 over limit 1.0",
             "peer: runs an older Foundry, which cannot take a create"
         ])
+    );
+
+    // Sampled again, the peer is tried again and refuses again: its refusals take no session.
+    daemon.limit(peer, 1, 1.0);
+    daemon.sample(peer, 0, 0.1);
+    let reply = daemon
+        .call(
+            "POST",
+            "/api/workspaces",
+            Some(choose(project, "waits too")),
+        )
+        .await;
+    assert_eq!(reply.status, 202, "{}", reply.body);
+    assert_eq!(
+        reply.json()["reasons"][1],
+        "peer: runs an older Foundry, which cannot take a create"
     );
 
     daemon.sample(daemon.me, 1, 0.5);

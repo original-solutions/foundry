@@ -891,3 +891,43 @@ async fn a_queued_request_whose_create_is_lost_on_b_fails_and_is_never_made_on_a
     );
     drop(silent);
 }
+
+#[tokio::test]
+async fn a_request_being_placed_cannot_be_cancelled_and_ends_failed_when_its_create_is_lost() {
+    let fleet = Fleet::start(2);
+    let (a, b) = (&fleet.daemons[0], &fleet.daemons[1]);
+    let remotes = tempfile::tempdir().unwrap();
+    let (on_a, project, silent) = b_never_answers(&fleet, remotes.path()).await;
+    a.write(loaded(4, 0.1));
+    let sampled = b.write(loaded(4, 0.1));
+    holds_sample(a, b.id, sampled.version()).await;
+    let (status, answer) = on_a
+        .post("/api/workspaces", Some(choose(project, "held")))
+        .await;
+    assert_eq!(status, 202, "{answer}");
+    let request = answer["request"].as_str().unwrap().to_owned();
+
+    let sampled = b.write(loaded(0, 0.1));
+    holds_sample(a, b.id, sampled.version()).await;
+    let started = tokio::time::Instant::now();
+    while on_a.get("/api/placements").await["requests"][0]["state"] != "placing" {
+        assert!(started.elapsed() < WAIT, "never placed");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let (status, answer) = on_a
+        .post(&format!("/api/placements/{request}/cancel"), None)
+        .await;
+    assert_eq!(status, 409, "{answer}");
+
+    fleet.cut(1);
+    let started = tokio::time::Instant::now();
+    loop {
+        let listed = on_a.get("/api/placements").await;
+        if listed["requests"][0]["state"] == "failed" {
+            break;
+        }
+        assert!(started.elapsed() < WAIT, "never failed: {listed}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    drop(silent);
+}
