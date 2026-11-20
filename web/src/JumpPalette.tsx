@@ -5,6 +5,7 @@ import { useEffect, useMemo, useRef, useState, type MutableRefObject } from "rea
 import { startShell } from "./api";
 import { locate, type MachineView } from "./fleet";
 import { destinations, newWorkspace, search, type Destination } from "./jump";
+import { Peek, useWide } from "./Peek";
 import { StateGlyph } from "./StateGlyph";
 import { actsFor, Icon, useTerminalActions, type Act } from "./TerminalMenu";
 
@@ -38,6 +39,8 @@ interface Props {
 export function JumpPalette({ machines, open, onOpenChange, onCreate, current, besideOnly = false, onBeside }: Props) {
   // After a pick the opened terminal has the keyboard, so focus does not go back where it was.
   const picked = useRef(false);
+  // A wide screen previews the highlighted row beside the list.
+  const wide = useWide();
   /** Leaves a terminal's actions for the list, answering whether there were any to leave. */
   const back = useRef<() => boolean>(() => false);
   const change = (next: boolean) => {
@@ -52,7 +55,7 @@ export function JumpPalette({ machines, open, onOpenChange, onCreate, current, b
           aria-describedby={undefined}
           onCloseAutoFocus={(event) => picked.current && event.preventDefault()}
           onEscapeKeyDown={(event) => back.current() && event.preventDefault()}
-          className="fixed inset-x-2 top-2 z-50 mx-auto flex max-h-[80dvh] max-w-xl flex-col overflow-hidden rounded-xl border border-neutral-700/70 bg-neutral-900 text-sm text-neutral-100 shadow-2xl shadow-black/60 sm:top-[12vh]"
+          className={`fixed inset-x-2 top-2 z-50 mx-auto flex max-h-[80dvh] ${wide ? "h-[min(36rem,80dvh)] max-w-4xl" : "max-w-xl"} flex-col overflow-hidden rounded-xl border border-neutral-700/70 bg-neutral-900 text-sm text-neutral-100 shadow-2xl shadow-black/60 sm:top-[12vh]`}
         >
           <Dialog.Title className="sr-only">{besideOnly && current ? `Open beside ${current.title}` : "Jump to"}</Dialog.Title>
           <Panel
@@ -67,6 +70,7 @@ export function JumpPalette({ machines, open, onOpenChange, onCreate, current, b
             besideOnly={besideOnly && !!current}
             onBeside={current ? onBeside : undefined}
             backRef={back}
+            wide={wide}
           />
         </Dialog.Content>
       </Dialog.Portal>
@@ -83,6 +87,7 @@ function Panel({
   besideOnly,
   onBeside,
   backRef,
+  wide,
 }: {
   machines: MachineView[];
   close: () => void;
@@ -93,6 +98,8 @@ function Panel({
   onBeside?: (terminal: string) => void;
   /** Set to leave the actions for the list, as Escape does. */
   backRef: MutableRefObject<() => boolean>;
+  /** Shows the highlighted row's preview beside the list. */
+  wide: boolean;
 }) {
   const navigate = useNavigate();
   const [query, setQuery] = useState("");
@@ -216,73 +223,78 @@ function Panel({
         />
         <kbd className="hidden rounded border border-neutral-700 px-1.5 py-0.5 text-[10px] text-neutral-400 sm:block">Esc</kbd>
       </div>
-      {acts ? (
-        <ul id="jump-list" ref={list} role="listbox" aria-label={label} className="min-h-0 flex-1 overflow-y-auto p-1.5">
-          {acts.map((a, i) => (
-            <li
-              key={a.key}
-              id={optionId(a.key)}
-              role="option"
-              aria-selected={i === at}
-              onMouseMove={() => i !== at && setActive(i)}
-              onClick={() => run(a)}
-              className={`flex cursor-pointer items-center gap-3 rounded-lg px-3 py-2.5 sm:py-2 ${i > 0 && a.group !== acts[i - 1].group ? "mt-1.5" : ""} ${
-                a.danger ? (i === at ? "bg-red-400/10 text-red-300" : "text-red-400") : i === at ? "bg-neutral-800 text-neutral-50" : "text-neutral-200"
-              }`}
-            >
-              <span className="flex w-4 justify-center">
-                <Icon d={a.icon} />
-              </span>
-              {a.label}
-            </li>
-          ))}
-        </ul>
-      ) : (
-        <ul id="jump-list" ref={list} role="listbox" aria-label="Sessions and shells" className="min-h-0 flex-1 overflow-y-auto p-1.5">
-          {shown.map((d, i) => (
-            <li
-              key={d.key}
-              id={optionId(d.key)}
-              role="option"
-              aria-selected={i === at}
-              onMouseMove={() => i !== at && setActive(i)}
-              onClick={(event) => go(d, event.shiftKey)}
-              className={`group flex cursor-pointer items-center gap-3 rounded-lg px-3 py-2.5 sm:py-2 ${i === at ? "bg-neutral-800 text-neutral-50" : "text-neutral-200"}`}
-            >
-              {d.kind === "terminal" ? (
-                <span className="flex w-4 justify-center">
-                  <StateGlyph glyph={d.glyph} />
-                </span>
-              ) : (
-                <PlusIcon className="size-4 shrink-0 text-neutral-500" />
-              )}
-              <span className="min-w-0 flex-1">
-                <span className="block truncate">{d.title}</span>
-                {d.kind === "terminal" && d.subtitle && <span className="block truncate text-xs text-neutral-500">{d.subtitle}</span>}
-              </span>
-              {d.kind === "terminal" && <span className="shrink-0 text-xs text-neutral-400">{d.label}</span>}
-              {many && <span className="hidden max-w-32 shrink-0 truncate text-xs text-neutral-500 sm:inline">{d.machine}</span>}
-              {actable && d.kind === "terminal" && (
-                <button
-                  type="button"
-                  tabIndex={-1}
-                  aria-label={`Actions for ${d.title}`}
-                  title="What can be done with it (Tab)"
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    act(d.terminal, i);
-                  }}
-                  className={`-my-1 -mr-1.5 shrink-0 rounded p-1 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-100 ${i === at ? "" : "pointer-fine:invisible pointer-fine:group-hover:visible"}`}
+      <div className="flex min-h-0 flex-1">
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+          {acts ? (
+            <ul id="jump-list" ref={list} role="listbox" aria-label={label} className="min-h-0 flex-1 overflow-y-auto p-1.5">
+              {acts.map((a, i) => (
+                <li
+                  key={a.key}
+                  id={optionId(a.key)}
+                  role="option"
+                  aria-selected={i === at}
+                  onMouseMove={() => i !== at && setActive(i)}
+                  onClick={() => run(a)}
+                  className={`flex cursor-pointer items-center gap-3 rounded-lg px-3 py-2.5 sm:py-2 ${i > 0 && a.group !== acts[i - 1].group ? "mt-1.5" : ""} ${
+                    a.danger ? (i === at ? "bg-red-400/10 text-red-300" : "text-red-400") : i === at ? "bg-neutral-800 text-neutral-50" : "text-neutral-200"
+                  }`}
                 >
-                  <DotsIcon />
-                </button>
-              )}
-            </li>
-          ))}
-        </ul>
-      )}
-      {acts && acts.length === 0 && <p className="px-4 pb-4 pt-1 text-neutral-500">No action matches “{query.trim()}”. ⌫ goes back.</p>}
-      {!acts && found.length === 0 && <p className="px-4 pb-4 pt-1 text-neutral-500">Nothing matches “{query.trim()}”. ↵ makes it a task for Claude.</p>}
+                  <span className="flex w-4 justify-center">
+                    <Icon d={a.icon} />
+                  </span>
+                  {a.label}
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <ul id="jump-list" ref={list} role="listbox" aria-label="Sessions and shells" className="min-h-0 flex-1 overflow-y-auto p-1.5">
+              {shown.map((d, i) => (
+                <li
+                  key={d.key}
+                  id={optionId(d.key)}
+                  role="option"
+                  aria-selected={i === at}
+                  onMouseMove={() => i !== at && setActive(i)}
+                  onClick={(event) => go(d, event.shiftKey)}
+                  className={`group flex cursor-pointer items-center gap-3 rounded-lg px-3 py-2.5 sm:py-2 ${i === at ? "bg-neutral-800 text-neutral-50" : "text-neutral-200"}`}
+                >
+                  {d.kind === "terminal" ? (
+                    <span className="flex w-4 justify-center">
+                      <StateGlyph glyph={d.glyph} />
+                    </span>
+                  ) : (
+                    <PlusIcon className="size-4 shrink-0 text-neutral-500" />
+                  )}
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate">{d.title}</span>
+                    {d.kind === "terminal" && d.subtitle && <span className="block truncate text-xs text-neutral-500">{d.subtitle}</span>}
+                  </span>
+                  {d.kind === "terminal" && <span className="shrink-0 text-xs text-neutral-400">{d.label}</span>}
+                  {many && <span className="hidden max-w-32 shrink-0 truncate text-xs text-neutral-500 sm:inline">{d.machine}</span>}
+                  {actable && d.kind === "terminal" && (
+                    <button
+                      type="button"
+                      tabIndex={-1}
+                      aria-label={`Actions for ${d.title}`}
+                      title="What can be done with it (Tab)"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        act(d.terminal, i);
+                      }}
+                      className={`-my-1 -mr-1.5 shrink-0 rounded p-1 text-neutral-400 hover:bg-neutral-700 hover:text-neutral-100 ${i === at ? "" : "pointer-fine:invisible pointer-fine:group-hover:visible"}`}
+                    >
+                      <DotsIcon />
+                    </button>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+          {acts && acts.length === 0 && <p className="px-4 pb-4 pt-1 text-neutral-500">No action matches “{query.trim()}”. ⌫ goes back.</p>}
+          {!acts && found.length === 0 && <p className="px-4 pb-4 pt-1 text-neutral-500">Nothing matches “{query.trim()}”. ↵ makes it a task for Claude.</p>}
+        </div>
+        {wide && <Peek at={acting ? all.find((d) => d.kind === "terminal" && d.terminal === acting.terminal) : shown[at]} machines={machines} />}
+      </div>
       {shell.isPending && <p className="border-t border-neutral-800 px-4 py-2 text-xs text-neutral-400">Starting a shell…</p>}
       {shell.isError && (
         <p role="alert" className="border-t border-neutral-800 px-4 py-2 text-xs text-red-400">

@@ -148,7 +148,7 @@ function TurnCard({ turn, newest, session, now }: { turn: Turn; newest: boolean;
   );
 }
 
-function StepRow({ step, now }: { step: Mark; now: number }) {
+export function StepRow({ step, now }: { step: Mark; now: number }) {
   const kind = kindOf(step);
   const look = chip[kind];
   const text = kind === "command" ? step.text.slice(2) : step.text;
