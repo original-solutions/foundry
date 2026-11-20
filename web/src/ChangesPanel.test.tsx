@@ -107,6 +107,22 @@ describe("ChangesPanel", () => {
     expect(panel.textContent).toContain("1 changed since viewed");
   });
 
+  it("opens at a file named in a terminal: it is the current one and scrolled to", async () => {
+    mockFetch(json(200, changes));
+    const scrolled = vi.fn();
+    Element.prototype.scrollIntoView = scrolled;
+    try {
+      await renderApp(<ChangesPanel workspace={target} file="docs/notes.md" onClose={() => {}} />);
+      const panel = await screen.findByRole("dialog", { name: /changes in fix login/i });
+      await within(panel).findByRole("region", { name: "docs/notes.md" });
+      await waitFor(() => expect(panel.querySelector("section[aria-current='true']")?.getAttribute("aria-label")).toBe("docs/notes.md"));
+      expect(scrolled).toHaveBeenCalledTimes(1);
+      expect(scrolled.mock.contexts[0]).toBe(panel.querySelector("[data-path='docs/notes.md']"));
+    } finally {
+      delete (Element.prototype as Partial<Element>).scrollIntoView;
+    }
+  });
+
   it("walks the files from the keyboard: j and k move, v marks viewed and moves to the next one to view", async () => {
     const { panel } = await opened(json(200, changes));
     await within(panel).findByRole("region", { name: "src/login.ts" });

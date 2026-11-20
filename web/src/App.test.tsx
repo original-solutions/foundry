@@ -1,5 +1,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createMemoryHistory, createRouter, RouterProvider } from "@tanstack/react-router";
+import type { ILink, ILinkProvider } from "@xterm/xterm";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { machineQuery, type Briefs, type Changes, type Shipping, type UiMessage } from "./api";
@@ -8,6 +9,9 @@ import { button, pressed } from "./Modal";
 import { nextSteps } from "./next";
 import { ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
 import { FakeSocket, json, mockFetch, type Call } from "./test-utils";
+
+// What the stand-in terminals show on every row, and the link finder the last one opened registered.
+const xtermScreen = vi.hoisted(() => ({ text: "cargo test: 1 error", links: null as ILinkProvider | null }));
 
 // jsdom cannot run xterm.js.
 vi.mock("@xterm/xterm", () => ({
@@ -31,7 +35,24 @@ vi.mock("@xterm/xterm", () => ({
     onScroll() {
       return { dispose() {} };
     }
-    buffer = { active: { length: 1, viewportY: 0, baseY: 0, cursorY: 0, getLine: () => ({ isWrapped: false, translateToString: () => "cargo test: 1 error" }) } };
+    buffer = {
+      active: {
+        length: 1,
+        viewportY: 0,
+        baseY: 0,
+        cursorY: 0,
+        getLine: () => ({
+          isWrapped: false,
+          translateToString: () => xtermScreen.text,
+          length: xtermScreen.text.length,
+          getCell: (x: number) => ({ getChars: () => xtermScreen.text[x], getWidth: () => 1 }),
+        }),
+      },
+    };
+    registerLinkProvider(provider: ILinkProvider) {
+      xtermScreen.links = provider;
+      return { dispose() {} };
+    }
     registerMarker() {
       return { dispose() {} };
     }
@@ -955,6 +976,24 @@ describe("App", () => {
 
     fireEvent.click(within(shell()).getByRole("button", { name: "Close steps" }));
     expect(screen.queryByRole("complementary", { name: "Steps" })).toBeNull();
+  });
+
+  it("opens a workspace's changes at a file its terminal names, on ⌘-click", async () => {
+    const login = { path: "src/login.ts", from: null, status: "modified", added: 1, removed: 0, uncommitted: true, patch: "@@ -1 +1,2 @@\n a\n+b" };
+    const named = { base: "main", commits: [], files: [{ ...login, path: "README.md" }, login] };
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => json(200, url.endsWith("/changes") ? named : url.endsWith("/pr") ? shipping : {})));
+    xtermScreen.text = "● Update(src/login.ts)";
+    try {
+      await open("/terminals/t1", live);
+      const [link] = await new Promise<ILink[]>((done) => xtermScreen.links!.provideLinks(1, (found) => done(found ?? [])));
+      expect(link.text).toBe("src/login.ts");
+      act(() => link.activate(new MouseEvent("click", { metaKey: true }), link.text));
+
+      const panel = await screen.findByRole("dialog", { name: "Changes in fix login" });
+      await waitFor(() => expect(panel.querySelector("section[aria-current='true']")?.getAttribute("aria-label")).toBe("src/login.ts"));
+    } finally {
+      xtermScreen.text = "cargo test: 1 error";
+    }
   });
 
   it("opens a workspace's changes from its row in the sidebar", async () => {

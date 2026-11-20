@@ -1,19 +1,27 @@
+import { useQueryClient } from "@tanstack/react-query";
 import { FitAddon } from "@xterm/addon-fit";
-import { Terminal } from "@xterm/xterm";
+import { Terminal, type ILink } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { MAX_FILE, sendFile } from "./api";
+import { MAX_FILE, sendFile, type FileChange } from "./api";
+import { changesQuery } from "./ChangesPanel";
 import { FindBar } from "./FindBar";
 import { DropOverlay, SendingChip } from "./Handoff";
 import { KeyBar } from "./KeyBar";
 import { NextSteps } from "./NextSteps";
 import type { Glyph } from "./labels";
+import { LinkPeek, type Peeked } from "./LinkPeek";
+import { linksIn, rowText, type Found } from "./links";
 import { Backoff, socketUrl } from "./socket";
 
 /** How long a pane tries a terminal it has never attached before it says the terminal is not here. */
 const NOT_HERE_AFTER = 10_000;
 /** How long a connection must stay up before the wait between attaches drops back to its start. */
 const STEADY_AFTER = 10_000;
+/** How long a read of the workspace's changed files serves the links of every line the pointer crosses. */
+const FILES_FRESH = 5_000;
+/** A word with a file extension: only a line with one is worth reading the changed files for. */
+const NAMES_FILE = /[\w-]\.[A-Za-z0-9]{1,10}\b/;
 
 /**
  * xterm.js attached to terminal `id` over `/api/terminals/{id}`.
@@ -46,6 +54,13 @@ const STEADY_AFTER = 10_000;
  *
  * A session of this machine (`workspace` given, `here`) that is idle leads its key bar with its
  * workspace's next steps, each typed in as a prompt and sent.
+ *
+ * What a terminal prints can be opened, as in a desktop terminal: a web address, and, on this
+ * machine, a file its workspace (`changesOf`) changed, by its path or its name. Resting the pointer
+ * on one shows where it goes or the file's diff; ⌘- or Ctrl-click (a tap on a touch screen) opens
+ * the address in a new tab or hands the file to `onFile`. A plain click still selects text. The
+ * changed files are read only for a line the pointer is on that has a file-like word, and one read
+ * serves every line for a few seconds.
  */
 export function TerminalPane({
   id,
@@ -57,6 +72,8 @@ export function TerminalPane({
   onFindClose = () => {},
   here = false,
   workspace,
+  changesOf,
+  onFile,
 }: {
   id: string;
   running: boolean | undefined;
@@ -70,6 +87,10 @@ export function TerminalPane({
   here?: boolean;
   /** The workspace of the session the terminal runs; not given for a shell. */
   workspace?: string;
+  /** The workspace the terminal (session or shell) belongs to, whose changed files its text can open. */
+  changesOf?: string;
+  /** Opens a changed file named on screen, by its path in the workspace's changes. */
+  onFile?: (path: string) => void;
 }) {
   const host = useRef<HTMLDivElement>(null);
   const shown = useRef<{ term: Terminal; fit: FitAddon } | null>(null);
@@ -79,16 +100,60 @@ export function TerminalPane({
   useEffect(() => {
     runningNow.current = running;
   }, [running]);
+  const client = useQueryClient();
+  const [peek, setPeek] = useState<Peeked | null>(null);
+  /** What the links read when found and opened; the terminal outlives a change of these. */
+  const linking = useRef({ client, changesOf, here, onFile });
+  useEffect(() => {
+    linking.current = { client, changesOf, here, onFile };
+  }, [client, changesOf, here, onFile]);
 
   useEffect(() => {
     // As many lines as the holder keeps (xterm's default is 1,000), so find reaches all of them.
     // Decorations, which the find bar lights its hits with, are still a proposed API in xterm.
-    const term = new Terminal({ cursorBlink: true, fontSize: 13, fontFamily: "ui-monospace, Menlo, monospace", scrollback: 10_000, allowProposedApi: true });
+    // A link a program marks as one (OSC 8) opens the way a found one does, and only on the web.
+    const linkHandler = {
+      activate: (event: MouseEvent, text: string) => {
+        if (wants(event) && /^https?:\/\//.test(text)) openUrl(text);
+      },
+      hover: (event: MouseEvent, text: string) => setPeek({ x: event.clientX, y: event.clientY, url: text }),
+      leave: () => setPeek(null),
+    };
+    const term = new Terminal({ cursorBlink: true, fontSize: 13, fontFamily: "ui-monospace, Menlo, monospace", scrollback: 10_000, allowProposedApi: true, linkHandler });
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.open(host.current!);
     fit.fit();
     shown.current = { term, fit };
+
+    const links = term.registerLinkProvider({
+      provideLinks(y, done) {
+        const { text, cells } = rowText((row) => term.buffer.active.getLine(row), y - 1);
+        const made = (found: Found[], files: FileChange[]): ILink[] =>
+          found.map((f) => {
+            const file = files.find((c) => c.path === f.target);
+            const [from, to] = [cells[f.start], cells[f.end - 1]];
+            return {
+              range: { start: { x: from.x + 1, y: from.y + 1 }, end: { x: to.x + 1, y: to.y + 1 } },
+              text: text.slice(f.start, f.end),
+              activate: (event) => {
+                if (!wants(event)) return;
+                setPeek(null);
+                if (f.kind === "url") openUrl(f.target);
+                else linking.current.onFile?.(f.target);
+              },
+              hover: (event) => setPeek(file ? { x: event.clientX, y: event.clientY, file } : { x: event.clientX, y: event.clientY, url: f.target }),
+              leave: () => setPeek(null),
+            };
+          });
+        const { client, changesOf, here } = linking.current;
+        if (!changesOf || !here || !NAMES_FILE.test(text)) return done(made(linksIn(text, []), []));
+        client.fetchQuery({ ...changesQuery(changesOf), staleTime: FILES_FRESH }).then(
+          (changes) => done(made(linksIn(text, changes.files.map((f) => f.path)), changes.files)),
+          () => done(made(linksIn(text, []), [])),
+        );
+      },
+    });
 
     let socket: WebSocket | undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -167,6 +232,8 @@ export function TerminalPane({
       observer.disconnect();
       typed.dispose();
       resized.dispose();
+      links.dispose();
+      setPeek(null);
       socket?.close();
       term.dispose();
       shown.current = null;
@@ -255,6 +322,7 @@ export function TerminalPane({
         {finding > 0 && <FindBar key={id} term={termNow} name={name ?? "terminal"} ask={finding} onClose={onFindClose} />}
         {dragging !== null && <DropOverlay name={name ?? "terminal"} count={dragging} refusal={refusal} />}
         {sending && <SendingChip names={sending} />}
+        {peek && <LinkPeek peek={peek} />}
       </div>
       {running !== false && (
         <KeyBar
@@ -278,6 +346,15 @@ export function TerminalPane({
       {status && <div className="border-t border-neutral-800 px-3 py-1 text-xs text-amber-400">{status}</div>}
     </div>
   );
+}
+
+/** Whether a click on a link opens it: with ⌘ or Ctrl held, so a plain click still selects; any tap on a touch screen. */
+function wants(event: MouseEvent): boolean {
+  return event.metaKey || event.ctrlKey || touch();
+}
+
+function openUrl(url: string) {
+  window.open(url, "_blank", "noopener,noreferrer");
 }
 
 /** Whether the main pointer is a finger. */

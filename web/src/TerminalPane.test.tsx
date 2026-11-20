@@ -1,6 +1,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ILink, ILinkProvider } from "@xterm/xterm";
 import type { Changes } from "./api";
 import { nextSteps } from "./next";
 import { TerminalPane } from "./TerminalPane";
@@ -15,6 +16,8 @@ const screenOps = vi.hoisted(() => ({
   term: null as { cols: number; rows: number } | null,
   options: null as Record<string, unknown> | null,
   focused: false,
+  provider: null as ILinkProvider | null,
+  rows: [] as string[],
 }));
 
 vi.mock("@xterm/xterm", () => ({
@@ -27,6 +30,19 @@ vi.mock("@xterm/xterm", () => ({
     }
     loadAddon() {}
     open() {}
+    registerLinkProvider(provider: ILinkProvider) {
+      screenOps.provider = provider;
+      return { dispose() {} };
+    }
+    // Rows of one-cell characters, none wrapped.
+    buffer = {
+      active: {
+        getLine: (y: number) => {
+          const text = screenOps.rows[y];
+          return text === undefined ? undefined : { isWrapped: false, length: text.length, getCell: (x: number) => ({ getChars: () => text[x], getWidth: () => 1 }) };
+        },
+      },
+    };
     focus() {
       screenOps.focused = true;
     }
@@ -65,6 +81,8 @@ beforeEach(() => {
   screenOps.resized = null;
   screenOps.term = null;
   screenOps.focused = false;
+  screenOps.provider = null;
+  screenOps.rows = [];
   FakeSocket.install();
   vi.stubGlobal(
     "ResizeObserver",
@@ -83,7 +101,10 @@ afterEach(() => {
 
 // An options object, not a defaulted parameter: a default would turn an explicit `undefined` into `true`.
 function mount(id = "t1", { running, glyph, here = true }: { running: boolean | undefined; glyph?: Glyph; here?: boolean } = { running: true }) {
-  const view = render(<TerminalPane id={id} running={running} name="opus" glyph={glyph} here={here} />);
+  const client = new QueryClient();
+  const view = render(<TerminalPane id={id} running={running} name="opus" glyph={glyph} here={here} />, {
+    wrapper: ({ children }) => <QueryClientProvider client={client}>{children}</QueryClientProvider>,
+  });
   return { socket: FakeSocket.last(), view };
 }
 
@@ -560,6 +581,91 @@ describe("TerminalPane", () => {
       });
 
       expect(sent(socket)).toEqual(["\x1b[200~/data/t1.files/shot.png \x1b[201~"]);
+    });
+  });
+
+  describe("what Claude prints can be opened", () => {
+    const patch = "@@ -1,2 +1,2 @@\n-export const version = \"1.3.0\";\n+export const version = \"1.4.0\";\n same";
+    const changes = {
+      base: "main",
+      commits: [],
+      files: [{ path: "src/version.ts", from: null, status: "modified", added: 1, removed: 1, uncommitted: true, patch }],
+    };
+    /** The links the pane finds on screen row `y` (0-based), as xterm asks for them. */
+    const linksOn = (y: number) =>
+      new Promise<ILink[] | undefined>((done) => {
+        screenOps.provider!.provideLinks(y + 1, done);
+      });
+    const click = (modifiers: Partial<MouseEvent> = {}) => ({ clientX: 100, clientY: 100, metaKey: false, ctrlKey: false, ...modifiers }) as MouseEvent;
+    const open = (onFile = vi.fn(), here = true) => {
+      vi.useRealTimers();
+      const fetch = vi.fn(async (url: string) => (url === "/api/workspaces/w1/changes" ? json(200, changes) : json(404, {})));
+      vi.stubGlobal("fetch", fetch);
+      render(
+        <QueryClientProvider client={new QueryClient()}>
+          <TerminalPane id="t1" running name="opus" glyph="ready" here={here} changesOf="w1" onFile={onFile} />
+        </QueryClientProvider>,
+      );
+      return { fetch, onFile };
+    };
+
+    it("finds a web address on a line, and Cmd- or Ctrl-click opens it in a new tab; a plain click selects as before", async () => {
+      const opened = vi.fn();
+      vi.stubGlobal("open", opened);
+      open();
+      screenOps.rows = ["● Opened https://github.com/o/r/pull/12."];
+
+      const [link] = (await linksOn(0))!;
+      expect(link.text).toBe("https://github.com/o/r/pull/12");
+      expect(link.range).toEqual({ start: { x: 10, y: 1 }, end: { x: 39, y: 1 } });
+
+      link.activate(click(), link.text);
+      expect(opened).not.toHaveBeenCalled();
+      link.activate(click({ metaKey: true }), link.text);
+      link.activate(click({ ctrlKey: true }), link.text);
+      expect(opened).toHaveBeenCalledTimes(2);
+      expect(opened).toHaveBeenCalledWith("https://github.com/o/r/pull/12", "_blank", "noopener,noreferrer");
+    });
+
+    it("finds a file its workspace changed, shows its diff while the pointer rests on it, and Cmd-click opens it in Changes", async () => {
+      const { onFile } = open();
+      screenOps.rows = ["● Update(src/version.ts)"];
+
+      const [link] = (await linksOn(0))!;
+      expect(link.text).toBe("src/version.ts");
+
+      act(() => link.hover!(click(), link.text));
+      const peek = screen.getByRole("tooltip");
+      expect(peek.textContent).toContain("src/version.ts");
+      expect(peek.textContent).toContain("+1");
+      expect(peek.textContent).toContain("uncommitted");
+      expect(peek.textContent).toContain('export const version = "1.4.0";');
+      expect(peek.textContent).toContain("click to open in Changes");
+
+      act(() => link.leave!(click(), link.text));
+      expect(screen.queryByRole("tooltip")).toBeNull();
+
+      act(() => link.activate(click({ metaKey: true }), link.text));
+      expect(onFile).toHaveBeenCalledWith("src/version.ts");
+    });
+
+    it("asks for the workspace's changes only for a line that names a file, and reads them once for many lines", async () => {
+      const { fetch } = open();
+      screenOps.rows = ["Done.", "edited src/version.ts", "and README.md"];
+
+      expect(await linksOn(0)).toEqual([]);
+      expect(fetch).not.toHaveBeenCalled();
+      await linksOn(1);
+      await linksOn(2);
+      expect(fetch.mock.calls.map(([url]) => url)).toEqual(["/api/workspaces/w1/changes"]);
+    });
+
+    it("links no files for a terminal on another machine, whose changes this daemon cannot read", async () => {
+      const { fetch } = open(vi.fn(), false);
+      screenOps.rows = ["edited src/version.ts at https://example.com"];
+
+      expect((await linksOn(0))!.map((l) => l.text)).toEqual(["https://example.com"]);
+      expect(fetch).not.toHaveBeenCalled();
     });
   });
 });

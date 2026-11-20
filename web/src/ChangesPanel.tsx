@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { Dialog } from "radix-ui";
-import { Fragment, useRef, useState, type KeyboardEvent } from "react";
+import { Fragment, useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { workspaceChanges, type Changes, type Commit, type FileChange } from "./api";
 import { diffLines, splitPath, totals } from "./changes";
 import type { SessionView } from "./fleet";
@@ -22,7 +22,7 @@ const FOLDED_PAST = 400;
 /** The query an open panel keeps fresh. The header reads its cached counts. */
 export const changesQuery = (workspace: string) => ({ queryKey: ["changes", workspace], queryFn: () => workspaceChanges(workspace) });
 
-const status: Record<FileChange["status"], { letter: string; title: string; tone: string }> = {
+export const fileStatus: Record<FileChange["status"], { letter: string; title: string; tone: string }> = {
   added: { letter: "A", title: "Added", tone: "bg-emerald-400/15 text-emerald-300" },
   modified: { letter: "M", title: "Modified", tone: "bg-amber-400/15 text-amber-300" },
   deleted: { letter: "D", title: "Deleted", tone: "bg-red-400/15 text-red-300" },
@@ -59,7 +59,7 @@ interface Editing extends Anchor {
  * as many as you like, then send them to one of the workspace's idle sessions as one message.
  * Unsent comments outlive the sheet closing, not a reload.
  */
-export function ChangesPanel({ workspace, onClose }: { workspace?: Target; onClose: () => void }) {
+export function ChangesPanel({ workspace, file, onClose }: { workspace?: Target; file?: string; onClose: () => void }) {
   const [notes, setNotes] = useState<Record<string, Note[]>>({});
   return (
     <Dialog.Root open={workspace !== undefined} onOpenChange={(open) => !open && onClose()}>
@@ -68,6 +68,7 @@ export function ChangesPanel({ workspace, onClose }: { workspace?: Target; onClo
           <Sheet
             key={workspace.id}
             workspace={workspace}
+            file={file}
             onClose={onClose}
             notes={notes[workspace.id] ?? []}
             onNotes={(list) => setNotes((all) => ({ ...all, [workspace.id]: list }))}
@@ -80,19 +81,28 @@ export function ChangesPanel({ workspace, onClose }: { workspace?: Target; onClo
 
 interface SheetProps {
   workspace: Target;
+  /** The file to open at, as a terminal named it; the sheet starts on it and scrolls it into view once. */
+  file?: string;
   onClose: () => void;
   notes: Note[];
   onNotes: (notes: Note[]) => void;
 }
 
-function Sheet({ workspace, onClose, notes, onNotes }: SheetProps) {
+function Sheet({ workspace, file, onClose, notes, onNotes }: SheetProps) {
   const { data, error, isPending } = useQuery({ ...changesQuery(workspace.id), refetchInterval: CHANGES_EVERY, retry: false });
   const body = useRef<HTMLDivElement>(null);
   const [viewed, setViewed] = useState<Viewed>(() => loadViewed(workspace.id));
   const [at, setAt] = useState<number>();
   const [editing, setEditing] = useState<Editing>();
   const files = data?.files ?? [];
-  const current = at !== undefined && at < files.length ? at : undefined;
+  const asked = file === undefined ? -1 : files.findIndex((f) => f.path === file);
+  const current = at !== undefined && at < files.length ? at : asked >= 0 ? asked : undefined;
+  const reached = useRef(false);
+  useEffect(() => {
+    if (asked < 0 || reached.current) return;
+    reached.current = true;
+    body.current?.querySelector(`[data-path="${CSS.escape(file!)}"]`)?.scrollIntoView?.({ block: "start" });
+  }, [asked, file]);
 
   const show = (i: number) => {
     setAt(i);
@@ -267,7 +277,7 @@ function Empty({ base, onClose }: { base: string; onClose: () => void }) {
 }
 
 function StatusChip({ file }: { file: FileChange }) {
-  const s = status[file.status];
+  const s = fileStatus[file.status];
   return (
     <span title={s.title} className={`inline-flex size-4 shrink-0 items-center justify-center rounded-sm font-mono text-[10px] font-semibold ${s.tone}`}>
       {s.letter}
@@ -345,12 +355,12 @@ function Commits({ commits, branch }: { commits: Commit[]; branch: string }) {
   );
 }
 
-const rowTone = {
+export const rowTone = {
   added: "bg-emerald-500/10 text-emerald-100",
   removed: "bg-red-500/10 text-red-100",
   same: "text-neutral-300",
 };
-const marker = { added: "+", removed: "-", same: " " };
+export const marker = { added: "+", removed: "-", same: " " };
 
 interface FileDiffProps {
   file: FileChange;

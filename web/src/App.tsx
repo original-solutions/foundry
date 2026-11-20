@@ -111,7 +111,7 @@ function Layout() {
   /** The find bar over the terminal with the keyboard: 0 closed, and one more each time it is asked for. */
   const [finding, setFinding] = useState(0);
   /** The workspace whose changes are open. */
-  const [changesOf, setChangesOf] = useState<string>();
+  const [changesOf, setChangesOf] = useState<{ workspace: string; file?: string }>();
   /** The workspace a new session is being asked for from a terminal's actions. */
   const [sessionIn, setSessionIn] = useState<{ id: string; name: string }>();
   /** The session of a workspace just made, until it shows up and is opened. */
@@ -199,9 +199,9 @@ function Layout() {
     setDrawer(false);
     setJump("jump");
   };
-  const openChanges = (workspace: string) => {
+  const openChanges = (workspace: string, file?: string) => {
     setDrawer(false);
-    setChangesOf(workspace);
+    setChangesOf({ workspace, file });
   };
   const openCreate = (task = "") => {
     setDrawer(false);
@@ -314,6 +314,8 @@ function Layout() {
                       onFindClose={() => setFinding(0)}
                       here={!!where && where.machine.id === here}
                       workspace={where?.session ? where.workspace.id : undefined}
+                      changesOf={where?.workspace.id}
+                      onFile={where && ((file) => openChanges(where.workspace.id, file))}
                     />
                   </div>
                 );
@@ -339,7 +341,11 @@ function Layout() {
           </main>
           {stepsOpen && stepsOf && <StepsPanel key={located?.session ?? terminalId} of={stepsOf} onClose={() => setStepsOpen(false)} />}
         </div>
-        <ChangesPanel workspace={machines.flatMap((m) => m.workspaces).find((w) => w.id === changesOf)} onClose={() => setChangesOf(undefined)} />
+        <ChangesPanel
+          workspace={machines.flatMap((m) => m.workspaces).find((w) => w.id === changesOf?.workspace)}
+          file={changesOf?.file}
+          onClose={() => setChangesOf(undefined)}
+        />
         <JumpPalette
           machines={machines}
           open={jump !== undefined}
