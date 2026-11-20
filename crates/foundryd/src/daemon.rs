@@ -443,15 +443,36 @@ fn new_addresses(
         .collect()
 }
 
-/// The Tailscale CLI. The macOS app ships it inside the app, often not on `PATH`; elsewhere,
-/// and for a Homebrew install on macOS, it is `tailscale` on `PATH`.
+/// The Tailscale CLI: `FOUNDRY_TAILSCALE` when set, which is how tests keep the daemon away
+/// from the real one, else by [`choose_cli`].
 fn tailscale_cli() -> PathBuf {
-    const IN_THE_APP: &str = "/Applications/Tailscale.app/Contents/MacOS/Tailscale";
-    if cfg!(target_os = "macos") && Path::new(IN_THE_APP).exists() {
-        PathBuf::from(IN_THE_APP)
-    } else {
-        PathBuf::from("tailscale")
+    choose_cli(std::env::var_os("FOUNDRY_TAILSCALE"), KNOWN_CLIS)
+}
+
+/// Where the Tailscale CLI is when it is not on a service's `PATH`: on macOS inside the app,
+/// which does not put it on `PATH`, then Homebrew's, which launchd's `PATH` leaves out. On
+/// Linux it is on `PATH`.
+const KNOWN_CLIS: &[&str] = if cfg!(target_os = "macos") {
+    &[
+        "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+        "/opt/homebrew/bin/tailscale",
+        "/usr/local/bin/tailscale",
+    ]
+} else {
+    &[]
+};
+
+/// The CLI to ask: `set` when it is not empty, else the first of `known` that is there, else
+/// `tailscale` on `PATH`.
+fn choose_cli(set: Option<OsString>, known: &[&str]) -> PathBuf {
+    if let Some(cli) = set.filter(|cli| !cli.is_empty()) {
+        return PathBuf::from(cli);
     }
+    known
+        .iter()
+        .map(Path::new)
+        .find(|cli| cli.exists())
+        .map_or_else(|| PathBuf::from("tailscale"), Path::to_path_buf)
 }
 
 /// How long `tailscale ip` may take before it is stopped and Tailscale counts as not answering.
