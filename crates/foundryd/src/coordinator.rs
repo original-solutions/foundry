@@ -325,8 +325,8 @@ pub fn numbered(held: &SharedSettings, edit: &Edit, me: MachineId) -> SharedSett
 
 /// One copy of the settings from two, setting by setting: the higher stamp's value holds. A
 /// setting both copies edited where neither had seen the other's edit also gets a "setting
-/// overwritten" item holding both values, stamped as the edit that held. `seen` is the higher
-/// of each.
+/// overwritten" item holding both values, stamped as the edit that held, or as the dismissal of
+/// an earlier item about that setting when that is later. `seen` is the higher of each.
 ///
 /// The result's `seq` is the higher of the two, plus one unless the result is the settings of
 /// every copy that holds that `seq`. That is one more case than "differs from both": a result
@@ -369,11 +369,21 @@ pub fn merge(a: &SharedSettings, b: &SharedSettings) -> SharedSettings {
     // An item from this merge replaces one held for the same setting only when it is about a
     // later edit kept or, for the same edit kept, a later edit lost: so with three or more
     // sides, every order of merging keeps the latest edit each side lost to.
+    //
+    // A conflict found here is news to both copies: a copy that held an item about it had
+    // seen both edits, so would raise none. A dismissal held for the setting is therefore of
+    // an earlier item, and the new item shows, stamped no lower than the dismissal so the
+    // dismissing copy does not remove it again when they meet.
     for (setting, item, stamp) in conflicts {
         let held_lost = out.overwritten.get(&setting).map(|i| i.lost_stamp);
         let key = StampKey::Overwritten(setting);
-        if (stamp, Some(item.lost_stamp)) > (self::stamp(&out, &key), held_lost) {
-            put(&mut out, &key, Some(Value::Item(item)), stamp);
+        let held = self::stamp(&out, &key);
+        let replaces = match held_lost {
+            None => true,
+            Some(held_lost) => (stamp, item.lost_stamp) > (held, held_lost),
+        };
+        if replaces {
+            put(&mut out, &key, Some(Value::Item(item)), stamp.max(held));
         }
     }
     out.seen = a.seen.clone();
@@ -957,6 +967,39 @@ mod tests {
         let out = merged(&dismissed, &b);
         assert!(out.overwritten.is_empty());
         assert_eq!(project_named(&out, 7).as_deref(), Some("from a"));
+    }
+
+    #[test]
+    fn a_dismissal_made_during_a_split_does_not_hide_a_conflict_the_split_raised() {
+        let a = numbered(&base(), &set_project(7, "from a"), id(A));
+        let b = numbered(&base(), &set_project(7, "from b"), id(B));
+        let joined = merged(&a, &b);
+        let key = SettingKey::Project(project(7, "p").id);
+        // Split again. One side edits the project, then dismisses the old item; the other
+        // side edits the project too.
+        let x = numbered(&joined, &set_project(7, "x"), id(A));
+        let x = numbered(
+            &x,
+            &Edit::Dismiss {
+                setting: key.clone(),
+            },
+            id(A),
+        );
+        let y = numbered(&joined, &set_project(7, "y"), id(B));
+        let out = merged(&x, &y);
+        assert_eq!(project_named(&out, 7).as_deref(), Some("x"));
+        assert_eq!(
+            out.overwritten.get(&key),
+            Some(&Overwritten {
+                kept: Some(SettingValue::Project(project(7, "x"))),
+                lost: Some(SettingValue::Project(project(7, "y"))),
+                lost_stamp: y.stamps[&StampKey::Setting(key.clone())],
+            })
+        );
+        // The new item can itself be dismissed.
+        let dismissed = numbered(&out, &Edit::Dismiss { setting: key }, id(A));
+        assert!(merged(&dismissed, &y).overwritten.is_empty());
+        assert!(merged(&dismissed, &x).overwritten.is_empty());
     }
 
     #[test]

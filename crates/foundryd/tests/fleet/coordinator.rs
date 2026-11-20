@@ -343,6 +343,58 @@ async fn an_acting_machine_numbers_at_once_with_a_peer_on_the_older_protocol_onl
     assert_eq!(project_named(&daemon.settings(), 7).as_deref(), Some("p"));
 }
 
+/// A daemon that takes `older`, linked only in the older protocol, to act, and a peer on this
+/// build that has sent its settings, both kept online by heartbeats. Returns the fleet, the
+/// older machine's heartbeat, and the end the test speaks on as the other peer.
+async fn behind_an_older_acting_machine()
+-> (Fleet, tokio::task::JoinHandle<()>, mpsc::Sender<String>) {
+    let (older, peer) = (MachineId::random(), MachineId::random());
+    let fleet = Fleet::start_coordinated_with(1, &[older, peer]);
+    let daemon = &fleet.daemons[0];
+    let mut held = daemon.settings();
+    held.seq += 1;
+    held.priority = vec![older, daemon.id, peer];
+    lock(&daemon.store).apply_settings(held).unwrap();
+    let older_beat = beating(drained(
+        raw_link_speaking(daemon, older, EDITS_SINCE - 1).await,
+    ));
+    let conn = drained(raw_link(daemon, peer).await);
+    say(&conn, &settings_message(daemon.settings())).await;
+    beating(conn.clone());
+    acting_becomes(&daemon.coordinator(), older, WAIT).await;
+    (fleet, older_beat, conn)
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_forwarded_edit_the_older_acting_machine_cannot_take_waits_for_the_role_to_move() {
+    let (fleet, older_beat, peer) = behind_an_older_acting_machine().await;
+    let daemon = &fleet.daemons[0];
+    say(&peer, &edit_message(set_project(7, "kept"))).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    // The older machine goes quiet, so the role moves here before the edit is given up.
+    older_beat.abort();
+    holds_project(daemon, 7, OFFLINE_AFTER + Duration::from_secs(5)).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_forwarded_edit_still_unsendable_after_the_keep_limit_is_dropped_and_the_next_goes_on() {
+    let (fleet, older_beat, peer) = behind_an_older_acting_machine().await;
+    let daemon = &fleet.daemons[0];
+    let start = Instant::now();
+    say(&peer, &edit_message(set_project(7, "dropped"))).await;
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    say(&peer, &edit_message(set_project(8, "next"))).await;
+    // The older machine is heard until now, so it acts past the first edit's keep limit
+    // (twice OFFLINE_AFTER from its arrival), and the role moves only after that.
+    older_beat.abort();
+    let settings = holds_project(daemon, 8, OFFLINE_AFTER * 2).await;
+    assert!(
+        start.elapsed() > OFFLINE_AFTER * 2,
+        "numbered before the older machine lost the role"
+    );
+    assert_eq!(project_named(&settings, 7), None, "kept past its limit");
+}
+
 // --- splits ---
 
 #[tokio::test(start_paused = true)]
