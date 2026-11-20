@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use nix::errno::Errno;
 use nix::fcntl::{Flock, FlockArg};
 use nix::sys::signal::{Signal, raise};
+use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 
 /// The repository the releases are read from.
@@ -34,6 +35,33 @@ const HEALTHY_AFTER: Duration = Duration::from_secs(60);
 /// How long a trial may take to become healthy before the process gives up and exits, so a
 /// start that hangs (on a keychain prompt, say) counts as a failed start.
 const TRIAL_DEADLINE: Duration = Duration::from_secs(300);
+
+/// The release public key, as hex. The release workflow reads it from this line and refuses to
+/// publish when its signing key does not match, so keep it on one line.
+const RELEASE_KEY_HEX: &str = "1884d7afeb3f7af2805f1727358a10baa8688264fd531685d116b9bec30b45e1";
+
+/// The Ed25519 public key a release's archive must be signed with before it is unpacked.
+const RELEASE_KEY: [u8; 32] = hex_key(RELEASE_KEY_HEX);
+
+/// Reads 64 lowercase hex digits as 32 bytes, at compile time.
+const fn hex_key(hex: &str) -> [u8; 32] {
+    const fn digit(c: u8) -> u8 {
+        match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => c - b'a' + 10,
+            _ => panic!("the release key is lowercase hex"),
+        }
+    }
+    let hex = hex.as_bytes();
+    assert!(hex.len() == 64, "the release key is 32 bytes");
+    let mut key = [0; 32];
+    let mut i = 0;
+    while i < 32 {
+        key[i] = (digit(hex[2 * i]) << 4) | digit(hex[2 * i + 1]);
+        i += 1;
+    }
+    key
+}
 
 /// How long to wait between two looks for a newer tag.
 const CHECK_EVERY: Duration = Duration::from_secs(600);
@@ -65,6 +93,9 @@ pub enum UpdateError {
     /// The release could not be listed, downloaded or checked; tried again later.
     #[error("{0}")]
     Fetch(String),
+    /// The release's archive is not signed by the release key.
+    #[error("{0} is refused: its signature did not verify")]
+    BadSignature(String),
     /// The release does not hold one of the two binaries.
     #[error("{0} is missing: a release holds foundryd and foundry-holder")]
     Missing(&'static str),
@@ -686,23 +717,36 @@ fn asset() -> String {
     )
 }
 
-/// Downloads this machine's asset of `tag` into `stage` and unpacks it there.
+/// Downloads this machine's asset of `tag` and its signature into `stage`, and unpacks it there
+/// once the signature verifies against [`RELEASE_KEY`].
 fn download(tag: &str, stage: &Path) -> Result<(), UpdateError> {
-    download_with(OsStr::new("gh"), tag, stage)
+    download_with(OsStr::new("gh"), &RELEASE_KEY, tag, stage)
 }
 
-/// [`download`] with the `gh` program given.
-fn download_with(gh: &OsStr, tag: &str, stage: &Path) -> Result<(), UpdateError> {
+/// [`download`] with the `gh` program and the public key given. A signature that cannot be
+/// downloaded is a fetch error, tried again later; one that does not verify is
+/// [`UpdateError::BadSignature`]. Either way nothing is unpacked.
+fn download_with(gh: &OsStr, key: &[u8], tag: &str, stage: &Path) -> Result<(), UpdateError> {
     let asset = asset();
+    let sig = format!("{asset}.sig");
     run_bounded(
         Command::new(gh)
-            .args(["release", "download", tag, "--repo", REPO, "--pattern"])
-            .arg(&asset)
+            .args(["release", "download", tag, "--repo", REPO])
+            .args(["--pattern", &asset, "--pattern", &sig])
             .arg("--dir")
             .arg(stage),
         DOWNLOAD_LIMIT,
     )
     .map_err(|error| UpdateError::Fetch(error.to_string()))?;
+    let read = |name: &str| {
+        fs::read(stage.join(name))
+            .map_err(|error| UpdateError::Fetch(format!("cannot read {name} of {tag}: {error}")))
+    };
+    let signature = read(&sig)?;
+    UnparsedPublicKey::new(&ED25519, key)
+        .verify(&read(&asset)?, &signature)
+        .map_err(|_| UpdateError::BadSignature(tag.to_string()))?;
+    let _ = fs::remove_file(stage.join(&sig));
     let archive = stage.join(&asset);
     run_bounded(
         Command::new("tar")
@@ -718,10 +762,10 @@ fn download_with(gh: &OsStr, tag: &str, stage: &Path) -> Result<(), UpdateError>
 }
 
 /// One look for a newer tag. `Some` is the tag that was installed. A release is refused, so it
-/// is not downloaded again, when it lacks a binary, when its `foundryd` cannot be executed,
-/// or when that `foundryd` ran and failed or printed the wrong version. Any other failure,
-/// including a version check that times out or hits a passing system error, is tried again
-/// later.
+/// is not downloaded again, when its signature does not verify, when it lacks a binary, when
+/// its `foundryd` cannot be executed, or when that `foundryd` ran and failed or printed the
+/// wrong version. Any other failure, including a missing signature or a version check that
+/// times out or hits a passing system error, is tried again later.
 fn check_with(
     home: &Path,
     running: &str,
@@ -744,7 +788,8 @@ fn check_with(
     match install_tag(home, &tag, running, version_limit, fetch) {
         Ok(()) => Ok(Some(tag)),
         Err(
-            error @ (UpdateError::WrongVersion { .. }
+            error @ (UpdateError::BadSignature(_)
+            | UpdateError::WrongVersion { .. }
             | UpdateError::BadCheck { .. }
             | UpdateError::Missing(_)),
         ) => {
