@@ -1,11 +1,14 @@
 import { useMutation } from "@tanstack/react-query";
-import { useState } from "react";
+import { useState, type ReactElement } from "react";
 import { Dialog } from "radix-ui";
 import { startSession } from "./api";
 import { button, field, Modal } from "./Modal";
 
-/** "New session" for a workspace: asks for the model, then starts Claude Code in it. */
-export function NewSession({ workspace, name }: { workspace: string; name: string }) {
+/**
+ * "New session" for a workspace: asks for the model, then starts Claude Code in it. `trigger`
+ * replaces the default text button.
+ */
+export function NewSession({ workspace, name, trigger = "New session" }: { workspace: string; name: string; trigger?: ReactElement | string }) {
   const [open, setOpen] = useState(false);
   const start = useMutation({
     mutationFn: (model: string) => startSession(workspace, model),
@@ -16,7 +19,7 @@ export function NewSession({ workspace, name }: { workspace: string; name: strin
   };
 
   return (
-    <Modal open={open} onOpenChange={change} trigger="New session" title={`New session in ${name}`} description="Starts Claude Code in the workspace.">
+    <Modal open={open} onOpenChange={change} trigger={trigger} title={`New session in ${name}`} description="Starts Claude Code in the workspace.">
       <form
         className="mt-3 space-y-3"
         onSubmit={(event) => {

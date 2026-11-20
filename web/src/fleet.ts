@@ -112,7 +112,7 @@ export function fleet(records: AnyRecord[], settings: SharedSettings): MachineVi
     });
     return {
       id,
-      name: settings.machines.find((m) => m.id === id)?.name ?? id,
+      name: settings.machines.find((m) => m.id === id)?.name ?? shortId(id),
       status: reachable.includes(false) ? "offline" : reachable.length === 0 ? "unknown" : "online",
       sample: sample?.body ?? null,
       workspaces,
@@ -132,13 +132,39 @@ export interface Located {
 export function locate(machines: MachineView[], id: string): Located | undefined {
   for (const machine of machines) {
     for (const workspace of machine.workspaces) {
-      const session = workspace.sessions.find((s) => s.terminal === id);
-      if (session) return { machine, workspace, name: session.model, label: sessionLabel[session.state], glyph: sessionGlyph[session.state] };
-      const shell = workspace.shells.find((t) => t.id === id);
-      if (shell) return { machine, workspace, name: "shell", label: terminalLabel(shell.state, shell.exitCode), glyph: terminalGlyph(shell.state, shell.exitCode) };
+      const row = rows(workspace).find((r) => r.terminal === id);
+      if (row) return { machine, workspace, name: row.name, label: row.label, glyph: row.glyph };
     }
   }
   return undefined;
+}
+
+/** One terminal of a workspace as the sidebar lists it. */
+export interface Row {
+  terminal: string;
+  name: string;
+  label: string;
+  glyph: Glyph;
+}
+
+/** A workspace's terminals in sidebar order: its sessions, then its shells. */
+export function rows(workspace: WorkspaceView): Row[] {
+  return [
+    ...workspace.sessions.map((s) => ({ terminal: s.terminal, name: s.model, label: sessionLabel[s.state], glyph: sessionGlyph[s.state] })),
+    ...workspace.shells.map((t) => ({ terminal: t.id, name: "shell", label: terminalLabel(t.state, t.exitCode), glyph: terminalGlyph(t.state, t.exitCode) })),
+  ];
+}
+
+const urgency: Glyph[] = ["waiting", "stuck", "failed", "working", "starting", "ready", "done", "away"];
+
+/** `rows` with what needs a person first, then what is busy, then the rest; ties keep their order. */
+export function byUrgency(list: Row[]): Row[] {
+  return [...list].sort((a, b) => urgency.indexOf(a.glyph) - urgency.indexOf(b.glyph));
+}
+
+/** A machine id to show when settings give no name: a UUID's first block, else the id. */
+function shortId(id: string): string {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-/i.test(id) ? id.slice(0, 8) : id;
 }
 
 /** The numbers line of `foundryd status`. */
@@ -146,4 +172,11 @@ export function machineNumbers(sample: MachineSample | null): string {
   if (!sample) return "no sample yet";
   const gb = (bytes: number) => (bytes / 1e9).toFixed(1);
   return `load ${sample.load_per_core.toFixed(2)}/core  memory ${gb(sample.free_memory)} GB free  disk ${gb(sample.free_disk)} GB free  ${sample.sessions} session${sample.sessions === 1 ? "" : "s"}`;
+}
+
+/** The same numbers, short enough for one sidebar line. */
+export function machineStats(sample: MachineSample | null): string {
+  if (!sample) return "no sample yet";
+  const gb = (bytes: number) => (bytes / 1e9).toFixed(1);
+  return `${sample.load_per_core.toFixed(2)}/core · ${gb(sample.free_memory)} GB mem · ${gb(sample.free_disk)} GB disk · ${sample.sessions} session${sample.sessions === 1 ? "" : "s"}`;
 }

@@ -1,14 +1,14 @@
 import { useMutation } from "@tanstack/react-query";
-import { useState } from "react";
+import { useState, type ReactElement } from "react";
 import { Dialog } from "radix-ui";
 import { archiveWorkspace, type Blockers } from "./api";
 import { button, Modal } from "./Modal";
 
 /**
  * Archives a workspace after asking, since archiving stops its terminals. When something holds
- * it up, lists it and offers to archive anyway.
+ * it up, lists it and offers to archive anyway. `trigger` replaces the default text button.
  */
-export function ArchiveButton({ workspace, name }: { workspace: string; name: string }) {
+export function ArchiveButton({ workspace, name, trigger = "Archive" }: { workspace: string; name: string; trigger?: ReactElement | string }) {
   const [open, setOpen] = useState(false);
   const [blockers, setBlockers] = useState<Blockers | null>(null);
   const archive = useMutation({
@@ -32,7 +32,7 @@ export function ArchiveButton({ workspace, name }: { workspace: string; name: st
     <Modal
       open={open}
       onOpenChange={change}
-      trigger="Archive"
+      trigger={trigger}
       title={`Archive ${name}?`}
       description={blockers ? "Archiving now would lose this work." : "Its terminals stop and its worktree is removed. The branch stays."}
     >
