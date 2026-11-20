@@ -822,6 +822,7 @@ mod tests {
     #[test]
     fn this_release_build_ignores_foundry_secrets() {
         use std::ffi::OsStr;
+        assert!(!OVERRIDE);
         assert_eq!(store(Some(OsStr::new("file"))), os_default());
     }
 
