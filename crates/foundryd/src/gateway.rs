@@ -700,10 +700,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_secret_across_the_cut_of_the_gateways_reason_never_shows() {
-        let filler = "x".repeat(REASON_AT_MOST - 5);
+        // Each cut lands inside the secret, so cutting before hiding would show most of it.
         for echo in [
-            format!("{filler}{KEY}"),
-            format!("{filler} https://tom:hunter2@gw/x"),
+            format!("{}{KEY}", "x".repeat(REASON_AT_MOST - KEY.len() + 1)),
+            format!(
+                "{} https://tom:hunter2@gw/x",
+                "x".repeat(REASON_AT_MOST - " https://tom:hunt".len())
+            ),
         ] {
             let (url, _) = answering(
                 StatusCode::BAD_GATEWAY,
