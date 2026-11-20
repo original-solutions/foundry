@@ -173,6 +173,7 @@ impl Daemon {
         api.sessions_refused = refused.map(str::to_owned);
         let listener = bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let placing = api.clone();
         let servers = vec![
             tokio::spawn(async move {
                 axum::serve(
@@ -185,6 +186,7 @@ impl Daemon {
             tokio::spawn(async move {
                 axum::serve(listener, router(api)).await.unwrap();
             }),
+            tokio::spawn(crate::placement::run(placing)),
         ];
         Daemon {
             data,
@@ -2443,4 +2445,254 @@ async fn a_peer_on_an_older_link_shows_online_and_a_call_for_it_is_503_saying_it
             .all(|r| !matches!(r, AnyRecord::Workspace(_)))
     );
     drop(mine);
+}
+
+// --- placement ---
+
+/// Ample free disk for a sample.
+const DISK: u64 = 100_000_000_000;
+
+impl Daemon {
+    /// Puts this machine in the machine list as `name`, first.
+    fn list_me(&self, name: &str) {
+        let mut store = self.store.lock().unwrap();
+        let mut settings = store.settings().unwrap();
+        settings.seq += 1;
+        settings.machines.insert(
+            0,
+            Machine {
+                id: self.me,
+                name: name.into(),
+                address: "100.64.0.1".into(),
+            },
+        );
+        assert!(store.apply_settings(settings).unwrap());
+    }
+
+    /// Gives `machine` at most `sessions` sessions and `load` load per core, and 1 GB free disk
+    /// at least.
+    fn limit(&self, machine: MachineId, sessions: u32, load: f64) {
+        let mut store = self.store.lock().unwrap();
+        let mut settings = store.settings().unwrap();
+        settings.seq += 1;
+        settings.limits.insert(
+            machine,
+            foundry_proto::settings::Limits {
+                max_sessions: sessions,
+                max_load_per_core: load,
+                min_free_disk: 1_000_000_000,
+            },
+        );
+        assert!(store.apply_settings(settings).unwrap());
+    }
+
+    /// Stores a new sample of `owner`'s with `sessions` and `load` per core, as its sampler or
+    /// sync would.
+    fn sample(&self, owner: MachineId, sessions: u32, load: f64) {
+        let mut store = self.store.lock().unwrap();
+        let version = if owner == self.me {
+            store.own_next_version().unwrap()
+        } else {
+            store.versions().unwrap().get(&owner).copied().unwrap_or(0) + 1
+        };
+        let record = AnyRecord::MachineSample(Record {
+            owner,
+            version,
+            deleted: false,
+            body: foundry_proto::record::MachineSample {
+                load_per_core: load,
+                free_memory: 8_000_000_000,
+                free_disk: DISK,
+                sessions,
+                update_refused: None,
+            },
+        });
+        assert_eq!(
+            store.apply(&record, owner).unwrap(),
+            crate::store::Applied::Stored
+        );
+    }
+
+    /// The live workspace named `name`, if one is held.
+    fn workspace_named(&self, name: &str) -> Option<foundry_proto::record::Workspace> {
+        self.records().into_iter().find_map(|r| match r {
+            AnyRecord::Workspace(w) if !w.deleted && w.body.name == name => Some(w.body),
+            _ => None,
+        })
+    }
+
+    fn sessions_in(&self, workspace: WorkspaceId) -> Vec<Session> {
+        self.records()
+            .into_iter()
+            .filter_map(|r| match r {
+                AnyRecord::Session(s) if s.body.workspace == workspace => Some(s.body),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+fn choose(project: ProjectId, name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "project": project, "base": "main", "name": name, "machine": "choose",
+        "model": MODEL, "prompt": "Fix the login page.",
+    })
+}
+
+#[tokio::test]
+async fn choose_makes_the_workspace_on_a_machine_under_its_limits_and_answers_which() {
+    let daemon = Daemon::new(TURN).await;
+    let project = daemon.project();
+    daemon.list_me("studio");
+    daemon.limit(daemon.me, 4, 1.0);
+    daemon.sample(daemon.me, 1, 0.3);
+    let reply = daemon
+        .call("POST", "/api/workspaces", Some(choose(project, "chosen")))
+        .await;
+    assert_eq!(reply.status, 201, "{}", reply.body);
+    let json = reply.json();
+    assert_eq!(json["machine"], serde_json::json!(daemon.me), "{json}");
+    assert!(json.get("warning").is_none(), "{json}");
+    let made = daemon.workspace_named("chosen").expect("the workspace is made");
+    assert_eq!(json["id"], serde_json::json!(made.id));
+    // The caller starts the session, as it does after any create.
+    assert!(daemon.sessions_in(made.id).is_empty());
+}
+
+#[tokio::test]
+async fn choose_with_no_machine_qualifying_waits_with_a_reason_per_machine_and_is_placed_with_its_model_once_one_does()
+ {
+    let daemon = Daemon::new(TURN).await;
+    let project = daemon.project();
+    daemon.list_me("studio");
+    let peer = daemon.add_machine();
+    daemon.limit(daemon.me, 4, 1.0);
+    daemon.sample(daemon.me, 1, 1.8);
+    daemon.sample(peer, 0, 0.0);
+
+    let reply = daemon
+        .call("POST", "/api/workspaces", Some(choose(project, "queued")))
+        .await;
+    assert_eq!(reply.status, 202, "{}", reply.body);
+    let json = reply.json();
+    let request = json["request"].as_str().expect("a request id").to_owned();
+    assert_eq!(
+        json["reasons"],
+        serde_json::json!(["studio: load 1.8 over limit 1.0", "peer: offline"])
+    );
+    assert!(daemon.workspace_named("queued").is_none());
+
+    let listed = daemon.call("GET", "/api/placements", None).await;
+    assert_eq!(listed.status, 200, "{}", listed.body);
+    let requests = listed.json()["requests"].clone();
+    assert_eq!(requests.as_array().map(Vec::len), Some(1), "{requests}");
+    assert_eq!(requests[0]["id"], request.as_str());
+    assert_eq!(requests[0]["name"], "queued");
+    assert_eq!(requests[0]["reasons"], json["reasons"]);
+    assert!(requests[0]["waiting_since"].as_u64().is_some(), "{requests}");
+
+    // This machine's next sample is under its limits.
+    let qualified = tokio::time::Instant::now();
+    daemon.sample(daemon.me, 1, 0.4);
+    let made = loop {
+        if let Some(made) = daemon.workspace_named("queued")
+            && !daemon.sessions_in(made.id).is_empty()
+        {
+            break made;
+        }
+        assert!(
+            qualified.elapsed() < Duration::from_secs(10),
+            "not placed within 10 seconds of a machine qualifying"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let sessions = daemon.sessions_in(made.id);
+    assert_eq!(sessions.len(), 1, "{sessions:?}");
+    assert_eq!(sessions[0].model, MODEL);
+    let listed = daemon.call("GET", "/api/placements", None).await;
+    assert_eq!(listed.json()["requests"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn a_cancelled_request_is_never_placed() {
+    let daemon = Daemon::new(TURN).await;
+    let project = daemon.project();
+    daemon.list_me("studio");
+    daemon.limit(daemon.me, 1, 1.0);
+    daemon.sample(daemon.me, 1, 0.1);
+    let reply = daemon
+        .call("POST", "/api/workspaces", Some(choose(project, "never")))
+        .await;
+    assert_eq!(reply.status, 202, "{}", reply.body);
+    assert_eq!(
+        reply.json()["reasons"],
+        serde_json::json!(["studio: sessions 1 at limit 1"])
+    );
+    let request = reply.json()["request"].as_str().unwrap().to_owned();
+
+    let path = format!("/api/placements/{request}/cancel");
+    let cancel = daemon.call("POST", &path, None).await;
+    assert_eq!(cancel.status, 204, "{}", cancel.body);
+    let listed = daemon.call("GET", "/api/placements", None).await;
+    assert_eq!(listed.json()["requests"], serde_json::json!([]));
+    let again = daemon.call("POST", &path, None).await;
+    assert_eq!(again.status, 404, "{}", again.body);
+
+    daemon.sample(daemon.me, 0, 0.1);
+    tokio::time::sleep(crate::placement::RETRY_EVERY * 3).await;
+    assert!(daemon.workspace_named("never").is_none());
+}
+
+#[tokio::test]
+async fn a_named_machine_over_its_limits_is_used_and_the_answer_warns_of_each_limit() {
+    let daemon = Daemon::new(TURN).await;
+    let project = daemon.project();
+    daemon.list_me("studio");
+    daemon.limit(daemon.me, 2, 1.0);
+    daemon.sample(daemon.me, 2, 1.5);
+    let body =
+        serde_json::json!({"project": project, "base": "main", "name": "anyway", "machine": daemon.me});
+    let reply = daemon.call("POST", "/api/workspaces", Some(body)).await;
+    assert_eq!(reply.status, 201, "{}", reply.body);
+    let warning = reply.json()["warning"].as_str().expect("a warning").to_owned();
+    for limit in ["sessions 2 at limit 2", "load 1.5 over limit 1.0"] {
+        assert!(warning.contains(limit), "{warning}");
+    }
+    assert!(daemon.workspace_named("anyway").is_some());
+
+    daemon.sample(daemon.me, 0, 0.1);
+    let body =
+        serde_json::json!({"project": project, "base": "main", "name": "under", "machine": daemon.me});
+    let reply = daemon.call("POST", "/api/workspaces", Some(body)).await;
+    assert_eq!(reply.status, 201, "{}", reply.body);
+    assert!(reply.json().get("warning").is_none(), "{}", reply.body);
+}
+
+#[tokio::test]
+async fn only_choose_takes_a_model_and_choose_needs_one() {
+    let daemon = Daemon::new(TURN).await;
+    let project = daemon.project();
+    daemon.sample(daemon.me, 0, 0.1);
+    for body in [
+        serde_json::json!({"project": project, "base": "main", "name": "a", "model": MODEL}),
+        serde_json::json!({"project": project, "base": "main", "name": "b", "machine": daemon.me, "model": MODEL}),
+        serde_json::json!({"project": project, "base": "main", "name": "c", "machine": "choose"}),
+        serde_json::json!({"project": project, "base": "main", "name": "d", "machine": "choose", "model": MODEL, "prompt": "a\0b"}),
+    ] {
+        let reply = daemon.call("POST", "/api/workspaces", Some(body.clone())).await;
+        assert_eq!(reply.status, 422, "{body}: {}", reply.body);
+    }
+    assert!(daemon.workspace_named("a").is_none());
+    assert!(daemon.workspace_named("b").is_none());
+}
+
+#[tokio::test]
+async fn a_cancel_of_a_request_this_machine_does_not_hold_is_404() {
+    let daemon = Daemon::new(TURN).await;
+    for id in [uuid::Uuid::new_v4().to_string(), "not-an-id".to_owned()] {
+        let reply = daemon
+            .call("POST", &format!("/api/placements/{id}/cancel"), None)
+            .await;
+        assert_eq!(reply.status, 404, "{id}: {}", reply.body);
+    }
 }
