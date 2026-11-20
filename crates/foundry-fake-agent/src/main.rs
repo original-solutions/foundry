@@ -31,7 +31,7 @@ use clap::Parser;
 use serde::Deserialize;
 
 /// Command line: the script, and the settings file Claude Code would have been given. The
-/// model and a prompt argument are accepted and ignored.
+/// model is accepted and ignored.
 #[derive(Parser)]
 struct Cli {
     #[arg(long)]
@@ -41,8 +41,6 @@ struct Cli {
     #[arg(long)]
     #[allow(dead_code)]
     model: Option<String>,
-    #[allow(dead_code)]
-    prompt: Option<String>,
 }
 
 #[derive(Deserialize)]

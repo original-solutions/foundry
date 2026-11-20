@@ -25,9 +25,22 @@ const EVENTS: [&str; 7] = [
 /// The events that take a tool matcher.
 const TOOL_EVENTS: [&str; 2] = ["PreToolUse", "PostToolUse"];
 
-/// What Claude Code writes once its input box takes keys: it turns bracketed paste on. The
-/// `SessionStart` hook comes before the box is drawn, so it is not the sign.
+/// What Claude Code writes once its screen takes keys: it turns bracketed paste on. The input
+/// box turns it on just after `SessionStart`, but a screen before the session starts, such as
+/// the trust prompt, turns it on too, so the sign counts only with `SessionStart`.
 pub const TAKES_INPUT: &[u8] = b"\x1b[?2004h";
+
+/// Whether `output`, read after `tail`, turns bracketed paste on ([`TAKES_INPUT`]). `tail` keeps
+/// the end of what was read, so a sign cut between two reads is still found.
+pub fn turns_paste_on(tail: &mut Vec<u8>, output: &[u8]) -> bool {
+    tail.extend_from_slice(output);
+    if tail.windows(TAKES_INPUT.len()).any(|w| w == TAKES_INPUT) {
+        tail.clear();
+        return true;
+    }
+    tail.drain(..tail.len().saturating_sub(TAKES_INPUT.len() - 1));
+    false
+}
 
 /// The keys that give Claude Code `prompt` as one prompt, as a person who pastes it and
 /// presses Enter: a bracketed paste, so its newlines stay in the prompt, then Enter. An escape

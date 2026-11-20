@@ -65,12 +65,12 @@ Claude Code has hook events `sessions` does not register, such as `PermissionReq
 
 ## The first prompt
 
-A session's first prompt is not an argument, where every user on the machine could read it. `sessions` types it into the terminal instead, as `claude::typed_prompt` writes it: a bracketed paste of the prompt, then Enter, in one write.
+A session's first prompt is not an argument, where every user on the machine could read it. `sessions` types it into the terminal instead, as `claude::typed_prompt` writes it: a bracketed paste of the prompt, then Enter, in one write, once `SessionStart` has come and the output has turned bracketed paste on, in either order.
 
-- **When to type it.** 2.1.322 turns bracketed paste on (`ESC[?2004h`) about a second after it starts, once its input box takes keys. `SessionStart` arrives before that, while the box is still being drawn, so it is not the sign. A paste written at once after `ESC[?2004h` is taken. The trust prompt turns bracketed paste on too, so in a folder Claude Code does not trust, the paste and its Enter would answer that prompt, whose default is "No, exit". `sessions` marks every worktree trusted before it starts a session there, and a start whose mark fails starts nothing.
+- **When to type it.** 2.1.322 turns bracketed paste on (`ESC[?2004h`) about a second after it starts, once its input box takes keys. `SessionStart` arrives before that, while the box is still being drawn, so it alone is not the sign. A paste written at once after `ESC[?2004h` is taken. The trust prompt turns bracketed paste on too, so in a folder Claude Code does not trust, the paste and its Enter would answer that prompt, whose default is "No, exit". `sessions` marks every worktree trusted, and waits for `SessionStart` as well as the sign, since `SessionStart` does not come until such a screen is answered.
 - **What arrives.** `UserPromptSubmit` reports the paste as one prompt with its newlines, exactly, up to three lines and about 800 characters. A longer paste arrives as Claude Code reports any long paste: the text inside `<pasted_content id="…">` tags, after two blank lines. Typing the prompt as keys does not avoid this: Claude Code takes a fast run of more than 800 characters as a paste too, and a tab typed as a key is dropped.
 
-These were found by hand with a `UserPromptSubmit` hook that exits 2, which blocks the prompt, so no model call was spent. The test types its first prompt the way `sessions` does and checks it arrives unchanged.
+These were found by hand with a `UserPromptSubmit` hook that exits 2, which blocks the prompt, so no model call was spent. The test types its first prompt the moment `sessions` would, as it would, and checks it arrives unchanged.
 
 ## The trust prompt
 

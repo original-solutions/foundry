@@ -3,11 +3,11 @@
 //! [`Sessions::start`] writes a settings file that registers hooks posting to this daemon's
 //! loopback port with a per-session token, marks the worktree trusted for Claude Code, and
 //! starts `claude --settings <file>` in a terminal with the gateway variables set. A first
-//! prompt is typed into the terminal once Claude Code takes input, so it is in no process's
-//! arguments, which every user on the machine can read. From then
-//! on the session's state comes from three sources, combined by [`state::next_state`]: the
-//! hooks ([`Sessions::router`]), the terminal's output, and the child's exit. A session that
-//! is working with no hook and no output for [`STUCK_AFTER`] is stuck.
+//! prompt is typed into the terminal once Claude Code has started the session and takes input,
+//! so it is in no process's arguments, which every user on the machine can read. From then on
+//! the session's state comes from three sources, combined by [`state::next_state`]: the hooks
+//! ([`Sessions::router`]), the terminal's output, and the child's exit. A session that is
+//! working with no hook and no output for [`STUCK_AFTER`] is stuck.
 //!
 //! A session's record is written whenever its state changes, under the session's own lock, so
 //! one session's writes never cross. The gateway key reaches the child's environment only: it
@@ -33,7 +33,7 @@ use tokio::time::Instant;
 
 use crate::store::{Store, StoreError};
 use crate::terminals::{TerminalError, Terminals};
-use state::{Event, next_state};
+use state::{Event, Hook, next_state};
 
 pub mod brief;
 pub mod claude;
@@ -172,6 +172,8 @@ struct Live {
     body: tokio::sync::Mutex<Session>,
     /// When a hook or output last arrived, for the stuck timer.
     activity: watch::Sender<Instant>,
+    /// Whether `SessionStart` has come, for typing the first prompt.
+    started: watch::Sender<bool>,
     /// What the session is for and doing, from its hooks' payloads.
     brief: Mutex<brief::Brief>,
     tasks: Mutex<Vec<AbortHandle>>,
@@ -218,9 +220,9 @@ impl Sessions {
     }
 
     /// [`Sessions::start`], with `prompt` as Claude Code's first prompt. It is typed into the
-    /// terminal as a paste and Enter once Claude Code takes input ([`claude::TAKES_INPUT`]), so
-    /// its hooks report it as any typed prompt and it is never on a command line. A blank
-    /// prompt is no prompt.
+    /// terminal as a paste and Enter once `SessionStart` has come and the output shows Claude
+    /// Code takes input ([`claude::TAKES_INPUT`]), so its hooks report it as any typed prompt
+    /// and it is never on a command line. A blank prompt is no prompt.
     pub async fn start_with(
         &self,
         workspace: WorkspaceId,
@@ -337,6 +339,7 @@ impl Inner {
                 state: SessionState::Starting,
             }),
             activity,
+            started: watch::Sender::new(false),
             brief: Mutex::default(),
             tasks: Mutex::default(),
         });
@@ -366,10 +369,9 @@ impl Inner {
         }
         drop(body);
 
-        let prompt = prompt.map(|p| Bytes::from(claude::typed_prompt(p)));
+        let first = FirstPrompt::new(prompt);
         let tasks = [
-            tokio::spawn(follow(self.clone(), live.clone(), terminal, floor, prompt))
-                .abort_handle(),
+            tokio::spawn(follow(self.clone(), live.clone(), terminal, floor, first)).abort_handle(),
             tokio::spawn(watch_for_stuck(self.clone(), live.clone())).abort_handle(),
         ];
         lock(&live.tasks).extend(tasks);
@@ -428,6 +430,9 @@ impl Inner {
         let mut body = live.body.lock().await;
         if !self.is_live(live) {
             return Ok(body.state);
+        }
+        if matches!(event, Event::Hook(Hook::SessionStart)) {
+            live.started.send_replace(true);
         }
         if matches!(event, Event::Hook(_) | Event::Output) {
             live.activity.send_replace(Instant::now());
@@ -529,33 +534,42 @@ impl Inner {
 }
 
 /// Follows the session's terminal: each chunk of output is an [`Event::Output`], and the end of
-/// the child is an [`Event::Exited`]. `prompt`, the keys of a first prompt, is typed once the
-/// output shows Claude Code takes input.
+/// the child is an [`Event::Exited`]. The first prompt is typed on the way, once it is ready.
 async fn follow(
     inner: Arc<Inner>,
     live: Arc<Live>,
     terminal: TerminalId,
     mut cursor: u64,
-    mut prompt: Option<Bytes>,
+    mut first: FirstPrompt,
 ) {
+    let mut started = live.started.subscribe();
     let mut backoff = Backoff::new();
     loop {
         match inner.terminals.attach(terminal).await {
             // What the terminal already held is not new output, but it may show the sign.
             Ok((snapshot, mut output)) => {
                 backoff.reset();
-                let mut seen = Vec::new();
-                hand_over(&inner, terminal, &mut prompt, &mut seen, &snapshot.bytes).await;
+                let mut tail = Vec::new();
+                first.read(&mut tail, &snapshot.bytes);
                 loop {
-                    match output.next().await {
+                    first.type_if_ready(&inner, terminal, &mut started).await;
+                    let next = tokio::select! {
+                        next = output.next() => next,
+                        // `SessionStart` came: the prompt may be ready with no more output.
+                        Ok(()) = started.changed(), if first.waiting() => continue,
+                    };
+                    match next {
                         Some(Ok(bytes)) => {
-                            hand_over(&inner, terminal, &mut prompt, &mut seen, &bytes).await;
+                            first.read(&mut tail, &bytes);
                             if !bytes.is_empty() {
                                 report(&inner, &live, Event::Output).await;
                             }
                         }
                         // The child exited.
-                        None => return exited(&inner, &live, terminal, &mut cursor).await,
+                        None => {
+                            first.give_up(terminal);
+                            return exited(&inner, &live, terminal, &mut cursor).await;
+                        }
                         Some(Err(error)) => {
                             retry(&mut backoff, terminal, error).await;
                             break;
@@ -565,6 +579,7 @@ async fn follow(
             }
             Err(error) => {
                 if matches!(error, TerminalError::Gone(_) | TerminalError::Unknown(_)) {
+                    first.give_up(terminal);
                     return exited(&inner, &live, terminal, &mut cursor).await;
                 }
                 retry(&mut backoff, terminal, error).await;
@@ -573,30 +588,63 @@ async fn follow(
     }
 }
 
-/// Types `prompt` into `terminal` once `output`, the terminal's next bytes, shows Claude Code
-/// takes input, and leaves it `None`. `seen` keeps the end of the bytes before, so a sign cut
-/// between two reads is still found. A prompt the holder refuses is lost: the session goes on
-/// without it, as it would with keys typed into a full terminal.
-async fn hand_over(
-    inner: &Inner,
-    terminal: TerminalId,
-    prompt: &mut Option<Bytes>,
-    seen: &mut Vec<u8>,
-    output: &[u8],
-) {
-    if prompt.is_none() {
-        return;
+/// A session's first prompt until it is typed. Claude Code takes it once the session has
+/// started, which `SessionStart` says, and its screen takes keys, which turning bracketed paste
+/// on says ([`claude::TAKES_INPUT`]), in either order. The sign alone is not enough: a screen
+/// before the session starts, such as the trust prompt, turns bracketed paste on too, and the
+/// paste's Enter would answer it.
+struct FirstPrompt {
+    /// The keys that type it, until they are sent.
+    keys: Option<Bytes>,
+    /// Whether the output has shown the sign.
+    takes_input: bool,
+}
+
+impl FirstPrompt {
+    fn new(prompt: Option<&str>) -> Self {
+        Self {
+            keys: prompt.map(|p| Bytes::from(claude::typed_prompt(p))),
+            takes_input: false,
+        }
     }
-    seen.extend_from_slice(output);
-    let sign = claude::TAKES_INPUT;
-    if !seen.windows(sign.len()).any(|w| w == sign) {
-        seen.drain(..seen.len().saturating_sub(sign.len() - 1));
-        return;
+
+    fn waiting(&self) -> bool {
+        self.keys.is_some()
     }
-    if let Some(keys) = prompt.take()
-        && let Err(error) = inner.terminals.input(terminal, keys).await
-    {
-        tracing::warn!(terminal = %terminal, %error, "the first prompt was not typed");
+
+    /// Notes `output`, read after `tail` since the follower attached.
+    fn read(&mut self, tail: &mut Vec<u8>, output: &[u8]) {
+        if self.waiting() && !self.takes_input {
+            self.takes_input = claude::turns_paste_on(tail, output);
+        }
+    }
+
+    /// Types the prompt when the session has started and takes input. The keys are sent once:
+    /// a prompt the holder does not take is lost, and the session goes on without it.
+    async fn type_if_ready(
+        &mut self,
+        inner: &Inner,
+        terminal: TerminalId,
+        started: &mut watch::Receiver<bool>,
+    ) {
+        if !(self.takes_input && *started.borrow_and_update()) {
+            return;
+        }
+        if let Some(keys) = self.keys.take()
+            && let Err(error) = inner.terminals.input(terminal, keys).await
+        {
+            tracing::warn!(terminal = %terminal, %error, "the first prompt was not typed");
+        }
+    }
+
+    /// The child is gone: says so when its first prompt was never typed.
+    fn give_up(&self, terminal: TerminalId) {
+        if self.waiting() {
+            tracing::warn!(
+                terminal = %terminal,
+                "the first prompt was not typed: Claude Code ended before it took input"
+            );
+        }
     }
 }
 
