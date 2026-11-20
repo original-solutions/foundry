@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::MachineId;
+use crate::ids::{MachineId, TerminalId};
 use crate::record::AnyRecord;
 use crate::settings::SharedSettings;
 
@@ -31,6 +31,13 @@ pub enum PeerMessage {
         protocol: u16,
         settings: SharedSettings,
     },
+    /// Opens a link, in place of a hello, that carries one of the receiver's terminals to the
+    /// sender: who is speaking and which terminal.
+    Relay {
+        protocol: u16,
+        machine: MachineId,
+        terminal: TerminalId,
+    },
 }
 
 impl PeerMessage {
@@ -38,7 +45,8 @@ impl PeerMessage {
         match self {
             Self::Hello { protocol, .. }
             | Self::Records { protocol, .. }
-            | Self::Settings { protocol, .. } => *protocol,
+            | Self::Settings { protocol, .. }
+            | Self::Relay { protocol, .. } => *protocol,
         }
     }
 }

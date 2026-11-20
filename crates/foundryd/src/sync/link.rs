@@ -253,8 +253,11 @@ async fn send_message(send: &Sender<String>, message: &PeerMessage) -> bool {
 async fn receive(inner: &Inner, peer: MachineId, text: &str) -> Result<(), String> {
     let records = match serde_json::from_str::<PeerMessage>(text) {
         Ok(PeerMessage::Records { records, .. }) => records,
-        // Shared settings move only through the coordinator, which owns how they are sent.
-        Ok(PeerMessage::Settings { .. }) | Ok(PeerMessage::Hello { .. }) => return Ok(()),
+        // Shared settings move only through the coordinator, which owns how they are sent. A
+        // relay opens a link of its own and means nothing on a record link.
+        Ok(PeerMessage::Settings { .. })
+        | Ok(PeerMessage::Hello { .. })
+        | Ok(PeerMessage::Relay { .. }) => return Ok(()),
         Err(error) => return Err(format!("a message from {peer} could not be read: {error}")),
     };
     on_store(&inner.store, move |store| {
