@@ -9,6 +9,18 @@ import { jumpKey, SearchIcon } from "./JumpPalette";
 import type { Glyph } from "./labels";
 import { glyphText, StateGlyph } from "./StateGlyph";
 import { Named, Now } from "./Now";
+import { Timeline } from "./Timeline";
+
+/** Which view of the fleet the home shows, kept for this browser. */
+type View = "board" | "timeline";
+const VIEW_KEY = "foundry.home";
+function loadView(): View {
+  try {
+    return localStorage.getItem(VIEW_KEY) === "timeline" ? "timeline" : "board";
+  } catch {
+    return "board";
+  }
+}
 
 /**
  * How often a card on screen reads its workspace's changes while an agent in it works. A quiet
@@ -43,18 +55,35 @@ const plural = (n: number, one: string) => `${n} ${one}${n === 1 ? "" : "s"}`;
  * (you, its agents, or nothing), each with its terminals' live states and what it has changed
  * since its base. A card's terminals open from it; its changes open the changes sheet. With no
  * workspaces yet it is a search bar and the way to start one.
+ *
+ * A switch beside the counts turns it into a timeline of every session's turns on one clock.
  */
 export function Board({
   machines,
   onJump,
   onCreate,
   onChanges,
+  onSteps,
+  traced,
 }: {
   machines: MachineView[];
   onJump: () => void;
   onCreate: () => void;
   onChanges: (workspace: string) => void;
+  /** Opens a terminal with its steps column. */
+  onSteps: (terminal: string) => void;
+  /** The sessions this machine keeps steps for, which the timeline reads. */
+  traced: Set<string>;
 }) {
+  const [view, setView] = useState(loadView);
+  const pick = (next: View) => {
+    setView(next);
+    try {
+      localStorage.setItem(VIEW_KEY, next);
+    } catch {
+      // Not kept: the view still changes.
+    }
+  };
   const workspaces = machines.flatMap((m) => m.workspaces);
   const sessions = workspaces.reduce((n, w) => n + w.sessions.length, 0);
   const shells = workspaces.reduce((n, w) => n + w.shells.length, 0);
@@ -93,15 +122,36 @@ export function Board({
       <div className="mx-auto flex max-w-7xl flex-col gap-7 px-6 pt-6 pb-16">
         <div className="flex flex-col gap-2">
           {search}
-          <p className="px-1 text-xs text-neutral-500">{counts}</p>
+          <div className="flex items-center gap-3 px-1">
+            <p className="min-w-0 flex-1 text-xs text-neutral-500">{counts}</p>
+            <div role="radiogroup" aria-label="View" className="flex shrink-0 gap-0.5 rounded-lg border border-neutral-800 bg-neutral-900 p-0.5 text-xs">
+              {(["board", "timeline"] as const).map((v) => (
+                <button
+                  key={v}
+                  type="button"
+                  role="radio"
+                  aria-checked={view === v}
+                  onClick={() => pick(v)}
+                  className={`flex items-center gap-1.5 rounded-md px-2.5 py-1 font-medium transition-colors ${view === v ? "bg-neutral-700 text-neutral-50" : "text-neutral-400 hover:text-neutral-200"}`}
+                >
+                  {v === "board" ? <BoardIcon /> : <TimelineIcon />}
+                  {v === "board" ? "Board" : "Timeline"}
+                </button>
+              ))}
+            </div>
+          </div>
         </div>
-        {lanes(machines).map(({ lane, cards }) => (
-          <LaneSection key={lane} lane={lane} count={cards.length}>
-            {cards.map((card) => (
-              <WorkspaceCard key={card.workspace.id} card={card} showMachine={several} onChanges={onChanges} />
-            ))}
-          </LaneSection>
-        ))}
+        {view === "timeline" ? (
+          <Timeline machines={machines} traced={traced} onSteps={onSteps} />
+        ) : (
+          lanes(machines).map(({ lane, cards }) => (
+            <LaneSection key={lane} lane={lane} count={cards.length}>
+              {cards.map((card) => (
+                <WorkspaceCard key={card.workspace.id} card={card} showMachine={several} onChanges={onChanges} />
+              ))}
+            </LaneSection>
+          ))
+        )}
       </div>
     </div>
   );
@@ -278,5 +328,22 @@ function ChangesFooter({ card, onScreen, onOpen }: { card: Card; onScreen: boole
     >
       {body}
     </button>
+  );
+}
+
+function BoardIcon() {
+  return (
+    <svg viewBox="0 0 16 16" className="size-3.5" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
+      <rect x="2" y="2.5" width="5" height="11" rx="1" />
+      <rect x="9" y="2.5" width="5" height="6.5" rx="1" />
+    </svg>
+  );
+}
+
+function TimelineIcon() {
+  return (
+    <svg viewBox="0 0 16 16" className="size-3.5" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" aria-hidden="true">
+      <path d="M2 4h6M5 8h8M3 12h4" />
+    </svg>
   );
 }

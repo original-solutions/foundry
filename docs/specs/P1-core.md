@@ -186,6 +186,10 @@ A session is named by what it was asked. The daemon keeps, in memory and for its
 
 A P3 run history on the same hooks. The daemon also keeps each of its sessions' trail: every prompt, tool call and question, and the end of each turn, the newest 200, with the time each hook arrived (for showing; the order is the order they arrived). `GET /api/sessions/{id}/trail` returns one session's trail, cut and hidden as briefs are; a session of another machine is `404`. The UI shows it in a Steps column beside the open terminal (the whole screen on a narrow one), opened from the terminal header: one card per turn, earlier turns folded to their prompt, what they did and how long they took, the newest open and growing while the session works.
 
+### Timeline
+
+A P3 run history on the same trails, across the fleet. The board switches to a timeline: every session of this machine that took a turn in the window (15 minutes to 12 hours, ending now) is a lane, each turn a bar from its prompt to its end, with a tick for each tool call and a dot for each question. A turn still going runs to the "now" edge in its session's state colour. A line above sums the window: turns, agent time, tool calls and questions. Pointing at a bar shows its prompt, what it did and how long it took; clicking it opens the terminal with its Steps column. Only sessions this daemon has briefs of are read, so a peer's session is never asked; a busy session's trail is read again every few seconds, a quiet one on a change of state.
+
 ## Placement
 
 - Each worker records CPU load per core, free memory, free disk and its session count every 5 seconds.

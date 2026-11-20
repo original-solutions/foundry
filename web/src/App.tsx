@@ -26,7 +26,9 @@ import { AlertsButton, useAlerts } from "./AlertsBell";
  * a split) keep their pane attached behind the others, so going back to one is instant; an older
  * tab attaches again when shown and gets its screen and scrollback back from the holder.
  *
- * With nothing open, the board shows every workspace as a card with its live states and changes.
+ * With nothing open, the board shows every workspace as a card with its live states and changes,
+ * or, switched to its timeline, every session's turns on one clock; a turn opens its terminal
+ * with the steps column.
  *
  * A workspace made from the new-workspace dialog (the sidebar, the board or the palette opens
  * it) is landed in: once its session shows up, its terminal opens, with the setup shell as a tab
@@ -56,6 +58,7 @@ function Layout() {
   const { state, connected } = useFleet();
   const { terminalId } = useParams({ strict: false });
   const briefs = useBriefs(state.records);
+  const traced = useMemo(() => new Set(Object.keys(briefs)), [briefs]);
   const machines = useMemo(() => fleet(state.records, state.settings, briefs), [state.records, state.settings, briefs]);
   const [drawer, setDrawer] = useState(false);
   /** The palette, and whether its picks open beside the open terminal. */
@@ -275,7 +278,19 @@ function Layout() {
               </div>
             );
           })}
-          {!terminalId && <Board machines={machines} onJump={openJump} onCreate={() => openCreate()} onChanges={openChanges} />}
+          {!terminalId && (
+            <Board
+              machines={machines}
+              onJump={openJump}
+              onCreate={() => openCreate()}
+              onChanges={openChanges}
+              traced={traced}
+              onSteps={(id) => {
+                setStepsOpen(true);
+                show(id);
+              }}
+            />
+          )}
         </div>
       </main>
       {stepsOpen && stepsOf && <StepsPanel key={located?.session ?? terminalId} of={stepsOf} onClose={() => setStepsOpen(false)} />}
