@@ -4,12 +4,20 @@ import { TerminalPane } from "./TerminalPane";
 import { FakeSocket } from "./test-utils";
 
 // jsdom cannot run xterm.js, so a stand-in records what the pane does to its screen.
-const screenOps = vi.hoisted(() => ({ ops: [] as string[], typed: null as ((data: string) => void) | null }));
+const screenOps = vi.hoisted(() => ({
+  ops: [] as string[],
+  typed: null as ((data: string) => void) | null,
+  resized: null as (() => void) | null,
+  term: null as { cols: number; rows: number } | null,
+}));
 
 vi.mock("@xterm/xterm", () => ({
   Terminal: class {
     cols = 80;
     rows = 24;
+    constructor() {
+      screenOps.term = this;
+    }
     loadAddon() {}
     open() {}
     reset() {
@@ -22,7 +30,8 @@ vi.mock("@xterm/xterm", () => ({
       screenOps.typed = callback;
       return { dispose() {} };
     }
-    onResize() {
+    onResize(callback: () => void) {
+      screenOps.resized = callback;
       return { dispose() {} };
     }
     dispose() {}
@@ -35,6 +44,8 @@ const bytes = (text: string) => new TextEncoder().encode(text).buffer;
 beforeEach(() => {
   screenOps.ops = [];
   screenOps.typed = null;
+  screenOps.resized = null;
+  screenOps.term = null;
   FakeSocket.install();
   vi.stubGlobal(
     "ResizeObserver",
@@ -51,7 +62,8 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-function mount(id = "t1", running: boolean | undefined = true) {
+// An options object, not a defaulted parameter: a default would turn an explicit `undefined` into `true`.
+function mount(id = "t1", { running }: { running: boolean | undefined } = { running: true }) {
   const view = render(<TerminalPane id={id} running={running} />);
   return { socket: FakeSocket.last(), view };
 }
@@ -190,6 +202,102 @@ describe("TerminalPane", () => {
     expect(FakeSocket.all).toHaveLength(count);
     expect(count).toBeLessThan(10);
     expect(screen.getByText(/not available here/i)).toBeDefined();
+  });
+
+  it("sends the new size when the terminal is resized", () => {
+    const { socket } = mount();
+    act(() => socket.open());
+
+    screenOps.term!.cols = 120;
+    screenOps.term!.rows = 40;
+    act(() => screenOps.resized?.());
+
+    expect(socket.sent.at(-1)).toBe(JSON.stringify({ type: "resize", cols: 120, rows: 40 }));
+  });
+
+  it("keeps reattaching after a drop while the state has not synced yet", () => {
+    const { socket } = mount("t1", { running: undefined });
+    act(() => socket.open());
+
+    act(() => socket.end(1006));
+    act(() => vi.advanceTimersByTime(5_000));
+    const second = FakeSocket.last();
+    expect(second).not.toBe(socket);
+    act(() => second.open());
+
+    act(() => second.end(1013));
+    act(() => vi.advanceTimersByTime(5_000));
+    const third = FakeSocket.last();
+    expect(third).not.toBe(second);
+    act(() => third.open());
+
+    expect(screen.queryByText(/no longer running/i)).toBeNull();
+  });
+
+  it("tries again after giving up once the state lists its terminal as running", () => {
+    const { view } = mount("t1", { running: undefined });
+    for (let i = 0; i < 20; i++) {
+      act(() => FakeSocket.last().end(1006));
+      act(() => vi.advanceTimersByTime(5_000));
+    }
+    expect(screen.getByText(/not available here/i)).toBeDefined();
+    const count = FakeSocket.all.length;
+
+    view.rerender(<TerminalPane id="t1" running />);
+
+    expect(FakeSocket.all.length).toBe(count + 1);
+    act(() => FakeSocket.last().open());
+    expect(screen.queryByText(/not available here/i)).toBeNull();
+  });
+
+  it("does not try again after giving up when the state already listed its terminal as running", () => {
+    const { view } = mount("t1", { running: true });
+    for (let i = 0; i < 20; i++) {
+      act(() => FakeSocket.last().end(1006));
+      act(() => vi.advanceTimersByTime(5_000));
+    }
+    const count = FakeSocket.all.length;
+
+    view.rerender(<TerminalPane id="t1" running />);
+    act(() => vi.advanceTimersByTime(60_000));
+
+    expect(FakeSocket.all).toHaveLength(count);
+  });
+
+  it("backs off a client the holder cuts off again and again", () => {
+    mount();
+    // Each attach opens, gets the kept screen, and is cut off with 1013 at once.
+    for (let step = 0; step < 100; step++) {
+      const socket = FakeSocket.last();
+      if (socket.readyState === FakeSocket.CONNECTING) {
+        act(() => socket.open());
+        act(() => socket.deliver(bytes("screen")));
+        act(() => socket.end(1013));
+      }
+      act(() => vi.advanceTimersByTime(100));
+    }
+
+    // Ten seconds at a fixed 200 ms would be about 50 attaches.
+    expect(FakeSocket.all.length).toBeLessThan(10);
+  });
+
+  it("reattaches quickly after a drop that ends a long, steady connection", () => {
+    const { socket } = mount();
+    act(() => socket.open());
+    // Two quick drops grow the wait.
+    for (let i = 0; i < 2; i++) {
+      act(() => FakeSocket.last().end(1006));
+      act(() => vi.advanceTimersByTime(5_000));
+      act(() => FakeSocket.last().open());
+    }
+    act(() => FakeSocket.last().deliver(bytes("screen")));
+    act(() => vi.advanceTimersByTime(60_000));
+    const steady = FakeSocket.last();
+
+    act(() => steady.end(1006));
+    act(() => vi.advanceTimersByTime(600));
+
+    expect(FakeSocket.last()).not.toBe(steady);
   });
 
   it("closes the old socket and attaches the new terminal when the selection changes", () => {

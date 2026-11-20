@@ -105,6 +105,18 @@ describe("fleet", () => {
     expect(w.shells).toEqual([{ id: "t2", state: "exited", exitCode: 1 }]);
   });
 
+  it("lists a running terminal whose session was deleted as a shell", () => {
+    const records = [
+      sample(ME, 1),
+      workspace(ME, "w1", "a"),
+      terminal(ME, "t1", "w1", "running"),
+      session(ME, "s1", "w1", "t1", "idle", { deleted: true }),
+    ];
+    const [w] = fleet(records, settings())[0].workspaces;
+    expect(w.sessions).toEqual([]);
+    expect(w.shells).toEqual([{ id: "t1", state: "running", exitCode: null }]);
+  });
+
   it("shows the project id when settings do not name the project", () => {
     const [machine] = fleet([sample(ME, 1), workspace(ME, "w1", "a", { project: "lost" })], settings());
     expect(machine.workspaces[0].project).toBe("lost");

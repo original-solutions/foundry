@@ -75,6 +75,16 @@ export interface MachineView {
 export function fleet(records: AnyRecord[], settings: SharedSettings): MachineView[] {
   const listed = settings.machines.map((m) => m.id);
   const others = [...new Set(records.filter((r) => r.kind === "machine_sample" && !listed.includes(r.owner)).map((r) => r.owner))].sort();
+  const live = records.filter((r) => !r.deleted);
+  const sessions = live.flatMap((r) => (r.kind === "session" ? [r.body] : []));
+  const referenced = new Set(sessions.map((s) => s.terminal));
+  const shellsOf = new Map<string, ShellView[]>();
+  for (const t of live) {
+    if (t.kind !== "terminal" || referenced.has(t.body.id)) continue;
+    const shells = shellsOf.get(t.body.workspace) ?? [];
+    shells.push({ id: t.body.id, state: t.body.state, exitCode: t.body.exit_code });
+    shellsOf.set(t.body.workspace, shells);
+  }
   return [...listed, ...others].map((id) => {
     const reachable = records.flatMap((r) =>
       r.owner === id && (r.kind === "session" || r.kind === "terminal") ? [r.body.state !== "unreachable"] : [],
@@ -84,9 +94,6 @@ export function fleet(records: AnyRecord[], settings: SharedSettings): MachineVi
       if (r.kind === "machine_sample" && r.owner === id && (!sample || r.version > sample.version)) sample = r;
     }
 
-    const live = records.filter((r) => !r.deleted);
-    const sessions = live.flatMap((r) => (r.kind === "session" ? [r.body] : []));
-    const referenced = new Set(records.flatMap((r) => (r.kind === "session" ? [r.body.terminal] : [])));
     const workspaces = live.flatMap((r) => {
       if (r.kind !== "workspace" || r.owner !== id) return [];
       const w = r.body;
@@ -98,11 +105,7 @@ export function fleet(records: AnyRecord[], settings: SharedSettings): MachineVi
           branch: w.branch,
           project: settings.projects.find((p) => p.id === w.project)?.name ?? w.project,
           sessions: mine.map((s) => ({ id: s.id, model: s.model, state: s.state, terminal: s.terminal })),
-          shells: live.flatMap((t) =>
-            t.kind === "terminal" && t.body.workspace === w.id && !referenced.has(t.body.id)
-              ? [{ id: t.body.id, state: t.body.state, exitCode: t.body.exit_code }]
-              : [],
-          ),
+          shells: shellsOf.get(w.id) ?? [],
         },
       ];
     });
