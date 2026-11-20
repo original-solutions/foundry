@@ -34,6 +34,7 @@ use crate::store::{Store, StoreError};
 use crate::sync::Peers;
 use crate::sync::ws::{self, WsDialer};
 use crate::terminals::{TerminalError, Terminals};
+use crate::update;
 use crate::workspaces::Workspaces;
 
 /// How long the runtime waits for tasks that will not stop once the daemon has decided to
@@ -41,7 +42,7 @@ use crate::workspaces::Workspaces;
 const EXIT_WITHIN: Duration = Duration::from_secs(5);
 
 #[derive(Debug, thiserror::Error)]
-enum DaemonError {
+pub(crate) enum DaemonError {
     #[error("set FOUNDRY_HOME or HOME to say where the data directory is")]
     NoHome,
     #[error("HOME is not set, so Claude Code's state file cannot be found")]
@@ -135,6 +136,9 @@ fn start() -> Result<(), DaemonError> {
         )
         .with_writer(io::stderr)
         .try_init();
+    if !update::starting(&home) {
+        return Ok(());
+    }
     let runtime = tokio::runtime::Runtime::new().map_err(io_error("cannot start the runtime"))?;
     let result = runtime.block_on(serve(home, port));
     runtime.shutdown_timeout(EXIT_WITHIN);
@@ -145,7 +149,7 @@ fn start() -> Result<(), DaemonError> {
 /// directory that already exists is never changed: it may be shared, or the user's home. One
 /// that other users can reach (`foundryd join` and `foundryd secret set` make it with the
 /// default mode) is refused, naming the `chmod` that fixes it.
-fn make_home(home: &Path) -> Result<(), DaemonError> {
+pub(crate) fn make_home(home: &Path) -> Result<(), DaemonError> {
     DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -279,6 +283,7 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
     }));
     services.spawn(named("the API server", serve_on(listener, app.clone())));
     services.spawn(named("the Tailscale address watch", tailscale.watch()));
+    services.spawn(named("updates", update::run(home.clone())));
 
     tokio::select! {
         _ = terminate.recv() => tracing::info!("SIGTERM: stopping; terminals keep running"),
