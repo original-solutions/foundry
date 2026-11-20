@@ -1,5 +1,12 @@
 # Runs the provision and gate commands on Linux. The factory gates on macOS. The steps mirror
 # factory.provision and factory.gate in .dw/config.yml: change both together.
+#
+# The two release steps are CI only and not in factory.gate. `cargo test --release -p foundryd
+# --lib --locked` runs the tests that prove a release build ignores the test-only overrides
+# FOUNDRY_SECRETS and FOUNDRY_TAILSCALE, which a debug build cannot run; the step before it builds
+# the holder and the fake agent those library tests start. The factory gates on macOS, where a
+# release build ignores FOUNDRY_SECRETS, so a release test that reaches the secret store would use
+# the real login keychain.
 name: check
 
 on:
@@ -49,5 +56,9 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: cargo test --workspace --locked
         run: cargo test --workspace --locked
+      - name: cargo build --release -p foundry-holder -p foundry-fake-agent --locked
+        run: cargo build --release -p foundry-holder -p foundry-fake-agent --locked
+      - name: cargo test --release -p foundryd --lib --locked
+        run: cargo test --release -p foundryd --lib --locked
       - name: npm --prefix web run check
         run: npm --prefix web run check
