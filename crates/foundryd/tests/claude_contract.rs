@@ -116,8 +116,9 @@ fn claude_code_posts_the_hooks_sessions_reads() {
     // prompt, typed when `sessions` types one: a paste and Enter the moment Claude Code turns
     // bracketed paste on after `SessionStart`, with no wait for the screen to settle. Its
     // newline stays in the one prompt.
-    // The sign must come soon after `SessionStart`: a sign `sessions` saw only before the hook
-    // counts after `EARLIER_SIGN_GRACE`, which must leave the box time to draw.
+    // The sign must be on the screen soon after `SessionStart` is seen: a sign `sessions` saw
+    // only before the hook counts after `EARLIER_SIGN_GRACE`, which must leave the box time to
+    // draw. A sign already there passes at once; the order is not checked.
     let seen_start = Instant::now();
     while !claude::turns_paste_on(&mut Vec::new(), &session.screen()) {
         assert!(

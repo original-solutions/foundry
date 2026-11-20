@@ -33,8 +33,8 @@ pub const TAKES_INPUT: &[u8] = b"\x1b[?2004h";
 
 /// How long after `SessionStart` a first prompt waits when the only sign that Claude Code takes
 /// input came before it, from an earlier screen. In a probe of 2.1.322 the input box turned
-/// bracketed paste on 0.19 s after the hook ran, and the contract test checks the sign comes
-/// within half of this after `SessionStart`.
+/// bracketed paste on 0.19 s after the hook ran, and the contract test checks the sign is on the
+/// screen within half of this after it sees `SessionStart`.
 pub const EARLIER_SIGN_GRACE: Duration = Duration::from_secs(1);
 
 /// Whether `output`, read after `tail`, turns bracketed paste on ([`TAKES_INPUT`]). `tail` keeps
