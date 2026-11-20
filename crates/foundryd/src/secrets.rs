@@ -749,6 +749,20 @@ mod tests {
         assert_eq!(held.get("gateway").unwrap().as_deref(), Some("sk-one"));
     }
 
+    #[test]
+    fn only_the_exact_word_file_chooses_the_file_store() {
+        use std::ffi::OsStr;
+        assert_eq!(choose(Some(OsStr::new("file"))), Store::File);
+        let os_default = if cfg!(target_os = "macos") {
+            Store::Keychain
+        } else {
+            Store::File
+        };
+        for choice in [None, Some(OsStr::new("keychain")), Some(OsStr::new("File"))] {
+            assert_eq!(choose(choice), os_default, "{choice:?}");
+        }
+    }
+
     /// What `set_from` stored under `name`, read back from a file store.
     fn stored(secrets: &FileSecrets, name: &str) -> Option<String> {
         secrets.get(name).unwrap()

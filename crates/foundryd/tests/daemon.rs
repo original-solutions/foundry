@@ -8,6 +8,7 @@ use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use foundry_proto::ids::{MachineId, ProjectId, TerminalId};
@@ -15,6 +16,7 @@ use foundry_proto::messages::{PROTOCOL, PeerMessage, UiMessage};
 use foundry_proto::record::AnyRecord;
 use foundry_proto::settings::{Machine, Project, SharedSettings};
 use foundry_proto::state::TerminalState;
+use foundryd::join::Keys;
 use foundryd::secrets::{FileSecrets, Secrets};
 use foundryd::store::Store;
 use futures::{SinkExt as _, StreamExt as _};
@@ -28,6 +30,9 @@ const WAIT: Duration = Duration::from_secs(30);
 /// A pid file's marker: the shell the daemon starts runs `sleep` for this many seconds, so a
 /// stray one is found by it.
 const SLEEP: &str = "74331";
+
+/// The same, for the fake `claude` a session runs.
+const SLEEP_CLAUDE: &str = "74332";
 
 /// Polls `check` until it gives a value, or fails the test once [`WAIT`] passes.
 fn wait_for<T>(what: &str, mut check: impl FnMut() -> Option<T>) -> T {
@@ -83,6 +88,10 @@ struct Fixture {
     user: TempDir,
     port: u16,
     shell: PathBuf,
+    /// `FOUNDRY_GATEWAY_URL` for the daemon, when the test sets one.
+    gateway_url: Option<String>,
+    /// A directory put first on the daemon's `PATH`.
+    path_first: Option<PathBuf>,
     daemon: Option<Child>,
 }
 
@@ -96,11 +105,14 @@ impl Fixture {
             user: tempfile::tempdir().unwrap(),
             port: free_port(),
             shell: PathBuf::from("/bin/sh"),
+            gateway_url: None,
+            path_first: None,
             daemon: None,
         }
     }
 
-    /// `foundryd args` on this data directory and `port`, with no gateway URL.
+    /// `foundryd args` on this data directory and `port`, with the gateway URL the test set,
+    /// else none.
     fn command(&self, port: u16, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_foundryd"));
         command
@@ -110,8 +122,16 @@ impl Fixture {
             .env("FOUNDRY_SECRETS", "file")
             .env("HOME", self.user.path())
             .env("SHELL", &self.shell)
-            .env_remove("FOUNDRY_GATEWAY_URL")
             .env_remove("CLAUDE_CONFIG_DIR");
+        match &self.gateway_url {
+            Some(url) => command.env("FOUNDRY_GATEWAY_URL", url),
+            None => command.env_remove("FOUNDRY_GATEWAY_URL"),
+        };
+        if let Some(first) = &self.path_first {
+            let mut paths = vec![first.clone()];
+            paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+            command.env("PATH", std::env::join_paths(paths).unwrap());
+        }
         command
     }
 
@@ -141,12 +161,13 @@ impl Fixture {
 
     /// Sends SIGTERM to the daemon, waits for it to exit and returns its exit code.
     fn stop(&mut self) -> Option<i32> {
+        self.stop_with(Signal::SIGTERM)
+    }
+
+    /// Sends `signal` to the daemon, waits for it to exit and returns its exit code.
+    fn stop_with(&mut self, signal: Signal) -> Option<i32> {
         let mut child = self.daemon.take().expect("a daemon is running");
-        kill(
-            Pid::from_raw(i32::try_from(child.id()).unwrap()),
-            Signal::SIGTERM,
-        )
-        .unwrap();
+        kill(Pid::from_raw(i32::try_from(child.id()).unwrap()), signal).unwrap();
         wait_for("the daemon to exit", || child.try_wait().unwrap()).code()
     }
 
@@ -288,13 +309,43 @@ fn run_twice_on_one_data_directory_exits_1_and_names_the_lock() {
     let mut first = Fixture::new();
     first.start();
 
-    let second = run_to_end(first.command(free_port(), &["run"]));
+    let mut second = first
+        .command(free_port(), &["run"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let end = Instant::now() + WAIT;
+    let exit = loop {
+        if let Some(exit) = second.try_wait().unwrap() {
+            break Some(exit);
+        }
+        if Instant::now() > end {
+            let _ = second.kill();
+            let _ = second.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let exit = exit.expect("the second daemon kept running instead of refusing the lock");
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(&mut second.stderr.take().unwrap(), &mut stderr).unwrap();
 
-    assert_eq!(second.status.code(), Some(1), "{}", text(&second.stderr));
-    assert!(
-        text(&second.stderr).contains("daemon.lock"),
-        "stderr: {}",
-        text(&second.stderr)
+    assert_eq!(exit.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("daemon.lock"), "stderr: {stderr}");
+}
+
+#[test]
+fn after_sigint_the_daemon_exits_0() {
+    let mut fixture = Fixture::new();
+    fixture.start();
+
+    assert_eq!(
+        fixture.stop_with(Signal::SIGINT),
+        Some(0),
+        "{}",
+        fixture.log()
     );
 }
 
@@ -450,4 +501,101 @@ fn a_session_start_without_a_gateway_is_refused_naming_what_is_missing() {
 
     let (status, body) = fixture.call("POST", &format!("/api/workspaces/{workspace}/shells"), None);
     assert_eq!(status, 201, "{body}");
+}
+
+#[test]
+fn a_session_start_with_a_gateway_gives_the_child_its_url_and_key() {
+    let mut fixture = Fixture::new();
+    let key = "sk-test-happy-0123456789";
+    FileSecrets::new(fixture.home.path().join("secrets.json"))
+        .set("gateway", key)
+        .unwrap();
+    fixture.gateway_url = Some("http://gw.invalid:8317".into());
+    let bin = fixture.user.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let seen = fixture.user.path().join("claude.env");
+    let script = bin.join("claude");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n%s\\n' \"$ANTHROPIC_BASE_URL\" \"$ANTHROPIC_AUTH_TOKEN\" > {}\nexec sleep {SLEEP_CLAUDE}\n",
+            seen.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    fixture.path_first = Some(bin);
+    let project = fixture.project();
+    fixture.seed(|settings| settings.projects.push(project.clone()));
+    fixture.start();
+    let workspace = fixture.workspace(&project);
+
+    let (status, body) = fixture.call(
+        "POST",
+        &format!("/api/workspaces/{workspace}/sessions"),
+        Some(serde_json::json!({"model": "opus"})),
+    );
+    assert!(
+        (200..300).contains(&status),
+        "{status}: {body}; {}",
+        fixture.log()
+    );
+
+    let lines = wait_for("the fake claude to write what it saw", || {
+        let text = fs::read_to_string(&seen).ok()?;
+        let lines: Vec<String> = text.lines().map(str::to_owned).collect();
+        (lines.len() == 2).then_some(lines)
+    });
+    assert_eq!(lines, ["http://gw.invalid:8317", key]);
+    assert!(!fixture.log().contains(key), "the key reached the log");
+}
+
+#[tokio::test]
+async fn the_daemon_dials_a_peer_through_the_key_handshake() {
+    let mut fixture = Fixture::new();
+    let other = tempfile::tempdir().unwrap();
+    let peer = Keys::open(Arc::new(FileSecrets::new(
+        other.path().join("secrets.json"),
+    )))
+    .unwrap();
+    let peer_id = peer.me();
+    {
+        let mine = Keys::open(Arc::new(FileSecrets::new(
+            fixture.home.path().join("secrets.json"),
+        )))
+        .unwrap();
+        let code = mine.new_code().unwrap();
+        mine.redeem(&code.to_string(), peer_id, &peer.public_key())
+            .unwrap();
+    }
+    fixture.seed(|settings| {
+        settings.machines.push(Machine {
+            id: peer_id,
+            name: "peer".into(),
+            address: "::1".into(),
+        });
+    });
+    // The daemon listens on 127.0.0.1 and Tailscale addresses only, so this port is free here.
+    let Ok(listener) = tokio::net::TcpListener::bind(("::1", fixture.port)).await else {
+        eprintln!("skipped: ::1 is not available on this machine");
+        return;
+    };
+    fixture.start();
+
+    let first = tokio::time::timeout(Duration::from_secs(20), async {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        loop {
+            match socket.next().await {
+                Some(Ok(Message::Text(text))) => return text.as_str().to_owned(),
+                Some(Ok(_)) => {}
+                other => panic!("the link ended before a first frame: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("the daemon did not dial the peer");
+
+    let said: serde_json::Value = serde_json::from_str(&first).unwrap();
+    assert_eq!(said["type"], "challenge", "first frame: {first}");
 }

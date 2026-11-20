@@ -7,11 +7,21 @@ use std::process::{Command, Output, Stdio};
 
 use foundryd::secrets::{FileSecrets, Secrets};
 
-fn foundryd(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_foundryd"))
+/// `foundryd` with the file secret store and a data directory and `HOME` of its own, so no
+/// run touches the login keychain or the real home.
+fn isolated(args: &[&str], home: &tempfile::TempDir) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_foundryd"));
+    command
         .args(args)
-        .output()
-        .expect("foundryd runs")
+        .env("FOUNDRY_HOME", home.path())
+        .env("FOUNDRY_SECRETS", "file")
+        .env("HOME", home.path());
+    command
+}
+
+fn foundryd(args: &[&str]) -> Output {
+    let home = tempfile::tempdir().unwrap();
+    isolated(args, &home).output().expect("foundryd runs")
 }
 
 #[test]
@@ -48,8 +58,8 @@ fn every_other_command_exits_2_and_says_not_built_yet() {
 
 #[test]
 fn join_with_a_port_that_is_not_a_number_exits_1_and_names_it() {
-    let out = Command::new(env!("CARGO_BIN_EXE_foundryd"))
-        .args(["join", "100.64.0.1", "ABCDEFGHJK"])
+    let home = tempfile::tempdir().unwrap();
+    let out = isolated(&["join", "100.64.0.1", "ABCDEFGHJK"], &home)
         .env("FOUNDRY_PORT", "not-a-port")
         .output()
         .expect("foundryd runs");
@@ -61,11 +71,7 @@ fn join_with_a_port_that_is_not_a_number_exits_1_and_names_it() {
 
 /// Runs `foundryd secret set <name>` with `input` on stdin, in a data directory of its own.
 fn secret_set(home: &tempfile::TempDir, name: &str, input: &str) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_foundryd"))
-        .args(["secret", "set", name])
-        .env("FOUNDRY_HOME", home.path())
-        .env("FOUNDRY_SECRETS", "file")
-        .env("HOME", home.path())
+    let mut child = isolated(&["secret", "set", name], home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

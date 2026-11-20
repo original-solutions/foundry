@@ -476,6 +476,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_data_directory_is_made_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let parent = tempfile::tempdir().unwrap();
+        let home = parent.path().join("a/b");
+
+        make_home(&home).unwrap();
+
+        let mode = std::fs::metadata(&home).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+    }
+
     const KEY: &str = "sk-distinct-0123456789";
 
     #[test]
@@ -488,7 +500,7 @@ mod tests {
     #[test]
     fn a_missing_url_names_foundry_gateway_url() {
         for url in [None, Some(String::new())] {
-            let missing = gateway(url, Ok(Some(KEY.into()))).unwrap_err();
+            let missing = gateway(url, Ok(Some(KEY.into()))).unwrap_err().said;
             assert!(missing.contains("FOUNDRY_GATEWAY_URL"), "{missing}");
             assert!(!missing.contains(KEY), "{missing}");
         }
@@ -496,26 +508,85 @@ mod tests {
 
     #[test]
     fn a_missing_key_names_the_secret_and_how_to_set_it() {
-        let missing = gateway(Some("http://gw.test".into()), Ok(None)).unwrap_err();
+        let missing = gateway(Some("http://gw.test".into()), Ok(None))
+            .unwrap_err()
+            .said;
         assert!(missing.contains("foundryd secret set gateway"), "{missing}");
         assert!(!missing.contains("FOUNDRY_GATEWAY_URL"), "{missing}");
     }
 
     #[test]
     fn both_missing_names_both() {
-        let missing = gateway(None, Ok(None)).unwrap_err();
+        let missing = gateway(None, Ok(None)).unwrap_err().said;
         assert!(missing.contains("FOUNDRY_GATEWAY_URL"), "{missing}");
         assert!(missing.contains("foundryd secret set gateway"), "{missing}");
     }
 
     #[test]
-    fn a_secrets_error_names_the_secret_and_the_error() {
+    fn a_secrets_error_is_named_in_the_log_but_not_in_what_a_client_is_told() {
         let error = SecretsError::Unreadable {
             path: PathBuf::from("/data/secrets.json"),
         };
         let missing = gateway(Some("http://gw.test".into()), Err(error)).unwrap_err();
-        assert!(missing.contains("gateway"), "{missing}");
-        assert!(missing.contains("/data/secrets.json"), "{missing}");
+
+        assert!(missing.said.contains("gateway"), "{}", missing.said);
+        assert!(missing.said.contains("daemon log"), "{}", missing.said);
+        assert!(!missing.said.contains("secrets.json"), "{}", missing.said);
+        assert!(!missing.said.contains("/data"), "{}", missing.said);
+        assert!(missing.log.contains("gateway"), "{}", missing.log);
+        assert!(
+            missing.log.contains("/data/secrets.json"),
+            "{}",
+            missing.log
+        );
+    }
+
+    #[test]
+    fn the_said_text_says_what_is_missing_in_plain_words() {
+        let missing = gateway(None, Ok(None)).unwrap_err();
+
+        assert!(
+            missing.said.contains("FOUNDRY_GATEWAY_URL is not set"),
+            "{}",
+            missing.said
+        );
+        assert!(
+            missing
+                .said
+                .contains("the secret gateway is not set (run `foundryd secret set gateway`)"),
+            "{}",
+            missing.said
+        );
+    }
+
+    fn addr(text: &str) -> SocketAddr {
+        text.parse().unwrap()
+    }
+
+    #[test]
+    fn only_tailscale_addresses_not_yet_served_are_new() {
+        let served: BTreeSet<SocketAddr> =
+            [addr("127.0.0.1:7433"), addr("100.101.102.103:7433")].into();
+        let found = [
+            ip("100.101.102.103"),
+            ip("100.64.0.9"),
+            ip("192.168.1.20"),
+            ip("fd7a:115c:a1e0::1"),
+            ip("127.0.0.1"),
+            ip("100.64.0.9"),
+        ];
+
+        assert_eq!(
+            new_addresses(7433, found, &served),
+            vec![addr("100.64.0.9:7433"), addr("[fd7a:115c:a1e0::1]:7433")]
+        );
+    }
+
+    #[test]
+    fn with_everything_served_nothing_is_new() {
+        let served: BTreeSet<SocketAddr> = [addr("127.0.0.1:7433")].into();
+
+        assert!(new_addresses(7433, [ip("10.0.0.5")], &served).is_empty());
     }
 
     /// What the stub router answers, so a request that got through is told from a refusal.

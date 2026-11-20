@@ -223,7 +223,10 @@ mod tests {
     fn a_named_machine_shows_its_name_state_and_numbers() {
         let mac = MachineId::random();
         let out = render(
-            &[sample(mac, 3, 0.4242, 2)],
+            &[
+                sample(mac, 3, 0.4242, 2),
+                terminal(mac, TerminalState::Running),
+            ],
             &settings(&[(mac, "trilogy-mac")]),
         );
 
@@ -283,7 +286,7 @@ mod tests {
     }
 
     #[test]
-    fn a_machine_with_only_reachable_records_is_online() {
+    fn a_machine_with_a_reachable_record_is_online() {
         let mac = MachineId::random();
         let records = [
             sample(mac, 1, 0.1, 1),
@@ -294,6 +297,36 @@ mod tests {
 
         assert!(out.contains("online"), "{out}");
         assert!(!out.contains("offline"), "{out}");
+    }
+
+    #[test]
+    fn a_listed_machine_with_only_a_sample_is_not_called_online() {
+        let peer = MachineId::random();
+        let out = render(&[sample(peer, 1, 0.1, 0)], &settings(&[(peer, "peer")]));
+
+        assert!(out.contains("unknown"), "{out}");
+        assert!(!out.contains("online"), "{out}");
+        assert!(!out.contains("offline"), "{out}");
+    }
+
+    #[test]
+    fn a_listed_machine_with_no_records_is_unknown() {
+        let peer = MachineId::random();
+        let out = render(&[], &settings(&[(peer, "peer")]));
+
+        assert!(out.contains("unknown"), "{out}");
+    }
+
+    #[test]
+    fn one_unreachable_record_makes_the_machine_offline_despite_a_reachable_one() {
+        let mac = MachineId::random();
+        let records = [
+            session(mac, SessionState::Idle, false),
+            terminal(mac, TerminalState::Unreachable),
+        ];
+        let out = render(&records, &settings(&[(mac, "mac")]));
+
+        assert!(out.contains("offline"), "{out}");
     }
 
     #[test]
