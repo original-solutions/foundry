@@ -3072,7 +3072,7 @@ async fn choose_on_a_machine_that_is_not_in_its_own_machine_list_places_it_there
 }
 
 #[tokio::test]
-async fn a_machine_given_a_request_takes_no_other_until_its_next_sample() {
+async fn a_machine_given_a_request_takes_no_other_until_its_second_newer_sample() {
     let daemon = Daemon::new(TURN).await;
     let project = daemon.project();
     daemon.list_me("studio");
@@ -3279,6 +3279,11 @@ async fn a_queued_create_the_machine_refuses_is_listed_as_failed_and_not_tried_a
         "{listed}"
     );
     assert_eq!(listed["requests"][0]["error"], error.as_str());
+    // The failed create holds no session: with no newer sample, this machine still has room.
+    let reply = daemon
+        .call("POST", "/api/workspaces", Some(choose(project, "after")))
+        .await;
+    assert_eq!(reply.status, 201, "{}", reply.body);
 }
 
 #[tokio::test]

@@ -19,11 +19,12 @@
 //!   placed now is `409`; an id this machine holds no request for is `404`.
 //!
 //! A create sent to a machine counts as one more session on it, in every pick, until the
-//! second sample newer than its session arrives (the first may have been written before the
-//! session started), so its limits hold before its samples catch up. A create that failed, or
-//! whose request went away mid-create, counts for nothing. A machine that cannot take the call (offline, older,
-//! its link down) is passed over until its next sample, with that reason, and the next roomiest
-//! is tried; a call that may have run there is never sent anywhere else.
+//! second sample newer than the version held once the create was kept (the first may have been
+//! written before its session started), so its limits hold before its samples catch up. A
+//! create that failed, or whose request went away mid-create, counts for nothing. A machine
+//! that cannot take the call (offline, older, its link down) is passed over until its next
+//! sample, with that reason, and the next roomiest is tried; a call that may have run there is
+//! never sent anywhere else.
 //!
 //! A placement whose create or session start fails stays listed with its error and is not tried
 //! again; cancelling it dismisses it. A request held longer than [`WAITING_ALERT_AFTER`], waiting
