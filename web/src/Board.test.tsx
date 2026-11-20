@@ -10,7 +10,7 @@ import { fleet, type MachineView } from "./fleet";
 import { ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
 import { RETRY_EVERY } from "./poll";
 import { TerminalActions } from "./TerminalMenu";
-import { FakeSocket, json } from "./test-utils";
+import { expectButtonShape, FakeSocket, json } from "./test-utils";
 
 const file = (path: string, added: number, removed: number, uncommitted = false) => ({
   path,
@@ -377,6 +377,7 @@ describe("Grouped by shipping", () => {
     await show(fleet(fleetOf(), settings()), vi.fn(), {}, true);
     await waitFor(() => expect(within(lane("Merged")).getByRole("article", { name: "rename api" })).toBeDefined());
     expect(screen.getByRole("button", { name: "Shipping" }).getAttribute("aria-pressed")).toBe("true");
+    expectButtonShape(screen.getByRole("button", { name: "Shipping" }));
     expect(screen.queryByRole("radio", { name: "Ship" })).toBeNull();
     expect(within(screen.getByRole("navigation", { name: "Home" })).queryByRole("button", { name: "Ship" })).toBeNull();
   });

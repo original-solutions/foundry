@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { News } from "./AlertsBell";
 import type { MachineView } from "./fleet";
 import { needsYou } from "./labels";
-import { fieldLook } from "./Modal";
+import { button, buttonShape, fieldLook } from "./Modal";
 import { arrive, current, TOAST_MS, type Live, type Toast } from "./news";
 import { Now } from "./Now";
 import { reply } from "./Said";
@@ -189,9 +189,9 @@ function Card({ live, canReply, onOpen, onGone }: { live: Live; canReply: boolea
         <button
           type="button"
           onClick={onOpen}
-          className={`h-8 shrink-0 rounded-md px-3 text-xs font-medium ring-1 pointer-fine:h-7 ${
-            urgent ? "bg-amber-400/15 text-amber-300 ring-amber-400/40 hover:bg-amber-400/25" : "text-neutral-200 ring-neutral-600 hover:bg-neutral-800"
-          } ${canReply ? "" : "ml-auto"}`}
+          className={`${urgent ? `${buttonShape} border-amber-400/40 bg-amber-400/15 text-amber-300 hover:bg-amber-400/25` : `${button} text-neutral-200`} h-8 shrink-0 font-medium pointer-fine:h-7 ${
+            canReply ? "" : "ml-auto"
+          }`}
         >
           Open
         </button>

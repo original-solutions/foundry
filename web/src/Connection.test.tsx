@@ -2,6 +2,7 @@ import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { LinkBanner, Unreachable } from "./Connection";
 import type { Link } from "./useFleet";
+import { expectButtonShape } from "./test-utils";
 
 const T0 = new Date("2026-11-20T09:00:00Z").getTime();
 
@@ -53,6 +54,7 @@ describe("LinkBanner", () => {
     expect(banner.textContent).toContain("Lost the daemon 12 s ago");
     expect(banner.textContent).toContain("what it last said");
     expect(banner.textContent).toContain("Retrying in 3 s");
+    expectButtonShape(screen.getByRole("button", { name: "Try now" }));
     fireEvent.click(screen.getByRole("button", { name: "Try now" }));
     expect(retry).toHaveBeenCalled();
   });

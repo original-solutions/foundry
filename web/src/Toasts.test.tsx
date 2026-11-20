@@ -5,7 +5,7 @@ import { fleet } from "./fleet";
 import { MAX_TOASTS, TOAST_MS } from "./news";
 import { useAlerts } from "./AlertsBell";
 import { Toasts } from "./Toasts";
-import { expectFieldLook } from "./test-utils";
+import { expectButtonShape, expectFieldLook } from "./test-utils";
 import { ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
 
 const sent: { id: string; text: string }[] = [];
@@ -133,6 +133,7 @@ describe("Toasts", () => {
     const ask = card("fix login: sonnet is waiting for you");
     expect(within(ask).getByText("Delete old.md?")).toBeDefined();
     expect(within(ask).queryByRole("textbox")).toBeNull();
+    expectButtonShape(within(ask).getByRole("button", { name: "Open" }));
     act(() => vi.advanceTimersByTime(TOAST_MS * 5));
     expect(cards()).toHaveLength(1);
 
@@ -172,7 +173,7 @@ describe("Toasts", () => {
     move(fleetAt({ s9: "idle" }));
     const news = card("far away: opus finished its turn");
     expect(within(news).queryByRole("textbox")).toBeNull();
-    expect(within(news).getByRole("button", { name: "Open" })).toBeDefined();
+    expectButtonShape(within(news).getByRole("button", { name: "Open" }));
   });
 
   it("puts the newest on top, one card per session, and keeps only the newest few", () => {

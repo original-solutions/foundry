@@ -3,7 +3,7 @@ import { Link, useNavigate, useRouterState } from "@tanstack/react-router";
 import { ARCHIVE_ICON, TerminalMenu, useTerminalActions } from "./TerminalMenu";
 import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { glance, lanes, topFiles, type Card, type Lane } from "./lanes";
-import { button, pressed } from "./Modal";
+import { buttonShape, pressed } from "./Modal";
 import { StepChips } from "./NextSteps";
 import { nextSteps } from "./next";
 import { shipLanes, useStaged, type ShipLane } from "./staged";
@@ -209,7 +209,7 @@ function GroupBar({ group, onPick, staged }: { group: Group; onPick: (group: Gro
             ["shipping", "Shipping", "How far each workspace's work has gone: only here, pushed, in review, merged"],
           ] as const
         ).map(([value, name, title]) => (
-          <button key={value} type="button" title={title} aria-pressed={group === value} onClick={() => onPick(value)} className={`${button} ${pressed} border-neutral-700 text-neutral-300`}>
+          <button key={value} type="button" title={title} aria-pressed={group === value} onClick={() => onPick(value)} className={`${buttonShape} ${pressed} border-neutral-700 text-neutral-300 hover:bg-neutral-800`}>
             {name}
           </button>
         ))}

@@ -2,7 +2,7 @@ import { fireEvent, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { PullRequest, Shipping } from "./api";
 import { ShipLine, shipLine } from "./Shipping";
-import { json, renderApp } from "./test-utils";
+import { expectButtonShape, json, renderApp } from "./test-utils";
 
 /** Stubs `fetch` to answer each read with `answers` in order, and returns the URLs read. */
 function answer(...answers: Shipping[]): string[] {
@@ -83,6 +83,7 @@ describe("ShipLine", () => {
     expect(link.getAttribute("href")).toBe("https://github.com/o/r/pull/12");
     expect(link.getAttribute("target")).toBe("_blank");
     expect(link.getAttribute("title")).toContain("Fix the login form");
+    expectButtonShape(screen.getByRole("button", { name: "Archive fix login: its pull request merged" }));
     fireEvent.click(screen.getByRole("button", { name: "Archive fix login: its pull request merged" }));
     expect(archive).toHaveBeenCalled();
   });

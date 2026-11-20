@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { button, primaryButton } from "./Modal";
+import { buttonShape, primaryButton } from "./Modal";
 import { heardAgo } from "./samples";
 import { shapes } from "./StateGlyph";
 import { useNow } from "./StepsPanel";
@@ -102,7 +102,7 @@ function Lost({ link, remembered }: { link: Link; remembered?: number }) {
         </span>
       )}
       <span className="text-xs tabular-nums">{nextTry(link.retryAt, now, "Retrying in")}</span>
-      <button type="button" onClick={link.retry} className={`${button} border-amber-400/40 text-amber-100 hover:bg-amber-400/15`}>
+      <button type="button" onClick={link.retry} className={`${buttonShape} border-amber-400/40 text-amber-100 hover:bg-amber-400/15`}>
         Try now
       </button>
     </div>

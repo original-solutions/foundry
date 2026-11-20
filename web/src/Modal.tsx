@@ -1,7 +1,9 @@
 import { Dialog } from "radix-ui";
 import { isValidElement, type ReactNode } from "react";
 
-export const button = "rounded border border-neutral-600 px-2 py-0.5 text-xs hover:bg-neutral-800 disabled:opacity-50";
+/** The shared button's shape and size, without its colours: a button with a tone of its own adds a border, a hover and a text colour to it. */
+export const buttonShape = "rounded border px-2 py-0.5 text-xs disabled:opacity-50";
+export const button = `${buttonShape} border-neutral-600 hover:bg-neutral-800`;
 /** Beside `button` on a toggle: its look while `aria-pressed` is true. */
 export const pressed = "aria-pressed:border-sky-400/50 aria-pressed:bg-sky-400/10 aria-pressed:text-sky-200";
 /** The shared button for the one action a form is for. */
