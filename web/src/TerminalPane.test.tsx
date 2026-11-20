@@ -9,6 +9,7 @@ const screenOps = vi.hoisted(() => ({
   typed: null as ((data: string) => void) | null,
   resized: null as (() => void) | null,
   term: null as { cols: number; rows: number } | null,
+  focused: false,
 }));
 
 vi.mock("@xterm/xterm", () => ({
@@ -20,6 +21,9 @@ vi.mock("@xterm/xterm", () => ({
     }
     loadAddon() {}
     open() {}
+    focus() {
+      screenOps.focused = true;
+    }
     reset() {
       screenOps.ops.push("reset");
     }
@@ -46,6 +50,7 @@ beforeEach(() => {
   screenOps.typed = null;
   screenOps.resized = null;
   screenOps.term = null;
+  screenOps.focused = false;
   FakeSocket.install();
   vi.stubGlobal(
     "ResizeObserver",
@@ -69,6 +74,11 @@ function mount(id = "t1", { running }: { running: boolean | undefined } = { runn
 }
 
 describe("TerminalPane", () => {
+  it("takes the keyboard when it opens, so a picked terminal can be typed into at once", () => {
+    mount();
+    expect(screenOps.focused).toBe(true);
+  });
+
   it("attaches to the terminal's socket, sends its size, and writes the kept screen over a reset", () => {
     const { socket } = mount("t 1/x");
     expect(socket.url).toMatch(/\/api\/terminals\/t%201%2Fx$/);

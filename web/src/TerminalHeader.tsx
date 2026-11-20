@@ -1,11 +1,12 @@
 import type { Located } from "./fleet";
+import { jumpKey, SearchIcon } from "./JumpPalette";
 import { StatePill } from "./StateDot";
 
 /**
  * The bar above the open terminal: which workspace and terminal it is, the machine it runs on and
  * its state. On a narrow screen it holds the button that opens the sidebar as a drawer.
  */
-export function TerminalHeader({ located, drawerOpen, onMenu }: { located?: Located; drawerOpen: boolean; onMenu: () => void }) {
+export function TerminalHeader({ located, drawerOpen, onMenu, onJump }: { located?: Located; drawerOpen: boolean; onMenu: () => void; onJump: () => void }) {
   return (
     <header aria-label="Open terminal" className="flex h-11 shrink-0 items-center gap-3 border-b border-neutral-800 bg-neutral-900 px-3 text-sm">
       <button
@@ -35,6 +36,15 @@ export function TerminalHeader({ located, drawerOpen, onMenu }: { located?: Loca
       ) : (
         <span className="flex-1 text-neutral-500">Terminal</span>
       )}
+      <button
+        type="button"
+        aria-label="Jump to"
+        title={`Jump to (${jumpKey})`}
+        onClick={onJump}
+        className="-mr-1 rounded p-1.5 text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200"
+      >
+        <SearchIcon className="size-4" />
+      </button>
     </header>
   );
 }

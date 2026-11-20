@@ -39,6 +39,7 @@ export function TerminalPane({ id, running }: { id: string; running: boolean | u
     term.loadAddon(fit);
     term.open(host.current!);
     fit.fit();
+    term.focus();
 
     let socket: WebSocket | undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
