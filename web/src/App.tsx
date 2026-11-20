@@ -26,12 +26,18 @@ import { Announcer, NotifyButton, useAlerts } from "./AlertsBell";
 import { KeySheet, useHelpKey } from "./KeySheet";
 import { Away } from "./Away";
 import { Toasts } from "./Toasts";
+import { Rail } from "./Rail";
+import { loadRail, saveRail } from "./collapsed";
 
 /**
  * The sidebar, and the terminal the URL names (`/terminals/$terminalId`) under its header filling
  * the rest. On a narrow screen the sidebar is a drawer: the board (or the machines view) is the
  * home, with a bar at the bottom that opens it, and an open terminal's header opens it too. Cmd+K (or Ctrl+K outside
  * the terminal, where the shell keeps it) opens the jump palette over everything.
+ *
+ * On a wide screen the sidebar collapses to a rail as narrow as a button (its button, or Cmd+B),
+ * which still shows every terminal's state as a column of glyphs per workspace; the choice is kept
+ * in this browser, and with none a window too narrow for the list beside a terminal starts so.
  *
  * One bar heads the terminal: its workspace, then the workspace's terminals as tabs with their
  * states, and a + that starts another session or shell in it. The few terminals shown last (and both sides of a split) keep
@@ -101,6 +107,12 @@ function Layout() {
   const traced = useMemo(() => new Set(Object.keys(briefs)), [briefs]);
   const machines = useMemo(() => fleet(state.records, state.settings, briefs), [state.records, state.settings, briefs]);
   const [drawer, setDrawer] = useState(false);
+  /** Whether the sidebar is collapsed to the rail on a wide screen. */
+  const [rail, setRail] = useState(() => loadRail(window.innerWidth));
+  const flipRail = () => {
+    saveRail(!rail);
+    setRail(!rail);
+  };
   /** The palette, and whether its picks open beside the open terminal. */
   const [jump, setJump] = useState<"jump" | "beside">();
   const [split, setSplit] = useState<Split>();
@@ -219,6 +231,7 @@ function Layout() {
     setDrawer(false);
     setJump((open) => (open ? undefined : "jump"));
   });
+  useShortcut("b", flipRail);
   useShortcut("f", terminalId ? () => setFinding((n) => n + 1) : undefined);
   useShortcut("\\", terminalId ? () => (split ? setSplit(undefined) : setJump("beside")) : undefined);
 
@@ -231,8 +244,10 @@ function Layout() {
   const firstRun = !terminalId && !onMachines && state.synced && (workspaces.length === 0 || launch.create.isPending || (launch.made && launch.create.isError));
   const board = !terminalId && !onMachines && !firstRun;
 
-  // On a narrow screen the sidebar is a drawer over whatever is shown: the board, the machines view or a terminal.
-  const place = drawer ? "fixed inset-0 z-30 flex md:static md:z-auto" : "hidden md:flex";
+  // On a narrow screen the sidebar is a drawer over whatever is shown: the board, the machines view
+  // or a terminal. Collapsed to the rail, it is only the drawer, and the rail takes its place.
+  const place = rail ? "fixed inset-0 z-30 flex md:hidden" : drawer ? "fixed inset-0 z-30 flex md:static md:z-auto" : "hidden md:flex";
+  const sidebar = !rail || drawer;
   return (
     <TerminalActions
       machines={machines}
@@ -257,19 +272,27 @@ function Layout() {
       <div className="flex h-dvh flex-col overflow-hidden bg-neutral-950 text-neutral-100">
         <LinkBanner link={link} />
         <div data-stale={stale || undefined} className="relative flex min-h-0 flex-1">
-          <div className={`${place} shrink-0`}>
-            <Sidebar
-              machines={machines}
-              onCreate={() => openCreate()}
-              selected={terminalId}
-              onNavigate={close}
-              onClose={close}
-              onJump={openJump}
-              onChanges={openChanges}
-              alerts={<NotifyButton {...notify} />}
-              onKeys={() => setKeysOpen(true)}
-            />
-          </div>
+          {rail && (
+            <div className="hidden shrink-0 md:flex">
+              <Rail machines={machines} selected={terminalId} onExpand={flipRail} onJump={openJump} onCreate={() => openCreate()} alerts={<NotifyButton {...notify} />} />
+            </div>
+          )}
+          {sidebar && (
+            <div className={`${place} shrink-0`}>
+              <Sidebar
+                machines={machines}
+                onCreate={() => openCreate()}
+                selected={terminalId}
+                onNavigate={close}
+                onClose={close}
+                onJump={openJump}
+                onChanges={openChanges}
+                alerts={<NotifyButton {...notify} />}
+                onKeys={() => setKeysOpen(true)}
+                onRail={rail ? undefined : flipRail}
+              />
+            </div>
+          )}
           <main className="flex min-w-0 flex-1 flex-col">
             {terminalId && (
               <div className="flex shrink-0">

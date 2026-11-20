@@ -13,13 +13,14 @@ import { ARCHIVE_ICON, TerminalMenu, useTerminalActions } from "./TerminalMenu";
 import { SparkIcon } from "./FirstPrompt";
 import { Mark } from "./Mark";
 import { ThemeButton } from "./ThemeButton";
+import { railKey } from "./collapsed";
 import type { MachineSample } from "./api";
 
 const statusColour = { online: "text-neutral-400", offline: "text-red-400", unknown: "text-neutral-400" };
 const statusDot = { online: "bg-emerald-400", offline: "bg-red-400", unknown: "bg-neutral-500" };
 
 /** How many states a folded workspace shows on its line before it counts the rest. */
-const STRIP = 6;
+export const STRIP = 6;
 
 interface Props {
   machines: MachineView[];
@@ -39,10 +40,12 @@ interface Props {
   alerts?: ReactNode;
   /** Opens the list of keys. */
   onKeys?: () => void;
+  /** Collapses the list to the rail, on a wide screen. */
+  onRail?: () => void;
 }
 
-/** The terminals a folded workspace shows on its line: the most urgent first, and the open one always. */
-function stripOf(list: Row[], selected?: string): Row[] {
+/** The terminals a folded workspace (or the rail) shows: the most urgent first, and the open one always. */
+export function stripOf(list: Row[], selected?: string): Row[] {
   const ordered = byUrgency(list);
   const shown = ordered.slice(0, STRIP);
   const open = ordered.slice(STRIP).find((r) => r.terminal === selected);
@@ -58,7 +61,7 @@ const TYPEAHEAD_MS = 600;
  * unfolds or goes in), Home and End go to the ends, and typing a name's first letters goes to the
  * next one it starts. A workspace's actions show while the keyboard is in it, the Tab after it.
  */
-export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJump, onChanges, alerts, onKeys }: Props) {
+export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJump, onChanges, alerts, onKeys, onRail }: Props) {
   const [folded, setFolded] = useState(() => new Set(loadFolded()));
   const fold = (ids: string[], on: boolean) =>
     setFolded((old) => {
@@ -125,6 +128,17 @@ export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJ
           </Link>
         </h1>
         <div className="flex items-center gap-1.5">
+          {onRail && (
+            <button
+              type="button"
+              aria-label="Collapse sidebar"
+              title={`Collapse to a rail of states, for a wider terminal (${railKey})`}
+              onClick={onRail}
+              className="hidden rounded p-1 text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200 md:block"
+            >
+              <PanelIcon className="size-4" />
+            </button>
+          )}
           <ThemeButton />
           {alerts}
           {onJump && (
@@ -403,5 +417,15 @@ function Item({ row, workspace, selected, onNavigate, tab }: { row: Row; workspa
         </Link>
       </TerminalMenu>
     </li>
+  );
+}
+
+/** A window with its left column marked: the sidebar, collapsed or expanded. */
+export function PanelIcon({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 16 16" className={className} fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
+      <rect x="2" y="2.5" width="12" height="11" rx="1.5" />
+      <path d="M6 2.5v11" />
+    </svg>
   );
 }

@@ -301,6 +301,35 @@ describe("App", () => {
     expect(screen.getByRole("button", { name: "Workspaces" }).getAttribute("aria-expanded")).toBe("false");
   });
 
+  it("collapses the sidebar to a rail of states with its button or Cmd+B, keeps the choice, and expands the same ways", async () => {
+    await open("/terminals/t1", live);
+    expect(screen.getByRole("link", { name: /^sonnet/ })).toBeDefined();
+
+    fireEvent.click(screen.getByRole("button", { name: "Collapse sidebar" }));
+    const rail = screen.getByRole("navigation", { name: "Workspaces" });
+    expect(rail.id).not.toBe("sidebar");
+    expect(within(rail).getByRole("link", { name: "fix login / sonnet: Working" }).getAttribute("aria-current")).toBe("page");
+    expect(localStorage.getItem("foundry.rail")).toBe("1");
+
+    fireEvent.keyDown(window, { key: "b", metaKey: true });
+    expect(screen.getByRole("navigation", { name: "Workspaces" }).id).toBe("sidebar");
+    expect(localStorage.getItem("foundry.rail")).toBe("0");
+
+    fireEvent.keyDown(window, { key: "b", metaKey: true });
+    fireEvent.click(screen.getByRole("button", { name: "Expand sidebar" }));
+    expect(screen.getByRole("navigation", { name: "Workspaces" }).id).toBe("sidebar");
+  });
+
+  it("opens collapsed in a window too narrow for the list and a terminal, while a phone's drawer still holds the whole list", async () => {
+    vi.stubGlobal("innerWidth", 900);
+    await open("/terminals/t1", live);
+    const rail = screen.getByRole("navigation", { name: "Workspaces" });
+    expect(within(rail).getByRole("button", { name: "Expand sidebar" })).toBeDefined();
+
+    fireEvent.click(screen.getByRole("button", { name: "Workspaces" }));
+    expect(screen.getAllByRole("navigation", { name: "Workspaces" }).map((n) => n.id)).toContain("sidebar");
+  });
+
   it("opens the jump palette on Cmd+K, filters as you type and opens the pick with Enter", async () => {
     const router = await open("/", live);
     expect(screen.queryByRole("dialog")).toBeNull();

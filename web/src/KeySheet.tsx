@@ -11,6 +11,7 @@ const groups: { where: string; keys: [string[], string][] }[] = [
       [[mod, "K"], "Jump to a terminal or workspace, or give Claude a new task"],
       [[mod, "F"], "Find in the open terminal"],
       [[mod, "\\"], "Open a terminal beside this one, or close the split"],
+      [[mod, "B"], "Collapse the workspaces list to a rail of states, or expand it"],
       [["?"], "This list"],
     ],
   },
