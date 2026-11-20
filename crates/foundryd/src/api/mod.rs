@@ -65,7 +65,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use foundry_proto::ids::{MachineId, ProjectId, TerminalId, WorkspaceId};
 use foundry_proto::messages::{PROTOCOL, UiMessage};
-use foundry_proto::settings::SharedSettings;
+use foundry_proto::settings::{SettingValue, SharedSettings};
 use serde::Deserialize;
 use tokio::net::TcpListener;
 
@@ -290,10 +290,18 @@ fn redacted(texts: &[String]) -> Vec<String> {
     texts.iter().map(|t| redact(t)).collect()
 }
 
-/// `settings` as the UI is shown them: each project's repo with [`redact`] applied.
+/// `settings` as the UI is shown them: each project's repo with [`redact`] applied, in the
+/// projects list and in both values of a "setting overwritten" item.
 fn shown(mut settings: SharedSettings) -> SharedSettings {
     for project in &mut settings.projects {
         project.repo = redact(&project.repo);
+    }
+    for item in settings.overwritten.values_mut() {
+        for value in [&mut item.kept, &mut item.lost].into_iter().flatten() {
+            if let SettingValue::Project(project) = value {
+                project.repo = redact(&project.repo);
+            }
+        }
     }
     settings
 }

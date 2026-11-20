@@ -118,6 +118,7 @@ fn settings(seq: u64) -> SharedSettings {
             },
         )]
         .into(),
+        ..SharedSettings::default()
     }
 }
 
