@@ -9,7 +9,7 @@ function Layout() {
   const { state, connected } = useFleet();
   const { terminalId } = useParams({ strict: false });
   return (
-    <div className="flex h-screen bg-neutral-950 text-neutral-100">
+    <div className="flex h-screen overflow-hidden bg-neutral-950 text-neutral-100">
       <Sidebar machines={fleet(state.records, state.settings)} projects={state.settings.projects} selected={terminalId} connected={connected} />
       <main className="min-w-0 flex-1">
         {terminalId ? (

@@ -121,7 +121,10 @@ export function TerminalPane({ id, running }: { id: string; running: boolean | u
 
   return (
     <div className="flex h-full flex-col bg-black">
-      <div ref={host} className="min-h-0 flex-1 p-2" />
+      {/* The fit add-on sizes the terminal to its parent's height, padding included, so the padding sits outside it. */}
+      <div className="min-h-0 flex-1 p-2">
+        <div ref={host} className="h-full" />
+      </div>
       {status && <div className="border-t border-neutral-800 px-3 py-1 text-xs text-amber-400">{status}</div>}
     </div>
   );
