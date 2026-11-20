@@ -22,7 +22,7 @@ import { useShortcut } from "./shortcut";
 import { useBriefs } from "./useBriefs";
 import { machineQuery } from "./api";
 import { useFleet } from "./useFleet";
-import { AlertsButton, Announcer, useAlerts } from "./AlertsBell";
+import { Announcer, NotifyButton, useAlerts } from "./AlertsBell";
 import { KeySheet, useHelpKey } from "./KeySheet";
 import { Away } from "./Away";
 import { Toasts } from "./Toasts";
@@ -67,10 +67,11 @@ import { Toasts } from "./Toasts";
  * Each session is named by its first prompt, and a busy one says what it is doing, from the
  * daemon's briefs of its hooks.
  *
- * The browser tab shows the fleet's state in its title and icon, and the sidebar's bell turns on
- * desktop alerts for a session that finishes its turn or needs you; a screen reader hears the same
- * news whatever the bell is set to. Coming back after the page was hidden for a while, a card in
- * the corner says what each session did meanwhile and what needs you, and opens their terminals.
+ * The browser tab shows the fleet's state in its title and icon. A session you are not looking at
+ * that finishes its turn or needs you is told once: as a card at the top right while you are at
+ * the page, or as a desktop alert while you are not; coming back after a while, a catch-up card
+ * heads the same stack. The sidebar's bell sets all three in one place; a screen reader hears the
+ * news whatever it is set to.
  *
  * ? (outside a field or the terminal) or the sidebar's Keyboard button lists every key the app
  * answers. The sidebar's list is one Tab stop that the arrows walk.
@@ -172,7 +173,9 @@ function Layout() {
     machines.flatMap((m) => m.workspaces.flatMap((w) => rows(w).flatMap((t) => (seen[t.terminal] !== undefined && seen[t.terminal] !== t.label ? [t.terminal] : [])))),
   );
   const show = (id: string) => void navigate({ to: "/terminals/$terminalId", params: { terminalId: id } });
-  const { spoken, ...alerts } = useAlerts(machines, state.synced, show);
+  const { spoken, news, ...notify } = useAlerts(machines, state.synced, show);
+  /** The sessions the catch-up card lists, whose news it already shows. */
+  const [caughtUp, setCaughtUp] = useState<string[]>([]);
   /** Whether the list of keys is open. */
   const [keysOpen, setKeysOpen] = useState(false);
   useHelpKey(() => setKeysOpen(true));
@@ -263,7 +266,7 @@ function Layout() {
               onClose={close}
               onJump={openJump}
               onChanges={openChanges}
-              alerts={<AlertsButton {...alerts} />}
+              alerts={<NotifyButton {...notify} />}
               onKeys={() => setKeysOpen(true)}
             />
           </div>
@@ -356,8 +359,11 @@ function Layout() {
         />
         <KeySheet open={keysOpen} onOpenChange={setKeysOpen} />
         <Announcer spoken={spoken} />
-        <Away records={state.records} synced={state.synced} machines={machines} traced={traced} onOpen={show} />
-        <Toasts machines={machines} synced={state.synced} here={here} onScreen={pair ? [pair.left, pair.right] : terminalId ? [terminalId] : []} onOpen={show} />
+        {/* One place on screen for news: the catch-up first, then the cards. */}
+        <div className="pointer-events-none fixed inset-x-2 top-2 z-40 flex flex-col gap-2 md:inset-x-auto md:top-14 md:right-4 md:w-[24rem]">
+          {notify.notify.away && <Away records={state.records} synced={state.synced} machines={machines} traced={traced} onOpen={show} onShown={setCaughtUp} />}
+          <Toasts news={news} machines={machines} here={here} onScreen={pair ? [pair.left, pair.right] : terminalId ? [terminalId] : []} covered={notify.notify.away ? caughtUp : []} onOpen={show} />
+        </div>
         {sessionIn && <NewSession key={sessionIn.id} workspace={sessionIn.id} name={sessionIn.name} onClose={() => setSessionIn(undefined)} onStarted={setLanding} />}
       </div>
     </TerminalActions>

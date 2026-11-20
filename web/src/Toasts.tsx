@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { alertsFor, type Seen } from "./alerts";
+import type { News } from "./AlertsBell";
 import type { MachineView } from "./fleet";
 import { needsYou } from "./labels";
 import { arrive, current, TOAST_MS, type Live, type Toast } from "./news";
@@ -13,47 +13,45 @@ import { glyphText, StateGlyph } from "./StateGlyph";
  * with what Claude said or asks, to open, or to answer on the spot when it rests on this machine,
  * without leaving the terminal you are in. A finished turn's card goes by itself after `TOAST_MS`
  * unless the pointer or the keyboard is on it; one that needs you stays while the session waits.
- * A card leaves once its session moves on or its terminal is opened. A screen reader hears the
- * same news from `Announcer`, so the cards are not a live region.
+ * A card leaves once its session moves on or its terminal is opened. Which news becomes a card is
+ * `useAlerts`' choice, so the same event never also raises a desktop alert. A screen reader hears
+ * the same news from `Announcer`, so the cards are not a live region.
  */
 export function Toasts({
+  news,
   machines,
-  synced,
   here,
   onScreen,
+  covered,
   onOpen,
 }: {
+  /** The news routed to cards, from `useAlerts`. */
+  news: News | undefined;
   machines: MachineView[];
-  synced: boolean;
   /** This daemon's machine: only its sessions can be answered from here. */
   here: string | undefined;
   /** The terminals on screen, whose news needs no card. */
   onScreen: string[];
+  /** Sessions the catch-up lists: their line there is live, so they get no card of their own. */
+  covered: string[];
   onOpen: (terminal: string) => void;
 }) {
   const [list, setList] = useState<Toast[]>([]);
-  const seen = useRef<Seen>(undefined);
-  const shown = useRef(onScreen);
+  const latest = useRef({ machines, onScreen, covered });
   useLayoutEffect(() => {
-    shown.current = onScreen;
+    latest.current = { machines, onScreen, covered };
   });
   useEffect(() => {
-    if (!synced) return;
-    const next = alertsFor(seen.current, machines);
-    seen.current = next.seen;
-    const front = document.visibilityState === "visible";
-    setList((old) => {
-      const kept = current(old, machines, shown.current).map((l) => l.toast);
-      const fresh = arrive(kept, front ? next.alerts : [], shown.current);
-      return fresh.length === old.length && fresh.every((t, i) => t === old[i]) ? old : fresh;
-    });
-  }, [machines, synced]);
+    if (!news) return;
+    const { machines, onScreen, covered } = latest.current;
+    setList((old) => arrive(current(old, machines, onScreen).map((l) => l.toast), news.alerts.filter((a) => !covered.includes(a.tag)), onScreen));
+  }, [news]);
 
   const live = current(list, machines, onScreen);
   if (live.length === 0) return null;
   const drop = (tag: string) => setList((old) => old.filter((t) => t.tag !== tag));
   return (
-    <section aria-label="News from your sessions" className="pointer-events-none fixed inset-x-2 top-2 z-40 flex flex-col gap-2 md:inset-x-auto md:top-14 md:right-4 md:w-[23rem]">
+    <section aria-label="News from your sessions" className="flex flex-col gap-2">
       {live.map((l) => (
         <Card
           key={`${l.toast.tag}:${l.toast.glyph}`}

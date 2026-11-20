@@ -227,7 +227,7 @@ describe("App", () => {
     expect(within(sidebar).getByText("Edit src/login.ts")).toBeDefined();
   });
 
-  it("titles the tab with the fleet's state, and a desktop alert's click opens the session it names", async () => {
+  it("titles the tab with the fleet's state, tells of a finished turn once, on the desktop, and its click opens the session", async () => {
     const shown: { title: string; onclick: (() => void) | null; close: () => void }[] = [];
     vi.stubGlobal(
       "Notification",
@@ -245,13 +245,16 @@ describe("App", () => {
     mockActions();
     const fresh = await open("/", live);
     expect(document.title).toBe("Foundry · 1 working");
-    expect(screen.getByRole("button", { name: "Alerts on" })).toBeDefined();
+    fireEvent.click(screen.getByRole("button", { name: "Notifications" }));
+    expect(screen.getByRole("switch", { name: "Desktop alerts" }).getAttribute("aria-checked")).toBe("true");
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
 
     vi.spyOn(document, "hasFocus").mockReturnValue(false);
     const events = sockets("/api/events").at(-1)!;
     act(() => events.deliver(JSON.stringify({ type: "record", protocol: 1, record: session(ME, "s1", "w1", "t1", "idle", { model: "sonnet", version: 2 }) })));
     expect(document.title).toBe("Foundry");
     expect(shown.map((n) => n.title)).toEqual(["fix login"]);
+    expect(screen.queryByRole("region", { name: "News from your sessions" })).toBeNull();
     act(() => shown[0].onclick?.());
     await waitFor(() => expect(fresh.state.location.pathname).toBe("/terminals/t1"));
     vi.restoreAllMocks();

@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AnyRecord, Briefs, SessionState } from "./api";
 import { fleet } from "./fleet";
 import { MAX_TOASTS, TOAST_MS } from "./news";
+import { useAlerts } from "./AlertsBell";
 import { Toasts } from "./Toasts";
 import { ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
 
@@ -55,9 +56,16 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-function view(onScreen: string[] = ["t3"]) {
+/** The cards as the app shows them: fed by the one hook that hears the fleet's news. */
+function Both({ records, shown, covered, onOpen }: { records: AnyRecord[]; shown: string[]; covered: string[]; onOpen: (terminal: string) => void }) {
+  const machines = fleet(records, settings({ machines: [] }), briefs);
+  const { news } = useAlerts(machines, true, onOpen);
+  return <Toasts news={news} machines={machines} here={ME} onScreen={shown} covered={covered} onOpen={onOpen} />;
+}
+
+function view(onScreen: string[] = ["t3"], covered: string[] = []) {
   const onOpen = vi.fn();
-  const ui = (r: AnyRecord[], shown: string[]) => <Toasts machines={fleet(r, settings({ machines: [] }), briefs)} synced here={ME} onScreen={shown} onOpen={onOpen} />;
+  const ui = (r: AnyRecord[], shown: string[]) => <Both records={r} shown={shown} covered={covered} onOpen={onOpen} />;
   const rendered = render(ui(fleetAt(), onScreen));
   return { onOpen, move: (r: AnyRecord[], shown = onScreen) => rendered.rerender(ui(r, shown)) };
 }
@@ -88,6 +96,12 @@ describe("Toasts", () => {
     visibility = "hidden";
     move(fleetAt({ s1: "idle", s2: "idle", s3: "idle" }));
     expect(cards()).toEqual([]);
+  });
+
+  it("gives no card of its own to a session the catch-up already lists", () => {
+    const { move } = view(["t3"], ["s1"]);
+    move(fleetAt({ s1: "idle", s2: "waiting_for_you" }));
+    expect(cards().map((c) => c.getAttribute("aria-label"))).toEqual(["fix login: sonnet is waiting for you"]);
   });
 
   it("takes a card off once its terminal is opened some other way", () => {

@@ -13,7 +13,8 @@ import { ago, tally } from "./trail";
 
 /**
  * Coming back to the page after it was hidden for `AWAY_MS` or more (another tab, another app on a
- * phone, the tab closed and opened again) says what happened meanwhile, in a card at the corner:
+ * phone, the tab closed and opened again) says what happened meanwhile, in a card heading the
+ * page's notifications:
  * how long you were away, and a line for each session whose record moved and each that needs you,
  * most urgent first: its state, the turns it ended and the tools it ran since, and the question it
  * waits on or what Claude said at the end of its turn. A line opens its terminal and leaves the
@@ -28,12 +29,15 @@ export function Away({
   machines,
   traced,
   onOpen,
+  onShown,
 }: {
   records: AnyRecord[];
   synced: boolean;
   machines: MachineView[];
   traced: Set<string>;
   onOpen: (terminal: string) => void;
+  /** The sessions the card lists now, so news of them raises no card of its own. */
+  onShown?: (sessions: string[]) => void;
 }) {
   const left = useLeft(records, synced);
   const [gone, setGone] = useState<{ of?: number; ids: string[] }>({ ids: [] });
@@ -50,6 +54,14 @@ export function Away({
     })),
   });
   useRereadOnChange(list.map((m) => `${m.row.session}=${m.row.label}`).join("\n"));
+  const shown = left.since ? list.map((m) => m.row.session).join(" ") : "";
+  const tell = useRef(onShown);
+  useLayoutEffect(() => {
+    tell.current = onShown;
+  });
+  useLayoutEffect(() => {
+    tell.current?.(shown ? shown.split(" ") : []);
+  }, [shown]);
   if (!left.since || list.length === 0) return null;
   const from = left.since.at;
 
@@ -69,7 +81,7 @@ export function Away({
     <aside
       aria-label="While you were away"
       onKeyDown={(event) => event.key === "Escape" && left.close()}
-      className="fixed inset-x-3 bottom-[4.25rem] z-20 flex max-h-[min(32rem,60dvh)] flex-col overflow-hidden rounded-xl border border-neutral-700/70 bg-neutral-900 text-sm text-neutral-100 shadow-2xl shadow-black/50 motion-safe:animate-sheet-in md:inset-x-auto md:right-4 md:bottom-4 md:w-[25rem]"
+      className="pointer-events-auto flex max-h-[min(32rem,55dvh)] flex-col overflow-hidden rounded-xl border border-neutral-700/70 bg-neutral-900 text-sm text-neutral-100 shadow-2xl shadow-black/50 motion-safe:animate-sheet-in"
     >
       <header className="flex items-start gap-3 border-b border-neutral-800 px-4 pt-3 pb-2.5">
         <div className="min-w-0 flex-1">

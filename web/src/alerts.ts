@@ -94,22 +94,3 @@ export function favicon(glyph: Glyph | undefined, frame?: string): string {
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="7" fill="#171717"/>${dots}</svg>`;
   return `data:image/svg+xml,${encodeURIComponent(svg)}`;
 }
-
-/** Whether alerts are on in this browser: off unless the user turned them on. */
-const KEY = "foundry.alerts";
-
-export function loadAlertsOn(): boolean {
-  try {
-    return localStorage.getItem(KEY) === "on";
-  } catch {
-    return false;
-  }
-}
-
-export function saveAlertsOn(on: boolean) {
-  try {
-    localStorage.setItem(KEY, on ? "on" : "off");
-  } catch {
-    // Storage blocked: the choice lasts for this page only.
-  }
-}
