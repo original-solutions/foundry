@@ -7,8 +7,10 @@
 # RELEASE_KEY. Any workflow pushed to this repository could read a repository secret, so the key is
 # only as safe as push access to the repository.
 #
-# A release's assets are never replaced: a daemon that read a new archive beside an old signature
-# would refuse a good tag. A release that needs new binaries ships under a new tag.
+# The publish job creates the release and fails when one already exists for the tag, so a release's
+# assets are never replaced: a daemon that read a new archive beside an old signature would refuse a
+# good tag. A release that needs new binaries ships under a new tag. Push the tag; do not make the
+# release in the GitHub UI first.
 #
 # Release builds use no cache, so nothing a pull request's run left behind reaches a release.
 name: release
@@ -235,17 +237,11 @@ jobs:
               -in "$archive" -sigfile "$archive.sig"
           done
 
+      # gh creates the release as a draft, uploads every asset, then publishes it, so no daemon sees
+      # it before all eight files are there. A run that fails part way can leave that draft: delete
+      # it and run again.
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
-        run: |
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' > "$RUNNER_TEMP/assets"; then
-            if grep -q '^foundryd-' "$RUNNER_TEMP/assets"; then
-              echo "::error::release $TAG already holds foundryd assets, which are never replaced: push a new tag"
-              exit 1
-            fi
-            gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY"
-          else
-            gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" --generate-notes
-          fi
+        run: gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" --generate-notes
