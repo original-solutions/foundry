@@ -2749,3 +2749,188 @@ async fn a_cancel_of_a_request_this_machine_does_not_hold_is_404() {
         assert_eq!(reply.status, 404, "{id}: {}", reply.body);
     }
 }
+
+/// Waits up to 10 seconds for this machine to list a request in `state`, and returns it.
+async fn listed_in(daemon: &Daemon, state: &str) -> serde_json::Value {
+    let started = tokio::time::Instant::now();
+    loop {
+        let listed = daemon.call("GET", "/api/placements", None).await.json();
+        if let Some(found) = listed["requests"]
+            .as_array()
+            .and_then(|all| all.iter().find(|r| r["state"] == state))
+        {
+            return found.clone();
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "no request {state} in {listed}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn choose_on_a_machine_that_is_not_in_its_own_machine_list_places_it_there() {
+    let daemon = Daemon::new(TURN).await;
+    let project = daemon.project();
+    daemon.sample(daemon.me, 0, 0.1);
+    let reply = daemon
+        .call("POST", "/api/workspaces", Some(choose(project, "solo")))
+        .await;
+    assert_eq!(reply.status, 201, "{}", reply.body);
+    assert_eq!(reply.json()["machine"], serde_json::json!(daemon.me));
+}
+
+#[tokio::test]
+async fn a_machine_given_a_request_takes_no_other_until_its_next_sample() {
+    let daemon = Daemon::new(TURN).await;
+    let project = daemon.project();
+    daemon.list_me("studio");
+    daemon.limit(daemon.me, 1, 1.0);
+    daemon.sample(daemon.me, 1, 0.1);
+    for name in ["first", "second"] {
+        let reply = daemon
+            .call("POST", "/api/workspaces", Some(choose(project, name)))
+            .await;
+        assert_eq!(reply.status, 202, "{name}: {}", reply.body);
+    }
+
+    daemon.sample(daemon.me, 0, 0.1);
+    let qualified = tokio::time::Instant::now();
+    loop {
+        if let Some(made) = daemon.workspace_named("first")
+            && !daemon.sessions_in(made.id).is_empty()
+        {
+            break;
+        }
+        assert!(
+            qualified.elapsed() < Duration::from_secs(10),
+            "first is not placed"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // No new sample: the one that let "first" in does not count its session.
+    tokio::time::sleep(crate::placement::RETRY_EVERY * 3).await;
+    assert!(
+        daemon.workspace_named("second").is_none(),
+        "over the limit of 1"
+    );
+    let waiting = listed_in(&daemon, "waiting").await;
+    assert_eq!(waiting["name"], "second");
+}
+
+#[tokio::test]
+async fn a_machine_that_cannot_take_the_call_is_passed_over_for_one_that_can() {
+    let daemon = Daemon::new(TURN).await;
+    let project = daemon.project();
+    daemon.list_me("studio");
+    let peer = daemon.add_machine();
+    let (mine, theirs) = Conn::pair();
+    let peers = daemon.peers.clone();
+    tokio::spawn(async move { peers.accept(theirs).await });
+    for message in [
+        PeerMessage::Hello {
+            protocol: 2,
+            machine: peer,
+            versions: Default::default(),
+        },
+        PeerMessage::Records {
+            protocol: 2,
+            records: Vec::new(),
+        },
+    ] {
+        mine.send
+            .send(serde_json::to_string(&message).unwrap())
+            .await
+            .unwrap();
+    }
+    let started = tokio::time::Instant::now();
+    while !daemon.peers.online().contains(&peer) {
+        assert!(started.elapsed() < WAIT, "the peer is never heard from");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // The peer has the most headroom, but runs a Foundry too old to take a create.
+    daemon.sample(daemon.me, 1, 0.5);
+    daemon.sample(peer, 0, 0.1);
+
+    let reply = daemon
+        .call(
+            "POST",
+            "/api/workspaces",
+            Some(choose(project, "reachable")),
+        )
+        .await;
+    assert_eq!(reply.status, 201, "{}", reply.body);
+    assert_eq!(reply.json()["machine"], serde_json::json!(daemon.me));
+    drop(mine);
+}
+
+#[tokio::test]
+async fn a_queued_create_the_machine_refuses_is_listed_as_failed_and_not_tried_again() {
+    let daemon = Daemon::new(TURN).await;
+    let project = daemon.project();
+    daemon.list_me("studio");
+    daemon.limit(daemon.me, 1, 1.0);
+    daemon.sample(daemon.me, 1, 0.1);
+    let reply = daemon
+        .call("POST", "/api/workspaces", Some(choose(project, "dup")))
+        .await;
+    assert_eq!(reply.status, 202, "{}", reply.body);
+    // Meanwhile someone makes a workspace with that name by hand.
+    daemon.create_workspace(project, "dup").await;
+
+    daemon.sample(daemon.me, 0, 0.1);
+    let failed = listed_in(&daemon, "failed").await;
+    let error = failed["error"].as_str().unwrap().to_owned();
+    assert!(error.contains("dup could not be made on studio"), "{error}");
+    daemon.sample(daemon.me, 0, 0.1);
+    tokio::time::sleep(crate::placement::RETRY_EVERY * 3).await;
+    let listed = daemon.call("GET", "/api/placements", None).await.json();
+    assert_eq!(
+        listed["requests"].as_array().map(Vec::len),
+        Some(1),
+        "{listed}"
+    );
+    assert_eq!(listed["requests"][0]["error"], error.as_str());
+}
+
+#[tokio::test]
+async fn a_queued_request_whose_session_cannot_start_is_listed_as_failed_with_its_workspace_made() {
+    let daemon = Daemon::refusing_sessions("set FOUNDRY_GATEWAY_URL").await;
+    let project = daemon.project();
+    daemon.list_me("studio");
+    daemon.limit(daemon.me, 1, 1.0);
+    daemon.sample(daemon.me, 1, 0.1);
+    let reply = daemon
+        .call(
+            "POST",
+            "/api/workspaces",
+            Some(choose(project, "sessionless")),
+        )
+        .await;
+    assert_eq!(reply.status, 202, "{}", reply.body);
+
+    daemon.sample(daemon.me, 0, 0.1);
+    let failed = listed_in(&daemon, "failed").await;
+    let error = failed["error"].as_str().unwrap();
+    assert!(error.contains("its session did not start"), "{error}");
+    assert!(error.contains("set FOUNDRY_GATEWAY_URL"), "{error}");
+    assert!(daemon.workspace_named("sessionless").is_some());
+}
+
+#[tokio::test]
+async fn choose_for_a_project_not_in_the_settings_is_refused_and_never_waits() {
+    let daemon = Daemon::new(TURN).await;
+    daemon.limit(daemon.me, 1, 1.0);
+    daemon.sample(daemon.me, 1, 0.1);
+    let reply = daemon
+        .call(
+            "POST",
+            "/api/workspaces",
+            Some(choose(ProjectId::random(), "nowhere")),
+        )
+        .await;
+    assert_eq!(reply.status, 422, "{}", reply.body);
+    let listed = daemon.call("GET", "/api/placements", None).await.json();
+    assert_eq!(listed["requests"], serde_json::json!([]));
+}

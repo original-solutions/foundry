@@ -804,8 +804,8 @@ mod tests {
         let placing = queue.wait(want("b"), Vec::new());
         assert!(queue.begin(placing).is_some());
         assert_eq!(queue.cancel(placing), Err(Refused::Placing));
-        // A placement that could not reach its machine waits again, and can be cancelled.
-        queue.finish(placing, Outcome::Retry);
+        // A placement that found no machine to take it waits again, and can be cancelled.
+        queue.finish(placing, Outcome::Wait(None));
         queue.cancel(placing).unwrap();
     }
 
@@ -824,6 +824,30 @@ mod tests {
         assert!(queue.begin(id).is_none(), "a failed request is tried again");
         queue.cancel(id).unwrap();
         assert!(queue.list().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_request_keeps_its_placement_waiting_item_until_it_is_dismissed() {
+        let me = MachineId::random();
+        let queue = Queue::new(me);
+        let id = queue.wait(want("docs"), Vec::new());
+        assert!(queue.begin(id).is_some());
+        queue.finish(
+            id,
+            Outcome::Failed("docs could not be made on vps: taken".into()),
+        );
+        tokio::time::advance(WAITING_ALERT_AFTER).await;
+        let items = queue.items(&fleet(me));
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert!(
+            items[0]
+                .what
+                .contains("docs could not be made on vps: taken"),
+            "{}",
+            items[0].what
+        );
+        queue.cancel(id).unwrap();
+        assert!(queue.items(&fleet(me)).is_empty());
     }
 
     #[test]

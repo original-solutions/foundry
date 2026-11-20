@@ -1251,4 +1251,44 @@ mod tests {
 
         assert!(why.contains("did not answer"), "{why}");
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_attention_list_holds_the_requests_waiting_for_a_machine() {
+        use crate::attention::Kind;
+        use crate::placement::{Queue, WAITING_ALERT_AFTER, Want};
+
+        let data = tempfile::tempdir().unwrap();
+        let me = foundry_proto::ids::MachineId::random();
+        let store = Arc::new(Mutex::new(
+            Store::open(data.path().join("foundry.db")).unwrap(),
+        ));
+        let peers = Peers::new(me, store.clone(), Arc::new(WsDialer { port: 9 }));
+        let coordinator = Arc::new(crate::coordinator::Coordinator::new(
+            me,
+            store.clone(),
+            peers.clone(),
+        ));
+        let gateway = Arc::new(gateway::Reader::new(
+            None,
+            Arc::new(crate::secrets::MemorySecrets::default()),
+        ));
+        let placements = Arc::new(Queue::new(me));
+        let attention = attention(me, &store, &peers, coordinator, gateway, &placements);
+        placements.wait(
+            Want {
+                project: foundry_proto::ids::ProjectId::random(),
+                base: "main".into(),
+                name: "fix login".into(),
+                model: "opus".into(),
+                prompt: None,
+            },
+            Vec::new(),
+        );
+        tokio::time::advance(WAITING_ALERT_AFTER).await;
+        let items = attention.items().await.unwrap();
+        assert!(
+            items.iter().any(|item| item.kind == Kind::PlacementWaiting),
+            "{items:?}"
+        );
+    }
 }
