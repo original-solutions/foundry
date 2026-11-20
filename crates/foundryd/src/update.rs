@@ -2112,13 +2112,51 @@ mod tests {
     }
 
     #[test]
-    fn the_release_key_is_the_one_the_release_workflow_signs_with() {
+    fn the_release_key_is_the_issued_public_key() {
         let hex: String = RELEASE_KEY.iter().map(|b| format!("{b:02x}")).collect();
 
         assert_eq!(
             hex,
             "1884d7afeb3f7af2805f1727358a10baa8688264fd531685d116b9bec30b45e1"
         );
+    }
+
+    #[test]
+    fn the_release_workflow_reads_the_key_from_its_one_line_in_this_file() {
+        let line = format!("const RELEASE_KEY_HEX: &str = \"{RELEASE_KEY_HEX}\";");
+        let source = include_str!("update.rs");
+        let workflow = include_str!("../../../.github/workflows/release.yml");
+
+        let found: Vec<&str> = source
+            .lines()
+            .filter(|l| l.starts_with("const RELEASE_KEY_HEX"))
+            .collect();
+
+        assert_eq!(found, [line.as_str()]);
+        assert!(workflow.contains(
+            r#"sed -n 's/^const RELEASE_KEY_HEX: &str = "\([0-9a-f]\{64\}\)";$/\1/p' crates/foundryd/src/update.rs"#
+        ));
+    }
+
+    /// Bytes from hex, for fixtures.
+    fn unhex(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn a_signature_made_the_way_the_release_workflow_signs_verifies() {
+        // Made once with a throwaway key and the command in release.yml's sign step:
+        // `openssl pkeyutl -sign -rawin -inkey <key> -in <message> -out <message>.sig`.
+        let key = unhex("c5f260650d6e1334514f0e40ccdc1b4e2cdb1ea1c2e4085c9c0469eaffbd185d");
+        let signature = unhex(
+            "6ef89c2ded9259bc97d9d6ecfbbf88751456adcb970225b383dff3e44e774d03fec4858e9ba95d14d7ede588bd68f5d697aa0e9e076b6c35645b00ba9bcb9f0c",
+        );
+
+        assert!(verifies(&key, b"foundryd release archive", &signature));
+        assert!(!verifies(&key, b"foundryd release archivf", &signature));
     }
 
     /// A fresh Ed25519 key, as the release workflow's would be.
