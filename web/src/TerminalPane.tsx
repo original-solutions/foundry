@@ -1,7 +1,8 @@
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { FindBar } from "./FindBar";
 import { KeyBar } from "./KeyBar";
 import type { Glyph } from "./labels";
 import { Backoff, socketUrl } from "./socket";
@@ -32,10 +33,30 @@ const STEADY_AFTER = 10_000;
  * screen, where focus would raise the on-screen keyboard over what you came to read. There a
  * key bar (`name` and `glyph` say whose and in what state) carries the keys a phone lacks and
  * a box to write a message in.
+ *
+ * While `finding`, a find bar over the screen searches its whole scrollback.
  */
-export function TerminalPane({ id, running, active = true, name, glyph }: { id: string; running: boolean | undefined; active?: boolean; name?: string; glyph?: Glyph }) {
+export function TerminalPane({
+  id,
+  running,
+  active = true,
+  name,
+  glyph,
+  finding = 0,
+  onFindClose = () => {},
+}: {
+  id: string;
+  running: boolean | undefined;
+  active?: boolean;
+  name?: string;
+  glyph?: Glyph;
+  /** Above 0, the find bar is open; it takes the keyboard again each time this changes. */
+  finding?: number;
+  onFindClose?: () => void;
+}) {
   const host = useRef<HTMLDivElement>(null);
   const shown = useRef<{ term: Terminal; fit: FitAddon } | null>(null);
+  const termNow = useCallback(() => shown.current?.term, []);
   const [status, setStatus] = useState<string | null>(null);
   const runningNow = useRef(running);
   useEffect(() => {
@@ -43,7 +64,9 @@ export function TerminalPane({ id, running, active = true, name, glyph }: { id: 
   }, [running]);
 
   useEffect(() => {
-    const term = new Terminal({ cursorBlink: true, fontSize: 13, fontFamily: "ui-monospace, Menlo, monospace" });
+    // As many lines as the holder keeps (xterm's default is 1,000), so find reaches all of them.
+    // Decorations, which the find bar lights its hits with, are still a proposed API in xterm.
+    const term = new Terminal({ cursorBlink: true, fontSize: 13, fontFamily: "ui-monospace, Menlo, monospace", scrollback: 10_000, allowProposedApi: true });
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.open(host.current!);
@@ -144,8 +167,9 @@ export function TerminalPane({ id, running, active = true, name, glyph }: { id: 
   return (
     <div className="flex h-full flex-col bg-black">
       {/* The fit add-on sizes the terminal to its parent's height, padding included, so the padding sits outside it. */}
-      <div className="min-h-0 flex-1 p-2">
+      <div className="relative min-h-0 flex-1 p-2">
         <div ref={host} className="h-full" />
+        {finding > 0 && <FindBar key={id} term={termNow} name={name ?? "terminal"} ask={finding} onClose={onFindClose} />}
       </div>
       {running !== false && (
         <KeyBar

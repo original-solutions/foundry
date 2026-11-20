@@ -1,5 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { changesQuery } from "./ChangesPanel";
+import { findKey } from "./FindBar";
 import { totals } from "./changes";
 import type { Located } from "./fleet";
 import { jumpKey, SearchIcon } from "./JumpPalette";
@@ -11,7 +12,7 @@ export const splitKey = jumpKey === "⌘K" ? "⌘\\" : "Ctrl \\";
 
 /**
  * The bar above a terminal: which workspace and terminal it is, the machine it runs on and its
- * state, and the ways into the workspace's changes and the session's steps. On a narrow screen it holds the button that
+ * state, and the ways into the workspace's changes, the session's steps and finding text in it. On a narrow screen it holds the button that
  * opens the sidebar as a drawer. On a wide one it opens another terminal beside this one, or, in
  * a split, closes its own side. In a split the side with the keyboard has a lit edge; the other
  * is dimmed.
@@ -24,6 +25,8 @@ export function TerminalHeader({
   onChanges,
   onSteps,
   stepsOpen = false,
+  onFind,
+  finding = false,
   onSplit,
   onClosePane,
   beside = false,
@@ -37,6 +40,9 @@ export function TerminalHeader({
   /** Shows or hides the steps column, which follows the terminal with the keyboard. */
   onSteps?: () => void;
   stepsOpen?: boolean;
+  /** Shows or hides the find bar over the terminal with the keyboard. */
+  onFind?: () => void;
+  finding?: boolean;
   /** Offered when nothing is beside: picks a terminal to show beside this one. */
   onSplit?: () => void;
   /** Offered in a split: closes this side, leaving the other. */
@@ -90,6 +96,18 @@ export function TerminalHeader({
             >
               <StepsIcon className="size-3.5" />
               <span className="sr-only sm:not-sr-only">Steps</span>
+            </button>
+          )}
+          {onFind && (
+            <button
+              type="button"
+              aria-label="Find"
+              aria-pressed={finding}
+              title={`Find in this terminal's scrollback (${findKey})`}
+              onClick={onFind}
+              className={`shrink-0 rounded p-1.5 ${finding ? "bg-sky-400/10 text-sky-200" : "text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200"}`}
+            >
+              <FindIcon className="size-4" />
             </button>
           )}
         </>
@@ -164,5 +182,16 @@ function ChangesButton({ workspace, onClick }: { workspace: string; onClick: () 
         </span>
       )}
     </button>
+  );
+}
+
+/** Lines of text with a magnifier: find in the terminal's text, unlike the jump palette's plain magnifier. */
+function FindIcon({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 16 16" className={className} fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
+      <path d="M2 3.5h10M2 7h5M2 10.5h3.5" strokeLinecap="round" />
+      <circle cx="10.5" cy="10" r="2.75" />
+      <path d="M12.5 12l1.75 1.75" strokeLinecap="round" />
+    </svg>
   );
 }

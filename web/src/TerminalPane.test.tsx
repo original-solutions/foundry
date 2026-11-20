@@ -10,6 +10,7 @@ const screenOps = vi.hoisted(() => ({
   typed: null as ((data: string) => void) | null,
   resized: null as (() => void) | null,
   term: null as { cols: number; rows: number } | null,
+  options: null as Record<string, unknown> | null,
   focused: false,
 }));
 
@@ -17,8 +18,9 @@ vi.mock("@xterm/xterm", () => ({
   Terminal: class {
     cols = 80;
     rows = 24;
-    constructor() {
+    constructor(options: Record<string, unknown>) {
       screenOps.term = this;
+      screenOps.options = options;
     }
     loadAddon() {}
     open() {}
@@ -98,6 +100,12 @@ describe("TerminalPane", () => {
     act(() => socket.deliver(bytes("kept screen")));
     act(() => socket.deliver(bytes("live")));
     expect(screenOps.ops).toEqual(["reset", "write:kept screen", "write:live"]);
+  });
+
+  it("holds the 10,000 lines of scrollback the holder keeps, so find reaches all of them, and turns on the decorations find lights its hits with", () => {
+    mount();
+    expect(screenOps.options?.scrollback).toBe(10_000);
+    expect(screenOps.options?.allowProposedApi).toBe(true);
   });
 
   it("sends typed keys as bytes", () => {

@@ -23,6 +23,20 @@ vi.mock("@xterm/xterm", () => ({
     onResize() {
       return { dispose() {} };
     }
+    onWriteParsed() {
+      return { dispose() {} };
+    }
+    onScroll() {
+      return { dispose() {} };
+    }
+    buffer = { active: { length: 1, viewportY: 0, baseY: 0, cursorY: 0, getLine: () => ({ isWrapped: false, translateToString: () => "cargo test: 1 error" }) } };
+    registerMarker() {
+      return { dispose() {} };
+    }
+    registerDecoration() {
+      return { dispose() {} };
+    }
+    scrollToLine() {}
     dispose() {}
   },
 }));
@@ -496,5 +510,33 @@ describe("App", () => {
     fireEvent.keyDown(window, { key: "\\", metaKey: true });
     expect(screen.queryByLabelText("Terminal beside")).toBeNull();
     expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("finds text in the open terminal with Cmd+F or the header's Find button, and closes on Escape", async () => {
+    await open("/terminals/t1", live);
+    fireEvent.keyDown(window, { key: "f", metaKey: true });
+
+    const box = screen.getByRole("searchbox", { name: "Find in sonnet" });
+    fireEvent.change(box, { target: { value: "error" } });
+    expect(screen.getByRole("status").textContent).toBe("1 of 1");
+    fireEvent.keyDown(box, { key: "Escape" });
+    expect(screen.queryByRole("searchbox")).toBeNull();
+
+    const find = within(screen.getByLabelText("Open terminal")).getByRole("button", { name: "Find" });
+    fireEvent.click(find);
+    expect(screen.getByRole("searchbox", { name: "Find in sonnet" })).toBeDefined();
+    expect(find.getAttribute("aria-pressed")).toBe("true");
+    fireEvent.click(find);
+    expect(screen.queryByRole("searchbox")).toBeNull();
+  });
+
+  it("leaves Ctrl+F inside the terminal to the program running there", async () => {
+    await open("/terminals/t1", live);
+    const inside = document.createElement("div");
+    inside.className = "xterm";
+    document.body.append(inside);
+    fireEvent.keyDown(inside, { key: "f", ctrlKey: true });
+    expect(screen.queryByRole("searchbox")).toBeNull();
+    inside.remove();
   });
 });

@@ -37,6 +37,9 @@ import { AlertsButton, useAlerts } from "./AlertsBell";
  * every prompt, tool call and question of the session with the keyboard, turn by turn. It follows
  * whichever terminal is open until it is closed.
  *
+ * Cmd+F (Ctrl+F outside the terminal) or the header's Find button finds text in the whole
+ * scrollback of the terminal with the keyboard; the bar follows it as the steps column does.
+ *
  * Each session is named by its first prompt, and a busy one says what it is doing, from the
  * daemon's briefs of its hooks.
  *
@@ -61,6 +64,8 @@ function Layout() {
   const [create, setCreate] = useState({ open: false, name: "" });
   /** Whether the steps column is shown. */
   const [stepsOpen, setStepsOpen] = useState(false);
+  /** The find bar over the terminal with the keyboard: 0 closed, and one more each time it is asked for. */
+  const [finding, setFinding] = useState(0);
   /** The workspace whose changes are open. */
   const [changesOf, setChangesOf] = useState<string>();
   /** The session of a workspace just made, until it shows up and is opened. */
@@ -173,6 +178,20 @@ function Layout() {
 
   useLayoutEffect(() => {
     if (!terminalId) return;
+    const find = (event: KeyboardEvent) => {
+      if (event.key.toLowerCase() !== "f" || event.altKey || event.shiftKey) return;
+      const inTerminal = event.target instanceof Element && event.target.closest(".xterm");
+      if (!event.metaKey && !(event.ctrlKey && !inTerminal)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      setFinding((n) => n + 1);
+    };
+    window.addEventListener("keydown", find, true);
+    return () => window.removeEventListener("keydown", find, true);
+  }, [terminalId]);
+
+  useLayoutEffect(() => {
+    if (!terminalId) return;
     const toggle = (event: KeyboardEvent) => {
       if (event.key !== "\\" || event.altKey || event.shiftKey) return;
       const inTerminal = event.target instanceof Element && event.target.closest(".xterm");
@@ -223,6 +242,8 @@ function Layout() {
                   onChanges={openChanges}
                   onSteps={id === terminalId ? () => setStepsOpen(!stepsOpen) : undefined}
                   stepsOpen={stepsOpen}
+                  onFind={id === terminalId ? () => setFinding(finding ? 0 : 1) : undefined}
+                  finding={finding > 0}
                   onSplit={pair ? undefined : () => setJump("beside")}
                   onClosePane={pair ? () => closePane(id) : undefined}
                   beside={id !== terminalId}
@@ -239,7 +260,15 @@ function Layout() {
             const where = locate(machines, id);
             return (
               <div key={id} data-testid={`pane-${id}`} onPointerDownCapture={side && focusPane(id)} onFocusCapture={side && focusPane(id)} className={`absolute ${place} ${seen}`}>
-                <TerminalPane id={id} running={terminalRunning(state, id)} active={id === terminalId} name={where?.name} glyph={where?.glyph} />
+                <TerminalPane
+                  id={id}
+                  running={terminalRunning(state, id)}
+                  active={id === terminalId}
+                  name={where?.name}
+                  glyph={where?.glyph}
+                  finding={id === terminalId ? finding : 0}
+                  onFindClose={() => setFinding(0)}
+                />
               </div>
             );
           })}
