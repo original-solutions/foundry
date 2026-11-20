@@ -15,7 +15,16 @@
 //! - `POST /api/workspaces` `{project, base, name, machine}`: makes a workspace, `201 {id}`, on
 //!   the machine `machine` names, or on this machine when it is absent. When the workspace is
 //!   made but its setup could not be started, it is still `201`, with an `error` beside the
-//!   `id` saying so: the workspace exists, and the id is how to reach it.
+//!   `id` saying so: the workspace exists, and the id is how to reach it. A machine named, or
+//!   this one, is used even when it is over its limits, and the answer then has a `warning`
+//!   naming each limit it is over.
+//!
+//!   `"machine": "choose"` lets [`placement`](crate::placement) pick the machine, and takes the
+//!   `model` (and optional `prompt`) of the session a waiting request starts; no other create
+//!   takes them. When a machine qualifies, the workspace is made there as a create naming it
+//!   is, and the answer is that create's with `machine` beside it. When none does, it is `202
+//!   {request, reasons}` and the request waits on this machine: see [`placement`](crate::placement)
+//!   for it and for `GET /api/placements` and `POST /api/placements/{id}/cancel`.
 //! - `POST /api/workspaces/{id}/archive` `{force}` (the body is optional): `204`, or `409` with
 //!   the uncommitted files, unpushed commits and submodules that hold it up.
 //! - `POST /api/workspaces/{id}/sessions` `{model}`: starts Claude Code in the workspace, `201
@@ -75,6 +84,7 @@ use foundry_proto::settings::{SettingValue, SharedSettings};
 use serde::Deserialize;
 use tokio::net::TcpListener;
 
+use crate::placement::{self, Queue, Want};
 use crate::secrets::redact;
 use crate::sessions::{SessionError, Sessions};
 use crate::store::{Store, StoreError};
@@ -112,6 +122,8 @@ pub struct Api {
     /// its own workspaces: a daemon with no gateway. `None` until the daemon sets it. A start
     /// for another machine's workspace is still carried there.
     pub sessions_refused: Option<String>,
+    /// The creates waiting for a machine to qualify, which [`placement::run`] places.
+    pub placements: Arc<Queue>,
 }
 
 impl Api {
@@ -123,14 +135,16 @@ impl Api {
         sessions: Arc<Sessions>,
         names: Vec<String>,
     ) -> Self {
+        let placements = Arc::new(Queue::new(peers.me()));
         Self {
             store,
             peers,
             terminals,
             workspaces,
             sessions,
-            names,
             sessions_refused: None,
+            placements,
+            names,
         }
     }
 }
@@ -151,6 +165,8 @@ pub fn router(api: Api) -> Router {
         .route("/api/briefs", get(briefs::briefs))
         .route("/api/machine", get(machine::machine))
         .route("/api/sessions/{id}/trail", get(trail::trail))
+        .route("/api/placements", get(placement::list))
+        .route("/api/placements/{id}/cancel", post(placement::cancel))
         .fallback(no_route)
         .method_not_allowed_fallback(wrong_method)
         .layer(middleware::from_fn_with_state(api.clone(), carry::carry))
@@ -599,6 +615,29 @@ async fn send(socket: &mut WebSocket, message: &UiMessage) -> bool {
 
 // --- actions ---
 
+/// Where a create goes: a machine by id, or `"choose"` for placement to pick one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Pick {
+    Choose,
+    Machine(MachineId),
+}
+
+impl<'de> Deserialize<'de> for Pick {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        if text == "choose" {
+            return Ok(Self::Choose);
+        }
+        text.parse()
+            .map(|id| Self::Machine(MachineId(id)))
+            .map_err(|_| {
+                serde::de::Error::custom(format!(
+                    "machine is a machine id or \"choose\", not {text:?}"
+                ))
+            })
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Create {
@@ -607,7 +646,17 @@ struct Create {
     name: String,
     /// The machine to make it on; absent is this machine.
     #[serde(default)]
-    machine: Option<MachineId>,
+    machine: Option<Pick>,
+    /// With `"choose"` only: the model of the session a request that waits starts.
+    #[serde(default)]
+    model: Option<String>,
+    /// With `"choose"` only: that session's first prompt.
+    #[serde(default)]
+    prompt: Option<String>,
+}
+
+fn unprocessable(message: String) -> ApiError {
+    ApiError::Rejected(StatusCode::UNPROCESSABLE_ENTITY, message)
 }
 
 async fn create_workspace(
@@ -615,26 +664,59 @@ async fn create_workspace(
     headers: HeaderMap,
     Body(create): Body<Create>,
 ) -> Result<Response, ApiError> {
+    let carried = headers.contains_key(crate::sync::call::CARRIED);
+    if create.machine != Some(Pick::Choose) && (create.model.is_some() || create.prompt.is_some()) {
+        return Err(unprocessable(
+            "only a create with \"machine\": \"choose\" takes a model and a prompt; the caller of \
+             any other starts its session itself"
+                .to_owned(),
+        ));
+    }
+    if create.machine == Some(Pick::Choose) && !carried {
+        return choose(&api, create).await;
+    }
     // A create naming another machine is carried there before this runs ([`carry`]), so one
     // that reaches here naming another was carried in, and is never carried on. One carried in
     // names this machine, as the caller's carry layer sends it.
     let me = api.peers.me();
-    let carried = headers.contains_key(crate::sync::call::CARRIED);
-    if create.machine.is_some_and(|m| m != me) || (carried && create.machine != Some(me)) {
-        let named = create
-            .machine
-            .map_or_else(|| "no machine".to_owned(), |m| format!("machine {m}"));
+    let machine = match create.machine {
+        Some(Pick::Machine(machine)) => Some(machine),
+        Some(Pick::Choose) | None => None,
+    };
+    if machine.is_some_and(|m| m != me) || (carried && machine != Some(me)) {
+        let named = machine.map_or_else(|| "no machine".to_owned(), |m| format!("machine {m}"));
         return Ok(error(
             StatusCode::MISDIRECTED_REQUEST,
             format!("this call names {named}, not this one, and is not carried on"),
         ));
     }
-    match api
-        .workspaces
-        .create(create.project, &create.base, &create.name)
-        .await
-    {
-        Ok(id) => Ok(created(id)),
+    // A carried create is warned of by the machine that carried it, which the person talks to.
+    let warning = if carried {
+        None
+    } else {
+        api.placements.warning(&api, me).await?
+    };
+    let (status, mut answer) =
+        create_here(&api, create.project, &create.base, &create.name).await?;
+    if let (Some(warning), Some(fields)) = (warning, answer.as_object_mut()) {
+        fields.insert("warning".to_owned(), warning.into());
+    }
+    Ok((status, Json(answer)).into_response())
+}
+
+/// Makes a workspace on this machine: `201 {id}`, with an `error` beside the id when its setup
+/// could not be started.
+async fn create_here(
+    api: &Api,
+    project: ProjectId,
+    base: &str,
+    name: &str,
+) -> Result<(StatusCode, serde_json::Value), ApiError> {
+    match api.workspaces.create(project, base, name).await {
+        Ok(id) => Ok((
+            StatusCode::CREATED,
+            serde_json::json!({ "id": id.to_string() }),
+        )),
         // The workspace exists, so the caller needs its id: a retry would only find the name
         // taken.
         Err(WorkspaceError::SetupNotStarted { workspace, source }) => {
@@ -644,12 +726,110 @@ async fn create_workspace(
             tracing::warn!("api: {message}");
             Ok((
                 StatusCode::CREATED,
-                Json(serde_json::json!({ "id": workspace.to_string(), "error": message })),
-            )
-                .into_response())
+                serde_json::json!({ "id": workspace.to_string(), "error": message }),
+            ))
         }
         Err(e) => Err(e.into()),
     }
+}
+
+/// A create with `"machine": "choose"`: made on the machine placement picks, or left waiting.
+async fn choose(api: &Api, create: Create) -> Result<Response, ApiError> {
+    let Some(model) = create.model.filter(|model| !model.trim().is_empty()) else {
+        return Err(unprocessable(
+            "a create with \"machine\": \"choose\" names the model of the session it starts \
+             when it is placed later"
+                .to_owned(),
+        ));
+    };
+    check_prompt(create.prompt.as_deref())?;
+    let settings = on_store(&api.store, |store| store.settings()).await?;
+    if !settings.projects.iter().any(|p| p.id == create.project) {
+        return Err(WorkspaceError::UnknownProject(create.project).into());
+    }
+    match api.placements.pick(api).await? {
+        Ok(machine) => {
+            let (status, mut answer) =
+                create_on(api, machine, create.project, &create.base, &create.name).await;
+            if let Some(fields) = answer.as_object_mut() {
+                fields.insert("machine".to_owned(), serde_json::json!(machine));
+            }
+            Ok((status, Json(answer)).into_response())
+        }
+        Err(reasons) => {
+            let want = Want {
+                project: create.project,
+                base: create.base,
+                name: create.name,
+                model,
+                prompt: create.prompt,
+            };
+            let request = api.placements.wait(want, reasons.clone());
+            Ok((
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({ "request": request, "reasons": reasons })),
+            )
+                .into_response())
+        }
+    }
+}
+
+/// Makes a workspace on `machine`: here, or carried there as a create naming it is. Gives the
+/// status and body answered.
+pub(crate) async fn create_on(
+    api: &Api,
+    machine: MachineId,
+    project: ProjectId,
+    base: &str,
+    name: &str,
+) -> (StatusCode, serde_json::Value) {
+    if machine == api.peers.me() {
+        return match create_here(api, project, base, name).await {
+            Ok(answer) => answer,
+            Err(e) => read(e.into_response()).await,
+        };
+    }
+    let body =
+        serde_json::json!({"project": project, "base": base, "name": name, "machine": machine});
+    read(carry::carried(api, machine, "/api/workspaces", &body).await).await
+}
+
+/// Starts a session with `model` and `prompt` in `machine`'s workspace `workspace`: here, or
+/// carried there. Gives the status and body answered.
+pub(crate) async fn start_on(
+    api: &Api,
+    machine: MachineId,
+    workspace: WorkspaceId,
+    model: &str,
+    prompt: Option<&str>,
+) -> (StatusCode, serde_json::Value) {
+    let start = Start {
+        model: model.to_owned(),
+        prompt: prompt.map(str::to_owned),
+    };
+    if machine == api.peers.me() {
+        let started =
+            start_session(State(api.clone()), Path(workspace.to_string()), Body(start)).await;
+        return read(started.into_response()).await;
+    }
+    let path = format!("/api/workspaces/{workspace}/sessions");
+    let body = match start.prompt {
+        Some(prompt) => serde_json::json!({"model": start.model, "prompt": prompt}),
+        None => serde_json::json!({"model": start.model}),
+    };
+    read(carry::carried(api, machine, &path, &body).await).await
+}
+
+/// A response's status and its body as JSON, `null` when it has none.
+async fn read(response: Response) -> (StatusCode, serde_json::Value) {
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap_or_default();
+    (
+        status,
+        serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
+    )
 }
 
 #[derive(Deserialize, Default)]
@@ -696,6 +876,18 @@ struct Start {
 /// The longest first prompt taken, in characters: a task, not a document.
 const MOST_PROMPT: usize = 20_000;
 
+/// Refuses a first prompt that is too long or holds a NUL.
+fn check_prompt(prompt: Option<&str>) -> Result<(), ApiError> {
+    match prompt {
+        Some(prompt) if prompt.contains('\0') || prompt.chars().count() > MOST_PROMPT => {
+            Err(unprocessable(format!(
+                "a first prompt is at most {MOST_PROMPT} characters, with no NUL"
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
 async fn start_session(
     State(api): State<Api>,
     Path(id): Path<String>,
@@ -705,14 +897,7 @@ async fn start_session(
         return Ok(error(StatusCode::SERVICE_UNAVAILABLE, said.clone()));
     }
     let id = parse_id(&id, "workspace", WorkspaceId)?;
-    if let Some(prompt) = &start.prompt
-        && (prompt.contains('\0') || prompt.chars().count() > MOST_PROMPT)
-    {
-        return Err(ApiError::Rejected(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            format!("a first prompt is at most {MOST_PROMPT} characters, with no NUL"),
-        ));
-    }
+    check_prompt(start.prompt.as_deref())?;
     let sessions = Arc::clone(&api.sessions);
     let session = api
         .workspaces

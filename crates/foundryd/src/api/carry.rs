@@ -13,6 +13,9 @@
 //! was sent may have run there, and is `504`. A request marked [`CARRIED`] arrived from another
 //! machine: it runs here, where a handler refuses anything this machine does not own, and is
 //! never carried on. Every other request, and one that names nothing elsewhere, runs here.
+//!
+//! A create carried to a machine over its limits is still made there, and its `201` gets the
+//! `warning` this machine gives of it, as a create made here does.
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Request, State};
@@ -61,6 +64,7 @@ pub(super) async fn carry(State(api): State<Api>, request: Request, next: Next) 
     let Some(target) = target(request.uri().path()) else {
         return next.run(request).await;
     };
+    let create = matches!(target, Target::Create);
     let (parts, body) = request.into_parts();
     let Ok(body) = axum::body::to_bytes(body, BODY_LIMIT).await else {
         return error(
@@ -77,13 +81,55 @@ pub(super) async fn carry(State(api): State<Api>, request: Request, next: Next) 
         .headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok());
+    let warning = if create {
+        match api.placements.warning(&api, owner).await {
+            Ok(warning) => warning,
+            Err(e) => return ApiError::from(e).into_response(),
+        }
+    } else {
+        None
+    };
     match api
         .peers
         .call(owner, parts.uri.path(), content_type, &body)
         .await
     {
+        Ok(answer) => answered(warned(answer, warning)),
+        Err(refused) => not_carried(&refused),
+    }
+}
+
+/// `POST`s `body` as JSON to `path` on machine `owner`, and gives its answer as the layer gives
+/// a call it carries.
+pub(super) async fn carried(
+    api: &Api,
+    owner: MachineId,
+    path: &str,
+    body: &serde_json::Value,
+) -> Response {
+    let body = body.to_string();
+    match api
+        .peers
+        .call(owner, path, Some("application/json"), body.as_bytes())
+        .await
+    {
         Ok(answer) => answered(answer),
         Err(refused) => not_carried(&refused),
+    }
+}
+
+/// `answer` with `warning` beside its fields, when it is a `201` with a JSON object.
+fn warned(answer: Answer, warning: Option<String>) -> Answer {
+    let Some(warning) = warning.filter(|_| answer.status == 201) else {
+        return answer;
+    };
+    let Ok(serde_json::Value::Object(mut fields)) = serde_json::from_slice(&answer.body) else {
+        return answer;
+    };
+    fields.insert("warning".to_owned(), warning.into());
+    Answer {
+        status: answer.status,
+        body: serde_json::Value::Object(fields).to_string().into(),
     }
 }
 

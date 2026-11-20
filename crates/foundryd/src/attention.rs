@@ -12,11 +12,12 @@
 //! | Session failed | a session failed and its terminal is not closed | its record and its terminal's |
 //! | Setup failed | a live workspace's setup terminal exited other than 0 and is not closed | the workspace's record and its terminal's |
 //! | Disk low | a machine's newest sample has less free disk than its limit | the sample and the limits |
+//! | Placement waiting | a request of this machine has waited over 5 minutes for a machine | [`crate::placement`] |
 //! | Setting overwritten | the shared settings hold an overwritten setting | the settings |
 //! | Update refused | a machine's newest sample names a refused tag | the sample |
 //! | Gateway unhealthy | this machine's read of the gateway fails | [`crate::gateway`] |
 //!
-//! Every row but the gateway's comes from the synced records and shared settings, so each
+//! Every row but the gateway's and placement's comes from the synced records and shared settings, so each
 //! machine shows the whole fleet's. Records are read as the rest of the UI sees them: an offline
 //! machine's sessions and terminals are unreachable, so they raise nothing while its "machine
 //! offline" item stands. Another module adds rows through a [`Source`].
@@ -59,6 +60,7 @@ pub enum Kind {
     SetupFailed,
     GatewayUnhealthy,
     DiskLow,
+    PlacementWaiting,
     SettingOverwritten,
     UpdateRefused,
 }
@@ -73,6 +75,7 @@ impl fmt::Display for Kind {
             Self::SetupFailed => "setup_failed",
             Self::GatewayUnhealthy => "gateway_unhealthy",
             Self::DiskLow => "disk_low",
+            Self::PlacementWaiting => "placement_waiting",
             Self::SettingOverwritten => "setting_overwritten",
             Self::UpdateRefused => "update_refused",
         })

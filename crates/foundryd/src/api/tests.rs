@@ -2553,7 +2553,9 @@ async fn choose_makes_the_workspace_on_a_machine_under_its_limits_and_answers_wh
     let json = reply.json();
     assert_eq!(json["machine"], serde_json::json!(daemon.me), "{json}");
     assert!(json.get("warning").is_none(), "{json}");
-    let made = daemon.workspace_named("chosen").expect("the workspace is made");
+    let made = daemon
+        .workspace_named("chosen")
+        .expect("the workspace is made");
     assert_eq!(json["id"], serde_json::json!(made.id));
     // The caller starts the session, as it does after any create.
     assert!(daemon.sessions_in(made.id).is_empty());
@@ -2589,7 +2591,10 @@ async fn choose_with_no_machine_qualifying_waits_with_a_reason_per_machine_and_i
     assert_eq!(requests[0]["id"], request.as_str());
     assert_eq!(requests[0]["name"], "queued");
     assert_eq!(requests[0]["reasons"], json["reasons"]);
-    assert!(requests[0]["waiting_since"].as_u64().is_some(), "{requests}");
+    assert!(
+        requests[0]["waiting_since"].as_u64().is_some(),
+        "{requests}"
+    );
 
     // This machine's next sample is under its limits.
     let qualified = tokio::time::Instant::now();
@@ -2650,19 +2655,20 @@ async fn a_named_machine_over_its_limits_is_used_and_the_answer_warns_of_each_li
     daemon.list_me("studio");
     daemon.limit(daemon.me, 2, 1.0);
     daemon.sample(daemon.me, 2, 1.5);
-    let body =
-        serde_json::json!({"project": project, "base": "main", "name": "anyway", "machine": daemon.me});
+    let body = serde_json::json!({"project": project, "base": "main", "name": "anyway", "machine": daemon.me});
     let reply = daemon.call("POST", "/api/workspaces", Some(body)).await;
     assert_eq!(reply.status, 201, "{}", reply.body);
-    let warning = reply.json()["warning"].as_str().expect("a warning").to_owned();
+    let warning = reply.json()["warning"]
+        .as_str()
+        .expect("a warning")
+        .to_owned();
     for limit in ["sessions 2 at limit 2", "load 1.5 over limit 1.0"] {
         assert!(warning.contains(limit), "{warning}");
     }
     assert!(daemon.workspace_named("anyway").is_some());
 
     daemon.sample(daemon.me, 0, 0.1);
-    let body =
-        serde_json::json!({"project": project, "base": "main", "name": "under", "machine": daemon.me});
+    let body = serde_json::json!({"project": project, "base": "main", "name": "under", "machine": daemon.me});
     let reply = daemon.call("POST", "/api/workspaces", Some(body)).await;
     assert_eq!(reply.status, 201, "{}", reply.body);
     assert!(reply.json().get("warning").is_none(), "{}", reply.body);
@@ -2679,7 +2685,9 @@ async fn only_choose_takes_a_model_and_choose_needs_one() {
         serde_json::json!({"project": project, "base": "main", "name": "c", "machine": "choose"}),
         serde_json::json!({"project": project, "base": "main", "name": "d", "machine": "choose", "model": MODEL, "prompt": "a\0b"}),
     ] {
-        let reply = daemon.call("POST", "/api/workspaces", Some(body.clone())).await;
+        let reply = daemon
+            .call("POST", "/api/workspaces", Some(body.clone()))
+            .await;
         assert_eq!(reply.status, 422, "{body}: {}", reply.body);
     }
     assert!(daemon.workspace_named("a").is_none());

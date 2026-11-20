@@ -27,6 +27,7 @@ use crate::attention::Attention;
 use crate::gateway;
 use crate::join::{self, JoinError, KeyedDialer, Keys};
 use crate::machine;
+use crate::placement;
 use crate::secrets::{self, GATEWAY, SecretsError};
 use crate::sessions::{self, Gateway, Sessions};
 use crate::store::{Store, StoreError};
@@ -275,8 +276,10 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
     ));
     let attention = Arc::new(
         Attention::new(me, store.clone(), peers.clone(), coordinator.clone())
-            .with_source(gateway_reader.clone()),
+            .with_source(gateway_reader.clone())
+            .with_source(api.placements.clone()),
     );
+    let placing = api.clone();
     let attention_routes = attention
         .router()
         .layer(middleware::from_fn_with_state(api.clone(), api::same_site));
@@ -307,22 +310,29 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
     services.spawn(named("the Tailscale address watch", tailscale.watch()));
     services.spawn(named("updates", update::run(home.clone())));
     services.spawn(named("gateway health", gateway_reader.run()));
+    services.spawn(named("placement", placement::run(placing.clone())));
 
-    tokio::select! {
-        _ = terminate.recv() => tracing::info!("SIGTERM: stopping; terminals keep running"),
-        _ = interrupt.recv() => tracing::info!("SIGINT: stopping; terminals keep running"),
-        ended = services.join_next() => {
-            return match ended {
-                Some(Ok(name)) => {
-                    tracing::error!("{name} stopped on its own");
-                    Err(DaemonError::Ended(name))
-                }
-                Some(Err(error)) => Err(error.into()),
-                None => Err(DaemonError::Ended("every service")),
-            };
+    let stopped = tokio::select! {
+        _ = terminate.recv() => {
+            tracing::info!("SIGTERM: stopping; terminals keep running");
+            Ok(())
         }
-    }
-    Ok(())
+        _ = interrupt.recv() => {
+            tracing::info!("SIGINT: stopping; terminals keep running");
+            Ok(())
+        }
+        ended = services.join_next() => match ended {
+            Some(Ok(name)) => {
+                tracing::error!("{name} stopped on its own");
+                Err(DaemonError::Ended(name))
+            }
+            Some(Err(error)) => Err(error.into()),
+            None => Err(DaemonError::Ended("every service")),
+        },
+    };
+    // The requests waiting for a machine live only in memory: a restart drops each, logged.
+    placing.placements.drop_all();
+    stopped
 }
 
 /// Runs `service` and names it once it ends, so the daemon can say which one stopped.
