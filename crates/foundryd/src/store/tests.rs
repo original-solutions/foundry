@@ -358,19 +358,20 @@ fn workspace_gives_one_workspace_by_its_id_deleted_or_not() {
 fn terminal_gives_one_terminal_by_its_id_deleted_or_not() {
     let (_dir, mut store) = open();
     let owner = MachineId::random();
-    let AnyRecord::Terminal(live) = terminal(owner, 1) else {
+    let AnyRecord::Terminal(live) = terminal(owner, 2) else {
         unreachable!()
     };
     let id = live.body.id;
     assert_eq!(store.terminal(id).unwrap(), None);
 
-    store.apply(&terminal(owner, 1), owner).unwrap();
-    // A workspace under the same id is another record.
-    let mut same_id = workspace(owner, 2);
+    // A workspace under the same id is another record. It goes in first, so a read that
+    // ignored the kind would find it before the terminal.
+    let mut same_id = workspace(owner, 1);
     if let AnyRecord::Workspace(r) = &mut same_id {
         r.body.id = WorkspaceId(id.0);
     }
     store.apply(&same_id, owner).unwrap();
+    store.apply(&terminal(owner, 2), owner).unwrap();
     insert_unreadable(&store, owner, 3, "printer", "{}");
     assert_eq!(store.terminal(id).unwrap(), Some(live.clone()));
 
@@ -384,6 +385,16 @@ fn terminal_gives_one_terminal_by_its_id_deleted_or_not() {
             .unwrap(),
         None
     );
+
+    // The one row this build cannot read is an error, not an absent terminal.
+    store
+        .conn
+        .execute(
+            "UPDATE records SET record = '{}' WHERE kind = 'terminal' AND id = ?1",
+            params![id.to_string()],
+        )
+        .unwrap();
+    assert!(matches!(store.terminal(id), Err(StoreError::Json(_))));
 }
 
 /// The terminals of one workspace are read without the owner's other records, deleted ones
