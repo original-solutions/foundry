@@ -10,8 +10,10 @@
 //! The key is read from the secret store once and kept. It is read again only while it is not
 //! set, so a key set with `foundryd secret set` counts from the next read, and after the
 //! gateway refuses it, when it is sent again once it has changed or after [`RETRY_REFUSED`]. A store that cannot read it (a denied keychain prompt, say) is not asked
-//! again until the daemon restarts, so it never prompts every few seconds. Neither the key nor a
-//! password in the URL reaches an item or a log line.
+//! again until the daemon restarts, so it never prompts every few seconds. A read of the key
+//! that has not ended within [`READ_EVERY`] (a keychain prompt nobody answers, say) raises the
+//! item until it ends, and no other read starts meanwhile. Neither the key nor a password in the
+//! URL reaches an item or a log line.
 
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -46,6 +48,10 @@ pub enum Health {
     Unanswered(String),
     /// It refused the management key: it answered 401.
     KeyRefused,
+    /// A read of the management key has not ended within [`READ_EVERY`]: a keychain prompt
+    /// nobody answers, say. The gateway's own answer is given up on sooner, after
+    /// [`ANSWER_WITHIN`].
+    KeyReadStuck,
     /// It answered with no account that is not disabled.
     NoAccounts,
     /// Every account that is not disabled is cooling down. `free_in` is how long until the
@@ -208,6 +214,10 @@ pub struct Reader {
     key: Mutex<Key>,
     /// [`RETRY_REFUSED`], shorter in tests.
     retry_refused: Duration,
+    /// [`READ_EVERY`], shorter in tests: how long a read runs before it counts as stuck.
+    read_within: Duration,
+    /// A read that had not ended when last waited on. The next wait is on it, not a new read.
+    pending: tokio::sync::Mutex<Option<tokio::task::JoinHandle<Health>>>,
     /// `None` until the first read ends.
     health: Mutex<Option<Health>>,
 }
@@ -220,6 +230,8 @@ impl Reader {
             secrets,
             key: Mutex::new(Key::Unread),
             retry_refused: RETRY_REFUSED,
+            read_within: READ_EVERY,
+            pending: tokio::sync::Mutex::new(None),
             health: Mutex::new(None),
         }
     }
@@ -232,16 +244,27 @@ impl Reader {
             .clone()
     }
 
-    /// Reads the gateway once, on the blocking pool, and keeps what it found.
+    /// Reads the gateway once, on the blocking pool, and keeps what it found. A read still
+    /// running after `read_within` is kept as [`Health::KeyReadStuck`] and waited on again by
+    /// the next call, which starts no read of its own until it ends.
     pub async fn read_once(self: &Arc<Self>) {
-        let reader = Arc::clone(self);
-        let health = tokio::task::spawn_blocking(move || reader.read_blocking()).await;
-        match health {
-            Ok(health) => {
-                *self.health.lock().unwrap_or_else(PoisonError::into_inner) = Some(health);
+        let mut pending = self.pending.lock().await;
+        let mut read = pending.take().unwrap_or_else(|| {
+            let reader = Arc::clone(self);
+            tokio::task::spawn_blocking(move || reader.read_blocking())
+        });
+        let health = match tokio::time::timeout(self.read_within, &mut read).await {
+            Ok(Ok(health)) => health,
+            Ok(Err(error)) => {
+                tracing::warn!("gateway: the read did not finish: {error}");
+                return;
             }
-            Err(error) => tracing::warn!("gateway: the read did not finish: {error}"),
-        }
+            Err(_) => {
+                *pending = Some(read);
+                Health::KeyReadStuck
+            }
+        };
+        *self.health.lock().unwrap_or_else(PoisonError::into_inner) = Some(health);
     }
 
     /// One read: the key as held, read from the store when it is not, then the gateway.
@@ -332,6 +355,14 @@ impl Source for Reader {
                     "Run `foundryd secret set {GATEWAY_MANAGEMENT}` with the right key; if the \
                      gateway was fixed to take this one, restart foundryd"
                 ),
+            ),
+            Some(Health::KeyReadStuck) => (
+                format!(
+                    "The gateway cannot be checked: reading the secret {GATEWAY_MANAGEMENT} has \
+                     not finished"
+                ),
+                "Look for a keychain prompt on this machine and answer it, or see the daemon log"
+                    .to_owned(),
             ),
             Some(Health::Unanswered(why)) => (
                 format!("The gateway at {} does not answer: {why}", self.shown_url()),
@@ -760,6 +791,84 @@ mod tests {
         reader.read_once().await;
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert_eq!(reader.health(), Some(Health::Healthy));
+    }
+
+    /// A secret store whose reads wait until `answered` is set, as a keychain prompt nobody
+    /// answers does.
+    struct Prompting {
+        inner: FileSecrets,
+        answered: std::sync::atomic::AtomicBool,
+        reads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Secrets for Prompting {
+        fn get(&self, name: &str) -> Result<Option<String>, SecretsError> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Bounded, so a failed test does not leave the runtime waiting on this thread.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !self.answered.load(std::sync::atomic::Ordering::SeqCst)
+                && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            self.inner.get(name)
+        }
+        fn set(&self, name: &str, value: &str) -> Result<(), SecretsError> {
+            self.inner.set(name, value)
+        }
+        fn update(&self, name: &str, edit: crate::secrets::Edit<'_>) -> Result<(), SecretsError> {
+            self.inner.update(name, edit)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_key_read_that_does_not_end_raises_the_item_and_starts_no_other_read() {
+        let home = tempfile::tempdir().unwrap();
+        let secrets = Arc::new(Prompting {
+            inner: FileSecrets::new(home.path().join("secrets.json")),
+            answered: Default::default(),
+            reads: Default::default(),
+        });
+        secrets.set(GATEWAY_MANAGEMENT, KEY).unwrap();
+        let url = gateway(serde_json::json!([account(serde_json::json!([]))])).await;
+        let mut reader = Reader::new(Some(url), secrets.clone());
+        reader.read_within = Duration::from_millis(200);
+        let reader = Arc::new(reader);
+        let machine = Machine::new(Some(KEY));
+
+        reader.read_once().await;
+        assert_eq!(reader.health(), Some(Health::KeyReadStuck));
+        let item = reader.items(&machine.fleet());
+        assert!(
+            one(&item).what.contains("has not finished"),
+            "{}",
+            item[0].what
+        );
+        assert!(item[0].todo.contains("keychain prompt"), "{}", item[0].todo);
+        // The next tick waits on the same read rather than starting another behind it, which
+        // would only queue on the key and hold a thread of the blocking pool.
+        assert!(
+            reader.pending.try_lock().unwrap().is_some(),
+            "the stuck read is kept"
+        );
+        reader.read_once().await;
+        assert_eq!(reader.health(), Some(Health::KeyReadStuck));
+        assert_eq!(secrets.reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Someone answers the prompt: that read ends and its health is kept.
+        secrets
+            .answered
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        reader.read_once().await;
+        assert_eq!(reader.health(), Some(Health::Healthy));
+        assert_eq!(secrets.reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(reader.pending.try_lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_gateway_answer_is_given_up_on_before_a_read_counts_as_stuck() {
+        // So a read still running after READ_EVERY is the key read, not the gateway.
+        assert!(ANSWER_WITHIN < READ_EVERY);
     }
 
     #[test]
