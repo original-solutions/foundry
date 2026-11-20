@@ -1,21 +1,206 @@
-//! Shared settings and their sequence number.
+//! Shared settings, their sequence number, and the stamps that say which edit set each one.
+//!
+//! A setting is one first-level entry: one machine, the priority order, one project, one
+//! machine's limits, or one "setting overwritten" item. Each is named by a [`SettingKey`]. The
+//! acting coordinator numbers every edit and stamps the setting it changed with a [`Stamp`];
+//! a removed setting keeps its stamp, so a merge does not bring it back.
 
 use std::collections::BTreeMap;
+use std::fmt;
+use std::str::FromStr;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::ids::{MachineId, ProjectId};
 
 /// Settings every machine shares, changed only through the acting coordinator.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SharedSettings {
-    /// The coordinator's sequence number for this edit. Higher wins.
+    /// The highest number this copy holds. A copy with a higher one replaces a held copy.
     pub seq: u64,
     pub machines: Vec<Machine>,
     /// Machines in the order they take the coordinator role, first first.
     pub priority: Vec<MachineId>,
     pub projects: Vec<Project>,
     pub limits: BTreeMap<MachineId, Limits>,
+    /// The edit that last set each setting, removed ones included. A setting with no stamp has
+    /// [`Stamp::NONE`].
+    #[serde(default)]
+    pub stamps: BTreeMap<SettingKey, Stamp>,
+    /// The highest number each coordinator gave an edit that this copy includes.
+    #[serde(default)]
+    pub seen: BTreeMap<MachineId, u64>,
+    /// "Setting overwritten" items, keyed by the setting two sides of a split both edited.
+    #[serde(default)]
+    pub overwritten: BTreeMap<SettingKey, Overwritten>,
+}
+
+/// One first-level setting. Written as text: `machine:<id>`, `priority`, `project:<id>`,
+/// `limits:<id>`, or `overwritten:<key>` for the item about another setting.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SettingKey {
+    Machine(MachineId),
+    Priority,
+    Project(ProjectId),
+    Limits(MachineId),
+    /// The "setting overwritten" item about a setting that is not itself one.
+    Overwritten(Box<SettingKey>),
+}
+
+impl SettingKey {
+    pub fn is_overwritten(&self) -> bool {
+        matches!(self, Self::Overwritten(_))
+    }
+}
+
+impl fmt::Display for SettingKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Machine(id) => write!(f, "machine:{id}"),
+            Self::Priority => f.write_str("priority"),
+            Self::Project(id) => write!(f, "project:{id}"),
+            Self::Limits(id) => write!(f, "limits:{id}"),
+            Self::Overwritten(key) => write!(f, "overwritten:{key}"),
+        }
+    }
+}
+
+impl FromStr for SettingKey {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let refused = || format!("`{text}` names no setting");
+        let id = |rest: &str| rest.parse::<uuid::Uuid>().map_err(|_| refused());
+        if text == "priority" {
+            return Ok(Self::Priority);
+        }
+        let (kind, rest) = text.split_once(':').ok_or_else(refused)?;
+        match kind {
+            "machine" => Ok(Self::Machine(MachineId(id(rest)?))),
+            "project" => Ok(Self::Project(ProjectId(id(rest)?))),
+            "limits" => Ok(Self::Limits(MachineId(id(rest)?))),
+            "overwritten" => match rest.parse::<Self>() {
+                Ok(inner) if !inner.is_overwritten() => Ok(Self::Overwritten(Box::new(inner))),
+                _ => Err(refused()),
+            },
+            _ => Err(refused()),
+        }
+    }
+}
+
+impl Serialize for SettingKey {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for SettingKey {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        String::deserialize(d)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// The edit that set a setting: the number the acting coordinator gave it, and that
+/// coordinator. Of two stamps the greater wins: the higher `seq`, then on an equal `seq` the
+/// lower `by`, so every machine picks the same one whatever order copies reach it in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Stamp {
+    pub seq: u64,
+    pub by: MachineId,
+}
+
+impl Stamp {
+    /// The stamp of a setting no numbered edit has set; every numbered edit beats it.
+    pub const NONE: Self = Self {
+        seq: 0,
+        by: MachineId(uuid::Uuid::nil()),
+    };
+}
+
+impl Default for Stamp {
+    fn default() -> Self {
+        Self::NONE
+    }
+}
+
+impl Ord for Stamp {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.seq
+            .cmp(&other.seq)
+            .then_with(|| other.by.cmp(&self.by))
+    }
+}
+
+impl PartialOrd for Stamp {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// The value of one setting that is not an overwritten item.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "setting", content = "value", rename_all = "snake_case")]
+pub enum SettingValue {
+    Machine(Machine),
+    Priority(Vec<MachineId>),
+    Project(Project),
+    Limits(Limits),
+}
+
+/// Two sides of a split both edited a setting: the value that holds and the one it replaced.
+/// `None` is a removed setting.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Overwritten {
+    pub kept: Option<SettingValue>,
+    pub lost: Option<SettingValue>,
+}
+
+/// A change to one setting, made through the acting coordinator.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Edit {
+    SetMachine { machine: Machine },
+    RemoveMachine { id: MachineId },
+    Priority { order: Vec<MachineId> },
+    SetProject { project: Project },
+    RemoveProject { id: ProjectId },
+    SetLimits { machine: MachineId, limits: Limits },
+    RemoveLimits { machine: MachineId },
+    /// Dismisses the "setting overwritten" item about `setting`.
+    Dismiss { setting: SettingKey },
+}
+
+impl Edit {
+    /// The setting this edit changes.
+    pub fn key(&self) -> SettingKey {
+        match self {
+            Self::SetMachine { machine } => SettingKey::Machine(machine.id),
+            Self::RemoveMachine { id } => SettingKey::Machine(*id),
+            Self::Priority { .. } => SettingKey::Priority,
+            Self::SetProject { project } => SettingKey::Project(project.id),
+            Self::RemoveProject { id } => SettingKey::Project(*id),
+            Self::SetLimits { machine, .. } | Self::RemoveLimits { machine } => {
+                SettingKey::Limits(*machine)
+            }
+            Self::Dismiss { setting } => SettingKey::Overwritten(Box::new(setting.clone())),
+        }
+    }
+
+    /// The value the setting holds after this edit, `None` when the edit removes it.
+    pub fn value(&self) -> Option<SettingValue> {
+        match self {
+            Self::SetMachine { machine } => Some(SettingValue::Machine(machine.clone())),
+            Self::Priority { order } => Some(SettingValue::Priority(order.clone())),
+            Self::SetProject { project } => Some(SettingValue::Project(project.clone())),
+            Self::SetLimits { limits, .. } => Some(SettingValue::Limits(limits.clone())),
+            Self::RemoveMachine { .. }
+            | Self::RemoveProject { .. }
+            | Self::RemoveLimits { .. }
+            | Self::Dismiss { .. } => None,
+        }
+    }
 }
 
 /// A machine in the fleet.

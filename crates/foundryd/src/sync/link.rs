@@ -273,6 +273,7 @@ async fn receive(inner: &Inner, peer: MachineId, text: &str) -> Result<(), Strin
         // Shared settings move only through the coordinator, which owns how they are sent. A
         // relay opens a link of its own and means nothing on a record link.
         Ok(PeerMessage::Settings { .. })
+        | Ok(PeerMessage::Edit { .. })
         | Ok(PeerMessage::Hello { .. })
         | Ok(PeerMessage::Relay { .. }) => return Ok(()),
         Err(error) => return Err(format!("a message from {peer} could not be read: {error}")),

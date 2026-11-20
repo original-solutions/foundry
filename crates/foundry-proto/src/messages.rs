@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::ids::{MachineId, TerminalId};
 use crate::record::AnyRecord;
-use crate::settings::SharedSettings;
+use crate::settings::{Edit, SharedSettings};
 
 /// The protocol number this build speaks.
 pub const PROTOCOL: u16 = 1;
@@ -38,6 +38,8 @@ pub enum PeerMessage {
         machine: MachineId,
         terminal: TerminalId,
     },
+    /// An edit to the shared settings, sent to the acting coordinator to number.
+    Edit { protocol: u16, edit: Edit },
 }
 
 impl PeerMessage {
@@ -46,7 +48,8 @@ impl PeerMessage {
             Self::Hello { protocol, .. }
             | Self::Records { protocol, .. }
             | Self::Settings { protocol, .. }
-            | Self::Relay { protocol, .. } => *protocol,
+            | Self::Relay { protocol, .. }
+            | Self::Edit { protocol, .. } => *protocol,
         }
     }
 }
@@ -85,7 +88,7 @@ mod tests {
     use super::*;
     use crate::record::tests::{machine_sample, session, terminal, workspace};
     use crate::settings::tests::settings;
-    use crate::settings::{Edit, SettingKey};
+    use crate::settings::SettingKey;
     use crate::{assert_round_trip, parse_error};
 
     fn records() -> Vec<AnyRecord> {
