@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { machineQuery, type Briefs, type Changes, type Shipping, type UiMessage } from "./api";
 import { router, routeTree } from "./App";
 import { button, pressed } from "./Modal";
+import { keep, KEEP_AFTER, recall } from "./memory";
 import { nextSteps } from "./next";
 import { ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
 import { FakeSocket, json, mockFetch, type Call } from "./test-utils";
@@ -204,6 +205,63 @@ describe("App", () => {
 
     expect(document.querySelector("[data-stale]")).toBeNull();
     expect(screen.getByRole("status").textContent).toContain("Back after");
+  });
+
+  async function before(path: string) {
+    const fresh = createRouter({ routeTree, history: createMemoryHistory({ initialEntries: [path] }) });
+    await fresh.load();
+    const client = new QueryClient();
+    client.setQueryData(machineQuery.queryKey, ME);
+    render(
+      <QueryClientProvider client={client}>
+        <RouterProvider router={fresh} />
+      </QueryClientProvider>,
+    );
+    return sockets("/api/events").at(-1)!;
+  }
+
+  it("paints the fleet this browser last saw at once, greyed, before the daemon answers, and goes live when it does", async () => {
+    mockActions();
+    keep({ records: live.records, settings: live.settings, synced: true }, Date.now() - 180_000);
+    const events = await before("/");
+
+    // Nothing has arrived yet, and the board and sidebar are already there, frozen.
+    expect(screen.getAllByText("fix login").length).toBeGreaterThan(0);
+    expect(screen.getByRole("button", { name: "New task" })).toBeDefined();
+    expect(document.querySelector("[data-stale]")).not.toBeNull();
+
+    act(() => events.open());
+    act(() => events.deliver(JSON.stringify({ ...live, records: [...live.records, workspace(ME, "w2", "add search")] })));
+
+    expect(document.querySelector("[data-stale]")).toBeNull();
+    expect(screen.getAllByText("add search").length).toBeGreaterThan(0);
+  });
+
+  it("with a remembered fleet and a daemon that does not answer, keeps it frozen under a line that says so, instead of the empty page", async () => {
+    mockActions();
+    keep({ records: live.records, settings: live.settings, synced: true }, Date.now() - 180_000);
+    const events = await before("/");
+
+    act(() => events.end(1006));
+
+    expect(screen.queryByRole("heading", { name: "Can't reach the daemon" })).toBeNull();
+    const line = screen.getByRole("status");
+    expect(line.textContent).toContain("Can't reach the daemon");
+    expect(line.textContent).toContain("last saw 3 min ago");
+    expect(screen.getAllByText("fix login").length).toBeGreaterThan(0);
+    expect(document.querySelector("[data-stale]")).not.toBeNull();
+  });
+
+  it("keeps the live fleet in this browser for the next load, never a frozen one", async () => {
+    mockActions();
+    await open("/", live);
+    await act(() => new Promise((resolve) => setTimeout(resolve, KEEP_AFTER + 50)));
+    expect(recall()?.records).toEqual(live.records);
+
+    localStorage.clear();
+    act(() => sockets("/api/events").at(-1)!.end(1006));
+    await act(() => new Promise((resolve) => setTimeout(resolve, KEEP_AFTER + 50)));
+    expect(recall()).toBeUndefined();
   });
 
   it("heads the open terminal with one bar: its workspace and machine, then its terminals as tabs, the open one with its state", async () => {

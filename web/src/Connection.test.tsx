@@ -57,6 +57,31 @@ describe("LinkBanner", () => {
     expect(retry).toHaveBeenCalled();
   });
 
+  it("over a remembered fleet, waits a second before saying it is still connecting, so a quick answer shows no line at all", () => {
+    render(<LinkBanner link={link()} remembered={T0 - 240_000} />);
+    expect(screen.queryByRole("status")).toBeNull();
+
+    act(() => vi.advanceTimersByTime(1_000));
+    const line = screen.getByRole("status");
+    expect(line.textContent).toContain("Connecting");
+    expect(line.textContent).toContain("last saw 4 min ago");
+    // Not trouble yet: no amber, and nothing to press.
+    expect(line.className).not.toMatch(/amber/);
+    expect(screen.queryByRole("button")).toBeNull();
+  });
+
+  it("over a remembered fleet the daemon has not answered, says it cannot be reached and offers to try now", () => {
+    const retry = vi.fn();
+    render(<LinkBanner link={link({ lostAt: T0 - 5_000, retryAt: T0 + 2_000, tries: 2, retry })} remembered={T0 - 240_000} />);
+
+    const line = screen.getByRole("status");
+    expect(line.textContent).toContain(`Can't reach the daemon at ${location.host}`);
+    expect(line.textContent).toContain("last saw 4 min ago");
+    expect(line.textContent).toContain("Retrying in 2 s");
+    fireEvent.click(screen.getByRole("button", { name: "Try now" }));
+    expect(retry).toHaveBeenCalled();
+  });
+
   it("says once that it is back and for how long it was gone, then goes", () => {
     const { rerender } = render(<LinkBanner link={link({ lostAt: T0, retryAt: T0 + 500, tries: 1 })} />);
     rerender(<LinkBanner link={link({ back: { after: 14_000, at: T0 + 14_000 } })} />);

@@ -178,11 +178,12 @@ body {
   }
 }
 
-/* The daemon's last word while the link to it is lost: greyed, and nothing moves as if it were live. */
+/* The daemon's last word while the link to it is lost, or the fleet this browser last saw before it answers:
+   greyed, and nothing moves as if it were live. The page eases in and out of it (App). A glyph's one pop
+   still finishes, or a glyph drawn while stale would stay frozen at its start, twice its size. */
 [data-stale] {
   filter: grayscale(1) opacity(0.7);
-  transition: filter 400ms ease-out;
 }
-[data-stale] * {
+[data-stale] *:not([data-glyph]) {
   animation-play-state: paused !important;
 }

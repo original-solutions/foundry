@@ -28,6 +28,7 @@ import { Away } from "./Away";
 import { Toasts } from "./Toasts";
 import { Rail } from "./Rail";
 import { loadRail, saveRail } from "./collapsed";
+import { useMemory } from "./memory";
 
 /**
  * The sidebar, and the terminal the URL names (`/terminals/$terminalId`) under its header filling
@@ -93,13 +94,19 @@ import { loadRail, saveRail } from "./collapsed";
  * keyboard; pressing in the other side moves it there, and a terminal opened from anywhere takes
  * the side that has it. On a narrow screen only that side shows.
  *
- * Until the daemon has sent its state once, a failed try fills the page with where it looked and
- * when it tries next, never an empty fleet. Once it has, a lost link greys everything and stills
- * the working glyphs under a line that says since when, until the daemon sends again; then a line
- * says, once, that it is back.
+ * A load paints at once the fleet this browser last saw, greyed with its working glyphs still,
+ * and it comes alive when the daemon sends its state; a line says it is connecting only after a
+ * second, and, if a try fails, that the daemon cannot be reached. With nothing remembered, a failed
+ * try fills the page with where it looked and when it tries next, never an empty fleet. Once the
+ * daemon has sent, a lost link greys everything and stills the working glyphs under a line that
+ * says since when, until the daemon sends again; then a line says, once, that it is back.
  */
 function Layout() {
-  const { state, connected, samples, link } = useFleet();
+  const { state: sent, connected, samples, link } = useFleet();
+  // Until the daemon's first state, the fleet this browser last saw stands in for it, frozen.
+  const memory = useMemory(sent, link.lostAt === undefined);
+  const remembering = !sent.synced && memory !== undefined;
+  const state = remembering ? { records: memory.records, settings: memory.settings, synced: true } : sent;
   const { terminalId } = useParams({ strict: false });
   const onMachines = useRouterState({ select: (s) => s.location.pathname === "/machines" });
   const briefs = useBriefs(state.records);
@@ -185,7 +192,8 @@ function Layout() {
     machines.flatMap((m) => m.workspaces.flatMap((w) => rows(w).flatMap((t) => (seen[t.terminal] !== undefined && seen[t.terminal] !== t.label ? [t.terminal] : [])))),
   );
   const show = (id: string) => void navigate({ to: "/terminals/$terminalId", params: { terminalId: id } });
-  const { spoken, news, ...notify } = useAlerts(machines, state.synced, show);
+  // News is told from the daemon's own states only, never from the change between the remembered fleet and them.
+  const { spoken, news, ...notify } = useAlerts(machines, sent.synced, show);
   /** The sessions the catch-up card lists, whose news it already shows. */
   const [caughtUp, setCaughtUp] = useState<string[]>([]);
   /** Whether the list of keys is open. */
@@ -237,7 +245,7 @@ function Layout() {
 
   // Never had the daemon's state: say so, rather than show an empty fleet.
   if (!state.synced && link.lostAt !== undefined) return <Unreachable link={link} />;
-  const stale = link.lostAt !== undefined;
+  const stale = link.lostAt !== undefined || remembering;
   const workspaces = machines.flatMap((m) => m.workspaces);
   // A fleet with no workspaces opens on the first-run page, kept while its create is under way or
   // its workspace was made but its session failed, so what happened stays on screen.
@@ -270,8 +278,8 @@ function Layout() {
       }}
     >
       <div className="flex h-dvh flex-col overflow-hidden bg-neutral-950 text-neutral-100">
-        <LinkBanner link={link} />
-        <div data-stale={stale || undefined} className="relative flex min-h-0 flex-1">
+        <LinkBanner link={link} remembered={remembering ? memory.at : undefined} />
+        <div data-stale={stale || undefined} className="relative flex min-h-0 flex-1 transition-[filter] duration-500 ease-out">
           {rail && (
             <div className="hidden shrink-0 md:flex">
               <Rail machines={machines} selected={terminalId} onExpand={flipRail} onJump={openJump} onCreate={() => openCreate()} alerts={<NotifyButton {...notify} />} />
@@ -390,7 +398,7 @@ function Layout() {
         <Announcer spoken={spoken} />
         {/* One place on screen for news: the catch-up first, then the cards. */}
         <div className="pointer-events-none fixed inset-x-2 top-2 z-40 flex flex-col gap-2 md:inset-x-auto md:top-14 md:right-4 md:w-[24rem]">
-          {notify.notify.away && <Away records={state.records} synced={state.synced} machines={machines} traced={traced} onOpen={show} onShown={setCaughtUp} />}
+          {notify.notify.away && <Away records={sent.records} synced={sent.synced} machines={machines} traced={traced} onOpen={show} onShown={setCaughtUp} />}
           <Toasts news={news} machines={machines} here={here} onScreen={pair ? [pair.left, pair.right] : terminalId ? [terminalId] : []} covered={notify.notify.away ? caughtUp : []} onOpen={show} />
         </div>
         {sessionIn && <NewSession key={sessionIn.id} workspace={sessionIn.id} name={sessionIn.name} onClose={() => setSessionIn(undefined)} onStarted={setLanding} />}
