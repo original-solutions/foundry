@@ -2,7 +2,7 @@
 //! back, starts every long-running module and stops on SIGTERM or SIGINT. The holders are
 //! sessions of their own, so a stopped daemon leaves every terminal's child running.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::future::Future;
@@ -22,7 +22,7 @@ use axum::response::IntoResponse;
 use nix::errno::Errno;
 use nix::fcntl::{Flock, FlockArg};
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::task::JoinSet;
+use tokio::task::{AbortHandle, JoinSet};
 use tracing_subscriber::EnvFilter;
 
 use crate::api::{self, Api, BindError};
@@ -443,6 +443,18 @@ fn new_addresses(
         .collect()
 }
 
+/// The `served` addresses whose IP Tailscale no longer reports: it logged out or moved to
+/// another tailnet. An interface may still carry one, and another VPN can hand it out next.
+fn withdrawn(
+    reported: &BTreeSet<IpAddr>,
+    served: impl IntoIterator<Item = SocketAddr>,
+) -> Vec<SocketAddr> {
+    served
+        .into_iter()
+        .filter(|addr| !reported.contains(&addr.ip()))
+        .collect()
+}
+
 /// The Tailscale CLI, by [`choose_cli`]. In a debug build `FOUNDRY_TAILSCALE` names it, which
 /// is how tests keep the daemon away from the real one. A release build ignores it, so what
 /// the daemon listens on always comes from Tailscale itself.
@@ -534,12 +546,13 @@ async fn ask_cli(cli: &Path, within: Duration) -> Result<BTreeSet<IpAddr>, Strin
 const RESCAN: Duration = Duration::from_secs(5);
 
 /// Serves the app on every address Tailscale reports for this machine, now and as they
-/// appear: the daemon can start before Tailscale does.
+/// appear, and stops serving one it no longer reports: the daemon can start before Tailscale
+/// does, and Tailscale can log out or move to another tailnet while it runs.
 struct Tailscale {
     port: u16,
     app: Router,
-    /// The Tailscale addresses being served.
-    served: BTreeSet<SocketAddr>,
+    /// The Tailscale addresses being served, each with its server's task.
+    served: BTreeMap<SocketAddr, AbortHandle>,
     /// The addresses that failed to bind, so each is warned about once.
     failed: BTreeSet<SocketAddr>,
     /// Whether the last ask of Tailscale failed, so a failure is warned about once until it
@@ -553,16 +566,18 @@ impl Tailscale {
         Self {
             port,
             app,
-            served: BTreeSet::new(),
+            served: BTreeMap::new(),
             failed: BTreeSet::new(),
             unanswered: false,
             servers: JoinSet::new(),
         }
     }
 
-    /// Binds each address in Tailscale's answer, `reported`, not served yet. A server that
-    /// ended is served again. `first` says this is the start, when having none is worth a
-    /// warning.
+    /// Binds each address in Tailscale's answer, `reported`, not served yet, and stops the
+    /// server on each served address the answer leaves out, so it takes no new connection; one
+    /// already open is not cut. A server that ended is served again. When Tailscale cannot be
+    /// asked, nothing is bound or stopped. `first` says this is the start, when having none is
+    /// worth a warning.
     async fn scan(&mut self, first: bool, reported: Result<BTreeSet<IpAddr>, String>) {
         while let Some(ended) = self.servers.try_join_next() {
             if let Ok(addr) = ended {
@@ -584,18 +599,25 @@ impl Tailscale {
                 return;
             }
         };
+        for addr in withdrawn(&reported, self.served.keys().copied()) {
+            if let Some(server) = self.served.remove(&addr) {
+                server.abort();
+                tracing::info!("stopped listening on {addr}: Tailscale no longer reports it");
+            }
+        }
         let found = interface_addresses();
-        for addr in new_addresses(self.port, reported, &found, &self.served) {
+        let served = self.served.keys().copied().collect();
+        for addr in new_addresses(self.port, reported, &found, &served) {
             match api::bind(addr).await {
                 Ok(listener) => {
                     tracing::info!("listening on {addr}");
-                    self.served.insert(addr);
                     self.failed.remove(&addr);
                     let app = self.app.clone();
-                    self.servers.spawn(async move {
+                    let server = self.servers.spawn(async move {
                         serve_on(listener, app).await;
                         addr
                     });
+                    self.served.insert(addr, server);
                 }
                 Err(error) => {
                     if self.failed.insert(addr) {
@@ -925,6 +947,44 @@ mod tests {
 
         served.extend(later);
         assert!(new_addresses(7433, [ip("100.64.0.9")], &found, &served).is_empty());
+    }
+
+    /// Tailscale logged out or moved to another tailnet: an address it no longer reports is
+    /// withdrawn, though an interface may still carry it, and one it still reports stays.
+    #[test]
+    fn a_served_address_tailscale_no_longer_reports_is_withdrawn() {
+        let served = [addr("100.101.102.103:7433"), addr("100.64.0.9:7433")];
+
+        assert_eq!(
+            withdrawn(&ips(["100.64.0.9"]), served),
+            vec![addr("100.101.102.103:7433")]
+        );
+        assert!(withdrawn(&ips(["100.101.102.103", "100.64.0.9"]), served).is_empty());
+    }
+
+    /// A server for an address Tailscale stops reporting is stopped, so nothing listens there
+    /// if the address turns up again on another VPN. When Tailscale cannot be asked, nothing is
+    /// stopped: a failed ask says nothing about which addresses are this machine's.
+    #[tokio::test]
+    async fn the_server_on_an_address_tailscale_no_longer_reports_is_stopped() {
+        let mut tailscale = Tailscale::new(7433, Router::new());
+        let gone = addr("100.101.102.103:7433");
+        let handle = tailscale.servers.spawn(async move {
+            std::future::pending::<()>().await;
+            gone
+        });
+        tailscale.served.insert(gone, handle);
+
+        tailscale.scan(false, Err("logged out".to_owned())).await;
+        assert!(tailscale.served.contains_key(&gone));
+
+        tailscale.scan(false, Ok(BTreeSet::new())).await;
+        assert!(tailscale.served.is_empty());
+        let ended = tokio::time::timeout(Duration::from_secs(5), tailscale.servers.join_next())
+            .await
+            .expect("the server was not stopped")
+            .unwrap();
+        assert!(ended.unwrap_err().is_cancelled());
     }
 
     /// Everything the daemon logs while it is set, as plain text.
