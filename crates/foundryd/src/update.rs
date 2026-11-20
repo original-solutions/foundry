@@ -5,15 +5,16 @@
 //! a trial: the daemon that starts from it counts its starts, and `update::run` calls it
 //! healthy once it has run for a minute. A trial that starts three times without becoming
 //! healthy is put back to the previous version and its tag is refused until a higher one
-//! appears.
+//! appears. Only a daemon that runs from `<home>/current` takes part in any of this.
 
 use std::fs::{self, OpenOptions};
 use std::future::pending;
 use std::io::{self, Write as _};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::Duration;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use nix::sys::signal::{Signal, raise};
 use serde::{Deserialize, Serialize};
@@ -24,6 +25,10 @@ const REPO: &str = "original-solutions/foundry";
 /// How long the daemon must have run to count as healthy.
 const HEALTHY_AFTER: Duration = Duration::from_secs(60);
 
+/// How long a trial may take to become healthy before the process gives up and exits, so a
+/// start that hangs (on a keychain prompt, say) counts as a failed start.
+const TRIAL_DEADLINE: Duration = Duration::from_secs(300);
+
 /// How long to wait between two looks for a newer tag.
 const CHECK_EVERY: Duration = Duration::from_secs(600);
 
@@ -33,6 +38,21 @@ const MAX_STARTS: u32 = 3;
 /// The binaries a release holds, at the top level of its archive.
 const BINARIES: [&str; 2] = ["foundryd", "foundry-holder"];
 
+/// How long `gh release list` may take.
+const LIST_LIMIT: Duration = Duration::from_secs(60);
+
+/// How long `gh release download` may take.
+const DOWNLOAD_LIMIT: Duration = Duration::from_secs(600);
+
+/// How long `tar` may take.
+const TAR_LIMIT: Duration = Duration::from_secs(120);
+
+/// How long a new `foundryd --version` may take.
+const VERSION_LIMIT: Duration = Duration::from_secs(10);
+
+/// Set once this daemon has run long enough to be healthy; the watchdog reads it.
+static HEALTHY: AtomicBool = AtomicBool::new(false);
+
 /// Why a tag could not be installed. None of these ever holds a secret.
 #[derive(Debug, thiserror::Error)]
 pub enum UpdateError {
@@ -40,7 +60,7 @@ pub enum UpdateError {
     #[error("{0}")]
     Fetch(String),
     /// The release does not hold one of the two binaries.
-    #[error("the release has no {0}")]
+    #[error("{0} is missing: a release holds foundryd and foundry-holder")]
     Missing(&'static str),
     /// The new binary does not say it is the version of the tag.
     #[error("{tag} is refused: its foundryd printed {printed:?}, not \"foundryd {version}\"")]
@@ -63,6 +83,90 @@ fn io_error(what: impl Into<String>) -> impl FnOnce(io::Error) -> UpdateError {
     move |source| UpdateError::Io { what, source }
 }
 
+/// Why a child process did not give a result.
+#[derive(Debug, thiserror::Error)]
+pub enum RunError {
+    /// It could not be started.
+    #[error("cannot run {name}: {source}")]
+    Spawn { name: String, source: io::Error },
+    /// It ran past its deadline and was killed.
+    #[error("{name} timed out after {secs} s")]
+    TimedOut { name: String, secs: u64 },
+    /// It exited non-zero. `stderr` is what it said, trimmed.
+    #[error("{name} failed: {stderr}")]
+    Failed { name: String, stderr: String },
+}
+
+/// The program and its first two arguments, to say which command went wrong.
+fn command_name(command: &Command) -> String {
+    let program = Path::new(command.get_program())
+        .file_name()
+        .unwrap_or(command.get_program())
+        .to_string_lossy()
+        .into_owned();
+    command.get_args().take(2).fold(program, |name, arg| {
+        format!("{name} {}", arg.to_string_lossy())
+    })
+}
+
+/// Reads a child's pipe to its end on a thread of its own, so a full pipe never blocks it.
+fn drain(pipe: Option<impl std::io::Read + Send + 'static>) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_end(&mut bytes);
+        }
+        bytes
+    })
+}
+
+/// Runs `command` and returns its stdout. It is killed and reaped when it outlives `limit`.
+/// Every child process of the daemon and of `install` goes through here.
+pub(crate) fn run_bounded(command: &mut Command, limit: Duration) -> Result<String, RunError> {
+    let name = command_name(command);
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|source| RunError::Spawn {
+            name: name.clone(),
+            source,
+        })?;
+    let out = drain(child.stdout.take());
+    let err = drain(child.stderr.take());
+    let end = Instant::now() + limit;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < end => std::thread::sleep(Duration::from_millis(20)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                // The readers are left to end by themselves: a grandchild may hold the pipes.
+                return Err(RunError::TimedOut {
+                    name,
+                    secs: limit.as_secs(),
+                });
+            }
+            Err(source) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(RunError::Spawn { name, source });
+            }
+        }
+    };
+    let stdout = out.join().unwrap_or_default();
+    let stderr = err.join().unwrap_or_default();
+    if status.success() {
+        return Ok(String::from_utf8_lossy(&stdout).into_owned());
+    }
+    Err(RunError::Failed {
+        name,
+        stderr: String::from_utf8_lossy(&stderr).trim().to_string(),
+    })
+}
+
 /// A version that was installed and has not yet shown it stays up.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Trial {
@@ -80,7 +184,7 @@ pub struct State {
     /// The version on trial, if any.
     #[serde(default)]
     pub trial: Option<Trial>,
-    /// A tag that was rolled back, like `v0.2.0`. It is skipped while it is the highest.
+    /// A tag that was refused, like `v0.2.0`. It is skipped while it is the highest.
     #[serde(default)]
     pub refused: Option<String>,
 }
@@ -119,6 +223,13 @@ pub fn point_current(home: &Path, version: &str) -> io::Result<()> {
     }
     symlink(Path::new("versions").join(version), &next)?;
     fs::rename(next, home.join("current"))
+}
+
+/// The version `current` points at, if it points at one.
+pub fn current_version(home: &Path) -> Option<String> {
+    let target = fs::read_link(home.join("current")).ok()?;
+    let version = target.strip_prefix("versions").ok()?;
+    Some(version.to_str()?.to_string())
 }
 
 /// Reads `X.Y.Z` as three numbers. Any other shape is not a version.
@@ -167,25 +278,74 @@ fn start_with(home: &Path, running: &str) -> io::Result<Start> {
             format!("cannot roll back: versions/{previous} is missing"),
         ));
     }
+    // Three steps, each safe to stop after: the refusal is saved with the trial still at its
+    // cap, `current` moves, and only then is the trial cleared. A failure or a crash in
+    // between leaves a trial at the cap, so the next start rolls back again.
     state.refused = Some(format!("v{running}"));
-    state.trial = None;
-    // The state first: a crash between the two leaves the refusal recorded and the trial
-    // started once more, which rolls back again.
     save(home, &state)?;
     point_current(home, &previous)?;
+    state.trial = None;
+    save(home, &state)?;
     Ok(Start::RolledBack { to: previous })
+}
+
+/// True when this process runs from `<home>/current`, the only place that is updated: that
+/// link names `running`, and `exe` is the file the link reaches.
+fn from_current(home: &Path, exe: &Path, running: &str) -> bool {
+    if current_version(home).as_deref() != Some(running) {
+        return false;
+    }
+    match (
+        fs::canonicalize(exe),
+        fs::canonicalize(home.join("current/foundryd")),
+    ) {
+        (Ok(exe), Ok(current)) => exe == current,
+        _ => false,
+    }
+}
+
+/// Waits for `healthy` to be set, looking every `poll`. False once `deadline` has passed.
+fn watch(healthy: &AtomicBool, deadline: Duration, poll: Duration) -> bool {
+    let end = Instant::now() + deadline;
+    while !healthy.load(Ordering::Relaxed) {
+        if Instant::now() >= end {
+            return false;
+        }
+        std::thread::sleep(poll);
+    }
+    true
 }
 
 /// Called by `foundryd run` before it does anything else. False means this version was
 /// rolled back and the process must exit with success so the service starts the previous one.
+/// A start that goes on while a trial of this version is on gets a watchdog: if the daemon is
+/// not healthy by [`TRIAL_DEADLINE`] the process exits, so a hang counts as a failed start.
 pub fn starting(home: &Path) -> bool {
-    match start_with(home, env!("CARGO_PKG_VERSION")) {
-        Ok(Start::Run) => true,
+    let running = env!("CARGO_PKG_VERSION");
+    let from_current = std::env::current_exe()
+        .map(|exe| from_current(home, &exe, running))
+        .unwrap_or(false);
+    if !from_current {
+        return true;
+    }
+    match start_with(home, running) {
+        Ok(Start::Run) => {
+            if state(home).is_ok_and(|s| s.trial.is_some_and(|t| t.version == running)) {
+                std::thread::spawn(|| {
+                    if !watch(&HEALTHY, TRIAL_DEADLINE, Duration::from_secs(1)) {
+                        tracing::error!(
+                            "not healthy after {} s: exiting so this start counts as failed",
+                            TRIAL_DEADLINE.as_secs()
+                        );
+                        std::process::exit(1);
+                    }
+                });
+            }
+            true
+        }
         Ok(Start::RolledBack { to }) => {
             tracing::error!(
-                "version {} did not become healthy in {MAX_STARTS} starts: back to {to}, and v{} is refused until a higher tag appears",
-                env!("CARGO_PKG_VERSION"),
-                env!("CARGO_PKG_VERSION"),
+                "version {running} did not become healthy in {MAX_STARTS} starts: back to {to}, and v{running} is refused until a higher tag appears"
             );
             false
         }
@@ -210,6 +370,24 @@ fn mark_healthy(home: &Path, running: &str) {
     }
 }
 
+/// Records a hand install of `version` over `before` (the version `current` named). It ends
+/// any trial, and when `version` is lower it refuses `v<before>` as an automatic rollback
+/// does, so the updater does not undo the install until a higher tag ships.
+pub fn placed_by_hand(home: &Path, version: &str, before: Option<&str>) -> io::Result<()> {
+    let mut state = state(home)?;
+    state.trial = None;
+    if let Some(before) = before.filter(|b| parse(b) > parse(version) && parse(b).is_some()) {
+        let held = state
+            .refused
+            .as_deref()
+            .and_then(|r| parse(r.strip_prefix('v')?));
+        if held.is_none_or(|held| held < parse(before).unwrap_or_default()) {
+            state.refused = Some(format!("v{before}"));
+        }
+    }
+    save(home, &state)
+}
+
 /// The tag to install: the highest valid one, if it is above `running` and is not the
 /// refused one. A tag above the refused one is picked.
 fn pick(tags: &[String], running: &str, refused: Option<&str>) -> Option<String> {
@@ -221,15 +399,64 @@ fn pick(tags: &[String], running: &str, refused: Option<&str>) -> Option<String>
     (beyond && refused != Some(top.as_str())).then(|| top.clone())
 }
 
-/// True when this process runs from `<home>/current`, the only place that is updated.
-fn installed(home: &Path, running: &str) -> bool {
-    fs::read_link(home.join("current"))
-        .is_ok_and(|target| target == Path::new("versions").join(running))
+/// Makes `versions/<version>` from a fresh stage directory: `fill` puts the files in it,
+/// both binaries must be there and are made executable, then `record` runs, the stage is
+/// swapped in and `current` is pointed at it. `record` runs before `current` moves, so a
+/// crash in between never leaves a version running that nothing recorded.
+pub(crate) fn place_version(
+    home: &Path,
+    version: &str,
+    fill: impl FnOnce(&Path) -> Result<(), UpdateError>,
+    record: impl FnOnce() -> io::Result<()>,
+) -> Result<(), UpdateError> {
+    let versions = home.join("versions");
+    let stage = versions.join(format!(".staging-{version}"));
+    let result = fill_and_swap(home, &versions, &stage, version, fill, record);
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&stage);
+    }
+    result
+}
+
+/// Checks that `stage` holds both binaries and makes them executable.
+fn make_executable(stage: &Path) -> Result<(), UpdateError> {
+    for name in BINARIES {
+        let path = stage.join(name);
+        if !path.is_file() {
+            return Err(UpdateError::Missing(name));
+        }
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+            .map_err(io_error(format!("cannot make {name} executable")))?;
+    }
+    Ok(())
+}
+
+fn fill_and_swap(
+    home: &Path,
+    versions: &Path,
+    stage: &Path,
+    version: &str,
+    fill: impl FnOnce(&Path) -> Result<(), UpdateError>,
+    record: impl FnOnce() -> io::Result<()>,
+) -> Result<(), UpdateError> {
+    let _ = fs::remove_dir_all(stage);
+    fs::create_dir_all(stage).map_err(io_error("cannot make the staging directory"))?;
+    fill(stage)?;
+    make_executable(stage)?;
+    let target = versions.join(version);
+    match fs::remove_dir_all(&target) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(io_error("cannot clear the old copy")(error)),
+    }
+    fs::rename(stage, &target).map_err(io_error("cannot move the new version into place"))?;
+    record().map_err(io_error("cannot save the update state"))?;
+    point_current(home, version).map_err(io_error("cannot point current at the new version"))
 }
 
 /// Installs `tag`: `fetch` puts the release's files in a fresh stage directory, the binaries
-/// are checked, the stage becomes `versions/<version>`, the trial is recorded and then
-/// `current` is pointed at it.
+/// are checked and the new `foundryd` must say it is this version, then the version is placed
+/// as a trial.
 fn install_tag(
     home: &Path,
     tag: &str,
@@ -240,99 +467,61 @@ fn install_tag(
         .strip_prefix('v')
         .filter(|version| parse(version).is_some())
         .ok_or_else(|| UpdateError::BadTag(tag.to_string()))?;
-    let versions = home.join("versions");
-    let stage = versions.join(format!(".staging-{version}"));
-    let result = stage_and_swap(home, &versions, &stage, tag, version, running, fetch);
-    if result.is_err() {
-        let _ = fs::remove_dir_all(&stage);
-    }
-    result
-}
-
-fn stage_and_swap(
-    home: &Path,
-    versions: &Path,
-    stage: &Path,
-    tag: &str,
-    version: &str,
-    running: &str,
-    fetch: impl FnOnce(&str, &Path) -> Result<(), UpdateError>,
-) -> Result<(), UpdateError> {
-    let _ = fs::remove_dir_all(stage);
-    fs::create_dir_all(stage).map_err(io_error("cannot make the staging directory"))?;
-    fetch(tag, stage)?;
-    for name in BINARIES {
-        let path = stage.join(name);
-        if !path.is_file() {
-            return Err(UpdateError::Missing(name));
-        }
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
-            .map_err(io_error(format!("cannot make {name} executable")))?;
-    }
-    let out = Command::new(stage.join("foundryd"))
-        .arg("--version")
-        .output()
-        .map_err(io_error("cannot run the new foundryd"))?;
-    let printed = String::from_utf8_lossy(&out.stdout);
-    if !out.status.success() || printed != format!("foundryd {version}\n") {
-        return Err(UpdateError::WrongVersion {
+    let fill = |stage: &Path| {
+        fetch(tag, stage)?;
+        make_executable(stage)?;
+        let wrong = |printed: String| UpdateError::WrongVersion {
             tag: tag.to_string(),
             version: version.to_string(),
-            printed: printed.trim().to_string(),
-        });
-    }
-    let target = versions.join(version);
-    match fs::remove_dir_all(&target) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(io_error("cannot clear the old copy")(error)),
-    }
-    fs::rename(stage, &target).map_err(io_error("cannot move the new version into place"))?;
-    let state = State {
-        trial: Some(Trial {
-            version: version.to_string(),
-            previous: running.to_string(),
-            starts: 0,
-        }),
-        refused: None,
+            printed,
+        };
+        let printed = run_bounded(
+            Command::new(stage.join("foundryd")).arg("--version"),
+            VERSION_LIMIT,
+        )
+        .map_err(|error| wrong(error.to_string()))?;
+        if printed != format!("foundryd {version}\n") {
+            return Err(wrong(printed.trim().to_string()));
+        }
+        Ok(())
     };
-    // The trial is written before `current` moves, so a crash between the two never leaves
-    // an uncounted trial running.
-    save(home, &state).map_err(io_error("cannot save the update state"))?;
-    point_current(home, version).map_err(io_error("cannot point current at the new version"))
-}
-
-/// Runs a command and returns its stdout, or what it said on stderr, trimmed.
-fn capture(command: &mut Command) -> Result<String, UpdateError> {
-    let out = command.output().map_err(|error| {
-        UpdateError::Fetch(format!("cannot run {:?}: {error}", command.get_program()))
-    })?;
-    if out.status.success() {
-        return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
-    }
-    Err(UpdateError::Fetch(format!(
-        "{:?} failed: {}",
-        command.get_program(),
-        String::from_utf8_lossy(&out.stderr).trim()
-    )))
+    let record = || {
+        // A trial of the new version, and no refusal: this tag is the highest there is.
+        save(
+            home,
+            &State {
+                trial: Some(Trial {
+                    version: version.to_string(),
+                    previous: running.to_string(),
+                    starts: 0,
+                }),
+                refused: None,
+            },
+        )
+    };
+    place_version(home, version, fill, record)
 }
 
 /// The release tags on GitHub, read with the machine's own `gh` login.
 fn list_tags() -> Result<Vec<String>, UpdateError> {
-    let out = capture(Command::new("gh").args([
-        "release",
-        "list",
-        "--repo",
-        REPO,
-        "--exclude-drafts",
-        "--exclude-pre-releases",
-        "--limit",
-        "100",
-        "--json",
-        "tagName",
-        "--jq",
-        ".[].tagName",
-    ]))?;
+    let out = run_bounded(
+        Command::new("gh").args([
+            "release",
+            "list",
+            "--repo",
+            REPO,
+            "--exclude-drafts",
+            "--exclude-pre-releases",
+            "--limit",
+            "100",
+            "--json",
+            "tagName",
+            "--jq",
+            ".[].tagName",
+        ]),
+        LIST_LIMIT,
+    )
+    .map_err(|error| UpdateError::Fetch(error.to_string()))?;
     Ok(out.lines().map(|line| line.trim().to_string()).collect())
 }
 
@@ -348,36 +537,58 @@ fn asset() -> String {
 /// Downloads this machine's asset of `tag` into `stage` and unpacks it there.
 fn download(tag: &str, stage: &Path) -> Result<(), UpdateError> {
     let asset = asset();
-    capture(
+    run_bounded(
         Command::new("gh")
             .args(["release", "download", tag, "--repo", REPO, "--pattern"])
             .arg(&asset)
             .arg("--dir")
             .arg(stage),
-    )?;
+        DOWNLOAD_LIMIT,
+    )
+    .map_err(|error| UpdateError::Fetch(error.to_string()))?;
     let archive = stage.join(&asset);
-    capture(
+    run_bounded(
         Command::new("tar")
             .arg("-xzf")
             .arg(&archive)
             .arg("-C")
             .arg(stage),
-    )?;
+        TAR_LIMIT,
+    )
+    .map_err(|error| UpdateError::Fetch(error.to_string()))?;
     let _ = fs::remove_file(archive);
     Ok(())
 }
 
-/// One look for a newer tag. `Some` is the tag that was installed.
-fn check(home: &Path, running: &str) -> Result<Option<String>, UpdateError> {
-    let tags = list_tags()?;
+/// One look for a newer tag. `Some` is the tag that was installed. A release whose files are
+/// bad is refused, so it is not downloaded again; any other failure is tried again later.
+fn check_with(
+    home: &Path,
+    running: &str,
+    list: impl FnOnce() -> Result<Vec<String>, UpdateError>,
+    fetch: impl FnOnce(&str, &Path) -> Result<(), UpdateError>,
+) -> Result<Option<String>, UpdateError> {
+    let tags = list()?;
     let refused = state(home)
         .map_err(io_error("cannot read the update state"))?
         .refused;
     let Some(tag) = pick(&tags, running, refused.as_deref()) else {
         return Ok(None);
     };
-    install_tag(home, &tag, running, download)?;
-    Ok(Some(tag))
+    match install_tag(home, &tag, running, fetch) {
+        Ok(()) => Ok(Some(tag)),
+        Err(error @ (UpdateError::WrongVersion { .. } | UpdateError::Missing(_))) => {
+            let refuse = state(home).and_then(|mut state| {
+                state.refused = Some(tag);
+                save(home, &state)
+            });
+            if let Err(error) = refuse {
+                tracing::warn!("cannot record the refused tag: {error}");
+            }
+            Err(error)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Marks this version healthy after a minute, then looks for a newer tag every ten minutes.
@@ -386,17 +597,22 @@ fn check(home: &Path, running: &str) -> Result<Option<String>, UpdateError> {
 pub async fn run(home: PathBuf) {
     let running = env!("CARGO_PKG_VERSION");
     tokio::time::sleep(HEALTHY_AFTER).await;
-    mark_healthy(&home, running);
-    if !installed(&home, running) {
+    HEALTHY.store(true, Ordering::Relaxed);
+    let from_current = std::env::current_exe()
+        .map(|exe| from_current(&home, &exe, running))
+        .unwrap_or(false);
+    if !from_current {
         tracing::info!(
             "updates are off: this daemon is not run from {}",
             home.join("current").display()
         );
         pending::<()>().await;
     }
+    mark_healthy(&home, running);
     loop {
         let work = home.clone();
-        match tokio::task::spawn_blocking(move || check(&work, running)).await {
+        let check = move || check_with(&work, running, list_tags, download);
+        match tokio::task::spawn_blocking(check).await {
             Ok(Ok(Some(tag))) => {
                 tracing::info!("installed {tag}: stopping so the service starts it");
                 if let Err(error) = raise(Signal::SIGTERM) {
@@ -415,7 +631,6 @@ pub async fn run(home: PathBuf) {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::os::unix::fs::symlink;
     use std::sync::atomic::AtomicBool;
     use std::time::Instant;
 
@@ -696,11 +911,19 @@ mod tests {
         let elsewhere = home.path().join("elsewhere");
         script(&elsewhere, "foundryd 0.1.0");
 
-        assert!(from_current(home.path(), &home.path().join("current/foundryd"), "0.1.0"));
+        assert!(from_current(
+            home.path(),
+            &home.path().join("current/foundryd"),
+            "0.1.0"
+        ));
         assert!(from_current(home.path(), &inside, "0.1.0"));
         assert!(!from_current(home.path(), &elsewhere, "0.1.0"));
         assert!(!from_current(home.path(), &inside, "0.2.0"));
-        assert!(!from_current(tempfile::tempdir().unwrap().path(), &inside, "0.1.0"));
+        assert!(!from_current(
+            tempfile::tempdir().unwrap().path(),
+            &inside,
+            "0.1.0"
+        ));
     }
 
     #[test]
@@ -808,7 +1031,10 @@ mod tests {
 
         placed_by_hand(home.path(), "0.1.0", Some("0.2.0")).unwrap();
 
-        assert_eq!(state(home.path()).unwrap().refused.as_deref(), Some("v0.5.0"));
+        assert_eq!(
+            state(home.path()).unwrap().refused.as_deref(),
+            Some("v0.5.0")
+        );
     }
 
     #[test]
@@ -829,10 +1055,17 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(started.elapsed() < Duration::from_secs(20), "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "{:?}",
+            started.elapsed()
+        );
         assert!(matches!(error, RunError::TimedOut { .. }), "{error}");
         assert!(error.to_string().contains("sleep 31.7"), "{error}");
-        let table = Command::new("ps").args(["-axo", "stat,command"]).output().unwrap();
+        let table = Command::new("ps")
+            .args(["-axo", "stat,command"])
+            .output()
+            .unwrap();
         let table = String::from_utf8_lossy(&table.stdout);
         let left: Vec<_> = table.lines().filter(|l| l.contains("sleep 31.7")).collect();
         assert!(left.is_empty(), "still there: {left:?}");
@@ -939,7 +1172,11 @@ mod tests {
             );
 
             assert!(result.is_err(), "{bad}");
-            assert_eq!(state(home.path()).unwrap().refused.as_deref(), Some("v0.2.0"), "{bad}");
+            assert_eq!(
+                state(home.path()).unwrap().refused.as_deref(),
+                Some("v0.2.0"),
+                "{bad}"
+            );
             let again = check_with(
                 home.path(),
                 "0.1.0",

@@ -9,7 +9,7 @@ compile_error!(
 );
 
 use std::fs;
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{PermissionsExt as _, symlink};
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -19,6 +19,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 #[test]
 fn a_trial_that_used_its_starts_rolls_back_and_exits_cleanly() {
     let home = tempfile::tempdir().unwrap();
+    fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let user = tempfile::tempdir().unwrap();
     let running = home.path().join("versions").join(VERSION);
     fs::create_dir_all(&running).unwrap();
@@ -28,10 +29,16 @@ fn a_trial_that_used_its_starts_rolls_back_and_exits_cleanly() {
     fs::create_dir_all(&previous).unwrap();
     fs::write(previous.join("foundryd"), "old").unwrap();
     fs::write(previous.join("foundry-holder"), "old").unwrap();
-    symlink(Path::new("versions").join(VERSION), home.path().join("current")).unwrap();
+    symlink(
+        Path::new("versions").join(VERSION),
+        home.path().join("current"),
+    )
+    .unwrap();
     fs::write(
         home.path().join("update.json"),
-        format!(r#"{{"trial":{{"version":"{VERSION}","previous":"0.0.1","starts":3}},"refused":null}}"#),
+        format!(
+            r#"{{"trial":{{"version":"{VERSION}","previous":"0.0.1","starts":3}},"refused":null}}"#
+        ),
     )
     .unwrap();
 

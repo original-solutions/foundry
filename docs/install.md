@@ -56,7 +56,7 @@ This copies both binaries to `<home>/versions/<version>/`, points `<home>/curren
 
 The log is `~/Library/Logs/foundry/foundryd.log`.
 
-Run `install` again to change an environment variable. It replaces the agent.
+To change an environment variable, set it in your shell and run `<home>/current/foundryd install`. It replaces the agent.
 
 ## Linux
 
@@ -83,17 +83,23 @@ A running service looks for a newer release tag every 10 minutes. The release wo
 
 When a higher tag exists, the daemon downloads the asset, checks that `foundryd --version` says the tag's version, and installs it under `<home>/versions/`. It then points `<home>/current` at it and stops. The service starts the new version. Terminals keep running: each one lives in its own `foundry-holder` process.
 
-The new version has to prove itself. It counts as healthy once it has run for 60 seconds. If it starts three times without getting there, the next start puts the previous version back and records the tag as refused in `<home>/update.json`. A refused tag is skipped while it is the highest. A higher tag installs and clears the refusal.
+The new version has to prove itself. It counts as healthy once it has run for 60 seconds. If it starts three times without getting there, the next start puts the previous version back and records the tag as refused in `<home>/update.json`. A start that hangs for 5 minutes (on a keychain prompt, for example) exits and counts as a failed start. A refused tag is skipped while it is the highest. A higher tag installs and clears the refusal.
 
-If `gh` is missing or a download fails, the daemon logs a warning and tries again 10 minutes later.
+A release whose archive is bad (a missing binary, or a `foundryd` that does not print its own version) is refused the same way, so it is not downloaded again.
 
-To go back to a version by hand, run `install` from that version's folder:
+On macOS, sign every release binary with one stable identity (a Developer ID). A differently signed binary cannot read the keys the old one stored in the keychain. It stops at a keychain prompt, and every update is rolled back.
+
+Only a daemon started from `<home>/current` takes part in updates. One run any other way (`cargo run`, `./foundryd run`) never updates itself and is never counted as a trial.
+
+If `gh` is missing or a download fails, the daemon logs a warning and tries again 10 minutes later. Each `gh` and `tar` call has a time limit.
+
+To go back to an older version by hand, run `install` from that version's folder:
 
 ```sh
 <home>/versions/<version>/foundryd install
 ```
 
-A daemon run any other way (`cargo run`, `./foundryd run`) never updates itself.
+The newer version is then refused, as after a rollback. The refusal holds until a higher tag ships. On Linux, run the `sudo systemctl restart foundryd` line it prints so the service starts the older version.
 
 ## Uninstall
 

@@ -42,7 +42,7 @@ use crate::workspaces::Workspaces;
 const EXIT_WITHIN: Duration = Duration::from_secs(5);
 
 #[derive(Debug, thiserror::Error)]
-enum DaemonError {
+pub(crate) enum DaemonError {
     #[error("set FOUNDRY_HOME or HOME to say where the data directory is")]
     NoHome,
     #[error("HOME is not set, so Claude Code's state file cannot be found")]
@@ -149,7 +149,7 @@ fn start() -> Result<(), DaemonError> {
 /// directory that already exists is never changed: it may be shared, or the user's home. One
 /// that other users can reach (`foundryd join` and `foundryd secret set` make it with the
 /// default mode) is refused, naming the `chmod` that fixes it.
-fn make_home(home: &Path) -> Result<(), DaemonError> {
+pub(crate) fn make_home(home: &Path) -> Result<(), DaemonError> {
     DirBuilder::new()
         .recursive(true)
         .mode(0o700)

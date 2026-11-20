@@ -2,16 +2,17 @@
 //! unit on Linux. Both keep the daemon running, start it again when it stops, and leave the
 //! holders (and so every terminal) alone when the daemon stops.
 
-use std::fs::{self, DirBuilder, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{self, Write as _};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::{Duration, Instant};
 
 use nix::unistd::{Uid, User};
 
-use crate::{daemon, update};
+use crate::daemon;
+use crate::update::{self, UpdateError};
 
 /// The launchd label, and so the plist's name.
 const LABEL: &str = "io.github.original-solutions.foundryd";
@@ -36,6 +37,9 @@ const HOLDER: &str = "foundry-holder";
 /// How long `install` waits for launchd to let go of an agent it was told to remove.
 const BOOTOUT_WAIT: Duration = Duration::from_secs(10);
 
+/// How long one `launchctl` call may take.
+const LAUNCHCTL_LIMIT: Duration = Duration::from_secs(30);
+
 /// Why an install or uninstall failed.
 #[derive(Debug, thiserror::Error)]
 enum ServiceError {
@@ -49,8 +53,10 @@ enum ServiceError {
     Root,
     #[error("cannot tell which user this is")]
     NoUser,
-    #[error("{0} is missing: it must sit beside foundryd")]
-    NoHolder(PathBuf),
+    #[error("{0}")]
+    Home(String),
+    #[error("{0}")]
+    Place(#[from] UpdateError),
     #[error("{what}: {source}")]
     Io { what: String, source: io::Error },
     #[error("{0}")]
@@ -157,67 +163,59 @@ WantedBy=multi-user.target\n"
     ))
 }
 
-/// Copies `from` to `to` and makes it executable.
-fn copy_executable(from: &Path, to: &Path) -> io::Result<()> {
-    fs::copy(from, to)?;
-    fs::set_permissions(to, fs::Permissions::from_mode(0o755))
-}
-
-/// Puts `exe` and the holder beside it in `versions/<version>` and points `current` there.
-/// A copy is made in a stage directory and renamed in. When `exe` already runs from that
-/// directory nothing is copied.
-fn place(home: &Path, exe: &Path, version: &str) -> io::Result<()> {
+/// Puts `exe` and the holder beside it in `versions/<version>` and points `current` there,
+/// and records the install: a version lower than the one `current` named is kept by refusing
+/// the higher one. A copy is made in a stage directory and renamed in; when `exe` already
+/// runs from that directory nothing is copied.
+fn place(home: &Path, exe: &Path, version: &str) -> Result<(), UpdateError> {
     let from = exe.parent().unwrap_or(Path::new("."));
     let holder = from.join(HOLDER);
     if !holder.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!(
-                "{} is missing: it must sit beside foundryd",
-                holder.display()
-            ),
-        ));
+        return Err(UpdateError::Missing(HOLDER));
     }
-    let versions = home.join("versions");
-    let target = versions.join(version);
-    let in_place = match (fs::canonicalize(from), fs::canonicalize(&target)) {
+    let before = update::current_version(home);
+    let record = || update::placed_by_hand(home, version, before.as_deref());
+    let in_place = match (
+        fs::canonicalize(from),
+        fs::canonicalize(home.join("versions").join(version)),
+    ) {
         (Ok(from), Ok(target)) => from == target,
         _ => false,
     };
-    if !in_place {
-        let stage = versions.join(format!(".staging-{version}"));
-        let _ = fs::remove_dir_all(&stage);
-        fs::create_dir_all(&stage)?;
-        copy_executable(exe, &stage.join("foundryd"))?;
-        copy_executable(&holder, &stage.join(HOLDER))?;
-        let _ = fs::remove_dir_all(&target);
-        fs::rename(&stage, &target)?;
+    if in_place {
+        record().map_err(|source| UpdateError::Io {
+            what: "cannot save the update state".into(),
+            source,
+        })?;
+        return update::point_current(home, version).map_err(|source| UpdateError::Io {
+            what: "cannot point current at this version".into(),
+            source,
+        });
     }
-    update::point_current(home, version)
+    let copy = |stage: &Path| {
+        for (from, name) in [(exe, "foundryd"), (holder.as_path(), HOLDER)] {
+            fs::copy(from, stage.join(name)).map_err(|source| UpdateError::Io {
+                what: format!("cannot copy {}", from.display()),
+                source,
+            })?;
+        }
+        Ok(())
+    };
+    update::place_version(home, version, copy, record)
 }
 
-/// Makes the data directory, readable only by this user, when it is missing.
-fn make_home(home: &Path) -> Result<(), ServiceError> {
-    DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(home)
-        .map_err(io_error(format!("cannot make {}", home.display())))
+/// Makes the data directory as `foundryd run` does (and refuses one other users can reach),
+/// then places this version.
+fn stage(home: &Path, exe: &Path, version: &str) -> Result<(), ServiceError> {
+    daemon::make_home(home).map_err(|error| ServiceError::Home(error.to_string()))?;
+    Ok(place(home, exe, version)?)
 }
 
-/// Runs a command and fails with what it said on stderr, trimmed.
-fn run_command(command: &mut Command) -> Result<(), ServiceError> {
-    let name = command.get_program().to_string_lossy().into_owned();
-    let out = command
-        .output()
-        .map_err(|error| ServiceError::Command(format!("cannot run {name}: {error}")))?;
-    if out.status.success() {
-        return Ok(());
-    }
-    Err(ServiceError::Command(format!(
-        "{name} failed: {}",
-        String::from_utf8_lossy(&out.stderr).trim()
-    )))
+/// Runs a `launchctl` call within its limit.
+fn launchctl(args: &[&str]) -> Result<(), ServiceError> {
+    update::run_bounded(Command::new("launchctl").args(args), LAUNCHCTL_LIMIT)
+        .map(|_| ())
+        .map_err(|error| ServiceError::Command(error.to_string()))
 }
 
 /// `gui/<uid>/<label>`, the launchd name of the agent.
@@ -235,9 +233,7 @@ fn plist_path() -> Result<PathBuf, ServiceError> {
 
 /// Stops and removes the agent. A failure is ignored: it may not be loaded.
 fn bootout() {
-    let _ = Command::new("launchctl")
-        .args(["bootout", &launchd_target()])
-        .output();
+    let _ = launchctl(&["bootout", &launchd_target()]);
 }
 
 fn install_macos(home: &Path) -> Result<String, ServiceError> {
@@ -257,20 +253,16 @@ fn install_macos(home: &Path) -> Result<String, ServiceError> {
     bootout();
     let started = Instant::now();
     while started.elapsed() < BOOTOUT_WAIT {
-        let loaded = Command::new("launchctl")
-            .args(["print", &launchd_target()])
-            .output()
-            .is_ok_and(|out| out.status.success());
-        if !loaded {
+        if launchctl(&["print", &launchd_target()]).is_err() {
             break;
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    run_command(Command::new("launchctl").args([
+    launchctl(&[
         "bootstrap",
         &format!("gui/{}", Uid::current()),
         &path.display().to_string(),
-    ]))?;
+    ])?;
     Ok(format!(
         "Installed the launchd agent {}\nIt runs {} and logs to {}",
         path.display(),
@@ -280,9 +272,6 @@ fn install_macos(home: &Path) -> Result<String, ServiceError> {
 }
 
 fn install_linux(home: &Path) -> Result<String, ServiceError> {
-    if Uid::current().is_root() {
-        return Err(ServiceError::Root);
-    }
     let user = User::from_uid(Uid::current())
         .ok()
         .flatten()
@@ -314,22 +303,12 @@ fn do_install() -> Result<String, ServiceError> {
     if !cfg!(any(target_os = "macos", target_os = "linux")) {
         return Err(ServiceError::Unsupported);
     }
-    if cfg!(target_os = "linux") && Uid::current().is_root() {
+    if Uid::current().is_root() {
         return Err(ServiceError::Root);
     }
-    make_home(&home)?;
     let exe = std::env::current_exe().map_err(io_error("cannot find this program"))?;
     let version = env!("CARGO_PKG_VERSION");
-    place(&home, &exe, version).map_err(|error| {
-        if error.kind() == io::ErrorKind::NotFound && error.to_string().contains(HOLDER) {
-            ServiceError::NoHolder(exe.with_file_name(HOLDER))
-        } else {
-            ServiceError::Io {
-                what: format!("cannot place version {version}"),
-                source: error,
-            }
-        }
-    })?;
+    stage(&home, &exe, version)?;
     let done = if cfg!(target_os = "macos") {
         install_macos(&home)?
     } else {
@@ -657,7 +636,10 @@ mod tests {
 
         stage(&home, &src.path().join("foundryd"), "0.1.0").unwrap();
 
-        assert_eq!(fs::metadata(&home).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(
+            fs::metadata(&home).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
         assert!(home.join("current/foundryd").is_file());
     }
 }
