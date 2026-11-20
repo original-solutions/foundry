@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use foundry_proto::ids::{MachineId, TerminalId, WorkspaceId};
+use foundry_proto::messages::{PROTOCOL, PeerMessage};
 use foundry_proto::record::AnyRecord;
 use foundry_proto::settings::Machine;
 use foundryd::api::{self, Api};
@@ -15,8 +16,8 @@ use foundryd::join::{KeyedDialer, Keys};
 use foundryd::secrets::FileSecrets;
 use foundryd::sessions::{self, Gateway, Sessions};
 use foundryd::store::Store;
-use foundryd::sync::relay::{Event, RelayError, Remote};
-use foundryd::sync::{Conn, Dialer, Peers};
+use foundryd::sync::relay::{Closed, Event, RelayError, Remote};
+use foundryd::sync::{Conn, Dialer, OFFLINE_AFTER, Peers};
 use foundryd::terminals::{Snapshot, Terminals};
 use foundryd::workspaces::Workspaces;
 use futures::future::BoxFuture;
@@ -75,13 +76,14 @@ impl Held {
 
     /// A terminal running `cat`.
     async fn cat(&self) -> TerminalId {
+        self.start(&["cat"]).await
+    }
+
+    /// A terminal running `argv` in this machine's working directory.
+    async fn start(&self, argv: &[&str]) -> TerminalId {
+        let argv: Vec<String> = argv.iter().map(|a| (*a).to_owned()).collect();
         self.terminals
-            .start(
-                WorkspaceId::random(),
-                self.cwd.path(),
-                &["cat".to_owned()],
-                &[],
-            )
+            .start(WorkspaceId::random(), self.cwd.path(), &argv, &[])
             .await
             .unwrap()
     }
@@ -389,7 +391,7 @@ struct KeyedPair {
     b: Keyed,
     a: Keyed,
     terminal: TerminalId,
-    _held: Held,
+    held: Held,
 }
 
 async fn keyed_pair(b_admits: bool) -> KeyedPair {
@@ -415,7 +417,7 @@ async fn keyed_pair(b_admits: bool) -> KeyedPair {
         b,
         a,
         terminal,
-        _held: held,
+        held,
     }
 }
 
@@ -460,7 +462,11 @@ async fn a_relay_from_a_machine_whose_key_is_not_admitted_is_refused_before_any_
         .peers
         .open_terminal(pair.b.keys.me(), pair.terminal)
         .await;
-    assert!(opened.is_err(), "a relay opened with no key admitted");
+    match opened {
+        Err(RelayError::Refused(reason)) => assert!(reason.contains("refused"), "{reason}"),
+        Err(other) => panic!("refused another way: {other}"),
+        Ok(_) => panic!("a relay opened with no key admitted"),
+    }
 }
 
 #[tokio::test]
@@ -488,5 +494,330 @@ async fn a_relay_from_a_revoked_machine_is_refused_and_an_open_one_closes() {
         .peers
         .open_terminal(pair.b.keys.me(), pair.terminal)
         .await;
-    assert!(opened.is_err(), "a relay opened from a revoked machine");
+    match opened {
+        Err(RelayError::Refused(reason)) => assert!(reason.contains("refused"), "{reason}"),
+        Err(other) => panic!("refused another way: {other}"),
+        Ok(_) => panic!("a relay opened from a revoked machine"),
+    }
+}
+
+/// Reads a relay to its end and returns how it closed.
+async fn remote_closed(remote: &mut Remote) -> Closed {
+    timeout(WAIT, async {
+        loop {
+            if let Event::Closed(closed) = remote.next().await {
+                return closed;
+            }
+        }
+    })
+    .await
+    .expect("the relay closes within the wait")
+}
+
+#[tokio::test]
+async fn a_keyed_relay_for_a_terminal_b_does_not_hold_is_refused_with_bs_reason() {
+    let pair = keyed_pair(true).await;
+    let unknown = TerminalId::random();
+    match pair.a.peers.open_terminal(pair.b.keys.me(), unknown).await {
+        Err(RelayError::Refused(reason)) => {
+            assert!(reason.contains(&unknown.to_string()), "{reason}");
+        }
+        Err(other) => panic!("refused another way: {other}"),
+        Ok(_) => panic!("a relay opened for a terminal B does not hold"),
+    }
+}
+
+#[tokio::test]
+async fn a_keyed_relay_whose_child_exits_closes_with_1000() {
+    let pair = keyed_pair(true).await;
+    let id = pair.held.start(&["sh", "-c", "read x"]).await;
+    let (_snapshot, mut remote) = pair
+        .a
+        .peers
+        .open_terminal(pair.b.keys.me(), id)
+        .await
+        .unwrap();
+    remote.input(Bytes::from_static(b"bye\n")).await.unwrap();
+    assert_eq!(remote_closed(&mut remote).await, Closed::exited());
+}
+
+#[tokio::test]
+async fn a_relay_naming_another_machine_than_the_one_proved_is_refused() {
+    let dirs = [(); 3].map(|()| tempfile::tempdir().unwrap());
+    let [a_keys, b_keys, c_keys] = [&dirs[0], &dirs[1], &dirs[2]].map(keys);
+    admit(&a_keys, &b_keys);
+    admit(&b_keys, &a_keys);
+    admit(&b_keys, &c_keys);
+    let [a_dir, b_dir, _] = dirs;
+    let b = Keyed::new(
+        &[a_keys.me(), c_keys.me()],
+        b_keys,
+        b_dir,
+        Arc::new(Nowhere),
+    );
+    let held = Held::new(b.keys.me(), b.store.clone());
+    b.peers.serve_terminals(held.terminals.clone());
+    let terminal = held.cat().await;
+    let _a_dir = a_dir;
+    let dialer = KeyedDialer::new(
+        Arc::new(ServedBy {
+            keys: b.keys.clone(),
+            peers: b.peers.clone(),
+        }),
+        a_keys,
+    );
+    let to_b = Machine {
+        id: b.keys.me(),
+        name: "b".into(),
+        address: "127.0.0.1".into(),
+    };
+    let mut conn = dialer.dial(&to_b).await.expect("both keys are proved");
+    let relay = PeerMessage::Relay {
+        protocol: PROTOCOL,
+        machine: c_keys.me(),
+        terminal,
+    };
+    conn.send
+        .send(serde_json::to_string(&relay).unwrap())
+        .await
+        .unwrap();
+    let ended = timeout(WAIT, async {
+        while let Some(text) = conn.recv.recv().await {
+            assert!(!text.contains("snapshot"), "B relayed for C: {text}");
+        }
+    })
+    .await;
+    assert!(ended.is_ok(), "the link stays open");
+}
+
+/// A link into `peers` that opens with a relay naming `machine`.
+async fn raw_relay(peers: &Peers, machine: MachineId, terminal: TerminalId) -> Conn {
+    let (near, far) = Conn::pair();
+    let peers = peers.clone();
+    tokio::spawn(async move { peers.accept(far).await });
+    let relay = PeerMessage::Relay {
+        protocol: PROTOCOL,
+        machine,
+        terminal,
+    };
+    near.send
+        .send(serde_json::to_string(&relay).unwrap())
+        .await
+        .unwrap();
+    near
+}
+
+/// The next frame on `conn`, or `None` once it is closed.
+async fn frame(conn: &mut Conn, within: Duration) -> Option<serde_json::Value> {
+    let text = timeout(within, conn.recv.recv())
+        .await
+        .expect("a frame or a close within the wait")?;
+    Some(serde_json::from_str(&text).unwrap())
+}
+
+#[tokio::test]
+async fn a_relay_naming_a_machine_not_listed_or_the_owner_itself_closes_with_a_reason() {
+    let fleet = Fleet::start(2);
+    let b = &fleet.daemons[1];
+    let on_b = Held::new(b.id, b.store.clone());
+    b.peers.serve_terminals(on_b.terminals.clone());
+    let id = on_b.cat().await;
+    for machine in [MachineId::random(), b.id] {
+        let mut conn = raw_relay(&b.peers, machine, id).await;
+        let first = frame(&mut conn, WAIT).await.expect("a close, not silence");
+        assert_eq!(first["type"], "closed", "{first}");
+        assert_eq!(first["code"], 1011, "{first}");
+        let reason = first["reason"].as_str().unwrap();
+        assert!(reason.contains("not a peer"), "{reason}");
+    }
+}
+
+#[tokio::test]
+async fn the_owner_beats_on_an_idle_relay_and_ends_one_its_opener_went_silent_on() {
+    let fleet = Fleet::start(2);
+    let (a, b) = (&fleet.daemons[0], &fleet.daemons[1]);
+    let on_b = Held::new(b.id, b.store.clone());
+    b.peers.serve_terminals(on_b.terminals.clone());
+    let id = on_b.cat().await;
+    let mut conn = raw_relay(&b.peers, a.id, id).await;
+    let first = frame(&mut conn, WAIT).await.expect("the snapshot");
+    assert_eq!(first["type"], "snapshot", "{first}");
+    let beat = frame(&mut conn, Duration::from_secs(3))
+        .await
+        .expect("a beat");
+    assert_eq!(beat["type"], "beat", "{beat}");
+    // This end sends nothing, so the owner takes the link as down and ends it.
+    let start = tokio::time::Instant::now();
+    while frame(&mut conn, OFFLINE_AFTER * 2).await.is_some() {}
+    assert!(start.elapsed() >= OFFLINE_AFTER - Duration::from_secs(3));
+}
+
+/// An owner that answers a relay with `answer`, then holds the link open and silent, or
+/// closes it when `hold` is false.
+struct FakeOwner {
+    answer: Vec<String>,
+    hold: bool,
+}
+
+impl Dialer for FakeOwner {
+    fn dial(&self, _: &Machine) -> BoxFuture<'static, std::io::Result<Conn>> {
+        let (near, mut far) = Conn::pair();
+        let (answer, hold) = (self.answer.clone(), self.hold);
+        tokio::spawn(async move {
+            let _relay = far.recv.recv().await;
+            for text in answer {
+                let _ = far.send.send(text).await;
+            }
+            while hold && far.recv.recv().await.is_some() {}
+        });
+        Box::pin(async move { Ok(near) })
+    }
+}
+
+/// Machine A dialing its one peer, named machine-1, through `owner`.
+fn opener(owner: FakeOwner) -> (Peers, MachineId, TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let (me, peer) = (MachineId::random(), MachineId::random());
+    let mut store = Store::open(dir.path().join("foundry.db")).unwrap();
+    assert!(store.apply_settings(settings_for(&[me, peer])).unwrap());
+    let peers = Peers::new(me, Arc::new(Mutex::new(store)), Arc::new(owner));
+    (peers, peer, dir)
+}
+
+const EMPTY_SNAPSHOT: &str = r#"{"type":"snapshot","start":0,"bytes":"","last":true}"#;
+
+#[tokio::test(start_paused = true)]
+async fn an_owner_silent_past_the_offline_limit_closes_the_relay_with_1013() {
+    let (peers, owner, _dir) = opener(FakeOwner {
+        answer: vec![EMPTY_SNAPSHOT.to_owned()],
+        hold: true,
+    });
+    let (_snapshot, mut remote) = peers
+        .open_terminal(owner, TerminalId::random())
+        .await
+        .unwrap();
+    let start = tokio::time::Instant::now();
+    let closed = remote_closed(&mut remote).await;
+    assert_eq!(closed.code, 1013, "{closed:?}");
+    assert_eq!(closed.reason, "the link to machine-1 is down");
+    assert!(start.elapsed() >= OFFLINE_AFTER);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_close_code_the_socket_does_not_give_reads_as_1011() {
+    let (peers, owner, _dir) = opener(FakeOwner {
+        answer: vec![
+            EMPTY_SNAPSHOT.to_owned(),
+            r#"{"type":"closed","code":4000,"reason":"odd"}"#.to_owned(),
+        ],
+        hold: true,
+    });
+    let (_snapshot, mut remote) = peers
+        .open_terminal(owner, TerminalId::random())
+        .await
+        .unwrap();
+    let closed = remote_closed(&mut remote).await;
+    assert_eq!(
+        closed,
+        Closed {
+            code: 1011,
+            reason: "odd".into()
+        }
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_owner_that_closes_a_relay_without_answering_has_refused_it() {
+    let (peers, owner, _dir) = opener(FakeOwner {
+        answer: Vec::new(),
+        hold: false,
+    });
+    match peers.open_terminal(owner, TerminalId::random()).await {
+        Err(RelayError::Refused(reason)) => assert!(reason.contains("older build"), "{reason}"),
+        Err(other) => panic!("refused another way: {other}"),
+        Ok(_) => panic!("a relay opened with no answer"),
+    }
+}
+
+#[tokio::test]
+async fn a_child_that_exits_on_b_closes_as_socket_with_1000() {
+    let fleet = Fleet::start(2);
+    let (a, b) = (&fleet.daemons[0], &fleet.daemons[1]);
+    let on_b = Held::new(b.id, b.store.clone());
+    b.peers.serve_terminals(on_b.terminals.clone());
+    let id = on_b.start(&["sh", "-c", "read x"]).await;
+    synced(a, id).await;
+    let api = Served::start(a).await;
+    let (mut socket, _) = api.attach(id).await;
+    socket.send(Message::binary(&b"bye\n"[..])).await.unwrap();
+    assert_eq!(closed(&mut socket).await, (1000, "exited".to_owned()));
+}
+
+#[tokio::test]
+async fn a_resize_through_a_reaches_the_terminal_on_b() {
+    let fleet = Fleet::start(2);
+    let (a, b) = (&fleet.daemons[0], &fleet.daemons[1]);
+    let on_b = Held::new(b.id, b.store.clone());
+    b.peers.serve_terminals(on_b.terminals.clone());
+    let id = on_b.start(&["sh", "-c", "read x; stty size; read y"]).await;
+    synced(a, id).await;
+    let api = Served::start(a).await;
+    let (mut socket, _) = api.attach(id).await;
+    socket
+        .send(Message::text(r#"{"type":"resize","cols":100,"rows":30}"#))
+        .await
+        .unwrap();
+    socket.send(Message::binary(&b"go\n"[..])).await.unwrap();
+    read_until(&mut socket, "30 100", 1).await;
+}
+
+#[tokio::test]
+async fn an_input_larger_than_one_frame_reaches_b_whole() {
+    let fleet = Fleet::start(2);
+    let (a, b) = (&fleet.daemons[0], &fleet.daemons[1]);
+    let on_b = Held::new(b.id, b.store.clone());
+    b.peers.serve_terminals(on_b.terminals.clone());
+    let script = "stty raw -echo; echo ready; head -c 2500000 > typed; echo done";
+    let id = on_b.start(&["sh", "-c", script]).await;
+    let (_snapshot, mut remote) = a.peers.open_terminal(b.id, id).await.unwrap();
+    remote_until(&mut remote, "ready", 1).await;
+    remote
+        .input(Bytes::from(vec![b'x'; 2_500_000]))
+        .await
+        .unwrap();
+    remote_until(&mut remote, "done", 1).await;
+    let typed = std::fs::metadata(on_b.cwd.path().join("typed")).unwrap();
+    assert_eq!(typed.len(), 2_500_000);
+}
+
+#[tokio::test]
+async fn an_attach_b_refuses_is_502_with_bs_reason() {
+    let fleet = Fleet::start(2);
+    let (a, b) = (&fleet.daemons[0], &fleet.daemons[1]);
+    let on_b = Held::new(b.id, b.store.clone());
+    let id = on_b.cat().await;
+    synced(a, id).await;
+    let api = Served::start(a).await;
+    let (status, body) = api.refused(id).await;
+    assert_eq!(status, 502, "{body}");
+    assert!(body.contains("serves no terminals"), "{body}");
+}
+
+#[tokio::test]
+async fn an_attach_to_a_terminal_b_closed_is_404() {
+    let fleet = Fleet::start(2);
+    let (a, b) = (&fleet.daemons[0], &fleet.daemons[1]);
+    let on_b = Held::new(b.id, b.store.clone());
+    b.peers.serve_terminals(on_b.terminals.clone());
+    let id = on_b.cat().await;
+    synced(a, id).await;
+    on_b.terminals.close(id).await.unwrap();
+    until(WAIT, "the terminal's deletion reaches A", || {
+        a.held(|r| matches!(r, AnyRecord::Terminal(t) if t.body.id == id && t.deleted))
+            .is_some()
+    })
+    .await;
+    let api = Served::start(a).await;
+    let (status, body) = api.refused(id).await;
+    assert_eq!(status, 404, "{body}");
 }
