@@ -692,8 +692,8 @@ impl Keys {
     }
 
     /// Serves a link a peer opened, as [`Peers::accept`] does, once both ends have proved
-    /// their keys and the peer's hello names the machine it proved. The link closes when that
-    /// machine is revoked.
+    /// their keys and the link's first message, a hello or a relay, names the machine proved.
+    /// The link closes when that machine is revoked.
     pub async fn accept(&self, peers: &Peers, conn: Conn) {
         let Conn { send, mut recv } = conn;
         let Some((machine, hello)) = self.admit(&send, &mut recv).await else {
@@ -709,7 +709,8 @@ impl Keys {
         }
     }
 
-    /// The accepting end of the handshake. Returns the machine proved and its hello.
+    /// The accepting end of the handshake. Returns the machine proved and its first message,
+    /// a hello or a relay.
     async fn admit(
         &self,
         send: &Sender<String>,
@@ -752,11 +753,14 @@ impl Keys {
         }
         let hello = timeout(OFFLINE_AFTER, recv.recv()).await.ok()??;
         match serde_json::from_str(&hello) {
-            Ok(PeerMessage::Hello { machine: named, .. }) if named == machine => {
-                Some((machine, hello))
-            }
+            Ok(
+                PeerMessage::Hello { machine: named, .. }
+                | PeerMessage::Relay { machine: named, .. },
+            ) if named == machine => Some((machine, hello)),
             _ => {
-                tracing::warn!("join: refused a link from {machine}: its hello names another");
+                tracing::warn!(
+                    "join: refused a link from {machine}: its first message names another"
+                );
                 None
             }
         }

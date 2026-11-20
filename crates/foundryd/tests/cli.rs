@@ -1,4 +1,4 @@
-//! The command line: `--version` works, the commands still unbuilt say so, and `secret set`
+//! The command line: `--version` works, `join` names a bad port, and `secret set`
 //! stores a gateway key without printing it. Every test that runs the binary uses the file
 //! secret store and a temporary data directory, never the login keychain.
 
@@ -40,27 +40,6 @@ fn version_prints_the_crate_version() {
         String::from_utf8_lossy(&out.stdout),
         format!("foundryd {}\n", env!("CARGO_PKG_VERSION"))
     );
-}
-
-#[test]
-fn every_other_command_exits_2_and_says_not_built_yet() {
-    let commands: [(&str, &[&str]); 2] = [("install", &["install"]), ("uninstall", &["uninstall"])];
-
-    for (name, args) in commands {
-        let out = foundryd(args);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-
-        assert_eq!(
-            out.status.code(),
-            Some(2),
-            "{args:?} exit: {:?}",
-            out.status
-        );
-        assert!(
-            stderr.contains(&format!("foundryd {name}: not built yet")),
-            "{args:?} stderr: {stderr}"
-        );
-    }
 }
 
 #[test]
