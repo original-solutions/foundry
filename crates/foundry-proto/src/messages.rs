@@ -115,7 +115,7 @@ impl UiMessage {
 mod tests {
     use super::*;
     use crate::record::tests::{machine_sample, session, terminal, workspace};
-    use crate::settings::SettingKey;
+    use crate::settings::{EditId, Outcome, SettingKey, Stamp};
     use crate::settings::tests::settings;
     use crate::{assert_round_trip, parse_error};
 
@@ -150,14 +150,33 @@ mod tests {
             },
             PeerMessage::Edit {
                 protocol: PROTOCOL,
+                id: Some(EditId::random()),
                 edit: Edit::SetProject {
                     project: settings().projects[0].clone(),
                 },
             },
             PeerMessage::Edit {
                 protocol: PROTOCOL,
+                id: None,
                 edit: Edit::Dismiss {
                     setting: SettingKey::Priority,
+                },
+            },
+            PeerMessage::Answer {
+                protocol: PROTOCOL,
+                id: EditId::random(),
+                outcome: Outcome::Numbered {
+                    stamp: Stamp {
+                        seq: 9,
+                        by: MachineId::random(),
+                    },
+                },
+            },
+            PeerMessage::Answer {
+                protocol: PROTOCOL,
+                id: EditId::random(),
+                outcome: Outcome::Refused {
+                    reason: "it could not be stored".into(),
                 },
             },
             PeerMessage::Call {
@@ -173,9 +192,27 @@ mod tests {
     }
 
     #[test]
-    fn calls_are_carried_from_the_protocol_after_edits_and_this_build_speaks_it() {
+    fn calls_are_carried_from_the_protocol_after_edits() {
         assert_eq!(CALLS_SINCE, EDITS_SINCE + 1);
-        assert_eq!(PROTOCOL, CALLS_SINCE);
+    }
+
+    #[test]
+    fn answers_are_carried_from_the_protocol_after_calls_and_this_build_speaks_it() {
+        assert_eq!(ANSWERS_SINCE, CALLS_SINCE + 1);
+        assert_eq!(PROTOCOL, ANSWERS_SINCE);
+    }
+
+    #[test]
+    fn an_edit_without_an_id_is_written_as_the_older_protocols_wrote_it() {
+        let edit = PeerMessage::Edit {
+            protocol: CALLS_SINCE,
+            id: None,
+            edit: Edit::Dismiss {
+                setting: SettingKey::Priority,
+            },
+        };
+        let json = serde_json::to_value(&edit).unwrap();
+        assert!(json.get("id").is_none(), "{json}");
     }
 
     fn ui_messages() -> Vec<UiMessage> {
@@ -250,6 +287,7 @@ mod tests {
         let record: AnyRecord = serde_json::from_str(&sample).unwrap();
         let id = MachineId(machine.parse().unwrap());
         let terminal = "1b4e28ba-2fa1-11d2-883f-0016d3cca427";
+        let edit = "22222222-2222-4222-8222-222222222222";
         let peer = [
             (
                 format!(
@@ -291,7 +329,42 @@ mod tests {
                 ),
                 PeerMessage::Edit {
                     protocol: 1,
+                    id: None,
                     edit: Edit::RemoveLimits { machine: id },
+                },
+            ),
+            (
+                format!(
+                    r#"{{"type":"edit","protocol":4,"id":"{edit}","edit":{{"kind":"remove_limits","machine":"{machine}"}}}}"#
+                ),
+                PeerMessage::Edit {
+                    protocol: 4,
+                    id: Some(EditId(edit.parse().unwrap())),
+                    edit: Edit::RemoveLimits { machine: id },
+                },
+            ),
+            (
+                format!(
+                    r#"{{"type":"answer","protocol":4,"id":"{edit}","outcome":{{"kind":"numbered","stamp":{{"seq":3,"by":"{machine}"}}}}}}"#
+                ),
+                PeerMessage::Answer {
+                    protocol: 4,
+                    id: EditId(edit.parse().unwrap()),
+                    outcome: Outcome::Numbered {
+                        stamp: Stamp { seq: 3, by: id },
+                    },
+                },
+            ),
+            (
+                format!(
+                    r#"{{"type":"answer","protocol":4,"id":"{edit}","outcome":{{"kind":"refused","reason":"no"}}}}"#
+                ),
+                PeerMessage::Answer {
+                    protocol: 4,
+                    id: EditId(edit.parse().unwrap()),
+                    outcome: Outcome::Refused {
+                        reason: "no".into(),
+                    },
                 },
             ),
             (

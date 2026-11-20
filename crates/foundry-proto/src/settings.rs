@@ -344,6 +344,7 @@ pub(crate) mod tests {
                 },
             )]
             .into(),
+            numbered: [(EditId::random(), Stamp { seq: 42, by: mac })].into(),
         }
     }
 
@@ -424,15 +425,18 @@ pub(crate) mod tests {
             }
         );
         assert!(read.stamps.is_empty() && read.seen.is_empty() && read.overwritten.is_empty());
+        assert!(read.numbered.is_empty());
     }
 
     #[test]
     fn stamped_settings_read_from_their_wire_form() {
         let mac = "67e55044-10b1-426f-9247-bb680e5fe0c8";
+        let edit = "22222222-2222-4222-8222-222222222222";
         let json = format!(
             r#"{{"seq":5,"machines":[],"priority":[],"projects":[],"limits":{{}},
                 "stamps":{{"priority":{{"seq":5,"by":"{mac}"}},"overwritten:limits:{mac}":{{"seq":4,"by":"{mac}"}}}},
                 "seen":{{"{mac}":5}},
+                "numbered":{{"{edit}":{{"seq":5,"by":"{mac}"}}}},
                 "overwritten":{{"limits:{mac}":{{"kept":{{"setting":"priority","value":["{mac}"]}},"lost":null,"lost_stamp":{{"seq":3,"by":"{mac}"}}}}}}}}"#
         );
         let id = MachineId(mac.parse().unwrap());
@@ -446,6 +450,10 @@ pub(crate) mod tests {
             Stamp { seq: 4, by: id }
         );
         assert_eq!(read.seen, [(id, 5)].into());
+        assert_eq!(
+            read.numbered,
+            [(EditId(edit.parse().unwrap()), Stamp { seq: 5, by: id })].into()
+        );
         assert_eq!(
             read.overwritten[&SettingKey::Limits(id)],
             Overwritten {
@@ -604,6 +612,38 @@ pub(crate) mod tests {
         ];
         for (json, expected) in cases {
             assert_eq!(serde_json::from_str::<Edit>(&json).expect(&json), expected);
+        }
+    }
+
+    #[test]
+    fn an_edit_id_and_each_outcome_round_trip_and_read_from_their_wire_form() {
+        let edit = EditId::random();
+        assert_round_trip(&edit);
+        assert_eq!(serde_json::to_value(edit).unwrap(), edit.to_string());
+        assert_ne!(EditId::random(), edit);
+
+        let mac = "67e55044-10b1-426f-9247-bb680e5fe0c8";
+        let by = MachineId(mac.parse().unwrap());
+        let cases = [
+            (
+                format!(r#"{{"kind":"numbered","stamp":{{"seq":9,"by":"{mac}"}}}}"#),
+                Outcome::Numbered {
+                    stamp: Stamp { seq: 9, by },
+                },
+            ),
+            (
+                r#"{"kind":"refused","reason":"it could not be stored"}"#.to_owned(),
+                Outcome::Refused {
+                    reason: "it could not be stored".into(),
+                },
+            ),
+        ];
+        for (json, expected) in cases {
+            assert_round_trip(&expected);
+            assert_eq!(
+                serde_json::from_str::<Outcome>(&json).expect(&json),
+                expected
+            );
         }
     }
 

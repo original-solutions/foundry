@@ -559,8 +559,8 @@ mod tests {
 
     use foundry_proto::ids::{MachineId, ProjectId};
     use foundry_proto::settings::{
-        Edit, Limits, Machine, Overwritten, Project, SettingKey, SettingValue, SharedSettings,
-        Stamp, StampKey,
+        Edit, EditId, Limits, Machine, Overwritten, Project, SettingKey, SettingValue,
+        SharedSettings, Stamp, StampKey,
     };
 
     use super::*;
@@ -1026,6 +1026,65 @@ mod tests {
         let out = merged(&a, &stale);
         assert_eq!(project_named(&out, 7).as_deref(), Some("p"));
         assert_eq!(out.seq, 10);
+    }
+
+    // --- the ids of numbered edits ---
+
+    #[test]
+    fn a_merge_keeps_the_numbered_edit_ids_of_both_copies() {
+        let (x, y) = (EditId::random(), EditId::random());
+        let mut a = numbered(&base(), &set_project(7, "from a"), id(A));
+        remember(&mut a, x, Stamp { seq: 2, by: id(A) });
+        let mut b = numbered(&base(), &set_project(8, "from b"), id(B));
+        remember(&mut b, y, Stamp { seq: 2, by: id(B) });
+        let out = merged(&a, &b);
+        assert_eq!(
+            out.numbered,
+            [
+                (x, Stamp { seq: 2, by: id(A) }),
+                (y, Stamp { seq: 2, by: id(B) })
+            ]
+            .into()
+        );
+    }
+
+    #[test]
+    fn one_id_numbered_on_two_sides_of_a_split_keeps_the_higher_stamp() {
+        let x = EditId::random();
+        let mut a = numbered(&base(), &set_project(7, "p"), id(A));
+        remember(&mut a, x, Stamp { seq: 2, by: id(A) });
+        let mut b = numbered(&base(), &Edit::RemoveLimits { machine: id(B) }, id(B));
+        b = numbered(&b, &set_project(7, "p"), id(B));
+        remember(&mut b, x, Stamp { seq: 3, by: id(B) });
+        assert_eq!(merged(&a, &b).numbered[&x], Stamp { seq: 3, by: id(B) });
+    }
+
+    #[test]
+    fn an_id_numbered_far_below_the_newest_is_forgotten_whatever_the_order() {
+        let (old, new) = (EditId::random(), EditId::random());
+        let low = Stamp { seq: 2, by: id(A) };
+        let high = Stamp {
+            seq: 2 + NUMBERED_KEPT,
+            by: id(B),
+        };
+        let mut a = base();
+        a.seq = low.seq;
+        remember(&mut a, old, low);
+        let mut b = base();
+        b.seq = high.seq;
+        remember(&mut b, new, high);
+        let out = merged(&a, &b);
+        assert_eq!(out.numbered, [(new, high)].into());
+
+        // One number closer, both are kept.
+        let mut near = b.clone();
+        near.numbered.clear();
+        remember(&mut near, new, Stamp { seq: high.seq - 1, ..high });
+        assert_eq!(merged(&a, &near).numbered.len(), 2);
+
+        // Remembering a newer id forgets one that falls out of the window.
+        remember(&mut a, new, high);
+        assert_eq!(a.numbered, [(new, high)].into());
     }
 
     #[test]

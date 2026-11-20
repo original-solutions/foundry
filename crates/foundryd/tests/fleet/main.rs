@@ -68,6 +68,23 @@ impl Daemon {
         }
     }
 
+    /// Stops this daemon and starts it again on the same database, dialing with `dialer`, with
+    /// a new coordinator when it had one. A task the stopped daemon left running goes on with a
+    /// scratch store, so it writes nothing the restarted daemon reads, as a stopped process
+    /// writes nothing. Its links must already be closed: [`Fleet::restart`] cuts them.
+    fn restart(&mut self, dialer: Arc<dyn Dialer>) {
+        self.run.abort();
+        let scratch = Store::open(self._dir.path().join("stopped.db")).unwrap();
+        drop(std::mem::replace(&mut *lock(&self.store), scratch));
+        self.store = Arc::new(Mutex::new(Store::open(&self.db).unwrap()));
+        self.peers = Peers::new(self.id, self.store.clone(), dialer);
+        let running = self.peers.clone();
+        self.run = tokio::spawn(async move { running.run().await });
+        if self.coordinator.is_some() {
+            self.coordinate();
+        }
+    }
+
     /// Gives this daemon a coordinator and returns it. Call it before the test first awaits,
     /// so no link opens without one.
     pub fn coordinate(&mut self) -> Arc<Coordinator> {
@@ -214,6 +231,22 @@ impl Fleet {
         self.net.cut.send_modify(|cut| {
             cut.remove(&id);
         });
+    }
+
+    /// Restarts daemon `i` ([`Daemon::restart`]): its links close, it starts again on the same
+    /// store with nothing held in memory, and it links again.
+    pub async fn restart(&mut self, i: usize) {
+        self.cut(i);
+        // Each passing link sees the cut and closes both its ends.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let id = self.daemons[i].id;
+        let dialer = NetDialer {
+            from: id,
+            net: self.net.clone(),
+        };
+        self.daemons[i].restart(Arc::new(dialer));
+        lock(&self.net.peers).insert(id, self.daemons[i].peers.clone());
+        self.heal(i);
     }
 
     /// True when every daemon holds the same records.
