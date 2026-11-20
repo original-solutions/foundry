@@ -212,6 +212,11 @@ impl Terminals {
             .await
     }
 
+    /// The machine whose terminals these are.
+    pub fn me(&self) -> MachineId {
+        self.inner.me
+    }
+
     /// Ends the terminal: hangs up its child, waits for its holder to end and deletes its
     /// record. A holder that is already gone is no error. The close finishes even when the
     /// caller stops waiting.

@@ -2,10 +2,10 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createMemoryHistory, createRouter, RouterProvider } from "@tanstack/react-router";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { Briefs, UiMessage } from "./api";
+import { machineQuery, type Briefs, type UiMessage } from "./api";
 import { router, routeTree } from "./App";
 import { button, pressed } from "./Modal";
-import { ME, sample, session, settings, terminal, workspace } from "./test-fixtures";
+import { ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
 import { FakeSocket, json, mockFetch, type Call } from "./test-utils";
 
 // jsdom cannot run xterm.js.
@@ -113,8 +113,11 @@ describe("App", () => {
   async function open(path: string, records: UiMessage & { type: "state" }) {
     const fresh = createRouter({ routeTree, history: createMemoryHistory({ initialEntries: [path] }) });
     await fresh.load();
+    // The UI is served by machine ME.
+    const client = new QueryClient();
+    client.setQueryData(machineQuery.queryKey, ME);
     render(
-      <QueryClientProvider client={new QueryClient()}>
+      <QueryClientProvider client={client}>
         <RouterProvider router={fresh} />
       </QueryClientProvider>,
     );
@@ -407,6 +410,124 @@ describe("App", () => {
     expect(sockets("/api/terminals/t2")[0].readyState).toBe(FakeSocket.CLOSED);
   });
 
+  const ended: UiMessage & { type: "state" } = {
+    ...live,
+    records: [...live.records, terminal(ME, "t3", "w1", "exited", { exit_code: 0 }), terminal(ME, "t4", "w1", "exited", { exit_code: 2 })],
+  };
+
+  it("right-clicking a terminal lists what can be done with it, and clearing an exited shell needs no asking", async () => {
+    const calls = mockActions(new Response(null, { status: 204 }));
+    await open("/terminals/t1", ended);
+    const sidebar = screen.getByRole("group", { name: "fix login" });
+
+    fireEvent.contextMenu(within(sidebar).getByRole("link", { name: /^shell Exited 0/ }));
+    const menu = await screen.findByRole("menu");
+    expect(within(menu).getAllByRole("menuitem").map((item) => item.textContent)).toEqual([
+      "Open",
+      "Open beside",
+      "Changes in fix login",
+      "Clear",
+      "Clear 2 ended in fix login",
+    ]);
+    fireEvent.click(within(menu).getByRole("menuitem", { name: "Clear" }));
+
+    await waitFor(() => expect(calls).toEqual([{ url: "/api/terminals/t3/close", method: "POST", body: undefined }]));
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("clears every ended terminal of a workspace at once from its row", async () => {
+    const calls = mockActions(new Response(null, { status: 204 }), new Response(null, { status: 204 }));
+    await open("/terminals/t1", ended);
+    const sidebar = screen.getByRole("group", { name: "fix login" });
+
+    fireEvent.click(within(sidebar).getByRole("button", { name: "Clear 2 ended" }));
+
+    await waitFor(() => expect(calls.map((c) => c.url).sort()).toEqual(["/api/terminals/t3/close", "/api/terminals/t4/close"]));
+  });
+
+  it("ends a running session from the header's menu only after asking, then moves to the next tab once it is gone", async () => {
+    const calls = mockActions(new Response(null, { status: 204 }));
+    const router = await open("/terminals/t1", live);
+    fireEvent.click(screen.getByRole("link", { name: /^shell/ }));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t2"));
+    fireEvent.click(screen.getByRole("tab", { name: /fix login \/ sonnet/ }));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t1"));
+
+    fireEvent.keyDown(within(screen.getByLabelText("Open terminal")).getByRole("button", { name: "More" }), { key: "Enter" });
+    const menu = await screen.findByRole("menu");
+    expect(within(menu).queryByRole("menuitem", { name: "Open" })).toBeNull();
+    fireEvent.click(within(menu).getByRole("menuitem", { name: "End sonnet…" }));
+    const dialog = await screen.findByRole("dialog", { name: "End sonnet?" });
+    expect(dialog.textContent).toMatch(/middle of a turn/);
+    expect(calls).toEqual([]);
+    fireEvent.click(within(dialog).getByRole("button", { name: "End" }));
+    await waitFor(() => expect(calls).toEqual([{ url: "/api/terminals/t1/close", method: "POST", body: undefined }]));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+
+    const events = sockets("/api/events").at(-1)!;
+    const gone: UiMessage = { type: "record", protocol: 1, record: terminal(ME, "t1", "w1", "exited", { deleted: true, version: 2 }) };
+    act(() => events.deliver(JSON.stringify(gone)));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t2"));
+    expect(within(screen.getByRole("group", { name: "fix login" })).queryByRole("link", { name: /^sonnet/ })).toBeNull();
+  });
+
+  it("says why a terminal could not be ended", async () => {
+    mockActions(json(404, { error: "no such terminal" }));
+    await open("/terminals/t1", ended);
+    fireEvent.contextMenu(within(screen.getByRole("group", { name: "fix login" })).getByRole("link", { name: /^shell Exited 2/ }));
+    fireEvent.click(within(await screen.findByRole("menu")).getByRole("menuitem", { name: "Clear" }));
+
+    expect((await screen.findByRole("alert")).textContent).toMatch(/no such terminal/);
+  });
+
+  it("offers no ending for another machine's terminals, which only that machine can end", async () => {
+    const calls = mockActions();
+    await open("/terminals/t1", {
+      ...ended,
+      records: [
+        ...ended.records,
+        sample(OTHER, 1),
+        workspace(OTHER, "w9", "remote job"),
+        terminal(OTHER, "t9", "w9", "exited", { exit_code: 0 }),
+        terminal(OTHER, "t8", "w9", "running"),
+      ],
+      settings: settings({ machines: [{ id: ME, name: "studio", address: "127.0.0.1" }, { id: OTHER, name: "attic", address: "10.0.0.2" }] }),
+    });
+    const remote = screen.getByRole("group", { name: "remote job" });
+    expect(within(remote).queryByRole("button", { name: /^Clear/ })).toBeNull();
+
+    for (const row of within(remote).getAllByRole("link", { name: /^shell/ })) {
+      fireEvent.contextMenu(row);
+      const menu = await screen.findByRole("menu");
+      expect(within(menu).getAllByRole("menuitem").map((item) => item.textContent)).toEqual(["Open", "Open beside", "Changes in remote job"]);
+      fireEvent.keyDown(menu, { key: "Escape" });
+      await waitFor(() => expect(screen.queryByRole("menu")).toBeNull());
+    }
+    // This machine's own ended terminals can still be cleared.
+    expect(within(screen.getByRole("group", { name: "fix login" })).getByRole("button", { name: "Clear 2 ended" })).toBeDefined();
+    expect(calls).toEqual([]);
+  });
+
+  it("does not end or clear anything when the button that opened the menu is let go over that item", async () => {
+    const calls = mockActions();
+    await open("/terminals/t1", ended);
+    const sidebar = screen.getByRole("group", { name: "fix login" });
+
+    // The press opened the menu under the pointer; its release lands on an item it never pressed.
+    for (const name of ["Clear", "Clear 2 ended in fix login"]) {
+      fireEvent.contextMenu(within(sidebar).getByRole("link", { name: /^shell Exited 0/ }));
+      fireEvent.pointerUp(within(await screen.findByRole("menu")).getByRole("menuitem", { name }));
+    }
+    fireEvent.contextMenu(within(sidebar).getByRole("link", { name: /^sonnet/ }));
+    fireEvent.pointerUp(within(await screen.findByRole("menu")).getByRole("menuitem", { name: "End sonnet…" }));
+    fireEvent.keyDown(within(screen.getByLabelText("Open terminal")).getByRole("button", { name: "More" }), { key: "Enter" });
+    fireEvent.pointerUp(within(await screen.findByRole("menu")).getByRole("menuitem", { name: "End sonnet…" }));
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(calls).toEqual([]);
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
   it("opens the open terminal's workspace changes from its header, and the header then shows their size", async () => {
     const calls = mockFetch(
       json(200, {
@@ -589,6 +710,19 @@ describe("App", () => {
     expect(find.getAttribute("aria-pressed")).toBe("true");
     fireEvent.click(find);
     expect(screen.queryByRole("searchbox")).toBeNull();
+  });
+
+  it("on a narrow screen, where the header has no room for Find, offers it in the header's menu", async () => {
+    vi.stubGlobal("matchMedia", () => ({ matches: false }));
+    await open("/terminals/t1", live);
+    fireEvent.keyDown(within(screen.getByLabelText("Open terminal")).getByRole("button", { name: "More" }), { key: "Enter" });
+    const menu = await screen.findByRole("menu");
+    expect(within(menu).queryByRole("menuitem", { name: "Open beside" })).toBeNull();
+
+    fireEvent.click(within(menu).getByRole("menuitem", { name: "Find in scrollback" }));
+    const box = await screen.findByRole("searchbox", { name: "Find in sonnet" });
+    await waitFor(() => expect(screen.queryByRole("menu")).toBeNull());
+    expect(document.activeElement).toBe(box);
   });
 
   it("leaves Ctrl+F inside the terminal to the program running there", async () => {

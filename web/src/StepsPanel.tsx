@@ -185,8 +185,8 @@ function End({ turn, running, newest, session }: { turn: Turn; running: boolean;
   return newest ? null : <p className="mt-1.5 text-xs text-neutral-500">Ended without finishing its turn</p>;
 }
 
-/** The time now, again every few seconds, so "how long ago" keeps up. */
-function useNow(every = 5000): number {
+/** The time now, again every `every` ms, so "how long ago" keeps up. */
+export function useNow(every = 5000): number {
   const [now, setNow] = useState(Date.now);
   useEffect(() => {
     const id = setInterval(() => setNow(Date.now()), every);
