@@ -1,15 +1,7 @@
-/** The open tabs, terminal ids in strip order, kept in this browser only. */
-const KEY = "foundry.tabs";
-
-/** `tabs` with terminal `id` added at the end, or `tabs` itself when it is already there. */
-export function withTab(tabs: string[], id: string): string[] {
-  return tabs.includes(id) ? tabs : [...tabs, id];
-}
-
 /**
- * How many tabs keep their pane attached. Each attached pane holds a socket and an xterm with up
+ * How many terminals keep their pane attached. Each attached pane holds a socket and an xterm with up
  * to 10,000 lines of scrollback, so with 50+ terminals they cannot all stay live. Six covers a
- * split (two) plus a working set to flick between; a tab beyond it attaches again when shown,
+ * split (two) plus a working set to flick between; one beyond it attaches again when shown,
  * and the holder sends its whole screen and scrollback as on a first open.
  */
 export const ATTACHED_MAX = 6;
@@ -29,22 +21,4 @@ export function withoutTab(tabs: string[], id: string): { tabs: string[]; next: 
   const at = tabs.indexOf(id);
   const rest = tabs.filter((t) => t !== id);
   return { tabs: rest, next: rest[Math.min(at, rest.length - 1)] };
-}
-
-/** The tabs this browser had open, or none when storage is empty, blocked or holds something else. */
-export function loadTabs(): string[] {
-  try {
-    const kept: unknown = JSON.parse(localStorage.getItem(KEY) ?? "[]");
-    return Array.isArray(kept) ? kept.filter((t): t is string => typeof t === "string") : [];
-  } catch {
-    return [];
-  }
-}
-
-export function saveTabs(tabs: string[]) {
-  try {
-    localStorage.setItem(KEY, JSON.stringify(tabs));
-  } catch {
-    // Storage blocked: the tabs last for this page only.
-  }
 }

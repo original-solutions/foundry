@@ -10,8 +10,8 @@ export const ATTENTION_EVERY = 2000;
 const key = ["attention"];
 
 /**
- * What needs a person, across the fleet: a card in the bottom corner while anything does, nothing
- * otherwise. Each item says what happened, what to do and on which machine, with its terminal one
+ * What needs a person, across the fleet: a card at the top of the layout's news while anything
+ * does, nothing otherwise. Each item says what happened, what to do and on which machine, with its terminal one
  * click away. A "setting overwritten" item is dismissed here; every other clears on its own.
  */
 export function AttentionList() {
@@ -32,7 +32,7 @@ export function AttentionList() {
   return (
     <section
       aria-label="Needs attention"
-      className="fixed inset-x-4 bottom-4 z-40 rounded-lg border border-amber-700/60 bg-neutral-900 text-sm shadow-lg shadow-black/50 md:left-auto md:w-96"
+      className="pointer-events-auto rounded-lg border border-amber-700/60 bg-neutral-900 text-sm shadow-lg shadow-black/50"
     >
       <button
         type="button"

@@ -10,6 +10,7 @@
 //!   cannot read, one a newer build wrote before a rollback, leaves out its owner's changes up
 //!   to it, with a warning, and the socket goes on.
 //! - `GET /api/terminals/{id}`, a WebSocket: see [`terminals`].
+//! - `GET /api/machine`: `{id}`, the machine that serves the UI, see [`machine`].
 //! - `GET /api/machines`: `{me, machines: [{id, name, online}]}`, this machine's id and each
 //!   machine in the machine list, in its order, with whether it is online.
 //! - `POST /api/workspaces` `{project, base, name, machine}`: makes a workspace, `201 {id}`, on
@@ -27,8 +28,9 @@
 //!   for it and for `GET /api/placements` and `POST /api/placements/{id}/cancel`.
 //! - `POST /api/workspaces/{id}/archive` `{force}` (the body is optional): `204`, or `409` with
 //!   the uncommitted files, unpushed commits and submodules that hold it up.
-//! - `POST /api/workspaces/{id}/sessions` `{model}`: starts Claude Code in the workspace, `201
-//!   {id}`.
+//! - `POST /api/workspaces/{id}/sessions` `{model, prompt}` (`prompt` is optional): starts
+//!   Claude Code in the workspace, on `prompt` as its first prompt when one is given, `201 {id}`.
+//!   A blank prompt is none; one with a NUL or over 20,000 characters is `422`.
 //! - `POST /api/workspaces/{id}/shells`: starts the daemon's `$SHELL` in the workspace, `201
 //!   {id}`.
 //! - `POST /api/terminals/{id}/close`: `204`.
@@ -36,8 +38,14 @@
 //!   These five actions, on a workspace or terminal another machine owns or a create that
 //!   names another machine, are carried to that machine and answered as it answers: see
 //!   [`carry`].
+//! - `POST /api/terminals/{id}/files?name=<name>`: keeps a file for the terminal and answers
+//!   its path, see [`files`].
 //! - `GET /api/workspaces/{id}/changes`: what the workspace changed since its base, see
 //!   [`changes`]. Only a workspace of this machine; any other is `404`.
+//! - `GET /api/workspaces/{id}/commits/{hash}`: what one commit on the workspace's branch
+//!   changed, see [`changes`]. Only a workspace of this machine.
+//! - `GET /api/workspaces/{id}/pr`: whether the workspace's branch is on `origin`, what is only
+//!   on this machine, and its pull request, see [`pr`]. Only a workspace of this machine.
 //! - `GET /api/briefs`: what each session of this machine is for and doing, see [`briefs`].
 //! - `GET /api/sessions/{id}/trail`: every step a session of this machine took, see [`trail`].
 //!
@@ -98,7 +106,9 @@ mod briefs;
 mod carry;
 pub(crate) use carry::carries;
 mod changes;
+mod files;
 mod machine;
+mod pr;
 pub mod terminals;
 #[cfg(test)]
 mod tests;
@@ -158,11 +168,17 @@ pub fn router(api: Api) -> Router {
         .route("/api/events", get(events))
         .route("/api/terminals/{id}", get(terminals::socket))
         .route("/api/terminals/{id}/close", post(close_terminal))
+        .route(
+            "/api/terminals/{id}/files",
+            post(files::keep).layer(axum::extract::DefaultBodyLimit::max(files::MAX_FILE)),
+        )
         .route("/api/workspaces", post(create_workspace))
         .route("/api/workspaces/{id}/archive", post(archive_workspace))
         .route("/api/workspaces/{id}/sessions", post(start_session))
         .route("/api/workspaces/{id}/shells", post(start_shell))
         .route("/api/workspaces/{id}/changes", get(changes::changes))
+        .route("/api/workspaces/{id}/commits/{hash}", get(changes::commit))
+        .route("/api/workspaces/{id}/pr", get(pr::shipping))
         .route("/api/briefs", get(briefs::briefs))
         .route("/api/machine", get(machine::machine))
         .route("/api/sessions/{id}/trail", get(trail::trail))
@@ -402,7 +418,9 @@ impl IntoResponse for ApiError {
             }
             Self::Workspace(e) => (
                 match e {
-                    WorkspaceError::Unknown(_) => StatusCode::NOT_FOUND,
+                    WorkspaceError::Unknown(_) | WorkspaceError::UnknownCommit(_) => {
+                        StatusCode::NOT_FOUND
+                    }
                     WorkspaceError::UnknownProject(_) | WorkspaceError::UnknownBase(_) => {
                         StatusCode::UNPROCESSABLE_ENTITY
                     }

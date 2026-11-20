@@ -38,7 +38,7 @@
 //! Every branch is made by [`safe_branch`] and every path reaches git after `--`, so a name as
 //! typed never reads as an option and never leaves the project's folder of worktrees.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fmt;
 use std::future::Future;
@@ -56,10 +56,12 @@ use crate::store::{Store, StoreError};
 use crate::terminals::{TerminalError, Terminals};
 
 mod changes;
+mod pr;
 #[cfg(test)]
 mod tests;
 
 pub use changes::{Changes, Commit, FileChange, FileStatus};
+pub use pr::{Checks, PrState, PullRequest, Review, Shipping};
 
 /// The longest branch [`safe_branch`] makes, in bytes.
 const BRANCH_AT_MOST: usize = 100;
@@ -96,6 +98,8 @@ pub enum WorkspaceError {
     BranchExists(String),
     #[error("the project's remote has no branch {0}")]
     UnknownBase(String),
+    #[error("commit {0} is not on this workspace's branch")]
+    UnknownCommit(String),
     #[error(transparent)]
     Dirty(Dirty),
     #[error("git {command} failed: {stderr}")]
@@ -220,11 +224,16 @@ struct Inner {
     terminals: Arc<Terminals>,
     data: PathBuf,
     git_within: Duration,
+    /// The program run to ask GitHub about a branch's pull request.
+    gh: std::ffi::OsString,
     /// One lock per project, held across every step that changes its clone or worktrees.
     projects: Mutex<HashMap<ProjectId, Arc<tokio::sync::Mutex<()>>>>,
     /// One lock per workspace, held by an archive and by a start for their whole work
     /// ([`Workspaces::locked`]). A workspace no one holds or waits for has none.
     lifecycle: Mutex<HashMap<WorkspaceId, Arc<tokio::sync::Mutex<()>>>>,
+    /// The workspaces whose worktree an archive is removing, from just before it starts to
+    /// after the record says archived ([`Removing`]).
+    removing: Mutex<HashSet<WorkspaceId>>,
 }
 
 impl Workspaces {
@@ -255,10 +264,21 @@ impl Workspaces {
                 terminals,
                 data,
                 git_within,
+                gh: pr::gh(),
                 projects: Mutex::default(),
                 lifecycle: Mutex::default(),
+                removing: Mutex::default(),
             }),
         }
+    }
+
+    /// These workspaces asking GitHub with the program at `gh` in place of `gh`.
+    #[cfg(test)]
+    pub(crate) fn with_gh(mut self, gh: &Path) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("set before the workspaces are shared")
+            .gh = gh.into();
+        self
     }
 
     /// Makes a workspace of `project` named `name`, on a new branch from `base` on the
@@ -545,11 +565,13 @@ impl Inner {
                 Err(e) => return Err(e.into()),
             }
         }
-        if tokio::fs::try_exists(&worktree).await? {
-            if !force {
-                // What the terminals wrote as they were hung up counts too.
-                self.refuse_dirty(&clone, &worktree, &body.branch).await?;
-            }
+        let there = tokio::fs::try_exists(&worktree).await?;
+        if there && !force {
+            // What the terminals wrote as they were hung up counts too.
+            self.refuse_dirty(&clone, &worktree, &body.branch).await?;
+        }
+        let _removing = Removing::mark(self, id);
+        if there {
             self.remove_worktree(&clone, &worktree, force).await?;
         } else if let Some((listed, _)) = self.registered(&clone, &worktree).await? {
             // Removed by hand: git forgets this worktree, and only this one, so its branch can be
@@ -1222,6 +1244,33 @@ fn sh(script: &str, args: impl IntoIterator<Item = String>) -> Vec<String> {
         .map(str::to_owned)
         .chain(args)
         .collect()
+}
+
+/// Marks a workspace's worktree as being removed until dropped. An archive holds it from just
+/// before it removes the worktree until its record says archived, so a read that overlaps any of
+/// that, which takes no lock, can tell its result is of a worktree half removed.
+struct Removing<'a> {
+    inner: &'a Inner,
+    id: WorkspaceId,
+}
+
+impl<'a> Removing<'a> {
+    fn mark(inner: &'a Inner, id: WorkspaceId) -> Self {
+        lock(&inner.removing).insert(id);
+        Removing { inner, id }
+    }
+}
+
+impl Drop for Removing<'_> {
+    fn drop(&mut self) {
+        lock(&self.inner.removing).remove(&self.id);
+    }
+}
+
+impl Inner {
+    fn removing(&self, id: WorkspaceId) -> bool {
+        lock(&self.removing).contains(&id)
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {

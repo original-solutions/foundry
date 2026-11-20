@@ -23,8 +23,8 @@ describe("destinations", () => {
   it("lists every terminal in the fleet with its workspace, name, state and machine, then a new shell per workspace", () => {
     const all = destinations(machines());
     expect(all.map((d) => d.title)).toEqual(["fix login / sonnet", "fix login / shell", "tidy readme / opus", "New shell in fix login", "New shell in tidy readme"]);
-    expect(all[0]).toMatchObject({ kind: "terminal", terminal: "t1", label: "Waiting for you", glyph: "waiting", machine: "studio" });
-    expect(all[1]).toMatchObject({ kind: "terminal", terminal: "t2", label: "Exited 2", glyph: "failed" });
+    expect(all[0]).toMatchObject({ kind: "terminal", terminal: "t1", label: "Needs you", glyph: "waiting", machine: "studio" });
+    expect(all[1]).toMatchObject({ kind: "terminal", terminal: "t2", label: "Failed · exit 2", glyph: "failed" });
     expect(all[2]).toMatchObject({ machine: "mini", glyph: "working" });
     expect(all[3]).toMatchObject({ kind: "shell", workspace: "w1" });
   });
@@ -37,9 +37,9 @@ describe("search", () => {
 
   it("keeps a destination only when every word is in its workspace, name, state, project, branch or machine", () => {
     const titles = (query: string) => search(destinations(machines()), query).map((d) => d.title);
-    expect(titles("LOGIN waiting")).toEqual(["fix login / sonnet"]);
+    expect(titles("LOGIN needs")).toEqual(["fix login / sonnet"]);
     expect(titles("mini")).toEqual(["tidy readme / opus", "New shell in tidy readme"]);
-    expect(titles("demo exited")).toEqual(["fix login / shell"]);
+    expect(titles("demo failed")).toEqual(["fix login / shell"]);
     expect(titles("new shell tidy")).toEqual(["New shell in tidy readme"]);
     expect(titles("nothing-like-this")).toEqual([]);
   });
@@ -54,13 +54,13 @@ describe("briefs in the palette", () => {
     );
     const found = search(destinations(withBriefs), "release");
     expect(found).toHaveLength(1);
-    expect(found[0]).toMatchObject({ kind: "terminal", terminal: "t2", title: "fix login / opus", subtitle: "write the release notes" });
+    expect(found[0]).toMatchObject({ kind: "terminal", terminal: "t2", title: "fix login / opus 2", subtitle: "write the release notes" });
   });
 });
 
 describe("newWorkspace", () => {
   it("names a new workspace with what was typed, and offers none for nothing", () => {
-    expect(newWorkspace("  add   search ")).toEqual([expect.objectContaining({ kind: "workspace", name: "add search", title: "New workspace “add search”" })]);
+    expect(newWorkspace("  add   search ")).toEqual([expect.objectContaining({ kind: "workspace", name: "add search", title: "New task “add search”" })]);
     expect(newWorkspace("   ")).toEqual([]);
   });
 });

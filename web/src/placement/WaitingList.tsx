@@ -44,7 +44,7 @@ function Requests({ requests }: { requests: Placement[] }) {
   return (
     <section
       aria-label="Waiting for a machine"
-      className="fixed inset-x-4 top-14 z-40 rounded-lg border border-sky-800/60 bg-neutral-900 text-sm shadow-lg shadow-black/50 md:inset-x-auto md:top-auto md:bottom-4 md:left-4 md:w-96"
+      className="pointer-events-auto rounded-lg border border-sky-800/60 bg-neutral-900 text-sm shadow-lg shadow-black/50"
     >
       <button
         type="button"

@@ -1,5 +1,5 @@
-//! `GET /api/machine`: which machine serves the UI, as `{"id": ...}`. Only this machine can end
-//! its terminals, so the UI offers ending one only when its record names this machine.
+//! `GET /api/machine`: which machine serves the UI, as `{"id": ...}`, so the UI can tell this
+//! machine's records from another machine's.
 
 use axum::Json;
 use axum::extract::State;

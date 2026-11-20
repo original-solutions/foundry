@@ -42,7 +42,7 @@ describe("NewSession", () => {
     const dialog = await screen.findByRole("dialog");
     fireEvent.click(within(dialog).getByRole("button", { name: "Start" }));
 
-    expect((await within(dialog).findByRole("alert")).textContent).toContain("set FOUNDRY_GATEWAY_URL");
+    expect((await within(dialog).findByRole("alert")).textContent).toBe("Could not start a session in fix login: set FOUNDRY_GATEWAY_URL.");
     expect(screen.getByRole("dialog")).toBeDefined();
   });
 

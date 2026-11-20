@@ -16,3 +16,10 @@ export function pollEvery(every: number, live: boolean) {
     return status === "error" ? Math.max(every, RETRY_EVERY) : every;
   };
 }
+
+/**
+ * How often a workspace's changes are read while an agent in it works, on a board card on screen
+ * or grouped by shipping. Otherwise they are read when shown and when one of its terminals changes
+ * state, never on a timer: each read runs git several times, and a fleet has dozens of workspaces.
+ */
+export const BOARD_BUSY_EVERY = 30_000;

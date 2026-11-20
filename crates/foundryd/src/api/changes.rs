@@ -1,6 +1,8 @@
 //! `GET /api/workspaces/{id}/changes`: what a workspace of this machine has changed since it
 //! left its base, as [`crate::workspaces::Changes`]. Every path, patch and commit subject is
 //! passed through [`redact`], so a URL with a password in it shows without the password.
+//! `GET /api/workspaces/{id}/commits/{hash}`: what one commit on its branch changed, shown the
+//! same way.
 
 use axum::Json;
 use axum::extract::{Path, State};
@@ -16,6 +18,15 @@ pub(super) async fn changes(
 ) -> Result<Response, ApiError> {
     let id = parse_id(&id, "workspace", WorkspaceId)?;
     let changes = api.workspaces.changes(id).await?;
+    Ok(Json(shown(changes)).into_response())
+}
+
+pub(super) async fn commit(
+    State(api): State<Api>,
+    Path((id, hash)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let id = parse_id(&id, "workspace", WorkspaceId)?;
+    let changes = api.workspaces.commit(id, &hash).await?;
     Ok(Json(shown(changes)).into_response())
 }
 
