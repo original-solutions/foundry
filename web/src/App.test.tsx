@@ -341,4 +341,65 @@ describe("App", () => {
     expect(sockets("/api/terminals/t1")).toHaveLength(0);
     expect(sockets("/api/terminals/t2")).toHaveLength(0);
   });
+  const three: UiMessage & { type: "state" } = { ...live, records: [...live.records, terminal(ME, "t3", "w1", "running")] };
+
+  it("opens a second terminal beside the open one, and both stay attached and headed", async () => {
+    const router = await open("/terminals/t1", live);
+    fireEvent.click(within(screen.getByLabelText("Open terminal")).getByRole("button", { name: "Open beside" }));
+    const picker = await screen.findByRole("dialog", { name: "Open beside fix login / sonnet" });
+    expect(within(picker).getAllByRole("option").map((o) => o.textContent)).toEqual([
+      expect.stringContaining("fix login / shell"),
+      expect.stringContaining("New shell in fix login"),
+    ]);
+    fireEvent.keyDown(within(picker).getByRole("combobox"), { key: "Enter" });
+
+    await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t2"));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(within(screen.getByLabelText("Open terminal")).getByText("shell")).toBeDefined();
+    expect(within(screen.getByLabelText("Terminal beside")).getByText("sonnet")).toBeDefined();
+    expect(sockets("/api/terminals/t1")[0].readyState).not.toBe(FakeSocket.CLOSED);
+    expect(sockets("/api/terminals/t2")).toHaveLength(1);
+    expect(screen.getAllByRole("tab").map((t) => t.getAttribute("data-beside"))).toEqual(["true", null]);
+  });
+
+  it("moves focus to the pane you press in, shows a tab you pick in the focused side, and closes a side to one", async () => {
+    const router = await open("/terminals/t1", three);
+    fireEvent.keyDown(window, { key: "k", metaKey: true });
+    const palette = await screen.findByRole("dialog", { name: "Jump to" });
+    fireEvent.change(within(palette).getByRole("combobox"), { target: { value: "shell" } });
+    fireEvent.keyDown(within(palette).getByRole("combobox"), { key: "Enter", shiftKey: true });
+    await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t2"));
+    expect(screen.getByLabelText("Terminal beside")).toBeDefined();
+
+    fireEvent.pointerDown(screen.getByTestId("pane-t1"));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t1"));
+    expect(within(screen.getByLabelText("Terminal beside")).getByText("shell")).toBeDefined();
+
+    fireEvent.keyDown(window, { key: "k", metaKey: true });
+    const again = await screen.findByRole("dialog", { name: "Jump to" });
+    const input = within(again).getByRole("combobox");
+    fireEvent.change(input, { target: { value: "shell" } });
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t3"));
+    expect(within(screen.getByLabelText("Terminal beside")).getByText("shell")).toBeDefined();
+    expect(screen.queryByText("sonnet", { selector: "header *" })).toBeNull();
+    expect(sockets("/api/terminals/t1")[0].readyState).not.toBe(FakeSocket.CLOSED);
+
+    fireEvent.click(within(screen.getByLabelText("Terminal beside")).getByRole("button", { name: "Close pane" }));
+    expect(screen.queryByLabelText("Terminal beside")).toBeNull();
+    expect(router.state.location.pathname).toBe("/terminals/t3");
+  });
+
+  it("toggles the split with Cmd+\\: a picker opens it, the same keys close it", async () => {
+    await open("/terminals/t1", live);
+    fireEvent.keyDown(window, { key: "\\", metaKey: true });
+    const picker = await screen.findByRole("dialog", { name: /^Open beside/ });
+    fireEvent.keyDown(within(picker).getByRole("combobox"), { key: "Enter" });
+    await waitFor(() => expect(screen.getByLabelText("Terminal beside")).toBeDefined());
+
+    fireEvent.keyDown(window, { key: "\\", metaKey: true });
+    expect(screen.queryByLabelText("Terminal beside")).toBeNull();
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
 });

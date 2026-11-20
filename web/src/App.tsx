@@ -5,6 +5,7 @@ import { CreateWorkspace } from "./CreateWorkspace";
 import { JumpPalette, jumpKey, SearchIcon } from "./JumpPalette";
 import { Sidebar } from "./Sidebar";
 import { TabStrip } from "./TabStrip";
+import { beside, follow, type Split } from "./split";
 import { loadTabs, saveTabs, withoutTab, withTab } from "./tabs";
 import { TerminalHeader } from "./TerminalHeader";
 import { TerminalPane } from "./TerminalPane";
@@ -25,13 +26,20 @@ import { useFleet } from "./useFleet";
  * beside it.
  *
  * A workspace's changes since its base open as a sheet from the header or the workspace's row.
+ *
+ * On a wide screen a second terminal can be shown beside the open one (the header's split button,
+ * Cmd+\ or Shift+Enter in the palette), each with its own header. The URL names the side with the
+ * keyboard; pressing in the other side moves it there, and a terminal opened from anywhere takes
+ * the side that has it. On a narrow screen only that side shows.
  */
 function Layout() {
   const { state, connected } = useFleet();
   const { terminalId } = useParams({ strict: false });
   const machines = useMemo(() => fleet(state.records, state.settings), [state.records, state.settings]);
   const [drawer, setDrawer] = useState(false);
-  const [jump, setJump] = useState(false);
+  /** The palette, and whether its picks open beside the open terminal. */
+  const [jump, setJump] = useState<"jump" | "beside">();
+  const [split, setSplit] = useState<Split>();
   /** The new-workspace dialog: open, and the name it starts with. */
   const [create, setCreate] = useState({ open: false, name: "" });
   /** The workspace whose changes are open. */
@@ -52,13 +60,16 @@ function Layout() {
   const [opened, setOpened] = useState<string>();
   if (terminalId !== opened) {
     setOpened(terminalId);
+    setSplit(follow(split, opened, terminalId));
     if (terminalId && !gone.has(terminalId)) setKept(withTab(kept, terminalId));
     if (terminalId) setAttached(withTab(attached, terminalId));
   }
   if (terminalId && located && seen[terminalId] !== located.label) setSeen({ ...seen, [terminalId]: located.label });
   if (kept.some((id) => gone.has(id))) setKept(kept.filter((id) => !gone.has(id)));
   if (attached.some((id) => id !== terminalId && gone.has(id))) setAttached(attached.filter((id) => id === terminalId || !gone.has(id)));
+  if (split && (gone.has(split.left) || gone.has(split.right))) setSplit(undefined);
   useEffect(() => saveTabs(kept), [kept]);
+  const pair = split && terminalId && (split.left === terminalId || split.right === terminalId) ? split : undefined;
 
   // Adjusted while rendering, like the tabs above: once the new session shows up, it and the
   // workspace's setup shell become tabs, and the session is the one to open.
@@ -75,18 +86,35 @@ function Layout() {
   }, [landed, navigate]);
 
   const changed = new Set(kept.filter((id) => seen[id] !== undefined && seen[id] !== locate(machines, id)?.label));
+  const show = (id: string) => void navigate({ to: "/terminals/$terminalId", params: { terminalId: id } });
+  /** Ends the split by closing side `id`; the other side keeps or takes the keyboard. */
+  const closePane = (id: string) => {
+    setSplit(undefined);
+    if (pair && id === terminalId) show(id === pair.left ? pair.right : pair.left);
+  };
   const closeTab = (id: string) => {
     const { tabs, next } = withoutTab(kept, id);
     setKept(tabs);
     setAttached(attached.filter((t) => t !== id));
+    if (pair && (id === pair.left || id === pair.right)) return closePane(id);
     if (id !== terminalId) return;
-    if (next) void navigate({ to: "/terminals/$terminalId", params: { terminalId: next } });
+    if (next) show(next);
     else void navigate({ to: "/" });
+  };
+  const openBeside = (id: string) => {
+    if (!terminalId || id === terminalId) return;
+    setSplit(beside(pair, terminalId, id));
+    show(id);
+  };
+  /** Gives the keyboard to side `id` of the split when the user presses or tabs into it. */
+  const focusPane = (id: string) => (event: React.SyntheticEvent) => {
+    if (id === terminalId || (event.target instanceof Element && event.target.closest("button"))) return;
+    show(id);
   };
   const close = () => setDrawer(false);
   const openJump = () => {
     setDrawer(false);
-    setJump(true);
+    setJump("jump");
   };
   const openChanges = (workspace: string) => {
     setDrawer(false);
@@ -112,11 +140,26 @@ function Layout() {
       event.preventDefault();
       event.stopPropagation();
       setDrawer(false);
-      setJump((open) => !open);
+      setJump((open) => (open ? undefined : "jump"));
     };
     window.addEventListener("keydown", shortcut, true);
     return () => window.removeEventListener("keydown", shortcut, true);
   }, []);
+
+  useLayoutEffect(() => {
+    if (!terminalId) return;
+    const toggle = (event: KeyboardEvent) => {
+      if (event.key !== "\\" || event.altKey || event.shiftKey) return;
+      const inTerminal = event.target instanceof Element && event.target.closest(".xterm");
+      if (!event.metaKey && !(event.ctrlKey && !inTerminal)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      if (split) setSplit(undefined);
+      else setJump("beside");
+    };
+    window.addEventListener("keydown", toggle, true);
+    return () => window.removeEventListener("keydown", toggle, true);
+  }, [terminalId, split]);
 
   const place = !terminalId ? "flex w-full md:w-auto" : drawer ? "fixed inset-0 z-30 flex md:static md:z-auto" : "hidden md:flex";
   return (
@@ -134,19 +177,56 @@ function Layout() {
         />
       </div>
       <main className={`${terminalId ? "flex" : "hidden md:flex"} min-w-0 flex-1 flex-col`}>
-        <TabStrip machines={machines} tabs={kept} active={terminalId} changed={changed} onClose={closeTab} />
-        {terminalId && <TerminalHeader located={located} drawerOpen={drawer} onMenu={() => setDrawer(true)} onJump={openJump} onChanges={openChanges} />}
+        <TabStrip
+          machines={machines}
+          tabs={kept}
+          active={terminalId}
+          beside={pair && (pair.left === terminalId ? pair.right : pair.left)}
+          changed={changed}
+          onClose={closeTab}
+        />
+        {terminalId && (
+          <div className="flex shrink-0">
+            {(pair ? [pair.left, pair.right] : [terminalId]).map((id) => (
+              <div key={id} className="contents" onPointerDown={focusPane(id)}>
+                <TerminalHeader
+                  located={id === terminalId ? located : locate(machines, id)}
+                  drawerOpen={drawer}
+                  onMenu={() => setDrawer(true)}
+                  onJump={openJump}
+                  onChanges={openChanges}
+                  onSplit={pair ? undefined : () => setJump("beside")}
+                  onClosePane={pair ? () => closePane(id) : undefined}
+                  beside={id !== terminalId}
+                />
+              </div>
+            ))}
+          </div>
+        )}
         <div className="relative min-h-0 flex-1">
-          {attached.map((id) => (
-            <div key={id} className={`absolute inset-0 ${id === terminalId ? "" : "invisible"}`}>
-              <TerminalPane id={id} running={terminalRunning(state, id)} active={id === terminalId} />
-            </div>
-          ))}
+          {attached.map((id) => {
+            const side = pair && (id === pair.left ? "left" : id === pair.right ? "right" : undefined);
+            const place = side === "left" ? "inset-y-0 left-0 right-0 md:right-1/2" : side === "right" ? "inset-y-0 right-0 left-0 md:left-1/2 md:border-l md:border-neutral-800" : "inset-0";
+            const seen = id === terminalId ? "" : side ? "invisible md:visible" : "invisible";
+            return (
+              <div key={id} data-testid={`pane-${id}`} onPointerDownCapture={side && focusPane(id)} onFocusCapture={side && focusPane(id)} className={`absolute ${place} ${seen}`}>
+                <TerminalPane id={id} running={terminalRunning(state, id)} active={id === terminalId} />
+              </div>
+            );
+          })}
           {!terminalId && <Home machines={machines} onJump={openJump} onCreate={() => openCreate()} />}
         </div>
       </main>
       <ChangesPanel workspace={machines.flatMap((m) => m.workspaces).find((w) => w.id === changesOf)} onClose={() => setChangesOf(undefined)} />
-      <JumpPalette machines={machines} open={jump} onOpenChange={setJump} onCreate={openCreate} />
+      <JumpPalette
+        machines={machines}
+        open={jump !== undefined}
+        onOpenChange={(open) => setJump(open ? "jump" : undefined)}
+        onCreate={openCreate}
+        current={terminalId && located ? { terminal: terminalId, title: `${located.workspace.name} / ${located.name}` } : undefined}
+        besideOnly={jump === "beside"}
+        onBeside={openBeside}
+      />
       <CreateWorkspace
         projects={state.settings.projects}
         workspaces={machines.flatMap((m) => m.workspaces)}

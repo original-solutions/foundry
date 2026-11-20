@@ -5,10 +5,15 @@ import type { Located } from "./fleet";
 import { jumpKey, SearchIcon } from "./JumpPalette";
 import { StatePill } from "./StateGlyph";
 
+/** The key that opens a terminal beside the open one, or closes the split. */
+export const splitKey = jumpKey === "⌘K" ? "⌘\\" : "Ctrl \\";
+
 /**
- * The bar above the open terminal: which workspace and terminal it is, the machine it runs on and
- * its state, and the way into the workspace's changes. On a narrow screen it holds the button that
- * opens the sidebar as a drawer.
+ * The bar above a terminal: which workspace and terminal it is, the machine it runs on and its
+ * state, and the way into the workspace's changes. On a narrow screen it holds the button that
+ * opens the sidebar as a drawer. On a wide one it opens another terminal beside this one, or, in
+ * a split, closes its own side. In a split the side with the keyboard has a lit edge; the other
+ * is dimmed.
  */
 export function TerminalHeader({
   located,
@@ -16,6 +21,9 @@ export function TerminalHeader({
   onMenu,
   onJump,
   onChanges,
+  onSplit,
+  onClosePane,
+  beside = false,
 }: {
   located?: Located;
   drawerOpen: boolean;
@@ -23,9 +31,19 @@ export function TerminalHeader({
   onJump: () => void;
   /** Opens the changes of the terminal's workspace. */
   onChanges: (workspace: string) => void;
+  /** Offered when nothing is beside: picks a terminal to show beside this one. */
+  onSplit?: () => void;
+  /** Offered in a split: closes this side, leaving the other. */
+  onClosePane?: () => void;
+  /** This is the side of a split without the keyboard: dimmed, and hidden on a narrow screen. */
+  beside?: boolean;
 }) {
   return (
-    <header aria-label="Open terminal" className="flex h-11 shrink-0 items-center gap-3 border-b border-neutral-800 bg-neutral-900 px-3 text-sm">
+    <header
+      aria-label={beside ? "Terminal beside" : "Open terminal"}
+      className={`relative h-11 min-w-0 flex-1 items-center gap-3 border-b border-neutral-800 bg-neutral-900 px-3 text-sm ${beside ? "hidden opacity-60 transition-opacity hover:opacity-100 md:flex" : "flex"}`}
+    >
+      {onClosePane && !beside && <span aria-hidden="true" className="absolute inset-x-0 bottom-0 h-0.5 bg-sky-400/70" />}
       <button
         type="button"
         aria-label="Workspaces"
@@ -53,6 +71,34 @@ export function TerminalHeader({
         </>
       ) : (
         <span className="flex-1 text-neutral-500">Terminal</span>
+      )}
+      {onSplit && (
+        <button
+          type="button"
+          aria-label="Open beside"
+          title={`Open another terminal beside this one (${splitKey})`}
+          onClick={onSplit}
+          className="hidden rounded p-1.5 text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200 md:block"
+        >
+          <svg viewBox="0 0 16 16" className="size-4" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
+            <rect x="2" y="2.5" width="12" height="11" rx="1.5" />
+            <path d="M8 2.5v11" />
+          </svg>
+        </button>
+      )}
+      {onClosePane && (
+        <button
+          type="button"
+          aria-label="Close pane"
+          title="Close this side (the terminal keeps running)"
+          onClick={onClosePane}
+          className="hidden rounded p-1.5 text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200 md:block"
+        >
+          <svg viewBox="0 0 16 16" className="size-4" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
+            <rect x="2" y="2.5" width="12" height="11" rx="1.5" />
+            <path d="M6 6l4 4M10 6l-4 4" strokeLinecap="round" />
+          </svg>
+        </button>
       )}
       <button
         type="button"

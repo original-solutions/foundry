@@ -6,8 +6,10 @@ import { glyphText, StateGlyph } from "./StateGlyph";
 interface Props {
   machines: MachineView[];
   tabs: string[];
-  /** The terminal shown now. */
+  /** The terminal shown now, with the keyboard. */
   active?: string;
+  /** The terminal shown beside it in a split. */
+  beside?: string;
   /** Tabs in the background whose state changed since they were last shown. */
   changed: Set<string>;
   onClose: (id: string) => void;
@@ -19,7 +21,7 @@ interface Props {
  * state until it is shown. Closing a tab leaves its terminal running. On a narrow screen the strip
  * shows only once there is a second tab to switch to.
  */
-export function TabStrip({ machines, tabs, active, changed, onClose }: Props) {
+export function TabStrip({ machines, tabs, active, beside, changed, onClose }: Props) {
   const strip = useRef<HTMLDivElement>(null);
   useEffect(() => {
     strip.current?.querySelector('[aria-selected="true"]')?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
@@ -51,12 +53,14 @@ export function TabStrip({ machines, tabs, active, changed, onClose }: Props) {
             }`}
           >
             {current && <span aria-hidden="true" className="absolute inset-x-0 top-0 h-0.5 bg-sky-400" />}
+            {id === beside && <span aria-hidden="true" className="absolute inset-x-0 top-0 h-0.5 bg-sky-400/35" />}
             <Link
               to="/terminals/$terminalId"
               params={{ terminalId: id }}
               role="tab"
               aria-selected={current}
               data-changed={fresh ? "true" : undefined}
+              data-beside={id === beside ? "true" : undefined}
               title={found ? `${title} on ${found.machine.name}: ${found.label}` : title}
               className="flex min-w-0 flex-1 items-center gap-2 py-1 pr-1 pl-3 text-xs"
             >
