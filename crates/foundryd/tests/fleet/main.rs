@@ -4,6 +4,7 @@
 //! the harness, so a test can cut a machine off and heal it, and run with tokio's paused clock
 //! to simulate hours in milliseconds.
 
+mod call;
 mod coordinator;
 mod relay;
 mod sync;

@@ -66,7 +66,7 @@ function Body({
         <h2 className="text-xl font-semibold tracking-tight text-neutral-50 sm:text-2xl">
           <label htmlFor="new-task">What should Claude work on?</label>
         </h2>
-        <Dialog.Description className="text-neutral-400">A branch and a folder of its own on this machine, with Claude Code at work in it.</Dialog.Description>
+        <Dialog.Description className="text-neutral-400">A branch and a folder of its own, with Claude Code at work in it.</Dialog.Description>
       </div>
       <Composer
         mode="page"

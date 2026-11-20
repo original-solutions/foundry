@@ -5,7 +5,7 @@ import { fleet } from "./fleet";
 import { field, inlineField } from "./Modal";
 import { NewTask } from "./NewTask";
 import { ME, session, settings, terminal, workspace } from "./test-fixtures";
-import { json, mockFetch, renderApp } from "./test-utils";
+import { json, mockFetch, renderApp, type Call } from "./test-utils";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -90,6 +90,58 @@ describe("NewTask", () => {
     await renderApp(<Harness />);
 
     const dialog = await show();
+    expect(within(dialog).queryByLabelText("Machine")).toBeNull();
+    expect(within(dialog).getByText(/on this machine/)).toBeDefined();
+  });
+
+  it("offers each other machine by name, an offline one shown but not pickable, and makes the workspace on the one picked", async () => {
+    const machines = {
+      me: ME,
+      machines: [
+        { id: ME, name: "studio", online: true },
+        { id: "m2", name: "laptop", online: true },
+        { id: "m3", name: "old mini", online: false },
+      ],
+    };
+    const calls: Call[] = [];
+    const answers = [json(201, { id: "w9" }), json(201, { id: "s9" })];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init: RequestInit = {}) => {
+        if (url === "/api/machines") return json(200, machines);
+        calls.push({ url, method: init.method ?? "GET", body: init.body ? JSON.parse(String(init.body)) : undefined });
+        return answers.shift() ?? json(500, { error: "unexpected request" });
+      }),
+    );
+    await renderApp(<Harness />);
+
+    const dialog = await show();
+    const machine = (await within(dialog).findByLabelText("Machine")) as HTMLSelectElement;
+    expect(Array.from(machine.options).map((o) => [o.textContent, o.disabled])).toEqual([
+      ["this machine", false],
+      ["laptop", false],
+      ["old mini (offline)", true],
+    ]);
+    expect(machine.value).toBe("");
+    expect(within(dialog).queryByText(/on this machine/)).toBeNull();
+
+    fireEvent.change(taskBox(dialog), { target: { value: "Far work" } });
+    fireEvent.change(machine, { target: { value: "m2" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Start" }));
+
+    await waitFor(() => expect(calls).toHaveLength(2));
+    expect(calls[0].body).toEqual({ project: "p1", base: "main", name: "far work", machine: "m2" });
+    expect(calls[1]).toEqual({ url: "/api/workspaces/w9/sessions", method: "POST", body: { model: "opus", prompt: "Far work" } });
+  });
+
+  it("still makes the workspace on this machine when the machine list cannot be read", async () => {
+    const read = vi.fn(async () => json(500, { error: "store unreadable" }));
+    vi.stubGlobal("fetch", read);
+    await renderApp(<Harness />);
+
+    const dialog = await show();
+    await waitFor(() => expect(read).toHaveBeenCalledWith("/api/machines"));
+    await new Promise((resolve) => setTimeout(resolve, 20));
     expect(within(dialog).queryByLabelText("Machine")).toBeNull();
     expect(within(dialog).getByText(/on this machine/)).toBeDefined();
   });

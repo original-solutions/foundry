@@ -120,7 +120,7 @@ export function Peek({ at, machines }: { at: Destination | undefined; machines: 
   return (
     <Shell label={`Preview of ${at.title}`}>
       <p className="text-sm text-neutral-200">{at.title}</p>
-      <p className="text-xs leading-5 text-neutral-400">Opens the task box with this as Claude's task. Start makes a workspace for it on this machine and lands you in its session, already at work.</p>
+      <p className="text-xs leading-5 text-neutral-400">Opens the task box with this as Claude's task. Start makes a workspace for it and lands you in its session, already at work.</p>
     </Shell>
   );
 }

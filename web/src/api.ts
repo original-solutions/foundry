@@ -116,8 +116,24 @@ async function get(path: string): Promise<Record<string, unknown>> {
   return json;
 }
 
-/** Makes a workspace. `error` beside the id means it exists but its setup did not start. */
-export async function createWorkspace(input: { project: string; base: string; name: string }): Promise<{ id: string; error?: string }> {
+/** A machine in the machine list, and whether this machine's daemon hears from it. */
+export interface MachineChoice {
+  id: string;
+  name: string;
+  online: boolean;
+}
+
+/** The machine list, with which one is this machine. */
+export async function listMachines(): Promise<{ me: string; machines: MachineChoice[] }> {
+  const json = await get("/api/machines");
+  return { me: String(json.me), machines: Array.isArray(json.machines) ? (json.machines as MachineChoice[]) : [] };
+}
+
+/**
+ * Makes a workspace, on `machine` when one is given and on this machine otherwise. `error` beside
+ * the id means it exists but its setup did not start.
+ */
+export async function createWorkspace(input: { project: string; base: string; name: string; machine?: string }): Promise<{ id: string; error?: string }> {
   const { status, json } = await post("/api/workspaces", input);
   if (status !== 201) throw refused(status, json);
   return { id: String(json.id), error: typeof json.error === "string" ? json.error : undefined };

@@ -356,8 +356,10 @@ async fn take(inner: &Inner, peer: MachineId, message: PeerMessage) -> Result<()
             }
             return Ok(());
         }
-        // A relay opens a link of its own and means nothing on a record link.
-        PeerMessage::Hello { .. } | PeerMessage::Relay { .. } => return Ok(()),
+        // A relay or a call opens a link of its own and means nothing on a record link.
+        PeerMessage::Hello { .. } | PeerMessage::Relay { .. } | PeerMessage::Call { .. } => {
+            return Ok(());
+        }
     };
     on_store(&inner.store, move |store| {
         for record in &records {

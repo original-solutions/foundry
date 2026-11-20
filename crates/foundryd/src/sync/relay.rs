@@ -15,8 +15,6 @@
 //! end that hears nothing for [`OFFLINE_AFTER`] takes the link as down, so a link that dies
 //! without closing still ends.
 
-use std::io;
-
 use bytes::Bytes;
 use foundry_proto::ids::{MachineId, TerminalId};
 use foundry_proto::messages::{PROTOCOL, PeerMessage};
@@ -26,7 +24,7 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{Instant, timeout, timeout_at};
 
 use super::link::{listed, send_message};
-use super::{Conn, DIAL_TIMEOUT, Inner, OFFLINE_AFTER, Peers, TICK, Task, lock, on_store};
+use super::{Conn, Inner, OFFLINE_AFTER, Peers, TICK, Task, Unopened, lock, on_store};
 use crate::store::StoreError;
 use crate::terminals::{Snapshot, TerminalError};
 
@@ -164,23 +162,16 @@ impl Peers {
             )));
         };
         let down = || RelayError::Down(peer.name.clone());
-        let Conn { send, mut recv } =
-            match timeout(DIAL_TIMEOUT, self.inner.dialer.dial(&peer)).await {
-                Ok(Ok(conn)) => conn,
-                // The owner refused this machine's key.
-                Ok(Err(e)) if e.kind() == io::ErrorKind::PermissionDenied => {
-                    return Err(RelayError::Refused(e.to_string()));
-                }
-                Ok(Err(_)) | Err(_) => return Err(down()),
-            };
         let open = PeerMessage::Relay {
             protocol: PROTOCOL,
             machine: self.inner.me,
             terminal: id,
         };
-        if !send_message(&send, &open).await {
-            return Err(down());
-        }
+        let Conn { send, mut recv } = match self.inner.open_link(&peer, &open).await {
+            Ok(conn) => conn,
+            Err(Unopened::Refused(reason)) => return Err(RelayError::Refused(reason)),
+            Err(Unopened::Down) => return Err(down()),
+        };
         // Beat from now on: the owner ends a relay it hears nothing on, and a large snapshot
         // over a slow link takes longer than that.
         let beating = beat(send.clone());
@@ -393,15 +384,25 @@ pub(super) async fn serve(inner: &Inner, machine: MachineId, terminal: TerminalI
     }
 }
 
-/// Sends the close that ends a relay, then waits, at most [`OFFLINE_AFTER`], for the opener to
-/// close the link. Returning at once would let a keyed link's forwarder, or the WebSocket under
-/// it, be dropped with the close still queued, and the opener would read a link gone down.
+/// Sends the close that ends a relay, as [`last_word`] does.
 async fn finish(send: &Sender<String>, recv: &mut Receiver<String>, closed: Closed) {
     let frame = Frame::Closed {
         code: closed.code,
         reason: closed.reason,
     };
-    if send_message(send, &frame).await {
+    last_word(send, recv, &frame).await;
+}
+
+/// Sends `frame`, the last message on a link of its own, then waits, at most
+/// [`OFFLINE_AFTER`], for the opener to close the link. Returning at once would let a keyed
+/// link's forwarder, or the WebSocket under it, be dropped with the frame still queued, and the
+/// opener would read a link gone down.
+pub(super) async fn last_word(
+    send: &Sender<String>,
+    recv: &mut Receiver<String>,
+    frame: &impl Serialize,
+) {
+    if send_message(send, frame).await {
         let _ = timeout(OFFLINE_AFTER, async {
             while recv.recv().await.is_some() {}
         })
@@ -410,7 +411,7 @@ async fn finish(send: &Sender<String>, recv: &mut Receiver<String>, closed: Clos
 }
 
 /// Sends a beat every [`TICK`] on `send` until the link closes or the task is dropped.
-fn beat(send: Sender<String>) -> Task {
+pub(super) fn beat(send: Sender<String>) -> Task {
     Task(tokio::spawn(async move {
         let mut every = tokio::time::interval(TICK);
         loop {
@@ -434,7 +435,7 @@ fn pieces(bytes: &[u8]) -> impl Iterator<Item = (&[u8], bool)> {
 
 const DIGITS: &[u8; 16] = b"0123456789abcdef";
 
-fn hex(bytes: &[u8]) -> String {
+pub(super) fn hex(bytes: &[u8]) -> String {
     let mut text = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         text.push(char::from(DIGITS[usize::from(byte >> 4)]));
@@ -443,7 +444,7 @@ fn hex(bytes: &[u8]) -> String {
     text
 }
 
-fn unhex(text: &str) -> Option<Bytes> {
+pub(super) fn unhex(text: &str) -> Option<Bytes> {
     let digit = |c: u8| {
         char::from(c)
             .to_digit(16)

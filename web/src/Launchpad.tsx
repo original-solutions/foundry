@@ -57,7 +57,7 @@ export function Launchpad({
             <label htmlFor="launch-task">What should Claude work on?</label>
           </h2>
           <p className="max-w-xl text-sm leading-relaxed text-pretty text-neutral-400">
-            Each task gets a branch and a folder of its own on this machine, with Claude Code already at work in it. You follow it from here.
+            Each task gets a branch and a folder of its own, with Claude Code already at work in it. You follow it from here.
           </p>
         </div>
 

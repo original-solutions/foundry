@@ -1,6 +1,6 @@
-import { useMutation } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { useState } from "react";
-import { ApiError, createWorkspace, startSession, type Project } from "./api";
+import { ApiError, createWorkspace, listMachines, startSession, type Project } from "./api";
 import { safeBranch, sameBranch } from "./branch";
 import { promptOf, sendKey, SparkIcon } from "./FirstPrompt";
 import type { WorkspaceView } from "./fleet";
@@ -10,11 +10,15 @@ import { inlineField, primaryButton } from "./Modal";
 /** The workspace was made, but its session did not start. */
 class SessionNotStarted extends ApiError {}
 
-/** What a new workspace is made from: its project, base and name, then its session's model and first prompt. */
+/**
+ * What a new workspace is made from: its project, base, name and machine (absent for this
+ * machine), then its session's model and first prompt.
+ */
 export interface CreateInput {
   project: string;
   base: string;
   name: string;
+  machine?: string;
   model: string;
   prompt?: string;
 }
@@ -29,7 +33,7 @@ export function useCreateWorkspace() {
   const create = useMutation({
     mutationFn: async (input: CreateInput) => {
       setStep("branch");
-      const workspace = await createWorkspace({ project: input.project, base: input.base, name: input.name });
+      const workspace = await createWorkspace({ project: input.project, base: input.base, name: input.name, machine: input.machine });
       setStep("session");
       // The workspace is usable when its setup did not start, so its session is started all the same.
       let session: string;
@@ -85,8 +89,11 @@ function freeName(name: string, project: Project | undefined, workspaces: Worksp
 /**
  * The box a task is given to Claude in: the task names the workspace and its branch as it is
  * typed (numbered when the project already has that branch), the project, base and model sit
- * under it, and Start (or Cmd+Enter) makes the workspace on this machine and starts Claude Code on
- * the task, handing the session to `onCreated` so the layout lands in it.
+ * under it, and Start (or Cmd+Enter) makes the workspace and starts Claude Code on the task,
+ * handing the session to `onCreated` so the layout lands in it. The workspace is made on this
+ * machine, or on another listed one when the fleet has one and it is picked; an offline machine
+ * is shown but cannot be picked. When the machine list cannot be read, only this machine is
+ * offered.
  *
  * On the first-run page and in the New task dialog (`page`) it is open and big. At the top of
  * the board (`bar`) it is one line beside a way to jump until it is used, so starting the next
@@ -127,6 +134,8 @@ export function Composer({
   const [base, setBase] = useState("main");
   const [model, setModel] = useState("opus");
   const [projectId, setProjectId] = useState(projects[0]?.id ?? "");
+  /** The machine picked: empty for this machine. */
+  const [machine, setMachine] = useState("");
   const [focused, setFocused] = useState(false);
   const project = projects.find((p) => p.id === projectId) ?? projects[0];
   const prompt = promptOf(task);
@@ -142,10 +151,16 @@ export function Composer({
   const ready = Boolean(project && chosen && base.trim() && model.trim()) && !taken && !create.isPending && !made;
   const bar = mode === "bar";
   const open = !bar || focused || task !== "" || name !== "" || create.isPending || create.isError;
+  // Read only once the box is open: the board's closed bar shows no machine.
+  const listed = useQuery({ queryKey: ["machines"], queryFn: listMachines, retry: false, enabled: open });
+  const others = listed.data ? listed.data.machines.filter((m) => m.id !== listed.data.me) : [];
 
   const submit = () => {
     if (!ready || !project) return;
-    create.mutate({ project: project.id, base: base.trim(), name: chosen, model: model.trim(), prompt }, { onSuccess: ({ session, warning }) => onCreated(session, warning) });
+    create.mutate(
+      { project: project.id, base: base.trim(), name: chosen, machine: machine || undefined, model: model.trim(), prompt },
+      { onSuccess: ({ session, warning }) => onCreated(session, warning) },
+    );
   };
   const clear = () => {
     create.reset();
@@ -247,6 +262,21 @@ export function Composer({
                 ))}
               </datalist>
             </label>
+            {others.length === 0 ? (
+              <span>on this machine</span>
+            ) : (
+              <label className="flex items-center gap-1.5">
+                on
+                <select name="machine" aria-label="Machine" value={machine} onChange={(e) => setMachine(e.target.value)} className={`${inlineField} font-sans`}>
+                  <option value="">this machine</option>
+                  {others.map((m) => (
+                    <option key={m.id} value={m.id} disabled={!m.online}>
+                      {m.online ? m.name : `${m.name} (offline)`}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
             <span className="ml-auto flex items-center gap-2">
               <kbd className="rounded border border-neutral-700 px-1.5 py-0.5 text-[10px] text-neutral-500 pointer-coarse:hidden">{sendKey}</kbd>
               <button type="submit" disabled={!ready} className={`${primaryButton} px-3 py-1`}>
