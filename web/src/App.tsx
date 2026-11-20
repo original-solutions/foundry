@@ -339,7 +339,7 @@ function Layout() {
           name={create.name}
           onCreated={setLanding}
         />
-        {sessionIn && <NewSession key={sessionIn.id} workspace={sessionIn.id} name={sessionIn.name} onClose={() => setSessionIn(undefined)} />}
+        {sessionIn && <NewSession key={sessionIn.id} workspace={sessionIn.id} name={sessionIn.name} onClose={() => setSessionIn(undefined)} onStarted={setLanding} />}
       </div>
     </TerminalActions>
   );

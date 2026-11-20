@@ -480,11 +480,47 @@ describe("App", () => {
     await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t9"));
   });
 
-  it("asks for a new session in the open workspace from the tabs' +", async () => {
-    await open("/terminals/t1", live);
-    fireEvent.keyDown(screen.getByRole("button", { name: "New in fix login" }), { key: "Enter" });
-    fireEvent.click(within(await screen.findByRole("menu")).getByRole("menuitem", { name: "New session…" }));
-    expect(await screen.findByRole("dialog", { name: "New session in fix login" })).toBeDefined();
+  it.each([
+    [
+      "the tabs' +",
+      async () => {
+        fireEvent.keyDown(screen.getByRole("button", { name: "New in fix login" }), { key: "Enter" });
+        fireEvent.click(within(await screen.findByRole("menu")).getByRole("menuitem", { name: "New session…" }));
+      },
+    ],
+    [
+      "a terminal's actions",
+      async () => {
+        fireEvent.contextMenu(within(screen.getByRole("group", { name: "fix login" })).getByRole("link", { name: /^shell/ }));
+        fireEvent.click(within(await screen.findByRole("menu")).getByRole("menuitem", { name: "New session in fix login" }));
+      },
+    ],
+    [
+      "the palette",
+      async () => {
+        fireEvent.keyDown(window, { key: "k", metaKey: true });
+        const dialog = await screen.findByRole("dialog", { name: "Jump to" });
+        fireEvent.click(within(dialog).getByRole("button", { name: "Actions for fix login / sonnet" }));
+        fireEvent.click(within(dialog).getByRole("option", { name: "New session in fix login" }));
+      },
+    ],
+    ["the sidebar", async () => fireEvent.click(within(screen.getByRole("group", { name: "fix login" })).getByRole("button", { name: "New session" }))],
+  ])("starts a new session in the workspace from %s and lands in it once it starts", async (_, ask) => {
+    const calls = mockActions(json(201, { id: "s9" }));
+    const router = await open("/terminals/t1", live);
+    await ask();
+
+    const dialog = await screen.findByRole("dialog", { name: "New session in fix login" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Start" }));
+    await waitFor(() => expect(calls).toEqual([{ url: "/api/workspaces/w1/sessions", method: "POST", body: { model: "opus" } }]));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(router.state.location.pathname).toBe("/terminals/t1");
+
+    const events = sockets("/api/events").at(-1)!;
+    const arrive = (record: ReturnType<typeof terminal>) => act(() => events.deliver(JSON.stringify({ type: "record", protocol: 1, record })));
+    arrive(terminal(ME, "t9", "w1", "running"));
+    arrive(session(ME, "s9", "w1", "t9", "starting"));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t9"));
   });
 
   it("offers no + on another machine's workspace, which only that machine can start terminals in", async () => {
@@ -723,18 +759,6 @@ describe("App", () => {
     expect(ask.textContent).toMatch(/middle of a turn/);
     expect(screen.queryByRole("dialog", { name: "Jump to" })).toBeNull();
     expect(calls).toEqual([]);
-  });
-
-  it("starts a new session in a terminal's workspace from its actions, through the new-session dialog", async () => {
-    const calls = mockActions(json(201, { id: "s9" }));
-    await open("/terminals/t1", live);
-    fireEvent.contextMenu(within(screen.getByRole("group", { name: "fix login" })).getByRole("link", { name: /^shell/ }));
-    fireEvent.click(within(await screen.findByRole("menu")).getByRole("menuitem", { name: "New session in fix login" }));
-
-    const ask = await screen.findByRole("dialog", { name: "New session in fix login" });
-    fireEvent.click(within(ask).getByRole("button", { name: "Start" }));
-    await waitFor(() => expect(calls).toEqual([{ url: "/api/workspaces/w1/sessions", method: "POST", body: { model: "opus" } }]));
-    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
   });
 
   it("starts a new shell in a terminal's workspace from its actions and opens it", async () => {

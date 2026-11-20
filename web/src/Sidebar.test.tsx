@@ -2,6 +2,7 @@ import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { fleet } from "./fleet";
 import { Sidebar } from "./Sidebar";
+import { TerminalActions } from "./TerminalMenu";
 import { ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
 import { json, mockFetch, renderApp } from "./test-utils";
 import type { SessionState } from "./api";
@@ -56,7 +57,15 @@ describe("Sidebar", () => {
   });
 
   it("lists a workspace's sessions and shells, each with its state label and a link to its terminal", async () => {
-    await renderApp(<Sidebar machines={machines()} {...props} />);
+    mockFetch(json(200, { id: ME }));
+    const onNewSession = vi.fn();
+    const view = machines();
+    const noop = () => {};
+    await renderApp(
+      <TerminalActions machines={view} onOpen={noop} onBeside={noop} onSteps={noop} onChanges={noop} onFind={noop} onNewSession={onNewSession}>
+        <Sidebar machines={view} {...props} />
+      </TerminalActions>,
+    );
 
     const group = screen.getByRole("group", { name: "fix login" });
     expect(within(group).getByText(/fix-login/)).toBeDefined();
@@ -71,6 +80,9 @@ describe("Sidebar", () => {
     for (const name of ["New session", "New shell", "Archive"]) {
       expect(within(group).getByRole("button", { name })).toBeDefined();
     }
+    // The layout asks for the model and lands in the session once it starts.
+    fireEvent.click(within(group).getByRole("button", { name: "New session" }));
+    expect(onNewSession).toHaveBeenCalledWith("w1", "fix login");
     expect(screen.getByRole("group", { name: "empty" })).toBeDefined();
   });
 

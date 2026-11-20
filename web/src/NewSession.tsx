@@ -8,18 +8,20 @@ import { button, field, Modal } from "./Modal";
 /**
  * "New session" for a workspace: asks for the model, then starts Claude Code in it. `trigger`
  * replaces the default text button. Given `onClose` instead, the dialog has no trigger: it is
- * open from the start and `onClose` runs when it shuts.
+ * open from the start and `onClose` runs when it shuts. `onStarted` gets the new session's id.
  */
 export function NewSession({
   workspace,
   name,
   trigger = "New session",
   onClose,
+  onStarted,
 }: {
   workspace: string;
   name: string;
   trigger?: ReactElement | string;
   onClose?: () => void;
+  onStarted?: (session: string) => void;
 }) {
   const [open, setOpen] = useState(!!onClose);
   const [prompt, setPrompt] = useState("");
@@ -41,7 +43,12 @@ export function NewSession({
           event.preventDefault();
           // Given per call, so a call the dialog was reset from cannot close it.
           const model = String(new FormData(event.currentTarget).get("model"));
-          start.mutate({ model, prompt: promptOf(prompt) }, { onSuccess: () => change(false) });
+          start.mutate({ model, prompt: promptOf(prompt) }, {
+              onSuccess: (session) => {
+                onStarted?.(session);
+                change(false);
+              },
+            });
         }}
       >
         <label className="block">

@@ -4,7 +4,6 @@ import { useState, type ReactNode } from "react";
 import { ArchiveButton } from "./ArchiveButton";
 import { button } from "./Modal";
 import { jumpKey, SearchIcon } from "./JumpPalette";
-import { NewSession } from "./NewSession";
 import { Named, Now } from "./Now";
 import { startShell } from "./api";
 import { loadFolded, saveFolded } from "./fold";
@@ -203,15 +202,11 @@ function Workspace({ workspace, machine, folded, onFold, selected, onNavigate, o
                   <path d="M8 2.5v6M5 5.5h6M5 12.5h6" />
                 </Action>
               )}
-              <NewSession
-                workspace={workspace.id}
-                name={workspace.name}
-                trigger={
-                  <Action label="New session" title="New Claude Code session">
-                    <path d="M8 2.5l1.3 3.2 3.2 1.3-3.2 1.3L8 11.5 6.7 8.3 3.5 7l3.2-1.3z" />
-                  </Action>
-                }
-              />
+              {terminals && (
+                <Action label="New session" title="New Claude Code session" onClick={() => terminals.onNewSession(workspace.id, workspace.name)}>
+                  <path d="M8 2.5l1.3 3.2 3.2 1.3-3.2 1.3L8 11.5 6.7 8.3 3.5 7l3.2-1.3z" />
+                </Action>
+              )}
               <Action label="New shell" title="New shell" onClick={() => shell.mutate()} disabled={shell.isPending}>
                 <path d="M3.5 4.5l3 3-3 3M8 11.5h4.5" />
               </Action>
