@@ -9,7 +9,7 @@ import { words } from "./labels";
 import { jumpKey, SearchIcon } from "./JumpPalette";
 import { button, pressed } from "./Modal";
 import { NextSteps, offersNext } from "./NextSteps";
-import { reply } from "./Said";
+import { reply } from "./reply";
 import { StepsIcon } from "./StepsPanel";
 import { TabStrip } from "./TabStrip";
 import { TerminalMenuButton } from "./TerminalMenu";

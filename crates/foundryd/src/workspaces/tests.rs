@@ -2969,6 +2969,18 @@ async fn changes_are_refused_as_unknown_while_the_worktree_is_being_removed() {
 }
 
 #[tokio::test]
+async fn shipping_is_refused_as_unknown_while_the_worktree_is_being_removed() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup.create(&remote, "main", "leaving").await;
+    let removing = Removing::mark(&setup.workspaces.inner, id);
+    let err = setup.workspaces.shipping(id).await.unwrap_err();
+    assert!(matches!(err, WorkspaceError::Unknown(_)), "{err}");
+    drop(removing);
+    setup.workspaces.shipping(id).await.unwrap();
+}
+
+#[tokio::test]
 async fn changes_of_a_workspace_that_is_not_here_are_refused() {
     let setup = Setup::new();
     let err = setup
@@ -3159,6 +3171,55 @@ async fn a_github_that_cannot_answer_leaves_the_pull_request_unknown_not_an_erro
         "To get started with GitHub CLI, please run: gh auth login",
     );
     assert!(garbled.shipping(id).await.unwrap().unreachable);
+}
+
+#[tokio::test]
+async fn a_pull_request_merged_with_a_merge_commit_is_still_shown_once_the_base_is_fetched() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup.create(&remote, "main", "merged").await;
+    let worktree = setup.worktree(remote.project, "merged");
+    git(&worktree, &["commit", "-q", "--allow-empty", "-m", "mine"]);
+    git(&worktree, &["push", "-q", "origin", "HEAD"]);
+    let mine = git(&worktree, &["rev-parse", "HEAD"]).trim().to_owned();
+    // GitHub merges the pull request with a merge commit, and the clone fetches it.
+    let merge = git(
+        &worktree,
+        &[
+            "commit-tree",
+            "HEAD^{tree}",
+            "-p",
+            "refs/remotes/origin/main",
+            "-p",
+            "HEAD",
+            "-m",
+            "Merge pull request #7",
+        ],
+    );
+    git(
+        &worktree,
+        &[
+            "push",
+            "-q",
+            "origin",
+            &format!("{}:refs/heads/main", merge.trim()),
+        ],
+    );
+    git(&worktree, &["fetch", "-q", "origin"]);
+    let (workspaces, _) = with_gh(
+        &setup,
+        &format!(
+            r#"[{{"number":7,"title":"Ship it","url":"https://github.com/o/r/pull/7","state":"MERGED","isDraft":false,"reviewDecision":"APPROVED","statusCheckRollup":[],"headRefOid":"{mine}"}}]"#
+        ),
+    );
+
+    let read = workspaces.shipping(id).await.unwrap();
+    assert!(read.pushed);
+    assert_eq!(
+        read.pr.map(|pr| (pr.number, pr.state)),
+        Some((7, PrState::Merged)),
+        "the merged pull request is still this branch's"
+    );
 }
 
 #[tokio::test]

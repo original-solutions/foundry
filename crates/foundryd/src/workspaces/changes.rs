@@ -108,12 +108,12 @@ impl Workspaces {
     /// worktree overlapped it. Checked after the read: an archive marks the worktree before it
     /// removes any of it and writes its record before it unmarks, so a removal that overlapped
     /// the read is seen as one or the other.
-    async fn read(
+    pub(super) async fn read<T>(
         &self,
         id: WorkspaceId,
         worktree: &Path,
-        read: Result<Changes, WorkspaceError>,
-    ) -> Result<Changes, WorkspaceError> {
+        read: Result<T, WorkspaceError>,
+    ) -> Result<T, WorkspaceError> {
         if self.inner.removing(id)
             || self.inner.live(id).await.is_err()
             || (read.is_err() && !tokio::fs::try_exists(worktree).await.unwrap_or(true))

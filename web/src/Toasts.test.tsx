@@ -10,7 +10,7 @@ import { ME, OTHER, sample, session, settings, terminal, workspace } from "./tes
 
 const sent: { id: string; text: string }[] = [];
 let refuse = false;
-vi.mock("./Said", () => ({
+vi.mock("./reply", () => ({
   reply: async (id: string, text: string) => {
     if (refuse) throw new Error("gone");
     sent.push({ id, text });

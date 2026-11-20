@@ -2,10 +2,10 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { News } from "./AlertsBell";
 import type { MachineView } from "./fleet";
 import { needsYou } from "./labels";
-import { button, buttonShape, fieldLook } from "./Modal";
+import { button, buttonShape } from "./Modal";
 import { arrive, current, TOAST_MS, type Live, type Toast } from "./news";
 import { Now } from "./Now";
-import { reply } from "./Said";
+import { ReplyBox, unreached, useReply } from "./Said";
 import { glyphText, StateGlyph } from "./StateGlyph";
 
 /**
@@ -72,13 +72,11 @@ export function Toasts({
 function Card({ live, canReply, onOpen, onGone }: { live: Live; canReply: boolean; onOpen: () => void; onGone: () => void }) {
   const { toast, row } = live;
   const urgent = needsYou.includes(row.glyph);
-  const [draft, setDraft] = useState("");
-  const [sending, setSending] = useState(false);
-  const [trouble, setTrouble] = useState(false);
+  const answer = useReply(toast.terminal, onGone);
   // Held while the pointer rests on the card, the keyboard is in it or a reply is begun, so a reply is never cut off.
   const [hovered, setHovered] = useState(false);
   const [focused, setFocused] = useState(false);
-  const held = hovered || focused || draft !== "" || trouble;
+  const held = hovered || focused || answer.draft !== "" || answer.trouble;
   const gone = useRef(onGone);
   useLayoutEffect(() => {
     gone.current = onGone;
@@ -94,19 +92,6 @@ function Card({ live, canReply, onOpen, onGone }: { live: Live; canReply: boolea
     };
   }, [urgent, held]);
 
-  const send = async () => {
-    const text = draft.trim();
-    if (!text || sending) return;
-    setSending(true);
-    setTrouble(false);
-    try {
-      await reply(toast.terminal, text);
-      onGone();
-    } catch {
-      setTrouble(true);
-      setSending(false);
-    }
-  };
 
   return (
     <article
@@ -160,32 +145,10 @@ function Card({ live, canReply, onOpen, onGone }: { live: Live; canReply: boolea
         className="mt-2 flex items-center gap-1.5 px-3 pb-3 pl-[2.375rem]"
         onSubmit={(event) => {
           event.preventDefault();
-          void send();
+          void answer.send();
         }}
       >
-        {canReply && (
-          <>
-            <input
-              aria-label={`Reply to ${row.name}`}
-              placeholder={`Reply to ${row.name}…`}
-              value={draft}
-              disabled={sending}
-              enterKeyHint="send"
-              onChange={(event) => setDraft(event.target.value)}
-              className={`${fieldLook} h-8 min-w-0 flex-1 rounded-md px-2 text-base pointer-fine:h-7 pointer-fine:text-xs`}
-            />
-            <button
-              type="submit"
-              aria-label="Send"
-              disabled={sending || !draft.trim()}
-              className="grid size-8 shrink-0 place-items-center rounded-md bg-sky-400/15 text-sky-300 ring-1 ring-sky-400/40 hover:bg-sky-400/25 disabled:opacity-40 pointer-fine:size-7"
-            >
-              <svg viewBox="0 0 16 16" className="size-3.5" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                <path d="M3 8h10M9 4l4 4-4 4" />
-              </svg>
-            </button>
-          </>
-        )}
+        {canReply && <ReplyBox reply={answer} name={row.name} />}
         <button
           type="button"
           onClick={onOpen}
@@ -196,9 +159,9 @@ function Card({ live, canReply, onOpen, onGone }: { live: Live; canReply: boolea
           Open
         </button>
       </form>
-      {trouble && (
+      {answer.trouble && (
         <p role="alert" className="-mt-1.5 px-3 pb-2.5 pl-[2.375rem] text-xs text-amber-400">
-          Could not reach {row.name}. Open its terminal to reply.
+          {unreached(row.name)}
         </p>
       )}
       {!urgent && (

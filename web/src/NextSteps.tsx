@@ -1,13 +1,10 @@
 import { useQuery } from "@tanstack/react-query";
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { changesQuery } from "./ChangesPanel";
 import type { Located } from "./fleet";
 import { nextSteps, type NextStep } from "./next";
 import { pollEvery } from "./poll";
 import { CHECKS_EVERY, shippingQuery } from "./Shipping";
-
-/** How long a pressed step stays down when the session does not start working, as when its hooks are not heard. */
-export const SENT_FOR = 15_000;
 
 /** Next steps are offered to an idle session of this machine (`here`): one that waits for its next prompt, and whose workspace this daemon can read. */
 export function offersNext(located: Located | undefined, here: string | undefined): boolean {
@@ -37,8 +34,8 @@ const looks = {
  * push and open a pull request, fix failing checks, answer a review), each sent to the session as
  * a prompt by `send`. Mounted when the session goes idle, so each turn's end reads the workspace's
  * changes and where its branch stands afresh; read again while checks run. A step pressed stays
- * down until the session starts working and the steps go away, or for `SENT_FOR` if it does not
- * seem to; one that did not reach it says so.
+ * down until the session starts working and the steps go away, or until the steps change; one
+ * that did not reach it says so.
  */
 export function NextSteps({ workspace, name, send, look }: { workspace: string; name: string; send: (prompt: string) => Promise<void> | void; look: keyof typeof looks }) {
   const { data: changes } = useQuery({ ...changesQuery(workspace), staleTime: 0, retry: false });
@@ -55,24 +52,24 @@ export function NextSteps({ workspace, name, send, look }: { workspace: string; 
 /**
  * The steps `steps` as chips, each sent to session `name` as a prompt by `send`. A step pressed
  * stays down until the chips are mounted afresh (the session started working, so callers key or
- * unmount them) or for `SENT_FOR`; one that did not reach it says so. Nothing shows for no steps.
+ * unmount them) or the steps change, never on a timer: a session whose hooks are down still reads
+ * as idle, and a step that pushes or opens a pull request must not be sent twice. One that did
+ * not reach the session says so. Nothing shows for no steps.
  */
 export function StepChips({ steps, name, send, look }: { steps: NextStep[]; name: string; send: (prompt: string) => Promise<void> | void; look: keyof typeof looks }) {
-  const [sent, setSent] = useState<string | null>(null);
+  // The steps a press was for: a press counts only while they are the steps shown.
+  const offered = steps.map((s) => `${s.label}\n${s.prompt}`).join("\0");
+  const [press, setPress] = useState<{ label: string; offered: string } | null>(null);
+  const sent = press !== null && press.offered === offered ? press.label : null;
   const [failed, setFailed] = useState(false);
-  useEffect(() => {
-    if (sent === null) return;
-    const timer = setTimeout(() => setSent(null), SENT_FOR);
-    return () => clearTimeout(timer);
-  }, [sent]);
   if (steps.length === 0) return null;
   const pick = async (step: NextStep) => {
-    setSent(step.label);
+    setPress({ label: step.label, offered });
     setFailed(false);
     try {
       await send(step.prompt);
     } catch {
-      setSent(null);
+      setPress(null);
       setFailed(true);
     }
   };

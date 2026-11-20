@@ -3,7 +3,7 @@ import type { SessionView } from "./fleet";
 import { button, fieldLook, inlineField, primaryButton } from "./Modal";
 import { review, takers, type Note } from "./notes";
 import { busy, plural } from "./labels";
-import { reply } from "./Said";
+import { reply } from "./reply";
 import { StateGlyph } from "./StateGlyph";
 
 /** What a comment's row, box and buttons are called: the line it is on, and whether that line was removed. */

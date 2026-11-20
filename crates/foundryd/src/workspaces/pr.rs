@@ -93,14 +93,25 @@ pub enum Review {
 impl Workspaces {
     /// Where live workspace `id`'s branch stands: on `origin` or not, what is only here, and its
     /// pull request.
+    /// Like the changes read, an archive that removes the worktree meanwhile makes it
+    /// [`WorkspaceError::Unknown`], never a half-read of a half-removed worktree.
     pub async fn shipping(&self, id: WorkspaceId) -> Result<Shipping, WorkspaceError> {
         let body = self.inner.live(id).await?;
         let worktree = self.inner.worktree(body.project, &body.branch);
+        let read = self.shipping_of(&worktree, body).await;
+        self.read(id, &worktree, read).await
+    }
+
+    async fn shipping_of(
+        &self,
+        worktree: &std::path::Path,
+        body: foundry_proto::record::Workspace,
+    ) -> Result<Shipping, WorkspaceError> {
         let remote = format!("refs/remotes/origin/{}^{{commit}}", body.branch);
-        let own = self.inner.own_commits(&worktree, &body.base).await?;
+        let own = self.inner.own_commits(worktree, &body.base).await?;
         let pushed = match self
             .inner
-            .git(&worktree, "rev-parse", ["--verify", "--quiet", &remote])
+            .git(worktree, "rev-parse", ["--verify", "--quiet", &remote])
             .await
         {
             Ok(tip) => {
@@ -108,7 +119,7 @@ impl Workspaces {
                 own.iter().any(|c| c == tip)
                     || self
                         .inner
-                        .git(&worktree, "rev-parse", ["HEAD"])
+                        .git(worktree, "rev-parse", ["HEAD"])
                         .await?
                         .trim()
                         == tip
@@ -118,7 +129,7 @@ impl Workspaces {
         let unpushed = self
             .inner
             .git(
-                &worktree,
+                worktree,
                 "rev-list",
                 ["--count", "HEAD", "--not", "--remotes", "--"],
             )
@@ -127,7 +138,7 @@ impl Workspaces {
             .parse()
             .unwrap_or(0);
         let (pr, unreachable) = if pushed {
-            match self.inner.gh_pull_requests(&worktree, &body.branch).await {
+            match self.inner.gh_pull_requests(worktree, &body.branch).await {
                 Some(listed) if listed.is_empty() => (None, false),
                 Some(listed) => {
                     let pr = listed
@@ -154,26 +165,49 @@ impl Workspaces {
 impl super::Inner {
     /// The commits on `worktree`'s `HEAD` since it left `origin/<base>`, full hashes. With the
     /// base gone from the remote there is nothing to tell them from the base's, so none.
+    ///
+    /// Once the base holds `HEAD`, as after a pull request merged with a merge commit, they are
+    /// counted from where the base stood before the first merge that brought `HEAD` in, so the
+    /// branch's own work is still its own. A branch the base took by fast-forward has none.
     async fn own_commits(
         &self,
         worktree: &std::path::Path,
         base: &str,
     ) -> Result<Vec<String>, WorkspaceError> {
+        let base = format!("refs/remotes/origin/{base}");
         let Ok(from) = self
-            .git(
-                worktree,
-                "merge-base",
-                ["HEAD", &format!("refs/remotes/origin/{base}")],
-            )
+            .git(worktree, "merge-base", ["HEAD", base.as_str()])
             .await
         else {
             return Ok(Vec::new());
         };
+        let mut from = from.trim().to_owned();
+        let head = self.git(worktree, "rev-parse", ["HEAD"]).await?;
+        if from == head.trim() {
+            // The base's own line, oldest last: the first of its commits that has `HEAD`.
+            let range = format!("HEAD..{base}");
+            let line = self
+                .git(
+                    worktree,
+                    "rev-list",
+                    ["--first-parent", "--ancestry-path", range.as_str(), "--"],
+                )
+                .await?;
+            if let Some(merge) = line.lines().last() {
+                let before = format!("{merge}^1");
+                if let Ok(start) = self
+                    .git(worktree, "merge-base", ["HEAD", before.as_str()])
+                    .await
+                {
+                    from = start.trim().to_owned();
+                }
+            }
+        }
         let listed = self
             .git(
                 worktree,
                 "rev-list",
-                [format!("{}..HEAD", from.trim()), "--".to_owned()],
+                [format!("{from}..HEAD"), "--".to_owned()],
             )
             .await?;
         Ok(listed.lines().map(str::to_owned).collect())

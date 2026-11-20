@@ -1,25 +1,67 @@
 import { useState } from "react";
 import { fieldLook } from "./Modal";
-import { socketUrl } from "./socket";
+import { reply } from "./reply";
+
+/** A reply being written to the session in `terminal`: its draft, and `send`, which types it in and calls `onSent`. */
+export function useReply(terminal: string, onSent: () => void) {
+  const [draft, setDraft] = useState("");
+  const [sending, setSending] = useState(false);
+  const [trouble, setTrouble] = useState(false);
+  const send = async () => {
+    const text = draft.trim();
+    if (!text || sending) return;
+    setSending(true);
+    setTrouble(false);
+    try {
+      await reply(terminal, text);
+      setDraft("");
+      onSent();
+    } catch {
+      setTrouble(true);
+    } finally {
+      setSending(false);
+    }
+  };
+  return { draft, setDraft, sending, trouble, setTrouble, send };
+}
+
+/** What a reply that could not reach session `name` says. */
+export const unreached = (name: string) => `Could not reach ${name}. Open its terminal to reply.`;
 
 /**
- * Types `text` into terminal `id` as one paste and presses Enter, over a socket of its own that
- * closes once both are sent. It never resizes the terminal, so a pane showing it is left alone.
- * Rejects when the terminal cannot be reached.
+ * The box a reply to session `name` is written in and its send button, for a form whose submit
+ * calls `reply.send`. Escape calls `onEscape` and goes no further.
  */
-export function reply(id: string, text: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const socket = new WebSocket(socketUrl(`/api/terminals/${id}`));
-    socket.binaryType = "arraybuffer";
-    const bytes = new TextEncoder();
-    socket.onopen = () => {
-      socket.send(bytes.encode(`\x1b[200~${text}\x1b[201~`));
-      socket.send(bytes.encode("\r"));
-      socket.close(1000);
-      resolve();
-    };
-    socket.onclose = (event) => reject(new Error(event.reason || "the terminal closed"));
-  });
+export function ReplyBox({ reply, name, autoFocus, onEscape }: { reply: ReturnType<typeof useReply>; name: string; autoFocus?: boolean; onEscape?: () => void }) {
+  return (
+    <>
+      <input
+        autoFocus={autoFocus}
+        aria-label={`Reply to ${name}`}
+        placeholder={`Reply to ${name}…`}
+        value={reply.draft}
+        disabled={reply.sending}
+        enterKeyHint="send"
+        onChange={(e) => reply.setDraft(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key !== "Escape" || !onEscape) return;
+          e.stopPropagation();
+          onEscape();
+        }}
+        className={`${fieldLook} h-8 min-w-0 flex-1 rounded-md px-2 text-base pointer-fine:h-7 pointer-fine:text-xs`}
+      />
+      <button
+        type="submit"
+        aria-label="Send"
+        disabled={reply.sending || !reply.draft.trim()}
+        className="grid size-8 shrink-0 place-items-center rounded-md bg-sky-400/15 text-sky-300 ring-1 ring-sky-400/40 hover:bg-sky-400/25 disabled:opacity-40 pointer-fine:size-7"
+      >
+        <svg viewBox="0 0 16 16" className="size-3.5" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+          <path d="M3 8h10M9 4l4 4-4 4" />
+        </svg>
+      </button>
+    </>
+  );
 }
 
 /**
@@ -29,28 +71,11 @@ export function reply(id: string, text: string): Promise<void> {
  */
 export function Said({ said, name, terminal, canReply }: { said: string; name: string; terminal: string; canReply: boolean }) {
   const [open, setOpen] = useState(false);
-  const [draft, setDraft] = useState("");
-  const [sending, setSending] = useState(false);
-  const [trouble, setTrouble] = useState(false);
-  const close = () => {
+  const answer = useReply(terminal, () => close());
+  function close() {
     setOpen(false);
-    setTrouble(false);
-  };
-  const send = async () => {
-    const text = draft.trim();
-    if (!text || sending) return;
-    setSending(true);
-    setTrouble(false);
-    try {
-      await reply(terminal, text);
-      setDraft("");
-      close();
-    } catch {
-      setTrouble(true);
-    } finally {
-      setSending(false);
-    }
-  };
+    answer.setTrouble(false);
+  }
   return (
     <div data-said className="mt-0.5 mb-1 ml-[1.625rem] mr-1">
       <button
@@ -69,39 +94,15 @@ export function Said({ said, name, terminal, canReply }: { said: string; name: s
           className="mt-1.5 flex items-center gap-1.5"
           onSubmit={(e) => {
             e.preventDefault();
-            void send();
+            void answer.send();
           }}
         >
-          <input
-            autoFocus
-            aria-label={`Reply to ${name}`}
-            placeholder={`Reply to ${name}…`}
-            value={draft}
-            disabled={sending}
-            enterKeyHint="send"
-            onChange={(e) => setDraft(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key !== "Escape") return;
-              e.stopPropagation();
-              close();
-            }}
-            className={`${fieldLook} h-8 min-w-0 flex-1 rounded-md px-2 text-base pointer-fine:h-7 pointer-fine:text-xs`}
-          />
-          <button
-            type="submit"
-            aria-label="Send"
-            disabled={sending || !draft.trim()}
-            className="grid size-7 shrink-0 place-items-center rounded-md bg-sky-400/15 text-sky-300 ring-1 ring-sky-400/40 hover:bg-sky-400/25 disabled:opacity-40"
-          >
-            <svg viewBox="0 0 16 16" className="size-3.5" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-              <path d="M3 8h10M9 4l4 4-4 4" />
-            </svg>
-          </button>
+          <ReplyBox reply={answer} name={name} autoFocus onEscape={close} />
         </form>
       )}
-      {trouble && (
+      {answer.trouble && (
         <p role="alert" className="mt-1 text-xs text-amber-400">
-          Could not reach {name}. Open its terminal to reply.
+          {unreached(name)}
         </p>
       )}
     </div>

@@ -1,8 +1,8 @@
-import { act, fireEvent, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Changes, Shipping } from "./api";
 import type { Located } from "./fleet";
-import { NextSteps, offersNext, SENT_FOR } from "./NextSteps";
+import { NextSteps, offersNext, StepChips } from "./NextSteps";
 import { json, renderApp } from "./test-utils";
 
 const dirty: Changes = {
@@ -44,19 +44,22 @@ describe("NextSteps", () => {
     expect((commit as HTMLButtonElement).disabled).toBe(true);
   });
 
-  it("lets a step be pressed again when the session does not start working", async () => {
-    answer(dirty);
-    const send = vi.fn(async () => {});
-    await renderApp(<NextSteps workspace="w1" name="opus" send={send} look="header" />);
-    const commit = (await screen.findByRole("button", { name: "Commit 1 file" })) as HTMLButtonElement;
-
+  it("keeps a sent step down for as long as the steps stay the same, and lets one be pressed again once they change", () => {
+    const push = { label: "Push and open a PR", prompt: "Push this branch and open a pull request." };
+    const checks = { label: "Fix failing checks", prompt: "Fix the failing checks.", urgent: true };
+    const send = vi.fn();
     vi.useFakeTimers();
     try {
-      fireEvent.click(commit);
-      await act(async () => {});
-      expect(commit.disabled).toBe(true);
-      act(() => vi.advanceTimersByTime(SENT_FOR));
-      expect(commit.disabled).toBe(false);
+      const { rerender } = render(<StepChips steps={[push]} name="opus" send={send} look="header" />);
+      fireEvent.click(screen.getByRole("button", { name: "Push and open a PR" }));
+      // A session whose hooks are down still reads as idle: a step that reaches GitHub is not offered again.
+      act(() => vi.advanceTimersByTime(10 * 60_000));
+      rerender(<StepChips steps={[{ ...push }]} name="opus" send={send} look="header" />);
+      expect((screen.getByRole("button", { name: "Push and open a PR" }) as HTMLButtonElement).disabled).toBe(true);
+      expect(send).toHaveBeenCalledTimes(1);
+
+      rerender(<StepChips steps={[checks]} name="opus" send={send} look="header" />);
+      expect((screen.getByRole("button", { name: "Fix failing checks" }) as HTMLButtonElement).disabled).toBe(false);
     } finally {
       vi.useRealTimers();
     }
