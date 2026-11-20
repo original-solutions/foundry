@@ -334,6 +334,28 @@ describe("App", () => {
     expect(await screen.findByRole("dialog", { name: /changes in fix login/i })).toBeDefined();
   });
 
+  it("on a phone opens on the board, with the workspaces a drawer from its bottom bar whose title leads back home", async () => {
+    mockActions();
+    const router = await open("/terminals/t1", live);
+    const sidebar = () => document.getElementById("sidebar")!.parentElement!;
+    // Home on a phone is the board, not the sidebar: the sidebar keeps its place beside it from `md`.
+    await act(() => router.navigate({ to: "/" }));
+    expect(screen.getByRole("main").className).not.toMatch(/(^| )hidden( |$)/);
+    expect(sidebar().className).toMatch(/(^| )hidden md:flex/);
+
+    fireEvent.click(within(screen.getByRole("navigation", { name: "Home" })).getByRole("button", { name: "Workspaces" }));
+    expect(sidebar().className).toMatch(/fixed inset-0/);
+    fireEvent.click(screen.getByRole("button", { name: "Close workspaces" }));
+    expect(sidebar().className).toMatch(/(^| )hidden md:flex/);
+
+    // From a terminal, the drawer's title goes back to the board.
+    await act(() => router.navigate({ to: "/terminals/$terminalId", params: { terminalId: "t1" } }));
+    fireEvent.click(screen.getByRole("button", { name: "Workspaces" }));
+    fireEvent.click(within(sidebar()).getByRole("link", { name: "Foundry" }));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/"));
+    expect(sidebar().className).toMatch(/(^| )hidden md:flex/);
+  });
+
   it("opens the machines view from the board's switch or a machine's name in the sidebar, and its samples draw as they arrive", async () => {
     mockActions();
     const router = await open("/", live);
@@ -352,7 +374,7 @@ describe("App", () => {
     await waitFor(() => expect(router.state.location.pathname).toBe("/"));
     expect(await screen.findByRole("region", { name: "Timeline" })).toBeDefined();
 
-    const name = within(screen.getByRole("navigation")).getByRole("link", { name: "studio" });
+    const name = within(screen.getByRole("navigation", { name: "Workspaces" })).getByRole("link", { name: "studio" });
     fireEvent.click(name);
     await waitFor(() => expect(router.state.location.pathname).toBe("/machines"));
     expect(screen.getByRole("region", { name: "Machines" })).toBeDefined();

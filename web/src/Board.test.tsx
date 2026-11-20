@@ -106,13 +106,14 @@ async function show(machines: MachineView[], onChanges = vi.fn(), props: Partial
         onCreated={() => {}}
         onMore={() => {}}
         traced={new Set()}
+        onMenu={() => {}}
         {...props}
       />
     );
   }
   const root = createRootRoute({ component: Shown });
   const router = createRouter({
-    routeTree: root.addChildren([createRoute({ getParentRoute: () => root, path: "/terminals/$terminalId" })]),
+    routeTree: root.addChildren([createRoute({ getParentRoute: () => root, path: "/terminals/$terminalId" }), createRoute({ getParentRoute: () => root, path: "/machines" })]),
     history: createMemoryHistory({ initialEntries: ["/"] }),
   });
   await router.load();
@@ -274,6 +275,32 @@ describe("Board", () => {
     fireEvent.click(screen.getByRole("radio", { name: "Board" }));
     expect(screen.getByRole("region", { name: "Working" })).toBeDefined();
     expect(localStorage.getItem("foundry.home")).toBe("board");
+  });
+});
+
+describe("On a phone", () => {
+  it("says at the top what needs you, what works and what rests", async () => {
+    await show(fleet(records(), settings()));
+    expect(screen.getByText("1 needs you · 1 working · 1 quiet")).toBeDefined();
+  });
+
+  it("switches the view from a bar at the bottom, which counts what needs you and opens the workspaces", async () => {
+    const onMenu = vi.fn();
+    const { router } = await show(fleet(records(), settings()), vi.fn(), { onMenu });
+    const bar = screen.getByRole("navigation", { name: "Home" });
+    const board = within(bar).getByRole("button", { name: "Board, 1 needs you" });
+    expect(board.getAttribute("aria-current")).toBe("page");
+
+    fireEvent.click(within(bar).getByRole("button", { name: "Timeline" }));
+    expect(await screen.findByRole("region", { name: "Timeline" })).toBeDefined();
+    expect(localStorage.getItem("foundry.home")).toBe("timeline");
+    expect(within(bar).getByRole("button", { name: "Timeline" }).getAttribute("aria-current")).toBe("page");
+
+    fireEvent.click(within(bar).getByRole("button", { name: "Workspaces" }));
+    expect(onMenu).toHaveBeenCalledOnce();
+
+    fireEvent.click(within(bar).getByRole("button", { name: "Machines" }));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/machines"));
   });
 });
 

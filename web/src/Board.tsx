@@ -2,7 +2,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate } from "@tanstack/react-router";
 import { ARCHIVE_ICON, TerminalMenu, useTerminalActions } from "./TerminalMenu";
 import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
-import { lanes, topFiles, type Card, type Lane } from "./lanes";
+import { glance, lanes, topFiles, type Card, type Lane } from "./lanes";
 import { useLeaving } from "./Archive";
 import { changesQuery } from "./ChangesPanel";
 import { splitPath, totals } from "./changes";
@@ -70,6 +70,9 @@ const edge: Record<Glyph, string> = {
  *
  * At the top, a one-line box gives Claude its next task (`Composer`), beside the way to jump.
  * A switch beside the counts turns it into a timeline of every session's turns on one clock.
+ *
+ * On a phone it is the home: a line above the task box says what needs you, what works and what
+ * rests, and a bar at the bottom (`PhoneNav`) takes the switch's place and opens the workspaces.
  */
 export function Board({
   machines,
@@ -80,6 +83,7 @@ export function Board({
   onCreated,
   onMore,
   traced,
+  onMenu,
 }: {
   machines: MachineView[];
   /** The fleet's projects, which a new task is started in. */
@@ -94,6 +98,8 @@ export function Board({
   onSteps: (terminal: string) => void;
   /** The sessions this machine keeps steps for, which the timeline reads. */
   traced: Set<string>;
+  /** Shows the workspaces, on a screen too narrow to keep them beside. */
+  onMenu: () => void;
 }) {
   const [view, setView] = useState(loadView);
   const navigate = useNavigate();
@@ -107,30 +113,39 @@ export function Board({
   const shells = workspaces.reduce((n, w) => n + w.shells.length, 0);
   const counts = `${plural(sessions, "session")} · ${plural(shells, "shell")} · ${plural(workspaces.length, "workspace")} · ${plural(machines.length, "machine")}`;
   const launch = useCreateWorkspace();
+  const board = lanes(machines);
+  const needs = board.find((l) => l.lane === "needs")?.cards.length ?? 0;
 
   const several = machines.length > 1;
   return (
-    <div className="absolute inset-0 overflow-y-auto">
-      <div className="mx-auto flex max-w-7xl flex-col gap-7 px-6 pt-6 pb-16">
-        <div className="flex flex-col gap-2">
-          <Composer mode="bar" id="board-task" projects={projects} workspaces={workspaces} launch={launch} onCreated={onCreated} onMore={onMore} onJump={onJump} doneLabel="Clear" />
-          <div className="flex items-center gap-3 px-1">
-            <p className="min-w-0 flex-1 text-xs text-neutral-500">{counts}</p>
-            <ViewSwitch view={view} onPick={pick} />
+    <div className="absolute inset-0 flex flex-col">
+      <div className="min-h-0 flex-1 overflow-y-auto">
+        <div className="mx-auto flex max-w-7xl flex-col gap-7 px-4 pt-4 pb-16 md:px-6 md:pt-6">
+          <div className="flex flex-col gap-2">
+            <p className={`flex items-center gap-2 px-1 pb-1 text-sm font-medium md:hidden ${needs ? "text-amber-300" : "text-neutral-400"}`}>
+              <StateGlyph glyph={needs ? "waiting" : "ready"} still />
+              {glance(board)}
+            </p>
+            <Composer mode="bar" id="board-task" projects={projects} workspaces={workspaces} launch={launch} onCreated={onCreated} onMore={onMore} onJump={onJump} doneLabel="Clear" />
+            <div className="hidden items-center gap-3 px-1 md:flex">
+              <p className="min-w-0 flex-1 text-xs text-neutral-500">{counts}</p>
+              <ViewSwitch view={view} onPick={pick} />
+            </div>
           </div>
+          {view === "timeline" ? (
+            <Timeline machines={machines} traced={traced} onSteps={onSteps} />
+          ) : (
+            board.map(({ lane, cards }) => (
+              <LaneSection key={lane} lane={lane} count={cards.length}>
+                {cards.map((card) => (
+                  <WorkspaceCard key={card.workspace.id} card={card} showMachine={several} onChanges={onChanges} />
+                ))}
+              </LaneSection>
+            ))
+          )}
         </div>
-        {view === "timeline" ? (
-          <Timeline machines={machines} traced={traced} onSteps={onSteps} />
-        ) : (
-          lanes(machines).map(({ lane, cards }) => (
-            <LaneSection key={lane} lane={lane} count={cards.length}>
-              {cards.map((card) => (
-                <WorkspaceCard key={card.workspace.id} card={card} showMachine={several} onChanges={onChanges} />
-              ))}
-            </LaneSection>
-          ))
-        )}
       </div>
+      <PhoneNav view={view} onPick={pick} needs={needs} onMenu={onMenu} />
     </div>
   );
 }
@@ -367,6 +382,47 @@ export function ViewSwitch({ view, onPick }: { view: View | "machines"; onPick: 
         </button>
       ))}
     </div>
+  );
+}
+
+/**
+ * The home's bar at the bottom of a phone, in reach of a thumb: the switch's views, the board's
+ * marked with how many workspaces need you, and the workspaces, which open as a drawer.
+ */
+export function PhoneNav({ view, onPick, needs, onMenu }: { view: View | "machines"; onPick: (view: View | "machines") => void; needs: number; onMenu: () => void }) {
+  const item = "relative flex flex-col items-center gap-1 pt-2 pb-1.5 text-[11px] font-medium transition-colors";
+  return (
+    <nav aria-label="Home" className="grid shrink-0 grid-cols-4 border-t border-neutral-800 bg-neutral-900 pb-[env(safe-area-inset-bottom)] md:hidden">
+      {views.map((v) => {
+        const on = view === v.view;
+        const count = v.view === "board" && needs > 0;
+        return (
+          <button key={v.view} type="button" aria-current={on ? "page" : undefined} onClick={() => onPick(v.view)} className={`${item} ${on ? "text-neutral-50" : "text-neutral-500 hover:text-neutral-200"}`}>
+            {on && <span aria-hidden="true" className="absolute inset-x-6 top-0 h-0.5 rounded-full bg-neutral-100" />}
+            <span className="relative [&>svg]:size-5">
+              {v.icon}
+              {count && (
+                <span aria-hidden="true" className="absolute -top-1.5 -right-3 min-w-4 rounded-full bg-amber-400 px-1 text-center text-[10px] leading-4 font-semibold text-neutral-950">
+                  {needs}
+                </span>
+              )}
+            </span>
+            <span>
+              {v.name}
+              {count && <span className="sr-only">, {needs} {needs === 1 ? "needs" : "need"} you</span>}
+            </span>
+          </button>
+        );
+      })}
+      <button type="button" aria-controls="sidebar" onClick={onMenu} className={`${item} text-neutral-500 hover:text-neutral-200`}>
+        <span className="[&>svg]:size-5">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" aria-hidden="true">
+            <path d="M2 4h12M2 8h12M2 12h12" />
+          </svg>
+        </span>
+        <span>Workspaces</span>
+      </button>
+    </nav>
   );
 }
 

@@ -1,6 +1,7 @@
 import { Link, useNavigate } from "@tanstack/react-router";
 import { useEffect, useId, useState } from "react";
-import { JumpBar, saveView, ViewSwitch } from "./Board";
+import { JumpBar, PhoneNav, saveView, ViewSwitch } from "./Board";
+import { lanes } from "./lanes";
 import { byUrgency, rows, type MachineView } from "./fleet";
 import { plural, urgency, type Glyph } from "./labels";
 import { heardAgo, scaled, span, spanWords, type History, type Point } from "./samples";
@@ -53,6 +54,8 @@ interface Props {
   here?: string;
   connected: boolean;
   onJump?: () => void;
+  /** Shows the workspaces, on a screen too narrow to keep them beside; with it, a phone gets the home's bottom bar. */
+  onMenu?: () => void;
 }
 
 /**
@@ -61,46 +64,43 @@ interface Props {
  * counted by state and its workspaces, each opening its most urgent terminal. An offline machine
  * keeps its card, greyed, with its last known numbers; nothing of it is hidden.
  */
-export function Machines({ machines, history, here, connected, onJump }: Props) {
+export function Machines({ machines, history, here, connected, onJump, onMenu }: Props) {
   const now = useNow();
   const navigate = useNavigate();
   const online = machines.filter((m) => m.status === "online").length;
   const offline = machines.filter((m) => m.status === "offline").length;
   const counts = [`${plural(machines.length, "machine")}`, `${online} online`, ...(offline ? [`${offline} offline`] : [])].join(" · ");
+  const pick = (view: "board" | "timeline" | "machines") => {
+    if (view === "machines") return;
+    saveView(view);
+    void navigate({ to: "/" });
+  };
   return (
-    <div className="absolute inset-0 overflow-y-auto">
-      <section aria-label="Machines" className="mx-auto flex max-w-7xl flex-col gap-6 px-4 pt-4 pb-16 md:px-6 md:pt-6">
-        <div className="flex flex-col gap-2">
-          <Link to="/" className="flex items-center gap-1 self-start rounded px-1 text-sm text-neutral-400 hover:text-neutral-100 md:hidden">
-            <svg viewBox="0 0 16 16" className="size-3.5" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" aria-hidden="true">
-              <path d="M10 3.5L5.5 8l4.5 4.5" />
-            </svg>
-            Workspaces
-          </Link>
-          {onJump && <JumpBar onJump={onJump} />}
-          <div className="flex items-center gap-3 px-1">
-            <p className="min-w-0 flex-1 text-xs text-neutral-500">{counts}</p>
-            <ViewSwitch
-              view="machines"
-              onPick={(view) => {
-                if (view === "machines") return;
-                saveView(view);
-                void navigate({ to: "/" });
-              }}
-            />
+    <div className="absolute inset-0 flex flex-col">
+      <div className="min-h-0 flex-1 overflow-y-auto">
+        <section aria-label="Machines" className="mx-auto flex max-w-7xl flex-col gap-6 px-4 pt-4 pb-16 md:px-6 md:pt-6">
+          <div className="flex flex-col gap-2">
+            {onJump && <JumpBar onJump={onJump} />}
+            <div className="flex items-center gap-3 px-1">
+              <p className="min-w-0 flex-1 text-xs text-neutral-500">{counts}</p>
+              <div className="hidden shrink-0 md:block">
+                <ViewSwitch view="machines" onPick={pick} />
+              </div>
+            </div>
+            {!connected && (
+              <p role="status" className="rounded-lg border border-amber-400/30 bg-amber-400/10 px-3 py-2 text-xs text-amber-300">
+                Disconnected from the daemon: these are the last numbers this page saw, until it reconnects.
+              </p>
+            )}
           </div>
-          {!connected && (
-            <p role="status" className="rounded-lg border border-amber-400/30 bg-amber-400/10 px-3 py-2 text-xs text-amber-300">
-              Disconnected from the daemon: these are the last numbers this page saw, until it reconnects.
-            </p>
-          )}
-        </div>
-        <div className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,24rem),1fr))] gap-4">
-          {machines.map((machine) => (
-            <MachineCard key={machine.id} machine={machine} points={history[machine.id]?.points ?? []} heard={history[machine.id]?.heard} here={machine.id === here} now={now} />
-          ))}
-        </div>
-      </section>
+          <div className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,24rem),1fr))] gap-4">
+            {machines.map((machine) => (
+              <MachineCard key={machine.id} machine={machine} points={history[machine.id]?.points ?? []} heard={history[machine.id]?.heard} here={machine.id === here} now={now} />
+            ))}
+          </div>
+        </section>
+      </div>
+      {onMenu && <PhoneNav view="machines" onPick={pick} needs={lanes(machines).find((l) => l.lane === "needs")?.cards.length ?? 0} onMenu={onMenu} />}
     </div>
   );
 }

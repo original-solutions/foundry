@@ -54,11 +54,13 @@ export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJ
     });
 
   return (
-    <nav id="sidebar" className="flex h-full w-full shrink-0 flex-col gap-4 overflow-y-auto bg-neutral-900 p-3 text-sm text-neutral-100 md:w-80">
+    <nav id="sidebar" aria-label="Workspaces" className="flex h-full w-full shrink-0 flex-col gap-4 overflow-y-auto bg-neutral-900 p-3 text-sm text-neutral-100 md:w-80">
       <div className="flex items-center justify-between gap-2">
-        <h1 className="flex items-center gap-1.5 text-lg font-semibold">
-          <Mark className="size-3.5 text-emerald-400" />
-          Foundry
+        <h1 className="text-lg font-semibold">
+          <Link to="/" onClick={onNavigate} title="The board" className="flex items-center gap-1.5 rounded">
+            <Mark className="size-3.5 text-emerald-400" />
+            Foundry
+          </Link>
         </h1>
         <div className="flex items-center gap-1.5">
           <ThemeButton />

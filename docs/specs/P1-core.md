@@ -183,6 +183,8 @@ A P3 overview on the same read. With no terminal open, the UI shows every worksp
 
 Above the lanes, one line takes the next task, beside the way to jump. Once used it opens into the first run's composer: the task names the workspace (numbered when its project already has that branch; a typed name the project has is refused), Start makes it on this machine and lands in its session already at work.
 
+On a phone the board is the home too. A line above the task box says how many workspaces need you (or that nothing does), then how many work and rest. A bar at the bottom switches between board, timeline and machines, marks the board with the count that needs you, and opens the workspaces as a drawer; the drawer's title leads back to the board from a terminal.
+
 ### First run
 
 A fleet with no workspaces opens on one question, what Claude should work on, and a box to answer it in, instead of an empty board. The task names the workspace and its branch as it is typed (its first words, editable); the project, base and model sit under the box. Start makes the workspace on this machine and starts its session with the task as its first prompt, then opens it. Under the box, the three states a task shows first (working, needs you, ready) are explained with their glyphs. Nothing shows before the daemon's state has arrived, so the page never flashes a first run at a fleet that has workspaces.

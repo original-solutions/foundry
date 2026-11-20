@@ -26,8 +26,8 @@ import { AlertsButton, useAlerts } from "./AlertsBell";
 
 /**
  * The sidebar, and the terminal the URL names (`/terminals/$terminalId`) under its header filling
- * the rest. On a narrow screen one of them has the whole width: the sidebar until a terminal is
- * open, then the terminal, with the sidebar as a drawer the header opens. Cmd+K (or Ctrl+K outside
+ * the rest. On a narrow screen the sidebar is a drawer: the board (or the machines view) is the
+ * home, with a bar at the bottom that opens it, and an open terminal's header opens it too. Cmd+K (or Ctrl+K outside
  * the terminal, where the shell keeps it) opens the jump palette over everything.
  *
  * Above the header, the open workspace's terminals are tabs with their states, and a + starts
@@ -214,7 +214,8 @@ function Layout() {
   const firstRun = !terminalId && !onMachines && state.synced && (workspaces.length === 0 || launch.create.isPending || (launch.made && launch.create.isError));
   const board = !terminalId && !onMachines && !firstRun;
 
-  const place = board ? "flex w-full md:w-auto" : drawer ? "fixed inset-0 z-30 flex md:static md:z-auto" : "hidden md:flex";
+  // On a narrow screen the sidebar is a drawer over whatever is shown: the board, the machines view or a terminal.
+  const place = drawer ? "fixed inset-0 z-30 flex md:static md:z-auto" : "hidden md:flex";
   return (
     <TerminalActions
       machines={machines}
@@ -245,13 +246,13 @@ function Layout() {
               onCreate={() => openCreate()}
               selected={terminalId}
               onNavigate={close}
-              onClose={terminalId || firstRun ? close : undefined}
+              onClose={close}
               onJump={openJump}
               onChanges={openChanges}
               alerts={<AlertsButton {...alerts} />}
             />
           </div>
-          <main className={`${board ? "hidden md:flex" : "flex"} min-w-0 flex-1 flex-col`}>
+          <main className="flex min-w-0 flex-1 flex-col">
             <TabStrip
               workspace={located?.workspace}
               machine={located?.machine}
@@ -304,7 +305,7 @@ function Layout() {
                   </div>
                 );
               })}
-              {!terminalId && onMachines && <Machines machines={machines} history={samples} here={here} connected={connected} onJump={openJump} />}
+              {!terminalId && onMachines && <Machines machines={machines} history={samples} here={here} connected={connected} onJump={openJump} onMenu={() => setDrawer(true)} />}
               {firstRun && <Launchpad projects={state.settings.projects} workspaces={workspaces} launch={launch} onCreated={setLanding} onMore={openCreate} onMenu={() => setDrawer(true)} />}
               {board && state.synced && (
                 <Board
@@ -315,6 +316,7 @@ function Layout() {
                   onMore={openCreate}
                   onChanges={openChanges}
                   traced={traced}
+                  onMenu={() => setDrawer(true)}
                   onSteps={(id) => {
                     setStepsOpen(true);
                     show(id);
