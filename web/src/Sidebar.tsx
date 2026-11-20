@@ -1,6 +1,7 @@
 import { useMutation } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
-import { ArchiveButton, button } from "./ArchiveButton";
+import { ArchiveButton } from "./ArchiveButton";
+import { button } from "./Modal";
 import { CreateWorkspace } from "./CreateWorkspace";
 import { NewSession } from "./NewSession";
 import { startShell, type Project } from "./api";

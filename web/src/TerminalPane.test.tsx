@@ -189,19 +189,19 @@ describe("TerminalPane", () => {
     expect(screen.getByText(/no longer running/i)).toBeDefined();
   });
 
-  it("gives up on a terminal it never attached to after about ten seconds", () => {
+  it("says a terminal it never attached is not available here after about ten seconds, and keeps trying every 5 s", () => {
     mount();
 
     for (let i = 0; i < 20; i++) {
       act(() => FakeSocket.last().end(1006));
       act(() => vi.advanceTimersByTime(5_000));
     }
-    const count = FakeSocket.all.length;
-    act(() => vi.advanceTimersByTime(60_000));
-
-    expect(FakeSocket.all).toHaveLength(count);
-    expect(count).toBeLessThan(10);
     expect(screen.getByText(/not available here/i)).toBeDefined();
+    const count = FakeSocket.all.length;
+    act(() => FakeSocket.last().end(1006));
+    act(() => vi.advanceTimersByTime(5_000));
+
+    expect(FakeSocket.all).toHaveLength(count + 1);
   });
 
   it("sends the new size when the terminal is resized", () => {
@@ -234,34 +234,30 @@ describe("TerminalPane", () => {
     expect(screen.queryByText(/no longer running/i)).toBeNull();
   });
 
-  it("tries again after giving up once the state lists its terminal as running", () => {
-    const { view } = mount("t1", { running: undefined });
-    for (let i = 0; i < 20; i++) {
+  it("attaches once the daemon is back, however long it was down, while its terminal is listed as running", () => {
+    mount();
+    // The daemon restarts for two minutes: every attach fails before it opens.
+    for (let i = 0; i < 24; i++) {
       act(() => FakeSocket.last().end(1006));
       act(() => vi.advanceTimersByTime(5_000));
     }
     expect(screen.getByText(/not available here/i)).toBeDefined();
-    const count = FakeSocket.all.length;
 
-    view.rerender(<TerminalPane id="t1" running />);
-
-    expect(FakeSocket.all.length).toBe(count + 1);
     act(() => FakeSocket.last().open());
+
     expect(screen.queryByText(/not available here/i)).toBeNull();
   });
 
-  it("does not try again after giving up when the state already listed its terminal as running", () => {
-    const { view } = mount("t1", { running: true });
-    for (let i = 0; i < 20; i++) {
-      act(() => FakeSocket.last().end(1006));
-      act(() => vi.advanceTimersByTime(5_000));
-    }
-    const count = FakeSocket.all.length;
+  it("stops trying a terminal it never attached once the state no longer lists it as running", () => {
+    const { view } = mount();
+    act(() => FakeSocket.last().end(1006));
 
-    view.rerender(<TerminalPane id="t1" running />);
+    view.rerender(<TerminalPane id="t1" running={false} />);
+    const count = FakeSocket.all.length;
     act(() => vi.advanceTimersByTime(60_000));
 
     expect(FakeSocket.all).toHaveLength(count);
+    expect(screen.getByText(/no longer running/i)).toBeDefined();
   });
 
   it("backs off a client the holder cuts off again and again", () => {

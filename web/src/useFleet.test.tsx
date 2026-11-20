@@ -70,4 +70,20 @@ describe("useFleet", () => {
       expect(FakeSocket.all).toHaveLength(count + 1);
     }
   });
+
+  it("waits 500 ms again after a socket that sent something closes", () => {
+    render(<Probe />);
+    for (let i = 0; i < 3; i++) {
+      act(() => FakeSocket.last().end(1006));
+      act(() => vi.advanceTimersByTime(5_000));
+    }
+    const socket = FakeSocket.last();
+    act(() => socket.open());
+    act(() => socket.deliver(stateMessage()));
+
+    act(() => socket.end(1006));
+    act(() => vi.advanceTimersByTime(500));
+
+    expect(FakeSocket.last()).not.toBe(socket);
+  });
 });

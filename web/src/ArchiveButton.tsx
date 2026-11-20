@@ -2,8 +2,7 @@ import { useMutation } from "@tanstack/react-query";
 import { useState } from "react";
 import { Dialog } from "radix-ui";
 import { archiveWorkspace, type Blockers } from "./api";
-
-export const button = "rounded border border-neutral-600 px-2 py-0.5 text-xs hover:bg-neutral-800 disabled:opacity-50";
+import { button, Modal } from "./Modal";
 
 /**
  * Archives a workspace after asking, since archiving stops its terminals. When something holds
@@ -30,38 +29,32 @@ export function ArchiveButton({ workspace, name }: { workspace: string; name: st
   };
 
   return (
-    <Dialog.Root open={open} onOpenChange={change}>
-      <Dialog.Trigger className={button}>Archive</Dialog.Trigger>
-      <Dialog.Portal>
-        <Dialog.Overlay className="fixed inset-0 bg-black/60" />
-        <Dialog.Content className="fixed left-1/2 top-1/2 w-96 -translate-x-1/2 -translate-y-1/2 rounded bg-neutral-900 p-4 text-sm text-neutral-100 shadow-xl">
-          <Dialog.Title className="font-semibold">Archive {name}?</Dialog.Title>
-          <Dialog.Description className="mt-1 text-neutral-400">
-            {blockers
-              ? "Archiving now would lose this work."
-              : "Its terminals stop and its worktree is removed. The branch stays."}
-          </Dialog.Description>
-          {blockers && (
-            <div className="mt-2 space-y-2">
-              <List title="Uncommitted files" items={blockers.uncommitted} />
-              <List title="Unpushed commits" items={blockers.unpushed} />
-              <List title="Submodules" items={blockers.submodules} />
-            </div>
-          )}
-          {archive.isError && (
-            <p role="alert" className="mt-2 text-xs text-red-400">
-              {archive.error.message}
-            </p>
-          )}
-          <div className="mt-4 flex justify-end gap-2">
-            <Dialog.Close className={button}>Cancel</Dialog.Close>
-            <button type="button" className={button} onClick={() => run(blockers !== null)} disabled={archive.isPending}>
-              {blockers ? "Archive anyway" : "Archive"}
-            </button>
-          </div>
-        </Dialog.Content>
-      </Dialog.Portal>
-    </Dialog.Root>
+    <Modal
+      open={open}
+      onOpenChange={change}
+      trigger="Archive"
+      title={`Archive ${name}?`}
+      description={blockers ? "Archiving now would lose this work." : "Its terminals stop and its worktree is removed. The branch stays."}
+    >
+      {blockers && (
+        <div className="mt-2 space-y-2">
+          <List title="Uncommitted files" items={blockers.uncommitted} />
+          <List title="Unpushed commits" items={blockers.unpushed} />
+          <List title="Submodules" items={blockers.submodules} />
+        </div>
+      )}
+      {archive.isError && (
+        <p role="alert" className="mt-2 text-xs text-red-400">
+          {archive.error.message}
+        </p>
+      )}
+      <div className="mt-4 flex justify-end gap-2">
+        <Dialog.Close className={button}>Cancel</Dialog.Close>
+        <button type="button" className={button} onClick={() => run(blockers !== null)} disabled={archive.isPending}>
+          {blockers ? "Archive anyway" : "Archive"}
+        </button>
+      </div>
+    </Modal>
   );
 }
 
