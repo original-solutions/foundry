@@ -27,7 +27,6 @@ interface Props {
   onCreate: () => void;
   /** The terminal open in the main pane. */
   selected?: string;
-  connected: boolean;
   /** Called when a terminal is picked, so a drawer can close. */
   onNavigate?: () => void;
   /** Given while the sidebar is a drawer over the terminal: its close button. */
@@ -40,7 +39,7 @@ interface Props {
   alerts?: ReactNode;
 }
 
-export function Sidebar({ machines, onCreate, selected, connected, onNavigate, onClose, onJump, onChanges, alerts }: Props) {
+export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJump, onChanges, alerts }: Props) {
   const [folded, setFolded] = useState(() => new Set(loadFolded()));
   const fold = (ids: string[], on: boolean) =>
     setFolded((old) => {
@@ -79,7 +78,6 @@ export function Sidebar({ machines, onCreate, selected, connected, onNavigate, o
           )}
         </div>
       </div>
-      {!connected && <p className="text-xs text-amber-400">Disconnected, reconnecting</p>}
       {machines.map((machine) => {
         const ids = machine.workspaces.map((w) => w.id);
         const allFolded = ids.length > 0 && ids.every((id) => folded.has(id));

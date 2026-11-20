@@ -33,6 +33,18 @@ function SamplesProbe() {
   return <p>{trace ? `${trace.points.length} points, ${trace.heard === undefined ? "not heard" : "heard"}` : "no samples"}</p>;
 }
 
+function LinkProbe() {
+  const { link } = useFleet();
+  return (
+    <>
+      <p>{link.lostAt === undefined ? `live, ${link.tries} tries${link.back ? `, back after ${link.back.after}` : ""}` : `lost at ${link.lostAt}, next at ${link.retryAt ?? "none"}, ${link.tries} tries`}</p>
+      <button type="button" onClick={link.retry}>
+        retry
+      </button>
+    </>
+  );
+}
+
 describe("useFleet", () => {
   it("keeps each machine's samples as they arrive, and a newer one than the first means it was heard", () => {
     render(<SamplesProbe />);
@@ -85,6 +97,47 @@ describe("useFleet", () => {
       act(() => vi.advanceTimersByTime(1));
       expect(FakeSocket.all).toHaveLength(count + 1);
     }
+  });
+
+  it("keeps when the link was lost across failed tries, when it tries next, and clears both once the daemon sends something", () => {
+    render(<LinkProbe />);
+    const first = FakeSocket.last();
+    act(() => first.open());
+    act(() => first.deliver(stateMessage()));
+    expect(screen.getByText("live, 0 tries")).toBeDefined();
+
+    const lost = Date.now();
+    act(() => first.end(1006));
+    expect(screen.getByText(`lost at ${lost}, next at ${lost + 500}, 1 tries`)).toBeDefined();
+
+    act(() => vi.advanceTimersByTime(500));
+    // This one opens and closes before sending anything: still lost since the first close.
+    act(() => FakeSocket.last().open());
+    act(() => FakeSocket.last().end(1011));
+    expect(screen.getByText(`lost at ${lost}, next at ${Date.now() + 1000}, 2 tries`)).toBeDefined();
+
+    act(() => vi.advanceTimersByTime(1000));
+    act(() => FakeSocket.last().open());
+    act(() => FakeSocket.last().deliver(stateMessage()));
+    expect(screen.getByText("live, 0 tries, back after 1500")).toBeDefined();
+  });
+
+  it("tries again at once when asked, instead of waiting out the backoff", () => {
+    render(<LinkProbe />);
+    act(() => FakeSocket.last().end(1006));
+    act(() => vi.advanceTimersByTime(500));
+    act(() => FakeSocket.last().end(1006));
+    const count = FakeSocket.all.length;
+
+    act(() => screen.getByRole("button", { name: "retry" }).click());
+    expect(FakeSocket.all).toHaveLength(count + 1);
+    expect(screen.getByText(/next at none/)).toBeDefined();
+    // The wait it skipped does not open a second one.
+    act(() => vi.advanceTimersByTime(1000));
+    expect(FakeSocket.all).toHaveLength(count + 1);
+    // A try already under way is not doubled.
+    act(() => screen.getByRole("button", { name: "retry" }).click());
+    expect(FakeSocket.all).toHaveLength(count + 1);
   });
 
   it("waits 500 ms again after a socket that sent something closes", () => {

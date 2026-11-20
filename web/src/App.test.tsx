@@ -140,6 +140,46 @@ describe("App", () => {
     settings: settings(),
   };
 
+  it("says the daemon cannot be reached, instead of showing an empty fleet, when no state ever arrives", async () => {
+    mockActions();
+    const fresh = createRouter({ routeTree, history: createMemoryHistory({ initialEntries: ["/"] }) });
+    await fresh.load();
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <RouterProvider router={fresh} />
+      </QueryClientProvider>,
+    );
+    // Before the first answer the page waits as before.
+    expect(screen.queryByRole("heading", { name: "Can't reach the daemon" })).toBeNull();
+
+    act(() => sockets("/api/events")[0].end(1006));
+
+    expect(screen.getByRole("heading", { name: "Can't reach the daemon" })).toBeDefined();
+    expect(screen.queryByText(/0 workspaces/)).toBeNull();
+    expect(screen.queryByRole("button", { name: "New workspace" })).toBeNull();
+  });
+
+  it("greys the last state it was sent and says the daemon was lost, until it sends again", async () => {
+    mockActions();
+    await open("/", live);
+    expect(screen.queryByRole("status")).toBeNull();
+
+    act(() => sockets("/api/events").at(-1)!.end(1006));
+
+    expect(screen.getByRole("status").textContent).toContain("Lost the daemon");
+    // The last word stays on screen, marked stale.
+    expect(screen.getAllByText("fix login").length).toBeGreaterThan(0);
+    expect(document.querySelector("[data-stale]")).not.toBeNull();
+
+    await act(() => new Promise((resolve) => setTimeout(resolve, 600)));
+    const again = sockets("/api/events").at(-1)!;
+    act(() => again.open());
+    act(() => again.deliver(JSON.stringify(live)));
+
+    expect(document.querySelector("[data-stale]")).toBeNull();
+    expect(screen.getByRole("status").textContent).toContain("Back after");
+  });
+
   it("heads the open terminal with its workspace, its name, its machine and its state", async () => {
     await open("/terminals/t1", live);
 

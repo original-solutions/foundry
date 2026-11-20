@@ -3,6 +3,7 @@ import { createRootRoute, createRoute, createRouter, useNavigate, useParams, use
 import { useEffect, useLayoutEffect, useMemo, useState } from "react";
 import { Board } from "./Board";
 import { ChangesPanel } from "./ChangesPanel";
+import { LinkBanner, Unreachable } from "./Connection";
 import { CreateWorkspace } from "./CreateWorkspace";
 import { JumpPalette } from "./JumpPalette";
 import { Machines } from "./Machines";
@@ -70,9 +71,14 @@ import { AlertsButton, useAlerts } from "./AlertsBell";
  * Cmd+\ or Shift+Enter in the palette), each with its own header. The URL names the side with the
  * keyboard; pressing in the other side moves it there, and a terminal opened from anywhere takes
  * the side that has it. On a narrow screen only that side shows.
+ *
+ * Until the daemon has sent its state once, a failed try fills the page with where it looked and
+ * when it tries next, never an empty fleet. Once it has, a lost link greys everything and stills
+ * the working glyphs under a line that says since when, until the daemon sends again; then a line
+ * says, once, that it is back.
  */
 function Layout() {
-  const { state, connected, samples } = useFleet();
+  const { state, connected, samples, link } = useFleet();
   const { terminalId } = useParams({ strict: false });
   const onMachines = useRouterState({ select: (s) => s.location.pathname === "/machines" });
   const briefs = useBriefs(state.records);
@@ -203,6 +209,10 @@ function Layout() {
   useShortcut("f", terminalId ? () => setFinding((n) => n + 1) : undefined);
   useShortcut("\\", terminalId ? () => (split ? setSplit(undefined) : setJump("beside")) : undefined);
 
+  // Never had the daemon's state: say so, rather than show an empty fleet.
+  if (!state.synced && link.lostAt !== undefined) return <Unreachable link={link} />;
+  const stale = link.lostAt !== undefined;
+
   const place = !terminalId && !onMachines ? "flex w-full md:w-auto" : drawer ? "fixed inset-0 z-30 flex md:static md:z-auto" : "hidden md:flex";
   return (
     <TerminalActions
@@ -225,90 +235,92 @@ function Layout() {
         setSessionIn({ id, name });
       }}
     >
-      <div className="flex h-dvh overflow-hidden bg-neutral-950 text-neutral-100">
-        <div className={`${place} shrink-0`}>
-          <Sidebar
-            machines={machines}
-            onCreate={() => openCreate()}
-            selected={terminalId}
-            connected={connected}
-            onNavigate={close}
-            onClose={terminalId ? close : undefined}
-            onJump={openJump}
-            onChanges={openChanges}
-            alerts={<AlertsButton {...alerts} />}
-          />
-        </div>
-        <main className={`${terminalId || onMachines ? "flex" : "hidden md:flex"} min-w-0 flex-1 flex-col`}>
-          <TabStrip
-            machines={machines}
-            tabs={kept}
-            active={terminalId}
-            beside={pair && (pair.left === terminalId ? pair.right : pair.left)}
-            changed={changed}
-            onClose={closeTab}
-          />
-          {terminalId && (
-            <div className="flex shrink-0">
-              {(pair ? [pair.left, pair.right] : [terminalId]).map((id) => (
-                <div key={id} className="contents" onPointerDown={focusPane(id)}>
-                  <TerminalHeader
-                    id={id}
-                    located={id === terminalId ? located : locate(machines, id)}
-                    drawerOpen={drawer}
-                    onMenu={() => setDrawer(true)}
-                    onJump={openJump}
-                    onChanges={openChanges}
-                    onSteps={id === terminalId ? () => setStepsOpen(!stepsOpen) : undefined}
-                    stepsOpen={stepsOpen}
-                    onFind={id === terminalId ? () => setFinding(finding ? 0 : 1) : undefined}
-                    finding={finding > 0}
-                    onSplit={pair ? undefined : () => setJump("beside")}
-                    onClosePane={pair ? () => closePane(id) : undefined}
-                    beside={id !== terminalId}
-                  />
-                </div>
-              ))}
-            </div>
-          )}
-          <div className="relative min-h-0 flex-1">
-            {/* In a fixed order, so a pane's element never moves when it is used. */}
-            {[...attached].sort().map((id) => {
-              const side = pair && (id === pair.left ? "left" : id === pair.right ? "right" : undefined);
-              const place = side === "left" ? "inset-y-0 left-0 right-0 md:right-1/2" : side === "right" ? "inset-y-0 right-0 left-0 md:left-1/2 md:border-l md:border-neutral-800" : "inset-0";
-              const seen = id === terminalId ? "" : side ? "invisible md:visible" : "invisible";
-              const where = locate(machines, id);
-              return (
-                <div key={id} data-testid={`pane-${id}`} onPointerDownCapture={side && focusPane(id)} onFocusCapture={side && focusPane(id)} className={`absolute ${place} ${seen}`}>
-                  <TerminalPane
-                    id={id}
-                    running={terminalRunning(state, id)}
-                    active={id === terminalId}
-                    name={where?.name}
-                    glyph={where?.glyph}
-                    finding={id === terminalId ? finding : 0}
-                    onFindClose={() => setFinding(0)}
-                  />
-                </div>
-              );
-            })}
-            {!terminalId && onMachines && <Machines machines={machines} history={samples} here={here} connected={connected} onJump={openJump} />}
-            {!terminalId && !onMachines && (
-              <Board
-                machines={machines}
-                onJump={openJump}
-                onCreate={() => openCreate()}
-                onChanges={openChanges}
-                traced={traced}
-                onSteps={(id) => {
-                  setStepsOpen(true);
-                  show(id);
-                }}
-              />
-            )}
+      <div className="flex h-dvh flex-col overflow-hidden bg-neutral-950 text-neutral-100">
+        <LinkBanner link={link} />
+        <div data-stale={stale || undefined} className="relative flex min-h-0 flex-1">
+          <div className={`${place} shrink-0`}>
+            <Sidebar
+              machines={machines}
+              onCreate={() => openCreate()}
+              selected={terminalId}
+              onNavigate={close}
+              onClose={terminalId ? close : undefined}
+              onJump={openJump}
+              onChanges={openChanges}
+              alerts={<AlertsButton {...alerts} />}
+            />
           </div>
-        </main>
-        {stepsOpen && stepsOf && <StepsPanel key={located?.session ?? terminalId} of={stepsOf} onClose={() => setStepsOpen(false)} />}
+          <main className={`${terminalId || onMachines ? "flex" : "hidden md:flex"} min-w-0 flex-1 flex-col`}>
+            <TabStrip
+              machines={machines}
+              tabs={kept}
+              active={terminalId}
+              beside={pair && (pair.left === terminalId ? pair.right : pair.left)}
+              changed={changed}
+              onClose={closeTab}
+            />
+            {terminalId && (
+              <div className="flex shrink-0">
+                {(pair ? [pair.left, pair.right] : [terminalId]).map((id) => (
+                  <div key={id} className="contents" onPointerDown={focusPane(id)}>
+                    <TerminalHeader
+                      id={id}
+                      located={id === terminalId ? located : locate(machines, id)}
+                      drawerOpen={drawer}
+                      onMenu={() => setDrawer(true)}
+                      onJump={openJump}
+                      onChanges={openChanges}
+                      onSteps={id === terminalId ? () => setStepsOpen(!stepsOpen) : undefined}
+                      stepsOpen={stepsOpen}
+                      onFind={id === terminalId ? () => setFinding(finding ? 0 : 1) : undefined}
+                      finding={finding > 0}
+                      onSplit={pair ? undefined : () => setJump("beside")}
+                      onClosePane={pair ? () => closePane(id) : undefined}
+                      beside={id !== terminalId}
+                    />
+                  </div>
+                ))}
+              </div>
+            )}
+            <div className="relative min-h-0 flex-1">
+              {/* In a fixed order, so a pane's element never moves when it is used. */}
+              {[...attached].sort().map((id) => {
+                const side = pair && (id === pair.left ? "left" : id === pair.right ? "right" : undefined);
+                const place = side === "left" ? "inset-y-0 left-0 right-0 md:right-1/2" : side === "right" ? "inset-y-0 right-0 left-0 md:left-1/2 md:border-l md:border-neutral-800" : "inset-0";
+                const seen = id === terminalId ? "" : side ? "invisible md:visible" : "invisible";
+                const where = locate(machines, id);
+                return (
+                  <div key={id} data-testid={`pane-${id}`} onPointerDownCapture={side && focusPane(id)} onFocusCapture={side && focusPane(id)} className={`absolute ${place} ${seen}`}>
+                    <TerminalPane
+                      id={id}
+                      running={terminalRunning(state, id)}
+                      active={id === terminalId}
+                      name={where?.name}
+                      glyph={where?.glyph}
+                      finding={id === terminalId ? finding : 0}
+                      onFindClose={() => setFinding(0)}
+                    />
+                  </div>
+                );
+              })}
+              {!terminalId && onMachines && <Machines machines={machines} history={samples} here={here} connected={connected} onJump={openJump} />}
+              {!terminalId && !onMachines && (
+                <Board
+                  machines={machines}
+                  onJump={openJump}
+                  onCreate={() => openCreate()}
+                  onChanges={openChanges}
+                  traced={traced}
+                  onSteps={(id) => {
+                    setStepsOpen(true);
+                    show(id);
+                  }}
+                />
+              )}
+            </div>
+          </main>
+          {stepsOpen && stepsOf && <StepsPanel key={located?.session ?? terminalId} of={stepsOf} onClose={() => setStepsOpen(false)} />}
+        </div>
         <ChangesPanel workspace={machines.flatMap((m) => m.workspaces).find((w) => w.id === changesOf)} onClose={() => setChangesOf(undefined)} />
         <JumpPalette
           machines={machines}
