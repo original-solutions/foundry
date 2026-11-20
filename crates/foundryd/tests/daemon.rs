@@ -77,6 +77,18 @@ fn exit_within(child: &mut Child, wait: Duration) -> Option<ExitStatus> {
 }
 
 #[test]
+fn a_fixture_whose_port_another_process_took_starts_on_another() {
+    let mut fixture = Fixture::new();
+    let taken_port = fixture.port;
+    let _taken = TcpListener::bind(("127.0.0.1", taken_port)).unwrap();
+
+    fixture.start();
+
+    assert_ne!(fixture.port, taken_port);
+    assert!(fixture.state().is_some());
+}
+
+#[test]
 fn free_ports_are_below_every_ephemeral_range_and_never_repeat() {
     let ports: Vec<u16> = (0..20).map(|_| free_port()).collect();
 
@@ -85,13 +97,25 @@ fn free_ports_are_below_every_ephemeral_range_and_never_repeat() {
     assert_eq!(distinct.len(), ports.len(), "{ports:?}");
 }
 
-/// A port nothing listens on now.
+/// Ports below every system's ephemeral range (Linux starts at 32768, macOS at 49152), so
+/// neither another socket's `bind(0)` nor an outgoing connection is ever handed one.
+const PORTS: std::ops::Range<u32> = 20000..32000;
+
+/// A port nothing listens on now. The daemon binds it only later, so it comes from [`PORTS`],
+/// where the system hands nothing out in between. No port is given twice in one run, and each
+/// run starts at a place set by its process id, so two runs at once rarely meet.
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let span = PORTS.end - PORTS.start;
+    let start = std::process::id() % span;
+    loop {
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        assert!(n < span, "every port in {PORTS:?} is taken");
+        let port = u16::try_from(PORTS.start + (start + n) % span).unwrap();
+        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
 }
 
 /// Runs git in `dir` with an identity of its own.
