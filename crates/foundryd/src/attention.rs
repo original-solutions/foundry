@@ -1,9 +1,8 @@
 //! Raises and clears attention items: what needs a person, with what happened and what to do.
 //!
-//! An item is not stored. It is read from what holds now, so it is raised once its rule holds
-//! and cleared once it no longer does. One read of the list is kept for [`KEPT_FOR`] and
-//! answers every poll in that time, so the records are read at most once a second however
-//! many tabs poll:
+//! An item is not stored. It is read from what holds now, so it is raised as soon as its rule
+//! holds and cleared as soon as it no longer does. The UI polls the list, so a read loads only
+//! the records written since the read before it, never the whole store again:
 //!
 //! | Item | Raised while | Read from |
 //! |---|---|---|
@@ -30,31 +29,24 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use foundry_proto::ids::{MachineId, TerminalId};
+use foundry_proto::ids::{MachineId, SessionId, TerminalId, WorkspaceId};
 use foundry_proto::record::{AnyRecord, Terminal};
 use foundry_proto::settings::{Edit, SettingKey, SettingValue, SharedSettings};
 use foundry_proto::state::{SessionState, TerminalState};
 use serde::Serialize;
-use tokio::time::Instant;
 
 use crate::coordinator::{Coordinator, CoordinatorError};
 use crate::machine::{Over, over_limits};
 use crate::secrets::redact;
 use crate::sessions::STUCK_AFTER;
 use crate::store::{Store, StoreError};
-use crate::sync::{OFFLINE_AFTER, Peers, on_store};
-
-/// How long one read of the list answers every poll. A read loads every record held, so the
-/// polls of every open tab share it. With the UI's 2 second poll an item still shows within
-/// 3 seconds of what raised it.
-pub const KEPT_FOR: Duration = Duration::from_secs(1);
+use crate::sync::{OFFLINE_AFTER, Peers, as_seen, lock, on_store};
 
 /// What an item is about, one per row of the spec's table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -344,6 +336,80 @@ fn value_text(fleet: &Fleet, value: Option<&SettingValue>) -> String {
     }
 }
 
+/// What names a record among its owner's.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum Key {
+    Workspace(WorkspaceId),
+    Terminal(TerminalId),
+    Session(SessionId),
+    /// An owner has one sample.
+    Sample,
+}
+
+impl Key {
+    fn of(record: &AnyRecord) -> Self {
+        match record {
+            AnyRecord::Workspace(r) => Self::Workspace(r.body.id),
+            AnyRecord::Terminal(r) => Self::Terminal(r.body.id),
+            AnyRecord::Session(r) => Self::Session(r.body.id),
+            AnyRecord::MachineSample(_) => Self::Sample,
+        }
+    }
+}
+
+/// The records read so far, kept from one read of the list to the next, so that a read loads
+/// only what was written since the last one.
+#[derive(Default)]
+struct Held {
+    /// The highest version read from each owner.
+    seen: BTreeMap<MachineId, u64>,
+    /// The newest copy of each owner's records, deleted ones too: a closed terminal is what
+    /// clears a "session failed" item.
+    records: BTreeMap<MachineId, BTreeMap<Key, AnyRecord>>,
+}
+
+impl Held {
+    /// Takes in what `store` holds above the versions already read, and says how many records
+    /// that was. An owner with a record this build cannot read, one a newer build wrote before
+    /// a rollback, is left out whole with a warning, as [`Peers::state`] leaves it out, and is
+    /// read from its first record again on the next read.
+    fn load(&mut self, store: &Store) -> Result<usize, StoreError> {
+        let mut read = 0;
+        for (owner, newest) in store.versions()? {
+            let seen = self.seen.get(&owner).copied().unwrap_or(0);
+            if newest <= seen {
+                continue;
+            }
+            match store.since(owner, seen) {
+                Ok(records) => {
+                    read += records.len();
+                    let held = self.records.entry(owner).or_default();
+                    for record in records {
+                        held.insert(Key::of(&record), record);
+                    }
+                    self.seen.insert(owner, newest);
+                }
+                Err(error) => {
+                    tracing::warn!("attention: records of {owner} not shown: {error}");
+                    self.seen.remove(&owner);
+                    self.records.remove(&owner);
+                }
+            }
+        }
+        Ok(read)
+    }
+
+    /// Every record held, with the sessions and terminals of an owner not in `online` shown
+    /// as unreachable.
+    fn as_seen(&self, online: &BTreeSet<MachineId>) -> Vec<AnyRecord> {
+        self.records
+            .values()
+            .flat_map(BTreeMap::values)
+            .map(|record| as_seen(record.clone(), online))
+            .collect()
+    }
+}
+
 /// The attention list of one machine: the fleet's items and those of each [`Source`].
 pub struct Attention {
     me: MachineId,
@@ -351,9 +417,7 @@ pub struct Attention {
     peers: Peers,
     coordinator: Arc<Coordinator>,
     sources: Vec<Arc<dyn Source>>,
-    /// The last read of the list and when it was made. A poll holds this for the length of its
-    /// read, so polls that arrive together wait for one read instead of each making their own.
-    kept: tokio::sync::Mutex<Option<(Instant, Vec<Item>)>>,
+    held: Arc<Mutex<Held>>,
 }
 
 impl Attention {
@@ -369,7 +433,7 @@ impl Attention {
             peers,
             coordinator,
             sources: Vec::new(),
-            kept: tokio::sync::Mutex::new(None),
+            held: Arc::default(),
         }
     }
 
@@ -379,27 +443,21 @@ impl Attention {
         self
     }
 
-    /// Every item that stands, ordered by kind and then id, from a read at most [`KEPT_FOR`]
-    /// old. A read that fails is not kept.
-    pub async fn items(&self) -> Result<Vec<Item>, StoreError> {
-        let mut kept = self.kept.lock().await;
-        if let Some((at, items)) = kept.as_ref()
-            && at.elapsed() < KEPT_FOR
-        {
-            return Ok(items.clone());
-        }
-        let items = self.read().await?;
-        *kept = Some((Instant::now(), items.clone()));
-        Ok(items)
-    }
-
-    /// Reads the list now. Records are read as [`Peers::state`] shows them, so an offline
+    /// Every item that stands now, ordered by kind and then id. Only the records written since
+    /// the last read are loaded. They are shown as [`Peers::state`] shows them, so an offline
     /// machine's sessions and terminals are unreachable and raise nothing but its "machine
     /// offline" item.
-    async fn read(&self) -> Result<Vec<Item>, StoreError> {
+    pub async fn items(&self) -> Result<Vec<Item>, StoreError> {
         let online = self.peers.online();
-        let records = self.peers.state().await?;
-        let settings = on_store(&self.store, |store| store.settings()).await?;
+        let (records, settings) = on_store(&self.store, {
+            let (held, online) = (Arc::clone(&self.held), online.clone());
+            move |store| {
+                let mut held = lock(&held);
+                held.load(store)?;
+                Ok::<_, StoreError>((held.as_seen(&online), store.settings()?))
+            }
+        })
+        .await?;
         let fleet = Fleet {
             me: self.me,
             records,
@@ -455,11 +513,7 @@ async fn dismiss(State(attention): State<Arc<Attention>>, Path(id): Path<String>
         Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
     match attention.coordinator.edit(Edit::Dismiss { setting }).await {
-        Ok(()) => {
-            // The read kept from before the edit still holds the item.
-            *attention.kept.lock().await = None;
-            StatusCode::NO_CONTENT.into_response()
-        }
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
             let status = match e {
                 CoordinatorError::NotLinked(_)
@@ -1240,28 +1294,6 @@ mod tests {
         assert!(!body.contains("hunter2"), "{body}");
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn reads_within_the_time_a_read_is_kept_share_one_read_of_the_records() {
-        let mut world = World::new();
-        let (peer, machines) = (world.peer, world.settings.machines.clone());
-        let served = Served::new(|_, settings| settings.machines = machines).await;
-        let refused = |items: Vec<Item>| items.iter().any(|i| i.kind == Kind::UpdateRefused);
-
-        // Two tabs polling at once, then a third poll just after.
-        let (first, second) = tokio::join!(served.attention.items(), served.attention.items());
-        assert_eq!(first.unwrap(), second.unwrap());
-        world.sample(peer, 100 * GB, Some("v0.2.0"));
-        served.hold(&world);
-        tokio::time::advance(KEPT_FOR - Duration::from_millis(1)).await;
-        assert!(!refused(served.attention.items().await.unwrap()));
-        assert_eq!(served.reads(), 1);
-
-        // Once the read is no longer kept, the next poll reads again and sees what changed.
-        tokio::time::advance(Duration::from_millis(1)).await;
-        assert!(refused(served.attention.items().await.unwrap()));
-        assert_eq!(served.reads(), 2);
-    }
-
     /// A world whose peer has a session waiting for you, a failed setup and a refused tag.
     fn busy_peer(world: &mut World) {
         let peer = world.peer;
@@ -1293,6 +1325,100 @@ mod tests {
             !kinds.contains(&("machine_offline".to_owned(), peer)),
             "{kinds:?}"
         );
+    }
+
+    #[test]
+    fn a_read_takes_in_only_the_records_written_since_the_last_read() {
+        let mut world = World::new();
+        busy_peer(&mut world);
+        let (me, peer) = (world.me, world.peer);
+        let waiting = world.session(me, SessionState::WaitingForYou);
+        let data = tempfile::tempdir().unwrap();
+        let mut store = Store::open(data.path().join("foundry.db")).unwrap();
+        for record in &world.records {
+            store.apply(record, record.owner()).unwrap();
+        }
+        let mut held = Held::default();
+        assert_eq!(held.load(&store).unwrap(), world.records.len());
+        assert_eq!(held.load(&store).unwrap(), 0);
+
+        // One record changes: the next read takes in that one, in place of the copy held.
+        world.put_session(
+            me,
+            Session {
+                state: SessionState::Working,
+                ..waiting.clone()
+            },
+            false,
+        );
+        let changed = world.records.last().unwrap();
+        store.apply(changed, me).unwrap();
+        assert_eq!(held.load(&store).unwrap(), 1);
+        assert_eq!(held.load(&store).unwrap(), 0);
+        let mut seen = held.as_seen(&[me, peer].into());
+        let by_version = |records: &mut Vec<AnyRecord>| records.sort_by_key(AnyRecord::version);
+        by_version(&mut seen);
+        by_version(&mut world.records);
+        assert_eq!(seen, world.records);
+    }
+
+    #[tokio::test]
+    async fn the_list_follows_a_record_from_one_read_to_the_next() {
+        let mut world = World::new();
+        let (peer, machines) = (world.peer, world.settings.machines.clone());
+        let waiting = world.session(peer, SessionState::WaitingForYou);
+        let served = Served::new(|_, settings| settings.machines = machines).await;
+        served.hold(&world);
+        served.hear(peer).await;
+        let raised = ("session_waiting".to_owned(), peer.to_string());
+        assert!(served.kinds().await.contains(&raised));
+
+        // It is answered, then waits again: each read shows the session as it is by then.
+        for (state, stands) in [
+            (SessionState::Working, false),
+            (SessionState::WaitingForYou, true),
+        ] {
+            let session = Session {
+                state,
+                ..waiting.clone()
+            };
+            world.put_session(peer, session, false);
+            served.hold(&world);
+            let kinds = served.kinds().await;
+            assert_eq!(kinds.contains(&raised), stands, "{state:?}: {kinds:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_record_this_build_cannot_read_hides_its_owners_items_and_no_other_owners() {
+        let mut world = World::new();
+        let (other, peer, machines) = (world.me, world.peer, world.settings.machines.clone());
+        world.sample(other, 100 * GB, Some("v0.2.0"));
+        world.sample(peer, 100 * GB, Some("v0.2.0"));
+        let served = Served::new(|_, settings| settings.machines = machines).await;
+        served.hold(&world);
+        let refused = |machine: MachineId| ("update_refused".to_owned(), machine.to_string());
+        let kinds = served.kinds().await;
+        assert!(kinds.contains(&refused(other)), "{kinds:?}");
+        assert!(kinds.contains(&refused(peer)), "{kinds:?}");
+
+        // A newer build on the peer left a row before a rollback: the peer's records, the
+        // ones already read too, are left out as the state leaves them out.
+        let conn = rusqlite::Connection::open(served._data.path().join("foundry.db")).unwrap();
+        conn.execute(
+            "INSERT INTO records (kind, id, owner, version, record) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                "printer",
+                "unreadable",
+                peer.to_string(),
+                1000,
+                r#"{"kind":"printer"}"#
+            ],
+        )
+        .unwrap();
+        let kinds = served.kinds().await;
+        assert!(kinds.contains(&refused(other)), "{kinds:?}");
+        assert!(!kinds.contains(&refused(peer)), "{kinds:?}");
     }
 
     #[tokio::test]
@@ -1334,7 +1460,6 @@ mod tests {
             .await;
         assert_eq!(status, 204, "{body}");
         assert!(served.overwritten().is_empty());
-        // The read kept from before the dismissal is not shown again.
         let items = served.attention.items().await.unwrap();
         assert!(
             items.iter().all(|i| i.kind != Kind::SettingOverwritten),

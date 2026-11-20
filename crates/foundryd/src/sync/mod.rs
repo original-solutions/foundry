@@ -399,7 +399,7 @@ impl Drop for Opened<'_> {
 
 /// `record` as a machine shows it: a session or terminal whose owner is offline is
 /// unreachable.
-fn as_seen(record: AnyRecord, online: &BTreeSet<MachineId>) -> AnyRecord {
+pub(crate) fn as_seen(record: AnyRecord, online: &BTreeSet<MachineId>) -> AnyRecord {
     if online.contains(&record.owner()) {
         return record;
     }
