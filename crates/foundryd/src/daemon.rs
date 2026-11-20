@@ -2,7 +2,7 @@
 //! back, starts every long-running module and stops on SIGTERM or SIGINT. The holders are
 //! sessions of their own, so a stopped daemon leaves every terminal's child running.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::future::Future;
@@ -22,7 +22,7 @@ use axum::response::IntoResponse;
 use nix::errno::Errno;
 use nix::fcntl::{Flock, FlockArg};
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::task::JoinSet;
+use tokio::task::{AbortHandle, JoinSet};
 use tracing_subscriber::EnvFilter;
 
 use crate::api::{self, Api, BindError};
@@ -265,7 +265,7 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
     let listener = api::bind(local).await?;
     tracing::info!("listening on {local}");
     let mut tailscale = Tailscale::new(port, app.clone());
-    tailscale.scan(true).await;
+    tailscale.scan(true, tailscale_ips().await).await;
     let mut services: JoinSet<&'static str> = JoinSet::new();
     // services
     services.spawn(named(
@@ -397,37 +397,31 @@ fn loopback(port: u16) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], port))
 }
 
-/// The addresses to listen on besides loopback, each once: every address in `found`, given
-/// with its interface's name, that is in Tailscale's range on a tunnel interface. A carrier or
-/// hotspot can hand out an address in that range on an ordinary interface, where anyone on
-/// that network could reach the API.
-fn listen_on(port: u16, found: impl IntoIterator<Item = (String, IpAddr)>) -> Vec<SocketAddr> {
+/// The addresses to listen on besides loopback, each once: every address Tailscale reports
+/// for this machine that one of its interfaces (`found`) carries, in Tailscale's range. Neither
+/// the range nor the interface's name is enough on its own: a VPN on macOS uses a `utun` too,
+/// and some (Cloudflare WARP) hand out addresses in the same carrier-grade NAT range.
+fn listen_on(
+    port: u16,
+    reported: impl IntoIterator<Item = IpAddr>,
+    found: &BTreeSet<IpAddr>,
+) -> Vec<SocketAddr> {
     let mut addrs = Vec::new();
-    for (interface, ip) in found {
+    for ip in reported {
         let addr = SocketAddr::new(ip, port);
-        if tunnel(&interface) && api::allowed(ip) && !ip.is_loopback() && !addrs.contains(&addr) {
+        if found.contains(&ip) && api::allowed(ip) && !ip.is_loopback() && !addrs.contains(&addr) {
             addrs.push(addr);
         }
     }
     addrs
 }
 
-/// Whether `interface` is one Tailscale makes: `tailscale0` on Linux, a `utun` on macOS.
-fn tunnel(interface: &str) -> bool {
-    interface.starts_with("tailscale") || interface.starts_with("utun")
-}
-
-/// The addresses of this machine's interfaces, each with its interface's name.
-fn interface_addresses() -> BTreeSet<(String, IpAddr)> {
+/// The addresses of this machine's interfaces.
+fn interface_addresses() -> BTreeSet<IpAddr> {
     match sysinfo::Networks::new_with_refreshed_list() {
         Ok(networks) => networks
-            .iter()
-            .flat_map(|(name, network)| {
-                network
-                    .ip_networks()
-                    .iter()
-                    .map(move |ip| (name.to_string_lossy().into_owned(), ip.addr))
-            })
+            .values()
+            .flat_map(|network| network.ip_networks().iter().map(|ip| ip.addr))
             .collect(),
         Err(error) => {
             tracing::warn!("cannot list this machine's addresses: {error}");
@@ -436,30 +430,134 @@ fn interface_addresses() -> BTreeSet<(String, IpAddr)> {
     }
 }
 
-/// The addresses in `found` to listen on that are not in `served` yet, by [`listen_on`]'s rule.
+/// The addresses to listen on that are not in `served` yet, by [`listen_on`]'s rule.
 fn new_addresses(
     port: u16,
-    found: impl IntoIterator<Item = (String, IpAddr)>,
+    reported: impl IntoIterator<Item = IpAddr>,
+    found: &BTreeSet<IpAddr>,
     served: &BTreeSet<SocketAddr>,
 ) -> Vec<SocketAddr> {
-    listen_on(port, found)
+    listen_on(port, reported, found)
         .into_iter()
         .filter(|addr| !served.contains(addr))
         .collect()
 }
 
-/// How often the machine's interfaces are looked at for a Tailscale address that has come up.
+/// The `served` addresses whose IP Tailscale no longer reports: it logged out or moved to
+/// another tailnet. An interface may still carry one, and another VPN can hand it out next.
+fn withdrawn(
+    reported: &BTreeSet<IpAddr>,
+    served: impl IntoIterator<Item = SocketAddr>,
+) -> Vec<SocketAddr> {
+    served
+        .into_iter()
+        .filter(|addr| !reported.contains(&addr.ip()))
+        .collect()
+}
+
+/// The Tailscale CLI, by [`choose_cli`]. In a debug build `FOUNDRY_TAILSCALE` names it, which
+/// is how tests keep the daemon away from the real one. A release build ignores it, so what
+/// the daemon listens on always comes from Tailscale itself.
+fn tailscale_cli() -> PathBuf {
+    cli_for(std::env::var_os("FOUNDRY_TAILSCALE"))
+}
+
+/// The CLI this build asks for a `FOUNDRY_TAILSCALE` value.
+fn cli_for(set: Option<OsString>) -> PathBuf {
+    choose_cli(set, TAILSCALE_OVERRIDE, KNOWN_CLIS)
+}
+
+/// Whether this build takes `FOUNDRY_TAILSCALE`: only a debug build.
+const TAILSCALE_OVERRIDE: bool = cfg!(debug_assertions);
+
+/// Where the Tailscale CLI is when it is not on a service's `PATH`: on macOS inside the app,
+/// which does not put it on `PATH`, then Homebrew's, which launchd's `PATH` leaves out. On
+/// Linux it is on `PATH`.
+const KNOWN_CLIS: &[&str] = if cfg!(target_os = "macos") {
+    &[
+        "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+        "/opt/homebrew/bin/tailscale",
+        "/usr/local/bin/tailscale",
+    ]
+} else {
+    &[]
+};
+
+/// The CLI to ask: `set` when `taken` (the build takes the override) and it is not empty,
+/// else the first of `known` that is there, else `tailscale` on `PATH`.
+fn choose_cli(set: Option<OsString>, taken: bool, known: &[&str]) -> PathBuf {
+    if let Some(cli) = set.filter(|cli| taken && !cli.is_empty()) {
+        return PathBuf::from(cli);
+    }
+    known
+        .iter()
+        .map(Path::new)
+        .find(|cli| cli.exists())
+        .map_or_else(|| PathBuf::from("tailscale"), Path::to_path_buf)
+}
+
+/// How long `tailscale ip` may take before it is stopped and Tailscale counts as not answering.
+const ASK_WITHIN: Duration = Duration::from_secs(3);
+
+/// The addresses Tailscale reports for this machine, or why it cannot say.
+async fn tailscale_ips() -> Result<BTreeSet<IpAddr>, String> {
+    ask_cli(&tailscale_cli(), ASK_WITHIN).await
+}
+
+/// Runs `<cli> ip`, which prints one of this machine's Tailscale addresses a line, and reads
+/// them. A CLI that fails, is missing, prints anything else or runs past `within` gives why.
+async fn ask_cli(cli: &Path, within: Duration) -> Result<BTreeSet<IpAddr>, String> {
+    let run = tokio::process::Command::new(cli)
+        .arg("ip")
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    let out = match tokio::time::timeout(within, run).await {
+        Ok(Ok(out)) => out,
+        Ok(Err(error)) => return Err(format!("{} could not be run: {error}", cli.display())),
+        Err(_) => {
+            return Err(format!(
+                "`{} ip` did not answer within {} s",
+                cli.display(),
+                within.as_secs_f32()
+            ));
+        }
+    };
+    if !out.status.success() {
+        return Err(format!(
+            "`{} ip` failed ({}): {}",
+            cli.display(),
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            line.parse()
+                .map_err(|_| format!("`{} ip` printed {line:?}, not an address", cli.display()))
+        })
+        .collect()
+}
+
+/// How often Tailscale is asked again for an address that has come up.
 const RESCAN: Duration = Duration::from_secs(5);
 
-/// Serves the app on every Tailscale address this machine has, now and as they appear: the
-/// daemon can start before Tailscale does.
+/// Serves the app on every address Tailscale reports for this machine, now and as they
+/// appear, and stops serving one it no longer reports: the daemon can start before Tailscale
+/// does, and Tailscale can log out or move to another tailnet while it runs.
 struct Tailscale {
     port: u16,
     app: Router,
-    /// The Tailscale addresses being served.
-    served: BTreeSet<SocketAddr>,
+    /// The Tailscale addresses being served, each with its server's task.
+    served: BTreeMap<SocketAddr, AbortHandle>,
     /// The addresses that failed to bind, so each is warned about once.
     failed: BTreeSet<SocketAddr>,
+    /// Whether the last ask of Tailscale failed, so a failure is warned about once until it
+    /// answers again.
+    unanswered: bool,
     servers: JoinSet<SocketAddr>,
 }
 
@@ -468,31 +566,61 @@ impl Tailscale {
         Self {
             port,
             app,
-            served: BTreeSet::new(),
+            served: BTreeMap::new(),
             failed: BTreeSet::new(),
+            unanswered: false,
             servers: JoinSet::new(),
         }
     }
 
-    /// Binds each Tailscale address not served yet. A server that ended is served again.
-    /// `first` says this is the start, when having none is worth a warning.
-    async fn scan(&mut self, first: bool) {
+    /// Binds each address in Tailscale's answer, `reported`, not served yet, and stops the
+    /// server on each served address the answer leaves out, so it takes no new connection; one
+    /// already open is not cut. A server that ended is served again. When Tailscale cannot be
+    /// asked, it counts as reporting nothing: every server is stopped and none is bound until
+    /// it answers. `first` says this is the start, when having none is worth a warning.
+    async fn scan(&mut self, first: bool, reported: Result<BTreeSet<IpAddr>, String>) {
         while let Some(ended) = self.servers.try_join_next() {
             if let Ok(addr) = ended {
                 self.served.remove(&addr);
             }
         }
-        for addr in new_addresses(self.port, interface_addresses(), &self.served) {
+        let reported = match reported {
+            Ok(reported) => {
+                self.unanswered = false;
+                reported
+            }
+            Err(why) => {
+                if !self.unanswered {
+                    tracing::warn!(
+                        "cannot ask Tailscale for this machine's addresses, so none is listened on until it answers: {why}"
+                    );
+                }
+                self.unanswered = true;
+                BTreeSet::new()
+            }
+        };
+        for addr in withdrawn(&reported, self.served.keys().copied()) {
+            if let Some(server) = self.served.remove(&addr) {
+                server.abort();
+                tracing::info!("stopped listening on {addr}: Tailscale no longer reports it");
+            }
+        }
+        if self.unanswered {
+            return;
+        }
+        let found = interface_addresses();
+        let served = self.served.keys().copied().collect();
+        for addr in new_addresses(self.port, reported, &found, &served) {
             match api::bind(addr).await {
                 Ok(listener) => {
                     tracing::info!("listening on {addr}");
-                    self.served.insert(addr);
                     self.failed.remove(&addr);
                     let app = self.app.clone();
-                    self.servers.spawn(async move {
+                    let server = self.servers.spawn(async move {
                         serve_on(listener, app).await;
                         addr
                     });
+                    self.served.insert(addr, server);
                 }
                 Err(error) => {
                     if self.failed.insert(addr) {
@@ -508,11 +636,11 @@ impl Tailscale {
         }
     }
 
-    /// Looks again every [`RESCAN`], for ever.
+    /// Asks again every [`RESCAN`], for ever.
     async fn watch(mut self) {
         loop {
             tokio::time::sleep(RESCAN).await;
-            self.scan(false).await;
+            self.scan(false, tailscale_ips().await).await;
         }
     }
 }
@@ -588,24 +716,31 @@ mod tests {
         assert!(error.contains("not-a-port"), "{error}");
     }
 
-    /// An interface's address as [`interface_addresses`] gives it.
-    fn on(interface: &str, text: &str) -> (String, IpAddr) {
-        (interface.into(), ip(text))
+    fn ips<const N: usize>(texts: [&str; N]) -> BTreeSet<IpAddr> {
+        texts.into_iter().map(ip).collect()
     }
 
     #[test]
     fn the_daemon_listens_on_tailscale_addresses_only_each_once() {
-        let found = [
-            on("en0", "192.168.1.20"),
-            on("utun4", "100.101.102.103"),
-            on("utun4", "fd7a:115c:a1e0::1"),
-            on("lo0", "127.0.0.1"),
-            on("utun4", "0.0.0.0"),
-            on("utun4", "fe80::1"),
-            on("utun4", "8.8.8.8"),
-            on("utun4", "100.101.102.103"),
+        let reported = [
+            ip("100.101.102.103"),
+            ip("fd7a:115c:a1e0::1"),
+            ip("127.0.0.1"),
+            ip("0.0.0.0"),
+            ip("fe80::1"),
+            ip("8.8.8.8"),
+            ip("100.101.102.103"),
         ];
-        let listening: Vec<SocketAddr> = listen_on(7433, found);
+        let found = ips([
+            "192.168.1.20",
+            "100.101.102.103",
+            "fd7a:115c:a1e0::1",
+            "127.0.0.1",
+            "0.0.0.0",
+            "fe80::1",
+            "8.8.8.8",
+        ]);
+        let listening: Vec<SocketAddr> = listen_on(7433, reported, &found);
 
         assert_eq!(
             listening,
@@ -618,29 +753,36 @@ mod tests {
 
     #[test]
     fn with_no_tailscale_there_is_nothing_besides_loopback_to_listen_on() {
-        assert!(listen_on(9000, [on("en0", "10.0.0.5"), on("lo0", "127.0.0.1")]).is_empty());
+        let found = ips(["10.0.0.5", "127.0.0.1", "100.64.0.1"]);
+        assert!(listen_on(9000, [], &found).is_empty());
+    }
+
+    /// Cloudflare WARP hands out 100.96.x.x on a `utun`: in Tailscale's range, on the kind of
+    /// interface Tailscale uses on macOS, yet every device on that VPN could reach the API.
+    #[test]
+    fn a_vpn_address_on_a_utun_that_tailscale_does_not_report_is_not_listened_on() {
+        // utun5 has WARP's 100.96.0.5, utun4 has Tailscale's 100.101.102.103.
+        let found = ips(["100.96.0.5", "100.101.102.103"]);
+        let reported = [ip("100.101.102.103")];
+
+        assert_eq!(
+            listen_on(7433, reported, &found),
+            vec![addr("100.101.102.103:7433")]
+        );
     }
 
     /// A carrier-grade NAT or phone hotspot hands out addresses in Tailscale's range on an
     /// ordinary interface, where anyone on that network could reach the API.
     #[test]
-    fn a_tailscale_range_address_off_a_tunnel_interface_is_not_listened_on() {
-        let found = [
-            on("en0", "100.72.10.5"),
-            on("wlan0", "100.72.10.6"),
-            on("eth0", "fd7a:115c:a1e0::2"),
-            on("bridge100", "100.72.10.7"),
-        ];
-        assert!(listen_on(7433, found).is_empty());
+    fn a_tailscale_range_address_tailscale_does_not_report_is_not_listened_on() {
+        let found = ips(["100.72.10.5", "100.72.10.6", "fd7a:115c:a1e0::2"]);
+        assert!(listen_on(7433, [ip("100.64.0.1")], &found).is_empty());
     }
 
+    /// Tailscale can report an address before this machine's tunnel carries it.
     #[test]
-    fn tailscale_tunnels_on_linux_and_macos_are_listened_on() {
-        let found = [on("tailscale0", "100.64.0.1"), on("utun3", "100.64.0.2")];
-        assert_eq!(
-            listen_on(7433, found),
-            vec![addr("100.64.0.1:7433"), addr("100.64.0.2:7433")]
-        );
+    fn a_reported_address_no_interface_has_yet_is_not_listened_on() {
+        assert!(listen_on(7433, [ip("100.64.0.1")], &BTreeSet::new()).is_empty());
     }
 
     #[test]
@@ -768,17 +910,22 @@ mod tests {
     #[test]
     fn only_tailscale_addresses_not_yet_served_are_new() {
         let served: BTreeSet<SocketAddr> = [addr("100.101.102.103:7433")].into();
-        let found = [
-            on("utun4", "100.101.102.103"),
-            on("utun4", "100.64.0.9"),
-            on("en0", "192.168.1.20"),
-            on("utun4", "fd7a:115c:a1e0::1"),
-            on("lo0", "127.0.0.1"),
-            on("utun4", "100.64.0.9"),
+        let reported = [
+            ip("100.101.102.103"),
+            ip("100.64.0.9"),
+            ip("fd7a:115c:a1e0::1"),
+            ip("100.64.0.9"),
         ];
+        let found = ips([
+            "100.101.102.103",
+            "100.64.0.9",
+            "192.168.1.20",
+            "fd7a:115c:a1e0::1",
+            "127.0.0.1",
+        ]);
 
         assert_eq!(
-            new_addresses(7433, found, &served),
+            new_addresses(7433, reported, &found, &served),
             vec![addr("100.64.0.9:7433"), addr("[fd7a:115c:a1e0::1]:7433")]
         );
     }
@@ -786,15 +933,312 @@ mod tests {
     #[test]
     fn with_everything_served_nothing_is_new() {
         let served: BTreeSet<SocketAddr> = [addr("100.64.0.9:7433")].into();
+        let found = ips(["10.0.0.5", "100.64.0.9"]);
 
-        assert!(
-            new_addresses(
-                7433,
-                [on("en0", "10.0.0.5"), on("utun4", "100.64.0.9")],
-                &served
-            )
-            .is_empty()
+        assert!(new_addresses(7433, [ip("100.64.0.9")], &found, &served).is_empty());
+    }
+
+    /// The daemon can start before Tailscale: an address it reports later is new then, once.
+    #[test]
+    fn an_address_tailscale_reports_after_the_start_is_new_once() {
+        let found = ips(["100.64.0.9"]);
+        let mut served = BTreeSet::new();
+        assert!(new_addresses(7433, [], &found, &served).is_empty());
+
+        let later = new_addresses(7433, [ip("100.64.0.9")], &found, &served);
+        assert_eq!(later, vec![addr("100.64.0.9:7433")]);
+
+        served.extend(later);
+        assert!(new_addresses(7433, [ip("100.64.0.9")], &found, &served).is_empty());
+    }
+
+    /// Tailscale logged out or moved to another tailnet: an address it no longer reports is
+    /// withdrawn, though an interface may still carry it, and one it still reports stays.
+    #[test]
+    fn a_served_address_tailscale_no_longer_reports_is_withdrawn() {
+        let served = [addr("100.101.102.103:7433"), addr("100.64.0.9:7433")];
+
+        assert_eq!(
+            withdrawn(&ips(["100.64.0.9"]), served),
+            vec![addr("100.101.102.103:7433")]
         );
+        assert!(withdrawn(&ips(["100.101.102.103", "100.64.0.9"]), served).is_empty());
+    }
+
+    /// A watcher serving `addr` with a server that runs until it is stopped.
+    fn serving(addr: SocketAddr) -> Tailscale {
+        let mut tailscale = Tailscale::new(7433, Router::new());
+        let server = tailscale.servers.spawn(async move {
+            std::future::pending::<()>().await;
+            addr
+        });
+        tailscale.served.insert(addr, server);
+        tailscale
+    }
+
+    /// Waits for the watcher's one server to end, and says whether it was stopped.
+    async fn stopped(mut tailscale: Tailscale) -> bool {
+        let ended = tokio::time::timeout(Duration::from_secs(5), tailscale.servers.join_next())
+            .await
+            .expect("the server was not stopped")
+            .unwrap();
+        ended.is_err_and(|error| error.is_cancelled())
+    }
+
+    /// A server for an address Tailscale stops reporting is stopped, so nothing listens there
+    /// if the address turns up again on another VPN.
+    #[tokio::test]
+    async fn the_server_on_an_address_tailscale_no_longer_reports_is_stopped() {
+        let gone = addr("100.101.102.103:7433");
+        let mut tailscale = serving(gone);
+
+        tailscale.scan(false, Ok(ips(["100.64.0.9"]))).await;
+
+        assert!(!tailscale.served.contains_key(&gone));
+        assert!(stopped(tailscale).await);
+    }
+
+    /// When Tailscale cannot be asked, it counts as reporting nothing: every server is stopped
+    /// until it answers again, and the failure is still warned about once.
+    #[tokio::test]
+    async fn when_tailscale_cannot_be_asked_every_server_is_stopped() {
+        let logged = Logged::default();
+        let _capture = logged.capture();
+        let mut tailscale = serving(addr("100.101.102.103:7433"));
+
+        tailscale.scan(false, Err("logged out".to_owned())).await;
+        tailscale.scan(false, Err("logged out".to_owned())).await;
+
+        assert!(tailscale.served.is_empty());
+        assert_eq!(logged.warnings().len(), 1, "{:?}", logged.warnings());
+        assert!(stopped(tailscale).await);
+    }
+
+    /// Everything the daemon logs while it is set, as plain text.
+    #[derive(Clone, Default)]
+    struct Logged(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for Logged {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Logged {
+        /// Captures this thread's log until the guard drops.
+        fn capture(&self) -> tracing::subscriber::DefaultGuard {
+            let logged = self.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(move || logged.clone())
+                .with_ansi(false)
+                .without_time()
+                .finish();
+            tracing::subscriber::set_default(subscriber)
+        }
+
+        fn warnings(&self) -> Vec<String> {
+            String::from_utf8_lossy(&self.0.lock().unwrap())
+                .lines()
+                .filter(|line| line.contains("WARN"))
+                .map(str::to_owned)
+                .collect()
+        }
+    }
+
+    /// Not installed, not running or logged out: nothing besides loopback is bound, and the
+    /// reason is logged once, not on every rescan.
+    #[tokio::test]
+    async fn when_tailscale_cannot_be_asked_nothing_is_bound_and_one_warning_says_why() {
+        let logged = Logged::default();
+        let _capture = logged.capture();
+        let mut tailscale = Tailscale::new(7433, Router::new());
+        let cannot = || Err::<BTreeSet<IpAddr>, _>("Tailscale is stopped.".to_owned());
+
+        tailscale.scan(true, cannot()).await;
+        tailscale.scan(false, cannot()).await;
+        tailscale.scan(false, cannot()).await;
+
+        assert!(tailscale.served.is_empty());
+        assert!(tailscale.servers.is_empty());
+        let warnings = logged.warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("Tailscale is stopped."),
+            "{warnings:?}"
+        );
+    }
+
+    /// After Tailscale answers again, a new failure is worth a new warning.
+    #[tokio::test]
+    async fn a_failure_after_tailscale_answered_again_is_warned_again() {
+        let logged = Logged::default();
+        let _capture = logged.capture();
+        let mut tailscale = Tailscale::new(7433, Router::new());
+
+        tailscale.scan(false, Err("not running".to_owned())).await;
+        tailscale.scan(false, Ok(BTreeSet::new())).await;
+        tailscale.scan(false, Err("logged out".to_owned())).await;
+
+        let warnings = logged.warnings();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[1].contains("logged out"), "{warnings:?}");
+    }
+
+    #[test]
+    fn foundry_tailscale_names_the_cli_when_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let known = dir.path().join("known");
+        std::fs::write(&known, "").unwrap();
+        let known = known.to_str().unwrap();
+
+        assert_eq!(
+            choose_cli(os("/opt/fake/tailscale"), true, &[known]),
+            PathBuf::from("/opt/fake/tailscale")
+        );
+    }
+
+    /// A release build ignores `FOUNDRY_TAILSCALE`: whatever the variable names, the daemon asks
+    /// the CLI where Tailscale puts it.
+    #[test]
+    fn foundry_tailscale_is_ignored_when_the_build_does_not_take_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let known = dir.path().join("known");
+        std::fs::write(&known, "").unwrap();
+
+        assert_eq!(
+            choose_cli(os("/opt/fake/tailscale"), false, &[known.to_str().unwrap()]),
+            known
+        );
+    }
+
+    /// The debug build the tests run takes `FOUNDRY_TAILSCALE`.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn this_debug_build_takes_foundry_tailscale() {
+        assert_eq!(
+            cli_for(os("/opt/fake/tailscale")),
+            PathBuf::from("/opt/fake/tailscale")
+        );
+    }
+
+    /// A release build does not. The gate runs debug builds only; run
+    /// `cargo test --release -p foundryd --lib daemon` to check this one.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn this_release_build_ignores_foundry_tailscale() {
+        assert_eq!(cli_for(os("/opt/fake/tailscale")), cli_for(None));
+    }
+
+    #[test]
+    fn without_foundry_tailscale_the_first_known_cli_that_is_there_is_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        let there = dir.path().join("there");
+        let also = dir.path().join("also");
+        std::fs::write(&there, "").unwrap();
+        std::fs::write(&also, "").unwrap();
+        let known = [
+            missing.to_str().unwrap(),
+            there.to_str().unwrap(),
+            also.to_str().unwrap(),
+        ];
+
+        assert_eq!(choose_cli(None, true, &known), there);
+        assert_eq!(choose_cli(os(""), true, &known), there);
+    }
+
+    #[test]
+    fn with_no_known_cli_there_tailscale_on_path_is_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+
+        assert_eq!(
+            choose_cli(None, true, &[missing.to_str().unwrap()]),
+            PathBuf::from("tailscale")
+        );
+    }
+
+    /// A service's `PATH` under launchd holds neither the app's CLI nor Homebrew's.
+    #[test]
+    fn on_macos_the_app_cli_comes_first_then_homebrew_s() {
+        let expected: &[&str] = if cfg!(target_os = "macos") {
+            &[
+                "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+                "/opt/homebrew/bin/tailscale",
+                "/usr/local/bin/tailscale",
+            ]
+        } else {
+            &[]
+        };
+        assert_eq!(KNOWN_CLIS, expected);
+    }
+
+    /// Writes an executable stand-in for the Tailscale CLI that runs `body`.
+    fn fake_cli(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let cli = dir.join("tailscale");
+        std::fs::write(&cli, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        cli
+    }
+
+    #[tokio::test]
+    async fn the_cli_is_asked_for_ip_and_its_addresses_are_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = fake_cli(
+            dir.path(),
+            r#"[ "$1" = ip ] || exit 9; printf '100.101.102.103\nfd7a:115c:a1e0::1\n'"#,
+        );
+
+        let reported = ask_cli(&cli, Duration::from_secs(10)).await;
+
+        assert_eq!(reported, Ok(ips(["100.101.102.103", "fd7a:115c:a1e0::1"])));
+    }
+
+    #[tokio::test]
+    async fn a_cli_that_fails_says_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = fake_cli(dir.path(), "echo 'Tailscale is stopped.' >&2; exit 1");
+
+        let why = ask_cli(&cli, Duration::from_secs(10)).await.unwrap_err();
+
+        assert!(why.contains("Tailscale is stopped."), "{why}");
+    }
+
+    #[tokio::test]
+    async fn a_missing_cli_says_which_one_could_not_be_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = dir.path().join("tailscale");
+
+        let why = ask_cli(&cli, Duration::from_secs(10)).await.unwrap_err();
+
+        assert!(why.contains(&cli.display().to_string()), "{why}");
+    }
+
+    #[tokio::test]
+    async fn output_that_is_not_addresses_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = fake_cli(dir.path(), "echo 'not an address'");
+
+        let why = ask_cli(&cli, Duration::from_secs(10)).await.unwrap_err();
+
+        assert!(why.contains("not an address"), "{why}");
+    }
+
+    #[tokio::test]
+    async fn a_cli_that_hangs_is_stopped_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        // A distinctive duration, so a stray is easy to find.
+        let cli = fake_cli(dir.path(), "exec sleep 7.317");
+
+        let why = ask_cli(&cli, Duration::from_millis(200)).await.unwrap_err();
+
+        assert!(why.contains("did not answer"), "{why}");
     }
 
     /// What the stub router answers, so a request that got through is told from a refusal.
