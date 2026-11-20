@@ -926,6 +926,79 @@ async fn a_shell_is_started_in_the_worktree_and_closed() {
 }
 
 #[tokio::test]
+async fn a_file_sent_to_a_terminal_is_kept_beside_it_under_a_plain_name_and_its_path_returned() {
+    let daemon = Daemon::new(TURN).await;
+    let project = daemon.project();
+    let workspace = daemon.create_workspace(project, "files").await;
+    let reply = daemon
+        .call("POST", &format!("/api/workspaces/{workspace}/shells"), None)
+        .await;
+    let shell: TerminalId = reply.id();
+    let host = daemon.host();
+    let send = |name: &str, body: &str| {
+        let path = format!("/api/terminals/{shell}/files?name={name}");
+        let (host, body) = (host.clone(), body.to_owned());
+        let daemon = &daemon;
+        async move {
+            daemon
+                .send("POST", &path, &[("Host", host.as_str())], &body)
+                .await
+        }
+    };
+
+    let reply = send("my%20shot%20(1).png", "first").await;
+    assert_eq!(reply.status, 201, "{}", reply.body);
+    let first = PathBuf::from(reply.json()["path"].as_str().unwrap());
+    let files = daemon
+        .data
+        .path()
+        .join("terminals")
+        .join(format!("{shell}.files"));
+    assert_eq!(first, files.join("my-shot-1.png"));
+    assert_eq!(std::fs::read_to_string(&first).unwrap(), "first");
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = std::fs::metadata(&files).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o700, "only this user reads what was sent");
+
+    // A clipboard image is always "image.png": a second one never overwrites a path already typed.
+    let again = send("my%20shot%20(1).png", "second").await;
+    assert_eq!(
+        again.json()["path"],
+        files.join("my-shot-1-2.png").to_str().unwrap()
+    );
+    assert_eq!(std::fs::read_to_string(&first).unwrap(), "first");
+
+    // No name, or one that is all path and dots, is still kept.
+    let unnamed = send("..%2F..%2F", "x").await;
+    assert_eq!(unnamed.json()["path"], files.join("file").to_str().unwrap());
+
+    let unknown = daemon
+        .send(
+            "POST",
+            &format!("/api/terminals/{}/files?name=a.txt", TerminalId::random()),
+            &[("Host", host.as_str())],
+            "x",
+        )
+        .await;
+    assert_eq!(unknown.status, 404, "{}", unknown.body);
+
+    let big = "x".repeat(super::files::MAX_FILE + 1);
+    let refused = send("big.bin", &big).await;
+    assert_eq!(refused.status, 413, "{}", refused.body);
+    assert!(
+        refused.json()["error"].as_str().unwrap().contains("25 MB"),
+        "{}",
+        refused.body
+    );
+
+    let reply = daemon
+        .call("POST", &format!("/api/terminals/{shell}/close"), None)
+        .await;
+    assert_eq!(reply.status, 204, "{}", reply.body);
+    assert!(!files.exists(), "the files go with the terminal");
+}
+
+#[tokio::test]
 async fn archive_with_uncommitted_work_is_refused_listing_it() {
     let daemon = Daemon::new(TURN).await;
     let project = daemon.project();

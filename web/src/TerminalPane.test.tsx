@@ -2,7 +2,7 @@ import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TerminalPane } from "./TerminalPane";
 import type { Glyph } from "./labels";
-import { FakeSocket } from "./test-utils";
+import { FakeSocket, json } from "./test-utils";
 
 // jsdom cannot run xterm.js, so a stand-in records what the pane does to its screen.
 const screenOps = vi.hoisted(() => ({
@@ -79,8 +79,8 @@ afterEach(() => {
 });
 
 // An options object, not a defaulted parameter: a default would turn an explicit `undefined` into `true`.
-function mount(id = "t1", { running, glyph }: { running: boolean | undefined; glyph?: Glyph } = { running: true }) {
-  const view = render(<TerminalPane id={id} running={running} name="opus" glyph={glyph} />);
+function mount(id = "t1", { running, glyph, here = true }: { running: boolean | undefined; glyph?: Glyph; here?: boolean } = { running: true }) {
+  const view = render(<TerminalPane id={id} running={running} name="opus" glyph={glyph} here={here} />);
   return { socket: FakeSocket.last(), view };
 }
 
@@ -411,6 +411,117 @@ describe("TerminalPane", () => {
       vi.stubGlobal("matchMedia", (query: string) => ({ matches: query === "(pointer: coarse)" }));
       mount();
       expect(screenOps.focused).toBe(false);
+    });
+  });
+
+  describe("handing it files", () => {
+    const sent = (socket: FakeSocket) => socket.sent.filter((d) => typeof d !== "string").map((d) => new TextDecoder().decode(d as Uint8Array));
+    const shot = () => new File(["png"], "shot.png", { type: "image/png" });
+    const files = (...list: File[]) => ({ types: ["Files"], files: list, items: list.map(() => ({ kind: "file" })) });
+    const keeps = () => {
+      let n = 0;
+      const fetch = vi.fn(async (url: string) => json(201, { path: `/data/t1.files/${new URL(url, "http://x").searchParams.get("name")}${n++ ? `-${n}` : ""}` }));
+      vi.stubGlobal("fetch", fetch);
+      return fetch;
+    };
+    const pane = () => screen.getByTestId("terminal-pane");
+
+    it("shows where a dragged file goes, and dropping it sends it and types its path for you to finish, without Enter", async () => {
+      const fetch = keeps();
+      const { socket } = mount();
+      act(() => socket.open());
+
+      fireEvent.dragEnter(pane(), { dataTransfer: files(shot()) });
+      expect(screen.getByText("Drop to hand opus this file")).toBeTruthy();
+      await act(async () => {
+        fireEvent.drop(pane(), { dataTransfer: files(shot()) });
+      });
+
+      expect(fetch).toHaveBeenCalledWith("/api/terminals/t1/files?name=shot.png", expect.objectContaining({ method: "POST" }));
+      expect(sent(socket)).toEqual(["\x1b[200~/data/t1.files/shot.png \x1b[201~"]);
+      expect(screen.queryByText("Drop to hand opus this file")).toBeNull();
+    });
+
+    it("types every path of several files dropped at once, in order", async () => {
+      keeps();
+      const { socket } = mount();
+      act(() => socket.open());
+
+      await act(async () => {
+        fireEvent.drop(pane(), { dataTransfer: files(shot(), new File(["a"], "notes.txt")) });
+      });
+
+      expect(sent(socket)).toEqual(["\x1b[200~/data/t1.files/shot.png /data/t1.files/notes.txt-2 \x1b[201~"]);
+    });
+
+    it("sends a pasted screenshot the same way, and leaves pasted text to the terminal", async () => {
+      const fetch = keeps();
+      const { socket } = mount();
+      act(() => socket.open());
+
+      await act(async () => {
+        fireEvent.paste(pane(), { clipboardData: { files: [shot()], getData: () => "" } });
+      });
+      expect(sent(socket)).toEqual(["\x1b[200~/data/t1.files/shot.png \x1b[201~"]);
+
+      fireEvent.paste(pane(), { clipboardData: { files: [], getData: () => "hello" } });
+      expect(fetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not send a file over 25 MB, and says why", async () => {
+      const fetch = keeps();
+      const { socket } = mount();
+      act(() => socket.open());
+      const big = new File(["x"], "video.mov");
+      Object.defineProperty(big, "size", { value: 25 * 1024 * 1024 + 1 });
+
+      await act(async () => {
+        fireEvent.drop(pane(), { dataTransfer: files(big) });
+      });
+
+      expect(fetch).not.toHaveBeenCalled();
+      expect(sent(socket)).toEqual([]);
+      expect(screen.getByText("video.mov is over 25 MB; nothing was sent")).toBeTruthy();
+    });
+
+    it("says what the daemon refused, and types nothing", async () => {
+      vi.stubGlobal("fetch", vi.fn(async () => json(500, { error: "the file could not be kept: disk full" })));
+      const { socket } = mount();
+      act(() => socket.open());
+
+      await act(async () => {
+        fireEvent.drop(pane(), { dataTransfer: files(shot()) });
+      });
+
+      expect(sent(socket)).toEqual([]);
+      expect(screen.getByText("Could not send shot.png: the file could not be kept: disk full")).toBeTruthy();
+    });
+
+    it("takes no files for a terminal on another machine, and says so instead of letting the browser open the file", () => {
+      const fetch = keeps();
+      mount("t1", { running: true, here: false });
+
+      fireEvent.dragEnter(pane(), { dataTransfer: files(shot()) });
+      expect(screen.getByText("Files go only to terminals on this machine")).toBeTruthy();
+      const drop = new Event("drop", { bubbles: true, cancelable: true });
+      Object.assign(drop, { dataTransfer: files(shot()) });
+      pane().dispatchEvent(drop);
+
+      expect(drop.defaultPrevented).toBe(true);
+      expect(fetch).not.toHaveBeenCalled();
+    });
+
+    it("on a phone, the key bar's clip picks files to send", async () => {
+      keeps();
+      const { socket } = mount();
+      act(() => socket.open());
+
+      const picker = screen.getByLabelText("Attach files for opus");
+      await act(async () => {
+        fireEvent.change(picker, { target: { files: [shot()] } });
+      });
+
+      expect(sent(socket)).toEqual(["\x1b[200~/data/t1.files/shot.png \x1b[201~"]);
     });
   });
 });

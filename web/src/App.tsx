@@ -299,6 +299,7 @@ function Layout() {
                       glyph={where?.glyph}
                       finding={id === terminalId ? finding : 0}
                       onFindClose={() => setFinding(0)}
+                      here={!!where && where.machine.id === here}
                     />
                   </div>
                 );

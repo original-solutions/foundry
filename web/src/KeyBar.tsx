@@ -7,6 +7,7 @@ import type { Glyph } from "./labels";
  * one-tap answers while a session waits for you) over a box to write a message in, which goes
  * as one paste and then Enter. Hidden where the main pointer is a mouse: there is a keyboard.
  * A key press keeps focus where it was, so the on-screen keyboard neither rises nor drops.
+ * With `onFiles`, a clip beside the box picks files (a photo, a screenshot) to hand the terminal.
  */
 export function KeyBar({
   name,
@@ -14,12 +15,14 @@ export function KeyBar({
   modes,
   onKey,
   onMessage,
+  onFiles,
 }: {
   name: string;
   glyph: Glyph;
   modes: () => { applicationCursorKeysMode: boolean };
   onKey: (data: string) => void;
   onMessage: (text: string) => void;
+  onFiles?: (files: File[]) => void;
 }) {
   const [draft, setDraft] = useState("");
   const shell = name === "shell";
@@ -58,6 +61,23 @@ export function KeyBar({
           send();
         }}
       >
+        {onFiles && (
+          <label title="Attach files" className="grid size-10 shrink-0 cursor-pointer place-items-center rounded-full bg-neutral-800/80 text-neutral-300 active:bg-neutral-700">
+            <input
+              type="file"
+              multiple
+              aria-label={`Attach files for ${name}`}
+              className="sr-only"
+              onChange={(e) => {
+                onFiles(Array.from(e.target.files ?? []));
+                e.target.value = "";
+              }}
+            />
+            <svg viewBox="0 0 16 16" className="size-4" aria-hidden="true">
+              <path d="M10.5 4.5 5.8 9.2a1.4 1.4 0 0 0 2 2l5-5a2.8 2.8 0 0 0-4-4l-5 5a4.2 4.2 0 0 0 6 6l4.2-4.2" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+          </label>
+        )}
         <input
           aria-label={`Message ${name}`}
           value={draft}

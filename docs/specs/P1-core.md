@@ -205,6 +205,10 @@ The board also switches to its machines (`/machines`, or a machine's name in the
 
 A terminal is ended or cleared from its menu (right-click or long press on its row, or the header's More button) through `POST /api/terminals/{id}/close`, which only the owning machine answers. `GET /api/machine` returns `{"id"}` of the machine serving the UI, and the menu offers End and Clear only for that machine's terminals. Ending one that still runs asks first; clearing one that ended does not, so End and Clear are picked only by a click on them or the keyboard, never by the release of the press that opened the menu.
 
+### Handing a terminal files
+
+A file dropped on a terminal of this machine, pasted into it (a screenshot on the clipboard), or picked with the phone key bar's clip is sent with `POST /api/terminals/{id}/files?name=<name>` (at most 25 MB). The daemon keeps it in a folder of that terminal readable by its user only, under a name cut to letters, digits, `.`, `_` and `-` that never overwrites an earlier one, and answers its path. The UI types the path into the terminal without Enter, as dragging a file into a desktop terminal does; Claude Code reads a pasted image path as the image. The folder goes when the terminal is closed. Another machine's terminal takes no files and says so.
+
 ## Placement
 
 - Each worker records CPU load per core, free memory, free disk and its session count every 5 seconds.

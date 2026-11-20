@@ -84,6 +84,11 @@ async function post(path: string, body?: unknown): Promise<{ status: number; jso
     headers: body === undefined ? undefined : { "content-type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
+  return answered(response);
+}
+
+/** A response's status and JSON body; `{}` for a body that is empty or not JSON. */
+async function answered(response: Response): Promise<{ status: number; json: Record<string, unknown> }> {
   let json: Record<string, unknown> = {};
   try {
     const parsed: unknown = JSON.parse(await response.text());
@@ -219,4 +224,15 @@ export async function sessionBriefs(): Promise<Briefs> {
 export async function closeTerminal(id: string): Promise<void> {
   const { status, json } = await post(`/api/terminals/${id}/close`);
   if (status !== 204) throw refused(status, json);
+}
+
+/** The largest file a terminal is sent; the daemon refuses a larger one. */
+export const MAX_FILE = 25 * 1024 * 1024;
+
+/** Sends `file` to terminal `id` of this machine, which keeps it beside the terminal until it is closed, and gives back the path it was kept at. */
+export async function sendFile(id: string, file: File): Promise<string> {
+  const response = await fetch(`/api/terminals/${id}/files?name=${encodeURIComponent(file.name)}`, { method: "POST", body: file });
+  const { status, json } = await answered(response);
+  if (status !== 201) throw refused(status, json);
+  return String(json.path);
 }

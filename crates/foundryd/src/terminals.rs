@@ -217,6 +217,14 @@ impl Terminals {
         self.inner.me
     }
 
+    /// The folder that keeps the files sent to live terminal `id`, such as a screenshot pasted
+    /// into a session, so a path to one can be typed in. It is not made here; [`Self::close`]
+    /// removes it with the terminal.
+    pub fn files(&self, id: TerminalId) -> Result<PathBuf, TerminalError> {
+        let entry = self.inner.entry(id)?;
+        Ok(self.inner.files(entry.id))
+    }
+
     /// Ends the terminal: hangs up its child, waits for its holder to end and deletes its
     /// record. A holder that is already gone is no error. The close finishes even when the
     /// caller stops waiting.
@@ -357,11 +365,19 @@ impl Inner {
         if let Some(watcher) = lock(&entry.watcher).take() {
             watcher.abort();
         }
+        let files = self.files(id);
+        tokio::task::spawn_blocking(move || std::fs::remove_dir_all(files))
+            .await?
+            .ok();
         Ok(())
     }
 
     fn socket(&self, id: TerminalId) -> PathBuf {
         self.dir.join(format!("{id}.sock"))
+    }
+
+    fn files(&self, id: TerminalId) -> PathBuf {
+        self.dir.join(format!("{id}.files"))
     }
 
     fn entry(&self, id: TerminalId) -> Result<Arc<Entry>, TerminalError> {
@@ -1693,6 +1709,24 @@ mod tests {
         assert!(matches!(
             terminals.attach(id).await,
             Err(TerminalError::Unknown(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_live_terminal_has_a_files_folder_that_goes_with_its_close() {
+        let setup = Setup::new();
+        let (terminals, _store) = setup.daemon();
+        let id = setup.start(&terminals, "sleep 60").await;
+        let files = terminals.files(id).unwrap();
+        assert_eq!(files, setup.dir().join(format!("{id}.files")));
+        std::fs::create_dir_all(&files).unwrap();
+        std::fs::write(files.join("shot.png"), b"png").unwrap();
+
+        terminals.close(id).await.unwrap();
+        assert!(!files.exists(), "the files are removed with the terminal");
+        assert!(matches!(
+            terminals.files(id),
+            Err(TerminalError::Unknown(gone)) if gone == id
         ));
     }
 

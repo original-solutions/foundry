@@ -2,7 +2,9 @@ import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { MAX_FILE, sendFile } from "./api";
 import { FindBar } from "./FindBar";
+import { DropOverlay, SendingChip } from "./Handoff";
 import { KeyBar } from "./KeyBar";
 import type { Glyph } from "./labels";
 import { Backoff, socketUrl } from "./socket";
@@ -35,6 +37,11 @@ const STEADY_AFTER = 10_000;
  * a box to write a message in.
  *
  * While `finding`, a find bar over the screen searches its whole scrollback.
+ *
+ * A terminal of this machine (`here`) can be handed files, as a desktop terminal can: dropped on
+ * the pane, pasted (a screenshot on the clipboard), or picked with the key bar's clip on a phone.
+ * Each is sent to the daemon, which keeps it beside the terminal, and its path is typed in
+ * without Enter, so you add the words. Claude Code reads a pasted image path as the image.
  */
 export function TerminalPane({
   id,
@@ -44,6 +51,7 @@ export function TerminalPane({
   glyph,
   finding = 0,
   onFindClose = () => {},
+  here = false,
 }: {
   id: string;
   running: boolean | undefined;
@@ -53,6 +61,8 @@ export function TerminalPane({
   /** Above 0, the find bar is open; it takes the keyboard again each time this changes. */
   finding?: number;
   onFindClose?: () => void;
+  /** The terminal runs on the machine whose daemon serves the page, so it can be handed files. */
+  here?: boolean;
 }) {
   const host = useRef<HTMLDivElement>(null);
   const shown = useRef<{ term: Terminal; fit: FitAddon } | null>(null);
@@ -157,6 +167,35 @@ export function TerminalPane({
     };
   }, [id]);
 
+  const [dragging, setDragging] = useState<number | null>(null);
+  const [sending, setSending] = useState<string[] | null>(null);
+  const [trouble, setTrouble] = useState<string | null>(null);
+  const refusal = !here ? "Files go only to terminals on this machine" : running === false ? "This terminal is no longer running" : null;
+  const hand = async (files: File[]) => {
+    if (files.length === 0 || refusal) return;
+    const big = files.find((f) => f.size > MAX_FILE);
+    if (big) return setTrouble(`${big.name} is over ${MAX_FILE >> 20} MB; nothing was sent`);
+    setTrouble(null);
+    setSending(files.map((f) => f.name));
+    const paths: string[] = [];
+    try {
+      for (const file of files) {
+        try {
+          paths.push(await sendFile(id, file));
+        } catch (e) {
+          return setTrouble(`Could not send ${file.name}: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+    } finally {
+      setSending(null);
+    }
+    const term = shown.current?.term;
+    if (!term) return;
+    term.paste(`${paths.join(" ")} `);
+    if (!touch()) term.focus();
+  };
+  const withFiles = (types: readonly string[] | DOMStringList | undefined) => !!types && Array.from(types).includes("Files");
+
   // A pane kept open behind another tab takes the keyboard, and the size it missed, when shown.
   useEffect(() => {
     if (!active || !shown.current) return;
@@ -165,11 +204,45 @@ export function TerminalPane({
   }, [active, id]);
 
   return (
-    <div className="flex h-full flex-col bg-black">
+    <div
+      data-testid="terminal-pane"
+      className="flex h-full flex-col bg-black"
+      onDragEnter={(e) => {
+        if (!withFiles(e.dataTransfer?.types)) return;
+        e.preventDefault();
+        setDragging(Array.from(e.dataTransfer.items ?? []).filter((i) => i.kind === "file").length || 1);
+      }}
+      onDragOver={(e) => {
+        if (!withFiles(e.dataTransfer?.types)) return;
+        e.preventDefault();
+        e.dataTransfer.dropEffect = refusal ? "none" : "copy";
+        setDragging((n) => n ?? 1);
+      }}
+      onDragLeave={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDragging(null);
+      }}
+      onDrop={(e) => {
+        if (!withFiles(e.dataTransfer?.types)) return;
+        // Never let the browser open the file in place of the app.
+        e.preventDefault();
+        setDragging(null);
+        void hand(Array.from(e.dataTransfer.files));
+      }}
+      onPasteCapture={(e) => {
+        const files = Array.from(e.clipboardData?.files ?? []);
+        if (files.length === 0 || refusal) return;
+        // Ahead of xterm, which would paste the clipboard's text, if any, instead.
+        e.preventDefault();
+        e.stopPropagation();
+        void hand(files);
+      }}
+    >
       {/* The fit add-on sizes the terminal to its parent's height, padding included, so the padding sits outside it. */}
       <div className="relative min-h-0 flex-1 p-2">
         <div ref={host} className="h-full" />
         {finding > 0 && <FindBar key={id} term={termNow} name={name ?? "terminal"} ask={finding} onClose={onFindClose} />}
+        {dragging !== null && <DropOverlay name={name ?? "terminal"} count={dragging} refusal={refusal} />}
+        {sending && <SendingChip names={sending} />}
       </div>
       {running !== false && (
         <KeyBar
@@ -181,7 +254,16 @@ export function TerminalPane({
             shown.current?.term.paste(text);
             shown.current?.term.input("\r", true);
           }}
+          onFiles={here ? (files) => void hand(files) : undefined}
         />
+      )}
+      {trouble && (
+        <div className="flex items-center gap-2 border-t border-neutral-800 px-3 py-1 text-xs text-amber-400">
+          <span className="min-w-0 flex-1 truncate">{trouble}</span>
+          <button type="button" aria-label="Dismiss" onClick={() => setTrouble(null)} className="text-neutral-500 hover:text-neutral-200">
+            ×
+          </button>
+        </div>
       )}
       {status && <div className="border-t border-neutral-800 px-3 py-1 text-xs text-amber-400">{status}</div>}
     </div>

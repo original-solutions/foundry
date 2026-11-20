@@ -532,6 +532,22 @@ describe("App", () => {
     expect(screen.queryByRole("button", { name: "New in far away" })).toBeNull();
   });
 
+  it("lets a file be dropped on this machine's terminals only", async () => {
+    const router = await open("/terminals/t7", {
+      ...live,
+      records: [...live.records, sample(OTHER, 1), workspace(OTHER, "w7", "far away"), terminal(OTHER, "t7", "w7", "running")],
+    });
+    const drag = { types: ["Files"], files: [], items: [{ kind: "file" }] };
+    const pane = async (id: string) => within(await screen.findByTestId(`pane-${id}`)).getByTestId("terminal-pane");
+    fireEvent.dragEnter(await pane("t7"), { dataTransfer: drag });
+    expect(screen.getByText("Files go only to terminals on this machine")).toBeDefined();
+    fireEvent.dragLeave(await pane("t7"), { dataTransfer: drag });
+
+    await act(() => router.navigate({ to: "/terminals/$terminalId", params: { terminalId: "t1" } }));
+    fireEvent.dragEnter(await pane("t1"), { dataTransfer: drag });
+    expect(await screen.findByText(/^Drop to hand .* this file$/)).toBeDefined();
+  });
+
   it("marks a tab in the background whose state changed since you looked, until you look", async () => {
     const router = await open("/terminals/t1", live);
     fireEvent.click(screen.getByRole("link", { name: /^shell/ }));

@@ -21,6 +21,8 @@
 //! - `POST /api/workspaces/{id}/shells`: starts the daemon's `$SHELL` in the workspace, `201
 //!   {id}`.
 //! - `POST /api/terminals/{id}/close`: `204`.
+//! - `POST /api/terminals/{id}/files?name=<name>`: keeps a file for the terminal and answers
+//!   its path, see [`files`].
 //! - `GET /api/workspaces/{id}/changes`: what the workspace changed since its base, see
 //!   [`changes`]. Only a workspace of this machine; any other is `404`.
 //! - `GET /api/briefs`: what each session of this machine is for and doing, see [`briefs`].
@@ -79,6 +81,7 @@ use crate::workspaces::{WorkspaceError, Workspaces};
 pub mod assets;
 mod briefs;
 mod changes;
+mod files;
 mod machine;
 pub mod terminals;
 #[cfg(test)]
@@ -129,6 +132,10 @@ pub fn router(api: Api) -> Router {
         .route("/api/events", get(events))
         .route("/api/terminals/{id}", get(terminals::socket))
         .route("/api/terminals/{id}/close", post(close_terminal))
+        .route(
+            "/api/terminals/{id}/files",
+            post(files::keep).layer(axum::extract::DefaultBodyLimit::max(files::MAX_FILE)),
+        )
         .route("/api/workspaces", post(create_workspace))
         .route("/api/workspaces/{id}/archive", post(archive_workspace))
         .route("/api/workspaces/{id}/sessions", post(start_session))
