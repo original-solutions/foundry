@@ -23,6 +23,7 @@ use foundryd::workspaces::Workspaces;
 use futures::future::BoxFuture;
 use futures::{SinkExt as _, StreamExt as _};
 use tempfile::TempDir;
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::{self, Message};
@@ -652,23 +653,47 @@ async fn the_owner_beats_on_an_idle_relay_and_ends_one_its_opener_went_silent_on
     assert!(start.elapsed() >= OFFLINE_AFTER - Duration::from_secs(3));
 }
 
-/// An owner that answers a relay with `answer`, then holds the link open and silent, or
-/// closes it when `hold` is false.
+/// An owner that answers a relay with `answer`, each frame after its delay, then holds the
+/// link open and silent, or closes it when `hold` is false. What the opener sends after its
+/// relay goes to `heard`.
 struct FakeOwner {
-    answer: Vec<String>,
+    answer: Vec<(Duration, String)>,
     hold: bool,
+    heard: Option<mpsc::UnboundedSender<String>>,
+}
+
+impl FakeOwner {
+    /// Answers with `frames` at once and holds the link.
+    fn answering(frames: &[&str]) -> Self {
+        Self {
+            answer: frames
+                .iter()
+                .map(|f| (Duration::ZERO, (*f).to_owned()))
+                .collect(),
+            hold: true,
+            heard: None,
+        }
+    }
 }
 
 impl Dialer for FakeOwner {
     fn dial(&self, _: &Machine) -> BoxFuture<'static, std::io::Result<Conn>> {
         let (near, mut far) = Conn::pair();
-        let (answer, hold) = (self.answer.clone(), self.hold);
+        let (answer, hold, heard) = (self.answer.clone(), self.hold, self.heard.clone());
         tokio::spawn(async move {
             let _relay = far.recv.recv().await;
-            for text in answer {
+            for (wait, text) in answer {
+                tokio::time::sleep(wait).await;
                 let _ = far.send.send(text).await;
             }
-            while hold && far.recv.recv().await.is_some() {}
+            while hold {
+                let Some(text) = far.recv.recv().await else {
+                    break;
+                };
+                if let Some(heard) = &heard {
+                    let _ = heard.send(text);
+                }
+            }
         });
         Box::pin(async move { Ok(near) })
     }
@@ -684,14 +709,40 @@ fn opener(owner: FakeOwner) -> (Peers, MachineId, TempDir) {
     (peers, peer, dir)
 }
 
+/// Makes `peers` hear from `owner` over a record link, so it shows online, and returns the
+/// link to keep it open.
+async fn hear_from(peers: &Peers, owner: MachineId) -> Conn {
+    let (near, far) = Conn::pair();
+    let served = peers.clone();
+    tokio::spawn(async move { served.accept(far).await });
+    for message in [
+        PeerMessage::Hello {
+            protocol: PROTOCOL,
+            machine: owner,
+            versions: Default::default(),
+        },
+        PeerMessage::Records {
+            protocol: PROTOCOL,
+            records: Vec::new(),
+        },
+    ] {
+        near.send
+            .send(serde_json::to_string(&message).unwrap())
+            .await
+            .unwrap();
+    }
+    until(WAIT, "A hears from the owner", || {
+        peers.online().contains(&owner)
+    })
+    .await;
+    near
+}
+
 const EMPTY_SNAPSHOT: &str = r#"{"type":"snapshot","start":0,"bytes":"","last":true}"#;
 
 #[tokio::test(start_paused = true)]
 async fn an_owner_silent_past_the_offline_limit_closes_the_relay_with_1013() {
-    let (peers, owner, _dir) = opener(FakeOwner {
-        answer: vec![EMPTY_SNAPSHOT.to_owned()],
-        hold: true,
-    });
+    let (peers, owner, _dir) = opener(FakeOwner::answering(&[EMPTY_SNAPSHOT]));
     let (_snapshot, mut remote) = peers
         .open_terminal(owner, TerminalId::random())
         .await
@@ -704,39 +755,220 @@ async fn an_owner_silent_past_the_offline_limit_closes_the_relay_with_1013() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_close_code_the_socket_does_not_give_reads_as_1011() {
-    let (peers, owner, _dir) = opener(FakeOwner {
-        answer: vec![
-            EMPTY_SNAPSHOT.to_owned(),
-            r#"{"type":"closed","code":4000,"reason":"odd"}"#.to_owned(),
-        ],
-        hold: true,
-    });
-    let (_snapshot, mut remote) = peers
-        .open_terminal(owner, TerminalId::random())
-        .await
-        .unwrap();
-    let closed = remote_closed(&mut remote).await;
-    assert_eq!(
-        closed,
-        Closed {
-            code: 1011,
-            reason: "odd".into()
-        }
-    );
+async fn the_owners_close_codes_pass_through_and_any_other_reads_as_1011() {
+    for (sent, read) in [(1013, 1013), (1000, 1000), (1011, 1011), (4000, 1011)] {
+        let closing = format!(r#"{{"type":"closed","code":{sent},"reason":"odd"}}"#);
+        let (peers, owner, _dir) = opener(FakeOwner::answering(&[EMPTY_SNAPSHOT, &closing]));
+        let (_snapshot, mut remote) = peers
+            .open_terminal(owner, TerminalId::random())
+            .await
+            .unwrap();
+        let closed = remote_closed(&mut remote).await;
+        assert_eq!(
+            closed,
+            Closed {
+                code: read,
+                reason: "odd".into()
+            },
+            "sent {sent}"
+        );
+    }
 }
 
 #[tokio::test(start_paused = true)]
-async fn an_owner_that_closes_a_relay_without_answering_has_refused_it() {
+async fn an_owner_heard_from_that_closes_a_relay_without_answering_has_refused_it() {
     let (peers, owner, _dir) = opener(FakeOwner {
         answer: Vec::new(),
         hold: false,
+        heard: None,
     });
+    let _records = hear_from(&peers, owner).await;
     match peers.open_terminal(owner, TerminalId::random()).await {
         Err(RelayError::Refused(reason)) => assert!(reason.contains("older build"), "{reason}"),
         Err(other) => panic!("refused another way: {other}"),
         Ok(_) => panic!("a relay opened with no answer"),
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_relay_closed_by_an_owner_not_heard_from_is_down() {
+    let (peers, owner, _dir) = opener(FakeOwner {
+        answer: Vec::new(),
+        hold: false,
+        heard: None,
+    });
+    match peers.open_terminal(owner, TerminalId::random()).await {
+        Err(RelayError::Down(name)) => assert_eq!(name, "machine-1"),
+        Err(other) => panic!("refused another way: {other}"),
+        Ok(_) => panic!("a relay opened with no answer"),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_link_that_drops_mid_snapshot_is_down() {
+    let (peers, owner, _dir) = opener(FakeOwner {
+        answer: vec![(
+            Duration::ZERO,
+            r#"{"type":"snapshot","start":0,"bytes":"61","last":false}"#.to_owned(),
+        )],
+        hold: false,
+        heard: None,
+    });
+    let _records = hear_from(&peers, owner).await;
+    match peers.open_terminal(owner, TerminalId::random()).await {
+        Err(RelayError::Down(name)) => assert_eq!(name, "machine-1"),
+        Err(other) => panic!("refused another way: {other}"),
+        Ok(_) => panic!("a relay opened on half a snapshot"),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_snapshot_in_pieces_slower_in_total_than_the_offline_limit_arrives_whole() {
+    let gap = OFFLINE_AFTER * 2 / 3;
+    let piece = |hex: &str, last: bool| {
+        (
+            gap,
+            format!(r#"{{"type":"snapshot","start":4,"bytes":"{hex}","last":{last}}}"#),
+        )
+    };
+    let (peers, owner, _dir) = opener(FakeOwner {
+        answer: vec![piece("61", false), piece("62", false), piece("63", true)],
+        hold: true,
+        heard: None,
+    });
+    let (snapshot, _remote) = peers
+        .open_terminal(owner, TerminalId::random())
+        .await
+        .unwrap();
+    assert_eq!(snapshot.start, 4);
+    assert_eq!(&snapshot.bytes[..], b"abc");
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_opener_beats_on_an_idle_relay() {
+    let (heard, mut sent) = mpsc::unbounded_channel();
+    let (peers, owner, _dir) = opener(FakeOwner {
+        heard: Some(heard),
+        ..FakeOwner::answering(&[EMPTY_SNAPSHOT])
+    });
+    let (_snapshot, _remote) = peers
+        .open_terminal(owner, TerminalId::random())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let mut frames = Vec::new();
+    while let Ok(text) = sent.try_recv() {
+        frames.push(text);
+    }
+    assert!(
+        frames.iter().any(|f| f == r#"{"type":"beat"}"#),
+        "{frames:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_input_larger_than_one_frame_goes_in_pieces_only_the_last_marked() {
+    let (heard, mut sent) = mpsc::unbounded_channel();
+    let (peers, owner, _dir) = opener(FakeOwner {
+        heard: Some(heard),
+        ..FakeOwner::answering(&[EMPTY_SNAPSHOT])
+    });
+    let (_snapshot, remote) = peers
+        .open_terminal(owner, TerminalId::random())
+        .await
+        .unwrap();
+    remote
+        .input(Bytes::from(vec![b'x'; 1_500_000]))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let mut pieces = Vec::new();
+    while let Ok(text) = sent.try_recv() {
+        let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+        if frame["type"] == "input" {
+            assert!(
+                text.len() < 2 * 1024 * 1024 + 100,
+                "a frame of {}",
+                text.len()
+            );
+            pieces.push(frame);
+        }
+    }
+    assert!(pieces.len() >= 2, "{} pieces", pieces.len());
+    let lasts: Vec<bool> = pieces.iter().map(|p| p["last"] == true).collect();
+    assert_eq!(lasts.iter().filter(|l| **l).count(), 1);
+    assert_eq!(lasts.last(), Some(&true));
+    let total: usize = pieces
+        .iter()
+        .map(|p| p["bytes"].as_str().unwrap().len() / 2)
+        .sum();
+    assert_eq!(total, 1_500_000);
+}
+
+#[tokio::test]
+async fn input_b_refuses_is_reported_and_the_relay_stays_open() {
+    let fleet = Fleet::start(2);
+    let (a, b) = (&fleet.daemons[0], &fleet.daemons[1]);
+    let on_b = Held::new(b.id, b.store.clone());
+    b.peers.serve_terminals(on_b.terminals.clone());
+    let id = on_b.start(&["sh", "-c", "stty -echo; sleep 60"]).await;
+    let (_snapshot, mut remote) = a.peers.open_terminal(b.id, id).await.unwrap();
+    let too_much = foundry_holder::protocol::MAX_PENDING_INPUT + 1;
+    remote
+        .input(Bytes::from(vec![b'x'; too_much]))
+        .await
+        .unwrap();
+    let event = timeout(WAIT, async {
+        loop {
+            match remote.next().await {
+                Event::Output(_) => {}
+                other => return other,
+            }
+        }
+    })
+    .await
+    .expect("an answer to the input");
+    assert!(matches!(event, Event::Refused(_)), "{event:?}");
+    remote.input(Bytes::from_static(b"y")).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_screen_larger_than_one_frame_crosses_a_relay_in_pieces_and_arrives_whole() {
+    let fleet = Fleet::start(2);
+    let (a, b) = (&fleet.daemons[0], &fleet.daemons[1]);
+    let on_b = Held::new(b.id, b.store.clone());
+    b.peers.serve_terminals(on_b.terminals.clone());
+    let script = r#"head -c 1500000 /dev/zero | tr "\0" x; echo END; cat"#;
+    let id = on_b.start(&["sh", "-c", script]).await;
+    // Until the holder has all the output, a snapshot may not hold it: attach again until it does.
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let snapshot = loop {
+        let (snapshot, _remote) = a.peers.open_terminal(b.id, id).await.unwrap();
+        if String::from_utf8_lossy(&snapshot.bytes).contains("END") {
+            break snapshot;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "END never reached B's screen"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert!(snapshot.bytes.len() > 1_500_000, "{}", snapshot.bytes.len());
+
+    let mut conn = raw_relay(&b.peers, a.id, id).await;
+    let mut lasts = Vec::new();
+    loop {
+        let piece = frame(&mut conn, WAIT).await.expect("a snapshot piece");
+        assert_eq!(piece["type"], "snapshot", "{piece}");
+        let bytes = piece["bytes"].as_str().unwrap().len();
+        assert!(bytes <= 2 * 1024 * 1024, "a piece of {bytes} hex digits");
+        let last = piece["last"] == true;
+        lasts.push(last);
+        if last {
+            break;
+        }
+    }
+    assert!(lasts.len() >= 2, "{} pieces", lasts.len());
 }
 
 #[tokio::test]
