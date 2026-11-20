@@ -424,41 +424,59 @@ async fn the_record_names_its_workspace_terminal_and_model_and_the_child_gets_it
     );
 }
 
-/// The arguments the fake agent printed with `print_args`, and the prompts it took with
-/// `wait_prompt`, from what the session's terminal shows once `done` holds.
-async fn args_and_prompts(
-    f: &Fixture,
-    id: SessionId,
-    done: impl Fn(&[String]) -> bool,
-) -> (Vec<String>, Vec<String>) {
-    let terminal = f.record(id).unwrap().body.terminal;
-    let (snapshot, mut output) = f.terminals.attach(terminal).await.unwrap();
-    let prompts = |seen: &str| -> Vec<String> {
-        seen.lines()
+/// What the fake agent showed in the session's terminal, read until `done` holds for it.
+struct Shown {
+    text: String,
+}
+
+impl Shown {
+    async fn until(f: &Fixture, id: SessionId, done: impl Fn(&Shown) -> bool) -> Shown {
+        let terminal = f.record(id).unwrap().body.terminal;
+        let (snapshot, mut output) = f.terminals.attach(terminal).await.unwrap();
+        let text = read_until(&snapshot.bytes, &mut output, |text| {
+            done(&Shown {
+                text: text.to_owned(),
+            })
+        })
+        .await;
+        Shown { text }
+    }
+
+    /// The arguments it printed with `print_args`.
+    fn args(&self) -> Vec<String> {
+        self.text
+            .lines()
+            .filter_map(|l| l.trim_end().strip_prefix("ARG=").map(str::to_owned))
+            .collect()
+    }
+
+    /// The prompts it took with `wait_prompt`.
+    fn prompts(&self) -> Vec<String> {
+        self.text
+            .lines()
             // The sign that the agent takes input may come first on the line.
             .filter_map(|l| l.trim_end().split_once("PROMPT=").map(|(_, json)| json))
             .map(|json| serde_json::from_str(json).unwrap())
             .collect()
-    };
-    let seen = read_until(&snapshot.bytes, &mut output, |seen| {
-        seen.contains("ARG=test-model") && done(&prompts(seen))
-    })
-    .await;
-    let args = seen
-        .lines()
-        .filter_map(|l| l.trim_end().strip_prefix("ARG=").map(str::to_owned))
-        .collect();
-    (args, prompts(&seen))
+    }
+
+    /// How many times it turned bracketed paste on: each `wait_prompt` that has begun.
+    fn waits(&self) -> usize {
+        self.text.matches("\u{1b}[?2004h").count()
+    }
 }
 
-#[tokio::test]
-async fn a_first_prompt_is_in_no_argument_and_is_typed_as_one_prompt_once_the_agent_takes_input() {
-    let f = Fixture::new("- print_args\n- wait_prompt\n- wait_prompt\n- wait_input\n").await;
-    // A leading dash, a quote, a newline, and an escape that would end a paste early and
-    // submit the rest as a second prompt.
-    let prompt = "-v fix the login,\nthen say \"done\" \u{1b}[201~\r and stop";
-    let id = f
-        .sessions
+/// Types `keys` into the session's terminal, as the person would.
+async fn type_keys(f: &Fixture, id: SessionId, keys: &'static [u8]) {
+    let terminal = f.record(id).unwrap().body.terminal;
+    f.terminals
+        .input(terminal, Bytes::from_static(keys))
+        .await
+        .unwrap();
+}
+
+async fn start_on(f: &Fixture, prompt: &str) -> SessionId {
+    f.sessions
         .start_with(
             WorkspaceId::random(),
             f.worktree.path(),
@@ -466,9 +484,25 @@ async fn a_first_prompt_is_in_no_argument_and_is_typed_as_one_prompt_once_the_ag
             Some(prompt),
         )
         .await
-        .unwrap();
+        .unwrap()
+}
 
-    let (args, prompts) = args_and_prompts(&f, id, |prompts| !prompts.is_empty()).await;
+#[tokio::test]
+async fn a_first_prompt_is_in_no_argument_and_is_typed_as_one_prompt_once_the_agent_takes_input() {
+    let f = Fixture::new(
+        "- print_args\n- hook: {event: SessionStart}\n- wait_prompt\n- wait_prompt\n- wait_input\n",
+    )
+    .await;
+    // A leading dash, a quote, a newline, and an escape that would end a paste early and
+    // submit the rest as a second prompt.
+    let id = start_on(
+        &f,
+        "-v fix the login,\nthen say \"done\" \u{1b}[201~\r and stop",
+    )
+    .await;
+
+    let shown = Shown::until(&f, id, |s| s.prompts().len() == 1 && s.waits() == 2).await;
+    let args = shown.args();
     assert!(
         args.ends_with(&["--model".to_string(), MODEL.to_string()]),
         "{args:?}"
@@ -479,7 +513,7 @@ async fn a_first_prompt_is_in_no_argument_and_is_typed_as_one_prompt_once_the_ag
     );
     // The escape is dropped; everything else arrives, newlines kept, as the first input.
     let want = "-v fix the login,\nthen say \"done\" [201~\n and stop";
-    assert_eq!(prompts, [want]);
+    assert_eq!(shown.prompts(), [want]);
     // Its hook reports it as any typed prompt.
     until("the prompt's hook", || {
         f.sessions.trail(id).is_some_and(|t| !t.is_empty())
@@ -493,40 +527,62 @@ async fn a_first_prompt_is_in_no_argument_and_is_typed_as_one_prompt_once_the_ag
     );
 
     // A second prompt typed by the person is the second prompt: nothing else was typed.
-    let terminal = f.record(id).unwrap().body.terminal;
-    f.terminals
-        .input(terminal, Bytes::from_static(b"next\r"))
-        .await
-        .unwrap();
-    let (_, prompts) = args_and_prompts(&f, id, |prompts| prompts.len() == 2).await;
-    assert_eq!(prompts, [want, "next"]);
+    type_keys(&f, id, b"next\r").await;
+    let shown = Shown::until(&f, id, |s| s.prompts().len() == 2).await;
+    assert_eq!(shown.prompts(), [want, "next"]);
+}
+
+#[tokio::test]
+async fn a_first_prompt_waits_for_the_session_to_start_though_a_screen_before_it_takes_input() {
+    // The first input is a screen before the session starts, as the trust prompt is: it turns
+    // bracketed paste on before `SessionStart`.
+    let f =
+        Fixture::new("- wait_prompt\n- hook: {event: SessionStart}\n- wait_prompt\n- wait_input\n")
+            .await;
+    let id = start_on(&f, "fix the login").await;
+    Shown::until(&f, id, |s| s.waits() == 1).await;
+    // Time enough for a daemon that went by the sign alone to have typed the prompt into it.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    type_keys(&f, id, b"yes\r").await;
+    let shown = Shown::until(&f, id, |s| s.prompts().len() == 2).await;
+    assert_eq!(shown.prompts(), ["yes", "fix the login"]);
+}
+
+#[tokio::test]
+async fn a_first_prompt_waits_for_the_agent_to_take_input_though_the_session_started() {
+    let f = Fixture::new(
+        "- hook: {event: SessionStart}\n- sleep_ms: 500\n- print: DRAWN\n- wait_prompt\n- wait_input\n",
+    )
+    .await;
+    let id = start_on(&f, "fix the login").await;
+    let shown = Shown::until(&f, id, |s| s.prompts().len() == 1).await;
+    assert_eq!(shown.prompts(), ["fix the login"]);
+    // The terminal echoes keys when they arrive, so the paste shows after what came before
+    // the agent took input.
+    let drawn = shown.text.find("DRAWN").unwrap();
+    let pasted = shown.text.find("[200~").unwrap();
+    assert!(
+        drawn < pasted,
+        "typed before the agent took input: {:?}",
+        shown.text
+    );
 }
 
 #[tokio::test]
 async fn a_blank_first_prompt_is_none_and_nothing_is_typed() {
-    let f = Fixture::new("- print_args\n- wait_prompt\n- wait_input\n").await;
-    let id = f
-        .sessions
-        .start_with(
-            WorkspaceId::random(),
-            f.worktree.path(),
-            MODEL,
-            Some("  \n "),
-        )
-        .await
-        .unwrap();
-    let (args, _) = args_and_prompts(&f, id, |_| true).await;
+    let f =
+        Fixture::new("- print_args\n- hook: {event: SessionStart}\n- wait_prompt\n- wait_input\n")
+            .await;
+    let id = start_on(&f, "  \n ").await;
+    let shown = Shown::until(&f, id, |s| s.waits() == 1 && !s.args().is_empty()).await;
+    let args = shown.args();
     assert!(
         args.ends_with(&["--model".to_string(), MODEL.to_string()]),
         "{args:?}"
     );
-    let terminal = f.record(id).unwrap().body.terminal;
-    f.terminals
-        .input(terminal, Bytes::from_static(b"mine\r"))
-        .await
-        .unwrap();
-    let (_, prompts) = args_and_prompts(&f, id, |prompts| !prompts.is_empty()).await;
-    assert_eq!(prompts, ["mine"]);
+    type_keys(&f, id, b"mine\r").await;
+    let shown = Shown::until(&f, id, |s| !s.prompts().is_empty()).await;
+    assert_eq!(shown.prompts(), ["mine"]);
 }
 
 #[tokio::test]

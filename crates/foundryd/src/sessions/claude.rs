@@ -304,6 +304,22 @@ mod tests {
     }
 
     #[test]
+    fn bracketed_paste_turned_on_is_found_when_it_is_cut_between_reads() {
+        let mut tail = Vec::new();
+        assert!(!turns_paste_on(&mut tail, b"drawing \x1b[?20"));
+        assert!(turns_paste_on(&mut tail, b"04h box"));
+
+        let mut tail = Vec::new();
+        assert!(turns_paste_on(&mut tail, b"\x1b[?2004h"));
+
+        // A long run of output with no sign keeps only what could start one.
+        let mut tail = Vec::new();
+        assert!(!turns_paste_on(&mut tail, &[b'x'; 10_000]));
+        assert!(tail.len() < TAKES_INPUT.len());
+        assert!(!turns_paste_on(&mut tail, b"\x1b[?2004l"));
+    }
+
+    #[test]
     fn a_prompt_is_typed_as_one_bracketed_paste_then_enter_with_no_escape_in_it() {
         assert_eq!(
             typed_prompt("fix it\nthen \u{1b}[201~\rstop é"),
