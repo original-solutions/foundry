@@ -576,8 +576,8 @@ impl Tailscale {
     /// Binds each address in Tailscale's answer, `reported`, not served yet, and stops the
     /// server on each served address the answer leaves out, so it takes no new connection; one
     /// already open is not cut. A server that ended is served again. When Tailscale cannot be
-    /// asked, nothing is bound or stopped. `first` says this is the start, when having none is
-    /// worth a warning.
+    /// asked, it counts as reporting nothing: every server is stopped and none is bound until
+    /// it answers. `first` says this is the start, when having none is worth a warning.
     async fn scan(&mut self, first: bool, reported: Result<BTreeSet<IpAddr>, String>) {
         while let Some(ended) = self.servers.try_join_next() {
             if let Ok(addr) = ended {
@@ -592,11 +592,11 @@ impl Tailscale {
             Err(why) => {
                 if !self.unanswered {
                     tracing::warn!(
-                        "cannot ask Tailscale for this machine's addresses, so no new one is listened on until it answers: {why}"
+                        "cannot ask Tailscale for this machine's addresses, so none is listened on until it answers: {why}"
                     );
                 }
                 self.unanswered = true;
-                return;
+                BTreeSet::new()
             }
         };
         for addr in withdrawn(&reported, self.served.keys().copied()) {
@@ -604,6 +604,9 @@ impl Tailscale {
                 server.abort();
                 tracing::info!("stopped listening on {addr}: Tailscale no longer reports it");
             }
+        }
+        if self.unanswered {
+            return;
         }
         let found = interface_addresses();
         let served = self.served.keys().copied().collect();
@@ -962,29 +965,53 @@ mod tests {
         assert!(withdrawn(&ips(["100.101.102.103", "100.64.0.9"]), served).is_empty());
     }
 
-    /// A server for an address Tailscale stops reporting is stopped, so nothing listens there
-    /// if the address turns up again on another VPN. When Tailscale cannot be asked, nothing is
-    /// stopped: a failed ask says nothing about which addresses are this machine's.
-    #[tokio::test]
-    async fn the_server_on_an_address_tailscale_no_longer_reports_is_stopped() {
+    /// A watcher serving `addr` with a server that runs until it is stopped.
+    fn serving(addr: SocketAddr) -> Tailscale {
         let mut tailscale = Tailscale::new(7433, Router::new());
-        let gone = addr("100.101.102.103:7433");
-        let handle = tailscale.servers.spawn(async move {
+        let server = tailscale.servers.spawn(async move {
             std::future::pending::<()>().await;
-            gone
+            addr
         });
-        tailscale.served.insert(gone, handle);
+        tailscale.served.insert(addr, server);
+        tailscale
+    }
 
-        tailscale.scan(false, Err("logged out".to_owned())).await;
-        assert!(tailscale.served.contains_key(&gone));
-
-        tailscale.scan(false, Ok(BTreeSet::new())).await;
-        assert!(tailscale.served.is_empty());
+    /// Waits for the watcher's one server to end, and says whether it was stopped.
+    async fn stopped(mut tailscale: Tailscale) -> bool {
         let ended = tokio::time::timeout(Duration::from_secs(5), tailscale.servers.join_next())
             .await
             .expect("the server was not stopped")
             .unwrap();
-        assert!(ended.unwrap_err().is_cancelled());
+        ended.is_err_and(|error| error.is_cancelled())
+    }
+
+    /// A server for an address Tailscale stops reporting is stopped, so nothing listens there
+    /// if the address turns up again on another VPN.
+    #[tokio::test]
+    async fn the_server_on_an_address_tailscale_no_longer_reports_is_stopped() {
+        let gone = addr("100.101.102.103:7433");
+        let mut tailscale = serving(gone);
+
+        tailscale.scan(false, Ok(ips(["100.64.0.9"]))).await;
+
+        assert!(!tailscale.served.contains_key(&gone));
+        assert!(stopped(tailscale).await);
+    }
+
+    /// When Tailscale cannot be asked, it counts as reporting nothing: every server is stopped
+    /// until it answers again, and the failure is still warned about once.
+    #[tokio::test]
+    async fn when_tailscale_cannot_be_asked_every_server_is_stopped() {
+        let logged = Logged::default();
+        let _capture = logged.capture();
+        let mut tailscale = serving(addr("100.101.102.103:7433"));
+
+        tailscale.scan(false, Err("logged out".to_owned())).await;
+        tailscale.scan(false, Err("logged out".to_owned())).await;
+
+        assert!(tailscale.served.is_empty());
+        assert_eq!(logged.warnings().len(), 1, "{:?}", logged.warnings());
+        assert!(stopped(tailscale).await);
     }
 
     /// Everything the daemon logs while it is set, as plain text.
