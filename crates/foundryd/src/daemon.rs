@@ -1132,8 +1132,7 @@ mod tests {
         );
     }
 
-    /// A release build does not. The gate runs debug builds only; run
-    /// `cargo test --release -p foundryd --lib daemon` to check this one.
+    /// A release build does not. CI runs this one in a release build.
     #[cfg(not(debug_assertions))]
     #[test]
     fn this_release_build_ignores_foundry_tailscale() {
