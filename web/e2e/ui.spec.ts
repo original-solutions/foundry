@@ -21,6 +21,8 @@ test("create a workspace, use its shell, and see the same screen after a reload"
 
   const rows = page.locator(".xterm-rows");
   await expect(rows).toBeVisible();
+  // Keys typed before the shell's prompt shows could reach a terminal not yet attached.
+  await expect(rows).toContainText("$");
   await page.locator(".xterm").click();
   await page.keyboard.type("echo e2e-$((6*7))");
   await page.keyboard.press("Enter");
