@@ -6,10 +6,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::ids::{MachineId, TerminalId};
 use crate::record::AnyRecord;
-use crate::settings::{Edit, SharedSettings};
+use crate::settings::{Edit, EditId, Outcome, SharedSettings};
 
 /// The protocol number this build speaks.
-pub const PROTOCOL: u16 = 3;
+pub const PROTOCOL: u16 = 4;
 
 /// The first protocol whose links carry the shared settings and edits. A link in an older
 /// protocol carries neither: a machine on it has no coordinator, and refuses a message whose
@@ -19,6 +19,10 @@ pub const EDITS_SINCE: u16 = 2;
 /// The first protocol that carries a [`PeerMessage::Call`]. A machine on an older link is never
 /// sent one: it would refuse a link that opens with a `type` it does not know.
 pub const CALLS_SINCE: u16 = 3;
+
+/// The first protocol whose edits carry an id and are answered. A machine sends an edit only on
+/// a link in it or later, and an answer never on an older one.
+pub const ANSWERS_SINCE: u16 = 4;
 
 /// A message between two machines' daemons, tagged by `type`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -47,8 +51,20 @@ pub enum PeerMessage {
         machine: MachineId,
         terminal: TerminalId,
     },
-    /// An edit to the shared settings, sent to the acting coordinator to number.
-    Edit { protocol: u16, edit: Edit },
+    /// An edit to the shared settings, sent to the acting coordinator to number. Older
+    /// protocols send no id.
+    Edit {
+        protocol: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<EditId>,
+        edit: Edit,
+    },
+    /// The acting coordinator's answer to the edit sent under `id`: numbered or refused.
+    Answer {
+        protocol: u16,
+        id: EditId,
+        outcome: Outcome,
+    },
     /// Opens a link, in place of a hello, that carries one call to the receiver's API and its
     /// answer: who is speaking and the call.
     Call {
@@ -77,6 +93,7 @@ impl PeerMessage {
             | Self::Settings { protocol, .. }
             | Self::Relay { protocol, .. }
             | Self::Edit { protocol, .. }
+            | Self::Answer { protocol, .. }
             | Self::Call { protocol, .. } => *protocol,
         }
     }
@@ -115,8 +132,8 @@ impl UiMessage {
 mod tests {
     use super::*;
     use crate::record::tests::{machine_sample, session, terminal, workspace};
-    use crate::settings::{EditId, Outcome, SettingKey, Stamp};
     use crate::settings::tests::settings;
+    use crate::settings::{EditId, Outcome, SettingKey, Stamp};
     use crate::{assert_round_trip, parse_error};
 
     fn records() -> Vec<AnyRecord> {

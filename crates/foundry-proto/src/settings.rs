@@ -34,6 +34,39 @@ pub struct SharedSettings {
     /// "Setting overwritten" items, keyed by the setting two sides of a split both edited.
     #[serde(default)]
     pub overwritten: BTreeMap<SettingKey, Overwritten>,
+    /// Edits recently numbered, by the id they were sent under, so an edit sent again is not
+    /// numbered twice and its sender can find its stamp in a copy.
+    #[serde(default)]
+    pub numbered: BTreeMap<EditId, Stamp>,
+}
+
+/// The id a machine gives an edit it sends to the acting coordinator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EditId(pub uuid::Uuid);
+
+impl EditId {
+    /// A new random id.
+    pub fn random() -> Self {
+        Self(uuid::Uuid::new_v4())
+    }
+}
+
+impl fmt::Display for EditId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// What the acting coordinator did with an edit sent to it. A refusal's reason carries no
+/// setting value and no secret.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Outcome {
+    /// The edit was numbered; this is its stamp.
+    Numbered { stamp: Stamp },
+    /// The edit was not applied, and why.
+    Refused { reason: String },
 }
 
 /// One first-level setting. Written as text: `machine:<id>`, `priority`, `project:<id>` or
