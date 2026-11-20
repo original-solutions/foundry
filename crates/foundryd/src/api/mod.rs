@@ -85,6 +85,7 @@ use crate::workspaces::{WorkspaceError, Workspaces};
 pub mod assets;
 mod briefs;
 mod carry;
+pub(crate) use carry::carries;
 mod changes;
 pub mod terminals;
 #[cfg(test)]
@@ -106,6 +107,10 @@ pub struct Api {
     /// its MagicDNS short name and its `<name>.<tailnet>.ts.net` name. The daemon fills it;
     /// empty means only addresses and `localhost` are trusted in a `Host`.
     pub names: Vec<String>,
+    /// Why sessions cannot start on this machine, said as a `503` to a session start for one of
+    /// its own workspaces: a daemon with no gateway. `None` until the daemon sets it. A start
+    /// for another machine's workspace is still carried there.
+    pub sessions_refused: Option<String>,
 }
 
 impl Api {
@@ -124,6 +129,7 @@ impl Api {
             workspaces,
             sessions,
             names,
+            sessions_refused: None,
         }
     }
 }
@@ -679,6 +685,9 @@ async fn start_session(
     Path(id): Path<String>,
     Body(start): Body<Start>,
 ) -> Result<Response, ApiError> {
+    if let Some(said) = &api.sessions_refused {
+        return Ok(error(StatusCode::SERVICE_UNAVAILABLE, said.clone()));
+    }
     let id = parse_id(&id, "workspace", WorkspaceId)?;
     let sessions = Arc::clone(&api.sessions);
     let session = api

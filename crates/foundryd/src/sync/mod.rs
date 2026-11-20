@@ -328,7 +328,32 @@ impl Peers {
     }
 }
 
+/// Why a link of its own, a relay's or a call's, did not open.
+enum Unopened {
+    /// The peer refused this machine's key; the reason says so.
+    Refused(String),
+    /// The peer could not be reached, or the link closed before its first message went.
+    Down,
+}
+
 impl Inner {
+    /// Dials `peer` with the dialer the record links use, so the link proves both machines'
+    /// keys, and opens it with `first` in place of a hello: how a relay and a call each open a
+    /// link of their own.
+    async fn open_link(&self, peer: &Machine, first: &PeerMessage) -> Result<Conn, Unopened> {
+        let conn = match tokio::time::timeout(DIAL_TIMEOUT, self.dialer.dial(peer)).await {
+            Ok(Ok(conn)) => conn,
+            Ok(Err(e)) if e.kind() == io::ErrorKind::PermissionDenied => {
+                return Err(Unopened::Refused(e.to_string()));
+            }
+            Ok(Err(_)) | Err(_) => return Err(Unopened::Down),
+        };
+        if !link::send_message(&conn.send, first).await {
+            return Err(Unopened::Down);
+        }
+        Ok(conn)
+    }
+
     fn heard_from(&self, peer: MachineId) {
         lock(&self.heard).insert(peer, Instant::now());
     }

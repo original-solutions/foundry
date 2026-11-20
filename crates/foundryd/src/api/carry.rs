@@ -9,7 +9,8 @@
 //! Each goes to its owner over [`Peers::call`](crate::sync::Peers::call), its body passed as
 //! bytes, and the owner's status and body come back unchanged. A call for a machine not in the
 //! machine list is `404`; one for a machine that is offline, whose link is down, or that runs
-//! an older Foundry is `503` and names it. A request marked [`CARRIED`] arrived from another
+//! an older Foundry is `503` and names it, and was never sent. One whose link went down after it
+//! was sent may have run there, and is `504`. A request marked [`CARRIED`] arrived from another
 //! machine: it runs here, where a handler refuses anything this machine does not own, and is
 //! never carried on. Every other request, and one that names nothing elsewhere, runs here.
 
@@ -32,6 +33,12 @@ enum Target {
     Create,
     Workspace(WorkspaceId),
     Terminal(TerminalId),
+}
+
+/// Whether a `POST` to `path` is a route this layer carries: the only routes a carried call
+/// may name.
+pub(crate) fn carries(path: &str) -> bool {
+    target(path).is_some()
 }
 
 /// The target of a `POST` to `path`, when it is a route this layer carries.
@@ -128,9 +135,11 @@ fn answered(answer: Answer) -> Response {
 fn not_carried(refused: &CallError) -> Response {
     let status = match refused {
         CallError::NotListed(_) => StatusCode::NOT_FOUND,
-        CallError::Offline(_) | CallError::Older(_) | CallError::Down(_) | CallError::Lost(_) => {
+        CallError::Offline(_) | CallError::Older(_) | CallError::Down(_) => {
             StatusCode::SERVICE_UNAVAILABLE
         }
+        // Sent, so it may have run: not the 503 of a call that changed nothing.
+        CallError::Lost(_) => StatusCode::GATEWAY_TIMEOUT,
         CallError::Refused(_) => StatusCode::BAD_GATEWAY,
     };
     let message = redact(&refused.to_string());

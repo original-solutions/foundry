@@ -15,10 +15,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::Router;
-use axum::extract::Request;
-use axum::http::{Method, StatusCode};
-use axum::middleware::{self, Next};
-use axum::response::IntoResponse;
 use nix::errno::Errno;
 use nix::fcntl::{Flock, FlockArg};
 use tokio::signal::unix::{SignalKind, signal};
@@ -259,7 +255,7 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
         peers.clone(),
     ));
     peers.coordinate(coordinator.clone());
-    let api = Api::new(
+    let mut api = Api::new(
         store.clone(),
         peers.clone(),
         terminals.clone(),
@@ -267,12 +263,12 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
         sessions.clone(),
         host_names(),
     );
-    let mut app = api::router(api)
+    // Refused in the API, behind the layer that carries a start for another machine's
+    // workspace there: shells, sync and that machine's sessions still work.
+    api.sessions_refused = missing.map(|missing| missing.said);
+    let app = api::router(api)
         .merge(sessions.router())
         .merge(ws::keyed_router(peers.clone(), keys.clone()));
-    if let Some(missing) = missing {
-        app = refuse_sessions(app, missing);
-    }
 
     let mut terminate =
         signal(SignalKind::terminate()).map_err(io_error("cannot watch SIGTERM"))?;
@@ -370,32 +366,6 @@ fn gateway(
             })
         }
     }
-}
-
-/// Answers a request to start a session with what `missing` said as a 503, and passes every
-/// other request on. For a daemon with no gateway: shells and sync still work.
-fn refuse_sessions(router: Router, missing: Missing) -> Router {
-    let said = missing.said;
-    router.layer(middleware::from_fn(move |request: Request, next: Next| {
-        let missing = said.clone();
-        async move {
-            if starts_session(request.method(), request.uri().path()) {
-                let body = serde_json::json!({ "error": missing });
-                return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
-            }
-            next.run(request).await
-        }
-    }))
-}
-
-/// True for `POST /api/workspaces/{id}/sessions`.
-fn starts_session(method: &Method, path: &str) -> bool {
-    let segments: Vec<&str> = path.split('/').collect();
-    method == Method::POST
-        && matches!(
-            segments.as_slice(),
-            ["", "api", "workspaces", _, "sessions"]
-        )
 }
 
 /// This machine's short host name, lowercased: the API trusts it in a `Host` header as its
@@ -682,7 +652,6 @@ mod tests {
     use std::time::Duration;
 
     use axum::Router;
-    use axum::routing::{get, post};
 
     use super::*;
     use crate::secrets::SecretsError;
@@ -1255,64 +1224,5 @@ mod tests {
         let why = ask_cli(&cli, Duration::from_millis(200)).await.unwrap_err();
 
         assert!(why.contains("did not answer"), "{why}");
-    }
-
-    /// What the stub router answers, so a request that got through is told from a refusal.
-    fn stub() -> Router {
-        Router::new()
-            .route(
-                "/api/workspaces/{id}/sessions",
-                post(|| async { "stub sessions" }),
-            )
-            .route(
-                "/api/workspaces/{id}/shells",
-                post(|| async { "stub shells" }),
-            )
-            .route("/api/state", get(|| async { "stub state" }))
-    }
-
-    /// Serves `router` on a loopback port and returns the port.
-    async fn serve_stub(router: Router) -> u16 {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-        port
-    }
-
-    /// `(status, body)` of `method` on `url`.
-    fn ask(method: &str, url: &str) -> (u16, String) {
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .timeout_global(Some(Duration::from_secs(10)))
-            .build()
-            .into();
-        let mut response = match method {
-            "POST" => agent.post(url).send_empty(),
-            _ => agent.get(url).call(),
-        }
-        .unwrap();
-        let body = response.body_mut().read_to_string().unwrap();
-        (response.status().as_u16(), body)
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn session_starts_are_refused_with_what_is_missing_and_nothing_else_is() {
-        let missing = Missing {
-            said: "set FOUNDRY_GATEWAY_URL".into(),
-            log: "log-only detail /data/secrets.json".into(),
-        };
-        let port = serve_stub(refuse_sessions(stub(), missing)).await;
-        let base = format!("http://127.0.0.1:{port}");
-
-        let (status, body) = ask("POST", &format!("{base}/api/workspaces/x/sessions"));
-        assert_eq!(status, 503);
-        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(body["error"], "set FOUNDRY_GATEWAY_URL");
-        assert!(!body.to_string().contains("log-only"), "{body}");
-
-        let shells = ask("POST", &format!("{base}/api/workspaces/x/shells"));
-        assert_eq!(shells, (200, "stub shells".into()));
-        let state = ask("GET", &format!("{base}/api/state"));
-        assert_eq!(state, (200, "stub state".into()));
     }
 }

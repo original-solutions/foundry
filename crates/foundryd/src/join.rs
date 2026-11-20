@@ -705,7 +705,7 @@ impl Keys {
     }
 
     /// The accepting end of the handshake. Returns the machine proved and its first message,
-    /// a hello or a relay, parsed.
+    /// a hello, a relay or a call, parsed.
     async fn admit(
         &self,
         send: &Sender<String>,

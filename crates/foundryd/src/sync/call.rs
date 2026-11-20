@@ -1,7 +1,7 @@
 //! A call to another machine's API, carried over a link of its own.
 //!
 //! Machine A carries a call for a workspace or terminal machine B owns with [`Peers::call`]. It
-//! dials B with the [`super::Dialer`] the record links use, so the link proves both machines'
+//! opens a link to B as a relay does ([`Inner::open_link`]), so the link proves both machines'
 //! keys as every peer link does, and opens it with a [`PeerMessage::Call`] in place of a hello.
 //! B's [`Peers::accept`] hands that link to [`serve`], which makes the call to B's own API on
 //! loopback, marked [`CARRIED`] so that API runs it only for B and never carries it on, and
@@ -13,11 +13,12 @@
 //! has passed, so a call that follows on from this one, such as starting a session in the
 //! workspace it made, finds what it made already here.
 //!
-//! A call goes only to a machine in the machine list, heard from within [`OFFLINE_AFTER`],
-//! whose record links speak [`CALLS_SINCE`] or later; any other is refused before a link opens,
-//! so the refusal changes nothing anywhere. No end ever logs a body.
+//! A call goes only to a machine in the machine list and heard from within [`OFFLINE_AFTER`],
+//! and not to one whose open record links all speak a protocol older than [`CALLS_SINCE`]; each
+//! of those is refused before a link opens, so the refusal changes nothing anywhere. An older
+//! machine with no record link open at that moment is sent the call, closes the link without
+//! answering, and the call is [`CallError::Lost`]. No end ever logs a body.
 
-use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -25,12 +26,11 @@ use bytes::Bytes;
 use foundry_proto::ids::MachineId;
 use foundry_proto::messages::{CALLS_SINCE, Call, PROTOCOL, PeerMessage};
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{Instant, timeout};
 
-use super::link::{listed, send_message};
-use super::relay::{beat, hex, unhex};
-use super::{Conn, DIAL_TIMEOUT, Inner, OFFLINE_AFTER, Peers, lock, on_store};
+use super::link::listed;
+use super::relay::{beat, hex, last_word, unhex};
+use super::{Conn, Inner, OFFLINE_AFTER, Peers, Unopened, lock, on_store};
 
 #[cfg(doc)]
 use super::TICK;
@@ -38,6 +38,10 @@ use super::TICK;
 /// The header that marks a request to this machine's API as a call another machine carried
 /// here: the API runs it only for this machine and never carries it on.
 pub const CARRIED: &str = "x-foundry-carried";
+
+/// How long the owner's API may take to answer a carried call: longer than any git step a
+/// create runs, which the workspaces bound at ten minutes.
+const CALL_LIMIT: Duration = Duration::from_secs(15 * 60);
 
 /// How often a caller checks whether the records a call wrote have arrived.
 const SYNCED_EVERY: Duration = Duration::from_millis(50);
@@ -53,7 +57,7 @@ enum Frame {
         body: String,
         version: u64,
     },
-    /// Every [`TICK`] while the call runs.
+    /// Every [`TICK`] while the call runs: the relay's beat, written the same way.
     Beat,
 }
 
@@ -67,20 +71,22 @@ pub struct Answer {
 /// Why a call was not answered by its owner.
 #[derive(Debug, thiserror::Error)]
 pub enum CallError {
-    /// The owner is not in the machine list.
+    /// The owner is not in the machine list. Nothing was sent.
     #[error("machine {0} is not in the machine list")]
     NotListed(MachineId),
-    /// The owner, named here, has not been heard from within [`OFFLINE_AFTER`].
+    /// The owner, named here, has not been heard from within [`OFFLINE_AFTER`]. Nothing was
+    /// sent.
     #[error("{0} is offline")]
     Offline(String),
-    /// The owner, named here, speaks a protocol older than [`CALLS_SINCE`].
+    /// The owner, named here, speaks a protocol older than [`CALLS_SINCE`]. Nothing was sent.
     #[error("{0} runs an older Foundry, which cannot take this call")]
     Older(String),
-    /// The link to the owner, named here, could not be opened.
+    /// The link to the owner, named here, could not be opened. Nothing was sent.
     #[error("the link to {0} is down")]
     Down(String),
-    /// The link to the owner, named here, went down after the call was sent: it may have run.
-    #[error("the link to {0} went down before it answered")]
+    /// The link to the owner, named here, went down after the call was sent: it may have run
+    /// there, and what it changed shows once the link is back.
+    #[error("the link to {0} went down before it answered; the call may have run there")]
     Lost(String),
     /// The owner refused the link, or this machine cannot make the call; the reason says why.
     #[error("{0}")]
@@ -120,15 +126,6 @@ impl Peers {
         if self.speaks_before(owner, CALLS_SINCE) {
             return Err(CallError::Older(peer.name));
         }
-        let Conn { send, mut recv } =
-            match timeout(DIAL_TIMEOUT, self.inner.dialer.dial(&peer)).await {
-                Ok(Ok(conn)) => conn,
-                // The owner refused this machine's key.
-                Ok(Err(e)) if e.kind() == io::ErrorKind::PermissionDenied => {
-                    return Err(CallError::Refused(e.to_string()));
-                }
-                Ok(Err(_)) | Err(_) => return Err(CallError::Down(peer.name)),
-            };
         let open = PeerMessage::Call {
             protocol: PROTOCOL,
             machine: self.inner.me,
@@ -138,9 +135,11 @@ impl Peers {
                 body: hex(body),
             },
         };
-        if !send_message(&send, &open).await {
-            return Err(CallError::Down(peer.name));
-        }
+        let Conn { send, mut recv } = match self.inner.open_link(&peer, &open).await {
+            Ok(conn) => conn,
+            Err(Unopened::Refused(reason)) => return Err(CallError::Refused(reason)),
+            Err(Unopened::Down) => return Err(CallError::Down(peer.name)),
+        };
         let (status, body, version) = loop {
             let Ok(Some(text)) = timeout(OFFLINE_AFTER, recv.recv()).await else {
                 return Err(CallError::Lost(peer.name));
@@ -194,8 +193,9 @@ impl Peers {
 
 /// Serves a call that `machine` carried here, then waits, at most [`OFFLINE_AFTER`], for the
 /// caller to close the link, so the answer is never lost to a link torn down under it. A
-/// machine that is not a peer is answered `403`, a path outside the API `400`, and a call to a
-/// `Peers` serving no calls `503`. The call runs to its end even when the caller goes.
+/// machine that is not a peer is answered `403`, a path that is not one of the routes the API
+/// carries `400`, and a call to a `Peers` serving no calls `503`. The call runs to its end even
+/// when the caller goes.
 pub(super) async fn serve(inner: &Inner, machine: MachineId, call: Call, conn: Conn) {
     let Conn { send, mut recv } = conn;
     let api = *lock(&inner.calls);
@@ -205,10 +205,10 @@ pub(super) async fn serve(inner: &Inner, machine: MachineId, call: Call, conn: C
             403,
             format!("machine {machine} is not a peer of this machine"),
         )
-    } else if !call.path.starts_with("/api/") {
+    } else if !crate::api::carries(&call.path) {
         refusal(
             400,
-            "a carried call names a path outside the API".to_owned(),
+            "a carried call names a route that is not carried".to_owned(),
         )
     } else if let Some(api) = api {
         let _beat = beat(send.clone());
@@ -230,7 +230,20 @@ pub(super) async fn serve(inner: &Inner, machine: MachineId, call: Call, conn: C
         body: hex(&body),
         version,
     };
-    finish(&send, &mut recv, &answer).await;
+    last_word(&send, &mut recv, &answer).await;
+}
+
+/// The client a carried call is made to this machine's API with: no proxy, whatever the
+/// environment says, and no redirect, so the call never leaves this machine, and at most
+/// [`CALL_LIMIT`].
+fn loopback_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .proxy(None)
+        .max_redirects(0)
+        .timeout_global(Some(CALL_LIMIT))
+        .build()
+        .into()
 }
 
 /// Makes the call to this machine's API at `api` and gives back its status and body. The
@@ -242,11 +255,7 @@ async fn run(
     body: Bytes,
 ) -> (u16, Bytes) {
     let made = tokio::task::spawn_blocking(move || {
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .build()
-            .into();
-        let mut request = agent
+        let mut request = loopback_agent()
             .post(format!("http://{api}{path}"))
             .header(CARRIED, "1");
         if let Some(content_type) = content_type {
@@ -260,6 +269,10 @@ async fn run(
     .await;
     match made {
         Ok(Ok(answered)) => answered,
+        Ok(Err(ureq::Error::Timeout(_))) => refusal(
+            504,
+            format!("this machine's API did not answer within {CALL_LIMIT:?}"),
+        ),
         Ok(Err(error)) => {
             tracing::warn!("sync: a carried call could not reach this machine's API: {error}");
             refusal(
@@ -278,16 +291,6 @@ async fn run(
 fn refusal(status: u16, message: String) -> (u16, Bytes) {
     let body = serde_json::json!({ "error": message }).to_string();
     (status, Bytes::from(body))
-}
-
-/// Sends `answer`, then waits for the caller to close the link, as [`super::relay`] does.
-async fn finish(send: &Sender<String>, recv: &mut Receiver<String>, answer: &Frame) {
-    if send_message(send, answer).await {
-        let _ = timeout(OFFLINE_AFTER, async {
-            while recv.recv().await.is_some() {}
-        })
-        .await;
-    }
 }
 
 #[cfg(test)]
