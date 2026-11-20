@@ -424,11 +424,39 @@ async fn the_record_names_its_workspace_terminal_and_model_and_the_child_gets_it
     );
 }
 
+/// The arguments the fake agent printed with `print_args`, and the prompts it took with
+/// `wait_prompt`, from what the session's terminal shows once `done` holds.
+async fn args_and_prompts(
+    f: &Fixture,
+    id: SessionId,
+    done: impl Fn(&[String]) -> bool,
+) -> (Vec<String>, Vec<String>) {
+    let terminal = f.record(id).unwrap().body.terminal;
+    let (snapshot, mut output) = f.terminals.attach(terminal).await.unwrap();
+    let prompts = |seen: &str| -> Vec<String> {
+        seen.lines()
+            .filter_map(|l| l.trim_end().strip_prefix("PROMPT="))
+            .map(|json| serde_json::from_str(json).unwrap())
+            .collect()
+    };
+    let seen = read_until(&snapshot.bytes, &mut output, |seen| {
+        seen.contains("ARG=test-model") && done(&prompts(seen))
+    })
+    .await;
+    let args = seen
+        .lines()
+        .filter_map(|l| l.trim_end().strip_prefix("ARG=").map(str::to_owned))
+        .collect();
+    (args, prompts(&seen))
+}
+
 #[tokio::test]
-async fn a_first_prompt_is_the_last_argument_after_a_double_dash_and_a_blank_one_is_none() {
-    let f = Fixture::new("- print_args\n- wait_input\n").await;
-    let prompt = "-v fix the login, then say \"done\"";
-    let with = f
+async fn a_first_prompt_is_in_no_argument_and_is_typed_as_one_prompt_once_the_agent_takes_input() {
+    let f = Fixture::new("- print_args\n- wait_prompt\n- wait_prompt\n- wait_input\n").await;
+    // A leading dash, a quote, a newline, and an escape that would end a paste early and
+    // submit the rest as a second prompt.
+    let prompt = "-v fix the login,\nthen say \"done\" \u{1b}[201~\r and stop";
+    let id = f
         .sessions
         .start_with(
             WorkspaceId::random(),
@@ -438,7 +466,41 @@ async fn a_first_prompt_is_the_last_argument_after_a_double_dash_and_a_blank_one
         )
         .await
         .unwrap();
-    let blank = f
+
+    let (args, prompts) = args_and_prompts(&f, id, |prompts| !prompts.is_empty()).await;
+    assert!(
+        args.ends_with(&["--model".to_string(), MODEL.to_string()]),
+        "{args:?}"
+    );
+    assert!(
+        !args.iter().any(|a| a.contains("fix the login")),
+        "the prompt is in the arguments: {args:?}"
+    );
+    // The escape is dropped; everything else arrives, newlines kept, as the first input.
+    let want = "-v fix the login,\nthen say \"done\" [201~\n and stop";
+    assert_eq!(prompts, [want]);
+    // Its hook reports it as any typed prompt.
+    let trail = f.sessions.trail(id).unwrap();
+    let texts: Vec<&str> = trail.iter().map(|m| m.text.as_str()).collect();
+    assert_eq!(
+        texts,
+        ["-v fix the login, then say \"done\" [201~ and stop"]
+    );
+
+    // A second prompt typed by the person is the second prompt: nothing else was typed.
+    let terminal = f.record(id).unwrap().body.terminal;
+    f.terminals
+        .input(terminal, Bytes::from_static(b"next\r"))
+        .await
+        .unwrap();
+    let (_, prompts) = args_and_prompts(&f, id, |prompts| prompts.len() == 2).await;
+    assert_eq!(prompts, [want, "next"]);
+}
+
+#[tokio::test]
+async fn a_blank_first_prompt_is_none_and_nothing_is_typed() {
+    let f = Fixture::new("- print_args\n- wait_prompt\n- wait_input\n").await;
+    let id = f
         .sessions
         .start_with(
             WorkspaceId::random(),
@@ -448,32 +510,18 @@ async fn a_first_prompt_is_the_last_argument_after_a_double_dash_and_a_blank_one
         )
         .await
         .unwrap();
-
-    let args = |seen: &str| -> Vec<String> {
-        seen.lines()
-            .filter_map(|l| l.trim_end().strip_prefix("ARG=").map(str::to_owned))
-            .collect()
-    };
-    for (id, want) in [(with, Some(prompt)), (blank, None)] {
-        let terminal = f.record(id).unwrap().body.terminal;
-        let (snapshot, mut output) = f.terminals.attach(terminal).await.unwrap();
-        let seen = read_until(&snapshot.bytes, &mut output, |seen| {
-            seen.contains("ARG=test-model") && (want.is_none() || seen.contains("say \"done\""))
-        })
-        .await;
-        let args = args(&seen);
-        let tail: Vec<&str> = args
-            .iter()
-            .rev()
-            .take(2)
-            .rev()
-            .map(String::as_str)
-            .collect();
-        match want {
-            Some(prompt) => assert_eq!(tail, ["--", prompt], "{args:?}"),
-            None => assert_eq!(tail, ["--model", MODEL], "{args:?}"),
-        }
-    }
+    let (args, _) = args_and_prompts(&f, id, |_| true).await;
+    assert!(
+        args.ends_with(&["--model".to_string(), MODEL.to_string()]),
+        "{args:?}"
+    );
+    let terminal = f.record(id).unwrap().body.terminal;
+    f.terminals
+        .input(terminal, Bytes::from_static(b"mine\r"))
+        .await
+        .unwrap();
+    let (_, prompts) = args_and_prompts(&f, id, |prompts| !prompts.is_empty()).await;
+    assert_eq!(prompts, ["mine"]);
 }
 
 #[tokio::test]
