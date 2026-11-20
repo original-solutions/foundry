@@ -120,3 +120,36 @@ export async function archiveWorkspace(workspace: string, force: boolean): Promi
   }
   throw refused(status, json);
 }
+
+/** One path a workspace changed since its base. Counts are `null` for a binary file. */
+export interface FileChange {
+  path: string;
+  /** The path it was renamed from. */
+  from: string | null;
+  status: "added" | "modified" | "deleted" | "renamed" | "untracked";
+  added: number | null;
+  removed: number | null;
+  /** Some of the change is not committed yet. */
+  uncommitted: boolean;
+  /** The hunks, or `null` when binary, a symlink or too large to send. */
+  patch: string | null;
+}
+
+/** What a workspace changed since it left its base: commits on its branch and every changed file. */
+export interface Changes {
+  base: string;
+  commits: string[];
+  files: FileChange[];
+}
+
+export async function workspaceChanges(workspace: string): Promise<Changes> {
+  const response = await fetch(`/api/workspaces/${workspace}/changes`);
+  let json: Record<string, unknown> = {};
+  try {
+    json = (await response.json()) as Record<string, unknown>;
+  } catch {
+    // Not JSON: the status says what went wrong.
+  }
+  if (!response.ok) throw refused(response.status, json);
+  return json as unknown as Changes;
+}

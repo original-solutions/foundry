@@ -170,6 +170,10 @@ Branch names are `<name>` as typed, made safe for git. Worktrees live under the 
 - It refuses when the worktree has uncommitted or unpushed work, and says which. Tom can confirm to archive anyway.
 - A workspace on an offline machine shows as unreachable. If its branch was pushed, Tom can open a new workspace from that branch on another machine.
 
+### Changes
+
+A P3 diff view, built early on a read the daemon already had. `GET /api/workspaces/{id}/changes` lists what a workspace of this machine changed since it left `origin/<base>`: the commits on its branch and each changed file, committed or not, new files included, with its hunks. The read changes nothing in the worktree, never follows a symlink, and hides credentials in URLs. The UI shows it as a sheet opened from the terminal header or the workspace's row, reading again every few seconds while open.
+
 ## Placement
 
 - Each worker records CPU load per core, free memory, free disk and its session count every 5 seconds.

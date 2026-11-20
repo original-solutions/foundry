@@ -1,5 +1,6 @@
 import { createRootRoute, createRoute, createRouter, useNavigate, useParams } from "@tanstack/react-router";
 import { useEffect, useLayoutEffect, useMemo, useState } from "react";
+import { ChangesPanel } from "./ChangesPanel";
 import { CreateWorkspace } from "./CreateWorkspace";
 import { JumpPalette, jumpKey, SearchIcon } from "./JumpPalette";
 import { Sidebar } from "./Sidebar";
@@ -22,6 +23,8 @@ import { useFleet } from "./useFleet";
  * A workspace made from the new-workspace dialog (the sidebar, the fleet view or the palette opens
  * it) is landed in: once its session shows up, its terminal opens, with the setup shell as a tab
  * beside it.
+ *
+ * A workspace's changes since its base open as a sheet from the header or the workspace's row.
  */
 function Layout() {
   const { state, connected } = useFleet();
@@ -31,6 +34,8 @@ function Layout() {
   const [jump, setJump] = useState(false);
   /** The new-workspace dialog: open, and the name it starts with. */
   const [create, setCreate] = useState({ open: false, name: "" });
+  /** The workspace whose changes are open. */
+  const [changesOf, setChangesOf] = useState<string>();
   /** The session of a workspace just made, until it shows up and is opened. */
   const [landing, setLanding] = useState<string>();
   const navigate = useNavigate();
@@ -83,6 +88,10 @@ function Layout() {
     setDrawer(false);
     setJump(true);
   };
+  const openChanges = (workspace: string) => {
+    setDrawer(false);
+    setChangesOf(workspace);
+  };
   const openCreate = (name = "") => {
     setDrawer(false);
     setCreate({ open: true, name });
@@ -121,11 +130,12 @@ function Layout() {
           onNavigate={close}
           onClose={terminalId ? close : undefined}
           onJump={openJump}
+          onChanges={openChanges}
         />
       </div>
       <main className={`${terminalId ? "flex" : "hidden md:flex"} min-w-0 flex-1 flex-col`}>
         <TabStrip machines={machines} tabs={kept} active={terminalId} changed={changed} onClose={closeTab} />
-        {terminalId && <TerminalHeader located={located} drawerOpen={drawer} onMenu={() => setDrawer(true)} onJump={openJump} />}
+        {terminalId && <TerminalHeader located={located} drawerOpen={drawer} onMenu={() => setDrawer(true)} onJump={openJump} onChanges={openChanges} />}
         <div className="relative min-h-0 flex-1">
           {attached.map((id) => (
             <div key={id} className={`absolute inset-0 ${id === terminalId ? "" : "invisible"}`}>
@@ -135,6 +145,7 @@ function Layout() {
           {!terminalId && <Home machines={machines} onJump={openJump} onCreate={() => openCreate()} />}
         </div>
       </main>
+      <ChangesPanel workspace={machines.flatMap((m) => m.workspaces).find((w) => w.id === changesOf)} onClose={() => setChangesOf(undefined)} />
       <JumpPalette machines={machines} open={jump} onOpenChange={setJump} onCreate={openCreate} />
       <CreateWorkspace
         projects={state.settings.projects}

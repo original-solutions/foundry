@@ -55,8 +55,11 @@ use serde::Deserialize;
 use crate::store::{Store, StoreError};
 use crate::terminals::{TerminalError, Terminals};
 
+mod changes;
 #[cfg(test)]
 mod tests;
+
+pub use changes::{Changes, FileChange, FileStatus};
 
 /// The longest branch [`safe_branch`] makes, in bytes.
 const BRANCH_AT_MOST: usize = 100;

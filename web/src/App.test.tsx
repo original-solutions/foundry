@@ -303,6 +303,36 @@ describe("App", () => {
     expect(sockets("/api/terminals/t2")[0].readyState).toBe(FakeSocket.CLOSED);
   });
 
+  it("opens the open terminal's workspace changes from its header, and the header then shows their size", async () => {
+    const calls = mockFetch(
+      json(200, {
+        base: "main",
+        commits: [],
+        files: [{ path: "a.ts", from: null, status: "modified", added: 4, removed: 2, uncommitted: true, patch: "@@ -1 +1 @@\n-a\n+b\n" }],
+      }),
+    );
+    await open("/terminals/t1", live);
+    const header = screen.getByLabelText("Open terminal");
+    fireEvent.click(within(header).getByRole("button", { name: /changes/i }));
+
+    const panel = await screen.findByRole("dialog", { name: "Changes in fix login" });
+    await within(panel).findByRole("region", { name: "a.ts" });
+    expect(calls[0].url).toBe("/api/workspaces/w1/changes");
+
+    fireEvent.click(within(panel).getByRole("button", { name: "Close changes" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(within(header).getByRole("button", { name: /changes/i }).textContent).toContain("+4");
+  });
+
+  it("opens a workspace's changes from its row in the sidebar", async () => {
+    mockFetch(json(200, { base: "main", commits: [], files: [] }));
+    await open("/", live);
+    const row = screen.getByRole("group", { name: "fix login" });
+    fireEvent.click(within(row).getByRole("button", { name: "Changes" }));
+    const panel = await screen.findByRole("dialog", { name: "Changes in fix login" });
+    await waitFor(() => expect(panel.textContent).toMatch(/no changes since main/i));
+  });
+
   it("brings back the tabs this browser had open without attaching them until one is shown", async () => {
     localStorage.setItem("foundry.tabs", JSON.stringify(["t1", "t2"]));
     await open("/", live);

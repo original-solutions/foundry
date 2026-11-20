@@ -24,9 +24,11 @@ interface Props {
   onClose?: () => void;
   /** Opens the jump palette. */
   onJump?: () => void;
+  /** Opens a workspace's changes. */
+  onChanges?: (workspace: string) => void;
 }
 
-export function Sidebar({ machines, onCreate, selected, connected, onNavigate, onClose, onJump }: Props) {
+export function Sidebar({ machines, onCreate, selected, connected, onNavigate, onClose, onJump, onChanges }: Props) {
   return (
     <nav id="sidebar" className="flex h-full w-full shrink-0 flex-col gap-4 overflow-y-auto bg-neutral-900 p-3 text-sm text-neutral-100 md:w-80">
       <div className="flex items-center justify-between gap-2">
@@ -60,7 +62,7 @@ export function Sidebar({ machines, onCreate, selected, connected, onNavigate, o
             <div className="text-xs text-neutral-400">{machineNumbers(machine.sample)}</div>
           </div>
           {machine.workspaces.map((workspace) => (
-            <Workspace key={workspace.id} workspace={workspace} selected={selected} onNavigate={onNavigate} />
+            <Workspace key={workspace.id} workspace={workspace} selected={selected} onNavigate={onNavigate} onChanges={onChanges} />
           ))}
         </section>
       ))}
@@ -68,11 +70,33 @@ export function Sidebar({ machines, onCreate, selected, connected, onNavigate, o
   );
 }
 
-function Workspace({ workspace, selected, onNavigate }: { workspace: WorkspaceView; selected?: string; onNavigate?: () => void }) {
+function Workspace({
+  workspace,
+  selected,
+  onNavigate,
+  onChanges,
+}: {
+  workspace: WorkspaceView;
+  selected?: string;
+  onNavigate?: () => void;
+  onChanges?: (workspace: string) => void;
+}) {
   const shell = useMutation({ mutationFn: () => startShell(workspace.id) });
   return (
     <div role="group" aria-label={workspace.name} className="space-y-1 rounded bg-neutral-800/50 p-2">
-      <div className="font-medium">{workspace.name}</div>
+      <div className="flex items-baseline justify-between gap-2">
+        <div className="min-w-0 truncate font-medium">{workspace.name}</div>
+        {onChanges && (
+          <button
+            type="button"
+            onClick={() => onChanges(workspace.id)}
+            title="What this workspace changed since its base"
+            className="shrink-0 rounded px-1 text-xs text-neutral-400 hover:bg-neutral-700 hover:text-neutral-100"
+          >
+            Changes
+          </button>
+        )}
+      </div>
       <div className="text-xs text-neutral-400">
         {workspace.branch} · {workspace.project}
       </div>

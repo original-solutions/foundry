@@ -2536,3 +2536,101 @@ async fn sweep_logs_a_clone_it_cannot_read_and_goes_on_to_the_next() {
     assert!(line.contains("WARN"), "{line}");
     assert!(line.contains("could not be read"), "{line}");
 }
+
+#[tokio::test]
+async fn changes_show_committed_uncommitted_and_new_work_since_the_base() {
+    let setup = Setup::new();
+    let remote = setup.project(&[
+        ("README.md", "hello\nworld\n"),
+        ("old.txt", "old\n"),
+        ("gone.txt", "bye\n"),
+    ]);
+    let id = setup.create(&remote, "main", "edits").await;
+    let worktree = setup.worktree(remote.project, "edits");
+    // The base moves on after the workspace was made: none of it is the workspace's change.
+    remote.push("main", &[("later.txt", "later\n")]);
+    git(&setup.clone_of(remote.project), &["fetch", "-q", "origin"]);
+
+    std::fs::write(worktree.join("committed.txt"), "c\n").unwrap();
+    git(&worktree, &["add", "committed.txt"]);
+    git(&worktree, &["commit", "-q", "-m", "add committed"]);
+    std::fs::write(worktree.join("README.md"), "hello\nthere\n").unwrap();
+    std::fs::remove_file(worktree.join("gone.txt")).unwrap();
+    git(&worktree, &["mv", "old.txt", "moved.txt"]);
+    std::fs::write(worktree.join("new file.txt"), "one\ntwo").unwrap();
+    std::fs::write(worktree.join("blob.bin"), [0u8, 1, 2]).unwrap();
+    std::fs::write(worktree.join(".gitignore"), "ignored.txt\n").unwrap();
+    std::fs::write(worktree.join("ignored.txt"), "never shown").unwrap();
+    // A link the agent made to a file outside the worktree is listed, never read.
+    let outside = setup.remotes.path().join("secret.txt");
+    std::fs::write(&outside, "token-xyz").unwrap();
+    std::os::unix::fs::symlink(&outside, worktree.join("link")).unwrap();
+
+    let changes = setup.workspaces.changes(id).await.unwrap();
+    assert_eq!(changes.base, "main");
+    assert_eq!(changes.commits.len(), 1, "{:?}", changes.commits);
+    assert!(changes.commits[0].ends_with(" add committed"));
+    let paths: Vec<&str> = changes.files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        [
+            ".gitignore",
+            "README.md",
+            "blob.bin",
+            "committed.txt",
+            "gone.txt",
+            "link",
+            "moved.txt",
+            "new file.txt"
+        ]
+    );
+    let file = |path: &str| changes.files.iter().find(|f| f.path == path).unwrap();
+
+    let readme = file("README.md");
+    assert_eq!(readme.status, FileStatus::Modified);
+    assert_eq!((readme.added, readme.removed), (Some(1), Some(1)));
+    assert!(readme.uncommitted);
+    let patch = readme.patch.as_deref().unwrap();
+    assert!(patch.starts_with("@@ "), "{patch}");
+    assert!(patch.contains("-world\n+there\n"), "{patch}");
+
+    let committed = file("committed.txt");
+    assert_eq!(committed.status, FileStatus::Added);
+    assert!(!committed.uncommitted);
+    assert_eq!(committed.patch.as_deref(), Some("@@ -0,0 +1 @@\n+c\n"));
+
+    let moved = file("moved.txt");
+    assert_eq!(moved.status, FileStatus::Renamed);
+    assert_eq!(moved.from.as_deref(), Some("old.txt"));
+    assert_eq!(file("gone.txt").status, FileStatus::Deleted);
+
+    let new = file("new file.txt");
+    assert_eq!(new.status, FileStatus::Untracked);
+    assert_eq!((new.added, new.removed), (Some(2), Some(0)));
+    assert!(new.patch.as_deref().unwrap().contains("+one\n+two\n"));
+
+    let blob = file("blob.bin");
+    assert_eq!((blob.added, blob.patch.as_deref()), (None, None));
+    let link = file("link");
+    assert_eq!((link.added, link.patch.as_deref()), (None, None));
+    let shown = format!("{changes:?}");
+    assert!(!shown.contains("token-xyz") && !shown.contains("never shown"));
+
+    // A read changes nothing: the index still holds only what was added by hand.
+    let staged = git(
+        &worktree,
+        &["diff", "--cached", "--no-renames", "--name-only"],
+    );
+    assert_eq!(staged.lines().collect::<Vec<_>>(), ["moved.txt", "old.txt"]);
+}
+
+#[tokio::test]
+async fn changes_of_a_workspace_that_is_not_here_are_refused() {
+    let setup = Setup::new();
+    let err = setup
+        .workspaces
+        .changes(WorkspaceId::random())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, WorkspaceError::Unknown(_)), "{err}");
+}

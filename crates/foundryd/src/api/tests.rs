@@ -1877,3 +1877,42 @@ async fn no_response_contains_a_secret() {
         assert!(!said.contains(secret), "a response holds a secret");
     }
 }
+
+#[tokio::test]
+async fn changes_list_each_file_with_its_hunks_and_hide_credentials_in_urls() {
+    let daemon = Daemon::new(TURN).await;
+    let project = daemon.project();
+    let workspace = daemon.create_workspace(project, "changed").await;
+    let worktree = daemon.workspaces.worktree(workspace).await.unwrap();
+    std::fs::write(
+        worktree.join("notes.txt"),
+        "clone https://bot:hunter2@example.com/r.git\n",
+    )
+    .unwrap();
+
+    let path = format!("/api/workspaces/{workspace}/changes");
+    let reply = daemon.call("GET", &path, None).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    let json = reply.json();
+    assert_eq!(json["base"], "main");
+    let files = json["files"].as_array().unwrap();
+    let notes = files.iter().find(|f| f["path"] == "notes.txt").unwrap();
+    assert_eq!(notes["status"], "untracked");
+    assert_eq!(notes["added"], 1);
+    assert_eq!(notes["uncommitted"], true);
+    let patch = notes["patch"].as_str().unwrap();
+    assert!(
+        patch.starts_with("@@ -0,0 +1,1 @@\n+clone https://"),
+        "{patch}"
+    );
+    assert!(!reply.body.contains("hunter2"), "{}", reply.body);
+
+    let reply = daemon
+        .call(
+            "GET",
+            &format!("/api/workspaces/{}/changes", WorkspaceId::random()),
+            None,
+        )
+        .await;
+    assert_eq!(reply.status, 404, "{}", reply.body);
+}
