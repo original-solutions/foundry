@@ -1,9 +1,9 @@
 import type { MachineView } from "./fleet";
-import { sessionLabel, sessionTone, terminalLabel, terminalTone, type Tone } from "./labels";
+import { sessionLabel, sessionGlyph, terminalLabel, terminalGlyph, type Glyph } from "./labels";
 
 /** Somewhere the jump palette goes: an open terminal, a new shell in a workspace, or a new workspace. */
 export type Destination =
-  | { kind: "terminal"; key: string; terminal: string; title: string; label: string; tone: Tone; machine: string; words: string }
+  | { kind: "terminal"; key: string; terminal: string; title: string; label: string; glyph: Glyph; machine: string; words: string }
   | { kind: "shell"; key: string; workspace: string; title: string; machine: string; words: string }
   | { kind: "workspace"; key: string; name: string; title: string; machine: string; words: string };
 
@@ -14,10 +14,10 @@ export function destinations(machines: MachineView[]): Destination[] {
   for (const machine of machines) {
     for (const w of machine.workspaces) {
       const where = `${w.name} ${w.project} ${w.branch} ${machine.name}`;
-      const add = (terminal: string, name: string, label: string, tone: Tone) =>
-        open.push({ kind: "terminal", key: terminal, terminal, title: `${w.name} / ${name}`, label, tone, machine: machine.name, words: `${where} ${name} ${label}` });
-      for (const s of w.sessions) add(s.terminal, s.model, sessionLabel[s.state], sessionTone[s.state]);
-      for (const t of w.shells) add(t.id, "shell", terminalLabel(t.state, t.exitCode), terminalTone(t.state, t.exitCode));
+      const add = (terminal: string, name: string, label: string, glyph: Glyph) =>
+        open.push({ kind: "terminal", key: terminal, terminal, title: `${w.name} / ${name}`, label, glyph, machine: machine.name, words: `${where} ${name} ${label}` });
+      for (const s of w.sessions) add(s.terminal, s.model, sessionLabel[s.state], sessionGlyph[s.state]);
+      for (const t of w.shells) add(t.id, "shell", terminalLabel(t.state, t.exitCode), terminalGlyph(t.state, t.exitCode));
       const title = `New shell in ${w.name}`;
       shells.push({ kind: "shell", key: `new-shell:${w.id}`, workspace: w.id, title, machine: machine.name, words: `${title} ${where}` });
     }

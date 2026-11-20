@@ -1,6 +1,6 @@
 import type { Located } from "./fleet";
 import { jumpKey, SearchIcon } from "./JumpPalette";
-import { StatePill } from "./StateDot";
+import { StatePill } from "./StateGlyph";
 
 /**
  * The bar above the open terminal: which workspace and terminal it is, the machine it runs on and
@@ -31,7 +31,7 @@ export function TerminalHeader({ located, drawerOpen, onMenu, onJump }: { locate
               {located.machine.name}
             </span>
           </div>
-          <StatePill tone={located.tone} label={located.label} />
+          <StatePill glyph={located.glyph} label={located.label} />
         </>
       ) : (
         <span className="flex-1 text-neutral-500">Terminal</span>

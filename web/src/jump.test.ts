@@ -23,9 +23,9 @@ describe("destinations", () => {
   it("lists every terminal in the fleet with its workspace, name, state and machine, then a new shell per workspace", () => {
     const all = destinations(machines());
     expect(all.map((d) => d.title)).toEqual(["fix login / sonnet", "fix login / shell", "tidy readme / opus", "New shell in fix login", "New shell in tidy readme"]);
-    expect(all[0]).toMatchObject({ kind: "terminal", terminal: "t1", label: "Waiting for you", tone: "attention", machine: "studio" });
-    expect(all[1]).toMatchObject({ kind: "terminal", terminal: "t2", label: "Exited 2", tone: "bad" });
-    expect(all[2]).toMatchObject({ machine: "mini", tone: "busy" });
+    expect(all[0]).toMatchObject({ kind: "terminal", terminal: "t1", label: "Waiting for you", glyph: "waiting", machine: "studio" });
+    expect(all[1]).toMatchObject({ kind: "terminal", terminal: "t2", label: "Exited 2", glyph: "failed" });
+    expect(all[2]).toMatchObject({ machine: "mini", glyph: "working" });
     expect(all[3]).toMatchObject({ kind: "shell", workspace: "w1" });
   });
 });

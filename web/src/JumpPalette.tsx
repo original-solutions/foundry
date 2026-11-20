@@ -5,7 +5,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { startShell } from "./api";
 import type { MachineView } from "./fleet";
 import { destinations, newWorkspace, search, type Destination } from "./jump";
-import { StateDot } from "./StateDot";
+import { StateGlyph } from "./StateGlyph";
 
 /** The key that opens the palette, as this platform writes it. */
 export const jumpKey = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent) ? "⌘K" : "Ctrl K";
@@ -138,7 +138,7 @@ function Panel({ machines, close, onCreate }: { machines: MachineView[]; close: 
           >
             {d.kind === "terminal" ? (
               <span className="flex w-4 justify-center">
-                <StateDot tone={d.tone} label={d.label} />
+                <StateGlyph glyph={d.glyph} />
               </span>
             ) : (
               <PlusIcon className="size-4 shrink-0 text-neutral-500" />

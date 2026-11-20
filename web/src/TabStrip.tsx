@@ -1,17 +1,7 @@
 import { Link } from "@tanstack/react-router";
 import { useEffect, useRef } from "react";
 import { locate, type MachineView } from "./fleet";
-import type { Tone } from "./labels";
-import { StateDot } from "./StateDot";
-
-const toneText: Record<Tone, string> = {
-  attention: "text-amber-300",
-  bad: "text-red-300",
-  busy: "text-sky-300",
-  ready: "text-emerald-300",
-  quiet: "text-neutral-300",
-  away: "text-neutral-400",
-};
+import { glyphText, StateGlyph } from "./StateGlyph";
 
 interface Props {
   machines: MachineView[];
@@ -70,9 +60,9 @@ export function TabStrip({ machines, tabs, active, changed, onClose }: Props) {
               title={found ? `${title} on ${found.machine.name}: ${found.label}` : title}
               className="flex min-w-0 flex-1 items-center gap-2 py-1 pr-1 pl-3 text-xs"
             >
-              {found ? <StateDot tone={found.tone} label={found.label} /> : <span className="size-2 shrink-0" />}
+              {found ? <StateGlyph glyph={found.glyph} /> : <span className="size-3.25 shrink-0" />}
               <span className={`truncate ${fresh ? "font-semibold text-neutral-100" : ""}`}>{title}</span>
-              {fresh && found && <span className={`shrink-0 font-medium ${toneText[found.tone]}`}>{found.label}</span>}
+              {fresh && found && <span className={`shrink-0 font-medium ${glyphText[found.glyph]}`}>{found.label}</span>}
             </Link>
             <button
               type="button"

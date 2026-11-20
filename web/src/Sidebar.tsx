@@ -6,8 +6,8 @@ import { jumpKey, SearchIcon } from "./JumpPalette";
 import { NewSession } from "./NewSession";
 import { startShell } from "./api";
 import { machineNumbers, type MachineView, type WorkspaceView } from "./fleet";
-import { sessionLabel, sessionTone, terminalLabel, terminalTone, type Tone } from "./labels";
-import { StateDot } from "./StateDot";
+import { sessionGlyph, sessionLabel, terminalGlyph, terminalLabel, type Glyph } from "./labels";
+import { StateGlyph } from "./StateGlyph";
 
 const statusColour = { online: "text-emerald-400", offline: "text-red-400", unknown: "text-neutral-400" };
 
@@ -90,7 +90,7 @@ function Workspace({ workspace, selected, onNavigate }: { workspace: WorkspaceVi
       )}
       <ul>
         {workspace.sessions.map((s) => (
-          <Item key={s.id} terminal={s.terminal} selected={selected} name={s.model} label={sessionLabel[s.state]} tone={sessionTone[s.state]} onNavigate={onNavigate} />
+          <Item key={s.id} terminal={s.terminal} selected={selected} name={s.model} label={sessionLabel[s.state]} glyph={sessionGlyph[s.state]} onNavigate={onNavigate} />
         ))}
         {workspace.shells.map((t) => (
           <Item
@@ -99,7 +99,7 @@ function Workspace({ workspace, selected, onNavigate }: { workspace: WorkspaceVi
             selected={selected}
             name="shell"
             label={terminalLabel(t.state, t.exitCode)}
-            tone={terminalTone(t.state, t.exitCode)}
+            glyph={terminalGlyph(t.state, t.exitCode)}
             onNavigate={onNavigate}
           />
         ))}
@@ -113,11 +113,11 @@ interface ItemProps {
   selected?: string;
   name: string;
   label: string;
-  tone: Tone;
+  glyph: Glyph;
   onNavigate?: () => void;
 }
 
-function Item({ terminal, selected, name, label, tone, onNavigate }: ItemProps) {
+function Item({ terminal, selected, name, label, glyph, onNavigate }: ItemProps) {
   const current = terminal === selected;
   return (
     <li>
@@ -128,7 +128,7 @@ function Item({ terminal, selected, name, label, tone, onNavigate }: ItemProps) 
         onClick={onNavigate}
         className={`flex items-center gap-2 rounded px-2 py-1.5 hover:bg-neutral-700 md:py-1 ${current ? "bg-neutral-700" : ""}`}
       >
-        <StateDot tone={tone} label={label} />
+        <StateGlyph glyph={glyph} />
         <span className="flex-1">{name}</span> <span className="text-neutral-300">{label}</span>
       </Link>
     </li>

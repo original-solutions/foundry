@@ -174,20 +174,20 @@ describe("locate", () => {
 
   it("finds a session's terminal with its workspace, machine, name and state", () => {
     const found = locate(machines, "t1");
-    expect(found && { machine: found.machine.name, workspace: found.workspace.name, name: found.name, label: found.label, tone: found.tone }).toEqual({
+    expect(found && { machine: found.machine.name, workspace: found.workspace.name, name: found.name, label: found.label, glyph: found.glyph }).toEqual({
       machine: "studio",
       workspace: "fix login",
       name: "sonnet",
       label: "Waiting for you",
-      tone: "attention",
+      glyph: "waiting",
     });
   });
 
   it("finds a shell, named shell, with its exit code in the label", () => {
     const found = locate(machines, "sh1");
-    expect(found && [found.name, found.label, found.tone]).toEqual(["shell", "Exited 2", "bad"]);
+    expect(found && [found.name, found.label, found.glyph]).toEqual(["shell", "Exited 2", "failed"]);
     const away = locate(machines, "sh2");
-    expect(away && [away.machine.name, away.workspace.name, away.label, away.tone]).toEqual(["laptop", "docs", "Unreachable", "away"]);
+    expect(away && [away.machine.name, away.workspace.name, away.label, away.glyph]).toEqual(["laptop", "docs", "Unreachable", "away"]);
   });
 
   it("finds nothing for a terminal that is not listed", () => {

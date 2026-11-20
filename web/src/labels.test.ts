@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { SessionState } from "./api";
-import { sessionLabel, sessionTone, terminalLabel, terminalTone } from "./labels";
+import { sessionLabel, sessionGlyph, terminalLabel, terminalGlyph } from "./labels";
 
 describe("labels", () => {
   it("names every session state", () => {
@@ -25,13 +25,13 @@ describe("labels", () => {
     expect(terminalLabel("unreachable", null)).toBe("Unreachable");
   });
 
-  it("gives every state a tone: what needs you stands out, what failed is red, what is away is dim", () => {
+  it("gives every state a glyph: one per meaning, shared by sessions and shells", () => {
     const states: SessionState[] = ["starting", "working", "waiting_for_you", "idle", "finished", "failed", "stuck", "unreachable"];
-    expect(states.map((s) => sessionTone[s])).toEqual(["quiet", "busy", "attention", "ready", "quiet", "bad", "bad", "away"]);
-    expect(terminalTone("running", null)).toBe("ready");
-    expect(terminalTone("exited", 0)).toBe("quiet");
-    expect(terminalTone("exited", null)).toBe("quiet");
-    expect(terminalTone("exited", 1)).toBe("bad");
-    expect(terminalTone("unreachable", null)).toBe("away");
+    expect(states.map((s) => sessionGlyph[s])).toEqual(["starting", "working", "waiting", "ready", "done", "failed", "stuck", "away"]);
+    expect(terminalGlyph("running", null)).toBe("ready");
+    expect(terminalGlyph("exited", 0)).toBe("done");
+    expect(terminalGlyph("exited", null)).toBe("done");
+    expect(terminalGlyph("exited", 1)).toBe("failed");
+    expect(terminalGlyph("unreachable", null)).toBe("away");
   });
 });
