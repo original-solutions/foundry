@@ -2083,6 +2083,18 @@ mod tests {
         closed(&mut conn).await;
     }
 
+    #[tokio::test]
+    async fn a_link_whose_hello_was_parsed_is_answered_without_reading_it_again() {
+        let (h, p) = pair();
+        let host = host(&h, &[p.me()]);
+        let (mut near, far) = Conn::pair();
+        let first: PeerMessage = serde_json::from_str(&hello(p.me())).unwrap();
+        let peers = host.peers.clone();
+        tokio::spawn(async move { peers.accept_opened(far, first).await });
+        let answer = next(&mut near).await.expect("the link was refused");
+        assert!(is_hello(&answer), "{answer}");
+    }
+
     // ---- joining over HTTP ----
 
     async fn serve(keys: Keys) -> u16 {
