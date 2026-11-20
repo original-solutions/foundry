@@ -115,11 +115,12 @@ body {
   }
 }
 
-/* A state glyph's one pop when its state changes, the working glyph's ripple, and the changes sheet sliding in. */
+/* A state glyph's one pop when its state changes, the working glyph's ripple, the changes sheet sliding in, and a ship card arriving. */
 @theme {
   --animate-state-in: state-in 450ms ease-out;
   --animate-ripple: ripple 1.2s ease-in-out infinite;
   --animate-sheet-in: sheet-in 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
+  --animate-arrive: arrive 1.4s ease-out;
   @keyframes state-in {
     0% {
       transform: scale(2.2);
@@ -138,6 +139,19 @@ body {
     100% {
       transform: translateX(0);
       opacity: 1;
+    }
+  }
+  /* A ship card that moved a column forward glows once in its new place. */
+  @keyframes arrive {
+    0% {
+      transform: translateY(-0.5rem);
+      box-shadow: 0 0 0 2px var(--color-emerald-400);
+    }
+    25% {
+      transform: translateY(0);
+    }
+    100% {
+      box-shadow: 0 0 0 2px transparent;
     }
   }
   @keyframes ripple {

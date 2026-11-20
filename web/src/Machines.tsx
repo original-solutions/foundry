@@ -70,7 +70,7 @@ export function Machines({ machines, history, here, connected, onJump, onMenu }:
   const online = machines.filter((m) => m.status === "online").length;
   const offline = machines.filter((m) => m.status === "offline").length;
   const counts = [`${plural(machines.length, "machine")}`, `${online} online`, ...(offline ? [`${offline} offline`] : [])].join(" · ");
-  const pick = (view: "board" | "timeline" | "machines") => {
+  const pick = (view: "board" | "timeline" | "ship" | "machines") => {
     if (view === "machines") return;
     saveView(view);
     void navigate({ to: "/" });

@@ -15,15 +15,17 @@ import { plural, type Glyph } from "./labels";
 import { glyphText, StateGlyph } from "./StateGlyph";
 import { Named, Now } from "./Now";
 import { Said } from "./Said";
-import { pollEvery } from "./poll";
+import { BOARD_BUSY_EVERY, pollEvery } from "./poll";
+import { Ship } from "./Ship";
 import { Timeline } from "./Timeline";
 
 /** Which view of the fleet the home shows, kept for this browser. The machines view has its own URL. */
-type View = "board" | "timeline";
+type View = "board" | "timeline" | "ship";
 const VIEW_KEY = "foundry.home";
 function loadView(): View {
   try {
-    return localStorage.getItem(VIEW_KEY) === "timeline" ? "timeline" : "board";
+    const kept = localStorage.getItem(VIEW_KEY);
+    return kept === "timeline" || kept === "ship" ? kept : "board";
   } catch {
     return "board";
   }
@@ -37,12 +39,7 @@ export function saveView(view: View) {
   }
 }
 
-/**
- * How often a card on screen reads its workspace's changes while an agent in it works. A quiet
- * card is read when it comes on screen and when one of its terminals changes state, never on a
- * timer: each read runs git several times, and a fleet has dozens of workspaces.
- */
-export const BOARD_BUSY_EVERY = 30_000;
+export { BOARD_BUSY_EVERY };
 
 /** A card shows this many terminals, then says how many more. */
 const ROWS_SHOWN = 4;
@@ -70,7 +67,8 @@ const edge: Record<Glyph, string> = {
  * no workspaces yet opens on the first-run page instead (`Launchpad`).
  *
  * At the top, a one-line box gives Claude its next task (`Composer`), beside the way to jump.
- * A switch beside the counts turns it into a timeline of every session's turns on one clock.
+ * A switch beside the counts turns it into a timeline of every session's turns on one clock, or
+ * into the fleet's work on its way to main (`Ship`).
  *
  * On a phone it is the home: a line above the task box says what needs you, what works and what
  * rests, and a bar at the bottom (`PhoneNav`) takes the switch's place and opens the workspaces.
@@ -132,6 +130,8 @@ export function Board({
           </div>
           {view === "timeline" ? (
             <Timeline machines={machines} traced={traced} onSteps={onSteps} />
+          ) : view === "ship" ? (
+            <Ship machines={machines} onChanges={onChanges} />
           ) : (
             board.map(({ lane, cards }) => (
               <LaneSection key={lane} lane={lane} count={cards.length}>
@@ -372,10 +372,11 @@ export function JumpBar({ onJump }: { onJump: () => void }) {
 const views = [
   { view: "board", name: "Board", icon: <BoardIcon /> },
   { view: "timeline", name: "Timeline", icon: <TimelineIcon /> },
+  { view: "ship", name: "Ship", icon: <ShipIcon /> },
   { view: "machines", name: "Machines", icon: <MachinesIcon /> },
 ] as const;
 
-/** The switch between the home's views of the fleet: its workspaces, its turns and its machines. */
+/** The switch between the home's views of the fleet: its workspaces, its turns, its work on the way to main and its machines. */
 export function ViewSwitch({ view, onPick }: { view: View | "machines"; onPick: (view: View | "machines") => void }) {
   return (
     <div role="radiogroup" aria-label="View" className="flex shrink-0 gap-0.5 rounded-lg border border-neutral-800 bg-neutral-900 p-0.5 text-xs">
@@ -403,7 +404,7 @@ export function ViewSwitch({ view, onPick }: { view: View | "machines"; onPick: 
 export function PhoneNav({ view, onPick, needs, onMenu }: { view: View | "machines"; onPick: (view: View | "machines") => void; needs: number; onMenu: () => void }) {
   const item = "relative flex flex-col items-center gap-1 pt-2 pb-1.5 text-[11px] font-medium transition-colors";
   return (
-    <nav aria-label="Home" className="grid shrink-0 grid-cols-4 border-t border-neutral-800 bg-neutral-900 pb-[env(safe-area-inset-bottom)] md:hidden">
+    <nav aria-label="Home" className="grid shrink-0 grid-cols-5 border-t border-neutral-800 bg-neutral-900 pb-[env(safe-area-inset-bottom)] md:hidden">
       {views.map((v) => {
         const on = view === v.view;
         const count = v.view === "board" && needs > 0;
@@ -452,6 +453,17 @@ function BoardIcon() {
     <svg viewBox="0 0 16 16" className="size-3.5" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
       <rect x="2" y="2.5" width="5" height="11" rx="1" />
       <rect x="9" y="2.5" width="5" height="6.5" rx="1" />
+    </svg>
+  );
+}
+
+function ShipIcon() {
+  return (
+    <svg viewBox="0 0 16 16" className="size-3.5" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <circle cx="4" cy="3.5" r="1.5" />
+      <circle cx="4" cy="12" r="1.5" />
+      <circle cx="12" cy="12" r="1.5" />
+      <path d="M4 5v5.5M12 10.5V7a2.5 2.5 0 0 0-2.5-2.5H7m1.5-1.5L7 4.5 8.5 6" />
     </svg>
   );
 }
