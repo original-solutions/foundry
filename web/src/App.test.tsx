@@ -584,6 +584,7 @@ describe("App", () => {
       "New shell in fix login",
       "Clear",
       "Clear 2 ended in fix login",
+      "Archive fix login…",
     ]);
     fireEvent.click(within(menu).getByRole("menuitem", { name: "Clear" }));
 
@@ -664,6 +665,34 @@ describe("App", () => {
     expect(calls).toEqual([]);
   });
 
+  it("archives a workspace from its board card after showing what stops, then says what it kept", async () => {
+    const calls = mockActions(new Response(null, { status: 204 }));
+    await open("/", live);
+    const card = screen.getByRole("article", { name: "fix login" });
+
+    fireEvent.click(within(card).getByRole("button", { name: "Archive fix login" }));
+    const dialog = await screen.findByRole("dialog", { name: "Archive fix login?" });
+    expect(within(dialog).getByRole("region", { name: "Stops" }).textContent).toMatch(/sonnet.*Working.*mid-turn/);
+    expect(calls).toEqual([]);
+    fireEvent.click(within(dialog).getByRole("button", { name: "Archive" }));
+
+    await waitFor(() => expect(calls).toEqual([{ url: "/api/workspaces/w1/archive", method: "POST", body: { force: false } }]));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect((await screen.findByRole("status")).textContent).toMatch(/Archived fix login.*fix-login.*kept/);
+  });
+
+  it("offers archiving only for this machine's workspaces", async () => {
+    mockActions();
+    await open("/", {
+      ...live,
+      records: [...live.records, sample(OTHER, 1), workspace(OTHER, "w9", "remote job"), terminal(OTHER, "t9", "w9", "running")],
+      settings: settings({ machines: [{ id: ME, name: "studio", address: "127.0.0.1" }, { id: OTHER, name: "attic", address: "10.0.0.2" }] }),
+    });
+    expect(within(screen.getByRole("article", { name: "remote job" })).queryByRole("button", { name: /^Archive/ })).toBeNull();
+    expect(within(screen.getByRole("group", { name: "remote job" })).queryByRole("button", { name: "Archive" })).toBeNull();
+    expect(within(screen.getByRole("group", { name: "fix login" })).getByRole("button", { name: "Archive" })).toBeDefined();
+  });
+
   it("does not end or clear anything when the button that opened the menu is let go over that item", async () => {
     const calls = mockActions();
     await open("/terminals/t1", ended);
@@ -703,6 +732,7 @@ describe("App", () => {
       "New session in fix login",
       "New shell in fix login",
       "End shell…",
+      "Archive fix login…",
     ]);
 
     fireEvent.change(input, { target: { value: "chan" } });
@@ -752,6 +782,7 @@ describe("App", () => {
       "New session in fix login",
       "New shell in fix login",
       "End sonnet…",
+      "Archive fix login…",
     ]);
     fireEvent.click(within(dialog).getByRole("option", { name: "End sonnet…" }));
 

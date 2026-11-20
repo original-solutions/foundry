@@ -1,7 +1,8 @@
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { ContextMenu, Dialog, DropdownMenu } from "radix-ui";
-import { createContext, Fragment, useContext, useRef, useState, type ComponentType, type PointerEvent, type ReactElement, type ReactNode } from "react";
+import { createContext, Fragment, useContext, useEffect, useRef, useState, type ComponentType, type PointerEvent, type ReactElement, type ReactNode } from "react";
 import { closeTerminal, machineQuery, startShell } from "./api";
+import { ArchiveDialog } from "./Archive";
 import { ended, endOf } from "./ends";
 import { locate, type Located, type MachineView } from "./fleet";
 import { button, Modal } from "./Modal";
@@ -32,7 +33,12 @@ export interface Context extends Actions {
   clear: (ids: string[]) => void;
   /** Starts a shell in `workspace` and opens it. */
   shell: (workspace: string) => void;
+  /** Asks to archive `workspace`, showing what stays, what is lost and what stops. */
+  archive: (workspace: string) => void;
 }
+
+/** How long the line saying a workspace was archived stays. */
+export const ARCHIVED_FOR = 6000;
 
 const Terminals = createContext<Context | undefined>(undefined);
 
@@ -47,6 +53,13 @@ const Terminals = createContext<Context | undefined>(undefined);
 export function TerminalActions({ children, ...actions }: Actions & { children: ReactNode }) {
   const [asking, setAsking] = useState<string>();
   const [failed, setFailed] = useState<string>();
+  const [archiving, setArchiving] = useState<string>();
+  const [archived, setArchived] = useState<{ name: string; branch: string }>();
+  useEffect(() => {
+    if (!archived) return;
+    const timer = setTimeout(() => setArchived(undefined), ARCHIVED_FOR);
+    return () => clearTimeout(timer);
+  }, [archived]);
   const clearing = useMutation({
     mutationFn: (ids: string[]) => Promise.all(ids.map(closeTerminal)),
     onError: (error) => setFailed(`Could not end it: ${error.message}`),
@@ -67,12 +80,31 @@ export function TerminalActions({ children, ...actions }: Actions & { children: 
     },
     clear: (ids) => clearing.mutate(ids),
     shell: (workspace) => shell.mutate(workspace),
+    archive: setArchiving,
   };
   const target = asking ? locate(actions.machines, asking) : undefined;
+  const leaving = archiving ? actions.machines.flatMap((m) => m.workspaces).find((w) => w.id === archiving) : undefined;
   return (
     <Terminals.Provider value={context}>
       {children}
       {asking && target && <EndDialog key={asking} id={asking} found={target} onDone={() => setAsking(undefined)} />}
+      {leaving && <ArchiveDialog key={leaving.id} workspace={leaving} onClose={() => setArchiving(undefined)} onArchived={(name, branch) => setArchived({ name, branch })} />}
+      {archived && (
+        <p
+          role="status"
+          className="fixed inset-x-3 bottom-3 z-50 mx-auto flex max-w-md items-center gap-2.5 rounded-lg border border-emerald-400/40 bg-neutral-900 px-3 py-2 text-xs text-neutral-200 shadow-xl"
+        >
+          <svg viewBox="0 0 16 16" className="size-4 shrink-0 text-emerald-400" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <path d="M3.5 8.5l3 3 6-7" />
+          </svg>
+          <span className="min-w-0 flex-1">
+            Archived <span className="font-semibold">{archived.name}</span>. Branch <code className="font-mono text-emerald-300">{archived.branch}</code> kept.
+          </span>
+          <button type="button" onClick={() => setArchived(undefined)} className="shrink-0 rounded px-1.5 py-0.5 text-neutral-400 hover:bg-neutral-800 hover:text-neutral-100">
+            Dismiss
+          </button>
+        </p>
+      )}
       {failed && (
         <p
           role="alert"
@@ -129,6 +161,9 @@ function useReturnFocus() {
  */
 const deliberate = { onPointerUp: (event: PointerEvent) => event.preventDefault() };
 
+/** A box with its lid: archiving a workspace. */
+export const ARCHIVE_ICON = "M2.5 3.5h11v3h-11zM3.5 6.5v6h9v-6M6.5 9h3";
+
 /** One thing that can be done with a terminal, as its menu and the jump palette list it. */
 export interface Act {
   key: string;
@@ -176,6 +211,7 @@ export function actsFor(id: string, at: Context, found: Located, roomy = wide())
       run: () => at.clear(rest),
       group: "end",
     },
+    mine && { key: "archive", label: `Archive ${name}…`, icon: ARCHIVE_ICON, run: () => at.archive(workspace), group: "end" },
   ];
   return acts.filter((act): act is Act => !!act);
 }

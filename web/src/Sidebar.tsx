@@ -1,7 +1,6 @@
 import { useMutation } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { useState, type ReactNode } from "react";
-import { ArchiveButton } from "./ArchiveButton";
 import { button } from "./Modal";
 import { jumpKey, SearchIcon } from "./JumpPalette";
 import { Named, Now } from "./Now";
@@ -10,7 +9,7 @@ import { loadFolded, saveFolded } from "./fold";
 import { byUrgency, machineNumbers, machineStats, rows, type MachineView, type Row, type WorkspaceView } from "./fleet";
 import { glyphText, StateGlyph } from "./StateGlyph";
 import { ended } from "./ends";
-import { TerminalMenu, useTerminalActions } from "./TerminalMenu";
+import { ARCHIVE_ICON, TerminalMenu, useTerminalActions } from "./TerminalMenu";
 import { Mark } from "./Mark";
 import { ThemeButton } from "./ThemeButton";
 import type { MachineSample } from "./api";
@@ -215,15 +214,11 @@ function Workspace({ workspace, machine, folded, onFold, selected, onNavigate, o
                   <path d="M11.5 2l-3 6M4 8h7l1 5.5H3zM6 10.5v3M9 10.5v3" />
                 </Action>
               )}
-              <ArchiveButton
-                workspace={workspace.id}
-                name={workspace.name}
-                trigger={
-                  <Action label="Archive" title="Archive: stop its terminals, remove the worktree, keep the branch">
-                    <path d="M2.5 3.5h11v3h-11zM3.5 6.5v6h9v-6M6.5 9h3" />
-                  </Action>
-                }
-              />
+              {terminals?.here === machine && (
+                <Action label="Archive" title="Archive: stop its terminals, remove the worktree, keep the branch" onClick={() => terminals.archive(workspace.id)}>
+                  <path d={ARCHIVE_ICON} />
+                </Action>
+              )}
             </div>
           </div>
           {shell.error && (

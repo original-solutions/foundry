@@ -1,6 +1,6 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate } from "@tanstack/react-router";
-import { TerminalMenu } from "./TerminalMenu";
+import { ARCHIVE_ICON, TerminalMenu, useTerminalActions } from "./TerminalMenu";
 import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { lanes, topFiles, type Card, type Lane } from "./lanes";
 import { changesQuery } from "./ChangesPanel";
@@ -159,11 +159,12 @@ function WorkspaceCard({ card, showMachine, onChanges }: { card: Card; showMachi
   const [ref, onScreen] = useOnScreen<HTMLElement>();
   const { workspace, machine, rows, lead } = card;
   const shown = rows.slice(0, ROWS_SHOWN);
+  const terminals = useTerminalActions();
   return (
     <article
       ref={ref}
       aria-labelledby={id}
-      className="relative flex flex-col overflow-hidden rounded-xl border border-neutral-800 bg-neutral-900/60 transition-colors hover:border-neutral-700"
+      className="group/card relative flex flex-col overflow-hidden rounded-xl border border-neutral-800 bg-neutral-900/60 transition-colors hover:border-neutral-700"
     >
       <span aria-hidden="true" className={`absolute inset-y-0 left-0 w-1 ${lead ? edge[lead.glyph] : "bg-neutral-800"}`} />
       <header className="flex flex-col gap-0.5 px-4 pt-3 pb-2">
@@ -181,6 +182,19 @@ function WorkspaceCard({ card, showMachine, onChanges }: { card: Card; showMachi
             <span className="shrink-0 text-xs text-neutral-500" title={`Runs on ${machine.id}`}>
               {machine.name}
             </span>
+          )}
+          {terminals?.here === machine.id && (
+            <button
+              type="button"
+              aria-label={`Archive ${workspace.name}`}
+              title="Archive: see what stays and what stops, then stop its terminals and remove the worktree"
+              onClick={() => terminals.archive(workspace.id)}
+              className="-my-1 grid size-6 shrink-0 place-items-center self-center rounded text-neutral-500 hover:bg-neutral-800 hover:text-neutral-100 pointer-fine:opacity-0 pointer-fine:group-focus-within/card:opacity-100 pointer-fine:group-hover/card:opacity-100"
+            >
+              <svg viewBox="0 0 16 16" className="size-3.5" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <path d={ARCHIVE_ICON} />
+              </svg>
+            </button>
           )}
         </div>
         <p className="truncate font-mono text-xs text-neutral-500">

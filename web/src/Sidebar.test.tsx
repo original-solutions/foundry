@@ -77,9 +77,11 @@ describe("Sidebar", () => {
     expect(within(group).getByRole("link", { name: /Running/ }).getAttribute("href")).toBe("/terminals/sh1");
     expect(within(group).getByRole("link", { name: /Exited 1/ }).getAttribute("href")).toBe("/terminals/sh2");
     expect(within(group).getAllByRole("link", { name: /Unreachable/ })).toHaveLength(2);
-    for (const name of ["New session", "New shell", "Archive"]) {
+    for (const name of ["New session", "New shell"]) {
       expect(within(group).getByRole("button", { name })).toBeDefined();
     }
+    // Archiving is offered once the UI knows the workspace is on its own machine.
+    expect(await within(group).findByRole("button", { name: "Archive" })).toBeDefined();
     // The layout asks for the model and lands in the session once it starts.
     fireEvent.click(within(group).getByRole("button", { name: "New session" }));
     expect(onNewSession).toHaveBeenCalledWith("w1", "fix login");
