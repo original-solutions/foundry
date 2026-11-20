@@ -920,7 +920,10 @@ fn a_waiting_for_you_item_is_listed_within_5_seconds_of_the_hook() {
     )
     .unwrap();
     let agent = Path::new(env!("CARGO_BIN_EXE_foundryd")).with_file_name("foundry-fake-agent");
-    assert!(agent.exists(), "run `cargo test --workspace` to build the fake agent");
+    assert!(
+        agent.exists(),
+        "run `cargo test --workspace` to build the fake agent"
+    );
     let claude = bin.join("claude");
     fs::write(
         &claude,
@@ -955,7 +958,10 @@ fn a_waiting_for_you_item_is_listed_within_5_seconds_of_the_hook() {
     let took = started.elapsed();
     assert!(took < Duration::from_secs(5), "listed after {took:?}");
     assert_eq!(item["id"], format!("session_waiting:{session}"));
-    assert!(item["what"].as_str().unwrap().contains("waiting for you"), "{item}");
+    assert!(
+        item["what"].as_str().unwrap().contains("waiting for you"),
+        "{item}"
+    );
 }
 
 #[test]

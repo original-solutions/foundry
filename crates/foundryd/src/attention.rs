@@ -179,11 +179,9 @@ pub fn fleet_items(fleet: &Fleet) -> Vec<Item> {
             .map_or_else(|| "a workspace".to_owned(), |w| w.body.name.clone())
     };
     let closed = |id| terminals.get(&id).is_some_and(|(deleted, _)| *deleted);
-    let exit = |id| {
-        match terminals.get(&id).and_then(|(_, t)| t.exit_code) {
-            Some(code) => format!(" (exit code {code})"),
-            None => String::new(),
-        }
+    let exit = |id| match terminals.get(&id).and_then(|(_, t)| t.exit_code) {
+        Some(code) => format!(" (exit code {code})"),
+        None => String::new(),
     };
 
     for record in &fleet.records {
@@ -591,7 +589,10 @@ mod tests {
         }
 
         fn of(&self, kind: Kind) -> Vec<Item> {
-            self.items().into_iter().filter(|i| i.kind == kind).collect()
+            self.items()
+                .into_iter()
+                .filter(|i| i.kind == kind)
+                .collect()
         }
     }
 
@@ -662,7 +663,10 @@ mod tests {
         assert_eq!(item.id, format!("session_waiting:{}", session.id));
         assert_eq!(item.machine_name, "this-mac");
         assert_eq!(item.terminal, Some(session.terminal));
-        assert_eq!(item.what, "A session in fix login on this-mac is waiting for you");
+        assert_eq!(
+            item.what,
+            "A session in fix login on this-mac is waiting for you"
+        );
     }
 
     #[test]
@@ -680,12 +684,22 @@ mod tests {
         let mut world = World::new();
         let peer = world.peer;
         let session = world.session(peer, SessionState::Failed);
-        world.terminal(peer, session.terminal, session.workspace, Some(Some(2)), false);
+        world.terminal(
+            peer,
+            session.terminal,
+            session.workspace,
+            Some(Some(2)),
+            false,
+        );
         let items = world.of(Kind::SessionFailed);
         assert_eq!(items.len(), 1, "{items:?}");
         assert_eq!(items[0].id, format!("session_failed:{}", session.id));
         assert_eq!(items[0].terminal, Some(session.terminal));
-        assert!(items[0].what.ends_with("failed (exit code 2)"), "{}", items[0].what);
+        assert!(
+            items[0].what.ends_with("failed (exit code 2)"),
+            "{}",
+            items[0].what
+        );
     }
 
     #[test]
@@ -694,7 +708,13 @@ mod tests {
         let peer = world.peer;
         let session = world.session(peer, SessionState::Failed);
         assert_eq!(world.of(Kind::SessionFailed).len(), 1);
-        world.terminal(peer, session.terminal, session.workspace, Some(Some(2)), true);
+        world.terminal(
+            peer,
+            session.terminal,
+            session.workspace,
+            Some(Some(2)),
+            true,
+        );
         assert!(world.of(Kind::SessionFailed).is_empty());
     }
 
@@ -845,7 +865,10 @@ mod tests {
         assert_eq!(item.machine, world.peer);
         assert!(item.what.contains("the project foundry"), "{}", item.what);
         let text = serde_json::to_string(item).unwrap();
-        assert!(!text.contains("hunter2") && !text.contains("github.com"), "{text}");
+        assert!(
+            !text.contains("hunter2") && !text.contains("github.com"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -964,7 +987,10 @@ mod tests {
                 .unwrap();
             let response = String::from_utf8(response).unwrap();
             let (head, body) = response.split_once("\r\n\r\n").unwrap();
-            (head.split(' ').nth(1).unwrap().parse().unwrap(), body.to_owned())
+            (
+                head.split(' ').nth(1).unwrap().parse().unwrap(),
+                body.to_owned(),
+            )
         }
 
         fn overwritten(&self) -> BTreeMap<SettingKey, Overwritten> {
@@ -1015,12 +1041,18 @@ mod tests {
         let served = Served::new(with_overwritten).await;
         let key = served.overwritten().into_keys().next().unwrap();
         let (status, body) = served
-            .call("POST", &format!("/api/attention/setting_overwritten:{key}/dismiss"))
+            .call(
+                "POST",
+                &format!("/api/attention/setting_overwritten:{key}/dismiss"),
+            )
             .await;
         assert_eq!(status, 204, "{body}");
         assert!(served.overwritten().is_empty());
         let items = served.attention.items().await.unwrap();
-        assert!(items.iter().all(|i| i.kind != Kind::SettingOverwritten), "{items:?}");
+        assert!(
+            items.iter().all(|i| i.kind != Kind::SettingOverwritten),
+            "{items:?}"
+        );
     }
 
     #[tokio::test]
@@ -1084,7 +1116,10 @@ mod tests {
         }
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while !served.peers.online().contains(&peer) {
-            assert!(tokio::time::Instant::now() < deadline, "the peer was not heard");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the peer was not heard"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         drop(theirs);
@@ -1092,7 +1127,10 @@ mod tests {
 
         let key = served.overwritten().into_keys().next().unwrap();
         let (status, body) = served
-            .call("POST", &format!("/api/attention/setting_overwritten:{key}/dismiss"))
+            .call(
+                "POST",
+                &format!("/api/attention/setting_overwritten:{key}/dismiss"),
+            )
             .await;
         assert_eq!(status, 503, "{body}");
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();

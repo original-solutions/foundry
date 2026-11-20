@@ -409,8 +409,16 @@ mod tests {
         let url = gateway(serde_json::json!([cooling(600), cooling(90)])).await;
         let items = machine.items(Some(url)).await;
         let item = one(&items);
-        assert!(item.what.contains("cooling down (2 of them)"), "{}", item.what);
-        assert!(item.what.contains("free again in 2 minutes"), "{}", item.what);
+        assert!(
+            item.what.contains("cooling down (2 of them)"),
+            "{}",
+            item.what
+        );
+        assert!(
+            item.what.contains("free again in 2 minutes"),
+            "{}",
+            item.what
+        );
     }
 
     #[tokio::test]
