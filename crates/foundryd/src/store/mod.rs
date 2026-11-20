@@ -18,8 +18,23 @@ use rusqlite::{Connection, OptionalExtension, params};
 mod tests;
 
 /// The schema, one step per entry. A file's `user_version` counts the steps it has had, so
-/// a step once released is never edited: a change is a new step at the end. What a build
-/// does with a file a newer build migrated belongs to rollback (task 18).
+/// a step once released is never edited: a change is a new step at the end.
+///
+/// A rollback, or going back by hand with `install`, runs the previous build on the file a
+/// newer build migrated. That build skips the steps it does not know and keeps working, so
+/// a step may only add tables, non-unique indexes or nullable columns. It must never drop,
+/// rename or change the meaning of an existing table or column, and nothing it adds may
+/// refuse a write the previous build makes: the previous build still reads and writes them.
+/// Rows a newer build stored that the previous build cannot parse are another matter: see
+/// [`Store::since`].
+///
+/// The newer build comes back to the same file, and its step does not run again. Meanwhile
+/// the previous build inserted rows with nothing in the added columns, updated rows without
+/// touching them, and stored nothing in the added tables. So the newer build treats an added
+/// column as empty or out of date and rebuilds it from the columns the previous build
+/// writes, and never counts on a step having filled in existing rows. The test
+/// `every_later_migration_step_only_adds` checks the add-only part for each step after the
+/// first.
 const MIGRATIONS: &[&str] = &[
     // 1: records keyed by kind and id, the owner's own version counter, shared settings.
     "CREATE TABLE records (
