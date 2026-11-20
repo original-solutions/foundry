@@ -4,11 +4,11 @@
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
-use std::fs::{File, OpenOptions};
+use std::fs::{DirBuilder, File, OpenOptions};
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
@@ -120,7 +120,7 @@ pub fn run() -> ExitCode {
 fn start() -> Result<(), DaemonError> {
     let home = home().ok_or(DaemonError::NoHome)?;
     let port = port().map_err(DaemonError::Port)?;
-    std::fs::create_dir_all(&home).map_err(io_error(format!("cannot make {}", home.display())))?;
+    make_home(&home)?;
     // Held until this function returns.
     let _lock = lock(&home)?;
     let _ = tracing_subscriber::fmt()
@@ -133,6 +133,15 @@ fn start() -> Result<(), DaemonError> {
     let result = runtime.block_on(serve(home, port));
     runtime.shutdown_timeout(EXIT_WITHIN);
     result
+}
+
+/// Makes the data directory, readable only by this user, as the terminals' directory is.
+fn make_home(home: &Path) -> Result<(), DaemonError> {
+    DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(home)
+        .map_err(io_error(format!("cannot make {}", home.display())))
 }
 
 /// Takes an exclusive lock on `<home>/daemon.lock`, so two daemons never share a data
@@ -187,12 +196,12 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
     let (gateway, missing) = match gateway(std::env::var("FOUNDRY_GATEWAY_URL").ok(), key) {
         Ok(gateway) => (gateway, None),
         Err(missing) => {
-            tracing::warn!("{missing}");
+            tracing::warn!("{}", missing.log);
             let placeholder = Gateway {
                 base_url: String::new(),
                 key: String::new(),
             };
-            (placeholder, Some(missing))
+            (placeholder, Some(missing.said))
         }
     };
     let claude_json = sessions::claude::claude_json(
@@ -218,29 +227,34 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
     let api = Api::new(
         store.clone(),
         peers.clone(),
-        terminals,
-        workspaces,
+        terminals.clone(),
+        workspaces.clone(),
         sessions.clone(),
         host_names(),
     );
     let mut app = api::router(api)
         .merge(sessions.router())
-        .merge(ws::keyed_router(peers.clone(), keys));
+        .merge(ws::keyed_router(peers.clone(), keys.clone()));
     if let Some(missing) = missing {
         app = refuse_sessions(app, missing);
     }
 
-    let listeners = listen(port).await?;
+    let loopback = api::bind(SocketAddr::from(([127, 0, 0, 1], port))).await?;
+    tracing::info!("listening on {}", SocketAddr::from(([127, 0, 0, 1], port)));
+    let mut tailscale = Tailscale::new(port, app.clone());
+    tailscale.scan(true).await;
     let mut services: JoinSet<&'static str> = JoinSet::new();
     // services
     services.spawn(named(
         "machine sampling",
         machine::run(store.clone(), me, home.clone()),
     ));
-    services.spawn(named("peer sync", async move { peers.run().await }));
-    for listener in listeners {
-        services.spawn(named("the API server", serve_on(listener, app.clone())));
-    }
+    services.spawn(named("peer sync", {
+        let peers = peers.clone();
+        async move { peers.run().await }
+    }));
+    services.spawn(named("the API server", serve_on(loopback, app.clone())));
+    services.spawn(named("the Tailscale address watch", tailscale.watch()));
 
     tokio::select! {
         _ = terminate.recv() => tracing::info!("SIGTERM: stopping; terminals keep running"),
@@ -265,37 +279,55 @@ async fn named(name: &'static str, service: impl Future<Output = ()>) -> &'stati
     name
 }
 
+/// Why there is no gateway: what is missing, said two ways.
+#[derive(Debug)]
+struct Missing {
+    /// Plain words for a client that asked to start a session. It names the secret but holds
+    /// nothing from the secret store's error, which can name a path.
+    said: String,
+    /// The full reason, for the daemon's log.
+    log: String,
+}
+
 /// What `FOUNDRY_GATEWAY_URL` and the `gateway` secret make: the gateway sessions use, or why
-/// there is none. The reason names what is missing and never holds the key.
+/// there is none. Neither text holds the key.
 fn gateway(
     url: Option<String>,
     key: Result<Option<String>, SecretsError>,
-) -> Result<Gateway, String> {
+) -> Result<Gateway, Missing> {
     let url = url.filter(|url| !url.is_empty());
-    let (key, key_problem) = match key {
+    let (key, key_said, key_log) = match key {
         Ok(key) => match key.filter(|key| !key.is_empty()) {
-            Some(key) => (Some(key), None),
-            None => (
-                None,
-                Some(format!(
+            Some(key) => (Some(key), String::new(), String::new()),
+            None => {
+                let text = format!(
                     "the secret {GATEWAY} is not set (run `foundryd secret set {GATEWAY}`)"
-                )),
-            ),
+                );
+                (None, text.clone(), text)
+            }
         },
         Err(error) => (
             None,
-            Some(format!("the secret {GATEWAY} cannot be read: {error}")),
+            format!("the secret {GATEWAY} could not be read; see the daemon log"),
+            format!("the secret {GATEWAY} cannot be read: {error}"),
         ),
     };
     match (url, key) {
         (Some(base_url), Some(key)) => Ok(Gateway { base_url, key }),
-        (url, _) => {
-            let mut missing = Vec::new();
+        (url, key) => {
+            let (mut said, mut log) = (Vec::new(), Vec::new());
             if url.is_none() {
-                missing.push("FOUNDRY_GATEWAY_URL is not set".to_owned());
+                said.push("FOUNDRY_GATEWAY_URL is not set".to_owned());
+                log.push("FOUNDRY_GATEWAY_URL is not set".to_owned());
             }
-            missing.extend(key_problem);
-            Err(format!("sessions cannot start: {}", missing.join("; ")))
+            if key.is_none() {
+                said.push(key_said);
+                log.push(key_log);
+            }
+            Err(Missing {
+                said: format!("sessions cannot start: {}", said.join("; ")),
+                log: format!("sessions cannot start: {}", log.join("; ")),
+            })
         }
     }
 }
@@ -349,28 +381,99 @@ fn listen_on(port: u16, found: impl IntoIterator<Item = IpAddr>) -> Vec<SocketAd
     addrs
 }
 
-/// Binds loopback and every Tailscale address on this machine's interfaces. Loopback failing
-/// is an error; a Tailscale address failing is logged and left out.
-async fn listen(port: u16) -> Result<Vec<tokio::net::TcpListener>, DaemonError> {
-    let found: BTreeSet<IpAddr> = match sysinfo::Networks::new_with_refreshed_list() {
+/// The addresses of this machine's interfaces.
+fn interface_addresses() -> BTreeSet<IpAddr> {
+    match sysinfo::Networks::new_with_refreshed_list() {
         Ok(networks) => networks
             .values()
             .flat_map(|network| network.ip_networks().iter().map(|ip| ip.addr))
             .collect(),
         Err(error) => {
-            tracing::warn!("cannot list this machine's addresses, so loopback only: {error}");
+            tracing::warn!("cannot list this machine's addresses: {error}");
             BTreeSet::new()
         }
-    };
-    let mut listeners = Vec::new();
-    for (i, addr) in listen_on(port, found).into_iter().enumerate() {
-        match api::bind(addr).await {
-            Ok(listener) => listeners.push(listener),
-            Err(error) if i == 0 => return Err(error.into()),
-            Err(error) => tracing::warn!("{error}"),
+    }
+}
+
+/// The addresses in `found` to listen on that are not in `served` yet, by [`listen_on`]'s rule.
+fn new_addresses(
+    port: u16,
+    found: impl IntoIterator<Item = IpAddr>,
+    served: &BTreeSet<SocketAddr>,
+) -> Vec<SocketAddr> {
+    listen_on(port, found)
+        .into_iter()
+        .filter(|addr| !served.contains(addr))
+        .collect()
+}
+
+/// How often the machine's interfaces are looked at for a Tailscale address that has come up.
+const RESCAN: Duration = Duration::from_secs(5);
+
+/// Serves the app on every Tailscale address this machine has, now and as they appear: the
+/// daemon can start before Tailscale does.
+struct Tailscale {
+    port: u16,
+    app: Router,
+    /// The addresses being served.
+    served: BTreeSet<SocketAddr>,
+    /// The addresses that failed to bind, so each is warned about once.
+    failed: BTreeSet<SocketAddr>,
+    servers: JoinSet<SocketAddr>,
+}
+
+impl Tailscale {
+    fn new(port: u16, app: Router) -> Self {
+        Self {
+            port,
+            app,
+            served: [SocketAddr::from(([127, 0, 0, 1], port))].into(),
+            failed: BTreeSet::new(),
+            servers: JoinSet::new(),
         }
     }
-    Ok(listeners)
+
+    /// Binds each Tailscale address not served yet. A server that ended is served again.
+    /// `first` says this is the start, when having none is worth a warning.
+    async fn scan(&mut self, first: bool) {
+        while let Some(ended) = self.servers.try_join_next() {
+            if let Ok(addr) = ended {
+                self.served.remove(&addr);
+            }
+        }
+        for addr in new_addresses(self.port, interface_addresses(), &self.served) {
+            match api::bind(addr).await {
+                Ok(listener) => {
+                    tracing::info!("listening on {addr}");
+                    self.served.insert(addr);
+                    self.failed.remove(&addr);
+                    let app = self.app.clone();
+                    self.servers.spawn(async move {
+                        serve_on(listener, app).await;
+                        addr
+                    });
+                }
+                Err(error) => {
+                    if self.failed.insert(addr) {
+                        tracing::warn!("{error}");
+                    }
+                }
+            }
+        }
+        if first && self.served.len() == 1 {
+            tracing::warn!(
+                "no Tailscale address is bound yet, so peers cannot reach this machine until one appears"
+            );
+        }
+    }
+
+    /// Looks again every [`RESCAN`], for ever.
+    async fn watch(mut self) {
+        loop {
+            tokio::time::sleep(RESCAN).await;
+            self.scan(false).await;
+        }
+    }
 }
 
 /// Serves `app` on `listener` until the server fails.

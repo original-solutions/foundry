@@ -81,18 +81,31 @@ pub fn for_this_machine(home: &Path) -> Arc<dyn Secrets> {
     store_for(home, std::env::var_os("FOUNDRY_SECRETS").as_deref())
 }
 
+/// Which secret store a machine uses.
+#[derive(Debug, PartialEq, Eq)]
+enum Store {
+    File,
+    Keychain,
+}
+
+/// The store for a `FOUNDRY_SECRETS` value: the file for exactly `file`, else this OS's
+/// default, the keychain on macOS and the file elsewhere.
+fn choose(choice: Option<&OsStr>) -> Store {
+    if choice == Some(OsStr::new("file")) || !cfg!(target_os = "macos") {
+        Store::File
+    } else {
+        Store::Keychain
+    }
+}
+
 /// [`for_this_machine`] given the value of `FOUNDRY_SECRETS`.
 fn store_for(home: &Path, choice: Option<&OsStr>) -> Arc<dyn Secrets> {
-    if choice == Some(OsStr::new("file")) {
-        return Arc::new(FileSecrets::new(home.join("secrets.json")));
-    }
-    #[cfg(target_os = "macos")]
-    {
-        Arc::new(Keychain::new("foundry", home.join("secrets.lock")))
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        Arc::new(FileSecrets::new(home.join("secrets.json")))
+    match choose(choice) {
+        Store::File => Arc::new(FileSecrets::new(home.join("secrets.json"))),
+        #[cfg(target_os = "macos")]
+        Store::Keychain => Arc::new(Keychain::new("foundry", home.join("secrets.lock"))),
+        #[cfg(not(target_os = "macos"))]
+        Store::Keychain => unreachable!("only macOS chooses the keychain"),
     }
 }
 

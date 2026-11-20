@@ -67,7 +67,9 @@ fn fetch(port: u16) -> Result<UiMessage, String> {
 }
 
 /// Every machine and its sessions as plain text: machines in the settings' order, then any
-/// other machine that has a sample, by id.
+/// other machine that has a sample, by id. `/api/state` carries no online set, so a machine's
+/// state is shown only where its records prove it: `offline` when one is marked unreachable,
+/// `online` when one is not, `unknown` when it has none.
 pub fn render(records: &[AnyRecord], settings: &SharedSettings) -> String {
     let mut machines: Vec<MachineId> = settings.machines.iter().map(|m| m.id).collect();
     let listed: BTreeSet<MachineId> = machines.iter().copied().collect();
@@ -96,12 +98,26 @@ pub fn render(records: &[AnyRecord], settings: &SharedSettings) -> String {
 
 /// The machine's line, then a line for each of its sessions that is not deleted.
 fn machine_lines(out: &mut String, name: &str, id: MachineId, records: &[AnyRecord]) {
-    let offline = records.iter().any(|record| match record {
-        AnyRecord::Session(r) => r.owner == id && r.body.state == SessionState::Unreachable,
-        AnyRecord::Terminal(r) => r.owner == id && r.body.state == TerminalState::Unreachable,
-        _ => false,
-    });
-    let state = if offline { "offline" } else { "online" };
+    // Whether each of the machine's sessions and terminals is unreachable.
+    let reachability: Vec<bool> = records
+        .iter()
+        .filter_map(|record| match record {
+            AnyRecord::Session(r) if r.owner == id => {
+                Some(r.body.state == SessionState::Unreachable)
+            }
+            AnyRecord::Terminal(r) if r.owner == id => {
+                Some(r.body.state == TerminalState::Unreachable)
+            }
+            _ => None,
+        })
+        .collect();
+    let state = if reachability.contains(&true) {
+        "offline"
+    } else if reachability.is_empty() {
+        "unknown"
+    } else {
+        "online"
+    };
     let newest: Option<&Record<MachineSample>> = records
         .iter()
         .filter_map(|record| match record {
