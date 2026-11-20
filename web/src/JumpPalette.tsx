@@ -157,7 +157,7 @@ function Panel({
             aria-selected={i === at}
             onMouseMove={() => i !== at && setActive(i)}
             onClick={(event) => go(d, event.shiftKey)}
-            className={`flex cursor-pointer items-center gap-3 rounded-lg px-3 py-2.5 sm:py-2 ${i === at ? "bg-neutral-800 text-white" : "text-neutral-200"}`}
+            className={`flex cursor-pointer items-center gap-3 rounded-lg px-3 py-2.5 sm:py-2 ${i === at ? "bg-neutral-800 text-neutral-50" : "text-neutral-200"}`}
           >
             {d.kind === "terminal" ? (
               <span className="flex w-4 justify-center">

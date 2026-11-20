@@ -223,7 +223,7 @@ function Form({ projects, workspaces, initialName, create, step, onSubmit }: For
           <button
             type="submit"
             disabled={projects.length === 0 || create.isPending || Boolean(taken)}
-            className="rounded bg-emerald-500 px-3 py-1 text-xs font-semibold text-neutral-950 hover:bg-emerald-400 disabled:opacity-40"
+            className="rounded bg-emerald-400 px-3 py-1 text-xs font-semibold text-neutral-950 hover:bg-emerald-300 disabled:opacity-40"
           >
             Create and open
           </button>

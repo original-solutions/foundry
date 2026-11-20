@@ -80,7 +80,7 @@ export function KeyBar({
           aria-label="Send"
           disabled={!draft}
           onPointerDown={(e) => e.preventDefault()}
-          className="grid size-10 shrink-0 place-items-center rounded-full bg-sky-500 text-neutral-950 transition-colors disabled:bg-neutral-800 disabled:text-neutral-500"
+          className="grid size-10 shrink-0 place-items-center rounded-full bg-sky-400 text-neutral-950 transition-colors disabled:bg-neutral-800 disabled:text-neutral-500"
         >
           <svg viewBox="0 0 16 16" className="size-4" aria-hidden="true">
             <path d="M8 13V3M3.5 7.5 8 3l4.5 4.5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />

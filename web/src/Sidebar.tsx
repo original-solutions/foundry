@@ -9,6 +9,7 @@ import { startShell } from "./api";
 import { loadFolded, saveFolded } from "./fold";
 import { byUrgency, machineNumbers, machineStats, rows, type MachineView, type Row, type WorkspaceView } from "./fleet";
 import { glyphText, StateGlyph } from "./StateGlyph";
+import { ThemeButton } from "./ThemeButton";
 import type { MachineSample } from "./api";
 
 const statusColour = { online: "text-emerald-400", offline: "text-red-400", unknown: "text-neutral-400" };
@@ -56,6 +57,7 @@ export function Sidebar({ machines, onCreate, selected, connected, onNavigate, o
       <div className="flex items-center justify-between gap-2">
         <h1 className="text-lg font-semibold">Foundry</h1>
         <div className="flex items-center gap-2">
+          <ThemeButton />
           {alerts}
           {onJump && (
             <button type="button" aria-label="Jump to" title={`Jump to (${jumpKey})`} onClick={onJump} className="rounded p-1 text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200">

@@ -18,5 +18,7 @@ export default defineConfig({
     include: ["src/**/*.test.{ts,tsx}"],
     environment: "jsdom",
     setupFiles: ["./src/test-setup.ts"],
+    // theme.test.tsx reads these two as text, to check the light palette against Tailwind's.
+    css: { include: [/src\/index\.css/, /tailwindcss\/theme\.css/] },
   },
 });
