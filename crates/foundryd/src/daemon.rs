@@ -35,7 +35,7 @@ use crate::sync::Peers;
 use crate::sync::ws::{self, WsDialer};
 use crate::terminals::{TerminalError, Terminals};
 use crate::update;
-use crate::workspaces::Workspaces;
+use crate::workspaces::{WorkspaceError, Workspaces};
 
 /// How long the runtime waits for tasks that will not stop once the daemon has decided to
 /// exit, so one stuck task cannot hang the exit.
@@ -65,6 +65,8 @@ pub(crate) enum DaemonError {
     Keys(#[from] JoinError),
     #[error(transparent)]
     Terminals(#[from] TerminalError),
+    #[error(transparent)]
+    Workspaces(#[from] WorkspaceError),
     #[error(transparent)]
     Bind(#[from] BindError),
     #[error("a step run apart did not finish: {0}")]
@@ -215,6 +217,7 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
     let terminals = Arc::new(Terminals::new(me, store.clone(), &home, holder));
     terminals.reattach_all().await?;
     let workspaces = Arc::new(Workspaces::new(me, store.clone(), &home, terminals.clone()));
+    workspaces.sweep().await?;
 
     let (gateway, missing) = match gateway(std::env::var("FOUNDRY_GATEWAY_URL").ok(), key) {
         Ok(gateway) => (gateway, None),
