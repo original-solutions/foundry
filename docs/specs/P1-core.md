@@ -162,7 +162,7 @@ This is a rule for every piece, not only P1: nothing runs without the UI showing
 3. It runs the setup commands in a terminal inside the workspace. A failed setup stays visible there and raises an attention item. The workspace is still usable, so the failure can be fixed by hand.
 4. The workspace opens with one agent session. Shells and more sessions can be added.
 
-A session can be started with a first prompt (`POST /api/workspaces/{id}/sessions` takes `prompt` beside `model`): it is Claude Code's last argument, after `--`, so the agent starts on it at once and its hooks report it as any typed prompt. A blank prompt is none; one with a NUL or over 20,000 characters is refused. The new-workspace and new-session dialogs offer it as an optional box.
+A session can be started with a first prompt (`POST /api/workspaces/{id}/sessions` takes `prompt` beside `model`): it is Claude Code's last argument, after `--`, so the agent starts on it at once and its hooks report it as any typed prompt. A blank prompt is none; one with a NUL or over 20,000 characters is refused. The new-session dialog offers it as an optional box; a new workspace is made from the task box below, whose task is its first prompt.
 
 Branch names are `<name>` as typed, made safe for git. Worktrees live under the data directory at `worktrees/<project>/<branch>`.
 
@@ -186,6 +186,8 @@ A P3 PR view, small. `GET /api/workspaces/{id}/pr` says where a workspace of thi
 A P3 overview on the same read. With no terminal open, the UI shows every workspace as a card in three lanes by its most urgent terminal: needs you (waiting, stuck or failed), working (working or starting) and quiet. A card lists its terminals with their states and what the workspace changed since its base. A card reads the changes only while it is on screen: when it comes on screen, when one of its terminals changes state, and every half minute while an agent in it works. A quiet card is not read on a timer, so a fleet of dozens of workspaces does not keep git running. A workspace whose changes cannot be read from this machine says so.
 
 Above the lanes, one line takes the next task, beside the way to jump. Once used it opens into the first run's composer: the task names the workspace (numbered when its project already has that branch; a typed name the project has is refused), Start makes it on this machine and lands in its session already at work.
+
+That task box is the one way a workspace is made. The sidebar's New task button opens it over any screen, and the jump palette offers what was typed as a new task in it. With no task written, a typed workspace name makes the workspace with its session idle.
 
 On a phone the board is the home too. A line above the task box says how many workspaces need you (or that nothing does), then how many work and rest. A bar at the bottom switches between board, timeline and machines, marks the board with the count that needs you, and opens the workspaces as a drawer; the drawer's title leads back to the board from a terminal.
 

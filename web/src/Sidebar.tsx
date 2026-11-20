@@ -10,6 +10,7 @@ import { byUrgency, machineNumbers, machineStats, rows, type MachineView, type R
 import { glyphText, StateGlyph } from "./StateGlyph";
 import { ended } from "./ends";
 import { ARCHIVE_ICON, TerminalMenu, useTerminalActions } from "./TerminalMenu";
+import { SparkIcon } from "./FirstPrompt";
 import { Mark } from "./Mark";
 import { ThemeButton } from "./ThemeButton";
 import type { MachineSample } from "./api";
@@ -22,7 +23,7 @@ const STRIP = 6;
 
 interface Props {
   machines: MachineView[];
-  /** Opens the new-workspace dialog. */
+  /** Opens the New task dialog. */
   onCreate: () => void;
   /** The terminal open in the main pane. */
   selected?: string;
@@ -70,8 +71,9 @@ export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJ
               <SearchIcon className="size-4" />
             </button>
           )}
-          <button type="button" onClick={onCreate} className={`${button} whitespace-nowrap`}>
-            New workspace
+          <button type="button" onClick={onCreate} className={`${button} flex items-center gap-1 whitespace-nowrap`}>
+            <SparkIcon className="size-3 text-emerald-400" />
+            New task
           </button>
           {onClose && (
             <button type="button" aria-label="Close workspaces" onClick={onClose} className="rounded p-1 text-neutral-300 hover:bg-neutral-800 md:hidden">

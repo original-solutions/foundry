@@ -1,6 +1,5 @@
 import type { Project } from "./api";
-import { Composer } from "./Composer";
-import type { Launch } from "./CreateWorkspace";
+import { Composer, type Launch } from "./Composer";
 import type { WorkspaceView } from "./fleet";
 import type { Glyph } from "./labels";
 import { Mark } from "./Mark";
@@ -25,7 +24,6 @@ export function Launchpad({
   workspaces,
   launch,
   onCreated,
-  onMore,
   onMenu,
 }: {
   projects: Project[];
@@ -34,8 +32,6 @@ export function Launchpad({
   launch: Launch;
   /** Called with the new session's id once it has started, so the layout can open it. */
   onCreated: (session: string) => void;
-  /** Opens the full new-workspace dialog with this name. */
-  onMore: (name: string) => void;
   /** Shows the sidebar, on a screen too narrow to keep it beside. */
   onMenu: () => void;
 }) {
@@ -65,7 +61,7 @@ export function Launchpad({
           </p>
         </div>
 
-        <Composer mode="page" id="launch-task" projects={projects} workspaces={workspaces} launch={launch} onCreated={onCreated} onMore={onMore} doneLabel="Go to the board" />
+        <Composer mode="page" id="launch-task" projects={projects} workspaces={workspaces} launch={launch} onCreated={(session) => onCreated(session)} doneLabel="Go to the board" />
 
         <ul aria-label="What you will see" className="grid gap-px overflow-hidden rounded-xl border border-neutral-800 bg-neutral-800 sm:grid-cols-3">
           {states.map((s) => (

@@ -60,7 +60,7 @@ describe("briefs in the palette", () => {
 
 describe("newWorkspace", () => {
   it("names a new workspace with what was typed, and offers none for nothing", () => {
-    expect(newWorkspace("  add   search ")).toEqual([expect.objectContaining({ kind: "workspace", name: "add search", title: "New workspace “add search”" })]);
+    expect(newWorkspace("  add   search ")).toEqual([expect.objectContaining({ kind: "workspace", name: "add search", title: "New task “add search”" })]);
     expect(newWorkspace("   ")).toEqual([]);
   });
 });

@@ -160,7 +160,7 @@ describe("App", () => {
 
     expect(screen.getByRole("heading", { name: "Can't reach the daemon" })).toBeDefined();
     expect(screen.queryByText(/0 workspaces/)).toBeNull();
-    expect(screen.queryByRole("button", { name: "New workspace" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "New task" })).toBeNull();
   });
 
   it("greys the last state it was sent and says the daemon was lost, until it sends again", async () => {
@@ -282,7 +282,7 @@ describe("App", () => {
     expect(within(dialog).getAllByRole("option").map((o) => o.textContent)).toEqual([
       expect.stringContaining("fix login / shell"),
       expect.stringContaining("New shell in fix login"),
-      expect.stringContaining("New workspace “login shell”"),
+      expect.stringContaining("New task “login shell”"),
     ]);
     expect(within(dialog).getAllByRole("option")[0].getAttribute("aria-selected")).toBe("true");
     fireEvent.keyDown(input, { key: "Enter" });
@@ -401,10 +401,10 @@ describe("App", () => {
     const calls = mockActions(json(201, { id: "w9" }), json(201, { id: "s9" }));
     const router = await open("/", live);
 
-    fireEvent.click(screen.getByRole("button", { name: "New workspace" }));
-    const dialog = await screen.findByRole("dialog", { name: "New workspace" });
-    fireEvent.change(within(dialog).getByLabelText("Name"), { target: { value: "add search" } });
-    fireEvent.click(within(dialog).getByRole("button", { name: "Create and open" }));
+    fireEvent.click(screen.getByRole("button", { name: "New task" }));
+    const dialog = await screen.findByRole("dialog", { name: "New task" });
+    fireEvent.change(within(dialog).getByLabelText("What should Claude work on?"), { target: { value: "Add search." } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Start" }));
     await waitFor(() => expect(calls).toHaveLength(2));
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
     expect(router.state.location.pathname).toBe("/");
@@ -452,18 +452,18 @@ describe("App", () => {
     expect(screen.queryByText(/0 workspaces/)).toBeNull();
   });
 
-  it("offers a new workspace named from what you typed in the palette", async () => {
+  it("offers a new task of what you typed in the palette", async () => {
     await open("/", live);
     fireEvent.keyDown(window, { key: "k", metaKey: true });
     const palette = await screen.findByRole("dialog", { name: "Jump to" });
     const input = within(palette).getByRole("combobox");
     fireEvent.change(input, { target: { value: "zzz nothing" } });
 
-    expect(within(palette).getAllByRole("option").map((o) => o.textContent)).toEqual([expect.stringContaining("New workspace “zzz nothing”")]);
+    expect(within(palette).getAllByRole("option").map((o) => o.textContent)).toEqual([expect.stringContaining("New task “zzz nothing”")]);
     fireEvent.keyDown(input, { key: "Enter" });
 
-    const dialog = await screen.findByRole("dialog", { name: "New workspace" });
-    expect((within(dialog).getByLabelText("Name") as HTMLInputElement).value).toBe("zzz nothing");
+    const dialog = await screen.findByRole("dialog", { name: "New task" });
+    expect((within(dialog).getByLabelText("What should Claude work on?") as HTMLTextAreaElement).value).toBe("zzz nothing");
     expect(screen.queryByRole("dialog", { name: "Jump to" })).toBeNull();
   });
 

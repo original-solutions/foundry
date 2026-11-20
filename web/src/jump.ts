@@ -34,8 +34,8 @@ export function search(all: Destination[], query: string): Destination[] {
   });
 }
 
-/** A new workspace named with what was typed, or none when nothing was. */
+/** A new task of what was typed (its workspace named from it), or none when nothing was. */
 export function newWorkspace(query: string): Destination[] {
   const name = query.trim().replace(/\s+/g, " ");
-  return name ? [{ kind: "workspace", key: "new-workspace", name, title: `New workspace “${name}”`, machine: "", words: "" }] : [];
+  return name ? [{ kind: "workspace", key: "new-workspace", name, title: `New task “${name}”`, machine: "", words: "" }] : [];
 }

@@ -110,11 +110,11 @@ describe("Sidebar", () => {
     expect(screen.getByRole("link", { name: /Running/ }).getAttribute("aria-current")).toBeNull();
   });
 
-  it("offers a new workspace", async () => {
+  it("offers a new task", async () => {
     const onCreate = vi.fn();
     await renderApp(<Sidebar machines={[]} {...props} onCreate={onCreate} />);
 
-    fireEvent.click(screen.getByRole("button", { name: "New workspace" }));
+    fireEvent.click(screen.getByRole("button", { name: "New task" }));
     expect(onCreate).toHaveBeenCalled();
   });
 

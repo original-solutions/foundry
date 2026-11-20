@@ -10,8 +10,7 @@ import { splitPath, totals } from "./changes";
 import type { MachineView } from "./fleet";
 import { jumpKey, SearchIcon } from "./JumpPalette";
 import type { Project } from "./api";
-import { Composer } from "./Composer";
-import { useCreateWorkspace } from "./CreateWorkspace";
+import { Composer, useCreateWorkspace } from "./Composer";
 import { plural, type Glyph } from "./labels";
 import { glyphText, StateGlyph } from "./StateGlyph";
 import { Named, Now } from "./Now";
@@ -82,7 +81,6 @@ export function Board({
   onChanges,
   onSteps,
   onCreated,
-  onMore,
   traced,
   onMenu,
 }: {
@@ -92,8 +90,6 @@ export function Board({
   onJump: () => void;
   /** Called with the session a new task started, so the layout lands in it. */
   onCreated: (session: string) => void;
-  /** Opens the full new-workspace dialog with this name. */
-  onMore: (name: string) => void;
   onChanges: (workspace: string) => void;
   /** Opens a terminal with its steps column. */
   onSteps: (terminal: string) => void;
@@ -127,7 +123,7 @@ export function Board({
               <StateGlyph glyph={needs ? "waiting" : "ready"} still />
               {glance(board)}
             </p>
-            <Composer mode="bar" id="board-task" projects={projects} workspaces={workspaces} launch={launch} onCreated={onCreated} onMore={onMore} onJump={onJump} doneLabel="Clear" />
+            <Composer mode="bar" id="board-task" projects={projects} workspaces={workspaces} launch={launch} onCreated={(session) => onCreated(session)} onJump={onJump} doneLabel="Clear" />
             <div className="hidden items-center gap-3 px-1 md:flex">
               <p className="min-w-0 flex-1 text-xs text-neutral-500">{counts}</p>
               <ViewSwitch view={view} onPick={pick} />

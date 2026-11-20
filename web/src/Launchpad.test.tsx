@@ -1,8 +1,7 @@
 import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import type { ComponentProps } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { useCreateWorkspace } from "./CreateWorkspace";
-import { taskName } from "./Composer";
+import { taskName, useCreateWorkspace } from "./Composer";
 import { Launchpad } from "./Launchpad";
 import { primaryButton } from "./Modal";
 import { settings } from "./test-fixtures";
@@ -15,7 +14,7 @@ const projects = [...settings().projects, { id: "p2", name: "other", repo: "/tmp
 /** The launchpad with the create the layout holds for it. */
 function Harness(props: Partial<ComponentProps<typeof Launchpad>>) {
   const launch = useCreateWorkspace();
-  return <Launchpad projects={projects} workspaces={[]} launch={launch} onCreated={() => {}} onMore={() => {}} onMenu={() => {}} {...props} />;
+  return <Launchpad projects={projects} workspaces={[]} launch={launch} onCreated={() => {}} onMenu={() => {}} {...props} />;
 }
 
 const promptBox = () => screen.getByLabelText("What should Claude work on?");
@@ -121,13 +120,11 @@ describe("Launchpad", () => {
     expect(start().disabled).toBe(true);
   });
 
-  it("opens the full dialog with the name it would use, and teaches the states a task shows", async () => {
-    const more = vi.fn();
-    await renderApp(<Harness onMore={more} />);
+  it("has every option on the page, with no second form behind it, and teaches the states a task shows", async () => {
+    await renderApp(<Harness />);
 
     fireEvent.change(promptBox(), { target: { value: "Fix the login redirect." } });
-    fireEvent.click(screen.getByRole("button", { name: "More options" }));
-    expect(more).toHaveBeenCalledWith("fix the login redirect");
+    expect(screen.queryByRole("button", { name: "More options" })).toBeNull();
 
     const states = screen.getByRole("list", { name: "What you will see" });
     expect(within(states).getAllByRole("listitem").map((i) => i.querySelector("[data-glyph]")?.getAttribute("data-glyph"))).toEqual(["working", "waiting", "ready"]);

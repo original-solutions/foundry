@@ -104,7 +104,6 @@ async function show(machines: MachineView[], onChanges = vi.fn(), props: Partial
         onChanges={onChanges}
         onSteps={() => {}}
         onCreated={() => {}}
-        onMore={() => {}}
         traced={new Set()}
         onMenu={() => {}}
         {...props}

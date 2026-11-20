@@ -1,11 +1,53 @@
+import { useMutation } from "@tanstack/react-query";
 import { useState } from "react";
-import type { Project } from "./api";
+import { ApiError, createWorkspace, startSession, type Project } from "./api";
 import { safeBranch, sameBranch } from "./branch";
-import { BranchIcon, type Launch } from "./CreateWorkspace";
 import { promptOf, sendKey, SparkIcon } from "./FirstPrompt";
 import type { WorkspaceView } from "./fleet";
 import { jumpKey, SearchIcon } from "./JumpPalette";
 import { inlineField, primaryButton } from "./Modal";
+
+/** The workspace was made, but its session did not start. */
+class SessionNotStarted extends ApiError {}
+
+/** What a new workspace is made from: its project, base and name, then its session's model and first prompt. */
+export interface CreateInput {
+  project: string;
+  base: string;
+  name: string;
+  model: string;
+  prompt?: string;
+}
+
+/**
+ * Makes a workspace, then starts a session in it, saying which `step` it is on. `made` is true
+ * once the workspace exists, even when its session then failed to start, since a second try
+ * would only find its name taken.
+ */
+export function useCreateWorkspace() {
+  const [step, setStep] = useState<"branch" | "session">("branch");
+  const create = useMutation({
+    mutationFn: async (input: CreateInput) => {
+      setStep("branch");
+      const workspace = await createWorkspace({ project: input.project, base: input.base, name: input.name });
+      setStep("session");
+      // The workspace is usable when its setup did not start, so its session is started all the same.
+      let session: string;
+      try {
+        session = await startSession(workspace.id, input.model, input.prompt);
+      } catch (error) {
+        const setup = workspace.error ? ` Also: ${workspace.error}` : "";
+        throw new SessionNotStarted(`The workspace was made, but its session did not start: ${error instanceof Error ? error.message : error}.${setup}`);
+      }
+      return { session, warning: workspace.error ?? null };
+    },
+  });
+  const made = create.isSuccess || create.error instanceof SessionNotStarted;
+  return { create, step, made };
+}
+
+/** A create in hand: the mutation, its step and whether the workspace exists yet. */
+export type Launch = ReturnType<typeof useCreateWorkspace>;
 
 /** A name made from a task takes this many words at most, and this many characters. */
 const NAME_WORDS = 5;
@@ -46,9 +88,9 @@ function freeName(name: string, project: Project | undefined, workspaces: Worksp
  * under it, and Start (or Cmd+Enter) makes the workspace on this machine and starts Claude Code on
  * the task, handing the session to `onCreated` so the layout lands in it.
  *
- * On the first-run page (`page`) it is open and big. At the top of the board (`bar`) it is one
- * line beside a way to jump until it is used, so starting the next task is a click away from
- * everything already running.
+ * On the first-run page and in the New task dialog (`page`) it is open and big. At the top of
+ * the board (`bar`) it is one line beside a way to jump until it is used, so starting the next
+ * task is a click away from everything already running. It is the one way a workspace is made.
  */
 export function Composer({
   mode,
@@ -57,9 +99,10 @@ export function Composer({
   workspaces,
   launch,
   onCreated,
-  onMore,
   onJump,
   doneLabel,
+  onDone,
+  initialTask = "",
 }: {
   mode: "page" | "bar";
   /** The task box's id, so a heading elsewhere can label it. */
@@ -68,15 +111,18 @@ export function Composer({
   /** The workspaces open now, so a name a project already has is never sent. */
   workspaces: WorkspaceView[];
   launch: Launch;
-  onCreated: (session: string) => void;
-  /** Opens the full new-workspace dialog with this name. */
-  onMore: (name: string) => void;
+  /** Called with the new session, and the daemon's words when the workspace's setup did not start. */
+  onCreated: (session: string, warning: string | null) => void;
   /** Opens the jump palette, from the bar. */
   onJump?: () => void;
-  /** The button that clears a workspace that was made but whose session did not start. */
+  /** The button shown once a workspace was made but went wrong: its session or its setup did not start. */
   doneLabel: string;
+  /** What that button does; by default it clears the box for the next task. */
+  onDone?: () => void;
+  /** The task the box opens with. */
+  initialTask?: string;
 }) {
-  const [task, setTask] = useState("");
+  const [task, setTask] = useState(initialTask);
   const [name, setName] = useState("");
   const [base, setBase] = useState("main");
   const [model, setModel] = useState("opus");
@@ -88,6 +134,8 @@ export function Composer({
   const chosen = name.trim() || suggested;
   const taken = name.trim() ? holder(name.trim(), project, workspaces) : undefined;
   const { create, step, made } = launch;
+  const warning = create.data?.warning ?? null;
+  const models = [...new Set(["opus", "sonnet", ...workspaces.flatMap((w) => w.sessions.map((s) => s.model))])];
   // Once sent, the name is the one sent: the new workspace arriving must not renumber it.
   const shown = (create.isPending || made) && create.variables ? create.variables.name : chosen;
   const branch = safeBranch(shown);
@@ -97,7 +145,7 @@ export function Composer({
 
   const submit = () => {
     if (!ready || !project) return;
-    create.mutate({ project: project.id, base: base.trim(), name: chosen, model: model.trim(), prompt }, { onSuccess: ({ session }) => onCreated(session) });
+    create.mutate({ project: project.id, base: base.trim(), name: chosen, model: model.trim(), prompt }, { onSuccess: ({ session, warning }) => onCreated(session, warning) });
   };
   const clear = () => {
     create.reset();
@@ -194,8 +242,9 @@ export function Composer({
                 className={`${inlineField} [&::-webkit-calendar-picker-indicator]:hidden`}
               />
               <datalist id={`${id}-models`}>
-                <option value="opus" />
-                <option value="sonnet" />
+                {models.map((m) => (
+                  <option key={m} value={m} />
+                ))}
               </datalist>
             </label>
             <span className="ml-auto flex items-center gap-2">
@@ -230,9 +279,6 @@ export function Composer({
               </code>
             </>
           )}
-          <button type="button" onClick={() => onMore(chosen)} className="ml-auto text-neutral-400 underline decoration-neutral-700 underline-offset-4 hover:text-neutral-200">
-            More options
-          </button>
         </div>
       )}
 
@@ -247,16 +293,27 @@ export function Composer({
       <p aria-live="polite" className={`px-1 text-xs text-neutral-400 ${bar ? "empty:hidden" : "min-h-4"}`}>
         {create.isPending && (step === "branch" ? `Making ${branch} from ${base.trim()}…` : prompt ? `Starting ${model.trim()} on your task…` : `Starting ${model.trim()}…`)}
       </p>
-      {create.isError && (
-        <div role="alert" className="flex flex-wrap items-center gap-2 px-1 text-sm text-red-400">
-          <span className="min-w-0 flex-1">{create.error?.message}</span>
+      {(create.isError || warning) && (
+        <div role={create.isError ? "alert" : "status"} className={`flex flex-wrap items-center gap-2 px-1 text-sm ${create.isError ? "text-red-400" : "text-amber-300"}`}>
+          <span className="min-w-0 flex-1">{create.isError ? create.error?.message : warning}</span>
           {made && (
-            <button type="button" onClick={clear} className="text-neutral-300 underline decoration-neutral-600 underline-offset-4 hover:text-neutral-100">
+            <button type="button" onClick={onDone ?? clear} className="text-neutral-300 underline decoration-neutral-600 underline-offset-4 hover:text-neutral-100">
               {doneLabel}
             </button>
           )}
         </div>
       )}
     </form>
+  );
+}
+
+export function BranchIcon({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 16 16" className={className} fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
+      <circle cx="4.5" cy="3.5" r="1.5" />
+      <circle cx="4.5" cy="12.5" r="1.5" />
+      <circle cx="11.5" cy="5.5" r="1.5" />
+      <path d="M4.5 5v6M11.5 7c0 3-7 2-7 4" strokeLinecap="round" />
+    </svg>
   );
 }

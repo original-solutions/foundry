@@ -15,7 +15,7 @@ interface Props {
   machines: MachineView[];
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  /** Opens the new-workspace dialog with `name` typed in. */
+  /** Opens the new-task dialog with `name` as its task. */
   onCreate: (name: string) => void;
   /** The open terminal, which a pick can be opened beside. */
   current?: { terminal: string; title: string };
@@ -282,7 +282,7 @@ function Panel({
         </ul>
       )}
       {acts && acts.length === 0 && <p className="px-4 pb-4 pt-1 text-neutral-500">No action matches “{query.trim()}”. ⌫ goes back.</p>}
-      {!acts && found.length === 0 && <p className="px-4 pb-4 pt-1 text-neutral-500">Nothing matches “{query.trim()}”. ↵ makes it a new workspace.</p>}
+      {!acts && found.length === 0 && <p className="px-4 pb-4 pt-1 text-neutral-500">Nothing matches “{query.trim()}”. ↵ makes it a task for Claude.</p>}
       {shell.isPending && <p className="border-t border-neutral-800 px-4 py-2 text-xs text-neutral-400">Starting a shell…</p>}
       {shell.isError && (
         <p role="alert" className="border-t border-neutral-800 px-4 py-2 text-xs text-red-400">

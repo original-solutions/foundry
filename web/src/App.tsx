@@ -4,11 +4,12 @@ import { useEffect, useLayoutEffect, useMemo, useState } from "react";
 import { Board } from "./Board";
 import { ChangesPanel } from "./ChangesPanel";
 import { LinkBanner, Unreachable } from "./Connection";
-import { CreateWorkspace, useCreateWorkspace } from "./CreateWorkspace";
+import { useCreateWorkspace } from "./Composer";
 import { JumpPalette } from "./JumpPalette";
 import { Launchpad } from "./Launchpad";
 import { Machines } from "./Machines";
 import { NewSession } from "./NewSession";
+import { NewTask } from "./NewTask";
 import { Sidebar } from "./Sidebar";
 import { StepsPanel, type StepsOf } from "./StepsPanel";
 import { TabStrip } from "./TabStrip";
@@ -49,8 +50,8 @@ import { AlertsButton, useAlerts } from "./AlertsBell";
  * ten minutes from the samples this page has seen, its free memory and disk, its terminals by
  * state and its workspaces.
  *
- * A workspace made from the new-workspace dialog (the sidebar, the board or the palette opens
- * it) is landed in: once its session shows up, its terminal opens, its setup shell a tab beside it.
+ * A workspace is made one way, from a task box: the first run's, the board's top line, or the
+ * New task dialog (the sidebar's button, or the palette with what was typed as the task). It is landed in: once its session shows up, its terminal opens, its setup shell a tab beside it.
  *
  * A workspace's changes since its base open as a sheet from the header or the workspace's row.
  *
@@ -95,8 +96,8 @@ function Layout() {
   /** The palette, and whether its picks open beside the open terminal. */
   const [jump, setJump] = useState<"jump" | "beside">();
   const [split, setSplit] = useState<Split>();
-  /** The new-workspace dialog: open, and the name it starts with. */
-  const [create, setCreate] = useState({ open: false, name: "" });
+  /** The New task dialog: open, and the task it starts with. */
+  const [create, setCreate] = useState({ open: false, task: "" });
   /** Whether the steps column is shown. */
   const [stepsOpen, setStepsOpen] = useState(false);
   /** The find bar over the terminal with the keyboard: 0 closed, and one more each time it is asked for. */
@@ -186,9 +187,9 @@ function Layout() {
     setDrawer(false);
     setChangesOf(workspace);
   };
-  const openCreate = (name = "") => {
+  const openCreate = (task = "") => {
     setDrawer(false);
-    setCreate({ open: true, name });
+    setCreate({ open: true, task });
   };
 
   useLayoutEffect(() => {
@@ -306,14 +307,13 @@ function Layout() {
                 );
               })}
               {!terminalId && onMachines && <Machines machines={machines} history={samples} here={here} connected={connected} onJump={openJump} onMenu={() => setDrawer(true)} />}
-              {firstRun && <Launchpad projects={state.settings.projects} workspaces={workspaces} launch={launch} onCreated={setLanding} onMore={openCreate} onMenu={() => setDrawer(true)} />}
+              {firstRun && <Launchpad projects={state.settings.projects} workspaces={workspaces} launch={launch} onCreated={setLanding} onMenu={() => setDrawer(true)} />}
               {board && state.synced && (
                 <Board
                   machines={machines}
                   projects={state.settings.projects}
                   onJump={openJump}
                   onCreated={setLanding}
-                  onMore={openCreate}
                   onChanges={openChanges}
                   traced={traced}
                   onMenu={() => setDrawer(true)}
@@ -337,12 +337,12 @@ function Layout() {
           besideOnly={jump === "beside"}
           onBeside={openBeside}
         />
-        <CreateWorkspace
+        <NewTask
           projects={state.settings.projects}
           workspaces={workspaces}
           open={create.open}
           onOpenChange={(open) => setCreate((c) => ({ ...c, open }))}
-          name={create.name}
+          task={create.task}
           onCreated={setLanding}
         />
         {sessionIn && <NewSession key={sessionIn.id} workspace={sessionIn.id} name={sessionIn.name} onClose={() => setSessionIn(undefined)} onStarted={setLanding} />}
