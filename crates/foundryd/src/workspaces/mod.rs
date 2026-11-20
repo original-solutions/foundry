@@ -271,8 +271,8 @@ impl Workspaces {
     /// branch kept; any other, or one git will not remove, is left as it is and logged with what
     /// holds it. One named only by another owner's record is left and logged too. A worktree
     /// whose folder is gone is checked by the `HEAD` git keeps for it. Branches are never
-    /// touched. A store that cannot be read skips the sweep, and a clone whose worktrees cannot
-    /// be listed is passed over, each with a log line.
+    /// touched. A store that cannot be read skips the sweep, and a clone that cannot be read or
+    /// whose worktrees cannot be listed is passed over, each with a log line.
     pub async fn sweep(&self) -> Result<(), WorkspaceError> {
         self.inner.sweep().await
     }
@@ -463,8 +463,17 @@ impl Inner {
         };
         for project in projects {
             let clone = self.clone_path(project);
-            if !tokio::fs::try_exists(&clone).await? {
-                continue;
+            match tokio::fs::try_exists(&clone).await {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    tracing::warn!(
+                        clone = %clone.display(),
+                        %error,
+                        "the clone could not be read to find what a failed create left"
+                    );
+                    continue;
+                }
             }
             let branches = |mine: bool| -> Vec<&str> {
                 live.iter()
@@ -526,7 +535,8 @@ impl Inner {
             if self.named(project, &listed, folder, branch, others).await {
                 tracing::warn!(
                     %worktree,
-                    "a worktree only another machine's workspace record names is left as it is"
+                    "a worktree only another owner's workspace record names, another machine's or \
+                     this one's under an identity since made again, is left as it is"
                 );
                 continue;
             }
