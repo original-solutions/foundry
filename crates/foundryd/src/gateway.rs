@@ -678,6 +678,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_secret_across_the_cut_of_the_gateways_reason_never_shows() {
+        let filler = "x".repeat(REASON_AT_MOST - 5);
+        for echo in [
+            format!("{filler}{KEY}"),
+            format!("{filler} https://tom:hunter2@gw/x"),
+        ] {
+            let (url, _) = answering(
+                StatusCode::BAD_GATEWAY,
+                serde_json::json!({ "error": echo }),
+            )
+            .await;
+            let machine = Machine::new(Some(KEY));
+            let text = serde_json::to_string(one(&machine.items(Some(url)).await)).unwrap();
+            assert!(!text.contains(&KEY[..6]), "{text}");
+            assert!(!text.contains("hunt"), "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_key_is_sent_again_after_a_long_wait_and_clears_once_accepted() {
+        let status = Arc::new(std::sync::atomic::AtomicU16::new(401));
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/v0/management/auth-files",
+            get({
+                let (status, hits) = (status.clone(), hits.clone());
+                move || {
+                    hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let status = status.load(std::sync::atomic::Ordering::SeqCst);
+                    async move {
+                        let files =
+                            serde_json::json!({ "files": [account(serde_json::json!([]))] });
+                        (StatusCode::from_u16(status).unwrap(), axum::Json(files)).into_response()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let machine = Machine::new(Some(KEY));
+        let mut reader = Reader::new(Some(url), machine.secrets.clone());
+        reader.retry_refused = Duration::from_millis(300);
+        let reader = Arc::new(reader);
+
+        reader.read_once().await;
+        reader.read_once().await;
+        assert_eq!(reader.health(), Some(Health::KeyRefused));
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let item = reader.items(&machine.fleet());
+        assert!(one(&item).todo.contains("restart"), "{}", item[0].todo);
+
+        // The gateway is fixed to take the same key.
+        status.store(200, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        reader.read_once().await;
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(reader.health(), Some(Health::Healthy));
+    }
+
+    #[test]
+    fn a_refused_key_is_retried_rarely_enough_never_to_be_banned() {
+        // CLIProxyAPI bans an address after 5 refused keys and forgets one after 2 idle hours.
+        assert!(RETRY_REFUSED > Duration::from_secs(2 * 60 * 60));
+    }
+
+    #[tokio::test]
     async fn a_key_the_store_cannot_read_is_not_asked_for_again() {
         let home = tempfile::tempdir().unwrap();
         let secrets = counting(&home);
