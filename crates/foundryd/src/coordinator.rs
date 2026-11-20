@@ -23,21 +23,35 @@ use std::time::Duration;
 
 use foundry_proto::ids::MachineId;
 use foundry_proto::messages::{PROTOCOL, PeerMessage};
-use foundry_proto::settings::{Edit, Overwritten, SettingKey, SettingValue, SharedSettings, Stamp};
+use foundry_proto::settings::{
+    Edit, Overwritten, SettingKey, SettingValue, SharedSettings, Stamp, StampKey,
+};
 use serde::Serialize;
+use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::store::{Store, StoreError};
 use crate::sync::{OFFLINE_AFTER, Peers, on_store};
 
-/// How often an edit waiting for this machine to catch up looks again.
-const CATCH_UP_STEP: Duration = Duration::from_millis(100);
+/// How often an edit that waits looks again.
+const STEP: Duration = Duration::from_millis(100);
+
+/// How long an edit a peer forwarded is kept while this machine can neither number it nor pass
+/// it on: while it takes the forwarding machine to act, or has no link to the one that does. A
+/// machine silent for [`OFFLINE_AFTER`] is no longer reachable, so by twice that the role has
+/// settled.
+const KEEP_FORWARDED: Duration = OFFLINE_AFTER.saturating_mul(2);
 
 /// Why an edit was not made.
 #[derive(Debug, thiserror::Error)]
 pub enum CoordinatorError {
     #[error("no link to {0}, the acting coordinator, is open, so the edit was not sent")]
     NotLinked(MachineId),
+    #[error(
+        "an edit {from} forwarded was dropped: after {KEEP_FORWARDED:?} this machine still \
+         takes {acting} to act and cannot pass the edit to it"
+    )]
+    Unsettled { from: MachineId, acting: MachineId },
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -51,6 +65,12 @@ pub struct Coordinator {
     /// The machines this one has taken a copy of the settings from. Each link sends its copy
     /// before anything else, so a machine is in here by the time it is heard from.
     taken: Mutex<BTreeSet<MachineId>>,
+    /// When this machine started. Until every listed machine's copy is in, or
+    /// [`OFFLINE_AFTER`] has passed, its own copy may be an old one.
+    started: Instant,
+    /// The task making the edit forwarded last. Each forwarded edit waits for the one before,
+    /// so they are numbered in the order they arrived.
+    last_forwarded: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Coordinator {
@@ -60,16 +80,18 @@ impl Coordinator {
             store,
             peers,
             taken: Mutex::new(BTreeSet::new()),
+            started: Instant::now(),
+            last_forwarded: Mutex::new(None),
         }
     }
 
     /// The machine that holds the role, as this machine sees it now.
     pub async fn acting(&self) -> Result<MachineId, StoreError> {
-        let settings = on_store(&self.store, |store| store.settings()).await?;
-        Ok(acting(&settings.priority, &self.peers.online()))
+        let held = self.held().await?;
+        Ok(acting(&held.priority, &self.peers.online()))
     }
 
-    /// Makes `edit`. On the acting machine it is numbered, once this machine has caught up or
+    /// Makes `edit`. On the acting machine it is numbered once this machine has caught up, or
     /// after [`OFFLINE_AFTER`]. On any other machine it is sent to the acting one, and this
     /// returns without waiting for it to be numbered: the change shows when the settings
     /// arrive. It fails only when no link to the acting machine is open, or the store fails.
@@ -97,53 +119,80 @@ impl Coordinator {
     }
 
     /// Makes an edit `peer` forwarded, in the background, so the link that carried it goes on
-    /// reading while the edit waits for this machine to catch up.
+    /// reading while the edit waits. Forwarded edits are made one at a time, in the order they
+    /// arrived.
     pub(crate) fn take_edit(self: Arc<Self>, peer: MachineId, edit: Edit) {
-        tokio::spawn(async move {
-            if let Err(error) = self.edit_from(Some(peer), edit).await {
-                tracing::warn!("coordinator: an edit {peer} forwarded was not made: {error}");
+        let coordinator = Arc::clone(&self);
+        let mut last = lock(&self.last_forwarded);
+        let before = last.take();
+        *last = Some(tokio::spawn(async move {
+            if let Some(before) = before {
+                let _ = before.await;
             }
-        });
+            if let Err(error) = coordinator.edit_from(Some(peer), edit).await {
+                tracing::warn!("coordinator: {error}");
+            }
+        }));
     }
 
-    /// Makes `edit`, which came from `from` when a peer forwarded it. An edit is never sent
-    /// back to the machine that forwarded it: when each takes the other to act, this one
-    /// numbers it rather than lose it.
+    /// Makes `edit`, which `from` forwarded, or this machine's own when `None`. Only the
+    /// acting machine numbers it. A forwarded edit is never sent back to the machine that
+    /// forwarded it, and is kept, looking again every [`STEP`], while the acting machine is
+    /// that one or has no open link here, until [`KEEP_FORWARDED`].
     async fn edit_from(&self, from: Option<MachineId>, edit: Edit) -> Result<(), CoordinatorError> {
-        let deadline = Instant::now() + OFFLINE_AFTER;
+        let start = Instant::now();
         loop {
-            let acting = self.acting().await?;
-            if acting != self.me && Some(acting) != from {
+            let held = self.held().await?;
+            let acting = acting(&held.priority, &self.peers.online());
+            if acting == self.me {
+                if self.caught_up(&held) || start.elapsed() >= OFFLINE_AFTER {
+                    return self.number(edit).await;
+                }
+            } else if Some(acting) != from {
                 let message = PeerMessage::Edit {
                     protocol: PROTOCOL,
-                    edit,
+                    edit: edit.clone(),
                 };
-                return match self.peers.send(acting, &message).await {
-                    true => Ok(()),
-                    false => Err(CoordinatorError::NotLinked(acting)),
-                };
+                if self.peers.send(acting, &message).await {
+                    return Ok(());
+                }
+                if from.is_none() {
+                    return Err(CoordinatorError::NotLinked(acting));
+                }
             }
-            if self.caught_up() || Instant::now() >= deadline {
-                let me = self.me;
-                return on_store(&self.store, move |store| {
-                    let held = store.settings()?;
-                    store.apply_settings(numbered(&held, &edit, me))?;
-                    Ok(())
-                })
-                .await;
+            if let Some(from) = from
+                && start.elapsed() >= KEEP_FORWARDED
+            {
+                return Err(CoordinatorError::Unsettled { from, acting });
             }
-            tokio::time::sleep(CATCH_UP_STEP).await;
+            tokio::time::sleep(STEP).await;
         }
     }
 
-    /// Whether this machine has taken a copy of the settings from every other machine it can
-    /// reach.
-    fn caught_up(&self) -> bool {
+    /// Gives `edit` the next number, on the copy held at that moment.
+    async fn number(&self, edit: Edit) -> Result<(), CoordinatorError> {
+        let me = self.me;
+        on_store(&self.store, move |store| {
+            let held = store.settings()?;
+            store.apply_settings(numbered(&held, &edit, me))?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn held(&self) -> Result<SharedSettings, StoreError> {
+        on_store(&self.store, |store| store.settings()).await
+    }
+
+    /// Whether this machine holds what it needs to number: a copy from every other machine it
+    /// can reach, and, in its first [`OFFLINE_AFTER`], from every machine `held` lists, so a
+    /// machine that has just started and hears from no one yet does not number on an old copy.
+    fn caught_up(&self, held: &SharedSettings) -> bool {
         let taken = lock(&self.taken);
-        self.peers
-            .online()
-            .iter()
-            .all(|id| *id == self.me || taken.contains(id))
+        let has = |id: &MachineId| *id == self.me || taken.contains(id);
+        let reachable = self.peers.online().iter().all(has);
+        let listed = held.machines.iter().all(|m| has(&m.id));
+        reachable && (listed || self.started.elapsed() >= OFFLINE_AFTER)
     }
 }
 
@@ -179,8 +228,13 @@ pub fn numbered(held: &SharedSettings, edit: &Edit, me: MachineId) -> SharedSett
 /// One copy of the settings from two, setting by setting: the higher stamp's value holds. A
 /// setting both copies edited where neither had seen the other's edit also gets a "setting
 /// overwritten" item holding both values, stamped as the edit that held. `seen` is the higher
-/// of each. The result's `seq` is the higher of the two, plus one when the result is not the
-/// copy that holds it, so a copy that changed is always taken by a store holding either.
+/// of each.
+///
+/// The result's `seq` is the higher of the two, plus one unless the result is the settings of
+/// every copy that holds that `seq`. That is one more case than "differs from both": a result
+/// that is only the lower copy's settings also takes a new number. A store takes a copy only
+/// with a higher `seq` than it holds, so a store holding the top copy would refuse such a
+/// result if it kept the top `seq`, and the lower copy's edits would never reach it.
 pub fn merge(a: &SharedSettings, b: &SharedSettings) -> SharedSettings {
     let mut out = SharedSettings::default();
     let mut conflicts = Vec::new();
@@ -195,19 +249,22 @@ pub fn merge(a: &SharedSettings, b: &SharedSettings) -> SharedSettings {
             std::cmp::Ordering::Equal => text(&va) >= text(&vb),
         };
         let (held, lost, stamp) = if a_holds { (va, vb, sa) } else { (vb, va, sb) };
-        let conflict =
-            !key.is_overwritten() && held != lost && !covers(&a.seen, sb) && !covers(&b.seen, sa);
-        if conflict {
+        // Two sides that set one value raise nothing: no value was lost.
+        if let StampKey::Setting(setting) = key
+            && held != lost
+            && !covers(&a.seen, sb)
+            && !covers(&b.seen, sa)
+        {
             let item = Overwritten {
-                kept: setting(&held),
-                lost: setting(&lost),
+                kept: self::setting(&held),
+                lost: self::setting(&lost),
             };
-            conflicts.push((key.clone(), item, stamp));
+            conflicts.push((setting.clone(), item, stamp));
         }
         put(&mut out, key, held, stamp);
     }
     for (key, item, stamp) in conflicts {
-        let key = SettingKey::Overwritten(Box::new(key));
+        let key = StampKey::Overwritten(key);
         if stamp > self::stamp(&out, &key) {
             put(&mut out, &key, Some(Value::Item(item)), stamp);
         }
@@ -262,30 +319,39 @@ fn text(value: &Option<Value>) -> String {
 }
 
 /// Every setting `settings` holds a value or a stamp for.
-fn keys(settings: &SharedSettings) -> BTreeSet<SettingKey> {
-    let mut keys: BTreeSet<SettingKey> = settings.stamps.keys().cloned().collect();
-    keys.extend(settings.machines.iter().map(|m| SettingKey::Machine(m.id)));
-    keys.extend(settings.projects.iter().map(|p| SettingKey::Project(p.id)));
-    keys.extend(settings.limits.keys().map(|id| SettingKey::Limits(*id)));
+fn keys(settings: &SharedSettings) -> BTreeSet<StampKey> {
+    let mut keys: BTreeSet<StampKey> = settings.stamps.keys().cloned().collect();
+    let mut plain: Vec<SettingKey> = Vec::new();
+    plain.extend(settings.machines.iter().map(|m| SettingKey::Machine(m.id)));
+    plain.extend(settings.projects.iter().map(|p| SettingKey::Project(p.id)));
+    plain.extend(settings.limits.keys().map(|id| SettingKey::Limits(*id)));
+    if !settings.priority.is_empty() {
+        plain.push(SettingKey::Priority);
+    }
+    keys.extend(plain.into_iter().map(StampKey::Setting));
     keys.extend(
         settings
             .overwritten
             .keys()
-            .map(|key| SettingKey::Overwritten(Box::new(key.clone()))),
+            .cloned()
+            .map(StampKey::Overwritten),
     );
-    if !settings.priority.is_empty() {
-        keys.insert(SettingKey::Priority);
-    }
     keys
 }
 
-fn stamp(settings: &SharedSettings, key: &SettingKey) -> Stamp {
+fn stamp(settings: &SharedSettings, key: &StampKey) -> Stamp {
     settings.stamps.get(key).copied().unwrap_or(Stamp::NONE)
 }
 
 /// The value `settings` holds for `key`, `None` when it holds none. An empty priority order is
 /// none.
-fn get(settings: &SharedSettings, key: &SettingKey) -> Option<Value> {
+fn get(settings: &SharedSettings, key: &StampKey) -> Option<Value> {
+    let key = match key {
+        StampKey::Overwritten(key) => {
+            return settings.overwritten.get(key).cloned().map(Value::Item);
+        }
+        StampKey::Setting(key) => key,
+    };
     let value = match key {
         SettingKey::Machine(id) => settings
             .machines
@@ -302,9 +368,6 @@ fn get(settings: &SharedSettings, key: &SettingKey) -> Option<Value> {
             .cloned()
             .map(SettingValue::Project),
         SettingKey::Limits(id) => settings.limits.get(id).cloned().map(SettingValue::Limits),
-        SettingKey::Overwritten(inner) => {
-            return settings.overwritten.get(inner).cloned().map(Value::Item);
-        }
     };
     value.map(Value::Setting)
 }
@@ -312,9 +375,9 @@ fn get(settings: &SharedSettings, key: &SettingKey) -> Option<Value> {
 /// Sets `key` to `value` (`None` removes it) with `stamp`. Machines and projects are kept in
 /// id order, so two machines holding the same settings hold the same lists. A value of the
 /// wrong kind for `key` is taken as none.
-fn put(settings: &mut SharedSettings, key: &SettingKey, value: Option<Value>, stamp: Stamp) {
+fn put(settings: &mut SharedSettings, key: &StampKey, value: Option<Value>, stamp: Stamp) {
     match key {
-        SettingKey::Machine(id) => {
+        StampKey::Setting(SettingKey::Machine(id)) => {
             settings.machines.retain(|m| m.id != *id);
             if let Some(Value::Setting(SettingValue::Machine(m))) = value
                 && m.id == *id
@@ -323,13 +386,13 @@ fn put(settings: &mut SharedSettings, key: &SettingKey, value: Option<Value>, st
                 settings.machines.sort_by_key(|m| m.id);
             }
         }
-        SettingKey::Priority => {
+        StampKey::Setting(SettingKey::Priority) => {
             settings.priority = match value {
                 Some(Value::Setting(SettingValue::Priority(order))) => order,
                 _ => Vec::new(),
             };
         }
-        SettingKey::Project(id) => {
+        StampKey::Setting(SettingKey::Project(id)) => {
             settings.projects.retain(|p| p.id != *id);
             if let Some(Value::Setting(SettingValue::Project(p))) = value
                 && p.id == *id
@@ -338,7 +401,7 @@ fn put(settings: &mut SharedSettings, key: &SettingKey, value: Option<Value>, st
                 settings.projects.sort_by_key(|p| p.id);
             }
         }
-        SettingKey::Limits(id) => match value {
+        StampKey::Setting(SettingKey::Limits(id)) => match value {
             Some(Value::Setting(SettingValue::Limits(limits))) => {
                 settings.limits.insert(*id, limits);
             }
@@ -346,9 +409,9 @@ fn put(settings: &mut SharedSettings, key: &SettingKey, value: Option<Value>, st
                 settings.limits.remove(id);
             }
         },
-        SettingKey::Overwritten(inner) => match value {
+        StampKey::Overwritten(inner) => match value {
             Some(Value::Item(item)) => {
-                settings.overwritten.insert((**inner).clone(), item);
+                settings.overwritten.insert(inner.clone(), item);
             }
             _ => {
                 settings.overwritten.remove(inner);

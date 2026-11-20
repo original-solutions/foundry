@@ -741,7 +741,7 @@ async fn a_returning_machine_numbers_nothing_until_it_has_every_online_machines_
     theirs.seq = 5;
     theirs.projects.push(project(8, "from the peer"));
     theirs.stamps.insert(
-        SettingKey::Project(project(8, "").id),
+        StampKey::Setting(SettingKey::Project(project(8, "").id)),
         Stamp { seq: 5, by: peer },
     );
     theirs.seen.insert(peer, 5);
@@ -828,11 +828,15 @@ async fn a_link_sends_the_settings_after_the_hello_and_again_when_they_change() 
             let text = conn.recv.recv().await.unwrap();
             let message: serde_json::Value = serde_json::from_str(&text).unwrap();
             if message["type"] == "settings" {
-                return message;
+                let settings: SharedSettings =
+                    serde_json::from_value(message["settings"].clone()).unwrap();
+                if project_named(&settings, 7).is_some() {
+                    return settings;
+                }
             }
         }
     })
     .await
     .expect("the changed settings are sent");
-    assert_eq!(sent["settings"]["seq"], 2);
+    assert_eq!(sent, daemon.settings());
 }

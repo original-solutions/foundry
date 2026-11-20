@@ -1,9 +1,10 @@
 //! Shared settings, their sequence number, and the stamps that say which edit set each one.
 //!
 //! A setting is one first-level entry: one machine, the priority order, one project, one
-//! machine's limits, or one "setting overwritten" item. Each is named by a [`SettingKey`]. The
-//! acting coordinator numbers every edit and stamps the setting it changed with a [`Stamp`];
-//! a removed setting keeps its stamp, so a merge does not bring it back.
+//! machine's limits, each named by a [`SettingKey`], or the "setting overwritten" item about
+//! one of those. The acting coordinator numbers every edit and stamps what it changed with a
+//! [`Stamp`], kept under a [`StampKey`]; a removed setting keeps its stamp, so a merge does not
+//! bring it back.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -26,7 +27,7 @@ pub struct SharedSettings {
     /// The edit that last set each setting, removed ones included. A setting with no stamp has
     /// [`Stamp::NONE`].
     #[serde(default)]
-    pub stamps: BTreeMap<SettingKey, Stamp>,
+    pub stamps: BTreeMap<StampKey, Stamp>,
     /// The highest number each coordinator gave an edit that this copy includes.
     #[serde(default)]
     pub seen: BTreeMap<MachineId, u64>,
@@ -35,22 +36,22 @@ pub struct SharedSettings {
     pub overwritten: BTreeMap<SettingKey, Overwritten>,
 }
 
-/// One first-level setting. Written as text: `machine:<id>`, `priority`, `project:<id>`,
-/// `limits:<id>`, or `overwritten:<key>` for the item about another setting.
+/// One first-level setting. Written as text: `machine:<id>`, `priority`, `project:<id>` or
+/// `limits:<id>`.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SettingKey {
     Machine(MachineId),
     Priority,
     Project(ProjectId),
     Limits(MachineId),
-    /// The "setting overwritten" item about a setting that is not itself one.
-    Overwritten(Box<SettingKey>),
 }
 
-impl SettingKey {
-    pub fn is_overwritten(&self) -> bool {
-        matches!(self, Self::Overwritten(_))
-    }
+/// What a stamp is kept for: a setting, or the "setting overwritten" item about one. Written
+/// as the setting's key, or `overwritten:<key>`. An item is never about another item.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum StampKey {
+    Setting(SettingKey),
+    Overwritten(SettingKey),
 }
 
 impl fmt::Display for SettingKey {
@@ -60,7 +61,6 @@ impl fmt::Display for SettingKey {
             Self::Priority => f.write_str("priority"),
             Self::Project(id) => write!(f, "project:{id}"),
             Self::Limits(id) => write!(f, "limits:{id}"),
-            Self::Overwritten(key) => write!(f, "overwritten:{key}"),
         }
     }
 }
@@ -79,28 +79,52 @@ impl FromStr for SettingKey {
             "machine" => Ok(Self::Machine(MachineId(id(rest)?))),
             "project" => Ok(Self::Project(ProjectId(id(rest)?))),
             "limits" => Ok(Self::Limits(MachineId(id(rest)?))),
-            "overwritten" => match rest.parse::<Self>() {
-                Ok(inner) if !inner.is_overwritten() => Ok(Self::Overwritten(Box::new(inner))),
-                _ => Err(refused()),
-            },
             _ => Err(refused()),
         }
     }
 }
 
-impl Serialize for SettingKey {
-    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.collect_str(self)
+impl fmt::Display for StampKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Setting(key) => key.fmt(f),
+            Self::Overwritten(key) => write!(f, "overwritten:{key}"),
+        }
     }
 }
 
-impl<'de> Deserialize<'de> for SettingKey {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        String::deserialize(d)?
-            .parse()
-            .map_err(serde::de::Error::custom)
+impl FromStr for StampKey {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text.strip_prefix("overwritten:") {
+            Some(rest) => rest.parse().map(Self::Overwritten),
+            None => text.parse().map(Self::Setting),
+        }
     }
 }
+
+/// Serde for a key as its text, so it can key a JSON object.
+macro_rules! as_text {
+    ($key:ty) => {
+        impl Serialize for $key {
+            fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                s.collect_str(self)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $key {
+            fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                String::deserialize(d)?
+                    .parse()
+                    .map_err(serde::de::Error::custom)
+            }
+        }
+    };
+}
+
+as_text!(SettingKey);
+as_text!(StampKey);
 
 /// The edit that set a setting: the number the acting coordinator gave it, and that
 /// coordinator. Of two stamps the greater wins: the higher `seq`, then on an equal `seq` the
@@ -183,16 +207,17 @@ pub enum Edit {
     RemoveLimits {
         machine: MachineId,
     },
-    /// Dismisses the "setting overwritten" item about `setting`.
+    /// Dismisses the "setting overwritten" item about `setting`: the key of the setting both
+    /// sides edited, as the item is keyed in [`SharedSettings::overwritten`].
     Dismiss {
         setting: SettingKey,
     },
 }
 
 impl Edit {
-    /// The setting this edit changes.
-    pub fn key(&self) -> SettingKey {
-        match self {
+    /// The setting, or the item, this edit changes.
+    pub fn key(&self) -> StampKey {
+        let setting = match self {
             Self::SetMachine { machine } => SettingKey::Machine(machine.id),
             Self::RemoveMachine { id } => SettingKey::Machine(*id),
             Self::Priority { .. } => SettingKey::Priority,
@@ -201,8 +226,9 @@ impl Edit {
             Self::SetLimits { machine, .. } | Self::RemoveLimits { machine } => {
                 SettingKey::Limits(*machine)
             }
-            Self::Dismiss { setting } => SettingKey::Overwritten(Box::new(setting.clone())),
-        }
+            Self::Dismiss { setting } => return StampKey::Overwritten(setting.clone()),
+        };
+        StampKey::Setting(setting)
     }
 
     /// The value the setting holds after this edit, `None` when the edit removes it.
