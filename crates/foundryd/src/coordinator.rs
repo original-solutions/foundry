@@ -716,6 +716,28 @@ mod tests {
     };
 
     use super::*;
+    use crate::sync::{Conn, Dialer};
+    use foundry_proto::settings::Machine as SettingsMachine;
+    use futures::future::BoxFuture;
+
+    struct NoDial;
+
+    impl Dialer for NoDial {
+        fn dial(&self, _: &SettingsMachine) -> BoxFuture<'static, std::io::Result<Conn>> {
+            Box::pin(async { Err(std::io::Error::other("no peers in these tests")) })
+        }
+    }
+
+    /// A coordinator alone on its own store: it acts, and has nothing to catch up on.
+    fn alone() -> (tempfile::TempDir, Coordinator) {
+        let dir = tempfile::tempdir().unwrap();
+        let me = MachineId::random();
+        let store = Arc::new(Mutex::new(
+            Store::open(dir.path().join("foundry.db")).unwrap(),
+        ));
+        let peers = Peers::new(me, store.clone(), Arc::new(NoDial));
+        (dir, Coordinator::new(me, store, peers))
+    }
 
     /// Machine ids in a known order: `id(1) < id(2) < …`.
     fn id(n: u128) -> MachineId {
@@ -1255,5 +1277,40 @@ mod tests {
         let out = merged(&a, &b);
         assert!(out.overwritten.is_empty());
         assert_eq!(out.projects.len(), 1);
+    }
+
+    // --- waiting on an id, and numbering one ---
+
+    #[tokio::test]
+    async fn two_waiters_on_one_id_each_read_its_answer_after_the_first_stops_waiting() {
+        let (_dir, coordinator) = alone();
+        let id = EditId::random();
+        let first = coordinator.wait_on(id);
+        let _second = coordinator.wait_on(id);
+        drop(first);
+        let outcome = Outcome::Refused {
+            reason: "no".into(),
+        };
+        coordinator.take_answer(id, outcome.clone());
+        let held = lock(&coordinator.answers).get(&id).cloned().flatten();
+        assert_eq!(held, Some(outcome));
+    }
+
+    #[tokio::test]
+    async fn one_id_made_twice_at_once_is_numbered_once() {
+        let (_dir, coordinator) = alone();
+        let id = EditId::random();
+        let before = coordinator.held().await.unwrap().seq;
+        let (own, forwarded) = tokio::join!(
+            coordinator.edit_from(None, Instant::now(), id, set_project(7, "p")),
+            coordinator.edit_from(
+                Some(MachineId::random()),
+                Instant::now(),
+                id,
+                set_project(7, "p")
+            ),
+        );
+        assert_eq!(own.unwrap(), forwarded.unwrap());
+        assert_eq!(coordinator.held().await.unwrap().seq, before + 1);
     }
 }

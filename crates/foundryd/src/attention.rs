@@ -1634,7 +1634,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_dismissal_the_acting_coordinator_numbers_answers_only_once_it_is_numbered() {
+    async fn a_dismissal_the_acting_coordinator_numbers_answers_204() {
         let peer = MachineId::random();
         let served = Served::new(|me, settings| {
             with_overwritten(me, settings);
