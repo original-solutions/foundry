@@ -104,11 +104,11 @@ describe("CreateWorkspace", () => {
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
-  it("is a fresh dialog when reopened while an earlier create was still on its way", async () => {
-    let answer: (response: Response) => void = () => {};
+  it("is a fresh dialog, left open, when an earlier create cancelled on its way finishes", async () => {
+    const answers: ((response: Response) => void)[] = [];
     vi.stubGlobal(
       "fetch",
-      vi.fn(() => new Promise<Response>((resolve) => (answer = resolve))),
+      vi.fn(() => new Promise<Response>((resolve) => answers.push(resolve))),
     );
     await renderApp(<CreateWorkspace projects={projects} />);
 
@@ -117,11 +117,13 @@ describe("CreateWorkspace", () => {
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
     fireEvent.click(screen.getByRole("button", { name: "New workspace" }));
-    answer(json(201, { id: "w1" }));
+    answers[0](json(201, { id: "w1" }));
+    await waitFor(() => expect(answers).toHaveLength(2));
+    answers[1](json(201, { id: "s1" }));
     await new Promise((resolve) => setTimeout(resolve, 20));
 
+    expect(screen.getByRole("dialog")).toBeDefined();
     expect(screen.getByRole("button", { name: "Create" })).toBeDefined();
     expect(screen.getByRole("button", { name: "Cancel" })).toBeDefined();
   });
 });
-

@@ -31,4 +31,38 @@ describe("NewSession", () => {
     expect((await within(dialog).findByRole("alert")).textContent).toContain("set FOUNDRY_GATEWAY_URL");
     expect(screen.getByRole("dialog")).toBeDefined();
   });
+
+  it("is a fresh dialog when reopened after a refusal", async () => {
+    mockFetch(json(500, { error: "set FOUNDRY_GATEWAY_URL" }));
+    await renderApp(<NewSession workspace="w1" name="fix login" />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "New session" }));
+    fireEvent.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Start" }));
+    await screen.findByRole("alert");
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+
+    fireEvent.click(screen.getByRole("button", { name: "New session" }));
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("stays open when reopened before a cancelled start lands", async () => {
+    let answer: (response: Response) => void = () => {};
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => new Promise<Response>((resolve) => (answer = resolve))),
+    );
+    await renderApp(<NewSession workspace="w1" name="fix login" />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "New session" }));
+    fireEvent.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Start" }));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    fireEvent.click(screen.getByRole("button", { name: "New session" }));
+    answer(json(201, { id: "s2" }));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(screen.getByRole("dialog")).toBeDefined();
+  });
 });
+

@@ -84,5 +84,25 @@ describe("ArchiveButton", () => {
     await waitFor(() => expect(calls).toHaveLength(2));
     expect(calls[1].body).toEqual({ force: false });
   });
+
+  it("is a plain confirm when reopened before a cancelled archive's refusal lands", async () => {
+    let answer: (response: Response) => void = () => {};
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => new Promise<Response>((resolve) => (answer = resolve))),
+    );
+    await renderApp(<ArchiveButton workspace="w1" name="e2e work" />);
+
+    const dialog = await archive();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    fireEvent.click(screen.getByRole("button", { name: "Archive" }));
+    answer(json(409, { error: "held", uncommitted: ["src/a.rs"], unpushed: [], submodules: [] }));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    const again = screen.getByRole("dialog");
+    expect(again.textContent).not.toContain("src/a.rs");
+    expect(within(again).queryByRole("button", { name: "Archive anyway" })).toBeNull();
+  });
 });
 
