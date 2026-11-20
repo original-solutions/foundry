@@ -142,8 +142,171 @@ pub trait Source: Send + Sync {
 }
 
 /// The items the synced records and shared settings raise: every row but the gateway's.
-pub fn fleet_items(_fleet: &Fleet) -> Vec<Item> {
-    Vec::new()
+pub fn fleet_items(fleet: &Fleet) -> Vec<Item> {
+    let mut items = Vec::new();
+    for machine in &fleet.settings.machines {
+        if !fleet.online.contains(&machine.id) {
+            items.push(fleet.item(
+                Kind::MachineOffline,
+                machine.id,
+                machine.id,
+                format!(
+                    "{} has not been heard from for {} seconds",
+                    machine.name,
+                    OFFLINE_AFTER.as_secs()
+                ),
+                "Check that it is on, on the tailnet and running foundryd".to_owned(),
+            ));
+        }
+    }
+
+    let mut workspaces = BTreeMap::new();
+    let mut terminals: BTreeMap<TerminalId, (bool, &Terminal)> = BTreeMap::new();
+    for record in &fleet.records {
+        match record {
+            AnyRecord::Workspace(r) => {
+                workspaces.insert(r.body.id, r);
+            }
+            AnyRecord::Terminal(r) => {
+                terminals.insert(r.body.id, (r.deleted, &r.body));
+            }
+            _ => {}
+        }
+    }
+    let workspace_name = |id| {
+        workspaces
+            .get(&id)
+            .map_or_else(|| "a workspace".to_owned(), |w| w.body.name.clone())
+    };
+    let closed = |id| terminals.get(&id).is_some_and(|(deleted, _)| *deleted);
+    let exit = |id| {
+        match terminals.get(&id).and_then(|(_, t)| t.exit_code) {
+            Some(code) => format!(" (exit code {code})"),
+            None => String::new(),
+        }
+    };
+
+    for record in &fleet.records {
+        match record {
+            AnyRecord::Session(r) if !r.deleted => {
+                let session = &r.body;
+                let place = format!(
+                    "A session in {} on {}",
+                    workspace_name(session.workspace),
+                    fleet.name(r.owner)
+                );
+                let (kind, what, todo) = match session.state {
+                    SessionState::Stuck => (
+                        Kind::SessionStuck,
+                        format!(
+                            "{place} has shown no output or hook event for {} minutes",
+                            STUCK_AFTER.as_secs() / 60
+                        ),
+                        "Open its terminal and see what it is doing",
+                    ),
+                    SessionState::WaitingForYou => (
+                        Kind::SessionWaiting,
+                        format!("{place} is waiting for you"),
+                        "Open its terminal and answer it",
+                    ),
+                    SessionState::Failed if !closed(session.terminal) => (
+                        Kind::SessionFailed,
+                        format!("{place} failed{}", exit(session.terminal)),
+                        "Read its terminal for why, then close it",
+                    ),
+                    _ => continue,
+                };
+                let mut item = fleet.item(kind, session.id, r.owner, what, todo.to_owned());
+                item.terminal = Some(session.terminal);
+                items.push(item);
+            }
+            AnyRecord::Workspace(r) if !r.deleted => {
+                let Some(setup) = r.body.setup else { continue };
+                let failed = terminals.get(&setup).is_some_and(|(deleted, t)| {
+                    !deleted && t.state == TerminalState::Exited && t.exit_code != Some(0)
+                });
+                if failed {
+                    let mut item = fleet.item(
+                        Kind::SetupFailed,
+                        r.body.id,
+                        r.owner,
+                        format!(
+                            "The setup of {} on {} failed{}",
+                            r.body.name,
+                            fleet.name(r.owner),
+                            exit(setup)
+                        ),
+                        "Read its setup terminal, fix the workspace by hand, then close that \
+                         terminal"
+                            .to_owned(),
+                    );
+                    item.terminal = Some(setup);
+                    items.push(item);
+                }
+            }
+            AnyRecord::MachineSample(r) if !r.deleted => {
+                let name = fleet.name(r.owner);
+                if let Some(limits) = fleet.settings.limits.get(&r.owner) {
+                    for reason in over_limits(r, limits) {
+                        if matches!(reason.over, Over::Disk { .. }) {
+                            items.push(fleet.item(
+                                Kind::DiskLow,
+                                r.owner,
+                                r.owner,
+                                reason.text(&name),
+                                "Free disk space on it, or lower its disk limit".to_owned(),
+                            ));
+                        }
+                    }
+                }
+                if let Some(tag) = &r.body.update_refused {
+                    items.push(fleet.item(
+                        Kind::UpdateRefused,
+                        r.owner,
+                        r.owner,
+                        format!("{name} rolled back {tag}: it did not become healthy"),
+                        format!("Fix it in a higher tag; {name} skips {tag} until one ships"),
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for (key, overwritten) in &fleet.settings.overwritten {
+        let machine = overwritten.lost_stamp.by;
+        let setting = match key {
+            SettingKey::Machine(id) => format!("the machine {}", fleet.name(*id)),
+            SettingKey::Priority => "the coordinator order".to_owned(),
+            SettingKey::Limits(id) => format!("the limits of {}", fleet.name(*id)),
+            SettingKey::Project(id) => {
+                let named = fleet.settings.projects.iter().find(|p| p.id == *id);
+                let held = [&overwritten.kept, &overwritten.lost]
+                    .into_iter()
+                    .flatten()
+                    .find_map(|value| match value {
+                        SettingValue::Project(p) => Some(p),
+                        _ => None,
+                    });
+                match named.or(held) {
+                    Some(project) => format!("the project {}", project.name),
+                    None => "a project".to_owned(),
+                }
+            }
+        };
+        items.push(fleet.item(
+            Kind::SettingOverwritten,
+            key,
+            machine,
+            format!(
+                "Two sides of a split both edited {setting}; the edit made on {} was replaced",
+                fleet.name(machine)
+            ),
+            "Check it holds what you want, then dismiss this".to_owned(),
+        ));
+    }
+
+    items
 }
 
 /// The attention list of one machine: the fleet's items and those of each [`Source`].
@@ -222,8 +385,41 @@ async fn list(State(attention): State<Arc<Attention>>) -> Response {
     }
 }
 
-async fn dismiss(State(_attention): State<Arc<Attention>>, Path(_id): Path<String>) -> Response {
-    error(StatusCode::NOT_IMPLEMENTED, "not yet".to_owned())
+async fn dismiss(State(attention): State<Arc<Attention>>, Path(id): Path<String>) -> Response {
+    let items = match attention.items().await {
+        Ok(items) => items,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    let Some(item) = items.iter().find(|item| item.id == id) else {
+        return error(StatusCode::NOT_FOUND, format!("no attention item {id:?}"));
+    };
+    let setting = match id
+        .strip_prefix("setting_overwritten:")
+        .map(str::parse::<SettingKey>)
+    {
+        Some(Ok(setting)) if item.kind == Kind::SettingOverwritten => setting,
+        _ => {
+            return error(
+                StatusCode::CONFLICT,
+                "only a \"setting overwritten\" item can be dismissed; this one clears on its own"
+                    .to_owned(),
+            );
+        }
+    };
+    match attention.coordinator.edit(Edit::Dismiss { setting }).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => {
+            let status = match e {
+                CoordinatorError::NotLinked(_)
+                | CoordinatorError::Older { .. }
+                | CoordinatorError::Unsettled { .. } => StatusCode::SERVICE_UNAVAILABLE,
+                CoordinatorError::Unwritable(_) | CoordinatorError::Store(_) => {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+            };
+            error(status, e.to_string())
+        }
+    }
 }
 
 /// `{"error": message}` with any URL password in it hidden, logged when the fault is ours.
