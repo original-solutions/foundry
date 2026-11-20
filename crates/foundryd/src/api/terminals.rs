@@ -105,15 +105,22 @@ async fn control(api: &Api, id: TerminalId, text: &str) -> Result<(), TerminalEr
 }
 
 async fn close(mut socket: WebSocket, code: u16, reason: String) {
-    let mut reason = redact(&reason);
+    let frame = CloseFrame {
+        code,
+        reason: close_reason(&reason).into(),
+    };
+    let _ = socket.send(ws::Message::Close(Some(frame))).await;
+}
+
+/// `reason` as a close frame carries it: redacted first, so a cut never leaves part of a
+/// password with no `@` to find it by, then cut to [`REASON_AT_MOST`] bytes on a character
+/// boundary.
+pub(super) fn close_reason(reason: &str) -> String {
+    let mut reason = redact(reason);
     let mut end = reason.len().min(REASON_AT_MOST);
     while !reason.is_char_boundary(end) {
         end -= 1;
     }
     reason.truncate(end);
-    let frame = CloseFrame {
-        code,
-        reason: reason.into(),
-    };
-    let _ = socket.send(ws::Message::Close(Some(frame))).await;
+    reason
 }

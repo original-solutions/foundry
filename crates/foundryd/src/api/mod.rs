@@ -6,7 +6,9 @@
 //!   [`UiMessage::Settings`] when the shared settings change. When a machine goes offline or
 //!   comes back, the whole state is sent again, so its sessions and terminals show as
 //!   unreachable or as they are. The store is read every [`EVENTS_EVERY`], so a record written
-//!   several times between two reads is sent once, at its newest version.
+//!   several times between two reads is sent once, at its newest version. A record this build
+//!   cannot read, one a newer build wrote before a rollback, leaves out its owner's changes up
+//!   to it, with a warning, and the socket goes on.
 //! - `GET /api/terminals/{id}`, a WebSocket: see [`terminals`].
 //! - `POST /api/workspaces` `{project, base, name}`: makes a workspace on this machine, `201
 //!   {id}`. When the workspace is made but its setup could not be started, it is still `201`,
@@ -31,6 +33,10 @@
 //! attacker's DNS points at this machine is refused. A request a browser sends from another
 //! site, which it marks with an `Origin` that is not the `Host`, is refused too. Without that, any web page could open a
 //! terminal socket and type into a shell.
+//!
+//! Nothing asks who the caller is: every machine and process that can reach the address is
+//! trusted, as the spec decides ("Access is anyone on the tailnet until a second person needs
+//! the app"). The checks above keep out web pages, not peers.
 //!
 //! No response holds a secret: records and settings carry none, and the password or token in
 //! a URL, as git puts one in an error or a project's repo may hold one, is hidden by
@@ -566,7 +572,18 @@ async fn send_events(api: &Api, mut socket: WebSocket) -> Result<(), StoreError>
             if version <= from {
                 continue;
             }
-            let records = on_store(&api.store, move |store| store.since(owner, from)).await?;
+            let records = match on_store(&api.store, move |store| store.since(owner, from)).await {
+                Ok(records) => records,
+                // A record this build cannot read, one a newer build wrote before a rollback,
+                // leaves out its owner's changes up to `version`, as `Peers::state` leaves the
+                // owner out, rather than end the socket for every other owner.
+                Err(error @ StoreError::Json(_)) => {
+                    tracing::warn!("api: records of {owner} not sent: {error}");
+                    sent.versions.insert(owner, version);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             for record in records {
                 let version = record.version();
                 let message = UiMessage::Record {

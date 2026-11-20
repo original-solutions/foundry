@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use foundry_proto::ids::{MachineId, ProjectId, SessionId, TerminalId, WorkspaceId};
 use foundry_proto::messages::{PROTOCOL, PeerMessage, UiMessage};
-use foundry_proto::record::AnyRecord;
+use foundry_proto::record::{AnyRecord, Record, Session};
 use foundry_proto::settings::{Machine, Project};
 use foundry_proto::state::{SessionState, TerminalState};
 use futures::future::BoxFuture;
@@ -21,7 +21,7 @@ use tokio_tungstenite::tungstenite::{self, Message};
 use super::*;
 use crate::sessions::{self, Gateway, Sessions};
 use crate::store::Store;
-use crate::sync::{Conn, Dialer, Peers};
+use crate::sync::{Conn, Dialer, OFFLINE_AFTER, Peers};
 use crate::terminals::Terminals;
 use crate::workspaces::{Dirty, Workspaces};
 
@@ -1340,6 +1340,32 @@ async fn an_archive_with_no_body_is_archived_whatever_its_content_type() {
     assert_eq!(reply.status, 204, "{}", reply.body);
 }
 
+/// An archive body that is JSON but not an archive's, a `force` that is not a boolean or a
+/// field misspelled, is refused and archives nothing.
+#[tokio::test]
+async fn an_archive_body_of_the_wrong_shape_is_refused_and_archives_nothing() {
+    let daemon = Daemon::new(TURN).await;
+    let project = daemon.project();
+    let workspace = daemon.create_workspace(project, "shapes").await;
+    let worktree = daemon.workspaces.worktree(workspace).await.unwrap();
+    for body in [r#"{"force":"yes"}"#, r#"{"forse":true}"#] {
+        let reply = daemon
+            .call(
+                "POST",
+                &format!("/api/workspaces/{workspace}/archive"),
+                Some(serde_json::from_str(body).unwrap()),
+            )
+            .await;
+        assert_eq!(reply.status, 422, "{body}: {}", reply.body);
+        assert!(reply.json()["error"].is_string(), "{body}: {}", reply.body);
+        assert!(worktree.exists(), "{body} archived the workspace");
+        assert_eq!(
+            daemon.workspaces.worktree(workspace).await.unwrap(),
+            worktree
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_field_a_request_does_not_know_is_refused() {
     let daemon = Daemon::new(TURN).await;
@@ -1452,8 +1478,26 @@ async fn frames_within(socket: &mut Socket, span: Duration) -> Vec<UiMessage> {
     frames
 }
 
+/// A session owned by `owner`, at `version`, in `state`.
+fn peer_session(owner: MachineId, version: u64, state: SessionState) -> AnyRecord {
+    AnyRecord::Session(Record {
+        owner,
+        version,
+        deleted: false,
+        body: Session {
+            id: SessionId::random(),
+            workspace: WorkspaceId::random(),
+            terminal: TerminalId::random(),
+            model: MODEL.into(),
+            state,
+        },
+    })
+}
+
+/// A peer that comes online, writes a record and goes quiet: the UI gets the state again with
+/// the peer online, then its record, then the state again with its session unreachable.
 #[tokio::test]
-async fn events_send_the_state_again_when_a_peer_comes_online() {
+async fn events_follow_a_peer_that_comes_online_writes_and_goes_offline() {
     let daemon = Daemon::new(TURN).await;
     let peer = daemon.add_machine();
     let (mut socket, _) = daemon.events().await;
@@ -1491,7 +1535,89 @@ async fn events_send_the_state_again_when_a_peer_comes_online() {
         }
     }
     assert!(daemon.peers.online().contains(&peer));
-    // Going offline takes OFFLINE_AFTER (15 s) of real time, which is not waited for here.
+
+    let session = peer_session(peer, 1, SessionState::Working);
+    let records = PeerMessage::Records {
+        protocol: PROTOCOL,
+        records: vec![session.clone()],
+    };
+    mine.send
+        .send(serde_json::to_string(&records).unwrap())
+        .await
+        .unwrap();
+    match next_message(&mut socket).await {
+        UiMessage::Record { record, .. } => assert_eq!(record, session),
+        other => panic!("the peer's record did not come next: {other:?}"),
+    }
+
+    // The peer says nothing more, so it is offline OFFLINE_AFTER (15 s) after its record.
+    let id = match &session {
+        AnyRecord::Session(s) => s.body.id,
+        _ => unreachable!(),
+    };
+    let records = tokio::time::timeout(OFFLINE_AFTER + WAIT, async {
+        loop {
+            if let UiMessage::State { records, .. } = next_message(&mut socket).await {
+                return records;
+            }
+        }
+    })
+    .await
+    .expect("the state comes again once the peer is offline");
+    assert!(!daemon.peers.online().contains(&peer));
+    assert_eq!(
+        session_states(&records, id),
+        vec![SessionState::Unreachable]
+    );
+    drop(mine);
+}
+
+/// Puts a row this build cannot read into the daemon's store, as a newer build on `owner`
+/// would have left it before a rollback.
+fn insert_unreadable(daemon: &Daemon, owner: MachineId, version: u64) {
+    let conn = rusqlite::Connection::open(daemon.data.path().join("foundry.db")).unwrap();
+    conn.execute(
+        "INSERT INTO records (kind, id, owner, version, record) VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![
+            "printer",
+            format!("unreadable-{version}"),
+            owner.to_string(),
+            version as i64,
+            format!(
+                r#"{{"kind":"printer","owner":"{owner}","version":{version},"deleted":false,"body":{{}}}}"#
+            )
+        ],
+    )
+    .unwrap();
+}
+
+/// A record the store cannot read leaves its owner's changes up to it out, as the state does,
+/// and the socket goes on sending every other change and the owner's later ones.
+#[tokio::test]
+async fn events_go_on_past_a_record_this_build_cannot_read() {
+    let daemon = Daemon::new(TURN).await;
+    let (mut socket, _) = daemon.events().await;
+    let other = MachineId::random();
+    insert_unreadable(&daemon, other, 1);
+    // The socket meets the row within a few reads.
+    let frames = frames_within(&mut socket, 3 * EVENTS_EVERY).await;
+    assert!(frames.is_empty(), "{frames:?}");
+
+    daemon.add_machine();
+    loop {
+        if matches!(next_message(&mut socket).await, UiMessage::Settings { .. }) {
+            break;
+        }
+    }
+    let later = peer_session(other, 2, SessionState::Idle);
+    assert!(matches!(
+        daemon.store.lock().unwrap().apply(&later, other).unwrap(),
+        crate::store::Applied::Stored
+    ));
+    match next_message(&mut socket).await {
+        UiMessage::Record { record, .. } => assert_eq!(record, later),
+        other => panic!("the owner's later record did not come next: {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -1649,6 +1775,90 @@ async fn a_client_cut_off_for_falling_behind_is_closed_with_1013() {
             Some(Ok(_)) => {}
             other => panic!("the socket ended without a close frame: {other:?}"),
         }
+    }
+}
+
+/// Stops every process whose command line names `pattern` until this is dropped.
+struct Stopped(Vec<nix::unistd::Pid>);
+
+impl Stopped {
+    fn matching(pattern: &str) -> Self {
+        let out = Command::new("pgrep")
+            .args(["-f", pattern])
+            .output()
+            .unwrap();
+        let pids: Vec<_> = String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .map(|pid| nix::unistd::Pid::from_raw(pid.parse().unwrap()))
+            .collect();
+        assert!(!pids.is_empty(), "no process names {pattern}");
+        for pid in &pids {
+            nix::sys::signal::kill(*pid, nix::sys::signal::Signal::SIGSTOP).unwrap();
+        }
+        Stopped(pids)
+    }
+}
+
+impl Drop for Stopped {
+    fn drop(&mut self) {
+        for pid in &self.0 {
+            let _ = nix::sys::signal::kill(*pid, nix::sys::signal::Signal::SIGCONT);
+        }
+    }
+}
+
+/// Input the holder never answers, because it is stopped, ends the socket with 1011 and the
+/// reason, not with 1000 or 1013.
+#[tokio::test]
+async fn input_the_holder_never_answers_closes_the_socket_with_1011_and_the_reason() {
+    let daemon = Daemon::new(TURN).await;
+    let id = cat(&daemon).await;
+    let (mut socket, _) =
+        tokio_tungstenite::connect_async(daemon.ws_url(&format!("/api/terminals/{id}")))
+            .await
+            .unwrap();
+    socket
+        .send(Message::binary(&b"before\n"[..]))
+        .await
+        .unwrap();
+    read_until(&mut socket, "before").await;
+
+    let stopped = Stopped::matching(&format!("{id}.sock"));
+    socket.send(Message::binary(&b"after\n"[..])).await.unwrap();
+    loop {
+        let frame = tokio::time::timeout(2 * WAIT, socket.next())
+            .await
+            .expect("the socket closes once the holder does not answer");
+        match frame {
+            Some(Ok(Message::Close(Some(close)))) => {
+                assert_eq!(u16::from(close.code), 1011, "{close:?}");
+                assert!(close.reason.contains(&id.to_string()), "{close:?}");
+                break;
+            }
+            Some(Ok(_)) => {}
+            other => panic!("the socket ended without a close frame: {other:?}"),
+        }
+    }
+    drop(stopped);
+}
+
+/// A close reason is redacted before it is cut to the 123 bytes a close frame carries, and the
+/// cut never splits a character.
+#[test]
+fn a_close_reason_is_redacted_then_cut_on_a_character_boundary() {
+    assert_eq!(terminals::close_reason("exited"), "exited");
+    // Cut before redacting, the first would keep `user:secret-tok` with no `@` to hide it.
+    let url = format!("{}https://user:secret-token@host/r.git", "x".repeat(100));
+    let reason = terminals::close_reason(&url);
+    assert!(!reason.contains("secret"), "{reason}");
+    assert!(reason.len() <= 123, "{reason}");
+    // One of these two puts byte 123 inside a two-byte character.
+    for pad in ["", "x"] {
+        let long = format!("terminal: https://u:t@h/{pad}{}", "é".repeat(80));
+        let reason = terminals::close_reason(&long);
+        assert!(reason.len() <= 123 && reason.len() >= 122, "{reason}");
+        assert!(redact(&long).starts_with(&reason), "{reason}");
+        assert!(!reason.contains("u:t"), "{reason}");
     }
 }
 
