@@ -649,6 +649,37 @@ fn reopening_a_current_file_runs_no_migration_again() {
     assert_eq!(store.since(owner, 0).unwrap(), vec![workspace(owner, 2)]);
 }
 
+#[test]
+fn a_file_a_newer_build_migrated_opens_and_keeps_working() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("foundry.db");
+    let newer = MIGRATIONS.len() + 1;
+    drop(Store::open(&path).unwrap());
+    {
+        // What a newer build's extra step leaves: a table of its own and a higher count.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute("CREATE TABLE added_by_a_newer_build (x INTEGER)", [])
+            .unwrap();
+        conn.pragma_update(None, "user_version", newer as i64)
+            .unwrap();
+    }
+    let mut store = Store::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), newer);
+    let added: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM added_by_a_newer_build", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(added, 0);
+    let owner = MachineId::random();
+    assert_eq!(
+        store.apply(&workspace(owner, 1), owner).unwrap(),
+        Applied::Stored
+    );
+    assert_eq!(store.since(owner, 0).unwrap(), vec![workspace(owner, 1)]);
+}
+
 /// Puts a row this build cannot read into the store, as a newer build would have left it.
 fn insert_unreadable(store: &Store, owner: MachineId, version: u64, kind: &str, body: &str) {
     store
