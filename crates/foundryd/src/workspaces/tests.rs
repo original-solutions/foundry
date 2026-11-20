@@ -2151,3 +2151,27 @@ async fn sweep_skips_and_logs_when_a_record_cannot_be_read() {
         "{text}"
     );
 }
+
+#[tokio::test]
+async fn sweep_logs_a_clone_it_cannot_read_and_goes_on_to_the_next() {
+    let setup = Setup::new();
+    let broken = setup.project(&[("README.md", "hello\n")]);
+    // A link to itself cannot be read: the check for it fails rather than saying no.
+    let clone = setup.clone_of(broken.project);
+    std::fs::create_dir_all(setup.clones()).unwrap();
+    std::os::unix::fs::symlink(&clone, &clone).unwrap();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let leftover = setup.leftover(&remote, "crashed").await;
+    let (_guard, logs) = logs();
+
+    setup.workspaces.sweep().await.unwrap();
+
+    assert!(!leftover.exists());
+    let text = text_of(&logs);
+    let line = text
+        .lines()
+        .find(|l| l.contains(&format!("{}.git", broken.project)))
+        .unwrap_or_else(|| panic!("no line names the unreadable clone: {text}"));
+    assert!(line.contains("WARN"), "{line}");
+    assert!(line.contains("could not be read"), "{line}");
+}
