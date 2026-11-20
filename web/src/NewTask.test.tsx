@@ -119,6 +119,7 @@ describe("NewTask", () => {
     const machine = (await within(dialog).findByLabelText("Machine")) as HTMLSelectElement;
     expect(Array.from(machine.options).map((o) => [o.textContent, o.disabled])).toEqual([
       ["this machine", false],
+      ["let Foundry choose", false],
       ["laptop", false],
       ["old mini (offline)", true],
     ]);
@@ -132,6 +133,80 @@ describe("NewTask", () => {
     await waitFor(() => expect(calls).toHaveLength(2));
     expect(calls[0].body).toEqual({ project: "p1", base: "main", name: "far work", machine: "m2" });
     expect(calls[1]).toEqual({ url: "/api/workspaces/w9/sessions", method: "POST", body: { model: "opus", prompt: "Far work" } });
+  });
+
+  /** The fleet's machines, and `answers` to the requests the dialog sends, which it records. */
+  function fleetOf(...answers: Response[]): Call[] {
+    const machines = {
+      me: ME,
+      machines: [
+        { id: ME, name: "studio", online: true },
+        { id: "m2", name: "laptop", online: true },
+      ],
+    };
+    const calls: Call[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init: RequestInit = {}) => {
+        if (url === "/api/machines") return json(200, machines);
+        calls.push({ url, method: init.method ?? "GET", body: init.body ? JSON.parse(String(init.body)) : undefined });
+        return answers.shift() ?? json(500, { error: "unexpected request" });
+      }),
+    );
+    return calls;
+  }
+
+  it("letting Foundry choose sends the model and task with the create, then starts the session where it was made", async () => {
+    const calls = fleetOf(json(201, { id: "w9", machine: "m2" }), json(201, { id: "s9" }));
+    const created = vi.fn();
+    await renderApp(<Harness onCreated={created} />);
+
+    const dialog = await show();
+    const machine = (await within(dialog).findByLabelText("Machine")) as HTMLSelectElement;
+    fireEvent.change(taskBox(dialog), { target: { value: "Fix the footer." } });
+    fireEvent.change(machine, { target: { value: "choose" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Start" }));
+
+    await waitFor(() => expect(calls).toHaveLength(2));
+    expect(calls[0].body).toEqual({ project: "p1", base: "main", name: "fix the footer", machine: "choose", model: "opus", prompt: "Fix the footer." });
+    expect(calls[1]).toEqual({ url: "/api/workspaces/w9/sessions", method: "POST", body: { model: "opus", prompt: "Fix the footer." } });
+    await waitFor(() => expect(created).toHaveBeenCalledWith("s9"));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  });
+
+  it("closes on a request that waits for a machine, starts no session, and asks for the waiting list again", async () => {
+    const calls = fleetOf(json(202, { request: "r1", reasons: ["laptop: load 1.8 over limit 1.0"] }));
+    const created = vi.fn();
+    const { client } = await renderApp(<Harness onCreated={created} />);
+    const refreshed = vi.spyOn(client, "invalidateQueries");
+
+    const dialog = await show();
+    const machine = (await within(dialog).findByLabelText("Machine")) as HTMLSelectElement;
+    fireEvent.change(taskBox(dialog), { target: { value: "Later work" } });
+    fireEvent.change(machine, { target: { value: "choose" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Start" }));
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(calls).toHaveLength(1);
+    expect(calls[0].body).toEqual({ project: "p1", base: "main", name: "later work", machine: "choose", model: "opus", prompt: "Later work" });
+    expect(created).not.toHaveBeenCalled();
+    expect(refreshed).toHaveBeenCalledWith({ queryKey: ["placements"] });
+  });
+
+  it("shows the warning of a machine picked over its limits and stays open on it", async () => {
+    fleetOf(json(201, { id: "w9", warning: "laptop is over its limits: load 1.5 over limit 1.0" }), json(201, { id: "s9" }));
+    const created = vi.fn();
+    await renderApp(<Harness onCreated={created} />);
+
+    const dialog = await show();
+    const machine = (await within(dialog).findByLabelText("Machine")) as HTMLSelectElement;
+    fireEvent.change(taskBox(dialog), { target: { value: "Anyway" } });
+    fireEvent.change(machine, { target: { value: "m2" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Start" }));
+
+    expect(await within(dialog).findByText("laptop is over its limits: load 1.5 over limit 1.0")).toBeDefined();
+    expect(created).toHaveBeenCalledWith("s9");
+    expect(screen.getByRole("dialog")).toBeDefined();
   });
 
   it("still makes the workspace on this machine when the machine list cannot be read", async () => {
