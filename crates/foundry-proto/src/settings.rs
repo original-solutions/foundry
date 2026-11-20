@@ -50,7 +50,7 @@ pub struct Limits {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::assert_round_trip;
+    use crate::{assert_round_trip, parse_error};
 
     pub(crate) fn settings() -> SharedSettings {
         let mac = MachineId::random();
@@ -81,6 +81,28 @@ pub(crate) mod tests {
                     max_sessions: 6,
                     max_load_per_core: 1.0,
                     min_free_disk: 20 * 1024 * 1024 * 1024,
+                },
+            )]
+            .into(),
+            stamps: [
+                (SettingKey::Machine(mac), Stamp { seq: 40, by: vps }),
+                (SettingKey::Priority, Stamp { seq: 42, by: mac }),
+                (
+                    SettingKey::Overwritten(Box::new(SettingKey::Limits(vps))),
+                    Stamp { seq: 41, by: vps },
+                ),
+            ]
+            .into(),
+            seen: [(mac, 42), (vps, 41)].into(),
+            overwritten: [(
+                SettingKey::Limits(vps),
+                Overwritten {
+                    kept: None,
+                    lost: Some(SettingValue::Limits(Limits {
+                        max_sessions: 2,
+                        max_load_per_core: 0.5,
+                        min_free_disk: 1,
+                    })),
                 },
             )]
             .into(),
@@ -144,11 +166,196 @@ pub(crate) mod tests {
                 },
             )]
             .into(),
+            ..SharedSettings::default()
         };
         assert_eq!(
             serde_json::from_str::<SharedSettings>(&json).unwrap(),
             expected
         );
+    }
+
+    #[test]
+    fn the_older_form_without_stamps_still_reads() {
+        let json = r#"{"seq":7,"machines":[],"priority":[],"projects":[],"limits":{}}"#;
+        let read: SharedSettings = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            read,
+            SharedSettings {
+                seq: 7,
+                ..SharedSettings::default()
+            }
+        );
+        assert!(read.stamps.is_empty() && read.seen.is_empty() && read.overwritten.is_empty());
+    }
+
+    #[test]
+    fn stamped_settings_read_from_their_wire_form() {
+        let mac = "67e55044-10b1-426f-9247-bb680e5fe0c8";
+        let json = format!(
+            r#"{{"seq":5,"machines":[],"priority":[],"projects":[],"limits":{{}},
+                "stamps":{{"priority":{{"seq":5,"by":"{mac}"}},"overwritten:limits:{mac}":{{"seq":4,"by":"{mac}"}}}},
+                "seen":{{"{mac}":5}},
+                "overwritten":{{"limits:{mac}":{{"kept":{{"setting":"priority","value":["{mac}"]}},"lost":null}}}}}}"#
+        );
+        let id = MachineId(mac.parse().unwrap());
+        let read: SharedSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(read.stamps[&SettingKey::Priority], Stamp { seq: 5, by: id });
+        assert_eq!(
+            read.stamps[&SettingKey::Overwritten(Box::new(SettingKey::Limits(id)))],
+            Stamp { seq: 4, by: id }
+        );
+        assert_eq!(read.seen, [(id, 5)].into());
+        assert_eq!(
+            read.overwritten[&SettingKey::Limits(id)],
+            Overwritten {
+                kept: Some(SettingValue::Priority(vec![id])),
+                lost: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_setting_key_is_written_as_text_and_read_back() {
+        let id = MachineId::random();
+        let project = ProjectId::random();
+        let keys = [
+            (SettingKey::Machine(id), format!("machine:{id}")),
+            (SettingKey::Priority, "priority".to_owned()),
+            (SettingKey::Project(project), format!("project:{project}")),
+            (SettingKey::Limits(id), format!("limits:{id}")),
+            (
+                SettingKey::Overwritten(Box::new(SettingKey::Project(project))),
+                format!("overwritten:project:{project}"),
+            ),
+            (
+                SettingKey::Overwritten(Box::new(SettingKey::Priority)),
+                "overwritten:priority".to_owned(),
+            ),
+        ];
+        for (key, text) in keys {
+            assert_eq!(key.to_string(), text);
+            assert_eq!(text.parse::<SettingKey>().unwrap(), key);
+            assert_round_trip(&key);
+        }
+    }
+
+    #[test]
+    fn a_setting_key_that_names_nothing_is_refused() {
+        let id = MachineId::random();
+        for text in [
+            "".to_owned(),
+            "gossip".to_owned(),
+            "machine:not-a-uuid".to_owned(),
+            "priority:x".to_owned(),
+            format!("overwritten:overwritten:machine:{id}"),
+            "overwritten:".to_owned(),
+        ] {
+            assert!(text.parse::<SettingKey>().is_err(), "{text}");
+            parse_error::<SettingKey>(&format!("\"{text}\""));
+        }
+    }
+
+    #[test]
+    fn a_higher_seq_beats_and_an_equal_seq_goes_to_the_lower_machine() {
+        let low = MachineId(uuid::Uuid::from_u128(1));
+        let high = MachineId(uuid::Uuid::from_u128(2));
+        assert!(Stamp { seq: 3, by: high } > Stamp { seq: 2, by: low });
+        assert!(Stamp { seq: 2, by: low } > Stamp { seq: 2, by: high });
+        assert!(Stamp { seq: 1, by: high } > Stamp::NONE);
+        assert_eq!(Stamp::default(), Stamp::NONE);
+    }
+
+    #[test]
+    fn each_edit_names_its_setting_and_the_value_it_leaves() {
+        let settings = settings();
+        let machine = settings.machines[0].clone();
+        let project = settings.projects[0].clone();
+        let limits = settings.limits[&machine.id].clone();
+        let edits = [
+            (
+                Edit::SetMachine {
+                    machine: machine.clone(),
+                },
+                SettingKey::Machine(machine.id),
+                Some(SettingValue::Machine(machine.clone())),
+            ),
+            (
+                Edit::RemoveMachine { id: machine.id },
+                SettingKey::Machine(machine.id),
+                None,
+            ),
+            (
+                Edit::Priority {
+                    order: settings.priority.clone(),
+                },
+                SettingKey::Priority,
+                Some(SettingValue::Priority(settings.priority.clone())),
+            ),
+            (
+                Edit::SetProject {
+                    project: project.clone(),
+                },
+                SettingKey::Project(project.id),
+                Some(SettingValue::Project(project.clone())),
+            ),
+            (
+                Edit::RemoveProject { id: project.id },
+                SettingKey::Project(project.id),
+                None,
+            ),
+            (
+                Edit::SetLimits {
+                    machine: machine.id,
+                    limits: limits.clone(),
+                },
+                SettingKey::Limits(machine.id),
+                Some(SettingValue::Limits(limits)),
+            ),
+            (
+                Edit::RemoveLimits {
+                    machine: machine.id,
+                },
+                SettingKey::Limits(machine.id),
+                None,
+            ),
+            (
+                Edit::Dismiss {
+                    setting: SettingKey::Priority,
+                },
+                SettingKey::Overwritten(Box::new(SettingKey::Priority)),
+                None,
+            ),
+        ];
+        for (edit, key, value) in edits {
+            assert_eq!(edit.key(), key, "{edit:?}");
+            assert_eq!(edit.value(), value, "{edit:?}");
+            assert_round_trip(&edit);
+        }
+    }
+
+    #[test]
+    fn an_edit_reads_from_its_wire_form() {
+        let mac = "67e55044-10b1-426f-9247-bb680e5fe0c8";
+        let id = MachineId(mac.parse().unwrap());
+        let cases = [
+            (
+                format!(r#"{{"kind":"remove_machine","id":"{mac}"}}"#),
+                Edit::RemoveMachine { id },
+            ),
+            (
+                format!(r#"{{"kind":"priority","order":["{mac}"]}}"#),
+                Edit::Priority { order: vec![id] },
+            ),
+            (
+                format!(r#"{{"kind":"dismiss","setting":"limits:{mac}"}}"#),
+                Edit::Dismiss {
+                    setting: SettingKey::Limits(id),
+                },
+            ),
+        ];
+        for (json, expected) in cases {
+            assert_eq!(serde_json::from_str::<Edit>(&json).expect(&json), expected);
+        }
     }
 
     #[test]

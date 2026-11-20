@@ -85,6 +85,7 @@ mod tests {
     use super::*;
     use crate::record::tests::{machine_sample, session, terminal, workspace};
     use crate::settings::tests::settings;
+    use crate::settings::{Edit, SettingKey};
     use crate::{assert_round_trip, parse_error};
 
     fn records() -> Vec<AnyRecord> {
@@ -115,6 +116,18 @@ mod tests {
                 protocol: PROTOCOL,
                 machine: MachineId::random(),
                 terminal: TerminalId::random(),
+            },
+            PeerMessage::Edit {
+                protocol: PROTOCOL,
+                edit: Edit::SetProject {
+                    project: settings().projects[0].clone(),
+                },
+            },
+            PeerMessage::Edit {
+                protocol: PROTOCOL,
+                edit: Edit::Dismiss {
+                    setting: SettingKey::Priority,
+                },
             },
         ]
     }
@@ -224,6 +237,15 @@ mod tests {
                     protocol: 1,
                     machine: id,
                     terminal: TerminalId(terminal.parse().unwrap()),
+                },
+            ),
+            (
+                format!(
+                    r#"{{"type":"edit","protocol":1,"edit":{{"kind":"remove_limits","machine":"{machine}"}}}}"#
+                ),
+                PeerMessage::Edit {
+                    protocol: 1,
+                    edit: Edit::RemoveLimits { machine: id },
                 },
             ),
         ];
