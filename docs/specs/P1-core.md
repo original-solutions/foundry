@@ -164,6 +164,8 @@ This is a rule for every piece, not only P1: nothing runs without the UI showing
 
 A session can be started with a first prompt (`POST /api/workspaces/{id}/sessions` takes `prompt` beside `model`): it is Claude Code's last argument, after `--`, so the agent starts on it at once and its hooks report it as any typed prompt. A blank prompt is none; one with a NUL or over 20,000 characters is refused. The new-workspace and new-session dialogs offer it as an optional box.
 
+Any machine's UI can make a workspace on another machine and act on another machine's workspaces: a create that picks another machine, and a session, shell, archive or close on a workspace or terminal another machine owns, is carried to its owner over the keyed peer link, and the owner's answer comes back unchanged.
+
 Branch names are `<name>` as typed, made safe for git. Worktrees live under the data directory at `worktrees/<project>/<branch>`.
 
 ### Archiving
