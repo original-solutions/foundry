@@ -653,6 +653,77 @@ async fn the_owner_beats_on_an_idle_relay_and_ends_one_its_opener_went_silent_on
     assert!(start.elapsed() >= OFFLINE_AFTER - Duration::from_secs(3));
 }
 
+/// The next frame on `conn` that is not a beat.
+async fn said(conn: &mut Conn) -> serde_json::Value {
+    timeout(WAIT, async {
+        loop {
+            let next = frame(conn, WAIT)
+                .await
+                .expect("a frame, not the link's end");
+            if next["type"] != "beat" {
+                return next;
+            }
+        }
+    })
+    .await
+    .expect("a frame other than a beat within the wait")
+}
+
+#[tokio::test]
+async fn a_relay_closes_once_its_opener_leaves_the_machine_list() {
+    let fleet = Fleet::start(2);
+    let (a, b) = (&fleet.daemons[0], &fleet.daemons[1]);
+    let on_b = Held::new(b.id, b.store.clone());
+    b.peers.serve_terminals(on_b.terminals.clone());
+    let id = on_b.cat().await;
+    let mut conn = raw_relay(&b.peers, a.id, id).await;
+    let first = frame(&mut conn, WAIT).await.expect("the snapshot");
+    assert_eq!(first["type"], "snapshot", "{first}");
+    // Keep the relay heard from, so only the machine list can end it.
+    let beats = conn.send.clone();
+    let _beating = tokio::spawn(async move {
+        while beats.send(r#"{"type":"beat"}"#.to_owned()).await.is_ok() {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    });
+    b.set_settings(foundry_proto::settings::SharedSettings {
+        seq: 2,
+        ..settings_for(&[b.id])
+    });
+    let closed = said(&mut conn).await;
+    assert_eq!(closed["type"], "closed", "{closed}");
+    assert_eq!(closed["code"], 1011, "{closed}");
+    let reason = closed["reason"].as_str().unwrap();
+    assert!(reason.contains("no longer a peer"), "{reason}");
+}
+
+#[tokio::test]
+async fn input_that_cannot_be_read_or_passes_the_holders_limit_closes_the_relay() {
+    let fleet = Fleet::start(2);
+    let (a, b) = (&fleet.daemons[0], &fleet.daemons[1]);
+    let on_b = Held::new(b.id, b.store.clone());
+    b.peers.serve_terminals(on_b.terminals.clone());
+    let id = on_b.cat().await;
+    let odd = vec![serde_json::json!({"type": "input", "bytes": "abc", "last": true})];
+    // 17 pieces of 1 MiB, none marked last: more than the holder's 16 MiB frame.
+    let piece =
+        serde_json::json!({"type": "input", "bytes": "00".repeat(1024 * 1024), "last": false});
+    let too_much = vec![piece; 17];
+    for input in [odd, too_much] {
+        let mut conn = raw_relay(&b.peers, a.id, id).await;
+        let first = frame(&mut conn, WAIT).await.expect("the snapshot");
+        assert_eq!(first["type"], "snapshot", "{first}");
+        for frame in input {
+            conn.send.send(frame.to_string()).await.unwrap();
+        }
+        let closed = said(&mut conn).await;
+        assert_eq!(closed["type"], "closed", "{closed}");
+        assert_eq!(closed["code"], 1011, "{closed}");
+        let reason = closed["reason"].as_str().unwrap();
+        assert!(reason.contains("cannot be read"), "{reason}");
+    }
+}
+
 /// An owner that answers a relay with `answer`, each frame after its delay, then holds the
 /// link open and silent, or closes it when `hold` is false. What the opener sends after its
 /// relay goes to `heard`.
@@ -1077,4 +1148,64 @@ async fn an_attach_to_a_terminal_b_closed_is_404() {
     let api = Served::start(a).await;
     let (status, body) = api.refused(id).await;
     assert_eq!(status, 404, "{body}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_snapshot_that_cannot_be_read_or_passes_the_holders_limit_is_refused() {
+    let odd = vec![r#"{"type":"snapshot","start":0,"bytes":"abc","last":true}"#.to_owned()];
+    // 17 pieces of 1 MiB, none marked last: more than the holder's 16 MiB frame.
+    let piece = serde_json::json!({
+        "type": "snapshot",
+        "start": 0,
+        "bytes": "00".repeat(1024 * 1024),
+        "last": false,
+    });
+    let too_much = vec![piece.to_string(); 17];
+    for answer in [odd, too_much] {
+        let answer: Vec<&str> = answer.iter().map(String::as_str).collect();
+        let (peers, owner, _dir) = opener(FakeOwner::answering(&answer));
+        match peers.open_terminal(owner, TerminalId::random()).await {
+            Err(RelayError::Refused(reason)) => {
+                assert!(reason.contains("snapshot that cannot be read"), "{reason}");
+            }
+            Err(other) => panic!("refused another way: {other}"),
+            Ok(_) => panic!("a relay opened on a snapshot that cannot be read"),
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn output_that_cannot_be_read_closes_the_relay_with_1011() {
+    let output = r#"{"type":"output","bytes":"zz"}"#;
+    let (peers, owner, _dir) = opener(FakeOwner::answering(&[EMPTY_SNAPSHOT, output]));
+    let (_snapshot, mut remote) = peers
+        .open_terminal(owner, TerminalId::random())
+        .await
+        .unwrap();
+    let closed = remote_closed(&mut remote).await;
+    assert_eq!(closed.code, 1011, "{closed:?}");
+    assert!(closed.reason.contains("cannot be read"), "{closed:?}");
+}
+
+#[tokio::test]
+async fn an_attach_to_this_machines_own_terminal_that_is_not_live_here_is_404() {
+    let fleet = Fleet::start(2);
+    let a = &fleet.daemons[0];
+    // A's own terminal, held by terminals other than the ones A's API serves.
+    let elsewhere = Held::new(a.id, a.store.clone());
+    let id = elsewhere.cat().await;
+    let api = Served::start(a).await;
+    let (status, body) = api.refused(id).await;
+    assert_eq!(status, 404, "{body}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_link_whose_first_message_never_comes_is_dropped_after_the_offline_limit() {
+    let (peers, _owner, _dir) = opener(FakeOwner::answering(&[]));
+    let (_near, far) = Conn::pair();
+    let start = tokio::time::Instant::now();
+    timeout(OFFLINE_AFTER + Duration::from_secs(1), peers.accept(far))
+        .await
+        .expect("accept gives up on a silent link");
+    assert!(start.elapsed() >= OFFLINE_AFTER);
 }

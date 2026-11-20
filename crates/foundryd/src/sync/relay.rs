@@ -311,7 +311,8 @@ impl Remote {
 
 /// Serves a relay that `machine` opened for `terminal`, until either end goes. A machine that
 /// is not a peer, a `Peers` serving no terminals, and a terminal this machine does not hold
-/// are each answered with a close that says why.
+/// are each answered with a close that says why. The machine list is read again every
+/// [`TICK`], as the record link does, and a relay whose machine has left it closes the same way.
 pub(super) async fn serve(inner: &Inner, machine: MachineId, terminal: TerminalId, conn: Conn) {
     let Conn { send, mut recv } = conn;
     let failed = |reason: String| Closed {
@@ -344,8 +345,16 @@ pub(super) async fn serve(inner: &Inner, machine: MachineId, terminal: TerminalI
     let _beat = beat(send.clone());
     let mut heard = Instant::now();
     let mut typed = Vec::new();
+    let mut every = tokio::time::interval(TICK);
     loop {
         tokio::select! {
+            _ = every.tick() => {
+                if !listed(inner, machine).await {
+                    tracing::info!("sync: {machine} left the machine list; relay closed");
+                    let reason = format!("machine {machine} is no longer a peer of this machine");
+                    return finish(&send, &mut recv, failed(reason)).await;
+                }
+            }
             item = output.next() => {
                 let bytes = match item {
                     Some(Ok(bytes)) => bytes,
