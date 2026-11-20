@@ -918,6 +918,14 @@ async fn an_input_larger_than_one_frame_goes_in_pieces_only_the_last_marked() {
     assert_eq!(total, 1_500_000);
 }
 
+/// Waits until the child has printed "ready", which may already be in the snapshot when it
+/// printed before the attach.
+async fn ready(snapshot: &Snapshot, remote: &mut Remote) {
+    if !String::from_utf8_lossy(&snapshot.bytes).contains("ready") {
+        remote_until(remote, "ready", 1).await;
+    }
+}
+
 #[tokio::test]
 async fn input_b_refuses_is_reported_and_the_relay_stays_open() {
     let fleet = Fleet::start(2);
@@ -926,8 +934,8 @@ async fn input_b_refuses_is_reported_and_the_relay_stays_open() {
     b.peers.serve_terminals(on_b.terminals.clone());
     let script = "stty -echo; echo ready; read l; echo got-$l; sleep 60";
     let id = on_b.start(&["sh", "-c", script]).await;
-    let (_snapshot, mut remote) = a.peers.open_terminal(b.id, id).await.unwrap();
-    remote_until(&mut remote, "ready", 1).await;
+    let (snapshot, mut remote) = a.peers.open_terminal(b.id, id).await.unwrap();
+    ready(&snapshot, &mut remote).await;
     let too_much = foundry_holder::protocol::MAX_PENDING_INPUT + 1;
     remote
         .input(Bytes::from(vec![b'x'; too_much]))
@@ -1028,8 +1036,8 @@ async fn an_input_larger_than_one_frame_reaches_b_whole() {
     b.peers.serve_terminals(on_b.terminals.clone());
     let script = "stty raw -echo; echo ready; head -c 2500000 > typed; echo done";
     let id = on_b.start(&["sh", "-c", script]).await;
-    let (_snapshot, mut remote) = a.peers.open_terminal(b.id, id).await.unwrap();
-    remote_until(&mut remote, "ready", 1).await;
+    let (snapshot, mut remote) = a.peers.open_terminal(b.id, id).await.unwrap();
+    ready(&snapshot, &mut remote).await;
     remote
         .input(Bytes::from(vec![b'x'; 2_500_000]))
         .await
