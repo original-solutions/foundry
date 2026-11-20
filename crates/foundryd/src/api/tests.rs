@@ -997,6 +997,41 @@ async fn a_start_racing_an_archive_leaves_no_live_terminal_in_the_archived_works
 }
 
 #[tokio::test]
+async fn a_session_starts_with_a_first_prompt_and_one_that_cannot_be_an_argument_is_refused() {
+    let daemon = Daemon::new(TURN).await;
+    let project = daemon.project();
+    let workspace = daemon.create_workspace(project, "first prompt").await;
+    let sessions = format!("/api/workspaces/{workspace}/sessions");
+
+    let reply = daemon
+        .call(
+            "POST",
+            &sessions,
+            Some(serde_json::json!({"model": MODEL, "prompt": "fix the login"})),
+        )
+        .await;
+    assert_eq!(reply.status, 201, "{}", reply.body);
+
+    for prompt in ["a\u{0}b".to_string(), "x".repeat(20_001)] {
+        let reply = daemon
+            .call(
+                "POST",
+                &sessions,
+                Some(serde_json::json!({"model": MODEL, "prompt": prompt})),
+            )
+            .await;
+        assert_eq!(reply.status, 422, "{}", reply.body);
+        assert!(reply.json()["error"].is_string(), "{}", reply.body);
+    }
+    let started = daemon
+        .records()
+        .into_iter()
+        .filter(|r| matches!(r, AnyRecord::Session(s) if s.body.workspace == workspace))
+        .count();
+    assert_eq!(started, 1, "only the first start made a session");
+}
+
+#[tokio::test]
 async fn an_action_on_what_is_not_here_is_not_found() {
     let daemon = Daemon::new(TURN).await;
     let workspace = WorkspaceId::random();

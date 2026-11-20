@@ -105,8 +105,9 @@ export async function createWorkspace(input: { project: string; base: string; na
   return { id: String(json.id), error: typeof json.error === "string" ? json.error : undefined };
 }
 
-export async function startSession(workspace: string, model: string): Promise<string> {
-  const { status, json } = await post(`/api/workspaces/${workspace}/sessions`, { model });
+/** Starts Claude Code in `workspace`; with a `prompt`, Claude Code starts on it as its first prompt. */
+export async function startSession(workspace: string, model: string, prompt?: string): Promise<string> {
+  const { status, json } = await post(`/api/workspaces/${workspace}/sessions`, prompt === undefined ? { model } : { model, prompt });
   if (status !== 201) throw refused(status, json);
   return String(json.id);
 }

@@ -659,7 +659,13 @@ async fn archive_workspace(
 #[serde(deny_unknown_fields)]
 struct Start {
     model: String,
+    /// What Claude Code starts on, as if typed as its first prompt.
+    #[serde(default)]
+    prompt: Option<String>,
 }
+
+/// The longest first prompt taken, in characters: a task, not a document.
+const MOST_PROMPT: usize = 20_000;
 
 async fn start_session(
     State(api): State<Api>,
@@ -667,11 +673,24 @@ async fn start_session(
     Body(start): Body<Start>,
 ) -> Result<Response, ApiError> {
     let id = parse_id(&id, "workspace", WorkspaceId)?;
+    if let Some(prompt) = &start.prompt
+        && (prompt.contains('\0') || prompt.chars().count() > MOST_PROMPT)
+    {
+        return Err(ApiError::Rejected(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("a first prompt is at most {MOST_PROMPT} characters, with no NUL"),
+        ));
+    }
     let sessions = Arc::clone(&api.sessions);
     let session = api
         .workspaces
         .start_in(id, move |worktree| async move {
-            Ok::<_, ApiError>(sessions.start(id, &worktree, &start.model).await?)
+            let prompt = start.prompt.as_deref();
+            Ok::<_, ApiError>(
+                sessions
+                    .start_with(id, &worktree, &start.model, prompt)
+                    .await?,
+            )
         })
         .await?;
     Ok(created(session))

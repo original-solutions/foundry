@@ -162,6 +162,8 @@ This is a rule for every piece, not only P1: nothing runs without the UI showing
 3. It runs the setup commands in a terminal inside the workspace. A failed setup stays visible there and raises an attention item. The workspace is still usable, so the failure can be fixed by hand.
 4. The workspace opens with one agent session. Shells and more sessions can be added.
 
+A session can be started with a first prompt (`POST /api/workspaces/{id}/sessions` takes `prompt` beside `model`): it is Claude Code's last argument, after `--`, so the agent starts on it at once and its hooks report it as any typed prompt. A blank prompt is none; one with a NUL or over 20,000 characters is refused. The new-workspace and new-session dialogs offer it as an optional box.
+
 Branch names are `<name>` as typed, made safe for git. Worktrees live under the data directory at `worktrees/<project>/<branch>`.
 
 ### Archiving

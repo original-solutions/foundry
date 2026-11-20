@@ -211,9 +211,31 @@ impl Sessions {
         worktree: &Path,
         model: &str,
     ) -> Result<SessionId, SessionError> {
+        self.start_with(workspace, worktree, model, None).await
+    }
+
+    /// [`Sessions::start`], with `prompt` as Claude Code's first prompt: it is given as the
+    /// last argument, after `--`, so Claude Code starts on it and its hooks report it as any
+    /// typed prompt. A blank prompt is no prompt.
+    pub async fn start_with(
+        &self,
+        workspace: WorkspaceId,
+        worktree: &Path,
+        model: &str,
+        prompt: Option<&str>,
+    ) -> Result<SessionId, SessionError> {
         let inner = self.inner.clone();
         let (worktree, model) = (worktree.to_path_buf(), model.to_string());
-        tokio::spawn(async move { inner.start(workspace, &worktree, &model).await }).await?
+        let prompt = prompt
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_owned);
+        tokio::spawn(async move {
+            inner
+                .start(workspace, &worktree, &model, prompt.as_deref())
+                .await
+        })
+        .await?
     }
 
     /// `POST /hooks/{session}`, the endpoint a session's hooks post to.
@@ -261,6 +283,7 @@ impl Inner {
         workspace: WorkspaceId,
         worktree: &Path,
         model: &str,
+        prompt: Option<&str>,
     ) -> Result<SessionId, SessionError> {
         let id = SessionId::random();
         let token = format!(
@@ -319,7 +342,9 @@ impl Inner {
         let mut body = live.body.lock().await;
         lock(&self.live).insert(id, live.clone());
 
-        let started = self.launch(&settings, workspace, worktree, model).await;
+        let started = self
+            .launch(&settings, workspace, worktree, model, prompt)
+            .await;
         let (terminal, floor) = match started {
             Ok(started) => started,
             Err(error) => {
@@ -356,6 +381,7 @@ impl Inner {
         workspace: WorkspaceId,
         worktree: &Path,
         model: &str,
+        prompt: Option<&str>,
     ) -> Result<(TerminalId, u64), SessionError> {
         let me = self.me;
         let floor = self
@@ -368,6 +394,9 @@ impl Inner {
             "--model".into(),
             model.to_string(),
         ]);
+        if let Some(prompt) = prompt {
+            argv.extend(["--".into(), prompt.to_string()]);
+        }
         let env = [
             (
                 "ANTHROPIC_BASE_URL".to_string(),
