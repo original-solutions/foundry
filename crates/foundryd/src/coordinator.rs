@@ -1605,4 +1605,72 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, CoordinatorError::Store(_)), "{error}");
     }
+
+    /// A coordinator alone, holding settings, whose store then refuses every write.
+    fn refusing_writes() -> (tempfile::TempDir, Coordinator) {
+        let (dir, coordinator) = alone();
+        lock(&coordinator.store)
+            .apply_settings(SharedSettings {
+                seq: 1,
+                ..SharedSettings::default()
+            })
+            .unwrap();
+        rusqlite::Connection::open(dir.path().join("foundry.db"))
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER refuse BEFORE UPDATE ON settings \
+                 BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+            )
+            .unwrap();
+        (dir, coordinator)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_forwarded_edit_that_cannot_be_written_is_refused_when_nothing_else_waits_on_its_id()
+    {
+        let (_dir, coordinator) = refusing_writes();
+        let error = coordinator
+            .edit_from(
+                Some(MachineId::random()),
+                Instant::now(),
+                EditId::random(),
+                set_project(7, "p"),
+            )
+            .await
+            .unwrap_err();
+        let reason = format!("{} could not store it", coordinator.me);
+        assert!(
+            matches!(&error, CoordinatorError::Refused { reason: given } if *given == reason),
+            "{error}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_forwarded_edit_that_cannot_be_written_is_not_refused_while_another_waits_on_its_id()
+    {
+        let (_dir, coordinator) = refusing_writes();
+        let id = EditId::random();
+        // Another task here may number the id, so a failed write says nothing about it.
+        let _other = coordinator.wait_on(id);
+        let error = coordinator
+            .edit_from(
+                Some(MachineId::random()),
+                Instant::now(),
+                id,
+                set_project(7, "p"),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, CoordinatorError::Store(_)), "{error}");
+    }
+
+    #[test]
+    fn a_store_error_is_never_answered_as_a_refusal() {
+        let (_dir, coordinator) = alone();
+        let error = CoordinatorError::Store(StoreError::TooLarge {
+            what: "x",
+            value: 1,
+        });
+        assert_eq!(coordinator.outcome(Err(error)), None);
+    }
 }

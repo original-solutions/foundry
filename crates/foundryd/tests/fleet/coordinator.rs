@@ -2132,3 +2132,50 @@ async fn an_edit_sent_and_never_answered_is_no_answer_though_the_settings_cannot
         "{error}"
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_stamp_from_the_second_machine_replaces_the_first_machines_refusal() {
+    let (p1, p2) = (MachineId::random(), MachineId::random());
+    let fleet = Fleet::start_coordinated_with(1, &[p1, p2]);
+    let daemon = &fleet.daemons[0];
+    let theirs = ordered_by(&daemon.settings(), p1, vec![p1, p2, daemon.id]);
+    let (c1, said1) = recorded(raw_link(daemon, p1).await);
+    let (c2, said2) = recorded(raw_link(daemon, p2).await);
+    say(&c1, &settings_message(theirs.clone())).await;
+    say(&c2, &settings_message(theirs)).await;
+    let beat1 = beating(c1.clone());
+    let _beat2 = beating(c2.clone());
+    acting_becomes(&daemon.coordinator(), p1, WAIT).await;
+    let editing = tokio::spawn({
+        let coordinator = daemon.coordinator();
+        async move {
+            coordinator
+                .edit(set_project(7, "refused then numbered"))
+                .await
+        }
+    });
+    until(Duration::from_secs(2), "the edit goes to the first", || {
+        !edits_sent(&said1).is_empty()
+    })
+    .await;
+    beat1.abort();
+    until(OFFLINE_AFTER * 2, "the edit goes to the second", || {
+        !edits_sent(&said2).is_empty()
+    })
+    .await;
+    let (id, _) = edits_sent(&said2)[0].clone();
+    let id = id.unwrap();
+    let refused = Outcome::Refused {
+        reason: "no".into(),
+    };
+    // An answer is for an id, whichever link carries it.
+    say(&c2, &answer(id, refused)).await;
+    let stamp = Stamp { seq: 50, by: p2 };
+    say(&c2, &answer(id, Outcome::Numbered { stamp })).await;
+    let returned = tokio::time::timeout(Duration::from_secs(2), editing)
+        .await
+        .expect("the stamp settles it")
+        .unwrap()
+        .unwrap();
+    assert_eq!(returned, stamp);
+}
