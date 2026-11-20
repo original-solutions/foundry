@@ -879,6 +879,38 @@ async fn a_setup_that_cannot_start_leaves_the_workspace_and_names_it() {
 }
 
 #[tokio::test]
+async fn a_setup_whose_terminal_cannot_be_recorded_is_stopped_and_names_the_workspace() {
+    let setup = Setup::new();
+    let config = "factory:\n  provision:\n    - sleep 30\n";
+    let remote = setup.project(&[(".dw/config.yml", config)]);
+    // The store takes a workspace's first write and refuses any later one, the write that
+    // names the setup terminal among them.
+    rusqlite::Connection::open(setup.data.path().join("foundry.db"))
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER refuse_workspace_update BEFORE UPDATE ON records
+             WHEN NEW.kind = 'workspace'
+             BEGIN SELECT RAISE(ABORT, 'refused by the test'); END;",
+        )
+        .unwrap();
+
+    let err = setup
+        .workspaces
+        .create(remote.project, "main", "unrecorded")
+        .await
+        .unwrap_err();
+    let WorkspaceError::SetupNotRecorded { workspace, .. } = err else {
+        panic!("{err}");
+    };
+    assert!(!setup.record(workspace).unwrap().deleted);
+    assert!(setup.worktree(remote.project, "unrecorded").exists());
+    // No setup runs that the record does not name.
+    let terminals = setup.terminals_of(workspace);
+    assert_eq!(terminals.len(), 1, "{terminals:?}");
+    assert!(terminals[0].deleted, "the setup terminal is closed");
+}
+
+#[tokio::test]
 async fn a_fetch_that_hangs_fails_in_time_and_frees_the_project() {
     let setup = Setup::with(holder(), Duration::from_secs(1));
     let remote = setup.project(&[("README.md", "hello\n")]);

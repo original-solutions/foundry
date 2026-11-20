@@ -1,4 +1,4 @@
-import { ApiError } from "../api";
+import { get, post, refused } from "../api";
 
 /** What an item is about. A newer daemon may send a kind this build has no label for. */
 export type AttentionKind =
@@ -44,25 +44,12 @@ export const kindLabel: Record<AttentionKind, string> = {
 /** Only these clear when a person says so; every other item clears on its own. */
 export const dismissable = (item: AttentionItem) => item.kind === "setting_overwritten";
 
-async function answer(response: Response): Promise<Record<string, unknown>> {
-  let json: Record<string, unknown> = {};
-  try {
-    const parsed: unknown = JSON.parse(await response.text());
-    if (parsed && typeof parsed === "object") json = parsed as Record<string, unknown>;
-  } catch {
-    // An empty or non-JSON body, as a 204 has.
-  }
-  if (!response.ok) {
-    throw new ApiError(typeof json.error === "string" ? json.error : `request failed (${response.status})`, response.status);
-  }
-  return json;
-}
-
 export async function attentionItems(): Promise<AttentionItem[]> {
-  const json = await answer(await fetch("/api/attention"));
+  const json = await get("/api/attention");
   return Array.isArray(json.items) ? (json.items as AttentionItem[]) : [];
 }
 
 export async function dismissItem(id: string): Promise<void> {
-  await answer(await fetch(`/api/attention/${encodeURIComponent(id)}/dismiss`, { method: "POST" }));
+  const { status, json } = await post(`/api/attention/${encodeURIComponent(id)}/dismiss`);
+  if (status !== 204) throw refused(status, json);
 }

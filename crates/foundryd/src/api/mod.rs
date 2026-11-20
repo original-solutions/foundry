@@ -719,10 +719,11 @@ async fn create_here(
         )),
         // The workspace exists, so the caller needs its id: a retry would only find the name
         // taken.
-        Err(WorkspaceError::SetupNotStarted { workspace, source }) => {
-            let message = redact(&format!(
-                "workspace {workspace} was made, but its setup could not be started: {source}"
-            ));
+        Err(
+            e @ (WorkspaceError::SetupNotStarted { workspace, .. }
+            | WorkspaceError::SetupNotRecorded { workspace, .. }),
+        ) => {
+            let message = redact(&e.to_string());
             tracing::warn!("api: {message}");
             Ok((
                 StatusCode::CREATED,

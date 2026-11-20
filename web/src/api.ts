@@ -78,7 +78,7 @@ export class ApiError extends Error {
   }
 }
 
-async function post(path: string, body?: unknown): Promise<{ status: number; json: Record<string, unknown> }> {
+export async function post(path: string, body?: unknown): Promise<{ status: number; json: Record<string, unknown> }> {
   const response = await fetch(path, {
     method: "POST",
     headers: body === undefined ? undefined : { "content-type": "application/json" },
@@ -94,12 +94,12 @@ async function post(path: string, body?: unknown): Promise<{ status: number; jso
   return { status: response.status, json };
 }
 
-function refused(status: number, json: Record<string, unknown>): ApiError {
+export function refused(status: number, json: Record<string, unknown>): ApiError {
   return new ApiError(typeof json.error === "string" ? json.error : `request failed (${status})`, status);
 }
 
 /** Reads `path`: its JSON body, or the daemon's refusal as an `ApiError` with its status. */
-async function get(path: string): Promise<Record<string, unknown>> {
+export async function get(path: string): Promise<Record<string, unknown>> {
   const response = await fetch(path);
   let json: Record<string, unknown> = {};
   try {
