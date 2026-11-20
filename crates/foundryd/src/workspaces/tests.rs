@@ -2805,6 +2805,85 @@ async fn changes_send_no_diff_past_the_caps_and_still_list_the_file() {
 }
 
 #[tokio::test]
+async fn a_commit_on_the_branch_shows_only_its_own_change() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\nworld\n"), ("old.txt", "old\n")]);
+    let id = setup.create(&remote, "main", "steps").await;
+    let worktree = setup.worktree(remote.project, "steps");
+    std::fs::write(worktree.join("first.txt"), "one\n").unwrap();
+    git(&worktree, &["add", "first.txt"]);
+    git(&worktree, &["commit", "-q", "-m", "add first"]);
+    let first = git(&worktree, &["rev-parse", "--short", "HEAD"])
+        .trim()
+        .to_owned();
+    std::fs::write(worktree.join("README.md"), "hello\nthere\n").unwrap();
+    git(&worktree, &["mv", "old.txt", "moved.txt"]);
+    git(&worktree, &["commit", "-qam", "edit readme and move old"]);
+    let second = git(&worktree, &["rev-parse", "--short", "HEAD"])
+        .trim()
+        .to_owned();
+    // Work not committed yet is never part of a commit.
+    std::fs::write(worktree.join("first.txt"), "one\ntwo\n").unwrap();
+    std::fs::write(worktree.join("new.txt"), "new\n").unwrap();
+
+    let one = setup.workspaces.commit(id, &first).await.unwrap();
+    assert_eq!(one.base, "main");
+    assert_eq!(one.commits.len(), 1);
+    assert_eq!(
+        (
+            one.commits[0].hash.as_str(),
+            one.commits[0].subject.as_str()
+        ),
+        (first.as_str(), "add first")
+    );
+    assert_eq!(one.files.len(), 1, "{:?}", one.files);
+    let file = &one.files[0];
+    assert_eq!(
+        (file.path.as_str(), file.status),
+        ("first.txt", FileStatus::Added)
+    );
+    assert_eq!(
+        (file.added, file.removed, file.uncommitted),
+        (Some(1), Some(0), false)
+    );
+    assert_eq!(file.patch.as_deref(), Some("@@ -0,0 +1 @@\n+one\n"));
+
+    let two = setup.workspaces.commit(id, &second).await.unwrap();
+    let paths: Vec<&str> = two.files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, ["README.md", "moved.txt"]);
+    assert!(
+        two.files[0]
+            .patch
+            .as_deref()
+            .unwrap()
+            .contains("-world\n+there\n")
+    );
+    assert_eq!(two.files[1].status, FileStatus::Renamed);
+    assert_eq!(two.files[1].from.as_deref(), Some("old.txt"));
+    assert!(two.files.iter().all(|f| !f.uncommitted));
+}
+
+#[tokio::test]
+async fn a_commit_not_on_the_branch_is_refused_as_unknown() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup.create(&remote, "main", "nothing").await;
+    let worktree = setup.worktree(remote.project, "nothing");
+    // The base's own commit is not the workspace's change, and no option reaches git.
+    let base = git(&worktree, &["rev-parse", "--short", "HEAD"])
+        .trim()
+        .to_owned();
+    for asked in [base.as_str(), "--output=x", "HEAD", "abc1234", ""] {
+        let err = setup.workspaces.commit(id, asked).await.unwrap_err();
+        assert!(
+            matches!(err, WorkspaceError::UnknownCommit(_)),
+            "{asked}: {err}"
+        );
+    }
+    assert!(!worktree.join("x").exists());
+}
+
+#[tokio::test]
 async fn changes_of_a_workspace_whose_worktree_is_gone_are_refused_as_unknown() {
     // As an archive leaves it for a moment: the worktree removed, the record not yet written.
     let setup = Setup::new();

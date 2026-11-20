@@ -98,6 +98,8 @@ pub enum WorkspaceError {
     BranchExists(String),
     #[error("the project's remote has no branch {0}")]
     UnknownBase(String),
+    #[error("commit {0} is not on this workspace's branch")]
+    UnknownCommit(String),
     #[error(transparent)]
     Dirty(Dirty),
     #[error("git {command} failed: {stderr}")]

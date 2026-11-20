@@ -142,6 +142,7 @@ pub fn router(api: Api) -> Router {
         .route("/api/workspaces/{id}/sessions", post(start_session))
         .route("/api/workspaces/{id}/shells", post(start_shell))
         .route("/api/workspaces/{id}/changes", get(changes::changes))
+        .route("/api/workspaces/{id}/commits/{hash}", get(changes::commit))
         .route("/api/workspaces/{id}/pr", get(pr::shipping))
         .route("/api/briefs", get(briefs::briefs))
         .route("/api/machine", get(machine::machine))
@@ -378,7 +379,9 @@ impl IntoResponse for ApiError {
             }
             Self::Workspace(e) => (
                 match e {
-                    WorkspaceError::Unknown(_) => StatusCode::NOT_FOUND,
+                    WorkspaceError::Unknown(_) | WorkspaceError::UnknownCommit(_) => {
+                        StatusCode::NOT_FOUND
+                    }
                     WorkspaceError::UnknownProject(_) | WorkspaceError::UnknownBase(_) => {
                         StatusCode::UNPROCESSABLE_ENTITY
                     }

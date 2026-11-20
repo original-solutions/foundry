@@ -31,8 +31,8 @@ const changes: Changes = {
   ],
 };
 
-async function opened(answer: Response) {
-  const calls = mockFetch(answer);
+async function opened(...answers: Response[]) {
+  const calls = mockFetch(...answers);
   await renderApp(<ChangesPanel workspace={target} onClose={() => {}} />);
   return { calls, panel: await screen.findByRole("dialog", { name: /changes in fix login/i }) };
 }
@@ -141,6 +141,69 @@ describe("ChangesPanel", () => {
     expect(panel.textContent).toContain("All 3 viewed");
     fireEvent.keyDown(panel, { key: "j", metaKey: true });
     expect(current()).toBe("docs/notes.md");
+  });
+
+  describe("commit by commit", () => {
+    const two: Changes = { ...changes, commits: [{ hash: "bbb2222", subject: "style the form" }, ...changes.commits] };
+    const first: Changes = { base: "main", commits: [changes.commits[0]], files: [{ ...changes.files[0], uncommitted: false }] };
+    const second: Changes = {
+      base: "main",
+      commits: [two.commits[0]],
+      files: [{ path: "src/form.css", from: null, status: "added", added: 1, removed: 0, uncommitted: false, patch: "@@ -0,0 +1 @@\n+form {}\n" }],
+    };
+
+    it("lists the branch's commits oldest first, and a commit picked shows only what it changed, to read, not review", async () => {
+      const { calls, panel } = await opened(json(200, two), json(200, first));
+      const story = await within(panel).findByRole("region", { name: "Commits" });
+      const steps = within(story).getAllByRole("button");
+      expect(steps.map((b) => b.textContent)).toEqual([expect.stringContaining("All changes"), expect.stringContaining("add login form"), expect.stringContaining("style the form")]);
+      expect(steps[0].getAttribute("aria-pressed")).toBe("true");
+
+      fireEvent.click(steps[1]);
+      const commit = await within(panel).findByRole("region", { name: "Commit 1 of 2" });
+      expect(calls[1].url).toBe("/api/workspaces/w1/commits/abc1234");
+      expect(commit.textContent).toContain("abc1234");
+      expect(commit.textContent).toContain("add login form");
+      const file = await within(panel).findByRole("region", { name: "src/login.ts" });
+      expect(within(panel).queryByRole("region", { name: "logo.png" })).toBeNull();
+      expect(within(file).queryByRole("checkbox", { name: "Viewed" })).toBeNull();
+      expect(within(file).queryByRole("button", { name: /comment on/i })).toBeNull();
+      expect(file.textContent).not.toContain("Uncommitted");
+      expect(within(panel).getByRole("navigation", { name: "Changed files" }).textContent).toBe("Mlogin.tssrc");
+      expect(panel.textContent).toContain("0 of 3 viewed");
+
+      fireEvent.click(within(story).getByRole("button", { name: /all changes/i }));
+      expect(await within(within(panel).getByRole("region", { name: "src/login.ts" })).findByRole("checkbox", { name: "Viewed" })).toBeDefined();
+      expect(within(panel).getByRole("region", { name: "logo.png" })).toBeDefined();
+    });
+
+    it("steps through the commits from the keyboard: ] to the next, [ back, past the first to all changes", async () => {
+      const { calls, panel } = await opened(json(200, two), json(200, first), json(200, second));
+      await within(panel).findByRole("region", { name: "Commits" });
+      fireEvent.keyDown(panel, { key: "]" });
+      await within(panel).findByRole("region", { name: "Commit 1 of 2" });
+      fireEvent.keyDown(panel, { key: "]" });
+      await within(panel).findByRole("region", { name: "Commit 2 of 2" });
+      expect(await within(panel).findByRole("region", { name: "src/form.css" })).toBeDefined();
+      expect(calls.map((c) => c.url).slice(1)).toEqual(["/api/workspaces/w1/commits/abc1234", "/api/workspaces/w1/commits/bbb2222"]);
+      fireEvent.keyDown(panel, { key: "]" });
+      expect(within(panel).getByRole("region", { name: "Commit 2 of 2" })).toBeDefined();
+      fireEvent.keyDown(panel, { key: "[" });
+      await within(panel).findByRole("region", { name: "Commit 1 of 2" });
+      expect(calls).toHaveLength(3);
+      fireEvent.keyDown(panel, { key: "[" });
+      await waitFor(() => expect(within(panel).queryByRole("region", { name: /^Commit \d/ })).toBeNull());
+      expect(within(panel).getByRole("region", { name: "logo.png" })).toBeDefined();
+    });
+
+    it("says why a commit could not be read, and all changes stay a click away", async () => {
+      const { panel } = await opened(json(200, two), json(404, { error: "commit abc1234 is not on this workspace's branch" }));
+      const story = await within(panel).findByRole("region", { name: "Commits" });
+      fireEvent.click(within(story).getByRole("button", { name: /add login form/ }));
+      expect((await within(panel).findByRole("alert")).textContent).toContain("is not on this workspace's branch");
+      fireEvent.click(within(story).getByRole("button", { name: /all changes/i }));
+      expect(await within(panel).findByRole("region", { name: "logo.png" })).toBeDefined();
+    });
   });
 
   describe("comments for Claude", () => {

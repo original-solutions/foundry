@@ -1,12 +1,13 @@
 import { useQuery } from "@tanstack/react-query";
 import { Dialog } from "radix-ui";
-import { Fragment, useEffect, useRef, useState, type KeyboardEvent } from "react";
-import { workspaceChanges, type Changes, type Commit, type FileChange } from "./api";
+import { Fragment, useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
+import { workspaceChanges, workspaceCommit, type Changes, type Commit, type FileChange } from "./api";
 import { diffLines, splitPath, totals } from "./changes";
 import type { SessionView } from "./fleet";
 import { plural } from "./labels";
 import { anchor, onLine, type Anchor, type Note } from "./notes";
 import { lineName, NoteBox, NoteRow, SendBar } from "./LineNotes";
+import { button } from "./Modal";
 import { ShipLine } from "./Shipping";
 import { freshLines, loadViewed, nextUnviewed, progress, saveViewed, seen, standing, type Seen, type Standing, type Viewed } from "./review";
 
@@ -58,6 +59,11 @@ interface Editing extends Anchor {
  * And it is how you answer the change: click a line number to leave Claude a comment on that line,
  * as many as you like, then send them to one of the workspace's idle sessions as one message.
  * Unsent comments outlive the sheet closing, not a reload.
+ *
+ * And it tells the branch's story: its commits, oldest first, each one a step to read on its own,
+ * with only what that commit changed. [ and ] step through them, and back to all changes before
+ * the first. A commit is read, not reviewed: Viewed and comments belong to all changes, as the
+ * work stands now.
  */
 export function ChangesPanel({ workspace, file, onClose }: { workspace?: Target; file?: string; onClose: () => void }) {
   const [notes, setNotes] = useState<Record<string, Note[]>>({});
@@ -94,7 +100,20 @@ function Sheet({ workspace, file, onClose, notes, onNotes }: SheetProps) {
   const [viewed, setViewed] = useState<Viewed>(() => loadViewed(workspace.id));
   const [at, setAt] = useState<number>();
   const [editing, setEditing] = useState<Editing>();
-  const files = data?.files ?? [];
+  const [step, setStep] = useState<string>();
+  const story = data ? [...data.commits].reverse() : [];
+  // A commit amended or rebased away is no step any more: the sheet shows all changes again.
+  const picked = story.findIndex((c) => c.hash === step);
+  const commit = useQuery({
+    queryKey: ["commit", workspace.id, step],
+    queryFn: () => workspaceCommit(workspace.id, step!),
+    enabled: picked >= 0,
+    // A commit never changes, so it is read once.
+    staleTime: Infinity,
+    retry: false,
+  });
+  const reading = picked >= 0;
+  const files = (reading ? commit.data?.files : data?.files) ?? [];
   const asked = file === undefined ? -1 : files.findIndex((f) => f.path === file);
   const current = at !== undefined && at < files.length ? at : asked >= 0 ? asked : undefined;
   const reached = useRef(false);
@@ -107,6 +126,12 @@ function Sheet({ workspace, file, onClose, notes, onNotes }: SheetProps) {
   const show = (i: number) => {
     setAt(i);
     body.current?.querySelector(`[data-path="${CSS.escape(files[i].path)}"]`)?.scrollIntoView?.({ block: "start" });
+  };
+  const pick = (i: number) => {
+    setStep(i < 0 ? undefined : story[i].hash);
+    setAt(undefined);
+    setEditing(undefined);
+    body.current?.scrollTo?.({ top: 0 });
   };
   const mark = (file: FileChange, on: boolean) => {
     const next = { ...viewed };
@@ -124,10 +149,16 @@ function Sheet({ workspace, file, onClose, notes, onNotes }: SheetProps) {
     setEditing(undefined);
   };
   const keys = (e: KeyboardEvent) => {
-    if (e.metaKey || e.ctrlKey || e.altKey || files.length === 0 || e.target instanceof HTMLTextAreaElement) return;
+    if (e.metaKey || e.ctrlKey || e.altKey || e.target instanceof HTMLTextAreaElement) return;
+    if ((e.key === "]" || e.key === "[") && story.length > 0) {
+      e.preventDefault();
+      pick(e.key === "]" ? Math.min(picked + 1, story.length - 1) : Math.max(picked - 1, -1));
+      return;
+    }
+    if (files.length === 0) return;
     if (e.key === "j") show(current === undefined ? 0 : Math.min(current + 1, files.length - 1));
     else if (e.key === "k") show(current === undefined ? 0 : Math.max(current - 1, 0));
-    else if (e.key === "v") {
+    else if (e.key === "v" && !reading) {
       const i = current ?? nextUnviewed(files, viewed, files.length - 1) ?? 0;
       const on = standing(files[i], viewed[files[i].path]) !== "viewed";
       const next = mark(files[i], on);
@@ -163,11 +194,17 @@ function Sheet({ workspace, file, onClose, notes, onNotes }: SheetProps) {
                   {data?.base ?? "…"}
                 </span>
                 {data && data.files.length > 0 && <Summary changes={data} />}
-                {files.length > 0 && <Progress {...progress(files, viewed)} />}
+                {data && data.files.length > 0 && <Progress {...progress(data.files, viewed)} />}
                 <span className="text-neutral-600">Updates live</span>
                 {files.length > 0 && (
                   <span className="hidden text-neutral-600 md:inline">
                     <Key>j</Key> <Key>k</Key> files · <Key>v</Key> viewed · click a line number to comment for Claude
+                    {story.length > 0 && (
+                      <>
+                        {" "}
+                        · <Key>[</Key> <Key>]</Key> commits
+                      </>
+                    )}
                   </span>
                 )}
                 {files.length > 0 && <span className="text-neutral-600 md:hidden">Tap a line number to comment for Claude</span>}
@@ -194,35 +231,50 @@ function Sheet({ workspace, file, onClose, notes, onNotes }: SheetProps) {
         ) : (
           <div className="flex min-h-0 flex-1">
             <nav aria-label="Changed files" className="hidden w-64 shrink-0 overflow-y-auto border-r border-neutral-800 py-2 md:block">
-              {data.files.map((f, i) => (
-                <FileLink key={f.path} file={f} state={standing(f, viewed[f.path])} current={i === current} onPick={() => show(i)} />
+              {files.map((f, i) => (
+                <FileLink key={f.path} file={f} state={reading ? "unviewed" : standing(f, viewed[f.path])} current={i === current} onPick={() => show(i)} />
               ))}
             </nav>
             <div ref={body} className="min-w-0 flex-1 space-y-3 overflow-y-auto p-3 md:p-4">
-              {data.commits.length > 0 && <Commits commits={data.commits} branch={workspace.branch} />}
-              {data.files.map((f, i) => {
-                const state = standing(f, viewed[f.path]);
-                return (
-                  <FileDiff
-                    key={`${f.path}:${state}`}
-                    file={f}
-                    state={state}
-                    kept={viewed[f.path]}
-                    current={i === current}
-                    onViewed={(on) => {
-                      mark(f, on);
-                      setAt(i);
-                    }}
-                    notes={notes.filter((n) => n.path === f.path)}
-                    editing={editing?.path === f.path ? editing : undefined}
-                    onComment={(where) => setEditing({ ...where, path: f.path })}
-                    onEdit={(note) => setEditing(note)}
-                    onSave={save}
-                    onCancel={() => setEditing(undefined)}
-                    onDelete={(id) => onNotes(notes.filter((n) => n.id !== id))}
-                  />
-                );
-              })}
+              {story.length > 0 && <Story commits={story} branch={workspace.branch} picked={picked} onPick={pick} />}
+              {reading ? (
+                <>
+                  <CommitHead commit={story[picked]} n={picked + 1} of={story.length} changes={commit.data} onPick={(d) => pick(picked + d)} />
+                  {commit.error ? (
+                    <p role="alert" className="rounded border border-red-500/30 bg-red-500/10 px-3 py-2 text-red-300">
+                      {commit.error.message}
+                    </p>
+                  ) : commit.isPending ? (
+                    <p className="px-1 text-neutral-500">Reading the commit…</p>
+                  ) : (
+                    files.map((f, i) => <FileDiff key={`${step}:${f.path}`} file={f} state="unviewed" kept={undefined} current={i === current} readOnly {...still} />)
+                  )}
+                </>
+              ) : (
+                data.files.map((f, i) => {
+                  const state = standing(f, viewed[f.path]);
+                  return (
+                    <FileDiff
+                      key={`${f.path}:${state}`}
+                      file={f}
+                      state={state}
+                      kept={viewed[f.path]}
+                      current={i === current}
+                      onViewed={(on) => {
+                        mark(f, on);
+                        setAt(i);
+                      }}
+                      notes={notes.filter((n) => n.path === f.path)}
+                      editing={editing?.path === f.path ? editing : undefined}
+                      onComment={(where) => setEditing({ ...where, path: f.path })}
+                      onEdit={(note) => setEditing(note)}
+                      onSave={save}
+                      onCancel={() => setEditing(undefined)}
+                      onDelete={(id) => onNotes(notes.filter((n) => n.id !== id))}
+                    />
+                  );
+                })
+              )}
             </div>
           </div>
         )}
@@ -337,20 +389,92 @@ function Tick() {
   );
 }
 
-function Commits({ commits, branch }: { commits: Commit[]; branch: string }) {
+/** A commit's diff takes no Viewed tick and no comments: these do nothing. */
+const still = { onViewed: () => {}, notes: [], editing: undefined, onComment: () => {}, onEdit: () => {}, onSave: () => {}, onCancel: () => {}, onDelete: () => {} };
+
+/** The branch's commits as steps down a line, oldest first, after all changes; the one shown is pressed. */
+function Story({ commits, branch, picked, onPick }: { commits: Commit[]; branch: string; picked: number; onPick: (i: number) => void }) {
   return (
-    <section aria-label="Commits" className="rounded-lg border border-neutral-800 bg-neutral-900/60 px-3 py-2">
-      <h3 className="mb-1 text-xs text-neutral-500">
-        {plural(commits.length, "commit")} on <span className="font-mono text-neutral-300">{branch}</span>
+    <section aria-label="Commits" className="rounded-lg border border-neutral-800 bg-neutral-900/60 px-2 py-2">
+      <h3 className="mb-1 flex items-baseline gap-2 px-1 text-xs text-neutral-500">
+        <span>
+          {plural(commits.length, "commit")} on <span className="font-mono text-neutral-300">{branch}</span>
+        </span>
+        <span className="ml-auto text-neutral-600">Read them one at a time</span>
       </h3>
-      <ul className="space-y-0.5 text-xs">
-        {commits.map((c) => (
-          <li key={c.hash} className="flex gap-2">
-            <span className="shrink-0 font-mono text-amber-300/80">{c.hash}</span>
-            <span className="truncate text-neutral-300">{c.subject}</span>
+      <ol className="relative max-h-60 overflow-y-auto text-xs before:absolute before:top-3 before:bottom-3 before:left-[10.5px] before:w-px before:bg-neutral-700">
+        <li>
+          <StepButton pressed={picked < 0} onClick={() => onPick(-1)}>
+            <Dot pressed={picked < 0} all />
+            <span className={picked < 0 ? "text-neutral-100" : "text-neutral-300"}>All changes</span>
+            <span className="truncate text-neutral-500">as the work stands, to review</span>
+          </StepButton>
+        </li>
+        {commits.map((c, i) => (
+          <li key={c.hash}>
+            <StepButton pressed={picked === i} onClick={() => onPick(i)}>
+              <Dot pressed={picked === i} />
+              <span className="w-4 shrink-0 text-right font-mono text-neutral-600">{i + 1}</span>
+              <span className="shrink-0 font-mono text-amber-300/80">{c.hash}</span>
+              <span className={`truncate ${picked === i ? "text-neutral-100" : "text-neutral-300"}`}>{c.subject}</span>
+            </StepButton>
           </li>
         ))}
-      </ul>
+      </ol>
+    </section>
+  );
+}
+
+function StepButton({ pressed, onClick, children }: { pressed: boolean; onClick: () => void; children: ReactNode }) {
+  return (
+    <button
+      type="button"
+      aria-pressed={pressed}
+      onClick={onClick}
+      className={`relative flex w-full min-w-0 items-center gap-2 rounded px-1.5 py-1 text-left ${pressed ? "bg-sky-400/10" : "hover:bg-neutral-800/60"}`}
+    >
+      {children}
+    </button>
+  );
+}
+
+/** A step's mark on the line: a ring for all changes, a dot for a commit, filled when it is the one shown. */
+function Dot({ pressed, all }: { pressed: boolean; all?: boolean }) {
+  return (
+    <span
+      aria-hidden="true"
+      className={`relative size-2.5 shrink-0 border-2 ${all ? "rounded-sm" : "rounded-full"} ${
+        pressed ? "border-sky-400 bg-sky-400 motion-safe:animate-arrive" : "border-neutral-500 bg-neutral-900"
+      }`}
+    />
+  );
+}
+
+/** The commit being read: which step it is, what it says and changed, and the way to the ones either side. */
+function CommitHead({ commit, n, of, changes, onPick }: { commit: Commit; n: number; of: number; changes: Changes | undefined; onPick: (by: number) => void }) {
+  const label = `Commit ${n} of ${of}`;
+  const t = changes && totals(changes);
+  return (
+    <section aria-label={label} className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border border-sky-400/40 bg-sky-400/5 px-3 py-2 text-xs">
+      <span className="shrink-0 text-sky-300">{label}</span>
+      <span className="shrink-0 font-mono text-amber-300/80">{commit.hash}</span>
+      <span className="min-w-0 flex-1 basis-48 text-neutral-100">{commit.subject}</span>
+      {t && (
+        <span className="flex shrink-0 gap-2 text-neutral-400">
+          <span className="font-mono">
+            <span className="text-emerald-400">+{t.added}</span> <span className={t.removed ? "text-red-400" : "text-neutral-600"}>−{t.removed}</span>
+          </span>
+          {plural(t.files, "file")}
+        </span>
+      )}
+      <span className="flex shrink-0 gap-1">
+        <button type="button" disabled={n === 1} onClick={() => onPick(-1)} className={button}>
+          ← Earlier
+        </button>
+        <button type="button" disabled={n === of} onClick={() => onPick(1)} className={button}>
+          Later →
+        </button>
+      </span>
     </section>
   );
 }
@@ -364,6 +488,8 @@ export const marker = { added: "+", removed: "-", same: " " };
 
 interface FileDiffProps {
   file: FileChange;
+  /** A commit's diff: read only, with no Viewed tick and no comments. */
+  readOnly?: boolean;
   state: Standing;
   /** The file as it was when viewed, to mark the lines new since then. */
   kept: Seen | undefined;
@@ -378,6 +504,10 @@ interface FileDiffProps {
   onSave: (body: string) => void;
   onCancel: () => void;
   onDelete: (id: number) => void;
+}
+
+function Num({ n }: { n: number }) {
+  return <span className="w-full pr-2 text-right">{n}</span>;
 }
 
 /** A line number that opens a comment on its line; on a mouse, the row shows a plus over it. */
@@ -408,7 +538,7 @@ function LineButton({ at }: { at: Anchor & { onComment: (at: Anchor) => void } }
 }
 
 /** One file's diff. The parent remounts it when its standing changes, so ticking Viewed folds it and a change since opens it. */
-function FileDiff({ file, state, kept, current, onViewed, notes, editing, onComment, onEdit, onSave, onCancel, onDelete }: FileDiffProps) {
+function FileDiff({ file, readOnly, state, kept, current, onViewed, notes, editing, onComment, onEdit, onSave, onCancel, onDelete }: FileDiffProps) {
   const lines = file.patch === null ? [] : diffLines(file.patch);
   const [open, setOpen] = useState(state !== "viewed" && lines.length <= FOLDED_PAST);
   const fresh = state === "changed" ? freshLines(lines, kept) : new Set<number>();
@@ -452,10 +582,12 @@ function FileDiff({ file, state, kept, current, onViewed, notes, editing, onComm
             <Bar file={file} />
           </span>
         </button>
-        <label className="flex shrink-0 cursor-pointer items-center gap-1.5 border-l border-neutral-800 px-3 text-xs text-neutral-400 hover:bg-neutral-800/60 hover:text-neutral-100">
-          <input type="checkbox" checked={state === "viewed"} onChange={(e) => onViewed(e.target.checked)} className="size-3.5 cursor-pointer accent-emerald-400" />
-          Viewed
-        </label>
+        {!readOnly && (
+          <label className="flex shrink-0 cursor-pointer items-center gap-1.5 border-l border-neutral-800 px-3 text-xs text-neutral-400 hover:bg-neutral-800/60 hover:text-neutral-100">
+            <input type="checkbox" checked={state === "viewed"} onChange={(e) => onViewed(e.target.checked)} className="size-3.5 cursor-pointer accent-emerald-400" />
+            Viewed
+          </label>
+        )}
       </h3>
       {open &&
         (file.patch === null ? (
@@ -477,10 +609,20 @@ function FileDiff({ file, state, kept, current, onViewed, notes, editing, onComm
                 <Fragment key={i}>
                   <div role="row" aria-label={`${line.kind} line${fresh.has(i) ? ", new since viewed" : ""}`} className={`group/line flex min-w-max ${rowTone[line.kind]}`}>
                     <span role="cell" className={`flex w-10 shrink-0 select-none border-l-[3px] text-neutral-600 ${fresh.has(i) ? "border-sky-400" : "border-transparent"}`}>
-                      {line.kind === "removed" ? <LineButton at={{ ...anchors[i]!, onComment }} /> : line.kind === "same" ? <span className="w-full pr-2 text-right">{line.old}</span> : ""}
+                      {line.kind === "removed" ? (
+                        readOnly ? (
+                          <Num n={line.old} />
+                        ) : (
+                          <LineButton at={{ ...anchors[i]!, onComment }} />
+                        )
+                      ) : line.kind === "same" ? (
+                        <Num n={line.old} />
+                      ) : (
+                        ""
+                      )}
                     </span>
                     <span role="cell" className="flex w-10 shrink-0 select-none text-neutral-600">
-                      {line.kind === "removed" ? "" : <LineButton at={{ ...anchors[i]!, onComment }} />}
+                      {line.kind === "removed" ? "" : readOnly ? <Num n={line.new} /> : <LineButton at={{ ...anchors[i]!, onComment }} />}
                     </span>
                     <span role="cell" className="w-4 shrink-0 select-none text-center opacity-70">
                       {marker[line.kind]}

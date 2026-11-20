@@ -2269,6 +2269,62 @@ async fn changes_list_each_file_with_its_hunks_and_hide_credentials_in_urls() {
 }
 
 #[tokio::test]
+async fn a_commit_read_shows_its_own_change_and_hides_credentials_in_urls() {
+    let daemon = Daemon::new(TURN).await;
+    let project = daemon.project();
+    let workspace = daemon.create_workspace(project, "stepped").await;
+    let worktree = daemon.workspaces.worktree(workspace).await.unwrap();
+    std::fs::write(
+        worktree.join("mirror.txt"),
+        "clone https://bot:hunter2@example.com/r.git\n",
+    )
+    .unwrap();
+    git(&worktree, &["add", "mirror.txt"]);
+    git(
+        &worktree,
+        &[
+            "commit",
+            "-q",
+            "-m",
+            "mirror to https://bot:hunter2@example.com/r.git",
+        ],
+    );
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .current_dir(&worktree)
+        .output()
+        .unwrap();
+    let hash = String::from_utf8(out.stdout).unwrap();
+    let hash = hash.trim();
+
+    let reply = daemon
+        .call(
+            "GET",
+            &format!("/api/workspaces/{workspace}/commits/{hash}"),
+            None,
+        )
+        .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    let json = reply.json();
+    assert_eq!(json["commits"][0]["hash"], hash);
+    assert_eq!(
+        json["commits"][0]["subject"],
+        "mirror to https://***@example.com/r.git"
+    );
+    assert_eq!(json["files"][0]["path"], "mirror.txt");
+    assert!(!reply.body.contains("hunter2"), "{}", reply.body);
+
+    let reply = daemon
+        .call(
+            "GET",
+            &format!("/api/workspaces/{workspace}/commits/0000000"),
+            None,
+        )
+        .await;
+    assert_eq!(reply.status, 404, "{}", reply.body);
+}
+
+#[tokio::test]
 async fn a_workspaces_pr_read_says_what_is_only_on_this_machine() {
     let daemon = Daemon::new(TURN).await;
     let project = daemon.project();

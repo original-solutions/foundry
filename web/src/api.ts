@@ -178,6 +178,11 @@ export async function workspaceChanges(workspace: string): Promise<Changes> {
   return (await get(`/api/workspaces/${workspace}/changes`)) as unknown as Changes;
 }
 
+/** What one commit on a workspace's branch changed against its parent: that commit, and its files. */
+export async function workspaceCommit(workspace: string, hash: string): Promise<Changes> {
+  return (await get(`/api/workspaces/${workspace}/commits/${encodeURIComponent(hash)}`)) as unknown as Changes;
+}
+
 /** A pull request from a workspace's branch, as GitHub has it. */
 export interface PullRequest {
   number: number;

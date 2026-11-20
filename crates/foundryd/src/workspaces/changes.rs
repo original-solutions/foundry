@@ -83,15 +83,40 @@ impl Workspaces {
     /// that fails with the worktree gone, is [`WorkspaceError::Unknown`]: there is nothing here
     /// to read.
     pub async fn changes(&self, id: WorkspaceId) -> Result<Changes, WorkspaceError> {
+        let (worktree, base) = self.reading(id).await?;
+        let read = self.inner.changes(&worktree, &base).await;
+        self.read(id, &worktree, read).await
+    }
+
+    /// What one commit on live workspace `id`'s branch changed, against its first parent: the
+    /// commit itself and its files, none of them uncommitted. `hash` must be the short hash of
+    /// one of [`Changes::commits`]; anything else, the base's own commits among them, is
+    /// [`WorkspaceError::UnknownCommit`], and it never reaches git as an argument.
+    pub async fn commit(&self, id: WorkspaceId, hash: &str) -> Result<Changes, WorkspaceError> {
+        let (worktree, base) = self.reading(id).await?;
+        let read = self.inner.commit(&worktree, &base, hash).await;
+        self.read(id, &worktree, read).await
+    }
+
+    /// Live workspace `id`'s worktree and base, to read.
+    async fn reading(&self, id: WorkspaceId) -> Result<(PathBuf, String), WorkspaceError> {
         let body = self.inner.live(id).await?;
-        let worktree = self.inner.worktree(body.project, &body.branch);
-        let read = self.inner.changes(&worktree, &body.base).await;
-        // Checked after the read: an archive marks the worktree before it removes any of it and
-        // writes its record before it unmarks, so a removal that overlapped the read is seen as
-        // one or the other.
+        Ok((self.inner.worktree(body.project, &body.branch), body.base))
+    }
+
+    /// `read` of workspace `id`, or [`WorkspaceError::Unknown`] when an archive's removal of the
+    /// worktree overlapped it. Checked after the read: an archive marks the worktree before it
+    /// removes any of it and writes its record before it unmarks, so a removal that overlapped
+    /// the read is seen as one or the other.
+    async fn read(
+        &self,
+        id: WorkspaceId,
+        worktree: &Path,
+        read: Result<Changes, WorkspaceError>,
+    ) -> Result<Changes, WorkspaceError> {
         if self.inner.removing(id)
             || self.inner.live(id).await.is_err()
-            || (read.is_err() && !tokio::fs::try_exists(&worktree).await.unwrap_or(true))
+            || (read.is_err() && !tokio::fs::try_exists(worktree).await.unwrap_or(true))
         {
             return Err(WorkspaceError::Unknown(id));
         }
@@ -100,9 +125,9 @@ impl Workspaces {
 }
 
 impl Inner {
-    async fn changes(&self, worktree: &Path, base: &str) -> Result<Changes, WorkspaceError> {
-        // Where the branch left its base; with the base gone from the remote, the last commit.
-        let from = match self
+    /// Where the branch left its base; with the base gone from the remote, the last commit.
+    async fn left_base(&self, worktree: &Path, base: &str) -> String {
+        match self
             .git(
                 worktree,
                 "merge-base",
@@ -112,8 +137,12 @@ impl Inner {
         {
             Ok(out) => out.trim().to_owned(),
             Err(_) => "HEAD".to_owned(),
-        };
-        let commits = self
+        }
+    }
+
+    /// The commits on `HEAD` since `from`, newest first.
+    async fn commits(&self, worktree: &Path, from: &str) -> Result<Vec<Commit>, WorkspaceError> {
+        Ok(self
             .git(
                 worktree,
                 "log",
@@ -133,77 +162,27 @@ impl Inner {
                     subject: subject.to_owned(),
                 }
             })
-            .collect();
+            .collect())
+    }
+
+    async fn changes(&self, worktree: &Path, base: &str) -> Result<Changes, WorkspaceError> {
+        let from = self.left_base(worktree, base).await;
+        let commits = self.commits(worktree, &from).await?;
         // Git refreshes the index as it compares the worktree with it, and a `diff` writes what
         // it refreshed under the index's lock whatever `GIT_OPTIONAL_LOCKS` says. So the read
         // works on its own copy, and an agent's git command in the worktree never finds the
         // lock taken.
         let copy = IndexCopy::of(self, worktree).await?;
         let index = Some(copy.0.as_path());
-        let diff = ["--no-color", "--no-ext-diff", "--no-textconv", "-M"];
-        let names = self
-            .git_on(
-                worktree,
-                index,
-                "diff",
-                diff.iter()
-                    .copied()
-                    .chain(["--name-status", "-z", from.as_str(), "--"]),
-            )
-            .await?;
-        let counts = self
-            .git_on(
-                worktree,
-                index,
-                "diff",
-                diff.iter()
-                    .copied()
-                    .chain(["--numstat", "-z", from.as_str(), "--"]),
-            )
-            .await?;
-        let patches = self
-            .git_on(
-                worktree,
-                index,
-                "diff",
-                diff.iter().copied().chain([from.as_str(), "--"]),
-            )
-            .await?;
         let uncommitted: BTreeSet<String> = self
             .uncommitted(worktree, index)
             .await?
             .into_iter()
             .collect();
-
-        let mut files = Vec::new();
         let mut left = ALL_AT_MOST;
-        let counts = numstat(&counts);
-        let patches = split_patches(&patches);
-        // `--name-status` and `--numstat` list each path once; the patch has two pieces for a
-        // path whose type changed, so its pieces are walked on their own.
-        let mut piece = 0;
-        for (i, (status, path, old, typechange)) in name_status(&names).into_iter().enumerate() {
-            let (added, removed) = counts.get(i).copied().unwrap_or((None, None));
-            let patch = if typechange {
-                piece += 2;
-                None
-            } else {
-                piece += 1;
-                patches.get(piece - 1).and_then(|p| hunks(p))
-            }
-            .filter(|p| p.len() <= FILE_AT_MOST && p.len() <= left);
-            left -= patch.as_ref().map_or(0, String::len);
-            files.push(FileChange {
-                uncommitted: uncommitted.contains(&path)
-                    || old.as_ref().is_some_and(|f| uncommitted.contains(f)),
-                path,
-                from: old,
-                status,
-                added,
-                removed,
-                patch,
-            });
-        }
+        let mut files = self
+            .diffed(worktree, index, &[&from], &uncommitted, &mut left)
+            .await?;
 
         let new = self
             .git(
@@ -243,6 +222,93 @@ impl Inner {
         Ok(Changes {
             base: base.to_owned(),
             commits,
+            files,
+        })
+    }
+
+    /// What `git diff <range> --` lists, each file with its counts and hunks while they fit in
+    /// `left` bytes; a path in `uncommitted`, or renamed from one, is marked so.
+    async fn diffed(
+        &self,
+        worktree: &Path,
+        index: Option<&Path>,
+        range: &[&str],
+        uncommitted: &BTreeSet<String>,
+        left: &mut usize,
+    ) -> Result<Vec<FileChange>, WorkspaceError> {
+        let diff = ["--no-color", "--no-ext-diff", "--no-textconv", "-M"];
+        let run = |how: &'static [&'static str]| {
+            self.git_on(
+                worktree,
+                index,
+                "diff",
+                diff.iter().chain(how).chain(range).copied().chain(["--"]),
+            )
+        };
+        let names = run(&["--name-status", "-z"]).await?;
+        let counts = numstat(&run(&["--numstat", "-z"]).await?);
+        let patches = run(&[]).await?;
+        let mut files = Vec::new();
+        let patches = split_patches(&patches);
+        // `--name-status` and `--numstat` list each path once; the patch has two pieces for a
+        // path whose type changed, so its pieces are walked on their own.
+        let mut piece = 0;
+        for (i, (status, path, old, typechange)) in name_status(&names).into_iter().enumerate() {
+            let (added, removed) = counts.get(i).copied().unwrap_or((None, None));
+            let patch = if typechange {
+                piece += 2;
+                None
+            } else {
+                piece += 1;
+                patches.get(piece - 1).and_then(|p| hunks(p))
+            }
+            .filter(|p| p.len() <= FILE_AT_MOST && p.len() <= *left);
+            *left -= patch.as_ref().map_or(0, String::len);
+            files.push(FileChange {
+                uncommitted: uncommitted.contains(&path)
+                    || old.as_ref().is_some_and(|f| uncommitted.contains(f)),
+                path,
+                from: old,
+                status,
+                added,
+                removed,
+                patch,
+            });
+        }
+
+        Ok(files)
+    }
+
+    async fn commit(
+        &self,
+        worktree: &Path,
+        base: &str,
+        hash: &str,
+    ) -> Result<Changes, WorkspaceError> {
+        let from = self.left_base(worktree, base).await;
+        let Some(commit) = self
+            .commits(worktree, &from)
+            .await?
+            .into_iter()
+            .find(|c| !hash.is_empty() && c.hash == hash)
+        else {
+            return Err(WorkspaceError::UnknownCommit(hash.to_owned()));
+        };
+        // Two commits' trees: neither the worktree nor its index is read.
+        let parent = format!("{}^", commit.hash);
+        let mut left = ALL_AT_MOST;
+        let files = self
+            .diffed(
+                worktree,
+                None,
+                &[&parent, &commit.hash],
+                &BTreeSet::new(),
+                &mut left,
+            )
+            .await?;
+        Ok(Changes {
+            base: base.to_owned(),
+            commits: vec![commit],
             files,
         })
     }
