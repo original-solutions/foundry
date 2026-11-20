@@ -165,17 +165,19 @@ WantedBy=multi-user.target\n"
 
 /// Puts `exe` and the holder beside it in `versions/<version>` and points `current` there,
 /// and records the install: a version lower than the one `current` named is kept by refusing
-/// the higher one. Returns the tag a go-back left refused. A copy is made in a stage directory and renamed in; when `exe` already
-/// runs from that directory nothing is copied.
+/// the higher one. Returns the tag a go-back left refused. A copy is made in a stage
+/// directory and renamed in; when `exe` already runs from that directory nothing is copied.
 fn place(home: &Path, exe: &Path, version: &str) -> Result<Option<String>, UpdateError> {
     let from = exe.parent().unwrap_or(Path::new("."));
     let holder = from.join(HOLDER);
     if !holder.is_file() {
         return Err(UpdateError::Missing(HOLDER));
     }
-    let before = update::current_version(home);
     let mut refused = None;
+    // Runs under the update lock, before `current` moves, so `current` still names the
+    // version this install replaces.
     let record = || {
+        let before = update::current_version(home);
         refused = update::placed_by_hand(home, version, before.as_deref())?;
         Ok(())
     };
@@ -187,23 +189,13 @@ fn place(home: &Path, exe: &Path, version: &str) -> Result<Option<String>, Updat
         _ => false,
     };
     if in_place {
-        let mut record = record;
-        record().map_err(|source| UpdateError::Io {
-            what: "cannot save the update state".into(),
-            source,
-        })?;
-        update::point_current(home, version).map_err(|source| UpdateError::Io {
-            what: "cannot point current at this version".into(),
-            source,
-        })?;
+        update::commit_version(home, version, record)?;
         return Ok(refused);
     }
     let copy = |stage: &Path| {
         for (from, name) in [(exe, "foundryd"), (holder.as_path(), HOLDER)] {
-            fs::copy(from, stage.join(name)).map_err(|source| UpdateError::Io {
-                what: format!("cannot copy {}", from.display()),
-                source,
-            })?;
+            fs::copy(from, stage.join(name))
+                .map_err(update::io_error(format!("cannot copy {}", from.display())))?;
         }
         Ok(())
     };
@@ -317,8 +309,15 @@ fn install_linux(home: &Path) -> Result<String, ServiceError> {
     ))
 }
 
+/// The data directory as the service will see it. A relative one is made absolute against
+/// this shell's directory: the service starts elsewhere, and would read it from there.
+fn service_home(home: Option<PathBuf>) -> Result<PathBuf, ServiceError> {
+    let home = home.ok_or(ServiceError::NoHome)?;
+    std::path::absolute(home).map_err(|_| ServiceError::NoHome)
+}
+
 fn do_install() -> Result<String, ServiceError> {
-    let home = daemon::home().ok_or(ServiceError::NoHome)?;
+    let home = service_home(daemon::home())?;
     if !cfg!(any(target_os = "macos", target_os = "linux")) {
         return Err(ServiceError::Unsupported);
     }
@@ -350,7 +349,7 @@ fn remove(path: &Path) -> Result<(), ServiceError> {
 }
 
 fn do_uninstall() -> Result<String, ServiceError> {
-    let home = daemon::home().ok_or(ServiceError::NoHome)?;
+    let home = service_home(daemon::home())?;
     let kept = format!(
         "The data directory {} and its versions are kept.",
         home.display()
@@ -753,5 +752,27 @@ mod tests {
             "{plain}"
         );
         assert!(!plain.contains("Went back"), "{plain}");
+    }
+
+    #[test]
+    fn a_relative_data_directory_is_made_absolute_for_the_service() {
+        let cwd = std::env::current_dir().unwrap();
+
+        let home = service_home(Some(PathBuf::from("data/foundry"))).unwrap();
+
+        assert_eq!(home, cwd.join("data/foundry"));
+        assert_eq!(
+            service_home(Some(PathBuf::from("/srv/foundry"))).unwrap(),
+            PathBuf::from("/srv/foundry")
+        );
+    }
+
+    #[test]
+    fn no_data_directory_or_an_empty_one_is_refused() {
+        assert!(matches!(service_home(None), Err(ServiceError::NoHome)));
+        assert!(matches!(
+            service_home(Some(PathBuf::new())),
+            Err(ServiceError::NoHome)
+        ));
     }
 }

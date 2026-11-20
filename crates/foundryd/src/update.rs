@@ -6,8 +6,12 @@
 //! healthy once it has run for a minute. A trial that starts three times without becoming
 //! healthy is put back to the previous version and its tag is refused until a higher one
 //! appears. Only a daemon that runs from `<home>/current` takes part in any of this.
+//!
+//! `foundryd install` and the daemon are separate processes that both change `update.json`
+//! and `current`, so every change to either is made while holding `<home>/update.lock`.
 
-use std::fs::{self, OpenOptions};
+use std::ffi::OsStr;
+use std::fs::{self, File, OpenOptions};
 use std::future::pending;
 use std::io::{self, Write as _};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
@@ -17,6 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use nix::errno::Errno;
+use nix::fcntl::{Flock, FlockArg};
 use nix::sys::signal::{Signal, raise};
 use serde::{Deserialize, Serialize};
 
@@ -82,7 +87,7 @@ pub enum UpdateError {
 }
 
 /// Labels an I/O error with what was being done.
-fn io_error(what: impl Into<String>) -> impl FnOnce(io::Error) -> UpdateError {
+pub(crate) fn io_error(what: impl Into<String>) -> impl FnOnce(io::Error) -> UpdateError {
     let what = what.into();
     move |source| UpdateError::Io { what, source }
 }
@@ -220,7 +225,22 @@ pub fn state(home: &Path) -> io::Result<State> {
     }
 }
 
-/// Writes `update.json` (mode 0600) to a temporary name and renames it into place.
+/// Takes `<home>/update.lock`, waiting for another process that holds it. Every holder only
+/// reads and writes `update.json` and moves `current` (no network and no child process), so the
+/// wait is short. The lock is let go when the value is dropped. Never take it twice in one
+/// thread: a second open of the file waits for the first.
+fn lock(home: &Path) -> io::Result<Flock<File>> {
+    let file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(home.join("update.lock"))?;
+    Flock::lock(file, FlockArg::LockExclusive).map_err(|(_, errno)| io::Error::from(errno))
+}
+
+/// Writes `update.json` (mode 0600) to a temporary name and renames it into place. Callers
+/// hold [`lock`], so no two writers share the temporary file.
 fn save(home: &Path, state: &State) -> io::Result<()> {
     let temp = home.join("update.json.tmp");
     let mut file = OpenOptions::new()
@@ -283,6 +303,7 @@ pub enum Start {
 /// Counts this start against a trial of `running`, or rolls the trial back. Any other
 /// version (a dev build, a manual run, a version that is not on trial) is never counted.
 fn start_with(home: &Path, running: &str) -> io::Result<Start> {
+    let _lock = lock(home)?;
     let mut state = state(home)?;
     let Some(trial) = state.trial.as_mut().filter(|t| t.version == running) else {
         return Ok(Start::Run);
@@ -293,10 +314,11 @@ fn start_with(home: &Path, running: &str) -> io::Result<Start> {
         return Ok(Start::Run);
     }
     let previous = trial.previous.clone();
-    if !home.join("versions").join(&previous).is_dir() {
+    let back = home.join("versions").join(&previous);
+    if let Some(missing) = BINARIES.iter().find(|name| !back.join(name).is_file()) {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            format!("cannot roll back: versions/{previous} is missing"),
+            format!("cannot roll back: versions/{previous}/{missing} is missing"),
         ));
     }
     // Three steps, each safe to stop after: the refusal is saved with the trial still at its
@@ -421,7 +443,8 @@ fn watch_until_healthy(flag: &AtomicBool) -> bool {
 
 /// Ends the trial when it is of `running`: this version has stayed up.
 fn mark_healthy(home: &Path, running: &str) {
-    let result = state(home).and_then(|mut state| {
+    let result = lock(home).and_then(|_lock| {
+        let mut state = state(home)?;
         if state.trial.as_ref().is_some_and(|t| t.version == running) {
             state.trial = None;
             save(home, &state)?;
@@ -442,7 +465,8 @@ pub fn lowered(before: Option<&str>, version: &str) -> bool {
 /// a trial of any other version. When `version` is lower it refuses `v<before>`, as an
 /// automatic rollback does, so the updater does not undo the install until a higher tag
 /// ships; a higher refusal already held stays. Returns the tag that is refused after a
-/// go-back, and `None` when the version did not go down.
+/// go-back, and `None` when the version did not go down. It takes no lock: `install` calls it
+/// as the `record` of [`commit_version`], which holds one.
 pub fn placed_by_hand(
     home: &Path,
     version: &str,
@@ -479,9 +503,8 @@ fn pick(tags: &[String], running: &str, refused: Option<&str>) -> Option<String>
 }
 
 /// Makes `versions/<version>` from a fresh stage directory: `fill` puts the files in it,
-/// both binaries must be there and are made executable, then `record` runs, the stage is
-/// swapped in and `current` is pointed at it. `record` runs before `current` moves, so a
-/// crash in between never leaves a version running that nothing recorded.
+/// both binaries must be there and are made executable, then the stage is swapped in and
+/// [`commit_version`] records it and points `current` at it.
 pub(crate) fn place_version(
     home: &Path,
     version: &str,
@@ -529,6 +552,18 @@ fn fill_and_swap(
         Err(error) => return Err(io_error("cannot clear the old copy")(error)),
     }
     fs::rename(stage, &target).map_err(io_error("cannot move the new version into place"))?;
+    commit_version(home, version, record)
+}
+
+/// Runs `record`, then points `current` at `versions/<version>`, both under [`lock`]. `record`
+/// runs first, so a crash in between never leaves a version running that nothing recorded.
+/// `record` must not take the lock itself.
+pub(crate) fn commit_version(
+    home: &Path,
+    version: &str,
+    record: impl FnOnce() -> io::Result<()>,
+) -> Result<(), UpdateError> {
+    let _lock = lock(home).map_err(io_error("cannot lock the update state"))?;
     record().map_err(io_error("cannot save the update state"))?;
     point_current(home, version).map_err(io_error("cannot point current at the new version"))
 }
@@ -634,9 +669,14 @@ fn asset() -> String {
 
 /// Downloads this machine's asset of `tag` into `stage` and unpacks it there.
 fn download(tag: &str, stage: &Path) -> Result<(), UpdateError> {
+    download_with(OsStr::new("gh"), tag, stage)
+}
+
+/// [`download`] with the `gh` program given.
+fn download_with(gh: &OsStr, tag: &str, stage: &Path) -> Result<(), UpdateError> {
     let asset = asset();
     run_bounded(
-        Command::new("gh")
+        Command::new(gh)
             .args(["release", "download", tag, "--repo", REPO, "--pattern"])
             .arg(&asset)
             .arg("--dir")
@@ -684,7 +724,8 @@ fn check_with(
             | UpdateError::BadCheck { .. }
             | UpdateError::Missing(_)),
         ) => {
-            let refuse = state(home).and_then(|mut state| {
+            let refuse = lock(home).and_then(|_lock| {
+                let mut state = state(home)?;
                 state.refused = Some(tag);
                 save(home, &state)
             });
@@ -787,7 +828,9 @@ mod tests {
     fn trial_home() -> tempfile::TempDir {
         let home = tempfile::tempdir().unwrap();
         for version in ["0.1.0", "0.2.0"] {
-            fs::create_dir_all(home.path().join("versions").join(version)).unwrap();
+            let dir = home.path().join("versions").join(version);
+            fs::create_dir_all(&dir).unwrap();
+            release(&dir, version);
         }
         point_current(home.path(), "0.2.0").unwrap();
         save(
@@ -1900,5 +1943,201 @@ mod tests {
 
         assert_eq!(same, None);
         assert_eq!(up, None);
+    }
+
+    /// Runs `write` on another thread while this thread holds the update lock, and says
+    /// whether it finished before the lock was let go.
+    fn finished_while_locked(home: &Path, write: impl FnOnce() + Send + 'static) -> bool {
+        let held = lock(home).unwrap();
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = done.clone();
+        let writer = std::thread::spawn(move || {
+            write();
+            flag.store(true, Ordering::SeqCst);
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        let early = done.load(Ordering::SeqCst);
+        drop(held);
+        writer.join().unwrap();
+        early
+    }
+
+    #[test]
+    fn every_change_to_the_update_state_waits_for_the_lock() {
+        let home = trial_home();
+        let path = home.path().to_path_buf();
+        assert!(!finished_while_locked(home.path(), move || {
+            start_with(&path, "0.2.0").unwrap();
+        }));
+        assert_eq!(state(home.path()).unwrap().trial.unwrap().starts, 1);
+
+        let path = home.path().to_path_buf();
+        assert!(!finished_while_locked(home.path(), move || {
+            mark_healthy(&path, "0.2.0");
+        }));
+        assert_eq!(state(home.path()).unwrap().trial, None);
+
+        let path = home.path().to_path_buf();
+        assert!(!finished_while_locked(home.path(), move || {
+            commit_version(&path, "0.1.0", || {
+                placed_by_hand(&path, "0.1.0", Some("0.2.0")).map(drop)
+            })
+            .unwrap();
+        }));
+        assert_eq!(current(home.path()), PathBuf::from("versions/0.1.0"));
+
+        let home = installed_home();
+        let path = home.path().to_path_buf();
+        assert!(!finished_while_locked(home.path(), move || {
+            let _ = check_with(
+                &path,
+                "0.1.0",
+                LIMIT,
+                || Ok(tags(&["v0.2.0"])),
+                |_, stage| {
+                    script(&stage.join("foundryd"), "foundryd 0.2.0");
+                    Ok(())
+                },
+            );
+        }));
+        assert_eq!(
+            state(home.path()).unwrap().refused.as_deref(),
+            Some("v0.2.0")
+        );
+    }
+
+    #[test]
+    fn commit_version_records_before_it_moves_current() {
+        let home = installed_home();
+
+        let error = commit_version(home.path(), "0.2.0", || Err(io::Error::other("disk full")))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("disk full"), "{error}");
+        assert_eq!(current(home.path()), PathBuf::from("versions/0.1.0"));
+    }
+
+    #[test]
+    fn a_rollback_to_a_version_without_both_binaries_is_an_error_and_changes_nothing() {
+        for missing in BINARIES {
+            let home = trial_home();
+            fs::remove_file(home.path().join("versions/0.1.0").join(missing)).unwrap();
+            for _ in 0..3 {
+                start_with(home.path(), "0.2.0").unwrap();
+            }
+            let before = fs::read(home.path().join("update.json")).unwrap();
+
+            let error = start_with(home.path(), "0.2.0").unwrap_err();
+
+            assert!(error.to_string().contains(missing), "{missing}: {error}");
+            assert_eq!(current(home.path()), PathBuf::from("versions/0.2.0"));
+            assert_eq!(fs::read(home.path().join("update.json")).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn the_asset_is_the_name_the_release_workflow_publishes() {
+        let published = [
+            "foundryd-aarch64-macos.tar.gz",
+            "foundryd-x86_64-macos.tar.gz",
+            "foundryd-aarch64-linux.tar.gz",
+            "foundryd-x86_64-linux.tar.gz",
+        ];
+
+        assert!(published.contains(&asset().as_str()), "{}", asset());
+    }
+
+    #[test]
+    fn download_fetches_this_machines_asset_with_gh_and_unpacks_both_binaries() {
+        let work = tempfile::tempdir().unwrap();
+        let packed = work.path().join("packed");
+        fs::create_dir_all(&packed).unwrap();
+        release(&packed, "0.2.0");
+        let archive = work.path().join("release.tar.gz");
+        run_bounded(
+            Command::new("tar")
+                .arg("-czf")
+                .arg(&archive)
+                .arg("-C")
+                .arg(&packed)
+                .args(BINARIES),
+            LIMIT,
+        )
+        .unwrap();
+        let args = work.path().join("args");
+        let gh = work.path().join("gh");
+        fs::write(
+            &gh,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{args}'\nwhile [ $# -gt 0 ]; do\n  case \"$1\" in\n    --pattern) name=\"$2\"; shift ;;\n    --dir) dir=\"$2\"; shift ;;\n  esac\n  shift\ndone\ncp '{archive}' \"$dir/$name\"\n",
+                args = args.display(),
+                archive = archive.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+        let stage = work.path().join("stage");
+        fs::create_dir_all(&stage).unwrap();
+
+        download_with(gh.as_os_str(), "v0.2.0", &stage).unwrap();
+
+        let said = fs::read_to_string(&args).unwrap();
+        let said: Vec<&str> = said.lines().collect();
+        assert_eq!(
+            said,
+            [
+                "release",
+                "download",
+                "v0.2.0",
+                "--repo",
+                REPO,
+                "--pattern",
+                &asset(),
+                "--dir",
+                stage.to_str().unwrap()
+            ]
+        );
+        for name in BINARIES {
+            assert!(stage.join(name).is_file(), "{name}");
+        }
+        assert!(!stage.join(asset()).exists());
+    }
+
+    #[test]
+    fn download_passes_a_failed_gh_on_as_a_fetch_error() {
+        let work = tempfile::tempdir().unwrap();
+        let gh = work.path().join("gh");
+        fs::write(&gh, "#!/bin/sh\necho 'release not found' >&2\nexit 1\n").unwrap();
+        fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let error = download_with(gh.as_os_str(), "v0.2.0", work.path()).unwrap_err();
+
+        assert!(matches!(error, UpdateError::Fetch(_)), "{error}");
+        assert!(error.to_string().contains("release not found"), "{error}");
+    }
+
+    fn failing() -> Result<Option<String>, UpdateError> {
+        Err(UpdateError::Fetch("gh is not logged in".into()))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_keeps_checking_after_a_failed_check_and_never_stops_the_daemon() {
+        static FLAG: AtomicBool = AtomicBool::new(false);
+        static CHECKS: AtomicUsize = AtomicUsize::new(0);
+        static STOPS: AtomicUsize = AtomicUsize::new(0);
+        let home = trial_home();
+        let exe = exe_in(home.path(), "0.2.0");
+        let task = spawn_run(home.path(), Ok(exe), &FLAG, (&CHECKS, &STOPS), failing);
+
+        tokio::time::sleep(HEALTHY_AFTER + Duration::from_secs(1)).await;
+        reach(&CHECKS, 1).await;
+        assert_eq!(CHECKS.load(Ordering::Relaxed), 1);
+        tokio::time::sleep(TICK).await;
+        reach(&CHECKS, 2).await;
+
+        assert_eq!(CHECKS.load(Ordering::Relaxed), 2);
+        assert_eq!(STOPS.load(Ordering::Relaxed), 0);
+        assert!(!task.is_finished());
+        task.abort();
     }
 }
