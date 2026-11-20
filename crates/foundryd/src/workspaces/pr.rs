@@ -2,6 +2,8 @@
 //!
 //! Whether `origin` has the branch and how many commits on the worktree's `HEAD` no remote
 //! branch has come from git, with no fetch, so they are as of this machine's last fetch or push.
+//! `origin` has the branch only when its tip there is the worktree's `HEAD` or one of the
+//! branch's own commits: a branch of the same name left by older work is not this one pushed.
 //! The pull request comes from GitHub through the `gh` command, signed in as this machine's user,
 //! and only once the branch is on `origin`: a branch never pushed has no pull request, and a
 //! name another branch once had is not looked up. A `gh` that is missing, signed out, slow or
@@ -37,7 +39,8 @@ const PRS_AT_MOST: &str = "20";
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Shipping {
     pub branch: String,
-    /// Whether `origin` has the branch, as of this machine's last fetch or push.
+    /// Whether `origin` has this branch's work, as of this machine's last fetch or push: its
+    /// tip there is `HEAD` or one of the branch's own commits.
     pub pushed: bool,
     /// Commits on the worktree's `HEAD` that no remote branch has.
     pub unpushed: u64,
@@ -93,12 +96,25 @@ impl Workspaces {
     pub async fn shipping(&self, id: WorkspaceId) -> Result<Shipping, WorkspaceError> {
         let body = self.inner.live(id).await?;
         let worktree = self.inner.worktree(body.project, &body.branch);
-        let remote = format!("refs/remotes/origin/{}", body.branch);
-        let pushed = self
+        let remote = format!("refs/remotes/origin/{}^{{commit}}", body.branch);
+        let own = self.inner.own_commits(&worktree, &body.base).await?;
+        let pushed = match self
             .inner
             .git(&worktree, "rev-parse", ["--verify", "--quiet", &remote])
             .await
-            .is_ok();
+        {
+            Ok(tip) => {
+                let tip = tip.trim();
+                own.iter().any(|c| c == tip)
+                    || self
+                        .inner
+                        .git(&worktree, "rev-parse", ["HEAD"])
+                        .await?
+                        .trim()
+                        == tip
+            }
+            Err(_) => false,
+        };
         let unpushed = self
             .inner
             .git(
@@ -114,7 +130,6 @@ impl Workspaces {
             match self.inner.gh_pull_requests(&worktree, &body.branch).await {
                 Some(listed) if listed.is_empty() => (None, false),
                 Some(listed) => {
-                    let own = self.inner.own_commits(&worktree, &body.base).await?;
                     let pr = listed
                         .into_iter()
                         .find(|(head, _)| own.iter().any(|c| c == head))

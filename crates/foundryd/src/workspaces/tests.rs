@@ -3069,3 +3069,38 @@ async fn the_shipping_of_an_unknown_workspace_is_refused() {
         Err(WorkspaceError::Unknown(id)) if id == missing
     ));
 }
+
+#[tokio::test]
+async fn a_remote_branch_of_the_same_name_without_this_workspaces_work_is_not_pushed() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup.create(&remote, "main", "reused").await;
+    let worktree = setup.worktree(remote.project, "reused");
+    // An older branch of the same name, left on origin with work this one does not have.
+    git(
+        &worktree,
+        &["commit", "-q", "--allow-empty", "-m", "old work"],
+    );
+    git(&worktree, &["push", "-q", "origin", "HEAD"]);
+    git(
+        &worktree,
+        &["reset", "-q", "--hard", "refs/remotes/origin/main"],
+    );
+    git(&worktree, &["commit", "-q", "--allow-empty", "-m", "mine"]);
+    let (workspaces, asked) = with_gh(&setup, "[]");
+
+    let read = workspaces.shipping(id).await.unwrap();
+    assert!(!read.pushed, "the old branch's push is not this one's");
+    assert_eq!(read.unpushed, 1);
+    assert_eq!(read.pr, None);
+    assert!(!read.unreachable);
+    assert!(
+        !asked.exists(),
+        "GitHub was asked about a branch this workspace never pushed"
+    );
+
+    git(&worktree, &["push", "-q", "--force", "origin", "HEAD"]);
+    let read = workspaces.shipping(id).await.unwrap();
+    assert!(read.pushed);
+    assert_eq!(read.unpushed, 0);
+}
