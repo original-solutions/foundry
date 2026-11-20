@@ -10,6 +10,11 @@ compile_error!(
     "run these tests in a debug build: a release build on macOS uses the login keychain"
 );
 
+// A release build ignores `FOUNDRY_TAILSCALE`, so these runs of the binary would ask the real
+// Tailscale.
+#[cfg(not(debug_assertions))]
+compile_error!("run these tests in a debug build: a release build asks the real Tailscale");
+
 use std::fs;
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt as _;

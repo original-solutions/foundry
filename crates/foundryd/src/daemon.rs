@@ -1001,9 +1001,38 @@ mod tests {
         let known = known.to_str().unwrap();
 
         assert_eq!(
-            choose_cli(os("/opt/fake/tailscale"), &[known]),
+            choose_cli(os("/opt/fake/tailscale"), true, &[known]),
             PathBuf::from("/opt/fake/tailscale")
         );
+    }
+
+    /// A release build ignores `FOUNDRY_TAILSCALE`: whatever the variable names, the daemon asks
+    /// the CLI where Tailscale puts it.
+    #[test]
+    fn foundry_tailscale_is_ignored_when_the_build_does_not_take_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let known = dir.path().join("known");
+        std::fs::write(&known, "").unwrap();
+
+        assert_eq!(
+            choose_cli(os("/opt/fake/tailscale"), false, &[known.to_str().unwrap()]),
+            known
+        );
+    }
+
+    /// The debug build the tests run takes `FOUNDRY_TAILSCALE`.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn this_debug_build_takes_foundry_tailscale() {
+        assert!(TAILSCALE_OVERRIDE);
+    }
+
+    /// A release build does not. The gate runs debug builds only; run
+    /// `cargo test --release -p foundryd --lib daemon` to check this one.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn this_release_build_ignores_foundry_tailscale() {
+        assert!(!TAILSCALE_OVERRIDE);
     }
 
     #[test]
@@ -1020,8 +1049,8 @@ mod tests {
             also.to_str().unwrap(),
         ];
 
-        assert_eq!(choose_cli(None, &known), there);
-        assert_eq!(choose_cli(os(""), &known), there);
+        assert_eq!(choose_cli(None, true, &known), there);
+        assert_eq!(choose_cli(os(""), true, &known), there);
     }
 
     #[test]
@@ -1030,7 +1059,7 @@ mod tests {
         let missing = dir.path().join("missing");
 
         assert_eq!(
-            choose_cli(None, &[missing.to_str().unwrap()]),
+            choose_cli(None, true, &[missing.to_str().unwrap()]),
             PathBuf::from("tailscale")
         );
     }
