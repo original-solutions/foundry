@@ -1,6 +1,11 @@
-//! The command line: `--version` works and every other command says it is not built yet.
+//! The command line: `--version` works, the commands still unbuilt say so, and `secret set`
+//! stores a gateway key without printing it. Every test that runs the binary uses the file
+//! secret store and a temporary data directory, never the login keychain.
 
-use std::process::{Command, Output};
+use std::io::Write as _;
+use std::process::{Command, Output, Stdio};
+
+use foundryd::secrets::{FileSecrets, Secrets};
 
 fn foundryd(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_foundryd"))
@@ -22,12 +27,7 @@ fn version_prints_the_crate_version() {
 
 #[test]
 fn every_other_command_exits_2_and_says_not_built_yet() {
-    let commands: [(&str, &[&str]); 4] = [
-        ("run", &["run"]),
-        ("install", &["install"]),
-        ("uninstall", &["uninstall"]),
-        ("status", &["status"]),
-    ];
+    let commands: [(&str, &[&str]); 2] = [("install", &["install"]), ("uninstall", &["uninstall"])];
 
     for (name, args) in commands {
         let out = foundryd(args);
@@ -57,4 +57,78 @@ fn join_with_a_port_that_is_not_a_number_exits_1_and_names_it() {
 
     assert_eq!(out.status.code(), Some(1), "exit: {:?}", out.status);
     assert!(stderr.contains("FOUNDRY_PORT"), "stderr: {stderr}");
+}
+
+/// Runs `foundryd secret set <name>` with `input` on stdin, in a data directory of its own.
+fn secret_set(home: &tempfile::TempDir, name: &str, input: &str) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_foundryd"))
+        .args(["secret", "set", name])
+        .env("FOUNDRY_HOME", home.path())
+        .env("FOUNDRY_SECRETS", "file")
+        .env("HOME", home.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("foundryd runs");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+fn held(home: &tempfile::TempDir, name: &str) -> Option<String> {
+    FileSecrets::new(home.path().join("secrets.json"))
+        .get(name)
+        .unwrap()
+}
+
+#[test]
+fn secret_set_stores_the_gateway_keys_and_never_prints_them() {
+    for name in ["gateway", "gateway-management"] {
+        let home = tempfile::tempdir().unwrap();
+
+        let out = secret_set(&home, name, "sk-abc\n");
+
+        assert_eq!(out.status.code(), Some(0), "{name}: {:?}", out.status);
+        let printed = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!printed.contains("sk-abc"), "{name} printed: {printed}");
+        assert_eq!(held(&home, name).as_deref(), Some("sk-abc"));
+    }
+}
+
+#[test]
+fn secret_set_with_no_value_exits_1_and_stores_nothing() {
+    for input in ["", "\n"] {
+        let home = tempfile::tempdir().unwrap();
+
+        let out = secret_set(&home, "gateway", input);
+
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "input {input:?}: {:?}",
+            out.status
+        );
+        assert_eq!(held(&home, "gateway"), None);
+    }
+}
+
+#[test]
+fn secret_set_with_any_other_name_exits_1_and_stores_nothing() {
+    for name in ["machine", "machine-keys", "other"] {
+        let home = tempfile::tempdir().unwrap();
+
+        let out = secret_set(&home, name, "x\n");
+
+        assert_eq!(out.status.code(), Some(1), "{name}: {:?}", out.status);
+        assert_eq!(held(&home, name), None, "{name} was stored");
+    }
 }

@@ -653,4 +653,72 @@ mod tests {
         assert!(dir.path().join("secrets.lock").exists());
         security_framework::passwords::delete_generic_password("foundry-test", &name).unwrap();
     }
+
+    #[test]
+    fn the_file_choice_keeps_secrets_in_secrets_json_under_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_for(dir.path(), Some(std::ffi::OsStr::new("file")));
+        store.set("gateway", "sk-one").unwrap();
+        let held = FileSecrets::new(dir.path().join("secrets.json"));
+        assert_eq!(held.get("gateway").unwrap().as_deref(), Some("sk-one"));
+    }
+
+    /// What `set_from` stored under `name`, read back from a file store.
+    fn stored(secrets: &FileSecrets, name: &str) -> Option<String> {
+        secrets.get(name).unwrap()
+    }
+
+    #[test]
+    fn set_from_stores_the_line_without_its_newline() {
+        let (_dir, secrets) = file();
+        set_from(&secrets, GATEWAY, "sk-one\n".as_bytes()).unwrap();
+        set_from(&secrets, GATEWAY_MANAGEMENT, "sk-two\r\n".as_bytes()).unwrap();
+        assert_eq!(stored(&secrets, "gateway").as_deref(), Some("sk-one"));
+        assert_eq!(
+            stored(&secrets, "gateway-management").as_deref(),
+            Some("sk-two")
+        );
+    }
+
+    #[test]
+    fn set_from_keeps_only_the_first_line() {
+        let (_dir, secrets) = file();
+        set_from(&secrets, GATEWAY, "sk-one\nsk-two\n".as_bytes()).unwrap();
+        assert_eq!(stored(&secrets, "gateway").as_deref(), Some("sk-one"));
+    }
+
+    #[test]
+    fn set_from_refuses_an_empty_value_and_stores_nothing() {
+        let (_dir, secrets) = file();
+        for input in ["", "\n", "\r\n"] {
+            let error = set_from(&secrets, GATEWAY, input.as_bytes()).unwrap_err();
+            assert!(error.to_string().contains("no value on stdin"), "{error}");
+        }
+        assert_eq!(stored(&secrets, "gateway"), None);
+    }
+
+    #[test]
+    fn set_from_refuses_any_other_name_and_stores_nothing() {
+        let (_dir, secrets) = file();
+        for name in ["machine", "machine-keys", "other"] {
+            let error = set_from(&secrets, name, "x\n".as_bytes()).unwrap_err();
+            let text = error.to_string();
+            assert!(text.contains(name), "{text}");
+            assert!(text.contains("gateway-management"), "{text}");
+            assert_eq!(stored(&secrets, name), None);
+        }
+    }
+
+    #[test]
+    fn set_from_refuses_a_bad_name_before_it_reads_stdin() {
+        struct Unreadable;
+        impl io::Read for Unreadable {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                panic!("stdin was read");
+            }
+        }
+        let secrets = MemorySecrets::default();
+        let input = io::BufReader::new(Unreadable);
+        assert!(set_from(&secrets, "machine", input).is_err());
+    }
 }
