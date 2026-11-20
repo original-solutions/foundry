@@ -20,7 +20,6 @@ use std::io;
 use bytes::Bytes;
 use foundry_proto::ids::{MachineId, TerminalId};
 use foundry_proto::messages::{PROTOCOL, PeerMessage};
-use foundry_proto::record::AnyRecord;
 use futures::StreamExt as _;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -137,21 +136,10 @@ impl Peers {
     pub async fn owner_of(&self, id: TerminalId) -> Result<Option<MachineId>, StoreError> {
         let me = self.inner.me;
         on_store(&self.inner.store, move |store| {
-            for owner in store.versions()?.into_keys().filter(|owner| *owner != me) {
-                let held = match store.since(owner, 0) {
-                    Ok(held) => held,
-                    Err(error) => {
-                        tracing::warn!("sync: records of {owner} not searched: {error}");
-                        continue;
-                    }
-                };
-                if held.iter().any(
-                    |record| matches!(record, AnyRecord::Terminal(t) if t.body.id == id && !t.deleted),
-                ) {
-                    return Ok(Some(owner));
-                }
-            }
-            Ok(None)
+            Ok(store
+                .terminal(id)?
+                .filter(|record| !record.deleted && record.owner != me)
+                .map(|record| record.owner))
         })
         .await
     }

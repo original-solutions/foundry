@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use foundry_proto::ids::{MachineId, WorkspaceId};
+use foundry_proto::ids::{MachineId, TerminalId, WorkspaceId};
 use foundry_proto::record::{AnyRecord, Record, Terminal, Workspace};
 use foundry_proto::settings::SharedSettings;
 use rusqlite::types::Type;
@@ -178,6 +178,26 @@ impl Store {
         match serde_json::from_str(&json)? {
             AnyRecord::Workspace(record) => Ok(Some(record)),
             // Rows are stored under their own kind, so a workspace row holds a workspace.
+            _ => Ok(None),
+        }
+    }
+
+    /// The terminal record with `id`, deleted or not, read by its key without the rest.
+    pub fn terminal(&self, id: TerminalId) -> Result<Option<Record<Terminal>>, StoreError> {
+        let json: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT record FROM records WHERE kind = 'terminal' AND id = ?1",
+                params![id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(json) = json else {
+            return Ok(None);
+        };
+        match serde_json::from_str(&json)? {
+            AnyRecord::Terminal(record) => Ok(Some(record)),
+            // Rows are stored under their own kind, so a terminal row holds a terminal.
             _ => Ok(None),
         }
     }
