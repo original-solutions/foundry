@@ -190,6 +190,10 @@ A P3 run history on the same hooks. The daemon also keeps each of its sessions' 
 
 A P3 run history on the same trails, across the fleet. The board switches to a timeline: every session of this machine that took a turn in the window (15 minutes to 12 hours, ending now) is a lane, each turn a bar from its prompt to its end, with a tick for each tool call and a dot for each question. A turn still going runs to the "now" edge in its session's state colour. A line above sums the window: turns, agent time, tool calls and questions. Pointing at a bar shows its prompt, what it did and how long it took; clicking it opens the terminal with its Steps column. Only sessions this daemon has briefs of are read, so a peer's session is never asked; a busy session's trail is read again every few seconds, a quiet one on a change of state.
 
+### Ending terminals
+
+A terminal is ended or cleared from its menu (right-click or long press on its row, or the header's More button) through `POST /api/terminals/{id}/close`, which only the owning machine answers. `GET /api/machine` returns `{"id"}` of the machine serving the UI, and the menu offers End and Clear only for that machine's terminals. Ending one that still runs asks first; clearing one that ended does not, so End and Clear are picked only by a click on them or the keyboard, never by the release of the press that opened the menu.
+
 ## Placement
 
 - Each worker records CPU load per core, free memory, free disk and its session count every 5 seconds.

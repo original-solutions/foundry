@@ -78,6 +78,7 @@ use crate::workspaces::{WorkspaceError, Workspaces};
 pub mod assets;
 mod briefs;
 mod changes;
+mod machine;
 pub mod terminals;
 #[cfg(test)]
 mod tests;
@@ -133,6 +134,7 @@ pub fn router(api: Api) -> Router {
         .route("/api/workspaces/{id}/shells", post(start_shell))
         .route("/api/workspaces/{id}/changes", get(changes::changes))
         .route("/api/briefs", get(briefs::briefs))
+        .route("/api/machine", get(machine::machine))
         .route("/api/sessions/{id}/trail", get(trail::trail))
         .fallback(no_route)
         .method_not_allowed_fallback(wrong_method)

@@ -616,6 +616,15 @@ async fn a_request_from_another_site_is_refused() {
 }
 
 #[tokio::test]
+async fn the_ui_learns_which_machine_serves_it() {
+    let daemon = Daemon::new(TURN).await;
+    let reply = daemon.call("GET", "/api/machine", None).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    let body: serde_json::Value = serde_json::from_str(&reply.body).unwrap();
+    assert_eq!(body, serde_json::json!({"id": daemon.me.to_string()}));
+}
+
+#[tokio::test]
 async fn a_request_naming_another_host_is_refused() {
     // What a page whose name was rebound to this machine's address sends.
     let daemon = Daemon::new(TURN).await;
@@ -1278,6 +1287,7 @@ async fn every_route_refuses_another_site_and_another_host_and_does_nothing() {
         ("POST", &sessions, Some(model), false),
         ("POST", &shells, None, false),
         ("GET", "/api/briefs", None, false),
+        ("GET", "/api/machine", None, false),
         ("GET", &trail, None, false),
     ];
     for (method, path, body, upgrade) in routes {

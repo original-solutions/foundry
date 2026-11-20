@@ -1,7 +1,7 @@
-import { useMutation } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { ContextMenu, Dialog, DropdownMenu } from "radix-ui";
-import { createContext, useContext, useRef, useState, type ComponentType, type ReactElement, type ReactNode } from "react";
-import { closeTerminal } from "./api";
+import { createContext, useContext, useRef, useState, type ComponentType, type PointerEvent, type ReactElement, type ReactNode } from "react";
+import { closeTerminal, machineQuery } from "./api";
 import { ended, endOf } from "./ends";
 import { locate, type Located, type MachineView } from "./fleet";
 import { button, Modal } from "./Modal";
@@ -22,6 +22,8 @@ interface Actions {
 }
 
 interface Context extends Actions {
+  /** The machine serving the UI, once known: only its terminals can be ended from here. */
+  here?: string;
   /** Ends terminal `id`: at once when it already ended, else after asking. */
   end: (id: string) => void;
   /** Removes ended terminals `ids`. */
@@ -34,13 +36,16 @@ const Terminals = createContext<Context | undefined>(undefined);
  * Gives every terminal row inside it (sidebar, tabs, board) a menu of what can be done with that
  * terminal: right-click it, or press and hold on a touch screen. It holds the ending of
  * terminals too: one that still runs is ended after asking, one that already ended is cleared at
- * once, and a request the daemon refuses says why at the foot of the screen.
+ * once, and a request the daemon refuses says why at the foot of the screen. Only the machine
+ * serving the UI can end its terminals, so another machine's are not offered for ending.
  */
 export function TerminalActions({ children, ...actions }: Actions & { children: ReactNode }) {
   const [asking, setAsking] = useState<string>();
   const clearing = useMutation({ mutationFn: (ids: string[]) => Promise.all(ids.map(closeTerminal)) });
+  const { data: here } = useQuery(machineQuery);
   const context: Context = {
     ...actions,
+    here,
     end: (id) => {
       const found = locate(actions.machines, id);
       if (found && endOf(found.glyph) === "clear") clearing.mutate([id]);
@@ -78,7 +83,7 @@ const menu =
 const item = "flex cursor-default select-none items-center gap-2.5 rounded-md px-2 py-1.5 outline-none data-highlighted:bg-neutral-800 data-highlighted:text-neutral-50";
 
 interface Kit {
-  Item: ComponentType<{ onSelect?: () => void; className?: string; children: ReactNode }>;
+  Item: ComponentType<{ onSelect?: () => void; onPointerUp?: (event: PointerEvent) => void; className?: string; children: ReactNode }>;
   Separator: ComponentType<{ className?: string }>;
   Label: ComponentType<{ className?: string; children: ReactNode }>;
 }
@@ -102,10 +107,18 @@ function useReturnFocus() {
   };
 }
 
+/**
+ * Props for an item that ends or clears: picked only by a click (a press and a release on it) or
+ * the keyboard. Radix also picks an item on a release it never saw pressed, so the release of the
+ * right-click or long press that opened the menu under the pointer would pick whatever lies there.
+ */
+const deliberate = { onPointerUp: (event: PointerEvent) => event.preventDefault() };
+
 /** The menu's entries for terminal `id`, as a right-click menu or a button's menu draws them. */
 function Entries({ kit: { Item, Separator, Label }, id, at, found }: { kit: Kit; id: string; at: Context; found: Located }) {
-  const kind = endOf(found.glyph);
-  const rest = ended(found.workspace);
+  const mine = found.machine.id === at.here;
+  const kind = mine ? endOf(found.glyph) : undefined;
+  const rest = mine ? ended(found.workspace) : [];
   const sweep = rest.length > (kind === "clear" ? 1 : 0);
   return (
     <>
@@ -145,19 +158,19 @@ function Entries({ kit: { Item, Separator, Label }, id, at, found }: { kit: Kit;
       </Item>
       {(kind || sweep) && <Separator className="my-1 h-px bg-neutral-800" />}
       {kind === "end" && (
-        <Item onSelect={() => at.end(id)} className={`${item} text-red-400 data-highlighted:bg-red-400/10 data-highlighted:text-red-300`}>
+        <Item {...deliberate} onSelect={() => at.end(id)} className={`${item} text-red-400 data-highlighted:bg-red-400/10 data-highlighted:text-red-300`}>
           <Icon d="M8 2.5v5M4.8 4.6a4.8 4.8 0 1 0 6.4 0" />
           End {found.name}…
         </Item>
       )}
       {kind === "clear" && (
-        <Item onSelect={() => at.end(id)} className={item}>
+        <Item {...deliberate} onSelect={() => at.end(id)} className={item}>
           <Icon d="M3.5 4.5h9M6.5 4.5V3h3v1.5M4.5 4.5l.7 8.5h5.6l.7-8.5" />
           Clear
         </Item>
       )}
       {sweep && (
-        <Item onSelect={() => at.clear(rest)} className={item}>
+        <Item {...deliberate} onSelect={() => at.clear(rest)} className={item}>
           <Icon d="M11.5 2l-3 6M4 8h7l1 5.5H3zM6 10.5v3M9 10.5v3" />
           Clear {rest.length} ended in {found.workspace.name}
         </Item>
@@ -226,7 +239,7 @@ export function TerminalMenuButton({ id }: { id: string }) {
 }
 
 /** The ending of terminals, inside `TerminalActions`. */
-export function useTerminalActions(): Pick<Context, "end" | "clear"> | undefined {
+export function useTerminalActions(): Pick<Context, "end" | "clear" | "here"> | undefined {
   return useContext(Terminals);
 }
 

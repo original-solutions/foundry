@@ -2,9 +2,9 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createMemoryHistory, createRouter, RouterProvider } from "@tanstack/react-router";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { Briefs, UiMessage } from "./api";
+import { machineQuery, type Briefs, type UiMessage } from "./api";
 import { router, routeTree } from "./App";
-import { ME, sample, session, settings, terminal, workspace } from "./test-fixtures";
+import { ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
 import { FakeSocket, json, mockFetch, type Call } from "./test-utils";
 
 // jsdom cannot run xterm.js.
@@ -112,8 +112,11 @@ describe("App", () => {
   async function open(path: string, records: UiMessage & { type: "state" }) {
     const fresh = createRouter({ routeTree, history: createMemoryHistory({ initialEntries: [path] }) });
     await fresh.load();
+    // The UI is served by machine ME.
+    const client = new QueryClient();
+    client.setQueryData(machineQuery.queryKey, ME);
     render(
-      <QueryClientProvider client={new QueryClient()}>
+      <QueryClientProvider client={client}>
         <RouterProvider router={fresh} />
       </QueryClientProvider>,
     );
@@ -461,6 +464,54 @@ describe("App", () => {
     fireEvent.click(within(await screen.findByRole("menu")).getByRole("menuitem", { name: "Clear" }));
 
     expect((await screen.findByRole("alert")).textContent).toMatch(/no such terminal/);
+  });
+
+  it("offers no ending for another machine's terminals, which only that machine can end", async () => {
+    const calls = mockActions();
+    await open("/terminals/t1", {
+      ...ended,
+      records: [
+        ...ended.records,
+        sample(OTHER, 1),
+        workspace(OTHER, "w9", "remote job"),
+        terminal(OTHER, "t9", "w9", "exited", { exit_code: 0 }),
+        terminal(OTHER, "t8", "w9", "running"),
+      ],
+      settings: settings({ machines: [{ id: ME, name: "studio", address: "127.0.0.1" }, { id: OTHER, name: "attic", address: "10.0.0.2" }] }),
+    });
+    const remote = screen.getByRole("group", { name: "remote job" });
+    expect(within(remote).queryByRole("button", { name: /^Clear/ })).toBeNull();
+
+    for (const row of within(remote).getAllByRole("link", { name: /^shell/ })) {
+      fireEvent.contextMenu(row);
+      const menu = await screen.findByRole("menu");
+      expect(within(menu).getAllByRole("menuitem").map((item) => item.textContent)).toEqual(["Open", "Open beside", "Changes in remote job"]);
+      fireEvent.keyDown(menu, { key: "Escape" });
+      await waitFor(() => expect(screen.queryByRole("menu")).toBeNull());
+    }
+    // This machine's own ended terminals can still be cleared.
+    expect(within(screen.getByRole("group", { name: "fix login" })).getByRole("button", { name: "Clear 2 ended" })).toBeDefined();
+    expect(calls).toEqual([]);
+  });
+
+  it("does not end or clear anything when the button that opened the menu is let go over that item", async () => {
+    const calls = mockActions();
+    await open("/terminals/t1", ended);
+    const sidebar = screen.getByRole("group", { name: "fix login" });
+
+    // The press opened the menu under the pointer; its release lands on an item it never pressed.
+    for (const name of ["Clear", "Clear 2 ended in fix login"]) {
+      fireEvent.contextMenu(within(sidebar).getByRole("link", { name: /^shell Exited 0/ }));
+      fireEvent.pointerUp(within(await screen.findByRole("menu")).getByRole("menuitem", { name }));
+    }
+    fireEvent.contextMenu(within(sidebar).getByRole("link", { name: /^sonnet/ }));
+    fireEvent.pointerUp(within(await screen.findByRole("menu")).getByRole("menuitem", { name: "End sonnet…" }));
+    fireEvent.keyDown(within(screen.getByLabelText("Open terminal")).getByRole("button", { name: "More" }), { key: "Enter" });
+    fireEvent.pointerUp(within(await screen.findByRole("menu")).getByRole("menuitem", { name: "End sonnet…" }));
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(calls).toEqual([]);
+    expect(screen.queryByRole("dialog")).toBeNull();
   });
 
   it("opens the open terminal's workspace changes from its header, and the header then shows their size", async () => {

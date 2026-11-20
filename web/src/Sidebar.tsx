@@ -114,6 +114,7 @@ export function Sidebar({ machines, onCreate, selected, connected, onNavigate, o
                 <Workspace
                   key={workspace.id}
                   workspace={workspace}
+                  machine={machine.id}
                   folded={folded.has(workspace.id)}
                   onFold={(on) => fold([workspace.id], on)}
                   selected={selected}
@@ -149,6 +150,8 @@ function LoadMeter({ sample }: { sample: MachineSample }) {
 
 interface WorkspaceProps {
   workspace: WorkspaceView;
+  /** The machine it is on. */
+  machine: string;
   folded: boolean;
   onFold: (on: boolean) => void;
   selected?: string;
@@ -156,11 +159,12 @@ interface WorkspaceProps {
   onChanges?: (workspace: string) => void;
 }
 
-function Workspace({ workspace, folded, onFold, selected, onNavigate, onChanges }: WorkspaceProps) {
+function Workspace({ workspace, machine, folded, onFold, selected, onNavigate, onChanges }: WorkspaceProps) {
   const shell = useMutation({ mutationFn: () => startShell(workspace.id) });
   const terminals = useTerminalActions();
   const list = rows(workspace);
-  const over = ended(workspace);
+  // Only the machine serving the UI can clear its terminals.
+  const over = terminals?.here === machine ? ended(workspace) : [];
   return (
     <div role="group" aria-label={workspace.name} className="group/ws">
       <div className="flex items-center gap-2 rounded-md px-1 py-1 hover:bg-neutral-800/60">
