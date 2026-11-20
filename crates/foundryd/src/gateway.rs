@@ -211,8 +211,62 @@ impl Reader {
 }
 
 impl Source for Reader {
-    fn items(&self, _fleet: &Fleet) -> Vec<Item> {
-        Vec::new()
+    fn items(&self, fleet: &Fleet) -> Vec<Item> {
+        let (what, todo) = match self.health() {
+            None | Some(Health::Healthy) => return Vec::new(),
+            Some(Health::NotSet(missing)) => {
+                let what = missing
+                    .iter()
+                    .map(|name| match *name {
+                        GATEWAY_MANAGEMENT => format!("the secret {GATEWAY_MANAGEMENT} is not set"),
+                        name => format!("{name} is not set"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" and ");
+                let todo = missing
+                    .iter()
+                    .map(|name| match *name {
+                        GATEWAY_MANAGEMENT => {
+                            format!("run `foundryd secret set {GATEWAY_MANAGEMENT}` on it")
+                        }
+                        name => format!("set {name} for its foundryd and restart it"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", and ");
+                (
+                    format!("The gateway cannot be checked: {what}"),
+                    capitalized(&todo),
+                )
+            }
+            Some(Health::KeyUnreadable) => (
+                format!(
+                    "The gateway cannot be checked: the secret {GATEWAY_MANAGEMENT} could not be \
+                     read"
+                ),
+                "See the daemon log for why".to_owned(),
+            ),
+            Some(Health::Unanswered(why)) => (
+                format!("The gateway at {} does not answer: {why}", self.shown_url()),
+                "Check that the gateway runs and that this machine can reach it".to_owned(),
+            ),
+            Some(Health::NoAccounts) => (
+                format!("The gateway at {} has no account to use", self.shown_url()),
+                "Add an account to the gateway, or enable one".to_owned(),
+            ),
+            Some(Health::CoolingDown { accounts, free_in }) => {
+                let soonest = free_in.map_or_else(String::new, |wait| {
+                    format!("; the first is free again in {}", minutes(wait))
+                });
+                (
+                    format!(
+                        "Every account of the gateway is cooling down ({accounts} of \
+                         them){soonest}"
+                    ),
+                    "Wait for one to come back, or add an account to the gateway".to_owned(),
+                )
+            }
+        };
+        vec![fleet.item(Kind::GatewayUnhealthy, fleet.me, fleet.me, what, todo)]
     }
 }
 
