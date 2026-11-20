@@ -649,6 +649,124 @@ fn reopening_a_current_file_runs_no_migration_again() {
     assert_eq!(store.since(owner, 0).unwrap(), vec![workspace(owner, 2)]);
 }
 
+#[test]
+fn a_file_a_newer_build_migrated_opens_and_keeps_working() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("foundry.db");
+    let newer = MIGRATIONS.len() + 1;
+    let owner = MachineId::random();
+    Store::open(&path)
+        .unwrap()
+        .apply(&workspace(owner, 1), owner)
+        .unwrap();
+    {
+        // What a newer build's extra step leaves: a table of its own, a nullable column on
+        // every existing table and a higher count.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE added_by_a_newer_build (x INTEGER);
+             ALTER TABLE records ADD COLUMN added_later TEXT;
+             ALTER TABLE own_version ADD COLUMN added_later TEXT;
+             ALTER TABLE settings ADD COLUMN added_later TEXT;",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO added_by_a_newer_build VALUES (42)", [])
+            .unwrap();
+        conn.pragma_update(None, "user_version", newer as i64)
+            .unwrap();
+    }
+    let mut store = Store::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), newer);
+    let added: i64 = store
+        .conn
+        .query_row("SELECT x FROM added_by_a_newer_build", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(added, 42);
+    assert_eq!(
+        store.apply(&terminal(owner, 2), owner).unwrap(),
+        Applied::Stored
+    );
+    assert_eq!(
+        store.since(owner, 0).unwrap(),
+        vec![workspace(owner, 1), terminal(owner, 2)]
+    );
+    assert_eq!(store.own_next_version().unwrap(), 1);
+    assert!(store.apply_settings(settings(1)).unwrap());
+    assert_eq!(store.settings().unwrap(), settings(1));
+}
+
+/// The rule on [`MIGRATIONS`], checked: every step after the first only adds, and nothing it
+/// adds refuses a write an older build makes or asks a newer build to count on a backfill.
+#[test]
+fn every_later_migration_step_only_adds() {
+    for (at, step) in MIGRATIONS.iter().enumerate().skip(1) {
+        if let Err(statement) = adds_only(step) {
+            panic!("step {} breaks the rule on MIGRATIONS: {statement}", at + 1);
+        }
+    }
+}
+
+#[test]
+fn the_add_only_check_refuses_what_an_older_build_cannot_live_with() {
+    for step in [
+        "DROP TABLE settings",
+        "DROP INDEX records_by_owner",
+        "ALTER TABLE records RENAME TO kept",
+        "ALTER TABLE records RENAME COLUMN record TO body",
+        "ALTER TABLE records DROP COLUMN record",
+        "ALTER TABLE records ADD COLUMN origin TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE records ADD COLUMN origin TEXT UNIQUE",
+        "ALTER TABLE records ADD COLUMN origin TEXT CHECK (origin <> '')",
+        "ALTER TABLE records ADD COLUMN origin TEXT REFERENCES machines (id)",
+        "ALTER TABLE records ADD COLUMN origin TEXT PRIMARY KEY",
+        "CREATE UNIQUE INDEX one_per_version ON records (owner, version)",
+        "CREATE TRIGGER no_old_writes BEFORE INSERT ON records BEGIN SELECT 1; END",
+        "UPDATE records SET version = version + 1",
+        "DELETE FROM records",
+        "CREATE INDEX records_by_kind ON records (kind); UPDATE records SET kind = 'x'",
+    ] {
+        assert!(adds_only(step).is_err(), "{step}");
+    }
+    for step in [
+        "CREATE TABLE notes (id TEXT NOT NULL PRIMARY KEY, body TEXT NOT NULL)",
+        "CREATE INDEX records_by_kind ON records (kind)",
+        "alter table records add column origin text",
+        "ALTER TABLE records ADD origin TEXT DEFAULT ''",
+        "CREATE TABLE notes (id TEXT);\n  CREATE INDEX notes_by_id ON notes (id);",
+    ] {
+        assert_eq!(adds_only(step), Ok(()), "{step}");
+    }
+}
+
+/// Reads a step as statements split on `;` and allows only the three the rule names: a new
+/// table, a non-unique index and a nullable column with no constraint. Gives back the first
+/// statement that is anything else.
+fn adds_only(step: &str) -> Result<(), String> {
+    for statement in step.split(';') {
+        let statement = statement
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_uppercase();
+        let column = statement
+            .strip_prefix("ALTER TABLE ")
+            .and_then(|rest| rest.split_once(" ADD "))
+            .map(|(_, column)| column);
+        let allowed = statement.is_empty()
+            || statement.starts_with("CREATE TABLE ")
+            || statement.starts_with("CREATE INDEX ")
+            || column.is_some_and(|column| {
+                !["NOT NULL", "UNIQUE", "CHECK", "REFERENCES", "PRIMARY KEY"]
+                    .iter()
+                    .any(|constraint| column.contains(constraint))
+            });
+        if !allowed {
+            return Err(statement);
+        }
+    }
+    Ok(())
+}
+
 /// Puts a row this build cannot read into the store, as a newer build would have left it.
 fn insert_unreadable(store: &Store, owner: MachineId, version: u64, kind: &str, body: &str) {
     store
