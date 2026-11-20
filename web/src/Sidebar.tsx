@@ -2,7 +2,7 @@ import { useMutation } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { ArchiveButton, button } from "./ArchiveButton";
 import { CreateWorkspace } from "./CreateWorkspace";
-import { startSession, startShell, type Project } from "./api";
+import { startShell, type Project } from "./api";
 import { machineNumbers, type MachineView, type WorkspaceView } from "./fleet";
 import { sessionLabel, terminalLabel } from "./labels";
 
@@ -43,9 +43,7 @@ export function Sidebar({ machines, projects, selected, connected }: Props) {
 }
 
 function Workspace({ workspace, selected }: { workspace: WorkspaceView; selected?: string }) {
-  const session = useMutation({ mutationFn: () => startSession(workspace.id, "opus") });
   const shell = useMutation({ mutationFn: () => startShell(workspace.id) });
-  const error = session.error ?? shell.error;
   return (
     <div role="group" aria-label={workspace.name} className="space-y-1 rounded bg-neutral-800/50 p-2">
       <div className="font-medium">{workspace.name}</div>
@@ -53,17 +51,14 @@ function Workspace({ workspace, selected }: { workspace: WorkspaceView; selected
         {workspace.branch} · {workspace.project}
       </div>
       <div className="flex flex-wrap gap-1">
-        <button type="button" className={button} onClick={() => session.mutate()} disabled={session.isPending}>
-          New session
-        </button>
         <button type="button" className={button} onClick={() => shell.mutate()} disabled={shell.isPending}>
           New shell
         </button>
         <ArchiveButton workspace={workspace.id} name={workspace.name} />
       </div>
-      {error && (
+      {shell.error && (
         <p role="alert" className="text-xs text-red-400">
-          {error.message}
+          {shell.error.message}
         </p>
       )}
       <ul>

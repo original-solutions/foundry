@@ -16,11 +16,11 @@ export function useFleet() {
     const open = () => {
       const scheme = location.protocol === "https:" ? "wss" : "ws";
       socket = new WebSocket(`${scheme}://${location.host}/api/events`);
-      socket.onopen = () => {
-        delay = 500;
-        setConnected(true);
-      };
+      socket.onopen = () => setConnected(true);
       socket.onmessage = (event) => {
+        // The backoff resets only once the daemon has sent something, so a socket that opens and
+        // fails at once is not retried every 500 ms.
+        delay = 500;
         try {
           const message = JSON.parse(String(event.data)) as UiMessage;
           setState((current) => apply(current, message));

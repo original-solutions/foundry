@@ -23,13 +23,17 @@ function freePort(): Promise<number> {
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** An error `until` gives up on at once, rather than taking it for "not up yet". */
+class Fatal extends Error {}
+
 async function until<T>(what: string, check: () => Promise<T | undefined | false>, ms = 60_000): Promise<T> {
   const end = Date.now() + ms;
   for (;;) {
     try {
       const found = await check();
       if (found) return found;
-    } catch {
+    } catch (error) {
+      if (error instanceof Fatal) throw error;
       // Not up yet.
     }
     if (Date.now() > end) throw new Error(`timed out waiting for ${what}`);
@@ -127,7 +131,7 @@ export default async function globalSetup() {
       closeSync(fd);
       children.push(child);
       await until("the daemon to answer", async () => {
-        if (child.exitCode !== null) throw new Error(`the daemon exited: ${child.exitCode}`);
+        if (child.exitCode !== null) throw new Fatal(`the daemon exited: ${child.exitCode}`);
         return (await fetch(`http://127.0.0.1:${apiPort}/api/state`)).status === 200;
       });
       return child;
@@ -149,6 +153,9 @@ export default async function globalSetup() {
       projects: [{ id: randomUUID(), name: "demo", repo: path.join(remote, "remote.git") }],
       limits: {},
     };
+    // No API sets projects yet (the coordinator owns shared settings), so the row is written
+    // straight into the store while the daemon is down. The schema belongs to
+    // crates/foundryd/src/store/mod.rs; change this with it, or use the settings API once one exists.
     const db = new DatabaseSync(path.join(data, "store.sqlite"));
     db.prepare("INSERT INTO settings (only, seq, settings) VALUES (1, 1, ?) ON CONFLICT (only) DO UPDATE SET seq = excluded.seq, settings = excluded.settings").run(JSON.stringify(settings));
     db.close();

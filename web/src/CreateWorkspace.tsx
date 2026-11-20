@@ -10,24 +10,31 @@ const field = "mt-1 w-full rounded border border-neutral-600 bg-neutral-950 px-2
 export function CreateWorkspace({ projects }: { projects: Project[] }) {
   const [open, setOpen] = useState(false);
   const [project, setProject] = useState("");
-  const [warning, setWarning] = useState<string | null>(null);
+  // Once the workspace exists, a second create would only find its name taken, so the dialog
+  // then offers Close alone, with what went wrong.
+  const [made, setMade] = useState(false);
   const create = useMutation({
     mutationFn: async (input: { project: string; base: string; name: string; model: string }) => {
       const workspace = await createWorkspace({ project: input.project, base: input.base, name: input.name });
-      if (workspace.error) return workspace.error;
+      setMade(true);
+      // The workspace is usable when its setup did not start, so its session is started all the same.
       try {
         await startSession(workspace.id, input.model);
       } catch (error) {
-        throw new ApiError(`The workspace was made, but its session did not start: ${error instanceof Error ? error.message : error}`);
+        const setup = workspace.error ? ` Also: ${workspace.error}` : "";
+        throw new ApiError(`The workspace was made, but its session did not start: ${error instanceof Error ? error.message : error}.${setup}`);
       }
-      return null;
+      return workspace.error ?? null;
     },
-    onSuccess: (problem) => (problem ? setWarning(problem) : setOpen(false)),
+    onSuccess: (warning) => {
+      if (!warning) setOpen(false);
+    },
   });
+  const warning = create.data ?? null;
 
   const change = (next: boolean) => {
     setOpen(next);
-    setWarning(null);
+    setMade(false);
     create.reset();
   };
 
@@ -82,9 +89,6 @@ export function CreateWorkspace({ projects }: { projects: Project[] }) {
               Machine
               <select name="machine" className={field} defaultValue="this">
                 <option value="this">This machine</option>
-                <option value="auto" disabled>
-                  Let Foundry choose (comes with placement)
-                </option>
               </select>
             </label>
             {create.isError && (
@@ -94,12 +98,12 @@ export function CreateWorkspace({ projects }: { projects: Project[] }) {
             )}
             {warning && (
               <p role="status" className="text-amber-400">
-                The workspace was made, but its setup did not start: {warning}
+                {warning}
               </p>
             )}
             <div className="flex justify-end gap-2">
-              <Dialog.Close className={button}>{warning ? "Close" : "Cancel"}</Dialog.Close>
-              {!warning && (
+              <Dialog.Close className={button}>{made ? "Close" : "Cancel"}</Dialog.Close>
+              {!made && (
                 <button type="submit" className={button} disabled={projects.length === 0 || create.isPending}>
                   Create
                 </button>

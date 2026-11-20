@@ -3,7 +3,16 @@ import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { useEffect, useRef, useState } from "react";
 
-/** xterm.js attached to terminal `id` over `/api/terminals/{id}`. */
+/**
+ * xterm.js attached to terminal `id` over `/api/terminals/{id}`.
+ *
+ * The socket ends for good on 1000 (the child exited) and 1011 (the daemon gave a reason).
+ * Any other end is tried again while the pane is open: 1013 (the holder cut a slow client off),
+ * a drop with no verdict (the daemon restarting; terminals outlive it), and a socket that never
+ * opened (the daemon writes a terminal's record before its holder serves the socket, so a
+ * terminal can be listed a moment before it can be attached). Each attach's first frame is the
+ * whole kept screen, so the screen is reset before it is written.
+ */
 export function TerminalPane({ id }: { id: string }) {
   const host = useRef<HTMLDivElement>(null);
   const [status, setStatus] = useState<string | null>(null);
@@ -16,26 +25,26 @@ export function TerminalPane({ id }: { id: string }) {
     fit.fit();
 
     let socket: WebSocket | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     let stopped = false;
+    let delay = 500;
     const encoder = new TextEncoder();
     const sendSize = () => {
       if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "resize", cols: term.cols, rows: term.rows }));
     };
+    const again = (wait: number) => {
+      timer = setTimeout(() => !stopped && attach(), wait);
+    };
 
-    // The daemon writes a terminal's record before its holder serves the socket, so a terminal
-    // can be listed a moment before it can be attached. A socket that never opens is tried again
-    // for about 10 seconds before the pane gives up.
-    let misses = 0;
     const attach = () => {
       const scheme = location.protocol === "https:" ? "wss" : "ws";
-      const ws = new WebSocket(`${scheme}://${location.host}/api/terminals/${id}`);
+      const ws = new WebSocket(`${scheme}://${location.host}/api/terminals/${encodeURIComponent(id)}`);
       socket = ws;
       ws.binaryType = "arraybuffer";
       let opened = false;
       let first = true;
       ws.onopen = () => {
         opened = true;
-        misses = 0;
         setStatus(null);
         sendSize();
       };
@@ -49,22 +58,21 @@ export function TerminalPane({ id }: { id: string }) {
           }
           return;
         }
-        // The first frame is the kept screen, so it replaces what is shown.
         if (first) {
           term.reset();
           first = false;
+          delay = 500;
         }
         term.write(new Uint8Array(event.data as ArrayBuffer));
       };
       ws.onclose = (event) => {
         if (stopped) return;
-        if (!opened) {
-          if (++misses < 20) setTimeout(() => !stopped && attach(), 500);
-          else setStatus("terminal not available here");
-        }
-        else if (event.code === 1000) setStatus("exited");
-        else if (event.code === 1013) setTimeout(() => !stopped && attach(), 200);
-        else setStatus(event.reason || `disconnected (${event.code})`);
+        if (opened && event.code === 1000) return setStatus("Exited");
+        if (opened && event.code === 1011) return setStatus(event.reason || "The terminal ended with an error");
+        if (opened && event.code === 1013) return again(200);
+        setStatus(opened ? "Disconnected; reconnecting" : "Not attached yet; trying again");
+        again(delay);
+        delay = Math.min(delay * 2, 5000);
       };
     };
 
@@ -78,6 +86,7 @@ export function TerminalPane({ id }: { id: string }) {
 
     return () => {
       stopped = true;
+      clearTimeout(timer);
       observer.disconnect();
       typed.dispose();
       resized.dispose();
