@@ -19,13 +19,15 @@
 //! only one of them can reach the other. The second copy of a record is stale and changes
 //! nothing.
 //!
-//! A link trusts the machine id its peer names in its first message, a hello or a relay,
+//! A link trusts the machine id its peer names in its first message, a hello, a relay or a call,
 //! checked only against the machine list. Proving that id with a machine key belongs to
 //! joining (task 13): the daemon serves every peer link through `join::Keys::accept`.
 //!
 //! A link that opens with a [`PeerMessage::Relay`] in place of a hello carries one of this
 //! machine's terminals to the peer, not records ([`relay`]). That is shell access on this
-//! machine, so a link that has not passed `join::Keys::accept` must never reach it.
+//! machine, so a link that has not passed `join::Keys::accept` must never reach it. A link that
+//! opens with a [`PeerMessage::Call`] carries one call to this machine's API and its answer
+//! ([`call`]), and is kept behind the same keys.
 //!
 //! Sending stops at the highest version sent, so a machine's own records must be stored in
 //! the order of their versions: a writer takes [`Store::own_next_version`] and applies the
@@ -33,6 +35,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
@@ -51,6 +54,7 @@ use crate::coordinator::Coordinator;
 use crate::store::{Store, StoreError};
 use crate::terminals::Terminals;
 
+pub mod call;
 mod link;
 pub mod relay;
 pub mod ws;
@@ -141,6 +145,9 @@ struct Inner {
     heard: Mutex<BTreeMap<MachineId, Instant>>,
     /// The terminals a relay serves to peers; none until [`Peers::serve_terminals`].
     terminals: Mutex<Option<Arc<Terminals>>>,
+    /// The loopback address of the API a carried call is made to; none until
+    /// [`Peers::serve_calls`].
+    calls: Mutex<Option<SocketAddr>>,
     /// The coordinator a record link hands settings and edits to; none until
     /// [`Peers::coordinate`]. Held weakly, as the coordinator holds these peers.
     coordinator: Mutex<Option<Weak<Coordinator>>>,
@@ -158,6 +165,7 @@ impl Peers {
                 dialer,
                 heard: Mutex::new(BTreeMap::new()),
                 terminals: Mutex::new(None),
+                calls: Mutex::new(None),
                 coordinator: Mutex::new(None),
                 links: Mutex::new(BTreeMap::new()),
                 next_link: AtomicU64::new(0),
@@ -211,12 +219,16 @@ impl Peers {
 
     /// Serves a link a peer opened whose first message, `first`, has already been read from
     /// `conn`, until it ends. A link that opens with a [`PeerMessage::Relay`] goes to the
-    /// relay; every other link carries records, and takes `first` as its hello.
+    /// relay, and one that opens with a [`PeerMessage::Call`] to [`call`]; every other link
+    /// carries records, and takes `first` as its hello.
     pub(crate) async fn accept_opened(&self, conn: Conn, first: PeerMessage) {
         match first {
             PeerMessage::Relay {
                 machine, terminal, ..
             } => relay::serve(&self.inner, machine, terminal, conn).await,
+            PeerMessage::Call { machine, call, .. } => {
+                call::serve(&self.inner, machine, call, conn).await;
+            }
             hello => link::run(&self.inner, conn, None, Some(hello)).await,
         }
     }

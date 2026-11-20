@@ -183,7 +183,11 @@ impl Served {
     /// The worktree of the one workspace made on this machine.
     fn worktree(&self) -> PathBuf {
         let projects = self.data.path().join("worktrees");
-        let project = std::fs::read_dir(projects).unwrap().next().unwrap().unwrap();
+        let project = std::fs::read_dir(projects)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
         let mut branches = std::fs::read_dir(project.path()).unwrap();
         branches.next().unwrap().unwrap().path()
     }
@@ -265,11 +269,15 @@ async fn a_makes_a_workspace_on_b_starts_a_session_and_a_shell_there_and_archive
     assert_eq!(status, 201, "{answer}");
     let workspace: WorkspaceId = WorkspaceId(id_of(&answer).parse().unwrap());
     let shown = |records: &[AnyRecord], find: &dyn Fn(&AnyRecord) -> bool| {
-        records.iter().any(|record| record.owner() == b.id && find(record))
+        records
+            .iter()
+            .any(|record| record.owner() == b.id && find(record))
     };
-    let is_workspace =
-        |r: &AnyRecord| matches!(r, AnyRecord::Workspace(w) if w.body.id == workspace && !w.deleted);
-    assert!(shown(&on_a.state().await, &is_workspace), "A shows B's workspace");
+    let is_workspace = |r: &AnyRecord| matches!(r, AnyRecord::Workspace(w) if w.body.id == workspace && !w.deleted);
+    assert!(
+        shown(&on_a.state().await, &is_workspace),
+        "A shows B's workspace"
+    );
     assert!(
         a.held(|r| r.owner() == a.id && matches!(r, AnyRecord::Workspace(_)))
             .is_none(),
@@ -281,7 +289,10 @@ async fn a_makes_a_workspace_on_b_starts_a_session_and_a_shell_there_and_archive
     assert_eq!(status, 201, "{answer}");
     let session = SessionId(id_of(&answer).parse().unwrap());
     let is_session = |r: &AnyRecord| matches!(r, AnyRecord::Session(s) if s.body.id == session);
-    assert!(shown(&on_a.state().await, &is_session), "A shows B's session");
+    assert!(
+        shown(&on_a.state().await, &is_session),
+        "A shows B's session"
+    );
 
     let path = format!("/api/workspaces/{workspace}/shells");
     let (status, answer) = on_a.post(&path, None).await;
@@ -304,7 +315,10 @@ async fn a_makes_a_workspace_on_b_starts_a_session_and_a_shell_there_and_archive
         uncommitted.iter().any(|f| f.as_str() == Some("notes.txt")),
         "{answer}"
     );
-    assert!(shown(&on_a.state().await, &is_workspace), "the refusal changed nothing");
+    assert!(
+        shown(&on_a.state().await, &is_workspace),
+        "the refusal changed nothing"
+    );
 
     let (status, answer) = on_a.post(&path, Some(json!({"force": true}))).await;
     assert_eq!(status, 204, "{answer}");
@@ -353,7 +367,11 @@ async fn a_call_to_a_machine_serving_no_calls_is_answered_503_by_it() {
 async fn a_call_to_a_machine_not_listed_is_refused_before_any_link() {
     let fleet = Fleet::start(1);
     let unknown = MachineId::random();
-    match fleet.daemons[0].peers.call(unknown, "/api/workspaces", None, b"{}").await {
+    match fleet.daemons[0]
+        .peers
+        .call(unknown, "/api/workspaces", None, b"{}")
+        .await
+    {
         Err(CallError::NotListed(machine)) => assert_eq!(machine, unknown),
         other => panic!("not refused as unlisted: {other:?}"),
     }
@@ -363,7 +381,11 @@ async fn a_call_to_a_machine_not_listed_is_refused_before_any_link() {
 async fn a_call_to_a_listed_machine_never_heard_from_is_offline() {
     let silent = MachineId::random();
     let fleet = Fleet::start_with(1, &[silent]);
-    match fleet.daemons[0].peers.call(silent, "/api/workspaces", None, b"{}").await {
+    match fleet.daemons[0]
+        .peers
+        .call(silent, "/api/workspaces", None, b"{}")
+        .await
+    {
         Err(CallError::Offline(name)) => assert_eq!(name, "machine-1"),
         other => panic!("not refused as offline: {other:?}"),
     }
@@ -389,7 +411,11 @@ async fn raw_call(peers: &Peers, machine: MachineId, path: &str) -> Value {
         .unwrap();
     timeout(WAIT, async {
         loop {
-            let text = near.recv.recv().await.expect("an answer before the link closes");
+            let text = near
+                .recv
+                .recv()
+                .await
+                .expect("an answer before the link closes");
             let frame: Value = serde_json::from_str(&text).unwrap();
             if frame["type"] == "answer" {
                 return frame;
@@ -460,7 +486,7 @@ async fn a_call_to_a_peer_whose_link_speaks_an_older_protocol_is_refused_before_
     let old = MachineId::random();
     let fleet = Fleet::start_with(1, &[old]);
     let a = &fleet.daemons[0];
-    let (mut near, far) = Conn::pair();
+    let (near, far) = Conn::pair();
     let peers = a.peers.clone();
     tokio::spawn(async move { peers.accept(far).await });
     let hello = PeerMessage::Hello {

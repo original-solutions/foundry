@@ -9,12 +9,16 @@ use crate::record::AnyRecord;
 use crate::settings::{Edit, SharedSettings};
 
 /// The protocol number this build speaks.
-pub const PROTOCOL: u16 = 2;
+pub const PROTOCOL: u16 = 3;
 
 /// The first protocol whose links carry the shared settings and edits. A link in an older
 /// protocol carries neither: a machine on it has no coordinator, and refuses a message whose
 /// `type` it does not know.
 pub const EDITS_SINCE: u16 = 2;
+
+/// The first protocol that carries a [`PeerMessage::Call`]. A machine on an older link is never
+/// sent one: it would refuse a link that opens with a `type` it does not know.
+pub const CALLS_SINCE: u16 = 3;
 
 /// A message between two machines' daemons, tagged by `type`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -45,6 +49,24 @@ pub enum PeerMessage {
     },
     /// An edit to the shared settings, sent to the acting coordinator to number.
     Edit { protocol: u16, edit: Edit },
+    /// Opens a link, in place of a hello, that carries one call to the receiver's API and its
+    /// answer: who is speaking and the call.
+    Call {
+        protocol: u16,
+        machine: MachineId,
+        call: Call,
+    },
+}
+
+/// A `POST` to another machine's API, carried to it as it was made.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Call {
+    /// The path, such as `/api/workspaces`.
+    pub path: String,
+    /// The request's `Content-Type`, when it had one.
+    pub content_type: Option<String>,
+    /// The request body's bytes, as hex.
+    pub body: String,
 }
 
 impl PeerMessage {
@@ -54,7 +76,8 @@ impl PeerMessage {
             | Self::Records { protocol, .. }
             | Self::Settings { protocol, .. }
             | Self::Relay { protocol, .. }
-            | Self::Edit { protocol, .. } => *protocol,
+            | Self::Edit { protocol, .. }
+            | Self::Call { protocol, .. } => *protocol,
         }
     }
 }

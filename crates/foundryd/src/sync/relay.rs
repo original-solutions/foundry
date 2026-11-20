@@ -410,7 +410,7 @@ async fn finish(send: &Sender<String>, recv: &mut Receiver<String>, closed: Clos
 }
 
 /// Sends a beat every [`TICK`] on `send` until the link closes or the task is dropped.
-fn beat(send: Sender<String>) -> Task {
+pub(super) fn beat(send: Sender<String>) -> Task {
     Task(tokio::spawn(async move {
         let mut every = tokio::time::interval(TICK);
         loop {
@@ -434,7 +434,7 @@ fn pieces(bytes: &[u8]) -> impl Iterator<Item = (&[u8], bool)> {
 
 const DIGITS: &[u8; 16] = b"0123456789abcdef";
 
-fn hex(bytes: &[u8]) -> String {
+pub(super) fn hex(bytes: &[u8]) -> String {
     let mut text = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         text.push(char::from(DIGITS[usize::from(byte >> 4)]));
@@ -443,7 +443,7 @@ fn hex(bytes: &[u8]) -> String {
     text
 }
 
-fn unhex(text: &str) -> Option<Bytes> {
+pub(super) fn unhex(text: &str) -> Option<Bytes> {
     let digit = |c: u8| {
         char::from(c)
             .to_digit(16)

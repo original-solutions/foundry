@@ -2157,11 +2157,22 @@ async fn a_create_naming_a_machine_not_listed_is_404_and_makes_nothing() {
     let daemon = Daemon::new(TURN).await;
     let project = daemon.project();
     let stranger = MachineId::random();
-    let body = serde_json::json!({"project": project, "base": "main", "name": "far", "machine": stranger});
+    let body =
+        serde_json::json!({"project": project, "base": "main", "name": "far", "machine": stranger});
     let reply = daemon.call("POST", "/api/workspaces", Some(body)).await;
     assert_eq!(reply.status, 404, "{}", reply.body);
-    assert!(reply.json()["error"].as_str().unwrap().contains(&stranger.to_string()));
-    assert!(daemon.records().iter().all(|r| !matches!(r, AnyRecord::Workspace(_))));
+    assert!(
+        reply.json()["error"]
+            .as_str()
+            .unwrap()
+            .contains(&stranger.to_string())
+    );
+    assert!(
+        daemon
+            .records()
+            .iter()
+            .all(|r| !matches!(r, AnyRecord::Workspace(_)))
+    );
 }
 
 #[tokio::test]
@@ -2169,7 +2180,8 @@ async fn a_create_or_action_for_an_offline_machine_is_503_naming_it_and_changes_
     let daemon = Daemon::new(TURN).await;
     let project = daemon.project();
     let peer = daemon.add_machine();
-    let body = serde_json::json!({"project": project, "base": "main", "name": "far", "machine": peer});
+    let body =
+        serde_json::json!({"project": project, "base": "main", "name": "far", "machine": peer});
     let reply = daemon.call("POST", "/api/workspaces", Some(body)).await;
     assert_eq!(reply.status, 503, "{}", reply.body);
     assert_eq!(reply.json()["error"], "peer is offline");
@@ -2218,10 +2230,7 @@ async fn a_close_of_an_offline_machines_terminal_is_503_naming_it() {
 /// `method path` with `body`, marked as a call carried here from another machine.
 async fn carried(daemon: &Daemon, path: &str, body: Option<serde_json::Value>) -> Reply {
     let host = daemon.host();
-    let headers = [
-        ("Host", host.as_str()),
-        (crate::sync::call::CARRIED, "1"),
-    ];
+    let headers = [("Host", host.as_str()), (crate::sync::call::CARRIED, "1")];
     daemon.raw("POST", path, &headers, body).await
 }
 
@@ -2230,10 +2239,16 @@ async fn a_carried_create_naming_another_machine_is_refused_and_never_carried_on
     let daemon = Daemon::new(TURN).await;
     let project = daemon.project();
     let peer = daemon.add_machine();
-    let body = serde_json::json!({"project": project, "base": "main", "name": "far", "machine": peer});
+    let body =
+        serde_json::json!({"project": project, "base": "main", "name": "far", "machine": peer});
     let reply = carried(&daemon, "/api/workspaces", Some(body)).await;
     assert_eq!(reply.status, 421, "{}", reply.body);
-    assert!(daemon.records().iter().all(|r| !matches!(r, AnyRecord::Workspace(_))));
+    assert!(
+        daemon
+            .records()
+            .iter()
+            .all(|r| !matches!(r, AnyRecord::Workspace(_)))
+    );
 
     let body = serde_json::json!({"project": project, "base": "main", "name": "here", "machine": daemon.me});
     let reply = carried(&daemon, "/api/workspaces", Some(body)).await;

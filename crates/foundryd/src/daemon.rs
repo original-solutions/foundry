@@ -251,6 +251,7 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
     let dialer = KeyedDialer::new(Arc::new(WsDialer { port }), keys.clone());
     let peers = Peers::new(me, store.clone(), Arc::new(dialer));
     peers.serve_terminals(terminals.clone());
+    peers.serve_calls(loopback(port));
     // Peers hold the coordinator weakly; this binding keeps it for the daemon's life.
     let coordinator = Arc::new(crate::coordinator::Coordinator::new(
         me,
