@@ -5,3 +5,6 @@ import { afterEach } from "vitest";
 afterEach(() => {
   cleanup();
 });
+
+// jsdom does not implement scrolling; the router asks for it after each navigation.
+window.scrollTo = () => {};
