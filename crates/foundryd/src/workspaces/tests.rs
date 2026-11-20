@@ -2805,6 +2805,17 @@ async fn changes_send_no_diff_past_the_caps_and_still_list_the_file() {
 }
 
 #[tokio::test]
+async fn changes_of_a_workspace_whose_worktree_is_gone_are_refused_as_unknown() {
+    // As an archive leaves it for a moment: the worktree removed, the record not yet written.
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup.create(&remote, "main", "removed").await;
+    std::fs::remove_dir_all(setup.worktree(remote.project, "removed")).unwrap();
+    let err = setup.workspaces.changes(id).await.unwrap_err();
+    assert!(matches!(err, WorkspaceError::Unknown(_)), "{err}");
+}
+
+#[tokio::test]
 async fn changes_of_a_workspace_that_is_not_here_are_refused() {
     let setup = Setup::new();
     let err = setup

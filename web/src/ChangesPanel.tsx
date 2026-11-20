@@ -3,6 +3,7 @@ import { Dialog } from "radix-ui";
 import { useRef, useState } from "react";
 import { workspaceChanges, type Changes, type Commit, type FileChange } from "./api";
 import { diffLines, splitPath, totals } from "./changes";
+import { plural } from "./labels";
 
 /** How often an open panel reads the changes again, so an agent's edits show as it makes them. */
 export const CHANGES_EVERY = 3000;
@@ -108,7 +109,6 @@ function Sheet({ workspace, onClose }: { workspace: Target; onClose: () => void 
 
 function Summary({ changes }: { changes: Changes }) {
   const t = totals(changes);
-  const plural = (n: number, one: string) => `${n} ${one}${n === 1 ? "" : "s"}`;
   return (
     <>
       <span className="font-mono">
@@ -185,7 +185,7 @@ function Commits({ commits, branch }: { commits: Commit[]; branch: string }) {
   return (
     <section aria-label="Commits" className="rounded-lg border border-neutral-800 bg-neutral-900/60 px-3 py-2">
       <h3 className="mb-1 text-xs text-neutral-500">
-        {commits.length} commit{commits.length === 1 ? "" : "s"} on <span className="font-mono text-neutral-300">{branch}</span>
+        {plural(commits.length, "commit")} on <span className="font-mono text-neutral-300">{branch}</span>
       </h3>
       <ul className="space-y-0.5 text-xs">
         {commits.map((c) => (

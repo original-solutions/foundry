@@ -6,7 +6,7 @@ import { changesQuery } from "./ChangesPanel";
 import { splitPath, totals } from "./changes";
 import type { MachineView } from "./fleet";
 import { jumpKey, SearchIcon } from "./JumpPalette";
-import type { Glyph } from "./labels";
+import { plural, type Glyph } from "./labels";
 import { glyphText, StateGlyph } from "./StateGlyph";
 import { Named, Now } from "./Now";
 import { pollEvery } from "./poll";
@@ -36,8 +36,6 @@ const edge: Record<Glyph, string> = {
   done: "bg-neutral-600",
   away: "bg-neutral-700",
 };
-
-const plural = (n: number, one: string) => `${n} ${one}${n === 1 ? "" : "s"}`;
 
 /**
  * The view with nothing open: every workspace in the fleet as a card, in lanes by what it needs

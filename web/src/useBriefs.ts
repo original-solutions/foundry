@@ -1,13 +1,12 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef } from "react";
-import { sessionBriefs, type AnyRecord, type Briefs, type SessionState } from "./api";
+import { sessionBriefs, type AnyRecord, type Briefs } from "./api";
+import { addsSteps, sessionGlyph } from "./labels";
 import { pollEvery } from "./poll";
 
 /** How often briefs are read while a session works, so its "now" line keeps up with its tools. */
 export const BRIEFS_EVERY = 2000;
 
-/** States in which a session runs tools without a hook saying so in its state. */
-const busy: SessionState[] = ["starting", "working"];
 const none: Briefs = {};
 const key = ["briefs"];
 
@@ -19,7 +18,7 @@ const key = ["briefs"];
 export function useBriefs(records: AnyRecord[]): Briefs {
   const sessions = records.flatMap((r) => (r.kind === "session" && !r.deleted ? [r.body] : []));
   const states = sessions.map((s) => `${s.id}:${s.state}`).join(",");
-  const working = sessions.some((s) => busy.includes(s.state));
+  const working = sessions.some((s) => addsSteps.includes(sessionGlyph[s.state]));
   const client = useQueryClient();
   const { data, isError } = useQuery({
     queryKey: key,

@@ -5,9 +5,9 @@
 //! the worktree, its index or its refs, and takes no lock. It works on its own copy of the index,
 //! so it never takes git's index lock, which an agent's own git command in the worktree needs.
 //! It does not take the workspace's lifecycle lock, so it never holds up a start or an archive:
-//! a read an archive overtakes fails, and the next one finds the workspace gone. A new file is
-//! read only when it is a plain file, never through a symlink, so a link the agent made cannot
-//! show a file outside the worktree.
+//! a read an archive overtakes finds the worktree gone and fails as the workspace being gone.
+//! A new file is read only when it is a plain file, never through a symlink, so a link the agent
+//! made cannot show a file outside the worktree.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -77,11 +77,16 @@ pub enum FileStatus {
 
 impl Workspaces {
     /// What live workspace `id` has changed since it left its base. Each git call is bounded
-    /// as every git call here is.
+    /// as every git call here is. A read that fails with the worktree gone, as when an archive
+    /// removes it mid-read, is [`WorkspaceError::Unknown`]: there is nothing here to read.
     pub async fn changes(&self, id: WorkspaceId) -> Result<Changes, WorkspaceError> {
         let body = self.inner.live(id).await?;
         let worktree = self.inner.worktree(body.project, &body.branch);
-        self.inner.changes(&worktree, &body.base).await
+        let read = self.inner.changes(&worktree, &body.base).await;
+        if read.is_err() && !tokio::fs::try_exists(&worktree).await.unwrap_or(true) {
+            return Err(WorkspaceError::Unknown(id));
+        }
+        read
     }
 }
 

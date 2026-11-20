@@ -7,7 +7,13 @@ export const pressed = "aria-pressed:border-sky-400/50 aria-pressed:bg-sky-400/1
 /** The shared button for the one action a form is for. */
 export const primaryButton =
   "rounded border border-emerald-400 bg-emerald-400 px-2 py-0.5 text-xs font-semibold text-neutral-950 hover:border-emerald-300 hover:bg-emerald-300 disabled:opacity-50";
-export const field = "mt-1 w-full rounded border border-neutral-600 bg-neutral-950 px-2 py-1 text-sm";
+/** The shared field look: a dark box whose border lightens on focus, beside the browser's focus ring. */
+const box = "rounded border border-neutral-600 bg-neutral-950 text-neutral-100 placeholder:text-neutral-600 focus:border-neutral-400";
+export const field = `mt-1 w-full ${box} px-2 py-1 text-sm`;
+/** `field` for the one input a form is about, with room and bigger text. */
+export const bigField = `w-full ${box} px-3 py-2.5 text-base`;
+/** `field` inside a line of small text. */
+export const inlineField = `${box} px-1.5 py-0.5 font-mono`;
 
 /**
  * A dialog: the overlay, the centred panel, its title and description, then `children`. With a

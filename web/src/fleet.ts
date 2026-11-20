@@ -1,5 +1,5 @@
 import type { AnyRecord, Briefs, MachineSample, SessionState, SharedSettings, Step, TerminalState, UiMessage } from "./api";
-import { sessionLabel, sessionGlyph, terminalLabel, terminalGlyph, type Glyph } from "./labels";
+import { busy, plural, sessionLabel, sessionGlyph, terminalLabel, terminalGlyph, urgency, type Glyph } from "./labels";
 
 export interface FleetState {
   records: AnyRecord[];
@@ -162,13 +162,11 @@ export interface Row {
   name: string;
   /** A session's first prompt, which tells two sessions of one model apart. */
   title?: string;
-  /** What a session is doing, only while it works, waits or is stuck. */
+  /** What a session is doing, only while it is `busy`: in the middle of a turn. */
   now?: Step;
   label: string;
   glyph: Glyph;
 }
-
-const busy: Glyph[] = ["working", "waiting", "stuck"];
 
 /** A workspace's terminals in sidebar order: its sessions, then its shells. */
 export function rows(workspace: WorkspaceView): Row[] {
@@ -180,8 +178,6 @@ export function rows(workspace: WorkspaceView): Row[] {
     ...workspace.shells.map((t) => ({ terminal: t.id, name: "shell", label: terminalLabel(t.state, t.exitCode), glyph: terminalGlyph(t.state, t.exitCode) })),
   ];
 }
-
-const urgency: Glyph[] = ["waiting", "stuck", "failed", "working", "starting", "ready", "done", "away"];
 
 /** `rows` with what needs a person first, then what is busy, then the rest; ties keep their order. */
 export function byUrgency(list: Row[]): Row[] {
@@ -197,12 +193,12 @@ function shortId(id: string): string {
 export function machineNumbers(sample: MachineSample | null): string {
   if (!sample) return "no sample yet";
   const gb = (bytes: number) => (bytes / 1e9).toFixed(1);
-  return `load ${sample.load_per_core.toFixed(2)}/core  memory ${gb(sample.free_memory)} GB free  disk ${gb(sample.free_disk)} GB free  ${sample.sessions} session${sample.sessions === 1 ? "" : "s"}`;
+  return `load ${sample.load_per_core.toFixed(2)}/core  memory ${gb(sample.free_memory)} GB free  disk ${gb(sample.free_disk)} GB free  ${plural(sample.sessions, "session")}`;
 }
 
 /** The same numbers, short enough for one sidebar line. */
 export function machineStats(sample: MachineSample | null): string {
   if (!sample) return "no sample yet";
   const gb = (bytes: number) => (bytes / 1e9).toFixed(1);
-  return `${sample.load_per_core.toFixed(2)}/core · ${gb(sample.free_memory)} GB mem · ${gb(sample.free_disk)} GB disk · ${sample.sessions} session${sample.sessions === 1 ? "" : "s"}`;
+  return `${sample.load_per_core.toFixed(2)}/core · ${gb(sample.free_memory)} GB mem · ${gb(sample.free_disk)} GB disk · ${plural(sample.sessions, "session")}`;
 }
