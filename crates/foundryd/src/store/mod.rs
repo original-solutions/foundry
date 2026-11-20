@@ -28,10 +28,13 @@ mod tests;
 /// Rows a newer build stored that the previous build cannot parse are another matter: see
 /// [`Store::since`].
 ///
-/// The newer build comes back to the same file, and its step does not run again. The rows
-/// the previous build wrote meanwhile have nothing in the added columns and nothing in the
-/// added tables, so the newer build accepts both and a step never fills in existing rows.
-/// The test `every_later_migration_step_only_adds` holds each step after the first to this.
+/// The newer build comes back to the same file, and its step does not run again. Meanwhile
+/// the previous build inserted rows with nothing in the added columns, updated rows without
+/// touching them, and stored nothing in the added tables. So the newer build treats an added
+/// column as empty or out of date and rebuilds it from the columns the previous build
+/// writes, and never counts on a step having filled in existing rows. The test
+/// `every_later_migration_step_only_adds` checks the add-only part for each step after the
+/// first.
 const MIGRATIONS: &[&str] = &[
     // 1: records keyed by kind and id, the owner's own version counter, shared settings.
     "CREATE TABLE records (
