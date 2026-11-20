@@ -296,8 +296,10 @@ impl Workspaces {
         .await
     }
 
-    /// The folder of a live workspace's worktree, where its terminals start.
-    pub async fn worktree(&self, id: WorkspaceId) -> Result<PathBuf, WorkspaceError> {
+    /// The folder of a live workspace's worktree. It takes no lock, so it is for tests only: a
+    /// start goes through [`Workspaces::start_in`].
+    #[cfg(test)]
+    pub(crate) async fn worktree(&self, id: WorkspaceId) -> Result<PathBuf, WorkspaceError> {
         let body = self.inner.live(id).await?;
         Ok(self.inner.worktree(body.project, &body.branch))
     }

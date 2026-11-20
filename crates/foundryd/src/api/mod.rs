@@ -677,13 +677,13 @@ fn shell() -> Vec<String> {
 async fn start_shell(State(api): State<Api>, Path(id): Path<String>) -> Result<Response, ApiError> {
     let id = parse_id(&id, "workspace", WorkspaceId)?;
     let terminals = Arc::clone(&api.terminals);
-    let shell = api
+    let terminal = api
         .workspaces
         .start_in(id, move |worktree| async move {
             Ok::<_, ApiError>(terminals.start(id, &worktree, &shell(), &[]).await?)
         })
         .await?;
-    Ok(created(shell))
+    Ok(created(terminal))
 }
 
 async fn close_terminal(
