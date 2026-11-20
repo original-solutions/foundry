@@ -1952,10 +1952,15 @@ async fn sweep_leaves_a_live_workspace_that_is_the_same_folder_by_another_path()
 async fn sweep_leaves_the_entry_of_a_live_workspace_whose_folder_is_gone() {
     let setup = Setup::new();
     let remote = setup.project(&[("README.md", "hello\n")]);
-    // A decomposed name, which git on macOS keeps composed, and a plain one.
-    for name in ["\u{1112}\u{1161}\u{11ab}", "plain"] {
+    // A decomposed name, which git on macOS keeps composed, a plain one, and one whose branch
+    // was renamed, so only its folder's name is left to match.
+    for name in ["\u{1112}\u{1161}\u{11ab}", "plain", "renamed"] {
         let id = setup.create(&remote, "main", name).await;
-        std::fs::remove_dir_all(setup.workspaces.worktree(id).await.unwrap()).unwrap();
+        let worktree = setup.workspaces.worktree(id).await.unwrap();
+        if name == "renamed" {
+            git(&worktree, &["branch", "-m", "elsewhere"]);
+        }
+        std::fs::remove_dir_all(worktree).unwrap();
     }
     let entries = |listed: &str| {
         listed
@@ -1963,13 +1968,13 @@ async fn sweep_leaves_the_entry_of_a_live_workspace_whose_folder_is_gone() {
             .filter(|l| l.starts_with("worktree "))
             .count()
     };
-    // The clone and the two workspaces.
-    assert_eq!(entries(&setup.listed(remote.project)), 3);
+    // The clone and the three workspaces.
+    assert_eq!(entries(&setup.listed(remote.project)), 4);
 
     setup.workspaces.sweep().await.unwrap();
 
     let listed = setup.listed(remote.project);
-    assert_eq!(entries(&listed), 3, "{listed}");
+    assert_eq!(entries(&listed), 4, "{listed}");
 }
 
 #[tokio::test]
@@ -1979,6 +1984,14 @@ async fn sweep_never_touches_a_worktree_outside_the_projects_folder_of_worktrees
     setup.leftover(&remote, "crashed").await;
     let elsewhere = setup.data.path().join("elsewhere").join("by-hand");
     setup.worktree_at(remote.project, &elsewhere, "by-hand");
+    // In the folder of worktrees, but not under this project's.
+    let other_project = setup
+        .data
+        .path()
+        .join("worktrees")
+        .join("elsewhere")
+        .join("by-hand-too");
+    setup.worktree_at(remote.project, &other_project, "by-hand-too");
     let lookalike = setup
         .data
         .path()
@@ -1990,6 +2003,139 @@ async fn sweep_never_touches_a_worktree_outside_the_projects_folder_of_worktrees
     setup.workspaces.sweep().await.unwrap();
 
     assert!(elsewhere.exists());
+    assert!(other_project.exists());
     assert!(lookalike.exists());
     assert!(!setup.worktree(remote.project, "crashed").exists());
+}
+
+/// A worktree moved by hand is found only by the branch it has checked out.
+#[tokio::test]
+async fn sweep_leaves_a_live_workspace_whose_worktree_was_moved() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    setup.create(&remote, "main", "a").await;
+    let moved = setup.worktree(remote.project, "b");
+    git(
+        &setup.clone_of(remote.project),
+        &[
+            "worktree",
+            "move",
+            setup.worktree(remote.project, "a").to_str().unwrap(),
+            moved.to_str().unwrap(),
+        ],
+    );
+
+    setup.workspaces.sweep().await.unwrap();
+
+    assert!(moved.exists());
+}
+
+#[tokio::test]
+async fn sweep_leaves_and_logs_a_leftover_it_cannot_check() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let leftover = setup.leftover(&remote, "unreadable").await;
+    std::fs::write(leftover.join(".git"), "gitdir: /nonexistent\n").unwrap();
+    let (_guard, logs) = logs();
+
+    setup.workspaces.sweep().await.unwrap();
+
+    assert!(leftover.exists());
+    let text = text_of(&logs);
+    let line = text
+        .lines()
+        .find(|l| l.contains(&format!("{}/unreadable", remote.project)))
+        .unwrap_or_else(|| panic!("no line names the leftover: {text}"));
+    assert!(line.contains("WARN"), "{line}");
+    assert!(line.contains("could not be checked"), "{line}");
+}
+
+/// A create that dies leaves a bare checkout: setup and sessions start only after its record.
+/// A folder holding files git ignores was worked in, and git could not give them back.
+#[tokio::test]
+async fn sweep_leaves_and_logs_a_leftover_holding_files_git_ignores() {
+    let setup = Setup::new();
+    let remote = setup.project(&[(".gitignore", ".env\nbuild/\n")]);
+    let leftover = setup.leftover(&remote, "worked-in").await;
+    std::fs::write(leftover.join(".env"), "mine").unwrap();
+    std::fs::create_dir_all(leftover.join("build")).unwrap();
+    std::fs::write(leftover.join("build").join("out.bin"), "o").unwrap();
+    let (_guard, logs) = logs();
+
+    setup.workspaces.sweep().await.unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(leftover.join(".env")).unwrap(),
+        "mine"
+    );
+    let text = text_of(&logs);
+    let line = text
+        .lines()
+        .find(|l| l.contains(&format!("{}/worked-in", remote.project)))
+        .unwrap_or_else(|| panic!("no line names the leftover: {text}"));
+    assert!(line.contains("WARN"), "{line}");
+    assert!(line.contains(".env"), "{line}");
+    assert!(line.contains("build/"), "{line}");
+}
+
+/// A store made again over the same data directory gets its settings back from the fleet, but
+/// never its own workspace records: nothing a live workspace holds that git cannot give back
+/// is removed.
+#[tokio::test]
+async fn sweep_with_settings_and_no_records_keeps_what_git_cannot_give_back() {
+    let setup = Setup::new();
+    let remote = setup.project(&[(".gitignore", ".env\n")]);
+    setup.create(&remote, "main", "worked-in").await;
+    let worked_in = setup.worktree(remote.project, "worked-in");
+    std::fs::write(worked_in.join(".env"), "mine").unwrap();
+    let fresh = Arc::new(Mutex::new(
+        Store::open(setup.data.path().join("fresh.db")).unwrap(),
+    ));
+    {
+        let settings = setup.store.lock().unwrap().settings().unwrap();
+        assert!(fresh.lock().unwrap().apply_settings(settings).unwrap());
+    }
+
+    setup.workspaces_as(setup.me, fresh).sweep().await.unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(worked_in.join(".env")).unwrap(),
+        "mine"
+    );
+}
+
+/// A row a newer build wrote, from another owner, which this build cannot read.
+fn unreadable_row(db: &Path) {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    conn.execute(
+        "INSERT INTO records (kind, id, owner, version, record) VALUES (?1, ?2, ?3, 1, ?4)",
+        rusqlite::params![
+            "workspace",
+            WorkspaceId::random().to_string(),
+            MachineId::random().to_string(),
+            r#"{"kind":"from-a-newer-build"}"#,
+        ],
+    )
+    .unwrap();
+}
+
+/// What the store holds cannot all be read, so it cannot say which worktrees are named: the
+/// sweep is skipped, says so, and the daemon still starts.
+#[tokio::test]
+async fn sweep_skips_and_logs_when_a_record_cannot_be_read() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let leftover = setup.leftover(&remote, "crashed").await;
+    unreadable_row(&setup.data.path().join("foundry.db"));
+    let (_guard, logs) = logs();
+
+    setup.workspaces.sweep().await.unwrap();
+
+    assert!(leftover.exists());
+    let text = text_of(&logs);
+    assert!(
+        text.lines()
+            .any(|l| l.contains("WARN") && l.contains("sweep")),
+        "{text}"
+    );
 }
