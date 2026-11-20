@@ -2,11 +2,12 @@
 //!
 //! The changes are the worktree as it is on disk, committed or not, against the commit where its
 //! branch left `origin/<base>`, plus each new file git does not ignore. A read changes nothing in
-//! the worktree, its index or its refs, and takes no lock: it works on its own copy of the index,
-//! so never takes git's index lock, which an agent's own git command in the worktree needs, and
-//! it does not take the workspace's lifecycle lock, so it never holds up a start or an archive. A read an archive overtakes fails as the workspace being
-//! gone. A new file is read only when it is a plain file, never through a symlink, so a link the
-//! agent made cannot show a file outside the worktree.
+//! the worktree, its index or its refs, and takes no lock. It works on its own copy of the index,
+//! so it never takes git's index lock, which an agent's own git command in the worktree needs.
+//! It does not take the workspace's lifecycle lock, so it never holds up a start or an archive:
+//! a read an archive overtakes fails, and the next one finds the workspace gone. A new file is
+//! read only when it is a plain file, never through a symlink, so a link the agent made cannot
+//! show a file outside the worktree.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -76,16 +77,11 @@ pub enum FileStatus {
 
 impl Workspaces {
     /// What live workspace `id` has changed since it left its base. Each git call is bounded
-    /// as every git call here is. A read that fails once the workspace is no longer live, as
-    /// when an archive removed its worktree mid-read, is [`WorkspaceError::Unknown`].
+    /// as every git call here is.
     pub async fn changes(&self, id: WorkspaceId) -> Result<Changes, WorkspaceError> {
         let body = self.inner.live(id).await?;
         let worktree = self.inner.worktree(body.project, &body.branch);
-        let read = self.inner.changes(&worktree, &body.base).await;
-        if read.is_err() {
-            self.inner.live(id).await?;
-        }
-        read
+        self.inner.changes(&worktree, &body.base).await
     }
 }
 
