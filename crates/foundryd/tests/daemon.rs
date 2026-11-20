@@ -893,3 +893,104 @@ fn a_port_already_in_use_exits_1_and_names_the_address() {
         "stderr: {stderr}"
     );
 }
+
+/// The items `GET /api/attention` answers with.
+fn attention(fixture: &Fixture) -> Vec<serde_json::Value> {
+    let (status, body) = fixture.call("GET", "/api/attention", None);
+    assert_eq!(status, 200, "{body}");
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    json["items"].as_array().unwrap().clone()
+}
+
+#[test]
+fn a_waiting_for_you_item_is_listed_within_5_seconds_of_the_hook() {
+    let mut fixture = Fixture::new();
+    FileSecrets::new(fixture.home.path().join("secrets.json"))
+        .set("gateway", "sk-test-waiting-0123456789")
+        .unwrap();
+    fixture.gateway_url = Some("http://gw.invalid:8317".into());
+    // `claude` is the fake agent: it asks for permission at once, then waits.
+    let bin = fixture.user.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let script = fixture.user.path().join("agent.yaml");
+    fs::write(
+        &script,
+        "- hook: {event: SessionStart}\n- hook: {event: Notification, message: \"Claude needs your permission to use Bash\"}\n- sleep_ms: 600000\n",
+    )
+    .unwrap();
+    let agent = Path::new(env!("CARGO_BIN_EXE_foundryd")).with_file_name("foundry-fake-agent");
+    assert!(agent.exists(), "run `cargo test --workspace` to build the fake agent");
+    let claude = bin.join("claude");
+    fs::write(
+        &claude,
+        format!(
+            "#!/bin/sh\nexec {} --script {} \"$@\"\n",
+            agent.display(),
+            script.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).unwrap();
+    fixture.path_first = Some(bin);
+    let project = fixture.project();
+    fixture.seed(|settings| settings.projects.push(project.clone()));
+    fixture.start();
+    let workspace = fixture.workspace(&project);
+
+    // The hook fires after the start, so the start bounds it from before.
+    let started = Instant::now();
+    let (status, body) = fixture.call(
+        "POST",
+        &format!("/api/workspaces/{workspace}/sessions"),
+        Some(serde_json::json!({"model": "opus"})),
+    );
+    assert_eq!(status, 201, "{body}; {}", fixture.log());
+    let session = id_of(&body);
+    let item = wait_for("a waiting-for-you item", || {
+        attention(&fixture)
+            .into_iter()
+            .find(|item| item["kind"] == "session_waiting")
+    });
+    let took = started.elapsed();
+    assert!(took < Duration::from_secs(5), "listed after {took:?}");
+    assert_eq!(item["id"], format!("session_waiting:{session}"));
+    assert!(item["what"].as_str().unwrap().contains("waiting for you"), "{item}");
+}
+
+#[test]
+fn a_daemon_with_no_gateway_url_lists_gateway_unhealthy_naming_it() {
+    let mut fixture = Fixture::new();
+    fixture.start();
+    let item = wait_for("a gateway item", || {
+        attention(&fixture)
+            .into_iter()
+            .find(|item| item["kind"] == "gateway_unhealthy")
+    });
+    let what = item["what"].as_str().unwrap();
+    assert!(what.contains("FOUNDRY_GATEWAY_URL"), "{what}");
+    assert!(what.contains("gateway-management"), "{what}");
+}
+
+#[test]
+fn the_attention_routes_refuse_a_request_from_another_site() {
+    use std::io::{Read as _, Write as _};
+    let mut fixture = Fixture::new();
+    fixture.start();
+    let ask = |method: &str, path: &str, origin: Option<&str>| {
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", fixture.port)).unwrap();
+        let origin = origin.map_or_else(String::new, |o| format!("Origin: {o}\r\n"));
+        write!(
+            stream,
+            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n{origin}Connection: close\r\nContent-Length: 0\r\n\r\n",
+            fixture.port
+        )
+        .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        response.split(' ').nth(1).unwrap().parse::<u16>().unwrap()
+    };
+    let foreign = Some("http://evil.example");
+    assert_eq!(ask("GET", "/api/attention", None), 200);
+    assert_eq!(ask("GET", "/api/attention", foreign), 403);
+    assert_eq!(ask("POST", "/api/attention/x/dismiss", foreign), 403);
+}
