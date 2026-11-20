@@ -7,8 +7,11 @@
 //! healthy again once it answers with an account free. Health is this machine's own read, so
 //! the item it raises shows on this machine's list only.
 //!
-//! The URL and the key are read on every read, so a key set with `foundryd secret set` counts
-//! from the next one. Neither the key nor a password in the URL reaches an item or a log line.
+//! The key is read from the secret store once and kept. It is read again only while it is not
+//! set, so a key set with `foundryd secret set` counts from the next read, and after the
+//! gateway refuses it. A store that cannot read it (a denied keychain prompt, say) is not asked
+//! again until the daemon restarts, so it never prompts every few seconds. Neither the key nor a
+//! password in the URL reaches an item or a log line.
 
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -36,6 +39,8 @@ pub enum Health {
     KeyUnreadable,
     /// It did not answer with its accounts, for this reason.
     Unanswered(String),
+    /// It refused the management key with this status.
+    KeyRefused(u16),
     /// It answered with no account that is not disabled.
     NoAccounts,
     /// Every account that is not disabled is cooling down. `free_in` is how long until the
@@ -117,6 +122,7 @@ pub fn read(url: &str, key: &str) -> Health {
             Ok(answer) => return judged(&answer.files),
             Err(_) => "its answer is not a list of accounts".to_owned(),
         },
+        Err(ureq::Error::StatusCode(status @ (401 | 403))) => return Health::KeyRefused(status),
         Err(ureq::Error::StatusCode(status)) => format!("it answered {status}"),
         Err(error) => error.to_string(),
     };
@@ -125,7 +131,7 @@ pub fn read(url: &str, key: &str) -> Health {
 
 /// Reads the gateway at `url`, when set, with the management key `key` as the secret store
 /// gave it.
-pub fn check(url: Option<&str>, key: Result<Option<String>, SecretsError>) -> Health {
+pub fn check(url: Option<&str>, key: Result<Option<&str>, &SecretsError>) -> Health {
     let url = url.filter(|url| !url.is_empty());
     let key = match key {
         Ok(key) => key.filter(|key| !key.is_empty()),
@@ -135,7 +141,7 @@ pub fn check(url: Option<&str>, key: Result<Option<String>, SecretsError>) -> He
         }
     };
     match (url, key) {
-        (Some(url), Some(key)) => read(url, &key),
+        (Some(url), Some(key)) => read(url, key),
         (url, key) => {
             let mut missing = Vec::new();
             if url.is_none() {
@@ -149,10 +155,20 @@ pub fn check(url: Option<&str>, key: Result<Option<String>, SecretsError>) -> He
     }
 }
 
+/// The management key as the reader holds it.
+enum Key {
+    /// Not read yet, not set when last read, or refused by the gateway: read it next time.
+    Unread,
+    Held(String),
+    /// The secret store could not read it; not asked again.
+    Unreadable,
+}
+
 /// This machine's reader of the gateway, and the newest health it read.
 pub struct Reader {
     url: Option<String>,
     secrets: Arc<dyn Secrets>,
+    key: Mutex<Key>,
     /// `None` until the first read ends.
     health: Mutex<Option<Health>>,
 }
@@ -163,6 +179,7 @@ impl Reader {
         Self {
             url,
             secrets,
+            key: Mutex::new(Key::Unread),
             health: Mutex::new(None),
         }
     }
@@ -178,19 +195,31 @@ impl Reader {
     /// Reads the gateway once, on the blocking pool, and keeps what it found.
     pub async fn read_once(self: &Arc<Self>) {
         let reader = Arc::clone(self);
-        let health = tokio::task::spawn_blocking(move || {
-            check(
-                reader.url.as_deref(),
-                reader.secrets.get(GATEWAY_MANAGEMENT),
-            )
-        })
-        .await;
+        let health = tokio::task::spawn_blocking(move || reader.read_blocking()).await;
         match health {
             Ok(health) => {
                 *self.health.lock().unwrap_or_else(PoisonError::into_inner) = Some(health);
             }
             Err(error) => tracing::warn!("gateway: the read did not finish: {error}"),
         }
+    }
+
+    /// One read: the key as held, read from the store when it is not, then the gateway.
+    fn read_blocking(&self) -> Health {
+        let mut held = self.key.lock().unwrap_or_else(PoisonError::into_inner);
+        let key = match &*held {
+            Key::Held(key) => Ok(Some(key.clone())),
+            Key::Unreadable => return Health::KeyUnreadable,
+            Key::Unread => self.secrets.get(GATEWAY_MANAGEMENT),
+        };
+        let health = check(self.url.as_deref(), key.as_ref().map(Option::as_deref));
+        *held = match (key, &health) {
+            (_, Health::KeyUnreadable) => Key::Unreadable,
+            (_, Health::KeyRefused(_)) => Key::Unread,
+            (Ok(Some(key)), _) if !key.is_empty() => Key::Held(key),
+            _ => Key::Unread,
+        };
+        health
     }
 
     /// Reads the gateway every [`READ_EVERY`], the first at once. A read waits for the one
@@ -243,7 +272,14 @@ impl Source for Reader {
                     "The gateway cannot be checked: the secret {GATEWAY_MANAGEMENT} could not be \
                      read"
                 ),
-                "See the daemon log for why".to_owned(),
+                "See the daemon log for why, fix it, then restart foundryd".to_owned(),
+            ),
+            Some(Health::KeyRefused(status)) => (
+                format!(
+                    "The gateway at {} refused the management key: it answered {status}",
+                    self.shown_url()
+                ),
+                format!("Run `foundryd secret set {GATEWAY_MANAGEMENT}` with the right key"),
             ),
             Some(Health::Unanswered(why)) => (
                 format!("The gateway at {} does not answer: {why}", self.shown_url()),

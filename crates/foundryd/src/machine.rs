@@ -164,13 +164,14 @@ pub fn write_sample(
     data_dir: &Path,
 ) -> Result<Record<MachineSample>, MachineError> {
     let machine = read(data_dir, 0)?;
+    let update_refused = update_refused(data_dir);
     // A task that panicked while holding the store leaves it consistent: SQLite rolls back
     // a transaction that was not committed. Stopping here would freeze this machine's last
     // sample while it still looks online.
     let mut store = store.lock().unwrap_or_else(PoisonError::into_inner);
     let body = MachineSample {
         sessions: live_sessions(&store, me)?,
-        update_refused: update_refused(data_dir),
+        update_refused,
         ..machine
     };
     let record = Record {

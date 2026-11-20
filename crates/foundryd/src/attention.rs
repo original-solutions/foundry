@@ -16,7 +16,9 @@
 //! | Gateway unhealthy | this machine's read of the gateway fails | [`crate::gateway`] |
 //!
 //! Every row but the gateway's comes from the synced records and shared settings, so each
-//! machine shows the whole fleet's. Another module adds rows through a [`Source`].
+//! machine shows the whole fleet's. Records are read as the rest of the UI sees them: an offline
+//! machine's sessions and terminals are unreachable, so they raise nothing while its "machine
+//! offline" item stands. Another module adds rows through a [`Source`].
 //!
 //! - `GET /api/attention`: `{"items": [...]}`, each an [`Item`].
 //! - `POST /api/attention/{id}/dismiss`: dismisses a "setting overwritten" item through the
@@ -297,7 +299,10 @@ pub fn fleet_items(fleet: &Fleet) -> Vec<Item> {
             key,
             machine,
             format!(
-                "Two sides of a split both edited {setting}; the edit made on {} was replaced",
+                "Two sides of a split both edited {setting}: kept {}; replaced {}, the edit \
+                 made on {}",
+                value_text(fleet, overwritten.kept.as_ref()),
+                value_text(fleet, overwritten.lost.as_ref()),
                 fleet.name(machine)
             ),
             "Check it holds what you want, then dismiss this".to_owned(),
@@ -305,6 +310,29 @@ pub fn fleet_items(fleet: &Fleet) -> Vec<Item> {
     }
 
     items
+}
+
+/// One value of an overwritten setting as the item shows it, `removed` for none. A project's
+/// repo has any password hidden.
+fn value_text(fleet: &Fleet, value: Option<&SettingValue>) -> String {
+    match value {
+        None => "removed".to_owned(),
+        Some(SettingValue::Machine(machine)) => format!("{} ({})", machine.name, machine.address),
+        Some(SettingValue::Priority(order)) => order
+            .iter()
+            .map(|id| fleet.name(*id))
+            .collect::<Vec<_>>()
+            .join(", "),
+        Some(SettingValue::Project(project)) => {
+            format!("{} ({})", project.name, redact(&project.repo))
+        }
+        Some(SettingValue::Limits(limits)) => format!(
+            "at most {} sessions, load per core under {}, {:.1} GB free disk",
+            limits.max_sessions,
+            limits.max_load_per_core,
+            limits.min_free_disk as f64 / 1e9
+        ),
+    }
 }
 
 /// The attention list of one machine: the fleet's items and those of each [`Source`].
@@ -338,20 +366,13 @@ impl Attention {
         self
     }
 
-    /// Every item that stands now, ordered by kind and then id.
+    /// Every item that stands now, ordered by kind and then id. Records are read as
+    /// [`Peers::state`] shows them, so an offline machine's sessions and terminals are
+    /// unreachable and raise nothing but its "machine offline" item.
     pub async fn items(&self) -> Result<Vec<Item>, StoreError> {
         let online = self.peers.online();
-        let (records, settings) = on_store(&self.store, |store| {
-            let mut records = Vec::new();
-            for owner in store.versions()?.into_keys() {
-                match store.since(owner, 0) {
-                    Ok(held) => records.extend(held),
-                    Err(error) => tracing::warn!("attention: records of {owner} not read: {error}"),
-                }
-            }
-            Ok::<_, StoreError>((records, store.settings()?))
-        })
-        .await?;
+        let records = self.peers.state().await?;
+        let settings = on_store(&self.store, |store| store.settings()).await?;
         let fleet = Fleet {
             me: self.me,
             records,
@@ -1202,7 +1223,7 @@ mod tests {
             );
         }
         assert!(
-            kinds.iter().all(|(kind, _)| kind != "machine_offline"),
+            !kinds.contains(&("machine_offline".to_owned(), peer)),
             "{kinds:?}"
         );
     }
