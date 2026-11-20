@@ -9,6 +9,9 @@ import type { Link } from "./useFleet";
 /** How long the "back" line stays after the link returns. */
 const BACK_FOR = 4000;
 
+/** A connection line: a card at the head of the news, over the page, so it never takes room from a terminal. */
+const card = "pointer-events-auto rounded-xl border bg-neutral-900/95 px-3 py-2 text-sm shadow-2xl shadow-black/50 backdrop-blur";
+
 /** The wait until the next try, or that one is under way. */
 function nextTry(retryAt: number | undefined, now: number, lead: string): string {
   const seconds = retryAt === undefined ? 0 : Math.ceil((retryAt - now) / 1000);
@@ -80,21 +83,21 @@ export function Unreachable({ link }: { link: Link }) {
   );
 }
 
-/** The line across the top while the link is lost: since when, the next try, and Try now. */
+/** The line while the link is lost: since when, the next try, and Try now. */
 function Lost({ link, remembered }: { link: Link; remembered?: number }) {
   const now = useNow(1000);
   return (
-    <div role="status" className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1 border-b border-amber-400/30 bg-amber-400/10 px-4 py-2 text-sm text-amber-200">
+    <div role="status" className={`${card} flex flex-wrap items-center gap-x-3 gap-y-1 border-amber-400/30 text-amber-200`}>
       {remembered === undefined ? (
         <span className="min-w-0 flex-1">
           <span className="font-medium">Lost the daemon {heardAgo(link.lostAt, now) ?? "just now"}.</span>{" "}
-          <span className="hidden text-amber-200/70 sm:inline">Below is what it last said: states and numbers are frozen until it is back.</span>
+          <span className="hidden text-amber-200/70 sm:inline">The page shows what it last said: states and numbers are frozen until it is back.</span>
         </span>
       ) : (
         <span className="min-w-0 flex-1">
           <span className="font-medium">Can't reach the daemon at {location.host}.</span>{" "}
           <span className="text-amber-200/70">
-            Below is what this browser last saw {heardAgo(remembered, now)}<span className="hidden sm:inline">: frozen until it answers</span>.
+            Showing what this browser last saw {heardAgo(remembered, now)}<span className="hidden sm:inline">: frozen until it answers</span>.
           </span>
         </span>
       )}
@@ -119,17 +122,17 @@ function Connecting({ remembered }: { remembered: number }) {
   }, []);
   if (!slow) return null;
   return (
-    <div role="status" className="flex shrink-0 items-center gap-2 border-b border-neutral-800 bg-neutral-900 px-4 py-2 text-sm text-neutral-300">
-      <span className="font-medium">Connecting…</span>
-      <span className="min-w-0 truncate text-neutral-500">
-        Below is what this browser last saw {heardAgo(remembered, now)}<span className="hidden sm:inline">, until the daemon answers</span>.
+    <div role="status" className={`${card} border-neutral-800 text-neutral-300`}>
+      <span className="font-medium">Connecting…</span>{" "}
+      <span className="text-neutral-500">
+        Showing what this browser last saw {heardAgo(remembered, now)}<span className="hidden sm:inline">, until the daemon answers</span>.
       </span>
     </div>
   );
 }
 
 /**
- * Across the top of the page once it has had the daemon's state: while the link is lost, that what
+ * At the head of the news, over the page, once it has had the daemon's state: while the link is lost, that what
  * is shown is the daemon's last word and when it is tried next; when it comes back, once, for how
  * long it was gone. Over the fleet this browser last saw (`remembered`, when it saw it) before the
  * daemon's first answer: after a second, that it is connecting, or, once a try failed, that the
@@ -149,8 +152,8 @@ export function LinkBanner({ link, remembered }: { link: Link; remembered?: numb
   if (remembered !== undefined) return <Connecting remembered={remembered} />;
   if (!back || back.at === shown) return null;
   return (
-    <div role="status" className="flex shrink-0 items-center border-b border-emerald-400/30 bg-emerald-400/10 px-4 py-2 text-sm text-emerald-200">
-      <span className="font-medium">Back after {lasted(back.after)}.</span>&nbsp;<span className="hidden text-emerald-200/70 sm:inline">Everything is live again.</span>
+    <div role="status" className={`${card} border-emerald-400/30 text-emerald-200`}>
+      <span className="font-medium">Back after {lasted(back.after)}.</span> <span className="hidden text-emerald-200/70 sm:inline">Everything is live again.</span>
     </div>
   );
 }

@@ -246,6 +246,8 @@ function Layout() {
   // Never had the daemon's state: say so, rather than show an empty fleet.
   if (!state.synced && link.lostAt !== undefined) return <Unreachable link={link} />;
   const stale = link.lostAt !== undefined || remembering;
+  // Each part of the fleet greys on its own, so a terminal's own screen never does.
+  const frozen = { "data-fleet": true, "data-stale": stale || undefined };
   const workspaces = machines.flatMap((m) => m.workspaces);
   // A fleet with no workspaces opens on the first-run page, kept while its create is under way or
   // its workspace was made but its session failed, so what happened stays on screen.
@@ -278,15 +280,14 @@ function Layout() {
       }}
     >
       <div className="flex h-dvh flex-col overflow-hidden bg-neutral-950 text-neutral-100">
-        <LinkBanner link={link} remembered={remembering ? memory.at : undefined} />
-        <div data-stale={stale || undefined} className="relative flex min-h-0 flex-1 transition-[filter] duration-500 ease-out">
+        <div className="relative flex min-h-0 flex-1">
           {rail && (
-            <div className="hidden shrink-0 md:flex">
+            <div {...frozen} className="hidden shrink-0 md:flex">
               <Rail machines={machines} selected={terminalId} onExpand={flipRail} onJump={openJump} onCreate={() => openCreate()} alerts={<NotifyButton {...notify} />} />
             </div>
           )}
           {sidebar && (
-            <div className={`${place} shrink-0`}>
+            <div {...frozen} className={`${place} shrink-0`}>
               <Sidebar
                 machines={machines}
                 onCreate={() => openCreate()}
@@ -303,7 +304,7 @@ function Layout() {
           )}
           <main className="flex min-w-0 flex-1 flex-col">
             {terminalId && (
-              <div className="flex shrink-0">
+              <div {...frozen} className="flex shrink-0">
                 {(pair ? [pair.left, pair.right] : [terminalId]).map((id) => (
                   <div key={id} className="contents" onPointerDown={focusPane(id)}>
                     <TerminalHeader
@@ -351,26 +352,29 @@ function Layout() {
                   </div>
                 );
               })}
-              {!terminalId && onMachines && <Machines machines={machines} history={samples} here={here} connected={connected} onJump={openJump} onMenu={() => setDrawer(true)} />}
-              {firstRun && <Launchpad projects={state.settings.projects} workspaces={workspaces} launch={launch} onCreated={setLanding} onMenu={() => setDrawer(true)} />}
-              {board && state.synced && (
-                <Board
-                  machines={machines}
-                  projects={state.settings.projects}
-                  onJump={openJump}
-                  onCreated={setLanding}
-                  onChanges={openChanges}
-                  traced={traced}
-                  onMenu={() => setDrawer(true)}
-                  onSteps={(id) => {
-                    setStepsOpen(true);
-                    show(id);
-                  }}
-                />
-              )}
+              {/* Hidden while empty, so it never lies over a terminal. */}
+              <div {...frozen} className="absolute inset-0 empty:hidden">
+                {!terminalId && onMachines && <Machines machines={machines} history={samples} here={here} connected={connected} onJump={openJump} onMenu={() => setDrawer(true)} />}
+                {firstRun && <Launchpad projects={state.settings.projects} workspaces={workspaces} launch={launch} onCreated={setLanding} onMenu={() => setDrawer(true)} />}
+                {board && state.synced && (
+                  <Board
+                    machines={machines}
+                    projects={state.settings.projects}
+                    onJump={openJump}
+                    onCreated={setLanding}
+                    onChanges={openChanges}
+                    traced={traced}
+                    onMenu={() => setDrawer(true)}
+                    onSteps={(id) => {
+                      setStepsOpen(true);
+                      show(id);
+                    }}
+                  />
+                )}
+              </div>
             </div>
           </main>
-          {stepsOpen && stepsOf && <StepsPanel key={located?.session ?? terminalId} of={stepsOf} onClose={() => setStepsOpen(false)} />}
+          {stepsOpen && stepsOf && <StepsPanel key={located?.session ?? terminalId} of={stepsOf} onClose={() => setStepsOpen(false)} stale={stale} />}
         </div>
         <ChangesPanel
           workspace={machines.flatMap((m) => m.workspaces).find((w) => w.id === changesOf?.workspace)}
@@ -398,6 +402,7 @@ function Layout() {
         <Announcer spoken={spoken} />
         {/* One place on screen for news: the catch-up first, then the cards. */}
         <div className="pointer-events-none fixed inset-x-2 top-2 z-40 flex flex-col gap-2 md:inset-x-auto md:top-14 md:right-4 md:w-[24rem]">
+          <LinkBanner link={link} remembered={remembering ? memory.at : undefined} />
           {notify.notify.away && <Away records={sent.records} synced={sent.synced} machines={machines} traced={traced} onOpen={show} onShown={setCaughtUp} />}
           <Toasts news={news} machines={machines} here={here} onScreen={pair ? [pair.left, pair.right] : terminalId ? [terminalId] : []} covered={notify.notify.away ? caughtUp : []} onOpen={show} />
         </div>

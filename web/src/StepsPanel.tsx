@@ -31,9 +31,9 @@ const chip: Record<StepKind, { mark: string; tone: string }> = {
  * took; the newest stays open and grows live while the session works, keeping its newest step in
  * view. On a wide screen it is a column at the right; on a narrow one it takes the screen.
  */
-export function StepsPanel({ of, onClose }: { of: StepsOf; onClose: () => void }) {
+export function StepsPanel({ of, onClose, stale }: { of: StepsOf; onClose: () => void; stale?: boolean }) {
   return (
-    <aside aria-label="Steps" className="fixed inset-0 z-30 flex flex-col bg-neutral-950 text-sm text-neutral-100 md:static md:z-auto md:w-[22rem] md:shrink-0 md:border-l md:border-neutral-800 motion-safe:md:animate-sheet-in">
+    <aside aria-label="Steps" data-fleet data-stale={stale || undefined} className="fixed inset-0 z-30 flex flex-col bg-neutral-950 text-sm text-neutral-100 md:static md:z-auto md:w-[22rem] md:shrink-0 md:border-l md:border-neutral-800 motion-safe:md:animate-sheet-in">
       <header className="flex h-11 shrink-0 items-center gap-2 border-b border-neutral-800 bg-neutral-900 px-3 md:h-9 md:bg-neutral-950">
         <StepsIcon className="size-4 text-neutral-400" />
         <h2 className="font-medium">Steps</h2>

@@ -207,6 +207,35 @@ describe("App", () => {
     expect(screen.getByRole("status").textContent).toContain("Back after");
   });
 
+  it("never moves an open terminal when the connection line comes and goes, and greys the fleet around it but not its screen", async () => {
+    mockActions();
+    await open("/terminals/t1", live);
+    const pane = screen.getByTestId("pane-t1");
+    // What lies beside the pane at every level up: a line pushed in among them would shrink it, and its PTY with it.
+    const layout = () => {
+      const levels: Element[][] = [];
+      for (let at: Element | null = pane; at?.parentElement; at = at.parentElement) levels.push([...at.parentElement.children]);
+      return levels;
+    };
+    const steady = layout();
+    const unmoved = () => layout().every((level, i) => level.length === steady[i].length && level.every((element, j) => element === steady[i][j]));
+
+    act(() => sockets("/api/events").at(-1)!.end(1006));
+    expect(screen.getByRole("status").textContent).toContain("Lost the daemon");
+    expect(unmoved()).toBe(true);
+    // The sidebar and the terminal's header are greyed; the terminal's own bytes are not.
+    expect(screen.getByRole("button", { name: "New task" }).closest("[data-stale]")).not.toBeNull();
+    expect(screen.getByLabelText("Open terminal").closest("[data-stale]")).not.toBeNull();
+    expect(pane.closest("[data-stale]")).toBeNull();
+
+    await act(() => new Promise((resolve) => setTimeout(resolve, 600)));
+    const again = sockets("/api/events").at(-1)!;
+    act(() => again.open());
+    act(() => again.deliver(JSON.stringify(live)));
+    expect(screen.getByRole("status").textContent).toContain("Back after");
+    expect(unmoved()).toBe(true);
+  });
+
   async function before(path: string) {
     const fresh = createRouter({ routeTree, history: createMemoryHistory({ initialEntries: [path] }) });
     await fresh.load();
