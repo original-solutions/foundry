@@ -179,15 +179,16 @@ describe("CreateWorkspace", () => {
     expect(screen.getByLabelText("Branch").textContent).toBe("fix-auth");
   });
 
-  it("offers this machine and every other listed one by name, an offline one shown but not pickable", async () => {
+  it("offers this machine, letting Foundry choose, and every other listed one by name, an offline one shown but not pickable", async () => {
     await renderApp(<Harness />);
 
     fireEvent.click(await screen.findByRole("button", { name: "New workspace" }));
 
     const machine = screen.getByLabelText("Machine") as HTMLSelectElement;
-    await waitFor(() => expect(machine.options).toHaveLength(3));
+    await waitFor(() => expect(machine.options).toHaveLength(4));
     expect(Array.from(machine.options).map((o) => [o.textContent, o.disabled])).toEqual([
       ["This machine", false],
+      ["Let Foundry choose", false],
       ["laptop", false],
       ["old mini (offline)", true],
     ]);
@@ -201,7 +202,7 @@ describe("CreateWorkspace", () => {
 
     await fill("far work");
     const machine = screen.getByLabelText("Machine") as HTMLSelectElement;
-    await waitFor(() => expect(machine.options).toHaveLength(3));
+    await waitFor(() => expect(machine.options).toHaveLength(4));
     fireEvent.change(machine, { target: { value: "m2" } });
     fireEvent.click(screen.getByRole("button", { name: "Create and open" }));
 
@@ -209,6 +210,64 @@ describe("CreateWorkspace", () => {
     expect(calls[0]).toEqual({ url: "/api/workspaces", method: "POST", body: { project: "p1", base: "main", name: "far work", machine: "m2" } });
     expect(calls[1]).toEqual({ url: "/api/workspaces/w1/sessions", method: "POST", body: { model: "opus" } });
     await waitFor(() => expect(created).toHaveBeenCalledWith("s1"));
+  });
+
+  it("with Foundry choosing, sends the model and first prompt with the create, then starts the session where it was made", async () => {
+    const calls = mockFetch(json(201, { id: "w1", machine: "m2" }), json(201, { id: "s1" }));
+    const created = vi.fn();
+    await renderApp(<Harness onCreated={created} />);
+
+    await fill("anywhere");
+    fireEvent.change(screen.getByLabelText("First prompt"), { target: { value: "Fix the footer." } });
+    const machine = screen.getByLabelText("Machine") as HTMLSelectElement;
+    await waitFor(() => expect(machine.options).toHaveLength(4));
+    fireEvent.change(machine, { target: { value: "choose" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create and start" }));
+
+    await waitFor(() => expect(calls).toHaveLength(2));
+    expect(calls[0]).toEqual({
+      url: "/api/workspaces",
+      method: "POST",
+      body: { project: "p1", base: "main", name: "anywhere", machine: "choose", model: "opus", prompt: "Fix the footer." },
+    });
+    expect(calls[1]).toEqual({ url: "/api/workspaces/w1/sessions", method: "POST", body: { model: "opus", prompt: "Fix the footer." } });
+    await waitFor(() => expect(created).toHaveBeenCalledWith("s1"));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  });
+
+  it("closes on a request that waits for a machine, starts no session, and asks for the waiting list again", async () => {
+    const calls = mockFetch(json(202, { request: "r1", reasons: ["laptop: load 1.8 over limit 1.0"] }));
+    const created = vi.fn();
+    const { client } = await renderApp(<Harness onCreated={created} />);
+    const refreshed = vi.spyOn(client, "invalidateQueries");
+
+    await fill("later");
+    const machine = screen.getByLabelText("Machine") as HTMLSelectElement;
+    await waitFor(() => expect(machine.options).toHaveLength(4));
+    fireEvent.change(machine, { target: { value: "choose" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create and open" }));
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(calls).toHaveLength(1);
+    expect(calls[0].body).toEqual({ project: "p1", base: "main", name: "later", machine: "choose", model: "opus" });
+    expect(created).not.toHaveBeenCalled();
+    expect(refreshed).toHaveBeenCalledWith({ queryKey: ["placements"] });
+  });
+
+  it("shows the warning of a machine picked over its limits and stays open on it", async () => {
+    mockFetch(json(201, { id: "w1", warning: "laptop is over its limits: load 1.5 over limit 1.0" }), json(201, { id: "s1" }));
+    const created = vi.fn();
+    await renderApp(<Harness onCreated={created} />);
+
+    await fill("anyway");
+    const machine = screen.getByLabelText("Machine") as HTMLSelectElement;
+    await waitFor(() => expect(machine.options).toHaveLength(4));
+    fireEvent.change(machine, { target: { value: "m2" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create and open" }));
+
+    expect((await screen.findByRole("status")).textContent).toBe("laptop is over its limits: load 1.5 over limit 1.0");
+    expect(created).toHaveBeenCalledWith("s1");
+    expect(screen.getByRole("dialog")).toBeDefined();
   });
 
   it("still offers this machine when the machine list cannot be read", async () => {
