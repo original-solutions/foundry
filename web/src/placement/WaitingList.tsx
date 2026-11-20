@@ -1,4 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useState } from "react";
 import { cancelPlacement, listPlacements, placementsKey, type Placement } from "../api";
 import { pollEvery } from "../poll";
 import { useNow } from "../StepsPanel";
@@ -38,58 +39,69 @@ function Requests({ requests }: { requests: Placement[] }) {
     onSettled: () => client.invalidateQueries({ queryKey: placementsKey, exact: true }),
   });
   const now = useNow(CLOCK_EVERY);
+  const [open, setOpen] = useState(true);
 
   return (
     <section
       aria-label="Waiting for a machine"
-      className="fixed inset-x-4 top-4 z-40 rounded-lg border border-sky-800/60 bg-neutral-900 text-sm shadow-lg shadow-black/50 md:inset-x-auto md:top-auto md:bottom-4 md:left-4 md:w-96"
+      className="fixed inset-x-4 top-14 z-40 rounded-lg border border-sky-800/60 bg-neutral-900 text-sm shadow-lg shadow-black/50 md:inset-x-auto md:top-auto md:bottom-4 md:left-4 md:w-96"
     >
-      <h2 className="px-3 py-2 font-medium text-sky-300">
-        {requests.length} waiting for a machine
-      </h2>
-      <ul className="max-h-[40vh] divide-y divide-neutral-800 overflow-y-auto border-t border-neutral-800">
-        {requests.map((request) => {
-          const failed = request.state === "failed";
-          const action = failed ? "Dismiss" : "Cancel";
-          return (
-            <li key={request.id} className="space-y-1 px-3 py-2">
-              <p className="flex items-baseline gap-2">
-                <span className="min-w-0 truncate font-medium text-neutral-100">{request.name}</span>
-                <span className="shrink-0 text-xs text-neutral-500">
-                  {failed ? "not placed" : request.state === "placing" ? "placing…" : waited(request.waiting_since, Math.max(now, request.waiting_since))}
-                </span>
-              </p>
-              {failed ? (
-                <p className="text-red-400">{request.error}</p>
-              ) : (
-                <ul className="text-neutral-400">
-                  {request.reasons.map((reason) => (
-                    <li key={reason}>{reason}</li>
-                  ))}
-                </ul>
-              )}
-              {request.state !== "placing" && (
-                <p className="pt-1">
-                  <button
-                    type="button"
-                    aria-label={`${action} ${request.name}`}
-                    disabled={cancel.isPending && cancel.variables?.id === request.id}
-                    onClick={() => cancel.mutate(request)}
-                    className="text-sky-400 hover:text-sky-300 disabled:text-neutral-500"
-                  >
-                    {action}
-                  </button>
+      <button
+        type="button"
+        aria-expanded={open}
+        onClick={() => setOpen(!open)}
+        className="flex w-full items-center gap-2 px-3 py-2 text-left font-medium text-sky-300 hover:bg-neutral-800/60"
+      >
+        <span className="flex-1">{requests.length} waiting for a machine</span>
+        <span aria-hidden="true" className="text-neutral-500">
+          {open ? "▾" : "▴"}
+        </span>
+      </button>
+      {open && (
+        <ul className="max-h-[40vh] divide-y divide-neutral-800 overflow-y-auto border-t border-neutral-800">
+          {requests.map((request) => {
+            const failed = request.state === "failed";
+            const action = failed ? "Dismiss" : "Cancel";
+            return (
+              <li key={request.id} className="space-y-1 px-3 py-2">
+                <p className="flex items-baseline gap-2">
+                  <span className="min-w-0 truncate font-medium text-neutral-100">{request.name}</span>
+                  <span className="shrink-0 text-xs text-neutral-500">
+                    {failed ? "not placed" : request.state === "placing" ? "placing…" : waited(request.waiting_since, Math.max(now, request.waiting_since))}
+                  </span>
                 </p>
-              )}
-              {cancel.isError && cancel.variables?.id === request.id && (
-                <p role="alert" className="text-red-400">
-                  {cancel.error.message}
-                </p>
-              )}
-            </li>
-          );
-        })}
-      </ul>
+                {failed ? (
+                  <p className="text-red-400">{request.error}</p>
+                ) : (
+                  <ul className="text-neutral-400">
+                    {request.reasons.map((reason) => (
+                      <li key={reason}>{reason}</li>
+                    ))}
+                  </ul>
+                )}
+                {request.state !== "placing" && (
+                  <p className="pt-1">
+                    <button
+                      type="button"
+                      aria-label={`${action} ${request.name}`}
+                      disabled={cancel.isPending && cancel.variables?.id === request.id}
+                      onClick={() => cancel.mutate(request)}
+                      className="text-sky-400 hover:text-sky-300 disabled:text-neutral-500"
+                    >
+                      {action}
+                    </button>
+                  </p>
+                )}
+                {cancel.isError && cancel.variables?.id === request.id && (
+                  <p role="alert" className="text-red-400">
+                    {cancel.error.message}
+                  </p>
+                )}
+              </li>
+            );
+          })}
+        </ul>
+      )}
     </section>
   );
 }

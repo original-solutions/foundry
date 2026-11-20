@@ -66,6 +66,18 @@ describe("WaitingList", () => {
     expect(within(list).getByRole("button", { name: "Cancel fix login" })).toBeTruthy();
   });
 
+  it("folds to its count and opens again", async () => {
+    lists = [[waiting]];
+    await renderApp(<WaitingList />);
+    const list = await screen.findByRole("region", { name: "Waiting for a machine" });
+    const toggle = within(list).getByRole("button", { name: /1 waiting for a machine/ });
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(within(list).queryByText(waiting.reasons[0])).toBeNull();
+    fireEvent.click(toggle);
+    expect(within(list).getByText(waiting.reasons[0])).toBeTruthy();
+  });
+
   it("cancels a request and drops it from the list", async () => {
     lists = [[waiting], []];
     await renderApp(<WaitingList />);
