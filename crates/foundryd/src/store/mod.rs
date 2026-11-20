@@ -22,9 +22,11 @@ mod tests;
 ///
 /// A rollback, or going back by hand with `install`, runs the previous build on the file a
 /// newer build migrated. That build skips the steps it does not know and keeps working, so
-/// a step may only add tables, indexes or nullable columns. It must never drop, rename or
-/// change the meaning of an existing table or column: the previous build still reads and
-/// writes them.
+/// a step may only add tables, non-unique indexes or nullable columns. It must never drop,
+/// rename or change the meaning of an existing table or column, and nothing it adds may
+/// refuse a write the previous build makes: the previous build still reads and writes them.
+/// Rows a newer build stored that the previous build cannot parse are another matter: see
+/// [`Store::since`].
 const MIGRATIONS: &[&str] = &[
     // 1: records keyed by kind and id, the owner's own version counter, shared settings.
     "CREATE TABLE records (
