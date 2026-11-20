@@ -100,8 +100,8 @@ function freeName(name: string, project: Project | undefined, workspaces: Worksp
  * under it, and Start (or Cmd+Enter) makes the workspace and starts Claude Code on the task,
  * handing the session to `onCreated` so the layout lands in it. The workspace is made on this
  * machine, or on another listed one when the fleet has one and it is picked, or on the one
- * Foundry picks when it is let choose; an offline machine is shown but cannot be picked. When the machine list cannot be read, only this machine is
- * offered.
+ * Foundry picks when it is let choose; an offline machine is shown but cannot be picked. When
+ * the machine list cannot be read, only this machine is offered.
  *
  * On the first-run page and in the New task dialog (`page`) it is open and big. At the top of
  * the board (`bar`) it is one line beside a way to jump until it is used, so starting the next
