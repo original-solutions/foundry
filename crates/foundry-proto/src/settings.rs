@@ -287,10 +287,16 @@ pub(crate) mod tests {
             )]
             .into(),
             stamps: [
-                (SettingKey::Machine(mac), Stamp { seq: 40, by: vps }),
-                (SettingKey::Priority, Stamp { seq: 42, by: mac }),
                 (
-                    SettingKey::Overwritten(Box::new(SettingKey::Limits(vps))),
+                    StampKey::Setting(SettingKey::Machine(mac)),
+                    Stamp { seq: 40, by: vps },
+                ),
+                (
+                    StampKey::Setting(SettingKey::Priority),
+                    Stamp { seq: 42, by: mac },
+                ),
+                (
+                    StampKey::Overwritten(SettingKey::Limits(vps)),
                     Stamp { seq: 41, by: vps },
                 ),
             ]
@@ -401,9 +407,12 @@ pub(crate) mod tests {
         );
         let id = MachineId(mac.parse().unwrap());
         let read: SharedSettings = serde_json::from_str(&json).unwrap();
-        assert_eq!(read.stamps[&SettingKey::Priority], Stamp { seq: 5, by: id });
         assert_eq!(
-            read.stamps[&SettingKey::Overwritten(Box::new(SettingKey::Limits(id)))],
+            read.stamps[&StampKey::Setting(SettingKey::Priority)],
+            Stamp { seq: 5, by: id }
+        );
+        assert_eq!(
+            read.stamps[&StampKey::Overwritten(SettingKey::Limits(id))],
             Stamp { seq: 4, by: id }
         );
         assert_eq!(read.seen, [(id, 5)].into());
@@ -425,19 +434,20 @@ pub(crate) mod tests {
             (SettingKey::Priority, "priority".to_owned()),
             (SettingKey::Project(project), format!("project:{project}")),
             (SettingKey::Limits(id), format!("limits:{id}")),
-            (
-                SettingKey::Overwritten(Box::new(SettingKey::Project(project))),
-                format!("overwritten:project:{project}"),
-            ),
-            (
-                SettingKey::Overwritten(Box::new(SettingKey::Priority)),
-                "overwritten:priority".to_owned(),
-            ),
         ];
         for (key, text) in keys {
             assert_eq!(key.to_string(), text);
             assert_eq!(text.parse::<SettingKey>().unwrap(), key);
             assert_round_trip(&key);
+            let stamp_key = StampKey::Setting(key.clone());
+            assert_eq!(stamp_key.to_string(), text);
+            assert_eq!(text.parse::<StampKey>().unwrap(), stamp_key);
+            assert_round_trip(&stamp_key);
+            let item = StampKey::Overwritten(key);
+            let text = format!("overwritten:{text}");
+            assert_eq!(item.to_string(), text);
+            assert_eq!(text.parse::<StampKey>().unwrap(), item);
+            assert_round_trip(&item);
         }
     }
 
@@ -454,7 +464,13 @@ pub(crate) mod tests {
         ] {
             assert!(text.parse::<SettingKey>().is_err(), "{text}");
             parse_error::<SettingKey>(&format!("\"{text}\""));
+            assert!(text.parse::<StampKey>().is_err(), "{text}");
+            parse_error::<StampKey>(&format!("\"{text}\""));
         }
+        // An item is not itself a setting: no edit can name one as its setting.
+        let item = format!("overwritten:machine:{id}");
+        assert!(item.parse::<SettingKey>().is_err(), "{item}");
+        parse_error::<Edit>(&format!(r#"{{"kind":"dismiss","setting":"{item}"}}"#));
     }
 
     #[test]
@@ -478,31 +494,31 @@ pub(crate) mod tests {
                 Edit::SetMachine {
                     machine: machine.clone(),
                 },
-                SettingKey::Machine(machine.id),
+                StampKey::Setting(SettingKey::Machine(machine.id)),
                 Some(SettingValue::Machine(machine.clone())),
             ),
             (
                 Edit::RemoveMachine { id: machine.id },
-                SettingKey::Machine(machine.id),
+                StampKey::Setting(SettingKey::Machine(machine.id)),
                 None,
             ),
             (
                 Edit::Priority {
                     order: settings.priority.clone(),
                 },
-                SettingKey::Priority,
+                StampKey::Setting(SettingKey::Priority),
                 Some(SettingValue::Priority(settings.priority.clone())),
             ),
             (
                 Edit::SetProject {
                     project: project.clone(),
                 },
-                SettingKey::Project(project.id),
+                StampKey::Setting(SettingKey::Project(project.id)),
                 Some(SettingValue::Project(project.clone())),
             ),
             (
                 Edit::RemoveProject { id: project.id },
-                SettingKey::Project(project.id),
+                StampKey::Setting(SettingKey::Project(project.id)),
                 None,
             ),
             (
@@ -510,21 +526,21 @@ pub(crate) mod tests {
                     machine: machine.id,
                     limits: limits.clone(),
                 },
-                SettingKey::Limits(machine.id),
+                StampKey::Setting(SettingKey::Limits(machine.id)),
                 Some(SettingValue::Limits(limits)),
             ),
             (
                 Edit::RemoveLimits {
                     machine: machine.id,
                 },
-                SettingKey::Limits(machine.id),
+                StampKey::Setting(SettingKey::Limits(machine.id)),
                 None,
             ),
             (
                 Edit::Dismiss {
                     setting: SettingKey::Priority,
                 },
-                SettingKey::Overwritten(Box::new(SettingKey::Priority)),
+                StampKey::Overwritten(SettingKey::Priority),
                 None,
             ),
         ];

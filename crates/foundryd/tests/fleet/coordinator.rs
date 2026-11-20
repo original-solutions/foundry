@@ -9,7 +9,7 @@ use foundry_proto::ids::{MachineId, ProjectId, WorkspaceId};
 use foundry_proto::messages::{PROTOCOL, PeerMessage};
 use foundry_proto::record::AnyRecord;
 use foundry_proto::settings::{
-    Edit, Limits, Overwritten, Project, SettingKey, SettingValue, SharedSettings, Stamp,
+    Edit, Limits, Overwritten, Project, SettingKey, SettingValue, SharedSettings, Stamp, StampKey,
 };
 use foundry_proto::state::TerminalState;
 use foundryd::coordinator::Coordinator;
@@ -22,6 +22,13 @@ use tokio::time::Instant;
 use crate::*;
 
 const WAIT: Duration = Duration::from_secs(60);
+
+/// The spec's bound: the next machine in the order holds the role within 15 seconds of the
+/// coordinator disappearing.
+const ROLE_MOVES_WITHIN: Duration = Duration::from_secs(15);
+
+/// How often a test looks again at who acts.
+const POLL: Duration = Duration::from_millis(50);
 
 fn project(n: u128, name: &str) -> Project {
     Project {
@@ -56,8 +63,8 @@ fn project_named(settings: &SharedSettings, n: u128) -> Option<String> {
         .map(|p| p.name.clone())
 }
 
-/// Waits until `coordinator` names `want` as acting, checking every 100 ms, and returns how
-/// long that took. Fails past `limit`.
+/// Waits until `coordinator` names `want` as acting, checking every [`POLL`], and returns how
+/// long that took. Fails when a check past `limit` still names another machine.
 async fn acting_becomes(coordinator: &Coordinator, want: MachineId, limit: Duration) -> Duration {
     let start = Instant::now();
     loop {
@@ -68,7 +75,7 @@ async fn acting_becomes(coordinator: &Coordinator, want: MachineId, limit: Durat
             start.elapsed() <= limit,
             "{want} did not take the role within {limit:?}"
         );
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(POLL).await;
     }
 }
 
@@ -162,14 +169,11 @@ async fn stopping_the_coordinator_moves_the_role_in_time_while_a_session_elsewhe
     until(WAIT, "the terminal prints", || ticks() > 0).await;
 
     fleet.cut(0);
+    let cut_at = Instant::now();
     let at_cut = ticks();
-    let took = acting_becomes(&fleet.daemons[1].coordinator(), second, OFFLINE_AFTER).await;
-    acting_becomes(
-        &fleet.daemons[2].coordinator(),
-        second,
-        Duration::from_secs(1),
-    )
-    .await;
+    let took = acting_becomes(&fleet.daemons[1].coordinator(), second, ROLE_MOVES_WITHIN).await;
+    let left = ROLE_MOVES_WITHIN.saturating_sub(cut_at.elapsed());
+    acting_becomes(&fleet.daemons[2].coordinator(), second, left).await;
     let at_move = ticks();
     // Printing went on through the change of role, and goes on after it.
     assert!(
@@ -217,7 +221,7 @@ async fn an_edit_on_the_acting_machine_is_numbered_by_it_and_reaches_every_machi
     let settings = agreed(&fleet, &[0, 1, 2], "the edit reaches every machine").await;
     assert_eq!(project_named(&settings, 7).as_deref(), Some("p"));
     // Numbered by the acting machine, as the newest number every machine holds.
-    let stamp = settings.stamps[&SettingKey::Project(project(7, "p").id)];
+    let stamp = settings.stamps[&StampKey::Setting(SettingKey::Project(project(7, "p").id))];
     assert_eq!(stamp.by, first);
     assert_eq!(stamp.seq, settings.seq);
     assert_eq!(settings.seen, [(first, stamp.seq)].into());
@@ -243,7 +247,7 @@ async fn an_edit_sent_to_a_machine_that_is_not_acting_is_forwarded() {
     let settings = agreed(&fleet, &[0, 1, 2], "every machine agrees").await;
     // The acting machine numbered it.
     assert_eq!(
-        settings.stamps[&SettingKey::Project(project(7, "p").id)].by,
+        settings.stamps[&StampKey::Setting(SettingKey::Project(project(7, "p").id))].by,
         first
     );
     assert_eq!(settings.seen.keys().copied().collect::<Vec<_>>(), [first]);
@@ -486,19 +490,225 @@ fn heartbeat() -> PeerMessage {
 }
 
 /// Keeps `conn` open as a peer that sends only heartbeats, reading and dropping what the
-/// daemon sends, until the returned task is dropped.
+/// daemon sends.
 fn beat(conn: Conn) -> tokio::task::JoinHandle<()> {
+    beating(drained(conn))
+}
+
+/// Sends a heartbeat on `to` every second until the returned task is aborted or the link
+/// closes.
+fn beating(to: mpsc::Sender<String>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let Conn { send, mut recv } = conn;
-        tokio::spawn(async move { while recv.recv().await.is_some() {} });
         let text = serde_json::to_string(&heartbeat()).unwrap();
         loop {
-            if send.send(text.clone()).await.is_err() {
+            if to.send(text.clone()).await.is_err() {
                 return;
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     })
+}
+
+/// Keeps every message the daemon sends on `conn`, and returns the end the test sends on.
+fn recorded(conn: Conn) -> (mpsc::Sender<String>, Arc<Mutex<Vec<serde_json::Value>>>) {
+    let Conn { send, mut recv } = conn;
+    let said = Arc::new(Mutex::new(Vec::new()));
+    tokio::spawn({
+        let said = said.clone();
+        async move {
+            while let Some(text) = recv.recv().await {
+                lock(&said).push(serde_json::from_str(&text).unwrap());
+            }
+        }
+    });
+    (send, said)
+}
+
+/// `held` as a peer that numbered one edit to the priority order, putting `order` first.
+fn ordered_by(held: &SharedSettings, peer: MachineId, order: Vec<MachineId>) -> SharedSettings {
+    let mut theirs = held.clone();
+    theirs.seq += 5;
+    theirs.priority = order;
+    theirs.stamps.insert(
+        StampKey::Setting(SettingKey::Priority),
+        Stamp {
+            seq: theirs.seq,
+            by: peer,
+        },
+    );
+    theirs.seen.insert(peer, theirs.seq);
+    theirs
+}
+
+fn settings_message(settings: SharedSettings) -> PeerMessage {
+    PeerMessage::Settings {
+        protocol: PROTOCOL,
+        settings,
+    }
+}
+
+fn edit_message(edit: Edit) -> PeerMessage {
+    PeerMessage::Edit {
+        protocol: PROTOCOL,
+        edit,
+    }
+}
+
+/// Waits until `daemon` holds project `n`, and returns its settings.
+async fn holds_project(daemon: &Daemon, n: u128, within: Duration) -> SharedSettings {
+    until(within, "the project is numbered", || {
+        project_named(&daemon.settings(), n).is_some()
+    })
+    .await;
+    daemon.settings()
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_edit_forwarded_by_the_machine_this_one_takes_to_act_waits_and_is_never_sent_back() {
+    let peer = MachineId::random();
+    let fleet = Fleet::start_coordinated_with(1, &[peer]);
+    let daemon = &fleet.daemons[0];
+    let (conn, said) = recorded(raw_link(daemon, peer).await);
+    let theirs = ordered_by(&daemon.settings(), peer, vec![peer, daemon.id]);
+    say(&conn, &settings_message(theirs.clone())).await;
+    let _beating = beating(conn.clone());
+    until(WAIT, "the peer is online", || {
+        daemon.peers.online().contains(&peer)
+    })
+    .await;
+    assert_eq!(daemon.coordinator().acting().await.unwrap(), peer);
+
+    // The peer forwards an edit to it, though this machine takes the peer to act.
+    say(&conn, &edit_message(set_project(7, "forwarded"))).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        project_named(&daemon.settings(), 7),
+        None,
+        "numbered while not acting"
+    );
+
+    // The peer's next copy hands the role to this machine, which then numbers the edit.
+    let back = ordered_by(&theirs, peer, vec![daemon.id, peer]);
+    say(&conn, &settings_message(back)).await;
+    let settings = holds_project(daemon, 7, Duration::from_secs(2)).await;
+    assert_eq!(
+        settings.stamps[&StampKey::Setting(SettingKey::Project(project(7, "").id))].by,
+        daemon.id
+    );
+    let sent_back = lock(&said).iter().any(|m| m["type"] == "edit");
+    assert!(
+        !sent_back,
+        "the edit went back to the machine that forwarded it"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn forwarded_edits_wait_for_catch_up_without_stalling_the_link_and_keep_their_order() {
+    let peer = MachineId::random();
+    let fleet = Fleet::start_coordinated_with(1, &[peer]);
+    let daemon = &fleet.daemons[0];
+    let conn = drained(raw_link(daemon, peer).await);
+    say(&conn, &heartbeat()).await;
+    let _beating = beating(conn.clone());
+    until(WAIT, "the peer is online", || {
+        daemon.peers.online().contains(&peer)
+    })
+    .await;
+
+    // Two edits to one setting arrive before the peer's copy does.
+    let me = daemon.id;
+    say(&conn, &edit_message(set_limits(me, 4))).await;
+    say(&conn, &edit_message(set_limits(me, 6))).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        !daemon.settings().limits.contains_key(&me),
+        "numbered before catching up"
+    );
+
+    // The link goes on reading, so the copy that lets them be numbered gets through.
+    say(&conn, &settings_message(daemon.settings())).await;
+    until(Duration::from_secs(2), "both edits are numbered", || {
+        daemon.settings().seen.get(&me) == Some(&(daemon.settings().seq))
+            && daemon.settings().limits.contains_key(&me)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let settings = daemon.settings();
+    assert_eq!(settings.limits[&me].max_sessions, 6, "the later edit holds");
+    assert_eq!(
+        settings.stamps[&StampKey::Setting(SettingKey::Limits(me))].seq,
+        settings.seq
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_restarted_machine_waits_for_a_listed_machines_settings_before_numbering() {
+    let peer = MachineId::random();
+    let fleet = Fleet::start_coordinated_with(1, &[peer]);
+    let daemon = &fleet.daemons[0];
+    // It hears from no one yet, so it acts, but the listed peer may hold newer settings.
+    let editing = tokio::spawn({
+        let coordinator = daemon.coordinator();
+        async move { coordinator.edit(set_project(7, "after catching up")).await }
+    });
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        project_named(&daemon.settings(), 7),
+        None,
+        "numbered on a stale copy"
+    );
+
+    let conn = drained(raw_link(daemon, peer).await);
+    let mut theirs = daemon.settings();
+    theirs.seq = 5;
+    theirs.projects.push(project(8, "newer"));
+    theirs.stamps.insert(
+        StampKey::Setting(SettingKey::Project(project(8, "").id)),
+        Stamp { seq: 5, by: peer },
+    );
+    theirs.seen.insert(peer, 5);
+    say(&conn, &settings_message(theirs)).await;
+    tokio::time::timeout(Duration::from_secs(2), editing)
+        .await
+        .expect("numbered once the listed peer's copy is in")
+        .unwrap()
+        .unwrap();
+    let settings = daemon.settings();
+    assert_eq!(project_named(&settings, 8).as_deref(), Some("newer"));
+    assert!(
+        settings.stamps[&StampKey::Setting(SettingKey::Project(project(7, "").id))].seq > 5,
+        "{settings:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_forwarded_edit_outlives_the_acting_machines_closed_links() {
+    let (old, sender) = (MachineId::random(), MachineId::random());
+    let fleet = Fleet::start_coordinated_with(1, &[old, sender]);
+    let daemon = &fleet.daemons[0];
+    let theirs = ordered_by(&daemon.settings(), old, vec![old, daemon.id, sender]);
+    let old_conn = drained(raw_link(daemon, old).await);
+    let sender_conn = drained(raw_link(daemon, sender).await);
+    say(&old_conn, &settings_message(theirs.clone())).await;
+    say(&sender_conn, &settings_message(theirs)).await;
+    let old_beat = beating(old_conn.clone());
+    let _sender_beat = beating(sender_conn.clone());
+    acting_becomes(&daemon.coordinator(), old, WAIT).await;
+
+    // The old coordinator's links close; it stays online here until it has been silent for
+    // the offline limit.
+    old_beat.abort();
+    drop(old_conn);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(daemon.coordinator().acting().await.unwrap(), old);
+    say(&sender_conn, &edit_message(set_project(7, "outlived"))).await;
+
+    let settings = holds_project(daemon, 7, OFFLINE_AFTER * 2).await;
+    assert_eq!(project_named(&settings, 7).as_deref(), Some("outlived"));
+    assert_eq!(
+        settings.stamps[&StampKey::Setting(SettingKey::Project(project(7, "").id))].by,
+        daemon.id
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -555,7 +765,7 @@ async fn a_returning_machine_numbers_nothing_until_it_has_every_online_machines_
         Some("from the peer")
     );
     assert_eq!(
-        settings.stamps[&SettingKey::Project(project(7, "").id)].seq,
+        settings.stamps[&StampKey::Setting(SettingKey::Project(project(7, "").id))].seq,
         settings.seq
     );
     assert!(settings.seq > 5);
@@ -605,7 +815,8 @@ async fn a_link_sends_the_settings_after_the_hello_and_again_when_they_change() 
     assert_eq!(first["type"], "settings", "{first}");
     assert_eq!(first["settings"]["seq"], 1);
 
-    // No coordinator reachable but this one: it acts, and numbers at once.
+    // The peer's copy is in, so this machine, which acts, numbers at once.
+    send(&conn, &settings_message(daemon.settings())).await;
     daemon
         .coordinator()
         .edit(set_project(7, "p"))

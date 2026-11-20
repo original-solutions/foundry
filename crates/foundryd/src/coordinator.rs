@@ -369,7 +369,7 @@ mod tests {
     use foundry_proto::ids::{MachineId, ProjectId};
     use foundry_proto::settings::{
         Edit, Limits, Machine, Overwritten, Project, SettingKey, SettingValue, SharedSettings,
-        Stamp,
+        Stamp, StampKey,
     };
 
     use super::*;
@@ -477,7 +477,7 @@ mod tests {
         assert_eq!(next.seq, 2);
         assert_eq!(next.seen, [(id(B), 2)].into());
         assert_eq!(
-            next.stamps[&SettingKey::Project(project(7, "p").id)],
+            next.stamps[&StampKey::Setting(SettingKey::Project(project(7, "p").id))],
             Stamp { seq: 2, by: id(B) }
         );
         assert_eq!(project_named(&next, 7).as_deref(), Some("p"));
@@ -492,7 +492,7 @@ mod tests {
         let next = numbered(&held, &Edit::RemoveProject { id: id7 }, id(A));
         assert_eq!(project_named(&next, 7), None);
         assert_eq!(
-            next.stamps[&SettingKey::Project(id7)],
+            next.stamps[&StampKey::Setting(SettingKey::Project(id7))],
             Stamp { seq: 3, by: id(A) }
         );
     }
@@ -542,7 +542,7 @@ mod tests {
             }
         );
         assert_eq!(
-            out.stamps[&SettingKey::Overwritten(Box::new(SettingKey::Project(id7)))],
+            out.stamps[&StampKey::Overwritten(SettingKey::Project(id7))],
             Stamp { seq: 3, by: id(B) }
         );
     }
