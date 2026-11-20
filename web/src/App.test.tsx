@@ -600,6 +600,21 @@ describe("App", () => {
     expect(tab().getAttribute("data-changed")).toBeNull();
   });
 
+  it("slides in a card when a session you are not looking at finishes its turn, and its Open goes there", async () => {
+    const router = await open("/terminals/t2", live);
+    const events = sockets("/api/events").at(-1)!;
+    act(() => events.deliver(JSON.stringify({ type: "record", protocol: 1, record: session(ME, "s1", "w1", "t1", "idle", { model: "sonnet", version: 2 }) })));
+    const news = screen.getByRole("article", { name: "fix login: sonnet finished its turn" });
+
+    fireEvent.click(within(news).getByRole("button", { name: "Open" }));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t1"));
+    expect(screen.queryByRole("article")).toBeNull();
+    // The session on screen raises no card.
+    act(() => events.deliver(JSON.stringify({ type: "record", protocol: 1, record: session(ME, "s1", "w1", "t1", "working", { model: "sonnet", version: 3 }) })));
+    act(() => events.deliver(JSON.stringify({ type: "record", protocol: 1, record: session(ME, "s1", "w1", "t1", "idle", { model: "sonnet", version: 4 }) })));
+    expect(screen.queryByRole("article")).toBeNull();
+  });
+
   it("drops the tab of a terminal that is gone, as when its workspace is archived", async () => {
     const router = await open("/terminals/t1", live);
     fireEvent.click(screen.getByRole("link", { name: /^shell/ }));

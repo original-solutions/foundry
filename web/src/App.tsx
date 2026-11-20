@@ -25,6 +25,7 @@ import { useFleet } from "./useFleet";
 import { AlertsButton, Announcer, useAlerts } from "./AlertsBell";
 import { KeySheet, useHelpKey } from "./KeySheet";
 import { Away } from "./Away";
+import { Toasts } from "./Toasts";
 
 /**
  * The sidebar, and the terminal the URL names (`/terminals/$terminalId`) under its header filling
@@ -356,6 +357,7 @@ function Layout() {
         <KeySheet open={keysOpen} onOpenChange={setKeysOpen} />
         <Announcer spoken={spoken} />
         <Away records={state.records} synced={state.synced} machines={machines} traced={traced} onOpen={show} />
+        <Toasts machines={machines} synced={state.synced} here={here} onScreen={pair ? [pair.left, pair.right] : terminalId ? [terminalId] : []} onOpen={show} />
         {sessionIn && <NewSession key={sessionIn.id} workspace={sessionIn.id} name={sessionIn.name} onClose={() => setSessionIn(undefined)} onStarted={setLanding} />}
       </div>
     </TerminalActions>
