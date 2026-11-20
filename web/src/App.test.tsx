@@ -44,11 +44,12 @@ vi.mock("@xterm/xterm", () => ({
 vi.mock("@xterm/addon-fit", () => ({ FitAddon: class { fit() {} } }));
 
 /**
- * Like `mockFetch`, but the board's reads of each workspace's changes get an empty answer, and the
- * reads of session briefs get `briefs`; both are left out of the calls, so a test sees only the
- * requests it makes.
+ * Like `mockFetch`, but the board's reads of each workspace's changes get an empty answer, the
+ * reads of session briefs get `briefs` and the reads of the attention list get `attention`; all
+ * are left out of the calls, so a test sees only the requests it makes.
  */
 let briefs: Briefs = {};
+let attention: unknown[] = [];
 
 function mockActions(...answers: Response[]): Call[] {
   const calls: Call[] = [];
@@ -57,6 +58,7 @@ function mockActions(...answers: Response[]): Call[] {
     vi.fn(async (url: string, init: RequestInit = {}) => {
       if (url.endsWith("/changes")) return json(200, { base: "main", commits: [], files: [] });
       if (url.endsWith("/api/briefs")) return json(200, briefs);
+      if (url.endsWith("/api/attention")) return json(200, { items: attention });
       calls.push({ url, method: init.method ?? "GET", body: init.body ? JSON.parse(String(init.body)) : undefined });
       const next = answers.shift();
       if (!next) throw new Error("unexpected request");
@@ -70,6 +72,7 @@ const sockets = (path: string) => FakeSocket.all.filter((s) => s.url.endsWith(pa
 
 beforeEach(() => {
   briefs = {};
+  attention = [];
   localStorage.clear();
   FakeSocket.install();
   vi.stubGlobal(
@@ -136,6 +139,24 @@ describe("App", () => {
     ],
     settings: settings(),
   };
+
+  it("shows the attention list over the layout", async () => {
+    attention = [
+      {
+        id: "session_waiting:s1",
+        kind: "session_waiting",
+        machine: ME,
+        machine_name: "this-mac",
+        what: "A session in fix login on this-mac is waiting for you",
+        todo: "Open its terminal and answer it",
+        terminal: "t1",
+      },
+    ];
+    mockActions();
+    await open("/", live);
+    const list = await screen.findByRole("region", { name: "Needs attention" });
+    expect(within(list).getByText("A session in fix login on this-mac is waiting for you")).toBeDefined();
+  });
 
   it("heads the open terminal with its workspace, its name, its machine and its state", async () => {
     await open("/terminals/t1", live);
