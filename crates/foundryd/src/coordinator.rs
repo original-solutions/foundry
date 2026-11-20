@@ -63,8 +63,9 @@ pub struct Coordinator {
     peers: Peers,
     /// The machines this one has taken a copy of the settings from, and when it last took one.
     /// Each link sends its copy before anything else, so a machine is in here by the time it
-    /// is heard from.
-    taken: Mutex<BTreeMap<MachineId, Instant>>,
+    /// is heard from. Written and read for a waiting edit under the store's lock, with the
+    /// settings, so a copy counted here is always in the settings read with it.
+    taken: Arc<Mutex<BTreeMap<MachineId, Instant>>>,
     /// When this machine started. Until every listed machine's copy is in, or
     /// [`OFFLINE_AFTER`] has passed, its own copy may be an old one.
     started: Instant,
@@ -79,7 +80,7 @@ impl Coordinator {
             me,
             store,
             peers,
-            taken: Mutex::new(BTreeMap::new()),
+            taken: Arc::new(Mutex::new(BTreeMap::new())),
             started: Instant::now(),
             last_forwarded: Mutex::new(None),
         }
@@ -105,17 +106,17 @@ impl Coordinator {
         peer: MachineId,
         settings: SharedSettings,
     ) -> Result<(), StoreError> {
+        let (taken, at) = (Arc::clone(&self.taken), Instant::now());
         on_store(&self.store, move |store| {
             let held = store.settings()?;
             let merged = merge(&held, &settings);
             if merged != held {
                 store.apply_settings(merged)?;
             }
-            Ok::<_, StoreError>(())
+            lock(&taken).insert(peer, at);
+            Ok(())
         })
-        .await?;
-        lock(&self.taken).insert(peer, Instant::now());
-        Ok(())
+        .await
     }
 
     /// Makes an edit `peer` forwarded, in the background, so the link that carried it goes on
@@ -154,32 +155,37 @@ impl Coordinator {
         edit: Edit,
     ) -> Result<(), CoordinatorError> {
         loop {
-            // Read before the settings: a copy is counted only once it is merged, so any copy
-            // counted here is in the settings read next, and the acting machine reflects it.
-            let sender_spoke = from.is_some_and(|from| self.heard_since(from, arrived));
-            let held = self.held().await?;
-            let acting = acting(&held.priority, &self.peers.online());
+            let (held, sender_spoke) = self.view(from, arrived).await?;
+            let online = self.peers.online();
             let waited = arrived.elapsed();
-            if acting == self.me {
-                if self.caught_up(&held) || waited >= OFFLINE_AFTER {
-                    return self.number(edit).await;
+            let caught_up = self.caught_up(&held, &online);
+            match next(
+                self.me,
+                from,
+                &held,
+                &online,
+                sender_spoke,
+                caught_up,
+                waited,
+            ) {
+                Next::Number => return self.number(edit).await,
+                Next::Send(acting) => {
+                    let message = PeerMessage::Edit {
+                        protocol: PROTOCOL,
+                        edit: edit.clone(),
+                    };
+                    if self.peers.send(acting, &message).await {
+                        return Ok(());
+                    }
+                    match from {
+                        None => return Err(CoordinatorError::NotLinked(acting)),
+                        Some(from) if waited >= KEEP_FORWARDED => {
+                            return Err(CoordinatorError::Unsettled { from, acting });
+                        }
+                        Some(_) => {}
+                    }
                 }
-            } else if Some(acting) != from || waited >= OFFLINE_AFTER || sender_spoke {
-                let message = PeerMessage::Edit {
-                    protocol: PROTOCOL,
-                    edit: edit.clone(),
-                };
-                if self.peers.send(acting, &message).await {
-                    return Ok(());
-                }
-                if from.is_none() {
-                    return Err(CoordinatorError::NotLinked(acting));
-                }
-            }
-            if let Some(from) = from
-                && waited >= KEEP_FORWARDED
-            {
-                return Err(CoordinatorError::Unsettled { from, acting });
+                Next::Wait => {}
             }
             tokio::time::sleep(STEP).await;
         }
@@ -196,11 +202,24 @@ impl Coordinator {
         .await
     }
 
-    /// Whether a copy of the settings was taken from `peer` after `at`.
-    fn heard_since(&self, peer: MachineId, at: Instant) -> bool {
-        lock(&self.taken)
-            .get(&peer)
-            .is_some_and(|taken| *taken > at)
+    /// The settings held, and whether a copy of them was taken from `from` after `arrived`,
+    /// read together under the store's lock: a copy counted is in the settings returned.
+    async fn view(
+        &self,
+        from: Option<MachineId>,
+        arrived: Instant,
+    ) -> Result<(SharedSettings, bool), StoreError> {
+        let taken = Arc::clone(&self.taken);
+        on_store(&self.store, move |store| {
+            let held = store.settings()?;
+            let spoke = from.is_some_and(|from| {
+                lock(&taken)
+                    .get(&from)
+                    .is_some_and(|taken| *taken > arrived)
+            });
+            Ok((held, spoke))
+        })
+        .await
     }
 
     async fn held(&self) -> Result<SharedSettings, StoreError> {
@@ -210,10 +229,10 @@ impl Coordinator {
     /// Whether this machine holds what it needs to number: a copy from every other machine it
     /// can reach, and, in its first [`OFFLINE_AFTER`], from every machine `held` lists, so a
     /// machine that has just started and hears from no one yet does not number on an old copy.
-    fn caught_up(&self, held: &SharedSettings) -> bool {
+    fn caught_up(&self, held: &SharedSettings, online: &BTreeSet<MachineId>) -> bool {
         let taken = lock(&self.taken);
         let has = |id: &MachineId| *id == self.me || taken.contains_key(id);
-        let reachable = self.peers.online().iter().all(has);
+        let reachable = online.iter().all(has);
         let listed = held.machines.iter().all(|m| has(&m.id));
         reachable && (listed || self.started.elapsed() >= OFFLINE_AFTER)
     }
@@ -221,6 +240,49 @@ impl Coordinator {
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// What a waiting edit does next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Next {
+    /// Take the next number here.
+    Number,
+    /// Go to this machine, which acts.
+    Send(MachineId),
+    /// Look again in a [`STEP`].
+    Wait,
+}
+
+/// What an edit on machine `me` does next, from one view: `held`, and `sender_spoke`, whether
+/// a copy was taken from `from` (the machine that forwarded it, `None` for `me`'s own) after
+/// the edit arrived, read together; `online`, who `me` can reach; `caught_up`, whether `me`
+/// holds every copy it needs; `waited`, how long since the edit arrived.
+///
+/// The acting machine numbers once caught up or after [`OFFLINE_AFTER`]. Any other machine
+/// sends the edit to the acting one, except to the machine that forwarded it: the two may
+/// still disagree on who acts, so it goes back only once a copy from that machine, taken
+/// since the edit arrived, still leaves it acting, or after [`OFFLINE_AFTER`].
+fn next(
+    me: MachineId,
+    from: Option<MachineId>,
+    held: &SharedSettings,
+    online: &BTreeSet<MachineId>,
+    sender_spoke: bool,
+    caught_up: bool,
+    waited: Duration,
+) -> Next {
+    let acting = acting(&held.priority, online);
+    if acting == me {
+        if caught_up || waited >= OFFLINE_AFTER {
+            Next::Number
+        } else {
+            Next::Wait
+        }
+    } else if Some(acting) != from || sender_spoke || waited >= OFFLINE_AFTER {
+        Next::Send(acting)
+    } else {
+        Next::Wait
+    }
 }
 
 /// The machine that holds the coordinator role: the first in `priority` that is in
