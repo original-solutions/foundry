@@ -18,9 +18,10 @@
 //! - `POST /api/placements/{id}/cancel`: `204`, and the request is never placed. One being
 //!   placed now is `409`; an id this machine holds no request for is `404`.
 //!
-//! A create sent to a machine counts as one more session on it, in every pick, until a sample
-//! written after that session arrives, so its limits hold before its samples catch up. A
-//! create that failed counts for nothing. A machine that cannot take the call (offline, older,
+//! A create sent to a machine counts as one more session on it, in every pick, until the
+//! second sample newer than its session arrives (the first may have been written before the
+//! session started), so its limits hold before its samples catch up. A create that failed, or
+//! whose request went away mid-create, counts for nothing. A machine that cannot take the call (offline, older,
 //! its link down) is passed over until its next sample, with that reason, and the next roomiest
 //! is tried; a call that may have run there is never sent anywhere else.
 //!
@@ -46,7 +47,7 @@ use uuid::Uuid;
 
 use crate::api::{self, Api};
 use crate::attention::{Fleet, Item, Kind, Source};
-use crate::machine::{self, Over, SAMPLE_EVERY, over_limits};
+use crate::machine::{self, Over, over_limits};
 use crate::store::{Store, StoreError};
 use crate::sync::call::CallError;
 use crate::sync::{lock, on_store};
@@ -268,14 +269,45 @@ struct Bench {
 }
 
 /// A create sent to `machine` whose session its samples do not count yet. Each pick counts it
-/// as one more session on that machine, until a sample that counts it arrives: one newer than
-/// the version held once the session was made, read at least [`SAMPLE_EVERY`] after that.
+/// as one more session on that machine, until the second sample newer than the version held
+/// once it was kept: the first may have been written before its session started.
 struct Pending {
     id: Uuid,
     machine: MachineId,
-    /// The version held from `machine` once the session was made, and when; `None` while the
-    /// create is in flight.
-    counted_after: Option<(u64, Instant)>,
+    /// The newest version of `machine` known not to count the session; `None` while the create
+    /// is in flight.
+    counted_after: Option<u64>,
+    /// Whether one newer sample has been seen since it was kept.
+    rearmed: bool,
+}
+
+type Pendings = Arc<Mutex<Vec<Pending>>>;
+
+/// A create's claim on a session of the machine picked for it. Dropped without being kept (its
+/// create failed, or the request that made it went away mid-create), it counts no more.
+pub(crate) struct Reservation {
+    pendings: Pendings,
+    id: Uuid,
+    kept: bool,
+}
+
+impl Reservation {
+    /// Keeps counting the session until the second sample of its machine newer than `held`,
+    /// the version held once it was made.
+    pub(crate) fn keep_until(mut self, held: u64) {
+        if let Some(p) = lock(&self.pendings).iter_mut().find(|p| p.id == self.id) {
+            p.counted_after = Some(held);
+        }
+        self.kept = true;
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        if !self.kept {
+            lock(&self.pendings).retain(|p| p.id != self.id);
+        }
+    }
 }
 
 /// What a pick reads: each machine's newest sample, the settings and who is online.
@@ -307,7 +339,7 @@ pub(crate) struct Sent {
     pub answer: Result<(StatusCode, serde_json::Value), CallError>,
     /// The session it brings, counted against the machine until
     /// [`settle`](Queue::settle) says whether it was made.
-    pub pending: Uuid,
+    pub pending: Reservation,
 }
 
 /// What a reason says of a machine that refused a call before it was sent, or `None` when the
@@ -329,7 +361,7 @@ pub struct Queue {
     requests: Mutex<Vec<Request>>,
     samples: Arc<Mutex<Samples>>,
     benched: Mutex<BTreeMap<MachineId, Bench>>,
-    pending: Mutex<Vec<Pending>>,
+    pending: Pendings,
 }
 
 impl Queue {
@@ -339,7 +371,7 @@ impl Queue {
             requests: Mutex::default(),
             samples: Arc::default(),
             benched: Mutex::default(),
-            pending: Mutex::default(),
+            pending: Arc::default(),
         }
     }
 
@@ -369,7 +401,6 @@ impl Queue {
             };
             if !claimed {
                 if !claim() {
-                    lock(&self.pending).retain(|p| p.id != pending);
                     return Ok(Err(Vec::new()));
                 }
                 claimed = true;
@@ -384,7 +415,7 @@ impl Queue {
                     pending,
                 }));
             };
-            lock(&self.pending).retain(|p| p.id != pending);
+            drop(pending);
             let version = view.newest(machine).map_or(0, |s| s.version);
             lock(&self.benched).insert(machine, Bench { version, why });
         }
@@ -398,20 +429,14 @@ impl Queue {
         &self,
         view: &View,
         tried: &BTreeSet<MachineId>,
-    ) -> Result<(MachineId, Uuid), Vec<String>> {
+    ) -> Result<(MachineId, Reservation), Vec<String>> {
         let mut benched = lock(&self.benched);
         benched.retain(|machine, bench| {
             view.newest(*machine)
                 .is_some_and(|s| s.version <= bench.version)
         });
         let mut pending = lock(&self.pending);
-        pending.retain(|p| match p.counted_after {
-            Some((version, at)) => {
-                at.elapsed() < SAMPLE_EVERY
-                    || view.newest(p.machine).is_none_or(|s| s.version <= version)
-            }
-            None => true,
-        });
+        age(&mut pending, view);
         let candidates: Vec<Record<MachineSample>> = view
             .samples
             .iter()
@@ -433,8 +458,14 @@ impl Queue {
                     id,
                     machine,
                     counted_after: None,
+                    rearmed: false,
                 });
-                Ok((machine, id))
+                let reservation = Reservation {
+                    pendings: Arc::clone(&self.pending),
+                    id,
+                    kept: false,
+                };
+                Ok((machine, reservation))
             }
             Err(reasons) => {
                 let benched = benched
@@ -449,12 +480,30 @@ impl Queue {
         }
     }
 
-    /// Ends pending create `pending` on `machine`: when it `made` a session, or one is about to
-    /// be started in it, the session counts until a sample that counts it; otherwise it is
-    /// dropped at once.
-    pub(crate) async fn settle(&self, api: &Api, machine: MachineId, pending: Uuid, made: bool) {
+    /// Whether any create still counts as a session on its machine.
+    fn counting(&self) -> bool {
+        !lock(&self.pending).is_empty()
+    }
+
+    /// Reads the samples and lets each kept create see the newest of its machine's, so every
+    /// sample is seen while creates count, not only those a pick happens to read.
+    async fn watch(&self, api: &Api) -> Result<(), StoreError> {
+        let view = self.view(api).await?;
+        age(&mut lock(&self.pending), &view);
+        Ok(())
+    }
+
+    /// Ends the create `pending` reserved on `machine`: when it `made` a session, or one is
+    /// about to be started in it, the session counts until samples count it; otherwise it
+    /// counts no more.
+    pub(crate) async fn settle(
+        &self,
+        api: &Api,
+        machine: MachineId,
+        pending: Reservation,
+        made: bool,
+    ) {
         if !made {
-            lock(&self.pending).retain(|p| p.id != pending);
             return;
         }
         let held = on_store(&api.store, |store| store.versions())
@@ -462,9 +511,7 @@ impl Queue {
             .ok()
             .and_then(|versions| versions.get(&machine).copied())
             .unwrap_or(0);
-        if let Some(p) = lock(&self.pending).iter_mut().find(|p| p.id == pending) {
-            p.counted_after = Some((held, Instant::now()));
-        }
+        pending.keep_until(held);
     }
 
     /// What to warn of when a person names `machine` for a workspace: each limit its newest
@@ -671,8 +718,13 @@ impl Queue {
             let outcome = match sent {
                 Err(reasons) => Outcome::Wait(Some(reasons)),
                 Ok(sent) => {
-                    let (machine, pending) = (sent.machine, sent.pending);
-                    let outcome = start(api, &want, sent).await;
+                    let Sent {
+                        machine,
+                        name,
+                        answer,
+                        pending,
+                    } = sent;
+                    let outcome = start(api, &want, machine, &name, answer).await;
                     let placed = matches!(outcome, Outcome::Placed);
                     self.settle(api, machine, pending, placed).await;
                     if placed {
@@ -687,14 +739,36 @@ impl Queue {
     }
 }
 
-/// Starts `want`'s session in the workspace `sent` made, or says why it was not placed.
-async fn start(api: &Api, want: &Want, sent: Sent) -> Outcome {
-    let Sent {
-        machine,
-        name,
-        answer,
-        ..
-    } = sent;
+/// Stops counting each kept create whose machine has sent a second sample since it was kept;
+/// on the first, notes it.
+fn age(pending: &mut Vec<Pending>, view: &View) {
+    pending.retain_mut(|p| {
+        let Some(after) = p.counted_after else {
+            return true;
+        };
+        match view.newest(p.machine) {
+            Some(newest) if newest.version > after => {
+                if p.rearmed {
+                    return false;
+                }
+                p.counted_after = Some(newest.version);
+                p.rearmed = true;
+                true
+            }
+            _ => true,
+        }
+    });
+}
+
+/// Starts `want`'s session in the workspace the create sent to `machine`, named `name`, made,
+/// as `answer` says, or says why it was not placed.
+async fn start(
+    api: &Api,
+    want: &Want,
+    machine: MachineId,
+    name: &str,
+    answer: Result<(StatusCode, serde_json::Value), CallError>,
+) -> Outcome {
     let made = match answer {
         Ok((StatusCode::CREATED, made)) => made,
         Ok((_, refused)) => {
@@ -771,17 +845,22 @@ impl Source for Queue {
     }
 }
 
-/// Tries the waiting requests every [`RETRY_EVERY`] for as long as the daemon runs.
+/// Tries the waiting requests every [`RETRY_EVERY`] for as long as the daemon runs, and while
+/// none waits but creates still count, reads the samples that age them.
 pub async fn run(api: Api) {
     let queue = Arc::clone(&api.placements);
     let mut every = tokio::time::interval(RETRY_EVERY);
     every.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         every.tick().await;
-        if queue.waiting().is_empty() {
+        let tried = if !queue.waiting().is_empty() {
+            queue.retry(&api).await
+        } else if queue.counting() {
+            queue.watch(&api).await
+        } else {
             continue;
-        }
-        if let Err(error) = queue.retry(&api).await {
+        };
+        if let Err(error) = tried {
             tracing::warn!("placement: the waiting requests were not tried: {error}");
         }
     }

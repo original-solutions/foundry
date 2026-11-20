@@ -3139,11 +3139,13 @@ async fn a_machine_with_no_limits_takes_every_choose_and_a_create_it_refuses_hol
         assert_eq!(reply.status, status, "{name}: {}", reply.body);
         assert_eq!(reply.json()["machine"], serde_json::json!(daemon.me));
     }
-    // With room for two sessions, the refused create takes neither.
+    // With room for two sessions, the refused create takes neither. Two samples, each seen,
+    // stop the three made above counting.
     daemon.limit(daemon.me, 2, 1.0);
-    daemon.sample(daemon.me, 0, 0.1);
-    daemon.sample(daemon.me, 0, 0.1);
-    daemon.sample(daemon.me, 0, 0.1);
+    for _ in 0..2 {
+        daemon.sample(daemon.me, 0, 0.1);
+        tokio::time::sleep(crate::placement::RETRY_EVERY * 2).await;
+    }
     for (name, status) in [("four", 201), ("four", 409), ("five", 201)] {
         let reply = daemon
             .call("POST", "/api/workspaces", Some(choose(project, name)))
