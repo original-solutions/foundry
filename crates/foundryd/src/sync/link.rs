@@ -27,12 +27,13 @@ const WARN_EVERY: Duration = Duration::from_secs(60);
 /// Runs a link until it closes, the peer is silent for [`OFFLINE_AFTER`], the peer is not (or
 /// is no longer) in the machine list, or the peer takes nothing for [`OFFLINE_AFTER`].
 /// `dialed` is the machine this end dialed, or `None` for a link a peer opened. `first` is the
-/// peer's first message when the caller has already read it, so the hello is not read again.
+/// peer's first message when the caller has already read and parsed it, so the hello is
+/// neither read nor parsed again.
 pub(super) async fn run(
     inner: &Inner,
     conn: Conn,
     dialed: Option<MachineId>,
-    first: Option<String>,
+    first: Option<PeerMessage>,
 ) {
     let Conn { send, mut recv } = conn;
     let Some(open) = hello(inner, &send, &mut recv, dialed, first).await else {
@@ -182,22 +183,25 @@ async fn hello(
     send: &Sender<String>,
     recv: &mut Receiver<String>,
     dialed: Option<MachineId>,
-    first: Option<String>,
+    first: Option<PeerMessage>,
 ) -> Option<Open> {
     if dialed.is_some() && !send_message(send, &own_hello(inner, PROTOCOL).await?).await {
         return None;
     }
-    let text = match first {
-        Some(text) => text,
-        None => timeout_at(Instant::now() + OFFLINE_AFTER, recv.recv())
-            .await
-            .ok()??,
+    let first = match first {
+        Some(message) => Some(message),
+        None => {
+            let text = timeout_at(Instant::now() + OFFLINE_AFTER, recv.recv())
+                .await
+                .ok()??;
+            serde_json::from_str(&text).ok()
+        }
     };
-    let Ok(PeerMessage::Hello {
+    let Some(PeerMessage::Hello {
         protocol,
         machine,
         versions,
-    }) = serde_json::from_str(&text)
+    }) = first
     else {
         tracing::warn!("sync: a link opened without a hello");
         return None;
