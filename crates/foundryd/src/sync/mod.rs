@@ -19,8 +19,13 @@
 //! only one of them can reach the other. The second copy of a record is stale and changes
 //! nothing.
 //!
-//! A link trusts the machine id its peer names in the hello, checked only against the machine
-//! list. Proving that id with a machine key belongs to joining (task 13).
+//! A link trusts the machine id its peer names in its first message, a hello or a relay,
+//! checked only against the machine list. Proving that id with a machine key belongs to
+//! joining (task 13): the daemon serves every peer link through `join::Keys::accept`.
+//!
+//! A link that opens with a [`PeerMessage::Relay`] in place of a hello carries one of this
+//! machine's terminals to the peer, not records ([`relay`]). That is shell access on this
+//! machine, so a link that has not passed `join::Keys::accept` must never reach it.
 //!
 //! Sending stops at the highest version sent, so a machine's own records must be stored in
 //! the order of their versions: a writer takes [`Store::own_next_version`] and applies the
@@ -32,6 +37,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use foundry_proto::ids::MachineId;
+use foundry_proto::messages::PeerMessage;
 use foundry_proto::record::AnyRecord;
 use foundry_proto::settings::Machine;
 use foundry_proto::state::{SessionState, TerminalState};
@@ -41,6 +47,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::store::{Store, StoreError};
+use crate::terminals::Terminals;
 
 mod link;
 pub mod relay;
@@ -112,6 +119,8 @@ struct Inner {
     store: Arc<Mutex<Store>>,
     dialer: Arc<dyn Dialer>,
     heard: Mutex<BTreeMap<MachineId, Instant>>,
+    /// The terminals a relay serves to peers; none until [`Peers::serve_terminals`].
+    terminals: Mutex<Option<Arc<Terminals>>>,
 }
 
 impl Peers {
@@ -122,6 +131,7 @@ impl Peers {
                 store,
                 dialer,
                 heard: Mutex::new(BTreeMap::new()),
+                terminals: Mutex::new(None),
             }),
         }
     }
@@ -157,9 +167,27 @@ impl Peers {
         }
     }
 
-    /// Serves a link a peer opened, until it ends.
+    /// Serves a link a peer opened, until it ends. A link that opens with a
+    /// [`PeerMessage::Relay`] goes to the relay; every other link carries records.
     pub async fn accept(&self, conn: Conn) {
-        link::run(&self.inner, conn, None).await;
+        let Conn { send, mut recv } = conn;
+        let Ok(Some(first)) = tokio::time::timeout(OFFLINE_AFTER, recv.recv()).await else {
+            return;
+        };
+        if let Ok(PeerMessage::Relay {
+            machine, terminal, ..
+        }) = serde_json::from_str(&first)
+        {
+            return relay::serve(&self.inner, machine, terminal, Conn { send, recv }).await;
+        }
+        // The record link takes the first message as its hello.
+        link::run(&self.inner, Conn { send, recv }, None, Some(first)).await;
+    }
+
+    /// Serves `terminals` to peers that open a relay to one of them. Until this is called, a
+    /// relay is closed with the reason.
+    pub fn serve_terminals(&self, terminals: Arc<Terminals>) {
+        *lock(&self.inner.terminals) = Some(terminals);
     }
 
     /// The machines heard from within [`OFFLINE_AFTER`], and this machine.
@@ -200,7 +228,7 @@ impl Peers {
     async fn dial_forever(self, peer: Machine) {
         loop {
             match tokio::time::timeout(DIAL_TIMEOUT, self.inner.dialer.dial(&peer)).await {
-                Ok(Ok(conn)) => link::run(&self.inner, conn, Some(peer.id)).await,
+                Ok(Ok(conn)) => link::run(&self.inner, conn, Some(peer.id), None).await,
                 Ok(Err(error)) => tracing::debug!("sync: cannot reach {}: {error}", peer.name),
                 Err(_) => tracing::debug!("sync: dialing {} timed out", peer.name),
             }

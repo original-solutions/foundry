@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::MachineId;
+use crate::ids::{MachineId, TerminalId};
 use crate::record::AnyRecord;
 use crate::settings::SharedSettings;
 
@@ -31,6 +31,13 @@ pub enum PeerMessage {
         protocol: u16,
         settings: SharedSettings,
     },
+    /// Opens a link, in place of a hello, that carries one of the receiver's terminals to the
+    /// sender: who is speaking and which terminal.
+    Relay {
+        protocol: u16,
+        machine: MachineId,
+        terminal: TerminalId,
+    },
 }
 
 impl PeerMessage {
@@ -38,7 +45,8 @@ impl PeerMessage {
         match self {
             Self::Hello { protocol, .. }
             | Self::Records { protocol, .. }
-            | Self::Settings { protocol, .. } => *protocol,
+            | Self::Settings { protocol, .. }
+            | Self::Relay { protocol, .. } => *protocol,
         }
     }
 }
@@ -102,6 +110,11 @@ mod tests {
             PeerMessage::Settings {
                 protocol: PROTOCOL,
                 settings: settings(),
+            },
+            PeerMessage::Relay {
+                protocol: PROTOCOL,
+                machine: MachineId::random(),
+                terminal: TerminalId::random(),
             },
         ]
     }
@@ -177,6 +190,7 @@ mod tests {
         );
         let record: AnyRecord = serde_json::from_str(&sample).unwrap();
         let id = MachineId(machine.parse().unwrap());
+        let terminal = "1b4e28ba-2fa1-11d2-883f-0016d3cca427";
         let peer = [
             (
                 format!(
@@ -200,6 +214,16 @@ mod tests {
                 PeerMessage::Settings {
                     protocol: 1,
                     settings: SharedSettings::default(),
+                },
+            ),
+            (
+                format!(
+                    r#"{{"type":"relay","protocol":1,"machine":"{machine}","terminal":"{terminal}"}}"#
+                ),
+                PeerMessage::Relay {
+                    protocol: 1,
+                    machine: id,
+                    terminal: TerminalId(terminal.parse().unwrap()),
                 },
             ),
         ];

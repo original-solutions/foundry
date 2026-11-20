@@ -44,9 +44,10 @@ impl Dialer for WsDialer {
     }
 }
 
-/// The route that serves links peers open to this machine. A link names its machine in the
-/// hello and nothing proves it: the daemon mounts [`keyed_router`] instead, and this one is for
-/// tests and for an address only fleet machines can reach.
+/// The route that serves links peers open to this machine. A link names its machine in its
+/// first message and nothing proves it, and a link that opens with a relay gets this machine's
+/// terminals: shell access. The daemon mounts [`keyed_router`] instead; this one is for tests
+/// only.
 pub fn router(peers: Peers) -> Router {
     Router::new()
         .route(PEER_PATH, get(upgrade))
