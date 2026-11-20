@@ -1542,3 +1542,277 @@ async fn an_archive_stopped_by_a_terminal_that_will_not_close_keeps_the_workspac
     assert!(!worktree.exists());
     assert!(setup.terminals_of(id).iter().all(|t| t.deleted));
 }
+
+impl Setup {
+    /// What a create that died after `git worktree add` and before its record leaves: a branch
+    /// `branch` at `main` and its worktree, with no workspace record.
+    async fn leftover(&self, remote: &Remote, branch: &str) -> PathBuf {
+        let repo = remote.bare.to_string_lossy().into_owned();
+        let clone = self
+            .workspaces
+            .inner
+            .clone_for(remote.project, &repo)
+            .await
+            .unwrap();
+        git(&clone, &["fetch", "-q", "origin"]);
+        git(
+            &clone,
+            &[
+                "branch",
+                "-q",
+                "--no-track",
+                branch,
+                "refs/remotes/origin/main",
+            ],
+        );
+        let worktree = self.worktree(remote.project, branch);
+        git(
+            &clone,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--",
+                worktree.to_str().unwrap(),
+                branch,
+            ],
+        );
+        worktree
+    }
+
+    /// The worktrees git lists for the project's clone.
+    fn listed(&self, project: ProjectId) -> String {
+        git(
+            &self.clone_of(project),
+            &["worktree", "list", "--porcelain"],
+        )
+    }
+
+    /// The commit `refs/heads/<branch>` names in the project's clone.
+    fn branch_at(&self, project: ProjectId, branch: &str) -> String {
+        let reference = format!("refs/heads/{branch}");
+        git(
+            &self.clone_of(project),
+            &["rev-parse", "--verify", &reference],
+        )
+    }
+}
+
+/// Every tracing event this thread writes until the guard drops, as text.
+fn logs() -> (tracing::subscriber::DefaultGuard, Arc<Mutex<Vec<u8>>>) {
+    struct Writer(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Writer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let writer = buffer.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(move || Writer(writer.clone()))
+        .finish();
+    (tracing::subscriber::set_default(subscriber), buffer)
+}
+
+fn text_of(buffer: &Arc<Mutex<Vec<u8>>>) -> String {
+    String::from_utf8_lossy(&buffer.lock().unwrap()).into_owned()
+}
+
+#[tokio::test]
+async fn sweep_removes_a_leftover_worktree_with_no_work_and_keeps_its_branch() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let worktree = setup.leftover(&remote, "crashed").await;
+    let start = setup.branch_at(remote.project, "crashed");
+
+    setup.workspaces.sweep().await.unwrap();
+
+    assert!(!worktree.exists());
+    assert!(
+        !setup.listed(remote.project).contains("/crashed\n"),
+        "{}",
+        setup.listed(remote.project)
+    );
+    assert_eq!(setup.branch_at(remote.project, "crashed"), start);
+    // The name is free again.
+    setup.create(&remote, "main", "crashed-again").await;
+}
+
+#[tokio::test]
+async fn sweep_keeps_a_leftover_with_an_uncommitted_file_and_logs_its_path_and_the_file() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let worktree = setup.leftover(&remote, "half-done").await;
+    std::fs::write(worktree.join("draft.txt"), "mine").unwrap();
+    let (_guard, logs) = logs();
+
+    setup.workspaces.sweep().await.unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("draft.txt")).unwrap(),
+        "mine"
+    );
+    let text = text_of(&logs);
+    let line = text
+        .lines()
+        .find(|l| l.contains("draft.txt"))
+        .unwrap_or_else(|| panic!("no line names draft.txt: {text}"));
+    assert!(line.contains("WARN"), "{line}");
+    assert!(
+        line.contains(&format!("{}/half-done", remote.project)),
+        "{line}"
+    );
+}
+
+#[tokio::test]
+async fn sweep_keeps_a_leftover_with_an_unpushed_commit_on_its_branch_or_a_detached_head() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let ahead = setup.leftover(&remote, "ahead").await;
+    git(
+        &ahead,
+        &["commit", "-q", "--allow-empty", "-m", "only here"],
+    );
+    let detached = setup.leftover(&remote, "detached").await;
+    git(&detached, &["checkout", "-q", "--detach"]);
+    git(
+        &detached,
+        &["commit", "-q", "--allow-empty", "-m", "off the branch"],
+    );
+    let (_guard, logs) = logs();
+
+    setup.workspaces.sweep().await.unwrap();
+
+    assert!(ahead.exists());
+    assert!(detached.exists());
+    let text = text_of(&logs);
+    for unpushed in ["only here", "off the branch"] {
+        assert!(text.contains(unpushed), "{text}");
+    }
+}
+
+#[tokio::test]
+async fn sweep_leaves_a_live_workspace_and_counts_an_archived_record_as_none() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let live = setup.create(&remote, "main", "live").await;
+    let live_worktree = setup.worktree(remote.project, "live");
+    let archived = setup.create(&remote, "main", "archived").await;
+    let archived_worktree = setup.worktree(remote.project, "archived");
+    // The record says archived, but the worktree is still there.
+    let body = setup.body(archived);
+    setup.workspaces.inner.write(body, true).await.unwrap();
+
+    setup.workspaces.sweep().await.unwrap();
+
+    assert!(live_worktree.exists());
+    assert!(!setup.record(live).unwrap().deleted);
+    assert_eq!(
+        setup.workspaces.worktree(live).await.unwrap(),
+        live_worktree
+    );
+    assert!(!archived_worktree.exists());
+    setup.branch_at(remote.project, "archived");
+}
+
+#[tokio::test]
+async fn sweep_leaves_a_live_workspace_found_only_by_its_folder() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    // Every character a letter, so safe_branch keeps the decomposed form; git on macOS keeps
+    // the composed one for the same folder. Renamed, the branch no longer matches the record.
+    let name = "\u{1112}\u{1161}\u{11ab}";
+    let id = setup.create(&remote, "main", name).await;
+    let worktree = setup.workspaces.worktree(id).await.unwrap();
+    git(&worktree, &["branch", "-m", "renamed"]);
+    let other = setup.create(&remote, "main", "Fix").await;
+    let other_worktree = setup.workspaces.worktree(other).await.unwrap();
+    git(&other_worktree, &["branch", "-m", "renamed-too"]);
+
+    setup.workspaces.sweep().await.unwrap();
+
+    assert!(worktree.exists());
+    assert!(other_worktree.exists());
+}
+
+#[tokio::test]
+async fn sweep_never_touches_a_branch_with_no_worktree() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup.create(&remote, "main", "kept").await;
+    let worktree = setup.worktree(remote.project, "kept");
+    git(
+        &worktree,
+        &["commit", "-q", "--allow-empty", "-m", "unpushed"],
+    );
+    setup.workspaces.archive(id, true).await.unwrap();
+    let kept = setup.branch_at(remote.project, "kept");
+
+    setup.workspaces.sweep().await.unwrap();
+
+    assert_eq!(setup.branch_at(remote.project, "kept"), kept);
+}
+
+#[tokio::test]
+async fn sweep_with_no_clones_or_a_clone_with_no_worktrees_does_nothing() {
+    let setup = Setup::new();
+    setup.workspaces.sweep().await.unwrap();
+    assert!(!setup.clones().exists());
+
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let repo = remote.bare.to_string_lossy().into_owned();
+    let clone = setup
+        .workspaces
+        .inner
+        .clone_for(remote.project, &repo)
+        .await
+        .unwrap();
+    // A clone stopped half way, and a folder that is not a clone, are passed over.
+    std::fs::create_dir_all(
+        setup
+            .clones()
+            .join(format!("{}.partial", ProjectId::random())),
+    )
+    .unwrap();
+    std::fs::create_dir_all(setup.clones().join("not-a-project.git")).unwrap();
+    let before = names_in(&setup.clones());
+
+    setup.workspaces.sweep().await.unwrap();
+
+    assert!(clone.exists());
+    assert_eq!(names_in(&setup.clones()), before);
+}
+
+#[tokio::test]
+async fn sweep_forgets_a_leftover_whose_folder_is_gone_only_when_its_head_is_pushed() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let pushed = setup.leftover(&remote, "pushed-gone").await;
+    std::fs::remove_dir_all(&pushed).unwrap();
+    let unpushed = setup.leftover(&remote, "unpushed-gone").await;
+    git(&unpushed, &["checkout", "-q", "--detach"]);
+    git(
+        &unpushed,
+        &["commit", "-q", "--allow-empty", "-m", "only on the head"],
+    );
+    std::fs::remove_dir_all(&unpushed).unwrap();
+    let (_guard, logs) = logs();
+
+    setup.workspaces.sweep().await.unwrap();
+
+    let listed = setup.listed(remote.project);
+    assert!(!listed.contains("/pushed-gone\n"), "{listed}");
+    assert!(listed.contains("/unpushed-gone\n"), "{listed}");
+    setup.branch_at(remote.project, "pushed-gone");
+    let text = text_of(&logs);
+    let line = text
+        .lines()
+        .find(|l| l.contains("unpushed-gone"))
+        .unwrap_or_else(|| panic!("no line names unpushed-gone: {text}"));
+    assert!(line.contains("only on the head"), "{line}");
+}
