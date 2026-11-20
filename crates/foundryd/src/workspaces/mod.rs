@@ -28,12 +28,20 @@
 //! so git can give back all of it, keeping its branch, and leaves and logs any other. It stops at
 //! one deadline, and what it did not reach waits for the next start.
 //!
+//! A start of a shell or session in a workspace goes through [`Workspaces::start_in`], which
+//! holds the workspace's lifecycle lock for its whole work, as an archive does. So a start never
+//! lands between an archive's listing of the workspace's terminals and its delete: it runs
+//! before the archive, whose close then takes its terminal, or after it, and finds the workspace
+//! gone. The lock is per workspace, apart from the per-project lock, which a create holds across
+//! its setup's start: a start must not wait for a fetch of another workspace of the project.
+//!
 //! Every branch is made by [`safe_branch`] and every path reaches git after `--`, so a name as
 //! typed never reads as an option and never leaves the project's folder of worktrees.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fmt;
+use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -203,6 +211,9 @@ struct Inner {
     git_within: Duration,
     /// One lock per project, held across every step that changes its clone or worktrees.
     projects: Mutex<HashMap<ProjectId, Arc<tokio::sync::Mutex<()>>>>,
+    /// One lock per workspace, held by an archive and by a start for their whole work
+    /// ([`Workspaces::locked`]). A workspace no one holds or waits for has none.
+    lifecycle: Mutex<HashMap<WorkspaceId, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl Workspaces {
@@ -234,6 +245,7 @@ impl Workspaces {
                 data,
                 git_within,
                 projects: Mutex::default(),
+                lifecycle: Mutex::default(),
             }),
         }
     }
@@ -257,16 +269,71 @@ impl Workspaces {
     /// `force`, refuses with [`WorkspaceError::Dirty`] while there is uncommitted or unpushed
     /// work or a checked-out submodule, and changes nothing. Work that appears while the terminals close is refused with
     /// [`WorkspaceError::Dirty`] too, and then the terminals are already closed. The archive
-    /// finishes even when the caller stops waiting.
+    /// finishes even when the caller stops waiting, and holds the workspace's lifecycle lock
+    /// throughout, so no [`Workspaces::start_in`] runs beside it.
     pub async fn archive(&self, id: WorkspaceId, force: bool) -> Result<(), WorkspaceError> {
         let inner = self.inner.clone();
-        tokio::spawn(async move { inner.archive(id, force).await }).await?
+        self.locked(id, async move { inner.archive(id, force).await })
+            .await
+    }
+
+    /// Runs `start` with the worktree of live workspace `id`, to start a shell or session in it,
+    /// holding the workspace's lifecycle lock for the whole start, so it never lands while the
+    /// workspace is archived. A start queued behind an archive finds the workspace gone:
+    /// [`WorkspaceError::Unknown`]. The start finishes even when the caller stops waiting.
+    pub async fn start_in<T, E, F, Fut>(&self, id: WorkspaceId, start: F) -> Result<T, E>
+    where
+        F: FnOnce(PathBuf) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, E>> + Send + 'static,
+        T: Send + 'static,
+        E: From<WorkspaceError> + Send + 'static,
+    {
+        let inner = self.inner.clone();
+        self.locked(id, async move {
+            let body = inner.live(id).await?;
+            start(inner.worktree(body.project, &body.branch)).await
+        })
+        .await
     }
 
     /// The folder of a live workspace's worktree, where its terminals start.
     pub async fn worktree(&self, id: WorkspaceId) -> Result<PathBuf, WorkspaceError> {
         let body = self.inner.live(id).await?;
         Ok(self.inner.worktree(body.project, &body.branch))
+    }
+
+    /// Runs `work` holding workspace `id`'s lifecycle lock, on a task of its own, so the lock is
+    /// held until the work ends even when the caller stops waiting. Work that panics or is
+    /// stopped with the runtime is [`WorkspaceError::Interrupted`].
+    async fn locked<T, E>(
+        &self,
+        id: WorkspaceId,
+        work: impl Future<Output = Result<T, E>> + Send + 'static,
+    ) -> Result<T, E>
+    where
+        T: Send + 'static,
+        E: From<WorkspaceError> + Send + 'static,
+    {
+        let (lock, user) = {
+            let mut locks = lock(&self.inner.lifecycle);
+            let held = Arc::clone(locks.entry(id).or_default());
+            let user = User {
+                inner: Arc::clone(&self.inner),
+                id,
+                lock: Some(Arc::clone(&held)),
+            };
+            (held, user)
+        };
+        let task = tokio::spawn(async move {
+            // Dropped in the reverse order: the guard first, then the user.
+            let _user = user;
+            let _held = lock.lock_owned().await;
+            work.await
+        });
+        match task.await {
+            Ok(result) => result,
+            Err(error) => Err(WorkspaceError::from(error).into()),
+        }
     }
 
     /// Deals with each worktree under `worktrees/<project>/`, for each project in the shared
@@ -282,6 +349,29 @@ impl Workspaces {
     /// the rest for the next start.
     pub async fn sweep(&self) -> Result<(), WorkspaceError> {
         self.inner.sweep(SWEEP_WITHIN).await
+    }
+}
+
+/// One holder or waiter of a workspace's lifecycle lock. When the last one goes, its work
+/// panicking included, the lock is dropped from the map.
+struct User {
+    inner: Arc<Inner>,
+    id: WorkspaceId,
+    lock: Option<Arc<tokio::sync::Mutex<()>>>,
+}
+
+impl Drop for User {
+    fn drop(&mut self) {
+        let mut locks = lock(&self.inner.lifecycle);
+        // Users are made under the map's lock, and a user's guard is dropped before the user,
+        // so the last user out sees the map's own clone as the only one left.
+        self.lock = None;
+        if locks
+            .get(&self.id)
+            .is_some_and(|held| Arc::strong_count(held) == 1)
+        {
+            locks.remove(&self.id);
+        }
     }
 }
 
