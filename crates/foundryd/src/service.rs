@@ -642,4 +642,37 @@ mod tests {
         );
         assert!(home.join("current/foundryd").is_file());
     }
+
+    #[test]
+    fn placing_from_inside_a_lower_version_goes_back_and_refuses_the_higher() {
+        let home = tempfile::tempdir().unwrap();
+        let newer = tempfile::tempdir().unwrap();
+        binaries(newer.path(), "two");
+        place(home.path(), &newer.path().join("foundryd"), "0.2.0").unwrap();
+        let old = home.path().join("versions/0.1.0");
+        fs::create_dir_all(&old).unwrap();
+        binaries(&old, "one");
+
+        place(home.path(), &old.join("foundryd"), "0.1.0").unwrap();
+
+        assert_eq!(
+            fs::read_link(home.path().join("current")).unwrap(),
+            PathBuf::from("versions/0.1.0")
+        );
+        let state = update::state(home.path()).unwrap();
+        assert_eq!(state.refused.as_deref(), Some("v0.2.0"));
+        assert_eq!(state.trial, None);
+    }
+
+    #[test]
+    fn going_back_is_said_and_going_forward_is_not() {
+        let note = went_back_note(Some("0.2.0"), "0.1.0").unwrap();
+
+        assert_eq!(
+            note,
+            "Went back from 0.2.0 to 0.1.0; v0.2.0 is refused until a higher tag ships."
+        );
+        assert_eq!(went_back_note(Some("0.1.0"), "0.2.0"), None);
+        assert_eq!(went_back_note(None, "0.1.0"), None);
+    }
 }

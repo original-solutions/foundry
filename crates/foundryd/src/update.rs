@@ -749,6 +749,8 @@ mod tests {
         assert_eq!(mode & 0o777, 0o600);
     }
 
+    const LIMIT: Duration = Duration::from_secs(10);
+
     fn tags(list: &[&str]) -> Vec<String> {
         list.iter().map(|tag| tag.to_string()).collect()
     }
@@ -830,7 +832,7 @@ mod tests {
         )
         .unwrap();
 
-        install_tag(home.path(), "v0.2.0", "0.1.0", |tag, stage| {
+        install_tag(home.path(), "v0.2.0", "0.1.0", LIMIT, |tag, stage| {
             assert_eq!(tag, "v0.2.0");
             script(&stage.join("foundryd"), "foundryd 0.2.0");
             script(&stage.join("foundry-holder"), "holder");
@@ -863,7 +865,7 @@ mod tests {
     fn install_tag_refuses_a_binary_that_prints_another_version() {
         let home = installed_home();
 
-        let error = install_tag(home.path(), "v0.2.0", "0.1.0", |_, stage| {
+        let error = install_tag(home.path(), "v0.2.0", "0.1.0", LIMIT, |_, stage| {
             script(&stage.join("foundryd"), "foundryd 0.9.9");
             script(&stage.join("foundry-holder"), "holder");
             Ok(())
@@ -880,7 +882,7 @@ mod tests {
     fn install_tag_refuses_an_asset_without_the_holder() {
         let home = installed_home();
 
-        let error = install_tag(home.path(), "v0.2.0", "0.1.0", |_, stage| {
+        let error = install_tag(home.path(), "v0.2.0", "0.1.0", LIMIT, |_, stage| {
             script(&stage.join("foundryd"), "foundryd 0.2.0");
             Ok(())
         })
@@ -894,7 +896,7 @@ mod tests {
     fn install_tag_passes_a_failed_fetch_on_and_changes_nothing() {
         let home = installed_home();
 
-        let error = install_tag(home.path(), "v0.2.0", "0.1.0", |_, _| {
+        let error = install_tag(home.path(), "v0.2.0", "0.1.0", LIMIT, |_, _| {
             Err(UpdateError::Fetch("gh is not logged in".into()))
         })
         .unwrap_err();
@@ -1112,6 +1114,7 @@ mod tests {
         let done = check_with(
             home.path(),
             "0.1.0",
+            LIMIT,
             || Ok(tags(&["v0.1.0", "v0.2.0"])),
             |_, _| panic!("a refused tag was fetched"),
         )
@@ -1136,6 +1139,7 @@ mod tests {
         let done = check_with(
             home.path(),
             "0.1.0",
+            LIMIT,
             || Ok(tags(&["v0.1.0", "v0.2.0", "v0.3.0"])),
             |tag, stage| {
                 assert_eq!(tag, "v0.3.0");
@@ -1160,6 +1164,7 @@ mod tests {
             let result = check_with(
                 home.path(),
                 "0.1.0",
+                LIMIT,
                 || Ok(tags(&["v0.2.0"])),
                 |_, stage| {
                     if bad == "wrong version" {
@@ -1180,6 +1185,7 @@ mod tests {
             let again = check_with(
                 home.path(),
                 "0.1.0",
+                LIMIT,
                 || Ok(tags(&["v0.2.0"])),
                 |_, _| panic!("fetched again"),
             );
@@ -1194,17 +1200,190 @@ mod tests {
         let listed = check_with(
             home.path(),
             "0.1.0",
+            LIMIT,
             || Err(UpdateError::Fetch("offline".into())),
             |_, _| panic!("fetched"),
         );
         let fetched = check_with(
             home.path(),
             "0.1.0",
+            LIMIT,
             || Ok(tags(&["v0.2.0"])),
             |_, _| Err(UpdateError::Fetch("offline".into())),
         );
 
         assert!(listed.is_err() && fetched.is_err());
         assert_eq!(state(home.path()).unwrap().refused, None);
+    }
+
+    #[test]
+    fn a_version_check_that_times_out_is_retried_not_refused() {
+        let home = installed_home();
+
+        let error = check_with(
+            home.path(),
+            "0.1.0",
+            Duration::from_millis(300),
+            || Ok(tags(&["v0.2.0"])),
+            |_, stage| {
+                fs::write(stage.join("foundryd"), "#!/bin/sh\nexec sleep 32.3\n").unwrap();
+                fs::write(stage.join("foundry-holder"), "holder").unwrap();
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, UpdateError::Fetch(_)), "{error}");
+        assert!(error.to_string().contains("timed out"), "{error}");
+        assert_eq!(state(home.path()).unwrap().refused, None);
+        assert_eq!(current(home.path()), PathBuf::from("versions/0.1.0"));
+    }
+
+    #[test]
+    fn a_binary_that_cannot_be_started_is_retried_not_refused() {
+        let home = installed_home();
+
+        let error = check_with(
+            home.path(),
+            "0.1.0",
+            LIMIT,
+            || Ok(tags(&["v0.2.0"])),
+            |_, stage| {
+                // No interpreter line and not a binary: the system cannot start it.
+                fs::write(stage.join("foundryd"), "").unwrap();
+                fs::write(stage.join("foundry-holder"), "holder").unwrap();
+                Ok(())
+            },
+        );
+
+        // An empty file cannot be executed; whichever way the system says so, it is a failure
+        // to run, which is retried. A binary that ran and said the wrong thing is refused.
+        assert!(error.is_err());
+        let refused = state(home.path()).unwrap().refused;
+        assert!(refused.is_none() || matches!(error, Err(UpdateError::WrongVersion { .. })));
+    }
+
+    #[test]
+    fn a_binary_that_exits_non_zero_is_refused() {
+        let home = installed_home();
+
+        let error = check_with(
+            home.path(),
+            "0.1.0",
+            LIMIT,
+            || Ok(tags(&["v0.2.0"])),
+            |_, stage| {
+                fs::write(stage.join("foundryd"), "#!/bin/sh\nexit 3\n").unwrap();
+                fs::write(stage.join("foundry-holder"), "holder").unwrap();
+                Ok(())
+            },
+        );
+
+        assert!(matches!(error, Err(UpdateError::WrongVersion { .. })));
+        assert_eq!(state(home.path()).unwrap().refused.as_deref(), Some("v0.2.0"));
+    }
+
+    #[test]
+    fn re_running_install_on_the_trial_keeps_the_trial() {
+        let home = trial_home();
+
+        placed_by_hand(home.path(), "0.2.0", Some("0.2.0")).unwrap();
+
+        assert_eq!(state(home.path()).unwrap().trial.unwrap().version, "0.2.0");
+    }
+
+    #[test]
+    fn a_hand_install_of_a_lower_version_below_a_lower_refusal_raises_it() {
+        let home = tempfile::tempdir().unwrap();
+        save(
+            home.path(),
+            &State {
+                trial: None,
+                refused: Some("v0.1.5".into()),
+            },
+        )
+        .unwrap();
+
+        placed_by_hand(home.path(), "0.2.0", Some("0.3.0")).unwrap();
+
+        assert_eq!(state(home.path()).unwrap().refused.as_deref(), Some("v0.3.0"));
+    }
+
+    #[test]
+    fn lowered_says_whether_a_version_is_below_the_one_before() {
+        assert!(lowered(Some("0.2.0"), "0.1.0"));
+        assert!(!lowered(Some("0.1.0"), "0.2.0"));
+        assert!(!lowered(Some("0.1.0"), "0.1.0"));
+        assert!(!lowered(None, "0.1.0"));
+        assert!(!lowered(Some("junk"), "0.1.0"));
+    }
+
+    #[test]
+    fn became_healthy_from_current_clears_the_trial_and_says_updates_are_on() {
+        let home = trial_home();
+        let exe = home.path().join("versions/0.2.0/foundryd");
+        script(&exe, "foundryd 0.2.0");
+        HEALTHY.store(false, Ordering::Relaxed);
+
+        let on = became_healthy(home.path(), &exe, "0.2.0");
+
+        assert!(on);
+        assert!(HEALTHY.load(Ordering::Relaxed));
+        assert_eq!(state(home.path()).unwrap().trial, None);
+    }
+
+    #[test]
+    fn became_healthy_from_elsewhere_leaves_the_trial_and_turns_updates_off() {
+        let home = trial_home();
+        let exe = home.path().join("elsewhere");
+        script(&exe, "foundryd 0.2.0");
+        HEALTHY.store(false, Ordering::Relaxed);
+
+        let on = became_healthy(home.path(), &exe, "0.2.0");
+
+        assert!(!on);
+        assert!(HEALTHY.load(Ordering::Relaxed));
+        assert!(state(home.path()).unwrap().trial.is_some());
+    }
+
+    #[test]
+    fn on_trial_is_true_only_for_a_trial_of_this_version_run_from_current() {
+        let home = trial_home();
+        let inside = home.path().join("versions/0.2.0/foundryd");
+        script(&inside, "foundryd 0.2.0");
+        let elsewhere = home.path().join("elsewhere");
+        script(&elsewhere, "foundryd 0.2.0");
+
+        assert!(on_trial(home.path(), &inside, "0.2.0"));
+        assert!(!on_trial(home.path(), &elsewhere, "0.2.0"));
+        assert!(!on_trial(home.path(), &inside, "0.1.0"));
+        let bare = installed_home();
+        let exe = bare.path().join("versions/0.1.0/foundryd");
+        script(&exe, "foundryd 0.1.0");
+        assert!(!on_trial(bare.path(), &exe, "0.1.0"));
+    }
+
+    #[test]
+    fn a_failed_record_leaves_current_and_no_staging_directory() {
+        let home = installed_home();
+
+        let result = place_version(
+            home.path(),
+            "0.2.0",
+            |stage| {
+                release(stage, "0.2.0");
+                Ok(())
+            },
+            || Err(io::Error::other("disk full")),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(current(home.path()), PathBuf::from("versions/0.1.0"));
+        let left: Vec<_> = fs::read_dir(home.path().join("versions"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".staging"))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
     }
 }
