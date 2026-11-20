@@ -22,6 +22,10 @@ export function TerminalPane({ id }: { id: string }) {
       if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "resize", cols: term.cols, rows: term.rows }));
     };
 
+    // The daemon writes a terminal's record before its holder serves the socket, so a terminal
+    // can be listed a moment before it can be attached. A socket that never opens is tried again
+    // for about 10 seconds before the pane gives up.
+    let misses = 0;
     const attach = () => {
       const scheme = location.protocol === "https:" ? "wss" : "ws";
       const ws = new WebSocket(`${scheme}://${location.host}/api/terminals/${id}`);
@@ -31,6 +35,7 @@ export function TerminalPane({ id }: { id: string }) {
       let first = true;
       ws.onopen = () => {
         opened = true;
+        misses = 0;
         setStatus(null);
         sendSize();
       };
@@ -53,7 +58,10 @@ export function TerminalPane({ id }: { id: string }) {
       };
       ws.onclose = (event) => {
         if (stopped) return;
-        if (!opened) setStatus("terminal not available here");
+        if (!opened) {
+          if (++misses < 20) setTimeout(() => !stopped && attach(), 500);
+          else setStatus("terminal not available here");
+        }
         else if (event.code === 1000) setStatus("exited");
         else if (event.code === 1013) setTimeout(() => !stopped && attach(), 200);
         else setStatus(event.reason || `disconnected (${event.code})`);

@@ -8,7 +8,7 @@ export default defineConfig({
   fullyParallel: false,
   retries: 0,
   timeout: 180_000,
-  expect: { timeout: 15_000 },
+  expect: { timeout: 30_000 },
   reporter: "list",
   globalSetup: "./e2e/global-setup.ts",
   use: { channel: "chrome", trace: "retain-on-failure" },

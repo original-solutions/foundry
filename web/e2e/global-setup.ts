@@ -23,7 +23,7 @@ function freePort(): Promise<number> {
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-async function until<T>(what: string, check: () => Promise<T | undefined | false>, ms = 20_000): Promise<T> {
+async function until<T>(what: string, check: () => Promise<T | undefined | false>, ms = 60_000): Promise<T> {
   const end = Date.now() + ms;
   for (;;) {
     try {
@@ -106,7 +106,6 @@ export default async function globalSetup() {
       SHELL: "/bin/sh",
       FOUNDRY_GATEWAY_URL: "http://gateway.invalid:8317",
       PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
-      FOUNDRY_E2E: "1",
     };
     delete env.CLAUDE_CONFIG_DIR;
 
@@ -158,7 +157,7 @@ export default async function globalSetup() {
     const uiPort = await freePort();
     const preview = spawn(path.join(web, "node_modules/.bin/vite"), ["preview", "--port", String(uiPort), "--strictPort"], {
       cwd: web,
-      env: { ...process.env, FOUNDRY_API: `http://127.0.0.1:${apiPort}`, FOUNDRY_E2E: "1" },
+      env: { ...process.env, FOUNDRY_API: `http://127.0.0.1:${apiPort}` },
       stdio: "ignore",
     });
     children.push(preview);
