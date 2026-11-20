@@ -5,10 +5,12 @@
 //! reaches an error message: errors name the secret or the file, never what it holds.
 
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::io::{self, BufRead, Read, Write};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::{Mutex, PoisonError};
@@ -64,18 +66,124 @@ pub enum SecretsError {
     },
 }
 
+/// The secret the model gateway's key is held under: sessions send it as
+/// `ANTHROPIC_AUTH_TOKEN`.
+pub const GATEWAY: &str = "gateway";
+
+/// The secret the gateway's management key is held under.
+pub const GATEWAY_MANAGEMENT: &str = "gateway-management";
+
 /// The secret store this machine uses: the login keychain on macOS, its updates locked by
 /// the file `secrets.lock` in `home`, and on Linux the file `secrets.json` in `home`, readable
-/// only by the service user.
+/// only by the service user. In a debug build `FOUNDRY_SECRETS=file` picks the file on every
+/// OS, which is how tests keep out of the keychain. A release build ignores it.
 pub fn for_this_machine(home: &Path) -> Arc<dyn Secrets> {
-    #[cfg(target_os = "macos")]
-    {
-        Arc::new(Keychain::new("foundry", home.join("secrets.lock")))
+    store_for(home, store(std::env::var_os("FOUNDRY_SECRETS").as_deref()))
+}
+
+/// Whether this build takes `FOUNDRY_SECRETS`: only a debug build, so a release Mac always
+/// keeps its identity and keys in the keychain.
+const OVERRIDE: bool = cfg!(debug_assertions);
+
+/// Which secret store a machine uses.
+#[derive(Debug, PartialEq, Eq)]
+enum Store {
+    File,
+    Keychain,
+}
+
+/// The store for a `FOUNDRY_SECRETS` value: the file for exactly `file` when `taken` (the build
+/// takes the override), else this OS's default, the keychain on macOS and the file elsewhere.
+fn choose(choice: Option<&OsStr>, taken: bool) -> Store {
+    if (taken && choice == Some(OsStr::new("file"))) || !cfg!(target_os = "macos") {
+        Store::File
+    } else {
+        Store::Keychain
     }
-    #[cfg(not(target_os = "macos"))]
-    {
-        Arc::new(FileSecrets::new(home.join("secrets.json")))
+}
+
+/// The store this build picks for a `FOUNDRY_SECRETS` value.
+fn store(choice: Option<&OsStr>) -> Store {
+    choose(choice, OVERRIDE)
+}
+
+/// The secret store of kind `store` for the data directory `home`.
+fn store_for(home: &Path, store: Store) -> Arc<dyn Secrets> {
+    match store {
+        Store::File => Arc::new(FileSecrets::new(home.join("secrets.json"))),
+        #[cfg(target_os = "macos")]
+        Store::Keychain => Arc::new(Keychain::new("foundry", home.join("secrets.lock"))),
+        #[cfg(not(target_os = "macos"))]
+        Store::Keychain => unreachable!("only macOS chooses the keychain"),
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SetError {
+    #[error("{name} is not a secret to set here; the names are {GATEWAY} and {GATEWAY_MANAGEMENT}")]
+    UnknownName { name: String },
+    #[error("no value on stdin for {name}")]
+    NoValue { name: String },
+    #[error("cannot read stdin for {name}: {source}")]
+    Stdin { name: String, source: io::Error },
+    #[error(transparent)]
+    Secrets(#[from] SecretsError),
+}
+
+/// `foundryd secret set <name>`: reads one line from stdin and stores it in this machine's
+/// secret store. It never prints the value.
+pub fn set_command(name: &str) -> ExitCode {
+    let result = match crate::daemon::home() {
+        Some(home) => set_from(
+            &*for_this_machine(&home),
+            name,
+            io::BufReader::new(io::stdin()),
+        ),
+        None => {
+            eprintln!("foundryd secret set: set FOUNDRY_HOME or HOME");
+            return ExitCode::FAILURE;
+        }
+    };
+    match result {
+        Ok(()) => {
+            println!("foundryd secret set {name}: stored; restart foundryd so new sessions use it");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("foundryd secret set: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Stores the first line of `input` as the secret `name`, without its line ending. Only the
+/// gateway secrets can be set: the name is checked before `input` is read, so any other name
+/// leaves the store untouched, and the machine's own identity and key table stay out of reach.
+pub fn set_from(
+    secrets: &dyn Secrets,
+    name: &str,
+    mut input: impl BufRead,
+) -> Result<(), SetError> {
+    if name != GATEWAY && name != GATEWAY_MANAGEMENT {
+        return Err(SetError::UnknownName {
+            name: name.to_owned(),
+        });
+    }
+    let mut line = String::new();
+    input
+        .read_line(&mut line)
+        .map_err(|source| SetError::Stdin {
+            name: name.to_owned(),
+            source,
+        })?;
+    let line = line.strip_suffix('\n').unwrap_or(&line);
+    let value = line.strip_suffix('\r').unwrap_or(line);
+    if value.is_empty() {
+        return Err(SetError::NoValue {
+            name: name.to_owned(),
+        });
+    }
+    Ok(secrets.set(name, value)?)
 }
 
 /// Secrets in one JSON file that only its owner may read or write. The file is created 0600,
@@ -194,7 +302,8 @@ impl Secrets for FileSecrets {
     }
 }
 
-/// An exclusive lock on the file at `path`, made 0600 with its directory if needed, held until
+/// An exclusive lock on the file at `path`, made 0600 with its directory (0700, as `foundryd
+/// run` wants the data directory) if needed, held until
 /// the value is dropped. It is a `flock`, so it holds between processes, and between two opens
 /// of the file in one process. Each holder stamps the file's modified time as it takes it, and
 /// a waiter counts a new stamp as progress: it gives [`SecretsError::Locked`] only once `wait`
@@ -206,7 +315,11 @@ fn lock_file(path: &Path, wait: Duration) -> Result<Flock<File>, SecretsError> {
         source,
     };
     if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir).map_err(io)?;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .map_err(io)?;
     }
     let mut file = OpenOptions::new()
         .write(true)
@@ -652,5 +765,131 @@ mod tests {
         assert_eq!(secrets.get(&name).unwrap().as_deref(), Some("sk-two!"));
         assert!(dir.path().join("secrets.lock").exists());
         security_framework::passwords::delete_generic_password("foundry-test", &name).unwrap();
+    }
+
+    #[test]
+    fn the_file_choice_keeps_secrets_in_secrets_json_under_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_for(dir.path(), Store::File);
+        store.set("gateway", "sk-one").unwrap();
+        let held = FileSecrets::new(dir.path().join("secrets.json"));
+        assert_eq!(held.get("gateway").unwrap().as_deref(), Some("sk-one"));
+    }
+
+    /// `foundryd secret set` can run before the first `foundryd run`, which refuses a data
+    /// directory other users can reach.
+    #[test]
+    fn a_set_makes_a_missing_data_directory_private() {
+        let parent = tempfile::tempdir().unwrap();
+        let home = parent.path().join("a/home");
+        FileSecrets::new(home.join("secrets.json"))
+            .set("gateway", "sk-one")
+            .unwrap();
+        assert_eq!(mode(&home), 0o700);
+        assert_eq!(mode(&parent.path().join("a")), 0o700);
+    }
+
+    #[test]
+    fn only_the_exact_word_file_chooses_the_file_store() {
+        use std::ffi::OsStr;
+        assert_eq!(choose(Some(OsStr::new("file")), true), Store::File);
+        for choice in [None, Some(OsStr::new("keychain")), Some(OsStr::new("File"))] {
+            assert_eq!(choose(choice, true), os_default(), "{choice:?}");
+        }
+    }
+
+    /// A release build has no override, so a variable copied from the tests into a service
+    /// file cannot move a Mac off its keychain and give it a new identity.
+    #[test]
+    fn a_release_build_ignores_foundry_secrets() {
+        use std::ffi::OsStr;
+        for choice in [None, Some(OsStr::new("file"))] {
+            assert_eq!(choose(choice, false), os_default(), "{choice:?}");
+        }
+    }
+
+    /// The store `for_this_machine` picks with `FOUNDRY_SECRETS=file` in a debug build, the
+    /// one the tests run.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn this_debug_build_takes_foundry_secrets() {
+        use std::ffi::OsStr;
+        assert_eq!(store(Some(OsStr::new("file"))), Store::File);
+    }
+
+    /// The same in a release build, which ignores it. The gate runs debug builds only; run
+    /// `cargo test --release -p foundryd --lib secrets` to check this one.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn this_release_build_ignores_foundry_secrets() {
+        use std::ffi::OsStr;
+        assert_eq!(store(Some(OsStr::new("file"))), os_default());
+    }
+
+    fn os_default() -> Store {
+        if cfg!(target_os = "macos") {
+            Store::Keychain
+        } else {
+            Store::File
+        }
+    }
+
+    /// What `set_from` stored under `name`, read back from a file store.
+    fn stored(secrets: &FileSecrets, name: &str) -> Option<String> {
+        secrets.get(name).unwrap()
+    }
+
+    #[test]
+    fn set_from_stores_the_line_without_its_newline() {
+        let (_dir, secrets) = file();
+        set_from(&secrets, GATEWAY, "sk-one\n".as_bytes()).unwrap();
+        set_from(&secrets, GATEWAY_MANAGEMENT, "sk-two\r\n".as_bytes()).unwrap();
+        assert_eq!(stored(&secrets, "gateway").as_deref(), Some("sk-one"));
+        assert_eq!(
+            stored(&secrets, "gateway-management").as_deref(),
+            Some("sk-two")
+        );
+    }
+
+    #[test]
+    fn set_from_keeps_only_the_first_line() {
+        let (_dir, secrets) = file();
+        set_from(&secrets, GATEWAY, "sk-one\nsk-two\n".as_bytes()).unwrap();
+        assert_eq!(stored(&secrets, "gateway").as_deref(), Some("sk-one"));
+    }
+
+    #[test]
+    fn set_from_refuses_an_empty_value_and_stores_nothing() {
+        let (_dir, secrets) = file();
+        for input in ["", "\n", "\r\n"] {
+            let error = set_from(&secrets, GATEWAY, input.as_bytes()).unwrap_err();
+            assert!(error.to_string().contains("no value on stdin"), "{error}");
+        }
+        assert_eq!(stored(&secrets, "gateway"), None);
+    }
+
+    #[test]
+    fn set_from_refuses_any_other_name_and_stores_nothing() {
+        let (_dir, secrets) = file();
+        for name in ["machine", "machine-keys", "other"] {
+            let error = set_from(&secrets, name, "x\n".as_bytes()).unwrap_err();
+            let text = error.to_string();
+            assert!(text.contains(name), "{text}");
+            assert!(text.contains("gateway-management"), "{text}");
+            assert_eq!(stored(&secrets, name), None);
+        }
+    }
+
+    #[test]
+    fn set_from_refuses_a_bad_name_before_it_reads_stdin() {
+        struct Unreadable;
+        impl io::Read for Unreadable {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                panic!("stdin was read");
+            }
+        }
+        let secrets = MemorySecrets::default();
+        let input = io::BufReader::new(Unreadable);
+        assert!(set_from(&secrets, "machine", input).is_err());
     }
 }

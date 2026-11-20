@@ -1,10 +1,10 @@
-//! `foundryd`: the command line. Each command calls the module that owns it, whose stub exits 2
-//! until its plan task fills it.
+//! `foundryd`: the command line. Each command calls the module that owns it; one whose plan task
+//! is not done yet exits 2.
 
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use foundryd::{daemon, join, service, status};
+use foundryd::{daemon, join, secrets, service, status};
 
 #[derive(Parser)]
 #[command(name = "foundryd", version, about)]
@@ -30,6 +30,21 @@ enum Command {
         /// The one-time code shown in that machine's UI.
         code: String,
     },
+    /// Keep a secret in this machine's secret store.
+    Secret {
+        #[command(subcommand)]
+        command: SecretCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum SecretCommand {
+    /// Store the gateway key (`gateway`) or its management key (`gateway-management`), read as
+    /// one line from stdin.
+    Set {
+        /// The secret's name: `gateway` or `gateway-management`.
+        name: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -39,5 +54,8 @@ fn main() -> ExitCode {
         Command::Install => service::install(),
         Command::Uninstall => service::uninstall(),
         Command::Join { address, code } => join::join(&address, &code),
+        Command::Secret {
+            command: SecretCommand::Set { name },
+        } => secrets::set_command(&name),
     }
 }

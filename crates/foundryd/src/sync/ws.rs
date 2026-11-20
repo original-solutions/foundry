@@ -1,4 +1,5 @@
-//! Peer links over WebSockets: the dialer and the route a peer dials.
+//! Peer links over WebSockets: the dialer and the routes a peer dials. The daemon serves
+//! [`keyed_router`]; [`router`] proves nothing and is for tests.
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -14,6 +15,7 @@ use futures::{Sink, SinkExt, Stream, StreamExt};
 use tokio_tungstenite::tungstenite;
 
 use super::{Conn, Dialer, Peers};
+use crate::join::Keys;
 
 /// The path a peer's link is served on.
 pub const PEER_PATH: &str = "/api/peer";
@@ -43,8 +45,8 @@ impl Dialer for WsDialer {
 }
 
 /// The route that serves links peers open to this machine. A link names its machine in the
-/// hello and nothing proves it yet: mount this only where the machine keys of joining
-/// (task 13) are checked, or on an address only fleet machines can reach.
+/// hello and nothing proves it: the daemon mounts [`keyed_router`] instead, and this one is for
+/// tests and for an address only fleet machines can reach.
 pub fn router(peers: Peers) -> Router {
     Router::new()
         .route(PEER_PATH, get(upgrade))
@@ -52,17 +54,34 @@ pub fn router(peers: Peers) -> Router {
 }
 
 async fn upgrade(State(peers): State<Peers>, upgrade: WebSocketUpgrade) -> Response {
-    upgrade.on_upgrade(move |socket: WebSocket| async move {
-        let conn = pump(
-            socket,
-            |message| match message {
-                ws::Message::Text(text) => Some(text.as_str().to_owned()),
-                _ => None,
-            },
-            |text| ws::Message::Text(text.into()),
-        );
-        peers.accept(conn).await;
-    })
+    upgrade.on_upgrade(move |socket| async move { peers.accept(served(socket)).await })
+}
+
+/// The route that serves links peers open to this machine, each taken only once both ends have
+/// proved their keys ([`Keys::accept`]). This is the one the daemon mounts.
+pub fn keyed_router(peers: Peers, keys: Keys) -> Router {
+    Router::new()
+        .route(PEER_PATH, get(keyed_upgrade))
+        .with_state((peers, keys))
+}
+
+async fn keyed_upgrade(
+    State((peers, keys)): State<(Peers, Keys)>,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    upgrade.on_upgrade(move |socket| async move { keys.accept(&peers, served(socket)).await })
+}
+
+/// The link on a socket a peer opened to this machine.
+fn served(socket: WebSocket) -> Conn {
+    pump(
+        socket,
+        |message| match message {
+            ws::Message::Text(text) => Some(text.as_str().to_owned()),
+            _ => None,
+        },
+        |text| ws::Message::Text(text.into()),
+    )
 }
 
 /// The URL of a peer's link: `address` is an IP address or a host name.
