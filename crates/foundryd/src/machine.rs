@@ -530,6 +530,68 @@ mod tests {
         assert_eq!(again.body.sessions, 5);
     }
 
+    /// Writes `update.json` with `refused` and points `current` at `installed`, as the updater
+    /// leaves them.
+    fn updated(home: &Path, refused: Option<&str>, installed: Option<&str>) {
+        let state = serde_json::json!({ "refused": refused });
+        std::fs::write(home.join("update.json"), state.to_string()).unwrap();
+        if let Some(version) = installed {
+            crate::update::point_current(home, version).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_refused_tag_is_reported_while_the_version_installed_is_not_above_it() {
+        for installed in [Some("0.1.0"), Some("0.2.0"), None] {
+            let home = tempfile::tempdir().unwrap();
+            updated(home.path(), Some("v0.2.0"), installed);
+            assert_eq!(
+                update_refused(home.path()).as_deref(),
+                Some("v0.2.0"),
+                "{installed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_higher_version_installed_clears_the_refused_tag() {
+        let home = tempfile::tempdir().unwrap();
+        updated(home.path(), Some("v0.2.0"), Some("0.2.1"));
+        assert_eq!(update_refused(home.path()), None);
+    }
+
+    #[test]
+    fn no_refusal_and_no_update_state_report_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(update_refused(home.path()), None);
+        updated(home.path(), None, Some("0.1.0"));
+        assert_eq!(update_refused(home.path()), None);
+    }
+
+    #[test]
+    fn an_unreadable_update_state_reports_nothing_and_the_sample_is_still_written() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("update.json"), "not json").unwrap();
+        assert_eq!(update_refused(dir.path()), None);
+        let store = Mutex::new(Store::open(dir.path().join("foundry.db")).unwrap());
+        let written = write_sample(&store, MachineId::random(), dir.path()).unwrap();
+        assert_eq!(written.body.update_refused, None);
+    }
+
+    #[test]
+    fn every_sample_carries_the_refused_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Mutex::new(Store::open(dir.path().join("foundry.db")).unwrap());
+        let me = MachineId::random();
+        updated(dir.path(), Some("v0.2.0"), Some("0.1.0"));
+        let written = write_sample(&store, me, dir.path()).unwrap();
+        assert_eq!(written.body.update_refused.as_deref(), Some("v0.2.0"));
+
+        updated(dir.path(), Some("v0.2.0"), Some("0.3.0"));
+        let written = write_sample(&store, me, dir.path()).unwrap();
+        assert_eq!(written.body.update_refused, None);
+    }
+
     #[test]
     fn write_sample_reads_the_machine_before_taking_the_store() {
         let dir = tempfile::tempdir().unwrap();
