@@ -166,6 +166,21 @@ impl Served {
         .unwrap()
     }
 
+    /// The JSON `GET path` answers.
+    async fn get(&self, path: &str) -> Value {
+        let url = format!("http://{}{path}", self.addr);
+        tokio::task::spawn_blocking(move || {
+            ureq::get(&url)
+                .call()
+                .unwrap()
+                .body_mut()
+                .read_json()
+                .unwrap()
+        })
+        .await
+        .unwrap()
+    }
+
     /// The records `GET /api/state` shows.
     async fn state(&self) -> Vec<AnyRecord> {
         let url = format!("http://{}/api/state", self.addr);
@@ -787,4 +802,92 @@ async fn a_create_naming_b_over_its_limits_is_made_on_b_and_warns_of_each_limit(
         .is_some(),
         "the workspace is B's"
     );
+}
+
+/// Two machines that both qualify, B the roomier, whose API takes a call and never answers.
+/// Returns A's API and B's silent listener, which must be kept for the test.
+async fn b_never_answers(
+    fleet: &Fleet,
+    project_on: &Path,
+) -> (Served, ProjectId, tokio::net::TcpListener) {
+    let (a, b) = (&fleet.daemons[0], &fleet.daemons[1]);
+    let project = project(fleet, project_on);
+    limit_all(fleet);
+    let on_a = Served::of(a).await;
+    let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    b.peers.serve_calls(silent.local_addr().unwrap());
+    hears(&a.peers, b.id).await;
+    (on_a, project, silent)
+}
+
+#[tokio::test]
+async fn a_choose_whose_create_is_lost_on_b_is_never_sent_to_a_as_well() {
+    let fleet = Fleet::start(2);
+    let (a, b) = (&fleet.daemons[0], &fleet.daemons[1]);
+    let remotes = tempfile::tempdir().unwrap();
+    let (on_a, project, silent) = b_never_answers(&fleet, remotes.path()).await;
+    a.write(loaded(0, 0.8));
+    let sampled = b.write(loaded(0, 0.1));
+    holds_sample(a, b.id, sampled.version()).await;
+
+    let posted = tokio::spawn(async move {
+        let answer = on_a
+            .post("/api/workspaces", Some(choose(project, "lost")))
+            .await;
+        (on_a, answer)
+    });
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(!posted.is_finished(), "B answered");
+    fleet.cut(1);
+    let (_on_a, (status, answer)) = timeout(WAIT, posted).await.unwrap().unwrap();
+    assert_eq!(status, 504, "{answer}");
+    assert_eq!(answer["machine"], json!(b.id), "{answer}");
+    assert!(
+        a.held(|r| matches!(r, AnyRecord::Workspace(w) if w.body.name == "lost"))
+            .is_none(),
+        "the create was sent to A as well"
+    );
+    drop(silent);
+}
+
+#[tokio::test]
+async fn a_queued_request_whose_create_is_lost_on_b_fails_and_is_never_made_on_a() {
+    let fleet = Fleet::start(2);
+    let (a, b) = (&fleet.daemons[0], &fleet.daemons[1]);
+    let remotes = tempfile::tempdir().unwrap();
+    let (on_a, project, silent) = b_never_answers(&fleet, remotes.path()).await;
+    a.write(loaded(4, 0.1));
+    let sampled = b.write(loaded(4, 0.1));
+    holds_sample(a, b.id, sampled.version()).await;
+    let (status, answer) = on_a
+        .post("/api/workspaces", Some(choose(project, "lost")))
+        .await;
+    assert_eq!(status, 202, "{answer}");
+
+    let sampled = b.write(loaded(0, 0.1));
+    holds_sample(a, b.id, sampled.version()).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    fleet.cut(1);
+    let started = tokio::time::Instant::now();
+    let error = loop {
+        let listed = on_a.get("/api/placements").await;
+        if listed["requests"][0]["state"] == "failed" {
+            break listed["requests"][0]["error"].as_str().unwrap().to_owned();
+        }
+        assert!(
+            started.elapsed() < WAIT,
+            "the request never fails: {listed}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert!(error.contains("may have been made on machine-1"), "{error}");
+
+    a.write(loaded(0, 0.1));
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        a.held(|r| matches!(r, AnyRecord::Workspace(w) if w.body.name == "lost"))
+            .is_none(),
+        "the create was sent to A as well"
+    );
+    drop(silent);
 }

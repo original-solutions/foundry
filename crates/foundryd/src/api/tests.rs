@@ -2641,6 +2641,23 @@ async fn choose_with_no_machine_qualifying_waits_with_a_reason_per_machine_and_i
         "{requests}"
     );
 
+    // A newer sample over another limit changes what the waiting request says.
+    daemon.sample(daemon.me, 4, 0.4);
+    let started = tokio::time::Instant::now();
+    loop {
+        let listed = daemon.call("GET", "/api/placements", None).await.json();
+        if listed["requests"][0]["reasons"]
+            == serde_json::json!(["studio: sessions 4 at limit 4", "peer: offline"])
+        {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the reasons never follow the sample: {listed}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
     // This machine's next sample is under its limits.
     let qualified = tokio::time::Instant::now();
     daemon.sample(daemon.me, 1, 0.4);
@@ -2817,6 +2834,47 @@ async fn a_machine_given_a_request_takes_no_other_until_its_next_sample() {
     );
     let waiting = listed_in(&daemon, "waiting").await;
     assert_eq!(waiting["name"], "second");
+    // The session "first" brought counts against the limit until a sample counts it.
+    assert_eq!(
+        waiting["reasons"],
+        serde_json::json!(["studio: sessions 1 at limit 1"])
+    );
+}
+
+#[tokio::test]
+async fn a_machine_with_no_limits_takes_every_choose_and_a_create_it_refuses_holds_nothing_back() {
+    let daemon = Daemon::new(TURN).await;
+    let project = daemon.project();
+    daemon.list_me("studio");
+    daemon.sample(daemon.me, 0, 0.1);
+    for (name, status) in [("one", 201), ("two", 201), ("one", 409), ("three", 201)] {
+        let reply = daemon
+            .call("POST", "/api/workspaces", Some(choose(project, name)))
+            .await;
+        assert_eq!(reply.status, status, "{name}: {}", reply.body);
+        assert_eq!(reply.json()["machine"], serde_json::json!(daemon.me));
+    }
+}
+
+#[tokio::test]
+async fn two_chooses_at_once_never_both_take_the_last_session() {
+    let daemon = Daemon::new(TURN).await;
+    let project = daemon.project();
+    daemon.list_me("studio");
+    daemon.limit(daemon.me, 1, 1.0);
+    daemon.sample(daemon.me, 0, 0.1);
+    let (a, b) = tokio::join!(
+        daemon.call("POST", "/api/workspaces", Some(choose(project, "left"))),
+        daemon.call("POST", "/api/workspaces", Some(choose(project, "right"))),
+    );
+    let mut statuses = [a.status, b.status];
+    statuses.sort_unstable();
+    assert_eq!(statuses, [201, 202], "{} / {}", a.body, b.body);
+    let waited = if a.status == 202 { a } else { b };
+    assert_eq!(
+        waited.json()["reasons"],
+        serde_json::json!(["studio: sessions 1 at limit 1"])
+    );
 }
 
 #[tokio::test]
@@ -2850,8 +2908,22 @@ async fn a_machine_that_cannot_take_the_call_is_passed_over_for_one_that_can() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     // The peer has the most headroom, but runs a Foundry too old to take a create.
-    daemon.sample(daemon.me, 1, 0.5);
+    daemon.limit(daemon.me, 4, 1.0);
+    daemon.sample(daemon.me, 1, 1.5);
     daemon.sample(peer, 0, 0.1);
+    let reply = daemon
+        .call("POST", "/api/workspaces", Some(choose(project, "waits")))
+        .await;
+    assert_eq!(reply.status, 202, "{}", reply.body);
+    assert_eq!(
+        reply.json()["reasons"],
+        serde_json::json!([
+            "studio: load 1.5 over limit 1.0",
+            "peer: runs an older Foundry, which cannot take a create"
+        ])
+    );
+
+    daemon.sample(daemon.me, 1, 0.5);
 
     let reply = daemon
         .call(
