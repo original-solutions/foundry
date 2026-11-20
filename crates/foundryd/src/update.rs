@@ -743,9 +743,9 @@ fn download_with(gh: &OsStr, key: &[u8], tag: &str, stage: &Path) -> Result<(), 
             .map_err(|error| UpdateError::Fetch(format!("cannot read {name} of {tag}: {error}")))
     };
     let signature = read(&sig)?;
-    UnparsedPublicKey::new(&ED25519, key)
-        .verify(&read(&asset)?, &signature)
-        .map_err(|_| UpdateError::BadSignature(tag.to_string()))?;
+    if !verifies(key, &read(&asset)?, &signature) {
+        return Err(UpdateError::BadSignature(tag.to_string()));
+    }
     let _ = fs::remove_file(stage.join(&sig));
     let archive = stage.join(&asset);
     run_bounded(
@@ -759,6 +759,14 @@ fn download_with(gh: &OsStr, key: &[u8], tag: &str, stage: &Path) -> Result<(), 
     .map_err(|error| UpdateError::Fetch(error.to_string()))?;
     let _ = fs::remove_file(archive);
     Ok(())
+}
+
+/// True when `signature` is the Ed25519 signature of `archive` by `key`, as the release
+/// workflow makes it (`openssl pkeyutl -sign -rawin`).
+fn verifies(key: &[u8], archive: &[u8], signature: &[u8]) -> bool {
+    UnparsedPublicKey::new(&ED25519, key)
+        .verify(archive, signature)
+        .is_ok()
 }
 
 /// One look for a newer tag. `Some` is the tag that was installed. A release is refused, so it

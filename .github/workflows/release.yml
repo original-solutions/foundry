@@ -2,8 +2,13 @@
 # each holding foundryd and foundry-holder at its top level, and beside each one an Ed25519
 # signature (.sig) that the updater checks before it unpacks anything (crates/foundryd/src/update.rs).
 #
-# Only the publish job sees RELEASE_SIGNING_KEY. It publishes nothing unless the public key of that
-# secret equals RELEASE_KEY in update.rs and every signature verifies against RELEASE_KEY.
+# The publish job is the only job here that reads RELEASE_SIGNING_KEY. It publishes nothing unless
+# the public key of that secret equals RELEASE_KEY in update.rs and every signature verifies against
+# RELEASE_KEY. Any workflow pushed to this repository could read a repository secret, so the key is
+# only as safe as push access to the repository.
+#
+# A release's assets are never replaced: a daemon that read a new archive beside an old signature
+# would refuse a good tag. A release that needs new binaries ships under a new tag.
 #
 # Release builds use no cache, so nothing a pull request's run left behind reaches a release.
 name: release
@@ -154,7 +159,7 @@ jobs:
           path: dist/*.tar.gz
           if-no-files-found: error
 
-  # The only job that sees the signing key.
+  # The only job in this workflow that reads the signing key. Its actions are pinned to commits.
   publish:
     needs: [macos, linux]
     runs-on: ubuntu-latest
@@ -162,12 +167,12 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: foundryd-*
           path: dist
@@ -189,7 +194,9 @@ jobs:
           echo "hex=$hex" >> "$GITHUB_OUTPUT"
 
       # The key goes only into a mode 600 temporary file, removed when this step ends however it
-      # ends, and nothing prints it.
+      # ends, and nothing prints it. The updater checks what this signs with ring: a change to the
+      # signing command needs a new fixture in update.rs
+      # (a_signature_made_the_way_the_release_workflow_signs_verifies).
       - name: Sign every archive
         env:
           RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
@@ -233,8 +240,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-            gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' > "$RUNNER_TEMP/assets"; then
+            if grep -q '^foundryd-' "$RUNNER_TEMP/assets"; then
+              echo "::error::release $TAG already holds foundryd assets, which are never replaced: push a new tag"
+              exit 1
+            fi
+            gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY"
           else
             gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" --generate-notes
           fi
