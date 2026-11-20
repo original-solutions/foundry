@@ -9,8 +9,8 @@ use foundry_proto::ids::{MachineId, ProjectId, WorkspaceId};
 use foundry_proto::messages::{ANSWERS_SINCE, EDITS_SINCE, PROTOCOL, PeerMessage};
 use foundry_proto::record::AnyRecord;
 use foundry_proto::settings::{
-    Edit, EditId, Limits, Outcome, Overwritten, Project, SettingKey, SettingValue,
-    SharedSettings, Stamp, StampKey,
+    Edit, EditId, Limits, Outcome, Overwritten, Project, SettingKey, SettingValue, SharedSettings,
+    Stamp, StampKey,
 };
 use foundry_proto::state::TerminalState;
 use foundryd::coordinator::{Coordinator, CoordinatorError};
@@ -1250,9 +1250,11 @@ async fn an_edit_sent_again_after_its_answer_was_lost_is_numbered_once_and_answe
     let numbered = daemon.settings();
 
     say(&conn, &edit).await;
-    until(Duration::from_secs(2), "the edit sent again is answered", || {
-        answers_sent(&said).len() == 2
-    })
+    until(
+        Duration::from_secs(2),
+        "the edit sent again is answered",
+        || answers_sent(&said).len() == 2,
+    )
     .await;
     let answers = answers_sent(&said);
     assert_eq!(answers[0], answers[1]);
@@ -1416,7 +1418,10 @@ async fn an_edit_with_neither_an_answer_nor_its_stamp_is_a_no_answer_error_after
         .await
         .unwrap_err();
     let took = start.elapsed();
-    assert!(matches!(error, CoordinatorError::NoAnswer { .. }), "{error}");
+    assert!(
+        matches!(error, CoordinatorError::NoAnswer { .. }),
+        "{error}"
+    );
     assert!(error.to_string().contains(&peer.to_string()), "{error}");
     assert!(
         took >= OFFLINE_AFTER * 2 - POLL && took <= OFFLINE_AFTER * 2 + Duration::from_secs(1),
