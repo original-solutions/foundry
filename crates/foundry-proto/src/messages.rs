@@ -9,7 +9,12 @@ use crate::record::AnyRecord;
 use crate::settings::{Edit, SharedSettings};
 
 /// The protocol number this build speaks.
-pub const PROTOCOL: u16 = 1;
+pub const PROTOCOL: u16 = 2;
+
+/// The first protocol whose links carry the shared settings and edits. A link in an older
+/// protocol carries neither: a machine on it has no coordinator, and refuses a message whose
+/// `type` it does not know.
+pub const EDITS_SINCE: u16 = 2;
 
 /// A message between two machines' daemons, tagged by `type`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

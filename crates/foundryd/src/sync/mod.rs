@@ -38,9 +38,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
 use foundry_proto::ids::MachineId;
-use foundry_proto::messages::PeerMessage;
+use foundry_proto::messages::{EDITS_SINCE, PeerMessage};
 use foundry_proto::record::AnyRecord;
-use foundry_proto::settings::Machine;
+use foundry_proto::settings::{Edit, Machine};
 use foundry_proto::state::{SessionState, TerminalState};
 use futures::future::BoxFuture;
 use tokio::sync::mpsc;
@@ -110,6 +110,24 @@ pub trait Dialer: Send + Sync + 'static {
     fn dial(&self, peer: &Machine) -> BoxFuture<'static, io::Result<Conn>>;
 }
 
+/// Why [`Peers::send_edit`] sent nothing.
+#[derive(Debug)]
+pub enum Unsent {
+    /// No link to the machine is open.
+    NotLinked,
+    /// The open links to the machine speak this protocol, older than [`EDITS_SINCE`].
+    Older(u16),
+    /// The edit cannot be written as JSON.
+    Unwritable(serde_json::Error),
+}
+
+/// An open record link: the protocol both ends speak, and the sender that writes to it.
+#[derive(Clone)]
+struct Link {
+    speak: u16,
+    send: mpsc::Sender<String>,
+}
+
 /// This machine's links to its peers, and when each peer was last heard from.
 #[derive(Clone)]
 pub struct Peers {
@@ -126,8 +144,8 @@ struct Inner {
     /// The coordinator a record link hands settings and edits to; none until
     /// [`Peers::coordinate`]. Held weakly, as the coordinator holds these peers.
     coordinator: Mutex<Option<Weak<Coordinator>>>,
-    /// The sender of each open record link past its hellos, by peer and link number.
-    links: Mutex<BTreeMap<MachineId, BTreeMap<u64, mpsc::Sender<String>>>>,
+    /// Each open record link past its hellos, by peer and link number.
+    links: Mutex<BTreeMap<MachineId, BTreeMap<u64, Link>>>,
     next_link: AtomicU64,
 }
 
@@ -216,18 +234,29 @@ impl Peers {
         *lock(&self.inner.coordinator) = Some(Arc::downgrade(&coordinator));
     }
 
-    /// Sends `message` to `machine` on an open record link, and says whether a link took it.
-    pub async fn send(&self, machine: MachineId, message: &PeerMessage) -> bool {
-        let senders: Vec<mpsc::Sender<String>> = lock(&self.inner.links)
+    /// Sends `edit` to `machine` on an open record link that speaks [`EDITS_SINCE`] or later,
+    /// in that link's protocol, and says why when no link took it.
+    pub async fn send_edit(&self, machine: MachineId, edit: &Edit) -> Result<(), Unsent> {
+        let links: Vec<Link> = lock(&self.inner.links)
             .get(&machine)
             .map(|open| open.values().cloned().collect())
             .unwrap_or_default();
-        for sender in senders {
-            if link::send_message(&sender, message).await {
-                return true;
+        let mut unsent = Unsent::NotLinked;
+        for Link { speak, send } in links {
+            if speak < EDITS_SINCE {
+                unsent = Unsent::Older(speak);
+                continue;
+            }
+            let message = PeerMessage::Edit {
+                protocol: speak,
+                edit: edit.clone(),
+            };
+            let text = serde_json::to_string(&message).map_err(Unsent::Unwritable)?;
+            if link::send_text(&send, text).await {
+                return Ok(());
             }
         }
-        false
+        Err(unsent)
     }
 
     /// The machines heard from within [`OFFLINE_AFTER`], and this machine.
@@ -286,13 +315,14 @@ impl Inner {
         lock(&self.coordinator).as_ref().and_then(Weak::upgrade)
     }
 
-    /// Records an open link to `peer` that sends on `send`, until the returned guard drops.
-    fn opened(&self, peer: MachineId, send: mpsc::Sender<String>) -> Opened<'_> {
+    /// Records an open link to `peer` that speaks `speak` and sends on `send`, until the
+    /// returned guard drops.
+    fn opened(&self, peer: MachineId, speak: u16, send: mpsc::Sender<String>) -> Opened<'_> {
         let number = self.next_link.fetch_add(1, Ordering::Relaxed);
         lock(&self.links)
             .entry(peer)
             .or_default()
-            .insert(number, send);
+            .insert(number, Link { speak, send });
         Opened {
             inner: self,
             peer,
@@ -348,7 +378,7 @@ impl Drop for Task {
     }
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 

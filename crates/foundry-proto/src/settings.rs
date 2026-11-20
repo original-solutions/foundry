@@ -179,6 +179,9 @@ pub enum SettingValue {
 pub struct Overwritten {
     pub kept: Option<SettingValue>,
     pub lost: Option<SettingValue>,
+    /// The edit that set `lost`. When more than two sides edited the setting, the item keeps
+    /// the latest edit replaced, so every machine shows the same one.
+    pub lost_stamp: Stamp,
 }
 
 /// A change to one setting, made through the acting coordinator.
@@ -337,6 +340,7 @@ pub(crate) mod tests {
                         max_load_per_core: 0.5,
                         min_free_disk: 1,
                     })),
+                    lost_stamp: Stamp { seq: 40, by: vps },
                 },
             )]
             .into(),
@@ -429,7 +433,7 @@ pub(crate) mod tests {
             r#"{{"seq":5,"machines":[],"priority":[],"projects":[],"limits":{{}},
                 "stamps":{{"priority":{{"seq":5,"by":"{mac}"}},"overwritten:limits:{mac}":{{"seq":4,"by":"{mac}"}}}},
                 "seen":{{"{mac}":5}},
-                "overwritten":{{"limits:{mac}":{{"kept":{{"setting":"priority","value":["{mac}"]}},"lost":null}}}}}}"#
+                "overwritten":{{"limits:{mac}":{{"kept":{{"setting":"priority","value":["{mac}"]}},"lost":null,"lost_stamp":{{"seq":3,"by":"{mac}"}}}}}}}}"#
         );
         let id = MachineId(mac.parse().unwrap());
         let read: SharedSettings = serde_json::from_str(&json).unwrap();
@@ -447,6 +451,7 @@ pub(crate) mod tests {
             Overwritten {
                 kept: Some(SettingValue::Priority(vec![id])),
                 lost: None,
+                lost_stamp: Stamp { seq: 3, by: id },
             }
         );
     }

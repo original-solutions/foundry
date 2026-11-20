@@ -18,11 +18,10 @@
 //! reaches it before then waits, at most [`OFFLINE_AFTER`].
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use foundry_proto::ids::MachineId;
-use foundry_proto::messages::{PROTOCOL, PeerMessage};
 use foundry_proto::settings::{
     Edit, Overwritten, SettingKey, SettingValue, SharedSettings, Stamp, StampKey,
 };
@@ -31,14 +30,16 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::store::{Store, StoreError};
-use crate::sync::{OFFLINE_AFTER, Peers, on_store};
+use crate::sync::{OFFLINE_AFTER, Peers, Unsent, lock, on_store};
 
 /// How often an edit that waits looks again.
 const STEP: Duration = Duration::from_millis(100);
 
-/// How long an edit a peer forwarded is kept, from when it arrived, while this machine has no
-/// open link to the machine it takes to act. A machine silent for [`OFFLINE_AFTER`] is no
-/// longer reachable, so by twice that the role has moved to one this machine can reach.
+/// How long an edit a peer forwarded is kept, from when it arrived, while this machine cannot
+/// send it to the machine it takes to act: no link to it is open, or its links speak a protocol
+/// that carries no edits. A machine silent for [`OFFLINE_AFTER`] is no longer reachable, so by
+/// twice that the role has moved to one this machine can reach, unless the acting machine is
+/// reachable and older.
 const KEEP_FORWARDED: Duration = OFFLINE_AFTER.saturating_mul(2);
 
 /// Why an edit was not made.
@@ -47,8 +48,15 @@ pub enum CoordinatorError {
     #[error("no link to {0}, the acting coordinator, is open, so the edit was not sent")]
     NotLinked(MachineId),
     #[error(
+        "{acting}, the acting coordinator, speaks protocol {speaks}, which carries no edits, \
+         so the edit was not sent"
+    )]
+    Older { acting: MachineId, speaks: u16 },
+    #[error("the edit cannot be written, so it was not sent: {0}")]
+    Unwritable(serde_json::Error),
+    #[error(
         "an edit {from} forwarded was dropped: {KEEP_FORWARDED:?} after it arrived this \
-         machine still has no open link to {acting}, which acts as it sees it"
+         machine still cannot send it to {acting}, which acts as it sees it"
     )]
     Unsettled { from: MachineId, acting: MachineId },
     #[error(transparent)]
@@ -95,7 +103,8 @@ impl Coordinator {
     /// Makes `edit`. On the acting machine it is numbered once this machine has caught up, or
     /// after [`OFFLINE_AFTER`]. On any other machine it is sent to the acting one, and this
     /// returns without waiting for it to be numbered: the change shows when the settings
-    /// arrive. It fails only when no link to the acting machine is open, or the store fails.
+    /// arrive. It fails when no link to the acting machine is open, when that machine speaks a
+    /// protocol older than edits, when the edit cannot be written, or when the store fails.
     pub async fn edit(&self, edit: Edit) -> Result<(), CoordinatorError> {
         self.edit_from(None, Instant::now(), edit).await
     }
@@ -146,8 +155,7 @@ impl Coordinator {
     /// goes back only once their views agree: when a copy of the settings taken from that
     /// machine after the edit arrived still leaves it acting, or at the latest
     /// [`OFFLINE_AFTER`] after the edit arrived. The forwarding machine, acting, then numbers
-    /// it. While there is no open link to the acting machine it is kept until
-    /// [`KEEP_FORWARDED`].
+    /// it. While it cannot be sent to the acting machine it is kept until [`KEEP_FORWARDED`].
     async fn edit_from(
         &self,
         from: Option<MachineId>,
@@ -170,19 +178,24 @@ impl Coordinator {
             ) {
                 Next::Number => return self.number(edit).await,
                 Next::Send(acting) => {
-                    let message = PeerMessage::Edit {
-                        protocol: PROTOCOL,
-                        edit: edit.clone(),
+                    let unsent = match self.peers.send_edit(acting, &edit).await {
+                        Ok(()) => return Ok(()),
+                        Err(unsent) => unsent,
                     };
-                    if self.peers.send(acting, &message).await {
-                        return Ok(());
-                    }
-                    match from {
-                        None => return Err(CoordinatorError::NotLinked(acting)),
-                        Some(from) if waited >= KEEP_FORWARDED => {
+                    match (from, unsent) {
+                        (_, Unsent::Unwritable(error)) => {
+                            return Err(CoordinatorError::Unwritable(error));
+                        }
+                        (None, Unsent::NotLinked) => {
+                            return Err(CoordinatorError::NotLinked(acting));
+                        }
+                        (None, Unsent::Older(speaks)) => {
+                            return Err(CoordinatorError::Older { acting, speaks });
+                        }
+                        (Some(from), _) if waited >= KEEP_FORWARDED => {
                             return Err(CoordinatorError::Unsettled { from, acting });
                         }
-                        Some(_) => {}
+                        (Some(_), _) => {}
                     }
                 }
                 Next::Wait => {}
@@ -236,10 +249,6 @@ impl Coordinator {
         let listed = held.machines.iter().all(|m| has(&m.id));
         reachable && (listed || self.started.elapsed() >= OFFLINE_AFTER)
     }
-}
-
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// What a waiting edit does next.
@@ -331,9 +340,13 @@ pub fn merge(a: &SharedSettings, b: &SharedSettings) -> SharedSettings {
             std::cmp::Ordering::Less => false,
             // One edit, or two copies no edit has stamped: pick by the value, the same way on
             // every machine.
-            std::cmp::Ordering::Equal => text(&va) >= text(&vb),
+            std::cmp::Ordering::Equal => rank(&va) >= rank(&vb),
         };
-        let (held, lost, stamp) = if a_holds { (va, vb, sa) } else { (vb, va, sb) };
+        let (held, lost, stamp, lost_stamp) = if a_holds {
+            (va, vb, sa, sb)
+        } else {
+            (vb, va, sb, sa)
+        };
         // Two sides that set one value raise nothing: no value was lost.
         if let StampKey::Setting(setting) = key
             && held != lost
@@ -343,14 +356,19 @@ pub fn merge(a: &SharedSettings, b: &SharedSettings) -> SharedSettings {
             let item = Overwritten {
                 kept: self::setting(&held),
                 lost: self::setting(&lost),
+                lost_stamp,
             };
             conflicts.push((setting.clone(), item, stamp));
         }
         put(&mut out, key, held, stamp);
     }
-    for (key, item, stamp) in conflicts {
-        let key = StampKey::Overwritten(key);
-        if stamp > self::stamp(&out, &key) {
+    // An item from this merge replaces one held for the same setting only when it is about a
+    // later edit kept or, for the same edit kept, a later edit lost: so with three or more
+    // sides, every order of merging keeps the latest edit each side lost to.
+    for (setting, item, stamp) in conflicts {
+        let held_lost = out.overwritten.get(&setting).map(|i| i.lost_stamp);
+        let key = StampKey::Overwritten(setting);
+        if (stamp, Some(item.lost_stamp)) > (self::stamp(&out, &key), held_lost) {
             put(&mut out, &key, Some(Value::Item(item)), stamp);
         }
     }
@@ -396,6 +414,16 @@ fn setting(value: &Option<Value>) -> Option<SettingValue> {
         Some(Value::Setting(v)) => Some(v.clone()),
         _ => None,
     }
+}
+
+/// How two values with one stamp are ordered, the same way on every machine: of two items, the
+/// one about the later edit lost holds; otherwise, and on a tie, by the value as JSON text.
+fn rank(value: &Option<Value>) -> (Option<Stamp>, String) {
+    let lost = match value {
+        Some(Value::Item(item)) => Some(item.lost_stamp),
+        _ => None,
+    };
+    (lost, text(value))
 }
 
 /// `value` as JSON text, to order two values the same way on every machine.
@@ -767,6 +795,7 @@ mod tests {
             Overwritten {
                 kept: Some(SettingValue::Project(project(7, "from b"))),
                 lost: Some(SettingValue::Project(project(7, "from a"))),
+                lost_stamp: Stamp { seq: 2, by: id(A) },
             }
         );
         assert_eq!(
@@ -782,6 +811,60 @@ mod tests {
         let out = merged(&a, &b);
         assert_eq!(project_named(&out, 7).as_deref(), Some("from a"));
         assert_eq!(out.overwritten.len(), 1);
+    }
+
+    #[test]
+    fn three_sides_of_a_split_reach_one_result_in_any_order_and_the_item_keeps_the_runner_up() {
+        const C: u128 = 3;
+        let id7 = project(7, "x").id;
+        // Three sides each edit project 7, numbered 2 by a, 3 by b and 4 by c. As text, a's
+        // value sorts after b's, so the item cannot reach b's value by text alone.
+        let a = numbered(&base(), &set_project(7, "from the first side"), id(A));
+        let b = numbered(&base(), &set_project(8, "b's other"), id(B));
+        let b = numbered(&b, &set_project(7, "from b"), id(B));
+        let mut c = base();
+        for n in [9, 10] {
+            c = numbered(&c, &set_project(n, "c's other"), id(C));
+        }
+        let c = numbered(&c, &set_project(7, "from c"), id(C));
+
+        let copies = [("a", &a), ("b", &b), ("c", &c)];
+        let mut results = Vec::new();
+        for [x, y, z] in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let ((nx, x), (ny, y), (nz, z)) = (copies[x], copies[y], copies[z]);
+            results.push((format!("({nx} {ny}) {nz}"), merge(&merge(x, y), z)));
+            // Two machines that each met the third side meet each other.
+            results.push((
+                format!("({nx} {nz}) ({ny} {nz})"),
+                merge(&merge(x, z), &merge(y, z)),
+            ));
+        }
+        let (_, first) = &results[0];
+        for (order, result) in &results {
+            assert!(
+                same_settings(result, first),
+                "{order} gives {:?}, not {:?}",
+                result.overwritten,
+                first.overwritten
+            );
+        }
+        assert_eq!(project_named(first, 7).as_deref(), Some("from c"));
+        // The item shows the value that held and the latest edit it replaced.
+        assert_eq!(
+            first.overwritten[&SettingKey::Project(id7)],
+            Overwritten {
+                kept: Some(SettingValue::Project(project(7, "from c"))),
+                lost: Some(SettingValue::Project(project(7, "from b"))),
+                lost_stamp: Stamp { seq: 3, by: id(B) },
+            }
+        );
     }
 
     #[test]
@@ -843,6 +926,7 @@ mod tests {
             Overwritten {
                 kept: Some(SettingValue::Project(project(7, "kept"))),
                 lost: None,
+                lost_stamp: Stamp { seq: 3, by: id(A) },
             }
         );
     }

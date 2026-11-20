@@ -2,21 +2,22 @@
 //!
 //! The dialing end says hello first. The accepting end waits for that hello and answers in
 //! the lower of the two protocol numbers, and from then on each end sends in that protocol, so
-//! a newer machine speaks the older form to an older peer. With one protocol so far, the forms
-//! differ only in the number; a later protocol that changes a message's shape converts it to
-//! the older shape where [`records_message`] builds it.
+//! a newer machine speaks the older form to an older peer. Protocol 1 has no shared settings
+//! or edits on a link (see [`EDITS_SINCE`]), so a link in it sends neither; otherwise the
+//! forms differ only in the number. A later protocol that changes a message's shape converts
+//! it to the older shape where [`records_message`] builds it.
 //!
 //! Past the hellos, sending and reading run side by side, so a send that waits on a slow peer
 //! never stops this end hearing it.
 //!
-//! Once a coordinator is set ([`super::Peers::coordinate`]), each end sends the shared
-//! settings it holds first after the hellos, before any record, and again whenever their
-//! `seq` changes; a machine is therefore never heard from on a new link before its settings
-//! are taken. Settings and edits a link receives go to the coordinator, which merges them;
+//! Once a coordinator is set ([`super::Peers::coordinate`]), each end of a link that speaks
+//! [`EDITS_SINCE`] or later sends the shared settings it holds first after the hellos, before
+//! any record, and again whenever their `seq` changes; a machine is therefore never heard from
+//! on such a link before its settings are taken. Settings and edits a link receives go to the coordinator, which merges them;
 //! with none set they are ignored.
 
 use foundry_proto::ids::MachineId;
-use foundry_proto::messages::{PROTOCOL, PeerMessage};
+use foundry_proto::messages::{EDITS_SINCE, PROTOCOL, PeerMessage};
 use foundry_proto::record::AnyRecord;
 use serde::Serialize;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -45,7 +46,7 @@ pub(super) async fn run(
     let Some(open) = hello(inner, &send, &mut recv, dialed, first).await else {
         return;
     };
-    let _opened = inner.opened(open.peer, send.clone());
+    let _opened = inner.opened(open.peer, open.speak, send.clone());
     tokio::select! {
         () = sending(inner, &send, &open) => {}
         () = reading(inner, &mut recv, open.peer) => {}
@@ -74,15 +75,16 @@ async fn sending(inner: &Inner, send: &Sender<String>, open: &Open) {
     }
 }
 
-/// Sends the shared settings this machine holds when a coordinator is set and their `seq` is
-/// not the one last sent on this link (`last`), and says whether the link is still open.
+/// Sends the shared settings this machine holds when a coordinator is set, the link speaks
+/// [`EDITS_SINCE`] or later, and their `seq` is not the one last sent on this link (`last`),
+/// and says whether the link is still open.
 async fn send_settings(
     inner: &Inner,
     send: &Sender<String>,
     open: &Open,
     last: &mut Option<u64>,
 ) -> bool {
-    if inner.coordinator().is_none() {
+    if inner.coordinator().is_none() || open.speak < EDITS_SINCE {
         return true;
     }
     let settings = match on_store(&inner.store, |store| store.settings()).await {
@@ -307,13 +309,18 @@ pub(super) async fn listed(inner: &Inner, machine: MachineId) -> bool {
 /// Sends `message`, and says whether the link is still open. A message that cannot be
 /// written as JSON is skipped. A peer that takes nothing for [`OFFLINE_AFTER`] ends the link.
 pub(super) async fn send_message(send: &Sender<String>, message: &impl Serialize) -> bool {
-    let text = match serde_json::to_string(message) {
-        Ok(text) => text,
+    match serde_json::to_string(message) {
+        Ok(text) => send_text(send, text).await,
         Err(error) => {
             tracing::warn!("sync: a message could not be written: {error}");
-            return true;
+            true
         }
-    };
+    }
+}
+
+/// Sends a message already written as JSON, and says whether the link is still open, as
+/// [`send_message`] does.
+pub(super) async fn send_text(send: &Sender<String>, text: String) -> bool {
     matches!(timeout(OFFLINE_AFTER, send.send(text)).await, Ok(Ok(())))
 }
 

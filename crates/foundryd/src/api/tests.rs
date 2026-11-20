@@ -1741,7 +1741,7 @@ async fn ids_that_do_not_parse_and_a_base_that_is_not_there_are_answered_in_json
 
 #[test]
 fn a_projects_repo_inside_an_overwritten_item_is_shown_redacted() {
-    use foundry_proto::settings::{Overwritten, SettingKey, SettingValue, SharedSettings};
+    use foundry_proto::settings::{Overwritten, SettingKey, SettingValue, SharedSettings, Stamp};
     let project = |name: &str, secret: &str| Project {
         id: ProjectId(uuid::Uuid::from_u128(7)),
         name: name.into(),
@@ -1755,6 +1755,7 @@ fn a_projects_repo_inside_an_overwritten_item_is_shown_redacted() {
                 Overwritten {
                     kept: Some(SettingValue::Project(project("kept", "kept-secret"))),
                     lost: Some(SettingValue::Project(project("lost", "lost-secret"))),
+                    lost_stamp: Stamp::NONE,
                 },
             ),
             (
@@ -1762,6 +1763,7 @@ fn a_projects_repo_inside_an_overwritten_item_is_shown_redacted() {
                 Overwritten {
                     kept: None,
                     lost: Some(SettingValue::Project(project("gone", "gone-secret"))),
+                    lost_stamp: Stamp::NONE,
                 },
             ),
         ]

@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use foundry_proto::ids::{MachineId, ProjectId, WorkspaceId};
-use foundry_proto::messages::{PROTOCOL, PeerMessage};
+use foundry_proto::messages::{EDITS_SINCE, PROTOCOL, PeerMessage};
 use foundry_proto::record::AnyRecord;
 use foundry_proto::settings::{
     Edit, Limits, Overwritten, Project, SettingKey, SettingValue, SharedSettings, Stamp, StampKey,
@@ -273,6 +273,52 @@ async fn an_edit_with_no_open_link_to_the_acting_machine_is_an_error() {
     assert!(error.to_string().contains(&first.to_string()), "{error}");
 }
 
+#[tokio::test(start_paused = true)]
+async fn an_edit_that_cannot_be_written_is_an_error_not_sent() {
+    let fleet = Fleet::start_coordinated(2);
+    settled(&fleet, fleet.daemons[0].id).await;
+    let edit = Edit::SetLimits {
+        machine: fleet.daemons[1].id,
+        limits: Limits {
+            max_sessions: 2,
+            max_load_per_core: f64::NAN,
+            min_free_disk: 1,
+        },
+    };
+    let error = fleet.daemons[1].coordinator().edit(edit).await.unwrap_err();
+    assert!(error.to_string().contains("not sent"), "{error}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_acting_machine_on_the_older_protocol_is_sent_no_edit_and_no_settings() {
+    let older = MachineId::random();
+    let fleet = Fleet::start_coordinated_with(1, &[older]);
+    let daemon = &fleet.daemons[0];
+    // The older machine is first in the order. It sends no settings, so this copy says so.
+    let mut held = daemon.settings();
+    held.seq += 1;
+    held.priority = vec![older, daemon.id];
+    lock(&daemon.store).apply_settings(held).unwrap();
+    let (conn, said) = recorded(raw_link_speaking(daemon, older, EDITS_SINCE - 1).await);
+    let _beating = beating(conn);
+    acting_becomes(&daemon.coordinator(), older, WAIT).await;
+
+    let error = daemon
+        .coordinator()
+        .edit(set_project(7, "p"))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains(&older.to_string()), "{error}");
+    assert!(error.to_string().contains("protocol"), "{error}");
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let said = lock(&said);
+    assert!(!said.is_empty(), "the link sent nothing");
+    for message in said.iter() {
+        assert_eq!(message["type"], "records", "{message}");
+        assert_eq!(message["protocol"], EDITS_SINCE - 1, "{message}");
+    }
+}
+
 // --- splits ---
 
 #[tokio::test(start_paused = true)]
@@ -285,6 +331,10 @@ async fn after_a_split_with_one_edit_on_each_side_the_later_one_holds_and_an_ite
         .edit(set_project(7, "from the cut side"))
         .await
         .unwrap();
+    let cut_edit = Stamp {
+        seq: fleet.daemons[0].settings().seq,
+        by: fleet.daemons[0].id,
+    };
     // The other side edits something else first, so its edit to the project is the later one.
     let other = fleet.daemons[1].coordinator();
     other
@@ -307,6 +357,7 @@ async fn after_a_split_with_one_edit_on_each_side_the_later_one_holds_and_an_ite
             Overwritten {
                 kept: Some(SettingValue::Project(project(7, "from the rest"))),
                 lost: Some(SettingValue::Project(project(7, "from the cut side"))),
+                lost_stamp: cut_edit,
             }
         )]
         .into()
@@ -449,13 +500,18 @@ async fn a_dismissed_item_stays_dismissed_after_it_reaches_a_machine_that_still_
 /// A link to `daemon` that the test speaks on as `machine`: the hello is sent, and the
 /// daemon's hello read.
 async fn raw_link(daemon: &Daemon, machine: MachineId) -> Conn {
+    raw_link_speaking(daemon, machine, PROTOCOL).await
+}
+
+/// As [`raw_link`], with the test's hello naming `protocol`.
+async fn raw_link_speaking(daemon: &Daemon, machine: MachineId, protocol: u16) -> Conn {
     let (mut mine, theirs) = Conn::pair();
     let peers = daemon.peers.clone();
     tokio::spawn(async move { peers.accept(theirs).await });
     send(
         &mine,
         &PeerMessage::Hello {
-            protocol: PROTOCOL,
+            protocol,
             machine,
             versions: Default::default(),
         },
