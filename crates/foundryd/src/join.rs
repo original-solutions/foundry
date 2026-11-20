@@ -694,28 +694,23 @@ impl Keys {
     /// Serves a link a peer opened, as [`Peers::accept`] does, once both ends have proved
     /// their keys and the link's first message, a hello or a relay, names the machine proved.
     /// The link closes when that machine is revoked.
-    pub async fn accept(&self, peers: &Peers, conn: Conn) {
-        let Conn { send, mut recv } = conn;
-        let Some((machine, hello)) = self.admit(&send, &mut recv).await else {
+    pub async fn accept(&self, peers: &Peers, mut conn: Conn) {
+        let Some((machine, first)) = self.admit(&conn.send, &mut conn.recv).await else {
             return;
         };
-        let (near, far) = Conn::pair();
-        if near.send.send(hello).await.is_err() {
-            return;
-        }
         tokio::select! {
-            () = peers.accept(far) => {}
-            () = relay(Conn { send, recv }, near, self.clone(), machine) => {}
+            () = peers.accept_opened(conn, first) => {}
+            () = revoked(self, machine) => {}
         }
     }
 
     /// The accepting end of the handshake. Returns the machine proved and its first message,
-    /// a hello or a relay.
+    /// a hello or a relay, parsed.
     async fn admit(
         &self,
         send: &Sender<String>,
         recv: &mut Receiver<String>,
-    ) -> Option<(MachineId, String)> {
+    ) -> Option<(MachineId, PeerMessage)> {
         let me = self.me();
         let Some(Handshake::Challenge {
             machine,
@@ -751,12 +746,12 @@ impl Keys {
             refuse(refused);
             return None;
         }
-        let hello = timeout(OFFLINE_AFTER, recv.recv()).await.ok()??;
-        match serde_json::from_str(&hello) {
+        let text = timeout(OFFLINE_AFTER, recv.recv()).await.ok()??;
+        match serde_json::from_str(&text) {
             Ok(
-                PeerMessage::Hello { machine: named, .. }
-                | PeerMessage::Relay { machine: named, .. },
-            ) if named == machine => Some((machine, hello)),
+                first @ (PeerMessage::Hello { machine: named, .. }
+                | PeerMessage::Relay { machine: named, .. }),
+            ) if named == machine => Some((machine, first)),
             _ => {
                 tracing::warn!(
                     "join: refused a link from {machine}: its first message names another"
@@ -951,20 +946,23 @@ async fn relay(outer: Conn, inner: Conn, keys: Keys, peer: MachineId) {
         send: in_send,
         recv: mut in_recv,
     } = inner;
-    let watch = async {
-        let mut every = tokio::time::interval(RECHECK);
-        loop {
-            every.tick().await;
-            if let Err(refused) = keys.admitted(peer) {
-                tracing::info!("join: link with {peer} closed: {refused}");
-                return;
-            }
-        }
-    };
     tokio::select! {
         () = forward(&mut out_recv, &in_send) => {}
         () = forward(&mut in_recv, &out_send) => {}
-        () = watch => {}
+        () = revoked(&keys, peer) => {}
+    }
+}
+
+/// Returns once `keys` no longer admits `peer`, checked every [`RECHECK`], so a link with it
+/// selected against this closes.
+async fn revoked(keys: &Keys, peer: MachineId) {
+    let mut every = tokio::time::interval(RECHECK);
+    loop {
+        every.tick().await;
+        if let Err(refused) = keys.admitted(peer) {
+            tracing::info!("join: link with {peer} closed: {refused}");
+            return;
+        }
     }
 }
 

@@ -167,21 +167,29 @@ impl Peers {
         }
     }
 
-    /// Serves a link a peer opened, until it ends. A link that opens with a
-    /// [`PeerMessage::Relay`] goes to the relay; every other link carries records.
-    pub async fn accept(&self, conn: Conn) {
-        let Conn { send, mut recv } = conn;
-        let Ok(Some(first)) = tokio::time::timeout(OFFLINE_AFTER, recv.recv()).await else {
+    /// Serves a link a peer opened, until it ends: reads and parses its first message, then
+    /// serves it as [`Peers::accept_opened`] does.
+    pub async fn accept(&self, mut conn: Conn) {
+        let Ok(Some(text)) = tokio::time::timeout(OFFLINE_AFTER, conn.recv.recv()).await else {
             return;
         };
-        if let Ok(PeerMessage::Relay {
-            machine, terminal, ..
-        }) = serde_json::from_str(&first)
-        {
-            return relay::serve(&self.inner, machine, terminal, Conn { send, recv }).await;
+        let Ok(first) = serde_json::from_str(&text) else {
+            tracing::warn!("sync: a link opened without a hello");
+            return;
+        };
+        self.accept_opened(conn, first).await;
+    }
+
+    /// Serves a link a peer opened whose first message, `first`, has already been read from
+    /// `conn`, until it ends. A link that opens with a [`PeerMessage::Relay`] goes to the
+    /// relay; every other link carries records, and takes `first` as its hello.
+    pub async fn accept_opened(&self, conn: Conn, first: PeerMessage) {
+        match first {
+            PeerMessage::Relay {
+                machine, terminal, ..
+            } => relay::serve(&self.inner, machine, terminal, conn).await,
+            hello => link::run(&self.inner, conn, None, Some(hello)).await,
         }
-        // The record link takes the first message as its hello.
-        link::run(&self.inner, Conn { send, recv }, None, Some(first)).await;
     }
 
     /// Serves `terminals` to peers that open a relay to one of them. Until this is called, a
