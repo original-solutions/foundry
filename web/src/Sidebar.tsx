@@ -2,6 +2,7 @@ import { useMutation } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { ArchiveButton, button } from "./ArchiveButton";
 import { CreateWorkspace } from "./CreateWorkspace";
+import { NewSession } from "./NewSession";
 import { startShell, type Project } from "./api";
 import { machineNumbers, type MachineView, type WorkspaceView } from "./fleet";
 import { sessionLabel, terminalLabel } from "./labels";
@@ -51,6 +52,7 @@ function Workspace({ workspace, selected }: { workspace: WorkspaceView; selected
         {workspace.branch} · {workspace.project}
       </div>
       <div className="flex flex-wrap gap-1">
+        <NewSession workspace={workspace.id} name={workspace.name} />
         <button type="button" className={button} onClick={() => shell.mutate()} disabled={shell.isPending}>
           New shell
         </button>

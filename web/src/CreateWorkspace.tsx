@@ -4,25 +4,24 @@ import { Dialog } from "radix-ui";
 import { button } from "./ArchiveButton";
 import { ApiError, createWorkspace, startSession, type Project } from "./api";
 
-const field = "mt-1 w-full rounded border border-neutral-600 bg-neutral-950 px-2 py-1 text-sm";
+export const field = "mt-1 w-full rounded border border-neutral-600 bg-neutral-950 px-2 py-1 text-sm";
+
+/** The workspace was made, but its session did not start. */
+class SessionNotStarted extends ApiError {}
 
 /** The "New workspace" button and its dialog: makes the workspace, then starts a session in it. */
 export function CreateWorkspace({ projects }: { projects: Project[] }) {
   const [open, setOpen] = useState(false);
   const [project, setProject] = useState("");
-  // Once the workspace exists, a second create would only find its name taken, so the dialog
-  // then offers Close alone, with what went wrong.
-  const [made, setMade] = useState(false);
   const create = useMutation({
     mutationFn: async (input: { project: string; base: string; name: string; model: string }) => {
       const workspace = await createWorkspace({ project: input.project, base: input.base, name: input.name });
-      setMade(true);
       // The workspace is usable when its setup did not start, so its session is started all the same.
       try {
         await startSession(workspace.id, input.model);
       } catch (error) {
         const setup = workspace.error ? ` Also: ${workspace.error}` : "";
-        throw new ApiError(`The workspace was made, but its session did not start: ${error instanceof Error ? error.message : error}.${setup}`);
+        throw new SessionNotStarted(`The workspace was made, but its session did not start: ${error instanceof Error ? error.message : error}.${setup}`);
       }
       return workspace.error ?? null;
     },
@@ -31,10 +30,13 @@ export function CreateWorkspace({ projects }: { projects: Project[] }) {
     },
   });
   const warning = create.data ?? null;
+  // Once the workspace exists, a second create would only find its name taken, so the dialog
+  // then offers Close alone, with what went wrong. Read from the mutation, which a reset
+  // detaches from a call still on its way.
+  const made = create.isSuccess || create.error instanceof SessionNotStarted;
 
   const change = (next: boolean) => {
     setOpen(next);
-    setMade(false);
     create.reset();
   };
 

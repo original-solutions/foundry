@@ -3,11 +3,14 @@ import type { AnyRecord, MachineSample, SessionState, SharedSettings, TerminalSt
 export interface FleetState {
   records: AnyRecord[];
   settings: SharedSettings;
+  /** True once a full state has arrived, so a missing record means it is not there. */
+  synced: boolean;
 }
 
 export const emptyState: FleetState = {
   records: [],
   settings: { seq: 0, machines: [], priority: [], projects: [], limits: {} },
+  synced: false,
 };
 
 /** A machine sample is one per owner; every other record is one per kind and body id. */
@@ -17,7 +20,7 @@ const key = (record: AnyRecord) => (record.kind === "machine_sample" ? `sample:$
 export function apply(state: FleetState, message: UiMessage): FleetState {
   switch (message.type) {
     case "state":
-      return { records: message.records, settings: message.settings };
+      return { records: message.records, settings: message.settings, synced: true };
     case "settings":
       return { ...state, settings: message.settings };
     case "record": {
@@ -30,6 +33,15 @@ export function apply(state: FleetState, message: UiMessage): FleetState {
       return { ...state, records: state.records.map((r, i) => (i === at ? next : r)) };
     }
   }
+}
+
+/**
+ * Whether terminal `id` is listed as running and not deleted, or `undefined` before the first
+ * full state, when nothing is known yet.
+ */
+export function terminalRunning(state: FleetState, id: string): boolean | undefined {
+  if (!state.synced) return undefined;
+  return state.records.some((r) => r.kind === "terminal" && r.body.id === id && !r.deleted && r.body.state === "running");
 }
 
 export interface SessionView {
