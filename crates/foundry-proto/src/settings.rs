@@ -161,15 +161,32 @@ pub struct Overwritten {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Edit {
-    SetMachine { machine: Machine },
-    RemoveMachine { id: MachineId },
-    Priority { order: Vec<MachineId> },
-    SetProject { project: Project },
-    RemoveProject { id: ProjectId },
-    SetLimits { machine: MachineId, limits: Limits },
-    RemoveLimits { machine: MachineId },
+    SetMachine {
+        machine: Machine,
+    },
+    RemoveMachine {
+        id: MachineId,
+    },
+    Priority {
+        order: Vec<MachineId>,
+    },
+    SetProject {
+        project: Project,
+    },
+    RemoveProject {
+        id: ProjectId,
+    },
+    SetLimits {
+        machine: MachineId,
+        limits: Limits,
+    },
+    RemoveLimits {
+        machine: MachineId,
+    },
     /// Dismisses the "setting overwritten" item about `setting`.
-    Dismiss { setting: SettingKey },
+    Dismiss {
+        setting: SettingKey,
+    },
 }
 
 impl Edit {

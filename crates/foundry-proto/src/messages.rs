@@ -87,8 +87,8 @@ impl UiMessage {
 mod tests {
     use super::*;
     use crate::record::tests::{machine_sample, session, terminal, workspace};
-    use crate::settings::tests::settings;
     use crate::settings::SettingKey;
+    use crate::settings::tests::settings;
     use crate::{assert_round_trip, parse_error};
 
     fn records() -> Vec<AnyRecord> {
