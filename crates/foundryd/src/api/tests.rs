@@ -104,6 +104,20 @@ impl Daemon {
 
     /// A daemon whose terminals start the holder at `holder`.
     async fn start(script: &str, holder: PathBuf, names: &[&str]) -> Self {
+        Self::start_with(script, holder, names, None).await
+    }
+
+    /// A daemon with no gateway, whose session starts here are refused with `said`.
+    async fn refusing_sessions(said: &str) -> Self {
+        Self::start_with(TURN, built("foundry-holder"), &[], Some(said)).await
+    }
+
+    async fn start_with(
+        script: &str,
+        holder: PathBuf,
+        names: &[&str],
+        refused: Option<&str>,
+    ) -> Self {
         // A Unix socket path is at most about 100 bytes, which the system's own temporary
         // folder on macOS would take most of.
         let data = tempfile::Builder::new()
@@ -148,7 +162,7 @@ impl Daemon {
         ));
         let hook_router = sessions.router();
         let peers = Peers::new(me, store.clone(), Arc::new(NoDial));
-        let api = Api::new(
+        let mut api = Api::new(
             store.clone(),
             peers.clone(),
             terminals.clone(),
@@ -156,6 +170,7 @@ impl Daemon {
             sessions,
             names.iter().map(|n| (*n).to_owned()).collect(),
         );
+        api.sessions_refused = refused.map(str::to_owned);
         let listener = bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let servers = vec![
@@ -2143,4 +2158,288 @@ async fn changes_list_each_file_with_its_hunks_and_hide_credentials_in_urls() {
         )
         .await;
     assert_eq!(reply.status, 404, "{}", reply.body);
+}
+
+// --- calls carried to another machine ---
+
+/// A workspace of `owner`, held here as a peer's record is.
+fn peer_workspace(daemon: &Daemon, owner: MachineId) -> WorkspaceId {
+    let id = WorkspaceId::random();
+    let record = AnyRecord::Workspace(Record {
+        owner,
+        version: 1,
+        deleted: false,
+        body: foundry_proto::record::Workspace {
+            id,
+            project: ProjectId::random(),
+            name: "far work".into(),
+            branch: "far-work".into(),
+            base: "main".into(),
+        },
+    });
+    daemon.store.lock().unwrap().apply(&record, owner).unwrap();
+    id
+}
+
+#[tokio::test]
+async fn machines_lists_this_machine_and_each_listed_one_with_whether_it_is_online() {
+    let daemon = Daemon::new(TURN).await;
+    let peer = daemon.add_machine();
+    let reply = daemon.call("GET", "/api/machines", None).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(
+        reply.json(),
+        serde_json::json!({
+            "me": daemon.me,
+            "machines": [{"id": peer, "name": "peer", "online": false}],
+        })
+    );
+}
+
+#[tokio::test]
+async fn a_create_naming_this_machine_makes_the_workspace_here() {
+    let daemon = Daemon::new(TURN).await;
+    let project = daemon.project();
+    let body = serde_json::json!({"project": project, "base": "main", "name": "here", "machine": daemon.me});
+    let reply = daemon.call("POST", "/api/workspaces", Some(body)).await;
+    assert_eq!(reply.status, 201, "{}", reply.body);
+    let id: WorkspaceId = reply.id();
+    assert!(
+        daemon
+            .records()
+            .iter()
+            .any(|r| matches!(r, AnyRecord::Workspace(w) if w.body.id == id))
+    );
+}
+
+#[tokio::test]
+async fn a_create_naming_a_machine_not_listed_is_404_and_makes_nothing() {
+    let daemon = Daemon::new(TURN).await;
+    let project = daemon.project();
+    let stranger = MachineId::random();
+    let body =
+        serde_json::json!({"project": project, "base": "main", "name": "far", "machine": stranger});
+    let reply = daemon.call("POST", "/api/workspaces", Some(body)).await;
+    assert_eq!(reply.status, 404, "{}", reply.body);
+    assert!(
+        reply.json()["error"]
+            .as_str()
+            .unwrap()
+            .contains(&stranger.to_string())
+    );
+    assert!(
+        daemon
+            .records()
+            .iter()
+            .all(|r| !matches!(r, AnyRecord::Workspace(_)))
+    );
+}
+
+#[tokio::test]
+async fn a_create_or_action_for_an_offline_machine_is_503_naming_it_and_changes_nothing() {
+    let daemon = Daemon::new(TURN).await;
+    let project = daemon.project();
+    let peer = daemon.add_machine();
+    let body =
+        serde_json::json!({"project": project, "base": "main", "name": "far", "machine": peer});
+    let reply = daemon.call("POST", "/api/workspaces", Some(body)).await;
+    assert_eq!(reply.status, 503, "{}", reply.body);
+    assert_eq!(reply.json()["error"], "peer is offline");
+
+    let workspace = peer_workspace(&daemon, peer);
+    for (path, body) in [
+        ("sessions", Some(serde_json::json!({"model": MODEL}))),
+        ("shells", None),
+        ("archive", Some(serde_json::json!({"force": true}))),
+    ] {
+        let path = format!("/api/workspaces/{workspace}/{path}");
+        let reply = daemon.call("POST", &path, body).await;
+        assert_eq!(reply.status, 503, "{path}: {}", reply.body);
+        assert_eq!(reply.json()["error"], "peer is offline", "{path}");
+    }
+    assert!(daemon.records().iter().all(|r| !matches!(
+        r,
+        AnyRecord::Workspace(_) | AnyRecord::Terminal(_) | AnyRecord::Session(_)
+    )));
+}
+
+#[tokio::test]
+async fn a_close_of_an_offline_machines_terminal_is_503_naming_it() {
+    let daemon = Daemon::new(TURN).await;
+    let peer = daemon.add_machine();
+    let terminal = TerminalId::random();
+    let record = AnyRecord::Terminal(Record {
+        owner: peer,
+        version: 1,
+        deleted: false,
+        body: foundry_proto::record::Terminal {
+            id: terminal,
+            workspace: WorkspaceId::random(),
+            state: TerminalState::Running,
+            exit_code: None,
+        },
+    });
+    daemon.store.lock().unwrap().apply(&record, peer).unwrap();
+    let reply = daemon
+        .call("POST", &format!("/api/terminals/{terminal}/close"), None)
+        .await;
+    assert_eq!(reply.status, 503, "{}", reply.body);
+    assert_eq!(reply.json()["error"], "peer is offline");
+}
+
+/// `method path` with `body`, marked as a call carried here from another machine.
+async fn carried(daemon: &Daemon, path: &str, body: Option<serde_json::Value>) -> Reply {
+    let host = daemon.host();
+    let headers = [("Host", host.as_str()), (crate::sync::call::CARRIED, "1")];
+    daemon.raw("POST", path, &headers, body).await
+}
+
+#[tokio::test]
+async fn a_carried_create_naming_another_machine_is_refused_and_never_carried_on() {
+    let daemon = Daemon::new(TURN).await;
+    let project = daemon.project();
+    let peer = daemon.add_machine();
+    let body =
+        serde_json::json!({"project": project, "base": "main", "name": "far", "machine": peer});
+    let reply = carried(&daemon, "/api/workspaces", Some(body)).await;
+    assert_eq!(reply.status, 421, "{}", reply.body);
+    assert!(
+        daemon
+            .records()
+            .iter()
+            .all(|r| !matches!(r, AnyRecord::Workspace(_)))
+    );
+
+    let body = serde_json::json!({"project": project, "base": "main", "name": "unnamed"});
+    let reply = carried(&daemon, "/api/workspaces", Some(body)).await;
+    assert_eq!(
+        reply.status, 421,
+        "a carried create names its owner: {}",
+        reply.body
+    );
+    assert!(
+        daemon
+            .records()
+            .iter()
+            .all(|r| !matches!(r, AnyRecord::Workspace(_)))
+    );
+
+    let body = serde_json::json!({"project": project, "base": "main", "name": "here", "machine": daemon.me});
+    let reply = carried(&daemon, "/api/workspaces", Some(body)).await;
+    assert_eq!(reply.status, 201, "{}", reply.body);
+}
+
+#[tokio::test]
+async fn a_carried_action_on_another_machines_workspace_runs_only_here_and_is_404() {
+    let daemon = Daemon::new(TURN).await;
+    let peer = daemon.add_machine();
+    let workspace = peer_workspace(&daemon, peer);
+    let path = format!("/api/workspaces/{workspace}/shells");
+    let reply = carried(&daemon, &path, None).await;
+    assert_eq!(reply.status, 404, "{}", reply.body);
+}
+
+#[tokio::test]
+async fn a_session_start_with_no_gateway_is_refused_here_but_one_for_a_peers_workspace_is_carried()
+{
+    let daemon = Daemon::refusing_sessions("set FOUNDRY_GATEWAY_URL").await;
+    let project = daemon.project();
+    let here = daemon.create_workspace(project, "here").await;
+    let reply = daemon
+        .call(
+            "POST",
+            &format!("/api/workspaces/{here}/sessions"),
+            Some(serde_json::json!({"model": MODEL})),
+        )
+        .await;
+    assert_eq!(reply.status, 503, "{}", reply.body);
+    assert_eq!(reply.json()["error"], "set FOUNDRY_GATEWAY_URL");
+    let shell = daemon
+        .call("POST", &format!("/api/workspaces/{here}/shells"), None)
+        .await;
+    assert_eq!(shell.status, 201, "{}", shell.body);
+
+    let peer = daemon.add_machine();
+    let far = peer_workspace(&daemon, peer);
+    let reply = daemon
+        .call(
+            "POST",
+            &format!("/api/workspaces/{far}/sessions"),
+            Some(serde_json::json!({"model": MODEL})),
+        )
+        .await;
+    assert_eq!(reply.status, 503, "{}", reply.body);
+    assert_eq!(reply.json()["error"], "peer is offline");
+}
+
+#[tokio::test]
+async fn a_create_from_another_site_naming_another_machine_is_refused_before_it_is_carried() {
+    let daemon = Daemon::new(TURN).await;
+    let project = daemon.project();
+    let peer = daemon.add_machine();
+    let host = daemon.host();
+    let headers = [("Host", host.as_str()), ("Origin", "http://evil.example")];
+    let body =
+        serde_json::json!({"project": project, "base": "main", "name": "far", "machine": peer});
+    let reply = daemon
+        .raw("POST", "/api/workspaces", &headers, Some(body))
+        .await;
+    assert_eq!(reply.status, 403, "{}", reply.body);
+    assert!(!reply.body.contains("offline"), "{}", reply.body);
+}
+
+#[tokio::test]
+async fn a_peer_on_an_older_link_shows_online_and_a_call_for_it_is_503_saying_it_runs_an_older_foundry()
+ {
+    let daemon = Daemon::new(TURN).await;
+    let project = daemon.project();
+    let peer = daemon.add_machine();
+    let (mine, theirs) = Conn::pair();
+    let peers = daemon.peers.clone();
+    tokio::spawn(async move { peers.accept(theirs).await });
+    for message in [
+        PeerMessage::Hello {
+            protocol: 2,
+            machine: peer,
+            versions: Default::default(),
+        },
+        PeerMessage::Records {
+            protocol: 2,
+            records: Vec::new(),
+        },
+    ] {
+        mine.send
+            .send(serde_json::to_string(&message).unwrap())
+            .await
+            .unwrap();
+    }
+    let started = tokio::time::Instant::now();
+    while !daemon.peers.online().contains(&peer) {
+        assert!(started.elapsed() < WAIT, "the peer is never heard from");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let reply = daemon.call("GET", "/api/machines", None).await;
+    assert_eq!(
+        reply.json()["machines"][0]["online"],
+        true,
+        "{}",
+        reply.body
+    );
+
+    let body =
+        serde_json::json!({"project": project, "base": "main", "name": "far", "machine": peer});
+    let reply = daemon.call("POST", "/api/workspaces", Some(body)).await;
+    assert_eq!(reply.status, 503, "{}", reply.body);
+    assert_eq!(
+        reply.json()["error"],
+        "peer runs an older Foundry, which cannot take this call"
+    );
+    assert!(
+        daemon
+            .records()
+            .iter()
+            .all(|r| !matches!(r, AnyRecord::Workspace(_)))
+    );
+    drop(mine);
 }

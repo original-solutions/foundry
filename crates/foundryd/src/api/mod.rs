@@ -10,10 +10,12 @@
 //!   cannot read, one a newer build wrote before a rollback, leaves out its owner's changes up
 //!   to it, with a warning, and the socket goes on.
 //! - `GET /api/terminals/{id}`, a WebSocket: see [`terminals`].
-//! - `POST /api/workspaces` `{project, base, name}`: makes a workspace on this machine, `201
-//!   {id}`. When the workspace is made but its setup could not be started, it is still `201`,
-//!   with an `error` beside the `id` saying so: the workspace exists, and the id is how to
-//!   reach it.
+//! - `GET /api/machines`: `{me, machines: [{id, name, online}]}`, this machine's id and each
+//!   machine in the machine list, in its order, with whether it is online.
+//! - `POST /api/workspaces` `{project, base, name, machine}`: makes a workspace, `201 {id}`, on
+//!   the machine `machine` names, or on this machine when it is absent. When the workspace is
+//!   made but its setup could not be started, it is still `201`, with an `error` beside the
+//!   `id` saying so: the workspace exists, and the id is how to reach it.
 //! - `POST /api/workspaces/{id}/archive` `{force}` (the body is optional): `204`, or `409` with
 //!   the uncommitted files, unpushed commits and submodules that hold it up.
 //! - `POST /api/workspaces/{id}/sessions` `{model}`: starts Claude Code in the workspace, `201
@@ -21,6 +23,10 @@
 //! - `POST /api/workspaces/{id}/shells`: starts the daemon's `$SHELL` in the workspace, `201
 //!   {id}`.
 //! - `POST /api/terminals/{id}/close`: `204`.
+//!
+//!   These five actions, on a workspace or terminal another machine owns or a create that
+//!   names another machine, are carried to that machine and answered as it answers: see
+//!   [`carry`].
 //! - `GET /api/workspaces/{id}/changes`: what the workspace changed since its base, see
 //!   [`changes`]. Only a workspace of this machine; any other is `404`.
 //! - `GET /api/briefs`: what each session of this machine is for and doing, see [`briefs`].
@@ -59,7 +65,7 @@ use axum::extract::rejection::JsonRejection;
 use axum::extract::ws::rejection::WebSocketUpgradeRejection;
 use axum::extract::ws::{self, WebSocket, WebSocketUpgrade};
 use axum::extract::{FromRequest, Path, Request, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -78,6 +84,8 @@ use crate::workspaces::{WorkspaceError, Workspaces};
 
 pub mod assets;
 mod briefs;
+mod carry;
+pub(crate) use carry::carries;
 mod changes;
 mod machine;
 pub mod terminals;
@@ -100,6 +108,10 @@ pub struct Api {
     /// its MagicDNS short name and its `<name>.<tailnet>.ts.net` name. The daemon fills it;
     /// empty means only addresses and `localhost` are trusted in a `Host`.
     pub names: Vec<String>,
+    /// Why sessions cannot start on this machine, said as a `503` to a session start for one of
+    /// its own workspaces: a daemon with no gateway. `None` until the daemon sets it. A start
+    /// for another machine's workspace is still carried there.
+    pub sessions_refused: Option<String>,
 }
 
 impl Api {
@@ -118,6 +130,7 @@ impl Api {
             workspaces,
             sessions,
             names,
+            sessions_refused: None,
         }
     }
 }
@@ -126,6 +139,7 @@ impl Api {
 pub fn router(api: Api) -> Router {
     Router::new()
         .route("/api/state", get(state))
+        .route("/api/machines", get(machines))
         .route("/api/events", get(events))
         .route("/api/terminals/{id}", get(terminals::socket))
         .route("/api/terminals/{id}/close", post(close_terminal))
@@ -139,6 +153,7 @@ pub fn router(api: Api) -> Router {
         .route("/api/sessions/{id}/trail", get(trail::trail))
         .fallback(no_route)
         .method_not_allowed_fallback(wrong_method)
+        .layer(middleware::from_fn_with_state(api.clone(), carry::carry))
         .layer(middleware::from_fn_with_state(api.clone(), same_site))
         .with_state(api)
 }
@@ -458,6 +473,19 @@ async fn state(State(api): State<Api>) -> Result<Json<UiMessage>, ApiError> {
     Ok(Json(full_state(&api).await?.0))
 }
 
+async fn machines(State(api): State<Api>) -> Result<Json<serde_json::Value>, ApiError> {
+    let settings = on_store(&api.store, |store| store.settings()).await?;
+    let online = api.peers.online();
+    let machines: Vec<serde_json::Value> = settings
+        .machines
+        .iter()
+        .map(|m| serde_json::json!({"id": m.id, "name": m.name, "online": online.contains(&m.id)}))
+        .collect();
+    Ok(Json(
+        serde_json::json!({ "me": api.peers.me(), "machines": machines }),
+    ))
+}
+
 async fn events(
     State(api): State<Api>,
     upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
@@ -576,12 +604,30 @@ struct Create {
     project: ProjectId,
     base: String,
     name: String,
+    /// The machine to make it on; absent is this machine.
+    #[serde(default)]
+    machine: Option<MachineId>,
 }
 
 async fn create_workspace(
     State(api): State<Api>,
+    headers: HeaderMap,
     Body(create): Body<Create>,
 ) -> Result<Response, ApiError> {
+    // A create naming another machine is carried there before this runs ([`carry`]), so one
+    // that reaches here naming another was carried in, and is never carried on. One carried in
+    // names this machine, as the caller's carry layer sends it.
+    let me = api.peers.me();
+    let carried = headers.contains_key(crate::sync::call::CARRIED);
+    if create.machine.is_some_and(|m| m != me) || (carried && create.machine != Some(me)) {
+        let named = create
+            .machine
+            .map_or_else(|| "no machine".to_owned(), |m| format!("machine {m}"));
+        return Ok(error(
+            StatusCode::MISDIRECTED_REQUEST,
+            format!("this call names {named}, not this one, and is not carried on"),
+        ));
+    }
     match api
         .workspaces
         .create(create.project, &create.base, &create.name)
@@ -654,6 +700,9 @@ async fn start_session(
     Path(id): Path<String>,
     Body(start): Body<Start>,
 ) -> Result<Response, ApiError> {
+    if let Some(said) = &api.sessions_refused {
+        return Ok(error(StatusCode::SERVICE_UNAVAILABLE, said.clone()));
+    }
     let id = parse_id(&id, "workspace", WorkspaceId)?;
     if let Some(prompt) = &start.prompt
         && (prompt.contains('\0') || prompt.chars().count() > MOST_PROMPT)

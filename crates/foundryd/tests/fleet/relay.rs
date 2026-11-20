@@ -327,19 +327,24 @@ async fn a_relay_for_a_terminal_b_does_not_hold_closes_with_a_reason() {
 }
 
 /// One machine with keys of its own, a store listing `listed`, and its peer links.
-struct Keyed {
-    keys: Keys,
-    peers: Peers,
-    store: Arc<Mutex<Store>>,
+pub(crate) struct Keyed {
+    pub(crate) keys: Keys,
+    pub(crate) peers: Peers,
+    pub(crate) store: Arc<Mutex<Store>>,
     _dir: TempDir,
 }
 
-fn keys(dir: &TempDir) -> Keys {
+pub(crate) fn keys(dir: &TempDir) -> Keys {
     Keys::open(Arc::new(FileSecrets::new(dir.path().join("secrets")))).unwrap()
 }
 
 impl Keyed {
-    fn new(listed: &[MachineId], keys: Keys, dir: TempDir, dialer: Arc<dyn Dialer>) -> Self {
+    pub(crate) fn new(
+        listed: &[MachineId],
+        keys: Keys,
+        dir: TempDir,
+        dialer: Arc<dyn Dialer>,
+    ) -> Self {
         let mut store = Store::open(dir.path().join("foundry.db")).unwrap();
         let mut all = vec![keys.me()];
         all.extend(listed);
@@ -356,13 +361,13 @@ impl Keyed {
 }
 
 /// `host` admits `peer` with a fresh code, as `foundryd join` does.
-fn admit(host: &Keys, peer: &Keys) {
+pub(crate) fn admit(host: &Keys, peer: &Keys) {
     let code = host.new_code().unwrap().to_string();
     host.redeem(&code, peer.me(), &peer.public_key()).unwrap();
 }
 
 /// Dials nobody.
-struct Nowhere;
+pub(crate) struct Nowhere;
 
 impl Dialer for Nowhere {
     fn dial(&self, _: &Machine) -> BoxFuture<'static, std::io::Result<Conn>> {
@@ -371,9 +376,9 @@ impl Dialer for Nowhere {
 }
 
 /// Links served by another machine's [`Keys::accept`], as the daemon serves every peer link.
-struct ServedBy {
-    keys: Keys,
-    peers: Peers,
+pub(crate) struct ServedBy {
+    pub(crate) keys: Keys,
+    pub(crate) peers: Peers,
 }
 
 impl Dialer for ServedBy {

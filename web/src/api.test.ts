@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ApiError, sessionBriefs, sessionTrail, thisMachine, workspaceChanges } from "./api";
+import { ApiError, createWorkspace, listMachines, sessionBriefs, sessionTrail, thisMachine, workspaceChanges } from "./api";
 import { json } from "./test-utils";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -10,6 +10,7 @@ const reads = [
   ["briefs", () => sessionBriefs()],
   ["trail", () => sessionTrail("s1")],
   ["changes", () => workspaceChanges("w1")],
+  ["machines", () => listMachines()],
   ["machine", () => thisMachine()],
 ] as const;
 
@@ -42,5 +43,32 @@ describe("the reads", () => {
     expect(await workspaceChanges("w1")).toEqual({ base: "main", commits: [], files: [] });
     answer(json(200, { id: "m1" }));
     expect(await thisMachine()).toBe("m1");
+  });
+});
+
+describe("the machines", () => {
+  it("are read with which one is this machine and whether each is online", async () => {
+    const machines = { me: "m1", machines: [{ id: "m1", name: "studio", online: true }, { id: "m2", name: "laptop", online: false }] };
+    answer(json(200, machines));
+    expect(await listMachines()).toEqual(machines);
+  });
+});
+
+describe("createWorkspace", () => {
+  it("names the machine only when one is picked", async () => {
+    const sent: unknown[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init: RequestInit = {}) => {
+        sent.push(JSON.parse(String(init.body)));
+        return json(201, { id: "w1" });
+      }),
+    );
+    await createWorkspace({ project: "p1", base: "main", name: "here" });
+    await createWorkspace({ project: "p1", base: "main", name: "there", machine: "m2" });
+    expect(sent).toEqual([
+      { project: "p1", base: "main", name: "here" },
+      { project: "p1", base: "main", name: "there", machine: "m2" },
+    ]);
   });
 });
