@@ -686,10 +686,10 @@ impl Dialer for FakeOwner {
                 tokio::time::sleep(wait).await;
                 let _ = far.send.send(text).await;
             }
-            while hold {
-                let Some(text) = far.recv.recv().await else {
-                    break;
-                };
+            if !hold {
+                return;
+            }
+            while let Some(text) = far.recv.recv().await {
                 if let Some(heard) = &heard {
                     let _ = heard.send(text);
                 }
