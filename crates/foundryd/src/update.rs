@@ -63,13 +63,16 @@ pub enum UpdateError {
     /// The release does not hold one of the two binaries.
     #[error("{0} is missing: a release holds foundryd and foundry-holder")]
     Missing(&'static str),
-    /// The new binary does not say it is the version of the tag.
+    /// The new binary ran and printed something other than its version.
     #[error("{tag} is refused: its foundryd printed {printed:?}, not \"foundryd {version}\"")]
     WrongVersion {
         tag: String,
         version: String,
         printed: String,
     },
+    /// The new binary cannot be executed, or exited non-zero when asked its version.
+    #[error("{tag} is refused: {detail}")]
+    BadCheck { tag: String, detail: String },
     /// The tag is not `vX.Y.Z`.
     #[error("{0:?} is not a release tag")]
     BadTag(String),
@@ -369,19 +372,25 @@ fn begin(home: &Path, exe: &Path, running: &str) -> io::Result<Begin> {
 /// A start that goes on while a trial of this version is on gets a watchdog: if the daemon is
 /// not healthy by [`TRIAL_DEADLINE`] the process exits, so a hang counts as a failed start.
 pub fn starting(home: &Path) -> bool {
-    let running = env!("CARGO_PKG_VERSION");
     let Ok(exe) = std::env::current_exe() else {
         return true;
     };
-    match begin(home, &exe, running) {
+    starting_with(home, &exe, env!("CARGO_PKG_VERSION"), || {
+        std::thread::spawn(|| {
+            if !watch_until_healthy(&HEALTHY) {
+                std::process::exit(1);
+            }
+        });
+    })
+}
+
+/// [`starting`] for the process at `exe`; `arm` starts the watchdog.
+fn starting_with(home: &Path, exe: &Path, running: &str, arm: impl FnOnce()) -> bool {
+    match begin(home, exe, running) {
         Ok(Begin::Skip) => true,
         Ok(Begin::Run { watch }) => {
             if watch {
-                std::thread::spawn(|| {
-                    if !watch_until_healthy(&HEALTHY) {
-                        std::process::exit(1);
-                    }
-                });
+                arm();
             }
             true
         }
@@ -541,29 +550,11 @@ fn install_tag(
     let fill = |stage: &Path| {
         fetch(tag, stage)?;
         make_executable(stage)?;
-        let wrong = |printed: String| UpdateError::WrongVersion {
-            tag: tag.to_string(),
-            version: version.to_string(),
-            printed,
-        };
-        // A binary the system cannot execute, or one that ran and failed or said the wrong
-        // thing, is a bad asset. A timeout or a passing system error says nothing about the
-        // release: that is tried again.
-        let printed = match run_bounded(
+        let result = run_bounded(
             Command::new(stage.join("foundryd")).arg("--version"),
             version_limit,
-        ) {
-            Ok(printed) => printed,
-            Err(error @ RunError::Failed { .. }) => return Err(wrong(error.to_string())),
-            Err(RunError::Spawn { name, source }) if unrunnable(&source) => {
-                return Err(wrong(format!("cannot run {name}: {source}")));
-            }
-            Err(error) => return Err(UpdateError::Fetch(error.to_string())),
-        };
-        if printed != format!("foundryd {version}\n") {
-            return Err(wrong(printed.trim().to_string()));
-        }
-        Ok(())
+        );
+        judge_version_check(result, tag, version)
     };
     let record = || {
         // A trial of the new version, and no refusal: this tag is the highest there is.
@@ -580,6 +571,33 @@ fn install_tag(
         )
     };
     place_version(home, version, fill, record)
+}
+
+/// Judges what happened when the new `foundryd` was asked its version. A binary the system
+/// cannot execute, or one that ran and failed or printed the wrong text, is a bad asset. A
+/// timeout or a passing system error says nothing about the release: that is retried.
+fn judge_version_check(
+    result: Result<String, RunError>,
+    tag: &str,
+    version: &str,
+) -> Result<(), UpdateError> {
+    let bad = |detail: String| UpdateError::BadCheck {
+        tag: tag.to_string(),
+        detail,
+    };
+    match result {
+        Ok(printed) if printed == format!("foundryd {version}\n") => Ok(()),
+        Ok(printed) => Err(UpdateError::WrongVersion {
+            tag: tag.to_string(),
+            version: version.to_string(),
+            printed: printed.trim().to_string(),
+        }),
+        Err(error @ RunError::Failed { .. }) => Err(bad(error.to_string())),
+        Err(RunError::Spawn { name, source }) if unrunnable(&source) => {
+            Err(bad(format!("{name} cannot be executed: {source}")))
+        }
+        Err(error) => Err(UpdateError::Fetch(error.to_string())),
+    }
 }
 
 /// The release tags on GitHub, read with the machine's own `gh` login.
@@ -640,10 +658,11 @@ fn download(tag: &str, stage: &Path) -> Result<(), UpdateError> {
     Ok(())
 }
 
-/// One look for a newer tag. `Some` is the tag that was installed. A release whose files are
-/// bad (a missing binary, or one that ran and failed or printed the wrong version) is refused,
-/// so it is not downloaded again; any other failure, including a version check that cannot run
-/// or times out, is tried again later.
+/// One look for a newer tag. `Some` is the tag that was installed. A release is refused, so it
+/// is not downloaded again, when it lacks a binary, when its `foundryd` cannot be executed,
+/// or when that `foundryd` ran and failed or printed the wrong version. Any other failure,
+/// including a version check that times out or hits a passing system error, is tried again
+/// later.
 fn check_with(
     home: &Path,
     running: &str,
@@ -660,7 +679,11 @@ fn check_with(
     };
     match install_tag(home, &tag, running, version_limit, fetch) {
         Ok(()) => Ok(Some(tag)),
-        Err(error @ (UpdateError::WrongVersion { .. } | UpdateError::Missing(_))) => {
+        Err(
+            error @ (UpdateError::WrongVersion { .. }
+            | UpdateError::BadCheck { .. }
+            | UpdateError::Missing(_)),
+        ) => {
             let refuse = state(home).and_then(|mut state| {
                 state.refused = Some(tag);
                 save(home, &state)
@@ -697,20 +720,30 @@ pub async fn run(home: PathBuf) {
         running,
         &HEALTHY,
         HEALTHY_AFTER,
+        CHECK_EVERY,
         move || check_with(&work, running, VERSION_LIMIT, list_tags, download),
+        || {
+            if let Err(error) = raise(Signal::SIGTERM) {
+                tracing::error!("cannot stop for the update: {error}");
+            }
+        },
     )
     .await;
 }
 
 /// [`run`] with its inputs given: this process's path, the flag the watchdog reads, the wait
-/// before it is healthy and one update check.
+/// before it is healthy, the wait between checks, one update check, and what stops the
+/// daemon once a check has installed a tag.
+#[allow(clippy::too_many_arguments)]
 async fn run_with(
     home: PathBuf,
     exe: io::Result<PathBuf>,
     running: &'static str,
     flag: &AtomicBool,
     healthy_after: Duration,
+    check_every: Duration,
     check: impl Fn() -> Result<Option<String>, UpdateError> + Clone + Send + 'static,
+    stop: impl Fn(),
 ) {
     tokio::time::sleep(healthy_after).await;
     // The flag is set whatever `exe` is, so a failed lookup never lets the watchdog kill a
@@ -728,16 +761,14 @@ async fn run_with(
         match tokio::task::spawn_blocking(check.clone()).await {
             Ok(Ok(Some(tag))) => {
                 tracing::info!("installed {tag}: stopping so the service starts it");
-                if let Err(error) = raise(Signal::SIGTERM) {
-                    tracing::error!("cannot stop for the update: {error}");
-                }
+                stop();
                 pending::<()>().await;
             }
             Ok(Ok(None)) => {}
             Ok(Err(error)) => tracing::warn!("update check failed, trying again later: {error}"),
             Err(error) => tracing::warn!("update check stopped: {error}"),
         }
-        tokio::time::sleep(CHECK_EVERY).await;
+        tokio::time::sleep(check_every).await;
     }
 }
 
@@ -1703,7 +1734,13 @@ mod tests {
         let home = trial_home();
         let elsewhere = home.path().join("elsewhere");
         script(&elsewhere, "foundryd 0.2.0");
-        let task = spawn_run(home.path(), Ok(elsewhere), &FLAG, (&CHECKS, &STOPS), nothing);
+        let task = spawn_run(
+            home.path(),
+            Ok(elsewhere),
+            &FLAG,
+            (&CHECKS, &STOPS),
+            nothing,
+        );
 
         tokio::time::sleep(HEALTHY_AFTER + TICK * 3).await;
         std::thread::sleep(Duration::from_millis(100));
@@ -1802,14 +1839,26 @@ mod tests {
 
     #[test]
     fn a_version_check_is_judged_by_what_happened_to_it() {
-        assert!(matches!(judged(Err(spawn_error(Errno::EAGAIN))), Err(UpdateError::Fetch(_))));
         assert!(matches!(
-            judged(Err(RunError::TimedOut { name: "foundryd --version".into(), secs: 10 })),
+            judged(Err(spawn_error(Errno::EAGAIN))),
             Err(UpdateError::Fetch(_))
         ));
-        assert!(matches!(judged(Err(spawn_error(Errno::ENOEXEC))), Err(UpdateError::BadCheck { .. })));
         assert!(matches!(
-            judged(Err(RunError::Failed { name: "foundryd --version".into(), stderr: "boom".into() })),
+            judged(Err(RunError::TimedOut {
+                name: "foundryd --version".into(),
+                secs: 10
+            })),
+            Err(UpdateError::Fetch(_))
+        ));
+        assert!(matches!(
+            judged(Err(spawn_error(Errno::ENOEXEC))),
+            Err(UpdateError::BadCheck { .. })
+        ));
+        assert!(matches!(
+            judged(Err(RunError::Failed {
+                name: "foundryd --version".into(),
+                stderr: "boom".into()
+            })),
             Err(UpdateError::BadCheck { .. })
         ));
         assert!(matches!(
@@ -1821,7 +1870,9 @@ mod tests {
 
     #[test]
     fn a_refusal_says_what_the_binary_did_without_claiming_it_printed_an_error() {
-        let message = judged(Err(spawn_error(Errno::ENOEXEC))).unwrap_err().to_string();
+        let message = judged(Err(spawn_error(Errno::ENOEXEC)))
+            .unwrap_err()
+            .to_string();
 
         assert!(message.contains("v0.2.0 is refused"), "{message}");
         assert!(!message.contains("printed"), "{message}");

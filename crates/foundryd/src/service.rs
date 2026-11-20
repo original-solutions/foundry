@@ -211,6 +211,18 @@ fn place(home: &Path, exe: &Path, version: &str) -> Result<Option<String>, Updat
     Ok(refused)
 }
 
+/// What `install` prints once the version is placed: where, and when it went back to a lower
+/// version, which tag is refused.
+fn placed_note(home: &Path, version: &str, refused: Option<&str>) -> String {
+    let back = refused
+        .map(|tag| format!("Went back to {version}; {tag} is refused until a higher tag ships.\n"))
+        .unwrap_or_default();
+    format!(
+        "Placed version {version} in {}\n{back}",
+        home.join("versions").display()
+    )
+}
+
 /// Makes the data directory as `foundryd run` does (and refuses one other users can reach),
 /// then places this version. Returns the tag a go-back left refused.
 fn stage(home: &Path, exe: &Path, version: &str) -> Result<Option<String>, ServiceError> {
@@ -321,12 +333,9 @@ fn do_install() -> Result<String, ServiceError> {
     } else {
         install_linux(&home)?
     };
-    let back = refused
-        .map(|tag| format!("Went back to {version}; {tag} is refused until a higher tag ships.\n"))
-        .unwrap_or_default();
     Ok(format!(
-        "Placed version {version} in {}\n{back}{done}",
-        home.join("versions").display()
+        "{}{done}",
+        placed_note(&home, version, refused.as_deref())
     ))
 }
 
@@ -731,12 +740,18 @@ mod tests {
         let back = placed_note(home, "0.1.0", Some("v0.2.0"));
         let plain = placed_note(home, "0.1.0", None);
 
-        assert!(back.contains("Placed version 0.1.0 in /data/versions\n"), "{back}");
+        assert!(
+            back.contains("Placed version 0.1.0 in /data/versions\n"),
+            "{back}"
+        );
         assert!(
             back.contains("Went back to 0.1.0; v0.2.0 is refused until a higher tag ships.\n"),
             "{back}"
         );
-        assert!(plain.contains("Placed version 0.1.0 in /data/versions\n"), "{plain}");
+        assert!(
+            plain.contains("Placed version 0.1.0 in /data/versions\n"),
+            "{plain}"
+        );
         assert!(!plain.contains("Went back"), "{plain}");
     }
 }
