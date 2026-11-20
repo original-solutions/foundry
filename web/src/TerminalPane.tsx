@@ -2,6 +2,8 @@ import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { useEffect, useRef, useState } from "react";
+import { KeyBar } from "./KeyBar";
+import type { Glyph } from "./labels";
 import { Backoff, socketUrl } from "./socket";
 
 /** How long a pane tries a terminal it has never attached before it says the terminal is not here. */
@@ -26,9 +28,12 @@ const STEADY_AFTER = 10_000;
  * the screen is reset before it is written.
  *
  * A pane behind another tab (`active` false) stays attached, so showing it again is instant and
- * keeps its scroll position; it takes the keyboard each time it is shown.
+ * keeps its scroll position; it takes the keyboard each time it is shown, except on a touch
+ * screen, where focus would raise the on-screen keyboard over what you came to read. There a
+ * key bar (`name` and `glyph` say whose and in what state) carries the keys a phone lacks and
+ * a box to write a message in.
  */
-export function TerminalPane({ id, running, active = true }: { id: string; running: boolean | undefined; active?: boolean }) {
+export function TerminalPane({ id, running, active = true, name, glyph }: { id: string; running: boolean | undefined; active?: boolean; name?: string; glyph?: Glyph }) {
   const host = useRef<HTMLDivElement>(null);
   const shown = useRef<{ term: Terminal; fit: FitAddon } | null>(null);
   const [status, setStatus] = useState<string | null>(null);
@@ -133,7 +138,7 @@ export function TerminalPane({ id, running, active = true }: { id: string; runni
   useEffect(() => {
     if (!active || !shown.current) return;
     shown.current.fit.fit();
-    shown.current.term.focus();
+    if (!touch()) shown.current.term.focus();
   }, [active, id]);
 
   return (
@@ -142,7 +147,24 @@ export function TerminalPane({ id, running, active = true }: { id: string; runni
       <div className="min-h-0 flex-1 p-2">
         <div ref={host} className="h-full" />
       </div>
+      {running !== false && (
+        <KeyBar
+          name={name ?? "terminal"}
+          glyph={glyph ?? "ready"}
+          modes={() => shown.current?.term.modes ?? { applicationCursorKeysMode: false }}
+          onKey={(data) => shown.current?.term.input(data, true)}
+          onMessage={(text) => {
+            shown.current?.term.paste(text);
+            shown.current?.term.input("\r", true);
+          }}
+        />
+      )}
       {status && <div className="border-t border-neutral-800 px-3 py-1 text-xs text-amber-400">{status}</div>}
     </div>
   );
+}
+
+/** Whether the main pointer is a finger. */
+function touch(): boolean {
+  return typeof matchMedia === "function" && matchMedia("(pointer: coarse)").matches;
 }

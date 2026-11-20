@@ -1,6 +1,7 @@
-import { act, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TerminalPane } from "./TerminalPane";
+import type { Glyph } from "./labels";
 import { FakeSocket } from "./test-utils";
 
 // jsdom cannot run xterm.js, so a stand-in records what the pane does to its screen.
@@ -38,6 +39,14 @@ vi.mock("@xterm/xterm", () => ({
       screenOps.resized = callback;
       return { dispose() {} };
     }
+    modes = { applicationCursorKeysMode: false, bracketedPasteMode: true };
+    // As xterm does: a paste is typed data, wrapped when the program asked for bracketed paste.
+    paste(data: string) {
+      screenOps.typed?.(`\x1b[200~${data}\x1b[201~`);
+    }
+    input(data: string) {
+      screenOps.typed?.(data);
+    }
     dispose() {}
   },
 }));
@@ -68,8 +77,8 @@ afterEach(() => {
 });
 
 // An options object, not a defaulted parameter: a default would turn an explicit `undefined` into `true`.
-function mount(id = "t1", { running }: { running: boolean | undefined } = { running: true }) {
-  const view = render(<TerminalPane id={id} running={running} />);
+function mount(id = "t1", { running, glyph }: { running: boolean | undefined; glyph?: Glyph } = { running: true }) {
+  const view = render(<TerminalPane id={id} running={running} name="opus" glyph={glyph} />);
   return { socket: FakeSocket.last(), view };
 }
 
@@ -330,5 +339,70 @@ describe("TerminalPane", () => {
 
     expect(socket.readyState).toBe(FakeSocket.CLOSED);
     expect(FakeSocket.last().url).toMatch(/\/api\/terminals\/t2$/);
+  });
+
+  describe("touch keys", () => {
+    const sent = (socket: FakeSocket) => socket.sent.filter((d) => typeof d !== "string").map((d) => new TextDecoder().decode(d as Uint8Array));
+
+    it("sends the keys a phone keyboard lacks, as a keyboard would", () => {
+      const { socket } = mount();
+      act(() => socket.open());
+
+      fireEvent.click(screen.getByRole("button", { name: "Escape" }));
+      fireEvent.click(screen.getByRole("button", { name: "Up" }));
+      fireEvent.click(screen.getByRole("button", { name: "Shift+Tab" }));
+
+      expect(sent(socket)).toEqual(["\x1b", "\x1b[A", "\x1b[Z"]);
+    });
+
+    it("sends a written message as one paste and then Enter, and clears the box", () => {
+      const { socket } = mount();
+      act(() => socket.open());
+
+      const box = screen.getByRole("textbox", { name: "Message opus" });
+      fireEvent.change(box, { target: { value: "say hi" } });
+      fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+      expect(sent(socket)).toEqual(["\x1b[200~say hi\x1b[201~", "\r"]);
+      expect((box as HTMLInputElement).value).toBe("");
+    });
+
+    it("sends on Enter in the box, and sends nothing for an empty box", () => {
+      const { socket } = mount();
+      act(() => socket.open());
+
+      const box = screen.getByRole("textbox", { name: "Message opus" });
+      fireEvent.keyDown(box, { key: "Enter" });
+      expect(sent(socket)).toEqual([]);
+      fireEvent.change(box, { target: { value: "ls" } });
+      fireEvent.keyDown(box, { key: "Enter" });
+
+      expect(sent(socket)).toEqual(["\x1b[200~ls\x1b[201~", "\r"]);
+    });
+
+    it("offers one-tap answers while the session waits for you", () => {
+      const { socket } = mount("t1", { running: true, glyph: "waiting" });
+      act(() => socket.open());
+
+      fireEvent.click(screen.getByRole("button", { name: "Answer 1" }));
+
+      expect(sent(socket)).toEqual(["1"]);
+    });
+
+    it("offers no answers while the session works", () => {
+      mount("t1", { running: true, glyph: "working" });
+      expect(screen.queryByRole("button", { name: "Answer 1" })).toBeNull();
+    });
+
+    it("goes away once the terminal is no longer running", () => {
+      mount("t1", { running: false });
+      expect(screen.queryByRole("toolbar")).toBeNull();
+    });
+
+    it("does not raise a touch keyboard over the screen when a terminal opens", () => {
+      vi.stubGlobal("matchMedia", (query: string) => ({ matches: query === "(pointer: coarse)" }));
+      mount();
+      expect(screenOps.focused).toBe(false);
+    });
   });
 });

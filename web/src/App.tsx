@@ -217,9 +217,10 @@ function Layout() {
             const side = pair && (id === pair.left ? "left" : id === pair.right ? "right" : undefined);
             const place = side === "left" ? "inset-y-0 left-0 right-0 md:right-1/2" : side === "right" ? "inset-y-0 right-0 left-0 md:left-1/2 md:border-l md:border-neutral-800" : "inset-0";
             const seen = id === terminalId ? "" : side ? "invisible md:visible" : "invisible";
+            const where = locate(machines, id);
             return (
               <div key={id} data-testid={`pane-${id}`} onPointerDownCapture={side && focusPane(id)} onFocusCapture={side && focusPane(id)} className={`absolute ${place} ${seen}`}>
-                <TerminalPane id={id} running={terminalRunning(state, id)} active={id === terminalId} />
+                <TerminalPane id={id} running={terminalRunning(state, id)} active={id === terminalId} name={where?.name} glyph={where?.glyph} />
               </div>
             );
           })}
@@ -254,3 +255,4 @@ const terminalRoute = createRoute({ getParentRoute: () => rootRoute, path: "/ter
 
 export const routeTree = rootRoute.addChildren([indexRoute, terminalRoute]);
 export const router = createRouter({ routeTree });
+
