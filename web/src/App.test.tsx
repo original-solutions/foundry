@@ -44,9 +44,9 @@ vi.mock("@xterm/xterm", () => ({
 vi.mock("@xterm/addon-fit", () => ({ FitAddon: class { fit() {} } }));
 
 /**
- * Like `mockFetch`, but the board's reads of each workspace's changes get an empty answer, and the
- * reads of session briefs get `briefs`; both are left out of the calls, so a test sees only the
- * requests it makes.
+ * Like `mockFetch`, but the board's reads of each workspace's changes get an empty answer, the
+ * reads of session briefs get `briefs` and the new-workspace dialog's read of the machines gets
+ * this machine alone; all are left out of the calls, so a test sees only the requests it makes.
  */
 let briefs: Briefs = {};
 
@@ -57,6 +57,7 @@ function mockActions(...answers: Response[]): Call[] {
     vi.fn(async (url: string, init: RequestInit = {}) => {
       if (url.endsWith("/changes")) return json(200, { base: "main", commits: [], files: [] });
       if (url.endsWith("/api/briefs")) return json(200, briefs);
+      if (url.endsWith("/api/machines")) return json(200, { me: ME, machines: [] });
       calls.push({ url, method: init.method ?? "GET", body: init.body ? JSON.parse(String(init.body)) : undefined });
       const next = answers.shift();
       if (!next) throw new Error("unexpected request");

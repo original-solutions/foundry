@@ -1,13 +1,44 @@
 import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { useState, type ComponentProps } from "react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CreateWorkspace } from "./CreateWorkspace";
 import { fleet } from "./fleet";
 import { bigField, field, inlineField, primaryButton } from "./Modal";
 import { ME, settings, workspace } from "./test-fixtures";
-import { json, mockFetch, renderApp } from "./test-utils";
+import { json, renderApp, type Call } from "./test-utils";
 
 afterEach(() => vi.unstubAllGlobals());
+
+/** The machine list the daemon gives: this one, one online and one offline. */
+const machines = {
+  me: ME,
+  machines: [
+    { id: ME, name: "studio", online: true },
+    { id: "m2", name: "laptop", online: true },
+    { id: "m3", name: "old mini", online: false },
+  ],
+};
+
+/**
+ * Stubs `fetch` to give `answers` in order, and returns the requests it was sent. The dialog's read
+ * of the machines gets `machines` and is left out, so a test sees only the requests it makes.
+ */
+function mockFetch(...answers: Response[]): Call[] {
+  const calls: Call[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string, init: RequestInit = {}) => {
+      if (url === "/api/machines") return json(200, machines);
+      calls.push({ url, method: init.method ?? "GET", body: init.body ? JSON.parse(String(init.body)) : undefined });
+      const next = answers.shift();
+      if (!next) throw new Error("unexpected request");
+      return next;
+    }),
+  );
+  return calls;
+}
+
+beforeEach(() => mockFetch());
 
 const projects = [...settings().projects, { id: "p2", name: "other", repo: "/tmp/other.git" }];
 const open = fleet([workspace(ME, "w1", "fix login"), workspace(ME, "w2", "docs")], settings({ projects })).flatMap((m) => m.workspaces);
@@ -115,7 +146,43 @@ describe("CreateWorkspace", () => {
     expect(screen.getByLabelText("Branch").textContent).toBe("fix-auth");
   });
 
-  it("offers only this machine for now", async () => {
+  it("offers this machine and every other listed one by name, an offline one shown but not pickable", async () => {
+    await renderApp(<Harness />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "New workspace" }));
+
+    const machine = screen.getByLabelText("Machine") as HTMLSelectElement;
+    await waitFor(() => expect(machine.options).toHaveLength(3));
+    expect(Array.from(machine.options).map((o) => [o.textContent, o.disabled])).toEqual([
+      ["This machine", false],
+      ["laptop", false],
+      ["old mini (offline)", true],
+    ]);
+    expect(machine.value).toBe("");
+  });
+
+  it("makes the workspace on the machine picked, then starts its session there", async () => {
+    const calls = mockFetch(json(201, { id: "w1" }), json(201, { id: "s1" }));
+    const created = vi.fn();
+    await renderApp(<Harness onCreated={created} />);
+
+    await fill("far work");
+    const machine = screen.getByLabelText("Machine") as HTMLSelectElement;
+    await waitFor(() => expect(machine.options).toHaveLength(3));
+    fireEvent.change(machine, { target: { value: "m2" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create and open" }));
+
+    await waitFor(() => expect(calls).toHaveLength(2));
+    expect(calls[0]).toEqual({ url: "/api/workspaces", method: "POST", body: { project: "p1", base: "main", name: "far work", machine: "m2" } });
+    expect(calls[1]).toEqual({ url: "/api/workspaces/w1/sessions", method: "POST", body: { model: "opus" } });
+    await waitFor(() => expect(created).toHaveBeenCalledWith("s1"));
+  });
+
+  it("still offers this machine when the machine list cannot be read", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => json(500, { error: "store unreadable" })),
+    );
     await renderApp(<Harness />);
 
     fireEvent.click(await screen.findByRole("button", { name: "New workspace" }));
@@ -193,7 +260,7 @@ describe("CreateWorkspace", () => {
     const answers: ((response: Response) => void)[] = [];
     vi.stubGlobal(
       "fetch",
-      vi.fn(() => new Promise<Response>((resolve) => answers.push(resolve))),
+      vi.fn((url: string) => (url === "/api/machines" ? Promise.resolve(json(200, machines)) : new Promise<Response>((resolve) => answers.push(resolve)))),
     );
     await renderApp(<Harness />);
 

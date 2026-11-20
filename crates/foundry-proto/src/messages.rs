@@ -137,7 +137,22 @@ mod tests {
                     setting: SettingKey::Priority,
                 },
             },
+            PeerMessage::Call {
+                protocol: PROTOCOL,
+                machine: MachineId::random(),
+                call: Call {
+                    path: "/api/workspaces".into(),
+                    content_type: Some("application/json".into()),
+                    body: "7b7d".into(),
+                },
+            },
         ]
+    }
+
+    #[test]
+    fn calls_are_carried_from_the_protocol_after_edits_and_this_build_speaks_it() {
+        assert_eq!(CALLS_SINCE, EDITS_SINCE + 1);
+        assert_eq!(PROTOCOL, CALLS_SINCE);
     }
 
     fn ui_messages() -> Vec<UiMessage> {
@@ -254,6 +269,20 @@ mod tests {
                 PeerMessage::Edit {
                     protocol: 1,
                     edit: Edit::RemoveLimits { machine: id },
+                },
+            ),
+            (
+                format!(
+                    r#"{{"type":"call","protocol":3,"machine":"{machine}","call":{{"path":"/api/terminals/{terminal}/close","content_type":null,"body":""}}}}"#
+                ),
+                PeerMessage::Call {
+                    protocol: 3,
+                    machine: id,
+                    call: Call {
+                        path: format!("/api/terminals/{terminal}/close"),
+                        content_type: None,
+                        body: String::new(),
+                    },
                 },
             ),
         ];
