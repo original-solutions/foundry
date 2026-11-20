@@ -16,6 +16,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use nix::errno::Errno;
 use nix::sys::signal::{Signal, raise};
 use serde::{Deserialize, Serialize};
 
@@ -56,7 +57,7 @@ static HEALTHY: AtomicBool = AtomicBool::new(false);
 /// Why a tag could not be installed. None of these ever holds a secret.
 #[derive(Debug, thiserror::Error)]
 pub enum UpdateError {
-    /// The release could not be listed or downloaded.
+    /// The release could not be listed, downloaded or checked; tried again later.
     #[error("{0}")]
     Fetch(String),
     /// The release does not hold one of the two binaries.
@@ -165,6 +166,23 @@ pub(crate) fn run_bounded(command: &mut Command, limit: Duration) -> Result<Stri
         name,
         stderr: String::from_utf8_lossy(&stderr).trim().to_string(),
     })
+}
+
+/// True when a spawn error says the file cannot be executed (no such file or interpreter,
+/// not executable, not a program for this system). Any other (out of processes or memory, a
+/// busy file) says nothing about the file.
+fn unrunnable(error: &io::Error) -> bool {
+    let Some(code) = error.raw_os_error() else {
+        return false;
+    };
+    // EBADARCH, which macOS gives for a binary built for another architecture.
+    #[cfg(target_os = "macos")]
+    if code == 86 {
+        return true;
+    }
+    [Errno::ENOEXEC, Errno::ENOENT, Errno::EACCES]
+        .iter()
+        .any(|errno| code == *errno as i32)
 }
 
 /// A version that was installed and has not yet shown it stays up.
@@ -322,6 +340,30 @@ fn on_trial(home: &Path, exe: &Path, running: &str) -> bool {
         && state(home).is_ok_and(|s| s.trial.is_some_and(|t| t.version == running))
 }
 
+/// What [`begin`] decided.
+#[derive(Debug, PartialEq)]
+enum Begin {
+    /// Not run from `current`: nothing counted, nothing written.
+    Skip,
+    /// Carry on. `watch` is true when a trial of this version is on, so the watchdog is armed.
+    Run { watch: bool },
+    /// The trial failed and `current` went back to `to`.
+    RolledBack { to: String },
+}
+
+/// What a start does about an update, for the process at `exe`.
+fn begin(home: &Path, exe: &Path, running: &str) -> io::Result<Begin> {
+    if !from_current(home, exe, running) {
+        return Ok(Begin::Skip);
+    }
+    Ok(match start_with(home, running)? {
+        Start::Run => Begin::Run {
+            watch: on_trial(home, exe, running),
+        },
+        Start::RolledBack { to } => Begin::RolledBack { to },
+    })
+}
+
 /// Called by `foundryd run` before it does anything else. False means this version was
 /// rolled back and the process must exit with success so the service starts the previous one.
 /// A start that goes on while a trial of this version is on gets a watchdog: if the daemon is
@@ -331,25 +373,19 @@ pub fn starting(home: &Path) -> bool {
     let Ok(exe) = std::env::current_exe() else {
         return true;
     };
-    if !from_current(home, &exe, running) {
-        return true;
-    }
-    match start_with(home, running) {
-        Ok(Start::Run) => {
-            if on_trial(home, &exe, running) {
+    match begin(home, &exe, running) {
+        Ok(Begin::Skip) => true,
+        Ok(Begin::Run { watch }) => {
+            if watch {
                 std::thread::spawn(|| {
-                    if !watch(&HEALTHY, TRIAL_DEADLINE, Duration::from_secs(1)) {
-                        tracing::error!(
-                            "not healthy after {} s: exiting so this start counts as failed",
-                            TRIAL_DEADLINE.as_secs()
-                        );
+                    if !watch_until_healthy(&HEALTHY) {
                         std::process::exit(1);
                     }
                 });
             }
             true
         }
-        Ok(Start::RolledBack { to }) => {
+        Ok(Begin::RolledBack { to }) => {
             tracing::error!(
                 "version {running} did not become healthy in {MAX_STARTS} starts: back to {to}, and v{running} is refused until a higher tag appears"
             );
@@ -360,6 +396,18 @@ pub fn starting(home: &Path) -> bool {
             true
         }
     }
+}
+
+/// Waits for `flag` up to [`TRIAL_DEADLINE`] and logs when it does not come.
+fn watch_until_healthy(flag: &AtomicBool) -> bool {
+    let healthy = watch(flag, TRIAL_DEADLINE, Duration::from_secs(1));
+    if !healthy {
+        tracing::error!(
+            "not healthy after {} s: exiting so this start counts as failed",
+            TRIAL_DEADLINE.as_secs()
+        );
+    }
+    healthy
 }
 
 /// Ends the trial when it is of `running`: this version has stayed up.
@@ -382,15 +430,22 @@ pub fn lowered(before: Option<&str>, version: &str) -> bool {
 }
 
 /// Records a hand install of `version` over `before` (the version `current` named). It ends
-/// a trial of any other version, and when `version` is lower it refuses `v<before>` as an automatic rollback
-/// does, so the updater does not undo the install until a higher tag ships.
-pub fn placed_by_hand(home: &Path, version: &str, before: Option<&str>) -> io::Result<()> {
+/// a trial of any other version. When `version` is lower it refuses `v<before>`, as an
+/// automatic rollback does, so the updater does not undo the install until a higher tag
+/// ships; a higher refusal already held stays. Returns the tag that is refused after a
+/// go-back, and `None` when the version did not go down.
+pub fn placed_by_hand(
+    home: &Path,
+    version: &str,
+    before: Option<&str>,
+) -> io::Result<Option<String>> {
     let mut state = state(home)?;
     // Installing the version that is on trial again must not stop its rollback.
     if state.trial.as_ref().is_some_and(|t| t.version != version) {
         state.trial = None;
     }
-    if let Some(before) = before.filter(|b| lowered(Some(b), version)) {
+    let went_back = lowered(before, version);
+    if let Some(before) = before.filter(|_| went_back) {
         let held = state
             .refused
             .as_deref()
@@ -399,7 +454,8 @@ pub fn placed_by_hand(home: &Path, version: &str, before: Option<&str>) -> io::R
             state.refused = Some(format!("v{before}"));
         }
     }
-    save(home, &state)
+    save(home, &state)?;
+    Ok(state.refused.filter(|_| went_back))
 }
 
 /// The tag to install: the highest valid one, if it is above `running` and is not the
@@ -490,15 +546,18 @@ fn install_tag(
             version: version.to_string(),
             printed,
         };
-        // A binary that cannot run at all, or runs past the limit, says nothing about the
-        // release: that is tried again. One that ran and failed, or said the wrong thing, is
-        // a bad asset.
+        // A binary the system cannot execute, or one that ran and failed or said the wrong
+        // thing, is a bad asset. A timeout or a passing system error says nothing about the
+        // release: that is tried again.
         let printed = match run_bounded(
             Command::new(stage.join("foundryd")).arg("--version"),
             version_limit,
         ) {
             Ok(printed) => printed,
             Err(error @ RunError::Failed { .. }) => return Err(wrong(error.to_string())),
+            Err(RunError::Spawn { name, source }) if unrunnable(&source) => {
+                return Err(wrong(format!("cannot run {name}: {source}")));
+            }
             Err(error) => return Err(UpdateError::Fetch(error.to_string())),
         };
         if printed != format!("foundryd {version}\n") {
@@ -615,10 +674,10 @@ fn check_with(
     }
 }
 
-/// What the daemon does once it has run for a minute: tells the watchdog, and when it runs
-/// from `current` ends its trial. False means updates are off for this process.
-fn became_healthy(home: &Path, exe: &Path, running: &str) -> bool {
-    HEALTHY.store(true, Ordering::Relaxed);
+/// What the daemon does once it has run for a minute: tells the watchdog through `flag`, and
+/// when it runs from `current` ends its trial. False means updates are off for this process.
+fn became_healthy(flag: &AtomicBool, home: &Path, exe: &Path, running: &str) -> bool {
+    flag.store(true, Ordering::Relaxed);
     if !from_current(home, exe, running) {
         return false;
     }
@@ -631,8 +690,33 @@ fn became_healthy(home: &Path, exe: &Path, running: &str) -> bool {
 /// `current`. Never returns: a daemon that is not run from `current` just waits.
 pub async fn run(home: PathBuf) {
     let running = env!("CARGO_PKG_VERSION");
-    tokio::time::sleep(HEALTHY_AFTER).await;
-    let on = std::env::current_exe().is_ok_and(|exe| became_healthy(&home, &exe, running));
+    let work = home.clone();
+    run_with(
+        home,
+        std::env::current_exe(),
+        running,
+        &HEALTHY,
+        HEALTHY_AFTER,
+        move || check_with(&work, running, VERSION_LIMIT, list_tags, download),
+    )
+    .await;
+}
+
+/// [`run`] with its inputs given: this process's path, the flag the watchdog reads, the wait
+/// before it is healthy and one update check.
+async fn run_with(
+    home: PathBuf,
+    exe: io::Result<PathBuf>,
+    running: &'static str,
+    flag: &AtomicBool,
+    healthy_after: Duration,
+    check: impl Fn() -> Result<Option<String>, UpdateError> + Clone + Send + 'static,
+) {
+    tokio::time::sleep(healthy_after).await;
+    // The flag is set whatever `exe` is, so a failed lookup never lets the watchdog kill a
+    // healthy daemon.
+    flag.store(true, Ordering::Relaxed);
+    let on = exe.is_ok_and(|exe| became_healthy(flag, &home, &exe, running));
     if !on {
         tracing::info!(
             "updates are off: this daemon is not run from {}",
@@ -641,9 +725,7 @@ pub async fn run(home: PathBuf) {
         pending::<()>().await;
     }
     loop {
-        let work = home.clone();
-        let check = move || check_with(&work, running, VERSION_LIMIT, list_tags, download);
-        match tokio::task::spawn_blocking(check).await {
+        match tokio::task::spawn_blocking(check.clone()).await {
             Ok(Ok(Some(tag))) => {
                 tracing::info!("installed {tag}: stopping so the service starts it");
                 if let Err(error) = raise(Signal::SIGTERM) {
@@ -1289,16 +1371,30 @@ mod tests {
             },
         );
 
-        assert!(matches!(error, Err(UpdateError::WrongVersion { .. })), "{error:?}");
-        assert_eq!(state(home.path()).unwrap().refused.as_deref(), Some("v0.2.0"));
+        assert!(
+            matches!(error, Err(UpdateError::WrongVersion { .. })),
+            "{error:?}"
+        );
+        assert_eq!(
+            state(home.path()).unwrap().refused.as_deref(),
+            Some("v0.2.0")
+        );
     }
 
     #[test]
     fn only_errors_that_say_the_file_cannot_be_executed_are_unrunnable() {
-        for code in [libc_code(Errno::ENOEXEC), libc_code(Errno::ENOENT), libc_code(Errno::EACCES)] {
+        for code in [
+            libc_code(Errno::ENOEXEC),
+            libc_code(Errno::ENOENT),
+            libc_code(Errno::EACCES),
+        ] {
             assert!(unrunnable(&io::Error::from_raw_os_error(code)), "{code}");
         }
-        for code in [libc_code(Errno::EAGAIN), libc_code(Errno::ENOMEM), libc_code(Errno::ETXTBSY)] {
+        for code in [
+            libc_code(Errno::EAGAIN),
+            libc_code(Errno::ENOMEM),
+            libc_code(Errno::ETXTBSY),
+        ] {
             assert!(!unrunnable(&io::Error::from_raw_os_error(code)), "{code}");
         }
         assert!(!unrunnable(&io::Error::other("no code")));

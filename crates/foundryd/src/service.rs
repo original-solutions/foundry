@@ -165,16 +165,20 @@ WantedBy=multi-user.target\n"
 
 /// Puts `exe` and the holder beside it in `versions/<version>` and points `current` there,
 /// and records the install: a version lower than the one `current` named is kept by refusing
-/// the higher one. A copy is made in a stage directory and renamed in; when `exe` already
+/// the higher one. Returns the tag a go-back left refused. A copy is made in a stage directory and renamed in; when `exe` already
 /// runs from that directory nothing is copied.
-fn place(home: &Path, exe: &Path, version: &str) -> Result<(), UpdateError> {
+fn place(home: &Path, exe: &Path, version: &str) -> Result<Option<String>, UpdateError> {
     let from = exe.parent().unwrap_or(Path::new("."));
     let holder = from.join(HOLDER);
     if !holder.is_file() {
         return Err(UpdateError::Missing(HOLDER));
     }
     let before = update::current_version(home);
-    let record = || update::placed_by_hand(home, version, before.as_deref());
+    let mut refused = None;
+    let record = || {
+        refused = update::placed_by_hand(home, version, before.as_deref())?;
+        Ok(())
+    };
     let in_place = match (
         fs::canonicalize(from),
         fs::canonicalize(home.join("versions").join(version)),
@@ -183,14 +187,16 @@ fn place(home: &Path, exe: &Path, version: &str) -> Result<(), UpdateError> {
         _ => false,
     };
     if in_place {
+        let mut record = record;
         record().map_err(|source| UpdateError::Io {
             what: "cannot save the update state".into(),
             source,
         })?;
-        return update::point_current(home, version).map_err(|source| UpdateError::Io {
+        update::point_current(home, version).map_err(|source| UpdateError::Io {
             what: "cannot point current at this version".into(),
             source,
-        });
+        })?;
+        return Ok(refused);
     }
     let copy = |stage: &Path| {
         for (from, name) in [(exe, "foundryd"), (holder.as_path(), HOLDER)] {
@@ -201,20 +207,13 @@ fn place(home: &Path, exe: &Path, version: &str) -> Result<(), UpdateError> {
         }
         Ok(())
     };
-    update::place_version(home, version, copy, record)
-}
-
-/// The line `install` prints when it put back a version lower than the one `current` named.
-fn went_back_note(before: Option<&str>, version: &str) -> Option<String> {
-    let before = before.filter(|_| update::lowered(before, version))?;
-    Some(format!(
-        "Went back from {before} to {version}; v{before} is refused until a higher tag ships."
-    ))
+    update::place_version(home, version, copy, record)?;
+    Ok(refused)
 }
 
 /// Makes the data directory as `foundryd run` does (and refuses one other users can reach),
-/// then places this version.
-fn stage(home: &Path, exe: &Path, version: &str) -> Result<(), ServiceError> {
+/// then places this version. Returns the tag a go-back left refused.
+fn stage(home: &Path, exe: &Path, version: &str) -> Result<Option<String>, ServiceError> {
     daemon::make_home(home).map_err(|error| ServiceError::Home(error.to_string()))?;
     Ok(place(home, exe, version)?)
 }
@@ -316,15 +315,14 @@ fn do_install() -> Result<String, ServiceError> {
     }
     let exe = std::env::current_exe().map_err(io_error("cannot find this program"))?;
     let version = env!("CARGO_PKG_VERSION");
-    let before = update::current_version(&home);
-    stage(&home, &exe, version)?;
+    let refused = stage(&home, &exe, version)?;
     let done = if cfg!(target_os = "macos") {
         install_macos(&home)?
     } else {
         install_linux(&home)?
     };
-    let back = went_back_note(before.as_deref(), version)
-        .map(|note| format!("{note}\n"))
+    let back = refused
+        .map(|tag| format!("Went back to {version}; {tag} is refused until a higher tag ships.\n"))
         .unwrap_or_default();
     Ok(format!(
         "Placed version {version} in {}\n{back}{done}",

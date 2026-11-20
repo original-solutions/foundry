@@ -93,13 +93,13 @@ When a higher tag exists, the daemon downloads the asset, checks that `foundryd 
 
 The new version has to prove itself. It counts as healthy once it has run for 60 seconds. If it starts three times without getting there, the next start puts the previous version back and records the tag as refused in `<home>/update.json`. A start that hangs for 5 minutes (on a keychain prompt, for example) exits and counts as a failed start. A refused tag is skipped while it is the highest. A higher tag installs and clears the refusal.
 
-A release whose archive is bad (a missing binary, or a `foundryd` that does not print its own version) is refused the same way, so it is not downloaded again.
+A release is refused the same way, so it is not downloaded again, when its archive has no `foundryd` or no `foundry-holder`, when the new `foundryd --version` exits non-zero or prints anything but `foundryd <version>`, or when the system says the file cannot be executed (no such file or interpreter, not executable, not a program for this machine).
 
 On macOS, sign every release binary with one stable identity (a Developer ID). A differently signed binary cannot read the keys the old one stored in the keychain. It stops at a keychain prompt, and every update is rolled back.
 
 Only a daemon started from `<home>/current` takes part in updates. One run any other way (`cargo run`, `./foundryd run`) never updates itself and is never counted as a trial.
 
-If `gh` is missing or a download fails, the daemon logs a warning and tries again 10 minutes later. Each `gh` and `tar` call has a time limit.
+If `gh` is missing or a download fails, the daemon logs a warning and tries again 10 minutes later. So does a version check that times out (10 seconds) or hits a passing system error, such as being out of processes or memory. Each `gh` and `tar` call has a time limit too.
 
 To go back to an older version by hand, run `install` from that version's folder:
 
@@ -107,7 +107,7 @@ To go back to an older version by hand, run `install` from that version's folder
 <home>/versions/<version>/foundryd install
 ```
 
-`install` says it went back. The newer version is then refused, as after a rollback. Export the same variables first, as in the section above, because `install` rewrites the service from your shell. The refusal holds until a higher tag ships. On Linux, run the `sudo systemctl restart foundryd` line it prints so the service starts the older version.
+`install` says it went back and names the refused tag. The newer version is then refused, as after a rollback. Export the same variables first, as in the section above, because `install` rewrites the service from your shell. The refusal holds until a higher tag ships. On Linux, run the `sudo systemctl restart foundryd` line it prints so the service starts the older version.
 
 ## Uninstall
 
