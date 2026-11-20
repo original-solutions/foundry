@@ -1107,6 +1107,51 @@ async fn a_workspace_whose_setup_did_not_start_is_still_answered_with_its_id() {
 }
 
 #[tokio::test]
+async fn a_workspace_whose_setup_terminal_was_not_recorded_is_still_answered_with_its_id() {
+    let daemon = Daemon::new(TURN).await;
+    let project =
+        daemon.project_with(&[(".dw/config.yml", "factory:\n  provision:\n    - sleep 30\n")]);
+    // The store takes a workspace's first write and refuses any later one, the write that
+    // names the setup terminal among them.
+    rusqlite::Connection::open(daemon.data.path().join("foundry.db"))
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER refuse_workspace_update BEFORE UPDATE ON records
+             WHEN NEW.kind = 'workspace'
+             BEGIN SELECT RAISE(ABORT, 'refused by the test'); END;",
+        )
+        .unwrap();
+    let reply = daemon
+        .call(
+            "POST",
+            "/api/workspaces",
+            Some(serde_json::json!({"project": project, "base": "main", "name": "unrecorded"})),
+        )
+        .await;
+    assert_eq!(reply.status, 201, "{}", reply.body);
+    let error = reply.json()["error"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        error.contains("setup terminal could not be recorded"),
+        "{}",
+        reply.body
+    );
+    let workspace: WorkspaceId = reply.id();
+    let state = daemon.call("GET", "/api/state", None).await;
+    match serde_json::from_str::<UiMessage>(&state.body).unwrap() {
+        UiMessage::State { records, .. } => assert!(
+            records.iter().any(
+                |r| matches!(r, AnyRecord::Workspace(w) if w.body.id == workspace && !w.deleted)
+            ),
+            "the workspace {workspace} is not in the state"
+        ),
+        other => panic!("not the state: {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn a_name_already_taken_is_a_conflict() {
     let daemon = Daemon::new(TURN).await;
     let project = daemon.project();
