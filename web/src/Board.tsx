@@ -1,5 +1,6 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
+import { TerminalMenu } from "./TerminalMenu";
 import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { lanes, topFiles, type Card, type Lane } from "./lanes";
 import { changesQuery } from "./ChangesPanel";
@@ -226,23 +227,25 @@ function WorkspaceCard({ card, showMachine, onChanges }: { card: Card; showMachi
       <ul className="flex flex-col px-2 pb-2">
         {shown.map((row) => (
           <li key={row.terminal}>
-            <Link
-              to="/terminals/$terminalId"
-              params={{ terminalId: row.terminal }}
-              title={row.title ? `${row.name}: ${row.title}` : undefined}
-              className={`flex items-start gap-2.5 rounded-md px-2 py-1 text-sm hover:bg-neutral-800/80 ${row.glyph === "done" || row.glyph === "away" ? "text-neutral-500" : "text-neutral-200"}`}
-            >
-              <span className="flex h-5 shrink-0 items-center">
-                <StateGlyph glyph={row.glyph} />
-              </span>
-              <span className="min-w-0 flex-1">
-                <span className="flex items-baseline gap-2 leading-5">
-                  <Named name={row.name} title={row.title} />
-                  <span className={`shrink-0 text-xs ${glyphText[row.glyph]}`}>{row.label}</span>
+            <TerminalMenu id={row.terminal}>
+              <Link
+                to="/terminals/$terminalId"
+                params={{ terminalId: row.terminal }}
+                title={row.title ? `${row.name}: ${row.title}` : undefined}
+                className={`flex items-start gap-2.5 rounded-md px-2 py-1 text-sm hover:bg-neutral-800/80 ${row.glyph === "done" || row.glyph === "away" ? "text-neutral-500" : "text-neutral-200"}`}
+              >
+                <span className="flex h-5 shrink-0 items-center">
+                  <StateGlyph glyph={row.glyph} />
                 </span>
-                {row.now && <Now step={row.now} />}
-              </span>
-            </Link>
+                <span className="min-w-0 flex-1">
+                  <span className="flex items-baseline gap-2 leading-5">
+                    <Named name={row.name} title={row.title} />
+                    <span className={`shrink-0 text-xs ${glyphText[row.glyph]}`}>{row.label}</span>
+                  </span>
+                  {row.now && <Now step={row.now} />}
+                </span>
+              </Link>
+            </TerminalMenu>
           </li>
         ))}
         {rows.length > shown.length && <li className="px-2 py-1 text-xs text-neutral-500">+{rows.length - shown.length} more</li>}

@@ -199,3 +199,9 @@ export async function sessionBriefs(): Promise<Briefs> {
   if (!response.ok) throw new ApiError(`briefs failed (${response.status})`);
   return (await response.json()) as Briefs;
 }
+
+/** Ends a terminal: hangs up its child if it still runs and removes it, with its final screen. */
+export async function closeTerminal(id: string): Promise<void> {
+  const { status, json } = await post(`/api/terminals/${id}/close`);
+  if (status !== 204) throw refused(status, json);
+}

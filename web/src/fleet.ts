@@ -81,7 +81,9 @@ export function fleet(records: AnyRecord[], settings: SharedSettings, briefs: Br
   const listed = settings.machines.map((m) => m.id);
   const others = [...new Set(records.filter((r) => r.kind === "machine_sample" && !listed.includes(r.owner)).map((r) => r.owner))].sort();
   const live = records.filter((r) => !r.deleted);
-  const sessions = live.flatMap((r) => (r.kind === "session" ? [r.body] : []));
+  // A session whose terminal was closed has ended for good: its record stays, failed, behind it.
+  const closed = new Set(records.flatMap((r) => (r.kind === "terminal" && r.deleted ? [r.body.id] : [])));
+  const sessions = live.flatMap((r) => (r.kind === "session" && !closed.has(r.body.terminal) ? [r.body] : []));
   const referenced = new Set(sessions.map((s) => s.terminal));
   const shellsOf = new Map<string, ShellView[]>();
   for (const t of live) {

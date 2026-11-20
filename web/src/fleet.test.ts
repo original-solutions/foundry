@@ -111,6 +111,19 @@ describe("fleet", () => {
     expect(w.shells).toEqual([{ id: "t2", state: "exited", exitCode: 1 }]);
   });
 
+  it("hides a session whose terminal was closed, which the daemon leaves failed behind it", () => {
+    const records = [
+      sample(ME, 1),
+      workspace(ME, "w1", "a"),
+      terminal(ME, "t1", "w1", "exited", { deleted: true, version: 2 }),
+      session(ME, "s1", "w1", "t1", "failed"),
+      session(ME, "s2", "w1", "t2", "starting"),
+    ];
+    const [w] = fleet(records, settings())[0].workspaces;
+    expect(w.sessions.map((s) => s.id)).toEqual(["s2"]);
+    expect(w.shells).toEqual([]);
+  });
+
   it("lists a running terminal whose session was deleted as a shell", () => {
     const records = [
       sample(ME, 1),

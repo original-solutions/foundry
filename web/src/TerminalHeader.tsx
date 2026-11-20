@@ -6,18 +6,20 @@ import type { Located } from "./fleet";
 import { jumpKey, SearchIcon } from "./JumpPalette";
 import { StatePill } from "./StateGlyph";
 import { StepsIcon } from "./StepsPanel";
+import { TerminalMenuButton } from "./TerminalMenu";
 
 /** The key that opens a terminal beside the open one, or closes the split. */
 export const splitKey = jumpKey === "⌘K" ? "⌘\\" : "Ctrl \\";
 
 /**
  * The bar above a terminal: which workspace and terminal it is, the machine it runs on and its
- * state, and the ways into the workspace's changes, the session's steps and finding text in it. On a narrow screen it holds the button that
+ * state, and the ways into the workspace's changes, the session's steps, finding text in it and a menu with the rest, ending it included. On a narrow screen it holds the button that
  * opens the sidebar as a drawer. On a wide one it opens another terminal beside this one, or, in
  * a split, closes its own side. In a split the side with the keyboard has a lit edge; the other
  * is dimmed.
  */
 export function TerminalHeader({
+  id,
   located,
   drawerOpen,
   onMenu,
@@ -31,6 +33,8 @@ export function TerminalHeader({
   onClosePane,
   beside = false,
 }: {
+  /** The terminal it heads, for its menu. */
+  id?: string;
   located?: Located;
   drawerOpen: boolean;
   onMenu: () => void;
@@ -105,7 +109,7 @@ export function TerminalHeader({
               aria-pressed={finding}
               title={`Find in this terminal's scrollback (${findKey})`}
               onClick={onFind}
-              className={`shrink-0 rounded p-1.5 ${finding ? "bg-sky-400/10 text-sky-200" : "text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200"}`}
+              className={`hidden shrink-0 rounded p-1.5 md:block ${finding ? "bg-sky-400/10 text-sky-200" : "text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200"}`}
             >
               <FindIcon className="size-4" />
             </button>
@@ -142,6 +146,7 @@ export function TerminalHeader({
           </svg>
         </button>
       )}
+      {id && <TerminalMenuButton id={id} />}
       <button
         type="button"
         aria-label="Jump to"
