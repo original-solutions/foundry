@@ -36,6 +36,13 @@ describe("StateGlyph", () => {
     expect([0, 2, 6, 8].map(delay).every((d) => d > delay(1))).toBe(true);
   });
 
+  it("holds a still working glyph to its still frame, for a heading that names the state", () => {
+    const { container } = render(<StateGlyph glyph="working" still />);
+    const all = [...container.querySelectorAll("circle")];
+    expect(all.some((d) => d.getAttribute("class")?.includes("animate-ripple"))).toBe(false);
+    expect(all.map((d) => (d.dataset.lit ? "#" : ".")).join("")).toBe(shapes.working);
+  });
+
   it("is decoration: the pill says the state in words", () => {
     render(<StatePill glyph="stuck" label="Stuck" />);
     const svg = screen.getByText("Stuck").parentElement?.querySelector("svg");

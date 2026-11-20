@@ -45,11 +45,12 @@ const ring = [2, 1, 2, 1, 0, 1, 2, 1, 2];
 /**
  * A state's glyph: nine dots in a 3 by 3 grid. Working ripples out from the centre and is the
  * only one that moves; every other state is a still shape. Keyed by glyph, so it plays one pop
- * when the state changes and never otherwise.
+ * when the state changes and never otherwise. `still` holds working to its still frame, for a glyph
+ * that names a state rather than shows one (a heading, a legend).
  */
-export function StateGlyph({ glyph }: { glyph: Glyph }) {
+export function StateGlyph({ glyph, still = false }: { glyph: Glyph; still?: boolean }) {
   const shape = shapes[glyph];
-  const moving = glyph === "working";
+  const moving = glyph === "working" && !still;
   return (
     <svg
       key={glyph}

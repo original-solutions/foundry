@@ -1,15 +1,16 @@
 import { createRootRoute, createRoute, createRouter, useNavigate, useParams } from "@tanstack/react-router";
 import { useEffect, useLayoutEffect, useMemo, useState } from "react";
+import { Board } from "./Board";
 import { ChangesPanel } from "./ChangesPanel";
 import { CreateWorkspace } from "./CreateWorkspace";
-import { JumpPalette, jumpKey, SearchIcon } from "./JumpPalette";
+import { JumpPalette } from "./JumpPalette";
 import { Sidebar } from "./Sidebar";
 import { TabStrip } from "./TabStrip";
 import { beside, follow, type Split } from "./split";
 import { loadTabs, saveTabs, withoutTab, withTab } from "./tabs";
 import { TerminalHeader } from "./TerminalHeader";
 import { TerminalPane } from "./TerminalPane";
-import { fleet, locate, terminalRunning, type MachineView } from "./fleet";
+import { fleet, locate, terminalRunning } from "./fleet";
 import { useFleet } from "./useFleet";
 
 /**
@@ -21,7 +22,9 @@ import { useFleet } from "./useFleet";
  * Every terminal opened becomes a tab above the header. A tab shown since the page loaded keeps
  * its pane attached behind the others, so going back to it is instant.
  *
- * A workspace made from the new-workspace dialog (the sidebar, the fleet view or the palette opens
+ * With nothing open, the board shows every workspace as a card with its live states and changes.
+ *
+ * A workspace made from the new-workspace dialog (the sidebar, the board or the palette opens
  * it) is landed in: once its session shows up, its terminal opens, with the setup shell as a tab
  * beside it.
  *
@@ -214,7 +217,7 @@ function Layout() {
               </div>
             );
           })}
-          {!terminalId && <Home machines={machines} onJump={openJump} onCreate={() => openCreate()} />}
+          {!terminalId && <Board machines={machines} onJump={openJump} onCreate={() => openCreate()} onChanges={openChanges} />}
         </div>
       </main>
       <ChangesPanel workspace={machines.flatMap((m) => m.workspaces).find((w) => w.id === changesOf)} onClose={() => setChangesOf(undefined)} />
@@ -235,37 +238,6 @@ function Layout() {
         name={create.name}
         onCreated={setLanding}
       />
-    </div>
-  );
-}
-
-/** The desktop view with nothing open: what the fleet holds, and the way to jump into it. */
-function Home({ machines, onJump, onCreate }: { machines: MachineView[]; onJump: () => void; onCreate: () => void }) {
-  const workspaces = machines.flatMap((m) => m.workspaces);
-  const sessions = workspaces.reduce((n, w) => n + w.sessions.length, 0);
-  const shells = workspaces.reduce((n, w) => n + w.shells.length, 0);
-  const count = (n: number, one: string) => `${n} ${one}${n === 1 ? "" : "s"}`;
-  return (
-    <div className="absolute inset-0 flex flex-col items-center justify-center gap-5 px-6 pb-[12vh]">
-      <p className="text-sm text-neutral-500">
-        {count(sessions, "session")} · {count(shells, "shell")} · {count(workspaces.length, "workspace")} · {count(machines.length, "machine")}
-      </p>
-      <button
-        type="button"
-        onClick={onJump}
-        className="group flex w-full max-w-xl items-center gap-3 rounded-xl border border-neutral-700/70 bg-neutral-900 px-4 py-3.5 text-left text-base text-neutral-400 shadow-lg shadow-black/40 transition-colors hover:border-neutral-500 hover:text-neutral-200"
-      >
-        <SearchIcon className="size-5 shrink-0 text-neutral-500 group-hover:text-neutral-300" />
-        <span className="flex-1">Jump to a session or shell…</span>
-        <kbd className="rounded border border-neutral-700 px-1.5 py-0.5 text-xs text-neutral-400">{jumpKey}</kbd>
-      </button>
-      <p className="text-xs text-neutral-600">
-        Type a workspace, model, state or machine. Or{" "}
-        <button type="button" onClick={onCreate} className="text-neutral-400 underline decoration-neutral-700 underline-offset-4 hover:text-neutral-200">
-          start a new workspace
-        </button>
-        .
-      </p>
     </div>
   );
 }

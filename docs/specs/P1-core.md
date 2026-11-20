@@ -174,6 +174,10 @@ Branch names are `<name>` as typed, made safe for git. Worktrees live under the 
 
 A P3 diff view, built early on a read the daemon already had. `GET /api/workspaces/{id}/changes` lists what a workspace of this machine changed since it left `origin/<base>`: the commits on its branch and each changed file, committed or not, new files included, with its hunks. The read changes nothing in the worktree, never follows a symlink, and hides credentials in URLs. The UI shows it as a sheet opened from the terminal header or the workspace's row, reading again every few seconds while open.
 
+### The board
+
+A P3 overview on the same read. With no terminal open, the UI shows every workspace as a card in three lanes by its most urgent terminal: needs you (waiting, stuck or failed), working (working or starting) and quiet. A card lists its terminals with their states and what the workspace changed since its base. It reads the changes every few seconds while an agent in it works, now and then otherwise, and again when one of its terminals changes state. A workspace whose changes cannot be read from this machine says so.
+
 ## Placement
 
 - Each worker records CPU load per core, free memory, free disk and its session count every 5 seconds.

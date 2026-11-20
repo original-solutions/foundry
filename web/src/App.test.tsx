@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { UiMessage } from "./api";
 import { router, routeTree } from "./App";
 import { ME, sample, session, settings, terminal, workspace } from "./test-fixtures";
-import { FakeSocket, json, mockFetch } from "./test-utils";
+import { FakeSocket, json, mockFetch, type Call } from "./test-utils";
 
 // jsdom cannot run xterm.js.
 vi.mock("@xterm/xterm", () => ({
@@ -27,6 +27,25 @@ vi.mock("@xterm/xterm", () => ({
   },
 }));
 vi.mock("@xterm/addon-fit", () => ({ FitAddon: class { fit() {} } }));
+
+/**
+ * Like `mockFetch`, but the board's reads of each workspace's changes get an empty answer and are
+ * left out of the calls, so a test sees only the requests it makes.
+ */
+function mockActions(...answers: Response[]): Call[] {
+  const calls: Call[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string, init: RequestInit = {}) => {
+      if (url.endsWith("/changes")) return json(200, { base: "main", commits: [], files: [] });
+      calls.push({ url, method: init.method ?? "GET", body: init.body ? JSON.parse(String(init.body)) : undefined });
+      const next = answers.shift();
+      if (!next) throw new Error("unexpected request");
+      return next;
+    }),
+  );
+  return calls;
+}
 
 const sockets = (path: string) => FakeSocket.all.filter((s) => s.url.endsWith(path));
 
@@ -187,8 +206,18 @@ describe("App", () => {
     xterm.remove();
   });
 
+  it("shows the board with nothing open, and a card's changes open the changes sheet", async () => {
+    mockActions();
+    await open("/", live);
+    const card = screen.getByRole("article", { name: "fix login" });
+    expect(within(screen.getByRole("region", { name: "Working" })).getByRole("article", { name: "fix login" })).toBe(card);
+    await waitFor(() => expect(within(card).getByText("No changes yet")).toBeDefined());
+    fireEvent.click(within(card).getByRole("button", { name: "Changes in fix login" }));
+    expect(await screen.findByRole("dialog", { name: /changes in fix login/i })).toBeDefined();
+  });
+
   it("starts a new shell from the palette and opens it", async () => {
-    const calls = mockFetch(json(201, { id: "t9" }));
+    const calls = mockActions(json(201, { id: "t9" }));
     const router = await open("/", live);
     fireEvent.keyDown(window, { key: "k", metaKey: true });
     const dialog = await screen.findByRole("dialog", { name: "Jump to" });
@@ -201,7 +230,7 @@ describe("App", () => {
   });
 
   it("lands in the new workspace's session once it starts, with its setup shell as a tab beside it", async () => {
-    const calls = mockFetch(json(201, { id: "w9" }), json(201, { id: "s9" }));
+    const calls = mockActions(json(201, { id: "w9" }), json(201, { id: "s9" }));
     const router = await open("/", live);
 
     fireEvent.click(screen.getByRole("button", { name: "New workspace" }));
@@ -256,8 +285,8 @@ describe("App", () => {
     expect(JSON.parse(localStorage.getItem("foundry.tabs")!)).toEqual(["t1", "t2"]);
   });
 
-  it("closes a tab to its neighbour and then to the fleet view, leaving the terminal running", async () => {
-    const calls = mockFetch();
+  it("closes a tab to its neighbour and then to the board, leaving the terminal running", async () => {
+    const calls = mockActions();
     const router = await open("/terminals/t1", live);
     fireEvent.click(screen.getByRole("link", { name: /^shell/ }));
     await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t2"));
