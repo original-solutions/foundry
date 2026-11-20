@@ -20,6 +20,20 @@ describe("NewSession", () => {
     expect(calls).toEqual([{ url: "/api/workspaces/w1/sessions", method: "POST", body: { model: "sonnet" } }]);
   });
 
+  it("starts the session on the first prompt written, Ctrl+Enter in it starting", async () => {
+    const calls = mockFetch(json(201, { id: "s2" }));
+    await renderApp(<NewSession workspace="w1" name="fix login" />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "New session" }));
+    const dialog = await screen.findByRole("dialog");
+    const prompt = within(dialog).getByLabelText("First prompt");
+    fireEvent.change(prompt, { target: { value: "Find why login redirects twice" } });
+    fireEvent.keyDown(prompt, { key: "Enter", ctrlKey: true });
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(calls).toEqual([{ url: "/api/workspaces/w1/sessions", method: "POST", body: { model: "opus", prompt: "Find why login redirects twice" } }]);
+  });
+
   it("keeps the dialog open with the daemon's words when the session is refused", async () => {
     mockFetch(json(500, { error: "set FOUNDRY_GATEWAY_URL" }));
     await renderApp(<NewSession workspace="w1" name="fix login" />);

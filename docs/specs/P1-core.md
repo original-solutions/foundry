@@ -162,6 +162,8 @@ This is a rule for every piece, not only P1: nothing runs without the UI showing
 3. It runs the setup commands in a terminal inside the workspace. A failed setup stays visible there and raises an attention item. The workspace is still usable, so the failure can be fixed by hand.
 4. The workspace opens with one agent session. Shells and more sessions can be added.
 
+A session can be started with a first prompt (`POST /api/workspaces/{id}/sessions` takes `prompt` beside `model`): it is Claude Code's last argument, after `--`, so the agent starts on it at once and its hooks report it as any typed prompt. A blank prompt is none; one with a NUL or over 20,000 characters is refused. The new-workspace and new-session dialogs offer it as an optional box.
+
 Branch names are `<name>` as typed, made safe for git. Worktrees live under the data directory at `worktrees/<project>/<branch>`.
 
 ### Archiving
@@ -185,6 +187,14 @@ A session is named by what it was asked. The daemon keeps, in memory and for its
 ### Steps
 
 A P3 run history on the same hooks. The daemon also keeps each of its sessions' trail: every prompt, tool call and question, and the end of each turn, the newest 200, with the time each hook arrived (for showing; the order is the order they arrived). `GET /api/sessions/{id}/trail` returns one session's trail, cut and hidden as briefs are; a session of another machine is `404`. The UI shows it in a Steps column beside the open terminal (the whole screen on a narrow one), opened from the terminal header: one card per turn, earlier turns folded to their prompt, what they did and how long they took, the newest open and growing while the session works.
+
+### Timeline
+
+A P3 run history on the same trails, across the fleet. The board switches to a timeline: every session of this machine that took a turn in the window (15 minutes to 12 hours, ending now) is a lane, each turn a bar from its prompt to its end, with a tick for each tool call and a dot for each question. A turn still going runs to the "now" edge in its session's state colour. A line above sums the window: turns, agent time, tool calls and questions. Pointing at a bar shows its prompt, what it did and how long it took; clicking it opens the terminal with its Steps column. Only sessions this daemon has briefs of are read, so a peer's session is never asked; a busy session's trail is read again every few seconds, a quiet one on a change of state.
+
+### Ending terminals
+
+A terminal is ended or cleared from its menu (right-click or long press on its row, or the header's More button) through `POST /api/terminals/{id}/close`, which only the owning machine answers. `GET /api/machine` returns `{"id"}` of the machine serving the UI, and the menu offers End and Clear only for that machine's terminals. Ending one that still runs asks first; clearing one that ended does not, so End and Clear are picked only by a click on them or the keyboard, never by the release of the press that opened the menu.
 
 ## Placement
 

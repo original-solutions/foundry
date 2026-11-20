@@ -10,6 +10,8 @@ import { startShell } from "./api";
 import { loadFolded, saveFolded } from "./fold";
 import { byUrgency, machineNumbers, machineStats, rows, type MachineView, type Row, type WorkspaceView } from "./fleet";
 import { glyphText, StateGlyph } from "./StateGlyph";
+import { ended } from "./ends";
+import { TerminalMenu, useTerminalActions } from "./TerminalMenu";
 import { ThemeButton } from "./ThemeButton";
 import type { MachineSample } from "./api";
 
@@ -112,6 +114,7 @@ export function Sidebar({ machines, onCreate, selected, connected, onNavigate, o
                 <Workspace
                   key={workspace.id}
                   workspace={workspace}
+                  machine={machine.id}
                   folded={folded.has(workspace.id)}
                   onFold={(on) => fold([workspace.id], on)}
                   selected={selected}
@@ -147,6 +150,8 @@ function LoadMeter({ sample }: { sample: MachineSample }) {
 
 interface WorkspaceProps {
   workspace: WorkspaceView;
+  /** The machine it is on. */
+  machine: string;
   folded: boolean;
   onFold: (on: boolean) => void;
   selected?: string;
@@ -154,9 +159,12 @@ interface WorkspaceProps {
   onChanges?: (workspace: string) => void;
 }
 
-function Workspace({ workspace, folded, onFold, selected, onNavigate, onChanges }: WorkspaceProps) {
+function Workspace({ workspace, machine, folded, onFold, selected, onNavigate, onChanges }: WorkspaceProps) {
   const shell = useMutation({ mutationFn: () => startShell(workspace.id) });
+  const terminals = useTerminalActions();
   const list = rows(workspace);
+  // Only the machine serving the UI can clear its terminals.
+  const over = terminals?.here === machine ? ended(workspace) : [];
   return (
     <div role="group" aria-label={workspace.name} className="group/ws">
       <div className="flex items-center gap-2 rounded-md px-1 py-1 hover:bg-neutral-800/60">
@@ -198,6 +206,11 @@ function Workspace({ workspace, folded, onFold, selected, onNavigate, onChanges 
               <Action label="New shell" title="New shell" onClick={() => shell.mutate()} disabled={shell.isPending}>
                 <path d="M3.5 4.5l3 3-3 3M8 11.5h4.5" />
               </Action>
+              {terminals && over.length > 0 && (
+                <Action label={`Clear ${over.length} ended`} title="Clear the terminals that ended, with their final screens" onClick={() => terminals.clear(over)}>
+                  <path d="M11.5 2l-3 6M4 8h7l1 5.5H3zM6 10.5v3M9 10.5v3" />
+                </Action>
+              )}
               <ArchiveButton
                 workspace={workspace.id}
                 name={workspace.name}
@@ -240,18 +253,19 @@ function Strip({ list, selected, onNavigate }: { list: Row[]; selected?: string;
   return (
     <span className="flex shrink-0 items-center gap-0.5">
       {shown.map((row) => (
-        <Link
-          key={row.terminal}
-          to="/terminals/$terminalId"
-          params={{ terminalId: row.terminal }}
-          aria-label={`${row.name} ${row.label}`}
-          title={`${row.name}: ${row.label}`}
-          aria-current={row.terminal === selected ? "true" : undefined}
-          onClick={onNavigate}
-          className={`grid size-5 place-items-center rounded hover:bg-neutral-700 ${row.terminal === selected ? "bg-neutral-700" : ""}`}
-        >
-          <StateGlyph glyph={row.glyph} />
-        </Link>
+        <TerminalMenu key={row.terminal} id={row.terminal}>
+          <Link
+            to="/terminals/$terminalId"
+            params={{ terminalId: row.terminal }}
+            aria-label={`${row.name} ${row.label}`}
+            title={`${row.name}: ${row.label}`}
+            aria-current={row.terminal === selected ? "true" : undefined}
+            onClick={onNavigate}
+            className={`grid size-5 place-items-center rounded hover:bg-neutral-700 ${row.terminal === selected ? "bg-neutral-700" : ""}`}
+          >
+            <StateGlyph glyph={row.glyph} />
+          </Link>
+        </TerminalMenu>
       ))}
       {rest > 0 && <span className="pl-0.5 text-[11px] text-neutral-500">+{rest}</span>}
     </span>
@@ -280,24 +294,26 @@ function Item({ row, selected, onNavigate }: { row: Row; selected?: string; onNa
   const ended = row.glyph === "done" || row.glyph === "away";
   return (
     <li>
-      <Link
-        to="/terminals/$terminalId"
-        params={{ terminalId: row.terminal }}
-        aria-current={current ? "true" : undefined}
-        onClick={onNavigate}
-        title={row.title ? `${row.name}: ${row.title}` : undefined}
-        className={`flex items-start gap-2 rounded px-2 py-1.5 hover:bg-neutral-800 md:py-1 ${current ? "bg-neutral-800 text-neutral-50" : ended ? "text-neutral-500" : ""}`}
-      >
-        <span className="flex h-5 shrink-0 items-center">
-          <StateGlyph glyph={row.glyph} />
-        </span>
-        <span className="min-w-0 flex-1">
-          <span className="flex items-baseline gap-2 leading-5">
-            <Named name={row.name} title={row.title} /> <span className={`shrink-0 text-xs ${ended ? "" : glyphText[row.glyph]}`}>{row.label}</span>
+      <TerminalMenu id={row.terminal}>
+        <Link
+          to="/terminals/$terminalId"
+          params={{ terminalId: row.terminal }}
+          aria-current={current ? "true" : undefined}
+          onClick={onNavigate}
+          title={row.title ? `${row.name}: ${row.title}` : undefined}
+          className={`flex items-start gap-2 rounded px-2 py-1.5 hover:bg-neutral-800 md:py-1 ${current ? "bg-neutral-800 text-neutral-50" : ended ? "text-neutral-500" : ""}`}
+        >
+          <span className="flex h-5 shrink-0 items-center">
+            <StateGlyph glyph={row.glyph} />
           </span>
-          {row.now && <Now step={row.now} />}
-        </span>
-      </Link>
+          <span className="min-w-0 flex-1">
+            <span className="flex items-baseline gap-2 leading-5">
+              <Named name={row.name} title={row.title} /> <span className={`shrink-0 text-xs ${ended ? "" : glyphText[row.glyph]}`}>{row.label}</span>
+            </span>
+            {row.now && <Now step={row.now} />}
+          </span>
+        </Link>
+      </TerminalMenu>
     </li>
   );
 }

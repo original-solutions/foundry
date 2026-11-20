@@ -616,6 +616,15 @@ async fn a_request_from_another_site_is_refused() {
 }
 
 #[tokio::test]
+async fn the_ui_learns_which_machine_serves_it() {
+    let daemon = Daemon::new(TURN).await;
+    let reply = daemon.call("GET", "/api/machine", None).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    let body: serde_json::Value = serde_json::from_str(&reply.body).unwrap();
+    assert_eq!(body, serde_json::json!({"id": daemon.me.to_string()}));
+}
+
+#[tokio::test]
 async fn a_request_naming_another_host_is_refused() {
     // What a page whose name was rebound to this machine's address sends.
     let daemon = Daemon::new(TURN).await;
@@ -988,6 +997,41 @@ async fn a_start_racing_an_archive_leaves_no_live_terminal_in_the_archived_works
 }
 
 #[tokio::test]
+async fn a_session_starts_with_a_first_prompt_and_one_that_cannot_be_an_argument_is_refused() {
+    let daemon = Daemon::new(TURN).await;
+    let project = daemon.project();
+    let workspace = daemon.create_workspace(project, "first prompt").await;
+    let sessions = format!("/api/workspaces/{workspace}/sessions");
+
+    let reply = daemon
+        .call(
+            "POST",
+            &sessions,
+            Some(serde_json::json!({"model": MODEL, "prompt": "fix the login"})),
+        )
+        .await;
+    assert_eq!(reply.status, 201, "{}", reply.body);
+
+    for prompt in ["a\u{0}b".to_string(), "x".repeat(20_001)] {
+        let reply = daemon
+            .call(
+                "POST",
+                &sessions,
+                Some(serde_json::json!({"model": MODEL, "prompt": prompt})),
+            )
+            .await;
+        assert_eq!(reply.status, 422, "{}", reply.body);
+        assert!(reply.json()["error"].is_string(), "{}", reply.body);
+    }
+    let started = daemon
+        .records()
+        .into_iter()
+        .filter(|r| matches!(r, AnyRecord::Session(s) if s.body.workspace == workspace))
+        .count();
+    assert_eq!(started, 1, "only the first start made a session");
+}
+
+#[tokio::test]
 async fn an_action_on_what_is_not_here_is_not_found() {
     let daemon = Daemon::new(TURN).await;
     let workspace = WorkspaceId::random();
@@ -1279,6 +1323,7 @@ async fn every_route_refuses_another_site_and_another_host_and_does_nothing() {
         ("POST", &sessions, Some(model), false),
         ("POST", &shells, None, false),
         ("GET", "/api/briefs", None, false),
+        ("GET", "/api/machine", None, false),
         ("GET", &trail, None, false),
         ("GET", &changes, None, false),
     ];

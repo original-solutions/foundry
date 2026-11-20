@@ -425,6 +425,58 @@ async fn the_record_names_its_workspace_terminal_and_model_and_the_child_gets_it
 }
 
 #[tokio::test]
+async fn a_first_prompt_is_the_last_argument_after_a_double_dash_and_a_blank_one_is_none() {
+    let f = Fixture::new("- print_args\n- wait_input\n").await;
+    let prompt = "-v fix the login, then say \"done\"";
+    let with = f
+        .sessions
+        .start_with(
+            WorkspaceId::random(),
+            f.worktree.path(),
+            MODEL,
+            Some(prompt),
+        )
+        .await
+        .unwrap();
+    let blank = f
+        .sessions
+        .start_with(
+            WorkspaceId::random(),
+            f.worktree.path(),
+            MODEL,
+            Some("  \n "),
+        )
+        .await
+        .unwrap();
+
+    let args = |seen: &str| -> Vec<String> {
+        seen.lines()
+            .filter_map(|l| l.trim_end().strip_prefix("ARG=").map(str::to_owned))
+            .collect()
+    };
+    for (id, want) in [(with, Some(prompt)), (blank, None)] {
+        let terminal = f.record(id).unwrap().body.terminal;
+        let (snapshot, mut output) = f.terminals.attach(terminal).await.unwrap();
+        let seen = read_until(&snapshot.bytes, &mut output, |seen| {
+            seen.contains("ARG=test-model") && (want.is_none() || seen.contains("say \"done\""))
+        })
+        .await;
+        let args = args(&seen);
+        let tail: Vec<&str> = args
+            .iter()
+            .rev()
+            .take(2)
+            .rev()
+            .map(String::as_str)
+            .collect();
+        match want {
+            Some(prompt) => assert_eq!(tail, ["--", prompt], "{args:?}"),
+            None => assert_eq!(tail, ["--model", MODEL], "{args:?}"),
+        }
+    }
+}
+
+#[tokio::test]
 async fn a_hook_with_a_wrong_token_or_for_an_unknown_session_is_403_and_changes_nothing() {
     let f = Fixture::new("- wait_input\n").await;
     let id = f.start().await;
