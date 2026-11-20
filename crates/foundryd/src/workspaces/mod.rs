@@ -110,6 +110,14 @@ pub enum WorkspaceError {
         workspace: WorkspaceId,
         source: TerminalError,
     },
+    #[error(
+        "workspace {workspace} was made, but its setup terminal could not be recorded, so the \
+         setup was stopped: {source}"
+    )]
+    SetupNotRecorded {
+        workspace: WorkspaceId,
+        source: Box<WorkspaceError>,
+    },
     #[error(transparent)]
     Terminal(#[from] TerminalError),
     #[error(transparent)]
@@ -255,7 +263,8 @@ impl Workspaces {
 
     /// Makes a workspace of `project` named `name`, on a new branch from `base` on the
     /// project's remote, and starts its setup. Returns once the setup has started, not
-    /// finished. [`WorkspaceError::SetupNotStarted`] means the workspace was made all the same.
+    /// finished. [`WorkspaceError::SetupNotStarted`] and [`WorkspaceError::SetupNotRecorded`]
+    /// mean the workspace was made all the same, with no setup running.
     /// The create finishes even when the caller stops waiting.
     pub async fn create(
         &self,
@@ -497,14 +506,23 @@ impl Inner {
                     workspace: id,
                     source,
                 })?;
-            // The attention list reads a failed setup from this terminal. The setup runs
-            // whether or not the record says so, so a write that fails is only logged.
+            // The attention list reads a failed setup from this terminal, so a setup the
+            // record does not name would fail unseen: it is stopped instead.
             let body = Workspace {
                 setup: Some(terminal),
                 ..body
             };
             if let Err(e) = self.write(body, false).await {
-                tracing::warn!("workspace {id}: its setup terminal could not be recorded: {e}");
+                if let Err(close) = self.terminals.close(terminal).await {
+                    tracing::warn!(
+                        "workspace {id}: its unrecorded setup terminal {terminal} could not be \
+                         closed: {close}"
+                    );
+                }
+                return Err(WorkspaceError::SetupNotRecorded {
+                    workspace: id,
+                    source: Box::new(e),
+                });
             }
         }
         Ok(id)
