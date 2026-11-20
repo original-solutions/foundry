@@ -49,6 +49,9 @@ pub const STUCK_AFTER: Duration = Duration::from_secs(10 * 60);
 /// the exit being read, the exit, a stall or a hook being recorded. Each wait is twice the one
 /// before, up to [`RETRY_AT_MOST`].
 const RETRY_AFTER: Duration = Duration::from_millis(100);
+/// How long after `SessionStart` a first prompt waits when the only sign that Claude Code takes
+/// input came before it, from an earlier screen. The input box draws about 0.2 s after the hook.
+const EARLIER_SIGN_GRACE: Duration = Duration::from_secs(1);
 /// The longest wait between two tries.
 const RETRY_AT_MOST: Duration = Duration::from_secs(10);
 
@@ -550,17 +553,21 @@ async fn follow(
             Ok((snapshot, mut output)) => {
                 backoff.reset();
                 let mut tail = Vec::new();
-                first.read(&mut tail, &snapshot.bytes);
+                first.read(&mut tail, &snapshot.bytes, *started.borrow());
                 loop {
                     first.type_if_ready(&inner, terminal, &mut started).await;
+                    let grace = first.grace_until;
                     let next = tokio::select! {
                         next = output.next() => next,
-                        // `SessionStart` came: the prompt may be ready with no more output.
+                        // `SessionStart` came, or the grace ran out: the prompt may be ready
+                        // with no more output.
                         Ok(()) = started.changed(), if first.waiting() => continue,
+                        () = tokio::time::sleep_until(grace.unwrap_or_else(Instant::now)),
+                            if first.waiting() && grace.is_some() => continue,
                     };
                     match next {
                         Some(Ok(bytes)) => {
-                            first.read(&mut tail, &bytes);
+                            first.read(&mut tail, &bytes, *started.borrow());
                             if !bytes.is_empty() {
                                 report(&inner, &live, Event::Output).await;
                             }
@@ -589,22 +596,34 @@ async fn follow(
 }
 
 /// A session's first prompt until it is typed. Claude Code takes it once the session has
-/// started, which `SessionStart` says, and its screen takes keys, which turning bracketed paste
-/// on says ([`claude::TAKES_INPUT`]), in either order. The sign alone is not enough: a screen
-/// before the session starts, such as the trust prompt, turns bracketed paste on too, and the
-/// paste's Enter would answer it.
+/// started, which `SessionStart` says, and its input box takes keys, which turning bracketed
+/// paste on says ([`claude::TAKES_INPUT`]). A screen before the session starts, such as the
+/// trust prompt, turns bracketed paste on too, and the paste's Enter would answer it, so the
+/// prompt is typed on a sign that comes after `SessionStart`. A sign seen only before it, which
+/// is also what a hook that reaches the daemon after the box's sign looks like, counts
+/// [`EARLIER_SIGN_GRACE`] after `SessionStart`, by when the box is drawn.
 struct FirstPrompt {
     /// The keys that type it, until they are sent.
     keys: Option<Bytes>,
-    /// Whether the output has shown the sign.
-    takes_input: bool,
+    /// Where the output has shown the sign, as far as the daemon has read.
+    sign: Sign,
+    /// When an earlier sign counts, once `SessionStart` has come.
+    grace_until: Option<Instant>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Sign {
+    None,
+    BeforeStart,
+    AfterStart,
 }
 
 impl FirstPrompt {
     fn new(prompt: Option<&str>) -> Self {
         Self {
             keys: prompt.map(|p| Bytes::from(claude::typed_prompt(p))),
-            takes_input: false,
+            sign: Sign::None,
+            grace_until: None,
         }
     }
 
@@ -612,10 +631,18 @@ impl FirstPrompt {
         self.keys.is_some()
     }
 
-    /// Notes `output`, read after `tail` since the follower attached.
-    fn read(&mut self, tail: &mut Vec<u8>, output: &[u8]) {
-        if self.waiting() && !self.takes_input {
-            self.takes_input = claude::turns_paste_on(tail, output);
+    /// Notes `output`, read after `tail` since the follower attached, when `started` says
+    /// whether `SessionStart` has come.
+    fn read(&mut self, tail: &mut Vec<u8>, output: &[u8], started: bool) {
+        if !self.waiting() || self.sign == Sign::AfterStart {
+            return;
+        }
+        if claude::turns_paste_on(tail, output) {
+            self.sign = if started {
+                Sign::AfterStart
+            } else {
+                Sign::BeforeStart
+            };
         }
     }
 
@@ -627,7 +654,20 @@ impl FirstPrompt {
         terminal: TerminalId,
         started: &mut watch::Receiver<bool>,
     ) {
-        if !(self.takes_input && *started.borrow_and_update()) {
+        if !self.waiting() || !*started.borrow_and_update() {
+            return;
+        }
+        let ready = match self.sign {
+            Sign::None => false,
+            Sign::AfterStart => true,
+            Sign::BeforeStart => {
+                let until = *self
+                    .grace_until
+                    .get_or_insert_with(|| Instant::now() + EARLIER_SIGN_GRACE);
+                Instant::now() >= until
+            }
+        };
+        if !ready {
             return;
         }
         if let Some(keys) = self.keys.take()
