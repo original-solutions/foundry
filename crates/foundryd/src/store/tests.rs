@@ -654,11 +654,17 @@ fn a_file_a_newer_build_migrated_opens_and_keeps_working() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("foundry.db");
     let newer = MIGRATIONS.len() + 1;
-    drop(Store::open(&path).unwrap());
+    let owner = MachineId::random();
+    Store::open(&path)
+        .unwrap()
+        .apply(&workspace(owner, 1), owner)
+        .unwrap();
     {
         // What a newer build's extra step leaves: a table of its own and a higher count.
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute("CREATE TABLE added_by_a_newer_build (x INTEGER)", [])
+            .unwrap();
+        conn.execute("INSERT INTO added_by_a_newer_build VALUES (42)", [])
             .unwrap();
         conn.pragma_update(None, "user_version", newer as i64)
             .unwrap();
@@ -667,17 +673,17 @@ fn a_file_a_newer_build_migrated_opens_and_keeps_working() {
     assert_eq!(store.schema_version().unwrap(), newer);
     let added: i64 = store
         .conn
-        .query_row("SELECT COUNT(*) FROM added_by_a_newer_build", [], |row| {
-            row.get(0)
-        })
+        .query_row("SELECT x FROM added_by_a_newer_build", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(added, 0);
-    let owner = MachineId::random();
+    assert_eq!(added, 42);
     assert_eq!(
-        store.apply(&workspace(owner, 1), owner).unwrap(),
+        store.apply(&terminal(owner, 2), owner).unwrap(),
         Applied::Stored
     );
-    assert_eq!(store.since(owner, 0).unwrap(), vec![workspace(owner, 1)]);
+    assert_eq!(
+        store.since(owner, 0).unwrap(),
+        vec![workspace(owner, 1), terminal(owner, 2)]
+    );
 }
 
 /// Puts a row this build cannot read into the store, as a newer build would have left it.
