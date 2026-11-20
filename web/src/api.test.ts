@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ApiError, createWorkspace, listMachines, sessionBriefs, sessionTrail, thisMachine, workspaceChanges } from "./api";
+import { ApiError, createWorkspace, listMachines, sendFile, sessionBriefs, sessionTrail, thisMachine, workspaceChanges } from "./api";
 import { json } from "./test-utils";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -43,6 +43,24 @@ describe("the reads", () => {
     expect(await workspaceChanges("w1")).toEqual({ base: "main", commits: [], files: [] });
     answer(json(200, { id: "m1" }));
     expect(await thisMachine()).toBe("m1");
+  });
+});
+
+describe("sendFile", () => {
+  it("posts the file itself as the body, its name in the query, and gives back the path it was kept at", async () => {
+    const fetch = vi.fn(async () => json(201, { path: "/data/terminals/t1.files/my-shot.png" }));
+    vi.stubGlobal("fetch", fetch);
+    const file = new File(["png"], "my shot.png", { type: "image/png" });
+
+    expect(await sendFile("t1", file)).toBe("/data/terminals/t1.files/my-shot.png");
+    expect(fetch).toHaveBeenCalledWith("/api/terminals/t1/files?name=my%20shot.png", { method: "POST", body: file });
+  });
+
+  it("refuses with the daemon's text and its status", async () => {
+    answer(json(413, { error: "a file sent to a terminal is at most 25 MB" }));
+    const error = await sendFile("t1", new File(["x"], "big.bin")).catch((e: unknown) => e);
+    expect((error as ApiError).message).toBe("a file sent to a terminal is at most 25 MB");
+    expect((error as ApiError).status).toBe(413);
   });
 });
 

@@ -1,7 +1,7 @@
-import { render, screen } from "@testing-library/react";
+import { render } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import type { Glyph } from "./labels";
-import { shapes, StateGlyph, StatePill } from "./StateGlyph";
+import { glyphFill, glyphText, shapes, StateGlyph } from "./StateGlyph";
 
 const glyphs: Glyph[] = ["starting", "working", "waiting", "ready", "done", "failed", "stuck", "away"];
 
@@ -43,10 +43,15 @@ describe("StateGlyph", () => {
     expect(all.map((d) => (d.dataset.lit ? "#" : ".")).join("")).toBe(shapes.working);
   });
 
-  it("is decoration: the pill says the state in words", () => {
-    render(<StatePill glyph="stuck" label="Stuck" />);
-    const svg = screen.getByText("Stuck").parentElement?.querySelector("svg");
-    expect(svg?.getAttribute("aria-hidden")).toBe("true");
-    expect(svg?.dataset.glyph).toBe("stuck");
+  it("colours only a state that needs you or is moving; a resting one is grey, and green is left to actions", () => {
+    const loud: Glyph[] = ["working", "waiting", "failed", "stuck"];
+    for (const g of glyphs) {
+      for (const tone of [glyphText[g], glyphFill[g]]) {
+        expect(tone, g).not.toMatch(/emerald|green/);
+        expect(/neutral/.test(tone), `${g}: ${tone}`).toBe(!loud.includes(g));
+      }
+    }
+    const { container } = render(<StateGlyph glyph="ready" />);
+    expect(container.querySelector("svg")?.getAttribute("class")).toContain("text-neutral-");
   });
 });

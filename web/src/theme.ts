@@ -1,3 +1,5 @@
+import { readStored, store } from "./storage";
+
 // Dark or light. The page carries the choice as `data-theme` on <html>; index.css remaps the
 // palette for light, so every screen follows without its own light classes.
 
@@ -14,11 +16,7 @@ export function flippedShade(shade: number): number {
 
 /** The user's choice in this browser. The app is dark until they pick light. */
 export function storedTheme(): Theme {
-  try {
-    return localStorage.getItem(KEY) === "light" ? "light" : "dark";
-  } catch {
-    return "dark";
-  }
+  return readStored(KEY) === "light" ? "light" : "dark";
 }
 
 export function applyTheme(theme: Theme, root: HTMLElement = document.documentElement) {
@@ -26,9 +24,6 @@ export function applyTheme(theme: Theme, root: HTMLElement = document.documentEl
 }
 
 export function saveTheme(theme: Theme) {
-  try {
-    localStorage.setItem(KEY, theme);
-  } catch {
-    // Storage blocked: the choice holds until the page reloads.
-  }
+  // When not kept, the choice holds until the page reloads.
+  store(KEY, theme);
 }

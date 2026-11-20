@@ -2859,6 +2859,85 @@ async fn changes_send_no_diff_past_the_caps_and_still_list_the_file() {
 }
 
 #[tokio::test]
+async fn a_commit_on_the_branch_shows_only_its_own_change() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\nworld\n"), ("old.txt", "old\n")]);
+    let id = setup.create(&remote, "main", "steps").await;
+    let worktree = setup.worktree(remote.project, "steps");
+    std::fs::write(worktree.join("first.txt"), "one\n").unwrap();
+    git(&worktree, &["add", "first.txt"]);
+    git(&worktree, &["commit", "-q", "-m", "add first"]);
+    let first = git(&worktree, &["rev-parse", "--short", "HEAD"])
+        .trim()
+        .to_owned();
+    std::fs::write(worktree.join("README.md"), "hello\nthere\n").unwrap();
+    git(&worktree, &["mv", "old.txt", "moved.txt"]);
+    git(&worktree, &["commit", "-qam", "edit readme and move old"]);
+    let second = git(&worktree, &["rev-parse", "--short", "HEAD"])
+        .trim()
+        .to_owned();
+    // Work not committed yet is never part of a commit.
+    std::fs::write(worktree.join("first.txt"), "one\ntwo\n").unwrap();
+    std::fs::write(worktree.join("new.txt"), "new\n").unwrap();
+
+    let one = setup.workspaces.commit(id, &first).await.unwrap();
+    assert_eq!(one.base, "main");
+    assert_eq!(one.commits.len(), 1);
+    assert_eq!(
+        (
+            one.commits[0].hash.as_str(),
+            one.commits[0].subject.as_str()
+        ),
+        (first.as_str(), "add first")
+    );
+    assert_eq!(one.files.len(), 1, "{:?}", one.files);
+    let file = &one.files[0];
+    assert_eq!(
+        (file.path.as_str(), file.status),
+        ("first.txt", FileStatus::Added)
+    );
+    assert_eq!(
+        (file.added, file.removed, file.uncommitted),
+        (Some(1), Some(0), false)
+    );
+    assert_eq!(file.patch.as_deref(), Some("@@ -0,0 +1 @@\n+one\n"));
+
+    let two = setup.workspaces.commit(id, &second).await.unwrap();
+    let paths: Vec<&str> = two.files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, ["README.md", "moved.txt"]);
+    assert!(
+        two.files[0]
+            .patch
+            .as_deref()
+            .unwrap()
+            .contains("-world\n+there\n")
+    );
+    assert_eq!(two.files[1].status, FileStatus::Renamed);
+    assert_eq!(two.files[1].from.as_deref(), Some("old.txt"));
+    assert!(two.files.iter().all(|f| !f.uncommitted));
+}
+
+#[tokio::test]
+async fn a_commit_not_on_the_branch_is_refused_as_unknown() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup.create(&remote, "main", "nothing").await;
+    let worktree = setup.worktree(remote.project, "nothing");
+    // The base's own commit is not the workspace's change, and no option reaches git.
+    let base = git(&worktree, &["rev-parse", "--short", "HEAD"])
+        .trim()
+        .to_owned();
+    for asked in [base.as_str(), "--output=x", "HEAD", "abc1234", ""] {
+        let err = setup.workspaces.commit(id, asked).await.unwrap_err();
+        assert!(
+            matches!(err, WorkspaceError::UnknownCommit(_)),
+            "{asked}: {err}"
+        );
+    }
+    assert!(!worktree.join("x").exists());
+}
+
+#[tokio::test]
 async fn changes_of_a_workspace_whose_worktree_is_gone_are_refused_as_unknown() {
     // As an archive leaves it for a moment: the worktree removed, the record not yet written.
     let setup = Setup::new();
@@ -2870,6 +2949,70 @@ async fn changes_of_a_workspace_whose_worktree_is_gone_are_refused_as_unknown() 
 }
 
 #[tokio::test]
+async fn changes_read_while_an_archive_removes_the_worktree_are_refused_as_unknown() {
+    // Git removes a worktree file by file, so a read beside it sees the files go one by one, as
+    // deletes, and then no repo at all, while the folder is still there.
+    let setup = Setup::new();
+    let names: Vec<String> = (0..1500).map(|i| format!("f{i:04}.txt")).collect();
+    let files: Vec<(&str, &str)> = names.iter().map(|n| (n.as_str(), "x\n")).collect();
+    let remote = setup.project(&files);
+    let id = setup.create(&remote, "main", "leaving").await;
+    let done = std::sync::atomic::AtomicBool::new(false);
+
+    let archive = async {
+        let archived = setup.workspaces.archive(id, true).await;
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        archived
+    };
+    let reads = async {
+        let mut seen = Vec::new();
+        while !done.load(std::sync::atomic::Ordering::SeqCst) {
+            seen.push(setup.workspaces.changes(id).await);
+        }
+        seen
+    };
+    let (archived, seen) = tokio::join!(archive, reads);
+    archived.unwrap();
+
+    for read in &seen {
+        match read {
+            Ok(changes) => assert!(
+                changes.files.is_empty(),
+                "a read of a half-removed worktree: {} files",
+                changes.files.len()
+            ),
+            Err(WorkspaceError::Unknown(_)) => {}
+            Err(other) => panic!("a read during the archive failed as {other}, not as gone"),
+        }
+    }
+}
+
+/// A read that starts and ends while the worktree is being removed, with nothing removed yet.
+#[tokio::test]
+async fn changes_are_refused_as_unknown_while_the_worktree_is_being_removed() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup.create(&remote, "main", "removing").await;
+    let removing = Removing::mark(&setup.workspaces.inner, id);
+    let err = setup.workspaces.changes(id).await.unwrap_err();
+    assert!(matches!(err, WorkspaceError::Unknown(_)), "{err}");
+    drop(removing);
+    setup.workspaces.changes(id).await.unwrap();
+}
+
+#[tokio::test]
+async fn shipping_is_refused_as_unknown_while_the_worktree_is_being_removed() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup.create(&remote, "main", "leaving").await;
+    let removing = Removing::mark(&setup.workspaces.inner, id);
+    let err = setup.workspaces.shipping(id).await.unwrap_err();
+    assert!(matches!(err, WorkspaceError::Unknown(_)), "{err}");
+    drop(removing);
+    setup.workspaces.shipping(id).await.unwrap();
+}
+
+#[tokio::test]
 async fn changes_of_a_workspace_that_is_not_here_are_refused() {
     let setup = Setup::new();
     let err = setup
@@ -2878,4 +3021,280 @@ async fn changes_of_a_workspace_that_is_not_here_are_refused() {
         .await
         .unwrap_err();
     assert!(matches!(err, WorkspaceError::Unknown(_)), "{err}");
+}
+
+/// Workspaces over `setup`'s data that ask GitHub with a script printing `answer`, which also
+/// writes each call's arguments to `asked` in the script's folder.
+fn with_gh(setup: &Setup, answer: &str) -> (Workspaces, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = setup.remotes.path().join("gh");
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("gh");
+    let asked = dir.join("asked");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncat <<'JSON'\n{answer}\nJSON\n",
+            asked.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let workspaces = Workspaces::with_git_within(
+        setup.me,
+        setup.store.clone(),
+        setup.data.path(),
+        setup.terminals.clone(),
+        GIT_WITHIN,
+    )
+    .with_gh(&script);
+    (workspaces, asked)
+}
+
+#[tokio::test]
+async fn a_branch_never_pushed_counts_what_is_only_here_and_never_asks_github() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup.create(&remote, "main", "local only").await;
+    let worktree = setup.worktree(remote.project, "local-only");
+    let (workspaces, asked) = with_gh(&setup, "[]");
+
+    let fresh = workspaces.shipping(id).await.unwrap();
+    assert_eq!(fresh.branch, "local-only");
+    assert!(!fresh.pushed);
+    assert_eq!(fresh.unpushed, 0);
+
+    std::fs::write(worktree.join("a.txt"), "a").unwrap();
+    git(&worktree, &["add", "a.txt"]);
+    git(&worktree, &["commit", "-q", "-m", "a"]);
+    git(&worktree, &["commit", "-q", "--allow-empty", "-m", "b"]);
+    let read = workspaces.shipping(id).await.unwrap();
+    assert!(!read.pushed);
+    assert_eq!(read.unpushed, 2);
+    assert_eq!(read.pr, None);
+    assert!(!read.unreachable);
+    assert!(
+        !asked.exists(),
+        "GitHub was asked about a branch it cannot have"
+    );
+}
+
+#[tokio::test]
+async fn a_pushed_branch_shows_its_pull_request_and_what_is_not_pushed_yet() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup.create(&remote, "main", "shipped").await;
+    let worktree = setup.worktree(remote.project, "shipped");
+    git(&worktree, &["commit", "-q", "--allow-empty", "-m", "done"]);
+    git(&worktree, &["push", "-q", "origin", "HEAD"]);
+    let done = git(&worktree, &["rev-parse", "HEAD"]);
+    let (workspaces, asked) = with_gh(
+        &setup,
+        &format!(
+            r#"[{{"number":7,"title":"Ship it","url":"https://github.com/o/r/pull/7","state":"MERGED","isDraft":false,"reviewDecision":"APPROVED","statusCheckRollup":[],"headRefOid":"{}"}}]"#,
+            done.trim()
+        ),
+    );
+
+    let read = workspaces.shipping(id).await.unwrap();
+    assert!(read.pushed);
+    assert_eq!(read.unpushed, 0);
+    let pr = read.pr.expect("its pull request");
+    assert_eq!((pr.number, pr.state), (7, PrState::Merged));
+    assert!(!read.unreachable);
+    let args = std::fs::read_to_string(&asked).unwrap();
+    assert!(args.contains("pr list"), "{args}");
+    assert!(args.trim_end().ends_with("--head shipped"), "{args}");
+
+    git(&worktree, &["commit", "-q", "--allow-empty", "-m", "after"]);
+    let moved_past = workspaces.shipping(id).await.unwrap();
+    assert_eq!(moved_past.unpushed, 1);
+    assert_eq!(
+        moved_past.pr.map(|pr| pr.number),
+        Some(7),
+        "a pull request whose head the branch has moved past is still its own"
+    );
+}
+
+#[tokio::test]
+async fn a_pull_request_from_another_branch_of_the_same_name_is_never_shown() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup.create(&remote, "main", "namesake").await;
+    let worktree = setup.worktree(remote.project, "namesake");
+    git(&worktree, &["commit", "-q", "--allow-empty", "-m", "mine"]);
+    git(&worktree, &["push", "-q", "origin", "HEAD"]);
+    let mine = git(&worktree, &["rev-parse", "HEAD"]).trim().to_owned();
+    let in_base = git(&worktree, &["rev-parse", "refs/remotes/origin/main"])
+        .trim()
+        .to_owned();
+    let unknown = "0123456789abcdef0123456789abcdef01234567";
+    let listed = |number: u64, state: &str, head: &str| {
+        format!(
+            r#"{{"number":{number},"title":"PR {number}","url":"https://github.com/o/r/pull/{number}","state":"{state}","isDraft":false,"reviewDecision":"","statusCheckRollup":[],"headRefOid":"{head}"}}"#
+        )
+    };
+
+    let (others, asked) = with_gh(
+        &setup,
+        &format!(
+            "[{},{}]",
+            listed(32, "MERGED", unknown),
+            listed(31, "CLOSED", &in_base)
+        ),
+    );
+    let read = others.shipping(id).await.unwrap();
+    assert_eq!(
+        read.pr, None,
+        "an old branch's pull request is not this one's"
+    );
+    assert!(!read.unreachable);
+    let args = std::fs::read_to_string(&asked).unwrap();
+    let limit: u64 = args
+        .split_whitespace()
+        .skip_while(|a| *a != "--limit")
+        .nth(1)
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+    assert!(
+        limit > 1,
+        "only the newest pull request was asked for: {args}"
+    );
+
+    let (behind, _) = with_gh(
+        &setup,
+        &format!(
+            "[{},{}]",
+            listed(32, "MERGED", unknown),
+            listed(40, "OPEN", &mine)
+        ),
+    );
+    let read = behind.shipping(id).await.unwrap();
+    assert_eq!(
+        read.pr.map(|pr| (pr.number, pr.state)),
+        Some((40, PrState::Open)),
+        "its own pull request is found behind a newer one of the same name"
+    );
+}
+
+#[tokio::test]
+async fn a_github_that_cannot_answer_leaves_the_pull_request_unknown_not_an_error() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup.create(&remote, "main", "offline").await;
+    let worktree = setup.worktree(remote.project, "offline");
+    git(&worktree, &["push", "-q", "origin", "HEAD"]);
+
+    let missing = Workspaces::with_git_within(
+        setup.me,
+        setup.store.clone(),
+        setup.data.path(),
+        setup.terminals.clone(),
+        GIT_WITHIN,
+    )
+    .with_gh(&setup.remotes.path().join("no-such-gh"));
+    let read = missing.shipping(id).await.unwrap();
+    assert!(read.pushed);
+    assert_eq!(read.pr, None);
+    assert!(read.unreachable);
+
+    let (garbled, _) = with_gh(
+        &setup,
+        "To get started with GitHub CLI, please run: gh auth login",
+    );
+    assert!(garbled.shipping(id).await.unwrap().unreachable);
+}
+
+#[tokio::test]
+async fn a_pull_request_merged_with_a_merge_commit_is_still_shown_once_the_base_is_fetched() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup.create(&remote, "main", "merged").await;
+    let worktree = setup.worktree(remote.project, "merged");
+    git(&worktree, &["commit", "-q", "--allow-empty", "-m", "mine"]);
+    git(&worktree, &["push", "-q", "origin", "HEAD"]);
+    let mine = git(&worktree, &["rev-parse", "HEAD"]).trim().to_owned();
+    // GitHub merges the pull request with a merge commit, and the clone fetches it.
+    let merge = git(
+        &worktree,
+        &[
+            "commit-tree",
+            "HEAD^{tree}",
+            "-p",
+            "refs/remotes/origin/main",
+            "-p",
+            "HEAD",
+            "-m",
+            "Merge pull request #7",
+        ],
+    );
+    git(
+        &worktree,
+        &[
+            "push",
+            "-q",
+            "origin",
+            &format!("{}:refs/heads/main", merge.trim()),
+        ],
+    );
+    git(&worktree, &["fetch", "-q", "origin"]);
+    let (workspaces, _) = with_gh(
+        &setup,
+        &format!(
+            r#"[{{"number":7,"title":"Ship it","url":"https://github.com/o/r/pull/7","state":"MERGED","isDraft":false,"reviewDecision":"APPROVED","statusCheckRollup":[],"headRefOid":"{mine}"}}]"#
+        ),
+    );
+
+    let read = workspaces.shipping(id).await.unwrap();
+    assert!(read.pushed);
+    assert_eq!(
+        read.pr.map(|pr| (pr.number, pr.state)),
+        Some((7, PrState::Merged)),
+        "the merged pull request is still this branch's"
+    );
+}
+
+#[tokio::test]
+async fn the_shipping_of_an_unknown_workspace_is_refused() {
+    let setup = Setup::new();
+    let missing = WorkspaceId::random();
+    assert!(matches!(
+        setup.workspaces.shipping(missing).await,
+        Err(WorkspaceError::Unknown(id)) if id == missing
+    ));
+}
+
+#[tokio::test]
+async fn a_remote_branch_of_the_same_name_without_this_workspaces_work_is_not_pushed() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup.create(&remote, "main", "reused").await;
+    let worktree = setup.worktree(remote.project, "reused");
+    // An older branch of the same name, left on origin with work this one does not have.
+    git(
+        &worktree,
+        &["commit", "-q", "--allow-empty", "-m", "old work"],
+    );
+    git(&worktree, &["push", "-q", "origin", "HEAD"]);
+    git(
+        &worktree,
+        &["reset", "-q", "--hard", "refs/remotes/origin/main"],
+    );
+    git(&worktree, &["commit", "-q", "--allow-empty", "-m", "mine"]);
+    let (workspaces, asked) = with_gh(&setup, "[]");
+
+    let read = workspaces.shipping(id).await.unwrap();
+    assert!(!read.pushed, "the old branch's push is not this one's");
+    assert_eq!(read.unpushed, 1);
+    assert_eq!(read.pr, None);
+    assert!(!read.unreachable);
+    assert!(
+        !asked.exists(),
+        "GitHub was asked about a branch this workspace never pushed"
+    );
+
+    git(&worktree, &["push", "-q", "--force", "origin", "HEAD"]);
+    let read = workspaces.shipping(id).await.unwrap();
+    assert!(read.pushed);
+    assert_eq!(read.unpushed, 0);
 }

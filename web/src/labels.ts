@@ -1,24 +1,40 @@
 import type { SessionState, TerminalState } from "./api";
 
+/**
+ * A state in the words every screen uses. They match the board's lanes and the first-run page:
+ * a session that waits for its next prompt is Ready, one that asks something Needs you, and a
+ * session or shell that closed has Ended (or Failed).
+ */
 export const sessionLabel: Record<SessionState, string> = {
   starting: "Starting",
   working: "Working",
-  waiting_for_you: "Waiting for you",
-  idle: "Idle",
-  finished: "Finished",
+  waiting_for_you: "Needs you",
+  idle: "Ready",
+  finished: "Ended",
   failed: "Failed",
   stuck: "Stuck",
   unreachable: "Unreachable",
 };
 
-const terminalNames: Record<TerminalState, string> = {
-  running: "Running",
-  exited: "Exited",
-  unreachable: "Unreachable",
+/** A shell's state in the same words as a session's: a clean exit has Ended, any other Failed with its code. */
+export function terminalLabel(state: TerminalState, exitCode: number | null): string {
+  if (state === "running") return "Running";
+  if (state === "unreachable") return sessionLabel.unreachable;
+  return exitCode ? `${sessionLabel.failed} · exit ${exitCode}` : sessionLabel.finished;
+}
+
+/** Phrases more than one screen says, kept here so they read the same everywhere. */
+export const words = {
+  noChanges: "No changes yet",
+  unreadable: "Its changes can't be read from here",
+  changes: "What this workspace changed since it left its base branch",
+  archive: "Archive: see what stays and what stops, then stop its terminals and remove its worktree. The branch stays.",
 };
 
-export function terminalLabel(state: TerminalState, exitCode: number | null): string {
-  return state === "exited" && exitCode !== null ? `${terminalNames[state]} ${exitCode}` : terminalNames[state];
+/** What could not be done and why, as one sentence: "Could not start a shell: workspace not found." */
+export function couldNot(what: string, error: unknown): string {
+  const why = (error instanceof Error ? error.message : String(error)).trim().replace(/\.$/, "");
+  return `Could not ${what}: ${why}.`;
 }
 
 /**

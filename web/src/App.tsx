@@ -1,41 +1,66 @@
-import { createRootRoute, createRoute, createRouter, useNavigate, useParams } from "@tanstack/react-router";
+import { useQuery } from "@tanstack/react-query";
+import { createRootRoute, createRoute, createRouter, useNavigate, useParams, useRouterState } from "@tanstack/react-router";
 import { useEffect, useLayoutEffect, useMemo, useState } from "react";
 import { Board } from "./Board";
 import { ChangesPanel } from "./ChangesPanel";
-import { CreateWorkspace } from "./CreateWorkspace";
+import { LinkBanner, Unreachable } from "./Connection";
+import { useCreateWorkspace } from "./Composer";
 import { JumpPalette } from "./JumpPalette";
+import { Launchpad } from "./Launchpad";
+import { NewSession } from "./NewSession";
+import { NewTask } from "./NewTask";
 import { Sidebar } from "./Sidebar";
 import { StepsPanel, type StepsOf } from "./StepsPanel";
-import { TabStrip } from "./TabStrip";
 import { beside, follow, type Split } from "./split";
-import { loadTabs, saveTabs, touched, withoutTab, withTab } from "./tabs";
+import { touched, withoutTab } from "./tabs";
 import { TerminalHeader } from "./TerminalHeader";
 import { TerminalPane } from "./TerminalPane";
 import { TerminalActions } from "./TerminalMenu";
-import { fleet, locate, terminalRunning } from "./fleet";
+import { fleet, locate, rows, terminalRunning } from "./fleet";
 import { useShortcut } from "./shortcut";
 import { useBriefs } from "./useBriefs";
+import { machineQuery } from "./api";
 import { useFleet } from "./useFleet";
-import { AlertsButton, useAlerts } from "./AlertsBell";
+import { Announcer, NotifyButton, useAlerts } from "./AlertsBell";
+import { KeySheet, useHelpKey } from "./KeySheet";
+import { Away } from "./Away";
+import { Toasts } from "./Toasts";
+import { Rail } from "./Rail";
+import { loadRail, saveRail } from "./collapsed";
+import { useMemory } from "./memory";
 import { AttentionList } from "./attention/AttentionList";
 
 /**
  * The sidebar, and the terminal the URL names (`/terminals/$terminalId`) under its header filling
- * the rest. On a narrow screen one of them has the whole width: the sidebar until a terminal is
- * open, then the terminal, with the sidebar as a drawer the header opens. Cmd+K (or Ctrl+K outside
+ * the rest. On a narrow screen the sidebar is a drawer: the board (or the machines view) is the
+ * home, with a bar at the bottom that opens it, and an open terminal's header opens it too. Cmd+K (or Ctrl+K outside
  * the terminal, where the shell keeps it) opens the jump palette over everything.
  *
- * Every terminal opened becomes a tab above the header. The few tabs used last (and both sides of
- * a split) keep their pane attached behind the others, so going back to one is instant; an older
- * tab attaches again when shown and gets its screen and scrollback back from the holder.
+ * On a wide screen the sidebar collapses to a rail as narrow as a button (its button, or Cmd+B),
+ * which still shows every terminal's state as a column of glyphs per workspace; the choice is kept
+ * in this browser, and with none a window too narrow for the list beside a terminal starts so.
+ *
+ * One bar heads the terminal: its workspace, then the workspace's terminals as tabs with their
+ * states, and a + that starts another session or shell in it. The few terminals shown last (and both sides of a split) keep
+ * their pane attached behind the others, so going back to one is instant, from its tab or another
+ * workspace; an older one attaches again when shown and gets its screen and scrollback back from
+ * the holder.
  *
  * With nothing open, the board shows every workspace as a card with its live states and changes,
  * or, switched to its timeline, every session's turns on one clock; a turn opens its terminal
  * with the steps column.
  *
- * A workspace made from the new-workspace dialog (the sidebar, the board or the palette opens
- * it) is landed in: once its session shows up, its terminal opens, with the setup shell as a tab
- * beside it.
+ * A fleet with no workspaces opens on one question, what Claude should work on, and a box to
+ * answer it in: the task names the workspace and its branch, Start makes it and lands in its
+ * session already at work, and the three states it will show are explained under it.
+ *
+ * The machines view (`/machines`, from the board's switch or a machine's name in the sidebar)
+ * shows every machine as a card: its status, when it was last heard, its load drawn over the last
+ * ten minutes from the samples this page has seen, its free memory and disk, its terminals by
+ * state and its workspaces.
+ *
+ * A workspace is made one way, from a task box: the first run's, the board's top line, or the
+ * New task dialog (the sidebar's button, or the palette with what was typed as the task). It is landed in: once its session shows up, its terminal opens, its setup shell a tab beside it.
  *
  * A workspace's changes since its base open as a sheet from the header or the workspace's row.
  *
@@ -49,39 +74,69 @@ import { AttentionList } from "./attention/AttentionList";
  * Each session is named by its first prompt, and a busy one says what it is doing, from the
  * daemon's briefs of its hooks.
  *
- * The browser tab shows the fleet's state in its title and icon, and the sidebar's bell turns on
- * desktop alerts for a session that finishes its turn or needs you.
+ * The browser tab shows the fleet's state in its title and icon. A session you are not looking at
+ * that finishes its turn or needs you is told once: as a card at the top right while you are at
+ * the page, or as a desktop alert while you are not; coming back after a while, a catch-up card
+ * heads the same stack. The sidebar's bell sets all three in one place; a screen reader hears the
+ * news whatever it is set to.
  *
- * Right-clicking (or long-pressing) a terminal anywhere it is listed, or the header's More button,
- * opens its menu: open, open beside, steps, changes, and ending it. Ending a terminal that still
+ * ? (outside a field or the terminal) or the sidebar's Keyboard button lists every key the app
+ * answers. The sidebar's list is one Tab stop that the arrows walk.
+ *
+ * Right-clicking (or long-pressing) a terminal anywhere it is listed, the header's More button, or
+ * Tab on it in the palette, lists what can be done with it: open, open beside, steps, changes, a
+ * new session or shell in its workspace, and ending it. Ending a terminal that still
  * runs asks first; one that already ended is cleared at once, as are all of a workspace's ended
- * ones from its row. When the open terminal is gone, its neighbouring tab shows.
+ * ones from its row. When the open terminal is gone, its neighbouring tab shows, or the board.
  *
  * On a wide screen a second terminal can be shown beside the open one (the header's split button,
- * Cmd+\ or Shift+Enter in the palette), each with its own header. The URL names the side with the
+ * Cmd+\ or Shift+Enter in the palette), each with its own bar and tabs. The URL names the side with the
  * keyboard; pressing in the other side moves it there, and a terminal opened from anywhere takes
  * the side that has it. On a narrow screen only that side shows.
+ *
+ * A load paints at once the fleet this browser last saw, greyed with its working glyphs still,
+ * and it comes alive when the daemon sends its state; a line says it is connecting only after a
+ * second, and, if a try fails, that the daemon cannot be reached. With nothing remembered, a failed
+ * try fills the page with where it looked and when it tries next, never an empty fleet. Once the
+ * daemon has sent, a lost link greys everything and stills the working glyphs under a line that
+ * says since when, until the daemon sends again; then a line says, once, that it is back.
  */
 function Layout() {
-  const { state, connected } = useFleet();
+  const { state: sent, connected, samples, link } = useFleet();
+  // Until the daemon's first state, the fleet this browser last saw stands in for it, frozen.
+  const memory = useMemory(sent, link.lostAt === undefined);
+  const remembering = !sent.synced && memory !== undefined;
+  const state = remembering ? { records: memory.records, settings: memory.settings, synced: true } : sent;
   const { terminalId } = useParams({ strict: false });
+  const onMachines = useRouterState({ select: (s) => s.location.pathname === "/machines" });
   const briefs = useBriefs(state.records);
+  const { data: here } = useQuery(machineQuery);
   const traced = useMemo(() => new Set(Object.keys(briefs)), [briefs]);
   const machines = useMemo(() => fleet(state.records, state.settings, briefs), [state.records, state.settings, briefs]);
   const [drawer, setDrawer] = useState(false);
+  /** Whether the sidebar is collapsed to the rail on a wide screen. */
+  const [rail, setRail] = useState(() => loadRail(window.innerWidth));
+  const flipRail = () => {
+    saveRail(!rail);
+    setRail(!rail);
+  };
   /** The palette, and whether its picks open beside the open terminal. */
   const [jump, setJump] = useState<"jump" | "beside">();
   const [split, setSplit] = useState<Split>();
-  /** The new-workspace dialog: open, and the name it starts with. */
-  const [create, setCreate] = useState({ open: false, name: "" });
+  /** The New task dialog: open, and the task it starts with. */
+  const [create, setCreate] = useState({ open: false, task: "" });
   /** Whether the steps column is shown. */
   const [stepsOpen, setStepsOpen] = useState(false);
   /** The find bar over the terminal with the keyboard: 0 closed, and one more each time it is asked for. */
   const [finding, setFinding] = useState(0);
   /** The workspace whose changes are open. */
-  const [changesOf, setChangesOf] = useState<string>();
+  const [changesOf, setChangesOf] = useState<{ workspace: string; file?: string }>();
+  /** The workspace a new session is being asked for from a terminal's actions. */
+  const [sessionIn, setSessionIn] = useState<{ id: string; name: string }>();
   /** The session of a workspace just made, until it shows up and is opened. */
   const [landing, setLanding] = useState<string>();
+  /** The first-run page's create, held here so it outlives the page when its workspace arrives first. */
+  const launch = useCreateWorkspace();
   const navigate = useNavigate();
   const located = terminalId ? locate(machines, terminalId) : undefined;
   const stepsOf: StepsOf | undefined = !located
@@ -91,66 +146,63 @@ function Layout() {
       : { kind: "shell", name: located.name };
 
   const gone = useMemo(() => new Set(state.records.flatMap((r) => (r.kind === "terminal" && r.deleted ? [r.body.id] : []))), [state.records]);
-  const [kept, setKept] = useState(loadTabs);
-  /** Tabs whose pane is attached, most recent first: the last few shown, and both sides of a split. */
+  /** Terminals whose pane is attached, most recent first: the last few shown, and both sides of a split. */
   const [attached, setAttached] = useState<string[]>([]);
-  /** The state each tab had when it was last shown. */
+  /** The state each terminal had when it was last shown. */
   const [seen, setSeen] = useState<Record<string, string>>({});
-  // Adjusted while rendering, so a terminal opened from anywhere is a tab in the same paint. Only
-  // on a change of terminal: closing the open tab must not bring it back before the URL moves on.
+  // Adjusted while rendering, so a terminal opened from anywhere is attached in the same paint.
   const [opened, setOpened] = useState<string>();
   if (terminalId !== opened) {
     setOpened(terminalId);
     const next = follow(split, opened, terminalId);
     setSplit(next);
-    if (terminalId && !gone.has(terminalId)) setKept(withTab(kept, terminalId));
     if (terminalId) setAttached(touched(attached, terminalId, next ? [next.left, next.right] : []));
   }
   if (terminalId && located && seen[terminalId] !== located.label) setSeen({ ...seen, [terminalId]: located.label });
+  const tabs = located ? rows(located.workspace) : [];
+  // The open workspace's tabs as last seen, so a terminal that goes knows its neighbours.
+  const [lastTabs, setLastTabs] = useState<string[]>([]);
+  if (located && tabs.map((t) => t.terminal).join() !== lastTabs.join()) setLastTabs(tabs.map((t) => t.terminal));
   // The open terminal was ended or archived: show its neighbouring tab, or the board.
   const [left, setLeft] = useState<{ from: string; to?: string }>();
   if (terminalId && gone.has(terminalId) && left?.from !== terminalId) {
-    setLeft({ from: terminalId, to: withoutTab(kept.filter((id) => id === terminalId || !gone.has(id)), terminalId).next });
+    setLeft({ from: terminalId, to: withoutTab(lastTabs.filter((id) => id === terminalId || !gone.has(id)), terminalId).next });
   }
   useEffect(() => {
     if (left) void navigate(left.to ? { to: "/terminals/$terminalId", params: { terminalId: left.to } } : { to: "/" });
   }, [left, navigate]);
-  if (kept.some((id) => gone.has(id))) setKept(kept.filter((id) => !gone.has(id)));
   if (attached.some((id) => id !== terminalId && gone.has(id))) setAttached(attached.filter((id) => id === terminalId || !gone.has(id)));
   if (split && (gone.has(split.left) || gone.has(split.right))) setSplit(undefined);
-  useEffect(() => saveTabs(kept), [kept]);
   const pair = split && terminalId && (split.left === terminalId || split.right === terminalId) ? split : undefined;
 
-  // Adjusted while rendering, like the tabs above: once the new session shows up, it and the
-  // workspace's setup shell become tabs, and the session is the one to open.
+  // Adjusted while rendering, like the panes above: once the new session shows up, it is opened.
   const [landed, setLanded] = useState<string>();
   const arrived = landing ? machines.flatMap((m) => m.workspaces).find((w) => w.sessions.some((s) => s.id === landing)) : undefined;
   if (arrived) {
     const session = arrived.sessions.find((s) => s.id === landing)!;
     setLanding(undefined);
-    setKept(arrived.shells.reduce((all, shell) => withTab(all, shell.id), withTab(kept, session.terminal)));
     setLanded(session.terminal);
   }
   useEffect(() => {
     if (landed) void navigate({ to: "/terminals/$terminalId", params: { terminalId: landed } });
   }, [landed, navigate]);
 
-  const changed = new Set(kept.filter((id) => seen[id] !== undefined && seen[id] !== locate(machines, id)?.label));
+  // Any workspace's terminals, so each side of a split marks its own tabs.
+  const changed = new Set(
+    machines.flatMap((m) => m.workspaces.flatMap((w) => rows(w).flatMap((t) => (seen[t.terminal] !== undefined && seen[t.terminal] !== t.label ? [t.terminal] : [])))),
+  );
   const show = (id: string) => void navigate({ to: "/terminals/$terminalId", params: { terminalId: id } });
-  const alerts = useAlerts(machines, state.synced, show);
+  // News is told from the daemon's own states only, never from the change between the remembered fleet and them.
+  const { spoken, news, ...notify } = useAlerts(machines, sent.synced, show);
+  /** The sessions the catch-up card lists, whose news it already shows. */
+  const [caughtUp, setCaughtUp] = useState<string[]>([]);
+  /** Whether the list of keys is open. */
+  const [keysOpen, setKeysOpen] = useState(false);
+  useHelpKey(() => setKeysOpen(true));
   /** Ends the split by closing side `id`; the other side keeps or takes the keyboard. */
   const closePane = (id: string) => {
     setSplit(undefined);
     if (pair && id === terminalId) show(id === pair.left ? pair.right : pair.left);
-  };
-  const closeTab = (id: string) => {
-    const { tabs, next } = withoutTab(kept, id);
-    setKept(tabs);
-    setAttached(attached.filter((t) => t !== id));
-    if (pair && (id === pair.left || id === pair.right)) return closePane(id);
-    if (id !== terminalId) return;
-    if (next) show(next);
-    else void navigate({ to: "/" });
   };
   const openBeside = (id: string) => {
     if (!terminalId || id === terminalId) return;
@@ -167,13 +219,13 @@ function Layout() {
     setDrawer(false);
     setJump("jump");
   };
-  const openChanges = (workspace: string) => {
+  const openChanges = (workspace: string, file?: string) => {
     setDrawer(false);
-    setChangesOf(workspace);
+    setChangesOf({ workspace, file });
   };
-  const openCreate = (name = "") => {
+  const openCreate = (task = "") => {
     setDrawer(false);
-    setCreate({ open: true, name });
+    setCreate({ open: true, task });
   };
 
   useLayoutEffect(() => {
@@ -187,10 +239,25 @@ function Layout() {
     setDrawer(false);
     setJump((open) => (open ? undefined : "jump"));
   });
+  useShortcut("b", flipRail);
   useShortcut("f", terminalId ? () => setFinding((n) => n + 1) : undefined);
   useShortcut("\\", terminalId ? () => (split ? setSplit(undefined) : setJump("beside")) : undefined);
 
-  const place = !terminalId ? "flex w-full md:w-auto" : drawer ? "fixed inset-0 z-30 flex md:static md:z-auto" : "hidden md:flex";
+  // Never had the daemon's state: say so, rather than show an empty fleet.
+  if (!state.synced && link.lostAt !== undefined) return <Unreachable link={link} />;
+  const stale = link.lostAt !== undefined || remembering;
+  // Each part of the fleet greys on its own, so a terminal's own screen never does.
+  const frozen = { "data-fleet": true, "data-stale": stale || undefined };
+  const workspaces = machines.flatMap((m) => m.workspaces);
+  // A fleet with no workspaces opens on the first-run page, kept while its create is under way or
+  // its workspace was made but its session failed, so what happened stays on screen.
+  const firstRun = !terminalId && !onMachines && state.synced && (workspaces.length === 0 || launch.create.isPending || (launch.made && launch.create.isError));
+  const board = !terminalId && !onMachines && !firstRun;
+
+  // On a narrow screen the sidebar is a drawer over whatever is shown: the board, the machines view
+  // or a terminal. Collapsed to the rail, it is only the drawer, and the rail takes its place.
+  const place = rail ? "fixed inset-0 z-30 flex md:hidden" : drawer ? "fixed inset-0 z-30 flex md:static md:z-auto" : "hidden md:flex";
+  const sidebar = !rail || drawer;
   return (
     <TerminalActions
       machines={machines}
@@ -207,91 +274,115 @@ function Layout() {
       }}
       onChanges={openChanges}
       onFind={() => setFinding((n) => n + 1)}
+      onNewSession={(id, name) => {
+        setDrawer(false);
+        setSessionIn({ id, name });
+      }}
     >
-      <div className="flex h-dvh overflow-hidden bg-neutral-950 text-neutral-100">
-        <div className={`${place} shrink-0`}>
-          <Sidebar
-            machines={machines}
-            onCreate={() => openCreate()}
-            selected={terminalId}
-            connected={connected}
-            onNavigate={close}
-            onClose={terminalId ? close : undefined}
-            onJump={openJump}
-            onChanges={openChanges}
-            alerts={<AlertsButton {...alerts} />}
-          />
-        </div>
-        <main className={`${terminalId ? "flex" : "hidden md:flex"} min-w-0 flex-1 flex-col`}>
-          <TabStrip
-            machines={machines}
-            tabs={kept}
-            active={terminalId}
-            beside={pair && (pair.left === terminalId ? pair.right : pair.left)}
-            changed={changed}
-            onClose={closeTab}
-          />
-          {terminalId && (
-            <div className="flex shrink-0">
-              {(pair ? [pair.left, pair.right] : [terminalId]).map((id) => (
-                <div key={id} className="contents" onPointerDown={focusPane(id)}>
-                  <TerminalHeader
-                    id={id}
-                    located={id === terminalId ? located : locate(machines, id)}
-                    drawerOpen={drawer}
-                    onMenu={() => setDrawer(true)}
-                    onJump={openJump}
-                    onChanges={openChanges}
-                    onSteps={id === terminalId ? () => setStepsOpen(!stepsOpen) : undefined}
-                    stepsOpen={stepsOpen}
-                    onFind={id === terminalId ? () => setFinding(finding ? 0 : 1) : undefined}
-                    finding={finding > 0}
-                    onSplit={pair ? undefined : () => setJump("beside")}
-                    onClosePane={pair ? () => closePane(id) : undefined}
-                    beside={id !== terminalId}
-                  />
-                </div>
-              ))}
+      <div className="flex h-dvh flex-col overflow-hidden bg-neutral-950 text-neutral-100">
+        <div className="relative flex min-h-0 flex-1">
+          {rail && (
+            <div {...frozen} className="hidden shrink-0 md:flex">
+              <Rail machines={machines} selected={terminalId} onExpand={flipRail} onJump={openJump} onCreate={() => openCreate()} alerts={<NotifyButton {...notify} />} />
             </div>
           )}
-          <div className="relative min-h-0 flex-1">
-            {/* In a fixed order, so a pane's element never moves when it is used. */}
-            {[...attached].sort().map((id) => {
-              const side = pair && (id === pair.left ? "left" : id === pair.right ? "right" : undefined);
-              const place = side === "left" ? "inset-y-0 left-0 right-0 md:right-1/2" : side === "right" ? "inset-y-0 right-0 left-0 md:left-1/2 md:border-l md:border-neutral-800" : "inset-0";
-              const seen = id === terminalId ? "" : side ? "invisible md:visible" : "invisible";
-              const where = locate(machines, id);
-              return (
-                <div key={id} data-testid={`pane-${id}`} onPointerDownCapture={side && focusPane(id)} onFocusCapture={side && focusPane(id)} className={`absolute ${place} ${seen}`}>
-                  <TerminalPane
-                    id={id}
-                    running={terminalRunning(state, id)}
-                    active={id === terminalId}
-                    name={where?.name}
-                    glyph={where?.glyph}
-                    finding={id === terminalId ? finding : 0}
-                    onFindClose={() => setFinding(0)}
-                  />
-                </div>
-              );
-            })}
-            {!terminalId && (
-              <Board
+          {sidebar && (
+            <div {...frozen} className={`${place} shrink-0`}>
+              <Sidebar
                 machines={machines}
-                onJump={openJump}
                 onCreate={() => openCreate()}
+                selected={terminalId}
+                onNavigate={close}
+                onClose={close}
+                onJump={openJump}
                 onChanges={openChanges}
-                traced={traced}
-                onSteps={(id) => {
-                  setStepsOpen(true);
-                  show(id);
-                }}
+                alerts={<NotifyButton {...notify} />}
+                onKeys={() => setKeysOpen(true)}
+                onRail={rail ? undefined : flipRail}
               />
+            </div>
+          )}
+          <main className="flex min-w-0 flex-1 flex-col">
+            {terminalId && (
+              <div {...frozen} className="flex shrink-0">
+                {(pair ? [pair.left, pair.right] : [terminalId]).map((id) => (
+                  <div key={id} className="contents" onPointerDown={focusPane(id)}>
+                    <TerminalHeader
+                      id={id}
+                      located={id === terminalId ? located : locate(machines, id)}
+                      drawerOpen={drawer}
+                      onMenu={() => setDrawer(true)}
+                      onJump={openJump}
+                      onChanges={openChanges}
+                      onSteps={id === terminalId ? () => setStepsOpen(!stepsOpen) : undefined}
+                      stepsOpen={stepsOpen}
+                      onFind={id === terminalId ? () => setFinding(finding ? 0 : 1) : undefined}
+                      finding={finding > 0}
+                      onSplit={pair ? undefined : () => setJump("beside")}
+                      onClosePane={pair ? () => closePane(id) : undefined}
+                      beside={id !== terminalId}
+                      changed={changed}
+                    />
+                  </div>
+                ))}
+              </div>
             )}
-          </div>
-        </main>
-        {stepsOpen && stepsOf && <StepsPanel key={located?.session ?? terminalId} of={stepsOf} onClose={() => setStepsOpen(false)} />}
-        <ChangesPanel workspace={machines.flatMap((m) => m.workspaces).find((w) => w.id === changesOf)} onClose={() => setChangesOf(undefined)} />
+            <div className="relative min-h-0 flex-1">
+              {/* In a fixed order, so a pane's element never moves when it is used. */}
+              {[...attached].sort().map((id) => {
+                const side = pair && (id === pair.left ? "left" : id === pair.right ? "right" : undefined);
+                const place = side === "left" ? "inset-y-0 left-0 right-0 md:right-1/2" : side === "right" ? "inset-y-0 right-0 left-0 md:left-1/2 md:border-l md:border-neutral-800" : "inset-0";
+                const seen = id === terminalId ? "" : side ? "invisible md:visible" : "invisible";
+                const where = locate(machines, id);
+                return (
+                  <div key={id} data-testid={`pane-${id}`} onPointerDownCapture={side && focusPane(id)} onFocusCapture={side && focusPane(id)} className={`absolute ${place} ${seen}`}>
+                    <TerminalPane
+                      id={id}
+                      running={terminalRunning(state, id)}
+                      active={id === terminalId}
+                      name={where?.name}
+                      glyph={where?.glyph}
+                      finding={id === terminalId ? finding : 0}
+                      onFindClose={() => setFinding(0)}
+                      here={!!where && where.machine.id === here}
+                      workspace={where?.session ? where.workspace.id : undefined}
+                      changesOf={where?.workspace.id}
+                      onFile={where && ((file) => openChanges(where.workspace.id, file))}
+                    />
+                  </div>
+                );
+              })}
+              {/* Hidden while empty, so it never lies over a terminal. */}
+              <div {...frozen} className="absolute inset-0 empty:hidden">
+                {firstRun && <Launchpad projects={state.settings.projects} workspaces={workspaces} launch={launch} onCreated={setLanding} onMenu={() => setDrawer(true)} />}
+                {/* The board, the timeline and the machines are one element, so their shared head is never remounted. */}
+                {((board && state.synced) || (!terminalId && onMachines)) && (
+                  <Board
+                    machines={machines}
+                    projects={state.settings.projects}
+                    onJump={openJump}
+                    onCreated={setLanding}
+                    onChanges={openChanges}
+                    traced={traced}
+                    onMenu={() => setDrawer(true)}
+                    history={samples}
+                    connected={connected}
+                    onSteps={(id) => {
+                      setStepsOpen(true);
+                      show(id);
+                    }}
+                  />
+                )}
+              </div>
+            </div>
+          </main>
+          {stepsOpen && stepsOf && <StepsPanel key={located?.session ?? terminalId} of={stepsOf} onClose={() => setStepsOpen(false)} stale={stale} />}
+        </div>
+        <ChangesPanel
+          workspace={machines.flatMap((m) => m.workspaces).find((w) => w.id === changesOf?.workspace)}
+          file={changesOf?.file}
+          onClose={() => setChangesOf(undefined)}
+        />
         <JumpPalette
           machines={machines}
           open={jump !== undefined}
@@ -301,15 +392,24 @@ function Layout() {
           besideOnly={jump === "beside"}
           onBeside={openBeside}
         />
-        <CreateWorkspace
+        <NewTask
           projects={state.settings.projects}
-          workspaces={machines.flatMap((m) => m.workspaces)}
+          workspaces={workspaces}
           open={create.open}
           onOpenChange={(open) => setCreate((c) => ({ ...c, open }))}
-          name={create.name}
+          task={create.task}
           onCreated={setLanding}
         />
-        <AttentionList />
+        <KeySheet open={keysOpen} onOpenChange={setKeysOpen} />
+        <Announcer spoken={spoken} />
+        {/* One place on screen for news: what needs a person, the catch-up, then the cards. */}
+        <div className="pointer-events-none fixed inset-x-2 top-2 z-40 flex flex-col gap-2 md:inset-x-auto md:top-14 md:right-4 md:w-[24rem]">
+          <LinkBanner link={link} remembered={remembering ? memory.at : undefined} />
+          <AttentionList />
+          {notify.notify.away && <Away records={sent.records} synced={sent.synced} machines={machines} traced={traced} onOpen={show} onShown={setCaughtUp} />}
+          <Toasts news={news} machines={machines} here={here} onScreen={pair ? [pair.left, pair.right] : terminalId ? [terminalId] : []} covered={notify.notify.away ? caughtUp : []} onOpen={show} />
+        </div>
+        {sessionIn && <NewSession key={sessionIn.id} workspace={sessionIn.id} name={sessionIn.name} onClose={() => setSessionIn(undefined)} onStarted={setLanding} />}
       </div>
     </TerminalActions>
   );
@@ -318,7 +418,8 @@ function Layout() {
 const rootRoute = createRootRoute({ component: Layout });
 const indexRoute = createRoute({ getParentRoute: () => rootRoute, path: "/" });
 const terminalRoute = createRoute({ getParentRoute: () => rootRoute, path: "/terminals/$terminalId" });
+const machinesRoute = createRoute({ getParentRoute: () => rootRoute, path: "/machines" });
 
-export const routeTree = rootRoute.addChildren([indexRoute, terminalRoute]);
+export const routeTree = rootRoute.addChildren([indexRoute, terminalRoute, machinesRoute]);
 export const router = createRouter({ routeTree });
 

@@ -1,17 +1,25 @@
 import { Dialog } from "radix-ui";
 import { isValidElement, type ReactNode } from "react";
 
-export const button = "rounded border border-neutral-600 px-2 py-0.5 text-xs hover:bg-neutral-800 disabled:opacity-50";
+/** The shared button's shape and size, without its colours: a button with a tone of its own adds a border, a hover and a text colour to it. */
+export const buttonShape = "rounded border px-2 py-0.5 text-xs disabled:opacity-50";
+export const button = `${buttonShape} border-neutral-600 hover:bg-neutral-800`;
 /** Beside `button` on a toggle: its look while `aria-pressed` is true. */
 export const pressed = "aria-pressed:border-sky-400/50 aria-pressed:bg-sky-400/10 aria-pressed:text-sky-200";
 /** The shared button for the one action a form is for. */
 export const primaryButton =
   "rounded border border-emerald-400 bg-emerald-400 px-2 py-0.5 text-xs font-semibold text-neutral-950 hover:border-emerald-300 hover:bg-emerald-300 disabled:opacity-50";
-/** The shared field look: a dark box whose border lightens on focus, beside the browser's focus ring. */
-const box = "rounded border border-neutral-600 bg-neutral-950 text-neutral-100 placeholder:text-neutral-600 focus:border-neutral-400";
+/** `primaryButton` for an action that destroys something: ending a terminal, archiving work that would be lost. */
+export const dangerButton =
+  "rounded border border-red-400 bg-red-400 px-2 py-0.5 text-xs font-semibold text-neutral-950 hover:border-red-300 hover:bg-red-300 disabled:opacity-50";
+/**
+ * The shared field look, without a shape or a size: a dark box whose border lightens on focus,
+ * beside the browser's focus ring. A field shaped its own way (a reply beside a send button, a
+ * pill) is built from it, so every field keeps one focus treatment.
+ */
+export const fieldLook = "border border-neutral-600 bg-neutral-950 text-neutral-100 placeholder:text-neutral-600 focus:border-neutral-400";
+const box = `rounded ${fieldLook}`;
 export const field = `mt-1 w-full ${box} px-2 py-1 text-sm`;
-/** `field` for the one input a form is about, with room and bigger text. */
-export const bigField = `w-full ${box} px-3 py-2.5 text-base`;
 /** `field` inside a line of small text. */
 export const inlineField = `${box} px-1.5 py-0.5 font-mono`;
 

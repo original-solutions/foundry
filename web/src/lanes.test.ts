@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Changes } from "./api";
-import { lanes, topFiles } from "./lanes";
+import { glance, lanes, topFiles } from "./lanes";
 import { fleet } from "./fleet";
 import { ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
 
@@ -47,6 +47,20 @@ describe("lanes", () => {
   it("leaves out a lane with nothing in it", () => {
     const calm = fleet([sample(ME, 1), workspace(ME, "w1", "a"), terminal(ME, "t1", "w1"), session(ME, "s1", "w1", "t1", "idle")], settings());
     expect(lanes(calm).map((l) => l.lane)).toEqual(["quiet"]);
+  });
+});
+
+describe("glance", () => {
+  it("says first how many need you, then how many work and rest", () => {
+    expect(glance(lanes(machines))).toBe("2 need you · 1 working · 2 quiet");
+  });
+
+  it("says plainly when nothing needs you, and leaves out what has nothing in it", () => {
+    const calm = fleet([sample(ME, 1), workspace(ME, "w1", "a"), terminal(ME, "t1", "w1"), session(ME, "s1", "w1", "t1", "idle")], settings());
+    expect(glance(lanes(calm))).toBe("Nothing needs you · 1 quiet");
+    const one = fleet([sample(ME, 1), workspace(ME, "w1", "a"), terminal(ME, "t1", "w1"), session(ME, "s1", "w1", "t1", "waiting_for_you")], settings());
+    expect(glance(lanes(one))).toBe("1 needs you");
+    expect(glance([])).toBe("Nothing needs you");
   });
 });
 

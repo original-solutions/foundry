@@ -2,7 +2,8 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createMemoryHistory, createRootRoute, createRoute, createRouter, RouterProvider } from "@tanstack/react-router";
 import { render } from "@testing-library/react";
 import type { ReactNode } from "react";
-import { vi } from "vitest";
+import { expect, vi } from "vitest";
+import { buttonShape, fieldLook } from "./Modal";
 
 /** Renders `ui` inside a query client and a router that knows the terminal route, so links resolve. Gives back the query client too. */
 export async function renderApp(ui: ReactNode) {
@@ -25,8 +26,30 @@ export async function renderApp(ui: ReactNode) {
 export type Call = { url: string; method: string; body: unknown };
 
 /**
+ * Fails unless `element` is built from the shared button's shape, and holds one set of colours:
+ * the shared ones, or its own tone and none of the shared ones.
+ */
+export function expectButtonShape(element: HTMLElement) {
+  const classes = element.className.split(" ");
+  expect(classes).toEqual(expect.arrayContaining(buttonShape.split(" ")));
+  const borders = classes.filter((c) => /^border-(?!0|2|4)[a-z]/.test(c));
+  const hovers = classes.filter((c) => c.startsWith("hover:bg-"));
+  expect(borders.length, element.className).toBeLessThanOrEqual(1);
+  expect(hovers.length, element.className).toBeLessThanOrEqual(1);
+}
+
+/** Fails unless `element` is built from the shared field look, so it keeps its focus border and the browser's focus ring. */
+export function expectFieldLook(element: HTMLElement) {
+  const classes = element.className.split(" ");
+  expect(classes).toEqual(expect.arrayContaining(fieldLook.split(" ")));
+  expect(classes).not.toContain("focus:outline-none");
+}
+
+/**
  * Stubs `fetch` to give `answers` in order, and returns the requests it was sent. The layout's reads
- * of session briefs and of the attention list get none and are left out, so a test sees only the
+ * of session briefs and of the attention list get none, a read of where a workspace's branch
+ * stands gets a branch never pushed with nothing to push (so no line shows), and the task box's
+ * read of the machines gets this machine alone; all are left out, so a test sees only the
  * requests it makes.
  */
 export function mockFetch(...answers: Response[]): Call[] {
@@ -36,6 +59,8 @@ export function mockFetch(...answers: Response[]): Call[] {
     vi.fn(async (url: string, init: RequestInit = {}) => {
       if (url === "/api/briefs") return json(200, {});
       if (url === "/api/attention") return json(200, { items: [] });
+      if (url === "/api/machines") return json(200, { me: "me", machines: [] });
+      if (/^\/api\/workspaces\/[^/]+\/pr$/.test(url)) return json(200, { branch: "b", pushed: false, unpushed: 0, pr: null, unreachable: false });
       calls.push({ url, method: init.method ?? "GET", body: init.body ? JSON.parse(String(init.body)) : undefined });
       const next = answers.shift();
       if (!next) throw new Error("unexpected request");

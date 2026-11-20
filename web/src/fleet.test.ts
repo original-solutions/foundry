@@ -107,8 +107,8 @@ describe("fleet", () => {
     expect(machine.workspaces.map((w) => w.name)).toEqual(["fix login"]);
     const [w] = machine.workspaces;
     expect(w).toMatchObject({ id: "w1", branch: "fix-login", project: "demo" });
-    expect(w.sessions).toEqual([{ id: "s1", model: "opus", state: "idle", terminal: "t1" }]);
-    expect(w.shells).toEqual([{ id: "t2", state: "exited", exitCode: 1 }]);
+    expect(w.sessions).toEqual([{ id: "s1", model: "opus", name: "opus", state: "idle", terminal: "t1" }]);
+    expect(w.shells).toEqual([{ id: "t2", name: "shell", state: "exited", exitCode: 1 }]);
   });
 
   it("hides a session whose terminal was closed, which the daemon leaves failed behind it", () => {
@@ -133,7 +133,47 @@ describe("fleet", () => {
     ];
     const [w] = fleet(records, settings())[0].workspaces;
     expect(w.sessions).toEqual([]);
-    expect(w.shells).toEqual([{ id: "t1", state: "running", exitCode: null }]);
+    expect(w.shells).toEqual([{ id: "t1", name: "shell", state: "running", exitCode: null }]);
+  });
+
+  it("lists a workspace's sessions and shells in the order their terminals opened, so a reload, which sends records by version, does not reshuffle them", () => {
+    const records = [
+      sample(ME, 1),
+      workspace(ME, "w1", "a"),
+      terminal(ME, "t2", "w1", "running", { version: 5 }),
+      terminal(ME, "sh2", "w1", "running", { version: 7 }),
+      terminal(ME, "t1", "w1", "running", { version: 2 }),
+      session(ME, "s2", "w1", "t2", "idle", { version: 6 }),
+      terminal(ME, "sh1", "w1", "running", { version: 3 }),
+      // s1 changed state last, so a fresh state sends it last; its terminal opened first.
+      session(ME, "s1", "w1", "t1", "working", { version: 9 }),
+    ];
+    const [w] = fleet(records, settings())[0].workspaces;
+    expect(w.sessions.map((s) => s.id)).toEqual(["s1", "s2"]);
+    expect(w.shells.map((t) => t.id)).toEqual(["sh1", "sh2"]);
+  });
+
+  it("names sessions of one model and shells apart by number in opening order, and leaves a lone one plain", () => {
+    const records = [
+      sample(ME, 1),
+      workspace(ME, "w1", "a"),
+      terminal(ME, "t1", "w1", "running", { version: 1 }),
+      session(ME, "s1", "w1", "t1", "idle", { version: 9 }),
+      terminal(ME, "t2", "w1", "running", { version: 2 }),
+      session(ME, "s2", "w1", "t2", "idle", { model: "sonnet" }),
+      terminal(ME, "t3", "w1", "running", { version: 3 }),
+      session(ME, "s3", "w1", "t3", "working"),
+      terminal(ME, "sh1", "w1", "running", { version: 4 }),
+      terminal(ME, "sh2", "w1", "exited", { version: 8, exit_code: 0 }),
+      workspace(ME, "w2", "b"),
+      terminal(ME, "t4", "w2", "running"),
+      session(ME, "s4", "w2", "t4", "idle"),
+      terminal(ME, "sh3", "w2", "running"),
+    ];
+    const [one, two] = fleet(records, settings())[0].workspaces;
+    expect(rows(one).map((r) => r.name)).toEqual(["opus 1", "sonnet", "opus 2", "shell 1", "shell 2"]);
+    expect(rows(two).map((r) => r.name)).toEqual(["opus", "shell"]);
+    expect(locate(fleet(records, settings()), "t3")?.name).toBe("opus 2");
   });
 
   it("shows the project id when settings do not name the project", () => {
@@ -207,22 +247,22 @@ describe("locate", () => {
       machine: "studio",
       workspace: "fix login",
       name: "sonnet",
-      label: "Waiting for you",
+      label: "Needs you",
       glyph: "waiting",
     });
   });
 
   it("finds a shell, named shell, with its exit code in the label", () => {
     const found = locate(machines, "sh1");
-    expect(found && [found.name, found.label, found.glyph]).toEqual(["shell", "Exited 2", "failed"]);
+    expect(found && [found.name, found.label, found.glyph]).toEqual(["shell", "Failed · exit 2", "failed"]);
     const away = locate(machines, "sh2");
     expect(away && [away.machine.name, away.workspace.name, away.label, away.glyph]).toEqual(["laptop", "docs", "Unreachable", "away"]);
   });
 
   it("lists a workspace's terminals as rows, sessions first, each with its session, name, label and glyph", () => {
     expect(rows(machines[0].workspaces[0])).toEqual([
-      { terminal: "t1", session: "s1", name: "sonnet", label: "Waiting for you", glyph: "waiting" },
-      { terminal: "sh1", name: "shell", label: "Exited 2", glyph: "failed" },
+      { terminal: "t1", session: "s1", name: "sonnet", label: "Needs you", glyph: "waiting" },
+      { terminal: "sh1", name: "shell", label: "Failed · exit 2", glyph: "failed" },
     ]);
   });
 
@@ -257,9 +297,9 @@ describe("briefs", () => {
     const [machine] = fleet(records, settings(), briefs);
     const list = rows(machine.workspaces[0]);
     expect(list.map((r) => [r.name, r.title])).toEqual([
-      ["opus", "fix the login bug"],
-      ["opus", "add a test"],
-      ["opus", undefined],
+      ["opus 1", "fix the login bug"],
+      ["opus 2", "add a test"],
+      ["opus 3", undefined],
     ]);
     expect(locate([machine], "t1")?.title).toBe("fix the login bug");
   });
@@ -271,6 +311,14 @@ describe("briefs", () => {
     const starting = [workspace(ME, "w1", "fix login"), terminal(ME, "t1", "w1"), session(ME, "s1", "w1", "t1", "starting")];
     const [early] = fleet(starting, settings(), { s1: { title: "fix the login bug", now: { kind: "prompt" as const, text: "fix the login bug" } } });
     expect(rows(early.workspaces[0])[0].now?.text).toBe("fix the login bug");
+  });
+
+  it("keeps what Claude said at the end of a turn only for a session that is idle or finished", () => {
+    const said = "All done.";
+    const finished = [...records, terminal(ME, "t4", "w1"), session(ME, "s4", "w1", "t4", "finished"), terminal(ME, "t5", "w1"), session(ME, "s5", "w1", "t5", "failed")];
+    const all = Object.fromEntries(["s1", "s2", "s3", "s4", "s5"].map((id) => [id, { title: null, now: null, said }]));
+    const [machine] = fleet(finished, settings(), all);
+    expect(rows(machine.workspaces[0]).map((r) => r.said)).toEqual([undefined, said, undefined, said, undefined]);
   });
 
   it("leaves a session with no brief, as a peer's is, as it was", () => {

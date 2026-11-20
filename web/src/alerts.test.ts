@@ -49,6 +49,12 @@ describe("alertsFor", () => {
     const later = world("idle", [terminal(ME, "t2", "w1"), session(ME, "s2", "w1", "t2", "waiting_for_you", { model: "sonnet" }), terminal(ME, "t3", "w1"), session(ME, "s3", "w1", "t3", "idle")]);
     expect(alertsFor(seen, later).alerts.map((a) => a.body)).toEqual(["sonnet is waiting for you"]);
   });
+
+  it("names the session as the sidebar does, so one of two opus sessions says which", () => {
+    const two = (state: SessionState) => world("idle", [terminal(ME, "t2", "w1", "running", { version: 2 }), session(ME, "s2", "w1", "t2", state)]);
+    const { seen } = alertsFor(undefined, two("working"));
+    expect(alertsFor(seen, two("waiting_for_you")).alerts.map((a) => a.body)).toEqual(["opus 2 is waiting for you"]);
+  });
 });
 
 describe("pulse", () => {
@@ -92,6 +98,12 @@ describe("favicon", () => {
     const svg = decode(favicon("working", rippleFrames[0]));
     expect(lit(svg)).toBe([...rippleFrames[0]].filter((c) => c === "#").length);
     expect(svg).toContain("#38bdf8");
+  });
+
+  it("draws a resting session grey, so the tab icon has colour only when something works or needs you", () => {
+    const svg = decode(favicon("ready"));
+    expect(svg).not.toContain("#34d399");
+    expect(svg).toContain("#a3a3a3");
   });
 
   it("draws a grey grid when there is nothing to show", () => {

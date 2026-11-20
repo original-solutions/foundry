@@ -48,15 +48,21 @@ export function terminalRunning(state: FleetState, id: string): boolean | undefi
 export interface SessionView {
   id: string;
   model: string;
+  /** What every screen calls it: its model, numbered when its workspace has another of that model. */
+  name: string;
   state: SessionState;
   terminal: string;
   /** Its first prompt, when this machine's daemon has its brief. */
   title?: string;
   /** The newest step of its turn. */
   now?: Step;
+  /** What Claude said when its last turn ended. */
+  said?: string;
 }
 export interface ShellView {
   id: string;
+  /** "shell", numbered when its workspace has more than one. */
+  name: string;
   state: TerminalState;
   exitCode: number | null;
 }
@@ -85,7 +91,13 @@ export function fleet(records: AnyRecord[], settings: SharedSettings, briefs: Br
   const closed = new Set(records.flatMap((r) => (r.kind === "terminal" && r.deleted ? [r.body.id] : [])));
   const sessions = live.flatMap((r) => (r.kind === "session" && !closed.has(r.body.terminal) ? [r.body] : []));
   const referenced = new Set(sessions.map((s) => s.terminal));
-  const shellsOf = new Map<string, ShellView[]>();
+  // A fresh state sends records by version, so a session that just changed comes last. A
+  // running terminal's record is written when it opens and again only when it exits, so its
+  // version keeps the order terminals opened in across reloads.
+  const opened = new Map(live.flatMap((r) => (r.kind === "terminal" ? [[r.body.id, r.version] as const] : [])));
+  const byOpening = <T>(list: T[], terminal: (t: T) => string) =>
+    [...list].sort((a, b) => (opened.get(terminal(a)) ?? Infinity) - (opened.get(terminal(b)) ?? Infinity));
+  const shellsOf = new Map<string, Omit<ShellView, "name">[]>();
   for (const t of live) {
     if (t.kind !== "terminal" || referenced.has(t.body.id)) continue;
     const shells = shellsOf.get(t.body.workspace) ?? [];
@@ -104,22 +116,30 @@ export function fleet(records: AnyRecord[], settings: SharedSettings, briefs: Br
     const workspaces = live.flatMap((r) => {
       if (r.kind !== "workspace" || r.owner !== id) return [];
       const w = r.body;
-      const mine = sessions.filter((s) => s.workspace === w.id);
+      const mine = byOpening(
+        sessions.filter((s) => s.workspace === w.id),
+        (s) => s.terminal,
+      );
+      const sessionNames = numbered(mine.map((s) => s.model));
+      const shells = byOpening(shellsOf.get(w.id) ?? [], (t) => t.id);
+      const shellNames = numbered(shells.map(() => "shell"));
       return [
         {
           id: w.id,
           name: w.name,
           branch: w.branch,
           project: settings.projects.find((p) => p.id === w.project)?.name ?? w.project,
-          sessions: mine.map((s) => ({
+          sessions: mine.map((s, i) => ({
             id: s.id,
             model: s.model,
+            name: sessionNames[i],
             state: s.state,
             terminal: s.terminal,
             title: briefs[s.id]?.title ?? undefined,
             now: briefs[s.id]?.now ?? undefined,
+            said: briefs[s.id]?.said,
           })),
-          shells: shellsOf.get(w.id) ?? [],
+          shells: shells.map((t, i) => ({ ...t, name: shellNames[i] })),
         },
       ];
     });
@@ -156,6 +176,16 @@ export function locate(machines: MachineView[], id: string): Located | undefined
   return undefined;
 }
 
+/** Each name as given, or with its number among its kind ("opus 1", "opus 2") when the list has more than one. */
+function numbered(names: string[]): string[] {
+  const seen = new Map<string, number>();
+  return names.map((name) => {
+    const n = (seen.get(name) ?? 0) + 1;
+    seen.set(name, n);
+    return names.indexOf(name) === names.lastIndexOf(name) ? name : `${name} ${n}`;
+  });
+}
+
 /** One terminal of a workspace as the sidebar lists it. */
 export interface Row {
   terminal: string;
@@ -166,18 +196,23 @@ export interface Row {
   title?: string;
   /** What a session is doing, only while it is `busy`: in the middle of a turn. */
   now?: Step;
+  /** What Claude said when its last turn ended, only once the session rests: idle or finished. */
+  said?: string;
   label: string;
   glyph: Glyph;
 }
+
+/** A session that has stopped for now or for good, so what it last said is its news. */
+const rests: Glyph[] = ["ready", "done"];
 
 /** A workspace's terminals in sidebar order: its sessions, then its shells. */
 export function rows(workspace: WorkspaceView): Row[] {
   return [
     ...workspace.sessions.map((s) => {
       const glyph = sessionGlyph[s.state];
-      return { terminal: s.terminal, session: s.id, name: s.model, title: s.title, now: busy.includes(glyph) ? s.now : undefined, label: sessionLabel[s.state], glyph };
+      return { terminal: s.terminal, session: s.id, name: s.name, title: s.title, now: busy.includes(glyph) ? s.now : undefined, said: rests.includes(glyph) ? s.said : undefined, label: sessionLabel[s.state], glyph };
     }),
-    ...workspace.shells.map((t) => ({ terminal: t.id, name: "shell", label: terminalLabel(t.state, t.exitCode), glyph: terminalGlyph(t.state, t.exitCode) })),
+    ...workspace.shells.map((t) => ({ terminal: t.id, name: t.name, label: terminalLabel(t.state, t.exitCode), glyph: terminalGlyph(t.state, t.exitCode) })),
   ];
 }
 

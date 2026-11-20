@@ -104,12 +104,12 @@ impl Daemon {
 
     /// A daemon whose terminals start the holder at `holder`.
     async fn start(script: &str, holder: PathBuf, names: &[&str]) -> Self {
-        Self::start_with(script, holder, names, None).await
+        Self::start_with(script, holder, names, None, None).await
     }
 
     /// A daemon with no gateway, whose session starts here are refused with `said`.
     async fn refusing_sessions(said: &str) -> Self {
-        Self::start_with(TURN, built("foundry-holder"), &[], Some(said)).await
+        Self::start_with(TURN, built("foundry-holder"), &[], Some(said), None).await
     }
 
     async fn start_with(
@@ -117,6 +117,7 @@ impl Daemon {
         holder: PathBuf,
         names: &[&str],
         refused: Option<&str>,
+        gh: Option<&Path>,
     ) -> Self {
         // A Unix socket path is at most about 100 bytes, which the system's own temporary
         // folder on macOS would take most of.
@@ -131,12 +132,11 @@ impl Daemon {
             Store::open(data.path().join("foundry.db")).unwrap(),
         ));
         let terminals = Arc::new(Terminals::new(me, store.clone(), data.path(), holder));
-        let workspaces = Arc::new(Workspaces::new(
-            me,
-            store.clone(),
-            data.path(),
-            terminals.clone(),
-        ));
+        let mut workspaces = Workspaces::new(me, store.clone(), data.path(), terminals.clone());
+        if let Some(gh) = gh {
+            workspaces = workspaces.with_gh(gh);
+        }
+        let workspaces = Arc::new(workspaces);
         let hooks = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let home = tempfile::tempdir().unwrap();
         let key = format!("gw-key-{}", uuid::Uuid::new_v4());
@@ -941,6 +941,79 @@ async fn a_shell_is_started_in_the_worktree_and_closed() {
 }
 
 #[tokio::test]
+async fn a_file_sent_to_a_terminal_is_kept_beside_it_under_a_plain_name_and_its_path_returned() {
+    let daemon = Daemon::new(TURN).await;
+    let project = daemon.project();
+    let workspace = daemon.create_workspace(project, "files").await;
+    let reply = daemon
+        .call("POST", &format!("/api/workspaces/{workspace}/shells"), None)
+        .await;
+    let shell: TerminalId = reply.id();
+    let host = daemon.host();
+    let send = |name: &str, body: &str| {
+        let path = format!("/api/terminals/{shell}/files?name={name}");
+        let (host, body) = (host.clone(), body.to_owned());
+        let daemon = &daemon;
+        async move {
+            daemon
+                .send("POST", &path, &[("Host", host.as_str())], &body)
+                .await
+        }
+    };
+
+    let reply = send("my%20shot%20(1).png", "first").await;
+    assert_eq!(reply.status, 201, "{}", reply.body);
+    let first = PathBuf::from(reply.json()["path"].as_str().unwrap());
+    let files = daemon
+        .data
+        .path()
+        .join("terminals")
+        .join(format!("{shell}.files"));
+    assert_eq!(first, files.join("my-shot-1.png"));
+    assert_eq!(std::fs::read_to_string(&first).unwrap(), "first");
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = std::fs::metadata(&files).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o700, "only this user reads what was sent");
+
+    // A clipboard image is always "image.png": a second one never overwrites a path already typed.
+    let again = send("my%20shot%20(1).png", "second").await;
+    assert_eq!(
+        again.json()["path"],
+        files.join("my-shot-1-2.png").to_str().unwrap()
+    );
+    assert_eq!(std::fs::read_to_string(&first).unwrap(), "first");
+
+    // No name, or one that is all path and dots, is still kept.
+    let unnamed = send("..%2F..%2F", "x").await;
+    assert_eq!(unnamed.json()["path"], files.join("file").to_str().unwrap());
+
+    let unknown = daemon
+        .send(
+            "POST",
+            &format!("/api/terminals/{}/files?name=a.txt", TerminalId::random()),
+            &[("Host", host.as_str())],
+            "x",
+        )
+        .await;
+    assert_eq!(unknown.status, 404, "{}", unknown.body);
+
+    let big = "x".repeat(super::files::MAX_FILE + 1);
+    let refused = send("big.bin", &big).await;
+    assert_eq!(refused.status, 413, "{}", refused.body);
+    assert!(
+        refused.json()["error"].as_str().unwrap().contains("25 MB"),
+        "{}",
+        refused.body
+    );
+
+    let reply = daemon
+        .call("POST", &format!("/api/terminals/{shell}/close"), None)
+        .await;
+    assert_eq!(reply.status, 204, "{}", reply.body);
+    assert!(!files.exists(), "the files go with the terminal");
+}
+
+#[tokio::test]
 async fn archive_with_uncommitted_work_is_refused_listing_it() {
     let daemon = Daemon::new(TURN).await;
     let project = daemon.project();
@@ -1373,19 +1446,26 @@ async fn every_route_refuses_another_site_and_another_host_and_does_nothing() {
     let model = serde_json::json!({"model": MODEL});
     let trail = format!("/api/sessions/{}/trail", SessionId::random());
     let changes = format!("/api/workspaces/{workspace}/changes");
+    let shipping = format!("/api/workspaces/{workspace}/pr");
+    let commit = format!("/api/workspaces/{workspace}/commits/0000000");
+    let files = format!("/api/terminals/{live}/files?name=x.txt");
     let routes: Vec<(&str, &str, Option<serde_json::Value>, bool)> = vec![
         ("GET", "/api/state", None, false),
         ("GET", "/api/events", None, true),
         ("GET", &socket, None, true),
         ("POST", &close, None, false),
+        ("POST", &files, Some(serde_json::json!("sent")), false),
         ("POST", "/api/workspaces", Some(create), false),
         ("POST", &archive, Some(force), false),
         ("POST", &sessions, Some(model), false),
         ("POST", &shells, None, false),
         ("GET", "/api/briefs", None, false),
         ("GET", "/api/machine", None, false),
+        ("GET", "/api/machines", None, false),
         ("GET", &trail, None, false),
         ("GET", &changes, None, false),
+        ("GET", &commit, None, false),
+        ("GET", &shipping, None, false),
     ];
     for (method, path, body, upgrade) in routes {
         for (name, value) in [
@@ -1416,6 +1496,12 @@ async fn every_route_refuses_another_site_and_another_host_and_does_nothing() {
         "a refused request changed a record"
     );
     assert!(worktree.exists(), "a refused archive removed the worktree");
+    let sent = daemon
+        .data
+        .path()
+        .join("terminals")
+        .join(format!("{live}.files"));
+    assert!(!sent.exists(), "a refused file was kept");
     let (mut socket, _) = tokio_tungstenite::connect_async(daemon.ws_url(&socket))
         .await
         .unwrap();
@@ -1470,6 +1556,53 @@ async fn briefs_name_each_sessions_first_prompt_and_newest_step_with_url_passwor
         serde_json::json!({
             "title": "fetch https://***@example.com/a",
             "now": {"kind": "tool", "text": "$ git push https://***@example.com/r", "tool": "Bash"},
+        })
+    );
+}
+
+#[tokio::test]
+async fn a_brief_carries_what_claude_said_at_the_end_of_its_turn_with_url_passwords_hidden() {
+    let daemon = Daemon::new(
+        "
+- hook: {event: UserPromptSubmit, prompt: \"push it\"}
+- hook: {event: Stop, last_assistant_message: \"Pushed to https://me:hunter2@example.com/r\\n\\nAll done.\"}
+- wait_input
+",
+    )
+    .await;
+    let project = daemon.project();
+    let workspace = daemon.create_workspace(project, "answered").await;
+    let reply = daemon
+        .call(
+            "POST",
+            &format!("/api/workspaces/{workspace}/sessions"),
+            Some(serde_json::json!({"model": MODEL})),
+        )
+        .await;
+    assert_eq!(reply.status, 201, "{}", reply.body);
+    let session: SessionId = reply.id();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let brief = loop {
+        let reply = daemon.call("GET", "/api/briefs", None).await;
+        assert_eq!(reply.status, 200, "{}", reply.body);
+        let briefs: serde_json::Value = serde_json::from_str(&reply.body).unwrap();
+        let brief = briefs[session.to_string()].clone();
+        if !brief["said"].is_null() {
+            break brief;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "nothing said in {briefs}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(
+        brief,
+        serde_json::json!({
+            "title": "push it",
+            "now": null,
+            "said": "Pushed to https://***@example.com/r\n\nAll done.",
         })
     );
 }
@@ -2130,6 +2263,7 @@ async fn no_response_contains_a_secret() {
         "/api/briefs".to_owned(),
         format!("/api/sessions/{session}/trail"),
         format!("/api/workspaces/{workspace}/changes"),
+        format!("/api/workspaces/{workspace}/pr"),
     ] {
         let reply = daemon.call("GET", &path, None).await;
         assert_eq!(reply.status, 200, "{path}: {}", reply.body);
@@ -2203,6 +2337,137 @@ async fn changes_list_each_file_with_its_hunks_and_hide_credentials_in_urls() {
         )
         .await;
     assert_eq!(reply.status, 404, "{}", reply.body);
+}
+
+#[tokio::test]
+async fn a_commit_read_shows_its_own_change_and_hides_credentials_in_urls() {
+    let daemon = Daemon::new(TURN).await;
+    let project = daemon.project();
+    let workspace = daemon.create_workspace(project, "stepped").await;
+    let worktree = daemon.workspaces.worktree(workspace).await.unwrap();
+    std::fs::write(
+        worktree.join("mirror.txt"),
+        "clone https://bot:hunter2@example.com/r.git\n",
+    )
+    .unwrap();
+    git(&worktree, &["add", "mirror.txt"]);
+    git(
+        &worktree,
+        &[
+            "commit",
+            "-q",
+            "-m",
+            "mirror to https://bot:hunter2@example.com/r.git",
+        ],
+    );
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .current_dir(&worktree)
+        .output()
+        .unwrap();
+    let hash = String::from_utf8(out.stdout).unwrap();
+    let hash = hash.trim();
+
+    let reply = daemon
+        .call(
+            "GET",
+            &format!("/api/workspaces/{workspace}/commits/{hash}"),
+            None,
+        )
+        .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    let json = reply.json();
+    assert_eq!(json["commits"][0]["hash"], hash);
+    assert_eq!(
+        json["commits"][0]["subject"],
+        "mirror to https://***@example.com/r.git"
+    );
+    assert_eq!(json["files"][0]["path"], "mirror.txt");
+    assert!(!reply.body.contains("hunter2"), "{}", reply.body);
+
+    let reply = daemon
+        .call(
+            "GET",
+            &format!("/api/workspaces/{workspace}/commits/0000000"),
+            None,
+        )
+        .await;
+    assert_eq!(reply.status, 404, "{}", reply.body);
+}
+
+#[tokio::test]
+async fn a_workspaces_pr_read_says_what_is_only_on_this_machine() {
+    let daemon = Daemon::new(TURN).await;
+    let project = daemon.project();
+    let workspace = daemon.create_workspace(project, "only here").await;
+    let worktree = daemon.workspaces.worktree(workspace).await.unwrap();
+    git(&worktree, &["commit", "-q", "--allow-empty", "-m", "one"]);
+
+    let reply = daemon
+        .call("GET", &format!("/api/workspaces/{workspace}/pr"), None)
+        .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    let json = reply.json();
+    assert_eq!(json["branch"], "only-here");
+    assert_eq!(json["pushed"], false);
+    assert_eq!(json["unpushed"], 1);
+    assert_eq!(json["pr"], serde_json::Value::Null);
+    assert_eq!(json["unreachable"], false);
+
+    let reply = daemon
+        .call(
+            "GET",
+            &format!("/api/workspaces/{}/pr", WorkspaceId::random()),
+            None,
+        )
+        .await;
+    assert_eq!(reply.status, 404, "{}", reply.body);
+}
+
+#[tokio::test]
+async fn a_pull_request_read_hides_credentials_in_its_title_and_link() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let gh = tempfile::tempdir().unwrap();
+    let answer = gh.path().join("answer.json");
+    let stub = gh.path().join("gh");
+    std::fs::write(&stub, format!("#!/bin/sh\ncat '{}'\n", answer.display())).unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let daemon = Daemon::start_with(TURN, built("foundry-holder"), &[], None, Some(&stub)).await;
+    let project = daemon.project();
+    let workspace = daemon.create_workspace(project, "mirrored").await;
+    let worktree = daemon.workspaces.worktree(workspace).await.unwrap();
+    git(
+        &worktree,
+        &["commit", "-q", "--allow-empty", "-m", "mirror"],
+    );
+    git(&worktree, &["push", "-q", "origin", "HEAD"]);
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&worktree)
+        .output()
+        .unwrap();
+    let head = String::from_utf8(out.stdout).unwrap();
+    std::fs::write(
+        &answer,
+        format!(
+            r#"[{{"number":7,"title":"mirror to https://bot:hunter2@example.com/r.git","url":"https://bot:hunter2@github.com/o/r/pull/7","state":"OPEN","isDraft":false,"reviewDecision":"","statusCheckRollup":[],"headRefOid":"{}"}}]"#,
+            head.trim()
+        ),
+    )
+    .unwrap();
+
+    let reply = daemon
+        .call("GET", &format!("/api/workspaces/{workspace}/pr"), None)
+        .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    let json = reply.json();
+    assert_eq!(json["pr"]["number"], 7, "{}", reply.body);
+    assert_eq!(
+        json["pr"]["title"],
+        "mirror to https://***@example.com/r.git"
+    );
+    assert_eq!(json["pr"]["url"], "https://***@github.com/o/r/pull/7");
+    assert!(!reply.body.contains("hunter2"), "{}", reply.body);
 }
 
 // --- calls carried to another machine ---

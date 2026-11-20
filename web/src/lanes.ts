@@ -35,6 +35,20 @@ export function lanes(machines: MachineView[]): { lane: Lane; cards: Card[] }[] 
     .filter((l) => l.cards.length > 0);
 }
 
+/**
+ * The board's lanes in one line, for a glance from a phone: how many workspaces need you (said
+ * plainly when none do), then how many work and rest. A lane with nothing in it is left out.
+ */
+export function glance(board: { lane: Lane; cards: Card[] }[]): string {
+  const count = (lane: Lane) => board.find((l) => l.lane === lane)?.cards.length ?? 0;
+  const needs = count("needs");
+  return [
+    needs === 0 ? "Nothing needs you" : `${needs} ${needs === 1 ? "needs" : "need"} you`,
+    ...(count("working") ? [`${count("working")} working`] : []),
+    ...(count("quiet") ? [`${count("quiet")} quiet`] : []),
+  ].join(" · ");
+}
+
 /** The `count` files with the most lines changed, and how many others there are. */
 export function topFiles(changes: Changes, count: number): { names: string[]; more: number } {
   const size = (f: Changes["files"][number]) => (f.added ?? 0) + (f.removed ?? 0);

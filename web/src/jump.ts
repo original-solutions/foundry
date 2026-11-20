@@ -16,8 +16,8 @@ export function destinations(machines: MachineView[]): Destination[] {
       const where = `${w.name} ${w.project} ${w.branch} ${machine.name}`;
       const add = (terminal: string, name: string, label: string, glyph: Glyph, subtitle?: string) =>
         open.push({ kind: "terminal", key: terminal, terminal, title: `${w.name} / ${name}`, subtitle, label, glyph, machine: machine.name, words: `${where} ${name} ${label} ${subtitle ?? ""}` });
-      for (const s of w.sessions) add(s.terminal, s.model, sessionLabel[s.state], sessionGlyph[s.state], s.title);
-      for (const t of w.shells) add(t.id, "shell", terminalLabel(t.state, t.exitCode), terminalGlyph(t.state, t.exitCode));
+      for (const s of w.sessions) add(s.terminal, s.name, sessionLabel[s.state], sessionGlyph[s.state], s.title);
+      for (const t of w.shells) add(t.id, t.name, terminalLabel(t.state, t.exitCode), terminalGlyph(t.state, t.exitCode));
       const title = `New shell in ${w.name}`;
       shells.push({ kind: "shell", key: `new-shell:${w.id}`, workspace: w.id, title, machine: machine.name, words: `${title} ${where}` });
     }
@@ -34,8 +34,8 @@ export function search(all: Destination[], query: string): Destination[] {
   });
 }
 
-/** A new workspace named with what was typed, or none when nothing was. */
+/** A new task of what was typed (its workspace named from it), or none when nothing was. */
 export function newWorkspace(query: string): Destination[] {
   const name = query.trim().replace(/\s+/g, " ");
-  return name ? [{ kind: "workspace", key: "new-workspace", name, title: `New workspace “${name}”`, machine: "", words: "" }] : [];
+  return name ? [{ kind: "workspace", key: "new-workspace", name, title: `New task “${name}”`, machine: "", words: "" }] : [];
 }
