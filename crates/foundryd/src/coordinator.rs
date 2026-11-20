@@ -1,4 +1,232 @@
 //! The priority order and the shared settings sequence.
+//!
+//! [`acting`] says which machine holds the coordinator role: the first machine in the priority
+//! order that this machine can reach. Only that machine numbers edits to the shared settings
+//! ([`numbered`]); every other machine forwards an edit to it. Copies of the settings meet
+//! through [`merge`], one setting at a time, so a machine never loses an edit it has not
+//! passed on yet, and every machine reaches the same result whatever order copies arrive in.
+//!
+//! "Later" is the higher number, never wall time: of two edits to one setting the higher
+//! stamp holds ([`Stamp`]'s order). Two stamps conflict only when neither copy has seen the
+//! other's, which is two sides of a split each editing the setting. A conflict leaves a
+//! "setting overwritten" item, itself a setting, holding both values.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use foundry_proto::ids::MachineId;
+use foundry_proto::settings::{Edit, Overwritten, SettingKey, SettingValue, SharedSettings, Stamp};
+use serde::Serialize;
+
+/// The machine that holds the coordinator role: the first in `priority` that is in
+/// `reachable`, else the lowest id in `reachable`. `reachable` holds the asking machine, so is
+/// never empty in use; when it is, the first in `priority` acts, or the nil id.
+pub fn acting(priority: &[MachineId], reachable: &BTreeSet<MachineId>) -> MachineId {
+    priority
+        .iter()
+        .find(|id| reachable.contains(id))
+        .or_else(|| reachable.first())
+        .or_else(|| priority.first())
+        .copied()
+        .unwrap_or(Stamp::NONE.by)
+}
+
+/// `held` with `edit` applied as the next number, given by `me`: the setting takes the stamp
+/// `{held.seq + 1, me}`.
+pub fn numbered(held: &SharedSettings, edit: &Edit, me: MachineId) -> SharedSettings {
+    let seq = held.seq.saturating_add(1);
+    let mut next = held.clone();
+    let value = edit.value().map(Value::Setting);
+    put(&mut next, &edit.key(), value, Stamp { seq, by: me });
+    next.seen.insert(me, seq);
+    next.seq = seq;
+    next
+}
+
+/// One copy of the settings from two, setting by setting: the higher stamp's value holds. A
+/// setting both copies edited where neither had seen the other's edit also gets a "setting
+/// overwritten" item holding both values, stamped as the edit that held. `seen` is the higher
+/// of each. The result's `seq` is the higher of the two, plus one when the result is not the
+/// copy that holds it, so a copy that changed is always taken by a store holding either.
+pub fn merge(a: &SharedSettings, b: &SharedSettings) -> SharedSettings {
+    let mut out = SharedSettings::default();
+    let mut conflicts = Vec::new();
+    for key in keys(a).union(&keys(b)) {
+        let (sa, sb) = (stamp(a, key), stamp(b, key));
+        let (va, vb) = (get(a, key), get(b, key));
+        let a_holds = match sa.cmp(&sb) {
+            std::cmp::Ordering::Greater => true,
+            std::cmp::Ordering::Less => false,
+            // One edit, or two copies no edit has stamped: pick by the value, the same way on
+            // every machine.
+            std::cmp::Ordering::Equal => text(&va) >= text(&vb),
+        };
+        let (held, lost, stamp) = if a_holds { (va, vb, sa) } else { (vb, va, sb) };
+        let conflict =
+            !key.is_overwritten() && held != lost && !covers(&a.seen, sb) && !covers(&b.seen, sa);
+        if conflict {
+            let item = Overwritten {
+                kept: setting(&held),
+                lost: setting(&lost),
+            };
+            conflicts.push((key.clone(), item, stamp));
+        }
+        put(&mut out, key, held, stamp);
+    }
+    for (key, item, stamp) in conflicts {
+        let key = SettingKey::Overwritten(Box::new(key));
+        if stamp > self::stamp(&out, &key) {
+            put(&mut out, &key, Some(Value::Item(item)), stamp);
+        }
+    }
+    out.seen = a.seen.clone();
+    for (by, seq) in &b.seen {
+        let seen = out.seen.entry(*by).or_default();
+        *seen = (*seen).max(*seq);
+    }
+    let top = a.seq.max(b.seq);
+    let is_top = [a, b]
+        .iter()
+        .filter(|copy| copy.seq == top)
+        .all(|copy| same_settings(copy, &out));
+    out.seq = if is_top { top } else { top.saturating_add(1) };
+    out
+}
+
+/// Whether two copies hold the same settings, whatever their `seq`.
+fn same_settings(a: &SharedSettings, b: &SharedSettings) -> bool {
+    SharedSettings {
+        seq: 0,
+        ..a.clone()
+    } == SharedSettings {
+        seq: 0,
+        ..b.clone()
+    }
+}
+
+/// Whether a copy that has seen `seen` includes the edit stamped `stamp`.
+fn covers(seen: &BTreeMap<MachineId, u64>, stamp: Stamp) -> bool {
+    stamp == Stamp::NONE || seen.get(&stamp.by).is_some_and(|seq| *seq >= stamp.seq)
+}
+
+/// The value of one setting: a plain setting's, or an overwritten item.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+enum Value {
+    Setting(SettingValue),
+    Item(Overwritten),
+}
+
+fn setting(value: &Option<Value>) -> Option<SettingValue> {
+    match value {
+        Some(Value::Setting(v)) => Some(v.clone()),
+        _ => None,
+    }
+}
+
+/// `value` as JSON text, to order two values the same way on every machine.
+fn text(value: &Option<Value>) -> String {
+    serde_json::to_string(value).unwrap_or_default()
+}
+
+/// Every setting `settings` holds a value or a stamp for.
+fn keys(settings: &SharedSettings) -> BTreeSet<SettingKey> {
+    let mut keys: BTreeSet<SettingKey> = settings.stamps.keys().cloned().collect();
+    keys.extend(settings.machines.iter().map(|m| SettingKey::Machine(m.id)));
+    keys.extend(settings.projects.iter().map(|p| SettingKey::Project(p.id)));
+    keys.extend(settings.limits.keys().map(|id| SettingKey::Limits(*id)));
+    keys.extend(
+        settings
+            .overwritten
+            .keys()
+            .map(|key| SettingKey::Overwritten(Box::new(key.clone()))),
+    );
+    if !settings.priority.is_empty() {
+        keys.insert(SettingKey::Priority);
+    }
+    keys
+}
+
+fn stamp(settings: &SharedSettings, key: &SettingKey) -> Stamp {
+    settings.stamps.get(key).copied().unwrap_or(Stamp::NONE)
+}
+
+/// The value `settings` holds for `key`, `None` when it holds none. An empty priority order is
+/// none.
+fn get(settings: &SharedSettings, key: &SettingKey) -> Option<Value> {
+    let value = match key {
+        SettingKey::Machine(id) => settings
+            .machines
+            .iter()
+            .find(|m| m.id == *id)
+            .cloned()
+            .map(SettingValue::Machine),
+        SettingKey::Priority => (!settings.priority.is_empty())
+            .then(|| SettingValue::Priority(settings.priority.clone())),
+        SettingKey::Project(id) => settings
+            .projects
+            .iter()
+            .find(|p| p.id == *id)
+            .cloned()
+            .map(SettingValue::Project),
+        SettingKey::Limits(id) => settings.limits.get(id).cloned().map(SettingValue::Limits),
+        SettingKey::Overwritten(inner) => {
+            return settings.overwritten.get(inner).cloned().map(Value::Item);
+        }
+    };
+    value.map(Value::Setting)
+}
+
+/// Sets `key` to `value` (`None` removes it) with `stamp`. Machines and projects are kept in
+/// id order, so two machines holding the same settings hold the same lists. A value of the
+/// wrong kind for `key` is taken as none.
+fn put(settings: &mut SharedSettings, key: &SettingKey, value: Option<Value>, stamp: Stamp) {
+    match key {
+        SettingKey::Machine(id) => {
+            settings.machines.retain(|m| m.id != *id);
+            if let Some(Value::Setting(SettingValue::Machine(m))) = value
+                && m.id == *id
+            {
+                settings.machines.push(m);
+                settings.machines.sort_by_key(|m| m.id);
+            }
+        }
+        SettingKey::Priority => {
+            settings.priority = match value {
+                Some(Value::Setting(SettingValue::Priority(order))) => order,
+                _ => Vec::new(),
+            };
+        }
+        SettingKey::Project(id) => {
+            settings.projects.retain(|p| p.id != *id);
+            if let Some(Value::Setting(SettingValue::Project(p))) = value
+                && p.id == *id
+            {
+                settings.projects.push(p);
+                settings.projects.sort_by_key(|p| p.id);
+            }
+        }
+        SettingKey::Limits(id) => match value {
+            Some(Value::Setting(SettingValue::Limits(limits))) => {
+                settings.limits.insert(*id, limits);
+            }
+            _ => {
+                settings.limits.remove(id);
+            }
+        },
+        SettingKey::Overwritten(inner) => match value {
+            Some(Value::Item(item)) => {
+                settings.overwritten.insert((**inner).clone(), item);
+            }
+            _ => {
+                settings.overwritten.remove(inner);
+            }
+        },
+    }
+    if stamp == Stamp::NONE {
+        settings.stamps.remove(key);
+    } else {
+        settings.stamps.insert(key.clone(), stamp);
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -94,8 +322,16 @@ mod tests {
         let ab = merge(a, b);
         let ba = merge(b, a);
         assert_eq!(ab, ba, "the merge depends on its order");
-        assert_eq!(merge(&ab, a), ab, "merging a side in again changes the result");
-        assert_eq!(merge(&ab, b), ab, "merging a side in again changes the result");
+        assert_eq!(
+            merge(&ab, a),
+            ab,
+            "merging a side in again changes the result"
+        );
+        assert_eq!(
+            merge(&ab, b),
+            ab,
+            "merging a side in again changes the result"
+        );
         assert_eq!(merge(&ab, &ab), ab, "a merge with itself changes it");
         ab
     }
@@ -256,7 +492,13 @@ mod tests {
         let joined = merged(&a, &b);
         let key = SettingKey::Project(project(7, "p").id);
         assert!(joined.overwritten.contains_key(&key));
-        let dismissed = numbered(&joined, &Edit::Dismiss { setting: key.clone() }, id(A));
+        let dismissed = numbered(
+            &joined,
+            &Edit::Dismiss {
+                setting: key.clone(),
+            },
+            id(A),
+        );
         assert!(dismissed.overwritten.is_empty());
         let out = merged(&dismissed, &joined);
         assert!(out.overwritten.is_empty());
