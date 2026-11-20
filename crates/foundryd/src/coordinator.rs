@@ -36,10 +36,9 @@ use crate::sync::{OFFLINE_AFTER, Peers, on_store};
 /// How often an edit that waits looks again.
 const STEP: Duration = Duration::from_millis(100);
 
-/// How long an edit a peer forwarded is kept while this machine can neither number it nor pass
-/// it on: while it takes the forwarding machine to act, or has no link to the one that does. A
-/// machine silent for [`OFFLINE_AFTER`] is no longer reachable, so by twice that the role has
-/// settled.
+/// How long an edit a peer forwarded is kept, from when it arrived, while this machine has no
+/// open link to the machine it takes to act. A machine silent for [`OFFLINE_AFTER`] is no
+/// longer reachable, so by twice that the role has moved to one this machine can reach.
 const KEEP_FORWARDED: Duration = OFFLINE_AFTER.saturating_mul(2);
 
 /// Why an edit was not made.
@@ -48,8 +47,8 @@ pub enum CoordinatorError {
     #[error("no link to {0}, the acting coordinator, is open, so the edit was not sent")]
     NotLinked(MachineId),
     #[error(
-        "an edit {from} forwarded was dropped: after {KEEP_FORWARDED:?} this machine still \
-         takes {acting} to act and cannot pass the edit to it"
+        "an edit {from} forwarded was dropped: {KEEP_FORWARDED:?} after it arrived this \
+         machine still has no open link to {acting}, which acts as it sees it"
     )]
     Unsettled { from: MachineId, acting: MachineId },
     #[error(transparent)]
@@ -96,7 +95,7 @@ impl Coordinator {
     /// returns without waiting for it to be numbered: the change shows when the settings
     /// arrive. It fails only when no link to the acting machine is open, or the store fails.
     pub async fn edit(&self, edit: Edit) -> Result<(), CoordinatorError> {
-        self.edit_from(None, edit).await
+        self.edit_from(None, Instant::now(), edit).await
     }
 
     /// Merges a copy of the settings `peer` sent into the held copy.
@@ -120,8 +119,9 @@ impl Coordinator {
 
     /// Makes an edit `peer` forwarded, in the background, so the link that carried it goes on
     /// reading while the edit waits. Forwarded edits are made one at a time, in the order they
-    /// arrived.
+    /// arrived, and each one's waits count from when it arrived, not from its turn.
     pub(crate) fn take_edit(self: Arc<Self>, peer: MachineId, edit: Edit) {
+        let arrived = Instant::now();
         let coordinator = Arc::clone(&self);
         let mut last = lock(&self.last_forwarded);
         let before = last.take();
@@ -129,26 +129,36 @@ impl Coordinator {
             if let Some(before) = before {
                 let _ = before.await;
             }
-            if let Err(error) = coordinator.edit_from(Some(peer), edit).await {
+            if let Err(error) = coordinator.edit_from(Some(peer), arrived, edit).await {
                 tracing::warn!("coordinator: {error}");
             }
         }));
     }
 
-    /// Makes `edit`, which `from` forwarded, or this machine's own when `None`. Only the
-    /// acting machine numbers it. A forwarded edit is never sent back to the machine that
-    /// forwarded it, and is kept, looking again every [`STEP`], while the acting machine is
-    /// that one or has no open link here, until [`KEEP_FORWARDED`].
-    async fn edit_from(&self, from: Option<MachineId>, edit: Edit) -> Result<(), CoordinatorError> {
-        let start = Instant::now();
+    /// Makes `edit`, which `from` forwarded, or this machine's own when `None`; `arrived` is
+    /// when it reached this machine. Only the acting machine numbers it, once caught up or
+    /// [`OFFLINE_AFTER`] after it arrived.
+    ///
+    /// A forwarded edit looks again every [`STEP`] while it cannot go on. While this machine
+    /// takes the forwarding machine to act, the two may still disagree on who acts, so the edit
+    /// is not sent back until [`OFFLINE_AFTER`] after it arrived: by then their views agree,
+    /// and the forwarding machine, still acting, numbers it. While there is no open link to the
+    /// acting machine it is kept until [`KEEP_FORWARDED`].
+    async fn edit_from(
+        &self,
+        from: Option<MachineId>,
+        arrived: Instant,
+        edit: Edit,
+    ) -> Result<(), CoordinatorError> {
         loop {
             let held = self.held().await?;
             let acting = acting(&held.priority, &self.peers.online());
+            let waited = arrived.elapsed();
             if acting == self.me {
-                if self.caught_up(&held) || start.elapsed() >= OFFLINE_AFTER {
+                if self.caught_up(&held) || waited >= OFFLINE_AFTER {
                     return self.number(edit).await;
                 }
-            } else if Some(acting) != from {
+            } else if Some(acting) != from || waited >= OFFLINE_AFTER {
                 let message = PeerMessage::Edit {
                     protocol: PROTOCOL,
                     edit: edit.clone(),
@@ -161,7 +171,7 @@ impl Coordinator {
                 }
             }
             if let Some(from) = from
-                && start.elapsed() >= KEEP_FORWARDED
+                && waited >= KEEP_FORWARDED
             {
                 return Err(CoordinatorError::Unsettled { from, acting });
             }

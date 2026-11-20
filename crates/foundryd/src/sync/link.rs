@@ -111,12 +111,14 @@ async fn send_settings(
 /// [`OFFLINE_AFTER`]. Each message taken counts as hearing from the peer.
 ///
 /// After a message this machine cannot take (one it cannot read, or a record the store
-/// refuses), the link takes nothing more from the peer and no longer counts it as heard, so
+/// refuses), the link takes no more records from the peer and no longer counts it as heard, so
 /// the peer shows offline and its sessions unreachable within [`OFFLINE_AFTER`]. Records
 /// arrive in version order, so the store keeps a prefix and loses nothing. The link stays open
 /// for [`RETRY_REFUSED`], then ends, so the next link's hello asks again for everything past
 /// that prefix: a passing store error clears then, and a record this build can never take is
-/// resent once per link rather than once a second.
+/// resent once per link rather than once a second. Shared settings and edits do not depend on
+/// records, so a refused link still takes them: the peer has already been told an edit was
+/// sent.
 async fn reading(inner: &Inner, recv: &mut Receiver<String>, peer: MachineId) {
     let mut refused: Option<Instant> = None;
     loop {
@@ -132,6 +134,12 @@ async fn reading(inner: &Inner, recv: &mut Receiver<String>, peer: MachineId) {
             if at.elapsed() >= RETRY_REFUSED {
                 tracing::info!("sync: link to {peer} closed to ask again for what it refused");
                 return;
+            }
+            if let Ok(message @ (PeerMessage::Settings { .. } | PeerMessage::Edit { .. })) =
+                serde_json::from_str::<PeerMessage>(&text)
+                && let Err(error) = take(inner, peer, message).await
+            {
+                tracing::warn!("sync: {error}");
             }
             continue;
         }
@@ -315,9 +323,17 @@ pub(super) async fn send_message(send: &Sender<String>, message: &impl Serialize
 /// Shared settings are merged by the coordinator, and an edit handed to it to number or pass
 /// on; with no coordinator set both are ignored.
 async fn receive(inner: &Inner, peer: MachineId, text: &str) -> Result<(), String> {
-    let records = match serde_json::from_str::<PeerMessage>(text) {
-        Ok(PeerMessage::Records { records, .. }) => records,
-        Ok(PeerMessage::Settings { settings, .. }) => {
+    match serde_json::from_str::<PeerMessage>(text) {
+        Ok(message) => take(inner, peer, message).await,
+        Err(error) => Err(format!("a message from {peer} could not be read: {error}")),
+    }
+}
+
+/// Takes one message from `peer`, as [`receive`] says.
+async fn take(inner: &Inner, peer: MachineId, message: PeerMessage) -> Result<(), String> {
+    let records = match message {
+        PeerMessage::Records { records, .. } => records,
+        PeerMessage::Settings { settings, .. } => {
             if let Some(coordinator) = inner.coordinator() {
                 coordinator
                     .take_settings(peer, settings)
@@ -326,15 +342,14 @@ async fn receive(inner: &Inner, peer: MachineId, text: &str) -> Result<(), Strin
             }
             return Ok(());
         }
-        Ok(PeerMessage::Edit { edit, .. }) => {
+        PeerMessage::Edit { edit, .. } => {
             if let Some(coordinator) = inner.coordinator() {
                 coordinator.take_edit(peer, edit);
             }
             return Ok(());
         }
         // A relay opens a link of its own and means nothing on a record link.
-        Ok(PeerMessage::Hello { .. }) | Ok(PeerMessage::Relay { .. }) => return Ok(()),
-        Err(error) => return Err(format!("a message from {peer} could not be read: {error}")),
+        PeerMessage::Hello { .. } | PeerMessage::Relay { .. } => return Ok(()),
     };
     on_store(&inner.store, move |store| {
         for record in &records {
