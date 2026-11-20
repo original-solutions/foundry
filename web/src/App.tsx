@@ -25,6 +25,7 @@ import { machineQuery } from "./api";
 import { useFleet } from "./useFleet";
 import { AlertsButton, Announcer, useAlerts } from "./AlertsBell";
 import { KeySheet, useHelpKey } from "./KeySheet";
+import { Away } from "./Away";
 
 /**
  * The sidebar, and the terminal the URL names (`/terminals/$terminalId`) under its header filling
@@ -68,7 +69,8 @@ import { KeySheet, useHelpKey } from "./KeySheet";
  *
  * The browser tab shows the fleet's state in its title and icon, and the sidebar's bell turns on
  * desktop alerts for a session that finishes its turn or needs you; a screen reader hears the same
- * news whatever the bell is set to.
+ * news whatever the bell is set to. Coming back after the page was hidden for a while, a card in
+ * the corner says what each session did meanwhile and what needs you, and opens their terminals.
  *
  * ? (outside a field or the terminal) or the sidebar's Keyboard button lists every key the app
  * answers. The sidebar's list is one Tab stop that the arrows walk.
@@ -357,6 +359,7 @@ function Layout() {
         />
         <KeySheet open={keysOpen} onOpenChange={setKeysOpen} />
         <Announcer spoken={spoken} />
+        <Away records={state.records} synced={state.synced} machines={machines} traced={traced} onOpen={show} />
         {sessionIn && <NewSession key={sessionIn.id} workspace={sessionIn.id} name={sessionIn.name} onClose={() => setSessionIn(undefined)} onStarted={setLanding} />}
       </div>
     </TerminalActions>

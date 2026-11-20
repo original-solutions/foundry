@@ -167,7 +167,7 @@ export function Timeline({ machines, traced, onSteps }: { machines: MachineView[
  * Reads a session's trail again when its state changes (a hook arrived), given as `id=label`
  * lines; a session seen for the first time is read by its query already.
  */
-function useRereadOnChange(states: string) {
+export function useRereadOnChange(states: string) {
   const client = useQueryClient();
   const last = useRef(new Map<string, string>());
   useEffect(() => {
