@@ -1860,23 +1860,28 @@ impl Setup {
 #[tokio::test]
 async fn sweep_keeps_the_worktrees_live_records_of_another_identity_name() {
     let setup = Setup::new();
-    let remote = setup.project(&[(".gitignore", ".env\n")]);
+    let remote = setup.project(&[("README.md", "hello\n")]);
     setup.create(&remote, "main", "mine").await;
+    // Clean, with nothing ignored: only the record keeps it.
     let worktree = setup.worktree(remote.project, "mine");
-    // Ignored, so only the record keeps it.
-    std::fs::write(worktree.join(".env"), "mine").unwrap();
 
     let after_new_identity = setup.workspaces_as(MachineId::random(), setup.store.clone());
     let (_guard, logs) = logs();
     after_new_identity.sweep().await.unwrap();
 
-    assert!(worktree.join(".env").exists());
+    assert!(worktree.exists());
+    let listed = setup.listed(remote.project);
+    assert!(
+        listed.contains("/mine\0") || listed.contains("/mine\n"),
+        "{listed}"
+    );
     let text = text_of(&logs);
     let line = text
         .lines()
         .find(|l| l.contains(&format!("{}/mine", remote.project)))
         .unwrap_or_else(|| panic!("no line names the worktree: {text}"));
-    assert!(line.contains("another machine"), "{line}");
+    assert!(line.contains("WARN"), "{line}");
+    assert!(line.contains("another owner"), "{line}");
 }
 
 /// A store made again over the same data directory has no settings, so it cannot say which
