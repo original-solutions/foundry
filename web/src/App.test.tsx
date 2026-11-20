@@ -127,6 +127,36 @@ describe("App", () => {
     expect(within(header).getByText("Working")).toBeDefined();
   });
 
+  it("titles the tab with the fleet's state, and a desktop alert's click opens the session it names", async () => {
+    const shown: { title: string; onclick: (() => void) | null; close: () => void }[] = [];
+    vi.stubGlobal(
+      "Notification",
+      class {
+        static permission = "granted";
+        onclick: (() => void) | null = null;
+        close() {}
+        constructor(readonly title: string) {
+          shown.push(this);
+        }
+      },
+    );
+    vi.spyOn(window, "focus").mockImplementation(() => {});
+    localStorage.setItem("foundry.alerts", "on");
+    mockActions();
+    const fresh = await open("/", live);
+    expect(document.title).toBe("Foundry · 1 working");
+    expect(screen.getByRole("button", { name: "Alerts on" })).toBeDefined();
+
+    vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    const events = sockets("/api/events").at(-1)!;
+    act(() => events.deliver(JSON.stringify({ type: "record", protocol: 1, record: session(ME, "s1", "w1", "t1", "idle", { model: "sonnet", version: 2 }) })));
+    expect(document.title).toBe("Foundry");
+    expect(shown.map((n) => n.title)).toEqual(["fix login"]);
+    act(() => shown[0].onclick?.());
+    await waitFor(() => expect(fresh.state.location.pathname).toBe("/terminals/t1"));
+    vi.restoreAllMocks();
+  });
+
   it("opens the sidebar as a drawer from the header, and closes it on a pick or on Escape", async () => {
     await open("/terminals/t1", live);
     const menu = screen.getByRole("button", { name: "Workspaces" });

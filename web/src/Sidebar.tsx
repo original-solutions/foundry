@@ -32,9 +32,11 @@ interface Props {
   onJump?: () => void;
   /** Opens a workspace's changes. */
   onChanges?: (workspace: string) => void;
+  /** Shown first among the header's buttons: the alerts bell. */
+  alerts?: ReactNode;
 }
 
-export function Sidebar({ machines, onCreate, selected, connected, onNavigate, onClose, onJump, onChanges }: Props) {
+export function Sidebar({ machines, onCreate, selected, connected, onNavigate, onClose, onJump, onChanges, alerts }: Props) {
   const [folded, setFolded] = useState(() => new Set(loadFolded()));
   const fold = (ids: string[], on: boolean) =>
     setFolded((old) => {
@@ -54,6 +56,7 @@ export function Sidebar({ machines, onCreate, selected, connected, onNavigate, o
       <div className="flex items-center justify-between gap-2">
         <h1 className="text-lg font-semibold">Foundry</h1>
         <div className="flex items-center gap-2">
+          {alerts}
           {onJump && (
             <button type="button" aria-label="Jump to" title={`Jump to (${jumpKey})`} onClick={onJump} className="rounded p-1 text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200">
               <SearchIcon className="size-4" />

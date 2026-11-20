@@ -12,6 +12,7 @@ import { TerminalHeader } from "./TerminalHeader";
 import { TerminalPane } from "./TerminalPane";
 import { fleet, locate, terminalRunning } from "./fleet";
 import { useFleet } from "./useFleet";
+import { AlertsButton, useAlerts } from "./AlertsBell";
 
 /**
  * The sidebar, and the terminal the URL names (`/terminals/$terminalId`) under its header filling
@@ -29,6 +30,9 @@ import { useFleet } from "./useFleet";
  * beside it.
  *
  * A workspace's changes since its base open as a sheet from the header or the workspace's row.
+ *
+ * The browser tab shows the fleet's state in its title and icon, and the sidebar's bell turns on
+ * desktop alerts for a session that finishes its turn or needs you.
  *
  * On a wide screen a second terminal can be shown beside the open one (the header's split button,
  * Cmd+\ or Shift+Enter in the palette), each with its own header. The URL names the side with the
@@ -90,6 +94,7 @@ function Layout() {
 
   const changed = new Set(kept.filter((id) => seen[id] !== undefined && seen[id] !== locate(machines, id)?.label));
   const show = (id: string) => void navigate({ to: "/terminals/$terminalId", params: { terminalId: id } });
+  const alerts = useAlerts(machines, state.synced, show);
   /** Ends the split by closing side `id`; the other side keeps or takes the keyboard. */
   const closePane = (id: string) => {
     setSplit(undefined);
@@ -177,6 +182,7 @@ function Layout() {
           onClose={terminalId ? close : undefined}
           onJump={openJump}
           onChanges={openChanges}
+          alerts={<AlertsButton {...alerts} />}
         />
       </div>
       <main className={`${terminalId ? "flex" : "hidden md:flex"} min-w-0 flex-1 flex-col`}>
