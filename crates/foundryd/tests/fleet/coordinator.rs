@@ -216,11 +216,11 @@ async fn an_edit_on_the_acting_machine_is_numbered_by_it_and_reaches_every_machi
         .unwrap();
     let settings = agreed(&fleet, &[0, 1, 2], "the edit reaches every machine").await;
     assert_eq!(project_named(&settings, 7).as_deref(), Some("p"));
-    assert_eq!(settings.seq, 2);
-    assert_eq!(
-        settings.stamps[&SettingKey::Project(project(7, "p").id)].by,
-        first
-    );
+    // Numbered by the acting machine, as the newest number every machine holds.
+    let stamp = settings.stamps[&SettingKey::Project(project(7, "p").id)];
+    assert_eq!(stamp.by, first);
+    assert_eq!(stamp.seq, settings.seq);
+    assert_eq!(settings.seen, [(first, stamp.seq)].into());
 }
 
 #[tokio::test(start_paused = true)]

@@ -10,12 +10,146 @@
 //! stamp holds ([`Stamp`]'s order). Two stamps conflict only when neither copy has seen the
 //! other's, which is two sides of a split each editing the setting. A conflict leaves a
 //! "setting overwritten" item, itself a setting, holding both values.
+//!
+//! [`Coordinator`] runs this on a machine. Record links hand it every copy of the settings a
+//! peer sends and every edit forwarded to this machine ([`crate::sync::Peers::coordinate`]).
+//! A machine that comes to act numbers nothing until it has taken a copy from every other
+//! machine it can reach, so a returning machine catches up before it edits; an edit that
+//! reaches it before then waits, at most [`OFFLINE_AFTER`].
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use foundry_proto::ids::MachineId;
+use foundry_proto::messages::{PROTOCOL, PeerMessage};
 use foundry_proto::settings::{Edit, Overwritten, SettingKey, SettingValue, SharedSettings, Stamp};
 use serde::Serialize;
+use tokio::time::Instant;
+
+use crate::store::{Store, StoreError};
+use crate::sync::{OFFLINE_AFTER, Peers, on_store};
+
+/// How often an edit waiting for this machine to catch up looks again.
+const CATCH_UP_STEP: Duration = Duration::from_millis(100);
+
+/// Why an edit was not made.
+#[derive(Debug, thiserror::Error)]
+pub enum CoordinatorError {
+    #[error("no link to {0}, the acting coordinator, is open, so the edit was not sent")]
+    NotLinked(MachineId),
+    #[error(transparent)]
+    Store(#[from] StoreError),
+}
+
+/// This machine's part in the coordinator role: it numbers edits while it acts, forwards them
+/// while another machine does, and merges every copy of the settings a peer sends.
+pub struct Coordinator {
+    me: MachineId,
+    store: Arc<Mutex<Store>>,
+    peers: Peers,
+    /// The machines this one has taken a copy of the settings from. Each link sends its copy
+    /// before anything else, so a machine is in here by the time it is heard from.
+    taken: Mutex<BTreeSet<MachineId>>,
+}
+
+impl Coordinator {
+    pub fn new(me: MachineId, store: Arc<Mutex<Store>>, peers: Peers) -> Self {
+        Self {
+            me,
+            store,
+            peers,
+            taken: Mutex::new(BTreeSet::new()),
+        }
+    }
+
+    /// The machine that holds the role, as this machine sees it now.
+    pub async fn acting(&self) -> Result<MachineId, StoreError> {
+        let settings = on_store(&self.store, |store| store.settings()).await?;
+        Ok(acting(&settings.priority, &self.peers.online()))
+    }
+
+    /// Makes `edit`. On the acting machine it is numbered, once this machine has caught up or
+    /// after [`OFFLINE_AFTER`]. On any other machine it is sent to the acting one, and this
+    /// returns without waiting for it to be numbered: the change shows when the settings
+    /// arrive. It fails only when no link to the acting machine is open, or the store fails.
+    pub async fn edit(&self, edit: Edit) -> Result<(), CoordinatorError> {
+        self.edit_from(None, edit).await
+    }
+
+    /// Merges a copy of the settings `peer` sent into the held copy.
+    pub(crate) async fn take_settings(
+        &self,
+        peer: MachineId,
+        settings: SharedSettings,
+    ) -> Result<(), StoreError> {
+        on_store(&self.store, move |store| {
+            let held = store.settings()?;
+            let merged = merge(&held, &settings);
+            if merged != held {
+                store.apply_settings(merged)?;
+            }
+            Ok::<_, StoreError>(())
+        })
+        .await?;
+        lock(&self.taken).insert(peer);
+        Ok(())
+    }
+
+    /// Makes an edit `peer` forwarded, in the background, so the link that carried it goes on
+    /// reading while the edit waits for this machine to catch up.
+    pub(crate) fn take_edit(self: Arc<Self>, peer: MachineId, edit: Edit) {
+        tokio::spawn(async move {
+            if let Err(error) = self.edit_from(Some(peer), edit).await {
+                tracing::warn!("coordinator: an edit {peer} forwarded was not made: {error}");
+            }
+        });
+    }
+
+    /// Makes `edit`, which came from `from` when a peer forwarded it. An edit is never sent
+    /// back to the machine that forwarded it: when each takes the other to act, this one
+    /// numbers it rather than lose it.
+    async fn edit_from(&self, from: Option<MachineId>, edit: Edit) -> Result<(), CoordinatorError> {
+        let deadline = Instant::now() + OFFLINE_AFTER;
+        loop {
+            let acting = self.acting().await?;
+            if acting != self.me && Some(acting) != from {
+                let message = PeerMessage::Edit {
+                    protocol: PROTOCOL,
+                    edit,
+                };
+                return match self.peers.send(acting, &message).await {
+                    true => Ok(()),
+                    false => Err(CoordinatorError::NotLinked(acting)),
+                };
+            }
+            if self.caught_up() || Instant::now() >= deadline {
+                let me = self.me;
+                return on_store(&self.store, move |store| {
+                    let held = store.settings()?;
+                    store.apply_settings(numbered(&held, &edit, me))?;
+                    Ok(())
+                })
+                .await;
+            }
+            tokio::time::sleep(CATCH_UP_STEP).await;
+        }
+    }
+
+    /// Whether this machine has taken a copy of the settings from every other machine it can
+    /// reach.
+    fn caught_up(&self) -> bool {
+        let taken = lock(&self.taken);
+        self.peers
+            .online()
+            .iter()
+            .all(|id| *id == self.me || taken.contains(id))
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// The machine that holds the coordinator role: the first in `priority` that is in
 /// `reachable`, else the lowest id in `reachable`. `reachable` holds the asking machine, so is

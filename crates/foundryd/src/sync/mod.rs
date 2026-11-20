@@ -33,7 +33,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
 use foundry_proto::ids::MachineId;
@@ -46,6 +47,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
+use crate::coordinator::Coordinator;
 use crate::store::{Store, StoreError};
 use crate::terminals::Terminals;
 
@@ -121,6 +123,12 @@ struct Inner {
     heard: Mutex<BTreeMap<MachineId, Instant>>,
     /// The terminals a relay serves to peers; none until [`Peers::serve_terminals`].
     terminals: Mutex<Option<Arc<Terminals>>>,
+    /// The coordinator a record link hands settings and edits to; none until
+    /// [`Peers::coordinate`]. Held weakly, as the coordinator holds these peers.
+    coordinator: Mutex<Option<Weak<Coordinator>>>,
+    /// The sender of each open record link past its hellos, by peer and link number.
+    links: Mutex<BTreeMap<MachineId, BTreeMap<u64, mpsc::Sender<String>>>>,
+    next_link: AtomicU64,
 }
 
 impl Peers {
@@ -132,6 +140,9 @@ impl Peers {
                 dialer,
                 heard: Mutex::new(BTreeMap::new()),
                 terminals: Mutex::new(None),
+                coordinator: Mutex::new(None),
+                links: Mutex::new(BTreeMap::new()),
+                next_link: AtomicU64::new(0),
             }),
         }
     }
@@ -198,6 +209,27 @@ impl Peers {
         *lock(&self.inner.terminals) = Some(terminals);
     }
 
+    /// Hands the shared settings and edits record links receive to `coordinator`, and has each
+    /// record link send this machine's settings after the hellos and whenever their `seq`
+    /// changes. Until this is called, links neither send settings nor take them.
+    pub fn coordinate(&self, coordinator: Arc<Coordinator>) {
+        *lock(&self.inner.coordinator) = Some(Arc::downgrade(&coordinator));
+    }
+
+    /// Sends `message` to `machine` on an open record link, and says whether a link took it.
+    pub async fn send(&self, machine: MachineId, message: &PeerMessage) -> bool {
+        let senders: Vec<mpsc::Sender<String>> = lock(&self.inner.links)
+            .get(&machine)
+            .map(|open| open.values().cloned().collect())
+            .unwrap_or_default();
+        for sender in senders {
+            if link::send_message(&sender, message).await {
+                return true;
+            }
+        }
+        false
+    }
+
     /// The machines heard from within [`OFFLINE_AFTER`], and this machine.
     pub fn online(&self) -> BTreeSet<MachineId> {
         let now = Instant::now();
@@ -249,6 +281,43 @@ impl Inner {
     fn heard_from(&self, peer: MachineId) {
         lock(&self.heard).insert(peer, Instant::now());
     }
+
+    fn coordinator(&self) -> Option<Arc<Coordinator>> {
+        lock(&self.coordinator).as_ref().and_then(Weak::upgrade)
+    }
+
+    /// Records an open link to `peer` that sends on `send`, until the returned guard drops.
+    fn opened(&self, peer: MachineId, send: mpsc::Sender<String>) -> Opened<'_> {
+        let number = self.next_link.fetch_add(1, Ordering::Relaxed);
+        lock(&self.links)
+            .entry(peer)
+            .or_default()
+            .insert(number, send);
+        Opened {
+            inner: self,
+            peer,
+            number,
+        }
+    }
+}
+
+/// An open link in [`Inner::links`], removed when this drops.
+struct Opened<'a> {
+    inner: &'a Inner,
+    peer: MachineId,
+    number: u64,
+}
+
+impl Drop for Opened<'_> {
+    fn drop(&mut self) {
+        let mut links = lock(&self.inner.links);
+        if let Some(open) = links.get_mut(&self.peer) {
+            open.remove(&self.number);
+            if open.is_empty() {
+                links.remove(&self.peer);
+            }
+        }
+    }
 }
 
 /// `record` as a machine shows it: a session or terminal whose owner is offline is
@@ -286,7 +355,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// Runs `work` with the store on the blocking pool, as [`crate::machine::run`] does, so a
 /// slow disk or a busy store never stalls an async worker. A panic in `work` is raised again
 /// here.
-async fn on_store<T: Send + 'static>(
+pub(crate) async fn on_store<T: Send + 'static>(
     store: &Arc<Mutex<Store>>,
     work: impl FnOnce(&mut Store) -> T + Send + 'static,
 ) -> T {
