@@ -295,9 +295,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_beat_on_a_call_link_is_the_relays_beat() {
+    fn a_beat_on_a_call_link_reads_as_the_relays_beat_is_written() {
         let beat: Frame = serde_json::from_str(r#"{"type":"beat"}"#).unwrap();
         assert!(matches!(beat, Frame::Beat));
+    }
+
+    /// A proxy in the daemon's environment, or a redirect, would take a carried call off
+    /// this machine.
+    #[test]
+    fn the_loopback_call_uses_no_proxy_follows_no_redirect_and_has_a_limit() {
+        let agent = loopback_agent();
+        let config = agent.config();
+        assert!(config.proxy().is_none());
+        assert_eq!(config.max_redirects(), 0);
+        assert_eq!(config.timeouts().global, Some(CALL_LIMIT));
     }
 
     #[test]

@@ -179,13 +179,13 @@ describe("CreateWorkspace", () => {
   });
 
   it("still offers this machine when the machine list cannot be read", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => json(500, { error: "store unreadable" })),
-    );
+    const read = vi.fn(async () => json(500, { error: "store unreadable" }));
+    vi.stubGlobal("fetch", read);
     await renderApp(<Harness />);
 
     fireEvent.click(await screen.findByRole("button", { name: "New workspace" }));
+    await waitFor(() => expect(read).toHaveBeenCalledWith("/api/machines"));
+    await new Promise((resolve) => setTimeout(resolve, 20));
 
     const machine = screen.getByLabelText("Machine") as HTMLSelectElement;
     expect(Array.from(machine.options).map((o) => o.textContent)).toEqual(["This machine"]);

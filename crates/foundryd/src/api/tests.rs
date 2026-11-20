@@ -104,6 +104,20 @@ impl Daemon {
 
     /// A daemon whose terminals start the holder at `holder`.
     async fn start(script: &str, holder: PathBuf, names: &[&str]) -> Self {
+        Self::start_with(script, holder, names, None).await
+    }
+
+    /// A daemon with no gateway, whose session starts here are refused with `said`.
+    async fn refusing_sessions(said: &str) -> Self {
+        Self::start_with(TURN, built("foundry-holder"), &[], Some(said)).await
+    }
+
+    async fn start_with(
+        script: &str,
+        holder: PathBuf,
+        names: &[&str],
+        refused: Option<&str>,
+    ) -> Self {
         // A Unix socket path is at most about 100 bytes, which the system's own temporary
         // folder on macOS would take most of.
         let data = tempfile::Builder::new()
@@ -148,7 +162,7 @@ impl Daemon {
         ));
         let hook_router = sessions.router();
         let peers = Peers::new(me, store.clone(), Arc::new(NoDial));
-        let api = Api::new(
+        let mut api = Api::new(
             store.clone(),
             peers.clone(),
             terminals.clone(),
@@ -156,6 +170,7 @@ impl Daemon {
             sessions,
             names.iter().map(|n| (*n).to_owned()).collect(),
         );
+        api.sessions_refused = refused.map(str::to_owned);
         let listener = bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let servers = vec![
@@ -2263,4 +2278,109 @@ async fn a_carried_action_on_another_machines_workspace_runs_only_here_and_is_40
     let path = format!("/api/workspaces/{workspace}/shells");
     let reply = carried(&daemon, &path, None).await;
     assert_eq!(reply.status, 404, "{}", reply.body);
+}
+
+#[tokio::test]
+async fn a_session_start_with_no_gateway_is_refused_here_but_one_for_a_peers_workspace_is_carried()
+{
+    let daemon = Daemon::refusing_sessions("set FOUNDRY_GATEWAY_URL").await;
+    let project = daemon.project();
+    let here = daemon.create_workspace(project, "here").await;
+    let reply = daemon
+        .call(
+            "POST",
+            &format!("/api/workspaces/{here}/sessions"),
+            Some(serde_json::json!({"model": MODEL})),
+        )
+        .await;
+    assert_eq!(reply.status, 503, "{}", reply.body);
+    assert_eq!(reply.json()["error"], "set FOUNDRY_GATEWAY_URL");
+    let shell = daemon
+        .call("POST", &format!("/api/workspaces/{here}/shells"), None)
+        .await;
+    assert_eq!(shell.status, 201, "{}", shell.body);
+
+    let peer = daemon.add_machine();
+    let far = peer_workspace(&daemon, peer);
+    let reply = daemon
+        .call(
+            "POST",
+            &format!("/api/workspaces/{far}/sessions"),
+            Some(serde_json::json!({"model": MODEL})),
+        )
+        .await;
+    assert_eq!(reply.status, 503, "{}", reply.body);
+    assert_eq!(reply.json()["error"], "peer is offline");
+}
+
+#[tokio::test]
+async fn a_create_from_another_site_naming_another_machine_is_refused_before_it_is_carried() {
+    let daemon = Daemon::new(TURN).await;
+    let project = daemon.project();
+    let peer = daemon.add_machine();
+    let host = daemon.host();
+    let headers = [("Host", host.as_str()), ("Origin", "http://evil.example")];
+    let body =
+        serde_json::json!({"project": project, "base": "main", "name": "far", "machine": peer});
+    let reply = daemon
+        .raw("POST", "/api/workspaces", &headers, Some(body))
+        .await;
+    assert_eq!(reply.status, 403, "{}", reply.body);
+    assert!(!reply.body.contains("offline"), "{}", reply.body);
+}
+
+#[tokio::test]
+async fn a_peer_on_an_older_link_shows_online_and_a_call_for_it_is_503_saying_it_runs_an_older_foundry()
+ {
+    let daemon = Daemon::new(TURN).await;
+    let project = daemon.project();
+    let peer = daemon.add_machine();
+    let (mine, theirs) = Conn::pair();
+    let peers = daemon.peers.clone();
+    tokio::spawn(async move { peers.accept(theirs).await });
+    for message in [
+        PeerMessage::Hello {
+            protocol: 2,
+            machine: peer,
+            versions: Default::default(),
+        },
+        PeerMessage::Records {
+            protocol: 2,
+            records: Vec::new(),
+        },
+    ] {
+        mine.send
+            .send(serde_json::to_string(&message).unwrap())
+            .await
+            .unwrap();
+    }
+    let started = tokio::time::Instant::now();
+    while !daemon.peers.online().contains(&peer) {
+        assert!(started.elapsed() < WAIT, "the peer is never heard from");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let reply = daemon.call("GET", "/api/machines", None).await;
+    assert_eq!(
+        reply.json()["machines"][0]["online"],
+        true,
+        "{}",
+        reply.body
+    );
+
+    let body =
+        serde_json::json!({"project": project, "base": "main", "name": "far", "machine": peer});
+    let reply = daemon.call("POST", "/api/workspaces", Some(body)).await;
+    assert_eq!(reply.status, 503, "{}", reply.body);
+    assert_eq!(
+        reply.json()["error"],
+        "peer runs an older Foundry, which cannot take this call"
+    );
+    assert!(
+        daemon
+            .records()
+            .iter()
+            .all(|r| !matches!(r, AnyRecord::Workspace(_)))
+    );
+    drop(mine);
 }

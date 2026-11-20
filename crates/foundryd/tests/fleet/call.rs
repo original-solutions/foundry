@@ -440,13 +440,19 @@ async fn a_call_from_a_machine_not_listed_or_the_owner_itself_is_answered_403() 
 }
 
 #[tokio::test]
-async fn a_call_for_a_path_outside_the_api_is_answered_400_and_never_requested() {
+async fn a_call_for_a_path_outside_the_carried_routes_is_answered_400_and_never_requested() {
     let peer = MachineId::random();
     let fleet = Fleet::start_with(1, &[peer]);
     let b = &fleet.daemons[0];
     let on_b = Served::of(b).await;
     b.peers.serve_calls(on_b.addr);
-    for path in ["@example.com/api/workspaces", "/elsewhere", ""] {
+    for path in [
+        "@example.com/api/workspaces",
+        "/elsewhere",
+        "",
+        "/api/state",
+        "/api/briefs",
+    ] {
         let answer = raw_call(&b.peers, peer, path).await;
         assert_eq!(answer["status"], 400, "{path}: {answer}");
     }
@@ -524,4 +530,52 @@ impl Drop for Task {
     fn drop(&mut self) {
         self.0.abort();
     }
+}
+
+#[tokio::test]
+async fn a_call_carried_to_b_for_a_third_machines_workspace_runs_only_on_b_and_is_never_carried_on()
+{
+    let (peer, third) = (MachineId::random(), MachineId::random());
+    let fleet = Fleet::start_with(1, &[peer, third]);
+    let b = &fleet.daemons[0];
+    let on_b = Served::of(b).await;
+    b.peers.serve_calls(on_b.addr);
+    let workspace = WorkspaceId::random();
+    let record = crate::workspace(workspace, false)(third, 1);
+    lock(&b.store).apply(&record, third).unwrap();
+
+    // Carried on, the call would reach the third machine's link and be answered 503.
+    let answer = raw_call(
+        &b.peers,
+        peer,
+        &format!("/api/workspaces/{workspace}/shells"),
+    )
+    .await;
+    assert_eq!(answer["status"], 404, "{answer}");
+}
+
+#[tokio::test]
+async fn a_call_whose_link_goes_down_after_it_was_sent_is_lost_not_refused() {
+    let fleet = Fleet::start(2);
+    let (a, b) = (&fleet.daemons[0], &fleet.daemons[1]);
+    // An API that takes the connection and never answers, so the call is still running on B.
+    let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    b.peers.serve_calls(silent.local_addr().unwrap());
+    hears(&a.peers, b.id).await;
+
+    let peers = a.peers.clone();
+    let id = b.id;
+    let call = tokio::spawn(async move {
+        peers
+            .call(id, "/api/workspaces", Some("application/json"), b"{}")
+            .await
+    });
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(!call.is_finished(), "the call answered before the cut");
+    fleet.cut(1);
+    match timeout(WAIT, call).await.unwrap().unwrap() {
+        Err(CallError::Lost(name)) => assert_eq!(name, "machine-1"),
+        other => panic!("not lost: {other:?}"),
+    }
+    drop(silent);
 }

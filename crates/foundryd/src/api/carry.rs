@@ -143,6 +143,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_a_call_that_may_have_run_is_504_and_the_refusals_before_any_link_are_404_or_503() {
+        let id = MachineId(uuid::Uuid::new_v4());
+        let name = || "peer".to_owned();
+        let cases = [
+            (CallError::NotListed(id), 404),
+            (CallError::Offline(name()), 503),
+            (CallError::Older(name()), 503),
+            (CallError::Down(name()), 503),
+            (CallError::Lost(name()), 504),
+            (CallError::Refused("no".into()), 502),
+        ];
+        for (refused, status) in cases {
+            assert_eq!(not_carried(&refused).status().as_u16(), status, "{refused}");
+        }
+        let lost = CallError::Lost(name()).to_string();
+        assert!(lost.contains("may have run"), "{lost}");
+    }
+
+    #[test]
     fn only_the_carried_routes_have_a_target() {
         let id = uuid::Uuid::new_v4();
         assert!(matches!(target("/api/workspaces"), Some(Target::Create)));
