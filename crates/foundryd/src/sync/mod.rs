@@ -19,11 +19,13 @@
 //! only one of them can reach the other. The second copy of a record is stale and changes
 //! nothing.
 //!
-//! A link trusts the machine id its peer names in the hello, checked only against the machine
-//! list. Proving that id with a machine key belongs to joining (task 13).
+//! A link trusts the machine id its peer names in its first message, a hello or a relay,
+//! checked only against the machine list. Proving that id with a machine key belongs to
+//! joining (task 13): the daemon serves every peer link through `join::Keys::accept`.
 //!
 //! A link that opens with a [`PeerMessage::Relay`] in place of a hello carries one of this
-//! machine's terminals to the peer, not records ([`relay`]).
+//! machine's terminals to the peer, not records ([`relay`]). That is shell access on this
+//! machine, so a link that has not passed `join::Keys::accept` must never reach it.
 //!
 //! Sending stops at the highest version sent, so a machine's own records must be stored in
 //! the order of their versions: a writer takes [`Store::own_next_version`] and applies the
