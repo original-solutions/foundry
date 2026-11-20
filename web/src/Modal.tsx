@@ -2,6 +2,11 @@ import { Dialog } from "radix-ui";
 import { isValidElement, type ReactNode } from "react";
 
 export const button = "rounded border border-neutral-600 px-2 py-0.5 text-xs hover:bg-neutral-800 disabled:opacity-50";
+/** Beside `button` on a toggle: its look while `aria-pressed` is true. */
+export const pressed = "aria-pressed:border-sky-400/50 aria-pressed:bg-sky-400/10 aria-pressed:text-sky-200";
+/** The shared button for the one action a form is for. */
+export const primaryButton =
+  "rounded border border-emerald-400 bg-emerald-400 px-2 py-0.5 text-xs font-semibold text-neutral-950 hover:border-emerald-300 hover:bg-emerald-300 disabled:opacity-50";
 export const field = "mt-1 w-full rounded border border-neutral-600 bg-neutral-950 px-2 py-1 text-sm";
 
 /**

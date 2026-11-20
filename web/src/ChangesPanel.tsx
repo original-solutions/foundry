@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { Dialog } from "radix-ui";
 import { useRef, useState } from "react";
-import { workspaceChanges, type Changes, type FileChange } from "./api";
+import { workspaceChanges, type Changes, type Commit, type FileChange } from "./api";
 import { diffLines, splitPath, totals } from "./changes";
 
 /** How often an open panel reads the changes again, so an agent's edits show as it makes them. */
@@ -181,22 +181,19 @@ function FileLink({ file, onPick }: { file: FileChange; onPick: () => void }) {
   );
 }
 
-function Commits({ commits, branch }: { commits: string[]; branch: string }) {
+function Commits({ commits, branch }: { commits: Commit[]; branch: string }) {
   return (
     <section aria-label="Commits" className="rounded-lg border border-neutral-800 bg-neutral-900/60 px-3 py-2">
       <h3 className="mb-1 text-xs text-neutral-500">
         {commits.length} commit{commits.length === 1 ? "" : "s"} on <span className="font-mono text-neutral-300">{branch}</span>
       </h3>
       <ul className="space-y-0.5 text-xs">
-        {commits.map((c) => {
-          const at = c.indexOf(" ");
-          return (
-            <li key={c} className="flex gap-2">
-              <span className="shrink-0 font-mono text-amber-300/80">{c.slice(0, at)}</span>
-              <span className="truncate text-neutral-300">{c.slice(at + 1)}</span>
-            </li>
-          );
-        })}
+        {commits.map((c) => (
+          <li key={c.hash} className="flex gap-2">
+            <span className="shrink-0 font-mono text-amber-300/80">{c.hash}</span>
+            <span className="truncate text-neutral-300">{c.subject}</span>
+          </li>
+        ))}
       </ul>
     </section>
   );

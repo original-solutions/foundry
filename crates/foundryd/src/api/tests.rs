@@ -1268,6 +1268,7 @@ async fn every_route_refuses_another_site_and_another_host_and_does_nothing() {
     let force = serde_json::json!({"force": true});
     let model = serde_json::json!({"model": MODEL});
     let trail = format!("/api/sessions/{}/trail", SessionId::random());
+    let changes = format!("/api/workspaces/{workspace}/changes");
     let routes: Vec<(&str, &str, Option<serde_json::Value>, bool)> = vec![
         ("GET", "/api/state", None, false),
         ("GET", "/api/events", None, true),
@@ -1279,6 +1280,7 @@ async fn every_route_refuses_another_site_and_another_host_and_does_nothing() {
         ("POST", &shells, None, false),
         ("GET", "/api/briefs", None, false),
         ("GET", &trail, None, false),
+        ("GET", &changes, None, false),
     ];
     for (method, path, body, upgrade) in routes {
         for (name, value) in [
@@ -1362,7 +1364,7 @@ async fn briefs_name_each_sessions_first_prompt_and_newest_step_with_url_passwor
         brief,
         serde_json::json!({
             "title": "fetch https://***@example.com/a",
-            "now": {"kind": "tool", "text": "$ git push https://***@example.com/r"},
+            "now": {"kind": "tool", "text": "$ git push https://***@example.com/r", "tool": "Bash"},
         })
     );
 }
@@ -1975,6 +1977,16 @@ async fn no_response_contains_a_secret() {
         settings_frames > 0,
         "no Settings frame carried the late project"
     );
+    // The read routes, before the archive takes the workspace away.
+    for path in [
+        "/api/briefs".to_owned(),
+        format!("/api/sessions/{session}/trail"),
+        format!("/api/workspaces/{workspace}/changes"),
+    ] {
+        let reply = daemon.call("GET", &path, None).await;
+        assert_eq!(reply.status, 200, "{path}: {}", reply.body);
+        said.push(reply.body);
+    }
     for (method, path) in [
         ("POST", format!("/api/workspaces/{workspace}/archive")),
         ("POST", "/api/workspaces".to_owned()),
@@ -2004,6 +2016,17 @@ async fn changes_list_each_file_with_its_hunks_and_hide_credentials_in_urls() {
         "clone https://bot:hunter2@example.com/r.git\n",
     )
     .unwrap();
+    std::fs::write(worktree.join("mirror.txt"), "m\n").unwrap();
+    git(&worktree, &["add", "mirror.txt"]);
+    git(
+        &worktree,
+        &[
+            "commit",
+            "-q",
+            "-m",
+            "mirror to https://bot:hunter2@example.com/r.git",
+        ],
+    );
 
     let path = format!("/api/workspaces/{workspace}/changes");
     let reply = daemon.call("GET", &path, None).await;
@@ -2020,6 +2043,8 @@ async fn changes_list_each_file_with_its_hunks_and_hide_credentials_in_urls() {
         patch.starts_with("@@ -0,0 +1,1 @@\n+clone https://"),
         "{patch}"
     );
+    let subject = json["commits"][0]["subject"].as_str().unwrap();
+    assert_eq!(subject, "mirror to https://***@example.com/r.git");
     assert!(!reply.body.contains("hunter2"), "{}", reply.body);
 
     let reply = daemon

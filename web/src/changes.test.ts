@@ -4,7 +4,7 @@ import { diffLines, splitPath, totals } from "./changes";
 
 const changes: Changes = {
   base: "main",
-  commits: ["abc1234 add search"],
+  commits: [{ hash: "abc1234", subject: "add search" }],
   files: [
     { path: "src/a.ts", from: null, status: "modified", added: 3, removed: 1, uncommitted: true, patch: "" },
     { path: "logo.png", from: null, status: "added", added: null, removed: null, uncommitted: false, patch: null },

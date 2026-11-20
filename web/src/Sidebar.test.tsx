@@ -77,7 +77,7 @@ describe("Sidebar", () => {
   it("names each session by its first prompt and says what a working one is doing", async () => {
     const records = [workspace(ME, "w1", "fix login"), terminal(ME, "t1", "w1"), session(ME, "s1", "w1", "t1", "working"), terminal(ME, "t2", "w1"), session(ME, "s2", "w1", "t2", "idle")];
     const briefs = {
-      s1: { title: "fix the login bug", now: { kind: "tool" as const, text: "Edit src/login.ts" } },
+      s1: { title: "fix the login bug", now: { kind: "tool" as const, tool: "Edit", text: "Edit src/login.ts" } },
       s2: { title: "write the release notes", now: null },
     };
     await renderApp(<Sidebar machines={fleet(records, settings(), briefs)} {...props} />);

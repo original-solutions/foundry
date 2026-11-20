@@ -4,7 +4,7 @@ import { Dialog } from "radix-ui";
 import { ApiError, createWorkspace, startSession, type Project } from "./api";
 import { safeBranch, sameBranch } from "./branch";
 import type { WorkspaceView } from "./fleet";
-import { button, field, Modal } from "./Modal";
+import { button, field, Modal, primaryButton } from "./Modal";
 
 /** The workspace was made, but its session did not start. */
 class SessionNotStarted extends ApiError {}
@@ -223,7 +223,7 @@ function Form({ projects, workspaces, initialName, create, step, onSubmit }: For
           <button
             type="submit"
             disabled={projects.length === 0 || create.isPending || Boolean(taken)}
-            className="rounded bg-emerald-400 px-3 py-1 text-xs font-semibold text-neutral-950 hover:bg-emerald-300 disabled:opacity-40"
+            className={primaryButton}
           >
             Create and open
           </button>

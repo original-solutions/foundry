@@ -4,7 +4,7 @@ import { render } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { vi } from "vitest";
 
-/** Renders `ui` inside a query client and a router that knows the terminal route, so links resolve. */
+/** Renders `ui` inside a query client and a router that knows the terminal route, so links resolve. Gives back the query client too. */
 export async function renderApp(ui: ReactNode) {
   const root = createRootRoute({ component: () => <>{ui}</> });
   const terminal = createRoute({ getParentRoute: () => root, path: "/terminals/$terminalId" });
@@ -14,11 +14,12 @@ export async function renderApp(ui: ReactNode) {
   });
   await router.load();
   const client = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
-  return render(
+  const view = render(
     <QueryClientProvider client={client}>
       <RouterProvider router={router} />
     </QueryClientProvider>,
   );
+  return { ...view, client };
 }
 
 export type Call = { url: string; method: string; body: unknown };

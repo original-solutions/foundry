@@ -142,10 +142,16 @@ export interface FileChange {
   patch: string | null;
 }
 
-/** What a workspace changed since it left its base: commits on its branch and every changed file. */
+/** A commit on a workspace's branch: its short hash and the first line of its message. */
+export interface Commit {
+  hash: string;
+  subject: string;
+}
+
+/** What a workspace changed since it left its base: commits on its branch, newest first, and every changed file. */
 export interface Changes {
   base: string;
-  commits: string[];
+  commits: Commit[];
   files: FileChange[];
 }
 
@@ -164,6 +170,9 @@ export async function workspaceChanges(workspace: string): Promise<Changes> {
 /** The newest step of a session's turn: a prompt, a tool about to run, or a question for you. */
 export interface Step {
   kind: "prompt" | "tool" | "ask";
+  /** Claude Code's name for the tool ("Bash", "Edit", an MCP tool's name…); only on a `tool` step. */
+  tool?: string;
+  /** The line to show, such as `$ cargo test` or `Edit src/a.rs`. For display only. */
   text: string;
 }
 /** What a session is for (its first prompt) and doing, from its hooks. */
@@ -177,6 +186,8 @@ export type Briefs = Record<string, Brief>;
 /** One step on a session's trail: a prompt, a tool call, a question, or the end of a turn (`done`, no text). `at` is when its hook arrived, in ms since the epoch. */
 export interface Mark {
   kind: Step["kind"] | "done";
+  /** Claude Code's name for the tool; only on a `tool` step. */
+  tool?: string;
   text: string;
   at: number;
 }
@@ -196,6 +207,6 @@ export async function sessionTrail(id: string): Promise<Mark[]> {
 
 export async function sessionBriefs(): Promise<Briefs> {
   const response = await fetch("/api/briefs");
-  if (!response.ok) throw new ApiError(`briefs failed (${response.status})`);
+  if (!response.ok) throw new ApiError(`briefs failed (${response.status})`, response.status);
   return (await response.json()) as Briefs;
 }

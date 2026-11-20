@@ -3,6 +3,7 @@ import type { Mark } from "./api";
 import { ago, kindOf, tally, took, turns } from "./trail";
 
 const mark = (kind: Mark["kind"], text: string, at: number): Mark => ({ kind, text, at });
+const tool = (name: string, text: string): Mark => ({ kind: "tool", tool: name, text, at: 0 });
 
 describe("turns", () => {
   it("splits the trail at each prompt, oldest turn first, and ends a turn at its done", () => {
@@ -30,24 +31,35 @@ describe("turns", () => {
 });
 
 describe("kindOf", () => {
-  it("names what a tool step did from its text", () => {
-    expect(kindOf(mark("tool", "$ ls", 0))).toBe("command");
-    expect(kindOf(mark("tool", "Edit README.md", 0))).toBe("edit");
-    expect(kindOf(mark("tool", "Write a.ts", 0))).toBe("edit");
-    expect(kindOf(mark("tool", "MultiEdit a.ts", 0))).toBe("edit");
-    expect(kindOf(mark("tool", "Read a.ts", 0))).toBe("read");
-    expect(kindOf(mark("tool", "Grep fn main", 0))).toBe("search");
-    expect(kindOf(mark("tool", "Glob **/*.md", 0))).toBe("search");
-    expect(kindOf(mark("tool", "Fetch https://x.dev", 0))).toBe("web");
-    expect(kindOf(mark("tool", "Agent: find it", 0))).toBe("agent");
-    expect(kindOf(mark("tool", "TodoWrite", 0))).toBe("other");
+  it("names what a tool step did from the tool the hook named", () => {
+    expect(kindOf(tool("Bash", "$ ls"))).toBe("command");
+    expect(kindOf(tool("Edit", "Edit README.md"))).toBe("edit");
+    expect(kindOf(tool("Write", "Write a.ts"))).toBe("edit");
+    expect(kindOf(tool("MultiEdit", "MultiEdit a.ts"))).toBe("edit");
+    expect(kindOf(tool("NotebookEdit", "NotebookEdit a.ipynb"))).toBe("edit");
+    expect(kindOf(tool("Read", "Read a.ts"))).toBe("read");
+    expect(kindOf(tool("Grep", "Grep fn main"))).toBe("search");
+    expect(kindOf(tool("Glob", "Glob **/*.md"))).toBe("search");
+    expect(kindOf(tool("WebFetch", "Fetch https://x.dev"))).toBe("web");
+    expect(kindOf(tool("WebSearch", "Search rust traits"))).toBe("web");
+    expect(kindOf(tool("Task", "Agent: find it"))).toBe("agent");
+    expect(kindOf(tool("Agent", "Agent: find it"))).toBe("agent");
+    expect(kindOf(tool("TodoWrite", "TodoWrite"))).toBe("other");
+    expect(kindOf(tool("mcp__github__get_me", "mcp__github__get_me"))).toBe("other");
     expect(kindOf(mark("ask", "Claude needs you", 0))).toBe("ask");
+  });
+
+  it("goes by the tool, never by what the display text happens to start with", () => {
+    expect(kindOf(tool("Read", "$ not a command"))).toBe("read");
+    expect(kindOf(tool("mcp__x__Edit", "Edit a.ts"))).toBe("other");
+    expect(kindOf(mark("tool", "$ ls", 0))).toBe("other");
+    expect(kindOf(tool("constructor", "constructor"))).toBe("other");
   });
 });
 
 describe("tally", () => {
   it("counts a turn's steps by what they did, biggest first, in plain words", () => {
-    const steps = [mark("tool", "$ ls", 0), mark("tool", "Edit a", 0), mark("tool", "$ npm test", 0), mark("tool", "Read b", 0), mark("ask", "ok?", 0)];
+    const steps = [tool("Bash", "$ ls"), tool("Edit", "Edit a"), tool("Bash", "$ npm test"), tool("Read", "Read b"), mark("ask", "ok?", 0)];
     expect(tally(steps)).toBe("2 commands · 1 edit · 1 read · 1 question");
     expect(tally([])).toBe("no tools");
   });

@@ -231,7 +231,7 @@ impl Sessions {
     pub fn briefs(&self) -> HashMap<SessionId, brief::Brief> {
         lock(&self.inner.live)
             .values()
-            .map(|live| (live.id, lock(&live.brief).clone()))
+            .map(|live| (live.id, lock(&live.brief).summary()))
             .collect()
     }
 

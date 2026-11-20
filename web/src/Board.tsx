@@ -9,6 +9,7 @@ import { jumpKey, SearchIcon } from "./JumpPalette";
 import type { Glyph } from "./labels";
 import { glyphText, StateGlyph } from "./StateGlyph";
 import { Named, Now } from "./Now";
+import { pollEvery } from "./poll";
 
 /**
  * How often a card on screen reads its workspace's changes while an agent in it works. A quiet
@@ -207,8 +208,9 @@ function WorkspaceCard({ card, showMachine, onChanges }: { card: Card; showMachi
  * What the workspace changed since its base, read as the sheet reads it, but only while the card
  * is on screen: when it comes on screen, whenever one of its terminals changes state (so the end
  * of a turn shows what the turn wrote), and every `BOARD_BUSY_EVERY` while an agent in it works.
- * A state change off screen is read when the card comes back. A workspace the daemon cannot read
- * here says so and is not asked again on a timer.
+ * A state change off screen is read when the card comes back. A failed read says so instead of
+ * the old numbers and is tried again on the timer; a workspace the daemon does not have (a 404)
+ * is not asked again on a timer.
  */
 function ChangesFooter({ card, onScreen, onOpen }: { card: Card; onScreen: boolean; onOpen: () => void }) {
   const busy = card.rows.some((r) => r.glyph === "working");
@@ -219,7 +221,7 @@ function ChangesFooter({ card, onScreen, onOpen }: { card: Card; onScreen: boole
     enabled: onScreen,
     staleTime: BOARD_BUSY_EVERY,
     retry: false,
-    refetchInterval: (q) => (busy && q.state.status !== "error" ? BOARD_BUSY_EVERY : false),
+    refetchInterval: pollEvery(BOARD_BUSY_EVERY, busy),
   });
   const states = card.rows.map((r) => `${r.terminal}:${r.glyph}`).join(" ");
   const last = useRef(states);
@@ -237,8 +239,7 @@ function ChangesFooter({ card, onScreen, onOpen }: { card: Card; onScreen: boole
   else {
     const t = totals(data);
     const top = topFiles(data, 3);
-    const newest = data.commits[0];
-    const space = newest?.indexOf(" ") ?? -1;
+    const newest = data.commits.at(0);
     body = (
       <>
         <span className="flex flex-wrap items-center gap-x-2.5 gap-y-0.5 text-neutral-400">
@@ -261,8 +262,8 @@ function ChangesFooter({ card, onScreen, onOpen }: { card: Card; onScreen: boole
         )}
         {newest && (
           <span className="flex min-w-0 items-baseline gap-1.5">
-            <span className="shrink-0 font-mono text-[11px] text-neutral-600">{space > 0 ? newest.slice(0, space) : newest}</span>
-            <span className="truncate text-neutral-300">{space > 0 ? newest.slice(space + 1) : ""}</span>
+            <span className="shrink-0 font-mono text-[11px] text-neutral-600">{newest.hash}</span>
+            <span className="truncate text-neutral-300">{newest.subject}</span>
           </span>
         )}
       </>

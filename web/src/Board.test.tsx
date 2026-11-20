@@ -7,6 +7,7 @@ import type { AnyRecord, Changes, SessionState } from "./api";
 import { Board, BOARD_BUSY_EVERY } from "./Board";
 import { fleet, type MachineView } from "./fleet";
 import { ME, sample, session, settings, terminal, workspace } from "./test-fixtures";
+import { RETRY_EVERY } from "./poll";
 import { json } from "./test-utils";
 
 const file = (path: string, added: number, removed: number, uncommitted = false) => ({
@@ -67,7 +68,10 @@ beforeEach(() => {
   answers["/api/workspaces/w1/changes"] = () =>
     json(200, {
       base: "main",
-      commits: ["abc1234 Check the session on login", "def5678 Add the login form"],
+      commits: [
+        { hash: "abc1234", subject: "Check the session on login" },
+        { hash: "def5678", subject: "Add the login form" },
+      ],
       files: [file("src/login.ts", 30, 4), file("README.md", 2, 0, true), file("src/a.ts", 1, 1), file("src/b.ts", 1, 0)],
     } satisfies Changes);
   answers["/api/workspaces/w2/changes"] = () => json(200, { base: "main", commits: [], files: [] } satisfies Changes);
@@ -142,6 +146,7 @@ describe("Board", () => {
     expect(within(login).getByText("1 uncommitted")).toBeDefined();
     expect(within(login).getByText("login.ts")).toBeDefined();
     expect(within(login).getByText("+1 more")).toBeDefined();
+    expect(within(login).getByText("abc1234")).toBeDefined();
     expect(within(login).getByText("Check the session on login")).toBeDefined();
     await waitFor(() => expect(within(card("tidy readme")).getByText("No changes yet")).toBeDefined());
     await waitFor(() => expect(within(card("far away")).getByText(/not readable from here/i)).toBeDefined());
@@ -186,6 +191,18 @@ describe("Board", () => {
     await act(() => vi.advanceTimersByTimeAsync(twoMinutes + 100));
     expect(readsOf("w1")).toBe(working + Math.floor(twoMinutes / BOARD_BUSY_EVERY));
     expect(readsOf("w2")).toBe(waiting);
+  });
+
+  it("keeps reading a working card after a failed read, and stops for a workspace the daemon does not have", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    answers["/api/workspaces/w1/changes"] = () => json(500, { error: "git hiccup" });
+    const allWorking = records().map((r) => (r.kind === "session" ? { ...r, body: { ...r.body, state: "working" as const } } : r));
+    await show(fleet(allWorking, settings()));
+    await waitFor(() => expect(within(card("far away")).getByText(/not readable from here/i)).toBeDefined());
+    const twoMinutes = 120_000;
+    await act(() => vi.advanceTimersByTimeAsync(twoMinutes + 100));
+    expect(readsOf("w1")).toBe(1 + Math.floor(twoMinutes / Math.max(BOARD_BUSY_EVERY, RETRY_EVERY)));
+    expect(readsOf("w3")).toBe(1);
   });
 
   it("reads a card whose terminal changed state off screen when it comes back on screen, not before", async () => {

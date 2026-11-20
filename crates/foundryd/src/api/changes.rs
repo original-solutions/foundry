@@ -16,7 +16,7 @@ pub(super) async fn changes(
     let id = parse_id(&id, "workspace", WorkspaceId)?;
     let mut changes = api.workspaces.changes(id).await?;
     for commit in &mut changes.commits {
-        *commit = redact(commit);
+        commit.subject = redact(&commit.subject);
     }
     for file in &mut changes.files {
         file.path = redact(&file.path);
