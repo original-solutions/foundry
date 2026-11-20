@@ -2,9 +2,10 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createMemoryHistory, createRouter, RouterProvider } from "@tanstack/react-router";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { machineQuery, type Briefs, type Shipping, type UiMessage } from "./api";
+import { machineQuery, type Briefs, type Changes, type Shipping, type UiMessage } from "./api";
 import { router, routeTree } from "./App";
 import { button, pressed } from "./Modal";
+import { nextSteps } from "./next";
 import { ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
 import { FakeSocket, json, mockFetch, type Call } from "./test-utils";
 
@@ -884,6 +885,32 @@ describe("App", () => {
     fireEvent.click(within(panel).getByRole("button", { name: "Close changes" }));
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
     expect(within(header).getByRole("button", { name: /changes/i }).textContent).toContain("+4");
+  });
+
+  it("offers an idle session's next step in its header, and sends it to the session as a prompt", async () => {
+    const changes = { base: "main", commits: [], files: [{ path: "a.ts", from: null, status: "modified", added: 4, removed: 2, uncommitted: true, patch: null }] };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) => (url.endsWith("/changes") ? json(200, changes) : url.endsWith("/pr") ? json(200, quiet) : json(200, {}))),
+    );
+    const idle = { ...live, records: live.records.map((r) => (r.kind === "session" ? session(ME, "s1", "w1", "t1", "idle", { model: "sonnet" }) : r)) };
+    await open("/terminals/t1", idle);
+    const header = screen.getByLabelText("Open terminal");
+
+    fireEvent.click(await within(header).findByRole("button", { name: "Commit 1 file" }));
+    const once = sockets("/api/terminals/t1").at(-1)!;
+    act(() => once.open());
+
+    const typed = once.sent.map((d) => new TextDecoder().decode(d as Uint8Array));
+    expect(typed).toEqual([`\x1b[200~${nextSteps(changes as Changes)[0].prompt}\x1b[201~`, "\r"]);
+    expect(sockets("/api/terminals/t1")).toHaveLength(2);
+
+    // A split's half-width headers have no room for them.
+    fireEvent.click(within(header).getByRole("button", { name: "Open beside" }));
+    fireEvent.keyDown(within(await screen.findByRole("dialog", { name: /^Open beside/ })).getByRole("combobox"), { key: "Enter" });
+    await waitFor(() => expect(within(screen.getByLabelText("Terminal beside")).getByText("sonnet")).toBeDefined());
+    const beside = screen.getByLabelText("Terminal beside");
+    expect(within(beside).queryByRole("group", { name: "Next for sonnet" })).toBeNull();
   });
 
   it("opens the open session's steps beside its terminal, follows the terminal you open, and closes", async () => {

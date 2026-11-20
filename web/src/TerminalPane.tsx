@@ -6,6 +6,7 @@ import { MAX_FILE, sendFile } from "./api";
 import { FindBar } from "./FindBar";
 import { DropOverlay, SendingChip } from "./Handoff";
 import { KeyBar } from "./KeyBar";
+import { NextSteps } from "./NextSteps";
 import type { Glyph } from "./labels";
 import { Backoff, socketUrl } from "./socket";
 
@@ -42,6 +43,9 @@ const STEADY_AFTER = 10_000;
  * the pane, pasted (a screenshot on the clipboard), or picked with the key bar's clip on a phone.
  * Each is sent to the daemon, which keeps it beside the terminal, and its path is typed in
  * without Enter, so you add the words. Claude Code reads a pasted image path as the image.
+ *
+ * A session of this machine (`workspace` given, `here`) that is idle leads its key bar with its
+ * workspace's next steps, each typed in as a prompt and sent.
  */
 export function TerminalPane({
   id,
@@ -52,6 +56,7 @@ export function TerminalPane({
   finding = 0,
   onFindClose = () => {},
   here = false,
+  workspace,
 }: {
   id: string;
   running: boolean | undefined;
@@ -63,6 +68,8 @@ export function TerminalPane({
   onFindClose?: () => void;
   /** The terminal runs on the machine whose daemon serves the page, so it can be handed files. */
   here?: boolean;
+  /** The workspace of the session the terminal runs; not given for a shell. */
+  workspace?: string;
 }) {
   const host = useRef<HTMLDivElement>(null);
   const shown = useRef<{ term: Terminal; fit: FitAddon } | null>(null);
@@ -194,6 +201,11 @@ export function TerminalPane({
     term.paste(`${paths.join(" ")} `);
     if (!touch()) term.focus();
   };
+  /** Types `text` in as one paste and presses Enter, as a message is sent. */
+  const say = (text: string) => {
+    shown.current?.term.paste(text);
+    shown.current?.term.input("\r", true);
+  };
   const withFiles = (types: readonly string[] | DOMStringList | undefined) => !!types && Array.from(types).includes("Files");
 
   // A pane kept open behind another tab takes the keyboard, and the size it missed, when shown.
@@ -250,11 +262,9 @@ export function TerminalPane({
           glyph={glyph ?? "ready"}
           modes={() => shown.current?.term.modes ?? { applicationCursorKeysMode: false }}
           onKey={(data) => shown.current?.term.input(data, true)}
-          onMessage={(text) => {
-            shown.current?.term.paste(text);
-            shown.current?.term.input("\r", true);
-          }}
+          onMessage={say}
           onFiles={here ? (files) => void hand(files) : undefined}
+          lead={workspace && here && glyph === "ready" ? <NextSteps workspace={workspace} name={name ?? "terminal"} send={say} look="keys" /> : undefined}
         />
       )}
       {trouble && (

@@ -1,5 +1,8 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { Changes } from "./api";
+import { nextSteps } from "./next";
 import { TerminalPane } from "./TerminalPane";
 import type { Glyph } from "./labels";
 import { FakeSocket, json } from "./test-utils";
@@ -400,6 +403,41 @@ describe("TerminalPane", () => {
     it("offers no answers while the session works", () => {
       mount("t1", { running: true, glyph: "working" });
       expect(screen.queryByRole("button", { name: "Answer 1" })).toBeNull();
+    });
+
+    it("leads with an idle session's next steps, and one types its prompt and presses Enter", async () => {
+      vi.useRealTimers();
+      const dirty = { base: "main", commits: [], files: [{ path: "a.md", from: null, status: "modified", added: 1, removed: 0, uncommitted: true, patch: null }] };
+      const quiet = { branch: "b", pushed: false, unpushed: 0, pr: null, unreachable: false };
+      vi.stubGlobal("fetch", vi.fn(async (url: string) => json(200, url === "/api/workspaces/w1/changes" ? dirty : quiet)));
+      render(
+        <QueryClientProvider client={new QueryClient()}>
+          <TerminalPane id="t1" running name="opus" glyph="ready" here workspace="w1" />
+        </QueryClientProvider>,
+      );
+      const socket = FakeSocket.last();
+      act(() => socket.open());
+
+      fireEvent.click(await screen.findByRole("button", { name: "Commit 1 file" }));
+
+      expect(sent(socket)).toEqual([`\x1b[200~${nextSteps(dirty as Changes)[0].prompt}\x1b[201~`, "\r"]);
+    });
+
+    it("offers no next steps while the session works, nor for a terminal on another machine", () => {
+      vi.stubGlobal("fetch", vi.fn(async () => Promise.reject(new Error("unexpected request"))));
+      const client = new QueryClient();
+      const { rerender } = render(
+        <QueryClientProvider client={client}>
+          <TerminalPane id="t1" running name="opus" glyph="working" here workspace="w1" />
+        </QueryClientProvider>,
+      );
+      rerender(
+        <QueryClientProvider client={client}>
+          <TerminalPane id="t1" running name="opus" glyph="ready" here={false} workspace="w1" />
+        </QueryClientProvider>,
+      );
+      expect(screen.queryByRole("group", { name: "Next for opus" })).toBeNull();
+      expect(fetch).not.toHaveBeenCalled();
     });
 
     it("goes away once the terminal is no longer running", () => {

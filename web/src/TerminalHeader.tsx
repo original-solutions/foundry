@@ -4,8 +4,11 @@ import { changesQuery } from "./ChangesPanel";
 import { findKey } from "./FindBar";
 import { totals } from "./changes";
 import type { Located } from "./fleet";
+import { machineQuery } from "./api";
 import { jumpKey, SearchIcon } from "./JumpPalette";
 import { button, pressed } from "./Modal";
+import { NextSteps, offersNext } from "./NextSteps";
+import { reply } from "./Said";
 import { StatePill } from "./StateGlyph";
 import { StepsIcon } from "./StepsPanel";
 import { TerminalMenuButton } from "./TerminalMenu";
@@ -18,7 +21,9 @@ export const splitKey = jumpKey === "⌘K" ? "⌘\\" : "Ctrl \\";
  * state, and the ways into the workspace's changes, the session's steps, finding text in it and a menu with the rest, ending it included. On a narrow screen it holds the button that
  * opens the sidebar as a drawer. On a wide one it opens another terminal beside this one, or, in
  * a split, closes its own side. In a split the side with the keyboard has a lit edge; the other
- * is dimmed.
+ * is dimmed. An idle session of this machine offers its workspace's next steps (commit, open a
+ * pull request, fix failing checks) beside its name, each sent to it as a prompt; with a mouse on
+ * a wide screen and outside a split only, where the header has room (a phone's key bar offers them).
  */
 export function TerminalHeader({
   id,
@@ -56,6 +61,7 @@ export function TerminalHeader({
   /** This is the side of a split without the keyboard: dimmed, and hidden on a narrow screen. */
   beside?: boolean;
 }) {
+  const { data: here } = useQuery(machineQuery);
   return (
     <header
       aria-label={beside ? "Terminal beside" : "Open terminal"}
@@ -89,6 +95,11 @@ export function TerminalHeader({
               {located.machine.name}
             </span>
           </div>
+          {id && !onClosePane && offersNext(located, here) && (
+            <div className="hidden xl:pointer-fine:contents">
+              <NextSteps workspace={located.workspace.id} name={located.name} send={(prompt) => reply(id, prompt)} look="header" />
+            </div>
+          )}
           <StatePill glyph={located.glyph} label={located.label} />
           <ChangesButton workspace={located.workspace.id} onClick={() => onChanges(located.workspace.id)} />
           {onSteps && (

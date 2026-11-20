@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { keyData, keysFor } from "./keys";
 import type { Glyph } from "./labels";
 
@@ -8,6 +8,7 @@ import type { Glyph } from "./labels";
  * as one paste and then Enter. Hidden where the main pointer is a mouse: there is a keyboard.
  * A key press keeps focus where it was, so the on-screen keyboard neither rises nor drops.
  * With `onFiles`, a clip beside the box picks files (a photo, a screenshot) to hand the terminal.
+ * `lead` goes first in the row: an idle session's next steps.
  */
 export function KeyBar({
   name,
@@ -16,6 +17,7 @@ export function KeyBar({
   onKey,
   onMessage,
   onFiles,
+  lead,
 }: {
   name: string;
   glyph: Glyph;
@@ -23,6 +25,7 @@ export function KeyBar({
   onKey: (data: string) => void;
   onMessage: (text: string) => void;
   onFiles?: (files: File[]) => void;
+  lead?: ReactNode;
 }) {
   const [draft, setDraft] = useState("");
   const shell = name === "shell";
@@ -35,6 +38,7 @@ export function KeyBar({
   return (
     <div className="shrink-0 border-t border-neutral-800 bg-neutral-950 pb-[env(safe-area-inset-bottom)] pointer-fine:hidden">
       <div role="toolbar" aria-label={`Keys for ${name}`} className="flex items-center gap-1 overflow-x-auto px-2 pt-2 [scrollbar-width:none]">
+        {lead}
         {keys.some((k) => k.answer) && <span className="shrink-0 pr-0.5 text-[10px] font-medium tracking-wide text-amber-400 uppercase">Answer</span>}
         {keys.map((key) => (
           <button

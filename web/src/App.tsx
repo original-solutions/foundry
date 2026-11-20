@@ -302,6 +302,7 @@ function Layout() {
                       finding={id === terminalId ? finding : 0}
                       onFindClose={() => setFinding(0)}
                       here={!!where && where.machine.id === here}
+                      workspace={where?.session ? where.workspace.id : undefined}
                     />
                   </div>
                 );
