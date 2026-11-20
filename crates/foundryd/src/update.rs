@@ -1372,7 +1372,7 @@ mod tests {
         );
 
         assert!(
-            matches!(error, Err(UpdateError::WrongVersion { .. })),
+            matches!(error, Err(UpdateError::BadCheck { .. })),
             "{error:?}"
         );
         assert_eq!(
@@ -1422,7 +1422,7 @@ mod tests {
             },
         );
 
-        assert!(matches!(error, Err(UpdateError::WrongVersion { .. })));
+        assert!(matches!(error, Err(UpdateError::BadCheck { .. })));
         assert_eq!(
             state(home.path()).unwrap().refused.as_deref(),
             Some("v0.2.0")
@@ -1601,59 +1601,111 @@ mod tests {
         assert_eq!(current(home.path()), PathBuf::from("versions/0.1.0"));
     }
 
-    /// Runs `run_with` on a paused clock; `checks` counts the update checks it makes.
-    fn spawn_run(
-        home: &Path,
-        exe: PathBuf,
-        flag: &'static AtomicBool,
-        checks: &'static std::sync::atomic::AtomicUsize,
-    ) -> tokio::task::JoinHandle<()> {
-        let home = home.to_path_buf();
-        tokio::spawn(async move {
-            run_with(home, Ok(exe), "0.2.0", flag, HEALTHY_AFTER, move || {
-                checks.fetch_add(1, Ordering::Relaxed);
-                Ok(None)
-            })
-            .await;
-        })
+    use std::sync::atomic::AtomicUsize;
+
+    const TICK: Duration = Duration::from_secs(10);
+
+    fn nothing() -> Result<Option<String>, UpdateError> {
+        Ok(None)
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn run_marks_a_trial_healthy_after_the_wait_and_then_checks_for_updates() {
-        static FLAG: AtomicBool = AtomicBool::new(false);
-        static CHECKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let home = trial_home();
-        let exe = exe_in(home.path(), "0.2.0");
-        let task = spawn_run(home.path(), exe, &FLAG, &CHECKS);
+    fn found() -> Result<Option<String>, UpdateError> {
+        Ok(Some("v0.3.0".into()))
+    }
 
-        tokio::time::sleep(HEALTHY_AFTER / 2).await;
-        assert!(!FLAG.load(Ordering::Relaxed));
-        assert!(state(home.path()).unwrap().trial.is_some());
-        tokio::time::sleep(HEALTHY_AFTER).await;
-        for _ in 0..200 {
-            if CHECKS.load(Ordering::Relaxed) > 0 {
-                break;
+    /// Runs `run_with` on a paused clock with a check that gives `result`.
+    fn spawn_run(
+        home: &Path,
+        exe: io::Result<PathBuf>,
+        flag: &'static AtomicBool,
+        counts: (&'static AtomicUsize, &'static AtomicUsize),
+        result: fn() -> Result<Option<String>, UpdateError>,
+    ) -> tokio::task::JoinHandle<()> {
+        let home = home.to_path_buf();
+        let (checks, stops) = counts;
+        tokio::spawn(run_with(
+            home,
+            exe,
+            "0.2.0",
+            flag,
+            HEALTHY_AFTER,
+            TICK,
+            move || {
+                checks.fetch_add(1, Ordering::Relaxed);
+                result()
+            },
+            move || {
+                stops.fetch_add(1, Ordering::Relaxed);
+            },
+        ))
+    }
+
+    /// Lets the blocking check threads run until `counter` reaches `n`.
+    async fn reach(counter: &AtomicUsize, n: usize) {
+        for _ in 0..500 {
+            if counter.load(Ordering::Relaxed) >= n {
+                return;
             }
             tokio::task::yield_now().await;
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_marks_a_trial_healthy_after_the_wait_and_then_checks_every_interval() {
+        static FLAG: AtomicBool = AtomicBool::new(false);
+        static CHECKS: AtomicUsize = AtomicUsize::new(0);
+        static STOPS: AtomicUsize = AtomicUsize::new(0);
+        let home = trial_home();
+        let exe = exe_in(home.path(), "0.2.0");
+        let task = spawn_run(home.path(), Ok(exe), &FLAG, (&CHECKS, &STOPS), nothing);
+
+        tokio::time::sleep(HEALTHY_AFTER / 2).await;
+        assert!(!FLAG.load(Ordering::Relaxed));
+        assert!(state(home.path()).unwrap().trial.is_some());
+        tokio::time::sleep(HEALTHY_AFTER / 2 + Duration::from_secs(1)).await;
+        reach(&CHECKS, 1).await;
 
         assert!(FLAG.load(Ordering::Relaxed));
         assert_eq!(state(home.path()).unwrap().trial, None);
-        assert!(CHECKS.load(Ordering::Relaxed) > 0);
+        assert_eq!(CHECKS.load(Ordering::Relaxed), 1);
+        tokio::time::sleep(TICK + Duration::from_secs(1)).await;
+        reach(&CHECKS, 2).await;
+        assert_eq!(CHECKS.load(Ordering::Relaxed), 2);
+        assert_eq!(STOPS.load(Ordering::Relaxed), 0);
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_stops_the_daemon_once_when_a_check_installs_a_tag_and_checks_no_more() {
+        static FLAG: AtomicBool = AtomicBool::new(false);
+        static CHECKS: AtomicUsize = AtomicUsize::new(0);
+        static STOPS: AtomicUsize = AtomicUsize::new(0);
+        let home = trial_home();
+        let exe = exe_in(home.path(), "0.2.0");
+        let task = spawn_run(home.path(), Ok(exe), &FLAG, (&CHECKS, &STOPS), found);
+
+        tokio::time::sleep(HEALTHY_AFTER + Duration::from_secs(1)).await;
+        reach(&STOPS, 1).await;
+        tokio::time::sleep(TICK * 3).await;
+        std::thread::sleep(Duration::from_millis(100));
+
+        assert_eq!(STOPS.load(Ordering::Relaxed), 1);
+        assert_eq!(CHECKS.load(Ordering::Relaxed), 1);
         task.abort();
     }
 
     #[tokio::test(start_paused = true)]
     async fn run_from_elsewhere_sets_the_flag_but_never_checks() {
         static FLAG: AtomicBool = AtomicBool::new(false);
-        static CHECKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        static CHECKS: AtomicUsize = AtomicUsize::new(0);
+        static STOPS: AtomicUsize = AtomicUsize::new(0);
         let home = trial_home();
         let elsewhere = home.path().join("elsewhere");
         script(&elsewhere, "foundryd 0.2.0");
-        let task = spawn_run(home.path(), elsewhere, &FLAG, &CHECKS);
+        let task = spawn_run(home.path(), Ok(elsewhere), &FLAG, (&CHECKS, &STOPS), nothing);
 
-        tokio::time::sleep(HEALTHY_AFTER + CHECK_EVERY * 2).await;
+        tokio::time::sleep(HEALTHY_AFTER + TICK * 3).await;
         std::thread::sleep(Duration::from_millis(100));
 
         assert!(FLAG.load(Ordering::Relaxed));
@@ -1665,19 +1717,137 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn run_with_no_executable_path_still_sets_the_flag() {
         static FLAG: AtomicBool = AtomicBool::new(false);
+        static CHECKS: AtomicUsize = AtomicUsize::new(0);
+        static STOPS: AtomicUsize = AtomicUsize::new(0);
         let home = trial_home();
-        let task = tokio::spawn(run_with(
-            home.path().to_path_buf(),
+        let task = spawn_run(
+            home.path(),
             Err(io::Error::other("no exe")),
-            "0.2.0",
             &FLAG,
-            HEALTHY_AFTER,
-            || Ok(None),
-        ));
+            (&CHECKS, &STOPS),
+            nothing,
+        );
 
         tokio::time::sleep(HEALTHY_AFTER + Duration::from_secs(1)).await;
 
         assert!(FLAG.load(Ordering::Relaxed));
+        assert_eq!(CHECKS.load(Ordering::Relaxed), 0);
         task.abort();
+    }
+
+    #[test]
+    fn the_timings_are_the_ones_the_spec_gives() {
+        assert_eq!(HEALTHY_AFTER, Duration::from_secs(60));
+        assert_eq!(TRIAL_DEADLINE, Duration::from_secs(300));
+        assert_eq!(CHECK_EVERY, Duration::from_secs(600));
+    }
+
+    fn started(home: &Path, exe: &Path) -> (bool, usize) {
+        let armed = std::cell::Cell::new(0);
+        let go = starting_with(home, exe, "0.2.0", || armed.set(armed.get() + 1));
+        (go, armed.get())
+    }
+
+    #[test]
+    fn a_counted_trial_from_current_starts_and_arms_the_watchdog_once() {
+        let home = trial_home();
+        let exe = exe_in(home.path(), "0.2.0");
+
+        assert_eq!(started(home.path(), &exe), (true, 1));
+    }
+
+    #[test]
+    fn no_trial_starts_without_the_watchdog() {
+        let home = installed_home();
+        let exe = exe_in(home.path(), "0.1.0");
+        let armed = std::cell::Cell::new(0);
+
+        let go = starting_with(home.path(), &exe, "0.1.0", || armed.set(1));
+
+        assert!(go);
+        assert_eq!(armed.get(), 0);
+    }
+
+    #[test]
+    fn an_unreadable_state_file_starts_the_daemon_without_the_watchdog() {
+        let home = trial_home();
+        let exe = exe_in(home.path(), "0.2.0");
+        fs::write(home.path().join("update.json"), "not json").unwrap();
+
+        assert_eq!(started(home.path(), &exe), (true, 0));
+    }
+
+    #[test]
+    fn a_trial_at_its_cap_does_not_start_and_does_not_arm() {
+        let home = trial_home();
+        let exe = exe_in(home.path(), "0.2.0");
+        for _ in 0..3 {
+            assert!(started(home.path(), &exe).0);
+        }
+
+        assert_eq!(started(home.path(), &exe), (false, 0));
+        assert_eq!(current(home.path()), PathBuf::from("versions/0.1.0"));
+    }
+
+    fn judged(result: Result<String, RunError>) -> Result<(), UpdateError> {
+        judge_version_check(result, "v0.2.0", "0.2.0")
+    }
+
+    fn spawn_error(code: Errno) -> RunError {
+        RunError::Spawn {
+            name: "foundryd --version".into(),
+            source: io::Error::from_raw_os_error(code as i32),
+        }
+    }
+
+    #[test]
+    fn a_version_check_is_judged_by_what_happened_to_it() {
+        assert!(matches!(judged(Err(spawn_error(Errno::EAGAIN))), Err(UpdateError::Fetch(_))));
+        assert!(matches!(
+            judged(Err(RunError::TimedOut { name: "foundryd --version".into(), secs: 10 })),
+            Err(UpdateError::Fetch(_))
+        ));
+        assert!(matches!(judged(Err(spawn_error(Errno::ENOEXEC))), Err(UpdateError::BadCheck { .. })));
+        assert!(matches!(
+            judged(Err(RunError::Failed { name: "foundryd --version".into(), stderr: "boom".into() })),
+            Err(UpdateError::BadCheck { .. })
+        ));
+        assert!(matches!(
+            judged(Ok("foundryd 0.9.9\n".into())),
+            Err(UpdateError::WrongVersion { .. })
+        ));
+        assert!(judged(Ok("foundryd 0.2.0\n".into())).is_ok());
+    }
+
+    #[test]
+    fn a_refusal_says_what_the_binary_did_without_claiming_it_printed_an_error() {
+        let message = judged(Err(spawn_error(Errno::ENOEXEC))).unwrap_err().to_string();
+
+        assert!(message.contains("v0.2.0 is refused"), "{message}");
+        assert!(!message.contains("printed"), "{message}");
+    }
+
+    fn refused_state(refused: &str) -> tempfile::TempDir {
+        let home = tempfile::tempdir().unwrap();
+        save(
+            home.path(),
+            &State {
+                trial: None,
+                refused: Some(refused.into()),
+            },
+        )
+        .unwrap();
+        home
+    }
+
+    #[test]
+    fn placed_by_hand_says_nothing_when_the_version_did_not_go_down() {
+        let home = refused_state("v0.3.0");
+
+        let same = placed_by_hand(home.path(), "0.2.0", Some("0.2.0")).unwrap();
+        let up = placed_by_hand(home.path(), "0.3.1", Some("0.2.0")).unwrap();
+
+        assert_eq!(same, None);
+        assert_eq!(up, None);
     }
 }

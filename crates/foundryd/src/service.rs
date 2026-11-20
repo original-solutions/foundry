@@ -663,8 +663,9 @@ mod tests {
         fs::create_dir_all(&old).unwrap();
         binaries(&old, "one");
 
-        place(home.path(), &old.join("foundryd"), "0.1.0").unwrap();
+        let back = place(home.path(), &old.join("foundryd"), "0.1.0").unwrap();
 
+        assert_eq!(back.as_deref(), Some("v0.2.0"));
         assert_eq!(
             fs::read_link(home.path().join("current")).unwrap(),
             PathBuf::from("versions/0.1.0")
@@ -721,5 +722,21 @@ mod tests {
 
         assert_eq!(first, None);
         assert_eq!(back.as_deref(), Some("v0.2.0"));
+    }
+
+    #[test]
+    fn the_placed_note_names_a_go_back_and_says_nothing_otherwise() {
+        let home = Path::new("/data");
+
+        let back = placed_note(home, "0.1.0", Some("v0.2.0"));
+        let plain = placed_note(home, "0.1.0", None);
+
+        assert!(back.contains("Placed version 0.1.0 in /data/versions\n"), "{back}");
+        assert!(
+            back.contains("Went back to 0.1.0; v0.2.0 is refused until a higher tag ships.\n"),
+            "{back}"
+        );
+        assert!(plain.contains("Placed version 0.1.0 in /data/versions\n"), "{plain}");
+        assert!(!plain.contains("Went back"), "{plain}");
     }
 }
