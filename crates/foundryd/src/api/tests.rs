@@ -1490,6 +1490,53 @@ async fn briefs_name_each_sessions_first_prompt_and_newest_step_with_url_passwor
 }
 
 #[tokio::test]
+async fn a_brief_carries_what_claude_said_at_the_end_of_its_turn_with_url_passwords_hidden() {
+    let daemon = Daemon::new(
+        "
+- hook: {event: UserPromptSubmit, prompt: \"push it\"}
+- hook: {event: Stop, last_assistant_message: \"Pushed to https://me:hunter2@example.com/r\\n\\nAll done.\"}
+- wait_input
+",
+    )
+    .await;
+    let project = daemon.project();
+    let workspace = daemon.create_workspace(project, "answered").await;
+    let reply = daemon
+        .call(
+            "POST",
+            &format!("/api/workspaces/{workspace}/sessions"),
+            Some(serde_json::json!({"model": MODEL})),
+        )
+        .await;
+    assert_eq!(reply.status, 201, "{}", reply.body);
+    let session: SessionId = reply.id();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let brief = loop {
+        let reply = daemon.call("GET", "/api/briefs", None).await;
+        assert_eq!(reply.status, 200, "{}", reply.body);
+        let briefs: serde_json::Value = serde_json::from_str(&reply.body).unwrap();
+        let brief = briefs[session.to_string()].clone();
+        if !brief["said"].is_null() {
+            break brief;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "nothing said in {briefs}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(
+        brief,
+        serde_json::json!({
+            "title": "push it",
+            "now": null,
+            "said": "Pushed to https://***@example.com/r\n\nAll done.",
+        })
+    );
+}
+
+#[tokio::test]
 async fn a_sessions_trail_lists_its_steps_with_url_passwords_hidden_and_others_are_not_found() {
     let daemon = Daemon::new(
         "

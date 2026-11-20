@@ -150,6 +150,16 @@ describe("Board", () => {
     await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t2"));
   });
 
+  it("shows under an idle session what Claude said at the end of its turn, and nothing under a working one", async () => {
+    const said = "Fixed the login check. All tests pass.";
+    const briefs = { s1: { title: null, now: null, said: "left over" }, s4: { title: null, now: null, said } };
+    await show(fleet(records(), settings(), briefs));
+    expect(within(card("far away")).getByRole("button", { name: said })).toBeDefined();
+    expect(within(card("fix login")).queryByText("left over")).toBeNull();
+    fireEvent.click(within(card("far away")).getByRole("button", { name: said }));
+    expect(within(card("far away")).getByRole("textbox", { name: "Reply to opus" })).toBeDefined();
+  });
+
   it("shows what each workspace changed: lines, files, commits, the biggest files and the newest commit", async () => {
     await show(fleet(records(), settings()));
     const login = card("fix login");

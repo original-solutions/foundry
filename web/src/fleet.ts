@@ -54,6 +54,8 @@ export interface SessionView {
   title?: string;
   /** The newest step of its turn. */
   now?: Step;
+  /** What Claude said when its last turn ended. */
+  said?: string;
 }
 export interface ShellView {
   id: string;
@@ -118,6 +120,7 @@ export function fleet(records: AnyRecord[], settings: SharedSettings, briefs: Br
             terminal: s.terminal,
             title: briefs[s.id]?.title ?? undefined,
             now: briefs[s.id]?.now ?? undefined,
+            said: briefs[s.id]?.said,
           })),
           shells: shellsOf.get(w.id) ?? [],
         },
@@ -166,16 +169,21 @@ export interface Row {
   title?: string;
   /** What a session is doing, only while it is `busy`: in the middle of a turn. */
   now?: Step;
+  /** What Claude said when its last turn ended, only once the session rests: idle or finished. */
+  said?: string;
   label: string;
   glyph: Glyph;
 }
+
+/** A session that has stopped for now or for good, so what it last said is its news. */
+const rests: Glyph[] = ["ready", "done"];
 
 /** A workspace's terminals in sidebar order: its sessions, then its shells. */
 export function rows(workspace: WorkspaceView): Row[] {
   return [
     ...workspace.sessions.map((s) => {
       const glyph = sessionGlyph[s.state];
-      return { terminal: s.terminal, session: s.id, name: s.model, title: s.title, now: busy.includes(glyph) ? s.now : undefined, label: sessionLabel[s.state], glyph };
+      return { terminal: s.terminal, session: s.id, name: s.model, title: s.title, now: busy.includes(glyph) ? s.now : undefined, said: rests.includes(glyph) ? s.said : undefined, label: sessionLabel[s.state], glyph };
     }),
     ...workspace.shells.map((t) => ({ terminal: t.id, name: "shell", label: terminalLabel(t.state, t.exitCode), glyph: terminalGlyph(t.state, t.exitCode) })),
   ];

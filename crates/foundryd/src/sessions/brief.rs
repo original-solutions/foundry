@@ -1,5 +1,6 @@
 //! What a session is for and what it is doing, read from its hooks' payloads: the first prompt
-//! it was given, the newest prompt, tool call or question, and the trail of every step it took,
+//! it was given, the newest prompt, tool call or question, what Claude said at the end of its
+//! last turn, and the trail of every step it took,
 //! the newest [`TRAIL_LONGEST`] of them. Kept in memory for the session's life and never written
 //! to a record, so it does not sync and does not outlive the daemon.
 //!
@@ -18,6 +19,8 @@ const LONGEST: usize = 120;
 /// The shortest run of letters, digits, `-` and `_` taken for a token when it mixes letters and
 /// digits.
 const TOKEN_LENGTH: usize = 24;
+/// The longest answer kept, in characters, before an ellipsis: enough to read, not a document.
+pub const SAID_LONGEST: usize = 600;
 /// The most steps a trail keeps; past it, the oldest go.
 pub const TRAIL_LONGEST: usize = 200;
 /// What a hidden secret or token shows as.
@@ -30,6 +33,10 @@ pub struct Brief {
     pub title: Option<String>,
     /// The newest step of the turn, until the turn ends.
     pub now: Option<Step>,
+    /// What Claude said when its last turn ended, its lines kept, until the next prompt. Left
+    /// out when there is none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub said: Option<String>,
     /// Every step it took, oldest first, in the order its hooks arrived. Served on its own, so
     /// the briefs of a busy fleet stay small.
     #[serde(skip)]
@@ -78,6 +85,7 @@ impl Brief {
         Brief {
             title: self.title.clone(),
             now: self.now.clone(),
+            said: self.said.clone(),
             trail: VecDeque::new(),
         }
     }
@@ -98,6 +106,7 @@ impl Brief {
             "SessionStart" if field("source") == Some("clear") => {
                 self.title = None;
                 self.now = None;
+                self.said = None;
                 None
             }
             "UserPromptSubmit" => {
@@ -106,6 +115,7 @@ impl Brief {
                     self.title = step(StepKind::Prompt, prompt).map(|s| s.text);
                 }
                 self.now = step(StepKind::Prompt, prompt);
+                self.said = None;
                 self.now.clone()
             }
             "PreToolUse" => {
@@ -124,6 +134,7 @@ impl Brief {
             },
             "Stop" => {
                 self.now = None;
+                self.said = field("last_assistant_message").and_then(|text| said(text, secrets));
                 Some(Step {
                     kind: StepKind::Done,
                     text: String::new(),
@@ -199,6 +210,33 @@ pub fn shown(text: &str, secrets: &[&str]) -> String {
     }
     let cut: String = line.chars().take(LONGEST - 1).collect();
     format!("{}…", cut.trim_end())
+}
+
+/// What Claude said, its lines kept but blank runs cut to one, with `secrets`, token-shaped words
+/// and the password of any URL hidden, then cut to [`SAID_LONGEST`]; `None` when nothing is left.
+fn said(text: &str, secrets: &[&str]) -> Option<String> {
+    let mut lines: Vec<&str> = Vec::new();
+    for line in text.lines().map(str::trim_end) {
+        if !(line.is_empty() && lines.last().is_none_or(|l| l.is_empty())) {
+            lines.push(line);
+        }
+    }
+    while lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    let mut text = redact(&lines.join("\n"));
+    for secret in secrets.iter().filter(|s| !s.is_empty()) {
+        text = text.replace(secret, HIDDEN);
+    }
+    let text = tokens_hidden(&text);
+    if text.is_empty() {
+        return None;
+    }
+    if text.chars().count() <= SAID_LONGEST {
+        return Some(text);
+    }
+    let cut: String = text.chars().take(SAID_LONGEST - 1).collect();
+    Some(format!("{}…", cut.trim_end()))
 }
 
 /// `text` with each run of letters, digits, `-` and `_` that is at least [`TOKEN_LENGTH`] long
@@ -328,6 +366,50 @@ mod tests {
         let brief = noted(&[prompt("go"), ask, stop]);
         assert_eq!(brief.now, None);
         assert_eq!(brief.title.as_deref(), Some("go"));
+    }
+
+    fn stop(said: &str) -> serde_json::Value {
+        json!({"hook_event_name": "Stop", "last_assistant_message": said})
+    }
+
+    #[test]
+    fn the_end_of_a_turn_keeps_what_claude_said_until_the_next_prompt() {
+        let brief = noted(&[prompt("go"), stop("Done.\n\n\n\nAll   tests pass.  \n")]);
+        assert_eq!(brief.said.as_deref(), Some("Done.\n\nAll   tests pass."));
+        let brief = noted(&[prompt("go"), stop("Done."), prompt("next")]);
+        assert_eq!(brief.said, None);
+        let start = json!({"hook_event_name": "SessionStart", "source": "clear"});
+        assert_eq!(noted(&[prompt("go"), stop("Done."), start]).said, None);
+        let end = json!({"hook_event_name": "SessionEnd"});
+        let brief = noted(&[prompt("go"), stop("Done."), end]);
+        assert_eq!(brief.said.as_deref(), Some("Done."));
+        let blank = noted(&[prompt("go"), json!({"hook_event_name": "Stop"})]);
+        assert_eq!(blank.said, None);
+        assert_eq!(noted(&[prompt("go"), stop("  \n ")]).said, None);
+        assert_eq!(
+            serde_json::to_value(brief.summary()).unwrap()["said"],
+            json!("Done.")
+        );
+    }
+
+    #[test]
+    fn what_claude_said_hides_secrets_and_is_cut_short() {
+        let brief = noted(&[stop(
+            "key sk-gateway\ntoken abcdefghij0123456789ABCDEF\nhttps://bot:hunter2@example.com/r",
+        )]);
+        assert_eq!(
+            brief.said.as_deref(),
+            Some("key •••\ntoken •••\nhttps://***@example.com/r")
+        );
+        let long = noted(&[stop(&"word ".repeat(400))]).said.unwrap();
+        assert_eq!(long.chars().count(), SAID_LONGEST);
+        assert!(long.ends_with('…'));
+        let url = format!(
+            "{}https://bot:hunter2secret@example.com/r",
+            "a ".repeat(296)
+        );
+        let cut = noted(&[stop(&url)]).said.unwrap();
+        assert!(!cut.contains("hunter2"), "{cut}");
     }
 
     #[test]

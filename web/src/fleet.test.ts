@@ -273,6 +273,14 @@ describe("briefs", () => {
     expect(rows(early.workspaces[0])[0].now?.text).toBe("fix the login bug");
   });
 
+  it("keeps what Claude said at the end of a turn only for a session that is idle or finished", () => {
+    const said = "All done.";
+    const finished = [...records, terminal(ME, "t4", "w1"), session(ME, "s4", "w1", "t4", "finished"), terminal(ME, "t5", "w1"), session(ME, "s5", "w1", "t5", "failed")];
+    const all = Object.fromEntries(["s1", "s2", "s3", "s4", "s5"].map((id) => [id, { title: null, now: null, said }]));
+    const [machine] = fleet(finished, settings(), all);
+    expect(rows(machine.workspaces[0]).map((r) => r.said)).toEqual([undefined, said, undefined, said, undefined]);
+  });
+
   it("leaves a session with no brief, as a peer's is, as it was", () => {
     const [machine] = fleet(records, settings());
     expect(rows(machine.workspaces[0]).every((r) => r.title === undefined && r.now === undefined)).toBe(true);

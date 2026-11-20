@@ -219,6 +219,8 @@ export interface Step {
 export interface Brief {
   title: string | null;
   now: Step | null;
+  /** What Claude said when its last turn ended, its lines kept and cut short, until the next prompt. */
+  said?: string;
 }
 /** Briefs by session id: only this machine's sessions, since this daemon started. */
 export type Briefs = Record<string, Brief>;

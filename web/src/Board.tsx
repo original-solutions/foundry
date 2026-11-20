@@ -14,6 +14,7 @@ import { Composer, useCreateWorkspace } from "./Composer";
 import { plural, type Glyph } from "./labels";
 import { glyphText, StateGlyph } from "./StateGlyph";
 import { Named, Now } from "./Now";
+import { Said } from "./Said";
 import { pollEvery } from "./poll";
 import { Timeline } from "./Timeline";
 
@@ -250,6 +251,7 @@ function WorkspaceCard({ card, showMachine, onChanges }: { card: Card; showMachi
                 </span>
               </Link>
             </TerminalMenu>
+            {row.said && <Said said={row.said} name={row.name} terminal={row.terminal} canReply={row.glyph === "ready"} />}
           </li>
         ))}
         {rows.length > shown.length && <li className="px-2 py-1 text-xs text-neutral-500">+{rows.length - shown.length} more</li>}
