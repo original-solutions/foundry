@@ -22,6 +22,10 @@
 //! leaves the terminals closed and the worktree as it is. Only a forced archive passes `--force`
 //! to git, so without it git refuses whatever the checks missed.
 //!
+//! A create that dies after making its worktree and before writing its record leaves a worktree
+//! no record names. At start, [`Workspaces::sweep`] removes each such worktree that an unforced
+//! archive would remove, keeping its branch, and leaves and logs any other.
+//!
 //! Every branch is made by [`safe_branch`] and every path reaches git after `--`, so a name as
 //! typed never reads as an option and never leaves the project's folder of worktrees.
 
@@ -258,6 +262,16 @@ impl Workspaces {
         let body = self.inner.live(id).await?;
         Ok(self.inner.worktree(body.project, &body.branch))
     }
+
+    /// Deals with each worktree under `worktrees/<project>/` that no live workspace of this
+    /// machine names, as a create that died before writing its record leaves. One that passes
+    /// the checks of an unforced archive is removed without `--force` and its branch kept; any
+    /// other, or one git will not remove, is left as it is and logged with what holds it. A
+    /// worktree whose folder is gone is checked by the `HEAD` git keeps for it. Branches are
+    /// never touched. A clone whose worktrees cannot be listed is logged and passed over.
+    pub async fn sweep(&self) -> Result<(), WorkspaceError> {
+        self.inner.sweep().await
+    }
 }
 
 impl Inner {
@@ -405,6 +419,138 @@ impl Inner {
             self.remove_worktree(&clone, &listed, force).await?;
         }
         self.write(body, true).await
+    }
+
+    async fn sweep(&self) -> Result<(), WorkspaceError> {
+        let mut clones = match tokio::fs::read_dir(self.data.join("clones")).await {
+            Ok(clones) => clones,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        let me = self.me;
+        let live: Vec<Workspace> = self
+            .with_store(move |store| {
+                Ok(store
+                    .since(me, 0)?
+                    .into_iter()
+                    .filter_map(|record| match record {
+                        AnyRecord::Workspace(r) if !r.deleted => Some(r.body),
+                        _ => None,
+                    })
+                    .collect())
+            })
+            .await?;
+        while let Some(entry) = clones.next_entry().await? {
+            // Only `<project>.git`, as `clone_path` spells it, is a clone; one made half way is
+            // `<project>.partial`.
+            let name = entry.file_name();
+            let Some(project) = name
+                .to_str()
+                .and_then(|name| name.strip_suffix(".git"))
+                .and_then(|id| {
+                    uuid::Uuid::parse_str(id)
+                        .ok()
+                        .filter(|uuid| uuid.to_string() == id)
+                })
+                .map(ProjectId)
+            else {
+                continue;
+            };
+            let branches: Vec<&str> = live
+                .iter()
+                .filter(|w| w.project == project)
+                .map(|w| w.branch.as_str())
+                .collect();
+            if let Err(error) = self.sweep_project(project, &branches).await {
+                tracing::warn!(
+                    clone = %entry.path().display(),
+                    %error,
+                    "the clone's worktrees could not be listed to find what a failed create left"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// [`Workspaces::sweep`] for one project's clone, whose live workspaces are on `live`.
+    async fn sweep_project(&self, project: ProjectId, live: &[&str]) -> Result<(), WorkspaceError> {
+        let lock = self.lock(project);
+        let _held = lock.lock().await;
+        let clone = self.clone_path(project);
+        let list = self
+            .git(&clone, "worktree", ["list", "--porcelain", "-z"])
+            .await?;
+        let project_folder = project.to_string();
+        for (listed, branch) in worktrees_in(&list) {
+            // Only what a create makes, `worktrees/<project>/<branch>`, and never the clone.
+            let parent = listed.parent();
+            if parent.and_then(Path::file_name) != Some(OsStr::new(&project_folder))
+                || parent.and_then(Path::parent).and_then(Path::file_name)
+                    != Some(OsStr::new("worktrees"))
+            {
+                continue;
+            }
+            let Some(folder) = listed.file_name().and_then(OsStr::to_str) else {
+                continue;
+            };
+            if self
+                .named(project, &listed, folder, branch.as_deref(), live)
+                .await
+            {
+                continue;
+            }
+            let worktree = listed.display();
+            match self.refuse_dirty(&clone, &listed, folder).await {
+                Ok(()) => match self.remove_worktree(&clone, &listed, false).await {
+                    Ok(_) => tracing::info!(
+                        %worktree,
+                        "removed a worktree no workspace names, left by a failed create; its \
+                         branch is kept"
+                    ),
+                    Err(error) => tracing::warn!(
+                        %worktree,
+                        %error,
+                        "a worktree no workspace names could not be removed and is left as it is"
+                    ),
+                },
+                Err(WorkspaceError::Dirty(dirty)) => tracing::warn!(
+                    %worktree,
+                    uncommitted = ?dirty.uncommitted,
+                    unpushed = ?dirty.unpushed,
+                    submodules = ?dirty.submodules,
+                    "a worktree no workspace names holds work and is left as it is"
+                ),
+                Err(error) => tracing::warn!(
+                    %worktree,
+                    %error,
+                    "a worktree no workspace names could not be checked and is left as it is"
+                ),
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether a live workspace of `project`, one of whose branches is on `live`, names the
+    /// worktree git lists at `listed`, in `folder`, with `branch` checked out. Any doubt counts
+    /// as named: its branch is the one checked out, its folder's name is the same on a disk that
+    /// ignores case, or its folder is the same folder however each path is spelled.
+    async fn named(
+        &self,
+        project: ProjectId,
+        listed: &Path,
+        folder: &str,
+        branch: Option<&str>,
+        live: &[&str],
+    ) -> bool {
+        for name in live {
+            if branch == Some(*name)
+                || fold(name) == fold(folder)
+                || same_folder(listed, &self.worktree(project, name)).await
+            {
+                return true;
+            }
+        }
+        false
     }
 
     /// `git worktree remove`, passing `--force` only when `force`. Without it git refuses a
@@ -779,6 +925,32 @@ async fn setup(worktree: &Path) -> Option<Vec<String>> {
         }) if !provision.is_empty() => Some(sh(SETUP, provision)),
         Ok(_) => None,
         Err(e) => Some(unreadable(&e)),
+    }
+}
+
+/// Each worktree in the output of `git worktree list --porcelain -z`, as its path and the branch
+/// it has checked out, if any.
+fn worktrees_in(list: &str) -> Vec<(PathBuf, Option<String>)> {
+    let mut found: Vec<(PathBuf, Option<String>)> = Vec::new();
+    for field in list.split('\0') {
+        if let Some(path) = field.strip_prefix("worktree ") {
+            found.push((PathBuf::from(path), None));
+        } else if let Some(branch) = field.strip_prefix("branch refs/heads/")
+            && let Some((_, checked_out)) = found.last_mut()
+        {
+            *checked_out = Some(branch.to_owned());
+        }
+    }
+    found
+}
+
+/// Whether `a` and `b` are one folder on disk, however each is spelled. `false` when either
+/// cannot be read.
+async fn same_folder(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    match (tokio::fs::metadata(a).await, tokio::fs::metadata(b).await) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
     }
 }
 
