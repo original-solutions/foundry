@@ -210,7 +210,7 @@ describe("App", () => {
 
     const header = screen.getByLabelText("Open terminal");
     expect(await within(header).findByText("· fix the login bug")).toBeDefined();
-    expect(screen.getByRole("tab", { name: /fix login \/ fix the login bug/ })).toBeDefined();
+    expect(screen.getByRole("tab", { name: /fix the login bug/ })).toBeDefined();
     const sidebar = screen.getByRole("group", { name: "fix login" });
     expect(within(sidebar).getByText("Edit src/login.ts")).toBeDefined();
   });
@@ -391,7 +391,7 @@ describe("App", () => {
     arrive(session(ME, "s9", "w9", "t9", "starting"));
 
     await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t9"));
-    expect(screen.getAllByRole("tab").map((t) => t.textContent)).toEqual([expect.stringContaining("add search / opus"), expect.stringContaining("add search / shell")]);
+    expect(screen.getAllByRole("tab").map((t) => t.textContent)).toEqual([expect.stringMatching(/^opus/), expect.stringMatching(/^shell/)]);
     expect(screen.getAllByRole("tab")[0].getAttribute("aria-selected")).toBe("true");
   });
 
@@ -441,43 +441,66 @@ describe("App", () => {
     expect(screen.queryByRole("dialog", { name: "Jump to" })).toBeNull();
   });
 
-  it("keeps every terminal you open as a tab with its state, and a tab you go back to has not reconnected", async () => {
-    const router = await open("/terminals/t1", live);
-    fireEvent.click(screen.getByRole("link", { name: /^shell/ }));
-    await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t2"));
+  const two: UiMessage & { type: "state" } = {
+    ...live,
+    records: [...live.records, workspace(ME, "w2", "add search"), terminal(ME, "t5", "w2", "running"), session(ME, "s5", "w2", "t5", "idle", { model: "opus" })],
+  };
 
-    const strip = screen.getByRole("tablist", { name: "Open terminals" });
+  it("tabs the open workspace's terminals with their states, swaps them for another workspace's, and a tab you go back to has not reconnected", async () => {
+    const router = await open("/terminals/t1", two);
+    const strip = screen.getByRole("tablist", { name: "Terminals in fix login" });
     const tabs = within(strip).getAllByRole("tab");
-    expect(tabs.map((t) => t.textContent)).toEqual([expect.stringContaining("fix login / sonnet"), expect.stringContaining("fix login / shell")]);
-    expect(tabs[1].getAttribute("aria-selected")).toBe("true");
+    expect(tabs.map((t) => t.textContent)).toEqual([expect.stringMatching(/^sonnet/), expect.stringMatching(/^shell/)]);
+    expect(tabs[0].getAttribute("aria-selected")).toBe("true");
 
-    fireEvent.click(tabs[0]);
+    fireEvent.click(tabs[1]);
+    await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t2"));
+    fireEvent.click(within(screen.getByRole("group", { name: "add search" })).getByRole("link", { name: /^opus/ }));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t5"));
+    expect(within(screen.getByRole("tablist", { name: "Terminals in add search" })).getAllByRole("tab").map((t) => t.textContent)).toEqual([expect.stringMatching(/^opus/)]);
+
+    fireEvent.click(within(screen.getByRole("group", { name: "fix login" })).getByRole("link", { name: /^sonnet/ }));
     await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t1"));
     expect(sockets("/api/terminals/t1")).toHaveLength(1);
     expect(sockets("/api/terminals/t1")[0].readyState).not.toBe(FakeSocket.CLOSED);
-    expect(JSON.parse(localStorage.getItem("foundry.tabs")!)).toEqual(["t1", "t2"]);
+    expect(sockets("/api/terminals/t5")[0].readyState).not.toBe(FakeSocket.CLOSED);
+    expect(localStorage.getItem("foundry.tabs")).toBeNull();
+    expect(within(screen.getByRole("tablist", { name: "Terminals in fix login" })).getAllByRole("button").map((b) => b.getAttribute("aria-label"))).toEqual(["New in fix login"]);
   });
 
-  it("closes a tab to its neighbour and then to the board, leaving the terminal running", async () => {
-    const calls = mockActions();
+  it("starts a new shell in the open workspace from the tabs' + and opens it", async () => {
+    const calls = mockActions(json(201, { id: "t9" }));
     const router = await open("/terminals/t1", live);
-    fireEvent.click(screen.getByRole("link", { name: /^shell/ }));
-    await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t2"));
+    fireEvent.keyDown(within(screen.getByRole("tablist", { name: "Terminals in fix login" })).getByRole("button", { name: "New in fix login" }), { key: "Enter" });
+    const menu = await screen.findByRole("menu");
+    expect(within(menu).getAllByRole("menuitem").map((item) => item.textContent)).toEqual(["New session…", "New shell"]);
+    fireEvent.click(within(menu).getByRole("menuitem", { name: "New shell" }));
 
-    fireEvent.click(screen.getByRole("button", { name: "Close fix login / shell" }));
-    await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t1"));
-    expect(sockets("/api/terminals/t2")[0].readyState).toBe(FakeSocket.CLOSED);
-    fireEvent.click(screen.getByRole("button", { name: "Close fix login / sonnet" }));
-    await waitFor(() => expect(router.state.location.pathname).toBe("/"));
-    expect(screen.queryAllByRole("tab")).toHaveLength(0);
-    expect(calls).toEqual([]);
+    await waitFor(() => expect(calls).toEqual([{ url: "/api/workspaces/w1/shells", method: "POST", body: undefined }]));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t9"));
+  });
+
+  it("asks for a new session in the open workspace from the tabs' +", async () => {
+    await open("/terminals/t1", live);
+    fireEvent.keyDown(screen.getByRole("button", { name: "New in fix login" }), { key: "Enter" });
+    fireEvent.click(within(await screen.findByRole("menu")).getByRole("menuitem", { name: "New session…" }));
+    expect(await screen.findByRole("dialog", { name: "New session in fix login" })).toBeDefined();
+  });
+
+  it("offers no + on another machine's workspace, which only that machine can start terminals in", async () => {
+    await open("/terminals/t7", {
+      ...live,
+      records: [...live.records, sample(OTHER, 1), workspace(OTHER, "w7", "far away"), terminal(OTHER, "t7", "w7", "running"), terminal(OTHER, "t8", "w7", "running")],
+    });
+    expect(within(screen.getByRole("tablist", { name: "Terminals in far away" })).getAllByRole("tab")).toHaveLength(2);
+    expect(screen.queryByRole("button", { name: "New in far away" })).toBeNull();
   });
 
   it("marks a tab in the background whose state changed since you looked, until you look", async () => {
     const router = await open("/terminals/t1", live);
     fireEvent.click(screen.getByRole("link", { name: /^shell/ }));
     await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t2"));
-    const tab = () => screen.getByRole("tab", { name: /fix login \/ sonnet/ });
+    const tab = () => screen.getByRole("tab", { name: /^sonnet/ });
     expect(tab().getAttribute("data-changed")).toBeNull();
 
     const events = sockets("/api/events").at(-1)!;
@@ -495,13 +518,13 @@ describe("App", () => {
     const router = await open("/terminals/t1", live);
     fireEvent.click(screen.getByRole("link", { name: /^shell/ }));
     await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t2"));
-    fireEvent.click(screen.getByRole("tab", { name: /fix login \/ sonnet/ }));
+    fireEvent.click(screen.getByRole("tab", { name: /^sonnet/ }));
     await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t1"));
 
     const events = sockets("/api/events").at(-1)!;
     const gone: UiMessage = { type: "record", protocol: 1, record: terminal(ME, "t2", "w1", "exited", { deleted: true, version: 2 }) };
     act(() => events.deliver(JSON.stringify(gone)));
-    expect(screen.getAllByRole("tab").map((t) => t.textContent)).toEqual([expect.stringContaining("fix login / sonnet")]);
+    expect(screen.getAllByRole("tab").map((t) => t.textContent)).toEqual([expect.stringMatching(/^sonnet/)]);
     expect(sockets("/api/terminals/t2")[0].readyState).toBe(FakeSocket.CLOSED);
   });
 
@@ -547,7 +570,7 @@ describe("App", () => {
     const router = await open("/terminals/t1", live);
     fireEvent.click(screen.getByRole("link", { name: /^shell/ }));
     await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t2"));
-    fireEvent.click(screen.getByRole("tab", { name: /fix login \/ sonnet/ }));
+    fireEvent.click(screen.getByRole("tab", { name: /^sonnet/ }));
     await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t1"));
 
     fireEvent.keyDown(within(screen.getByLabelText("Open terminal")).getByRole("button", { name: "More" }), { key: "Enter" });
@@ -775,14 +798,6 @@ describe("App", () => {
     await waitFor(() => expect(panel.textContent).toMatch(/no changes since main/i));
   });
 
-  it("brings back the tabs this browser had open without attaching them until one is shown", async () => {
-    localStorage.setItem("foundry.tabs", JSON.stringify(["t1", "t2"]));
-    await open("/", live);
-
-    expect(screen.getAllByRole("tab")).toHaveLength(2);
-    expect(sockets("/api/terminals/t1")).toHaveLength(0);
-    expect(sockets("/api/terminals/t2")).toHaveLength(0);
-  });
   const three: UiMessage & { type: "state" } = { ...live, records: [...live.records, terminal(ME, "t3", "w1", "running")] };
 
   it("opens a second terminal beside the open one, and both stay attached and headed", async () => {
@@ -847,7 +862,7 @@ describe("App", () => {
     const router = await open("/terminals/t1", many);
     for (const id of ["t2", "t3", "t4", "t5", "t6", "t7"]) await visit(router, id);
 
-    expect(screen.getAllByRole("tab")).toHaveLength(7);
+    expect(screen.getAllByRole("tab")).toHaveLength(8);
     expect(screen.queryByTestId("pane-t1")).toBeNull();
     expect(live_("t1")).toHaveLength(0);
     for (const id of ["t2", "t3", "t4", "t5", "t6", "t7"]) expect(live_(id)).toHaveLength(1);
@@ -855,7 +870,7 @@ describe("App", () => {
     const events = sockets("/api/events").at(-1)!;
     const idle: UiMessage = { type: "record", protocol: 1, record: session(ME, "s1", "w1", "t1", "idle", { model: "sonnet", version: 2 }) };
     act(() => events.deliver(JSON.stringify(idle)));
-    const tab = screen.getByRole("tab", { name: /fix login \/ sonnet/ });
+    const tab = screen.getByRole("tab", { name: /^sonnet/ });
     expect(tab.getAttribute("data-changed")).toBe("true");
     expect(within(tab).getByText("Idle")).toBeDefined();
 
@@ -863,7 +878,7 @@ describe("App", () => {
     expect(sockets("/api/terminals/t1")).toHaveLength(2);
     expect(live_("t1")).toHaveLength(1);
     expect(live_("t2")).toHaveLength(0);
-    expect(screen.getByRole("tab", { name: /fix login \/ sonnet/ }).getAttribute("data-changed")).toBeNull();
+    expect(screen.getByRole("tab", { name: /^sonnet/ }).getAttribute("data-changed")).toBeNull();
   });
 
   it("never detaches the other side of a split, however many terminals pass through the focused side", async () => {

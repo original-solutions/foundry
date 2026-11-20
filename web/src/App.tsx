@@ -13,11 +13,11 @@ import { Sidebar } from "./Sidebar";
 import { StepsPanel, type StepsOf } from "./StepsPanel";
 import { TabStrip } from "./TabStrip";
 import { beside, follow, type Split } from "./split";
-import { loadTabs, saveTabs, touched, withoutTab, withTab } from "./tabs";
+import { touched, withoutTab } from "./tabs";
 import { TerminalHeader } from "./TerminalHeader";
 import { TerminalPane } from "./TerminalPane";
 import { TerminalActions } from "./TerminalMenu";
-import { fleet, locate, terminalRunning } from "./fleet";
+import { fleet, locate, rows, terminalRunning } from "./fleet";
 import { useShortcut } from "./shortcut";
 import { useBriefs } from "./useBriefs";
 import { machineQuery } from "./api";
@@ -30,9 +30,11 @@ import { AlertsButton, useAlerts } from "./AlertsBell";
  * open, then the terminal, with the sidebar as a drawer the header opens. Cmd+K (or Ctrl+K outside
  * the terminal, where the shell keeps it) opens the jump palette over everything.
  *
- * Every terminal opened becomes a tab above the header. The few tabs used last (and both sides of
- * a split) keep their pane attached behind the others, so going back to one is instant; an older
- * tab attaches again when shown and gets its screen and scrollback back from the holder.
+ * Above the header, the open workspace's terminals are tabs with their states, and a + starts
+ * another session or shell in it. The few terminals shown last (and both sides of a split) keep
+ * their pane attached behind the others, so going back to one is instant, from its tab or another
+ * workspace; an older one attaches again when shown and gets its screen and scrollback back from
+ * the holder.
  *
  * With nothing open, the board shows every workspace as a card with its live states and changes,
  * or, switched to its timeline, every session's turns on one clock; a turn opens its terminal
@@ -48,8 +50,7 @@ import { AlertsButton, useAlerts } from "./AlertsBell";
  * state and its workspaces.
  *
  * A workspace made from the new-workspace dialog (the sidebar, the board or the palette opens
- * it) is landed in: once its session shows up, its terminal opens, with the setup shell as a tab
- * beside it.
+ * it) is landed in: once its session shows up, its terminal opens, its setup shell a tab beside it.
  *
  * A workspace's changes since its base open as a sheet from the header or the workspace's row.
  *
@@ -70,7 +71,7 @@ import { AlertsButton, useAlerts } from "./AlertsBell";
  * Tab on it in the palette, lists what can be done with it: open, open beside, steps, changes, a
  * new session or shell in its workspace, and ending it. Ending a terminal that still
  * runs asks first; one that already ended is cleared at once, as are all of a workspace's ended
- * ones from its row. When the open terminal is gone, its neighbouring tab shows.
+ * ones from its row. When the open terminal is gone, its neighbouring tab shows, or the board.
  *
  * On a wide screen a second terminal can be shown beside the open one (the header's split button,
  * Cmd+\ or Shift+Enter in the palette), each with its own header. The URL names the side with the
@@ -117,66 +118,54 @@ function Layout() {
       : { kind: "shell", name: located.name };
 
   const gone = useMemo(() => new Set(state.records.flatMap((r) => (r.kind === "terminal" && r.deleted ? [r.body.id] : []))), [state.records]);
-  const [kept, setKept] = useState(loadTabs);
-  /** Tabs whose pane is attached, most recent first: the last few shown, and both sides of a split. */
+  /** Terminals whose pane is attached, most recent first: the last few shown, and both sides of a split. */
   const [attached, setAttached] = useState<string[]>([]);
-  /** The state each tab had when it was last shown. */
+  /** The state each terminal had when it was last shown. */
   const [seen, setSeen] = useState<Record<string, string>>({});
-  // Adjusted while rendering, so a terminal opened from anywhere is a tab in the same paint. Only
-  // on a change of terminal: closing the open tab must not bring it back before the URL moves on.
+  // Adjusted while rendering, so a terminal opened from anywhere is attached in the same paint.
   const [opened, setOpened] = useState<string>();
   if (terminalId !== opened) {
     setOpened(terminalId);
     const next = follow(split, opened, terminalId);
     setSplit(next);
-    if (terminalId && !gone.has(terminalId)) setKept(withTab(kept, terminalId));
     if (terminalId) setAttached(touched(attached, terminalId, next ? [next.left, next.right] : []));
   }
   if (terminalId && located && seen[terminalId] !== located.label) setSeen({ ...seen, [terminalId]: located.label });
+  const tabs = located ? rows(located.workspace) : [];
+  // The open workspace's tabs as last seen, so a terminal that goes knows its neighbours.
+  const [lastTabs, setLastTabs] = useState<string[]>([]);
+  if (located && tabs.map((t) => t.terminal).join() !== lastTabs.join()) setLastTabs(tabs.map((t) => t.terminal));
   // The open terminal was ended or archived: show its neighbouring tab, or the board.
   const [left, setLeft] = useState<{ from: string; to?: string }>();
   if (terminalId && gone.has(terminalId) && left?.from !== terminalId) {
-    setLeft({ from: terminalId, to: withoutTab(kept.filter((id) => id === terminalId || !gone.has(id)), terminalId).next });
+    setLeft({ from: terminalId, to: withoutTab(lastTabs.filter((id) => id === terminalId || !gone.has(id)), terminalId).next });
   }
   useEffect(() => {
     if (left) void navigate(left.to ? { to: "/terminals/$terminalId", params: { terminalId: left.to } } : { to: "/" });
   }, [left, navigate]);
-  if (kept.some((id) => gone.has(id))) setKept(kept.filter((id) => !gone.has(id)));
   if (attached.some((id) => id !== terminalId && gone.has(id))) setAttached(attached.filter((id) => id === terminalId || !gone.has(id)));
   if (split && (gone.has(split.left) || gone.has(split.right))) setSplit(undefined);
-  useEffect(() => saveTabs(kept), [kept]);
   const pair = split && terminalId && (split.left === terminalId || split.right === terminalId) ? split : undefined;
 
-  // Adjusted while rendering, like the tabs above: once the new session shows up, it and the
-  // workspace's setup shell become tabs, and the session is the one to open.
+  // Adjusted while rendering, like the panes above: once the new session shows up, it is opened.
   const [landed, setLanded] = useState<string>();
   const arrived = landing ? machines.flatMap((m) => m.workspaces).find((w) => w.sessions.some((s) => s.id === landing)) : undefined;
   if (arrived) {
     const session = arrived.sessions.find((s) => s.id === landing)!;
     setLanding(undefined);
-    setKept(arrived.shells.reduce((all, shell) => withTab(all, shell.id), withTab(kept, session.terminal)));
     setLanded(session.terminal);
   }
   useEffect(() => {
     if (landed) void navigate({ to: "/terminals/$terminalId", params: { terminalId: landed } });
   }, [landed, navigate]);
 
-  const changed = new Set(kept.filter((id) => seen[id] !== undefined && seen[id] !== locate(machines, id)?.label));
+  const changed = new Set(tabs.flatMap((t) => (seen[t.terminal] !== undefined && seen[t.terminal] !== t.label ? [t.terminal] : [])));
   const show = (id: string) => void navigate({ to: "/terminals/$terminalId", params: { terminalId: id } });
   const alerts = useAlerts(machines, state.synced, show);
   /** Ends the split by closing side `id`; the other side keeps or takes the keyboard. */
   const closePane = (id: string) => {
     setSplit(undefined);
     if (pair && id === terminalId) show(id === pair.left ? pair.right : pair.left);
-  };
-  const closeTab = (id: string) => {
-    const { tabs, next } = withoutTab(kept, id);
-    setKept(tabs);
-    setAttached(attached.filter((t) => t !== id));
-    if (pair && (id === pair.left || id === pair.right)) return closePane(id);
-    if (id !== terminalId) return;
-    if (next) show(next);
-    else void navigate({ to: "/" });
   };
   const openBeside = (id: string) => {
     if (!terminalId || id === terminalId) return;
@@ -264,12 +253,11 @@ function Layout() {
           </div>
           <main className={`${board ? "hidden md:flex" : "flex"} min-w-0 flex-1 flex-col`}>
             <TabStrip
-              machines={machines}
-              tabs={kept}
+              workspace={located?.workspace}
+              machine={located?.machine}
               active={terminalId}
               beside={pair && (pair.left === terminalId ? pair.right : pair.left)}
               changed={changed}
-              onClose={closeTab}
             />
             {terminalId && (
               <div className="flex shrink-0">
