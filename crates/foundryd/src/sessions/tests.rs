@@ -535,10 +535,11 @@ async fn a_first_prompt_is_in_no_argument_and_is_typed_as_one_prompt_once_the_ag
 #[tokio::test]
 async fn a_first_prompt_waits_for_the_session_to_start_though_a_screen_before_it_takes_input() {
     // The first input is a screen before the session starts, as the trust prompt is: it turns
-    // bracketed paste on before `SessionStart`.
-    let f =
-        Fixture::new("- wait_prompt\n- hook: {event: SessionStart}\n- wait_prompt\n- wait_input\n")
-            .await;
+    // bracketed paste on before `SessionStart`. The input box draws a moment after the hook.
+    let f = Fixture::new(
+        "- wait_prompt\n- hook: {event: SessionStart}\n- sleep_ms: 300\n- print: BOX\n- wait_prompt\n- wait_input\n",
+    )
+    .await;
     let id = start_on(&f, "fix the login").await;
     Shown::until(&f, id, |s| s.waits() == 1).await;
     // Time enough for a daemon that went by the sign alone to have typed the prompt into it.
@@ -546,6 +547,30 @@ async fn a_first_prompt_waits_for_the_session_to_start_though_a_screen_before_it
     type_keys(&f, id, b"yes\r").await;
     let shown = Shown::until(&f, id, |s| s.prompts().len() == 2).await;
     assert_eq!(shown.prompts(), ["yes", "fix the login"]);
+    // The earlier screen's sign does not count for the box: the paste waits for the box's own.
+    let drawn = shown.text.find("BOX").unwrap();
+    let pasted = shown.text.find("[200~").unwrap();
+    assert!(
+        drawn < pasted,
+        "typed before the box took input: {:?}",
+        shown.text
+    );
+}
+
+#[tokio::test]
+async fn a_first_prompt_after_an_earlier_screens_sign_is_typed_a_moment_after_the_session_starts() {
+    // The box gives no sign of its own: the earlier screen's still counts, after a grace.
+    let f = Fixture::new(
+        "- wait_prompt\n- hook: {event: SessionStart}\n- sleep_ms: 300\n- print: BOX\n- wait_input\n- print: TOOK\n- wait_input\n",
+    )
+    .await;
+    let id = start_on(&f, "fix the login").await;
+    Shown::until(&f, id, |s| s.waits() == 1).await;
+    type_keys(&f, id, b"yes\r").await;
+    let shown = Shown::until(&f, id, |s| s.text.contains("TOOK")).await;
+    let drawn = shown.text.find("BOX").unwrap();
+    let pasted = shown.text.find("[200~").unwrap();
+    assert!(drawn < pasted, "typed with no grace: {:?}", shown.text);
 }
 
 #[tokio::test]
