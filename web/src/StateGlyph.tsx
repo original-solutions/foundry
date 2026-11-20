@@ -28,17 +28,6 @@ export const glyphText: Record<Glyph, string> = {
   away: "text-neutral-500",
 };
 
-const pillBg: Record<Glyph, string> = {
-  starting: "bg-neutral-700/60",
-  working: "bg-sky-400/15",
-  waiting: "bg-amber-400/15",
-  ready: "bg-emerald-400/10",
-  done: "bg-neutral-700/60",
-  failed: "bg-red-500/15",
-  stuck: "bg-orange-400/15",
-  away: "bg-neutral-800",
-};
-
 /** How far each cell sits from the centre, in rings: the ripple's delay. */
 const ring = [2, 1, 2, 1, 0, 1, 2, 1, 2];
 
@@ -76,15 +65,5 @@ export function StateGlyph({ glyph, still = false }: { glyph: Glyph; still?: boo
         );
       })}
     </svg>
-  );
-}
-
-/** The state as a pill: its glyph and its label. */
-export function StatePill({ glyph, label }: { glyph: Glyph; label: string }) {
-  return (
-    <span className={`inline-flex shrink-0 items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-medium ${pillBg[glyph]} ${glyphText[glyph]}`}>
-      <StateGlyph glyph={glyph} />
-      <span>{label}</span>
-    </span>
   );
 }

@@ -12,7 +12,6 @@ import { NewSession } from "./NewSession";
 import { NewTask } from "./NewTask";
 import { Sidebar } from "./Sidebar";
 import { StepsPanel, type StepsOf } from "./StepsPanel";
-import { TabStrip } from "./TabStrip";
 import { beside, follow, type Split } from "./split";
 import { touched, withoutTab } from "./tabs";
 import { TerminalHeader } from "./TerminalHeader";
@@ -33,8 +32,8 @@ import { Away } from "./Away";
  * home, with a bar at the bottom that opens it, and an open terminal's header opens it too. Cmd+K (or Ctrl+K outside
  * the terminal, where the shell keeps it) opens the jump palette over everything.
  *
- * Above the header, the open workspace's terminals are tabs with their states, and a + starts
- * another session or shell in it. The few terminals shown last (and both sides of a split) keep
+ * One bar heads the terminal: its workspace, then the workspace's terminals as tabs with their
+ * states, and a + that starts another session or shell in it. The few terminals shown last (and both sides of a split) keep
  * their pane attached behind the others, so going back to one is instant, from its tab or another
  * workspace; an older one attaches again when shown and gets its screen and scrollback back from
  * the holder.
@@ -82,7 +81,7 @@ import { Away } from "./Away";
  * ones from its row. When the open terminal is gone, its neighbouring tab shows, or the board.
  *
  * On a wide screen a second terminal can be shown beside the open one (the header's split button,
- * Cmd+\ or Shift+Enter in the palette), each with its own header. The URL names the side with the
+ * Cmd+\ or Shift+Enter in the palette), each with its own bar and tabs. The URL names the side with the
  * keyboard; pressing in the other side moves it there, and a terminal opened from anywhere takes
  * the side that has it. On a narrow screen only that side shows.
  *
@@ -167,7 +166,10 @@ function Layout() {
     if (landed) void navigate({ to: "/terminals/$terminalId", params: { terminalId: landed } });
   }, [landed, navigate]);
 
-  const changed = new Set(tabs.flatMap((t) => (seen[t.terminal] !== undefined && seen[t.terminal] !== t.label ? [t.terminal] : [])));
+  // Any workspace's terminals, so each side of a split marks its own tabs.
+  const changed = new Set(
+    machines.flatMap((m) => m.workspaces.flatMap((w) => rows(w).flatMap((t) => (seen[t.terminal] !== undefined && seen[t.terminal] !== t.label ? [t.terminal] : [])))),
+  );
   const show = (id: string) => void navigate({ to: "/terminals/$terminalId", params: { terminalId: id } });
   const { spoken, ...alerts } = useAlerts(machines, state.synced, show);
   /** Whether the list of keys is open. */
@@ -265,13 +267,6 @@ function Layout() {
             />
           </div>
           <main className="flex min-w-0 flex-1 flex-col">
-            <TabStrip
-              workspace={located?.workspace}
-              machine={located?.machine}
-              active={terminalId}
-              beside={pair && (pair.left === terminalId ? pair.right : pair.left)}
-              changed={changed}
-            />
             {terminalId && (
               <div className="flex shrink-0">
                 {(pair ? [pair.left, pair.right] : [terminalId]).map((id) => (
@@ -290,6 +285,7 @@ function Layout() {
                       onSplit={pair ? undefined : () => setJump("beside")}
                       onClosePane={pair ? () => closePane(id) : undefined}
                       beside={id !== terminalId}
+                      changed={changed}
                     />
                   </div>
                 ))}

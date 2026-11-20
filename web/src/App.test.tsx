@@ -185,14 +185,22 @@ describe("App", () => {
     expect(screen.getByRole("status").textContent).toContain("Back after");
   });
 
-  it("heads the open terminal with its workspace, its name, its machine and its state", async () => {
+  it("heads the open terminal with one bar: its workspace and machine, then its terminals as tabs, the open one with its state", async () => {
     await open("/terminals/t1", live);
 
     const header = screen.getByLabelText("Open terminal");
     expect(within(header).getByText("fix login")).toBeDefined();
-    expect(within(header).getByText("sonnet")).toBeDefined();
     expect(within(header).getByText("studio")).toBeDefined();
-    expect(within(header).getByText("Working")).toBeDefined();
+    // The tabs are in the bar, not a second row above it, and the open tab carries the state.
+    expect(screen.getAllByRole("tablist")).toEqual([within(header).getByRole("tablist", { name: "Terminals in fix login" })]);
+    const open_ = within(header).getByRole("tab", { selected: true });
+    expect(open_.textContent).toMatch(/^sonnet/);
+    expect(within(open_).getByText("Working")).toBeDefined();
+    // Nothing else in the bar repeats the terminal's name or state.
+    expect(within(header).getAllByText("sonnet")).toHaveLength(1);
+    expect(within(header).getAllByText("Working")).toHaveLength(1);
+    // The sidebar beside it already has the way to jump; a phone, without the sidebar, keeps it in the bar.
+    expect(within(header).getByRole("button", { name: "Jump to" }).className).toMatch(/(^| )md:hidden( |$)/);
   });
 
   it("gives the header's Changes and Steps buttons the shared button look, Steps with its pressed look", async () => {
@@ -208,14 +216,13 @@ describe("App", () => {
     expect(missing(steps, `${button} ${pressed}`)).toEqual([]);
   });
 
-  it("names the open session by its first prompt in the header, the tab and the sidebar, and says what it is doing", async () => {
+  it("names the open session by its first prompt on its tab in the header and in the sidebar, and says what it is doing", async () => {
     briefs = { s1: { title: "fix the login bug", now: { kind: "tool", tool: "Edit", text: "Edit src/login.ts" } } };
     mockActions();
     await open("/terminals/t1", live);
 
     const header = screen.getByLabelText("Open terminal");
-    expect(await within(header).findByText("· fix the login bug")).toBeDefined();
-    expect(screen.getByRole("tab", { name: /fix the login bug/ })).toBeDefined();
+    expect(await within(header).findByRole("tab", { name: /fix the login bug/, selected: true })).toBeDefined();
     const sidebar = screen.getByRole("group", { name: "fix login" });
     expect(within(sidebar).getByText("Edit src/login.ts")).toBeDefined();
   });
@@ -959,11 +966,16 @@ describe("App", () => {
     expect(within(screen.getByLabelText("Terminal beside")).getByText("sonnet")).toBeDefined();
     expect(sockets("/api/terminals/t1")[0].readyState).not.toBe(FakeSocket.CLOSED);
     expect(sockets("/api/terminals/t2")).toHaveLength(1);
-    expect(screen.getAllByRole("tab").map((t) => t.getAttribute("data-beside"))).toEqual(["true", null]);
+    // Each side's bar tabs its own workspace's terminals and selects its own, as an editor's two groups do.
+    const selected = (label: string) => within(within(screen.getByLabelText(label)).getByRole("tablist", { name: "Terminals in fix login" })).getByRole("tab", { selected: true });
+    expect(selected("Open terminal").textContent).toMatch(/^shell/);
+    expect(selected("Terminal beside").textContent).toMatch(/^sonnet/);
   });
 
   it("moves focus to the pane you press in, shows a tab you pick in the focused side, and closes a side to one", async () => {
     const router = await open("/terminals/t1", three);
+    /** What a side's bar heads: its selected tab. */
+    const heads = (side: string) => within(screen.getByLabelText(side)).getByRole("tab", { selected: true }).textContent;
     fireEvent.keyDown(window, { key: "k", metaKey: true });
     const palette = await screen.findByRole("dialog", { name: "Jump to" });
     fireEvent.change(within(palette).getByRole("combobox"), { target: { value: "shell" } });
@@ -973,7 +985,7 @@ describe("App", () => {
 
     fireEvent.pointerDown(screen.getByTestId("pane-t1"));
     await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t1"));
-    expect(within(screen.getByLabelText("Terminal beside")).getByText("shell")).toBeDefined();
+    expect(heads("Terminal beside")).toMatch(/^shell/);
 
     fireEvent.keyDown(window, { key: "k", metaKey: true });
     const again = await screen.findByRole("dialog", { name: "Jump to" });
@@ -982,8 +994,8 @@ describe("App", () => {
     fireEvent.keyDown(input, { key: "ArrowDown" });
     fireEvent.keyDown(input, { key: "Enter" });
     await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t3"));
-    expect(within(screen.getByLabelText("Terminal beside")).getByText("shell")).toBeDefined();
-    expect(screen.queryByText("sonnet", { selector: "header *" })).toBeNull();
+    expect(heads("Terminal beside")).toMatch(/^shell/);
+    expect(heads("Open terminal")).toMatch(/^shell/);
     expect(sockets("/api/terminals/t1")[0].readyState).not.toBe(FakeSocket.CLOSED);
 
     fireEvent.click(within(screen.getByLabelText("Terminal beside")).getByRole("button", { name: "Close pane" }));

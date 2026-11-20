@@ -1,7 +1,7 @@
-import { render, screen } from "@testing-library/react";
+import { render } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import type { Glyph } from "./labels";
-import { shapes, StateGlyph, StatePill } from "./StateGlyph";
+import { shapes, StateGlyph } from "./StateGlyph";
 
 const glyphs: Glyph[] = ["starting", "working", "waiting", "ready", "done", "failed", "stuck", "away"];
 
@@ -41,12 +41,5 @@ describe("StateGlyph", () => {
     const all = [...container.querySelectorAll("circle")];
     expect(all.some((d) => d.getAttribute("class")?.includes("animate-ripple"))).toBe(false);
     expect(all.map((d) => (d.dataset.lit ? "#" : ".")).join("")).toBe(shapes.working);
-  });
-
-  it("is decoration: the pill says the state in words", () => {
-    render(<StatePill glyph="stuck" label="Stuck" />);
-    const svg = screen.getByText("Stuck").parentElement?.querySelector("svg");
-    expect(svg?.getAttribute("aria-hidden")).toBe("true");
-    expect(svg?.dataset.glyph).toBe("stuck");
   });
 });

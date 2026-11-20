@@ -9,21 +9,24 @@ import { jumpKey, SearchIcon } from "./JumpPalette";
 import { button, pressed } from "./Modal";
 import { NextSteps, offersNext } from "./NextSteps";
 import { reply } from "./Said";
-import { StatePill } from "./StateGlyph";
 import { StepsIcon } from "./StepsPanel";
+import { TabStrip } from "./TabStrip";
 import { TerminalMenuButton } from "./TerminalMenu";
 
 /** The key that opens a terminal beside the open one, or closes the split. */
 export const splitKey = jumpKey === "⌘K" ? "⌘\\" : "Ctrl \\";
 
 /**
- * The bar above a terminal: which workspace and terminal it is, the machine it runs on and its
- * state, and the ways into the workspace's changes, the session's steps, finding text in it and a menu with the rest, ending it included. On a narrow screen it holds the button that
- * opens the sidebar as a drawer. On a wide one it opens another terminal beside this one, or, in
- * a split, closes its own side. In a split the side with the keyboard has a lit edge; the other
- * is dimmed. An idle session of this machine offers its workspace's next steps (commit, open a
- * pull request, fix failing checks) beside its name, each sent to it as a prompt; with a mouse on
- * a wide screen and outside a split only, where the header has room (a phone's key bar offers them).
+ * The one bar above a terminal: its workspace and the machine it runs on, then the workspace's
+ * terminals as tabs (the open one with its state), and the ways into the workspace's changes, the
+ * session's steps, finding text in it and a menu with the rest, ending it included. On a narrow
+ * screen it holds the button that opens the sidebar as a drawer, and the way to jump that the
+ * sidebar holds on a wide one. On a wide one it opens another terminal beside this one, or, in a
+ * split, closes its own side. In a split each side has its bar; the side with the keyboard has a
+ * lit edge and the other is dimmed. An idle session of this machine offers its workspace's next
+ * steps (commit, open a pull request, fix failing checks) in the bar, each sent to it as a prompt;
+ * with a mouse on a wide screen and outside a split only, where the bar has room (a phone's key
+ * bar offers them).
  */
 export function TerminalHeader({
   id,
@@ -39,6 +42,7 @@ export function TerminalHeader({
   onSplit,
   onClosePane,
   beside = false,
+  changed = none,
 }: {
   /** The terminal it heads, for its menu. */
   id?: string;
@@ -60,12 +64,14 @@ export function TerminalHeader({
   onClosePane?: () => void;
   /** This is the side of a split without the keyboard: dimmed, and hidden on a narrow screen. */
   beside?: boolean;
+  /** Terminals whose state changed in the background since they were last shown. */
+  changed?: Set<string>;
 }) {
   const { data: here } = useQuery(machineQuery);
   return (
     <header
       aria-label={beside ? "Terminal beside" : "Open terminal"}
-      className={`relative h-11 min-w-0 flex-1 items-center gap-3 border-b border-neutral-800 bg-neutral-900 px-3 text-sm ${beside ? "hidden opacity-60 transition-opacity hover:opacity-100 md:flex" : "flex"}`}
+      className={`relative min-h-11 min-w-0 flex-1 flex-wrap items-center gap-x-3 border-b border-neutral-800 bg-neutral-900 px-3 text-sm ${onClosePane ? "" : "md:flex-nowrap"} ${beside ? "hidden opacity-60 transition-opacity hover:opacity-100 md:flex" : "flex"}`}
     >
       {onClosePane && !beside && <span aria-hidden="true" className="absolute inset-x-0 bottom-0 h-0.5 bg-sky-400/70" />}
       <button
@@ -74,7 +80,7 @@ export function TerminalHeader({
         aria-controls="sidebar"
         aria-expanded={drawerOpen}
         onClick={onMenu}
-        className="-ml-1 rounded p-1.5 text-neutral-300 hover:bg-neutral-800 md:hidden"
+        className="-ml-1 shrink-0 rounded p-1.5 text-neutral-300 hover:bg-neutral-800 md:hidden"
       >
         <svg viewBox="0 0 16 16" className="size-4" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
           <path d="M2 4h12M2 8h12M2 12h12" strokeLinecap="round" />
@@ -82,25 +88,20 @@ export function TerminalHeader({
       </button>
       {located ? (
         <>
-          <div className="flex min-w-0 flex-1 items-baseline gap-1.5">
-            <span className="truncate font-medium text-neutral-100">{located.workspace.name}</span>
-            <span className="text-neutral-600">/</span>
-            <span className="shrink-0 text-neutral-300">{located.name}</span>
-            {located.title && (
-              <span className="hidden min-w-0 truncate text-neutral-400 sm:inline" title={located.title}>
-                · {located.title}
-              </span>
-            )}
-            <span className="ml-2 hidden min-w-0 truncate text-xs text-neutral-500 sm:inline" title={`Runs on ${located.machine.name}`}>
+          <div className={`flex h-11 min-w-0 shrink items-center gap-2 ${onClosePane ? "flex-1" : "max-md:flex-1 md:max-w-64"}`}>
+            <span className="truncate font-medium text-neutral-100" title={`${located.workspace.branch} · ${located.workspace.project}`}>
+              {located.workspace.name}
+            </span>
+            <span className="hidden shrink-0 text-xs text-neutral-500 sm:inline" title={`Runs on ${located.machine.name}`}>
               {located.machine.name}
             </span>
           </div>
+          {id ? <TabStrip workspace={located.workspace} machine={located.machine} active={id} changed={changed} apart={!!onClosePane} /> : <span className="flex-1" />}
           {id && !onClosePane && offersNext(located, here) && (
             <div className="hidden xl:pointer-fine:contents">
               <NextSteps workspace={located.workspace.id} name={located.name} send={(prompt) => reply(id, prompt)} look="header" />
             </div>
           )}
-          <StatePill glyph={located.glyph} label={located.label} />
           <ChangesButton workspace={located.workspace.id} onClick={() => onChanges(located.workspace.id)} />
           {onSteps && (
             <button
@@ -165,13 +166,15 @@ export function TerminalHeader({
         aria-label="Jump to"
         title={`Jump to (${jumpKey})`}
         onClick={onJump}
-        className="-mr-1 rounded p-1.5 text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200"
+        className="-mr-1 shrink-0 rounded p-1.5 text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200 md:hidden"
       >
         <SearchIcon className="size-4" />
       </button>
     </header>
   );
 }
+
+const none = new Set<string>();
 
 /** How often the header reads a workspace's changes again, once they have been opened. */
 const HEADER_EVERY = 15_000;
