@@ -78,7 +78,7 @@ pub const GATEWAY_MANAGEMENT: &str = "gateway-management";
 /// only by the service user. In a debug build `FOUNDRY_SECRETS=file` picks the file on every
 /// OS, which is how tests keep out of the keychain. A release build ignores it.
 pub fn for_this_machine(home: &Path) -> Arc<dyn Secrets> {
-    store_for(home, std::env::var_os("FOUNDRY_SECRETS").as_deref())
+    store_for(home, store(std::env::var_os("FOUNDRY_SECRETS").as_deref()))
 }
 
 /// Whether this build takes `FOUNDRY_SECRETS`: only a debug build, so a release Mac always
@@ -102,9 +102,14 @@ fn choose(choice: Option<&OsStr>, taken: bool) -> Store {
     }
 }
 
-/// [`for_this_machine`] given the value of `FOUNDRY_SECRETS`.
-fn store_for(home: &Path, choice: Option<&OsStr>) -> Arc<dyn Secrets> {
-    match choose(choice, OVERRIDE) {
+/// The store this build picks for a `FOUNDRY_SECRETS` value.
+fn store(choice: Option<&OsStr>) -> Store {
+    choose(choice, OVERRIDE)
+}
+
+/// The secret store of kind `store` for the data directory `home`.
+fn store_for(home: &Path, store: Store) -> Arc<dyn Secrets> {
+    match store {
         Store::File => Arc::new(FileSecrets::new(home.join("secrets.json"))),
         #[cfg(target_os = "macos")]
         Store::Keychain => Arc::new(Keychain::new("foundry", home.join("secrets.lock"))),
@@ -765,7 +770,7 @@ mod tests {
     #[test]
     fn the_file_choice_keeps_secrets_in_secrets_json_under_home() {
         let dir = tempfile::tempdir().unwrap();
-        let store = store_for(dir.path(), Some(std::ffi::OsStr::new("file")));
+        let store = store_for(dir.path(), Store::File);
         store.set("gateway", "sk-one").unwrap();
         let held = FileSecrets::new(dir.path().join("secrets.json"));
         assert_eq!(held.get("gateway").unwrap().as_deref(), Some("sk-one"));
@@ -803,9 +808,22 @@ mod tests {
         }
     }
 
+    /// The store `for_this_machine` picks with `FOUNDRY_SECRETS=file` in a debug build, the
+    /// one the tests run.
+    #[cfg(debug_assertions)]
     #[test]
-    fn only_a_debug_build_takes_the_override() {
-        assert_eq!(OVERRIDE, cfg!(debug_assertions));
+    fn this_debug_build_takes_foundry_secrets() {
+        use std::ffi::OsStr;
+        assert_eq!(store(Some(OsStr::new("file"))), Store::File);
+    }
+
+    /// The same in a release build, which ignores it. The gate runs debug builds only; run
+    /// `cargo test --release -p foundryd --lib secrets` to check this one.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn this_release_build_ignores_foundry_secrets() {
+        use std::ffi::OsStr;
+        assert_eq!(store(Some(OsStr::new("file"))), os_default());
     }
 
     fn os_default() -> Store {

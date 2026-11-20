@@ -3,6 +3,13 @@
 //! test uses its own data directory, a free port and the file secret store, never the
 //! defaults or the login keychain.
 
+// A release build ignores `FOUNDRY_SECRETS`, so on macOS these runs of the binary would use
+// the login keychain.
+#[cfg(all(target_os = "macos", not(debug_assertions)))]
+compile_error!(
+    "run these tests in a debug build: a release build on macOS uses the login keychain"
+);
+
 use std::fs;
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt as _;

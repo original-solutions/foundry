@@ -2,6 +2,13 @@
 //! stores a gateway key without printing it. Every test that runs the binary uses the file
 //! secret store and a temporary data directory, never the login keychain.
 
+// A release build ignores `FOUNDRY_SECRETS`, so on macOS these runs of the binary would use
+// the login keychain.
+#[cfg(all(target_os = "macos", not(debug_assertions)))]
+compile_error!(
+    "run these tests in a debug build: a release build on macOS uses the login keychain"
+);
+
 use std::io::Write as _;
 use std::process::{Command, Output, Stdio};
 
