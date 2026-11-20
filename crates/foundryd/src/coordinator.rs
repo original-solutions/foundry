@@ -1038,4 +1038,64 @@ mod tests {
         assert!(out.overwritten.is_empty());
         assert_eq!(out.projects.len(), 1);
     }
+
+    /// `base()` at `seq` with `projects`, none of them stamped.
+    fn unstamped(seq: u64, projects: Vec<Project>) -> SharedSettings {
+        SharedSettings {
+            seq,
+            projects,
+            ..base()
+        }
+    }
+
+    #[test]
+    fn an_older_unstamped_copy_does_not_bring_back_a_removed_project() {
+        let newer = unstamped(8, vec![]);
+        let older = unstamped(7, vec![project(7, "p")]);
+        let out = merged(&newer, &older);
+        assert_eq!(project_named(&out, 7), None);
+        assert!(out.overwritten.is_empty());
+    }
+
+    #[test]
+    fn of_two_unstamped_copies_the_newer_one_names_a_project() {
+        // The older name sorts higher as JSON text, so only the seq can pick the newer one.
+        let newer = unstamped(8, vec![project(7, "a-new")]);
+        let older = unstamped(7, vec![project(7, "z-old")]);
+        let out = merged(&newer, &older);
+        assert_eq!(project_named(&out, 7).as_deref(), Some("a-new"));
+        assert!(out.overwritten.is_empty());
+    }
+
+    #[test]
+    fn unstamped_copies_at_one_seq_merge_by_value_in_either_order() {
+        let a = unstamped(7, vec![project(7, "a")]);
+        let b = unstamped(7, vec![project(7, "b")]);
+        let out = merged(&a, &b);
+        assert_eq!(project_named(&out, 7).as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn three_unstamped_copies_merge_to_the_newest_in_every_order() {
+        let c6 = unstamped(6, vec![project(5, "five"), project(7, "m")]);
+        let c7 = unstamped(7, vec![project(7, "z")]);
+        let c8 = unstamped(8, vec![project(7, "a")]);
+        let copies = [&c6, &c7, &c8];
+        let mut results = Vec::new();
+        for (x, y, z) in [
+            (0, 1, 2),
+            (0, 2, 1),
+            (1, 0, 2),
+            (1, 2, 0),
+            (2, 0, 1),
+            (2, 1, 0),
+        ] {
+            let (x, y, z) = (copies[x], copies[y], copies[z]);
+            results.push(merge(&merge(x, y), z));
+            results.push(merge(x, &merge(y, z)));
+        }
+        for out in &results {
+            assert_eq!(out, &c8, "the merge depends on its order");
+        }
+    }
 }
