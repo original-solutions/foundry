@@ -451,6 +451,7 @@ fn put(settings: &mut SharedSettings, key: &StampKey, value: Option<Value>, stam
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::time::Duration;
 
     use foundry_proto::ids::{MachineId, ProjectId};
     use foundry_proto::settings::{
@@ -554,6 +555,85 @@ mod tests {
         );
         assert_eq!(merge(&ab, &ab), ab, "a merge with itself changes it");
         ab
+    }
+
+    // --- what a waiting edit does next ---
+
+    const EARLY: Duration = Duration::from_secs(1);
+
+    #[test]
+    fn the_acting_machine_numbers_once_caught_up_or_after_the_offline_limit() {
+        let (held, all) = (base(), reachable(&[id(A), id(B)]));
+        assert_eq!(
+            next(id(A), None, &held, &all, false, true, EARLY),
+            Next::Number
+        );
+        assert_eq!(
+            next(id(A), None, &held, &all, false, false, EARLY),
+            Next::Wait
+        );
+        let late = OFFLINE_AFTER;
+        assert_eq!(
+            next(id(A), None, &held, &all, false, false, late),
+            Next::Number
+        );
+        // A forwarded edit is numbered the same way.
+        let from = Some(id(B));
+        assert_eq!(
+            next(id(A), from, &held, &all, false, true, EARLY),
+            Next::Number
+        );
+    }
+
+    #[test]
+    fn an_edit_on_a_machine_that_does_not_act_goes_to_the_one_that_does() {
+        let (held, all) = (base(), reachable(&[id(A), id(B)]));
+        assert_eq!(
+            next(id(B), None, &held, &all, false, false, EARLY),
+            Next::Send(id(A))
+        );
+        let other = Some(id(9));
+        assert_eq!(
+            next(id(B), other, &held, &all, false, false, EARLY),
+            Next::Send(id(A))
+        );
+        // With the first machine out of reach, the next one acts.
+        let alone = reachable(&[id(B)]);
+        assert_eq!(
+            next(id(B), None, &held, &alone, false, true, EARLY),
+            Next::Number
+        );
+    }
+
+    #[test]
+    fn an_edit_from_the_acting_machine_waits_until_it_sends_a_copy_or_the_offline_limit() {
+        let (held, all) = (base(), reachable(&[id(A), id(B)]));
+        let from = Some(id(A));
+        assert_eq!(
+            next(id(B), from, &held, &all, false, true, EARLY),
+            Next::Wait
+        );
+        assert_eq!(
+            next(id(B), from, &held, &all, true, true, EARLY),
+            Next::Send(id(A))
+        );
+        let late = OFFLINE_AFTER;
+        assert_eq!(
+            next(id(B), from, &held, &all, false, true, late),
+            Next::Send(id(A))
+        );
+    }
+
+    #[test]
+    fn a_copy_from_the_sender_that_hands_this_machine_the_role_numbers_the_edit_here() {
+        // The sender's copy, counted as a copy since the edit arrived, put this machine first.
+        let mut held = base();
+        held.priority = vec![id(B), id(A)];
+        let all = reachable(&[id(A), id(B)]);
+        assert_eq!(
+            next(id(B), Some(id(A)), &held, &all, true, true, EARLY),
+            Next::Number
+        );
     }
 
     #[test]
