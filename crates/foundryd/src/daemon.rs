@@ -26,6 +26,8 @@ use tokio::task::{AbortHandle, JoinSet};
 use tracing_subscriber::EnvFilter;
 
 use crate::api::{self, Api, BindError};
+use crate::attention::Attention;
+use crate::gateway;
 use crate::join::{self, JoinError, KeyedDialer, Keys};
 use crate::machine;
 use crate::secrets::{self, GATEWAY, SecretsError};
@@ -266,8 +268,20 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
         sessions.clone(),
         host_names(),
     );
+    let gateway_reader = Arc::new(gateway::Reader::new(
+        std::env::var("FOUNDRY_GATEWAY_URL").ok(),
+        secrets.clone(),
+    ));
+    let attention = Arc::new(
+        Attention::new(me, store.clone(), peers.clone(), coordinator.clone())
+            .with_source(gateway_reader.clone()),
+    );
+    let attention_routes = attention
+        .router()
+        .layer(middleware::from_fn_with_state(api.clone(), api::same_site));
     let mut app = api::router(api)
         .merge(sessions.router())
+        .merge(attention_routes)
         .merge(ws::keyed_router(peers.clone(), keys.clone()));
     if let Some(missing) = missing {
         app = refuse_sessions(app, missing);
@@ -294,6 +308,7 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
     services.spawn(named("the API server", serve_on(listener, app.clone())));
     services.spawn(named("the Tailscale address watch", tailscale.watch()));
     services.spawn(named("updates", update::run(home.clone())));
+    services.spawn(named("gateway health", gateway_reader.run()));
 
     tokio::select! {
         _ = terminate.recv() => tracing::info!("SIGTERM: stopping; terminals keep running"),

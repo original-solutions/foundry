@@ -909,13 +909,14 @@ fn a_waiting_for_you_item_is_listed_within_5_seconds_of_the_hook() {
         .set("gateway", "sk-test-waiting-0123456789")
         .unwrap();
     fixture.gateway_url = Some("http://gw.invalid:8317".into());
-    // `claude` is the fake agent: it asks for permission at once, then waits.
+    // `claude` is the fake agent: it starts a turn and asks for permission at once, then
+    // waits.
     let bin = fixture.user.path().join("bin");
     fs::create_dir_all(&bin).unwrap();
     let script = fixture.user.path().join("agent.yaml");
     fs::write(
         &script,
-        "- hook: {event: SessionStart}\n- hook: {event: Notification, message: \"Claude needs your permission to use Bash\"}\n- sleep_ms: 600000\n",
+        "- hook: {event: UserPromptSubmit, prompt: \"tidy up\"}\n- hook: {event: Notification, message: \"Claude needs your permission to use Bash\"}\n- sleep_ms: 600000\n",
     )
     .unwrap();
     let agent = Path::new(env!("CARGO_BIN_EXE_foundryd")).with_file_name("foundry-fake-agent");
