@@ -10,7 +10,6 @@ export function NewSession({ workspace, name }: { workspace: string; name: strin
   const [open, setOpen] = useState(false);
   const start = useMutation({
     mutationFn: (model: string) => startSession(workspace, model),
-    onSuccess: () => setOpen(false),
   });
   const change = (next: boolean) => {
     setOpen(next);
@@ -29,7 +28,8 @@ export function NewSession({ workspace, name }: { workspace: string; name: strin
             className="mt-3 space-y-3"
             onSubmit={(event) => {
               event.preventDefault();
-              start.mutate(String(new FormData(event.currentTarget).get("model")));
+              // Given per call, so a call the dialog was reset from cannot close it.
+              start.mutate(String(new FormData(event.currentTarget).get("model")), { onSuccess: () => setOpen(false) });
             }}
           >
             <label className="block">

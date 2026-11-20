@@ -25,9 +25,6 @@ export function CreateWorkspace({ projects }: { projects: Project[] }) {
       }
       return workspace.error ?? null;
     },
-    onSuccess: (warning) => {
-      if (!warning) setOpen(false);
-    },
   });
   const warning = create.data ?? null;
   // Once the workspace exists, a second create would only find its name taken, so the dialog
@@ -53,12 +50,20 @@ export function CreateWorkspace({ projects }: { projects: Project[] }) {
             onSubmit={(event) => {
               event.preventDefault();
               const form = new FormData(event.currentTarget);
-              create.mutate({
-                project: String(form.get("project")),
-                base: String(form.get("base")),
-                name: String(form.get("name")),
-                model: String(form.get("model")),
-              });
+              create.mutate(
+                {
+                  project: String(form.get("project")),
+                  base: String(form.get("base")),
+                  name: String(form.get("name")),
+                  model: String(form.get("model")),
+                },
+                // Given per call, so a call the dialog was reset from cannot close it.
+                {
+                  onSuccess: (warning) => {
+                    if (!warning) setOpen(false);
+                  },
+                },
+              );
             }}
           >
             {projects.length === 0 ? (

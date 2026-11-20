@@ -14,11 +14,15 @@ export function ArchiveButton({ workspace, name }: { workspace: string; name: st
   const [blockers, setBlockers] = useState<Blockers | null>(null);
   const archive = useMutation({
     mutationFn: (force: boolean) => archiveWorkspace(workspace, force),
-    onSuccess: (held) => {
-      setBlockers(held);
-      if (!held) setOpen(false);
-    },
   });
+  // Given per call, so a call the dialog was reset from cannot change it.
+  const run = (force: boolean) =>
+    archive.mutate(force, {
+      onSuccess: (held) => {
+        setBlockers(held);
+        if (!held) setOpen(false);
+      },
+    });
   const change = (next: boolean) => {
     setOpen(next);
     setBlockers(null);
@@ -51,7 +55,7 @@ export function ArchiveButton({ workspace, name }: { workspace: string; name: st
           )}
           <div className="mt-4 flex justify-end gap-2">
             <Dialog.Close className={button}>Cancel</Dialog.Close>
-            <button type="button" className={button} onClick={() => archive.mutate(blockers !== null)} disabled={archive.isPending}>
+            <button type="button" className={button} onClick={() => run(blockers !== null)} disabled={archive.isPending}>
               {blockers ? "Archive anyway" : "Archive"}
             </button>
           </div>
