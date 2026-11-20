@@ -1,4 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
+import { useLeaving } from "./Archive";
 import { changesQuery } from "./ChangesPanel";
 import { findKey } from "./FindBar";
 import { totals } from "./changes";
@@ -169,8 +170,9 @@ const HEADER_EVERY = 15_000;
  * fresh; until then it reads nothing, so a header costs the daemon nothing.
  */
 function ChangesButton({ workspace, onClick }: { workspace: string; onClick: () => void }) {
-  const { data } = useQuery({ ...changesQuery(workspace), enabled: (query) => query.state.data !== undefined, refetchInterval: HEADER_EVERY, retry: false });
-  const t = data && totals(data);
+  const leaving = useLeaving(workspace);
+  const { data } = useQuery({ ...changesQuery(workspace), enabled: (query) => !leaving && query.state.data !== undefined, refetchInterval: HEADER_EVERY, retry: false });
+  const t = data && !leaving && totals(data);
   return (
     <button
       type="button"

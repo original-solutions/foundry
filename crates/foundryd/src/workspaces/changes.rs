@@ -4,8 +4,10 @@
 //! branch left `origin/<base>`, plus each new file git does not ignore. A read changes nothing in
 //! the worktree, its index or its refs, and takes no lock. It works on its own copy of the index,
 //! so it never takes git's index lock, which an agent's own git command in the worktree needs.
-//! It does not take the workspace's lifecycle lock, so it never holds up a start or an archive:
-//! a read an archive overtakes finds the worktree gone and fails as the workspace being gone.
+//! It does not take the workspace's lifecycle lock, so it never holds up a start or an archive.
+//! Git removes a worktree file by file, so a read beside an archive would see its files as
+//! deleted, then no repo at all. A read that overlaps the removal, or ends after the archive, is
+//! refused as the workspace being gone, never sent.
 //! A new file is read only when it is a plain file, never through a symlink, so a link the agent
 //! made cannot show a file outside the worktree.
 
@@ -77,13 +79,20 @@ pub enum FileStatus {
 
 impl Workspaces {
     /// What live workspace `id` has changed since it left its base. Each git call is bounded
-    /// as every git call here is. A read that fails with the worktree gone, as when an archive
-    /// removes it mid-read, is [`WorkspaceError::Unknown`]: there is nothing here to read.
+    /// as every git call here is. A read an archive's removal of the worktree overlaps, and one
+    /// that fails with the worktree gone, is [`WorkspaceError::Unknown`]: there is nothing here
+    /// to read.
     pub async fn changes(&self, id: WorkspaceId) -> Result<Changes, WorkspaceError> {
         let body = self.inner.live(id).await?;
         let worktree = self.inner.worktree(body.project, &body.branch);
         let read = self.inner.changes(&worktree, &body.base).await;
-        if read.is_err() && !tokio::fs::try_exists(&worktree).await.unwrap_or(true) {
+        // Checked after the read: an archive marks the worktree before it removes any of it and
+        // writes its record before it unmarks, so a removal that overlapped the read is seen as
+        // one or the other.
+        if self.inner.removing(id)
+            || self.inner.live(id).await.is_err()
+            || (read.is_err() && !tokio::fs::try_exists(&worktree).await.unwrap_or(true))
+        {
             return Err(WorkspaceError::Unknown(id));
         }
         read

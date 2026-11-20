@@ -3,6 +3,7 @@ import { Link, useNavigate } from "@tanstack/react-router";
 import { ARCHIVE_ICON, TerminalMenu, useTerminalActions } from "./TerminalMenu";
 import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { lanes, topFiles, type Card, type Lane } from "./lanes";
+import { useLeaving } from "./Archive";
 import { changesQuery } from "./ChangesPanel";
 import { splitPath, totals } from "./changes";
 import type { MachineView } from "./fleet";
@@ -239,15 +240,16 @@ function WorkspaceCard({ card, showMachine, onChanges }: { card: Card; showMachi
  * of a turn shows what the turn wrote), and every `BOARD_BUSY_EVERY` while an agent in it works.
  * A state change off screen is read when the card comes back. A failed read says so instead of
  * the old numbers and is tried again on the timer; a workspace the daemon does not have (a 404)
- * is not asked again on a timer.
+ * is not asked again on a timer. Once its workspace is being archived, nothing is read or shown.
  */
 function ChangesFooter({ card, onScreen, onOpen }: { card: Card; onScreen: boolean; onOpen: () => void }) {
   const busy = card.rows.some((r) => r.glyph === "working");
   const workspace = card.workspace.id;
   const client = useQueryClient();
+  const leaving = useLeaving(workspace);
   const { data, error } = useQuery({
     ...changesQuery(workspace),
-    enabled: onScreen,
+    enabled: onScreen && !leaving,
     staleTime: BOARD_BUSY_EVERY,
     retry: false,
     refetchInterval: pollEvery(BOARD_BUSY_EVERY, busy),
@@ -257,12 +259,14 @@ function ChangesFooter({ card, onScreen, onOpen }: { card: Card; onScreen: boole
   useEffect(() => {
     if (last.current === states) return;
     last.current = states;
+    if (leaving) return;
     // Read now if on screen; otherwise marked out of date, and read when it comes on screen.
     void client.invalidateQueries({ queryKey: changesQuery(workspace).queryKey, exact: true });
-  }, [states, client, workspace]);
+  }, [states, client, workspace, leaving]);
 
   let body: React.ReactNode;
-  if (error) body = <span className="text-neutral-500">Changes not readable from here</span>;
+  if (leaving) body = <span className="text-neutral-500">Archiving…</span>;
+  else if (error) body = <span className="text-neutral-500">Changes not readable from here</span>;
   else if (!data) body = <span className="text-neutral-600">Reading changes…</span>;
   else if (data.files.length === 0 && data.commits.length === 0) body = <span className="text-neutral-500">No changes yet</span>;
   else {

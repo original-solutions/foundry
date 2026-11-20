@@ -1,4 +1,4 @@
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { useMutation, useMutationState, useQuery } from "@tanstack/react-query";
 import { useId, useState, type ReactNode } from "react";
 import { Dialog } from "radix-ui";
 import { archiveWorkspace, type Blockers, type FileChange } from "./api";
@@ -20,6 +20,23 @@ const cut: Partial<Record<Glyph, string>> = {
   waiting: "stops without your answer",
 };
 
+/** Archiving `workspace`: one mutation per workspace, so every view can see it under way or done. */
+export const archiveOf = (workspace: string) => ({
+  mutationKey: ["archive", workspace],
+  mutationFn: (force: boolean) => archiveWorkspace(workspace, force),
+});
+
+/**
+ * Whether `workspace` is being archived from this page, or was. Its worktree is going or gone,
+ * so its changes are not read or shown: a read mid-archive would see its files as deleted.
+ */
+export function useLeaving(workspace: string): boolean {
+  const leaving = useMutationState({
+    filters: { mutationKey: archiveOf(workspace).mutationKey, predicate: (m) => m.state.status === "pending" || (m.state.status === "success" && m.state.data === null) },
+  });
+  return leaving.length > 0;
+}
+
 /**
  * Asks before archiving `workspace`, and shows what archiving it means before anything is sent:
  * the commits that stay on its branch, the uncommitted files that go with the worktree, and every
@@ -29,9 +46,10 @@ const cut: Partial<Record<Glyph, string>> = {
  */
 export function ArchiveDialog({ workspace, onClose, onArchived }: { workspace: WorkspaceView; onClose: () => void; onArchived: (name: string, branch: string) => void }) {
   const [blockers, setBlockers] = useState<Blockers | null>(null);
-  const changes = useQuery({ ...changesQuery(workspace.id), retry: false });
+  const leaving = useLeaving(workspace.id);
+  const changes = useQuery({ ...changesQuery(workspace.id), enabled: !leaving, retry: false });
   const archive = useMutation({
-    mutationFn: (force: boolean) => archiveWorkspace(workspace.id, force),
+    ...archiveOf(workspace.id),
     onSuccess: (held) => {
       setBlockers(held);
       if (held) return;

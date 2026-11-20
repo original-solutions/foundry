@@ -2816,6 +2816,58 @@ async fn changes_of_a_workspace_whose_worktree_is_gone_are_refused_as_unknown() 
 }
 
 #[tokio::test]
+async fn changes_read_while_an_archive_removes_the_worktree_are_refused_as_unknown() {
+    // Git removes a worktree file by file, so a read beside it sees the files go one by one, as
+    // deletes, and then no repo at all, while the folder is still there.
+    let setup = Setup::new();
+    let names: Vec<String> = (0..1500).map(|i| format!("f{i:04}.txt")).collect();
+    let files: Vec<(&str, &str)> = names.iter().map(|n| (n.as_str(), "x\n")).collect();
+    let remote = setup.project(&files);
+    let id = setup.create(&remote, "main", "leaving").await;
+    let done = std::sync::atomic::AtomicBool::new(false);
+
+    let archive = async {
+        let archived = setup.workspaces.archive(id, true).await;
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        archived
+    };
+    let reads = async {
+        let mut seen = Vec::new();
+        while !done.load(std::sync::atomic::Ordering::SeqCst) {
+            seen.push(setup.workspaces.changes(id).await);
+        }
+        seen
+    };
+    let (archived, seen) = tokio::join!(archive, reads);
+    archived.unwrap();
+
+    for read in &seen {
+        match read {
+            Ok(changes) => assert!(
+                changes.files.is_empty(),
+                "a read of a half-removed worktree: {} files",
+                changes.files.len()
+            ),
+            Err(WorkspaceError::Unknown(_)) => {}
+            Err(other) => panic!("a read during the archive failed as {other}, not as gone"),
+        }
+    }
+}
+
+/// A read that starts and ends while the worktree is being removed, with nothing removed yet.
+#[tokio::test]
+async fn changes_are_refused_as_unknown_while_the_worktree_is_being_removed() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup.create(&remote, "main", "removing").await;
+    let removing = Removing::mark(&setup.workspaces.inner, id);
+    let err = setup.workspaces.changes(id).await.unwrap_err();
+    assert!(matches!(err, WorkspaceError::Unknown(_)), "{err}");
+    drop(removing);
+    setup.workspaces.changes(id).await.unwrap();
+}
+
+#[tokio::test]
 async fn changes_of_a_workspace_that_is_not_here_are_refused() {
     let setup = Setup::new();
     let err = setup

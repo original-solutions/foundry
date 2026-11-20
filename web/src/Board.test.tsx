@@ -4,6 +4,7 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createContext, useContext } from "react";
 import type { AnyRecord, Changes, SessionState } from "./api";
+import { archiveOf } from "./Archive";
 import { Board, BOARD_BUSY_EVERY } from "./Board";
 import { fleet, type MachineView } from "./fleet";
 import { ME, sample, session, settings, terminal, workspace } from "./test-fixtures";
@@ -112,7 +113,7 @@ async function show(machines: MachineView[], onChanges = vi.fn()) {
     </Machines.Provider>
   );
   const view = render(tree(machines));
-  return { router, update: (next: MachineView[]) => view.rerender(tree(next)) };
+  return { router, client, update: (next: MachineView[]) => view.rerender(tree(next)) };
 }
 
 const card = (name: string) => screen.getByRole("article", { name });
@@ -216,6 +217,40 @@ describe("Board", () => {
     expect(readsOf("w1")).toBe(before);
     scroll("fix login", true);
     await waitFor(() => expect(readsOf("w1")).toBe(before + 1));
+  });
+
+  it("stops reading a card's changes and shows none once its workspace is archiving or archived", async () => {
+    let archived: (done: Response) => void = () => {};
+    const archive = new Promise<Response>((resolve) => (archived = resolve));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) => {
+        reads.push(url);
+        return url.endsWith("/archive") ? archive : answers[url]();
+      }),
+    );
+    // Mid-archive, a read sees the worktree's files go: every file deleted.
+    const { client, update } = await show(fleet(records("waiting_for_you"), settings()));
+    const login = card("fix login");
+    await waitFor(() => expect(within(login).getByText("+34")).toBeDefined());
+    answers["/api/workspaces/w1/changes"] = () => json(200, { base: "main", commits: [], files: [file("src/login.ts", 0, 24986)] } satisfies Changes);
+    const before = readsOf("w1");
+
+    void client.getMutationCache().build(client, archiveOf("w1")).execute(true);
+    await waitFor(() => expect(within(login).getByText(/archiving/i)).toBeDefined());
+    expect(within(login).queryByText("+34")).toBeNull();
+    // The archive closes its terminals.
+    const closed = records("waiting_for_you").filter((r) => !(r.kind === "session" && r.body.workspace === "w1") && !(r.kind === "terminal" && r.body.workspace === "w1"));
+    update(fleet(closed, settings()));
+    await act(async () => {});
+
+    archived(new Response(null, { status: 204 }));
+    await act(async () => {});
+    update(fleet(records("failed"), settings()));
+    await act(async () => {});
+    expect(readsOf("w1") - before).toBe(1); // the archive itself
+    expect(within(card("fix login")).queryByText(/24986/)).toBeNull();
+    expect(within(card("fix login")).getByText(/archiving/i)).toBeDefined();
   });
 
   it("switches to a timeline of every session's turns, and keeps that view for next time", async () => {
