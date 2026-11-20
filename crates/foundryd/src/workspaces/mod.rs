@@ -494,23 +494,38 @@ impl Inner {
                 name: name.to_owned(),
                 branch: stored.to_owned(),
                 base: base.to_owned(),
+                setup: None,
             };
-            self.write(body, false).await
+            self.write(body.clone(), false).await?;
+            Ok(body)
         }
         .await;
-        if let Err(e) = made {
-            self.undo(&clone, &worktree, &branch, &start).await;
-            return Err(e);
-        }
+        let body = match made {
+            Ok(body) => body,
+            Err(e) => {
+                self.undo(&clone, &worktree, &branch, &start).await;
+                return Err(e);
+            }
+        };
         // Still under the lock, so an archive cannot run before the setup's terminal is known.
         if let Some(argv) = setup(&worktree).await {
-            self.terminals
+            let terminal = self
+                .terminals
                 .start(id, &worktree, &argv, &[])
                 .await
                 .map_err(|source| WorkspaceError::SetupNotStarted {
                     workspace: id,
                     source,
                 })?;
+            // The attention list reads a failed setup from this terminal. The setup runs
+            // whether or not the record says so, so a write that fails is only logged.
+            let body = Workspace {
+                setup: Some(terminal),
+                ..body
+            };
+            if let Err(e) = self.write(body, false).await {
+                tracing::warn!("workspace {id}: its setup terminal could not be recorded: {e}");
+            }
         }
         Ok(id)
     }

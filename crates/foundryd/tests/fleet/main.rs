@@ -327,6 +327,7 @@ pub fn workspace(id: WorkspaceId, deleted: bool) -> impl FnOnce(MachineId, u64) 
                 name: "fix login".into(),
                 branch: "fix-login".into(),
                 base: "main".into(),
+                setup: None,
             },
         })
     }
@@ -384,6 +385,7 @@ pub fn sample(sessions: u32) -> impl FnOnce(MachineId, u64) -> AnyRecord {
                 free_memory: 1 << 30,
                 free_disk: 1 << 35,
                 sessions,
+                update_refused: None,
             },
         })
     }

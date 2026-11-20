@@ -286,7 +286,7 @@ P2 adds a lease per project on GitHub, so that claiming issues and merging can n
 | Session stuck | Working with no output or hook event for 10 minutes | Output or an event arrives, or the session ends |
 | Session waiting for you | The agent needs input | It gets it |
 | Session failed | The process died or exited non-zero | The terminal is closed |
-| Setup failed | A setup command exited non-zero | The workspace is archived or setup is run again and passes |
+| Setup failed | A setup command exited non-zero | The workspace is archived or its setup terminal is closed |
 | Gateway unhealthy | The gateway does not answer, or every account is cooling down | It answers with an account free |
 | Disk low | Free disk is under the machine's limit | It is back over |
 | Placement waiting | A request has waited over 5 minutes | It is placed or cancelled |

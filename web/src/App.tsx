@@ -28,6 +28,7 @@ import { Toasts } from "./Toasts";
 import { Rail } from "./Rail";
 import { loadRail, saveRail } from "./collapsed";
 import { useMemory } from "./memory";
+import { AttentionList } from "./attention/AttentionList";
 
 /**
  * The sidebar, and the terminal the URL names (`/terminals/$terminalId`) under its header filling
@@ -401,9 +402,10 @@ function Layout() {
         />
         <KeySheet open={keysOpen} onOpenChange={setKeysOpen} />
         <Announcer spoken={spoken} />
-        {/* One place on screen for news: the catch-up first, then the cards. */}
+        {/* One place on screen for news: what needs a person, the catch-up, then the cards. */}
         <div className="pointer-events-none fixed inset-x-2 top-2 z-40 flex flex-col gap-2 md:inset-x-auto md:top-14 md:right-4 md:w-[24rem]">
           <LinkBanner link={link} remembered={remembering ? memory.at : undefined} />
+          <AttentionList />
           {notify.notify.away && <Away records={sent.records} synced={sent.synced} machines={machines} traced={traced} onOpen={show} onShown={setCaughtUp} />}
           <Toasts news={news} machines={machines} here={here} onScreen={pair ? [pair.left, pair.right] : terminalId ? [terminalId] : []} covered={notify.notify.away ? caughtUp : []} onOpen={show} />
         </div>

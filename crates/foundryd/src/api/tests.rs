@@ -2440,6 +2440,7 @@ fn peer_workspace(daemon: &Daemon, owner: MachineId) -> WorkspaceId {
             name: "far work".into(),
             branch: "far-work".into(),
             base: "main".into(),
+            setup: None,
         },
     });
     daemon.store.lock().unwrap().apply(&record, owner).unwrap();

@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::Router;
+use axum::middleware;
 use nix::errno::Errno;
 use nix::fcntl::{Flock, FlockArg};
 use tokio::signal::unix::{SignalKind, signal};
@@ -22,6 +23,8 @@ use tokio::task::{AbortHandle, JoinSet};
 use tracing_subscriber::EnvFilter;
 
 use crate::api::{self, Api, BindError};
+use crate::attention::Attention;
+use crate::gateway;
 use crate::join::{self, JoinError, KeyedDialer, Keys};
 use crate::machine;
 use crate::secrets::{self, GATEWAY, SecretsError};
@@ -266,8 +269,20 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
     // Refused in the API, behind the layer that carries a start for another machine's
     // workspace there: shells, sync and that machine's sessions still work.
     api.sessions_refused = missing.map(|missing| missing.said);
+    let gateway_reader = Arc::new(gateway::Reader::new(
+        std::env::var("FOUNDRY_GATEWAY_URL").ok(),
+        secrets.clone(),
+    ));
+    let attention = Arc::new(
+        Attention::new(me, store.clone(), peers.clone(), coordinator.clone())
+            .with_source(gateway_reader.clone()),
+    );
+    let attention_routes = attention
+        .router()
+        .layer(middleware::from_fn_with_state(api.clone(), api::same_site));
     let app = api::router(api)
         .merge(sessions.router())
+        .merge(attention_routes)
         .merge(ws::keyed_router(peers.clone(), keys.clone()));
 
     let mut terminate =
@@ -291,6 +306,7 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
     services.spawn(named("the API server", serve_on(listener, app.clone())));
     services.spawn(named("the Tailscale address watch", tailscale.watch()));
     services.spawn(named("updates", update::run(home.clone())));
+    services.spawn(named("gateway health", gateway_reader.run()));
 
     tokio::select! {
         _ = terminate.recv() => tracing::info!("SIGTERM: stopping; terminals keep running"),

@@ -68,11 +68,12 @@ vi.mock("@xterm/addon-fit", () => ({ FitAddon: class { fit() {} } }));
 
 /**
  * Like `mockFetch`, but the board's reads of each workspace's changes get an empty answer, the
- * reads of where each branch stands get `shipping`, the reads of session briefs get `briefs`, and
- * the task box's read of the machines gets this machine alone; all are left out of the calls, so
- * a test sees only the requests it makes.
+ * reads of where each branch stands get `shipping`, the reads of session briefs get `briefs`, the
+ * reads of the attention list get `attention`, and the task box's read of the machines gets this
+ * machine alone; all are left out of the calls, so a test sees only the requests it makes.
  */
 let briefs: Briefs = {};
+let attention: unknown[] = [];
 const quiet: Shipping = { branch: "b", pushed: false, unpushed: 0, pr: null, unreachable: false };
 let shipping: Shipping = quiet;
 
@@ -84,6 +85,7 @@ function mockActions(...answers: Response[]): Call[] {
       if (url.endsWith("/changes")) return json(200, { base: "main", commits: [], files: [] });
       if (url.endsWith("/api/briefs")) return json(200, briefs);
       if (url.endsWith("/pr")) return json(200, shipping);
+      if (url.endsWith("/api/attention")) return json(200, { items: attention });
       if (url.endsWith("/api/machines")) return json(200, { me: ME, machines: [] });
       calls.push({ url, method: init.method ?? "GET", body: init.body ? JSON.parse(String(init.body)) : undefined });
       const next = answers.shift();
@@ -99,6 +101,7 @@ const sockets = (path: string) => FakeSocket.all.filter((s) => s.url.endsWith(pa
 beforeEach(() => {
   briefs = {};
   shipping = quiet;
+  attention = [];
   localStorage.clear();
   FakeSocket.install();
   vi.stubGlobal(
@@ -168,6 +171,24 @@ describe("App", () => {
     ],
     settings: settings(),
   };
+
+  it("shows the attention list over the layout", async () => {
+    attention = [
+      {
+        id: "session_waiting:s1",
+        kind: "session_waiting",
+        machine: ME,
+        machine_name: "this-mac",
+        what: "A session in fix login on this-mac is waiting for you",
+        todo: "Open its terminal and answer it",
+        terminal: "t1",
+      },
+    ];
+    mockActions();
+    await open("/", live);
+    const list = await screen.findByRole("region", { name: "Needs attention" });
+    expect(within(list).getByText("A session in fix login on this-mac is waiting for you")).toBeDefined();
+  });
 
   it("says the daemon cannot be reached, instead of showing an empty fleet, when no state ever arrives", async () => {
     mockActions();
