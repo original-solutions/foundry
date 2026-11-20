@@ -588,24 +588,31 @@ mod tests {
         assert!(error.contains("not-a-port"), "{error}");
     }
 
-    /// An interface's address as [`interface_addresses`] gives it.
-    fn on(interface: &str, text: &str) -> (String, IpAddr) {
-        (interface.into(), ip(text))
+    fn ips<const N: usize>(texts: [&str; N]) -> BTreeSet<IpAddr> {
+        texts.into_iter().map(ip).collect()
     }
 
     #[test]
     fn the_daemon_listens_on_tailscale_addresses_only_each_once() {
-        let found = [
-            on("en0", "192.168.1.20"),
-            on("utun4", "100.101.102.103"),
-            on("utun4", "fd7a:115c:a1e0::1"),
-            on("lo0", "127.0.0.1"),
-            on("utun4", "0.0.0.0"),
-            on("utun4", "fe80::1"),
-            on("utun4", "8.8.8.8"),
-            on("utun4", "100.101.102.103"),
+        let reported = [
+            ip("100.101.102.103"),
+            ip("fd7a:115c:a1e0::1"),
+            ip("127.0.0.1"),
+            ip("0.0.0.0"),
+            ip("fe80::1"),
+            ip("8.8.8.8"),
+            ip("100.101.102.103"),
         ];
-        let listening: Vec<SocketAddr> = listen_on(7433, found);
+        let found = ips([
+            "192.168.1.20",
+            "100.101.102.103",
+            "fd7a:115c:a1e0::1",
+            "127.0.0.1",
+            "0.0.0.0",
+            "fe80::1",
+            "8.8.8.8",
+        ]);
+        let listening: Vec<SocketAddr> = listen_on(7433, reported, &found);
 
         assert_eq!(
             listening,
@@ -618,29 +625,36 @@ mod tests {
 
     #[test]
     fn with_no_tailscale_there_is_nothing_besides_loopback_to_listen_on() {
-        assert!(listen_on(9000, [on("en0", "10.0.0.5"), on("lo0", "127.0.0.1")]).is_empty());
+        let found = ips(["10.0.0.5", "127.0.0.1", "100.64.0.1"]);
+        assert!(listen_on(9000, [], &found).is_empty());
+    }
+
+    /// Cloudflare WARP hands out 100.96.x.x on a `utun`: in Tailscale's range, on the kind of
+    /// interface Tailscale uses on macOS, yet every device on that VPN could reach the API.
+    #[test]
+    fn a_vpn_address_on_a_utun_that_tailscale_does_not_report_is_not_listened_on() {
+        // utun5 has WARP's 100.96.0.5, utun4 has Tailscale's 100.101.102.103.
+        let found = ips(["100.96.0.5", "100.101.102.103"]);
+        let reported = [ip("100.101.102.103")];
+
+        assert_eq!(
+            listen_on(7433, reported, &found),
+            vec![addr("100.101.102.103:7433")]
+        );
     }
 
     /// A carrier-grade NAT or phone hotspot hands out addresses in Tailscale's range on an
     /// ordinary interface, where anyone on that network could reach the API.
     #[test]
-    fn a_tailscale_range_address_off_a_tunnel_interface_is_not_listened_on() {
-        let found = [
-            on("en0", "100.72.10.5"),
-            on("wlan0", "100.72.10.6"),
-            on("eth0", "fd7a:115c:a1e0::2"),
-            on("bridge100", "100.72.10.7"),
-        ];
-        assert!(listen_on(7433, found).is_empty());
+    fn a_tailscale_range_address_tailscale_does_not_report_is_not_listened_on() {
+        let found = ips(["100.72.10.5", "100.72.10.6", "fd7a:115c:a1e0::2"]);
+        assert!(listen_on(7433, [ip("100.64.0.1")], &found).is_empty());
     }
 
+    /// Tailscale can report an address before this machine's tunnel carries it.
     #[test]
-    fn tailscale_tunnels_on_linux_and_macos_are_listened_on() {
-        let found = [on("tailscale0", "100.64.0.1"), on("utun3", "100.64.0.2")];
-        assert_eq!(
-            listen_on(7433, found),
-            vec![addr("100.64.0.1:7433"), addr("100.64.0.2:7433")]
-        );
+    fn a_reported_address_no_interface_has_yet_is_not_listened_on() {
+        assert!(listen_on(7433, [ip("100.64.0.1")], &BTreeSet::new()).is_empty());
     }
 
     #[test]
@@ -768,17 +782,22 @@ mod tests {
     #[test]
     fn only_tailscale_addresses_not_yet_served_are_new() {
         let served: BTreeSet<SocketAddr> = [addr("100.101.102.103:7433")].into();
-        let found = [
-            on("utun4", "100.101.102.103"),
-            on("utun4", "100.64.0.9"),
-            on("en0", "192.168.1.20"),
-            on("utun4", "fd7a:115c:a1e0::1"),
-            on("lo0", "127.0.0.1"),
-            on("utun4", "100.64.0.9"),
+        let reported = [
+            ip("100.101.102.103"),
+            ip("100.64.0.9"),
+            ip("fd7a:115c:a1e0::1"),
+            ip("100.64.0.9"),
         ];
+        let found = ips([
+            "100.101.102.103",
+            "100.64.0.9",
+            "192.168.1.20",
+            "fd7a:115c:a1e0::1",
+            "127.0.0.1",
+        ]);
 
         assert_eq!(
-            new_addresses(7433, found, &served),
+            new_addresses(7433, reported, &found, &served),
             vec![addr("100.64.0.9:7433"), addr("[fd7a:115c:a1e0::1]:7433")]
         );
     }
@@ -786,15 +805,158 @@ mod tests {
     #[test]
     fn with_everything_served_nothing_is_new() {
         let served: BTreeSet<SocketAddr> = [addr("100.64.0.9:7433")].into();
+        let found = ips(["10.0.0.5", "100.64.0.9"]);
 
-        assert!(
-            new_addresses(
-                7433,
-                [on("en0", "10.0.0.5"), on("utun4", "100.64.0.9")],
-                &served
-            )
-            .is_empty()
+        assert!(new_addresses(7433, [ip("100.64.0.9")], &found, &served).is_empty());
+    }
+
+    /// The daemon can start before Tailscale: an address it reports later is new then, once.
+    #[test]
+    fn an_address_tailscale_reports_after_the_start_is_new_once() {
+        let found = ips(["100.64.0.9"]);
+        let mut served = BTreeSet::new();
+        assert!(new_addresses(7433, [], &found, &served).is_empty());
+
+        let later = new_addresses(7433, [ip("100.64.0.9")], &found, &served);
+        assert_eq!(later, vec![addr("100.64.0.9:7433")]);
+
+        served.extend(later);
+        assert!(new_addresses(7433, [ip("100.64.0.9")], &found, &served).is_empty());
+    }
+
+    /// Everything the daemon logs while it is set, as plain text.
+    #[derive(Clone, Default)]
+    struct Logged(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for Logged {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Logged {
+        /// Captures this thread's log until the guard drops.
+        fn capture(&self) -> tracing::subscriber::DefaultGuard {
+            let logged = self.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(move || logged.clone())
+                .with_ansi(false)
+                .without_time()
+                .finish();
+            tracing::subscriber::set_default(subscriber)
+        }
+
+        fn warnings(&self) -> Vec<String> {
+            String::from_utf8_lossy(&self.0.lock().unwrap())
+                .lines()
+                .filter(|line| line.contains("WARN"))
+                .map(str::to_owned)
+                .collect()
+        }
+    }
+
+    /// Not installed, not running or logged out: nothing besides loopback is bound, and the
+    /// reason is logged once, not on every rescan.
+    #[tokio::test]
+    async fn when_tailscale_cannot_be_asked_nothing_is_bound_and_one_warning_says_why() {
+        let logged = Logged::default();
+        let _capture = logged.capture();
+        let mut tailscale = Tailscale::new(7433, Router::new());
+        let cannot = || Err::<BTreeSet<IpAddr>, _>("Tailscale is stopped.".to_owned());
+
+        tailscale.scan(true, cannot()).await;
+        tailscale.scan(false, cannot()).await;
+        tailscale.scan(false, cannot()).await;
+
+        assert!(tailscale.served.is_empty());
+        assert!(tailscale.servers.is_empty());
+        let warnings = logged.warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("Tailscale is stopped."), "{warnings:?}");
+    }
+
+    /// After Tailscale answers again, a new failure is worth a new warning.
+    #[tokio::test]
+    async fn a_failure_after_tailscale_answered_again_is_warned_again() {
+        let logged = Logged::default();
+        let _capture = logged.capture();
+        let mut tailscale = Tailscale::new(7433, Router::new());
+
+        tailscale.scan(false, Err("not running".to_owned())).await;
+        tailscale.scan(false, Ok(BTreeSet::new())).await;
+        tailscale.scan(false, Err("logged out".to_owned())).await;
+
+        let warnings = logged.warnings();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[1].contains("logged out"), "{warnings:?}");
+    }
+
+    /// Writes an executable stand-in for the Tailscale CLI that runs `body`.
+    fn fake_cli(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let cli = dir.join("tailscale");
+        std::fs::write(&cli, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        cli
+    }
+
+    #[tokio::test]
+    async fn the_cli_is_asked_for_ip_and_its_addresses_are_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = fake_cli(
+            dir.path(),
+            r#"[ "$1" = ip ] || exit 9; printf '100.101.102.103\nfd7a:115c:a1e0::1\n'"#,
         );
+
+        let reported = ask_cli(&cli, Duration::from_secs(10)).await;
+
+        assert_eq!(reported, Ok(ips(["100.101.102.103", "fd7a:115c:a1e0::1"])));
+    }
+
+    #[tokio::test]
+    async fn a_cli_that_fails_says_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = fake_cli(dir.path(), "echo 'Tailscale is stopped.' >&2; exit 1");
+
+        let why = ask_cli(&cli, Duration::from_secs(10)).await.unwrap_err();
+
+        assert!(why.contains("Tailscale is stopped."), "{why}");
+    }
+
+    #[tokio::test]
+    async fn a_missing_cli_says_which_one_could_not_be_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = dir.path().join("tailscale");
+
+        let why = ask_cli(&cli, Duration::from_secs(10)).await.unwrap_err();
+
+        assert!(why.contains(&cli.display().to_string()), "{why}");
+    }
+
+    #[tokio::test]
+    async fn output_that_is_not_addresses_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = fake_cli(dir.path(), "echo 'not an address'");
+
+        let why = ask_cli(&cli, Duration::from_secs(10)).await.unwrap_err();
+
+        assert!(why.contains("not an address"), "{why}");
+    }
+
+    #[tokio::test]
+    async fn a_cli_that_hangs_is_stopped_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        // A distinctive duration, so a stray is easy to find.
+        let cli = fake_cli(dir.path(), "exec sleep 7.317");
+
+        let why = ask_cli(&cli, Duration::from_millis(200)).await.unwrap_err();
+
+        assert!(why.contains("did not answer"), "{why}");
     }
 
     /// What the stub router answers, so a request that got through is told from a refusal.
