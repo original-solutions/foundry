@@ -64,13 +64,13 @@ describe("review", () => {
 });
 
 describe("takers", () => {
-  const session = (over: Partial<SessionView>): SessionView => ({ id: "s1", model: "opus", state: "idle", terminal: "t1", ...over });
+  const session = (over: Partial<SessionView>): SessionView => ({ id: "s1", model: "opus", name: "opus", state: "idle", terminal: "t1", ...over });
 
-  it("names each session, by its first prompt when it has one, else by number among its model", () => {
+  it("names each session as the sidebar does, with its first prompt after it when it has one", () => {
     const list = takers([
-      session({}),
-      session({ id: "s2", terminal: "t2", state: "working" }),
-      session({ id: "s3", terminal: "t3", model: "sonnet", title: "Fix the login check" }),
+      session({ name: "opus 1" }),
+      session({ id: "s2", terminal: "t2", name: "opus 2", state: "working" }),
+      session({ id: "s3", terminal: "t3", model: "sonnet", name: "sonnet", title: "Fix the login check" }),
     ]);
     expect(list.map((t) => [t.name, t.ready])).toEqual([
       ["opus 1", true],

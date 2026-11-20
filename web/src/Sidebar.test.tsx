@@ -100,10 +100,10 @@ describe("Sidebar", () => {
     await renderApp(<Sidebar machines={fleet(records, settings(), briefs)} {...props} />);
 
     const group = screen.getByRole("group", { name: "fix login" });
-    const working = within(group).getByRole("link", { name: /opus fix the login bug.*Working/ });
+    const working = within(group).getByRole("link", { name: /opus 1 fix the login bug.*Working/ });
     expect(within(working).getByText("Edit src/login.ts")).toBeDefined();
-    expect(working.getAttribute("title")).toBe("opus: fix the login bug");
-    expect(within(group).getByRole("link", { name: /opus write the release notes.*Idle/ })).toBeDefined();
+    expect(working.getAttribute("title")).toBe("opus 1: fix the login bug");
+    expect(within(group).getByRole("link", { name: /opus 2 write the release notes.*Idle/ })).toBeDefined();
   });
 
   it("highlights the selected terminal", async () => {
@@ -154,7 +154,7 @@ describe("Sidebar", () => {
       "model-2 Waiting for you",
       "model-6 Stuck",
       "model-5 Failed",
-      "shell Exited 1",
+      "shell 2 Exited 1",
       "model-1 Working",
       "model-0 Starting",
     ]);
@@ -178,7 +178,7 @@ describe("Sidebar", () => {
 
     const strip = within(screen.getByRole("group", { name: "fix login" })).getAllByRole("link");
     expect(strip).toHaveLength(6);
-    expect(strip[5].getAttribute("aria-label")).toBe("shell Running");
+    expect(strip[5].getAttribute("aria-label")).toBe("shell 1 Running");
     expect(strip[5].getAttribute("aria-current")).toBe("true");
   });
 

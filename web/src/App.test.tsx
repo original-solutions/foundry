@@ -663,7 +663,7 @@ describe("App", () => {
     await open("/terminals/t1", ended);
     const sidebar = screen.getByRole("group", { name: "fix login" });
 
-    fireEvent.contextMenu(within(sidebar).getByRole("link", { name: /^shell Exited 0/ }));
+    fireEvent.contextMenu(within(sidebar).getByRole("link", { name: /^shell 2 Exited 0/ }));
     const menu = await screen.findByRole("menu");
     expect(within(menu).getAllByRole("menuitem").map((item) => item.textContent)).toEqual([
       "Open",
@@ -720,7 +720,7 @@ describe("App", () => {
   it("says why a terminal could not be ended", async () => {
     mockActions(json(404, { error: "no such terminal" }));
     await open("/terminals/t1", ended);
-    fireEvent.contextMenu(within(screen.getByRole("group", { name: "fix login" })).getByRole("link", { name: /^shell Exited 2/ }));
+    fireEvent.contextMenu(within(screen.getByRole("group", { name: "fix login" })).getByRole("link", { name: /^shell 3 Exited 2/ }));
     fireEvent.click(within(await screen.findByRole("menu")).getByRole("menuitem", { name: "Clear" }));
 
     expect((await screen.findByRole("alert")).textContent).toMatch(/no such terminal/);
@@ -808,7 +808,7 @@ describe("App", () => {
 
     // The press opened the menu under the pointer; its release lands on an item it never pressed.
     for (const name of ["Clear", "Clear 2 ended in fix login"]) {
-      fireEvent.contextMenu(within(sidebar).getByRole("link", { name: /^shell Exited 0/ }));
+      fireEvent.contextMenu(within(sidebar).getByRole("link", { name: /^shell 2 Exited 0/ }));
       fireEvent.pointerUp(within(await screen.findByRole("menu")).getByRole("menuitem", { name }));
     }
     fireEvent.contextMenu(within(sidebar).getByRole("link", { name: /^sonnet/ }));

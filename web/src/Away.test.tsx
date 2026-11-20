@@ -164,7 +164,7 @@ describe("Away", () => {
     move(fleetAt({}, {}, [terminal(ME, "t4", "w2"), session(ME, "s4", "w2", "t4", "working")]));
     vi.spyOn(Date, "now").mockReturnValue(at(10));
     setVisibility("visible");
-    expect(within(panel()).getByRole("button", { name: "Open opus in tidy readme: Working" }).textContent).toContain("New");
+    expect(within(panel()).getByRole("button", { name: "Open opus 2 in tidy readme: Working" }).textContent).toContain("New");
   });
 
   it("picks up from when the tab was last hidden, after the page was closed and opened again", async () => {

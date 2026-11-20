@@ -208,8 +208,8 @@ describe("ChangesPanel", () => {
 
   describe("comments for Claude", () => {
     const sessions = [
-      { id: "s1", model: "opus", state: "idle" as const, terminal: "t1" },
-      { id: "s2", model: "opus", state: "working" as const, terminal: "t2" },
+      { id: "s1", model: "opus", name: "opus 1", state: "idle" as const, terminal: "t1" },
+      { id: "s2", model: "opus", name: "opus 2", state: "working" as const, terminal: "t2" },
     ];
     const typed = (socket: FakeSocket) => socket.sent.map((d) => (typeof d === "string" ? d : new TextDecoder().decode(d)));
 
@@ -281,7 +281,7 @@ describe("ChangesPanel", () => {
         return (
           <>
             <button onClick={() => setState("working")}>Start the turn</button>
-            <ChangesPanel workspace={{ ...target, sessions: [{ ...sessions[0], state }] }} onClose={() => {}} />
+            <ChangesPanel workspace={{ ...target, sessions: [{ ...sessions[0], name: "opus", state }] }} onClose={() => {}} />
           </>
         );
       }
@@ -308,7 +308,7 @@ describe("ChangesPanel", () => {
     });
 
     it("sends nothing while no session is idle, and says why", async () => {
-      const { panel } = await commented({ sessions: [sessions[1]] });
+      const { panel } = await commented({ sessions: [{ ...sessions[1], name: "opus" }] });
       const send = within(panel).getByRole("button", { name: "Send 1 comment to opus" });
       expect(send).toHaveProperty("disabled", true);
       expect(panel.textContent).toContain("opus is working");

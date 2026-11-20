@@ -64,14 +64,9 @@ export interface Taker {
 const TITLE_SHOWN = 40;
 
 export function takers(sessions: SessionView[]): Taker[] {
-  const count = new Map<string, number>();
-  for (const s of sessions) count.set(s.model, (count.get(s.model) ?? 0) + 1);
-  const seen = new Map<string, number>();
   return sessions.map((s) => {
-    const n = (seen.get(s.model) ?? 0) + 1;
-    seen.set(s.model, n);
     const title = s.title && (s.title.length > TITLE_SHOWN ? `${s.title.slice(0, TITLE_SHOWN - 1)}…` : s.title);
-    const name = title ? `${s.model} · ${title}` : count.get(s.model)! > 1 ? `${s.model} ${n}` : s.model;
+    const name = title ? `${s.name} · ${title}` : s.name;
     return { terminal: s.terminal, name, ready: s.state === "idle", label: sessionLabel[s.state], glyph: sessionGlyph[s.state] };
   });
 }

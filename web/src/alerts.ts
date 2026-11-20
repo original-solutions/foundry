@@ -40,7 +40,7 @@ export function alertsFor(before: Seen | undefined, machines: MachineView[]): { 
       const was = before.get(s.id);
       if (was === s.state) continue;
       const phrase = was === "working" && s.state === "idle" ? "finished its turn" : says[s.state];
-      if (phrase) alerts.push({ terminal: s.terminal, tag: s.id, glyph: sessionGlyph[s.state], title: workspace.name, body: `${s.model} ${phrase}` });
+      if (phrase) alerts.push({ terminal: s.terminal, tag: s.id, glyph: sessionGlyph[s.state], title: workspace.name, body: `${s.name} ${phrase}` });
     }
   }
   return { alerts, seen };

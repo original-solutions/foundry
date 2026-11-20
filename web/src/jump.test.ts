@@ -54,7 +54,7 @@ describe("briefs in the palette", () => {
     );
     const found = search(destinations(withBriefs), "release");
     expect(found).toHaveLength(1);
-    expect(found[0]).toMatchObject({ kind: "terminal", terminal: "t2", title: "fix login / opus", subtitle: "write the release notes" });
+    expect(found[0]).toMatchObject({ kind: "terminal", terminal: "t2", title: "fix login / opus 2", subtitle: "write the release notes" });
   });
 });
 
