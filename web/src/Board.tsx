@@ -1,5 +1,5 @@
 import { useMutationState, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Link, useNavigate } from "@tanstack/react-router";
+import { Link, useNavigate, useRouterState } from "@tanstack/react-router";
 import { ARCHIVE_ICON, TerminalMenu, useTerminalActions } from "./TerminalMenu";
 import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { glance, lanes, topFiles, type Card, type Lane } from "./lanes";
@@ -12,7 +12,6 @@ import { changesQuery } from "./ChangesPanel";
 import { ShipLine, shippingQuery } from "./Shipping";
 import { splitPath, totals } from "./changes";
 import type { MachineView } from "./fleet";
-import { jumpKey, SearchIcon } from "./JumpPalette";
 import type { Project } from "./api";
 import { Composer, useCreateWorkspace } from "./Composer";
 import { plural, words, type Glyph } from "./labels";
@@ -21,8 +20,10 @@ import { Named, Now } from "./Now";
 import { reply, Said } from "./Said";
 import { BOARD_BUSY_EVERY, pollEvery } from "./poll";
 import { Timeline } from "./Timeline";
+import { Machines } from "./Machines";
+import type { History } from "./samples";
 
-/** Which view of the fleet the home shows, kept for this browser. The machines view has its own URL. */
+/** Which of the board and the timeline the home shows, kept for this browser. The machines view has its own URL. */
 type View = "board" | "timeline";
 const VIEW_KEY = "foundry.home";
 function loadView(): View {
@@ -54,7 +55,7 @@ function saveGroup(group: Group) {
   }
 }
 /** Keeps `view` as the home's view for next time. */
-export function saveView(view: View) {
+function saveView(view: View) {
   try {
     localStorage.setItem(VIEW_KEY, view);
   } catch {
@@ -80,7 +81,8 @@ const laneGlyph: Record<Lane, Glyph> = { needs: "waiting", working: "working", q
  *
  * At the top, a one-line box gives Claude its next task (`Composer`), beside the way to jump.
  * A switch beside the counts turns it into a timeline of every session's turns on one clock, or
- * the machines. Above the lanes, the cards can be grouped instead by how far each workspace's work
+ * the machines (`/machines`). The three views share this head, kept mounted, so it never moves and
+ * a task half typed survives a change of view. Above the lanes, the cards can be grouped instead by how far each workspace's work
  * has gone on its way to main (`useStaged`), counted and summed; either way an idle session of this
  * machine is offered the step that takes its work further, under it on its card.
  *
@@ -96,6 +98,8 @@ export function Board({
   onCreated,
   traced,
   onMenu,
+  history,
+  connected,
 }: {
   machines: MachineView[];
   /** The fleet's projects, which a new task is started in. */
@@ -110,18 +114,26 @@ export function Board({
   traced: Set<string>;
   /** Shows the workspaces, on a screen too narrow to keep them beside. */
   onMenu: () => void;
+  /** Each machine's samples since this page opened, which the machines view draws. */
+  history: History;
+  /** Whether the page hears the daemon now, so the machines view can say its numbers stopped. */
+  connected: boolean;
 }) {
-  const [view, setView] = useState(loadView);
+  const [kept, setKept] = useState(loadView);
+  const onMachines = useRouterState({ select: (s) => s.location.pathname === "/machines" });
+  const view = onMachines ? "machines" : kept;
   const navigate = useNavigate();
   const pick = (next: View | "machines") => {
     if (next === "machines") return void navigate({ to: "/machines" });
-    setView(next);
+    setKept(next);
     saveView(next);
+    if (onMachines) void navigate({ to: "/" });
   };
   const workspaces = machines.flatMap((m) => m.workspaces);
   const sessions = workspaces.reduce((n, w) => n + w.sessions.length, 0);
   const shells = workspaces.reduce((n, w) => n + w.shells.length, 0);
-  const counts = `${plural(sessions, "session")} · ${plural(shells, "shell")} · ${plural(workspaces.length, "workspace")} · ${plural(machines.length, "machine")}`;
+  const offline = machines.filter((m) => m.status === "offline").length;
+  const counts = [plural(sessions, "session"), plural(shells, "shell"), plural(workspaces.length, "workspace"), plural(machines.length, "machine"), ...(offline ? [`${offline} offline`] : [])].join(" · ");
   const launch = useCreateWorkspace();
   const board = lanes(machines);
   const needs = board.find((l) => l.lane === "needs")?.cards.length ?? 0;
@@ -160,7 +172,9 @@ export function Board({
               <ViewSwitch view={view} onPick={pick} />
             </div>
           </div>
-          {view === "timeline" ? (
+          {view === "machines" ? (
+            <Machines machines={machines} history={history} here={here} connected={connected} />
+          ) : view === "timeline" ? (
             <Timeline machines={machines} traced={traced} onSteps={onSteps} />
           ) : (
             <>
@@ -479,21 +493,6 @@ function ChangesFooter({ card, onScreen, onOpen }: { card: Card; onScreen: boole
   );
 }
 
-/** The search bar at the top of the home views: a button that opens the jump palette. */
-export function JumpBar({ onJump }: { onJump: () => void }) {
-  return (
-    <button
-      type="button"
-      onClick={onJump}
-      className="group flex w-full items-center gap-3 rounded-xl border border-neutral-700/70 bg-neutral-900 px-4 py-3 text-left text-base text-neutral-400 shadow-lg shadow-black/40 transition-colors hover:border-neutral-500 hover:text-neutral-200"
-    >
-      <SearchIcon className="size-5 shrink-0 text-neutral-500 group-hover:text-neutral-300" />
-      <span className="flex-1">Jump to a session or shell…</span>
-      <kbd className="rounded border border-neutral-700 px-1.5 py-0.5 text-xs text-neutral-400">{jumpKey}</kbd>
-    </button>
-  );
-}
-
 const views = [
   { view: "board", name: "Board", icon: <BoardIcon /> },
   { view: "timeline", name: "Timeline", icon: <TimelineIcon /> },
@@ -501,7 +500,7 @@ const views = [
 ] as const;
 
 /** The switch between the home's views of the fleet: its workspaces, its turns and its machines. */
-export function ViewSwitch({ view, onPick }: { view: View | "machines"; onPick: (view: View | "machines") => void }) {
+function ViewSwitch({ view, onPick }: { view: View | "machines"; onPick: (view: View | "machines") => void }) {
   return (
     <div role="radiogroup" aria-label="View" className="flex shrink-0 gap-0.5 rounded-lg border border-neutral-800 bg-neutral-900 p-0.5 text-xs">
       {views.map((v) => (
@@ -525,7 +524,7 @@ export function ViewSwitch({ view, onPick }: { view: View | "machines"; onPick: 
  * The home's bar at the bottom of a phone, in reach of a thumb: the switch's views, the board's
  * marked with how many workspaces need you, and the workspaces, which open as a drawer.
  */
-export function PhoneNav({ view, onPick, needs, onMenu }: { view: View | "machines"; onPick: (view: View | "machines") => void; needs: number; onMenu: () => void }) {
+function PhoneNav({ view, onPick, needs, onMenu }: { view: View | "machines"; onPick: (view: View | "machines") => void; needs: number; onMenu: () => void }) {
   const item = "relative flex flex-col items-center gap-1 pt-2 pb-1.5 text-[11px] font-medium transition-colors";
   return (
     <nav aria-label="Home" className="grid shrink-0 grid-cols-4 border-t border-neutral-800 bg-neutral-900 pb-[env(safe-area-inset-bottom)] md:hidden">

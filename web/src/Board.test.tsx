@@ -108,6 +108,8 @@ async function show(machines: MachineView[], onChanges = vi.fn(), props: Partial
         onCreated={() => {}}
         traced={new Set()}
         onMenu={() => {}}
+        history={{}}
+        connected
         {...props}
       />
     );
@@ -408,6 +410,38 @@ describe("Grouped by shipping", () => {
     expect(within(lane("Pushed")).getByRole("article", { name: "draft login" }).dataset.arrived).toBe("true");
     expect(within(lane("Pushed")).getByRole("article", { name: "push docs" }).dataset.arrived).toBeUndefined();
     expect(reads.filter((u) => u === "/api/workspaces/w3/pr").length).toBe(1);
+  });
+});
+
+describe("The home's head", () => {
+  it("stays the same over the board, the timeline and the machines, and keeps a task being typed while the view changes", async () => {
+    const { router } = await show(fleet(records(), settings()));
+    const task = () => screen.getByRole("textbox", { name: "New task" }) as HTMLTextAreaElement;
+    fireEvent.change(task(), { target: { value: "make the footer say the version" } });
+
+    fireEvent.click(screen.getByRole("radio", { name: "Machines" }));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/machines"));
+    expect(screen.getByRole("region", { name: "Machines" })).toBeDefined();
+    // The same head: the task bar with its jump, the line of what needs you, the counts and the switch.
+    expect(task().value).toBe("make the footer say the version");
+    expect(screen.getByRole("button", { name: "Jump to a session or shell" })).toBeDefined();
+    expect(screen.getByText("1 needs you · 1 working · 1 quiet")).toBeDefined();
+    expect(screen.getByText("3 sessions · 1 shell · 3 workspaces · 1 machine")).toBeDefined();
+    expect(screen.getByRole("radio", { name: "Machines" }).getAttribute("aria-checked")).toBe("true");
+    expect(within(screen.getByRole("navigation", { name: "Home" })).getByRole("button", { name: "Machines" }).getAttribute("aria-current")).toBe("page");
+
+    fireEvent.click(screen.getByRole("radio", { name: "Timeline" }));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/"));
+    expect(await screen.findByRole("region", { name: "Timeline" })).toBeDefined();
+    expect(screen.queryByRole("region", { name: "Machines" })).toBeNull();
+    expect(task().value).toBe("make the footer say the version");
+    expect(localStorage.getItem("foundry.home")).toBe("timeline");
+  });
+
+  it("says when a machine is offline in the counts", async () => {
+    const two = settings({ machines: [{ id: ME, name: "studio", address: "" }, { id: OTHER, name: "laptop", address: "" }] });
+    await show(fleet([...records(), sample(OTHER, 1), workspace(OTHER, "w9", "far off"), terminal(OTHER, "t9", "w9", "unreachable")], two));
+    expect(screen.getByText(/2 machines · 1 offline$/)).toBeDefined();
   });
 });
 

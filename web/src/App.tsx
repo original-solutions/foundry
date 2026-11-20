@@ -7,7 +7,6 @@ import { LinkBanner, Unreachable } from "./Connection";
 import { useCreateWorkspace } from "./Composer";
 import { JumpPalette } from "./JumpPalette";
 import { Launchpad } from "./Launchpad";
-import { Machines } from "./Machines";
 import { NewSession } from "./NewSession";
 import { NewTask } from "./NewTask";
 import { Sidebar } from "./Sidebar";
@@ -354,9 +353,9 @@ function Layout() {
               })}
               {/* Hidden while empty, so it never lies over a terminal. */}
               <div {...frozen} className="absolute inset-0 empty:hidden">
-                {!terminalId && onMachines && <Machines machines={machines} history={samples} here={here} connected={connected} onJump={openJump} onMenu={() => setDrawer(true)} />}
                 {firstRun && <Launchpad projects={state.settings.projects} workspaces={workspaces} launch={launch} onCreated={setLanding} onMenu={() => setDrawer(true)} />}
-                {board && state.synced && (
+                {/* The board, the timeline and the machines are one element, so their shared head is never remounted. */}
+                {((board && state.synced) || (!terminalId && onMachines)) && (
                   <Board
                     machines={machines}
                     projects={state.settings.projects}
@@ -365,6 +364,8 @@ function Layout() {
                     onChanges={openChanges}
                     traced={traced}
                     onMenu={() => setDrawer(true)}
+                    history={samples}
+                    connected={connected}
                     onSteps={(id) => {
                       setStepsOpen(true);
                       show(id);
