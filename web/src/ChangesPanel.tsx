@@ -1,9 +1,12 @@
 import { useQuery } from "@tanstack/react-query";
 import { Dialog } from "radix-ui";
-import { useRef, useState, type KeyboardEvent } from "react";
+import { Fragment, useRef, useState, type KeyboardEvent } from "react";
 import { workspaceChanges, type Changes, type Commit, type FileChange } from "./api";
 import { diffLines, splitPath, totals } from "./changes";
+import type { SessionView } from "./fleet";
 import { plural } from "./labels";
+import { anchor, onLine, type Anchor, type Note } from "./notes";
+import { lineName, NoteBox, NoteRow, SendBar } from "./LineNotes";
 import { ShipLine } from "./Shipping";
 import { freshLines, loadViewed, nextUnviewed, progress, saveViewed, seen, standing, type Seen, type Standing, type Viewed } from "./review";
 
@@ -31,6 +34,14 @@ interface Target {
   id: string;
   name: string;
   branch: string;
+  /** Its sessions, which can take the comments written on its diff. */
+  sessions?: SessionView[];
+}
+
+/** The comment being written or changed: on a line of a file, and which comment when it is a change. */
+interface Editing extends Anchor {
+  path: string;
+  id?: number;
 }
 
 /**
@@ -43,20 +54,43 @@ interface Target {
  * When an agent changes a viewed file again, the file opens, says it changed since you viewed it
  * and marks the lines that are new since then. j and k step through the files, v ticks the one
  * you are on and moves to the next one still to view. What you viewed is kept in this browser.
+ *
+ * And it is how you answer the change: click a line number to leave Claude a comment on that line,
+ * as many as you like, then send them to one of the workspace's idle sessions as one message.
+ * Unsent comments outlive the sheet closing, not a reload.
  */
 export function ChangesPanel({ workspace, onClose }: { workspace?: Target; onClose: () => void }) {
+  const [notes, setNotes] = useState<Record<string, Note[]>>({});
   return (
     <Dialog.Root open={workspace !== undefined} onOpenChange={(open) => !open && onClose()}>
-      <Dialog.Portal>{workspace && <Sheet key={workspace.id} workspace={workspace} onClose={onClose} />}</Dialog.Portal>
+      <Dialog.Portal>
+        {workspace && (
+          <Sheet
+            key={workspace.id}
+            workspace={workspace}
+            onClose={onClose}
+            notes={notes[workspace.id] ?? []}
+            onNotes={(list) => setNotes((all) => ({ ...all, [workspace.id]: list }))}
+          />
+        )}
+      </Dialog.Portal>
     </Dialog.Root>
   );
 }
 
-function Sheet({ workspace, onClose }: { workspace: Target; onClose: () => void }) {
+interface SheetProps {
+  workspace: Target;
+  onClose: () => void;
+  notes: Note[];
+  onNotes: (notes: Note[]) => void;
+}
+
+function Sheet({ workspace, onClose, notes, onNotes }: SheetProps) {
   const { data, error, isPending } = useQuery({ ...changesQuery(workspace.id), refetchInterval: CHANGES_EVERY, retry: false });
   const body = useRef<HTMLDivElement>(null);
   const [viewed, setViewed] = useState<Viewed>(() => loadViewed(workspace.id));
   const [at, setAt] = useState<number>();
+  const [editing, setEditing] = useState<Editing>();
   const files = data?.files ?? [];
   const current = at !== undefined && at < files.length ? at : undefined;
 
@@ -72,8 +106,15 @@ function Sheet({ workspace, onClose }: { workspace: Target; onClose: () => void 
     saveViewed(workspace.id, next, files);
     return next;
   };
+  const save = (body: string) => {
+    if (!editing) return;
+    const { id, ...where } = editing;
+    if (id === undefined) onNotes([...notes, { ...where, id: Math.max(0, ...notes.map((n) => n.id)) + 1, body }]);
+    else onNotes(notes.map((n) => (n.id === id ? { ...n, body } : n)));
+    setEditing(undefined);
+  };
   const keys = (e: KeyboardEvent) => {
-    if (e.metaKey || e.ctrlKey || e.altKey || files.length === 0) return;
+    if (e.metaKey || e.ctrlKey || e.altKey || files.length === 0 || e.target instanceof HTMLTextAreaElement) return;
     if (e.key === "j") show(current === undefined ? 0 : Math.min(current + 1, files.length - 1));
     else if (e.key === "k") show(current === undefined ? 0 : Math.max(current - 1, 0));
     else if (e.key === "v") {
@@ -90,6 +131,11 @@ function Sheet({ workspace, onClose }: { workspace: Target; onClose: () => void 
       <Dialog.Overlay className="fixed inset-0 z-40 bg-black/50" />
       <Dialog.Content
         onKeyDown={keys}
+        onEscapeKeyDown={(e) => {
+          if (!editing) return;
+          e.preventDefault();
+          setEditing(undefined);
+        }}
         className="fixed inset-y-0 right-0 z-50 flex w-full flex-col border-l border-neutral-800 bg-neutral-950 text-sm text-neutral-100 shadow-2xl shadow-black outline-none md:w-[min(72rem,calc(100vw-5rem))] motion-safe:animate-sheet-in"
       >
         <header className="flex shrink-0 items-start gap-3 border-b border-neutral-800 bg-neutral-900/80 px-4 py-3">
@@ -111,9 +157,10 @@ function Sheet({ workspace, onClose }: { workspace: Target; onClose: () => void 
                 <span className="text-neutral-600">Updates live</span>
                 {files.length > 0 && (
                   <span className="hidden text-neutral-600 md:inline">
-                    <Key>j</Key> <Key>k</Key> files · <Key>v</Key> viewed
+                    <Key>j</Key> <Key>k</Key> files · <Key>v</Key> viewed · click a line number to comment for Claude
                   </span>
                 )}
+                {files.length > 0 && <span className="text-neutral-600 md:hidden">Tap a line number to comment for Claude</span>}
               </div>
             </Dialog.Description>
             <ShipLine workspace={workspace.id} name={workspace.name} enabled every={SHIPPING_EVERY} className="mt-1.5" />
@@ -156,12 +203,20 @@ function Sheet({ workspace, onClose }: { workspace: Target; onClose: () => void 
                       mark(f, on);
                       setAt(i);
                     }}
+                    notes={notes.filter((n) => n.path === f.path)}
+                    editing={editing?.path === f.path ? editing : undefined}
+                    onComment={(where) => setEditing({ ...where, path: f.path })}
+                    onEdit={(note) => setEditing(note)}
+                    onSave={save}
+                    onCancel={() => setEditing(undefined)}
+                    onDelete={(id) => onNotes(notes.filter((n) => n.id !== id))}
                   />
                 );
               })}
             </div>
           </div>
         )}
+        <SendBar notes={notes} sessions={workspace.sessions ?? []} onSent={() => onNotes([])} />
       </Dialog.Content>
     </>
   );
@@ -305,14 +360,58 @@ interface FileDiffProps {
   /** The file j, k and v act on. */
   current: boolean;
   onViewed: (on: boolean) => void;
+  /** The comments on this file, and the one being written, if it is on this file. */
+  notes: Note[];
+  editing: Editing | undefined;
+  onComment: (at: Anchor) => void;
+  onEdit: (note: Note) => void;
+  onSave: (body: string) => void;
+  onCancel: () => void;
+  onDelete: (id: number) => void;
+}
+
+/** A line number that opens a comment on its line; on a mouse, the row shows a plus over it. */
+function LineButton({ at }: { at: Anchor & { onComment: (at: Anchor) => void } }) {
+  const { onComment, ...where } = at;
+  return (
+    <button
+      type="button"
+      tabIndex={-1}
+      aria-label={`Comment on ${lineName(where)}`}
+      title="Comment for Claude"
+      onClick={() => onComment(where)}
+      className="relative w-full cursor-pointer pr-2 text-right hover:text-sky-300"
+    >
+      <span className="pointer-fine:group-hover/line:invisible">{where.line}</span>
+      <svg
+        viewBox="0 0 16 16"
+        className="absolute inset-y-0 right-1 my-auto hidden size-4 rounded-sm bg-sky-400 p-0.5 text-neutral-950 pointer-fine:group-hover/line:block"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+        aria-hidden="true"
+      >
+        <path d="M8 3.5v9M3.5 8h9" strokeLinecap="round" />
+      </svg>
+    </button>
+  );
 }
 
 /** One file's diff. The parent remounts it when its standing changes, so ticking Viewed folds it and a change since opens it. */
-function FileDiff({ file, state, kept, current, onViewed }: FileDiffProps) {
+function FileDiff({ file, state, kept, current, onViewed, notes, editing, onComment, onEdit, onSave, onCancel, onDelete }: FileDiffProps) {
   const lines = file.patch === null ? [] : diffLines(file.patch);
   const [open, setOpen] = useState(state !== "viewed" && lines.length <= FOLDED_PAST);
   const fresh = state === "changed" ? freshLines(lines, kept) : new Set<number>();
   const { dir, name } = splitPath(file.path);
+  const anchors = lines.map(anchor);
+  const placed = (n: Pick<Note, "side" | "line" | "code">) => anchors.some((a) => a && a.side === n.side && a.line === n.line && a.code === n.code);
+  const below = (n: Note) =>
+    editing?.id === n.id ? (
+      <NoteBox key={`edit-${n.id}`} name={lineName(n)} initial={n.body} onSave={onSave} onCancel={onCancel} />
+    ) : (
+      <NoteRow key={n.id} note={n} onEdit={() => onEdit(n)} onDelete={() => onDelete(n.id)} />
+    );
+  const astray = notes.filter((n) => !placed(n));
   return (
     <section
       aria-label={file.path}
@@ -365,22 +464,29 @@ function FileDiff({ file, state, kept, current, onViewed }: FileDiffProps) {
                   {line.text}
                 </div>
               ) : (
-                <div key={i} role="row" aria-label={`${line.kind} line${fresh.has(i) ? ", new since viewed" : ""}`} className={`flex min-w-max ${rowTone[line.kind]}`}>
-                  <span role="cell" className={`w-10 shrink-0 select-none border-l-[3px] pr-2 text-right text-neutral-600 ${fresh.has(i) ? "border-sky-400" : "border-transparent"}`}>
-                    {line.kind === "added" ? "" : line.old}
-                  </span>
-                  <span role="cell" className="w-10 shrink-0 select-none pr-2 text-right text-neutral-600">
-                    {line.kind === "removed" ? "" : line.new}
-                  </span>
-                  <span role="cell" className="w-4 shrink-0 select-none text-center opacity-70">
-                    {marker[line.kind]}
-                  </span>
-                  <span role="cell" className="whitespace-pre pr-4">
-                    {line.text}
-                  </span>
-                </div>
+                <Fragment key={i}>
+                  <div role="row" aria-label={`${line.kind} line${fresh.has(i) ? ", new since viewed" : ""}`} className={`group/line flex min-w-max ${rowTone[line.kind]}`}>
+                    <span role="cell" className={`flex w-10 shrink-0 select-none border-l-[3px] text-neutral-600 ${fresh.has(i) ? "border-sky-400" : "border-transparent"}`}>
+                      {line.kind === "removed" ? <LineButton at={{ ...anchors[i]!, onComment }} /> : line.kind === "same" ? <span className="w-full pr-2 text-right">{line.old}</span> : ""}
+                    </span>
+                    <span role="cell" className="flex w-10 shrink-0 select-none text-neutral-600">
+                      {line.kind === "removed" ? "" : <LineButton at={{ ...anchors[i]!, onComment }} />}
+                    </span>
+                    <span role="cell" className="w-4 shrink-0 select-none text-center opacity-70">
+                      {marker[line.kind]}
+                    </span>
+                    <span role="cell" className="whitespace-pre pr-4">
+                      {line.text}
+                    </span>
+                  </div>
+                  {notes.filter((n) => onLine(n, file.path, anchors[i]!)).map(below)}
+                  {editing && editing.id === undefined && onLine({ ...editing, id: 0, body: "" }, file.path, anchors[i]!) && (
+                    <NoteBox name={lineName(editing)} initial="" onSave={onSave} onCancel={onCancel} />
+                  )}
+                </Fragment>
               ),
             )}
+            {astray.map((n) => (editing?.id === n.id ? below(n) : <NoteRow key={n.id} note={n} moved onEdit={() => onEdit(n)} onDelete={() => onDelete(n.id)} />))}
           </div>
         ))}
     </section>

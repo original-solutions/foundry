@@ -175,7 +175,7 @@ Branch names are `<name>` as typed, made safe for git. Worktrees live under the 
 
 ### Changes
 
-A P3 diff view, built early on a read the daemon already had. `GET /api/workspaces/{id}/changes` lists what a workspace of this machine changed since it left `origin/<base>`: the commits on its branch and each changed file, committed or not, new files included, with its hunks. The read changes nothing in the worktree, never follows a symlink, and hides credentials in URLs. The UI shows it as a sheet opened from the terminal header or the workspace's row, reading again every few seconds while open.
+A P3 diff view, built early on a read the daemon already had. `GET /api/workspaces/{id}/changes` lists what a workspace of this machine changed since it left `origin/<base>`: the commits on its branch and each changed file, committed or not, new files included, with its hunks. The read changes nothing in the worktree, never follows a symlink, and hides credentials in URLs. The UI shows it as a sheet opened from the terminal header or the workspace's row, reading again every few seconds while open. A line number in the sheet takes a comment for Claude on that line; the comments are sent together to one of the workspace's idle sessions as a single message, typed into its terminal with Enter, each with its file, line and the line's text. A session that is working or waiting for an answer cannot be sent to. Unsent comments are kept in the open page only.
 
 ### Pull requests
 

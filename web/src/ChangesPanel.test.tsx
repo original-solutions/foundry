@@ -1,9 +1,10 @@
-import { fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Changes } from "./api";
 import { ChangesPanel } from "./ChangesPanel";
 import { loadViewed, saveViewed, seen } from "./review";
-import { json, mockFetch, renderApp } from "./test-utils";
+import { FakeSocket, json, mockFetch, renderApp } from "./test-utils";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -124,5 +125,153 @@ describe("ChangesPanel", () => {
     expect(panel.textContent).toContain("All 3 viewed");
     fireEvent.keyDown(panel, { key: "j", metaKey: true });
     expect(current()).toBe("docs/notes.md");
+  });
+
+  describe("comments for Claude", () => {
+    const sessions = [
+      { id: "s1", model: "opus", state: "idle" as const, terminal: "t1" },
+      { id: "s2", model: "opus", state: "working" as const, terminal: "t2" },
+    ];
+    const typed = (socket: FakeSocket) => socket.sent.map((d) => (typeof d === "string" ? d : new TextDecoder().decode(d)));
+
+    async function commented(over: { sessions?: typeof sessions } = {}) {
+      FakeSocket.install();
+      mockFetch(json(200, changes), json(200, changes));
+      const view = await renderApp(<ChangesPanel workspace={{ ...target, sessions: over.sessions ?? sessions }} onClose={() => {}} />);
+      const panel = await screen.findByRole("dialog", { name: /changes in fix login/i });
+      const file = await within(panel).findByRole("region", { name: "src/login.ts" });
+      fireEvent.click(within(file).getByRole("button", { name: "Comment on line 6" }));
+      const box = within(file).getByRole("textbox", { name: "Comment on line 6" });
+      fireEvent.change(box, { target: { value: "call it total" } });
+      fireEvent.keyDown(box, { key: "Enter", metaKey: true });
+      return { ...view, panel, file };
+    }
+
+    it("puts a comment under the line it was written on, and typing j or v in it moves nothing", async () => {
+      FakeSocket.install();
+      mockFetch(json(200, changes));
+      await renderApp(<ChangesPanel workspace={{ ...target, sessions }} onClose={() => {}} />);
+      const panel = await screen.findByRole("dialog", { name: /changes in fix login/i });
+      const file = await within(panel).findByRole("region", { name: "src/login.ts" });
+      fireEvent.click(within(file).getByRole("button", { name: "Comment on removed line 5" }));
+      const box = within(file).getByRole("textbox", { name: "Comment on removed line 5" });
+      fireEvent.keyDown(box, { key: "j" });
+      fireEvent.keyDown(box, { key: "v" });
+      expect(panel.querySelector("section[aria-current='true']")).toBeNull();
+      expect(panel.textContent).toContain("0 of 3 viewed");
+      fireEvent.change(box, { target: { value: "keep b at 2" } });
+      fireEvent.click(within(file).getByRole("button", { name: "Add comment" }));
+      const note = within(file).getByRole("row", { name: "Comment on removed line 5" });
+      expect(note.textContent).toContain("keep b at 2");
+      const rows = within(file).getAllByRole("row");
+      expect(rows.indexOf(note)).toBe(rows.findIndex((r) => r.textContent === "5-const b = 2;") + 1);
+      expect(within(panel).getByRole("button", { name: "Send 1 comment to opus 1" })).toBeDefined();
+    });
+
+    it("Escape in a comment box closes the box, not the sheet", async () => {
+      FakeSocket.install();
+      mockFetch(json(200, changes));
+      await renderApp(<ChangesPanel workspace={{ ...target, sessions }} onClose={() => {}} />);
+      const panel = await screen.findByRole("dialog", { name: /changes in fix login/i });
+      const file = await within(panel).findByRole("region", { name: "src/login.ts" });
+      fireEvent.click(within(file).getByRole("button", { name: "Comment on line 6" }));
+      fireEvent.keyDown(within(file).getByRole("textbox"), { key: "Escape" });
+      expect(within(file).queryByRole("textbox")).toBeNull();
+      expect(screen.getByRole("dialog", { name: /changes in fix login/i })).toBeDefined();
+    });
+
+    it("sends every comment to the idle session as one message and presses Enter, then says so", async () => {
+      const { panel, file } = await commented();
+      fireEvent.click(within(panel).getByRole("button", { name: "Send 1 comment to opus 1" }));
+      const socket = FakeSocket.last();
+      expect(socket.url).toMatch(/\/api\/terminals\/t1$/);
+      act(() => socket.open());
+      expect(typed(socket)).toEqual([
+        "\x1b[200~Review comments on your changes. Address each one, then say what you changed.\n\n1. src/login.ts:6\n   > const c = 4;\n   call it total\x1b[201~",
+        "\r",
+      ]);
+      await waitFor(() => expect(within(panel).getByRole("status").textContent).toContain("Sent 1 comment to opus 1"));
+      expect(within(file).queryByRole("row", { name: /^Comment on/ })).toBeNull();
+    });
+
+    it("after sending, shows the session at work on the comments for as long as it works", async () => {
+      FakeSocket.install();
+      mockFetch(json(200, changes));
+      function Working() {
+        const [state, setState] = useState<"idle" | "working">("idle");
+        return (
+          <>
+            <button onClick={() => setState("working")}>Start the turn</button>
+            <ChangesPanel workspace={{ ...target, sessions: [{ ...sessions[0], state }] }} onClose={() => {}} />
+          </>
+        );
+      }
+      await renderApp(<Working />);
+      const file = await screen.findByRole("region", { name: "src/login.ts" });
+      fireEvent.click(within(file).getByRole("button", { name: "Comment on line 6" }));
+      fireEvent.change(within(file).getByRole("textbox"), { target: { value: "call it total" } });
+      fireEvent.keyDown(within(file).getByRole("textbox"), { key: "Enter", metaKey: true });
+      fireEvent.click(screen.getByRole("button", { name: "Send 1 comment to opus" }));
+      act(() => FakeSocket.last().open());
+      await screen.findByRole("status");
+      fireEvent.click(screen.getByRole("button", { name: "Start the turn", hidden: true }));
+      const status = screen.getByRole("status");
+      expect(status.textContent).toContain("opus is working on it");
+      expect(status.querySelector("[data-glyph='working']")).not.toBeNull();
+    });
+
+    it("keeps the comments and says so when the session cannot be reached", async () => {
+      const { panel, file } = await commented();
+      fireEvent.click(within(panel).getByRole("button", { name: "Send 1 comment to opus 1" }));
+      act(() => FakeSocket.last().end(1011, "terminal gone"));
+      await waitFor(() => expect(within(panel).getByRole("alert").textContent).toContain("Could not reach opus 1"));
+      expect(within(file).getByRole("row", { name: "Comment on line 6" }).textContent).toContain("call it total");
+    });
+
+    it("sends nothing while no session is idle, and says why", async () => {
+      const { panel } = await commented({ sessions: [sessions[1]] });
+      const send = within(panel).getByRole("button", { name: "Send 1 comment to opus" });
+      expect(send).toHaveProperty("disabled", true);
+      expect(panel.textContent).toContain("opus is working");
+      fireEvent.click(send);
+      expect(FakeSocket.all).toHaveLength(0);
+    });
+
+    it("keeps unsent comments when the sheet closes and opens again", async () => {
+      FakeSocket.install();
+      mockFetch(json(200, changes), json(200, changes));
+      function Reopen() {
+        const [open, setOpen] = useState(true);
+        return (
+          <>
+            <button onClick={() => setOpen(true)}>Open changes</button>
+            <ChangesPanel workspace={open ? { ...target, sessions } : undefined} onClose={() => setOpen(false)} />
+          </>
+        );
+      }
+      await renderApp(<Reopen />);
+      const file = await screen.findByRole("region", { name: "src/login.ts" });
+      fireEvent.click(within(file).getByRole("button", { name: "Comment on line 6" }));
+      fireEvent.change(within(file).getByRole("textbox"), { target: { value: "call it total" } });
+      fireEvent.keyDown(within(file).getByRole("textbox"), { key: "Enter", metaKey: true });
+      fireEvent.click(screen.getByRole("button", { name: "Close changes" }));
+      await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+      fireEvent.click(screen.getByRole("button", { name: "Open changes" }));
+      const again = await screen.findByRole("region", { name: "src/login.ts" });
+      expect(within(again).getByRole("row", { name: "Comment on line 6" }).textContent).toContain("call it total");
+    });
+
+    it("deletes a comment, and edits one by clicking it", async () => {
+      const { panel, file } = await commented();
+      fireEvent.click(within(file).getByRole("button", { name: /call it total/ }));
+      const box = within(file).getByRole("textbox", { name: "Comment on line 6" });
+      expect((box as HTMLTextAreaElement).value).toBe("call it total");
+      fireEvent.change(box, { target: { value: "call it sum" } });
+      fireEvent.keyDown(box, { key: "Enter", ctrlKey: true });
+      expect(within(file).getByRole("row", { name: "Comment on line 6" }).textContent).toContain("call it sum");
+      fireEvent.click(within(file).getByRole("button", { name: "Delete comment on line 6" }));
+      expect(within(file).queryByRole("row", { name: /^Comment on/ })).toBeNull();
+      expect(within(panel).queryByRole("button", { name: /^Send/ })).toBeNull();
+    });
   });
 });
