@@ -1276,6 +1276,7 @@ async fn every_route_refuses_another_site_and_another_host_and_does_nothing() {
         ("POST", &archive, Some(force), false),
         ("POST", &sessions, Some(model), false),
         ("POST", &shells, None, false),
+        ("GET", "/api/briefs", None, false),
     ];
     for (method, path, body, upgrade) in routes {
         for (name, value) in [
@@ -1314,6 +1315,54 @@ async fn every_route_refuses_another_site_and_another_host_and_does_nothing() {
         .await
         .unwrap();
     read_until(&mut socket, "still here").await;
+}
+
+// --- briefs ---
+
+#[tokio::test]
+async fn briefs_name_each_sessions_first_prompt_and_newest_step_with_url_passwords_hidden() {
+    let daemon = Daemon::new(
+        "
+- hook: {event: UserPromptSubmit, prompt: \"fetch https://me:hunter2@example.com/a\"}
+- hook: {event: PreToolUse, tool_name: Bash, tool_input: {command: \"git push https://me:hunter2@example.com/r\"}}
+- wait_input
+",
+    )
+    .await;
+    let project = daemon.project();
+    let workspace = daemon.create_workspace(project, "briefed").await;
+    let reply = daemon
+        .call(
+            "POST",
+            &format!("/api/workspaces/{workspace}/sessions"),
+            Some(serde_json::json!({"model": MODEL})),
+        )
+        .await;
+    assert_eq!(reply.status, 201, "{}", reply.body);
+    let session: SessionId = reply.id();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let brief = loop {
+        let reply = daemon.call("GET", "/api/briefs", None).await;
+        assert_eq!(reply.status, 200, "{}", reply.body);
+        let briefs: serde_json::Value = serde_json::from_str(&reply.body).unwrap();
+        let brief = briefs[session.to_string()].clone();
+        if brief["now"]["kind"] == "tool" {
+            break brief;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no tool step in {briefs}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(
+        brief,
+        serde_json::json!({
+            "title": "fetch https://***@example.com/a",
+            "now": {"kind": "tool", "text": "$ git push https://***@example.com/r"},
+        })
+    );
 }
 
 // --- events ---

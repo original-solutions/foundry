@@ -10,7 +10,7 @@ use axum::http::{HeaderMap, StatusCode, header::AUTHORIZATION};
 use foundry_proto::ids::SessionId;
 
 use super::state::{Event, Hook};
-use super::{Backoff, Inner, Live};
+use super::{Backoff, Inner, Live, lock};
 
 /// How long a hook whose record cannot be written is tried again for, with a growing wait. No
 /// try starts after it, so the answer usually reaches the hook command within the 5 seconds it
@@ -48,18 +48,30 @@ pub(super) async fn hook(
         tracing::warn!(session = %session, "hook refused: no such session or wrong token");
         return StatusCode::FORBIDDEN;
     }
-    let hook = serde_json::from_slice::<serde_json::Value>(&body)
-        .ok()
-        .and_then(|payload| Hook::from_payload(&payload));
-    let Some(hook) = hook else {
+    let payload = serde_json::from_slice::<serde_json::Value>(&body).ok();
+    let Some((payload, hook)) = payload.and_then(|p| Hook::from_payload(&p).map(|hook| (p, hook)))
+    else {
         return StatusCode::BAD_REQUEST;
     };
+    note(&inner, &live, &payload);
     tokio::spawn(async move { apply(&inner, &live, hook).await })
         .await
         .unwrap_or_else(|error| {
             tracing::error!(session = %session, %error, "hook not recorded");
             StatusCode::INTERNAL_SERVER_ERROR
         })
+}
+
+/// Takes `payload` into the session's brief, with the gateway key and every live session's
+/// token hidden in what it keeps.
+fn note(inner: &Inner, live: &Live, payload: &serde_json::Value) {
+    let tokens: Vec<String> = lock(&inner.live)
+        .values()
+        .map(|l| l.token.clone())
+        .collect();
+    let mut secrets: Vec<&str> = tokens.iter().map(String::as_str).collect();
+    secrets.push(&inner.config.gateway.key);
+    lock(&live.brief).note(payload, &secrets);
 }
 
 /// Applies `hook` to the session, trying again for [`KEEP_TRYING_FOR`] while the store does not

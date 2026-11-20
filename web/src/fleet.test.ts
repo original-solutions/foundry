@@ -223,3 +223,42 @@ describe("locate", () => {
     expect(locate(machines, "nope")).toBeUndefined();
   });
 });
+
+describe("briefs", () => {
+  const records = [
+    workspace(ME, "w1", "fix login"),
+    terminal(ME, "t1", "w1"),
+    session(ME, "s1", "w1", "t1", "working"),
+    terminal(ME, "t2", "w1"),
+    session(ME, "s2", "w1", "t2", "idle"),
+    terminal(ME, "t3", "w1"),
+    session(ME, "s3", "w1", "t3", "waiting_for_you"),
+  ];
+  const briefs = {
+    s1: { title: "fix the login bug", now: { kind: "tool" as const, text: "Edit src/login.ts" } },
+    s2: { title: "add a test", now: { kind: "prompt" as const, text: "left over" } },
+    s3: { title: null, now: { kind: "ask" as const, text: "Claude needs your permission to use Bash" } },
+  };
+
+  it("gives each session its first prompt as a title, so two sessions of one model read apart", () => {
+    const [machine] = fleet(records, settings(), briefs);
+    const list = rows(machine.workspaces[0]);
+    expect(list.map((r) => [r.name, r.title])).toEqual([
+      ["opus", "fix the login bug"],
+      ["opus", "add a test"],
+      ["opus", undefined],
+    ]);
+    expect(locate([machine], "t1")?.title).toBe("fix the login bug");
+  });
+
+  it("says what a session is doing only while it works, waits or is stuck", () => {
+    const [machine] = fleet(records, settings(), briefs);
+    const list = rows(machine.workspaces[0]);
+    expect(list.map((r) => r.now?.text)).toEqual(["Edit src/login.ts", undefined, "Claude needs your permission to use Bash"]);
+  });
+
+  it("leaves a session with no brief, as a peer's is, as it was", () => {
+    const [machine] = fleet(records, settings());
+    expect(rows(machine.workspaces[0]).every((r) => r.title === undefined && r.now === undefined)).toBe(true);
+  });
+});

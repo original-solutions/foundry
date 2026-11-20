@@ -1,4 +1,4 @@
-import type { AnyRecord, MachineSample, SessionState, SharedSettings, TerminalState, UiMessage } from "./api";
+import type { AnyRecord, Briefs, MachineSample, SessionState, SharedSettings, Step, TerminalState, UiMessage } from "./api";
 import { sessionLabel, sessionGlyph, terminalLabel, terminalGlyph, type Glyph } from "./labels";
 
 export interface FleetState {
@@ -50,6 +50,10 @@ export interface SessionView {
   model: string;
   state: SessionState;
   terminal: string;
+  /** Its first prompt, when this machine's daemon has its brief. */
+  title?: string;
+  /** The newest step of its turn. */
+  now?: Step;
 }
 export interface ShellView {
   id: string;
@@ -72,8 +76,8 @@ export interface MachineView {
   workspaces: WorkspaceView[];
 }
 
-/** The sidebar's model. Machine rules follow `foundryd status`. */
-export function fleet(records: AnyRecord[], settings: SharedSettings): MachineView[] {
+/** The sidebar's model. Machine rules follow `foundryd status`. `briefs` name sessions by what they were asked. */
+export function fleet(records: AnyRecord[], settings: SharedSettings, briefs: Briefs = {}): MachineView[] {
   const listed = settings.machines.map((m) => m.id);
   const others = [...new Set(records.filter((r) => r.kind === "machine_sample" && !listed.includes(r.owner)).map((r) => r.owner))].sort();
   const live = records.filter((r) => !r.deleted);
@@ -105,7 +109,14 @@ export function fleet(records: AnyRecord[], settings: SharedSettings): MachineVi
           name: w.name,
           branch: w.branch,
           project: settings.projects.find((p) => p.id === w.project)?.name ?? w.project,
-          sessions: mine.map((s) => ({ id: s.id, model: s.model, state: s.state, terminal: s.terminal })),
+          sessions: mine.map((s) => ({
+            id: s.id,
+            model: s.model,
+            state: s.state,
+            terminal: s.terminal,
+            title: briefs[s.id]?.title ?? undefined,
+            now: briefs[s.id]?.now ?? undefined,
+          })),
           shells: shellsOf.get(w.id) ?? [],
         },
       ];
@@ -125,6 +136,8 @@ export interface Located {
   machine: MachineView;
   workspace: WorkspaceView;
   name: string;
+  /** A session's first prompt. */
+  title?: string;
   label: string;
   glyph: Glyph;
 }
@@ -133,7 +146,7 @@ export function locate(machines: MachineView[], id: string): Located | undefined
   for (const machine of machines) {
     for (const workspace of machine.workspaces) {
       const row = rows(workspace).find((r) => r.terminal === id);
-      if (row) return { machine, workspace, name: row.name, label: row.label, glyph: row.glyph };
+      if (row) return { machine, workspace, name: row.name, title: row.title, label: row.label, glyph: row.glyph };
     }
   }
   return undefined;
@@ -143,14 +156,23 @@ export function locate(machines: MachineView[], id: string): Located | undefined
 export interface Row {
   terminal: string;
   name: string;
+  /** A session's first prompt, which tells two sessions of one model apart. */
+  title?: string;
+  /** What a session is doing, only while it works, waits or is stuck. */
+  now?: Step;
   label: string;
   glyph: Glyph;
 }
 
+const busy: Glyph[] = ["working", "waiting", "stuck"];
+
 /** A workspace's terminals in sidebar order: its sessions, then its shells. */
 export function rows(workspace: WorkspaceView): Row[] {
   return [
-    ...workspace.sessions.map((s) => ({ terminal: s.terminal, name: s.model, label: sessionLabel[s.state], glyph: sessionGlyph[s.state] })),
+    ...workspace.sessions.map((s) => {
+      const glyph = sessionGlyph[s.state];
+      return { terminal: s.terminal, name: s.model, title: s.title, now: busy.includes(glyph) ? s.now : undefined, label: sessionLabel[s.state], glyph };
+    }),
     ...workspace.shells.map((t) => ({ terminal: t.id, name: "shell", label: terminalLabel(t.state, t.exitCode), glyph: terminalGlyph(t.state, t.exitCode) })),
   ];
 }

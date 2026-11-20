@@ -45,6 +45,19 @@ describe("search", () => {
   });
 });
 
+describe("briefs in the palette", () => {
+  it("finds a session by its title and shows the title under its name", () => {
+    const withBriefs = fleet(
+      [workspace(ME, "w1", "fix login"), terminal(ME, "t1", "w1"), session(ME, "s1", "w1", "t1", "idle"), terminal(ME, "t2", "w1"), session(ME, "s2", "w1", "t2", "idle")],
+      settings(),
+      { s1: { title: "make the button blue", now: null }, s2: { title: "write the release notes", now: null } },
+    );
+    const found = search(destinations(withBriefs), "release");
+    expect(found).toHaveLength(1);
+    expect(found[0]).toMatchObject({ kind: "terminal", terminal: "t2", title: "fix login / opus", subtitle: "write the release notes" });
+  });
+});
+
 describe("newWorkspace", () => {
   it("names a new workspace with what was typed, and offers none for nothing", () => {
     expect(newWorkspace("  add   search ")).toEqual([expect.objectContaining({ kind: "workspace", name: "add search", title: "New workspace “add search”" })]);

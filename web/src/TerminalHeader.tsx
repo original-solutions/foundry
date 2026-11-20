@@ -62,6 +62,11 @@ export function TerminalHeader({
             <span className="truncate font-medium text-neutral-100">{located.workspace.name}</span>
             <span className="text-neutral-600">/</span>
             <span className="shrink-0 text-neutral-300">{located.name}</span>
+            {located.title && (
+              <span className="hidden min-w-0 truncate text-neutral-400 sm:inline" title={located.title}>
+                · {located.title}
+              </span>
+            )}
             <span className="ml-2 hidden min-w-0 truncate text-xs text-neutral-500 sm:inline" title={`Runs on ${located.machine.name}`}>
               {located.machine.name}
             </span>

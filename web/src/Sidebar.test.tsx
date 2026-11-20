@@ -74,6 +74,21 @@ describe("Sidebar", () => {
     expect(screen.getByRole("group", { name: "empty" })).toBeDefined();
   });
 
+  it("names each session by its first prompt and says what a working one is doing", async () => {
+    const records = [workspace(ME, "w1", "fix login"), terminal(ME, "t1", "w1"), session(ME, "s1", "w1", "t1", "working"), terminal(ME, "t2", "w1"), session(ME, "s2", "w1", "t2", "idle")];
+    const briefs = {
+      s1: { title: "fix the login bug", now: { kind: "tool" as const, text: "Edit src/login.ts" } },
+      s2: { title: "write the release notes", now: null },
+    };
+    await renderApp(<Sidebar machines={fleet(records, settings(), briefs)} {...props} />);
+
+    const group = screen.getByRole("group", { name: "fix login" });
+    const working = within(group).getByRole("link", { name: /opus fix the login bug.*Working/ });
+    expect(within(working).getByText("Edit src/login.ts")).toBeDefined();
+    expect(working.getAttribute("title")).toBe("opus: fix the login bug");
+    expect(within(group).getByRole("link", { name: /opus write the release notes.*Idle/ })).toBeDefined();
+  });
+
   it("highlights the selected terminal", async () => {
     await renderApp(<Sidebar machines={machines()} selected="sh2" {...props} />);
 

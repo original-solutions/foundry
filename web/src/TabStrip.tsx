@@ -36,7 +36,7 @@ export function TabStrip({ machines, tabs, active, beside, changed, onClose }: P
     >
       {tabs.map((id) => {
         const found = locate(machines, id);
-        const title = found ? `${found.workspace.name} / ${found.name}` : "Terminal";
+        const title = found ? `${found.workspace.name} / ${found.title ?? found.name}` : "Terminal";
         const current = id === active;
         const fresh = !current && changed.has(id);
         return (

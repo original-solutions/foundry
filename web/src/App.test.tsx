@@ -2,7 +2,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createMemoryHistory, createRouter, RouterProvider } from "@tanstack/react-router";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { UiMessage } from "./api";
+import type { Briefs, UiMessage } from "./api";
 import { router, routeTree } from "./App";
 import { ME, sample, session, settings, terminal, workspace } from "./test-fixtures";
 import { FakeSocket, json, mockFetch, type Call } from "./test-utils";
@@ -29,15 +29,19 @@ vi.mock("@xterm/xterm", () => ({
 vi.mock("@xterm/addon-fit", () => ({ FitAddon: class { fit() {} } }));
 
 /**
- * Like `mockFetch`, but the board's reads of each workspace's changes get an empty answer and are
- * left out of the calls, so a test sees only the requests it makes.
+ * Like `mockFetch`, but the board's reads of each workspace's changes get an empty answer, and the
+ * reads of session briefs get `briefs`; both are left out of the calls, so a test sees only the
+ * requests it makes.
  */
+let briefs: Briefs = {};
+
 function mockActions(...answers: Response[]): Call[] {
   const calls: Call[] = [];
   vi.stubGlobal(
     "fetch",
     vi.fn(async (url: string, init: RequestInit = {}) => {
       if (url.endsWith("/changes")) return json(200, { base: "main", commits: [], files: [] });
+      if (url.endsWith("/api/briefs")) return json(200, briefs);
       calls.push({ url, method: init.method ?? "GET", body: init.body ? JSON.parse(String(init.body)) : undefined });
       const next = answers.shift();
       if (!next) throw new Error("unexpected request");
@@ -50,6 +54,7 @@ function mockActions(...answers: Response[]): Call[] {
 const sockets = (path: string) => FakeSocket.all.filter((s) => s.url.endsWith(path));
 
 beforeEach(() => {
+  briefs = {};
   localStorage.clear();
   FakeSocket.install();
   vi.stubGlobal(
@@ -125,6 +130,18 @@ describe("App", () => {
     expect(within(header).getByText("sonnet")).toBeDefined();
     expect(within(header).getByText("studio")).toBeDefined();
     expect(within(header).getByText("Working")).toBeDefined();
+  });
+
+  it("names the open session by its first prompt in the header, the tab and the sidebar, and says what it is doing", async () => {
+    briefs = { s1: { title: "fix the login bug", now: { kind: "tool", text: "Edit src/login.ts" } } };
+    mockActions();
+    await open("/terminals/t1", live);
+
+    const header = screen.getByLabelText("Open terminal");
+    expect(await within(header).findByText("· fix the login bug")).toBeDefined();
+    expect(screen.getByRole("tab", { name: /fix login \/ fix the login bug/ })).toBeDefined();
+    const sidebar = screen.getByRole("group", { name: "fix login" });
+    expect(within(sidebar).getByText("Edit src/login.ts")).toBeDefined();
   });
 
   it("titles the tab with the fleet's state, and a desktop alert's click opens the session it names", async () => {

@@ -8,6 +8,7 @@ import type { MachineView } from "./fleet";
 import { jumpKey, SearchIcon } from "./JumpPalette";
 import type { Glyph } from "./labels";
 import { glyphText, StateGlyph } from "./StateGlyph";
+import { Named, Now } from "./Now";
 
 /**
  * How often a card on screen reads its workspace's changes while an agent in it works. A quiet
@@ -178,11 +179,19 @@ function WorkspaceCard({ card, showMachine, onChanges }: { card: Card; showMachi
             <Link
               to="/terminals/$terminalId"
               params={{ terminalId: row.terminal }}
-              className={`flex items-center gap-2.5 rounded-md px-2 py-1 text-sm hover:bg-neutral-800/80 ${row.glyph === "done" || row.glyph === "away" ? "text-neutral-500" : "text-neutral-200"}`}
+              title={row.title ? `${row.name}: ${row.title}` : undefined}
+              className={`flex items-start gap-2.5 rounded-md px-2 py-1 text-sm hover:bg-neutral-800/80 ${row.glyph === "done" || row.glyph === "away" ? "text-neutral-500" : "text-neutral-200"}`}
             >
-              <StateGlyph glyph={row.glyph} />
-              <span className="truncate">{row.name}</span>
-              <span className={`ml-auto shrink-0 text-xs ${glyphText[row.glyph]}`}>{row.label}</span>
+              <span className="flex h-5 shrink-0 items-center">
+                <StateGlyph glyph={row.glyph} />
+              </span>
+              <span className="min-w-0 flex-1">
+                <span className="flex items-baseline gap-2 leading-5">
+                  <Named name={row.name} title={row.title} />
+                  <span className={`shrink-0 text-xs ${glyphText[row.glyph]}`}>{row.label}</span>
+                </span>
+                {row.now && <Now step={row.now} />}
+              </span>
             </Link>
           </li>
         ))}

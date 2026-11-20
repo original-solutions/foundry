@@ -1210,3 +1210,37 @@ fn logs() -> Arc<Mutex<Vec<u8>>> {
     })
     .clone()
 }
+
+#[tokio::test]
+async fn a_sessions_brief_names_its_first_prompt_and_its_newest_step_with_its_secrets_hidden() {
+    let f = Fixture::new("- wait_input\n").await;
+    let id = f.start().await;
+    let other = f.start().await;
+    assert_eq!(f.sessions.briefs().get(&id), Some(&brief::Brief::default()));
+
+    let token = f.token(other);
+    let prompt = serde_json::json!({
+        "hook_event_name": "UserPromptSubmit",
+        "prompt": format!("fix it with {} and {token}", f.key),
+    });
+    let prompt: &'static str = Box::leak(prompt.to_string().into_boxed_str());
+    assert_eq!(loopback_hook(&f, id, prompt).await, StatusCode::NO_CONTENT);
+    let tool =
+        r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"ls"}}"#;
+    assert_eq!(loopback_hook(&f, id, tool).await, StatusCode::NO_CONTENT);
+
+    let briefs = f.sessions.briefs();
+    let brief = &briefs[&id];
+    assert_eq!(brief.title.as_deref(), Some("fix it with ••• and •••"));
+    assert_eq!(brief.now.as_ref().map(|s| s.text.as_str()), Some("$ ls"));
+    assert_eq!(briefs[&other], brief::Brief::default());
+}
+
+#[tokio::test]
+async fn a_refused_hook_leaves_the_brief_alone() {
+    let f = Fixture::new("- wait_input\n").await;
+    let id = f.start().await;
+    let body = r#"{"hook_event_name":"UserPromptSubmit","prompt":"sneaky"}"#;
+    assert_eq!(post(f.url(id), Some("wrong".into()), body).await, 403);
+    assert_eq!(f.sessions.briefs()[&id], brief::Brief::default());
+}

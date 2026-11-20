@@ -5,6 +5,7 @@ import { ArchiveButton } from "./ArchiveButton";
 import { button } from "./Modal";
 import { jumpKey, SearchIcon } from "./JumpPalette";
 import { NewSession } from "./NewSession";
+import { Named, Now } from "./Now";
 import { startShell } from "./api";
 import { loadFolded, saveFolded } from "./fold";
 import { byUrgency, machineNumbers, machineStats, rows, type MachineView, type Row, type WorkspaceView } from "./fleet";
@@ -284,10 +285,18 @@ function Item({ row, selected, onNavigate }: { row: Row; selected?: string; onNa
         params={{ terminalId: row.terminal }}
         aria-current={current ? "true" : undefined}
         onClick={onNavigate}
-        className={`flex items-center gap-2 rounded px-2 py-1.5 hover:bg-neutral-800 md:py-1 ${current ? "bg-neutral-800 text-neutral-50" : ended ? "text-neutral-500" : ""}`}
+        title={row.title ? `${row.name}: ${row.title}` : undefined}
+        className={`flex items-start gap-2 rounded px-2 py-1.5 hover:bg-neutral-800 md:py-1 ${current ? "bg-neutral-800 text-neutral-50" : ended ? "text-neutral-500" : ""}`}
       >
-        <StateGlyph glyph={row.glyph} />
-        <span className="flex-1 truncate">{row.name}</span> <span className={`shrink-0 text-xs ${ended ? "" : glyphText[row.glyph]}`}>{row.label}</span>
+        <span className="flex h-5 shrink-0 items-center">
+          <StateGlyph glyph={row.glyph} />
+        </span>
+        <span className="min-w-0 flex-1">
+          <span className="flex items-baseline gap-2 leading-5">
+            <Named name={row.name} title={row.title} /> <span className={`shrink-0 text-xs ${ended ? "" : glyphText[row.glyph]}`}>{row.label}</span>
+          </span>
+          {row.now && <Now step={row.now} />}
+        </span>
       </Link>
     </li>
   );

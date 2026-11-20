@@ -166,7 +166,10 @@ function Panel({
             ) : (
               <PlusIcon className="size-4 shrink-0 text-neutral-500" />
             )}
-            <span className="min-w-0 flex-1 truncate">{d.title}</span>
+            <span className="min-w-0 flex-1">
+              <span className="block truncate">{d.title}</span>
+              {d.kind === "terminal" && d.subtitle && <span className="block truncate text-xs text-neutral-500">{d.subtitle}</span>}
+            </span>
             {d.kind === "terminal" && <span className="shrink-0 text-xs text-neutral-400">{d.label}</span>}
             {many && <span className="hidden max-w-32 shrink-0 truncate text-xs text-neutral-500 sm:inline">{d.machine}</span>}
           </li>

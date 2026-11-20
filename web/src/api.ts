@@ -153,3 +153,22 @@ export async function workspaceChanges(workspace: string): Promise<Changes> {
   if (!response.ok) throw refused(response.status, json);
   return json as unknown as Changes;
 }
+
+/** The newest step of a session's turn: a prompt, a tool about to run, or a question for you. */
+export interface Step {
+  kind: "prompt" | "tool" | "ask";
+  text: string;
+}
+/** What a session is for (its first prompt) and doing, from its hooks. */
+export interface Brief {
+  title: string | null;
+  now: Step | null;
+}
+/** Briefs by session id: only this machine's sessions, since this daemon started. */
+export type Briefs = Record<string, Brief>;
+
+export async function sessionBriefs(): Promise<Briefs> {
+  const response = await fetch("/api/briefs");
+  if (!response.ok) throw new ApiError(`briefs failed (${response.status})`);
+  return (await response.json()) as Briefs;
+}

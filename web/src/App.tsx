@@ -11,6 +11,7 @@ import { loadTabs, saveTabs, withoutTab, withTab } from "./tabs";
 import { TerminalHeader } from "./TerminalHeader";
 import { TerminalPane } from "./TerminalPane";
 import { fleet, locate, terminalRunning } from "./fleet";
+import { useBriefs } from "./useBriefs";
 import { useFleet } from "./useFleet";
 import { AlertsButton, useAlerts } from "./AlertsBell";
 
@@ -31,6 +32,9 @@ import { AlertsButton, useAlerts } from "./AlertsBell";
  *
  * A workspace's changes since its base open as a sheet from the header or the workspace's row.
  *
+ * Each session is named by its first prompt, and a busy one says what it is doing, from the
+ * daemon's briefs of its hooks.
+ *
  * The browser tab shows the fleet's state in its title and icon, and the sidebar's bell turns on
  * desktop alerts for a session that finishes its turn or needs you.
  *
@@ -42,7 +46,8 @@ import { AlertsButton, useAlerts } from "./AlertsBell";
 function Layout() {
   const { state, connected } = useFleet();
   const { terminalId } = useParams({ strict: false });
-  const machines = useMemo(() => fleet(state.records, state.settings), [state.records, state.settings]);
+  const briefs = useBriefs(state.records);
+  const machines = useMemo(() => fleet(state.records, state.settings, briefs), [state.records, state.settings, briefs]);
   const [drawer, setDrawer] = useState(false);
   /** The palette, and whether its picks open beside the open terminal. */
   const [jump, setJump] = useState<"jump" | "beside">();
