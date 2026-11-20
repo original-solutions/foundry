@@ -1867,9 +1867,16 @@ async fn sweep_keeps_the_worktrees_live_records_of_another_identity_name() {
     std::fs::write(worktree.join(".env"), "mine").unwrap();
 
     let after_new_identity = setup.workspaces_as(MachineId::random(), setup.store.clone());
+    let (_guard, logs) = logs();
     after_new_identity.sweep().await.unwrap();
 
     assert!(worktree.join(".env").exists());
+    let text = text_of(&logs);
+    let line = text
+        .lines()
+        .find(|l| l.contains(&format!("{}/mine", remote.project)))
+        .unwrap_or_else(|| panic!("no line names the worktree: {text}"));
+    assert!(line.contains("another machine"), "{line}");
 }
 
 /// A store made again over the same data directory has no settings, so it cannot say which
