@@ -2,7 +2,8 @@
 //!
 //! Every 5 seconds this machine writes one [`MachineSample`] record of its own: the whole
 //! machine's load per core, its free memory, the free disk on the volume holding the data
-//! directory, and its live session count. The record's version is the sample's `at_version`.
+//! directory, its live session count, and the tag its updater refused while the version
+//! installed is not above it. The record's version is the sample's `at_version`.
 //! [`over_limits`] says which of a machine's limits a sample is at or over, one [`Reason`]
 //! per limit.
 
@@ -19,6 +20,7 @@ use sysinfo::{CpuRefreshKind, LoadAvg, MemoryRefreshKind, RefreshKind, System};
 use tokio::time::MissedTickBehavior;
 
 use crate::store::{Store, StoreError};
+use crate::update;
 
 /// How often this machine writes its sample.
 pub const SAMPLE_EVERY: Duration = Duration::from_secs(5);
@@ -168,6 +170,7 @@ pub fn write_sample(
     let mut store = store.lock().unwrap_or_else(PoisonError::into_inner);
     let body = MachineSample {
         sessions: live_sessions(&store, me)?,
+        update_refused: update_refused(data_dir),
         ..machine
     };
     let record = Record {
@@ -178,6 +181,21 @@ pub fn write_sample(
     };
     store.apply(&AnyRecord::MachineSample(record.clone()), me)?;
     Ok(record)
+}
+
+/// The tag the updater in `home` refused, like `v0.2.0`, while the version `current` names is
+/// not above it: a higher version installed clears it. An `update.json` that cannot be read is
+/// logged and reports nothing, so it never stops a sample.
+pub fn update_refused(home: &Path) -> Option<String> {
+    let refused = match update::state(home) {
+        Ok(state) => state.refused?,
+        Err(error) => {
+            tracing::warn!("the refused tag cannot be read: {error}");
+            return None;
+        }
+    };
+    let version = refused.strip_prefix('v').unwrap_or(&refused);
+    (!update::lowered(update::current_version(home).as_deref(), version)).then_some(refused)
 }
 
 /// Sessions `me` owns that are not removed and have not finished or failed.
