@@ -1563,21 +1563,35 @@ async fn start_sleeper(
 async fn a_start_racing_an_archive_leaves_no_live_terminal_in_the_archived_workspace() {
     let setup = Setup::new();
     let remote = setup.project(&[("README.md", "hello\n")]);
+    let (mut ran_before, mut found_gone) = (0, 0);
     for round in 0..10 {
         let id = setup
             .create(&remote, "main", &format!("race {round}"))
             .await;
-        let (a, b, archived) = tokio::join!(
-            start_sleeper(&setup.workspaces, id),
-            start_sleeper(&setup.workspaces, id),
-            setup.workspaces.archive(id, true),
-        );
+        // Each is polled, and so queues for the lock, in the order given: odd rounds put the
+        // archive first, so starts wait behind it as well as ahead of it.
+        let archive = setup.workspaces.archive(id, true);
+        let (a, b, archived) = if round % 2 == 0 {
+            tokio::join!(
+                start_sleeper(&setup.workspaces, id),
+                start_sleeper(&setup.workspaces, id),
+                archive,
+            )
+        } else {
+            let (archived, a, b) = tokio::join!(
+                archive,
+                start_sleeper(&setup.workspaces, id),
+                start_sleeper(&setup.workspaces, id),
+            );
+            (a, b, archived)
+        };
         archived.unwrap_or_else(|e| panic!("round {round}: {e}"));
         for started in [a, b] {
-            assert!(
-                matches!(started, Ok(_) | Err(WorkspaceError::Unknown(_))),
-                "round {round}: {started:?}"
-            );
+            match started {
+                Ok(_) => ran_before += 1,
+                Err(WorkspaceError::Unknown(w)) if w == id => found_gone += 1,
+                other => panic!("round {round}: {other:?}"),
+            }
         }
         let live: Vec<_> = setup
             .terminals_of(id)
@@ -1590,6 +1604,10 @@ async fn a_start_racing_an_archive_leaves_no_live_terminal_in_the_archived_works
             "round {round}: terminals {live:?} are live in an archived workspace"
         );
     }
+    assert!(
+        ran_before > 0 && found_gone > 0,
+        "starts ran before the archive {ran_before} times and found it gone {found_gone} times"
+    );
 }
 
 #[tokio::test]
