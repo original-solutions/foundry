@@ -4,10 +4,14 @@ import { useRef, useState, type KeyboardEvent } from "react";
 import { workspaceChanges, type Changes, type Commit, type FileChange } from "./api";
 import { diffLines, splitPath, totals } from "./changes";
 import { plural } from "./labels";
+import { ShipLine } from "./Shipping";
 import { freshLines, loadViewed, nextUnviewed, progress, saveViewed, seen, standing, type Seen, type Standing, type Viewed } from "./review";
 
 /** How often an open panel reads the changes again, so an agent's edits show as it makes them. */
 export const CHANGES_EVERY = 3000;
+
+/** How often an open panel asks again where its branch stands: GitHub is asked, so not every few seconds. */
+const SHIPPING_EVERY = 30_000;
 
 /** A file with more diff lines than this starts folded. */
 const FOLDED_PAST = 400;
@@ -112,6 +116,7 @@ function Sheet({ workspace, onClose }: { workspace: Target; onClose: () => void 
                 )}
               </div>
             </Dialog.Description>
+            <ShipLine workspace={workspace.id} name={workspace.name} enabled every={SHIPPING_EVERY} className="mt-1.5" />
           </div>
           <Dialog.Close aria-label="Close changes" className="-mr-1 rounded p-1.5 text-neutral-400 hover:bg-neutral-800 hover:text-neutral-100">
             <svg viewBox="0 0 16 16" className="size-4" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">

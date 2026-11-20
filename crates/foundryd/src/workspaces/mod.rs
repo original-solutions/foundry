@@ -56,10 +56,12 @@ use crate::store::{Store, StoreError};
 use crate::terminals::{TerminalError, Terminals};
 
 mod changes;
+mod pr;
 #[cfg(test)]
 mod tests;
 
 pub use changes::{Changes, Commit, FileChange, FileStatus};
+pub use pr::{Checks, PrState, PullRequest, Review, Shipping};
 
 /// The longest branch [`safe_branch`] makes, in bytes.
 const BRANCH_AT_MOST: usize = 100;
@@ -212,6 +214,8 @@ struct Inner {
     terminals: Arc<Terminals>,
     data: PathBuf,
     git_within: Duration,
+    /// The program run to ask GitHub about a branch's pull request.
+    gh: std::ffi::OsString,
     /// One lock per project, held across every step that changes its clone or worktrees.
     projects: Mutex<HashMap<ProjectId, Arc<tokio::sync::Mutex<()>>>>,
     /// One lock per workspace, held by an archive and by a start for their whole work
@@ -250,11 +254,21 @@ impl Workspaces {
                 terminals,
                 data,
                 git_within,
+                gh: pr::gh(),
                 projects: Mutex::default(),
                 lifecycle: Mutex::default(),
                 removing: Mutex::default(),
             }),
         }
+    }
+
+    /// These workspaces asking GitHub with the program at `gh` in place of `gh`.
+    #[cfg(test)]
+    fn with_gh(mut self, gh: &Path) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("set before the workspaces are shared")
+            .gh = gh.into();
+        self
     }
 
     /// Makes a workspace of `project` named `name`, on a new branch from `base` on the

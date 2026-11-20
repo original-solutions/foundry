@@ -5,6 +5,7 @@ import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { glance, lanes, topFiles, type Card, type Lane } from "./lanes";
 import { useLeaving } from "./Archive";
 import { changesQuery } from "./ChangesPanel";
+import { ShipLine, shippingQuery } from "./Shipping";
 import { splitPath, totals } from "./changes";
 import type { MachineView } from "./fleet";
 import { jumpKey, SearchIcon } from "./JumpPalette";
@@ -189,6 +190,7 @@ function WorkspaceCard({ card, showMachine, onChanges }: { card: Card; showMachi
   const { workspace, machine, rows, lead } = card;
   const shown = rows.slice(0, ROWS_SHOWN);
   const terminals = useTerminalActions();
+  const leaving = useLeaving(workspace.id);
   return (
     <article
       ref={ref}
@@ -258,6 +260,15 @@ function WorkspaceCard({ card, showMachine, onChanges }: { card: Card; showMachi
         {rows.length === 0 && <li className="px-2 py-1 text-xs text-neutral-500">No terminals</li>}
       </ul>
       <ChangesFooter card={card} onScreen={onScreen} onOpen={() => onChanges(workspace.id)} />
+      {terminals?.here === machine.id && (
+        <ShipLine
+          workspace={workspace.id}
+          name={workspace.name}
+          enabled={onScreen && !leaving}
+          onArchive={() => terminals.archive(workspace.id)}
+          className="border-t border-neutral-800/70 bg-neutral-950/40 px-4 py-2"
+        />
+      )}
     </article>
   );
 }
@@ -290,6 +301,8 @@ function ChangesFooter({ card, onScreen, onOpen }: { card: Card; onScreen: boole
     if (leaving) return;
     // Read now if on screen; otherwise marked out of date, and read when it comes on screen.
     void client.invalidateQueries({ queryKey: changesQuery(workspace).queryKey, exact: true });
+    // A turn that ends may have pushed or opened a pull request.
+    void client.invalidateQueries({ queryKey: shippingQuery(workspace).queryKey, exact: true });
   }, [states, client, workspace, leaving]);
 
   let body: React.ReactNode;

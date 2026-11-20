@@ -2877,3 +2877,124 @@ async fn changes_of_a_workspace_that_is_not_here_are_refused() {
         .unwrap_err();
     assert!(matches!(err, WorkspaceError::Unknown(_)), "{err}");
 }
+
+/// Workspaces over `setup`'s data that ask GitHub with a script printing `answer`, which also
+/// writes each call's arguments to `asked` in the script's folder.
+fn with_gh(setup: &Setup, answer: &str) -> (Workspaces, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = setup.remotes.path().join("gh");
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("gh");
+    let asked = dir.join("asked");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncat <<'JSON'\n{answer}\nJSON\n",
+            asked.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let workspaces = Workspaces::with_git_within(
+        setup.me,
+        setup.store.clone(),
+        setup.data.path(),
+        setup.terminals.clone(),
+        GIT_WITHIN,
+    )
+    .with_gh(&script);
+    (workspaces, asked)
+}
+
+#[tokio::test]
+async fn a_branch_never_pushed_counts_what_is_only_here_and_never_asks_github() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup.create(&remote, "main", "local only").await;
+    let worktree = setup.worktree(remote.project, "local-only");
+    let (workspaces, asked) = with_gh(&setup, "[]");
+
+    let fresh = workspaces.shipping(id).await.unwrap();
+    assert_eq!(fresh.branch, "local-only");
+    assert!(!fresh.pushed);
+    assert_eq!(fresh.unpushed, 0);
+
+    std::fs::write(worktree.join("a.txt"), "a").unwrap();
+    git(&worktree, &["add", "a.txt"]);
+    git(&worktree, &["commit", "-q", "-m", "a"]);
+    git(&worktree, &["commit", "-q", "--allow-empty", "-m", "b"]);
+    let read = workspaces.shipping(id).await.unwrap();
+    assert!(!read.pushed);
+    assert_eq!(read.unpushed, 2);
+    assert_eq!(read.pr, None);
+    assert!(!read.unreachable);
+    assert!(
+        !asked.exists(),
+        "GitHub was asked about a branch it cannot have"
+    );
+}
+
+#[tokio::test]
+async fn a_pushed_branch_shows_its_pull_request_and_what_is_not_pushed_yet() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup.create(&remote, "main", "shipped").await;
+    let worktree = setup.worktree(remote.project, "shipped");
+    git(&worktree, &["commit", "-q", "--allow-empty", "-m", "done"]);
+    git(&worktree, &["push", "-q", "origin", "HEAD"]);
+    let (workspaces, asked) = with_gh(
+        &setup,
+        r#"[{"number":7,"title":"Ship it","url":"https://github.com/o/r/pull/7","state":"MERGED","isDraft":false,"reviewDecision":"APPROVED","statusCheckRollup":[]}]"#,
+    );
+
+    let read = workspaces.shipping(id).await.unwrap();
+    assert!(read.pushed);
+    assert_eq!(read.unpushed, 0);
+    let pr = read.pr.expect("its pull request");
+    assert_eq!((pr.number, pr.state), (7, PrState::Merged));
+    assert!(!read.unreachable);
+    let args = std::fs::read_to_string(&asked).unwrap();
+    assert!(args.contains("pr list"), "{args}");
+    assert!(args.trim_end().ends_with("--head shipped"), "{args}");
+
+    git(&worktree, &["commit", "-q", "--allow-empty", "-m", "after"]);
+    assert_eq!(workspaces.shipping(id).await.unwrap().unpushed, 1);
+}
+
+#[tokio::test]
+async fn a_github_that_cannot_answer_leaves_the_pull_request_unknown_not_an_error() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup.create(&remote, "main", "offline").await;
+    let worktree = setup.worktree(remote.project, "offline");
+    git(&worktree, &["push", "-q", "origin", "HEAD"]);
+
+    let missing = Workspaces::with_git_within(
+        setup.me,
+        setup.store.clone(),
+        setup.data.path(),
+        setup.terminals.clone(),
+        GIT_WITHIN,
+    )
+    .with_gh(&setup.remotes.path().join("no-such-gh"));
+    let read = missing.shipping(id).await.unwrap();
+    assert!(read.pushed);
+    assert_eq!(read.pr, None);
+    assert!(read.unreachable);
+
+    let (garbled, _) = with_gh(
+        &setup,
+        "To get started with GitHub CLI, please run: gh auth login",
+    );
+    assert!(garbled.shipping(id).await.unwrap().unreachable);
+}
+
+#[tokio::test]
+async fn the_shipping_of_an_unknown_workspace_is_refused() {
+    let setup = Setup::new();
+    let missing = WorkspaceId::random();
+    assert!(matches!(
+        setup.workspaces.shipping(missing).await,
+        Err(WorkspaceError::Unknown(id)) if id == missing
+    ));
+}

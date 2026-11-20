@@ -1386,6 +1386,7 @@ async fn every_route_refuses_another_site_and_another_host_and_does_nothing() {
     let model = serde_json::json!({"model": MODEL});
     let trail = format!("/api/sessions/{}/trail", SessionId::random());
     let changes = format!("/api/workspaces/{workspace}/changes");
+    let shipping = format!("/api/workspaces/{workspace}/pr");
     let routes: Vec<(&str, &str, Option<serde_json::Value>, bool)> = vec![
         ("GET", "/api/state", None, false),
         ("GET", "/api/events", None, true),
@@ -1399,6 +1400,7 @@ async fn every_route_refuses_another_site_and_another_host_and_does_nothing() {
         ("GET", "/api/machine", None, false),
         ("GET", &trail, None, false),
         ("GET", &changes, None, false),
+        ("GET", &shipping, None, false),
     ];
     for (method, path, body, upgrade) in routes {
         for (name, value) in [
@@ -2143,6 +2145,7 @@ async fn no_response_contains_a_secret() {
         "/api/briefs".to_owned(),
         format!("/api/sessions/{session}/trail"),
         format!("/api/workspaces/{workspace}/changes"),
+        format!("/api/workspaces/{workspace}/pr"),
     ] {
         let reply = daemon.call("GET", &path, None).await;
         assert_eq!(reply.status, 200, "{path}: {}", reply.body);
@@ -2212,6 +2215,35 @@ async fn changes_list_each_file_with_its_hunks_and_hide_credentials_in_urls() {
         .call(
             "GET",
             &format!("/api/workspaces/{}/changes", WorkspaceId::random()),
+            None,
+        )
+        .await;
+    assert_eq!(reply.status, 404, "{}", reply.body);
+}
+
+#[tokio::test]
+async fn a_workspaces_pr_read_says_what_is_only_on_this_machine() {
+    let daemon = Daemon::new(TURN).await;
+    let project = daemon.project();
+    let workspace = daemon.create_workspace(project, "only here").await;
+    let worktree = daemon.workspaces.worktree(workspace).await.unwrap();
+    git(&worktree, &["commit", "-q", "--allow-empty", "-m", "one"]);
+
+    let reply = daemon
+        .call("GET", &format!("/api/workspaces/{workspace}/pr"), None)
+        .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    let json = reply.json();
+    assert_eq!(json["branch"], "only-here");
+    assert_eq!(json["pushed"], false);
+    assert_eq!(json["unpushed"], 1);
+    assert_eq!(json["pr"], serde_json::Value::Null);
+    assert_eq!(json["unreachable"], false);
+
+    let reply = daemon
+        .call(
+            "GET",
+            &format!("/api/workspaces/{}/pr", WorkspaceId::random()),
             None,
         )
         .await;

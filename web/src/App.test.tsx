@@ -2,7 +2,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createMemoryHistory, createRouter, RouterProvider } from "@tanstack/react-router";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { machineQuery, type Briefs, type UiMessage } from "./api";
+import { machineQuery, type Briefs, type Shipping, type UiMessage } from "./api";
 import { router, routeTree } from "./App";
 import { button, pressed } from "./Modal";
 import { ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
@@ -44,11 +44,13 @@ vi.mock("@xterm/xterm", () => ({
 vi.mock("@xterm/addon-fit", () => ({ FitAddon: class { fit() {} } }));
 
 /**
- * Like `mockFetch`, but the board's reads of each workspace's changes get an empty answer, and the
- * reads of session briefs get `briefs`; both are left out of the calls, so a test sees only the
- * requests it makes.
+ * Like `mockFetch`, but the board's reads of each workspace's changes get an empty answer, the
+ * reads of where each branch stands get `shipping`, and the reads of session briefs get `briefs`;
+ * all are left out of the calls, so a test sees only the requests it makes.
  */
 let briefs: Briefs = {};
+const quiet: Shipping = { branch: "b", pushed: false, unpushed: 0, pr: null, unreachable: false };
+let shipping: Shipping = quiet;
 
 function mockActions(...answers: Response[]): Call[] {
   const calls: Call[] = [];
@@ -57,6 +59,7 @@ function mockActions(...answers: Response[]): Call[] {
     vi.fn(async (url: string, init: RequestInit = {}) => {
       if (url.endsWith("/changes")) return json(200, { base: "main", commits: [], files: [] });
       if (url.endsWith("/api/briefs")) return json(200, briefs);
+      if (url.endsWith("/pr")) return json(200, shipping);
       calls.push({ url, method: init.method ?? "GET", body: init.body ? JSON.parse(String(init.body)) : undefined });
       const next = answers.shift();
       if (!next) throw new Error("unexpected request");
@@ -70,6 +73,7 @@ const sockets = (path: string) => FakeSocket.all.filter((s) => s.url.endsWith(pa
 
 beforeEach(() => {
   briefs = {};
+  shipping = quiet;
   localStorage.clear();
   FakeSocket.install();
   vi.stubGlobal(
@@ -717,6 +721,25 @@ describe("App", () => {
     await waitFor(() => expect(calls).toEqual([{ url: "/api/workspaces/w1/archive", method: "POST", body: { force: false } }]));
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
     expect((await screen.findByRole("status")).textContent).toMatch(/Archived fix login.*fix-login.*kept/);
+  });
+
+  it("shows a card's merged pull request, linked to GitHub, and archives the workspace from it", async () => {
+    shipping = {
+      branch: "fix-login",
+      pushed: true,
+      unpushed: 0,
+      pr: { number: 7, title: "Fix login", url: "https://github.com/o/r/pull/7", state: "merged", draft: false, checks: "passing", review: "approved" },
+      unreachable: false,
+    };
+    const calls = mockActions();
+    await open("/", live);
+    const card = screen.getByRole("article", { name: "fix login" });
+    const link = await within(card).findByRole("link", { name: /PR #7 merged/ });
+    expect(link.getAttribute("href")).toBe("https://github.com/o/r/pull/7");
+
+    fireEvent.click(within(card).getByRole("button", { name: "Archive fix login: its pull request merged" }));
+    expect(await screen.findByRole("dialog", { name: "Archive fix login?" })).toBeDefined();
+    expect(calls).toEqual([]);
   });
 
   it("offers archiving only for this machine's workspaces", async () => {

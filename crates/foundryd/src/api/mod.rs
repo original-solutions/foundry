@@ -83,6 +83,7 @@ mod briefs;
 mod changes;
 mod files;
 mod machine;
+mod pr;
 pub mod terminals;
 #[cfg(test)]
 mod tests;
@@ -141,6 +142,7 @@ pub fn router(api: Api) -> Router {
         .route("/api/workspaces/{id}/sessions", post(start_session))
         .route("/api/workspaces/{id}/shells", post(start_shell))
         .route("/api/workspaces/{id}/changes", get(changes::changes))
+        .route("/api/workspaces/{id}/pr", get(pr::shipping))
         .route("/api/briefs", get(briefs::briefs))
         .route("/api/machine", get(machine::machine))
         .route("/api/sessions/{id}/trail", get(trail::trail))

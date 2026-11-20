@@ -178,6 +178,35 @@ export async function workspaceChanges(workspace: string): Promise<Changes> {
   return (await get(`/api/workspaces/${workspace}/changes`)) as unknown as Changes;
 }
 
+/** A pull request from a workspace's branch, as GitHub has it. */
+export interface PullRequest {
+  number: number;
+  title: string;
+  url: string;
+  state: "open" | "merged" | "closed";
+  draft: boolean;
+  /** Its checks rolled up: any failing, else any running, else passing; `none` when it has none. */
+  checks: "none" | "pending" | "passing" | "failing";
+  review: "none" | "required" | "approved" | "changes_requested";
+}
+
+/** Where a workspace's branch stands past this machine. */
+export interface Shipping {
+  branch: string;
+  /** `origin` has the branch, as of this machine's last fetch or push. */
+  pushed: boolean;
+  /** Commits on the worktree's HEAD that no remote branch has. */
+  unpushed: number;
+  /** The newest pull request from the branch, once pushed, when GitHub answered and has one. */
+  pr: PullRequest | null;
+  /** GitHub was asked and could not answer, so `pr` says nothing. */
+  unreachable: boolean;
+}
+
+export async function workspaceShipping(workspace: string): Promise<Shipping> {
+  return (await get(`/api/workspaces/${workspace}/pr`)) as unknown as Shipping;
+}
+
 /** The newest step of a session's turn: a prompt, a tool about to run, or a question for you. */
 export interface Step {
   kind: "prompt" | "tool" | "ask";
