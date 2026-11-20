@@ -494,6 +494,54 @@ fn status_with_no_daemon_exits_1_and_says_none_is_running() {
     );
 }
 
+#[test]
+fn at_start_a_leftover_worktree_with_no_work_is_removed_and_its_branch_kept() {
+    let mut fixture = Fixture::new();
+    let project = fixture.project();
+    fixture.seed(|settings| settings.projects.push(project.clone()));
+    // What a create that died before writing its record leaves: the project's clone, a branch
+    // and its worktree, and no workspace record.
+    let clones = fixture.home.path().join("clones");
+    let clone = clones.join(format!("{}.git", project.id));
+    fs::create_dir_all(&clones).unwrap();
+    git(&clones, &["init", "-q", "--bare", clone.to_str().unwrap()]);
+    git(&clone, &["remote", "add", "origin", &project.repo]);
+    git(&clone, &["fetch", "-q", "origin"]);
+    git(
+        &clone,
+        &[
+            "branch",
+            "-q",
+            "--no-track",
+            "crashed",
+            "refs/remotes/origin/main",
+        ],
+    );
+    let worktree = fixture
+        .home
+        .path()
+        .join("worktrees")
+        .join(project.id.to_string())
+        .join("crashed");
+    git(
+        &clone,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--",
+            worktree.to_str().unwrap(),
+            "crashed",
+        ],
+    );
+
+    fixture.start();
+
+    assert!(!worktree.exists(), "{}", fixture.log());
+    git(&clone, &["rev-parse", "--verify", "refs/heads/crashed"]);
+    assert_eq!(fixture.stop(), Some(0));
+}
+
 #[tokio::test]
 async fn the_daemons_peer_route_refuses_a_link_with_no_key_proof() {
     let mut fixture = Fixture::new();

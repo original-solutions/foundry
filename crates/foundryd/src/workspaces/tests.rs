@@ -1542,3 +1542,719 @@ async fn an_archive_stopped_by_a_terminal_that_will_not_close_keeps_the_workspac
     assert!(!worktree.exists());
     assert!(setup.terminals_of(id).iter().all(|t| t.deleted));
 }
+
+impl Setup {
+    /// What a create that died after `git worktree add` and before its record leaves: a branch
+    /// `branch` at `main` and its worktree, with no workspace record.
+    async fn leftover(&self, remote: &Remote, branch: &str) -> PathBuf {
+        let repo = remote.bare.to_string_lossy().into_owned();
+        let clone = self
+            .workspaces
+            .inner
+            .clone_for(remote.project, &repo)
+            .await
+            .unwrap();
+        git(&clone, &["fetch", "-q", "origin"]);
+        git(
+            &clone,
+            &[
+                "branch",
+                "-q",
+                "--no-track",
+                branch,
+                "refs/remotes/origin/main",
+            ],
+        );
+        let worktree = self.worktree(remote.project, branch);
+        git(
+            &clone,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--",
+                worktree.to_str().unwrap(),
+                branch,
+            ],
+        );
+        worktree
+    }
+
+    /// The worktrees git lists for the project's clone.
+    fn listed(&self, project: ProjectId) -> String {
+        git(
+            &self.clone_of(project),
+            &["worktree", "list", "--porcelain"],
+        )
+    }
+
+    /// The commit `refs/heads/<branch>` names in the project's clone.
+    fn branch_at(&self, project: ProjectId, branch: &str) -> String {
+        let reference = format!("refs/heads/{branch}");
+        git(
+            &self.clone_of(project),
+            &["rev-parse", "--verify", &reference],
+        )
+    }
+}
+
+/// Every tracing event this thread writes until the guard drops, as text.
+fn logs() -> (tracing::subscriber::DefaultGuard, Arc<Mutex<Vec<u8>>>) {
+    struct Writer(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Writer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let writer = buffer.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(move || Writer(writer.clone()))
+        .finish();
+    (tracing::subscriber::set_default(subscriber), buffer)
+}
+
+fn text_of(buffer: &Arc<Mutex<Vec<u8>>>) -> String {
+    String::from_utf8_lossy(&buffer.lock().unwrap()).into_owned()
+}
+
+#[tokio::test]
+async fn sweep_removes_a_leftover_worktree_with_no_work_and_keeps_its_branch() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let worktree = setup.leftover(&remote, "crashed").await;
+    let start = setup.branch_at(remote.project, "crashed");
+
+    setup.workspaces.sweep().await.unwrap();
+
+    assert!(!worktree.exists());
+    assert!(
+        !setup.listed(remote.project).contains("/crashed\n"),
+        "{}",
+        setup.listed(remote.project)
+    );
+    assert_eq!(setup.branch_at(remote.project, "crashed"), start);
+}
+
+#[tokio::test]
+async fn sweep_keeps_a_leftover_with_an_uncommitted_file_and_logs_its_path_and_the_file() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let worktree = setup.leftover(&remote, "half-done").await;
+    std::fs::write(worktree.join("draft.txt"), "mine").unwrap();
+    let (_guard, logs) = logs();
+
+    setup.workspaces.sweep().await.unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("draft.txt")).unwrap(),
+        "mine"
+    );
+    let text = text_of(&logs);
+    let line = text
+        .lines()
+        .find(|l| l.contains("draft.txt"))
+        .unwrap_or_else(|| panic!("no line names draft.txt: {text}"));
+    assert!(line.contains("WARN"), "{line}");
+    assert!(
+        line.contains(&format!("{}/half-done", remote.project)),
+        "{line}"
+    );
+}
+
+#[tokio::test]
+async fn sweep_keeps_a_leftover_with_an_unpushed_commit_on_its_branch_or_a_detached_head() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let ahead = setup.leftover(&remote, "ahead").await;
+    git(
+        &ahead,
+        &["commit", "-q", "--allow-empty", "-m", "only here"],
+    );
+    let detached = setup.leftover(&remote, "detached").await;
+    git(&detached, &["checkout", "-q", "--detach"]);
+    git(
+        &detached,
+        &["commit", "-q", "--allow-empty", "-m", "off the branch"],
+    );
+    let (_guard, logs) = logs();
+
+    setup.workspaces.sweep().await.unwrap();
+
+    assert!(ahead.exists());
+    assert!(detached.exists());
+    let text = text_of(&logs);
+    for unpushed in ["only here", "off the branch"] {
+        assert!(text.contains(unpushed), "{text}");
+    }
+}
+
+#[tokio::test]
+async fn sweep_leaves_a_live_workspace_and_counts_an_archived_record_as_none() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let live = setup.create(&remote, "main", "live").await;
+    let live_worktree = setup.worktree(remote.project, "live");
+    let archived = setup.create(&remote, "main", "archived").await;
+    let archived_worktree = setup.worktree(remote.project, "archived");
+    // The record says archived, but the worktree is still there.
+    let body = setup.body(archived);
+    setup.workspaces.inner.write(body, true).await.unwrap();
+
+    setup.workspaces.sweep().await.unwrap();
+
+    assert!(live_worktree.exists());
+    assert!(!setup.record(live).unwrap().deleted);
+    assert_eq!(
+        setup.workspaces.worktree(live).await.unwrap(),
+        live_worktree
+    );
+    assert!(!archived_worktree.exists());
+    setup.branch_at(remote.project, "archived");
+}
+
+#[tokio::test]
+async fn sweep_leaves_a_live_workspace_whose_branch_was_renamed() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    // Every character a letter, so safe_branch keeps the decomposed form; git on macOS keeps
+    // the composed one for the same folder. Renamed, the branch no longer matches the record.
+    let name = "\u{1112}\u{1161}\u{11ab}";
+    let id = setup.create(&remote, "main", name).await;
+    let worktree = setup.workspaces.worktree(id).await.unwrap();
+    git(&worktree, &["branch", "-m", "renamed"]);
+    let other = setup.create(&remote, "main", "Fix").await;
+    let other_worktree = setup.workspaces.worktree(other).await.unwrap();
+    git(&other_worktree, &["branch", "-m", "renamed-too"]);
+
+    setup.workspaces.sweep().await.unwrap();
+
+    assert!(worktree.exists());
+    assert!(other_worktree.exists());
+}
+
+#[tokio::test]
+async fn sweep_never_touches_a_branch_with_no_worktree() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup.create(&remote, "main", "kept").await;
+    let worktree = setup.worktree(remote.project, "kept");
+    git(
+        &worktree,
+        &["commit", "-q", "--allow-empty", "-m", "unpushed"],
+    );
+    setup.workspaces.archive(id, true).await.unwrap();
+    let kept = setup.branch_at(remote.project, "kept");
+
+    setup.workspaces.sweep().await.unwrap();
+
+    assert_eq!(setup.branch_at(remote.project, "kept"), kept);
+}
+
+#[tokio::test]
+async fn sweep_with_no_clones_or_a_clone_with_no_worktrees_does_nothing() {
+    let setup = Setup::new();
+    setup.workspaces.sweep().await.unwrap();
+    assert!(!setup.clones().exists());
+
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let repo = remote.bare.to_string_lossy().into_owned();
+    let clone = setup
+        .workspaces
+        .inner
+        .clone_for(remote.project, &repo)
+        .await
+        .unwrap();
+    // A clone stopped half way, and a folder that is not a clone, are passed over.
+    std::fs::create_dir_all(
+        setup
+            .clones()
+            .join(format!("{}.partial", ProjectId::random())),
+    )
+    .unwrap();
+    std::fs::create_dir_all(setup.clones().join("not-a-project.git")).unwrap();
+    let before = names_in(&setup.clones());
+
+    setup.workspaces.sweep().await.unwrap();
+
+    assert!(clone.exists());
+    assert_eq!(names_in(&setup.clones()), before);
+}
+
+#[tokio::test]
+async fn sweep_forgets_a_leftover_whose_folder_is_gone_only_when_its_head_is_pushed() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let pushed = setup.leftover(&remote, "pushed-gone").await;
+    std::fs::remove_dir_all(&pushed).unwrap();
+    let unpushed = setup.leftover(&remote, "unpushed-gone").await;
+    git(&unpushed, &["checkout", "-q", "--detach"]);
+    git(
+        &unpushed,
+        &["commit", "-q", "--allow-empty", "-m", "only on the head"],
+    );
+    std::fs::remove_dir_all(&unpushed).unwrap();
+    let (_guard, logs) = logs();
+
+    setup.workspaces.sweep().await.unwrap();
+
+    let listed = setup.listed(remote.project);
+    assert!(!listed.contains("/pushed-gone\n"), "{listed}");
+    assert!(listed.contains("/unpushed-gone\n"), "{listed}");
+    setup.branch_at(remote.project, "pushed-gone");
+    let text = text_of(&logs);
+    let line = text
+        .lines()
+        .find(|l| l.contains("unpushed-gone"))
+        .unwrap_or_else(|| panic!("no line names unpushed-gone: {text}"));
+    assert!(line.contains("only on the head"), "{line}");
+}
+
+impl Setup {
+    /// This machine's workspaces as another daemon would see them: on the same data directory
+    /// and terminals, as machine `me`, with `store`.
+    fn workspaces_as(&self, me: MachineId, store: Arc<Mutex<Store>>) -> Workspaces {
+        Workspaces::with_git_within(
+            me,
+            store,
+            self.data.path(),
+            self.terminals.clone(),
+            GIT_WITHIN,
+        )
+    }
+
+    /// A clean worktree of the project's clone at `path`, on a new branch `branch` at `main`.
+    fn worktree_at(&self, project: ProjectId, path: &Path, branch: &str) {
+        let clone = self.clone_of(project);
+        git(
+            &clone,
+            &[
+                "branch",
+                "-q",
+                "--no-track",
+                branch,
+                "refs/remotes/origin/main",
+            ],
+        );
+        git(
+            &clone,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--",
+                path.to_str().unwrap(),
+                branch,
+            ],
+        );
+    }
+}
+
+/// The machine's identity can be made again while its data directory stays: its live
+/// workspaces' records are then another owner's, and still name their worktrees.
+#[tokio::test]
+async fn sweep_keeps_the_worktrees_live_records_of_another_identity_name() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    setup.create(&remote, "main", "mine").await;
+    // Clean, with nothing ignored: only the record keeps it.
+    let worktree = setup.worktree(remote.project, "mine");
+
+    let after_new_identity = setup.workspaces_as(MachineId::random(), setup.store.clone());
+    let (_guard, logs) = logs();
+    after_new_identity.sweep().await.unwrap();
+
+    assert!(worktree.exists());
+    let listed = setup.listed(remote.project);
+    assert!(
+        listed.contains("/mine\0") || listed.contains("/mine\n"),
+        "{listed}"
+    );
+    let text = text_of(&logs);
+    let line = text
+        .lines()
+        .find(|l| l.contains(&format!("{}/mine", remote.project)))
+        .unwrap_or_else(|| panic!("no line names the worktree: {text}"));
+    assert!(line.contains("WARN"), "{line}");
+    assert!(line.contains("another owner"), "{line}");
+}
+
+/// A store made again over the same data directory has no settings, so it cannot say which
+/// worktrees its records name: nothing is removed.
+#[tokio::test]
+async fn sweep_passes_over_a_project_the_store_does_not_hold() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let leftover = setup.leftover(&remote, "crashed").await;
+    let fresh = Arc::new(Mutex::new(
+        Store::open(setup.data.path().join("fresh.db")).unwrap(),
+    ));
+
+    setup.workspaces_as(setup.me, fresh).sweep().await.unwrap();
+
+    assert!(leftover.exists());
+}
+
+#[tokio::test]
+async fn sweep_logs_a_clone_git_cannot_list_and_goes_on_to_the_next() {
+    let setup = Setup::new();
+    let broken = setup.project(&[("README.md", "hello\n")]);
+    std::fs::create_dir_all(setup.clone_of(broken.project)).unwrap();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let leftover = setup.leftover(&remote, "crashed").await;
+    let (_guard, logs) = logs();
+
+    setup.workspaces.sweep().await.unwrap();
+
+    assert!(!leftover.exists());
+    let text = text_of(&logs);
+    let line = text
+        .lines()
+        .find(|l| l.contains(&format!("{}.git", broken.project)))
+        .unwrap_or_else(|| panic!("no line names the broken clone: {text}"));
+    assert!(line.contains("WARN"), "{line}");
+}
+
+#[tokio::test]
+async fn sweep_leaves_and_logs_a_clean_leftover_git_will_not_remove() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let leftover = setup.leftover(&remote, "locked").await;
+    git(
+        &setup.clone_of(remote.project),
+        &["worktree", "lock", "--", leftover.to_str().unwrap()],
+    );
+    let (_guard, logs) = logs();
+
+    setup.workspaces.sweep().await.unwrap();
+
+    assert!(leftover.exists());
+    let text = text_of(&logs);
+    let line = text
+        .lines()
+        .find(|l| l.contains(&format!("{}/locked", remote.project)))
+        .unwrap_or_else(|| panic!("no line names the locked leftover: {text}"));
+    assert!(line.contains("WARN"), "{line}");
+}
+
+/// The record's branch and the folder's name share nothing; only the disk says they are one.
+#[tokio::test]
+async fn sweep_leaves_a_live_workspace_that_is_the_same_folder_by_another_path() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup.create(&remote, "main", "real").await;
+    let worktree = setup.worktree(remote.project, "real");
+    git(&worktree, &["branch", "-m", "renamed"]);
+    std::os::unix::fs::symlink(&worktree, setup.worktree(remote.project, "alias")).unwrap();
+    let mut body = setup.body(id);
+    body.branch = "alias".into();
+    setup.workspaces.inner.write(body, false).await.unwrap();
+
+    setup.workspaces.sweep().await.unwrap();
+
+    assert!(worktree.exists());
+}
+
+#[tokio::test]
+async fn sweep_leaves_the_entry_of_a_live_workspace_whose_folder_is_gone() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    // A decomposed name, which git on macOS keeps composed, a plain one, and one whose branch
+    // was renamed, so only its folder's name is left to match.
+    for name in ["\u{1112}\u{1161}\u{11ab}", "plain", "renamed"] {
+        let id = setup.create(&remote, "main", name).await;
+        let worktree = setup.workspaces.worktree(id).await.unwrap();
+        if name == "renamed" {
+            git(&worktree, &["branch", "-m", "elsewhere"]);
+        }
+        std::fs::remove_dir_all(worktree).unwrap();
+    }
+    let entries = |listed: &str| {
+        listed
+            .lines()
+            .filter(|l| l.starts_with("worktree "))
+            .count()
+    };
+    // The clone and the three workspaces.
+    assert_eq!(entries(&setup.listed(remote.project)), 4);
+
+    setup.workspaces.sweep().await.unwrap();
+
+    let listed = setup.listed(remote.project);
+    assert_eq!(entries(&listed), 4, "{listed}");
+}
+
+#[tokio::test]
+async fn sweep_never_touches_a_worktree_outside_the_projects_folder_of_worktrees() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    setup.leftover(&remote, "crashed").await;
+    let elsewhere = setup.data.path().join("elsewhere").join("by-hand");
+    setup.worktree_at(remote.project, &elsewhere, "by-hand");
+    // In the folder of worktrees, but not under this project's.
+    let other_project = setup
+        .data
+        .path()
+        .join("worktrees")
+        .join("elsewhere")
+        .join("by-hand-too");
+    setup.worktree_at(remote.project, &other_project, "by-hand-too");
+    let lookalike = setup
+        .data
+        .path()
+        .join("other")
+        .join(remote.project.to_string())
+        .join("lookalike");
+    setup.worktree_at(remote.project, &lookalike, "lookalike");
+
+    setup.workspaces.sweep().await.unwrap();
+
+    assert!(elsewhere.exists());
+    assert!(other_project.exists());
+    assert!(lookalike.exists());
+    assert!(!setup.worktree(remote.project, "crashed").exists());
+}
+
+/// A worktree moved by hand is found only by the branch it has checked out.
+#[tokio::test]
+async fn sweep_leaves_a_live_workspace_whose_worktree_was_moved() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    setup.create(&remote, "main", "a").await;
+    let moved = setup.worktree(remote.project, "b");
+    git(
+        &setup.clone_of(remote.project),
+        &[
+            "worktree",
+            "move",
+            setup.worktree(remote.project, "a").to_str().unwrap(),
+            moved.to_str().unwrap(),
+        ],
+    );
+
+    setup.workspaces.sweep().await.unwrap();
+
+    assert!(moved.exists());
+}
+
+#[tokio::test]
+async fn sweep_leaves_and_logs_a_leftover_it_cannot_check() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let leftover = setup.leftover(&remote, "unreadable").await;
+    std::fs::write(leftover.join(".git"), "gitdir: /nonexistent\n").unwrap();
+    let (_guard, logs) = logs();
+
+    setup.workspaces.sweep().await.unwrap();
+
+    assert!(leftover.exists());
+    let text = text_of(&logs);
+    let line = text
+        .lines()
+        .find(|l| l.contains(&format!("{}/unreadable", remote.project)))
+        .unwrap_or_else(|| panic!("no line names the leftover: {text}"));
+    assert!(line.contains("WARN"), "{line}");
+    assert!(line.contains("could not be checked"), "{line}");
+}
+
+/// A create that dies leaves a bare checkout: setup and sessions start only after its record.
+/// A folder holding files git ignores was worked in, and git could not give them back.
+#[tokio::test]
+async fn sweep_leaves_and_logs_a_leftover_holding_files_git_ignores() {
+    let setup = Setup::new();
+    let remote = setup.project(&[(".gitignore", ".env\nbuild/\n")]);
+    let leftover = setup.leftover(&remote, "worked-in").await;
+    std::fs::write(leftover.join(".env"), "mine").unwrap();
+    std::fs::create_dir_all(leftover.join("build")).unwrap();
+    std::fs::write(leftover.join("build").join("out.bin"), "o").unwrap();
+    let (_guard, logs) = logs();
+
+    setup.workspaces.sweep().await.unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(leftover.join(".env")).unwrap(),
+        "mine"
+    );
+    let text = text_of(&logs);
+    let line = text
+        .lines()
+        .find(|l| l.contains(&format!("{}/worked-in", remote.project)))
+        .unwrap_or_else(|| panic!("no line names the leftover: {text}"));
+    assert!(line.contains("WARN"), "{line}");
+    assert!(line.contains(".env"), "{line}");
+    assert!(line.contains("build/"), "{line}");
+}
+
+/// A store made again over the same data directory gets its settings back from the fleet, but
+/// never its own workspace records: nothing a live workspace holds that git cannot give back
+/// is removed.
+#[tokio::test]
+async fn sweep_with_settings_and_no_records_keeps_what_git_cannot_give_back() {
+    let setup = Setup::new();
+    let remote = setup.project(&[(".gitignore", ".env\n")]);
+    setup.create(&remote, "main", "worked-in").await;
+    let worked_in = setup.worktree(remote.project, "worked-in");
+    std::fs::write(worked_in.join(".env"), "mine").unwrap();
+    let fresh = Arc::new(Mutex::new(
+        Store::open(setup.data.path().join("fresh.db")).unwrap(),
+    ));
+    {
+        let settings = setup.store.lock().unwrap().settings().unwrap();
+        assert!(fresh.lock().unwrap().apply_settings(settings).unwrap());
+    }
+
+    setup.workspaces_as(setup.me, fresh).sweep().await.unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(worked_in.join(".env")).unwrap(),
+        "mine"
+    );
+}
+
+/// A row a newer build wrote, from another owner, which this build cannot read.
+fn unreadable_row(db: &Path) {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    conn.execute(
+        "INSERT INTO records (kind, id, owner, version, record) VALUES (?1, ?2, ?3, 1, ?4)",
+        rusqlite::params![
+            "workspace",
+            WorkspaceId::random().to_string(),
+            MachineId::random().to_string(),
+            r#"{"kind":"from-a-newer-build"}"#,
+        ],
+    )
+    .unwrap();
+}
+
+/// What the store holds cannot all be read, so it cannot say which worktrees are named: the
+/// sweep is skipped, says so, and the daemon still starts.
+#[tokio::test]
+async fn sweep_skips_and_logs_when_a_record_cannot_be_read() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let leftover = setup.leftover(&remote, "crashed").await;
+    unreadable_row(&setup.data.path().join("foundry.db"));
+    let (_guard, logs) = logs();
+
+    setup.workspaces.sweep().await.unwrap();
+
+    assert!(leftover.exists());
+    let text = text_of(&logs);
+    assert!(
+        text.lines()
+            .any(|l| l.contains("WARN") && l.contains("sweep")),
+        "{text}"
+    );
+}
+
+/// A row of another kind this build cannot read says nothing about which worktrees are
+/// named, so the sweep still runs.
+#[tokio::test]
+async fn sweep_runs_when_only_a_row_of_another_kind_cannot_be_read() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let leftover = setup.leftover(&remote, "crashed").await;
+    let conn = rusqlite::Connection::open(setup.data.path().join("foundry.db")).unwrap();
+    conn.execute(
+        "INSERT INTO records (kind, id, owner, version, record) VALUES (?1, ?2, ?3, 1, ?4)",
+        rusqlite::params![
+            "terminal",
+            TerminalId::random().to_string(),
+            MachineId::random().to_string(),
+            r#"{"kind":"from-a-newer-build"}"#,
+        ],
+    )
+    .unwrap();
+
+    setup.workspaces.sweep().await.unwrap();
+
+    assert!(!leftover.exists());
+}
+
+/// `git worktree list --porcelain` before git 2.36 has no `-z`: one field per line, and a blank
+/// line after each worktree.
+#[test]
+fn worktrees_in_reads_the_porcelain_list_line_by_line() {
+    let list = "worktree /data/clones/p.git\nbare\n\n\
+                worktree /data/worktrees/p/fix-login\nHEAD abc123\nbranch refs/heads/fix-login\n\n\
+                worktree /data/worktrees/p/detached\nHEAD def456\ndetached\n\n";
+    let found: Vec<_> = worktrees_in(list)
+        .into_iter()
+        .map(|l| (l.path, l.head, l.branch))
+        .collect();
+    assert_eq!(
+        found,
+        vec![
+            (PathBuf::from("/data/clones/p.git"), None, None),
+            (
+                PathBuf::from("/data/worktrees/p/fix-login"),
+                Some("abc123".to_owned()),
+                Some("fix-login".to_owned())
+            ),
+            (
+                PathBuf::from("/data/worktrees/p/detached"),
+                Some("def456".to_owned()),
+                None
+            ),
+        ]
+    );
+}
+
+/// The sweep has one deadline for all of it. A project it cannot get through in time, here
+/// one whose lock is held, stops it with a WARN line naming the clone, and start goes on.
+#[tokio::test]
+async fn sweep_stops_at_its_deadline_and_logs_the_clone_it_stopped_in() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let leftover = setup.leftover(&remote, "crashed").await;
+    let lock = setup.workspaces.inner.lock(remote.project);
+    let _held = lock.lock().await;
+    let (_guard, logs) = logs();
+
+    let started = Instant::now();
+    setup
+        .workspaces
+        .inner
+        .sweep(Duration::from_millis(200))
+        .await
+        .unwrap();
+
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert!(leftover.exists());
+    let text = text_of(&logs);
+    let line = text
+        .lines()
+        .find(|l| l.contains(&format!("{}.git", remote.project)))
+        .unwrap_or_else(|| panic!("no line names the clone: {text}"));
+    assert!(line.contains("WARN"), "{line}");
+    assert!(line.contains("next start"), "{line}");
+}
+
+#[tokio::test]
+async fn sweep_logs_a_clone_it_cannot_read_and_goes_on_to_the_next() {
+    let setup = Setup::new();
+    let broken = setup.project(&[("README.md", "hello\n")]);
+    // A link to itself cannot be read: the check for it fails rather than saying no.
+    let clone = setup.clone_of(broken.project);
+    std::fs::create_dir_all(setup.clones()).unwrap();
+    std::os::unix::fs::symlink(&clone, &clone).unwrap();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let leftover = setup.leftover(&remote, "crashed").await;
+    let (_guard, logs) = logs();
+
+    setup.workspaces.sweep().await.unwrap();
+
+    assert!(!leftover.exists());
+    let text = text_of(&logs);
+    let line = text
+        .lines()
+        .find(|l| l.contains(&format!("{}.git", broken.project)))
+        .unwrap_or_else(|| panic!("no line names the unreadable clone: {text}"));
+    assert!(line.contains("WARN"), "{line}");
+    assert!(line.contains("could not be read"), "{line}");
+}
