@@ -87,15 +87,17 @@ On macOS this replaces the agent. On Linux it rewrites the unit; run the `sudo` 
 
 ## Updates
 
-A running service looks for a newer release tag every 10 minutes. The release workflow must publish `foundryd-<arch>-<os>.tar.gz` on each `vX.Y.Z` release, built from `std::env::consts::ARCH` and `OS` (`aarch64`, `x86_64`, `macos`, `linux`).
+A running service looks for a newer release tag every 10 minutes. On each pushed `vX.Y.Z` tag, the release workflow (`.github/workflows/release.yml`) publishes `foundryd-<arch>-<os>.tar.gz`, named from `std::env::consts::ARCH` and `OS` (`aarch64`, `x86_64`, `macos`, `linux`). Beside each archive it publishes `foundryd-<arch>-<os>.tar.gz.sig`, an Ed25519 signature made with the key in the repository secret `RELEASE_SIGNING_KEY`. It publishes nothing when the tag is not `v` followed by the version in the root `Cargo.toml`, or when that key does not match the public key built into `foundryd` (`RELEASE_KEY` in `crates/foundryd/src/update.rs`). It creates the release itself and fails when one already exists for the tag, so a release's assets are never replaced: new binaries ship under a new tag. Push the tag; do not make the release in the GitHub UI first.
 
-When a higher tag exists, the daemon downloads the asset, checks that `foundryd --version` says the tag's version, and installs it under `<home>/versions/`. It then points `<home>/current` at it and stops. The service starts the new version. Terminals keep running: each one lives in its own `foundry-holder` process.
+The signature shows that an archive came from the release workflow, so an asset changed or uploaded any other way is never installed. It does not guard against push access: anyone who can push to the repository can push a tag, or a workflow that reads the key.
+
+When a higher tag exists, the daemon downloads the asset and its `.sig`, and checks the signature against the key built into `foundryd` before it unpacks anything. A release whose signature does not verify is refused, as described below. A release with no signature is never installed: the daemon tries it again at the next look. Once the signature checks out, the daemon checks that `foundryd --version` says the tag's version, and installs it under `<home>/versions/`. It then points `<home>/current` at it and stops. The service starts the new version. Terminals keep running: each one lives in its own `foundry-holder` process.
 
 The new version has to prove itself. It counts as healthy once it has run for 60 seconds. If it starts three times without getting there, the next start puts the previous version back and records the tag as refused in `<home>/update.json`. A start that hangs for 5 minutes (on a keychain prompt, for example) exits and counts as a failed start. A refused tag is skipped while it is the highest. A higher tag installs and clears the refusal.
 
-A release is refused the same way, so it is not downloaded again, when its archive has no `foundryd` or no `foundry-holder`, when the new `foundryd --version` exits non-zero or prints anything but `foundryd <version>`, or when the system says the file cannot be executed (no such file or interpreter, not executable, not a program for this machine).
+A release is refused the same way, so it is not downloaded again, when its signature does not verify, when its archive has no `foundryd` or no `foundry-holder`, when the new `foundryd --version` exits non-zero or prints anything but `foundryd <version>`, or when the system says the file cannot be executed (no such file or interpreter, not executable, not a program for this machine).
 
-On macOS, sign every release binary with one stable identity (a Developer ID). A differently signed binary cannot read the keys the old one stored in the keychain. It stops at a keychain prompt, and every update is rolled back.
+On macOS, sign every release binary with one stable identity (a Developer ID). The release workflow does not do this yet. A differently signed binary cannot read the keys the old one stored in the keychain. It stops at a keychain prompt, and every update is rolled back.
 
 Only a daemon started from `<home>/current` takes part in updates. One run any other way (`cargo run`, `./foundryd run`) never updates itself and is never counted as a trial.
 
