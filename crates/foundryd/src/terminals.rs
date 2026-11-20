@@ -228,7 +228,8 @@ impl Terminals {
     /// Runs `write` on live terminal `id`'s files folder (see [`Self::files`]) and gives back
     /// what it returns. A close waits for a write under way, then removes the folder with what
     /// was written; a write that comes after the close is refused, so it never makes the folder
-    /// again with nothing left to remove it.
+    /// again with nothing left to remove it. The write finishes, and the close goes on waiting
+    /// for it, even when the caller stops waiting.
     pub async fn keep_file<F>(
         &self,
         id: TerminalId,
@@ -237,14 +238,19 @@ impl Terminals {
     where
         F: FnOnce(&Path) -> io::Result<PathBuf> + Send + 'static,
     {
-        let entry = self.inner.entry(id)?;
-        // A close holds the body from before it lets the entry go until the folder is removed.
-        let _body = entry.body.lock().await;
-        if !self.inner.is_live(&entry) {
-            return Err(TerminalError::Unknown(id));
-        }
-        let folder = self.inner.files(id);
-        Ok(tokio::task::spawn_blocking(move || write(&folder)).await?)
+        let inner = self.inner.clone();
+        tokio::spawn(async move {
+            let entry = inner.entry(id)?;
+            // A close holds the body from before it lets the entry go until the folder is
+            // removed.
+            let _body = entry.body.lock().await;
+            if !inner.is_live(&entry) {
+                return Err(TerminalError::Unknown(id));
+            }
+            let folder = inner.files(id);
+            Ok(tokio::task::spawn_blocking(move || write(&folder)).await?)
+        })
+        .await?
     }
 
     /// Ends the terminal: hangs up its child, waits for its holder to end and deletes its
@@ -1811,6 +1817,51 @@ mod tests {
         let kept = keeping.await.unwrap().unwrap().unwrap();
         closing.await.unwrap().unwrap();
         assert!(!kept.exists(), "the file goes with the terminal");
+        assert!(!terminals.inner.files(id).exists());
+    }
+
+    #[tokio::test]
+    async fn a_close_waits_for_a_file_whose_caller_went_away_and_removes_it_with_the_folder() {
+        let setup = Setup::new();
+        let (terminals, _store) = setup.daemon();
+        let id = setup.start(&terminals, "sleep 60").await;
+        let terminals = Arc::new(terminals);
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let (wrote_tx, wrote_rx) = std::sync::mpsc::channel::<PathBuf>();
+        let keeping = tokio::spawn({
+            let terminals = terminals.clone();
+            async move {
+                terminals
+                    .keep_file(id, move |folder| {
+                        started_tx.send(()).unwrap();
+                        go_rx.recv().unwrap();
+                        std::fs::create_dir_all(folder)?;
+                        std::fs::write(folder.join("shot.png"), b"png")?;
+                        wrote_tx.send(folder.join("shot.png")).unwrap();
+                        Ok(folder.join("shot.png"))
+                    })
+                    .await
+            }
+        });
+        tokio::task::spawn_blocking(move || started_rx.recv().unwrap())
+            .await
+            .unwrap();
+        // The upload's client hangs up: its handler is dropped while the write goes on.
+        keeping.abort();
+        let closing = tokio::spawn({
+            let terminals = terminals.clone();
+            async move { terminals.close(id).await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!closing.is_finished(), "the close waits for the write");
+
+        go_tx.send(()).unwrap();
+        closing.await.unwrap().unwrap();
+        let written = tokio::task::spawn_blocking(move || wrote_rx.recv().unwrap())
+            .await
+            .unwrap();
+        assert!(!written.exists(), "the file goes with the terminal");
         assert!(!terminals.inner.files(id).exists());
     }
 

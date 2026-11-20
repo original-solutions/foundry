@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import type { SessionView } from "./fleet";
-import { button, fieldLook, primaryButton } from "./Modal";
+import { button, fieldLook, inlineField, primaryButton } from "./Modal";
 import { review, takers, type Note } from "./notes";
 import { busy, plural } from "./labels";
 import { reply } from "./Said";
@@ -141,7 +141,7 @@ export function SendBar({ notes, sessions, onSent }: { notes: Note[]; sessions: 
           <select
             value={taker?.terminal}
             onChange={(e) => setPicked(e.target.value)}
-            className="max-w-56 min-w-0 truncate rounded border border-neutral-700 bg-neutral-950 px-1.5 py-0.5 text-neutral-100"
+            className={`${inlineField} max-w-56 min-w-0 truncate font-sans`}
           >
             {list.map((t) => (
               <option key={t.terminal} value={t.terminal} disabled={!t.ready}>

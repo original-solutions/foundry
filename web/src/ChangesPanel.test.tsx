@@ -262,6 +262,7 @@ describe("ChangesPanel", () => {
 
     it("sends every comment to the idle session as one message and presses Enter, then says so", async () => {
       const { panel, file } = await commented();
+      expectFieldLook(within(panel).getByRole("combobox", { name: "to" }));
       fireEvent.click(within(panel).getByRole("button", { name: "Send 1 comment to opus 1" }));
       const socket = FakeSocket.last();
       expect(socket.url).toMatch(/\/api\/terminals\/t1$/);

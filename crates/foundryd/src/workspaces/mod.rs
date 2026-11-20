@@ -266,7 +266,7 @@ impl Workspaces {
 
     /// These workspaces asking GitHub with the program at `gh` in place of `gh`.
     #[cfg(test)]
-    fn with_gh(mut self, gh: &Path) -> Self {
+    pub(crate) fn with_gh(mut self, gh: &Path) -> Self {
         Arc::get_mut(&mut self.inner)
             .expect("set before the workspaces are shared")
             .gh = gh.into();
