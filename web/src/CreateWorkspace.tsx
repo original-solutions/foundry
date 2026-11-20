@@ -3,6 +3,7 @@ import { useState } from "react";
 import { Dialog } from "radix-ui";
 import { ApiError, createWorkspace, listMachines, startSession, type Project } from "./api";
 import { safeBranch, sameBranch } from "./branch";
+import { FirstPrompt, promptOf } from "./FirstPrompt";
 import type { WorkspaceView } from "./fleet";
 import { plural } from "./labels";
 import { bigField, button, field, inlineField, Modal, primaryButton } from "./Modal";
@@ -18,6 +19,8 @@ interface CreateInput {
   base: string;
   name: string;
   model: string;
+  /** The first prompt, when one was typed. */
+  prompt?: string;
   machine?: string;
 }
 
@@ -48,7 +51,7 @@ export function CreateWorkspace({ projects, workspaces, open, onOpenChange, name
       // The workspace is usable when its setup did not start, so its session is started all the same.
       let session: string;
       try {
-        session = await startSession(workspace.id, input.model);
+        session = await startSession(workspace.id, input.model, input.prompt);
       } catch (error) {
         const setup = workspace.error ? ` Also: ${workspace.error}` : "";
         throw new SessionNotStarted(`The workspace was made, but its session did not start: ${error instanceof Error ? error.message : error}.${setup}`);
@@ -62,7 +65,7 @@ export function CreateWorkspace({ projects, workspaces, open, onOpenChange, name
   };
 
   return (
-    <Modal open={open} onOpenChange={change} wide title="New workspace" description="A branch of its own, with Claude Code already running in it.">
+    <Modal open={open} onOpenChange={change} wide title="New workspace" description="A branch of its own, with Claude Code already running in it, and already at work when you give it a first prompt.">
       <Form
         projects={projects}
         workspaces={workspaces}
@@ -103,6 +106,8 @@ function Form({ projects, workspaces, initialName, create, step, onSubmit }: For
   const [name, setName] = useState(initialName);
   const [base, setBase] = useState("main");
   const [model, setModel] = useState("opus");
+  const [prompt, setPrompt] = useState("");
+  const first = promptOf(prompt);
   const [projectId, setProjectId] = useState(projects[0]?.id ?? "");
   /** The machine picked: empty for this machine. */
   const [machine, setMachine] = useState("");
@@ -123,7 +128,7 @@ function Form({ projects, workspaces, initialName, create, step, onSubmit }: For
       onSubmit={(event) => {
         event.preventDefault();
         if (!project || taken) return;
-        onSubmit({ project: project.id, base, name, model, machine: machine || undefined });
+        onSubmit({ project: project.id, base, name, model, prompt: first, machine: machine || undefined });
       }}
     >
       <div>
@@ -170,6 +175,8 @@ function Form({ projects, workspaces, initialName, create, step, onSubmit }: For
           </p>
         )}
       </div>
+
+      <FirstPrompt id="new-workspace-prompt" value={prompt} onChange={setPrompt} />
 
       {projects.length === 0 ? (
         <p>No projects yet</p>
@@ -235,7 +242,7 @@ function Form({ projects, workspaces, initialName, create, step, onSubmit }: For
       )}
       <div className="flex items-center justify-end gap-2 border-t border-neutral-800 pt-3">
         <p aria-live="polite" className="mr-auto min-w-0 truncate text-xs text-neutral-400">
-          {create.isPending && (step === "branch" ? `Making ${branch} from ${base}…` : `Starting ${model}…`)}
+          {create.isPending && (step === "branch" ? `Making ${branch} from ${base}…` : first ? `Starting ${model} on your prompt…` : `Starting ${model}…`)}
         </p>
         <Dialog.Close className={button}>{made ? "Close" : "Cancel"}</Dialog.Close>
         {!made && (
@@ -244,7 +251,7 @@ function Form({ projects, workspaces, initialName, create, step, onSubmit }: For
             disabled={projects.length === 0 || create.isPending || Boolean(taken)}
             className={primaryButton}
           >
-            Create and open
+            {first ? "Create and start" : "Create and open"}
           </button>
         )}
       </div>

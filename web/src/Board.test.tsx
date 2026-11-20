@@ -63,6 +63,7 @@ function scroll(name: string, onScreen: boolean) {
 beforeEach(() => {
   reads = [];
   watched = [];
+  localStorage.clear();
   startOnScreen = true;
   vi.stubGlobal("IntersectionObserver", FakeObserver);
   answers["/api/workspaces/w1/changes"] = () =>
@@ -94,7 +95,7 @@ const Machines = createContext<MachineView[]>([]);
 
 async function show(machines: MachineView[], onChanges = vi.fn()) {
   function Shown() {
-    return <Board machines={useContext(Machines)} onJump={() => {}} onCreate={() => {}} onChanges={onChanges} />;
+    return <Board machines={useContext(Machines)} onJump={() => {}} onCreate={() => {}} onChanges={onChanges} onSteps={() => {}} traced={new Set()} />;
   }
   const root = createRootRoute({ component: Shown });
   const router = createRouter({
@@ -215,5 +216,16 @@ describe("Board", () => {
     expect(readsOf("w1")).toBe(before);
     scroll("fix login", true);
     await waitFor(() => expect(readsOf("w1")).toBe(before + 1));
+  });
+
+  it("switches to a timeline of every session's turns, and keeps that view for next time", async () => {
+    await show(fleet(records(), settings()));
+    fireEvent.click(screen.getByRole("radio", { name: "Timeline" }));
+    expect(await screen.findByRole("region", { name: "Timeline" })).toBeDefined();
+    expect(screen.queryByRole("region", { name: "Working" })).toBeNull();
+    expect(localStorage.getItem("foundry.home")).toBe("timeline");
+    fireEvent.click(screen.getByRole("radio", { name: "Board" }));
+    expect(screen.getByRole("region", { name: "Working" })).toBeDefined();
+    expect(localStorage.getItem("foundry.home")).toBe("board");
   });
 });

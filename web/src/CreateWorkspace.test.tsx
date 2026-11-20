@@ -80,6 +80,39 @@ describe("CreateWorkspace", () => {
     expect(created).toHaveBeenCalledWith("s1");
   });
 
+  it("starts the session on the first prompt written, and Cmd+Enter in it creates", async () => {
+    const calls = mockFetch(json(201, { id: "w1" }), json(201, { id: "s1" }));
+    await renderApp(<Harness />);
+
+    await fill("fix the footer");
+    const prompt = screen.getByLabelText("First prompt");
+    fireEvent.change(prompt, { target: { value: "  Show the version in the footer.\nKeep it small.  " } });
+    expect(screen.getByRole("button", { name: "Create and start" })).toBeDefined();
+    fireEvent.keyDown(prompt, { key: "Enter", metaKey: true });
+
+    await waitFor(() => expect(calls).toHaveLength(2));
+    expect(calls[1]).toEqual({
+      url: "/api/workspaces/w1/sessions",
+      method: "POST",
+      body: { model: "opus", prompt: "Show the version in the footer.\nKeep it small." },
+    });
+  });
+
+  it("starts the session idle when the first prompt is blank, and Enter alone writes a new line", async () => {
+    const calls = mockFetch(json(201, { id: "w1" }), json(201, { id: "s1" }));
+    await renderApp(<Harness />);
+
+    await fill("fix the footer");
+    const prompt = screen.getByLabelText("First prompt");
+    fireEvent.change(prompt, { target: { value: " \n " } });
+    fireEvent.keyDown(prompt, { key: "Enter" });
+    expect(calls).toEqual([]);
+    fireEvent.click(screen.getByRole("button", { name: "Create and open" }));
+
+    await waitFor(() => expect(calls).toHaveLength(2));
+    expect(calls[1].body).toEqual({ model: "opus" });
+  });
+
   it("shows the branch the name makes, from the base, as you type", async () => {
     await renderApp(<Harness />);
 

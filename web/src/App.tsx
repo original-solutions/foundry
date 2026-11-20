@@ -11,6 +11,7 @@ import { beside, follow, type Split } from "./split";
 import { loadTabs, saveTabs, touched, withoutTab, withTab } from "./tabs";
 import { TerminalHeader } from "./TerminalHeader";
 import { TerminalPane } from "./TerminalPane";
+import { TerminalActions } from "./TerminalMenu";
 import { fleet, locate, terminalRunning } from "./fleet";
 import { useShortcut } from "./shortcut";
 import { useBriefs } from "./useBriefs";
@@ -27,7 +28,9 @@ import { AlertsButton, useAlerts } from "./AlertsBell";
  * a split) keep their pane attached behind the others, so going back to one is instant; an older
  * tab attaches again when shown and gets its screen and scrollback back from the holder.
  *
- * With nothing open, the board shows every workspace as a card with its live states and changes.
+ * With nothing open, the board shows every workspace as a card with its live states and changes,
+ * or, switched to its timeline, every session's turns on one clock; a turn opens its terminal
+ * with the steps column.
  *
  * A workspace made from the new-workspace dialog (the sidebar, the board or the palette opens
  * it) is landed in: once its session shows up, its terminal opens, with the setup shell as a tab
@@ -48,6 +51,11 @@ import { AlertsButton, useAlerts } from "./AlertsBell";
  * The browser tab shows the fleet's state in its title and icon, and the sidebar's bell turns on
  * desktop alerts for a session that finishes its turn or needs you.
  *
+ * Right-clicking (or long-pressing) a terminal anywhere it is listed, or the header's More button,
+ * opens its menu: open, open beside, steps, changes, and ending it. Ending a terminal that still
+ * runs asks first; one that already ended is cleared at once, as are all of a workspace's ended
+ * ones from its row. When the open terminal is gone, its neighbouring tab shows.
+ *
  * On a wide screen a second terminal can be shown beside the open one (the header's split button,
  * Cmd+\ or Shift+Enter in the palette), each with its own header. The URL names the side with the
  * keyboard; pressing in the other side moves it there, and a terminal opened from anywhere takes
@@ -57,6 +65,7 @@ function Layout() {
   const { state, connected } = useFleet();
   const { terminalId } = useParams({ strict: false });
   const briefs = useBriefs(state.records);
+  const traced = useMemo(() => new Set(Object.keys(briefs)), [briefs]);
   const machines = useMemo(() => fleet(state.records, state.settings, briefs), [state.records, state.settings, briefs]);
   const [drawer, setDrawer] = useState(false);
   /** The palette, and whether its picks open beside the open terminal. */
@@ -97,6 +106,14 @@ function Layout() {
     if (terminalId) setAttached(touched(attached, terminalId, next ? [next.left, next.right] : []));
   }
   if (terminalId && located && seen[terminalId] !== located.label) setSeen({ ...seen, [terminalId]: located.label });
+  // The open terminal was ended or archived: show its neighbouring tab, or the board.
+  const [left, setLeft] = useState<{ from: string; to?: string }>();
+  if (terminalId && gone.has(terminalId) && left?.from !== terminalId) {
+    setLeft({ from: terminalId, to: withoutTab(kept.filter((id) => id === terminalId || !gone.has(id)), terminalId).next });
+  }
+  useEffect(() => {
+    if (left) void navigate(left.to ? { to: "/terminals/$terminalId", params: { terminalId: left.to } } : { to: "/" });
+  }, [left, navigate]);
   if (kept.some((id) => gone.has(id))) setKept(kept.filter((id) => !gone.has(id)));
   if (attached.some((id) => id !== terminalId && gone.has(id))) setAttached(attached.filter((id) => id === terminalId || !gone.has(id)));
   if (split && (gone.has(split.left) || gone.has(split.right))) setSplit(undefined);
@@ -174,95 +191,125 @@ function Layout() {
 
   const place = !terminalId ? "flex w-full md:w-auto" : drawer ? "fixed inset-0 z-30 flex md:static md:z-auto" : "hidden md:flex";
   return (
-    <div className="flex h-dvh overflow-hidden bg-neutral-950 text-neutral-100">
-      <div className={`${place} shrink-0`}>
-        <Sidebar
+    <TerminalActions
+      machines={machines}
+      current={terminalId}
+      onOpen={(id) => {
+        setDrawer(false);
+        show(id);
+      }}
+      onBeside={openBeside}
+      onSteps={(id) => {
+        setDrawer(false);
+        setStepsOpen(true);
+        show(id);
+      }}
+      onChanges={openChanges}
+      onFind={() => setFinding((n) => n + 1)}
+    >
+      <div className="flex h-dvh overflow-hidden bg-neutral-950 text-neutral-100">
+        <div className={`${place} shrink-0`}>
+          <Sidebar
+            machines={machines}
+            onCreate={() => openCreate()}
+            selected={terminalId}
+            connected={connected}
+            onNavigate={close}
+            onClose={terminalId ? close : undefined}
+            onJump={openJump}
+            onChanges={openChanges}
+            alerts={<AlertsButton {...alerts} />}
+          />
+        </div>
+        <main className={`${terminalId ? "flex" : "hidden md:flex"} min-w-0 flex-1 flex-col`}>
+          <TabStrip
+            machines={machines}
+            tabs={kept}
+            active={terminalId}
+            beside={pair && (pair.left === terminalId ? pair.right : pair.left)}
+            changed={changed}
+            onClose={closeTab}
+          />
+          {terminalId && (
+            <div className="flex shrink-0">
+              {(pair ? [pair.left, pair.right] : [terminalId]).map((id) => (
+                <div key={id} className="contents" onPointerDown={focusPane(id)}>
+                  <TerminalHeader
+                    id={id}
+                    located={id === terminalId ? located : locate(machines, id)}
+                    drawerOpen={drawer}
+                    onMenu={() => setDrawer(true)}
+                    onJump={openJump}
+                    onChanges={openChanges}
+                    onSteps={id === terminalId ? () => setStepsOpen(!stepsOpen) : undefined}
+                    stepsOpen={stepsOpen}
+                    onFind={id === terminalId ? () => setFinding(finding ? 0 : 1) : undefined}
+                    finding={finding > 0}
+                    onSplit={pair ? undefined : () => setJump("beside")}
+                    onClosePane={pair ? () => closePane(id) : undefined}
+                    beside={id !== terminalId}
+                  />
+                </div>
+              ))}
+            </div>
+          )}
+          <div className="relative min-h-0 flex-1">
+            {/* In a fixed order, so a pane's element never moves when it is used. */}
+            {[...attached].sort().map((id) => {
+              const side = pair && (id === pair.left ? "left" : id === pair.right ? "right" : undefined);
+              const place = side === "left" ? "inset-y-0 left-0 right-0 md:right-1/2" : side === "right" ? "inset-y-0 right-0 left-0 md:left-1/2 md:border-l md:border-neutral-800" : "inset-0";
+              const seen = id === terminalId ? "" : side ? "invisible md:visible" : "invisible";
+              const where = locate(machines, id);
+              return (
+                <div key={id} data-testid={`pane-${id}`} onPointerDownCapture={side && focusPane(id)} onFocusCapture={side && focusPane(id)} className={`absolute ${place} ${seen}`}>
+                  <TerminalPane
+                    id={id}
+                    running={terminalRunning(state, id)}
+                    active={id === terminalId}
+                    name={where?.name}
+                    glyph={where?.glyph}
+                    finding={id === terminalId ? finding : 0}
+                    onFindClose={() => setFinding(0)}
+                  />
+                </div>
+              );
+            })}
+            {!terminalId && (
+              <Board
+                machines={machines}
+                onJump={openJump}
+                onCreate={() => openCreate()}
+                onChanges={openChanges}
+                traced={traced}
+                onSteps={(id) => {
+                  setStepsOpen(true);
+                  show(id);
+                }}
+              />
+            )}
+          </div>
+        </main>
+        {stepsOpen && stepsOf && <StepsPanel key={located?.session ?? terminalId} of={stepsOf} onClose={() => setStepsOpen(false)} />}
+        <ChangesPanel workspace={machines.flatMap((m) => m.workspaces).find((w) => w.id === changesOf)} onClose={() => setChangesOf(undefined)} />
+        <JumpPalette
           machines={machines}
-          onCreate={() => openCreate()}
-          selected={terminalId}
-          connected={connected}
-          onNavigate={close}
-          onClose={terminalId ? close : undefined}
-          onJump={openJump}
-          onChanges={openChanges}
-          alerts={<AlertsButton {...alerts} />}
+          open={jump !== undefined}
+          onOpenChange={(open) => setJump(open ? "jump" : undefined)}
+          onCreate={openCreate}
+          current={terminalId && located ? { terminal: terminalId, title: `${located.workspace.name} / ${located.name}` } : undefined}
+          besideOnly={jump === "beside"}
+          onBeside={openBeside}
+        />
+        <CreateWorkspace
+          projects={state.settings.projects}
+          workspaces={machines.flatMap((m) => m.workspaces)}
+          open={create.open}
+          onOpenChange={(open) => setCreate((c) => ({ ...c, open }))}
+          name={create.name}
+          onCreated={setLanding}
         />
       </div>
-      <main className={`${terminalId ? "flex" : "hidden md:flex"} min-w-0 flex-1 flex-col`}>
-        <TabStrip
-          machines={machines}
-          tabs={kept}
-          active={terminalId}
-          beside={pair && (pair.left === terminalId ? pair.right : pair.left)}
-          changed={changed}
-          onClose={closeTab}
-        />
-        {terminalId && (
-          <div className="flex shrink-0">
-            {(pair ? [pair.left, pair.right] : [terminalId]).map((id) => (
-              <div key={id} className="contents" onPointerDown={focusPane(id)}>
-                <TerminalHeader
-                  located={id === terminalId ? located : locate(machines, id)}
-                  drawerOpen={drawer}
-                  onMenu={() => setDrawer(true)}
-                  onJump={openJump}
-                  onChanges={openChanges}
-                  onSteps={id === terminalId ? () => setStepsOpen(!stepsOpen) : undefined}
-                  stepsOpen={stepsOpen}
-                  onFind={id === terminalId ? () => setFinding(finding ? 0 : 1) : undefined}
-                  finding={finding > 0}
-                  onSplit={pair ? undefined : () => setJump("beside")}
-                  onClosePane={pair ? () => closePane(id) : undefined}
-                  beside={id !== terminalId}
-                />
-              </div>
-            ))}
-          </div>
-        )}
-        <div className="relative min-h-0 flex-1">
-          {/* In a fixed order, so a pane's element never moves when it is used. */}
-          {[...attached].sort().map((id) => {
-            const side = pair && (id === pair.left ? "left" : id === pair.right ? "right" : undefined);
-            const place = side === "left" ? "inset-y-0 left-0 right-0 md:right-1/2" : side === "right" ? "inset-y-0 right-0 left-0 md:left-1/2 md:border-l md:border-neutral-800" : "inset-0";
-            const seen = id === terminalId ? "" : side ? "invisible md:visible" : "invisible";
-            const where = locate(machines, id);
-            return (
-              <div key={id} data-testid={`pane-${id}`} onPointerDownCapture={side && focusPane(id)} onFocusCapture={side && focusPane(id)} className={`absolute ${place} ${seen}`}>
-                <TerminalPane
-                  id={id}
-                  running={terminalRunning(state, id)}
-                  active={id === terminalId}
-                  name={where?.name}
-                  glyph={where?.glyph}
-                  finding={id === terminalId ? finding : 0}
-                  onFindClose={() => setFinding(0)}
-                />
-              </div>
-            );
-          })}
-          {!terminalId && <Board machines={machines} onJump={openJump} onCreate={() => openCreate()} onChanges={openChanges} />}
-        </div>
-      </main>
-      {stepsOpen && stepsOf && <StepsPanel key={located?.session ?? terminalId} of={stepsOf} onClose={() => setStepsOpen(false)} />}
-      <ChangesPanel workspace={machines.flatMap((m) => m.workspaces).find((w) => w.id === changesOf)} onClose={() => setChangesOf(undefined)} />
-      <JumpPalette
-        machines={machines}
-        open={jump !== undefined}
-        onOpenChange={(open) => setJump(open ? "jump" : undefined)}
-        onCreate={openCreate}
-        current={terminalId && located ? { terminal: terminalId, title: `${located.workspace.name} / ${located.name}` } : undefined}
-        besideOnly={jump === "beside"}
-        onBeside={openBeside}
-      />
-      <CreateWorkspace
-        projects={state.settings.projects}
-        workspaces={machines.flatMap((m) => m.workspaces)}
-        open={create.open}
-        onOpenChange={(open) => setCreate((c) => ({ ...c, open }))}
-        name={create.name}
-        onCreated={setLanding}
-      />
-    </div>
+    </TerminalActions>
   );
 }
 

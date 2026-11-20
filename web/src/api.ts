@@ -134,8 +134,9 @@ export async function createWorkspace(input: { project: string; base: string; na
   return { id: String(json.id), error: typeof json.error === "string" ? json.error : undefined };
 }
 
-export async function startSession(workspace: string, model: string): Promise<string> {
-  const { status, json } = await post(`/api/workspaces/${workspace}/sessions`, { model });
+/** Starts Claude Code in `workspace`; with a `prompt`, Claude Code starts on it as its first prompt. */
+export async function startSession(workspace: string, model: string, prompt?: string): Promise<string> {
+  const { status, json } = await post(`/api/workspaces/${workspace}/sessions`, prompt === undefined ? { model } : { model, prompt });
   if (status !== 201) throw refused(status, json);
   return String(json.id);
 }
@@ -218,6 +219,20 @@ export async function sessionTrail(id: string): Promise<Mark[]> {
   return ((await get(`/api/sessions/${id}/trail`)).steps ?? []) as Mark[];
 }
 
+/** The id of the machine whose daemon serves the UI: the only one that can end its terminals. */
+export async function thisMachine(): Promise<string> {
+  return String((await get("/api/machine")).id);
+}
+
+/** The read of which machine serves the UI; it does not change while the page is open. */
+export const machineQuery = { queryKey: ["machine"], queryFn: thisMachine, staleTime: Infinity };
+
 export async function sessionBriefs(): Promise<Briefs> {
   return (await get("/api/briefs")) as Briefs;
+}
+
+/** Ends a terminal: hangs up its child if it still runs and removes it, with its final screen. */
+export async function closeTerminal(id: string): Promise<void> {
+  const { status, json } = await post(`/api/terminals/${id}/close`);
+  if (status !== 204) throw refused(status, json);
 }
