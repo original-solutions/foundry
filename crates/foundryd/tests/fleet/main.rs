@@ -18,6 +18,7 @@ use foundry_proto::ids::{MachineId, ProjectId, SessionId, TerminalId, WorkspaceI
 use foundry_proto::record::{AnyRecord, MachineSample, Record, Session, Terminal, Workspace};
 use foundry_proto::settings::{Machine, SharedSettings};
 use foundry_proto::state::{SessionState, TerminalState};
+use foundryd::coordinator::Coordinator;
 use foundryd::store::{Applied, Store};
 use foundryd::sync::{Conn, Dialer, Peers};
 use futures::future::BoxFuture;
@@ -32,6 +33,8 @@ pub struct Daemon {
     pub store: Arc<Mutex<Store>>,
     pub peers: Peers,
     pub db: PathBuf,
+    /// The coordinator its links hand settings and edits to, once [`Daemon::coordinate`] ran.
+    pub coordinator: Option<Arc<Coordinator>>,
     run: JoinHandle<()>,
     _dir: TempDir,
 }
@@ -58,9 +61,35 @@ impl Daemon {
             store,
             peers,
             db,
+            coordinator: None,
             run,
             _dir: dir,
         }
+    }
+
+    /// Gives this daemon a coordinator and returns it. Call it before the test first awaits,
+    /// so no link opens without one.
+    pub fn coordinate(&mut self) -> Arc<Coordinator> {
+        let coordinator = Arc::new(Coordinator::new(
+            self.id,
+            self.store.clone(),
+            self.peers.clone(),
+        ));
+        self.peers.coordinate(coordinator.clone());
+        self.coordinator = Some(coordinator.clone());
+        coordinator
+    }
+
+    /// Its coordinator; panics if [`Daemon::coordinate`] has not run.
+    pub fn coordinator(&self) -> Arc<Coordinator> {
+        self.coordinator
+            .clone()
+            .expect("a daemon with a coordinator")
+    }
+
+    /// The shared settings this daemon holds.
+    pub fn settings(&self) -> SharedSettings {
+        lock(&self.store).settings().unwrap()
     }
 
     /// Writes one of this machine's own records under its next version and returns it.
@@ -154,6 +183,20 @@ impl Fleet {
             })
             .collect();
         Self { daemons, net }
+    }
+
+    /// Starts `n` daemons that list each other as peers, each with a coordinator.
+    pub fn start_coordinated(n: usize) -> Self {
+        Self::start_coordinated_with(n, &[])
+    }
+
+    /// As [`Fleet::start_with`], each daemon with a coordinator.
+    pub fn start_coordinated_with(n: usize, extra: &[MachineId]) -> Self {
+        let mut fleet = Self::start_with(n, extra);
+        for daemon in &mut fleet.daemons {
+            daemon.coordinate();
+        }
+        fleet
     }
 
     /// Cuts every link to and from daemon `i`, and refuses new ones until it is healed.

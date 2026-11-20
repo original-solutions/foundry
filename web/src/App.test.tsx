@@ -4,6 +4,7 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { machineQuery, type Briefs, type UiMessage } from "./api";
 import { router, routeTree } from "./App";
+import { button, pressed } from "./Modal";
 import { ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
 import { FakeSocket, json, mockFetch, type Call } from "./test-utils";
 
@@ -149,8 +150,21 @@ describe("App", () => {
     expect(within(header).getByText("Working")).toBeDefined();
   });
 
+  it("gives the header's Changes and Steps buttons the shared button look, Steps with its pressed look", async () => {
+    mockActions(json(200, { steps: [] }));
+    await open("/terminals/t1", live);
+    const header = screen.getByLabelText("Open terminal");
+    const missing = (el: Element, look: string) => look.split(" ").filter((c) => !el.classList.contains(c));
+    const steps = within(header).getByRole("button", { name: "Steps" });
+    expect(missing(within(header).getByRole("button", { name: /changes/i }), button)).toEqual([]);
+    expect(missing(steps, `${button} ${pressed}`)).toEqual([]);
+    fireEvent.click(steps);
+    expect(steps.getAttribute("aria-pressed")).toBe("true");
+    expect(missing(steps, `${button} ${pressed}`)).toEqual([]);
+  });
+
   it("names the open session by its first prompt in the header, the tab and the sidebar, and says what it is doing", async () => {
-    briefs = { s1: { title: "fix the login bug", now: { kind: "tool", text: "Edit src/login.ts" } } };
+    briefs = { s1: { title: "fix the login bug", now: { kind: "tool", tool: "Edit", text: "Edit src/login.ts" } } };
     mockActions();
     await open("/terminals/t1", live);
 
@@ -536,7 +550,7 @@ describe("App", () => {
   });
 
   it("opens the open session's steps beside its terminal, follows the terminal you open, and closes", async () => {
-    const calls = mockActions(json(200, { steps: [{ kind: "prompt", text: "fix the login bug", at: Date.now() }, { kind: "tool", text: "Edit src/login.ts", at: Date.now() }] }));
+    const calls = mockActions(json(200, { steps: [{ kind: "prompt", text: "fix the login bug", at: Date.now() }, { kind: "tool", tool: "Edit", text: "Edit src/login.ts", at: Date.now() }] }));
     const router = await open("/terminals/t1", live);
     fireEvent.click(within(screen.getByLabelText("Open terminal")).getByRole("button", { name: "Steps" }));
 

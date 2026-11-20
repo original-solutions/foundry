@@ -27,17 +27,26 @@ export function turns(trail: Mark[]): Turn[] {
 
 export type StepKind = "command" | "edit" | "read" | "search" | "web" | "agent" | "ask" | "other";
 
-/** What a step did, from the tool name the daemon writes at the start of its text. */
+/** What each of Claude Code's tools does. Any other tool, such as an MCP one, is "other". */
+const toolKinds = new Map<string, StepKind>([
+  ["Bash", "command"],
+  ["Edit", "edit"],
+  ["Write", "edit"],
+  ["MultiEdit", "edit"],
+  ["NotebookEdit", "edit"],
+  ["Read", "read"],
+  ["Grep", "search"],
+  ["Glob", "search"],
+  ["WebFetch", "web"],
+  ["WebSearch", "web"],
+  ["Task", "agent"],
+  ["Agent", "agent"],
+]);
+
+/** What a step did, from the tool its hook named. */
 export function kindOf(mark: Mark): StepKind {
   if (mark.kind === "ask") return "ask";
-  const [first] = mark.text.split(" ");
-  if (first === "$") return "command";
-  if (["Edit", "Write", "MultiEdit", "NotebookEdit"].includes(first)) return "edit";
-  if (first === "Read") return "read";
-  if (first === "Grep" || first === "Glob") return "search";
-  if (first === "Fetch" || first === "Search") return "web";
-  if (first === "Agent:") return "agent";
-  return "other";
+  return (mark.tool !== undefined && toolKinds.get(mark.tool)) || "other";
 }
 
 const words: Record<StepKind, [string, string]> = {

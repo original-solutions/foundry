@@ -4,11 +4,14 @@
 //! to a record, so it does not sync and does not outlive the daemon.
 //!
 //! Prompts and commands can hold anything a person typed, so every text is cut to one short
-//! line, the secrets this daemon knows are hidden, and so is any word shaped like a token.
+//! line, the secrets this daemon knows are hidden, and so are any word shaped like a token and
+//! the password of any URL.
 
 use std::collections::VecDeque;
 
 use serde::Serialize;
+
+use crate::secrets::redact;
 
 /// The longest text kept, in characters, before an ellipsis.
 const LONGEST: usize = 120;
@@ -39,13 +42,20 @@ pub struct Brief {
 pub struct Mark {
     pub kind: StepKind,
     pub text: String,
+    /// The tool's name as Claude Code gives it, on a tool step only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
     pub at: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Step {
     pub kind: StepKind,
+    /// The step as one line, for showing.
     pub text: String,
+    /// The tool's name as Claude Code gives it, on a tool step only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -62,13 +72,27 @@ pub enum StepKind {
 }
 
 impl Brief {
+    /// The brief as it is served: its title and newest step, without the trail, which is
+    /// served on its own.
+    pub fn summary(&self) -> Brief {
+        Brief {
+            title: self.title.clone(),
+            now: self.now.clone(),
+            trail: VecDeque::new(),
+        }
+    }
+
     /// Takes in one hook payload that arrived at `at`, in milliseconds since the Unix epoch.
     /// `secrets` are hidden wherever they appear.
     pub fn note(&mut self, payload: &serde_json::Value, secrets: &[&str], at: u64) {
         let field = |name: &str| payload.get(name).and_then(|v| v.as_str());
         let step = |kind, text: &str| {
             let text = shown(text, secrets);
-            (!text.is_empty()).then_some(Step { kind, text })
+            (!text.is_empty()).then_some(Step {
+                kind,
+                text,
+                tool: None,
+            })
         };
         let taken = match field("hook_event_name").unwrap_or_default() {
             "SessionStart" if field("source") == Some("clear") => {
@@ -85,7 +109,10 @@ impl Brief {
                 self.now.clone()
             }
             "PreToolUse" => {
-                self.now = step(StepKind::Tool, &tool(payload));
+                self.now = step(StepKind::Tool, &tool(payload)).map(|s| Step {
+                    tool: field("tool_name").map(str::to_owned),
+                    ..s
+                });
                 self.now.clone()
             }
             "Notification" => match field("message") {
@@ -100,6 +127,7 @@ impl Brief {
                 Some(Step {
                     kind: StepKind::Done,
                     text: String::new(),
+                    tool: None,
                 })
             }
             "SessionEnd" => {
@@ -108,11 +136,16 @@ impl Brief {
             }
             _ => None,
         };
-        if let Some(Step { kind, text }) = taken {
+        if let Some(Step { kind, text, tool }) = taken {
             if self.trail.len() == TRAIL_LONGEST {
                 self.trail.pop_front();
             }
-            self.trail.push_back(Mark { kind, text, at });
+            self.trail.push_back(Mark {
+                kind,
+                text,
+                tool,
+                at,
+            });
         }
     }
 }
@@ -152,9 +185,11 @@ fn tool(payload: &serde_json::Value) -> String {
     detail.unwrap_or_else(|| name.to_string())
 }
 
-/// `text` on one line, with `secrets` and token-shaped words hidden, cut to [`LONGEST`].
+/// `text` on one line, with `secrets`, token-shaped words and the password of any URL hidden,
+/// then cut to [`LONGEST`]. Hidden before the cut, so a cut never leaves part of a secret with
+/// nothing left to mark it as one.
 pub fn shown(text: &str, secrets: &[&str]) -> String {
-    let mut line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut line = redact(&text.split_whitespace().collect::<Vec<_>>().join(" "));
     for secret in secrets.iter().filter(|s| !s.is_empty()) {
         line = line.replace(secret, HIDDEN);
     }
@@ -318,6 +353,39 @@ mod tests {
             now(&noted(&[payload])),
             Some((StepKind::Tool, "$ curl -H 'Authorization: Bearer •••' x"))
         );
+    }
+
+    #[test]
+    fn a_url_password_the_cut_falls_inside_is_still_hidden() {
+        // The cut at LONGEST lands inside the password: cut first, the `@` that marks it as one
+        // would be gone and the start of it shown.
+        let text = format!(
+            "{}https://bot:hunter2secret@example.com/r.git",
+            "a ".repeat(50)
+        );
+        let shown = shown(&text, &[]);
+        assert!(!shown.contains("hunter2"), "{shown}");
+        assert!(!shown.contains("bot:"), "{shown}");
+        assert!(shown.ends_with("https://***@example…"), "{shown}");
+    }
+
+    #[test]
+    fn a_tool_step_names_its_tool_apart_from_its_text() {
+        let brief = noted(&[tool_use(
+            "WebFetch",
+            json!({"url": "https://example.com/a"}),
+        )]);
+        let step = brief.now.as_ref().unwrap();
+        assert_eq!(step.tool.as_deref(), Some("WebFetch"));
+        assert_eq!(brief.trail[0].tool.as_deref(), Some("WebFetch"));
+        let brief = noted(&[prompt("go")]);
+        assert_eq!(brief.now.as_ref().unwrap().tool, None);
+        assert_eq!(
+            serde_json::to_value(&brief.trail[0]).unwrap(),
+            json!({"kind": "prompt", "text": "go", "at": 0})
+        );
+        let brief = noted(&[json!({"hook_event_name": "PreToolUse"})]);
+        assert_eq!(brief.now.as_ref().unwrap().tool, None);
     }
 
     #[test]

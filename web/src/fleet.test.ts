@@ -264,10 +264,13 @@ describe("briefs", () => {
     expect(locate([machine], "t1")?.title).toBe("fix the login bug");
   });
 
-  it("says what a session is doing only while it works, waits or is stuck", () => {
+  it("says what a session is doing only while it is in a turn: starting, working, waiting or stuck", () => {
     const [machine] = fleet(records, settings(), briefs);
     const list = rows(machine.workspaces[0]);
     expect(list.map((r) => r.now?.text)).toEqual(["Edit src/login.ts", undefined, "Claude needs your permission to use Bash"]);
+    const starting = [workspace(ME, "w1", "fix login"), terminal(ME, "t1", "w1"), session(ME, "s1", "w1", "t1", "starting")];
+    const [early] = fleet(starting, settings(), { s1: { title: "fix the login bug", now: { kind: "prompt" as const, text: "fix the login bug" } } });
+    expect(rows(early.workspaces[0])[0].now?.text).toBe("fix the login bug");
   });
 
   it("leaves a session with no brief, as a peer's is, as it was", () => {

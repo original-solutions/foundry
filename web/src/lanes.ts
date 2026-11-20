@@ -1,6 +1,6 @@
 import type { Changes } from "./api";
 import { byUrgency, rows, type MachineView, type Row, type WorkspaceView } from "./fleet";
-import type { Glyph } from "./labels";
+import { addsSteps, needsYou, urgency, type Glyph } from "./labels";
 
 /** Where a workspace sits on the board: it needs a person, it is busy, or nothing is happening. */
 export type Lane = "needs" | "working" | "quiet";
@@ -14,11 +14,9 @@ export interface Card {
   lead?: Row;
 }
 
-const laneOf = (glyph: Glyph | undefined): Lane =>
-  glyph === "waiting" || glyph === "stuck" || glyph === "failed" ? "needs" : glyph === "working" || glyph === "starting" ? "working" : "quiet";
+const laneOf = (glyph: Glyph | undefined): Lane => (glyph === undefined ? "quiet" : needsYou.includes(glyph) ? "needs" : addsSteps.includes(glyph) ? "working" : "quiet");
 
-const order: Glyph[] = ["waiting", "stuck", "failed", "working", "starting", "ready", "done", "away"];
-const rank = (card: Card) => (card.lead ? order.indexOf(card.lead.glyph) : order.length);
+const rank = (card: Card) => (card.lead ? urgency.indexOf(card.lead.glyph) : urgency.length);
 
 /**
  * Every workspace in the fleet as a card, in lanes by its most urgent terminal: the ones that need

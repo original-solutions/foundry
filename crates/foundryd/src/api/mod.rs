@@ -65,10 +65,11 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use foundry_proto::ids::{MachineId, ProjectId, TerminalId, WorkspaceId};
 use foundry_proto::messages::{PROTOCOL, UiMessage};
-use foundry_proto::settings::SharedSettings;
+use foundry_proto::settings::{SettingValue, SharedSettings};
 use serde::Deserialize;
 use tokio::net::TcpListener;
 
+use crate::secrets::redact;
 use crate::sessions::{SessionError, Sessions};
 use crate::store::{Store, StoreError};
 use crate::sync::Peers;
@@ -261,41 +262,22 @@ fn refuse(message: String) -> Response {
 
 // --- secrets ---
 
-/// `text` with the user and password of every URL in it hidden: `https://user:token@host`
-/// becomes `https://***@host`. A git address with no scheme, `git@host:repo`, holds no secret
-/// and is left as it is.
-fn redact(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(at) = rest.find("://") {
-        let (before, after) = rest.split_at(at + 3);
-        out.push_str(before);
-        let authority = after
-            .find(|c: char| {
-                matches!(c, '/' | '?' | '#') || c.is_whitespace() || c == '\'' || c == '"'
-            })
-            .unwrap_or(after.len());
-        match after[..authority].rfind('@') {
-            Some(user_end) => {
-                out.push_str("***");
-                out.push_str(&after[user_end..authority]);
-            }
-            None => out.push_str(&after[..authority]),
-        }
-        rest = &after[authority..];
-    }
-    out.push_str(rest);
-    out
-}
-
 fn redacted(texts: &[String]) -> Vec<String> {
     texts.iter().map(|t| redact(t)).collect()
 }
 
-/// `settings` as the UI is shown them: each project's repo with [`redact`] applied.
+/// `settings` as the UI is shown them: each project's repo with [`redact`] applied, in the
+/// projects list and in both values of a "setting overwritten" item.
 fn shown(mut settings: SharedSettings) -> SharedSettings {
     for project in &mut settings.projects {
         project.repo = redact(&project.repo);
+    }
+    for item in settings.overwritten.values_mut() {
+        for value in [&mut item.kept, &mut item.lost].into_iter().flatten() {
+            if let SettingValue::Project(project) = value {
+                project.repo = redact(&project.repo);
+            }
+        }
     }
     settings
 }

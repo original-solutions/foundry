@@ -33,19 +33,21 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
 use foundry_proto::ids::MachineId;
-use foundry_proto::messages::PeerMessage;
+use foundry_proto::messages::{EDITS_SINCE, PeerMessage};
 use foundry_proto::record::AnyRecord;
-use foundry_proto::settings::Machine;
+use foundry_proto::settings::{Edit, Machine};
 use foundry_proto::state::{SessionState, TerminalState};
 use futures::future::BoxFuture;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
+use crate::coordinator::Coordinator;
 use crate::store::{Store, StoreError};
 use crate::terminals::Terminals;
 
@@ -108,6 +110,24 @@ pub trait Dialer: Send + Sync + 'static {
     fn dial(&self, peer: &Machine) -> BoxFuture<'static, io::Result<Conn>>;
 }
 
+/// Why [`Peers::send_edit`] sent nothing.
+#[derive(Debug)]
+pub enum Unsent {
+    /// No link to the machine is open.
+    NotLinked,
+    /// The open links to the machine speak this protocol, older than [`EDITS_SINCE`].
+    Older(u16),
+    /// The edit cannot be written as JSON.
+    Unwritable(serde_json::Error),
+}
+
+/// An open record link: the protocol both ends speak, and the sender that writes to it.
+#[derive(Clone)]
+struct Link {
+    speak: u16,
+    send: mpsc::Sender<String>,
+}
+
 /// This machine's links to its peers, and when each peer was last heard from.
 #[derive(Clone)]
 pub struct Peers {
@@ -121,6 +141,12 @@ struct Inner {
     heard: Mutex<BTreeMap<MachineId, Instant>>,
     /// The terminals a relay serves to peers; none until [`Peers::serve_terminals`].
     terminals: Mutex<Option<Arc<Terminals>>>,
+    /// The coordinator a record link hands settings and edits to; none until
+    /// [`Peers::coordinate`]. Held weakly, as the coordinator holds these peers.
+    coordinator: Mutex<Option<Weak<Coordinator>>>,
+    /// Each open record link past its hellos, by peer and link number.
+    links: Mutex<BTreeMap<MachineId, BTreeMap<u64, Link>>>,
+    next_link: AtomicU64,
 }
 
 impl Peers {
@@ -132,6 +158,9 @@ impl Peers {
                 dialer,
                 heard: Mutex::new(BTreeMap::new()),
                 terminals: Mutex::new(None),
+                coordinator: Mutex::new(None),
+                links: Mutex::new(BTreeMap::new()),
+                next_link: AtomicU64::new(0),
             }),
         }
     }
@@ -198,6 +227,48 @@ impl Peers {
         *lock(&self.inner.terminals) = Some(terminals);
     }
 
+    /// Hands the shared settings and edits record links receive to `coordinator`, and has each
+    /// record link send this machine's settings after the hellos and whenever their `seq`
+    /// changes. Until this is called, links neither send settings nor take them.
+    pub fn coordinate(&self, coordinator: Arc<Coordinator>) {
+        *lock(&self.inner.coordinator) = Some(Arc::downgrade(&coordinator));
+    }
+
+    /// Sends `edit` to `machine` on an open record link that speaks [`EDITS_SINCE`] or later,
+    /// in that link's protocol, and says why when no link took it.
+    pub async fn send_edit(&self, machine: MachineId, edit: &Edit) -> Result<(), Unsent> {
+        let links: Vec<Link> = lock(&self.inner.links)
+            .get(&machine)
+            .map(|open| open.values().cloned().collect())
+            .unwrap_or_default();
+        let mut unsent = Unsent::NotLinked;
+        for Link { speak, send } in links {
+            if speak < EDITS_SINCE {
+                unsent = Unsent::Older(speak);
+                continue;
+            }
+            let message = PeerMessage::Edit {
+                protocol: speak,
+                edit: edit.clone(),
+            };
+            let text = serde_json::to_string(&message).map_err(Unsent::Unwritable)?;
+            if link::send_text(&send, text).await {
+                return Ok(());
+            }
+        }
+        Err(unsent)
+    }
+
+    /// The machines with an open record link whose every open link speaks a protocol older than
+    /// [`EDITS_SINCE`]: they send no shared settings and take no edits.
+    pub fn older(&self) -> BTreeSet<MachineId> {
+        lock(&self.inner.links)
+            .iter()
+            .filter(|(_, open)| open.values().all(|link| link.speak < EDITS_SINCE))
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
     /// The machines heard from within [`OFFLINE_AFTER`], and this machine.
     pub fn online(&self) -> BTreeSet<MachineId> {
         let now = Instant::now();
@@ -249,6 +320,44 @@ impl Inner {
     fn heard_from(&self, peer: MachineId) {
         lock(&self.heard).insert(peer, Instant::now());
     }
+
+    fn coordinator(&self) -> Option<Arc<Coordinator>> {
+        lock(&self.coordinator).as_ref().and_then(Weak::upgrade)
+    }
+
+    /// Records an open link to `peer` that speaks `speak` and sends on `send`, until the
+    /// returned guard drops.
+    fn opened(&self, peer: MachineId, speak: u16, send: mpsc::Sender<String>) -> Opened<'_> {
+        let number = self.next_link.fetch_add(1, Ordering::Relaxed);
+        lock(&self.links)
+            .entry(peer)
+            .or_default()
+            .insert(number, Link { speak, send });
+        Opened {
+            inner: self,
+            peer,
+            number,
+        }
+    }
+}
+
+/// An open link in [`Inner::links`], removed when this drops.
+struct Opened<'a> {
+    inner: &'a Inner,
+    peer: MachineId,
+    number: u64,
+}
+
+impl Drop for Opened<'_> {
+    fn drop(&mut self) {
+        let mut links = lock(&self.inner.links);
+        if let Some(open) = links.get_mut(&self.peer) {
+            open.remove(&self.number);
+            if open.is_empty() {
+                links.remove(&self.peer);
+            }
+        }
+    }
 }
 
 /// `record` as a machine shows it: a session or terminal whose owner is offline is
@@ -279,14 +388,14 @@ impl Drop for Task {
     }
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Runs `work` with the store on the blocking pool, as [`crate::machine::run`] does, so a
 /// slow disk or a busy store never stalls an async worker. A panic in `work` is raised again
 /// here.
-async fn on_store<T: Send + 'static>(
+pub(crate) async fn on_store<T: Send + 'static>(
     store: &Arc<Mutex<Store>>,
     work: impl FnOnce(&mut Store) -> T + Send + 'static,
 ) -> T {

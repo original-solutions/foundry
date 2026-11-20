@@ -45,3 +45,21 @@ export function terminalGlyph(state: TerminalState, exitCode: number | null): Gl
   if (state === "unreachable") return "away";
   return exitCode ? "failed" : "done";
 }
+
+/** Every glyph from most to least urgent: what needs a person, then what is busy, then the rest. */
+export const urgency: Glyph[] = ["waiting", "stuck", "failed", "working", "starting", "ready", "done", "away"];
+
+/** Glyphs that need a person. */
+export const needsYou: Glyph[] = ["waiting", "stuck", "failed"];
+
+/** A session shown as busy: in the middle of a turn, so its live turn and what it is doing now show. */
+export const busy: Glyph[] = ["starting", "working", "waiting", "stuck"];
+
+/**
+ * A session that adds steps without changing state, so its steps and brief are read on a timer.
+ * Unlike the rest of `busy`, a waiting or stuck one changes only when a hook arrives, which is a state change.
+ */
+export const addsSteps: Glyph[] = ["starting", "working"];
+
+/** `n` things in plain words: "1 file", "3 files". */
+export const plural = (n: number, one: string) => `${n} ${one}${n === 1 ? "" : "s"}`;

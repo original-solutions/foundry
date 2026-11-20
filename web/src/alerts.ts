@@ -1,6 +1,6 @@
 import type { SessionState } from "./api";
 import { byUrgency, rows, type MachineView } from "./fleet";
-import { sessionGlyph, type Glyph } from "./labels";
+import { needsYou, sessionGlyph, type Glyph } from "./labels";
 import { shapes } from "./StateGlyph";
 
 /** A desktop alert: a session finished its turn or needs you. */
@@ -56,7 +56,7 @@ export interface Pulse {
 export function pulse(machines: MachineView[]): Pulse {
   const all = machines.flatMap((m) => m.workspaces.flatMap(rows));
   const count = (...glyphs: Glyph[]) => all.filter((r) => glyphs.includes(r.glyph)).length;
-  return { glyph: byUrgency(all)[0]?.glyph, needYou: count("waiting", "stuck", "failed"), working: count("working") };
+  return { glyph: byUrgency(all)[0]?.glyph, needYou: count(...needsYou), working: count("working") };
 }
 
 /** The tab's title: what needs you first, so a narrow tab still shows the count. */

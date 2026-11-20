@@ -14,7 +14,7 @@ const target = { id: "w1", name: "fix login", branch: "fix-login" };
 
 const changes: Changes = {
   base: "main",
-  commits: ["abc1234 add login form"],
+  commits: [{ hash: "abc1234", subject: "add login form" }],
   files: [
     {
       path: "src/login.ts",
@@ -46,8 +46,9 @@ describe("ChangesPanel", () => {
     expect(panel.textContent).toContain("−1");
     expect(panel.textContent).toContain("3 files");
     expect(panel.textContent).toContain("2 uncommitted");
-    expect(panel.textContent).toContain("abc1234");
-    expect(panel.textContent).toContain("add login form");
+    const commits = within(panel).getByRole("region", { name: "Commits" });
+    expect(within(commits).getByText("abc1234")).toBeDefined();
+    expect(within(commits).getByText("add login form")).toBeDefined();
   });
 
   it("shows each file's diff with its lines numbered and marked added or removed", async () => {

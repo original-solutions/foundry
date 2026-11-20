@@ -13,6 +13,7 @@ import { TerminalHeader } from "./TerminalHeader";
 import { TerminalPane } from "./TerminalPane";
 import { TerminalActions } from "./TerminalMenu";
 import { fleet, locate, terminalRunning } from "./fleet";
+import { useShortcut } from "./shortcut";
 import { useBriefs } from "./useBriefs";
 import { useFleet } from "./useFleet";
 import { AlertsButton, useAlerts } from "./AlertsBell";
@@ -181,48 +182,12 @@ function Layout() {
     return () => window.removeEventListener("keydown", escape);
   }, [drawer]);
 
-  useLayoutEffect(() => {
-    const shortcut = (event: KeyboardEvent) => {
-      if (event.key.toLowerCase() !== "k" || event.altKey || event.shiftKey) return;
-      const inTerminal = event.target instanceof Element && event.target.closest(".xterm");
-      if (!event.metaKey && !(event.ctrlKey && !inTerminal)) return;
-      event.preventDefault();
-      event.stopPropagation();
-      setDrawer(false);
-      setJump((open) => (open ? undefined : "jump"));
-    };
-    window.addEventListener("keydown", shortcut, true);
-    return () => window.removeEventListener("keydown", shortcut, true);
-  }, []);
-
-  useLayoutEffect(() => {
-    if (!terminalId) return;
-    const find = (event: KeyboardEvent) => {
-      if (event.key.toLowerCase() !== "f" || event.altKey || event.shiftKey) return;
-      const inTerminal = event.target instanceof Element && event.target.closest(".xterm");
-      if (!event.metaKey && !(event.ctrlKey && !inTerminal)) return;
-      event.preventDefault();
-      event.stopPropagation();
-      setFinding((n) => n + 1);
-    };
-    window.addEventListener("keydown", find, true);
-    return () => window.removeEventListener("keydown", find, true);
-  }, [terminalId]);
-
-  useLayoutEffect(() => {
-    if (!terminalId) return;
-    const toggle = (event: KeyboardEvent) => {
-      if (event.key !== "\\" || event.altKey || event.shiftKey) return;
-      const inTerminal = event.target instanceof Element && event.target.closest(".xterm");
-      if (!event.metaKey && !(event.ctrlKey && !inTerminal)) return;
-      event.preventDefault();
-      event.stopPropagation();
-      if (split) setSplit(undefined);
-      else setJump("beside");
-    };
-    window.addEventListener("keydown", toggle, true);
-    return () => window.removeEventListener("keydown", toggle, true);
-  }, [terminalId, split]);
+  useShortcut("k", () => {
+    setDrawer(false);
+    setJump((open) => (open ? undefined : "jump"));
+  });
+  useShortcut("f", terminalId ? () => setFinding((n) => n + 1) : undefined);
+  useShortcut("\\", terminalId ? () => (split ? setSplit(undefined) : setJump("beside")) : undefined);
 
   const place = !terminalId ? "flex w-full md:w-auto" : drawer ? "fixed inset-0 z-30 flex md:static md:z-auto" : "hidden md:flex";
   return (

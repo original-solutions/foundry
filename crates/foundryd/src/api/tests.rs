@@ -1312,6 +1312,7 @@ async fn every_route_refuses_another_site_and_another_host_and_does_nothing() {
     let force = serde_json::json!({"force": true});
     let model = serde_json::json!({"model": MODEL});
     let trail = format!("/api/sessions/{}/trail", SessionId::random());
+    let changes = format!("/api/workspaces/{workspace}/changes");
     let routes: Vec<(&str, &str, Option<serde_json::Value>, bool)> = vec![
         ("GET", "/api/state", None, false),
         ("GET", "/api/events", None, true),
@@ -1324,6 +1325,7 @@ async fn every_route_refuses_another_site_and_another_host_and_does_nothing() {
         ("GET", "/api/briefs", None, false),
         ("GET", "/api/machine", None, false),
         ("GET", &trail, None, false),
+        ("GET", &changes, None, false),
     ];
     for (method, path, body, upgrade) in routes {
         for (name, value) in [
@@ -1407,7 +1409,7 @@ async fn briefs_name_each_sessions_first_prompt_and_newest_step_with_url_passwor
         brief,
         serde_json::json!({
             "title": "fetch https://***@example.com/a",
-            "now": {"kind": "tool", "text": "$ git push https://***@example.com/r"},
+            "now": {"kind": "tool", "text": "$ git push https://***@example.com/r", "tool": "Bash"},
         })
     );
 }
@@ -1900,6 +1902,49 @@ async fn ids_that_do_not_parse_and_a_base_that_is_not_there_are_answered_in_json
 // --- secrets ---
 
 #[test]
+fn a_projects_repo_inside_an_overwritten_item_is_shown_redacted() {
+    use foundry_proto::settings::{Overwritten, SettingKey, SettingValue, SharedSettings, Stamp};
+    let project = |name: &str, secret: &str| Project {
+        id: ProjectId(uuid::Uuid::from_u128(7)),
+        name: name.into(),
+        repo: format!("https://x-access-token:{secret}@example.invalid/o/{name}.git"),
+    };
+    let settings = SharedSettings {
+        projects: vec![project("kept", "kept-secret")],
+        overwritten: [
+            (
+                SettingKey::Project(ProjectId(uuid::Uuid::from_u128(7))),
+                Overwritten {
+                    kept: Some(SettingValue::Project(project("kept", "kept-secret"))),
+                    lost: Some(SettingValue::Project(project("lost", "lost-secret"))),
+                    lost_stamp: Stamp::NONE,
+                },
+            ),
+            (
+                SettingKey::Project(ProjectId(uuid::Uuid::from_u128(8))),
+                Overwritten {
+                    kept: None,
+                    lost: Some(SettingValue::Project(project("gone", "gone-secret"))),
+                    lost_stamp: Stamp::NONE,
+                },
+            ),
+        ]
+        .into(),
+        ..SharedSettings::default()
+    };
+    let said = serde_json::to_string(&shown(settings)).unwrap();
+    for secret in ["kept-secret", "lost-secret", "gone-secret"] {
+        assert!(!said.contains(secret), "{said}");
+    }
+    for name in ["kept", "lost", "gone"] {
+        assert!(
+            said.contains(&format!("example.invalid/o/{name}.git")),
+            "{said}"
+        );
+    }
+}
+
+#[test]
 fn credentials_in_a_url_are_hidden() {
     for (text, secret) in [
         (
@@ -2020,6 +2065,16 @@ async fn no_response_contains_a_secret() {
         settings_frames > 0,
         "no Settings frame carried the late project"
     );
+    // The read routes, before the archive takes the workspace away.
+    for path in [
+        "/api/briefs".to_owned(),
+        format!("/api/sessions/{session}/trail"),
+        format!("/api/workspaces/{workspace}/changes"),
+    ] {
+        let reply = daemon.call("GET", &path, None).await;
+        assert_eq!(reply.status, 200, "{path}: {}", reply.body);
+        said.push(reply.body);
+    }
     for (method, path) in [
         ("POST", format!("/api/workspaces/{workspace}/archive")),
         ("POST", "/api/workspaces".to_owned()),
@@ -2049,6 +2104,17 @@ async fn changes_list_each_file_with_its_hunks_and_hide_credentials_in_urls() {
         "clone https://bot:hunter2@example.com/r.git\n",
     )
     .unwrap();
+    std::fs::write(worktree.join("mirror.txt"), "m\n").unwrap();
+    git(&worktree, &["add", "mirror.txt"]);
+    git(
+        &worktree,
+        &[
+            "commit",
+            "-q",
+            "-m",
+            "mirror to https://bot:hunter2@example.com/r.git",
+        ],
+    );
 
     let path = format!("/api/workspaces/{workspace}/changes");
     let reply = daemon.call("GET", &path, None).await;
@@ -2065,6 +2131,8 @@ async fn changes_list_each_file_with_its_hunks_and_hide_credentials_in_urls() {
         patch.starts_with("@@ -0,0 +1,1 @@\n+clone https://"),
         "{patch}"
     );
+    let subject = json["commits"][0]["subject"].as_str().unwrap();
+    assert_eq!(subject, "mirror to https://***@example.com/r.git");
     assert!(!reply.body.contains("hunter2"), "{}", reply.body);
 
     let reply = daemon

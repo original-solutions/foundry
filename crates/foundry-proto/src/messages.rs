@@ -6,10 +6,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::ids::{MachineId, TerminalId};
 use crate::record::AnyRecord;
-use crate::settings::SharedSettings;
+use crate::settings::{Edit, SharedSettings};
 
 /// The protocol number this build speaks.
-pub const PROTOCOL: u16 = 1;
+pub const PROTOCOL: u16 = 2;
+
+/// The first protocol whose links carry the shared settings and edits. A link in an older
+/// protocol carries neither: a machine on it has no coordinator, and refuses a message whose
+/// `type` it does not know.
+pub const EDITS_SINCE: u16 = 2;
 
 /// A message between two machines' daemons, tagged by `type`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -38,6 +43,8 @@ pub enum PeerMessage {
         machine: MachineId,
         terminal: TerminalId,
     },
+    /// An edit to the shared settings, sent to the acting coordinator to number.
+    Edit { protocol: u16, edit: Edit },
 }
 
 impl PeerMessage {
@@ -46,7 +53,8 @@ impl PeerMessage {
             Self::Hello { protocol, .. }
             | Self::Records { protocol, .. }
             | Self::Settings { protocol, .. }
-            | Self::Relay { protocol, .. } => *protocol,
+            | Self::Relay { protocol, .. }
+            | Self::Edit { protocol, .. } => *protocol,
         }
     }
 }
@@ -84,6 +92,7 @@ impl UiMessage {
 mod tests {
     use super::*;
     use crate::record::tests::{machine_sample, session, terminal, workspace};
+    use crate::settings::SettingKey;
     use crate::settings::tests::settings;
     use crate::{assert_round_trip, parse_error};
 
@@ -115,6 +124,18 @@ mod tests {
                 protocol: PROTOCOL,
                 machine: MachineId::random(),
                 terminal: TerminalId::random(),
+            },
+            PeerMessage::Edit {
+                protocol: PROTOCOL,
+                edit: Edit::SetProject {
+                    project: settings().projects[0].clone(),
+                },
+            },
+            PeerMessage::Edit {
+                protocol: PROTOCOL,
+                edit: Edit::Dismiss {
+                    setting: SettingKey::Priority,
+                },
             },
         ]
     }
@@ -224,6 +245,15 @@ mod tests {
                     protocol: 1,
                     machine: id,
                     terminal: TerminalId(terminal.parse().unwrap()),
+                },
+            ),
+            (
+                format!(
+                    r#"{{"type":"edit","protocol":1,"edit":{{"kind":"remove_limits","machine":"{machine}"}}}}"#
+                ),
+                PeerMessage::Edit {
+                    protocol: 1,
+                    edit: Edit::RemoveLimits { machine: id },
                 },
             ),
         ];

@@ -2,15 +2,22 @@
 //!
 //! The dialing end says hello first. The accepting end waits for that hello and answers in
 //! the lower of the two protocol numbers, and from then on each end sends in that protocol, so
-//! a newer machine speaks the older form to an older peer. With one protocol so far, the forms
-//! differ only in the number; a later protocol that changes a message's shape converts it to
-//! the older shape where [`records_message`] builds it.
+//! a newer machine speaks the older form to an older peer. Protocol 1 has no shared settings
+//! or edits on a link (see [`EDITS_SINCE`]), so a link in it sends neither; otherwise the
+//! forms differ only in the number. A later protocol that changes a message's shape converts
+//! it to the older shape where [`records_message`] builds it.
 //!
 //! Past the hellos, sending and reading run side by side, so a send that waits on a slow peer
 //! never stops this end hearing it.
+//!
+//! Once a coordinator is set ([`super::Peers::coordinate`]), each end of a link that speaks
+//! [`EDITS_SINCE`] or later sends the shared settings it holds first after the hellos, before
+//! any record, and again whenever their `seq` changes; a machine is therefore never heard from
+//! on such a link before its settings are taken. Settings and edits a link receives go to the coordinator, which merges them;
+//! with none set they are ignored.
 
 use foundry_proto::ids::MachineId;
-use foundry_proto::messages::{PROTOCOL, PeerMessage};
+use foundry_proto::messages::{EDITS_SINCE, PROTOCOL, PeerMessage};
 use foundry_proto::record::AnyRecord;
 use serde::Serialize;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -39,6 +46,7 @@ pub(super) async fn run(
     let Some(open) = hello(inner, &send, &mut recv, dialed, first).await else {
         return;
     };
+    let _opened = inner.opened(open.peer, open.speak, send.clone());
     tokio::select! {
         () = sending(inner, &send, &open) => {}
         () = reading(inner, &mut recv, open.peer) => {}
@@ -49,6 +57,7 @@ pub(super) async fn run(
 /// stops taking them.
 async fn sending(inner: &Inner, send: &Sender<String>, open: &Open) {
     let mut sent = open.sent;
+    let mut settings_sent: Option<u64> = None;
     let mut warned: Option<Instant> = None;
     let mut every = tokio::time::interval(TICK);
     loop {
@@ -57,22 +66,61 @@ async fn sending(inner: &Inner, send: &Sender<String>, open: &Open) {
             tracing::info!("sync: {} left the machine list; link closed", open.peer);
             return;
         }
+        if !send_settings(inner, send, open, &mut settings_sent).await {
+            return;
+        }
         if !send_own(inner, send, open, &mut sent, &mut warned).await {
             return;
         }
     }
 }
 
+/// Sends the shared settings this machine holds when a coordinator is set, the link speaks
+/// [`EDITS_SINCE`] or later, and their `seq` is not the one last sent on this link (`last`),
+/// and says whether the link is still open.
+async fn send_settings(
+    inner: &Inner,
+    send: &Sender<String>,
+    open: &Open,
+    last: &mut Option<u64>,
+) -> bool {
+    if inner.coordinator().is_none() || open.speak < EDITS_SINCE {
+        return true;
+    }
+    let settings = match on_store(&inner.store, |store| store.settings()).await {
+        Ok(settings) => settings,
+        Err(error) => {
+            tracing::warn!("sync: cannot read the shared settings to send: {error}");
+            return true;
+        }
+    };
+    if *last == Some(settings.seq) {
+        return true;
+    }
+    let seq = settings.seq;
+    let message = PeerMessage::Settings {
+        protocol: open.speak,
+        settings,
+    };
+    if !send_message(send, &message).await {
+        return false;
+    }
+    *last = Some(seq);
+    true
+}
+
 /// Takes the peer's messages until the link closes or the peer is silent for
 /// [`OFFLINE_AFTER`]. Each message taken counts as hearing from the peer.
 ///
 /// After a message this machine cannot take (one it cannot read, or a record the store
-/// refuses), the link takes nothing more from the peer and no longer counts it as heard, so
+/// refuses), the link takes no more records from the peer and no longer counts it as heard, so
 /// the peer shows offline and its sessions unreachable within [`OFFLINE_AFTER`]. Records
 /// arrive in version order, so the store keeps a prefix and loses nothing. The link stays open
 /// for [`RETRY_REFUSED`], then ends, so the next link's hello asks again for everything past
 /// that prefix: a passing store error clears then, and a record this build can never take is
-/// resent once per link rather than once a second.
+/// resent once per link rather than once a second. Shared settings and edits do not depend on
+/// records, so a refused link still takes them: the peer has already been told an edit was
+/// sent.
 async fn reading(inner: &Inner, recv: &mut Receiver<String>, peer: MachineId) {
     let mut refused: Option<Instant> = None;
     loop {
@@ -85,6 +133,13 @@ async fn reading(inner: &Inner, recv: &mut Receiver<String>, peer: MachineId) {
             }
         };
         if let Some(at) = refused {
+            // Taken before the link closes, so the message that closes it is not lost.
+            if let Ok(message @ (PeerMessage::Settings { .. } | PeerMessage::Edit { .. })) =
+                serde_json::from_str::<PeerMessage>(&text)
+                && let Err(error) = take(inner, peer, message).await
+            {
+                tracing::warn!("sync: {error}");
+            }
             if at.elapsed() >= RETRY_REFUSED {
                 tracing::info!("sync: link to {peer} closed to ask again for what it refused");
                 return;
@@ -254,28 +309,55 @@ pub(super) async fn listed(inner: &Inner, machine: MachineId) -> bool {
 /// Sends `message`, and says whether the link is still open. A message that cannot be
 /// written as JSON is skipped. A peer that takes nothing for [`OFFLINE_AFTER`] ends the link.
 pub(super) async fn send_message(send: &Sender<String>, message: &impl Serialize) -> bool {
-    let text = match serde_json::to_string(message) {
-        Ok(text) => text,
+    match serde_json::to_string(message) {
+        Ok(text) => send_text(send, text).await,
         Err(error) => {
             tracing::warn!("sync: a message could not be written: {error}");
-            return true;
+            true
         }
-    };
+    }
+}
+
+/// Sends a message already written as JSON, and says whether the link is still open, as
+/// [`send_message`] does.
+pub(super) async fn send_text(send: &Sender<String>, text: String) -> bool {
     matches!(timeout(OFFLINE_AFTER, send.send(text)).await, Ok(Ok(())))
 }
 
 /// Takes the records in a message from `peer`, each only if `peer` owns it and it is newer.
 /// A message that cannot be read, or a record that cannot be stored, is an error, and nothing
 /// after it is taken: the store then holds a prefix of the peer's records.
+///
+/// Shared settings are merged by the coordinator, and an edit handed to it to number or pass
+/// on; with no coordinator set both are ignored.
 async fn receive(inner: &Inner, peer: MachineId, text: &str) -> Result<(), String> {
-    let records = match serde_json::from_str::<PeerMessage>(text) {
-        Ok(PeerMessage::Records { records, .. }) => records,
-        // Shared settings move only through the coordinator, which owns how they are sent. A
-        // relay opens a link of its own and means nothing on a record link.
-        Ok(PeerMessage::Settings { .. })
-        | Ok(PeerMessage::Hello { .. })
-        | Ok(PeerMessage::Relay { .. }) => return Ok(()),
-        Err(error) => return Err(format!("a message from {peer} could not be read: {error}")),
+    match serde_json::from_str::<PeerMessage>(text) {
+        Ok(message) => take(inner, peer, message).await,
+        Err(error) => Err(format!("a message from {peer} could not be read: {error}")),
+    }
+}
+
+/// Takes one message from `peer`, as [`receive`] says.
+async fn take(inner: &Inner, peer: MachineId, message: PeerMessage) -> Result<(), String> {
+    let records = match message {
+        PeerMessage::Records { records, .. } => records,
+        PeerMessage::Settings { settings, .. } => {
+            if let Some(coordinator) = inner.coordinator() {
+                coordinator
+                    .take_settings(peer, settings)
+                    .await
+                    .map_err(|error| format!("settings from {peer} not stored: {error}"))?;
+            }
+            return Ok(());
+        }
+        PeerMessage::Edit { edit, .. } => {
+            if let Some(coordinator) = inner.coordinator() {
+                coordinator.take_edit(peer, edit);
+            }
+            return Ok(());
+        }
+        // A relay opens a link of its own and means nothing on a record link.
+        PeerMessage::Hello { .. } | PeerMessage::Relay { .. } => return Ok(()),
     };
     on_store(&inner.store, move |store| {
         for record in &records {

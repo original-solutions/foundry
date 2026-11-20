@@ -31,8 +31,8 @@ use foundry_proto::state::TerminalState;
 use foundryd::join::{KeyedDialer, Keys};
 use foundryd::secrets::{FileSecrets, Secrets};
 use foundryd::store::Store;
-use foundryd::sync::Dialer as _;
 use foundryd::sync::ws::WsDialer;
+use foundryd::sync::{Conn, Dialer as _};
 use futures::{SinkExt as _, StreamExt as _};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
@@ -747,9 +747,10 @@ fn sigterm_stops_a_daemon_stuck_reading_its_secrets_at_start() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn the_daemons_peer_route_takes_a_keyed_peer_and_syncs_its_records() {
-    let mut fixture = Fixture::new();
+/// Starts the fixture's daemon with one more machine in its list, whose keys both sides have
+/// exchanged, and opens a peer link to the daemon as that machine, hellos exchanged. Returns
+/// the link, the peer's id, and the directory holding the peer's secrets.
+async fn keyed_peer_link(fixture: &mut Fixture) -> (Conn, MachineId, TempDir) {
     let other = tempfile::tempdir().unwrap();
     let peer = Keys::open(Arc::new(FileSecrets::new(
         other.path().join("secrets.json"),
@@ -807,6 +808,31 @@ async fn the_daemons_peer_route_takes_a_keyed_peer_and_syncs_its_records() {
     .await
     .expect("the daemon did not answer the hello");
     assert_eq!(answered, Some(daemon.id));
+    (conn, peer_id, other)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_daemons_peer_link_sends_its_shared_settings_after_the_hellos() {
+    let mut fixture = Fixture::new();
+    let (mut conn, _, _other) = keyed_peer_link(&mut fixture).await;
+    let settings = tokio::time::timeout(Duration::from_secs(20), async {
+        while let Some(text) = conn.recv.recv().await {
+            if let Ok(PeerMessage::Settings { settings, .. }) = serde_json::from_str(&text) {
+                return Some(settings);
+            }
+        }
+        None
+    })
+    .await
+    .expect("the daemon sent no settings on the peer link")
+    .expect("the link closed before the daemon sent its settings");
+    assert!(settings.machines.iter().any(|m| m.name == "peer"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_daemons_peer_route_takes_a_keyed_peer_and_syncs_its_records() {
+    let mut fixture = Fixture::new();
+    let (conn, peer_id, _other) = keyed_peer_link(&mut fixture).await;
 
     let sample = AnyRecord::MachineSample(Record {
         owner: peer_id,

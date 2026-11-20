@@ -2569,7 +2569,12 @@ async fn changes_show_committed_uncommitted_and_new_work_since_the_base() {
     let changes = setup.workspaces.changes(id).await.unwrap();
     assert_eq!(changes.base, "main");
     assert_eq!(changes.commits.len(), 1, "{:?}", changes.commits);
-    assert!(changes.commits[0].ends_with(" add committed"));
+    let commit = &changes.commits[0];
+    assert_eq!(commit.subject, "add committed");
+    assert_eq!(
+        commit.hash,
+        git(&worktree, &["rev-parse", "--short", "HEAD"]).trim()
+    );
     let paths: Vec<&str> = changes.files.iter().map(|f| f.path.as_str()).collect();
     assert_eq!(
         paths,
@@ -2622,6 +2627,192 @@ async fn changes_show_committed_uncommitted_and_new_work_since_the_base() {
         &["diff", "--cached", "--no-renames", "--name-only"],
     );
     assert_eq!(staged.lines().collect::<Vec<_>>(), ["moved.txt", "old.txt"]);
+}
+
+#[tokio::test]
+async fn changes_pair_each_file_with_its_own_diff_past_a_link_made_a_file() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup.create(&remote, "main", "typechange").await;
+    let worktree = setup.worktree(remote.project, "typechange");
+    // The base holds `a` as a link: git prints a link made a file as two diffs, a delete and
+    // an add, though it lists the path once.
+    std::os::unix::fs::symlink("README.md", worktree.join("a")).unwrap();
+    std::fs::write(worktree.join("b.txt"), "b\n").unwrap();
+    git(&worktree, &["add", "a", "b.txt"]);
+    git(&worktree, &["commit", "-q", "-m", "link"]);
+    git(
+        &worktree,
+        &["update-ref", "refs/remotes/origin/main", "HEAD"],
+    );
+    std::fs::remove_file(worktree.join("a")).unwrap();
+    std::fs::write(worktree.join("a"), "real\n").unwrap();
+    std::fs::write(worktree.join("b.txt"), "b2\n").unwrap();
+
+    let changes = setup.workspaces.changes(id).await.unwrap();
+    let file = |path: &str| changes.files.iter().find(|f| f.path == path).unwrap();
+    assert_eq!(file("a").status, FileStatus::Modified);
+    let b = file("b.txt").patch.as_deref().unwrap();
+    assert!(b.contains("-b\n+b2\n"), "{b}");
+}
+
+#[tokio::test]
+async fn a_changes_read_never_writes_the_index() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup.create(&remote, "main", "touched").await;
+    let worktree = setup.worktree(remote.project, "touched");
+    // The same text with a newer time: a status free to refresh the index writes it, under the
+    // index lock an agent's `git add` in the same worktree then fails on.
+    std::thread::sleep(Duration::from_millis(1100));
+    std::fs::write(worktree.join("README.md"), "hello\n").unwrap();
+    let index = worktree.join(git(&worktree, &["rev-parse", "--git-path", "index"]).trim());
+    let before = std::fs::read(&index).unwrap();
+
+    setup.workspaces.changes(id).await.unwrap();
+
+    assert!(
+        std::fs::read(&index).unwrap() == before,
+        "the read wrote the index"
+    );
+    let left: Vec<_> = std::fs::read_dir(index.parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .filter(|n| n.to_string_lossy().starts_with("index."))
+        .collect();
+    assert!(left.is_empty(), "the read left {left:?}");
+}
+
+#[tokio::test]
+async fn a_changes_read_does_not_wait_for_the_lifecycle_lock() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup.create(&remote, "main", "busy").await;
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    let (holding, held) = tokio::sync::oneshot::channel::<()>();
+    let start = {
+        let workspaces = Workspaces {
+            inner: setup.workspaces.inner.clone(),
+        };
+        tokio::spawn(async move {
+            workspaces
+                .start_in(id, move |_| async move {
+                    let _ = holding.send(());
+                    let _ = released.await;
+                    Ok::<_, WorkspaceError>(())
+                })
+                .await
+        })
+    };
+    tokio::time::timeout(WAIT, held)
+        .await
+        .expect("the start takes the lock in time")
+        .expect("the start runs");
+
+    let read = tokio::time::timeout(WAIT, setup.workspaces.changes(id)).await;
+    let _ = release.send(());
+    start.await.unwrap().unwrap();
+    read.expect("the read does not queue behind the start")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn changes_send_no_diff_past_the_caps_and_still_list_the_file() {
+    use super::changes::{ALL_AT_MOST, FILE_AT_MOST, NEW_READ_AT_MOST};
+    let setup = Setup::new();
+    let remote = setup.project(&[("big.txt", "x\n")]);
+    let id = setup.create(&remote, "main", "caps").await;
+    let worktree = setup.worktree(remote.project, "caps");
+    let line = format!("{}\n", "z".repeat(99));
+
+    // A tracked file whose diff is over the cap for one file: counted, not sent.
+    std::fs::write(
+        worktree.join("big.txt"),
+        line.repeat(FILE_AT_MOST / 100 + 1),
+    )
+    .unwrap();
+    // Added files each under the cap for one file that together pass the cap for a whole read.
+    let each = FILE_AT_MOST * 9 / 10 / 100;
+    let fill = ALL_AT_MOST / (each * 101) + 1;
+    for n in 0..fill {
+        std::fs::write(worktree.join(format!("fill-{n:02}.txt")), line.repeat(each)).unwrap();
+    }
+    git(&worktree, &["add", "."]);
+    // A new file as large, read after them, finds the budget spent too.
+    std::fs::write(worktree.join("late.txt"), line.repeat(each)).unwrap();
+    // A new file over the cap for one file: listed, never read.
+    std::fs::write(
+        worktree.join("huge.txt"),
+        line.repeat(FILE_AT_MOST / 100 + 1),
+    )
+    .unwrap();
+    // More new files than are read: every one is listed, the ones past the count by name only.
+    let read_tiny = NEW_READ_AT_MOST - 2;
+    for n in 0..=read_tiny {
+        std::fs::write(worktree.join(format!("tiny-{n:03}.txt")), "t\n").unwrap();
+    }
+
+    let changes = setup.workspaces.changes(id).await.unwrap();
+    let file = |path: &str| {
+        changes
+            .files
+            .iter()
+            .find(|f| f.path == path)
+            .unwrap_or_else(|| panic!("{path} is listed"))
+    };
+    let big = file("big.txt");
+    assert_eq!(big.patch, None);
+    assert_eq!(
+        (big.added, big.removed),
+        (Some(FILE_AT_MOST as u64 / 100 + 1), Some(1))
+    );
+    let huge = file("huge.txt");
+    assert_eq!((huge.added, huge.patch.as_deref()), (None, None));
+
+    let sent: usize = changes
+        .files
+        .iter()
+        .filter_map(|f| f.patch.as_ref().map(String::len))
+        .sum();
+    assert!(sent <= ALL_AT_MOST, "{sent} bytes sent");
+    let first = file("fill-00.txt");
+    assert!(first.patch.is_some());
+    let last = file(&format!("fill-{:02}.txt", fill - 1));
+    assert_eq!(last.status, FileStatus::Added);
+    assert_eq!(last.patch, None);
+    assert_eq!(
+        last.added,
+        Some(each as u64),
+        "a file past the budget keeps its count"
+    );
+
+    let late = file("late.txt");
+    assert_eq!(late.status, FileStatus::Untracked);
+    assert_eq!(
+        (late.added, late.patch.as_deref()),
+        (Some(each as u64), None)
+    );
+
+    // New files are read in name order: `huge.txt` and `late.txt` come before `tiny-*`.
+    let in_count = file(&format!("tiny-{:03}.txt", read_tiny - 1));
+    assert_eq!(in_count.added, Some(1));
+    let past_count = file(&format!("tiny-{read_tiny:03}.txt"));
+    assert_eq!(past_count.status, FileStatus::Untracked);
+    assert_eq!(
+        (past_count.added, past_count.patch.as_deref()),
+        (None, None)
+    );
+}
+
+#[tokio::test]
+async fn changes_of_a_workspace_whose_worktree_is_gone_are_refused_as_unknown() {
+    // As an archive leaves it for a moment: the worktree removed, the record not yet written.
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup.create(&remote, "main", "removed").await;
+    std::fs::remove_dir_all(setup.worktree(remote.project, "removed")).unwrap();
+    let err = setup.workspaces.changes(id).await.unwrap_err();
+    assert!(matches!(err, WorkspaceError::Unknown(_)), "{err}");
 }
 
 #[tokio::test]
