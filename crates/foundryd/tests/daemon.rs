@@ -80,7 +80,9 @@ fn exit_within(child: &mut Child, wait: Duration) -> Option<ExitStatus> {
 fn a_fixture_whose_port_another_process_took_starts_on_another() {
     let mut fixture = Fixture::new();
     let taken_port = fixture.port;
-    let _taken = TcpListener::bind(("127.0.0.1", taken_port)).unwrap();
+    let taken = TcpListener::bind(("127.0.0.1", taken_port)).unwrap();
+    // Whatever took the port hangs up on every caller, so asking it for the state fails fast.
+    std::thread::spawn(move || taken.incoming().for_each(drop));
 
     fixture.start();
 
@@ -103,11 +105,19 @@ const PORTS: std::ops::Range<u32> = 20000..32000;
 
 /// A port nothing listens on now. The daemon binds it only later, so it comes from [`PORTS`],
 /// where the system hands nothing out in between. No port is given twice in one run, and each
-/// run starts at a place set by its process id, so two runs at once rarely meet.
+/// run starts at a random place, so two runs rarely meet. Another process can still take the
+/// port first: [`Fixture::start`] then moves to another.
 fn free_port() -> u16 {
+    use std::hash::{BuildHasher as _, Hasher as _};
     static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    static START: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     let span = PORTS.end - PORTS.start;
-    let start = std::process::id() % span;
+    let start = *START.get_or_init(|| {
+        let random = std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish();
+        u32::try_from(random % u64::from(span)).unwrap()
+    });
     loop {
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         assert!(n < span, "every port in {PORTS:?} is taken");
@@ -217,8 +227,21 @@ impl Fixture {
         command
     }
 
-    /// Starts the daemon and waits until it answers.
+    /// Starts the daemon and waits until it answers. When another process took the port first,
+    /// the daemon exits naming it, and this moves to a fresh port and starts again.
     fn start(&mut self) {
+        for _ in 0..5 {
+            if self.try_start() {
+                return;
+            }
+            self.port = free_port();
+        }
+        panic!("the daemon found its port taken five times; {}", self.log());
+    }
+
+    /// Starts the daemon and waits until it answers. False when it exited because its port was
+    /// taken, so the caller can pick another.
+    fn try_start(&mut self) -> bool {
         assert!(self.daemon.is_none(), "a daemon is already running");
         let log = fs::File::create(self.user.path().join("daemon.log")).unwrap();
         let child = self
@@ -231,10 +254,17 @@ impl Fixture {
         self.daemon = Some(child);
         wait_for("the daemon to answer", || {
             if let Some(exit) = self.daemon.as_mut().unwrap().try_wait().unwrap() {
-                panic!("the daemon exited at start: {exit}; {}", self.log());
+                let log = self.log();
+                if log.contains(&format!("cannot listen on 127.0.0.1:{}", self.port))
+                    && log.contains("Address already in use")
+                {
+                    self.daemon = None;
+                    return Some(false);
+                }
+                panic!("the daemon exited at start: {exit}; {log}");
             }
-            self.state()
-        });
+            self.state().map(|_| true)
+        })
     }
 
     fn log(&self) -> String {
@@ -717,10 +747,16 @@ async fn the_daemon_dials_a_peer_through_the_key_handshake() {
         });
     });
     // The daemon listens on 127.0.0.1 and Tailscale addresses only, so this port is free here.
-    let listener = tokio::net::TcpListener::bind(("::1", fixture.port))
-        .await
-        .expect("::1 must be bindable for this test: it plays the peer at address ::1");
-    fixture.start();
+    // It dials the peer on its own port, so a start on another port needs a listener there.
+    let listener = loop {
+        let listener = tokio::net::TcpListener::bind(("::1", fixture.port))
+            .await
+            .expect("::1 must be bindable for this test: it plays the peer at address ::1");
+        if fixture.try_start() {
+            break listener;
+        }
+        fixture.port = free_port();
+    };
 
     let first = tokio::time::timeout(Duration::from_secs(20), async {
         let (stream, _) = listener.accept().await.unwrap();
