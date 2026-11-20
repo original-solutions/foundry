@@ -1,7 +1,9 @@
-import { createRootRoute, createRoute, createRouter, useParams } from "@tanstack/react-router";
-import { useLayoutEffect, useMemo, useState } from "react";
+import { createRootRoute, createRoute, createRouter, useNavigate, useParams } from "@tanstack/react-router";
+import { useEffect, useLayoutEffect, useMemo, useState } from "react";
 import { JumpPalette, jumpKey, SearchIcon } from "./JumpPalette";
 import { Sidebar } from "./Sidebar";
+import { TabStrip } from "./TabStrip";
+import { loadTabs, saveTabs, withoutTab, withTab } from "./tabs";
 import { TerminalHeader } from "./TerminalHeader";
 import { TerminalPane } from "./TerminalPane";
 import { fleet, locate, terminalRunning, type MachineView } from "./fleet";
@@ -12,6 +14,9 @@ import { useFleet } from "./useFleet";
  * the rest. On a narrow screen one of them has the whole width: the sidebar until a terminal is
  * open, then the terminal, with the sidebar as a drawer the header opens. Cmd+K (or Ctrl+K outside
  * the terminal, where the shell keeps it) opens the jump palette over everything.
+ *
+ * Every terminal opened becomes a tab above the header. A tab shown since the page loaded keeps
+ * its pane attached behind the others, so going back to it is instant.
  */
 function Layout() {
   const { state, connected } = useFleet();
@@ -19,6 +24,37 @@ function Layout() {
   const machines = useMemo(() => fleet(state.records, state.settings), [state.records, state.settings]);
   const [drawer, setDrawer] = useState(false);
   const [jump, setJump] = useState(false);
+  const navigate = useNavigate();
+  const located = terminalId ? locate(machines, terminalId) : undefined;
+
+  const gone = useMemo(() => new Set(state.records.flatMap((r) => (r.kind === "terminal" && r.deleted ? [r.body.id] : []))), [state.records]);
+  const [kept, setKept] = useState(loadTabs);
+  /** Tabs whose pane is attached: the ones shown since the page loaded. */
+  const [attached, setAttached] = useState<string[]>([]);
+  /** The state each tab had when it was last shown. */
+  const [seen, setSeen] = useState<Record<string, string>>({});
+  // Adjusted while rendering, so a terminal opened from anywhere is a tab in the same paint. Only
+  // on a change of terminal: closing the open tab must not bring it back before the URL moves on.
+  const [opened, setOpened] = useState<string>();
+  if (terminalId !== opened) {
+    setOpened(terminalId);
+    if (terminalId && !gone.has(terminalId)) setKept(withTab(kept, terminalId));
+    if (terminalId) setAttached(withTab(attached, terminalId));
+  }
+  if (terminalId && located && seen[terminalId] !== located.label) setSeen({ ...seen, [terminalId]: located.label });
+  if (kept.some((id) => gone.has(id))) setKept(kept.filter((id) => !gone.has(id)));
+  if (attached.some((id) => id !== terminalId && gone.has(id))) setAttached(attached.filter((id) => id === terminalId || !gone.has(id)));
+  useEffect(() => saveTabs(kept), [kept]);
+
+  const changed = new Set(kept.filter((id) => seen[id] !== undefined && seen[id] !== locate(machines, id)?.label));
+  const closeTab = (id: string) => {
+    const { tabs, next } = withoutTab(kept, id);
+    setKept(tabs);
+    setAttached(attached.filter((t) => t !== id));
+    if (id !== terminalId) return;
+    if (next) void navigate({ to: "/terminals/$terminalId", params: { terminalId: next } });
+    else void navigate({ to: "/" });
+  };
   const close = () => setDrawer(false);
   const openJump = () => {
     setDrawer(false);
@@ -61,16 +97,16 @@ function Layout() {
         />
       </div>
       <main className={`${terminalId ? "flex" : "hidden md:flex"} min-w-0 flex-1 flex-col`}>
-        {terminalId ? (
-          <>
-            <TerminalHeader located={locate(machines, terminalId)} drawerOpen={drawer} onMenu={() => setDrawer(true)} onJump={openJump} />
-            <div className="min-h-0 flex-1">
-              <TerminalPane id={terminalId} running={terminalRunning(state, terminalId)} />
+        <TabStrip machines={machines} tabs={kept} active={terminalId} changed={changed} onClose={closeTab} />
+        {terminalId && <TerminalHeader located={located} drawerOpen={drawer} onMenu={() => setDrawer(true)} onJump={openJump} />}
+        <div className="relative min-h-0 flex-1">
+          {attached.map((id) => (
+            <div key={id} className={`absolute inset-0 ${id === terminalId ? "" : "invisible"}`}>
+              <TerminalPane id={id} running={terminalRunning(state, id)} active={id === terminalId} />
             </div>
-          </>
-        ) : (
-          <Home machines={machines} onJump={openJump} />
-        )}
+          ))}
+          {!terminalId && <Home machines={machines} onJump={openJump} />}
+        </div>
       </main>
       <JumpPalette machines={machines} open={jump} onOpenChange={setJump} />
     </div>
@@ -84,7 +120,7 @@ function Home({ machines, onJump }: { machines: MachineView[]; onJump: () => voi
   const shells = workspaces.reduce((n, w) => n + w.shells.length, 0);
   const count = (n: number, one: string) => `${n} ${one}${n === 1 ? "" : "s"}`;
   return (
-    <div className="flex flex-1 flex-col items-center justify-center gap-5 px-6 pb-[12vh]">
+    <div className="absolute inset-0 flex flex-col items-center justify-center gap-5 px-6 pb-[12vh]">
       <p className="text-sm text-neutral-500">
         {count(sessions, "session")} · {count(shells, "shell")} · {count(workspaces.length, "workspace")} · {count(machines.length, "machine")}
       </p>

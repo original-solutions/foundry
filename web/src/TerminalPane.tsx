@@ -24,9 +24,13 @@ const STEADY_AFTER = 10_000;
  * not attached after [NOT_HERE_AFTER] says the terminal is not available here, as for a terminal
  * on another machine, and keeps trying. Each attach's first frame is the whole kept screen, so
  * the screen is reset before it is written.
+ *
+ * A pane behind another tab (`active` false) stays attached, so showing it again is instant and
+ * keeps its scroll position; it takes the keyboard each time it is shown.
  */
-export function TerminalPane({ id, running }: { id: string; running: boolean | undefined }) {
+export function TerminalPane({ id, running, active = true }: { id: string; running: boolean | undefined; active?: boolean }) {
   const host = useRef<HTMLDivElement>(null);
+  const shown = useRef<{ term: Terminal; fit: FitAddon } | null>(null);
   const [status, setStatus] = useState<string | null>(null);
   const runningNow = useRef(running);
   useEffect(() => {
@@ -39,7 +43,7 @@ export function TerminalPane({ id, running }: { id: string; running: boolean | u
     term.loadAddon(fit);
     term.open(host.current!);
     fit.fit();
-    term.focus();
+    shown.current = { term, fit };
 
     let socket: WebSocket | undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -120,9 +124,17 @@ export function TerminalPane({ id, running }: { id: string; running: boolean | u
       resized.dispose();
       socket?.close();
       term.dispose();
+      shown.current = null;
       setStatus(null);
     };
   }, [id]);
+
+  // A pane kept open behind another tab takes the keyboard, and the size it missed, when shown.
+  useEffect(() => {
+    if (!active || !shown.current) return;
+    shown.current.fit.fit();
+    shown.current.term.focus();
+  }, [active, id]);
 
   return (
     <div className="flex h-full flex-col bg-black">

@@ -31,6 +31,7 @@ vi.mock("@xterm/addon-fit", () => ({ FitAddon: class { fit() {} } }));
 const sockets = (path: string) => FakeSocket.all.filter((s) => s.url.endsWith(path));
 
 beforeEach(() => {
+  localStorage.clear();
   FakeSocket.install();
   vi.stubGlobal(
     "ResizeObserver",
@@ -193,5 +194,78 @@ describe("App", () => {
     await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t9"));
     expect(calls).toEqual([{ url: "/api/workspaces/w1/shells", method: "POST", body: undefined }]);
     expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("keeps every terminal you open as a tab with its state, and a tab you go back to has not reconnected", async () => {
+    const router = await open("/terminals/t1", live);
+    fireEvent.click(screen.getByRole("link", { name: /^shell/ }));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t2"));
+
+    const strip = screen.getByRole("tablist", { name: "Open terminals" });
+    const tabs = within(strip).getAllByRole("tab");
+    expect(tabs.map((t) => t.textContent)).toEqual([expect.stringContaining("fix login / sonnet"), expect.stringContaining("fix login / shell")]);
+    expect(tabs[1].getAttribute("aria-selected")).toBe("true");
+
+    fireEvent.click(tabs[0]);
+    await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t1"));
+    expect(sockets("/api/terminals/t1")).toHaveLength(1);
+    expect(sockets("/api/terminals/t1")[0].readyState).not.toBe(FakeSocket.CLOSED);
+    expect(JSON.parse(localStorage.getItem("foundry.tabs")!)).toEqual(["t1", "t2"]);
+  });
+
+  it("closes a tab to its neighbour and then to the fleet view, leaving the terminal running", async () => {
+    const calls = mockFetch();
+    const router = await open("/terminals/t1", live);
+    fireEvent.click(screen.getByRole("link", { name: /^shell/ }));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t2"));
+
+    fireEvent.click(screen.getByRole("button", { name: "Close fix login / shell" }));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t1"));
+    expect(sockets("/api/terminals/t2")[0].readyState).toBe(FakeSocket.CLOSED);
+    fireEvent.click(screen.getByRole("button", { name: "Close fix login / sonnet" }));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/"));
+    expect(screen.queryAllByRole("tab")).toHaveLength(0);
+    expect(calls).toEqual([]);
+  });
+
+  it("marks a tab in the background whose state changed since you looked, until you look", async () => {
+    const router = await open("/terminals/t1", live);
+    fireEvent.click(screen.getByRole("link", { name: /^shell/ }));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t2"));
+    const tab = () => screen.getByRole("tab", { name: /fix login \/ sonnet/ });
+    expect(tab().getAttribute("data-changed")).toBeNull();
+
+    const events = sockets("/api/events").at(-1)!;
+    const idle: UiMessage = { type: "record", protocol: 1, record: session(ME, "s1", "w1", "t1", "idle", { model: "sonnet", version: 2 }) };
+    act(() => events.deliver(JSON.stringify(idle)));
+    expect(tab().getAttribute("data-changed")).toBe("true");
+    expect(within(tab()).getByText("Idle")).toBeDefined();
+
+    fireEvent.click(tab());
+    await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t1"));
+    expect(tab().getAttribute("data-changed")).toBeNull();
+  });
+
+  it("drops the tab of a terminal that is gone, as when its workspace is archived", async () => {
+    const router = await open("/terminals/t1", live);
+    fireEvent.click(screen.getByRole("link", { name: /^shell/ }));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t2"));
+    fireEvent.click(screen.getByRole("tab", { name: /fix login \/ sonnet/ }));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t1"));
+
+    const events = sockets("/api/events").at(-1)!;
+    const gone: UiMessage = { type: "record", protocol: 1, record: terminal(ME, "t2", "w1", "exited", { deleted: true, version: 2 }) };
+    act(() => events.deliver(JSON.stringify(gone)));
+    expect(screen.getAllByRole("tab").map((t) => t.textContent)).toEqual([expect.stringContaining("fix login / sonnet")]);
+    expect(sockets("/api/terminals/t2")[0].readyState).toBe(FakeSocket.CLOSED);
+  });
+
+  it("brings back the tabs this browser had open without attaching them until one is shown", async () => {
+    localStorage.setItem("foundry.tabs", JSON.stringify(["t1", "t2"]));
+    await open("/", live);
+
+    expect(screen.getAllByRole("tab")).toHaveLength(2);
+    expect(sockets("/api/terminals/t1")).toHaveLength(0);
+    expect(sockets("/api/terminals/t2")).toHaveLength(0);
   });
 });
