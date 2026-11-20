@@ -61,9 +61,10 @@ pub struct Coordinator {
     me: MachineId,
     store: Arc<Mutex<Store>>,
     peers: Peers,
-    /// The machines this one has taken a copy of the settings from. Each link sends its copy
-    /// before anything else, so a machine is in here by the time it is heard from.
-    taken: Mutex<BTreeSet<MachineId>>,
+    /// The machines this one has taken a copy of the settings from, and when it last took one.
+    /// Each link sends its copy before anything else, so a machine is in here by the time it
+    /// is heard from.
+    taken: Mutex<BTreeMap<MachineId, Instant>>,
     /// When this machine started. Until every listed machine's copy is in, or
     /// [`OFFLINE_AFTER`] has passed, its own copy may be an old one.
     started: Instant,
@@ -78,7 +79,7 @@ impl Coordinator {
             me,
             store,
             peers,
-            taken: Mutex::new(BTreeSet::new()),
+            taken: Mutex::new(BTreeMap::new()),
             started: Instant::now(),
             last_forwarded: Mutex::new(None),
         }
@@ -113,7 +114,7 @@ impl Coordinator {
             Ok::<_, StoreError>(())
         })
         .await?;
-        lock(&self.taken).insert(peer);
+        lock(&self.taken).insert(peer, Instant::now());
         Ok(())
     }
 
@@ -141,9 +142,11 @@ impl Coordinator {
     ///
     /// A forwarded edit looks again every [`STEP`] while it cannot go on. While this machine
     /// takes the forwarding machine to act, the two may still disagree on who acts, so the edit
-    /// is not sent back until [`OFFLINE_AFTER`] after it arrived: by then their views agree,
-    /// and the forwarding machine, still acting, numbers it. While there is no open link to the
-    /// acting machine it is kept until [`KEEP_FORWARDED`].
+    /// goes back only once their views agree: when a copy of the settings taken from that
+    /// machine after the edit arrived still leaves it acting, or at the latest
+    /// [`OFFLINE_AFTER`] after the edit arrived. The forwarding machine, acting, then numbers
+    /// it. While there is no open link to the acting machine it is kept until
+    /// [`KEEP_FORWARDED`].
     async fn edit_from(
         &self,
         from: Option<MachineId>,
@@ -158,7 +161,10 @@ impl Coordinator {
                 if self.caught_up(&held) || waited >= OFFLINE_AFTER {
                     return self.number(edit).await;
                 }
-            } else if Some(acting) != from || waited >= OFFLINE_AFTER {
+            } else if Some(acting) != from
+                || waited >= OFFLINE_AFTER
+                || self.heard_since(acting, arrived)
+            {
                 let message = PeerMessage::Edit {
                     protocol: PROTOCOL,
                     edit: edit.clone(),
@@ -190,6 +196,13 @@ impl Coordinator {
         .await
     }
 
+    /// Whether a copy of the settings was taken from `peer` after `at`.
+    fn heard_since(&self, peer: MachineId, at: Instant) -> bool {
+        lock(&self.taken)
+            .get(&peer)
+            .is_some_and(|taken| *taken > at)
+    }
+
     async fn held(&self) -> Result<SharedSettings, StoreError> {
         on_store(&self.store, |store| store.settings()).await
     }
@@ -199,7 +212,7 @@ impl Coordinator {
     /// machine that has just started and hears from no one yet does not number on an old copy.
     fn caught_up(&self, held: &SharedSettings) -> bool {
         let taken = lock(&self.taken);
-        let has = |id: &MachineId| *id == self.me || taken.contains(id);
+        let has = |id: &MachineId| *id == self.me || taken.contains_key(id);
         let reachable = self.peers.online().iter().all(has);
         let listed = held.machines.iter().all(|m| has(&m.id));
         reachable && (listed || self.started.elapsed() >= OFFLINE_AFTER)

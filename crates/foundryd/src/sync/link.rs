@@ -131,15 +131,16 @@ async fn reading(inner: &Inner, recv: &mut Receiver<String>, peer: MachineId) {
             }
         };
         if let Some(at) = refused {
-            if at.elapsed() >= RETRY_REFUSED {
-                tracing::info!("sync: link to {peer} closed to ask again for what it refused");
-                return;
-            }
+            // Taken before the link closes, so the message that closes it is not lost.
             if let Ok(message @ (PeerMessage::Settings { .. } | PeerMessage::Edit { .. })) =
                 serde_json::from_str::<PeerMessage>(&text)
                 && let Err(error) = take(inner, peer, message).await
             {
                 tracing::warn!("sync: {error}");
+            }
+            if at.elapsed() >= RETRY_REFUSED {
+                tracing::info!("sync: link to {peer} closed to ask again for what it refused");
+                return;
             }
             continue;
         }
