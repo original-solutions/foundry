@@ -91,10 +91,6 @@ pub struct Api {
     /// its MagicDNS short name and its `<name>.<tailnet>.ts.net` name. The daemon fills it;
     /// empty means only addresses and `localhost` are trusted in a `Host`.
     pub names: Vec<String>,
-    /// A lock per workspace, held by an archive and by a shell or session start for their
-    /// whole work ([`locked`]), so a start cannot land between an archive's listing of the
-    /// workspace's terminals and its delete. A workspace no one holds or waits for has none.
-    lifecycle: Locks,
 }
 
 impl Api {
@@ -113,7 +109,6 @@ impl Api {
             workspaces,
             sessions,
             names,
-            lifecycle: Arc::default(),
         }
     }
 }
@@ -448,63 +443,6 @@ async fn on_store<T: Send + 'static>(
     }
 }
 
-/// The lifecycle locks, one per workspace someone holds or waits for.
-type Locks = Arc<Mutex<BTreeMap<WorkspaceId, Arc<tokio::sync::Mutex<()>>>>>;
-
-/// Runs `work` holding `workspace`'s lifecycle lock, on a task of its own, so the lock is held
-/// until the work ends even when the caller hangs up and its request is dropped.
-async fn locked<T: Send + 'static>(
-    api: &Api,
-    workspace: WorkspaceId,
-    work: impl Future<Output = Result<T, ApiError>> + Send + 'static,
-) -> Result<T, ApiError> {
-    let (lock, user) = {
-        let mut locks = api.lifecycle.lock().unwrap_or_else(PoisonError::into_inner);
-        let lock = Arc::clone(locks.entry(workspace).or_default());
-        let user = User {
-            locks: Arc::clone(&api.lifecycle),
-            workspace,
-            lock: Some(Arc::clone(&lock)),
-        };
-        (lock, user)
-    };
-    let task = tokio::spawn(async move {
-        // Dropped in the reverse order: the guard first, then the user.
-        let _user = user;
-        let _held = lock.lock_owned().await;
-        work.await
-    });
-    match task.await {
-        Ok(result) => result,
-        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
-        // The runtime is shutting down, and drops the task that waits here with it.
-        Err(_) => std::future::pending().await,
-    }
-}
-
-/// One holder or waiter of a workspace's lock. When the last one goes, its work panicking
-/// included, the lock is dropped from the map.
-struct User {
-    locks: Locks,
-    workspace: WorkspaceId,
-    lock: Option<Arc<tokio::sync::Mutex<()>>>,
-}
-
-impl Drop for User {
-    fn drop(&mut self) {
-        let mut locks = self.locks.lock().unwrap_or_else(PoisonError::into_inner);
-        // Users are made under the map's lock, and a user's guard is dropped before the user,
-        // so the last user out sees the map's own clone as the only one left.
-        self.lock = None;
-        if locks
-            .get(&self.workspace)
-            .is_some_and(|lock| Arc::strong_count(lock) == 1)
-        {
-            locks.remove(&self.workspace);
-        }
-    }
-}
-
 // --- state and events ---
 
 /// The full state as [`UiMessage::State`], and the highest version it holds per owner. The
@@ -701,9 +639,7 @@ async fn archive_workspace(
             )
         })?
     };
-    let workspaces = Arc::clone(&api.workspaces);
-    let work = async move { Ok(workspaces.archive(id, archive.force).await?) };
-    locked(&api, id, work).await?;
+    api.workspaces.archive(id, archive.force).await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
@@ -719,14 +655,14 @@ async fn start_session(
     Body(start): Body<Start>,
 ) -> Result<Response, ApiError> {
     let id = parse_id(&id, "workspace", WorkspaceId)?;
-    let work = {
-        let api = api.clone();
-        async move {
-            let worktree = api.workspaces.worktree(id).await?;
-            Ok(api.sessions.start(id, &worktree, &start.model).await?)
-        }
-    };
-    Ok(created(locked(&api, id, work).await?))
+    let sessions = Arc::clone(&api.sessions);
+    let session = api
+        .workspaces
+        .start_in(id, move |worktree| async move {
+            Ok::<_, ApiError>(sessions.start(id, &worktree, &start.model).await?)
+        })
+        .await?;
+    Ok(created(session))
 }
 
 /// The shell a new terminal runs: the daemon's `$SHELL`, else `/bin/sh`, as a login shell.
@@ -740,14 +676,14 @@ fn shell() -> Vec<String> {
 
 async fn start_shell(State(api): State<Api>, Path(id): Path<String>) -> Result<Response, ApiError> {
     let id = parse_id(&id, "workspace", WorkspaceId)?;
-    let work = {
-        let api = api.clone();
-        async move {
-            let worktree = api.workspaces.worktree(id).await?;
-            Ok(api.terminals.start(id, &worktree, &shell(), &[]).await?)
-        }
-    };
-    Ok(created(locked(&api, id, work).await?))
+    let terminals = Arc::clone(&api.terminals);
+    let terminal = api
+        .workspaces
+        .start_in(id, move |worktree| async move {
+            Ok::<_, ApiError>(terminals.start(id, &worktree, &shell(), &[]).await?)
+        })
+        .await?;
+    Ok(created(terminal))
 }
 
 async fn close_terminal(
