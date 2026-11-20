@@ -1,4 +1,5 @@
-import type { AnyRecord, MachineSample, SessionState, SharedSettings, TerminalState, UiMessage } from "./api";
+import type { AnyRecord, Briefs, MachineSample, SessionState, SharedSettings, Step, TerminalState, UiMessage } from "./api";
+import { sessionLabel, sessionGlyph, terminalLabel, terminalGlyph, type Glyph } from "./labels";
 
 export interface FleetState {
   records: AnyRecord[];
@@ -49,6 +50,10 @@ export interface SessionView {
   model: string;
   state: SessionState;
   terminal: string;
+  /** Its first prompt, when this machine's daemon has its brief. */
+  title?: string;
+  /** The newest step of its turn. */
+  now?: Step;
 }
 export interface ShellView {
   id: string;
@@ -71,8 +76,8 @@ export interface MachineView {
   workspaces: WorkspaceView[];
 }
 
-/** The sidebar's model. Machine rules follow `foundryd status`. */
-export function fleet(records: AnyRecord[], settings: SharedSettings): MachineView[] {
+/** The sidebar's model. Machine rules follow `foundryd status`. `briefs` name sessions by what they were asked. */
+export function fleet(records: AnyRecord[], settings: SharedSettings, briefs: Briefs = {}): MachineView[] {
   const listed = settings.machines.map((m) => m.id);
   const others = [...new Set(records.filter((r) => r.kind === "machine_sample" && !listed.includes(r.owner)).map((r) => r.owner))].sort();
   const live = records.filter((r) => !r.deleted);
@@ -104,14 +109,21 @@ export function fleet(records: AnyRecord[], settings: SharedSettings): MachineVi
           name: w.name,
           branch: w.branch,
           project: settings.projects.find((p) => p.id === w.project)?.name ?? w.project,
-          sessions: mine.map((s) => ({ id: s.id, model: s.model, state: s.state, terminal: s.terminal })),
+          sessions: mine.map((s) => ({
+            id: s.id,
+            model: s.model,
+            state: s.state,
+            terminal: s.terminal,
+            title: briefs[s.id]?.title ?? undefined,
+            now: briefs[s.id]?.now ?? undefined,
+          })),
           shells: shellsOf.get(w.id) ?? [],
         },
       ];
     });
     return {
       id,
-      name: settings.machines.find((m) => m.id === id)?.name ?? id,
+      name: settings.machines.find((m) => m.id === id)?.name ?? shortId(id),
       status: reachable.includes(false) ? "offline" : reachable.length === 0 ? "unknown" : "online",
       sample: sample?.body ?? null,
       workspaces,
@@ -119,9 +131,78 @@ export function fleet(records: AnyRecord[], settings: SharedSettings): MachineVi
   });
 }
 
+/** Where terminal `id` sits in the fleet, with the name and state the sidebar gives it. */
+export interface Located {
+  machine: MachineView;
+  workspace: WorkspaceView;
+  /** The session it runs, when it is a session's terminal. */
+  session?: string;
+  name: string;
+  /** A session's first prompt. */
+  title?: string;
+  label: string;
+  glyph: Glyph;
+}
+
+export function locate(machines: MachineView[], id: string): Located | undefined {
+  for (const machine of machines) {
+    for (const workspace of machine.workspaces) {
+      const row = rows(workspace).find((r) => r.terminal === id);
+      if (row) return { machine, workspace, session: row.session, name: row.name, title: row.title, label: row.label, glyph: row.glyph };
+    }
+  }
+  return undefined;
+}
+
+/** One terminal of a workspace as the sidebar lists it. */
+export interface Row {
+  terminal: string;
+  /** The session it runs, when it is a session's terminal. */
+  session?: string;
+  name: string;
+  /** A session's first prompt, which tells two sessions of one model apart. */
+  title?: string;
+  /** What a session is doing, only while it works, waits or is stuck. */
+  now?: Step;
+  label: string;
+  glyph: Glyph;
+}
+
+const busy: Glyph[] = ["working", "waiting", "stuck"];
+
+/** A workspace's terminals in sidebar order: its sessions, then its shells. */
+export function rows(workspace: WorkspaceView): Row[] {
+  return [
+    ...workspace.sessions.map((s) => {
+      const glyph = sessionGlyph[s.state];
+      return { terminal: s.terminal, session: s.id, name: s.model, title: s.title, now: busy.includes(glyph) ? s.now : undefined, label: sessionLabel[s.state], glyph };
+    }),
+    ...workspace.shells.map((t) => ({ terminal: t.id, name: "shell", label: terminalLabel(t.state, t.exitCode), glyph: terminalGlyph(t.state, t.exitCode) })),
+  ];
+}
+
+const urgency: Glyph[] = ["waiting", "stuck", "failed", "working", "starting", "ready", "done", "away"];
+
+/** `rows` with what needs a person first, then what is busy, then the rest; ties keep their order. */
+export function byUrgency(list: Row[]): Row[] {
+  return [...list].sort((a, b) => urgency.indexOf(a.glyph) - urgency.indexOf(b.glyph));
+}
+
+/** A machine id to show when settings give no name: a UUID's first block, else the id. */
+function shortId(id: string): string {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-/i.test(id) ? id.slice(0, 8) : id;
+}
+
 /** The numbers line of `foundryd status`. */
 export function machineNumbers(sample: MachineSample | null): string {
   if (!sample) return "no sample yet";
   const gb = (bytes: number) => (bytes / 1e9).toFixed(1);
   return `load ${sample.load_per_core.toFixed(2)}/core  memory ${gb(sample.free_memory)} GB free  disk ${gb(sample.free_disk)} GB free  ${sample.sessions} session${sample.sessions === 1 ? "" : "s"}`;
+}
+
+/** The same numbers, short enough for one sidebar line. */
+export function machineStats(sample: MachineSample | null): string {
+  if (!sample) return "no sample yet";
+  const gb = (bytes: number) => (bytes / 1e9).toFixed(1);
+  return `${sample.load_per_core.toFixed(2)}/core · ${gb(sample.free_memory)} GB mem · ${gb(sample.free_disk)} GB disk · ${sample.sessions} session${sample.sessions === 1 ? "" : "s"}`;
 }

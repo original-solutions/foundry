@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { AnyRecord, UiMessage } from "./api";
-import { apply, emptyState, fleet, machineNumbers, terminalRunning } from "./fleet";
+import { apply, byUrgency, emptyState, fleet, locate, machineNumbers, machineStats, rows, terminalRunning } from "./fleet";
+import type { Glyph } from "./labels";
 import { ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
 
 const full = (records: AnyRecord[]): UiMessage => ({ type: "state", protocol: 1, records, settings: settings() });
@@ -58,6 +59,11 @@ describe("fleet", () => {
     });
     const machines = fleet([sample("z", 1), sample("a", 1), sample("c", 1)], s);
     expect(machines.map((m) => m.name)).toEqual(["second", "first", "c", "z"]);
+  });
+
+  it("names a machine settings do not name by the start of its id when the id is a UUID", () => {
+    const id = "e2b2e8f1-52f2-4dd0-8575-7c6e2b6745d7";
+    expect(fleet([sample(id, 1)], settings({ machines: [] })).map((m) => m.name)).toEqual(["e2b2e8f1"]);
   });
 
   it("is offline when any session or terminal of the machine is unreachable, online when one is not, else unknown", () => {
@@ -134,6 +140,16 @@ describe("machineNumbers", () => {
   });
 });
 
+describe("machineStats", () => {
+  it("gives the sidebar's short form of the same numbers", () => {
+    expect(machineStats({ load_per_core: 0.42, free_memory: 12_300_000_000, free_disk: 120_500_000_000, sessions: 4 })).toBe(
+      "0.42/core · 12.3 GB mem · 120.5 GB disk · 4 sessions",
+    );
+    expect(machineStats({ load_per_core: 1, free_memory: 0, free_disk: 0, sessions: 1 })).toMatch(/· 1 session$/);
+    expect(machineStats(null)).toBe("no sample yet");
+  });
+});
+
 describe("terminalRunning", () => {
   it("does not know before the first state arrives", () => {
     expect(terminalRunning(emptyState, "t1")).toBeUndefined();
@@ -155,5 +171,94 @@ describe("terminalRunning", () => {
     expect(terminalRunning(state, "gone")).toBe(false);
     expect(terminalRunning(state, "away")).toBe(false);
     expect(terminalRunning(state, "never")).toBe(false);
+  });
+});
+
+describe("locate", () => {
+  const machines = fleet(
+    [
+      sample(ME, 1),
+      workspace(ME, "w1", "fix login"),
+      terminal(ME, "t1", "w1", "running"),
+      session(ME, "s1", "w1", "t1", "waiting_for_you", { model: "sonnet" }),
+      terminal(ME, "sh1", "w1", "exited", { exit_code: 2 }),
+      workspace(OTHER, "w2", "docs"),
+      terminal(OTHER, "sh2", "w2", "unreachable"),
+    ],
+    settings({ machines: [{ id: ME, name: "studio", address: "" }, { id: OTHER, name: "laptop", address: "" }] }),
+  );
+
+  it("finds a session's terminal with its workspace, machine, name and state", () => {
+    const found = locate(machines, "t1");
+    expect(found && { machine: found.machine.name, workspace: found.workspace.name, name: found.name, label: found.label, glyph: found.glyph }).toEqual({
+      machine: "studio",
+      workspace: "fix login",
+      name: "sonnet",
+      label: "Waiting for you",
+      glyph: "waiting",
+    });
+  });
+
+  it("finds a shell, named shell, with its exit code in the label", () => {
+    const found = locate(machines, "sh1");
+    expect(found && [found.name, found.label, found.glyph]).toEqual(["shell", "Exited 2", "failed"]);
+    const away = locate(machines, "sh2");
+    expect(away && [away.machine.name, away.workspace.name, away.label, away.glyph]).toEqual(["laptop", "docs", "Unreachable", "away"]);
+  });
+
+  it("lists a workspace's terminals as rows, sessions first, each with its session, name, label and glyph", () => {
+    expect(rows(machines[0].workspaces[0])).toEqual([
+      { terminal: "t1", session: "s1", name: "sonnet", label: "Waiting for you", glyph: "waiting" },
+      { terminal: "sh1", name: "shell", label: "Exited 2", glyph: "failed" },
+    ]);
+  });
+
+  it("orders rows by what needs a person first: waiting, stuck, failed, working, then the rest", () => {
+    const row = (terminal: string, glyph: Glyph) => ({ terminal, name: terminal, label: "", glyph });
+    const all = ["done", "ready", "working", "away", "failed", "starting", "stuck", "waiting"].map((g) => row(g, g as Glyph));
+    expect(byUrgency(all).map((r) => r.glyph)).toEqual(["waiting", "stuck", "failed", "working", "starting", "ready", "done", "away"]);
+  });
+
+  it("finds nothing for a terminal that is not listed", () => {
+    expect(locate(machines, "nope")).toBeUndefined();
+  });
+});
+
+describe("briefs", () => {
+  const records = [
+    workspace(ME, "w1", "fix login"),
+    terminal(ME, "t1", "w1"),
+    session(ME, "s1", "w1", "t1", "working"),
+    terminal(ME, "t2", "w1"),
+    session(ME, "s2", "w1", "t2", "idle"),
+    terminal(ME, "t3", "w1"),
+    session(ME, "s3", "w1", "t3", "waiting_for_you"),
+  ];
+  const briefs = {
+    s1: { title: "fix the login bug", now: { kind: "tool" as const, text: "Edit src/login.ts" } },
+    s2: { title: "add a test", now: { kind: "prompt" as const, text: "left over" } },
+    s3: { title: null, now: { kind: "ask" as const, text: "Claude needs your permission to use Bash" } },
+  };
+
+  it("gives each session its first prompt as a title, so two sessions of one model read apart", () => {
+    const [machine] = fleet(records, settings(), briefs);
+    const list = rows(machine.workspaces[0]);
+    expect(list.map((r) => [r.name, r.title])).toEqual([
+      ["opus", "fix the login bug"],
+      ["opus", "add a test"],
+      ["opus", undefined],
+    ]);
+    expect(locate([machine], "t1")?.title).toBe("fix the login bug");
+  });
+
+  it("says what a session is doing only while it works, waits or is stuck", () => {
+    const [machine] = fleet(records, settings(), briefs);
+    const list = rows(machine.workspaces[0]);
+    expect(list.map((r) => r.now?.text)).toEqual(["Edit src/login.ts", undefined, "Claude needs your permission to use Bash"]);
+  });
+
+  it("leaves a session with no brief, as a peer's is, as it was", () => {
+    const [machine] = fleet(records, settings());
+    expect(rows(machine.workspaces[0]).every((r) => r.title === undefined && r.now === undefined)).toBe(true);
   });
 });

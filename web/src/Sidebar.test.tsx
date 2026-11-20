@@ -33,9 +33,12 @@ function machines() {
   return fleet(records, settings({ machines: [{ id: ME, name: "studio", address: "" }, { id: OTHER, name: "laptop", address: "" }] }));
 }
 
-const props = { projects: settings().projects, connected: true };
+const props = { connected: true, onCreate: () => {} };
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.unstubAllGlobals();
+  localStorage.clear();
+});
 
 describe("Sidebar", () => {
   it("shows each machine with its state (offline: one session is unreachable) and numbers", async () => {
@@ -44,7 +47,9 @@ describe("Sidebar", () => {
     expect(screen.getByRole("heading", { name: "Foundry" })).toBeDefined();
     const studio = screen.getByRole("region", { name: "studio" });
     expect(within(studio).getByText("offline")).toBeDefined();
-    expect(within(studio).getByText(/load 0\.42\/core/)).toBeDefined();
+    const stats = within(studio).getByText("0.42/core · 12.3 GB mem · 120.5 GB disk · 4 sessions");
+    expect(stats.getAttribute("title")).toBe("load 0.42/core  memory 12.3 GB free  disk 120.5 GB free  4 sessions");
+    expect(within(studio).getByRole("meter", { name: "Load per core" }).getAttribute("aria-valuenow")).toBe("0.42");
     const laptop = screen.getByRole("region", { name: "laptop" });
     expect(within(laptop).getByText("unknown")).toBeDefined();
     expect(within(laptop).getByText("no sample yet")).toBeDefined();
@@ -69,6 +74,21 @@ describe("Sidebar", () => {
     expect(screen.getByRole("group", { name: "empty" })).toBeDefined();
   });
 
+  it("names each session by its first prompt and says what a working one is doing", async () => {
+    const records = [workspace(ME, "w1", "fix login"), terminal(ME, "t1", "w1"), session(ME, "s1", "w1", "t1", "working"), terminal(ME, "t2", "w1"), session(ME, "s2", "w1", "t2", "idle")];
+    const briefs = {
+      s1: { title: "fix the login bug", now: { kind: "tool" as const, text: "Edit src/login.ts" } },
+      s2: { title: "write the release notes", now: null },
+    };
+    await renderApp(<Sidebar machines={fleet(records, settings(), briefs)} {...props} />);
+
+    const group = screen.getByRole("group", { name: "fix login" });
+    const working = within(group).getByRole("link", { name: /opus fix the login bug.*Working/ });
+    expect(within(working).getByText("Edit src/login.ts")).toBeDefined();
+    expect(working.getAttribute("title")).toBe("opus: fix the login bug");
+    expect(within(group).getByRole("link", { name: /opus write the release notes.*Idle/ })).toBeDefined();
+  });
+
   it("highlights the selected terminal", async () => {
     await renderApp(<Sidebar machines={machines()} selected="sh2" {...props} />);
 
@@ -77,9 +97,11 @@ describe("Sidebar", () => {
   });
 
   it("offers a new workspace and says when the events socket is down", async () => {
-    await renderApp(<Sidebar machines={[]} {...props} connected={false} />);
+    const onCreate = vi.fn();
+    await renderApp(<Sidebar machines={[]} {...props} onCreate={onCreate} connected={false} />);
 
-    expect(screen.getByRole("button", { name: "New workspace" })).toBeDefined();
+    fireEvent.click(screen.getByRole("button", { name: "New workspace" }));
+    expect(onCreate).toHaveBeenCalled();
     expect(screen.getByText(/disconnected/i)).toBeDefined();
   });
 
@@ -100,5 +122,61 @@ describe("Sidebar", () => {
     fireEvent.click(within(group).getByRole("button", { name: "New shell" }));
 
     expect((await within(group).findByRole("alert")).textContent).toContain("at the terminal limit");
+  });
+
+  it("folds a workspace to one line of its states, the most urgent first, and remembers the fold", async () => {
+    const { unmount } = await renderApp(<Sidebar machines={machines()} {...props} />);
+    const group = screen.getByRole("group", { name: "fix login" });
+    const toggle = within(group).getByRole("button", { name: "fix login" });
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+
+    fireEvent.click(toggle);
+
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    const strip = within(group).getAllByRole("link");
+    expect(strip.map((l) => l.getAttribute("aria-label"))).toEqual([
+      "model-2 Waiting for you",
+      "model-6 Stuck",
+      "model-5 Failed",
+      "shell Exited 1",
+      "model-1 Working",
+      "model-0 Starting",
+    ]);
+    expect(strip[0].getAttribute("href")).toBe("/terminals/st2");
+    expect(within(group).getByText("+5")).toBeDefined();
+    expect(within(group).queryByRole("button", { name: "New shell" })).toBeNull();
+    expect(JSON.parse(localStorage.getItem("foundry.folded") ?? "[]")).toEqual(["w1"]);
+
+    unmount();
+    await renderApp(<Sidebar machines={machines()} {...props} />);
+    const again = within(screen.getByRole("group", { name: "fix login" })).getByRole("button", { name: "fix login" });
+    expect(again.getAttribute("aria-expanded")).toBe("false");
+    fireEvent.click(again);
+    expect(again.getAttribute("aria-expanded")).toBe("true");
+    expect(within(screen.getByRole("group", { name: "fix login" })).getAllByRole("link")).toHaveLength(11);
+  });
+
+  it("keeps the open terminal in a folded workspace's line even when more urgent ones fill it", async () => {
+    localStorage.setItem("foundry.folded", JSON.stringify(["w1"]));
+    await renderApp(<Sidebar machines={machines()} selected="sh1" {...props} />);
+
+    const strip = within(screen.getByRole("group", { name: "fix login" })).getAllByRole("link");
+    expect(strip).toHaveLength(6);
+    expect(strip[5].getAttribute("aria-label")).toBe("shell Running");
+    expect(strip[5].getAttribute("aria-current")).toBe("true");
+  });
+
+  it("folds and unfolds every workspace of a machine at once", async () => {
+    await renderApp(<Sidebar machines={machines()} {...props} />);
+    const studio = screen.getByRole("region", { name: "studio" });
+
+    fireEvent.click(within(studio).getByRole("button", { name: "Fold all" }));
+    for (const name of ["fix login", "empty"]) {
+      expect(within(studio).getByRole("button", { name }).getAttribute("aria-expanded")).toBe("false");
+    }
+    fireEvent.click(within(studio).getByRole("button", { name: "Unfold all" }));
+    for (const name of ["fix login", "empty"]) {
+      expect(within(studio).getByRole("button", { name }).getAttribute("aria-expanded")).toBe("true");
+    }
   });
 });

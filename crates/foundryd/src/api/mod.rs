@@ -21,6 +21,10 @@
 //! - `POST /api/workspaces/{id}/shells`: starts the daemon's `$SHELL` in the workspace, `201
 //!   {id}`.
 //! - `POST /api/terminals/{id}/close`: `204`.
+//! - `GET /api/workspaces/{id}/changes`: what the workspace changed since its base, see
+//!   [`changes`]. Only a workspace of this machine; any other is `404`.
+//! - `GET /api/briefs`: what each session of this machine is for and doing, see [`briefs`].
+//! - `GET /api/sessions/{id}/trail`: every step a session of this machine took, see [`trail`].
 //!
 //! An error is `{"error": "..."}` with a status that says what kind it was, a request axum
 //! refuses (a body that is not the JSON wanted, an unknown route or method, a socket path asked
@@ -72,9 +76,12 @@ use crate::terminals::{TerminalError, Terminals};
 use crate::workspaces::{WorkspaceError, Workspaces};
 
 pub mod assets;
+mod briefs;
+mod changes;
 pub mod terminals;
 #[cfg(test)]
 mod tests;
+mod trail;
 
 /// How often the events socket reads the store for changes.
 pub const EVENTS_EVERY: Duration = Duration::from_millis(200);
@@ -124,6 +131,9 @@ pub fn router(api: Api) -> Router {
         .route("/api/workspaces/{id}/archive", post(archive_workspace))
         .route("/api/workspaces/{id}/sessions", post(start_session))
         .route("/api/workspaces/{id}/shells", post(start_shell))
+        .route("/api/workspaces/{id}/changes", get(changes::changes))
+        .route("/api/briefs", get(briefs::briefs))
+        .route("/api/sessions/{id}/trail", get(trail::trail))
         .fallback(no_route)
         .method_not_allowed_fallback(wrong_method)
         .layer(middleware::from_fn_with_state(api.clone(), same_site))

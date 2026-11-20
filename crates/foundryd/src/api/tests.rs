@@ -1267,6 +1267,7 @@ async fn every_route_refuses_another_site_and_another_host_and_does_nothing() {
     let create = serde_json::json!({"project": project, "base": "main", "name": "intruder"});
     let force = serde_json::json!({"force": true});
     let model = serde_json::json!({"model": MODEL});
+    let trail = format!("/api/sessions/{}/trail", SessionId::random());
     let routes: Vec<(&str, &str, Option<serde_json::Value>, bool)> = vec![
         ("GET", "/api/state", None, false),
         ("GET", "/api/events", None, true),
@@ -1276,6 +1277,8 @@ async fn every_route_refuses_another_site_and_another_host_and_does_nothing() {
         ("POST", &archive, Some(force), false),
         ("POST", &sessions, Some(model), false),
         ("POST", &shells, None, false),
+        ("GET", "/api/briefs", None, false),
+        ("GET", &trail, None, false),
     ];
     for (method, path, body, upgrade) in routes {
         for (name, value) in [
@@ -1314,6 +1317,118 @@ async fn every_route_refuses_another_site_and_another_host_and_does_nothing() {
         .await
         .unwrap();
     read_until(&mut socket, "still here").await;
+}
+
+// --- briefs ---
+
+#[tokio::test]
+async fn briefs_name_each_sessions_first_prompt_and_newest_step_with_url_passwords_hidden() {
+    let daemon = Daemon::new(
+        "
+- hook: {event: UserPromptSubmit, prompt: \"fetch https://me:hunter2@example.com/a\"}
+- hook: {event: PreToolUse, tool_name: Bash, tool_input: {command: \"git push https://me:hunter2@example.com/r\"}}
+- wait_input
+",
+    )
+    .await;
+    let project = daemon.project();
+    let workspace = daemon.create_workspace(project, "briefed").await;
+    let reply = daemon
+        .call(
+            "POST",
+            &format!("/api/workspaces/{workspace}/sessions"),
+            Some(serde_json::json!({"model": MODEL})),
+        )
+        .await;
+    assert_eq!(reply.status, 201, "{}", reply.body);
+    let session: SessionId = reply.id();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let brief = loop {
+        let reply = daemon.call("GET", "/api/briefs", None).await;
+        assert_eq!(reply.status, 200, "{}", reply.body);
+        let briefs: serde_json::Value = serde_json::from_str(&reply.body).unwrap();
+        let brief = briefs[session.to_string()].clone();
+        if brief["now"]["kind"] == "tool" {
+            break brief;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no tool step in {briefs}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(
+        brief,
+        serde_json::json!({
+            "title": "fetch https://***@example.com/a",
+            "now": {"kind": "tool", "text": "$ git push https://***@example.com/r"},
+        })
+    );
+}
+
+#[tokio::test]
+async fn a_sessions_trail_lists_its_steps_with_url_passwords_hidden_and_others_are_not_found() {
+    let daemon = Daemon::new(
+        "
+- hook: {event: UserPromptSubmit, prompt: \"fetch https://me:hunter2@example.com/a\"}
+- hook: {event: PreToolUse, tool_name: Read, tool_input: {file_path: \"notes.md\"}}
+- hook: {event: Stop}
+- wait_input
+",
+    )
+    .await;
+    let project = daemon.project();
+    let workspace = daemon.create_workspace(project, "trailed").await;
+    let reply = daemon
+        .call(
+            "POST",
+            &format!("/api/workspaces/{workspace}/sessions"),
+            Some(serde_json::json!({"model": MODEL})),
+        )
+        .await;
+    assert_eq!(reply.status, 201, "{}", reply.body);
+    let session: SessionId = reply.id();
+
+    let path = format!("/api/sessions/{session}/trail");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let steps = loop {
+        let reply = daemon.call("GET", &path, None).await;
+        assert_eq!(reply.status, 200, "{}", reply.body);
+        let body: serde_json::Value = serde_json::from_str(&reply.body).unwrap();
+        let steps = body["steps"].as_array().cloned().unwrap_or_default();
+        if steps.len() == 3 {
+            break steps;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "not three steps in {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let shown: Vec<(&str, &str)> = steps
+        .iter()
+        .map(|s| (s["kind"].as_str().unwrap(), s["text"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            ("prompt", "fetch https://***@example.com/a"),
+            ("tool", "Read notes.md"),
+            ("done", ""),
+        ]
+    );
+    assert!(
+        steps.iter().all(|s| s["at"].as_u64() > Some(0)),
+        "{steps:?}"
+    );
+
+    for other in [SessionId::random().to_string(), "nonsense".to_string()] {
+        let reply = daemon
+            .call("GET", &format!("/api/sessions/{other}/trail"), None)
+            .await;
+        assert_eq!(reply.status, 404, "{}", reply.body);
+    }
 }
 
 // --- events ---
@@ -1876,4 +1991,43 @@ async fn no_response_contains_a_secret() {
     ]) {
         assert!(!said.contains(secret), "a response holds a secret");
     }
+}
+
+#[tokio::test]
+async fn changes_list_each_file_with_its_hunks_and_hide_credentials_in_urls() {
+    let daemon = Daemon::new(TURN).await;
+    let project = daemon.project();
+    let workspace = daemon.create_workspace(project, "changed").await;
+    let worktree = daemon.workspaces.worktree(workspace).await.unwrap();
+    std::fs::write(
+        worktree.join("notes.txt"),
+        "clone https://bot:hunter2@example.com/r.git\n",
+    )
+    .unwrap();
+
+    let path = format!("/api/workspaces/{workspace}/changes");
+    let reply = daemon.call("GET", &path, None).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    let json = reply.json();
+    assert_eq!(json["base"], "main");
+    let files = json["files"].as_array().unwrap();
+    let notes = files.iter().find(|f| f["path"] == "notes.txt").unwrap();
+    assert_eq!(notes["status"], "untracked");
+    assert_eq!(notes["added"], 1);
+    assert_eq!(notes["uncommitted"], true);
+    let patch = notes["patch"].as_str().unwrap();
+    assert!(
+        patch.starts_with("@@ -0,0 +1,1 @@\n+clone https://"),
+        "{patch}"
+    );
+    assert!(!reply.body.contains("hunter2"), "{}", reply.body);
+
+    let reply = daemon
+        .call(
+            "GET",
+            &format!("/api/workspaces/{}/changes", WorkspaceId::random()),
+            None,
+        )
+        .await;
+    assert_eq!(reply.status, 404, "{}", reply.body);
 }

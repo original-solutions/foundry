@@ -23,12 +23,16 @@ export async function renderApp(ui: ReactNode) {
 
 export type Call = { url: string; method: string; body: unknown };
 
-/** Stubs `fetch` to give `answers` in order, and returns the requests it was sent. */
+/**
+ * Stubs `fetch` to give `answers` in order, and returns the requests it was sent. The layout's read
+ * of session briefs gets none and is left out, so a test sees only the requests it makes.
+ */
 export function mockFetch(...answers: Response[]): Call[] {
   const calls: Call[] = [];
   vi.stubGlobal(
     "fetch",
     vi.fn(async (url: string, init: RequestInit = {}) => {
+      if (url === "/api/briefs") return json(200, {});
       calls.push({ url, method: init.method ?? "GET", body: init.body ? JSON.parse(String(init.body)) : undefined });
       const next = answers.shift();
       if (!next) throw new Error("unexpected request");

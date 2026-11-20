@@ -32,6 +32,7 @@ use crate::store::{Store, StoreError};
 use crate::terminals::{TerminalError, Terminals};
 use state::{Event, next_state};
 
+pub mod brief;
 pub mod claude;
 mod hooks;
 pub mod state;
@@ -168,6 +169,8 @@ struct Live {
     body: tokio::sync::Mutex<Session>,
     /// When a hook or output last arrived, for the stuck timer.
     activity: watch::Sender<Instant>,
+    /// What the session is for and doing, from its hooks' payloads.
+    brief: Mutex<brief::Brief>,
     tasks: Mutex<Vec<AbortHandle>>,
 }
 
@@ -222,6 +225,22 @@ impl Sessions {
         Router::new()
             .route("/hooks/{session}", post(hooks::hook))
             .with_state(self.inner.clone())
+    }
+
+    /// What each of this daemon's sessions is for and doing, from its hooks since it started.
+    pub fn briefs(&self) -> HashMap<SessionId, brief::Brief> {
+        lock(&self.inner.live)
+            .values()
+            .map(|live| (live.id, lock(&live.brief).clone()))
+            .collect()
+    }
+
+    /// Every step session `id` took since this daemon started, oldest first, or `None` when it
+    /// is not one of this daemon's sessions.
+    pub fn trail(&self, id: SessionId) -> Option<Vec<brief::Mark>> {
+        let live = lock(&self.inner.live).get(&id).cloned()?;
+        let trail = lock(&live.brief).trail.iter().cloned().collect();
+        Some(trail)
     }
 }
 
@@ -291,6 +310,7 @@ impl Inner {
                 state: SessionState::Starting,
             }),
             activity,
+            brief: Mutex::default(),
             tasks: Mutex::default(),
         });
         // Locked before the session can be found, and kept until its record is written: a hook

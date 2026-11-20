@@ -1,6 +1,7 @@
-import { act, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TerminalPane } from "./TerminalPane";
+import type { Glyph } from "./labels";
 import { FakeSocket } from "./test-utils";
 
 // jsdom cannot run xterm.js, so a stand-in records what the pane does to its screen.
@@ -9,17 +10,23 @@ const screenOps = vi.hoisted(() => ({
   typed: null as ((data: string) => void) | null,
   resized: null as (() => void) | null,
   term: null as { cols: number; rows: number } | null,
+  options: null as Record<string, unknown> | null,
+  focused: false,
 }));
 
 vi.mock("@xterm/xterm", () => ({
   Terminal: class {
     cols = 80;
     rows = 24;
-    constructor() {
+    constructor(options: Record<string, unknown>) {
       screenOps.term = this;
+      screenOps.options = options;
     }
     loadAddon() {}
     open() {}
+    focus() {
+      screenOps.focused = true;
+    }
     reset() {
       screenOps.ops.push("reset");
     }
@@ -34,6 +41,14 @@ vi.mock("@xterm/xterm", () => ({
       screenOps.resized = callback;
       return { dispose() {} };
     }
+    modes = { applicationCursorKeysMode: false, bracketedPasteMode: true };
+    // As xterm does: a paste is typed data, wrapped when the program asked for bracketed paste.
+    paste(data: string) {
+      screenOps.typed?.(`\x1b[200~${data}\x1b[201~`);
+    }
+    input(data: string) {
+      screenOps.typed?.(data);
+    }
     dispose() {}
   },
 }));
@@ -46,6 +61,7 @@ beforeEach(() => {
   screenOps.typed = null;
   screenOps.resized = null;
   screenOps.term = null;
+  screenOps.focused = false;
   FakeSocket.install();
   vi.stubGlobal(
     "ResizeObserver",
@@ -63,12 +79,17 @@ afterEach(() => {
 });
 
 // An options object, not a defaulted parameter: a default would turn an explicit `undefined` into `true`.
-function mount(id = "t1", { running }: { running: boolean | undefined } = { running: true }) {
-  const view = render(<TerminalPane id={id} running={running} />);
+function mount(id = "t1", { running, glyph }: { running: boolean | undefined; glyph?: Glyph } = { running: true }) {
+  const view = render(<TerminalPane id={id} running={running} name="opus" glyph={glyph} />);
   return { socket: FakeSocket.last(), view };
 }
 
 describe("TerminalPane", () => {
+  it("takes the keyboard when it opens, so a picked terminal can be typed into at once", () => {
+    mount();
+    expect(screenOps.focused).toBe(true);
+  });
+
   it("attaches to the terminal's socket, sends its size, and writes the kept screen over a reset", () => {
     const { socket } = mount("t 1/x");
     expect(socket.url).toMatch(/\/api\/terminals\/t%201%2Fx$/);
@@ -79,6 +100,12 @@ describe("TerminalPane", () => {
     act(() => socket.deliver(bytes("kept screen")));
     act(() => socket.deliver(bytes("live")));
     expect(screenOps.ops).toEqual(["reset", "write:kept screen", "write:live"]);
+  });
+
+  it("holds the 10,000 lines of scrollback the holder keeps, so find reaches all of them, and turns on the decorations find lights its hits with", () => {
+    mount();
+    expect(screenOps.options?.scrollback).toBe(10_000);
+    expect(screenOps.options?.allowProposedApi).toBe(true);
   });
 
   it("sends typed keys as bytes", () => {
@@ -320,5 +347,70 @@ describe("TerminalPane", () => {
 
     expect(socket.readyState).toBe(FakeSocket.CLOSED);
     expect(FakeSocket.last().url).toMatch(/\/api\/terminals\/t2$/);
+  });
+
+  describe("touch keys", () => {
+    const sent = (socket: FakeSocket) => socket.sent.filter((d) => typeof d !== "string").map((d) => new TextDecoder().decode(d as Uint8Array));
+
+    it("sends the keys a phone keyboard lacks, as a keyboard would", () => {
+      const { socket } = mount();
+      act(() => socket.open());
+
+      fireEvent.click(screen.getByRole("button", { name: "Escape" }));
+      fireEvent.click(screen.getByRole("button", { name: "Up" }));
+      fireEvent.click(screen.getByRole("button", { name: "Shift+Tab" }));
+
+      expect(sent(socket)).toEqual(["\x1b", "\x1b[A", "\x1b[Z"]);
+    });
+
+    it("sends a written message as one paste and then Enter, and clears the box", () => {
+      const { socket } = mount();
+      act(() => socket.open());
+
+      const box = screen.getByRole("textbox", { name: "Message opus" });
+      fireEvent.change(box, { target: { value: "say hi" } });
+      fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+      expect(sent(socket)).toEqual(["\x1b[200~say hi\x1b[201~", "\r"]);
+      expect((box as HTMLInputElement).value).toBe("");
+    });
+
+    it("sends on Enter in the box, and sends nothing for an empty box", () => {
+      const { socket } = mount();
+      act(() => socket.open());
+
+      const box = screen.getByRole("textbox", { name: "Message opus" });
+      fireEvent.keyDown(box, { key: "Enter" });
+      expect(sent(socket)).toEqual([]);
+      fireEvent.change(box, { target: { value: "ls" } });
+      fireEvent.keyDown(box, { key: "Enter" });
+
+      expect(sent(socket)).toEqual(["\x1b[200~ls\x1b[201~", "\r"]);
+    });
+
+    it("offers one-tap answers while the session waits for you", () => {
+      const { socket } = mount("t1", { running: true, glyph: "waiting" });
+      act(() => socket.open());
+
+      fireEvent.click(screen.getByRole("button", { name: "Answer 1" }));
+
+      expect(sent(socket)).toEqual(["1"]);
+    });
+
+    it("offers no answers while the session works", () => {
+      mount("t1", { running: true, glyph: "working" });
+      expect(screen.queryByRole("button", { name: "Answer 1" })).toBeNull();
+    });
+
+    it("goes away once the terminal is no longer running", () => {
+      mount("t1", { running: false });
+      expect(screen.queryByRole("toolbar")).toBeNull();
+    });
+
+    it("does not raise a touch keyboard over the screen when a terminal opens", () => {
+      vi.stubGlobal("matchMedia", (query: string) => ({ matches: query === "(pointer: coarse)" }));
+      mount();
+      expect(screenOps.focused).toBe(false);
+    });
   });
 });

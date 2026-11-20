@@ -1,0 +1,282 @@
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { Link } from "@tanstack/react-router";
+import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
+import { lanes, topFiles, type Card, type Lane } from "./lanes";
+import { changesQuery } from "./ChangesPanel";
+import { splitPath, totals } from "./changes";
+import type { MachineView } from "./fleet";
+import { jumpKey, SearchIcon } from "./JumpPalette";
+import type { Glyph } from "./labels";
+import { glyphText, StateGlyph } from "./StateGlyph";
+import { Named, Now } from "./Now";
+
+/**
+ * How often a card on screen reads its workspace's changes while an agent in it works. A quiet
+ * card is read when it comes on screen and when one of its terminals changes state, never on a
+ * timer: each read runs git several times, and a fleet has dozens of workspaces.
+ */
+export const BOARD_BUSY_EVERY = 30_000;
+
+/** A card shows this many terminals, then says how many more. */
+const ROWS_SHOWN = 4;
+
+const laneTitle: Record<Lane, string> = { needs: "Needs you", working: "Working", quiet: "Quiet" };
+const laneTone: Record<Lane, string> = { needs: "text-amber-300", working: "text-sky-300", quiet: "text-neutral-400" };
+const laneGlyph: Record<Lane, Glyph> = { needs: "waiting", working: "working", quiet: "ready" };
+
+/** The card's edge, coloured by its most urgent terminal. */
+const edge: Record<Glyph, string> = {
+  waiting: "bg-amber-400",
+  stuck: "bg-orange-400",
+  failed: "bg-red-400",
+  working: "bg-sky-400",
+  starting: "bg-neutral-400",
+  ready: "bg-emerald-400/50",
+  done: "bg-neutral-600",
+  away: "bg-neutral-700",
+};
+
+const plural = (n: number, one: string) => `${n} ${one}${n === 1 ? "" : "s"}`;
+
+/**
+ * The view with nothing open: every workspace in the fleet as a card, in lanes by what it needs
+ * (you, its agents, or nothing), each with its terminals' live states and what it has changed
+ * since its base. A card's terminals open from it; its changes open the changes sheet. With no
+ * workspaces yet it is a search bar and the way to start one.
+ */
+export function Board({
+  machines,
+  onJump,
+  onCreate,
+  onChanges,
+}: {
+  machines: MachineView[];
+  onJump: () => void;
+  onCreate: () => void;
+  onChanges: (workspace: string) => void;
+}) {
+  const workspaces = machines.flatMap((m) => m.workspaces);
+  const sessions = workspaces.reduce((n, w) => n + w.sessions.length, 0);
+  const shells = workspaces.reduce((n, w) => n + w.shells.length, 0);
+  const counts = `${plural(sessions, "session")} · ${plural(shells, "shell")} · ${plural(workspaces.length, "workspace")} · ${plural(machines.length, "machine")}`;
+  const search = (
+    <button
+      type="button"
+      onClick={onJump}
+      className="group flex w-full items-center gap-3 rounded-xl border border-neutral-700/70 bg-neutral-900 px-4 py-3 text-left text-base text-neutral-400 shadow-lg shadow-black/40 transition-colors hover:border-neutral-500 hover:text-neutral-200"
+    >
+      <SearchIcon className="size-5 shrink-0 text-neutral-500 group-hover:text-neutral-300" />
+      <span className="flex-1">Jump to a session or shell…</span>
+      <kbd className="rounded border border-neutral-700 px-1.5 py-0.5 text-xs text-neutral-400">{jumpKey}</kbd>
+    </button>
+  );
+
+  if (workspaces.length === 0) {
+    return (
+      <div className="absolute inset-0 flex flex-col items-center justify-center gap-5 px-6 pb-[12vh]">
+        <p className="text-sm text-neutral-500">{counts}</p>
+        <div className="w-full max-w-xl">{search}</div>
+        <p className="text-xs text-neutral-600">
+          Type a workspace, model, state or machine. Or{" "}
+          <button type="button" onClick={onCreate} className="text-neutral-400 underline decoration-neutral-700 underline-offset-4 hover:text-neutral-200">
+            start a new workspace
+          </button>
+          .
+        </p>
+      </div>
+    );
+  }
+
+  const several = machines.length > 1;
+  return (
+    <div className="absolute inset-0 overflow-y-auto">
+      <div className="mx-auto flex max-w-7xl flex-col gap-7 px-6 pt-6 pb-16">
+        <div className="flex flex-col gap-2">
+          {search}
+          <p className="px-1 text-xs text-neutral-500">{counts}</p>
+        </div>
+        {lanes(machines).map(({ lane, cards }) => (
+          <LaneSection key={lane} lane={lane} count={cards.length}>
+            {cards.map((card) => (
+              <WorkspaceCard key={card.workspace.id} card={card} showMachine={several} onChanges={onChanges} />
+            ))}
+          </LaneSection>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function LaneSection({ lane, count, children }: { lane: Lane; count: number; children: React.ReactNode }) {
+  const id = useId();
+  return (
+    <section aria-labelledby={id} className="flex flex-col gap-3">
+      <div className="flex items-center gap-2 px-1">
+        <span className={laneTone[lane]}>
+          <StateGlyph glyph={laneGlyph[lane]} still />
+        </span>
+        <h2 id={id} className={`text-xs font-semibold tracking-wider uppercase ${laneTone[lane]}`}>
+          {laneTitle[lane]}
+        </h2>
+        <span className="rounded-full bg-neutral-800 px-1.5 text-[11px] text-neutral-400">{count}</span>
+        <span aria-hidden="true" className="h-px flex-1 bg-neutral-800" />
+      </div>
+      <div className="grid grid-cols-[repeat(auto-fill,minmax(17rem,1fr))] gap-3">{children}</div>
+    </section>
+  );
+}
+
+/** Whether the element is on screen, or near it; always true where the browser cannot tell. */
+function useOnScreen<T extends Element>() {
+  const ref = useRef<T>(null);
+  const [onScreen, setOnScreen] = useState(() => typeof IntersectionObserver === "undefined");
+  useLayoutEffect(() => {
+    const element = ref.current;
+    if (!element || typeof IntersectionObserver === "undefined") return;
+    const observer = new IntersectionObserver((entries) => setOnScreen(entries[entries.length - 1].isIntersecting), { rootMargin: "200px" });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+  return [ref, onScreen] as const;
+}
+
+function WorkspaceCard({ card, showMachine, onChanges }: { card: Card; showMachine: boolean; onChanges: (workspace: string) => void }) {
+  const id = useId();
+  const [ref, onScreen] = useOnScreen<HTMLElement>();
+  const { workspace, machine, rows, lead } = card;
+  const shown = rows.slice(0, ROWS_SHOWN);
+  return (
+    <article
+      ref={ref}
+      aria-labelledby={id}
+      className="relative flex flex-col overflow-hidden rounded-xl border border-neutral-800 bg-neutral-900/60 transition-colors hover:border-neutral-700"
+    >
+      <span aria-hidden="true" className={`absolute inset-y-0 left-0 w-1 ${lead ? edge[lead.glyph] : "bg-neutral-800"}`} />
+      <header className="flex flex-col gap-0.5 px-4 pt-3 pb-2">
+        <div className="flex items-baseline gap-2">
+          <h3 id={id} className="min-w-0 flex-1 truncate text-[15px] font-semibold text-neutral-100">
+            {lead ? (
+              <Link to="/terminals/$terminalId" params={{ terminalId: lead.terminal }} className="hover:underline hover:decoration-neutral-600 hover:underline-offset-4">
+                {workspace.name}
+              </Link>
+            ) : (
+              workspace.name
+            )}
+          </h3>
+          {showMachine && (
+            <span className="shrink-0 text-xs text-neutral-500" title={`Runs on ${machine.id}`}>
+              {machine.name}
+            </span>
+          )}
+        </div>
+        <p className="truncate font-mono text-xs text-neutral-500">
+          {workspace.project} · {workspace.branch}
+        </p>
+      </header>
+      <ul className="flex flex-col px-2 pb-2">
+        {shown.map((row) => (
+          <li key={row.terminal}>
+            <Link
+              to="/terminals/$terminalId"
+              params={{ terminalId: row.terminal }}
+              title={row.title ? `${row.name}: ${row.title}` : undefined}
+              className={`flex items-start gap-2.5 rounded-md px-2 py-1 text-sm hover:bg-neutral-800/80 ${row.glyph === "done" || row.glyph === "away" ? "text-neutral-500" : "text-neutral-200"}`}
+            >
+              <span className="flex h-5 shrink-0 items-center">
+                <StateGlyph glyph={row.glyph} />
+              </span>
+              <span className="min-w-0 flex-1">
+                <span className="flex items-baseline gap-2 leading-5">
+                  <Named name={row.name} title={row.title} />
+                  <span className={`shrink-0 text-xs ${glyphText[row.glyph]}`}>{row.label}</span>
+                </span>
+                {row.now && <Now step={row.now} />}
+              </span>
+            </Link>
+          </li>
+        ))}
+        {rows.length > shown.length && <li className="px-2 py-1 text-xs text-neutral-500">+{rows.length - shown.length} more</li>}
+        {rows.length === 0 && <li className="px-2 py-1 text-xs text-neutral-500">No terminals</li>}
+      </ul>
+      <ChangesFooter card={card} onScreen={onScreen} onOpen={() => onChanges(workspace.id)} />
+    </article>
+  );
+}
+
+/**
+ * What the workspace changed since its base, read as the sheet reads it, but only while the card
+ * is on screen: when it comes on screen, whenever one of its terminals changes state (so the end
+ * of a turn shows what the turn wrote), and every `BOARD_BUSY_EVERY` while an agent in it works.
+ * A state change off screen is read when the card comes back. A workspace the daemon cannot read
+ * here says so and is not asked again on a timer.
+ */
+function ChangesFooter({ card, onScreen, onOpen }: { card: Card; onScreen: boolean; onOpen: () => void }) {
+  const busy = card.rows.some((r) => r.glyph === "working");
+  const workspace = card.workspace.id;
+  const client = useQueryClient();
+  const { data, error } = useQuery({
+    ...changesQuery(workspace),
+    enabled: onScreen,
+    staleTime: BOARD_BUSY_EVERY,
+    retry: false,
+    refetchInterval: (q) => (busy && q.state.status !== "error" ? BOARD_BUSY_EVERY : false),
+  });
+  const states = card.rows.map((r) => `${r.terminal}:${r.glyph}`).join(" ");
+  const last = useRef(states);
+  useEffect(() => {
+    if (last.current === states) return;
+    last.current = states;
+    // Read now if on screen; otherwise marked out of date, and read when it comes on screen.
+    void client.invalidateQueries({ queryKey: changesQuery(workspace).queryKey, exact: true });
+  }, [states, client, workspace]);
+
+  let body: React.ReactNode;
+  if (error) body = <span className="text-neutral-500">Changes not readable from here</span>;
+  else if (!data) body = <span className="text-neutral-600">Reading changes…</span>;
+  else if (data.files.length === 0 && data.commits.length === 0) body = <span className="text-neutral-500">No changes yet</span>;
+  else {
+    const t = totals(data);
+    const top = topFiles(data, 3);
+    const newest = data.commits[0];
+    const space = newest?.indexOf(" ") ?? -1;
+    body = (
+      <>
+        <span className="flex flex-wrap items-center gap-x-2.5 gap-y-0.5 text-neutral-400">
+          <span className="font-mono">
+            <span className="text-emerald-400">+{t.added}</span> <span className={t.removed ? "text-red-400" : "text-neutral-600"}>−{t.removed}</span>
+          </span>
+          <span>{plural(t.files, "file")}</span>
+          {t.uncommitted > 0 && <span className="text-amber-300">{t.uncommitted} uncommitted</span>}
+          {data.commits.length > 0 && <span>{plural(data.commits.length, "commit")}</span>}
+        </span>
+        {top.names.length > 0 && (
+          <span className="flex min-w-0 flex-wrap gap-1">
+            {top.names.map((path) => (
+              <span key={path} title={path} className="max-w-full truncate rounded bg-neutral-800/80 px-1.5 py-px font-mono text-[11px] text-neutral-300">
+                {splitPath(path).name}
+              </span>
+            ))}
+            {top.more > 0 && <span className="px-1 py-px text-[11px] text-neutral-500">+{top.more} more</span>}
+          </span>
+        )}
+        {newest && (
+          <span className="flex min-w-0 items-baseline gap-1.5">
+            <span className="shrink-0 font-mono text-[11px] text-neutral-600">{space > 0 ? newest.slice(0, space) : newest}</span>
+            <span className="truncate text-neutral-300">{space > 0 ? newest.slice(space + 1) : ""}</span>
+          </span>
+        )}
+      </>
+    );
+  }
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      aria-label={`Changes in ${card.workspace.name}`}
+      title={error ? String(error.message) : "Changes since the base branch"}
+      className="mt-auto flex flex-col gap-1.5 border-t border-neutral-800 bg-neutral-950/40 px-4 py-2.5 text-left text-xs transition-colors hover:bg-neutral-800/50"
+    >
+      {body}
+    </button>
+  );
+}
