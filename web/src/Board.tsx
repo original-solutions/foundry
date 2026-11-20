@@ -16,7 +16,7 @@ import { jumpKey, SearchIcon } from "./JumpPalette";
 import type { Project } from "./api";
 import { Composer, useCreateWorkspace } from "./Composer";
 import { plural, type Glyph } from "./labels";
-import { glyphText, StateGlyph } from "./StateGlyph";
+import { glyphFill, glyphText, StateGlyph } from "./StateGlyph";
 import { Named, Now } from "./Now";
 import { reply, Said } from "./Said";
 import { BOARD_BUSY_EVERY, pollEvery } from "./poll";
@@ -71,18 +71,6 @@ const laneTitle: Record<Lane, string> = { needs: "Needs you", working: "Working"
 const laneHint: Record<Lane, string> = { needs: "Waiting for you, stuck or failed", working: "An agent is working or starting", quiet: "Nothing is happening" };
 const laneTone: Record<Lane, string> = { needs: "text-amber-300", working: "text-sky-300", quiet: "text-neutral-400" };
 const laneGlyph: Record<Lane, Glyph> = { needs: "waiting", working: "working", quiet: "ready" };
-
-/** The card's edge, coloured by its most urgent terminal. */
-const edge: Record<Glyph, string> = {
-  waiting: "bg-amber-400",
-  stuck: "bg-orange-400",
-  failed: "bg-red-400",
-  working: "bg-sky-400",
-  starting: "bg-neutral-400",
-  ready: "bg-emerald-400/50",
-  done: "bg-neutral-600",
-  away: "bg-neutral-700",
-};
 
 /**
  * The view with nothing open: every workspace in the fleet as a card, in lanes by what it needs
@@ -313,7 +301,7 @@ function WorkspaceCard({ card, showMachine, onChanges, arrived = false }: { card
       data-arrived={arrived || undefined}
       className={`group/card relative flex flex-col overflow-hidden rounded-xl border border-neutral-800 bg-neutral-900/60 transition-colors hover:border-neutral-700 ${arrived ? "motion-safe:animate-arrive" : ""}`}
     >
-      <span aria-hidden="true" className={`absolute inset-y-0 left-0 w-1 ${lead ? edge[lead.glyph] : "bg-neutral-800"}`} />
+      <span aria-hidden="true" className={`absolute inset-y-0 left-0 w-1 ${lead ? glyphFill[lead.glyph] : "bg-neutral-800"}`} />
       <header className="flex flex-col gap-0.5 px-4 pt-3 pb-2">
         <div className="flex items-baseline gap-2">
           <h3 id={id} className="min-w-0 flex-1 truncate text-[15px] font-semibold text-neutral-100">

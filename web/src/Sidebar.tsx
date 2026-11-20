@@ -15,7 +15,7 @@ import { Mark } from "./Mark";
 import { ThemeButton } from "./ThemeButton";
 import type { MachineSample } from "./api";
 
-const statusColour = { online: "text-emerald-400", offline: "text-red-400", unknown: "text-neutral-400" };
+const statusColour = { online: "text-neutral-400", offline: "text-red-400", unknown: "text-neutral-400" };
 const statusDot = { online: "bg-emerald-400", offline: "bg-red-400", unknown: "bg-neutral-500" };
 
 /** How many states a folded workspace shows on its line before it counts the rest. */
@@ -214,10 +214,10 @@ export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJ
   );
 }
 
-/** Load per core as a short bar: green with room, amber near full, red past one per core. */
+/** Load per core as a short bar: grey with room, amber near full, red past one per core. */
 function LoadMeter({ sample }: { sample: MachineSample }) {
   const load = sample.load_per_core;
-  const tone = load >= 1 ? "bg-red-400" : load >= 0.7 ? "bg-amber-400" : "bg-emerald-400";
+  const tone = load >= 1 ? "bg-red-400" : load >= 0.7 ? "bg-amber-400" : "bg-neutral-400";
   return (
     <span
       role="meter"

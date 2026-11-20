@@ -71,7 +71,7 @@ const hex: Record<Glyph, string> = {
   starting: "#d4d4d4",
   working: "#38bdf8",
   waiting: "#fbbf24",
-  ready: "#34d399",
+  ready: "#a3a3a3",
   done: "#a3a3a3",
   failed: "#f87171",
   stuck: "#fb923c",

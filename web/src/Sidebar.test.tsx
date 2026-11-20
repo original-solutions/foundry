@@ -50,7 +50,10 @@ describe("Sidebar", () => {
     expect(within(studio).getByText("offline")).toBeDefined();
     const stats = within(studio).getByText("0.42/core · 12.3 GB mem · 120.5 GB disk · 4 sessions");
     expect(stats.getAttribute("title")).toBe("load 0.42/core  memory 12.3 GB free  disk 120.5 GB free  4 sessions");
-    expect(within(studio).getByRole("meter", { name: "Load per core" }).getAttribute("aria-valuenow")).toBe("0.42");
+    const meter = within(studio).getByRole("meter", { name: "Load per core" });
+    expect(meter.getAttribute("aria-valuenow")).toBe("0.42");
+    // Load with room to spare is calm grey; only a machine near or past full takes a colour.
+    expect(meter.firstElementChild?.getAttribute("class")).toContain("bg-neutral-");
     const laptop = screen.getByRole("region", { name: "laptop" });
     expect(within(laptop).getByText("unknown")).toBeDefined();
     expect(within(laptop).getByText("no sample yet")).toBeDefined();

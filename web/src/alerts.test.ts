@@ -94,6 +94,12 @@ describe("favicon", () => {
     expect(svg).toContain("#38bdf8");
   });
 
+  it("draws a resting session grey, so the tab icon has colour only when something works or needs you", () => {
+    const svg = decode(favicon("ready"));
+    expect(svg).not.toContain("#34d399");
+    expect(svg).toContain("#a3a3a3");
+  });
+
   it("draws a grey grid when there is nothing to show", () => {
     expect(decode(favicon(undefined))).toContain("#737373");
   });

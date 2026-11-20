@@ -47,8 +47,10 @@ describe("Machines", () => {
     expect(screen.getByRole("region", { name: "Machines" })).toBeDefined();
     const studio = card("studio");
     expect(within(studio).getByText("This machine")).toBeDefined();
-    expect(within(studio).getByText("online")).toBeDefined();
+    expect(within(studio).getByText("online").getAttribute("class")).not.toMatch(/emerald/);
     expect(within(studio).getByText(/heard 4 s ago/)).toBeDefined();
+    // A machine at rest is grey: its load (0.5 per core) takes a colour only near or past full.
+    expect(within(studio).getByText("0.50").getAttribute("class")).toContain("text-neutral-");
     expect(within(studio).getByRole("meter", { name: "Load per core" }).getAttribute("aria-valuenow")).toBe("0.5");
     expect(within(studio).getByText("16.3 GB")).toBeDefined();
     expect(within(studio).getByText("26.8 GB")).toBeDefined();

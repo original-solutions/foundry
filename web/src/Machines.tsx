@@ -5,9 +5,9 @@ import { lanes } from "./lanes";
 import { byUrgency, rows, type MachineView } from "./fleet";
 import { plural, urgency, type Glyph } from "./labels";
 import { heardAgo, scaled, span, spanWords, type History, type Point } from "./samples";
-import { glyphText, StateGlyph } from "./StateGlyph";
+import { glyphFill, glyphText, StateGlyph } from "./StateGlyph";
 
-const statusText = { online: "text-emerald-400", offline: "text-red-400", unknown: "text-neutral-400" };
+const statusText = { online: "text-neutral-400", offline: "text-red-400", unknown: "text-neutral-400" };
 const statusDot = { online: "bg-emerald-400", offline: "bg-red-400", unknown: "bg-neutral-500" };
 
 /** A count of terminals in a state, in words. */
@@ -21,19 +21,9 @@ const stateWord: Record<Glyph, string> = {
   done: "ended",
   away: "unreachable",
 };
-const stateBar: Record<Glyph, string> = {
-  waiting: "bg-amber-400",
-  stuck: "bg-orange-400",
-  failed: "bg-red-400",
-  working: "bg-sky-400",
-  starting: "bg-neutral-400",
-  ready: "bg-emerald-400/60",
-  done: "bg-neutral-600",
-  away: "bg-neutral-700",
-};
 
-/** Load per core: green with room, amber near full, red past one per core. */
-const loadTone = (load: number) => (load >= 1 ? "text-red-400" : load >= 0.7 ? "text-amber-400" : "text-emerald-400");
+/** Load per core: grey with room, amber near full, red past one per core. */
+const loadTone = (load: number) => (load >= 1 ? "text-red-400" : load >= 0.7 ? "text-amber-400" : "text-neutral-200");
 const gb = (bytes: number) => `${(bytes / 1e9).toFixed(1)} GB`;
 
 /** This browser's clock, moved on every second, for "heard 4 s ago" and the lines' sliding window. */
@@ -242,7 +232,7 @@ function States({ glyphs }: { glyphs: Glyph[] }) {
     <div className="flex flex-col gap-2 px-4 pt-3 pb-1">
       <div aria-hidden="true" className="flex h-1.5 gap-0.5 overflow-hidden rounded-full">
         {counts.map(({ glyph, n }) => (
-          <span key={glyph} className={stateBar[glyph]} style={{ flexGrow: n }} />
+          <span key={glyph} className={glyphFill[glyph]} style={{ flexGrow: n }} />
         ))}
       </div>
       <ul aria-label="Terminals by state" className="flex flex-wrap gap-x-3 gap-y-1 text-xs">
