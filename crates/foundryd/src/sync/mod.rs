@@ -178,26 +178,8 @@ impl Peers {
         {
             return relay::serve(&self.inner, machine, terminal, Conn { send, recv }).await;
         }
-        // The record link reads the first message again, then the rest as they come.
-        let (put, taken) = mpsc::channel(BUFFER);
-        if put.try_send(first).is_err() {
-            return;
-        }
-        let forward = async move {
-            while let Some(text) = recv.recv().await {
-                if put.send(text).await.is_err() {
-                    return;
-                }
-            }
-            // The peer closed: closing `put` too lets the link take what is left, then end.
-            drop(put);
-            std::future::pending::<()>().await;
-        };
-        let records = link::run(&self.inner, Conn { send, recv: taken }, None);
-        tokio::select! {
-            () = records => {}
-            () = forward => {}
-        }
+        // The record link takes the first message as its hello.
+        link::run(&self.inner, Conn { send, recv }, None, Some(first)).await;
     }
 
     /// Serves `terminals` to peers that open a relay to one of them. Until this is called, a
@@ -244,7 +226,7 @@ impl Peers {
     async fn dial_forever(self, peer: Machine) {
         loop {
             match tokio::time::timeout(DIAL_TIMEOUT, self.inner.dialer.dial(&peer)).await {
-                Ok(Ok(conn)) => link::run(&self.inner, conn, Some(peer.id)).await,
+                Ok(Ok(conn)) => link::run(&self.inner, conn, Some(peer.id), None).await,
                 Ok(Err(error)) => tracing::debug!("sync: cannot reach {}: {error}", peer.name),
                 Err(_) => tracing::debug!("sync: dialing {} timed out", peer.name),
             }

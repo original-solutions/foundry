@@ -12,6 +12,7 @@
 use foundry_proto::ids::MachineId;
 use foundry_proto::messages::{PROTOCOL, PeerMessage};
 use foundry_proto::record::AnyRecord;
+use serde::Serialize;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{Instant, timeout, timeout_at};
 
@@ -25,10 +26,16 @@ const WARN_EVERY: Duration = Duration::from_secs(60);
 
 /// Runs a link until it closes, the peer is silent for [`OFFLINE_AFTER`], the peer is not (or
 /// is no longer) in the machine list, or the peer takes nothing for [`OFFLINE_AFTER`].
-/// `dialed` is the machine this end dialed, or `None` for a link a peer opened.
-pub(super) async fn run(inner: &Inner, conn: Conn, dialed: Option<MachineId>) {
+/// `dialed` is the machine this end dialed, or `None` for a link a peer opened. `first` is the
+/// peer's first message when the caller has already read it, so the hello is not read again.
+pub(super) async fn run(
+    inner: &Inner,
+    conn: Conn,
+    dialed: Option<MachineId>,
+    first: Option<String>,
+) {
     let Conn { send, mut recv } = conn;
-    let Some(open) = hello(inner, &send, &mut recv, dialed).await else {
+    let Some(open) = hello(inner, &send, &mut recv, dialed, first).await else {
         return;
     };
     tokio::select! {
@@ -175,13 +182,17 @@ async fn hello(
     send: &Sender<String>,
     recv: &mut Receiver<String>,
     dialed: Option<MachineId>,
+    first: Option<String>,
 ) -> Option<Open> {
     if dialed.is_some() && !send_message(send, &own_hello(inner, PROTOCOL).await?).await {
         return None;
     }
-    let text = timeout_at(Instant::now() + OFFLINE_AFTER, recv.recv())
-        .await
-        .ok()??;
+    let text = match first {
+        Some(text) => text,
+        None => timeout_at(Instant::now() + OFFLINE_AFTER, recv.recv())
+            .await
+            .ok()??,
+    };
     let Ok(PeerMessage::Hello {
         protocol,
         machine,
@@ -224,7 +235,9 @@ async fn own_hello(inner: &Inner, protocol: u16) -> Option<PeerMessage> {
     }
 }
 
-async fn listed(inner: &Inner, machine: MachineId) -> bool {
+/// Whether `machine` is in the machine list: the one rule for who is a peer, for record links
+/// and relays alike.
+pub(super) async fn listed(inner: &Inner, machine: MachineId) -> bool {
     match on_store(&inner.store, |store| store.settings()).await {
         Ok(settings) => settings.machines.iter().any(|m| m.id == machine),
         Err(error) => {
@@ -236,7 +249,7 @@ async fn listed(inner: &Inner, machine: MachineId) -> bool {
 
 /// Sends `message`, and says whether the link is still open. A message that cannot be
 /// written as JSON is skipped. A peer that takes nothing for [`OFFLINE_AFTER`] ends the link.
-async fn send_message(send: &Sender<String>, message: &PeerMessage) -> bool {
+pub(super) async fn send_message(send: &Sender<String>, message: &impl Serialize) -> bool {
     let text = match serde_json::to_string(message) {
         Ok(text) => text,
         Err(error) => {

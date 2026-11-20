@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{Instant, timeout, timeout_at};
 
+use super::link::{listed, send_message};
 use super::{Conn, DIAL_TIMEOUT, Inner, OFFLINE_AFTER, Peers, TICK, Task, lock, on_store};
 use crate::store::StoreError;
 use crate::terminals::{Snapshot, TerminalError};
@@ -189,7 +190,7 @@ impl Peers {
             machine: self.inner.me,
             terminal: id,
         };
-        if !send_text(&send, &open).await {
+        if !send_message(&send, &open).await {
             return Err(down());
         }
         // Beat from now on: the owner ends a relay it hears nothing on, and a large snapshot
@@ -301,7 +302,7 @@ impl Remote {
     }
 
     async fn send(&self, frame: &Frame) -> Result<(), Closed> {
-        if send_text(&self.send, frame).await {
+        if send_message(&self.send, frame).await {
             Ok(())
         } else {
             Err(self.down.clone())
@@ -338,7 +339,7 @@ pub(super) async fn serve(inner: &Inner, machine: MachineId, terminal: TerminalI
             bytes: hex(piece),
             last,
         };
-        if !send_text(&send, &frame).await {
+        if !send_message(&send, &frame).await {
             return;
         }
     }
@@ -362,7 +363,7 @@ pub(super) async fn serve(inner: &Inner, machine: MachineId, terminal: TerminalI
                     Some(Err(error)) => return finish(&send, &mut recv, Closed::of(&error)).await,
                 };
                 for (piece, _) in pieces(&bytes) {
-                    if !send_text(&send, &Frame::Output { bytes: hex(piece) }).await {
+                    if !send_message(&send, &Frame::Output { bytes: hex(piece) }).await {
                         return;
                     }
                 }
@@ -393,7 +394,7 @@ pub(super) async fn serve(inner: &Inner, machine: MachineId, terminal: TerminalI
                 match done {
                     Ok(()) => {}
                     Err(TerminalError::Refused { reason, .. }) => {
-                        if !send_text(&send, &Frame::Refused { reason }).await {
+                        if !send_message(&send, &Frame::Refused { reason }).await {
                             return;
                         }
                     }
@@ -412,21 +413,11 @@ async fn finish(send: &Sender<String>, recv: &mut Receiver<String>, closed: Clos
         code: closed.code,
         reason: closed.reason,
     };
-    if send_text(send, &frame).await {
+    if send_message(send, &frame).await {
         let _ = timeout(OFFLINE_AFTER, async {
             while recv.recv().await.is_some() {}
         })
         .await;
-    }
-}
-
-async fn listed(inner: &Inner, machine: MachineId) -> bool {
-    match on_store(&inner.store, |store| store.settings()).await {
-        Ok(settings) => settings.machines.iter().any(|m| m.id == machine),
-        Err(error) => {
-            tracing::warn!("sync: cannot read the machine list: {error}");
-            false
-        }
     }
 }
 
@@ -436,24 +427,11 @@ fn beat(send: Sender<String>) -> Task {
         let mut every = tokio::time::interval(TICK);
         loop {
             every.tick().await;
-            if !send_text(&send, &Frame::Beat).await {
+            if !send_message(&send, &Frame::Beat).await {
                 return;
             }
         }
     }))
-}
-
-/// Sends `message` as JSON, and says whether the link is still open. A message that cannot be
-/// written as JSON is skipped. A peer that takes nothing for [`OFFLINE_AFTER`] ends the link.
-async fn send_text(send: &Sender<String>, message: &impl Serialize) -> bool {
-    let text = match serde_json::to_string(message) {
-        Ok(text) => text,
-        Err(error) => {
-            tracing::warn!("sync: a relay message could not be written: {error}");
-            return true;
-        }
-    };
-    matches!(timeout(OFFLINE_AFTER, send.send(text)).await, Ok(Ok(())))
 }
 
 /// `bytes` in pieces of at most [`CHUNK`], each with whether it is the last. Empty bytes are
