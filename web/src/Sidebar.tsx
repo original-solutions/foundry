@@ -2,10 +2,9 @@ import { useMutation } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { ArchiveButton } from "./ArchiveButton";
 import { button } from "./Modal";
-import { CreateWorkspace } from "./CreateWorkspace";
 import { jumpKey, SearchIcon } from "./JumpPalette";
 import { NewSession } from "./NewSession";
-import { startShell, type Project } from "./api";
+import { startShell } from "./api";
 import { machineNumbers, type MachineView, type WorkspaceView } from "./fleet";
 import { sessionLabel, sessionTone, terminalLabel, terminalTone, type Tone } from "./labels";
 import { StateDot } from "./StateDot";
@@ -14,7 +13,8 @@ const statusColour = { online: "text-emerald-400", offline: "text-red-400", unkn
 
 interface Props {
   machines: MachineView[];
-  projects: Project[];
+  /** Opens the new-workspace dialog. */
+  onCreate: () => void;
   /** The terminal open in the main pane. */
   selected?: string;
   connected: boolean;
@@ -26,7 +26,7 @@ interface Props {
   onJump?: () => void;
 }
 
-export function Sidebar({ machines, projects, selected, connected, onNavigate, onClose, onJump }: Props) {
+export function Sidebar({ machines, onCreate, selected, connected, onNavigate, onClose, onJump }: Props) {
   return (
     <nav id="sidebar" className="flex h-full w-full shrink-0 flex-col gap-4 overflow-y-auto bg-neutral-900 p-3 text-sm text-neutral-100 md:w-80">
       <div className="flex items-center justify-between gap-2">
@@ -37,7 +37,9 @@ export function Sidebar({ machines, projects, selected, connected, onNavigate, o
               <SearchIcon className="size-4" />
             </button>
           )}
-          <CreateWorkspace projects={projects} />
+          <button type="button" onClick={onCreate} className={button}>
+            New workspace
+          </button>
           {onClose && (
             <button type="button" aria-label="Close workspaces" onClick={onClose} className="rounded p-1 text-neutral-300 hover:bg-neutral-800 md:hidden">
               <svg viewBox="0 0 16 16" className="size-4" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">

@@ -138,7 +138,11 @@ describe("App", () => {
     expect(within(dialog).getAllByRole("option")).toHaveLength(3);
 
     fireEvent.change(input, { target: { value: "login shell" } });
-    expect(within(dialog).getAllByRole("option").map((o) => o.textContent)).toEqual([expect.stringContaining("fix login / shell"), expect.stringContaining("New shell in fix login")]);
+    expect(within(dialog).getAllByRole("option").map((o) => o.textContent)).toEqual([
+      expect.stringContaining("fix login / shell"),
+      expect.stringContaining("New shell in fix login"),
+      expect.stringContaining("New workspace “login shell”"),
+    ]);
     expect(within(dialog).getAllByRole("option")[0].getAttribute("aria-selected")).toBe("true");
     fireEvent.keyDown(input, { key: "Enter" });
 
@@ -194,6 +198,45 @@ describe("App", () => {
     await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t9"));
     expect(calls).toEqual([{ url: "/api/workspaces/w1/shells", method: "POST", body: undefined }]);
     expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("lands in the new workspace's session once it starts, with its setup shell as a tab beside it", async () => {
+    const calls = mockFetch(json(201, { id: "w9" }), json(201, { id: "s9" }));
+    const router = await open("/", live);
+
+    fireEvent.click(screen.getByRole("button", { name: "New workspace" }));
+    const dialog = await screen.findByRole("dialog", { name: "New workspace" });
+    fireEvent.change(within(dialog).getByLabelText("Name"), { target: { value: "add search" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Create and open" }));
+    await waitFor(() => expect(calls).toHaveLength(2));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(router.state.location.pathname).toBe("/");
+
+    const events = sockets("/api/events").at(-1)!;
+    const arrive = (record: ReturnType<typeof workspace>) => act(() => events.deliver(JSON.stringify({ type: "record", protocol: 1, record })));
+    arrive(workspace(ME, "w9", "add search"));
+    arrive(terminal(ME, "t8", "w9", "running"));
+    arrive(terminal(ME, "t9", "w9", "running"));
+    arrive(session(ME, "s9", "w9", "t9", "starting"));
+
+    await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t9"));
+    expect(screen.getAllByRole("tab").map((t) => t.textContent)).toEqual([expect.stringContaining("add search / opus"), expect.stringContaining("add search / shell")]);
+    expect(screen.getAllByRole("tab")[0].getAttribute("aria-selected")).toBe("true");
+  });
+
+  it("offers a new workspace named from what you typed in the palette", async () => {
+    await open("/", live);
+    fireEvent.keyDown(window, { key: "k", metaKey: true });
+    const palette = await screen.findByRole("dialog", { name: "Jump to" });
+    const input = within(palette).getByRole("combobox");
+    fireEvent.change(input, { target: { value: "zzz nothing" } });
+
+    expect(within(palette).getAllByRole("option").map((o) => o.textContent)).toEqual([expect.stringContaining("New workspace “zzz nothing”")]);
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    const dialog = await screen.findByRole("dialog", { name: "New workspace" });
+    expect((within(dialog).getByLabelText("Name") as HTMLInputElement).value).toBe("zzz nothing");
+    expect(screen.queryByRole("dialog", { name: "Jump to" })).toBeNull();
   });
 
   it("keeps every terminal you open as a tab with its state, and a tab you go back to has not reconnected", async () => {

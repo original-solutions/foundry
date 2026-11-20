@@ -4,17 +4,26 @@ import { Dialog } from "radix-ui";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { startShell } from "./api";
 import type { MachineView } from "./fleet";
-import { destinations, search, type Destination } from "./jump";
+import { destinations, newWorkspace, search, type Destination } from "./jump";
 import { StateDot } from "./StateDot";
 
 /** The key that opens the palette, as this platform writes it. */
 export const jumpKey = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent) ? "⌘K" : "Ctrl K";
 
+interface Props {
+  machines: MachineView[];
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  /** Opens the new-workspace dialog with `name` typed in. */
+  onCreate: (name: string) => void;
+}
+
 /**
  * Jump to any session or shell in the fleet, or start a new shell in any workspace, by typing a
- * few words of its workspace, name, state, project, branch or machine.
+ * few words of its workspace, name, state, project, branch or machine. What was typed can also
+ * name a new workspace.
  */
-export function JumpPalette({ machines, open, onOpenChange }: { machines: MachineView[]; open: boolean; onOpenChange: (open: boolean) => void }) {
+export function JumpPalette({ machines, open, onOpenChange, onCreate }: Props) {
   // After a pick the opened terminal has the keyboard, so focus does not go back where it was.
   const picked = useRef(false);
   const change = (next: boolean) => {
@@ -37,6 +46,7 @@ export function JumpPalette({ machines, open, onOpenChange }: { machines: Machin
               picked.current = true;
               onOpenChange(false);
             }}
+            onCreate={onCreate}
           />
         </Dialog.Content>
       </Dialog.Portal>
@@ -44,12 +54,13 @@ export function JumpPalette({ machines, open, onOpenChange }: { machines: Machin
   );
 }
 
-function Panel({ machines, close }: { machines: MachineView[]; close: () => void }) {
+function Panel({ machines, close, onCreate }: { machines: MachineView[]; close: () => void; onCreate: (name: string) => void }) {
   const navigate = useNavigate();
   const [query, setQuery] = useState("");
   const [active, setActive] = useState(0);
   const all = useMemo(() => destinations(machines), [machines]);
-  const shown = useMemo(() => search(all, query), [all, query]);
+  const found = useMemo(() => search(all, query), [all, query]);
+  const shown = useMemo(() => [...found, ...newWorkspace(query)], [found, query]);
   const at = Math.min(active, Math.max(shown.length - 1, 0));
   const list = useRef<HTMLUListElement>(null);
   const shell = useMutation({ mutationFn: startShell });
@@ -64,6 +75,11 @@ function Panel({ machines, close }: { machines: MachineView[]; close: () => void
     if (d.kind === "terminal") {
       close();
       void navigate({ to: "/terminals/$terminalId", params: { terminalId: d.terminal } });
+      return;
+    }
+    if (d.kind === "workspace") {
+      close();
+      onCreate(d.name);
       return;
     }
     shell.mutate(d.workspace, {
@@ -133,7 +149,7 @@ function Panel({ machines, close }: { machines: MachineView[]; close: () => void
           </li>
         ))}
       </ul>
-      {shown.length === 0 && <p className="px-4 pb-4 pt-1 text-neutral-500">Nothing matches “{query.trim()}”.</p>}
+      {found.length === 0 && <p className="px-4 pb-4 pt-1 text-neutral-500">Nothing matches “{query.trim()}”. ↵ makes it a new workspace.</p>}
       {shell.isPending && <p className="border-t border-neutral-800 px-4 py-2 text-xs text-neutral-400">Starting a shell…</p>}
       {shell.isError && (
         <p role="alert" className="border-t border-neutral-800 px-4 py-2 text-xs text-red-400">

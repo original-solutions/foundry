@@ -1,5 +1,6 @@
 import { createRootRoute, createRoute, createRouter, useNavigate, useParams } from "@tanstack/react-router";
 import { useEffect, useLayoutEffect, useMemo, useState } from "react";
+import { CreateWorkspace } from "./CreateWorkspace";
 import { JumpPalette, jumpKey, SearchIcon } from "./JumpPalette";
 import { Sidebar } from "./Sidebar";
 import { TabStrip } from "./TabStrip";
@@ -17,6 +18,10 @@ import { useFleet } from "./useFleet";
  *
  * Every terminal opened becomes a tab above the header. A tab shown since the page loaded keeps
  * its pane attached behind the others, so going back to it is instant.
+ *
+ * A workspace made from the new-workspace dialog (the sidebar, the fleet view or the palette opens
+ * it) is landed in: once its session shows up, its terminal opens, with the setup shell as a tab
+ * beside it.
  */
 function Layout() {
   const { state, connected } = useFleet();
@@ -24,6 +29,10 @@ function Layout() {
   const machines = useMemo(() => fleet(state.records, state.settings), [state.records, state.settings]);
   const [drawer, setDrawer] = useState(false);
   const [jump, setJump] = useState(false);
+  /** The new-workspace dialog: open, and the name it starts with. */
+  const [create, setCreate] = useState({ open: false, name: "" });
+  /** The session of a workspace just made, until it shows up and is opened. */
+  const [landing, setLanding] = useState<string>();
   const navigate = useNavigate();
   const located = terminalId ? locate(machines, terminalId) : undefined;
 
@@ -46,6 +55,20 @@ function Layout() {
   if (attached.some((id) => id !== terminalId && gone.has(id))) setAttached(attached.filter((id) => id === terminalId || !gone.has(id)));
   useEffect(() => saveTabs(kept), [kept]);
 
+  // Adjusted while rendering, like the tabs above: once the new session shows up, it and the
+  // workspace's setup shell become tabs, and the session is the one to open.
+  const [landed, setLanded] = useState<string>();
+  const arrived = landing ? machines.flatMap((m) => m.workspaces).find((w) => w.sessions.some((s) => s.id === landing)) : undefined;
+  if (arrived) {
+    const session = arrived.sessions.find((s) => s.id === landing)!;
+    setLanding(undefined);
+    setKept(arrived.shells.reduce((all, shell) => withTab(all, shell.id), withTab(kept, session.terminal)));
+    setLanded(session.terminal);
+  }
+  useEffect(() => {
+    if (landed) void navigate({ to: "/terminals/$terminalId", params: { terminalId: landed } });
+  }, [landed, navigate]);
+
   const changed = new Set(kept.filter((id) => seen[id] !== undefined && seen[id] !== locate(machines, id)?.label));
   const closeTab = (id: string) => {
     const { tabs, next } = withoutTab(kept, id);
@@ -59,6 +82,10 @@ function Layout() {
   const openJump = () => {
     setDrawer(false);
     setJump(true);
+  };
+  const openCreate = (name = "") => {
+    setDrawer(false);
+    setCreate({ open: true, name });
   };
 
   useLayoutEffect(() => {
@@ -88,7 +115,7 @@ function Layout() {
       <div className={`${place} shrink-0`}>
         <Sidebar
           machines={machines}
-          projects={state.settings.projects}
+          onCreate={() => openCreate()}
           selected={terminalId}
           connected={connected}
           onNavigate={close}
@@ -105,16 +132,24 @@ function Layout() {
               <TerminalPane id={id} running={terminalRunning(state, id)} active={id === terminalId} />
             </div>
           ))}
-          {!terminalId && <Home machines={machines} onJump={openJump} />}
+          {!terminalId && <Home machines={machines} onJump={openJump} onCreate={() => openCreate()} />}
         </div>
       </main>
-      <JumpPalette machines={machines} open={jump} onOpenChange={setJump} />
+      <JumpPalette machines={machines} open={jump} onOpenChange={setJump} onCreate={openCreate} />
+      <CreateWorkspace
+        projects={state.settings.projects}
+        workspaces={machines.flatMap((m) => m.workspaces)}
+        open={create.open}
+        onOpenChange={(open) => setCreate((c) => ({ ...c, open }))}
+        name={create.name}
+        onCreated={setLanding}
+      />
     </div>
   );
 }
 
 /** The desktop view with nothing open: what the fleet holds, and the way to jump into it. */
-function Home({ machines, onJump }: { machines: MachineView[]; onJump: () => void }) {
+function Home({ machines, onJump, onCreate }: { machines: MachineView[]; onJump: () => void; onCreate: () => void }) {
   const workspaces = machines.flatMap((m) => m.workspaces);
   const sessions = workspaces.reduce((n, w) => n + w.sessions.length, 0);
   const shells = workspaces.reduce((n, w) => n + w.shells.length, 0);
@@ -133,7 +168,13 @@ function Home({ machines, onJump }: { machines: MachineView[]; onJump: () => voi
         <span className="flex-1">Jump to a session or shell…</span>
         <kbd className="rounded border border-neutral-700 px-1.5 py-0.5 text-xs text-neutral-400">{jumpKey}</kbd>
       </button>
-      <p className="text-xs text-neutral-600">Type a workspace, model, state or machine. Or pick one on the left.</p>
+      <p className="text-xs text-neutral-600">
+        Type a workspace, model, state or machine. Or{" "}
+        <button type="button" onClick={onCreate} className="text-neutral-400 underline decoration-neutral-700 underline-offset-4 hover:text-neutral-200">
+          start a new workspace
+        </button>
+        .
+      </p>
     </div>
   );
 }

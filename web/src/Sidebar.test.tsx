@@ -33,7 +33,7 @@ function machines() {
   return fleet(records, settings({ machines: [{ id: ME, name: "studio", address: "" }, { id: OTHER, name: "laptop", address: "" }] }));
 }
 
-const props = { projects: settings().projects, connected: true };
+const props = { connected: true, onCreate: () => {} };
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -77,9 +77,11 @@ describe("Sidebar", () => {
   });
 
   it("offers a new workspace and says when the events socket is down", async () => {
-    await renderApp(<Sidebar machines={[]} {...props} connected={false} />);
+    const onCreate = vi.fn();
+    await renderApp(<Sidebar machines={[]} {...props} onCreate={onCreate} connected={false} />);
 
-    expect(screen.getByRole("button", { name: "New workspace" })).toBeDefined();
+    fireEvent.click(screen.getByRole("button", { name: "New workspace" }));
+    expect(onCreate).toHaveBeenCalled();
     expect(screen.getByText(/disconnected/i)).toBeDefined();
   });
 

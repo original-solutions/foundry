@@ -1,10 +1,11 @@
 import type { MachineView } from "./fleet";
 import { sessionLabel, sessionTone, terminalLabel, terminalTone, type Tone } from "./labels";
 
-/** Somewhere the jump palette goes: an open terminal, or a new shell in a workspace. */
+/** Somewhere the jump palette goes: an open terminal, a new shell in a workspace, or a new workspace. */
 export type Destination =
   | { kind: "terminal"; key: string; terminal: string; title: string; label: string; tone: Tone; machine: string; words: string }
-  | { kind: "shell"; key: string; workspace: string; title: string; machine: string; words: string };
+  | { kind: "shell"; key: string; workspace: string; title: string; machine: string; words: string }
+  | { kind: "workspace"; key: string; name: string; title: string; machine: string; words: string };
 
 /** Every session and shell in the fleet in sidebar order, then a new shell for each workspace. */
 export function destinations(machines: MachineView[]): Destination[] {
@@ -31,4 +32,10 @@ export function search(all: Destination[], query: string): Destination[] {
     const hay = d.words.toLowerCase();
     return words.every((word) => hay.includes(word));
   });
+}
+
+/** A new workspace named with what was typed, or none when nothing was. */
+export function newWorkspace(query: string): Destination[] {
+  const name = query.trim().replace(/\s+/g, " ");
+  return name ? [{ kind: "workspace", key: "new-workspace", name, title: `New workspace “${name}”`, machine: "", words: "" }] : [];
 }

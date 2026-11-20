@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { fleet } from "./fleet";
-import { destinations, search } from "./jump";
+import { destinations, newWorkspace, search } from "./jump";
 import { ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
 
 const machines = () =>
@@ -42,5 +42,12 @@ describe("search", () => {
     expect(titles("demo exited")).toEqual(["fix login / shell"]);
     expect(titles("new shell tidy")).toEqual(["New shell in tidy readme"]);
     expect(titles("nothing-like-this")).toEqual([]);
+  });
+});
+
+describe("newWorkspace", () => {
+  it("names a new workspace with what was typed, and offers none for nothing", () => {
+    expect(newWorkspace("  add   search ")).toEqual([expect.objectContaining({ kind: "workspace", name: "add search", title: "New workspace “add search”" })]);
+    expect(newWorkspace("   ")).toEqual([]);
   });
 });
