@@ -162,6 +162,8 @@ This is a rule for every piece, not only P1: nothing runs without the UI showing
 3. It runs the setup commands in a terminal inside the workspace. A failed setup stays visible there and raises an attention item. The workspace is still usable, so the failure can be fixed by hand.
 4. The workspace opens with one agent session. Shells and more sessions can be added.
 
+Any machine's UI can make a workspace on another machine and act on another machine's workspaces: a create that picks another machine, and a session, shell, archive or close on a workspace or terminal another machine owns, is carried to its owner over the keyed peer link, and the owner's answer comes back unchanged.
+
 Branch names are `<name>` as typed, made safe for git. Worktrees live under the data directory at `worktrees/<project>/<branch>`.
 
 ### Archiving

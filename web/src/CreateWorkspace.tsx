@@ -1,7 +1,7 @@
-import { useMutation } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { useState } from "react";
 import { Dialog } from "radix-ui";
-import { ApiError, createWorkspace, startSession, type Project } from "./api";
+import { ApiError, createWorkspace, listMachines, startSession, type Project } from "./api";
 import { safeBranch, sameBranch } from "./branch";
 import type { WorkspaceView } from "./fleet";
 import { plural } from "./labels";
@@ -11,6 +11,15 @@ import { bigField, button, field, inlineField, Modal, primaryButton } from "./Mo
 class SessionNotStarted extends ApiError {}
 
 type Step = "branch" | "session";
+
+/** What the form asks for. `machine` is absent for this machine. */
+interface CreateInput {
+  project: string;
+  base: string;
+  name: string;
+  model: string;
+  machine?: string;
+}
 
 interface Props {
   projects: Project[];
@@ -32,9 +41,9 @@ interface Props {
 export function CreateWorkspace({ projects, workspaces, open, onOpenChange, name = "", onCreated }: Props) {
   const [step, setStep] = useState<Step>("branch");
   const create = useMutation({
-    mutationFn: async (input: { project: string; base: string; name: string; model: string }) => {
+    mutationFn: async (input: CreateInput) => {
       setStep("branch");
-      const workspace = await createWorkspace({ project: input.project, base: input.base, name: input.name });
+      const workspace = await createWorkspace({ project: input.project, base: input.base, name: input.name, machine: input.machine });
       setStep("session");
       // The workspace is usable when its setup did not start, so its session is started all the same.
       let session: string;
@@ -86,7 +95,7 @@ interface FormProps {
     data: { warning: string | null } | undefined;
   };
   step: Step;
-  onSubmit: (input: { project: string; base: string; name: string; model: string }) => void;
+  onSubmit: (input: CreateInput) => void;
 }
 
 /** Mounted while the dialog is open, so each opening starts from what it was given. */
@@ -95,6 +104,10 @@ function Form({ projects, workspaces, initialName, create, step, onSubmit }: For
   const [base, setBase] = useState("main");
   const [model, setModel] = useState("opus");
   const [projectId, setProjectId] = useState(projects[0]?.id ?? "");
+  /** The machine picked: empty for this machine. */
+  const [machine, setMachine] = useState("");
+  const listed = useQuery({ queryKey: ["machines"], queryFn: listMachines, retry: false });
+  const others = listed.data ? listed.data.machines.filter((m) => m.id !== listed.data.me) : [];
   const project = projects.find((p) => p.id === projectId) ?? projects[0];
   const branch = safeBranch(name);
   const taken = project && name.trim() !== "" ? workspaces.find((w) => w.project === project.name && sameBranch(w.branch, branch)) : undefined;
@@ -110,7 +123,7 @@ function Form({ projects, workspaces, initialName, create, step, onSubmit }: For
       onSubmit={(event) => {
         event.preventDefault();
         if (!project || taken) return;
-        onSubmit({ project: project.id, base, name, model });
+        onSubmit({ project: project.id, base, name, model, machine: machine || undefined });
       }}
     >
       <div>
@@ -199,8 +212,13 @@ function Form({ projects, workspaces, initialName, create, step, onSubmit }: For
         </label>
         <label className="block text-xs text-neutral-400">
           Machine
-          <select name="machine" className={field} defaultValue="this">
-            <option value="this">This machine</option>
+          <select name="machine" className={field} value={machine} onChange={(e) => setMachine(e.target.value)}>
+            <option value="">This machine</option>
+            {others.map((m) => (
+              <option key={m.id} value={m.id} disabled={!m.online}>
+                {m.online ? m.name : `${m.name} (offline)`}
+              </option>
+            ))}
           </select>
         </label>
       </div>
