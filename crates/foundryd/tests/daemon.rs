@@ -79,8 +79,18 @@ fn exit_within(child: &mut Child, wait: Duration) -> Option<ExitStatus> {
 #[test]
 fn a_fixture_whose_port_another_process_took_starts_on_another() {
     let mut fixture = Fixture::new();
+    // Another process can take the fixture's port before this test does, as it can before the
+    // daemon does: then the test takes another one for the fixture.
+    let taken = loop {
+        match TcpListener::bind(("127.0.0.1", fixture.port)) {
+            Ok(taken) => break taken,
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                fixture.port = free_port();
+            }
+            Err(error) => panic!("cannot take port {}: {error}", fixture.port),
+        }
+    };
     let taken_port = fixture.port;
-    let taken = TcpListener::bind(("127.0.0.1", taken_port)).unwrap();
     // Whatever took the port hangs up on every caller, so asking it for the state fails fast.
     std::thread::spawn(move || taken.incoming().for_each(drop));
 
