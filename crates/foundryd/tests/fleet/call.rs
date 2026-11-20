@@ -114,9 +114,11 @@ impl Served {
         ));
         let hook_router = sessions.router();
         let api = Api::new(store, peers, terminals, workspaces, sessions, Vec::new());
+        let placing = api.clone();
         let listener = api::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let servers = vec![
+            tokio::spawn(foundryd::placement::run(placing)),
             tokio::spawn(async move {
                 axum::serve(
                     hooks,
@@ -616,4 +618,173 @@ async fn a_call_whose_link_goes_down_after_it_was_sent_is_lost_not_refused() {
         other => panic!("not lost: {other:?}"),
     }
     drop(silent);
+}
+
+// --- placement across machines ---
+
+/// One of a machine's own samples, with `sessions` and `load` per core.
+fn loaded(sessions: u32, load: f64) -> impl FnOnce(MachineId, u64) -> AnyRecord {
+    move |owner, version| {
+        AnyRecord::MachineSample(foundry_proto::record::Record {
+            owner,
+            version,
+            deleted: false,
+            body: foundry_proto::record::MachineSample {
+                load_per_core: load,
+                free_memory: 1 << 30,
+                free_disk: 1 << 35,
+                sessions,
+                update_refused: None,
+            },
+        })
+    }
+}
+
+/// Gives every machine of `fleet`, in every daemon's settings, at most 4 sessions and a load of
+/// 1.0 per core.
+fn limit_all(fleet: &Fleet) {
+    for daemon in &fleet.daemons {
+        let mut settings = daemon.settings();
+        settings.seq += 1;
+        for machine in &fleet.daemons {
+            settings.limits.insert(
+                machine.id,
+                foundry_proto::settings::Limits {
+                    max_sessions: 4,
+                    max_load_per_core: 1.0,
+                    min_free_disk: 1 << 30,
+                },
+            );
+        }
+        daemon.set_settings(settings);
+    }
+}
+
+/// Waits until `daemon` holds `owner`'s sample at `version` or later.
+async fn holds_sample(daemon: &Daemon, owner: MachineId, version: u64) {
+    until(WAIT, "the sample arrives", || {
+        daemon
+            .held(|r| {
+                r.owner() == owner
+                    && r.version() >= version
+                    && matches!(r, AnyRecord::MachineSample(_))
+            })
+            .is_some()
+    })
+    .await;
+}
+
+fn choose(project: ProjectId, name: &str) -> Value {
+    json!({"project": project, "base": "main", "name": name, "machine": "choose", "model": "test-model"})
+}
+
+#[tokio::test]
+async fn choose_on_a_makes_the_workspace_on_b_when_b_has_the_most_headroom() {
+    let fleet = Fleet::start(2);
+    let (a, b) = (&fleet.daemons[0], &fleet.daemons[1]);
+    let remotes = tempfile::tempdir().unwrap();
+    let project = project(&fleet, remotes.path());
+    limit_all(&fleet);
+    let on_a = Served::of(a).await;
+    let on_b = Served::of(b).await;
+    b.peers.serve_calls(on_b.addr);
+    hears(&a.peers, b.id).await;
+    a.write(loaded(0, 0.8));
+    let sampled = b.write(loaded(2, 0.3));
+    holds_sample(a, b.id, sampled.version()).await;
+
+    let (status, answer) = on_a
+        .post("/api/workspaces", Some(choose(project, "far")))
+        .await;
+    assert_eq!(status, 201, "{answer}");
+    assert_eq!(answer["machine"], json!(b.id), "{answer}");
+    let workspace = WorkspaceId(id_of(&answer).parse().unwrap());
+    assert!(
+        a.held(
+            |r| r.owner() == b.id && matches!(r, AnyRecord::Workspace(w) if w.body.id == workspace)
+        )
+        .is_some(),
+        "the workspace is B's"
+    );
+}
+
+#[tokio::test]
+async fn a_request_waiting_on_a_is_placed_on_b_with_its_session_once_b_qualifies() {
+    let fleet = Fleet::start(2);
+    let (a, b) = (&fleet.daemons[0], &fleet.daemons[1]);
+    let remotes = tempfile::tempdir().unwrap();
+    let project = project(&fleet, remotes.path());
+    limit_all(&fleet);
+    let on_a = Served::of(a).await;
+    let on_b = Served::of(b).await;
+    b.peers.serve_calls(on_b.addr);
+    hears(&a.peers, b.id).await;
+    a.write(loaded(4, 0.1));
+    let sampled = b.write(loaded(0, 2.5));
+    holds_sample(a, b.id, sampled.version()).await;
+
+    let (status, answer) = on_a
+        .post("/api/workspaces", Some(choose(project, "later")))
+        .await;
+    assert_eq!(status, 202, "{answer}");
+    assert_eq!(
+        answer["reasons"],
+        json!([
+            "machine-0: sessions 4 at limit 4",
+            "machine-1: load 2.5 over limit 1.0"
+        ])
+    );
+
+    b.write(loaded(0, 0.2));
+    let took = until(Duration::from_secs(10), "placed on B", || {
+        let Some(AnyRecord::Workspace(made)) = a.held(|r| {
+            r.owner() == b.id && matches!(r, AnyRecord::Workspace(w) if w.body.name == "later")
+        }) else {
+            return false;
+        };
+        a.held(|r| {
+            r.owner() == b.id
+                && matches!(r, AnyRecord::Session(s)
+                    if s.body.workspace == made.body.id && s.body.model == "test-model")
+        })
+        .is_some()
+    })
+    .await;
+    assert!(took < Duration::from_secs(10), "{took:?}");
+    assert!(
+        a.held(|r| r.owner() == a.id && matches!(r, AnyRecord::Workspace(_)))
+            .is_none(),
+        "nothing was made on A"
+    );
+}
+
+#[tokio::test]
+async fn a_create_naming_b_over_its_limits_is_made_on_b_and_warns_of_each_limit() {
+    let fleet = Fleet::start(2);
+    let (a, b) = (&fleet.daemons[0], &fleet.daemons[1]);
+    let remotes = tempfile::tempdir().unwrap();
+    let project = project(&fleet, remotes.path());
+    limit_all(&fleet);
+    let on_a = Served::of(a).await;
+    let on_b = Served::of(b).await;
+    b.peers.serve_calls(on_b.addr);
+    hears(&a.peers, b.id).await;
+    let sampled = b.write(loaded(5, 1.2));
+    holds_sample(a, b.id, sampled.version()).await;
+
+    let named = json!({"project": project, "base": "main", "name": "anyway", "machine": b.id});
+    let (status, answer) = on_a.post("/api/workspaces", Some(named)).await;
+    assert_eq!(status, 201, "{answer}");
+    assert_eq!(
+        answer["warning"],
+        "machine-1 is over its limits: sessions 5 over limit 4, load 1.2 over limit 1.0"
+    );
+    let workspace = WorkspaceId(id_of(&answer).parse().unwrap());
+    assert!(
+        a.held(
+            |r| r.owner() == b.id && matches!(r, AnyRecord::Workspace(w) if w.body.id == workspace)
+        )
+        .is_some(),
+        "the workspace is B's"
+    );
 }
