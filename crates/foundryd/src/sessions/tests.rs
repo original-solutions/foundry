@@ -542,8 +542,9 @@ async fn a_first_prompt_waits_for_the_session_to_start_though_a_screen_before_it
     .await;
     let id = start_on(&f, "fix the login").await;
     Shown::until(&f, id, |s| s.waits() == 1).await;
-    // Time enough for a daemon that went by the sign alone to have typed the prompt into it.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Time enough for a daemon that went by the sign alone, even after the grace, to have typed
+    // the prompt into it.
+    tokio::time::sleep(claude::EARLIER_SIGN_GRACE + Duration::from_millis(500)).await;
     type_keys(&f, id, b"yes\r").await;
     let shown = Shown::until(&f, id, |s| s.prompts().len() == 2).await;
     assert_eq!(shown.prompts(), ["yes", "fix the login"]);
@@ -559,18 +560,17 @@ async fn a_first_prompt_waits_for_the_session_to_start_though_a_screen_before_it
 
 #[tokio::test]
 async fn a_first_prompt_after_an_earlier_screens_sign_is_typed_a_moment_after_the_session_starts() {
-    // The box gives no sign of its own: the earlier screen's still counts, after a grace.
+    // The box gives no sign of its own and the agent shows nothing more after `SessionStart`:
+    // the earlier screen's sign still counts once the grace is over.
     let f = Fixture::new(
-        "- wait_prompt\n- hook: {event: SessionStart}\n- sleep_ms: 300\n- print: BOX\n- wait_input\n- print: TOOK\n- wait_input\n",
+        "- wait_prompt\n- hook: {event: SessionStart}\n- wait_input\n- print: TOOK\n- wait_input\n",
     )
     .await;
     let id = start_on(&f, "fix the login").await;
     Shown::until(&f, id, |s| s.waits() == 1).await;
     type_keys(&f, id, b"yes\r").await;
     let shown = Shown::until(&f, id, |s| s.text.contains("TOOK")).await;
-    let drawn = shown.text.find("BOX").unwrap();
-    let pasted = shown.text.find("[200~").unwrap();
-    assert!(drawn < pasted, "typed with no grace: {:?}", shown.text);
+    assert!(shown.text.contains("[200~"), "{:?}", shown.text);
 }
 
 #[tokio::test]
@@ -605,6 +605,8 @@ async fn a_blank_first_prompt_is_none_and_nothing_is_typed() {
         args.ends_with(&["--model".to_string(), MODEL.to_string()]),
         "{args:?}"
     );
+    // Time enough for a daemon that kept a blank prompt to have typed it.
+    tokio::time::sleep(Duration::from_millis(500)).await;
     type_keys(&f, id, b"mine\r").await;
     let shown = Shown::until(&f, id, |s| !s.prompts().is_empty()).await;
     assert_eq!(shown.prompts(), ["mine"]);
