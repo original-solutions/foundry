@@ -357,6 +357,11 @@ fn start_with(home: &Path, running: &str) -> io::Result<Start> {
     // between leaves a trial at the cap, so the next start rolls back again.
     state.refused = Some(format!("v{running}"));
     save(home, &state)?;
+    // The previous version reads its secrets only from the keychain, so a file this version
+    // moved them into would hide every change it makes there from the next version.
+    crate::secrets::file_in(home)
+        .undo_move(running)
+        .map_err(io::Error::other)?;
     point_current(home, &previous)?;
     state.trial = None;
     save(home, &state)?;
@@ -943,6 +948,37 @@ mod tests {
         let state = state(home.path()).unwrap();
         assert_eq!(state.refused.as_deref(), Some("v0.2.0"));
         assert_eq!(state.trial, None);
+    }
+
+    /// The previous version reads only the keychain, so a file this version moved its
+    /// secrets into would hide from the next version every change the previous one makes.
+    #[test]
+    fn a_rollback_gives_back_the_secrets_this_version_moved_out_of_the_keychain() {
+        let home = trial_home();
+        let file = crate::secrets::file_in(home.path());
+        file.adopt(&crate::secrets::MemorySecrets::default(), &[], "0.2.0")
+            .unwrap();
+        for _ in 0..3 {
+            start_with(home.path(), "0.2.0").unwrap();
+        }
+
+        let fourth = start_with(home.path(), "0.2.0").unwrap();
+
+        assert_eq!(fourth, Start::RolledBack { to: "0.1.0".into() });
+        assert!(!home.path().join("secrets.json").exists());
+    }
+
+    #[test]
+    fn a_rollback_keeps_secrets_an_earlier_version_moved() {
+        let home = trial_home();
+        let file = crate::secrets::file_in(home.path());
+        file.adopt(&crate::secrets::MemorySecrets::default(), &[], "0.1.0")
+            .unwrap();
+        for _ in 0..4 {
+            start_with(home.path(), "0.2.0").unwrap();
+        }
+
+        assert!(home.path().join("secrets.json").exists());
     }
 
     #[test]

@@ -109,7 +109,11 @@ The new version has to prove itself. It counts as healthy once it has run for 60
 
 A release is refused the same way, so it is not downloaded again, when its signature does not verify, when its archive has no `foundryd` or no `foundry-holder`, when the new `foundryd --version` exits non-zero or prints anything but `foundryd <version>`, or when the system says the file cannot be executed (no such file or interpreter, not executable, not a program for this machine).
 
-Secrets live in `<home>/secrets.json` (mode 0600) on macOS as on Linux, so a new binary reads them with no keychain prompt and release binaries need no stable code signature. A Mac that kept its secrets in the login keychain before moves them into that file the first time the new version opens its store: approve that one keychain prompt. The keychain keeps its copy, so an older version still finds the secrets it knew. A secret set after the move, such as `gateway-management`, is only in the file.
+Secrets live in `<home>/secrets.json` (mode 0600) on macOS as on Linux, so a new binary reads them with no keychain prompt and release binaries need no stable code signature. Sessions run as the service user, so a session can read and change that file, the machine's identity and key table included. Isolation stronger than that is P4.
+
+A Mac that kept its secrets in the login keychain moves them into that file the first time the new version opens its store. The keychain asks once for each secret it holds, up to four prompts, and every one has to be approved. A start still waiting on them after 5 minutes counts as a failed start, so a Mac nobody is watching rolls that version back and refuses it. Install it by hand there instead, as in the sections above, and answer the prompts. A refused prompt stops the start with an error, and the next start asks again.
+
+The keychain keeps its copies. When the version that moved the secrets is rolled back on its own, the rollback removes `secrets.json`, so the older version runs on the keychain and the next update moves the secrets again. Going back by hand past the move does not: the older version finds the keychain as it was at the move, without any machine joined or revoked or any key set since. Make those changes again, and delete `<home>/secrets.json` before going forward, so the next start moves what the keychain holds then.
 
 Only a daemon started from `<home>/current` takes part in updates. One run any other way (`cargo run`, `./foundryd run`) never updates itself and is never counted as a trial.
 
