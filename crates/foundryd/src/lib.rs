@@ -6,6 +6,7 @@ pub mod api;
 pub mod attention;
 pub mod coordinator;
 pub mod daemon;
+pub mod dashboard;
 pub mod gateway;
 pub mod join;
 pub mod machine;

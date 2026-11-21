@@ -49,6 +49,8 @@
 //! - `GET /api/briefs`: what each session of this machine is for and doing, see [`briefs`].
 //! - `GET /api/sessions/{id}/trail`: every step a session of this machine took, see [`trail`].
 //!
+//! - Any other path outside `/api`: the web UI, see [`assets::serve`].
+//!
 //! An error is `{"error": "..."}` with a status that says what kind it was, a request axum
 //! refuses (a body that is not the JSON wanted, an unknown route or method, a socket path asked
 //! for without an upgrade) included.
@@ -184,7 +186,7 @@ pub fn router(api: Api) -> Router {
         .route("/api/sessions/{id}/trail", get(trail::trail))
         .route("/api/placements", get(placement::list))
         .route("/api/placements/{id}/cancel", post(placement::cancel))
-        .fallback(no_route)
+        .fallback(assets::serve)
         .method_not_allowed_fallback(wrong_method)
         .layer(middleware::from_fn_with_state(api.clone(), carry::carry))
         .layer(middleware::from_fn_with_state(api.clone(), same_site))

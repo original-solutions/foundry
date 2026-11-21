@@ -124,3 +124,24 @@ fn secret_set_with_any_other_name_exits_1_and_stores_nothing() {
         assert_eq!(held(&home, name), None, "{name} was stored");
     }
 }
+
+#[test]
+fn dashboard_with_no_daemon_running_exits_1_and_says_so() {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let home = tempfile::tempdir().unwrap();
+    let out = isolated(&["dashboard"], &home)
+        .env("FOUNDRY_PORT", port.to_string())
+        .output()
+        .expect("foundryd runs");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(out.status.code(), Some(1), "exit: {:?}", out.status);
+    assert!(
+        stderr.contains(&format!("no daemon is running on 127.0.0.1:{port}")),
+        "stderr: {stderr}"
+    );
+}

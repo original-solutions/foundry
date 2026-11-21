@@ -305,8 +305,15 @@ impl Daemon {
         let response = String::from_utf8(response).unwrap();
         let (head, body) = response.split_once("\r\n\r\n").unwrap();
         let status = head.split(' ').nth(1).unwrap().parse().unwrap();
+        let headers = head
+            .lines()
+            .skip(1)
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_owned()))
+            .collect();
         Reply {
             status,
+            headers,
             body: body.to_owned(),
         }
     }
@@ -381,10 +388,19 @@ type Socket =
 
 struct Reply {
     status: u16,
+    /// Each header as sent, its name in lower case.
+    headers: Vec<(String, String)>,
     body: String,
 }
 
 impl Reply {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(sent, _)| sent == name)
+            .map(|(_, value)| value.as_str())
+    }
+
     fn json(&self) -> serde_json::Value {
         serde_json::from_str(&self.body).unwrap_or_else(|e| panic!("{e}: {}", self.body))
     }
@@ -3348,4 +3364,104 @@ async fn choose_for_a_project_not_in_the_settings_is_refused_and_never_waits() {
     assert_eq!(reply.status, 422, "{}", reply.body);
     let listed = daemon.call("GET", "/api/placements", None).await.json();
     assert_eq!(listed["requests"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn the_web_ui_is_served_at_the_root_and_on_every_page_it_routes() {
+    let daemon = Daemon::new(TURN).await;
+    let index = daemon.call("GET", "/", None).await;
+    assert_eq!(index.status, 200, "{}", index.body);
+    assert!(index.body.contains("<div id=\"root\">"), "{}", index.body);
+
+    let page = daemon
+        .call(
+            "GET",
+            &format!("/workspaces/{}", WorkspaceId::random()),
+            None,
+        )
+        .await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert_eq!(page.body, index.body, "a page the UI routes gets the app");
+    for reply in [&index, &page] {
+        assert_eq!(
+            reply.header("content-type"),
+            Some("text/html; charset=utf-8")
+        );
+        assert_eq!(reply.header("cache-control"), Some("no-cache"));
+    }
+
+    let script = index
+        .body
+        .split("src=\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("index.html loads a script")
+        .to_owned();
+    let asset = daemon.call("GET", &script, None).await;
+    assert_eq!(asset.status, 200, "{script}: {}", asset.body);
+    assert_ne!(
+        asset.body, index.body,
+        "{script} is the script, not the app"
+    );
+    assert_eq!(
+        asset.header("content-type"),
+        Some("text/javascript; charset=utf-8")
+    );
+    assert!(script.starts_with("/assets/"), "{script}");
+    assert_eq!(
+        asset.header("cache-control"),
+        Some("public, max-age=31536000, immutable")
+    );
+}
+
+#[tokio::test]
+async fn no_other_site_may_show_the_web_ui_in_a_frame() {
+    let daemon = Daemon::new(TURN).await;
+    let page = format!("/workspaces/{}", WorkspaceId::random());
+    for path in ["/", page.as_str()] {
+        let reply = daemon.call("GET", path, None).await;
+        assert_eq!(reply.status, 200, "{path}: {}", reply.body);
+        assert_eq!(reply.header("x-frame-options"), Some("DENY"), "{path}");
+        assert_eq!(
+            reply.header("content-security-policy"),
+            Some("frame-ancestors 'none'"),
+            "{path}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_missing_asset_and_an_unknown_api_route_are_not_found() {
+    let daemon = Daemon::new(TURN).await;
+    for path in ["/assets/missing.js", "/api/nope", "/api"] {
+        let reply = daemon.call("GET", path, None).await;
+        assert_eq!(reply.status, 404, "{path}: {}", reply.body);
+        assert!(reply.json()["error"].is_string(), "{path}: {}", reply.body);
+    }
+}
+
+#[tokio::test]
+async fn the_web_ui_answers_only_get_and_head() {
+    let daemon = Daemon::new(TURN).await;
+    let page = format!("/workspaces/{}", WorkspaceId::random());
+    for path in ["/", page.as_str()] {
+        let reply = daemon.call("POST", path, None).await;
+        assert_eq!(reply.status, 404, "POST {path}: {}", reply.body);
+        assert!(
+            reply.json()["error"].is_string(),
+            "POST {path}: {}",
+            reply.body
+        );
+        let head = daemon.call("HEAD", path, None).await;
+        assert_eq!(head.status, 200, "HEAD {path}");
+    }
+}
+
+#[tokio::test]
+async fn the_web_ui_is_refused_to_a_host_that_is_not_this_machine() {
+    let daemon = Daemon::new(TURN).await;
+    let reply = daemon
+        .raw("GET", "/", &[("Host", "evil.example")], None)
+        .await;
+    assert_eq!(reply.status, 403, "{}", reply.body);
 }
