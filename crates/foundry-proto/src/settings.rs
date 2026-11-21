@@ -65,8 +65,18 @@ impl fmt::Display for EditId {
 pub enum Outcome {
     /// The edit was numbered; this is its stamp.
     Numbered { stamp: Stamp },
-    /// The edit was not applied, and why.
-    Refused { reason: String },
+    /// The edit was not applied, and why. `conflict` says it breaks a rule of the settings as
+    /// the acting machine holds them, such as a second project of one name. It is written only
+    /// when true, and a machine that does not know it reads the refusal as any other.
+    Refused {
+        reason: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        conflict: bool,
+    },
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// One first-level setting. Written as text: `machine:<id>`, `priority`, `project:<id>` or
@@ -668,6 +678,14 @@ pub(crate) mod tests {
                 r#"{"kind":"refused","reason":"it could not be stored"}"#.to_owned(),
                 Outcome::Refused {
                     reason: "it could not be stored".into(),
+                    conflict: false,
+                },
+            ),
+            (
+                r#"{"kind":"refused","reason":"another has that name","conflict":true}"#.to_owned(),
+                Outcome::Refused {
+                    reason: "another has that name".into(),
+                    conflict: true,
                 },
             ),
         ];
@@ -677,6 +695,8 @@ pub(crate) mod tests {
                 serde_json::from_str::<Outcome>(&json).expect(&json),
                 expected
             );
+            // Written as it is read, so a machine before `conflict` reads every refusal.
+            assert_eq!(serde_json::to_string(&expected).unwrap(), json);
         }
     }
 

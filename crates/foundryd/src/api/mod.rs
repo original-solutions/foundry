@@ -464,6 +464,7 @@ fn error(status: StatusCode, message: String) -> Response {
 pub(crate) fn edit_status(error: &CoordinatorError) -> StatusCode {
     match error {
         CoordinatorError::Refused { .. } => StatusCode::BAD_GATEWAY,
+        CoordinatorError::Conflict { .. } => StatusCode::CONFLICT,
         // Sent, so it may have been numbered: not the 503 of an edit that changed nothing.
         CoordinatorError::NoAnswer { .. } => StatusCode::GATEWAY_TIMEOUT,
         CoordinatorError::NotLinked(_)

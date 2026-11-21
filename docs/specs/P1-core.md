@@ -150,7 +150,10 @@ This is a rule for every piece, not only P1: nothing runs without the UI showing
 ### Projects
 
 - A project is a repo URL and a name, stored as a shared setting.
-- A project is added and removed in the UI's Projects dialog, opened from the task box. Remove asks once more before it sends. A project cannot be removed while the machine serving the dialog knows of a live workspace made from it. That machine checks its own copy, so a workspace still being made, or one whose records have not reached it, does not stop a remove.
+- A project is added and removed in the UI's Projects dialog, opened from the task box. Remove asks once more before it sends.
+- Two projects never share a name, compared trimmed and in any case. The machine serving the dialog checks its own copy, and the acting coordinator checks again as it numbers the add, so a machine that has not yet heard of an add cannot make a second project of that name.
+- A project cannot be removed while a live workspace is made from it. The machine serving the dialog refuses when it knows of one, and the acting coordinator refuses when its store holds one. A workspace create checks that the project is still there as it writes the workspace's record. If the project is gone, the create takes back its worktree and branch and fails.
+- A split fleet cannot hold either rule. Each side numbers its own edits, so both sides can add a project of one name, and one side can remove a project while the other makes a workspace of it. A create also checks only its own machine's copy, so a remove that the acting coordinator numbered before the create's record reached it, and that has not yet reached the creating machine, still lands. In both cases the heal keeps both projects, or leaves a live workspace whose project is gone, and nothing shows it.
 - Each machine keeps one bare clone per project and makes worktrees from it.
 - A machine clones a project the first time it hosts a workspace for it. Adding a machine needs no setup per repo.
 - In P1 a machine clones with whatever git credentials it already has. Credentials handed out by the coordinator come with GitHub accounts in P2.

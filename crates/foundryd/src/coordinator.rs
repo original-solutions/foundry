@@ -29,6 +29,13 @@
 //! The edits one machine forwards are sent on, and numbered, in the order they arrived, also
 //! when sent again ([`in_turn`]), so of two edits to one setting the later one holds.
 //!
+//! The acting machine checks the project rules as it numbers an edit, against its own copy and
+//! store ([`breaks`]): it refuses a new project whose name another project has, and the removal
+//! of a project its store holds a live workspace of, with [`CoordinatorError::Conflict`], which
+//! [`may_refuse`] governs as any refusal. Two sides of a split each number their own edits, so
+//! neither check holds across a split. An edit with no id, from a machine before
+//! [`ANSWERS_SINCE`], is numbered unchecked: nobody answers it, so a refusal would drop it unseen.
+//!
 //! [`Coordinator`] runs this on a machine. Record links hand it every copy of the settings a
 //! peer sends and every edit forwarded to this machine ([`crate::sync::Peers::coordinate`]).
 //! A machine that comes to act numbers nothing until it has taken a copy from every other
@@ -82,6 +89,8 @@ pub enum CoordinatorError {
     Older { acting: MachineId, speaks: u16 },
     #[error("the edit was refused: {reason}")]
     Refused { reason: String },
+    #[error("the edit breaks a project rule: {reason}")]
+    Conflict { reason: String },
     #[error(
         "no answer came from {acting}, the acting coordinator, within {KEEP_FORWARDED:?}; the \
          edit may or may not have been numbered"
@@ -280,6 +289,14 @@ impl Coordinator {
         }
     }
 
+    /// A refusal from this machine of an edit that breaks a project rule, for `why`: a fixed
+    /// phrase, as [`Coordinator::refused`] builds.
+    fn conflict(&self, why: &str) -> CoordinatorError {
+        CoordinatorError::Conflict {
+            reason: format!("{} {why}", self.me),
+        }
+    }
+
     /// Makes `edit`, sent under `id`, which `from` forwarded, or this machine's own when `None`;
     /// `arrived` is when it reached this machine. See [`Coordinator::run_edit`].
     #[cfg(test)]
@@ -324,6 +341,7 @@ impl Coordinator {
         let mut read_logged: Option<String> = None;
         let mut write_logged: Option<String> = None;
         let mut ignored = false;
+        let mut broke_logged = false;
         loop {
             let answered = self.known().get(&id).and_then(|known| known.answer.clone());
             if let Some(Outcome::Numbered { stamp }) = answered {
@@ -336,9 +354,13 @@ impl Coordinator {
             {
                 return Ok(self.settled(id, *stamp));
             }
-            if let Some(Outcome::Refused { reason }) = answered {
+            if let Some(Outcome::Refused { reason, conflict }) = answered {
                 if self.may_refuse(id, from, Cause::Answered) {
-                    return Err(CoordinatorError::Refused { reason });
+                    return Err(if conflict {
+                        CoordinatorError::Conflict { reason }
+                    } else {
+                        CoordinatorError::Refused { reason }
+                    });
                 }
                 if !ignored {
                     ignored = true;
@@ -366,14 +388,30 @@ impl Coordinator {
                         // was never sent; otherwise it is logged and tried again.
                         Next::Number => match self.number(Some(id), &edit).await {
                             Ok(stamp) => return Ok(self.settled(id, stamp)),
-                            Err(failure) => {
-                                if failure.write && self.may_refuse(id, from, Cause::Here) {
+                            // A rule refusal follows the same rule as a failed write; this
+                            // machine's own edit never sent fails with it.
+                            Err(Unnumbered::Breaks(why)) => {
+                                if self.may_refuse(id, from, Cause::Here)
+                                    || (from.is_none() && sent.is_none())
+                                {
+                                    return Err(self.conflict(why));
+                                }
+                                if !broke_logged {
+                                    broke_logged = true;
+                                    tracing::warn!(
+                                        "coordinator: an edit another machine may have numbered \
+                                         breaks a project rule here; waiting"
+                                    );
+                                }
+                            }
+                            Err(Unnumbered::Store { error, write }) => {
+                                if write && self.may_refuse(id, from, Cause::Here) {
                                     return Err(self.refused("could not store it"));
                                 }
                                 if from.is_none() && sent.is_none() {
-                                    return Err(failure.error.into());
+                                    return Err(error.into());
                                 }
-                                failed = Some((failure.error, failure.write));
+                                failed = Some((error, write));
                             }
                         },
                         Next::Send(acting) => {
@@ -509,11 +547,12 @@ impl Coordinator {
                     let (next, on) = queued.turn(look.next);
                     match next {
                         Next::Number => {
-                            return self
-                                .number(None, &edit)
-                                .await
-                                .map(|_| ())
-                                .map_err(|failure| failure.error.into());
+                            return match self.number(None, &edit).await {
+                                Ok(_) => Ok(()),
+                                Err(Unnumbered::Store { error, .. }) => Err(error.into()),
+                                // Not given: an edit with no id is numbered unchecked.
+                                Err(Unnumbered::Breaks(why)) => Err(self.conflict(why)),
+                            };
                         }
                         Next::Send(acting) => {
                             match self.peers.send_edit(acting, None, &edit, on).await {
@@ -574,7 +613,9 @@ impl Coordinator {
     }
 
     /// Gives the edit the next number, on the copy held at that moment, unless that copy
-    /// already holds a stamp for its `id`, which is returned.
+    /// already holds a stamp for its `id`, which is returned. An edit with an id that breaks a
+    /// project rule in that copy and store ([`breaks`]) is not numbered; one with none is not
+    /// checked.
     async fn number(&self, id: Option<EditId>, edit: &Edit) -> Result<Stamp, Unnumbered> {
         let me = self.me;
         let edit = edit.clone();
@@ -582,6 +623,11 @@ impl Coordinator {
             let held = store.settings().map_err(Unnumbered::read)?;
             if let Some(stamp) = id.and_then(|id| held.numbered.get(&id)) {
                 return Ok(*stamp);
+            }
+            if id.is_some()
+                && let Some(why) = breaks(store, &held, &edit).map_err(Unnumbered::read)?
+            {
+                return Err(Unnumbered::Breaks(why));
             }
             let mut next = numbered(&held, &edit, me);
             let stamp = Stamp {
@@ -681,8 +727,8 @@ impl Known {
 enum Cause {
     /// A machine it was sent to answered it refused.
     Answered,
-    /// This machine failed it: could not store it while acting, write it to send it on, or send
-    /// it on within [`KEEP_FORWARDED`].
+    /// This machine failed it: could not store it while acting, found it breaks a project rule
+    /// while acting, could not write it to send it on, or send it on within [`KEEP_FORWARDED`].
     Here,
 }
 
@@ -813,29 +859,64 @@ fn in_turn(next: Next, earlier: &[Sent], last: Sent) -> Turn {
 fn outcome(result: Result<Stamp, CoordinatorError>) -> Option<Outcome> {
     match result {
         Ok(stamp) => Some(Outcome::Numbered { stamp }),
-        Err(CoordinatorError::Refused { reason }) => Some(Outcome::Refused { reason }),
+        Err(CoordinatorError::Refused { reason }) => Some(Outcome::Refused {
+            reason,
+            conflict: false,
+        }),
+        Err(CoordinatorError::Conflict { reason }) => Some(Outcome::Refused {
+            reason,
+            conflict: true,
+        }),
         Err(_) => None,
     }
 }
 
-/// Why [`Coordinator::number`] stored no stamp: the store's error, and whether it came from the
-/// write, after the read found no stamp for the id, or from the read.
-struct Unnumbered {
-    error: StoreError,
-    write: bool,
+/// Why [`Coordinator::number`] stored no stamp.
+enum Unnumbered {
+    /// The store's error, and whether it came from the write, after the read found no stamp
+    /// for the id, or from the read.
+    Store { error: StoreError, write: bool },
+    /// The edit breaks a project rule, for this fixed phrase ([`breaks`]).
+    Breaks(&'static str),
 }
 
 impl Unnumbered {
     fn read(error: StoreError) -> Self {
-        Self {
+        Self::Store {
             error,
             write: false,
         }
     }
 
     fn write(error: StoreError) -> Self {
-        Self { error, write: true }
+        Self::Store { error, write: true }
     }
+}
+
+/// The project rule `edit` breaks in `held` and the workspaces `store` holds, as a fixed phrase
+/// that names no setting value, or `None`. A project for an id `held` does not hold breaks it
+/// when another project has its name, compared trimmed and in any case. Removing a project
+/// breaks it while a live workspace in `store`, from any machine, was made from it.
+fn breaks(
+    store: &Store,
+    held: &SharedSettings,
+    edit: &Edit,
+) -> Result<Option<&'static str>, StoreError> {
+    Ok(match edit {
+        Edit::SetProject { project } if !held.projects.iter().any(|p| p.id == project.id) => {
+            let name = project.name.trim().to_lowercase();
+            held.projects
+                .iter()
+                .any(|p| p.name.trim().to_lowercase() == name)
+                .then_some("holds another project with that name")
+        }
+        Edit::RemoveProject { id } => store
+            .live_workspaces()?
+            .iter()
+            .any(|w| w.body.project == *id)
+            .then_some("holds a live workspace made from that project"),
+        _ => None,
+    })
 }
 
 /// What one look at a waiting edit found.
@@ -1759,6 +1840,7 @@ mod tests {
         drop(first);
         let outcome = Outcome::Refused {
             reason: "no".into(),
+            conflict: false,
         };
         coordinator.take_answer(id, outcome.clone());
         let held = coordinator
@@ -1881,7 +1963,18 @@ mod tests {
         assert_eq!(
             outcome(Err(refused)),
             Some(Outcome::Refused {
-                reason: "no".into()
+                reason: "no".into(),
+                conflict: false,
+            })
+        );
+        let broken = CoordinatorError::Conflict {
+            reason: "no".into(),
+        };
+        assert_eq!(
+            outcome(Err(broken)),
+            Some(Outcome::Refused {
+                reason: "no".into(),
+                conflict: true,
             })
         );
         // Each of these leaves open whether the edit was numbered.
@@ -2039,6 +2132,7 @@ mod tests {
             id,
             Outcome::Refused {
                 reason: "no".into(),
+                conflict: false,
             },
         );
         let made = coordinator
@@ -2079,6 +2173,7 @@ mod tests {
             id,
             Outcome::Refused {
                 reason: "no".into(),
+                conflict: false,
             },
         );
         let again = coordinator
@@ -2086,5 +2181,195 @@ mod tests {
             .await;
         assert_eq!(again.unwrap(), stamp);
         assert_eq!(coordinator.held().await.unwrap().seq, held.seq);
+    }
+
+    // --- the project rules ---
+
+    /// A coordinator alone holding `projects`.
+    fn alone_with(projects: &[Project]) -> (tempfile::TempDir, Arc<Coordinator>) {
+        let (dir, coordinator) = alone();
+        lock(&coordinator.store)
+            .apply_settings(SharedSettings {
+                seq: 1,
+                projects: projects.to_vec(),
+                ..SharedSettings::default()
+            })
+            .unwrap();
+        (dir, coordinator)
+    }
+
+    /// Stores a workspace another machine made from project `n`, live or archived.
+    fn workspace_of(coordinator: &Coordinator, n: u128, archived: bool) {
+        use foundry_proto::ids::WorkspaceId;
+        use foundry_proto::record::{AnyRecord, Record, Workspace};
+        let owner = MachineId::random();
+        let record = AnyRecord::Workspace(Record {
+            owner,
+            version: 1,
+            deleted: archived,
+            body: Workspace {
+                id: WorkspaceId::random(),
+                project: project(n, "").id,
+                name: "fix login".into(),
+                branch: "fix-login".into(),
+                base: "main".into(),
+                setup: None,
+            },
+        });
+        lock(&coordinator.store).apply(&record, owner).unwrap();
+    }
+
+    fn remove_project(n: u128) -> Edit {
+        Edit::RemoveProject {
+            id: project(n, "").id,
+        }
+    }
+
+    /// The reason of a rule refusal, failing on any other end.
+    fn conflict(made: Result<Stamp, CoordinatorError>) -> String {
+        match made {
+            Err(CoordinatorError::Conflict { reason }) => reason,
+            other => panic!("not a rule refusal: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_forwarded_add_of_a_name_another_project_has_is_refused_naming_no_value() {
+        let held = project(1, "Foundry");
+        let (_dir, coordinator) = alone_with(std::slice::from_ref(&held));
+        let before = coordinator.held().await.unwrap();
+        let mut add = project(2, "  fOUNDRY ");
+        add.repo = "https://tom:hunter2@example.invalid/other.git".into();
+        let made = coordinator
+            .edit_from(
+                Some(MachineId::random()),
+                Instant::now(),
+                EditId::random(),
+                Edit::SetProject { project: add },
+            )
+            .await;
+        let reason = conflict(made);
+        assert!(reason.contains(&coordinator.me.to_string()), "{reason}");
+        for value in ["oundry", "OUNDRY", "hunter2", "example.invalid"] {
+            assert!(!reason.contains(value), "{value} in {reason}");
+        }
+        assert_eq!(coordinator.held().await.unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn the_acting_machines_own_add_of_a_name_another_project_has_is_refused() {
+        let (_dir, coordinator) = alone_with(&[project(1, "foundry")]);
+        let made = coordinator
+            .edit_from(
+                None,
+                Instant::now(),
+                EditId::random(),
+                set_project(2, "Foundry"),
+            )
+            .await;
+        conflict(made);
+        assert_eq!(coordinator.held().await.unwrap().projects.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_add_of_a_new_name_or_a_set_of_a_held_project_is_numbered() {
+        let (_dir, coordinator) = alone_with(&[project(1, "foundry")]);
+        for edit in [set_project(2, "api"), set_project(1, "foundry")] {
+            coordinator
+                .edit_from(
+                    Some(MachineId::random()),
+                    Instant::now(),
+                    EditId::random(),
+                    edit,
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(coordinator.held().await.unwrap().projects.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_forwarded_remove_of_a_project_with_a_live_workspace_is_refused_naming_no_value() {
+        let held = project(1, "foundry");
+        let (_dir, coordinator) = alone_with(std::slice::from_ref(&held));
+        workspace_of(&coordinator, 1, false);
+        let made = coordinator
+            .edit_from(
+                Some(MachineId::random()),
+                Instant::now(),
+                EditId::random(),
+                remove_project(1),
+            )
+            .await;
+        let reason = conflict(made);
+        for value in ["foundry", "fix login", "example.invalid"] {
+            assert!(!reason.contains(value), "{value} in {reason}");
+        }
+        assert_eq!(coordinator.held().await.unwrap().projects, [held]);
+    }
+
+    #[tokio::test]
+    async fn a_remove_of_a_project_whose_workspaces_are_archived_or_elsewhere_is_numbered() {
+        let (_dir, coordinator) = alone_with(&[project(1, "foundry")]);
+        workspace_of(&coordinator, 1, true);
+        workspace_of(&coordinator, 2, false);
+        coordinator
+            .edit_from(None, Instant::now(), EditId::random(), remove_project(1))
+            .await
+            .unwrap();
+        assert!(coordinator.held().await.unwrap().projects.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_rule_refusal_is_not_reported_while_another_task_waits_on_its_id() {
+        let (_dir, coordinator) = alone_with(&[project(1, "foundry")]);
+        let id = EditId::random();
+        // Another task here may number the id, so a refusal here says nothing final about it.
+        let _other = coordinator.wait_on(id);
+        let made = coordinator
+            .edit_from(
+                Some(MachineId::random()),
+                Instant::now(),
+                id,
+                set_project(2, "foundry"),
+            )
+            .await;
+        assert!(
+            !matches!(made, Ok(_) | Err(CoordinatorError::Conflict { .. })),
+            "{made:?}"
+        );
+        assert_eq!(coordinator.held().await.unwrap().projects.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_edit_with_no_id_from_an_older_machine_is_numbered_unchecked() {
+        let (_dir, coordinator) = alone_with(&[project(1, "foundry")]);
+        // Nobody answers it, so a refusal would drop it without a word.
+        coordinator
+            .number(None, &set_project(2, "foundry"))
+            .await
+            .unwrap_or_else(|_| panic!("not numbered"));
+        assert_eq!(coordinator.held().await.unwrap().projects.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_rule_refusal_answered_to_this_machine_ends_its_edit_as_a_rule_refusal() {
+        let (_dir, coordinator) = alone();
+        let (peer, id) = (MachineId::random(), EditId::random());
+        let _waiting = coordinator.wait_on(id);
+        coordinator.sent_to(id, peer);
+        let refused = Outcome::Refused {
+            reason: format!("{peer} holds another project with that name"),
+            conflict: true,
+        };
+        coordinator.take_answer(id, refused);
+        // It acts here too, but the answer is read first.
+        let made = coordinator
+            .run_edit(None, Instant::now(), id, set_project(7, "p"))
+            .await;
+        assert_eq!(
+            conflict(made),
+            format!("{peer} holds another project with that name")
+        );
     }
 }

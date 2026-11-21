@@ -13,15 +13,15 @@
 //!   is `404`. A project that a live workspace this machine knows of, from any machine, was made
 //!   from is `409`, naming each such workspace.
 //!
-//! Both checks read this machine's store, so they hold for what it has heard. The coordinator
-//! orders edits and checks none: a workspace still being made, or one whose records have not
-//! reached this machine, does not stop a remove, and two machines that add one name before
-//! hearing of each other's add both go through.
+//! Both checks read this machine's store first, and nothing is sent to the coordinator when one
+//! refuses. The acting coordinator checks both rules again against its own copy and store as it
+//! numbers the edit ([`crate::coordinator`]), so an add or a remove this machine let through on
+//! what it had heard is still refused there, `409` as well. A split fleet holds neither rule:
+//! each side numbers its own edits.
 //!
-//! Nothing is sent to the coordinator when a request is refused. An edit the coordinator could
-//! not make answers as an attention dismissal does, through the shared [`edit_status`]. No
-//! answer names a repo: any message that could is passed through
-//! [`redact`](crate::secrets::redact).
+//! Any other edit the coordinator could not make answers as an attention dismissal does,
+//! through the shared [`edit_status`]. No answer names a repo: any message that could is passed
+//! through [`redact`](crate::secrets::redact).
 
 use std::sync::{Arc, Mutex};
 
@@ -171,7 +171,7 @@ mod tests {
     use foundry_proto::ids::{MachineId, ProjectId, WorkspaceId};
     use foundry_proto::messages::{PROTOCOL, PeerMessage};
     use foundry_proto::record::{AnyRecord, Record, Workspace};
-    use foundry_proto::settings::{Machine, Project, SharedSettings};
+    use foundry_proto::settings::{Machine, Outcome, Project, SharedSettings};
     use futures::future::BoxFuture;
     use serde_json::{Value, json};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -313,6 +313,75 @@ mod tests {
             drop(theirs);
             accepting.await.unwrap();
         }
+
+        /// `peer`, which acts by the settings, links and stays linked, answering every edit
+        /// sent to it with a refusal, a rule refusal when `conflict`. The link holds while the
+        /// returned task runs.
+        async fn refused_by(&self, peer: MachineId, conflict: bool) -> tokio::task::JoinHandle<()> {
+            let (ours, mut theirs) = Conn::pair();
+            tokio::spawn({
+                let peers = self.peers.clone();
+                async move { peers.accept(ours).await }
+            });
+            let hello = PeerMessage::Hello {
+                protocol: PROTOCOL,
+                machine: peer,
+                versions: BTreeMap::new(),
+            };
+            let nothing = PeerMessage::Records {
+                protocol: PROTOCOL,
+                records: Vec::new(),
+            };
+            for message in [hello, nothing] {
+                theirs
+                    .send
+                    .send(serde_json::to_string(&message).unwrap())
+                    .await
+                    .unwrap();
+            }
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while !self.peers.online().contains(&peer) {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the peer was not heard"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            tokio::spawn(async move {
+                while let Some(text) = theirs.recv.recv().await {
+                    let Ok(PeerMessage::Edit { id: Some(id), .. }) = serde_json::from_str(&text)
+                    else {
+                        continue;
+                    };
+                    let answer = PeerMessage::Answer {
+                        protocol: PROTOCOL,
+                        id,
+                        outcome: Outcome::Refused {
+                            reason: format!("{peer} refused it"),
+                            conflict,
+                        },
+                    };
+                    let text = serde_json::to_string(&answer).unwrap();
+                    if theirs.send.send(text).await.is_err() {
+                        return;
+                    }
+                }
+            })
+        }
+    }
+
+    /// A machine that does not act: `peer` acts by the order, and is the only other listed.
+    async fn behind(peer: MachineId, projects: Vec<Project>) -> Served {
+        Served::new(move |me, settings| {
+            settings.machines = vec![Machine {
+                id: peer,
+                name: "trilogy-mac".into(),
+                address: "100.64.0.2".into(),
+            }];
+            settings.priority = vec![peer, me];
+            settings.projects = projects;
+        })
+        .await
     }
 
     fn project(name: &str, repo: &str) -> Project {
@@ -530,6 +599,31 @@ mod tests {
         assert!(served.settings().projects.is_empty());
     }
 
+    #[tokio::test]
+    async fn an_add_the_acting_machine_refuses_by_the_project_rules_is_409_without_the_repo() {
+        let peer = MachineId::random();
+        let served = behind(peer, Vec::new()).await;
+        let _peer = served.refused_by(peer, true).await;
+        let (status, body) = served
+            .add("foundry", "https://tom:hunter2@github.com/o/foundry.git")
+            .await;
+        assert_eq!(status, 409, "{body}");
+        assert!(error_of(&body).contains(&peer.to_string()), "{body}");
+        for value in ["hunter2", "github.com"] {
+            assert!(!body.contains(value), "{value} in {body}");
+        }
+        assert!(served.settings().projects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_add_the_acting_machine_refuses_for_any_other_reason_is_still_502() {
+        let peer = MachineId::random();
+        let served = behind(peer, Vec::new()).await;
+        let _peer = served.refused_by(peer, false).await;
+        let (status, body) = served.add("foundry", "/srv/foundry.git").await;
+        assert_eq!(status, 502, "{body}");
+    }
+
     // --- removing ---
 
     #[tokio::test]
@@ -618,6 +712,22 @@ mod tests {
             .await;
         assert_eq!(status, 204, "{body}");
         assert!(served.settings().projects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_remove_the_acting_machine_refuses_by_the_project_rules_is_409() {
+        let held = project("foundry", "https://tom:hunter2@github.com/o/foundry.git");
+        let id = held.id;
+        let peer = MachineId::random();
+        let served = behind(peer, vec![held]).await;
+        let _peer = served.refused_by(peer, true).await;
+        let (status, body) = served
+            .post(&format!("/api/projects/{id}/remove"), None)
+            .await;
+        assert_eq!(status, 409, "{body}");
+        assert!(!error_of(&body).is_empty(), "{body}");
+        assert!(!body.contains("hunter2"), "{body}");
+        assert_eq!(served.settings().projects.len(), 1);
     }
 
     #[tokio::test]
