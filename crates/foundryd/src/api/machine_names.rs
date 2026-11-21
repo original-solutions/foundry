@@ -10,6 +10,15 @@
 //!   a control character is `422`; a name another machine has, compared trimmed and in any
 //!   case, is `409`; an id the list does not hold is `404`. Nothing is sent when a rename is
 //!   refused, and an edit the coordinator could not make answers through [`edit_status`].
+//!
+//! Both decide from this machine's copy of the settings and send the whole entry, as
+//! `SetMachine` carries it. So the listing waits until peers have had time to send their
+//! copies before its first look: a machine renamed elsewhere while it was away, or added to the
+//! list by a peer, finds that entry before it decides anything. What stays open: a rename sent
+//! from a copy that has not yet heard of the machine's new address puts the old address back
+//! until the machine's next look moves it again, and an edit numbered elsewhere between a look's
+//! read and its send is replaced. The listing's default name is not checked as a rename is: two
+//! machines that fall back to one host name are both listed under it.
 
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
@@ -40,9 +49,9 @@ pub struct Entry {
 }
 
 /// Reads `tailscale status --self --json`: the first label of `Self.DNSName` as the name
-/// (`personal-mac.tail459612.ts.net.` gives `personal-mac`), else `host`, and the first IPv4
-/// in `Self.TailscaleIPs` as the address. `Self.HostName` is a display name with spaces, so it
-/// is not used.
+/// (`personal-mac.tail459612.ts.net.` gives `personal-mac`), else `host`, cut to
+/// [`NAME_AT_MOST`] characters, and the first IPv4 in `Self.TailscaleIPs` as the address.
+/// `Self.HostName` is a display name with spaces, so it is not used.
 pub fn entry(status: &[u8], host: Option<&str>) -> Result<Entry, String> {
     #[derive(Deserialize)]
     struct Status {
@@ -74,7 +83,7 @@ pub fn entry(status: &[u8], host: Option<&str>) -> Result<Entry, String> {
         .find(|ip| ip.parse::<Ipv4Addr>().is_ok())
         .ok_or("Tailscale reports no IPv4 address for this machine")?;
     Ok(Entry {
-        name: name.to_owned(),
+        name: name.chars().take(NAME_AT_MOST).collect(),
         address: address.clone(),
     })
 }
@@ -86,22 +95,36 @@ pub struct Listing {
     store: Arc<Mutex<Store>>,
     /// Whether the last look failed, so a failure is warned about once until a look succeeds.
     warned: bool,
+    /// Until when a look does nothing, so peers' copies of the settings can arrive first.
+    settled: tokio::time::Instant,
 }
 
 impl Listing {
-    pub fn new(me: MachineId, coordinator: Arc<Coordinator>, store: Arc<Mutex<Store>>) -> Self {
+    /// A listing whose looks do nothing for `settle` from now: the daemon passes
+    /// [`OFFLINE_AFTER`](crate::sync::OFFLINE_AFTER), the time a peer has to be heard from.
+    pub fn new(
+        me: MachineId,
+        coordinator: Arc<Coordinator>,
+        store: Arc<Mutex<Store>>,
+        settle: std::time::Duration,
+    ) -> Self {
         Self {
             me,
             coordinator,
             store,
             warned: false,
+            settled: tokio::time::Instant::now() + settle,
         }
     }
 
     /// Adds this machine to the list under `entry`'s name when the list does not hold it, and
     /// moves it to `entry`'s address, keeping its name, when the address it holds differs.
     /// A failure, or no entry, is logged once until a look succeeds; the next look tries again.
+    /// A look before the settle time does nothing.
     pub async fn list(&mut self, entry: Result<Entry, String>) {
+        if tokio::time::Instant::now() < self.settled {
+            return;
+        }
         match self.send(entry).await {
             Ok(()) => self.warned = false,
             Err(why) => {

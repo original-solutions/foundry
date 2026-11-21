@@ -213,9 +213,9 @@ async function renameMachine({ id, name }: { id: string; name: string }): Promis
  * A machine's name, renamed in place. `children` draws the name and is given what opens the
  * field, which starts on the name with all of it selected. Enter sends the name, trimmed, and
  * closes the field once the daemon takes it; the new name shows once it arrives in the settings,
- * on every machine. The name it already has sends nothing. Escape, or leaving the field, closes it
- * and sends nothing. A refusal shows under the field and keeps the text. `className` sizes the
- * field's text to the name it stands in for.
+ * on every machine. The name it already has sends nothing. Escape closes it and sends nothing.
+ * A refusal shows under the field and keeps the text. `className` sizes the field's text to the
+ * name it stands in for.
  */
 export function MachineName({
   machine,
@@ -248,7 +248,6 @@ export function MachineName({
         value={text}
         onFocus={(e) => e.currentTarget.select()}
         onChange={(e) => setText(e.target.value)}
-        onBlur={close}
         onKeyDown={(e) => {
           if (e.key === "Enter") {
             e.preventDefault();

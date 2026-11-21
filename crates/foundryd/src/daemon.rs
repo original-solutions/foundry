@@ -298,7 +298,12 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
         .layer(middleware::from_fn_with_state(api.clone(), api::same_site));
     let machine_name_routes = api::machine_names::router(coordinator.clone(), store.clone())
         .layer(middleware::from_fn_with_state(api.clone(), api::same_site));
-    let listing = api::machine_names::Listing::new(me, coordinator.clone(), store.clone());
+    let listing = api::machine_names::Listing::new(
+        me,
+        coordinator.clone(),
+        store.clone(),
+        crate::sync::OFFLINE_AFTER,
+    );
     let app = api::router(api)
         .merge(sessions.router())
         .merge(attention_routes)

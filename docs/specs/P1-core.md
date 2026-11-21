@@ -256,7 +256,7 @@ A file dropped on a terminal of this machine, pasted into it (a screenshot on th
 ### The coordinator role
 
 - Shared settings are the machine list, the priority order, projects and machine limits. They are changed only through the acting coordinator, which gives each change the next number in one sequence and sends it to everyone.
-- A machine adds itself to the machine list under its Tailscale (MagicDNS) short name, such as `personal-mac`, and keeps its Tailscale address there up to date. Anyone can rename a machine from the UI, on its name in the sidebar or on the machines board; the machine never replaces a name already set.
+- A machine adds itself to the machine list under its Tailscale (MagicDNS) short name, such as `personal-mac`, and keeps its Tailscale address there up to date. Anyone can rename a machine from the UI: with the Rename button beside its name in the sidebar, or by clicking its name on its card on the machines board. The machine never replaces a name already set.
 - The acting coordinator is the highest-priority machine that a machine can reach. Each machine works this out from who it can reach, and the UI shows which machine holds the role.
 - When the coordinator disappears, the next machine in the order takes the role within 15 seconds, using its synced copy.
 - When a higher-priority machine comes back, it catches up first, then takes the role.
