@@ -12,7 +12,9 @@
 //! again every [`RETRY_EVERY`], so a request is placed within a second of a sample that shows a
 //! machine qualifies. A placed request is made the way the UI makes one: the create on the
 //! picked machine, carried there when it is another, then one session with the request's model
-//! and first prompt.
+//! and first prompt. Machines are picked for the waiting requests one at a time, in the order
+//! they came; each create and session start then runs as a task of its own, so a machine slow
+//! to answer one request holds back no other.
 //!
 //! - `GET /api/placements`: `{"requests": [...]}`, each a [`Listed`].
 //! - `POST /api/placements/{id}/cancel`: `204`, and the request is never placed. One being
@@ -43,6 +45,7 @@ use foundry_proto::ids::{MachineId, ProjectId, WorkspaceId};
 use foundry_proto::record::{AnyRecord, MachineSample, Record};
 use foundry_proto::settings::{Limits, SharedSettings};
 use serde::Serialize;
+use tokio::task::JoinSet;
 use tokio::time::{Instant, MissedTickBehavior};
 use uuid::Uuid;
 
@@ -332,6 +335,17 @@ impl View {
     }
 }
 
+/// A machine picked for a create, before anything is sent to it.
+pub(crate) struct Picked {
+    machine: MachineId,
+    /// The machine's name, for messages.
+    name: String,
+    /// The version of its newest sample at the pick, which a bench of it lasts past.
+    version: u64,
+    /// The session the create brings, counted against the machine from the pick on.
+    pending: Reservation,
+}
+
 /// A create sent to the machine picked for it, and what that machine answered.
 pub(crate) struct Sent {
     pub machine: MachineId,
@@ -380,45 +394,71 @@ impl Queue {
     /// call, or gives the reasons no machine qualifies, as the UI shows them. A machine that
     /// refuses the call before it is sent is benched and the next is tried. The create sent
     /// counts as a session on its machine until the caller settles it.
-    ///
-    /// `claim` runs once, when a machine is first picked and before anything is sent: when it
-    /// says no, nothing is sent and no reasons are given.
     pub(crate) async fn create(
         &self,
         api: &Api,
         project: ProjectId,
         base: &str,
         name: &str,
-        claim: impl Fn() -> bool,
     ) -> Result<Result<Sent, Vec<String>>, StoreError> {
-        // Each machine is tried once per call, even when a new sample takes it off the bench.
+        match self.choose(api, &BTreeSet::new()).await? {
+            Ok(picked) => self.send(api, picked, project, base, name).await,
+            Err(reasons) => Ok(Err(reasons)),
+        }
+    }
+
+    /// The roomiest machine not in `tried`, with the create about to be sent there counted as
+    /// a session on it, or the reasons no machine qualifies, as the UI shows them.
+    async fn choose(
+        &self,
+        api: &Api,
+        tried: &BTreeSet<MachineId>,
+    ) -> Result<Result<Picked, Vec<String>>, StoreError> {
+        let view = self.view(api).await?;
+        Ok(self.pick(&view, tried).map(|(machine, pending)| Picked {
+            machine,
+            name: view.name(machine),
+            version: view.newest(machine).map_or(0, |s| s.version),
+            pending,
+        }))
+    }
+
+    /// Sends a create of `name` from `base` in `project` to the machine `picked`. When that
+    /// machine refuses the call before it is sent, it is benched and the next roomiest is
+    /// picked and tried, until one takes the call or none qualifies.
+    async fn send(
+        &self,
+        api: &Api,
+        mut picked: Picked,
+        project: ProjectId,
+        base: &str,
+        name: &str,
+    ) -> Result<Result<Sent, Vec<String>>, StoreError> {
+        // Each machine is tried once per create, even when a new sample takes it off the bench.
         let mut tried = BTreeSet::new();
-        let mut claimed = false;
         loop {
-            let view = self.view(api).await?;
-            let (machine, pending) = match self.pick(&view, &tried) {
-                Ok(picked) => picked,
-                Err(reasons) => return Ok(Err(reasons)),
-            };
-            if !claimed {
-                if !claim() {
-                    return Ok(Err(Vec::new()));
-                }
-                claimed = true;
-            }
+            let Picked {
+                machine,
+                name: called,
+                version,
+                pending,
+            } = picked;
             tried.insert(machine);
             let answer = api::create_on(api, machine, project, base, name).await;
             let Some(why) = answer.as_ref().err().and_then(unreachable) else {
                 return Ok(Ok(Sent {
                     machine,
-                    name: view.name(machine),
+                    name: called,
                     answer,
                     pending,
                 }));
             };
             drop(pending);
-            let version = view.newest(machine).map_or(0, |s| s.version);
             lock(&self.benched).insert(machine, Bench { version, why });
+            picked = match self.choose(api, &tried).await? {
+                Ok(picked) => picked,
+                Err(reasons) => return Ok(Err(reasons)),
+            };
         }
     }
 
@@ -652,14 +692,6 @@ impl Queue {
             .collect()
     }
 
-    /// What waiting request `id` makes, or `None` when it is not waiting.
-    fn want(&self, id: Uuid) -> Option<Want> {
-        lock(&self.requests)
-            .iter()
-            .find(|r| r.id == id && r.phase == Phase::Waiting)
-            .map(|r| r.want.clone())
-    }
-
     /// Marks waiting request `id` as being placed and gives what it makes, or `None` when it is
     /// not waiting: cancelled, failed or being placed already.
     pub(crate) fn begin(&self, id: Uuid) -> Option<Want> {
@@ -697,46 +729,63 @@ impl Queue {
         }
     }
 
-    /// Tries each waiting request once, in the order they came.
-    async fn retry(&self, api: &Api) -> Result<(), StoreError> {
+    /// Tries each waiting request once, in the order they came: picks its machine here, so the
+    /// picks keep that order, then sends its create and starts its session as a task of
+    /// `placing`, so a machine slow to answer one request holds back no other.
+    async fn retry(
+        self: &Arc<Self>,
+        api: &Api,
+        placing: &mut JoinSet<()>,
+    ) -> Result<(), StoreError> {
         for id in self.waiting() {
-            let Some(want) = self.want(id) else {
-                continue;
+            let picked = match self.choose(api, &BTreeSet::new()).await? {
+                Ok(picked) => picked,
+                Err(reasons) => {
+                    self.finish(id, Outcome::Wait(Some(reasons)));
+                    continue;
+                }
             };
             // Marked as being placed only once a machine is picked, so a cancel while no machine
-            // qualifies is never refused.
-            let claim = || self.begin(id).is_some();
-            let sent = match self
-                .create(api, want.project, &want.base, &want.name, claim)
-                .await
-            {
-                Ok(sent) => sent,
-                Err(error) => {
-                    self.finish(id, Outcome::Wait(None));
-                    return Err(error);
-                }
+            // qualifies is never refused. One cancelled since is not placed, and the pick,
+            // dropped here, counts for nothing.
+            let Some(want) = self.begin(id) else {
+                continue;
             };
-            let outcome = match sent {
-                Err(reasons) => Outcome::Wait(Some(reasons)),
-                Ok(sent) => {
-                    let Sent {
-                        machine,
-                        name,
-                        answer,
-                        pending,
-                    } = sent;
-                    let outcome = start(api, &want, machine, &name, answer).await;
-                    let placed = matches!(outcome, Outcome::Placed);
-                    self.settle(api, machine, pending, placed).await;
-                    if placed {
-                        tracing::info!("placement: {} is placed", want.name);
-                    }
-                    outcome
-                }
-            };
-            self.finish(id, outcome);
+            let (queue, api) = (Arc::clone(self), api.clone());
+            placing.spawn(async move { queue.place_picked(&api, id, want, picked).await });
         }
         Ok(())
+    }
+
+    /// Places request `id`, already marked as being placed, on the machine `picked` for it:
+    /// the create, then its session.
+    async fn place_picked(&self, api: &Api, id: Uuid, want: Want, picked: Picked) {
+        let sent = self
+            .send(api, picked, want.project, &want.base, &want.name)
+            .await;
+        let outcome = match sent {
+            Err(error) => {
+                tracing::warn!("placement: {} was not tried: {error}", want.name);
+                Outcome::Wait(None)
+            }
+            Ok(Err(reasons)) => Outcome::Wait(Some(reasons)),
+            Ok(Ok(sent)) => {
+                let Sent {
+                    machine,
+                    name,
+                    answer,
+                    pending,
+                } = sent;
+                let outcome = start(api, &want, machine, &name, answer).await;
+                let placed = matches!(outcome, Outcome::Placed);
+                self.settle(api, machine, pending, placed).await;
+                if placed {
+                    tracing::info!("placement: {} is placed", want.name);
+                }
+                outcome
+            }
+        };
+        self.finish(id, outcome);
     }
 }
 
@@ -847,15 +896,24 @@ impl Source for Queue {
 }
 
 /// Tries the waiting requests every [`RETRY_EVERY`] for as long as the daemon runs, and while
-/// none waits but creates still count, reads the samples that age them.
+/// none waits but creates still count, reads the samples that age them. The placements under
+/// way are its tasks: they end with it, and one that panics takes it down as well.
 pub async fn run(api: Api) {
     let queue = Arc::clone(&api.placements);
+    let mut placing = JoinSet::new();
     let mut every = tokio::time::interval(RETRY_EVERY);
     every.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         every.tick().await;
+        while let Some(ended) = placing.try_join_next() {
+            if let Err(error) = ended
+                && error.is_panic()
+            {
+                std::panic::resume_unwind(error.into_panic());
+            }
+        }
         let tried = if !queue.waiting().is_empty() {
-            queue.retry(&api).await
+            queue.retry(&api, &mut placing).await
         } else if queue.counting() {
             queue.watch(&api).await
         } else {

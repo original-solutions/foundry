@@ -769,7 +769,7 @@ async fn choose(api: &Api, create: Create) -> Result<Response, ApiError> {
     }
     let placements = Arc::clone(&api.placements);
     match placements
-        .create(api, create.project, &create.base, &create.name, || true)
+        .create(api, create.project, &create.base, &create.name)
         .await?
     {
         Ok(sent) => {
