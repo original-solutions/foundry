@@ -58,7 +58,7 @@ crates/
     src/sync/                  peer links, record exchange, catch-up
     src/coordinator.rs         priority order, shared settings sequence
     src/join.rs                one-time codes, machine keys
-    src/secrets.rs             keychain on macOS, 0600 file on Linux
+    src/secrets.rs             0600 file on every OS
     src/gateway.rs             health and cooldown read
     src/attention.rs           raise and clear items
     src/api/                   HTTP and WebSocket for the UI
@@ -159,7 +159,7 @@ Dependencies are in brackets. Tasks with no dependency between them can build at
 
 - **Spec:** Security.
 - **Files:** `crates/foundryd/src/join.rs`, `crates/foundryd/src/secrets.rs`.
-- **Produces:** `foundryd join <address> <code>`; a one-time code valid for 10 minutes; a key per machine checked on every peer link; revoking a machine; `Secrets::get` and `set` over the macOS keychain or a 0600 file.
+- **Produces:** `foundryd join <address> <code>`; a one-time code valid for 10 minutes; a key per machine checked on every peer link; revoking a machine; `Secrets::get` and `set` over a 0600 file.
 - **Tests:** a code works once and not after 10 minutes. A peer with a revoked key is refused and shown as revoked. A link with no key is refused. The Linux secrets file is created 0600 and a wider mode is refused at read.
 
 ### 14. Coordinator [12, 13, 20]

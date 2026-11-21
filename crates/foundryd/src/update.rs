@@ -33,7 +33,7 @@ const REPO: &str = "original-solutions/foundry";
 const HEALTHY_AFTER: Duration = Duration::from_secs(60);
 
 /// How long a trial may take to become healthy before the process gives up and exits, so a
-/// start that hangs (on a keychain prompt, say) counts as a failed start.
+/// start that hangs (on a disk that does not answer, say) counts as a failed start.
 const TRIAL_DEADLINE: Duration = Duration::from_secs(300);
 
 /// The release public key, as hex. The release workflow reads it from this line and refuses to
@@ -329,6 +329,12 @@ pub enum Start {
         /// The version `current` went back to.
         to: String,
     },
+    /// The trial failed and the rollback stopped part way: this process must exit, and the
+    /// next start, with the trial still at its cap, tries the rollback again.
+    RollbackStopped {
+        /// Why it stopped.
+        error: String,
+    },
 }
 
 /// Counts this start against a trial of `running`, or rolls the trial back. Any other
@@ -352,15 +358,25 @@ fn start_with(home: &Path, running: &str) -> io::Result<Start> {
             format!("cannot roll back: versions/{previous}/{missing} is missing"),
         ));
     }
-    // Three steps, each safe to stop after: the refusal is saved with the trial still at its
-    // cap, `current` moves, and only then is the trial cleared. A failure or a crash in
-    // between leaves a trial at the cap, so the next start rolls back again.
-    state.refused = Some(format!("v{running}"));
-    save(home, &state)?;
-    point_current(home, &previous)?;
-    state.trial = None;
-    save(home, &state)?;
-    Ok(Start::RolledBack { to: previous })
+    // Four steps, each safe to stop after: the refusal is saved with the trial still at its
+    // cap, a copy this trial made of the keychain is removed (the release `current` goes back
+    // to may read only the keychain, so the copy must not outlive the trial), `current` moves,
+    // and only then is the trial cleared. A failure or a crash in between leaves a trial at
+    // the cap, so the next start rolls back again.
+    let mut roll_back = || -> io::Result<()> {
+        state.refused = Some(format!("v{running}"));
+        save(home, &state)?;
+        crate::secrets::drop_copy(home, running).map_err(io::Error::other)?;
+        point_current(home, &previous)?;
+        state.trial = None;
+        save(home, &state)
+    };
+    Ok(match roll_back() {
+        Ok(()) => Start::RolledBack { to: previous },
+        Err(error) => Start::RollbackStopped {
+            error: error.to_string(),
+        },
+    })
 }
 
 /// True when this process runs from `<home>/current`, the only place that is updated: that
@@ -405,6 +421,8 @@ enum Begin {
     Run { watch: bool },
     /// The trial failed and `current` went back to `to`.
     RolledBack { to: String },
+    /// The trial failed and the rollback stopped part way, for `error`.
+    RollbackStopped { error: String },
 }
 
 /// What a start does about an update, for the process at `exe`.
@@ -417,11 +435,13 @@ fn begin(home: &Path, exe: &Path, running: &str) -> io::Result<Begin> {
             watch: on_trial(home, exe, running),
         },
         Start::RolledBack { to } => Begin::RolledBack { to },
+        Start::RollbackStopped { error } => Begin::RollbackStopped { error },
     })
 }
 
 /// Called by `foundryd run` before it does anything else. False means this version was
-/// rolled back and the process must exit with success so the service starts the previous one.
+/// rolled back, or its rollback stopped part way, and the process must exit with success so
+/// the service starts the previous one or tries the rollback again.
 /// A start that goes on while a trial of this version is on gets a watchdog: if the daemon is
 /// not healthy by [`TRIAL_DEADLINE`] the process exits, so a hang counts as a failed start.
 pub fn starting(home: &Path) -> bool {
@@ -450,6 +470,12 @@ fn starting_with(home: &Path, exe: &Path, running: &str, arm: impl FnOnce()) -> 
         Ok(Begin::RolledBack { to }) => {
             tracing::error!(
                 "version {running} did not become healthy in {MAX_STARTS} starts: back to {to}, and v{running} is refused until a higher tag appears"
+            );
+            false
+        }
+        Ok(Begin::RollbackStopped { error }) => {
+            tracing::error!(
+                "version {running} did not become healthy in {MAX_STARTS} starts, and putting the previous version back stopped part way: {error}; exiting so the next start tries again"
             );
             false
         }
@@ -929,6 +955,82 @@ mod tests {
         fs::read_link(home.join("current")).unwrap()
     }
 
+    /// The copy a trial made of the keychain is removed when it rolls back, so the
+    /// keychain-era release it goes back to stays the one source, and the next release copies
+    /// again.
+    #[test]
+    fn a_rollback_removes_the_secrets_the_trial_copied() {
+        let home = trial_home();
+        let secrets = home.path().join("secrets.json");
+        let mark = home.path().join("secrets.json.copied");
+        fs::write(&secrets, "{}").unwrap();
+        fs::write(&mark, "0.2.0").unwrap();
+        for _ in 0..3 {
+            start_with(home.path(), "0.2.0").unwrap();
+        }
+        let fourth = start_with(home.path(), "0.2.0").unwrap();
+        assert_eq!(fourth, Start::RolledBack { to: "0.1.0".into() });
+        assert!(!secrets.exists());
+        assert!(!mark.exists());
+    }
+
+    /// A copy the previous version made is its live store: a rollback to it keeps the file.
+    #[test]
+    fn a_rollback_leaves_a_copy_another_version_made() {
+        let home = trial_home();
+        let secrets = home.path().join("secrets.json");
+        let mark = home.path().join("secrets.json.copied");
+        fs::write(&secrets, "{}").unwrap();
+        fs::write(&mark, "0.1.0").unwrap();
+        for _ in 0..4 {
+            start_with(home.path(), "0.2.0").unwrap();
+        }
+        assert_eq!(current(home.path()), PathBuf::from("versions/0.1.0"));
+        assert!(secrets.exists());
+        assert_eq!(fs::read_to_string(&mark).unwrap(), "0.1.0");
+    }
+
+    /// A rollback that stops part way exits rather than run the failed version unwatched, and
+    /// the trial stays at its cap, so the next start tries the rollback again.
+    #[test]
+    fn a_rollback_that_cannot_remove_the_copy_exits_and_rolls_back_on_the_next_start() {
+        let home = trial_home();
+        let exe = exe_in(home.path(), "0.2.0");
+        let secrets = home.path().join("secrets.json");
+        let mark = home.path().join("secrets.json.copied");
+        // A directory with a file in it is not removed as a file is.
+        fs::create_dir(&secrets).unwrap();
+        fs::write(secrets.join("held"), "").unwrap();
+        fs::write(&mark, "0.2.0").unwrap();
+        for _ in 0..3 {
+            assert_eq!(started(home.path(), &exe), (true, 1));
+        }
+
+        assert_eq!(started(home.path(), &exe), (false, 0));
+        assert_eq!(current(home.path()), PathBuf::from("versions/0.2.0"));
+        assert!(mark.exists());
+
+        fs::remove_dir_all(&secrets).unwrap();
+        fs::write(&secrets, "{}").unwrap();
+        assert_eq!(started(home.path(), &exe), (false, 0));
+        assert_eq!(current(home.path()), PathBuf::from("versions/0.1.0"));
+        assert!(!secrets.exists());
+        assert!(!mark.exists());
+        assert_eq!(state(home.path()).unwrap().trial, None);
+    }
+
+    #[test]
+    fn a_rollback_leaves_secrets_no_trial_copied() {
+        let home = trial_home();
+        let secrets = home.path().join("secrets.json");
+        fs::write(&secrets, "{}").unwrap();
+        for _ in 0..4 {
+            start_with(home.path(), "0.2.0").unwrap();
+        }
+        assert_eq!(current(home.path()), PathBuf::from("versions/0.1.0"));
+        assert!(secrets.exists());
+    }
+
     #[test]
     fn three_starts_that_never_report_healthy_roll_back_on_the_next() {
         let home = trial_home();
@@ -1203,7 +1305,11 @@ mod tests {
         let obstacle = home.path().join("current.new");
         fs::create_dir_all(obstacle.join("inside")).unwrap();
 
-        assert!(start_with(home.path(), "0.2.0").is_err());
+        let stopped = start_with(home.path(), "0.2.0").unwrap();
+        assert!(
+            matches!(stopped, Start::RollbackStopped { .. }),
+            "{stopped:?}"
+        );
         assert_eq!(current(home.path()), PathBuf::from("versions/0.2.0"));
         fs::remove_dir_all(&obstacle).unwrap();
         let next = start_with(home.path(), "0.2.0").unwrap();
