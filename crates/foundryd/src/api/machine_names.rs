@@ -266,6 +266,8 @@ mod tests {
     use serde_json::{Value, json};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::*;
     use crate::sync::{Conn, Dialer, Peers};
 
@@ -409,11 +411,17 @@ mod tests {
         }
 
         fn listing_after(&self, settle: Duration) -> Listing {
+            self.listing_marked(settle, Arc::new(AtomicBool::new(false)))
+        }
+
+        /// A listing that reads `away`, the mark the address watch sets when Tailscale fails.
+        fn listing_marked(&self, settle: Duration, away: Arc<AtomicBool>) -> Listing {
             Listing::new(
                 self.me,
                 self.coordinator.clone(),
                 self.store.clone(),
                 settle,
+                away,
             )
         }
 
@@ -745,12 +753,14 @@ mod tests {
         })
         .await;
         let seq = served.settings().seq;
-        let mut listing = served.listing_after(SETTLE);
+        let away = Arc::new(AtomicBool::new(false));
+        let mut listing = served.listing_marked(SETTLE, away.clone());
         listing.list(here("personal-mac", "100.91.54.18")).await;
 
-        // Tailscale stops answering for longer than the settle time, so no look runs.
+        // Tailscale stops answering for longer than the settle time, so no look runs, and the
+        // address watch marks it away.
         tokio::time::sleep(SETTLE * 2).await;
-        listing.away();
+        away.store(true, Ordering::Relaxed);
         listing.list(here("personal-mac", "100.91.54.18")).await;
         assert_eq!(
             served.settings().seq,
