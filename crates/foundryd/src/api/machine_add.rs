@@ -3,9 +3,9 @@
 //! The name is trimmed. One that is blank or over [`NAME_AT_MOST`] characters is `422`, and so
 //! is one that resolves to no Tailscale address, by the rule `foundryd join` sends a code by
 //! ([`join_targets`]). A name a listed machine has, compared trimmed and in any case, is `409`.
-//! A machine the list does not hold yet has no name to put in the command, so it answers `503`.
+//! A machine the list does not hold yet has no address to put in the command, so it answers `503`.
 //! Otherwise it answers `201` `{code, command, expires_in_secs}`: a new join code,
-//! `foundryd join <this machine's name> <code>` to run on the new machine, and how long the
+//! `foundryd join <this machine's address> <code>` to run on the new machine, and how long the
 //! code works ([`CODE_VALID_FOR`]).
 //!
 //! The name and the first Tailscale address it resolved to are held in memory until the code is
@@ -87,9 +87,7 @@ async fn add(
     let Some(own) = settings.machines.iter().find(|m| m.id == me) else {
         return Err(ApiError::Rejected(
             StatusCode::SERVICE_UNAVAILABLE,
-            "this machine is not in the machine list yet, so the new machine has no name to \
-             join it by; try again once this machine's card shows its name"
-                .to_owned(),
+            "this machine is not in its machine list yet; try again in a minute".to_owned(),
         ));
     };
     let address = resolve(&name).await?;
@@ -104,7 +102,7 @@ async fn add(
         address,
     ));
     let answer = serde_json::json!({
-        "command": format!("foundryd join {} {code}", own.name.trim()),
+        "command": format!("foundryd join {} {code}", own.address.trim()),
         "code": code.to_string(),
         "expires_in_secs": CODE_VALID_FOR.as_secs(),
     });
