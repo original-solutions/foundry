@@ -144,8 +144,9 @@ impl Terminals {
         }
     }
 
-    /// Starts `argv` in `cwd` with `env` set over the daemon's own environment, in a new
-    /// terminal of `workspace`. The start finishes even when the caller stops waiting.
+    /// Starts `argv` in `cwd` with `env`, plus a colour `TERM` and `COLORTERM` each where `env`
+    /// does not name it, set over the daemon's own environment, in a new terminal of
+    /// `workspace`. The start finishes even when the caller stops waiting.
     pub async fn start(
         &self,
         workspace: WorkspaceId,
@@ -646,7 +647,7 @@ fn no_answer() -> io::Error {
     )
 }
 
-/// `env` with a colour terminal's `TERM` and `COLORTERM` added where it names neither. The
+/// `env` with each of a colour terminal's `TERM` and `COLORTERM` that it does not name. The
 /// daemon under launchd has no `TERM`, and the browser side, xterm.js, shows truecolor.
 fn colour_env(env: &[(String, String)]) -> Vec<(String, String)> {
     [("TERM", "xterm-256color"), ("COLORTERM", "truecolor")]
