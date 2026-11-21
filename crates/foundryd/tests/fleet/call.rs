@@ -931,3 +931,56 @@ async fn a_request_being_placed_cannot_be_cancelled_and_ends_failed_when_its_cre
     }
     drop(silent);
 }
+
+#[tokio::test]
+async fn a_request_whose_create_gets_no_answer_from_b_does_not_hold_back_the_next_request() {
+    let fleet = Fleet::start(2);
+    let (a, b) = (&fleet.daemons[0], &fleet.daemons[1]);
+    let remotes = tempfile::tempdir().unwrap();
+    let (on_a, project, silent) = b_never_answers(&fleet, remotes.path()).await;
+    a.write(loaded(4, 0.1));
+    let sampled = b.write(loaded(4, 0.1));
+    holds_sample(a, b.id, sampled.version()).await;
+    for name in ["held", "next"] {
+        let (status, answer) = on_a
+            .post("/api/workspaces", Some(choose(project, name)))
+            .await;
+        assert_eq!(status, 202, "{answer}");
+    }
+
+    // B has room for one session. The first request takes it, and B never answers its create.
+    let sampled = b.write(loaded(3, 0.1));
+    holds_sample(a, b.id, sampled.version()).await;
+    let started = tokio::time::Instant::now();
+    while on_a.get("/api/placements").await["requests"][0]["state"] != "placing" {
+        assert!(
+            started.elapsed() < WAIT,
+            "the first request is never placed"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // A qualifies while the first request is still being placed on B.
+    a.write(loaded(0, 0.1));
+    until(
+        Duration::from_secs(10),
+        "the next request is placed on A",
+        || {
+            let Some(AnyRecord::Workspace(made)) = a.held(|r| {
+                r.owner() == a.id && matches!(r, AnyRecord::Workspace(w) if w.body.name == "next")
+            }) else {
+                return false;
+            };
+            a.held(|r| {
+                r.owner() == a.id
+                    && matches!(r, AnyRecord::Session(s) if s.body.workspace == made.body.id)
+            })
+            .is_some()
+        },
+    )
+    .await;
+    let listed = on_a.get("/api/placements").await;
+    assert_eq!(listed["requests"][0]["name"], "held", "{listed}");
+    assert_eq!(listed["requests"][0]["state"], "placing", "{listed}");
+    drop(silent);
+}

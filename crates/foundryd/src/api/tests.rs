@@ -3010,6 +3010,29 @@ async fn a_named_machine_over_its_limits_is_used_and_the_answer_warns_of_each_li
 }
 
 #[tokio::test]
+async fn a_create_naming_no_machine_is_made_here_and_warns_of_each_limit_this_machine_is_over() {
+    let daemon = Daemon::new(TURN).await;
+    let project = daemon.project();
+    daemon.list_me("studio");
+    daemon.limit(daemon.me, 2, 1.0);
+    daemon.sample(daemon.me, 2, 1.5);
+    let body = serde_json::json!({"project": project, "base": "main", "name": "anyway"});
+    let reply = daemon.call("POST", "/api/workspaces", Some(body)).await;
+    assert_eq!(reply.status, 201, "{}", reply.body);
+    assert_eq!(
+        reply.json()["warning"],
+        "studio is over its limits: sessions 2 at limit 2, load 1.5 over limit 1.0"
+    );
+    assert!(daemon.workspace_named("anyway").is_some());
+
+    daemon.sample(daemon.me, 0, 0.1);
+    let body = serde_json::json!({"project": project, "base": "main", "name": "under"});
+    let reply = daemon.call("POST", "/api/workspaces", Some(body)).await;
+    assert_eq!(reply.status, 201, "{}", reply.body);
+    assert!(reply.json().get("warning").is_none(), "{}", reply.body);
+}
+
+#[tokio::test]
 async fn only_choose_takes_a_model_and_choose_needs_one() {
     let daemon = Daemon::new(TURN).await;
     let project = daemon.project();
