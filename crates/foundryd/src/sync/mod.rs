@@ -251,12 +251,14 @@ impl Peers {
     /// number of the link it went on. With an `id` it goes only on a link that speaks
     /// [`ANSWERS_SINCE`] or later, which carries the id and its answer. With none, which is how an
     /// edit that reached this machine from an older one is passed on, it goes on a link that
-    /// speaks [`EDITS_SINCE`] or later, and is never answered. It says why when no link took it.
+    /// speaks [`EDITS_SINCE`] or later, and is never answered. With `on`, it goes only on the
+    /// link of that number. It says why when no link took it.
     pub async fn send_edit(
         &self,
         machine: MachineId,
         id: Option<EditId>,
         edit: &Edit,
+        on: Option<u64>,
     ) -> Result<u64, Unsent> {
         let since = if id.is_some() {
             ANSWERS_SINCE
@@ -265,7 +267,12 @@ impl Peers {
         };
         let links: Vec<(u64, Link)> = lock(&self.inner.links)
             .get(&machine)
-            .map(|open| open.iter().map(|(n, link)| (*n, link.clone())).collect())
+            .map(|open| {
+                open.iter()
+                    .filter(|(n, _)| on.is_none_or(|on| on == **n))
+                    .map(|(n, link)| (*n, link.clone()))
+                    .collect()
+            })
             .unwrap_or_default();
         let mut unsent = Unsent::NotLinked;
         for (number, Link { speak, send }) in links {

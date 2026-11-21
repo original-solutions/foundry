@@ -2257,3 +2257,76 @@ async fn an_edit_relayed_and_answered_is_answered_with_its_stamp_again_once_the_
         "the edit sent again is answered with the stamp this machine saw, not refused"
     );
 }
+
+// On real time: the first link's writer fails at once, while the link stays listed until its
+// next heartbeat fails, a second later. A paused clock could reach that heartbeat while the
+// daemon reads its store.
+#[tokio::test]
+async fn a_forwarded_edit_goes_only_on_the_link_the_one_before_it_went_on() {
+    goes_after_the_edit_before_it(false).await;
+}
+
+#[tokio::test]
+async fn an_edit_without_an_id_goes_only_on_the_link_the_one_before_it_went_on() {
+    goes_after_the_edit_before_it(true).await;
+}
+
+/// A sender forwards edit "a" and then "b" to project 7. "a" goes on the first of two links to
+/// the acting machine, which then stops taking what the daemon sends. "b" must not overtake it
+/// on the second link. With `without_id`, "b" comes with no id, on a link the sender also
+/// opened in the protocol before answers.
+async fn goes_after_the_edit_before_it(without_id: bool) {
+    let (acting, sender) = (MachineId::random(), MachineId::random());
+    let fleet = Fleet::start_coordinated_with(1, &[acting, sender]);
+    let daemon = &fleet.daemons[0];
+    let theirs = ordered_by(&daemon.settings(), acting, vec![acting, daemon.id, sender]);
+    let Conn {
+        send: first,
+        recv: mut first_said,
+    } = raw_link(daemon, acting).await;
+    let (second, said_second) = recorded(raw_link(daemon, acting).await);
+    let cs = drained(raw_link(daemon, sender).await);
+    let older = drained(raw_link_speaking(daemon, sender, ANSWERS_SINCE - 1).await);
+    say(&first, &settings_message(theirs.clone())).await;
+    say(&cs, &settings_message(theirs)).await;
+    let _beat_first = beating(first.clone());
+    let _beat_second = beating(second.clone());
+    let _beat_s = beating(cs.clone());
+    acting_becomes(&daemon.coordinator(), acting, WAIT).await;
+
+    say(&cs, &edit_message(set_project(7, "a"))).await;
+    tokio::time::timeout(WAIT, async {
+        while let Some(text) = first_said.recv().await {
+            if text.contains("\"type\":\"edit\"") {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the first edit goes on the first link");
+    // The first link stops taking what the daemon sends, with the first edit unread, and the
+    // next edit arrives.
+    drop(first_said);
+    if without_id {
+        let edit = PeerMessage::Edit {
+            protocol: ANSWERS_SINCE - 1,
+            id: None,
+            edit: set_project(7, "b"),
+        };
+        say(&older, &edit).await;
+    } else {
+        say(&cs, &edit_message(set_project(7, "b"))).await;
+    }
+    until(WAIT, "both go on the second link", || {
+        edits_sent(&said_second).len() == 2
+    })
+    .await;
+    let names: Vec<_> = edits_sent(&said_second)
+        .into_iter()
+        .map(|(_, edit)| match edit {
+            Edit::SetProject { project } => project.name,
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(names, ["a", "b"], "in the order they arrived");
+}

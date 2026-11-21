@@ -62,10 +62,13 @@ const STEP: Duration = Duration::from_millis(100);
 /// machine can reach, unless the acting machine is reachable and older.
 const KEEP_FORWARDED: Duration = OFFLINE_AFTER.saturating_mul(2);
 
-/// How far below the newest numbered edit an edit's id is kept in [`SharedSettings::numbered`].
-/// It must cover every edit the acting machine can number within [`KEEP_FORWARDED`], the longest
-/// a sender sends one again.
-pub const NUMBERED_KEPT: u64 = 128;
+/// How far below the newest numbered edit an edit's id is kept in [`SharedSettings::numbered`],
+/// counted in numbers, so every copy forgets the same ids. The machine that numbered an id, or
+/// was answered its stamp, also keeps it for [`KEEP_FORWARDED`] ([`Known`]), the longest a sender
+/// sends it again, so it answers a resend with the stamp however many numbers came since. The
+/// window matters only when the role moves before the resend: then it must cover what the fleet
+/// numbered in between.
+const NUMBERED_KEPT: u64 = 128;
 
 /// Why an edit was not made.
 #[derive(Debug, thiserror::Error)]
@@ -323,41 +326,46 @@ impl Coordinator {
         let mut ignored = false;
         loop {
             let answered = self.known().get(&id).and_then(|known| known.answer.clone());
-            match answered {
-                Some(Outcome::Numbered { stamp }) => return Ok(stamp),
-                Some(Outcome::Refused { reason }) if self.may_refuse(id, from, Cause::Answered) => {
+            if let Some(Outcome::Numbered { stamp }) = answered {
+                return Ok(stamp);
+            }
+            let look = self.look(from, arrived).await;
+            // A stamp in the held copy settles the id, whatever refusal came for it.
+            if let Ok(look) = &look
+                && let Some(stamp) = look.held.numbered.get(&id)
+            {
+                return Ok(self.settled(id, *stamp));
+            }
+            if let Some(Outcome::Refused { reason }) = answered {
+                if self.may_refuse(id, from, Cause::Answered) {
                     return Err(CoordinatorError::Refused { reason });
                 }
-                Some(Outcome::Refused { .. }) if !ignored => {
+                if !ignored {
                     ignored = true;
                     tracing::warn!(
                         "coordinator: a refusal of an edit another machine may have numbered; \
                          waiting"
                     );
                 }
-                _ => {}
             }
             // The error to report when the limit passes with nothing settled.
             let mut failed: Option<(StoreError, bool)> = None;
-            match self.look(from, arrived).await {
+            match look {
                 // A read that fails ends only this machine's own edit that was never sent.
                 Err(error) if from.is_none() && sent.is_none() => return Err(error.into()),
                 Err(error) => failed = Some((error, false)),
                 Ok(look) => {
                     read_logged = None;
-                    if let Some(stamp) = look.held.numbered.get(&id) {
-                        return Ok(*stamp);
-                    }
-                    let next = match queued {
-                        Some(queued) if !queued.in_turn(look.next) => Next::Wait,
-                        _ => look.next,
+                    let (next, on) = match queued {
+                        Some(queued) => queued.turn(look.next),
+                        None => (look.next, None),
                     };
                     match next {
                         // A failed write here is a cause to refuse; a failed read says nothing
                         // of the id. Any other failure ends only this machine's own edit that
                         // was never sent; otherwise it is logged and tried again.
                         Next::Number => match self.number(Some(id), &edit).await {
-                            Ok(stamp) => return Ok(stamp),
+                            Ok(stamp) => return Ok(self.settled(id, stamp)),
                             Err(failure) => {
                                 if failure.write && self.may_refuse(id, from, Cause::Here) {
                                     return Err(self.refused("could not store it"));
@@ -373,7 +381,7 @@ impl Coordinator {
                                 to == acting && self.peers.is_open(acting, link)
                             });
                             if !on_its_way {
-                                match self.peers.send_edit(acting, Some(id), &edit).await {
+                                match self.peers.send_edit(acting, Some(id), &edit, on).await {
                                     Ok(link) => {
                                         sent = Some((acting, link));
                                         self.sent_to(id, acting);
@@ -498,11 +506,7 @@ impl Coordinator {
                 }
                 Ok(look) => {
                     logged = None;
-                    let next = if queued.in_turn(look.next) {
-                        look.next
-                    } else {
-                        Next::Wait
-                    };
+                    let (next, on) = queued.turn(look.next);
                     match next {
                         Next::Number => {
                             return self
@@ -511,14 +515,15 @@ impl Coordinator {
                                 .map(|_| ())
                                 .map_err(|failure| failure.error.into());
                         }
-                        Next::Send(acting) => match self.peers.send_edit(acting, None, &edit).await
-                        {
-                            Ok(_) => return Ok(()),
-                            Err(Unsent::Unwritable(error)) => {
-                                return Err(CoordinatorError::Unwritable(error));
+                        Next::Send(acting) => {
+                            match self.peers.send_edit(acting, None, &edit, on).await {
+                                Ok(_) => return Ok(()),
+                                Err(Unsent::Unwritable(error)) => {
+                                    return Err(CoordinatorError::Unwritable(error));
+                                }
+                                Err(Unsent::NotLinked | Unsent::Older(_)) => {}
                             }
-                            Err(Unsent::NotLinked | Unsent::Older(_)) => {}
-                        },
+                        }
                         Next::Wait => {}
                     }
                     if look.waited >= KEEP_FORWARDED {
@@ -545,6 +550,17 @@ impl Coordinator {
             known: &self.known,
             id,
         }
+    }
+
+    /// Notes that the edit under `id` was numbered with `stamp`, as this machine found in its own
+    /// copy or numbered itself, and returns the stamp. Like a stamp answered, it replaces any
+    /// refusal held for the id, and it answers the id while it is kept, whatever the shared
+    /// copy has forgotten since ([`NUMBERED_KEPT`]).
+    fn settled(&self, id: EditId, stamp: Stamp) -> Stamp {
+        if let Some(known) = self.known().get_mut(&id) {
+            known.answer = Some(Outcome::Numbered { stamp });
+        }
+        stamp
     }
 
     /// Notes that a task here sent the edit under `id` to `acting`.
@@ -642,7 +658,8 @@ struct Known {
     /// When the last task that waited on it ended, `None` while one waits. It is kept for
     /// [`KEEP_FORWARDED`] after that: the longest its sender sends it again.
     ended: Option<Instant>,
-    /// The answer a machine it was sent to gave.
+    /// Its stamp, once this machine numbered it, found it in its copy or was answered it; else
+    /// the refusal a machine it was sent to answered.
     answer: Option<Outcome>,
     /// Every machine a task here sent it to.
     sent_to: BTreeSet<MachineId>,
@@ -730,15 +747,14 @@ impl Queued {
         }
     }
 
-    /// Whether the edit may do `next` now ([`in_turn`]).
-    fn in_turn(&self, next: Next) -> bool {
+    /// What the edit may do now, for `next`, and the link it must go on ([`in_turn`]).
+    fn turn(&self, next: Next) -> Turn {
         let earlier: Vec<Sent> = lock(&self.coordinator.queue)
             .edits
             .range((self.peer, 0)..(self.peer, self.number))
             .map(|(_, (_, sent))| *sent)
             .collect();
-        let peers = &self.coordinator.peers;
-        in_turn(next, &earlier, |machine, link| peers.is_open(machine, link))
+        in_turn(next, &earlier)
     }
 }
 
@@ -750,19 +766,25 @@ impl Drop for Queued {
     }
 }
 
-/// Whether a forwarded edit may do `next` now, given where each edit the same machine
-/// forwarded before it, still queued or running here, was last sent: `earlier`, and `open`,
-/// whether a link is open. It is numbered only once none of them is left, and sent only to a
-/// machine every one of them is on its way to, on a link still open. Links carry messages in
-/// order, so edits from one machine reach the acting machine, and take their numbers, in the
-/// order they arrived, also when sent again.
-fn in_turn(next: Next, earlier: &[Sent], open: impl Fn(MachineId, u64) -> bool) -> bool {
-    match next {
-        Next::Number => earlier.is_empty(),
-        Next::Send(acting) => earlier
-            .iter()
-            .all(|sent| sent.is_some_and(|(to, link)| to == acting && open(to, link))),
-        Next::Wait => true,
+/// What a forwarded edit does next, and the number of the link it must go on, `None` for any.
+type Turn = (Next, Option<u64>);
+
+/// What a forwarded edit may do now, for `next` from its look, given where each edit the same
+/// machine forwarded before it, still queued or running here, was last sent: `earlier`. It is
+/// numbered only once none of them is left. It is sent only to the machine they all went to, on
+/// the one link they all went on, which the second value names (`None`: any link, as none is
+/// earlier); when that link has closed, it waits until they are sent again. Otherwise it waits.
+/// Links carry messages in order, so edits from one machine reach the acting machine, and take
+/// their numbers, in the order they arrived, also when sent again.
+fn in_turn(next: Next, earlier: &[Sent]) -> Turn {
+    match (next, earlier.first()) {
+        (Next::Number, None) | (Next::Send(_), None) => (next, None),
+        (Next::Send(acting), Some(&Some((to, link))))
+            if to == acting && earlier.iter().all(|sent| *sent == Some((acting, link))) =>
+        {
+            (next, Some(link))
+        }
+        _ => (Next::Wait, None),
     }
 }
 
@@ -1899,21 +1921,27 @@ mod tests {
     #[test]
     fn a_forwarded_edit_goes_only_after_the_ones_its_machine_forwarded_before_it() {
         let (a, b) = (MachineId::random(), MachineId::random());
-        let open = |_: MachineId, link: u64| link != 9;
-        let rows: [(Next, &[Sent], bool); 9] = [
-            (Next::Number, &[], true),
-            (Next::Number, &[Some((a, 1))], false),
-            (Next::Send(a), &[], true),
-            (Next::Send(a), &[Some((a, 1)), Some((a, 2))], true),
-            // An earlier one not sent yet, sent elsewhere, or on a link since closed goes first.
-            (Next::Send(a), &[None], false),
-            (Next::Send(a), &[Some((b, 1))], false),
-            (Next::Send(a), &[Some((a, 9))], false),
-            (Next::Send(a), &[Some((a, 1)), None], false),
-            (Next::Wait, &[None], true),
+        let wait = (Next::Wait, None);
+        let rows: [(Next, &[Sent], Turn); 10] = [
+            (Next::Number, &[], (Next::Number, None)),
+            (Next::Number, &[Some((a, 1))], wait),
+            (Next::Send(a), &[], (Next::Send(a), None)),
+            // On the link the earlier ones went on, whether or not it is still open.
+            (Next::Send(a), &[Some((a, 1))], (Next::Send(a), Some(1))),
+            (
+                Next::Send(a),
+                &[Some((a, 1)), Some((a, 1))],
+                (Next::Send(a), Some(1)),
+            ),
+            // An earlier one not sent yet, sent elsewhere, or on another link goes first.
+            (Next::Send(a), &[None], wait),
+            (Next::Send(a), &[Some((b, 1))], wait),
+            (Next::Send(a), &[Some((a, 1)), Some((a, 2))], wait),
+            (Next::Send(a), &[Some((a, 1)), None], wait),
+            (Next::Wait, &[None], wait),
         ];
         for (next, earlier, want) in rows {
-            assert_eq!(in_turn(next, earlier, open), want, "{next:?} {earlier:?}");
+            assert_eq!(in_turn(next, earlier), want, "{next:?} {earlier:?}");
         }
     }
 
@@ -1960,5 +1988,83 @@ mod tests {
             held.stamps[&StampKey::Setting(SettingKey::Project(project(7, "").id))],
             stamp
         );
+    }
+
+    #[tokio::test]
+    async fn a_refusal_that_arrives_after_this_machine_numbered_the_id_does_not_replace_its_stamp()
+    {
+        let (_dir, coordinator) = alone();
+        let (peer, id) = (MachineId::random(), EditId::random());
+        let stamp = coordinator
+            .edit_from(Some(peer), Instant::now(), id, set_project(7, "p"))
+            .await
+            .unwrap();
+        // A machine this one sent it to before the role moved here refuses it late.
+        coordinator.take_answer(
+            id,
+            Outcome::Refused {
+                reason: "no".into(),
+            },
+        );
+        let again = coordinator
+            .edit_from(Some(peer), Instant::now(), id, set_project(7, "p"))
+            .await;
+        assert_eq!(again.unwrap(), stamp);
+    }
+
+    #[tokio::test]
+    async fn a_refusal_held_for_an_id_whose_stamp_is_in_the_held_copy_is_not_reported() {
+        let (_dir, coordinator) = alone();
+        let (peer, id) = (MachineId::random(), EditId::random());
+        let other = MachineId::random();
+        let stamp = Stamp { seq: 5, by: other };
+        let mut held = coordinator.held().await.unwrap();
+        held.seq = 5;
+        remember(&mut held, id, stamp);
+        lock(&coordinator.store).apply_settings(held).unwrap();
+        let _earlier = coordinator.wait_on(id);
+        coordinator.sent_to(id, other);
+        coordinator.take_answer(
+            id,
+            Outcome::Refused {
+                reason: "no".into(),
+            },
+        );
+        let made = coordinator
+            .edit_from(Some(peer), Instant::now(), id, set_project(7, "p"))
+            .await;
+        assert_eq!(made.unwrap(), stamp);
+    }
+
+    #[tokio::test]
+    async fn an_id_this_machine_numbered_is_answered_with_its_stamp_however_many_numbers_follow() {
+        let (_dir, coordinator) = alone();
+        let (peer, id) = (MachineId::random(), EditId::random());
+        let stamp = coordinator
+            .edit_from(Some(peer), Instant::now(), id, set_project(7, "p"))
+            .await
+            .unwrap();
+        for n in 0..=NUMBERED_KEPT {
+            let id = EditId::random();
+            coordinator
+                .edit_from(
+                    Some(peer),
+                    Instant::now(),
+                    id,
+                    set_project(8, &n.to_string()),
+                )
+                .await
+                .unwrap();
+        }
+        let held = coordinator.held().await.unwrap();
+        assert!(
+            !held.numbered.contains_key(&id),
+            "the shared copy forgot it"
+        );
+        let again = coordinator
+            .edit_from(Some(peer), Instant::now(), id, set_project(7, "p"))
+            .await;
+        assert_eq!(again.unwrap(), stamp);
+        assert_eq!(coordinator.held().await.unwrap().seq, held.seq);
     }
 }
