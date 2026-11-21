@@ -317,7 +317,9 @@ async fn a_peer_speaking_a_newer_protocol_is_sent_this_builds_form() {
 
 #[tokio::test(start_paused = true)]
 async fn a_hello_from_a_machine_not_in_the_list_is_refused() {
-    let fleet = Fleet::start(1);
+    // The list holds another machine, so it is a list to follow: a machine alone in its list
+    // takes a link from any machine whose key it holds.
+    let fleet = Fleet::start_with(1, &[MachineId::random()]);
     let a = &fleet.daemons[0];
     populate(a, Ids::random(), SessionState::Idle);
 
@@ -555,7 +557,8 @@ async fn a_machine_removed_from_the_list_is_dropped_on_every_link() {
     populated(&fleet, SessionState::Idle);
     until(Duration::from_secs(10), "first sync", || fleet.converged()).await;
 
-    let mut settings = settings_for(&[a.id]);
+    // `a` keeps another machine in its list: alone in it, it would take any link its keys admit.
+    let mut settings = settings_for(&[a.id, MachineId::random()]);
     settings.seq = 2;
     a.set_settings(settings);
     tokio::time::sleep(Duration::from_secs(3)).await;
