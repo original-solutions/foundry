@@ -288,6 +288,12 @@ mod tests {
         /// `peer` says hello and sends nothing, so it is heard from, then its link drops: it
         /// acts, and an edit has nowhere to go.
         async fn hear(&self, peer: MachineId) {
+            self.hear_sending(peer, None).await;
+        }
+
+        /// As [`Served::hear`], and `peer` also sends `settings` when there are some, so this
+        /// machine has caught up with it and numbers an edit at once.
+        async fn hear_sending(&self, peer: MachineId, settings: Option<SharedSettings>) {
             let (ours, theirs) = Conn::pair();
             let accepting = tokio::spawn({
                 let peers = self.peers.clone();
@@ -302,7 +308,11 @@ mod tests {
                 protocol: PROTOCOL,
                 records: Vec::new(),
             };
-            for message in [hello, nothing] {
+            let settings = settings.map(|settings| PeerMessage::Settings {
+                protocol: PROTOCOL,
+                settings,
+            });
+            for message in [hello].into_iter().chain(settings).chain([nothing]) {
                 theirs
                     .send
                     .send(serde_json::to_string(&message).unwrap())
@@ -425,6 +435,40 @@ mod tests {
         let before = served.settings();
 
         assert_eq!(served.join(&other, &joining).await.0, 200);
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(served.settings(), before);
+    }
+
+    #[tokio::test]
+    async fn a_code_redeemed_by_a_machine_already_listed_leaves_its_entry_alone() {
+        let joining = Keys::open(Arc::new(MemorySecrets::default())).unwrap();
+        let listed = joining.me();
+        let served = Served::new(move |_, settings| {
+            settings
+                .machines
+                .push(machine(listed, "trilogy-mac", "100.64.0.2"));
+        })
+        .await;
+        // Caught up with it, so this machine numbers an edit at once.
+        served.hear_sending(listed, Some(served.settings())).await;
+        let code = served.code_for("127.0.0.1").await;
+        let before = served.settings();
+
+        served.join(&code, &joining).await;
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(served.settings(), before);
+    }
+
+    #[tokio::test]
+    async fn a_code_redeemed_by_this_machines_own_keys_leaves_its_entry_alone() {
+        let served = Served::new(|_, _| {}).await;
+        let code = served.code_for("127.0.0.1").await;
+        let before = served.settings();
+
+        // Whatever the join route answers, nothing is listed.
+        served.join(&code, &served.keys).await;
 
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(served.settings(), before);
