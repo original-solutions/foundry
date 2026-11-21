@@ -80,6 +80,8 @@ export interface WorkspaceView {
 export interface MachineView {
   id: string;
   name: string;
+  /** Whether the machine list holds it: only a listed machine can be renamed. */
+  listed: boolean;
   status: "online" | "offline" | "unknown";
   sample: MachineSample | null;
   workspaces: WorkspaceView[];
@@ -187,6 +189,7 @@ export function fleet(records: AnyRecord[], settings: SharedSettings, briefs: Br
   return [...listed, ...others].map((id) => ({
     id,
     name: machineNames.get(id) ?? shortId(id),
+    listed: machineNames.has(id),
     status: statusByOwner.get(id) ?? "unknown",
     sample: samplesByOwner.get(id)?.body ?? null,
     workspaces: (workspacesByOwner.get(id) ?? []).map((w) => {

@@ -212,6 +212,28 @@ impl Fixture {
         self
     }
 
+    /// Puts a stand-in for the Tailscale CLI in the daemon's `HOME` that answers as a running
+    /// Tailscale does: `ip` with this machine's address, which no interface carries so nothing
+    /// is bound to it, and `status --self --json` with this machine's names. It notes each
+    /// question, a line each, in `tailscale-asked`.
+    fn with_tailscale_answering(self) -> Self {
+        let cli = self.user.path().join("tailscale");
+        fs::write(
+            &cli,
+            r#"#!/bin/sh
+echo "$*" >> "$(dirname "$0")/tailscale-asked"
+case "$*" in
+ip) echo 100.127.254.253 ;;
+"status --self --json") echo '{"Self": {"HostName": "Personal Mac", "DNSName": "personal-mac.tail459612.ts.net.", "TailscaleIPs": ["100.127.254.253", "fd7a:115c:a1e0::e832:3612"]}}' ;;
+*) exit 9 ;;
+esac
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&cli, fs::Permissions::from_mode(0o755)).unwrap();
+        self
+    }
+
     /// `foundryd args` on this data directory and `port`, with the gateway URL the test set,
     /// else none.
     fn command(&self, port: u16, args: &[&str]) -> Command {
@@ -1154,4 +1176,81 @@ fn the_project_routes_refuse_a_request_from_another_site() {
     let remove = format!("/api/projects/{}/remove", ProjectId::random());
     assert_eq!(ask(&remove, &here, foreign), 403);
     assert_eq!(ask(&remove, "evil.example", None), 403);
+}
+
+/// `GET /api/machines` once it answers 200: which machine is this one, and the list.
+fn machines(fixture: &Fixture) -> (String, Vec<serde_json::Value>) {
+    let (status, body) = fixture.call("GET", "/api/machines", None);
+    assert_eq!(status, 200, "{body}");
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    (
+        json["me"].as_str().unwrap().to_owned(),
+        json["machines"].as_array().unwrap().clone(),
+    )
+}
+
+#[test]
+fn a_daemon_lists_itself_under_its_tailscale_name_once_tailscale_answers_and_can_be_renamed() {
+    let mut fixture = Fixture::new().with_tailscale_answering();
+    fixture.start();
+
+    // Its first look, when Tailscale first answers, waits for peers' copies: nothing is sent.
+    let asked = fixture.user.path().join("tailscale-asked");
+    wait_for("the daemon to ask what Tailscale calls it", || {
+        fs::read_to_string(&asked)
+            .ok()?
+            .contains("status --self --json")
+            .then_some(())
+    });
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(machines(&fixture).1, Vec::<serde_json::Value>::new());
+
+    let me = wait_for("this machine in the machine list", || {
+        let (me, machines) = machines(&fixture);
+        machines
+            .iter()
+            .any(|m| m["id"] == me.as_str() && m["name"] == "personal-mac")
+            .then_some(me)
+    });
+    assert_eq!(machines(&fixture).1.len(), 1);
+
+    let (status, body) = fixture.call(
+        "POST",
+        &format!("/api/machines/{me}/rename"),
+        Some(serde_json::json!({"name": " Tom's desk "})),
+    );
+    assert_eq!(status, 204, "{body}");
+    let (_, listed) = machines(&fixture);
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0]["name"], "Tom's desk");
+    assert_eq!(fixture.stop(), Some(0));
+}
+
+#[test]
+fn the_rename_route_refuses_a_request_from_another_site() {
+    use std::io::{Read as _, Write as _};
+    let mut fixture = Fixture::new();
+    fixture.start();
+    // A refused request is answered before its body is read, and a close with the body unread
+    // can reset the link before the answer is read, so only the request served sends one.
+    let ask = |path: &str, host: &str, origin: Option<&str>, body: &str| {
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", fixture.port)).unwrap();
+        let origin = origin.map_or_else(String::new, |o| format!("Origin: {o}\r\n"));
+        write!(
+            stream,
+            "POST {path} HTTP/1.1\r\nHost: {host}\r\n{origin}Connection: close\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        response.split(' ').nth(1).unwrap().parse::<u16>().unwrap()
+    };
+    let here = format!("127.0.0.1:{}", fixture.port);
+    let rename = format!("/api/machines/{}/rename", MachineId::random());
+    // Served here: a machine the list does not hold is refused by the route itself.
+    assert_eq!(ask(&rename, &here, None, r#"{"name": "desk"}"#), 404);
+    assert_eq!(ask(&rename, &here, Some("http://evil.example"), ""), 403);
+    assert_eq!(ask(&rename, "evil.example", None, ""), 403);
 }

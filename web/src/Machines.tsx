@@ -1,7 +1,10 @@
+import { useMutation } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
-import { useId } from "react";
+import { useState, type ReactNode } from "react";
+import { post, refused } from "./api";
 import { byUrgency, rows, type MachineView } from "./fleet";
 import { plural, urgency, type Glyph } from "./labels";
+import { fieldLook } from "./Modal";
 import { heardAgo, scaled, span, spanWords, type History, type Point } from "./samples";
 import { glyphFill, glyphText, StateGlyph } from "./StateGlyph";
 import { useNow } from "./StepsPanel";
@@ -61,7 +64,6 @@ export function Machines({ machines, history, here, connected }: Props) {
 }
 
 function MachineCard({ machine, points, heard, here, now }: { machine: MachineView; points: Point[]; heard?: number; here: boolean; now: number }) {
-  const id = useId();
   const { sample, status } = machine;
   const away = status === "offline";
   const all = machine.workspaces.flatMap(rows);
@@ -73,14 +75,29 @@ function MachineCard({ machine, points, heard, here, now }: { machine: MachineVi
   const covers = span(points, end);
   return (
     <article
-      aria-labelledby={id}
+      aria-label={machine.name}
       className={`relative flex flex-col overflow-hidden rounded-xl border bg-neutral-900/60 ${away ? "border-red-400/30" : here ? "border-neutral-700" : "border-neutral-800"}`}
     >
       <header className="flex flex-wrap items-center gap-x-2 gap-y-1 px-4 pt-3.5">
         <span aria-hidden="true" className={`size-2 shrink-0 rounded-full ${statusDot[status]}`} />
-        <h3 id={id} className="min-w-0 truncate text-[15px] font-semibold text-neutral-100" title={machine.id}>
-          {machine.name}
-        </h3>
+        <MachineName machine={machine} className="text-[15px] font-semibold">
+          {(rename) => (
+            <h3 className="min-w-0 truncate text-[15px] font-semibold text-neutral-100" title={rename ? undefined : machine.id}>
+              {rename ? (
+                <button
+                  type="button"
+                  onClick={rename}
+                  title={`${machine.id}: click to rename`}
+                  className="max-w-full truncate rounded text-left hover:underline hover:decoration-neutral-600 hover:underline-offset-4"
+                >
+                  {machine.name}
+                </button>
+              ) : (
+                machine.name
+              )}
+            </h3>
+          )}
+        </MachineName>
         {here && <span className="rounded-full bg-neutral-800 px-2 py-px text-[11px] font-medium text-neutral-300">This machine</span>}
         <span className="ml-auto flex items-baseline gap-1.5 text-xs">
           <span className={statusText[status]}>{status}</span>
@@ -186,6 +203,76 @@ function MachineCard({ machine, points, heard, here, now }: { machine: MachineVi
         {machine.workspaces.length === 0 && <li className="px-2 py-1.5 text-xs text-neutral-500">No workspaces on this machine</li>}
       </ul>
     </article>
+  );
+}
+
+/** Renames machine `id` through the daemon, which sends the name to the acting coordinator. */
+async function renameMachine({ id, name }: { id: string; name: string }): Promise<void> {
+  const { status, json } = await post(`/api/machines/${id}/rename`, { name });
+  if (status !== 204) throw refused(status, json);
+}
+
+/**
+ * A machine's name, renamed in place. `children` draws the name and is given what opens the
+ * field, which starts on the name with all of it selected, or nothing for a machine the machine
+ * list does not hold yet, which the daemon cannot rename. Enter sends the name, trimmed, and
+ * closes the field once the daemon takes it; the new name shows once it arrives in the settings,
+ * on every machine. The name it already has sends nothing. Escape closes it and sends nothing.
+ * While the name is on its way the field is busy and takes no edits. A refusal shows under the
+ * field and keeps the text. `className` sizes the field's text to the
+ * name it stands in for.
+ */
+export function MachineName({
+  machine,
+  className,
+  children,
+}: {
+  machine: { id: string; name: string; listed: boolean };
+  className: string;
+  children: (rename: (() => void) | undefined) => ReactNode;
+}) {
+  const [text, setText] = useState<string | null>(null);
+  const rename = useMutation({ mutationFn: renameMachine, onSuccess: () => setText(null) });
+  const close = () => {
+    setText(null);
+    rename.reset();
+  };
+  if (text === null) return <>{children(machine.listed ? () => setText(machine.name) : undefined)}</>;
+  const save = () => {
+    const name = text.trim();
+    if (name === machine.name) return close();
+    if (!rename.isPending) rename.mutate({ id: machine.id, name });
+  };
+  return (
+    <div className="min-w-0 flex-1">
+      <input
+        aria-label="Machine name"
+        autoFocus
+        autoComplete="off"
+        spellCheck={false}
+        value={text}
+        readOnly={rename.isPending}
+        aria-busy={rename.isPending || undefined}
+        onFocus={(e) => e.currentTarget.select()}
+        onChange={(e) => setText(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            save();
+          } else if (e.key === "Escape") {
+            e.preventDefault();
+            e.stopPropagation();
+            close();
+          }
+        }}
+        className={`w-full rounded px-1 py-px aria-busy:opacity-60 ${fieldLook} ${className}`}
+      />
+      {rename.isError && (
+        <p role="alert" className="mt-1 text-xs font-normal text-red-400">
+          {rename.error.message}
+        </p>
+      )}
+    </div>
   );
 }
 

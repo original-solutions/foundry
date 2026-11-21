@@ -11,6 +11,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -296,10 +297,13 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
         .layer(middleware::from_fn_with_state(api.clone(), api::same_site));
     let project_routes = api::projects::router(coordinator.clone(), store.clone())
         .layer(middleware::from_fn_with_state(api.clone(), api::same_site));
+    let machine_name_routes = api::machine_names::router(coordinator.clone(), store.clone())
+        .layer(middleware::from_fn_with_state(api.clone(), api::same_site));
     let app = api::router(api)
         .merge(sessions.router())
         .merge(attention_routes)
         .merge(project_routes)
+        .merge(machine_name_routes)
         .merge(ws::keyed_router(peers.clone(), keys.clone()));
 
     let mut terminate =
@@ -309,6 +313,9 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
     let listener = api::bind(local).await?;
     tracing::info!("listening on {local}");
     let mut tailscale = Tailscale::new(port, app.clone());
+    let listing = tailscale.listing(me, coordinator.clone(), store.clone());
+    // Taken before the first scan, so the listing hears its answer.
+    let answered = tailscale.answered.subscribe();
     tailscale.scan(true, tailscale_ips().await).await;
     let mut services: JoinSet<&'static str> = JoinSet::new();
     // services
@@ -322,6 +329,10 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
     }));
     services.spawn(named("the API server", serve_on(listener, app.clone())));
     services.spawn(named("the Tailscale address watch", tailscale.watch()));
+    services.spawn(named(
+        "the machine list entry",
+        list_this_machine(answered, listing),
+    ));
     services.spawn(named("updates", update::run(home.clone())));
     services.spawn(named("gateway health", gateway_reader.run()));
     services.spawn(named("placement", placement::run(placing.clone())));
@@ -550,8 +561,29 @@ async fn tailscale_ips() -> Result<BTreeSet<IpAddr>, String> {
 /// Runs `<cli> ip`, which prints one of this machine's Tailscale addresses a line, and reads
 /// them. A CLI that fails, is missing, prints anything else or runs past `within` gives why.
 async fn ask_cli(cli: &Path, within: Duration) -> Result<BTreeSet<IpAddr>, String> {
+    String::from_utf8_lossy(&run_cli(cli, &["ip"], within).await?)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            line.parse()
+                .map_err(|_| format!("`{} ip` printed {line:?}, not an address", cli.display()))
+        })
+        .collect()
+}
+
+/// Runs `<cli> status --self --json`, which says what Tailscale calls this machine and its
+/// addresses, and gives what it printed, or why it cannot, as [`run_cli`] does.
+async fn ask_status(cli: &Path, within: Duration) -> Result<Vec<u8>, String> {
+    run_cli(cli, &["status", "--self", "--json"], within).await
+}
+
+/// Runs `<cli> <args>` and gives what it printed. A CLI that fails, is missing or runs past
+/// `within` gives why.
+async fn run_cli(cli: &Path, args: &[&str], within: Duration) -> Result<Vec<u8>, String> {
+    let asked = format!("{} {}", cli.display(), args.join(" "));
     let run = tokio::process::Command::new(cli)
-        .arg("ip")
+        .args(args)
         // The CLI inside Tailscale.app answers only when `TERM` is set; without it, as under
         // launchd, it tries to start the app's GUI and fails.
         .env("TERM", "dumb")
@@ -563,29 +595,88 @@ async fn ask_cli(cli: &Path, within: Duration) -> Result<BTreeSet<IpAddr>, Strin
         Ok(Err(error)) => return Err(format!("{} could not be run: {error}", cli.display())),
         Err(_) => {
             return Err(format!(
-                "`{} ip` did not answer within {} s",
-                cli.display(),
+                "`{asked}` did not answer within {} s",
                 within.as_secs_f32()
             ));
         }
     };
     if !out.status.success() {
         return Err(format!(
-            "`{} ip` failed ({}): {}",
-            cli.display(),
+            "`{asked}` failed ({}): {}",
             out.status,
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(|line| {
-            line.parse()
-                .map_err(|_| format!("`{} ip` printed {line:?}, not an address", cli.display()))
-        })
-        .collect()
+    Ok(out.stdout)
+}
+
+/// Keeps this machine in the shared machine list: each time the address watch hears from
+/// Tailscale (`answered`, with the addresses `ip` gave), hands what Tailscale calls this machine
+/// to `listing`, which also reads the watch's mark that Tailscale was away. It runs apart from
+/// the watch, so an edit waiting on the coordinator never holds up binding an address.
+///
+/// `tailscale status` is asked only when [`Told`] has no answer for what `ip` said. Each look
+/// still reads this machine's copy of the settings: that is what moves back an address another
+/// machine's edit put back.
+async fn list_this_machine(
+    mut answered: tokio::sync::watch::Receiver<BTreeSet<IpAddr>>,
+    mut listing: api::machine_names::Listing,
+) {
+    let mut told = Told::default();
+    while answered.changed().await.is_ok() {
+        let ips = answered.borrow_and_update().clone();
+        let entry = told
+            .entry(&ips, || async {
+                ask_status(&tailscale_cli(), ASK_WITHIN)
+                    .await
+                    .and_then(|status| {
+                        api::machine_names::entry(&status, host_names().first().map(String::as_str))
+                    })
+            })
+            .await;
+        listing.list(entry).await;
+    }
+}
+
+/// What `tailscale status` last said this machine is, and the addresses `ip` gave just before,
+/// so an unchanged `ip` answer is not followed by another `status` process every rescan.
+#[derive(Default)]
+struct Told {
+    ips: BTreeSet<IpAddr>,
+    entry: Option<api::machine_names::Entry>,
+}
+
+impl Told {
+    /// The entry for `ips`, `ip`'s answer: the one kept for the same answer, else what `ask`
+    /// gives. An entry is kept only when `ip` gave its address too, so a `status` read while the
+    /// address moved, or one that failed, is asked again on the next answer.
+    async fn entry<F>(
+        &mut self,
+        ips: &BTreeSet<IpAddr>,
+        ask: impl FnOnce() -> F,
+    ) -> Result<api::machine_names::Entry, String>
+    where
+        F: Future<Output = Result<api::machine_names::Entry, String>>,
+    {
+        if let Some(entry) = &self.entry
+            && self.ips == *ips
+        {
+            return Ok(entry.clone());
+        }
+        let asked = ask().await;
+        self.ips = ips.clone();
+        self.entry = asked
+            .as_ref()
+            .ok()
+            .filter(|entry| {
+                entry
+                    .address
+                    .parse()
+                    .is_ok_and(|address: IpAddr| ips.contains(&address))
+            })
+            .cloned();
+        asked
+    }
 }
 
 /// How often Tailscale is asked again for an address that has come up.
@@ -605,6 +696,13 @@ struct Tailscale {
     /// answers again.
     unanswered: bool,
     servers: JoinSet<SocketAddr>,
+    /// Given `ip`'s answer each time Tailscale answers, so the machine list entry is kept up
+    /// to date.
+    answered: tokio::sync::watch::Sender<BTreeSet<IpAddr>>,
+    /// Set when an ask of Tailscale fails, until the machine list entry's [`Listing`] reads it.
+    ///
+    /// [`Listing`]: api::machine_names::Listing
+    away: Arc<AtomicBool>,
 }
 
 impl Tailscale {
@@ -616,7 +714,27 @@ impl Tailscale {
             failed: BTreeSet::new(),
             unanswered: false,
             servers: JoinSet::new(),
+            answered: tokio::sync::watch::Sender::new(BTreeSet::new()),
+            away: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// The machine list entry this watch keeps up to date. It gives peers' copies
+    /// [`OFFLINE_AFTER`](crate::sync::OFFLINE_AFTER) to arrive, and reads the mark this watch
+    /// sets when Tailscale fails, so it waits again after Tailscale was away.
+    fn listing(
+        &self,
+        me: foundry_proto::ids::MachineId,
+        coordinator: Arc<crate::coordinator::Coordinator>,
+        store: Arc<Mutex<Store>>,
+    ) -> api::machine_names::Listing {
+        api::machine_names::Listing::new(
+            me,
+            coordinator,
+            store,
+            crate::sync::OFFLINE_AFTER,
+            self.away.clone(),
+        )
     }
 
     /// Binds each address in Tailscale's answer, `reported`, not served yet, and stops the
@@ -633,6 +751,7 @@ impl Tailscale {
         let reported = match reported {
             Ok(reported) => {
                 self.unanswered = false;
+                self.answered.send_replace(reported.clone());
                 reported
             }
             Err(why) => {
@@ -642,6 +761,7 @@ impl Tailscale {
                     );
                 }
                 self.unanswered = true;
+                self.away.store(true, Ordering::Relaxed);
                 BTreeSet::new()
             }
         };
@@ -1115,6 +1235,154 @@ mod tests {
         assert!(
             warnings[0].contains("Tailscale is stopped."),
             "{warnings:?}"
+        );
+    }
+
+    /// The listing restarts its wait after Tailscale was away: the watch says so until it is
+    /// read, however many answers come before.
+    #[tokio::test]
+    async fn an_ask_that_fails_marks_tailscale_away_until_the_mark_is_read() {
+        // Captured as the warning tests capture it: a test that hits this warning with no
+        // subscriber can register its call site as off while another test is counting it.
+        let _capture = Logged::default().capture();
+        let mut tailscale = Tailscale::new(7433, Router::new());
+        assert!(!tailscale.away.load(Ordering::Relaxed));
+
+        tailscale.scan(false, Err("logged out".to_owned())).await;
+        tailscale.scan(false, Ok(BTreeSet::new())).await;
+
+        assert!(tailscale.away.swap(false, Ordering::Relaxed));
+        tailscale.scan(false, Ok(BTreeSet::new())).await;
+        assert!(!tailscale.away.load(Ordering::Relaxed));
+    }
+
+    /// The listing the watch hands out reads the watch's own away mark: an edit found before
+    /// an ask fails waits its whole settle time again once Tailscale answers.
+    #[tokio::test(start_paused = true)]
+    async fn the_listing_waits_again_after_its_watch_found_tailscale_away() {
+        use api::machine_names::Entry;
+
+        // Captured as the warning tests capture it: a test that hits this warning with no
+        // subscriber can register its call site as off while another test is counting it.
+        let _capture = Logged::default().capture();
+        let data = tempfile::tempdir().unwrap();
+        let me = foundry_proto::ids::MachineId::random();
+        let store = Arc::new(Mutex::new(
+            Store::open(data.path().join("foundry.db")).unwrap(),
+        ));
+        let peers = Peers::new(me, store.clone(), Arc::new(WsDialer { port: 9 }));
+        let coordinator = Arc::new(crate::coordinator::Coordinator::new(
+            me,
+            store.clone(),
+            peers.clone(),
+        ));
+        peers.coordinate(coordinator.clone());
+        let mut tailscale = Tailscale::new(7433, Router::new());
+        let mut listing = tailscale.listing(me, coordinator, store.clone());
+        let here = || {
+            Ok(Entry {
+                name: "personal-mac".into(),
+                address: "100.91.54.18".into(),
+            })
+        };
+        let listed = || {
+            store
+                .lock()
+                .unwrap()
+                .settings()
+                .unwrap()
+                .machines
+                .iter()
+                .any(|m| m.id == me)
+        };
+        listing.list(here()).await;
+
+        tokio::time::sleep(crate::sync::OFFLINE_AFTER).await;
+        tailscale.scan(false, Err("logged out".to_owned())).await;
+        listing.list(here()).await;
+        assert!(!listed(), "the look after Tailscale was away sends nothing");
+
+        tokio::time::sleep(crate::sync::OFFLINE_AFTER).await;
+        listing.list(here()).await;
+        assert!(listed());
+    }
+
+    /// Each answer, the same as the last or not, is handed to the listing with its addresses;
+    /// an ask that fails is not.
+    #[tokio::test]
+    async fn each_answer_is_handed_on_with_its_addresses_and_a_failure_is_not() {
+        let _capture = Logged::default().capture();
+        let mut tailscale = Tailscale::new(7433, Router::new());
+        let mut answered = tailscale.answered.subscribe();
+        // Addresses no interface here carries, so nothing is bound.
+        let ips = BTreeSet::from([ip("100.127.254.253")]);
+
+        for _ in 0..2 {
+            tailscale.scan(false, Ok(ips.clone())).await;
+            assert!(answered.has_changed().unwrap());
+            assert_eq!(*answered.borrow_and_update(), ips);
+        }
+        tailscale.scan(false, Err("logged out".to_owned())).await;
+        assert!(!answered.has_changed().unwrap());
+    }
+
+    /// `tailscale status` is asked again only when `ip`'s answer changed, the last ask gave no
+    /// entry, or the entry's address is not among the addresses `ip` gave.
+    #[tokio::test]
+    async fn tailscale_status_is_asked_again_only_when_what_ip_said_changed() {
+        use api::machine_names::Entry;
+        use std::sync::atomic::AtomicUsize;
+
+        let asks = AtomicUsize::new(0);
+        let at = |address: &str| {
+            let address = address.to_owned();
+            let asks = &asks;
+            move || {
+                asks.fetch_add(1, Ordering::Relaxed);
+                async move {
+                    Ok(Entry {
+                        name: "personal-mac".into(),
+                        address,
+                    })
+                }
+            }
+        };
+        let failing = || {
+            asks.fetch_add(1, Ordering::Relaxed);
+            async { Err("status failed".to_owned()) }
+        };
+        let ips = |text: &str| BTreeSet::from([ip(text)]);
+        let mut told = Told::default();
+
+        let first = told.entry(&ips("100.91.54.18"), at("100.91.54.18")).await;
+        let again = told.entry(&ips("100.91.54.18"), at("100.91.54.18")).await;
+        assert_eq!(again, first);
+        assert_eq!(asks.load(Ordering::Relaxed), 1, "the same answer asks once");
+
+        let moved = told.entry(&ips("100.91.54.19"), at("100.91.54.19")).await;
+        assert_eq!(moved.map(|e| e.address), Ok("100.91.54.19".to_owned()));
+        assert_eq!(asks.load(Ordering::Relaxed), 2, "a new answer asks again");
+
+        assert!(told.entry(&ips("100.91.54.20"), failing).await.is_err());
+        told.entry(&ips("100.91.54.20"), at("100.91.54.20"))
+            .await
+            .unwrap();
+        assert_eq!(
+            asks.load(Ordering::Relaxed),
+            4,
+            "a failed ask is asked again"
+        );
+
+        // `status` read before the move: its address is not one `ip` gave, so it is not kept.
+        told.entry(&ips("100.91.54.21"), at("100.91.54.20"))
+            .await
+            .unwrap();
+        let read = told.entry(&ips("100.91.54.21"), at("100.91.54.21")).await;
+        assert_eq!(read.map(|e| e.address), Ok("100.91.54.21".to_owned()));
+        assert_eq!(
+            asks.load(Ordering::Relaxed),
+            6,
+            "a status ip disagrees with is asked again"
         );
     }
 
