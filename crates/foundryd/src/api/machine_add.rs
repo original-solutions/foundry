@@ -13,6 +13,7 @@
 //! name at that address through the acting coordinator, as every machine list change is. An
 //! edit that fails is warned, and the join stands. A code made anywhere else lists nothing.
 
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -91,7 +92,18 @@ async fn add(
             "this machine is not in its machine list yet; try again in a minute".to_owned(),
         ));
     };
-    let address = resolve(&name).await?;
+    let addresses = resolve(&name).await?;
+    if let Some(other) = settings
+        .machines
+        .iter()
+        .find(|m| addresses.iter().any(|ip| has_address(&m.address, *ip)))
+    {
+        return Err(ApiError::Rejected(
+            StatusCode::CONFLICT,
+            format!("{name:?} is already in the fleet as {:?}", other.name),
+        ));
+    }
+    let address = addresses[0].to_string();
     let (code, used) = adding
         .keys
         .new_watched_code()
@@ -111,15 +123,23 @@ async fn add(
     Ok((StatusCode::CREATED, axum::Json(answer)).into_response())
 }
 
-/// The first Tailscale address `name` resolves to, as `foundryd join` would send a code to it.
+/// Whether a listed `address` is `ip`: compared as an IP when it parses as one, else as text.
+fn has_address(address: &str, ip: IpAddr) -> bool {
+    let address = address.trim();
+    address
+        .parse::<IpAddr>()
+        .map_or_else(|_| address == ip.to_string(), |listed| listed == ip)
+}
+
+/// Every Tailscale address `name` resolves to, first the one `foundryd join` sends a code to.
 /// Resolving it can wait on DNS, so it runs on the blocking pool.
-async fn resolve(name: &str) -> Result<String, ApiError> {
+async fn resolve(name: &str) -> Result<Vec<IpAddr>, ApiError> {
     let lookup = name.to_owned();
     let resolved = tokio::task::spawn_blocking(move || join_targets(&lookup, DEFAULT_PORT))
         .await
         .map_err(|e| ApiError::Rejected(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     match resolved {
-        Ok(targets) => Ok(targets[0].ip().to_string()),
+        Ok(targets) => Ok(targets.iter().map(|target| target.ip()).collect()),
         Err(JoinError::NotTailscale(_)) => Err(unprocessable(format!(
             "{name:?} is not on Tailscale: it resolves to no Tailscale address"
         ))),
@@ -144,8 +164,17 @@ async fn list_when_used(
     let Ok(Ok(id)) = tokio::time::timeout(wait, used).await else {
         return;
     };
-    let held = on_store(&store, |store| store.settings()).await;
-    if held.is_ok_and(|held| held.machines.iter().any(|m| m.id == id)) {
+    let held = match on_store(&store, |store| store.settings()).await {
+        Ok(held) => held,
+        Err(error) => {
+            tracing::warn!(
+                "machine {id} used a code to join, but the machine list could not be read, so it \
+                 is not listed: {error}"
+            );
+            return;
+        }
+    };
+    if held.machines.iter().any(|m| m.id == id) {
         tracing::warn!(
             "machine {id} used a code to join but is already in the machine list; its entry is left as it is"
         );
