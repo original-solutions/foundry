@@ -539,13 +539,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_blank_or_long_name_is_422_and_issues_no_code() {
+    async fn a_blank_name_and_a_long_one_are_each_422_with_their_own_message() {
         let served = Served::new(|_, _| {}).await;
-        for name in ["", "   ", &"a".repeat(61)] {
+        for name in ["", "   "] {
             let (status, body) = served.add(name).await;
             assert_eq!(status, 422, "{name:?}: {body}");
-            assert!(!error_of(&body).is_empty(), "{body}");
+            assert_eq!(error_of(&body), "type the new machine's Tailscale name");
         }
+        let (status, body) = served.add(&"a".repeat(61)).await;
+        assert_eq!(status, 422, "{body}");
+        assert!(error_of(&body).contains("at most 60 characters"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_name_of_exactly_sixty_characters_passes_the_length_check() {
+        let served = Served::new(|_, _| {}).await;
+
+        // As the 422 test below does, a name under `.invalid`, which nothing resolves.
+        let name = format!("{}.invalid", "a".repeat(52));
+        assert_eq!(name.chars().count(), 60);
+
+        let (status, body) = served.add(&name).await;
+
+        // It goes on to resolution, which refuses it for the name, not its length.
+        assert_eq!(status, 422, "{body}");
+        let error = error_of(&body);
+        assert!(!error.contains("at most"), "{error}");
+        assert!(error.contains(&name), "{error}");
     }
 
     #[tokio::test]
