@@ -299,11 +299,13 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
         .layer(middleware::from_fn_with_state(api.clone(), api::same_site));
     let machine_name_routes = api::machine_names::router(coordinator.clone(), store.clone())
         .layer(middleware::from_fn_with_state(api.clone(), api::same_site));
+    let away = Arc::new(AtomicBool::new(false));
     let listing = api::machine_names::Listing::new(
         me,
         coordinator.clone(),
         store.clone(),
         crate::sync::OFFLINE_AFTER,
+        away.clone(),
     );
     let app = api::router(api)
         .merge(sessions.router())
@@ -319,8 +321,10 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
     let listener = api::bind(local).await?;
     tracing::info!("listening on {local}");
     let mut tailscale = Tailscale::new(port, app.clone());
+    // The listing reads the mark this watch sets when Tailscale fails.
+    tailscale.away = away;
     tailscale.scan(true, tailscale_ips().await).await;
-    let (answered, away) = (tailscale.answered.clone(), tailscale.away.clone());
+    let answered = tailscale.answered.clone();
     let mut services: JoinSet<&'static str> = JoinSet::new();
     // services
     services.spawn(named(
@@ -335,7 +339,7 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
     services.spawn(named("the Tailscale address watch", tailscale.watch()));
     services.spawn(named(
         "the machine list entry",
-        list_this_machine(answered, away, listing),
+        list_this_machine(answered, listing),
     ));
     services.spawn(named("updates", update::run(home.clone())));
     services.spawn(named("gateway health", gateway_reader.run()));
@@ -616,18 +620,14 @@ async fn run_cli(cli: &Path, args: &[&str], within: Duration) -> Result<Vec<u8>,
 
 /// Keeps this machine in the shared machine list: each time the address watch hears from
 /// Tailscale (`answered`), reads what Tailscale calls this machine and hands it to `listing`,
-/// first telling it when Tailscale was away since the last look (`away`). It runs apart from
-/// the watch, so an edit waiting on the coordinator never holds up binding an address.
+/// which also reads the watch's mark that Tailscale was away. It runs apart from the watch, so
+/// an edit waiting on the coordinator never holds up binding an address.
 async fn list_this_machine(
     answered: Arc<tokio::sync::Notify>,
-    away: Arc<AtomicBool>,
     mut listing: api::machine_names::Listing,
 ) {
     loop {
         answered.notified().await;
-        if away.swap(false, Ordering::Relaxed) {
-            listing.away();
-        }
         let entry = ask_status(&tailscale_cli(), ASK_WITHIN)
             .await
             .and_then(|status| {
@@ -656,7 +656,9 @@ struct Tailscale {
     servers: JoinSet<SocketAddr>,
     /// Told each time Tailscale answers, so the machine list entry is kept up to date.
     answered: Arc<tokio::sync::Notify>,
-    /// Set when an ask of Tailscale fails, until the machine list entry's keeper reads it.
+    /// Set when an ask of Tailscale fails, until the machine list entry's [`Listing`] reads it.
+    ///
+    /// [`Listing`]: api::machine_names::Listing
     away: Arc<AtomicBool>,
 }
 

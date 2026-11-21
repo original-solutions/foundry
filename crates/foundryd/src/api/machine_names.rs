@@ -25,6 +25,7 @@
 //! has, or one over [`NAME_AT_MOST`] characters, is listed as it is, and a rename sets it right.
 
 use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -105,16 +106,20 @@ pub struct Listing {
     settle: Duration,
     /// Since when the looks have found an edit to send; `None` while there is none.
     found: Option<Instant>,
+    /// Set by the address watch when an ask of Tailscale fails, read and cleared by a look.
+    away: Arc<AtomicBool>,
 }
 
 impl Listing {
     /// A listing that gives peers' copies `settle` to arrive: the daemon passes
     /// [`OFFLINE_AFTER`](crate::sync::OFFLINE_AFTER), the time a peer has to be heard from.
+    /// `away` is the address watch's mark that Tailscale was away.
     pub fn new(
         me: MachineId,
         coordinator: Arc<Coordinator>,
         store: Arc<Mutex<Store>>,
         settle: Duration,
+        away: Arc<AtomicBool>,
     ) -> Self {
         Self {
             me,
@@ -123,6 +128,7 @@ impl Listing {
             warned: false,
             settle,
             found: None,
+            away,
         }
     }
 
@@ -133,8 +139,12 @@ impl Listing {
     /// The look that first finds an edit to send sends nothing: one at least the settle time
     /// later that still finds it sends it, so peers' copies can arrive first. A look that finds
     /// nothing to send, or sends, ends the wait; a failed send does not, so the next look tries
-    /// again. [`Listing::away`] starts the wait over.
+    /// again. A look after the `away` mark was set starts the wait over: no peer could link
+    /// while Tailscale was away, so an edit found before waits again.
     pub async fn list(&mut self, entry: Result<Entry, String>) {
+        if self.away.swap(false, Ordering::Relaxed) {
+            self.found = None;
+        }
         match self.look(entry).await {
             Ok(()) => self.warned = false,
             Err(why) => {
@@ -146,12 +156,6 @@ impl Listing {
                 self.warned = true;
             }
         }
-    }
-
-    /// Tailscale was away, so no peer could link: an edit found before waits again from the
-    /// next look that finds it.
-    pub fn away(&mut self) {
-        self.found = None;
     }
 
     async fn look(&mut self, entry: Result<Entry, String>) -> Result<(), String> {
@@ -265,8 +269,6 @@ mod tests {
     use futures::future::BoxFuture;
     use serde_json::{Value, json};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-
-    use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
     use crate::sync::{Conn, Dialer, Peers};
