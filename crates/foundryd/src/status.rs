@@ -44,17 +44,27 @@ pub fn status() -> ExitCode {
 }
 
 /// `GET /api/state` from the daemon on loopback at `port`.
-pub(crate) fn fetch(port: u16) -> Result<UiMessage, String> {
-    let url = format!("http://127.0.0.1:{port}/api/state");
+fn fetch(port: u16) -> Result<UiMessage, String> {
+    let (url, mut response) = get(port, "/api/state")?;
+    response
+        .body_mut()
+        .read_json()
+        .map_err(|error| format!("the answer from {url} is not the state: {error}"))
+}
+
+/// `GET path` from the daemon on loopback at `port`, with the URL asked. An answer other than
+/// `2xx`, and no daemon on the port, are errors that say so.
+pub(crate) fn get(
+    port: u16,
+    path: &str,
+) -> Result<(String, ureq::http::Response<ureq::Body>), String> {
+    let url = format!("http://127.0.0.1:{port}{path}");
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(ANSWER_WITHIN))
         .build()
         .into();
     match agent.get(&url).call() {
-        Ok(mut response) => response
-            .body_mut()
-            .read_json()
-            .map_err(|error| format!("the answer from {url} is not the state: {error}")),
+        Ok(response) => Ok((url, response)),
         Err(ureq::Error::StatusCode(status)) => Err(format!("{url} answered {status}")),
         Err(ureq::Error::Io(error)) if error.kind() == io::ErrorKind::ConnectionRefused => {
             Err(format!("no daemon is running on 127.0.0.1:{port}"))

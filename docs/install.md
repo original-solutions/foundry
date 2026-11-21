@@ -64,7 +64,9 @@ The daemon serves the UI at its own address, `http://127.0.0.1:7433/` (or `FOUND
 foundryd dashboard
 ```
 
-It prints the address and exits 1 when no daemon is running there. Run it from `<home>/current/`, or link `<home>/current/foundryd` into a folder on your `PATH`.
+It prints the address, then opens it with `open` on macOS or `xdg-open` on Linux. It reads `FOUNDRY_PORT` from the shell you run it in, so give it the value you gave `install`. Run it from `<home>/current/`, or link `<home>/current/foundryd` into a folder on your `PATH`.
+
+It exits 1 when no daemon is running there, and when it cannot open a browser. A Linux server with no desktop is the second case: `127.0.0.1` there is the server itself, so open the UI from your own machine at the server's Tailscale address instead: `http://<tailscale address>:7433/`, or the `FOUNDRY_PORT` you gave `install`.
 
 ## Linux
 

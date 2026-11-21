@@ -1,4 +1,6 @@
-//! `foundryd dashboard`: opens the local daemon's web UI in the default browser.
+//! `foundryd dashboard`: opens the local daemon's web UI in the default browser. The port is
+//! `FOUNDRY_PORT` from the shell it runs in, as for the daemon. On a machine with no desktop
+//! there is no browser to open: it prints the address and exits 1.
 
 use std::process::{Command, ExitCode};
 
@@ -18,7 +20,9 @@ pub fn dashboard() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if let Err(error) = crate::status::fetch(port) {
+    // `/api/machine` is the smallest answer the daemon gives, and its shape is the same on
+    // every version, so a CLI older or newer than the running daemon still finds it.
+    if let Err(error) = crate::status::get(port, "/api/machine") {
         eprintln!("foundryd dashboard: {error}");
         return ExitCode::FAILURE;
     }
