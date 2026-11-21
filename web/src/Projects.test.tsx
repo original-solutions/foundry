@@ -49,6 +49,8 @@ describe("Projects", () => {
     expect(addButton().disabled).toBe(true);
     fireEvent.change(repoField(), { target: { value: "git@github.com:o/api.git" } });
     expect(addButton().disabled).toBe(false);
+    fireEvent.change(nameField(), { target: { value: "   " } });
+    expect(addButton().disabled).toBe(true);
   });
 
   it("posts the name and repo, then clears the form and hands over the new project's id on 201", async () => {

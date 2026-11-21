@@ -82,7 +82,26 @@ describe("Composer projects", () => {
     fireEvent.change(within(dialog).getByLabelText("Repo URL"), { target: { value: "/srv/api.git" } });
     fireEvent.submit(within(dialog).getByLabelText("Name"));
 
-    await waitFor(() => expect(calls).toHaveLength(1));
-    expect(calls[0].url).toBe("/api/projects");
+    await waitFor(() => expect((within(dialog).getByLabelText("Name") as HTMLInputElement).value).toBe(""));
+    // A workspace create would have been sent by now: it starts from the same submit.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(calls.map((c) => c.url)).toEqual(["/api/projects"]);
+    expect(screen.queryByText(/^Making /)).toBeNull();
+  });
+
+  it("keeps the bar's options row open while the Projects dialog is up", async () => {
+    function Bar() {
+      const launch = useCreateWorkspace();
+      return <Composer mode="bar" id="bar" projects={[demo]} workspaces={[]} launch={launch} onCreated={() => {}} doneLabel="Clear" />;
+    }
+    await renderApp(<Bar />);
+    fireEvent.focus(document.getElementById("bar") as HTMLTextAreaElement);
+    fireEvent.click(screen.getByRole("button", { name: "Projects" }));
+    const dialog = await screen.findByRole("dialog", { name: "Projects" });
+
+    fireEvent.focus(within(dialog).getByLabelText("Name"));
+    fireEvent.blur(document.getElementById("bar") as HTMLTextAreaElement, { relatedTarget: within(dialog).getByLabelText("Name") });
+
+    expect(screen.getByRole("button", { name: "Projects", hidden: true })).toBeDefined();
   });
 });
