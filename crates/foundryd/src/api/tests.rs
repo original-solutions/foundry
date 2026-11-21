@@ -3349,3 +3349,54 @@ async fn choose_for_a_project_not_in_the_settings_is_refused_and_never_waits() {
     let listed = daemon.call("GET", "/api/placements", None).await.json();
     assert_eq!(listed["requests"], serde_json::json!([]));
 }
+
+#[tokio::test]
+async fn the_web_ui_is_served_at_the_root_and_on_every_page_it_routes() {
+    let daemon = Daemon::new(TURN).await;
+    let index = daemon.call("GET", "/", None).await;
+    assert_eq!(index.status, 200, "{}", index.body);
+    assert!(index.body.contains("<div id=\"root\">"), "{}", index.body);
+
+    let page = daemon
+        .call(
+            "GET",
+            &format!("/workspaces/{}", WorkspaceId::random()),
+            None,
+        )
+        .await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert_eq!(page.body, index.body, "a page the UI routes gets the app");
+
+    let script = index
+        .body
+        .split("src=\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("index.html loads a script")
+        .to_owned();
+    let asset = daemon.call("GET", &script, None).await;
+    assert_eq!(asset.status, 200, "{script}: {}", asset.body);
+    assert_ne!(
+        asset.body, index.body,
+        "{script} is the script, not the app"
+    );
+}
+
+#[tokio::test]
+async fn a_missing_asset_and_an_unknown_api_route_are_not_found() {
+    let daemon = Daemon::new(TURN).await;
+    for path in ["/assets/missing.js", "/api/nope"] {
+        let reply = daemon.call("GET", path, None).await;
+        assert_eq!(reply.status, 404, "{path}: {}", reply.body);
+        assert!(reply.json()["error"].is_string(), "{path}: {}", reply.body);
+    }
+}
+
+#[tokio::test]
+async fn the_web_ui_is_refused_to_a_host_that_is_not_this_machine() {
+    let daemon = Daemon::new(TURN).await;
+    let reply = daemon
+        .raw("GET", "/", &[("Host", "evil.example")], None)
+        .await;
+    assert_eq!(reply.status, 403, "{}", reply.body);
+}
