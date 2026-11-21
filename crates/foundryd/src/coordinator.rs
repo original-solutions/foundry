@@ -517,7 +517,10 @@ impl Coordinator {
                         }
                         Next::Send(acting) => {
                             match self.peers.send_edit(acting, None, &edit, on).await {
-                                Ok(_) => return Ok(()),
+                                Ok(link) => {
+                                    queued.sent(acting, link);
+                                    return Ok(());
+                                }
                                 Err(Unsent::Unwritable(error)) => {
                                     return Err(CoordinatorError::Unwritable(error));
                                 }
@@ -710,6 +713,10 @@ struct Queue {
     /// Each edit by the machine that forwarded it and its number: its id, and the machine and
     /// link it was last sent on.
     edits: BTreeMap<(MachineId, u64), (Option<EditId>, Sent)>,
+    /// The machine and link each machine's forwarded edit went on last. An edit with no id
+    /// leaves [`Queue::edits`] once sent, as it is never sent again, and may still wait unread
+    /// on that link.
+    last: BTreeMap<MachineId, (MachineId, u64)>,
 }
 
 /// An edit `peer` forwarded with a task queued or running, in [`Coordinator::queue`], removed
@@ -745,16 +752,23 @@ impl Queued {
         if let Some((_, sent)) = queue.edits.get_mut(&(self.peer, self.number)) {
             *sent = Some((acting, link));
         }
+        queue.last.insert(self.peer, (acting, link));
     }
 
     /// What the edit may do now, for `next`, and the link it must go on ([`in_turn`]).
     fn turn(&self, next: Next) -> Turn {
-        let earlier: Vec<Sent> = lock(&self.coordinator.queue)
-            .edits
-            .range((self.peer, 0)..(self.peer, self.number))
-            .map(|(_, (_, sent))| *sent)
-            .collect();
-        in_turn(next, &earlier)
+        let (earlier, last): (Vec<Sent>, Sent) = {
+            let queue = lock(&self.coordinator.queue);
+            let earlier = queue
+                .edits
+                .range((self.peer, 0)..(self.peer, self.number))
+                .map(|(_, (_, sent))| *sent)
+                .collect();
+            (earlier, queue.last.get(&self.peer).copied())
+        };
+        let peers = &self.coordinator.peers;
+        let last = last.filter(|(machine, link)| peers.is_open(*machine, *link));
+        in_turn(next, &earlier, last)
     }
 }
 
@@ -772,13 +786,18 @@ type Turn = (Next, Option<u64>);
 /// What a forwarded edit may do now, for `next` from its look, given where each edit the same
 /// machine forwarded before it, still queued or running here, was last sent: `earlier`. It is
 /// numbered only once none of them is left. It is sent only to the machine they all went to, on
-/// the one link they all went on, which the second value names (`None`: any link, as none is
-/// earlier); when that link has closed, it waits until they are sent again. Otherwise it waits.
-/// Links carry messages in order, so edits from one machine reach the acting machine, and take
-/// their numbers, in the order they arrived, also when sent again.
-fn in_turn(next: Next, earlier: &[Sent]) -> Turn {
+/// the one link they all went on, which the second value names; when that link has closed, it
+/// waits until they are sent again. With none earlier it goes on `last`, the open link that
+/// machine's edit went on last, when that goes to the same machine, and else on any link
+/// (`None`). Otherwise it waits. Links carry messages in order, so edits from one machine reach
+/// the acting machine, and take their numbers, in the order they arrived, also when sent again.
+fn in_turn(next: Next, earlier: &[Sent], last: Sent) -> Turn {
     match (next, earlier.first()) {
-        (Next::Number, None) | (Next::Send(_), None) => (next, None),
+        (Next::Number, None) => (next, None),
+        (Next::Send(acting), None) => (
+            next,
+            last.filter(|(to, _)| *to == acting).map(|(_, link)| link),
+        ),
         (Next::Send(acting), Some(&Some((to, link))))
             if to == acting && earlier.iter().all(|sent| *sent == Some((acting, link))) =>
         {
@@ -1922,26 +1941,40 @@ mod tests {
     fn a_forwarded_edit_goes_only_after_the_ones_its_machine_forwarded_before_it() {
         let (a, b) = (MachineId::random(), MachineId::random());
         let wait = (Next::Wait, None);
-        let rows: [(Next, &[Sent], Turn); 10] = [
-            (Next::Number, &[], (Next::Number, None)),
-            (Next::Number, &[Some((a, 1))], wait),
-            (Next::Send(a), &[], (Next::Send(a), None)),
+        let rows: [(Next, &[Sent], Sent, Turn); 13] = [
+            (Next::Number, &[], None, (Next::Number, None)),
+            (Next::Number, &[], Some((a, 3)), (Next::Number, None)),
+            (Next::Number, &[Some((a, 1))], None, wait),
+            (Next::Send(a), &[], None, (Next::Send(a), None)),
+            // With none earlier, on the open link the last edit went on, to the same machine.
+            (Next::Send(a), &[], Some((a, 3)), (Next::Send(a), Some(3))),
+            (Next::Send(a), &[], Some((b, 3)), (Next::Send(a), None)),
             // On the link the earlier ones went on, whether or not it is still open.
-            (Next::Send(a), &[Some((a, 1))], (Next::Send(a), Some(1))),
+            (
+                Next::Send(a),
+                &[Some((a, 1))],
+                Some((a, 3)),
+                (Next::Send(a), Some(1)),
+            ),
             (
                 Next::Send(a),
                 &[Some((a, 1)), Some((a, 1))],
+                None,
                 (Next::Send(a), Some(1)),
             ),
             // An earlier one not sent yet, sent elsewhere, or on another link goes first.
-            (Next::Send(a), &[None], wait),
-            (Next::Send(a), &[Some((b, 1))], wait),
-            (Next::Send(a), &[Some((a, 1)), Some((a, 2))], wait),
-            (Next::Send(a), &[Some((a, 1)), None], wait),
-            (Next::Wait, &[None], wait),
+            (Next::Send(a), &[None], None, wait),
+            (Next::Send(a), &[Some((b, 1))], None, wait),
+            (Next::Send(a), &[Some((a, 1)), Some((a, 2))], None, wait),
+            (Next::Send(a), &[Some((a, 1)), None], None, wait),
+            (Next::Wait, &[None], None, wait),
         ];
-        for (next, earlier, want) in rows {
-            assert_eq!(in_turn(next, earlier), want, "{next:?} {earlier:?}");
+        for (next, earlier, last, want) in rows {
+            assert_eq!(
+                in_turn(next, earlier, last),
+                want,
+                "{next:?} {earlier:?} {last:?}"
+            );
         }
     }
 
@@ -1991,28 +2024,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_refusal_that_arrives_after_this_machine_numbered_the_id_does_not_replace_its_stamp()
-    {
-        let (_dir, coordinator) = alone();
-        let (peer, id) = (MachineId::random(), EditId::random());
-        let stamp = coordinator
-            .edit_from(Some(peer), Instant::now(), id, set_project(7, "p"))
-            .await
-            .unwrap();
-        // A machine this one sent it to before the role moved here refuses it late.
-        coordinator.take_answer(
-            id,
-            Outcome::Refused {
-                reason: "no".into(),
-            },
-        );
-        let again = coordinator
-            .edit_from(Some(peer), Instant::now(), id, set_project(7, "p"))
-            .await;
-        assert_eq!(again.unwrap(), stamp);
-    }
-
-    #[tokio::test]
     async fn a_refusal_held_for_an_id_whose_stamp_is_in_the_held_copy_is_not_reported() {
         let (_dir, coordinator) = alone();
         let (peer, id) = (MachineId::random(), EditId::random());
@@ -2037,13 +2048,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_id_this_machine_numbered_is_answered_with_its_stamp_however_many_numbers_follow() {
+    async fn an_id_this_machine_numbered_keeps_its_stamp_over_later_numbers_and_a_late_refusal() {
         let (_dir, coordinator) = alone();
         let (peer, id) = (MachineId::random(), EditId::random());
         let stamp = coordinator
             .edit_from(Some(peer), Instant::now(), id, set_project(7, "p"))
             .await
             .unwrap();
+        // It went to another machine before the role moved here, and that machine refuses it
+        // late, once the shared copy has forgotten the id.
+        coordinator.sent_to(id, MachineId::random());
         for n in 0..=NUMBERED_KEPT {
             let id = EditId::random();
             coordinator
@@ -2060,6 +2074,12 @@ mod tests {
         assert!(
             !held.numbered.contains_key(&id),
             "the shared copy forgot it"
+        );
+        coordinator.take_answer(
+            id,
+            Outcome::Refused {
+                reason: "no".into(),
+            },
         );
         let again = coordinator
             .edit_from(Some(peer), Instant::now(), id, set_project(7, "p"))
