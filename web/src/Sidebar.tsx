@@ -196,17 +196,16 @@ export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJ
                           {machine.name}
                         </Link>
                       </h2>
-                      <button
-                        type="button"
-                        onClick={rename}
-                        aria-label={`Rename ${machine.name}`}
-                        title="Rename"
-                        className="shrink-0 rounded p-0.5 text-neutral-500 hover:bg-neutral-800 hover:text-neutral-200 pointer-fine:opacity-0 pointer-fine:group-hover/machine:opacity-100 pointer-fine:focus-visible:opacity-100"
-                      >
-                        <svg viewBox="0 0 16 16" className="size-3.5" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
-                          <path d="M10.5 2.5l3 3L6 13H3v-3z" strokeLinejoin="round" />
-                        </svg>
-                      </button>
+                      {rename && (
+                        <Action
+                          label={`Rename ${machine.name}`}
+                          title="Rename"
+                          onClick={rename}
+                          className="shrink-0 pointer-fine:opacity-0 pointer-fine:group-hover/machine:opacity-100 pointer-fine:focus-visible:opacity-100"
+                        >
+                          <path d="M10.5 2.5l3 3L6 13H3v-3z" />
+                        </Action>
+                      )}
                     </>
                   )}
                 </MachineName>
@@ -403,7 +402,7 @@ function Strip({ list, workspace, selected, onNavigate, tab }: { list: Row[]; wo
   );
 }
 
-function Action({ label, title, onClick, disabled, children }: { label: string; title: string; onClick?: () => void; disabled?: boolean; children: ReactNode }) {
+function Action({ label, title, onClick, disabled, className = "", children }: { label: string; title: string; onClick?: () => void; disabled?: boolean; className?: string; children: ReactNode }) {
   return (
     <button
       type="button"
@@ -411,7 +410,7 @@ function Action({ label, title, onClick, disabled, children }: { label: string; 
       title={title}
       onClick={onClick}
       disabled={disabled}
-      className="grid size-6 place-items-center rounded text-neutral-400 hover:bg-neutral-700 hover:text-neutral-100 disabled:opacity-40"
+      className={`grid size-6 place-items-center rounded text-neutral-400 hover:bg-neutral-700 hover:text-neutral-100 disabled:opacity-40 ${className}`}
     >
       <svg viewBox="0 0 16 16" className="size-3.5" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
         {children}

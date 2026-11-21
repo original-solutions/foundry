@@ -299,14 +299,6 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
         .layer(middleware::from_fn_with_state(api.clone(), api::same_site));
     let machine_name_routes = api::machine_names::router(coordinator.clone(), store.clone())
         .layer(middleware::from_fn_with_state(api.clone(), api::same_site));
-    let away = Arc::new(AtomicBool::new(false));
-    let listing = api::machine_names::Listing::new(
-        me,
-        coordinator.clone(),
-        store.clone(),
-        crate::sync::OFFLINE_AFTER,
-        away.clone(),
-    );
     let app = api::router(api)
         .merge(sessions.router())
         .merge(attention_routes)
@@ -321,8 +313,7 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
     let listener = api::bind(local).await?;
     tracing::info!("listening on {local}");
     let mut tailscale = Tailscale::new(port, app.clone());
-    // The listing reads the mark this watch sets when Tailscale fails.
-    tailscale.away = away;
+    let listing = tailscale.listing(me, coordinator.clone(), store.clone());
     tailscale.scan(true, tailscale_ips().await).await;
     let answered = tailscale.answered.clone();
     let mut services: JoinSet<&'static str> = JoinSet::new();
@@ -674,6 +665,24 @@ impl Tailscale {
             answered: Arc::new(tokio::sync::Notify::new()),
             away: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// The machine list entry this watch keeps up to date. It gives peers' copies
+    /// [`OFFLINE_AFTER`](crate::sync::OFFLINE_AFTER) to arrive, and reads the mark this watch
+    /// sets when Tailscale fails, so it waits again after Tailscale was away.
+    fn listing(
+        &self,
+        me: foundry_proto::ids::MachineId,
+        coordinator: Arc<crate::coordinator::Coordinator>,
+        store: Arc<Mutex<Store>>,
+    ) -> api::machine_names::Listing {
+        api::machine_names::Listing::new(
+            me,
+            coordinator,
+            store,
+            crate::sync::OFFLINE_AFTER,
+            self.away.clone(),
+        )
     }
 
     /// Binds each address in Tailscale's answer, `reported`, not served yet, and stops the
@@ -1181,6 +1190,9 @@ mod tests {
     /// read, however many answers come before.
     #[tokio::test]
     async fn an_ask_that_fails_marks_tailscale_away_until_the_mark_is_read() {
+        // Captured as the warning tests capture it: a test that hits this warning with no
+        // subscriber can register its call site as off while another test is counting it.
+        let _capture = Logged::default().capture();
         let mut tailscale = Tailscale::new(7433, Router::new());
         assert!(!tailscale.away.load(Ordering::Relaxed));
 
@@ -1190,6 +1202,57 @@ mod tests {
         assert!(tailscale.away.swap(false, Ordering::Relaxed));
         tailscale.scan(false, Ok(BTreeSet::new())).await;
         assert!(!tailscale.away.load(Ordering::Relaxed));
+    }
+
+    /// The listing the watch hands out reads the watch's own away mark: an edit found before
+    /// an ask fails waits its whole settle time again once Tailscale answers.
+    #[tokio::test(start_paused = true)]
+    async fn the_listing_waits_again_after_its_watch_found_tailscale_away() {
+        use api::machine_names::Entry;
+
+        // Captured as the warning tests capture it: a test that hits this warning with no
+        // subscriber can register its call site as off while another test is counting it.
+        let _capture = Logged::default().capture();
+        let data = tempfile::tempdir().unwrap();
+        let me = foundry_proto::ids::MachineId::random();
+        let store = Arc::new(Mutex::new(
+            Store::open(data.path().join("foundry.db")).unwrap(),
+        ));
+        let peers = Peers::new(me, store.clone(), Arc::new(WsDialer { port: 9 }));
+        let coordinator = Arc::new(crate::coordinator::Coordinator::new(
+            me,
+            store.clone(),
+            peers.clone(),
+        ));
+        peers.coordinate(coordinator.clone());
+        let mut tailscale = Tailscale::new(7433, Router::new());
+        let mut listing = tailscale.listing(me, coordinator, store.clone());
+        let here = || {
+            Ok(Entry {
+                name: "personal-mac".into(),
+                address: "100.91.54.18".into(),
+            })
+        };
+        let listed = || {
+            store
+                .lock()
+                .unwrap()
+                .settings()
+                .unwrap()
+                .machines
+                .iter()
+                .any(|m| m.id == me)
+        };
+        listing.list(here()).await;
+
+        tokio::time::sleep(crate::sync::OFFLINE_AFTER).await;
+        tailscale.scan(false, Err("logged out".to_owned())).await;
+        listing.list(here()).await;
+        assert!(!listed(), "the look after Tailscale was away sends nothing");
+
+        tokio::time::sleep(crate::sync::OFFLINE_AFTER).await;
+        listing.list(here()).await;
+        assert!(listed());
     }
 
     /// After Tailscale answers again, a new failure is worth a new warning.

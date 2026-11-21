@@ -4,7 +4,7 @@
 //!
 //! - [`Listing`] keeps this machine in the list. Fed what [`entry`] reads from
 //!   `tailscale status --self --json`, it adds the machine when the list does not hold it,
-//!   moves its address when that changed, and never touches a name already set.
+//!   moves its address when that changed, and never touches a name it has seen set.
 //! - `POST /api/machines/{id}/rename` `{name}`: sets a listed machine's name, trimmed, and
 //!   keeps its address, `204`. A name that is blank, over [`NAME_AT_MOST`] characters or holds
 //!   a control character is `422`; a name another machine has, compared trimmed and in any
@@ -40,7 +40,7 @@ use serde::Deserialize;
 use tokio::time::Instant;
 
 use super::{ApiError, Body, edit_status, on_store, parse_id, unprocessable};
-use crate::coordinator::Coordinator;
+use crate::coordinator::{Coordinator, CoordinatorError};
 use crate::store::Store;
 
 /// The most characters a machine's name holds.
@@ -138,8 +138,9 @@ impl Listing {
     ///
     /// The look that first finds an edit to send sends nothing: one at least the settle time
     /// later that still finds it sends it, so peers' copies can arrive first. A look that finds
-    /// nothing to send, or sends, ends the wait; a failed send does not, so the next look tries
-    /// again. A look after the `away` mark was set starts the wait over: no peer could link
+    /// nothing to send, or sends, ends the wait, and so does a send that may have been numbered
+    /// though it failed (no answer came); one the coordinator says it did not send keeps the
+    /// wait over, so the next look tries again. A look after the `away` mark was set starts the wait over: no peer could link
     /// while Tailscale was away, so an edit found before waits again.
     pub async fn list(&mut self, entry: Result<Entry, String>) {
         if self.away.swap(false, Ordering::Relaxed) {
@@ -182,12 +183,18 @@ impl Listing {
         if found.elapsed() < self.settle {
             return Ok(());
         }
-        self.coordinator
-            .edit(Edit::SetMachine { machine })
-            .await
-            .map_err(|e| e.to_string())?;
-        self.found = None;
-        Ok(())
+        let sent = self.coordinator.edit(Edit::SetMachine { machine }).await;
+        // A send that may have reached the coordinator waits again, as a sent one does, for
+        // the copy that holds it; one that says it was not sent is tried on the next look.
+        if !matches!(
+            sent,
+            Err(CoordinatorError::NotLinked(_)
+                | CoordinatorError::Older { .. }
+                | CoordinatorError::Unwritable(_))
+        ) {
+            self.found = None;
+        }
+        sent.map(drop).map_err(|e| e.to_string())
     }
 }
 
@@ -458,6 +465,14 @@ mod tests {
         /// `peer` says hello and sends nothing, so it is heard from, then its link drops: it
         /// acts, and an edit has nowhere to go.
         async fn hear(&self, peer: MachineId) {
+            let (theirs, accepting) = self.link(peer).await;
+            drop(theirs);
+            accepting.await.unwrap();
+        }
+
+        /// `peer` says hello and sends nothing, so it is heard from, and its link stays open
+        /// while the returned end is held: an edit reaches it and is never answered.
+        async fn link(&self, peer: MachineId) -> (Conn, tokio::task::JoinHandle<()>) {
             let (ours, theirs) = Conn::pair();
             let accepting = tokio::spawn({
                 let peers = self.peers.clone();
@@ -487,8 +502,7 @@ mod tests {
                 );
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            drop(theirs);
-            accepting.await.unwrap();
+            (theirs, accepting)
         }
     }
 
@@ -811,6 +825,65 @@ mod tests {
         acting.seq += 1;
         acting.priority = vec![served.me, peer];
         served.store.lock().unwrap().apply_settings(acting).unwrap();
+        listing.list(here("personal-mac", "100.91.54.18")).await;
+        assert!(served.settings().machines.contains(&machine(
+            served.me,
+            "personal-mac",
+            "100.91.54.18"
+        )));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_send_that_got_no_answer_waits_the_settle_time_before_it_is_sent_again() {
+        let logged = Logged::default();
+        let _capture = logged.capture();
+        let peer = MachineId::random();
+        let served = Served::new(|me, settings| {
+            settings
+                .machines
+                .push(machine(peer, "trilogy-mac", "100.64.0.2"));
+            settings.priority = vec![peer, me];
+        })
+        .await;
+        // The peer acts, keeps its link up, takes the edit and never answers it, so it may
+        // have numbered it.
+        let (theirs, _accepting) = served.link(peer).await;
+        let Conn { send, mut recv } = theirs;
+        let _taking = tokio::spawn(async move { while recv.recv().await.is_some() {} });
+        let _talking = tokio::spawn(async move {
+            let nothing = serde_json::to_string(&PeerMessage::Records {
+                protocol: PROTOCOL,
+                records: Vec::new(),
+            })
+            .unwrap();
+            while send.send(nothing.clone()).await.is_ok() {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
+        let mut listing = served.listing_after(SETTLE);
+        listing.list(here("personal-mac", "100.91.54.18")).await;
+        tokio::time::sleep(SETTLE).await;
+        listing.list(here("personal-mac", "100.91.54.18")).await;
+        let warnings = logged.warnings();
+        assert!(
+            warnings.iter().any(|w| w.contains("no answer came")),
+            "{warnings:?}"
+        );
+
+        // This machine comes to act, while its copy does not hold the entry the peer may have.
+        let mut acting = served.settings();
+        acting.seq += 1;
+        acting.priority = vec![served.me, peer];
+        served.store.lock().unwrap().apply_settings(acting).unwrap();
+        let seq = served.settings().seq;
+        listing.list(here("personal-mac", "100.91.54.18")).await;
+        assert_eq!(
+            served.settings().seq,
+            seq,
+            "the look right after a send that got no answer sends nothing"
+        );
+
+        tokio::time::sleep(SETTLE).await;
         listing.list(here("personal-mac", "100.91.54.18")).await;
         assert!(served.settings().machines.contains(&machine(
             served.me,

@@ -163,6 +163,48 @@ describe("Machines", () => {
       expect(nameField().value).toBe("Laptop");
     });
 
+    it("shows the field busy while the rename is on its way, then takes edits again", async () => {
+      mockFetch();
+      const served = globalThis.fetch;
+      let answer!: (response: Response) => void;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn((url: string, init?: RequestInit) => (url.endsWith("/rename") ? new Promise<Response>((r) => (answer = r)) : served(url, init))),
+      );
+      await show();
+
+      rename("Laptop");
+      fireEvent.keyDown(nameField(), { key: "Enter" });
+
+      await waitFor(() => expect(nameField().getAttribute("aria-busy")).toBe("true"));
+      expect(nameField().readOnly).toBe(true);
+      answer(json(409, { error: 'another machine is named "laptop"' }));
+      await screen.findByRole("alert");
+      expect(nameField().getAttribute("aria-busy")).toBeNull();
+      expect(nameField().readOnly).toBe(false);
+    });
+
+    it("keeps the card named, and its machine id on hover, while the field is open", async () => {
+      mockFetch();
+      await show();
+
+      expect(within(card("studio")).getByTitle(new RegExp(ME))).toBeDefined();
+      rename("Tom's desk");
+
+      expect(within(card("studio")).getByRole("textbox", { name: "Machine name" })).toBeDefined();
+    });
+
+    it("offers no rename for a machine not in the machine list yet", async () => {
+      mockFetch();
+      const listed = settings({ machines: [{ id: ME, name: "studio", address: "" }] });
+      await renderApp(<Machines machines={fleet(records, listed)} history={{}} here={ME} connected />);
+
+      const unlisted = screen.getAllByRole("article").find((article) => !within(article).queryByText("This machine"))!;
+      expect(within(unlisted).queryByRole("button")).toBeNull();
+      expect(within(unlisted).getByTitle(OTHER)).toBeDefined();
+      expect(within(card("studio")).getByRole("button", { name: "studio" })).toBeDefined();
+    });
+
     it("shows a 422's error the same way", async () => {
       mockFetch(json(422, { error: "a machine's name is at most 60 characters" }));
       await show();

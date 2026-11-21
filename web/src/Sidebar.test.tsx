@@ -348,6 +348,17 @@ describe("Sidebar", () => {
     expect(calls).toEqual([{ url: `/api/machines/${ME}/rename`, method: "POST", body: { name: "Tom's desk" } }]);
   });
 
+  it("offers no rename in the header of a machine not in the machine list yet", async () => {
+    mockFetch();
+    const records = [sample(ME, 1), sample(OTHER, 1)];
+    const view = fleet(records, settings({ machines: [{ id: ME, name: "studio", address: "" }] }));
+    await renderApp(<Sidebar machines={view} {...props} />);
+
+    const unlisted = screen.getAllByRole("region").find((region) => region.getAttribute("aria-label") !== "studio")!;
+    expect(within(unlisted).queryByRole("button", { name: /^Rename/ })).toBeNull();
+    expect(within(screen.getByRole("region", { name: "studio" })).getByRole("button", { name: "Rename studio" })).toBeDefined();
+  });
+
   it("shows a refused rename's error under the header's field and sends nothing on Escape", async () => {
     const calls = mockFetch(json(409, { error: 'another machine is named "laptop"' }));
     await renderApp(<Sidebar machines={machines()} {...props} />);
