@@ -49,6 +49,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::oneshot;
 use tokio::time::{Instant, timeout};
 
 use crate::secrets::{self, Secrets, SecretsError};
@@ -208,7 +209,7 @@ fn post_join(
 
 /// The Tailscale and loopback addresses `address` names or resolves to, at `port` unless it
 /// names one. [`JoinError::NotTailscale`] when it has none.
-fn join_targets(address: &str, port: u16) -> Result<Vec<SocketAddr>, JoinError> {
+pub(crate) fn join_targets(address: &str, port: u16) -> Result<Vec<SocketAddr>, JoinError> {
     let authority = join_authority(address, port);
     let resolved = authority
         .to_socket_addrs()
@@ -533,6 +534,8 @@ struct Shown {
     /// Also kept because `at` stops while the machine sleeps.
     wall: SystemTime,
     used_by: Option<MachineId>,
+    /// For a watched code: told the machine that used it, once.
+    watch: Option<oneshot::Sender<MachineId>>,
 }
 
 impl Shown {
@@ -597,6 +600,20 @@ impl Keys {
 
     /// A new code that works once within [`CODE_VALID_FOR`].
     pub fn new_code(&self) -> Result<Code, JoinError> {
+        self.issue(None)
+    }
+
+    /// A new code, as [`Keys::new_code`], and what says which machine used it. That is said
+    /// once, when the machine's key is first saved; the code expiring unused, once any later
+    /// code or redeem forgets it, says nothing and ends the watch.
+    pub(crate) fn new_watched_code(
+        &self,
+    ) -> Result<(Code, oneshot::Receiver<MachineId>), JoinError> {
+        let (tell, told) = oneshot::channel();
+        Ok((self.issue(Some(tell))?, told))
+    }
+
+    fn issue(&self, watch: Option<oneshot::Sender<MachineId>>) -> Result<Code, JoinError> {
         let mut bytes = [0; CODE_LENGTH];
         SystemRandom::new()
             .fill(&mut bytes)
@@ -612,6 +629,7 @@ impl Keys {
             at: Instant::now(),
             wall: SystemTime::now(),
             used_by: None,
+            watch,
         });
         Ok(Code(code))
     }
@@ -645,6 +663,10 @@ impl Keys {
             .find(|shown| same(shown.code.as_bytes(), typed.as_bytes()))
         {
             shown.used_by = Some(machine);
+            if let Some(watch) = shown.watch.take() {
+                // Nobody watching any more is no reason to fail the join.
+                let _ = watch.send(machine);
+            }
         }
         Ok(())
     }
@@ -1260,7 +1282,7 @@ mod tests {
         let host = Keys::open(flaky.clone()).unwrap();
         let peer = machine_keys();
         let (code, mut used) = host.new_watched_code().unwrap();
-        // Another code used, or this one refused to another machine's stolen claim, says nothing.
+        // Another code used says nothing, and so does a save of this one that fails.
         admit(&host, &machine_keys());
         flaky.failing.store(true, Ordering::SeqCst);
         assert!(
