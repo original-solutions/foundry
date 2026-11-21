@@ -130,6 +130,17 @@ describe("Machines", () => {
       expect(calls).toEqual([]);
     });
 
+    it("keeps the field open, with its text, when it loses focus", async () => {
+      const calls = mockFetch();
+      await show();
+
+      rename("Tom's desk");
+      fireEvent.blur(nameField());
+
+      expect(nameField().value).toBe("Tom's desk");
+      expect(calls).toEqual([]);
+    });
+
     it("sends nothing for the name it already has", async () => {
       const calls = mockFetch();
       await show();

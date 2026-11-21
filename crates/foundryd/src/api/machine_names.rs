@@ -283,6 +283,16 @@ mod tests {
     }
 
     #[test]
+    fn a_dns_label_longer_than_a_name_holds_is_cut_to_60_characters() {
+        let label = "m".repeat(63);
+        let status = STATUS.replace("personal-mac.tail", &format!("{label}.tail"));
+        assert_eq!(
+            entry(status.as_bytes(), None).map(|e| e.name),
+            Ok("m".repeat(NAME_AT_MOST))
+        );
+    }
+
+    #[test]
     fn with_no_ipv4_there_is_no_entry() {
         let status = STATUS.replace(r#""100.91.54.18", "#, "");
         let why = entry(status.as_bytes(), Some("host")).unwrap_err();
@@ -349,8 +359,18 @@ mod tests {
             }
         }
 
+        /// A listing that looks from the start, with no wait for peers' copies.
         fn listing(&self) -> Listing {
-            Listing::new(self.me, self.coordinator.clone(), self.store.clone())
+            self.listing_after(Duration::ZERO)
+        }
+
+        fn listing_after(&self, settle: Duration) -> Listing {
+            Listing::new(
+                self.me,
+                self.coordinator.clone(),
+                self.store.clone(),
+                settle,
+            )
         }
 
         fn settings(&self) -> SharedSettings {
@@ -576,6 +596,47 @@ mod tests {
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains(&peer.to_string()), "{warnings:?}");
         assert!(!served.settings().machines.iter().any(|m| m.id == served.me));
+    }
+
+    #[tokio::test]
+    async fn a_look_before_the_settle_time_sends_nothing_and_one_after_it_lists_the_machine() {
+        let served = Served::new(|_, _| {}).await;
+        let seq = served.settings().seq;
+        let mut listing = served.listing_after(Duration::from_millis(400));
+
+        listing.list(here("personal-mac", "100.91.54.18")).await;
+        assert_eq!(
+            served.settings().seq,
+            seq,
+            "nothing is sent while peers' copies may still be on their way"
+        );
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        listing.list(here("personal-mac", "100.91.54.18")).await;
+        assert_eq!(
+            served.settings().machines,
+            [machine(served.me, "personal-mac", "100.91.54.18")]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_look_is_tried_again_on_the_next_and_a_new_failure_is_warned_again() {
+        let logged = Logged::default();
+        let _capture = logged.capture();
+        let served = Served::new(|_, _| {}).await;
+        let mut listing = served.listing();
+
+        listing.list(Err("no IPv4 here".to_owned())).await;
+        listing.list(here("personal-mac", "100.91.54.18")).await;
+        assert_eq!(
+            served.settings().machines,
+            [machine(served.me, "personal-mac", "100.91.54.18")]
+        );
+        listing.list(Err("logged out".to_owned())).await;
+
+        let warnings = logged.warnings();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[1].contains("logged out"), "{warnings:?}");
     }
 
     #[tokio::test]
