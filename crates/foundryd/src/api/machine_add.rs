@@ -597,6 +597,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_name_that_resolves_to_a_listed_machines_address_is_409_and_issues_no_code() {
+        let peer = MachineId::random();
+        let served = Served::new(move |me, settings| {
+            settings
+                .machines
+                .push(machine(peer, "trilogy-mac", "127.0.0.1"));
+            settings.priority = vec![me];
+        })
+        .await;
+
+        for name in ["localhost", "127.0.0.1"] {
+            let (status, body) = served.add(name).await;
+
+            assert_eq!(status, 409, "{name:?}: {body}");
+            assert!(error_of(&body).contains("trilogy-mac"), "{body}");
+        }
+    }
+
+    #[tokio::test]
     async fn an_add_on_a_machine_not_in_the_list_yet_is_503() {
         let served = Served::new(|me, settings| settings.machines.retain(|m| m.id != me)).await;
 
