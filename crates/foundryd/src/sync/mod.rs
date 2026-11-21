@@ -41,9 +41,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
 use foundry_proto::ids::MachineId;
-use foundry_proto::messages::{EDITS_SINCE, PeerMessage};
+use foundry_proto::messages::{ANSWERS_SINCE, EDITS_SINCE, PeerMessage};
 use foundry_proto::record::AnyRecord;
-use foundry_proto::settings::{Edit, Machine};
+use foundry_proto::settings::{Edit, EditId, Machine, Outcome};
 use foundry_proto::state::{SessionState, TerminalState};
 use futures::future::BoxFuture;
 use tokio::sync::mpsc;
@@ -119,7 +119,8 @@ pub trait Dialer: Send + Sync + 'static {
 pub enum Unsent {
     /// No link to the machine is open.
     NotLinked,
-    /// The open links to the machine speak this protocol, older than [`EDITS_SINCE`].
+    /// The open links to the machine speak this protocol, older than the edit needs: see
+    /// [`Peers::send_edit`].
     Older(u16),
     /// The edit cannot be written as JSON.
     Unwritable(serde_json::Error),
@@ -258,29 +259,86 @@ impl Peers {
         *lock(&self.inner.coordinator) = Some(Arc::downgrade(&coordinator));
     }
 
-    /// Sends `edit` to `machine` on an open record link that speaks [`EDITS_SINCE`] or later,
-    /// in that link's protocol, and says why when no link took it.
-    pub async fn send_edit(&self, machine: MachineId, edit: &Edit) -> Result<(), Unsent> {
-        let links: Vec<Link> = lock(&self.inner.links)
+    /// Sends `edit` to `machine` on an open record link, in that link's protocol, and returns the
+    /// number of the link it went on. With an `id` it goes only on a link that speaks
+    /// [`ANSWERS_SINCE`] or later, which carries the id and its answer. With none, which is how an
+    /// edit that reached this machine from an older one is passed on, it goes on a link that
+    /// speaks [`EDITS_SINCE`] or later, and is never answered. With `on`, it goes only on the
+    /// link of that number. It says why when no link took it.
+    pub async fn send_edit(
+        &self,
+        machine: MachineId,
+        id: Option<EditId>,
+        edit: &Edit,
+        on: Option<u64>,
+    ) -> Result<u64, Unsent> {
+        let since = if id.is_some() {
+            ANSWERS_SINCE
+        } else {
+            EDITS_SINCE
+        };
+        let links: Vec<(u64, Link)> = lock(&self.inner.links)
             .get(&machine)
-            .map(|open| open.values().cloned().collect())
+            .map(|open| {
+                open.iter()
+                    .filter(|(n, _)| on.is_none_or(|on| on == **n))
+                    .map(|(n, link)| (*n, link.clone()))
+                    .collect()
+            })
             .unwrap_or_default();
         let mut unsent = Unsent::NotLinked;
-        for Link { speak, send } in links {
-            if speak < EDITS_SINCE {
+        for (number, Link { speak, send }) in links {
+            if speak < since {
                 unsent = Unsent::Older(speak);
                 continue;
             }
             let message = PeerMessage::Edit {
                 protocol: speak,
+                id,
                 edit: edit.clone(),
             };
             let text = serde_json::to_string(&message).map_err(Unsent::Unwritable)?;
             if link::send_text(&send, text).await {
-                return Ok(());
+                return Ok(number);
             }
         }
         Err(unsent)
+    }
+
+    /// Whether record link `link` to `machine`, as [`Peers::send_edit`] numbered it, is still
+    /// open.
+    pub fn is_open(&self, machine: MachineId, link: u64) -> bool {
+        lock(&self.inner.links)
+            .get(&machine)
+            .is_some_and(|open| open.contains_key(&link))
+    }
+
+    /// Answers the edit `machine` sent under `id` on the first open record link to it that
+    /// speaks [`ANSWERS_SINCE`] or later. False when no link took it.
+    pub(crate) async fn send_answer(
+        &self,
+        machine: MachineId,
+        id: EditId,
+        outcome: Outcome,
+    ) -> bool {
+        let links: Vec<Link> = lock(&self.inner.links)
+            .get(&machine)
+            .map(|open| open.values().cloned().collect())
+            .unwrap_or_default();
+        for Link { speak, send } in links {
+            if speak < ANSWERS_SINCE {
+                continue;
+            }
+            let message = PeerMessage::Answer {
+                protocol: speak,
+                id,
+                outcome: outcome.clone(),
+            };
+            if link::send_message(&send, &message).await {
+                return true;
+            }
+        }
+        false
     }
 
     /// The machines with an open record link whose every open link speaks a protocol older than

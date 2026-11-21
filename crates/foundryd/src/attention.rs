@@ -24,8 +24,10 @@
 //!
 //! - `GET /api/attention`: `{"items": [...]}`, each an [`Item`].
 //! - `POST /api/attention/{id}/dismiss`: dismisses a "setting overwritten" item through the
-//!   coordinator, `204`. Any other item is `409`; an id that names no item is `404`. An edit
-//!   that fails answers with its error, which names no setting's value.
+//!   coordinator, `204` once the dismissal is numbered. Any other item is `409`; an id that
+//!   names no item is `404`. A dismissal the acting coordinator refuses is `502`, and one it
+//!   does not answer in time `504`; a failed one answers with its error, which names no
+//!   setting's value.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -516,17 +518,22 @@ async fn dismiss(State(attention): State<Arc<Attention>>, Path(id): Path<String>
         Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
     match attention.coordinator.edit(Edit::Dismiss { setting }).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => {
-            let status = match e {
-                CoordinatorError::NotLinked(_)
-                | CoordinatorError::Older { .. }
-                | CoordinatorError::Unsettled { .. } => StatusCode::SERVICE_UNAVAILABLE,
-                CoordinatorError::Unwritable(_) | CoordinatorError::Store(_) => {
-                    StatusCode::INTERNAL_SERVER_ERROR
-                }
-            };
-            error(status, e.to_string())
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => error(dismissal_status(&e), e.to_string()),
+    }
+}
+
+/// The status a dismissal that failed answers with.
+fn dismissal_status(error: &CoordinatorError) -> StatusCode {
+    match error {
+        CoordinatorError::Refused { .. } => StatusCode::BAD_GATEWAY,
+        // Sent, so it may have been numbered: not the 503 of an edit that changed nothing.
+        CoordinatorError::NoAnswer { .. } => StatusCode::GATEWAY_TIMEOUT,
+        CoordinatorError::NotLinked(_)
+        | CoordinatorError::Older { .. }
+        | CoordinatorError::Unsettled { .. } => StatusCode::SERVICE_UNAVAILABLE,
+        CoordinatorError::Unwritable(_) | CoordinatorError::Store(_) => {
+            StatusCode::INTERNAL_SERVER_ERROR
         }
     }
 }
@@ -548,7 +555,7 @@ mod tests {
     use foundry_proto::ids::{ProjectId, SessionId, WorkspaceId};
     use foundry_proto::messages::{PROTOCOL, PeerMessage};
     use foundry_proto::record::{MachineSample, Record, Session, Workspace};
-    use foundry_proto::settings::{Limits, Machine, Overwritten, Project, Stamp};
+    use foundry_proto::settings::{Limits, Machine, Outcome, Overwritten, Project, Stamp};
     use futures::future::BoxFuture;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -1224,6 +1231,56 @@ mod tests {
             accepting.await.unwrap();
         }
 
+        /// Opens a link from `peer` that stays open, is heard from, and answers every edit it is
+        /// sent with `outcome`, as an acting coordinator on this build would.
+        async fn answering(&self, peer: MachineId, outcome: Outcome) {
+            let (ours, theirs) = Conn::pair();
+            tokio::spawn({
+                let peers = self.peers.clone();
+                async move { peers.accept(ours).await }
+            });
+            let Conn { send, mut recv } = theirs;
+            let hello = PeerMessage::Hello {
+                protocol: PROTOCOL,
+                machine: peer,
+                versions: BTreeMap::new(),
+            };
+            let nothing = PeerMessage::Records {
+                protocol: PROTOCOL,
+                records: Vec::new(),
+            };
+            for message in [hello, nothing] {
+                send.send(serde_json::to_string(&message).unwrap())
+                    .await
+                    .unwrap();
+            }
+            tokio::spawn(async move {
+                while let Some(text) = recv.recv().await {
+                    let Ok(PeerMessage::Edit { id: Some(id), .. }) = serde_json::from_str(&text)
+                    else {
+                        continue;
+                    };
+                    let answer = PeerMessage::Answer {
+                        protocol: PROTOCOL,
+                        id,
+                        outcome: outcome.clone(),
+                    };
+                    let text = serde_json::to_string(&answer).unwrap();
+                    if send.send(text).await.is_err() {
+                        return;
+                    }
+                }
+            });
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while !self.peers.online().contains(&peer) {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the peer was not heard"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
         /// Stores every record `world` holds, as their owners sent them.
         fn hold(&self, world: &World) {
             let mut store = self.store.lock().unwrap();
@@ -1507,6 +1564,49 @@ mod tests {
         }
     }
 
+    #[test]
+    fn only_an_edit_that_may_have_been_numbered_is_504_and_a_refusal_is_502() {
+        let id = MachineId::random();
+        let cases = [
+            (CoordinatorError::NotLinked(id), 503),
+            (
+                CoordinatorError::Older {
+                    acting: id,
+                    speaks: 3,
+                },
+                503,
+            ),
+            (
+                CoordinatorError::Unsettled {
+                    from: id,
+                    acting: id,
+                },
+                503,
+            ),
+            (
+                CoordinatorError::Refused {
+                    reason: "no".into(),
+                },
+                502,
+            ),
+            (CoordinatorError::NoAnswer { acting: id }, 504),
+            (
+                CoordinatorError::Unwritable(serde_json::from_str::<u8>("x").unwrap_err()),
+                500,
+            ),
+            (
+                CoordinatorError::Store(StoreError::TooLarge {
+                    what: "x",
+                    value: 1,
+                }),
+                500,
+            ),
+        ];
+        for (error, status) in cases {
+            assert_eq!(dismissal_status(&error).as_u16(), status, "{error}");
+        }
+    }
+
     #[tokio::test]
     async fn a_dismissal_the_coordinator_cannot_send_answers_its_error_without_the_value() {
         let peer = MachineId::random();
@@ -1539,5 +1639,78 @@ mod tests {
             assert!(!body.contains(value), "{value} in {body}");
         }
         assert_eq!(served.overwritten().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_dismissal_the_acting_coordinator_refuses_answers_the_refusal_without_the_value() {
+        let peer = MachineId::random();
+        let served = Served::new(|me, settings| {
+            with_overwritten(me, settings);
+            settings.machines = vec![Machine {
+                id: peer,
+                name: "trilogy-mac".into(),
+                address: "100.64.0.2".into(),
+            }];
+            settings.priority = vec![peer, me];
+        })
+        .await;
+        // The peer acts, and refuses the dismissal it is sent.
+        let reason = format!("{peer} could not store it");
+        served
+            .answering(
+                peer,
+                Outcome::Refused {
+                    reason: reason.clone(),
+                },
+            )
+            .await;
+
+        let key = served.overwritten().into_keys().next().unwrap();
+        let (status, body) = served
+            .call(
+                "POST",
+                &format!("/api/attention/setting_overwritten:{key}/dismiss"),
+            )
+            .await;
+        assert_eq!(status, 502, "{body}");
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let error = json["error"].as_str().unwrap();
+        assert!(error.contains(&reason), "{error}");
+        for value in ["hunter2", "github.com", "secret-name", "other-name"] {
+            assert!(!body.contains(value), "{value} in {body}");
+        }
+        assert_eq!(served.overwritten().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_dismissal_the_acting_coordinator_numbers_answers_204() {
+        let peer = MachineId::random();
+        let served = Served::new(|me, settings| {
+            with_overwritten(me, settings);
+            settings.machines = vec![Machine {
+                id: peer,
+                name: "trilogy-mac".into(),
+                address: "100.64.0.2".into(),
+            }];
+            settings.priority = vec![peer, me];
+        })
+        .await;
+        served
+            .answering(
+                peer,
+                Outcome::Numbered {
+                    stamp: Stamp { seq: 99, by: peer },
+                },
+            )
+            .await;
+
+        let key = served.overwritten().into_keys().next().unwrap();
+        let (status, body) = served
+            .call(
+                "POST",
+                &format!("/api/attention/setting_overwritten:{key}/dismiss"),
+            )
+            .await;
+        assert_eq!(status, 204, "{body}");
     }
 }
