@@ -17,7 +17,6 @@ use std::process::Child;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use bytes::Bytes;
 use foundry_holder::protocol::{
     self, ChildStatus, MAX_PENDING_INPUT, Reply, Request, UNKNOWN_EXIT,
 };
@@ -142,16 +141,22 @@ impl Outbox {
     /// or the task is aborted. Dropping the write half
     /// at the end shuts the connection down.
     async fn write_to(&self, mut wr: OwnedWriteHalf) {
+        const KEEP_CAPACITY: usize = 256 * 1024;
+        let mut chunk = Vec::new();
         loop {
-            let (chunk, closed) = {
+            let closed = {
                 let mut state = self.lock();
-                let chunk = std::mem::take(&mut state.unsent);
+                std::mem::swap(&mut chunk, &mut state.unsent);
                 state.writing = chunk.len();
-                (chunk, state.closed)
+                state.closed
             };
             if !chunk.is_empty() {
                 if wr.write_all(&chunk).await.is_err() {
                     return;
+                }
+                chunk.clear();
+                if chunk.capacity() > KEEP_CAPACITY {
+                    chunk.shrink_to(KEEP_CAPACITY);
                 }
                 self.lock().writing = 0;
             } else if closed {
@@ -174,6 +179,7 @@ struct Terminal {
     scrollback: Scrollback,
     clients: HashMap<u64, Client>,
     input: Vec<u8>,
+    frame_buf: Vec<u8>,
     exit: Option<i32>,
 }
 
@@ -291,11 +297,13 @@ impl Terminal {
     fn handle(&mut self, id: u64, request: Request, master: &File) -> Flow {
         match request {
             Request::Attach => {
-                let snapshot = Reply::Snapshot {
-                    start: self.scrollback.start(),
-                    bytes: Bytes::from(self.scrollback.snapshot()),
-                };
-                let frame = snapshot.encode();
+                let mut frame = Vec::new();
+                Reply::encode_snapshot_from(
+                    self.scrollback.start(),
+                    self.scrollback.len(),
+                    |dst| self.scrollback.snapshot_into(dst),
+                    &mut frame,
+                );
                 if let Some(client) = self.clients.get_mut(&id) {
                     client.attached = true;
                     client.allowance = MAX_BACKLOG + frame.len();
@@ -340,7 +348,9 @@ impl Terminal {
     fn output(&mut self, data: &[u8]) {
         self.scrollback.push(data);
         if self.clients.values().any(|c| c.attached) {
-            self.broadcast(&Reply::Output(Bytes::copy_from_slice(data)));
+            Reply::encode_output_into(data, &mut self.frame_buf);
+            let frame = &self.frame_buf;
+            self.clients.retain(|_, c| !c.attached || c.queue(frame));
         }
     }
 

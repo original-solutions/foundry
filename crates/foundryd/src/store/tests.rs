@@ -876,3 +876,115 @@ fn every_query_that_orders_orders_by_version() {
     }
     assert!(found > 0, "since() orders its result");
 }
+
+#[test]
+fn store_opens_with_fast_pragmas() {
+    let (_dir, store) = open();
+    let sync_mode: i64 = store
+        .conn
+        .pragma_query_value(None, "synchronous", |row| row.get(0))
+        .unwrap();
+    let temp_store: i64 = store
+        .conn
+        .pragma_query_value(None, "temp_store", |row| row.get(0))
+        .unwrap();
+    assert_eq!(sync_mode, 1); // NORMAL
+    assert_eq!(temp_store, 2); // MEMORY
+}
+
+#[test]
+fn settings_seq_tracks_applied_settings_without_reading_full_body() {
+    let (_dir, mut store) = open();
+    assert_eq!(store.settings_seq().unwrap(), 0);
+    assert!(store.apply_settings(settings(4)).unwrap());
+    assert_eq!(store.settings_seq().unwrap(), 4);
+    assert!(!store.apply_settings(settings(2)).unwrap());
+    assert_eq!(store.settings_seq().unwrap(), 4);
+}
+
+#[test]
+fn live_session_count_counts_only_live_sessions_of_that_owner() {
+    let (_dir, mut store) = open();
+    let me = MachineId::random();
+    let peer = MachineId::random();
+    let make_session =
+        |id: u128, owner: MachineId, version: u64, state: SessionState, del: bool| {
+            AnyRecord::Session(Record {
+                owner,
+                version,
+                deleted: del,
+                body: Session {
+                    id: SessionId(uuid::Uuid::from_u128(id)),
+                    workspace: WorkspaceId(uuid::Uuid::from_u128(1)),
+                    terminal: TerminalId(uuid::Uuid::from_u128(3)),
+                    model: "opus".into(),
+                    state,
+                },
+            })
+        };
+    store.apply(&workspace(me, 1), me).unwrap();
+    store.apply(&terminal(me, 2), me).unwrap();
+    store.apply(&sample(me, 3), me).unwrap();
+    for (idx, state) in [
+        SessionState::Starting,
+        SessionState::Working,
+        SessionState::WaitingForYou,
+        SessionState::Idle,
+        SessionState::Stuck,
+        SessionState::Finished,
+        SessionState::Failed,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        store
+            .apply(
+                &make_session(100 + idx as u128, me, 10 + idx as u64, state, false),
+                me,
+            )
+            .unwrap();
+    }
+    store
+        .apply(&make_session(200, me, 20, SessionState::Working, true), me)
+        .unwrap();
+    store
+        .apply(
+            &make_session(201, peer, 1, SessionState::Working, false),
+            peer,
+        )
+        .unwrap();
+    // Unreadable row of another kind does not affect live_session_count.
+    insert_unreadable(&store, me, 30, "printer", "{}");
+
+    assert_eq!(store.live_session_count(me).unwrap(), 5);
+    assert_eq!(store.live_session_count(peer).unwrap(), 1);
+    assert_eq!(store.live_session_count(MachineId::random()).unwrap(), 0);
+}
+
+#[test]
+fn apply_batch_stores_valid_prefix_skips_stale_and_reports_not_owner() {
+    let (_dir, mut store) = open();
+    let owner = MachineId::random();
+    let other = MachineId::random();
+
+    // Seed workspace at version 2 so version 1 is stale.
+    store.apply(&workspace(owner, 2), owner).unwrap();
+
+    let mut refused = Vec::new();
+    let batch = [
+        workspace(owner, 1),      // stale
+        terminal(other, 1),       // not owner
+        terminal(owner, 3),       // stored
+        session(owner, u64::MAX), // error mid-batch
+        sample(owner, 4),         // must not be stored after error
+    ];
+    let err = store
+        .apply_batch(&batch, owner, |r| refused.push(r.owner()))
+        .unwrap_err();
+    assert!(matches!(err, StoreError::TooLarge { .. }), "{err}");
+    assert_eq!(refused, vec![other]);
+    assert_eq!(
+        store.since(owner, 0).unwrap(),
+        vec![workspace(owner, 2), terminal(owner, 3)]
+    );
+}

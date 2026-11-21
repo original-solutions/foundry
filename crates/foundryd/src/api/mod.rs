@@ -473,13 +473,12 @@ async fn on_store<T: Send + 'static>(
 
 // --- state and events ---
 
-/// The full state as [`UiMessage::State`], and the highest version it holds per owner. The
-/// versions are read first, so a record written while the state is read is sent again later
-/// rather than missed.
-async fn full_state(api: &Api) -> Result<(UiMessage, BTreeMap<MachineId, u64>), StoreError> {
-    let versions = on_store(&api.store, |store| store.versions()).await?;
-    let records = api.peers.state().await?;
-    let settings = on_store(&api.store, |store| store.settings()).await?;
+/// The full state as [`UiMessage::State`], and the highest version it holds per owner.
+async fn full_state_for(
+    api: &Api,
+    online: &BTreeSet<MachineId>,
+) -> Result<(UiMessage, BTreeMap<MachineId, u64>), StoreError> {
+    let (versions, records, settings) = api.peers.state_snapshot_for(online).await?;
     let state = UiMessage::State {
         protocol: PROTOCOL,
         records,
@@ -489,7 +488,8 @@ async fn full_state(api: &Api) -> Result<(UiMessage, BTreeMap<MachineId, u64>), 
 }
 
 async fn state(State(api): State<Api>) -> Result<Json<UiMessage>, ApiError> {
-    Ok(Json(full_state(&api).await?.0))
+    let online = api.peers.online();
+    Ok(Json(full_state_for(&api, &online).await?.0))
 }
 
 async fn machines(State(api): State<Api>) -> Result<Json<serde_json::Value>, ApiError> {
@@ -545,7 +545,10 @@ async fn send_events(api: &Api, mut socket: WebSocket) -> Result<(), StoreError>
             }
             continue;
         }
-        let held = on_store(&api.store, |store| store.versions()).await?;
+        let (held, seq) = on_store(&api.store, |store| {
+            Ok((store.versions()?, store.settings_seq()?))
+        })
+        .await?;
         for (owner, version) in held {
             let from = sent.versions.get(&owner).copied().unwrap_or(0);
             if version <= from {
@@ -575,8 +578,8 @@ async fn send_events(api: &Api, mut socket: WebSocket) -> Result<(), StoreError>
                 sent.versions.insert(owner, version);
             }
         }
-        let settings = on_store(&api.store, |store| store.settings()).await?;
-        if settings.seq != sent.seq {
+        if seq != sent.seq {
+            let settings = on_store(&api.store, |store| store.settings()).await?;
             sent.seq = settings.seq;
             let message = UiMessage::Settings {
                 protocol: PROTOCOL,
@@ -592,7 +595,7 @@ async fn send_events(api: &Api, mut socket: WebSocket) -> Result<(), StoreError>
 /// Sends the full state and says what it covered, or `None` when the UI has gone.
 async fn send_state(api: &Api, socket: &mut WebSocket) -> Result<Option<Sent>, StoreError> {
     let online = api.peers.online();
-    let (state, versions) = full_state(api).await?;
+    let (state, versions) = full_state_for(api, &online).await?;
     let seq = match &state {
         UiMessage::State { settings, .. } => settings.seq,
         _ => 0,

@@ -14,7 +14,6 @@ use std::time::Duration;
 use foundry_proto::ids::MachineId;
 use foundry_proto::record::{AnyRecord, MachineSample, Record};
 use foundry_proto::settings::Limits;
-use foundry_proto::state::SessionState;
 use nix::sys::statvfs::statvfs;
 use sysinfo::{CpuRefreshKind, LoadAvg, MemoryRefreshKind, RefreshKind, System};
 use tokio::time::MissedTickBehavior;
@@ -137,12 +136,24 @@ pub fn free_disk(path: &Path) -> Result<u64, MachineError> {
 
 /// Reads this machine's load, memory and the free disk for `data_dir`, with `sessions`.
 pub fn read(data_dir: &Path, sessions: u32) -> Result<MachineSample, MachineError> {
-    let system = System::new_with_specifics(
+    let mut system = System::new_with_specifics(
         RefreshKind::nothing()
             .with_cpu(CpuRefreshKind::nothing())
             .with_memory(MemoryRefreshKind::nothing().with_ram()),
     )
     .map_err(MachineError::System)?;
+    read_with(&mut system, data_dir, sessions, false)
+}
+
+fn read_with(
+    system: &mut System,
+    data_dir: &Path,
+    sessions: u32,
+    refresh_mem: bool,
+) -> Result<MachineSample, MachineError> {
+    if refresh_mem {
+        system.refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
+    }
     let load = System::load_average().map_err(MachineError::Load)?;
     Ok(MachineSample {
         load_per_core: load_per_core(&load, system.cpus().len()),
@@ -165,12 +176,45 @@ pub fn write_sample(
 ) -> Result<Record<MachineSample>, MachineError> {
     let machine = read(data_dir, 0)?;
     let update_refused = update_refused(data_dir);
+    store_sample(store, me, machine, update_refused)
+}
+
+fn write_sample_with(
+    system: &mut Option<System>,
+    store: &Mutex<Store>,
+    me: MachineId,
+    data_dir: &Path,
+) -> Result<Record<MachineSample>, MachineError> {
+    let machine = match system {
+        Some(sys) => read_with(sys, data_dir, 0, true)?,
+        None => {
+            let mut sys = System::new_with_specifics(
+                RefreshKind::nothing()
+                    .with_cpu(CpuRefreshKind::nothing())
+                    .with_memory(MemoryRefreshKind::nothing().with_ram()),
+            )
+            .map_err(MachineError::System)?;
+            let sample = read_with(&mut sys, data_dir, 0, false)?;
+            *system = Some(sys);
+            sample
+        }
+    };
+    let update_refused = update_refused(data_dir);
+    store_sample(store, me, machine, update_refused)
+}
+
+fn store_sample(
+    store: &Mutex<Store>,
+    me: MachineId,
+    machine: MachineSample,
+    update_refused: Option<String>,
+) -> Result<Record<MachineSample>, MachineError> {
     // A task that panicked while holding the store leaves it consistent: SQLite rolls back
     // a transaction that was not committed. Stopping here would freeze this machine's last
     // sample while it still looks online.
     let mut store = store.lock().unwrap_or_else(PoisonError::into_inner);
     let body = MachineSample {
-        sessions: live_sessions(&store, me)?,
+        sessions: store.live_session_count(me)?,
         update_refused,
         ..machine
     };
@@ -198,32 +242,22 @@ pub fn update_refused(home: &Path) -> Option<String> {
     let version = refused.strip_prefix('v').unwrap_or(&refused);
     (!update::lowered(update::current_version(home).as_deref(), version)).then_some(refused)
 }
-
-/// Sessions `me` owns that are not removed and have not finished or failed.
-fn live_sessions(store: &Store, me: MachineId) -> Result<u32, MachineError> {
-    let live = store
-        .since(me, 0)?
-        .into_iter()
-        .filter(|record| match record {
-            AnyRecord::Session(r) => {
-                !r.deleted && !matches!(r.body.state, SessionState::Finished | SessionState::Failed)
-            }
-            _ => false,
-        })
-        .count();
-    Ok(u32::try_from(live).unwrap_or(u32::MAX))
-}
-
 /// Writes a sample every [`SAMPLE_EVERY`], the first at once, each on the blocking pool so a
 /// slow disk read or a busy store never stalls an async worker. A sample that cannot be read
 /// or stored is logged and the next one is tried on time.
 pub async fn run(store: Arc<Mutex<Store>>, me: MachineId, data_dir: PathBuf) {
     let mut every = tokio::time::interval(SAMPLE_EVERY);
     every.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let system = Arc::new(Mutex::new(None::<System>));
     loop {
         every.tick().await;
-        let (store, data_dir) = (store.clone(), data_dir.clone());
-        match tokio::task::spawn_blocking(move || write_sample(&store, me, &data_dir)).await {
+        let (store, data_dir, system) = (store.clone(), data_dir.clone(), system.clone());
+        match tokio::task::spawn_blocking(move || {
+            let mut sys = system.lock().unwrap_or_else(PoisonError::into_inner);
+            write_sample_with(&mut sys, &store, me, &data_dir)
+        })
+        .await
+        {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => tracing::warn!(%error, "machine sample not written"),
             Err(error) => tracing::warn!(%error, "machine sample not written"),
@@ -267,6 +301,7 @@ mod tests {
     use super::*;
     use foundry_proto::ids::{SessionId, TerminalId, WorkspaceId};
     use foundry_proto::record::Session;
+    use foundry_proto::state::SessionState;
 
     fn sample(sessions: u32, load_per_core: f64, free_disk: u64) -> Record<MachineSample> {
         Record {

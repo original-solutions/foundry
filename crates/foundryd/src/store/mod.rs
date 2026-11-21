@@ -11,8 +11,9 @@ use std::path::Path;
 use foundry_proto::ids::{MachineId, TerminalId, WorkspaceId};
 use foundry_proto::record::{AnyRecord, Record, Terminal, Workspace};
 use foundry_proto::settings::SharedSettings;
+use foundry_proto::state::SessionState;
 use rusqlite::types::Type;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 #[cfg(test)]
 mod tests;
@@ -92,6 +93,10 @@ impl Store {
     /// Opens or creates the database at `path` and brings its schema up to date.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let mut conn = Connection::open(path)?;
+        conn.execute_batch(
+            "PRAGMA synchronous = NORMAL;
+             PRAGMA temp_store = MEMORY;",
+        )?;
         migrate(&mut conn, MIGRATIONS.len())?;
         Ok(Self { conn })
     }
@@ -100,46 +105,57 @@ impl Store {
     /// higher than the copy held. A deleted record is kept, so an older live copy that
     /// arrives later is [`Applied::Stale`] and cannot bring it back.
     pub fn apply(&mut self, record: &AnyRecord, from: MachineId) -> Result<Applied, StoreError> {
-        let owner = record.owner();
-        if owner != from {
+        if record.owner() != from {
             return Ok(Applied::NotOwner);
         }
-        let version = to_sql("version", record.version())?;
-        let (kind, id) = key(record);
-        let json = serde_json::to_string(record)?;
-
         let tx = self.conn.transaction()?;
-        let held: Option<(String, i64)> = tx
-            .query_row(
-                "SELECT owner, version FROM records WHERE kind = ?1 AND id = ?2",
-                params![kind, id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        match held {
-            Some((held_owner, _)) if held_owner != owner.to_string() => {
-                return Ok(Applied::NotOwner);
-            }
-            Some((_, held_version)) if version <= held_version => return Ok(Applied::Stale),
-            _ => {}
+        let applied = apply_in_tx(&tx, record, from)?;
+        if applied == Applied::Stored {
+            tx.commit()?;
         }
-        tx.execute(
-            "INSERT INTO records (kind, id, owner, version, record) VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT (kind, id) DO UPDATE SET version = excluded.version, record = excluded.record",
-            params![kind, id, owner.to_string(), version, json],
-        )?;
-        tx.commit()?;
-        Ok(Applied::Stored)
+        Ok(applied)
+    }
+
+    /// Stores a slice of records from `from` in one SQLite transaction, calling `on_not_owner`
+    /// for any record `from` does not own. On error, commits the prefix already applied so
+    /// nothing before the failing record is lost.
+    pub fn apply_batch(
+        &mut self,
+        records: &[AnyRecord],
+        from: MachineId,
+        mut on_not_owner: impl FnMut(&AnyRecord),
+    ) -> Result<(), StoreError> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.transaction()?;
+        let mut stored_any = false;
+        for record in records {
+            match apply_in_tx(&tx, record, from) {
+                Ok(Applied::Stored) => stored_any = true,
+                Ok(Applied::Stale) => {}
+                Ok(Applied::NotOwner) => on_not_owner(record),
+                Err(error) => {
+                    if stored_any {
+                        tx.commit()?;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        if stored_any {
+            tx.commit()?;
+        }
+        Ok(())
     }
 
     /// The version for this machine's next write of one of its own records. Each call gives
     /// a higher number than the last, across restarts too.
     pub fn own_next_version(&mut self) -> Result<u64, StoreError> {
-        let version: i64 = self.conn.query_row(
-            "UPDATE own_version SET version = version + 1 RETURNING version",
-            [],
-            |row| row.get(0),
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare_cached("UPDATE own_version SET version = version + 1 RETURNING version")?;
+        let version: i64 = stmt.query_row([], |row| row.get(0))?;
         Ok(from_sql(version))
     }
 
@@ -163,7 +179,7 @@ impl Store {
         // Nothing stored is above i64::MAX, so a larger `version` correctly finds nothing.
         let version = i64::try_from(version).unwrap_or(i64::MAX);
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        let mut query = self.conn.prepare(
+        let mut query = self.conn.prepare_cached(
             "SELECT record FROM records WHERE owner = ?1 AND version > ?2 ORDER BY version \
              LIMIT ?3",
         )?;
@@ -179,13 +195,11 @@ impl Store {
 
     /// The workspace record with `id`, deleted or not, read by its key without the rest.
     pub fn workspace(&self, id: WorkspaceId) -> Result<Option<Record<Workspace>>, StoreError> {
-        let json: Option<String> = self
+        let mut query = self
             .conn
-            .query_row(
-                "SELECT record FROM records WHERE kind = 'workspace' AND id = ?1",
-                params![id.to_string()],
-                |row| row.get(0),
-            )
+            .prepare_cached("SELECT record FROM records WHERE kind = 'workspace' AND id = ?1")?;
+        let json: Option<String> = query
+            .query_row(params![id.to_string()], |row| row.get(0))
             .optional()?;
         let Some(json) = json else {
             return Ok(None);
@@ -199,13 +213,11 @@ impl Store {
 
     /// The terminal record with `id`, deleted or not, read by its key without the rest.
     pub fn terminal(&self, id: TerminalId) -> Result<Option<Record<Terminal>>, StoreError> {
-        let json: Option<String> = self
+        let mut query = self
             .conn
-            .query_row(
-                "SELECT record FROM records WHERE kind = 'terminal' AND id = ?1",
-                params![id.to_string()],
-                |row| row.get(0),
-            )
+            .prepare_cached("SELECT record FROM records WHERE kind = 'terminal' AND id = ?1")?;
+        let json: Option<String> = query
+            .query_row(params![id.to_string()], |row| row.get(0))
             .optional()?;
         let Some(json) = json else {
             return Ok(None);
@@ -221,9 +233,9 @@ impl Store {
     /// workspace rows are parsed, so a row of another kind this build cannot read does not stop
     /// it.
     pub fn live_workspaces(&self) -> Result<Vec<Record<Workspace>>, StoreError> {
-        let mut query = self
-            .conn
-            .prepare("SELECT record FROM records WHERE kind = 'workspace' ORDER BY version")?;
+        let mut query = self.conn.prepare_cached(
+            "SELECT record FROM records WHERE kind = 'workspace' ORDER BY version",
+        )?;
         let rows = query.query_map([], |row| row.get::<_, String>(0))?;
         let mut records = Vec::new();
         for json in rows {
@@ -243,7 +255,7 @@ impl Store {
         owner: MachineId,
         workspace: WorkspaceId,
     ) -> Result<Vec<Record<Terminal>>, StoreError> {
-        let mut query = self.conn.prepare(
+        let mut query = self.conn.prepare_cached(
             "SELECT record FROM records WHERE owner = ?1 AND kind = 'terminal' \
              AND json_extract(record, '$.body.workspace') = ?2 ORDER BY version",
         )?;
@@ -259,11 +271,30 @@ impl Store {
         Ok(records)
     }
 
+    /// Live sessions owned by `owner`: not deleted and neither finished nor failed. Only
+    /// session rows of `owner` are read.
+    pub fn live_session_count(&self, owner: MachineId) -> Result<u32, StoreError> {
+        let mut query = self
+            .conn
+            .prepare_cached("SELECT record FROM records WHERE owner = ?1 AND kind = 'session'")?;
+        let rows = query.query_map(params![owner.to_string()], |row| row.get::<_, String>(0))?;
+        let mut live: usize = 0;
+        for json in rows {
+            if let AnyRecord::Session(r) = serde_json::from_str(&json?)?
+                && !r.deleted
+                && !matches!(r.body.state, SessionState::Finished | SessionState::Failed)
+            {
+                live += 1;
+            }
+        }
+        Ok(u32::try_from(live).unwrap_or(u32::MAX))
+    }
+
     /// The highest version held from each owner.
     pub fn versions(&self) -> Result<BTreeMap<MachineId, u64>, StoreError> {
         let mut query = self
             .conn
-            .prepare("SELECT owner, MAX(version) FROM records GROUP BY owner")?;
+            .prepare_cached("SELECT owner, MAX(version) FROM records GROUP BY owner")?;
         let rows = query.query_map([], |row| {
             let owner: String = row.get(0)?;
             let owner = owner.parse().map_err(|e| {
@@ -274,12 +305,17 @@ impl Store {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// The `seq` of the held shared settings, or `0` before any arrive, without parsing JSON.
+    pub fn settings_seq(&self) -> Result<u64, StoreError> {
+        let mut query = self.conn.prepare_cached("SELECT seq FROM settings")?;
+        let seq: Option<i64> = query.query_row([], |row| row.get(0)).optional()?;
+        Ok(seq.map_or(0, from_sql))
+    }
+
     /// The shared settings held, or empty settings with `seq` 0 before any arrive.
     pub fn settings(&self) -> Result<SharedSettings, StoreError> {
-        let json: Option<String> = self
-            .conn
-            .query_row("SELECT settings FROM settings", [], |row| row.get(0))
-            .optional()?;
+        let mut query = self.conn.prepare_cached("SELECT settings FROM settings")?;
+        let json: Option<String> = query.query_row([], |row| row.get(0)).optional()?;
         match json {
             Some(json) => Ok(serde_json::from_str(&json)?),
             None => Ok(SharedSettings::default()),
@@ -290,21 +326,22 @@ impl Store {
     /// did. Settings with an equal or lower `seq` change nothing.
     pub fn apply_settings(&mut self, settings: SharedSettings) -> Result<bool, StoreError> {
         let seq = to_sql("settings seq", settings.seq)?;
-        let json = serde_json::to_string(&settings)?;
 
         let tx = self.conn.transaction()?;
         let held: i64 = tx
-            .query_row("SELECT seq FROM settings", [], |row| row.get(0))
+            .prepare_cached("SELECT seq FROM settings")?
+            .query_row([], |row| row.get(0))
             .optional()?
             .unwrap_or(0);
         if seq <= held {
             return Ok(false);
         }
-        tx.execute(
+        let json = serde_json::to_string(&settings)?;
+        tx.prepare_cached(
             "INSERT INTO settings (only, seq, settings) VALUES (1, ?1, ?2)
              ON CONFLICT (only) DO UPDATE SET seq = excluded.seq, settings = excluded.settings",
-            params![seq, json],
-        )?;
+        )?
+        .execute(params![seq, json])?;
         tx.commit()?;
         Ok(true)
     }
@@ -314,6 +351,39 @@ impl Store {
     fn schema_version(&self) -> Result<usize, StoreError> {
         user_version(&self.conn)
     }
+}
+
+fn apply_in_tx(
+    tx: &Transaction<'_>,
+    record: &AnyRecord,
+    from: MachineId,
+) -> Result<Applied, StoreError> {
+    let owner = record.owner();
+    if owner != from {
+        return Ok(Applied::NotOwner);
+    }
+    let version = to_sql("version", record.version())?;
+    let (kind, id) = key(record);
+    let owner_str = owner.to_string();
+
+    let held: Option<(String, i64)> = tx
+        .prepare_cached("SELECT owner, version FROM records WHERE kind = ?1 AND id = ?2")?
+        .query_row(params![kind, id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .optional()?;
+    match held {
+        Some((held_owner, _)) if held_owner != owner_str => {
+            return Ok(Applied::NotOwner);
+        }
+        Some((_, held_version)) if version <= held_version => return Ok(Applied::Stale),
+        _ => {}
+    }
+    let json = serde_json::to_string(record)?;
+    tx.prepare_cached(
+        "INSERT INTO records (kind, id, owner, version, record) VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT (kind, id) DO UPDATE SET version = excluded.version, record = excluded.record",
+    )?
+    .execute(params![kind, id, owner_str, version, json])?;
+    Ok(Applied::Stored)
 }
 
 /// Runs the steps of [`MIGRATIONS`] the file has not had, up to step `to`, each in its own

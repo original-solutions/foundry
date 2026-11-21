@@ -54,25 +54,25 @@ impl Scrollback {
     pub fn push(&mut self, mut data: &[u8]) {
         if data.len() > self.max_bytes {
             let skipped = data.len() - self.max_bytes;
-            self.drop_front(self.bytes.len());
-            self.start += skipped as u64;
+            self.start += (self.bytes.len() + skipped) as u64;
+            self.bytes.clear();
+            self.newlines.clear();
             self.on_line = data[skipped - 1] == b'\n';
             data = &data[skipped..];
         }
         let over = (self.bytes.len() + data.len()).saturating_sub(self.max_bytes);
         self.drop_front(over);
         let end = self.start + self.bytes.len() as u64;
-        for (i, byte) in data.iter().enumerate() {
-            if *byte == b'\n' {
-                self.newlines.push_back(end + i as u64);
-            }
-        }
+        push_newlines(&mut self.newlines, data, end);
         self.bytes.extend(data);
         if !self.on_line {
             self.drop_to_next_line();
         }
-        while self.newlines.len() > self.max_lines {
-            self.drop_to_next_line();
+        if self.newlines.len() > self.max_lines {
+            let excess = self.newlines.len() - self.max_lines;
+            let at = self.newlines[excess - 1];
+            let n = usize::try_from(at + 1 - self.start).unwrap_or(self.bytes.len());
+            self.drop_front(n);
         }
     }
 
@@ -81,10 +81,29 @@ impl Scrollback {
         self.start
     }
 
+    /// Number of kept bytes.
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// True when no bytes are kept.
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    /// Appends everything kept, oldest first, into `dst`.
+    pub fn snapshot_into(&self, dst: &mut Vec<u8>) {
+        let (front, back) = self.bytes.as_slices();
+        dst.reserve(front.len() + back.len());
+        dst.extend_from_slice(front);
+        dst.extend_from_slice(back);
+    }
+
     /// Everything kept, oldest first.
     pub fn snapshot(&self) -> Vec<u8> {
-        let (front, back) = self.bytes.as_slices();
-        [front, back].concat()
+        let mut out = Vec::with_capacity(self.bytes.len());
+        self.snapshot_into(&mut out);
+        out
     }
 
     fn drop_front(&mut self, n: usize) {
@@ -104,6 +123,33 @@ impl Scrollback {
         if let Some(&at) = self.newlines.front() {
             let n = usize::try_from(at + 1 - self.start).unwrap_or(self.bytes.len());
             self.drop_front(n);
+        }
+    }
+}
+
+/// Records the stream offset of every `b'\n'` in `data`, scanning 8 bytes at a time via SWAR so
+/// chunks without newlines skip 8 bytes per iteration.
+fn push_newlines(newlines: &mut VecDeque<u64>, data: &[u8], base: u64) {
+    const LF_MASK: u64 = u64::from_ne_bytes([b'\n'; 8]);
+    const LO_BITS: u64 = 0x0101_0101_0101_0101;
+    const HI_BITS: u64 = 0x8080_8080_8080_8080;
+
+    let (chunks, tail) = data.as_chunks::<8>();
+    let mut offset = 0usize;
+    for chunk in chunks {
+        let x = u64::from_ne_bytes(*chunk) ^ LF_MASK;
+        if x.wrapping_sub(LO_BITS) & !x & HI_BITS != 0 {
+            for (j, &byte) in chunk.iter().enumerate() {
+                if byte == b'\n' {
+                    newlines.push_back(base + (offset + j) as u64);
+                }
+            }
+        }
+        offset += 8;
+    }
+    for (j, &byte) in tail.iter().enumerate() {
+        if byte == b'\n' {
+            newlines.push_back(base + (offset + j) as u64);
         }
     }
 }
@@ -165,5 +211,41 @@ mod tests {
         scrollback.push(b"abc\ndef\n");
         scrollback.push(b"ghi\n");
         assert_eq!(scrollback.snapshot(), b"def\nghi\n");
+    }
+
+    #[test]
+    fn snapshot_into_matches_snapshot_across_wrapped_ring_buffer() {
+        let mut scrollback = Scrollback::with_limits(10, 64);
+        // Push and evict several times so VecDeque wraps around internally.
+        for i in 0..40 {
+            scrollback.push(format!("line-{i:02}\n").as_bytes());
+        }
+        let mut dst = b"prefix:".to_vec();
+        scrollback.snapshot_into(&mut dst);
+        let mut expected = b"prefix:".to_vec();
+        expected.extend_from_slice(&scrollback.snapshot());
+        assert_eq!(dst, expected);
+        assert_eq!(scrollback.len(), scrollback.snapshot().len());
+    }
+
+    #[test]
+    fn bulk_push_over_line_limit_keeps_exact_tail() {
+        let mut scrollback = Scrollback::with_limits(100, 1024 * 1024);
+        scrollback.push(&numbered(1, 5_000));
+        assert_eq!(scrollback.snapshot(), numbered(4_901, 5_000));
+    }
+
+    #[test]
+    fn newline_scan_handles_every_word_lane_and_high_bytes() {
+        for pos in 0..16 {
+            let mut buf = vec![0x8au8; 24]; // 0x8a has low 7 bits equal to 0x0a ('\n')
+            buf[pos] = b'\n';
+            let mut sb = Scrollback::with_limits(1, 1024);
+            sb.push(&buf);
+            sb.push(b"tail\n");
+            let mut expected = buf[pos + 1..].to_vec();
+            expected.extend_from_slice(b"tail\n");
+            assert_eq!(sb.snapshot(), expected, "failed at newline position {pos}");
+        }
     }
 }

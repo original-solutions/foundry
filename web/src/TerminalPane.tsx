@@ -2,7 +2,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal, type ILink } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { MAX_FILE, sendFile, type FileChange } from "./api";
 import { changesQuery } from "./ChangesPanel";
 import { FindBar } from "./FindBar";
@@ -62,7 +62,7 @@ const NAMES_FILE = /[\w-]\.[A-Za-z0-9]{1,10}\b/;
  * changed files are read only for a line the pointer is on that has a file-like word, and one read
  * serves every line for a few seconds.
  */
-export function TerminalPane({
+export const TerminalPane = memo(function TerminalPane({
   id,
   running,
   active = true,
@@ -346,7 +346,7 @@ export function TerminalPane({
       {status && <div className="border-t border-neutral-800 px-3 py-1 text-xs text-amber-400">{status}</div>}
     </div>
   );
-}
+});
 
 /** Whether a click on a link opens it: with ⌘ or Ctrl held, so a plain click still selects; any tap on a touch screen. */
 function wants(event: MouseEvent): boolean {

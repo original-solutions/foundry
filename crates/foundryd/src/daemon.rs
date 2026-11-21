@@ -20,7 +20,9 @@ use nix::errno::Errno;
 use nix::fcntl::{Flock, FlockArg};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::task::{AbortHandle, JoinSet};
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::filter::{LevelFilter, Targets};
+use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::util::SubscriberInitExt as _;
 
 use crate::api::{self, Api, BindError};
 use crate::attention::Attention;
@@ -131,11 +133,10 @@ fn start() -> Result<(), DaemonError> {
     make_home(&home)?;
     // Held until this function returns.
     let _lock = lock(&home)?;
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_writer(io::stderr)
+    let filter = log_filter(std::env::var("RUST_LOG").ok().as_deref());
+    let _ = tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer().with_writer(io::stderr))
         .try_init();
     if !update::starting(&home) {
         return Ok(());
@@ -144,6 +145,13 @@ fn start() -> Result<(), DaemonError> {
     let result = runtime.block_on(serve(home, port));
     runtime.shutdown_timeout(EXIT_WITHIN);
     result
+}
+
+/// Parses `RUST_LOG` into a target/level filter, defaulting to `info`.
+fn log_filter(rust_log: Option<&str>) -> Targets {
+    rust_log
+        .and_then(|spec| spec.parse().ok())
+        .unwrap_or_else(|| Targets::new().with_default(LevelFilter::INFO))
 }
 
 /// Makes the data directory, readable only by this user, as the terminals' directory is. A
@@ -1240,5 +1248,23 @@ mod tests {
         let why = ask_cli(&cli, Duration::from_millis(200)).await.unwrap_err();
 
         assert!(why.contains("did not answer"), "{why}");
+    }
+
+    #[test]
+    fn log_filter_parses_rust_log_and_falls_back_to_info() {
+        use tracing::Level;
+
+        let default = log_filter(None);
+        assert!(default.would_enable("foundryd", &Level::INFO));
+        assert!(!default.would_enable("foundryd", &Level::DEBUG));
+
+        let custom = log_filter(Some("warn,foundryd=debug"));
+        assert!(custom.would_enable("foundryd::sync", &Level::DEBUG));
+        assert!(!custom.would_enable("hyper", &Level::INFO));
+        assert!(custom.would_enable("hyper", &Level::WARN));
+
+        let invalid = log_filter(Some("not=a=valid=level"));
+        assert!(invalid.would_enable("foundryd", &Level::INFO));
+        assert!(!invalid.would_enable("foundryd", &Level::DEBUG));
     }
 }

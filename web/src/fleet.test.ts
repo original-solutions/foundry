@@ -225,6 +225,15 @@ describe("terminalRunning", () => {
     expect(terminalRunning(state, "away")).toBe(false);
     expect(terminalRunning(state, "never")).toBe(false);
   });
+
+  it("replaces an existing record without mutating the prior state array", () => {
+    const initial = apply(emptyState, full([sample(ME, 1), workspace(ME, "w1", "a")]));
+    const prevRecords = initial.records;
+    const updated = apply(initial, one(sample(ME, 2, { load: 2.5 })));
+    expect(prevRecords[0].version).toBe(1);
+    expect(updated.records[0].version).toBe(2);
+    expect(updated.records).toHaveLength(2);
+  });
 });
 
 describe("locate", () => {

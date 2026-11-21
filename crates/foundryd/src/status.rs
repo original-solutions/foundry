@@ -1,7 +1,7 @@
 //! `foundryd status`: asks the local daemon for its state and prints each machine with its
 //! numbers and each of its sessions.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::io;
 use std::process::ExitCode;
@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use foundry_proto::ids::MachineId;
 use foundry_proto::messages::UiMessage;
-use foundry_proto::record::{AnyRecord, MachineSample, Record};
+use foundry_proto::record::{AnyRecord, MachineSample, Record, Session};
 use foundry_proto::settings::SharedSettings;
 use foundry_proto::state::{SessionState, TerminalState};
 
@@ -66,85 +66,108 @@ fn fetch(port: u16) -> Result<UiMessage, String> {
     }
 }
 
+#[derive(Default)]
+struct MachineSummary<'a> {
+    has_reachable: bool,
+    has_unreachable: bool,
+    newest_sample: Option<&'a Record<MachineSample>>,
+    live_sessions: Vec<&'a Record<Session>>,
+}
+
 /// Every machine and its sessions as plain text: machines in the settings' order, then any
 /// other machine that has a sample, by id. `/api/state` carries no online set, so a machine's
 /// state is shown only where its records prove it: `offline` when one is marked unreachable,
 /// `online` when one is not, `unknown` when it has none.
 pub fn render(records: &[AnyRecord], settings: &SharedSettings) -> String {
-    let mut machines: Vec<MachineId> = settings.machines.iter().map(|m| m.id).collect();
-    let listed: BTreeSet<MachineId> = machines.iter().copied().collect();
-    let others: BTreeSet<MachineId> = records
-        .iter()
-        .filter_map(|record| match record {
-            AnyRecord::MachineSample(sample) if !listed.contains(&sample.owner) => {
-                Some(sample.owner)
+    let mut names: BTreeMap<MachineId, &str> = BTreeMap::new();
+    let mut machines: Vec<MachineId> = Vec::with_capacity(settings.machines.len());
+    for machine in &settings.machines {
+        machines.push(machine.id);
+        names.insert(machine.id, machine.name.as_str());
+    }
+
+    let mut by_machine: BTreeMap<MachineId, MachineSummary<'_>> = BTreeMap::new();
+    let mut others: BTreeSet<MachineId> = BTreeSet::new();
+    for record in records {
+        match record {
+            AnyRecord::MachineSample(sample) => {
+                if !names.contains_key(&sample.owner) {
+                    others.insert(sample.owner);
+                }
+                let entry = by_machine.entry(sample.owner).or_default();
+                if entry
+                    .newest_sample
+                    .is_none_or(|prev| sample.version > prev.version)
+                {
+                    entry.newest_sample = Some(sample);
+                }
             }
-            _ => None,
-        })
-        .collect();
+            AnyRecord::Session(r) => {
+                let entry = by_machine.entry(r.owner).or_default();
+                if r.body.state == SessionState::Unreachable {
+                    entry.has_unreachable = true;
+                } else {
+                    entry.has_reachable = true;
+                }
+                if !r.deleted {
+                    entry.live_sessions.push(r);
+                }
+            }
+            AnyRecord::Terminal(r) => {
+                let entry = by_machine.entry(r.owner).or_default();
+                if r.body.state == TerminalState::Unreachable {
+                    entry.has_unreachable = true;
+                } else {
+                    entry.has_reachable = true;
+                }
+            }
+            AnyRecord::Workspace(_) => {}
+        }
+    }
     machines.extend(others);
 
     let mut out = String::new();
     for id in machines {
-        let name = settings
-            .machines
-            .iter()
-            .find(|m| m.id == id)
-            .map_or_else(|| id.to_string(), |m| m.name.clone());
-        machine_lines(&mut out, &name, id, records);
+        let fallback;
+        let name = match names.get(&id) {
+            Some(name) => *name,
+            None => {
+                fallback = id.to_string();
+                &fallback
+            }
+        };
+        let summary = by_machine.get(&id);
+        write_machine_lines(&mut out, name, summary);
     }
     out
 }
 
 /// The machine's line, then a line for each of its sessions that is not deleted.
-fn machine_lines(out: &mut String, name: &str, id: MachineId, records: &[AnyRecord]) {
-    // Whether each of the machine's sessions and terminals is unreachable.
-    let reachability: Vec<bool> = records
-        .iter()
-        .filter_map(|record| match record {
-            AnyRecord::Session(r) if r.owner == id => {
-                Some(r.body.state == SessionState::Unreachable)
-            }
-            AnyRecord::Terminal(r) if r.owner == id => {
-                Some(r.body.state == TerminalState::Unreachable)
-            }
-            _ => None,
-        })
-        .collect();
-    let state = if reachability.contains(&true) {
-        "offline"
-    } else if reachability.is_empty() {
-        "unknown"
-    } else {
-        "online"
+fn write_machine_lines(out: &mut String, name: &str, summary: Option<&MachineSummary<'_>>) {
+    let state = match summary {
+        Some(s) if s.has_unreachable => "offline",
+        Some(s) if s.has_reachable => "online",
+        _ => "unknown",
     };
-    let newest: Option<&Record<MachineSample>> = records
-        .iter()
-        .filter_map(|record| match record {
-            AnyRecord::MachineSample(sample) if sample.owner == id => Some(sample),
-            _ => None,
-        })
-        .max_by_key(|sample| sample.version);
-    let numbers = match newest {
+    match summary.and_then(|s| s.newest_sample) {
         Some(sample) => {
             let body = &sample.body;
             let plural = if body.sessions == 1 { "" } else { "s" };
-            format!(
-                "load {:.2}/core  memory {:.1} GB free  disk {:.1} GB free  {} session{plural}",
+            let _ = writeln!(
+                out,
+                "{name}  {state}  load {:.2}/core  memory {:.1} GB free  disk {:.1} GB free  {} session{plural}",
                 body.load_per_core,
                 gigabytes(body.free_memory),
                 gigabytes(body.free_disk),
                 body.sessions
-            )
+            );
         }
-        None => "no sample yet".to_owned(),
-    };
-    let _ = writeln!(out, "{name}  {state}  {numbers}");
-    for record in records {
-        if let AnyRecord::Session(r) = record
-            && r.owner == id
-            && !r.deleted
-        {
+        None => {
+            let _ = writeln!(out, "{name}  {state}  no sample yet");
+        }
+    }
+    if let Some(summary) = summary {
+        for r in &summary.live_sessions {
             let _ = writeln!(
                 out,
                 "  session {}  {}  {}",
@@ -162,11 +185,17 @@ fn gigabytes(bytes: u64) -> f64 {
 }
 
 /// A state as it is on the wire, such as `waiting_for_you`.
-fn wire_name(state: SessionState) -> String {
-    serde_json::to_value(state)
-        .ok()
-        .and_then(|value| value.as_str().map(str::to_owned))
-        .unwrap_or_else(|| format!("{state:?}"))
+fn wire_name(state: SessionState) -> &'static str {
+    match state {
+        SessionState::Starting => "starting",
+        SessionState::Working => "working",
+        SessionState::WaitingForYou => "waiting_for_you",
+        SessionState::Idle => "idle",
+        SessionState::Finished => "finished",
+        SessionState::Failed => "failed",
+        SessionState::Stuck => "stuck",
+        SessionState::Unreachable => "unreachable",
+    }
 }
 
 #[cfg(test)]
@@ -397,5 +426,22 @@ mod tests {
         assert!(at("first") < at("second"));
         assert!(at("second") < at(&low.to_string()));
         assert!(at(&low.to_string()) < at(&high.to_string()));
+    }
+
+    #[test]
+    fn wire_name_matches_serde_for_every_session_state() {
+        for state in [
+            SessionState::Starting,
+            SessionState::Working,
+            SessionState::WaitingForYou,
+            SessionState::Idle,
+            SessionState::Finished,
+            SessionState::Failed,
+            SessionState::Stuck,
+            SessionState::Unreachable,
+        ] {
+            let expected = serde_json::to_value(state).unwrap();
+            assert_eq!(wire_name(state), expected.as_str().unwrap());
+        }
     }
 }
