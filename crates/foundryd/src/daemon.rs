@@ -1166,6 +1166,25 @@ mod tests {
         );
     }
 
+    /// The listing restarts its wait after Tailscale was away: the watch says so until it is
+    /// read, however many answers come before.
+    #[tokio::test]
+    async fn an_ask_that_fails_marks_tailscale_away_until_the_mark_is_read() {
+        let mut tailscale = Tailscale::new(7433, Router::new());
+        assert!(!tailscale.away.load(std::sync::atomic::Ordering::Relaxed));
+
+        tailscale.scan(false, Err("logged out".to_owned())).await;
+        tailscale.scan(false, Ok(BTreeSet::new())).await;
+
+        assert!(
+            tailscale
+                .away
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+        );
+        tailscale.scan(false, Ok(BTreeSet::new())).await;
+        assert!(!tailscale.away.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
     /// After Tailscale answers again, a new failure is worth a new warning.
     #[tokio::test]
     async fn a_failure_after_tailscale_answered_again_is_warned_again() {

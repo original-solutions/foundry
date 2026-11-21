@@ -728,6 +728,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_wait_found_before_tailscale_went_away_starts_over_when_it_answers_again() {
+        let served = Served::new(|me, settings| {
+            settings
+                .machines
+                .push(machine(me, "Tom's desk", "100.64.0.9"));
+        })
+        .await;
+        let seq = served.settings().seq;
+        let mut listing = served.listing_after(SETTLE);
+        listing.list(here("personal-mac", "100.91.54.18")).await;
+
+        // Tailscale stops answering for longer than the settle time, so no look runs.
+        tokio::time::sleep(SETTLE * 2).await;
+        listing.away();
+        listing.list(here("personal-mac", "100.91.54.18")).await;
+        assert_eq!(
+            served.settings().seq,
+            seq,
+            "the first look after it is back sends nothing"
+        );
+        tokio::time::sleep(STEP).await;
+        listing.list(here("personal-mac", "100.91.54.18")).await;
+        assert_eq!(
+            served.settings().seq,
+            seq,
+            "nor does one inside the settle time"
+        );
+
+        tokio::time::sleep(STEP).await;
+        listing.list(here("personal-mac", "100.91.54.18")).await;
+        assert_eq!(
+            served.settings().machines,
+            [machine(served.me, "Tom's desk", "100.91.54.18")]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_send_the_coordinator_refused_is_sent_again_on_the_very_next_look() {
+        let peer = MachineId::random();
+        let served = Served::new(|me, settings| {
+            settings
+                .machines
+                .push(machine(peer, "trilogy-mac", "100.64.0.2"));
+            settings.priority = vec![peer, me];
+        })
+        .await;
+        served.hear(peer).await;
+        let mut listing = served.listing_after(SETTLE);
+        for _ in 0..3 {
+            listing.list(here("personal-mac", "100.91.54.18")).await;
+            tokio::time::sleep(STEP).await;
+        }
+        assert!(
+            !served.settings().machines.iter().any(|m| m.id == served.me),
+            "the peer acts and cannot be reached, so the send failed"
+        );
+
+        // This machine comes to act; the next look, with no wait, sends again.
+        let mut acting = served.settings();
+        acting.seq += 1;
+        acting.priority = vec![served.me, peer];
+        served.store.lock().unwrap().apply_settings(acting).unwrap();
+        listing.list(here("personal-mac", "100.91.54.18")).await;
+        assert!(served.settings().machines.contains(&machine(
+            served.me,
+            "personal-mac",
+            "100.91.54.18"
+        )));
+    }
+
+    #[tokio::test]
     async fn after_a_send_the_next_look_waits_for_the_copy_that_holds_it() {
         let served = Served::new(|_, _| {}).await;
         let mut listing = served.listing_after(SETTLE);
