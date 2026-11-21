@@ -221,8 +221,8 @@ impl Fixture {
             &cli,
             r#"#!/bin/sh
 case "$*" in
-ip) echo 100.91.54.18 ;;
-"status --self --json") echo '{"Self": {"HostName": "Personal Mac", "DNSName": "personal-mac.tail459612.ts.net.", "TailscaleIPs": ["100.91.54.18", "fd7a:115c:a1e0::e832:3612"]}}' ;;
+ip) echo 100.127.254.253 ;;
+"status --self --json") echo '{"Self": {"HostName": "Personal Mac", "DNSName": "personal-mac.tail459612.ts.net.", "TailscaleIPs": ["100.127.254.253", "fd7a:115c:a1e0::e832:3612"]}}' ;;
 *) exit 9 ;;
 esac
 "#,
