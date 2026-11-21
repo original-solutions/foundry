@@ -1281,6 +1281,81 @@ async fn acting_with_a_peer() -> (
     (fleet, peer, conn, said)
 }
 
+/// Gives the acting `daemon` project `n` named `name`, as an add it numbered would.
+fn holding_project(daemon: &Daemon, n: u128, name: &str) {
+    let mut settings = daemon.settings();
+    settings.seq += 1;
+    settings.projects.push(project(n, name));
+    settings.stamps.insert(
+        project_key(n),
+        Stamp {
+            seq: settings.seq,
+            by: daemon.id,
+        },
+    );
+    settings.seen.insert(daemon.id, settings.seq);
+    daemon.set_settings(settings);
+}
+
+/// The one answer the daemon sent, once it has sent one.
+async fn the_answer(said: &Mutex<Vec<serde_json::Value>>) -> (EditId, Outcome) {
+    until(Duration::from_secs(2), "the edit is answered", || {
+        !answers_sent(said).is_empty()
+    })
+    .await;
+    let answers = answers_sent(said);
+    assert_eq!(answers.len(), 1, "{answers:?}");
+    answers[0].clone()
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_add_of_a_held_name_forwarded_by_a_machine_that_has_not_heard_of_it_is_refused() {
+    let (fleet, _, conn, said) = acting_with_a_peer().await;
+    let daemon = &fleet.daemons[0];
+    holding_project(daemon, 1, "Foundry");
+    let before = daemon.settings();
+    // The peer's copy predates the first add, and it sends one of its own under that name.
+    let id = EditId::random();
+    say(&conn, &edit_with(id, set_project(2, " fOUNDRY "))).await;
+    let (answered, outcome) = the_answer(&said).await;
+    assert_eq!(answered, id);
+    let Outcome::Refused { reason, conflict } = outcome else {
+        panic!("not refused: {outcome:?}");
+    };
+    assert!(conflict, "{reason}");
+    for value in ["oundry", "OUNDRY", "example.invalid"] {
+        assert!(!reason.contains(value), "{value} in {reason}");
+    }
+    assert_eq!(daemon.settings(), before);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_remove_forwarded_while_the_acting_machine_holds_a_live_workspace_of_it_is_refused() {
+    let (fleet, _, conn, said) = acting_with_a_peer().await;
+    let daemon = &fleet.daemons[0];
+    holding_project(daemon, 1, "foundry");
+    // A workspace of project 1, made on the acting machine, whose records the peer lacks.
+    daemon.write(workspace(WorkspaceId::random(), false));
+    let id = EditId::random();
+    let remove = Edit::RemoveProject {
+        id: project(1, "").id,
+    };
+    say(&conn, &edit_with(id, remove)).await;
+    let (answered, outcome) = the_answer(&said).await;
+    assert_eq!(answered, id);
+    let Outcome::Refused { reason, conflict } = outcome else {
+        panic!("not refused: {outcome:?}");
+    };
+    assert!(conflict, "{reason}");
+    for value in ["foundry", "fix login", "example.invalid"] {
+        assert!(!reason.contains(value), "{value} in {reason}");
+    }
+    assert_eq!(
+        project_named(&daemon.settings(), 1).as_deref(),
+        Some("foundry")
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn the_acting_machine_answers_a_forwarded_edit_with_its_id_and_stamp() {
     let (fleet, _, conn, said) = acting_with_a_peer().await;
@@ -1544,6 +1619,7 @@ async fn an_edit_the_acting_machine_refuses_returns_its_reason() {
             id.unwrap(),
             Outcome::Refused {
                 reason: reason.clone(),
+                conflict: false,
             },
         ),
     )
@@ -1623,6 +1699,7 @@ async fn a_machine_that_passes_a_forwarded_edit_on_passes_its_answer_back() {
     assert_eq!(edits_sent(&said_a)[0].0, Some(id));
     let refused = Outcome::Refused {
         reason: format!("{acting} could not store it"),
+        conflict: false,
     };
     say(&ca, &answer(id, refused.clone())).await;
     until(Duration::from_secs(2), "the answer is passed back", || {
@@ -1906,6 +1983,7 @@ async fn an_answer_on_a_link_that_refused_a_message_is_still_taken() {
             id.unwrap(),
             Outcome::Refused {
                 reason: "no".into(),
+                conflict: false,
             },
         ),
     )
@@ -1982,6 +2060,55 @@ async fn a_failed_write_after_the_edit_was_sent_does_not_end_the_wait_once_the_r
         project_named(&daemon.settings(), 7).as_deref(),
         Some("written later")
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_own_add_sent_before_the_role_moves_here_is_not_refused_by_the_rules_here() {
+    let peer = MachineId::random();
+    let fleet = Fleet::start_coordinated_with(1, &[peer]);
+    let daemon = &fleet.daemons[0];
+    let (conn, said) = recorded(raw_link(daemon, peer).await);
+    let theirs = ordered_by(&daemon.settings(), peer, vec![peer, daemon.id]);
+    say(&conn, &settings_message(theirs)).await;
+    let beat = beating(conn.clone());
+    acting_becomes(&daemon.coordinator(), peer, WAIT).await;
+    holding_project(daemon, 1, "foundry");
+    let editing = tokio::spawn({
+        let coordinator = daemon.coordinator();
+        async move { coordinator.edit(set_project(7, "Foundry")).await }
+    });
+    until(Duration::from_secs(2), "the edit is sent", || {
+        !edits_sent(&said).is_empty()
+    })
+    .await;
+    let id = edits_sent(&said)[0].0.expect("sent with an id");
+
+    // The peer goes quiet, so the role moves here, where the add breaks the name rule. The
+    // peer may have numbered it, so it waits.
+    beat.abort();
+    acting_becomes(&daemon.coordinator(), daemon.id, WAIT).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(!editing.is_finished(), "ended by the rule here");
+
+    // The peer comes back on a new link with a copy that holds its stamp for the id, which
+    // settles it.
+    let (conn, _) = recorded(raw_link(daemon, peer).await);
+    let mut numbered = daemon.settings();
+    numbered.seq += 5;
+    numbered.projects.push(project(7, "Foundry"));
+    let stamp = Stamp {
+        seq: numbered.seq,
+        by: peer,
+    };
+    numbered.stamps.insert(project_key(7), stamp);
+    numbered.seen.insert(peer, numbered.seq);
+    numbered.numbered.insert(id, stamp);
+    say(&conn, &settings_message(numbered)).await;
+    let made = tokio::time::timeout(Duration::from_secs(2), editing)
+        .await
+        .expect("settled by the stamp")
+        .unwrap();
+    assert_eq!(made.unwrap(), stamp);
 }
 
 #[tokio::test(start_paused = true)]
@@ -2121,6 +2248,7 @@ async fn a_refusal_from_a_second_machine_is_not_final_for_an_edit_sent_to_two() 
     let (id, _) = edits_sent(&said2)[0].clone();
     let refused = Outcome::Refused {
         reason: "no".into(),
+        conflict: false,
     };
     say(&c2, &answer(id.unwrap(), refused)).await;
     let error = tokio::time::timeout(OFFLINE_AFTER * 3, editing)
@@ -2196,6 +2324,7 @@ async fn a_stamp_from_the_second_machine_replaces_the_first_machines_refusal() {
     let id = id.unwrap();
     let refused = Outcome::Refused {
         reason: "no".into(),
+        conflict: false,
     };
     // An answer is for an id, whichever link carries it.
     say(&c2, &answer(id, refused)).await;
