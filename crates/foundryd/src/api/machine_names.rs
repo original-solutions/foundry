@@ -13,10 +13,9 @@
 //!
 //! Both decide from this machine's copy of the settings and send the whole entry, as
 //! `SetMachine` carries it. So the listing gives peers' copies time to arrive before it
-//! decides: its first look, the first after Tailscale was away, and the one after each edit it
-//! sent do nothing, and it acts on a look the settle time later. A machine renamed elsewhere
-//! while it was away, or added to the list by a peer, finds that entry when a peer can reach it
-//! within that time. What stays open: a rename sent from a copy that has not yet heard of the
+//! decides: it sends an edit only from a look at least the settle time after the look that
+//! first found it needed. A machine renamed elsewhere while it was away, or added to the list
+//! by a peer, finds that entry when a peer can reach it within that time. What stays open: a rename sent from a copy that has not yet heard of the
 //! machine's new address puts the old address back until the machine's next look moves it
 //! again, and an edit numbered elsewhere between a look's read and its send is replaced. The
 //! default name is not checked as a rename is: a default another machine already has, or one
@@ -101,10 +100,8 @@ pub struct Listing {
     warned: bool,
     /// How long peers' copies get to arrive before a look acts.
     settle: Duration,
-    /// When the last look came, so a look after a longer gap than `settle` waits again.
-    looked: Option<Instant>,
-    /// Until when a look does nothing.
-    settled: Instant,
+    /// Since when the looks have found an edit to send; `None` while there is none.
+    found: Option<Instant>,
 }
 
 impl Listing {
@@ -122,8 +119,7 @@ impl Listing {
             store,
             warned: false,
             settle,
-            looked: None,
-            settled: Instant::now(),
+            found: None,
         }
     }
 
@@ -131,26 +127,13 @@ impl Listing {
     /// moves it to `entry`'s address, keeping its name, when the address it holds differs.
     /// A failure, or no entry, is logged once until a look succeeds; the next look tries again.
     ///
-    /// The first look, a look more than the settle time after the one before (Tailscale was
-    /// away, so no peer could link), and every look within the settle time after one of those,
-    /// or after an edit this sent, do nothing.
+    /// The look that first finds an edit to send sends nothing: one at least the settle time
+    /// later that still finds it sends it, so peers' copies can arrive first, whatever kept this
+    /// machine away. A look that finds nothing to send, or sends, ends the wait; a failed send
+    /// does not, so the next look tries again.
     pub async fn list(&mut self, entry: Result<Entry, String>) {
-        let now = Instant::now();
-        if self.looked.is_none_or(|at| now - at > self.settle) {
-            self.settled = now + self.settle;
-        }
-        self.looked = Some(now);
-        if now < self.settled {
-            return;
-        }
-        match self.send(entry).await {
-            Ok(sent) => {
-                self.warned = false;
-                if sent {
-                    // The copy that holds the edit can come after its answer.
-                    self.settled = Instant::now() + self.settle;
-                }
-            }
+        match self.look(entry).await {
+            Ok(()) => self.warned = false,
             Err(why) => {
                 if !self.warned {
                     tracing::warn!(
@@ -162,8 +145,7 @@ impl Listing {
         }
     }
 
-    /// Sends the edit this look calls for, if any: whether it sent one.
-    async fn send(&self, entry: Result<Entry, String>) -> Result<bool, String> {
+    async fn look(&mut self, entry: Result<Entry, String>) -> Result<(), String> {
         let entry = entry?;
         let settings = on_store(&self.store, |store| store.settings())
             .await
@@ -178,13 +160,21 @@ impl Listing {
                 address: entry.address,
                 ..held.clone()
             },
-            Some(_) => return Ok(false),
+            Some(_) => {
+                self.found = None;
+                return Ok(());
+            }
         };
+        let found = *self.found.get_or_insert_with(Instant::now);
+        if found.elapsed() < self.settle {
+            return Ok(());
+        }
         self.coordinator
             .edit(Edit::SetMachine { machine })
             .await
-            .map(|_| true)
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        self.found = None;
+        Ok(())
     }
 }
 
