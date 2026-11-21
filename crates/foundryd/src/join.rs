@@ -102,7 +102,14 @@ pub fn join(address: &str, code: &str) -> ExitCode {
         eprintln!("foundryd join: set FOUNDRY_HOME or HOME");
         return ExitCode::FAILURE;
     };
-    match join_at(address, port, code, &*secrets::for_this_machine(&home)) {
+    let secrets = match secrets::for_this_machine(&home) {
+        Ok(secrets) => secrets,
+        Err(error) => {
+            eprintln!("foundryd join: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match join_at(address, port, code, &*secrets) {
         Ok(machine) => {
             println!(
                 "joined the fleet as machine {machine}; if foundryd is already running here, \
@@ -543,7 +550,7 @@ impl Keys {
     /// This machine's identity and key table, kept in `secrets`, with no codes outstanding.
     /// A machine with no identity yet is given one, and its own entry is always its own key.
     ///
-    /// Blocks on the secret store: a keychain prompt, or another process's lock until
+    /// Blocks on the secret store: a disk that does not answer, or another process's lock until
     /// [`secrets::LOCK_WAIT`] passes with no change getting through. Call it from a blocking
     /// context, not an async task.
     pub fn open(secrets: Arc<dyn Secrets>) -> Result<Self, JoinError> {
@@ -770,7 +777,7 @@ impl Keys {
     }
 
     /// The `saving` lock. A change waiting behind others that keep taking it waits on; one
-    /// that sees nobody take it for `wait`, as when a holder is stuck on a keychain prompt,
+    /// that sees nobody take it for `wait`, as when a holder is stuck on the secret store,
     /// gives [`JoinError::Busy`].
     fn saving_within(&self, wait: Duration) -> Result<MutexGuard<'_, ()>, JoinError> {
         let mut seen = self.inner.taken.load(Ordering::SeqCst);
@@ -1004,7 +1011,7 @@ async fn redeem(State(keys): State<Keys>, Json(request): Json<JoinRequest>) -> R
         machine: keys.me(),
         key: keys.public_key(),
     };
-    // Saving the key table can wait on the keychain or the disk.
+    // Saving the key table can wait on the disk.
     let redeemed = tokio::task::spawn_blocking(move || {
         keys.redeem(&request.code, request.machine, &request.key)
     })
@@ -1105,10 +1112,9 @@ mod tests {
         }
         fn set(&self, name: &str, value: &str) -> Result<(), SecretsError> {
             if self.failing.load(Ordering::SeqCst) {
-                return Err(SecretsError::Keychain {
-                    action: "store",
-                    name: name.to_owned(),
-                    reason: "test".into(),
+                return Err(SecretsError::Io {
+                    path: "secrets.json".into(),
+                    source: std::io::ErrorKind::PermissionDenied.into(),
                 });
             }
             self.inner.set(name, value)
