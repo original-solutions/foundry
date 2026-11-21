@@ -418,3 +418,112 @@ async fn take(
     })
     .await
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::io;
+    use std::sync::{Arc, Mutex};
+
+    use foundry_proto::settings::Machine;
+    use futures::future::BoxFuture;
+
+    use super::*;
+    use crate::store::Store;
+    use crate::sync::{Conn, Dialer, Peers};
+
+    struct NoDial;
+
+    impl Dialer for NoDial {
+        fn dial(&self, _: &Machine) -> BoxFuture<'static, io::Result<Conn>> {
+            Box::pin(async { Err(io::Error::other("no peers in these tests")) })
+        }
+    }
+
+    const WAIT: Duration = Duration::from_secs(5);
+
+    /// A machine whose list holds `listed`, a peer dialing it, and the peer's end of the link.
+    struct Dialed {
+        _data: tempfile::TempDir,
+        theirs: Conn,
+        accepting: tokio::task::JoinHandle<()>,
+    }
+
+    impl Dialed {
+        /// This machine lists `listed` (by id) and accepts a link `peer` opens with a hello.
+        async fn new(listed: impl FnOnce(MachineId) -> Vec<MachineId>, peer: MachineId) -> Self {
+            let data = tempfile::tempdir().unwrap();
+            let me = MachineId::random();
+            let mut store = Store::open(data.path().join("foundry.db")).unwrap();
+            let mut held = store.settings().unwrap();
+            held.seq += 1;
+            held.machines = listed(me)
+                .into_iter()
+                .enumerate()
+                .map(|(i, id)| Machine {
+                    id,
+                    name: format!("machine-{i}"),
+                    address: format!("100.64.0.{}", i + 1),
+                })
+                .collect();
+            store.apply_settings(held).unwrap();
+            let peers = Peers::new(me, Arc::new(Mutex::new(store)), Arc::new(NoDial));
+            let (ours, theirs) = Conn::pair();
+            let accepting = tokio::spawn(async move { peers.accept(ours).await });
+            let hello = PeerMessage::Hello {
+                protocol: PROTOCOL,
+                machine: peer,
+                versions: BTreeMap::new(),
+            };
+            theirs
+                .send
+                .send(serde_json::to_string(&hello).unwrap())
+                .await
+                .unwrap();
+            Self {
+                _data: data,
+                theirs,
+                accepting,
+            }
+        }
+
+        /// The next message on the link, or `None` when it closed or sent nothing in time.
+        async fn next(&mut self) -> Option<PeerMessage> {
+            let text = timeout(WAIT, self.theirs.recv.recv()).await.ok()??;
+            Some(serde_json::from_str(&text).unwrap())
+        }
+
+        /// Whether the link was accepted: a hello came back.
+        async fn accepted(&mut self) -> bool {
+            matches!(self.next().await, Some(PeerMessage::Hello { .. }))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_machine_whose_list_holds_only_itself_opens_a_link_a_peer_dialed() {
+        let mut link = Dialed::new(|me| vec![me], MachineId::random()).await;
+
+        assert!(link.accepted().await, "the link was refused");
+        // The link stays open past its first tick: a heartbeat arrives, not a close.
+        assert!(
+            matches!(link.next().await, Some(PeerMessage::Records { .. })),
+            "the link closed instead of sending"
+        );
+        assert!(!link.accepting.is_finished());
+    }
+
+    #[tokio::test]
+    async fn a_machine_whose_list_is_empty_opens_a_link_a_peer_dialed() {
+        let mut link = Dialed::new(|_| Vec::new(), MachineId::random()).await;
+
+        assert!(link.accepted().await, "the link was refused");
+    }
+
+    #[tokio::test]
+    async fn a_machine_whose_list_holds_another_machine_refuses_a_link_from_one_not_in_it() {
+        let mut link = Dialed::new(|me| vec![me, MachineId::random()], MachineId::random()).await;
+
+        assert!(!link.accepted().await, "the link was accepted");
+        link.accepting.await.unwrap();
+    }
+}
