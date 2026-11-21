@@ -9,6 +9,7 @@ export type AttentionKind =
   | "setup_failed"
   | "gateway_unhealthy"
   | "disk_low"
+  | "placement_waiting"
   | "setting_overwritten"
   | "update_refused";
 
@@ -35,6 +36,7 @@ export const kindLabel: Record<AttentionKind, string> = {
   setup_failed: "Setup failed",
   gateway_unhealthy: "Gateway unhealthy",
   disk_low: "Disk low",
+  placement_waiting: "Placement waiting",
   setting_overwritten: "Setting overwritten",
   update_refused: "Update refused",
 };

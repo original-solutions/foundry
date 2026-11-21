@@ -1,6 +1,6 @@
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
-import { ApiError, createWorkspace, listMachines, startSession, type Project } from "./api";
+import { ApiError, createWorkspace, listMachines, placementsKey, startSession, type Project } from "./api";
 import { safeBranch, sameBranch } from "./branch";
 import { promptOf, sendKey, SparkIcon } from "./FirstPrompt";
 import type { WorkspaceView } from "./fleet";
@@ -12,7 +12,7 @@ class SessionNotStarted extends ApiError {}
 
 /**
  * What a new workspace is made from: its project, base, name and machine (absent for this
- * machine), then its session's model and first prompt.
+ * machine, "choose" to let Foundry pick one), then its session's model and first prompt.
  */
 export interface CreateInput {
   project: string;
@@ -26,24 +26,32 @@ export interface CreateInput {
 /**
  * Makes a workspace, then starts a session in it, saying which `step` it is on. `made` is true
  * once the workspace exists, even when its session then failed to start, since a second try
- * would only find its name taken.
+ * would only find its name taken. Letting Foundry choose sends the model and first prompt along:
+ * when no machine qualifies the request waits (`session` is null), the waiting list is read
+ * again to show it, and Foundry starts the session once it is placed.
  */
 export function useCreateWorkspace() {
   const [step, setStep] = useState<"branch" | "session">("branch");
+  const client = useQueryClient();
   const create = useMutation({
-    mutationFn: async (input: CreateInput) => {
+    mutationFn: async (input: CreateInput): Promise<{ session: string | null; warning: string | null }> => {
       setStep("branch");
-      const workspace = await createWorkspace({ project: input.project, base: input.base, name: input.name, machine: input.machine });
+      const session = input.machine === "choose" ? { model: input.model, prompt: input.prompt } : {};
+      const workspace = await createWorkspace({ project: input.project, base: input.base, name: input.name, machine: input.machine, ...session });
+      if ("request" in workspace) {
+        await client.invalidateQueries({ queryKey: placementsKey });
+        return { session: null, warning: null };
+      }
       setStep("session");
       // The workspace is usable when its setup did not start, so its session is started all the same.
-      let session: string;
+      let started: string;
       try {
-        session = await startSession(workspace.id, input.model, input.prompt);
+        started = await startSession(workspace.id, input.model, input.prompt);
       } catch (error) {
-        const setup = workspace.error ? ` Also: ${workspace.error}` : "";
-        throw new SessionNotStarted(`The workspace was made, but its session did not start: ${error instanceof Error ? error.message : error}.${setup}`);
+        const also = [workspace.error, workspace.warning].filter(Boolean).map((said) => ` Also: ${said}`).join("");
+        throw new SessionNotStarted(`The workspace was made, but its session did not start: ${error instanceof Error ? error.message : error}.${also}`);
       }
-      return { session, warning: workspace.error ?? null };
+      return { session: started, warning: [workspace.error, workspace.warning].filter(Boolean).join(" ") || null };
     },
   });
   const made = create.isSuccess || create.error instanceof SessionNotStarted;
@@ -91,9 +99,9 @@ function freeName(name: string, project: Project | undefined, workspaces: Worksp
  * typed (numbered when the project already has that branch), the project, base and model sit
  * under it, and Start (or Cmd+Enter) makes the workspace and starts Claude Code on the task,
  * handing the session to `onCreated` so the layout lands in it. The workspace is made on this
- * machine, or on another listed one when the fleet has one and it is picked; an offline machine
- * is shown but cannot be picked. When the machine list cannot be read, only this machine is
- * offered.
+ * machine, or on another listed one when the fleet has one and it is picked, or on the one
+ * Foundry picks when it is let choose; an offline machine is shown but cannot be picked. When
+ * the machine list cannot be read, only this machine is offered.
  *
  * On the first-run page and in the New task dialog (`page`) it is open and big. At the top of
  * the board (`bar`) it is one line beside a way to jump until it is used, so starting the next
@@ -159,7 +167,10 @@ export function Composer({
     if (!ready || !project) return;
     create.mutate(
       { project: project.id, base: base.trim(), name: chosen, machine: machine || undefined, model: model.trim(), prompt },
-      { onSuccess: ({ session, warning }) => onCreated(session, warning) },
+      {
+        // A request that waits is shown in the waiting list; the box is done with it.
+        onSuccess: ({ session, warning }) => (session ? onCreated(session, warning) : (onDone ?? clear)()),
+      },
     );
   };
   const clear = () => {
@@ -269,6 +280,7 @@ export function Composer({
                 on
                 <select name="machine" aria-label="Machine" value={machine} onChange={(e) => setMachine(e.target.value)} className={`${inlineField} font-sans`}>
                   <option value="">this machine</option>
+                  <option value="choose">let Foundry choose</option>
                   {others.map((m) => (
                     <option key={m.id} value={m.id} disabled={!m.online}>
                       {m.online ? m.name : `${m.name} (offline)`}

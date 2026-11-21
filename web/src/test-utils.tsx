@@ -47,7 +47,7 @@ export function expectFieldLook(element: HTMLElement) {
 
 /**
  * Stubs `fetch` to give `answers` in order, and returns the requests it was sent. The layout's reads
- * of session briefs and of the attention list get none, a read of where a workspace's branch
+ * of session briefs, the attention list and the waiting list get none, a read of where a workspace's branch
  * stands gets a branch never pushed with nothing to push (so no line shows), and the task box's
  * read of the machines gets this machine alone; all are left out, so a test sees only the
  * requests it makes.
@@ -59,6 +59,7 @@ export function mockFetch(...answers: Response[]): Call[] {
     vi.fn(async (url: string, init: RequestInit = {}) => {
       if (url === "/api/briefs") return json(200, {});
       if (url === "/api/attention") return json(200, { items: [] });
+      if (url === "/api/placements") return json(200, { requests: [] });
       if (url === "/api/machines") return json(200, { me: "me", machines: [] });
       if (/^\/api\/workspaces\/[^/]+\/pr$/.test(url)) return json(200, { branch: "b", pushed: false, unpushed: 0, pr: null, unreachable: false });
       calls.push({ url, method: init.method ?? "GET", body: init.body ? JSON.parse(String(init.body)) : undefined });

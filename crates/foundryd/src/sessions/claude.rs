@@ -1,10 +1,12 @@
-//! What Claude Code reads: the settings file that registers the hooks, and the state file where
-//! a folder is marked trusted so the trust prompt does not stop a session.
+//! What Claude Code reads: the settings file that registers the hooks, the state file where
+//! a folder is marked trusted so the trust prompt does not stop a session, and the keys that
+//! type a session's first prompt.
 
 use std::ffi::OsString;
 use std::io::{self, Write as _};
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde_json::{Map, Value, json};
 
@@ -23,6 +25,39 @@ const EVENTS: [&str; 7] = [
 
 /// The events that take a tool matcher.
 const TOOL_EVENTS: [&str; 2] = ["PreToolUse", "PostToolUse"];
+
+/// What Claude Code writes once its screen takes keys: it turns bracketed paste on. The input
+/// box turns it on just after `SessionStart`, but a screen before the session starts, such as
+/// the trust prompt, turns it on too, so the sign counts only with `SessionStart`.
+pub const TAKES_INPUT: &[u8] = b"\x1b[?2004h";
+
+/// How long after `SessionStart` a first prompt waits when the only sign that Claude Code takes
+/// input came before it, from an earlier screen. In a probe of 2.1.322 the input box turned
+/// bracketed paste on 0.19 s after the hook ran, and the contract test checks the sign is on the
+/// screen within half of this after it sees `SessionStart`.
+pub const EARLIER_SIGN_GRACE: Duration = Duration::from_secs(1);
+
+/// Whether `output`, read after `tail`, turns bracketed paste on ([`TAKES_INPUT`]). `tail` keeps
+/// the end of what was read, so a sign cut between two reads is still found.
+pub fn turns_paste_on(tail: &mut Vec<u8>, output: &[u8]) -> bool {
+    tail.extend_from_slice(output);
+    if tail.windows(TAKES_INPUT.len()).any(|w| w == TAKES_INPUT) {
+        tail.clear();
+        return true;
+    }
+    tail.drain(..tail.len().saturating_sub(TAKES_INPUT.len() - 1));
+    false
+}
+
+/// The keys that give Claude Code `prompt` as one prompt, as a person who pastes it and
+/// presses Enter: a bracketed paste, so its newlines stay in the prompt, then Enter. An escape
+/// in `prompt` is dropped, so it cannot end the paste early and type the rest as keys.
+pub fn typed_prompt(prompt: &str) -> Vec<u8> {
+    let mut keys = b"\x1b[200~".to_vec();
+    keys.extend(prompt.bytes().filter(|&b| b != 0x1b));
+    keys.extend_from_slice(b"\x1b[201~\r");
+    keys
+}
 
 /// `text` in single quotes for `sh`, each `'` in it written as `'\''`.
 pub fn shell_quote(text: &str) -> String {
@@ -286,6 +321,30 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string()
+    }
+
+    #[test]
+    fn bracketed_paste_turned_on_is_found_when_it_is_cut_between_reads() {
+        let mut tail = Vec::new();
+        assert!(!turns_paste_on(&mut tail, b"drawing \x1b[?20"));
+        assert!(turns_paste_on(&mut tail, b"04h box"));
+
+        let mut tail = Vec::new();
+        assert!(turns_paste_on(&mut tail, b"\x1b[?2004h"));
+
+        // A long run of output with no sign keeps only what could start one.
+        let mut tail = Vec::new();
+        assert!(!turns_paste_on(&mut tail, &[b'x'; 10_000]));
+        assert!(tail.len() < TAKES_INPUT.len());
+        assert!(!turns_paste_on(&mut tail, b"\x1b[?2004l"));
+    }
+
+    #[test]
+    fn a_prompt_is_typed_as_one_bracketed_paste_then_enter_with_no_escape_in_it() {
+        assert_eq!(
+            typed_prompt("fix it\nthen \u{1b}[201~\rstop é"),
+            "\u{1b}[200~fix it\nthen [201~\rstop é\u{1b}[201~\r".as_bytes()
+        );
     }
 
     #[test]

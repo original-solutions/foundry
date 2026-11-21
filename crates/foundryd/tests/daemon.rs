@@ -507,6 +507,50 @@ fn after_sigterm_the_daemon_exits_0_and_a_terminal_child_still_runs() {
     assert_eq!(fixture.stop(), Some(0));
 }
 
+#[test]
+fn after_sigterm_the_log_names_each_request_that_was_waiting_for_a_machine() {
+    let mut fixture = Fixture::new();
+    let project = fixture.project();
+    fixture.seed(|settings| settings.projects.push(project.clone()));
+    fixture.start();
+    let me = wait_for("a machine sample", || {
+        fixture
+            .state()?
+            .into_iter()
+            .find_map(|record| match record {
+                AnyRecord::MachineSample(sample) => Some(sample.owner),
+                _ => None,
+            })
+    });
+    assert_eq!(fixture.stop(), Some(0), "{}", fixture.log());
+    // No session fits under a limit of none, so a create that lets Foundry choose waits.
+    fixture.seed(|settings| {
+        settings.limits.insert(
+            me,
+            foundry_proto::settings::Limits {
+                max_sessions: 0,
+                max_load_per_core: f64::MAX,
+                min_free_disk: 0,
+            },
+        );
+    });
+    fixture.start();
+    let create = serde_json::json!({
+        "project": project.id, "base": "main", "name": "parked", "machine": "choose",
+        "model": "test-model",
+    });
+    let (status, body) = fixture.call("POST", "/api/workspaces", Some(create));
+    assert_eq!(status, 202, "{body}");
+
+    assert_eq!(fixture.stop(), Some(0), "{}", fixture.log());
+
+    let log = fixture.log();
+    assert!(
+        log.contains("the daemon stops, so the request for parked is dropped"),
+        "{log}"
+    );
+}
+
 /// Tailscale stopped, logged out or missing: the daemon asks it, still serves loopback, and
 /// says why it serves nothing else in one warning.
 #[test]
