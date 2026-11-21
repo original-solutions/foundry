@@ -64,6 +64,8 @@ pub(crate) enum DaemonError {
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]
+    Secrets(#[from] SecretsError),
+    #[error(transparent)]
     Keys(#[from] JoinError),
     #[error(transparent)]
     Terminals(#[from] TerminalError),
@@ -205,10 +207,14 @@ fn lock(home: &Path) -> Result<Flock<File>, DaemonError> {
 /// Builds every module, starts them and waits for a signal or for one to end.
 async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
     let store = Arc::new(Mutex::new(Store::open(home.join("store.sqlite"))?));
-    let secrets = secrets::for_this_machine(&home);
-    // Both read the secret store, which can block on a keychain prompt. SIGTERM and SIGINT
-    // are not watched until startup is done, so until then they stop the daemon as usual.
-    tracing::info!("reading the secret store; on macOS this waits on any keychain prompt");
+    // SIGTERM and SIGINT are not watched until startup is done, so until then they stop the
+    // daemon as usual. On a Mac a keychain-era release ran on, opening the store first moves its
+    // secrets out of the login keychain, which can wait on one prompt.
+    tracing::info!("opening the secret store");
+    let secrets = {
+        let home = home.clone();
+        tokio::task::spawn_blocking(move || secrets::for_this_machine(&home)).await??
+    };
     let keys = {
         let secrets = secrets.clone();
         tokio::task::spawn_blocking(move || Keys::open(secrets)).await??

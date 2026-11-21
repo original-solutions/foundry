@@ -33,7 +33,7 @@ const REPO: &str = "original-solutions/foundry";
 const HEALTHY_AFTER: Duration = Duration::from_secs(60);
 
 /// How long a trial may take to become healthy before the process gives up and exits, so a
-/// start that hangs (on a keychain prompt, say) counts as a failed start.
+/// start that hangs (on a disk that does not answer, say) counts as a failed start.
 const TRIAL_DEADLINE: Duration = Duration::from_secs(300);
 
 /// The release public key, as hex. The release workflow reads it from this line and refuses to

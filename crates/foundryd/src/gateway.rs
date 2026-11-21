@@ -9,9 +9,9 @@
 //!
 //! The key is read from the secret store once and kept. It is read again only while it is not
 //! set, so a key set with `foundryd secret set` counts from the next read, and after the
-//! gateway refuses it, when it is sent again once it has changed or after [`RETRY_REFUSED`]. A store that cannot read it (a denied keychain prompt, say) is not asked
+//! gateway refuses it, when it is sent again once it has changed or after [`RETRY_REFUSED`]. A store that cannot read it (a secrets file others can read, say) is not asked
 //! again until the daemon restarts, so it never prompts every few seconds. A read of the key
-//! that has not ended within [`READ_EVERY`] (a keychain prompt nobody answers, say) raises the
+//! that has not ended within [`READ_EVERY`] (on a disk that does not answer, say) raises the
 //! item until it ends, and no other read starts meanwhile. Neither the key nor a password in the
 //! URL reaches an item or a log line.
 
@@ -48,8 +48,8 @@ pub enum Health {
     Unanswered(String),
     /// It refused the management key: it answered 401.
     KeyRefused,
-    /// A read of the management key has not ended within [`READ_EVERY`]: a keychain prompt
-    /// nobody answers, say. The gateway's own answer is given up on sooner, after
+    /// A read of the management key has not ended within [`READ_EVERY`]: on a disk that does
+    /// not answer, say. The gateway's own answer is given up on sooner, after
     /// [`ANSWER_WITHIN`].
     KeyReadStuck,
     /// It answered with no account that is not disabled.
@@ -295,7 +295,7 @@ impl Reader {
     }
 
     /// Reads the gateway every [`READ_EVERY`], the first at once. A read waits for the one
-    /// before it, so a slow gateway or keychain never piles reads up.
+    /// before it, so a slow gateway or secret store never piles reads up.
     pub async fn run(self: Arc<Self>) {
         let mut every = tokio::time::interval(READ_EVERY);
         every.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -361,7 +361,8 @@ impl Source for Reader {
                     "The gateway cannot be checked: reading the secret {GATEWAY_MANAGEMENT} has \
                      not finished"
                 ),
-                "Look for a keychain prompt on this machine and answer it, or see the daemon log"
+                "See the daemon log, and check that the disk holding foundry's data directory \
+                 answers"
                     .to_owned(),
             ),
             Some(Health::Unanswered(why)) => (
@@ -591,10 +592,9 @@ mod tests {
         fn get(&self, name: &str) -> Result<Option<String>, SecretsError> {
             self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
-                return Err(SecretsError::Keychain {
-                    action: "read",
-                    name: name.to_owned(),
-                    reason: "denied".into(),
+                return Err(SecretsError::Io {
+                    path: "secrets.json".into(),
+                    source: std::io::ErrorKind::PermissionDenied.into(),
                 });
             }
             self.inner.get(name)
@@ -793,8 +793,8 @@ mod tests {
         assert_eq!(reader.health(), Some(Health::Healthy));
     }
 
-    /// A secret store whose reads wait until `answered` is set, as a keychain prompt nobody
-    /// answers does.
+    /// A secret store whose reads wait until `answered` is set, as one on a disk that does
+    /// not answer does.
     struct Prompting {
         inner: FileSecrets,
         answered: std::sync::atomic::AtomicBool,
@@ -845,7 +845,7 @@ mod tests {
             item[0].what
         );
         assert!(item[0].todo.contains("daemon log"), "{}", item[0].todo);
-        assert!(!item[0].todo.contains("keychain"), "{}", item[0].todo);
+        assert!(item[0].todo.contains("disk"), "{}", item[0].todo);
         // The next tick waits on the same read rather than starting another behind it, which
         // would only queue on the key and hold a thread of the blocking pool.
         assert!(
