@@ -1,6 +1,7 @@
-import { fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { fleet } from "./fleet";
+import { fleet, type MachineView } from "./fleet";
 import { Machines } from "./Machines";
 import { remember } from "./samples";
 import { ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
@@ -214,6 +215,73 @@ describe("Machines", () => {
 
       expect((await screen.findByRole("alert")).textContent).toBe("a machine's name is at most 60 characters");
       expect(nameField().value).toBe("x".repeat(61));
+    });
+  });
+
+  describe("adding a machine", () => {
+    const added = { code: "K7QX3M9PRT", command: "foundryd join studio K7QX3M9PRT", expires_in_secs: 600 };
+    const nameField = () => screen.getByRole<HTMLInputElement>("textbox", { name: "Name" });
+    const add = (name: string) => {
+      fireEvent.click(screen.getByRole("button", { name: "Add machine" }));
+      fireEvent.change(nameField(), { target: { value: name } });
+      fireEvent.click(screen.getByRole("button", { name: "Add" }));
+    };
+
+    it("posts the name typed and shows the command to run on the new machine, which Copy puts on the clipboard", async () => {
+      const calls = mockFetch(json(201, added));
+      const writeText = vi.fn(async () => {});
+      vi.stubGlobal("navigator", { ...navigator, clipboard: { writeText } });
+      await show();
+
+      add(" trilogy-mac ");
+      expect(nameField().placeholder).toBe("Tailscale name, e.g. trilogy-mac");
+
+      const command = await screen.findByText(added.command);
+      expect(command.closest("pre, code")).not.toBeNull();
+      expect(screen.getByText(/expires in 10 minutes/)).toBeDefined();
+      expect(calls).toEqual([{ url: "/api/machines/add", method: "POST", body: { name: "trilogy-mac" } }]);
+      fireEvent.click(screen.getByRole("button", { name: "Copy" }));
+      await waitFor(() => expect(writeText).toHaveBeenCalledWith(added.command));
+    });
+
+    it("shows a 422's error in the dialog and keeps the text", async () => {
+      mockFetch(json(422, { error: '"trilogy-mac" is not on Tailscale: it resolves to no Tailscale address' }));
+      await show();
+
+      add("trilogy-mac");
+
+      expect((await screen.findByRole("alert")).textContent).toBe('"trilogy-mac" is not on Tailscale: it resolves to no Tailscale address');
+      expect(nameField().value).toBe("trilogy-mac");
+    });
+
+    it("shows a 409's error the same way", async () => {
+      mockFetch(json(409, { error: 'a machine named "laptop" is already in the fleet' }));
+      await show();
+
+      add("Laptop");
+
+      expect((await screen.findByRole("alert")).textContent).toBe('a machine named "laptop" is already in the fleet');
+      expect(nameField().value).toBe("Laptop");
+    });
+
+    it("says the machine joined once it shows in the settings, and its card appears", async () => {
+      mockFetch(json(201, added));
+      let setMachines!: (machines: MachineView[]) => void;
+      function Live() {
+        const [machines, set] = useState(fleet(records, twoMachines));
+        setMachines = set;
+        return <Machines machines={machines} history={{}} here={ME} connected />;
+      }
+      await renderApp(<Live />);
+
+      add("trilogy-mac");
+      await screen.findByText(added.command);
+      expect(screen.queryByText("trilogy-mac joined")).toBeNull();
+      const joined = settings({ machines: [...twoMachines.machines, { id: "m-3", name: "trilogy-mac", address: "100.64.0.3" }] });
+      act(() => setMachines(fleet(records, joined)));
+
+      expect((await screen.findByRole("status")).textContent).toBe("trilogy-mac joined");
+      expect(card("trilogy-mac")).toBeDefined();
     });
   });
 });
