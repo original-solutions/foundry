@@ -34,7 +34,8 @@ use super::{BATCH, Conn, Inner, OFFLINE_AFTER, RETRY_REFUSED, TICK, on_store};
 const WARN_EVERY: Duration = Duration::from_secs(60);
 
 /// Runs a link until it closes, the peer is silent for [`OFFLINE_AFTER`], the peer is not (or
-/// is no longer) in the machine list, or the peer takes nothing for [`OFFLINE_AFTER`].
+/// is no longer) one this machine links with ([`links_with`]: it is listed, or this machine's
+/// list holds no machine but itself), or the peer takes nothing for [`OFFLINE_AFTER`].
 /// `dialed` is the machine this end dialed, or `None` for a link a peer opened. `first` is the
 /// peer's first message when the caller has already read and parsed it, so the hello is
 /// neither read nor parsed again.
@@ -55,8 +56,9 @@ pub(super) async fn run(
     }
 }
 
-/// Sends this machine's new records every [`TICK`] until the peer leaves the machine list or
-/// stops taking them.
+/// Sends this machine's new records every [`TICK`] until the peer is no longer one this machine
+/// links with ([`links_with`]: it is listed, or this machine's list holds no machine but
+/// itself) or stops taking them.
 async fn sending(inner: &Inner, send: &Sender<String>, open: &Open) {
     let mut sent = open.sent;
     let mut settings_sent: Option<u64> = None;

@@ -92,7 +92,7 @@ The unit runs as your user. Read the log with `journalctl -u foundryd`.
 1. Install `foundryd` on the new machine, as above. It must be on the same tailnet as the fleet.
 2. Open the UI of any machine already in the fleet, go to the machines board and click **Add machine**.
 3. Type the new machine's Tailscale name, for example `trilogy-mac`, and click **Add**.
-4. On the new machine, run the command the dialog shows, for example `foundryd join 100.101.102.103 K7QX3M9PRT`. The code works once, within 10 minutes.
+4. On the new machine, run the command the dialog shows, for example `foundryd join 100.101.102.103 K7QX3M9PRT`. Run it in a shell with the same `FOUNDRY_HOME` and `FOUNDRY_PORT` you gave `install`, from `<home>/current/`, or after linking `<home>/current/foundryd` into a folder on your `PATH`. The code works once, within 10 minutes.
 5. Restart the service on the new machine: `launchctl kickstart -k gui/$(id -u)/io.github.original-solutions.foundryd` on macOS, `sudo systemctl restart foundryd` on Linux.
 
 The dialog says when the machine has joined, and its card shows on the board under the name you typed.
