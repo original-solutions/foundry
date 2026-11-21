@@ -331,4 +331,37 @@ describe("Sidebar", () => {
       expect(onKeys).toHaveBeenCalled();
     });
   });
+
+  it("renames a machine in place from its header, its name still opening the machines board", async () => {
+    const calls = mockFetch(new Response(null, { status: 204 }));
+    await renderApp(<Sidebar machines={machines()} {...props} />);
+    const studio = screen.getByRole("region", { name: "studio" });
+    expect(within(studio).getByRole("link", { name: "studio" }).getAttribute("href")).toBe("/machines");
+
+    fireEvent.click(within(studio).getByRole("button", { name: "Rename studio" }));
+    const field = within(studio).getByRole<HTMLInputElement>("textbox", { name: "Machine name" });
+    expect(field.value).toBe("studio");
+    fireEvent.change(field, { target: { value: "Tom's desk" } });
+    fireEvent.keyDown(field, { key: "Enter" });
+
+    await waitFor(() => expect(within(studio).queryByRole("textbox", { name: "Machine name" })).toBeNull());
+    expect(calls).toEqual([{ url: `/api/machines/${ME}/rename`, method: "POST", body: { name: "Tom's desk" } }]);
+  });
+
+  it("shows a refused rename's error under the header's field and sends nothing on Escape", async () => {
+    const calls = mockFetch(json(409, { error: 'another machine is named "laptop"' }));
+    await renderApp(<Sidebar machines={machines()} {...props} />);
+    const studio = screen.getByRole("region", { name: "studio" });
+
+    fireEvent.click(within(studio).getByRole("button", { name: "Rename studio" }));
+    const field = within(studio).getByRole<HTMLInputElement>("textbox", { name: "Machine name" });
+    fireEvent.change(field, { target: { value: "laptop" } });
+    fireEvent.keyDown(field, { key: "Enter" });
+    expect((await within(studio).findByRole("alert")).textContent).toBe('another machine is named "laptop"');
+    expect(field.value).toBe("laptop");
+
+    fireEvent.keyDown(field, { key: "Escape" });
+    expect(within(studio).getByRole("link", { name: "studio" })).toBeDefined();
+    expect(calls).toHaveLength(1);
+  });
 });
