@@ -20,8 +20,8 @@ const said = (error: unknown) => (error instanceof Error ? error.message : Strin
 /**
  * The fleet's projects, each with its repo as the settings show it (any password hidden) and a
  * Remove button, and a form that adds one. A change shows once it arrives in the settings, on
- * every machine. A refused add keeps what was typed and says why under the form until a field is
- * edited; a refused remove says why beside its project. `onAdded` is given each new project's id.
+ * every machine. A refused add keeps what was typed and says why under the form; a refused
+ * remove says why beside its project. `onAdded` is given each new project's id.
  */
 export function Projects({
   open,
@@ -109,10 +109,7 @@ export function Projects({
       <form onSubmit={add} className="mt-5 space-y-3">
         <label className="block text-xs text-neutral-400">
           Name
-          <input name="name" autoComplete="off" spellCheck={false} value={name} onChange={(e) => {
-              setName(e.target.value);
-              setAddError(null);
-            }} placeholder="foundry" className={field} />
+          <input name="name" autoComplete="off" spellCheck={false} value={name} onChange={(e) => setName(e.target.value)} placeholder="foundry" className={field} />
         </label>
         <label className="block text-xs text-neutral-400">
           Repo URL
@@ -121,10 +118,7 @@ export function Projects({
             autoComplete="off"
             spellCheck={false}
             value={repo}
-            onChange={(e) => {
-              setRepo(e.target.value);
-              setAddError(null);
-            }}
+            onChange={(e) => setRepo(e.target.value)}
             placeholder="git@github.com:org/repo.git"
             className={`${field} font-mono`}
           />
