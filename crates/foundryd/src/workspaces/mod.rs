@@ -11,6 +11,9 @@
 //! A create never touches what it did not make: it refuses a name whose branch or folder is
 //! already there, makes the branch itself, and when it fails takes back only that branch, while
 //! it still points where it was made, and the worktree in a folder that was not there before.
+//! It reads the project's repo from the shared settings at the start and checks they still
+//! hold the project as it writes the record, so a project removed while its clone, fetch and
+//! worktree were made fails the create, which takes back what it made.
 //!
 //! Archiving refuses while there is uncommitted or unpushed work, unless forced. Uncommitted
 //! work is a changed, deleted or new file that git does not ignore; ignored files, such as build
@@ -505,7 +508,7 @@ impl Inner {
                 base: base.to_owned(),
                 setup: None,
             };
-            self.write(body.clone(), false).await?;
+            self.write_new(body.clone()).await?;
             Ok(body)
         }
         .await;
@@ -1136,6 +1139,36 @@ impl Inner {
                 .collect())
         })
         .await
+    }
+
+    /// Writes the first record of a workspace this machine made, once the shared settings, read
+    /// under the same lock of the store, still hold its project; else writes nothing and fails
+    /// with [`WorkspaceError::UnknownProject`]. A remove numbered on this machine therefore
+    /// lands before the check, which sees it, or after the record, which the acting machine
+    /// counts once it has it.
+    async fn write_new(&self, body: Workspace) -> Result<(), WorkspaceError> {
+        let me = self.me;
+        let project = body.project;
+        let written = self
+            .with_store(move |store| {
+                if !store.settings()?.projects.iter().any(|p| p.id == project) {
+                    return Ok(false);
+                }
+                let record = Record {
+                    owner: me,
+                    version: store.own_next_version()?,
+                    deleted: false,
+                    body,
+                };
+                store.apply(&AnyRecord::Workspace(record), me)?;
+                Ok(true)
+            })
+            .await?;
+        if written {
+            Ok(())
+        } else {
+            Err(WorkspaceError::UnknownProject(project))
+        }
     }
 
     async fn write(&self, body: Workspace, deleted: bool) -> Result<(), WorkspaceError> {
