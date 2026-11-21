@@ -144,8 +144,9 @@ impl Terminals {
         }
     }
 
-    /// Starts `argv` in `cwd` with `env` set over the daemon's own environment, in a new
-    /// terminal of `workspace`. The start finishes even when the caller stops waiting.
+    /// Starts `argv` in `cwd` with `env`, plus a colour `TERM` and `COLORTERM` each where `env`
+    /// does not name it, set over the daemon's own environment, in a new terminal of
+    /// `workspace`. The start finishes even when the caller stops waiting.
     pub async fn start(
         &self,
         workspace: WorkspaceId,
@@ -338,7 +339,8 @@ impl Inner {
         self.write(body.clone(), false).await?;
         let socket = self.socket(id);
         let env_file = self.dir.join(format!("{id}.env"));
-        let launched = self.launch(&socket, cwd, &env_file, argv, env);
+        let env = colour_env(env);
+        let launched = self.launch(&socket, cwd, &env_file, argv, &env);
         let started = match tokio::time::timeout(START_WITHIN, launched).await {
             Ok(started) => started,
             // The process run is killed. A holder it forked that already serves the socket
@@ -643,6 +645,17 @@ fn no_answer() -> io::Error {
             ANSWER_WITHIN.as_secs()
         ),
     )
+}
+
+/// `env` with each of a colour terminal's `TERM` and `COLORTERM` that it does not name. The
+/// daemon under launchd has no `TERM`, and the browser side, xterm.js, shows truecolor.
+fn colour_env(env: &[(String, String)]) -> Vec<(String, String)> {
+    [("TERM", "xterm-256color"), ("COLORTERM", "truecolor")]
+        .into_iter()
+        .filter(|(name, _)| !env.iter().any(|(named, _)| named == name))
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .chain(env.iter().cloned())
+        .collect()
 }
 
 /// Why a holder's socket could not be connected to.
@@ -1662,6 +1675,63 @@ mod tests {
             TerminalState::Running
         );
         terminals.close(id).await.unwrap();
+    }
+
+    /// What the child of a terminal started with `env` sees in `TERM` and `COLORTERM`.
+    async fn colour_vars(env: &[(String, String)]) -> String {
+        let setup = Setup::new();
+        let (terminals, _) = setup.daemon();
+        let id = terminals
+            .start(
+                WorkspaceId::random(),
+                setup.cwd.path(),
+                &argv("echo \"[TERM=$TERM] [COLORTERM=$COLORTERM] [end]\"; sleep 60"),
+                env,
+            )
+            .await
+            .unwrap();
+        let (snapshot, mut stream) = terminals.attach(id).await.unwrap();
+        let mut seen = snapshot.bytes.to_vec();
+        read_until(&mut stream, &mut seen, |seen| contains(seen, b"[end]")).await;
+        terminals.close(id).await.unwrap();
+        String::from_utf8_lossy(&seen).into_owned()
+    }
+
+    /// The daemon under launchd has no `TERM`, so the terminal names a colour one itself.
+    #[tokio::test]
+    async fn a_terminal_starts_as_a_colour_terminal() {
+        let seen = colour_vars(&[]).await;
+        assert!(seen.contains("[TERM=xterm-256color]"), "{seen:?}");
+        assert!(seen.contains("[COLORTERM=truecolor]"), "{seen:?}");
+    }
+
+    #[tokio::test]
+    async fn the_callers_term_wins_over_the_colour_default() {
+        let seen = colour_vars(&[("TERM".to_string(), "vt100".to_string())]).await;
+        assert!(seen.contains("[TERM=vt100]"), "{seen:?}");
+        assert!(seen.contains("[COLORTERM=truecolor]"), "{seen:?}");
+    }
+
+    /// Whatever the test process's own `TERM`, a caller's variable replaces its default rather
+    /// than sitting beside it.
+    #[test]
+    fn colour_env_adds_only_the_defaults_the_caller_does_not_name() {
+        let pair = |name: &str, value: &str| (name.to_string(), value.to_string());
+        assert_eq!(
+            colour_env(&[]),
+            vec![
+                pair("TERM", "xterm-256color"),
+                pair("COLORTERM", "truecolor")
+            ]
+        );
+        assert_eq!(
+            colour_env(&[pair("TERM", "vt100"), pair("FOUNDRY_TEST_VALUE", "kept")]),
+            vec![
+                pair("COLORTERM", "truecolor"),
+                pair("TERM", "vt100"),
+                pair("FOUNDRY_TEST_VALUE", "kept"),
+            ]
+        );
     }
 
     #[tokio::test]
