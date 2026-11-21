@@ -942,6 +942,36 @@ mod tests {
         fs::read_link(home.join("current")).unwrap()
     }
 
+    /// The secrets a trial copied out of the keychain are set aside when it rolls back, so the
+    /// keychain-era release it goes back to stays the one source, and the next release copies
+    /// again.
+    #[test]
+    fn a_rollback_sets_aside_the_secrets_the_trial_copied() {
+        let home = trial_home();
+        let secrets = home.path().join("secrets.json");
+        fs::write(&secrets, "{}").unwrap();
+        fs::write(home.path().join("secrets.json.copied"), "").unwrap();
+        for _ in 0..3 {
+            start_with(home.path(), "0.2.0").unwrap();
+        }
+        let fourth = start_with(home.path(), "0.2.0").unwrap();
+        assert_eq!(fourth, Start::RolledBack { to: "0.1.0".into() });
+        assert!(!secrets.exists());
+        assert!(home.path().join("secrets.json.rolled-back").exists());
+    }
+
+    #[test]
+    fn a_rollback_leaves_secrets_no_trial_copied() {
+        let home = trial_home();
+        let secrets = home.path().join("secrets.json");
+        fs::write(&secrets, "{}").unwrap();
+        for _ in 0..4 {
+            start_with(home.path(), "0.2.0").unwrap();
+        }
+        assert_eq!(current(home.path()), PathBuf::from("versions/0.1.0"));
+        assert!(secrets.exists());
+    }
+
     #[test]
     fn three_starts_that_never_report_healthy_roll_back_on_the_next() {
         let home = trial_home();
@@ -1838,6 +1868,7 @@ mod tests {
         assert_eq!(PROVEN.load(Ordering::Relaxed), 0);
         tokio::time::sleep(HEALTHY_AFTER / 2 + Duration::from_secs(1)).await;
         reach(&CHECKS, 1).await;
+        reach(&PROVEN, 1).await;
         assert_eq!(state(home.path()).unwrap().trial, None);
         assert_eq!(PROVEN.load(Ordering::Relaxed), 1);
         tokio::time::sleep(CHECK_EVERY + Duration::from_secs(1)).await;
@@ -1871,7 +1902,38 @@ mod tests {
         fs::remove_dir(&blocker).unwrap();
         tokio::time::sleep(CHECK_EVERY).await;
         reach(&CHECKS, 2).await;
+        reach(&PROVEN, 1).await;
         assert_eq!(PROVEN.load(Ordering::Relaxed), 1);
+        task.abort();
+    }
+
+    /// The proven step can wait on a keychain prompt; the update checks go on meanwhile.
+    #[tokio::test(start_paused = true)]
+    async fn a_proven_step_that_waits_does_not_hold_up_the_update_checks() {
+        static FLAG: AtomicBool = AtomicBool::new(false);
+        static CHECKS: AtomicUsize = AtomicUsize::new(0);
+        let home = trial_home();
+        let exe = exe_in(home.path(), "0.2.0");
+        let (release, waiting) = std::sync::mpsc::channel::<()>();
+        let task = tokio::spawn(run_with(
+            home.path().to_path_buf(),
+            Ok(exe),
+            "0.2.0",
+            &FLAG,
+            || {
+                CHECKS.fetch_add(1, Ordering::Relaxed);
+                Ok(None)
+            },
+            || {},
+            move || {
+                let _ = waiting.recv();
+            },
+        ));
+
+        tokio::time::sleep(HEALTHY_AFTER + Duration::from_secs(1)).await;
+        reach(&CHECKS, 1).await;
+        assert_eq!(CHECKS.load(Ordering::Relaxed), 1);
+        drop(release);
         task.abort();
     }
 

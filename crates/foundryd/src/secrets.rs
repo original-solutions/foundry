@@ -1103,6 +1103,115 @@ mod tests {
         assert_eq!(fs::read(dir.path().join("secrets.json")).unwrap(), before);
     }
 
+    fn copied(dir: &tempfile::TempDir) -> bool {
+        dir.path().join("secrets.json.copied").exists()
+    }
+
+    #[test]
+    fn a_copy_is_marked_and_no_copy_leaves_no_mark() {
+        let (dir, new) = file();
+        move_secrets(&old_store(&MOVED), &new).unwrap();
+        assert!(copied(&dir));
+        assert_eq!(mode(&dir.path().join("secrets.json.copied")), 0o600);
+
+        let (dir, new) = file();
+        move_secrets(&MemorySecrets::default(), &new).unwrap();
+        assert!(!copied(&dir));
+
+        let (dir, new) = file();
+        new.set(GATEWAY, "sk-file").unwrap();
+        move_secrets(&old_store(&MOVED), &new).unwrap();
+        assert!(!copied(&dir));
+    }
+
+    #[test]
+    fn forgetting_a_marked_copy_empties_the_keychain_and_drops_the_mark() {
+        let (dir, new) = file();
+        let old = old_store(&MOVED);
+        move_secrets(&old, &new).unwrap();
+        forget_copied(&old, &new);
+        assert!(held_in(&old).is_empty());
+        assert!(!copied(&dir));
+        assert_eq!(
+            new.get("machine").unwrap().as_deref(),
+            Some("value-of-machine")
+        );
+    }
+
+    /// A file with no mark is not a copy this version made, so the keychain is not touched:
+    /// on every later start of a proven Mac, nothing asks the keychain anything.
+    #[test]
+    fn forgetting_without_a_mark_removes_nothing() {
+        let (_dir, new) = file();
+        for name in MOVED {
+            new.set(name, "x").unwrap();
+        }
+        let old = old_store(&MOVED);
+        forget_copied(&old, &new);
+        assert_eq!(held_in(&old), held_in(&old_store(&MOVED)));
+    }
+
+    #[test]
+    fn a_failed_remove_still_drops_the_mark() {
+        let (dir, new) = file();
+        let old = Denying::removes(old_store(&MOVED), "gateway");
+        move_secrets(&old, &new).unwrap();
+        forget_copied(&old, &new);
+        assert_eq!(held_in(&old.inner), ["gateway"]);
+        assert!(!copied(&dir));
+    }
+
+    #[test]
+    fn a_copy_that_cannot_be_read_keeps_its_mark_and_the_keychain() {
+        let (dir, new) = file();
+        let old = old_store(&MOVED);
+        move_secrets(&old, &new).unwrap();
+        fs::set_permissions(
+            dir.path().join("secrets.json"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        forget_copied(&old, &new);
+        assert!(copied(&dir));
+        assert_eq!(held_in(&old), held_in(&old_store(&MOVED)));
+    }
+
+    /// A rolled-back trial sets its copy aside, so the next release copies the keychain again
+    /// and sees what the keychain-era release changed in between.
+    #[test]
+    fn a_copy_set_aside_is_kept_and_the_next_open_copies_the_keychain_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = old_store(&MOVED);
+        open(dir.path(), Some(&old)).unwrap();
+        set_aside_copy(dir.path()).unwrap();
+        let aside = dir.path().join("secrets.json.rolled-back");
+        assert!(!dir.path().join("secrets.json").exists());
+        assert!(!copied(&dir));
+        assert_eq!(mode(&aside), 0o600);
+        assert_eq!(
+            FileSecrets::new(&aside).get("machine-keys").unwrap().as_deref(),
+            Some("value-of-machine-keys")
+        );
+
+        // The keychain-era release, running again, changes the key table.
+        Secrets::set(&old, "machine-keys", "revoked-one").unwrap();
+        let store = open(dir.path(), Some(&old)).unwrap();
+        assert_eq!(
+            store.get("machine-keys").unwrap().as_deref(),
+            Some("revoked-one")
+        );
+    }
+
+    /// A rollback from one release that uses the file to another leaves the file alone.
+    #[test]
+    fn setting_aside_with_no_mark_leaves_the_file_alone() {
+        let (dir, new) = file();
+        new.set(GATEWAY, "sk-file").unwrap();
+        set_aside_copy(dir.path()).unwrap();
+        assert_eq!(new.get(GATEWAY).unwrap().as_deref(), Some("sk-file"));
+        assert!(!dir.path().join("secrets.json.rolled-back").exists());
+    }
+
     /// `foundryd secret set` can run before the first `foundryd run`, which refuses a data
     /// directory other users can reach.
     #[test]
