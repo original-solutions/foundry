@@ -1664,6 +1664,41 @@ mod tests {
         terminals.close(id).await.unwrap();
     }
 
+    /// What the child of a terminal started with `env` sees in `TERM` and `COLORTERM`.
+    async fn colour_vars(env: &[(String, String)]) -> String {
+        let setup = Setup::new();
+        let (terminals, _) = setup.daemon();
+        let id = terminals
+            .start(
+                WorkspaceId::random(),
+                setup.cwd.path(),
+                &argv("echo \"[TERM=$TERM] [COLORTERM=$COLORTERM] [end]\"; sleep 60"),
+                env,
+            )
+            .await
+            .unwrap();
+        let (snapshot, mut stream) = terminals.attach(id).await.unwrap();
+        let mut seen = snapshot.bytes.to_vec();
+        read_until(&mut stream, &mut seen, |seen| contains(seen, b"[end]")).await;
+        terminals.close(id).await.unwrap();
+        String::from_utf8_lossy(&seen).into_owned()
+    }
+
+    /// The daemon under launchd has no `TERM`, so the terminal names a colour one itself.
+    #[tokio::test]
+    async fn a_terminal_starts_as_a_colour_terminal() {
+        let seen = colour_vars(&[]).await;
+        assert!(seen.contains("[TERM=xterm-256color]"), "{seen:?}");
+        assert!(seen.contains("[COLORTERM=truecolor]"), "{seen:?}");
+    }
+
+    #[tokio::test]
+    async fn the_callers_term_wins_over_the_colour_default() {
+        let seen = colour_vars(&[("TERM".to_string(), "vt100".to_string())]).await;
+        assert!(seen.contains("[TERM=vt100]"), "{seen:?}");
+        assert!(seen.contains("[COLORTERM=truecolor]"), "{seen:?}");
+    }
+
     #[tokio::test]
     async fn the_child_gets_the_env_and_the_env_file_is_gone() {
         let setup = Setup::new();
