@@ -284,5 +284,23 @@ describe("Machines", () => {
       // Behind the dialog, which hides the rest of the page from the accessibility tree while open.
       expect(screen.getByRole("article", { name: "trilogy-mac", hidden: true })).toBeDefined();
     });
+
+    it("says the machine joined when the listed name differs from the typed one only in case", async () => {
+      mockFetch(json(201, added));
+      let setMachines!: (machines: MachineView[]) => void;
+      function Live() {
+        const [machines, set] = useState(fleet(records, twoMachines));
+        setMachines = set;
+        return <Machines machines={machines} history={{}} here={ME} connected />;
+      }
+      await renderApp(<Live />);
+
+      add("Work-Mac");
+      await screen.findByText(added.command);
+      const joined = settings({ machines: [...twoMachines.machines, { id: "m-3", name: "work-mac", address: "100.64.0.3" }] });
+      act(() => setMachines(fleet(records, joined)));
+
+      expect((await screen.findByRole("status")).textContent).toMatch(/joined$/);
+    });
   });
 });

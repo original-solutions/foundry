@@ -626,7 +626,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_name_that_resolves_to_a_listed_machines_address_is_409_and_issues_no_code() {
+    async fn a_name_that_resolves_to_a_listed_machines_address_is_409() {
         let peer = MachineId::random();
         let served = Served::new(move |me, settings| {
             settings

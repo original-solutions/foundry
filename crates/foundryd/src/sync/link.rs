@@ -477,6 +477,16 @@ mod tests {
     impl Dialed {
         /// This machine lists `listed` (by id) and accepts a link `peer` opens with a hello.
         async fn new(listed: impl FnOnce(MachineId) -> Vec<MachineId>, peer: MachineId) -> Self {
+            Self::open(listed, peer, false).await
+        }
+
+        /// As [`Dialed::new`]; when `unreadable`, the stored settings are then damaged through
+        /// a second connection to the database file, so the machine list cannot be read.
+        async fn open(
+            listed: impl FnOnce(MachineId) -> Vec<MachineId>,
+            peer: MachineId,
+            unreadable: bool,
+        ) -> Self {
             let data = tempfile::tempdir().unwrap();
             let me = MachineId::random();
             let mut store = Store::open(data.path().join("foundry.db")).unwrap();
@@ -492,6 +502,12 @@ mod tests {
                 })
                 .collect();
             store.apply_settings(held).unwrap();
+            if unreadable {
+                rusqlite::Connection::open(data.path().join("foundry.db"))
+                    .unwrap()
+                    .execute("UPDATE settings SET settings = 'not settings'", [])
+                    .unwrap();
+            }
             let peers = Peers::new(me, Arc::new(Mutex::new(store)), Arc::new(NoDial));
             let (ours, theirs) = Conn::pair();
             let accepting = tokio::spawn(async move { peers.accept(ours).await });
@@ -547,6 +563,22 @@ mod tests {
     #[tokio::test]
     async fn a_machine_whose_list_holds_another_machine_refuses_a_link_from_one_not_in_it() {
         let mut link = Dialed::new(|me| vec![me, MachineId::random()], MachineId::random()).await;
+
+        assert!(!link.accepted().await, "the link was accepted");
+        link.accepting.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_machine_whose_list_holds_one_other_machine_refuses_a_link_from_a_third() {
+        let mut link = Dialed::new(|_| vec![MachineId::random()], MachineId::random()).await;
+
+        assert!(!link.accepted().await, "the link was accepted");
+        link.accepting.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_machine_whose_list_cannot_be_read_refuses_a_link() {
+        let mut link = Dialed::open(|me| vec![me], MachineId::random(), true).await;
 
         assert!(!link.accepted().await, "the link was accepted");
         link.accepting.await.unwrap();
