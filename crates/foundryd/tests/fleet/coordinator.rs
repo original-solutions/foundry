@@ -2086,7 +2086,8 @@ async fn an_own_add_sent_before_the_role_moves_here_is_not_refused_by_the_rules_
     // The peer goes quiet, so the role moves here, where the add breaks the name rule. The
     // peer may have numbered it, so it waits.
     beat.abort();
-    tokio::time::sleep(OFFLINE_AFTER + Duration::from_secs(2)).await;
+    acting_becomes(&daemon.coordinator(), daemon.id, WAIT).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
     assert!(!editing.is_finished(), "ended by the rule here");
 
     // The peer comes back on a new link with a copy that holds its stamp for the id, which
