@@ -338,7 +338,8 @@ impl Inner {
         self.write(body.clone(), false).await?;
         let socket = self.socket(id);
         let env_file = self.dir.join(format!("{id}.env"));
-        let launched = self.launch(&socket, cwd, &env_file, argv, env);
+        let env = colour_env(env);
+        let launched = self.launch(&socket, cwd, &env_file, argv, &env);
         let started = match tokio::time::timeout(START_WITHIN, launched).await {
             Ok(started) => started,
             // The process run is killed. A holder it forked that already serves the socket
@@ -643,6 +644,17 @@ fn no_answer() -> io::Error {
             ANSWER_WITHIN.as_secs()
         ),
     )
+}
+
+/// `env` with a colour terminal's `TERM` and `COLORTERM` added where it names neither. The
+/// daemon under launchd has no `TERM`, and the browser side, xterm.js, shows truecolor.
+fn colour_env(env: &[(String, String)]) -> Vec<(String, String)> {
+    [("TERM", "xterm-256color"), ("COLORTERM", "truecolor")]
+        .into_iter()
+        .filter(|(name, _)| !env.iter().any(|(named, _)| named == name))
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .chain(env.iter().cloned())
+        .collect()
 }
 
 /// Why a holder's socket could not be connected to.
