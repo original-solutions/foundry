@@ -209,8 +209,9 @@ fn lock(home: &Path) -> Result<Flock<File>, DaemonError> {
 async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
     let store = Arc::new(Mutex::new(Store::open(home.join("store.sqlite"))?));
     // SIGTERM and SIGINT are not watched until startup is done, so until then they stop the
-    // daemon as usual. On a Mac a keychain-era release ran on, opening the store first copies its
-    // secrets out of the login keychain, which can wait on a prompt for each.
+    // daemon as usual. On a Mac a keychain-era release ran on, opening the store with no update on
+    // trial first copies its secrets out of the login keychain, which can wait on a prompt for
+    // each.
     tracing::info!("opening the secret store");
     let secrets = {
         let home = home.clone();

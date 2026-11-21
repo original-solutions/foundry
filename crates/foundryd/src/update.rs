@@ -358,15 +358,14 @@ fn start_with(home: &Path, running: &str) -> io::Result<Start> {
             format!("cannot roll back: versions/{previous}/{missing} is missing"),
         ));
     }
-    // Four steps, each safe to stop after: the refusal is saved with the trial still at its
-    // cap, a copy this trial made of the keychain is removed (the release `current` goes back
-    // to may read only the keychain, so the copy must not outlive the trial), `current` moves,
-    // and only then is the trial cleared. A failure or a crash in between leaves a trial at
-    // the cap, so the next start rolls back again.
+    // Three steps, each safe to stop after: the refusal is saved with the trial still at its
+    // cap, `current` moves, and only then is the trial cleared. A failure or a crash in
+    // between leaves a trial at the cap, so the next start rolls back again. A trial never
+    // copies a Mac's secrets out of the keychain (only a version installed by hand does), so
+    // the version `current` goes back to finds them where it left them.
     let mut roll_back = || -> io::Result<()> {
         state.refused = Some(format!("v{running}"));
         save(home, &state)?;
-        crate::secrets::drop_copy(home, running).map_err(io::Error::other)?;
         point_current(home, &previous)?;
         state.trial = None;
         save(home, &state)
@@ -404,6 +403,12 @@ fn watch(healthy: &AtomicBool, deadline: Duration, poll: Duration) -> bool {
         std::thread::sleep(poll);
     }
     true
+}
+
+/// True when an update is on trial in `home`, or when `update.json` cannot be read, so a caller
+/// that must stay out of a trial stays out when it cannot tell.
+pub fn trial_on(home: &Path) -> bool {
+    !state(home).is_ok_and(|state| state.trial.is_none())
 }
 
 /// True when this process runs from `current` and a trial of `running` is on.
@@ -955,80 +960,18 @@ mod tests {
         fs::read_link(home.join("current")).unwrap()
     }
 
-    /// The copy a trial made of the keychain is removed when it rolls back, so the
-    /// keychain-era release it goes back to stays the one source, and the next release copies
-    /// again.
     #[test]
-    fn a_rollback_removes_the_secrets_the_trial_copied() {
+    fn a_trial_is_on_while_update_json_holds_one_or_cannot_be_read() {
         let home = trial_home();
-        let secrets = home.path().join("secrets.json");
-        let mark = home.path().join("secrets.json.copied");
-        fs::write(&secrets, "{}").unwrap();
-        fs::write(&mark, "0.2.0").unwrap();
-        for _ in 0..3 {
-            start_with(home.path(), "0.2.0").unwrap();
-        }
-        let fourth = start_with(home.path(), "0.2.0").unwrap();
-        assert_eq!(fourth, Start::RolledBack { to: "0.1.0".into() });
-        assert!(!secrets.exists());
-        assert!(!mark.exists());
-    }
+        assert!(trial_on(home.path()));
 
-    /// A copy the previous version made is its live store: a rollback to it keeps the file.
-    #[test]
-    fn a_rollback_leaves_a_copy_another_version_made() {
-        let home = trial_home();
-        let secrets = home.path().join("secrets.json");
-        let mark = home.path().join("secrets.json.copied");
-        fs::write(&secrets, "{}").unwrap();
-        fs::write(&mark, "0.1.0").unwrap();
-        for _ in 0..4 {
-            start_with(home.path(), "0.2.0").unwrap();
-        }
-        assert_eq!(current(home.path()), PathBuf::from("versions/0.1.0"));
-        assert!(secrets.exists());
-        assert_eq!(fs::read_to_string(&mark).unwrap(), "0.1.0");
-    }
+        mark_healthy(home.path(), "0.2.0");
+        assert!(!trial_on(home.path()));
 
-    /// A rollback that stops part way exits rather than run the failed version unwatched, and
-    /// the trial stays at its cap, so the next start tries the rollback again.
-    #[test]
-    fn a_rollback_that_cannot_remove_the_copy_exits_and_rolls_back_on_the_next_start() {
-        let home = trial_home();
-        let exe = exe_in(home.path(), "0.2.0");
-        let secrets = home.path().join("secrets.json");
-        let mark = home.path().join("secrets.json.copied");
-        // A directory with a file in it is not removed as a file is.
-        fs::create_dir(&secrets).unwrap();
-        fs::write(secrets.join("held"), "").unwrap();
-        fs::write(&mark, "0.2.0").unwrap();
-        for _ in 0..3 {
-            assert_eq!(started(home.path(), &exe), (true, 1));
-        }
+        fs::write(home.path().join("update.json"), "not json").unwrap();
+        assert!(trial_on(home.path()));
 
-        assert_eq!(started(home.path(), &exe), (false, 0));
-        assert_eq!(current(home.path()), PathBuf::from("versions/0.2.0"));
-        assert!(mark.exists());
-
-        fs::remove_dir_all(&secrets).unwrap();
-        fs::write(&secrets, "{}").unwrap();
-        assert_eq!(started(home.path(), &exe), (false, 0));
-        assert_eq!(current(home.path()), PathBuf::from("versions/0.1.0"));
-        assert!(!secrets.exists());
-        assert!(!mark.exists());
-        assert_eq!(state(home.path()).unwrap().trial, None);
-    }
-
-    #[test]
-    fn a_rollback_leaves_secrets_no_trial_copied() {
-        let home = trial_home();
-        let secrets = home.path().join("secrets.json");
-        fs::write(&secrets, "{}").unwrap();
-        for _ in 0..4 {
-            start_with(home.path(), "0.2.0").unwrap();
-        }
-        assert_eq!(current(home.path()), PathBuf::from("versions/0.1.0"));
-        assert!(secrets.exists());
+        assert!(!trial_on(tempfile::tempdir().unwrap().path()));
     }
 
     #[test]
@@ -2033,6 +1976,28 @@ mod tests {
         fs::write(home.path().join("update.json"), "not json").unwrap();
 
         assert_eq!(started(home.path(), &exe), (true, 0));
+    }
+
+    /// A rollback that stops part way exits rather than run the failed version unwatched, and
+    /// the trial stays at its cap, so the next start tries the rollback again.
+    #[test]
+    fn a_rollback_that_stops_part_way_exits_and_rolls_back_on_the_next_start() {
+        let home = trial_home();
+        let exe = exe_in(home.path(), "0.2.0");
+        for _ in 0..3 {
+            assert_eq!(started(home.path(), &exe), (true, 1));
+        }
+        // A directory with a file in it stops `current` from moving.
+        let obstacle = home.path().join("current.new");
+        fs::create_dir_all(obstacle.join("inside")).unwrap();
+
+        assert_eq!(started(home.path(), &exe), (false, 0));
+        assert_eq!(current(home.path()), PathBuf::from("versions/0.2.0"));
+
+        fs::remove_dir_all(&obstacle).unwrap();
+        assert_eq!(started(home.path(), &exe), (false, 0));
+        assert_eq!(current(home.path()), PathBuf::from("versions/0.1.0"));
+        assert_eq!(state(home.path()).unwrap().trial, None);
     }
 
     #[test]
