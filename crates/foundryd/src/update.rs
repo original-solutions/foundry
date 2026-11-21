@@ -352,11 +352,14 @@ fn start_with(home: &Path, running: &str) -> io::Result<Start> {
             format!("cannot roll back: versions/{previous}/{missing} is missing"),
         ));
     }
-    // Three steps, each safe to stop after: the refusal is saved with the trial still at its
-    // cap, `current` moves, and only then is the trial cleared. A failure or a crash in
-    // between leaves a trial at the cap, so the next start rolls back again.
+    // Four steps, each safe to stop after: the refusal is saved with the trial still at its
+    // cap, a copy this trial made of the keychain is set aside (the release `current` goes
+    // back to may read only the keychain, so the copy must not outlive the trial), `current`
+    // moves, and only then is the trial cleared. A failure or a crash in between leaves a
+    // trial at the cap, so the next start rolls back again.
     state.refused = Some(format!("v{running}"));
     save(home, &state)?;
+    crate::secrets::set_aside_copy(home).map_err(io::Error::other)?;
     point_current(home, &previous)?;
     state.trial = None;
     save(home, &state)?;
@@ -881,11 +884,9 @@ async fn run_with(
                 .await
                 .unwrap_or(false);
         }
-        if marked
-            && let Some(proven) = proven.take()
-            && let Err(error) = tokio::task::spawn_blocking(proven).await
-        {
-            tracing::warn!("the step after the healthy mark stopped: {error}");
+        // Not awaited: it can wait on a keychain prompt, and the update checks go on meanwhile.
+        if marked && let Some(proven) = proven.take() {
+            tokio::task::spawn_blocking(proven);
         }
         match tokio::task::spawn_blocking(check.clone()).await {
             Ok(Ok(Some(tag))) => {
@@ -1930,7 +1931,9 @@ mod tests {
             },
         ));
 
-        tokio::time::sleep(HEALTHY_AFTER + Duration::from_secs(1)).await;
+        // Exactly to the mark: a paused clock does not advance while the waiting step holds
+        // its blocking thread.
+        tokio::time::sleep(HEALTHY_AFTER).await;
         reach(&CHECKS, 1).await;
         assert_eq!(CHECKS.load(Ordering::Relaxed), 1);
         drop(release);

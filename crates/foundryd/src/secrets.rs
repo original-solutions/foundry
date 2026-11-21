@@ -2,9 +2,10 @@
 //!
 //! [`Secrets`] is the one interface and [`FileSecrets`] backs it: [`for_this_machine`] gives
 //! the file `secrets.json` in the data directory. Earlier releases kept a Mac's secrets in the
-//! login keychain; the first start on such a Mac copies them into the file, and the keychain
-//! items are deleted once that version is proven (see [`for_this_machine`] and
-//! [`forget_moved`]). A secret's value never reaches an error message: errors name the
+//! login keychain. The first start on such a Mac copies them into the file and marks the copy.
+//! Until that version passes its update trial the keychain stays the one source: a rollback
+//! sets the copy aside ([`set_aside_copy`]), and once the trial passes the keychain items are
+//! deleted ([`forget_moved`]). A secret's value never reaches an error message: errors name the
 //! secret or the file, never what it holds.
 
 use std::collections::BTreeMap;
@@ -111,20 +112,57 @@ pub const GATEWAY_MANAGEMENT: &str = "gateway-management";
 /// copied into it from the login keychain ([`move_secrets`]). Each keychain read can bring up a
 /// prompt, which this call waits on. A failed read gives an error and writes nothing, so the
 /// caller stops rather than start with an empty store, and the next start tries again. The
-/// keychain items stay until this version is proven ([`forget_moved`]). In a debug build
-/// `FOUNDRY_SECRETS=file` skips the keychain, which is how tests keep out of it. A release
-/// build ignores it.
+/// keychain items stay until this version is proven ([`forget_moved`]), and a rollback before
+/// then sets the copy aside ([`set_aside_copy`]). In a debug build `FOUNDRY_SECRETS=file`
+/// skips the keychain, which is how tests keep out of it. A release build ignores it.
 pub fn for_this_machine(home: &Path) -> Result<Arc<dyn Secrets>, SecretsError> {
     open(home, keychain().as_deref())
 }
 
-/// Removes from the login keychain each secret a keychain-era release stored there that
-/// `secrets.json` in `home` now holds. The daemon calls it once its update trial is over, so a
-/// rollback to a keychain-era release before then still finds its identity and keys. A failure
-/// is logged, naming the secret, and changes nothing else: the secrets are safe in the file.
+/// When `secrets.json` in `home` is a marked copy from the keychain, removes from the login
+/// keychain each secret it holds and drops the mark. The daemon calls it once its update trial
+/// is over, so a rollback to a keychain-era release before then still finds its identity and
+/// keys. A failure is logged, naming the secret, and changes nothing else: the secrets are safe
+/// in the file. With no mark it asks the keychain nothing.
 pub fn forget_moved(home: &Path) {
     if let Some(keychain) = keychain() {
-        forget(&*keychain, &FileSecrets::new(home.join("secrets.json")));
+        forget_copied(&*keychain, &FileSecrets::new(home.join("secrets.json")));
+    }
+}
+
+/// Called when an update trial rolls back: when `secrets.json` in `home` is a marked copy from
+/// the keychain, renames it to `secrets.json.rolled-back` and drops the mark. The keychain-era
+/// release the trial goes back to reads and writes only the keychain, so the copy would go
+/// stale; with it set aside, the next release copies the keychain again. A file with no mark
+/// is left alone.
+pub fn set_aside_copy(home: &Path) -> Result<(), SecretsError> {
+    let secrets = FileSecrets::new(home.join("secrets.json"));
+    let _locked = secrets.lock()?;
+    let mark = secrets.beside(".copied");
+    if !exists(&mark).map_err(|e| secrets.io(e))? {
+        return Ok(());
+    }
+    match fs::rename(&secrets.path, secrets.beside(".rolled-back")) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(secrets.io(error)),
+        _ => {}
+    }
+    remove(&mark).map_err(|e| secrets.io(e))
+}
+
+/// Whether `path` exists; an error other than its absence is passed on.
+fn exists(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// Removes the file at `path`; one that is already gone is not an error.
+fn remove(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
     }
 }
 
@@ -132,7 +170,7 @@ pub fn forget_moved(home: &Path) {
 /// run skips it with `FOUNDRY_SECRETS=file`; elsewhere none.
 fn keychain() -> Option<Box<dyn OldStore>> {
     #[cfg(target_os = "macos")]
-    if !skips_move(std::env::var_os("FOUNDRY_SECRETS").as_deref(), OVERRIDE) {
+    if !skips_keychain(std::env::var_os("FOUNDRY_SECRETS").as_deref(), OVERRIDE) {
         return Some(Box::new(Keychain { service: "foundry" }));
     }
     None
@@ -148,14 +186,14 @@ fn open(home: &Path, old: Option<&dyn OldStore>) -> Result<Arc<dyn Secrets>, Sec
 }
 
 /// Whether this build takes `FOUNDRY_SECRETS`: only a debug build, so a release Mac always
-/// moves its identity and keys out of the keychain.
+/// copies its identity and keys out of the keychain and later deletes them there.
 #[cfg(any(target_os = "macos", test))]
 const OVERRIDE: bool = cfg!(debug_assertions);
 
 /// Whether a `FOUNDRY_SECRETS` value skips the keychain: only exactly `file`, and only when
 /// `taken` (the build takes the override).
 #[cfg(any(target_os = "macos", test))]
-fn skips_move(choice: Option<&OsStr>, taken: bool) -> bool {
+fn skips_keychain(choice: Option<&OsStr>, taken: bool) -> bool {
     taken && choice == Some(OsStr::new("file"))
 }
 
@@ -174,15 +212,14 @@ trait OldStore {
 
 /// Copies every one of [`KEYCHAIN_NAMES`] that `old` holds into `new`, once: only while `new`'s
 /// file does not exist, and under its lock, so two processes starting at once copy them once.
-/// Every read comes first; any failure returns before anything is written. The secrets found
-/// are written in one go. `old` is left as it was, for [`forget`] once this version is proven.
-/// When `old` holds none, no file is written.
+/// Every read comes first; any failure returns before anything is written. The copy is marked
+/// with the file `<new>.copied`, made before the secrets are written in one go, so a copy on
+/// disk always has its mark. `old` is left as it was, for [`forget_copied`] once this version is
+/// proven. When `old` holds none, nothing is written.
 fn move_secrets(old: &dyn OldStore, new: &FileSecrets) -> Result<(), SecretsError> {
     let _locked = new.lock()?;
-    match fs::symlink_metadata(&new.path) {
-        Ok(_) => return Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(new.io(error)),
+    if exists(&new.path).map_err(|e| new.io(e))? {
+        return Ok(());
     }
     let mut found = BTreeMap::new();
     for name in KEYCHAIN_NAMES {
@@ -193,18 +230,46 @@ fn move_secrets(old: &dyn OldStore, new: &FileSecrets) -> Result<(), SecretsErro
     if found.is_empty() {
         return Ok(());
     }
+    OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(new.beside(".copied"))
+        .and_then(|mark| mark.sync_all())
+        .map_err(|e| new.io(e))?;
     new.write(&found)
 }
 
+/// [`forget`] for a marked copy: with no mark on `new` it removes nothing. The mark is dropped
+/// once removes were tried, even failed ones, so a later rollback never sets aside a file whose
+/// keychain items are already gone. A file that cannot be read keeps its mark and the keychain.
+fn forget_copied(old: &dyn OldStore, new: &FileSecrets) {
+    let mark = new.beside(".copied");
+    match exists(&mark) {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(error) => {
+            tracing::warn!("keychain secrets left in place: {}", new.io(error));
+            return;
+        }
+    }
+    if forget(old, new)
+        && let Err(error) = remove(&mark)
+    {
+        tracing::warn!("{}", new.io(error));
+    }
+}
+
 /// Removes from `old` each of [`KEYCHAIN_NAMES`] that `new` holds, so only a secret safe in the
-/// file leaves `old`. A file that cannot be read removes nothing. A failed remove is logged and
-/// the rest are still removed.
-fn forget(old: &dyn OldStore, new: &FileSecrets) {
+/// file leaves `old`. A file that cannot be read removes nothing and gives false. A failed
+/// remove is logged and the rest are still removed.
+fn forget(old: &dyn OldStore, new: &FileSecrets) -> bool {
     let held = match new.read() {
         Ok(held) => held,
         Err(error) => {
             tracing::warn!("keychain secrets left in place: {error}");
-            return;
+            return false;
         }
     };
     for name in KEYCHAIN_NAMES
@@ -215,6 +280,7 @@ fn forget(old: &dyn OldStore, new: &FileSecrets) {
             tracing::warn!("{error}; it is safe in {}", new.path.display());
         }
     }
+    true
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -453,7 +519,7 @@ fn lock_file(path: &Path, wait: Duration) -> Result<Flock<File>, SecretsError> {
 }
 
 /// The generic passwords a keychain-era release stored in the login keychain, one per name,
-/// under `service`: only read and removed, by [`move_secrets`].
+/// under `service`: only read, by [`move_secrets`], and removed, by [`forget`].
 #[cfg(target_os = "macos")]
 struct Keychain {
     service: &'static str,
@@ -1189,7 +1255,10 @@ mod tests {
         assert!(!copied(&dir));
         assert_eq!(mode(&aside), 0o600);
         assert_eq!(
-            FileSecrets::new(&aside).get("machine-keys").unwrap().as_deref(),
+            FileSecrets::new(&aside)
+                .get("machine-keys")
+                .unwrap()
+                .as_deref(),
             Some("value-of-machine-keys")
         );
 
@@ -1226,11 +1295,11 @@ mod tests {
     }
 
     #[test]
-    fn only_the_exact_word_file_skips_the_move() {
+    fn only_the_exact_word_file_skips_the_keychain() {
         use std::ffi::OsStr;
-        assert!(skips_move(Some(OsStr::new("file")), true));
+        assert!(skips_keychain(Some(OsStr::new("file")), true));
         for choice in [None, Some(OsStr::new("keychain")), Some(OsStr::new("File"))] {
-            assert!(!skips_move(choice, true), "{choice:?}");
+            assert!(!skips_keychain(choice, true), "{choice:?}");
         }
     }
 
@@ -1240,7 +1309,7 @@ mod tests {
     fn a_release_build_ignores_foundry_secrets() {
         use std::ffi::OsStr;
         for choice in [None, Some(OsStr::new("file"))] {
-            assert!(!skips_move(choice, false), "{choice:?}");
+            assert!(!skips_keychain(choice, false), "{choice:?}");
         }
     }
 
@@ -1249,7 +1318,7 @@ mod tests {
     #[test]
     fn this_debug_build_takes_foundry_secrets() {
         use std::ffi::OsStr;
-        assert!(skips_move(Some(OsStr::new("file")), OVERRIDE));
+        assert!(skips_keychain(Some(OsStr::new("file")), OVERRIDE));
     }
 
     /// The same in a release build, which ignores it. CI runs this one in a release build.
@@ -1258,7 +1327,7 @@ mod tests {
     fn this_release_build_ignores_foundry_secrets() {
         use std::ffi::OsStr;
         assert!(!OVERRIDE);
-        assert!(!skips_move(Some(OsStr::new("file")), OVERRIDE));
+        assert!(!skips_keychain(Some(OsStr::new("file")), OVERRIDE));
     }
 
     /// What `set_from` stored under `name`, read back from a file store.
