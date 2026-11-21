@@ -676,22 +676,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_look_after_a_gap_longer_than_the_settle_time_waits_again() {
-        let served = Served::new(|_, _| {}).await;
-        let seq = served.settings().seq;
+    async fn an_address_that_moves_between_two_close_looks_waits_the_settle_time() {
+        let served = Served::new(|me, settings| {
+            settings
+                .machines
+                .push(machine(me, "Tom's desk", "100.64.0.9"));
+        })
+        .await;
         let mut listing = served.listing_after(SETTLE);
         for _ in 0..3 {
-            listing.list(Err("not yet".to_owned())).await;
+            listing.list(here("personal-mac", "100.64.0.9")).await;
             tokio::time::sleep(STEP).await;
         }
+        let seq = served.settings().seq;
 
-        // Tailscale went away: no look for longer than the settle time.
-        tokio::time::sleep(SETTLE * 2).await;
+        // No gap between looks, as after a sleep the clock does not count: the address moved.
         listing.list(here("personal-mac", "100.91.54.18")).await;
         assert_eq!(
             served.settings().seq,
             seq,
-            "the first look after the gap sends nothing"
+            "the look that finds the move sends nothing"
         );
         tokio::time::sleep(STEP).await;
         listing.list(here("personal-mac", "100.91.54.18")).await;
@@ -703,7 +707,34 @@ mod tests {
 
         tokio::time::sleep(STEP).await;
         listing.list(here("personal-mac", "100.91.54.18")).await;
-        assert_eq!(served.settings().machines.len(), 1);
+        assert_eq!(
+            served.settings().machines,
+            [machine(served.me, "Tom's desk", "100.91.54.18")]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_look_that_finds_nothing_to_send_starts_the_wait_over() {
+        let served = Served::new(|me, settings| {
+            settings
+                .machines
+                .push(machine(me, "Tom's desk", "100.64.0.9"));
+        })
+        .await;
+        let seq = served.settings().seq;
+        let mut listing = served.listing_after(SETTLE);
+
+        listing.list(here("personal-mac", "100.91.54.18")).await;
+        tokio::time::sleep(STEP).await;
+        // The address came back: nothing to send, so the wait is over.
+        listing.list(here("personal-mac", "100.64.0.9")).await;
+        tokio::time::sleep(STEP).await;
+        listing.list(here("personal-mac", "100.91.54.18")).await;
+        assert_eq!(
+            served.settings().seq,
+            seq,
+            "a new move waits from where it was found"
+        );
     }
 
     #[tokio::test]
@@ -737,10 +768,32 @@ mod tests {
         tokio::time::sleep(STEP).await;
         listing.list(here("personal-mac", "100.91.54.18")).await;
         assert_eq!(
+            served.settings().seq,
+            seq,
+            "nor does one inside the settle time"
+        );
+        tokio::time::sleep(STEP).await;
+        listing.list(here("personal-mac", "100.91.54.18")).await;
+        assert_eq!(
             served.settings().machines.len(),
             1,
             "a later look lists it again"
         );
+    }
+
+    #[tokio::test]
+    async fn once_the_settle_time_has_run_a_failed_look_is_followed_at_once_by_one_that_sends() {
+        let served = Served::new(|_, _| {}).await;
+        let mut listing = served.listing_after(SETTLE);
+        for _ in 0..2 {
+            listing.list(here("personal-mac", "100.91.54.18")).await;
+            tokio::time::sleep(STEP).await;
+        }
+        assert!(served.settings().machines.is_empty());
+
+        listing.list(Err("status did not answer".to_owned())).await;
+        listing.list(here("personal-mac", "100.91.54.18")).await;
+        assert_eq!(served.settings().machines.len(), 1);
     }
 
     #[tokio::test]
