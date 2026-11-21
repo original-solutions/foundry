@@ -1769,6 +1769,19 @@ mod tests {
         counts: (&'static AtomicUsize, &'static AtomicUsize),
         result: fn() -> Result<Option<String>, UpdateError>,
     ) -> tokio::task::JoinHandle<()> {
+        static IGNORED: AtomicUsize = AtomicUsize::new(0);
+        spawn_run_proven(home, exe, flag, counts, result, &IGNORED)
+    }
+
+    /// [`spawn_run`], counting in `proven` each time this version is told it is proven.
+    fn spawn_run_proven(
+        home: &Path,
+        exe: io::Result<PathBuf>,
+        flag: &'static AtomicBool,
+        counts: (&'static AtomicUsize, &'static AtomicUsize),
+        result: fn() -> Result<Option<String>, UpdateError>,
+        proven: &'static AtomicUsize,
+    ) -> tokio::task::JoinHandle<()> {
         let home = home.to_path_buf();
         let (checks, stops) = counts;
         tokio::spawn(run_with(
@@ -1783,7 +1796,96 @@ mod tests {
             move || {
                 stops.fetch_add(1, Ordering::Relaxed);
             },
+            move || {
+                proven.fetch_add(1, Ordering::Relaxed);
+            },
         ))
+    }
+
+    /// The keychain items a keychain-era release left are forgotten only once this version's
+    /// trial is over, so a rollback before then still finds them.
+    #[tokio::test(start_paused = true)]
+    async fn run_says_this_version_is_proven_once_and_only_after_the_trial_is_marked_healthy() {
+        static FLAG: AtomicBool = AtomicBool::new(false);
+        static CHECKS: AtomicUsize = AtomicUsize::new(0);
+        static STOPS: AtomicUsize = AtomicUsize::new(0);
+        static PROVEN: AtomicUsize = AtomicUsize::new(0);
+        let home = trial_home();
+        let exe = exe_in(home.path(), "0.2.0");
+        let task = spawn_run_proven(
+            home.path(),
+            Ok(exe),
+            &FLAG,
+            (&CHECKS, &STOPS),
+            nothing,
+            &PROVEN,
+        );
+
+        tokio::time::sleep(HEALTHY_AFTER / 2).await;
+        assert_eq!(PROVEN.load(Ordering::Relaxed), 0);
+        tokio::time::sleep(HEALTHY_AFTER / 2 + Duration::from_secs(1)).await;
+        reach(&CHECKS, 1).await;
+        assert_eq!(state(home.path()).unwrap().trial, None);
+        assert_eq!(PROVEN.load(Ordering::Relaxed), 1);
+        tokio::time::sleep(CHECK_EVERY + Duration::from_secs(1)).await;
+        reach(&CHECKS, 2).await;
+        assert_eq!(PROVEN.load(Ordering::Relaxed), 1);
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_healthy_mark_that_cannot_be_saved_proves_nothing_until_it_is_saved() {
+        static FLAG: AtomicBool = AtomicBool::new(false);
+        static CHECKS: AtomicUsize = AtomicUsize::new(0);
+        static STOPS: AtomicUsize = AtomicUsize::new(0);
+        static PROVEN: AtomicUsize = AtomicUsize::new(0);
+        let home = trial_home();
+        let exe = exe_in(home.path(), "0.2.0");
+        let blocker = home.path().join("update.json.tmp");
+        fs::create_dir(&blocker).unwrap();
+        let task = spawn_run_proven(
+            home.path(),
+            Ok(exe),
+            &FLAG,
+            (&CHECKS, &STOPS),
+            nothing,
+            &PROVEN,
+        );
+
+        tokio::time::sleep(HEALTHY_AFTER + Duration::from_secs(1)).await;
+        reach(&CHECKS, 1).await;
+        assert_eq!(PROVEN.load(Ordering::Relaxed), 0);
+        fs::remove_dir(&blocker).unwrap();
+        tokio::time::sleep(CHECK_EVERY).await;
+        reach(&CHECKS, 2).await;
+        assert_eq!(PROVEN.load(Ordering::Relaxed), 1);
+        task.abort();
+    }
+
+    /// A daemon not run from `current` takes no part in trials, so nothing proves it.
+    #[tokio::test(start_paused = true)]
+    async fn run_from_elsewhere_is_never_proven() {
+        static FLAG: AtomicBool = AtomicBool::new(false);
+        static CHECKS: AtomicUsize = AtomicUsize::new(0);
+        static STOPS: AtomicUsize = AtomicUsize::new(0);
+        static PROVEN: AtomicUsize = AtomicUsize::new(0);
+        let home = trial_home();
+        let elsewhere = home.path().join("elsewhere");
+        script(&elsewhere, "foundryd 0.2.0");
+        let task = spawn_run_proven(
+            home.path(),
+            Ok(elsewhere),
+            &FLAG,
+            (&CHECKS, &STOPS),
+            nothing,
+            &PROVEN,
+        );
+
+        tokio::time::sleep(HEALTHY_AFTER + CHECK_EVERY * 3).await;
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(FLAG.load(Ordering::Relaxed));
+        assert_eq!(PROVEN.load(Ordering::Relaxed), 0);
+        task.abort();
     }
 
     /// Lets the blocking check threads run until `counter` reaches `n`.

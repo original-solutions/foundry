@@ -796,10 +796,30 @@ mod tests {
         }
     }
 
-    /// A keychain stand-in whose reads of `failing` fail, as a denied keychain prompt does.
+    /// A keychain stand-in whose reads of `failing` fail, as a denied keychain prompt does, and
+    /// whose removes of `failing_remove` fail.
     struct Denying {
         inner: MemorySecrets,
         failing: &'static str,
+        failing_remove: &'static str,
+    }
+
+    impl Denying {
+        fn reads(inner: MemorySecrets, failing: &'static str) -> Self {
+            Self {
+                inner,
+                failing,
+                failing_remove: "",
+            }
+        }
+
+        fn removes(inner: MemorySecrets, failing_remove: &'static str) -> Self {
+            Self {
+                inner,
+                failing: "",
+                failing_remove,
+            }
+        }
     }
 
     impl OldStore for Denying {
@@ -815,6 +835,13 @@ mod tests {
         }
 
         fn remove(&self, name: &str) -> Result<(), SecretsError> {
+            if name == self.failing_remove {
+                return Err(SecretsError::Keychain {
+                    action: "delete",
+                    name: name.to_owned(),
+                    reason: "denied".into(),
+                });
+            }
             OldStore::remove(&self.inner, name)
         }
     }
@@ -833,8 +860,10 @@ mod tests {
         old.lock().keys().cloned().collect()
     }
 
+    /// The move only copies: until this version is proven, a rollback to a keychain-era
+    /// release must still find its identity and keys in the keychain.
     #[test]
-    fn the_move_takes_all_four_secrets_and_removes_them_from_the_keychain() {
+    fn the_move_copies_all_four_secrets_and_leaves_the_keychain_as_it_was() {
         let (dir, new) = file();
         let old = old_store(&MOVED);
         Secrets::set(&old, "unrelated", "kept").unwrap();
@@ -847,7 +876,10 @@ mod tests {
                 "{name}"
             );
         }
-        assert_eq!(held_in(&old), ["unrelated"]);
+        let mut all = MOVED.map(str::to_owned).to_vec();
+        all.push("unrelated".into());
+        all.sort();
+        assert_eq!(held_in(&old), all);
         assert_eq!(new.get("unrelated").unwrap(), None);
         assert_eq!(mode(&dir.path().join("secrets.json")), 0o600);
     }
@@ -867,7 +899,7 @@ mod tests {
         );
         assert_eq!(new.get("machine-keys").unwrap(), None);
         assert_eq!(new.get(GATEWAY_MANAGEMENT).unwrap(), None);
-        assert!(held_in(&old).is_empty());
+        assert_eq!(held_in(&old), ["gateway", "machine"]);
     }
 
     #[test]
@@ -881,10 +913,7 @@ mod tests {
     fn a_failed_read_moves_nothing_and_names_the_secret_not_its_value() {
         for failing in MOVED {
             let (dir, new) = file();
-            let old = Denying {
-                inner: old_store(&MOVED),
-                failing,
-            };
+            let old = Denying::reads(old_store(&MOVED), failing);
             let error = move_secrets(&old, &new).unwrap_err();
             assert!(error.to_string().contains(failing), "{error}");
             assert!(!error.to_string().contains("value-of-"), "{error}");
@@ -916,6 +945,119 @@ mod tests {
         move_secrets(&old_store(&[GATEWAY]), &new).unwrap();
         assert_eq!(mode(&home), 0o700);
         assert_eq!(mode(&home.join("secrets.json")), 0o600);
+    }
+
+    #[test]
+    fn a_failed_write_gives_the_error_and_leaves_the_keychain_as_it_was() {
+        let (dir, new) = file();
+        // A directory where the temporary file goes: removing it fails, so the write does.
+        fs::create_dir(dir.path().join("secrets.json.tmp")).unwrap();
+        let old = old_store(&MOVED);
+        assert!(move_secrets(&old, &new).is_err());
+        assert!(!dir.path().join("secrets.json").exists());
+        assert_eq!(held_in(&old), held_in(&old_store(&MOVED)));
+    }
+
+    #[test]
+    fn the_move_waits_on_the_secrets_lock_and_moves_nothing_while_another_holds_it() {
+        let (dir, new) = file();
+        let held = lock_file(&dir.path().join("secrets.json.lock"), LOCK_WAIT).unwrap();
+        let old = old_store(&MOVED);
+        let started = Instant::now();
+        let error = move_secrets(&old, &new).unwrap_err();
+        assert!(started.elapsed() >= LOCK_WAIT);
+        assert!(matches!(error, SecretsError::Locked { .. }), "{error:?}");
+        assert!(!dir.path().join("secrets.json").exists());
+        drop(held);
+    }
+
+    #[test]
+    fn opening_with_a_keychain_and_no_file_copies_its_secrets_into_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = old_store(&MOVED);
+        let store = open(dir.path(), Some(&old)).unwrap();
+        assert_eq!(
+            store.get("machine").unwrap().as_deref(),
+            Some("value-of-machine")
+        );
+        let file = FileSecrets::new(dir.path().join("secrets.json"));
+        assert_eq!(
+            file.get("machine-keys").unwrap().as_deref(),
+            Some("value-of-machine-keys")
+        );
+    }
+
+    /// The daemon, `join` and `secret set` all stop on this error rather than start with an
+    /// empty store and make a new identity.
+    #[test]
+    fn opening_when_a_keychain_read_fails_gives_the_error_and_writes_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = Denying::reads(old_store(&MOVED), "machine");
+        let error = match open(dir.path(), Some(&old)) {
+            Ok(_) => panic!("opened a store although the keychain read failed"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("machine"), "{error}");
+        assert!(!dir.path().join("secrets.json").exists());
+    }
+
+    #[test]
+    fn opening_with_no_keychain_moves_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(dir.path(), None).unwrap();
+        assert_eq!(store.get("machine").unwrap(), None);
+        assert!(!dir.path().join("secrets.json").exists());
+    }
+
+    #[test]
+    fn forgetting_removes_from_the_keychain_only_what_secrets_json_holds() {
+        let (_dir, new) = file();
+        let old = old_store(&MOVED);
+        Secrets::set(&old, "unrelated", "kept").unwrap();
+        new.set("machine", "value-of-machine").unwrap();
+        new.set(GATEWAY, "value-of-gateway").unwrap();
+        forget(&old, &new);
+        assert_eq!(
+            held_in(&old),
+            ["gateway-management", "machine-keys", "unrelated"]
+        );
+    }
+
+    #[test]
+    fn forgetting_with_no_secrets_json_removes_nothing() {
+        let (_dir, new) = file();
+        let old = old_store(&MOVED);
+        forget(&old, &new);
+        assert_eq!(held_in(&old), held_in(&old_store(&MOVED)));
+    }
+
+    #[test]
+    fn forgetting_with_a_secrets_json_others_can_read_removes_nothing() {
+        let (dir, new) = file();
+        for name in MOVED {
+            new.set(name, "x").unwrap();
+        }
+        fs::set_permissions(
+            dir.path().join("secrets.json"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        let old = old_store(&MOVED);
+        forget(&old, &new);
+        assert_eq!(held_in(&old), held_in(&old_store(&MOVED)));
+    }
+
+    #[test]
+    fn a_failed_remove_still_removes_the_others_and_changes_no_file() {
+        let (dir, new) = file();
+        for name in MOVED {
+            new.set(name, &format!("value-of-{name}")).unwrap();
+        }
+        let before = fs::read(dir.path().join("secrets.json")).unwrap();
+        let old = Denying::removes(old_store(&MOVED), "gateway");
+        forget(&old, &new);
+        assert_eq!(held_in(&old.inner), ["gateway"]);
+        assert_eq!(fs::read(dir.path().join("secrets.json")).unwrap(), before);
     }
 
     /// `foundryd secret set` can run before the first `foundryd run`, which refuses a data
