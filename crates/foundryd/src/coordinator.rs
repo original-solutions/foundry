@@ -550,8 +550,9 @@ impl Coordinator {
                             return match self.number(None, &edit).await {
                                 Ok(_) => Ok(()),
                                 Err(Unnumbered::Store { error, .. }) => Err(error.into()),
-                                // Not given: an edit with no id is numbered unchecked.
-                                Err(Unnumbered::Breaks(why)) => Err(self.conflict(why)),
+                                Err(Unnumbered::Breaks(_)) => {
+                                    unreachable!("an edit with no id is numbered unchecked")
+                                }
                             };
                         }
                         Next::Send(acting) => {
@@ -903,13 +904,9 @@ fn breaks(
     edit: &Edit,
 ) -> Result<Option<&'static str>, StoreError> {
     Ok(match edit {
-        Edit::SetProject { project } if !held.projects.iter().any(|p| p.id == project.id) => {
-            let name = project.name.trim().to_lowercase();
-            held.projects
-                .iter()
-                .any(|p| p.name.trim().to_lowercase() == name)
-                .then_some("holds another project with that name")
-        }
+        Edit::SetProject { project } if !held.projects.iter().any(|p| p.id == project.id) => held
+            .project_named(&project.name)
+            .map(|_| "holds another project with that name"),
         Edit::RemoveProject { id } => store
             .live_workspaces()?
             .iter()

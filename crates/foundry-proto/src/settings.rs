@@ -40,6 +40,17 @@ pub struct SharedSettings {
     pub numbered: BTreeMap<EditId, Stamp>,
 }
 
+impl SharedSettings {
+    /// The project named `name`, compared trimmed and in any case: the one rule for when two
+    /// project names are the same.
+    pub fn project_named(&self, name: &str) -> Option<&Project> {
+        let wanted = name.trim().to_lowercase();
+        self.projects
+            .iter()
+            .find(|p| p.name.trim().to_lowercase() == wanted)
+    }
+}
+
 /// The id a machine gives an edit it sends to the acting coordinator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -388,6 +399,23 @@ pub(crate) mod tests {
             )]
             .into(),
             numbered: [(EditId::random(), Stamp { seq: 42, by: mac })].into(),
+        }
+    }
+
+    #[test]
+    fn a_project_is_found_by_its_name_trimmed_and_in_any_case() {
+        let mut settings = settings();
+        settings.projects[0].name = " Foundry ".into();
+        let id = settings.projects[0].id;
+        for name in ["foundry", "  FOUNDRY", "fOuNdRy\t"] {
+            assert_eq!(
+                settings.project_named(name).map(|p| p.id),
+                Some(id),
+                "{name:?}"
+            );
+        }
+        for name in ["found", "foundry2", "", "foun dry"] {
+            assert_eq!(settings.project_named(name), None, "{name:?}");
         }
     }
 

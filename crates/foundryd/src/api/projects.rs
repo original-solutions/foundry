@@ -14,10 +14,13 @@
 //!   from is `409`, naming each such workspace.
 //!
 //! Both checks read this machine's store first, and nothing is sent to the coordinator when one
-//! refuses. The acting coordinator checks both rules again against its own copy and store as it
-//! numbers the edit ([`crate::coordinator`]), so an add or a remove this machine let through on
-//! what it had heard is still refused there, `409` as well. A split fleet holds neither rule:
-//! each side numbers its own edits.
+//! refuses. The acting coordinator checks the name and the live workspaces again, against its
+//! own copy and store, as it numbers the edit ([`crate::coordinator`]). So an add of a name this
+//! machine had not heard of is still refused there, `409` as well, and so is a remove of a
+//! project the acting machine's store holds a live workspace of. Only this machine checks an id
+//! another project holds. A remove still lands when neither machine holds the record of a
+//! workspace being made, and a split fleet holds neither rule, as each side numbers its own
+//! edits.
 //!
 //! Any other edit the coordinator could not make answers as an attention dismissal does,
 //! through the shared [`edit_status`]. No answer names a repo: any message that could is passed
@@ -96,12 +99,7 @@ async fn add(
             "a project with the id {id} already exists"
         )));
     }
-    let wanted = name.to_lowercase();
-    if let Some(held) = settings
-        .projects
-        .iter()
-        .find(|p| p.name.trim().to_lowercase() == wanted)
-    {
+    if let Some(held) = settings.project_named(name) {
         return Err(conflict(format!(
             "a project named {:?} already exists",
             held.name
