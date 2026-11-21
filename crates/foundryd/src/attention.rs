@@ -519,12 +519,13 @@ async fn dismiss(State(attention): State<Arc<Attention>>, Path(id): Path<String>
     }
     match attention.coordinator.edit(Edit::Dismiss { setting }).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => error(dismissal_status(&e), e.to_string()),
+        Err(e) => error(edit_status(&e), e.to_string()),
     }
 }
 
-/// The status a dismissal that failed answers with.
-fn dismissal_status(error: &CoordinatorError) -> StatusCode {
+/// The status an edit sent through the coordinator that failed answers with: a dismissal here,
+/// and a project added or removed ([`crate::api::projects`]).
+pub(crate) fn edit_status(error: &CoordinatorError) -> StatusCode {
     match error {
         CoordinatorError::Refused { .. } => StatusCode::BAD_GATEWAY,
         // Sent, so it may have been numbered: not the 503 of an edit that changed nothing.
@@ -1603,7 +1604,7 @@ mod tests {
             ),
         ];
         for (error, status) in cases {
-            assert_eq!(dismissal_status(&error).as_u16(), status, "{error}");
+            assert_eq!(edit_status(&error).as_u16(), status, "{error}");
         }
     }
 

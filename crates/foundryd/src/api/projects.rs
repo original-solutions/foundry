@@ -16,10 +16,16 @@
 use std::sync::{Arc, Mutex};
 
 use axum::Router;
-use axum::extract::State;
-use axum::response::Response;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::post;
+use foundry_proto::ids::ProjectId;
+use foundry_proto::settings::{Edit, Project};
+use serde::Deserialize;
 
+use super::{ApiError, Body, created, on_store, parse_id, unprocessable};
+use crate::attention::edit_status;
 use crate::coordinator::Coordinator;
 use crate::store::Store;
 
@@ -37,13 +43,105 @@ struct Projects {
 /// guards the rest of the API.
 pub fn router(coordinator: Arc<Coordinator>, store: Arc<Mutex<Store>>) -> Router {
     Router::new()
-        .route("/api/projects", post(stub))
-        .route("/api/projects/{id}/remove", post(stub))
+        .route("/api/projects", post(add))
+        .route("/api/projects/{id}/remove", post(remove))
         .with_state(Arc::new(Projects { coordinator, store }))
 }
 
-async fn stub(State(_projects): State<Arc<Projects>>) -> Response {
-    axum::response::IntoResponse::into_response(axum::http::StatusCode::NOT_IMPLEMENTED)
+#[derive(Deserialize)]
+struct Add {
+    name: String,
+    repo: String,
+}
+
+async fn add(
+    State(projects): State<Arc<Projects>>,
+    Body(add): Body<Add>,
+) -> Result<Response, ApiError> {
+    let (name, repo) = (add.name.trim(), add.repo.trim());
+    if name.is_empty() {
+        return Err(unprocessable("a project needs a name".to_owned()));
+    }
+    if name.chars().count() > NAME_AT_MOST {
+        return Err(unprocessable(format!(
+            "a project's name is at most {NAME_AT_MOST} characters"
+        )));
+    }
+    if repo.is_empty() {
+        return Err(unprocessable("a project needs a repo URL".to_owned()));
+    }
+    if repo.contains(|c: char| c.is_whitespace() || c == '\0') {
+        return Err(unprocessable(
+            "a repo URL holds no spaces, tabs, line breaks or NULs".to_owned(),
+        ));
+    }
+    let settings = on_store(&projects.store, |store| store.settings()).await?;
+    let wanted = name.to_lowercase();
+    if let Some(held) = settings
+        .projects
+        .iter()
+        .find(|p| p.name.trim().to_lowercase() == wanted)
+    {
+        return Err(conflict(format!(
+            "a project named {:?} already exists",
+            held.name
+        )));
+    }
+    let id = ProjectId::random();
+    let project = Project {
+        id,
+        name: name.to_owned(),
+        repo: repo.to_owned(),
+    };
+    edit(&projects, Edit::SetProject { project }).await?;
+    Ok(created(id))
+}
+
+async fn remove(
+    State(projects): State<Arc<Projects>>,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    let id = parse_id(&id, "project", ProjectId)?;
+    let (settings, live) = on_store(&projects.store, |store| {
+        Ok((store.settings()?, store.live_workspaces()?))
+    })
+    .await?;
+    let Some(project) = settings.projects.iter().find(|p| p.id == id) else {
+        return Err(ApiError::NotFound(format!("no project {id} here")));
+    };
+    let holding: Vec<String> = live
+        .iter()
+        .filter(|w| w.body.project == id)
+        .map(|w| {
+            let machine = settings
+                .machines
+                .iter()
+                .find(|m| m.id == w.owner)
+                .map_or_else(|| w.owner.to_string(), |m| m.name.clone());
+            format!("{:?} on {machine}", w.body.name)
+        })
+        .collect();
+    if !holding.is_empty() {
+        return Err(conflict(format!(
+            "{} still has live workspaces: {}; archive them first",
+            project.name,
+            holding.join(", ")
+        )));
+    }
+    edit(&projects, Edit::RemoveProject { id }).await?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// Sends `edit` through the coordinator, answering a failure as a dismissal's is answered.
+async fn edit(projects: &Projects, edit: Edit) -> Result<(), ApiError> {
+    match projects.coordinator.edit(edit).await {
+        Ok(_) => Ok(()),
+        Err(e) => Err(ApiError::Rejected(edit_status(&e), e.to_string())),
+    }
+}
+
+fn conflict(message: String) -> ApiError {
+    ApiError::Rejected(StatusCode::CONFLICT, message)
 }
 
 #[cfg(test)]
@@ -359,7 +457,9 @@ mod tests {
     #[tokio::test]
     async fn removing_a_project_the_settings_do_not_hold_is_404_and_sends_nothing() {
         let served = Served::new(|_, settings| {
-            settings.projects.push(project("foundry", "/srv/foundry.git"));
+            settings
+                .projects
+                .push(project("foundry", "/srv/foundry.git"));
         })
         .await;
         let seq = served.settings().seq;
