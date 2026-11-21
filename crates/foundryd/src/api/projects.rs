@@ -1,13 +1,20 @@
 //! Adds and removes projects, through the acting coordinator as every shared-settings change
 //! goes, so a project added on one machine shows on every machine.
 //!
-//! - `POST /api/projects` `{name, repo}`: adds a project under a new id, with its name and repo
-//!   trimmed, `201 {id}`. A name that is blank or over [`NAME_AT_MOST`] characters, or a repo
-//!   that is blank or holds whitespace or a NUL, is `422`. A name another project has, compared
-//!   trimmed and in any case, is `409`.
+//! - `POST /api/projects` `{name, repo, id?}`: adds a project with its name and repo trimmed,
+//!   `201 {id}`. The id is the one the caller sent, else a new one. A caller that sends its own
+//!   id and sends the add again after an answer that came too late sends the same edit, so a
+//!   retry cannot make a second project. A name that is blank or over [`NAME_AT_MOST`]
+//!   characters, or a repo that is blank or holds whitespace or a NUL, is `422`. A name another
+//!   project has, compared trimmed and in any case, or an id another project has, is `409`.
 //! - `POST /api/projects/{id}/remove`: removes a project, `204`. An id the settings do not hold
-//!   is `404`. A project a live workspace on any machine was made from is `409`, naming each
-//!   such workspace.
+//!   is `404`. A project that a live workspace this machine knows of, from any machine, was made
+//!   from is `409`, naming each such workspace.
+//!
+//! Both checks read this machine's store, so they hold for what it has heard. The coordinator
+//! orders edits and checks none: a workspace still being made, or one whose records have not
+//! reached this machine, does not stop a remove, and two machines that add one name before
+//! hearing of each other's add both go through.
 //!
 //! Nothing is sent to the coordinator when a request is refused. An edit the coordinator could
 //! not make answers as an attention dismissal does ([`edit_status`]). No answer names a repo:
@@ -52,6 +59,7 @@ pub fn router(coordinator: Arc<Coordinator>, store: Arc<Mutex<Store>>) -> Router
 struct Add {
     name: String,
     repo: String,
+    id: Option<ProjectId>,
 }
 
 async fn add(
@@ -87,7 +95,12 @@ async fn add(
             held.name
         )));
     }
-    let id = ProjectId::random();
+    let id = add.id.unwrap_or_else(ProjectId::random);
+    if settings.projects.iter().any(|p| p.id == id) {
+        return Err(conflict(format!(
+            "a project with the id {id} already exists"
+        )));
+    }
     let project = Project {
         id,
         name: name.to_owned(),
@@ -304,6 +317,11 @@ mod tests {
         }
     }
 
+    fn id_of(body: &str) -> ProjectId {
+        let json: Value = serde_json::from_str(body).unwrap();
+        ProjectId(json["id"].as_str().unwrap().parse().unwrap())
+    }
+
     fn error_of(body: &str) -> String {
         let json: Value = serde_json::from_str(body).unwrap();
         json["error"].as_str().unwrap().to_owned()
@@ -339,6 +357,50 @@ mod tests {
         let projects = served.settings().projects;
         assert_eq!(projects.len(), 2);
         assert_ne!(projects[0].id, projects[1].id);
+    }
+
+    #[tokio::test]
+    async fn an_add_under_the_callers_id_keeps_that_id() {
+        let served = Served::new(|_, _| {}).await;
+        let id = ProjectId::random();
+        let (status, body) = served
+            .post(
+                "/api/projects",
+                Some(json!({ "name": "api", "repo": "/srv/api.git", "id": id })),
+            )
+            .await;
+        assert_eq!(status, 201, "{body}");
+        assert_eq!(id_of(&body), id);
+        assert_eq!(
+            served.settings().projects,
+            [Project {
+                id,
+                name: "api".into(),
+                repo: "/srv/api.git".into(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_add_under_an_id_another_project_has_is_409_and_sends_nothing() {
+        let held = project("foundry", "/srv/foundry.git");
+        let id = held.id;
+        let served = Served::new({
+            let held = held.clone();
+            move |_, settings| settings.projects.push(held)
+        })
+        .await;
+        let seq = served.settings().seq;
+        let (status, body) = served
+            .post(
+                "/api/projects",
+                Some(json!({ "name": "other", "repo": "/srv/other.git", "id": id })),
+            )
+            .await;
+        assert_eq!(status, 409, "{body}");
+        assert!(error_of(&body).contains(&id.to_string()), "{body}");
+        assert_eq!(served.settings().seq, seq);
+        assert_eq!(served.settings().projects, [held]);
     }
 
     #[tokio::test]
@@ -488,8 +550,10 @@ mod tests {
             settings.projects.push(held);
         })
         .await;
+        let gone = MachineId::random();
         served.workspace(peer, id, "fix login", false);
         served.workspace(peer, id, "tidy readme", false);
+        served.workspace(gone, id, "left behind", false);
         served.workspace(peer, id, "old work", true);
         served.workspace(peer, ProjectId::random(), "elsewhere", false);
         let seq = served.settings().seq;
@@ -499,9 +563,15 @@ mod tests {
             .await;
         assert_eq!(status, 409, "{body}");
         let error = error_of(&body);
-        for named in ["fix login", "tidy readme"] {
+        for named in ["fix login", "tidy readme", "left behind"] {
             assert!(error.contains(named), "{named} not in {error}");
         }
+        assert!(error.contains("on trilogy-mac"), "{error}");
+        // A machine the settings no longer list is named by its id.
+        assert!(
+            error.contains(&format!("\"left behind\" on {gone}")),
+            "{error}"
+        );
         for unnamed in ["old work", "elsewhere"] {
             assert!(!error.contains(unnamed), "{unnamed} in {error}");
         }
