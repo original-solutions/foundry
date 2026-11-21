@@ -1,8 +1,11 @@
-//! Secrets in the macOS keychain or a 0600 file on Linux.
+//! Secrets in a 0600 file, `secrets.json` in the data directory, on every OS.
 //!
-//! [`Secrets`] is the one interface: [`Keychain`] backs it on macOS and [`FileSecrets`] on
-//! Linux, and [`for_this_machine`] picks the one this machine uses. A secret's value never
-//! reaches an error message: errors name the secret or the file, never what it holds.
+//! [`Secrets`] is the one interface and [`FileSecrets`] backs it. [`for_this_machine`] picks
+//! the store this machine uses. macOS once kept them in the login keychain ([`Keychain`]); a
+//! Mac that still has them there moves them into the file the first time it opens its store
+//! ([`FileSecrets::adopt`]), so a rebuilt or updated binary, which the keychain treats as
+//! another program, never stops at a keychain prompt again. A secret's value never reaches an
+//! error message: errors name the secret or the file, never what it holds.
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -100,32 +103,39 @@ pub const GATEWAY: &str = "gateway";
 /// The secret the gateway's management key is held under.
 pub const GATEWAY_MANAGEMENT: &str = "gateway-management";
 
-/// The secret store this machine uses: the login keychain on macOS, its updates locked by
-/// the file `secrets.lock` in `home`, and on Linux the file `secrets.json` in `home`, readable
-/// only by the service user. In a debug build `FOUNDRY_SECRETS=file` picks the file on every
-/// OS, which is how tests keep out of the keychain. A release build ignores it.
+/// Every secret a machine keeps: the ones a Mac moves out of its keychain.
+pub const KEPT: &[&str] = &[GATEWAY, GATEWAY_MANAGEMENT, "machine", "machine-keys"];
+
+/// The secret store this machine uses: the file `secrets.json` in `home`, readable only by
+/// the service user. On macOS the secrets in [`KEPT`] are first moved into it from the login
+/// keychain, once; while that move cannot be made (a keychain prompt refused, say) the
+/// keychain is used as before and the move is tried again next time. In a debug build
+/// `FOUNDRY_SECRETS=file` skips the keychain, which is how tests keep out of it. A release
+/// build ignores it.
 pub fn for_this_machine(home: &Path) -> Arc<dyn Secrets> {
     store_for(home, store(std::env::var_os("FOUNDRY_SECRETS").as_deref()))
 }
 
 /// Whether this build takes `FOUNDRY_SECRETS`: only a debug build, so a release Mac always
-/// keeps its identity and keys in the keychain.
+/// moves what its keychain holds.
 const OVERRIDE: bool = cfg!(debug_assertions);
 
 /// Which secret store a machine uses.
 #[derive(Debug, PartialEq, Eq)]
 enum Store {
     File,
-    Keychain,
+    /// The file, after moving what the keychain holds into it.
+    FileFromKeychain,
 }
 
-/// The store for a `FOUNDRY_SECRETS` value: the file for exactly `file` when `taken` (the build
-/// takes the override), else this OS's default, the keychain on macOS and the file elsewhere.
+/// The store for a `FOUNDRY_SECRETS` value: the plain file for exactly `file` when `taken` (the
+/// build takes the override), else this OS's default: on macOS the file moved from the
+/// keychain, elsewhere the plain file.
 fn choose(choice: Option<&OsStr>, taken: bool) -> Store {
     if (taken && choice == Some(OsStr::new("file"))) || !cfg!(target_os = "macos") {
         Store::File
     } else {
-        Store::Keychain
+        Store::FileFromKeychain
     }
 }
 
@@ -139,9 +149,22 @@ fn store_for(home: &Path, store: Store) -> Arc<dyn Secrets> {
     match store {
         Store::File => Arc::new(FileSecrets::new(home.join("secrets.json"))),
         #[cfg(target_os = "macos")]
-        Store::Keychain => Arc::new(Keychain::new("foundry", home.join("secrets.lock"))),
+        Store::FileFromKeychain => {
+            let file = FileSecrets::new(home.join("secrets.json"));
+            let keychain = Keychain::new("foundry", home.join("secrets.lock"));
+            match file.adopt(&keychain, KEPT) {
+                Ok(()) => Arc::new(file),
+                Err(error) => {
+                    tracing::warn!(
+                        "cannot move the secrets out of the keychain, so it is used this time: \
+                         {error}"
+                    );
+                    Arc::new(keychain)
+                }
+            }
+        }
         #[cfg(not(target_os = "macos"))]
-        Store::Keychain => unreachable!("only macOS chooses the keychain"),
+        Store::FileFromKeychain => unreachable!("only macOS has a keychain to move from"),
     }
 }
 
@@ -298,6 +321,25 @@ impl FileSecrets {
                 .map_err(|e| self.io(e))?;
         }
         Ok(())
+    }
+
+    /// Moves the secrets named in `names` out of `old` into this store, once: only when its
+    /// file does not exist yet. Every name is read before anything is written, so a read that
+    /// fails leaves no file and the next call tries again. The file is made even when `old`
+    /// holds none of them, so `old` is never read again. `old` keeps what it holds, for a
+    /// version from before the move.
+    pub fn adopt(&self, old: &dyn Secrets, names: &[&str]) -> Result<(), SecretsError> {
+        let _locked = self.lock()?;
+        if self.path.try_exists().map_err(|e| self.io(e))? {
+            return Ok(());
+        }
+        let mut secrets = BTreeMap::new();
+        for name in names {
+            if let Some(value) = old.get(name)? {
+                secrets.insert((*name).to_owned(), value);
+            }
+        }
+        self.write(&secrets)
     }
 
     fn io(&self, source: io::Error) -> SecretsError {
@@ -855,7 +897,7 @@ mod tests {
 
     fn os_default() -> Store {
         if cfg!(target_os = "macos") {
-            Store::Keychain
+            Store::FileFromKeychain
         } else {
             Store::File
         }
@@ -918,5 +960,82 @@ mod tests {
         let secrets = MemorySecrets::default();
         let input = io::BufReader::new(Unreadable);
         assert!(set_from(&secrets, "machine", input).is_err());
+    }
+
+    /// A store whose every read fails, or panics when it must not be read at all.
+    struct Failing {
+        panics: bool,
+    }
+
+    impl Secrets for Failing {
+        fn get(&self, name: &str) -> Result<Option<String>, SecretsError> {
+            assert!(!self.panics, "{name} was read");
+            Err(SecretsError::Keychain {
+                action: "read",
+                name: name.to_owned(),
+                reason: "denied".into(),
+            })
+        }
+        fn set(&self, _: &str, _: &str) -> Result<(), SecretsError> {
+            unreachable!()
+        }
+        fn update(&self, _: &str, _: Edit<'_>) -> Result<(), SecretsError> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn adopt_copies_every_kept_secret_the_old_store_holds_into_a_0600_file() {
+        let (dir, file) = file();
+        let old = MemorySecrets::default();
+        old.set(GATEWAY, "sk-gw").unwrap();
+        old.set("machine", "identity").unwrap();
+        old.set("unrelated", "x").unwrap();
+
+        file.adopt(&old, KEPT).unwrap();
+
+        assert_eq!(stored(&file, GATEWAY).as_deref(), Some("sk-gw"));
+        assert_eq!(stored(&file, "machine").as_deref(), Some("identity"));
+        assert_eq!(stored(&file, GATEWAY_MANAGEMENT), None);
+        assert_eq!(stored(&file, "unrelated"), None);
+        let mode = fs::metadata(dir.path().join("secrets.json"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn adopt_from_an_empty_old_store_still_makes_the_file_so_it_is_not_asked_again() {
+        let (dir, file) = file();
+        file.adopt(&MemorySecrets::default(), KEPT).unwrap();
+        assert!(dir.path().join("secrets.json").exists());
+        file.adopt(&Failing { panics: true }, KEPT).unwrap();
+    }
+
+    #[test]
+    fn adopt_leaves_a_file_that_exists_alone_and_never_reads_the_old_store() {
+        let (_dir, file) = file();
+        file.set(GATEWAY, "sk-new").unwrap();
+
+        file.adopt(&Failing { panics: true }, KEPT).unwrap();
+
+        assert_eq!(stored(&file, GATEWAY).as_deref(), Some("sk-new"));
+    }
+
+    #[test]
+    fn adopt_that_cannot_read_the_old_store_fails_and_makes_no_file() {
+        let (dir, file) = file();
+        let error = file.adopt(&Failing { panics: false }, KEPT).unwrap_err();
+        assert!(error.to_string().contains("denied"), "{error}");
+        assert!(!dir.path().join("secrets.json").exists());
+    }
+
+    #[test]
+    fn every_secret_the_daemon_keeps_is_moved() {
+        assert_eq!(
+            KEPT,
+            [GATEWAY, GATEWAY_MANAGEMENT, "machine", "machine-keys"]
+        );
     }
 }
