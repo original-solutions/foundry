@@ -14,6 +14,7 @@
 //! edit that fails is warned, and the join stands. A code made anywhere else lists nothing.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::Router;
 use axum::extract::State;
@@ -97,6 +98,7 @@ async fn add(
         .map_err(|e| ApiError::Rejected(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     tokio::spawn(list_when_used(
         adding.coordinator.clone(),
+        adding.store.clone(),
         used,
         name,
         address,
@@ -128,16 +130,27 @@ async fn resolve(name: &str) -> Result<String, ApiError> {
 }
 
 /// Lists the machine that uses the code, told by `used`, as `name` at `address`, or nothing
-/// when the code expires unused. The code is never logged.
+/// when the code expires unused or the machine is already in the machine list (this machine
+/// included), whose entry is never overwritten. The code is never logged.
 async fn list_when_used(
     coordinator: Arc<Coordinator>,
+    store: Arc<Mutex<Store>>,
     used: oneshot::Receiver<MachineId>,
     name: String,
     address: String,
 ) {
-    let Ok(Ok(id)) = tokio::time::timeout(CODE_VALID_FOR, used).await else {
+    // A redeem that starts just before the code expires can wait for the key lock.
+    let wait = CODE_VALID_FOR + crate::secrets::LOCK_WAIT + Duration::from_secs(5);
+    let Ok(Ok(id)) = tokio::time::timeout(wait, used).await else {
         return;
     };
+    let held = on_store(&store, |store| store.settings()).await;
+    if held.is_ok_and(|held| held.machines.iter().any(|m| m.id == id)) {
+        tracing::warn!(
+            "machine {id} used a code to join but is already in the machine list; its entry is left as it is"
+        );
+        return;
+    }
     let machine = Machine { id, name, address };
     if let Err(error) = coordinator.edit(Edit::SetMachine { machine }).await {
         tracing::warn!("machine {id} joined, but it could not be listed: {error}");
