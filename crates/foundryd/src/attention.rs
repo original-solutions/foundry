@@ -44,7 +44,8 @@ use foundry_proto::settings::{Edit, SettingKey, SettingValue, SharedSettings};
 use foundry_proto::state::{SessionState, TerminalState};
 use serde::Serialize;
 
-use crate::coordinator::{Coordinator, CoordinatorError};
+use crate::api::edit_status;
+use crate::coordinator::Coordinator;
 use crate::machine::{Over, over_limits};
 use crate::secrets::redact;
 use crate::sessions::STUCK_AFTER;
@@ -519,22 +520,7 @@ async fn dismiss(State(attention): State<Arc<Attention>>, Path(id): Path<String>
     }
     match attention.coordinator.edit(Edit::Dismiss { setting }).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => error(dismissal_status(&e), e.to_string()),
-    }
-}
-
-/// The status a dismissal that failed answers with.
-fn dismissal_status(error: &CoordinatorError) -> StatusCode {
-    match error {
-        CoordinatorError::Refused { .. } => StatusCode::BAD_GATEWAY,
-        // Sent, so it may have been numbered: not the 503 of an edit that changed nothing.
-        CoordinatorError::NoAnswer { .. } => StatusCode::GATEWAY_TIMEOUT,
-        CoordinatorError::NotLinked(_)
-        | CoordinatorError::Older { .. }
-        | CoordinatorError::Unsettled { .. } => StatusCode::SERVICE_UNAVAILABLE,
-        CoordinatorError::Unwritable(_) | CoordinatorError::Store(_) => {
-            StatusCode::INTERNAL_SERVER_ERROR
-        }
+        Err(e) => error(edit_status(&e), e.to_string()),
     }
 }
 
@@ -560,6 +546,7 @@ mod tests {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     use super::*;
+    use crate::coordinator::CoordinatorError;
     use crate::sync::{Conn, Dialer};
 
     const GB: u64 = 1_000_000_000;
@@ -1603,7 +1590,7 @@ mod tests {
             ),
         ];
         for (error, status) in cases {
-            assert_eq!(dismissal_status(&error).as_u16(), status, "{error}");
+            assert_eq!(edit_status(&error).as_u16(), status, "{error}");
         }
     }
 

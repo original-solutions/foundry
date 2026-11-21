@@ -294,9 +294,12 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
     let attention_routes = attention
         .router()
         .layer(middleware::from_fn_with_state(api.clone(), api::same_site));
+    let project_routes = api::projects::router(coordinator.clone(), store.clone())
+        .layer(middleware::from_fn_with_state(api.clone(), api::same_site));
     let app = api::router(api)
         .merge(sessions.router())
         .merge(attention_routes)
+        .merge(project_routes)
         .merge(ws::keyed_router(peers.clone(), keys.clone()));
 
     let mut terminate =

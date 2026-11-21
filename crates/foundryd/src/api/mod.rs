@@ -94,6 +94,7 @@ use foundry_proto::settings::{SettingValue, SharedSettings};
 use serde::Deserialize;
 use tokio::net::TcpListener;
 
+use crate::coordinator::CoordinatorError;
 use crate::placement::{self, Queue, Want};
 use crate::secrets::redact;
 use crate::sessions::{SessionError, Sessions};
@@ -111,6 +112,7 @@ mod changes;
 mod files;
 mod machine;
 mod pr;
+pub mod projects;
 pub mod terminals;
 #[cfg(test)]
 mod tests;
@@ -454,6 +456,23 @@ impl IntoResponse for ApiError {
 
 fn error(status: StatusCode, message: String) -> Response {
     (status, Json(serde_json::json!({ "error": message }))).into_response()
+}
+
+/// The status a route answers with when an edit it sent through the coordinator failed: a
+/// dismissal ([`crate::attention`]) and a project added or removed ([`projects`]). One mapping,
+/// so every shared-settings route answers a failure alike.
+pub(crate) fn edit_status(error: &CoordinatorError) -> StatusCode {
+    match error {
+        CoordinatorError::Refused { .. } => StatusCode::BAD_GATEWAY,
+        // Sent, so it may have been numbered: not the 503 of an edit that changed nothing.
+        CoordinatorError::NoAnswer { .. } => StatusCode::GATEWAY_TIMEOUT,
+        CoordinatorError::NotLinked(_)
+        | CoordinatorError::Older { .. }
+        | CoordinatorError::Unsettled { .. } => StatusCode::SERVICE_UNAVAILABLE,
+        CoordinatorError::Unwritable(_) | CoordinatorError::Store(_) => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
 }
 
 fn created(id: impl ToString) -> Response {
