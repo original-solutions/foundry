@@ -95,6 +95,19 @@ describe("Projects", () => {
     expect(added).not.toHaveBeenCalled();
   });
 
+  it("clears an add's error once a field is edited", async () => {
+    mockFetch(json(409, { error: 'a project named "demo" already exists' }));
+    await show();
+
+    fireEvent.change(nameField(), { target: { value: "demo" } });
+    fireEvent.change(repoField(), { target: { value: "/srv/demo2.git" } });
+    fireEvent.click(addButton());
+    await within(dialog()).findByRole("alert");
+
+    fireEvent.change(nameField(), { target: { value: "demo2" } });
+    expect(within(dialog()).queryByRole("alert")).toBeNull();
+  });
+
   it("shows a 422's error in the form and keeps what was typed", async () => {
     mockFetch(json(422, { error: "a repo URL holds no spaces, tabs, line breaks or NULs" }));
     await show();
