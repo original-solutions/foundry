@@ -27,6 +27,7 @@ use crate::attention::Attention;
 use crate::gateway;
 use crate::join::{self, JoinError, KeyedDialer, Keys};
 use crate::machine;
+use crate::placement;
 use crate::secrets::{self, GATEWAY, SecretsError};
 use crate::sessions::{self, Gateway, Sessions};
 use crate::store::{Store, StoreError};
@@ -273,10 +274,15 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
         std::env::var("FOUNDRY_GATEWAY_URL").ok(),
         secrets.clone(),
     ));
-    let attention = Arc::new(
-        Attention::new(me, store.clone(), peers.clone(), coordinator.clone())
-            .with_source(gateway_reader.clone()),
+    let attention = attention(
+        me,
+        &store,
+        &peers,
+        coordinator.clone(),
+        gateway_reader.clone(),
+        &api.placements,
     );
+    let placing = api.clone();
     let attention_routes = attention
         .router()
         .layer(middleware::from_fn_with_state(api.clone(), api::same_site));
@@ -307,22 +313,45 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
     services.spawn(named("the Tailscale address watch", tailscale.watch()));
     services.spawn(named("updates", update::run(home.clone())));
     services.spawn(named("gateway health", gateway_reader.run()));
+    services.spawn(named("placement", placement::run(placing.clone())));
 
-    tokio::select! {
-        _ = terminate.recv() => tracing::info!("SIGTERM: stopping; terminals keep running"),
-        _ = interrupt.recv() => tracing::info!("SIGINT: stopping; terminals keep running"),
-        ended = services.join_next() => {
-            return match ended {
-                Some(Ok(name)) => {
-                    tracing::error!("{name} stopped on its own");
-                    Err(DaemonError::Ended(name))
-                }
-                Some(Err(error)) => Err(error.into()),
-                None => Err(DaemonError::Ended("every service")),
-            };
+    let stopped = tokio::select! {
+        _ = terminate.recv() => {
+            tracing::info!("SIGTERM: stopping; terminals keep running");
+            Ok(())
         }
-    }
-    Ok(())
+        _ = interrupt.recv() => {
+            tracing::info!("SIGINT: stopping; terminals keep running");
+            Ok(())
+        }
+        ended = services.join_next() => match ended {
+            Some(Ok(name)) => {
+                tracing::error!("{name} stopped on its own");
+                Err(DaemonError::Ended(name))
+            }
+            Some(Err(error)) => Err(error.into()),
+            None => Err(DaemonError::Ended("every service")),
+        },
+    };
+    // The requests waiting for a machine live only in memory: a restart drops each, logged.
+    placing.placements.drop_all();
+    stopped
+}
+
+/// This machine's attention list: the fleet's items, the gateway's and the placement queue's.
+fn attention(
+    me: foundry_proto::ids::MachineId,
+    store: &Arc<Mutex<Store>>,
+    peers: &Peers,
+    coordinator: Arc<crate::coordinator::Coordinator>,
+    gateway: Arc<gateway::Reader>,
+    placements: &Arc<placement::Queue>,
+) -> Arc<Attention> {
+    Arc::new(
+        Attention::new(me, store.clone(), peers.clone(), coordinator)
+            .with_source(gateway)
+            .with_source(placements.clone()),
+    )
 }
 
 /// Runs `service` and names it once it ends, so the daemon can say which one stopped.
@@ -1240,5 +1269,45 @@ mod tests {
         let why = ask_cli(&cli, Duration::from_millis(200)).await.unwrap_err();
 
         assert!(why.contains("did not answer"), "{why}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_attention_list_holds_the_requests_waiting_for_a_machine() {
+        use crate::attention::Kind;
+        use crate::placement::{Queue, WAITING_ALERT_AFTER, Want};
+
+        let data = tempfile::tempdir().unwrap();
+        let me = foundry_proto::ids::MachineId::random();
+        let store = Arc::new(Mutex::new(
+            Store::open(data.path().join("foundry.db")).unwrap(),
+        ));
+        let peers = Peers::new(me, store.clone(), Arc::new(WsDialer { port: 9 }));
+        let coordinator = Arc::new(crate::coordinator::Coordinator::new(
+            me,
+            store.clone(),
+            peers.clone(),
+        ));
+        let gateway = Arc::new(gateway::Reader::new(
+            None,
+            Arc::new(crate::secrets::MemorySecrets::default()),
+        ));
+        let placements = Arc::new(Queue::new(me));
+        let attention = attention(me, &store, &peers, coordinator, gateway, &placements);
+        placements.wait(
+            Want {
+                project: foundry_proto::ids::ProjectId::random(),
+                base: "main".into(),
+                name: "fix login".into(),
+                model: "opus".into(),
+                prompt: None,
+            },
+            Vec::new(),
+        );
+        tokio::time::advance(WAITING_ALERT_AFTER).await;
+        let items = attention.items().await.unwrap();
+        assert!(
+            items.iter().any(|item| item.kind == Kind::PlacementWaiting),
+            "{items:?}"
+        );
     }
 }

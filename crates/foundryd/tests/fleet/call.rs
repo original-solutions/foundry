@@ -114,9 +114,11 @@ impl Served {
         ));
         let hook_router = sessions.router();
         let api = Api::new(store, peers, terminals, workspaces, sessions, Vec::new());
+        let placing = api.clone();
         let listener = api::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let servers = vec![
+            tokio::spawn(foundryd::placement::run(placing)),
             tokio::spawn(async move {
                 axum::serve(
                     hooks,
@@ -159,6 +161,21 @@ impl Served {
             let status = response.status().as_u16();
             let text = response.body_mut().read_to_string().unwrap();
             (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+        })
+        .await
+        .unwrap()
+    }
+
+    /// The JSON `GET path` answers.
+    async fn get(&self, path: &str) -> Value {
+        let url = format!("http://{}{path}", self.addr);
+        tokio::task::spawn_blocking(move || {
+            ureq::get(&url)
+                .call()
+                .unwrap()
+                .body_mut()
+                .read_json()
+                .unwrap()
         })
         .await
         .unwrap()
@@ -615,5 +632,355 @@ async fn a_call_whose_link_goes_down_after_it_was_sent_is_lost_not_refused() {
         Err(CallError::Lost(name)) => assert_eq!(name, "machine-1"),
         other => panic!("not lost: {other:?}"),
     }
+    drop(silent);
+}
+
+// --- placement across machines ---
+
+/// One of a machine's own samples, with `sessions` and `load` per core.
+fn loaded(sessions: u32, load: f64) -> impl FnOnce(MachineId, u64) -> AnyRecord {
+    move |owner, version| {
+        AnyRecord::MachineSample(foundry_proto::record::Record {
+            owner,
+            version,
+            deleted: false,
+            body: foundry_proto::record::MachineSample {
+                load_per_core: load,
+                free_memory: 1 << 30,
+                free_disk: 1 << 35,
+                sessions,
+                update_refused: None,
+            },
+        })
+    }
+}
+
+/// Gives every machine of `fleet`, in every daemon's settings, at most 4 sessions and a load of
+/// 1.0 per core.
+fn limit_all(fleet: &Fleet) {
+    for daemon in &fleet.daemons {
+        let mut settings = daemon.settings();
+        settings.seq += 1;
+        for machine in &fleet.daemons {
+            settings.limits.insert(
+                machine.id,
+                foundry_proto::settings::Limits {
+                    max_sessions: 4,
+                    max_load_per_core: 1.0,
+                    min_free_disk: 1 << 30,
+                },
+            );
+        }
+        daemon.set_settings(settings);
+    }
+}
+
+/// Waits until `daemon` holds `owner`'s sample at `version` or later.
+async fn holds_sample(daemon: &Daemon, owner: MachineId, version: u64) {
+    until(WAIT, "the sample arrives", || {
+        daemon
+            .held(|r| {
+                r.owner() == owner
+                    && r.version() >= version
+                    && matches!(r, AnyRecord::MachineSample(_))
+            })
+            .is_some()
+    })
+    .await;
+}
+
+fn choose(project: ProjectId, name: &str) -> Value {
+    json!({"project": project, "base": "main", "name": name, "machine": "choose", "model": "test-model"})
+}
+
+#[tokio::test]
+async fn choose_on_a_makes_the_workspace_on_b_when_b_has_the_most_headroom() {
+    let fleet = Fleet::start(2);
+    let (a, b) = (&fleet.daemons[0], &fleet.daemons[1]);
+    let remotes = tempfile::tempdir().unwrap();
+    let project = project(&fleet, remotes.path());
+    limit_all(&fleet);
+    let on_a = Served::of(a).await;
+    let on_b = Served::of(b).await;
+    b.peers.serve_calls(on_b.addr);
+    hears(&a.peers, b.id).await;
+    a.write(loaded(0, 0.8));
+    let sampled = b.write(loaded(2, 0.3));
+    holds_sample(a, b.id, sampled.version()).await;
+
+    let (status, answer) = on_a
+        .post("/api/workspaces", Some(choose(project, "far")))
+        .await;
+    assert_eq!(status, 201, "{answer}");
+    assert_eq!(answer["machine"], json!(b.id), "{answer}");
+    let workspace = WorkspaceId(id_of(&answer).parse().unwrap());
+    assert!(
+        a.held(
+            |r| r.owner() == b.id && matches!(r, AnyRecord::Workspace(w) if w.body.id == workspace)
+        )
+        .is_some(),
+        "the workspace is B's"
+    );
+}
+
+#[tokio::test]
+async fn a_request_waiting_on_a_is_placed_on_b_with_its_session_once_b_qualifies() {
+    let fleet = Fleet::start(2);
+    let (a, b) = (&fleet.daemons[0], &fleet.daemons[1]);
+    let remotes = tempfile::tempdir().unwrap();
+    let project = project(&fleet, remotes.path());
+    limit_all(&fleet);
+    let on_a = Served::of(a).await;
+    let on_b = Served::of(b).await;
+    b.peers.serve_calls(on_b.addr);
+    hears(&a.peers, b.id).await;
+    a.write(loaded(4, 0.1));
+    let sampled = b.write(loaded(0, 2.5));
+    holds_sample(a, b.id, sampled.version()).await;
+
+    let (status, answer) = on_a
+        .post("/api/workspaces", Some(choose(project, "later")))
+        .await;
+    assert_eq!(status, 202, "{answer}");
+    assert_eq!(
+        answer["reasons"],
+        json!([
+            "machine-0: sessions 4 at limit 4",
+            "machine-1: load 2.5 over limit 1.0"
+        ])
+    );
+
+    b.write(loaded(0, 0.2));
+    let took = until(Duration::from_secs(10), "placed on B", || {
+        let Some(AnyRecord::Workspace(made)) = a.held(|r| {
+            r.owner() == b.id && matches!(r, AnyRecord::Workspace(w) if w.body.name == "later")
+        }) else {
+            return false;
+        };
+        a.held(|r| {
+            r.owner() == b.id
+                && matches!(r, AnyRecord::Session(s)
+                    if s.body.workspace == made.body.id && s.body.model == "test-model")
+        })
+        .is_some()
+    })
+    .await;
+    assert!(took < Duration::from_secs(10), "{took:?}");
+    assert!(
+        a.held(|r| r.owner() == a.id && matches!(r, AnyRecord::Workspace(_)))
+            .is_none(),
+        "nothing was made on A"
+    );
+}
+
+#[tokio::test]
+async fn a_create_naming_b_over_its_limits_is_made_on_b_and_warns_of_each_limit() {
+    let fleet = Fleet::start(2);
+    let (a, b) = (&fleet.daemons[0], &fleet.daemons[1]);
+    let remotes = tempfile::tempdir().unwrap();
+    let project = project(&fleet, remotes.path());
+    limit_all(&fleet);
+    let on_a = Served::of(a).await;
+    let on_b = Served::of(b).await;
+    b.peers.serve_calls(on_b.addr);
+    hears(&a.peers, b.id).await;
+    let sampled = b.write(loaded(5, 1.2));
+    holds_sample(a, b.id, sampled.version()).await;
+
+    let named = json!({"project": project, "base": "main", "name": "anyway", "machine": b.id});
+    let (status, answer) = on_a.post("/api/workspaces", Some(named)).await;
+    assert_eq!(status, 201, "{answer}");
+    assert_eq!(
+        answer["warning"],
+        "machine-1 is over its limits: sessions 5 over limit 4, load 1.2 over limit 1.0"
+    );
+    let workspace = WorkspaceId(id_of(&answer).parse().unwrap());
+    assert!(
+        a.held(
+            |r| r.owner() == b.id && matches!(r, AnyRecord::Workspace(w) if w.body.id == workspace)
+        )
+        .is_some(),
+        "the workspace is B's"
+    );
+}
+
+/// Two machines that both qualify, B the roomier, whose API takes a call and never answers.
+/// Returns A's API and B's silent listener, which must be kept for the test.
+async fn b_never_answers(
+    fleet: &Fleet,
+    project_on: &Path,
+) -> (Served, ProjectId, tokio::net::TcpListener) {
+    let (a, b) = (&fleet.daemons[0], &fleet.daemons[1]);
+    let project = project(fleet, project_on);
+    limit_all(fleet);
+    let on_a = Served::of(a).await;
+    let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    b.peers.serve_calls(silent.local_addr().unwrap());
+    hears(&a.peers, b.id).await;
+    (on_a, project, silent)
+}
+
+#[tokio::test]
+async fn a_choose_whose_create_is_lost_on_b_is_never_sent_to_a_as_well() {
+    let fleet = Fleet::start(2);
+    let (a, b) = (&fleet.daemons[0], &fleet.daemons[1]);
+    let remotes = tempfile::tempdir().unwrap();
+    let (on_a, project, silent) = b_never_answers(&fleet, remotes.path()).await;
+    a.write(loaded(0, 0.8));
+    let sampled = b.write(loaded(0, 0.1));
+    holds_sample(a, b.id, sampled.version()).await;
+
+    let posted = tokio::spawn(async move {
+        let answer = on_a
+            .post("/api/workspaces", Some(choose(project, "lost")))
+            .await;
+        (on_a, answer)
+    });
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(!posted.is_finished(), "B answered");
+    fleet.cut(1);
+    let (_on_a, (status, answer)) = timeout(WAIT, posted).await.unwrap().unwrap();
+    assert_eq!(status, 504, "{answer}");
+    assert_eq!(answer["machine"], json!(b.id), "{answer}");
+    assert!(
+        a.held(|r| matches!(r, AnyRecord::Workspace(w) if w.body.name == "lost"))
+            .is_none(),
+        "the create was sent to A as well"
+    );
+    drop(silent);
+}
+
+#[tokio::test]
+async fn a_queued_request_whose_create_is_lost_on_b_fails_and_is_never_made_on_a() {
+    let fleet = Fleet::start(2);
+    let (a, b) = (&fleet.daemons[0], &fleet.daemons[1]);
+    let remotes = tempfile::tempdir().unwrap();
+    let (on_a, project, silent) = b_never_answers(&fleet, remotes.path()).await;
+    a.write(loaded(4, 0.1));
+    let sampled = b.write(loaded(4, 0.1));
+    holds_sample(a, b.id, sampled.version()).await;
+    let (status, answer) = on_a
+        .post("/api/workspaces", Some(choose(project, "lost")))
+        .await;
+    assert_eq!(status, 202, "{answer}");
+
+    let sampled = b.write(loaded(0, 0.1));
+    holds_sample(a, b.id, sampled.version()).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    fleet.cut(1);
+    let started = tokio::time::Instant::now();
+    let error = loop {
+        let listed = on_a.get("/api/placements").await;
+        if listed["requests"][0]["state"] == "failed" {
+            break listed["requests"][0]["error"].as_str().unwrap().to_owned();
+        }
+        assert!(
+            started.elapsed() < WAIT,
+            "the request never fails: {listed}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert!(error.contains("may have been made on machine-1"), "{error}");
+
+    a.write(loaded(0, 0.1));
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        a.held(|r| matches!(r, AnyRecord::Workspace(w) if w.body.name == "lost"))
+            .is_none(),
+        "the create was sent to A as well"
+    );
+    drop(silent);
+}
+
+#[tokio::test]
+async fn a_request_being_placed_cannot_be_cancelled_and_ends_failed_when_its_create_is_lost() {
+    let fleet = Fleet::start(2);
+    let (a, b) = (&fleet.daemons[0], &fleet.daemons[1]);
+    let remotes = tempfile::tempdir().unwrap();
+    let (on_a, project, silent) = b_never_answers(&fleet, remotes.path()).await;
+    a.write(loaded(4, 0.1));
+    let sampled = b.write(loaded(4, 0.1));
+    holds_sample(a, b.id, sampled.version()).await;
+    let (status, answer) = on_a
+        .post("/api/workspaces", Some(choose(project, "held")))
+        .await;
+    assert_eq!(status, 202, "{answer}");
+    let request = answer["request"].as_str().unwrap().to_owned();
+
+    let sampled = b.write(loaded(0, 0.1));
+    holds_sample(a, b.id, sampled.version()).await;
+    let started = tokio::time::Instant::now();
+    while on_a.get("/api/placements").await["requests"][0]["state"] != "placing" {
+        assert!(started.elapsed() < WAIT, "never placed");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let (status, answer) = on_a
+        .post(&format!("/api/placements/{request}/cancel"), None)
+        .await;
+    assert_eq!(status, 409, "{answer}");
+
+    fleet.cut(1);
+    let started = tokio::time::Instant::now();
+    loop {
+        let listed = on_a.get("/api/placements").await;
+        if listed["requests"][0]["state"] == "failed" {
+            break;
+        }
+        assert!(started.elapsed() < WAIT, "never failed: {listed}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    drop(silent);
+}
+
+#[tokio::test]
+async fn a_request_whose_create_gets_no_answer_from_b_does_not_hold_back_the_next_request() {
+    let fleet = Fleet::start(2);
+    let (a, b) = (&fleet.daemons[0], &fleet.daemons[1]);
+    let remotes = tempfile::tempdir().unwrap();
+    let (on_a, project, silent) = b_never_answers(&fleet, remotes.path()).await;
+    a.write(loaded(4, 0.1));
+    let sampled = b.write(loaded(4, 0.1));
+    holds_sample(a, b.id, sampled.version()).await;
+    for name in ["held", "next"] {
+        let (status, answer) = on_a
+            .post("/api/workspaces", Some(choose(project, name)))
+            .await;
+        assert_eq!(status, 202, "{answer}");
+    }
+
+    // B has room for one session. The first request takes it, and B never answers its create.
+    let sampled = b.write(loaded(3, 0.1));
+    holds_sample(a, b.id, sampled.version()).await;
+    let started = tokio::time::Instant::now();
+    while on_a.get("/api/placements").await["requests"][0]["state"] != "placing" {
+        assert!(
+            started.elapsed() < WAIT,
+            "the first request is never placed"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // A qualifies while the first request is still being placed on B.
+    a.write(loaded(0, 0.1));
+    until(
+        Duration::from_secs(10),
+        "the next request is placed on A",
+        || {
+            let Some(AnyRecord::Workspace(made)) = a.held(|r| {
+                r.owner() == a.id && matches!(r, AnyRecord::Workspace(w) if w.body.name == "next")
+            }) else {
+                return false;
+            };
+            a.held(|r| {
+                r.owner() == a.id
+                    && matches!(r, AnyRecord::Session(s) if s.body.workspace == made.body.id)
+            })
+            .is_some()
+        },
+    )
+    .await;
+    let listed = on_a.get("/api/placements").await;
+    assert_eq!(listed["requests"][0]["name"], "held", "{listed}");
+    assert_eq!(listed["requests"][0]["state"], "placing", "{listed}");
     drop(silent);
 }

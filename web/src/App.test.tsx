@@ -86,6 +86,7 @@ function mockActions(...answers: Response[]): Call[] {
       if (url.endsWith("/api/briefs")) return json(200, briefs);
       if (url.endsWith("/pr")) return json(200, shipping);
       if (url.endsWith("/api/attention")) return json(200, { items: attention });
+      if (url.endsWith("/api/placements")) return json(200, { requests: [] });
       if (url.endsWith("/api/machines")) return json(200, { me: ME, machines: [] });
       calls.push({ url, method: init.method ?? "GET", body: init.body ? JSON.parse(String(init.body)) : undefined });
       const next = answers.shift();

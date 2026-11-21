@@ -129,14 +129,65 @@ export async function listMachines(): Promise<{ me: string; machines: MachineCho
   return { me: String(json.me), machines: Array.isArray(json.machines) ? (json.machines as MachineChoice[]) : [] };
 }
 
+/** A workspace made: `error` means it exists but its setup did not start, `warning` that its machine is over its limits. */
+export interface Made {
+  id: string;
+  error?: string;
+  warning?: string;
+}
+
+/** A create no machine takes yet: the request that waits for one, and each machine's reason. */
+export interface Waiting {
+  request: string;
+  reasons: string[];
+}
+
+const text = (value: unknown) => (typeof value === "string" ? value : undefined);
+
 /**
- * Makes a workspace, on `machine` when one is given and on this machine otherwise. `error` beside
- * the id means it exists but its setup did not start.
+ * Makes a workspace, on `machine` when one is given and on this machine otherwise. With `machine`
+ * "choose" Foundry picks the machine, and `model` and `prompt` go with it for the session a request
+ * that waits starts once it is placed.
  */
-export async function createWorkspace(input: { project: string; base: string; name: string; machine?: string }): Promise<{ id: string; error?: string }> {
+export async function createWorkspace(input: {
+  project: string;
+  base: string;
+  name: string;
+  machine?: string;
+  model?: string;
+  prompt?: string;
+}): Promise<Made | Waiting> {
   const { status, json } = await post("/api/workspaces", input);
+  if (status === 202) return { request: String(json.request), reasons: Array.isArray(json.reasons) ? json.reasons.map(String) : [] };
   if (status !== 201) throw refused(status, json);
-  return { id: String(json.id), error: typeof json.error === "string" ? json.error : undefined };
+  return { id: String(json.id), error: text(json.error), warning: text(json.warning) };
+}
+
+/** A create waiting on this machine for one to qualify, as `GET /api/placements` lists it. */
+export interface Placement {
+  id: string;
+  project: string;
+  name: string;
+  /** "placing" while its workspace is being made; "failed" when that did not work, with `error`. */
+  state: "waiting" | "placing" | "failed";
+  /** When it started waiting, in ms since the epoch. */
+  waiting_since: number;
+  /** Why no machine takes it, one per machine. */
+  reasons: string[];
+  error: string | null;
+}
+
+export const placementsKey = ["placements"];
+
+export async function listPlacements(): Promise<Placement[]> {
+  const json = await get("/api/placements");
+  return Array.isArray(json.requests) ? (json.requests as Placement[]) : [];
+}
+
+/** Cancels a waiting request, so it is never placed, or dismisses one that failed. */
+export async function cancelPlacement(id: string): Promise<void> {
+  const { status, json } = await post(`/api/placements/${id}/cancel`);
+  if (status !== 204) throw refused(status, json);
 }
 
 /** Starts Claude Code in `workspace`; with a `prompt`, Claude Code starts on it as its first prompt. */
