@@ -1280,12 +1280,7 @@ async fn a_store_error_on_the_acting_machine_reports_the_edit_refused_to_the_for
     let first = fleet.daemons[0].id;
     settled(&fleet, first).await;
     // The acting machine's store refuses every write to the settings from now on.
-    let db = rusqlite::Connection::open(&fleet.daemons[0].db).unwrap();
-    db.execute_batch(
-        "CREATE TRIGGER refuse BEFORE UPDATE ON settings \
-         BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
-    )
-    .unwrap();
+    let _refusing = refuse_settings_writes(&fleet.daemons[0].db);
 
     let error = fleet.daemons[1]
         .coordinator()
@@ -1705,12 +1700,7 @@ async fn a_forwarded_edit_sent_twice_while_it_waits_to_catch_up_is_answered_once
         online.contains(&peer) && online.contains(&quiet)
     })
     .await;
-    let db = rusqlite::Connection::open(&daemon.db).unwrap();
-    db.execute_batch(
-        "CREATE TRIGGER refuse BEFORE UPDATE ON settings \
-         BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
-    )
-    .unwrap();
+    let _refusing = refuse_settings_writes(&daemon.db);
 
     let edit = edit_with(EditId::random(), set_project(7, "twice"));
     say(&conn, &edit).await;
@@ -1883,12 +1873,7 @@ async fn an_answer_on_a_link_that_refused_a_message_is_still_taken() {
 async fn an_id_refused_is_refused_again_when_it_is_sent_again() {
     let (fleet, _, conn, said) = acting_with_a_peer().await;
     let daemon = &fleet.daemons[0];
-    let db = rusqlite::Connection::open(&daemon.db).unwrap();
-    db.execute_batch(
-        "CREATE TRIGGER refuse BEFORE UPDATE ON settings \
-         BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
-    )
-    .unwrap();
+    let db = refuse_settings_writes(&daemon.db);
     let edit = edit_with(EditId::random(), set_project(7, "refused once"));
     say(&conn, &edit).await;
     until(Duration::from_secs(2), "the edit is refused", || {
@@ -1935,12 +1920,7 @@ async fn a_failed_write_after_the_edit_was_sent_does_not_end_the_wait_once_the_r
 
     // The peer goes quiet, so the role moves here while the store refuses writes.
     beat.abort();
-    let db = rusqlite::Connection::open(&daemon.db).unwrap();
-    db.execute_batch(
-        "CREATE TRIGGER refuse BEFORE UPDATE ON settings \
-         BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
-    )
-    .unwrap();
+    let db = refuse_settings_writes(&daemon.db);
     tokio::time::sleep(OFFLINE_AFTER + Duration::from_secs(2)).await;
     assert!(!editing.is_finished(), "ended by the failed write");
     db.execute_batch("DROP TRIGGER refuse").unwrap();
@@ -2178,4 +2158,102 @@ async fn a_stamp_from_the_second_machine_replaces_the_first_machines_refusal() {
         .unwrap()
         .unwrap();
     assert_eq!(returned, stamp);
+}
+
+/// Makes the store at `db` refuse every write to the settings, until the returned connection
+/// runs `DROP TRIGGER refuse`.
+fn refuse_settings_writes(db: &Path) -> rusqlite::Connection {
+    let db = rusqlite::Connection::open(db).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER refuse BEFORE UPDATE ON settings \
+         BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+    )
+    .unwrap();
+    db
+}
+
+/// A daemon on which `acting`, on this build, acts, and that `sender` forwards edits to, both
+/// linked and sending heartbeats. Returns the ends the test speaks on as each, with what the
+/// daemon sends them, and the heartbeat task of `acting`.
+async fn relaying() -> (
+    Fleet,
+    (MachineId, SharedSettings),
+    (mpsc::Sender<String>, Arc<Mutex<Vec<serde_json::Value>>>),
+    (mpsc::Sender<String>, Arc<Mutex<Vec<serde_json::Value>>>),
+    tokio::task::JoinHandle<()>,
+) {
+    let (acting, sender) = (MachineId::random(), MachineId::random());
+    let fleet = Fleet::start_coordinated_with(1, &[acting, sender]);
+    let daemon = &fleet.daemons[0];
+    let theirs = ordered_by(&daemon.settings(), acting, vec![acting, daemon.id, sender]);
+    let (ca, said_a) = recorded(raw_link(daemon, acting).await);
+    let (cs, said_s) = recorded(raw_link(daemon, sender).await);
+    say(&ca, &settings_message(theirs.clone())).await;
+    say(&cs, &settings_message(theirs.clone())).await;
+    let beat_a = beating(ca.clone());
+    beating(cs.clone());
+    acting_becomes(&daemon.coordinator(), acting, WAIT).await;
+    (fleet, (acting, theirs), (ca, said_a), (cs, said_s), beat_a)
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_relayed_edit_is_not_refused_when_a_write_here_fails_once_the_role_moves_here() {
+    let (fleet, _, (_ca, said_a), (cs, said_s), beat_a) = relaying().await;
+    let daemon = &fleet.daemons[0];
+    say(&cs, &edit_message(set_project(7, "relayed"))).await;
+    until(Duration::from_secs(2), "the edit is passed on", || {
+        edits_sent(&said_a).len() == 1
+    })
+    .await;
+
+    // The acting machine goes quiet, and may have numbered the edit. The role moves here,
+    // where the store refuses writes.
+    beat_a.abort();
+    let _refusing = refuse_settings_writes(&daemon.db);
+    acting_becomes(&daemon.coordinator(), daemon.id, WAIT).await;
+    tokio::time::sleep(OFFLINE_AFTER * 2).await;
+    assert_eq!(
+        answers_sent(&said_s),
+        [],
+        "an edit another machine may have numbered is not refused"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_edit_relayed_and_answered_is_answered_with_its_stamp_again_once_the_role_moves_here() {
+    let (fleet, (acting, theirs), (ca, said_a), (cs, said_s), beat_a) = relaying().await;
+    let daemon = &fleet.daemons[0];
+    let id = EditId::random();
+    let edit = edit_with(id, set_project(7, "numbered there"));
+    say(&cs, &edit).await;
+    until(Duration::from_secs(2), "the edit is passed on", || {
+        edits_sent(&said_a).len() == 1
+    })
+    .await;
+    let stamp = Stamp {
+        seq: theirs.seq + 1,
+        by: acting,
+    };
+    say(&ca, &answer(id, Outcome::Numbered { stamp })).await;
+    until(Duration::from_secs(2), "the answer is passed back", || {
+        answers_sent(&said_s).len() == 1
+    })
+    .await;
+
+    // The answer is lost on its way to the sender, and the acting machine goes quiet before
+    // its copy holding the stamp reaches here. The role moves here, where the store refuses
+    // writes, and the sender sends the edit again.
+    beat_a.abort();
+    let _refusing = refuse_settings_writes(&daemon.db);
+    acting_becomes(&daemon.coordinator(), daemon.id, WAIT).await;
+    say(&cs, &edit).await;
+    tokio::time::sleep(OFFLINE_AFTER * 2).await;
+    assert_eq!(
+        answers_sent(&said_s),
+        [
+            (id, Outcome::Numbered { stamp }),
+            (id, Outcome::Numbered { stamp })
+        ],
+        "the edit sent again is answered with the stamp this machine saw, not refused"
+    );
 }

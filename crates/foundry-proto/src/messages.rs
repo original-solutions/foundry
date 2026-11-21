@@ -20,8 +20,10 @@ pub const EDITS_SINCE: u16 = 2;
 /// sent one: it would refuse a link that opens with a `type` it does not know.
 pub const CALLS_SINCE: u16 = 3;
 
-/// The first protocol whose edits carry an id and are answered. A machine sends an edit only on
-/// a link in it or later, and an answer never on an older one.
+/// The first protocol whose edits carry an id and are answered. A machine sends an edit with an
+/// id only on a link in it or later, and an answer never on an older one. An edit with no id,
+/// passed on from a machine before this protocol, still goes on any link in [`EDITS_SINCE`] or
+/// later.
 pub const ANSWERS_SINCE: u16 = 4;
 
 /// A message between two machines' daemons, tagged by `type`.

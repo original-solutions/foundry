@@ -19,10 +19,15 @@
 //! a split that cannot reach each other can still number it once each.
 //!
 //! A machine reports an edit refused, or failed with a store error, only when no machine can
-//! have numbered its id. Otherwise the outcome is the stamp, or [`CoordinatorError::NoAnswer`]
-//! when [`KEEP_FORWARDED`] passes without it. So a sender's refusal is final only when the edit
-//! went to one machine, whose own copy holds every id it numbered; once an edit went to two, a
-//! refusal from either is ignored, as the other may have numbered it.
+//! have numbered its id ([`may_refuse`], the one place that decides). Otherwise the outcome is
+//! the stamp, or [`CoordinatorError::NoAnswer`] when [`KEEP_FORWARDED`] passes without it. So a
+//! sender's refusal is final only when the edit went to one machine, whose own copy holds every
+//! id it numbered; once an edit went to two, a refusal from either is ignored, as the other may
+//! have numbered it. What a machine knows of an id ([`Known`]: who it sent it to, the answer)
+//! outlasts the task that sent it by [`KEEP_FORWARDED`], so an edit sent again is judged on it.
+//!
+//! The edits one machine forwards are sent on, and numbered, in the order they arrived, also
+//! when sent again ([`in_turn`]), so of two edits to one setting the later one holds.
 //!
 //! [`Coordinator`] runs this on a machine. Record links hand it every copy of the settings a
 //! peer sends and every edit forwarded to this machine ([`crate::sync::Peers::coordinate`]).
@@ -41,7 +46,6 @@ use foundry_proto::settings::{
     Edit, EditId, Outcome, Overwritten, SettingKey, SettingValue, SharedSettings, Stamp, StampKey,
 };
 use serde::Serialize;
-use tokio::sync::oneshot;
 use tokio::time::Instant;
 
 use crate::store::{Store, StoreError};
@@ -105,20 +109,11 @@ pub struct Coordinator {
     /// When this machine started. Until every listed machine's copy is in, or
     /// [`OFFLINE_AFTER`] has passed, its own copy may be an old one.
     started: Instant,
-    /// Released when the edit forwarded last is numbered here or first sent on, or its task
-    /// ends. Each forwarded edit waits for the one before, so they are numbered and first sent
-    /// in the order they arrived.
-    last_forwarded: Mutex<Option<oneshot::Receiver<()>>>,
-    /// The ids of the forwarded edits with a task queued or running, so an edit sent again
-    /// while its first copy waits is not made twice.
-    forwarding: Mutex<BTreeSet<(MachineId, EditId)>>,
-    /// The ids this machine answered refused, with the refusal and when, kept for
-    /// [`KEEP_FORWARDED`]: a refusal is final for its id. A timeout, not an order of records, so
-    /// the clock is fine here.
-    refused: Mutex<BTreeMap<EditId, (Instant, Outcome)>>,
-    /// The ids of the edits this machine waits on, how many wait on each, and the answer to the
-    /// id once it came.
-    answers: Mutex<BTreeMap<EditId, (usize, Option<Outcome>)>>,
+    /// The forwarded edits with a task queued or running, so an edit sent again while its first
+    /// copy waits is not made twice, and edits from one machine go in the order they arrived.
+    queue: Mutex<Queue>,
+    /// What this machine knows of each id it waits on, or waited on within [`KEEP_FORWARDED`].
+    known: Mutex<BTreeMap<EditId, Known>>,
 }
 
 impl Coordinator {
@@ -129,10 +124,8 @@ impl Coordinator {
             peers,
             taken: Arc::new(Mutex::new(BTreeMap::new())),
             started: Instant::now(),
-            last_forwarded: Mutex::new(None),
-            forwarding: Mutex::new(BTreeSet::new()),
-            refused: Mutex::new(BTreeMap::new()),
-            answers: Mutex::new(BTreeMap::new()),
+            queue: Mutex::new(Queue::default()),
+            known: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -153,17 +146,17 @@ impl Coordinator {
     /// no link to the acting machine is open or it speaks a protocol that does not answer
     /// edits, when the edit cannot be written, or when the store fails before any send.
     pub async fn edit(&self, edit: Edit) -> Result<Stamp, CoordinatorError> {
-        self.edit_from(None, Instant::now(), EditId::random(), edit)
+        self.run_edit(None, Instant::now(), EditId::random(), edit)
             .await
     }
 
-    /// Takes the answer to the edit sent under `id`, when this machine waits on it. An answer
-    /// nobody waits for is dropped.
+    /// Takes the answer to the edit sent under `id`, when this machine knows the id ([`Known`]).
+    /// An answer to an id it does not know is dropped.
     pub(crate) fn take_answer(&self, id: EditId, outcome: Outcome) {
-        if let Some((_, slot)) = lock(&self.answers).get_mut(&id) {
+        if let Some(known) = self.known().get_mut(&id) {
             // A stamp from any machine settles the edit, so it replaces a refusal.
-            if slot.is_none() || matches!(outcome, Outcome::Numbered { .. }) {
-                *slot = Some(outcome);
+            if known.answer.is_none() || matches!(outcome, Outcome::Numbered { .. }) {
+                known.answer = Some(outcome);
             }
         }
     }
@@ -196,156 +189,150 @@ impl Coordinator {
     }
 
     /// Makes an edit `peer` forwarded, in the background, so the link that carried it goes on
-    /// reading while the edit waits. Forwarded edits are numbered and first sent one at a time,
-    /// in the order they arrived, and each one's waits count from when it arrived, not from its
-    /// turn. When the edit came with an `id`, `peer` is answered under it: numbered, or refused
-    /// with a fixed reason that names no setting value. A refusal is final for its id: an edit
-    /// sent again under it is refused again, for [`KEEP_FORWARDED`]. An edit sent again by the
-    /// same machine while its first copy is queued or running is dropped: that copy answers. An
-    /// edit from a machine before [`ANSWERS_SINCE`] has no id: it is passed on as it came, or
-    /// numbered here, and never answered.
+    /// reading while the edit waits. The edits one machine forwards are sent on, and numbered,
+    /// in the order they arrived, also when sent again ([`in_turn`]), and each one's waits count
+    /// from when it arrived, not from its turn. When the edit came with an `id`, `peer` is
+    /// answered under it: numbered, or refused with a fixed reason that names no setting value.
+    /// A refusal is final for its id: an edit sent again under it is refused again, for
+    /// [`KEEP_FORWARDED`]. An edit sent again by the same machine while its first copy is queued
+    /// or running is dropped: that copy answers. An edit from a machine before [`ANSWERS_SINCE`]
+    /// has no id: it is passed on as it came, or numbered here, and never answered.
     pub(crate) fn take_edit(self: Arc<Self>, peer: MachineId, id: Option<EditId>, edit: Edit) {
         let arrived = Instant::now();
-        let queued = match id {
-            Some(id) => match Queued::new(&self, peer, id) {
-                Some(queued) => Some(queued),
-                None => return,
-            },
-            None => None,
+        let Some(queued) = Queued::new(&self, peer, id) else {
+            return;
         };
-        let coordinator = Arc::clone(&self);
-        let (released, next) = oneshot::channel();
-        let before = lock(&self.last_forwarded).replace(next);
         tokio::spawn(async move {
-            let _queued = queued;
-            if let Some(before) = before {
-                // Resolves when the edit before is numbered or first sent, or its task ends.
-                let _ = before.await;
-            }
             let Some(id) = id else {
-                if let Err(error) = coordinator.pass_on(peer, arrived, edit, released).await {
+                if let Err(error) = self.pass_on(&queued, arrived, edit).await {
                     tracing::warn!("coordinator: {error}");
                 }
                 return;
             };
-            let mut released = Some(released);
-            let outcome = match coordinator.refusal(id) {
+            let outcome = match self.refusal(id) {
                 Some(refused) => Some(refused),
                 None => {
-                    let result = coordinator
-                        .run_edit(Some(peer), arrived, id, edit, &mut released)
-                        .await;
+                    let result = self.run_edit(Some(&queued), arrived, id, edit).await;
                     if let Err(error) = &result {
                         tracing::warn!("coordinator: {error}");
                     }
-                    coordinator.outcome(result)
+                    outcome(result)
                 }
             };
-            if let Some(outcome) = outcome {
-                if matches!(outcome, Outcome::Refused { .. }) {
-                    lock(&coordinator.refused).insert(id, (Instant::now(), outcome.clone()));
-                }
-                // Only now may the next edit go on: a copy of this id sees the refusal.
-                drop(released);
-                coordinator.peers.send_answer(peer, id, outcome).await;
+            if let Some(refused @ Outcome::Refused { .. }) = &outcome {
+                self.remember_refusal(id, refused.clone());
+            }
+            // Only now may the next edit from `peer` go on: a copy of this id sees the refusal.
+            drop(queued);
+            if let Some(outcome) = outcome
+                && !self.peers.send_answer(peer, id, outcome).await
+            {
+                tracing::warn!(
+                    "coordinator: no link to {peer} took the answer to an edit it forwarded"
+                );
             }
         });
     }
 
-    /// The refusal this machine gave `id` within [`KEEP_FORWARDED`], if it did.
-    fn refusal(&self, id: EditId) -> Option<Outcome> {
-        let mut refused = lock(&self.refused);
-        refused.retain(|_, (at, _)| at.elapsed() < KEEP_FORWARDED);
-        refused.get(&id).map(|(_, outcome)| outcome.clone())
+    /// What this machine knows of each id, without the ids it no longer keeps: those no task
+    /// here waits on, whose last task ended [`KEEP_FORWARDED`] ago or more. A timeout, not an
+    /// order of records, so the clock is fine here.
+    fn known(&self) -> std::sync::MutexGuard<'_, BTreeMap<EditId, Known>> {
+        let mut known = lock(&self.known);
+        known.retain(|_, known| known.kept());
+        known
     }
 
-    /// What to tell a machine whose forwarded edit ended in `result`; `None` when nothing is
-    /// told. A reason is a fixed phrase built from machine ids only: never a store error's text
-    /// or a setting value.
-    fn outcome(&self, result: Result<Stamp, CoordinatorError>) -> Option<Outcome> {
-        let me = self.me;
-        let reason = match result {
-            Ok(stamp) => return Some(Outcome::Numbered { stamp }),
-            Err(CoordinatorError::Refused { reason }) => reason,
-            Err(CoordinatorError::Unwritable(_)) => {
-                format!("{me} could not write it to pass it on")
-            }
-            Err(CoordinatorError::Unsettled { acting, .. }) => {
-                format!("{me} could not send it to {acting}, the acting coordinator")
-            }
-            // Whether it was numbered is unknown: the forwarder's own limit reports it. The
-            // only store failure that is a refusal is a failed write with nothing else waiting
-            // on the id, and `run_edit` makes that one `Refused`. The rest cannot happen for a
-            // forwarded edit.
-            Err(
-                CoordinatorError::Store(_)
-                | CoordinatorError::NoAnswer { .. }
-                | CoordinatorError::NotLinked(_)
-                | CoordinatorError::Older { .. },
-            ) => return None,
-        };
-        Some(Outcome::Refused { reason })
+    /// The refusal this machine gave `id` within [`KEEP_FORWARDED`], if it did.
+    fn refusal(&self, id: EditId) -> Option<Outcome> {
+        self.known()
+            .get(&id)
+            .and_then(|known| known.refused.clone())
+    }
+
+    /// Notes that this machine answered `id` with `refused`: a refusal is final for its id.
+    fn remember_refusal(&self, id: EditId, refused: Outcome) {
+        let mut known = self.known();
+        let known = known.entry(id).or_default();
+        known.refused = Some(refused);
+        if known.waiting == 0 {
+            known.ended.get_or_insert_with(Instant::now);
+        }
+    }
+
+    /// Whether the edit sent under `id`, which `from` forwarded or this machine's own when
+    /// `None`, may be reported refused for `cause`, by what this machine knows of the id now
+    /// ([`may_refuse`]).
+    fn may_refuse(&self, id: EditId, from: Option<MachineId>, cause: Cause) -> bool {
+        self.known()
+            .get(&id)
+            .is_some_and(|known| may_refuse(known, from.is_some(), cause))
+    }
+
+    /// A refusal from this machine for `why`: a fixed phrase built from machine ids only, never
+    /// a store error's text or a setting value.
+    fn refused(&self, why: &str) -> CoordinatorError {
+        CoordinatorError::Refused {
+            reason: format!("{} {why}", self.me),
+        }
     }
 
     /// Makes `edit`, sent under `id`, which `from` forwarded, or this machine's own when `None`;
     /// `arrived` is when it reached this machine. See [`Coordinator::run_edit`].
+    #[cfg(test)]
     async fn edit_from(
-        &self,
+        self: &Arc<Self>,
         from: Option<MachineId>,
         arrived: Instant,
         id: EditId,
         edit: Edit,
     ) -> Result<Stamp, CoordinatorError> {
-        self.run_edit(from, arrived, id, edit, &mut None).await
+        let queued = from.map(|from| Queued::new(self, from, Some(id)).expect("not queued yet"));
+        self.run_edit(queued.as_ref(), arrived, id, edit).await
     }
 
-    /// Makes `edit`, sent under `id`, which `from` forwarded, or this machine's own when `None`;
-    /// `arrived` is when it reached this machine. Only the acting machine numbers it, once
-    /// caught up or [`OFFLINE_AFTER`] after it arrived, and it numbers an `id` once. `released`
-    /// is fired once the edit is first sent.
+    /// Makes `edit`, sent under `id`, which a peer forwarded as `queued`, or this machine's own
+    /// when `None`; `arrived` is when it reached this machine. Only the acting machine numbers
+    /// it, once caught up or [`OFFLINE_AFTER`] after it arrived, and it numbers an `id` once. A
+    /// forwarded edit is sent, or numbered, only in its turn ([`in_turn`]).
     ///
     /// Every [`STEP`] it looks again. An answer to `id` settles it, and so does a copy of the
     /// settings that holds a stamp for `id`. Otherwise, while another machine acts, the edit is
     /// sent to it, and sent again when the link it went on closes or another machine acts
     /// ([`Coordinator::look`] says where it goes).
     ///
-    /// It reports a refusal, or a store error, only when no machine can have numbered `id`:
-    /// a refusal ends the wait only while the edit went to at most one machine, whose own copy
-    /// holds every id it numbered, and a store error ends it only before the edit was ever
-    /// sent. Once it was sent, a refusal from one of two machines and any store error are
+    /// It reports a refusal only when [`may_refuse`] allows it, and a store error only on this
+    /// machine's own edit before it was ever sent. Otherwise a refusal and any store error are
     /// logged and it waits on, and [`KEEP_FORWARDED`] after it arrived it ends as
     /// [`CoordinatorError::NoAnswer`], naming the machine it went to last.
     async fn run_edit(
         &self,
-        from: Option<MachineId>,
+        queued: Option<&Queued>,
         arrived: Instant,
         id: EditId,
         edit: Edit,
-        released: &mut Option<oneshot::Sender<()>>,
     ) -> Result<Stamp, CoordinatorError> {
+        let from = queued.map(|queued| queued.peer);
         let _waiting = self.wait_on(id);
         // The acting machine this edit was last sent to, and the number of the link it went on.
-        let mut sent: Option<(MachineId, u64)> = None;
-        // Every machine it was sent to.
-        let mut sent_to: BTreeSet<MachineId> = BTreeSet::new();
+        let mut sent: Sent = None;
         // The last read error and the last write error, and whether a refusal was ignored,
         // logged once each: a read that goes right does not clear a write that keeps failing.
         let mut read_logged: Option<String> = None;
         let mut write_logged: Option<String> = None;
         let mut ignored = false;
         loop {
-            let answered = lock(&self.answers)
-                .get(&id)
-                .and_then(|(_, outcome)| outcome.clone());
+            let answered = self.known().get(&id).and_then(|known| known.answer.clone());
             match answered {
                 Some(Outcome::Numbered { stamp }) => return Ok(stamp),
-                Some(Outcome::Refused { reason }) if sent_to.len() <= 1 => {
+                Some(Outcome::Refused { reason }) if self.may_refuse(id, from, Cause::Answered) => {
                     return Err(CoordinatorError::Refused { reason });
                 }
                 Some(Outcome::Refused { .. }) if !ignored => {
                     ignored = true;
                     tracing::warn!(
-                        "coordinator: a refusal of an edit sent to two machines; waiting"
+                        "coordinator: a refusal of an edit another machine may have numbered; \
+                         waiting"
                     );
                 }
                 _ => {}
@@ -361,23 +348,19 @@ impl Coordinator {
                     if let Some(stamp) = look.held.numbered.get(&id) {
                         return Ok(*stamp);
                     }
-                    match look.next {
-                        // The only store failure that is a refusal is a failed write, on an
-                        // edit that was never sent, with no other task here waiting on the id
-                        // (it may be numbering it): then nothing else can have numbered it.
-                        // Another failure ends only this machine's own edit that was never
-                        // sent; otherwise it is logged and tried again.
+                    let next = match queued {
+                        Some(queued) if !queued.in_turn(look.next) => Next::Wait,
+                        _ => look.next,
+                    };
+                    match next {
+                        // A failed write here is a cause to refuse; a failed read says nothing
+                        // of the id. Any other failure ends only this machine's own edit that
+                        // was never sent; otherwise it is logged and tried again.
                         Next::Number => match self.number(Some(id), &edit).await {
                             Ok(stamp) => return Ok(stamp),
                             Err(failure) => {
-                                if failure.write
-                                    && from.is_some()
-                                    && sent.is_none()
-                                    && self.waiting_on(id) == 1
-                                {
-                                    return Err(CoordinatorError::Refused {
-                                        reason: format!("{} could not store it", self.me),
-                                    });
+                                if failure.write && self.may_refuse(id, from, Cause::Here) {
+                                    return Err(self.refused("could not store it"));
                                 }
                                 if from.is_none() && sent.is_none() {
                                     return Err(failure.error.into());
@@ -393,10 +376,17 @@ impl Coordinator {
                                 match self.peers.send_edit(acting, Some(id), &edit).await {
                                     Ok(link) => {
                                         sent = Some((acting, link));
-                                        sent_to.insert(acting);
-                                        if let Some(released) = released.take() {
-                                            let _ = released.send(());
+                                        self.sent_to(id, acting);
+                                        if let Some(queued) = queued {
+                                            queued.sent(acting, link);
                                         }
+                                    }
+                                    Err(Unsent::Unwritable(_))
+                                        if self.may_refuse(id, from, Cause::Here) =>
+                                    {
+                                        return Err(
+                                            self.refused("could not write it to pass it on")
+                                        );
                                     }
                                     Err(Unsent::Unwritable(error)) => {
                                         return Err(CoordinatorError::Unwritable(error));
@@ -418,6 +408,11 @@ impl Coordinator {
                     if look.waited >= KEEP_FORWARDED && failed.is_none() {
                         return Err(match (sent, from) {
                             (Some((to, _)), _) => CoordinatorError::NoAnswer { acting: to },
+                            (None, Some(_)) if self.may_refuse(id, from, Cause::Here) => self
+                                .refused(&format!(
+                                    "could not send it to {}, the acting coordinator",
+                                    look.acting
+                                )),
                             (None, Some(from)) => CoordinatorError::Unsettled {
                                 from,
                                 acting: look.acting,
@@ -476,20 +471,18 @@ impl Coordinator {
         })
     }
 
-    /// Passes on, or numbers here, an edit `peer` forwarded with no id, because it came from a
-    /// machine before [`ANSWERS_SINCE`]. Nobody answers it, so this ends once the edit is sent
-    /// on a link that speaks [`foundry_proto::messages::EDITS_SINCE`] or later, or numbered, and
-    /// never sends it again. It differs from [`Coordinator::run_edit`] only in that: it has no id
-    /// to look up or be answered under, so nothing here can be refused. `released` is dropped on
-    /// return, which lets the next forwarded edit go on.
+    /// Passes on, or numbers here, an edit a peer forwarded with no id, as `queued`, because it
+    /// came from a machine before [`ANSWERS_SINCE`]. Nobody answers it, so this ends once the
+    /// edit is sent on a link that speaks [`foundry_proto::messages::EDITS_SINCE`] or later, or
+    /// numbered, and never sends it again. It differs from [`Coordinator::run_edit`] only in
+    /// that: it has no id to look up or be answered under, so nothing here can be refused.
     async fn pass_on(
         &self,
-        peer: MachineId,
+        queued: &Queued,
         arrived: Instant,
         edit: Edit,
-        released: oneshot::Sender<()>,
     ) -> Result<(), CoordinatorError> {
-        let _released = released;
+        let peer = queued.peer;
         let mut logged: Option<String> = None;
         loop {
             match self.look(Some(peer), arrived).await {
@@ -505,7 +498,12 @@ impl Coordinator {
                 }
                 Ok(look) => {
                     logged = None;
-                    match look.next {
+                    let next = if queued.in_turn(look.next) {
+                        look.next
+                    } else {
+                        Next::Wait
+                    };
+                    match next {
                         Next::Number => {
                             return self
                                 .number(None, &edit)
@@ -536,22 +534,32 @@ impl Coordinator {
     }
 
     /// Registers `id` as an edit this machine waits on, until the guard drops. Edits that wait
-    /// on one id are counted, so the answer stays until the last of them is done.
+    /// on one id are counted, and what this machine knows of it is kept until
+    /// [`KEEP_FORWARDED`] after the last of them is done.
     fn wait_on(&self, id: EditId) -> Waiting<'_> {
-        lock(&self.answers).entry(id).or_insert((0, None)).0 += 1;
+        let mut known = self.known();
+        let known = known.entry(id).or_default();
+        known.waiting += 1;
+        known.ended = None;
         Waiting {
-            answers: &self.answers,
+            known: &self.known,
             id,
         }
     }
 
+    /// Notes that a task here sent the edit under `id` to `acting`.
+    fn sent_to(&self, id: EditId, acting: MachineId) {
+        if let Some(known) = self.known().get_mut(&id) {
+            known.sent_to.insert(acting);
+        }
+    }
+
     /// Gives the edit the next number, on the copy held at that moment, unless that copy
-    /// already holds a stamp for its `id`, which is returned. A stamp stored for `id` ends any
-    /// refusal remembered for it.
+    /// already holds a stamp for its `id`, which is returned.
     async fn number(&self, id: Option<EditId>, edit: &Edit) -> Result<Stamp, Unnumbered> {
         let me = self.me;
         let edit = edit.clone();
-        let stamp = on_store(&self.store, move |store| {
+        on_store(&self.store, move |store| {
             let held = store.settings().map_err(Unnumbered::read)?;
             if let Some(stamp) = id.and_then(|id| held.numbered.get(&id)) {
                 return Ok(*stamp);
@@ -567,18 +575,7 @@ impl Coordinator {
             store.apply_settings(next).map_err(Unnumbered::write)?;
             Ok(stamp)
         })
-        .await?;
-        if let Some(id) = id {
-            lock(&self.refused).remove(&id);
-        }
-        Ok(stamp)
-    }
-
-    /// How many edits on this machine wait on `id`.
-    fn waiting_on(&self, id: EditId) -> usize {
-        lock(&self.answers)
-            .get(&id)
-            .map_or(0, |(waiting, _)| *waiting)
+        .await
     }
 
     /// The settings held, and whether a copy of them was taken from `from` after `arrived`,
@@ -620,48 +617,163 @@ impl Coordinator {
     }
 }
 
-/// An edit this machine waits on, in [`Coordinator::answers`], removed when this drops.
+/// An edit this machine waits on, counted in [`Coordinator::known`] until this drops.
 struct Waiting<'a> {
-    answers: &'a Mutex<BTreeMap<EditId, (usize, Option<Outcome>)>>,
+    known: &'a Mutex<BTreeMap<EditId, Known>>,
     id: EditId,
 }
 
 impl Drop for Waiting<'_> {
     fn drop(&mut self) {
-        let mut answers = lock(self.answers);
-        if let Some((waiting, _)) = answers.get_mut(&self.id) {
-            *waiting -= 1;
-            if *waiting == 0 {
-                answers.remove(&self.id);
+        if let Some(known) = lock(self.known).get_mut(&self.id) {
+            known.waiting -= 1;
+            if known.waiting == 0 {
+                known.ended = Some(Instant::now());
             }
         }
     }
 }
 
-/// A forwarded edit from one machine with a task queued or running, in [`Coordinator::forwarding`], removed when
-/// this drops.
+/// What this machine knows of one edit id, in [`Coordinator::known`].
+#[derive(Debug, Default)]
+struct Known {
+    /// How many tasks here wait on it.
+    waiting: usize,
+    /// When the last task that waited on it ended, `None` while one waits. It is kept for
+    /// [`KEEP_FORWARDED`] after that: the longest its sender sends it again.
+    ended: Option<Instant>,
+    /// The answer a machine it was sent to gave.
+    answer: Option<Outcome>,
+    /// Every machine a task here sent it to.
+    sent_to: BTreeSet<MachineId>,
+    /// The refusal this machine answered it with: final for the id.
+    refused: Option<Outcome>,
+}
+
+impl Known {
+    fn kept(&self) -> bool {
+        self.waiting > 0 || self.ended.is_some_and(|at| at.elapsed() < KEEP_FORWARDED)
+    }
+}
+
+/// What may end an edit as refused.
+#[derive(Clone, Copy, Debug)]
+enum Cause {
+    /// A machine it was sent to answered it refused.
+    Answered,
+    /// This machine failed it: could not store it while acting, write it to send it on, or send
+    /// it on within [`KEEP_FORWARDED`].
+    Here,
+}
+
+/// The one rule for refusals: an edit is reported refused for `cause` only when no machine can
+/// have numbered its id, by what this machine knows of it, `known`, while a task here waits on
+/// it. `forwarded` is whether a peer forwarded the edit: this machine's own edit is not refused
+/// for a failure here, it fails with the error.
+fn may_refuse(known: &Known, forwarded: bool, cause: Cause) -> bool {
+    match cause {
+        // The refusing machine's own copy holds every id it numbered, so its refusal is final
+        // while no other machine was sent the id.
+        Cause::Answered => known.sent_to.len() <= 1,
+        // Once a task here sent the id on, the machine it went to may have numbered it, and
+        // another task here that waits on it may be numbering it now.
+        Cause::Here => forwarded && known.sent_to.is_empty() && known.waiting <= 1,
+    }
+}
+
+/// Where an edit was last sent: the acting machine and the number of the link, `None` before
+/// it was sent.
+type Sent = Option<(MachineId, u64)>;
+
+/// The forwarded edits with a task queued or running, in [`Coordinator::queue`].
+#[derive(Default)]
+struct Queue {
+    /// The number the next edit to arrive takes.
+    next: u64,
+    /// Each edit by the machine that forwarded it and its number: its id, and the machine and
+    /// link it was last sent on.
+    edits: BTreeMap<(MachineId, u64), (Option<EditId>, Sent)>,
+}
+
+/// An edit `peer` forwarded with a task queued or running, in [`Coordinator::queue`], removed
+/// when this drops.
 struct Queued {
     coordinator: Arc<Coordinator>,
     peer: MachineId,
-    id: EditId,
+    number: u64,
 }
 
 impl Queued {
-    /// `None` when `id` already has one.
-    fn new(coordinator: &Arc<Coordinator>, peer: MachineId, id: EditId) -> Option<Self> {
-        lock(&coordinator.forwarding)
-            .insert((peer, id))
-            .then(|| Self {
-                coordinator: Arc::clone(coordinator),
-                peer,
-                id,
-            })
+    /// Queues an edit `peer` forwarded under `id`; `None` when one from `peer` under that id is
+    /// queued already.
+    fn new(coordinator: &Arc<Coordinator>, peer: MachineId, id: Option<EditId>) -> Option<Self> {
+        let mut queue = lock(&coordinator.queue);
+        let mine = (peer, 0)..=(peer, u64::MAX);
+        if id.is_some() && queue.edits.range(mine).any(|(_, (held, _))| *held == id) {
+            return None;
+        }
+        let number = queue.next;
+        queue.next += 1;
+        queue.edits.insert((peer, number), (id, None));
+        Some(Self {
+            coordinator: Arc::clone(coordinator),
+            peer,
+            number,
+        })
+    }
+
+    /// Notes that the edit went to `acting` on link `link`.
+    fn sent(&self, acting: MachineId, link: u64) {
+        let mut queue = lock(&self.coordinator.queue);
+        if let Some((_, sent)) = queue.edits.get_mut(&(self.peer, self.number)) {
+            *sent = Some((acting, link));
+        }
+    }
+
+    /// Whether the edit may do `next` now ([`in_turn`]).
+    fn in_turn(&self, next: Next) -> bool {
+        let earlier: Vec<Sent> = lock(&self.coordinator.queue)
+            .edits
+            .range((self.peer, 0)..(self.peer, self.number))
+            .map(|(_, (_, sent))| *sent)
+            .collect();
+        let peers = &self.coordinator.peers;
+        in_turn(next, &earlier, |machine, link| peers.is_open(machine, link))
     }
 }
 
 impl Drop for Queued {
     fn drop(&mut self) {
-        lock(&self.coordinator.forwarding).remove(&(self.peer, self.id));
+        lock(&self.coordinator.queue)
+            .edits
+            .remove(&(self.peer, self.number));
+    }
+}
+
+/// Whether a forwarded edit may do `next` now, given where each edit the same machine
+/// forwarded before it, still queued or running here, was last sent: `earlier`, and `open`,
+/// whether a link is open. It is numbered only once none of them is left, and sent only to a
+/// machine every one of them is on its way to, on a link still open. Links carry messages in
+/// order, so edits from one machine reach the acting machine, and take their numbers, in the
+/// order they arrived, also when sent again.
+fn in_turn(next: Next, earlier: &[Sent], open: impl Fn(MachineId, u64) -> bool) -> bool {
+    match next {
+        Next::Number => earlier.is_empty(),
+        Next::Send(acting) => earlier
+            .iter()
+            .all(|sent| sent.is_some_and(|(to, link)| to == acting && open(to, link))),
+        Next::Wait => true,
+    }
+}
+
+/// What to tell a machine whose forwarded edit ended in `result`: its stamp, or the refusal
+/// [`Coordinator::run_edit`] gave under [`may_refuse`]. Any other end leaves open whether the
+/// edit was numbered, so nothing is told and the forwarder's own limit reports it.
+fn outcome(result: Result<Stamp, CoordinatorError>) -> Option<Outcome> {
+    match result {
+        Ok(stamp) => Some(Outcome::Numbered { stamp }),
+        Err(CoordinatorError::Refused { reason }) => Some(Outcome::Refused { reason }),
+        Err(_) => None,
     }
 }
 
@@ -1045,14 +1157,14 @@ mod tests {
     }
 
     /// A coordinator alone on its own store: it acts, and has nothing to catch up on.
-    fn alone() -> (tempfile::TempDir, Coordinator) {
+    fn alone() -> (tempfile::TempDir, Arc<Coordinator>) {
         let dir = tempfile::tempdir().unwrap();
         let me = MachineId::random();
         let store = Arc::new(Mutex::new(
             Store::open(dir.path().join("foundry.db")).unwrap(),
         ));
         let peers = Peers::new(me, store.clone(), Arc::new(NoDial));
-        (dir, Coordinator::new(me, store, peers))
+        (dir, Arc::new(Coordinator::new(me, store, peers)))
     }
 
     /// Machine ids in a known order: `id(1) < id(2) < …`.
@@ -1608,9 +1720,10 @@ mod tests {
             reason: "no".into(),
         };
         coordinator.take_answer(id, outcome.clone());
-        let held = lock(&coordinator.answers)
+        let held = coordinator
+            .known()
             .get(&id)
-            .and_then(|(_, outcome)| outcome.clone());
+            .and_then(|known| known.answer.clone());
         assert_eq!(held, Some(outcome));
     }
 
@@ -1659,7 +1772,7 @@ mod tests {
     }
 
     /// A coordinator alone, holding settings, whose store then refuses every write.
-    fn refusing_writes() -> (tempfile::TempDir, Coordinator) {
+    fn refusing_writes() -> (tempfile::TempDir, Arc<Coordinator>) {
         let (dir, coordinator) = alone();
         lock(&coordinator.store)
             .apply_settings(SharedSettings {
@@ -1717,12 +1830,135 @@ mod tests {
     }
 
     #[test]
-    fn a_store_error_is_never_answered_as_a_refusal() {
+    fn only_a_stamp_or_a_refusal_is_answered_and_every_other_end_is_not() {
+        let acting = MachineId::random();
+        let stamp = Stamp { seq: 3, by: acting };
+        assert_eq!(outcome(Ok(stamp)), Some(Outcome::Numbered { stamp }));
+        let refused = CoordinatorError::Refused {
+            reason: "no".into(),
+        };
+        assert_eq!(
+            outcome(Err(refused)),
+            Some(Outcome::Refused {
+                reason: "no".into()
+            })
+        );
+        // Each of these leaves open whether the edit was numbered.
+        let unwritable = serde_json::from_str::<u8>("x").unwrap_err();
+        for error in [
+            CoordinatorError::Store(StoreError::TooLarge {
+                what: "x",
+                value: 1,
+            }),
+            CoordinatorError::NoAnswer { acting },
+            CoordinatorError::NotLinked(acting),
+            CoordinatorError::Older { acting, speaks: 3 },
+            CoordinatorError::Unwritable(unwritable),
+            CoordinatorError::Unsettled {
+                from: MachineId::random(),
+                acting,
+            },
+        ] {
+            let text = error.to_string();
+            assert_eq!(outcome(Err(error)), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn an_edit_is_refused_only_when_no_machine_can_have_numbered_it() {
+        let (a, b) = (MachineId::random(), MachineId::random());
+        let known = |waiting: usize, sent_to: &[MachineId]| Known {
+            waiting,
+            sent_to: sent_to.iter().copied().collect(),
+            ..Known::default()
+        };
+        let rows = [
+            // (what is known, forwarded, cause, may refuse)
+            (known(1, &[a]), true, Cause::Answered, true),
+            (known(1, &[a]), false, Cause::Answered, true),
+            (known(2, &[a]), true, Cause::Answered, true),
+            (known(1, &[a, b]), true, Cause::Answered, false),
+            (known(1, &[a, b]), false, Cause::Answered, false),
+            (known(1, &[]), true, Cause::Here, true),
+            // Its own edit fails with the error instead.
+            (known(1, &[]), false, Cause::Here, false),
+            // A machine it went to may have numbered it.
+            (known(1, &[a]), true, Cause::Here, false),
+            // Another task here may be numbering it.
+            (known(2, &[]), true, Cause::Here, false),
+        ];
+        for (known, forwarded, cause, want) in rows {
+            assert_eq!(
+                may_refuse(&known, forwarded, cause),
+                want,
+                "{known:?} forwarded {forwarded} {cause:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_forwarded_edit_goes_only_after_the_ones_its_machine_forwarded_before_it() {
+        let (a, b) = (MachineId::random(), MachineId::random());
+        let open = |_: MachineId, link: u64| link != 9;
+        let rows: [(Next, &[Sent], bool); 9] = [
+            (Next::Number, &[], true),
+            (Next::Number, &[Some((a, 1))], false),
+            (Next::Send(a), &[], true),
+            (Next::Send(a), &[Some((a, 1)), Some((a, 2))], true),
+            // An earlier one not sent yet, sent elsewhere, or on a link since closed goes first.
+            (Next::Send(a), &[None], false),
+            (Next::Send(a), &[Some((b, 1))], false),
+            (Next::Send(a), &[Some((a, 9))], false),
+            (Next::Send(a), &[Some((a, 1)), None], false),
+            (Next::Wait, &[None], true),
+        ];
+        for (next, earlier, want) in rows {
+            assert_eq!(in_turn(next, earlier, open), want, "{next:?} {earlier:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_forwarded_edit_is_numbered_only_once_the_edit_its_machine_sent_before_is_done() {
         let (_dir, coordinator) = alone();
-        let error = CoordinatorError::Store(StoreError::TooLarge {
-            what: "x",
-            value: 1,
+        let peer = MachineId::random();
+        let earlier = Queued::new(&coordinator, peer, Some(EditId::random())).unwrap();
+        // Another machine's edits are not held back by it.
+        let other = coordinator
+            .edit_from(
+                Some(MachineId::random()),
+                Instant::now(),
+                EditId::random(),
+                set_project(8, "elsewhere"),
+            )
+            .await;
+        assert!(other.is_ok(), "{other:?}");
+
+        let later = tokio::spawn({
+            let coordinator = Arc::clone(&coordinator);
+            async move {
+                coordinator
+                    .edit_from(
+                        Some(peer),
+                        Instant::now(),
+                        EditId::random(),
+                        set_project(7, "later"),
+                    )
+                    .await
+            }
         });
-        assert_eq!(coordinator.outcome(Err(error)), None);
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(!later.is_finished(), "numbered before the earlier edit");
+        assert_eq!(project_named(&coordinator.held().await.unwrap(), 7), None);
+        drop(earlier);
+        let stamp = tokio::time::timeout(Duration::from_secs(1), later)
+            .await
+            .expect("numbered once the earlier edit is done")
+            .unwrap()
+            .unwrap();
+        let held = coordinator.held().await.unwrap();
+        assert_eq!(
+            held.stamps[&StampKey::Setting(SettingKey::Project(project(7, "").id))],
+            stamp
+        );
     }
 }
