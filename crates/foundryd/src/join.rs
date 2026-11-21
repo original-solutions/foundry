@@ -1240,6 +1240,45 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_watched_code_says_which_machine_used_it() {
+        let (host, peer) = (machine_keys(), machine_keys());
+        let (code, used) = host.new_watched_code().unwrap();
+        host.redeem(&code.to_string(), peer.me(), &peer.public_key())
+            .unwrap();
+        assert_eq!(used.await.unwrap(), peer.me());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_watched_code_says_nothing_until_it_is_used_and_nothing_for_a_failed_save() {
+        let flaky = Arc::new(Flaky::default());
+        let host = Keys::open(flaky.clone()).unwrap();
+        let peer = machine_keys();
+        let (code, mut used) = host.new_watched_code().unwrap();
+        // Another code used, or this one refused to another machine's stolen claim, says nothing.
+        admit(&host, &machine_keys());
+        flaky.failing.store(true, Ordering::SeqCst);
+        assert!(
+            host.redeem(&code.to_string(), peer.me(), &peer.public_key())
+                .is_err()
+        );
+        assert!(used.try_recv().is_err());
+        flaky.failing.store(false, Ordering::SeqCst);
+        host.redeem(&code.to_string(), peer.me(), &peer.public_key())
+            .unwrap();
+        assert_eq!(used.await.unwrap(), peer.me());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_watched_code_that_expires_unused_ends_its_watch() {
+        let host = machine_keys();
+        let (_code, used) = host.new_watched_code().unwrap();
+        tokio::time::advance(CODE_VALID_FOR).await;
+        // Any later code forgets the expired one.
+        host.new_code().unwrap();
+        assert!(used.await.is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_failed_save_admits_nobody_and_leaves_the_code_unspent() {
         let flaky = Arc::new(Flaky::default());
         let host = Keys::open(flaky.clone()).unwrap();

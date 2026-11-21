@@ -1,0 +1,385 @@
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::io;
+    use std::net::IpAddr;
+    use std::time::Duration;
+
+    use foundry_proto::ids::MachineId;
+    use foundry_proto::messages::{PROTOCOL, PeerMessage};
+    use foundry_proto::settings::{Machine, SharedSettings};
+    use futures::future::BoxFuture;
+    use serde_json::{Value, json};
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    use super::*;
+    use crate::join::{self, CODE_VALID_FOR};
+    use crate::secrets::MemorySecrets;
+    use crate::sync::{Conn, Dialer, Peers};
+
+    struct NoDial;
+
+    impl Dialer for NoDial {
+        fn dial(&self, _: &Machine) -> BoxFuture<'static, io::Result<Conn>> {
+            Box::pin(async { Err(io::Error::other("no peers in these tests")) })
+        }
+    }
+
+    /// One machine's keys, coordinator and store, its join and add routes served on a
+    /// loopback port.
+    struct Served {
+        _data: tempfile::TempDir,
+        me: MachineId,
+        keys: Keys,
+        store: Arc<Mutex<Store>>,
+        peers: Peers,
+        addr: std::net::SocketAddr,
+        _server: tokio::task::JoinHandle<()>,
+    }
+
+    impl Served {
+        /// A machine listed as `personal-mac` that acts alone, holding the settings
+        /// `settings` makes from that.
+        async fn new(settings: impl FnOnce(MachineId, &mut SharedSettings)) -> Self {
+            let data = tempfile::tempdir().unwrap();
+            let keys = Keys::open(Arc::new(MemorySecrets::default())).unwrap();
+            let me = keys.me();
+            let mut store = Store::open(data.path().join("foundry.db")).unwrap();
+            let mut held = store.settings().unwrap();
+            held.seq += 1;
+            held.machines
+                .push(machine(me, "personal-mac", "100.91.54.18"));
+            held.priority = vec![me];
+            settings(me, &mut held);
+            store.apply_settings(held).unwrap();
+            let store = Arc::new(Mutex::new(store));
+            let peers = Peers::new(me, store.clone(), Arc::new(NoDial));
+            let coordinator = Arc::new(Coordinator::new(me, store.clone(), peers.clone()));
+            peers.coordinate(coordinator.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let app = join::router(keys.clone()).merge(router(keys.clone(), coordinator, store.clone()));
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            Self {
+                _data: data,
+                me,
+                keys,
+                store,
+                peers,
+                addr,
+                _server: server,
+            }
+        }
+
+        fn settings(&self) -> SharedSettings {
+            self.store.lock().unwrap().settings().unwrap()
+        }
+
+        /// `(status, body)` of a post of `body` to `path`.
+        async fn post(&self, path: &str, body: &Value) -> (u16, String) {
+            let mut stream = tokio::net::TcpStream::connect(self.addr).await.unwrap();
+            let body = body.to_string();
+            let request = format!(
+                "POST {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\
+                 Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                self.addr,
+                body.len()
+            );
+            stream.write_all(request.as_bytes()).await.unwrap();
+            let mut response = Vec::new();
+            tokio::time::timeout(Duration::from_secs(20), stream.read_to_end(&mut response))
+                .await
+                .expect("the route answers in time")
+                .unwrap();
+            let response = String::from_utf8(response).unwrap();
+            let (head, body) = response.split_once("\r\n\r\n").unwrap();
+            (
+                head.split(' ').nth(1).unwrap().parse().unwrap(),
+                body.to_owned(),
+            )
+        }
+
+        /// `(status, body)` of an add of `name`.
+        async fn add(&self, name: &str) -> (u16, String) {
+            self.post("/api/machines/add", &json!({ "name": name })).await
+        }
+
+        /// The code of an add of `name` that must succeed.
+        async fn code_for(&self, name: &str) -> String {
+            let (status, body) = self.add(name).await;
+            assert_eq!(status, 201, "{body}");
+            let answer: Value = serde_json::from_str(&body).unwrap();
+            answer["code"].as_str().unwrap().to_owned()
+        }
+
+        /// `(status, body)` of a join with `code` by `joining`, as `foundryd join` posts it.
+        async fn join(&self, code: &str, joining: &Keys) -> (u16, String) {
+            let request = json!({
+                "code": code,
+                "machine": joining.me(),
+                "key": joining.public_key(),
+            });
+            self.post(join::JOIN_PATH, &request).await
+        }
+
+        /// Waits for the machine list to hold `id`.
+        async fn listed(&self, id: MachineId) -> Machine {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(found) = self.settings().machines.into_iter().find(|m| m.id == id) {
+                    return found;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "{id} was not listed"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        /// `peer` says hello and sends nothing, so it is heard from, then its link drops: it
+        /// acts, and an edit has nowhere to go.
+        async fn hear(&self, peer: MachineId) {
+            let (ours, theirs) = Conn::pair();
+            let accepting = tokio::spawn({
+                let peers = self.peers.clone();
+                async move { peers.accept(ours).await }
+            });
+            let hello = PeerMessage::Hello {
+                protocol: PROTOCOL,
+                machine: peer,
+                versions: BTreeMap::new(),
+            };
+            let nothing = PeerMessage::Records {
+                protocol: PROTOCOL,
+                records: Vec::new(),
+            };
+            for message in [hello, nothing] {
+                theirs
+                    .send
+                    .send(serde_json::to_string(&message).unwrap())
+                    .await
+                    .unwrap();
+            }
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while !self.peers.online().contains(&peer) {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the peer was not heard"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            drop(theirs);
+            accepting.await.unwrap();
+        }
+    }
+
+    fn machine(id: MachineId, name: &str, address: &str) -> Machine {
+        Machine {
+            id,
+            name: name.into(),
+            address: address.into(),
+        }
+    }
+
+    fn error_of(body: &str) -> String {
+        let json: Value = serde_json::from_str(body).unwrap();
+        json["error"].as_str().unwrap().to_owned()
+    }
+
+    /// Everything logged while it is set, as plain text.
+    #[derive(Clone, Default)]
+    struct Logged(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for Logged {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Logged {
+        /// Captures this thread's log until the guard drops.
+        fn capture(&self) -> tracing::subscriber::DefaultGuard {
+            let logged = self.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(move || logged.clone())
+                .with_ansi(false)
+                .without_time()
+                .finish();
+            tracing::subscriber::set_default(subscriber)
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    #[tokio::test]
+    async fn an_add_answers_the_code_the_command_to_run_there_and_ten_minutes() {
+        let served = Served::new(|_, _| {}).await;
+
+        let (status, body) = served.add("  127.0.0.1 ").await;
+
+        assert_eq!(status, 201, "{body}");
+        let answer: Value = serde_json::from_str(&body).unwrap();
+        let code = answer["code"].as_str().unwrap();
+        assert_eq!(code.len(), 10, "{body}");
+        assert_eq!(
+            answer["command"],
+            format!("foundryd join personal-mac {code}"),
+            "{body}"
+        );
+        assert_eq!(answer["expires_in_secs"], CODE_VALID_FOR.as_secs());
+        // An add changes nothing in the list until the code is used.
+        assert_eq!(served.settings().machines.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_used_code_lists_the_machine_under_the_name_typed_at_its_address() {
+        let served = Served::new(|_, _| {}).await;
+        let joining = Keys::open(Arc::new(MemorySecrets::default())).unwrap();
+        let code = served.code_for(" 127.0.0.1 ").await;
+
+        let (status, body) = served.join(&code, &joining).await;
+
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(
+            served.listed(joining.me()).await,
+            machine(joining.me(), "127.0.0.1", "127.0.0.1")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_name_is_listed_as_typed_at_the_first_tailscale_address_it_resolves_to() {
+        let served = Served::new(|_, _| {}).await;
+        let joining = Keys::open(Arc::new(MemorySecrets::default())).unwrap();
+        let code = served.code_for("localhost").await;
+
+        assert_eq!(served.join(&code, &joining).await.0, 200);
+
+        let listed = served.listed(joining.me()).await;
+        assert_eq!(listed.name, "localhost");
+        let first = join::join_targets("localhost", join::DEFAULT_PORT).unwrap()[0].ip();
+        assert_eq!(listed.address.parse::<IpAddr>().unwrap(), first);
+    }
+
+    #[tokio::test]
+    async fn a_join_with_a_code_this_route_did_not_issue_changes_nothing_in_the_settings() {
+        let served = Served::new(|_, _| {}).await;
+        served.code_for("127.0.0.1").await;
+        let joining = Keys::open(Arc::new(MemorySecrets::default())).unwrap();
+        let other = served.keys.new_code().unwrap().to_string();
+        let before = served.settings();
+
+        assert_eq!(served.join(&other, &joining).await.0, 200);
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(served.settings(), before);
+    }
+
+    #[tokio::test]
+    async fn a_join_sent_again_after_its_answer_was_lost_lists_the_machine_once() {
+        let served = Served::new(|_, _| {}).await;
+        let joining = Keys::open(Arc::new(MemorySecrets::default())).unwrap();
+        let code = served.code_for("127.0.0.1").await;
+
+        assert_eq!(served.join(&code, &joining).await.0, 200);
+        served.listed(joining.me()).await;
+        let seq = served.settings().seq;
+        assert_eq!(served.join(&code, &joining).await.0, 200);
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(served.settings().seq, seq);
+    }
+
+    #[tokio::test]
+    async fn a_listing_the_coordinator_cannot_send_is_warned_and_the_join_still_succeeds() {
+        let logged = Logged::default();
+        let _capture = logged.capture();
+        let peer = MachineId::random();
+        let served = Served::new(move |me, settings| {
+            settings
+                .machines
+                .push(machine(peer, "trilogy-mac", "100.64.0.2"));
+            settings.priority = vec![peer, me];
+        })
+        .await;
+        served.hear(peer).await;
+        let joining = Keys::open(Arc::new(MemorySecrets::default())).unwrap();
+        let code = served.code_for("127.0.0.1").await;
+
+        let (status, body) = served.join(&code, &joining).await;
+
+        assert_eq!(status, 200, "{body}");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !logged.text().contains("WARN") {
+            assert!(tokio::time::Instant::now() < deadline, "nothing was warned");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let text = logged.text();
+        assert!(text.contains(&joining.me().to_string()), "{text}");
+        assert!(!text.contains(&code), "the code reached the log: {text}");
+        assert!(
+            !served
+                .settings()
+                .machines
+                .iter()
+                .any(|m| m.id == joining.me())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_blank_or_long_name_is_422_and_issues_no_code() {
+        let served = Served::new(|_, _| {}).await;
+        for name in ["", "   ", &"a".repeat(61)] {
+            let (status, body) = served.add(name).await;
+            assert_eq!(status, 422, "{name:?}: {body}");
+            assert!(!error_of(&body).is_empty(), "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_name_that_resolves_to_no_tailscale_address_is_422() {
+        let served = Served::new(|_, _| {}).await;
+        // A name nothing resolves, and an address outside Tailscale's ranges.
+        for name in ["localhost.invalid", "192.0.2.1"] {
+            let (status, body) = served.add(name).await;
+            assert_eq!(status, 422, "{name:?}: {body}");
+            assert!(error_of(&body).contains(name), "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_name_a_listed_machine_has_in_any_case_or_spacing_is_409() {
+        let peer = MachineId::random();
+        let served = Served::new(move |_, settings| {
+            settings
+                .machines
+                .push(machine(peer, " Trilogy-Mac ", "100.64.0.2"));
+        })
+        .await;
+
+        for name in ["trilogy-mac", " TRILOGY-MAC ", "Personal-Mac"] {
+            let (status, body) = served.add(name).await;
+            assert_eq!(status, 409, "{name:?}: {body}");
+            assert!(!error_of(&body).is_empty(), "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_add_on_a_machine_not_in_the_list_yet_is_503() {
+        let served = Served::new(|me, settings| settings.machines.retain(|m| m.id != me)).await;
+
+        let (status, body) = served.add("127.0.0.1").await;
+
+        assert_eq!(status, 503, "{body}");
+        assert!(!error_of(&body).is_empty(), "{body}");
+    }
+}
