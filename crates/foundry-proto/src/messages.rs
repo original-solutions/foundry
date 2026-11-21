@@ -196,6 +196,7 @@ mod tests {
                 id: EditId::random(),
                 outcome: Outcome::Refused {
                     reason: "it could not be stored".into(),
+                    conflict: false,
                 },
             },
             PeerMessage::Call {
@@ -383,6 +384,7 @@ mod tests {
                     id: EditId(edit.parse().unwrap()),
                     outcome: Outcome::Refused {
                         reason: "no".into(),
+                        conflict: false,
                     },
                 },
             ),

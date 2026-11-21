@@ -1648,6 +1648,7 @@ mod tests {
                 peer,
                 Outcome::Refused {
                     reason: reason.clone(),
+                    conflict: false,
                 },
             )
             .await;
