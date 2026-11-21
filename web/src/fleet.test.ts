@@ -85,6 +85,16 @@ describe("fleet", () => {
     expect(state).toEqual({ one: "offline", two: "online", three: "unknown" });
   });
 
+  it("stays offline when a reachable record of the machine comes after an unreachable one", () => {
+    const s = settings({ machines: [{ id: "m1", name: "one", address: "" }] });
+    const records = [
+      workspace("m1", "w1", "a"),
+      session("m1", "s1", "w1", "t1", "unreachable"),
+      terminal("m1", "t1", "w1", "running"),
+    ];
+    expect(fleet(records, s).map((m) => m.status)).toEqual(["offline"]);
+  });
+
   it("uses the newest sample by version", () => {
     const machines = fleet([sample(ME, 5, { sessions: 5 }), sample(ME, 7, { sessions: 7 }), sample(ME, 6, { sessions: 6 })], settings());
     expect(machines[0].sample?.sessions).toBe(7);

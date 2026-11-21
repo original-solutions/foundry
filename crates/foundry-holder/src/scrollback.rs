@@ -201,8 +201,11 @@ mod tests {
         scrollback.push(b"abc\n");
         scrollback.push(b"0123456789");
         assert_eq!(scrollback.snapshot(), b"6789");
+        // The 4 bytes held and the 6 skipped are behind the snapshot now.
+        assert_eq!(scrollback.start(), 10);
         scrollback.push(b"\nx");
         assert_eq!(scrollback.snapshot(), b"x");
+        assert_eq!(scrollback.start(), 15);
     }
 
     #[test]

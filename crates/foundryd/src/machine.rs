@@ -136,13 +136,17 @@ pub fn free_disk(path: &Path) -> Result<u64, MachineError> {
 
 /// Reads this machine's load, memory and the free disk for `data_dir`, with `sessions`.
 pub fn read(data_dir: &Path, sessions: u32) -> Result<MachineSample, MachineError> {
-    let mut system = System::new_with_specifics(
+    read_with(&mut new_system()?, data_dir, sessions, false)
+}
+
+/// A System that knows the logical cores and has read the memory once.
+fn new_system() -> Result<System, MachineError> {
+    System::new_with_specifics(
         RefreshKind::nothing()
             .with_cpu(CpuRefreshKind::nothing())
             .with_memory(MemoryRefreshKind::nothing().with_ram()),
     )
-    .map_err(MachineError::System)?;
-    read_with(&mut system, data_dir, sessions, false)
+    .map_err(MachineError::System)
 }
 
 fn read_with(
@@ -174,11 +178,11 @@ pub fn write_sample(
     me: MachineId,
     data_dir: &Path,
 ) -> Result<Record<MachineSample>, MachineError> {
-    let machine = read(data_dir, 0)?;
-    let update_refused = update_refused(data_dir);
-    store_sample(store, me, machine, update_refused)
+    write_sample_with(&mut None, store, me, data_dir)
 }
 
+/// [`write_sample`] with a System kept from the sample before, as [`run`] keeps one: built on
+/// the first sample, then only its memory is read again.
 fn write_sample_with(
     system: &mut Option<System>,
     store: &Mutex<Store>,
@@ -188,12 +192,7 @@ fn write_sample_with(
     let machine = match system {
         Some(sys) => read_with(sys, data_dir, 0, true)?,
         None => {
-            let mut sys = System::new_with_specifics(
-                RefreshKind::nothing()
-                    .with_cpu(CpuRefreshKind::nothing())
-                    .with_memory(MemoryRefreshKind::nothing().with_ram()),
-            )
-            .map_err(MachineError::System)?;
+            let mut sys = new_system()?;
             let sample = read_with(&mut sys, data_dir, 0, false)?;
             *system = Some(sys);
             sample
