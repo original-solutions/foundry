@@ -2,11 +2,11 @@
 //!
 //! [`Secrets`] is the one interface and [`FileSecrets`] backs it: [`for_this_machine`] gives
 //! the file `secrets.json` in the data directory. Earlier releases kept a Mac's secrets in the
-//! login keychain. The first start on such a Mac copies them into the file and marks the copy
-//! with its own version. The keychain items are never deleted, so a release that reads only the
-//! keychain still finds them, and a rollback of the version that made the copy removes the copy
-//! ([`drop_copy`]). A secret's value never reaches an error message: errors name the secret or
-//! the file, never what it holds.
+//! login keychain. The first open on such a Mac with no update on trial copies them into the
+//! file; none is made while an update is on trial, so an automatic rollback never runs an older
+//! release on a keychain the file has moved on from. The keychain items are
+//! never deleted, so a release that reads only the keychain still finds them. A secret's value
+//! never reaches an error message: errors name the secret or the file, never what it holds.
 
 use std::collections::BTreeMap;
 #[cfg(any(target_os = "macos", test))]
@@ -90,6 +90,12 @@ pub enum SecretsError {
         LOCK_WAIT.as_secs()
     )]
     Locked { path: PathBuf },
+    #[error(
+        "the secrets are still in the login keychain, and they are not copied while an update is \
+         on trial; once that update has rolled back, install this version by hand and answer the \
+         keychain prompts (docs/install.md)"
+    )]
+    NotMoved,
     #[error("the keychain could not {action} the secret {name}: {reason}")]
     Keychain {
         action: &'static str,
@@ -109,35 +115,15 @@ pub const GATEWAY_MANAGEMENT: &str = "gateway-management";
 /// service user, on every OS.
 ///
 /// On macOS, when that file does not exist, the secrets a keychain-era release stored are first
-/// copied into it from the login keychain ([`move_secrets`]). Each keychain read can bring up a
-/// prompt, which this call waits on. A failed read gives an error and writes nothing, so the
-/// caller stops rather than start with an empty store, and the next start tries again. The
-/// keychain items are left as they were. In a debug build `FOUNDRY_SECRETS=file` skips the
-/// keychain, which is how tests keep out of it. A release build ignores it.
+/// copied into it from the login keychain ([`move_secrets`]), except while an update is on
+/// trial, which gives [`SecretsError::NotMoved`] instead. Each
+/// keychain read can bring up a prompt, which this call waits on. A failed read gives an error
+/// and writes nothing, so the caller stops rather than start with an empty store, and the next
+/// start tries again. The keychain items are left as they were. In a debug build
+/// `FOUNDRY_SECRETS=file` skips the keychain, which is how tests keep out of it. A release
+/// build ignores it.
 pub fn for_this_machine(home: &Path) -> Result<Arc<dyn Secrets>, SecretsError> {
-    open(home, keychain().as_deref(), env!("CARGO_PKG_VERSION"))
-}
-
-/// Called when the update trial of `version` rolls back: when `secrets.json` in `home` is the
-/// copy `version` made of the keychain, removes it and its mark. The keychain-era release the
-/// trial goes back to reads and writes only the keychain, which still holds every secret the
-/// copy took, so the copy would only go stale; with it gone, the next release copies the
-/// keychain again. A copy another version made, or a file that is no copy, is left alone: the
-/// version before `version` used that file too.
-pub fn drop_copy(home: &Path, version: &str) -> Result<(), SecretsError> {
-    let secrets = FileSecrets::new(home.join("secrets.json"));
-    let _locked = secrets.lock()?;
-    let mark = secrets.beside(".copied");
-    let made_by = match fs::read_to_string(&mark) {
-        Ok(made_by) => made_by,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(secrets.io(error)),
-    };
-    if made_by != version {
-        return Ok(());
-    }
-    remove(&secrets.path).map_err(|e| secrets.io(e))?;
-    remove(&mark).map_err(|e| secrets.io(e))
+    open(home, keychain().as_deref())
 }
 
 /// Whether `path` exists; an error other than its absence is passed on.
@@ -146,14 +132,6 @@ fn exists(path: &Path) -> io::Result<bool> {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error),
-    }
-}
-
-/// Removes the file at `path`; one that is already gone is not an error.
-fn remove(path: &Path) -> io::Result<()> {
-    match fs::remove_file(path) {
-        Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
-        _ => Ok(()),
     }
 }
 
@@ -167,16 +145,25 @@ fn keychain() -> Option<Box<dyn OldStore>> {
     None
 }
 
-/// The file store `secrets.json` in `home`, after [`move_secrets`] from `old` by `version` when
-/// there is one.
-fn open(
-    home: &Path,
-    old: Option<&dyn OldStore>,
-    version: &str,
-) -> Result<Arc<dyn Secrets>, SecretsError> {
+/// The file store `secrets.json` in `home`, after [`move_secrets`] from `old` when there is
+/// one. While an update is on trial ([`crate::update::trial_on`]) `old` is never read: the file
+/// is used when an earlier copy made it, and the open is refused otherwise. The daemon,
+/// `foundryd join` and `foundryd secret set` all open the store here, so none of them copies
+/// during a trial, and the release a rollback goes back to finds the keychain still the one
+/// store.
+fn open(home: &Path, old: Option<&dyn OldStore>) -> Result<Arc<dyn Secrets>, SecretsError> {
     let secrets = FileSecrets::new(home.join("secrets.json"));
     if let Some(old) = old {
-        move_secrets(old, &secrets, version)?;
+        if crate::update::trial_on(home) {
+            if !exists(&secrets.path).map_err(|e| secrets.io(e))? {
+                return Err(SecretsError::NotMoved);
+            }
+        } else {
+            // Every keychain write a keychain-era release makes holds this lock, so none lands
+            // between the copy's reads and the file it writes.
+            let _locked = lock_file(&home.join("secrets.lock"), LOCK_WAIT)?;
+            move_secrets(old, &secrets)?;
+        }
     }
     Ok(Arc::new(secrets))
 }
@@ -211,12 +198,9 @@ trait OldStore {
 
 /// Copies every one of [`KEYCHAIN_NAMES`] that `old` holds into `new`, once: only while `new`'s
 /// file does not exist, and under its lock, so two processes starting at once copy them once.
-/// Every read comes first; any failure returns before anything is written. The copy is marked
-/// with the file `<new>.copied`, which holds `version` and is made before the secrets are
-/// written in one go, so a copy on disk always has its mark. A mark left with no file, by a
-/// write that failed, is made again by the next copy. `old` is left as it was. When `old` holds
-/// none, nothing is written.
-fn move_secrets(old: &dyn OldStore, new: &FileSecrets, version: &str) -> Result<(), SecretsError> {
+/// Every read comes first; any failure returns before anything is written, and the secrets are
+/// written in one go. `old` is left as it was. When `old` holds none, nothing is written.
+fn move_secrets(old: &dyn OldStore, new: &FileSecrets) -> Result<(), SecretsError> {
     let _locked = new.lock()?;
     if exists(&new.path).map_err(|e| new.io(e))? {
         return Ok(());
@@ -230,17 +214,6 @@ fn move_secrets(old: &dyn OldStore, new: &FileSecrets, version: &str) -> Result<
     if found.is_empty() {
         return Ok(());
     }
-    OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(new.beside(".copied"))
-        .and_then(|mut mark| {
-            mark.write_all(version.as_bytes())?;
-            mark.sync_all()
-        })
-        .map_err(|e| new.io(e))?;
     new.write(&found)
 }
 
@@ -872,9 +845,6 @@ mod tests {
         }
     }
 
-    /// The version that makes the copies in these tests.
-    const VERSION: &str = "0.2.0";
-
     /// The names are the ones `join` and the gateway keep their secrets under.
     #[test]
     fn the_names_copied_are_the_four_foundry_stores() {
@@ -903,7 +873,7 @@ mod tests {
         let (dir, new) = file();
         let old = old_store(&KEYCHAIN_NAMES);
         Secrets::set(&old, "unrelated", "kept").unwrap();
-        move_secrets(&old, &new, VERSION).unwrap();
+        move_secrets(&old, &new).unwrap();
         for name in KEYCHAIN_NAMES {
             let expected = format!("value-of-{name}");
             assert_eq!(
@@ -924,7 +894,7 @@ mod tests {
     fn the_move_takes_only_the_secrets_the_keychain_holds() {
         let (_dir, new) = file();
         let old = old_store(&["machine", GATEWAY]);
-        move_secrets(&old, &new, VERSION).unwrap();
+        move_secrets(&old, &new).unwrap();
         assert_eq!(
             new.get("machine").unwrap().as_deref(),
             Some("value-of-machine")
@@ -941,7 +911,7 @@ mod tests {
     #[test]
     fn the_move_writes_no_file_when_the_keychain_holds_none() {
         let (dir, new) = file();
-        move_secrets(&MemorySecrets::default(), &new, VERSION).unwrap();
+        move_secrets(&MemorySecrets::default(), &new).unwrap();
         assert!(!dir.path().join("secrets.json").exists());
     }
 
@@ -950,7 +920,7 @@ mod tests {
         for failing in KEYCHAIN_NAMES {
             let (dir, new) = file();
             let old = Denying::reads(old_store(&KEYCHAIN_NAMES), failing);
-            let error = move_secrets(&old, &new, VERSION).unwrap_err();
+            let error = move_secrets(&old, &new).unwrap_err();
             assert!(error.to_string().contains(failing), "{error}");
             assert!(!error.to_string().contains("value-of-"), "{error}");
             assert!(!dir.path().join("secrets.json").exists(), "{failing}");
@@ -968,7 +938,7 @@ mod tests {
         new.set(GATEWAY, "sk-file").unwrap();
         let before = fs::read(dir.path().join("secrets.json")).unwrap();
         let old = old_store(&KEYCHAIN_NAMES);
-        move_secrets(&old, &new, VERSION).unwrap();
+        move_secrets(&old, &new).unwrap();
         assert_eq!(fs::read(dir.path().join("secrets.json")).unwrap(), before);
         assert_eq!(held_in(&old), held_in(&old_store(&KEYCHAIN_NAMES)));
     }
@@ -978,7 +948,7 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let home = parent.path().join("home");
         let new = FileSecrets::new(home.join("secrets.json"));
-        move_secrets(&old_store(&[GATEWAY]), &new, VERSION).unwrap();
+        move_secrets(&old_store(&[GATEWAY]), &new).unwrap();
         assert_eq!(mode(&home), 0o700);
         assert_eq!(mode(&home.join("secrets.json")), 0o600);
     }
@@ -989,7 +959,7 @@ mod tests {
         // A directory where the temporary file goes: removing it fails, so the write does.
         fs::create_dir(dir.path().join("secrets.json.tmp")).unwrap();
         let old = old_store(&KEYCHAIN_NAMES);
-        assert!(move_secrets(&old, &new, VERSION).is_err());
+        assert!(move_secrets(&old, &new).is_err());
         assert!(!dir.path().join("secrets.json").exists());
         assert_eq!(held_in(&old), held_in(&old_store(&KEYCHAIN_NAMES)));
     }
@@ -1000,7 +970,7 @@ mod tests {
         let held = lock_file(&dir.path().join("secrets.json.lock"), LOCK_WAIT).unwrap();
         let old = old_store(&KEYCHAIN_NAMES);
         let started = Instant::now();
-        let error = move_secrets(&old, &new, VERSION).unwrap_err();
+        let error = move_secrets(&old, &new).unwrap_err();
         assert!(started.elapsed() >= LOCK_WAIT);
         assert!(matches!(error, SecretsError::Locked { .. }), "{error:?}");
         assert!(!dir.path().join("secrets.json").exists());
@@ -1011,7 +981,7 @@ mod tests {
     fn opening_with_a_keychain_and_no_file_copies_its_secrets_into_the_file() {
         let dir = tempfile::tempdir().unwrap();
         let old = old_store(&KEYCHAIN_NAMES);
-        let store = open(dir.path(), Some(&old), VERSION).unwrap();
+        let store = open(dir.path(), Some(&old)).unwrap();
         assert_eq!(
             store.get("machine").unwrap().as_deref(),
             Some("value-of-machine")
@@ -1029,7 +999,7 @@ mod tests {
     fn opening_when_a_keychain_read_fails_gives_the_error_and_writes_no_file() {
         let dir = tempfile::tempdir().unwrap();
         let old = Denying::reads(old_store(&KEYCHAIN_NAMES), "machine");
-        let error = match open(dir.path(), Some(&old), VERSION) {
+        let error = match open(dir.path(), Some(&old)) {
             Ok(_) => panic!("opened a store although the keychain read failed"),
             Err(error) => error,
         };
@@ -1040,99 +1010,95 @@ mod tests {
     #[test]
     fn opening_with_no_keychain_moves_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        let store = open(dir.path(), None, VERSION).unwrap();
+        let store = open(dir.path(), None).unwrap();
         assert_eq!(store.get("machine").unwrap(), None);
         assert!(!dir.path().join("secrets.json").exists());
     }
 
-    fn copied(dir: &tempfile::TempDir) -> bool {
-        dir.path().join("secrets.json.copied").exists()
+    /// A keychain stand-in that must not be read at all.
+    struct Untouchable;
+
+    impl OldStore for Untouchable {
+        fn read(&self, name: &str) -> Result<Option<String>, SecretsError> {
+            panic!("{name} was read from the keychain");
+        }
     }
 
-    #[test]
-    fn a_copy_is_marked_with_the_version_that_made_it_and_no_copy_leaves_no_mark() {
-        let (dir, new) = file();
-        move_secrets(&old_store(&KEYCHAIN_NAMES), &new, VERSION).unwrap();
-        let mark = dir.path().join("secrets.json.copied");
-        assert_eq!(fs::read_to_string(&mark).unwrap(), VERSION);
-        assert_eq!(mode(&mark), 0o600);
-
-        let (dir, new) = file();
-        move_secrets(&MemorySecrets::default(), &new, VERSION).unwrap();
-        assert!(!copied(&dir));
-
-        let (dir, new) = file();
-        new.set(GATEWAY, "sk-file").unwrap();
-        move_secrets(&old_store(&KEYCHAIN_NAMES), &new, VERSION).unwrap();
-        assert!(!copied(&dir));
+    /// `dir` with an update on trial, as `update.json` records one.
+    fn on_trial(dir: &Path) {
+        fs::write(
+            dir.join("update.json"),
+            r#"{"trial": {"version": "0.2.0", "previous": "0.1.0", "starts": 1}}"#,
+        )
+        .unwrap();
     }
 
-    /// A rollback of the version that made the copy removes it, so the next release copies
-    /// the keychain again and sees what the keychain-era release changed in between.
+    /// No copy is made during a trial, so an automatic rollback never leaves an older release
+    /// on a keychain that the file has moved on from.
     #[test]
-    fn a_copy_dropped_by_its_version_is_gone_and_the_next_open_copies_the_keychain_again() {
+    fn during_a_trial_the_keychain_is_never_read_and_the_open_is_refused_with_no_file() {
         let dir = tempfile::tempdir().unwrap();
-        let old = old_store(&KEYCHAIN_NAMES);
-        open(dir.path(), Some(&old), VERSION).unwrap();
-        drop_copy(dir.path(), VERSION).unwrap();
+        on_trial(dir.path());
+
+        let error = open(dir.path(), Some(&Untouchable))
+            .err()
+            .expect("no copy during a trial");
+
+        assert!(matches!(error, SecretsError::NotMoved), "{error}");
         assert!(!dir.path().join("secrets.json").exists());
-        assert!(!copied(&dir));
-        assert_eq!(held_in(&old), held_in(&old_store(&KEYCHAIN_NAMES)));
-
-        // The keychain-era release, running again, changes the key table.
-        Secrets::set(&old, "machine-keys", "revoked-one").unwrap();
-        let store = open(dir.path(), Some(&old), "0.3.0").unwrap();
-        assert_eq!(
-            store.get("machine-keys").unwrap().as_deref(),
-            Some("revoked-one")
-        );
-        assert_eq!(
-            fs::read_to_string(dir.path().join("secrets.json.copied")).unwrap(),
-            "0.3.0"
-        );
     }
 
-    /// A copy an earlier version made is the store the version before the rolled-back one
-    /// used, so it stays, mark and all.
     #[test]
-    fn a_copy_another_version_made_is_left_alone() {
+    fn during_a_trial_the_file_an_earlier_copy_made_is_used() {
         let dir = tempfile::tempdir().unwrap();
-        open(dir.path(), Some(&old_store(&KEYCHAIN_NAMES)), "0.1.0").unwrap();
-        let before = fs::read(dir.path().join("secrets.json")).unwrap();
-        drop_copy(dir.path(), VERSION).unwrap();
-        assert_eq!(fs::read(dir.path().join("secrets.json")).unwrap(), before);
-        assert_eq!(
-            fs::read_to_string(dir.path().join("secrets.json.copied")).unwrap(),
-            "0.1.0"
-        );
+        on_trial(dir.path());
+        FileSecrets::new(dir.path().join("secrets.json"))
+            .set(GATEWAY, "sk-copied")
+            .unwrap();
+
+        let store = open(dir.path(), Some(&Untouchable)).unwrap();
+
+        assert_eq!(store.get(GATEWAY).unwrap().as_deref(), Some("sk-copied"));
     }
 
-    /// A rollback from one release that uses the file to another leaves the file alone.
+    /// A machine with no keychain, such as Linux, takes its updates with no file yet.
     #[test]
-    fn dropping_with_no_mark_leaves_the_file_alone() {
-        let (dir, new) = file();
-        new.set(GATEWAY, "sk-file").unwrap();
-        drop_copy(dir.path(), VERSION).unwrap();
-        assert_eq!(new.get(GATEWAY).unwrap().as_deref(), Some("sk-file"));
-    }
-
-    /// A start that stopped between the mark and the file leaves a mark alone: dropping it
-    /// works, and so does the next copy.
-    #[test]
-    fn a_mark_with_no_file_is_dropped_and_copied_over() {
+    fn during_a_trial_a_machine_with_no_keychain_opens_with_no_file() {
         let dir = tempfile::tempdir().unwrap();
-        let mark = dir.path().join("secrets.json.copied");
-        fs::write(&mark, VERSION).unwrap();
-        drop_copy(dir.path(), VERSION).unwrap();
-        assert!(!mark.exists());
+        on_trial(dir.path());
 
-        fs::write(&mark, "0.1.0").unwrap();
-        let store = open(dir.path(), Some(&old_store(&KEYCHAIN_NAMES)), VERSION).unwrap();
-        assert_eq!(
-            store.get("machine").unwrap().as_deref(),
-            Some("value-of-machine")
-        );
-        assert_eq!(fs::read_to_string(&mark).unwrap(), VERSION);
+        let store = open(dir.path(), None).unwrap();
+
+        assert_eq!(store.get("machine").unwrap(), None);
+        assert!(!dir.path().join("secrets.json").exists());
+    }
+
+    /// When it cannot tell whether a trial is on, it does not copy.
+    #[test]
+    fn an_unreadable_update_state_refuses_the_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("update.json"), "not json").unwrap();
+
+        let error = open(dir.path(), Some(&Untouchable))
+            .err()
+            .expect("no copy when the trial cannot be read");
+
+        assert!(matches!(error, SecretsError::NotMoved), "{error}");
+    }
+
+    /// A keychain-era release's keychain writes hold `secrets.lock`, so the copy waits on it.
+    #[test]
+    fn the_copy_waits_on_the_keychain_era_lock_and_copies_nothing_while_another_holds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = lock_file(&dir.path().join("secrets.lock"), LOCK_WAIT).unwrap();
+
+        let error = open(dir.path(), Some(&old_store(&KEYCHAIN_NAMES)))
+            .err()
+            .expect("the lock is held");
+
+        assert!(matches!(error, SecretsError::Locked { .. }), "{error:?}");
+        assert!(!dir.path().join("secrets.json").exists());
+        drop(held);
     }
 
     /// `foundryd secret set` can run before the first `foundryd run`, which refuses a data
