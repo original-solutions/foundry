@@ -11,6 +11,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -319,7 +320,7 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
     tracing::info!("listening on {local}");
     let mut tailscale = Tailscale::new(port, app.clone());
     tailscale.scan(true, tailscale_ips().await).await;
-    let answered = tailscale.answered.clone();
+    let (answered, away) = (tailscale.answered.clone(), tailscale.away.clone());
     let mut services: JoinSet<&'static str> = JoinSet::new();
     // services
     services.spawn(named(
@@ -334,7 +335,7 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
     services.spawn(named("the Tailscale address watch", tailscale.watch()));
     services.spawn(named(
         "the machine list entry",
-        list_this_machine(answered, listing),
+        list_this_machine(answered, away, listing),
     ));
     services.spawn(named("updates", update::run(home.clone())));
     services.spawn(named("gateway health", gateway_reader.run()));
@@ -614,15 +615,19 @@ async fn run_cli(cli: &Path, args: &[&str], within: Duration) -> Result<Vec<u8>,
 }
 
 /// Keeps this machine in the shared machine list: each time the address watch hears from
-/// Tailscale (`answered`), reads what Tailscale calls this machine and hands it to `listing`.
-/// It runs apart from the watch, so an edit waiting on the coordinator never holds up binding
-/// an address.
+/// Tailscale (`answered`), reads what Tailscale calls this machine and hands it to `listing`,
+/// first telling it when Tailscale was away since the last look (`away`). It runs apart from
+/// the watch, so an edit waiting on the coordinator never holds up binding an address.
 async fn list_this_machine(
     answered: Arc<tokio::sync::Notify>,
+    away: Arc<AtomicBool>,
     mut listing: api::machine_names::Listing,
 ) {
     loop {
         answered.notified().await;
+        if away.swap(false, Ordering::Relaxed) {
+            listing.away();
+        }
         let entry = ask_status(&tailscale_cli(), ASK_WITHIN)
             .await
             .and_then(|status| {
@@ -651,6 +656,8 @@ struct Tailscale {
     servers: JoinSet<SocketAddr>,
     /// Told each time Tailscale answers, so the machine list entry is kept up to date.
     answered: Arc<tokio::sync::Notify>,
+    /// Set when an ask of Tailscale fails, until the machine list entry's keeper reads it.
+    away: Arc<AtomicBool>,
 }
 
 impl Tailscale {
@@ -663,6 +670,7 @@ impl Tailscale {
             unanswered: false,
             servers: JoinSet::new(),
             answered: Arc::new(tokio::sync::Notify::new()),
+            away: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -690,6 +698,7 @@ impl Tailscale {
                     );
                 }
                 self.unanswered = true;
+                self.away.store(true, Ordering::Relaxed);
                 BTreeSet::new()
             }
         };
@@ -1171,18 +1180,14 @@ mod tests {
     #[tokio::test]
     async fn an_ask_that_fails_marks_tailscale_away_until_the_mark_is_read() {
         let mut tailscale = Tailscale::new(7433, Router::new());
-        assert!(!tailscale.away.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!tailscale.away.load(Ordering::Relaxed));
 
         tailscale.scan(false, Err("logged out".to_owned())).await;
         tailscale.scan(false, Ok(BTreeSet::new())).await;
 
-        assert!(
-            tailscale
-                .away
-                .swap(false, std::sync::atomic::Ordering::Relaxed)
-        );
+        assert!(tailscale.away.swap(false, Ordering::Relaxed));
         tailscale.scan(false, Ok(BTreeSet::new())).await;
-        assert!(!tailscale.away.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!tailscale.away.load(Ordering::Relaxed));
     }
 
     /// After Tailscale answers again, a new failure is worth a new warning.

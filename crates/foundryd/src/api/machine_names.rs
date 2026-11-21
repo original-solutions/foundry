@@ -14,12 +14,13 @@
 //! Both decide from this machine's copy of the settings and send the whole entry, as
 //! `SetMachine` carries it. So the listing gives peers' copies time to arrive before it
 //! decides: it sends an edit only from a look at least the settle time after the look that
-//! first found it needed. A machine renamed elsewhere while it was away, or added to the list
-//! by a peer, finds that entry when a peer can reach it within that time. What stays open: a rename sent from a copy that has not yet heard of the
-//! machine's new address puts the old address back until the machine's next look moves it
-//! again, and an edit numbered elsewhere between a look's read and its send is replaced. The
-//! default name is not checked as a rename is: a default another machine already has, or one
-//! over [`NAME_AT_MOST`] characters, is listed as it is, and a rename sets it right.
+//! first found it needed, and that wait starts over when Tailscale was away. A machine renamed
+//! elsewhere while it was away, or added to the list by a peer, finds that entry when a peer
+//! can reach it within that time. What stays open: a rename sent from a copy that has not yet
+//! heard of the machine's new address puts the old address back until the machine's next look
+//! moves it again, and an edit numbered elsewhere between a look's read and its send is
+//! replaced. The default name is not checked as a rename is: a default another machine already
+//! has, or one over [`NAME_AT_MOST`] characters, is listed as it is, and a rename sets it right.
 
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
@@ -128,9 +129,9 @@ impl Listing {
     /// A failure, or no entry, is logged once until a look succeeds; the next look tries again.
     ///
     /// The look that first finds an edit to send sends nothing: one at least the settle time
-    /// later that still finds it sends it, so peers' copies can arrive first, whatever kept this
-    /// machine away. A look that finds nothing to send, or sends, ends the wait; a failed send
-    /// does not, so the next look tries again.
+    /// later that still finds it sends it, so peers' copies can arrive first. A look that finds
+    /// nothing to send, or sends, ends the wait; a failed send does not, so the next look tries
+    /// again. [`Listing::away`] starts the wait over.
     pub async fn list(&mut self, entry: Result<Entry, String>) {
         match self.look(entry).await {
             Ok(()) => self.warned = false,
@@ -143,6 +144,12 @@ impl Listing {
                 self.warned = true;
             }
         }
+    }
+
+    /// Tailscale was away, so no peer could link: an edit found before waits again from the
+    /// next look that finds it.
+    pub fn away(&mut self) {
+        self.found = None;
     }
 
     async fn look(&mut self, entry: Result<Entry, String>) -> Result<(), String> {
