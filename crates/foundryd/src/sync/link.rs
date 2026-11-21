@@ -64,7 +64,7 @@ async fn sending(inner: &Inner, send: &Sender<String>, open: &Open) {
     let mut every = tokio::time::interval(TICK);
     loop {
         every.tick().await;
-        if !listed(inner, open.peer).await {
+        if !links_with(inner, open.peer).await {
             tracing::info!("sync: {} left the machine list; link closed", open.peer);
             return;
         }
@@ -234,9 +234,15 @@ struct Open {
     sent: u64,
 }
 
-/// Exchanges hellos, and refuses a peer that is not in the machine list, is this machine, or
-/// is not the machine that was dialed. A hello does not count as hearing from the peer: that
-/// waits for a message this machine takes.
+/// Exchanges hellos, and refuses a peer that is not in the machine list ([`links_with`]), is
+/// this machine, or is not the machine that was dialed. A hello does not count as hearing from
+/// the peer: that waits for a message this machine takes.
+///
+/// A machine whose list holds no machine but itself takes a record link from any machine. A
+/// link reaches `hello` only after `Keys::accept` has proved a key this machine holds, so
+/// after `foundryd join` the only machine it lets in is the one that admitted it. The joined
+/// machine then takes that machine's settings through the normal merge, and the current rule,
+/// the machine list, applies from then on.
 async fn hello(
     inner: &Inner,
     send: &Sender<String>,
@@ -267,7 +273,7 @@ async fn hello(
     };
     let allowed = match dialed {
         Some(expected) => machine == expected,
-        None => machine != inner.me && listed(inner, machine).await,
+        None => machine != inner.me && links_with(inner, machine).await,
     };
     if !allowed {
         tracing::warn!("sync: refused a link from {machine}: not a peer of this machine");
@@ -300,43 +306,60 @@ async fn own_hello(inner: &Inner, protocol: u16) -> Option<PeerMessage> {
 
 type ListedCache = (u64, std::collections::BTreeSet<MachineId>);
 
-/// Checks whether `machine` is listed in `store`'s shared settings, reusing `cached` while the
-/// settings are unchanged, and gives back the machine ids when it read them again.
-fn listed_in_store(
+/// The machine ids in `store`'s shared settings, reusing `cached` while the settings are
+/// unchanged, and the ids to cache when it read them again.
+fn ids_in_store(
     store: &crate::store::Store,
-    machine: MachineId,
     cached: Option<&ListedCache>,
-) -> Result<(bool, Option<ListedCache>), crate::store::StoreError> {
+) -> Result<(std::collections::BTreeSet<MachineId>, Option<ListedCache>), crate::store::StoreError>
+{
     Ok(match store.settings_since(cached.map(|(seq, _)| *seq))? {
-        None => (cached.is_some_and(|(_, ids)| ids.contains(&machine)), None),
+        None => (cached.map(|(_, ids)| ids.clone()).unwrap_or_default(), None),
         Some(settings) => {
             let ids: std::collections::BTreeSet<MachineId> =
                 settings.machines.into_iter().map(|m| m.id).collect();
-            (ids.contains(&machine), Some((settings.seq, ids)))
+            (ids.clone(), Some((settings.seq, ids)))
         }
     })
 }
 
-/// Whether `machine` is in the machine list: the one rule for who is a peer, for record links
-/// and relays alike.
-pub(super) async fn listed(inner: &Inner, machine: MachineId) -> bool {
+/// The machine ids in the machine list, through the cache, or `None` when it cannot be read.
+async fn listed_ids(inner: &Inner) -> Option<std::collections::BTreeSet<MachineId>> {
     let cached = super::lock(&inner.listed_cache).clone();
     let result = on_store(&inner.store, move |store| {
-        listed_in_store(store, machine, cached.as_ref())
+        ids_in_store(store, cached.as_ref())
     })
     .await;
     match result {
-        Ok((present, updated)) => {
+        Ok((ids, updated)) => {
             if let Some(cache) = updated {
                 *super::lock(&inner.listed_cache) = Some(cache);
             }
-            present
+            Some(ids)
         }
         Err(error) => {
             tracing::warn!("sync: cannot read the machine list: {error}");
-            false
+            None
         }
     }
+}
+
+/// Whether `machine` is in the machine list: the rule for who is a peer for calls and relays,
+/// and for record links once the list holds another machine ([`links_with`]).
+pub(super) async fn listed(inner: &Inner, machine: MachineId) -> bool {
+    listed_ids(inner)
+        .await
+        .is_some_and(|ids| ids.contains(&machine))
+}
+
+/// Whether a record link with `machine` is allowed: it is in the machine list, or the list
+/// holds no machine but this one (or is empty), so a machine just joined takes a link from the
+/// machine that admitted it before it has that machine's settings. A list that cannot be read
+/// allows nothing.
+async fn links_with(inner: &Inner, machine: MachineId) -> bool {
+    listed_ids(inner)
+        .await
+        .is_some_and(|ids| ids.contains(&machine) || ids.iter().all(|id| *id == inner.me))
 }
 
 /// Sends `message`, and says whether the link is still open. A message that cannot be
