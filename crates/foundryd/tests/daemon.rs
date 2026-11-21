@@ -1124,3 +1124,34 @@ fn the_attention_routes_refuse_a_request_from_another_site() {
     assert_eq!(ask("GET", "/api/attention", foreign), 403);
     assert_eq!(ask("POST", "/api/attention/x/dismiss", foreign), 403);
 }
+
+#[test]
+fn the_project_routes_refuse_a_request_from_another_site() {
+    use std::io::{Read as _, Write as _};
+    let mut fixture = Fixture::new();
+    fixture.start();
+    let ask = |path: &str, host: &str, origin: Option<&str>| {
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", fixture.port)).unwrap();
+        let origin = origin.map_or_else(String::new, |o| format!("Origin: {o}\r\n"));
+        let body = r#"{"name": "", "repo": ""}"#;
+        write!(
+            stream,
+            "POST {path} HTTP/1.1\r\nHost: {host}\r\n{origin}Connection: close\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        response.split(' ').nth(1).unwrap().parse::<u16>().unwrap()
+    };
+    let here = format!("127.0.0.1:{}", fixture.port);
+    let foreign = Some("http://evil.example");
+    // Served here: a project with no name is refused by the route itself.
+    assert_eq!(ask("/api/projects", &here, None), 422);
+    assert_eq!(ask("/api/projects", &here, foreign), 403);
+    assert_eq!(ask("/api/projects", "evil.example", None), 403);
+    let remove = format!("/api/projects/{}/remove", ProjectId::random());
+    assert_eq!(ask(&remove, &here, foreign), 403);
+    assert_eq!(ask(&remove, "evil.example", None), 403);
+}

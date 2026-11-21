@@ -109,6 +109,7 @@ mod changes;
 mod files;
 mod machine;
 mod pr;
+pub mod projects;
 pub mod terminals;
 #[cfg(test)]
 mod tests;

@@ -277,6 +277,55 @@ async fn an_edit_with_no_open_link_to_the_acting_machine_is_an_error() {
     assert!(error.to_string().contains(&first.to_string()), "{error}");
 }
 
+/// The UI's add goes through the machine that serves it; the acting machine numbers it.
+#[tokio::test]
+async fn a_project_added_through_a_machine_that_is_not_acting_shows_on_the_acting_machine() {
+    let fleet = Fleet::start_coordinated(2);
+    let first = fleet.daemons[0].id;
+    settled(&fleet, first).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/api/projects", listener.local_addr().unwrap());
+    let app = foundryd::api::projects::router(
+        fleet.daemons[1].coordinator(),
+        fleet.daemons[1].store.clone(),
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let (status, body) = tokio::task::spawn_blocking(move || {
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .timeout_global(Some(WAIT))
+            .build()
+            .into();
+        let mut response = agent
+            .post(&url)
+            .send_json(serde_json::json!({"name": "foundry", "repo": "/srv/foundry.git"}))
+            .unwrap();
+        let status = response.status().as_u16();
+        (status, response.body_mut().read_to_string().unwrap())
+    })
+    .await
+    .unwrap();
+    assert_eq!(status, 201, "{body}");
+    let id: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let id = ProjectId(id["id"].as_str().unwrap().parse().unwrap());
+
+    until(WAIT, "the project reaches the acting machine", || {
+        fleet.daemons[0]
+            .settings()
+            .projects
+            .iter()
+            .any(|p| p.id == id && p.name == "foundry" && p.repo == "/srv/foundry.git")
+    })
+    .await;
+    let settings = agreed(&fleet, &[0, 1], "both machines agree").await;
+    assert_eq!(
+        settings.stamps[&StampKey::Setting(SettingKey::Project(id))].by,
+        first
+    );
+    server.abort();
+}
+
 #[tokio::test(start_paused = true)]
 async fn an_edit_that_cannot_be_written_is_an_error_not_sent() {
     let fleet = Fleet::start_coordinated(2);
