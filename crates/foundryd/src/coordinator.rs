@@ -47,8 +47,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use foundry_proto::ids::MachineId;
+use foundry_proto::ids::{MachineId, ProjectId};
 use foundry_proto::messages::ANSWERS_SINCE;
+use foundry_proto::record::{Record, Workspace};
 use foundry_proto::settings::{
     Edit, EditId, Outcome, Overwritten, SettingKey, SettingValue, SharedSettings, Stamp, StampKey,
 };
@@ -907,13 +908,19 @@ fn breaks(
         Edit::SetProject { project } if !held.projects.iter().any(|p| p.id == project.id) => held
             .project_named(&project.name)
             .map(|_| "holds another project with that name"),
-        Edit::RemoveProject { id } => store
-            .live_workspaces()?
-            .iter()
-            .any(|w| w.body.project == *id)
+        Edit::RemoveProject { id } => (!holding(store, *id)?.is_empty())
             .then_some("holds a live workspace made from that project"),
         _ => None,
     })
+}
+
+/// The live workspaces in `store`, from any machine, made from `project`: the one rule for
+/// which workspaces keep a project from being removed. The route that serves a remove and the
+/// acting machine's check ([`breaks`]) both read it.
+pub fn holding(store: &Store, project: ProjectId) -> Result<Vec<Record<Workspace>>, StoreError> {
+    let mut live = store.live_workspaces()?;
+    live.retain(|w| w.body.project == project);
+    Ok(live)
 }
 
 /// What one look at a waiting edit found.
@@ -2315,6 +2322,18 @@ mod tests {
             .await
             .unwrap();
         assert!(coordinator.held().await.unwrap().projects.is_empty());
+    }
+
+    #[test]
+    fn a_project_is_held_only_by_its_own_live_workspaces() {
+        let (_dir, coordinator) = alone_with(&[project(1, "foundry"), project(2, "api")]);
+        workspace_of(&coordinator, 1, true);
+        workspace_of(&coordinator, 2, false);
+        let store = lock(&coordinator.store);
+        assert!(holding(&store, project(1, "").id).unwrap().is_empty());
+        let held = holding(&store, project(2, "").id).unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].body.project, project(2, "").id);
     }
 
     #[tokio::test(start_paused = true)]

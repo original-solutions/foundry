@@ -38,7 +38,7 @@ use foundry_proto::settings::{Edit, Project};
 use serde::Deserialize;
 
 use super::{ApiError, Body, created, edit_status, on_store, parse_id, unprocessable};
-use crate::coordinator::Coordinator;
+use crate::coordinator::{Coordinator, holding};
 use crate::store::Store;
 
 /// The most characters a project's name holds.
@@ -119,16 +119,15 @@ async fn remove(
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
     let id = parse_id(&id, "project", ProjectId)?;
-    let (settings, live) = on_store(&projects.store, |store| {
-        Ok((store.settings()?, store.live_workspaces()?))
+    let (settings, live) = on_store(&projects.store, move |store| {
+        Ok((store.settings()?, holding(store, id)?))
     })
     .await?;
     let Some(project) = settings.projects.iter().find(|p| p.id == id) else {
         return Err(ApiError::NotFound(format!("no project {id} here")));
     };
-    let holding: Vec<String> = live
+    let names: Vec<String> = live
         .iter()
-        .filter(|w| w.body.project == id)
         .map(|w| {
             let machine = settings
                 .machines
@@ -138,11 +137,11 @@ async fn remove(
             format!("{:?} on {machine}", w.body.name)
         })
         .collect();
-    if !holding.is_empty() {
+    if !names.is_empty() {
         return Err(conflict(format!(
             "{} still has live workspaces: {}; archive them first",
             project.name,
-            holding.join(", ")
+            names.join(", ")
         )));
     }
     edit(&projects, Edit::RemoveProject { id }).await?;
