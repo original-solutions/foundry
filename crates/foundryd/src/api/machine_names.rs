@@ -12,16 +12,19 @@
 //!   refused, and an edit the coordinator could not make answers through [`edit_status`].
 //!
 //! Both decide from this machine's copy of the settings and send the whole entry, as
-//! `SetMachine` carries it. So the listing waits until peers have had time to send their
-//! copies before its first look: a machine renamed elsewhere while it was away, or added to the
-//! list by a peer, finds that entry before it decides anything. What stays open: a rename sent
-//! from a copy that has not yet heard of the machine's new address puts the old address back
-//! until the machine's next look moves it again, and an edit numbered elsewhere between a look's
-//! read and its send is replaced. The listing's default name is not checked as a rename is: two
-//! machines that fall back to one host name are both listed under it.
+//! `SetMachine` carries it. So the listing gives peers' copies time to arrive before it
+//! decides: its first look, the first after Tailscale was away, and the one after each edit it
+//! sent do nothing, and it acts on a look the settle time later. A machine renamed elsewhere
+//! while it was away, or added to the list by a peer, finds that entry when a peer can reach it
+//! within that time. What stays open: a rename sent from a copy that has not yet heard of the
+//! machine's new address puts the old address back until the machine's next look moves it
+//! again, and an edit numbered elsewhere between a look's read and its send is replaced. The
+//! default name is not checked as a rename is: a default another machine already has, or one
+//! over [`NAME_AT_MOST`] characters, is listed as it is, and a rename sets it right.
 
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::Router;
 use axum::extract::{Path, State};
@@ -31,6 +34,7 @@ use axum::routing::post;
 use foundry_proto::ids::MachineId;
 use foundry_proto::settings::{Edit, Machine};
 use serde::Deserialize;
+use tokio::time::Instant;
 
 use super::{ApiError, Body, edit_status, on_store, parse_id, unprocessable};
 use crate::coordinator::Coordinator;
@@ -49,8 +53,8 @@ pub struct Entry {
 }
 
 /// Reads `tailscale status --self --json`: the first label of `Self.DNSName` as the name
-/// (`personal-mac.tail459612.ts.net.` gives `personal-mac`), else `host`, cut to
-/// [`NAME_AT_MOST`] characters, and the first IPv4 in `Self.TailscaleIPs` as the address.
+/// (`personal-mac.tail459612.ts.net.` gives `personal-mac`), else `host`, and the first IPv4
+/// in `Self.TailscaleIPs` as the address.
 /// `Self.HostName` is a display name with spaces, so it is not used.
 pub fn entry(status: &[u8], host: Option<&str>) -> Result<Entry, String> {
     #[derive(Deserialize)]
@@ -83,7 +87,7 @@ pub fn entry(status: &[u8], host: Option<&str>) -> Result<Entry, String> {
         .find(|ip| ip.parse::<Ipv4Addr>().is_ok())
         .ok_or("Tailscale reports no IPv4 address for this machine")?;
     Ok(Entry {
-        name: name.chars().take(NAME_AT_MOST).collect(),
+        name: name.to_owned(),
         address: address.clone(),
     })
 }
@@ -95,38 +99,58 @@ pub struct Listing {
     store: Arc<Mutex<Store>>,
     /// Whether the last look failed, so a failure is warned about once until a look succeeds.
     warned: bool,
-    /// Until when a look does nothing, so peers' copies of the settings can arrive first.
-    settled: tokio::time::Instant,
+    /// How long peers' copies get to arrive before a look acts.
+    settle: Duration,
+    /// When the last look came, so a look after a longer gap than `settle` waits again.
+    looked: Option<Instant>,
+    /// Until when a look does nothing.
+    settled: Instant,
 }
 
 impl Listing {
-    /// A listing whose looks do nothing for `settle` from now: the daemon passes
+    /// A listing that gives peers' copies `settle` to arrive: the daemon passes
     /// [`OFFLINE_AFTER`](crate::sync::OFFLINE_AFTER), the time a peer has to be heard from.
     pub fn new(
         me: MachineId,
         coordinator: Arc<Coordinator>,
         store: Arc<Mutex<Store>>,
-        settle: std::time::Duration,
+        settle: Duration,
     ) -> Self {
         Self {
             me,
             coordinator,
             store,
             warned: false,
-            settled: tokio::time::Instant::now() + settle,
+            settle,
+            looked: None,
+            settled: Instant::now(),
         }
     }
 
     /// Adds this machine to the list under `entry`'s name when the list does not hold it, and
     /// moves it to `entry`'s address, keeping its name, when the address it holds differs.
     /// A failure, or no entry, is logged once until a look succeeds; the next look tries again.
-    /// A look before the settle time does nothing.
+    ///
+    /// The first look, a look more than the settle time after the one before (Tailscale was
+    /// away, so no peer could link), and every look within the settle time after one of those,
+    /// or after an edit this sent, do nothing.
     pub async fn list(&mut self, entry: Result<Entry, String>) {
-        if tokio::time::Instant::now() < self.settled {
+        let now = Instant::now();
+        if self.looked.is_none_or(|at| now - at > self.settle) {
+            self.settled = now + self.settle;
+        }
+        self.looked = Some(now);
+        if now < self.settled {
             return;
         }
         match self.send(entry).await {
-            Ok(()) => self.warned = false,
+            Ok(sent) => {
+                self.warned = false;
+                if sent {
+                    // The copy that holds the edit can come after its answer.
+                    self.settled = Instant::now() + self.settle;
+                }
+            }
             Err(why) => {
                 if !self.warned {
                     tracing::warn!(
@@ -138,7 +162,8 @@ impl Listing {
         }
     }
 
-    async fn send(&self, entry: Result<Entry, String>) -> Result<(), String> {
+    /// Sends the edit this look calls for, if any: whether it sent one.
+    async fn send(&self, entry: Result<Entry, String>) -> Result<bool, String> {
         let entry = entry?;
         let settings = on_store(&self.store, |store| store.settings())
             .await
@@ -153,12 +178,12 @@ impl Listing {
                 address: entry.address,
                 ..held.clone()
             },
-            Some(_) => return Ok(()),
+            Some(_) => return Ok(false),
         };
         self.coordinator
             .edit(Edit::SetMachine { machine })
             .await
-            .map(drop)
+            .map(|_| true)
             .map_err(|e| e.to_string())
     }
 }
@@ -618,7 +643,11 @@ mod tests {
         assert!(!served.settings().machines.iter().any(|m| m.id == served.me));
     }
 
-    const SETTLE: Duration = Duration::from_millis(300);
+    const SETTLE: Duration = Duration::from_millis(400);
+
+    /// Looks are this far apart while Tailscale answers, as the daemon's rescans are well
+    /// inside its settle time.
+    const STEP: Duration = Duration::from_millis(250);
 
     #[tokio::test]
     async fn the_first_look_waits_the_settle_time_however_long_after_the_start_it_comes() {
@@ -630,8 +659,7 @@ mod tests {
 
         listing.list(here("personal-mac", "100.91.54.18")).await;
         assert_eq!(served.settings().seq, seq, "the first look sends nothing");
-
-        tokio::time::sleep(SETTLE / 2).await;
+        tokio::time::sleep(STEP).await;
         listing.list(here("personal-mac", "100.91.54.18")).await;
         assert_eq!(
             served.settings().seq,
@@ -639,7 +667,7 @@ mod tests {
             "nor does one inside the settle time"
         );
 
-        tokio::time::sleep(SETTLE).await;
+        tokio::time::sleep(STEP).await;
         listing.list(here("personal-mac", "100.91.54.18")).await;
         assert_eq!(
             served.settings().machines,
@@ -652,9 +680,10 @@ mod tests {
         let served = Served::new(|_, _| {}).await;
         let seq = served.settings().seq;
         let mut listing = served.listing_after(SETTLE);
-        listing.list(Err("not yet".to_owned())).await;
-        tokio::time::sleep(SETTLE + SETTLE / 2).await;
-        listing.list(Err("still not".to_owned())).await;
+        for _ in 0..3 {
+            listing.list(Err("not yet".to_owned())).await;
+            tokio::time::sleep(STEP).await;
+        }
 
         // Tailscale went away: no look for longer than the settle time.
         tokio::time::sleep(SETTLE * 2).await;
@@ -664,8 +693,15 @@ mod tests {
             seq,
             "the first look after the gap sends nothing"
         );
+        tokio::time::sleep(STEP).await;
+        listing.list(here("personal-mac", "100.91.54.18")).await;
+        assert_eq!(
+            served.settings().seq,
+            seq,
+            "nor does one inside the settle time"
+        );
 
-        tokio::time::sleep(SETTLE + SETTLE / 4).await;
+        tokio::time::sleep(STEP).await;
         listing.list(here("personal-mac", "100.91.54.18")).await;
         assert_eq!(served.settings().machines.len(), 1);
     }
@@ -674,9 +710,10 @@ mod tests {
     async fn after_a_send_the_next_look_waits_for_the_copy_that_holds_it() {
         let served = Served::new(|_, _| {}).await;
         let mut listing = served.listing_after(SETTLE);
-        listing.list(here("personal-mac", "100.91.54.18")).await;
-        tokio::time::sleep(SETTLE + SETTLE / 4).await;
-        listing.list(here("personal-mac", "100.91.54.18")).await;
+        for _ in 0..3 {
+            listing.list(here("personal-mac", "100.91.54.18")).await;
+            tokio::time::sleep(STEP).await;
+        }
         assert_eq!(served.settings().machines.len(), 1);
 
         // This copy does not hold the entry yet, as a forwarded edit's copy can lag its answer.
@@ -696,6 +733,13 @@ mod tests {
             served.settings().seq,
             seq,
             "the look right after a send sends nothing"
+        );
+        tokio::time::sleep(STEP).await;
+        listing.list(here("personal-mac", "100.91.54.18")).await;
+        assert_eq!(
+            served.settings().machines.len(),
+            1,
+            "a later look lists it again"
         );
     }
 
