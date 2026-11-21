@@ -1,3 +1,211 @@
+//! Machine names: each machine adds itself to the shared machine list under its Tailscale
+//! short name, and anyone can rename a listed machine from the UI. Both go through the acting
+//! coordinator, as every shared-settings change does.
+//!
+//! - [`Listing`] keeps this machine in the list. Fed what [`entry`] reads from
+//!   `tailscale status --self --json`, it adds the machine when the list does not hold it,
+//!   moves its address when that changed, and never touches a name already set.
+//! - `POST /api/machines/{id}/rename` `{name}`: sets a listed machine's name, trimmed, and
+//!   keeps its address, `204`. A name that is blank, over [`NAME_AT_MOST`] characters or holds
+//!   a control character is `422`; a name another machine has, compared trimmed and in any
+//!   case, is `409`; an id the list does not hold is `404`. Nothing is sent when a rename is
+//!   refused, and an edit the coordinator could not make answers through [`edit_status`].
+
+use std::net::Ipv4Addr;
+use std::sync::{Arc, Mutex};
+
+use axum::Router;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::routing::post;
+use foundry_proto::ids::MachineId;
+use foundry_proto::settings::{Edit, Machine};
+use serde::Deserialize;
+
+use super::{ApiError, Body, edit_status, on_store, parse_id, unprocessable};
+use crate::coordinator::Coordinator;
+use crate::store::Store;
+
+/// The most characters a machine's name holds.
+pub const NAME_AT_MOST: usize = 60;
+
+/// What Tailscale says this machine is called and where it is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Entry {
+    /// Its default name: the first label of its MagicDNS name.
+    pub name: String,
+    /// Its Tailscale IPv4 address.
+    pub address: String,
+}
+
+/// Reads `tailscale status --self --json`: the first label of `Self.DNSName` as the name
+/// (`personal-mac.tail459612.ts.net.` gives `personal-mac`), else `host`, and the first IPv4
+/// in `Self.TailscaleIPs` as the address. `Self.HostName` is a display name with spaces, so it
+/// is not used.
+pub fn entry(status: &[u8], host: Option<&str>) -> Result<Entry, String> {
+    #[derive(Deserialize)]
+    struct Status {
+        #[serde(rename = "Self")]
+        me: Node,
+    }
+    #[derive(Deserialize)]
+    struct Node {
+        #[serde(rename = "DNSName", default)]
+        dns_name: String,
+        #[serde(rename = "TailscaleIPs", default)]
+        ips: Vec<String>,
+    }
+    let status: Status = serde_json::from_slice(status).map_err(|e| {
+        format!("`tailscale status --self --json` did not say what this machine is: {e}")
+    })?;
+    let name = status
+        .me
+        .dns_name
+        .split('.')
+        .next()
+        .filter(|label| !label.is_empty())
+        .or(host.filter(|host| !host.is_empty()))
+        .ok_or("Tailscale gives this machine no DNS name and it has no host name")?;
+    let address = status
+        .me
+        .ips
+        .iter()
+        .find(|ip| ip.parse::<Ipv4Addr>().is_ok())
+        .ok_or("Tailscale reports no IPv4 address for this machine")?;
+    Ok(Entry {
+        name: name.to_owned(),
+        address: address.clone(),
+    })
+}
+
+/// Keeps this machine in the shared machine list, at the address Tailscale gives it.
+pub struct Listing {
+    me: MachineId,
+    coordinator: Arc<Coordinator>,
+    store: Arc<Mutex<Store>>,
+    /// Whether the last look failed, so a failure is warned about once until a look succeeds.
+    warned: bool,
+}
+
+impl Listing {
+    pub fn new(me: MachineId, coordinator: Arc<Coordinator>, store: Arc<Mutex<Store>>) -> Self {
+        Self {
+            me,
+            coordinator,
+            store,
+            warned: false,
+        }
+    }
+
+    /// Adds this machine to the list under `entry`'s name when the list does not hold it, and
+    /// moves it to `entry`'s address, keeping its name, when the address it holds differs.
+    /// A failure, or no entry, is logged once until a look succeeds; the next look tries again.
+    pub async fn list(&mut self, entry: Result<Entry, String>) {
+        match self.send(entry).await {
+            Ok(()) => self.warned = false,
+            Err(why) => {
+                if !self.warned {
+                    tracing::warn!(
+                        "cannot keep this machine in the machine list, trying again on the next Tailscale rescan: {why}"
+                    );
+                }
+                self.warned = true;
+            }
+        }
+    }
+
+    async fn send(&self, entry: Result<Entry, String>) -> Result<(), String> {
+        let entry = entry?;
+        let settings = on_store(&self.store, |store| store.settings())
+            .await
+            .map_err(|e| e.to_string())?;
+        let machine = match settings.machines.iter().find(|m| m.id == self.me) {
+            None => Machine {
+                id: self.me,
+                name: entry.name,
+                address: entry.address,
+            },
+            Some(held) if held.address != entry.address => Machine {
+                address: entry.address,
+                ..held.clone()
+            },
+            Some(_) => return Ok(()),
+        };
+        self.coordinator
+            .edit(Edit::SetMachine { machine })
+            .await
+            .map(drop)
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// What the rename route acts on: the coordinator that sends the edit and the store whose
+/// machine list says whether to send it.
+struct Names {
+    coordinator: Arc<Coordinator>,
+    store: Arc<Mutex<Store>>,
+}
+
+/// `POST /api/machines/{id}/rename`. The caller guards it as it guards the rest of the API.
+pub fn router(coordinator: Arc<Coordinator>, store: Arc<Mutex<Store>>) -> Router {
+    Router::new()
+        .route("/api/machines/{id}/rename", post(rename))
+        .with_state(Arc::new(Names { coordinator, store }))
+}
+
+#[derive(Deserialize)]
+struct Rename {
+    name: String,
+}
+
+async fn rename(
+    State(names): State<Arc<Names>>,
+    Path(id): Path<String>,
+    Body(rename): Body<Rename>,
+) -> Result<Response, ApiError> {
+    let id = parse_id(&id, "machine", MachineId)?;
+    let name = rename.name.trim();
+    if name.is_empty() {
+        return Err(unprocessable("a machine needs a name".to_owned()));
+    }
+    if name.chars().count() > NAME_AT_MOST {
+        return Err(unprocessable(format!(
+            "a machine's name is at most {NAME_AT_MOST} characters"
+        )));
+    }
+    if name.chars().any(char::is_control) {
+        return Err(unprocessable(
+            "a machine's name holds no line breaks, tabs or other control characters".to_owned(),
+        ));
+    }
+    let settings = on_store(&names.store, |store| store.settings()).await?;
+    let Some(held) = settings.machines.iter().find(|m| m.id == id) else {
+        return Err(ApiError::NotFound(format!(
+            "no machine {id} in the machine list"
+        )));
+    };
+    let wanted = name.to_lowercase();
+    if let Some(other) = settings
+        .machines
+        .iter()
+        .find(|m| m.id != id && m.name.trim().to_lowercase() == wanted)
+    {
+        return Err(ApiError::Rejected(
+            StatusCode::CONFLICT,
+            format!("another machine is named {:?}", other.name),
+        ));
+    }
+    let machine = Machine {
+        name: name.to_owned(),
+        ..held.clone()
+    };
+    match names.coordinator.edit(Edit::SetMachine { machine }).await {
+        Ok(_) => Ok(StatusCode::NO_CONTENT.into_response()),
+        Err(e) => Err(ApiError::Rejected(edit_status(&e), e.to_string())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -84,7 +292,10 @@ mod tests {
     #[test]
     fn an_answer_that_is_not_status_json_is_no_entry() {
         for answer in ["", "Tailscale is stopped.", r#"{"Version": "1.90.6"}"#] {
-            assert!(entry(answer.as_bytes(), Some("host")).is_err(), "{answer:?}");
+            assert!(
+                entry(answer.as_bytes(), Some("host")).is_err(),
+                "{answer:?}"
+            );
         }
     }
 
@@ -290,7 +501,10 @@ mod tests {
         })
         .await;
 
-        served.listing().list(here("personal-mac", "100.91.54.18")).await;
+        served
+            .listing()
+            .list(here("personal-mac", "100.91.54.18"))
+            .await;
 
         let machines = served.settings().machines;
         assert_eq!(machines.len(), 2, "{machines:?}");
@@ -301,11 +515,16 @@ mod tests {
     #[tokio::test]
     async fn a_listed_machine_whose_address_changed_keeps_its_name() {
         let served = Served::new(|me, settings| {
-            settings.machines.push(machine(me, "Tom's desk", "100.64.0.9"));
+            settings
+                .machines
+                .push(machine(me, "Tom's desk", "100.64.0.9"));
         })
         .await;
 
-        served.listing().list(here("personal-mac", "100.91.54.18")).await;
+        served
+            .listing()
+            .list(here("personal-mac", "100.91.54.18"))
+            .await;
 
         assert_eq!(
             served.settings().machines,
@@ -316,12 +535,17 @@ mod tests {
     #[tokio::test]
     async fn a_listed_machine_at_the_same_address_sends_nothing() {
         let served = Served::new(|me, settings| {
-            settings.machines.push(machine(me, "Tom's desk", "100.91.54.18"));
+            settings
+                .machines
+                .push(machine(me, "Tom's desk", "100.91.54.18"));
         })
         .await;
         let seq = served.settings().seq;
 
-        served.listing().list(here("personal-mac", "100.91.54.18")).await;
+        served
+            .listing()
+            .list(here("personal-mac", "100.91.54.18"))
+            .await;
 
         assert_eq!(served.settings().seq, seq);
         assert_eq!(
@@ -336,7 +560,9 @@ mod tests {
         let _capture = logged.capture();
         let peer = MachineId::random();
         let served = Served::new(|me, settings| {
-            settings.machines.push(machine(peer, "trilogy-mac", "100.64.0.2"));
+            settings
+                .machines
+                .push(machine(peer, "trilogy-mac", "100.64.0.2"));
             settings.priority = vec![peer, me];
         })
         .await;
@@ -374,7 +600,9 @@ mod tests {
     #[tokio::test]
     async fn a_rename_sets_the_trimmed_name_and_keeps_the_address() {
         let served = Served::new(|me, settings| {
-            settings.machines.push(machine(me, "personal-mac", "100.91.54.18"));
+            settings
+                .machines
+                .push(machine(me, "personal-mac", "100.91.54.18"));
         })
         .await;
 
@@ -391,7 +619,9 @@ mod tests {
     async fn another_machine_can_be_renamed_from_here() {
         let other = MachineId::random();
         let served = Served::new(move |_, settings| {
-            settings.machines.push(machine(other, "trilogy-mac", "100.64.0.2"));
+            settings
+                .machines
+                .push(machine(other, "trilogy-mac", "100.64.0.2"));
         })
         .await;
 
@@ -407,7 +637,9 @@ mod tests {
     #[tokio::test]
     async fn a_machine_can_take_its_own_name_in_another_case() {
         let served = Served::new(|me, settings| {
-            settings.machines.push(machine(me, "personal-mac", "100.91.54.18"));
+            settings
+                .machines
+                .push(machine(me, "personal-mac", "100.91.54.18"));
         })
         .await;
 
@@ -420,7 +652,9 @@ mod tests {
     #[tokio::test]
     async fn a_name_of_60_characters_is_taken_and_one_of_61_is_not() {
         let served = Served::new(|me, settings| {
-            settings.machines.push(machine(me, "personal-mac", "100.91.54.18"));
+            settings
+                .machines
+                .push(machine(me, "personal-mac", "100.91.54.18"));
         })
         .await;
         let (status, body) = served.rename(served.me, &"é".repeat(60)).await;
@@ -432,12 +666,22 @@ mod tests {
     #[tokio::test]
     async fn a_blank_long_or_control_character_name_is_422_and_sends_nothing() {
         let served = Served::new(|me, settings| {
-            settings.machines.push(machine(me, "personal-mac", "100.91.54.18"));
+            settings
+                .machines
+                .push(machine(me, "personal-mac", "100.91.54.18"));
         })
         .await;
         let seq = served.settings().seq;
         let long = "n".repeat(NAME_AT_MOST + 1);
-        for name in ["", "  \t ", long.as_str(), "desk\u{0}", "my\ndesk", "a\u{7}b", "a\u{1b}[31mb"] {
+        for name in [
+            "",
+            "  \t ",
+            long.as_str(),
+            "desk\u{0}",
+            "my\ndesk",
+            "a\u{7}b",
+            "a\u{1b}[31mb",
+        ] {
             let (status, body) = served.rename(served.me, name).await;
             assert_eq!(status, 422, "{name:?}: {body}");
             assert!(!error_of(&body).is_empty(), "{body}");
@@ -450,8 +694,12 @@ mod tests {
     async fn a_name_another_machine_has_in_any_case_or_spacing_is_409_and_sends_nothing() {
         let other = MachineId::random();
         let served = Served::new(move |me, settings| {
-            settings.machines.push(machine(me, "personal-mac", "100.91.54.18"));
-            settings.machines.push(machine(other, " Trilogy-Mac ", "100.64.0.2"));
+            settings
+                .machines
+                .push(machine(me, "personal-mac", "100.91.54.18"));
+            settings
+                .machines
+                .push(machine(other, " Trilogy-Mac ", "100.64.0.2"));
         })
         .await;
         let seq = served.settings().seq;
@@ -466,7 +714,9 @@ mod tests {
     #[tokio::test]
     async fn a_machine_not_in_the_list_is_404_and_sends_nothing() {
         let served = Served::new(|me, settings| {
-            settings.machines.push(machine(me, "personal-mac", "100.91.54.18"));
+            settings
+                .machines
+                .push(machine(me, "personal-mac", "100.91.54.18"));
         })
         .await;
         let seq = served.settings().seq;
@@ -482,8 +732,12 @@ mod tests {
     async fn a_rename_the_coordinator_cannot_send_answers_503_and_keeps_the_name() {
         let peer = MachineId::random();
         let served = Served::new(move |me, settings| {
-            settings.machines.push(machine(me, "personal-mac", "100.91.54.18"));
-            settings.machines.push(machine(peer, "trilogy-mac", "100.64.0.2"));
+            settings
+                .machines
+                .push(machine(me, "personal-mac", "100.91.54.18"));
+            settings
+                .machines
+                .push(machine(peer, "trilogy-mac", "100.64.0.2"));
             settings.priority = vec![peer, me];
         })
         .await;
@@ -493,7 +747,11 @@ mod tests {
 
         assert_eq!(status, 503, "{body}");
         assert!(error_of(&body).contains(&peer.to_string()), "{body}");
-        let mine = served.settings().machines.into_iter().find(|m| m.id == served.me);
+        let mine = served
+            .settings()
+            .machines
+            .into_iter()
+            .find(|m| m.id == served.me);
         assert_eq!(mine.unwrap().name, "personal-mac");
     }
 }

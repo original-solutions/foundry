@@ -1218,10 +1218,11 @@ fn the_rename_route_refuses_a_request_from_another_site() {
     use std::io::{Read as _, Write as _};
     let mut fixture = Fixture::new();
     fixture.start();
-    let ask = |path: &str, host: &str, origin: Option<&str>| {
+    // A refused request is answered before its body is read, and a close with the body unread
+    // can reset the link before the answer is read, so only the request served sends one.
+    let ask = |path: &str, host: &str, origin: Option<&str>, body: &str| {
         let mut stream = std::net::TcpStream::connect(("127.0.0.1", fixture.port)).unwrap();
         let origin = origin.map_or_else(String::new, |o| format!("Origin: {o}\r\n"));
-        let body = r#"{"name": "desk"}"#;
         write!(
             stream,
             "POST {path} HTTP/1.1\r\nHost: {host}\r\n{origin}Connection: close\r\n\
@@ -1236,7 +1237,7 @@ fn the_rename_route_refuses_a_request_from_another_site() {
     let here = format!("127.0.0.1:{}", fixture.port);
     let rename = format!("/api/machines/{}/rename", MachineId::random());
     // Served here: a machine the list does not hold is refused by the route itself.
-    assert_eq!(ask(&rename, &here, None), 404);
-    assert_eq!(ask(&rename, &here, Some("http://evil.example")), 403);
-    assert_eq!(ask(&rename, "evil.example", None), 403);
+    assert_eq!(ask(&rename, &here, None, r#"{"name": "desk"}"#), 404);
+    assert_eq!(ask(&rename, &here, Some("http://evil.example"), ""), 403);
+    assert_eq!(ask(&rename, "evil.example", None, ""), 403);
 }

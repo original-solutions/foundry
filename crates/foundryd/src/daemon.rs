@@ -296,10 +296,14 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
         .layer(middleware::from_fn_with_state(api.clone(), api::same_site));
     let project_routes = api::projects::router(coordinator.clone(), store.clone())
         .layer(middleware::from_fn_with_state(api.clone(), api::same_site));
+    let machine_name_routes = api::machine_names::router(coordinator.clone(), store.clone())
+        .layer(middleware::from_fn_with_state(api.clone(), api::same_site));
+    let listing = api::machine_names::Listing::new(me, coordinator.clone(), store.clone());
     let app = api::router(api)
         .merge(sessions.router())
         .merge(attention_routes)
         .merge(project_routes)
+        .merge(machine_name_routes)
         .merge(ws::keyed_router(peers.clone(), keys.clone()));
 
     let mut terminate =
@@ -310,6 +314,7 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
     tracing::info!("listening on {local}");
     let mut tailscale = Tailscale::new(port, app.clone());
     tailscale.scan(true, tailscale_ips().await).await;
+    let answered = tailscale.answered.clone();
     let mut services: JoinSet<&'static str> = JoinSet::new();
     // services
     services.spawn(named(
@@ -322,6 +327,10 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
     }));
     services.spawn(named("the API server", serve_on(listener, app.clone())));
     services.spawn(named("the Tailscale address watch", tailscale.watch()));
+    services.spawn(named(
+        "the machine list entry",
+        list_this_machine(answered, listing),
+    ));
     services.spawn(named("updates", update::run(home.clone())));
     services.spawn(named("gateway health", gateway_reader.run()));
     services.spawn(named("placement", placement::run(placing.clone())));
@@ -550,8 +559,29 @@ async fn tailscale_ips() -> Result<BTreeSet<IpAddr>, String> {
 /// Runs `<cli> ip`, which prints one of this machine's Tailscale addresses a line, and reads
 /// them. A CLI that fails, is missing, prints anything else or runs past `within` gives why.
 async fn ask_cli(cli: &Path, within: Duration) -> Result<BTreeSet<IpAddr>, String> {
+    String::from_utf8_lossy(&run_cli(cli, &["ip"], within).await?)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            line.parse()
+                .map_err(|_| format!("`{} ip` printed {line:?}, not an address", cli.display()))
+        })
+        .collect()
+}
+
+/// Runs `<cli> status --self --json`, which says what Tailscale calls this machine and its
+/// addresses, and gives what it printed, or why it cannot, as [`run_cli`] does.
+async fn ask_status(cli: &Path, within: Duration) -> Result<Vec<u8>, String> {
+    run_cli(cli, &["status", "--self", "--json"], within).await
+}
+
+/// Runs `<cli> <args>` and gives what it printed. A CLI that fails, is missing or runs past
+/// `within` gives why.
+async fn run_cli(cli: &Path, args: &[&str], within: Duration) -> Result<Vec<u8>, String> {
+    let asked = format!("{} {}", cli.display(), args.join(" "));
     let run = tokio::process::Command::new(cli)
-        .arg("ip")
+        .args(args)
         // The CLI inside Tailscale.app answers only when `TERM` is set; without it, as under
         // launchd, it tries to start the app's GUI and fails.
         .env("TERM", "dumb")
@@ -563,29 +593,38 @@ async fn ask_cli(cli: &Path, within: Duration) -> Result<BTreeSet<IpAddr>, Strin
         Ok(Err(error)) => return Err(format!("{} could not be run: {error}", cli.display())),
         Err(_) => {
             return Err(format!(
-                "`{} ip` did not answer within {} s",
-                cli.display(),
+                "`{asked}` did not answer within {} s",
                 within.as_secs_f32()
             ));
         }
     };
     if !out.status.success() {
         return Err(format!(
-            "`{} ip` failed ({}): {}",
-            cli.display(),
+            "`{asked}` failed ({}): {}",
             out.status,
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(|line| {
-            line.parse()
-                .map_err(|_| format!("`{} ip` printed {line:?}, not an address", cli.display()))
-        })
-        .collect()
+    Ok(out.stdout)
+}
+
+/// Keeps this machine in the shared machine list: each time the address watch hears from
+/// Tailscale (`answered`), reads what Tailscale calls this machine and hands it to `listing`.
+/// It runs apart from the watch, so an edit waiting on the coordinator never holds up binding
+/// an address.
+async fn list_this_machine(
+    answered: Arc<tokio::sync::Notify>,
+    mut listing: api::machine_names::Listing,
+) {
+    loop {
+        answered.notified().await;
+        let entry = ask_status(&tailscale_cli(), ASK_WITHIN)
+            .await
+            .and_then(|status| {
+                api::machine_names::entry(&status, host_names().first().map(String::as_str))
+            });
+        listing.list(entry).await;
+    }
 }
 
 /// How often Tailscale is asked again for an address that has come up.
@@ -605,6 +644,8 @@ struct Tailscale {
     /// answers again.
     unanswered: bool,
     servers: JoinSet<SocketAddr>,
+    /// Told each time Tailscale answers, so the machine list entry is kept up to date.
+    answered: Arc<tokio::sync::Notify>,
 }
 
 impl Tailscale {
@@ -616,6 +657,7 @@ impl Tailscale {
             failed: BTreeSet::new(),
             unanswered: false,
             servers: JoinSet::new(),
+            answered: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -633,6 +675,7 @@ impl Tailscale {
         let reported = match reported {
             Ok(reported) => {
                 self.unanswered = false;
+                self.answered.notify_one();
                 reported
             }
             Err(why) => {
