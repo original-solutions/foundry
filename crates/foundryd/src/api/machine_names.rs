@@ -306,13 +306,10 @@ mod tests {
     }
 
     #[test]
-    fn a_dns_label_longer_than_a_name_holds_is_cut_to_60_characters() {
+    fn the_name_is_the_whole_first_label_however_long() {
         let label = "m".repeat(63);
         let status = STATUS.replace("personal-mac.tail", &format!("{label}.tail"));
-        assert_eq!(
-            entry(status.as_bytes(), None).map(|e| e.name),
-            Ok("m".repeat(NAME_AT_MOST))
-        );
+        assert_eq!(entry(status.as_bytes(), None).map(|e| e.name), Ok(label));
     }
 
     #[test]
@@ -621,24 +618,84 @@ mod tests {
         assert!(!served.settings().machines.iter().any(|m| m.id == served.me));
     }
 
+    const SETTLE: Duration = Duration::from_millis(300);
+
     #[tokio::test]
-    async fn a_look_before_the_settle_time_sends_nothing_and_one_after_it_lists_the_machine() {
+    async fn the_first_look_waits_the_settle_time_however_long_after_the_start_it_comes() {
         let served = Served::new(|_, _| {}).await;
         let seq = served.settings().seq;
-        let mut listing = served.listing_after(Duration::from_millis(400));
+        let mut listing = served.listing_after(SETTLE);
+        // Tailscale answers only well after the daemon started: no peer could link before.
+        tokio::time::sleep(SETTLE * 2).await;
+
+        listing.list(here("personal-mac", "100.91.54.18")).await;
+        assert_eq!(served.settings().seq, seq, "the first look sends nothing");
+
+        tokio::time::sleep(SETTLE / 2).await;
+        listing.list(here("personal-mac", "100.91.54.18")).await;
+        assert_eq!(
+            served.settings().seq,
+            seq,
+            "nor does one inside the settle time"
+        );
+
+        tokio::time::sleep(SETTLE).await;
+        listing.list(here("personal-mac", "100.91.54.18")).await;
+        assert_eq!(
+            served.settings().machines,
+            [machine(served.me, "personal-mac", "100.91.54.18")]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_look_after_a_gap_longer_than_the_settle_time_waits_again() {
+        let served = Served::new(|_, _| {}).await;
+        let seq = served.settings().seq;
+        let mut listing = served.listing_after(SETTLE);
+        listing.list(Err("not yet".to_owned())).await;
+        tokio::time::sleep(SETTLE + SETTLE / 2).await;
+        listing.list(Err("still not".to_owned())).await;
+
+        // Tailscale went away: no look for longer than the settle time.
+        tokio::time::sleep(SETTLE * 2).await;
+        listing.list(here("personal-mac", "100.91.54.18")).await;
+        assert_eq!(
+            served.settings().seq,
+            seq,
+            "the first look after the gap sends nothing"
+        );
+
+        tokio::time::sleep(SETTLE + SETTLE / 4).await;
+        listing.list(here("personal-mac", "100.91.54.18")).await;
+        assert_eq!(served.settings().machines.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn after_a_send_the_next_look_waits_for_the_copy_that_holds_it() {
+        let served = Served::new(|_, _| {}).await;
+        let mut listing = served.listing_after(SETTLE);
+        listing.list(here("personal-mac", "100.91.54.18")).await;
+        tokio::time::sleep(SETTLE + SETTLE / 4).await;
+        listing.list(here("personal-mac", "100.91.54.18")).await;
+        assert_eq!(served.settings().machines.len(), 1);
+
+        // This copy does not hold the entry yet, as a forwarded edit's copy can lag its answer.
+        let mut lagging = served.settings();
+        lagging.seq += 1;
+        lagging.machines.clear();
+        served
+            .store
+            .lock()
+            .unwrap()
+            .apply_settings(lagging)
+            .unwrap();
+        let seq = served.settings().seq;
 
         listing.list(here("personal-mac", "100.91.54.18")).await;
         assert_eq!(
             served.settings().seq,
             seq,
-            "nothing is sent while peers' copies may still be on their way"
-        );
-
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        listing.list(here("personal-mac", "100.91.54.18")).await;
-        assert_eq!(
-            served.settings().machines,
-            [machine(served.me, "personal-mac", "100.91.54.18")]
+            "the look right after a send sends nothing"
         );
     }
 

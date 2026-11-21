@@ -214,12 +214,14 @@ impl Fixture {
 
     /// Puts a stand-in for the Tailscale CLI in the daemon's `HOME` that answers as a running
     /// Tailscale does: `ip` with this machine's address, which no interface carries so nothing
-    /// is bound to it, and `status --self --json` with this machine's names.
+    /// is bound to it, and `status --self --json` with this machine's names. It notes each
+    /// question, a line each, in `tailscale-asked`.
     fn with_tailscale_answering(self) -> Self {
         let cli = self.user.path().join("tailscale");
         fs::write(
             &cli,
             r#"#!/bin/sh
+echo "$*" >> "$(dirname "$0")/tailscale-asked"
 case "$*" in
 ip) echo 100.127.254.253 ;;
 "status --self --json") echo '{"Self": {"HostName": "Personal Mac", "DNSName": "personal-mac.tail459612.ts.net.", "TailscaleIPs": ["100.127.254.253", "fd7a:115c:a1e0::e832:3612"]}}' ;;
@@ -1191,6 +1193,17 @@ fn machines(fixture: &Fixture) -> (String, Vec<serde_json::Value>) {
 fn a_daemon_lists_itself_under_its_tailscale_name_once_tailscale_answers_and_can_be_renamed() {
     let mut fixture = Fixture::new().with_tailscale_answering();
     fixture.start();
+
+    // Its first look, when Tailscale first answers, waits for peers' copies: nothing is sent.
+    let asked = fixture.user.path().join("tailscale-asked");
+    wait_for("the daemon to ask what Tailscale calls it", || {
+        fs::read_to_string(&asked)
+            .ok()?
+            .contains("status --self --json")
+            .then_some(())
+    });
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(machines(&fixture).1, Vec::<serde_json::Value>::new());
 
     let me = wait_for("this machine in the machine list", || {
         let (me, machines) = machines(&fixture);
