@@ -93,10 +93,9 @@ impl Store {
     /// Opens or creates the database at `path` and brings its schema up to date.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let mut conn = Connection::open(path)?;
-        conn.execute_batch(
-            "PRAGMA synchronous = NORMAL;
-             PRAGMA temp_store = MEMORY;",
-        )?;
+        // synchronous stays at SQLite's FULL: with the rollback journal, NORMAL lets a power
+        // cut corrupt the file.
+        conn.execute_batch("PRAGMA temp_store = MEMORY;")?;
         migrate(&mut conn, MIGRATIONS.len())?;
         Ok(Self { conn })
     }

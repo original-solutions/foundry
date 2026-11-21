@@ -878,8 +878,9 @@ fn every_query_that_orders_orders_by_version() {
 }
 
 #[test]
-fn store_opens_with_fast_pragmas() {
+fn store_opens_with_full_sync_and_temp_tables_in_memory() {
     let (_dir, store) = open();
+    // FULL, not NORMAL: with the rollback journal a power cut under NORMAL can corrupt the file.
     let sync_mode: i64 = store
         .conn
         .pragma_query_value(None, "synchronous", |row| row.get(0))
@@ -888,7 +889,7 @@ fn store_opens_with_fast_pragmas() {
         .conn
         .pragma_query_value(None, "temp_store", |row| row.get(0))
         .unwrap();
-    assert_eq!(sync_mode, 1); // NORMAL
+    assert_eq!(sync_mode, 2); // FULL
     assert_eq!(temp_store, 2); // MEMORY
 }
 

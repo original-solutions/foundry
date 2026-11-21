@@ -584,6 +584,31 @@ mod tests {
         assert_eq!(again.body.sessions, 5);
     }
 
+    #[test]
+    fn write_sample_with_keeps_one_system_and_refreshes_it_each_sample() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path().join("foundry.db")).unwrap();
+        let me = MachineId::random();
+        put_session(&mut store, me, SessionState::Working, false);
+        put_session(&mut store, me, SessionState::Finished, false);
+        let store = Mutex::new(store);
+        let mut system = None;
+
+        let first = write_sample_with(&mut system, &store, me, dir.path()).unwrap();
+        assert!(
+            system.is_some(),
+            "the first sample keeps the System it built"
+        );
+
+        let second = write_sample_with(&mut system, &store, me, dir.path()).unwrap();
+        assert!(second.version > first.version);
+        for sample in [&first, &second] {
+            assert!(sample.body.free_memory > 0);
+            assert_eq!(sample.body.sessions, 1);
+        }
+        assert_eq!(held_sample(&store.lock().unwrap(), me), Some(second));
+    }
+
     /// Writes `update.json` with `refused` and points `current` at `installed`, as the updater
     /// leaves them.
     fn updated(home: &Path, refused: Option<&str>, installed: Option<&str>) {
