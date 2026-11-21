@@ -37,7 +37,7 @@ async fn a_machine_added_by_name_is_listed_under_that_name_once_it_joins_and_lin
     let later = Later::default();
     let a_keys = keys(&a_dir);
     let dialer = KeyedDialer::new(Arc::new(later.clone()), a_keys.clone());
-    // A lists itself as `machine-0` and acts alone.
+    // A lists itself as `machine-0` at 100.64.0.1 and acts alone.
     let a = Keyed::new(&[], a_keys, a_dir, Arc::new(dialer));
     let coordinator = Arc::new(Coordinator::new(
         a.keys.me(),
@@ -69,7 +69,7 @@ async fn a_machine_added_by_name_is_listed_under_that_name_once_it_joins_and_lin
     .await
     .unwrap();
     let code = added["code"].as_str().unwrap().to_owned();
-    assert_eq!(added["command"], format!("foundryd join machine-0 {code}"));
+    assert_eq!(added["command"], format!("foundryd join 100.64.0.1 {code}"));
 
     // On B: `foundryd join`, then its daemon starts.
     let secrets = FileSecrets::new(b_dir.path().join("secrets"));

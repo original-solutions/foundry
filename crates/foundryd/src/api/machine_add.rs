@@ -381,7 +381,7 @@ mod tests {
         assert_eq!(code.len(), 10, "{body}");
         assert_eq!(
             answer["command"],
-            format!("foundryd join personal-mac {code}"),
+            format!("foundryd join 100.91.54.18 {code}"),
             "{body}"
         );
         assert_eq!(answer["expires_in_secs"], CODE_VALID_FOR.as_secs());
@@ -528,6 +528,9 @@ mod tests {
         let (status, body) = served.add("127.0.0.1").await;
 
         assert_eq!(status, 503, "{body}");
-        assert!(!error_of(&body).is_empty(), "{body}");
+        assert_eq!(
+            error_of(&body),
+            "this machine is not in its machine list yet; try again in a minute"
+        );
     }
 }
