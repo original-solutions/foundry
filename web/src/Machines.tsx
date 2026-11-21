@@ -1,10 +1,10 @@
 import { useMutation } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
-import { useState, type ReactNode } from "react";
+import { useRef, useState, type ReactNode } from "react";
 import { post, refused } from "./api";
 import { byUrgency, rows, type MachineView } from "./fleet";
 import { plural, urgency, type Glyph } from "./labels";
-import { fieldLook } from "./Modal";
+import { button, field, fieldLook, Modal, primaryButton } from "./Modal";
 import { heardAgo, scaled, span, spanWords, type History, type Point } from "./samples";
 import { glyphFill, glyphText, StateGlyph } from "./StateGlyph";
 import { useNow } from "./StepsPanel";
@@ -54,6 +54,9 @@ export function Machines({ machines, history, here, connected }: Props) {
           Disconnected from the daemon: these are the last numbers this page saw, until it reconnects.
         </p>
       )}
+      <div className="flex justify-end">
+        <AddMachine machines={machines} />
+      </div>
       <div className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,24rem),1fr))] gap-4">
         {machines.map((machine) => (
           <MachineCard key={machine.id} machine={machine} points={history[machine.id]?.points ?? []} heard={history[machine.id]?.heard} here={machine.id === here} now={now} />
@@ -203,6 +206,121 @@ function MachineCard({ machine, points, heard, here, now }: { machine: MachineVi
         {machine.workspaces.length === 0 && <li className="px-2 py-1.5 text-xs text-neutral-500">No workspaces on this machine</li>}
       </ul>
     </article>
+  );
+}
+
+/** What an add answered: the command to run on the new machine, and how long its code works. */
+interface Added {
+  name: string;
+  command: string;
+  expiresInSecs: number;
+}
+
+/** Asks the daemon for a join code for the machine Tailscale calls `name`. */
+async function addMachine(name: string): Promise<Added> {
+  const { status, json } = await post("/api/machines/add", { name });
+  if (status !== 201) throw refused(status, json);
+  return { name, command: String(json.command), expiresInSecs: Number(json.expires_in_secs) };
+}
+
+/**
+ * The board's Add machine button and its dialog. The person types the new machine's Tailscale
+ * name and gets the one command to run there; a refusal shows in the dialog and keeps the text.
+ * Once a listed machine of that name arrives in the settings, the dialog says it joined. Closing
+ * it forgets the command.
+ */
+function AddMachine({ machines }: { machines: MachineView[] }) {
+  const [open, setOpen] = useState(false);
+  const [name, setName] = useState("");
+  const [copied, setCopied] = useState<"copied" | "selected" | null>(null);
+  const command = useRef<HTMLElement>(null);
+  const add = useMutation({ mutationFn: addMachine });
+  const added = add.data;
+  const joined = added !== undefined && machines.some((m) => m.listed && m.name.trim().toLowerCase() === added.name.toLowerCase());
+  const change = (next: boolean) => {
+    setOpen(next);
+    if (!next) {
+      setName("");
+      setCopied(null);
+      add.reset();
+    }
+  };
+  const copy = async (text: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied("copied");
+    } catch {
+      // No clipboard outside a secure context, as on a Tailscale address: select it to copy by hand.
+      const range = document.createRange();
+      if (command.current) range.selectNodeContents(command.current);
+      window.getSelection()?.removeAllRanges();
+      window.getSelection()?.addRange(range);
+      setCopied("selected");
+    }
+  };
+  return (
+    <Modal
+      open={open}
+      onOpenChange={change}
+      trigger="Add machine"
+      title="Add machine"
+      description={added ? `Run this on ${added.name}, where foundryd is installed.` : "Type the new machine's Tailscale name to get the command to run on it."}
+    >
+      {added ? (
+        <div className="mt-3 flex flex-col gap-2">
+          <div className="flex items-start gap-2">
+            <pre className="min-w-0 flex-1 overflow-x-auto rounded bg-neutral-950 px-2 py-1.5 text-xs">
+              <code ref={command}>{added.command}</code>
+            </pre>
+            <button type="button" className={button} onClick={() => void copy(added.command)}>
+              {copied === "copied" ? "Copied" : "Copy"}
+            </button>
+          </div>
+          <p className="text-xs text-neutral-500">
+            {copied === "selected" ? "Selected: press Ctrl+C or ⌘C to copy it. " : ""}
+            The code works once and expires in {Math.round(added.expiresInSecs / 60)} minutes.
+          </p>
+          {joined ? (
+            <p role="status" className="text-xs text-emerald-400">
+              {added.name} joined
+            </p>
+          ) : (
+            <p className="text-xs text-neutral-500">Waiting for {added.name} to join…</p>
+          )}
+        </div>
+      ) : (
+        <form
+          className="mt-3 flex flex-col gap-2"
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (name.trim() && !add.isPending) add.mutate(name.trim());
+          }}
+        >
+          <label className="text-xs text-neutral-400">
+            Name
+            <input
+              autoFocus
+              autoComplete="off"
+              spellCheck={false}
+              value={name}
+              placeholder="Tailscale name, e.g. trilogy-mac"
+              onChange={(e) => setName(e.target.value)}
+              className={field}
+            />
+          </label>
+          {add.isError && (
+            <p role="alert" className="text-xs text-red-400">
+              {add.error.message}
+            </p>
+          )}
+          <div className="flex justify-end">
+            <button type="submit" className={primaryButton} disabled={!name.trim() || add.isPending}>
+              Add
+            </button>
+          </div>
+        </form>
+      )}
+    </Modal>
   );
 }
 
