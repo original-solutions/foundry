@@ -74,7 +74,7 @@ jobs:
   # Both macOS targets on one runner: macOS minutes cost ten times as much.
   macos:
     needs: prepare
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
