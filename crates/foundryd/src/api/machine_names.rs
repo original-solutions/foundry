@@ -19,7 +19,9 @@
 //! can reach it within that time. What stays open: a rename sent from a copy that has not yet
 //! heard of the machine's new address puts the old address back until the machine's next look
 //! moves it again, and an edit numbered elsewhere between a look's read and its send is
-//! replaced. The default name is not checked as a rename is: a default another machine already
+//! replaced. The wait runs on a clock that stops while the machine sleeps, so a wait begun just
+//! before a sleep can end just after waking, when Tailscale answers at once and before peers
+//! have linked again. The default name is not checked as a rename is: a default another machine already
 //! has, or one over [`NAME_AT_MOST`] characters, is listed as it is, and a rename sets it right.
 
 use std::net::Ipv4Addr;
