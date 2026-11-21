@@ -4,7 +4,7 @@
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use foundryd::{daemon, join, secrets, service, status};
+use foundryd::{daemon, dashboard, join, secrets, service, status};
 
 #[derive(Parser)]
 #[command(name = "foundryd", version, about)]
@@ -23,6 +23,8 @@ enum Command {
     Uninstall,
     /// Show this machine's daemon and its peers.
     Status,
+    /// Open this machine's web UI in the default browser.
+    Dashboard,
     /// Join a fleet with a one-time code from a machine already in it.
     Join {
         /// The address of a machine already in the fleet.
@@ -51,6 +53,7 @@ fn main() -> ExitCode {
     match Cli::parse().command {
         Command::Run => daemon::run(),
         Command::Status => status::status(),
+        Command::Dashboard => dashboard::dashboard(),
         Command::Install => service::install(),
         Command::Uninstall => service::uninstall(),
         Command::Join { address, code } => join::join(&address, &code),

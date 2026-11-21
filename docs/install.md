@@ -56,6 +56,16 @@ This copies both binaries to `<home>/versions/<version>/`, points `<home>/curren
 
 The log is `~/Library/Logs/foundry/foundryd.log`.
 
+## Open the UI
+
+The daemon serves the UI at its own address, `http://127.0.0.1:7433/` (or `FOUNDRY_PORT`). To open it in your browser:
+
+```sh
+foundryd dashboard
+```
+
+It prints the address and exits 1 when no daemon is running there. Run it from `<home>/current/`, or link `<home>/current/foundryd` into a folder on your `PATH`.
+
 ## Linux
 
 Run `install` as the user that will run the service. Never as root: Claude Code refuses its permission mode as root, and `install` refuses to run as root.

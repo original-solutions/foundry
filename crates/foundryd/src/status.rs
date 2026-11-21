@@ -44,7 +44,7 @@ pub fn status() -> ExitCode {
 }
 
 /// `GET /api/state` from the daemon on loopback at `port`.
-fn fetch(port: u16) -> Result<UiMessage, String> {
+pub(crate) fn fetch(port: u16) -> Result<UiMessage, String> {
     let url = format!("http://127.0.0.1:{port}/api/state");
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(ANSWER_WITHIN))
