@@ -450,9 +450,10 @@ impl Shown {
             .collect()
     }
 
-    /// The prompts it took with `wait_prompt`.
+    /// The prompts it took with `wait_prompt`. A line still being printed is not read yet.
     fn prompts(&self) -> Vec<String> {
-        self.text
+        let printed = self.text.rfind('\n').map_or("", |end| &self.text[..end]);
+        printed
             .lines()
             // The sign that the agent takes input may come first on the line.
             .filter_map(|l| l.trim_end().split_once("PROMPT=").map(|(_, json)| json))
@@ -591,6 +592,124 @@ async fn a_first_prompt_waits_for_the_agent_to_take_input_though_the_session_sta
         "typed before the agent took input: {:?}",
         shown.text
     );
+}
+
+/// A first prompt whose keys are `claude::typed_prompt("go")`.
+fn first_prompt() -> (FirstPrompt, Bytes) {
+    (
+        FirstPrompt::new(Some("go")),
+        Bytes::from(claude::typed_prompt("go")),
+    )
+}
+
+const SIGN: &[u8] = b"box \x1b[?2004h";
+
+#[test]
+fn a_first_prompt_is_not_ready_before_the_session_starts_or_with_no_sign() {
+    let now = tokio::time::Instant::now();
+    let long = Duration::from_secs(3600);
+
+    // A sign, and no `SessionStart`.
+    let (mut first, _) = first_prompt();
+    first.read(SIGN, false);
+    assert_eq!(first.ready(None, now + long), None);
+    assert_eq!(first.grace_ends(None), None);
+
+    // `SessionStart`, and no sign: there is no moment to wait for either.
+    let (mut first, _) = first_prompt();
+    first.read(b"drawing", true);
+    assert_eq!(first.ready(Some(now), now + long), None);
+    assert_eq!(first.grace_ends(Some(now)), None);
+    assert!(first.waiting());
+}
+
+#[test]
+fn a_first_prompt_is_ready_at_once_on_a_sign_after_the_start_and_is_given_once() {
+    let now = tokio::time::Instant::now();
+    let (mut first, keys) = first_prompt();
+    // The sign is cut between two reads.
+    first.read(b"box \x1b[?20", true);
+    assert_eq!(first.ready(Some(now), now), None);
+    first.read(b"04h", true);
+    // The box's own sign needs no grace.
+    assert_eq!(first.grace_ends(Some(now)), None);
+    assert_eq!(first.ready(Some(now), now), Some(keys));
+    assert!(!first.waiting());
+    assert_eq!(first.ready(Some(now), now + Duration::from_secs(60)), None);
+}
+
+#[test]
+fn a_first_prompt_with_a_sign_from_before_the_start_is_ready_when_the_grace_is_over() {
+    let started = tokio::time::Instant::now();
+    let over = started + claude::EARLIER_SIGN_GRACE;
+    let (mut first, keys) = first_prompt();
+    first.read(SIGN, false);
+    assert_eq!(first.grace_ends(Some(started)), Some(over));
+    assert_eq!(
+        first.ready(Some(started), over - Duration::from_millis(1)),
+        None
+    );
+    assert_eq!(first.ready(Some(started), over), Some(keys));
+    assert_eq!(first.grace_ends(Some(started)), None);
+}
+
+#[test]
+fn a_sign_after_the_start_takes_the_place_of_one_from_before_it() {
+    let started = tokio::time::Instant::now();
+    let (mut first, keys) = first_prompt();
+    first.read(SIGN, false);
+    first.read(SIGN, true);
+    assert_eq!(first.ready(Some(started), started), Some(keys));
+}
+
+#[test]
+fn a_sign_the_terminal_already_held_on_attach_counts_as_one_from_before_the_start() {
+    // The follower was cut off after `SessionStart` and attaches again: the terminal's stored
+    // output still holds an earlier screen's sign, and the box has not given its own.
+    let started = tokio::time::Instant::now();
+    let over = started + claude::EARLIER_SIGN_GRACE;
+    let (mut first, keys) = first_prompt();
+    first.attached(SIGN);
+    assert_eq!(
+        first.ready(Some(started), over - Duration::from_millis(1)),
+        None
+    );
+    assert_eq!(first.grace_ends(Some(started)), Some(over));
+    assert_eq!(first.ready(Some(started), over), Some(keys));
+
+    // Half a sign read before the cut does not join what the terminal holds after it.
+    let (mut first, _) = first_prompt();
+    first.read(b"\x1b[?20", true);
+    first.attached(b"04h");
+    first.read(b"more", true);
+    assert_eq!(first.ready(Some(started), over), None);
+
+    // A sign the box gave before the cut still stands.
+    let (mut first, keys) = first_prompt();
+    first.read(SIGN, true);
+    first.attached(SIGN);
+    assert_eq!(first.ready(Some(started), started), Some(keys));
+}
+
+#[tokio::test]
+async fn a_long_first_prompt_arrives_whole_and_is_typed_once() {
+    let f =
+        Fixture::new("- hook: {event: SessionStart}\n- wait_prompt\n- wait_prompt\n- wait_input\n")
+            .await;
+    // Past the 800 characters and three lines Claude Code shows as typed. Each line is short
+    // enough for the fake agent's terminal, which hands input over a line at a time.
+    let lines: Vec<String> = (0..25)
+        .map(|n| format!("{n:02}{}", " fix the login é".repeat(5)))
+        .collect();
+    let want = lines.join("\n");
+    assert!(want.chars().count() > 2000);
+    let id = start_on(&f, &want).await;
+
+    let shown = Shown::until(&f, id, |s| s.prompts().len() == 1 && s.waits() == 2).await;
+    assert_eq!(shown.prompts(), [want.as_str()]);
+    type_keys(&f, id, b"next\r").await;
+    let shown = Shown::until(&f, id, |s| s.prompts().len() == 2).await;
+    assert_eq!(shown.prompts(), [want.as_str(), "next"]);
 }
 
 #[tokio::test]

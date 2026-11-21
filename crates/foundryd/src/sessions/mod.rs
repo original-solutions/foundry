@@ -172,8 +172,8 @@ struct Live {
     body: tokio::sync::Mutex<Session>,
     /// When a hook or output last arrived, for the stuck timer.
     activity: watch::Sender<Instant>,
-    /// Whether `SessionStart` has come, for typing the first prompt.
-    started: watch::Sender<bool>,
+    /// When `SessionStart` first came, for typing the first prompt.
+    started: watch::Sender<Option<Instant>>,
     /// What the session is for and doing, from its hooks' payloads.
     brief: Mutex<brief::Brief>,
     tasks: Mutex<Vec<AbortHandle>>,
@@ -339,7 +339,7 @@ impl Inner {
                 state: SessionState::Starting,
             }),
             activity,
-            started: watch::Sender::new(false),
+            started: watch::Sender::new(None),
             brief: Mutex::default(),
             tasks: Mutex::default(),
         });
@@ -432,7 +432,8 @@ impl Inner {
             return Ok(body.state);
         }
         if matches!(event, Event::Hook(Hook::SessionStart)) {
-            live.started.send_replace(true);
+            live.started
+                .send_if_modified(|at| at.replace(at.unwrap_or_else(Instant::now)).is_none());
         }
         if matches!(event, Event::Hook(_) | Event::Output) {
             live.activity.send_replace(Instant::now());
@@ -549,22 +550,24 @@ async fn follow(
             // What the terminal already held is not new output, but it may show the sign.
             Ok((snapshot, mut output)) => {
                 backoff.reset();
-                let mut tail = Vec::new();
-                first.read(&mut tail, &snapshot.bytes, *started.borrow());
+                first.attached(&snapshot.bytes);
                 loop {
-                    first.type_if_ready(&inner, terminal, &mut started).await;
-                    let grace = first.grace_until;
+                    let at = *started.borrow_and_update();
+                    if let Some(keys) = first.ready(at, Instant::now()) {
+                        type_first(&inner, terminal, keys).await;
+                    }
+                    let grace = first.grace_ends(at);
                     let next = tokio::select! {
                         next = output.next() => next,
                         // `SessionStart` came, or the grace ran out: the prompt may be ready
                         // with no more output.
                         Ok(()) = started.changed(), if first.waiting() => continue,
                         () = tokio::time::sleep_until(grace.unwrap_or_else(Instant::now)),
-                            if first.waiting() && grace.is_some() => continue,
+                            if grace.is_some() => continue,
                     };
                     match next {
                         Some(Ok(bytes)) => {
-                            first.read(&mut tail, &bytes, *started.borrow());
+                            first.read(&bytes, started.borrow().is_some());
                             if !bytes.is_empty() {
                                 report(&inner, &live, Event::Output).await;
                             }
@@ -598,14 +601,20 @@ async fn follow(
 /// trust prompt, turns bracketed paste on too, and the paste's Enter would answer it, so the
 /// prompt is typed on a sign that comes after `SessionStart`. A sign seen only before it, which
 /// is also what a hook that reaches the daemon after the box's sign looks like, counts
-/// [`claude::EARLIER_SIGN_GRACE`] after `SessionStart`, by when the box is drawn.
+/// [`claude::EARLIER_SIGN_GRACE`] after `SessionStart`, by when the box is drawn. So does a
+/// sign in what the terminal already held when the follower attached: nothing says when that
+/// was written.
+///
+/// This decides and does no I/O: [`follow`] hands it the output and the time, and types the
+/// keys [`FirstPrompt::ready`] gives. The prompt is held here only, so a daemon that restarts
+/// before it is typed loses it.
 struct FirstPrompt {
-    /// The keys that type it, until they are sent.
+    /// The keys that type it, until they are given to be sent.
     keys: Option<Bytes>,
     /// Where the output has shown the sign, as far as the daemon has read.
     sign: Sign,
-    /// When an earlier sign counts, once `SessionStart` has come.
-    grace_until: Option<Instant>,
+    /// The end of the output read since the follower attached, for a sign cut between reads.
+    tail: Vec<u8>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -620,7 +629,7 @@ impl FirstPrompt {
         Self {
             keys: prompt.map(|p| Bytes::from(claude::typed_prompt(p))),
             sign: Sign::None,
-            grace_until: None,
+            tail: Vec::new(),
         }
     }
 
@@ -628,13 +637,20 @@ impl FirstPrompt {
         self.keys.is_some()
     }
 
-    /// Notes `output`, read after `tail` since the follower attached, when `started` says
-    /// whether `SessionStart` has come.
-    fn read(&mut self, tail: &mut Vec<u8>, output: &[u8], started: bool) {
+    /// The follower attached, and the terminal already held `snapshot`. A sign in it counts as
+    /// one from before `SessionStart`, whenever the follower attaches: after the holder cut it
+    /// off, the snapshot still holds an earlier screen's sign.
+    fn attached(&mut self, snapshot: &[u8]) {
+        self.tail.clear();
+        self.read(snapshot, false);
+    }
+
+    /// Notes `output` as it arrives, when `started` says whether `SessionStart` has come.
+    fn read(&mut self, output: &[u8], started: bool) {
         if !self.waiting() || self.sign == Sign::AfterStart {
             return;
         }
-        if claude::turns_paste_on(tail, output) {
+        if claude::turns_paste_on(&mut self.tail, output) {
             self.sign = if started {
                 Sign::AfterStart
             } else {
@@ -643,35 +659,23 @@ impl FirstPrompt {
         }
     }
 
-    /// Types the prompt when the session has started and takes input. The keys are sent once:
-    /// a prompt the holder does not take is lost, and the session goes on without it.
-    async fn type_if_ready(
-        &mut self,
-        inner: &Inner,
-        terminal: TerminalId,
-        started: &mut watch::Receiver<bool>,
-    ) {
-        if !self.waiting() || !*started.borrow_and_update() {
-            return;
-        }
+    /// The keys to type at `now`, when the session started at `started` and takes input. They
+    /// are given once.
+    fn ready(&mut self, started: Option<Instant>, now: Instant) -> Option<Bytes> {
+        let started = started?;
         let ready = match self.sign {
             Sign::None => false,
             Sign::AfterStart => true,
-            Sign::BeforeStart => {
-                let until = *self
-                    .grace_until
-                    .get_or_insert_with(|| Instant::now() + claude::EARLIER_SIGN_GRACE);
-                Instant::now() >= until
-            }
+            Sign::BeforeStart => now >= started + claude::EARLIER_SIGN_GRACE,
         };
-        if !ready {
-            return;
-        }
-        if let Some(keys) = self.keys.take()
-            && let Err(error) = inner.terminals.input(terminal, keys).await
-        {
-            tracing::warn!(terminal = %terminal, %error, "the first prompt was not typed");
-        }
+        if ready { self.keys.take() } else { None }
+    }
+
+    /// When a sign from before `SessionStart` starts to count, while the prompt waits on that
+    /// alone.
+    fn grace_ends(&self, started: Option<Instant>) -> Option<Instant> {
+        (self.waiting() && self.sign == Sign::BeforeStart)
+            .then_some(started? + claude::EARLIER_SIGN_GRACE)
     }
 
     /// The child is gone: says so when its first prompt was never typed.
@@ -682,6 +686,14 @@ impl FirstPrompt {
                 "the first prompt was not typed: Claude Code ended before it took input"
             );
         }
+    }
+}
+
+/// Types the first prompt's keys. They are sent once: a prompt the holder does not take is
+/// lost, and the session goes on without it.
+async fn type_first(inner: &Inner, terminal: TerminalId, keys: Bytes) {
+    if let Err(error) = inner.terminals.input(terminal, keys).await {
+        tracing::warn!(terminal = %terminal, %error, "the first prompt was not typed");
     }
 }
 
