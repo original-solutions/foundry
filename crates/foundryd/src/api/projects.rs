@@ -4,9 +4,11 @@
 //! - `POST /api/projects` `{name, repo, id?}`: adds a project with its name and repo trimmed,
 //!   `201 {id}`. The id is the one the caller sent, else a new one. A caller that sends its own
 //!   id and sends the add again after an answer that came too late sends the same edit, so a
-//!   retry cannot make a second project. A name that is blank or over [`NAME_AT_MOST`]
-//!   characters, or a repo that is blank or holds whitespace or a NUL, is `422`. A name another
-//!   project has, compared trimmed and in any case, or an id another project has, is `409`.
+//!   retry cannot make a second project. A retry that finds its project already held, with the
+//!   same name and repo, answers `201` again and sends nothing. A name that is blank or over
+//!   [`NAME_AT_MOST`] characters, or a repo that is blank or holds whitespace or a NUL, is
+//!   `422`. A name another project has, compared trimmed and in any case, or an id a project
+//!   with another name or repo has, is `409`.
 //! - `POST /api/projects/{id}/remove`: removes a project, `204`. An id the settings do not hold
 //!   is `404`. A project that a live workspace this machine knows of, from any machine, was made
 //!   from is `409`, naming each such workspace.
@@ -84,6 +86,16 @@ async fn add(
         ));
     }
     let settings = on_store(&projects.store, |store| store.settings()).await?;
+    let id = add.id.unwrap_or_else(ProjectId::random);
+    // The caller's own add, sent again after it landed: the same answer, and nothing sent.
+    if let Some(held) = settings.projects.iter().find(|p| p.id == id) {
+        if held.name == name && held.repo == repo {
+            return Ok(created(id));
+        }
+        return Err(conflict(format!(
+            "a project with the id {id} already exists"
+        )));
+    }
     let wanted = name.to_lowercase();
     if let Some(held) = settings
         .projects
@@ -93,12 +105,6 @@ async fn add(
         return Err(conflict(format!(
             "a project named {:?} already exists",
             held.name
-        )));
-    }
-    let id = add.id.unwrap_or_else(ProjectId::random);
-    if settings.projects.iter().any(|p| p.id == id) {
-        return Err(conflict(format!(
-            "a project with the id {id} already exists"
         )));
     }
     let project = Project {
@@ -382,6 +388,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_add_sent_again_after_it_landed_answers_201_with_its_id_and_sends_nothing() {
+        let served = Served::new(|_, _| {}).await;
+        let id = ProjectId::random();
+        let add = json!({ "name": " api ", "repo": "/srv/api.git", "id": id });
+        let (status, body) = served.post("/api/projects", Some(add.clone())).await;
+        assert_eq!(status, 201, "{body}");
+        let seq = served.settings().seq;
+
+        let (status, body) = served.post("/api/projects", Some(add)).await;
+        assert_eq!(status, 201, "{body}");
+        assert_eq!(id_of(&body), id);
+        assert_eq!(served.settings().seq, seq);
+        assert_eq!(served.settings().projects.len(), 1);
+    }
+
+    #[tokio::test]
     async fn an_add_under_an_id_another_project_has_is_409_and_sends_nothing() {
         let held = project("foundry", "/srv/foundry.git");
         let id = held.id;
@@ -391,14 +413,20 @@ mod tests {
         })
         .await;
         let seq = served.settings().seq;
-        let (status, body) = served
-            .post(
-                "/api/projects",
-                Some(json!({ "name": "other", "repo": "/srv/other.git", "id": id })),
-            )
-            .await;
-        assert_eq!(status, 409, "{body}");
-        assert!(error_of(&body).contains(&id.to_string()), "{body}");
+        for (name, repo) in [
+            ("other", "/srv/other.git"),
+            ("foundry", "/srv/other.git"),
+            ("other", "/srv/foundry.git"),
+        ] {
+            let (status, body) = served
+                .post(
+                    "/api/projects",
+                    Some(json!({ "name": name, "repo": repo, "id": id })),
+                )
+                .await;
+            assert_eq!(status, 409, "{name} {repo}: {body}");
+            assert!(error_of(&body).contains(&id.to_string()), "{body}");
+        }
         assert_eq!(served.settings().seq, seq);
         assert_eq!(served.settings().projects, [held]);
     }
