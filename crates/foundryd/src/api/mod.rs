@@ -562,8 +562,9 @@ async fn send_events(api: &Api, mut socket: WebSocket) -> Result<(), StoreError>
             }
             continue;
         }
-        let (held, seq) = on_store(&api.store, |store| {
-            Ok((store.versions()?, store.settings_seq()?))
+        let seen = sent.seq;
+        let (held, settings) = on_store(&api.store, move |store| {
+            Ok((store.versions()?, store.settings_since(Some(seen))?))
         })
         .await?;
         for (owner, version) in held {
@@ -595,8 +596,7 @@ async fn send_events(api: &Api, mut socket: WebSocket) -> Result<(), StoreError>
                 sent.versions.insert(owner, version);
             }
         }
-        if seq != sent.seq {
-            let settings = on_store(&api.store, |store| store.settings()).await?;
+        if let Some(settings) = settings {
             sent.seq = settings.seq;
             let message = UiMessage::Settings {
                 protocol: PROTOCOL,

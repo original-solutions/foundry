@@ -87,15 +87,7 @@ async fn send_settings(
         return true;
     }
     let prev = *last;
-    let settings = match on_store(&inner.store, move |store| {
-        let seq = store.settings_seq()?;
-        if prev == Some(seq) {
-            return Ok::<_, crate::store::StoreError>(None);
-        }
-        Ok(Some(store.settings()?))
-    })
-    .await
-    {
+    let settings = match on_store(&inner.store, move |store| store.settings_since(prev)).await {
         Ok(Some(settings)) => settings,
         Ok(None) => return true,
         Err(error) => {
@@ -302,43 +294,38 @@ async fn own_hello(inner: &Inner, protocol: u16) -> Option<PeerMessage> {
 
 type ListedCache = (u64, std::collections::BTreeSet<MachineId>);
 
-/// Checks whether `machine` is listed in `store`'s shared settings, reusing `cached` whenever
-/// `settings_seq` matches.
+/// Checks whether `machine` is listed in `store`'s shared settings, reusing `cached` while the
+/// settings are unchanged, and gives back the machine ids when it read them again.
 fn listed_in_store(
     store: &crate::store::Store,
     machine: MachineId,
     cached: Option<&ListedCache>,
-) -> (Result<bool, crate::store::StoreError>, Option<ListedCache>) {
-    match store.settings_seq() {
-        Ok(seq) => match cached {
-            Some((cached_seq, ids)) if *cached_seq == seq => (Ok(ids.contains(&machine)), None),
-            _ => match store.settings() {
-                Ok(settings) => {
-                    let ids: std::collections::BTreeSet<MachineId> =
-                        settings.machines.into_iter().map(|m| m.id).collect();
-                    let present = ids.contains(&machine);
-                    (Ok(present), Some((settings.seq, ids)))
-                }
-                Err(error) => (Err(error), None),
-            },
-        },
-        Err(error) => (Err(error), None),
-    }
+) -> Result<(bool, Option<ListedCache>), crate::store::StoreError> {
+    Ok(match store.settings_since(cached.map(|(seq, _)| *seq))? {
+        None => (cached.is_some_and(|(_, ids)| ids.contains(&machine)), None),
+        Some(settings) => {
+            let ids: std::collections::BTreeSet<MachineId> =
+                settings.machines.into_iter().map(|m| m.id).collect();
+            (ids.contains(&machine), Some((settings.seq, ids)))
+        }
+    })
 }
 
 /// Whether `machine` is in the machine list: the one rule for who is a peer, for record links
 /// and relays alike.
 pub(super) async fn listed(inner: &Inner, machine: MachineId) -> bool {
     let cached = super::lock(&inner.listed_cache).clone();
-    let (result, updated) = on_store(&inner.store, move |store| {
+    let result = on_store(&inner.store, move |store| {
         listed_in_store(store, machine, cached.as_ref())
     })
     .await;
-    if let Some(cache) = updated {
-        *super::lock(&inner.listed_cache) = Some(cache);
-    }
     match result {
-        Ok(present) => present,
+        Ok((present, updated)) => {
+            if let Some(cache) = updated {
+                *super::lock(&inner.listed_cache) = Some(cache);
+            }
+            present
+        }
         Err(error) => {
             tracing::warn!("sync: cannot read the machine list: {error}");
             false

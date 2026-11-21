@@ -904,6 +904,16 @@ fn settings_seq_tracks_applied_settings_without_reading_full_body() {
 }
 
 #[test]
+fn settings_since_gives_the_settings_only_when_their_seq_is_not_the_one_seen() {
+    let (_dir, mut store) = open();
+    assert_eq!(store.settings_since(None).unwrap().map(|s| s.seq), Some(0));
+    assert_eq!(store.settings_since(Some(0)).unwrap(), None);
+    assert!(store.apply_settings(settings(4)).unwrap());
+    assert_eq!(store.settings_since(Some(0)).unwrap(), Some(settings(4)));
+    assert_eq!(store.settings_since(Some(4)).unwrap(), None);
+}
+
+#[test]
 fn live_session_count_counts_only_live_sessions_of_that_owner() {
     let (_dir, mut store) = open();
     let me = MachineId::random();

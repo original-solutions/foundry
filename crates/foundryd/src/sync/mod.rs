@@ -189,12 +189,7 @@ impl Peers {
             every.tick().await;
             let prev = last_seq;
             let update = on_store(&self.inner.store, move |store| {
-                let seq = store.settings_seq()?;
-                if prev == Some(seq) {
-                    return Ok::<_, StoreError>(None);
-                }
-                let settings = store.settings()?;
-                Ok(Some((settings.seq, settings.machines)))
+                Ok::<_, StoreError>(store.settings_since(prev)?.map(|s| (s.seq, s.machines)))
             })
             .await;
             let (seq, machines) = match update {

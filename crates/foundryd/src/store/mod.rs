@@ -321,6 +321,15 @@ impl Store {
         }
     }
 
+    /// The shared settings held when their `seq` is not `seen`, else `None`, so a caller that
+    /// keeps the last `seq` it read parses the settings only after they change.
+    pub fn settings_since(&self, seen: Option<u64>) -> Result<Option<SharedSettings>, StoreError> {
+        if seen == Some(self.settings_seq()?) {
+            return Ok(None);
+        }
+        self.settings().map(Some)
+    }
+
     /// Stores `settings` when their `seq` is higher than the held one's, and says whether it
     /// did. Settings with an equal or lower `seq` change nothing.
     pub fn apply_settings(&mut self, settings: SharedSettings) -> Result<bool, StoreError> {
