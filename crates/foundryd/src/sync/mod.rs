@@ -143,6 +143,9 @@ struct Inner {
     store: Arc<Mutex<Store>>,
     dialer: Arc<dyn Dialer>,
     heard: Mutex<BTreeMap<MachineId, Instant>>,
+    /// Cached machine ids from the shared settings at a given `seq`, avoiding full JSON
+    /// deserialization on every link tick when settings have not changed.
+    listed_cache: Mutex<Option<(u64, BTreeSet<MachineId>)>>,
     /// The terminals a relay serves to peers; none until [`Peers::serve_terminals`].
     terminals: Mutex<Option<Arc<Terminals>>>,
     /// The loopback address of the API a carried call is made to; none until
@@ -164,6 +167,7 @@ impl Peers {
                 store,
                 dialer,
                 heard: Mutex::new(BTreeMap::new()),
+                listed_cache: Mutex::new(None),
                 terminals: Mutex::new(None),
                 calls: Mutex::new(None),
                 coordinator: Mutex::new(None),
@@ -179,16 +183,24 @@ impl Peers {
     /// dialed or served, closes within a second.
     pub async fn run(&self) {
         let mut links: BTreeMap<MachineId, (Machine, Task)> = BTreeMap::new();
+        let mut last_seq: Option<u64> = None;
         let mut every = tokio::time::interval(REDIAL);
         loop {
             every.tick().await;
-            let machines = match on_store(&self.inner.store, |store| store.settings()).await {
-                Ok(settings) => settings.machines,
+            let prev = last_seq;
+            let update = on_store(&self.inner.store, move |store| {
+                Ok::<_, StoreError>(store.settings_since(prev)?.map(|s| (s.seq, s.machines)))
+            })
+            .await;
+            let (seq, machines) = match update {
+                Ok(Some(changed)) => changed,
+                Ok(None) => continue,
                 Err(error) => {
                     tracing::warn!("sync: cannot read the machine list: {error}");
                     continue;
                 }
             };
+            last_seq = Some(seq);
             let wanted: BTreeMap<MachineId, Machine> = machines
                 .into_iter()
                 .filter(|m| m.id != self.inner.me)
@@ -299,21 +311,41 @@ impl Peers {
     /// shows.
     pub async fn state(&self) -> Result<Vec<AnyRecord>, StoreError> {
         let online = self.online();
-        let records = on_store(&self.inner.store, |store| {
+        let (_, records, _) = self.state_snapshot_for(&online).await?;
+        Ok(records)
+    }
+
+    /// Reads versions, all records (marked unreachable for offline owners), and shared settings
+    /// in a single blocking store pass.
+    pub(crate) async fn state_snapshot_for(
+        &self,
+        online: &BTreeSet<MachineId>,
+    ) -> Result<
+        (
+            BTreeMap<MachineId, u64>,
+            Vec<AnyRecord>,
+            foundry_proto::settings::SharedSettings,
+        ),
+        StoreError,
+    > {
+        let (versions, records, settings) = on_store(&self.inner.store, |store| {
+            let versions = store.versions()?;
             let mut records = Vec::new();
-            for owner in store.versions()?.into_keys() {
+            for &owner in versions.keys() {
                 match store.since(owner, 0) {
                     Ok(held) => records.extend(held),
                     Err(error) => tracing::warn!("sync: records of {owner} not shown: {error}"),
                 }
             }
-            Ok::<_, StoreError>(records)
+            let settings = store.settings()?;
+            Ok::<_, StoreError>((versions, records, settings))
         })
         .await?;
-        Ok(records
+        let records = records
             .into_iter()
-            .map(|record| as_seen(record, &online))
-            .collect())
+            .map(|record| as_seen(record, online))
+            .collect();
+        Ok((versions, records, settings))
     }
 
     async fn dial_forever(self, peer: Machine) {

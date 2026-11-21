@@ -26,7 +26,6 @@ use tokio::time::{Instant, timeout, timeout_at};
 use std::time::Duration;
 
 use super::{BATCH, Conn, Inner, OFFLINE_AFTER, RETRY_REFUSED, TICK, on_store};
-use crate::store::Applied;
 
 /// How often a link repeats the warning that this machine's records cannot be read.
 const WARN_EVERY: Duration = Duration::from_secs(60);
@@ -87,16 +86,15 @@ async fn send_settings(
     if inner.coordinator().is_none() || open.speak < EDITS_SINCE {
         return true;
     }
-    let settings = match on_store(&inner.store, |store| store.settings()).await {
-        Ok(settings) => settings,
+    let prev = *last;
+    let settings = match on_store(&inner.store, move |store| store.settings_since(prev)).await {
+        Ok(Some(settings)) => settings,
+        Ok(None) => return true,
         Err(error) => {
             tracing::warn!("sync: cannot read the shared settings to send: {error}");
             return true;
         }
     };
-    if *last == Some(settings.seq) {
-        return true;
-    }
     let seq = settings.seq;
     let message = PeerMessage::Settings {
         protocol: open.speak,
@@ -294,11 +292,40 @@ async fn own_hello(inner: &Inner, protocol: u16) -> Option<PeerMessage> {
     }
 }
 
+type ListedCache = (u64, std::collections::BTreeSet<MachineId>);
+
+/// Checks whether `machine` is listed in `store`'s shared settings, reusing `cached` while the
+/// settings are unchanged, and gives back the machine ids when it read them again.
+fn listed_in_store(
+    store: &crate::store::Store,
+    machine: MachineId,
+    cached: Option<&ListedCache>,
+) -> Result<(bool, Option<ListedCache>), crate::store::StoreError> {
+    Ok(match store.settings_since(cached.map(|(seq, _)| *seq))? {
+        None => (cached.is_some_and(|(_, ids)| ids.contains(&machine)), None),
+        Some(settings) => {
+            let ids: std::collections::BTreeSet<MachineId> =
+                settings.machines.into_iter().map(|m| m.id).collect();
+            (ids.contains(&machine), Some((settings.seq, ids)))
+        }
+    })
+}
+
 /// Whether `machine` is in the machine list: the one rule for who is a peer, for record links
 /// and relays alike.
 pub(super) async fn listed(inner: &Inner, machine: MachineId) -> bool {
-    match on_store(&inner.store, |store| store.settings()).await {
-        Ok(settings) => settings.machines.iter().any(|m| m.id == machine),
+    let cached = super::lock(&inner.listed_cache).clone();
+    let result = on_store(&inner.store, move |store| {
+        listed_in_store(store, machine, cached.as_ref())
+    })
+    .await;
+    match result {
+        Ok((present, updated)) => {
+            if let Some(cache) = updated {
+                *super::lock(&inner.listed_cache) = Some(cache);
+            }
+            present
+        }
         Err(error) => {
             tracing::warn!("sync: cannot read the machine list: {error}");
             false
@@ -362,17 +389,14 @@ async fn take(inner: &Inner, peer: MachineId, message: PeerMessage) -> Result<()
         }
     };
     on_store(&inner.store, move |store| {
-        for record in &records {
-            match store.apply(record, peer) {
-                Ok(Applied::NotOwner) => tracing::warn!(
+        store
+            .apply_batch(&records, peer, |record| {
+                tracing::warn!(
                     "sync: {peer} sent a record owned by {}; refused",
                     record.owner()
-                ),
-                Ok(Applied::Stored | Applied::Stale) => {}
-                Err(error) => return Err(format!("a record from {peer} not stored: {error}")),
-            }
-        }
-        Ok(())
+                );
+            })
+            .map_err(|error| format!("a record from {peer} not stored: {error}"))
     })
     .await
 }

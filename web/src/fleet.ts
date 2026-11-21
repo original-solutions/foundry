@@ -26,12 +26,15 @@ export function apply(state: FleetState, message: UiMessage): FleetState {
       return { ...state, settings: message.settings };
     case "record": {
       const next = message.record;
-      const at = state.records.findIndex((r) => key(r) === key(next));
+      const nextKey = key(next);
+      const at = state.records.findIndex((r) => key(r) === nextKey);
       if (at < 0) return { ...state, records: [...state.records, next] };
       const old = state.records[at];
       // Mirror Record::supersedes: the same owner, a higher version.
       if (old.owner !== next.owner || next.version <= old.version) return state;
-      return { ...state, records: state.records.map((r, i) => (i === at ? next : r)) };
+      const records = state.records.slice();
+      records[at] = next;
+      return { ...state, records };
     }
   }
 }
@@ -84,73 +87,129 @@ export interface MachineView {
 
 /** The sidebar's model. Machine rules follow `foundryd status`. `briefs` name sessions by what they were asked. */
 export function fleet(records: AnyRecord[], settings: SharedSettings, briefs: Briefs = {}): MachineView[] {
-  const listed = settings.machines.map((m) => m.id);
-  const others = [...new Set(records.filter((r) => r.kind === "machine_sample" && !listed.includes(r.owner)).map((r) => r.owner))].sort();
-  const live = records.filter((r) => !r.deleted);
+  const machineNames = new Map<string, string>();
+  const listed: string[] = [];
+  for (const m of settings.machines) {
+    listed.push(m.id);
+    machineNames.set(m.id, m.name);
+  }
+  const projectNames = new Map<string, string>();
+  for (const p of settings.projects) projectNames.set(p.id, p.name);
+
+  const otherSet = new Set<string>();
+  const samplesByOwner = new Map<string, { version: number; body: MachineSample }>();
+  const statusByOwner = new Map<string, "online" | "offline">();
   // A session whose terminal was closed has ended for good: its record stays, failed, behind it.
-  const closed = new Set(records.flatMap((r) => (r.kind === "terminal" && r.deleted ? [r.body.id] : [])));
-  const sessions = live.flatMap((r) => (r.kind === "session" && !closed.has(r.body.terminal) ? [r.body] : []));
-  const referenced = new Set(sessions.map((s) => s.terminal));
+  const closed = new Set<string>();
   // A fresh state sends records by version, so a session that just changed comes last. A
   // running terminal's record is written when it opens and again only when it exits, so its
   // version keeps the order terminals opened in across reloads.
-  const opened = new Map(live.flatMap((r) => (r.kind === "terminal" ? [[r.body.id, r.version] as const] : [])));
+  const opened = new Map<string, number>();
+  const liveSessions: { id: string; workspace: string; model: string; state: SessionState; terminal: string }[] = [];
+  const liveTerminals: { workspace: string; view: Omit<ShellView, "name"> }[] = [];
+  const workspacesByOwner = new Map<string, { id: string; name: string; branch: string; project: string }[]>();
+
+  for (const r of records) {
+    switch (r.kind) {
+      case "machine_sample": {
+        if (!machineNames.has(r.owner)) otherSet.add(r.owner);
+        const prev = samplesByOwner.get(r.owner);
+        if (!prev || r.version > prev.version) samplesByOwner.set(r.owner, r);
+        break;
+      }
+      case "session": {
+        if (r.body.state === "unreachable") statusByOwner.set(r.owner, "offline");
+        else if (!statusByOwner.has(r.owner)) statusByOwner.set(r.owner, "online");
+        if (!r.deleted) liveSessions.push(r.body);
+        break;
+      }
+      case "terminal": {
+        if (r.body.state === "unreachable") statusByOwner.set(r.owner, "offline");
+        else if (!statusByOwner.has(r.owner)) statusByOwner.set(r.owner, "online");
+        if (r.deleted) {
+          closed.add(r.body.id);
+        } else {
+          opened.set(r.body.id, r.version);
+          liveTerminals.push({
+            workspace: r.body.workspace,
+            view: { id: r.body.id, state: r.body.state, exitCode: r.body.exit_code },
+          });
+        }
+        break;
+      }
+      case "workspace": {
+        if (!r.deleted) {
+          let list = workspacesByOwner.get(r.owner);
+          if (!list) {
+            list = [];
+            workspacesByOwner.set(r.owner, list);
+          }
+          list.push({
+            id: r.body.id,
+            name: r.body.name,
+            branch: r.body.branch,
+            project: projectNames.get(r.body.project) ?? r.body.project,
+          });
+        }
+        break;
+      }
+    }
+  }
+
+  const referenced = new Set<string>();
+  const sessionsByWorkspace = new Map<string, typeof liveSessions>();
+  for (const s of liveSessions) {
+    if (closed.has(s.terminal)) continue;
+    referenced.add(s.terminal);
+    let list = sessionsByWorkspace.get(s.workspace);
+    if (!list) {
+      list = [];
+      sessionsByWorkspace.set(s.workspace, list);
+    }
+    list.push(s);
+  }
+
+  const shellsOf = new Map<string, Omit<ShellView, "name">[]>();
+  for (const t of liveTerminals) {
+    if (referenced.has(t.view.id)) continue;
+    let shells = shellsOf.get(t.workspace);
+    if (!shells) {
+      shells = [];
+      shellsOf.set(t.workspace, shells);
+    }
+    shells.push(t.view);
+  }
+
   const byOpening = <T>(list: T[], terminal: (t: T) => string) =>
     [...list].sort((a, b) => (opened.get(terminal(a)) ?? Infinity) - (opened.get(terminal(b)) ?? Infinity));
-  const shellsOf = new Map<string, Omit<ShellView, "name">[]>();
-  for (const t of live) {
-    if (t.kind !== "terminal" || referenced.has(t.body.id)) continue;
-    const shells = shellsOf.get(t.body.workspace) ?? [];
-    shells.push({ id: t.body.id, state: t.body.state, exitCode: t.body.exit_code });
-    shellsOf.set(t.body.workspace, shells);
-  }
-  return [...listed, ...others].map((id) => {
-    const reachable = records.flatMap((r) =>
-      r.owner === id && (r.kind === "session" || r.kind === "terminal") ? [r.body.state !== "unreachable"] : [],
-    );
-    let sample: { version: number; body: MachineSample } | null = null;
-    for (const r of records) {
-      if (r.kind === "machine_sample" && r.owner === id && (!sample || r.version > sample.version)) sample = r;
-    }
 
-    const workspaces = live.flatMap((r) => {
-      if (r.kind !== "workspace" || r.owner !== id) return [];
-      const w = r.body;
-      const mine = byOpening(
-        sessions.filter((s) => s.workspace === w.id),
-        (s) => s.terminal,
-      );
+  const others = [...otherSet].sort();
+  return [...listed, ...others].map((id) => ({
+    id,
+    name: machineNames.get(id) ?? shortId(id),
+    status: statusByOwner.get(id) ?? "unknown",
+    sample: samplesByOwner.get(id)?.body ?? null,
+    workspaces: (workspacesByOwner.get(id) ?? []).map((w) => {
+      const mine = byOpening(sessionsByWorkspace.get(w.id) ?? [], (s) => s.terminal);
       const sessionNames = numbered(mine.map((s) => s.model));
       const shells = byOpening(shellsOf.get(w.id) ?? [], (t) => t.id);
       const shellNames = numbered(shells.map(() => "shell"));
-      return [
-        {
-          id: w.id,
-          name: w.name,
-          branch: w.branch,
-          project: settings.projects.find((p) => p.id === w.project)?.name ?? w.project,
-          sessions: mine.map((s, i) => ({
-            id: s.id,
-            model: s.model,
-            name: sessionNames[i],
-            state: s.state,
-            terminal: s.terminal,
-            title: briefs[s.id]?.title ?? undefined,
-            now: briefs[s.id]?.now ?? undefined,
-            said: briefs[s.id]?.said,
-          })),
-          shells: shells.map((t, i) => ({ ...t, name: shellNames[i] })),
-        },
-      ];
-    });
-    return {
-      id,
-      name: settings.machines.find((m) => m.id === id)?.name ?? shortId(id),
-      status: reachable.includes(false) ? "offline" : reachable.length === 0 ? "unknown" : "online",
-      sample: sample?.body ?? null,
-      workspaces,
-    };
-  });
+      return {
+        ...w,
+        sessions: mine.map((s, i) => ({
+          id: s.id,
+          model: s.model,
+          name: sessionNames[i],
+          state: s.state,
+          terminal: s.terminal,
+          title: briefs[s.id]?.title ?? undefined,
+          now: briefs[s.id]?.now ?? undefined,
+          said: briefs[s.id]?.said,
+        })),
+        shells: shells.map((t, i) => ({ ...t, name: shellNames[i] })),
+      };
+    }),
+  }));
 }
 
 /** Where terminal `id` sits in the fleet, with the name and state the sidebar gives it. */

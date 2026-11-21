@@ -114,7 +114,9 @@ impl Request {
             Request::Attach => frame(ATTACH, &[]),
             Request::Input(bytes) => frame(INPUT, bytes),
             Request::Resize { cols, rows } => {
-                frame(RESIZE, &[cols.to_be_bytes(), rows.to_be_bytes()].concat())
+                let [c0, c1] = cols.to_be_bytes();
+                let [r0, r1] = rows.to_be_bytes();
+                frame(RESIZE, &[c0, c1, r0, r1])
             }
             Request::Status => frame(STATUS, &[]),
             Request::Close => frame(CLOSE, &[]),
@@ -144,12 +146,36 @@ impl Request {
 impl Reply {
     /// The whole frame, length prefix included.
     pub fn encode(&self) -> Vec<u8> {
-        let (kind, head, body) = self.parts();
+        let (kind, head, head_len, body) = self.parts();
+        let head = &head[..head_len];
         let mut frame = Vec::with_capacity(6 + head.len() + body.len());
         frame.extend_from_slice(&header(kind, head.len() + body.len()));
-        frame.extend_from_slice(&head);
+        frame.extend_from_slice(head);
         frame.extend_from_slice(body);
         frame
+    }
+
+    /// Encodes an `Output` frame for `data` into `out`, reusing its capacity.
+    pub fn encode_output_into(data: &[u8], out: &mut Vec<u8>) {
+        out.clear();
+        out.reserve(6 + data.len());
+        out.extend_from_slice(&header(OUTPUT, data.len()));
+        out.extend_from_slice(data);
+    }
+
+    /// Encodes a `Snapshot` frame of `len` bytes at `start` into `out`, writing the payload
+    /// directly via `write_bytes` without intermediate copies.
+    pub fn encode_snapshot_from(
+        start: u64,
+        len: usize,
+        write_bytes: impl FnOnce(&mut Vec<u8>),
+        out: &mut Vec<u8>,
+    ) {
+        out.clear();
+        out.reserve(14 + len);
+        out.extend_from_slice(&header(SNAPSHOT, 8 + len));
+        out.extend_from_slice(&start.to_be_bytes());
+        write_bytes(out);
     }
 
     /// Decodes a frame's payload: everything after the length prefix.
@@ -178,16 +204,17 @@ impl Reply {
         }
     }
 
-    /// The kind, a short head and the body, so a large body is copied once into its frame.
-    fn parts(&self) -> (u8, Vec<u8>, &[u8]) {
+    /// The kind, a short inline head and the body, so a large body is copied once into its frame.
+    fn parts(&self) -> (u8, [u8; 8], usize, &[u8]) {
         match self {
-            Reply::Snapshot { start, bytes } => (SNAPSHOT, start.to_be_bytes().to_vec(), bytes),
-            Reply::Output(bytes) => (OUTPUT, Vec::new(), bytes),
-            Reply::Status(ChildStatus::Running) => (STATUS_REPLY, vec![0], &[]),
+            Reply::Snapshot { start, bytes } => (SNAPSHOT, start.to_be_bytes(), 8, bytes),
+            Reply::Output(bytes) => (OUTPUT, [0; 8], 0, bytes),
+            Reply::Status(ChildStatus::Running) => (STATUS_REPLY, [0; 8], 1, &[]),
             Reply::Status(ChildStatus::Exited(code)) => {
-                (STATUS_REPLY, [&[1][..], &code.to_be_bytes()].concat(), &[])
+                let [a, b, c, d] = code.to_be_bytes();
+                (STATUS_REPLY, [1, a, b, c, d, 0, 0, 0], 5, &[])
             }
-            Reply::Refused(reason) => (REFUSED, Vec::new(), reason.as_bytes()),
+            Reply::Refused(reason) => (REFUSED, [0; 8], 0, reason.as_bytes()),
         }
     }
 }
@@ -483,5 +510,26 @@ mod tests {
             read_reply(&mut server).await,
             Err(Error::TooLarge(n)) if n == MAX_FRAME + 1
         ));
+    }
+
+    #[test]
+    fn direct_encoders_match_reply_encode_byte_for_byte() {
+        let mut out = Vec::new();
+        Reply::encode_output_into(b"hello world\r\n", &mut out);
+        assert_eq!(
+            out,
+            Reply::Output(Bytes::from_static(b"hello world\r\n")).encode()
+        );
+
+        let mut snap = Vec::new();
+        Reply::encode_snapshot_from(258, 2, |dst| dst.extend_from_slice(b"hi"), &mut snap);
+        assert_eq!(
+            snap,
+            Reply::Snapshot {
+                start: 258,
+                bytes: Bytes::from_static(b"hi"),
+            }
+            .encode()
+        );
     }
 }

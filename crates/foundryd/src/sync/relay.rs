@@ -436,28 +436,35 @@ fn pieces(bytes: &[u8]) -> impl Iterator<Item = (&[u8], bool)> {
 const DIGITS: &[u8; 16] = b"0123456789abcdef";
 
 pub(super) fn hex(bytes: &[u8]) -> String {
-    let mut text = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        text.push(char::from(DIGITS[usize::from(byte >> 4)]));
-        text.push(char::from(DIGITS[usize::from(byte & 0xf)]));
+    let mut out = Vec::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(DIGITS[usize::from(byte >> 4)]);
+        out.push(DIGITS[usize::from(byte & 0xf)]);
     }
-    text
+    // Every byte pushed is an ASCII hex digit from `DIGITS`.
+    String::from_utf8(out).expect("hex digits are valid UTF-8")
+}
+
+#[inline]
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 pub(super) fn unhex(text: &str) -> Option<Bytes> {
-    let digit = |c: u8| {
-        char::from(c)
-            .to_digit(16)
-            .and_then(|d| u8::try_from(d).ok())
-    };
-    let text = text.as_bytes();
-    if !text.len().is_multiple_of(2) {
+    let (chunks, rem) = text.as_bytes().as_chunks::<2>();
+    if !rem.is_empty() {
         return None;
     }
-    text.chunks(2)
-        .map(|pair| Some(digit(pair[0])? << 4 | digit(pair[1])?))
-        .collect::<Option<Vec<u8>>>()
-        .map(Bytes::from)
+    let mut out = Vec::with_capacity(chunks.len());
+    for &[hi, lo] in chunks {
+        out.push(hex_nibble(hi)? << 4 | hex_nibble(lo)?);
+    }
+    Some(Bytes::from(out))
 }
 
 #[cfg(test)]
@@ -475,6 +482,19 @@ mod tests {
     fn hex_that_is_odd_or_not_hex_is_refused() {
         assert_eq!(unhex("abc"), None);
         assert_eq!(unhex("zz"), None);
+        for bad in [
+            "//", "::", "@@", "GG", "gg", "0/", "0:", "0@", "0G", "0g", "\u{00e9}",
+        ] {
+            assert_eq!(unhex(bad), None, "accepted {bad:?}");
+        }
+        assert_eq!(
+            unhex("0123456789ABCDEFabcdef").as_deref(),
+            Some(
+                &[
+                    0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xab, 0xcd, 0xef
+                ][..]
+            )
+        );
     }
 
     /// The holder keeps up to 8 MiB of screen, which as one hex frame would pass the 16 MiB a

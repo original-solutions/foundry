@@ -85,6 +85,16 @@ describe("fleet", () => {
     expect(state).toEqual({ one: "offline", two: "online", three: "unknown" });
   });
 
+  it("stays offline when a reachable record of the machine comes after an unreachable one", () => {
+    const s = settings({ machines: [{ id: "m1", name: "one", address: "" }] });
+    const records = [
+      workspace("m1", "w1", "a"),
+      session("m1", "s1", "w1", "t1", "unreachable"),
+      terminal("m1", "t1", "w1", "running"),
+    ];
+    expect(fleet(records, s).map((m) => m.status)).toEqual(["offline"]);
+  });
+
   it("uses the newest sample by version", () => {
     const machines = fleet([sample(ME, 5, { sessions: 5 }), sample(ME, 7, { sessions: 7 }), sample(ME, 6, { sessions: 6 })], settings());
     expect(machines[0].sample?.sessions).toBe(7);
@@ -224,6 +234,15 @@ describe("terminalRunning", () => {
     expect(terminalRunning(state, "gone")).toBe(false);
     expect(terminalRunning(state, "away")).toBe(false);
     expect(terminalRunning(state, "never")).toBe(false);
+  });
+
+  it("replaces an existing record without mutating the prior state array", () => {
+    const initial = apply(emptyState, full([sample(ME, 1), workspace(ME, "w1", "a")]));
+    const prevRecords = initial.records;
+    const updated = apply(initial, one(sample(ME, 2, { load: 2.5 })));
+    expect(prevRecords[0].version).toBe(1);
+    expect(updated.records[0].version).toBe(2);
+    expect(updated.records).toHaveLength(2);
   });
 });
 

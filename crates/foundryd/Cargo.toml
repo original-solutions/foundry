@@ -23,7 +23,7 @@ serde_json.workspace = true
 serde_yaml_ng.workspace = true
 sysinfo.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "sync", "time", "process", "signal", "fs", "macros"] }
 tokio-tungstenite.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
