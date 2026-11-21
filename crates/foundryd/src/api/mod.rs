@@ -111,6 +111,7 @@ pub(crate) use carry::carries;
 mod changes;
 mod files;
 mod machine;
+pub mod machine_names;
 mod pr;
 pub mod projects;
 pub mod terminals;
