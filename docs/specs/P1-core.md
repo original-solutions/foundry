@@ -150,6 +150,7 @@ This is a rule for every piece, not only P1: nothing runs without the UI showing
 ### Projects
 
 - A project is a repo URL and a name, stored as a shared setting.
+- A project is added and removed in the UI's Projects dialog, opened from the task box. A project with a live workspace cannot be removed.
 - Each machine keeps one bare clone per project and makes worktrees from it.
 - A machine clones a project the first time it hosts a workspace for it. Adding a machine needs no setup per repo.
 - In P1 a machine clones with whatever git credentials it already has. Credentials handed out by the coordinator come with GitHub accounts in P2.
