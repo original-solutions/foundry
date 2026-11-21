@@ -491,6 +491,19 @@ impl MemorySecrets {
     }
 }
 
+/// The fake keychain the move's tests use.
+#[cfg(test)]
+impl OldStore for MemorySecrets {
+    fn read(&self, name: &str) -> Result<Option<String>, SecretsError> {
+        Ok(self.lock().get(name).cloned())
+    }
+
+    fn remove(&self, name: &str) -> Result<(), SecretsError> {
+        self.lock().remove(name);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -794,13 +807,145 @@ mod tests {
         security_framework::passwords::delete_generic_password("foundry-test", &name).unwrap();
     }
 
+    /// The store every machine uses is `secrets.json` under home. The file exists before the
+    /// call, so on macOS nothing is moved and the real keychain is never touched.
     #[test]
-    fn the_file_choice_keeps_secrets_in_secrets_json_under_home() {
+    fn this_machine_keeps_secrets_in_secrets_json_under_home() {
         let dir = tempfile::tempdir().unwrap();
-        let store = store_for(dir.path(), Store::File);
-        store.set("gateway", "sk-one").unwrap();
         let held = FileSecrets::new(dir.path().join("secrets.json"));
-        assert_eq!(held.get("gateway").unwrap().as_deref(), Some("sk-one"));
+        held.set("gateway", "sk-one").unwrap();
+        let store = for_this_machine(dir.path()).unwrap();
+        assert_eq!(store.get("gateway").unwrap().as_deref(), Some("sk-one"));
+        store.set("gateway-management", "sk-two").unwrap();
+        assert_eq!(
+            held.get("gateway-management").unwrap().as_deref(),
+            Some("sk-two")
+        );
+    }
+
+    /// On macOS as on Linux, a `secrets.json` others can read or write is refused at read.
+    #[test]
+    fn this_machine_refuses_a_secrets_json_others_can_read() {
+        for wider in [0o640, 0o604, 0o644] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("secrets.json");
+            FileSecrets::new(&path).set("gateway", "sk-one").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(wider)).unwrap();
+            let store = for_this_machine(dir.path()).unwrap();
+            let error = store.get("gateway").unwrap_err();
+            assert!(
+                matches!(error, SecretsError::TooOpen { .. }),
+                "{wider:o}: {error}"
+            );
+        }
+    }
+
+    /// A keychain stand-in whose reads of `failing` fail, as a denied keychain prompt does.
+    struct Denying {
+        inner: MemorySecrets,
+        failing: &'static str,
+    }
+
+    impl OldStore for Denying {
+        fn read(&self, name: &str) -> Result<Option<String>, SecretsError> {
+            if name == self.failing {
+                return Err(SecretsError::Keychain {
+                    action: "read",
+                    name: name.to_owned(),
+                    reason: "denied".into(),
+                });
+            }
+            OldStore::read(&self.inner, name)
+        }
+
+        fn remove(&self, name: &str) -> Result<(), SecretsError> {
+            OldStore::remove(&self.inner, name)
+        }
+    }
+
+    const MOVED: [&str; 4] = ["machine", "machine-keys", GATEWAY, GATEWAY_MANAGEMENT];
+
+    fn old_store(names: &[&str]) -> MemorySecrets {
+        let old = MemorySecrets::default();
+        for name in names {
+            Secrets::set(&old, name, &format!("value-of-{name}")).unwrap();
+        }
+        old
+    }
+
+    fn held_in(old: &MemorySecrets) -> Vec<String> {
+        old.lock().keys().cloned().collect()
+    }
+
+    #[test]
+    fn the_move_takes_all_four_secrets_and_removes_them_from_the_keychain() {
+        let (dir, new) = file();
+        let old = old_store(&MOVED);
+        Secrets::set(&old, "unrelated", "kept").unwrap();
+        move_secrets(&old, &new).unwrap();
+        for name in MOVED {
+            let expected = format!("value-of-{name}");
+            assert_eq!(new.get(name).unwrap().as_deref(), Some(&*expected), "{name}");
+        }
+        assert_eq!(held_in(&old), ["unrelated"]);
+        assert_eq!(new.get("unrelated").unwrap(), None);
+        assert_eq!(mode(&dir.path().join("secrets.json")), 0o600);
+    }
+
+    #[test]
+    fn the_move_takes_only_the_secrets_the_keychain_holds() {
+        let (_dir, new) = file();
+        let old = old_store(&["machine", GATEWAY]);
+        move_secrets(&old, &new).unwrap();
+        assert_eq!(new.get("machine").unwrap().as_deref(), Some("value-of-machine"));
+        assert_eq!(new.get(GATEWAY).unwrap().as_deref(), Some("value-of-gateway"));
+        assert_eq!(new.get("machine-keys").unwrap(), None);
+        assert_eq!(new.get(GATEWAY_MANAGEMENT).unwrap(), None);
+        assert!(held_in(&old).is_empty());
+    }
+
+    #[test]
+    fn the_move_writes_no_file_when_the_keychain_holds_none() {
+        let (dir, new) = file();
+        move_secrets(&MemorySecrets::default(), &new).unwrap();
+        assert!(!dir.path().join("secrets.json").exists());
+    }
+
+    #[test]
+    fn a_failed_read_moves_nothing_and_names_the_secret_not_its_value() {
+        for failing in MOVED {
+            let (dir, new) = file();
+            let old = Denying {
+                inner: old_store(&MOVED),
+                failing,
+            };
+            let error = move_secrets(&old, &new).unwrap_err();
+            assert!(error.to_string().contains(failing), "{error}");
+            assert!(!error.to_string().contains("value-of-"), "{error}");
+            assert!(!dir.path().join("secrets.json").exists(), "{failing}");
+            assert_eq!(held_in(&old.inner), held_in(&old_store(&MOVED)), "{failing}");
+        }
+    }
+
+    #[test]
+    fn an_existing_secrets_json_is_left_alone_and_stops_the_move() {
+        let (dir, new) = file();
+        new.set(GATEWAY, "sk-file").unwrap();
+        let before = fs::read(dir.path().join("secrets.json")).unwrap();
+        let old = old_store(&MOVED);
+        move_secrets(&old, &new).unwrap();
+        assert_eq!(fs::read(dir.path().join("secrets.json")).unwrap(), before);
+        assert_eq!(held_in(&old), held_in(&old_store(&MOVED)));
+    }
+
+    #[test]
+    fn the_move_makes_a_missing_data_directory_private() {
+        let parent = tempfile::tempdir().unwrap();
+        let home = parent.path().join("home");
+        let new = FileSecrets::new(home.join("secrets.json"));
+        move_secrets(&old_store(&[GATEWAY]), &new).unwrap();
+        assert_eq!(mode(&home), 0o700);
+        assert_eq!(mode(&home.join("secrets.json")), 0o600);
     }
 
     /// `foundryd secret set` can run before the first `foundryd run`, which refuses a data
@@ -817,31 +962,30 @@ mod tests {
     }
 
     #[test]
-    fn only_the_exact_word_file_chooses_the_file_store() {
+    fn only_the_exact_word_file_skips_the_move() {
         use std::ffi::OsStr;
-        assert_eq!(choose(Some(OsStr::new("file")), true), Store::File);
+        assert!(skips_move(Some(OsStr::new("file")), true));
         for choice in [None, Some(OsStr::new("keychain")), Some(OsStr::new("File"))] {
-            assert_eq!(choose(choice, true), os_default(), "{choice:?}");
+            assert!(!skips_move(choice, true), "{choice:?}");
         }
     }
 
     /// A release build has no override, so a variable copied from the tests into a service
-    /// file cannot move a Mac off its keychain and give it a new identity.
+    /// file cannot stop a Mac moving its identity and keys out of the keychain.
     #[test]
     fn a_release_build_ignores_foundry_secrets() {
         use std::ffi::OsStr;
         for choice in [None, Some(OsStr::new("file"))] {
-            assert_eq!(choose(choice, false), os_default(), "{choice:?}");
+            assert!(!skips_move(choice, false), "{choice:?}");
         }
     }
 
-    /// The store `for_this_machine` picks with `FOUNDRY_SECRETS=file` in a debug build, the
-    /// one the tests run.
+    /// `FOUNDRY_SECRETS=file` in a debug build, the one the tests run, skips the move.
     #[cfg(debug_assertions)]
     #[test]
     fn this_debug_build_takes_foundry_secrets() {
         use std::ffi::OsStr;
-        assert_eq!(store(Some(OsStr::new("file"))), Store::File);
+        assert!(skips_move(Some(OsStr::new("file")), OVERRIDE));
     }
 
     /// The same in a release build, which ignores it. CI runs this one in a release build.
@@ -850,15 +994,7 @@ mod tests {
     fn this_release_build_ignores_foundry_secrets() {
         use std::ffi::OsStr;
         assert!(!OVERRIDE);
-        assert_eq!(store(Some(OsStr::new("file"))), os_default());
-    }
-
-    fn os_default() -> Store {
-        if cfg!(target_os = "macos") {
-            Store::Keychain
-        } else {
-            Store::File
-        }
+        assert!(!skips_move(Some(OsStr::new("file")), OVERRIDE));
     }
 
     /// What `set_from` stored under `name`, read back from a file store.

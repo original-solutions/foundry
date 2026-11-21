@@ -844,7 +844,8 @@ mod tests {
             "{}",
             item[0].what
         );
-        assert!(item[0].todo.contains("keychain prompt"), "{}", item[0].todo);
+        assert!(item[0].todo.contains("daemon log"), "{}", item[0].todo);
+        assert!(!item[0].todo.contains("keychain"), "{}", item[0].todo);
         // The next tick waits on the same read rather than starting another behind it, which
         // would only queue on the key and hold a thread of the blocking pool.
         assert!(
