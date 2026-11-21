@@ -272,7 +272,7 @@ P2 adds a lease per project on GitHub, so that claiming issues and merging can n
 ## Security
 
 - The daemon binds to the machine's Tailscale address and to localhost. It refuses to start bound to anything else.
-- A new machine joins with a one-time code shown in the UI of a machine already in the fleet. Joining gives it a key of its own, and each machine's key can be revoked from the UI.
+- A new machine joins with a one-time code made for it, by its Tailscale name, in the Add machine dialog of a machine already in the fleet. Joining gives it a key of its own, and each machine's key can be revoked from the UI.
 - Each machine keeps the gateway key and the gateway's management key in its own secret store, set with `foundryd secret set gateway` and `foundryd secret set gateway-management`: the OS keychain on macOS and a file readable only by the service user on Linux. They are never written to a log or shown in the UI after they are entered.
 - Hook calls are accepted only on localhost and only with the per-session token the daemon wrote for that session. The token is kept in a 0600 curl config (`<data dir>/sessions/<id>.curl`), which the hook command in the session's settings file reads with `curl -K`, so it never sits on a command line.
 - Sessions run with the permissions of the service user. Isolation stronger than that is P4.
