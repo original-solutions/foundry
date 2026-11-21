@@ -2063,6 +2063,54 @@ async fn a_failed_write_after_the_edit_was_sent_does_not_end_the_wait_once_the_r
 }
 
 #[tokio::test(start_paused = true)]
+async fn an_own_add_sent_before_the_role_moves_here_is_not_refused_by_the_rules_here() {
+    let peer = MachineId::random();
+    let fleet = Fleet::start_coordinated_with(1, &[peer]);
+    let daemon = &fleet.daemons[0];
+    let (conn, said) = recorded(raw_link(daemon, peer).await);
+    let theirs = ordered_by(&daemon.settings(), peer, vec![peer, daemon.id]);
+    say(&conn, &settings_message(theirs)).await;
+    let beat = beating(conn.clone());
+    acting_becomes(&daemon.coordinator(), peer, WAIT).await;
+    holding_project(daemon, 1, "foundry");
+    let editing = tokio::spawn({
+        let coordinator = daemon.coordinator();
+        async move { coordinator.edit(set_project(7, "Foundry")).await }
+    });
+    until(Duration::from_secs(2), "the edit is sent", || {
+        !edits_sent(&said).is_empty()
+    })
+    .await;
+    let id = edits_sent(&said)[0].0.expect("sent with an id");
+
+    // The peer goes quiet, so the role moves here, where the add breaks the name rule. The
+    // peer may have numbered it, so it waits.
+    beat.abort();
+    tokio::time::sleep(OFFLINE_AFTER + Duration::from_secs(2)).await;
+    assert!(!editing.is_finished(), "ended by the rule here");
+
+    // The peer comes back on a new link with a copy that holds its stamp for the id, which
+    // settles it.
+    let (conn, _) = recorded(raw_link(daemon, peer).await);
+    let mut numbered = daemon.settings();
+    numbered.seq += 5;
+    numbered.projects.push(project(7, "Foundry"));
+    let stamp = Stamp {
+        seq: numbered.seq,
+        by: peer,
+    };
+    numbered.stamps.insert(project_key(7), stamp);
+    numbered.seen.insert(peer, numbered.seq);
+    numbered.numbered.insert(id, stamp);
+    say(&conn, &settings_message(numbered)).await;
+    let made = tokio::time::timeout(Duration::from_secs(2), editing)
+        .await
+        .expect("settled by the stamp")
+        .unwrap();
+    assert_eq!(made.unwrap(), stamp);
+}
+
+#[tokio::test(start_paused = true)]
 async fn the_same_id_from_two_machines_is_answered_to_each() {
     let (p1, p2, quiet) = (
         MachineId::random(),
