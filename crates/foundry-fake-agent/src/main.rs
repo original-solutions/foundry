@@ -5,6 +5,7 @@
 //!
 //! ```yaml
 //! - wait_input                          # read one line from stdin; EOF carries on
+//! - wait_prompt                         # take one prompt as Claude Code does (below)
 //! - hook: {event: PreToolUse, tool_name: Bash}   # extra keys join the payload
 //! - sleep_ms: 200
 //! - print: "some text"
@@ -14,6 +15,11 @@
 //! ```
 //!
 //! The end of the script exits 0.
+//!
+//! `wait_prompt` acts out Claude Code's input box: it turns bracketed paste on, as Claude Code
+//! does once its box takes keys, then reads one prompt, a bracketed paste and the Enter after
+//! it, or else one typed line. It prints `PROMPT=` and the prompt as a JSON string, and fires
+//! `UserPromptSubmit` with it as `prompt`.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead as _, Write as _};
@@ -25,8 +31,7 @@ use clap::Parser;
 use serde::Deserialize;
 
 /// Command line: the script, and the settings file Claude Code would have been given. The
-/// model and a first prompt (the last argument, as Claude Code takes it) are accepted and
-/// ignored.
+/// model is accepted and ignored.
 #[derive(Parser)]
 struct Cli {
     #[arg(long)]
@@ -36,14 +41,13 @@ struct Cli {
     #[arg(long)]
     #[allow(dead_code)]
     model: Option<String>,
-    #[allow(dead_code)]
-    prompt: Option<String>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Step {
     WaitInput,
+    WaitPrompt,
     Hook {
         event: String,
         #[serde(flatten)]
@@ -86,6 +90,17 @@ fn run(cli: Cli) -> Result<u8, String> {
                 let mut line = String::new();
                 let _ = std::io::stdin().lock().read_line(&mut line);
             }
+            Step::WaitPrompt => {
+                print!("\x1b[?2004h");
+                let _ = std::io::stdout().flush();
+                let prompt = read_prompt();
+                say(&format!(
+                    "PROMPT={}",
+                    serde_json::Value::from(prompt.as_str())
+                ));
+                let extra = BTreeMap::from([("prompt".to_string(), prompt.into())]);
+                fire(&settings, "UserPromptSubmit", extra);
+            }
             Step::Hook { event, extra } => fire(&settings, &event, extra),
             Step::SleepMs(ms) => std::thread::sleep(Duration::from_millis(ms)),
             Step::Print(text) => say(&text),
@@ -102,6 +117,35 @@ fn run(cli: Cli) -> Result<u8, String> {
         }
     }
     Ok(0)
+}
+
+const PASTE_START: &[u8] = b"\x1b[200~";
+const PASTE_END: &[u8] = b"\x1b[201~";
+
+/// One prompt from stdin, as Claude Code's input box takes it: a bracketed paste with its
+/// newlines kept, up to the Enter after it, or else one typed line, which Enter ends. The
+/// terminal is left as it is, so Enter arrives as a newline.
+fn read_prompt() -> String {
+    let mut stdin = std::io::stdin().lock();
+    let mut read = Vec::new();
+    let _ = stdin.read_until(b'\n', &mut read);
+    let Some(pasted) = read.strip_prefix(PASTE_START) else {
+        return String::from_utf8_lossy(&read)
+            .trim_end_matches(['\r', '\n'])
+            .to_string();
+    };
+    let mut pasted = pasted.to_vec();
+    loop {
+        if let Some(end) = pasted.windows(PASTE_END.len()).position(|w| w == PASTE_END) {
+            pasted.truncate(end);
+            return String::from_utf8_lossy(&pasted).into_owned();
+        }
+        let mut more = Vec::new();
+        if stdin.read_until(b'\n', &mut more).unwrap_or(0) == 0 {
+            return String::from_utf8_lossy(&pasted).into_owned();
+        }
+        pasted.extend(more);
+    }
 }
 
 /// Prints a line and flushes it.

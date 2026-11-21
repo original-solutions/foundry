@@ -3,8 +3,9 @@
 //! One session, started the way `sessions` starts one: the daemon's own settings file and curl
 //! config, its trust mark on a folder Claude Code has never seen, and `claude --settings <file>
 //! --model <model>` in a PTY with the gateway variables set. The test then runs one shell
-//! command, answers a permission with yes, denies one, interrupts a turn with Esc while its tool
-//! runs, and exits with `/exit`. It checks that no trust prompt shows, that each hook `sessions`
+//! command from a first prompt typed when and as `sessions` types one, answers a permission
+//! with yes, denies one, interrupts a turn with Esc while its tool runs, and exits with
+//! `/exit`. It checks that no trust prompt shows, that each hook `sessions`
 //! registers arrives with the fields it reads, and that each step posts exactly the hooks the doc
 //! lists for it, in order: none after the denial or the Esc. It prints every hook of each step.
 //! `docs/claude-code-contract.md` records what it found.
@@ -100,7 +101,6 @@ fn claude_code_posts_the_hooks_sessions_reads() {
 
     // Start: no trust prompt, and `SessionStart`, which the prompt holds back until answered.
     let started = run.within(0, "SessionStart", STARTUP);
-    session.quiet();
     assert!(
         !shows_trust_prompt(&session.screen()),
         "Claude Code showed the trust prompt:\n{}",
@@ -111,19 +111,48 @@ fn claude_code_posts_the_hooks_sessions_reads() {
         "no SessionStart within {STARTUP:?}:\n{}",
         session.tail()
     );
+
+    // One shell command, which the default permission mode runs without asking, as the first
+    // prompt, typed when `sessions` types one: a paste and Enter the moment Claude Code turns
+    // bracketed paste on after `SessionStart`, with no wait for the screen to settle. Its
+    // newline stays in the one prompt.
+    // The sign must be on the screen soon after `SessionStart` is seen: a sign `sessions` saw
+    // only before the hook counts after `EARLIER_SIGN_GRACE`, which must leave the box time to
+    // draw. A sign already there passes at once; the order is not checked.
+    let seen_start = Instant::now();
+    while !claude::turns_paste_on(&mut Vec::new(), &session.screen()) {
+        assert!(
+            seen_start.elapsed() < claude::EARLIER_SIGN_GRACE / 2,
+            "Claude Code did not turn bracketed paste on within {:?} of SessionStart:\n{}",
+            claude::EARLIER_SIGN_GRACE / 2,
+            session.tail()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    eprintln!(
+        "bracketed paste on {:?} after SessionStart was seen",
+        seen_start.elapsed()
+    );
     run.report("start", 0);
     run.expect("start", 0, &["SessionStart"]);
-
-    // One shell command, which the default permission mode runs without asking.
     let mark = posted.len();
-    session.prompt(
-        "Run the shell command `echo foundry-contract` with your Bash tool. Do nothing else.",
-    );
+    let first =
+        "Run the shell command `echo foundry-contract` with your Bash tool.\nDo nothing else.";
+    session.send(&claude::typed_prompt(first));
     run.wait_for(mark, "PostToolUse", TURN);
     run.wait_for(mark, "Stop", TURN);
     run.report("shell command", mark);
     let turn = ["UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"];
     run.expect("shell command", mark, &turn);
+    let submitted = posted.all()[mark..]
+        .iter()
+        .find(|p| p["hook_event_name"] == "UserPromptSubmit")
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        submitted["prompt"], first,
+        "the first prompt arrived changed: {submitted}"
+    );
 
     // A write the default permission mode asks about, answered yes.
     let mark = posted.len();

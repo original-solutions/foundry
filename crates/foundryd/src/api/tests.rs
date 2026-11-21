@@ -1087,7 +1087,7 @@ async fn a_start_racing_an_archive_leaves_no_live_terminal_in_the_archived_works
 }
 
 #[tokio::test]
-async fn a_session_starts_with_a_first_prompt_and_one_that_cannot_be_an_argument_is_refused() {
+async fn a_session_starts_with_a_first_prompt_and_one_with_a_nul_or_over_the_limit_is_refused() {
     let daemon = Daemon::new(TURN).await;
     let project = daemon.project();
     let workspace = daemon.create_workspace(project, "first prompt").await;
