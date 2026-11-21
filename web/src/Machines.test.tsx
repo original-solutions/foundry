@@ -281,7 +281,8 @@ describe("Machines", () => {
       act(() => setMachines(fleet(records, joined)));
 
       expect((await screen.findByRole("status")).textContent).toBe("trilogy-mac joined");
-      expect(card("trilogy-mac")).toBeDefined();
+      // Behind the dialog, which hides the rest of the page from the accessibility tree while open.
+      expect(screen.getByRole("article", { name: "trilogy-mac", hidden: true })).toBeDefined();
     });
   });
 });
