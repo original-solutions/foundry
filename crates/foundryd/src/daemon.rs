@@ -552,6 +552,9 @@ async fn tailscale_ips() -> Result<BTreeSet<IpAddr>, String> {
 async fn ask_cli(cli: &Path, within: Duration) -> Result<BTreeSet<IpAddr>, String> {
     let run = tokio::process::Command::new(cli)
         .arg("ip")
+        // The CLI inside Tailscale.app answers only when `TERM` is set; without it, as under
+        // launchd, it tries to start the app's GUI and fails.
+        .env("TERM", "dumb")
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true)
         .output();
@@ -1239,6 +1242,22 @@ mod tests {
         let reported = ask_cli(&cli, Duration::from_secs(10)).await;
 
         assert_eq!(reported, Ok(ips(["100.101.102.103", "fd7a:115c:a1e0::1"])));
+    }
+
+    /// The CLI inside Tailscale.app starts the app's GUI instead of answering when `TERM` is not
+    /// set, as under launchd. The test's own `TERM` is whatever the shell gave it, so the stand-in
+    /// answers only to the value the daemon sets.
+    #[tokio::test]
+    async fn the_cli_is_given_a_term_so_the_app_cli_answers_under_launchd() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = fake_cli(
+            dir.path(),
+            r#"[ "$TERM" = dumb ] || { echo 'The Tailscale GUI failed to start' >&2; exit 1; }; echo 100.101.102.103"#,
+        );
+
+        let reported = ask_cli(&cli, Duration::from_secs(10)).await;
+
+        assert_eq!(reported, Ok(ips(["100.101.102.103"])));
     }
 
     #[tokio::test]
