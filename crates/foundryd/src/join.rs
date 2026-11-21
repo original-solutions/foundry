@@ -67,10 +67,10 @@ pub const JOIN_PATH: &str = "/api/join";
 pub const DEFAULT_PORT: u16 = 7433;
 
 /// The secret that holds the key table: every machine's public key, or that it is revoked.
-const KEYS_SECRET: &str = "machine-keys";
+pub(crate) const KEYS_SECRET: &str = "machine-keys";
 
 /// The secret that holds this machine's own id and private key.
-const IDENTITY_SECRET: &str = "machine";
+pub(crate) const IDENTITY_SECRET: &str = "machine";
 
 /// Letters and digits a person cannot misread: no 0, O, 1 or I. 32 of them, so one random
 /// byte modulo 32 picks each without bias.

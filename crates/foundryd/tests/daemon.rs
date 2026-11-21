@@ -1,13 +1,13 @@
 //! The `foundryd` binary run as a daemon: the data-directory lock, a clean stop that leaves
 //! terminals running, `status`, the peer route's key proof and the gateway settings. Each
-//! test uses its own data directory, a free port and no move from the keychain, never the
+//! test uses its own data directory, a free port and no copy from the keychain, never the
 //! defaults or the login keychain.
 
 // A release build ignores `FOUNDRY_SECRETS`, so on macOS these runs of the binary would move
 // secrets out of the login keychain.
 #[cfg(all(target_os = "macos", not(debug_assertions)))]
 compile_error!(
-    "run these tests in a debug build: a release build on macOS moves secrets out of the login keychain"
+    "run these tests in a debug build: a release build on macOS copies secrets out of the login keychain"
 );
 
 // A release build ignores `FOUNDRY_TAILSCALE`, so these runs of the binary would ask the real

@@ -329,6 +329,12 @@ pub enum Start {
         /// The version `current` went back to.
         to: String,
     },
+    /// The trial failed and the rollback stopped part way: this process must exit, and the
+    /// next start, with the trial still at its cap, tries the rollback again.
+    RollbackStopped {
+        /// Why it stopped.
+        error: String,
+    },
 }
 
 /// Counts this start against a trial of `running`, or rolls the trial back. Any other
@@ -353,17 +359,24 @@ fn start_with(home: &Path, running: &str) -> io::Result<Start> {
         ));
     }
     // Four steps, each safe to stop after: the refusal is saved with the trial still at its
-    // cap, a copy this trial made of the keychain is set aside (the release `current` goes
-    // back to may read only the keychain, so the copy must not outlive the trial), `current`
-    // moves, and only then is the trial cleared. A failure or a crash in between leaves a
-    // trial at the cap, so the next start rolls back again.
-    state.refused = Some(format!("v{running}"));
-    save(home, &state)?;
-    crate::secrets::set_aside_copy(home).map_err(io::Error::other)?;
-    point_current(home, &previous)?;
-    state.trial = None;
-    save(home, &state)?;
-    Ok(Start::RolledBack { to: previous })
+    // cap, a copy this trial made of the keychain is removed (the release `current` goes back
+    // to may read only the keychain, so the copy must not outlive the trial), `current` moves,
+    // and only then is the trial cleared. A failure or a crash in between leaves a trial at
+    // the cap, so the next start rolls back again.
+    let mut roll_back = || -> io::Result<()> {
+        state.refused = Some(format!("v{running}"));
+        save(home, &state)?;
+        crate::secrets::drop_copy(home, running).map_err(io::Error::other)?;
+        point_current(home, &previous)?;
+        state.trial = None;
+        save(home, &state)
+    };
+    Ok(match roll_back() {
+        Ok(()) => Start::RolledBack { to: previous },
+        Err(error) => Start::RollbackStopped {
+            error: error.to_string(),
+        },
+    })
 }
 
 /// True when this process runs from `<home>/current`, the only place that is updated: that
@@ -408,6 +421,8 @@ enum Begin {
     Run { watch: bool },
     /// The trial failed and `current` went back to `to`.
     RolledBack { to: String },
+    /// The trial failed and the rollback stopped part way, for `error`.
+    RollbackStopped { error: String },
 }
 
 /// What a start does about an update, for the process at `exe`.
@@ -420,11 +435,13 @@ fn begin(home: &Path, exe: &Path, running: &str) -> io::Result<Begin> {
             watch: on_trial(home, exe, running),
         },
         Start::RolledBack { to } => Begin::RolledBack { to },
+        Start::RollbackStopped { error } => Begin::RollbackStopped { error },
     })
 }
 
 /// Called by `foundryd run` before it does anything else. False means this version was
-/// rolled back and the process must exit with success so the service starts the previous one.
+/// rolled back, or its rollback stopped part way, and the process must exit with success so
+/// the service starts the previous one or tries the rollback again.
 /// A start that goes on while a trial of this version is on gets a watchdog: if the daemon is
 /// not healthy by [`TRIAL_DEADLINE`] the process exits, so a hang counts as a failed start.
 pub fn starting(home: &Path) -> bool {
@@ -453,6 +470,12 @@ fn starting_with(home: &Path, exe: &Path, running: &str, arm: impl FnOnce()) -> 
         Ok(Begin::RolledBack { to }) => {
             tracing::error!(
                 "version {running} did not become healthy in {MAX_STARTS} starts: back to {to}, and v{running} is refused until a higher tag appears"
+            );
+            false
+        }
+        Ok(Begin::RollbackStopped { error }) => {
+            tracing::error!(
+                "version {running} did not become healthy in {MAX_STARTS} starts, and putting the previous version back stopped part way: {error}; exiting so the next start tries again"
             );
             false
         }
@@ -826,15 +849,12 @@ fn became_healthy(flag: &AtomicBool, home: &Path, exe: &Path, running: &str) -> 
 }
 
 /// Marks this version healthy after a minute (again at each check until the mark is saved),
-/// then looks for a newer tag every ten minutes. Once the mark is saved it removes the keychain
-/// secrets a keychain-era release left, now that no rollback can need them
-/// ([`crate::secrets::forget_moved`]).
+/// then looks for a newer tag every ten minutes.
 /// After installing one it stops the daemon with SIGTERM, so the service starts the new
 /// `current`. Never returns: a daemon that is not run from `current` just waits.
 pub async fn run(home: PathBuf) {
     let running = env!("CARGO_PKG_VERSION");
     let work = home.clone();
-    let proven = home.clone();
     run_with(
         home,
         std::env::current_exe(),
@@ -846,14 +866,12 @@ pub async fn run(home: PathBuf) {
                 tracing::error!("cannot stop for the update: {error}");
             }
         },
-        move || crate::secrets::forget_moved(&proven),
     )
     .await;
 }
 
 /// [`run`] with its inputs given: this process's path, the flag the watchdog reads, one
-/// update check, what stops the daemon once a check has installed a tag, and what to do once
-/// the healthy mark is saved, when no rollback can put the previous version back.
+/// update check, and what stops the daemon once a check has installed a tag.
 async fn run_with(
     home: PathBuf,
     exe: io::Result<PathBuf>,
@@ -861,7 +879,6 @@ async fn run_with(
     flag: &AtomicBool,
     check: impl Fn() -> Result<Option<String>, UpdateError> + Clone + Send + 'static,
     stop: impl Fn(),
-    proven: impl FnOnce() + Send + 'static,
 ) {
     tokio::time::sleep(HEALTHY_AFTER).await;
     // The flag is set whatever `exe` is, so a failed lookup never lets the watchdog kill a
@@ -876,17 +893,12 @@ async fn run_with(
         pending::<()>().await;
     }
     let mut marked = false;
-    let mut proven = Some(proven);
     loop {
         if !marked {
             let home = home.clone();
             marked = tokio::task::spawn_blocking(move || mark_healthy(&home, running))
                 .await
                 .unwrap_or(false);
-        }
-        // Not awaited: it can wait on a keychain prompt, and the update checks go on meanwhile.
-        if marked && let Some(proven) = proven.take() {
-            tokio::task::spawn_blocking(proven);
         }
         match tokio::task::spawn_blocking(check.clone()).await {
             Ok(Ok(Some(tag))) => {
@@ -943,22 +955,68 @@ mod tests {
         fs::read_link(home.join("current")).unwrap()
     }
 
-    /// The secrets a trial copied out of the keychain are set aside when it rolls back, so the
+    /// The copy a trial made of the keychain is removed when it rolls back, so the
     /// keychain-era release it goes back to stays the one source, and the next release copies
     /// again.
     #[test]
-    fn a_rollback_sets_aside_the_secrets_the_trial_copied() {
+    fn a_rollback_removes_the_secrets_the_trial_copied() {
         let home = trial_home();
         let secrets = home.path().join("secrets.json");
+        let mark = home.path().join("secrets.json.copied");
         fs::write(&secrets, "{}").unwrap();
-        fs::write(home.path().join("secrets.json.copied"), "").unwrap();
+        fs::write(&mark, "0.2.0").unwrap();
         for _ in 0..3 {
             start_with(home.path(), "0.2.0").unwrap();
         }
         let fourth = start_with(home.path(), "0.2.0").unwrap();
         assert_eq!(fourth, Start::RolledBack { to: "0.1.0".into() });
         assert!(!secrets.exists());
-        assert!(home.path().join("secrets.json.rolled-back").exists());
+        assert!(!mark.exists());
+    }
+
+    /// A copy the previous version made is its live store: a rollback to it keeps the file.
+    #[test]
+    fn a_rollback_leaves_a_copy_another_version_made() {
+        let home = trial_home();
+        let secrets = home.path().join("secrets.json");
+        let mark = home.path().join("secrets.json.copied");
+        fs::write(&secrets, "{}").unwrap();
+        fs::write(&mark, "0.1.0").unwrap();
+        for _ in 0..4 {
+            start_with(home.path(), "0.2.0").unwrap();
+        }
+        assert_eq!(current(home.path()), PathBuf::from("versions/0.1.0"));
+        assert!(secrets.exists());
+        assert_eq!(fs::read_to_string(&mark).unwrap(), "0.1.0");
+    }
+
+    /// A rollback that stops part way exits rather than run the failed version unwatched, and
+    /// the trial stays at its cap, so the next start tries the rollback again.
+    #[test]
+    fn a_rollback_that_cannot_remove_the_copy_exits_and_rolls_back_on_the_next_start() {
+        let home = trial_home();
+        let exe = exe_in(home.path(), "0.2.0");
+        let secrets = home.path().join("secrets.json");
+        let mark = home.path().join("secrets.json.copied");
+        // A directory with a file in it is not removed as a file is.
+        fs::create_dir(&secrets).unwrap();
+        fs::write(secrets.join("held"), "").unwrap();
+        fs::write(&mark, "0.2.0").unwrap();
+        for _ in 0..3 {
+            assert_eq!(started(home.path(), &exe), (true, 1));
+        }
+
+        assert_eq!(started(home.path(), &exe), (false, 0));
+        assert_eq!(current(home.path()), PathBuf::from("versions/0.2.0"));
+        assert!(mark.exists());
+
+        fs::remove_dir_all(&secrets).unwrap();
+        fs::write(&secrets, "{}").unwrap();
+        assert_eq!(started(home.path(), &exe), (false, 0));
+        assert_eq!(current(home.path()), PathBuf::from("versions/0.1.0"));
+        assert!(!secrets.exists());
+        assert!(!mark.exists());
+        assert_eq!(state(home.path()).unwrap().trial, None);
     }
 
     #[test]
@@ -1247,7 +1305,11 @@ mod tests {
         let obstacle = home.path().join("current.new");
         fs::create_dir_all(obstacle.join("inside")).unwrap();
 
-        assert!(start_with(home.path(), "0.2.0").is_err());
+        let stopped = start_with(home.path(), "0.2.0").unwrap();
+        assert!(
+            matches!(stopped, Start::RollbackStopped { .. }),
+            "{stopped:?}"
+        );
         assert_eq!(current(home.path()), PathBuf::from("versions/0.2.0"));
         fs::remove_dir_all(&obstacle).unwrap();
         let next = start_with(home.path(), "0.2.0").unwrap();
@@ -1813,19 +1875,6 @@ mod tests {
         counts: (&'static AtomicUsize, &'static AtomicUsize),
         result: fn() -> Result<Option<String>, UpdateError>,
     ) -> tokio::task::JoinHandle<()> {
-        static IGNORED: AtomicUsize = AtomicUsize::new(0);
-        spawn_run_proven(home, exe, flag, counts, result, &IGNORED)
-    }
-
-    /// [`spawn_run`], counting in `proven` each time this version is told it is proven.
-    fn spawn_run_proven(
-        home: &Path,
-        exe: io::Result<PathBuf>,
-        flag: &'static AtomicBool,
-        counts: (&'static AtomicUsize, &'static AtomicUsize),
-        result: fn() -> Result<Option<String>, UpdateError>,
-        proven: &'static AtomicUsize,
-    ) -> tokio::task::JoinHandle<()> {
         let home = home.to_path_buf();
         let (checks, stops) = counts;
         tokio::spawn(run_with(
@@ -1840,130 +1889,7 @@ mod tests {
             move || {
                 stops.fetch_add(1, Ordering::Relaxed);
             },
-            move || {
-                proven.fetch_add(1, Ordering::Relaxed);
-            },
         ))
-    }
-
-    /// The keychain items a keychain-era release left are forgotten only once this version's
-    /// trial is over, so a rollback before then still finds them.
-    #[tokio::test(start_paused = true)]
-    async fn run_says_this_version_is_proven_once_and_only_after_the_trial_is_marked_healthy() {
-        static FLAG: AtomicBool = AtomicBool::new(false);
-        static CHECKS: AtomicUsize = AtomicUsize::new(0);
-        static STOPS: AtomicUsize = AtomicUsize::new(0);
-        static PROVEN: AtomicUsize = AtomicUsize::new(0);
-        let home = trial_home();
-        let exe = exe_in(home.path(), "0.2.0");
-        let task = spawn_run_proven(
-            home.path(),
-            Ok(exe),
-            &FLAG,
-            (&CHECKS, &STOPS),
-            nothing,
-            &PROVEN,
-        );
-
-        tokio::time::sleep(HEALTHY_AFTER / 2).await;
-        assert_eq!(PROVEN.load(Ordering::Relaxed), 0);
-        tokio::time::sleep(HEALTHY_AFTER / 2 + Duration::from_secs(1)).await;
-        reach(&CHECKS, 1).await;
-        reach(&PROVEN, 1).await;
-        assert_eq!(state(home.path()).unwrap().trial, None);
-        assert_eq!(PROVEN.load(Ordering::Relaxed), 1);
-        tokio::time::sleep(CHECK_EVERY + Duration::from_secs(1)).await;
-        reach(&CHECKS, 2).await;
-        assert_eq!(PROVEN.load(Ordering::Relaxed), 1);
-        task.abort();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_healthy_mark_that_cannot_be_saved_proves_nothing_until_it_is_saved() {
-        static FLAG: AtomicBool = AtomicBool::new(false);
-        static CHECKS: AtomicUsize = AtomicUsize::new(0);
-        static STOPS: AtomicUsize = AtomicUsize::new(0);
-        static PROVEN: AtomicUsize = AtomicUsize::new(0);
-        let home = trial_home();
-        let exe = exe_in(home.path(), "0.2.0");
-        let blocker = home.path().join("update.json.tmp");
-        fs::create_dir(&blocker).unwrap();
-        let task = spawn_run_proven(
-            home.path(),
-            Ok(exe),
-            &FLAG,
-            (&CHECKS, &STOPS),
-            nothing,
-            &PROVEN,
-        );
-
-        tokio::time::sleep(HEALTHY_AFTER + Duration::from_secs(1)).await;
-        reach(&CHECKS, 1).await;
-        assert_eq!(PROVEN.load(Ordering::Relaxed), 0);
-        fs::remove_dir(&blocker).unwrap();
-        tokio::time::sleep(CHECK_EVERY).await;
-        reach(&CHECKS, 2).await;
-        reach(&PROVEN, 1).await;
-        assert_eq!(PROVEN.load(Ordering::Relaxed), 1);
-        task.abort();
-    }
-
-    /// The proven step can wait on a keychain prompt; the update checks go on meanwhile.
-    #[tokio::test(start_paused = true)]
-    async fn a_proven_step_that_waits_does_not_hold_up_the_update_checks() {
-        static FLAG: AtomicBool = AtomicBool::new(false);
-        static CHECKS: AtomicUsize = AtomicUsize::new(0);
-        let home = trial_home();
-        let exe = exe_in(home.path(), "0.2.0");
-        let (release, waiting) = std::sync::mpsc::channel::<()>();
-        let task = tokio::spawn(run_with(
-            home.path().to_path_buf(),
-            Ok(exe),
-            "0.2.0",
-            &FLAG,
-            || {
-                CHECKS.fetch_add(1, Ordering::Relaxed);
-                Ok(None)
-            },
-            || {},
-            move || {
-                let _ = waiting.recv();
-            },
-        ));
-
-        // Exactly to the mark: a paused clock does not advance while the waiting step holds
-        // its blocking thread.
-        tokio::time::sleep(HEALTHY_AFTER).await;
-        reach(&CHECKS, 1).await;
-        assert_eq!(CHECKS.load(Ordering::Relaxed), 1);
-        drop(release);
-        task.abort();
-    }
-
-    /// A daemon not run from `current` takes no part in trials, so nothing proves it.
-    #[tokio::test(start_paused = true)]
-    async fn run_from_elsewhere_is_never_proven() {
-        static FLAG: AtomicBool = AtomicBool::new(false);
-        static CHECKS: AtomicUsize = AtomicUsize::new(0);
-        static STOPS: AtomicUsize = AtomicUsize::new(0);
-        static PROVEN: AtomicUsize = AtomicUsize::new(0);
-        let home = trial_home();
-        let elsewhere = home.path().join("elsewhere");
-        script(&elsewhere, "foundryd 0.2.0");
-        let task = spawn_run_proven(
-            home.path(),
-            Ok(elsewhere),
-            &FLAG,
-            (&CHECKS, &STOPS),
-            nothing,
-            &PROVEN,
-        );
-
-        tokio::time::sleep(HEALTHY_AFTER + CHECK_EVERY * 3).await;
-        std::thread::sleep(Duration::from_millis(100));
-        assert!(FLAG.load(Ordering::Relaxed));
-        assert_eq!(PROVEN.load(Ordering::Relaxed), 0);
-        task.abort();
     }
 
     /// Lets the blocking check threads run until `counter` reaches `n`.
