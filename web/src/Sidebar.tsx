@@ -8,6 +8,7 @@ import { startShell } from "./api";
 import { couldNot, words } from "./labels";
 import { loadUnfolded, saveUnfolded } from "./fold";
 import { byUrgency, machineNumbers, machineStats, rows, type MachineView, type Row, type WorkspaceView } from "./fleet";
+import { MachineName } from "./Machines";
 import { glyphText, StateGlyph } from "./StateGlyph";
 import { ended } from "./ends";
 import { ARCHIVE_ICON, TerminalMenu, useTerminalActions } from "./TerminalMenu";
@@ -180,18 +181,34 @@ export function Sidebar({ machines, onCreate, selected, onNavigate, onClose, onJ
         return (
           <section key={machine.id} aria-label={machine.name} className="space-y-2">
             <div className="px-1">
-              <div className="flex items-center gap-2">
+              <div className="group/machine flex items-center gap-2">
                 <span aria-hidden="true" className={`size-1.5 shrink-0 rounded-full ${statusDot[machine.status]}`} />
-                <h2 className="min-w-0 truncate font-semibold">
-                  <Link
-                    to="/machines"
-                    onClick={onNavigate}
-                    title={`${machine.id}: its load, memory, disk and workspaces`}
-                    className="rounded hover:underline hover:decoration-neutral-600 hover:underline-offset-4"
-                  >
-                    {machine.name}
-                  </Link>
-                </h2>
+                <MachineName machine={machine} className="text-sm font-semibold">
+                  {(rename) => (
+                    <>
+                      <h2 className="min-w-0 truncate font-semibold">
+                        <Link
+                          to="/machines"
+                          onClick={onNavigate}
+                          title={`${machine.id}: its load, memory, disk and workspaces`}
+                          className="rounded hover:underline hover:decoration-neutral-600 hover:underline-offset-4"
+                        >
+                          {machine.name}
+                        </Link>
+                      </h2>
+                      {rename && (
+                        <Action
+                          label={`Rename ${machine.name}`}
+                          title="Rename"
+                          onClick={rename}
+                          className="shrink-0 pointer-fine:opacity-0 pointer-fine:group-hover/machine:opacity-100 pointer-fine:focus-visible:opacity-100"
+                        >
+                          <path d="M10.5 2.5l3 3L6 13H3v-3z" />
+                        </Action>
+                      )}
+                    </>
+                  )}
+                </MachineName>
                 <span className={`text-xs ${statusColour[machine.status]}`}>{machine.status}</span>
                 {ids.length > 0 && (
                   <button
@@ -385,7 +402,7 @@ function Strip({ list, workspace, selected, onNavigate, tab }: { list: Row[]; wo
   );
 }
 
-function Action({ label, title, onClick, disabled, children }: { label: string; title: string; onClick?: () => void; disabled?: boolean; children: ReactNode }) {
+function Action({ label, title, onClick, disabled, className = "", children }: { label: string; title: string; onClick?: () => void; disabled?: boolean; className?: string; children: ReactNode }) {
   return (
     <button
       type="button"
@@ -393,7 +410,7 @@ function Action({ label, title, onClick, disabled, children }: { label: string; 
       title={title}
       onClick={onClick}
       disabled={disabled}
-      className="grid size-6 place-items-center rounded text-neutral-400 hover:bg-neutral-700 hover:text-neutral-100 disabled:opacity-40"
+      className={`grid size-6 place-items-center rounded text-neutral-400 hover:bg-neutral-700 hover:text-neutral-100 disabled:opacity-40 ${className}`}
     >
       <svg viewBox="0 0 16 16" className="size-3.5" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
         {children}

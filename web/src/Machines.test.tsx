@@ -1,10 +1,10 @@
-import { screen, within } from "@testing-library/react";
+import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { fleet } from "./fleet";
 import { Machines } from "./Machines";
 import { remember } from "./samples";
 import { ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
-import { renderApp } from "./test-utils";
+import { json, mockFetch, renderApp } from "./test-utils";
 
 const twoMachines = settings({
   machines: [
@@ -88,5 +88,132 @@ describe("Machines", () => {
   it("says the numbers stopped when the page lost the daemon", async () => {
     await show({ connected: false });
     expect(screen.getByText(/disconnected/i)).toBeDefined();
+  });
+
+  describe("renaming", () => {
+    const nameField = () => screen.getByRole<HTMLInputElement>("textbox", { name: "Machine name" });
+    const rename = (to: string) => {
+      fireEvent.click(within(card("studio")).getByRole("button", { name: "studio" }));
+      fireEvent.change(nameField(), { target: { value: to } });
+    };
+
+    it("renames a machine in place: a click on its name, then Enter posts the name, trimmed, and closes the field on 204", async () => {
+      const calls = mockFetch(new Response(null, { status: 204 }));
+      await show();
+
+      rename("  Tom's desk ");
+      fireEvent.keyDown(nameField(), { key: "Enter" });
+
+      await waitFor(() => expect(screen.queryByRole("textbox", { name: "Machine name" })).toBeNull());
+      expect(calls).toEqual([{ url: `/api/machines/${ME}/rename`, method: "POST", body: { name: "Tom's desk" } }]);
+    });
+
+    it("opens the field on the machine's name, all of it selected", async () => {
+      mockFetch();
+      await show();
+
+      fireEvent.click(within(card("studio")).getByRole("button", { name: "studio" }));
+
+      expect(nameField().value).toBe("studio");
+      expect(document.activeElement).toBe(nameField());
+    });
+
+    it("sends nothing on Escape and shows the name again", async () => {
+      const calls = mockFetch();
+      await show();
+
+      rename("Tom's desk");
+      fireEvent.keyDown(nameField(), { key: "Escape" });
+
+      expect(screen.queryByRole("textbox", { name: "Machine name" })).toBeNull();
+      expect(within(card("studio")).getByRole("button", { name: "studio" })).toBeDefined();
+      expect(calls).toEqual([]);
+    });
+
+    it("keeps the field open, with its text, when it loses focus", async () => {
+      const calls = mockFetch();
+      await show();
+
+      rename("Tom's desk");
+      fireEvent.blur(nameField());
+
+      expect(nameField().value).toBe("Tom's desk");
+      expect(calls).toEqual([]);
+    });
+
+    it("sends nothing for the name it already has", async () => {
+      const calls = mockFetch();
+      await show();
+
+      rename(" studio ");
+      fireEvent.keyDown(nameField(), { key: "Enter" });
+
+      expect(screen.queryByRole("textbox", { name: "Machine name" })).toBeNull();
+      expect(calls).toEqual([]);
+    });
+
+    it("shows a 409's error under the field and keeps the text", async () => {
+      mockFetch(json(409, { error: 'another machine is named "laptop"' }));
+      await show();
+
+      rename("Laptop");
+      fireEvent.keyDown(nameField(), { key: "Enter" });
+
+      expect((await screen.findByRole("alert")).textContent).toBe('another machine is named "laptop"');
+      expect(nameField().value).toBe("Laptop");
+    });
+
+    it("shows the field busy while the rename is on its way, then takes edits again", async () => {
+      mockFetch();
+      const served = globalThis.fetch;
+      let answer!: (response: Response) => void;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn((url: string, init?: RequestInit) => (url.endsWith("/rename") ? new Promise<Response>((r) => (answer = r)) : served(url, init))),
+      );
+      await show();
+
+      rename("Laptop");
+      fireEvent.keyDown(nameField(), { key: "Enter" });
+
+      await waitFor(() => expect(nameField().getAttribute("aria-busy")).toBe("true"));
+      expect(nameField().readOnly).toBe(true);
+      answer(json(409, { error: 'another machine is named "laptop"' }));
+      await screen.findByRole("alert");
+      expect(nameField().getAttribute("aria-busy")).toBeNull();
+      expect(nameField().readOnly).toBe(false);
+    });
+
+    it("keeps the card named, and its machine id on hover, while the field is open", async () => {
+      mockFetch();
+      await show();
+
+      expect(within(card("studio")).getByTitle(new RegExp(ME))).toBeDefined();
+      rename("Tom's desk");
+
+      expect(within(card("studio")).getByRole("textbox", { name: "Machine name" })).toBeDefined();
+    });
+
+    it("offers no rename for a machine not in the machine list yet", async () => {
+      mockFetch();
+      const listed = settings({ machines: [{ id: ME, name: "studio", address: "" }] });
+      await renderApp(<Machines machines={fleet(records, listed)} history={{}} here={ME} connected />);
+
+      const unlisted = screen.getAllByRole("article").find((article) => !within(article).queryByText("This machine"))!;
+      expect(within(unlisted).queryByRole("button")).toBeNull();
+      expect(within(unlisted).getByTitle(OTHER)).toBeDefined();
+      expect(within(card("studio")).getByRole("button", { name: "studio" })).toBeDefined();
+    });
+
+    it("shows a 422's error the same way", async () => {
+      mockFetch(json(422, { error: "a machine's name is at most 60 characters" }));
+      await show();
+
+      rename("x".repeat(61));
+      fireEvent.keyDown(nameField(), { key: "Enter" });
+
+      expect((await screen.findByRole("alert")).textContent).toBe("a machine's name is at most 60 characters");
+      expect(nameField().value).toBe("x".repeat(61));
+    });
   });
 });
