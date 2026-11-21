@@ -1,12 +1,12 @@
 //! The command line: `--version` works, `join` names a bad port, and `secret set`
-//! stores a gateway key without printing it. Every test that runs the binary uses the file
-//! secret store and a temporary data directory, never the login keychain.
+//! stores a gateway key without printing it. Every test that runs the binary uses a temporary
+//! data directory and skips the copy from the login keychain.
 
-// A release build ignores `FOUNDRY_SECRETS`, so on macOS these runs of the binary would read
-// the login keychain to move its secrets.
+// A release build ignores `FOUNDRY_SECRETS`, so on macOS these runs of the binary would move
+// secrets out of the login keychain.
 #[cfg(all(target_os = "macos", not(debug_assertions)))]
 compile_error!(
-    "run these tests in a debug build: a release build on macOS reads the login keychain"
+    "run these tests in a debug build: a release build on macOS copies secrets out of the login keychain"
 );
 
 use std::io::Write as _;
@@ -14,7 +14,7 @@ use std::process::{Command, Output, Stdio};
 
 use foundryd::secrets::{FileSecrets, Secrets};
 
-/// `foundryd` with the file secret store and a data directory and `HOME` of its own, so no
+/// `foundryd` with a data directory and `HOME` of its own and no copy from the keychain, so no
 /// run touches the login keychain or the real home.
 fn isolated(args: &[&str], home: &tempfile::TempDir) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_foundryd"));

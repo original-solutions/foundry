@@ -2,11 +2,11 @@
 //! back to the previous version and the tag is refused. The binary runs from `<home>/current`,
 //! as the service runs it, with the file secret store and a data directory of its own.
 
-// A release build ignores `FOUNDRY_SECRETS`, so on macOS this run would read the login
-// keychain to move its secrets.
+// A release build ignores `FOUNDRY_SECRETS`, so on macOS this run would copy secrets out of the
+// login keychain.
 #[cfg(all(target_os = "macos", not(debug_assertions)))]
 compile_error!(
-    "run these tests in a debug build: a release build on macOS reads the login keychain"
+    "run these tests in a debug build: a release build on macOS copies secrets out of the login keychain"
 );
 
 use std::fs;

@@ -1,13 +1,13 @@
 //! The `foundryd` binary run as a daemon: the data-directory lock, a clean stop that leaves
 //! terminals running, `status`, the peer route's key proof and the gateway settings. Each
-//! test uses its own data directory, a free port and the file secret store, never the
+//! test uses its own data directory, a free port and no copy from the keychain, never the
 //! defaults or the login keychain.
 
-// A release build ignores `FOUNDRY_SECRETS`, so on macOS these runs of the binary would read
-// the login keychain to move its secrets.
+// A release build ignores `FOUNDRY_SECRETS`, so on macOS these runs of the binary would move
+// secrets out of the login keychain.
 #[cfg(all(target_os = "macos", not(debug_assertions)))]
 compile_error!(
-    "run these tests in a debug build: a release build on macOS reads the login keychain"
+    "run these tests in a debug build: a release build on macOS copies secrets out of the login keychain"
 );
 
 // A release build ignores `FOUNDRY_TAILSCALE`, so these runs of the binary would ask the real
@@ -852,7 +852,7 @@ async fn the_daemon_dials_a_peer_through_the_key_handshake() {
     assert_eq!(said["type"], "challenge", "first frame: {first}");
 }
 
-/// A secret read that never returns, as a keychain prompt nobody answers does: the secret
+/// A secret read that never returns, as one from a disk that does not answer does: the secret
 /// store's file is a FIFO the test holds open and never writes to.
 #[test]
 fn sigterm_stops_a_daemon_stuck_reading_its_secrets_at_start() {

@@ -33,7 +33,7 @@ const REPO: &str = "original-solutions/foundry";
 const HEALTHY_AFTER: Duration = Duration::from_secs(60);
 
 /// How long a trial may take to become healthy before the process gives up and exits, so a
-/// start that hangs (on a keychain prompt, say) counts as a failed start.
+/// start that hangs (on a disk that does not answer, say) counts as a failed start.
 const TRIAL_DEADLINE: Duration = Duration::from_secs(300);
 
 /// The release public key, as hex. The release workflow reads it from this line and refuses to
@@ -329,6 +329,12 @@ pub enum Start {
         /// The version `current` went back to.
         to: String,
     },
+    /// The trial failed and the rollback stopped part way: this process must exit, and the
+    /// next start, with the trial still at its cap, tries the rollback again.
+    RollbackStopped {
+        /// Why it stopped.
+        error: String,
+    },
 }
 
 /// Counts this start against a trial of `running`, or rolls the trial back. Any other
@@ -354,13 +360,22 @@ fn start_with(home: &Path, running: &str) -> io::Result<Start> {
     }
     // Three steps, each safe to stop after: the refusal is saved with the trial still at its
     // cap, `current` moves, and only then is the trial cleared. A failure or a crash in
-    // between leaves a trial at the cap, so the next start rolls back again.
-    state.refused = Some(format!("v{running}"));
-    save(home, &state)?;
-    point_current(home, &previous)?;
-    state.trial = None;
-    save(home, &state)?;
-    Ok(Start::RolledBack { to: previous })
+    // between leaves a trial at the cap, so the next start rolls back again. A trial never
+    // copies a Mac's secrets out of the keychain (only a version installed by hand does), so
+    // the version `current` goes back to finds them where it left them.
+    let mut roll_back = || -> io::Result<()> {
+        state.refused = Some(format!("v{running}"));
+        save(home, &state)?;
+        point_current(home, &previous)?;
+        state.trial = None;
+        save(home, &state)
+    };
+    Ok(match roll_back() {
+        Ok(()) => Start::RolledBack { to: previous },
+        Err(error) => Start::RollbackStopped {
+            error: error.to_string(),
+        },
+    })
 }
 
 /// True when this process runs from `<home>/current`, the only place that is updated: that
@@ -410,6 +425,8 @@ enum Begin {
     Run { watch: bool },
     /// The trial failed and `current` went back to `to`.
     RolledBack { to: String },
+    /// The trial failed and the rollback stopped part way, for `error`.
+    RollbackStopped { error: String },
 }
 
 /// What a start does about an update, for the process at `exe`.
@@ -422,11 +439,13 @@ fn begin(home: &Path, exe: &Path, running: &str) -> io::Result<Begin> {
             watch: on_trial(home, exe, running),
         },
         Start::RolledBack { to } => Begin::RolledBack { to },
+        Start::RollbackStopped { error } => Begin::RollbackStopped { error },
     })
 }
 
 /// Called by `foundryd run` before it does anything else. False means this version was
-/// rolled back and the process must exit with success so the service starts the previous one.
+/// rolled back, or its rollback stopped part way, and the process must exit with success so
+/// the service starts the previous one or tries the rollback again.
 /// A start that goes on while a trial of this version is on gets a watchdog: if the daemon is
 /// not healthy by [`TRIAL_DEADLINE`] the process exits, so a hang counts as a failed start.
 pub fn starting(home: &Path) -> bool {
@@ -455,6 +474,12 @@ fn starting_with(home: &Path, exe: &Path, running: &str, arm: impl FnOnce()) -> 
         Ok(Begin::RolledBack { to }) => {
             tracing::error!(
                 "version {running} did not become healthy in {MAX_STARTS} starts: back to {to}, and v{running} is refused until a higher tag appears"
+            );
+            false
+        }
+        Ok(Begin::RollbackStopped { error }) => {
+            tracing::error!(
+                "version {running} did not become healthy in {MAX_STARTS} starts, and putting the previous version back stopped part way: {error}; exiting so the next start tries again"
             );
             false
         }
@@ -1208,7 +1233,11 @@ mod tests {
         let obstacle = home.path().join("current.new");
         fs::create_dir_all(obstacle.join("inside")).unwrap();
 
-        assert!(start_with(home.path(), "0.2.0").is_err());
+        let stopped = start_with(home.path(), "0.2.0").unwrap();
+        assert!(
+            matches!(stopped, Start::RollbackStopped { .. }),
+            "{stopped:?}"
+        );
         assert_eq!(current(home.path()), PathBuf::from("versions/0.2.0"));
         fs::remove_dir_all(&obstacle).unwrap();
         let next = start_with(home.path(), "0.2.0").unwrap();
@@ -1932,6 +1961,28 @@ mod tests {
         fs::write(home.path().join("update.json"), "not json").unwrap();
 
         assert_eq!(started(home.path(), &exe), (true, 0));
+    }
+
+    /// A rollback that stops part way exits rather than run the failed version unwatched, and
+    /// the trial stays at its cap, so the next start tries the rollback again.
+    #[test]
+    fn a_rollback_that_stops_part_way_exits_and_rolls_back_on_the_next_start() {
+        let home = trial_home();
+        let exe = exe_in(home.path(), "0.2.0");
+        for _ in 0..3 {
+            assert_eq!(started(home.path(), &exe), (true, 1));
+        }
+        // A directory with a file in it stops `current` from moving.
+        let obstacle = home.path().join("current.new");
+        fs::create_dir_all(obstacle.join("inside")).unwrap();
+
+        assert_eq!(started(home.path(), &exe), (false, 0));
+        assert_eq!(current(home.path()), PathBuf::from("versions/0.2.0"));
+
+        fs::remove_dir_all(&obstacle).unwrap();
+        assert_eq!(started(home.path(), &exe), (false, 0));
+        assert_eq!(current(home.path()), PathBuf::from("versions/0.1.0"));
+        assert_eq!(state(home.path()).unwrap().trial, None);
     }
 
     #[test]
