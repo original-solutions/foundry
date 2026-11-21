@@ -1100,6 +1100,80 @@ async fn a_create_that_cannot_record_its_workspace_leaves_no_branch_behind() {
 }
 
 #[tokio::test]
+async fn a_create_whose_project_is_removed_before_its_record_is_written_leaves_nothing_behind() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    // The first create makes the clone, where the hook goes.
+    setup.create(&remote, "main", "first").await;
+
+    // `worktree add` runs this hook once the worktree is there and before the record is
+    // written: it says so, then waits to be let go.
+    let marks = tempfile::tempdir().unwrap();
+    let (reached, go) = (marks.path().join("reached"), marks.path().join("go"));
+    let hook = setup.clone_of(remote.project).join("hooks/post-checkout");
+    std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\ntouch '{}'\nwhile [ ! -e '{}' ]; do sleep 0.05; done\n",
+            reached.display(),
+            go.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let removing = async {
+        let deadline = Instant::now() + WAIT;
+        while !reached.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "the create never reached the hook"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let mut store = setup.store.lock().unwrap();
+        let mut settings = store.settings().unwrap();
+        settings.seq += 1;
+        settings.projects.retain(|p| p.id != remote.project);
+        assert!(store.apply_settings(settings).unwrap());
+        drop(store);
+        std::fs::write(&go, "").unwrap();
+    };
+    let (created, ()) = tokio::join!(
+        setup.workspaces.create(remote.project, "main", "second"),
+        removing
+    );
+
+    let err = created.unwrap_err();
+    assert!(
+        matches!(err, WorkspaceError::UnknownProject(p) if p == remote.project),
+        "{err:?}"
+    );
+    assert!(
+        err.to_string().contains(&remote.project.to_string()),
+        "{err}"
+    );
+    assert!(!setup.worktree(remote.project, "second").exists());
+    let clone = setup.clone_of(remote.project);
+    let branches = git(
+        &clone,
+        &["for-each-ref", "--format=%(refname)", "refs/heads/"],
+    );
+    assert!(!branches.contains("second"), "{branches}");
+    let listed = git(&clone, &["worktree", "list", "--porcelain"]);
+    assert!(!listed.contains("second"), "{listed}");
+    let store = setup.store.lock().unwrap();
+    let named = store
+        .since(setup.me, 0)
+        .unwrap()
+        .into_iter()
+        .any(|record| matches!(record, AnyRecord::Workspace(r) if r.body.name == "second"));
+    assert!(!named, "a record names the workspace");
+}
+
+#[tokio::test]
 async fn a_name_whose_folder_is_taken_is_refused_and_the_folder_is_untouched() {
     let setup = Setup::new();
     let remote = setup.project(&[("README.md", "hello\n")]);
