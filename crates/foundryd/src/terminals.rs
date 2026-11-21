@@ -1712,6 +1712,28 @@ mod tests {
         assert!(seen.contains("[COLORTERM=truecolor]"), "{seen:?}");
     }
 
+    /// Whatever the test process's own `TERM`, a caller's variable replaces its default rather
+    /// than sitting beside it.
+    #[test]
+    fn colour_env_adds_only_the_defaults_the_caller_does_not_name() {
+        let pair = |name: &str, value: &str| (name.to_string(), value.to_string());
+        assert_eq!(
+            colour_env(&[]),
+            vec![
+                pair("TERM", "xterm-256color"),
+                pair("COLORTERM", "truecolor")
+            ]
+        );
+        assert_eq!(
+            colour_env(&[pair("TERM", "vt100"), pair("FOUNDRY_TEST_VALUE", "kept")]),
+            vec![
+                pair("COLORTERM", "truecolor"),
+                pair("TERM", "vt100"),
+                pair("FOUNDRY_TEST_VALUE", "kept"),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn the_child_gets_the_env_and_the_env_file_is_gone() {
         let setup = Setup::new();
