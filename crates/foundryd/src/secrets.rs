@@ -2,9 +2,9 @@
 //!
 //! [`Secrets`] is the one interface and [`FileSecrets`] backs it. [`for_this_machine`] picks
 //! the store this machine uses. macOS once kept them in the login keychain ([`Keychain`]); a
-//! Mac that still has them there moves them into the file the first time it opens its store
-//! ([`FileSecrets::adopt`]), so a rebuilt or updated binary, which the keychain treats as
-//! another program, never stops at a keychain prompt again. A secret's value never reaches an
+//! Mac that still has them there moves them into the file the first time a version installed
+//! by hand opens its store ([`FileSecrets::adopt`]), so from then on a rebuilt or updated
+//! binary, which the keychain treats as another program, never stops at a keychain prompt. A secret's value never reaches an
 //! error message: errors name the secret or the file, never what it holds.
 
 use std::collections::BTreeMap;
@@ -88,6 +88,12 @@ pub enum SecretsError {
         LOCK_WAIT.as_secs()
     )]
     Locked { path: PathBuf },
+    #[error(
+        "the secrets are still in the login keychain, and a version the daemon installed itself \
+         does not move them; install this version by hand and answer the keychain prompts \
+         (docs/install.md)"
+    )]
+    NotMoved,
     #[error("the keychain could not {action} the secret {name}: {reason}")]
     Keychain {
         action: &'static str,
@@ -113,16 +119,22 @@ pub const KEPT: &[&str] = &[
 
 /// The secret store this machine uses: the file `secrets.json` in `home`, readable only by
 /// the service user. On macOS the secrets in [`KEPT`] are first moved into it from the login
-/// keychain, once. A move that cannot be made (a keychain prompt refused, say) is an error, so
-/// no process ever runs on the keychain once the file may exist; the next start tries again.
-/// In a debug build `FOUNDRY_SECRETS=file` skips the keychain, which is how tests keep out of
-/// it. A release build ignores it.
-pub fn for_this_machine(home: &Path) -> Result<Arc<dyn Secrets>, SecretsError> {
-    store_for(home, store(std::env::var_os("FOUNDRY_SECRETS").as_deref()))
+/// keychain, once, and never by a version `on_trial` (one the daemon installed itself), so an
+/// automatic rollback never runs an older version on a keychain the file has left behind. A
+/// move that cannot be made (a keychain prompt refused, say) is an error, so no process ever
+/// runs on the keychain once the file may exist; the next start tries again. In a debug build
+/// `FOUNDRY_SECRETS=file` skips the keychain, which is how tests keep out of it. A release
+/// build ignores it.
+pub fn for_this_machine(home: &Path, on_trial: bool) -> Result<Arc<dyn Secrets>, SecretsError> {
+    store_for(
+        home,
+        store(std::env::var_os("FOUNDRY_SECRETS").as_deref()),
+        on_trial,
+    )
 }
 
 /// The file store of the data directory `home`.
-pub fn file_in(home: &Path) -> FileSecrets {
+fn file_in(home: &Path) -> FileSecrets {
     FileSecrets::new(home.join("secrets.json"))
 }
 
@@ -155,7 +167,7 @@ fn store(choice: Option<&OsStr>) -> Store {
 }
 
 /// The secret store of kind `store` for the data directory `home`.
-fn store_for(home: &Path, store: Store) -> Result<Arc<dyn Secrets>, SecretsError> {
+fn store_for(home: &Path, store: Store, on_trial: bool) -> Result<Arc<dyn Secrets>, SecretsError> {
     match store {
         Store::File => Ok(Arc::new(file_in(home))),
         #[cfg(target_os = "macos")]
@@ -164,23 +176,27 @@ fn store_for(home: &Path, store: Store) -> Result<Arc<dyn Secrets>, SecretsError
             // Every keychain write an older version makes holds this lock, so none lands
             // between the move's reads and the file it writes.
             let _locked = lock_file(&lock, LOCK_WAIT)?;
-            moved(
-                home,
-                &Keychain::new("foundry", lock),
-                env!("CARGO_PKG_VERSION"),
-            )
+            moved(home, &Keychain::new("foundry", lock), on_trial)
         }
         #[cfg(not(target_os = "macos"))]
-        Store::FileFromKeychain => unreachable!("only macOS has a keychain to move from"),
+        Store::FileFromKeychain => {
+            let _ = on_trial;
+            unreachable!("only macOS has a keychain to move from")
+        }
     }
 }
 
-/// The file store of `home`, once the secrets in [`KEPT`] are moved into it from `old` by the
-/// version `by` (see [`FileSecrets::adopt`]).
+/// The file store of `home`, once the secrets in [`KEPT`] are moved into it from `old` (see
+/// [`FileSecrets::adopt`]). A version `on_trial` never reads `old`: it uses the file only when
+/// an earlier move made it, and is refused otherwise.
 #[cfg(any(target_os = "macos", test))]
-fn moved(home: &Path, old: &dyn Secrets, by: &str) -> Result<Arc<dyn Secrets>, SecretsError> {
+fn moved(home: &Path, old: &dyn Secrets, on_trial: bool) -> Result<Arc<dyn Secrets>, SecretsError> {
     let file = file_in(home);
-    file.adopt(old, KEPT, by)?;
+    if !on_trial {
+        file.adopt(old, KEPT)?;
+    } else if !file.path.try_exists().map_err(|e| file.io(e))? {
+        return Err(SecretsError::NotMoved);
+    }
     Ok(Arc::new(file))
 }
 
@@ -200,7 +216,7 @@ pub enum SetError {
 /// secret store. It never prints the value.
 pub fn set_command(name: &str) -> ExitCode {
     let result = match crate::daemon::home() {
-        Some(home) => for_this_machine(&home)
+        Some(home) => for_this_machine(&home, false)
             .map_err(SetError::from)
             .and_then(|secrets| set_from(&*secrets, name, io::BufReader::new(io::stdin()))),
         None => {
@@ -341,9 +357,8 @@ impl FileSecrets {
     /// file does not exist yet. Every name is read before anything is written, so a read that
     /// fails leaves no file and the next call tries again. The file is made even when `old`
     /// holds none of them, so `old` is never read again. `old` keeps what it holds, for a
-    /// version from before the move. `by`, the version making the move, is noted in
-    /// `<path>.moved`, so a rollback of that version can [undo](Self::undo_move) it.
-    pub fn adopt(&self, old: &dyn Secrets, names: &[&str], by: &str) -> Result<(), SecretsError> {
+    /// version from before the move.
+    pub fn adopt(&self, old: &dyn Secrets, names: &[&str]) -> Result<(), SecretsError> {
         let _locked = self.lock()?;
         if self.path.try_exists().map_err(|e| self.io(e))? {
             return Ok(());
@@ -354,48 +369,7 @@ impl FileSecrets {
                 secrets.insert((*name).to_owned(), value);
             }
         }
-        // The note first: a crash before the file leaves a note and no file, and the next move
-        // writes both again.
-        let note = self.beside(".moved");
-        let at = |source| SecretsError::Io {
-            path: note.clone(),
-            source,
-        };
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&note)
-            .map_err(at)?;
-        file.write_all(by.as_bytes()).map_err(at)?;
-        file.sync_all().map_err(at)?;
         self.write(&secrets)
-    }
-
-    /// Undoes the move the version `by` made with [`adopt`](Self::adopt): removes the file and
-    /// its note, so the old store is the one that holds the secrets again and the next move
-    /// reads them afresh. A file moved by another version, or not moved at all, is left alone.
-    pub fn undo_move(&self, by: &str) -> Result<(), SecretsError> {
-        let _locked = self.lock()?;
-        let note = self.beside(".moved");
-        let at = |source| SecretsError::Io {
-            path: note.clone(),
-            source,
-        };
-        match fs::read_to_string(&note) {
-            Ok(moved_by) if moved_by == by => {}
-            Ok(_) => return Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(at(error)),
-        }
-        // The file first: a crash before the note goes leaves a note and no file, which the
-        // next move or undo handles.
-        match fs::remove_file(&self.path) {
-            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(self.io(error)),
-            _ => {}
-        }
-        fs::remove_file(&note).map_err(at)
     }
 
     fn io(&self, source: io::Error) -> SecretsError {
@@ -895,7 +869,7 @@ mod tests {
     #[test]
     fn the_file_choice_keeps_secrets_in_secrets_json_under_home() {
         let dir = tempfile::tempdir().unwrap();
-        let store = store_for(dir.path(), Store::File).unwrap();
+        let store = store_for(dir.path(), Store::File, false).unwrap();
         store.set("gateway", "sk-one").unwrap();
         let held = FileSecrets::new(dir.path().join("secrets.json"));
         assert_eq!(held.get("gateway").unwrap().as_deref(), Some("sk-one"));
@@ -1048,7 +1022,7 @@ mod tests {
         old.set("machine", "identity").unwrap();
         old.set("unrelated", "x").unwrap();
 
-        file.adopt(&old, KEPT, "0.9.0").unwrap();
+        file.adopt(&old, KEPT).unwrap();
 
         assert_eq!(stored(&file, GATEWAY).as_deref(), Some("sk-gw"));
         assert_eq!(stored(&file, "machine").as_deref(), Some("identity"));
@@ -1064,11 +1038,9 @@ mod tests {
     #[test]
     fn adopt_from_an_empty_old_store_still_makes_the_file_so_it_is_not_asked_again() {
         let (dir, file) = file();
-        file.adopt(&MemorySecrets::default(), KEPT, "0.9.0")
-            .unwrap();
+        file.adopt(&MemorySecrets::default(), KEPT).unwrap();
         assert!(dir.path().join("secrets.json").exists());
-        file.adopt(&Failing { panics: true }, KEPT, "0.9.0")
-            .unwrap();
+        file.adopt(&Failing { panics: true }, KEPT).unwrap();
     }
 
     #[test]
@@ -1076,8 +1048,7 @@ mod tests {
         let (_dir, file) = file();
         file.set(GATEWAY, "sk-new").unwrap();
 
-        file.adopt(&Failing { panics: true }, KEPT, "0.9.0")
-            .unwrap();
+        file.adopt(&Failing { panics: true }, KEPT).unwrap();
 
         assert_eq!(stored(&file, GATEWAY).as_deref(), Some("sk-new"));
     }
@@ -1085,9 +1056,7 @@ mod tests {
     #[test]
     fn adopt_that_cannot_read_the_old_store_fails_and_makes_no_file() {
         let (dir, file) = file();
-        let error = file
-            .adopt(&Failing { panics: false }, KEPT, "0.9.0")
-            .unwrap_err();
+        let error = file.adopt(&Failing { panics: false }, KEPT).unwrap_err();
         assert!(error.to_string().contains("denied"), "{error}");
         assert!(!dir.path().join("secrets.json").exists());
     }
@@ -1106,7 +1075,7 @@ mod tests {
             old.set(name, &format!("value of {name}")).unwrap();
         }
 
-        file.adopt(&old, KEPT, "0.9.0").unwrap();
+        file.adopt(&old, KEPT).unwrap();
 
         for name in names {
             assert_eq!(
@@ -1123,7 +1092,7 @@ mod tests {
         let old = MemorySecrets::default();
         old.set(GATEWAY, "sk-gw").unwrap();
 
-        let store = moved(dir.path(), &old, "0.9.0").unwrap();
+        let store = moved(dir.path(), &old, false).unwrap();
 
         assert_eq!(store.get(GATEWAY).unwrap().as_deref(), Some("sk-gw"));
         let held = FileSecrets::new(dir.path().join("secrets.json"));
@@ -1136,7 +1105,7 @@ mod tests {
     fn a_move_that_cannot_read_the_old_store_is_an_error_and_makes_no_file() {
         let dir = tempfile::tempdir().unwrap();
 
-        let error = moved(dir.path(), &Failing { panics: false }, "0.9.0")
+        let error = moved(dir.path(), &Failing { panics: false }, false)
             .err()
             .expect("the move failed");
 
@@ -1144,46 +1113,27 @@ mod tests {
         assert!(!dir.path().join("secrets.json").exists());
     }
 
+    /// An update the daemon installed itself never moves, so its automatic rollback never
+    /// leaves an older version on a keychain that the file has moved on from.
     #[test]
-    fn undoing_the_move_of_the_version_that_made_it_removes_the_file_so_the_next_moves_again() {
-        let (dir, file) = file();
-        file.adopt(&MemorySecrets::default(), KEPT, "0.9.0")
-            .unwrap();
+    fn a_version_on_trial_never_reads_the_old_store_and_is_refused_when_nothing_was_moved() {
+        let dir = tempfile::tempdir().unwrap();
 
-        file.undo_move("0.9.0").unwrap();
+        let error = moved(dir.path(), &Failing { panics: true }, true)
+            .err()
+            .expect("a trial does not move");
 
+        assert!(matches!(error, SecretsError::NotMoved), "{error}");
         assert!(!dir.path().join("secrets.json").exists());
-        let old = MemorySecrets::default();
-        old.set(GATEWAY, "sk-changed-under-the-old-version")
-            .unwrap();
-        file.adopt(&old, KEPT, "0.10.0").unwrap();
-        assert_eq!(
-            stored(&file, GATEWAY).as_deref(),
-            Some("sk-changed-under-the-old-version")
-        );
     }
 
     #[test]
-    fn undoing_a_move_another_version_made_leaves_the_file() {
-        let (dir, file) = file();
-        file.adopt(&MemorySecrets::default(), KEPT, "0.9.0")
-            .unwrap();
-        file.set(GATEWAY, "sk-new").unwrap();
+    fn a_version_on_trial_uses_the_file_an_earlier_move_made() {
+        let dir = tempfile::tempdir().unwrap();
+        file_in(dir.path()).set(GATEWAY, "sk-moved").unwrap();
 
-        file.undo_move("0.10.0").unwrap();
+        let store = moved(dir.path(), &Failing { panics: true }, true).unwrap();
 
-        assert!(dir.path().join("secrets.json").exists());
-        assert_eq!(stored(&file, GATEWAY).as_deref(), Some("sk-new"));
-    }
-
-    #[test]
-    fn undoing_a_move_when_nothing_was_moved_leaves_the_file() {
-        let (dir, file) = file();
-        file.set(GATEWAY, "sk-linux").unwrap();
-
-        file.undo_move("0.9.0").unwrap();
-
-        assert!(dir.path().join("secrets.json").exists());
-        assert_eq!(stored(&file, GATEWAY).as_deref(), Some("sk-linux"));
+        assert_eq!(store.get(GATEWAY).unwrap().as_deref(), Some("sk-moved"));
     }
 }
