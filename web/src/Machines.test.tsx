@@ -219,7 +219,7 @@ describe("Machines", () => {
   });
 
   describe("adding a machine", () => {
-    const added = { code: "K7QX3M9PRT", command: "foundryd join studio K7QX3M9PRT", expires_in_secs: 600 };
+    const added = { code: "K7QX3M9PRT", command: "foundryd join 100.101.102.103 K7QX3M9PRT", expires_in_secs: 600 };
     const nameField = () => screen.getByRole<HTMLInputElement>("textbox", { name: "Name" });
     const add = (name: string) => {
       fireEvent.click(screen.getByRole("button", { name: "Add machine" }));
