@@ -1,3 +1,151 @@
+//! Adding a machine by its Tailscale name, from the UI: `POST /api/machines/add` `{name}`.
+//!
+//! The name is trimmed. One that is blank or over [`NAME_AT_MOST`] characters is `422`, and so
+//! is one that resolves to no Tailscale address, by the rule `foundryd join` sends a code by
+//! ([`join_targets`]). A name a listed machine has, compared trimmed and in any case, is `409`.
+//! A machine the list does not hold yet has no name to put in the command, so it answers `503`.
+//! Otherwise it answers `201` `{code, command, expires_in_secs}`: a new join code,
+//! `foundryd join <this machine's name> <code>` to run on the new machine, and how long the
+//! code works ([`CODE_VALID_FOR`]).
+//!
+//! The name and the first Tailscale address it resolved to are held in memory until the code is
+//! used or expires. When a machine uses the code on the join route, it is listed under that
+//! name at that address through the acting coordinator, as every machine list change is. An
+//! edit that fails is warned, and the join stands. A code made anywhere else lists nothing.
+
+use std::sync::{Arc, Mutex};
+
+use axum::Router;
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::routing::post;
+use foundry_proto::ids::MachineId;
+use foundry_proto::settings::{Edit, Machine};
+use serde::Deserialize;
+use tokio::sync::oneshot;
+
+use super::machine_names::NAME_AT_MOST;
+use super::{ApiError, Body, on_store, unprocessable};
+use crate::coordinator::Coordinator;
+use crate::join::{CODE_VALID_FOR, DEFAULT_PORT, JoinError, Keys, join_targets};
+use crate::store::Store;
+
+/// What the add route acts on: the keys that make codes, the coordinator that lists the
+/// machine and the store whose machine list it checks.
+struct Adding {
+    keys: Keys,
+    coordinator: Arc<Coordinator>,
+    store: Arc<Mutex<Store>>,
+}
+
+/// `POST /api/machines/add`. The caller guards it as it guards the rest of the API, and serves
+/// [`crate::join::router`] beside it on the same keys.
+pub fn router(keys: Keys, coordinator: Arc<Coordinator>, store: Arc<Mutex<Store>>) -> Router {
+    Router::new()
+        .route("/api/machines/add", post(add))
+        .with_state(Arc::new(Adding {
+            keys,
+            coordinator,
+            store,
+        }))
+}
+
+#[derive(Deserialize)]
+struct Add {
+    name: String,
+}
+
+async fn add(
+    State(adding): State<Arc<Adding>>,
+    Body(add): Body<Add>,
+) -> Result<Response, ApiError> {
+    let name = add.name.trim().to_owned();
+    if name.is_empty() {
+        return Err(unprocessable(
+            "type the new machine's Tailscale name".to_owned(),
+        ));
+    }
+    if name.chars().count() > NAME_AT_MOST {
+        return Err(unprocessable(format!(
+            "a machine's name is at most {NAME_AT_MOST} characters"
+        )));
+    }
+    let settings = on_store(&adding.store, |store| store.settings()).await?;
+    let wanted = name.to_lowercase();
+    if let Some(other) = settings
+        .machines
+        .iter()
+        .find(|m| m.name.trim().to_lowercase() == wanted)
+    {
+        return Err(ApiError::Rejected(
+            StatusCode::CONFLICT,
+            format!("a machine named {:?} is already in the fleet", other.name),
+        ));
+    }
+    let me = adding.keys.me();
+    let Some(own) = settings.machines.iter().find(|m| m.id == me) else {
+        return Err(ApiError::Rejected(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "this machine is not in the machine list yet, so the new machine has no name to \
+             join it by; try again once this machine's card shows its name"
+                .to_owned(),
+        ));
+    };
+    let address = resolve(&name).await?;
+    let (code, used) = adding
+        .keys
+        .new_watched_code()
+        .map_err(|e| ApiError::Rejected(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    tokio::spawn(list_when_used(
+        adding.coordinator.clone(),
+        used,
+        name,
+        address,
+    ));
+    let answer = serde_json::json!({
+        "command": format!("foundryd join {} {code}", own.name.trim()),
+        "code": code.to_string(),
+        "expires_in_secs": CODE_VALID_FOR.as_secs(),
+    });
+    Ok((StatusCode::CREATED, axum::Json(answer)).into_response())
+}
+
+/// The first Tailscale address `name` resolves to, as `foundryd join` would send a code to it.
+/// Resolving it can wait on DNS, so it runs on the blocking pool.
+async fn resolve(name: &str) -> Result<String, ApiError> {
+    let lookup = name.to_owned();
+    let resolved = tokio::task::spawn_blocking(move || join_targets(&lookup, DEFAULT_PORT))
+        .await
+        .map_err(|e| ApiError::Rejected(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    match resolved {
+        Ok(targets) => Ok(targets[0].ip().to_string()),
+        Err(JoinError::NotTailscale(_)) => Err(unprocessable(format!(
+            "{name:?} is not on Tailscale: it resolves to no Tailscale address"
+        ))),
+        Err(_) => Err(unprocessable(format!(
+            "no machine named {name:?} was found; type the name Tailscale shows for it"
+        ))),
+    }
+}
+
+/// Lists the machine that uses the code, told by `used`, as `name` at `address`, or nothing
+/// when the code expires unused. The code is never logged.
+async fn list_when_used(
+    coordinator: Arc<Coordinator>,
+    used: oneshot::Receiver<MachineId>,
+    name: String,
+    address: String,
+) {
+    let Ok(Ok(id)) = tokio::time::timeout(CODE_VALID_FOR, used).await else {
+        return;
+    };
+    let machine = Machine { id, name, address };
+    if let Err(error) = coordinator.edit(Edit::SetMachine { machine }).await {
+        tracing::warn!("machine {id} joined, but it could not be listed: {error}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -29,7 +177,6 @@ mod tests {
     /// loopback port.
     struct Served {
         _data: tempfile::TempDir,
-        me: MachineId,
         keys: Keys,
         store: Arc<Mutex<Store>>,
         peers: Peers,
@@ -58,13 +205,13 @@ mod tests {
             peers.coordinate(coordinator.clone());
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
-            let app = join::router(keys.clone()).merge(router(keys.clone(), coordinator, store.clone()));
+            let app =
+                join::router(keys.clone()).merge(router(keys.clone(), coordinator, store.clone()));
             let server = tokio::spawn(async move {
                 axum::serve(listener, app).await.unwrap();
             });
             Self {
                 _data: data,
-                me,
                 keys,
                 store,
                 peers,
@@ -103,7 +250,8 @@ mod tests {
 
         /// `(status, body)` of an add of `name`.
         async fn add(&self, name: &str) -> (u16, String) {
-            self.post("/api/machines/add", &json!({ "name": name })).await
+            self.post("/api/machines/add", &json!({ "name": name }))
+                .await
         }
 
         /// The code of an add of `name` that must succeed.

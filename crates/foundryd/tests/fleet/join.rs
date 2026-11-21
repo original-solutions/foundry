@@ -73,10 +73,11 @@ async fn a_machine_added_by_name_is_listed_under_that_name_once_it_joins_and_lin
 
     // On B: `foundryd join`, then its daemon starts.
     let secrets = FileSecrets::new(b_dir.path().join("secrets"));
-    let joined = tokio::task::spawn_blocking(move || join::join_at("127.0.0.1", port, &code, &secrets))
-        .await
-        .unwrap()
-        .unwrap();
+    let joined =
+        tokio::task::spawn_blocking(move || join::join_at("127.0.0.1", port, &code, &secrets))
+            .await
+            .unwrap()
+            .unwrap();
     let b = Keyed::new(&[], keys(&b_dir), b_dir, Arc::new(Nowhere));
     assert_eq!(b.keys.me(), joined);
     tokio::spawn({
@@ -96,9 +97,17 @@ async fn a_machine_added_by_name_is_listed_under_that_name_once_it_joins_and_lin
             .any(|m| m.id == joined && m.name == "localhost")
     })
     .await;
-    let listed = a_settings().machines.into_iter().find(|m| m.id == joined).unwrap();
+    let listed = a_settings()
+        .machines
+        .into_iter()
+        .find(|m| m.id == joined)
+        .unwrap();
     assert!(
-        listed.address.parse::<std::net::IpAddr>().unwrap().is_loopback(),
+        listed
+            .address
+            .parse::<std::net::IpAddr>()
+            .unwrap()
+            .is_loopback(),
         "{listed:?}"
     );
     until(Duration::from_secs(10), "A and B linked", || {

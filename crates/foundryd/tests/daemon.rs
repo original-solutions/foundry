@@ -1279,7 +1279,11 @@ fn the_join_and_add_routes_are_served_and_refuse_a_request_from_another_site() {
     for path in ["/api/join", "/api/machines/add"] {
         // Served here: a body the route cannot take is refused by the route itself.
         assert_eq!(ask(path, &here, None, "{}"), 422, "{path}");
-        assert_eq!(ask(path, &here, Some("http://evil.example"), ""), 403, "{path}");
+        assert_eq!(
+            ask(path, &here, Some("http://evil.example"), ""),
+            403,
+            "{path}"
+        );
         assert_eq!(ask(path, "evil.example", None, ""), 403, "{path}");
     }
 }
