@@ -19,8 +19,9 @@
 //! hearing of each other's add both go through.
 //!
 //! Nothing is sent to the coordinator when a request is refused. An edit the coordinator could
-//! not make answers as an attention dismissal does ([`edit_status`]). No answer names a repo:
-//! any message that could is passed through [`redact`](crate::secrets::redact).
+//! not make answers as an attention dismissal does, through the shared [`edit_status`]. No
+//! answer names a repo: any message that could is passed through
+//! [`redact`](crate::secrets::redact).
 
 use std::sync::{Arc, Mutex};
 
@@ -33,8 +34,7 @@ use foundry_proto::ids::ProjectId;
 use foundry_proto::settings::{Edit, Project};
 use serde::Deserialize;
 
-use super::{ApiError, Body, created, on_store, parse_id, unprocessable};
-use crate::attention::edit_status;
+use super::{ApiError, Body, created, edit_status, on_store, parse_id, unprocessable};
 use crate::coordinator::Coordinator;
 use crate::store::Store;
 

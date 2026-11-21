@@ -44,7 +44,8 @@ use foundry_proto::settings::{Edit, SettingKey, SettingValue, SharedSettings};
 use foundry_proto::state::{SessionState, TerminalState};
 use serde::Serialize;
 
-use crate::coordinator::{Coordinator, CoordinatorError};
+use crate::api::edit_status;
+use crate::coordinator::Coordinator;
 use crate::machine::{Over, over_limits};
 use crate::secrets::redact;
 use crate::sessions::STUCK_AFTER;
@@ -523,22 +524,6 @@ async fn dismiss(State(attention): State<Arc<Attention>>, Path(id): Path<String>
     }
 }
 
-/// The status an edit sent through the coordinator that failed answers with: a dismissal here,
-/// and a project added or removed ([`crate::api::projects`]).
-pub(crate) fn edit_status(error: &CoordinatorError) -> StatusCode {
-    match error {
-        CoordinatorError::Refused { .. } => StatusCode::BAD_GATEWAY,
-        // Sent, so it may have been numbered: not the 503 of an edit that changed nothing.
-        CoordinatorError::NoAnswer { .. } => StatusCode::GATEWAY_TIMEOUT,
-        CoordinatorError::NotLinked(_)
-        | CoordinatorError::Older { .. }
-        | CoordinatorError::Unsettled { .. } => StatusCode::SERVICE_UNAVAILABLE,
-        CoordinatorError::Unwritable(_) | CoordinatorError::Store(_) => {
-            StatusCode::INTERNAL_SERVER_ERROR
-        }
-    }
-}
-
 /// `{"error": message}` with any URL password in it hidden, logged when the fault is ours.
 fn error(status: StatusCode, message: String) -> Response {
     let message = redact(&message);
@@ -561,6 +546,7 @@ mod tests {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     use super::*;
+    use crate::coordinator::CoordinatorError;
     use crate::sync::{Conn, Dialer};
 
     const GB: u64 = 1_000_000_000;
