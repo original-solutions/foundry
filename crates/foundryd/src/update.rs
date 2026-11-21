@@ -823,12 +823,15 @@ fn became_healthy(flag: &AtomicBool, home: &Path, exe: &Path, running: &str) -> 
 }
 
 /// Marks this version healthy after a minute (again at each check until the mark is saved),
-/// then looks for a newer tag every ten minutes.
+/// then looks for a newer tag every ten minutes. Once the mark is saved it removes the keychain
+/// secrets a keychain-era release left, now that no rollback can need them
+/// ([`crate::secrets::forget_moved`]).
 /// After installing one it stops the daemon with SIGTERM, so the service starts the new
 /// `current`. Never returns: a daemon that is not run from `current` just waits.
 pub async fn run(home: PathBuf) {
     let running = env!("CARGO_PKG_VERSION");
     let work = home.clone();
+    let proven = home.clone();
     run_with(
         home,
         std::env::current_exe(),
@@ -840,12 +843,14 @@ pub async fn run(home: PathBuf) {
                 tracing::error!("cannot stop for the update: {error}");
             }
         },
+        move || crate::secrets::forget_moved(&proven),
     )
     .await;
 }
 
 /// [`run`] with its inputs given: this process's path, the flag the watchdog reads, one
-/// update check, and what stops the daemon once a check has installed a tag.
+/// update check, what stops the daemon once a check has installed a tag, and what to do once
+/// the healthy mark is saved, when no rollback can put the previous version back.
 async fn run_with(
     home: PathBuf,
     exe: io::Result<PathBuf>,
@@ -853,6 +858,7 @@ async fn run_with(
     flag: &AtomicBool,
     check: impl Fn() -> Result<Option<String>, UpdateError> + Clone + Send + 'static,
     stop: impl Fn(),
+    proven: impl FnOnce() + Send + 'static,
 ) {
     tokio::time::sleep(HEALTHY_AFTER).await;
     // The flag is set whatever `exe` is, so a failed lookup never lets the watchdog kill a
@@ -867,12 +873,19 @@ async fn run_with(
         pending::<()>().await;
     }
     let mut marked = false;
+    let mut proven = Some(proven);
     loop {
         if !marked {
             let home = home.clone();
             marked = tokio::task::spawn_blocking(move || mark_healthy(&home, running))
                 .await
                 .unwrap_or(false);
+        }
+        if marked
+            && let Some(proven) = proven.take()
+            && let Err(error) = tokio::task::spawn_blocking(proven).await
+        {
+            tracing::warn!("the step after the healthy mark stopped: {error}");
         }
         match tokio::task::spawn_blocking(check.clone()).await {
             Ok(Ok(Some(tag))) => {

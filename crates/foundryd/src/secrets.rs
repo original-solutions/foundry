@@ -1,9 +1,10 @@
 //! Secrets in a 0600 file, on every OS.
 //!
 //! [`Secrets`] is the one interface and [`FileSecrets`] backs it: [`for_this_machine`] gives
-//! the file `secrets.json` in the data directory. Releases before this one kept a Mac's
-//! secrets in the login keychain; the first start on such a Mac moves them into the file once
-//! (see [`for_this_machine`]). A secret's value never reaches an error message: errors name the
+//! the file `secrets.json` in the data directory. Earlier releases kept a Mac's secrets in the
+//! login keychain; the first start on such a Mac copies them into the file, and the keychain
+//! items are deleted once that version is proven (see [`for_this_machine`] and
+//! [`forget_moved`]). A secret's value never reaches an error message: errors name the
 //! secret or the file, never what it holds.
 
 use std::collections::BTreeMap;
@@ -106,17 +107,42 @@ pub const GATEWAY_MANAGEMENT: &str = "gateway-management";
 /// The secret store this machine uses: the file `secrets.json` in `home`, readable only by the
 /// service user, on every OS.
 ///
-/// On macOS, when that file does not exist, the secrets a keychain-era release stored first
-/// move into it from the login keychain ([`move_secrets`]). The keychain read can bring up one
+/// On macOS, when that file does not exist, the secrets a keychain-era release stored are first
+/// copied into it from the login keychain ([`move_secrets`]). Each keychain read can bring up a
 /// prompt, which this call waits on. A failed read gives an error and writes nothing, so the
-/// caller stops rather than start with an empty store, and the next start tries again. In a
-/// debug build `FOUNDRY_SECRETS=file` skips the move, which is how tests keep out of the
-/// keychain. A release build ignores it.
+/// caller stops rather than start with an empty store, and the next start tries again. The
+/// keychain items stay until this version is proven ([`forget_moved`]). In a debug build
+/// `FOUNDRY_SECRETS=file` skips the keychain, which is how tests keep out of it. A release
+/// build ignores it.
 pub fn for_this_machine(home: &Path) -> Result<Arc<dyn Secrets>, SecretsError> {
-    let secrets = FileSecrets::new(home.join("secrets.json"));
+    open(home, keychain().as_deref())
+}
+
+/// Removes from the login keychain each secret a keychain-era release stored there that
+/// `secrets.json` in `home` now holds. The daemon calls it once its update trial is over, so a
+/// rollback to a keychain-era release before then still finds its identity and keys. A failure
+/// is logged, naming the secret, and changes nothing else: the secrets are safe in the file.
+pub fn forget_moved(home: &Path) {
+    if let Some(keychain) = keychain() {
+        forget(&*keychain, &FileSecrets::new(home.join("secrets.json")));
+    }
+}
+
+/// The keychain a keychain-era release kept a Mac's secrets in: on macOS, unless this debug
+/// run skips it with `FOUNDRY_SECRETS=file`; elsewhere none.
+fn keychain() -> Option<Box<dyn OldStore>> {
     #[cfg(target_os = "macos")]
     if !skips_move(std::env::var_os("FOUNDRY_SECRETS").as_deref(), OVERRIDE) {
-        move_secrets(&Keychain { service: "foundry" }, &secrets)?;
+        return Some(Box::new(Keychain { service: "foundry" }));
+    }
+    None
+}
+
+/// The file store `secrets.json` in `home`, after [`move_secrets`] from `old` when there is one.
+fn open(home: &Path, old: Option<&dyn OldStore>) -> Result<Arc<dyn Secrets>, SecretsError> {
+    let secrets = FileSecrets::new(home.join("secrets.json"));
+    if let Some(old) = old {
+        move_secrets(old, &secrets)?;
     }
     Ok(Arc::new(secrets))
 }
@@ -126,8 +152,8 @@ pub fn for_this_machine(home: &Path) -> Result<Arc<dyn Secrets>, SecretsError> {
 #[cfg(any(target_os = "macos", test))]
 const OVERRIDE: bool = cfg!(debug_assertions);
 
-/// Whether a `FOUNDRY_SECRETS` value skips the move from the keychain: only exactly `file`,
-/// and only when `taken` (the build takes the override).
+/// Whether a `FOUNDRY_SECRETS` value skips the keychain: only exactly `file`, and only when
+/// `taken` (the build takes the override).
 #[cfg(any(target_os = "macos", test))]
 fn skips_move(choice: Option<&OsStr>, taken: bool) -> bool {
     taken && choice == Some(OsStr::new("file"))
@@ -135,12 +161,10 @@ fn skips_move(choice: Option<&OsStr>, taken: bool) -> bool {
 
 /// The names a keychain-era release stored: the machine's identity, its key table and the two
 /// gateway keys.
-#[cfg(any(target_os = "macos", test))]
 const KEYCHAIN_NAMES: [&str; 4] = ["machine", "machine-keys", GATEWAY, GATEWAY_MANAGEMENT];
 
 /// A store secrets are moved out of, as far as the move needs it: the login keychain, or a
 /// fake in tests.
-#[cfg(any(target_os = "macos", test))]
 trait OldStore {
     /// The secret called `name`, or `None` when the store holds none.
     fn read(&self, name: &str) -> Result<Option<String>, SecretsError>;
@@ -148,12 +172,11 @@ trait OldStore {
     fn remove(&self, name: &str) -> Result<(), SecretsError>;
 }
 
-/// Moves every one of [`KEYCHAIN_NAMES`] that `old` holds into `new`, once: only while `new`'s
-/// file does not exist, and under its lock, so two processes starting at once move them once.
-/// Every read comes first; any failure returns before anything is written or removed. The
-/// secrets found are written in one go, and only after that write succeeds are they removed from
-/// `old`. When `old` holds none, no file is written.
-#[cfg(any(target_os = "macos", test))]
+/// Copies every one of [`KEYCHAIN_NAMES`] that `old` holds into `new`, once: only while `new`'s
+/// file does not exist, and under its lock, so two processes starting at once copy them once.
+/// Every read comes first; any failure returns before anything is written. The secrets found
+/// are written in one go. `old` is left as it was, for [`forget`] once this version is proven.
+/// When `old` holds none, no file is written.
 fn move_secrets(old: &dyn OldStore, new: &FileSecrets) -> Result<(), SecretsError> {
     let _locked = new.lock()?;
     match fs::symlink_metadata(&new.path) {
@@ -170,8 +193,28 @@ fn move_secrets(old: &dyn OldStore, new: &FileSecrets) -> Result<(), SecretsErro
     if found.is_empty() {
         return Ok(());
     }
-    new.write(&found)?;
-    found.keys().try_for_each(|name| old.remove(name))
+    new.write(&found)
+}
+
+/// Removes from `old` each of [`KEYCHAIN_NAMES`] that `new` holds, so only a secret safe in the
+/// file leaves `old`. A file that cannot be read removes nothing. A failed remove is logged and
+/// the rest are still removed.
+fn forget(old: &dyn OldStore, new: &FileSecrets) {
+    let held = match new.read() {
+        Ok(held) => held,
+        Err(error) => {
+            tracing::warn!("keychain secrets left in place: {error}");
+            return;
+        }
+    };
+    for name in KEYCHAIN_NAMES
+        .iter()
+        .filter(|name| held.contains_key(**name))
+    {
+        if let Err(error) = old.remove(name) {
+            tracing::warn!("{error}; it is safe in {}", new.path.display());
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
