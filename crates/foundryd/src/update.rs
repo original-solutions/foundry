@@ -405,9 +405,10 @@ fn watch(healthy: &AtomicBool, deadline: Duration, poll: Duration) -> bool {
     true
 }
 
-/// True when this process runs from `current` and its own version is on trial.
-pub fn on_trial_now(home: &Path) -> bool {
-    std::env::current_exe().is_ok_and(|exe| on_trial(home, &exe, env!("CARGO_PKG_VERSION")))
+/// True when an update is on trial in `home`, or when `update.json` cannot be read, so a caller
+/// that must stay out of a trial stays out when it cannot tell.
+pub fn trial_on(home: &Path) -> bool {
+    !state(home).is_ok_and(|state| state.trial.is_none())
 }
 
 /// True when this process runs from `current` and a trial of `running` is on.
@@ -957,6 +958,20 @@ mod tests {
 
     fn current(home: &Path) -> PathBuf {
         fs::read_link(home.join("current")).unwrap()
+    }
+
+    #[test]
+    fn a_trial_is_on_while_update_json_holds_one_or_cannot_be_read() {
+        let home = trial_home();
+        assert!(trial_on(home.path()));
+
+        mark_healthy(home.path(), "0.2.0");
+        assert!(!trial_on(home.path()));
+
+        fs::write(home.path().join("update.json"), "not json").unwrap();
+        assert!(trial_on(home.path()));
+
+        assert!(!trial_on(tempfile::tempdir().unwrap().path()));
     }
 
     #[test]

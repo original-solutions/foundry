@@ -102,7 +102,7 @@ pub fn join(address: &str, code: &str) -> ExitCode {
         eprintln!("foundryd join: set FOUNDRY_HOME or HOME");
         return ExitCode::FAILURE;
     };
-    let secrets = match secrets::for_this_machine(&home, false) {
+    let secrets = match secrets::for_this_machine(&home) {
         Ok(secrets) => secrets,
         Err(error) => {
             eprintln!("foundryd join: {error}");

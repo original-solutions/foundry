@@ -2,9 +2,9 @@
 //!
 //! [`Secrets`] is the one interface and [`FileSecrets`] backs it: [`for_this_machine`] gives
 //! the file `secrets.json` in the data directory. Earlier releases kept a Mac's secrets in the
-//! login keychain. The first start of a version installed by hand on such a Mac copies them
-//! into the file; a version the daemon installed itself never does, so its automatic rollback
-//! never runs an older release on a keychain the file has moved on from. The keychain items are
+//! login keychain. The first open on such a Mac with no update on trial copies them into the
+//! file; none is made while an update is on trial, so an automatic rollback never runs an older
+//! release on a keychain the file has moved on from. The keychain items are
 //! never deleted, so a release that reads only the keychain still finds them. A secret's value
 //! never reaches an error message: errors name the secret or the file, never what it holds.
 
@@ -91,9 +91,9 @@ pub enum SecretsError {
     )]
     Locked { path: PathBuf },
     #[error(
-        "the secrets are still in the login keychain, and a version the daemon installed itself \
-         does not copy them; install this version by hand and answer the keychain prompts \
-         (docs/install.md)"
+        "the secrets are still in the login keychain, and they are not copied while an update is \
+         on trial; once that update has rolled back, install this version by hand and answer the \
+         keychain prompts (docs/install.md)"
     )]
     NotMoved,
     #[error("the keychain could not {action} the secret {name}: {reason}")]
@@ -115,15 +115,15 @@ pub const GATEWAY_MANAGEMENT: &str = "gateway-management";
 /// service user, on every OS.
 ///
 /// On macOS, when that file does not exist, the secrets a keychain-era release stored are first
-/// copied into it from the login keychain ([`move_secrets`]), except by a version `on_trial`
-/// (one the daemon installed itself), which gives [`SecretsError::NotMoved`] instead. Each
+/// copied into it from the login keychain ([`move_secrets`]), except while an update is on
+/// trial, which gives [`SecretsError::NotMoved`] instead. Each
 /// keychain read can bring up a prompt, which this call waits on. A failed read gives an error
 /// and writes nothing, so the caller stops rather than start with an empty store, and the next
 /// start tries again. The keychain items are left as they were. In a debug build
 /// `FOUNDRY_SECRETS=file` skips the keychain, which is how tests keep out of it. A release
 /// build ignores it.
-pub fn for_this_machine(home: &Path, on_trial: bool) -> Result<Arc<dyn Secrets>, SecretsError> {
-    open(home, keychain().as_deref(), on_trial)
+pub fn for_this_machine(home: &Path) -> Result<Arc<dyn Secrets>, SecretsError> {
+    open(home, keychain().as_deref())
 }
 
 /// Whether `path` exists; an error other than its absence is passed on.
@@ -146,16 +146,15 @@ fn keychain() -> Option<Box<dyn OldStore>> {
 }
 
 /// The file store `secrets.json` in `home`, after [`move_secrets`] from `old` when there is
-/// one. A version `on_trial` never reads `old`: it uses the file when an earlier copy made it,
-/// and is refused otherwise.
-fn open(
-    home: &Path,
-    old: Option<&dyn OldStore>,
-    on_trial: bool,
-) -> Result<Arc<dyn Secrets>, SecretsError> {
+/// one. While an update is on trial ([`crate::update::trial_on`]) `old` is never read: the file
+/// is used when an earlier copy made it, and the open is refused otherwise. The daemon,
+/// `foundryd join` and `foundryd secret set` all open the store here, so none of them copies
+/// during a trial, and the release a rollback goes back to finds the keychain still the one
+/// store.
+fn open(home: &Path, old: Option<&dyn OldStore>) -> Result<Arc<dyn Secrets>, SecretsError> {
     let secrets = FileSecrets::new(home.join("secrets.json"));
     if let Some(old) = old {
-        if on_trial {
+        if crate::update::trial_on(home) {
             if !exists(&secrets.path).map_err(|e| secrets.io(e))? {
                 return Err(SecretsError::NotMoved);
             }
@@ -234,7 +233,7 @@ pub enum SetError {
 /// secret store. It never prints the value.
 pub fn set_command(name: &str) -> ExitCode {
     let result = match crate::daemon::home() {
-        Some(home) => for_this_machine(&home, false)
+        Some(home) => for_this_machine(&home)
             .map_err(SetError::from)
             .and_then(|secrets| set_from(&*secrets, name, io::BufReader::new(io::stdin()))),
         None => {
@@ -795,7 +794,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let held = FileSecrets::new(dir.path().join("secrets.json"));
         held.set("gateway", "sk-one").unwrap();
-        let store = for_this_machine(dir.path(), false).unwrap();
+        let store = for_this_machine(dir.path()).unwrap();
         assert_eq!(store.get("gateway").unwrap().as_deref(), Some("sk-one"));
         store.set("gateway-management", "sk-two").unwrap();
         assert_eq!(
@@ -812,7 +811,7 @@ mod tests {
             let path = dir.path().join("secrets.json");
             FileSecrets::new(&path).set("gateway", "sk-one").unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(wider)).unwrap();
-            let store = for_this_machine(dir.path(), false).unwrap();
+            let store = for_this_machine(dir.path()).unwrap();
             let error = store.get("gateway").unwrap_err();
             assert!(
                 matches!(error, SecretsError::TooOpen { .. }),
@@ -982,7 +981,7 @@ mod tests {
     fn opening_with_a_keychain_and_no_file_copies_its_secrets_into_the_file() {
         let dir = tempfile::tempdir().unwrap();
         let old = old_store(&KEYCHAIN_NAMES);
-        let store = open(dir.path(), Some(&old), false).unwrap();
+        let store = open(dir.path(), Some(&old)).unwrap();
         assert_eq!(
             store.get("machine").unwrap().as_deref(),
             Some("value-of-machine")
@@ -1000,7 +999,7 @@ mod tests {
     fn opening_when_a_keychain_read_fails_gives_the_error_and_writes_no_file() {
         let dir = tempfile::tempdir().unwrap();
         let old = Denying::reads(old_store(&KEYCHAIN_NAMES), "machine");
-        let error = match open(dir.path(), Some(&old), false) {
+        let error = match open(dir.path(), Some(&old)) {
             Ok(_) => panic!("opened a store although the keychain read failed"),
             Err(error) => error,
         };
@@ -1011,7 +1010,7 @@ mod tests {
     #[test]
     fn opening_with_no_keychain_moves_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        let store = open(dir.path(), None, false).unwrap();
+        let store = open(dir.path(), None).unwrap();
         assert_eq!(store.get("machine").unwrap(), None);
         assert!(!dir.path().join("secrets.json").exists());
     }
@@ -1025,30 +1024,66 @@ mod tests {
         }
     }
 
-    /// An update the daemon installed itself never copies, so its automatic rollback never
-    /// leaves an older release on a keychain that the file has moved on from.
-    #[test]
-    fn a_version_on_trial_never_reads_the_keychain_and_is_refused_when_nothing_was_copied() {
-        let dir = tempfile::tempdir().unwrap();
+    /// `dir` with an update on trial, as `update.json` records one.
+    fn on_trial(dir: &Path) {
+        fs::write(
+            dir.join("update.json"),
+            r#"{"trial": {"version": "0.2.0", "previous": "0.1.0", "starts": 1}}"#,
+        )
+        .unwrap();
+    }
 
-        let error = open(dir.path(), Some(&Untouchable), true)
+    /// No copy is made during a trial, so an automatic rollback never leaves an older release
+    /// on a keychain that the file has moved on from.
+    #[test]
+    fn during_a_trial_the_keychain_is_never_read_and_the_open_is_refused_with_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        on_trial(dir.path());
+
+        let error = open(dir.path(), Some(&Untouchable))
             .err()
-            .expect("a trial does not copy");
+            .expect("no copy during a trial");
 
         assert!(matches!(error, SecretsError::NotMoved), "{error}");
         assert!(!dir.path().join("secrets.json").exists());
     }
 
     #[test]
-    fn a_version_on_trial_uses_the_file_an_earlier_copy_made() {
+    fn during_a_trial_the_file_an_earlier_copy_made_is_used() {
         let dir = tempfile::tempdir().unwrap();
+        on_trial(dir.path());
         FileSecrets::new(dir.path().join("secrets.json"))
             .set(GATEWAY, "sk-copied")
             .unwrap();
 
-        let store = open(dir.path(), Some(&Untouchable), true).unwrap();
+        let store = open(dir.path(), Some(&Untouchable)).unwrap();
 
         assert_eq!(store.get(GATEWAY).unwrap().as_deref(), Some("sk-copied"));
+    }
+
+    /// A machine with no keychain, such as Linux, takes its updates with no file yet.
+    #[test]
+    fn during_a_trial_a_machine_with_no_keychain_opens_with_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        on_trial(dir.path());
+
+        let store = open(dir.path(), None).unwrap();
+
+        assert_eq!(store.get("machine").unwrap(), None);
+        assert!(!dir.path().join("secrets.json").exists());
+    }
+
+    /// When it cannot tell whether a trial is on, it does not copy.
+    #[test]
+    fn an_unreadable_update_state_refuses_the_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("update.json"), "not json").unwrap();
+
+        let error = open(dir.path(), Some(&Untouchable))
+            .err()
+            .expect("no copy when the trial cannot be read");
+
+        assert!(matches!(error, SecretsError::NotMoved), "{error}");
     }
 
     /// A keychain-era release's keychain writes hold `secrets.lock`, so the copy waits on it.
@@ -1057,7 +1092,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let held = lock_file(&dir.path().join("secrets.lock"), LOCK_WAIT).unwrap();
 
-        let error = open(dir.path(), Some(&old_store(&KEYCHAIN_NAMES)), false)
+        let error = open(dir.path(), Some(&old_store(&KEYCHAIN_NAMES)))
             .err()
             .expect("the lock is held");
 
