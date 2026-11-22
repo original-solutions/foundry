@@ -1,8 +1,8 @@
-import { fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Placement } from "../api";
 import { json, renderApp } from "../test-utils";
-import { WaitingList } from "./WaitingList";
+import { PLACEMENTS_EVERY, WaitingList } from "./WaitingList";
 
 const waiting: Placement = {
   id: "r1",
@@ -45,7 +45,10 @@ beforeEach(() => {
   );
 });
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.useRealTimers();
+  vi.unstubAllGlobals();
+});
 
 const reads = () => requests.filter((r) => r.url === "/api/placements").length;
 
@@ -87,6 +90,20 @@ describe("WaitingList", () => {
     expect(within(list).queryByText(waiting.reasons[0])).toBeNull();
     fireEvent.click(toggle);
     expect(within(list).getByText(waiting.reasons[0])).toBeTruthy();
+  });
+
+  it("starts folded again when the list empties and then fills, as the attention list does", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    lists = [[waiting], [], [waiting]];
+    await renderApp(<WaitingList folded />);
+    fireEvent.click(await screen.findByRole("button", { name: /1 waiting for a machine/ }));
+    expect(screen.getByText(waiting.reasons[0])).toBeTruthy();
+    await act(() => vi.advanceTimersByTimeAsync(PLACEMENTS_EVERY + 100));
+    await waitFor(() => expect(screen.queryByRole("region", { name: "Waiting for a machine" })).toBeNull());
+    await act(() => vi.advanceTimersByTimeAsync(PLACEMENTS_EVERY + 100));
+    const toggle = await screen.findByRole("button", { name: /1 waiting for a machine/ });
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByText(waiting.reasons[0])).toBeNull();
   });
 
   it("cancels a request and drops it from the list", async () => {

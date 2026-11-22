@@ -32,7 +32,7 @@ export function WaitingList({ folded = false }: { folded?: boolean }) {
   return requests.length > 0 ? <Requests requests={requests} folded={folded} /> : null;
 }
 
-/** Mounted while any request is held, so its clock starts from when the card shows. */
+/** Mounted while any request is held, so its clock and its fold start from when the card shows. */
 function Requests({ requests, folded }: { requests: Placement[]; folded: boolean }) {
   const client = useQueryClient();
   const cancel = useMutation({
