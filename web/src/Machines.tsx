@@ -335,11 +335,11 @@ function AddMachine({ machines }: { machines: MachineView[] }) {
   );
 }
 
-/** Bytes as gigabytes, without float noise. */
-const wholeGb = (bytes: number) => Number((bytes / 1e9).toFixed(3));
+/** Bytes as gigabytes for the card's line: at most three decimals. */
+const gbShown = (bytes: number) => Number((bytes / 1e9).toFixed(3));
 
 /** A machine's limits in a line. */
-const limitsText = (l: Limits) => `At most ${plural(l.max_sessions, "session")} · load ${l.max_load_per_core} per core · ${wholeGb(l.min_free_disk)} GB disk free`;
+const limitsText = (l: Limits) => `At most ${plural(l.max_sessions, "session")} · load ${l.max_load_per_core} per core · ${gbShown(l.min_free_disk)} GB disk free`;
 
 /** What the limits dialog sends: the fields as numbers (a blank one is null, which the daemon refuses), or a clear. */
 type LimitsAction = { fields: { max_sessions: number | null; max_load_per_core: number | null; min_free_disk_gb: number | null } } | "clear";
@@ -368,7 +368,7 @@ function LimitsDialog({ machine }: { machine: MachineView }) {
     if (next) {
       setSessions(limits ? String(limits.max_sessions) : "");
       setLoad(limits ? String(limits.max_load_per_core) : "");
-      setDisk(limits ? String(wholeGb(limits.min_free_disk)) : "");
+      setDisk(limits ? String(limits.min_free_disk / 1e9) : "");
     }
     send.reset();
     setOpen(next);
@@ -380,7 +380,7 @@ function LimitsDialog({ machine }: { machine: MachineView }) {
     </label>
   );
   return (
-    <Modal open={open} onOpenChange={change} trigger="Limits" title={machine.name} description="Placement skips this machine while it is at or over any of these limits.">
+    <Modal open={open} onOpenChange={change} trigger="Limits" title={machine.name} description="Placement skips this machine while it has this many sessions or more, this load per core or more, or less free disk than this.">
       <form
         className="mt-3 flex flex-col gap-2"
         onSubmit={(e) => {
