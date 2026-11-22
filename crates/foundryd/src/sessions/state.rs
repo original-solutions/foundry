@@ -33,12 +33,13 @@ impl Hook {
     }
 
     /// The hook a posted payload is, or `None` when it names none. `SessionEnd` with reason
-    /// `clear` is [`Hook::Other`]: Claude Code sends it, then `SessionStart` with source
-    /// `clear`, and keeps running.
+    /// `clear` or `resume` is [`Hook::Other`]: on `/clear` and `/resume` Claude Code sends it,
+    /// then `SessionStart` with the same word as its source, and keeps running.
     pub fn from_payload(payload: &serde_json::Value) -> Option<Self> {
         let hook = Self::from_name(payload.get("hook_event_name")?.as_str()?);
-        let cleared = payload.get("reason").and_then(|r| r.as_str()) == Some("clear");
-        Some(if hook == Self::SessionEnd && cleared {
+        let reason = payload.get("reason").and_then(|r| r.as_str());
+        let continues = matches!(reason, Some("clear" | "resume"));
+        Some(if hook == Self::SessionEnd && continues {
             Self::Other
         } else {
             hook
