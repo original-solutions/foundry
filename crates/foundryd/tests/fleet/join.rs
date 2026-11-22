@@ -411,6 +411,8 @@ async fn a_redeem_whose_listing_fails_is_503_and_the_same_code_works_once_it_can
     assert!(error.contains("run the same command again"), "{error}");
     assert!(!error.contains(&code), "{error}");
     assert_eq!(keys(&b_dir).state(a.keys.me()), KeyState::NoKey);
+    // Neither side keeps the other's key from a join that was not listed.
+    assert_eq!(a.keys.state(keys(&b_dir).me()), KeyState::NoKey);
 
     // Once X has been silent long enough, A acts, and the same command succeeds.
     until(Duration::from_secs(30), "X offline on A", || {
@@ -427,6 +429,7 @@ async fn a_redeem_whose_listing_fails_is_503_and_the_same_code_works_once_it_can
             .any(|m| m.id == b_id && m.name == "b")
     );
     assert_eq!(keys(&b_dir).state(a.keys.me()), KeyState::Active);
+    assert_eq!(a.keys.state(b_id), KeyState::Active);
 }
 
 #[tokio::test]

@@ -157,8 +157,8 @@ fn home() -> Option<PathBuf> {
 /// Posts `code` with this machine's id and public key, and the entry it lists itself under
 /// (`own`) when there is one, to the machine at `address` (`port` unless the address names
 /// one), keeps the admitting machine's key in this machine's key table, and returns this
-/// machine's id. The admitting machine lists this one before it answers; when it cannot, it
-/// keeps nothing here and the same command can be run again. The identity in `secrets` is
+/// machine's id. The admitting machine lists this one before it answers; when it cannot, neither
+/// machine keeps the other's key and the same command can be run again. The identity in `secrets` is
 /// made if there is none and never replaced, so joining again, or retrying a join whose answer
 /// was lost, is the same machine.
 ///
@@ -235,29 +235,32 @@ fn post_join(
             }),
         403 => Err(JoinError::BadCode),
         409 => Err(JoinError::Taken(request.machine)),
-        503 => {
-            #[derive(Deserialize)]
-            struct Unlisted {
-                error: String,
-            }
-            let reason = response
-                .body_mut()
-                .read_json::<Unlisted>()
-                // What another machine says is printed, so it moves no terminal's cursor.
-                .map_or_else(
-                    |_| "no reason was given".to_owned(),
-                    |u| u.error.chars().filter(|c| !c.is_control()).collect(),
-                );
-            Err(JoinError::NotListed {
-                url: url.to_owned(),
-                reason,
-            })
-        }
+        422 => Err(JoinError::EntryRefused {
+            url: url.to_owned(),
+            reason: reason_given(&mut response),
+        }),
+        503 => Err(JoinError::NotListed {
+            url: url.to_owned(),
+            reason: reason_given(&mut response),
+        }),
         status => Err(JoinError::NotAdmitted {
             url: url.to_owned(),
             status,
         }),
     }
+}
+
+/// The `error` of a join answer's `{"error"}` body, without its control characters: what
+/// another machine says is printed, so it moves no terminal's cursor.
+fn reason_given(response: &mut ureq::http::Response<ureq::Body>) -> String {
+    #[derive(Deserialize)]
+    struct Refusal {
+        error: String,
+    }
+    response.body_mut().read_json::<Refusal>().map_or_else(
+        |_| "no reason was given".to_owned(),
+        |refusal| refusal.error.chars().filter(|c| !c.is_control()).collect(),
+    )
 }
 
 /// The Tailscale and loopback addresses `address` names or resolves to, at `port` unless it
@@ -410,6 +413,8 @@ pub enum JoinError {
          again"
     )]
     NotListed { url: String, reason: String },
+    #[error("{url} will not list this machine under the name and address it sent: {reason}")]
+    EntryRefused { url: String, reason: String },
     #[error("{url} could not admit this machine (HTTP {status}); ask for a new code")]
     NotAdmitted { url: String, status: u16 },
     #[error("{url} could not be reached: {reason}")]
@@ -557,6 +562,16 @@ pub struct Named {
     pub address: IpAddr,
 }
 
+/// What a redeem did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Redeemed {
+    /// The machine the code was made for, for a code made for a named machine.
+    pub named: Option<Named>,
+    /// Whether this redeem put the machine's key in the key table, and so is the one to take
+    /// it back ([`Keys::take_back`]). False when the table already held the machine.
+    pub admitted: bool,
+}
+
 /// A one-time join code, shown to a person. It is never shown in debug output.
 pub struct Code(String);
 
@@ -599,6 +614,9 @@ struct KeysInner {
     taken: AtomicU64,
     /// The machines listed with a key that does not parse, each warned about once.
     unparsed: Mutex<BTreeSet<MachineId>>,
+    /// How many times a key was taken back: what tells the follower to read the machine
+    /// list again though the settings did not change.
+    taken_back: AtomicU64,
 }
 
 struct Held {
@@ -654,6 +672,7 @@ impl Keys {
                 saving: Mutex::new(()),
                 taken: AtomicU64::new(0),
                 unparsed: Mutex::new(BTreeSet::new()),
+                taken_back: AtomicU64::new(0),
             }),
         };
         let own = keys.public_key();
@@ -723,7 +742,8 @@ impl Keys {
     /// again while it is valid, as a join whose answer was lost does. A code is used up only
     /// once the key is saved. A code made for a named machine is refused from any other
     /// address, before anything is saved. Gives the machine the code was made for, for a
-    /// code made for a named machine.
+    /// code made for a named machine, and whether the key table did not hold the machine
+    /// before.
     ///
     /// Blocks on the secret store, as [`Keys::open`] does, and behind any other change to the
     /// key table in this process.
@@ -733,7 +753,7 @@ impl Keys {
         machine: MachineId,
         key: &PublicKey,
         from: IpAddr,
-    ) -> Result<Option<Named>, JoinError> {
+    ) -> Result<Redeemed, JoinError> {
         let typed = code.trim().to_ascii_uppercase();
         let saving = self.saving()?;
         // Read before the save, so a code that expires while the save waits still gives it.
@@ -749,11 +769,38 @@ impl Keys {
             }
             shown.named.clone()
         };
-        self.change(&saving, |machines| admit_into(machines, machine, key))?;
+        let mut admitted = false;
+        self.change(&saving, |machines| {
+            admitted = !machines.contains_key(&machine);
+            admit_into(machines, machine, key)
+        })?;
         if let Some(shown) = self.held().shown(&typed) {
             shown.used_by = Some(machine);
         }
-        Ok(named)
+        Ok(Redeemed { named, admitted })
+    }
+
+    /// Takes back the key a redeem admitted `machine` with, for a join that is answered as
+    /// failed: the machine is held no longer, as before the redeem. The code stays that
+    /// machine's, so the same join sent again admits it again. A revocation, or another key
+    /// than `key`, is left as it is.
+    ///
+    /// The machine list may carry the key all the same, when an edit that got no answer was
+    /// numbered after all, and [`Keys::follow`] may have passed it over while the key was
+    /// held. So this also has the follower read the list again.
+    ///
+    /// Blocks on the secret store, as [`Keys::open`] does, and behind any other change to the
+    /// key table in this process.
+    pub fn take_back(&self, machine: MachineId, key: &PublicKey) -> Result<(), JoinError> {
+        let saving = self.saving()?;
+        let taken = self.change(&saving, |machines| {
+            if matches!(machines.get(&machine), Some(Entry::Active { key: held }) if held == key) {
+                machines.remove(&machine);
+            }
+            Ok(())
+        });
+        self.inner.taken_back.fetch_add(1, Ordering::SeqCst);
+        taken
     }
 
     /// Admits, by [`admit_into`]'s rule, each machine in `machines` listed with a key that
@@ -799,16 +846,19 @@ impl Keys {
     }
 
     /// Admits the keys the machine list in `store` carries, by [`Keys::learn`], whenever the
-    /// settings change, checked every [`RECHECK`], until the returned future is dropped. A
-    /// change it could not save is tried again on the next check, and warned about once until
-    /// one succeeds.
+    /// settings change or a key was taken back ([`Keys::take_back`]), checked every
+    /// [`RECHECK`], until the returned future is dropped. A change it could not save is tried
+    /// again on the next check, and warned about once until one succeeds.
     pub async fn follow(&self, store: Arc<Mutex<Store>>) {
         let mut seen = None;
+        let mut taken_back = self.inner.taken_back.load(Ordering::SeqCst);
         let mut warned = false;
         let mut every = tokio::time::interval(RECHECK);
         loop {
             every.tick().await;
-            let prev = seen;
+            // Read before the list, so a key taken back while this pass runs starts another.
+            let back = self.inner.taken_back.load(Ordering::SeqCst);
+            let prev = seen.filter(|_| back == taken_back);
             let changed = on_store(&store, move |store| {
                 Ok::<_, StoreError>(store.settings_since(prev)?.map(|s| (s.seq, s.machines)))
             })
@@ -825,6 +875,7 @@ impl Keys {
             match tokio::task::spawn_blocking(move || keys.learn(&machines)).await {
                 Ok(Ok(())) => {
                     seen = Some(seq);
+                    taken_back = back;
                     warned = false;
                 }
                 Ok(Err(error)) => {
@@ -1200,10 +1251,12 @@ async fn forward(from: &mut Receiver<String>, to: &Sender<String>) {
 /// `lister` before the answer, with its key: under the name and address the request sends, the
 /// entry the joining machine lists itself under, or, from a `foundryd join` that sends no name
 /// or no address, under the name typed and the address it resolved to. A listing that fails is
-/// `503` `{"error"}`, and the code stays valid for that machine. A sent name with a control
-/// character, or a sent address that is not a Tailscale or loopback IP, which a machine's own
-/// entry never holds, is `503` too, before the code is used or the key is kept. A code made by
-/// [`Keys::new_code`] lists nothing.
+/// `503` `{"error"}`: the key this join admitted the machine with is taken back
+/// ([`Keys::take_back`]), so a join answered `503` leaves the machine as it was held before,
+/// and the code stays valid for that machine. A sent name with a control character, or a sent
+/// address that is not a Tailscale or loopback IP, which a machine's own entry never holds, is
+/// `422` `{"error"}`, before the code is used or the key is kept: sending the same again
+/// cannot work. A code made by [`Keys::new_code`] lists nothing.
 pub fn router(keys: Keys, lister: Lister) -> Router {
     Router::new()
         .route(JOIN_PATH, post(redeem))
@@ -1283,7 +1336,7 @@ async fn redeem(
         Ok(sent) => sent,
         Err(why) => {
             return (
-                StatusCode::SERVICE_UNAVAILABLE,
+                StatusCode::UNPROCESSABLE_ENTITY,
                 Json(serde_json::json!({ "error": why })),
             )
                 .into_response();
@@ -1299,8 +1352,8 @@ async fn redeem(
     let redeemed =
         tokio::task::spawn_blocking(move || keys.redeem(&code, machine, &key, sender.ip())).await;
     match redeemed {
-        Ok(Ok(named)) => {
-            let listed = match named {
+        Ok(Ok(redeemed)) => {
+            let listed = match redeemed.named {
                 Some(named) => {
                     let entry = sent
                         .unwrap_or_else(|| request.listed(named.name, named.address.to_string()));
@@ -1310,11 +1363,16 @@ async fn redeem(
             };
             match listed {
                 Ok(()) => Json(answer).into_response(),
-                Err(error) => (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(serde_json::json!({ "error": error })),
-                )
-                    .into_response(),
+                Err(error) => {
+                    if redeemed.admitted {
+                        take_back(&joining.keys, request.machine, request.key).await;
+                    }
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({ "error": error })),
+                    )
+                        .into_response()
+                }
             }
         }
         Ok(Err(error @ (JoinError::BadCode | JoinError::OtherMachine))) => {
@@ -1335,6 +1393,25 @@ async fn redeem(
                 .into_response()
         }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// Takes back the key a join that could not be listed admitted `machine` with, so a join
+/// answered as failed keeps nothing. When the key table cannot be saved the key stays held,
+/// and that is warned: the machine is admitted to links though nothing lists it.
+async fn take_back(keys: &Keys, machine: MachineId, key: PublicKey) {
+    let keys = keys.clone();
+    let taken = tokio::task::spawn_blocking(move || keys.take_back(machine, &key)).await;
+    match taken {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(
+            "join: machine {machine} could not be listed, and its key is still held, since it \
+             could not be taken back: {error}"
+        ),
+        Err(error) => tracing::warn!(
+            "join: machine {machine} could not be listed, and its key is still held, since \
+             taking it back stopped: {error}"
+        ),
     }
 }
 
@@ -1574,12 +1651,62 @@ mod tests {
 
         for _ in 0..2 {
             let used = host.redeem(&code, peer.me(), &peer.public_key(), HERE);
-            assert_eq!(used.unwrap(), Some(named(HERE)));
+            assert_eq!(used.unwrap().named, Some(named(HERE)));
         }
         let plain = host.new_code().unwrap().to_string();
         let other = machine_keys();
         let used = host.redeem(&plain, other.me(), &other.public_key(), HERE);
-        assert_eq!(used.unwrap(), None);
+        assert_eq!(used.unwrap().named, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_redeem_says_whether_it_admitted_the_machine_or_found_it_held() {
+        let (host, peer) = (machine_keys(), machine_keys());
+        let code = host.new_code().unwrap().to_string();
+
+        let first = host.redeem(&code, peer.me(), &peer.public_key(), HERE);
+        assert!(first.unwrap().admitted);
+        // Sent again after a lost answer, then with a new code: held already both times.
+        let again = host.redeem(&code, peer.me(), &peer.public_key(), HERE);
+        assert!(!again.unwrap().admitted);
+        let new = host.new_code().unwrap().to_string();
+        let held = host.redeem(&new, peer.me(), &peer.public_key(), HERE);
+        assert!(!held.unwrap().admitted);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_key_taken_back_is_held_no_longer_and_the_same_code_admits_that_machine_again() {
+        let secrets = Arc::new(MemorySecrets::default());
+        let host = Keys::open(secrets.clone()).unwrap();
+        let (peer, other) = (machine_keys(), machine_keys());
+        let code = host.new_code().unwrap().to_string();
+        host.redeem(&code, peer.me(), &peer.public_key(), HERE)
+            .unwrap();
+
+        host.take_back(peer.me(), &peer.public_key()).unwrap();
+
+        assert_eq!(host.state(peer.me()), KeyState::NoKey);
+        let reopened = Keys::open(secrets).unwrap();
+        assert_eq!(reopened.state(peer.me()), KeyState::NoKey);
+        // The code is still that machine's, and nobody else's.
+        let claimed = host.redeem(&code, other.me(), &other.public_key(), HERE);
+        assert!(matches!(claimed, Err(JoinError::BadCode)), "{claimed:?}");
+        let again = host.redeem(&code, peer.me(), &peer.public_key(), HERE);
+        assert!(again.unwrap().admitted);
+        assert_eq!(host.state(peer.me()), KeyState::Active);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn taking_a_key_back_never_removes_another_key_or_a_revocation() {
+        let (host, peer, other) = (machine_keys(), machine_keys(), machine_keys());
+        admit(&host, &peer);
+
+        host.take_back(peer.me(), &other.public_key()).unwrap();
+        assert_eq!(held_key(&host, peer.me()), Some(peer.public_key()));
+
+        host.revoke(peer.me()).unwrap();
+        host.take_back(peer.me(), &peer.public_key()).unwrap();
+        assert_eq!(host.state(peer.me()), KeyState::Revoked);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1595,7 +1722,7 @@ mod tests {
         );
         flaky.failing.store(false, Ordering::SeqCst);
         let used = host.redeem(&code.to_string(), peer.me(), &peer.public_key(), HERE);
-        assert_eq!(used.unwrap(), Some(named(HERE)));
+        assert_eq!(used.unwrap().named, Some(named(HERE)));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1615,7 +1742,7 @@ mod tests {
 
         let used = host.redeem(&code.to_string(), peer.me(), &peer.public_key(), HERE);
 
-        assert_eq!(used.unwrap(), Some(named(HERE)));
+        assert_eq!(used.unwrap().named, Some(named(HERE)));
         assert_eq!(host.state(peer.me()), KeyState::Active);
     }
 
@@ -2195,6 +2322,42 @@ mod tests {
             assert!(tokio::time::Instant::now() < deadline, "never admitted");
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        following.abort();
+    }
+
+    #[tokio::test]
+    async fn a_key_taken_back_while_its_machine_is_listed_is_admitted_again_with_no_new_change() {
+        let (host, peer) = (machine_keys(), machine_keys());
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path().join("foundry.db")).unwrap();
+        let settings = SharedSettings {
+            seq: 1,
+            machines: vec![listed(peer.me(), peer.public_key().hex())],
+            ..SharedSettings::default()
+        };
+        assert!(store.apply_settings(settings).unwrap());
+        let store = Arc::new(Mutex::new(store));
+        let following = tokio::spawn({
+            let host = host.clone();
+            async move { host.follow(store).await }
+        });
+        let peer_id = peer.me();
+        let admitted = |what: &'static str| {
+            let host = host.clone();
+            async move {
+                let deadline = tokio::time::Instant::now() + RECHECK * 5;
+                while host.state(peer_id) != KeyState::Active {
+                    assert!(tokio::time::Instant::now() < deadline, "{what}");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        };
+        admitted("never admitted").await;
+
+        // As a join whose listing got no answer does, when the edit was numbered after all.
+        host.take_back(peer.me(), &peer.public_key()).unwrap();
+
+        admitted("not admitted again").await;
         following.abort();
     }
 
@@ -2869,6 +3032,70 @@ mod tests {
             matches!(failed, Err(JoinError::NotAdmitted { .. })),
             "{failed:?}"
         );
+    }
+
+    /// The port of a join route that answers every join with `status` and `body`.
+    async fn answering(status: u16, body: &'static str) -> u16 {
+        let app = Router::new().route(
+            JOIN_PATH,
+            post(move || async move { (StatusCode::from_u16(status).unwrap(), body) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        port
+    }
+
+    /// An answer's error with a terminal title, a bell, a screen clear and a line break in it.
+    const LOUD: &str = r#"{"error":"\u001b]0;pwned\u0007\u001b[2Jthe list\nis busy"}"#;
+    const QUIET: &str = "]0;pwned[2Jthe listis busy";
+
+    #[tokio::test]
+    async fn a_503_reason_is_given_without_its_control_characters_and_says_to_run_it_again() {
+        let port = answering(503, LOUD).await;
+        let joined = join_over_http(port, "ABCDEFGHJK", Arc::default()).await;
+        let Err(error @ JoinError::NotListed { .. }) = joined else {
+            panic!("{joined:?}");
+        };
+        assert!(
+            matches!(&error, JoinError::NotListed { reason, .. } if reason == QUIET),
+            "{error:?}"
+        );
+        let shown = error.to_string();
+        assert!(!shown.chars().any(char::is_control), "{shown:?}");
+        assert!(shown.ends_with("run the same command again"), "{shown}");
+    }
+
+    #[tokio::test]
+    async fn a_503_or_a_422_whose_body_is_not_the_error_object_says_no_reason_was_given() {
+        for status in [503, 422] {
+            let port = answering(status, "busy\u{1b}[2J").await;
+            let joined = join_over_http(port, "ABCDEFGHJK", Arc::default()).await;
+            assert!(
+                matches!(
+                    &joined,
+                    Err(JoinError::NotListed { reason, .. } | JoinError::EntryRefused { reason, .. })
+                        if reason == "no reason was given"
+                ),
+                "{status}: {joined:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_422_reason_is_given_without_its_control_characters_and_not_as_worth_a_retry() {
+        let port = answering(422, LOUD).await;
+        let joined = join_over_http(port, "ABCDEFGHJK", Arc::default()).await;
+        let Err(error @ JoinError::EntryRefused { .. }) = joined else {
+            panic!("{joined:?}");
+        };
+        assert!(
+            matches!(&error, JoinError::EntryRefused { reason, .. } if reason == QUIET),
+            "{error:?}"
+        );
+        let shown = error.to_string();
+        assert!(!shown.chars().any(char::is_control), "{shown:?}");
+        assert!(!shown.contains("again"), "{shown}");
     }
 
     #[test]

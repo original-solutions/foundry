@@ -18,8 +18,8 @@
 //! change is, before it answers: with its key, under the name and address it lists itself
 //! under, or under the name typed at that address when it sends none. A list that already holds
 //! the machine is left as it is. When another machine has the name or the address, or the edit
-//! fails, the join is `503`, and the same machine may send the code again. A code made anywhere
-//! else lists nothing.
+//! fails, the join is `503`, the key the join admitted the machine with is taken back, and the
+//! same machine may send the code again. A code made anywhere else lists nothing.
 
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
@@ -631,6 +631,7 @@ mod tests {
             assert_eq!(status, 503, "{name:?} at {address}: {body}");
             assert!(error_of(&body).contains("build-box"), "{body}");
             assert_eq!(served.held(joining.me()), None, "{name:?} at {address}");
+            assert_eq!(served.keys.state(joining.me()), join::KeyState::NoKey);
         }
     }
 
@@ -653,7 +654,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_sent_name_or_address_outside_the_rules_is_503_and_admits_nothing() {
+    async fn a_sent_name_or_address_outside_the_rules_is_422_and_admits_nothing() {
         for (name, address) in [
             ("build\tbox", "100.64.0.7"),
             ("build-box", "relay.example.com"),
@@ -667,7 +668,7 @@ mod tests {
                 .join_as(&code, &joining, Some(name), Some(address))
                 .await;
 
-            assert_eq!(status, 503, "{name:?} at {address}: {body}");
+            assert_eq!(status, 422, "{name:?} at {address}: {body}");
             assert!(!error_of(&body).chars().any(char::is_control), "{body}");
             assert_eq!(served.held(joining.me()), None, "{name:?} at {address}");
             assert_eq!(served.keys.state(joining.me()), join::KeyState::NoKey);
@@ -706,6 +707,7 @@ mod tests {
         assert!(error.contains(&peer.to_string()), "{error}");
         assert!(!body.contains(&code), "the code reached the answer: {body}");
         assert_eq!(served.held(joining.me()), None);
+        assert_eq!(served.keys.state(joining.me()), join::KeyState::NoKey);
 
         // This machine comes to act, and the same machine sends the same code again.
         let mut acting = served.settings();
@@ -721,6 +723,32 @@ mod tests {
             served.held(joining.me()),
             Some(keyed(&joining, "build-box", "100.64.0.7"))
         );
+        assert_eq!(served.keys.state(joining.me()), join::KeyState::Active);
+    }
+
+    #[tokio::test]
+    async fn a_join_that_is_not_listed_leaves_a_key_the_machine_was_held_with_before() {
+        let other = MachineId::random();
+        let served = Served::new(move |_, settings| {
+            settings
+                .machines
+                .push(machine(other, "build-box", "100.64.0.9"));
+        })
+        .await;
+        served.hear_sending(other, Some(served.settings())).await;
+        let joining = Keys::open(Arc::new(MemorySecrets::default())).unwrap();
+        // Admitted before, by a code made for no named machine.
+        let plain = served.keys.new_code().unwrap().to_string();
+        let (status, body) = served.join(&plain, &joining).await;
+        assert_eq!(status, 200, "{body}");
+        let code = served.code_for("127.0.0.1").await;
+
+        let (status, body) = served
+            .join_as(&code, &joining, Some("build-box"), Some("100.64.0.7"))
+            .await;
+
+        assert_eq!(status, 503, "{body}");
+        assert_eq!(served.keys.state(joining.me()), join::KeyState::Active);
     }
 
     #[tokio::test]
@@ -825,6 +853,7 @@ mod tests {
         let (status, body) = served.join(&second_code, &second).await;
         assert_eq!(status, 503, "{body}");
         assert!(error_of(&body).contains("127.0.0.1"), "{body}");
+        assert_eq!(served.keys.state(second.me()), join::KeyState::NoKey);
 
         tokio::time::sleep(Duration::from_millis(300)).await;
         let machines = served.settings().machines;
@@ -859,6 +888,7 @@ mod tests {
 
             let (status, body) = served.join(&code, &joining).await;
             assert_eq!(status, 503, "{name:?} at {address}: {body}");
+            assert_eq!(served.keys.state(joining.me()), join::KeyState::NoKey);
 
             let machines = served.settings().machines;
             assert!(
