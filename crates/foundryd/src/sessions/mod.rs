@@ -255,8 +255,8 @@ impl Sessions {
 
     /// Takes up this machine's sessions that a daemon before this one started and that have
     /// not failed: call it once, after the terminals are reattached and before the hooks are
-    /// served. A finished session is among them, since its child can still exit badly and its
-    /// files go only with the child. A session whose terminal is gone or has exited is ended,
+    /// served. A finished session whose files are still there is among them, since its child
+    /// can still exit badly and its files go only with the child. A session whose terminal is gone or has exited is ended,
     /// its record written as the exit makes it and its files removed; an end the store refuses
     /// is written later, in a task of the session's own. Any other is followed again as
     /// [`Sessions::start`] follows a new one, its curl config is written again with this
@@ -438,22 +438,33 @@ impl Inner {
         }
     }
 
-    /// This machine's sessions that are not deleted and have not failed, each with its
-    /// terminal's exit code when the terminal is gone or has exited, and this machine's newest
-    /// version. One store call reads them all, so an exit recorded after it is above that
-    /// version, and a follower reading from there does not miss it. Only session rows are
-    /// read; a session whose terminal row cannot be read is left as it is, with a warning.
+    /// This machine's sessions that are not deleted, have not failed and, when finished, still
+    /// have a file, each with its terminal's exit code when the terminal is gone or has
+    /// exited, and this machine's newest version. One store call reads them all, so an exit
+    /// recorded after it is above that version, and a follower reading from there does not
+    /// miss it. Only session rows are read, and a terminal only for a session kept, so the
+    /// work grows with the sessions still open rather than with every session ever run. A
+    /// session whose terminal row cannot be read is left as it is, with a warning.
     async fn open_sessions(&self) -> Result<OpenSessions, SessionError> {
         #[cfg(test)]
         if take_one(&self.fail_adopt_reads) {
             return Err(busy().into());
         }
-        let me = self.me;
+        let (me, dir) = (self.me, self.dir.clone());
         self.on_store(move |store| {
             let cursor = store.versions()?.get(&me).copied().unwrap_or(0);
             let mut open = Vec::new();
             for record in store.sessions_of(me)? {
-                if record.body.state == SessionState::Failed {
+                let done = match record.body.state {
+                    SessionState::Failed => true,
+                    // Its exit was applied once its files are gone: `event` removes them then.
+                    SessionState::Finished => {
+                        let (settings, curl) = files(&dir, record.body.id);
+                        !settings.exists() && !curl.exists()
+                    }
+                    _ => false,
+                };
+                if done {
                     continue;
                 }
                 let terminal = match store.terminal(record.body.terminal) {
@@ -549,10 +560,7 @@ impl Inner {
 
     /// The settings file and curl config of session `id`.
     fn files(&self, id: SessionId) -> (PathBuf, PathBuf) {
-        (
-            self.dir.join(format!("{id}.json")),
-            self.dir.join(format!("{id}.curl")),
-        )
+        files(&self.dir, id)
     }
 
     /// Starts the terminal, and gives it with the highest version this machine has written
@@ -1008,6 +1016,14 @@ fn has_ended(terminal: &Record<Terminal>) -> bool {
     terminal.deleted || terminal.body.state == TerminalState::Exited
 }
 
+/// The settings file and curl config of session `id`, in the sessions folder `dir`.
+fn files(dir: &Path, id: SessionId) -> (PathBuf, PathBuf) {
+    (
+        dir.join(format!("{id}.json")),
+        dir.join(format!("{id}.curl")),
+    )
+}
+
 /// Whether `error` is the store being busy, which passes, rather than one that comes back on
 /// every read.
 fn is_busy(error: &StoreError) -> bool {
@@ -1306,5 +1322,97 @@ mod adopt_tests {
             .expect("adopt kept reading a store that cannot answer");
 
         assert!(!lock(&sessions.inner.live).contains_key(&id));
+    }
+
+    #[tokio::test]
+    async fn a_finished_session_whose_child_still_runs_is_followed_and_fails_when_it_exits_badly() {
+        let running = Some((false, TerminalState::Running, None));
+        let finished = Seed {
+            state: SessionState::Finished,
+            ..WORKING
+        };
+        let (_data, sessions, id) = with_a_session_record(running, finished);
+
+        sessions.adopt().await;
+
+        assert!(lock(&sessions.inner.live).contains_key(&id));
+        let session = record(&sessions, id).unwrap().body;
+        {
+            let mut store = lock(&sessions.inner.store);
+            let exit = AnyRecord::Terminal(Record {
+                owner: sessions.inner.me,
+                version: store.own_next_version().unwrap(),
+                deleted: false,
+                body: Terminal {
+                    id: session.terminal,
+                    workspace: session.workspace,
+                    state: TerminalState::Exited,
+                    exit_code: Some(1),
+                },
+            });
+            store.apply(&exit, sessions.inner.me).unwrap();
+        }
+        let end = Instant::now() + Duration::from_secs(20);
+        while state(&sessions, id) != Some(SessionState::Failed) || !files_gone(&sessions, id) {
+            assert!(Instant::now() < end, "the session did not fail");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_finished_session_whose_files_are_gone_is_not_read_again() {
+        let running = Some((false, TerminalState::Running, None));
+        let finished = Seed {
+            state: SessionState::Finished,
+            ..WORKING
+        };
+        let (_data, sessions, id) = with_a_session_record(running, finished);
+        let (settings, curl) = sessions.inner.files(id);
+        std::fs::remove_file(settings).unwrap();
+        std::fs::remove_file(curl).unwrap();
+
+        sessions.adopt().await;
+
+        assert!(!lock(&sessions.inner.live).contains_key(&id));
+    }
+
+    #[tokio::test]
+    async fn a_session_whose_terminal_row_cannot_be_read_is_left_alone_and_the_rest_adopted() {
+        let (data, sessions, ended) = with_a_session_whose_terminal_exited();
+        let me = sessions.inner.me;
+        let unreadable = SessionId::random();
+        let terminal = TerminalId::random();
+        {
+            let mut store = lock(&sessions.inner.store);
+            let session = AnyRecord::Session(Record {
+                owner: me,
+                version: store.own_next_version().unwrap(),
+                deleted: false,
+                body: Session {
+                    id: unreadable,
+                    workspace: WorkspaceId::random(),
+                    terminal,
+                    model: "test-model".into(),
+                    state: SessionState::Working,
+                },
+            });
+            store.apply(&session, me).unwrap();
+        }
+        let db = rusqlite::Connection::open(data.path().join("foundry.db")).unwrap();
+        db.execute(
+            "INSERT INTO records (kind, id, owner, version, record) \
+             VALUES ('terminal', ?1, ?2, 1000, '{\"from\":\"a newer build\"}')",
+            rusqlite::params![terminal.to_string(), me.to_string()],
+        )
+        .unwrap();
+
+        sessions.adopt().await;
+
+        // The states are read with every record, which the unreadable row would stop.
+        db.execute("DELETE FROM records WHERE version = 1000", [])
+            .unwrap();
+        assert_eq!(state(&sessions, ended), Some(SessionState::Finished));
+        assert_eq!(state(&sessions, unreadable), Some(SessionState::Working));
+        assert!(!lock(&sessions.inner.live).contains_key(&unreadable));
     }
 }
