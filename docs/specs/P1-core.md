@@ -49,7 +49,7 @@ In:
 
 Out, and where it goes:
 
-- GitHub accounts, issues, labels, gates, reviews, merging, leases, the ledger: P2.
+- GitHub logins, issues, labels, gates, leases, the ledger: P2. Reviews and merging: P2b.
 - Diffs, the PR view, run history, the desktop wrapper: P3.
 - File editing in the app: never. Code changes go through a terminal.
 - Plugins, automations, tasks, pages: never.
@@ -268,7 +268,7 @@ A file dropped on a terminal of this machine, pasted into it (a screenshot on th
 - If the network splits, each side may have its own acting coordinator for a while. In P1 the only harm is two edits to the same shared setting. The later edit wins when the sides rejoin, and an attention item says a setting was overwritten and shows both values.
 - Sessions are never affected by a change of coordinator. They belong to their machines.
 
-P2 adds a lease per project on GitHub, so that claiming issues and merging can never happen from two machines at once. P1 has nothing that needs it.
+P2 adds a lease per project on GitHub, so that claiming issues can never happen from two machines at once. P2b's merging goes under the same lease. P1 has nothing that needs it.
 
 ## Security
 
@@ -340,7 +340,7 @@ One thing the check found that the design did not expect: in a folder Claude Cod
 
 ## Decisions already made for later pieces
 
-Settled in the brainstorm on 2026-11-17. P2's spec, [P2-factory.md](P2-factory.md), takes the leases, the gate on any machine, reconciling every pass and what is kept from the earlier factories. It keeps one GitHub login per machine with an override per project instead of the coordinator handing credentials out. The review loop, the merge setting and the merge queue belong to P2b and stay recorded here until its spec exists.
+Settled in the brainstorm on 2026-11-17. P2's spec, [P2-factory.md](P2-factory.md), takes the leases, the gate on any machine, reconciling every pass and what is kept from the earlier factories. Each machine holds tokens for the logins it can act as, and each project names the login it acts as, instead of the coordinator handing credentials out. The review loop, the merge setting and the merge queue belong to P2b and stay recorded here until its spec exists.
 
 - **GitHub accounts.** Replaced by P2's spec: each machine holds its own tokens, a project names the login it acts as, and no credential is handed from one machine to another. Instructors stay a list per project.
 - **The unattended loop.** Claim, build with the `/factory` skill, run the gate on a fresh checkout, then run the review gate and fix until it scores 5 out of 5. A cap on rounds ends in the `stuck` state.
