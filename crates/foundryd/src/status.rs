@@ -25,17 +25,12 @@ pub fn status() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match fetch(port) {
-        Ok(UiMessage::State {
-            records,
-            settings,
-            online,
-            ..
-        }) => {
-            print!("{}", render(&records, &settings, online.as_deref()));
+    match fetch(port).map(state_text) {
+        Ok(Some(text)) => {
+            print!("{text}");
             ExitCode::SUCCESS
         }
-        Ok(_) => {
+        Ok(None) => {
             eprintln!("foundryd status: the daemon on 127.0.0.1:{port} did not send its state");
             ExitCode::FAILURE
         }
@@ -43,6 +38,20 @@ pub fn status() -> ExitCode {
             eprintln!("foundryd status: {error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// What `foundryd status` prints for the message the daemon sent: its state rendered with the
+/// online set it carried, or `None` when the message is not the state.
+fn state_text(message: UiMessage) -> Option<String> {
+    match message {
+        UiMessage::State {
+            records,
+            settings,
+            online,
+            ..
+        } => Some(render(&records, &settings, online.as_deref())),
+        _ => None,
     }
 }
 
