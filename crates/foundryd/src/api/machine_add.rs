@@ -7,18 +7,21 @@
 //! fleet run on one machine is. A name a listed machine has, compared trimmed and in any case,
 //! is `409`, and so is a name that resolves to a listed machine's address. A machine the list
 //! does not hold yet has no address to put in the command, so it answers `503`. Otherwise it
-//! answers `201` `{code, command, expires_in_secs}`: a new join code,
-//! `foundryd join <this machine's address> <code>` to run on the new machine, and how long the
-//! code works ([`CODE_VALID_FOR`]).
+//!
+//! answers `201` `{code, command, expires_in_secs, address}`: a new join code,
+//! `foundryd join <this machine's address> <code>` to run on the new machine, how long the
+//! code works ([`CODE_VALID_FOR`]) and the address the name resolved to, which the machine is
+//! listed at unless it says another.
 //!
 //! The code works only from an address the name resolved to. The name and the first of those
 //! addresses are held with the code until it expires. When a machine uses the code on the join
 //! route, the route lists it through [`Lister`], through the acting coordinator, as every
 //! machine list change is, before it answers: with its key, under the name and address it
-//! lists itself under, or, from a `foundryd join` that sends none, under the name typed at that
-//! first address. Nothing is listed when the list by then holds that machine, that name or that
-//! address; that is warned, and the join stands. An edit that fails makes the join `503`, and
-//! the same machine may send the code again. A code made anywhere else lists nothing.
+//! lists itself under, or under the name typed at that first address when it sends none, sends
+//! one that breaks the rules, or sends one another listed machine has. A list that already holds
+//! the machine is left as it is. When another machine has the name or the address it would be
+//! listed under either way, or the edit fails, the join is `503`, and the same machine may send
+//! the code again. A code made anywhere else lists nothing.
 
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
@@ -104,10 +107,8 @@ async fn add(
             format!("{name:?} is already in the fleet as {:?}", other.name),
         ));
     }
-    let named = Named {
-        name,
-        address: addresses[0],
-    };
+    let address = addresses[0];
+    let named = Named { name, address };
     let code = adding
         .keys
         .new_named_code(named, addresses)
@@ -116,6 +117,7 @@ async fn add(
         "command": format!("foundryd join {} {code}", own.address.trim()),
         "code": code.to_string(),
         "expires_in_secs": CODE_VALID_FOR.as_secs(),
+        "address": address.to_string(),
     });
     Ok((StatusCode::CREATED, axum::Json(answer)).into_response())
 }
@@ -162,42 +164,48 @@ impl Lister {
         Self { coordinator, store }
     }
 
-    /// Lists `machine` through the coordinator, and says once the edit is numbered. Nothing is
-    /// sent when the list already holds that machine (this machine included), whose entry is
-    /// never overwritten, or another machine with that name or at that address, as after a
-    /// second code for the same name; that is warned. A list that cannot be read, or an edit
-    /// that fails, gives why. The code is never logged.
-    pub(crate) async fn list(&self, machine: Machine) -> Result<(), String> {
-        let id = machine.id;
+    /// Lists the machine that used a code, and says once the edit is numbered: as `sent`, the
+    /// entry it lists itself under, else as `typed`, the name typed for the code at the address
+    /// it resolved to, whichever first has a name and an address no other listed machine has.
+    /// A list that already holds the machine (this machine included) is left as it is: its
+    /// entry is never overwritten, and a join sent again after a lost answer finds it there.
+    /// A list that cannot be read, another machine with the name or the address of both, or an
+    /// edit that fails gives why, which is warned. The code is never logged.
+    pub(crate) async fn list(&self, sent: Option<Machine>, typed: Machine) -> Result<(), String> {
+        let id = typed.id;
         let held = on_store(&self.store, |store| store.settings())
             .await
             .map_err(|error| format!("the machine list could not be read: {error}"))?;
         if held.machines.iter().any(|m| m.id == id) {
-            tracing::warn!(
-                "machine {id} used a code to join but is already in the machine list; its entry is left as it is"
-            );
             return Ok(());
         }
-        let wanted = machine.name.trim().to_lowercase();
-        let address = machine.address.trim();
-        if let Some(other) = held.machines.iter().find(|m| {
-            m.name.trim().to_lowercase() == wanted
-                || address
-                    .parse::<IpAddr>()
-                    .map_or(m.address.trim() == address, |ip| {
-                        has_address(&m.address, ip)
-                    })
-        }) {
-            tracing::warn!(
-                "machine {id} used a code to join as {:?} at {}, but {:?} at {} is already in \
-                 the machine list, so it is not listed",
-                machine.name,
-                machine.address,
-                other.name,
-                other.address
-            );
-            return Ok(());
-        }
+        let taken = |machine: &Machine| {
+            let wanted = machine.name.trim().to_lowercase();
+            let address = machine.address.trim();
+            held.machines.iter().find(|m| {
+                m.name.trim().to_lowercase() == wanted
+                    || address
+                        .parse::<IpAddr>()
+                        .map_or(m.address.trim() == address, |ip| {
+                            has_address(&m.address, ip)
+                        })
+            })
+        };
+        let machine = match sent.filter(|sent| taken(sent).is_none()) {
+            Some(sent) => sent,
+            None => {
+                if let Some(other) = taken(&typed) {
+                    let why = format!(
+                        "{:?} at {} is already in the machine list, so the machine is not listed \
+                         as {:?} at {}",
+                        other.name, other.address, typed.name, typed.address
+                    );
+                    tracing::warn!("machine {id} used a code to join, but {why}");
+                    return Err(why);
+                }
+                typed
+            }
+        };
         match self.coordinator.edit(Edit::SetMachine { machine }).await {
             Ok(_) => Ok(()),
             Err(error) => {

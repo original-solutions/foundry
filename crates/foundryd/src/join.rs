@@ -53,6 +53,7 @@ use tokio::time::{Instant, timeout};
 
 use crate::api::machine_add::Lister;
 use crate::api::machine_names;
+use crate::api::machine_names::is_name;
 use crate::secrets::{self, Secrets, SecretsError};
 use crate::store::{Store, StoreError};
 use crate::sync::{Conn, Dialer, OFFLINE_AFTER, Peers, on_store};
@@ -243,7 +244,11 @@ fn post_join(
             let reason = response
                 .body_mut()
                 .read_json::<Unlisted>()
-                .map_or_else(|_| "no reason was given".to_owned(), |u| u.error);
+                // What another machine says is printed, so it moves no terminal's cursor.
+                .map_or_else(
+                    |_| "no reason was given".to_owned(),
+                    |u| u.error.chars().filter(|c| !c.is_control()).collect(),
+                );
             Err(JoinError::NotListed {
                 url: url.to_owned(),
                 reason,
@@ -832,7 +837,15 @@ impl Keys {
                     }
                     warned = true;
                 }
-                Err(_) => {}
+                Err(error) => {
+                    if !warned {
+                        tracing::warn!(
+                            "join: admitting the keys the machine list carries stopped, trying \
+                             again: {error}"
+                        );
+                    }
+                    warned = true;
+                }
             }
         }
     }
@@ -1185,10 +1198,12 @@ async fn forward(from: &mut Receiver<String>, to: &Sender<String>) {
 /// serves every route.
 ///
 /// A code made for a named machine, by the add route, also lists the machine through
-/// `lister` before the answer: under the name and address the request sends, the entry the
-/// joining machine lists itself under, else under the name typed and the address it resolved
-/// to, with its key. A listing that fails is `503` `{"error"}`, and the code stays valid for
-/// that machine. Without a `lister`, no code lists anything.
+/// `lister` before the answer, with its key: under the name and address the request sends, the
+/// entry the joining machine lists itself under, when that name passes the rule for a
+/// machine's name, that address is a Tailscale or loopback IP and no other listed machine has
+/// either; else under the name typed and the address it resolved to. A listing that fails is
+/// `503` `{"error"}`, and the code stays valid for that machine. Without a `lister`, no code
+/// lists anything.
 pub fn router(keys: Keys, lister: Option<Lister>) -> Router {
     Router::new()
         .route(JOIN_PATH, post(redeem))
@@ -1223,15 +1238,25 @@ struct JoinRequest {
 }
 
 impl JoinRequest {
-    /// The entry the machine is listed under once it joins with a code made for `named`: the
-    /// name and address it sent, else, when either is missing or blank, the name typed and the
-    /// address it resolved to.
-    fn entry(&self, named: Named) -> Machine {
-        let sent = |field: &Option<String>| field.clone().filter(|f| !f.trim().is_empty());
-        let (name, address) = match (sent(&self.name), sent(&self.address)) {
-            (Some(name), Some(address)) => (name, address),
-            _ => (named.name, named.address.to_string()),
-        };
+    /// The entry the machine lists itself under, as it sent it: none when the name or the
+    /// address is missing, the name breaks the rule for a machine's name, or the address is not
+    /// a Tailscale or loopback IP, which is all a machine's own entry ever holds.
+    fn sent(&self) -> Option<Machine> {
+        let name = self.name.clone().filter(|name| is_name(name))?;
+        let address = self.address.clone().filter(|address| {
+            address
+                .parse::<IpAddr>()
+                .is_ok_and(|ip| joinable(ip.to_canonical()))
+        })?;
+        Some(self.listed(name, address))
+    }
+
+    /// The entry under the name typed for a code and the address it resolved to, `named`.
+    fn typed(&self, named: Named) -> Machine {
+        self.listed(named.name, named.address.to_string())
+    }
+
+    fn listed(&self, name: String, address: String) -> Machine {
         Machine {
             id: self.machine,
             name,
@@ -1258,7 +1283,9 @@ async fn redeem(
     match redeemed {
         Ok(Ok(named)) => {
             let listed = match (named, &joining.lister) {
-                (Some(named), Some(lister)) => lister.list(request.entry(named)).await,
+                (Some(named), Some(lister)) => {
+                    lister.list(request.sent(), request.typed(named)).await
+                }
                 _ => Ok(()),
             };
             match listed {

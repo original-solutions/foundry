@@ -191,6 +191,7 @@ impl Coordinator {
             if speak < ANSWERS_SINCE {
                 settings.numbered = held.numbered.clone();
             }
+            keep_keys(&held, &mut settings);
             let merged = merge(&held, &settings);
             if merged != held {
                 store.apply_settings(merged)?;
@@ -1024,6 +1025,25 @@ fn forget_old(numbered: &mut BTreeMap<EditId, Stamp>) {
     numbered.retain(|_, stamp| stamp.seq.saturating_add(NUMBERED_KEPT) > top);
 }
 
+/// Puts back in `copy` each machine's key that `held` has for the same edit, the same stamp,
+/// where `copy` has none: a machine from before keys were listed drops the key when it reads
+/// an entry and sends the edit on without it. One edit has one value, so the key is its own;
+/// without this the copy without it would differ from the held one at the same stamp, and
+/// every merge with that machine would take a new number.
+pub fn keep_keys(held: &SharedSettings, copy: &mut SharedSettings) {
+    let stamps = copy.stamps.clone();
+    for machine in copy.machines.iter_mut().filter(|m| m.key.is_empty()) {
+        let key = StampKey::Setting(SettingKey::Machine(machine.id));
+        let theirs = stamps.get(&key).copied().unwrap_or(Stamp::NONE);
+        if stamp(held, &key) != theirs {
+            continue;
+        }
+        if let Some(kept) = held.machines.iter().find(|m| m.id == machine.id) {
+            machine.key.clone_from(&kept.key);
+        }
+    }
+}
+
 /// One copy of the settings from two, setting by setting: the higher stamp's value holds. A
 /// setting both copies edited where neither had seen the other's edit also gets a "setting
 /// overwritten" item holding both values, stamped as the edit that held, or as the dismissal of
@@ -1540,10 +1560,41 @@ mod tests {
             m.key.clear();
         }
 
-        let out = merged(&keyed, &stripped);
+        keep_keys(&keyed, &mut stripped);
 
-        assert!(out.machines.contains(&c), "{:?}", out.machines);
-        assert!(out.overwritten.is_empty());
+        assert!(stripped.machines.contains(&c), "{:?}", stripped.machines);
+        assert_eq!(
+            merged(&keyed, &stripped),
+            keyed,
+            "the merge takes no new number"
+        );
+    }
+
+    #[test]
+    fn a_copy_without_a_key_from_another_edit_keeps_its_own_value() {
+        let c = Machine {
+            id: id(9),
+            name: "c".into(),
+            address: "100.64.0.9".into(),
+            key: "ab".repeat(32),
+        };
+        let keyed = numbered(&base(), &Edit::SetMachine { machine: c.clone() }, id(A));
+        let renamed = Machine {
+            name: "renamed".into(),
+            key: String::new(),
+            ..c
+        };
+        let mut later = numbered(
+            &keyed,
+            &Edit::SetMachine {
+                machine: renamed.clone(),
+            },
+            id(B),
+        );
+
+        keep_keys(&keyed, &mut later);
+
+        assert!(later.machines.contains(&renamed), "{:?}", later.machines);
     }
 
     #[test]

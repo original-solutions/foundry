@@ -82,6 +82,8 @@ export interface MachineView {
   name: string;
   /** Whether the machine list holds it: only a listed machine can be renamed. */
   listed: boolean;
+  /** The address the machine list holds for it; none for a machine it does not list. */
+  address?: string;
   status: "online" | "offline" | "unknown";
   sample: MachineSample | null;
   workspaces: WorkspaceView[];
@@ -90,10 +92,12 @@ export interface MachineView {
 /** The sidebar's model. Machine rules follow `foundryd status`. `briefs` name sessions by what they were asked. */
 export function fleet(records: AnyRecord[], settings: SharedSettings, briefs: Briefs = {}): MachineView[] {
   const machineNames = new Map<string, string>();
+  const machineAddresses = new Map<string, string>();
   const listed: string[] = [];
   for (const m of settings.machines) {
     listed.push(m.id);
     machineNames.set(m.id, m.name);
+    machineAddresses.set(m.id, m.address);
   }
   const projectNames = new Map<string, string>();
   for (const p of settings.projects) projectNames.set(p.id, p.name);
@@ -190,6 +194,7 @@ export function fleet(records: AnyRecord[], settings: SharedSettings, briefs: Br
     id,
     name: machineNames.get(id) ?? shortId(id),
     listed: machineNames.has(id),
+    address: machineAddresses.get(id),
     status: statusByOwner.get(id) ?? "unknown",
     sample: samplesByOwner.get(id)?.body ?? null,
     workspaces: (workspacesByOwner.get(id) ?? []).map((w) => {

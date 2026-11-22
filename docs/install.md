@@ -95,7 +95,7 @@ The unit runs as your user. Read the log with `journalctl -u foundryd`.
 4. On the new machine, run the command the dialog shows, for example `foundryd join 100.101.102.103 K7QX3M9PRT`. Run it in a shell with the same `FOUNDRY_HOME` and `FOUNDRY_PORT` you gave `install`, as `<home>/current/foundryd join …`, or as shown once `<home>/current/foundryd` is linked into a folder on your `PATH`. The code works once, within 10 minutes, and only on the machine whose name you typed.
 5. Restart the service on the new machine: `launchctl kickstart -k gui/$(id -u)/io.github.original-solutions.foundryd` on macOS, `sudo systemctl restart foundryd` on Linux.
 
-The dialog says when the machine has joined, and its card shows on the board under the name you typed.
+The dialog says when the machine has joined, and its card shows on the board under the machine's own Tailscale name: the short name, even when you typed its full name or its address.
 
 ## Change a setting
 

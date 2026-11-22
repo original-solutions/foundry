@@ -47,6 +47,11 @@ use crate::store::Store;
 /// The most characters a machine's name holds.
 pub const NAME_AT_MOST: usize = 60;
 
+/// How long after sending its key alone a machine waits before sending it again when its entry
+/// still holds none. A machine from before keys were listed drops the key from an edit it
+/// numbers, so while one acts, a key sent at once each look would go round forever.
+pub const KEY_AGAIN_AFTER: Duration = Duration::from_secs(10 * 60);
+
 /// What Tailscale says this machine is called and where it is.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
@@ -111,6 +116,8 @@ pub struct Listing {
     found: Option<Instant>,
     /// Set by the address watch when an ask of Tailscale fails, read and cleared by a look.
     away: Arc<AtomicBool>,
+    /// When this machine last sent an edit whose only change was its key.
+    key_sent: Option<Instant>,
 }
 
 impl Listing {
@@ -135,12 +142,14 @@ impl Listing {
             settle,
             found: None,
             away,
+            key_sent: None,
         }
     }
 
     /// Adds this machine to the list under `entry`'s name, with its key, when the list does not
     /// hold it, and moves it to `entry`'s address and its own key, keeping its name, when the
-    /// address or the key it holds differs.
+    /// address or the key it holds differs. A key alone is sent again only [`KEY_AGAIN_AFTER`]
+    /// after the last time.
     /// A failure, or no entry, is logged once until a look succeeds; the next look tries again.
     ///
     /// The look that first finds an edit to send sends nothing: one at least the settle time
@@ -178,11 +187,16 @@ impl Listing {
                 address: entry.address,
                 key: self.key.clone(),
             },
-            Some(held) if held.address != entry.address || held.key != self.key => Machine {
-                address: entry.address,
-                key: self.key.clone(),
-                ..held.clone()
-            },
+            Some(held)
+                if held.address != entry.address
+                    || held.key != self.key && !self.key_sent_lately() =>
+            {
+                Machine {
+                    address: entry.address,
+                    key: self.key.clone(),
+                    ..held.clone()
+                }
+            }
             Some(_) => {
                 self.found = None;
                 return Ok(());
@@ -192,6 +206,10 @@ impl Listing {
         if found.elapsed() < self.settle {
             return Ok(());
         }
+        let key_only = settings
+            .machines
+            .iter()
+            .any(|held| held.id == self.me && held.address == machine.address);
         let sent = self.coordinator.edit(Edit::SetMachine { machine }).await;
         // A send that may have reached the coordinator waits again, as a sent one does, for
         // the copy that holds it; one that says it was not sent is tried on the next look.
@@ -202,8 +220,19 @@ impl Listing {
                 | CoordinatorError::Unwritable(_))
         ) {
             self.found = None;
+            if key_only {
+                self.key_sent = Some(Instant::now());
+            }
         }
         sent.map(drop).map_err(|e| e.to_string())
+    }
+}
+
+impl Listing {
+    /// Whether this machine sent its key alone within [`KEY_AGAIN_AFTER`].
+    fn key_sent_lately(&self) -> bool {
+        self.key_sent
+            .is_some_and(|sent| sent.elapsed() < KEY_AGAIN_AFTER)
     }
 }
 
@@ -219,6 +248,11 @@ pub fn router(coordinator: Arc<Coordinator>, store: Arc<Mutex<Store>>) -> Router
     Router::new()
         .route("/api/machines/{id}/rename", post(rename))
         .with_state(Arc::new(Names { coordinator, store }))
+}
+
+/// Whether `raw` passes [`checked_name`]'s rule for a machine's name.
+pub(crate) fn is_name(raw: &str) -> bool {
+    checked_name(raw, "").is_ok()
 }
 
 /// `raw` trimmed, or `422` when it is blank (answered with `blank`), over [`NAME_AT_MOST`]
