@@ -1416,7 +1416,7 @@ mod tests {
 
     use foundry_proto::ids::MachineId;
     use foundry_proto::messages::{PROTOCOL, PeerMessage};
-    use foundry_proto::settings::{Machine, SharedSettings};
+    use foundry_proto::settings::{Machine, SettingKey, SharedSettings, Stamp, StampKey};
     use futures::future::BoxFuture;
     use tokio::time::timeout;
 
@@ -2313,6 +2313,158 @@ mod tests {
         let deadline = tokio::time::Instant::now() + RECHECK * 5;
         while host.state(peer.me()) != KeyState::Active {
             assert!(tokio::time::Instant::now() < deadline, "never admitted");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        following.abort();
+    }
+
+    /// Settings whose list holds `listed` and that stamp every machine in `removed` as removed
+    /// from it.
+    fn settings_with(seq: u64, listed: Vec<Machine>, removed: &[MachineId]) -> SharedSettings {
+        let mut settings = SharedSettings {
+            seq,
+            machines: listed,
+            ..SharedSettings::default()
+        };
+        for (n, id) in removed.iter().enumerate() {
+            settings.stamps.insert(
+                StampKey::Setting(SettingKey::Machine(*id)),
+                Stamp {
+                    seq: n as u64 + 1,
+                    by: *id,
+                },
+            );
+        }
+        settings
+    }
+
+    #[test]
+    fn a_machine_removed_from_the_list_and_held_active_is_revoked_and_saved() {
+        let secrets = Arc::new(MemorySecrets::default());
+        let host = Keys::open(secrets.clone()).unwrap();
+        let (gone, kept) = (machine_keys(), machine_keys());
+        admit(&host, &gone);
+        admit(&host, &kept);
+        let settings = settings_with(
+            2,
+            vec![listed(kept.me(), kept.public_key().hex())],
+            &[gone.me()],
+        );
+
+        host.refuse_removed(&settings).unwrap();
+
+        assert_eq!(host.state(gone.me()), KeyState::Revoked);
+        assert_eq!(host.state(kept.me()), KeyState::Active);
+        let reopened = Keys::open(secrets).unwrap();
+        assert_eq!(reopened.state(gone.me()), KeyState::Revoked);
+    }
+
+    #[test]
+    fn this_machine_never_revokes_itself_even_when_stamped_removed() {
+        let host = machine_keys();
+        let settings = settings_with(2, vec![], &[host.me()]);
+
+        host.refuse_removed(&settings).unwrap();
+
+        assert_eq!(host.state(host.me()), KeyState::Active);
+    }
+
+    #[test]
+    fn a_removed_machine_with_no_key_or_a_revocation_is_left_as_it_is() {
+        let host = machine_keys();
+        let (unknown, revoked) = (MachineId::random(), machine_keys());
+        admit(&host, &revoked);
+        host.revoke(revoked.me()).unwrap();
+        let settings = settings_with(2, vec![], &[unknown, revoked.me()]);
+
+        host.refuse_removed(&settings).unwrap();
+
+        assert_eq!(host.state(unknown), KeyState::NoKey);
+        assert_eq!(host.state(revoked.me()), KeyState::Revoked);
+    }
+
+    #[test]
+    fn a_machine_still_in_the_list_is_not_revoked_whatever_its_stamp() {
+        let host = machine_keys();
+        let peer = machine_keys();
+        admit(&host, &peer);
+        // Removed, then added again: the stamp stays, the list holds it.
+        let settings = settings_with(
+            3,
+            vec![listed(peer.me(), peer.public_key().hex())],
+            &[peer.me()],
+        );
+
+        host.refuse_removed(&settings).unwrap();
+
+        assert_eq!(host.state(peer.me()), KeyState::Active);
+    }
+
+    #[tokio::test]
+    async fn a_machine_revoked_on_removal_stays_revoked_when_listed_again_with_its_key() {
+        let host = machine_keys();
+        let peer = machine_keys();
+        admit(&host, &peer);
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path().join("foundry.db")).unwrap();
+        assert!(
+            store
+                .apply_settings(settings_with(2, vec![], &[peer.me()]))
+                .unwrap()
+        );
+        let store = Arc::new(Mutex::new(store));
+        let following = tokio::spawn({
+            let host = host.clone();
+            let store = store.clone();
+            async move { host.follow(store).await }
+        });
+        let deadline = tokio::time::Instant::now() + RECHECK * 5;
+        while host.state(peer.me()) != KeyState::Revoked {
+            assert!(tokio::time::Instant::now() < deadline, "never revoked");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // A later copy lists it again with its key.
+        let later = settings_with(
+            3,
+            vec![listed(peer.me(), peer.public_key().hex())],
+            &[peer.me()],
+        );
+        assert!(store.lock().unwrap().apply_settings(later.clone()).unwrap());
+        tokio::time::sleep(RECHECK * 3).await;
+        assert_eq!(host.state(peer.me()), KeyState::Revoked);
+        host.learn(&later.machines).unwrap();
+        host.refuse_removed(&later).unwrap();
+        assert_eq!(host.state(peer.me()), KeyState::Revoked);
+        following.abort();
+    }
+
+    #[tokio::test]
+    async fn a_revocation_that_cannot_be_saved_is_tried_again_on_the_next_check() {
+        let flaky = Arc::new(Flaky::default());
+        let host = Keys::open(flaky.clone()).unwrap();
+        let gone = machine_keys();
+        admit(&host, &gone);
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path().join("foundry.db")).unwrap();
+        assert!(
+            store
+                .apply_settings(settings_with(2, vec![], &[gone.me()]))
+                .unwrap()
+        );
+        let store = Arc::new(Mutex::new(store));
+        flaky.failing.store(true, Ordering::SeqCst);
+        let following = tokio::spawn({
+            let host = host.clone();
+            async move { host.follow(store).await }
+        });
+
+        tokio::time::sleep(RECHECK * 3).await;
+        assert_eq!(host.state(gone.me()), KeyState::Active);
+        flaky.failing.store(false, Ordering::SeqCst);
+        let deadline = tokio::time::Instant::now() + RECHECK * 5;
+        while host.state(gone.me()) != KeyState::Revoked {
+            assert!(tokio::time::Instant::now() < deadline, "never revoked");
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         following.abort();

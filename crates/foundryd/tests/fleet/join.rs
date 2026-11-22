@@ -12,10 +12,10 @@ use std::time::Duration;
 use foundry_proto::ids::MachineId;
 use foundry_proto::messages::{PROTOCOL, PeerMessage};
 use foundry_proto::settings::{Machine, SharedSettings};
-use foundryd::api::machine_add;
 use foundryd::api::machine_names::{Entry, Listing};
+use foundryd::api::{machine_add, machine_remove};
 use foundryd::coordinator::Coordinator;
-use foundryd::join::{self, KeyState, KeyedDialer, Keys};
+use foundryd::join::{self, KeyState, KeyedDialer, Keys, RECHECK};
 use foundryd::secrets::FileSecrets;
 use foundryd::store::Store;
 use foundryd::sync::{Conn, Dialer, Peers};
@@ -209,7 +209,12 @@ impl Member {
         let port = listener.local_addr().unwrap().port();
         let lister = machine_add::Lister::new(self.coordinator.clone(), self.store.clone());
         let app = join::router(self.keys.clone(), lister)
-            .merge(machine_add::router(self.keys.clone(), self.store.clone()));
+            .merge(machine_add::router(self.keys.clone(), self.store.clone()))
+            .merge(machine_remove::router(
+                self.keys.me(),
+                self.coordinator.clone(),
+                self.store.clone(),
+            ));
         tokio::spawn(async move {
             axum::serve(
                 listener,
@@ -219,6 +224,13 @@ impl Member {
             .unwrap()
         });
         port
+    }
+
+    /// Whether a record link to `machine` is open. `Peers` names a link by number and counts
+    /// them from 0, one per link ever opened, so this asks after the first 64: far more than a
+    /// three-machine test opens, including every redial.
+    fn linked_with(&self, machine: MachineId) -> bool {
+        (0..64).any(|link| self.peers.is_open(machine, link))
     }
 
     fn settings(&self) -> SharedSettings {
@@ -534,4 +546,81 @@ async fn hear(peers: &Peers, peer: MachineId) {
     .await;
     drop(theirs);
     accepting.await.unwrap();
+}
+
+/// How often a link sends new records and settings: `TICK` in `foundryd::sync`, which is
+/// private. One sync round.
+const SYNC_ROUND: Duration = Duration::from_secs(1);
+
+#[tokio::test]
+async fn a_machine_removed_through_a_is_revoked_by_every_machine_and_its_links_close() {
+    let net = Net::default();
+    let dirs: Vec<TempDir> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let a = Member::start(&net, &dirs[0], &a_entry()).await;
+    let port = a.serve().await;
+    let b = joined(&net, &dirs[1], port, own("b", "127.0.0.3")).await;
+    let c = joined(&net, &dirs[2], port, own("c", "127.0.0.4")).await;
+    let (a_id, b_id, c_id) = (a.keys.me(), b.keys.me(), c.keys.me());
+    until(Duration::from_secs(30), "all three linked", || {
+        a.linked_with(b_id)
+            && a.linked_with(c_id)
+            && b.linked_with(a_id)
+            && b.linked_with(c_id)
+            && c.linked_with(a_id)
+            && c.linked_with(b_id)
+    })
+    .await;
+    // C has a record of its own, and it has reached A.
+    let workspace_id = foundry_proto::ids::WorkspaceId::random();
+    {
+        let mut store = lock(&c.store);
+        let version = store.own_next_version().unwrap();
+        store
+            .apply(&crate::workspace(workspace_id, false)(c_id, version), c_id)
+            .unwrap();
+    }
+    let on_a = |a: &Member| {
+        lock(&a.store)
+            .since(c_id, 0)
+            .unwrap()
+            .iter()
+            .any(|r| matches!(r, foundry_proto::record::AnyRecord::Workspace(w) if w.body.id == workspace_id))
+    };
+    until(Duration::from_secs(10), "C's record on A", || on_a(&a)).await;
+
+    // In A's UI: remove C.
+    let status = tokio::task::spawn_blocking(move || {
+        ureq::post(format!(
+            "http://127.0.0.1:{port}/api/machines/{c_id}/remove"
+        ))
+        .send_empty()
+        .unwrap()
+        .status()
+    })
+    .await
+    .unwrap();
+    assert_eq!(status, 204);
+
+    // A revokes once its list check sees the removal and closes the link on its next check.
+    // B hears the removal from A in one sync round first. One more second is slack for the
+    // 100 ms polling here and a loaded machine.
+    let bound = RECHECK + RECHECK + SYNC_ROUND + Duration::from_secs(1);
+    until(bound, "C revoked and unlinked on A and B", || {
+        a.keys.state(c_id) == KeyState::Revoked
+            && b.keys.state(c_id) == KeyState::Revoked
+            && !a.linked_with(c_id)
+            && !b.linked_with(c_id)
+    })
+    .await;
+    assert_eq!(a.keys.state(b_id), KeyState::Active);
+    assert_eq!(b.keys.state(a_id), KeyState::Active);
+    assert_eq!(a.keys.state(a_id), KeyState::Active);
+    assert!(a.settings().machines.iter().all(|m| m.id != c_id));
+    // What `GET /api/state` reads: A still holds C's records.
+    let state = a.peers.state().await.unwrap();
+    assert!(
+        state.iter().any(|r| r.owner() == c_id),
+        "A lost C's records"
+    );
+    assert!(on_a(&a));
 }

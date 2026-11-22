@@ -15,6 +15,7 @@
 //!   machine in the machine list, in its order, with whether it is online.
 //! - `POST /api/machines/{id}/limits` and `POST /api/machines/{id}/limits/clear`: set and clear a
 //!   machine's placement limits, see [`machine_limits`].
+//! - `POST /api/machines/{id}/remove`: removes a machine from the fleet, see [`machine_remove`].
 //! - `POST /api/workspaces` `{project, base, name, machine}`: makes a workspace, `201 {id}`, on
 //!   the machine `machine` names, or on this machine when it is absent. When the workspace is
 //!   made but its setup could not be started, it is still `201`, with an `error` beside the
@@ -116,6 +117,7 @@ mod machine;
 pub mod machine_add;
 pub mod machine_limits;
 pub mod machine_names;
+pub mod machine_remove;
 mod pr;
 pub mod projects;
 pub mod terminals;
