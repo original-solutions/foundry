@@ -375,7 +375,7 @@ dependencies = [
 
 [[package]]
 name = "foundry-fake-agent"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "clap",
  "serde",
@@ -385,7 +385,7 @@ dependencies = [
 
 [[package]]
 name = "foundry-holder"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "clap",
@@ -398,7 +398,7 @@ dependencies = [
 
 [[package]]
 name = "foundry-proto"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -408,7 +408,7 @@ dependencies = [
 
 [[package]]
 name = "foundryd"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "axum",
  "bytes",
