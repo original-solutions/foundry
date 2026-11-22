@@ -306,9 +306,9 @@ function Layout() {
             </div>
           )}
           <main className="flex min-w-0 flex-1 flex-col">
-            {/* Takes no room while both are empty. */}
+            {/* In the flow, so the terminal below gives up the room it takes; none while both are empty, and at most half the screen. */}
             {narrow && (
-              <div className="flex shrink-0 flex-col gap-2 p-2 empty:hidden">
+              <div className="flex max-h-[50dvh] shrink-0 flex-col gap-2 overflow-y-auto p-2 empty:hidden">
                 <AttentionList folded />
                 <WaitingList folded />
               </div>
