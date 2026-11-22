@@ -28,7 +28,7 @@ use axum::Router;
 use axum::routing::post;
 use bytes::Bytes;
 use foundry_proto::ids::{MachineId, SessionId, TerminalId, WorkspaceId};
-use foundry_proto::record::{AnyRecord, Record, Session};
+use foundry_proto::record::{AnyRecord, Record, Session, Terminal};
 use foundry_proto::state::{SessionState, TerminalState};
 use futures::StreamExt as _;
 use tokio::sync::watch;
@@ -161,6 +161,9 @@ struct Inner {
     /// Tests: how many of the next reads of a terminal's exit fail.
     #[cfg(test)]
     fail_exit_reads: std::sync::atomic::AtomicUsize,
+    /// Tests: how many of the next reads of the sessions to adopt fail.
+    #[cfg(test)]
+    fail_adopt_reads: std::sync::atomic::AtomicUsize,
 }
 
 /// A session this daemon started, or took up from the daemon before it.
@@ -206,6 +209,8 @@ impl Sessions {
                 fail_writes: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(test)]
                 fail_exit_reads: std::sync::atomic::AtomicUsize::new(0),
+                #[cfg(test)]
+                fail_adopt_reads: std::sync::atomic::AtomicUsize::new(0),
             }),
         }
     }
@@ -254,11 +259,9 @@ impl Sessions {
     /// as the exit makes it and its files removed. Any other is followed again as
     /// [`Sessions::start`] follows a new one, and its hooks are taken with the token in its curl
     /// config. A session whose curl config holds no token is still followed to its end, but its
-    /// hooks stay refused. A store that cannot be read is logged, and no session is taken up.
+    /// hooks stay refused. A busy store is tried again until it answers.
     pub async fn adopt(&self) {
-        if let Err(error) = self.inner.adopt().await {
-            tracing::warn!(%error, "the sessions from before this daemon started were not taken up");
-        }
+        self.inner.adopt().await;
     }
 
     /// `POST /hooks/{session}`, the endpoint a session's hooks post to.
@@ -403,76 +406,98 @@ impl Inner {
         lock(&live.tasks).extend(tasks);
     }
 
-    /// [`Sessions::adopt`]. The sessions and their terminals are read in one store call, with
-    /// this machine's newest version as the cursor its followers read exits from, so an exit
-    /// recorded after that call is above the cursor and is not missed.
-    async fn adopt(self: &Arc<Self>) -> Result<(), SessionError> {
-        let me = self.me;
-        let (open, cursor) = self
-            .on_store(move |store| {
-                let cursor = store.versions()?.get(&me).copied().unwrap_or(0);
-                let mut open = Vec::new();
-                for record in store.since(me, 0)? {
-                    let AnyRecord::Session(record) = record else {
-                        continue;
-                    };
-                    if record.deleted || is_final(record.body.state) {
-                        continue;
+    /// [`Sessions::adopt`]. A store that cannot be read is read again, each wait longer, until
+    /// it answers: a session left out would be refused and counted for the daemon's whole run.
+    async fn adopt(self: &Arc<Self>) {
+        let mut backoff = Backoff::new();
+        let (open, cursor) = loop {
+            match self.open_sessions().await {
+                Ok(found) => break found,
+                Err(error) => {
+                    if backoff.first_failure() {
+                        tracing::warn!(%error, "the sessions from before this daemon started were not read; trying again");
                     }
-                    // The exit code, when the terminal is gone or has exited.
-                    let exit = match store.terminal(record.body.terminal)? {
-                        Some(t) if !t.deleted && t.body.state != TerminalState::Exited => None,
-                        terminal => Some(terminal.and_then(|t| t.body.exit_code)),
-                    };
-                    open.push((record.body, exit));
+                    tokio::time::sleep(backoff.next_wait()).await;
                 }
-                Ok((open, cursor))
-            })
-            .await?;
+            }
+        };
         for (session, exit) in open {
-            let (settings, curl) = self.files(session.id);
             match exit {
-                Some(code) => {
-                    let id = session.id;
-                    let ended = Session {
-                        state: next_state(session.state, Event::Exited(code)),
-                        ..session
-                    };
-                    match self.write(ended).await {
-                        Ok(()) => self.remove_files(&settings, &curl).await,
-                        Err(error) => {
-                            tracing::warn!(session = %id, %error, "the end of a session whose terminal is gone was not recorded");
-                        }
-                    }
-                }
-                None => self.take_up(session, settings, curl, cursor).await,
+                Some(code) => self.end(session, code).await,
+                None => self.take_up(session, cursor).await,
             }
         }
-        Ok(())
+    }
+
+    /// This machine's sessions that are not deleted and have not ended, each with its
+    /// terminal's exit code when the terminal is gone or has exited, and this machine's newest
+    /// version. One store call reads them all, so an exit recorded after it is above that
+    /// version, and a follower reading from there does not miss it.
+    async fn open_sessions(&self) -> Result<OpenSessions, SessionError> {
+        #[cfg(test)]
+        if take_one(&self.fail_adopt_reads) {
+            return Err(busy().into());
+        }
+        let me = self.me;
+        self.on_store(move |store| {
+            let cursor = store.versions()?.get(&me).copied().unwrap_or(0);
+            let mut open = Vec::new();
+            for record in store.since(me, 0)? {
+                let AnyRecord::Session(record) = record else {
+                    continue;
+                };
+                if record.deleted || is_final(record.body.state) {
+                    continue;
+                }
+                let exit = match store.terminal(record.body.terminal)? {
+                    Some(t) if !has_ended(&t) => None,
+                    terminal => Some(terminal.and_then(|t| t.body.exit_code)),
+                };
+                open.push((record.body, exit));
+            }
+            Ok((open, cursor))
+        })
+        .await
+    }
+
+    /// Ends `session`, whose terminal is gone or exited with `code`, as its follower would:
+    /// [`Inner::event`] writes the record and removes its files. A write the store does not
+    /// take is tried again in a task of the session's own until it holds.
+    async fn end(self: &Arc<Self>, session: Session, code: Option<i32>) {
+        // The child is gone, so no hook can come: nobody holds this token.
+        let live = self.adopted(session, new_token());
+        if self.event(&live, Event::Exited(code)).await.is_err() {
+            let task = tokio::spawn({
+                let (inner, live) = (self.clone(), live.clone());
+                async move { record_exit(&inner, &live, code).await }
+            });
+            lock(&live.tasks).push(task.abort_handle());
+        }
     }
 
     /// Follows `session`, which a daemon before this one started and whose terminal still
-    /// runs, from above `cursor`, and takes its hooks with the token in `curl`.
-    async fn take_up(
-        self: &Arc<Self>,
-        session: Session,
-        settings: PathBuf,
-        curl: PathBuf,
-        cursor: u64,
-    ) {
+    /// runs, from above `cursor`, and takes its hooks with the token in its curl config.
+    async fn take_up(self: &Arc<Self>, session: Session, cursor: u64) {
         let (id, terminal) = (session.id, session.terminal);
-        let token = {
-            let curl = curl.clone();
-            blocking(move || claude::curl_token(&curl))
-                .await
-                .ok()
-                .flatten()
-        };
+        let (_, curl) = self.files(id);
+        let token = blocking(move || claude::curl_token(&curl))
+            .await
+            .ok()
+            .flatten();
         // No hook can present a token nobody has, so its hooks stay refused.
         let token = token.unwrap_or_else(|| {
             tracing::warn!(session = %id, "the session's curl config holds no token, so its hooks are refused; it is followed to its end");
             new_token()
         });
+        let live = self.adopted(session, token);
+        self.run(&live, terminal, cursor, FirstPrompt::new(None));
+        tracing::info!(session = %id, "session taken up from the daemon before");
+    }
+
+    /// Makes `session`, from a daemon before this one, live again with `token`.
+    fn adopted(&self, session: Session, token: String) -> Arc<Live> {
+        let id = session.id;
+        let (settings, curl) = self.files(id);
         let live = Arc::new(Live {
             id,
             token,
@@ -485,8 +510,7 @@ impl Inner {
             tasks: Mutex::default(),
         });
         lock(&self.live).insert(id, live.clone());
-        self.run(&live, terminal, cursor, FirstPrompt::new(None));
-        tracing::info!(session = %id, "session taken up from the daemon before");
+        live
     }
 
     /// The settings file and curl config of session `id`.
@@ -639,7 +663,7 @@ impl Inner {
                     newest = newest.max(record.version());
                     if let AnyRecord::Terminal(r) = record
                         && r.body.id == terminal
-                        && (r.body.state == TerminalState::Exited || r.deleted)
+                        && has_ended(&r)
                     {
                         exit = Some(r.body.exit_code);
                     }
@@ -651,6 +675,10 @@ impl Inner {
         Ok(exit)
     }
 }
+
+/// This machine's sessions to adopt, each with its terminal's exit code when the terminal is
+/// gone, and this machine's newest version.
+type OpenSessions = (Vec<(Session, Option<Option<i32>>)>, u64);
 
 /// Follows the session's terminal: each chunk of output is an [`Event::Output`], and the end of
 /// the child is an [`Event::Exited`]. The first prompt is typed on the way, once it is ready.
@@ -847,8 +875,12 @@ async fn exited(inner: &Inner, live: &Arc<Live>, terminal: TerminalId, cursor: &
         };
         tokio::time::sleep(wait).await;
     };
-    // The end is not given up on: a session left running after its child is gone is wrong for
-    // good. It stops once the session is no longer live.
+    record_exit(inner, live, code).await;
+}
+
+/// Reports the child's exit with `code`. The end is not given up on: a session left running
+/// after its child is gone is wrong for good. It stops once the session is no longer live.
+async fn record_exit(inner: &Inner, live: &Arc<Live>, code: Option<i32>) {
     let mut backoff = Backoff::new();
     while let Err(error) = inner.event(live, Event::Exited(code)).await {
         if !inner.is_live(live) {
@@ -910,13 +942,60 @@ async fn watch_for_stuck(inner: Arc<Inner>, live: Arc<Live>) {
     }
 }
 
+/// Tests: takes one from `count` when it is above zero, and says whether it did.
+#[cfg(test)]
+fn take_one(count: &std::sync::atomic::AtomicUsize) -> bool {
+    use std::sync::atomic::Ordering::SeqCst;
+    count
+        .try_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+        .is_ok()
+}
+
+/// Tests: the error a busy store gives.
+#[cfg(test)]
+fn busy() -> StoreError {
+    StoreError::Sqlite(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+        None,
+    ))
+}
+
+/// A new session's token: two random UUIDs, as hex.
+fn new_token() -> String {
+    format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
+/// Whether `terminal`'s child is gone: its record says it exited, or was deleted.
+fn has_ended(terminal: &Record<Terminal>) -> bool {
+    terminal.deleted || terminal.body.state == TerminalState::Exited
+}
+
+fn is_final(state: SessionState) -> bool {
+    matches!(state, SessionState::Finished | SessionState::Failed)
+}
+
+/// Runs `work` on the blocking pool, so file and store work never stalls an async worker.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, SessionError> {
+    Ok(tokio::task::spawn_blocking(work).await?)
+}
+
+/// Locks `mutex`, taking the value a panicked holder of the lock left: every value kept under
+/// these locks is whole between statements.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// [`Sessions::adopt`] against a store that is busy for a while. The sessions are ones whose
 /// terminal has exited, so no holder is needed.
 #[cfg(test)]
 mod adopt_tests {
     use std::sync::atomic::Ordering::SeqCst;
-
-    use foundry_proto::record::Terminal;
 
     use super::*;
 
@@ -1022,48 +1101,4 @@ mod adopt_tests {
         assert!(files_gone(&sessions, id));
         assert_eq!(sessions.inner.fail_adopt_reads.load(SeqCst), 0);
     }
-}
-
-/// Tests: takes one from `count` when it is above zero, and says whether it did.
-#[cfg(test)]
-fn take_one(count: &std::sync::atomic::AtomicUsize) -> bool {
-    use std::sync::atomic::Ordering::SeqCst;
-    count
-        .try_update(SeqCst, SeqCst, |n| n.checked_sub(1))
-        .is_ok()
-}
-
-/// Tests: the error a busy store gives.
-#[cfg(test)]
-fn busy() -> StoreError {
-    StoreError::Sqlite(rusqlite::Error::SqliteFailure(
-        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
-        None,
-    ))
-}
-
-/// A new session's token: two random UUIDs, as hex.
-fn new_token() -> String {
-    format!(
-        "{}{}",
-        uuid::Uuid::new_v4().simple(),
-        uuid::Uuid::new_v4().simple()
-    )
-}
-
-fn is_final(state: SessionState) -> bool {
-    matches!(state, SessionState::Finished | SessionState::Failed)
-}
-
-/// Runs `work` on the blocking pool, so file and store work never stalls an async worker.
-async fn blocking<T: Send + 'static>(
-    work: impl FnOnce() -> T + Send + 'static,
-) -> Result<T, SessionError> {
-    Ok(tokio::task::spawn_blocking(work).await?)
-}
-
-/// Locks `mutex`, taking the value a panicked holder of the lock left: every value kept under
-/// these locks is whole between statements.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
