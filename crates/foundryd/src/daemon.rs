@@ -29,6 +29,7 @@ use crate::api::{self, Api, BindError};
 use crate::attention::Attention;
 use crate::gateway;
 use crate::join::{self, JoinError, KeyedDialer, Keys};
+use crate::lister::Lister;
 use crate::machine;
 use crate::placement;
 use crate::secrets::{self, GATEWAY, SecretsError};
@@ -36,6 +37,7 @@ use crate::sessions::{self, Gateway, Sessions};
 use crate::store::{Store, StoreError};
 use crate::sync::Peers;
 use crate::sync::ws::{self, WsDialer};
+use crate::tailscale::{Entry, host_names, own_entry, tailscale_ips};
 use crate::terminals::{TerminalError, Terminals};
 use crate::update;
 use crate::workspaces::{WorkspaceError, Workspaces};
@@ -306,7 +308,7 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
         .layer(middleware::from_fn_with_state(api.clone(), api::same_site));
     let machine_name_routes = api::machine_names::router(coordinator.clone(), store.clone())
         .layer(middleware::from_fn_with_state(api.clone(), api::same_site));
-    let lister = api::machine_add::Lister::new(coordinator.clone(), store.clone());
+    let lister = Lister::new(coordinator.clone(), store.clone());
     let join_routes = join::router(keys.clone(), lister)
         .layer(middleware::from_fn_with_state(api.clone(), api::same_site));
     let machine_add_routes = api::machine_add::router(keys.clone(), store.clone())
@@ -461,17 +463,6 @@ fn gateway(
     }
 }
 
-/// This machine's short host name, lowercased: the API trusts it in a `Host` header as its
-/// MagicDNS name.
-fn host_names() -> Vec<String> {
-    sysinfo::System::host_name()
-        .ok()
-        .and_then(|name| name.split('.').next().map(str::to_ascii_lowercase))
-        .filter(|name| !name.is_empty())
-        .into_iter()
-        .collect()
-}
-
 /// The loopback address the daemon always listens on.
 fn loopback(port: u16) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], port))
@@ -535,115 +526,6 @@ fn withdrawn(
         .collect()
 }
 
-/// The Tailscale CLI, by [`choose_cli`]. In a debug build `FOUNDRY_TAILSCALE` names it, which
-/// is how tests keep the daemon away from the real one. A release build ignores it, so what
-/// the daemon listens on always comes from Tailscale itself.
-fn tailscale_cli() -> PathBuf {
-    cli_for(std::env::var_os("FOUNDRY_TAILSCALE"))
-}
-
-/// The CLI this build asks for a `FOUNDRY_TAILSCALE` value.
-fn cli_for(set: Option<OsString>) -> PathBuf {
-    choose_cli(set, TAILSCALE_OVERRIDE, KNOWN_CLIS)
-}
-
-/// Whether this build takes `FOUNDRY_TAILSCALE`: only a debug build.
-const TAILSCALE_OVERRIDE: bool = cfg!(debug_assertions);
-
-/// Where the Tailscale CLI is when it is not on a service's `PATH`: on macOS inside the app,
-/// which does not put it on `PATH`, then Homebrew's, which launchd's `PATH` leaves out. On
-/// Linux it is on `PATH`.
-const KNOWN_CLIS: &[&str] = if cfg!(target_os = "macos") {
-    &[
-        "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
-        "/opt/homebrew/bin/tailscale",
-        "/usr/local/bin/tailscale",
-    ]
-} else {
-    &[]
-};
-
-/// The CLI to ask: `set` when `taken` (the build takes the override) and it is not empty,
-/// else the first of `known` that is there, else `tailscale` on `PATH`.
-fn choose_cli(set: Option<OsString>, taken: bool, known: &[&str]) -> PathBuf {
-    if let Some(cli) = set.filter(|cli| taken && !cli.is_empty()) {
-        return PathBuf::from(cli);
-    }
-    known
-        .iter()
-        .map(Path::new)
-        .find(|cli| cli.exists())
-        .map_or_else(|| PathBuf::from("tailscale"), Path::to_path_buf)
-}
-
-/// How long `tailscale ip` may take before it is stopped and Tailscale counts as not answering.
-const ASK_WITHIN: Duration = Duration::from_secs(3);
-
-/// The addresses Tailscale reports for this machine, or why it cannot say.
-async fn tailscale_ips() -> Result<BTreeSet<IpAddr>, String> {
-    ask_cli(&tailscale_cli(), ASK_WITHIN).await
-}
-
-/// Runs `<cli> ip`, which prints one of this machine's Tailscale addresses a line, and reads
-/// them. A CLI that fails, is missing, prints anything else or runs past `within` gives why.
-async fn ask_cli(cli: &Path, within: Duration) -> Result<BTreeSet<IpAddr>, String> {
-    String::from_utf8_lossy(&run_cli(cli, &["ip"], within).await?)
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(|line| {
-            line.parse()
-                .map_err(|_| format!("`{} ip` printed {line:?}, not an address", cli.display()))
-        })
-        .collect()
-}
-
-/// Runs `<cli> status --self --json`, which says what Tailscale calls this machine and its
-/// addresses, and gives what it printed, or why it cannot, as [`run_cli`] does.
-async fn ask_status(cli: &Path, within: Duration) -> Result<Vec<u8>, String> {
-    run_cli(cli, &["status", "--self", "--json"], within).await
-}
-
-/// Runs `<cli> <args>` and gives what it printed. A CLI that fails, is missing or runs past
-/// `within` gives why.
-async fn run_cli(cli: &Path, args: &[&str], within: Duration) -> Result<Vec<u8>, String> {
-    let asked = format!("{} {}", cli.display(), args.join(" "));
-    let run = tokio::process::Command::new(cli)
-        .args(args)
-        // The CLI inside Tailscale.app answers only when `TERM` is set; without it, as under
-        // launchd, it tries to start the app's GUI and fails.
-        .env("TERM", "dumb")
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .output();
-    let out = match tokio::time::timeout(within, run).await {
-        Ok(Ok(out)) => out,
-        Ok(Err(error)) => return Err(format!("{} could not be run: {error}", cli.display())),
-        Err(_) => {
-            return Err(format!(
-                "`{asked}` did not answer within {} s",
-                within.as_secs_f32()
-            ));
-        }
-    };
-    if !out.status.success() {
-        return Err(format!(
-            "`{asked}` failed ({}): {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    Ok(out.stdout)
-}
-
-/// What this machine lists itself under: what `tailscale status --self --json` says it is
-/// called and its address, read by [`api::machine_names::entry`]. The one source of the entry
-/// the daemon lists and the one `foundryd join` sends, so the two never differ.
-pub(crate) async fn own_entry() -> Result<api::machine_names::Entry, String> {
-    let status = ask_status(&tailscale_cli(), ASK_WITHIN).await?;
-    api::machine_names::entry(&status, host_names().first().map(String::as_str))
-}
-
 /// Keeps this machine in the shared machine list: each time the address watch hears from
 /// Tailscale (`answered`, with the addresses `ip` gave), hands what Tailscale calls this machine
 /// to `listing`, which also reads the watch's mark that Tailscale was away. It runs apart from
@@ -669,7 +551,7 @@ async fn list_this_machine(
 #[derive(Default)]
 struct Told {
     ips: BTreeSet<IpAddr>,
-    entry: Option<api::machine_names::Entry>,
+    entry: Option<Entry>,
 }
 
 impl Told {
@@ -680,9 +562,9 @@ impl Told {
         &mut self,
         ips: &BTreeSet<IpAddr>,
         ask: impl FnOnce() -> F,
-    ) -> Result<api::machine_names::Entry, String>
+    ) -> Result<Entry, String>
     where
-        F: Future<Output = Result<api::machine_names::Entry, String>>,
+        F: Future<Output = Result<Entry, String>>,
     {
         if let Some(entry) = &self.entry
             && self.ips == *ips
@@ -862,6 +744,7 @@ mod tests {
 
     use super::*;
     use crate::secrets::SecretsError;
+    use crate::test_log::Logged;
 
     fn os(text: &str) -> Option<OsString> {
         Some(text.into())
@@ -1207,42 +1090,6 @@ mod tests {
         assert!(stopped(tailscale).await);
     }
 
-    /// Everything the daemon logs while it is set, as plain text.
-    #[derive(Clone, Default)]
-    struct Logged(Arc<Mutex<Vec<u8>>>);
-
-    impl io::Write for Logged {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl Logged {
-        /// Captures this thread's log until the guard drops.
-        fn capture(&self) -> tracing::subscriber::DefaultGuard {
-            let logged = self.clone();
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(move || logged.clone())
-                .with_ansi(false)
-                .without_time()
-                .finish();
-            tracing::subscriber::set_default(subscriber)
-        }
-
-        fn warnings(&self) -> Vec<String> {
-            String::from_utf8_lossy(&self.0.lock().unwrap())
-                .lines()
-                .filter(|line| line.contains("WARN"))
-                .map(str::to_owned)
-                .collect()
-        }
-    }
-
     /// Not installed, not running or logged out: nothing besides loopback is bound, and the
     /// reason is logged once, not on every rescan.
     #[tokio::test]
@@ -1288,8 +1135,6 @@ mod tests {
     /// an ask fails waits its whole settle time again once Tailscale answers.
     #[tokio::test(start_paused = true)]
     async fn the_listing_waits_again_after_its_watch_found_tailscale_away() {
-        use api::machine_names::Entry;
-
         // Captured as the warning tests capture it: a test that hits this warning with no
         // subscriber can register its call site as off while another test is counting it.
         let _capture = Logged::default().capture();
@@ -1358,7 +1203,6 @@ mod tests {
     /// entry, or the entry's address is not among the addresses `ip` gave.
     #[tokio::test]
     async fn tailscale_status_is_asked_again_only_when_what_ip_said_changed() {
-        use api::machine_names::Entry;
         use std::sync::atomic::AtomicUsize;
 
         let asks = AtomicUsize::new(0);
@@ -1428,173 +1272,6 @@ mod tests {
         let warnings = logged.warnings();
         assert_eq!(warnings.len(), 2, "{warnings:?}");
         assert!(warnings[1].contains("logged out"), "{warnings:?}");
-    }
-
-    #[test]
-    fn foundry_tailscale_names_the_cli_when_set() {
-        let dir = tempfile::tempdir().unwrap();
-        let known = dir.path().join("known");
-        std::fs::write(&known, "").unwrap();
-        let known = known.to_str().unwrap();
-
-        assert_eq!(
-            choose_cli(os("/opt/fake/tailscale"), true, &[known]),
-            PathBuf::from("/opt/fake/tailscale")
-        );
-    }
-
-    /// A release build ignores `FOUNDRY_TAILSCALE`: whatever the variable names, the daemon asks
-    /// the CLI where Tailscale puts it.
-    #[test]
-    fn foundry_tailscale_is_ignored_when_the_build_does_not_take_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let known = dir.path().join("known");
-        std::fs::write(&known, "").unwrap();
-
-        assert_eq!(
-            choose_cli(os("/opt/fake/tailscale"), false, &[known.to_str().unwrap()]),
-            known
-        );
-    }
-
-    /// The debug build the tests run takes `FOUNDRY_TAILSCALE`.
-    #[cfg(debug_assertions)]
-    #[test]
-    fn this_debug_build_takes_foundry_tailscale() {
-        assert_eq!(
-            cli_for(os("/opt/fake/tailscale")),
-            PathBuf::from("/opt/fake/tailscale")
-        );
-    }
-
-    /// A release build does not. CI runs this one in a release build.
-    #[cfg(not(debug_assertions))]
-    #[test]
-    fn this_release_build_ignores_foundry_tailscale() {
-        assert_eq!(cli_for(os("/opt/fake/tailscale")), cli_for(None));
-    }
-
-    #[test]
-    fn without_foundry_tailscale_the_first_known_cli_that_is_there_is_used() {
-        let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().join("missing");
-        let there = dir.path().join("there");
-        let also = dir.path().join("also");
-        std::fs::write(&there, "").unwrap();
-        std::fs::write(&also, "").unwrap();
-        let known = [
-            missing.to_str().unwrap(),
-            there.to_str().unwrap(),
-            also.to_str().unwrap(),
-        ];
-
-        assert_eq!(choose_cli(None, true, &known), there);
-        assert_eq!(choose_cli(os(""), true, &known), there);
-    }
-
-    #[test]
-    fn with_no_known_cli_there_tailscale_on_path_is_used() {
-        let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().join("missing");
-
-        assert_eq!(
-            choose_cli(None, true, &[missing.to_str().unwrap()]),
-            PathBuf::from("tailscale")
-        );
-    }
-
-    /// A service's `PATH` under launchd holds neither the app's CLI nor Homebrew's.
-    #[test]
-    fn on_macos_the_app_cli_comes_first_then_homebrew_s() {
-        let expected: &[&str] = if cfg!(target_os = "macos") {
-            &[
-                "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
-                "/opt/homebrew/bin/tailscale",
-                "/usr/local/bin/tailscale",
-            ]
-        } else {
-            &[]
-        };
-        assert_eq!(KNOWN_CLIS, expected);
-    }
-
-    /// Writes an executable stand-in for the Tailscale CLI that runs `body`.
-    fn fake_cli(dir: &Path, body: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt as _;
-        let cli = dir.join("tailscale");
-        std::fs::write(&cli, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
-        cli
-    }
-
-    #[tokio::test]
-    async fn the_cli_is_asked_for_ip_and_its_addresses_are_read() {
-        let dir = tempfile::tempdir().unwrap();
-        let cli = fake_cli(
-            dir.path(),
-            r#"[ "$1" = ip ] || exit 9; printf '100.101.102.103\nfd7a:115c:a1e0::1\n'"#,
-        );
-
-        let reported = ask_cli(&cli, Duration::from_secs(10)).await;
-
-        assert_eq!(reported, Ok(ips(["100.101.102.103", "fd7a:115c:a1e0::1"])));
-    }
-
-    /// The CLI inside Tailscale.app starts the app's GUI instead of answering when `TERM` is not
-    /// set, as under launchd. The test's own `TERM` is whatever the shell gave it, so the stand-in
-    /// answers only to the value the daemon sets.
-    #[tokio::test]
-    async fn the_cli_is_given_a_term_so_the_app_cli_answers_under_launchd() {
-        let dir = tempfile::tempdir().unwrap();
-        let cli = fake_cli(
-            dir.path(),
-            r#"[ "$TERM" = dumb ] || { echo 'The Tailscale GUI failed to start' >&2; exit 1; }; echo 100.101.102.103"#,
-        );
-
-        let reported = ask_cli(&cli, Duration::from_secs(10)).await;
-
-        assert_eq!(reported, Ok(ips(["100.101.102.103"])));
-    }
-
-    #[tokio::test]
-    async fn a_cli_that_fails_says_why() {
-        let dir = tempfile::tempdir().unwrap();
-        let cli = fake_cli(dir.path(), "echo 'Tailscale is stopped.' >&2; exit 1");
-
-        let why = ask_cli(&cli, Duration::from_secs(10)).await.unwrap_err();
-
-        assert!(why.contains("Tailscale is stopped."), "{why}");
-    }
-
-    #[tokio::test]
-    async fn a_missing_cli_says_which_one_could_not_be_run() {
-        let dir = tempfile::tempdir().unwrap();
-        let cli = dir.path().join("tailscale");
-
-        let why = ask_cli(&cli, Duration::from_secs(10)).await.unwrap_err();
-
-        assert!(why.contains(&cli.display().to_string()), "{why}");
-    }
-
-    #[tokio::test]
-    async fn output_that_is_not_addresses_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let cli = fake_cli(dir.path(), "echo 'not an address'");
-
-        let why = ask_cli(&cli, Duration::from_secs(10)).await.unwrap_err();
-
-        assert!(why.contains("not an address"), "{why}");
-    }
-
-    #[tokio::test]
-    async fn a_cli_that_hangs_is_stopped_and_says_so() {
-        let dir = tempfile::tempdir().unwrap();
-        // A distinctive duration, so a stray is easy to find.
-        let cli = fake_cli(dir.path(), "exec sleep 7.317");
-
-        let why = ask_cli(&cli, Duration::from_millis(200)).await.unwrap_err();
-
-        assert!(why.contains("did not answer"), "{why}");
     }
 
     #[test]

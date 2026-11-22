@@ -13,6 +13,7 @@ use tempfile::TempDir;
 use super::*;
 use crate::store::Store;
 use crate::terminals::Terminals;
+use crate::test_log::Logged;
 
 const WAIT: Duration = Duration::from_secs(20);
 
@@ -2004,31 +2005,6 @@ impl Setup {
     }
 }
 
-/// Every tracing event this thread writes until the guard drops, as text.
-fn logs() -> (tracing::subscriber::DefaultGuard, Arc<Mutex<Vec<u8>>>) {
-    struct Writer(Arc<Mutex<Vec<u8>>>);
-    impl std::io::Write for Writer {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let buffer = Arc::new(Mutex::new(Vec::new()));
-    let writer = buffer.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_writer(move || Writer(writer.clone()))
-        .finish();
-    (tracing::subscriber::set_default(subscriber), buffer)
-}
-
-fn text_of(buffer: &Arc<Mutex<Vec<u8>>>) -> String {
-    String::from_utf8_lossy(&buffer.lock().unwrap()).into_owned()
-}
-
 #[tokio::test]
 async fn sweep_removes_a_leftover_worktree_with_no_work_and_keeps_its_branch() {
     let setup = Setup::new();
@@ -2053,7 +2029,8 @@ async fn sweep_keeps_a_leftover_with_an_uncommitted_file_and_logs_its_path_and_t
     let remote = setup.project(&[("README.md", "hello\n")]);
     let worktree = setup.leftover(&remote, "half-done").await;
     std::fs::write(worktree.join("draft.txt"), "mine").unwrap();
-    let (_guard, logs) = logs();
+    let logs = Logged::default();
+    let _guard = logs.capture();
 
     setup.workspaces.sweep().await.unwrap();
 
@@ -2061,7 +2038,7 @@ async fn sweep_keeps_a_leftover_with_an_uncommitted_file_and_logs_its_path_and_t
         std::fs::read_to_string(worktree.join("draft.txt")).unwrap(),
         "mine"
     );
-    let text = text_of(&logs);
+    let text = logs.text();
     let line = text
         .lines()
         .find(|l| l.contains("draft.txt"))
@@ -2088,13 +2065,14 @@ async fn sweep_keeps_a_leftover_with_an_unpushed_commit_on_its_branch_or_a_detac
         &detached,
         &["commit", "-q", "--allow-empty", "-m", "off the branch"],
     );
-    let (_guard, logs) = logs();
+    let logs = Logged::default();
+    let _guard = logs.capture();
 
     setup.workspaces.sweep().await.unwrap();
 
     assert!(ahead.exists());
     assert!(detached.exists());
-    let text = text_of(&logs);
+    let text = logs.text();
     for unpushed in ["only here", "off the branch"] {
         assert!(text.contains(unpushed), "{text}");
     }
@@ -2205,7 +2183,8 @@ async fn sweep_forgets_a_leftover_whose_folder_is_gone_only_when_its_head_is_pus
         &["commit", "-q", "--allow-empty", "-m", "only on the head"],
     );
     std::fs::remove_dir_all(&unpushed).unwrap();
-    let (_guard, logs) = logs();
+    let logs = Logged::default();
+    let _guard = logs.capture();
 
     setup.workspaces.sweep().await.unwrap();
 
@@ -2213,7 +2192,7 @@ async fn sweep_forgets_a_leftover_whose_folder_is_gone_only_when_its_head_is_pus
     assert!(!listed.contains("/pushed-gone\n"), "{listed}");
     assert!(listed.contains("/unpushed-gone\n"), "{listed}");
     setup.branch_at(remote.project, "pushed-gone");
-    let text = text_of(&logs);
+    let text = logs.text();
     let line = text
         .lines()
         .find(|l| l.contains("unpushed-gone"))
@@ -2272,7 +2251,8 @@ async fn sweep_keeps_the_worktrees_live_records_of_another_identity_name() {
     let worktree = setup.worktree(remote.project, "mine");
 
     let after_new_identity = setup.workspaces_as(MachineId::random(), setup.store.clone());
-    let (_guard, logs) = logs();
+    let logs = Logged::default();
+    let _guard = logs.capture();
     after_new_identity.sweep().await.unwrap();
 
     assert!(worktree.exists());
@@ -2281,7 +2261,7 @@ async fn sweep_keeps_the_worktrees_live_records_of_another_identity_name() {
         listed.contains("/mine\0") || listed.contains("/mine\n"),
         "{listed}"
     );
-    let text = text_of(&logs);
+    let text = logs.text();
     let line = text
         .lines()
         .find(|l| l.contains(&format!("{}/mine", remote.project)))
@@ -2313,12 +2293,13 @@ async fn sweep_logs_a_clone_git_cannot_list_and_goes_on_to_the_next() {
     std::fs::create_dir_all(setup.clone_of(broken.project)).unwrap();
     let remote = setup.project(&[("README.md", "hello\n")]);
     let leftover = setup.leftover(&remote, "crashed").await;
-    let (_guard, logs) = logs();
+    let logs = Logged::default();
+    let _guard = logs.capture();
 
     setup.workspaces.sweep().await.unwrap();
 
     assert!(!leftover.exists());
-    let text = text_of(&logs);
+    let text = logs.text();
     let line = text
         .lines()
         .find(|l| l.contains(&format!("{}.git", broken.project)))
@@ -2335,12 +2316,13 @@ async fn sweep_leaves_and_logs_a_clean_leftover_git_will_not_remove() {
         &setup.clone_of(remote.project),
         &["worktree", "lock", "--", leftover.to_str().unwrap()],
     );
-    let (_guard, logs) = logs();
+    let logs = Logged::default();
+    let _guard = logs.capture();
 
     setup.workspaces.sweep().await.unwrap();
 
     assert!(leftover.exists());
-    let text = text_of(&logs);
+    let text = logs.text();
     let line = text
         .lines()
         .find(|l| l.contains(&format!("{}/locked", remote.project)))
@@ -2454,12 +2436,13 @@ async fn sweep_leaves_and_logs_a_leftover_it_cannot_check() {
     let remote = setup.project(&[("README.md", "hello\n")]);
     let leftover = setup.leftover(&remote, "unreadable").await;
     std::fs::write(leftover.join(".git"), "gitdir: /nonexistent\n").unwrap();
-    let (_guard, logs) = logs();
+    let logs = Logged::default();
+    let _guard = logs.capture();
 
     setup.workspaces.sweep().await.unwrap();
 
     assert!(leftover.exists());
-    let text = text_of(&logs);
+    let text = logs.text();
     let line = text
         .lines()
         .find(|l| l.contains(&format!("{}/unreadable", remote.project)))
@@ -2478,7 +2461,8 @@ async fn sweep_leaves_and_logs_a_leftover_holding_files_git_ignores() {
     std::fs::write(leftover.join(".env"), "mine").unwrap();
     std::fs::create_dir_all(leftover.join("build")).unwrap();
     std::fs::write(leftover.join("build").join("out.bin"), "o").unwrap();
-    let (_guard, logs) = logs();
+    let logs = Logged::default();
+    let _guard = logs.capture();
 
     setup.workspaces.sweep().await.unwrap();
 
@@ -2486,7 +2470,7 @@ async fn sweep_leaves_and_logs_a_leftover_holding_files_git_ignores() {
         std::fs::read_to_string(leftover.join(".env")).unwrap(),
         "mine"
     );
-    let text = text_of(&logs);
+    let text = logs.text();
     let line = text
         .lines()
         .find(|l| l.contains(&format!("{}/worked-in", remote.project)))
@@ -2545,12 +2529,13 @@ async fn sweep_skips_and_logs_when_a_record_cannot_be_read() {
     let remote = setup.project(&[("README.md", "hello\n")]);
     let leftover = setup.leftover(&remote, "crashed").await;
     unreadable_row(&setup.data.path().join("foundry.db"));
-    let (_guard, logs) = logs();
+    let logs = Logged::default();
+    let _guard = logs.capture();
 
     setup.workspaces.sweep().await.unwrap();
 
     assert!(leftover.exists());
-    let text = text_of(&logs);
+    let text = logs.text();
     assert!(
         text.lines()
             .any(|l| l.contains("WARN") && l.contains("sweep")),
@@ -2620,7 +2605,8 @@ async fn sweep_stops_at_its_deadline_and_logs_the_clone_it_stopped_in() {
     let leftover = setup.leftover(&remote, "crashed").await;
     let lock = setup.workspaces.inner.lock(remote.project);
     let _held = lock.lock().await;
-    let (_guard, logs) = logs();
+    let logs = Logged::default();
+    let _guard = logs.capture();
 
     let started = Instant::now();
     setup
@@ -2632,7 +2618,7 @@ async fn sweep_stops_at_its_deadline_and_logs_the_clone_it_stopped_in() {
 
     assert!(started.elapsed() < Duration::from_secs(10));
     assert!(leftover.exists());
-    let text = text_of(&logs);
+    let text = logs.text();
     let line = text
         .lines()
         .find(|l| l.contains(&format!("{}.git", remote.project)))
@@ -2651,12 +2637,13 @@ async fn sweep_logs_a_clone_it_cannot_read_and_goes_on_to_the_next() {
     std::os::unix::fs::symlink(&clone, &clone).unwrap();
     let remote = setup.project(&[("README.md", "hello\n")]);
     let leftover = setup.leftover(&remote, "crashed").await;
-    let (_guard, logs) = logs();
+    let logs = Logged::default();
+    let _guard = logs.capture();
 
     setup.workspaces.sweep().await.unwrap();
 
     assert!(!leftover.exists());
-    let text = text_of(&logs);
+    let text = logs.text();
     let line = text
         .lines()
         .find(|l| l.contains(&format!("{}.git", broken.project)))

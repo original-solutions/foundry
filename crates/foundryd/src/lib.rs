@@ -9,6 +9,7 @@ pub mod daemon;
 pub mod dashboard;
 pub mod gateway;
 pub mod join;
+pub mod lister;
 pub mod machine;
 pub mod placement;
 pub mod secrets;
@@ -17,7 +18,10 @@ pub mod sessions;
 pub mod status;
 pub mod store;
 pub mod sync;
+pub mod tailscale;
 pub mod terminals;
+#[cfg(test)]
+mod test_log;
 pub mod update;
 pub mod workspaces;
 
