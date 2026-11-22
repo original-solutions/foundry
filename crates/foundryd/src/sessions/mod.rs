@@ -910,6 +910,120 @@ async fn watch_for_stuck(inner: Arc<Inner>, live: Arc<Live>) {
     }
 }
 
+/// [`Sessions::adopt`] against a store that is busy for a while. The sessions are ones whose
+/// terminal has exited, so no holder is needed.
+#[cfg(test)]
+mod adopt_tests {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    use foundry_proto::record::Terminal;
+
+    use super::*;
+
+    /// Sessions of a new machine whose store holds one `Working` session, with its settings
+    /// file and curl config, whose terminal exited with code 0.
+    fn with_a_session_whose_terminal_exited() -> (tempfile::TempDir, Sessions, SessionId) {
+        let data = tempfile::tempdir().unwrap();
+        let me = MachineId::random();
+        let mut store = Store::open(data.path().join("foundry.db")).unwrap();
+        let (workspace, terminal, id) = (
+            WorkspaceId::random(),
+            TerminalId::random(),
+            SessionId::random(),
+        );
+        let records = [
+            AnyRecord::Terminal(Record {
+                owner: me,
+                version: store.own_next_version().unwrap(),
+                deleted: false,
+                body: Terminal {
+                    id: terminal,
+                    workspace,
+                    state: TerminalState::Exited,
+                    exit_code: Some(0),
+                },
+            }),
+            AnyRecord::Session(Record {
+                owner: me,
+                version: store.own_next_version().unwrap(),
+                deleted: false,
+                body: Session {
+                    id,
+                    workspace,
+                    terminal,
+                    model: "test-model".into(),
+                    state: SessionState::Working,
+                },
+            }),
+        ];
+        for record in &records {
+            store.apply(record, me).unwrap();
+        }
+        let store = Arc::new(Mutex::new(store));
+        let terminals = Arc::new(Terminals::new(
+            me,
+            store.clone(),
+            data.path(),
+            data.path().join("no-holder"),
+        ));
+        let config = Config {
+            claude: vec!["claude".into()],
+            claude_json: data.path().join(".claude.json"),
+            hook_port: 9,
+            gateway: Gateway {
+                base_url: String::new(),
+                key: String::new(),
+            },
+        };
+        let sessions = Sessions::new(me, store, terminals, data.path(), config);
+        let (settings, curl) = sessions.inner.files(id);
+        claude::write_curl_config(&curl, "http://127.0.0.1:9/hooks/x", "t0ken").unwrap();
+        claude::write_settings(&settings, &claude::settings_json(&curl)).unwrap();
+        (data, sessions, id)
+    }
+
+    fn state(sessions: &Sessions, id: SessionId) -> Option<SessionState> {
+        let me = sessions.inner.me;
+        let records = lock(&sessions.inner.store).since(me, 0).unwrap();
+        records.into_iter().find_map(|record| match record {
+            AnyRecord::Session(r) if r.body.id == id => Some(r.body.state),
+            _ => None,
+        })
+    }
+
+    fn files_gone(sessions: &Sessions, id: SessionId) -> bool {
+        let (settings, curl) = sessions.inner.files(id);
+        !settings.exists() && !curl.exists()
+    }
+
+    #[tokio::test]
+    async fn a_gone_session_whose_end_cannot_be_written_is_ended_once_the_store_answers() {
+        let (_data, sessions, id) = with_a_session_whose_terminal_exited();
+        sessions.inner.fail_writes.store(3, SeqCst);
+
+        sessions.adopt().await;
+
+        let end = Instant::now() + Duration::from_secs(20);
+        while state(&sessions, id) != Some(SessionState::Finished) || !files_gone(&sessions, id) {
+            assert!(Instant::now() < end, "the session was not ended");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(sessions.inner.fail_writes.load(SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_store_that_cannot_be_read_at_first_is_read_again_before_adopt_returns() {
+        let (_data, sessions, id) = with_a_session_whose_terminal_exited();
+        sessions.inner.fail_adopt_reads.store(2, SeqCst);
+
+        sessions.adopt().await;
+
+        assert_eq!(state(&sessions, id), Some(SessionState::Finished));
+        assert!(files_gone(&sessions, id));
+        assert_eq!(sessions.inner.fail_adopt_reads.load(SeqCst), 0);
+    }
+}
+
 /// Tests: takes one from `count` when it is above zero, and says whether it did.
 #[cfg(test)]
 fn take_one(count: &std::sync::atomic::AtomicUsize) -> bool {
