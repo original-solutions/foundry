@@ -14,7 +14,7 @@
 //!
 //! The code works only from an address the name resolved to. The name and that address are
 //! held with the code until it expires. When a machine uses the code on the join route, the
-//! route lists it through [`Lister`], through the acting coordinator, as every machine list
+//! route lists it through [`Lister`](crate::lister::Lister), through the acting coordinator, as every machine list
 //! change is, before it answers: with its key, under the name and address it lists itself
 //! under, or under the name typed at that address when it sends none. A list that already holds
 //! the machine is left as it is. When another machine has the name or the address, or the edit
@@ -29,13 +29,12 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
-use foundry_proto::settings::{Edit, Machine};
 use serde::Deserialize;
 
 use super::machine_names::checked_name;
 use super::{ApiError, Body, on_store, unprocessable};
-use crate::coordinator::Coordinator;
 use crate::join::{CODE_VALID_FOR, DEFAULT_PORT, JoinError, Keys, Named, join_targets};
+use crate::lister::has_address;
 use crate::store::Store;
 
 /// What the add route acts on: the keys that make codes and the store whose machine list it
@@ -46,7 +45,7 @@ struct Adding {
 }
 
 /// `POST /api/machines/add`. The caller guards it as it guards the rest of the API, and serves
-/// [`crate::join::router`] beside it on the same keys, with a [`Lister`].
+/// [`crate::join::router`] beside it on the same keys, with a [`Lister`](crate::lister::Lister).
 pub fn router(keys: Keys, store: Arc<Mutex<Store>>) -> Router {
     Router::new()
         .route("/api/machines/add", post(add))
@@ -131,14 +130,6 @@ fn listed_address(addresses: &[IpAddr]) -> IpAddr {
         .to_canonical()
 }
 
-/// Whether a listed `address` is `ip`: compared as an IP when it parses as one, else as text.
-fn has_address(address: &str, ip: IpAddr) -> bool {
-    let address = address.trim();
-    address
-        .parse::<IpAddr>()
-        .map_or_else(|_| address == ip.to_string(), |listed| listed == ip)
-}
-
 /// Every Tailscale address `name` resolves to, first the one `foundryd join` sends a code to.
 /// Resolving it can wait on DNS, so it runs on the blocking pool.
 async fn resolve(name: &str) -> Result<Vec<IpAddr>, ApiError> {
@@ -161,72 +152,6 @@ fn not_on_tailscale(name: &str) -> ApiError {
     ))
 }
 
-/// Lists a machine that used a code the add route made, for the join route.
-#[derive(Clone)]
-pub struct Lister {
-    coordinator: Arc<Coordinator>,
-    store: Arc<Mutex<Store>>,
-}
-
-impl Lister {
-    pub fn new(coordinator: Arc<Coordinator>, store: Arc<Mutex<Store>>) -> Self {
-        Self { coordinator, store }
-    }
-
-    /// Lists `machine`, which used a code, and says once the edit is numbered. A list that
-    /// already holds it (this machine included) is left as it is: its entry is never
-    /// overwritten, and a join sent again after a lost answer finds it there. A list that
-    /// cannot be read, another machine with its name or its address, or an edit that fails
-    /// gives why, which is warned. The code is never logged.
-    pub(crate) async fn list(&self, machine: Machine) -> Result<(), String> {
-        let id = machine.id;
-        let held = on_store(&self.store, |store| store.settings())
-            .await
-            .map_err(|error| format!("the machine list could not be read: {error}"))?;
-        if held.machines.iter().any(|m| m.id == id) {
-            return Ok(());
-        }
-        let wanted = machine.name.trim().to_lowercase();
-        let address = machine.address.trim();
-        let at_address = |m: &Machine| {
-            address
-                .parse::<IpAddr>()
-                .map_or(m.address.trim() == address, |ip| {
-                    has_address(&m.address, ip)
-                })
-        };
-        if let Some(other) = held
-            .machines
-            .iter()
-            .find(|m| at_address(m) || m.name.trim().to_lowercase() == wanted)
-        {
-            // A rename keeps the address, and no machine can be removed yet.
-            let way_out = if at_address(other) {
-                "a machine cannot be removed from the list yet, so this one cannot join at that \
-                 address"
-            } else {
-                "rename that machine first"
-            };
-            let why = format!(
-                "{:?} at {} is already in the machine list, so the machine is not listed as {:?} \
-                 at {}; {way_out}",
-                other.name, other.address, machine.name, machine.address
-            );
-            tracing::warn!("machine {id} used a code to join, but {why}");
-            return Err(why);
-        }
-        match self.coordinator.edit(Edit::SetMachine { machine }).await {
-            Ok(_) => Ok(()),
-            Err(error) => {
-                tracing::warn!(
-                    "machine {id} used a code to join, but it could not be listed: {error}"
-                );
-                Err(error.to_string())
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -242,7 +167,9 @@ mod tests {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     use super::*;
+    use crate::coordinator::Coordinator;
     use crate::join::{self, CODE_VALID_FOR};
+    use crate::lister::Lister;
     use crate::secrets::MemorySecrets;
     use crate::sync::{Conn, Dialer, Peers};
 

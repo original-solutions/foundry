@@ -1,4 +1,90 @@
-//! Listing a machine that joined with a code.
+//! Listing a machine that used a join code the add route (`POST /api/machines/add`) made, for
+//! the join route ([`crate::join::router`]): through the acting coordinator, as every machine
+//! list change is, and only when no other machine has its name or its address. It sits apart
+//! from the API so the join route lists through it without depending on the API layer.
+
+use std::net::IpAddr;
+use std::sync::{Arc, Mutex};
+
+use foundry_proto::settings::{Edit, Machine};
+
+use crate::coordinator::Coordinator;
+use crate::store::Store;
+use crate::sync::on_store;
+
+/// Lists a machine that used a code the add route made, for the join route.
+#[derive(Clone)]
+pub struct Lister {
+    coordinator: Arc<Coordinator>,
+    store: Arc<Mutex<Store>>,
+}
+
+impl Lister {
+    pub fn new(coordinator: Arc<Coordinator>, store: Arc<Mutex<Store>>) -> Self {
+        Self { coordinator, store }
+    }
+
+    /// Lists `machine`, which used a code, and says once the edit is numbered. A list that
+    /// already holds it (this machine included) is left as it is: its entry is never
+    /// overwritten, and a join sent again after a lost answer finds it there. A list that
+    /// cannot be read, another machine with its name or its address, or an edit that fails
+    /// gives why, which is warned. The code is never logged.
+    pub(crate) async fn list(&self, machine: Machine) -> Result<(), String> {
+        let id = machine.id;
+        let held = on_store(&self.store, |store| store.settings())
+            .await
+            .map_err(|error| format!("the machine list could not be read: {error}"))?;
+        if held.machines.iter().any(|m| m.id == id) {
+            return Ok(());
+        }
+        let wanted = machine.name.trim().to_lowercase();
+        let address = machine.address.trim();
+        let at_address = |m: &Machine| {
+            address
+                .parse::<IpAddr>()
+                .map_or(m.address.trim() == address, |ip| {
+                    has_address(&m.address, ip)
+                })
+        };
+        if let Some(other) = held
+            .machines
+            .iter()
+            .find(|m| at_address(m) || m.name.trim().to_lowercase() == wanted)
+        {
+            // A rename keeps the address, and no machine can be removed yet.
+            let way_out = if at_address(other) {
+                "a machine cannot be removed from the list yet, so this one cannot join at that \
+                 address"
+            } else {
+                "rename that machine first"
+            };
+            let why = format!(
+                "{:?} at {} is already in the machine list, so the machine is not listed as {:?} \
+                 at {}; {way_out}",
+                other.name, other.address, machine.name, machine.address
+            );
+            tracing::warn!("machine {id} used a code to join, but {why}");
+            return Err(why);
+        }
+        match self.coordinator.edit(Edit::SetMachine { machine }).await {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                tracing::warn!(
+                    "machine {id} used a code to join, but it could not be listed: {error}"
+                );
+                Err(error.to_string())
+            }
+        }
+    }
+}
+
+/// Whether a listed `address` is `ip`: compared as an IP when it parses as one, else as text.
+pub(crate) fn has_address(address: &str, ip: IpAddr) -> bool {
+    let address = address.trim();
+    address
+        .parse::<IpAddr>()
+        .map_or_else(|_| address == ip.to_string(), |listed| listed == ip)
+}
 
 #[cfg(test)]
 mod tests {

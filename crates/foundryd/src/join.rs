@@ -51,7 +51,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{Instant, timeout};
 
-use crate::api::machine_add::Lister;
+use crate::lister::Lister;
 use crate::secrets::{self, Secrets, SecretsError};
 use crate::store::{Store, StoreError};
 use crate::sync::{Conn, Dialer, OFFLINE_AFTER, Peers, on_store};

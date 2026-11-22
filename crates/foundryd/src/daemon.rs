@@ -29,6 +29,7 @@ use crate::api::{self, Api, BindError};
 use crate::attention::Attention;
 use crate::gateway;
 use crate::join::{self, JoinError, KeyedDialer, Keys};
+use crate::lister::Lister;
 use crate::machine;
 use crate::placement;
 use crate::secrets::{self, GATEWAY, SecretsError};
@@ -307,7 +308,7 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
         .layer(middleware::from_fn_with_state(api.clone(), api::same_site));
     let machine_name_routes = api::machine_names::router(coordinator.clone(), store.clone())
         .layer(middleware::from_fn_with_state(api.clone(), api::same_site));
-    let lister = api::machine_add::Lister::new(coordinator.clone(), store.clone());
+    let lister = Lister::new(coordinator.clone(), store.clone());
     let join_routes = join::router(keys.clone(), lister)
         .layer(middleware::from_fn_with_state(api.clone(), api::same_site));
     let machine_add_routes = api::machine_add::router(keys.clone(), store.clone())
