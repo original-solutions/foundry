@@ -1398,3 +1398,33 @@ fn the_join_and_add_routes_are_served_and_refuse_a_request_from_another_site() {
         assert_eq!(ask(path, "evil.example", None, ""), 403, "{path}");
     }
 }
+
+#[test]
+fn the_remove_route_is_served_and_refuses_a_request_from_another_site() {
+    use std::io::{Read as _, Write as _};
+    let mut fixture = Fixture::new();
+    fixture.start();
+    let ask = |path: &str, host: &str, origin: Option<&str>| {
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", fixture.port)).unwrap();
+        let origin = origin.map_or_else(String::new, |o| format!("Origin: {o}\r\n"));
+        write!(
+            stream,
+            "POST {path} HTTP/1.1\r\nHost: {host}\r\n{origin}Connection: close\r\n\
+             Content-Length: 0\r\n\r\n"
+        )
+        .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        let status = response.split(' ').nth(1).unwrap().parse::<u16>().unwrap();
+        (status, response)
+    };
+    let here = format!("127.0.0.1:{}", fixture.port);
+    let remove = format!("/api/machines/{}/remove", MachineId::random());
+    // Served here: a machine the list does not hold is refused by the route itself, not as an
+    // unrouted path.
+    let (status, answer) = ask(&remove, &here, None);
+    assert_eq!(status, 404, "{answer}");
+    assert!(answer.contains("machine list"), "{answer}");
+    assert_eq!(ask(&remove, &here, Some("http://evil.example")).0, 403);
+    assert_eq!(ask(&remove, "evil.example", None).0, 403);
+}

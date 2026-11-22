@@ -2517,6 +2517,38 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_link_closes_at_once_when_its_machine_is_revoked_not_at_the_next_check() {
+        let host = machine_keys();
+        let peer = machine_keys();
+        admit(&host, &peer);
+        let closing = tokio::spawn({
+            let (host, peer) = (host.clone(), peer.me());
+            async move { revoked(&host, peer).await }
+        });
+        // Past the first check, so the next is a RECHECK away.
+        tokio::time::sleep(RECHECK / 4).await;
+        assert!(!closing.is_finished());
+
+        host.revoke(peer.me()).unwrap();
+
+        timeout(RECHECK / 4, closing)
+            .await
+            .expect("the link closes without waiting for the next check")
+            .unwrap();
+    }
+
+    #[test]
+    fn removed_names_the_machines_stamped_removed_and_not_listed() {
+        let (gone, kept) = (MachineId::random(), MachineId::random());
+        let settings = settings_with(3, vec![machine(kept)], &[gone, kept]);
+
+        assert_eq!(removed(&settings).collect::<Vec<_>>(), [gone]);
+        assert!(is_removed(&settings, gone));
+        assert!(!is_removed(&settings, kept));
+        assert!(!is_removed(&settings, MachineId::random()));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_listed_key_never_replaces_a_revocation_or_another_key_held() {
         let host = machine_keys();
         let (revoked, held, stranger) = (machine_keys(), machine_keys(), machine_keys());

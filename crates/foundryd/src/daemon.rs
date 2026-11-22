@@ -863,6 +863,9 @@ mod tests {
 
     use axum::Router;
 
+    use foundry_proto::ids::MachineId;
+    use foundry_proto::settings::{SettingKey, SharedSettings, StampKey};
+
     use super::*;
     use crate::secrets::SecretsError;
 
@@ -1656,5 +1659,91 @@ mod tests {
             items.iter().any(|item| item.kind == Kind::PlacementWaiting),
             "{items:?}"
         );
+    }
+
+    /// A coordinator and listing for a machine that acts alone, over a store holding what
+    /// `settings` makes of an empty copy.
+    fn listing_over(
+        settings: impl FnOnce(MachineId, &mut SharedSettings),
+    ) -> (
+        tempfile::TempDir,
+        MachineId,
+        Arc<Mutex<Store>>,
+        api::machine_names::Listing,
+    ) {
+        struct Nobody;
+        impl crate::sync::Dialer for Nobody {
+            fn dial(
+                &self,
+                _: &foundry_proto::settings::Machine,
+            ) -> futures::future::BoxFuture<'static, io::Result<crate::sync::Conn>> {
+                Box::pin(async { Err(io::Error::other("nobody")) })
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let me = foundry_proto::ids::MachineId::random();
+        let mut store = Store::open(dir.path().join("foundry.db")).unwrap();
+        let mut held = store.settings().unwrap();
+        held.seq += 1;
+        settings(me, &mut held);
+        store.apply_settings(held).unwrap();
+        let store = Arc::new(Mutex::new(store));
+        let peers = Peers::new(me, store.clone(), Arc::new(Nobody));
+        let coordinator = Arc::new(crate::coordinator::Coordinator::new(
+            me,
+            store.clone(),
+            peers.clone(),
+        ));
+        peers.coordinate(coordinator.clone());
+        let listing = api::machine_names::Listing::new(
+            me,
+            "ab".repeat(32),
+            coordinator,
+            store.clone(),
+            Duration::ZERO,
+            Arc::new(AtomicBool::new(false)),
+        );
+        (dir, me, store, listing)
+    }
+
+    fn here() -> api::machine_names::Entry {
+        api::machine_names::Entry {
+            name: "studio".into(),
+            address: "100.64.0.1".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_machine_removed_from_the_fleet_does_not_list_itself_again() {
+        let (_dir, me, store, mut listing) = listing_over(|me, settings| {
+            settings.stamps.insert(
+                StampKey::Setting(SettingKey::Machine(me)),
+                foundry_proto::settings::Stamp { seq: 1, by: me },
+            );
+        });
+        let before = store.lock().unwrap().settings().unwrap();
+        let mut warned = false;
+
+        for _ in 0..5 {
+            list_unless_removed(&mut listing, &store, me, &mut warned, Ok(here())).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let after = store.lock().unwrap().settings().unwrap();
+        assert_eq!(after.seq, before.seq);
+        assert!(after.machines.is_empty());
+        assert!(warned);
+    }
+
+    #[tokio::test]
+    async fn a_machine_never_listed_lists_itself_as_before() {
+        let (_dir, me, store, mut listing) = listing_over(|_, _| {});
+        let mut warned = false;
+
+        list_unless_removed(&mut listing, &store, me, &mut warned, Ok(here())).await;
+
+        let after = store.lock().unwrap().settings().unwrap();
+        assert!(after.machines.iter().any(|m| m.id == me));
+        assert!(!warned);
     }
 }

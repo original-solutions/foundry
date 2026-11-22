@@ -68,9 +68,11 @@ async fn remove(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::io;
     use std::time::Duration;
 
+    use foundry_proto::messages::{PROTOCOL, PeerMessage};
     use foundry_proto::settings::{Machine, SharedSettings};
     use futures::future::BoxFuture;
     use serde_json::Value;
@@ -92,6 +94,7 @@ mod tests {
         _data: tempfile::TempDir,
         me: MachineId,
         store: Arc<Mutex<Store>>,
+        peers: Peers,
         addr: std::net::SocketAddr,
         _server: tokio::task::JoinHandle<()>,
     }
@@ -117,6 +120,7 @@ mod tests {
             let coordinator = Arc::new(Coordinator::new(me, store.clone(), peers.clone()));
             peers.coordinate(coordinator.clone());
             let app = router(me, coordinator, store.clone());
+            let served_peers = peers.clone();
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let server = tokio::spawn(async move {
@@ -126,6 +130,7 @@ mod tests {
                 _data: data,
                 me,
                 store,
+                peers: served_peers,
                 addr,
                 _server: server,
             }
@@ -155,6 +160,44 @@ mod tests {
                 head.split(' ').nth(1).unwrap().parse().unwrap(),
                 body.to_owned(),
             )
+        }
+    }
+
+    impl Served {
+        /// `peer` says hello and sends nothing, so it is heard from, then its link drops: it
+        /// acts, and an edit has nowhere to go.
+        async fn hear(&self, peer: MachineId) {
+            let (ours, theirs) = Conn::pair();
+            let accepting = tokio::spawn({
+                let peers = self.peers.clone();
+                async move { peers.accept(ours).await }
+            });
+            let hello = PeerMessage::Hello {
+                protocol: PROTOCOL,
+                machine: peer,
+                versions: BTreeMap::new(),
+            };
+            let nothing = PeerMessage::Records {
+                protocol: PROTOCOL,
+                records: Vec::new(),
+            };
+            for message in [hello, nothing] {
+                theirs
+                    .send
+                    .send(serde_json::to_string(&message).unwrap())
+                    .await
+                    .unwrap();
+            }
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while !self.peers.online().contains(&peer) {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the peer was not heard"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            drop(theirs);
+            accepting.await.unwrap();
         }
     }
 
@@ -216,5 +259,40 @@ mod tests {
         assert!(after.machines.iter().all(|m| m.id != gone));
         assert!(after.machines.iter().any(|m| m.id == served.me));
         assert!(after.seq > seq);
+    }
+
+    #[tokio::test]
+    async fn an_edit_the_coordinator_cannot_send_answers_503_and_numbers_nothing() {
+        let (acting, gone) = (MachineId::random(), MachineId::random());
+        let served = Served::new(|settings| {
+            for (id, name, address) in [(acting, "x", "100.64.0.9"), (gone, "y", "100.64.0.8")] {
+                settings.machines.push(Machine {
+                    id,
+                    name: name.into(),
+                    address: address.into(),
+                    key: String::new(),
+                });
+            }
+            // An unreachable machine ahead in priority acts as coordinator.
+            settings.priority = vec![acting, settings.machines[0].id];
+        })
+        .await;
+        served.hear(acting).await;
+        let before = served.settings();
+
+        let (status, body) = served.remove(gone).await;
+
+        assert_eq!(status, 503, "{body}");
+        let json: Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap()
+                .contains(&acting.to_string())
+        );
+        let after = served.settings();
+        assert_eq!(after.seq, before.seq);
+        assert_eq!(after.stamps, before.stamps);
+        assert!(after.machines.iter().any(|m| m.id == gone));
     }
 }
