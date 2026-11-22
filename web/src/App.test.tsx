@@ -238,19 +238,25 @@ describe("App", () => {
     });
   }
 
-  it("on a wide screen, or with no matchMedia, keeps both lists open in the news stack", async () => {
-    attention = [needsYou];
-    placements = [held];
-    mockActions();
-    await open("/terminals/t1", live);
-    for (const name of ["Needs attention", "Waiting for a machine"]) {
-      const list = await screen.findByRole("region", { name });
-      expect(screen.getAllByRole("region", { name })).toHaveLength(1);
-      expect(newsStack(list)).not.toBeNull();
-      expect(document.querySelector("main")!.contains(list)).toBe(false);
-      expect(within(list).getByRole("button", { expanded: true })).toBeDefined();
-    }
-  });
+  for (const [screenIs, wide] of [
+    ["a wide screen", () => vi.stubGlobal("matchMedia", (query: string) => ({ matches: query === "(min-width: 768px)" }))],
+    ["no matchMedia", () => {}],
+  ] as const) {
+    it(`with ${screenIs}, keeps both lists open in the news stack`, async () => {
+      wide();
+      attention = [needsYou];
+      placements = [held];
+      mockActions();
+      await open("/terminals/t1", live);
+      for (const name of ["Needs attention", "Waiting for a machine"]) {
+        const list = await screen.findByRole("region", { name });
+        expect(screen.getAllByRole("region", { name })).toHaveLength(1);
+        expect(newsStack(list)).not.toBeNull();
+        expect(document.querySelector("main")!.contains(list)).toBe(false);
+        expect(within(list).getByRole("button", { expanded: true })).toBeDefined();
+      }
+    });
+  }
 
   it("moves the lists between the page and the news stack as the screen crosses the breakpoint", async () => {
     let wide = false;
@@ -281,13 +287,16 @@ describe("App", () => {
     expect(within(back).queryByText(needsYou.what)).toBeNull();
   });
 
-  it("takes no room in the page on a narrow screen while nothing needs attention or waits", async () => {
+  it("takes no room in the page on a narrow screen while nothing needs attention or waits, and at most half of it otherwise", async () => {
     vi.stubGlobal("matchMedia", () => ({ matches: false }));
     mockActions();
     await open("/terminals/t1", live);
     await waitFor(() => expect(document.querySelector("main")!.firstElementChild!.className).toMatch(/\bempty:hidden\b/));
     const slot = document.querySelector("main")!.firstElementChild!;
     expect(slot.className).toMatch(/\bshrink-0\b/);
+    // Both lists unfolded never push the header off the screen: the slot scrolls past half of it.
+    expect(slot.className).toMatch(/\bmax-h-\[50dvh\]/);
+    expect(slot.className).toMatch(/\boverflow-y-auto\b/);
     expect(slot.childElementCount).toBe(0);
   });
 
