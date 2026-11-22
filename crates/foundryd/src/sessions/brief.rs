@@ -29,7 +29,8 @@ pub const HIDDEN: &str = "•••";
 /// A session's brief, as the UI is sent it.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct Brief {
-    /// The first prompt since the session started or was cleared, slash commands left out.
+    /// The first prompt since the session started, was cleared or resumed another conversation,
+    /// slash commands left out.
     pub title: Option<String>,
     /// The newest step of the turn, until the turn ends.
     pub now: Option<Step>,
@@ -103,7 +104,8 @@ impl Brief {
             })
         };
         let taken = match field("hook_event_name").unwrap_or_default() {
-            "SessionStart" if field("source") == Some("clear") => {
+            // `/clear` and `/resume` both put another conversation in the same session.
+            "SessionStart" if matches!(field("source"), Some("clear" | "resume")) => {
                 self.title = None;
                 self.now = None;
                 self.said = None;
@@ -311,12 +313,20 @@ mod tests {
     }
 
     #[test]
-    fn clear_forgets_the_title_and_other_session_starts_do_not() {
+    fn clear_and_resume_forget_the_conversation_and_other_session_starts_do_not() {
         let start = |source| json!({"hook_event_name": "SessionStart", "source": source});
-        let brief = noted(&[prompt("one"), start("compact"), start("resume")]);
+        let brief = noted(&[prompt("one"), start("compact"), start("startup")]);
         assert_eq!(brief.title.as_deref(), Some("one"));
-        let brief = noted(&[prompt("one"), start("clear"), prompt("two")]);
-        assert_eq!(brief.title.as_deref(), Some("two"));
+        assert_eq!(now(&brief), Some((StepKind::Prompt, "one")));
+        // `/clear` and `/resume` both leave the conversation the title names.
+        for source in ["clear", "resume"] {
+            let brief = noted(&[prompt("one"), start(source)]);
+            assert_eq!((brief.title, brief.now), (None, None), "{source}");
+            let brief = noted(&[prompt("one"), stop("Done."), start(source)]);
+            assert_eq!(brief.said, None, "{source}");
+            let brief = noted(&[prompt("one"), start(source), prompt("two")]);
+            assert_eq!(brief.title.as_deref(), Some("two"), "{source}");
+        }
     }
 
     #[test]

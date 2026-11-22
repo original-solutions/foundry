@@ -1362,7 +1362,7 @@ async fn a_resume_does_not_end_the_session() {
 }
 
 #[tokio::test]
-async fn a_session_end_that_is_not_a_clear_still_ends_it() {
+async fn a_session_end_that_does_not_continue_still_ends_it() {
     let f = Fixture::new("- wait_input\n").await;
     let id = f.start().await;
     let body = r#"{"hook_event_name":"SessionEnd","reason":"logout"}"#;

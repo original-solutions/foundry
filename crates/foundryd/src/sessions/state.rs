@@ -170,7 +170,7 @@ mod tests {
     }
 
     #[test]
-    fn a_session_end_that_is_a_clear_is_not_an_end() {
+    fn a_session_end_that_continues_is_not_an_end() {
         let payload = |reason: Option<&str>| {
             let mut v = serde_json::json!({"hook_event_name": "SessionEnd"});
             if let Some(reason) = reason {
