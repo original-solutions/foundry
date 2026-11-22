@@ -272,6 +272,27 @@ describe("Machines", () => {
       ]);
     });
 
+    it("Save with the disk field left alone posts the stored disk limit exactly", async () => {
+      const calls = mockFetch(new Response(null, { status: 204 }));
+      await showLimited(settings({ machines: twoMachines.machines, limits: { [ME]: { max_sessions: 4, max_load_per_core: 1.5, min_free_disk: 4_355_500_000 } } }));
+
+      open();
+      expect(diskField().value).toBe("4.3555");
+      fireEvent.change(sessionsField(), { target: { value: "5" } });
+      fireEvent.click(within(dialog()).getByRole("button", { name: "Save" }));
+
+      await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+      expect(calls[0].body).toEqual({ max_sessions: 5, max_load_per_core: 1.5, min_free_disk_gb: 4.3555 });
+    });
+
+    it("says what the dialog does with each limit", async () => {
+      await showLimited();
+
+      open();
+
+      expect(within(dialog()).getByText(/less free disk than this/)).toBeDefined();
+    });
+
     it("sends an empty field as null, which the daemon refuses", async () => {
       const calls = mockFetch(json(422, { error: "the maximum sessions is a whole number from 1 to 4294967295" }));
       await showLimited();
