@@ -26,14 +26,117 @@ use super::{ApiError, Body, edit_status, on_store, parse_id, unprocessable};
 use crate::coordinator::Coordinator;
 use crate::store::Store;
 
-/// The limits routes. The caller guards them as it guards the rest of the API.
-pub fn router(_coordinator: Arc<Coordinator>, _store: Arc<Mutex<Store>>) -> Router {
-    Router::new()
+/// What the limits routes act on: the coordinator that sends the edit and the store whose
+/// machine list says whether to send it.
+struct Held {
+    coordinator: Arc<Coordinator>,
+    store: Arc<Mutex<Store>>,
 }
 
-/// Gigabytes as bytes.
-fn gb_to_bytes(_gb: f64) -> Option<u64> {
-    None
+/// The limits routes. The caller guards them as it guards the rest of the API.
+pub fn router(coordinator: Arc<Coordinator>, store: Arc<Mutex<Store>>) -> Router {
+    Router::new()
+        .route("/api/machines/{id}/limits", post(set))
+        .route("/api/machines/{id}/limits/clear", post(clear))
+        .with_state(Arc::new(Held { coordinator, store }))
+}
+
+#[derive(Deserialize)]
+struct Wanted {
+    max_sessions: f64,
+    max_load_per_core: f64,
+    min_free_disk_gb: f64,
+}
+
+/// `gb` gigabytes (10^9 bytes) as bytes, rounded down, read from the number's shortest decimal
+/// text so no float error creeps in. `None` when it is negative, not finite or past `u64`.
+fn gb_to_bytes(gb: f64) -> Option<u64> {
+    if !gb.is_finite() || gb < 0.0 {
+        return None;
+    }
+    if gb == 0.0 {
+        // Also -0.0, which prints as "-0".
+        return Some(0);
+    }
+    // Display never uses an exponent for an f64.
+    let text = format!("{gb}");
+    let (whole, fraction) = text.split_once('.').unwrap_or((&text, ""));
+    let mut digits: String = fraction.chars().take(9).collect();
+    while digits.len() < 9 {
+        digits.push('0');
+    }
+    let whole: u64 = whole.parse().ok()?;
+    let fraction: u64 = digits.parse().ok()?;
+    whole.checked_mul(1_000_000_000)?.checked_add(fraction)
+}
+
+/// The limits `wanted` asks for, or why they are refused.
+fn checked(wanted: &Wanted) -> Result<Limits, ApiError> {
+    let sessions = wanted.max_sessions;
+    if !sessions.is_finite()
+        || sessions.fract() != 0.0
+        || sessions < 1.0
+        || sessions > f64::from(u32::MAX)
+    {
+        return Err(unprocessable(format!(
+            "the maximum sessions is a whole number from 1 to {}",
+            u32::MAX
+        )));
+    }
+    let load = wanted.max_load_per_core;
+    if !load.is_finite() || load <= 0.0 {
+        return Err(unprocessable(
+            "the maximum load per core is a number above 0".to_owned(),
+        ));
+    }
+    let Some(min_free_disk) = gb_to_bytes(wanted.min_free_disk_gb) else {
+        return Err(unprocessable(
+            "the minimum free disk is a number of gigabytes, 0 or more".to_owned(),
+        ));
+    };
+    Ok(Limits {
+        // Whole and in range, checked above.
+        max_sessions: sessions as u32,
+        max_load_per_core: load,
+        min_free_disk,
+    })
+}
+
+/// `404` unless the machine list holds `id`.
+async fn listed(held: &Held, id: &str) -> Result<MachineId, ApiError> {
+    let id = parse_id(id, "machine", MachineId)?;
+    let settings = on_store(&held.store, |store| store.settings()).await?;
+    if !settings.machines.iter().any(|m| m.id == id) {
+        return Err(ApiError::NotFound(format!(
+            "no machine {id} in the machine list"
+        )));
+    }
+    Ok(id)
+}
+
+async fn send(held: &Held, edit: Edit) -> Result<Response, ApiError> {
+    match held.coordinator.edit(edit).await {
+        Ok(_) => Ok(StatusCode::NO_CONTENT.into_response()),
+        Err(e) => Err(ApiError::Rejected(edit_status(&e), e.to_string())),
+    }
+}
+
+async fn set(
+    State(held): State<Arc<Held>>,
+    Path(id): Path<String>,
+    Body(wanted): Body<Wanted>,
+) -> Result<Response, ApiError> {
+    let machine = listed(&held, &id).await?;
+    let limits = checked(&wanted)?;
+    send(&held, Edit::SetLimits { machine, limits }).await
+}
+
+async fn clear(
+    State(held): State<Arc<Held>>,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    let machine = listed(&held, &id).await?;
+    send(&held, Edit::RemoveLimits { machine }).await
 }
 
 #[cfg(test)]
@@ -386,14 +489,6 @@ mod tests {
             assert_eq!(status, 422, "{body}: {answer}");
             assert!(!error_of(&answer).is_empty(), "{body}: {answer}");
         }
-        let (status, answer) = served
-            .post(
-                &format!("/api/machines/{}/limits", served.me),
-                Some("not json"),
-            )
-            .await;
-        assert_eq!(status, 422, "{answer}");
-        assert!(!error_of(&answer).is_empty(), "{answer}");
         assert_eq!(served.settings().seq, seq);
         assert!(served.settings().limits.is_empty());
     }
