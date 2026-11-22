@@ -79,7 +79,8 @@ import { WaitingList } from "./placement/WaitingList";
  * that finishes its turn or needs you is told once: as a card at the top right while you are at
  * the page, or as a desktop alert while you are not; coming back after a while, a catch-up card
  * heads the same stack. The sidebar's bell sets all three in one place; a screen reader hears the
- * news whatever it is set to.
+ * news whatever it is set to. On a narrow screen what needs a person and the creates waiting for a
+ * machine head the page instead, folded, above an open terminal's header, so they never lie over it.
  *
  * ? (outside a field or the terminal) or the sidebar's Keyboard button lists every key the app
  * answers. The sidebar's list is one Tab stop that the arrows walk.
@@ -117,6 +118,7 @@ function Layout() {
   const [drawer, setDrawer] = useState(false);
   /** Whether the sidebar is collapsed to the rail on a wide screen. */
   const [rail, setRail] = useState(() => loadRail(window.innerWidth));
+  const narrow = useNarrow();
   const flipRail = () => {
     saveRail(!rail);
     setRail(!rail);
@@ -304,6 +306,13 @@ function Layout() {
             </div>
           )}
           <main className="flex min-w-0 flex-1 flex-col">
+            {/* In the flow, so the terminal below gives up the room it takes; none while both are empty, and at most half the screen. */}
+            {narrow && (
+              <div className="flex max-h-[50dvh] shrink-0 flex-col gap-2 overflow-y-auto p-2 empty:hidden">
+                <AttentionList folded />
+                <WaitingList folded />
+              </div>
+            )}
             {terminalId && (
               <div {...frozen} className="flex shrink-0">
                 {(pair ? [pair.left, pair.right] : [terminalId]).map((id) => (
@@ -403,11 +412,11 @@ function Layout() {
         />
         <KeySheet open={keysOpen} onOpenChange={setKeysOpen} />
         <Announcer spoken={spoken} />
-        {/* One place on screen for news: what needs a person, the catch-up, then the cards. */}
+        {/* One place on screen for news: what needs a person (on a wide screen), the catch-up, then the cards. */}
         <div className="pointer-events-none fixed inset-x-2 top-2 z-40 flex flex-col gap-2 md:inset-x-auto md:top-14 md:right-4 md:w-[24rem]">
           <LinkBanner link={link} remembered={remembering ? memory.at : undefined} />
-          <AttentionList />
-          <WaitingList />
+          {!narrow && <AttentionList />}
+          {!narrow && <WaitingList />}
           {notify.notify.away && <Away records={sent.records} synced={sent.synced} machines={machines} traced={traced} onOpen={show} onShown={setCaughtUp} />}
           <Toasts news={news} machines={machines} here={here} onScreen={pair ? [pair.left, pair.right] : terminalId ? [terminalId] : []} covered={notify.notify.away ? caughtUp : []} onOpen={show} />
         </div>
@@ -415,6 +424,25 @@ function Layout() {
       </div>
     </TerminalActions>
   );
+}
+
+const WIDE = "(min-width: 768px)";
+
+/**
+ * Whether the screen is narrow, following it as it changes. A browser with no `matchMedia` counts
+ * as wide.
+ */
+function useNarrow(): boolean {
+  const [narrow, setNarrow] = useState(() => typeof matchMedia === "function" && !matchMedia(WIDE).matches);
+  useLayoutEffect(() => {
+    if (typeof matchMedia !== "function") return;
+    const media = matchMedia(WIDE);
+    const change = () => setNarrow(!media.matches);
+    change();
+    media.addEventListener?.("change", change);
+    return () => media.removeEventListener?.("change", change);
+  }, []);
+  return narrow;
 }
 
 const rootRoute = createRootRoute({ component: Layout });

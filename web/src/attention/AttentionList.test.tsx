@@ -121,6 +121,30 @@ describe("AttentionList", () => {
     expect(screen.getByText(waiting.what)).toBeTruthy();
   });
 
+  it("starts folded when told to, and opens to its items", async () => {
+    lists = [[waiting]];
+    await renderApp(<AttentionList folded />);
+    const toggle = await screen.findByRole("button", { name: /1 needs attention/ });
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByText(waiting.what)).toBeNull();
+    fireEvent.click(toggle);
+    expect(screen.getByText(waiting.what)).toBeTruthy();
+  });
+
+  it("starts folded again when the list empties and then fills, as the waiting list does", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    lists = [[waiting], [], [waiting]];
+    await renderApp(<AttentionList folded />);
+    fireEvent.click(await screen.findByRole("button", { name: /1 needs attention/ }));
+    expect(screen.getByText(waiting.what)).toBeTruthy();
+    await act(() => vi.advanceTimersByTimeAsync(ATTENTION_EVERY + 100));
+    await waitFor(() => expect(screen.queryByRole("region", { name: "Needs attention" })).toBeNull());
+    await act(() => vi.advanceTimersByTimeAsync(ATTENTION_EVERY + 100));
+    const toggle = await screen.findByRole("button", { name: /1 needs attention/ });
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByText(waiting.what)).toBeNull();
+  });
+
   it("shows an item of a kind this build does not know by its kind", async () => {
     lists = [[{ ...waiting, id: "lease_lost:p1", kind: "lease_lost", terminal: null }]];
     await renderApp(<AttentionList />);
