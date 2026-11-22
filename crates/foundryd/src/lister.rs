@@ -198,7 +198,7 @@ mod tests {
     async fn a_name_another_machine_has_in_any_case_or_spacing_is_refused_naming_it() {
         let other = machine(MachineId::random(), "Trilogy-Mac", "100.64.0.2");
         let listed = Listed::new(std::slice::from_ref(&other));
-        let joining = machine(MachineId::random(), " trilogy-mac ", "100.64.0.3");
+        let joining = machine(MachineId::random(), " TRILOGY-mac ", "100.64.0.3");
         let logged = Logged::default();
         let _capture = logged.capture();
 
