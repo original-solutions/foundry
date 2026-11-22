@@ -97,7 +97,11 @@ export default async function globalSetup() {
     const binDir = path.join(home, "bin");
     mkdirSync(binDir);
     const script = path.join(home, "agent.yaml");
-    writeFileSync(script, ["- hook: {event: SessionStart}", '- print: "fake agent ready"', ...Array(50).fill("- wait_input")].join("\n") + "\n");
+    // The session takes the task as its first prompt, as Claude Code's input box does, and ends its turn.
+    writeFileSync(
+      script,
+      ["- hook: {event: SessionStart}", '- print: "fake agent ready"', "- wait_prompt", "- hook: {event: Stop}", ...Array(50).fill("- wait_input")].join("\n") + "\n",
+    );
     writeFileSync(path.join(binDir, "claude"), `#!/bin/sh\nexec ${bin("foundry-fake-agent")} --script ${script} "$@"\n`);
     chmodSync(path.join(binDir, "claude"), 0o755);
 
