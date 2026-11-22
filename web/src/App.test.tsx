@@ -733,6 +733,76 @@ describe("App", () => {
     await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t9"));
   });
 
+  /** Starts a task from the board's task box, or the first-run page's, then delivers its workspace, terminal and session. */
+  async function startFromBox(router: Awaited<ReturnType<typeof open>>, calls: Call[], from: "board" | "first-run") {
+    const box = from === "board" ? screen.getByRole("textbox", { name: "New task" }) : screen.getByLabelText("What should Claude work on?");
+    expect(box.id).toBe(from === "board" ? "board-task" : "launch-task");
+    fireEvent.change(box, { target: { value: "Add search." } });
+    fireEvent.click(screen.getByRole("button", { name: "Start" }));
+    await waitFor(() => expect(calls).toHaveLength(2));
+
+    const events = sockets("/api/events").at(-1)!;
+    const arrive = (record: ReturnType<typeof workspace>) => act(() => events.deliver(JSON.stringify({ type: "record", protocol: 1, record })));
+    arrive(workspace(ME, "w9", "add search"));
+    arrive(terminal(ME, "t9", "w9", "running"));
+    arrive(session(ME, "s9", "w9", "t9", "working"));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/terminals/t9"));
+  }
+
+  const noSetup = "workspace w9 was made, but its setup could not be started: no holder";
+  const firstRun: UiMessage & { type: "state" } = { type: "state", protocol: 1, records: [sample(ME, 1)], settings: settings() };
+
+  it("keeps the daemon's warning on screen after a task from the board's box lands in its session, until it is dismissed", async () => {
+    const calls = mockActions(json(201, { id: "w9", error: noSetup }), json(201, { id: "s9" }));
+    const router = await open("/", live);
+
+    await startFromBox(router, calls, "board");
+
+    const alert = screen.getByRole("alert", { name: "Task warning" });
+    expect(alert.textContent).toContain("its setup could not be started");
+    fireEvent.click(within(alert).getByRole("button", { name: "Dismiss" }));
+    expect(screen.queryByRole("alert", { name: "Task warning" })).toBeNull();
+  });
+
+  it("keeps the daemon's warning on screen after a task from the first-run page lands in its session, until it is dismissed", async () => {
+    const calls = mockActions(json(201, { id: "w9", error: noSetup }), json(201, { id: "s9" }));
+    const router = await open("/", firstRun);
+
+    await startFromBox(router, calls, "first-run");
+
+    const alert = screen.getByRole("alert", { name: "Task warning" });
+    expect(alert.textContent).toContain("its setup could not be started");
+    fireEvent.click(within(alert).getByRole("button", { name: "Dismiss" }));
+    expect(screen.queryByRole("alert", { name: "Task warning" })).toBeNull();
+  });
+
+  it("shows no task warning when the create has none", async () => {
+    const calls = mockActions(json(201, { id: "w9" }), json(201, { id: "s9" }));
+    const router = await open("/", live);
+
+    await startFromBox(router, calls, "board");
+
+    expect(screen.queryByRole("alert", { name: "Task warning" })).toBeNull();
+  });
+
+  it("shows the daemon's warning as text, and a later task from the board's box clears it when it has none", async () => {
+    const said = "<b>machine</b> is over its limits";
+    const calls = mockActions(json(201, { id: "w9", warning: said }), json(201, { id: "s9" }), json(201, { id: "w10" }), json(201, { id: "s10" }));
+    const router = await open("/", live);
+
+    await startFromBox(router, calls, "board");
+    const alert = screen.getByRole("alert", { name: "Task warning" });
+    expect(alert.textContent).toContain(said);
+    expect(alert.querySelector("b")).toBeNull();
+
+    await act(() => router.navigate({ to: "/" }));
+    expect(screen.getByRole("alert", { name: "Task warning" })).toBeDefined();
+    fireEvent.change(screen.getByRole("textbox", { name: "New task" }), { target: { value: "Add sorting." } });
+    fireEvent.click(screen.getByRole("button", { name: "Start" }));
+    await waitFor(() => expect(calls).toHaveLength(4));
+    await waitFor(() => expect(screen.queryByRole("alert", { name: "Task warning" })).toBeNull());
+  });
+
   it("shows no first-run page before the daemon's state arrives", async () => {
     const fresh = createRouter({ routeTree, history: createMemoryHistory({ initialEntries: ["/"] }) });
     await fresh.load();
