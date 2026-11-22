@@ -8,7 +8,7 @@ disable-model-invocation: true
 
 A release is a pushed `vX.Y.Z` tag. `.github/workflows/release.yml` builds four archives (`foundryd-<arch>-<os>.tar.gz`), signs each with `RELEASE_SIGNING_KEY`, and creates the GitHub Release with generated notes. Every installed daemon checks for a higher tag every 10 minutes and installs it itself (`docs/install.md`, "Updates"). So the tag is the deploy: it reaches every machine within minutes, and a bad one is fixed only by a higher one.
 
-The workflow publishes nothing unless the tag is exactly `v` + the `version` in the root `Cargo.toml` `[workspace.package]`. It refuses a tag that already has a release, so each tag publishes once. A run that fails ships under the next patch, and tags on origin stay as they are.
+The workflow publishes nothing unless the tag is exactly `v` + the `version` in the root `Cargo.toml` `[workspace.package]`. It refuses a tag that already has a release, so each tag publishes once. A pushed tag is never moved or deleted: a failed run is either run again on the same tag (step 6) or, when the fix is a code change, replaced by the next patch.
 
 ## Arguments
 
@@ -40,7 +40,7 @@ Tell the user, in one short block: current version → new version (say whether 
 ## 3. Bump
 
 ```sh
-sed -i '' '/^\[workspace.package\]/,/^\[/ s/^version = ".*"/version = "X.Y.Z"/' Cargo.toml
+perl -pi -e 's/^version = ".*"/version = "X.Y.Z"/ if /^\[workspace\.package\]/ ... /^\[/' Cargo.toml
 cargo update --workspace --offline
 git diff --stat
 cargo metadata --no-deps --format-version 1 --locked | jq -r '.packages[] | select(.name=="foundryd") | .version'
@@ -67,32 +67,53 @@ Done when all pass. On a failure, show its output, put the tree back (`git check
 ```sh
 git commit -am "chore(release): vX.Y.Z"
 git tag vX.Y.Z
-git push origin main vX.Y.Z
+git push --atomic origin main vX.Y.Z
 ```
 
-The commit carries the change only, with no trailers. Push the tag yourself. The workflow creates the release, and one made first in the GitHub UI makes the run fail.
+`--atomic` pushes both refs or neither, so a refused `main` (origin moved since step 1) never leaves a tag that ships a commit `main` lacks. On that refusal, delete the local tag (`git tag -d vX.Y.Z`), drop the release commit (`git reset --hard HEAD~1`; step 1 left the tree clean, so it holds only the bump), and start again at step 1. The commit carries the change only, with no trailers. Push the tag yourself. The workflow creates the release, and one made first in the GitHub UI makes the run fail.
 
 ## 6. Watch it publish
 
+The run for this tag, not the newest release run (a tag push takes a few seconds to register a run):
+
 ```sh
-gh run list -R original-solutions/foundry --workflow release.yml --limit 1
-gh run watch <id> -R original-solutions/foundry --exit-status
+for i in $(seq 24); do
+  id=$(gh run list -R original-solutions/foundry --workflow release.yml --branch vX.Y.Z --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+  [ -n "$id" ] && break; sleep 5
+done; echo "run: ${id:-none after 2 minutes}"
+gh run watch "$id" -R original-solutions/foundry --exit-status
 gh release view vX.Y.Z -R original-solutions/foundry --json assets --jq '[.assets[].name]'
 ```
 
-Done when the run is green and the release lists 8 assets: an archive and its `.sig` for each of `aarch64-macos`, `x86_64-macos`, `aarch64-linux`, `x86_64-linux`. A red run: show the failing step's log (`gh run view <id> --log-failed`) and stop; the fix ships under the next patch.
+Done when the run is green and the release lists 8 assets: an archive and its `.sig` for each of `aarch64-macos`, `x86_64-macos`, `aarch64-linux`, `x86_64-linux`.
+
+A red run: show the failing step's log (`gh run view "$id" -R original-solutions/foundry --log-failed`) and tell the user which case it is. Rerun only on their yes.
+
+- **Failed before `Publish`** with a cause outside the code (a runner, a network fetch): nothing was released. Rerun the same tag: `gh run rerun "$id" -R original-solutions/foundry --failed`.
+- **Failed in `Publish`:** it can leave a draft release for the tag, and the rerun then fails on it. Delete the draft (`gh release delete vX.Y.Z -R original-solutions/foundry --yes`, never `--cleanup-tag`), then rerun as above. This is what the comment above `Publish` in `release.yml` says.
+- **Needs a code change** (a build or a check that fails on the tagged commit): the tag stays. Fix it on `main` and release the next patch.
 
 ## 7. See this machine take it
 
-Within about 10 minutes of the release:
+Within about 10 minutes of the release. The data directory is `FOUNDRY_HOME` as the service was installed with it, else `~/.local/share/foundry`; the port is `FOUNDRY_PORT`, else 7433:
 
 ```sh
-readlink ~/.local/share/foundry/current          # versions/X.Y.Z
-grep -E "installed vX.Y.Z|update check failed" ~/Library/Logs/foundry/foundryd.log | tail -3
-cat ~/.local/share/foundry/update.json            # "refused" stays null
+home="${FOUNDRY_HOME:-$HOME/.local/share/foundry}"
+readlink "$home/current"                          # versions/X.Y.Z
+log() { if [ "$(uname)" = Darwin ]; then cat ~/Library/Logs/foundry/foundryd.log; else journalctl -u foundryd --no-pager; fi; }
+log | grep -E "installed vX.Y.Z|is refused|did not become healthy|update check failed" | tail -5
+cat "$home/update.json"                           # "refused" stays null
+curl -s "127.0.0.1:${FOUNDRY_PORT:-7433}/api/machine"
 ```
 
-Done when `current` points at `versions/X.Y.Z` and the new daemon answers `curl -s 127.0.0.1:7433/api/machine`. A `refused` tag means the new version failed to start three times and was rolled back: read the log lines before the rollback and report them.
+Done when `current` points at `versions/X.Y.Z` and the new daemon answers on `/api/machine`.
+
+A `refused` tag in `update.json` has one of two causes, and the log line says which:
+
+- **Refused before install:** the signature did not verify, the archive has no `foundryd` or `foundry-holder`, or the new `foundryd --version` failed or printed another version. The line reads `vX.Y.Z is refused: <reason>`, and `current` never moved.
+- **Rolled back:** the new version installed but failed to start three times. The line reads `did not become healthy`, and `current` points at the previous version again.
+
+Report the line and its cause. `docs/install.md`, "Updates", has the full rules.
 
 ## Report
 
