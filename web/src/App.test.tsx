@@ -834,6 +834,7 @@ describe("App", () => {
     await open("/terminals/t7", {
       ...live,
       records: [...live.records, sample(OTHER, 1), workspace(OTHER, "w7", "far away"), terminal(OTHER, "t7", "w7", "running"), terminal(OTHER, "t8", "w7", "running")],
+      settings: settings({ machines: [{ id: ME, name: "studio", address: "" }, { id: OTHER, name: "laptop", address: "" }] }),
     });
     expect(within(screen.getByRole("tablist", { name: "Terminals in far away" })).getAllByRole("tab")).toHaveLength(2);
     expect(screen.queryByRole("button", { name: "New in far away" })).toBeNull();

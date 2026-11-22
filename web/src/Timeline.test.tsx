@@ -65,10 +65,13 @@ afterEach(() => {
 
 const traced = new Set(["s1", "s2", "s3"]);
 
+/** Both machines the records are on are listed, since a machine the list does not hold shows nothing. */
+const listed = () => settings({ machines: [{ id: ME, name: "studio", address: "" }, { id: OTHER, name: "laptop", address: "" }] });
+
 function show(onSteps = vi.fn()) {
   render(
     <QueryClientProvider client={new QueryClient()}>
-      <Timeline machines={fleet(records, settings())} traced={traced} onSteps={onSteps} />
+      <Timeline machines={fleet(records, listed())} traced={traced} onSteps={onSteps} />
     </QueryClientProvider>,
   );
   return onSteps;
@@ -83,7 +86,7 @@ async function watch(state: SessionState) {
   const client = new QueryClient();
   const at = (s: SessionState) => (
     <QueryClientProvider client={client}>
-      <Timeline machines={fleet(withS1(s), settings())} traced={traced} onSteps={vi.fn()} />
+      <Timeline machines={fleet(withS1(s), listed())} traced={traced} onSteps={vi.fn()} />
     </QueryClientProvider>
   );
   const view = render(at(state));
