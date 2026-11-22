@@ -20,6 +20,8 @@ pub mod store;
 pub mod sync;
 pub mod tailscale;
 pub mod terminals;
+#[cfg(test)]
+mod test_log;
 pub mod update;
 pub mod workspaces;
 
