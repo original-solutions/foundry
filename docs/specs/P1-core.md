@@ -127,7 +127,7 @@ Units, each with one job:
 | working | The agent is running a turn | A prompt was submitted or a tool is running |
 | waiting for you | The agent needs a permission answer or other input | The notification hook |
 | idle | The turn ended and the agent waits for the next prompt | The stop hook |
-| finished | The session ended normally | The session-end hook, or exit code 0 |
+| finished | The session ended normally | The session-end hook, unless its reason is `clear` or `resume` (`/clear` and `/resume` keep the session running), or exit code 0 |
 | failed | The process died or exited non-zero | The holder |
 | stuck | Working, with no terminal output and no hook event for 10 minutes | A timer in `sessions` |
 | unreachable | The owning machine is offline | `sync` |
