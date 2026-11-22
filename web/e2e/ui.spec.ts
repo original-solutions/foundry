@@ -20,6 +20,9 @@ test("start a task, use its workspace's shell, and see the same screen after a r
   // The fake agent takes the task as its first prompt and ends its turn.
   const session = workspace.getByRole("link", { name: idle });
   await expect(session).toBeVisible({ timeout: 60_000 });
+  await session.click();
+  await expect(page).toHaveURL(/\/terminals\/[0-9a-f-]+$/);
+  await expect(page.getByTestId(`pane-${page.url().split("/").at(-1)}`).locator(".xterm-rows")).toContainText('PROMPT="e2e work"');
 
   // A workspace's actions show while the pointer is over it.
   await workspace.hover();
