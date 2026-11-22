@@ -285,12 +285,30 @@ describe("Machines", () => {
       expect(calls[0].body).toEqual({ max_sessions: 5, max_load_per_core: 1.5, min_free_disk_gb: 4.3555 });
     });
 
+    it("fills a disk limit of a single byte over a gigabyte exactly and saves it unchanged", async () => {
+      const calls = mockFetch(new Response(null, { status: 204 }));
+      await showLimited(settings({ machines: twoMachines.machines, limits: { [ME]: { max_sessions: 4, max_load_per_core: 1.5, min_free_disk: 1_000_000_001 } } }));
+
+      open();
+      expect(diskField().value).toBe("1.000000001");
+      fireEvent.click(within(dialog()).getByRole("button", { name: "Save" }));
+
+      await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+      expect(calls[0].body).toEqual({ max_sessions: 4, max_load_per_core: 1.5, min_free_disk_gb: 1.000000001 });
+    });
+
+    it("shows a disk limit on the card to three decimals", async () => {
+      await showLimited(settings({ machines: twoMachines.machines, limits: { [ME]: { max_sessions: 4, max_load_per_core: 1.5, min_free_disk: 4_355_500_000 } } }));
+
+      expect(within(card("studio")).getByText("At most 4 sessions · load 1.5 per core · 4.356 GB disk free")).toBeDefined();
+    });
+
     it("says what the dialog does with each limit", async () => {
       await showLimited();
 
       open();
 
-      expect(within(dialog()).getByText(/less free disk than this/)).toBeDefined();
+      expect(within(dialog()).getByText("Placement skips this machine while it has this many sessions or more, this load per core or more, or less free disk than this.")).toBeDefined();
     });
 
     it("sends an empty field as null, which the daemon refuses", async () => {

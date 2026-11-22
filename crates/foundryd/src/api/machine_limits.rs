@@ -441,6 +441,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_most_sessions_a_u32_holds_is_taken() {
+        let served = Served::new(|_, _| {}).await;
+
+        let (status, body) = served
+            .limit(
+                served.me,
+                &wanted(json!(4_294_967_295_u64), json!(1), json!(1)),
+            )
+            .await;
+
+        assert_eq!(status, 204, "{body}");
+        assert_eq!(served.settings().limits[&served.me].max_sessions, u32::MAX);
+    }
+
+    #[tokio::test]
     async fn a_whole_number_written_with_a_fraction_is_taken_and_a_fractional_disk_is_exact() {
         let served = Served::new(|_, _| {}).await;
 
