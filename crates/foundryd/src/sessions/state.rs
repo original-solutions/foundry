@@ -178,6 +178,7 @@ mod tests {
             Hook::from_payload(&v)
         };
         assert_eq!(payload(Some("clear")), Some(Hook::Other));
+        assert_eq!(payload(Some("resume")), Some(Hook::Other));
         for reason in [
             None,
             Some("logout"),
