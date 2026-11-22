@@ -711,6 +711,77 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn a_key_the_list_drops_again_is_sent_again_only_after_a_while() {
+        let served = Served::new(|me, settings| {
+            settings
+                .machines
+                .push(machine(me, "Tom's desk", "100.91.54.18"));
+        })
+        .await;
+        let mut listing = served.listing();
+        listing.list(here("personal-mac", "100.91.54.18")).await;
+        assert_eq!(
+            served.settings().machines,
+            [own(served.me, "Tom's desk", "100.91.54.18")]
+        );
+        // An older acting machine numbered it, and its copy came back without the key.
+        let mut stripped = served.settings();
+        stripped.seq += 1;
+        stripped.machines[0].key.clear();
+        served
+            .store
+            .lock()
+            .unwrap()
+            .apply_settings(stripped)
+            .unwrap();
+        let seq = served.settings().seq;
+
+        listing.list(here("personal-mac", "100.91.54.18")).await;
+        tokio::time::sleep(KEY_AGAIN_AFTER / 2).await;
+        listing.list(here("personal-mac", "100.91.54.18")).await;
+        assert_eq!(
+            served.settings().seq,
+            seq,
+            "the key is not sent again at once"
+        );
+
+        tokio::time::sleep(KEY_AGAIN_AFTER / 2).await;
+        listing.list(here("personal-mac", "100.91.54.18")).await;
+        assert_eq!(
+            served.settings().machines,
+            [own(served.me, "Tom's desk", "100.91.54.18")]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_address_move_is_sent_at_once_while_a_dropped_key_waits() {
+        let served = Served::new(|me, settings| {
+            settings
+                .machines
+                .push(machine(me, "Tom's desk", "100.91.54.18"));
+        })
+        .await;
+        let mut listing = served.listing();
+        listing.list(here("personal-mac", "100.91.54.18")).await;
+        let mut stripped = served.settings();
+        stripped.seq += 1;
+        stripped.machines[0].key.clear();
+        served
+            .store
+            .lock()
+            .unwrap()
+            .apply_settings(stripped)
+            .unwrap();
+
+        listing.list(here("personal-mac", "100.64.0.9")).await;
+
+        assert_eq!(
+            served.settings().machines,
+            [own(served.me, "Tom's desk", "100.64.0.9")]
+        );
+    }
+
     #[tokio::test]
     async fn an_add_the_coordinator_cannot_send_is_warned_once_and_tried_again_each_look() {
         let logged = Logged::default();

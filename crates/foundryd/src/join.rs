@@ -2119,6 +2119,38 @@ mod tests {
         assert_eq!(held_key(&reopened, peer.me()), Some(peer.public_key()));
     }
 
+    #[tokio::test]
+    async fn a_listed_key_whose_save_failed_is_admitted_once_a_save_succeeds() {
+        let flaky = Arc::new(Flaky::default());
+        let host = Keys::open(flaky.clone()).unwrap();
+        let peer = machine_keys();
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path().join("foundry.db")).unwrap();
+        let settings = SharedSettings {
+            seq: 1,
+            machines: vec![listed(peer.me(), peer.public_key().hex())],
+            ..SharedSettings::default()
+        };
+        assert!(store.apply_settings(settings).unwrap());
+        let store = Arc::new(Mutex::new(store));
+        flaky.failing.store(true, Ordering::SeqCst);
+        let following = tokio::spawn({
+            let host = host.clone();
+            async move { host.follow(store).await }
+        });
+
+        tokio::time::sleep(RECHECK * 3).await;
+        assert_eq!(host.state(peer.me()), KeyState::NoKey);
+        // The settings do not change again: the next check tries the same list.
+        flaky.failing.store(false, Ordering::SeqCst);
+        let deadline = tokio::time::Instant::now() + RECHECK * 5;
+        while host.state(peer.me()) != KeyState::Active {
+            assert!(tokio::time::Instant::now() < deadline, "never admitted");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        following.abort();
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_listed_key_never_replaces_a_revocation_or_another_key_held() {
         let host = machine_keys();

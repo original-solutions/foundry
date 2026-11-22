@@ -466,6 +466,7 @@ mod tests {
             "{body}"
         );
         assert_eq!(answer["expires_in_secs"], CODE_VALID_FOR.as_secs());
+        assert_eq!(answer["address"], "127.0.0.1", "{body}");
         // An add changes nothing in the list until the code is used.
         assert_eq!(served.settings().machines.len(), 1);
     }
@@ -502,6 +503,7 @@ mod tests {
             (Some("build-box"), None),
             (None, Some("100.64.0.7")),
             (Some(" "), Some("100.64.0.7")),
+            (Some("build-box"), Some(" ")),
         ] {
             let served = Served::new(|_, _| {}).await;
             let joining = Keys::open(Arc::new(MemorySecrets::default())).unwrap();
@@ -593,6 +595,60 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(served.settings().seq, seq);
+    }
+
+    #[tokio::test]
+    async fn a_join_whose_sent_name_or_address_another_machine_has_is_listed_as_typed() {
+        for (name, address) in [(" BUILD-box ", "100.64.0.7"), ("studio", "100.64.0.9")] {
+            let other = MachineId::random();
+            let served = Served::new(move |_, settings| {
+                settings
+                    .machines
+                    .push(machine(other, "build-box", "100.64.0.9"));
+            })
+            .await;
+            // Caught up with it, so this machine numbers an edit at once.
+            served.hear_sending(other, Some(served.settings())).await;
+            let joining = Keys::open(Arc::new(MemorySecrets::default())).unwrap();
+            let code = served.code_for("127.0.0.1").await;
+
+            let (status, body) = served
+                .join_as(&code, &joining, Some(name), Some(address))
+                .await;
+
+            assert_eq!(status, 200, "{name:?} at {address}: {body}");
+            assert_eq!(
+                served.held(joining.me()),
+                Some(keyed(&joining, "127.0.0.1", "127.0.0.1")),
+                "{name:?} at {address}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sent_name_or_address_outside_the_rules_is_listed_as_typed() {
+        let long = "n".repeat(crate::api::machine_names::NAME_AT_MOST + 1);
+        for (name, address) in [
+            (long.as_str(), "100.64.0.7"),
+            ("build\tbox", "100.64.0.7"),
+            ("build-box", "relay.example.com"),
+            ("build-box", "203.0.113.9"),
+        ] {
+            let served = Served::new(|_, _| {}).await;
+            let joining = Keys::open(Arc::new(MemorySecrets::default())).unwrap();
+            let code = served.code_for("127.0.0.1").await;
+
+            let (status, body) = served
+                .join_as(&code, &joining, Some(name), Some(address))
+                .await;
+
+            assert_eq!(status, 200, "{name:?} at {address}: {body}");
+            assert_eq!(
+                served.held(joining.me()),
+                Some(keyed(&joining, "127.0.0.1", "127.0.0.1")),
+                "{name:?} at {address}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -719,7 +775,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_second_code_for_the_same_name_lists_nobody_once_the_first_is_used() {
+    async fn a_second_code_for_the_same_name_is_503_once_the_first_is_used_and_lists_nobody() {
         let served = Served::new(|_, _| {}).await;
         let (first, second) = (
             Keys::open(Arc::new(MemorySecrets::default())).unwrap(),
@@ -734,7 +790,9 @@ mod tests {
         served
             .hear_sending(first.me(), Some(served.settings()))
             .await;
-        assert_eq!(served.join(&second_code, &second).await.0, 200);
+        let (status, body) = served.join(&second_code, &second).await;
+        assert_eq!(status, 503, "{body}");
+        assert!(error_of(&body).contains("127.0.0.1"), "{body}");
 
         tokio::time::sleep(Duration::from_millis(300)).await;
         let machines = served.settings().machines;
@@ -750,7 +808,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_name_or_an_address_listed_after_the_code_was_made_lists_nobody() {
+    async fn a_name_or_an_address_listed_after_the_code_was_made_is_503_and_lists_nobody() {
         // Listed while the code was open, as a rename or another join does.
         for (name, address) in [(" 127.0.0.1 ", "100.64.0.2"), ("trilogy-mac", "127.0.0.1")] {
             let served = Served::new(|_, _| {}).await;
@@ -767,9 +825,9 @@ mod tests {
             // Caught up with it, so this machine numbers an edit at once.
             served.hear_sending(listed, Some(served.settings())).await;
 
-            assert_eq!(served.join(&code, &joining).await.0, 200);
+            let (status, body) = served.join(&code, &joining).await;
+            assert_eq!(status, 503, "{name:?} at {address}: {body}");
 
-            tokio::time::sleep(Duration::from_millis(300)).await;
             let machines = served.settings().machines;
             assert!(
                 !machines.iter().any(|m| m.id == joining.me()),

@@ -857,6 +857,52 @@ async fn the_daemon_dials_a_peer_through_the_key_handshake() {
     assert_eq!(said["type"], "challenge", "first frame: {first}");
 }
 
+#[tokio::test]
+async fn the_daemon_admits_a_key_its_machine_list_carries_and_dials_that_peer() {
+    let mut fixture = Fixture::new();
+    let other = tempfile::tempdir().unwrap();
+    let peer = Keys::open(Arc::new(FileSecrets::new(
+        other.path().join("secrets.json"),
+    )))
+    .unwrap();
+    let peer_id = peer.me();
+    // The key table does not hold the peer: only its machine-list entry carries its key.
+    fixture.seed(|settings| {
+        settings.machines.push(Machine {
+            id: peer_id,
+            name: "peer".into(),
+            address: "::1".into(),
+            key: peer.public_key().hex().to_owned(),
+        });
+    });
+    let listener = loop {
+        let listener = tokio::net::TcpListener::bind(("::1", fixture.port))
+            .await
+            .expect("::1 must be bindable for this test: it plays the peer at address ::1");
+        if fixture.try_start() {
+            break listener;
+        }
+        fixture.port = free_port();
+    };
+
+    let first = tokio::time::timeout(Duration::from_secs(20), async {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        loop {
+            match socket.next().await {
+                Some(Ok(Message::Text(text))) => return text.as_str().to_owned(),
+                Some(Ok(_)) => {}
+                other => panic!("the link ended before a first frame: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("the daemon did not dial the peer its list carries the key of");
+
+    let said: serde_json::Value = serde_json::from_str(&first).unwrap();
+    assert_eq!(said["type"], "challenge", "first frame: {first}");
+}
+
 /// A secret read that never returns, as one from a disk that does not answer does: the secret
 /// store's file is a FIFO the test holds open and never writes to.
 #[test]

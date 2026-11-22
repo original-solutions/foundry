@@ -1526,6 +1526,27 @@ mod tests {
     }
 
     #[test]
+    fn a_copy_that_dropped_a_machines_key_does_not_take_it_from_the_same_edit() {
+        let c = Machine {
+            id: id(9),
+            name: "c".into(),
+            address: "100.64.0.9".into(),
+            key: "ab".repeat(32),
+        };
+        let keyed = numbered(&base(), &Edit::SetMachine { machine: c.clone() }, id(A));
+        // As a machine from before keys were listed holds the same edit.
+        let mut stripped = keyed.clone();
+        for m in &mut stripped.machines {
+            m.key.clear();
+        }
+
+        let out = merged(&keyed, &stripped);
+
+        assert!(out.machines.contains(&c), "{:?}", out.machines);
+        assert!(out.overwritten.is_empty());
+    }
+
+    #[test]
     fn after_a_split_the_side_with_the_higher_number_holds_and_an_item_shows_both() {
         let id7 = project(7, "x").id;
         // Side a: one edit. Side b: an unrelated edit, then the same setting, later.
