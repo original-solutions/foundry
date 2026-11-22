@@ -250,11 +250,6 @@ pub fn router(coordinator: Arc<Coordinator>, store: Arc<Mutex<Store>>) -> Router
         .with_state(Arc::new(Names { coordinator, store }))
 }
 
-/// Whether `raw` passes [`checked_name`]'s rule for a machine's name.
-pub(crate) fn is_name(raw: &str) -> bool {
-    checked_name(raw, "").is_ok()
-}
-
 /// `raw` trimmed, or `422` when it is blank (answered with `blank`), over [`NAME_AT_MOST`]
 /// characters or holds a control character: the one rule for a machine's name, on a rename
 /// and on an add.

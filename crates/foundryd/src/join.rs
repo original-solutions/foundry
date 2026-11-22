@@ -53,7 +53,6 @@ use tokio::time::{Instant, timeout};
 
 use crate::api::machine_add::Lister;
 use crate::api::machine_names;
-use crate::api::machine_names::{NAME_AT_MOST, is_name};
 use crate::secrets::{self, Secrets, SecretsError};
 use crate::store::{Store, StoreError};
 use crate::sync::{Conn, Dialer, OFFLINE_AFTER, Peers, on_store};
@@ -1200,10 +1199,11 @@ async fn forward(from: &mut Receiver<String>, to: &Sender<String>) {
 /// A code made for a named machine, by the add route, also lists the machine through
 /// `lister` before the answer, with its key: under the name and address the request sends, the
 /// entry the joining machine lists itself under, or, from a `foundryd join` that sends no name
-/// or no address, under the name typed and the address it resolved to. A sent name that breaks
-/// the rule for a machine's name, a sent address that is not a Tailscale or loopback IP, and a
-/// listing that fails are `503` `{"error"}`, and the code stays valid for that machine. A code
-/// made by [`Keys::new_code`] lists nothing.
+/// or no address, under the name typed and the address it resolved to. A listing that fails is
+/// `503` `{"error"}`, and the code stays valid for that machine. A sent name with a control
+/// character, or a sent address that is not a Tailscale or loopback IP, which a machine's own
+/// entry never holds, is `503` too, before the code is used or the key is kept. A code made by
+/// [`Keys::new_code`] lists nothing.
 pub fn router(keys: Keys, lister: Lister) -> Router {
     Router::new()
         .route(JOIN_PATH, post(redeem))
@@ -1238,20 +1238,18 @@ struct JoinRequest {
 }
 
 impl JoinRequest {
-    /// The entry the machine is listed under once it joins with a code made for `named`: the
-    /// one it sent, the entry it lists itself under, or, when it sent no name or no address (a
-    /// blank one counts as none), the name typed at the address it resolved to. A sent name that
-    /// breaks the rule for a machine's name, or a sent address that is not a Tailscale or
-    /// loopback IP, which a machine's own entry never holds, gives why.
-    fn entry(&self, named: Named) -> Result<Machine, String> {
+    /// The entry the machine lists itself under, as it sent it, or none when it sent no name
+    /// or no address (a blank one counts as none). The rule is the one a machine's own entry
+    /// keeps ([`entry`](crate::api::machine_names::entry)): a name of any length with no
+    /// control character, at a Tailscale or loopback IP. One that breaks it gives why.
+    fn sent(&self) -> Result<Option<Machine>, String> {
         let sent = |field: &Option<String>| field.clone().filter(|f| !f.trim().is_empty());
         let (Some(name), Some(address)) = (sent(&self.name), sent(&self.address)) else {
-            return Ok(self.listed(named.name, named.address.to_string()));
+            return Ok(None);
         };
-        if !is_name(&name) {
+        if name.chars().any(char::is_control) {
             return Err(format!(
-                "the name this machine sent, {name:?}, is over {NAME_AT_MOST} characters or \
-                 holds a control character"
+                "the name this machine sent, {name:?}, holds a control character"
             ));
         }
         let joins = address
@@ -1262,7 +1260,7 @@ impl JoinRequest {
                 "the address this machine sent, {address:?}, is not a Tailscale or loopback IP"
             ));
         }
-        Ok(self.listed(name, address))
+        Ok(Some(self.listed(name, address)))
     }
 
     fn listed(&self, name: String, address: String) -> Machine {
@@ -1280,6 +1278,17 @@ async fn redeem(
     ConnectInfo(sender): ConnectInfo<SocketAddr>,
     Json(request): Json<JoinRequest>,
 ) -> Response {
+    // Refused before the code is used or the key kept, so a retry can only find what it found.
+    let sent = match request.sent() {
+        Ok(sent) => sent,
+        Err(why) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": why })),
+            )
+                .into_response();
+        }
+    };
     let keys = joining.keys.clone();
     let answer = JoinAnswer {
         machine: keys.me(),
@@ -1291,9 +1300,12 @@ async fn redeem(
         tokio::task::spawn_blocking(move || keys.redeem(&code, machine, &key, sender.ip())).await;
     match redeemed {
         Ok(Ok(named)) => {
-            let listed = match named.map(|named| request.entry(named)) {
-                Some(Ok(entry)) => joining.lister.list(entry).await,
-                Some(Err(why)) => Err(why),
+            let listed = match named {
+                Some(named) => {
+                    let entry = sent
+                        .unwrap_or_else(|| request.listed(named.name, named.address.to_string()));
+                    joining.lister.list(entry).await
+                }
                 None => Ok(()),
             };
             match listed {
