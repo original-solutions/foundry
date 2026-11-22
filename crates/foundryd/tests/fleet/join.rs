@@ -73,7 +73,7 @@ async fn a_machine_added_by_name_is_listed_under_that_name_once_it_joins_and_lin
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let lister = machine_add::Lister::new(coordinator, a.store.clone());
-    let app = join::router(a.keys.clone(), Some(lister))
+    let app = join::router(a.keys.clone(), lister)
         .merge(machine_add::router(a.keys.clone(), a.store.clone()));
     tokio::spawn(async move {
         axum::serve(
@@ -208,7 +208,7 @@ impl Member {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let lister = machine_add::Lister::new(self.coordinator.clone(), self.store.clone());
-        let app = join::router(self.keys.clone(), Some(lister))
+        let app = join::router(self.keys.clone(), lister)
             .merge(machine_add::router(self.keys.clone(), self.store.clone()));
         tokio::spawn(async move {
             axum::serve(
