@@ -142,6 +142,18 @@ pub fn write_curl_config(path: &Path, url: &str, token: &str) -> Result<(), Sess
     write_new_private(path, config.as_bytes())
 }
 
+/// The bearer token in the curl config [`write_curl_config`] wrote at `path`, or `None` when
+/// the file cannot be read or holds no `Authorization: Bearer` header line.
+pub fn curl_token(path: &Path) -> Option<String> {
+    let config = std::fs::read_to_string(path).ok()?;
+    config.lines().find_map(|line| {
+        line.strip_prefix("header = \"Authorization: Bearer ")?
+            .strip_suffix('"')
+            .filter(|token| !token.is_empty())
+            .map(str::to_owned)
+    })
+}
+
 /// [`mark_trusted`] while holding `lock`, so two marks made by this process never read the file
 /// at the same time and one overwrite the other.
 pub fn mark_trusted_locked(

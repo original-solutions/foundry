@@ -263,6 +263,7 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
             gateway,
         },
     ));
+    sessions.adopt().await;
 
     let dialer = KeyedDialer::new(Arc::new(WsDialer { port }), keys.clone());
     let peers = Peers::new(me, store.clone(), Arc::new(dialer));
