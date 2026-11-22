@@ -1,7 +1,8 @@
 //! Adding a machine by its Tailscale name, from the UI: `POST /api/machines/add` `{name}`.
 //!
-//! The name is trimmed. One that is blank or over [`NAME_AT_MOST`] characters is `422`, and so
-//! is one that resolves to no Tailscale address, by the rule `foundryd join` sends a code by
+//! The name is trimmed. One that is blank, over [`NAME_AT_MOST`](super::machine_names::NAME_AT_MOST) characters or holds a control
+//! character is `422`, by the rename route's rule ([`checked_name`]), and so is one that
+//! resolves to no Tailscale address, by the rule `foundryd join` sends a code by
 //! ([`join_targets`]). Loopback counts only on a machine listed at a loopback address, as a
 //! fleet run on one machine is. A name a listed machine has, compared trimmed and in any case,
 //! is `409`, and so is a name that resolves to a listed machine's address. A machine the list
@@ -31,7 +32,7 @@ use foundry_proto::settings::{Edit, Machine};
 use serde::Deserialize;
 use tokio::sync::oneshot;
 
-use super::machine_names::NAME_AT_MOST;
+use super::machine_names::checked_name;
 use super::{ApiError, Body, on_store, unprocessable};
 use crate::coordinator::Coordinator;
 use crate::join::{CODE_VALID_FOR, DEFAULT_PORT, JoinError, Keys, join_targets};
@@ -66,17 +67,7 @@ async fn add(
     State(adding): State<Arc<Adding>>,
     Body(add): Body<Add>,
 ) -> Result<Response, ApiError> {
-    let name = add.name.trim().to_owned();
-    if name.is_empty() {
-        return Err(unprocessable(
-            "type the new machine's Tailscale name".to_owned(),
-        ));
-    }
-    if name.chars().count() > NAME_AT_MOST {
-        return Err(unprocessable(format!(
-            "a machine's name is at most {NAME_AT_MOST} characters"
-        )));
-    }
+    let name = checked_name(&add.name, "type the new machine's Tailscale name")?.to_owned();
     let settings = on_store(&adding.store, |store| store.settings()).await?;
     let wanted = name.to_lowercase();
     if let Some(other) = settings
@@ -625,6 +616,11 @@ mod tests {
         let (status, body) = served.add(&"a".repeat(61)).await;
         assert_eq!(status, 422, "{body}");
         assert!(error_of(&body).contains("at most 60 characters"), "{body}");
+        // A name with a control character is refused by the rename route's rule, before any
+        // lookup.
+        let (status, body) = served.add("trilogy\tmac").await;
+        assert_eq!(status, 422, "{body}");
+        assert!(error_of(&body).contains("control characters"), "{body}");
     }
 
     #[tokio::test]

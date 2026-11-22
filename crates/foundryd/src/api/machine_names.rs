@@ -212,20 +212,13 @@ pub fn router(coordinator: Arc<Coordinator>, store: Arc<Mutex<Store>>) -> Router
         .with_state(Arc::new(Names { coordinator, store }))
 }
 
-#[derive(Deserialize)]
-struct Rename {
-    name: String,
-}
-
-async fn rename(
-    State(names): State<Arc<Names>>,
-    Path(id): Path<String>,
-    Body(rename): Body<Rename>,
-) -> Result<Response, ApiError> {
-    let id = parse_id(&id, "machine", MachineId)?;
-    let name = rename.name.trim();
+/// `raw` trimmed, or `422` when it is blank (answered with `blank`), over [`NAME_AT_MOST`]
+/// characters or holds a control character: the one rule for a machine's name, on a rename
+/// and on an add.
+pub(super) fn checked_name<'a>(raw: &'a str, blank: &str) -> Result<&'a str, ApiError> {
+    let name = raw.trim();
     if name.is_empty() {
-        return Err(unprocessable("a machine needs a name".to_owned()));
+        return Err(unprocessable(blank.to_owned()));
     }
     if name.chars().count() > NAME_AT_MOST {
         return Err(unprocessable(format!(
@@ -237,6 +230,21 @@ async fn rename(
             "a machine's name holds no line breaks, tabs or other control characters".to_owned(),
         ));
     }
+    Ok(name)
+}
+
+#[derive(Deserialize)]
+struct Rename {
+    name: String,
+}
+
+async fn rename(
+    State(names): State<Arc<Names>>,
+    Path(id): Path<String>,
+    Body(rename): Body<Rename>,
+) -> Result<Response, ApiError> {
+    let id = parse_id(&id, "machine", MachineId)?;
+    let name = checked_name(&rename.name, "a machine needs a name")?;
     let settings = on_store(&names.store, |store| store.settings()).await?;
     let Some(held) = settings.machines.iter().find(|m| m.id == id) else {
         return Err(ApiError::NotFound(format!(
