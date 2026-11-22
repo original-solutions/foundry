@@ -78,6 +78,17 @@ describe("WaitingList", () => {
     expect(within(list).getByText(waiting.reasons[0])).toBeTruthy();
   });
 
+  it("starts folded when told to, and opens to its requests", async () => {
+    lists = [[waiting]];
+    await renderApp(<WaitingList folded />);
+    const list = await screen.findByRole("region", { name: "Waiting for a machine" });
+    const toggle = within(list).getByRole("button", { name: /1 waiting for a machine/ });
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(within(list).queryByText(waiting.reasons[0])).toBeNull();
+    fireEvent.click(toggle);
+    expect(within(list).getByText(waiting.reasons[0])).toBeTruthy();
+  });
+
   it("cancels a request and drops it from the list", async () => {
     lists = [[waiting], []];
     await renderApp(<WaitingList />);

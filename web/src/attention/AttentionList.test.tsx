@@ -121,6 +121,16 @@ describe("AttentionList", () => {
     expect(screen.getByText(waiting.what)).toBeTruthy();
   });
 
+  it("starts folded when told to, and opens to its items", async () => {
+    lists = [[waiting]];
+    await renderApp(<AttentionList folded />);
+    const toggle = await screen.findByRole("button", { name: /1 needs attention/ });
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByText(waiting.what)).toBeNull();
+    fireEvent.click(toggle);
+    expect(screen.getByText(waiting.what)).toBeTruthy();
+  });
+
   it("shows an item of a kind this build does not know by its kind", async () => {
     lists = [[{ ...waiting, id: "lease_lost:p1", kind: "lease_lost", terminal: null }]];
     await renderApp(<AttentionList />);
