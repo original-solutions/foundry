@@ -537,6 +537,23 @@ mod tests {
     }
 
     #[test]
+    fn the_token_is_read_back_from_the_curl_config_and_is_none_with_no_bearer_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions").join("s.curl");
+        write_curl_config(&path, URL, TOKEN).unwrap();
+        assert_eq!(curl_token(&path).as_deref(), Some(TOKEN));
+
+        let bare = dir.path().join("bare.curl");
+        std::fs::write(
+            &bare,
+            format!("header = \"Content-Type: application/json\"\nurl = \"{URL}\"\n"),
+        )
+        .unwrap();
+        assert_eq!(curl_token(&bare), None);
+        assert_eq!(curl_token(&dir.path().join("missing.curl")), None);
+    }
+
+    #[test]
     fn trust_marks_made_at_once_through_one_lock_are_all_kept() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join(".claude.json");

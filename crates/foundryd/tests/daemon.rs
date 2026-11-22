@@ -25,9 +25,9 @@ use std::time::{Duration, Instant};
 
 use foundry_proto::ids::{MachineId, ProjectId, TerminalId};
 use foundry_proto::messages::{PROTOCOL, PeerMessage, UiMessage};
-use foundry_proto::record::{AnyRecord, MachineSample, Record};
+use foundry_proto::record::{AnyRecord, MachineSample, Record, Session};
 use foundry_proto::settings::{Machine, Project, SharedSettings};
-use foundry_proto::state::TerminalState;
+use foundry_proto::state::{SessionState, TerminalState};
 use foundryd::join::{KeyedDialer, Keys};
 use foundryd::secrets::{FileSecrets, Secrets};
 use foundryd::store::Store;
@@ -1110,6 +1110,172 @@ fn a_waiting_for_you_item_is_listed_within_5_seconds_of_the_hook() {
         item["what"].as_str().unwrap().contains("waiting for you"),
         "{item}"
     );
+}
+
+/// Makes `claude` on the daemon's `PATH` the fake agent acting out `script`, and gives the
+/// daemon a gateway, so a session can start.
+fn fake_claude(fixture: &mut Fixture, script: &str) {
+    FileSecrets::new(fixture.home.path().join("secrets.json"))
+        .set("gateway", "sk-test-restart-0123456789")
+        .unwrap();
+    fixture.gateway_url = Some("http://gw.invalid:8317".into());
+    let bin = fixture.user.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let steps = fixture.user.path().join("agent.yaml");
+    fs::write(&steps, script).unwrap();
+    let agent = Path::new(env!("CARGO_BIN_EXE_foundryd")).with_file_name("foundry-fake-agent");
+    assert!(
+        agent.exists(),
+        "run `cargo test --workspace` to build the fake agent"
+    );
+    let claude = bin.join("claude");
+    fs::write(
+        &claude,
+        format!(
+            "#!/bin/sh\nexec {} --script {} \"$@\"\n",
+            agent.display(),
+            steps.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).unwrap();
+    fixture.path_first = Some(bin);
+}
+
+/// Starts a session in a new workspace of a new project, and gives its id.
+fn started_session(fixture: &mut Fixture) -> String {
+    let project = fixture.project();
+    fixture.seed(|settings| settings.projects.push(project.clone()));
+    fixture.start();
+    let workspace = fixture.workspace(&project);
+    let (status, body) = fixture.call(
+        "POST",
+        &format!("/api/workspaces/{workspace}/sessions"),
+        Some(serde_json::json!({"model": "opus"})),
+    );
+    assert_eq!(status, 201, "{body}; {}", fixture.log());
+    id_of(&body)
+}
+
+/// Waits for session `id`'s record to be in one of `states`, and gives it.
+fn wait_for_session(fixture: &Fixture, id: &str, states: &[SessionState]) -> Record<Session> {
+    let found = || {
+        fixture
+            .state()?
+            .into_iter()
+            .find_map(|record| match record {
+                AnyRecord::Session(r) if r.body.id.to_string() == id => Some(r),
+                _ => None,
+            })
+    };
+    let end = Instant::now() + WAIT;
+    loop {
+        let record = found();
+        if let Some(record) = record.as_ref().filter(|r| states.contains(&r.body.state)) {
+            return record.clone();
+        }
+        assert!(
+            Instant::now() < end,
+            "session {id} is not {states:?} but {:?}; {}",
+            record.map(|r| r.body.state),
+            fixture.log()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Waits for this machine's sample written after `version` that counts no session.
+fn wait_for_no_sessions_after(fixture: &Fixture, version: u64) {
+    wait_for("a newer machine sample with no session", || {
+        fixture
+            .state()?
+            .into_iter()
+            .find_map(|record| match record {
+                AnyRecord::MachineSample(s) if s.version > version && s.body.sessions == 0 => {
+                    Some(())
+                }
+                _ => None,
+            })
+    });
+}
+
+#[test]
+fn a_session_keeps_reporting_after_the_daemon_restarts() {
+    let mut fixture = Fixture::new();
+    fake_claude(
+        &mut fixture,
+        "- hook: {event: SessionStart}\n- hook: {event: UserPromptSubmit, prompt: \"tidy up\"}\n- sleep_ms: 8000\n- hook: {event: Stop}\n- sleep_ms: 600000\n",
+    );
+    let session = started_session(&mut fixture);
+    let working = wait_for_session(&fixture, &session, &[SessionState::Working]);
+    let curl = fixture
+        .home
+        .path()
+        .join("sessions")
+        .join(format!("{session}.curl"));
+    let config = fs::read_to_string(&curl).unwrap();
+    let token = config
+        .lines()
+        .find_map(|line| line.strip_prefix("header = \"Authorization: Bearer "))
+        .and_then(|rest| rest.strip_suffix('"'))
+        .unwrap()
+        .to_owned();
+
+    let port = fixture.port;
+    assert_eq!(fixture.stop(), Some(0));
+    fixture.start();
+    assert_eq!(fixture.port, port, "the daemon came back on another port");
+
+    let idle = wait_for_session(&fixture, &session, &[SessionState::Idle]);
+    assert_eq!(idle.body.terminal, working.body.terminal);
+
+    let url = format!("http://127.0.0.1:{}/hooks/{session}", fixture.port);
+    let refused = Fixture::agent()
+        .post(&url)
+        .header("Authorization", "Bearer 0123456789abcdef0123456789abcdef")
+        .send_json(serde_json::json!({"hook_event_name": "UserPromptSubmit"}))
+        .unwrap();
+    assert_eq!(refused.status().as_u16(), 403, "a wrong token");
+
+    let (status, body) = fixture.call(
+        "POST",
+        &format!("/api/terminals/{}/close", idle.body.terminal),
+        None,
+    );
+    assert_eq!(status, 204, "{body}");
+    let ended = wait_for_session(
+        &fixture,
+        &session,
+        &[SessionState::Finished, SessionState::Failed],
+    );
+    wait_for_no_sessions_after(&fixture, ended.version);
+    assert!(!fixture.log().contains(&token), "the token reached the log");
+}
+
+#[test]
+fn a_session_whose_agent_ended_while_the_daemon_was_down_is_ended_at_start() {
+    let mut fixture = Fixture::new();
+    fake_claude(
+        &mut fixture,
+        "- hook: {event: SessionStart}\n- hook: {event: UserPromptSubmit, prompt: \"tidy up\"}\n- sleep_ms: 3000\n",
+    );
+    let session = started_session(&mut fixture);
+    wait_for_session(&fixture, &session, &[SessionState::Working]);
+
+    assert_eq!(fixture.stop(), Some(0));
+    std::thread::sleep(Duration::from_secs(5));
+    fixture.start();
+
+    let ended = wait_for_session(
+        &fixture,
+        &session,
+        &[SessionState::Finished, SessionState::Failed],
+    );
+    wait_for_no_sessions_after(&fixture, ended.version);
+    let dir = fixture.home.path().join("sessions");
+    for file in [format!("{session}.json"), format!("{session}.curl")] {
+        assert!(!dir.join(&file).exists(), "{file} is still there");
+    }
 }
 
 #[test]
