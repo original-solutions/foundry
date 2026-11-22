@@ -693,6 +693,7 @@ async fn the_daemons_peer_route_refuses_a_link_with_no_key_proof() {
             id: peer,
             name: "peer".into(),
             address: "127.0.0.2".into(),
+            key: String::new(),
         });
     });
     fixture.start();
@@ -823,6 +824,7 @@ async fn the_daemon_dials_a_peer_through_the_key_handshake() {
             id: peer_id,
             name: "peer".into(),
             address: "::1".into(),
+            key: String::new(),
         });
     });
     // The daemon listens on 127.0.0.1 and Tailscale addresses only, so this port is free here.
@@ -920,6 +922,7 @@ async fn keyed_peer_link(fixture: &mut Fixture) -> (Conn, MachineId, TempDir) {
             id: mine.me(),
             name: "daemon".into(),
             address: "127.0.0.1".into(),
+            key: String::new(),
         }
     };
     fixture.seed(|settings| {
@@ -927,6 +930,7 @@ async fn keyed_peer_link(fixture: &mut Fixture) -> (Conn, MachineId, TempDir) {
             id: peer_id,
             name: "peer".into(),
             address: "127.0.0.2".into(),
+            key: String::new(),
         });
     });
     fixture.start();

@@ -1346,6 +1346,7 @@ mod tests {
                 id: *id,
                 name: format!("m{i}"),
                 address: format!("100.64.0.{i}"),
+                key: String::new(),
             })
             .collect();
         SharedSettings {
@@ -1502,6 +1503,7 @@ mod tests {
             id: id(9),
             name: "c".into(),
             address: "100.64.0.9".into(),
+            key: String::new(),
         };
         held = numbered(&held, &Edit::SetMachine { machine: c.clone() }, id(A));
         assert!(held.machines.contains(&c));

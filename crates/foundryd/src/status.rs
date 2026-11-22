@@ -269,6 +269,7 @@ mod tests {
                     id: *id,
                     name: (*name).into(),
                     address: "100.64.0.1".into(),
+                    key: String::new(),
                 })
                 .collect(),
             ..SharedSettings::default()

@@ -579,6 +579,7 @@ async fn a_relay_naming_another_machine_than_the_one_proved_is_refused() {
         id: b.keys.me(),
         name: "b".into(),
         address: "127.0.0.1".into(),
+        key: String::new(),
     };
     let mut conn = dialer.dial(&to_b).await.expect("both keys are proved");
     let relay = PeerMessage::Relay {

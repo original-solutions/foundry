@@ -1864,6 +1864,7 @@ mod tests {
             id,
             name: format!("m-{id}"),
             address: "127.0.0.1".into(),
+            key: String::new(),
         }
     }
 

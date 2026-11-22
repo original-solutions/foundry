@@ -169,6 +169,7 @@ impl Listing {
                 id: self.me,
                 name: entry.name,
                 address: entry.address,
+                key: String::new(),
             },
             Some(held) if held.address != entry.address => Machine {
                 address: entry.address,
@@ -519,6 +520,7 @@ mod tests {
             id,
             name: name.into(),
             address: address.into(),
+            key: String::new(),
         }
     }
 

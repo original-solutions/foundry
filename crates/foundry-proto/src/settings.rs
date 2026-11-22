@@ -310,6 +310,10 @@ pub struct Machine {
     pub name: String,
     /// Its Tailscale address.
     pub address: String,
+    /// Its Ed25519 public key, as hex, so every machine admits it. Empty in an entry from a
+    /// machine before keys were listed.
+    #[serde(default)]
+    pub key: String,
 }
 
 /// A repo and a name.
@@ -347,11 +351,13 @@ pub(crate) mod tests {
                     id: mac,
                     name: "trilogy-mac".into(),
                     address: "100.64.0.1".into(),
+                    key: String::new(),
                 },
                 Machine {
                     id: vps,
                     name: "vps".into(),
                     address: "100.64.0.2".into(),
+                    key: String::new(),
                 },
             ],
             priority: vec![vps, mac],
@@ -460,6 +466,7 @@ pub(crate) mod tests {
                 id: mac,
                 name: "m".into(),
                 address: "100.64.0.1".into(),
+                key: String::new(),
             }],
             priority: vec![mac],
             projects: vec![Project {

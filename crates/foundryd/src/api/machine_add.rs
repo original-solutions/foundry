@@ -210,6 +210,7 @@ async fn list_when_used(
         id,
         name,
         address: address.to_string(),
+        key: String::new(),
     };
     if let Err(error) = coordinator.edit(Edit::SetMachine { machine }).await {
         tracing::warn!("machine {id} joined, but it could not be listed: {error}");
@@ -417,6 +418,7 @@ mod tests {
             id,
             name: name.into(),
             address: address.into(),
+            key: String::new(),
         }
     }
 
