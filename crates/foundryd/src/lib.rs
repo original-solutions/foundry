@@ -17,6 +17,7 @@ pub mod sessions;
 pub mod status;
 pub mod store;
 pub mod sync;
+pub mod tailscale;
 pub mod terminals;
 pub mod update;
 pub mod workspaces;
