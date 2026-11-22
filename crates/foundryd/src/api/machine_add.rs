@@ -635,10 +635,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_sent_name_or_address_outside_the_rules_is_503_and_lists_nothing() {
-        let long = "n".repeat(crate::api::machine_names::NAME_AT_MOST + 1);
+    async fn a_long_sent_name_is_listed_as_sent_as_the_machine_lists_itself() {
+        let long = "n".repeat(crate::api::machine_names::NAME_AT_MOST + 3);
+        let served = Served::new(|_, _| {}).await;
+        let joining = Keys::open(Arc::new(MemorySecrets::default())).unwrap();
+        let code = served.code_for("127.0.0.1").await;
+
+        let (status, body) = served
+            .join_as(&code, &joining, Some(&long), Some("100.64.0.7"))
+            .await;
+
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(
+            served.held(joining.me()),
+            Some(keyed(&joining, &long, "100.64.0.7"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sent_name_or_address_outside_the_rules_is_503_and_admits_nothing() {
         for (name, address) in [
-            (long.as_str(), "100.64.0.7"),
             ("build\tbox", "100.64.0.7"),
             ("build-box", "relay.example.com"),
             ("build-box", "203.0.113.9"),
@@ -654,6 +670,7 @@ mod tests {
             assert_eq!(status, 503, "{name:?} at {address}: {body}");
             assert!(!error_of(&body).chars().any(char::is_control), "{body}");
             assert_eq!(served.held(joining.me()), None, "{name:?} at {address}");
+            assert_eq!(served.keys.state(joining.me()), join::KeyState::NoKey);
         }
     }
 
