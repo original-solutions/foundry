@@ -96,6 +96,10 @@ mod tests {
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("a warning line"), "{warnings:?}");
         assert!(!warnings[0].contains('\u{1b}'), "no colours: {warnings:?}");
+        assert!(
+            warnings[0].trim_start().starts_with("WARN"),
+            "no time before the level: {warnings:?}"
+        );
     }
 
     #[test]

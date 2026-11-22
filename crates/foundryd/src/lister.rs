@@ -100,6 +100,7 @@ mod tests {
     use crate::coordinator::Coordinator;
     use crate::store::Store;
     use crate::sync::{Conn, Dialer, Peers};
+    use crate::test_log::Logged;
 
     struct NoDial;
 
@@ -198,12 +199,21 @@ mod tests {
         let other = machine(MachineId::random(), "Trilogy-Mac", "100.64.0.2");
         let listed = Listed::new(std::slice::from_ref(&other));
         let joining = machine(MachineId::random(), " trilogy-mac ", "100.64.0.3");
+        let logged = Logged::default();
+        let _capture = logged.capture();
 
         let why = listed.lister.list(joining.clone()).await.unwrap_err();
 
         assert!(why.contains("\"Trilogy-Mac\" at 100.64.0.2"), "{why}");
         assert!(why.contains("rename that machine first"), "{why}");
         assert_eq!(listed.held(joining.id), None);
+        let warnings = logged.warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains(&joining.id.to_string()),
+            "{warnings:?}"
+        );
+        assert!(warnings[0].contains("Trilogy-Mac"), "{warnings:?}");
     }
 
     #[tokio::test]
@@ -211,12 +221,21 @@ mod tests {
         let other = machine(MachineId::random(), "trilogy-mac", " fd7a:115c:a1e0:0::2 ");
         let listed = Listed::new(std::slice::from_ref(&other));
         let joining = machine(MachineId::random(), "studio-mac", "fd7a:115c:a1e0::2");
+        let logged = Logged::default();
+        let _capture = logged.capture();
 
         let why = listed.lister.list(joining.clone()).await.unwrap_err();
 
         assert!(why.contains("\"trilogy-mac\""), "{why}");
         assert!(why.contains("cannot join at that address"), "{why}");
         assert_eq!(listed.held(joining.id), None);
+        let warnings = logged.warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains(&joining.id.to_string()),
+            "{warnings:?}"
+        );
+        assert!(warnings[0].contains("trilogy-mac"), "{warnings:?}");
     }
 
     #[test]
