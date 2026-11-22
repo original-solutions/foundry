@@ -1270,18 +1270,16 @@ fn a_session_whose_agent_ended_while_the_daemon_was_down_is_ended_at_start() {
     std::thread::sleep(Duration::from_secs(5));
     fixture.start();
 
-    // Taken up before the daemon listens, so the first answer already shows the end, and the
-    // state is the one the terminal's exit code gives.
-    let records = fixture.state().unwrap();
-    let ended = records
-        .iter()
-        .find_map(|record| match record {
-            AnyRecord::Session(r) if r.body.id.to_string() == session => Some(r.clone()),
-            _ => None,
-        })
-        .unwrap();
-    let code = records
-        .iter()
+    let ended = wait_for_session(
+        &fixture,
+        &session,
+        &[SessionState::Finished, SessionState::Failed],
+    );
+    // The state is the one the terminal's exit code gives.
+    let code = fixture
+        .state()
+        .unwrap()
+        .into_iter()
         .find_map(|record| match record {
             AnyRecord::Terminal(r) if r.body.id == ended.body.terminal => Some(r.body.exit_code),
             _ => None,
@@ -1320,16 +1318,17 @@ fn a_session_whose_curl_config_lost_its_token_is_still_followed_to_its_end() {
     fs::write(&curl, "header = \"Content-Type: application/json\"\n").unwrap();
     fixture.start();
 
+    // Read before a hook is refused, which logs a warning naming the session too.
+    let log = fixture.log();
+    assert!(
+        log.lines()
+            .any(|line| line.contains("holds no token") && line.contains(&session)),
+        "no warning names the session; {log}"
+    );
     assert_eq!(
         hook_status(&fixture, &session, &token),
         403,
         "the old token"
-    );
-    let log = fixture.log();
-    assert!(
-        log.lines()
-            .any(|line| line.contains("WARN") && line.contains(&session)),
-        "no warning names the session; {log}"
     );
     assert!(!log.contains(&token), "the token reached the log");
     close_and_wait_for_the_end(&fixture, &session, working.body.terminal);

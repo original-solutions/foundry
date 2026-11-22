@@ -255,11 +255,12 @@ impl Sessions {
 
     /// Takes up this machine's sessions that a daemon before this one started and that have
     /// not ended: call it once, after the terminals are reattached and before the hooks are
-    /// served. A session whose terminal is gone or has exited is ended now, its record written
-    /// as the exit makes it and its files removed. Any other is followed again as
-    /// [`Sessions::start`] follows a new one, and its hooks are taken with the token in its curl
-    /// config. A session whose curl config holds no token is still followed to its end, but its
-    /// hooks stay refused. A busy store is tried again until it answers.
+    /// served. A session whose terminal is gone or has exited is ended, its record written as
+    /// the exit makes it and its files removed; an end the store refuses is written later, in
+    /// a task of the session's own. Any other is followed again as [`Sessions::start`] follows a
+    /// new one, and its hooks are taken with the token in its curl config. A session whose curl
+    /// config holds no token is still followed to its end, but its hooks stay refused. A read
+    /// of the store that fails, for any reason, is tried again until it answers.
     pub async fn adopt(&self) {
         self.inner.adopt().await;
     }
@@ -1002,6 +1003,14 @@ mod adopt_tests {
     /// Sessions of a new machine whose store holds one `Working` session, with its settings
     /// file and curl config, whose terminal exited with code 0.
     fn with_a_session_whose_terminal_exited() -> (tempfile::TempDir, Sessions, SessionId) {
+        with_a_session(Some((false, TerminalState::Exited, Some(0))))
+    }
+
+    /// [`with_a_session_whose_terminal_exited`], with the session's terminal record deleted or
+    /// not, in a state and with an exit code, or with no terminal record at all.
+    fn with_a_session(
+        terminal_record: Option<(bool, TerminalState, Option<i32>)>,
+    ) -> (tempfile::TempDir, Sessions, SessionId) {
         let data = tempfile::tempdir().unwrap();
         let me = MachineId::random();
         let mut store = Store::open(data.path().join("foundry.db")).unwrap();
@@ -1010,31 +1019,32 @@ mod adopt_tests {
             TerminalId::random(),
             SessionId::random(),
         );
-        let records = [
-            AnyRecord::Terminal(Record {
+        let mut records = Vec::new();
+        if let Some((deleted, state, exit_code)) = terminal_record {
+            records.push(AnyRecord::Terminal(Record {
                 owner: me,
                 version: store.own_next_version().unwrap(),
-                deleted: false,
+                deleted,
                 body: Terminal {
                     id: terminal,
                     workspace,
-                    state: TerminalState::Exited,
-                    exit_code: Some(0),
+                    state,
+                    exit_code,
                 },
-            }),
-            AnyRecord::Session(Record {
-                owner: me,
-                version: store.own_next_version().unwrap(),
-                deleted: false,
-                body: Session {
-                    id,
-                    workspace,
-                    terminal,
-                    model: "test-model".into(),
-                    state: SessionState::Working,
-                },
-            }),
-        ];
+            }));
+        }
+        records.push(AnyRecord::Session(Record {
+            owner: me,
+            version: store.own_next_version().unwrap(),
+            deleted: false,
+            body: Session {
+                id,
+                workspace,
+                terminal,
+                model: "test-model".into(),
+                state: SessionState::Working,
+            },
+        }));
         for record in &records {
             store.apply(record, me).unwrap();
         }
@@ -1073,6 +1083,27 @@ mod adopt_tests {
     fn files_gone(sessions: &Sessions, id: SessionId) -> bool {
         let (settings, curl) = sessions.inner.files(id);
         !settings.exists() && !curl.exists()
+    }
+
+    #[tokio::test]
+    async fn a_session_whose_terminal_is_gone_is_ended_with_the_state_its_exit_gives() {
+        use TerminalState::{Exited, Running};
+        let cases = [
+            (Some((false, Exited, Some(0))), SessionState::Finished),
+            (Some((false, Exited, Some(3))), SessionState::Failed),
+            (Some((false, Exited, None)), SessionState::Failed),
+            (Some((true, Running, None)), SessionState::Failed),
+            (Some((true, Exited, Some(0))), SessionState::Finished),
+            (None, SessionState::Failed),
+        ];
+        for (terminal, wanted) in cases {
+            let (_data, sessions, id) = with_a_session(terminal);
+
+            sessions.adopt().await;
+
+            assert_eq!(state(&sessions, id), Some(wanted), "{terminal:?}");
+            assert!(files_gone(&sessions, id), "{terminal:?}");
+        }
     }
 
     #[tokio::test]
