@@ -5,7 +5,7 @@ use std::io::Write as _;
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::extract::{ConnectInfo, Path as UrlPath, State};
@@ -23,6 +23,7 @@ use super::*;
 use crate::store::Store;
 use crate::sync::{Conn, Dialer, Peers};
 use crate::terminals::Output;
+use crate::test_log::Logged;
 
 const WAIT: Duration = Duration::from_secs(20);
 const MODEL: &str = "test-model";
@@ -1038,7 +1039,7 @@ async fn a_hook_whose_caller_stops_waiting_mid_write_still_keeps_memory_and_reco
 
 #[tokio::test]
 async fn an_exit_that_cannot_be_read_is_tried_again_with_a_growing_wait_and_one_warning() {
-    let logs = logs();
+    let logs = Logged::everywhere();
     let f = Fixture::new("- wait_input\n- exit: 0\n").await;
     let id = f.start().await;
     let terminal = f.record(id).unwrap().body.terminal;
@@ -1057,7 +1058,7 @@ async fn an_exit_that_cannot_be_read_is_tried_again_with_a_growing_wait_and_one_
         "{:?}",
         entered.elapsed()
     );
-    let logs = String::from_utf8_lossy(&logs.lock().unwrap()).into_owned();
+    let logs = logs.text();
     let warnings = logs
         .lines()
         .filter(|l| l.contains("terminal exit not read") && l.contains(&terminal.to_string()))
@@ -1067,7 +1068,7 @@ async fn an_exit_that_cannot_be_read_is_tried_again_with_a_growing_wait_and_one_
 
 #[tokio::test]
 async fn the_gateway_key_is_in_the_childs_environment_and_in_no_log_line_or_file() {
-    let logs = logs();
+    let logs = Logged::everywhere();
     let f = Fixture::new(
         "
 - hook: {event: SessionStart}
@@ -1117,7 +1118,7 @@ async fn the_gateway_key_is_in_the_childs_environment_and_in_no_log_line_or_file
     );
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let logged = String::from_utf8_lossy(&logs.lock().unwrap()).into_owned();
+    let logged = logs.text();
     assert!(
         logged.contains("session started") && logged.contains(&id.to_string()),
         "the capture works: {logged}"
@@ -1514,34 +1515,6 @@ async fn the_hook_token_is_in_a_private_curl_config_and_not_in_the_settings_or_t
         settings.contains(&f.curl_file(id).display().to_string()),
         "{settings}"
     );
-}
-
-/// The text every tracing event is written to, once a test has called [`logs`].
-fn logs() -> Arc<Mutex<Vec<u8>>> {
-    static LOGS: OnceLock<Arc<Mutex<Vec<u8>>>> = OnceLock::new();
-    struct Writer(Arc<Mutex<Vec<u8>>>);
-    impl std::io::Write for Writer {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    LOGS.get_or_init(|| {
-        let buffer = Arc::new(Mutex::new(Vec::new()));
-        let writer = buffer.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .with_ansi(false)
-            .with_writer(move || Writer(writer.clone()))
-            .finish();
-        tracing::subscriber::set_global_default(subscriber)
-            .expect("no other test installs a global tracing subscriber");
-        buffer
-    })
-    .clone()
 }
 
 #[tokio::test]

@@ -51,11 +51,11 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{Instant, timeout};
 
-use crate::api::machine_add::Lister;
-use crate::api::machine_names;
+use crate::lister::Lister;
 use crate::secrets::{self, Secrets, SecretsError};
 use crate::store::{Store, StoreError};
 use crate::sync::{Conn, Dialer, OFFLINE_AFTER, Peers, on_store};
+use crate::tailscale;
 
 /// How long a join code works after it is shown.
 pub const CODE_VALID_FOR: Duration = Duration::from_secs(10 * 60);
@@ -138,12 +138,12 @@ pub fn join(address: &str, code: &str) -> ExitCode {
 }
 
 /// What this machine lists itself under, read from Tailscale as the daemon reads it.
-fn own_entry() -> Result<machine_names::Entry, String> {
+fn own_entry() -> Result<tailscale::Entry, String> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| format!("cannot ask Tailscale what this machine is called: {e}"))?
-        .block_on(crate::daemon::own_entry())
+        .block_on(tailscale::own_entry())
 }
 
 /// The data directory: `FOUNDRY_HOME`, else `~/.local/share/foundry`.
@@ -171,7 +171,7 @@ pub fn join_at(
     port: u16,
     code: &str,
     secrets: &dyn Secrets,
-    own: Option<&machine_names::Entry>,
+    own: Option<&tailscale::Entry>,
 ) -> Result<MachineId, JoinError> {
     let targets = join_targets(address, port)?;
     let identity = Identity::load_or_create(secrets)?;
@@ -1279,7 +1279,7 @@ struct JoinRequest {
 impl JoinRequest {
     /// The entry the machine lists itself under, as it sent it, or none when it sent no name
     /// or no address (a blank one counts as none). The rule is the one a machine's own entry
-    /// keeps ([`entry`](crate::api::machine_names::entry)): a name of any length with no
+    /// keeps ([`entry`](crate::tailscale::entry)): a name of any length with no
     /// control character, at a Tailscale or loopback IP. One that breaks it gives why.
     fn sent(&self) -> Result<Option<Machine>, String> {
         let sent = |field: &Option<String>| field.clone().filter(|f| !f.trim().is_empty());
@@ -1424,6 +1424,7 @@ mod tests {
     use crate::secrets::{Edit, FileSecrets, MemorySecrets, Secrets, SecretsError};
     use crate::store::Store;
     use crate::sync::{Conn, Dialer, Peers};
+    use crate::test_log::Logged;
 
     /// Where a redeem in these tests comes from.
     const HERE: IpAddr = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
@@ -2241,37 +2242,6 @@ mod tests {
         }
     }
 
-    /// Every warning logged while the returned guard is held, a line each.
-    fn capture_warnings() -> (Arc<Mutex<Vec<u8>>>, tracing::subscriber::DefaultGuard) {
-        #[derive(Clone)]
-        struct Into(Arc<Mutex<Vec<u8>>>);
-        impl io::Write for Into {
-            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(bytes);
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-        let logged = Arc::new(Mutex::new(Vec::new()));
-        let writer = Into(logged.clone());
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(move || writer.clone())
-            .with_ansi(false)
-            .without_time()
-            .finish();
-        (logged, tracing::subscriber::set_default(subscriber))
-    }
-
-    fn warnings(logged: &Mutex<Vec<u8>>) -> Vec<String> {
-        String::from_utf8_lossy(&logged.lock().unwrap())
-            .lines()
-            .filter(|line| line.contains("WARN"))
-            .map(str::to_owned)
-            .collect()
-    }
-
     #[tokio::test(start_paused = true)]
     async fn a_key_in_the_machine_list_is_admitted_and_saved() {
         let secrets = Arc::new(MemorySecrets::default());
@@ -2356,7 +2326,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_listed_key_that_does_not_parse_is_skipped_with_one_warning_naming_the_machine() {
-        let (logged, _capture) = capture_warnings();
+        let logged = Logged::default();
+        let _capture = logged.capture();
         let host = machine_keys();
         let (odd, older, peer) = (MachineId::random(), MachineId::random(), machine_keys());
         // Hex, but 16 bytes: not an Ed25519 public key.
@@ -2373,7 +2344,7 @@ mod tests {
         assert_eq!(host.state(odd), KeyState::NoKey);
         assert_eq!(host.state(older), KeyState::NoKey);
         assert_eq!(host.state(peer.me()), KeyState::Active);
-        let warned = warnings(&logged);
+        let warned = logged.warnings();
         assert_eq!(warned.len(), 1, "{warned:?}");
         assert!(warned[0].contains(&odd.to_string()), "{warned:?}");
         assert!(
