@@ -9,6 +9,7 @@ pub mod daemon;
 pub mod dashboard;
 pub mod gateway;
 pub mod join;
+pub mod lister;
 pub mod machine;
 pub mod placement;
 pub mod secrets;
