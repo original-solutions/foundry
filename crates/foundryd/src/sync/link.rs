@@ -34,7 +34,8 @@ use super::{BATCH, Conn, Inner, OFFLINE_AFTER, RETRY_REFUSED, TICK, on_store};
 const WARN_EVERY: Duration = Duration::from_secs(60);
 
 /// Runs a link until it closes, the peer is silent for [`OFFLINE_AFTER`], the peer is not (or
-/// is no longer) in the machine list, or the peer takes nothing for [`OFFLINE_AFTER`].
+/// is no longer) one this machine links with ([`links_with`]: it is listed, or this machine's
+/// list holds no machine but itself), or the peer takes nothing for [`OFFLINE_AFTER`].
 /// `dialed` is the machine this end dialed, or `None` for a link a peer opened. `first` is the
 /// peer's first message when the caller has already read and parsed it, so the hello is
 /// neither read nor parsed again.
@@ -55,8 +56,9 @@ pub(super) async fn run(
     }
 }
 
-/// Sends this machine's new records every [`TICK`] until the peer leaves the machine list or
-/// stops taking them.
+/// Sends this machine's new records every [`TICK`] until the peer is no longer one this machine
+/// links with ([`links_with`]: it is listed, or this machine's list holds no machine but
+/// itself) or stops taking them.
 async fn sending(inner: &Inner, send: &Sender<String>, open: &Open) {
     let mut sent = open.sent;
     let mut settings_sent: Option<u64> = None;
@@ -64,7 +66,7 @@ async fn sending(inner: &Inner, send: &Sender<String>, open: &Open) {
     let mut every = tokio::time::interval(TICK);
     loop {
         every.tick().await;
-        if !listed(inner, open.peer).await {
+        if !links_with(inner, open.peer).await {
             tracing::info!("sync: {} left the machine list; link closed", open.peer);
             return;
         }
@@ -234,9 +236,16 @@ struct Open {
     sent: u64,
 }
 
-/// Exchanges hellos, and refuses a peer that is not in the machine list, is this machine, or
-/// is not the machine that was dialed. A hello does not count as hearing from the peer: that
-/// waits for a message this machine takes.
+/// Exchanges hellos, and refuses a peer that is not in the machine list ([`links_with`]), is
+/// this machine, or is not the machine that was dialed. A hello does not count as hearing from
+/// the peer: that waits for a message this machine takes.
+///
+/// A machine whose list holds no machine but itself takes a record link from any machine. A
+/// link reaches `hello` only after `Keys::accept` has proved a key this machine holds, so
+/// after `foundryd join` the only machine it lets in is the one that admitted it. The joined
+/// machine then takes that machine's settings through the normal merge, and the current rule,
+/// the machine list, applies from then on. A machine whose list is later cut down to itself
+/// takes a record link again from any machine whose key it still holds.
 async fn hello(
     inner: &Inner,
     send: &Sender<String>,
@@ -267,7 +276,7 @@ async fn hello(
     };
     let allowed = match dialed {
         Some(expected) => machine == expected,
-        None => machine != inner.me && listed(inner, machine).await,
+        None => machine != inner.me && links_with(inner, machine).await,
     };
     if !allowed {
         tracing::warn!("sync: refused a link from {machine}: not a peer of this machine");
@@ -300,43 +309,61 @@ async fn own_hello(inner: &Inner, protocol: u16) -> Option<PeerMessage> {
 
 type ListedCache = (u64, std::collections::BTreeSet<MachineId>);
 
-/// Checks whether `machine` is listed in `store`'s shared settings, reusing `cached` while the
-/// settings are unchanged, and gives back the machine ids when it read them again.
-fn listed_in_store(
+/// The machine ids in `store`'s shared settings, reusing `cached` while the settings are
+/// unchanged, and the ids to cache when it read them again.
+fn ids_in_store(
     store: &crate::store::Store,
-    machine: MachineId,
     cached: Option<&ListedCache>,
-) -> Result<(bool, Option<ListedCache>), crate::store::StoreError> {
+) -> Result<(std::collections::BTreeSet<MachineId>, Option<ListedCache>), crate::store::StoreError>
+{
     Ok(match store.settings_since(cached.map(|(seq, _)| *seq))? {
-        None => (cached.is_some_and(|(_, ids)| ids.contains(&machine)), None),
+        None => (cached.map(|(_, ids)| ids.clone()).unwrap_or_default(), None),
         Some(settings) => {
             let ids: std::collections::BTreeSet<MachineId> =
                 settings.machines.into_iter().map(|m| m.id).collect();
-            (ids.contains(&machine), Some((settings.seq, ids)))
+            (ids.clone(), Some((settings.seq, ids)))
         }
     })
 }
 
-/// Whether `machine` is in the machine list: the one rule for who is a peer, for record links
-/// and relays alike.
-pub(super) async fn listed(inner: &Inner, machine: MachineId) -> bool {
+/// The machine ids in the machine list, through the cache, or `None` when it cannot be read.
+async fn listed_ids(inner: &Inner) -> Option<std::collections::BTreeSet<MachineId>> {
     let cached = super::lock(&inner.listed_cache).clone();
     let result = on_store(&inner.store, move |store| {
-        listed_in_store(store, machine, cached.as_ref())
+        ids_in_store(store, cached.as_ref())
     })
     .await;
     match result {
-        Ok((present, updated)) => {
+        Ok((ids, updated)) => {
             if let Some(cache) = updated {
                 *super::lock(&inner.listed_cache) = Some(cache);
             }
-            present
+            Some(ids)
         }
         Err(error) => {
             tracing::warn!("sync: cannot read the machine list: {error}");
-            false
+            None
         }
     }
+}
+
+/// Whether `machine` is in the machine list: the rule for who is a peer for calls and relays,
+/// and for record links once the list holds another machine ([`links_with`]).
+pub(super) async fn listed(inner: &Inner, machine: MachineId) -> bool {
+    listed_ids(inner)
+        .await
+        .is_some_and(|ids| ids.contains(&machine))
+}
+
+/// Whether a record link with `machine` is allowed: it is in the machine list, or the list
+/// holds no machine but this one (or is empty), so a machine just joined takes a link from the
+/// machine that admitted it before it has that machine's settings. That holds whenever the
+/// list is cut down to this machine, for any machine whose key it holds. A list that cannot be
+/// read allows nothing.
+async fn links_with(inner: &Inner, machine: MachineId) -> bool {
+    listed_ids(inner)
+        .await
+        .is_some_and(|ids| ids.contains(&machine) || ids.iter().all(|id| *id == inner.me))
 }
 
 /// Sends `message`, and says whether the link is still open. A message that cannot be
@@ -417,4 +444,145 @@ async fn take(
             .map_err(|error| format!("a record from {peer} not stored: {error}"))
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::io;
+    use std::sync::{Arc, Mutex};
+
+    use foundry_proto::settings::Machine;
+    use futures::future::BoxFuture;
+
+    use super::*;
+    use crate::store::Store;
+    use crate::sync::{Conn, Dialer, Peers};
+
+    struct NoDial;
+
+    impl Dialer for NoDial {
+        fn dial(&self, _: &Machine) -> BoxFuture<'static, io::Result<Conn>> {
+            Box::pin(async { Err(io::Error::other("no peers in these tests")) })
+        }
+    }
+
+    const WAIT: Duration = Duration::from_secs(5);
+
+    /// A machine whose list holds `listed`, a peer dialing it, and the peer's end of the link.
+    struct Dialed {
+        _data: tempfile::TempDir,
+        theirs: Conn,
+        accepting: tokio::task::JoinHandle<()>,
+    }
+
+    impl Dialed {
+        /// This machine lists `listed` (by id) and accepts a link `peer` opens with a hello.
+        async fn new(listed: impl FnOnce(MachineId) -> Vec<MachineId>, peer: MachineId) -> Self {
+            Self::open(listed, peer, false).await
+        }
+
+        /// As [`Dialed::new`]; when `unreadable`, the stored settings are then damaged through
+        /// a second connection to the database file, so the machine list cannot be read.
+        async fn open(
+            listed: impl FnOnce(MachineId) -> Vec<MachineId>,
+            peer: MachineId,
+            unreadable: bool,
+        ) -> Self {
+            let data = tempfile::tempdir().unwrap();
+            let me = MachineId::random();
+            let mut store = Store::open(data.path().join("foundry.db")).unwrap();
+            let mut held = store.settings().unwrap();
+            held.seq += 1;
+            held.machines = listed(me)
+                .into_iter()
+                .enumerate()
+                .map(|(i, id)| Machine {
+                    id,
+                    name: format!("machine-{i}"),
+                    address: format!("100.64.0.{}", i + 1),
+                })
+                .collect();
+            store.apply_settings(held).unwrap();
+            if unreadable {
+                rusqlite::Connection::open(data.path().join("foundry.db"))
+                    .unwrap()
+                    .execute("UPDATE settings SET settings = 'not settings'", [])
+                    .unwrap();
+            }
+            let peers = Peers::new(me, Arc::new(Mutex::new(store)), Arc::new(NoDial));
+            let (ours, theirs) = Conn::pair();
+            let accepting = tokio::spawn(async move { peers.accept(ours).await });
+            let hello = PeerMessage::Hello {
+                protocol: PROTOCOL,
+                machine: peer,
+                versions: BTreeMap::new(),
+            };
+            theirs
+                .send
+                .send(serde_json::to_string(&hello).unwrap())
+                .await
+                .unwrap();
+            Self {
+                _data: data,
+                theirs,
+                accepting,
+            }
+        }
+
+        /// The next message on the link, or `None` when it closed or sent nothing in time.
+        async fn next(&mut self) -> Option<PeerMessage> {
+            let text = timeout(WAIT, self.theirs.recv.recv()).await.ok()??;
+            Some(serde_json::from_str(&text).unwrap())
+        }
+
+        /// Whether the link was accepted: a hello came back.
+        async fn accepted(&mut self) -> bool {
+            matches!(self.next().await, Some(PeerMessage::Hello { .. }))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_machine_whose_list_holds_only_itself_opens_a_link_a_peer_dialed() {
+        let mut link = Dialed::new(|me| vec![me], MachineId::random()).await;
+
+        assert!(link.accepted().await, "the link was refused");
+        // The link stays open past its first tick: a heartbeat arrives, not a close.
+        assert!(
+            matches!(link.next().await, Some(PeerMessage::Records { .. })),
+            "the link closed instead of sending"
+        );
+        assert!(!link.accepting.is_finished());
+    }
+
+    #[tokio::test]
+    async fn a_machine_whose_list_is_empty_opens_a_link_a_peer_dialed() {
+        let mut link = Dialed::new(|_| Vec::new(), MachineId::random()).await;
+
+        assert!(link.accepted().await, "the link was refused");
+    }
+
+    #[tokio::test]
+    async fn a_machine_whose_list_holds_another_machine_refuses_a_link_from_one_not_in_it() {
+        let mut link = Dialed::new(|me| vec![me, MachineId::random()], MachineId::random()).await;
+
+        assert!(!link.accepted().await, "the link was accepted");
+        link.accepting.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_machine_whose_list_holds_one_other_machine_refuses_a_link_from_a_third() {
+        let mut link = Dialed::new(|_| vec![MachineId::random()], MachineId::random()).await;
+
+        assert!(!link.accepted().await, "the link was accepted");
+        link.accepting.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_machine_whose_list_cannot_be_read_refuses_a_link() {
+        let mut link = Dialed::open(|me| vec![me], MachineId::random(), true).await;
+
+        assert!(!link.accepted().await, "the link was accepted");
+        link.accepting.await.unwrap();
+    }
 }

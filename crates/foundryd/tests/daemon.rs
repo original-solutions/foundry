@@ -16,7 +16,7 @@ compile_error!(
 compile_error!("run these tests in a debug build: a release build asks the real Tailscale");
 
 use std::fs;
-use std::net::TcpListener;
+use std::net::{IpAddr, Ipv4Addr, TcpListener};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
@@ -40,6 +40,9 @@ use tempfile::TempDir;
 use tokio_tungstenite::tungstenite::Message;
 
 const WAIT: Duration = Duration::from_secs(30);
+
+/// Where a code is redeemed from in these tests: one made with `new_code` works from anywhere.
+const HERE: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
 /// A pid file's marker: the shell the daemon starts runs `sleep` for this many seconds, so a
 /// stray one is found by it.
@@ -812,7 +815,7 @@ async fn the_daemon_dials_a_peer_through_the_key_handshake() {
         )))
         .unwrap();
         let code = mine.new_code().unwrap();
-        mine.redeem(&code.to_string(), peer_id, &peer.public_key())
+        mine.redeem(&code.to_string(), peer_id, &peer.public_key(), HERE)
             .unwrap();
     }
     fixture.seed(|settings| {
@@ -908,10 +911,10 @@ async fn keyed_peer_link(fixture: &mut Fixture) -> (Conn, MachineId, TempDir) {
         )))
         .unwrap();
         let code = mine.new_code().unwrap();
-        mine.redeem(&code.to_string(), peer_id, &peer.public_key())
+        mine.redeem(&code.to_string(), peer_id, &peer.public_key(), HERE)
             .unwrap();
         let code = peer.new_code().unwrap();
-        peer.redeem(&code.to_string(), mine.me(), &mine.public_key())
+        peer.redeem(&code.to_string(), mine.me(), &mine.public_key(), HERE)
             .unwrap();
         Machine {
             id: mine.me(),
@@ -1253,4 +1256,37 @@ fn the_rename_route_refuses_a_request_from_another_site() {
     assert_eq!(ask(&rename, &here, None, r#"{"name": "desk"}"#), 404);
     assert_eq!(ask(&rename, &here, Some("http://evil.example"), ""), 403);
     assert_eq!(ask(&rename, "evil.example", None, ""), 403);
+}
+
+#[test]
+fn the_join_and_add_routes_are_served_and_refuse_a_request_from_another_site() {
+    use std::io::{Read as _, Write as _};
+    let mut fixture = Fixture::new();
+    fixture.start();
+    // As in the rename route's test: only a request the route serves sends a body.
+    let ask = |path: &str, host: &str, origin: Option<&str>, body: &str| {
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", fixture.port)).unwrap();
+        let origin = origin.map_or_else(String::new, |o| format!("Origin: {o}\r\n"));
+        write!(
+            stream,
+            "POST {path} HTTP/1.1\r\nHost: {host}\r\n{origin}Connection: close\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        response.split(' ').nth(1).unwrap().parse::<u16>().unwrap()
+    };
+    let here = format!("127.0.0.1:{}", fixture.port);
+    for path in ["/api/join", "/api/machines/add"] {
+        // Served here: a body the route cannot take is refused by the route itself.
+        assert_eq!(ask(path, &here, None, "{}"), 422, "{path}");
+        assert_eq!(
+            ask(path, &here, Some("http://evil.example"), ""),
+            403,
+            "{path}"
+        );
+        assert_eq!(ask(path, "evil.example", None, ""), 403, "{path}");
+    }
 }

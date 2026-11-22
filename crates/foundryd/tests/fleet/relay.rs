@@ -363,7 +363,10 @@ impl Keyed {
 /// `host` admits `peer` with a fresh code, as `foundryd join` does.
 pub(crate) fn admit(host: &Keys, peer: &Keys) {
     let code = host.new_code().unwrap().to_string();
-    host.redeem(&code, peer.me(), &peer.public_key()).unwrap();
+    // A code made with `new_code` works from any address.
+    let from = std::net::Ipv4Addr::LOCALHOST.into();
+    host.redeem(&code, peer.me(), &peer.public_key(), from)
+        .unwrap();
 }
 
 /// Dials nobody.
