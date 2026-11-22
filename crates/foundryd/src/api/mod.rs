@@ -112,6 +112,7 @@ mod changes;
 mod files;
 mod machine;
 pub mod machine_add;
+pub mod machine_limits;
 pub mod machine_names;
 mod pr;
 pub mod projects;
