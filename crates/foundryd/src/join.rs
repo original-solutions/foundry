@@ -2711,6 +2711,73 @@ mod tests {
         assert!(!host.peers.online().contains(&a.me()));
     }
 
+    #[tokio::test]
+    async fn a_proof_over_an_earlier_challenge_does_not_open_a_new_link() {
+        let (h, a) = pair();
+        let host = host(&h, &[a.me()]);
+
+        // A link to H as A, whose challenge A signs. It is dropped before any hello, so A is
+        // never online.
+        let mut first = host.raw();
+        send(
+            &first,
+            &Handshake::Challenge {
+                machine: a.me(),
+                nonce: nonce().unwrap(),
+            },
+        )
+        .await;
+        let Handshake::Answer { nonce: n1, .. } = read(&mut first).await else {
+            panic!("H did not answer");
+        };
+        let old = a.sign(&link_message(DIALING, a.me(), h.me(), &n1));
+        drop(first);
+
+        // A second link to H as A, which offers that proof for H's fresh challenge.
+        let mut second = host.raw();
+        send(
+            &second,
+            &Handshake::Challenge {
+                machine: a.me(),
+                nonce: nonce().unwrap(),
+            },
+        )
+        .await;
+        let Handshake::Answer { nonce: n2, .. } = read(&mut second).await else {
+            panic!("H did not answer");
+        };
+        assert_ne!(n1, n2);
+        send(&second, &Handshake::Proof { proof: old }).await;
+        let _ = second.send.send(hello(a.me())).await;
+        closed(&mut second).await;
+        assert!(!host.peers.online().contains(&a.me()));
+    }
+
+    #[tokio::test]
+    async fn an_answer_proved_over_another_challenge_is_refused_by_the_dialer() {
+        let (a, b) = pair();
+        let b_id = b.me();
+        // B's accepting signature over a challenge A never sent.
+        let old = b.sign(&link_message(ACCEPTING, b_id, a.me(), &nonce().unwrap()));
+
+        let inner = Arc::new(Pairs::default());
+        let dialing = tokio::spawn(KeyedDialer::new(inner.clone(), a.clone()).dial(&machine(b_id)));
+        let mut at_b = inner_far(&inner).await;
+        let Handshake::Challenge { .. } = read(&mut at_b).await else {
+            panic!("A sent no challenge");
+        };
+        send(
+            &at_b,
+            &Handshake::Answer {
+                machine: b_id,
+                nonce: nonce().unwrap(),
+                proof: old,
+            },
+        )
+        .await;
+        assert!(dialing.await.unwrap().is_err());
+    }
+
     /// The far end of the link `pairs` hands out once it has dialed.
     async fn inner_far(pairs: &Pairs) -> Conn {
         timeout(Duration::from_secs(5), async {
