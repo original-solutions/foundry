@@ -1414,41 +1414,52 @@ mod tests {
         assert_eq!(founder.state(founder.me()), KeyState::Active);
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn a_watched_code_says_which_machine_used_it() {
-        let (host, peer) = (machine_keys(), machine_keys());
-        let (code, used) = host.new_watched_code(vec![HERE]).unwrap();
-        host.redeem(&code.to_string(), peer.me(), &peer.public_key(), HERE)
-            .unwrap();
-        assert_eq!(used.await.unwrap(), peer.me());
+    /// The name typed in the Add machine dialog for a code, and the address it resolved to.
+    fn named(address: IpAddr) -> Named {
+        Named {
+            name: "localhost".into(),
+            address,
+        }
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_watched_code_says_nothing_until_it_is_used_and_nothing_for_a_failed_save() {
+    async fn a_named_code_gives_its_name_at_every_redeem_and_a_plain_code_gives_none() {
+        let (host, peer) = (machine_keys(), machine_keys());
+        let code = host.new_named_code(named(HERE), vec![HERE]).unwrap();
+        let code = code.to_string();
+
+        for _ in 0..2 {
+            let used = host.redeem(&code, peer.me(), &peer.public_key(), HERE);
+            assert_eq!(used.unwrap(), Some(named(HERE)));
+        }
+        let plain = host.new_code().unwrap().to_string();
+        let other = machine_keys();
+        let used = host.redeem(&plain, other.me(), &other.public_key(), HERE);
+        assert_eq!(used.unwrap(), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_named_code_whose_save_failed_gives_its_name_once_a_save_succeeds() {
         let flaky = Arc::new(Flaky::default());
         let host = Keys::open(flaky.clone()).unwrap();
         let peer = machine_keys();
-        let (code, mut used) = host.new_watched_code(vec![HERE]).unwrap();
-        // Another code used says nothing, and so does a save of this one that fails.
-        admit(&host, &machine_keys());
+        let code = host.new_named_code(named(HERE), vec![HERE]).unwrap();
         flaky.failing.store(true, Ordering::SeqCst);
         assert!(
             host.redeem(&code.to_string(), peer.me(), &peer.public_key(), HERE)
                 .is_err()
         );
-        assert!(used.try_recv().is_err());
         flaky.failing.store(false, Ordering::SeqCst);
-        host.redeem(&code.to_string(), peer.me(), &peer.public_key(), HERE)
-            .unwrap();
-        assert_eq!(used.await.unwrap(), peer.me());
+        let used = host.redeem(&code.to_string(), peer.me(), &peer.public_key(), HERE);
+        assert_eq!(used.unwrap(), Some(named(HERE)));
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_watched_code_that_expires_while_its_key_is_saved_still_says_who_used_it() {
+    async fn a_named_code_that_expires_while_its_key_is_saved_still_gives_its_name() {
         let flaky = Arc::new(Flaky::default());
         let host = Keys::open(flaky.clone()).unwrap();
         let peer = machine_keys();
-        let (code, used) = host.new_watched_code(vec![HERE]).unwrap();
+        let code = host.new_named_code(named(HERE), vec![HERE]).unwrap();
         // While the key is saved, the code expires and an add forgets it.
         let adding = host.clone();
         *flaky.during_save.lock().unwrap() = Some(Box::new(move || {
@@ -1458,18 +1469,25 @@ mod tests {
             adding.new_code().unwrap();
         }));
 
-        host.redeem(&code.to_string(), peer.me(), &peer.public_key(), HERE)
-            .unwrap();
+        let used = host.redeem(&code.to_string(), peer.me(), &peer.public_key(), HERE);
 
+        assert_eq!(used.unwrap(), Some(named(HERE)));
         assert_eq!(host.state(peer.me()), KeyState::Active);
-        assert_eq!(used.await.unwrap(), peer.me());
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_code_made_for_a_named_machine_is_refused_from_another_address_and_saves_nothing() {
         let (host, peer) = (machine_keys(), machine_keys());
         let named: IpAddr = "100.64.0.5".parse().unwrap();
-        let (code, mut used) = host.new_watched_code(vec![named]).unwrap();
+        let code = host
+            .new_named_code(
+                super::Named {
+                    name: "m".into(),
+                    address: named,
+                },
+                vec![named],
+            )
+            .unwrap();
         let code = code.to_string();
 
         for elsewhere in ["127.0.0.1", "100.64.0.9", "::ffff:100.64.0.9"] {
@@ -1485,24 +1503,12 @@ mod tests {
             );
         }
         assert_eq!(host.state(peer.me()), KeyState::NoKey);
-        assert!(used.try_recv().is_err());
 
         // The code is unspent, and works from the named machine, over IPv4 or mapped IPv6.
         let mapped: IpAddr = "::ffff:100.64.0.5".parse().unwrap();
         host.redeem(&code, peer.me(), &peer.public_key(), mapped)
             .unwrap();
         assert_eq!(host.state(peer.me()), KeyState::Active);
-        assert_eq!(used.await.unwrap(), peer.me());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_watched_code_that_expires_unused_ends_its_watch() {
-        let host = machine_keys();
-        let (_code, used) = host.new_watched_code(vec![HERE]).unwrap();
-        tokio::time::advance(CODE_VALID_FOR).await;
-        // Any later code forgets the expired one.
-        host.new_code().unwrap();
-        assert!(used.await.is_err());
     }
 
     #[tokio::test(start_paused = true)]
@@ -1674,7 +1680,7 @@ mod tests {
             );
             assert_eq!(secrets.get(name).unwrap().as_deref(), Some("not json"));
             if other.is_some() {
-                let joined = join_at("127.0.0.1:1", DEFAULT_PORT, "CODE", &*secrets);
+                let joined = join_at("127.0.0.1:1", DEFAULT_PORT, "CODE", &*secrets, None);
                 assert!(matches!(joined, Err(JoinError::Unreadable(n)) if n == name));
                 assert_eq!(secrets.get(name).unwrap().as_deref(), Some("not json"));
             }
@@ -2483,7 +2489,7 @@ mod tests {
         tokio::spawn(async move {
             axum::serve(
                 listener,
-                router(keys).into_make_service_with_connect_info::<SocketAddr>(),
+                router(keys, None).into_make_service_with_connect_info::<SocketAddr>(),
             )
             .await
         });
@@ -2497,7 +2503,13 @@ mod tests {
     ) -> Result<MachineId, JoinError> {
         let code = code.to_owned();
         tokio::task::spawn_blocking(move || {
-            join_at(&format!("127.0.0.1:{port}"), DEFAULT_PORT, &code, &*secrets)
+            join_at(
+                &format!("127.0.0.1:{port}"),
+                DEFAULT_PORT,
+                &code,
+                &*secrets,
+                None,
+            )
         })
         .await
         .unwrap()
@@ -2695,7 +2707,7 @@ mod tests {
             "fd7a:115c:a1e1::1",
         ] {
             let secrets = MemorySecrets::default();
-            let joined = join_at(address, DEFAULT_PORT, "CODE", &secrets);
+            let joined = join_at(address, DEFAULT_PORT, "CODE", &secrets, None);
             assert!(
                 matches!(&joined, Err(JoinError::NotTailscale(a)) if a == address),
                 "{address}: {joined:?}"
@@ -2714,7 +2726,13 @@ mod tests {
         // shows a join moving on to the next address.
         let joined = tokio::task::spawn_blocking(move || {
             let secrets = MemorySecrets::default();
-            join_at(&format!("localhost:{port}"), DEFAULT_PORT, &code, &secrets)
+            join_at(
+                &format!("localhost:{port}"),
+                DEFAULT_PORT,
+                &code,
+                &secrets,
+                None,
+            )
         })
         .await
         .unwrap()

@@ -275,8 +275,12 @@ mod tests {
             peers.coordinate(coordinator.clone());
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
-            let app =
-                join::router(keys.clone()).merge(router(keys.clone(), coordinator, store.clone()));
+            let lister = Lister::new(coordinator.clone(), store.clone());
+            let app = join::router(keys.clone(), Some(lister)).merge(router(
+                keys.clone(),
+                coordinator,
+                store.clone(),
+            ));
             let server = tokio::spawn(async move {
                 axum::serve(
                     listener,
@@ -337,7 +341,8 @@ mod tests {
             answer["code"].as_str().unwrap().to_owned()
         }
 
-        /// `(status, body)` of a join with `code` by `joining`, as `foundryd join` posts it.
+        /// `(status, body)` of a join with `code` by `joining`, as a `foundryd join` from
+        /// before it sent the machine's own entry posts it.
         async fn join(&self, code: &str, joining: &Keys) -> (u16, String) {
             let request = json!({
                 "code": code,
@@ -345,6 +350,34 @@ mod tests {
                 "key": joining.public_key(),
             });
             self.post(join::JOIN_PATH, &request).await
+        }
+
+        /// `(status, body)` of a join with `code` by `joining`, as `foundryd join` posts it
+        /// with the entry `joining` lists itself under: `name` and `address`, each when given.
+        async fn join_as(
+            &self,
+            code: &str,
+            joining: &Keys,
+            name: Option<&str>,
+            address: Option<&str>,
+        ) -> (u16, String) {
+            let mut request = json!({
+                "code": code,
+                "machine": joining.me(),
+                "key": joining.public_key(),
+            });
+            if let Some(name) = name {
+                request["name"] = json!(name);
+            }
+            if let Some(address) = address {
+                request["address"] = json!(address);
+            }
+            self.post(join::JOIN_PATH, &request).await
+        }
+
+        /// The entry the machine list holds for `id` now, without waiting.
+        fn held(&self, id: MachineId) -> Option<Machine> {
+            self.settings().machines.into_iter().find(|m| m.id == id)
         }
 
         /// Waits for the machine list to hold `id`.
@@ -427,38 +460,6 @@ mod tests {
         json["error"].as_str().unwrap().to_owned()
     }
 
-    /// Everything logged while it is set, as plain text.
-    #[derive(Clone, Default)]
-    struct Logged(Arc<Mutex<Vec<u8>>>);
-
-    impl io::Write for Logged {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl Logged {
-        /// Captures this thread's log until the guard drops.
-        fn capture(&self) -> tracing::subscriber::DefaultGuard {
-            let logged = self.clone();
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(move || logged.clone())
-                .with_ansi(false)
-                .without_time()
-                .finish();
-            tracing::subscriber::set_default(subscriber)
-        }
-
-        fn text(&self) -> String {
-            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
-        }
-    }
-
     #[tokio::test]
     async fn an_add_answers_the_code_the_command_to_run_there_and_ten_minutes() {
         let served = Served::new(|_, _| {}).await;
@@ -479,19 +480,52 @@ mod tests {
         assert_eq!(served.settings().machines.len(), 1);
     }
 
+    /// The entry `joining` is listed under at `name` and `address`, with its key.
+    fn keyed(joining: &Keys, name: &str, address: &str) -> Machine {
+        Machine {
+            key: joining.public_key().hex().to_owned(),
+            ..machine(joining.me(), name, address)
+        }
+    }
+
     #[tokio::test]
-    async fn a_used_code_lists_the_machine_under_the_name_typed_at_its_address() {
+    async fn a_join_that_sends_its_own_entry_is_listed_as_that_entry_before_it_is_answered() {
         let served = Served::new(|_, _| {}).await;
         let joining = Keys::open(Arc::new(MemorySecrets::default())).unwrap();
         let code = served.code_for(" 127.0.0.1 ").await;
 
-        let (status, body) = served.join(&code, &joining).await;
+        let (status, body) = served
+            .join_as(&code, &joining, Some("personal-mac"), Some("100.91.54.18"))
+            .await;
 
         assert_eq!(status, 200, "{body}");
         assert_eq!(
-            served.listed(joining.me()).await,
-            machine(joining.me(), "127.0.0.1", "127.0.0.1")
+            served.held(joining.me()),
+            Some(keyed(&joining, "personal-mac", "100.91.54.18"))
         );
+    }
+
+    #[tokio::test]
+    async fn a_join_with_no_name_or_no_address_is_listed_under_the_name_typed_at_its_address() {
+        for (name, address) in [
+            (None, None),
+            (Some("personal-mac"), None),
+            (None, Some("100.91.54.18")),
+            (Some(" "), Some("100.91.54.18")),
+        ] {
+            let served = Served::new(|_, _| {}).await;
+            let joining = Keys::open(Arc::new(MemorySecrets::default())).unwrap();
+            let code = served.code_for(" 127.0.0.1 ").await;
+
+            let (status, body) = served.join_as(&code, &joining, name, address).await;
+
+            assert_eq!(status, 200, "{name:?} {address:?}: {body}");
+            assert_eq!(
+                served.held(joining.me()),
+                Some(keyed(&joining, "127.0.0.1", "127.0.0.1")),
+                "{name:?} {address:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -572,9 +606,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_listing_the_coordinator_cannot_send_is_warned_and_the_join_still_succeeds() {
-        let logged = Logged::default();
-        let _capture = logged.capture();
+    async fn a_listing_the_coordinator_cannot_make_is_503_and_the_same_code_works_again() {
         let peer = MachineId::random();
         let served = Served::new(move |me, settings| {
             settings
@@ -587,23 +619,29 @@ mod tests {
         let joining = Keys::open(Arc::new(MemorySecrets::default())).unwrap();
         let code = served.code_for("127.0.0.1").await;
 
-        let (status, body) = served.join(&code, &joining).await;
+        let (status, body) = served
+            .join_as(&code, &joining, Some("personal-mac"), Some("100.91.54.18"))
+            .await;
+
+        assert_eq!(status, 503, "{body}");
+        let error = error_of(&body);
+        assert!(error.contains(&peer.to_string()), "{error}");
+        assert!(!body.contains(&code), "the code reached the answer: {body}");
+        assert_eq!(served.held(joining.me()), None);
+
+        // This machine comes to act, and the same machine sends the same code again.
+        let mut acting = served.settings();
+        acting.seq += 1;
+        acting.priority.reverse();
+        served.store.lock().unwrap().apply_settings(acting).unwrap();
+        let (status, body) = served
+            .join_as(&code, &joining, Some("personal-mac"), Some("100.91.54.18"))
+            .await;
 
         assert_eq!(status, 200, "{body}");
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while !logged.text().contains("WARN") {
-            assert!(tokio::time::Instant::now() < deadline, "nothing was warned");
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        let text = logged.text();
-        assert!(text.contains(&joining.me().to_string()), "{text}");
-        assert!(!text.contains(&code), "the code reached the log: {text}");
-        assert!(
-            !served
-                .settings()
-                .machines
-                .iter()
-                .any(|m| m.id == joining.me())
+        assert_eq!(
+            served.held(joining.me()),
+            Some(keyed(&joining, "personal-mac", "100.91.54.18"))
         );
     }
 
