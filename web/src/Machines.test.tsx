@@ -218,6 +218,163 @@ describe("Machines", () => {
     });
   });
 
+  describe("limits", () => {
+    const limited = settings({
+      machines: twoMachines.machines,
+      limits: { [ME]: { max_sessions: 4, max_load_per_core: 1.5, min_free_disk: 20_000_000_000 } },
+    });
+    const showLimited = (given = limited) => renderApp(<Machines machines={fleet(records, given)} history={{}} here={ME} connected />);
+    const open = () => fireEvent.click(within(card("studio")).getByRole("button", { name: "Limits" }));
+    const dialog = () => screen.getByRole("dialog", { name: "studio" });
+    const sessionsField = () => within(dialog()).getByRole<HTMLInputElement>("spinbutton", { name: "Max sessions" });
+    const loadField = () => within(dialog()).getByRole<HTMLInputElement>("spinbutton", { name: "Max load per core" });
+    const diskField = () => within(dialog()).getByRole<HTMLInputElement>("spinbutton", { name: "Min free disk (GB)" });
+
+    it("shows each machine's limits on its card, or that it has none", async () => {
+      await showLimited();
+
+      expect(within(card("studio")).getByText("At most 4 sessions · load 1.5 per core · 20 GB disk free")).toBeDefined();
+      expect(within(card("laptop")).getByText("No limits")).toBeDefined();
+    });
+
+    it("opens a dialog titled with the machine's name, the fields filled from its limits", async () => {
+      await showLimited();
+
+      open();
+
+      expect(sessionsField().value).toBe("4");
+      expect(loadField().value).toBe("1.5");
+      expect(diskField().value).toBe("20");
+    });
+
+    it("opens the fields empty for a machine with no limits and disables Clear", async () => {
+      await showLimited();
+
+      fireEvent.click(within(card("laptop")).getByRole("button", { name: "Limits" }));
+
+      expect(within(screen.getByRole("dialog", { name: "laptop" })).getByRole<HTMLInputElement>("spinbutton", { name: "Max sessions" }).value).toBe("");
+      expect(within(screen.getByRole("dialog", { name: "laptop" })).getByRole<HTMLButtonElement>("button", { name: "Clear" }).disabled).toBe(true);
+    });
+
+    it("Save posts the three fields as numbers, the disk in gigabytes, and closes on 204", async () => {
+      const calls = mockFetch(new Response(null, { status: 204 }));
+      await showLimited();
+
+      open();
+      fireEvent.change(sessionsField(), { target: { value: "6" } });
+      fireEvent.change(loadField(), { target: { value: "0.8" } });
+      fireEvent.change(diskField(), { target: { value: "4.35" } });
+      fireEvent.click(within(dialog()).getByRole("button", { name: "Save" }));
+
+      await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+      expect(calls).toEqual([
+        { url: `/api/machines/${ME}/limits`, method: "POST", body: { max_sessions: 6, max_load_per_core: 0.8, min_free_disk_gb: 4.35 } },
+      ]);
+    });
+
+    it("Save with the disk field left alone posts the stored disk limit exactly", async () => {
+      const calls = mockFetch(new Response(null, { status: 204 }));
+      await showLimited(settings({ machines: twoMachines.machines, limits: { [ME]: { max_sessions: 4, max_load_per_core: 1.5, min_free_disk: 4_355_500_000 } } }));
+
+      open();
+      expect(diskField().value).toBe("4.3555");
+      fireEvent.change(sessionsField(), { target: { value: "5" } });
+      fireEvent.click(within(dialog()).getByRole("button", { name: "Save" }));
+
+      await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+      expect(calls[0].body).toEqual({ max_sessions: 5, max_load_per_core: 1.5, min_free_disk_gb: 4.3555 });
+    });
+
+    it("fills a disk limit of a single byte over a gigabyte exactly and saves it unchanged", async () => {
+      const calls = mockFetch(new Response(null, { status: 204 }));
+      await showLimited(settings({ machines: twoMachines.machines, limits: { [ME]: { max_sessions: 4, max_load_per_core: 1.5, min_free_disk: 1_000_000_001 } } }));
+
+      open();
+      expect(diskField().value).toBe("1.000000001");
+      fireEvent.click(within(dialog()).getByRole("button", { name: "Save" }));
+
+      await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+      expect(calls[0].body).toEqual({ max_sessions: 4, max_load_per_core: 1.5, min_free_disk_gb: 1.000000001 });
+    });
+
+    it("shows a disk limit on the card to three decimals", async () => {
+      await showLimited(settings({ machines: twoMachines.machines, limits: { [ME]: { max_sessions: 4, max_load_per_core: 1.5, min_free_disk: 4_355_500_000 } } }));
+
+      expect(within(card("studio")).getByText("At most 4 sessions · load 1.5 per core · 4.356 GB disk free")).toBeDefined();
+    });
+
+    it("says what the dialog does with each limit", async () => {
+      await showLimited();
+
+      open();
+
+      expect(within(dialog()).getByText("Placement skips this machine while it has this many sessions or more, this load per core or more, or less free disk than this.")).toBeDefined();
+    });
+
+    it("sends an empty field as null, which the daemon refuses", async () => {
+      const calls = mockFetch(json(422, { error: "the maximum sessions is a whole number from 1 to 4294967295" }));
+      await showLimited();
+
+      fireEvent.click(within(card("laptop")).getByRole("button", { name: "Limits" }));
+      const laptop = within(screen.getByRole("dialog", { name: "laptop" }));
+      fireEvent.change(laptop.getByRole("spinbutton", { name: "Max load per core" }), { target: { value: "1" } });
+      fireEvent.click(laptop.getByRole("button", { name: "Save" }));
+
+      await screen.findByRole("alert");
+      expect(calls).toEqual([
+        { url: `/api/machines/${OTHER}/limits`, method: "POST", body: { max_sessions: null, max_load_per_core: 1, min_free_disk_gb: null } },
+      ]);
+    });
+
+    it("Clear posts to the clear route and closes on 204", async () => {
+      const calls = mockFetch(new Response(null, { status: 204 }));
+      await showLimited();
+
+      open();
+      fireEvent.click(within(dialog()).getByRole("button", { name: "Clear" }));
+
+      await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+      expect(calls).toEqual([{ url: `/api/machines/${ME}/limits/clear`, method: "POST", body: undefined }]);
+    });
+
+    it("shows a 422's error in the dialog and keeps the values", async () => {
+      mockFetch(json(422, { error: "the maximum load per core is a number above 0" }));
+      await showLimited();
+
+      open();
+      fireEvent.change(loadField(), { target: { value: "0" } });
+      fireEvent.click(within(dialog()).getByRole("button", { name: "Save" }));
+
+      expect((await screen.findByRole("alert")).textContent).toBe("the maximum load per core is a number above 0");
+      expect(loadField().value).toBe("0");
+      expect(sessionsField().value).toBe("4");
+      expect(diskField().value).toBe("20");
+    });
+
+    it("fills the fields from the current limits each time it opens", async () => {
+      mockFetch(json(422, { error: "no" }));
+      await showLimited();
+
+      open();
+      fireEvent.change(sessionsField(), { target: { value: "9" } });
+      fireEvent.keyDown(dialog(), { key: "Escape" });
+      await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+      open();
+
+      expect(sessionsField().value).toBe("4");
+    });
+
+    it("offers no Limits for a machine not in the machine list yet", async () => {
+      mockFetch();
+      const listed = settings({ machines: [{ id: ME, name: "studio", address: "" }] });
+      await showLimited(listed);
+
+      const unlisted = screen.getAllByRole("article").find((article) => !within(article).queryByText("This machine"))!;
+      expect(within(unlisted).queryByRole("button", { name: "Limits" })).toBeNull();
+      expect(within(card("studio")).getByRole("button", { name: "Limits" })).toBeDefined();
+    });
+  });
+
   describe("adding a machine", () => {
     const added = { code: "K7QX3M9PRT", command: "foundryd join 100.101.102.103 K7QX3M9PRT", expires_in_secs: 600 };
     const nameField = () => screen.getByRole<HTMLInputElement>("textbox", { name: "Name" });
