@@ -327,7 +327,12 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
     let listener = api::bind(local).await?;
     tracing::info!("listening on {local}");
     let mut tailscale = Tailscale::new(port, app.clone());
-    let listing = tailscale.listing(me, coordinator.clone(), store.clone());
+    let listing = tailscale.listing(
+        me,
+        keys.public_key().hex().to_owned(),
+        coordinator.clone(),
+        store.clone(),
+    );
     // Taken before the first scan, so the listing hears its answer.
     let answered = tailscale.answered.subscribe();
     tailscale.scan(true, tailscale_ips().await).await;
@@ -739,11 +744,13 @@ impl Tailscale {
     fn listing(
         &self,
         me: foundry_proto::ids::MachineId,
+        key: String,
         coordinator: Arc<crate::coordinator::Coordinator>,
         store: Arc<Mutex<Store>>,
     ) -> api::machine_names::Listing {
         api::machine_names::Listing::new(
             me,
+            key,
             coordinator,
             store,
             crate::sync::OFFLINE_AFTER,
@@ -1292,7 +1299,7 @@ mod tests {
         ));
         peers.coordinate(coordinator.clone());
         let mut tailscale = Tailscale::new(7433, Router::new());
-        let mut listing = tailscale.listing(me, coordinator, store.clone());
+        let mut listing = tailscale.listing(me, String::new(), coordinator, store.clone());
         let here = || {
             Ok(Entry {
                 name: "personal-mac".into(),

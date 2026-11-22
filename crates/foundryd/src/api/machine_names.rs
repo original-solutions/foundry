@@ -3,8 +3,9 @@
 //! coordinator, as every shared-settings change does.
 //!
 //! - [`Listing`] keeps this machine in the list. Fed what [`entry`] reads from
-//!   `tailscale status --self --json`, it adds the machine when the list does not hold it,
-//!   moves its address when that changed, and never touches a name it has seen set.
+//!   `tailscale status --self --json`, it adds the machine with its public key when the list
+//!   does not hold it, moves its address when that changed, puts its key back when the entry
+//!   holds none or another, and never touches a name it has seen set.
 //! - `POST /api/machines/{id}/rename` `{name}`: sets a listed machine's name, trimmed, and
 //!   keeps its address, `204`. A name that is blank, over [`NAME_AT_MOST`] characters or holds
 //!   a control character is `422`; a name another machine has, compared trimmed and in any
@@ -98,6 +99,8 @@ pub fn entry(status: &[u8], host: Option<&str>) -> Result<Entry, String> {
 /// Keeps this machine in the shared machine list, at the address Tailscale gives it.
 pub struct Listing {
     me: MachineId,
+    /// This machine's public key, as hex: what its entry carries.
+    key: String,
     coordinator: Arc<Coordinator>,
     store: Arc<Mutex<Store>>,
     /// Whether the last look failed, so a failure is warned about once until a look succeeds.
@@ -113,9 +116,11 @@ pub struct Listing {
 impl Listing {
     /// A listing that gives peers' copies `settle` to arrive: the daemon passes
     /// [`OFFLINE_AFTER`](crate::sync::OFFLINE_AFTER), the time a peer has to be heard from.
-    /// `away` is the address watch's mark that Tailscale was away.
+    /// `away` is the address watch's mark that Tailscale was away. `key` is this machine's
+    /// public key, as hex.
     pub fn new(
         me: MachineId,
+        key: String,
         coordinator: Arc<Coordinator>,
         store: Arc<Mutex<Store>>,
         settle: Duration,
@@ -123,6 +128,7 @@ impl Listing {
     ) -> Self {
         Self {
             me,
+            key,
             coordinator,
             store,
             warned: false,
@@ -132,8 +138,9 @@ impl Listing {
         }
     }
 
-    /// Adds this machine to the list under `entry`'s name when the list does not hold it, and
-    /// moves it to `entry`'s address, keeping its name, when the address it holds differs.
+    /// Adds this machine to the list under `entry`'s name, with its key, when the list does not
+    /// hold it, and moves it to `entry`'s address and its own key, keeping its name, when the
+    /// address or the key it holds differs.
     /// A failure, or no entry, is logged once until a look succeeds; the next look tries again.
     ///
     /// The look that first finds an edit to send sends nothing: one at least the settle time
@@ -169,10 +176,11 @@ impl Listing {
                 id: self.me,
                 name: entry.name,
                 address: entry.address,
-                key: String::new(),
+                key: self.key.clone(),
             },
-            Some(held) if held.address != entry.address => Machine {
+            Some(held) if held.address != entry.address || held.key != self.key => Machine {
                 address: entry.address,
+                key: self.key.clone(),
                 ..held.clone()
             },
             Some(_) => {
@@ -881,7 +889,7 @@ mod tests {
         acting.priority = vec![served.me, peer];
         served.store.lock().unwrap().apply_settings(acting).unwrap();
         listing.list(here("personal-mac", "100.91.54.18")).await;
-        assert!(served.settings().machines.contains(&machine(
+        assert!(served.settings().machines.contains(&own(
             served.me,
             "personal-mac",
             "100.91.54.18"
@@ -940,7 +948,7 @@ mod tests {
 
         tokio::time::sleep(SETTLE).await;
         listing.list(here("personal-mac", "100.91.54.18")).await;
-        assert!(served.settings().machines.contains(&machine(
+        assert!(served.settings().machines.contains(&own(
             served.me,
             "personal-mac",
             "100.91.54.18"

@@ -403,6 +403,11 @@ pub enum KeyState {
 pub struct PublicKey(String);
 
 impl PublicKey {
+    /// The key as hex, as a machine-list entry carries it.
+    pub fn hex(&self) -> &str {
+        &self.0
+    }
+
     fn verifier(&self) -> Option<UnparsedPublicKey<Vec<u8>>> {
         let bytes = unhex(&self.0).filter(|b| b.len() == ED25519_PUBLIC_KEY_LENGTH)?;
         Some(UnparsedPublicKey::new(&ED25519, bytes))
