@@ -25,6 +25,8 @@
 //! The key table is held in this machine's secret store. It holds only public keys. Each
 //! machine's public key also travels in its machine-list entry, and every machine admits the
 //! keys its list carries ([`Keys::follow`]), so a machine admitted by one is admitted by all.
+//! A machine removed from the list is revoked by every machine that holds its key
+//! ([`Keys::refuse_removed`]), so its links close; listing its key again never re-admits it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -43,7 +45,7 @@ use axum::routing::post;
 use axum::{Json, Router};
 use foundry_proto::ids::MachineId;
 use foundry_proto::messages::PeerMessage;
-use foundry_proto::settings::Machine;
+use foundry_proto::settings::{Machine, SettingKey, SharedSettings, StampKey};
 use futures::future::BoxFuture;
 use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
@@ -54,7 +56,7 @@ use tokio::time::{Instant, timeout};
 use crate::api::machine_add::Lister;
 use crate::api::machine_names;
 use crate::secrets::{self, Secrets, SecretsError};
-use crate::store::{Store, StoreError};
+use crate::store::Store;
 use crate::sync::{Conn, Dialer, OFFLINE_AFTER, Peers, on_store};
 
 /// How long a join code works after it is shown.
@@ -832,10 +834,51 @@ impl Keys {
         })
     }
 
-    /// Admits the keys the machine list in `store` carries, by [`Keys::learn`], whenever the
-    /// settings change, checked every [`RECHECK`], until the returned future is dropped. A
-    /// change it could not save is tried again on the next check, and warned about once until
-    /// one succeeds.
+    /// Revokes each machine `settings` shows removed from the machine list, a machine with a
+    /// `Machine` stamp and no list entry, that the key table holds active. This machine is never
+    /// revoked, and a machine held no key for, or already revoked, stays as it is. All are
+    /// revoked in one save, and nothing is saved when there is nothing to revoke.
+    ///
+    /// Blocks on the secret store, as [`Keys::open`] does, and behind any other change to the
+    /// key table in this process.
+    pub fn refuse_removed(&self, settings: &SharedSettings) -> Result<(), JoinError> {
+        let me = self.me();
+        let removed: Vec<MachineId> = settings
+            .stamps
+            .keys()
+            .filter_map(|key| match key {
+                StampKey::Setting(SettingKey::Machine(id)) => Some(*id),
+                _ => None,
+            })
+            .filter(|id| *id != me && !settings.machines.iter().any(|m| m.id == *id))
+            .collect();
+        let saving = self.saving()?;
+        let held: Vec<MachineId> = {
+            let table = self.held();
+            removed
+                .into_iter()
+                .filter(|id| matches!(table.machines.get(id), Some(Entry::Active { .. })))
+                .collect()
+        };
+        if held.is_empty() {
+            return Ok(());
+        }
+        self.change(&saving, |machines| {
+            for id in &held {
+                // Only a key held active is revoked, as the stored table has it now.
+                if matches!(machines.get(id), Some(Entry::Active { .. })) {
+                    machines.insert(*id, Entry::Revoked);
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Acts on the machine list in `store` whenever the settings change, checked every
+    /// [`RECHECK`], until the returned future is dropped: first [`Keys::refuse_removed`], then
+    /// admits the keys the list carries by [`Keys::learn`], so a machine removed is never
+    /// admitted again from the list. A change it could not save is tried again on the next
+    /// check, and warned about once until one succeeds.
     pub async fn follow(&self, store: Arc<Mutex<Store>>) {
         let mut seen = None;
         let mut warned = false;
@@ -843,20 +886,23 @@ impl Keys {
         loop {
             every.tick().await;
             let prev = seen;
-            let changed = on_store(&store, move |store| {
-                Ok::<_, StoreError>(store.settings_since(prev)?.map(|s| (s.seq, s.machines)))
-            })
-            .await;
-            let (seq, machines) = match changed {
-                Ok(Some(changed)) => changed,
+            let changed = on_store(&store, move |store| store.settings_since(prev)).await;
+            let settings = match changed {
+                Ok(Some(settings)) => settings,
                 Ok(None) => continue,
                 Err(error) => {
                     tracing::warn!("join: cannot read the machine list for its keys: {error}");
                     continue;
                 }
             };
+            let seq = settings.seq;
             let keys = self.clone();
-            match tokio::task::spawn_blocking(move || keys.learn(&machines)).await {
+            let acted = tokio::task::spawn_blocking(move || {
+                keys.refuse_removed(&settings)?;
+                keys.learn(&settings.machines)
+            })
+            .await;
+            match acted {
                 Ok(Ok(())) => {
                     seen = Some(seq);
                     warned = false;
@@ -864,7 +910,7 @@ impl Keys {
                 Ok(Err(error)) => {
                     if !warned {
                         tracing::warn!(
-                            "join: cannot admit the keys the machine list carries, trying again: \
+                            "join: cannot update the keys from the machine list, trying again: \
                              {error}"
                         );
                     }
@@ -873,7 +919,7 @@ impl Keys {
                 Err(error) => {
                     if !warned {
                         tracing::warn!(
-                            "join: admitting the keys the machine list carries stopped, trying \
+                            "join: updating the keys from the machine list stopped, trying \
                              again: {error}"
                         );
                     }

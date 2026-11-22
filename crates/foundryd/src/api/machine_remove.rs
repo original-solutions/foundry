@@ -1,11 +1,70 @@
-//! Removing a machine from the fleet.
+//! Removing a machine from the fleet, from another machine's UI.
+//!
+//! - `POST /api/machines/{id}/remove`: removes a listed machine from the machine list through
+//!   the acting coordinator, `204`. Every machine that sees it gone from the list revokes the
+//!   machine's key ([`Keys::refuse_removed`](crate::join::Keys::refuse_removed)) and closes its
+//!   links.
+//!
+//! The machine that serves the request cannot be removed from its own UI: that is `409`. An id
+//! the machine list does not hold is `404`. Nothing is sent when a request is refused, and an
+//! edit the coordinator could not make answers through [`edit_status`]. The machine's records
+//! stay.
 
 use std::sync::{Arc, Mutex};
 
+use axum::Router;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::routing::post;
 use foundry_proto::ids::MachineId;
+use foundry_proto::settings::Edit;
 
+use super::{ApiError, edit_status, on_store, parse_id};
 use crate::coordinator::Coordinator;
 use crate::store::Store;
+
+/// What the remove route acts on: this machine's id, the coordinator that sends the edit and
+/// the store whose machine list says whether to send it.
+struct Held {
+    me: MachineId,
+    coordinator: Arc<Coordinator>,
+    store: Arc<Mutex<Store>>,
+}
+
+/// The remove route of the machine `me`. The caller guards it as it guards the rest of the API.
+pub fn router(me: MachineId, coordinator: Arc<Coordinator>, store: Arc<Mutex<Store>>) -> Router {
+    Router::new()
+        .route("/api/machines/{id}/remove", post(remove))
+        .with_state(Arc::new(Held {
+            me,
+            coordinator,
+            store,
+        }))
+}
+
+async fn remove(
+    State(held): State<Arc<Held>>,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    let id = parse_id(&id, "machine", MachineId)?;
+    if id == held.me {
+        return Err(ApiError::Rejected(
+            StatusCode::CONFLICT,
+            "remove a machine from another machine's UI".to_owned(),
+        ));
+    }
+    let settings = on_store(&held.store, |store| store.settings()).await?;
+    if !settings.machines.iter().any(|m| m.id == id) {
+        return Err(ApiError::NotFound(format!(
+            "no machine {id} in the machine list"
+        )));
+    }
+    match held.coordinator.edit(Edit::RemoveMachine { id }).await {
+        Ok(_) => Ok(StatusCode::NO_CONTENT.into_response()),
+        Err(e) => Err(ApiError::Rejected(edit_status(&e), e.to_string())),
+    }
+}
 
 #[cfg(test)]
 mod tests {
