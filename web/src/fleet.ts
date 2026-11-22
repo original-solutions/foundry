@@ -91,7 +91,14 @@ export interface MachineView {
   workspaces: WorkspaceView[];
 }
 
-/** The sidebar's model. Machine rules follow `foundryd status`. `briefs` name sessions by what they were asked. */
+/**
+ * The model the sidebar, the board and the machines board share. Machine rules follow `foundryd
+ * status`. `briefs` name sessions by what they were asked. Once the machine list holds a machine,
+ * a machine it does not hold (a removed one) has no workspaces, so none of its workspaces,
+ * terminals or sessions show anywhere; its card stays, named by id with its last sample. Its
+ * records stay in the state. While the list is empty (a lone machine that has not listed itself
+ * yet) nothing is hidden.
+ */
 export function fleet(records: AnyRecord[], settings: SharedSettings, briefs: Briefs = {}): MachineView[] {
   const machineNames = new Map<string, string>();
   const machineAddresses = new Map<string, string>();
@@ -200,7 +207,7 @@ export function fleet(records: AnyRecord[], settings: SharedSettings, briefs: Br
     limits: settings.limits[id],
     status: statusByOwner.get(id) ?? "unknown",
     sample: samplesByOwner.get(id)?.body ?? null,
-    workspaces: (workspacesByOwner.get(id) ?? []).map((w) => {
+    workspaces: (settings.machines.length > 0 && !machineNames.has(id) ? [] : (workspacesByOwner.get(id) ?? [])).map((w) => {
       const mine = byOpening(sessionsByWorkspace.get(w.id) ?? [], (s) => s.terminal);
       const sessionNames = numbered(mine.map((s) => s.model));
       const shells = byOpening(shellsOf.get(w.id) ?? [], (t) => t.id);
