@@ -41,11 +41,15 @@ pub fn router(coordinator: Arc<Coordinator>, store: Arc<Mutex<Store>>) -> Router
         .with_state(Arc::new(Held { coordinator, store }))
 }
 
+/// A field the UI leaves blank is `null` or missing; it reaches [`checked`] as `None`.
 #[derive(Deserialize)]
 struct Wanted {
-    max_sessions: f64,
-    max_load_per_core: f64,
-    min_free_disk_gb: f64,
+    #[serde(default)]
+    max_sessions: Option<f64>,
+    #[serde(default)]
+    max_load_per_core: Option<f64>,
+    #[serde(default)]
+    min_free_disk_gb: Option<f64>,
 }
 
 /// `gb` gigabytes (10^9 bytes) as bytes, rounded down, read from the number's shortest decimal
@@ -72,7 +76,7 @@ fn gb_to_bytes(gb: f64) -> Option<u64> {
 
 /// The limits `wanted` asks for, or why they are refused.
 fn checked(wanted: &Wanted) -> Result<Limits, ApiError> {
-    let sessions = wanted.max_sessions;
+    let sessions = wanted.max_sessions.unwrap_or(f64::NAN);
     if !sessions.is_finite()
         || sessions.fract() != 0.0
         || sessions < 1.0
@@ -83,13 +87,13 @@ fn checked(wanted: &Wanted) -> Result<Limits, ApiError> {
             u32::MAX
         )));
     }
-    let load = wanted.max_load_per_core;
+    let load = wanted.max_load_per_core.unwrap_or(f64::NAN);
     if !load.is_finite() || load <= 0.0 {
         return Err(unprocessable(
             "the maximum load per core is a number above 0".to_owned(),
         ));
     }
-    let Some(min_free_disk) = gb_to_bytes(wanted.min_free_disk_gb) else {
+    let Some(min_free_disk) = wanted.min_free_disk_gb.and_then(gb_to_bytes) else {
         return Err(unprocessable(
             "the minimum free disk is a number of gigabytes, 0 or more".to_owned(),
         ));
