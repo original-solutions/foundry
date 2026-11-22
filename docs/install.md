@@ -99,6 +99,12 @@ The dialog says when the machine has joined, and its card shows on the board und
 
 Run `foundryd join` from a release at least as new as the one on the machine you join through. An older `foundryd join` still joins. But when the machine cannot be listed it says to ask for a new code, where running the same command again is what works, and it gives up after 10 seconds while the fleet may take half a minute to answer.
 
+## Remove a machine
+
+Open the machines board of another machine in the fleet, click **Remove from fleet** on the card of the machine to remove, and confirm. A machine cannot be removed from its own UI. Every machine then refuses it: each revokes its key and closes its links, and the board stops listing its workspaces, terminals and sessions. Its workspaces stay on its disk.
+
+A removed machine has to be given a new identity before it can join again. That is not built yet, so for now a removed machine cannot rejoin.
+
 ## Change a setting
 
 `install` writes the service from the current shell alone. To change a variable, export every one the service needs again first: `FOUNDRY_HOME` if you use it, `FOUNDRY_GATEWAY_URL`, and any of `PATH`, `FOUNDRY_PORT` and `CLAUDE_CONFIG_DIR` you set. Then run:
