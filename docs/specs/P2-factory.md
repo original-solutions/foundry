@@ -2,7 +2,7 @@
 
 Product: Foundry, a dark software factory that also runs manual sessions.
 
-Status: design, written 2026-11-22 and revised the same day after a review against P1's code on `main` (v0.2.0). Nothing here is built. The plan comes after the checks at the end of this spec and after P1's open fleet and session fixes land.
+Status: design, written 2026-11-22 and revised twice the same day after reviews against P1's code on `main` (v0.2.0). Nothing here is built. The plan comes after the checks at the end of this spec and after the P1 issues named under "Before P2 starts" are closed.
 
 ## Why
 
@@ -23,7 +23,7 @@ In:
 - A factory switch per project, with the GitHub login the project acts as.
 - GitHub tokens per machine, in each machine's own secret store.
 - A lease per project, a ref in the project's repo.
-- Factory attention items and a Factory view in the UI.
+- Factory attention items and a Factory view in the UI, the same on every machine.
 - The additions to P1 that the factory needs, listed under "What P1 gains".
 
 Out, and where it goes:
@@ -32,8 +32,15 @@ Out, and where it goes:
 - A native `retro`: later. The exit week uses the runner's.
 - Linear: P4.
 - Cloud targets, `default_project` inference, model fallbacks, `factory.owner` and the belt page: dropped. The Foundry UI replaces the belt.
+- Repos reached over SSH. A project's factory can be turned on only when its repo URL is `https://github.com/...`.
 
 Where this spec says "as the runner does" or is silent on a rule of the lifecycle, the runner's code and tests at commit `8ed9bef` decide.
+
+## Before P2 starts
+
+- #96 is closed. A session must keep taking its hooks after its daemon restarts. Today a restart, which every update causes, leaves the Stop hook refused, and a factory run would hang until `limits.minutes`.
+- #85 and #87 are closed, so a fleet's machines all link and a removed machine's key is revoked.
+- P1's acceptance run has passed.
 
 ## Decisions
 
@@ -41,29 +48,31 @@ Where this spec says "as the runner does" or is silent on a rule of the lifecycl
 |---|---|---|
 | F1 | Port or adapter | Port the runner's core to Rust inside `foundryd`. The runner's tests are the behaviour spec. Driving `foundryd` from the TypeScript runner through a new adapter was rejected: it keeps a second process, store and updater, and pins the factory to one machine while the coordinator moves |
 | F2 | Who runs the factory | The acting coordinator, for each project whose lease it holds. Builds and gates run on any machine placement picks |
-| F3 | How a run is hosted | A P1 workspace with a P1 session. A gate is a P1 workspace with a shell terminal. There is no second way of starting work |
-| F4 | GitHub logins | Each machine holds tokens for the logins it can act as, and names one as its default. Turning a project's factory on writes the login it acts as into the project's setting, taken from the coordinator's default at that moment and editable. Tokens never leave the machine that holds them |
+| F3 | How a run is hosted | A P1 workspace with a P1 session. A gate is a P1 workspace whose setup terminal runs the gate. There is no second way of starting work |
+| F4 | GitHub logins | Each machine holds tokens for the logins it can act as, and names one as its default. Turning a project's factory on writes the login it acts as into the project's factory setting, taken from the coordinator's default at that moment and editable. Tokens never leave the machine that holds them |
 | F5 | Where an issue's state lives | GitHub: labels, the claim comment, the status comment, the pull request. Run steps are synced `run_event` records. A new coordinator rebuilds its view from both and needs nothing handed over |
-| F6 | Order of run events | By lease generation, then by the writing machine's record version. No clock is compared |
+| F6 | Order of run events | By lease generation, then by the writing machine's factory version. No clock is compared |
 | F7 | When to claim | Only when placement can place the run now. The runner claims first and waits for a slot; #96 sat in `triage` for 72 minutes on 2026-11-21 |
 | F8 | Cutover order | foundry first, then the runner's other repos one at a time |
 | F9 | `factory.owner` | Ignored, with a line in the Factory view when a repo sets it. The lease decides which machine acts. An owner that is not the acting coordinator would leave the project idle for good |
+| F10 | What every machine knows of the factory | The lease holder writes one `factory_status` record per project each pass. Every machine draws the Factory view and the factory's attention items from it, and a worker uses it to know the holder is still there |
+| F11 | Where factory records are kept | In a table of their own with their own version per owner and their own sync cursor, apart from P1's records. Existing P1 records and settings values gain no field |
 
 ## Architecture
 
 ```
 acting coordinator                        any machine placement picks
 ┌─────────────────────────────┐           ┌───────────────────────────────┐
-│ factory::pass, every poll   │──create──►│ workspace fac/<N>-<attempt>   │
+│ factory::pass, every poll   │──create──►│ build workspace               │
 │  ├ lease (refs/factory/)    │  (peer    │  └ session: claude with the   │
 │  ├ github (gh, token)       │   link)   │    launch message, GH_TOKEN,  │
 │  ├ lifecycle (pure)         │◄─records──│    skipped permissions        │
 │  ├ runs                     │  (sync)   │                               │
 │  └ ledger (run events)      │◄─calls────│ each turn's final message,    │
 │                             │  (peer    │ kept on disk by its machine   │
-│                             │   link)   │                               │
-│                             │──create──►│ gate workspace                │
-└─────────────────────────────┘           │  └ shell terminal: provision  │
+│ writes factory_status ──────┼──sync────►│                               │
+│ to every machine            │──create──►│ gate workspace                │
+└─────────────────────────────┘           │  └ setup terminal: provision  │
                                           │    and gate; exit code from   │
                                           │    the holder                 │
                                           └───────────────────────────────┘
@@ -72,16 +81,16 @@ acting coordinator                        any machine placement picks
 | Unit | Job | Ported from (`factory-on-paradev/src/`) |
 |---|---|---|
 | `factory::lifecycle` | Pure functions: the state machine, approval, `## Depends on`, `## Base`, the result line | `domain/` |
-| `factory::github` | Issues, labels, comments, pull requests, checks and dependency links through `gh`, behind a trait | `tracker/` |
+| `factory::github` | Issues, labels, comments, pull requests, checks and dependency links through `gh`, behind a trait. Every call ends within 30 seconds | `tracker/` |
 | `factory::lease` | Takes, renews and drops a project's lease | New |
 | `factory::runs` | One run's steps: claim, place, launch, watch, gate, feedback, stop, resume | `runner/`, `claims.ts` |
 | `factory::gate` | The gate in a fresh worktree of the pull request's head, with the runner's git hardening | `gate.ts`, `gitHardening.ts` |
-| `factory::ledger` | `run_event` records and the export | `ledger/` |
-| `factory::pass` | Each pass: reconcile with GitHub, advance the runs, then claim if placement has room | `pass.ts` |
+| `factory::ledger` | `run_event` and `factory_status` records, and the export | `ledger/` |
+| `factory::pass` | Each pass: reconcile with GitHub, advance the runs, then claim if placement has room. No step of a pass waits on a worker's setup or build; it looks again next pass | `pass.ts` |
 
-`factory` depends on P1's `placement`, `workspaces`, `sessions`, `sync`, `coordinator`, `store` and `attention`. Nothing in P1 depends on `factory`.
+`factory` depends on P1's `placement`, `workspaces`, `sessions`, `sync`, `coordinator`, `store` and `attention`. P1's `attention` and `web` read `factory_status`. Nothing else in P1 depends on `factory`.
 
-A factory session is a P1 session with three additions:
+A factory session is a P1 session started with factory options (G12):
 
 - Claude Code starts with `--dangerously-skip-permissions`, and with the model and effort from the factory settings.
 - `GH_TOKEN` is set from the worker's own secret store for the project's login.
@@ -93,18 +102,21 @@ P1 as built on `main` cannot carry a run that lives on another machine than the 
 
 | # | Unit | Today | Gains |
 |---|---|---|---|
-| G1 | `sessions` | The Stop hook's last message is kept in memory only, cut to 600 characters, never leaves its machine, and has every word of 24 or more mixed letters and digits hidden, which can break a URL | Each turn's whole final message is written to disk by the owning machine under a turn number that only rises. The session's record carries the newest turn number. Any machine reads a turn's message over the peer link by session id and turn number. Only known secrets are hidden: the gateway keys, session tokens and every `github:*` token the machine holds |
-| G2 | `api` (carried routes) | Carries workspace create, sessions, shells, archive, and terminal close | Also carries "send a prompt to a session", typed as P1 types a first prompt and refused unless the session is idle |
-| G3 | `api`, `terminals` | A terminal of another machine can only be read as a raw byte stream | A carried read of the last lines of a terminal as plain text, escapes removed, at most 64 KB |
-| G4 | `workspaces` | `create` always makes a new branch from `origin/<base>`, refuses a branch that exists, and runs `factory.provision` from the worktree's own `.dw/config.yml` | Three ways to make a worktree: a new branch from a base (as now), an existing branch of `origin` (a local branch of that name is moved to it), and one commit with no branch. Setup is one of: the worktree's own provision (as now), a command list the caller gives, or none |
-| G5 | `workspaces` | git runs with whatever credentials the machine has | For a project with a login, every git call of that project on that machine gets the login's token through `GIT_ASKPASS`, with other credential helpers turned off for the call |
-| G6 | `attention` | Only "setting overwritten" can be dismissed | "Foreign claim" can be dismissed too, per issue and marker comment, so a later pass does not raise the same one again |
-| G7 | `foundry-proto`, `sync`, `store` | A record of an unknown kind is an error, in the store and on the link | `PROTOCOL` goes up by one. `run_event` records, the new shared settings and the new machine fields are sent only to a peer that speaks the new protocol |
-| G8 | `api` | `GET /api/state` returns every record | `run_event` records are left out of it and served by `GET /api/factory/runs` and `GET /api/factory/runs/{id}` |
-| G9 | `machine` | The machine's record has load, memory, disk and sessions | It also lists the GitHub logins the machine holds, so `foundryd secret set github:<login>` shows on every machine within one sample |
-| G10 | `sessions`, `workspaces` | A session cut off from the fleet runs on | A machine that has reached no peer for 10 minutes ends its factory sessions (see "When things go wrong") |
+| G1 | `sessions` | The Stop hook's last message and a notification's question are kept in memory only, cut short, never leave their machine, and have every word of 24 or more mixed letters and digits hidden, which can break a URL | For a factory session, each turn's whole final message and the newest question are written to disk by the owning machine. Turns are numbered, and the number only rises. The file is on disk before the session's record carries the new turn number, and a Stop that changes no state still writes the record. The files go when the terminal is closed. Any machine reads a turn's message or the question through a carried call (G2). Known secrets are hidden (the gateway keys, session tokens, every `github:*` token the machine holds) and URL passwords, as P1 hides them. Nothing else is |
+| G2 | `api` (carried routes) | Carries workspace create, sessions, shells, archive, and terminal close, all as `POST` | Also carries: start a factory session (G12), send a prompt to a session (typed as P1 types a first prompt, at most P1's 20,000 characters, refused unless the session is idle), read a turn's message or question (G1), read a terminal's tail (G3), end a workspace's factory sessions, and stop a run (carried to the lease holder). All are `POST`, since a carried call is one |
+| G3 | `terminals` | A terminal of another machine can only be read as a raw byte stream | A read of the last lines of a terminal as plain text, escapes removed, at most 64 KB |
+| G4 | `workspaces` | `create` always makes a new branch from `origin/<base>`, refuses a branch that exists, runs `factory.provision` from the worktree's own `.dw/config.yml`, turns `/` in a branch into `-`, and keeps each worktree in a folder named after its branch | Three ways to make a worktree: a new branch from a base (as now), an existing branch of `origin` (a local branch of that name is moved to it), and one commit with no branch. The caller may give the branch exactly, `/` kept. The worktree's folder is named by the workspace's id, so it no longer depends on the branch; folders made before this stay where they are. Setup is one of: the worktree's own provision (as now), a command list the caller gives, or none |
+| G5 | `workspaces` | git runs with whatever credentials the machine has | For a project whose factory is on, every git call of that project on that machine gets the login's token through `GIT_ASKPASS`, with other credential helpers turned off for the call |
+| G6 | `foundry-proto`, `sync`, `store` | One table and one version per owner for every record. A record of an unknown kind is an error, in the store and on the link | `PROTOCOL` goes from 4 to 5. Factory records (`run_event`, `factory_status`) get a table, a version per owner and a sync cursor of their own, and are sent only on a link whose two ends speak 5. A machine that updates later asks for them from zero and misses none. P1's record table, its catch-up, `GET /api/state`, `GET /api/events` and the attention list's record cache never hold a `run_event` |
+| G7 | `coordinator`, settings | A settings key of an unknown kind does not parse | Factory settings are keys of their own (`factory` for the fleet, `factory:<project>` for a project), so no existing value gains a field. They are never sent to a peer on protocol 4, and a settings copy merged from such a peer leaves them as they are. They cannot be edited while the acting coordinator is on protocol 4 |
+| G8 | `api`, `web` | | `GET /api/factory` returns each project's `factory_status`. `GET /api/factory/runs/{id}` returns a run's events. The events socket sends `factory_status` changes, never run events |
+| G9 | `machine` | The machine's record has load, memory, disk and sessions | The logins a machine holds are written in a factory record it owns, so `foundryd secret set github:<login>` shows on every machine at once and P1's machine record does not change |
+| G10 | `sessions` | A session cut off from the fleet runs on | A machine ends its factory sessions of a project when it has neither held that project's lease nor received a fresh `factory_status` for it for 10 minutes (see "When things go wrong") |
+| G11 | `secrets` | `secret set` takes only `gateway` and `gateway-management`. The store cannot list its names. `sessions` reads no secret after start | `secret set` takes `github:<login>`. The store lists its names. `sessions` reads the store at each session start and each time it hides secrets, so a new token needs no restart |
+| G12 | `sessions`, `api` | A session start takes a model and a prompt | A factory start, made only by the factory and never offered in the UI, also takes: skip permissions, effort, the login whose token becomes `GH_TOKEN`, and the project. The machine keeps "factory session of project P" with the session's files on disk |
+| G13 | `attention` | A stuck, failed or waiting session and a failed setup each raise an item | They raise none for a session or workspace a `factory_status` names, or that its own machine knows as a factory session |
 
-A fleet in the middle of an update has machines on both protocols. The factory runs only when the acting coordinator speaks the new one, and it places runs and gates only on machines that do.
+A fleet in the middle of an update has machines on both protocols. The factory runs only when the acting coordinator speaks protocol 5, and it places runs and gates only on machines that do.
 
 ## Config
 
@@ -127,11 +139,13 @@ Changed through the acting coordinator, like every P1 shared setting.
 | `max_gates` | fleet | 2 |
 | model, effort | fleet | `opus`, `high` |
 
-A run holds one of `max_runs` from its claim until its session reports its pull request or the run ends, as the runner counts it. A gate holds one of `max_gates` while it runs. Both sit on top of each machine's P1 limits. A pass that claims more than one issue counts each machine it picked as one session fuller for the rest of the pass, as P1's placement does for creates in flight.
+- A run holds one of `max_runs` from its claim until its session reports its pull request or the run ends, as the runner counts it. A gate failure sent back to that session can therefore put one more session to work than `max_runs`, as with the runner.
+- A gate holds one of `max_gates` while it runs. A gate has no session, so it does not count toward a machine's session limit. Its machine's load and disk limits apply.
+- A pass that claims more than one issue counts each machine it picked as one session fuller for the rest of the pass, as P1's placement does for creates in flight.
 
 ### GitHub tokens
 
-- `foundryd secret set github:<login>` stores a token in the machine's secret store. `foundryd github default <login>` names the machine's default, which is only read when a project's factory is turned on from that machine as coordinator.
+- `foundryd secret set github:<login>` stores a token in the machine's secret store (G11). `foundryd github default <login>` names the machine's default, which is only read when a project's factory is turned on while that machine is coordinator.
 - A project's login is a shared setting, so it does not change when the coordinator role moves. A coordinator that holds no token for it leaves the project idle and says so.
 - A token reaches a child process only through its environment: never an argument, a log line, an error, a record or the UI.
 - Every `github:*` token and gateway key a machine holds is hidden from all text the factory records or posts: comments, gate and setup output, messages sent to a session and `run_event` data.
@@ -139,64 +153,94 @@ A run holds one of `max_runs` from its claim until its session reports its pull 
 
 ## A run
 
+A run's workspaces are named from the run, and the name alone says what each is for:
+
+| Workspace | Name | Branch |
+|---|---|---|
+| Build | `fac/<N>-<attempt>` | new branch `fac/<N>-<attempt>` |
+| Resume after an interruption, the k-th | `fac/<N>-<attempt>-r<k>` | the pull request's branch when pushed, else a new branch of this name from the base |
+| Feedback round, the k-th | `fac/<N>-<attempt>-f<k>` | the pull request's branch |
+| Gate, the k-th | `fac/<N>-<attempt>-g<k>` | none: the pull request's head commit |
+
+The newest build, resume or feedback workspace is the run's active one. A run never has two workspaces on one branch on one machine: the earlier one is archived before the later one is made.
+
 1. **Pass.** The coordinator holds the project's lease and reads its `factory:ready` issues. As the runner does, it skips an issue that no instructor approved, that has an assignee, or that has an open blocker.
-2. **Claim.** Only when placement has a machine under its limits that holds the project's login, and a run slot is free. The claim swaps `ready` for `triage`, assigns the login, and posts the claim comment and status comment in the runner's format, naming the machine. `limits.minutes` counts from here, so a setup that hangs ends the run.
-3. **Launch.** The coordinator asks that machine, over the peer link, for workspace `fac/<N>-<attempt>` on a new branch from `## Base`, or from `factory.base` when the issue has none, with the worktree's own provision as setup. It waits for the setup terminal to exit. A failed setup makes the run stuck, with the tail of the setup terminal in the comment (G3). The coordinator then checks the approval again. An approval that was taken back ends the run the way the runner refuses an unapproved issue, and the workspace is archived. Otherwise the session starts with the launch message and the label moves to `building`.
-4. **Build.** The run follows the session's synced state. When a turn ends, the coordinator reads that turn's final message (G1) once per turn number.
+2. **Claim.** Only when placement has a machine under its limits that holds the project's login, and a run slot is free. The claim swaps `ready` for `triage`, assigns the login, and posts the claim comment and status comment in the runner's format, naming the machine.
+3. **Launch.** The coordinator asks that machine, over the peer link, for the build workspace from `## Base`, or from `factory.base` when the issue has none, with the worktree's own provision as setup. Later passes look at the setup terminal until it has exited. A failed setup makes the run stuck, with the tail of the setup terminal in the comment (G3). The coordinator then checks the approval again. An approval that was taken back ends the run the way the runner refuses an unapproved issue, and the workspace is archived by force. Otherwise the session starts with the launch message and the label moves to `building`.
+4. **Build.** The run follows the session's synced state. When a turn ends, the coordinator reads that turn's final message (G1) and records the turn number, so no turn is acted on twice.
    - `FACTORY-DONE: <PR URL>`, with a pull request on this repo, moves the run to the gate.
-   - `FACTORY-STOP: needs-info` posts the questions and moves the label to `needs-info`. The run ends: its session is ended, its workspace archived with its branch kept, its slot freed. When an instructor answers and sets `factory:ready`, the next attempt is a new run, as with the runner.
+   - `FACTORY-STOP: needs-info` posts the questions and moves the label to `needs-info`. The run ends: its session is ended, its workspace archived by force with its branch kept, its slot freed. When an instructor answers and sets `factory:ready`, the next attempt is a new run, as with the runner.
    - Any other stop, a malformed result line, or `limits.minutes` running out makes the run stuck, with the reason posted.
    - A turn that ends with no result line gets the runner's reminder once (G2). A second one makes the run stuck.
-   - A session that waits for a person makes the run stuck at once, with its question in the comment. Permissions are skipped, so nothing should ask.
+   - A session that waits for a person makes the run stuck at once, with its question (G1) in the comment. Permissions are skipped, so nothing should ask.
+   - A session whose process ends, with any exit code, before a result line was read is an interruption.
    - P1 marks a session stuck after 10 minutes of silence. The factory does nothing on that; a long build is silent for longer. `limits.minutes` ends such a run.
-5. **Gate.** Placement puts a gate workspace on a machine under its limits that holds the project's login, while a gate slot is free. The worktree is the pull request's head commit with no branch and no setup of its own. One shell terminal runs `provision` and then `gate`, both taken from the default branch's `.dw/config.yml` and given by the coordinator, so a pull request cannot change what gates it. The holder keeps the exit code. The run records the commit it gated.
+5. **Gate.** Placement puts a gate workspace on a machine under its load and disk limits that holds the project's login, while a gate slot is free. The worktree is the pull request's head commit with no branch. Its setup (G4) is the command list the coordinator gives: `provision` and then `gate`, both from the default branch's `.dw/config.yml`, so a pull request cannot change what gates it. The setup terminal's exit code is the gate's result. The run records the commit it gated.
    - On a pass, the run waits for `required_checks` on that same commit, up to `checks_minutes`. A check that fails is sent back to the session at once, as the runner does. When all pass, the pull request is marked ready for review and the label moves to `pr-open`.
    - A head that moved since the gate is gated again before anything is marked ready.
-   - On a fail, the tail of the output (G3) goes back to the same session as the runner sends it (G2), up to `gate_retries` times. Then the run is stuck.
+   - On a fail, the gate's output goes back to the same session as the runner sends it (G2), cut to its last 16,000 characters, up to `gate_retries` times. Then the run is stuck.
    - The gate workspace is archived by force when the gate ends. Its output tail is kept in the run's events.
-6. **Feedback.** In `pr-open`, every `feedback_seconds`, the factory reads new instructor comments on the pull request and the issue. As the runner does, it moves the label back to `building` and starts a new session in a new workspace on the pull request's branch (G4), with the runner's resumed message and the comments. That session takes a run slot and waits for placement like a claim, and its limits start fresh. Its new head is gated again.
+   - On reaching `pr-open`, the build session is ended and its workspace archived by force. Its branch is on `origin`. An idle session would count against its machine's session limit for as long as the pull request waits for review.
+6. **Feedback.** In `pr-open`, every `feedback_seconds`, the factory reads new instructor comments on the pull request and the issue. As the runner does, it moves the label back to `building` and starts a new session in a feedback workspace on the pull request's branch (G4), with the runner's resumed message and the comments. That session takes a run slot and waits for placement like a claim, and its limits start fresh. Its new head is gated again.
 7. **End.** A merged pull request or a closed issue ends the run and archives its workspaces by force.
 
-A factory session's "stuck", "failed" and "waiting for you" raise no P1 attention item of their own. The run's item covers them.
+`limits.minutes` counts the time a run spends in `triage` and `building` until its session reports a pull request, as the runner counts it. So a setup that hangs ends the run, and the waits for the gate and for required checks do not count. The time is taken from the timestamps the events carry, as in the runner's ledger. A machine with a wrong clock ends a run early or late. Timestamps never order events.
 
 ### When things go wrong
 
-- A session that fails, or whose machine stays unreachable for 15 minutes, is an interruption. The run resumes on any machine that qualifies, from the pull request's branch when it was pushed and from the base when not, up to `interruption_resumes` times. Then it is stuck.
-- The machine that was cut off must not push after the run has moved on. A machine that has reached no peer for 10 minutes on its own clock ends its factory sessions (G10), five minutes before any other machine may resume them. When it is heard from again, the coordinator archives every workspace of a run that has since moved to another workspace.
-- Every step records before it acts on what the runner records, so doing a step again carries on from where it stopped. A coordinator that takes over finds a run by its claim comment on GitHub and by the workspace records named `fac/<N>-<attempt>`, before any `run_event`. A claim with a workspace and no event is carried on, never launched again.
+- A session that fails, or whose machine stays unreachable for 15 minutes on the coordinator's sleep-counting clock, is an interruption. The run resumes on any machine that qualifies, in a resume workspace, up to `interruption_resumes` times. Then it is stuck.
+- A machine that was cut off must not push after the run has moved on. The rule (G10): a machine ends its factory sessions of a project when, for 10 minutes on its sleep-counting clock, it has neither held that project's lease nor received a fresh `factory_status` for it at the highest lease generation it has seen. That is five minutes before any other machine may resume them.
+  - A coordinator that hosts a run itself, alone in the fleet or not, holds the lease and ends nothing.
+  - In a split of two against two, the side without the lease holder gets no fresh status and ends its sessions.
+  - When the role moves, the new holder's status arrives within about three minutes, and nothing is ended.
+  - A Mac that slept for 20 minutes wakes with the 10 minutes long past and ends its sessions at once. In the seconds before it does, a session that was mid-push can still push. The coordinator then finds a head it did not gate and gates it again, so nothing ungated is marked ready.
+  - When a machine is heard from again, the coordinator has it archive, by force, every workspace of a run that has since moved to another workspace.
+- Every step records before it acts on what the runner records, so doing a step again carries on from where it stopped. A coordinator that takes over finds a run by its claim comment on GitHub and by the workspace records with the run's names, before any `run_event`. A claim with a build workspace and no event is carried on, never launched again.
+- A call the coordinator sent to a worker can land after its lease has lapsed, since a create may take minutes. That is safe because every such call names a workspace by the run's names, and the next holder finds and carries on what it made.
 - A person who edits the title, removes the label or assigns someone stops the run at the next reconcile, as with the runner.
-- Stop, in the Factory view, makes the run stuck on the next pass, as the runner's `runs stop` does.
+- Stop, in the Factory view of any machine, is carried to the lease holder (G2) and makes the run stuck on its next pass, as the runner's `runs stop` does.
 - A stuck run's session is ended and its workspace kept, so it can be looked at. It is archived by force when the issue leaves `stuck`. Work a person left there uncommitted is lost then, and the Factory view says so beside the run.
 - Paused claims stop new claims for a project or the fleet. Runs already going carry on.
-- A gate that cannot run at all (fetch, provision of the gate checkout, disk) is not a gate failure. It is tried again after 1 pass, then 2, 4 and 8. The fifth failure makes the run stuck.
+- A gate that cannot run at all (fetch, disk, no machine holding the login) is not a gate failure. It is tried again after 1 pass, then 2, 4 and 8. The fifth failure makes the run stuck. A `provision` that fails in the gate checkout is a gate failure, since the build's own provision passed.
 
 ## The lease
 
 - Each project's repo has one ref, `refs/factory/lease`. It points at a commit with no parent, whose message holds the holder's machine id, a generation number and a renewal count. The ref never grows a history.
-- The holder renews it every 60 seconds, from a task of its own beside the pass, with a compare-and-swap push: `git push --force-with-lease=refs/factory/lease:<sha it read>`. A renewal keeps the generation and adds one to the count, which makes a new commit. A takeover adds one to the generation.
-- A machine acts on a project only while its last successful push is less than 120 seconds old. It checks that before every change it makes on GitHub or asks of a worker, not once per pass. A create or a `gh` call can outlast a pass.
-- Another machine takes over only after it has seen the same lease commit unchanged for 180 seconds.
-- Both ages are measured on the machine's own clock that keeps counting while the machine sleeps (`CLOCK_MONOTONIC` on macOS, `CLOCK_BOOTTIME` on Linux), never Rust's `Instant`, which stops during sleep on macOS. A Mac that slept through its lease wakes with it expired. No two clocks are compared, so clock skew cannot make two holders.
+- The coordinator keeps a small bare git directory per project for the lease alone. It holds the empty tree and lease commits, fetches only that ref, and is no clone of the repo.
+- The holder renews every 60 seconds, from a task of its own beside the pass, with a compare-and-swap push: `git push --force-with-lease=refs/factory/lease:<sha it read>`. A renewal keeps the generation and adds one to the count, which makes a new commit. A takeover adds one to the generation. A push ends within 30 seconds or counts as failed.
+- A machine acts on a project only while less than 120 seconds have passed since it started its last successful push. The age is counted from before the push began, since GitHub may take the push long before the answer arrives. The machine checks the age before every change it makes on GitHub or asks of a worker, not once per pass.
+- Another machine takes over only after it has seen the same lease commit unchanged for 180 seconds. With every `gh` call and push ending within 30 seconds, a change the old holder started in time has landed before a takeover can.
+- A ref that does not exist is taken at once, with the push expecting no ref.
+- A coordinator that starts and finds its own machine id in the lease renews at once, so an update's restart does not stall the factory for three minutes. P1's daemon lock allows one daemon per machine, and the compare-and-swap decides any race with a machine that was about to take over.
+- All ages are measured on the machine's own clock that keeps counting while the machine sleeps (`CLOCK_MONOTONIC` on macOS, `CLOCK_BOOTTIME` on Linux), never Rust's `Instant`, which stops during sleep on macOS. A Mac that slept through its lease wakes with it expired. No two clocks are compared, so clock skew cannot make two holders.
 - Only the acting coordinator takes or renews leases. A machine that stops acting stops renewing, and the next coordinator takes over after the wait. A move of the role therefore pauses the factory for about three minutes and stops no run.
 - A machine that loses a push race stops acting on that project at once. That is not an error.
 - In a split, only the side whose push lands can act. The other side's Factory view says who holds the lease and at which generation.
 
-## Run events
+## Factory records
 
-- Each step of a run is a `run_event` record: run id, event name, data, and the lease generation it was written under. The event names and their data are the runner's ledger events, unchanged.
-- A record is owned by the machine that wrote it. P1's rule holds: no two machines write the same record.
-- A run's events are ordered by lease generation, then by the writer's record version. Within one generation only one machine writes, and generations only rise.
-- Output kept in an event (a gate or setup tail) is at most 64 KB.
-- Each machine keeps the events of live runs and of the newest 200 finished runs per project. Older finished runs are removed, oldest first by lease generation and version. `foundryd factory export` before the exit week's comparison keeps what `retro` needs.
-- `foundryd factory export <dir>` writes every run as `runs/<owner>__<repo>__<N>__<attempt>.jsonl` in the runner's layout, so `factory-runner retro --data-dir <dir>` reads it.
+Kept and synced apart from P1's records (G6). Each is owned by the machine that wrote it, so P1's rule holds: no two machines write the same record.
+
+- **`run_event`.** One per step of a run: run id, event name, data, a timestamp and the lease generation it was written under. The event names and their data are the runner's ledger events, unchanged.
+  - A run's events are ordered by lease generation, then by the writer's factory version. Within one generation only one machine writes, and generations only rise.
+  - Output kept in an event (a gate or setup tail) is at most 64 KB.
+  - Each machine keeps the events of live runs and of the newest 200 finished runs per project, and deletes older ones outright. The table has its own cursor, so P1's rule that a version is never removed does not apply to it.
+- **`factory_status`.** One per project, written by the lease holder each pass: the holder and generation, why the factory is idle if it is, the ready queue with each issue's reason for waiting, each live run (issue, step, machine, attempt, retries and minutes used, its workspaces and sessions), the last 20 finished runs, and any foreign claims. A machine believes the status with the highest generation.
+- **Logins held.** One per machine: the GitHub logins it holds a token for (G9).
+
+`foundryd factory export <dir>` writes every run this machine holds as `runs/<owner>__<repo>__<N>__<attempt>.jsonl` in the runner's layout, so `factory-runner retro --data-dir <dir>` reads it.
 
 ## Two factories at once
 
-During the cutover the runner and Foundry never watch the same repo: a repo is taken out of the runner's `repos:` before its switch goes on in Foundry. Foundry also checks. An issue in a watched project carrying another factory's claim marker raises an attention item, and Foundry leaves that issue alone.
+During the cutover the runner and Foundry never watch the same repo. A repo moves when the runner has no run of it in `triage` or `building`: it is taken out of the runner's `repos:`, then its switch goes on in Foundry.
+
+Foundry also checks. An issue of a watched project in `triage` or `building` that Foundry has no run for, by event or by workspace, is a foreign claim: it raises an attention item and Foundry leaves the issue alone.
+
+An issue the runner left in `pr-open` is not read for feedback. Setting it `factory:ready` again starts a Foundry run that carries on from its pull request's branch, as the runner does with a pull request of its own.
 
 ## UI
 
-Runs are already workspaces on the board, so the UI adds little.
+Runs are already workspaces on the board, so the UI adds little. Everything here is drawn from `factory_status`, so it is the same on every machine.
 
 - The Projects dialog gains the factory switch, the GitHub login and pause for each project.
 - A Factory view lists each project with:
@@ -208,30 +252,46 @@ Runs are already workspaces on the board, so the UI adds little.
 
 ## Attention items in P2
 
+Every machine works these out from `factory_status`, as it works out P1's items from records.
+
 | Item | Raised when | Clears when |
 |---|---|---|
 | Run stuck | A run goes stuck | The issue leaves `stuck` |
 | Run needs info | A run posts questions | The issue leaves `needs-info` |
-| Factory idle | Raised by the acting coordinator only: it holds no token for the project's login, or it has failed to take the lease for over 10 minutes, or `.dw/config.yml` does not load, or `gh` failed three passes running | The cause clears |
-| Foreign claim | Another factory's claim marker is on an issue of a watched project | Tom dismisses it (G6), or the marker's issue is closed |
+| Factory idle | The status gives a reason: the holder has no token for the project's login, or `.dw/config.yml` does not load, or `gh` failed three passes running. Or no fresh status has arrived for 10 minutes for a project whose factory is on | The cause clears |
+| Foreign claim | The status lists one | The issue is closed or leaves `triage` and `building` |
 | Gate infra | A gate could not run at all | A gate of that run starts, or the run ends |
+
+A factory session's "stuck", "failed" and "waiting for you", and a failed setup of a factory workspace, raise no P1 item of their own (G13). The run's item covers them.
 
 ## Testing
 
 - The runner's tests are the spec. For each ported module, its tests become Rust tests with the same cases and names, written first and failing before the code lands.
 - `factory::github` sits behind a trait. Its fake answers from the runner's `tracker/fixtures/`. No test calls GitHub.
-- Lease tests push to a local bare repo with a clock the test moves: two machines racing, a takeover after the wait, a holder that lost the lease and stops, a holder whose clock jumps past the limit (a sleep) and does not act, a split.
-- Fleet tests use P1's three daemons and the fake agent, which ends a turn with a result line in its Stop hook. They cover: an issue reaching `pr-open`; a failed gate sent back and passed on the retry; needs-info; the coordinator killed during a build and the next one carrying the run on with its events in order; a coordinator killed between the claim and its first event; a worker going offline, ending its own session, and the run resuming on another machine; a split where only one side acts; a peer on the old protocol that receives no `run_event`.
+- Lease tests push to a local bare repo with a clock the test moves: two machines racing, a takeover after the wait, a first take of a ref that does not exist, a restart that renews its own lease, a holder that lost the lease and stops, a holder whose clock jumps past the limit (a sleep) and does not act, a push whose answer comes late, a split.
+- Fleet tests use P1's three daemons and the fake agent, which ends a turn with a result line in its Stop hook. They cover:
+  - an issue reaching `pr-open`, with its build session ended and workspace gone
+  - a failed gate sent back and passed on the retry
+  - needs-info
+  - a feedback round placed on the machine that built the run
+  - the coordinator killed during a build and the next one carrying the run on with its events in order
+  - a coordinator killed between the claim and its first event
+  - a worker's daemon restarted during a build, and the result line still read
+  - a worker cut off from the lease holder ending its own session, and the run resuming on another machine
+  - a lone coordinator hosting its own run and ending nothing
+  - a split where only one side acts
+  - a peer on protocol 4 that receives no factory record, then updates and receives them all
+  - the Factory view and its attention items read from a machine that is not the coordinator, and Stop sent from it
 - A gate test opens a pull request whose branch changes `provision` and `gate`, and checks the default branch's commands ran.
-- A redaction test puts a token in gate output and checks it reaches no comment, message or event.
+- A redaction test puts a token in gate output and checks it reaches no comment, message or event, and that a pull request URL with a long id comes through whole.
 - The export test compares `foundryd factory export` of a fixture run with a golden file copied from the runner's own ledger output, in this repo, with the runner commit it came from named beside it. CI needs no Node and no second checkout.
 - No test spends model calls. One `#[ignore]` contract test, run with `FOUNDRY_CONTRACT=1`, starts a real factory session with skipped permissions and a first prompt, and checks the whole result line arrives.
 
 ## Cutover
 
-1. P1's acceptance run passes.
-2. P2 ships in a release.
-3. foundry leaves the runner's `repos:`, and its factory switch goes on in Foundry.
+1. The issues under "Before P2 starts" are closed and P1's acceptance run passes.
+2. P2 ships in a release, and every machine is on protocol 5.
+3. When the runner has no foundry run in `triage` or `building`, foundry leaves the runner's `repos:`, and its factory switch goes on in Foundry.
 4. Foundry builds foundry until 10 runs have reached `pr-open` or `stuck` and no factory bug is open.
 5. The runner's other repos move one at a time, each after the last moved repo has 5 clean runs: factory-paradev-spike, spec-reader, clockwork, factory-on-paradev, people-hub.
 6. The runner stays stopped, still installed, for a week.
@@ -246,9 +306,10 @@ The way back, per repo: turn its switch off in Foundry and put it back in the ru
 | 1 | Interactive Claude Code started with `--dangerously-skip-permissions` in a P1 terminal does not stop at a one-time confirmation of the bypass mode | A factory session cannot wait for a person |
 | 2 | The Stop hook's `last_assistant_message` holds the whole final message | The result line and the pull request URL come from it |
 | 3 | With `GIT_ASKPASS` giving the token and `credential.helper` emptied for the call, `git push` over HTTPS acts as the project's login on macOS and Linux, on a Mac whose keychain holds another GitHub account. `GH_TOKEN` alone covers `gh` but not git | Otherwise the keychain's account pushes |
-| 4 | GitHub accepts force-with-lease pushes to `refs/factory/lease` on these repos, no ruleset blocks them, and they start no workflow | The lease rests on it |
+| 4 | GitHub accepts force-with-lease pushes to `refs/factory/lease` on these repos, also when the ref does not exist yet, no ruleset blocks them, and they start no workflow | The lease rests on it |
 | 5 | A push a minute per repo, 1,440 a day each across six repos, trips no GitHub rate limit, and parentless commits that the ref has left do not pile up in the repo | The lease's cadence rests on it. If it fails, renew less often and wait longer before a takeover |
 | 6 | `/factory-build` is installed on every machine that can host a run | Today it is in `~/.claude/skills/factory-build` on this Mac only |
 | 7 | The runner's claim and status comments can be parsed both ways | The cutover and the foreign claim item rest on it |
 | 8 | Interactive Claude Code takes the effort setting by a flag or variable, and the gateway passes it through | The factory setting names an effort |
-| 9 | `CLOCK_MONOTONIC` on macOS and `CLOCK_BOOTTIME` on Linux count through sleep on the fleet's machines | The lease's ages rest on it |
+| 9 | `CLOCK_MONOTONIC` on macOS and `CLOCK_BOOTTIME` on Linux count through sleep on the fleet's machines. Confirmed for macOS on 2026-11-22; Linux is open | The lease's ages and the cut-off rule rest on it |
+| 10 | Two worktrees of one bare clone cannot hold the same branch, and moving a local branch to `origin`'s for a feedback workspace works once the build workspace is archived | The workspace table rests on it |
