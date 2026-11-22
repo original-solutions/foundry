@@ -10,12 +10,13 @@ Three factories came before this one. Rust softfac drove a separate T3 Code serv
 
 Foundry owns the agent session itself. There is no host app. It replaces Paradev and T3 Code.
 
-## The whole product, in four pieces
+## The whole product, in five pieces
 
 | Piece | What it adds | When it is done |
 |---|---|---|
 | P1 Core (this spec) | The daemon on every machine, workspaces, terminals, agent sessions, load, placement, sync, a moving coordinator, a minimal UI | Manual sessions run on any machine and Paradev is no longer needed for them |
-| P2 Factory | GitHub accounts, projects with instructors, the label state machine, claims, dependencies, the gate, the review loop to 5 out of 5, the merge setting and merge queue, project leases, the ledger, attention items | The current runner is turned off |
+| P2 Factory ([spec](P2-factory.md)) | GitHub logins per machine and project, the label state machine, claims, dependencies, the gate, feedback, project leases, the ledger, attention items: the Paradev runner's behaviour, ported | The current runner is turned off |
+| P2b Review and merge | The review loop to 5 out of 5, the merge setting and the merge queue | |
 | P3 Full UI | The Paradev-like layout, diffs, the PR view, run history, a scoreboard, the Tauri wrapper | The browser tab is no longer the main way in |
 | P4 Later | A phone app, sandboxed runs on rented machines, Linear, machines started on demand, a preview per PR | |
 
@@ -48,7 +49,7 @@ In:
 
 Out, and where it goes:
 
-- GitHub accounts, issues, labels, gates, reviews, merging, leases, the ledger: P2.
+- GitHub logins, issues, labels, gates, leases, the ledger: P2. Reviews and merging: P2b.
 - Diffs, the PR view, run history, the desktop wrapper: P3.
 - File editing in the app: never. Code changes go through a terminal.
 - Plugins, automations, tasks, pages: never.
@@ -157,7 +158,7 @@ This is a rule for every piece, not only P1: nothing runs without the UI showing
 - A split fleet holds neither rule. Each side numbers its own edits, so both sides can add a project of one name, and one side can remove a project while the other makes a workspace of it. The heal keeps both projects, or leaves the workspace without its project, and nothing shows it. Neither rule is checked while the acting machine runs a build from before these checks, and a create on such a build does not check its project. The acting coordinator also numbers an add or remove without either check when it comes from a machine on a build from before edits carried an id: nobody waits for that edit's answer, so a refusal would drop it unseen.
 - Each machine keeps one bare clone per project and makes worktrees from it.
 - A machine clones a project the first time it hosts a workspace for it. Adding a machine needs no setup per repo.
-- In P1 a machine clones with whatever git credentials it already has. Credentials handed out by the coordinator come with GitHub accounts in P2.
+- In P1 a machine clones with whatever git credentials it already has. Tokens per machine come with GitHub logins in P2.
 - A project may name setup commands, read from the repo's `.dw/config.yml` `provision` key when the file has one. This is the same step the gate uses in P2.
 
 ### Creating a workspace
@@ -267,7 +268,7 @@ A file dropped on a terminal of this machine, pasted into it (a screenshot on th
 - If the network splits, each side may have its own acting coordinator for a while. In P1 the only harm is two edits to the same shared setting. The later edit wins when the sides rejoin, and an attention item says a setting was overwritten and shows both values.
 - Sessions are never affected by a change of coordinator. They belong to their machines.
 
-P2 adds a lease per project on GitHub, so that claiming issues and merging can never happen from two machines at once. P1 has nothing that needs it.
+P2 adds a lease per project on GitHub, so that claiming issues can never happen from two machines at once. P2b's merging goes under the same lease. P1 has nothing that needs it.
 
 ## Security
 
@@ -340,9 +341,9 @@ One thing the check found that the design did not expect: in a folder Claude Cod
 
 ## Decisions already made for later pieces
 
-Settled in the brainstorm on 2026-11-17. They belong to P2 and P3 and are recorded here until those specs exist.
+Settled in the brainstorm on 2026-11-17. P2's spec, [P2-factory.md](P2-factory.md), takes the leases, the gate on any machine, reconciling every pass and what is kept from the earlier factories. Each machine holds tokens for the logins it can act as, and each project names the login it acts as, instead of the coordinator handing credentials out. The review loop, the merge setting and the merge queue belong to P2b and stay recorded here until its spec exists.
 
-- **GitHub accounts.** Several accounts are connected to the app. Each project uses the one that owns its repo. The coordinator holds the credentials and gives a worker the right one for each run. Instructors stay a list per project.
+- **GitHub accounts.** Replaced by P2's spec: each machine holds its own tokens, a project names the login it acts as, and no credential is handed from one machine to another. Instructors stay a list per project.
 - **The unattended loop.** Claim, build with the `/factory` skill, run the gate on a fresh checkout, then run the review gate and fix until it scores 5 out of 5. A cap on rounds ends in the `stuck` state.
 - **Review independence, from `wow.md`.** The builder never reviews its own work. Each review is a fresh session with only the spec and the diff. Findings go back to the same builder session. A moved head is gated again. A merge names the exact head that was scored.
 - **Merge setting per project.** Either wait for a person, which is the default, or squash-merge when the gate is green and the review is 5 out of 5.
