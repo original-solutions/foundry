@@ -18,8 +18,8 @@
 //! change is, before it answers: with its key, under the name and address it lists itself
 //! under, or under the name typed at that address when it sends none. A list that already holds
 //! the machine is left as it is. When another machine has the name or the address, or the edit
-//! fails, the join is `503`, the key the join admitted the machine with is taken back, and the
-//! same machine may send the code again. A code made anywhere else lists nothing.
+//! fails, the join is `503`, no key is kept for the machine, and the same machine may send the
+//! code again. A code made anywhere else lists nothing.
 
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
@@ -724,6 +724,35 @@ mod tests {
             Some(keyed(&joining, "build-box", "100.64.0.7"))
         );
         assert_eq!(served.keys.state(joining.me()), join::KeyState::Active);
+    }
+
+    #[tokio::test]
+    async fn a_revoked_machine_or_a_key_that_is_not_ed25519_is_refused_before_it_is_listed() {
+        let served = Served::new(|_, _| {}).await;
+        let revoked = Keys::open(Arc::new(MemorySecrets::default())).unwrap();
+        served.keys.revoke(revoked.me()).unwrap();
+        let code = served.code_for("127.0.0.1").await;
+        let before = served.settings();
+
+        let (status, body) = served
+            .join_as(&code, &revoked, Some("build-box"), Some("100.64.0.7"))
+            .await;
+        assert_eq!(status, 409, "{body}");
+
+        let stranger = MachineId::random();
+        let request = json!({
+            "code": code,
+            "machine": stranger,
+            "key": "ab",
+            "name": "build-box",
+            "address": "100.64.0.7",
+        });
+        let (status, body) = served.post(join::JOIN_PATH, &request).await;
+        assert_eq!(status, 400, "{body}");
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(served.settings(), before);
+        assert_eq!(served.keys.state(stranger), join::KeyState::NoKey);
     }
 
     #[tokio::test]
