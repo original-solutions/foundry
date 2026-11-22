@@ -972,6 +972,46 @@ fn live_session_count_counts_only_live_sessions_of_that_owner() {
     assert_eq!(store.live_session_count(MachineId::random()).unwrap(), 0);
 }
 
+/// One owner's sessions are read without its other records: a session row this build cannot
+/// read is left out, and a row of another kind it cannot read is never parsed.
+#[test]
+fn sessions_of_gives_one_owners_sessions_not_deleted_and_leaves_out_a_row_it_cannot_read() {
+    let (_dir, mut store) = open();
+    let me = MachineId::random();
+    let peer = MachineId::random();
+    let numbered = |id: u128, owner: MachineId, version: u64| {
+        let AnyRecord::Session(mut r) = session(owner, version) else {
+            unreachable!()
+        };
+        r.body.id = SessionId(uuid::Uuid::from_u128(id));
+        r
+    };
+    assert!(store.sessions_of(me).unwrap().is_empty());
+
+    let first = numbered(40, me, 1);
+    let mut gone = numbered(41, me, 2);
+    gone.deleted = true;
+    let mut failed = numbered(42, me, 3);
+    failed.body.state = SessionState::Failed;
+    for r in [&first, &gone, &failed] {
+        store.apply(&AnyRecord::Session(r.clone()), me).unwrap();
+    }
+    store
+        .apply(&AnyRecord::Session(numbered(43, peer, 1)), peer)
+        .unwrap();
+    store.apply(&terminal(me, 4), me).unwrap();
+    insert_unreadable(
+        &store,
+        me,
+        5,
+        "session",
+        r#"{"state":"from-a-newer-build"}"#,
+    );
+    insert_unreadable(&store, me, 6, "printer", "{}");
+
+    assert_eq!(store.sessions_of(me).unwrap(), vec![first, failed]);
+}
+
 #[test]
 fn apply_batch_stores_valid_prefix_skips_stale_and_reports_not_owner() {
     let (_dir, mut store) = open();

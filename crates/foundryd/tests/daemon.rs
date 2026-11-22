@@ -1149,6 +1149,11 @@ fn started_session(fixture: &mut Fixture) -> String {
     fixture.seed(|settings| settings.projects.push(project.clone()));
     fixture.start();
     let workspace = fixture.workspace(&project);
+    session_in(fixture, &workspace)
+}
+
+/// Starts a session in `workspace`, and gives its id.
+fn session_in(fixture: &Fixture, workspace: &str) -> String {
     let (status, body) = fixture.call(
         "POST",
         &format!("/api/workspaces/{workspace}/sessions"),
@@ -1254,6 +1259,90 @@ fn a_session_keeps_reporting_after_the_daemon_restarts() {
 
     close_and_wait_for_the_end(&fixture, &session, idle.body.terminal);
     assert!(!fixture.log().contains(&token), "the token reached the log");
+}
+
+#[test]
+fn two_sessions_taken_up_after_a_restart_each_keep_their_own_hook_token() {
+    let mut fixture = Fixture::new();
+    fake_claude(
+        &mut fixture,
+        "- hook: {event: SessionStart}\n- hook: {event: UserPromptSubmit, prompt: \"tidy up\"}\n- sleep_ms: 8000\n- hook: {event: Stop}\n- sleep_ms: 600000\n",
+    );
+    let project = fixture.project();
+    fixture.seed(|settings| settings.projects.push(project.clone()));
+    fixture.start();
+    let workspace = fixture.workspace(&project);
+    let sessions = [
+        session_in(&fixture, &workspace),
+        session_in(&fixture, &workspace),
+    ];
+    let tokens = sessions.each_ref().map(|session| {
+        wait_for_session(&fixture, session, &[SessionState::Working]);
+        let curl = fixture
+            .home
+            .path()
+            .join("sessions")
+            .join(format!("{session}.curl"));
+        claude::curl_token(&curl).unwrap()
+    });
+
+    let port = fixture.port;
+    assert_eq!(fixture.stop(), Some(0));
+    fixture.start();
+    assert_eq!(fixture.port, port, "the daemon came back on another port");
+
+    let idle = sessions
+        .each_ref()
+        .map(|session| wait_for_session(&fixture, session, &[SessionState::Idle]));
+    for (mine, other) in [(0, 1), (1, 0)] {
+        assert_eq!(
+            hook_status(&fixture, &sessions[mine], &tokens[other]),
+            403,
+            "session {mine} with session {other}'s token"
+        );
+        assert_eq!(
+            hook_status(&fixture, &sessions[mine], &tokens[mine]),
+            204,
+            "session {mine} with its own token"
+        );
+    }
+
+    for record in &idle {
+        let terminal = record.body.terminal;
+        let (status, body) =
+            fixture.call("POST", &format!("/api/terminals/{terminal}/close"), None);
+        assert_eq!(status, 204, "{body}");
+    }
+    let ended = sessions.each_ref().map(|session| {
+        wait_for_session(
+            &fixture,
+            session,
+            &[SessionState::Finished, SessionState::Failed],
+        )
+        .version
+    });
+    wait_for_no_sessions_after(&fixture, ended.into_iter().max().unwrap());
+}
+
+#[test]
+fn a_hook_posted_while_the_daemon_restarts_reaches_it_once_it_is_back() {
+    let mut fixture = Fixture::new();
+    fake_claude(
+        &mut fixture,
+        "- hook: {event: SessionStart}\n- hook: {event: UserPromptSubmit, prompt: \"tidy up\"}\n- sleep_ms: 3000\n- hook: {event: Stop}\n- sleep_ms: 600000\n",
+    );
+    let session = started_session(&mut fixture);
+    wait_for_session(&fixture, &session, &[SessionState::Working]);
+
+    let port = fixture.port;
+    assert_eq!(fixture.stop(), Some(0));
+    // The agent posts Stop 3 seconds after the prompt, while nothing listens.
+    std::thread::sleep(Duration::from_secs(4));
+    fixture.start();
+    assert_eq!(fixture.port, port, "the daemon came back on another port");
+
+    let idle = wait_for_session(&fixture, &session, &[SessionState::Idle]);
+    close_and_wait_for_the_end(&fixture, &session, idle.body.terminal);
 }
 
 #[test]

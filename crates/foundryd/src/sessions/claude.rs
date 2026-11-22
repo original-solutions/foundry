@@ -74,7 +74,8 @@ pub fn shell_quote(text: &str) -> String {
 ///
 /// The command's stdout goes to /dev/null, because Claude Code adds the stdout of some hooks
 /// to the model's context. It ends in `|| true`, because a hook that exits 2 blocks the tool
-/// call, and posting must never block the agent.
+/// call, and a post that fails must never stop the agent. While the daemon is down a post
+/// holds the agent up for a few seconds: see [`write_curl_config`].
 pub fn settings_json(curl_config: &Path) -> Value {
     let command = format!(
         "curl -q -sS -m 5 -K {} -X POST --data-binary @- >/dev/null 2>&1 || true",
@@ -131,15 +132,40 @@ pub fn write_settings(path: &Path, value: &Value) -> Result<(), SessionError> {
 /// `url` to post to, and no proxy for any host. Same file rules as [`write_settings`]. `url`
 /// and `token` sit inside double quotes, so they must hold none: a hex token and
 /// `http://127.0.0.1:<port>/hooks/<uuid>` never do.
+///
+/// A hook posted while the daemon restarts is refused, so curl tries again each second for up
+/// to [`HOOK_RETRY_SECS`] seconds: a restart that short loses no hook. While the daemon stays
+/// down, each hook holds the agent up for that long.
 pub fn write_curl_config(path: &Path, url: &str, token: &str) -> Result<(), SessionError> {
     debug_assert!(!url.contains(['"', '\\', '\n']) && !token.contains(['"', '\\', '\n']));
     let config = format!(
         "header = \"Content-Type: application/json\"\n\
          header = \"Authorization: Bearer {token}\"\n\
          url = \"{url}\"\n\
-         noproxy = \"*\"\n"
+         noproxy = \"*\"\n\
+         retry = {HOOK_RETRY_SECS}\n\
+         retry-connrefused\n\
+         retry-delay = 1\n\
+         retry-max-time = {HOOK_RETRY_SECS}\n"
     );
     write_new_private(path, config.as_bytes())
+}
+
+/// How long a hook's curl tries again while nothing answers, in seconds.
+pub const HOOK_RETRY_SECS: u32 = 10;
+
+/// Replaces the curl config at `path` with one [`write_curl_config`] writes for `url` and
+/// `token`. The new file is written beside it and renamed over it, so a hook reading it at
+/// that moment reads the old config or the new one, never a part.
+pub fn rewrite_curl_config(path: &Path, url: &str, token: &str) -> Result<(), SessionError> {
+    let new = path.with_extension("curl.new");
+    // One left by a write that stopped part way would refuse this one.
+    let _ = std::fs::remove_file(&new);
+    write_curl_config(&new, url, token)?;
+    std::fs::rename(&new, path).map_err(|source| SessionError::Io {
+        what: format!("{}: replace the file", path.display()),
+        source,
+    })
 }
 
 /// The bearer token in the curl config [`write_curl_config`] wrote at `path`, or `None` when
@@ -537,7 +563,11 @@ mod tests {
                 "header = \"Content-Type: application/json\"\n\
                  header = \"Authorization: Bearer {TOKEN}\"\n\
                  url = \"{URL}\"\n\
-                 noproxy = \"*\"\n"
+                 noproxy = \"*\"\n\
+                 retry = 10\n\
+                 retry-connrefused\n\
+                 retry-delay = 1\n\
+                 retry-max-time = 10\n"
             )
         );
         assert_eq!(mode(&path), 0o600);
@@ -546,6 +576,25 @@ mod tests {
             write_curl_config(&path, URL, TOKEN).is_err(),
             "a second write"
         );
+    }
+
+    #[test]
+    fn a_rewritten_curl_config_holds_the_new_url_and_stays_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions").join("s.curl");
+        write_curl_config(&path, "http://127.0.0.1:1/hooks/old", TOKEN).unwrap();
+        std::fs::write(path.with_extension("curl.new"), "left part way").unwrap();
+
+        rewrite_curl_config(&path, URL, TOKEN).unwrap();
+
+        let fresh = dir.path().join("fresh.curl");
+        write_curl_config(&fresh, URL, TOKEN).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            std::fs::read_to_string(&fresh).unwrap()
+        );
+        assert_eq!(mode(&path), 0o600);
+        assert!(!path.with_extension("curl.new").exists());
     }
 
     #[test]

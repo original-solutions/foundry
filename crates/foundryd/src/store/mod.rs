@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use foundry_proto::ids::{MachineId, TerminalId, WorkspaceId};
-use foundry_proto::record::{AnyRecord, Record, Terminal, Workspace};
+use foundry_proto::record::{AnyRecord, Record, Session, Terminal, Workspace};
 use foundry_proto::settings::SharedSettings;
 use foundry_proto::state::SessionState;
 use rusqlite::types::Type;
@@ -287,6 +287,31 @@ impl Store {
             }
         }
         Ok(u32::try_from(live).unwrap_or(u32::MAX))
+    }
+
+    /// The session records `owner` wrote that are not deleted, lowest version first. Only
+    /// session rows of `owner` are read, and one this build cannot parse, such as a newer
+    /// build's, is left out with a warning, so it does not hide the rest.
+    pub fn sessions_of(&self, owner: MachineId) -> Result<Vec<Record<Session>>, StoreError> {
+        let mut query = self.conn.prepare_cached(
+            "SELECT version, record FROM records WHERE owner = ?1 AND kind = 'session' \
+             ORDER BY version",
+        )?;
+        let rows = query.query_map(params![owner.to_string()], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut records = Vec::new();
+        for row in rows {
+            let (version, json) = row?;
+            match serde_json::from_str(&json) {
+                Ok(AnyRecord::Session(record)) if !record.deleted => records.push(record),
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%owner, version, %error, "a session record this build cannot read is left out");
+                }
+            }
+        }
+        Ok(records)
     }
 
     /// The highest version held from each owner.
