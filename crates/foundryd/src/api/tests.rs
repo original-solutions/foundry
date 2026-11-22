@@ -252,6 +252,7 @@ impl Daemon {
             id,
             name: "peer".into(),
             address: "100.64.0.9".into(),
+            key: String::new(),
         });
         assert!(store.apply_settings(settings).unwrap());
         id
@@ -2790,6 +2791,7 @@ impl Daemon {
                 id: self.me,
                 name: name.into(),
                 address: "100.64.0.1".into(),
+                key: String::new(),
             },
         );
         assert!(store.apply_settings(settings).unwrap());

@@ -374,6 +374,7 @@ mod tests {
                 id: peer,
                 name: "trilogy-mac".into(),
                 address: "100.64.0.2".into(),
+                key: String::new(),
             }];
             settings.priority = vec![peer, me];
             settings.projects = projects;
@@ -579,6 +580,7 @@ mod tests {
                 id: peer,
                 name: "trilogy-mac".into(),
                 address: "100.64.0.2".into(),
+                key: String::new(),
             }];
             settings.priority = vec![peer, me];
         })
@@ -665,6 +667,7 @@ mod tests {
                 id: peer,
                 name: "trilogy-mac".into(),
                 address: "100.64.0.2".into(),
+                key: String::new(),
             }];
             settings.projects.push(held);
         })
@@ -737,6 +740,7 @@ mod tests {
                 id: peer,
                 name: "trilogy-mac".into(),
                 address: "100.64.0.2".into(),
+                key: String::new(),
             }];
             settings.priority = vec![peer, me];
             settings.projects.push(held);

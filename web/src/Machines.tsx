@@ -209,25 +209,30 @@ function MachineCard({ machine, points, heard, here, now }: { machine: MachineVi
   );
 }
 
-/** What an add answered: the command to run on the new machine, and how long its code works. */
+/**
+ * What an add answered: the command to run on the new machine, how long its code works, and the
+ * address the name resolved to.
+ */
 interface Added {
   name: string;
   command: string;
   expiresInSecs: number;
+  address: string;
 }
 
 /** Asks the daemon for a join code for the machine Tailscale calls `name`. */
 async function addMachine(name: string): Promise<Added> {
   const { status, json } = await post("/api/machines/add", { name });
   if (status !== 201) throw refused(status, json);
-  return { name, command: String(json.command), expiresInSecs: Number(json.expires_in_secs) };
+  return { name, command: String(json.command), expiresInSecs: Number(json.expires_in_secs), address: String(json.address) };
 }
 
 /**
  * The board's Add machine button and its dialog. The person types the new machine's Tailscale
  * name and gets the one command to run there; a refusal shows in the dialog and keeps the text.
- * Once a listed machine of that name arrives in the settings, the dialog says it joined. Closing
- * it forgets the command.
+ * Once a listed machine of that name, or at the address it resolved to, arrives in the settings,
+ * the dialog says it joined: a machine lists itself under its own Tailscale name, which differs
+ * from a full name or an address typed. Closing it forgets the command.
  */
 function AddMachine({ machines }: { machines: MachineView[] }) {
   const [open, setOpen] = useState(false);
@@ -236,7 +241,9 @@ function AddMachine({ machines }: { machines: MachineView[] }) {
   const command = useRef<HTMLElement>(null);
   const add = useMutation({ mutationFn: addMachine });
   const added = add.data;
-  const joined = added !== undefined && machines.some((m) => m.listed && m.name.trim().toLowerCase() === added.name.toLowerCase());
+  const joined =
+    added !== undefined &&
+    machines.some((m) => m.listed && (m.name.trim().toLowerCase() === added.name.toLowerCase() || m.address === added.address));
   const change = (next: boolean) => {
     setOpen(next);
     if (!next) {

@@ -302,5 +302,23 @@ describe("Machines", () => {
 
       expect((await screen.findByRole("status")).textContent).toMatch(/joined$/);
     });
+
+    it("says the machine joined when it lists itself under its own name at the address the typed name resolved to", async () => {
+      mockFetch(json(201, { ...added, address: "100.64.0.3" }));
+      let setMachines!: (machines: MachineView[]) => void;
+      function Live() {
+        const [machines, set] = useState(fleet(records, twoMachines));
+        setMachines = set;
+        return <Machines machines={machines} history={{}} here={ME} connected />;
+      }
+      await renderApp(<Live />);
+
+      add("trilogy-mac.tail459612.ts.net");
+      await screen.findByText(added.command);
+      const joined = settings({ machines: [...twoMachines.machines, { id: "m-3", name: "trilogy-mac", address: "100.64.0.3" }] });
+      act(() => setMachines(fleet(records, joined)));
+
+      expect((await screen.findByRole("status")).textContent).toBe("trilogy-mac.tail459612.ts.net joined");
+    });
   });
 });

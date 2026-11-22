@@ -108,6 +108,7 @@ fn settings(seq: u64) -> SharedSettings {
             id: mac,
             name: "trilogy-mac".into(),
             address: "100.64.0.1".into(),
+            key: String::new(),
         }],
         priority: vec![mac],
         projects: vec![],

@@ -693,6 +693,7 @@ async fn the_daemons_peer_route_refuses_a_link_with_no_key_proof() {
             id: peer,
             name: "peer".into(),
             address: "127.0.0.2".into(),
+            key: String::new(),
         });
     });
     fixture.start();
@@ -823,6 +824,7 @@ async fn the_daemon_dials_a_peer_through_the_key_handshake() {
             id: peer_id,
             name: "peer".into(),
             address: "::1".into(),
+            key: String::new(),
         });
     });
     // The daemon listens on 127.0.0.1 and Tailscale addresses only, so this port is free here.
@@ -850,6 +852,52 @@ async fn the_daemon_dials_a_peer_through_the_key_handshake() {
     })
     .await
     .expect("the daemon did not dial the peer");
+
+    let said: serde_json::Value = serde_json::from_str(&first).unwrap();
+    assert_eq!(said["type"], "challenge", "first frame: {first}");
+}
+
+#[tokio::test]
+async fn the_daemon_admits_a_key_its_machine_list_carries_and_dials_that_peer() {
+    let mut fixture = Fixture::new();
+    let other = tempfile::tempdir().unwrap();
+    let peer = Keys::open(Arc::new(FileSecrets::new(
+        other.path().join("secrets.json"),
+    )))
+    .unwrap();
+    let peer_id = peer.me();
+    // The key table does not hold the peer: only its machine-list entry carries its key.
+    fixture.seed(|settings| {
+        settings.machines.push(Machine {
+            id: peer_id,
+            name: "peer".into(),
+            address: "::1".into(),
+            key: peer.public_key().hex().to_owned(),
+        });
+    });
+    let listener = loop {
+        let listener = tokio::net::TcpListener::bind(("::1", fixture.port))
+            .await
+            .expect("::1 must be bindable for this test: it plays the peer at address ::1");
+        if fixture.try_start() {
+            break listener;
+        }
+        fixture.port = free_port();
+    };
+
+    let first = tokio::time::timeout(Duration::from_secs(20), async {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        loop {
+            match socket.next().await {
+                Some(Ok(Message::Text(text))) => return text.as_str().to_owned(),
+                Some(Ok(_)) => {}
+                other => panic!("the link ended before a first frame: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("the daemon did not dial the peer its list carries the key of");
 
     let said: serde_json::Value = serde_json::from_str(&first).unwrap();
     assert_eq!(said["type"], "challenge", "first frame: {first}");
@@ -920,6 +968,7 @@ async fn keyed_peer_link(fixture: &mut Fixture) -> (Conn, MachineId, TempDir) {
             id: mine.me(),
             name: "daemon".into(),
             address: "127.0.0.1".into(),
+            key: String::new(),
         }
     };
     fixture.seed(|settings| {
@@ -927,6 +976,7 @@ async fn keyed_peer_link(fixture: &mut Fixture) -> (Conn, MachineId, TempDir) {
             id: peer_id,
             name: "peer".into(),
             address: "127.0.0.2".into(),
+            key: String::new(),
         });
     });
     fixture.start();
@@ -1227,6 +1277,21 @@ fn a_daemon_lists_itself_under_its_tailscale_name_once_tailscale_answers_and_can
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0]["name"], "Tom's desk");
     assert_eq!(fixture.stop(), Some(0));
+
+    // Its entry carries its own public key, so every other machine admits it.
+    let keys = Keys::open(Arc::new(FileSecrets::new(
+        fixture.home.path().join("secrets.json"),
+    )))
+    .unwrap();
+    let store = Store::open(fixture.home.path().join("store.sqlite")).unwrap();
+    let own = store
+        .settings()
+        .unwrap()
+        .machines
+        .into_iter()
+        .find(|m| m.id.to_string() == me)
+        .unwrap();
+    assert_eq!(own.key, keys.public_key().hex());
 }
 
 #[test]

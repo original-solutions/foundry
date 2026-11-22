@@ -3,8 +3,9 @@
 //! coordinator, as every shared-settings change does.
 //!
 //! - [`Listing`] keeps this machine in the list. Fed what [`entry`] reads from
-//!   `tailscale status --self --json`, it adds the machine when the list does not hold it,
-//!   moves its address when that changed, and never touches a name it has seen set.
+//!   `tailscale status --self --json`, it adds the machine with its public key when the list
+//!   does not hold it, moves its address when that changed, puts its key back when the entry
+//!   holds none or another, and never touches a name it has seen set.
 //! - `POST /api/machines/{id}/rename` `{name}`: sets a listed machine's name, trimmed, and
 //!   keeps its address, `204`. A name that is blank, over [`NAME_AT_MOST`] characters or holds
 //!   a control character is `422`; a name another machine has, compared trimmed and in any
@@ -45,6 +46,11 @@ use crate::store::Store;
 
 /// The most characters a machine's name holds.
 pub const NAME_AT_MOST: usize = 60;
+
+/// How long after sending its key alone a machine waits before sending it again when its entry
+/// still holds none. A machine from before keys were listed drops the key from an edit it
+/// numbers, so while one acts, a key sent at once each look would go round forever.
+pub const KEY_AGAIN_AFTER: Duration = Duration::from_secs(10 * 60);
 
 /// What Tailscale says this machine is called and where it is.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -98,6 +104,8 @@ pub fn entry(status: &[u8], host: Option<&str>) -> Result<Entry, String> {
 /// Keeps this machine in the shared machine list, at the address Tailscale gives it.
 pub struct Listing {
     me: MachineId,
+    /// This machine's public key, as hex: what its entry carries.
+    key: String,
     coordinator: Arc<Coordinator>,
     store: Arc<Mutex<Store>>,
     /// Whether the last look failed, so a failure is warned about once until a look succeeds.
@@ -108,14 +116,18 @@ pub struct Listing {
     found: Option<Instant>,
     /// Set by the address watch when an ask of Tailscale fails, read and cleared by a look.
     away: Arc<AtomicBool>,
+    /// When this machine last sent an edit whose only change was its key.
+    key_sent: Option<Instant>,
 }
 
 impl Listing {
     /// A listing that gives peers' copies `settle` to arrive: the daemon passes
     /// [`OFFLINE_AFTER`](crate::sync::OFFLINE_AFTER), the time a peer has to be heard from.
-    /// `away` is the address watch's mark that Tailscale was away.
+    /// `away` is the address watch's mark that Tailscale was away. `key` is this machine's
+    /// public key, as hex.
     pub fn new(
         me: MachineId,
+        key: String,
         coordinator: Arc<Coordinator>,
         store: Arc<Mutex<Store>>,
         settle: Duration,
@@ -123,17 +135,21 @@ impl Listing {
     ) -> Self {
         Self {
             me,
+            key,
             coordinator,
             store,
             warned: false,
             settle,
             found: None,
             away,
+            key_sent: None,
         }
     }
 
-    /// Adds this machine to the list under `entry`'s name when the list does not hold it, and
-    /// moves it to `entry`'s address, keeping its name, when the address it holds differs.
+    /// Adds this machine to the list under `entry`'s name, with its key, when the list does not
+    /// hold it, and moves it to `entry`'s address and its own key, keeping its name, when the
+    /// address or the key it holds differs. A key alone is sent again only [`KEY_AGAIN_AFTER`]
+    /// after the last time.
     /// A failure, or no entry, is logged once until a look succeeds; the next look tries again.
     ///
     /// The look that first finds an edit to send sends nothing: one at least the settle time
@@ -169,11 +185,18 @@ impl Listing {
                 id: self.me,
                 name: entry.name,
                 address: entry.address,
+                key: self.key.clone(),
             },
-            Some(held) if held.address != entry.address => Machine {
-                address: entry.address,
-                ..held.clone()
-            },
+            Some(held)
+                if held.address != entry.address
+                    || held.key != self.key && !self.key_sent_lately() =>
+            {
+                Machine {
+                    address: entry.address,
+                    key: self.key.clone(),
+                    ..held.clone()
+                }
+            }
             Some(_) => {
                 self.found = None;
                 return Ok(());
@@ -183,6 +206,10 @@ impl Listing {
         if found.elapsed() < self.settle {
             return Ok(());
         }
+        let key_only = settings
+            .machines
+            .iter()
+            .any(|held| held.id == self.me && held.address == machine.address);
         let sent = self.coordinator.edit(Edit::SetMachine { machine }).await;
         // A send that may have reached the coordinator waits again, as a sent one does, for
         // the copy that holds it; one that says it was not sent is tried on the next look.
@@ -193,8 +220,19 @@ impl Listing {
                 | CoordinatorError::Unwritable(_))
         ) {
             self.found = None;
+            if key_only {
+                self.key_sent = Some(Instant::now());
+            }
         }
         sent.map(drop).map_err(|e| e.to_string())
+    }
+}
+
+impl Listing {
+    /// Whether this machine sent its key alone within [`KEY_AGAIN_AFTER`].
+    fn key_sent_lately(&self) -> bool {
+        self.key_sent
+            .is_some_and(|sent| sent.elapsed() < KEY_AGAIN_AFTER)
     }
 }
 
@@ -435,6 +473,7 @@ mod tests {
         fn listing_marked(&self, settle: Duration, away: Arc<AtomicBool>) -> Listing {
             Listing::new(
                 self.me,
+                KEY.to_owned(),
                 self.coordinator.clone(),
                 self.store.clone(),
                 settle,
@@ -519,6 +558,18 @@ mod tests {
             id,
             name: name.into(),
             address: address.into(),
+            key: String::new(),
+        }
+    }
+
+    /// This machine's public key in these tests, as hex.
+    const KEY: &str = "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c";
+
+    /// This machine's own entry, as its listing writes it: with [`KEY`].
+    fn own(id: MachineId, name: &str, address: &str) -> Machine {
+        Machine {
+            key: KEY.to_owned(),
+            ..machine(id, name, address)
         }
     }
 
@@ -583,7 +634,7 @@ mod tests {
 
         assert_eq!(
             served.settings().machines,
-            [machine(served.me, "personal-mac", "100.91.54.18")]
+            [own(served.me, "personal-mac", "100.91.54.18")]
         );
         assert_eq!(served.settings().seq, seq, "the second look sent nothing");
     }
@@ -605,15 +656,13 @@ mod tests {
         let machines = served.settings().machines;
         assert_eq!(machines.len(), 2, "{machines:?}");
         assert!(machines.contains(&other));
-        assert!(machines.contains(&machine(served.me, "personal-mac", "100.91.54.18")));
+        assert!(machines.contains(&own(served.me, "personal-mac", "100.91.54.18")));
     }
 
     #[tokio::test]
     async fn a_listed_machine_whose_address_changed_keeps_its_name() {
         let served = Served::new(|me, settings| {
-            settings
-                .machines
-                .push(machine(me, "Tom's desk", "100.64.0.9"));
+            settings.machines.push(own(me, "Tom's desk", "100.64.0.9"));
         })
         .await;
 
@@ -624,7 +673,7 @@ mod tests {
 
         assert_eq!(
             served.settings().machines,
-            [machine(served.me, "Tom's desk", "100.91.54.18")]
+            [own(served.me, "Tom's desk", "100.91.54.18")]
         );
     }
 
@@ -633,7 +682,7 @@ mod tests {
         let served = Served::new(|me, settings| {
             settings
                 .machines
-                .push(machine(me, "Tom's desk", "100.91.54.18"));
+                .push(own(me, "Tom's desk", "100.91.54.18"));
         })
         .await;
         let seq = served.settings().seq;
@@ -646,7 +695,119 @@ mod tests {
         assert_eq!(served.settings().seq, seq);
         assert_eq!(
             served.settings().machines,
-            [machine(served.me, "Tom's desk", "100.91.54.18")]
+            [own(served.me, "Tom's desk", "100.91.54.18")]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_listed_machine_with_no_key_sends_its_own_and_keeps_its_name_and_address() {
+        let served = Served::new(|me, settings| {
+            settings
+                .machines
+                .push(machine(me, "Tom's desk", "100.91.54.18"));
+        })
+        .await;
+
+        served
+            .listing()
+            .list(here("personal-mac", "100.91.54.18"))
+            .await;
+
+        assert_eq!(
+            served.settings().machines,
+            [own(served.me, "Tom's desk", "100.91.54.18")]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_listed_machine_held_with_another_key_sends_its_own_and_keeps_its_name() {
+        let served = Served::new(|me, settings| {
+            settings.machines.push(Machine {
+                key: "ab".repeat(32),
+                ..machine(me, "Tom's desk", "100.64.0.9")
+            });
+        })
+        .await;
+
+        served
+            .listing()
+            .list(here("personal-mac", "100.91.54.18"))
+            .await;
+
+        assert_eq!(
+            served.settings().machines,
+            [own(served.me, "Tom's desk", "100.91.54.18")]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_key_the_list_drops_again_is_sent_again_only_after_a_while() {
+        let served = Served::new(|me, settings| {
+            settings
+                .machines
+                .push(machine(me, "Tom's desk", "100.91.54.18"));
+        })
+        .await;
+        let mut listing = served.listing();
+        listing.list(here("personal-mac", "100.91.54.18")).await;
+        assert_eq!(
+            served.settings().machines,
+            [own(served.me, "Tom's desk", "100.91.54.18")]
+        );
+        // An older acting machine numbered it, and its copy came back without the key.
+        let mut stripped = served.settings();
+        stripped.seq += 1;
+        stripped.machines[0].key.clear();
+        served
+            .store
+            .lock()
+            .unwrap()
+            .apply_settings(stripped)
+            .unwrap();
+        let seq = served.settings().seq;
+
+        listing.list(here("personal-mac", "100.91.54.18")).await;
+        tokio::time::sleep(KEY_AGAIN_AFTER / 2).await;
+        listing.list(here("personal-mac", "100.91.54.18")).await;
+        assert_eq!(
+            served.settings().seq,
+            seq,
+            "the key is not sent again at once"
+        );
+
+        tokio::time::sleep(KEY_AGAIN_AFTER / 2).await;
+        listing.list(here("personal-mac", "100.91.54.18")).await;
+        assert_eq!(
+            served.settings().machines,
+            [own(served.me, "Tom's desk", "100.91.54.18")]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_address_move_is_sent_at_once_while_a_dropped_key_waits() {
+        let served = Served::new(|me, settings| {
+            settings
+                .machines
+                .push(machine(me, "Tom's desk", "100.91.54.18"));
+        })
+        .await;
+        let mut listing = served.listing();
+        listing.list(here("personal-mac", "100.91.54.18")).await;
+        let mut stripped = served.settings();
+        stripped.seq += 1;
+        stripped.machines[0].key.clear();
+        served
+            .store
+            .lock()
+            .unwrap()
+            .apply_settings(stripped)
+            .unwrap();
+
+        listing.list(here("personal-mac", "100.64.0.9")).await;
+
+        assert_eq!(
+            served.settings().machines,
+            [own(served.me, "Tom's desk", "100.64.0.9")]
         );
     }
 
@@ -702,16 +863,14 @@ mod tests {
         listing.list(here("personal-mac", "100.91.54.18")).await;
         assert_eq!(
             served.settings().machines,
-            [machine(served.me, "personal-mac", "100.91.54.18")]
+            [own(served.me, "personal-mac", "100.91.54.18")]
         );
     }
 
     #[tokio::test]
     async fn an_address_that_moves_between_two_close_looks_waits_the_settle_time() {
         let served = Served::new(|me, settings| {
-            settings
-                .machines
-                .push(machine(me, "Tom's desk", "100.64.0.9"));
+            settings.machines.push(own(me, "Tom's desk", "100.64.0.9"));
         })
         .await;
         let mut listing = served.listing_after(SETTLE);
@@ -740,16 +899,14 @@ mod tests {
         listing.list(here("personal-mac", "100.91.54.18")).await;
         assert_eq!(
             served.settings().machines,
-            [machine(served.me, "Tom's desk", "100.91.54.18")]
+            [own(served.me, "Tom's desk", "100.91.54.18")]
         );
     }
 
     #[tokio::test]
     async fn a_look_that_finds_nothing_to_send_starts_the_wait_over() {
         let served = Served::new(|me, settings| {
-            settings
-                .machines
-                .push(machine(me, "Tom's desk", "100.64.0.9"));
+            settings.machines.push(own(me, "Tom's desk", "100.64.0.9"));
         })
         .await;
         let seq = served.settings().seq;
@@ -771,9 +928,7 @@ mod tests {
     #[tokio::test]
     async fn a_wait_found_before_tailscale_went_away_starts_over_when_it_answers_again() {
         let served = Served::new(|me, settings| {
-            settings
-                .machines
-                .push(machine(me, "Tom's desk", "100.64.0.9"));
+            settings.machines.push(own(me, "Tom's desk", "100.64.0.9"));
         })
         .await;
         let seq = served.settings().seq;
@@ -803,7 +958,7 @@ mod tests {
         listing.list(here("personal-mac", "100.91.54.18")).await;
         assert_eq!(
             served.settings().machines,
-            [machine(served.me, "Tom's desk", "100.91.54.18")]
+            [own(served.me, "Tom's desk", "100.91.54.18")]
         );
     }
 
@@ -834,7 +989,7 @@ mod tests {
         acting.priority = vec![served.me, peer];
         served.store.lock().unwrap().apply_settings(acting).unwrap();
         listing.list(here("personal-mac", "100.91.54.18")).await;
-        assert!(served.settings().machines.contains(&machine(
+        assert!(served.settings().machines.contains(&own(
             served.me,
             "personal-mac",
             "100.91.54.18"
@@ -893,7 +1048,7 @@ mod tests {
 
         tokio::time::sleep(SETTLE).await;
         listing.list(here("personal-mac", "100.91.54.18")).await;
-        assert!(served.settings().machines.contains(&machine(
+        assert!(served.settings().machines.contains(&own(
             served.me,
             "personal-mac",
             "100.91.54.18"
@@ -970,7 +1125,7 @@ mod tests {
         listing.list(here("personal-mac", "100.91.54.18")).await;
         assert_eq!(
             served.settings().machines,
-            [machine(served.me, "personal-mac", "100.91.54.18")]
+            [own(served.me, "personal-mac", "100.91.54.18")]
         );
         listing.list(Err("logged out".to_owned())).await;
 
@@ -1003,7 +1158,7 @@ mod tests {
         let served = Served::new(|me, settings| {
             settings
                 .machines
-                .push(machine(me, "personal-mac", "100.91.54.18"));
+                .push(own(me, "personal-mac", "100.91.54.18"));
         })
         .await;
 
@@ -1012,7 +1167,7 @@ mod tests {
         assert_eq!(status, 204, "{body}");
         assert_eq!(
             served.settings().machines,
-            [machine(served.me, "Tom's desk", "100.91.54.18")]
+            [own(served.me, "Tom's desk", "100.91.54.18")]
         );
     }
 
@@ -1040,7 +1195,7 @@ mod tests {
         let served = Served::new(|me, settings| {
             settings
                 .machines
-                .push(machine(me, "personal-mac", "100.91.54.18"));
+                .push(own(me, "personal-mac", "100.91.54.18"));
         })
         .await;
 
@@ -1055,7 +1210,7 @@ mod tests {
         let served = Served::new(|me, settings| {
             settings
                 .machines
-                .push(machine(me, "personal-mac", "100.91.54.18"));
+                .push(own(me, "personal-mac", "100.91.54.18"));
         })
         .await;
         let (status, body) = served.rename(served.me, &"é".repeat(60)).await;
@@ -1069,7 +1224,7 @@ mod tests {
         let served = Served::new(|me, settings| {
             settings
                 .machines
-                .push(machine(me, "personal-mac", "100.91.54.18"));
+                .push(own(me, "personal-mac", "100.91.54.18"));
         })
         .await;
         let seq = served.settings().seq;
@@ -1097,7 +1252,7 @@ mod tests {
         let served = Served::new(move |me, settings| {
             settings
                 .machines
-                .push(machine(me, "personal-mac", "100.91.54.18"));
+                .push(own(me, "personal-mac", "100.91.54.18"));
             settings
                 .machines
                 .push(machine(other, " Trilogy-Mac ", "100.64.0.2"));
@@ -1117,7 +1272,7 @@ mod tests {
         let served = Served::new(|me, settings| {
             settings
                 .machines
-                .push(machine(me, "personal-mac", "100.91.54.18"));
+                .push(own(me, "personal-mac", "100.91.54.18"));
         })
         .await;
         let seq = served.settings().seq;
@@ -1135,7 +1290,7 @@ mod tests {
         let served = Served::new(move |me, settings| {
             settings
                 .machines
-                .push(machine(me, "personal-mac", "100.91.54.18"));
+                .push(own(me, "personal-mac", "100.91.54.18"));
             settings
                 .machines
                 .push(machine(peer, "trilogy-mac", "100.64.0.2"));

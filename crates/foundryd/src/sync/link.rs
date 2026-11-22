@@ -501,6 +501,7 @@ mod tests {
                     id,
                     name: format!("machine-{i}"),
                     address: format!("100.64.0.{}", i + 1),
+                    key: String::new(),
                 })
                 .collect();
             store.apply_settings(held).unwrap();

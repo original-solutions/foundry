@@ -568,6 +568,7 @@ mod tests {
                 id,
                 name: name.into(),
                 address: "100.64.0.1".into(),
+                key: String::new(),
             };
             Self {
                 me,
@@ -1603,6 +1604,7 @@ mod tests {
                 id: peer,
                 name: "trilogy-mac".into(),
                 address: "100.64.0.2".into(),
+                key: String::new(),
             }];
             settings.priority = vec![peer, me];
         })
@@ -1637,6 +1639,7 @@ mod tests {
                 id: peer,
                 name: "trilogy-mac".into(),
                 address: "100.64.0.2".into(),
+                key: String::new(),
             }];
             settings.priority = vec![peer, me];
         })
@@ -1679,6 +1682,7 @@ mod tests {
                 id: peer,
                 name: "trilogy-mac".into(),
                 address: "100.64.0.2".into(),
+                key: String::new(),
             }];
             settings.priority = vec![peer, me];
         })

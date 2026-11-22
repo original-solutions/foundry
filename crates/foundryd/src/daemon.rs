@@ -306,11 +306,11 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
         .layer(middleware::from_fn_with_state(api.clone(), api::same_site));
     let machine_name_routes = api::machine_names::router(coordinator.clone(), store.clone())
         .layer(middleware::from_fn_with_state(api.clone(), api::same_site));
-    let join_routes = join::router(keys.clone())
+    let lister = api::machine_add::Lister::new(coordinator.clone(), store.clone());
+    let join_routes = join::router(keys.clone(), lister)
         .layer(middleware::from_fn_with_state(api.clone(), api::same_site));
-    let machine_add_routes =
-        api::machine_add::router(keys.clone(), coordinator.clone(), store.clone())
-            .layer(middleware::from_fn_with_state(api.clone(), api::same_site));
+    let machine_add_routes = api::machine_add::router(keys.clone(), store.clone())
+        .layer(middleware::from_fn_with_state(api.clone(), api::same_site));
     let app = api::router(api)
         .merge(sessions.router())
         .merge(attention_routes)
@@ -327,7 +327,12 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
     let listener = api::bind(local).await?;
     tracing::info!("listening on {local}");
     let mut tailscale = Tailscale::new(port, app.clone());
-    let listing = tailscale.listing(me, coordinator.clone(), store.clone());
+    let listing = tailscale.listing(
+        me,
+        keys.public_key().hex().to_owned(),
+        coordinator.clone(),
+        store.clone(),
+    );
     // Taken before the first scan, so the listing hears its answer.
     let answered = tailscale.answered.subscribe();
     tailscale.scan(true, tailscale_ips().await).await;
@@ -340,6 +345,10 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
     services.spawn(named("peer sync", {
         let peers = peers.clone();
         async move { peers.run().await }
+    }));
+    services.spawn(named("the keys the machine list carries", {
+        let (keys, store) = (keys.clone(), store.clone());
+        async move { keys.follow(store).await }
     }));
     services.spawn(named("the API server", serve_on(listener, app.clone())));
     services.spawn(named("the Tailscale address watch", tailscale.watch()));
@@ -624,6 +633,14 @@ async fn run_cli(cli: &Path, args: &[&str], within: Duration) -> Result<Vec<u8>,
     Ok(out.stdout)
 }
 
+/// What this machine lists itself under: what `tailscale status --self --json` says it is
+/// called and its address, read by [`api::machine_names::entry`]. The one source of the entry
+/// the daemon lists and the one `foundryd join` sends, so the two never differ.
+pub(crate) async fn own_entry() -> Result<api::machine_names::Entry, String> {
+    let status = ask_status(&tailscale_cli(), ASK_WITHIN).await?;
+    api::machine_names::entry(&status, host_names().first().map(String::as_str))
+}
+
 /// Keeps this machine in the shared machine list: each time the address watch hears from
 /// Tailscale (`answered`, with the addresses `ip` gave), hands what Tailscale calls this machine
 /// to `listing`, which also reads the watch's mark that Tailscale was away. It runs apart from
@@ -639,15 +656,7 @@ async fn list_this_machine(
     let mut told = Told::default();
     while answered.changed().await.is_ok() {
         let ips = answered.borrow_and_update().clone();
-        let entry = told
-            .entry(&ips, || async {
-                ask_status(&tailscale_cli(), ASK_WITHIN)
-                    .await
-                    .and_then(|status| {
-                        api::machine_names::entry(&status, host_names().first().map(String::as_str))
-                    })
-            })
-            .await;
+        let entry = told.entry(&ips, own_entry).await;
         listing.list(entry).await;
     }
 }
@@ -739,11 +748,13 @@ impl Tailscale {
     fn listing(
         &self,
         me: foundry_proto::ids::MachineId,
+        key: String,
         coordinator: Arc<crate::coordinator::Coordinator>,
         store: Arc<Mutex<Store>>,
     ) -> api::machine_names::Listing {
         api::machine_names::Listing::new(
             me,
+            key,
             coordinator,
             store,
             crate::sync::OFFLINE_AFTER,
@@ -1292,7 +1303,7 @@ mod tests {
         ));
         peers.coordinate(coordinator.clone());
         let mut tailscale = Tailscale::new(7433, Router::new());
-        let mut listing = tailscale.listing(me, coordinator, store.clone());
+        let mut listing = tailscale.listing(me, String::new(), coordinator, store.clone());
         let here = || {
             Ok(Entry {
                 name: "personal-mac".into(),

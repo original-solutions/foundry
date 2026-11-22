@@ -92,10 +92,12 @@ The unit runs as your user. Read the log with `journalctl -u foundryd`.
 1. Install `foundryd` on the new machine, as above. It must be on the same tailnet as the fleet.
 2. Open the UI of any machine already in the fleet, go to the machines board and click **Add machine**.
 3. Type the new machine's Tailscale name, for example `trilogy-mac`, and click **Add**.
-4. On the new machine, run the command the dialog shows, for example `foundryd join 100.101.102.103 K7QX3M9PRT`. Run it in a shell with the same `FOUNDRY_HOME` and `FOUNDRY_PORT` you gave `install`, as `<home>/current/foundryd join …`, or as shown once `<home>/current/foundryd` is linked into a folder on your `PATH`. The code works once, within 10 minutes, and only on the machine whose name you typed.
+4. On the new machine, run the command the dialog shows, for example `foundryd join 100.101.102.103 K7QX3M9PRT`. Run it in a shell with the same `FOUNDRY_HOME` and `FOUNDRY_PORT` you gave `install`, as `<home>/current/foundryd join …`, or as shown once `<home>/current/foundryd` is linked into a folder on your `PATH`. The code works once, within 10 minutes, and only on the machine whose name you typed. If the command says the machine could not be added to the machine list, run the same command again while the code is valid. When it names a machine that already has the name, rename that machine first. When it names one that already has the address, the join cannot finish yet, because a machine cannot be removed from the fleet yet. The new machine may show on the board all the same, when the fleet was only slow to answer, and running the command again is still what finishes the join.
 5. Restart the service on the new machine: `launchctl kickstart -k gui/$(id -u)/io.github.original-solutions.foundryd` on macOS, `sudo systemctl restart foundryd` on Linux.
 
-The dialog says when the machine has joined, and its card shows on the board under the name you typed.
+The dialog says when the machine has joined, and its card shows on the board under the machine's own Tailscale name: the short name, even when you typed its full name or its address. There are two exceptions, and in both the card keeps the name you typed until you rename it. One is when `foundryd join` warned that it could not ask Tailscale what the machine is called. The other is an older `foundryd join`, which sends no name of its own.
+
+Run `foundryd join` from a release at least as new as the one on the machine you join through. An older `foundryd join` still joins. But when the machine cannot be listed it says to ask for a new code, where running the same command again is what works, and it gives up after 10 seconds while the fleet may take half a minute to answer.
 
 ## Change a setting
 

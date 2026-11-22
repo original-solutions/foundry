@@ -163,6 +163,7 @@ pub fn settings_for(ids: &[MachineId]) -> SharedSettings {
                 id: *id,
                 name: format!("machine-{i}"),
                 address: format!("100.64.0.{}", i + 1),
+                key: String::new(),
             })
             .collect(),
         priority: ids.to_vec(),
