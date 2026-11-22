@@ -265,6 +265,36 @@ async fn input_typed_through_a_reaches_cat_on_b_and_its_output_returns() {
     read_until(&mut socket, "through a", 2).await;
 }
 
+/// Only the relay's beats cross an idle relay, so this holds only while each end counts a
+/// beat as hearing from the other. Real time: the holder behind `Held` does not run on a
+/// paused clock.
+#[tokio::test]
+async fn an_idle_relayed_terminal_stays_open_past_the_offline_limit_and_still_takes_input() {
+    let fleet = Fleet::start(2);
+    let (a, b) = (&fleet.daemons[0], &fleet.daemons[1]);
+    let on_b = Held::new(b.id, b.store.clone());
+    b.peers.serve_terminals(on_b.terminals.clone());
+    let id = on_b.cat().await;
+    synced(a, id).await;
+    let api = Served::start(a).await;
+
+    let (mut socket, _) = api.attach(id).await;
+    let idle_until = tokio::time::Instant::now() + OFFLINE_AFTER + Duration::from_secs(5);
+    while let Ok(frame) = tokio::time::timeout_at(idle_until, socket.next()).await {
+        match frame {
+            Some(Ok(Message::Close(close))) => panic!("the idle socket closed: {close:?}"),
+            Some(Ok(_)) => {}
+            other => panic!("the idle socket ended: {other:?}"),
+        }
+    }
+
+    socket
+        .send(Message::binary(&b"still here\n"[..]))
+        .await
+        .unwrap();
+    read_until(&mut socket, "still here", 2).await;
+}
+
 #[tokio::test]
 async fn cutting_the_link_closes_the_socket_with_1013_and_attach_is_503_until_it_heals() {
     let fleet = Fleet::start(2);
