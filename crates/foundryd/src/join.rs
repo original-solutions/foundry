@@ -2217,6 +2217,24 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_listed_key_never_replaces_a_revocation_another_process_stored() {
+        let secrets = Arc::new(MemorySecrets::default());
+        let host = Keys::open(secrets.clone()).unwrap();
+        let peer = machine_keys();
+        // Another process, after this one read the table, stored the peer revoked.
+        let mut stored = parse_table(secrets.get(KEYS_SECRET).unwrap()).unwrap();
+        stored.insert(peer.me(), Entry::Revoked);
+        secrets.set(KEYS_SECRET, &write_table(&stored)).unwrap();
+
+        host.learn(&[listed(peer.me(), peer.public_key().hex())])
+            .unwrap();
+
+        assert_eq!(host.state(peer.me()), KeyState::Revoked);
+        let kept = parse_table(secrets.get(KEYS_SECRET).unwrap()).unwrap();
+        assert!(matches!(kept.get(&peer.me()), Some(Entry::Revoked)));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_listed_key_that_does_not_parse_is_skipped_with_one_warning_naming_the_machine() {
         let (logged, _capture) = capture_warnings();
         let host = machine_keys();
