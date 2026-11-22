@@ -121,9 +121,10 @@ describe("fleet", () => {
       workspace("m2", "w2", "b"),
       terminal("m2", "t2", "w2", "unreachable"),
       sample("m9", 1),
+      sample("m8", 1),
     ];
     const state = Object.fromEntries(fleet(records, s, {}, ["m2", "m9"]).map((m) => [m.name, m.status]));
-    expect(state).toEqual({ one: "offline", two: "online", m9: "online" });
+    expect(state).toEqual({ one: "offline", two: "online", m8: "offline", m9: "online" });
   });
 
   it("stays offline when a reachable record of the machine comes after an unreachable one", () => {

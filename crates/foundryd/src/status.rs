@@ -404,7 +404,8 @@ mod tests {
 
     #[test]
     fn with_the_online_set_records_do_not_decide_the_state() {
-        let (up, down, stranger) = (
+        let (up, down, stranger, silent) = (
+            MachineId::random(),
             MachineId::random(),
             MachineId::random(),
             MachineId::random(),
@@ -413,6 +414,7 @@ mod tests {
             terminal(up, TerminalState::Unreachable),
             terminal(down, TerminalState::Running),
             sample(stranger, 1, 0.1, 0),
+            sample(silent, 1, 0.1, 0),
         ];
         let out = render(
             &records,
@@ -423,6 +425,28 @@ mod tests {
         assert!(out.contains("up  online"), "{out}");
         assert!(out.contains("down  offline"), "{out}");
         assert!(out.contains(&format!("{stranger}  online")), "{out}");
+        assert!(out.contains(&format!("{silent}  offline")), "{out}");
+    }
+
+    #[test]
+    fn the_state_the_daemon_sent_is_shown_by_its_online_set() {
+        let me = MachineId::random();
+        let state = |online| UiMessage::State {
+            protocol: foundry_proto::messages::PROTOCOL,
+            records: vec![sample(me, 1, 0.1, 0)],
+            settings: settings(&[(me, "mac")]),
+            online,
+        };
+
+        let heard = state_text(state(Some(vec![me]))).unwrap();
+        assert!(heard.contains("mac  online"), "{heard}");
+        let older = state_text(state(None)).unwrap();
+        assert!(older.contains("mac  unknown"), "{older}");
+        let record = UiMessage::Settings {
+            protocol: foundry_proto::messages::PROTOCOL,
+            settings: settings(&[]),
+        };
+        assert!(state_text(record).is_none());
     }
 
     #[test]
