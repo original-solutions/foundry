@@ -188,17 +188,28 @@ impl Lister {
         }
         let wanted = machine.name.trim().to_lowercase();
         let address = machine.address.trim();
-        if let Some(other) = held.machines.iter().find(|m| {
-            m.name.trim().to_lowercase() == wanted
-                || address
-                    .parse::<IpAddr>()
-                    .map_or(m.address.trim() == address, |ip| {
-                        has_address(&m.address, ip)
-                    })
-        }) {
+        let at_address = |m: &Machine| {
+            address
+                .parse::<IpAddr>()
+                .map_or(m.address.trim() == address, |ip| {
+                    has_address(&m.address, ip)
+                })
+        };
+        if let Some(other) = held
+            .machines
+            .iter()
+            .find(|m| at_address(m) || m.name.trim().to_lowercase() == wanted)
+        {
+            // A rename keeps the address, and no machine can be removed yet.
+            let way_out = if at_address(other) {
+                "a machine cannot be removed from the list yet, so this one cannot join at that \
+                 address"
+            } else {
+                "rename that machine first"
+            };
             let why = format!(
                 "{:?} at {} is already in the machine list, so the machine is not listed as {:?} \
-                 at {}; rename or remove that machine first",
+                 at {}; {way_out}",
                 other.name, other.address, machine.name, machine.address
             );
             tracing::warn!("machine {id} used a code to join, but {why}");
@@ -630,6 +641,10 @@ mod tests {
 
             assert_eq!(status, 503, "{name:?} at {address}: {body}");
             assert!(error_of(&body).contains("build-box"), "{body}");
+            // Only a name clash has a way out: a rename keeps the address.
+            let renames = error_of(&body).contains("rename that machine first");
+            assert_eq!(renames, address != "100.64.0.9", "{body}");
+            assert!(!error_of(&body).contains("remove that"), "{body}");
             assert_eq!(served.held(joining.me()), None, "{name:?} at {address}");
             assert_eq!(served.keys.state(joining.me()), join::KeyState::NoKey);
         }

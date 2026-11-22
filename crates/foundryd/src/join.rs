@@ -1237,7 +1237,9 @@ async fn forward(from: &mut Receiver<String>, to: &Sender<String>) {
 /// `503` `{"error"}`. The machine's key is kept only once it is listed, so a join answered
 /// `503`, or one whose sender hangs up first, has saved no key, and the code stays valid for
 /// that machine. An edit that got no answer may be numbered after all: the machine is then
-/// listed, every machine admits its key from the list, and the same join sent again finishes. A sent name with a control character, or a sent
+/// listed, every machine admits its key from the list, and the same join sent again finishes.
+/// A key table that cannot be read or saved is `503` `{"error"}` too, for any code: the code
+/// is still that machine's, and a machine listed by then stays listed. A sent name with a control character, or a sent
 /// address that is not a Tailscale or loopback IP, which a machine's own entry never holds, is
 /// `422` `{"error"}`, before the code is held or anything is listed: sending the same again
 /// cannot work. A code made by [`Keys::new_code`] lists nothing.
@@ -1368,11 +1370,13 @@ async fn redeem(
         Ok(Err(error @ JoinError::BadKey)) => {
             (StatusCode::BAD_REQUEST, error.to_string()).into_response()
         }
+        // The code is still that machine's, and it may be listed by now: sent again, the
+        // same join finishes.
         Ok(Err(error)) => {
-            tracing::warn!("join: a machine could not be admitted: {error}");
+            tracing::warn!("join: a machine's key could not be stored: {error}");
             (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "the new machine's key could not be stored",
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": "it could not store this machine's key" })),
             )
                 .into_response()
         }
@@ -2794,19 +2798,37 @@ mod tests {
     // ---- joining over HTTP ----
 
     async fn serve(keys: Keys) -> u16 {
+        serve_acting(keys).await.0
+    }
+
+    /// The port of `keys`' join route, on a machine that is listed and acts alone, so it
+    /// numbers the edit that lists a joining machine, and its store.
+    async fn serve_acting(keys: Keys) -> (u16, Arc<Mutex<Store>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(Mutex::new(
-            Store::open(dir.path().join("foundry.db")).unwrap(),
-        ));
+        let mut store = Store::open(dir.path().join("foundry.db")).unwrap();
+        let acting = SharedSettings {
+            seq: 1,
+            machines: vec![Machine {
+                id: keys.me(),
+                name: "host".into(),
+                address: "100.64.0.1".into(),
+                key: keys.public_key().hex().to_owned(),
+            }],
+            priority: vec![keys.me()],
+            ..SharedSettings::default()
+        };
+        assert!(store.apply_settings(acting).unwrap());
+        let store = Arc::new(Mutex::new(store));
         let peers = Peers::new(keys.me(), store.clone(), Arc::new(Pairs::default()));
         let coordinator = Arc::new(crate::coordinator::Coordinator::new(
             keys.me(),
             store.clone(),
-            peers,
+            peers.clone(),
         ));
-        let lister = Lister::new(coordinator, store);
+        peers.coordinate(coordinator.clone());
+        let lister = Lister::new(coordinator, store.clone());
         tokio::spawn(async move {
             let _dir = dir;
             axum::serve(
@@ -2815,7 +2837,7 @@ mod tests {
             )
             .await
         });
-        port
+        (port, store)
     }
 
     async fn join_over_http(
@@ -2982,9 +3004,48 @@ mod tests {
         flaky.failing.store(true, Ordering::SeqCst);
         let failed = join_over_http(port, &code, Arc::new(MemorySecrets::default())).await;
         assert!(
-            matches!(failed, Err(JoinError::NotAdmitted { .. })),
+            matches!(failed, Err(JoinError::NotListed { .. })),
             "{failed:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_machine_listed_whose_key_could_not_be_saved_is_told_to_run_it_again_and_then_joins()
+    {
+        let flaky = Arc::new(Flaky::default());
+        let host = Keys::open(flaky.clone()).unwrap();
+        let (port, store) = serve_acting(host.clone()).await;
+        let code = host.new_named_code(named(HERE), vec![HERE]).unwrap();
+        let code = code.to_string();
+        let secrets = Arc::new(MemorySecrets::default());
+        flaky.failing.store(true, Ordering::SeqCst);
+
+        let failed = join_over_http(port, &code, secrets.clone()).await;
+
+        let Err(error @ JoinError::NotListed { .. }) = failed else {
+            panic!("{failed:?}");
+        };
+        let shown = error.to_string();
+        assert!(shown.contains("could not store"), "{shown}");
+        assert!(shown.contains("run the same command again"), "{shown}");
+        // Listed with its key all the same, and neither machine holds the other's yet.
+        let me = Keys::open(secrets.clone()).unwrap();
+        let listed = lock(&store).settings().unwrap().machines;
+        assert!(
+            listed
+                .iter()
+                .any(|m| m.id == me.me() && m.key == me.public_key().hex()),
+            "{listed:?}"
+        );
+        assert_eq!(host.state(me.me()), KeyState::NoKey);
+        assert_eq!(me.state(host.me()), KeyState::NoKey);
+
+        flaky.failing.store(false, Ordering::SeqCst);
+        let joined = join_over_http(port, &code, secrets.clone()).await;
+        assert_eq!(joined.unwrap(), me.me());
+        assert_eq!(host.state(me.me()), KeyState::Active);
+        let me = Keys::open(secrets).unwrap();
+        assert_eq!(me.state(host.me()), KeyState::Active);
     }
 
     /// The port of a join route that answers every join with `status` and `body`.
