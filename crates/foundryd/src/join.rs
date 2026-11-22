@@ -22,11 +22,11 @@
 //! every packet and ties each address to one machine. A machine address that is not on it is
 //! not safe for a peer link.
 //!
-//! The key table is held in this machine's secret store. It holds only public keys, so it can
-//! be carried to every other machine; carrying it, and the new machine's place in the machine
-//! list, belongs with the shared settings.
+//! The key table is held in this machine's secret store. It holds only public keys. Each
+//! machine's public key also travels in its machine-list entry, and every machine admits the
+//! keys its list carries ([`Keys::follow`]), so a machine admitted by one is admitted by all.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
@@ -53,7 +53,8 @@ use tokio::sync::oneshot;
 use tokio::time::{Instant, timeout};
 
 use crate::secrets::{self, Secrets, SecretsError};
-use crate::sync::{Conn, Dialer, OFFLINE_AFTER, Peers};
+use crate::store::{Store, StoreError};
+use crate::sync::{Conn, Dialer, OFFLINE_AFTER, Peers, on_store};
 
 /// How long a join code works after it is shown.
 pub const CODE_VALID_FOR: Duration = Duration::from_secs(10 * 60);
@@ -530,6 +531,8 @@ struct KeysInner {
     saving: Mutex<()>,
     /// How many times `saving` has been taken: what a change waiting on it counts as progress.
     taken: AtomicU64,
+    /// The machines listed with a key that does not parse, each warned about once.
+    unparsed: Mutex<BTreeSet<MachineId>>,
 }
 
 struct Held {
@@ -584,6 +587,7 @@ impl Keys {
                 }),
                 saving: Mutex::new(()),
                 taken: AtomicU64::new(0),
+                unparsed: Mutex::new(BTreeSet::new()),
             }),
         };
         let own = keys.public_key();
@@ -700,6 +704,91 @@ impl Keys {
             let _ = watch.send(machine);
         }
         Ok(())
+    }
+
+    /// Admits, by [`admit_into`]'s rule, each machine in `machines` listed with a key that
+    /// parses as an Ed25519 public key and that the key table does not hold. A revocation or
+    /// another key held is never replaced. An entry with no key, from a machine before keys
+    /// were listed, is skipped; one whose key does not parse is skipped with a warning, once
+    /// per machine, that names the machine and not the key. Saves only when there is a machine
+    /// to admit.
+    ///
+    /// Blocks on the secret store, as [`Keys::open`] does, and behind any other change to the
+    /// key table in this process.
+    pub fn learn(&self, machines: &[Machine]) -> Result<(), JoinError> {
+        let unheld: Vec<(MachineId, PublicKey)> = {
+            let held = self.held();
+            machines
+                .iter()
+                .filter(|m| !m.key.is_empty() && !held.machines.contains_key(&m.id))
+                .map(|m| (m.id, PublicKey(m.key.clone())))
+                .collect()
+        };
+        let mut admitting = Vec::new();
+        for (machine, key) in unheld {
+            if key.verifier().is_some() {
+                admitting.push((machine, key));
+            } else if lock(&self.inner.unparsed).insert(machine) {
+                tracing::warn!(
+                    "join: machine {machine} is listed with a key that is not an Ed25519 public \
+                     key, so it is not admitted"
+                );
+            }
+        }
+        if admitting.is_empty() {
+            return Ok(());
+        }
+        let saving = self.saving()?;
+        self.change(&saving, |machines| {
+            for (machine, key) in &admitting {
+                // A revocation or another key held stays as it is.
+                let _ = admit_into(machines, *machine, key);
+            }
+            Ok(())
+        })
+    }
+
+    /// Admits the keys the machine list in `store` carries, by [`Keys::learn`], whenever the
+    /// settings change, checked every [`RECHECK`], until the returned future is dropped. A
+    /// change it could not save is tried again on the next check, and warned about once until
+    /// one succeeds.
+    pub async fn follow(&self, store: Arc<Mutex<Store>>) {
+        let mut seen = None;
+        let mut warned = false;
+        let mut every = tokio::time::interval(RECHECK);
+        loop {
+            every.tick().await;
+            let prev = seen;
+            let changed = on_store(&store, move |store| {
+                Ok::<_, StoreError>(store.settings_since(prev)?.map(|s| (s.seq, s.machines)))
+            })
+            .await;
+            let (seq, machines) = match changed {
+                Ok(Some(changed)) => changed,
+                Ok(None) => continue,
+                Err(error) => {
+                    tracing::warn!("join: cannot read the machine list for its keys: {error}");
+                    continue;
+                }
+            };
+            let keys = self.clone();
+            match tokio::task::spawn_blocking(move || keys.learn(&machines)).await {
+                Ok(Ok(())) => {
+                    seen = Some(seq);
+                    warned = false;
+                }
+                Ok(Err(error)) => {
+                    if !warned {
+                        tracing::warn!(
+                            "join: cannot admit the keys the machine list carries, trying again: \
+                             {error}"
+                        );
+                    }
+                    warned = true;
+                }
+                Err(_) => {}
+            }
+        }
     }
 
     /// Revokes `machine`: its key is forgotten and every link with it is refused.

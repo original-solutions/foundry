@@ -346,6 +346,10 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
         let peers = peers.clone();
         async move { peers.run().await }
     }));
+    services.spawn(named("the keys the machine list carries", {
+        let (keys, store) = (keys.clone(), store.clone());
+        async move { keys.follow(store).await }
+    }));
     services.spawn(named("the API server", serve_on(listener, app.clone())));
     services.spawn(named("the Tailscale address watch", tailscale.watch()));
     services.spawn(named(
