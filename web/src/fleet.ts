@@ -1,4 +1,4 @@
-import type { AnyRecord, Briefs, MachineSample, SessionState, SharedSettings, Step, TerminalState, UiMessage } from "./api";
+import type { AnyRecord, Briefs, Limits, MachineSample, SessionState, SharedSettings, Step, TerminalState, UiMessage } from "./api";
 import { busy, plural, sessionLabel, sessionGlyph, terminalLabel, terminalGlyph, urgency, type Glyph } from "./labels";
 
 export interface FleetState {
@@ -84,6 +84,8 @@ export interface MachineView {
   listed: boolean;
   /** The address the machine list holds for it; none for a machine it does not list. */
   address?: string;
+  /** The limits the settings hold for it, if any. */
+  limits?: Limits;
   status: "online" | "offline" | "unknown";
   sample: MachineSample | null;
   workspaces: WorkspaceView[];
@@ -195,6 +197,7 @@ export function fleet(records: AnyRecord[], settings: SharedSettings, briefs: Br
     name: machineNames.get(id) ?? shortId(id),
     listed: machineNames.has(id),
     address: machineAddresses.get(id),
+    limits: settings.limits[id],
     status: statusByOwner.get(id) ?? "unknown",
     sample: samplesByOwner.get(id)?.body ?? null,
     workspaces: (workspacesByOwner.get(id) ?? []).map((w) => {

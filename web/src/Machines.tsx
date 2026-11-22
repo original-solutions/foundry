@@ -1,7 +1,7 @@
 import { useMutation } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { useRef, useState, type ReactNode } from "react";
-import { post, refused } from "./api";
+import { post, refused, type Limits } from "./api";
 import { byUrgency, rows, type MachineView } from "./fleet";
 import { plural, urgency, type Glyph } from "./labels";
 import { button, field, fieldLook, Modal, primaryButton } from "./Modal";
@@ -108,6 +108,10 @@ function MachineCard({ machine, points, heard, here, now }: { machine: MachineVi
         </span>
       </header>
       <p className="truncate px-4 font-mono text-[11px] text-neutral-600">{machine.id}</p>
+      <div className="flex items-center justify-between gap-2 px-4 pt-1.5">
+        <p className="min-w-0 text-xs text-neutral-400">{machine.limits ? limitsText(machine.limits) : "No limits"}</p>
+        {machine.listed && <LimitsDialog machine={machine} />}
+      </div>
 
       {sample ? (
         <div className={away ? "opacity-60 grayscale" : undefined}>
@@ -327,6 +331,81 @@ function AddMachine({ machines }: { machines: MachineView[] }) {
           </div>
         </form>
       )}
+    </Modal>
+  );
+}
+
+/** Bytes as gigabytes, without float noise. */
+const wholeGb = (bytes: number) => Number((bytes / 1e9).toFixed(3));
+
+/** A machine's limits in a line. */
+const limitsText = (l: Limits) => `At most ${plural(l.max_sessions, "session")} · load ${l.max_load_per_core} per core · ${wholeGb(l.min_free_disk)} GB disk free`;
+
+/** What the limits dialog sends: the fields as numbers (a blank one is null, which the daemon refuses), or a clear. */
+type LimitsAction = { fields: { max_sessions: number | null; max_load_per_core: number | null; min_free_disk_gb: number | null } } | "clear";
+
+async function sendLimits({ id, action }: { id: string; action: LimitsAction }): Promise<void> {
+  const { status, json } = action === "clear" ? await post(`/api/machines/${id}/limits/clear`) : await post(`/api/machines/${id}/limits`, action.fields);
+  if (status !== 204) throw refused(status, json);
+}
+
+const asNumber = (text: string) => (text.trim() === "" ? null : Number(text));
+
+/**
+ * A listed machine's Limits button and its dialog: three number fields filled from its current
+ * limits (the disk in gigabytes) or empty, Save to set them and Clear to remove them. The dialog
+ * closes once the daemon takes the change; a refusal shows in it and keeps the values. Opening it
+ * fills the fields again from the limits then.
+ */
+function LimitsDialog({ machine }: { machine: MachineView }) {
+  const { limits } = machine;
+  const [open, setOpen] = useState(false);
+  const [sessions, setSessions] = useState("");
+  const [load, setLoad] = useState("");
+  const [disk, setDisk] = useState("");
+  const send = useMutation({ mutationFn: sendLimits, onSuccess: () => setOpen(false) });
+  const change = (next: boolean) => {
+    if (next) {
+      setSessions(limits ? String(limits.max_sessions) : "");
+      setLoad(limits ? String(limits.max_load_per_core) : "");
+      setDisk(limits ? String(wholeGb(limits.min_free_disk)) : "");
+    }
+    send.reset();
+    setOpen(next);
+  };
+  const numberField = (label: string, value: string, set: (text: string) => void, attrs: { min: number | string; step: number | string }) => (
+    <label className="text-xs text-neutral-400">
+      {label}
+      <input type="number" inputMode="decimal" {...attrs} value={value} onChange={(e) => set(e.target.value)} className={field} />
+    </label>
+  );
+  return (
+    <Modal open={open} onOpenChange={change} trigger="Limits" title={machine.name} description="Placement skips this machine while it is at or over any of these limits.">
+      <form
+        className="mt-3 flex flex-col gap-2"
+        onSubmit={(e) => {
+          e.preventDefault();
+          if (send.isPending) return;
+          send.mutate({ id: machine.id, action: { fields: { max_sessions: asNumber(sessions), max_load_per_core: asNumber(load), min_free_disk_gb: asNumber(disk) } } });
+        }}
+      >
+        {numberField("Max sessions", sessions, setSessions, { min: 1, step: 1 })}
+        {numberField("Max load per core", load, setLoad, { min: 0, step: "any" })}
+        {numberField("Min free disk (GB)", disk, setDisk, { min: 0, step: "any" })}
+        {send.isError && (
+          <p role="alert" className="text-xs text-red-400">
+            {send.error.message}
+          </p>
+        )}
+        <div className="flex justify-end gap-2">
+          <button type="button" className={button} disabled={!limits || send.isPending} onClick={() => send.mutate({ id: machine.id, action: "clear" })}>
+            Clear
+          </button>
+          <button type="submit" className={primaryButton} disabled={send.isPending}>
+            Save
+          </button>
+        </div>
+      </form>
     </Modal>
   );
 }
