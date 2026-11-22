@@ -158,7 +158,7 @@ This is a rule for every piece, not only P1: nothing runs without the UI showing
 - A split fleet holds neither rule. Each side numbers its own edits, so both sides can add a project of one name, and one side can remove a project while the other makes a workspace of it. The heal keeps both projects, or leaves the workspace without its project, and nothing shows it. Neither rule is checked while the acting machine runs a build from before these checks, and a create on such a build does not check its project. The acting coordinator also numbers an add or remove without either check when it comes from a machine on a build from before edits carried an id: nobody waits for that edit's answer, so a refusal would drop it unseen.
 - Each machine keeps one bare clone per project and makes worktrees from it.
 - A machine clones a project the first time it hosts a workspace for it. Adding a machine needs no setup per repo.
-- In P1 a machine clones with whatever git credentials it already has. Credentials handed out by the coordinator come with GitHub accounts in P2.
+- In P1 a machine clones with whatever git credentials it already has. Tokens per machine come with GitHub logins in P2.
 - A project may name setup commands, read from the repo's `.dw/config.yml` `provision` key when the file has one. This is the same step the gate uses in P2.
 
 ### Creating a workspace
@@ -342,7 +342,7 @@ One thing the check found that the design did not expect: in a folder Claude Cod
 
 Settled in the brainstorm on 2026-11-17. P2's spec, [P2-factory.md](P2-factory.md), takes the leases, the gate on any machine, reconciling every pass and what is kept from the earlier factories. It keeps one GitHub login per machine with an override per project instead of the coordinator handing credentials out. The review loop, the merge setting and the merge queue belong to P2b and stay recorded here until its spec exists.
 
-- **GitHub accounts.** Several accounts are connected to the app. Each project uses the one that owns its repo. The coordinator holds the credentials and gives a worker the right one for each run. Instructors stay a list per project.
+- **GitHub accounts.** Replaced by P2's spec: each machine holds its own tokens, a project names the login it acts as, and no credential is handed from one machine to another. Instructors stay a list per project.
 - **The unattended loop.** Claim, build with the `/factory` skill, run the gate on a fresh checkout, then run the review gate and fix until it scores 5 out of 5. A cap on rounds ends in the `stuck` state.
 - **Review independence, from `wow.md`.** The builder never reviews its own work. Each review is a fresh session with only the spec and the diff. Findings go back to the same builder session. A moved head is gated again. A merge names the exact head that was scored.
 - **Merge setting per project.** Either wait for a person, which is the default, or squash-merge when the gate is green and the review is 5 out of 5.
