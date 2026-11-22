@@ -19,27 +19,28 @@ function waited(since: number, now: number): string {
  * The creates this machine holds while no machine qualifies for them: a card while any waits,
  * nothing otherwise. Each says why every machine was passed over and can be cancelled; one being
  * placed shows that, and one whose placement failed shows why until it is dismissed. A placed
- * request leaves the list and its workspace shows up as any other does.
+ * request leaves the list and its workspace shows up as any other does. `folded` starts it folded
+ * to its count.
  */
-export function WaitingList() {
+export function WaitingList({ folded = false }: { folded?: boolean }) {
   const { data: requests = [] } = useQuery({
     queryKey: placementsKey,
     queryFn: listPlacements,
     refetchInterval: pollEvery(PLACEMENTS_EVERY, true),
     retry: false,
   });
-  return requests.length > 0 ? <Requests requests={requests} /> : null;
+  return requests.length > 0 ? <Requests requests={requests} folded={folded} /> : null;
 }
 
-/** Mounted while any request is held, so its clock starts from when the card shows. */
-function Requests({ requests }: { requests: Placement[] }) {
+/** Mounted while any request is held, so its clock and its fold start from when the card shows. */
+function Requests({ requests, folded }: { requests: Placement[]; folded: boolean }) {
   const client = useQueryClient();
   const cancel = useMutation({
     mutationFn: (request: Placement) => cancelPlacement(request.id),
     onSettled: () => client.invalidateQueries({ queryKey: placementsKey, exact: true }),
   });
   const now = useNow(CLOCK_EVERY);
-  const [open, setOpen] = useState(true);
+  const [open, setOpen] = useState(!folded);
 
   return (
     <section

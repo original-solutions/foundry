@@ -1336,7 +1336,33 @@ async fn a_clear_does_not_end_the_session() {
 }
 
 #[tokio::test]
-async fn a_session_end_that_is_not_a_clear_still_ends_it() {
+async fn a_resume_does_not_end_the_session() {
+    // Claude Code's /resume sends SessionEnd with reason "resume", then SessionStart with source
+    // "resume", and keeps running.
+    let f = Fixture::new(
+        "
+- hook: {event: SessionStart}
+- hook: {event: UserPromptSubmit}
+- hook: {event: SessionEnd, reason: resume}
+- hook: {event: SessionStart, source: resume}
+- hook: {event: UserPromptSubmit}
+- print: DONE
+- wait_input
+",
+    )
+    .await;
+    let id = f.start().await;
+    let terminal = f.record(id).unwrap().body.terminal;
+    let (snapshot, mut output) = f.terminals.attach(terminal).await.unwrap();
+
+    // Every hook is posted and answered before the agent prints.
+    read_until(&snapshot.bytes, &mut output, |seen| seen.contains("DONE")).await;
+
+    assert_eq!(f.state(id), Some(SessionState::Working));
+}
+
+#[tokio::test]
+async fn a_session_end_that_does_not_continue_still_ends_it() {
     let f = Fixture::new("- wait_input\n").await;
     let id = f.start().await;
     let body = r#"{"hook_event_name":"SessionEnd","reason":"logout"}"#;

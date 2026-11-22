@@ -19,7 +19,7 @@ Each run marks its temporary folder as trusted in your `~/.claude.json` (or `$CL
 | Field | On | What it decides |
 |---|---|---|
 | `hook_event_name` | every hook | which hook it is (`Hook::from_name`) |
-| `reason` | `SessionEnd` | `clear` means `/clear`, and the session keeps running. Any other reason ends it |
+| `reason` | `SessionEnd` | `clear` means `/clear` and `resume` means `/resume`: the session keeps running. Any other reason ends it |
 
 The session comes from the URL the hook posts to, `/hooks/<session>`, not from the body. Nothing else in the body is read.
 

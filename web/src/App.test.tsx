@@ -69,11 +69,12 @@ vi.mock("@xterm/addon-fit", () => ({ FitAddon: class { fit() {} } }));
 /**
  * Like `mockFetch`, but the board's reads of each workspace's changes get an empty answer, the
  * reads of where each branch stands get `shipping`, the reads of session briefs get `briefs`, the
- * reads of the attention list get `attention`, and the task box's read of the machines gets this
+ * reads of the attention list get `attention`, the reads of the waiting creates get `placements`, and the task box's read of the machines gets this
  * machine alone; all are left out of the calls, so a test sees only the requests it makes.
  */
 let briefs: Briefs = {};
 let attention: unknown[] = [];
+let placements: unknown[] = [];
 const quiet: Shipping = { branch: "b", pushed: false, unpushed: 0, pr: null, unreachable: false };
 let shipping: Shipping = quiet;
 
@@ -86,7 +87,7 @@ function mockActions(...answers: Response[]): Call[] {
       if (url.endsWith("/api/briefs")) return json(200, briefs);
       if (url.endsWith("/pr")) return json(200, shipping);
       if (url.endsWith("/api/attention")) return json(200, { items: attention });
-      if (url.endsWith("/api/placements")) return json(200, { requests: [] });
+      if (url.endsWith("/api/placements")) return json(200, { requests: placements });
       if (url.endsWith("/api/machines")) return json(200, { me: ME, machines: [] });
       calls.push({ url, method: init.method ?? "GET", body: init.body ? JSON.parse(String(init.body)) : undefined });
       const next = answers.shift();
@@ -103,6 +104,7 @@ beforeEach(() => {
   briefs = {};
   shipping = quiet;
   attention = [];
+  placements = [];
   localStorage.clear();
   FakeSocket.install();
   vi.stubGlobal(
@@ -189,6 +191,113 @@ describe("App", () => {
     await open("/", live);
     const list = await screen.findByRole("region", { name: "Needs attention" });
     expect(within(list).getByText("A session in fix login on this-mac is waiting for you")).toBeDefined();
+  });
+
+  const needsYou = {
+    id: "session_waiting:s1",
+    kind: "session_waiting",
+    machine: ME,
+    machine_name: "this-mac",
+    what: "A session in fix login on this-mac is waiting for you",
+    todo: "Open its terminal and answer it",
+    terminal: "t1",
+  };
+  const held = {
+    id: "r1",
+    project: "p1",
+    name: "docs",
+    state: "waiting",
+    waiting_since: Date.now(),
+    reasons: ["laptop: offline"],
+    error: null,
+  };
+  /** The fixed stack of news at the top of the screen. */
+  const newsStack = (el: Element) => el.closest(".fixed");
+
+  for (const [name, toggle, shown] of [
+    ["Needs attention", /1 needs attention/, needsYou.what],
+    ["Waiting for a machine", /1 waiting for a machine/, held.reasons[0]],
+  ] as const) {
+    it(`on a narrow screen puts "${name}" folded in the page above the terminal header, not over it`, async () => {
+      vi.stubGlobal("matchMedia", () => ({ matches: false }));
+      attention = [needsYou];
+      placements = [held];
+      mockActions();
+      await open("/terminals/t1", live);
+      const list = await screen.findByRole("region", { name });
+      expect(screen.getAllByRole("region", { name })).toHaveLength(1);
+      expect(document.querySelector("main")!.contains(list)).toBe(true);
+      const header = document.querySelector('header[aria-label="Open terminal"]')!;
+      expect(list.compareDocumentPosition(header) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      expect(newsStack(list)).toBeNull();
+      const button = within(list).getByRole("button", { name: toggle });
+      expect(button.getAttribute("aria-expanded")).toBe("false");
+      expect(within(list).queryByText(shown)).toBeNull();
+      fireEvent.click(button);
+      expect(within(list).getByText(shown)).toBeDefined();
+    });
+  }
+
+  for (const [screenIs, wide] of [
+    ["a wide screen", () => vi.stubGlobal("matchMedia", (query: string) => ({ matches: query === "(min-width: 768px)" }))],
+    ["no matchMedia", () => {}],
+  ] as const) {
+    it(`with ${screenIs}, keeps both lists open in the news stack`, async () => {
+      wide();
+      attention = [needsYou];
+      placements = [held];
+      mockActions();
+      await open("/terminals/t1", live);
+      for (const name of ["Needs attention", "Waiting for a machine"]) {
+        const list = await screen.findByRole("region", { name });
+        expect(screen.getAllByRole("region", { name })).toHaveLength(1);
+        expect(newsStack(list)).not.toBeNull();
+        expect(document.querySelector("main")!.contains(list)).toBe(false);
+        expect(within(list).getByRole("button", { expanded: true })).toBeDefined();
+      }
+    });
+  }
+
+  it("moves the lists between the page and the news stack as the screen crosses the breakpoint", async () => {
+    let wide = false;
+    const listeners = new Set<() => void>();
+    vi.stubGlobal("matchMedia", (query: string) => ({
+      get matches() {
+        return query === "(min-width: 768px)" && wide;
+      },
+      addEventListener: (_: string, f: () => void) => listeners.add(f),
+      removeEventListener: (_: string, f: () => void) => listeners.delete(f),
+    }));
+    attention = [needsYou];
+    mockActions();
+    await open("/terminals/t1", live);
+    const narrow = await screen.findByRole("region", { name: "Needs attention" });
+    expect(newsStack(narrow)).toBeNull();
+
+    wide = true;
+    act(() => listeners.forEach((f) => f()));
+    const moved = screen.getByRole("region", { name: "Needs attention" });
+    expect(newsStack(moved)).not.toBeNull();
+    expect(within(moved).getByText(needsYou.what)).toBeDefined();
+
+    wide = false;
+    act(() => listeners.forEach((f) => f()));
+    const back = screen.getByRole("region", { name: "Needs attention" });
+    expect(newsStack(back)).toBeNull();
+    expect(within(back).queryByText(needsYou.what)).toBeNull();
+  });
+
+  it("takes no room in the page on a narrow screen while nothing needs attention or waits, and at most half of it otherwise", async () => {
+    vi.stubGlobal("matchMedia", () => ({ matches: false }));
+    mockActions();
+    await open("/terminals/t1", live);
+    await waitFor(() => expect(document.querySelector("main")!.firstElementChild!.className).toMatch(/\bempty:hidden\b/));
+    const slot = document.querySelector("main")!.firstElementChild!;
+    expect(slot.className).toMatch(/\bshrink-0\b/);
+    // Both lists unfolded never push the header off the screen: the slot scrolls past half of it.
+    expect(slot.className).toMatch(/\bmax-h-\[50dvh\]/);
+    expect(slot.className).toMatch(/\boverflow-y-auto\b/);
+    expect(slot.childElementCount).toBe(0);
   });
 
   it("says the daemon cannot be reached, instead of showing an empty fleet, when no state ever arrives", async () => {
