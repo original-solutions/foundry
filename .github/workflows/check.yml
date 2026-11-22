@@ -5,9 +5,10 @@
 #
 # `npm --prefix web run e2e` runs the browser test, web/e2e/ui.spec.ts: the real terminal against
 # a real daemon, with the fake agent as `claude`. It needs Google Chrome, which ubuntu-latest
-# ships, and the debug foundryd, foundry-holder and foundry-fake-agent the `cargo test` step before
-# it leaves in target/debug. The factory gates on macOS, and the test starts a real daemon and a
-# browser, so it runs here only.
+# ships. Its setup builds and starts the debug foundryd, foundry-holder and foundry-fake-agent; it
+# runs after the `cargo test` step, which leaves them in target/debug, so that build has nothing
+# left to do. The factory gates on macOS, and the test starts a real daemon and a browser, so it
+# runs here only.
 #
 # `cargo test --release -p foundryd --lib --locked` runs the tests that prove a release build
 # ignores the test-only overrides FOUNDRY_SECRETS and FOUNDRY_TAILSCALE, which a debug build cannot

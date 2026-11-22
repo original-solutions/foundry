@@ -1,8 +1,11 @@
 import { expect, test } from "@playwright/test";
 import { sessionLabel } from "../src/labels";
 
-/** A session's line in the sidebar once it waits for its next prompt: its model, its title, then its state. */
-const idle = new RegExp(`^opus\\b.*\\b${sessionLabel.idle}$`);
+/**
+ * The session's line in the sidebar once its first turn ended: its model, the title its task gave
+ * it, then the idle state. A session that has not taken the task yet has no title.
+ */
+const idle = new RegExp(`^opus e2e work ${sessionLabel.idle}$`);
 
 test("start a task, use its workspace's shell, and see the same screen after a reload", async ({ page }) => {
   await page.goto(`${process.env.FOUNDRY_E2E_URL}/`);
