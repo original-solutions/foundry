@@ -2,7 +2,7 @@
 
 Product: Foundry, a dark software factory that also runs manual sessions.
 
-Status: design, written 2026-11-22 and revised six times the same day after reviews against P1's code on `main` (v0.2.0). Nothing here is built. The plan comes after the checks at the end of this spec and after the P1 issues named under "Before P2 starts" are closed.
+Status: approved 2026-11-22, after six revisions the same day from reviews against P1's code on `main` (v0.2.0). Nothing here is built. The plan comes after the checks at the end of this spec and after the P1 issues named under "Before P2 starts" are closed.
 
 ## Why
 
@@ -47,6 +47,7 @@ Where this spec says "as the runner does" or is silent on a rule of the lifecycl
   - It reads its brief from the file named on its command line (F12), also when the file is outside the worktree.
   - Its "GitHub account" step, which probes `gh` logins, runs `gh auth token` and swaps git's credential helper, is skipped when the brief says Foundry set `GH_TOKEN`. That step runs before anything else today and would pick an account against the one Foundry chose.
   - Its gate-failure paragraph says the command and its output are in the file named on the line, where today it says they are in the message.
+  - factory-on-paradev holds a copy of the skill and a check (`plugins/factory/skills/factory/scripts/check.sh`) that fails when the "GitHub account" text is missing, so that check changes with it.
 
 ## Decisions
 
@@ -335,7 +336,7 @@ The way back, per repo: turn its switch off in Foundry and put it back in the ru
 | 5 | A push a minute per repo, 1,440 a day each across six repos, trips no GitHub rate limit, and parentless commits that the ref has left do not pile up in the repo | The lease's cadence rests on it. If it fails, renew less often and wait longer before a takeover |
 | 6 | A line of under 800 characters starting `/factory-build`, typed as P1 types a first prompt, loads the skill, the model reads the file the line names when it is outside the worktree, and `UserPromptSubmit` fires for it | Every launch rests on it (F12), and the resend rule counts that hook |
 | 11 | A session that has the skill, sent the line `The factory gate failed` with a path, opens the file and acts on it | Gate retries rest on it |
-| 7 | No gate command of the six repos calls `gh` or fetches a private dependency from GitHub | The gate terminal has no token |
+| 7 | No gate command of the six repos calls `gh` or fetches a private dependency from GitHub. Read on 2026-11-22: no `provision` or `gate` command, Makefile, script or dependency manifest in five of the repos does, from the runner's clones, which are up to ten days old. Still open: factory-paradev-spike's scripts, and whether any test starts a real `gh` | The gate terminal has no token |
 | 8 | Interactive Claude Code takes the effort setting by a flag or variable, and the gateway passes it through | The factory setting names an effort |
 | 9 | `CLOCK_MONOTONIC` on macOS and `CLOCK_BOOTTIME` on Linux count through sleep on the fleet's machines. Confirmed for macOS on 2026-11-22; Linux is open | The lease's ages and the cut-off rule rest on it |
 | 10 | Two worktrees of one bare clone cannot hold the same branch, and moving a local branch to `origin`'s for a feedback workspace works once the build workspace is archived | The workspace table rests on it |
