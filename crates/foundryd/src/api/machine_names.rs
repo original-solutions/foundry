@@ -276,6 +276,7 @@ mod tests {
 
     use super::*;
     use crate::sync::{Conn, Dialer, Peers};
+    use crate::test_log::Logged;
 
     struct NoDial;
 
@@ -450,42 +451,6 @@ mod tests {
     fn error_of(body: &str) -> String {
         let json: Value = serde_json::from_str(body).unwrap();
         json["error"].as_str().unwrap().to_owned()
-    }
-
-    /// Everything logged while it is set, as plain text.
-    #[derive(Clone, Default)]
-    struct Logged(Arc<Mutex<Vec<u8>>>);
-
-    impl io::Write for Logged {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl Logged {
-        /// Captures this thread's log until the guard drops.
-        fn capture(&self) -> tracing::subscriber::DefaultGuard {
-            let logged = self.clone();
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(move || logged.clone())
-                .with_ansi(false)
-                .without_time()
-                .finish();
-            tracing::subscriber::set_default(subscriber)
-        }
-
-        fn warnings(&self) -> Vec<String> {
-            String::from_utf8_lossy(&self.0.lock().unwrap())
-                .lines()
-                .filter(|line| line.contains("WARN"))
-                .map(str::to_owned)
-                .collect()
-        }
     }
 
     // --- listing this machine ---

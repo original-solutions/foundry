@@ -1424,6 +1424,7 @@ mod tests {
     use crate::secrets::{Edit, FileSecrets, MemorySecrets, Secrets, SecretsError};
     use crate::store::Store;
     use crate::sync::{Conn, Dialer, Peers};
+    use crate::test_log::Logged;
 
     /// Where a redeem in these tests comes from.
     const HERE: IpAddr = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
@@ -2241,37 +2242,6 @@ mod tests {
         }
     }
 
-    /// Every warning logged while the returned guard is held, a line each.
-    fn capture_warnings() -> (Arc<Mutex<Vec<u8>>>, tracing::subscriber::DefaultGuard) {
-        #[derive(Clone)]
-        struct Into(Arc<Mutex<Vec<u8>>>);
-        impl io::Write for Into {
-            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(bytes);
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-        let logged = Arc::new(Mutex::new(Vec::new()));
-        let writer = Into(logged.clone());
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(move || writer.clone())
-            .with_ansi(false)
-            .without_time()
-            .finish();
-        (logged, tracing::subscriber::set_default(subscriber))
-    }
-
-    fn warnings(logged: &Mutex<Vec<u8>>) -> Vec<String> {
-        String::from_utf8_lossy(&logged.lock().unwrap())
-            .lines()
-            .filter(|line| line.contains("WARN"))
-            .map(str::to_owned)
-            .collect()
-    }
-
     #[tokio::test(start_paused = true)]
     async fn a_key_in_the_machine_list_is_admitted_and_saved() {
         let secrets = Arc::new(MemorySecrets::default());
@@ -2356,7 +2326,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_listed_key_that_does_not_parse_is_skipped_with_one_warning_naming_the_machine() {
-        let (logged, _capture) = capture_warnings();
+        let logged = Logged::default();
+        let _capture = logged.capture();
         let host = machine_keys();
         let (odd, older, peer) = (MachineId::random(), MachineId::random(), machine_keys());
         // Hex, but 16 bytes: not an Ed25519 public key.
@@ -2373,7 +2344,7 @@ mod tests {
         assert_eq!(host.state(odd), KeyState::NoKey);
         assert_eq!(host.state(older), KeyState::NoKey);
         assert_eq!(host.state(peer.me()), KeyState::Active);
-        let warned = warnings(&logged);
+        let warned = logged.warnings();
         assert_eq!(warned.len(), 1, "{warned:?}");
         assert!(warned[0].contains(&odd.to_string()), "{warned:?}");
         assert!(
