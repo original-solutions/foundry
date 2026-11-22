@@ -243,7 +243,7 @@ A file dropped on a terminal of this machine, pasted into it (a screenshot on th
 
 - Each worker records CPU load per core, free memory, free disk and its session count every 5 seconds.
 - Load is the whole machine's, not only Foundry's work, so another program filling a machine counts.
-- Each machine has limits, set in shared settings: maximum sessions, maximum load per core, minimum free disk.
+- Each machine has limits, set in shared settings from the machines board: maximum sessions, maximum load per core, minimum free disk.
 - "Let Foundry choose" picks, among online machines under all their limits, the one with the lowest load per core. Ties go to the one with fewer sessions.
 - When no machine qualifies, the request waits in a queue shown in the UI with each machine's reason, for example `trilogy-mac: load 1.8 over limit 1.0`. It is placed as soon as a machine qualifies.
 - A machine Tom picks by name is used even over its limits, after a warning.

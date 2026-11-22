@@ -1324,6 +1324,49 @@ fn the_rename_route_refuses_a_request_from_another_site() {
 }
 
 #[test]
+fn the_limits_routes_refuse_a_request_from_another_site() {
+    use std::io::{Read as _, Write as _};
+    let mut fixture = Fixture::new();
+    fixture.start();
+    // As in the rename route's test: only a request the route serves sends a body.
+    let ask = |path: &str, host: &str, origin: Option<&str>, body: &str| {
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", fixture.port)).unwrap();
+        let origin = origin.map_or_else(String::new, |o| format!("Origin: {o}\r\n"));
+        write!(
+            stream,
+            "POST {path} HTTP/1.1\r\nHost: {host}\r\n{origin}Connection: close\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        let status = response.split(' ').nth(1).unwrap().parse::<u16>().unwrap();
+        (status, response)
+    };
+    let here = format!("127.0.0.1:{}", fixture.port);
+    let machine = MachineId::random();
+    let limits = format!("/api/machines/{machine}/limits");
+    let clear = format!("/api/machines/{machine}/limits/clear");
+    let body = r#"{"max_sessions": 2, "max_load_per_core": 1, "min_free_disk_gb": 20}"#;
+    // Served here: a machine the list does not hold is refused by the route itself, not as an
+    // unrouted path.
+    for (path, body) in [(&limits, body), (&clear, "")] {
+        let (status, answer) = ask(path, &here, None, body);
+        assert_eq!(status, 404, "{path}");
+        assert!(answer.contains("machine list"), "{path}: {answer}");
+    }
+    for path in [&limits, &clear] {
+        assert_eq!(
+            ask(path, &here, Some("http://evil.example"), "").0,
+            403,
+            "{path}"
+        );
+        assert_eq!(ask(path, "evil.example", None, "").0, 403, "{path}");
+    }
+}
+
+#[test]
 fn the_join_and_add_routes_are_served_and_refuse_a_request_from_another_site() {
     use std::io::{Read as _, Write as _};
     let mut fixture = Fixture::new();

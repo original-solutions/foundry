@@ -48,7 +48,13 @@ export interface SharedSettings {
   machines: { id: string; name: string; address: string }[];
   priority: string[];
   projects: Project[];
-  limits: Record<string, unknown>;
+  limits: Record<string, Limits>;
+}
+/** What placement keeps a machine under. `min_free_disk` is bytes. */
+export interface Limits {
+  max_sessions: number;
+  max_load_per_core: number;
+  min_free_disk: number;
 }
 export interface Project {
   id: string;
