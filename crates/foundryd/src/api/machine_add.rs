@@ -14,12 +14,12 @@
 //!
 //! The code works only from an address the name resolved to. The name and that address are
 //! held with the code until it expires. When a machine uses the code on the join route, the
-//! route lists it through [`Lister`](crate::lister::Lister), through the acting coordinator, as every machine list
-//! change is, before it answers: with its key, under the name and address it lists itself
-//! under, or under the name typed at that address when it sends none. A list that already holds
-//! the machine is left as it is. When another machine has the name or the address, or the edit
-//! fails, the join is `503`, no key is kept for the machine, and the same machine may send the
-//! code again. A code made anywhere else lists nothing.
+//! route lists it through [`Lister`](crate::lister::Lister), through the acting coordinator, as
+//! every machine list change is, before it answers: with its key, under the name and address it
+//! lists itself under, or under the name typed at that address when it sends none. A list that
+//! already holds the machine is left as it is. When another machine has the name or the
+//! address, or the edit fails, the join is `503`, no key is kept for the machine, and the same
+//! machine may send the code again. A code made anywhere else lists nothing.
 
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};

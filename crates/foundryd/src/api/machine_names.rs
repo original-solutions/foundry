@@ -2,10 +2,10 @@
 //! short name, and anyone can rename a listed machine from the UI. Both go through the acting
 //! coordinator, as every shared-settings change does.
 //!
-//! - [`Listing`] keeps this machine in the list. Fed what [`entry`](crate::tailscale::entry) reads from
-//!   `tailscale status --self --json`, it adds the machine with its public key when the list
-//!   does not hold it, moves its address when that changed, puts its key back when the entry
-//!   holds none or another, and never touches a name it has seen set.
+//! - [`Listing`] keeps this machine in the list. Fed what [`entry`](crate::tailscale::entry)
+//!   reads from `tailscale status --self --json`, it adds the machine with its public key when
+//!   the list does not hold it, moves its address when that changed, puts its key back when the
+//!   entry holds none or another, and never touches a name it has seen set.
 //! - `POST /api/machines/{id}/rename` `{name}`: sets a listed machine's name, trimmed, and
 //!   keeps its address, `204`. A name that is blank, over [`NAME_AT_MOST`] characters or holds
 //!   a control character is `422`; a name another machine has, compared trimmed and in any

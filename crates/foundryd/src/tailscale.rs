@@ -1,7 +1,9 @@
 //! What Tailscale says about this machine: the addresses it reports, from `tailscale ip`, and
 //! the entry the machine lists itself under ([`Entry`]), from `tailscale status --self --json`.
 //! [`own_entry`] is the one source of that entry, for the daemon's listing and for
-//! `foundryd join`.
+//! `foundryd join`. The machine's own host name ([`host_names`]) is read from the system, not
+//! from Tailscale: the entry falls back to it when Tailscale gives no DNS name, and the API
+//! trusts it in a `Host` header.
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
