@@ -52,8 +52,8 @@ export function Modal({
         trigger !== undefined && <Dialog.Trigger className={button}>{trigger}</Dialog.Trigger>
       )}
       <Dialog.Portal>
-        <Dialog.Overlay className="fixed inset-0 bg-black/60" />
-        <Dialog.Content className={`fixed left-1/2 top-1/2 ${wide ? "w-[min(32rem,calc(100vw-1.5rem))] rounded-xl border border-neutral-700/70 p-5" : "w-96 rounded p-4"} -translate-x-1/2 -translate-y-1/2 bg-neutral-900 text-sm text-neutral-100 shadow-xl`}>
+        <Dialog.Overlay className="fixed inset-0 z-50 bg-black/60" />
+        <Dialog.Content className={`fixed left-1/2 top-1/2 z-50 max-h-[calc(100dvh-1.5rem)] overflow-y-auto ${wide ? "w-[min(32rem,calc(100vw-1.5rem))] rounded-xl border border-neutral-700/70 p-5" : "w-96 rounded p-4"} -translate-x-1/2 -translate-y-1/2 bg-neutral-900 text-sm text-neutral-100 shadow-xl`}>
           <Dialog.Title className="font-semibold">{title}</Dialog.Title>
           <Dialog.Description className="mt-1 text-neutral-400">{description}</Dialog.Description>
           {children}
