@@ -485,6 +485,35 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_machine_carries_its_public_key_through_the_json_round_trip() {
+        let machine = Machine {
+            id: MachineId::random(),
+            name: "personal-mac".into(),
+            address: "100.91.54.18".into(),
+            key: "ab".repeat(32),
+        };
+        assert_round_trip(&machine);
+        let json = serde_json::to_value(&machine).unwrap();
+        assert_eq!(json["key"], "ab".repeat(32));
+    }
+
+    #[test]
+    fn a_machine_from_an_older_machine_reads_with_an_empty_key() {
+        let mac = "67e55044-10b1-426f-9247-bb680e5fe0c8";
+        let json = format!(r#"{{"id":"{mac}","name":"m","address":"100.64.0.1"}}"#);
+        let read: Machine = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            read,
+            Machine {
+                id: MachineId(mac.parse().unwrap()),
+                name: "m".into(),
+                address: "100.64.0.1".into(),
+                key: String::new(),
+            }
+        );
+    }
+
+    #[test]
     fn the_older_form_without_stamps_still_reads() {
         let json = r#"{"seq":7,"machines":[],"priority":[],"projects":[],"limits":{}}"#;
         let read: SharedSettings = serde_json::from_str(json).unwrap();
