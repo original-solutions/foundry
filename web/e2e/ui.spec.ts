@@ -2,8 +2,9 @@ import { expect, test } from "@playwright/test";
 import { sessionLabel } from "../src/labels";
 
 /**
- * The session's line in the sidebar once its first turn ended: its model, the title its task gave
- * it, then the idle state. A session that has not taken the task yet has no title.
+ * The session's line in the sidebar once it took its task and went idle: its model, the title its
+ * task gave it, then the idle state. A session that has not taken the task yet has no title. After
+ * the reload, only the Stop that ends the turn can make it idle again.
  */
 const idle = new RegExp(`^opus e2e work ${sessionLabel.idle}$`);
 
