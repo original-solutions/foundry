@@ -13,8 +13,9 @@ const key = ["attention"];
  * What needs a person, across the fleet: a card at the top of the layout's news while anything
  * does, nothing otherwise. Each item says what happened, what to do and on which machine, with its terminal one
  * click away. A "setting overwritten" item is dismissed here; every other clears on its own.
+ * `folded` starts it folded to its count.
  */
-export function AttentionList() {
+export function AttentionList({ folded = false }: { folded?: boolean }) {
   const client = useQueryClient();
   const { data: items = [] } = useQuery({
     queryKey: key,
@@ -22,7 +23,7 @@ export function AttentionList() {
     refetchInterval: pollEvery(ATTENTION_EVERY, true),
     retry: false,
   });
-  const [open, setOpen] = useState(true);
+  const [open, setOpen] = useState(!folded);
   const dismiss = useMutation({
     mutationFn: (item: AttentionItem) => dismissItem(item.id),
     onSettled: () => client.invalidateQueries({ queryKey: key, exact: true }),
