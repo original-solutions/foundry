@@ -153,6 +153,21 @@ describe("Board", () => {
     expect(within(quiet).getByRole("article", { name: "far away" })).toBeDefined();
   });
 
+  it("lists no workspace of a machine the machine list does not hold, nor its terminals or sessions", async () => {
+    const all = [
+      ...records(),
+      sample(OTHER, 1),
+      workspace(OTHER, "w9", "cut off"),
+      terminal(OTHER, "t9", "w9"),
+      session(OTHER, "s9", "w9", "t9", "waiting_for_you", { model: "gone-model" }),
+    ];
+    await show(fleet(all, settings({ machines: [{ id: ME, name: "studio", address: "" }] })));
+
+    expect(card("fix login")).toBeDefined();
+    expect(screen.queryByRole("article", { name: "cut off" })).toBeNull();
+    expect(screen.queryByText("gone-model")).toBeNull();
+  });
+
   it("lists a card's terminals with their states, each opening its terminal", async () => {
     const { router } = await show(fleet(records(), settings()));
     const login = card("fix login");

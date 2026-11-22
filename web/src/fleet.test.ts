@@ -50,6 +50,38 @@ describe("apply", () => {
 });
 
 describe("fleet", () => {
+  describe("a machine the machine list does not hold", () => {
+    const records = [
+      sample(ME, 1),
+      workspace(ME, "w1", "mine"),
+      terminal(ME, "t1", "w1"),
+      session(ME, "s1", "w1", "t1"),
+      terminal(ME, "sh1", "w1"),
+      sample(OTHER, 1),
+      workspace(OTHER, "w2", "gone"),
+      terminal(OTHER, "t2", "w2"),
+      session(OTHER, "s2", "w2", "t2"),
+      terminal(OTHER, "sh2", "w2"),
+    ];
+
+    it("has no workspaces, sessions or shells once the list holds a machine, and keeps its card", () => {
+      const machines = fleet(records, settings({ machines: [{ id: ME, name: "studio", address: "" }] }));
+      expect(machines.map((m) => m.id)).toEqual([ME, OTHER]);
+      const [mine, gone] = machines;
+      expect(mine.workspaces.map((w) => w.name)).toEqual(["mine"]);
+      expect(mine.workspaces[0].sessions.map((x) => x.id)).toEqual(["s1"]);
+      expect(mine.workspaces[0].shells).toHaveLength(1);
+      expect(gone.listed).toBe(false);
+      expect(gone.sample).not.toBeNull();
+      expect(gone.workspaces).toEqual([]);
+    });
+
+    it("hides nothing while the list is empty", () => {
+      const machines = fleet(records, settings({ machines: [] }));
+      expect(machines.flatMap((m) => m.workspaces.map((w) => w.name)).sort()).toEqual(["gone", "mine"]);
+    });
+  });
+
   it("lists machines in settings order, then others that have a sample, named by id", () => {
     const s = settings({
       machines: [

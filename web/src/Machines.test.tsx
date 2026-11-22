@@ -375,6 +375,53 @@ describe("Machines", () => {
     });
   });
 
+  describe("removing a machine", () => {
+    const confirmText = "laptop will be cut off from every machine and cannot join again under its current identity. Its workspaces stay on its disk.";
+    const showListed = (given = twoMachines) => renderApp(<Machines machines={fleet(records, given)} history={{}} here={ME} connected />);
+    const remove = () => fireEvent.click(within(card("laptop")).getByRole("button", { name: "Remove from fleet" }));
+
+    it("is absent on this machine's card and on a card the machine list does not hold", async () => {
+      await showListed(settings({ machines: [{ id: ME, name: "studio", address: "" }] }));
+
+      expect(within(card("studio")).queryByRole("button", { name: "Remove from fleet" })).toBeNull();
+      const unlisted = screen.getAllByRole("article").find((article) => !within(article).queryByText("This machine"))!;
+      expect(within(unlisted).queryByRole("button", { name: "Remove from fleet" })).toBeNull();
+    });
+
+    it("asks first, with the name, and posts nothing until confirmed", async () => {
+      const calls = mockFetch();
+      await showListed();
+
+      expect(within(card("studio")).queryByRole("button", { name: "Remove from fleet" })).toBeNull();
+      remove();
+
+      expect(within(screen.getByRole("dialog")).getByText(confirmText)).toBeDefined();
+      expect(calls).toEqual([]);
+    });
+
+    it("posts to the remove route on confirm and closes on 204", async () => {
+      const calls = mockFetch(new Response(null, { status: 204 }));
+      await showListed();
+
+      remove();
+      fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Remove from fleet" }));
+
+      await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+      expect(calls).toEqual([{ url: `/api/machines/${OTHER}/remove`, method: "POST", body: undefined }]);
+    });
+
+    it("shows a 409's error in the dialog and keeps it open", async () => {
+      mockFetch(json(409, { error: "remove a machine from another machine's UI" }));
+      await showListed();
+
+      remove();
+      fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Remove from fleet" }));
+
+      expect((await screen.findByRole("alert")).textContent).toBe("remove a machine from another machine's UI");
+      expect(screen.getByRole("dialog")).toBeDefined();
+    });
+  });
+
   describe("adding a machine", () => {
     const added = { code: "K7QX3M9PRT", command: "foundryd join 100.101.102.103 K7QX3M9PRT", expires_in_secs: 600 };
     const nameField = () => screen.getByRole<HTMLInputElement>("textbox", { name: "Name" });
