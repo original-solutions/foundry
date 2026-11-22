@@ -27,9 +27,12 @@ pub fn status() -> ExitCode {
     };
     match fetch(port) {
         Ok(UiMessage::State {
-            records, settings, ..
+            records,
+            settings,
+            online,
+            ..
         }) => {
-            print!("{}", render(&records, &settings));
+            print!("{}", render(&records, &settings, online.as_deref()));
             ExitCode::SUCCESS
         }
         Ok(_) => {
@@ -85,10 +88,16 @@ struct MachineSummary<'a> {
 }
 
 /// Every machine and its sessions as plain text: machines in the settings' order, then any
-/// other machine that has a sample, by id. `/api/state` carries no online set, so a machine's
-/// state is shown only where its records prove it: `offline` when one is marked unreachable,
+/// other machine that has a sample, by id. With `online`, the machines the daemon hears, a
+/// machine is `online` when the set holds it and `offline` when it does not, whatever its
+/// records say. Without it, from a daemon whose state carries no online set, a machine's state
+/// is shown only where its records prove it: `offline` when one is marked unreachable,
 /// `online` when one is not, `unknown` when it has none.
-pub fn render(records: &[AnyRecord], settings: &SharedSettings) -> String {
+pub fn render(
+    records: &[AnyRecord],
+    settings: &SharedSettings,
+    online: Option<&[MachineId]>,
+) -> String {
     let mut names: BTreeMap<MachineId, &str> = BTreeMap::new();
     let mut machines: Vec<MachineId> = Vec::with_capacity(settings.machines.len());
     for machine in &settings.machines {
@@ -147,18 +156,25 @@ pub fn render(records: &[AnyRecord], settings: &SharedSettings) -> String {
             }
         };
         let summary = by_machine.get(&id);
-        write_machine_lines(&mut out, name, summary);
+        let state = match (online, summary) {
+            (Some(online), _) if online.contains(&id) => "online",
+            (Some(_), _) => "offline",
+            (None, Some(s)) if s.has_unreachable => "offline",
+            (None, Some(s)) if s.has_reachable => "online",
+            (None, _) => "unknown",
+        };
+        write_machine_lines(&mut out, name, state, summary);
     }
     out
 }
 
 /// The machine's line, then a line for each of its sessions that is not deleted.
-fn write_machine_lines(out: &mut String, name: &str, summary: Option<&MachineSummary<'_>>) {
-    let state = match summary {
-        Some(s) if s.has_unreachable => "offline",
-        Some(s) if s.has_reachable => "online",
-        _ => "unknown",
-    };
+fn write_machine_lines(
+    out: &mut String,
+    name: &str,
+    state: &str,
+    summary: Option<&MachineSummary<'_>>,
+) {
     match summary.and_then(|s| s.newest_sample) {
         Some(sample) => {
             let body = &sample.body;
@@ -360,7 +376,11 @@ mod tests {
     #[test]
     fn a_listed_machine_with_only_a_sample_is_not_called_online() {
         let peer = MachineId::random();
-        let out = render(&[sample(peer, 1, 0.1, 0)], &settings(&[(peer, "peer")]), None);
+        let out = render(
+            &[sample(peer, 1, 0.1, 0)],
+            &settings(&[(peer, "peer")]),
+            None,
+        );
 
         assert!(out.contains("unknown"), "{out}");
         assert!(!out.contains("online"), "{out}");
@@ -384,7 +404,11 @@ mod tests {
 
     #[test]
     fn with_the_online_set_records_do_not_decide_the_state() {
-        let (up, down, stranger) = (MachineId::random(), MachineId::random(), MachineId::random());
+        let (up, down, stranger) = (
+            MachineId::random(),
+            MachineId::random(),
+            MachineId::random(),
+        );
         let records = [
             terminal(up, TerminalState::Unreachable),
             terminal(down, TerminalState::Running),
@@ -464,7 +488,11 @@ mod tests {
             sample(second, 1, 0.1, 0),
             sample(low, 1, 0.1, 0),
         ];
-        let out = render(&records, &settings(&[(first, "first"), (second, "second")]), None);
+        let out = render(
+            &records,
+            &settings(&[(first, "first"), (second, "second")]),
+            None,
+        );
         let at = |needle: &str| {
             out.find(needle)
                 .unwrap_or_else(|| panic!("{needle} in {out}"))

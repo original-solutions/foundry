@@ -110,6 +110,10 @@ pub enum UiMessage {
         protocol: u16,
         records: Vec<AnyRecord>,
         settings: SharedSettings,
+        /// Every machine the daemon serving the UI hears, itself included. None from a daemon
+        /// that predates it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        online: Option<Vec<MachineId>>,
     },
     /// One record changed.
     Record { protocol: u16, record: AnyRecord },
