@@ -30,8 +30,8 @@ export function Launchpad({
   /** The workspaces open now: a create under way keeps this page while its workspace arrives. */
   workspaces: WorkspaceView[];
   launch: Launch;
-  /** Called with the new session's id once it has started, so the layout can open it. */
-  onCreated: (session: string) => void;
+  /** Called with the new session's id once it has started, so the layout can open it, and the daemon's warning about its create, if any. */
+  onCreated: (session: string, warning: string | null) => void;
   /** Shows the sidebar, on a screen too narrow to keep it beside. */
   onMenu: () => void;
 }) {
@@ -61,7 +61,7 @@ export function Launchpad({
           </p>
         </div>
 
-        <Composer mode="page" id="launch-task" projects={projects} workspaces={workspaces} launch={launch} onCreated={(session) => onCreated(session)} doneLabel="Go to the board" />
+        <Composer mode="page" id="launch-task" projects={projects} workspaces={workspaces} launch={launch} onCreated={(session, warning) => onCreated(session, warning)} doneLabel="Go to the board" />
 
         <ul aria-label="What you will see" className="grid gap-px overflow-hidden rounded-xl border border-neutral-800 bg-neutral-800 sm:grid-cols-3">
           {states.map((s) => (

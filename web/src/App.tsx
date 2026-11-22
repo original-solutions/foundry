@@ -138,6 +138,13 @@ function Layout() {
   const [sessionIn, setSessionIn] = useState<{ id: string; name: string }>();
   /** The session of a workspace just made, until it shows up and is opened. */
   const [landing, setLanding] = useState<string>();
+  /** The daemon's warning about the last task started from the board's box or the first-run page, until it is dismissed. */
+  const [taskWarning, setTaskWarning] = useState<string>();
+  /** Lands in a task's session, keeping the warning about its create, or clearing the last one when it has none. */
+  const started = (session: string, warning: string | null) => {
+    setLanding(session);
+    setTaskWarning(warning ?? undefined);
+  };
   /** The first-run page's create, held here so it outlives the page when its workspace arrives first. */
   const launch = useCreateWorkspace();
   const navigate = useNavigate();
@@ -364,14 +371,14 @@ function Layout() {
               })}
               {/* Hidden while empty, so it never lies over a terminal. */}
               <div {...frozen} className="absolute inset-0 empty:hidden">
-                {firstRun && <Launchpad projects={state.settings.projects} workspaces={workspaces} launch={launch} onCreated={setLanding} onMenu={() => setDrawer(true)} />}
+                {firstRun && <Launchpad projects={state.settings.projects} workspaces={workspaces} launch={launch} onCreated={started} onMenu={() => setDrawer(true)} />}
                 {/* The board, the timeline and the machines are one element, so their shared head is never remounted. */}
                 {((board && state.synced) || (!terminalId && onMachines)) && (
                   <Board
                     machines={machines}
                     projects={state.settings.projects}
                     onJump={openJump}
-                    onCreated={setLanding}
+                    onCreated={started}
                     onChanges={openChanges}
                     traced={traced}
                     onMenu={() => setDrawer(true)}
@@ -418,6 +425,18 @@ function Layout() {
           {!narrow && <AttentionList />}
           {!narrow && <WaitingList />}
           {notify.notify.away && <Away records={sent.records} synced={sent.synced} machines={machines} traced={traced} onOpen={show} onShown={setCaughtUp} />}
+          {taskWarning && (
+            <div
+              role="alert"
+              aria-label="Task warning"
+              className="pointer-events-auto flex items-start gap-3 rounded-xl border border-amber-400/40 bg-neutral-900 px-4 py-3 text-sm text-amber-200 shadow-2xl shadow-black/50"
+            >
+              <span className="min-w-0 flex-1 break-words">{taskWarning}</span>
+              <button type="button" onClick={() => setTaskWarning(undefined)} className="-my-0.5 shrink-0 rounded px-1.5 py-0.5 text-xs text-neutral-400 hover:bg-neutral-800 hover:text-neutral-100">
+                Dismiss
+              </button>
+            </div>
+          )}
           <Toasts news={news} machines={machines} here={here} onScreen={pair ? [pair.left, pair.right] : terminalId ? [terminalId] : []} covered={notify.notify.away ? caughtUp : []} onOpen={show} />
         </div>
         {sessionIn && <NewSession key={sessionIn.id} workspace={sessionIn.id} name={sessionIn.name} onClose={() => setSessionIn(undefined)} onStarted={setLanding} />}
