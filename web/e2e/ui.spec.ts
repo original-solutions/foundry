@@ -1,39 +1,62 @@
 import { expect, test } from "@playwright/test";
+import { sessionLabel } from "../src/labels";
 
-test("create a workspace, use its shell, and see the same screen after a reload", async ({ page }) => {
+/**
+ * The session's line in the sidebar once it took its task and went idle: its model, the title its
+ * task gave it, then the idle state. A session that has not taken the task yet has no title. After
+ * the reload, only the Stop that ends the turn can make it idle again.
+ */
+const idle = new RegExp(`^opus e2e work ${sessionLabel.idle}$`);
+
+test("start a task, use its workspace's shell, and see the same screen after a reload", async ({ page }) => {
   await page.goto(`${process.env.FOUNDRY_E2E_URL}/`);
   await expect(page.getByRole("region", { name: "e2e-machine" })).toBeVisible();
 
-  await page.getByRole("button", { name: "New workspace" }).click();
-  await page.getByLabel("Project").selectOption({ label: "demo" });
-  await page.getByLabel("Name").fill("e2e work");
-  await page.getByRole("button", { name: "Create" }).click();
+  await page.getByRole("button", { name: "New task" }).click();
+  const dialog = page.getByRole("dialog", { name: "New task" });
+  // The task names the workspace.
+  await dialog.getByRole("textbox", { name: "What should Claude work on?" }).fill("e2e work");
+  await dialog.getByRole("radiogroup", { name: "Project" }).getByRole("radio", { name: "demo" }).check();
+  await dialog.getByRole("button", { name: "Start" }).click();
 
   const workspace = page.getByRole("group", { name: "e2e work" });
   await expect(workspace).toBeVisible();
-  const session = workspace.getByRole("link", { name: /opus\s*Idle/ });
+  // The fake agent takes the task as its first prompt and ends its turn.
+  const session = workspace.getByRole("link", { name: idle });
   await expect(session).toBeVisible({ timeout: 60_000 });
+  await session.click();
+  await expect(page).toHaveURL(/\/terminals\/[0-9a-f-]+$/);
+  await expect(page.getByTestId(`pane-${page.url().split("/").at(-1)}`).locator(".xterm-rows")).toContainText('PROMPT="e2e work"');
 
+  // A workspace's actions show while the pointer is over it.
+  await workspace.hover();
   await workspace.getByRole("button", { name: "New shell" }).click();
   const shell = workspace.getByRole("link", { name: /^shell/ });
+  // The page is on the session's terminal, so a check of the URL's shape would pass before the
+  // move to the shell: wait for the URL to leave the session's.
+  const sessionUrl = page.url();
   await shell.click();
+  await expect(page).not.toHaveURL(sessionUrl);
   await expect(page).toHaveURL(/\/terminals\/[0-9a-f-]+$/);
+  const url = page.url();
+  // The session's terminal stays mounted, hidden, beside the shell's: read the shell's pane.
+  const pane = page.getByTestId(`pane-${url.split("/").at(-1)}`);
 
-  const rows = page.locator(".xterm-rows");
+  const rows = pane.locator(".xterm-rows");
   await expect(rows).toBeVisible();
   // Keys typed before the shell's prompt shows could reach a terminal not yet attached.
   await expect(rows).toContainText("$");
-  await page.locator(".xterm").click();
+  await pane.locator(".xterm").click();
   await page.keyboard.type("echo e2e-$((6*7))");
   await page.keyboard.press("Enter");
   await expect(rows).toContainText("e2e-42");
-  const url = page.url();
 
   await page.reload();
 
   await expect(page).toHaveURL(url);
-  await expect(page.getByRole("group", { name: "e2e work" })).toBeVisible();
-  await expect(page.getByRole("group", { name: "e2e work" }).getByRole("link", { name: /opus\s*Idle/ })).toBeVisible();
-  await expect(page.getByRole("group", { name: "e2e work" }).getByRole("link", { name: /^shell/ })).toBeVisible();
-  await expect(page.locator(".xterm-rows")).toContainText("e2e-42");
+  const again = page.getByRole("group", { name: "e2e work" });
+  await expect(again).toBeVisible();
+  await expect(again.getByRole("link", { name: idle })).toBeVisible();
+  await expect(again.getByRole("link", { name: /^shell/ })).toBeVisible();
+  await expect(rows).toContainText("e2e-42");
 });

@@ -1,12 +1,23 @@
 # Runs the provision and gate commands on Linux. The factory gates on macOS. The steps mirror
 # factory.provision and factory.gate in .dw/config.yml: change both together.
 #
-# The two release steps are CI only and not in factory.gate. `cargo test --release -p foundryd
-# --lib --locked` runs the tests that prove a release build ignores the test-only overrides
-# FOUNDRY_SECRETS and FOUNDRY_TAILSCALE, which a debug build cannot run; the step before it builds
-# the holder and the fake agent those library tests start. The factory gates on macOS, where a
-# release build ignores FOUNDRY_SECRETS, so a release test that reaches the secret store would use
-# the real login keychain.
+# Four steps are CI only and not in factory.gate: the e2e step, the upload of its traces and the
+# two release steps.
+#
+# `npm --prefix web run e2e` runs the browser test, web/e2e/ui.spec.ts: the real terminal against
+# a real daemon, with the fake agent as `claude`. It needs Google Chrome, which ubuntu-latest
+# ships. Its setup builds and starts the debug foundryd, foundry-holder and foundry-fake-agent; it
+# runs after the `cargo test` step, which leaves them in target/debug, so that build reuses most of
+# it. The factory gates on macOS, and the test starts a real daemon and a browser, so it runs here
+# only. When it fails, the step after it uploads web/test-results, where Playwright keeps the
+# failed test's trace (`trace: "retain-on-failure"` in web/playwright.config.ts): CI is the only
+# place the test runs, so the trace is the only record of a failure.
+#
+# `cargo test --release -p foundryd --lib --locked` runs the tests that prove a release build
+# ignores the test-only overrides FOUNDRY_SECRETS and FOUNDRY_TAILSCALE, which a debug build cannot
+# run; the step before it builds the holder and the fake agent those library tests start. The
+# factory gates on macOS, where a release build ignores FOUNDRY_SECRETS, so a release test that
+# reaches the secret store would use the real login keychain.
 name: check
 
 on:
@@ -56,6 +67,15 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: cargo test --workspace --locked
         run: cargo test --workspace --locked
+      - name: npm --prefix web run e2e
+        run: npm --prefix web run e2e
+      - name: upload the browser test's traces
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: e2e-test-results
+          path: web/test-results
+          if-no-files-found: ignore
       - name: cargo build --release -p foundry-holder -p foundry-fake-agent --locked
         run: cargo build --release -p foundry-holder -p foundry-fake-agent --locked
       - name: cargo test --release -p foundryd --lib --locked
