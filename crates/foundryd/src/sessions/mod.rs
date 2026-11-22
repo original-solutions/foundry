@@ -1011,6 +1011,14 @@ mod adopt_tests {
     fn with_a_session(
         terminal_record: Option<(bool, TerminalState, Option<i32>)>,
     ) -> (tempfile::TempDir, Sessions, SessionId) {
+        with_a_session_record(terminal_record, false)
+    }
+
+    /// [`with_a_session`], with the session's record deleted or not.
+    fn with_a_session_record(
+        terminal_record: Option<(bool, TerminalState, Option<i32>)>,
+        session_deleted: bool,
+    ) -> (tempfile::TempDir, Sessions, SessionId) {
         let data = tempfile::tempdir().unwrap();
         let me = MachineId::random();
         let mut store = Store::open(data.path().join("foundry.db")).unwrap();
@@ -1036,7 +1044,7 @@ mod adopt_tests {
         records.push(AnyRecord::Session(Record {
             owner: me,
             version: store.own_next_version().unwrap(),
-            deleted: false,
+            deleted: session_deleted,
             body: Session {
                 id,
                 workspace,
@@ -1104,6 +1112,19 @@ mod adopt_tests {
             assert_eq!(state(&sessions, id), Some(wanted), "{terminal:?}");
             assert!(files_gone(&sessions, id), "{terminal:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_deleted_session_is_left_alone() {
+        let exited = Some((false, TerminalState::Exited, Some(0)));
+        let (_data, sessions, id) = with_a_session_record(exited, true);
+
+        sessions.adopt().await;
+
+        assert_eq!(state(&sessions, id), Some(SessionState::Working));
+        let (settings, curl) = sessions.inner.files(id);
+        assert!(settings.exists() && curl.exists());
+        assert!(!lock(&sessions.inner.live).contains_key(&id));
     }
 
     #[tokio::test]
