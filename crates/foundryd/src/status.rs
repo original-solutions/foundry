@@ -285,6 +285,7 @@ mod tests {
                 terminal(mac, TerminalState::Running),
             ],
             &settings(&[(mac, "trilogy-mac")]),
+            None,
         );
 
         assert!(out.starts_with("trilogy-mac"), "{out}");
@@ -298,7 +299,7 @@ mod tests {
     #[test]
     fn a_machine_not_in_the_settings_shows_its_id() {
         let stranger = MachineId::random();
-        let out = render(&[sample(stranger, 1, 0.1, 0)], &settings(&[]));
+        let out = render(&[sample(stranger, 1, 0.1, 0)], &settings(&[]), None);
 
         assert!(out.starts_with(&stranger.to_string()), "{out}");
     }
@@ -307,7 +308,7 @@ mod tests {
     fn the_newest_sample_is_the_one_shown() {
         let mac = MachineId::random();
         let records = [sample(mac, 9, 0.9, 7), sample(mac, 2, 0.1, 1)];
-        let out = render(&records, &settings(&[(mac, "mac")]));
+        let out = render(&records, &settings(&[(mac, "mac")]), None);
 
         assert!(out.contains("load 0.90/core"), "{out}");
         assert!(!out.contains("load 0.10/core"), "{out}");
@@ -316,7 +317,7 @@ mod tests {
     #[test]
     fn a_machine_with_no_sample_yet_says_so() {
         let mac = MachineId::random();
-        let out = render(&[], &settings(&[(mac, "mac")]));
+        let out = render(&[], &settings(&[(mac, "mac")]), None);
 
         assert!(out.contains("no sample yet"), "{out}");
     }
@@ -330,7 +331,7 @@ mod tests {
             sample(b, 1, 0.1, 0),
             terminal(b, TerminalState::Unreachable),
         ];
-        let out = render(&records, &settings(&[(a, "alpha"), (b, "beta")]));
+        let out = render(&records, &settings(&[(a, "alpha"), (b, "beta")]), None);
 
         for line in out
             .lines()
@@ -350,7 +351,7 @@ mod tests {
             session(mac, SessionState::Idle, false),
             terminal(mac, TerminalState::Running),
         ];
-        let out = render(&records, &settings(&[(mac, "mac")]));
+        let out = render(&records, &settings(&[(mac, "mac")]), None);
 
         assert!(out.contains("online"), "{out}");
         assert!(!out.contains("offline"), "{out}");
@@ -359,7 +360,7 @@ mod tests {
     #[test]
     fn a_listed_machine_with_only_a_sample_is_not_called_online() {
         let peer = MachineId::random();
-        let out = render(&[sample(peer, 1, 0.1, 0)], &settings(&[(peer, "peer")]));
+        let out = render(&[sample(peer, 1, 0.1, 0)], &settings(&[(peer, "peer")]), None);
 
         assert!(out.contains("unknown"), "{out}");
         assert!(!out.contains("online"), "{out}");
@@ -367,9 +368,43 @@ mod tests {
     }
 
     #[test]
+    fn with_the_online_set_a_listed_machine_with_only_a_sample_is_online_or_offline() {
+        let peer = MachineId::random();
+        let records = [sample(peer, 1, 0.1, 0)];
+        let listed = settings(&[(peer, "peer")]);
+
+        let heard = render(&records, &listed, Some(&[peer]));
+        assert!(heard.contains("peer  online"), "{heard}");
+        assert!(!heard.contains("unknown"), "{heard}");
+
+        let silent = render(&records, &listed, Some(&[]));
+        assert!(silent.contains("peer  offline"), "{silent}");
+        assert!(!silent.contains("unknown"), "{silent}");
+    }
+
+    #[test]
+    fn with_the_online_set_records_do_not_decide_the_state() {
+        let (up, down, stranger) = (MachineId::random(), MachineId::random(), MachineId::random());
+        let records = [
+            terminal(up, TerminalState::Unreachable),
+            terminal(down, TerminalState::Running),
+            sample(stranger, 1, 0.1, 0),
+        ];
+        let out = render(
+            &records,
+            &settings(&[(up, "up"), (down, "down")]),
+            Some(&[up, stranger]),
+        );
+
+        assert!(out.contains("up  online"), "{out}");
+        assert!(out.contains("down  offline"), "{out}");
+        assert!(out.contains(&format!("{stranger}  online")), "{out}");
+    }
+
+    #[test]
     fn a_listed_machine_with_no_records_is_unknown() {
         let peer = MachineId::random();
-        let out = render(&[], &settings(&[(peer, "peer")]));
+        let out = render(&[], &settings(&[(peer, "peer")]), None);
 
         assert!(out.contains("unknown"), "{out}");
     }
@@ -381,7 +416,7 @@ mod tests {
             session(mac, SessionState::Idle, false),
             terminal(mac, TerminalState::Unreachable),
         ];
-        let out = render(&records, &settings(&[(mac, "mac")]));
+        let out = render(&records, &settings(&[(mac, "mac")]), None);
 
         assert!(out.contains("offline"), "{out}");
     }
@@ -398,6 +433,7 @@ mod tests {
         let out = render(
             &[sample(mac, 1, 0.1, 1), working, gone],
             &settings(&[(mac, "mac")]),
+            None,
         );
 
         let line = out
@@ -428,7 +464,7 @@ mod tests {
             sample(second, 1, 0.1, 0),
             sample(low, 1, 0.1, 0),
         ];
-        let out = render(&records, &settings(&[(first, "first"), (second, "second")]));
+        let out = render(&records, &settings(&[(first, "first"), (second, "second")]), None);
         let at = |needle: &str| {
             out.find(needle)
                 .unwrap_or_else(|| panic!("{needle} in {out}"))

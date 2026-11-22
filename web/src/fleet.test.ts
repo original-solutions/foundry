@@ -42,6 +42,16 @@ describe("apply", () => {
     expect(state.records[0].deleted).toBe(true);
   });
 
+  it("takes the online set from a state message and keeps it across record and settings messages", () => {
+    let state = apply(emptyState, { type: "state", protocol: 1, records: [], settings: settings(), online: [ME] });
+    expect(state.online).toEqual([ME]);
+    state = apply(state, one(sample(OTHER, 1)));
+    state = apply(state, { type: "settings", protocol: 1, settings: settings({ seq: 2 }) });
+    expect(state.online).toEqual([ME]);
+    state = apply(state, full([]));
+    expect(state.online).toBeUndefined();
+  });
+
   it("replaces the settings on a settings message", () => {
     const next = settings({ seq: 2, projects: [] });
     const state = apply(emptyState, { type: "settings", protocol: 1, settings: next });
@@ -83,6 +93,37 @@ describe("fleet", () => {
     ];
     const state = Object.fromEntries(fleet(records, s).map((m) => [m.name, m.status]));
     expect(state).toEqual({ one: "offline", two: "online", three: "unknown" });
+  });
+
+  it("with the online set, is online when the set holds the machine and offline when not, before any terminal", () => {
+    const s = settings({
+      machines: [
+        { id: "m1", name: "one", address: "" },
+        { id: "m2", name: "two", address: "" },
+        { id: "m3", name: "three", address: "" },
+      ],
+    });
+    const records = [sample("m1", 1), sample("m2", 1), sample("m3", 1)];
+    const state = Object.fromEntries(fleet(records, s, {}, ["m1"]).map((m) => [m.name, m.status]));
+    expect(state).toEqual({ one: "online", two: "offline", three: "offline" });
+  });
+
+  it("with the online set, records do not decide: a running terminal of a machine it lacks is offline", () => {
+    const s = settings({
+      machines: [
+        { id: "m1", name: "one", address: "" },
+        { id: "m2", name: "two", address: "" },
+      ],
+    });
+    const records = [
+      workspace("m1", "w1", "a"),
+      terminal("m1", "t1", "w1", "running"),
+      workspace("m2", "w2", "b"),
+      terminal("m2", "t2", "w2", "unreachable"),
+      sample("m9", 1),
+    ];
+    const state = Object.fromEntries(fleet(records, s, {}, ["m2", "m9"]).map((m) => [m.name, m.status]));
+    expect(state).toEqual({ one: "offline", two: "online", m9: "online" });
   });
 
   it("stays offline when a reachable record of the machine comes after an unreachable one", () => {

@@ -718,6 +718,32 @@ async fn state_is_every_record_and_the_settings() {
 }
 
 #[tokio::test]
+async fn state_carries_the_machines_the_daemon_hears_this_one_included() {
+    let daemon = Daemon::new(TURN).await;
+
+    let reply = daemon.call("GET", "/api/state", None).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    match serde_json::from_str::<UiMessage>(&reply.body).unwrap() {
+        UiMessage::State { online, .. } => {
+            let online = online.expect("the state carries the online set");
+            assert!(online.contains(&daemon.me), "{online:?}");
+        }
+        other => panic!("not the state: {other:?}"),
+    }
+
+    let (mut socket, _) = tokio_tungstenite::connect_async(daemon.ws_url("/api/events"))
+        .await
+        .unwrap();
+    match next_message(&mut socket).await {
+        UiMessage::State { online, .. } => {
+            let online = online.expect("the events socket's state carries the online set");
+            assert!(online.contains(&daemon.me), "{online:?}");
+        }
+        other => panic!("the first message is not the state: {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn events_show_a_workspace_appear_and_its_session_change_state() {
     let daemon = Daemon::new(TURN).await;
     let project = daemon.project();

@@ -241,6 +241,13 @@ mod tests {
                 protocol: PROTOCOL,
                 records: records(),
                 settings: settings(),
+                online: Some(vec![MachineId::random(), MachineId::random()]),
+            },
+            UiMessage::State {
+                protocol: PROTOCOL,
+                records: records(),
+                settings: settings(),
+                online: None,
             },
             UiMessage::Record {
                 protocol: PROTOCOL,
@@ -265,6 +272,40 @@ mod tests {
         for message in ui_messages() {
             assert_round_trip(&message);
         }
+    }
+
+    #[test]
+    fn a_state_carries_the_online_set_and_parses_without_one() {
+        let me = MachineId::random();
+        let state = UiMessage::State {
+            protocol: PROTOCOL,
+            records: vec![],
+            settings: SharedSettings::default(),
+            online: Some(vec![me]),
+        };
+        let json = serde_json::to_value(&state).unwrap();
+        assert_eq!(json["online"], serde_json::json!([me]), "{json}");
+
+        let mut without = json.clone();
+        without.as_object_mut().unwrap().remove("online");
+        assert_eq!(
+            serde_json::from_value::<UiMessage>(without).unwrap(),
+            UiMessage::State {
+                protocol: PROTOCOL,
+                records: vec![],
+                settings: SharedSettings::default(),
+                online: None,
+            }
+        );
+
+        let none = UiMessage::State {
+            protocol: PROTOCOL,
+            records: vec![],
+            settings: SharedSettings::default(),
+            online: None,
+        };
+        let json = serde_json::to_value(&none).unwrap();
+        assert!(json.get("online").is_none(), "{json}");
     }
 
     #[test]
@@ -418,6 +459,7 @@ mod tests {
                     protocol: 1,
                     records: vec![record.clone()],
                     settings: SharedSettings::default(),
+                    online: None,
                 },
             ),
             (
