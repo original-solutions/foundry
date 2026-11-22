@@ -127,7 +127,7 @@ Units, each with one job:
 | working | The agent is running a turn | A prompt was submitted or a tool is running |
 | waiting for you | The agent needs a permission answer or other input | The notification hook |
 | idle | The turn ended and the agent waits for the next prompt | The stop hook |
-| finished | The session ended normally | The session-end hook, or exit code 0 |
+| finished | The session ended normally | The session-end hook, unless its reason is `clear` or `resume` (`/clear` and `/resume` keep the session running), or exit code 0 |
 | failed | The process died or exited non-zero | The holder |
 | stuck | Working, with no terminal output and no hook event for 10 minutes | A timer in `sessions` |
 | unreachable | The owning machine is offline | `sync` |
@@ -204,7 +204,7 @@ A fleet with no workspaces opens on one question, what Claude should work on, an
 
 ### Briefs
 
-A session is named by what it was asked. The daemon keeps, in memory and for its own sessions only, each session's first prompt since it started or was cleared (slash commands left out) and the newest step of its turn: the prompt, the tool about to run with what it acts on, or the question a notification asks. `GET /api/briefs` returns them by session id. Nothing is written to a record, so briefs do not sync and a peer's sessions show their model alone. Each text is one line of at most 120 characters, with the gateway key, every session token, token-shaped words and URL passwords hidden. The UI shows the first prompt beside the model wherever a session is listed, and the newest step under it while the session works, waits or is stuck. When a turn ends the brief also keeps what Claude said, from the stop hook's last message, until the next prompt: its lines kept, blank runs cut to one, at most 600 characters, hidden the same way.
+A session is named by what it was asked. The daemon keeps, in memory and for its own sessions only, each session's first prompt since it started, was cleared or resumed another conversation with `/resume` (slash commands left out) and the newest step of its turn: the prompt, the tool about to run with what it acts on, or the question a notification asks. `GET /api/briefs` returns them by session id. Nothing is written to a record, so briefs do not sync and a peer's sessions show their model alone. Each text is one line of at most 120 characters, with the gateway key, every session token, token-shaped words and URL passwords hidden. The UI shows the first prompt beside the model wherever a session is listed, and the newest step under it while the session works, waits or is stuck. When a turn ends the brief also keeps what Claude said, from the stop hook's last message, until the next prompt: its lines kept, blank runs cut to one, at most 600 characters, hidden the same way.
 
 ### Steps
 

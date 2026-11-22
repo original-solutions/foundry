@@ -33,12 +33,13 @@ impl Hook {
     }
 
     /// The hook a posted payload is, or `None` when it names none. `SessionEnd` with reason
-    /// `clear` is [`Hook::Other`]: Claude Code sends it, then `SessionStart` with source
-    /// `clear`, and keeps running.
+    /// `clear` or `resume` is [`Hook::Other`]: on `/clear` and `/resume` Claude Code sends it,
+    /// then `SessionStart` with the same word as its source, and keeps running.
     pub fn from_payload(payload: &serde_json::Value) -> Option<Self> {
         let hook = Self::from_name(payload.get("hook_event_name")?.as_str()?);
-        let cleared = payload.get("reason").and_then(|r| r.as_str()) == Some("clear");
-        Some(if hook == Self::SessionEnd && cleared {
+        let reason = payload.get("reason").and_then(|r| r.as_str());
+        let continues = matches!(reason, Some("clear" | "resume"));
+        Some(if hook == Self::SessionEnd && continues {
             Self::Other
         } else {
             hook
@@ -169,7 +170,7 @@ mod tests {
     }
 
     #[test]
-    fn a_session_end_that_is_a_clear_is_not_an_end() {
+    fn a_session_end_that_continues_is_not_an_end() {
         let payload = |reason: Option<&str>| {
             let mut v = serde_json::json!({"hook_event_name": "SessionEnd"});
             if let Some(reason) = reason {
@@ -178,6 +179,7 @@ mod tests {
             Hook::from_payload(&v)
         };
         assert_eq!(payload(Some("clear")), Some(Hook::Other));
+        assert_eq!(payload(Some("resume")), Some(Hook::Other));
         for reason in [
             None,
             Some("logout"),
@@ -188,6 +190,8 @@ mod tests {
         }
         let named = |name: &str| Hook::from_payload(&serde_json::json!({"hook_event_name": name}));
         assert_eq!(named("Stop"), Some(Hook::Stop));
+        let stop_resume = serde_json::json!({"hook_event_name": "Stop", "reason": "resume"});
+        assert_eq!(Hook::from_payload(&stop_resume), Some(Hook::Stop));
         assert_eq!(named("Whatever"), Some(Hook::Other));
         assert_eq!(Hook::from_payload(&serde_json::json!({"a": 1})), None);
         assert_eq!(
