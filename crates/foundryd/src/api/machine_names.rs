@@ -436,6 +436,7 @@ mod tests {
         fn listing_marked(&self, settle: Duration, away: Arc<AtomicBool>) -> Listing {
             Listing::new(
                 self.me,
+                KEY.to_owned(),
                 self.coordinator.clone(),
                 self.store.clone(),
                 settle,
@@ -524,6 +525,17 @@ mod tests {
         }
     }
 
+    /// This machine's public key in these tests, as hex.
+    const KEY: &str = "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c";
+
+    /// This machine's own entry, as its listing writes it: with [`KEY`].
+    fn own(id: MachineId, name: &str, address: &str) -> Machine {
+        Machine {
+            key: KEY.to_owned(),
+            ..machine(id, name, address)
+        }
+    }
+
     fn here(name: &str, address: &str) -> Result<Entry, String> {
         Ok(Entry {
             name: name.into(),
@@ -585,7 +597,7 @@ mod tests {
 
         assert_eq!(
             served.settings().machines,
-            [machine(served.me, "personal-mac", "100.91.54.18")]
+            [own(served.me, "personal-mac", "100.91.54.18")]
         );
         assert_eq!(served.settings().seq, seq, "the second look sent nothing");
     }
@@ -607,15 +619,13 @@ mod tests {
         let machines = served.settings().machines;
         assert_eq!(machines.len(), 2, "{machines:?}");
         assert!(machines.contains(&other));
-        assert!(machines.contains(&machine(served.me, "personal-mac", "100.91.54.18")));
+        assert!(machines.contains(&own(served.me, "personal-mac", "100.91.54.18")));
     }
 
     #[tokio::test]
     async fn a_listed_machine_whose_address_changed_keeps_its_name() {
         let served = Served::new(|me, settings| {
-            settings
-                .machines
-                .push(machine(me, "Tom's desk", "100.64.0.9"));
+            settings.machines.push(own(me, "Tom's desk", "100.64.0.9"));
         })
         .await;
 
@@ -626,7 +636,7 @@ mod tests {
 
         assert_eq!(
             served.settings().machines,
-            [machine(served.me, "Tom's desk", "100.91.54.18")]
+            [own(served.me, "Tom's desk", "100.91.54.18")]
         );
     }
 
@@ -635,7 +645,7 @@ mod tests {
         let served = Served::new(|me, settings| {
             settings
                 .machines
-                .push(machine(me, "Tom's desk", "100.91.54.18"));
+                .push(own(me, "Tom's desk", "100.91.54.18"));
         })
         .await;
         let seq = served.settings().seq;
@@ -648,7 +658,48 @@ mod tests {
         assert_eq!(served.settings().seq, seq);
         assert_eq!(
             served.settings().machines,
-            [machine(served.me, "Tom's desk", "100.91.54.18")]
+            [own(served.me, "Tom's desk", "100.91.54.18")]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_listed_machine_with_no_key_sends_its_own_and_keeps_its_name_and_address() {
+        let served = Served::new(|me, settings| {
+            settings
+                .machines
+                .push(machine(me, "Tom's desk", "100.91.54.18"));
+        })
+        .await;
+
+        served
+            .listing()
+            .list(here("personal-mac", "100.91.54.18"))
+            .await;
+
+        assert_eq!(
+            served.settings().machines,
+            [own(served.me, "Tom's desk", "100.91.54.18")]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_listed_machine_held_with_another_key_sends_its_own_and_keeps_its_name() {
+        let served = Served::new(|me, settings| {
+            settings.machines.push(Machine {
+                key: "ab".repeat(32),
+                ..machine(me, "Tom's desk", "100.64.0.9")
+            });
+        })
+        .await;
+
+        served
+            .listing()
+            .list(here("personal-mac", "100.91.54.18"))
+            .await;
+
+        assert_eq!(
+            served.settings().machines,
+            [own(served.me, "Tom's desk", "100.91.54.18")]
         );
     }
 
@@ -704,16 +755,14 @@ mod tests {
         listing.list(here("personal-mac", "100.91.54.18")).await;
         assert_eq!(
             served.settings().machines,
-            [machine(served.me, "personal-mac", "100.91.54.18")]
+            [own(served.me, "personal-mac", "100.91.54.18")]
         );
     }
 
     #[tokio::test]
     async fn an_address_that_moves_between_two_close_looks_waits_the_settle_time() {
         let served = Served::new(|me, settings| {
-            settings
-                .machines
-                .push(machine(me, "Tom's desk", "100.64.0.9"));
+            settings.machines.push(own(me, "Tom's desk", "100.64.0.9"));
         })
         .await;
         let mut listing = served.listing_after(SETTLE);
@@ -742,16 +791,14 @@ mod tests {
         listing.list(here("personal-mac", "100.91.54.18")).await;
         assert_eq!(
             served.settings().machines,
-            [machine(served.me, "Tom's desk", "100.91.54.18")]
+            [own(served.me, "Tom's desk", "100.91.54.18")]
         );
     }
 
     #[tokio::test]
     async fn a_look_that_finds_nothing_to_send_starts_the_wait_over() {
         let served = Served::new(|me, settings| {
-            settings
-                .machines
-                .push(machine(me, "Tom's desk", "100.64.0.9"));
+            settings.machines.push(own(me, "Tom's desk", "100.64.0.9"));
         })
         .await;
         let seq = served.settings().seq;
@@ -773,9 +820,7 @@ mod tests {
     #[tokio::test]
     async fn a_wait_found_before_tailscale_went_away_starts_over_when_it_answers_again() {
         let served = Served::new(|me, settings| {
-            settings
-                .machines
-                .push(machine(me, "Tom's desk", "100.64.0.9"));
+            settings.machines.push(own(me, "Tom's desk", "100.64.0.9"));
         })
         .await;
         let seq = served.settings().seq;
@@ -805,7 +850,7 @@ mod tests {
         listing.list(here("personal-mac", "100.91.54.18")).await;
         assert_eq!(
             served.settings().machines,
-            [machine(served.me, "Tom's desk", "100.91.54.18")]
+            [own(served.me, "Tom's desk", "100.91.54.18")]
         );
     }
 
@@ -972,7 +1017,7 @@ mod tests {
         listing.list(here("personal-mac", "100.91.54.18")).await;
         assert_eq!(
             served.settings().machines,
-            [machine(served.me, "personal-mac", "100.91.54.18")]
+            [own(served.me, "personal-mac", "100.91.54.18")]
         );
         listing.list(Err("logged out".to_owned())).await;
 
@@ -1005,7 +1050,7 @@ mod tests {
         let served = Served::new(|me, settings| {
             settings
                 .machines
-                .push(machine(me, "personal-mac", "100.91.54.18"));
+                .push(own(me, "personal-mac", "100.91.54.18"));
         })
         .await;
 
@@ -1014,7 +1059,7 @@ mod tests {
         assert_eq!(status, 204, "{body}");
         assert_eq!(
             served.settings().machines,
-            [machine(served.me, "Tom's desk", "100.91.54.18")]
+            [own(served.me, "Tom's desk", "100.91.54.18")]
         );
     }
 
@@ -1042,7 +1087,7 @@ mod tests {
         let served = Served::new(|me, settings| {
             settings
                 .machines
-                .push(machine(me, "personal-mac", "100.91.54.18"));
+                .push(own(me, "personal-mac", "100.91.54.18"));
         })
         .await;
 
@@ -1057,7 +1102,7 @@ mod tests {
         let served = Served::new(|me, settings| {
             settings
                 .machines
-                .push(machine(me, "personal-mac", "100.91.54.18"));
+                .push(own(me, "personal-mac", "100.91.54.18"));
         })
         .await;
         let (status, body) = served.rename(served.me, &"é".repeat(60)).await;
@@ -1071,7 +1116,7 @@ mod tests {
         let served = Served::new(|me, settings| {
             settings
                 .machines
-                .push(machine(me, "personal-mac", "100.91.54.18"));
+                .push(own(me, "personal-mac", "100.91.54.18"));
         })
         .await;
         let seq = served.settings().seq;
@@ -1099,7 +1144,7 @@ mod tests {
         let served = Served::new(move |me, settings| {
             settings
                 .machines
-                .push(machine(me, "personal-mac", "100.91.54.18"));
+                .push(own(me, "personal-mac", "100.91.54.18"));
             settings
                 .machines
                 .push(machine(other, " Trilogy-Mac ", "100.64.0.2"));
@@ -1119,7 +1164,7 @@ mod tests {
         let served = Served::new(|me, settings| {
             settings
                 .machines
-                .push(machine(me, "personal-mac", "100.91.54.18"));
+                .push(own(me, "personal-mac", "100.91.54.18"));
         })
         .await;
         let seq = served.settings().seq;
@@ -1137,7 +1182,7 @@ mod tests {
         let served = Served::new(move |me, settings| {
             settings
                 .machines
-                .push(machine(me, "personal-mac", "100.91.54.18"));
+                .push(own(me, "personal-mac", "100.91.54.18"));
             settings
                 .machines
                 .push(machine(peer, "trilogy-mac", "100.64.0.2"));
