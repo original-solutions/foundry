@@ -52,10 +52,10 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{Instant, timeout};
 
 use crate::api::machine_add::Lister;
-use crate::api::machine_names;
 use crate::secrets::{self, Secrets, SecretsError};
 use crate::store::{Store, StoreError};
 use crate::sync::{Conn, Dialer, OFFLINE_AFTER, Peers, on_store};
+use crate::tailscale;
 
 /// How long a join code works after it is shown.
 pub const CODE_VALID_FOR: Duration = Duration::from_secs(10 * 60);
@@ -138,12 +138,12 @@ pub fn join(address: &str, code: &str) -> ExitCode {
 }
 
 /// What this machine lists itself under, read from Tailscale as the daemon reads it.
-fn own_entry() -> Result<machine_names::Entry, String> {
+fn own_entry() -> Result<tailscale::Entry, String> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| format!("cannot ask Tailscale what this machine is called: {e}"))?
-        .block_on(crate::daemon::own_entry())
+        .block_on(tailscale::own_entry())
 }
 
 /// The data directory: `FOUNDRY_HOME`, else `~/.local/share/foundry`.
@@ -171,7 +171,7 @@ pub fn join_at(
     port: u16,
     code: &str,
     secrets: &dyn Secrets,
-    own: Option<&machine_names::Entry>,
+    own: Option<&tailscale::Entry>,
 ) -> Result<MachineId, JoinError> {
     let targets = join_targets(address, port)?;
     let identity = Identity::load_or_create(secrets)?;
@@ -1279,7 +1279,7 @@ struct JoinRequest {
 impl JoinRequest {
     /// The entry the machine lists itself under, as it sent it, or none when it sent no name
     /// or no address (a blank one counts as none). The rule is the one a machine's own entry
-    /// keeps ([`entry`](crate::api::machine_names::entry)): a name of any length with no
+    /// keeps ([`entry`](crate::tailscale::entry)): a name of any length with no
     /// control character, at a Tailscale or loopback IP. One that breaks it gives why.
     fn sent(&self) -> Result<Option<Machine>, String> {
         let sent = |field: &Option<String>| field.clone().filter(|f| !f.trim().is_empty());

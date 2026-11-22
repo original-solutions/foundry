@@ -122,7 +122,7 @@ async fn add(
 
 /// The address of `addresses`, which a name resolved to, that the machine is listed at when it
 /// does not say its own: the first IPv4 one, as a machine lists itself
-/// ([`entry`](super::machine_names::entry)), else the first. `addresses` is never empty.
+/// ([`entry`](crate::tailscale::entry)), else the first. `addresses` is never empty.
 fn listed_address(addresses: &[IpAddr]) -> IpAddr {
     addresses
         .iter()

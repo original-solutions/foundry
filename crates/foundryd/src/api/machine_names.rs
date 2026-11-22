@@ -2,7 +2,7 @@
 //! short name, and anyone can rename a listed machine from the UI. Both go through the acting
 //! coordinator, as every shared-settings change does.
 //!
-//! - [`Listing`] keeps this machine in the list. Fed what [`entry`] reads from
+//! - [`Listing`] keeps this machine in the list. Fed what [`entry`](crate::tailscale::entry) reads from
 //!   `tailscale status --self --json`, it adds the machine with its public key when the list
 //!   does not hold it, moves its address when that changed, puts its key back when the entry
 //!   holds none or another, and never touches a name it has seen set.
@@ -25,7 +25,6 @@
 //! have linked again. The default name is not checked as a rename is: a default another machine already
 //! has, or one over [`NAME_AT_MOST`] characters, is listed as it is, and a rename sets it right.
 
-use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -43,6 +42,7 @@ use tokio::time::Instant;
 use super::{ApiError, Body, edit_status, on_store, parse_id, unprocessable};
 use crate::coordinator::{Coordinator, CoordinatorError};
 use crate::store::Store;
+use crate::tailscale::Entry;
 
 /// The most characters a machine's name holds.
 pub const NAME_AT_MOST: usize = 60;
@@ -51,55 +51,6 @@ pub const NAME_AT_MOST: usize = 60;
 /// still holds none. A machine from before keys were listed drops the key from an edit it
 /// numbers, so while one acts, a key sent at once each look would go round forever.
 pub const KEY_AGAIN_AFTER: Duration = Duration::from_secs(10 * 60);
-
-/// What Tailscale says this machine is called and where it is.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Entry {
-    /// Its default name: the first label of its MagicDNS name.
-    pub name: String,
-    /// Its Tailscale IPv4 address.
-    pub address: String,
-}
-
-/// Reads `tailscale status --self --json`: the first label of `Self.DNSName` as the name
-/// (`personal-mac.tail459612.ts.net.` gives `personal-mac`), else `host`, and the first IPv4
-/// in `Self.TailscaleIPs` as the address.
-/// `Self.HostName` is a display name with spaces, so it is not used.
-pub fn entry(status: &[u8], host: Option<&str>) -> Result<Entry, String> {
-    #[derive(Deserialize)]
-    struct Status {
-        #[serde(rename = "Self")]
-        me: Node,
-    }
-    #[derive(Deserialize)]
-    struct Node {
-        #[serde(rename = "DNSName", default)]
-        dns_name: String,
-        #[serde(rename = "TailscaleIPs", default)]
-        ips: Vec<String>,
-    }
-    let status: Status = serde_json::from_slice(status).map_err(|e| {
-        format!("`tailscale status --self --json` did not say what this machine is: {e}")
-    })?;
-    let name = status
-        .me
-        .dns_name
-        .split('.')
-        .next()
-        .filter(|label| !label.is_empty())
-        .or(host.filter(|host| !host.is_empty()))
-        .ok_or("Tailscale gives this machine no DNS name and it has no host name")?;
-    let address = status
-        .me
-        .ips
-        .iter()
-        .find(|ip| ip.parse::<Ipv4Addr>().is_ok())
-        .ok_or("Tailscale reports no IPv4 address for this machine")?;
-    Ok(Entry {
-        name: name.to_owned(),
-        address: address.clone(),
-    })
-}
 
 /// Keeps this machine in the shared machine list, at the address Tailscale gives it.
 pub struct Listing {
