@@ -562,6 +562,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(curl_token(&bare), None);
+        let empty = dir.path().join("empty.curl");
+        std::fs::write(&empty, "header = \"Authorization: Bearer \"\n").unwrap();
+        assert_eq!(curl_token(&empty), None, "an empty bearer value");
         assert_eq!(curl_token(&dir.path().join("missing.curl")), None);
     }
 

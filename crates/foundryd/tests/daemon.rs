@@ -30,6 +30,7 @@ use foundry_proto::settings::{Machine, Project, SharedSettings};
 use foundry_proto::state::{SessionState, TerminalState};
 use foundryd::join::{KeyedDialer, Keys};
 use foundryd::secrets::{FileSecrets, Secrets};
+use foundryd::sessions::claude;
 use foundryd::store::Store;
 use foundryd::sync::ws::WsDialer;
 use foundryd::sync::{Conn, Dialer as _};
@@ -1199,6 +1200,31 @@ fn wait_for_no_sessions_after(fixture: &Fixture, version: u64) {
     });
 }
 
+/// The status a `UserPromptSubmit` hook for `session` gets with the bearer `token`.
+fn hook_status(fixture: &Fixture, session: &str, token: &str) -> u16 {
+    let url = format!("http://127.0.0.1:{}/hooks/{session}", fixture.port);
+    Fixture::agent()
+        .post(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .send_json(serde_json::json!({"hook_event_name": "UserPromptSubmit"}))
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+/// Closes `terminal`, then waits for `session` to end and for a newer sample to count no
+/// session.
+fn close_and_wait_for_the_end(fixture: &Fixture, session: &str, terminal: TerminalId) {
+    let (status, body) = fixture.call("POST", &format!("/api/terminals/{terminal}/close"), None);
+    assert_eq!(status, 204, "{body}");
+    let ended = wait_for_session(
+        fixture,
+        session,
+        &[SessionState::Finished, SessionState::Failed],
+    );
+    wait_for_no_sessions_after(fixture, ended.version);
+}
+
 #[test]
 fn a_session_keeps_reporting_after_the_daemon_restarts() {
     let mut fixture = Fixture::new();
@@ -1213,13 +1239,7 @@ fn a_session_keeps_reporting_after_the_daemon_restarts() {
         .path()
         .join("sessions")
         .join(format!("{session}.curl"));
-    let config = fs::read_to_string(&curl).unwrap();
-    let token = config
-        .lines()
-        .find_map(|line| line.strip_prefix("header = \"Authorization: Bearer "))
-        .and_then(|rest| rest.strip_suffix('"'))
-        .unwrap()
-        .to_owned();
+    let token = claude::curl_token(&curl).unwrap();
 
     let port = fixture.port;
     assert_eq!(fixture.stop(), Some(0));
@@ -1229,26 +1249,10 @@ fn a_session_keeps_reporting_after_the_daemon_restarts() {
     let idle = wait_for_session(&fixture, &session, &[SessionState::Idle]);
     assert_eq!(idle.body.terminal, working.body.terminal);
 
-    let url = format!("http://127.0.0.1:{}/hooks/{session}", fixture.port);
-    let refused = Fixture::agent()
-        .post(&url)
-        .header("Authorization", "Bearer 0123456789abcdef0123456789abcdef")
-        .send_json(serde_json::json!({"hook_event_name": "UserPromptSubmit"}))
-        .unwrap();
-    assert_eq!(refused.status().as_u16(), 403, "a wrong token");
+    let wrong = "0123456789abcdef0123456789abcdef";
+    assert_eq!(hook_status(&fixture, &session, wrong), 403, "a wrong token");
 
-    let (status, body) = fixture.call(
-        "POST",
-        &format!("/api/terminals/{}/close", idle.body.terminal),
-        None,
-    );
-    assert_eq!(status, 204, "{body}");
-    let ended = wait_for_session(
-        &fixture,
-        &session,
-        &[SessionState::Finished, SessionState::Failed],
-    );
-    wait_for_no_sessions_after(&fixture, ended.version);
+    close_and_wait_for_the_end(&fixture, &session, idle.body.terminal);
     assert!(!fixture.log().contains(&token), "the token reached the log");
 }
 
@@ -1266,16 +1270,69 @@ fn a_session_whose_agent_ended_while_the_daemon_was_down_is_ended_at_start() {
     std::thread::sleep(Duration::from_secs(5));
     fixture.start();
 
-    let ended = wait_for_session(
-        &fixture,
-        &session,
-        &[SessionState::Finished, SessionState::Failed],
-    );
+    // Taken up before the daemon listens, so the first answer already shows the end, and the
+    // state is the one the terminal's exit code gives.
+    let records = fixture.state().unwrap();
+    let ended = records
+        .iter()
+        .find_map(|record| match record {
+            AnyRecord::Session(r) if r.body.id.to_string() == session => Some(r.clone()),
+            _ => None,
+        })
+        .unwrap();
+    let code = records
+        .iter()
+        .find_map(|record| match record {
+            AnyRecord::Terminal(r) if r.body.id == ended.body.terminal => Some(r.body.exit_code),
+            _ => None,
+        })
+        .unwrap_or(None);
+    let wanted = if code == Some(0) {
+        SessionState::Finished
+    } else {
+        SessionState::Failed
+    };
+    assert_eq!(ended.body.state, wanted, "exit code {code:?}");
     wait_for_no_sessions_after(&fixture, ended.version);
     let dir = fixture.home.path().join("sessions");
     for file in [format!("{session}.json"), format!("{session}.curl")] {
         assert!(!dir.join(&file).exists(), "{file} is still there");
     }
+}
+
+#[test]
+fn a_session_whose_curl_config_lost_its_token_is_still_followed_to_its_end() {
+    let mut fixture = Fixture::new();
+    fake_claude(
+        &mut fixture,
+        "- hook: {event: SessionStart}\n- hook: {event: UserPromptSubmit, prompt: \"tidy up\"}\n- sleep_ms: 600000\n",
+    );
+    let session = started_session(&mut fixture);
+    let working = wait_for_session(&fixture, &session, &[SessionState::Working]);
+    let curl = fixture
+        .home
+        .path()
+        .join("sessions")
+        .join(format!("{session}.curl"));
+    let token = claude::curl_token(&curl).unwrap();
+
+    assert_eq!(fixture.stop(), Some(0));
+    fs::write(&curl, "header = \"Content-Type: application/json\"\n").unwrap();
+    fixture.start();
+
+    assert_eq!(
+        hook_status(&fixture, &session, &token),
+        403,
+        "the old token"
+    );
+    let log = fixture.log();
+    assert!(
+        log.lines()
+            .any(|line| line.contains("WARN") && line.contains(&session)),
+        "no warning names the session; {log}"
+    );
+    assert!(!log.contains(&token), "the token reached the log");
+    close_and_wait_for_the_end(&fixture, &session, working.body.terminal);
 }
 
 #[test]
