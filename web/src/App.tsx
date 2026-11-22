@@ -114,7 +114,7 @@ function Layout() {
   const briefs = useBriefs(state.records);
   const { data: here } = useQuery(machineQuery);
   const traced = useMemo(() => new Set(Object.keys(briefs)), [briefs]);
-  const machines = useMemo(() => fleet(state.records, state.settings, briefs), [state.records, state.settings, briefs]);
+  const machines = useMemo(() => fleet(state.records, state.settings, briefs, state.online), [state.records, state.settings, briefs, state.online]);
   const [drawer, setDrawer] = useState(false);
   /** Whether the sidebar is collapsed to the rail on a wide screen. */
   const [rail, setRail] = useState(() => loadRail(window.innerWidth));

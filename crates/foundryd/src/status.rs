@@ -25,14 +25,12 @@ pub fn status() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match fetch(port) {
-        Ok(UiMessage::State {
-            records, settings, ..
-        }) => {
-            print!("{}", render(&records, &settings));
+    match fetch(port).map(state_text) {
+        Ok(Some(text)) => {
+            print!("{text}");
             ExitCode::SUCCESS
         }
-        Ok(_) => {
+        Ok(None) => {
             eprintln!("foundryd status: the daemon on 127.0.0.1:{port} did not send its state");
             ExitCode::FAILURE
         }
@@ -40,6 +38,20 @@ pub fn status() -> ExitCode {
             eprintln!("foundryd status: {error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// What `foundryd status` prints for the message the daemon sent: its state rendered with the
+/// online set it carried, or `None` when the message is not the state.
+fn state_text(message: UiMessage) -> Option<String> {
+    match message {
+        UiMessage::State {
+            records,
+            settings,
+            online,
+            ..
+        } => Some(render(&records, &settings, online.as_deref())),
+        _ => None,
     }
 }
 
@@ -85,10 +97,16 @@ struct MachineSummary<'a> {
 }
 
 /// Every machine and its sessions as plain text: machines in the settings' order, then any
-/// other machine that has a sample, by id. `/api/state` carries no online set, so a machine's
-/// state is shown only where its records prove it: `offline` when one is marked unreachable,
+/// other machine that has a sample, by id. With `online`, the machines the daemon hears, a
+/// machine is `online` when the set holds it and `offline` when it does not, whatever its
+/// records say. Without it, from a daemon whose state carries no online set, a machine's state
+/// is shown only where its records prove it: `offline` when one is marked unreachable,
 /// `online` when one is not, `unknown` when it has none.
-pub fn render(records: &[AnyRecord], settings: &SharedSettings) -> String {
+pub fn render(
+    records: &[AnyRecord],
+    settings: &SharedSettings,
+    online: Option<&[MachineId]>,
+) -> String {
     let mut names: BTreeMap<MachineId, &str> = BTreeMap::new();
     let mut machines: Vec<MachineId> = Vec::with_capacity(settings.machines.len());
     for machine in &settings.machines {
@@ -147,18 +165,25 @@ pub fn render(records: &[AnyRecord], settings: &SharedSettings) -> String {
             }
         };
         let summary = by_machine.get(&id);
-        write_machine_lines(&mut out, name, summary);
+        let state = match (online, summary) {
+            (Some(online), _) if online.contains(&id) => "online",
+            (Some(_), _) => "offline",
+            (None, Some(s)) if s.has_unreachable => "offline",
+            (None, Some(s)) if s.has_reachable => "online",
+            (None, _) => "unknown",
+        };
+        write_machine_lines(&mut out, name, state, summary);
     }
     out
 }
 
 /// The machine's line, then a line for each of its sessions that is not deleted.
-fn write_machine_lines(out: &mut String, name: &str, summary: Option<&MachineSummary<'_>>) {
-    let state = match summary {
-        Some(s) if s.has_unreachable => "offline",
-        Some(s) if s.has_reachable => "online",
-        _ => "unknown",
-    };
+fn write_machine_lines(
+    out: &mut String,
+    name: &str,
+    state: &str,
+    summary: Option<&MachineSummary<'_>>,
+) {
     match summary.and_then(|s| s.newest_sample) {
         Some(sample) => {
             let body = &sample.body;
@@ -285,6 +310,7 @@ mod tests {
                 terminal(mac, TerminalState::Running),
             ],
             &settings(&[(mac, "trilogy-mac")]),
+            None,
         );
 
         assert!(out.starts_with("trilogy-mac"), "{out}");
@@ -298,7 +324,7 @@ mod tests {
     #[test]
     fn a_machine_not_in_the_settings_shows_its_id() {
         let stranger = MachineId::random();
-        let out = render(&[sample(stranger, 1, 0.1, 0)], &settings(&[]));
+        let out = render(&[sample(stranger, 1, 0.1, 0)], &settings(&[]), None);
 
         assert!(out.starts_with(&stranger.to_string()), "{out}");
     }
@@ -307,7 +333,7 @@ mod tests {
     fn the_newest_sample_is_the_one_shown() {
         let mac = MachineId::random();
         let records = [sample(mac, 9, 0.9, 7), sample(mac, 2, 0.1, 1)];
-        let out = render(&records, &settings(&[(mac, "mac")]));
+        let out = render(&records, &settings(&[(mac, "mac")]), None);
 
         assert!(out.contains("load 0.90/core"), "{out}");
         assert!(!out.contains("load 0.10/core"), "{out}");
@@ -316,7 +342,7 @@ mod tests {
     #[test]
     fn a_machine_with_no_sample_yet_says_so() {
         let mac = MachineId::random();
-        let out = render(&[], &settings(&[(mac, "mac")]));
+        let out = render(&[], &settings(&[(mac, "mac")]), None);
 
         assert!(out.contains("no sample yet"), "{out}");
     }
@@ -330,7 +356,7 @@ mod tests {
             sample(b, 1, 0.1, 0),
             terminal(b, TerminalState::Unreachable),
         ];
-        let out = render(&records, &settings(&[(a, "alpha"), (b, "beta")]));
+        let out = render(&records, &settings(&[(a, "alpha"), (b, "beta")]), None);
 
         for line in out
             .lines()
@@ -350,7 +376,7 @@ mod tests {
             session(mac, SessionState::Idle, false),
             terminal(mac, TerminalState::Running),
         ];
-        let out = render(&records, &settings(&[(mac, "mac")]));
+        let out = render(&records, &settings(&[(mac, "mac")]), None);
 
         assert!(out.contains("online"), "{out}");
         assert!(!out.contains("offline"), "{out}");
@@ -359,7 +385,11 @@ mod tests {
     #[test]
     fn a_listed_machine_with_only_a_sample_is_not_called_online() {
         let peer = MachineId::random();
-        let out = render(&[sample(peer, 1, 0.1, 0)], &settings(&[(peer, "peer")]));
+        let out = render(
+            &[sample(peer, 1, 0.1, 0)],
+            &settings(&[(peer, "peer")]),
+            None,
+        );
 
         assert!(out.contains("unknown"), "{out}");
         assert!(!out.contains("online"), "{out}");
@@ -367,9 +397,71 @@ mod tests {
     }
 
     #[test]
+    fn with_the_online_set_a_listed_machine_with_only_a_sample_is_online_or_offline() {
+        let peer = MachineId::random();
+        let records = [sample(peer, 1, 0.1, 0)];
+        let listed = settings(&[(peer, "peer")]);
+
+        let heard = render(&records, &listed, Some(&[peer]));
+        assert!(heard.contains("peer  online"), "{heard}");
+        assert!(!heard.contains("unknown"), "{heard}");
+
+        let silent = render(&records, &listed, Some(&[]));
+        assert!(silent.contains("peer  offline"), "{silent}");
+        assert!(!silent.contains("unknown"), "{silent}");
+    }
+
+    #[test]
+    fn with_the_online_set_records_do_not_decide_the_state() {
+        let (up, down, stranger, silent) = (
+            MachineId::random(),
+            MachineId::random(),
+            MachineId::random(),
+            MachineId::random(),
+        );
+        let records = [
+            terminal(up, TerminalState::Unreachable),
+            terminal(down, TerminalState::Running),
+            sample(stranger, 1, 0.1, 0),
+            sample(silent, 1, 0.1, 0),
+        ];
+        let out = render(
+            &records,
+            &settings(&[(up, "up"), (down, "down")]),
+            Some(&[up, stranger]),
+        );
+
+        assert!(out.contains("up  online"), "{out}");
+        assert!(out.contains("down  offline"), "{out}");
+        assert!(out.contains(&format!("{stranger}  online")), "{out}");
+        assert!(out.contains(&format!("{silent}  offline")), "{out}");
+    }
+
+    #[test]
+    fn the_state_the_daemon_sent_is_shown_by_its_online_set() {
+        let me = MachineId::random();
+        let state = |online| UiMessage::State {
+            protocol: foundry_proto::messages::PROTOCOL,
+            records: vec![sample(me, 1, 0.1, 0)],
+            settings: settings(&[(me, "mac")]),
+            online,
+        };
+
+        let heard = state_text(state(Some(vec![me]))).unwrap();
+        assert!(heard.contains("mac  online"), "{heard}");
+        let older = state_text(state(None)).unwrap();
+        assert!(older.contains("mac  unknown"), "{older}");
+        let record = UiMessage::Settings {
+            protocol: foundry_proto::messages::PROTOCOL,
+            settings: settings(&[]),
+        };
+        assert!(state_text(record).is_none());
+    }
+
+    #[test]
     fn a_listed_machine_with_no_records_is_unknown() {
         let peer = MachineId::random();
-        let out = render(&[], &settings(&[(peer, "peer")]));
+        let out = render(&[], &settings(&[(peer, "peer")]), None);
 
         assert!(out.contains("unknown"), "{out}");
     }
@@ -381,7 +473,7 @@ mod tests {
             session(mac, SessionState::Idle, false),
             terminal(mac, TerminalState::Unreachable),
         ];
-        let out = render(&records, &settings(&[(mac, "mac")]));
+        let out = render(&records, &settings(&[(mac, "mac")]), None);
 
         assert!(out.contains("offline"), "{out}");
     }
@@ -398,6 +490,7 @@ mod tests {
         let out = render(
             &[sample(mac, 1, 0.1, 1), working, gone],
             &settings(&[(mac, "mac")]),
+            None,
         );
 
         let line = out
@@ -428,7 +521,11 @@ mod tests {
             sample(second, 1, 0.1, 0),
             sample(low, 1, 0.1, 0),
         ];
-        let out = render(&records, &settings(&[(first, "first"), (second, "second")]));
+        let out = render(
+            &records,
+            &settings(&[(first, "first"), (second, "second")]),
+            None,
+        );
         let at = |needle: &str| {
             out.find(needle)
                 .unwrap_or_else(|| panic!("{needle} in {out}"))

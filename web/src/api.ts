@@ -63,7 +63,7 @@ export interface Project {
 }
 
 export type UiMessage =
-  | { type: "state"; protocol: number; records: AnyRecord[]; settings: SharedSettings }
+  | { type: "state"; protocol: number; records: AnyRecord[]; settings: SharedSettings; online?: string[] }
   | { type: "record"; protocol: number; record: AnyRecord }
   | { type: "settings"; protocol: number; settings: SharedSettings };
 

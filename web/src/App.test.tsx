@@ -665,6 +665,18 @@ describe("App", () => {
     expect(screen.getByRole("region", { name: "Machines" })).toBeDefined();
   });
 
+  it("shows each machine online or offline by the machines the daemon hears, before any terminal", async () => {
+    mockActions();
+    const fleet = settings({ machines: [{ id: ME, name: "studio", address: "127.0.0.1" }, { id: OTHER, name: "laptop", address: "100.64.0.2" }] });
+    await open("/machines", { type: "state", protocol: 1, records: [sample(ME, 1), sample(OTHER, 1)], settings: fleet, online: [ME] });
+
+    const here = await screen.findByRole("article", { name: "studio" });
+    const away = screen.getByRole("article", { name: "laptop" });
+    expect(within(here).getByText("online")).toBeDefined();
+    expect(within(away).getByText("offline")).toBeDefined();
+    expect(screen.queryByText("unknown")).toBeNull();
+  });
+
   it("starts a new shell from the palette and opens it", async () => {
     const calls = mockActions(json(201, { id: "t9" }));
     const router = await open("/", live);

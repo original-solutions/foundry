@@ -718,6 +718,32 @@ async fn state_is_every_record_and_the_settings() {
 }
 
 #[tokio::test]
+async fn state_carries_the_machines_the_daemon_hears_this_one_included() {
+    let daemon = Daemon::new(TURN).await;
+
+    let reply = daemon.call("GET", "/api/state", None).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    match serde_json::from_str::<UiMessage>(&reply.body).unwrap() {
+        UiMessage::State { online, .. } => {
+            let online = online.expect("the state carries the online set");
+            assert!(online.contains(&daemon.me), "{online:?}");
+        }
+        other => panic!("not the state: {other:?}"),
+    }
+
+    let (mut socket, _) = tokio_tungstenite::connect_async(daemon.ws_url("/api/events"))
+        .await
+        .unwrap();
+    match next_message(&mut socket).await {
+        UiMessage::State { online, .. } => {
+            let online = online.expect("the events socket's state carries the online set");
+            assert!(online.contains(&daemon.me), "{online:?}");
+        }
+        other => panic!("the first message is not the state: {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn events_show_a_workspace_appear_and_its_session_change_state() {
     let daemon = Daemon::new(TURN).await;
     let project = daemon.project();
@@ -1755,12 +1781,14 @@ async fn events_follow_a_peer_that_comes_online_writes_and_goes_offline() {
         .send(serde_json::to_string(&heartbeat).unwrap())
         .await
         .unwrap();
-    loop {
-        if matches!(next_message(&mut socket).await, UiMessage::State { .. }) {
-            break;
+    let online = loop {
+        if let UiMessage::State { online, .. } = next_message(&mut socket).await {
+            break online.expect("the state carries the online set");
         }
-    }
+    };
     assert!(daemon.peers.online().contains(&peer));
+    assert!(online.contains(&peer), "{online:?}");
+    assert!(online.contains(&daemon.me), "{online:?}");
 
     let session = peer_session(peer, 1, SessionState::Working);
     let records = PeerMessage::Records {
@@ -1781,16 +1809,21 @@ async fn events_follow_a_peer_that_comes_online_writes_and_goes_offline() {
         AnyRecord::Session(s) => s.body.id,
         _ => unreachable!(),
     };
-    let records = tokio::time::timeout(OFFLINE_AFTER + WAIT, async {
+    let (records, online) = tokio::time::timeout(OFFLINE_AFTER + WAIT, async {
         loop {
-            if let UiMessage::State { records, .. } = next_message(&mut socket).await {
-                return records;
+            if let UiMessage::State {
+                records, online, ..
+            } = next_message(&mut socket).await
+            {
+                return (records, online.expect("the state carries the online set"));
             }
         }
     })
     .await
     .expect("the state comes again once the peer is offline");
     assert!(!daemon.peers.online().contains(&peer));
+    assert!(!online.contains(&peer), "{online:?}");
+    assert!(online.contains(&daemon.me), "{online:?}");
     assert_eq!(
         session_states(&records, id),
         vec![SessionState::Unreachable]
