@@ -32,10 +32,12 @@ test("start a task, use its workspace's shell, and see the same screen after a r
   await workspace.hover();
   await workspace.getByRole("button", { name: "New shell" }).click();
   const shell = workspace.getByRole("link", { name: /^shell/ });
+  // The page is on the session's terminal, so a check of the URL's shape would pass before the
+  // move to the shell: wait for the URL to leave the session's.
+  const sessionUrl = page.url();
   await shell.click();
-  // The page is already on the session's terminal, so a check of the URL's shape would pass before
-  // the move to the shell. The sidebar marks the link of the terminal the URL names.
-  await expect(shell).toHaveAttribute("aria-current", "true");
+  await expect(page).not.toHaveURL(sessionUrl);
+  await expect(page).toHaveURL(/\/terminals\/[0-9a-f-]+$/);
   const url = page.url();
   // The session's terminal stays mounted, hidden, beside the shell's: read the shell's pane.
   const pane = page.getByTestId(`pane-${url.split("/").at(-1)}`);
