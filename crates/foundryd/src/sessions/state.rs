@@ -190,6 +190,8 @@ mod tests {
         }
         let named = |name: &str| Hook::from_payload(&serde_json::json!({"hook_event_name": name}));
         assert_eq!(named("Stop"), Some(Hook::Stop));
+        let stop_resume = serde_json::json!({"hook_event_name": "Stop", "reason": "resume"});
+        assert_eq!(Hook::from_payload(&stop_resume), Some(Hook::Stop));
         assert_eq!(named("Whatever"), Some(Hook::Other));
         assert_eq!(Hook::from_payload(&serde_json::json!({"a": 1})), None);
         assert_eq!(
