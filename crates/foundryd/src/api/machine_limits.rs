@@ -494,6 +494,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_blank_or_missing_field_is_refused_with_that_fields_own_message() {
+        let served = Served::new(|_, _| {}).await;
+        let seq = served.settings().seq;
+        let (sessions, load, disk) = (
+            "maximum sessions",
+            "maximum load per core",
+            "minimum free disk",
+        );
+        let cases = [
+            (wanted(json!(null), json!(1), json!(1)), sessions),
+            (
+                json!({ "max_load_per_core": 1, "min_free_disk_gb": 1 }),
+                sessions,
+            ),
+            (wanted(json!(2), json!(null), json!(1)), load),
+            (json!({ "max_sessions": 2, "min_free_disk_gb": 1 }), load),
+            (wanted(json!(2), json!(1), json!(null)), disk),
+            (json!({ "max_sessions": 2, "max_load_per_core": 1 }), disk),
+        ];
+        for (body, field) in &cases {
+            let (status, answer) = served.limit(served.me, body).await;
+            assert_eq!(status, 422, "{body}: {answer}");
+            let error = error_of(&answer);
+            assert!(
+                error.starts_with(&format!("the {field} is ")),
+                "{body}: {error}"
+            );
+        }
+        assert_eq!(served.settings().seq, seq);
+    }
+
+    #[tokio::test]
     async fn a_machine_the_list_does_not_hold_is_404_and_nothing_is_sent() {
         let served = Served::new(|_, _| {}).await;
         let seq = served.settings().seq;
