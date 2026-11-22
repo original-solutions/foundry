@@ -1864,6 +1864,115 @@ mod tests {
         );
     }
 
+    // ---- keys learned from the machine list ----
+
+    /// An entry in the machine list for `id`, carrying `key`.
+    fn listed(id: MachineId, key: &str) -> Machine {
+        Machine {
+            key: key.to_owned(),
+            ..machine(id)
+        }
+    }
+
+    /// The key `keys` holds for `machine`, if it holds one active.
+    fn held_key(keys: &Keys, machine: MachineId) -> Option<PublicKey> {
+        match keys.held().machines.get(&machine) {
+            Some(Entry::Active { key }) => Some(key.clone()),
+            _ => None,
+        }
+    }
+
+    /// Every warning logged while the returned guard is held, a line each.
+    fn capture_warnings() -> (Arc<Mutex<Vec<u8>>>, tracing::subscriber::DefaultGuard) {
+        #[derive(Clone)]
+        struct Into(Arc<Mutex<Vec<u8>>>);
+        impl io::Write for Into {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let logged = Arc::new(Mutex::new(Vec::new()));
+        let writer = Into(logged.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        (logged, tracing::subscriber::set_default(subscriber))
+    }
+
+    fn warnings(logged: &Mutex<Vec<u8>>) -> Vec<String> {
+        String::from_utf8_lossy(&logged.lock().unwrap())
+            .lines()
+            .filter(|line| line.contains("WARN"))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_key_in_the_machine_list_is_admitted_and_saved() {
+        let secrets = Arc::new(MemorySecrets::default());
+        let host = Keys::open(secrets.clone()).unwrap();
+        let peer = machine_keys();
+
+        host.learn(&[listed(peer.me(), peer.public_key().hex())])
+            .unwrap();
+
+        assert_eq!(held_key(&host, peer.me()), Some(peer.public_key()));
+        let reopened = Keys::open(secrets).unwrap();
+        assert_eq!(held_key(&reopened, peer.me()), Some(peer.public_key()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_listed_key_never_replaces_a_revocation_or_another_key_held() {
+        let host = machine_keys();
+        let (revoked, held, stranger) = (machine_keys(), machine_keys(), machine_keys());
+        admit(&host, &revoked);
+        host.revoke(revoked.me()).unwrap();
+        admit(&host, &held);
+
+        host.learn(&[
+            listed(revoked.me(), revoked.public_key().hex()),
+            listed(held.me(), stranger.public_key().hex()),
+        ])
+        .unwrap();
+
+        assert_eq!(host.state(revoked.me()), KeyState::Revoked);
+        assert_eq!(held_key(&host, held.me()), Some(held.public_key()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_listed_key_that_does_not_parse_is_skipped_with_one_warning_naming_the_machine() {
+        let (logged, _capture) = capture_warnings();
+        let host = machine_keys();
+        let (odd, older, peer) = (MachineId::random(), MachineId::random(), machine_keys());
+        // Hex, but 16 bytes: not an Ed25519 public key.
+        let bad = "c0ffee".repeat(5) + "c0";
+        let list = [
+            listed(odd, &bad),
+            listed(older, ""),
+            listed(peer.me(), peer.public_key().hex()),
+        ];
+
+        host.learn(&list).unwrap();
+        host.learn(&list).unwrap();
+
+        assert_eq!(host.state(odd), KeyState::NoKey);
+        assert_eq!(host.state(older), KeyState::NoKey);
+        assert_eq!(host.state(peer.me()), KeyState::Active);
+        let warned = warnings(&logged);
+        assert_eq!(warned.len(), 1, "{warned:?}");
+        assert!(warned[0].contains(&odd.to_string()), "{warned:?}");
+        assert!(
+            !warned[0].contains(&bad),
+            "the key reached the log: {warned:?}"
+        );
+    }
+
     fn machine(id: MachineId) -> Machine {
         Machine {
             id,
