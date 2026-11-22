@@ -803,6 +803,20 @@ describe("App", () => {
     await waitFor(() => expect(screen.queryByRole("alert", { name: "Task warning" })).toBeNull());
   });
 
+  it("replaces the kept warning with a later task's own", async () => {
+    const calls = mockActions(json(201, { id: "w9", error: noSetup }), json(201, { id: "s9" }), json(201, { id: "w10", warning: "this-mac is over its limits" }), json(201, { id: "s10" }));
+    const router = await open("/", live);
+
+    await startFromBox(router, calls, "board");
+    await act(() => router.navigate({ to: "/" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "New task" }), { target: { value: "Add sorting." } });
+    fireEvent.click(screen.getByRole("button", { name: "Start" }));
+    await waitFor(() => expect(calls).toHaveLength(4));
+
+    await waitFor(() => expect(screen.getByRole("alert", { name: "Task warning" }).textContent).toContain("this-mac is over its limits"));
+    expect(screen.getByRole("alert", { name: "Task warning" }).textContent).not.toContain("its setup could not be started");
+  });
+
   it("shows no first-run page before the daemon's state arrives", async () => {
     const fresh = createRouter({ routeTree, history: createMemoryHistory({ initialEntries: ["/"] }) });
     await fresh.load();
