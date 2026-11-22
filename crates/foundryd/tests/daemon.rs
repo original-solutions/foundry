@@ -1277,6 +1277,21 @@ fn a_daemon_lists_itself_under_its_tailscale_name_once_tailscale_answers_and_can
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0]["name"], "Tom's desk");
     assert_eq!(fixture.stop(), Some(0));
+
+    // Its entry carries its own public key, so every other machine admits it.
+    let keys = Keys::open(Arc::new(FileSecrets::new(
+        fixture.home.path().join("secrets.json"),
+    )))
+    .unwrap();
+    let store = Store::open(fixture.home.path().join("store.sqlite")).unwrap();
+    let own = store
+        .settings()
+        .unwrap()
+        .machines
+        .into_iter()
+        .find(|m| m.id.to_string() == me)
+        .unwrap();
+    assert_eq!(own.key, keys.public_key().hex());
 }
 
 #[test]

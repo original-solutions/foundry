@@ -1570,6 +1570,32 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_copy_from_a_machine_that_drops_keys_changes_nothing_held() {
+        let (_dir, coordinator) = alone();
+        let c = Machine {
+            id: id(9),
+            name: "c".into(),
+            address: "100.64.0.9".into(),
+            key: "ab".repeat(32),
+        };
+        let keyed = numbered(&base(), &Edit::SetMachine { machine: c }, id(A));
+        lock(&coordinator.store)
+            .apply_settings(keyed.clone())
+            .unwrap();
+        let mut stripped = keyed.clone();
+        for m in &mut stripped.machines {
+            m.key.clear();
+        }
+
+        coordinator
+            .take_settings(id(B), foundry_proto::messages::PROTOCOL, stripped)
+            .await
+            .unwrap();
+
+        assert_eq!(lock(&coordinator.store).settings().unwrap(), keyed);
+    }
+
     #[test]
     fn a_copy_without_a_key_from_another_edit_keeps_its_own_value() {
         let c = Machine {

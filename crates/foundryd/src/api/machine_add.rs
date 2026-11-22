@@ -529,7 +529,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_name_is_listed_as_typed_at_the_first_tailscale_address_it_resolves_to() {
+    async fn a_name_is_listed_as_typed_at_the_address_it_resolves_to() {
         let served = Served::new(|_, _| {}).await;
         let joining = Keys::open(Arc::new(MemorySecrets::default())).unwrap();
         let code = served.code_for("localhost").await;
@@ -538,8 +538,15 @@ mod tests {
 
         let listed = served.listed(joining.me()).await;
         assert_eq!(listed.name, "localhost");
-        let first = join::join_targets("localhost", join::DEFAULT_PORT).unwrap()[0].ip();
-        assert_eq!(listed.address.parse::<IpAddr>().unwrap(), first);
+        let resolved: Vec<IpAddr> = join::join_targets("localhost", join::DEFAULT_PORT)
+            .unwrap()
+            .iter()
+            .map(|target| target.ip())
+            .collect();
+        assert_eq!(
+            listed.address.parse::<IpAddr>().unwrap(),
+            listed_address(&resolved)
+        );
     }
 
     #[tokio::test]
@@ -606,7 +613,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_join_whose_sent_name_or_address_another_machine_has_is_listed_as_typed() {
+    async fn a_join_whose_sent_name_or_address_another_machine_has_is_503_naming_it() {
         for (name, address) in [(" BUILD-box ", "100.64.0.7"), ("studio", "100.64.0.9")] {
             let other = MachineId::random();
             let served = Served::new(move |_, settings| {
@@ -624,17 +631,14 @@ mod tests {
                 .join_as(&code, &joining, Some(name), Some(address))
                 .await;
 
-            assert_eq!(status, 200, "{name:?} at {address}: {body}");
-            assert_eq!(
-                served.held(joining.me()),
-                Some(keyed(&joining, "127.0.0.1", "127.0.0.1")),
-                "{name:?} at {address}"
-            );
+            assert_eq!(status, 503, "{name:?} at {address}: {body}");
+            assert!(error_of(&body).contains("build-box"), "{body}");
+            assert_eq!(served.held(joining.me()), None, "{name:?} at {address}");
         }
     }
 
     #[tokio::test]
-    async fn a_sent_name_or_address_outside_the_rules_is_listed_as_typed() {
+    async fn a_sent_name_or_address_outside_the_rules_is_503_and_lists_nothing() {
         let long = "n".repeat(crate::api::machine_names::NAME_AT_MOST + 1);
         for (name, address) in [
             (long.as_str(), "100.64.0.7"),
@@ -650,13 +654,19 @@ mod tests {
                 .join_as(&code, &joining, Some(name), Some(address))
                 .await;
 
-            assert_eq!(status, 200, "{name:?} at {address}: {body}");
-            assert_eq!(
-                served.held(joining.me()),
-                Some(keyed(&joining, "127.0.0.1", "127.0.0.1")),
-                "{name:?} at {address}"
-            );
+            assert_eq!(status, 503, "{name:?} at {address}: {body}");
+            assert!(!error_of(&body).chars().any(char::is_control), "{body}");
+            assert_eq!(served.held(joining.me()), None, "{name:?} at {address}");
         }
+    }
+
+    #[test]
+    fn a_name_is_listed_at_its_first_ipv4_address_as_a_machine_lists_itself() {
+        let v6: IpAddr = "fd7a:115c:a1e0::7".parse().unwrap();
+        let v4: IpAddr = "100.64.0.7".parse().unwrap();
+        assert_eq!(listed_address(&[v6, v4]), v4);
+        assert_eq!(listed_address(&[v4, v6]), v4);
+        assert_eq!(listed_address(&[v6]), v6);
     }
 
     #[tokio::test]
