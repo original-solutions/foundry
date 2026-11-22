@@ -16,7 +16,7 @@ compile_error!(
 compile_error!("run these tests in a debug build: a release build asks the real Tailscale");
 
 use std::fs;
-use std::net::TcpListener;
+use std::net::{IpAddr, Ipv4Addr, TcpListener};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
@@ -40,6 +40,9 @@ use tempfile::TempDir;
 use tokio_tungstenite::tungstenite::Message;
 
 const WAIT: Duration = Duration::from_secs(30);
+
+/// Where a code is redeemed from in these tests: one made with `new_code` works from anywhere.
+const HERE: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
 /// A pid file's marker: the shell the daemon starts runs `sleep` for this many seconds, so a
 /// stray one is found by it.
@@ -812,7 +815,7 @@ async fn the_daemon_dials_a_peer_through_the_key_handshake() {
         )))
         .unwrap();
         let code = mine.new_code().unwrap();
-        mine.redeem(&code.to_string(), peer_id, &peer.public_key())
+        mine.redeem(&code.to_string(), peer_id, &peer.public_key(), HERE)
             .unwrap();
     }
     fixture.seed(|settings| {
@@ -908,10 +911,10 @@ async fn keyed_peer_link(fixture: &mut Fixture) -> (Conn, MachineId, TempDir) {
         )))
         .unwrap();
         let code = mine.new_code().unwrap();
-        mine.redeem(&code.to_string(), peer_id, &peer.public_key())
+        mine.redeem(&code.to_string(), peer_id, &peer.public_key(), HERE)
             .unwrap();
         let code = peer.new_code().unwrap();
-        peer.redeem(&code.to_string(), mine.me(), &mine.public_key())
+        peer.redeem(&code.to_string(), mine.me(), &mine.public_key(), HERE)
             .unwrap();
         Machine {
             id: mine.me(),

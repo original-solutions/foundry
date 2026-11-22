@@ -2,16 +2,20 @@
 //!
 //! The name is trimmed. One that is blank or over [`NAME_AT_MOST`] characters is `422`, and so
 //! is one that resolves to no Tailscale address, by the rule `foundryd join` sends a code by
-//! ([`join_targets`]). A name a listed machine has, compared trimmed and in any case, is `409`.
-//! A machine the list does not hold yet has no address to put in the command, so it answers `503`.
-//! Otherwise it answers `201` `{code, command, expires_in_secs}`: a new join code,
+//! ([`join_targets`]). Loopback counts only on a machine listed at a loopback address, as a
+//! fleet run on one machine is. A name a listed machine has, compared trimmed and in any case,
+//! is `409`, and so is a name that resolves to a listed machine's address. A machine the list
+//! does not hold yet has no address to put in the command, so it answers `503`. Otherwise it
+//! answers `201` `{code, command, expires_in_secs}`: a new join code,
 //! `foundryd join <this machine's address> <code>` to run on the new machine, and how long the
 //! code works ([`CODE_VALID_FOR`]).
 //!
-//! The name and the first Tailscale address it resolved to are held in memory until the code is
-//! used or expires. When a machine uses the code on the join route, it is listed under that
-//! name at that address through the acting coordinator, as every machine list change is. An
-//! edit that fails is warned, and the join stands. A code made anywhere else lists nothing.
+//! The code works only from an address the name resolved to. The name and the first of those
+//! addresses are held in memory until the code is used or expires. When a machine uses the code
+//! on the join route, it is listed under that name at that address through the acting
+//! coordinator, as every machine list change is, unless the list by then holds that machine,
+//! that name or that address. An edit that fails or is skipped is warned, and the join stands.
+//! A code made anywhere else lists nothing.
 
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
@@ -92,7 +96,19 @@ async fn add(
             "this machine is not in its machine list yet; try again in a minute".to_owned(),
         ));
     };
-    let addresses = resolve(&name).await?;
+    let own_loopback = own
+        .address
+        .trim()
+        .parse::<IpAddr>()
+        .is_ok_and(|ip| ip.to_canonical().is_loopback());
+    let addresses: Vec<IpAddr> = resolve(&name)
+        .await?
+        .into_iter()
+        .filter(|ip| own_loopback || !ip.to_canonical().is_loopback())
+        .collect();
+    if addresses.is_empty() {
+        return Err(not_on_tailscale(&name));
+    }
     if let Some(other) = settings
         .machines
         .iter()
@@ -103,10 +119,10 @@ async fn add(
             format!("{name:?} is already in the fleet as {:?}", other.name),
         ));
     }
-    let address = addresses[0].to_string();
+    let address = addresses[0];
     let (code, used) = adding
         .keys
-        .new_watched_code()
+        .new_watched_code(addresses)
         .map_err(|e| ApiError::Rejected(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     tokio::spawn(list_when_used(
         adding.coordinator.clone(),
@@ -140,24 +156,29 @@ async fn resolve(name: &str) -> Result<Vec<IpAddr>, ApiError> {
         .map_err(|e| ApiError::Rejected(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     match resolved {
         Ok(targets) => Ok(targets.iter().map(|target| target.ip()).collect()),
-        Err(JoinError::NotTailscale(_)) => Err(unprocessable(format!(
-            "{name:?} is not on Tailscale: it resolves to no Tailscale address"
-        ))),
+        Err(JoinError::NotTailscale(_)) => Err(not_on_tailscale(name)),
         Err(_) => Err(unprocessable(format!(
             "no machine named {name:?} was found; type the name Tailscale shows for it"
         ))),
     }
 }
 
+fn not_on_tailscale(name: &str) -> ApiError {
+    unprocessable(format!(
+        "{name:?} is not on Tailscale: it resolves to no Tailscale address"
+    ))
+}
+
 /// Lists the machine that uses the code, told by `used`, as `name` at `address`, or nothing
-/// when the code expires unused or the machine is already in the machine list (this machine
-/// included), whose entry is never overwritten. The code is never logged.
+/// when the code expires unused, or the machine list already holds that machine (this machine
+/// included), whose entry is never overwritten, or another machine with that name or at that
+/// address, as after a second code for the same name. The code is never logged.
 async fn list_when_used(
     coordinator: Arc<Coordinator>,
     store: Arc<Mutex<Store>>,
     used: oneshot::Receiver<MachineId>,
     name: String,
-    address: String,
+    address: IpAddr,
 ) {
     // A redeem that starts just before the code expires can wait for the key lock.
     let wait = CODE_VALID_FOR + crate::secrets::LOCK_WAIT + Duration::from_secs(5);
@@ -180,7 +201,25 @@ async fn list_when_used(
         );
         return;
     }
-    let machine = Machine { id, name, address };
+    let wanted = name.to_lowercase();
+    if let Some(other) = held
+        .machines
+        .iter()
+        .find(|m| m.name.trim().to_lowercase() == wanted || has_address(&m.address, address))
+    {
+        tracing::warn!(
+            "machine {id} used a code to join as {name:?} at {address}, but {:?} at {} is already \
+             in the machine list, so it is not listed",
+            other.name,
+            other.address
+        );
+        return;
+    }
+    let machine = Machine {
+        id,
+        name,
+        address: address.to_string(),
+    };
     if let Err(error) = coordinator.edit(Edit::SetMachine { machine }).await {
         tracing::warn!("machine {id} joined, but it could not be listed: {error}");
     }
@@ -225,8 +264,8 @@ mod tests {
     }
 
     impl Served {
-        /// A machine listed as `personal-mac` that acts alone, holding the settings
-        /// `settings` makes from that.
+        /// A machine listed as `personal-mac` at [`OWN`] that acts alone, holding the
+        /// settings `settings` makes from that.
         async fn new(settings: impl FnOnce(MachineId, &mut SharedSettings)) -> Self {
             let data = tempfile::tempdir().unwrap();
             let keys = Keys::open(Arc::new(MemorySecrets::default())).unwrap();
@@ -234,8 +273,7 @@ mod tests {
             let mut store = Store::open(data.path().join("foundry.db")).unwrap();
             let mut held = store.settings().unwrap();
             held.seq += 1;
-            held.machines
-                .push(machine(me, "personal-mac", "100.91.54.18"));
+            held.machines.push(machine(me, "personal-mac", OWN));
             held.priority = vec![me];
             settings(me, &mut held);
             store.apply_settings(held).unwrap();
@@ -248,7 +286,12 @@ mod tests {
             let app =
                 join::router(keys.clone()).merge(router(keys.clone(), coordinator, store.clone()));
             let server = tokio::spawn(async move {
-                axum::serve(listener, app).await.unwrap();
+                axum::serve(
+                    listener,
+                    app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .await
+                .unwrap();
             });
             Self {
                 _data: data,
@@ -374,6 +417,10 @@ mod tests {
         }
     }
 
+    /// This machine's address in these tests: loopback, as a fleet run on one machine is, so a
+    /// loopback name can be added. A request to the routes comes from 127.0.0.1.
+    const OWN: &str = "127.0.0.2";
+
     fn machine(id: MachineId, name: &str, address: &str) -> Machine {
         Machine {
             id,
@@ -431,7 +478,7 @@ mod tests {
         assert_eq!(code.len(), 10, "{body}");
         assert_eq!(
             answer["command"],
-            format!("foundryd join 100.91.54.18 {code}"),
+            format!("foundryd join {OWN} {code}"),
             "{body}"
         );
         assert_eq!(answer["expires_in_secs"], CODE_VALID_FOR.as_secs());
@@ -605,6 +652,103 @@ mod tests {
             let (status, body) = served.add(name).await;
             assert_eq!(status, 422, "{name:?}: {body}");
             assert!(error_of(&body).contains(name), "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_loopback_name_is_422_on_a_machine_listed_at_a_tailscale_address() {
+        let served = Served::new(|me, settings| {
+            for listed in &mut settings.machines {
+                if listed.id == me {
+                    listed.address = "100.91.54.18".into();
+                }
+            }
+        })
+        .await;
+        let before = served.settings();
+
+        for name in ["localhost", "127.0.0.1"] {
+            let (status, body) = served.add(name).await;
+            assert_eq!(status, 422, "{name:?}: {body}");
+            assert!(error_of(&body).contains("not on Tailscale"), "{body}");
+        }
+        assert_eq!(served.settings(), before);
+    }
+
+    #[tokio::test]
+    async fn a_code_used_from_an_address_the_name_did_not_resolve_to_is_403_and_lists_nothing() {
+        let served = Served::new(|_, _| {}).await;
+        let joining = Keys::open(Arc::new(MemorySecrets::default())).unwrap();
+        // Made for the machine at 127.0.0.3; the join below comes from 127.0.0.1.
+        let code = served.code_for("127.0.0.3").await;
+        let before = served.settings();
+
+        let (status, body) = served.join(&code, &joining).await;
+
+        assert_eq!(status, 403, "{body}");
+        assert!(body.contains("made for another machine"), "{body}");
+        assert_eq!(served.keys.state(joining.me()), join::KeyState::NoKey);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(served.settings(), before);
+    }
+
+    #[tokio::test]
+    async fn a_second_code_for_the_same_name_lists_nobody_once_the_first_is_used() {
+        let served = Served::new(|_, _| {}).await;
+        let (first, second) = (
+            Keys::open(Arc::new(MemorySecrets::default())).unwrap(),
+            Keys::open(Arc::new(MemorySecrets::default())).unwrap(),
+        );
+        let first_code = served.code_for("127.0.0.1").await;
+        let second_code = served.code_for("127.0.0.1").await;
+
+        assert_eq!(served.join(&first_code, &first).await.0, 200);
+        served.listed(first.me()).await;
+        // Caught up with it, so this machine numbers an edit at once.
+        served
+            .hear_sending(first.me(), Some(served.settings()))
+            .await;
+        assert_eq!(served.join(&second_code, &second).await.0, 200);
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let machines = served.settings().machines;
+        let named: Vec<_> = machines
+            .iter()
+            .filter(|m| m.name == "127.0.0.1" || m.address == "127.0.0.1")
+            .collect();
+        assert_eq!(named, [&machine(first.me(), "127.0.0.1", "127.0.0.1")]);
+        assert!(
+            !machines.iter().any(|m| m.id == second.me()),
+            "{machines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_name_or_an_address_listed_after_the_code_was_made_lists_nobody() {
+        // Listed while the code was open, as a rename or another join does.
+        for (name, address) in [(" 127.0.0.1 ", "100.64.0.2"), ("trilogy-mac", "127.0.0.1")] {
+            let served = Served::new(|_, _| {}).await;
+            let joining = Keys::open(Arc::new(MemorySecrets::default())).unwrap();
+            let code = served.code_for("127.0.0.1").await;
+            let listed = MachineId::random();
+            {
+                let mut store = served.store.lock().unwrap();
+                let mut held = store.settings().unwrap();
+                held.seq += 1;
+                held.machines.push(machine(listed, name, address));
+                store.apply_settings(held).unwrap();
+            }
+            // Caught up with it, so this machine numbers an edit at once.
+            served.hear_sending(listed, Some(served.settings())).await;
+
+            assert_eq!(served.join(&code, &joining).await.0, 200);
+
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let machines = served.settings().machines;
+            assert!(
+                !machines.iter().any(|m| m.id == joining.me()),
+                "{name:?} at {address}: {machines:?}"
+            );
         }
     }
 

@@ -37,8 +37,21 @@ async fn a_machine_added_by_name_is_listed_under_that_name_once_it_joins_and_lin
     let later = Later::default();
     let a_keys = keys(&a_dir);
     let dialer = KeyedDialer::new(Arc::new(later.clone()), a_keys.clone());
-    // A lists itself as `machine-0` at 100.64.0.1 and acts alone.
+    // A lists itself as `machine-0` and acts alone. It is listed at a loopback address other
+    // than `localhost`'s, as a fleet run on one machine is, so it may add `localhost`. Nothing
+    // dials A at it here.
     let a = Keyed::new(&[], a_keys, a_dir, Arc::new(dialer));
+    {
+        let mut store = lock(&a.store);
+        let mut held = store.settings().unwrap();
+        held.seq += 1;
+        for listed in &mut held.machines {
+            if listed.id == a.keys.me() {
+                listed.address = "127.0.0.2".into();
+            }
+        }
+        store.apply_settings(held).unwrap();
+    }
     let coordinator = Arc::new(Coordinator::new(
         a.keys.me(),
         a.store.clone(),
@@ -56,7 +69,14 @@ async fn a_machine_added_by_name_is_listed_under_that_name_once_it_joins_and_lin
         coordinator,
         a.store.clone(),
     ));
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap()
+    });
 
     // In A's UI: add machine `localhost`.
     let added: Value = tokio::task::spawn_blocking(move || {
@@ -69,7 +89,7 @@ async fn a_machine_added_by_name_is_listed_under_that_name_once_it_joins_and_lin
     .await
     .unwrap();
     let code = added["code"].as_str().unwrap().to_owned();
-    assert_eq!(added["command"], format!("foundryd join 100.64.0.1 {code}"));
+    assert_eq!(added["command"], format!("foundryd join 127.0.0.2 {code}"));
 
     // On B: `foundryd join`, then its daemon starts.
     let secrets = FileSecrets::new(b_dir.path().join("secrets"));

@@ -244,7 +244,8 @@ struct Open {
 /// link reaches `hello` only after `Keys::accept` has proved a key this machine holds, so
 /// after `foundryd join` the only machine it lets in is the one that admitted it. The joined
 /// machine then takes that machine's settings through the normal merge, and the current rule,
-/// the machine list, applies from then on.
+/// the machine list, applies from then on. A machine whose list is later cut down to itself
+/// takes a record link again from any machine whose key it still holds.
 async fn hello(
     inner: &Inner,
     send: &Sender<String>,
@@ -356,8 +357,9 @@ pub(super) async fn listed(inner: &Inner, machine: MachineId) -> bool {
 
 /// Whether a record link with `machine` is allowed: it is in the machine list, or the list
 /// holds no machine but this one (or is empty), so a machine just joined takes a link from the
-/// machine that admitted it before it has that machine's settings. A list that cannot be read
-/// allows nothing.
+/// machine that admitted it before it has that machine's settings. That holds whenever the
+/// list is cut down to this machine, for any machine whose key it holds. A list that cannot be
+/// read allows nothing.
 async fn links_with(inner: &Inner, machine: MachineId) -> bool {
     listed_ids(inner)
         .await

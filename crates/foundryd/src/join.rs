@@ -36,7 +36,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::time::{Duration, SystemTime};
 
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -328,8 +328,13 @@ fn join_authority(address: &str, port: u16) -> String {
 
 #[derive(Debug, thiserror::Error)]
 pub enum JoinError {
-    #[error("the code is wrong, used or expired; ask for a new one")]
+    #[error("the code is wrong, used or expired, or made for another machine; ask for a new one")]
     BadCode,
+    #[error(
+        "the code was made for another machine; run the command on the machine named in the \
+         Add machine dialog"
+    )]
+    OtherMachine,
     #[error(
         "machine {0} is revoked, or held with another key; a revoked machine cannot join again \
          under the same id"
@@ -536,6 +541,9 @@ struct Shown {
     used_by: Option<MachineId>,
     /// For a watched code: told the machine that used it, once.
     watch: Option<oneshot::Sender<MachineId>>,
+    /// The addresses the code may be used from, or empty for any. A code made for a named
+    /// machine works only from an address that name resolved to.
+    from: Vec<IpAddr>,
 }
 
 impl Shown {
@@ -600,20 +608,26 @@ impl Keys {
 
     /// A new code that works once within [`CODE_VALID_FOR`].
     pub fn new_code(&self) -> Result<Code, JoinError> {
-        self.issue(None)
+        self.issue(None, Vec::new())
     }
 
-    /// A new code, as [`Keys::new_code`], and what says which machine used it. That is said
-    /// once, when the machine's key is first saved; the code expiring unused, once any later
-    /// code or redeem forgets it, says nothing and ends the watch.
+    /// A new code, as [`Keys::new_code`], that works only from one of `from`, and what says
+    /// which machine used it. That is said once, when the machine's key is first saved; the
+    /// code expiring unused, once any later code or redeem forgets it, says nothing and ends
+    /// the watch.
     pub(crate) fn new_watched_code(
         &self,
+        from: Vec<IpAddr>,
     ) -> Result<(Code, oneshot::Receiver<MachineId>), JoinError> {
         let (tell, told) = oneshot::channel();
-        Ok((self.issue(Some(tell))?, told))
+        Ok((self.issue(Some(tell), from)?, told))
     }
 
-    fn issue(&self, watch: Option<oneshot::Sender<MachineId>>) -> Result<Code, JoinError> {
+    fn issue(
+        &self,
+        watch: Option<oneshot::Sender<MachineId>>,
+        from: Vec<IpAddr>,
+    ) -> Result<Code, JoinError> {
         let mut bytes = [0; CODE_LENGTH];
         SystemRandom::new()
             .fill(&mut bytes)
@@ -630,43 +644,55 @@ impl Keys {
             wall: SystemTime::now(),
             used_by: None,
             watch,
+            from: from.into_iter().map(|ip| ip.to_canonical()).collect(),
         });
         Ok(Code(code))
     }
 
-    /// Uses up `code` to admit `machine` with public key `key`, by [`admit_into`]'s rule on
-    /// the stored table. The machine that used a code may send it again while it is valid, as
-    /// a join whose answer was lost does. A code is used up only once the key is saved.
+    /// Uses up `code`, sent from address `from`, to admit `machine` with public key `key`, by
+    /// [`admit_into`]'s rule on the stored table. The machine that used a code may send it
+    /// again while it is valid, as a join whose answer was lost does. A code is used up only
+    /// once the key is saved. A code made for a named machine is refused from any other
+    /// address, before anything is saved.
     ///
     /// Blocks on the secret store, as [`Keys::open`] does, and behind any other change to the
     /// key table in this process.
-    pub fn redeem(&self, code: &str, machine: MachineId, key: &PublicKey) -> Result<(), JoinError> {
+    pub fn redeem(
+        &self,
+        code: &str,
+        machine: MachineId,
+        key: &PublicKey,
+        from: IpAddr,
+    ) -> Result<(), JoinError> {
         let typed = code.trim().to_ascii_uppercase();
         let saving = self.saving()?;
-        let used_by = {
+        // The watch is taken before the save, so a code that expires while the save waits
+        // still says which machine used it.
+        let watch = {
             let mut held = self.held();
             held.forget_expired_codes();
-            held.codes
-                .iter()
-                .find(|shown| same(shown.code.as_bytes(), typed.as_bytes()))
-                .ok_or(JoinError::BadCode)?
-                .used_by
-        };
-        if used_by.is_some_and(|user| user != machine) {
-            return Err(JoinError::BadCode);
-        }
-        self.change(&saving, |machines| admit_into(machines, machine, key))?;
-        if let Some(shown) = self
-            .held()
-            .codes
-            .iter_mut()
-            .find(|shown| same(shown.code.as_bytes(), typed.as_bytes()))
-        {
-            shown.used_by = Some(machine);
-            if let Some(watch) = shown.watch.take() {
-                // Nobody watching any more is no reason to fail the join.
-                let _ = watch.send(machine);
+            let shown = held.shown(&typed).ok_or(JoinError::BadCode)?;
+            if shown.used_by.is_some_and(|user| user != machine) {
+                return Err(JoinError::BadCode);
             }
+            if !shown.from.is_empty() && !shown.from.contains(&from.to_canonical()) {
+                return Err(JoinError::OtherMachine);
+            }
+            shown.watch.take()
+        };
+        if let Err(error) = self.change(&saving, |machines| admit_into(machines, machine, key)) {
+            // The code is still unspent, so its watch goes back with it.
+            if let Some(shown) = self.held().shown(&typed) {
+                shown.watch = watch;
+            }
+            return Err(error);
+        }
+        if let Some(shown) = self.held().shown(&typed) {
+            shown.used_by = Some(machine);
+        }
+        if let Some(watch) = watch {
+            // Nobody watching any more is no reason to fail the join.
+            let _ = watch.send(machine);
         }
         Ok(())
     }
@@ -851,6 +877,13 @@ impl Held {
     fn forget_expired_codes(&mut self) {
         self.codes.retain(Shown::valid);
     }
+
+    /// The code shown as `typed`, compared in constant time.
+    fn shown(&mut self, typed: &str) -> Option<&mut Shown> {
+        self.codes
+            .iter_mut()
+            .find(|shown| same(shown.code.as_bytes(), typed.as_bytes()))
+    }
 }
 
 /// The messages a link opens with, before the hello.
@@ -1005,9 +1038,11 @@ async fn forward(from: &mut Receiver<String>, to: &Sender<String>) {
 }
 
 /// The route a joining machine posts its code to. It answers with this machine's id and
-/// public key when the machine is admitted, 403 to a code that is wrong, used or expired, 409
-/// to a machine revoked or held with another key, and 400 to a key that is not an Ed25519
-/// public key.
+/// public key when the machine is admitted, 403 to a code that is wrong, used or expired, or
+/// made for a machine at another address, 409 to a machine revoked or held with another key,
+/// and 400 to a key that is not an Ed25519 public key. It reads the sender's address, so it
+/// must be served with `into_make_service_with_connect_info::<SocketAddr>()`, as the daemon
+/// serves every route.
 pub fn router(keys: Keys) -> Router {
     Router::new()
         .route(JOIN_PATH, post(redeem))
@@ -1028,19 +1063,23 @@ struct JoinRequest {
     key: PublicKey,
 }
 
-async fn redeem(State(keys): State<Keys>, Json(request): Json<JoinRequest>) -> Response {
+async fn redeem(
+    State(keys): State<Keys>,
+    ConnectInfo(sender): ConnectInfo<SocketAddr>,
+    Json(request): Json<JoinRequest>,
+) -> Response {
     let answer = JoinAnswer {
         machine: keys.me(),
         key: keys.public_key(),
     };
     // Saving the key table can wait on the disk.
     let redeemed = tokio::task::spawn_blocking(move || {
-        keys.redeem(&request.code, request.machine, &request.key)
+        keys.redeem(&request.code, request.machine, &request.key, sender.ip())
     })
     .await;
     match redeemed {
         Ok(Ok(())) => Json(answer).into_response(),
-        Ok(Err(error @ JoinError::BadCode)) => {
+        Ok(Err(error @ (JoinError::BadCode | JoinError::OtherMachine))) => {
             (StatusCode::FORBIDDEN, error.to_string()).into_response()
         }
         Ok(Err(error @ JoinError::Taken(_))) => {
@@ -1102,6 +1141,9 @@ mod tests {
     use crate::store::Store;
     use crate::sync::{Conn, Dialer, Peers};
 
+    /// Where a redeem in these tests comes from.
+    const HERE: IpAddr = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+
     /// A machine's keys over a fresh in-memory secret store.
     fn machine_keys() -> Keys {
         Keys::open(Arc::new(MemorySecrets::default())).unwrap()
@@ -1110,7 +1152,8 @@ mod tests {
     /// `host` admits `peer` with a fresh code, as `foundryd join` does.
     fn admit(host: &Keys, peer: &Keys) {
         let code = host.new_code().unwrap().to_string();
-        host.redeem(&code, peer.me(), &peer.public_key()).unwrap();
+        host.redeem(&code, peer.me(), &peer.public_key(), HERE)
+            .unwrap();
     }
 
     /// Two machines that hold each other's key, as they will once keys reach every machine.
@@ -1121,11 +1164,13 @@ mod tests {
         (a, b)
     }
 
-    /// A secret store whose writes fail while `failing` is set.
+    /// A secret store whose writes fail while `failing` is set, and that runs `during_save`
+    /// once, in the middle of the next write.
     #[derive(Default)]
     struct Flaky {
         inner: MemorySecrets,
         failing: AtomicBool,
+        during_save: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     }
 
     impl Secrets for Flaky {
@@ -1138,6 +1183,10 @@ mod tests {
                     path: "secrets.json".into(),
                     source: std::io::ErrorKind::PermissionDenied.into(),
                 });
+            }
+            let during = self.during_save.lock().unwrap().take();
+            if let Some(during) = during {
+                during();
             }
             self.inner.set(name, value)
         }
@@ -1155,9 +1204,10 @@ mod tests {
     async fn a_code_works_once() {
         let (host, peer, other) = (machine_keys(), machine_keys(), machine_keys());
         let code = host.new_code().unwrap().to_string();
-        host.redeem(&code, peer.me(), &peer.public_key()).unwrap();
+        host.redeem(&code, peer.me(), &peer.public_key(), HERE)
+            .unwrap();
         assert_eq!(host.state(peer.me()), KeyState::Active);
-        let again = host.redeem(&code, other.me(), &other.public_key());
+        let again = host.redeem(&code, other.me(), &other.public_key(), HERE);
         assert!(matches!(again, Err(JoinError::BadCode)), "{again:?}");
         assert_eq!(host.state(other.me()), KeyState::NoKey);
     }
@@ -1166,8 +1216,10 @@ mod tests {
     async fn the_machine_that_used_a_code_may_send_it_again_when_the_answer_was_lost() {
         let (host, peer) = (machine_keys(), machine_keys());
         let code = host.new_code().unwrap().to_string();
-        host.redeem(&code, peer.me(), &peer.public_key()).unwrap();
-        host.redeem(&code, peer.me(), &peer.public_key()).unwrap();
+        host.redeem(&code, peer.me(), &peer.public_key(), HERE)
+            .unwrap();
+        host.redeem(&code, peer.me(), &peer.public_key(), HERE)
+            .unwrap();
         assert_eq!(host.state(peer.me()), KeyState::Active);
     }
 
@@ -1177,10 +1229,10 @@ mod tests {
         let early_code = host.new_code().unwrap().to_string();
         let late_code = host.new_code().unwrap().to_string();
         tokio::time::advance(CODE_VALID_FOR - Duration::from_secs(1)).await;
-        host.redeem(&early_code, early.me(), &early.public_key())
+        host.redeem(&early_code, early.me(), &early.public_key(), HERE)
             .unwrap();
         tokio::time::advance(Duration::from_secs(1)).await;
-        let expired = host.redeem(&late_code, late.me(), &late.public_key());
+        let expired = host.redeem(&late_code, late.me(), &late.public_key(), HERE);
         assert!(matches!(expired, Err(JoinError::BadCode)), "{expired:?}");
     }
 
@@ -1189,7 +1241,8 @@ mod tests {
         let (host, peer) = (machine_keys(), machine_keys());
         let code = host.new_code().unwrap().to_string();
         let typed = format!(" {} ", code.to_lowercase());
-        host.redeem(&typed, peer.me(), &peer.public_key()).unwrap();
+        host.redeem(&typed, peer.me(), &peer.public_key(), HERE)
+            .unwrap();
     }
 
     #[tokio::test(start_paused = true)]
@@ -1197,7 +1250,7 @@ mod tests {
         let (host, peer) = (machine_keys(), machine_keys());
         host.new_code().unwrap();
         for wrong in ["ABCDEFGHJK", ""] {
-            let refused = host.redeem(wrong, peer.me(), &peer.public_key());
+            let refused = host.redeem(wrong, peer.me(), &peer.public_key(), HERE);
             assert!(matches!(refused, Err(JoinError::BadCode)), "{wrong}");
         }
     }
@@ -1225,12 +1278,12 @@ mod tests {
         admit(&host, &peer);
         for taken in [peer.me(), host.me()] {
             let code = host.new_code().unwrap().to_string();
-            let claimed = host.redeem(&code, taken, &thief.public_key());
+            let claimed = host.redeem(&code, taken, &thief.public_key(), HERE);
             assert!(matches!(claimed, Err(JoinError::Taken(_))), "{claimed:?}");
         }
         host.revoke(peer.me()).unwrap();
         let code = host.new_code().unwrap().to_string();
-        let rejoined = host.redeem(&code, peer.me(), &peer.public_key());
+        let rejoined = host.redeem(&code, peer.me(), &peer.public_key(), HERE);
         assert!(matches!(rejoined, Err(JoinError::Taken(_))), "{rejoined:?}");
         assert_eq!(host.state(peer.me()), KeyState::Revoked);
     }
@@ -1270,8 +1323,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_watched_code_says_which_machine_used_it() {
         let (host, peer) = (machine_keys(), machine_keys());
-        let (code, used) = host.new_watched_code().unwrap();
-        host.redeem(&code.to_string(), peer.me(), &peer.public_key())
+        let (code, used) = host.new_watched_code(vec![HERE]).unwrap();
+        host.redeem(&code.to_string(), peer.me(), &peer.public_key(), HERE)
             .unwrap();
         assert_eq!(used.await.unwrap(), peer.me());
     }
@@ -1281,25 +1334,77 @@ mod tests {
         let flaky = Arc::new(Flaky::default());
         let host = Keys::open(flaky.clone()).unwrap();
         let peer = machine_keys();
-        let (code, mut used) = host.new_watched_code().unwrap();
+        let (code, mut used) = host.new_watched_code(vec![HERE]).unwrap();
         // Another code used says nothing, and so does a save of this one that fails.
         admit(&host, &machine_keys());
         flaky.failing.store(true, Ordering::SeqCst);
         assert!(
-            host.redeem(&code.to_string(), peer.me(), &peer.public_key())
+            host.redeem(&code.to_string(), peer.me(), &peer.public_key(), HERE)
                 .is_err()
         );
         assert!(used.try_recv().is_err());
         flaky.failing.store(false, Ordering::SeqCst);
-        host.redeem(&code.to_string(), peer.me(), &peer.public_key())
+        host.redeem(&code.to_string(), peer.me(), &peer.public_key(), HERE)
             .unwrap();
+        assert_eq!(used.await.unwrap(), peer.me());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_watched_code_that_expires_while_its_key_is_saved_still_says_who_used_it() {
+        let flaky = Arc::new(Flaky::default());
+        let host = Keys::open(flaky.clone()).unwrap();
+        let peer = machine_keys();
+        let (code, used) = host.new_watched_code(vec![HERE]).unwrap();
+        // While the key is saved, the code expires and an add forgets it.
+        let adding = host.clone();
+        *flaky.during_save.lock().unwrap() = Some(Box::new(move || {
+            for shown in &mut adding.held().codes {
+                shown.wall -= CODE_VALID_FOR + Duration::from_secs(1);
+            }
+            adding.new_code().unwrap();
+        }));
+
+        host.redeem(&code.to_string(), peer.me(), &peer.public_key(), HERE)
+            .unwrap();
+
+        assert_eq!(host.state(peer.me()), KeyState::Active);
+        assert_eq!(used.await.unwrap(), peer.me());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_code_made_for_a_named_machine_is_refused_from_another_address_and_saves_nothing() {
+        let (host, peer) = (machine_keys(), machine_keys());
+        let named: IpAddr = "100.64.0.5".parse().unwrap();
+        let (code, mut used) = host.new_watched_code(vec![named]).unwrap();
+        let code = code.to_string();
+
+        for elsewhere in ["127.0.0.1", "100.64.0.9", "::ffff:100.64.0.9"] {
+            let refused = host.redeem(
+                &code,
+                peer.me(),
+                &peer.public_key(),
+                elsewhere.parse().unwrap(),
+            );
+            assert!(
+                matches!(refused, Err(JoinError::OtherMachine)),
+                "{elsewhere}: {refused:?}"
+            );
+        }
+        assert_eq!(host.state(peer.me()), KeyState::NoKey);
+        assert!(used.try_recv().is_err());
+
+        // The code is unspent, and works from the named machine, over IPv4 or mapped IPv6.
+        let mapped: IpAddr = "::ffff:100.64.0.5".parse().unwrap();
+        host.redeem(&code, peer.me(), &peer.public_key(), mapped)
+            .unwrap();
+        assert_eq!(host.state(peer.me()), KeyState::Active);
         assert_eq!(used.await.unwrap(), peer.me());
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_watched_code_that_expires_unused_ends_its_watch() {
         let host = machine_keys();
-        let (_code, used) = host.new_watched_code().unwrap();
+        let (_code, used) = host.new_watched_code(vec![HERE]).unwrap();
         tokio::time::advance(CODE_VALID_FOR).await;
         // Any later code forgets the expired one.
         host.new_code().unwrap();
@@ -1313,11 +1418,12 @@ mod tests {
         let peer = machine_keys();
         let code = host.new_code().unwrap().to_string();
         flaky.failing.store(true, Ordering::SeqCst);
-        let failed = host.redeem(&code, peer.me(), &peer.public_key());
+        let failed = host.redeem(&code, peer.me(), &peer.public_key(), HERE);
         assert!(matches!(failed, Err(JoinError::Secrets(_))), "{failed:?}");
         assert_eq!(host.state(peer.me()), KeyState::NoKey);
         flaky.failing.store(false, Ordering::SeqCst);
-        host.redeem(&code, peer.me(), &peer.public_key()).unwrap();
+        host.redeem(&code, peer.me(), &peer.public_key(), HERE)
+            .unwrap();
         assert_eq!(host.state(peer.me()), KeyState::Active);
     }
 
@@ -1346,7 +1452,10 @@ mod tests {
         std::thread::scope(|scope| {
             for (peer, code) in peers.iter().zip(&codes) {
                 let host = host.clone();
-                scope.spawn(move || host.redeem(code, peer.me(), &peer.public_key()).unwrap());
+                scope.spawn(move || {
+                    host.redeem(code, peer.me(), &peer.public_key(), HERE)
+                        .unwrap()
+                });
             }
         });
         let reopened = Keys::open(secrets).unwrap();
@@ -1379,9 +1488,10 @@ mod tests {
         let (host, peer, other) = (machine_keys(), machine_keys(), machine_keys());
         admit(&host, &peer);
         let code = host.new_code().unwrap().to_string();
-        host.redeem(&code, peer.me(), &peer.public_key()).unwrap();
+        host.redeem(&code, peer.me(), &peer.public_key(), HERE)
+            .unwrap();
         assert_eq!(host.state(peer.me()), KeyState::Active);
-        let spent = host.redeem(&code, other.me(), &other.public_key());
+        let spent = host.redeem(&code, other.me(), &other.public_key(), HERE);
         assert!(matches!(spent, Err(JoinError::BadCode)), "{spent:?}");
     }
 
@@ -1451,7 +1561,7 @@ mod tests {
                     shown.wall + Duration::from_secs(shift as u64)
                 };
             }
-            let late = host.redeem(&code, peer.me(), &peer.public_key());
+            let late = host.redeem(&code, peer.me(), &peer.public_key(), HERE);
             assert!(matches!(late, Err(JoinError::BadCode)), "{shift}: {late:?}");
         }
     }
@@ -1633,13 +1743,13 @@ mod tests {
         gated.armed.store(true, Ordering::SeqCst);
         let started = AtomicBool::new(false);
         let results = std::thread::scope(|scope| {
-            let first = scope.spawn(|| host.redeem(&code, x.me(), &x.public_key()));
+            let first = scope.spawn(|| host.redeem(&code, x.me(), &x.public_key(), HERE));
             while gated.waiting.load(Ordering::SeqCst) == 0 {
                 std::thread::yield_now();
             }
             let second = scope.spawn(|| {
                 started.store(true, Ordering::SeqCst);
-                host.redeem(&code, y.me(), &y.public_key())
+                host.redeem(&code, y.me(), &y.public_key(), HERE)
             });
             while !started.load(Ordering::SeqCst) {
                 std::thread::yield_now();
@@ -1683,7 +1793,7 @@ mod tests {
             (held.me(), thief.public_key()),
             (revoked.me(), revoked.public_key()),
         ] {
-            let claimed = daemon.redeem(&code, machine, &key);
+            let claimed = daemon.redeem(&code, machine, &key, HERE);
             assert!(
                 matches!(claimed, Err(JoinError::Taken(m)) if m == machine),
                 "{claimed:?}"
@@ -1691,7 +1801,7 @@ mod tests {
             assert_eq!(secrets.get(KEYS_SECRET).unwrap(), before);
         }
         daemon
-            .redeem(&code, newcomer.me(), &newcomer.public_key())
+            .redeem(&code, newcomer.me(), &newcomer.public_key(), HERE)
             .unwrap();
         let reopened = Keys::open(secrets).unwrap();
         assert_eq!(reopened.state(held.me()), KeyState::Active);
@@ -1713,7 +1823,7 @@ mod tests {
             matches!(revoked, Err(JoinError::Unreadable(KEYS_SECRET))),
             "{revoked:?}"
         );
-        let redeemed = keys.redeem(&code, newcomer.me(), &newcomer.public_key());
+        let redeemed = keys.redeem(&code, newcomer.me(), &newcomer.public_key(), HERE);
         assert!(
             matches!(redeemed, Err(JoinError::Unreadable(KEYS_SECRET))),
             "{redeemed:?}"
@@ -1723,7 +1833,7 @@ mod tests {
             Some("not json")
         );
         secrets.set(KEYS_SECRET, &table).unwrap();
-        keys.redeem(&code, newcomer.me(), &newcomer.public_key())
+        keys.redeem(&code, newcomer.me(), &newcomer.public_key(), HERE)
             .unwrap();
     }
 
@@ -2166,7 +2276,13 @@ mod tests {
     async fn serve(keys: Keys) -> u16 {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move { axum::serve(listener, router(keys)).await });
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router(keys).into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+        });
         port
     }
 
