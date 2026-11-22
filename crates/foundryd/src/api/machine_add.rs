@@ -12,50 +12,44 @@
 //! code works ([`CODE_VALID_FOR`]).
 //!
 //! The code works only from an address the name resolved to. The name and the first of those
-//! addresses are held in memory until the code is used or expires. When a machine uses the code
-//! on the join route, it is listed under that name at that address through the acting
-//! coordinator, as every machine list change is, unless the list by then holds that machine,
-//! that name or that address. An edit that fails or is skipped is warned, and the join stands.
-//! A code made anywhere else lists nothing.
+//! addresses are held with the code until it expires. When a machine uses the code on the join
+//! route, the route lists it through [`Lister`], through the acting coordinator, as every
+//! machine list change is, before it answers: with its key, under the name and address it
+//! lists itself under, or, from a `foundryd join` that sends none, under the name typed at that
+//! first address. Nothing is listed when the list by then holds that machine, that name or that
+//! address; that is warned, and the join stands. An edit that fails makes the join `503`, and
+//! the same machine may send the code again. A code made anywhere else lists nothing.
 
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use axum::Router;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
-use foundry_proto::ids::MachineId;
 use foundry_proto::settings::{Edit, Machine};
 use serde::Deserialize;
-use tokio::sync::oneshot;
 
 use super::machine_names::checked_name;
 use super::{ApiError, Body, on_store, unprocessable};
 use crate::coordinator::Coordinator;
-use crate::join::{CODE_VALID_FOR, DEFAULT_PORT, JoinError, Keys, join_targets};
+use crate::join::{CODE_VALID_FOR, DEFAULT_PORT, JoinError, Keys, Named, join_targets};
 use crate::store::Store;
 
-/// What the add route acts on: the keys that make codes, the coordinator that lists the
-/// machine and the store whose machine list it checks.
+/// What the add route acts on: the keys that make codes and the store whose machine list it
+/// checks.
 struct Adding {
     keys: Keys,
-    coordinator: Arc<Coordinator>,
     store: Arc<Mutex<Store>>,
 }
 
 /// `POST /api/machines/add`. The caller guards it as it guards the rest of the API, and serves
-/// [`crate::join::router`] beside it on the same keys.
-pub fn router(keys: Keys, coordinator: Arc<Coordinator>, store: Arc<Mutex<Store>>) -> Router {
+/// [`crate::join::router`] beside it on the same keys, with a [`Lister`].
+pub fn router(keys: Keys, store: Arc<Mutex<Store>>) -> Router {
     Router::new()
         .route("/api/machines/add", post(add))
-        .with_state(Arc::new(Adding {
-            keys,
-            coordinator,
-            store,
-        }))
+        .with_state(Arc::new(Adding { keys, store }))
 }
 
 #[derive(Deserialize)]
@@ -110,18 +104,14 @@ async fn add(
             format!("{name:?} is already in the fleet as {:?}", other.name),
         ));
     }
-    let address = addresses[0];
-    let (code, used) = adding
-        .keys
-        .new_watched_code(addresses)
-        .map_err(|e| ApiError::Rejected(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    tokio::spawn(list_when_used(
-        adding.coordinator.clone(),
-        adding.store.clone(),
-        used,
+    let named = Named {
         name,
-        address,
-    ));
+        address: addresses[0],
+    };
+    let code = adding
+        .keys
+        .new_named_code(named, addresses)
+        .map_err(|e| ApiError::Rejected(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let answer = serde_json::json!({
         "command": format!("foundryd join {} {code}", own.address.trim()),
         "code": code.to_string(),
@@ -160,60 +150,63 @@ fn not_on_tailscale(name: &str) -> ApiError {
     ))
 }
 
-/// Lists the machine that uses the code, told by `used`, as `name` at `address`, or nothing
-/// when the code expires unused, or the machine list already holds that machine (this machine
-/// included), whose entry is never overwritten, or another machine with that name or at that
-/// address, as after a second code for the same name. The code is never logged.
-async fn list_when_used(
+/// Lists a machine that used a code the add route made, for the join route.
+#[derive(Clone)]
+pub struct Lister {
     coordinator: Arc<Coordinator>,
     store: Arc<Mutex<Store>>,
-    used: oneshot::Receiver<MachineId>,
-    name: String,
-    address: IpAddr,
-) {
-    // A redeem that starts just before the code expires can wait for the key lock.
-    let wait = CODE_VALID_FOR + crate::secrets::LOCK_WAIT + Duration::from_secs(5);
-    let Ok(Ok(id)) = tokio::time::timeout(wait, used).await else {
-        return;
-    };
-    let held = match on_store(&store, |store| store.settings()).await {
-        Ok(held) => held,
-        Err(error) => {
+}
+
+impl Lister {
+    pub fn new(coordinator: Arc<Coordinator>, store: Arc<Mutex<Store>>) -> Self {
+        Self { coordinator, store }
+    }
+
+    /// Lists `machine` through the coordinator, and says once the edit is numbered. Nothing is
+    /// sent when the list already holds that machine (this machine included), whose entry is
+    /// never overwritten, or another machine with that name or at that address, as after a
+    /// second code for the same name; that is warned. A list that cannot be read, or an edit
+    /// that fails, gives why. The code is never logged.
+    pub(crate) async fn list(&self, machine: Machine) -> Result<(), String> {
+        let id = machine.id;
+        let held = on_store(&self.store, |store| store.settings())
+            .await
+            .map_err(|error| format!("the machine list could not be read: {error}"))?;
+        if held.machines.iter().any(|m| m.id == id) {
             tracing::warn!(
-                "machine {id} used a code to join, but the machine list could not be read, so it \
-                 is not listed: {error}"
+                "machine {id} used a code to join but is already in the machine list; its entry is left as it is"
             );
-            return;
+            return Ok(());
         }
-    };
-    if held.machines.iter().any(|m| m.id == id) {
-        tracing::warn!(
-            "machine {id} used a code to join but is already in the machine list; its entry is left as it is"
-        );
-        return;
-    }
-    let wanted = name.to_lowercase();
-    if let Some(other) = held
-        .machines
-        .iter()
-        .find(|m| m.name.trim().to_lowercase() == wanted || has_address(&m.address, address))
-    {
-        tracing::warn!(
-            "machine {id} used a code to join as {name:?} at {address}, but {:?} at {} is already \
-             in the machine list, so it is not listed",
-            other.name,
-            other.address
-        );
-        return;
-    }
-    let machine = Machine {
-        id,
-        name,
-        address: address.to_string(),
-        key: String::new(),
-    };
-    if let Err(error) = coordinator.edit(Edit::SetMachine { machine }).await {
-        tracing::warn!("machine {id} joined, but it could not be listed: {error}");
+        let wanted = machine.name.trim().to_lowercase();
+        let address = machine.address.trim();
+        if let Some(other) = held.machines.iter().find(|m| {
+            m.name.trim().to_lowercase() == wanted
+                || address
+                    .parse::<IpAddr>()
+                    .map_or(m.address.trim() == address, |ip| {
+                        has_address(&m.address, ip)
+                    })
+        }) {
+            tracing::warn!(
+                "machine {id} used a code to join as {:?} at {}, but {:?} at {} is already in \
+                 the machine list, so it is not listed",
+                machine.name,
+                machine.address,
+                other.name,
+                other.address
+            );
+            return Ok(());
+        }
+        match self.coordinator.edit(Edit::SetMachine { machine }).await {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                tracing::warn!(
+                    "machine {id} used a code to join, but it could not be listed: {error}"
+                );
+                Err(error.to_string())
+            }
+        }
     }
 }
 
@@ -276,11 +269,8 @@ mod tests {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let lister = Lister::new(coordinator.clone(), store.clone());
-            let app = join::router(keys.clone(), Some(lister)).merge(router(
-                keys.clone(),
-                coordinator,
-                store.clone(),
-            ));
+            let app =
+                join::router(keys.clone(), Some(lister)).merge(router(keys.clone(), store.clone()));
             let server = tokio::spawn(async move {
                 axum::serve(
                     listener,
@@ -495,13 +485,13 @@ mod tests {
         let code = served.code_for(" 127.0.0.1 ").await;
 
         let (status, body) = served
-            .join_as(&code, &joining, Some("personal-mac"), Some("100.91.54.18"))
+            .join_as(&code, &joining, Some("build-box"), Some("100.64.0.7"))
             .await;
 
         assert_eq!(status, 200, "{body}");
         assert_eq!(
             served.held(joining.me()),
-            Some(keyed(&joining, "personal-mac", "100.91.54.18"))
+            Some(keyed(&joining, "build-box", "100.64.0.7"))
         );
     }
 
@@ -509,9 +499,9 @@ mod tests {
     async fn a_join_with_no_name_or_no_address_is_listed_under_the_name_typed_at_its_address() {
         for (name, address) in [
             (None, None),
-            (Some("personal-mac"), None),
-            (None, Some("100.91.54.18")),
-            (Some(" "), Some("100.91.54.18")),
+            (Some("build-box"), None),
+            (None, Some("100.64.0.7")),
+            (Some(" "), Some("100.64.0.7")),
         ] {
             let served = Served::new(|_, _| {}).await;
             let joining = Keys::open(Arc::new(MemorySecrets::default())).unwrap();
@@ -620,7 +610,7 @@ mod tests {
         let code = served.code_for("127.0.0.1").await;
 
         let (status, body) = served
-            .join_as(&code, &joining, Some("personal-mac"), Some("100.91.54.18"))
+            .join_as(&code, &joining, Some("build-box"), Some("100.64.0.7"))
             .await;
 
         assert_eq!(status, 503, "{body}");
@@ -635,13 +625,13 @@ mod tests {
         acting.priority.reverse();
         served.store.lock().unwrap().apply_settings(acting).unwrap();
         let (status, body) = served
-            .join_as(&code, &joining, Some("personal-mac"), Some("100.91.54.18"))
+            .join_as(&code, &joining, Some("build-box"), Some("100.64.0.7"))
             .await;
 
         assert_eq!(status, 200, "{body}");
         assert_eq!(
             served.held(joining.me()),
-            Some(keyed(&joining, "personal-mac", "100.91.54.18"))
+            Some(keyed(&joining, "build-box", "100.64.0.7"))
         );
     }
 
@@ -752,7 +742,7 @@ mod tests {
             .iter()
             .filter(|m| m.name == "127.0.0.1" || m.address == "127.0.0.1")
             .collect();
-        assert_eq!(named, [&machine(first.me(), "127.0.0.1", "127.0.0.1")]);
+        assert_eq!(named, [&keyed(&first, "127.0.0.1", "127.0.0.1")]);
         assert!(
             !machines.iter().any(|m| m.id == second.me()),
             "{machines:?}"

@@ -49,9 +49,10 @@ use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::sync::oneshot;
 use tokio::time::{Instant, timeout};
 
+use crate::api::machine_add::Lister;
+use crate::api::machine_names;
 use crate::secrets::{self, Secrets, SecretsError};
 use crate::store::{Store, StoreError};
 use crate::sync::{Conn, Dialer, OFFLINE_AFTER, Peers, on_store};
@@ -111,7 +112,17 @@ pub fn join(address: &str, code: &str) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match join_at(address, port, code, &*secrets) {
+    let own = match own_entry() {
+        Ok(own) => Some(own),
+        Err(why) => {
+            eprintln!(
+                "foundryd join: {why}; the machine that admits this one lists it under the name \
+                 typed there until this machine lists itself"
+            );
+            None
+        }
+    };
+    match join_at(address, port, code, &*secrets, own.as_ref()) {
         Ok(machine) => {
             println!(
                 "joined the fleet as machine {machine}; if foundryd is already running here, \
@@ -126,6 +137,15 @@ pub fn join(address: &str, code: &str) -> ExitCode {
     }
 }
 
+/// What this machine lists itself under, read from Tailscale as the daemon reads it.
+fn own_entry() -> Result<machine_names::Entry, String> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("cannot ask Tailscale what this machine is called: {e}"))?
+        .block_on(crate::daemon::own_entry())
+}
+
 /// The data directory: `FOUNDRY_HOME`, else `~/.local/share/foundry`.
 fn home() -> Option<PathBuf> {
     match std::env::var_os("FOUNDRY_HOME") {
@@ -134,9 +154,11 @@ fn home() -> Option<PathBuf> {
     }
 }
 
-/// Posts `code` with this machine's id and public key to the machine at `address` (`port`
-/// unless the address names one), keeps the admitting machine's key in this machine's key
-/// table, and returns this machine's id. The identity in `secrets` is
+/// Posts `code` with this machine's id and public key, and the entry it lists itself under
+/// (`own`) when there is one, to the machine at `address` (`port` unless the address names
+/// one), keeps the admitting machine's key in this machine's key table, and returns this
+/// machine's id. The admitting machine lists this one before it answers; when it cannot, it
+/// keeps nothing here and the same command can be run again. The identity in `secrets` is
 /// made if there is none and never replaced, so joining again, or retrying a join whose answer
 /// was lost, is the same machine.
 ///
@@ -149,6 +171,7 @@ pub fn join_at(
     port: u16,
     code: &str,
     secrets: &dyn Secrets,
+    own: Option<&machine_names::Entry>,
 ) -> Result<MachineId, JoinError> {
     let targets = join_targets(address, port)?;
     let identity = Identity::load_or_create(secrets)?;
@@ -156,9 +179,15 @@ pub fn join_at(
         code: code.to_owned(),
         machine: identity.machine,
         key: identity.key_pair()?.public(),
+        name: own.map(|own| own.name.clone()),
+        address: own.map(|own| own.address.clone()),
     };
+    // The answer waits for the admitting machine to list this one, which can wait on its
+    // acting coordinator for half a minute.
     let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(10)))
+        .timeout_connect(Some(Duration::from_secs(10)))
+        .timeout_global(Some(Duration::from_secs(90)))
+        .http_status_as_error(false)
         .build()
         .into();
     let mut answered = None;
@@ -187,23 +216,42 @@ fn post_join(
     url: &str,
     request: &JoinRequest,
 ) -> Result<JoinAnswer, JoinError> {
-    match agent.post(url).send_json(request) {
-        Ok(mut response) => response
+    let mut response = match agent.post(url).send_json(request) {
+        Ok(response) => response,
+        Err(error) => {
+            return Err(JoinError::Unreachable {
+                url: url.to_owned(),
+                reason: error.to_string(),
+            });
+        }
+    };
+    match response.status().as_u16() {
+        200 => response
             .body_mut()
             .read_json()
             .map_err(|_| JoinError::NotAdmitted {
                 url: url.to_owned(),
                 status: 200,
             }),
-        Err(ureq::Error::StatusCode(403)) => Err(JoinError::BadCode),
-        Err(ureq::Error::StatusCode(409)) => Err(JoinError::Taken(request.machine)),
-        Err(ureq::Error::StatusCode(status)) => Err(JoinError::NotAdmitted {
+        403 => Err(JoinError::BadCode),
+        409 => Err(JoinError::Taken(request.machine)),
+        503 => {
+            #[derive(Deserialize)]
+            struct Unlisted {
+                error: String,
+            }
+            let reason = response
+                .body_mut()
+                .read_json::<Unlisted>()
+                .map_or_else(|_| "no reason was given".to_owned(), |u| u.error);
+            Err(JoinError::NotListed {
+                url: url.to_owned(),
+                reason,
+            })
+        }
+        status => Err(JoinError::NotAdmitted {
             url: url.to_owned(),
             status,
-        }),
-        Err(error) => Err(JoinError::Unreachable {
-            url: url.to_owned(),
-            reason: error.to_string(),
         }),
     }
 }
@@ -353,6 +401,11 @@ pub enum JoinError {
     AnsweredAsThisMachine(String),
     #[error("the public key sent is not an Ed25519 public key")]
     BadKey,
+    #[error(
+        "{url} could not add this machine to the machine list: {reason}; run the same command \
+         again"
+    )]
+    NotListed { url: String, reason: String },
     #[error("{url} could not admit this machine (HTTP {status}); ask for a new code")]
     NotAdmitted { url: String, status: u16 },
     #[error("{url} could not be reached: {reason}")]
@@ -491,6 +544,15 @@ impl Signer {
     }
 }
 
+/// The machine a code was made for, in the Add machine dialog: the name typed there and the
+/// first address it resolved to. A redeem of the code lists the machine under these when the
+/// joining machine does not say what it lists itself under.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Named {
+    pub name: String,
+    pub address: IpAddr,
+}
+
 /// A one-time join code, shown to a person. It is never shown in debug output.
 pub struct Code(String);
 
@@ -547,8 +609,8 @@ struct Shown {
     /// Also kept because `at` stops while the machine sleeps.
     wall: SystemTime,
     used_by: Option<MachineId>,
-    /// For a watched code: told the machine that used it, once.
-    watch: Option<oneshot::Sender<MachineId>>,
+    /// For a code made for a named machine: the name typed and the address it resolved to.
+    named: Option<Named>,
     /// The addresses the code may be used from, or empty for any. A code made for a named
     /// machine works only from an address that name resolved to.
     from: Vec<IpAddr>,
@@ -620,23 +682,17 @@ impl Keys {
         self.issue(None, Vec::new())
     }
 
-    /// A new code, as [`Keys::new_code`], that works only from one of `from`, and what says
-    /// which machine used it. That is said once, when the machine's key is first saved; the
-    /// code expiring unused, once any later code or redeem forgets it, says nothing and ends
-    /// the watch.
-    pub(crate) fn new_watched_code(
+    /// A new code, as [`Keys::new_code`], made for the machine `named`, that works only from
+    /// one of `from`. Each redeem of it gives `named` back.
+    pub(crate) fn new_named_code(
         &self,
-        from: Vec<IpAddr>,
-    ) -> Result<(Code, oneshot::Receiver<MachineId>), JoinError> {
-        let (tell, told) = oneshot::channel();
-        Ok((self.issue(Some(tell), from)?, told))
-    }
-
-    fn issue(
-        &self,
-        watch: Option<oneshot::Sender<MachineId>>,
+        named: Named,
         from: Vec<IpAddr>,
     ) -> Result<Code, JoinError> {
+        self.issue(Some(named), from)
+    }
+
+    fn issue(&self, named: Option<Named>, from: Vec<IpAddr>) -> Result<Code, JoinError> {
         let mut bytes = [0; CODE_LENGTH];
         SystemRandom::new()
             .fill(&mut bytes)
@@ -652,7 +708,7 @@ impl Keys {
             at: Instant::now(),
             wall: SystemTime::now(),
             used_by: None,
-            watch,
+            named,
             from: from.into_iter().map(|ip| ip.to_canonical()).collect(),
         });
         Ok(Code(code))
@@ -662,7 +718,8 @@ impl Keys {
     /// [`admit_into`]'s rule on the stored table. The machine that used a code may send it
     /// again while it is valid, as a join whose answer was lost does. A code is used up only
     /// once the key is saved. A code made for a named machine is refused from any other
-    /// address, before anything is saved.
+    /// address, before anything is saved. Gives the machine the code was made for, for a
+    /// code made for a named machine.
     ///
     /// Blocks on the secret store, as [`Keys::open`] does, and behind any other change to the
     /// key table in this process.
@@ -672,12 +729,11 @@ impl Keys {
         machine: MachineId,
         key: &PublicKey,
         from: IpAddr,
-    ) -> Result<(), JoinError> {
+    ) -> Result<Option<Named>, JoinError> {
         let typed = code.trim().to_ascii_uppercase();
         let saving = self.saving()?;
-        // The watch is taken before the save, so a code that expires while the save waits
-        // still says which machine used it.
-        let watch = {
+        // Read before the save, so a code that expires while the save waits still gives it.
+        let named = {
             let mut held = self.held();
             held.forget_expired_codes();
             let shown = held.shown(&typed).ok_or(JoinError::BadCode)?;
@@ -687,23 +743,13 @@ impl Keys {
             if !shown.from.is_empty() && !shown.from.contains(&from.to_canonical()) {
                 return Err(JoinError::OtherMachine);
             }
-            shown.watch.take()
+            shown.named.clone()
         };
-        if let Err(error) = self.change(&saving, |machines| admit_into(machines, machine, key)) {
-            // The code is still unspent, so its watch goes back with it.
-            if let Some(shown) = self.held().shown(&typed) {
-                shown.watch = watch;
-            }
-            return Err(error);
-        }
+        self.change(&saving, |machines| admit_into(machines, machine, key))?;
         if let Some(shown) = self.held().shown(&typed) {
             shown.used_by = Some(machine);
         }
-        if let Some(watch) = watch {
-            // Nobody watching any more is no reason to fail the join.
-            let _ = watch.send(machine);
-        }
-        Ok(())
+        Ok(named)
     }
 
     /// Admits, by [`admit_into`]'s rule, each machine in `machines` listed with a key that
@@ -1137,10 +1183,22 @@ async fn forward(from: &mut Receiver<String>, to: &Sender<String>) {
 /// and 400 to a key that is not an Ed25519 public key. It reads the sender's address, so it
 /// must be served with `into_make_service_with_connect_info::<SocketAddr>()`, as the daemon
 /// serves every route.
-pub fn router(keys: Keys) -> Router {
+///
+/// A code made for a named machine, by the add route, also lists the machine through
+/// `lister` before the answer: under the name and address the request sends, the entry the
+/// joining machine lists itself under, else under the name typed and the address it resolved
+/// to, with its key. A listing that fails is `503` `{"error"}`, and the code stays valid for
+/// that machine. Without a `lister`, no code lists anything.
+pub fn router(keys: Keys, lister: Option<Lister>) -> Router {
     Router::new()
         .route(JOIN_PATH, post(redeem))
-        .with_state(keys)
+        .with_state(Arc::new(Joining { keys, lister }))
+}
+
+/// What the join route acts on.
+struct Joining {
+    keys: Keys,
+    lister: Option<Lister>,
 }
 
 /// The admitting machine's answer: who it is and its public key.
@@ -1155,24 +1213,63 @@ struct JoinRequest {
     code: String,
     machine: MachineId,
     key: PublicKey,
+    /// The name the joining machine lists itself under; none from a `foundryd join` before it
+    /// sent one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    /// The address the joining machine lists itself at; none as for `name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    address: Option<String>,
+}
+
+impl JoinRequest {
+    /// The entry the machine is listed under once it joins with a code made for `named`: the
+    /// name and address it sent, else, when either is missing or blank, the name typed and the
+    /// address it resolved to.
+    fn entry(&self, named: Named) -> Machine {
+        let sent = |field: &Option<String>| field.clone().filter(|f| !f.trim().is_empty());
+        let (name, address) = match (sent(&self.name), sent(&self.address)) {
+            (Some(name), Some(address)) => (name, address),
+            _ => (named.name, named.address.to_string()),
+        };
+        Machine {
+            id: self.machine,
+            name,
+            address,
+            key: self.key.hex().to_owned(),
+        }
+    }
 }
 
 async fn redeem(
-    State(keys): State<Keys>,
+    State(joining): State<Arc<Joining>>,
     ConnectInfo(sender): ConnectInfo<SocketAddr>,
     Json(request): Json<JoinRequest>,
 ) -> Response {
+    let keys = joining.keys.clone();
     let answer = JoinAnswer {
         machine: keys.me(),
         key: keys.public_key(),
     };
     // Saving the key table can wait on the disk.
-    let redeemed = tokio::task::spawn_blocking(move || {
-        keys.redeem(&request.code, request.machine, &request.key, sender.ip())
-    })
-    .await;
+    let (code, machine, key) = (request.code.clone(), request.machine, request.key.clone());
+    let redeemed =
+        tokio::task::spawn_blocking(move || keys.redeem(&code, machine, &key, sender.ip())).await;
     match redeemed {
-        Ok(Ok(())) => Json(answer).into_response(),
+        Ok(Ok(named)) => {
+            let listed = match (named, &joining.lister) {
+                (Some(named), Some(lister)) => lister.list(request.entry(named)).await,
+                _ => Ok(()),
+            };
+            match listed {
+                Ok(()) => Json(answer).into_response(),
+                Err(error) => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({ "error": error })),
+                )
+                    .into_response(),
+            }
+        }
         Ok(Err(error @ (JoinError::BadCode | JoinError::OtherMachine))) => {
             (StatusCode::FORBIDDEN, error.to_string()).into_response()
         }
@@ -2562,6 +2659,8 @@ mod tests {
             code: code.clone(),
             machine,
             key: PublicKey("ab".into()),
+            name: None,
+            address: None,
         };
         let url = format!("http://127.0.0.1:{port}{JOIN_PATH}");
         let answer =

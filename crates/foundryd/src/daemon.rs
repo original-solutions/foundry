@@ -306,11 +306,11 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
         .layer(middleware::from_fn_with_state(api.clone(), api::same_site));
     let machine_name_routes = api::machine_names::router(coordinator.clone(), store.clone())
         .layer(middleware::from_fn_with_state(api.clone(), api::same_site));
-    let join_routes = join::router(keys.clone())
+    let lister = api::machine_add::Lister::new(coordinator.clone(), store.clone());
+    let join_routes = join::router(keys.clone(), Some(lister))
         .layer(middleware::from_fn_with_state(api.clone(), api::same_site));
-    let machine_add_routes =
-        api::machine_add::router(keys.clone(), coordinator.clone(), store.clone())
-            .layer(middleware::from_fn_with_state(api.clone(), api::same_site));
+    let machine_add_routes = api::machine_add::router(keys.clone(), store.clone())
+        .layer(middleware::from_fn_with_state(api.clone(), api::same_site));
     let app = api::router(api)
         .merge(sessions.router())
         .merge(attention_routes)
@@ -633,6 +633,14 @@ async fn run_cli(cli: &Path, args: &[&str], within: Duration) -> Result<Vec<u8>,
     Ok(out.stdout)
 }
 
+/// What this machine lists itself under: what `tailscale status --self --json` says it is
+/// called and its address, read by [`api::machine_names::entry`]. The one source of the entry
+/// the daemon lists and the one `foundryd join` sends, so the two never differ.
+pub(crate) async fn own_entry() -> Result<api::machine_names::Entry, String> {
+    let status = ask_status(&tailscale_cli(), ASK_WITHIN).await?;
+    api::machine_names::entry(&status, host_names().first().map(String::as_str))
+}
+
 /// Keeps this machine in the shared machine list: each time the address watch hears from
 /// Tailscale (`answered`, with the addresses `ip` gave), hands what Tailscale calls this machine
 /// to `listing`, which also reads the watch's mark that Tailscale was away. It runs apart from
@@ -648,15 +656,7 @@ async fn list_this_machine(
     let mut told = Told::default();
     while answered.changed().await.is_ok() {
         let ips = answered.borrow_and_update().clone();
-        let entry = told
-            .entry(&ips, || async {
-                ask_status(&tailscale_cli(), ASK_WITHIN)
-                    .await
-                    .and_then(|status| {
-                        api::machine_names::entry(&status, host_names().first().map(String::as_str))
-                    })
-            })
-            .await;
+        let entry = told.entry(&ips, own_entry).await;
         listing.list(entry).await;
     }
 }

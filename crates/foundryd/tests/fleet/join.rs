@@ -64,11 +64,9 @@ async fn a_machine_added_by_name_is_listed_under_that_name_once_it_joins_and_lin
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let app = join::router(a.keys.clone()).merge(machine_add::router(
-        a.keys.clone(),
-        coordinator,
-        a.store.clone(),
-    ));
+    let lister = machine_add::Lister::new(coordinator, a.store.clone());
+    let app = join::router(a.keys.clone(), Some(lister))
+        .merge(machine_add::router(a.keys.clone(), a.store.clone()));
     tokio::spawn(async move {
         axum::serve(
             listener,
@@ -93,11 +91,12 @@ async fn a_machine_added_by_name_is_listed_under_that_name_once_it_joins_and_lin
 
     // On B: `foundryd join`, then its daemon starts.
     let secrets = FileSecrets::new(b_dir.path().join("secrets"));
-    let joined =
-        tokio::task::spawn_blocking(move || join::join_at("127.0.0.1", port, &code, &secrets))
-            .await
-            .unwrap()
-            .unwrap();
+    let joined = tokio::task::spawn_blocking(move || {
+        join::join_at("127.0.0.1", port, &code, &secrets, None)
+    })
+    .await
+    .unwrap()
+    .unwrap();
     let b = Keyed::new(&[], keys(&b_dir), b_dir, Arc::new(Nowhere));
     assert_eq!(b.keys.me(), joined);
     tokio::spawn({
