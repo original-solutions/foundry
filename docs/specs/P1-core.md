@@ -10,12 +10,13 @@ Three factories came before this one. Rust softfac drove a separate T3 Code serv
 
 Foundry owns the agent session itself. There is no host app. It replaces Paradev and T3 Code.
 
-## The whole product, in four pieces
+## The whole product, in five pieces
 
 | Piece | What it adds | When it is done |
 |---|---|---|
 | P1 Core (this spec) | The daemon on every machine, workspaces, terminals, agent sessions, load, placement, sync, a moving coordinator, a minimal UI | Manual sessions run on any machine and Paradev is no longer needed for them |
-| P2 Factory | GitHub accounts, projects with instructors, the label state machine, claims, dependencies, the gate, the review loop to 5 out of 5, the merge setting and merge queue, project leases, the ledger, attention items | The current runner is turned off |
+| P2 Factory ([spec](P2-factory.md)) | GitHub logins per machine and project, the label state machine, claims, dependencies, the gate, feedback, project leases, the ledger, attention items: the Paradev runner's behaviour, ported | The current runner is turned off |
+| P2b Review and merge | The review loop to 5 out of 5, the merge setting and the merge queue | |
 | P3 Full UI | The Paradev-like layout, diffs, the PR view, run history, a scoreboard, the Tauri wrapper | The browser tab is no longer the main way in |
 | P4 Later | A phone app, sandboxed runs on rented machines, Linear, machines started on demand, a preview per PR | |
 
@@ -339,7 +340,7 @@ One thing the check found that the design did not expect: in a folder Claude Cod
 
 ## Decisions already made for later pieces
 
-Settled in the brainstorm on 2026-11-17. They belong to P2 and P3 and are recorded here until those specs exist.
+Settled in the brainstorm on 2026-11-17. P2's spec, [P2-factory.md](P2-factory.md), takes the leases, the gate on any machine, reconciling every pass and what is kept from the earlier factories. It keeps one GitHub login per machine with an override per project instead of the coordinator handing credentials out. The review loop, the merge setting and the merge queue belong to P2b and stay recorded here until its spec exists.
 
 - **GitHub accounts.** Several accounts are connected to the app. Each project uses the one that owns its repo. The coordinator holds the credentials and gives a worker the right one for each run. Instructors stay a list per project.
 - **The unattended loop.** Claim, build with the `/factory` skill, run the gate on a fresh checkout, then run the review gate and fix until it scores 5 out of 5. A cap on rounds ends in the `stuck` state.
