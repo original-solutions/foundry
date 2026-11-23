@@ -2457,7 +2457,7 @@ mod tests {
         admit(&host, &revoked);
         host.revoke(revoked.me()).unwrap();
         let settings = settings_with(2, vec![], &[MachineId::random(), revoked.me(), host.me()]);
-        let mut saved = host.inner.changed.subscribe();
+        let saved = host.inner.changed.subscribe();
         // Any save would fail, and bump the signal when it did not.
         flaky.failing.store(true, Ordering::SeqCst);
 
