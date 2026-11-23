@@ -1481,6 +1481,8 @@ fn run_events_read_back_in_generation_order_whatever_the_versions_and_times() {
     assert_eq!(events[0].ms, 9_000);
 }
 
+// Pins the read order should the query plan change: the primary-key range read yields
+// `<run>/<owner>/<version>` in owner order by itself today.
 #[test]
 fn run_events_of_one_generation_and_version_come_back_in_owner_order() {
     let (_dir, mut store) = open();
@@ -1569,6 +1571,32 @@ fn runs_of_gives_each_run_of_the_repo_once_in_order() {
     assert_eq!(store.runs_of("rawphp/softfac").unwrap(), expected);
     assert_eq!(store.runs_of("RawPHP/SoftFac").unwrap(), expected);
     assert!(store.runs_of("rawphp/none").unwrap().is_empty());
+}
+
+#[test]
+fn runs_of_keeps_out_a_repo_whose_name_extends_the_one_asked_for() {
+    let (_dir, mut store) = open();
+    let owner = MachineId::random();
+    let mut version = 0;
+    let mut put = |store: &mut Store, run: &RunId| {
+        version += 1;
+        store
+            .apply_factory(&run_event(owner, version, run, 1, 1), owner)
+            .unwrap();
+    };
+    let plain = run_id("rawphp/softfac", 8, 1);
+    let own = run_id("rawphp/softfac__x", 1, 1);
+    // Its key, `rawphp__softfac__8__1__3__1`, reads like a run of `rawphp/softfac`.
+    let lookalike = run_id("rawphp/softfac__8__1", 3, 1);
+    for run in [&plain, &own, &lookalike] {
+        put(&mut store, run);
+    }
+    assert_eq!(store.runs_of("rawphp/softfac").unwrap(), vec![plain]);
+    assert_eq!(store.runs_of("rawphp/softfac__x").unwrap(), vec![own]);
+    assert_eq!(
+        store.runs_of("rawphp/softfac__8__1").unwrap(),
+        vec![lookalike]
+    );
 }
 
 #[test]
