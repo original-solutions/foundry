@@ -475,6 +475,104 @@ mod tests {
         assert!(nix::sys::signal::kill(Pid::from_raw(pid), None).is_err());
     }
 
+    /// The pid the script wrote to `file`, once it has.
+    fn pid_in(file: &Path) -> i32 {
+        let begun = Instant::now();
+        while begun.elapsed() < Duration::from_secs(10) {
+            if let Some(pid) = fs::read_to_string(file)
+                .ok()
+                .and_then(|text| text.trim().parse().ok())
+            {
+                return pid;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("no pid in {}", file.display());
+    }
+
+    /// Whether `pid` answers no signal within 5 seconds.
+    fn goes_away(pid: i32) -> bool {
+        let begun = Instant::now();
+        while nix::sys::signal::kill(Pid::from_raw(pid), None).is_ok()
+            && begun.elapsed() < Duration::from_secs(5)
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        nix::sys::signal::kill(Pid::from_raw(pid), None).is_err()
+    }
+
+    #[test]
+    fn a_descendant_holding_the_pipes_after_the_leader_exits_is_still_killed_at_30_seconds() {
+        let dir = tempfile::tempdir().unwrap();
+        let gpid_file = dir.path().join("gpid");
+        // The leader exits at once; the background sleep keeps stdout open.
+        let program = fake_gh(
+            dir.path(),
+            &format!(
+                "sleep 47.3191 &\necho $! > '{}'\nprintf ok",
+                gpid_file.display()
+            ),
+        );
+        let clock = Arc::new(FakeClock::new());
+        let gh = gh_at(&program, clock.clone());
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(gh.gh(&args(&["issue", "list", "--repo", "rawphp/softfac"])));
+        });
+        let gpid = pid_in(&gpid_file);
+
+        clock.advance(Duration::from_millis(29_999));
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "answered before 30 s on the clock"
+        );
+        clock.advance(Duration::from_millis(1));
+        let error = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("answered once 30 s passed on the clock")
+            .unwrap_err();
+        assert!(matches!(error, TrackerError::Timeout { .. }), "{error:?}");
+        assert!(goes_away(gpid), "the descendant outlived the call");
+    }
+
+    #[test]
+    fn the_command_sets_the_token_and_clears_every_other_source_of_credentials() {
+        let gh = Gh::new("rawphp", TOKEN, Arc::new(FakeClock::new()));
+        let command = gh.command(&args(&["api", "user"]));
+        let envs: std::collections::HashMap<_, _> = command
+            .get_envs()
+            .map(|(key, value)| (key.to_owned(), value.map(|v| v.to_owned())))
+            .collect();
+        let set = |name: &str| envs.get(std::ffi::OsStr::new(name)).cloned();
+        assert_eq!(set("GH_TOKEN"), Some(Some(TOKEN.into())));
+        assert_eq!(set("GH_PROMPT_DISABLED"), Some(Some("1".into())));
+        assert_eq!(set("GH_NO_UPDATE_NOTIFIER"), Some(Some("1".into())));
+        for removed in [
+            "GH_HOST",
+            "GH_ENTERPRISE_TOKEN",
+            "GITHUB_ENTERPRISE_TOKEN",
+            "GITHUB_TOKEN",
+        ] {
+            assert_eq!(set(removed), Some(None), "{removed} is not removed");
+        }
+    }
+
+    #[test]
+    fn an_empty_token_never_starts_gh() {
+        for token in ["", "  ", "\t\n"] {
+            let dir = tempfile::tempdir().unwrap();
+            let ran = dir.path().join("ran");
+            let program = fake_gh(dir.path(), &format!("touch '{}'", ran.display()));
+            let gh = Gh::new("rawphp", token, Arc::new(FakeClock::new())).with_program(&program);
+            let error = gh.gh(&args(&["api", "user"])).unwrap_err();
+            let TrackerError::Other(message) = error else {
+                panic!("not Other: {error:?}");
+            };
+            assert!(message.contains("no token for rawphp"), "{message}");
+            assert!(!ran.exists(), "gh ran with token {token:?}");
+        }
+    }
+
     #[test]
     fn a_gh_on_the_system_clock_answers_well_inside_the_limit() {
         let dir = tempfile::tempdir().unwrap();
