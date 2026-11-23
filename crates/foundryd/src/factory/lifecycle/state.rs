@@ -61,6 +61,12 @@ impl State {
         State::ALL.into_iter().find(|state| state.label() == label)
     }
 
+    /// The state for its name (exact, case-sensitive), e.g. `needs-info`, or `None` if it is
+    /// not one of the seven.
+    pub fn from_name(name: &str) -> Option<State> {
+        State::ALL.into_iter().find(|state| state.name() == name)
+    }
+
     /// The label's colour on GitHub: six lowercase hex digits without the `#`.
     pub fn color(self) -> &'static str {
         match self {
@@ -175,6 +181,28 @@ pub enum Action {
     MarkPrDraft { pr: u64 },
     PostGateResults { pr: u64 },
     PostUnapproved { reason: String },
+}
+
+impl Action {
+    /// The action's kebab-case name, as the runner names it.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Action::AssignToMachine => "assign-to-machine",
+            Action::Unassign => "unassign",
+            Action::SetLabel { .. } => "set-label",
+            Action::LaunchSession => "launch-session",
+            Action::UpdateStatusComment => "update-status-comment",
+            Action::PostQuestions { .. } => "post-questions",
+            Action::PostStuckComment { .. } => "post-stuck-comment",
+            Action::ForwardComment { .. } => "forward-comment",
+            Action::ForwardBodyEdit => "forward-body-edit",
+            Action::SendGateFailure { .. } => "send-gate-failure",
+            Action::MarkPrReady { .. } => "mark-pr-ready",
+            Action::MarkPrDraft { .. } => "mark-pr-draft",
+            Action::PostGateResults { .. } => "post-gate-results",
+            Action::PostUnapproved { .. } => "post-unapproved",
+        }
+    }
 }
 
 /// The failure of [`transition`]: the event is not valid in the current state.

@@ -35,26 +35,44 @@ fn is_word(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '-' || c == '_'
 }
 
-/// Where a URL ends: at whitespace, or at a character that closes or quotes it in prose or
-/// markdown.
-fn ends_url(c: char) -> bool {
-    c.is_whitespace()
+/// Whether `c` can be part of a URL as [`for_comment`] reads one: an ASCII letter or digit, or
+/// one of RFC 3986's other characters except the quotes, brackets and parentheses that close a
+/// URL in prose or markdown, and `,` and `;`, which end one in a list. Whitespace, controls,
+/// every non-ASCII character, `\` and `^` end a URL too, since no URL holds them.
+fn in_url(c: char) -> bool {
+    c.is_ascii_alphanumeric()
         || matches!(
             c,
-            '<' | '>' | '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | '|'
+            '-' | '.'
+                | '_'
+                | '~'
+                | ':'
+                | '/'
+                | '?'
+                | '#'
+                | '@'
+                | '!'
+                | '$'
+                | '&'
+                | '*'
+                | '+'
+                | '='
+                | '%'
         )
 }
 
-/// The length in bytes of the URL `text` starts with, or 0 when it does not start with one.
+/// The length in bytes of the URL `text` starts with: `http://` or `https://`, in any case,
+/// then every URL character up to the first that is not one. 0 when `text` does not start with
+/// a URL.
 fn url_len(text: &str) -> usize {
-    let lower = |prefix: &str| {
-        text.get(..prefix.len())
-            .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
-    };
-    if !(lower("https://") || lower("http://")) {
+    let Some(scheme) = ["https://", "http://"].into_iter().find(|scheme| {
+        text.get(..scheme.len())
+            .is_some_and(|start| start.eq_ignore_ascii_case(scheme))
+    }) else {
         return 0;
-    }
-    text.find(ends_url).unwrap_or(text.len())
+    };
+    let rest = &text[scheme.len()..];
+    scheme.len() + rest.find(|c| !in_url(c)).unwrap_or(rest.len())
 }
 
 fn push_word(out: &mut String, word: &str) {
@@ -67,42 +85,79 @@ fn push_word(out: &mut String, word: &str) {
     }
 }
 
-/// `text` as a comment the factory posts on GitHub may show it: every run of letters, digits,
-/// `-` and `_` that is at least 24 long and mixes letters and digits is hidden, as P1 hides
-/// them, except inside an `http://` or `https://` URL, which is kept whole. Keys, tokens,
-/// commit ids and hashes look like that; words, paths and pull request URLs do not. Known
-/// secrets are hidden before this, by `secrets::hide_known`.
-pub fn for_comment(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
+/// `text` with every run of letters, digits, `-` and `_` that is at least 24 long and mixes
+/// letters and digits hidden, and everything else as it is.
+fn push_hidden(out: &mut String, text: &str) {
     let mut word_start: Option<usize> = None;
-    let mut at = 0;
-    while at < text.len() {
-        let rest = &text[at..];
-        let url = url_len(rest);
-        if url > 0 {
-            if let Some(start) = word_start.take() {
-                push_word(&mut out, &text[start..at]);
-            }
-            out.push_str(&rest[..url]);
-            at += url;
-            continue;
-        }
-        let Some(c) = rest.chars().next() else {
-            break;
-        };
+    for (at, c) in text.char_indices() {
         if is_word(c) {
             word_start.get_or_insert(at);
         } else {
             if let Some(start) = word_start.take() {
-                push_word(&mut out, &text[start..at]);
+                push_word(out, &text[start..at]);
             }
             out.push(c);
         }
-        at += c.len_utf8();
     }
     if let Some(start) = word_start {
-        push_word(&mut out, &text[start..]);
+        push_word(out, &text[start..]);
     }
+}
+
+/// A URL as a comment may show it. Only the path and fragment of a `github.com` URL are kept
+/// whole: its pull request, commit and blob links hold long ids. Its userinfo is hidden as
+/// [`redact`](crate::secrets::redact) hides it. Its host, its query and every other host's path
+/// go through the word rule like the rest of the text, since a webhook, a signed link or an
+/// `?access_token=` carries its secret there.
+fn push_url(out: &mut String, url: &str) {
+    let scheme = url.find("://").map_or(0, |at| at + 3);
+    out.push_str(&url[..scheme]);
+    let rest = &url[scheme..];
+    let (authority, rest) = rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
+    let host = match authority.rfind('@') {
+        Some(at) => {
+            out.push_str("***@");
+            &authority[at + 1..]
+        }
+        None => authority,
+    };
+    push_hidden(out, host);
+    if !host.eq_ignore_ascii_case("github.com") {
+        push_hidden(out, rest);
+        return;
+    }
+    let (path, rest) = rest.split_at(rest.find(['?', '#']).unwrap_or(rest.len()));
+    out.push_str(path);
+    let (query, fragment) = rest.split_at(rest.find('#').unwrap_or(rest.len()));
+    push_hidden(out, query);
+    out.push_str(fragment);
+}
+
+/// `text` as a comment the factory posts on GitHub may show it: every run of letters, digits,
+/// `-` and `_` that is at least 24 long and mixes letters and digits is hidden, as P1 hides
+/// them, except inside the path or fragment of an `http://` or `https://` URL on `github.com`,
+/// which is kept whole. Keys, tokens, commit ids and hashes look like that; words, paths and
+/// pull request URLs do not. A URL ends at the first character no URL holds, and at `,` and `;`.
+///
+/// The caller hides the secrets it knows (held tokens, gateway keys, URL passwords) before
+/// this, and adds the factory's own markers, such as `<!-- foundry:claim <run id> <machine> -->`,
+/// after it: a run id and a machine id are token-shaped, and this would hide them.
+pub fn for_comment(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut plain = 0;
+    let mut at = 0;
+    while at < text.len() {
+        let url = url_len(&text[at..]);
+        if url > 0 {
+            push_hidden(&mut out, &text[plain..at]);
+            push_url(&mut out, &text[at..at + url]);
+            at += url;
+            plain = at;
+        } else {
+            at += text[at..].chars().next().map_or(1, char::len_utf8);
+        }
+    }
+    push_hidden(&mut out, &text[plain..]);
     out
 }
 
