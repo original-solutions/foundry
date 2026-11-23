@@ -5,7 +5,6 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-
 use foundryd::{daemon, dashboard, factory, join, secrets, service, status};
 
 #[derive(Parser)]
