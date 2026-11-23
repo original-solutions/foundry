@@ -1333,7 +1333,12 @@ fn factory_since_gives_one_owners_records_above_a_version_lowest_first_up_to_a_l
         store.factory_since(owner, 0, 10).unwrap(),
         vec![held(owner, 5, &["x"])]
     );
-    assert!(store.factory_since(owner, u64::MAX, 100).unwrap().is_empty());
+    assert!(
+        store
+            .factory_since(owner, u64::MAX, 100)
+            .unwrap()
+            .is_empty()
+    );
 
     let run = run_id("a/b", 1, 1);
     for version in [10, 8, 9, 7] {
@@ -1439,7 +1444,12 @@ fn p1_reads_never_return_or_count_a_factory_record() {
             .unwrap(),
         Applied::Stored
     );
-    assert!(!store.factory_since(factory_owner, 0, 10).unwrap().is_empty());
+    assert!(
+        !store
+            .factory_since(factory_owner, 0, 10)
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(store.since(owner, 0).unwrap(), before_since);
     assert!(store.since(factory_owner, 0).unwrap().is_empty());
     assert_eq!(store.versions().unwrap(), before_versions);
