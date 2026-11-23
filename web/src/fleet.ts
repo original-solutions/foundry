@@ -121,9 +121,11 @@ function actingMachine(priority: string[], online: string[]): string | undefined
  * else unknown. Once the machine list holds a machine, a machine it does not hold (a removed one)
  * has no workspaces, so none of its workspaces, terminals or sessions show anywhere; its card
  * stays, named by id with its last sample. Its records stay in the state. While the list is empty
- * (a lone machine that has not listed itself yet) nothing is hidden.
+ * (a lone machine that has not listed itself yet) nothing is hidden. The exception is `here`, the
+ * machine serving the page: its own records are always listed, under a card of its own, whatever
+ * the list holds, so a removed machine's UI still reaches its own sessions.
  */
-export function fleet(records: AnyRecord[], settings: SharedSettings, briefs: Briefs = {}, online?: string[]): MachineView[] {
+export function fleet(records: AnyRecord[], settings: SharedSettings, briefs: Briefs = {}, online?: string[], here?: string): MachineView[] {
   const machineNames = new Map<string, string>();
   const machineAddresses = new Map<string, string>();
   const listed: string[] = [];
@@ -178,6 +180,7 @@ export function fleet(records: AnyRecord[], settings: SharedSettings, briefs: Br
       }
       case "workspace": {
         if (!r.deleted) {
+          if (r.owner === here && !machineNames.has(here)) otherSet.add(here);
           let list = workspacesByOwner.get(r.owner);
           if (!list) {
             list = [];
@@ -235,7 +238,7 @@ export function fleet(records: AnyRecord[], settings: SharedSettings, briefs: Br
     acting: acting === undefined ? undefined : id === acting,
     status: online ? (online.includes(id) ? "online" : "offline") : (statusByOwner.get(id) ?? "unknown"),
     sample: samplesByOwner.get(id)?.body ?? null,
-    workspaces: (settings.machines.length > 0 && !machineNames.has(id) ? [] : (workspacesByOwner.get(id) ?? [])).map((w) => {
+    workspaces: (settings.machines.length > 0 && !machineNames.has(id) && id !== here ? [] : (workspacesByOwner.get(id) ?? [])).map((w) => {
       const mine = byOpening(sessionsByWorkspace.get(w.id) ?? [], (s) => s.terminal);
       const sessionNames = numbered(mine.map((s) => s.model));
       const shells = byOpening(shellsOf.get(w.id) ?? [], (t) => t.id);
