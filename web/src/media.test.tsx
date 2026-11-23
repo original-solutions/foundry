@@ -2,7 +2,7 @@ import { act, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { matches, MD, useMediaQuery } from "./media";
 
-/** A `matchMedia` whose answer for `query` is `on()`, counting the `change` listeners each query holds. */
+/** A `matchMedia` whose answer for `query` is `on()` (and `false` for any other), keeping the `change` listeners added through it. */
 function stubMedia(query: string, on: () => boolean) {
   const listeners = new Set<() => void>();
   const added = vi.fn((_: string, f: () => void) => listeners.add(f));
@@ -57,21 +57,25 @@ describe("matches", () => {
 describe("useMediaQuery", () => {
   for (const fallback of [true, false]) {
     describe(`with a fallback of ${fallback}`, () => {
-      it("answers the fallback and adds no listener when there is no matchMedia", () => {
+      it("answers the fallback when there is no matchMedia", () => {
         vi.stubGlobal("matchMedia", undefined);
         const { result } = renderHook(() => useMediaQuery(MD, fallback));
         expect(result.current).toBe(fallback);
       });
 
-      it("answers true when the query matches", () => {
+      it("answers true from its first render when the query matches", () => {
         stubMedia(MD, () => true);
-        const { result } = renderHook(() => useMediaQuery(MD, fallback));
+        const seen: boolean[] = [];
+        const { result } = renderHook(() => seen[seen.push(useMediaQuery(MD, fallback)) - 1]);
+        expect(seen[0]).toBe(true);
         expect(result.current).toBe(true);
       });
 
-      it("answers false when the query does not match", () => {
+      it("answers false from its first render when the query does not match", () => {
         stubMedia(MD, () => false);
-        const { result } = renderHook(() => useMediaQuery(MD, fallback));
+        const seen: boolean[] = [];
+        const { result } = renderHook(() => seen[seen.push(useMediaQuery(MD, fallback)) - 1]);
+        expect(seen[0]).toBe(false);
         expect(result.current).toBe(false);
       });
 
@@ -89,6 +93,15 @@ describe("useMediaQuery", () => {
       });
     });
   }
+
+  it("follows a new query when it is given one", () => {
+    const media = stubMedia(MD, () => true);
+    const { result, rerender } = renderHook(({ query }) => useMediaQuery(query, false), { initialProps: { query: "(pointer: coarse)" } });
+    expect(result.current).toBe(false);
+    rerender({ query: MD });
+    expect(result.current).toBe(true);
+    expect(media.listeners.size).toBe(1);
+  });
 
   it("listens for the query's change event and stops on unmount", () => {
     const media = stubMedia(MD, () => true);
