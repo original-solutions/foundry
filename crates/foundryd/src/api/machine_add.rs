@@ -568,10 +568,12 @@ mod tests {
 
             assert_eq!(status, 503, "{name:?} at {address}: {body}");
             assert!(error_of(&body).contains("build-box"), "{body}");
-            // Only a name clash has a way out: a rename keeps the address.
+            // A name clash is cleared by a rename, which keeps the address; an address clash by
+            // removing the machine that has it.
             let renames = error_of(&body).contains("rename that machine first");
             assert_eq!(renames, address != "100.64.0.9", "{body}");
-            assert!(!error_of(&body).contains("remove that"), "{body}");
+            let removes = error_of(&body).contains("remove that machine with Remove from fleet");
+            assert_eq!(removes, address == "100.64.0.9", "{body}");
             assert_eq!(served.held(joining.me()), None, "{name:?} at {address}");
             assert_eq!(served.keys.state(joining.me()), join::KeyState::NoKey);
         }

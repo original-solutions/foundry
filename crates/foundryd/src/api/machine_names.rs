@@ -897,10 +897,12 @@ mod tests {
         }
         assert_eq!(served.settings().machines.len(), 1);
 
-        // This copy does not hold the entry yet, as a forwarded edit's copy can lag its answer.
+        // This copy does not hold the entry yet, as a forwarded edit's copy can lag its answer:
+        // neither the entry nor the edit's stamp. A stamp with no entry is a removal.
         let mut lagging = served.settings();
         lagging.seq += 1;
         lagging.machines.clear();
+        lagging.stamps.clear();
         served
             .store
             .lock()
