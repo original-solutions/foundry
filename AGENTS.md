@@ -1,6 +1,6 @@
 # Foundry
 
-Read `docs/specs/P1-core.md` (what to build) and `docs/specs/P1-core-plan.md` (how it is cut) before changing code. The plan's "Global constraints" apply to every change.
+Read `docs/specs/P1-core.md` (what to build) and `docs/specs/P1-core-plan.md` (how it is cut) before changing code. For the factory, read `docs/specs/P2-factory.md` (what to build) and `docs/specs/P2-factory-plan.md` (how it is cut) beside them. Each plan's "Global constraints" apply to every change it covers.
 
 ## Rules for a build
 

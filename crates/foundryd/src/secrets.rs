@@ -253,6 +253,11 @@ pub fn set_command(name: &str) -> ExitCode {
     }
 }
 
+/// `foundryd github default <login>`. Not built yet: exits 2.
+pub fn github_default_command(_login: &str) -> ExitCode {
+    crate::not_built("github default")
+}
+
 /// Stores the first line of `input` as the secret `name`, without its line ending. Only the
 /// gateway secrets can be set: the name is checked before `input` is read, so any other name
 /// leaves the store untouched, and the machine's own identity and key table stay out of reach.
