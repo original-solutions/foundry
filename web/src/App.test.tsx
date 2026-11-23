@@ -708,7 +708,9 @@ describe("App", () => {
     expect(within(sidebar).queryByRole("group", { name: "still here" })).toBeNull();
 
     await act(async () => answer(json(200, { id: "c" })));
-    expect(await within(sidebar).findByRole("group", { name: "still here" })).toBeDefined();
+    const group = await within(sidebar).findByRole("group", { name: "still here" });
+    fireEvent.click(within(group).getByTitle("Unfold"));
+    expect(within(group).getByText("opus")).toBeDefined();
   });
 
   it("shows each machine online or offline by the machines the daemon hears, before any terminal", async () => {
