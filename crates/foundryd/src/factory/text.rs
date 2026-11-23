@@ -63,8 +63,8 @@ fn in_url(c: char) -> bool {
 }
 
 /// The length in bytes of the URL `text` starts with: `http://` or `https://`, in any case,
-/// then every URL character up to the first that is not one. 0 when `text` does not start with
-/// a URL.
+/// then every URL character up to the first that is not one, less the `.`, `:`, `!` and `?`
+/// that end a sentence after a link. 0 when `text` does not start with a URL.
 fn url_len(text: &str) -> usize {
     let Some(scheme) = ["https://", "http://"].into_iter().find(|scheme| {
         text.get(..scheme.len())
@@ -73,7 +73,8 @@ fn url_len(text: &str) -> usize {
         return 0;
     };
     let rest = &text[scheme.len()..];
-    scheme.len() + rest.find(|c| !in_url(c)).unwrap_or(rest.len())
+    let rest = &rest[..rest.find(|c| !in_url(c)).unwrap_or(rest.len())];
+    scheme.len() + rest.trim_end_matches(['.', ':', '!', '?']).len()
 }
 
 fn push_word(out: &mut String, word: &str) {
@@ -105,10 +106,10 @@ fn push_hidden(out: &mut String, text: &str) {
     }
 }
 
-/// The path segments a GitHub link puts a commit id after, as in `commit/<id>`, `blob/<id>/…`
-/// or `compare/<id>...<id>`.
-const GITHUB_COMMIT_AFTER: [&str; 7] = [
-    "commit", "commits", "blob", "tree", "blame", "raw", "compare",
+/// The path segments a GitHub link puts a commit id after, as in `commit/<id>`, `blob/<id>/…`,
+/// `pull/<n>/files/<id>` or `compare/<id>...<id>`.
+const GITHUB_COMMIT_AFTER: [&str; 8] = [
+    "commit", "commits", "blob", "tree", "blame", "raw", "files", "compare",
 ];
 
 /// The anchors a GitHub page links to that end in a number: an issue comment, a review comment
@@ -145,10 +146,25 @@ fn is_github_anchor(fragment: &str) -> bool {
     is_commit_id(id) && is_diff_lines(lines)
 }
 
+/// A path segment where a GitHub link puts a commit id: kept whole when it is one, alone or as
+/// a `.patch` or `.diff` of it, and through the word rule otherwise.
+fn push_commit(out: &mut String, segment: &str) {
+    let id = segment
+        .strip_suffix(".patch")
+        .or_else(|| segment.strip_suffix(".diff"))
+        .unwrap_or(segment);
+    if is_commit_id(id) {
+        out.push_str(segment);
+    } else {
+        push_hidden(out, segment);
+    }
+}
+
 /// The path, query and fragment of a `github.com` URL as a comment may show them. A commit id
-/// is kept whole only as the whole path segment after one of [`GITHUB_COMMIT_AFTER`], or as
-/// one side of a compare's `...`; a fragment only when the whole of it is a GitHub anchor.
-/// Everything else, the query included, goes through the word rule.
+/// is kept whole only as the path segment after one of [`GITHUB_COMMIT_AFTER`] ([`push_commit`]),
+/// or as one side of a compare's `...` or `..`; a fragment only when the whole of it is a GitHub
+/// anchor ([`is_github_anchor`]). Everything else, the owner, the repo, branch and file names
+/// and the query included, goes through the word rule.
 fn push_github(out: &mut String, rest: &str) {
     let (path, rest) = rest.split_at(rest.find(['?', '#']).unwrap_or(rest.len()));
     let mut after = "";
@@ -157,15 +173,20 @@ fn push_github(out: &mut String, rest: &str) {
             out.push('/');
         }
         if GITHUB_COMMIT_AFTER.contains(&after) {
-            for (n, side) in segment.split("...").enumerate() {
-                if n > 0 {
-                    out.push_str("...");
+            let compare = (after == "compare")
+                .then(|| {
+                    segment
+                        .split_once("...")
+                        .or_else(|| segment.split_once(".."))
+                })
+                .flatten();
+            match compare {
+                Some((base, head)) => {
+                    push_commit(out, base);
+                    out.push_str(&segment[base.len()..segment.len() - head.len()]);
+                    push_commit(out, head);
                 }
-                if is_commit_id(side) {
-                    out.push_str(side);
-                } else {
-                    push_hidden(out, side);
-                }
+                None => push_commit(out, segment),
             }
         } else {
             push_hidden(out, segment);
@@ -187,7 +208,7 @@ fn push_github(out: &mut String, rest: &str) {
 /// A URL, its userinfo already hidden by [`redact`](crate::secrets::redact), as a comment may
 /// show it. Every part goes through the word rule like the rest of the text, since a webhook,
 /// a signed link or an `?access_token=` carries its secret there. Only a `github.com` URL keeps
-/// the ids its commit, blob, compare and review links hold ([`push_github`]).
+/// the commit ids and anchors its links hold ([`push_github`]).
 fn push_url(out: &mut String, url: &str) {
     let scheme = url.find("://").map_or(0, |at| at + 3);
     out.push_str(&url[..scheme]);
@@ -208,10 +229,12 @@ fn push_url(out: &mut String, url: &str) {
 /// `-` and `_` that is at least 24 long and mixes letters and digits is hidden, as P1 hides
 /// them. Keys, tokens, commit ids and hashes look like that; words and paths do not. Inside an
 /// `http://` or `https://` URL the same holds, except that a `github.com` URL keeps a commit id
-/// where its commit, blob, tree and compare links put one, and an anchor its review and diff
-/// links end in, so those links come through whole. A URL's userinfo is hidden as
+/// where a link puts one ([`GITHUB_COMMIT_AFTER`]) and an anchor a review, comment or diff link
+/// ends in ([`is_github_anchor`]). So a pull request, commit, blob or review link comes through
+/// whole unless its owner, repo, branch or file name has a word of 24 or more mixed letters and
+/// digits, which is then hidden. A URL's userinfo is hidden as
 /// [`redact`](crate::secrets::redact) hides it. A URL ends at the first character no URL holds,
-/// and at `,` and `;`.
+/// at `,` and `;`, and before the `.`, `:`, `!` or `?` that ends a sentence after it.
 ///
 /// The caller hides the secrets it knows (held tokens, gateway keys, URL passwords) before
 /// this, and adds the factory's own markers, such as `<!-- foundry:claim <run id> <machine> -->`,
