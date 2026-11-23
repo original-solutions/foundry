@@ -104,13 +104,13 @@ export interface MachineView {
 export function coordinatorOrder(priority: string[], listed: string[]): string[] {
   const held = new Set(listed);
   const first = priority.filter((id, i) => held.has(id) && priority.indexOf(id) === i);
-  const rest = listed.filter((id) => !first.includes(id)).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  const rest = listed.filter((id) => !first.includes(id)).sort();
   return [...first, ...rest];
 }
 
 /** The machine that holds the coordinator role, as `coordinator::acting` picks it. */
 function actingMachine(priority: string[], online: string[]): string | undefined {
-  return priority.find((id) => online.includes(id)) ?? [...online].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))[0] ?? priority[0];
+  return priority.find((id) => online.includes(id)) ?? [...online].sort()[0] ?? priority[0];
 }
 
 /**

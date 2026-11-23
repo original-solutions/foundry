@@ -82,8 +82,13 @@ export function Machines({ machines, history, here, connected }: Props) {
             machine={machine}
             order={order}
             moving={move.isPending}
-            onMove={(next) => move.mutate(next)} points={history[machine.id]?.points ?? []}
-            heard={history[machine.id]?.heard} here={machine.id === here} known={here !== undefined} now={now} />
+            onMove={(next) => move.mutate(next)}
+            points={history[machine.id]?.points ?? []}
+            heard={history[machine.id]?.heard}
+            here={machine.id === here}
+            known={here !== undefined}
+            now={now}
+          />
         ))}
       </div>
     </section>
