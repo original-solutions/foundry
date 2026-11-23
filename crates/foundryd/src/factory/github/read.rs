@@ -5811,6 +5811,21 @@ mod tests {
         assert_eq!(ids_of(&activity_of(&fake, &["tom"])), vec!["3"]);
     }
 
+    // The runner's case; the second body is Foundry's own claim marker.
+    #[test]
+    fn a_claim_comment_by_an_instructor_is_never_read_as_feedback() {
+        for body in [
+            "Claimed by machine trilogy-mac.\n\n<!-- softfac:claim trilogy-mac -->",
+            "Claimed by machine mac-1.\n\n<!-- foundry:claim owner__repo__6__1 mac-1 -->",
+        ] {
+            let fake = answering(&[
+                rest_reply(&[rest_node(7, Some("tom"), LATER, body)]),
+                activity_body_reply("b", None),
+            ]);
+            assert_eq!(activity_of(&fake, &["tom"]).comments, vec![], "{body}");
+        }
+    }
+
     #[test]
     fn activity_ignores_deleted_authors_and_lists_the_comments_oldest_first() {
         let fake = answering(&[
@@ -6897,6 +6912,28 @@ mod tests {
                     "rawphp",
                 ),
             ],
+        ));
+        assert_eq!(got, vec![]);
+    }
+
+    #[test]
+    fn a_comment_with_foundrys_marker_is_never_feedback() {
+        let marker = "<!-- foundry:claim owner__repo__6__1 mac-1 -->";
+        let got = read_feedback(&feedback_reply(
+            &[review_node(
+                11,
+                "COMMENTED",
+                &format!("ok {marker}"),
+                Some("2026-10-04T11:00:00Z"),
+                "rawphp",
+                &[],
+            )],
+            &[pr_comment_node(
+                21,
+                &format!("claimed\n\n{marker}"),
+                "2026-10-04T11:00:00Z",
+                "rawphp",
+            )],
         ));
         assert_eq!(got, vec![]);
     }
