@@ -14,6 +14,7 @@
 use super::lifecycle::State;
 use super::lifecycle::approval::{Refusal, unapproved_comment};
 use super::text::{command_line, sanitize, short_sha, tail};
+use foundry_proto::factory::RunId;
 
 /// A typed line is shorter than this many characters: Claude Code wraps a longer paste in
 /// `<pasted_content>` tags, and the line would not start with `/factory-build` (F12).
@@ -286,14 +287,14 @@ pub fn session_may_exist_note(what: &str, command_id: &str) -> String {
 pub const WRONG_ACCOUNT_PREFIX: &str = "the session's gh account is ";
 
 /// What a resumed launch continues from. The worktree is made from `branch`. `TimeLimit` and
-/// `Interrupted` continue an earlier run (`run`, its id as the ledger spells it); `ExistingPr`
+/// `Interrupted` continue an earlier run (`run`); `ExistingPr`
 /// continues the open pull request at `pr_url` that an earlier attempt opened. A feedback round
 /// and a failed re-gate continue the run's own pull request with text of their own below, so
 /// they have their own messages, [`feedback`] and [`regate`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ResumeFrom {
-    TimeLimit { run: String, branch: String },
-    Interrupted { run: String, branch: String },
+    TimeLimit { run: RunId, branch: String },
+    Interrupted { run: RunId, branch: String },
     ExistingPr { branch: String, pr_url: String },
 }
 
@@ -953,7 +954,6 @@ mod tests {
     use super::*;
     use crate::factory::lifecycle::State;
     use crate::factory::lifecycle::approval::{Refusal, unapproved_comment};
-    use foundry_proto::factory::RunId;
 
     const PATH: &str = "/var/lib/foundry/sessions/s1/message-1.md";
 
