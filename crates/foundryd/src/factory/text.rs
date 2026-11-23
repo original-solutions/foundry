@@ -1,1 +1,1022 @@
 //! Cutting a tail, and hiding secrets in a comment.
+//!
+//! Also the rest of the runner's `src/text.ts`: text from a session, a config or a repo, made
+//! safe to store and to show.
+
+use ring::digest;
+
+use crate::secrets::redact;
+use crate::sessions::brief::tokens_hidden;
+
+/// The longest command shown in a gate message or a results table, in characters.
+const MAX_COMMAND_CHARS: usize = 300;
+
+/// The last `max_chars` characters of `text`, cut on a character boundary: the whole text when
+/// it is no longer than that.
+pub fn tail(text: &str, max_chars: usize) -> &str {
+    if max_chars == 0 {
+        return "";
+    }
+    match text.char_indices().rev().nth(max_chars - 1) {
+        Some((at, _)) => &text[at..],
+        None => text,
+    }
+}
+
+/// The milliseconds from `from_ms` to `to_ms`, never negative: a clock that stepped back
+/// counts 0, not a negative span.
+pub fn elapsed_ms(from_ms: u64, to_ms: u64) -> u64 {
+    to_ms.saturating_sub(from_ms)
+}
+
+/// Whether `c` can be part of a URL as [`for_comment`] reads one: an ASCII letter or digit, or
+/// one of RFC 3986's other characters except the quotes, brackets and parentheses that close a
+/// URL in prose or markdown, and `,` and `;`, which end one in a list. Whitespace, controls,
+/// every non-ASCII character, `\` and `^` end a URL too, since no URL holds them.
+fn in_url(c: char) -> bool {
+    c.is_ascii_alphanumeric()
+        || matches!(
+            c,
+            '-' | '.'
+                | '_'
+                | '~'
+                | ':'
+                | '/'
+                | '?'
+                | '#'
+                | '@'
+                | '!'
+                | '$'
+                | '&'
+                | '*'
+                | '+'
+                | '='
+                | '%'
+        )
+}
+
+/// The length in bytes of the URL `text` starts with: `http://` or `https://`, in any case,
+/// then every URL character up to the first that is not one, less the `.`, `:`, `!` and `?`
+/// that end a sentence after a link. 0 when `text` does not start with a URL.
+fn url_len(text: &str) -> usize {
+    let Some(scheme) = ["https://", "http://"].into_iter().find(|scheme| {
+        text.get(..scheme.len())
+            .is_some_and(|start| start.eq_ignore_ascii_case(scheme))
+    }) else {
+        return 0;
+    };
+    let rest = &text[scheme.len()..];
+    let rest = &rest[..rest.find(|c| !in_url(c)).unwrap_or(rest.len())];
+    scheme.len() + rest.trim_end_matches(['.', ':', '!', '?']).len()
+}
+
+/// `text` with every run of letters, digits, `-` and `_` that is at least 24 long and mixes
+/// letters and digits hidden, and everything else as it is: the one word rule P1 hides a
+/// session's brief with ([`tokens_hidden`]), so a brief and a comment hide the same words.
+fn push_hidden(out: &mut String, text: &str) {
+    out.push_str(&tokens_hidden(text));
+}
+
+/// The anchors a GitHub page links to that end in a number: an issue comment, a review comment
+/// and a review.
+const GITHUB_NUMBERED_ANCHORS: [&str; 3] = ["issuecomment-", "discussion_r", "pullrequestreview-"];
+
+fn is_number(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Whether `lines` is empty or a line of a diff, `L12` or `R12`, or a range of them, `L3-R20`.
+fn is_diff_lines(lines: &str) -> bool {
+    let line = |line: &str| line.strip_prefix(['L', 'R']).is_some_and(is_number);
+    lines.is_empty()
+        || match lines.split_once('-') {
+            Some((from, to)) => line(from) && line(to),
+            None => line(lines),
+        }
+}
+
+/// Whether the whole of `fragment`, after its `#`, is an anchor a GitHub page links to: a
+/// numbered comment or review, or a file of a diff, `diff-<id>`, with an optional line.
+fn is_github_anchor(fragment: &str) -> bool {
+    if let Some(number) = GITHUB_NUMBERED_ANCHORS
+        .iter()
+        .find_map(|name| fragment.strip_prefix(name))
+    {
+        return is_number(number);
+    }
+    let Some(diff) = fragment.strip_prefix("diff-") else {
+        return false;
+    };
+    let (id, lines) = diff.split_at(diff.find(['L', 'R']).unwrap_or(diff.len()));
+    is_commit_id(id) && is_diff_lines(lines)
+}
+
+/// Where a `github.com` link's path puts a commit id: the index of that segment, counting the
+/// empty one before the first `/`, and whether it can hold a range, `<id>...<id>` or
+/// `<id>..<id>`. After the owner and the repo: `commit/<id>`, `commits/<id>`, `blob/<id>/…`,
+/// `tree/<id>/…`, `blame/<id>/…`, `raw/<id>/…` and `compare/<range>`. After a pull request's
+/// number: `commits/<id>` and `files/<range>`. No other segment holds one.
+fn github_commit_place(segments: &[&str]) -> Option<(usize, bool)> {
+    match segments.get(3..)? {
+        ["commit" | "commits" | "blob" | "tree" | "blame" | "raw", ..] => Some((4, false)),
+        ["compare", ..] => Some((4, true)),
+        ["pull", number, "commits", ..] if is_number(number) => Some((6, false)),
+        ["pull", number, "files", ..] if is_number(number) => Some((6, true)),
+        _ => None,
+    }
+}
+
+/// A path segment where a GitHub link puts a commit id: kept whole when it is one, alone or as
+/// a `.patch` or `.diff` of it, and through the word rule otherwise.
+fn push_commit(out: &mut String, segment: &str) {
+    let id = segment
+        .strip_suffix(".patch")
+        .or_else(|| segment.strip_suffix(".diff"))
+        .unwrap_or(segment);
+    if is_commit_id(id) {
+        out.push_str(segment);
+    } else {
+        push_hidden(out, segment);
+    }
+}
+
+/// The path, query and fragment of a `github.com` URL as a comment may show them. A commit id
+/// is kept whole only in the one segment where the link's shape puts one
+/// ([`github_commit_place`]), alone or as one side of a range; a fragment only when the whole
+/// of it is a GitHub anchor ([`is_github_anchor`]). Every other word, the owner, the repo,
+/// branch and file names and the query included, goes through the word rule.
+fn push_github(out: &mut String, rest: &str) {
+    let (path, rest) = rest.split_at(rest.find(['?', '#']).unwrap_or(rest.len()));
+    let segments: Vec<&str> = path.split('/').collect();
+    let place = github_commit_place(&segments);
+    for (n, segment) in segments.into_iter().enumerate() {
+        if n > 0 {
+            out.push('/');
+        }
+        let range = match place {
+            Some((at, range)) if at == n => range,
+            _ => {
+                push_hidden(out, segment);
+                continue;
+            }
+        };
+        let sides = range
+            .then(|| {
+                segment
+                    .split_once("...")
+                    .or_else(|| segment.split_once(".."))
+            })
+            .flatten();
+        match sides {
+            Some((base, head)) => {
+                push_commit(out, base);
+                out.push_str(&segment[base.len()..segment.len() - head.len()]);
+                push_commit(out, head);
+            }
+            None => push_commit(out, segment),
+        }
+    }
+    let (query, fragment) = rest.split_at(rest.find('#').unwrap_or(rest.len()));
+    push_hidden(out, query);
+    if let Some(anchor) = fragment.strip_prefix('#') {
+        out.push('#');
+        if is_github_anchor(anchor) {
+            out.push_str(anchor);
+        } else {
+            push_hidden(out, anchor);
+        }
+    }
+}
+
+/// A URL, its userinfo already hidden ([`hide_userinfo`]), as a comment may show it. Every
+/// part goes through the word rule like the rest of the text, since a webhook, a signed link or
+/// an `?access_token=` carries its secret there. Only a `github.com` URL keeps the commit ids
+/// and anchors its links hold ([`push_github`]).
+fn push_url(out: &mut String, url: &str) {
+    let scheme = url.find("://").map_or(0, |at| at + 3);
+    out.push_str(&url[..scheme]);
+    let rest = &url[scheme..];
+    let (authority, rest) = rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
+    let host = authority.rfind('@').map_or(0, |at| at + 1);
+    let (userinfo, host) = authority.split_at(host);
+    push_hidden(out, userinfo);
+    push_hidden(out, host);
+    if host.eq_ignore_ascii_case("github.com") {
+        push_github(out, rest);
+    } else {
+        push_hidden(out, rest);
+    }
+}
+
+/// `text` as a comment the factory posts on GitHub may show it: every run of letters, digits,
+/// `-` and `_` that is at least 24 long and mixes letters and digits is hidden, as P1 hides
+/// them. Keys, tokens, commit ids and hashes look like that; words and paths do not. Inside an
+/// `http://` or `https://` URL the same holds. The only such word a comment keeps is a commit
+/// id or a comment, review or diff anchor in a `github.com` link, at the place GitHub's own
+/// links put one ([`github_commit_place`], [`is_github_anchor`]). So a pull request, commit,
+/// blob or review link comes through whole unless its owner, repo, branch or file name has a
+/// word of 24 or more mixed letters and digits, which is then hidden. Every URL's user and
+/// password are hidden first, as [`redact`] hides them and then up to the last `@` before the
+/// authority's end ([`hide_userinfo`]), so a comment hides all `redact` hides and more. A URL
+/// ends at the first character no URL holds, at `,` and `;`, and before the `.`, `:`, `!` or
+/// `?` that ends a sentence after it.
+///
+/// The caller hides the secrets it knows (held tokens, gateway keys, URL passwords) before
+/// this, and adds the factory's own markers, such as `<!-- foundry:claim <run id> <machine> -->`,
+/// after it: a run id and a machine id are token-shaped, and this would hide them.
+pub fn for_comment(text: &str) -> String {
+    // P1's rule first, so whatever it learns to hide a comment hides too; then the wider end.
+    let text = &hide_userinfo(&redact(text));
+    let mut out = String::with_capacity(text.len());
+    let mut plain = 0;
+    let mut at = 0;
+    while at < text.len() {
+        let url = url_len(&text[at..]);
+        if url > 0 {
+            push_hidden(&mut out, &text[plain..at]);
+            push_url(&mut out, &text[at..at + url]);
+            at += url;
+            plain = at;
+        } else {
+            at += text[at..].chars().next().map_or(1, char::len_utf8);
+        }
+    }
+    push_hidden(&mut out, &text[plain..]);
+    out
+}
+
+/// `text` with the user and password of every URL hidden, `scheme://user:pass@host` shown as
+/// `scheme://***@host`, as [`redact`] hides them. Here the authority
+/// runs from `://` to the first `/`, `?`, `#` or whitespace, whatever comes before it, so a
+/// password that holds a quote, a `,` or a `;`, where a URL ends in prose, is hidden whole.
+fn hide_userinfo(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("://") {
+        let (before, after) = rest.split_at(at + 3);
+        out.push_str(before);
+        let end = after
+            .find(|c: char| matches!(c, '/' | '?' | '#') || c.is_whitespace())
+            .unwrap_or(after.len());
+        let host = after[..end].rfind('@').map_or(0, |user_end| {
+            out.push_str("***");
+            user_end
+        });
+        out.push_str(&after[host..end]);
+        rest = &after[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn is_control(c: char) -> bool {
+    let cp = u32::from(c);
+    cp <= 0x1f || (0x7f..=0x9f).contains(&cp)
+}
+
+/// Characters that could fake a line break or hide text, besides the control characters.
+fn is_invisible_or_separator(c: char) -> bool {
+    matches!(
+        u32::from(c),
+        0x2028 | 0x2029 | 0x200b..=0x200f | 0x202a..=0x202e | 0x2066..=0x2069 | 0xfeff
+    )
+}
+
+/// `text` with what could fake a line break, hide text or drive a terminal replaced with a
+/// space. Newline and tab are kept only when `keep_layout` is set.
+pub fn sanitize(text: &str, keep_layout: bool) -> String {
+    text.chars()
+        .map(|c| {
+            let layout = c == '\n' || c == '\t';
+            if (is_control(c) && !(keep_layout && layout)) || is_invisible_or_separator(c) {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// A command as one short line: sanitised, newlines and tabs turned into spaces, cut at 300
+/// characters.
+pub fn command_line(command: &str) -> String {
+    let clean = sanitize(command, false);
+    match clean.char_indices().nth(MAX_COMMAND_CHARS) {
+        Some((at, _)) => format!("{}\u{2026}", &clean[..at]),
+        None => clean,
+    }
+}
+
+/// The first seven hex digits of a commit id, as the words for people and the session name it.
+pub fn short_sha(sha: &str) -> String {
+    sha.chars()
+        .filter(char::is_ascii_hexdigit)
+        .take(7)
+        .collect()
+}
+
+/// Whether `text` is a full commit id: 40 hex digits (64 in a SHA-256 repo).
+pub fn is_commit_id(text: &str) -> bool {
+    matches!(text.len(), 40 | 64) && text.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// The sha256 of `text`, as lowercase hex.
+pub fn sha256(text: &str) -> String {
+    digest::digest(&digest::SHA256, text.as_bytes())
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sessions::brief::HIDDEN;
+
+    const KEY: &str = "sk9AbC3dEf5GhI7jKl1MnO2pQr4StU"; // 30 mixed letters and digits
+
+    #[test]
+    fn tail_keeps_the_last_characters() {
+        assert_eq!(tail("abcdef", 3), "def");
+        assert_eq!(tail("abc", 3), "abc");
+        assert_eq!(tail("ab", 3), "ab");
+        assert_eq!(tail("", 3), "");
+        assert_eq!(tail("abc", 0), "");
+    }
+
+    #[test]
+    fn tail_cuts_on_a_character_boundary() {
+        // Each of these is more than one byte: the cut counts characters, never bytes.
+        assert_eq!(tail("a€bé✓", 3), "bé✓");
+        assert_eq!(tail("€€€€", 2), "€€");
+        assert_eq!(tail("x🦀", 1), "🦀");
+        assert_eq!(tail("😀😀", 5), "😀😀");
+    }
+
+    #[test]
+    fn tail_of_megabytes_keeps_exactly_the_last_characters() {
+        let text = "é".repeat(3_000_000);
+        let cut = tail(&text, 20_000);
+        assert_eq!(cut.chars().count(), 20_000);
+        assert!(text.ends_with(cut));
+    }
+
+    #[test]
+    fn for_comment_hides_a_30_character_key() {
+        assert_eq!(KEY.len(), 30);
+        let text = format!("the key is {KEY}, from .env");
+        let shown = for_comment(&text);
+        assert!(!shown.contains(KEY), "{shown}");
+        assert_eq!(shown, "the key is •••, from .env");
+    }
+
+    #[test]
+    fn for_comment_keeps_a_pull_request_url_whole() {
+        let text = "Opened https://github.com/o/r/pull/123 for it.";
+        assert_eq!(for_comment(text), text);
+    }
+
+    #[test]
+    fn for_comment_keeps_a_url_with_a_long_path_whole() {
+        let url = "https://github.com/original-solutions/foundry/blob/0123456789abcdef0123456789abcdef01234567/crates/foundryd/src/factory/text.rs#L12";
+        let text = format!("See {url}\nand {KEY}");
+        assert_eq!(for_comment(&text), format!("See {url}\nand •••"));
+        let upper = "HTTPS://GitHub.com/o/r/commit/0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(for_comment(upper), upper);
+    }
+
+    #[test]
+    fn for_comment_keeps_the_ids_a_github_link_holds() {
+        let sha256 = "0123456789abcdef".repeat(4);
+        for url in [
+            "https://github.com/o/r/pull/123#discussion_r1234567890123".to_string(),
+            "https://github.com/o/r/pull/123#issuecomment-71015707501234".to_string(),
+            "https://github.com/o/r/pull/123#pullrequestreview-12345678901234".to_string(),
+            format!("https://github.com/o/r/pull/123/files#diff-{sha256}"),
+            format!("https://github.com/o/r/pull/123/files#diff-{sha256}R12"),
+            format!("https://github.com/o/r/pull/123/files#diff-{sha256}L3-R20"),
+            format!(
+                "https://github.com/o/r/pull/123/files#diff-{}",
+                "abcdef0123456789".repeat(4)
+            ),
+            "https://github.com/o/r/compare/0123456789abcdef0123456789abcdef01234567...main"
+                .to_string(),
+            "https://github.com/o/r/commit/abcdef0123456789abcdef0123456789abcdef01".to_string(),
+            "https://github.com/o/r/pull/1/commits/abcdef0123456789abcdef0123456789abcdef01"
+                .to_string(),
+            "https://github.com/o/r/blame/0123456789abcdef0123456789abcdef01234567/a.rs#L3-L9"
+                .to_string(),
+            format!("https://github.com/o/r/tree/{sha256}/docs"),
+            "https://github.com/o/r/raw/0123456789abcdef0123456789abcdef01234567/a.rs".to_string(),
+            "https://github.com/o/r/compare/0123456789abcdef0123456789abcdef01234567..abcdef0123456789abcdef0123456789abcdef01".to_string(),
+            "https://github.com/o/r/commit/0123456789abcdef0123456789abcdef01234567.patch"
+                .to_string(),
+            "https://github.com/o/r/commit/0123456789abcdef0123456789abcdef01234567.diff"
+                .to_string(),
+            "https://github.com/o/r/pull/12/files/0123456789abcdef0123456789abcdef01234567"
+                .to_string(),
+        ] {
+            assert_eq!(for_comment(&url), url);
+        }
+    }
+
+    #[test]
+    fn for_comment_leaves_sentence_punctuation_after_a_github_link_out_of_it() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let sha256 = "0123456789abcdef".repeat(4);
+        for end in [".", ":", "!", "?", "...", ".)"] {
+            for text in [
+                format!("Pushed https://github.com/o/r/commit/{sha}{end}"),
+                format!("See https://github.com/o/r/pull/1/files#diff-{sha256}{end}"),
+            ] {
+                assert_eq!(for_comment(&text), text);
+            }
+        }
+    }
+
+    #[test]
+    fn for_comment_hides_a_key_glued_to_a_github_link_by_url_characters() {
+        for (text, shown) in [
+            (
+                "curl -d \"pr=https://github.com/o/r/pull/1&token=KEY\"",
+                "curl -d \"pr=https://github.com/o/r/pull/1&token=•••\"",
+            ),
+            (
+                "https://github.com/o/r/pull/1&access_token=KEY",
+                "https://github.com/o/r/pull/1&access_token=•••",
+            ),
+            (
+                "repo=https://github.com/o/r&api_key=KEY",
+                "repo=https://github.com/o/r&api_key=•••",
+            ),
+            (
+                "https://github.com/o/r/pull/1https://hooks.slack.com/services/T0/B0/KEY",
+                "https://github.com/o/r/pull/1https://hooks.slack.com/services/T0/B0/•••",
+            ),
+            (
+                "https://github.com/o/r/pull/1%0AGH_TOKEN%3DKEY",
+                "https://github.com/o/r/pull/1%0AGH_TOKEN%•••",
+            ),
+            (
+                "https://github.com/o/r/pull/1#access_token=KEY",
+                "https://github.com/o/r/pull/1#access_token=•••",
+            ),
+            (
+                "https://github.com/o/r/pull/1.KEY",
+                "https://github.com/o/r/pull/1.•••",
+            ),
+            (
+                "https://github.com/o/r/pull/1/KEY",
+                "https://github.com/o/r/pull/1/•••",
+            ),
+            (
+                "https://github.com/o/r/pull/1#ghp_AbCdEf0123456789AbCdEf0123456789",
+                "https://github.com/o/r/pull/1#•••",
+            ),
+        ] {
+            assert_eq!(for_comment(&text.replace("KEY", KEY)), shown, "{text}");
+        }
+    }
+
+    #[test]
+    fn for_comment_hides_a_hex_key_in_a_github_link_where_no_commit_id_goes() {
+        let hex40 = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b";
+        let hex64 = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+        for hex in [hex40, hex64] {
+            for (text, shown) in [
+                (
+                    "https://github.com/o/r/pull/1?access_token=HEX",
+                    "https://github.com/o/r/pull/1?access_token=•••",
+                ),
+                (
+                    "curl -d \"pr=https://github.com/o/r/pull/1&dd_app_key=HEX\"",
+                    "curl -d \"pr=https://github.com/o/r/pull/1&dd_app_key=•••\"",
+                ),
+                (
+                    "https://github.com/o/r/pull/1#secret=HEX",
+                    "https://github.com/o/r/pull/1#secret=•••",
+                ),
+                (
+                    "https://github.com/o/r/pull/1.HEX",
+                    "https://github.com/o/r/pull/1.•••",
+                ),
+                (
+                    "https://github.com/o/r/pull/1/HEX",
+                    "https://github.com/o/r/pull/1/•••",
+                ),
+                (
+                    "https://github.com/o/r/pull/1https://hooks.example.com/x/HEX",
+                    "https://github.com/o/r/pull/1https://hooks.example.com/x/•••",
+                ),
+                (
+                    "https://github.com/o/r/pull/1?x=HEXL12",
+                    "https://github.com/o/r/pull/1?x=•••",
+                ),
+                (
+                    "https://github.com/o/r/commit/HEX&token=HEX",
+                    "https://github.com/o/r/commit/•••&token=•••",
+                ),
+                (
+                    "https://github.com/o/r/commit/tokenHEX",
+                    "https://github.com/o/r/commit/•••",
+                ),
+                (
+                    "https://github.com/o/r/pull/1#HEX",
+                    "https://github.com/o/r/pull/1#•••",
+                ),
+            ] {
+                assert_eq!(for_comment(&text.replace("HEX", hex)), shown, "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn for_comment_keeps_only_whole_github_anchors_and_commit_ids() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let hex32 = "0123456789abcdef".repeat(2);
+        for (text, shown) in [
+            (
+                format!("https://github.com/o/r/commit/{hex32}"),
+                "https://github.com/o/r/commit/•••",
+            ),
+            (
+                format!("https://github.com/o/r/pull/1#diff-{sha}L3-{KEY}"),
+                "https://github.com/o/r/pull/1#•••",
+            ),
+            (
+                format!("https://github.com/o/r/pull/1#diff-{sha}L{KEY}-R20"),
+                "https://github.com/o/r/pull/1#•••",
+            ),
+            (
+                format!("https://github.com/o/r/pull/1#diff-{sha}L3-R"),
+                "https://github.com/o/r/pull/1#•••",
+            ),
+            (
+                format!("https://github.com/o/r/commit/{sha}...{sha}"),
+                "https://github.com/o/r/commit/•••...•••",
+            ),
+            (
+                format!("https://github.com/o/r/commit/{sha}.exe"),
+                "https://github.com/o/r/commit/•••.exe",
+            ),
+            (
+                format!("https://github.com/o/r/pull/1#diff-{sha}R"),
+                "https://github.com/o/r/pull/1#•••",
+            ),
+            (
+                format!("https://github.com/o/r/pull/1#diff-{sha}X12"),
+                "https://github.com/o/r/pull/1#•••",
+            ),
+            (
+                format!("https://github.com/o/r/pull/1#diff-{hex32}"),
+                "https://github.com/o/r/pull/1#•••",
+            ),
+            (
+                "https://github.com/o/r/pull/1#ABCDEFGHIJKLMNOPQRSTUVWL123".to_string(),
+                "https://github.com/o/r/pull/1#•••",
+            ),
+            (
+                "https://github.com/o/r/pull/1#issuecomment-1234567890abcdefghijk".to_string(),
+                "https://github.com/o/r/pull/1#•••",
+            ),
+            (
+                format!("https://github.com/o/r/pull/1#issuecomment-{sha}x"),
+                "https://github.com/o/r/pull/1#•••",
+            ),
+            (
+                format!("https://github.com/o/r/pull/1#discussion_r1&{KEY}"),
+                "https://github.com/o/r/pull/1#discussion_r1&•••",
+            ),
+            (
+                format!("https://github.com/o/r/blob/main/docs/{sha}/x"),
+                "https://github.com/o/r/blob/main/docs/•••/x",
+            ),
+            (
+                format!(
+                    "https://github.com/o/r/pull/1/files/{}{}",
+                    "a".repeat(99),
+                    "1".repeat(30)
+                ),
+                "https://github.com/o/r/pull/1/files/•••",
+            ),
+        ] {
+            assert_eq!(for_comment(&text), shown, "{text}");
+        }
+        let compare = format!("https://github.com/o/r/compare/{KEY}...{sha}");
+        assert_eq!(
+            for_comment(&compare),
+            format!("https://github.com/o/r/compare/•••...{sha}")
+        );
+        let head = format!("https://github.com/o/r/compare/{sha}...{KEY}");
+        assert_eq!(
+            for_comment(&head),
+            format!("https://github.com/o/r/compare/{sha}...•••")
+        );
+        let two_dot = format!("https://github.com/o/r/compare/main..{KEY}");
+        assert_eq!(
+            for_comment(&two_dot),
+            "https://github.com/o/r/compare/main..•••"
+        );
+    }
+
+    #[test]
+    fn for_comment_ends_a_github_link_before_a_character_no_url_holds() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        for end in [
+            " ", "\t", "\n", "(", ")", "[", "]", "{", "}", "<", ">", "`", "\"", "'", "|", "\\",
+            "^", ",", ";", "\u{200b}", "\u{1b}", "\u{3067}", "\u{2192}",
+        ] {
+            let text = format!("https://github.com/o/r{end}/commit/{sha}");
+            assert_eq!(
+                for_comment(&text),
+                format!("https://github.com/o/r{end}/commit/•••"),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn for_comment_keeps_github_ids_whole_only_on_github_com() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        for host in [
+            "notgithub.com",
+            "github.com.evil.example",
+            "gist.github.com",
+            "github.com:443",
+            "github.com@evil.example",
+        ] {
+            let url = format!("https://{host}/o/r/commit/{sha}");
+            let shown = for_comment(&url);
+            assert!(shown.ends_with("/o/r/commit/•••"), "{url} -> {shown}");
+        }
+        let url = format!("https://github.com/o/r/commit/{sha}");
+        assert_eq!(for_comment(&url), url);
+    }
+
+    #[test]
+    fn for_comment_ends_a_url_at_a_character_no_url_holds() {
+        for (before, after) in [
+            ("https://a.example\\nKEY=", ""),
+            ("https://github.com/o/r/pull/1\u{200b}", ""),
+            ("https://github.com/o/r/pull/1\u{1b}", ""),
+            ("https://github.com/o/r/pull/1\u{2192}", ""),
+            ("https://github.com/o/r/pull/1\\", ""),
+            ("https://github.com/o/r/pull/1^", ""),
+            ("https://github.com/o/r/pull/1\t", ""),
+            ("https://github.com/o/r/pull/1 ", ""),
+            ("https://github.com/o/r/pull/1|", ""),
+            ("https://github.com/o/r/pull/1}", ""),
+            ("https://github.com/o/r/pull/1'", ""),
+            (
+                "PR\u{306f}https://github.com/o/r/pull/1\u{3067}\u{3059}\u{3002}",
+                "\u{3067}\u{3059}",
+            ),
+            ("endpoint=https://api.example.com,key=", ""),
+            ("https://github.com/o/r/pull/1,GH_TOKEN=", ""),
+            ("https://github.com/o/r/pull/1;", ""),
+            ("`https://github.com/o/r/pull/1`", ""),
+            ("\"https://github.com/o/r/pull/1\"", ""),
+            ("[https://github.com/o/r/pull/1]", ""),
+            ("(https://github.com/o/r/pull/1)", ""),
+        ] {
+            let text = format!("{before}{KEY}{after}");
+            assert_eq!(for_comment(&text), format!("{before}•••{after}"), "{text}");
+        }
+    }
+
+    #[test]
+    fn for_comment_hides_a_token_in_a_url_query_userinfo_or_another_hosts_path() {
+        let webhook = format!("https://hooks.slack.com/services/T0000/B0000/{KEY}");
+        assert_eq!(
+            for_comment(&webhook),
+            "https://hooks.slack.com/services/T0000/B0000/•••"
+        );
+        let log = "http://example.com/runs/aB3dE5gH7jK9mN1pQ3sT5vX7zA9cD1/log";
+        assert_eq!(for_comment(log), "http://example.com/runs/•••/log");
+        let query = format!("https://github.com/o/r/pull/1?access_token={KEY}#top");
+        assert_eq!(
+            for_comment(&query),
+            "https://github.com/o/r/pull/1?access_token=•••#top"
+        );
+        let signed = format!("https://bucket.s3.amazonaws.com/a?X-Amz-Signature={KEY}");
+        assert_eq!(
+            for_comment(&signed),
+            "https://bucket.s3.amazonaws.com/a?X-Amz-Signature=•••"
+        );
+        let userinfo = "git push https://bot:short@github.com/o/r";
+        assert_eq!(for_comment(userinfo), "git push https://***@github.com/o/r");
+        let nested = "https://example.com/login?next=https://bot:hunter2@github.com/o/r";
+        assert_eq!(
+            for_comment(nested),
+            "https://example.com/login?next=https://***@github.com/o/r"
+        );
+        let token_user = format!("https://{KEY}@github.com/o/r/pull/1");
+        assert_eq!(
+            for_comment(&token_user),
+            "https://***@github.com/o/r/pull/1"
+        );
+    }
+
+    /// The rule as the spec states it: a word of 24 or more mixed letters and digits reaches a
+    /// comment only as a commit id or a GitHub anchor in a `github.com` link, at the place
+    /// GitHub's own links put one. Each word shape is tried in each place.
+    #[test]
+    fn for_comment_keeps_a_long_mixed_word_only_where_a_github_link_puts_one() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let sha256 = "0123456789abcdef".repeat(4);
+        let other_sha = "fedcba9876543210fedcba9876543210fedcba98";
+        let ids = [sha.to_string(), sha256.clone()];
+        let not_ids = [
+            KEY.to_string(),
+            "0123456789abcdef".repeat(2),
+            format!("{sha}0"),
+            format!("g{}", &sha[1..]),
+        ];
+        let id_places = [
+            "https://github.com/o/r/commit/W",
+            "https://github.com/o/r/commit/W.patch",
+            "https://github.com/o/r/commit/W.diff",
+            "https://github.com/o/r/commits/W",
+            "https://github.com/o/r/blob/W/src/a.rs",
+            "https://github.com/o/r/tree/W",
+            "https://github.com/o/r/blame/W/a.rs#L3-L9",
+            "https://github.com/o/r/raw/W/a.rs",
+            "https://github.com/o/r/compare/W...main",
+            "https://github.com/o/r/compare/main...W",
+            "https://github.com/o/r/compare/main..W",
+            "https://github.com/o/r/pull/12/commits/W",
+            "https://github.com/o/r/pull/12/files/W",
+            "https://github.com/o/r/pull/12/files/W..SHA",
+            "https://github.com/o/r/pull/12/files/SHA..W",
+        ];
+        let anchors = [
+            "issuecomment-1234567890123".to_string(),
+            "discussion_r1234567890123".to_string(),
+            "pullrequestreview-1234567890".to_string(),
+            format!("diff-{sha256}"),
+            format!("diff-{sha256}R12"),
+            format!("diff-{sha256}L3-R20"),
+        ];
+        let not_anchors = [
+            KEY.to_string(),
+            "issuecomment-1234567890abcdefghijk".to_string(),
+            format!("diff-{}", "0123456789abcdef".repeat(2)),
+            format!("diff-{sha256}X12"),
+        ];
+        let anchor_places = [
+            "https://github.com/o/r/pull/1#W",
+            "https://github.com/o/r/pull/1/files#W",
+            "https://github.com/o/r/issues/1#W",
+        ];
+        let other_places = [
+            "W",
+            "at W.",
+            "(W)",
+            "https://github.com/W/r/commit/SHA",
+            "https://github.com/o/W/pull/1",
+            "https://github.com/o/W/commit/SHA",
+            "https://github.com/o/tree/W",
+            "https://github.com/o/commit/W",
+            "https://github.com/commit/W",
+            "https://github.com/o/r/W",
+            "https://github.com/o/r/pull/1/W",
+            "https://github.com/o/r/pull/x/files/W",
+            "https://github.com/o/r/issues/1/commits/W",
+            "https://github.com/o/r/blob/main/W",
+            "https://github.com/o/r/blob/main/tree/W",
+            "https://github.com/o/r/blob/main/files/W",
+            "https://github.com/o/r/tree/main/commit/W",
+            "https://github.com/o/r/blob/SHA/commits/W",
+            "https://github.com/o/r/commit/xW",
+            "https://github.com/o/r/pull/1?sha=W",
+            "https://github.com/o/r/pull/1#x-W",
+            "https://github.com/o/r/pull/1#W&x",
+            "https://W@github.com/o/r/commit/SHA",
+            "https://example.com/o/r/commit/W",
+            "https://example.com/o/r/pull/1#W",
+            "https://gist.github.com/o/r/commit/W",
+            "https://github.com.evil.example/o/r/commit/W",
+        ];
+        let comment = |place: &str, word: &str| {
+            let text = place.replace("SHA", other_sha).replace('W', word);
+            (for_comment(&text), text)
+        };
+        for (words, kept, places) in [
+            (&ids[..], true, &id_places[..]),
+            (&not_ids[..], false, &id_places[..]),
+            (&anchors[..], true, &anchor_places[..]),
+            (&not_anchors[..], false, &anchor_places[..]),
+            (&ids[..], false, &anchor_places[..]),
+            (&anchors[..], false, &id_places[..]),
+            (&ids[..], false, &other_places[..]),
+            (&not_ids[..], false, &other_places[..]),
+            (&anchors[..], false, &other_places[..]),
+            (&not_anchors[..], false, &other_places[..]),
+        ] {
+            for word in words {
+                for place in places {
+                    let (shown, text) = comment(place, word);
+                    if kept {
+                        assert_eq!(shown, text);
+                    } else {
+                        assert!(!shown.contains(word.as_str()), "{text} -> {shown}");
+                        let marked = shown.contains(HIDDEN) || shown.contains("***@");
+                        assert!(marked, "{text} -> {shown}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn for_comment_hides_a_url_password_whatever_characters_it_holds() {
+        for c in [
+            ";", ",", "'", "\"", "(", ")", "[", "]", "<", ">", "{", "}", "|", "^", "\\", "`", "!",
+            "é", "\u{200b}",
+        ] {
+            let text = format!("git push https://bot:hunter{c}2@github.com/o/r and go");
+            assert_eq!(
+                for_comment(&text),
+                "git push https://***@github.com/o/r and go",
+                "{text:?}"
+            );
+        }
+        let ssh = "ssh://git:pa;ss@example.com/r";
+        assert_eq!(for_comment(ssh), "ssh://***@example.com/r");
+    }
+
+    /// A comment hides at least what P1's `secrets::redact` hides: running `redact` before
+    /// `for_comment` changes nothing, whatever the text.
+    #[test]
+    fn for_comment_hides_everything_redact_hides() {
+        for text in [
+            "fatal: unable to access 'https://x-access-token:ghp_s3cret@github.com/o/r.git/'",
+            "https://ghp_t0ken@github.com/o/r.git",
+            "ssh://deploy:hunter2@host/r.git and more",
+            "git push https://bot:pa\"ss@github.com/o/r",
+            "git push https://bot:pa'ss@github.com/o/r",
+            "git push https://bot:pa;ss@github.com/o/r",
+            "clone \"https://bot:hunter2@github.com/o/r\" now",
+            "clone 'https://bot:hunter2@github.com/o/r' now",
+            "'https://example.com/a'@b and \"https://x.example\"@y",
+            "https://example.com/login?next=https://bot:hunter2@github.com/o/r",
+            "git@github.com:o/r.git",
+            "no url here",
+        ] {
+            assert_eq!(for_comment(&redact(text)), for_comment(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn for_comment_keeps_a_word_glued_to_the_scheme() {
+        assert_eq!(for_comment("xhttp://a.b"), "xhttp://a.b");
+        assert_eq!(
+            for_comment(&format!("{KEY}https://github.com/o/r/pull/1")),
+            "•••https://github.com/o/r/pull/1"
+        );
+    }
+
+    #[test]
+    fn for_comment_hides_a_key_that_follows_a_url() {
+        let text = format!("<https://github.com/o/r/pull/123>{KEY} (https://x.example/a){KEY}");
+        assert_eq!(
+            for_comment(&text),
+            "<https://github.com/o/r/pull/123>••• (https://x.example/a)•••"
+        );
+    }
+
+    #[test]
+    fn for_comment_hides_commit_ids_and_hashes() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(for_comment(&format!("at {sha}.")), "at •••.");
+        let token = "ghp_AbCdEf0123456789AbCdEf0123456789";
+        assert_eq!(for_comment(&format!("GH_TOKEN={token}")), "GH_TOKEN=•••");
+    }
+
+    #[test]
+    fn for_comment_keeps_words_paths_and_short_tokens() {
+        for text in [
+            "crates/foundryd/src/factory/lifecycle/result_line.rs",
+            "an_identifier_with_no_digits_at_all_that_is_long",
+            "123456789012345678901234567890",
+            "abc123 short",
+            &KEY[..23],
+            "a € multibyte line ✓",
+        ] {
+            assert_eq!(for_comment(text), text);
+        }
+        assert_eq!(for_comment(&KEY[..24]), "•••");
+    }
+
+    #[test]
+    fn elapsed_ms_of_a_later_from_is_0() {
+        assert_eq!(elapsed_ms(10_000, 4_000), 0);
+        assert_eq!(elapsed_ms(u64::MAX, 0), 0);
+    }
+
+    #[test]
+    fn elapsed_ms_counts_forward() {
+        assert_eq!(elapsed_ms(4_000, 10_000), 6_000);
+        assert_eq!(elapsed_ms(7, 7), 0);
+    }
+
+    // The rest of the runner's text.ts.
+
+    #[test]
+    fn sanitize_replaces_control_and_invisible_characters_with_a_space() {
+        assert_eq!(sanitize("a\u{1b}[31mb", false), "a [31mb");
+        assert_eq!(sanitize("a\u{0}b\u{7f}c\u{85}d", false), "a b c d");
+        assert_eq!(
+            sanitize(
+                "a\u{2028}b\u{2029}c\u{200b}d\u{202e}e\u{2066}f\u{feff}g",
+                false
+            ),
+            "a b c d e f g"
+        );
+        assert_eq!(sanitize("a\rb", true), "a b");
+    }
+
+    /// The runner's case, from its `src/gate.test.ts`.
+    #[test]
+    fn sanitize_turns_control_and_hidden_text_characters_into_spaces() {
+        assert_eq!(sanitize("a\u{1b}b\u{0}c\u{7f}d\u{85}e", false), "a b c d e");
+        assert_eq!(sanitize("a\nb\tc", false), "a b c");
+        assert_eq!(sanitize("a\nb\tc", true), "a\nb\tc");
+        assert_eq!(
+            sanitize(
+                "x\u{2028}y\u{2029}z\u{200b}w\u{200f}\u{202a}\u{2069}\u{feff}v",
+                true
+            ),
+            "x y z w    v"
+        );
+    }
+
+    #[test]
+    fn sanitize_replaces_both_ends_of_each_range_and_keeps_their_neighbours() {
+        for c in [
+            '\u{0}', '\u{1f}', '\u{7f}', '\u{9f}', '\u{200b}', '\u{200f}', '\u{202a}', '\u{202e}',
+            '\u{2066}', '\u{2069}', '\u{2028}', '\u{2029}', '\u{feff}',
+        ] {
+            assert_eq!(
+                sanitize(&format!("a{c}b"), false),
+                "a b",
+                "{:x}",
+                u32::from(c)
+            );
+        }
+        for c in [
+            '\u{20}', '\u{7e}', '\u{a0}', '\u{200a}', '\u{2010}', '\u{2027}', '\u{202f}',
+            '\u{2065}', '\u{206a}', '\u{fefe}',
+        ] {
+            let text = format!("a{c}b");
+            assert_eq!(sanitize(&text, false), text, "{:x}", u32::from(c));
+        }
+    }
+
+    #[test]
+    fn sanitize_keeps_newline_and_tab_only_for_layout() {
+        assert_eq!(sanitize("a\nb\tc", true), "a\nb\tc");
+        assert_eq!(sanitize("a\nb\tc", false), "a b c");
+        assert_eq!(sanitize("é ✓ 🦀", false), "é ✓ 🦀");
+    }
+
+    #[test]
+    fn command_line_is_one_line_cut_at_300_characters() {
+        assert_eq!(command_line("cargo test\n--all"), "cargo test --all");
+        let long = "é".repeat(301);
+        assert_eq!(command_line(&long), format!("{}…", "é".repeat(300)));
+        let exact = "x".repeat(300);
+        assert_eq!(command_line(&exact), exact);
+    }
+
+    #[test]
+    fn short_sha_is_the_first_seven_hex_digits() {
+        assert_eq!(short_sha("0123456789abcdef"), "0123456");
+        assert_eq!(short_sha("zz01-23ABcdef"), "0123ABc");
+        assert_eq!(short_sha("abc"), "abc");
+        assert_eq!(short_sha(""), "");
+    }
+
+    #[test]
+    fn is_commit_id_takes_40_or_64_hex_digits() {
+        assert!(is_commit_id(&"a".repeat(40)));
+        assert!(is_commit_id(&"F".repeat(64)));
+        assert!(!is_commit_id(&"a".repeat(39)));
+        assert!(!is_commit_id(&"a".repeat(41)));
+        assert!(!is_commit_id(&"g".repeat(40)));
+        assert!(!is_commit_id(""));
+    }
+
+    #[test]
+    fn sha256_is_lowercase_hex() {
+        assert_eq!(
+            sha256(""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+}
