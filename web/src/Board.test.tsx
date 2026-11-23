@@ -153,6 +153,21 @@ describe("Board", () => {
     expect(within(quiet).getByRole("article", { name: "far away" })).toBeDefined();
   });
 
+  it("lists no workspace of a machine the machine list does not hold, nor its terminals or sessions", async () => {
+    const all = [
+      ...records(),
+      sample(OTHER, 1),
+      workspace(OTHER, "w9", "cut off"),
+      terminal(OTHER, "t9", "w9"),
+      session(OTHER, "s9", "w9", "t9", "waiting_for_you", { model: "gone-model" }),
+    ];
+    await show(fleet(all, settings({ machines: [{ id: ME, name: "studio", address: "" }] })));
+
+    expect(card("fix login")).toBeDefined();
+    expect(screen.queryByRole("article", { name: "cut off" })).toBeNull();
+    expect(screen.queryByText("gone-model")).toBeNull();
+  });
+
   it("lists a card's terminals with their states, each opening its terminal", async () => {
     const { router } = await show(fleet(records(), settings()));
     const login = card("fix login");
@@ -325,6 +340,8 @@ describe("Grouped by shipping", () => {
     terminal(OTHER, "t6", "w6"),
   ];
   const lane = (name: string) => screen.getByRole("region", { name });
+  // "far off" lives on a listed machine; one the list does not hold shows no workspaces at all.
+  const listed = () => settings({ machines: [{ id: ME, name: "studio", address: "" }, { id: OTHER, name: "laptop", address: "" }] });
 
   beforeEach(() => {
     FakeSocket.all = [];
@@ -343,7 +360,7 @@ describe("Grouped by shipping", () => {
   });
 
   it("puts the cards in lanes by how far their work has gone, counts each, and sums the fleet's work", async () => {
-    await show(fleet(fleetOf(), settings()), vi.fn(), {}, true);
+    await show(fleet(fleetOf(), listed()), vi.fn(), {}, true);
     const toggle = screen.getByRole("button", { name: "Shipping" });
     expect(toggle.getAttribute("aria-pressed")).toBe("false");
     fireEvent.click(toggle);
@@ -374,7 +391,7 @@ describe("Grouped by shipping", () => {
 
   it("opens grouped by shipping for a browser that kept the old ship view, which is no longer a view of its own", async () => {
     localStorage.setItem("foundry.home", "ship");
-    await show(fleet(fleetOf(), settings()), vi.fn(), {}, true);
+    await show(fleet(fleetOf(), listed()), vi.fn(), {}, true);
     await waitFor(() => expect(within(lane("Merged")).getByRole("article", { name: "rename api" })).toBeDefined());
     expect(screen.getByRole("button", { name: "Shipping" }).getAttribute("aria-pressed")).toBe("true");
     expectButtonShape(screen.getByRole("button", { name: "Shipping" }));
@@ -383,7 +400,7 @@ describe("Grouped by shipping", () => {
   });
 
   it("offers an idle session the step that takes its work further, under it on its card, and types it into its terminal", async () => {
-    await show(fleet(fleetOf(), settings()), vi.fn(), {}, true);
+    await show(fleet(fleetOf(), listed()), vi.fn(), {}, true);
     const draft = card("draft login");
     const step = await within(draft).findByRole("button", { name: "Commit 1 file" });
     expect(within(draft).getByRole("group", { name: "Next for opus" })).toBeDefined();
@@ -402,11 +419,11 @@ describe("Grouped by shipping", () => {
 
   it("moves a card to its new lane when one of its terminals changes state, and lights it up once there", async () => {
     localStorage.setItem("foundry.group", "shipping");
-    const { update } = await show(fleet(fleetOf("working"), settings()), vi.fn(), {}, true);
+    const { update } = await show(fleet(fleetOf("working"), listed()), vi.fn(), {}, true);
     await waitFor(() => expect(within(lane("Only here")).getByRole("article", { name: "draft login" })).toBeDefined());
     answers["/api/workspaces/w1/changes"] = () => json(200, { base: "main", commits: [commit("aaa1111", "Draft the login form")], files: [file("src/login.ts", 40, 2)] } satisfies Changes);
     answers["/api/workspaces/w1/pr"] = () => json(200, shipping({ pushed: true }));
-    update(fleet(fleetOf("idle"), settings()));
+    update(fleet(fleetOf("idle"), listed()));
     await waitFor(() => expect(within(lane("Pushed")).getByRole("article", { name: "draft login" })).toBeDefined());
     expect(within(lane("Pushed")).getByRole("article", { name: "draft login" }).dataset.arrived).toBe("true");
     expect(within(lane("Pushed")).getByRole("article", { name: "push docs" }).dataset.arrived).toBeUndefined();

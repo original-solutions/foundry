@@ -4,7 +4,7 @@ import { useRef, useState, type ReactNode } from "react";
 import { post, refused, type Limits } from "./api";
 import { byUrgency, rows, type MachineView } from "./fleet";
 import { plural, urgency, type Glyph } from "./labels";
-import { button, field, fieldLook, Modal, primaryButton } from "./Modal";
+import { button, dangerButton, field, fieldLook, Modal, primaryButton } from "./Modal";
 import { heardAgo, scaled, span, spanWords, type History, type Point } from "./samples";
 import { glyphFill, glyphText, StateGlyph } from "./StateGlyph";
 import { useNow } from "./StepsPanel";
@@ -59,14 +59,14 @@ export function Machines({ machines, history, here, connected }: Props) {
       </div>
       <div className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,24rem),1fr))] gap-4">
         {machines.map((machine) => (
-          <MachineCard key={machine.id} machine={machine} points={history[machine.id]?.points ?? []} heard={history[machine.id]?.heard} here={machine.id === here} now={now} />
+          <MachineCard key={machine.id} machine={machine} points={history[machine.id]?.points ?? []} heard={history[machine.id]?.heard} here={machine.id === here} known={here !== undefined} now={now} />
         ))}
       </div>
     </section>
   );
 }
 
-function MachineCard({ machine, points, heard, here, now }: { machine: MachineView; points: Point[]; heard?: number; here: boolean; now: number }) {
+function MachineCard({ machine, points, heard, here, known, now }: { machine: MachineView; points: Point[]; heard?: number; here: boolean; known: boolean; now: number }) {
   const { sample, status } = machine;
   const away = status === "offline";
   const all = machine.workspaces.flatMap(rows);
@@ -112,6 +112,11 @@ function MachineCard({ machine, points, heard, here, now }: { machine: MachineVi
         <p className="min-w-0 text-xs text-neutral-400">{machine.limits ? limitsText(machine.limits) : "No limits"}</p>
         {machine.listed && <LimitsDialog machine={machine} />}
       </div>
+      {machine.listed && known && !here && (
+        <div className="flex justify-end px-4 pt-1.5">
+          <RemoveDialog machine={machine} />
+        </div>
+      )}
 
       {sample ? (
         <div className={away ? "opacity-60 grayscale" : undefined}>
@@ -406,6 +411,51 @@ function LimitsDialog({ machine }: { machine: MachineView }) {
           </button>
         </div>
       </form>
+    </Modal>
+  );
+}
+
+/** Removes machine `id` from the fleet: every machine then revokes its key and closes its links. */
+async function removeMachine(id: string): Promise<void> {
+  const { status, json } = await post(`/api/machines/${encodeURIComponent(id)}/remove`);
+  if (status !== 204) throw refused(status, json);
+}
+
+/**
+ * Another listed machine's Remove from fleet button and its confirmation. Nothing is sent until
+ * the person confirms; the dialog closes once the daemon takes it, and a refusal (as when this
+ * machine is the one named) shows in it.
+ */
+function RemoveDialog({ machine }: { machine: MachineView }) {
+  const [open, setOpen] = useState(false);
+  const remove = useMutation({ mutationFn: removeMachine, onSuccess: () => setOpen(false) });
+  const change = (next: boolean) => {
+    remove.reset();
+    setOpen(next);
+  };
+  return (
+    <Modal
+      open={open}
+      onOpenChange={change}
+      trigger="Remove from fleet"
+      title={`Remove ${machine.name}`}
+      description={`${machine.name} will be cut off from every machine and cannot join again under its current identity. Its workspaces stay on its disk.`}
+    >
+      <div className="mt-3 flex flex-col gap-2">
+        {remove.isError && (
+          <p role="alert" className="text-xs text-red-400">
+            {remove.error.message}
+          </p>
+        )}
+        <div className="flex justify-end gap-2">
+          <button type="button" className={button} onClick={() => change(false)}>
+            Cancel
+          </button>
+          <button type="button" className={dangerButton} disabled={remove.isPending} onClick={() => remove.mutate(machine.id)}>
+            Remove from fleet
+          </button>
+        </div>
+      </div>
     </Modal>
   );
 }

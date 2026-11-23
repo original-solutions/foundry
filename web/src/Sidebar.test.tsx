@@ -63,6 +63,30 @@ describe("Sidebar", () => {
     expect(within(laptop).getByText("no sample yet")).toBeDefined();
   });
 
+  it("lists no workspace, terminal or session of a machine the machine list does not hold", async () => {
+    const records = [
+      sample(ME, 1),
+      workspace(ME, "w1", "fix login"),
+      terminal(ME, "t1", "w1"),
+      session(ME, "s1", "w1", "t1", "working", { model: "kept-model" }),
+      sample(OTHER, 1),
+      workspace(OTHER, "w9", "cut off"),
+      terminal(OTHER, "t9", "w9"),
+      session(OTHER, "s9", "w9", "t9", "working", { model: "gone-model" }),
+      terminal(OTHER, "sh9", "w9"),
+    ];
+    const view = fleet(records, settings({ machines: [{ id: ME, name: "studio", address: "" }] }));
+    await renderApp(<Sidebar machines={view} {...props} />);
+
+    expect(screen.getByRole("button", { name: "fix login" })).toBeDefined();
+    expect(screen.queryByRole("button", { name: "cut off" })).toBeNull();
+    unfold("fix login");
+    expect(screen.getByText("kept-model")).toBeDefined();
+    expect(screen.queryByText("cut off")).toBeNull();
+    expect(screen.queryByText("gone-model")).toBeNull();
+    expect(screen.queryByText("shell")).toBeNull();
+  });
+
   it("lists a workspace's sessions and shells, each with its state label and a link to its terminal", async () => {
     mockFetch(json(200, { id: ME }));
     const onNewSession = vi.fn();

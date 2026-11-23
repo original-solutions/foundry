@@ -58,7 +58,9 @@ pub(super) async fn run(
 
 /// Sends this machine's new records every [`TICK`] until the peer is no longer one this machine
 /// links with ([`links_with`]: it is listed, or this machine's list holds no machine but
-/// itself) or stops taking them.
+/// itself) or stops taking them. Changed settings go first in each round, so a peer just removed
+/// from the list is sent the copy that removed it before its link closes, and holds its own
+/// removal.
 async fn sending(inner: &Inner, send: &Sender<String>, open: &Open) {
     let mut sent = open.sent;
     let mut settings_sent: Option<u64> = None;
@@ -66,11 +68,11 @@ async fn sending(inner: &Inner, send: &Sender<String>, open: &Open) {
     let mut every = tokio::time::interval(TICK);
     loop {
         every.tick().await;
-        if !links_with(inner, open.peer).await {
-            tracing::info!("sync: {} left the machine list; link closed", open.peer);
+        if !send_settings(inner, send, open, &mut settings_sent).await {
             return;
         }
-        if !send_settings(inner, send, open, &mut settings_sent).await {
+        if !links_with(inner, open.peer).await {
+            tracing::info!("sync: {} left the machine list; link closed", open.peer);
             return;
         }
         if !send_own(inner, send, open, &mut sent, &mut warned).await {
@@ -577,6 +579,85 @@ mod tests {
 
         assert!(!link.accepted().await, "the link was accepted");
         link.accepting.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_machine_removed_from_the_list_is_sent_the_copy_that_removed_it_before_its_link_closes()
+     {
+        use foundry_proto::settings::Edit;
+
+        use crate::coordinator::{Coordinator, numbered};
+
+        let data = tempfile::tempdir().unwrap();
+        let (me, peer, third) = (
+            MachineId::random(),
+            MachineId::random(),
+            MachineId::random(),
+        );
+        let mut store = Store::open(data.path().join("foundry.db")).unwrap();
+        let mut held = store.settings().unwrap();
+        held.seq += 1;
+        held.machines = [me, peer, third]
+            .iter()
+            .enumerate()
+            .map(|(i, id)| Machine {
+                id: *id,
+                name: format!("machine-{i}"),
+                address: format!("100.64.0.{}", i + 1),
+                key: String::new(),
+            })
+            .collect();
+        store.apply_settings(held).unwrap();
+        let store = Arc::new(Mutex::new(store));
+        let peers = Peers::new(me, store.clone(), Arc::new(NoDial));
+        let coordinator = Arc::new(Coordinator::new(me, store.clone(), peers.clone()));
+        peers.coordinate(coordinator.clone());
+        let (ours, mut theirs) = Conn::pair();
+        let accepting = tokio::spawn(async move { peers.accept(ours).await });
+        let hello = PeerMessage::Hello {
+            protocol: PROTOCOL,
+            machine: peer,
+            versions: BTreeMap::new(),
+        };
+        theirs
+            .send
+            .send(serde_json::to_string(&hello).unwrap())
+            .await
+            .unwrap();
+        let next = |recv: &mut tokio::sync::mpsc::Receiver<String>| {
+            let text = recv.try_recv().ok()?;
+            Some(serde_json::from_str::<PeerMessage>(&text).unwrap())
+        };
+        // The link is up: the peer has been sent this machine's settings.
+        let deadline = Instant::now() + WAIT;
+        let mut settled = false;
+        while !settled {
+            assert!(Instant::now() < deadline, "no settings on the open link");
+            while let Some(message) = next(&mut theirs.recv) {
+                settled |= matches!(message, PeerMessage::Settings { .. });
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        {
+            let mut store = store.lock().unwrap();
+            let held = store.settings().unwrap();
+            let removal = numbered(&held, &Edit::RemoveMachine { id: peer }, me);
+            store.apply_settings(removal).unwrap();
+        }
+
+        // Read to the close: the copy that removed the peer comes first.
+        let mut sent_removal = false;
+        while let Ok(Some(text)) = timeout(WAIT, theirs.recv.recv()).await {
+            if let PeerMessage::Settings { settings, .. } = serde_json::from_str(&text).unwrap() {
+                sent_removal |= crate::join::is_removed(&settings, peer);
+            }
+        }
+        assert!(
+            timeout(WAIT, accepting).await.is_ok(),
+            "the link did not close"
+        );
+        assert!(sent_removal, "the link closed without sending the removal");
     }
 
     #[tokio::test]

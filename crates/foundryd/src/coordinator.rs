@@ -9,7 +9,9 @@
 //! "Later" is the higher number, never wall time: of two edits to one setting the higher
 //! stamp holds ([`Stamp`]'s order). Two stamps conflict only when neither copy has seen the
 //! other's, which is two sides of a split each editing the setting. A conflict leaves a
-//! "setting overwritten" item, itself a setting, holding both values.
+//! "setting overwritten" item, itself a setting, holding both values. One exception: a machine
+//! removed from the machine list stays removed, so its removal holds over any later entry for
+//! it, and a removed machine is never listed again ([`crate::join::is_removed`]).
 //!
 //! An edit is sent under an [`EditId`] its sender picks, and the acting machine answers it with
 //! an [`Outcome`]: numbered, with its stamp, or refused. The sender keeps the edit until the
@@ -32,7 +34,8 @@
 //! The acting machine checks the project rules as it numbers an edit, against its own copy and
 //! store ([`breaks`]): it refuses a new project whose name another project has, and the removal
 //! of a project its store holds a live workspace of, with [`CoordinatorError::Conflict`], which
-//! [`may_refuse`] governs as any refusal. Two sides of a split each number their own edits, so
+//! [`may_refuse`] governs as any refusal. It refuses an entry for a machine its copy shows
+//! removed the same way. Two sides of a split each number their own edits, so
 //! neither check holds across a split. An edit with no id, from a machine before
 //! [`ANSWERS_SINCE`], is numbered unchecked: nobody answers it, so a refusal would drop it unseen.
 //!
@@ -899,7 +902,8 @@ impl Unnumbered {
 /// The project rule `edit` breaks in `held` and the workspaces `store` holds, as a fixed phrase
 /// that names no setting value, or `None`. A project for an id `held` does not hold breaks it
 /// when another project has its name, compared trimmed and in any case. Removing a project
-/// breaks it while a live workspace in `store`, from any machine, was made from it.
+/// breaks it while a live workspace in `store`, from any machine, was made from it. An entry
+/// for a machine `held` shows removed breaks the rule that a removal is one-way.
 fn breaks(
     store: &Store,
     held: &SharedSettings,
@@ -911,6 +915,9 @@ fn breaks(
             .map(|_| "holds another project with that name"),
         Edit::RemoveProject { id } => (!holding(store, *id)?.is_empty())
             .then_some("holds a live workspace made from that project"),
+        Edit::SetMachine { machine } if crate::join::is_removed(held, machine.id) => {
+            Some("holds that machine removed from the machine list")
+        }
         _ => None,
     })
 }
@@ -1044,10 +1051,12 @@ pub fn keep_keys(held: &SharedSettings, copy: &mut SharedSettings) {
     }
 }
 
-/// One copy of the settings from two, setting by setting: the higher stamp's value holds. A
-/// setting both copies edited where neither had seen the other's edit also gets a "setting
-/// overwritten" item holding both values, stamped as the edit that held, or as the dismissal of
-/// an earlier item about that setting when that is later. `seen` is the higher of each.
+/// One copy of the settings from two, setting by setting: the higher stamp's value holds, except
+/// that a machine either copy shows removed stays removed ([`crate::join::is_removed`]), at the
+/// higher of the two removal stamps when both do. A setting both copies edited where neither
+/// had seen the other's edit also gets a "setting overwritten" item holding both values,
+/// stamped as the edit that held, or as the dismissal of an earlier item about that setting
+/// when that is later. `seen` is the higher of each.
 ///
 /// The result's `seq` is the higher of the two, plus one unless the result is the settings of
 /// every copy that holds that `seq`. That is one more case than "differs from both": a result
@@ -1060,12 +1069,22 @@ pub fn merge(a: &SharedSettings, b: &SharedSettings) -> SharedSettings {
     for key in keys(a).union(&keys(b)) {
         let (sa, sb) = (stamp(a, key), stamp(b, key));
         let (va, vb) = (get(a, key), get(b, key));
-        let a_holds = match sa.cmp(&sb) {
-            std::cmp::Ordering::Greater => true,
-            std::cmp::Ordering::Less => false,
+        let (ra, rb) = match key {
+            StampKey::Setting(SettingKey::Machine(id)) => (
+                crate::join::is_removed(a, *id),
+                crate::join::is_removed(b, *id),
+            ),
+            _ => (false, false),
+        };
+        let a_holds = match (ra, rb, sa.cmp(&sb)) {
+            // A removal is one-way: it holds over an entry, whatever the entry's stamp.
+            (true, false, _) => true,
+            (false, true, _) => false,
+            (_, _, std::cmp::Ordering::Greater) => true,
+            (_, _, std::cmp::Ordering::Less) => false,
             // One edit, or two copies no edit has stamped: pick by the value, the same way on
             // every machine.
-            std::cmp::Ordering::Equal => rank(&va) >= rank(&vb),
+            (_, _, std::cmp::Ordering::Equal) => rank(&va) >= rank(&vb),
         };
         let (held, lost, stamp, lost_stamp) = if a_holds {
             (va, vb, sa, sb)
@@ -1773,6 +1792,104 @@ mod tests {
         );
     }
 
+    fn listed_machine(n: u128, address: &str) -> Machine {
+        Machine {
+            id: id(n),
+            name: format!("m{n}"),
+            address: address.into(),
+            key: String::new(),
+        }
+    }
+
+    fn lists(settings: &SharedSettings, n: u128) -> bool {
+        settings.machines.iter().any(|m| m.id == id(n))
+    }
+
+    #[test]
+    fn a_machine_removed_on_one_side_stays_removed_though_it_listed_itself_later_on_the_other() {
+        const C: u128 = 9;
+        let key = StampKey::Setting(SettingKey::Machine(id(C)));
+        let synced = numbered(
+            &base(),
+            &Edit::SetMachine {
+                machine: listed_machine(C, "100.64.0.9"),
+            },
+            id(A),
+        );
+        let removed = numbered(&synced, &Edit::RemoveMachine { id: id(C) }, id(A));
+        // C missed the removal and, acting alone, lists itself again at new addresses: its
+        // stamp is the higher one.
+        let mut on_c = synced.clone();
+        for n in 0..3 {
+            let machine = listed_machine(C, &format!("100.64.1.{n}"));
+            on_c = numbered(&on_c, &Edit::SetMachine { machine }, id(C));
+        }
+        assert!(stamp(&on_c, &key) > stamp(&removed, &key));
+
+        let out = merged(&removed, &on_c);
+
+        assert!(!lists(&out, C), "the removed machine is listed again");
+        assert!(crate::join::is_removed(&out, id(C)));
+    }
+
+    #[test]
+    fn a_machine_that_missed_a_removal_and_took_the_removed_machines_copy_drops_it_on_meeting_the_removal()
+     {
+        const C: u128 = 9;
+        let synced = numbered(
+            &base(),
+            &Edit::SetMachine {
+                machine: listed_machine(C, "100.64.0.9"),
+            },
+            id(A),
+        );
+        // A and B hold the removal. C missed it and lists itself again; D, offline during the
+        // removal, links with C first and takes C's copy.
+        let removed = numbered(&synced, &Edit::RemoveMachine { id: id(C) }, id(A));
+        let mut on_c = synced.clone();
+        for n in 0..2 {
+            let machine = listed_machine(C, &format!("100.64.1.{n}"));
+            on_c = numbered(&on_c, &Edit::SetMachine { machine }, id(C));
+        }
+        let on_d = merged(&synced, &on_c);
+        assert!(lists(&on_d, C), "D lists C until it hears of the removal");
+
+        // D meets a machine that holds the removal: C is removed on both, in either order, and
+        // merging every copy in any grouping gives the same result.
+        let out = merged(&on_d, &removed);
+        assert!(!lists(&out, C) && crate::join::is_removed(&out, id(C)));
+        let other_grouping = merged(&merged(&removed, &on_c), &on_d);
+        assert_eq!(out.machines, other_grouping.machines);
+        assert_eq!(out.stamps, other_grouping.stamps);
+    }
+
+    #[test]
+    fn two_removals_of_one_machine_keep_the_higher_stamp() {
+        const C: u128 = 9;
+        let key = StampKey::Setting(SettingKey::Machine(id(C)));
+        let synced = numbered(
+            &base(),
+            &Edit::SetMachine {
+                machine: listed_machine(C, "100.64.0.9"),
+            },
+            id(A),
+        );
+        let on_a = numbered(&synced, &Edit::RemoveMachine { id: id(C) }, id(A));
+        let on_b = numbered(
+            &numbered(&synced, &Edit::RemoveLimits { machine: id(B) }, id(B)),
+            &Edit::RemoveMachine { id: id(C) },
+            id(B),
+        );
+
+        let out = merged(&on_a, &on_b);
+
+        assert!(!lists(&out, C));
+        assert_eq!(
+            stamp(&out, &key),
+            stamp(&on_a, &key).max(stamp(&on_b, &key))
+        );
+    }
+
     #[test]
     fn a_dismissed_item_stays_dismissed_when_it_meets_a_copy_that_still_holds_it() {
         let a = numbered(&base(), &set_project(7, "from a"), id(A));
@@ -2455,6 +2572,39 @@ mod tests {
             "{made:?}"
         );
         assert_eq!(coordinator.held().await.unwrap().projects.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_acting_machine_refuses_to_list_a_machine_its_copy_shows_removed() {
+        let (_dir, coordinator) = alone();
+        let c = MachineId::random();
+        let entry = |address: &str| Edit::SetMachine {
+            machine: Machine {
+                id: c,
+                name: "c".into(),
+                address: address.into(),
+                key: String::new(),
+            },
+        };
+        for edit in [entry("100.64.0.9"), Edit::RemoveMachine { id: c }] {
+            coordinator
+                .number(Some(EditId::random()), &edit)
+                .await
+                .unwrap_or_else(|_| panic!("not numbered"));
+        }
+
+        let again = coordinator
+            .number(Some(EditId::random()), &entry("100.64.1.1"))
+            .await;
+
+        assert!(
+            matches!(again, Err(Unnumbered::Breaks(_))),
+            "a removed machine was listed again"
+        );
+        assert!(crate::join::is_removed(
+            &coordinator.held().await.unwrap(),
+            c
+        ));
     }
 
     #[tokio::test]

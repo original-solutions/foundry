@@ -25,6 +25,8 @@
 //! The key table is held in this machine's secret store. It holds only public keys. Each
 //! machine's public key also travels in its machine-list entry, and every machine admits the
 //! keys its list carries ([`Keys::follow`]), so a machine admitted by one is admitted by all.
+//! A machine removed from the list is revoked by every machine that holds its key
+//! ([`Keys::refuse_removed`]), so its links close; listing its key again never re-admits it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -43,7 +45,7 @@ use axum::routing::post;
 use axum::{Json, Router};
 use foundry_proto::ids::MachineId;
 use foundry_proto::messages::PeerMessage;
-use foundry_proto::settings::Machine;
+use foundry_proto::settings::{Machine, SettingKey, SharedSettings, StampKey};
 use futures::future::BoxFuture;
 use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
@@ -53,7 +55,7 @@ use tokio::time::{Instant, timeout};
 
 use crate::lister::Lister;
 use crate::secrets::{self, Secrets, SecretsError};
-use crate::store::{Store, StoreError};
+use crate::store::Store;
 use crate::sync::{Conn, Dialer, OFFLINE_AFTER, Peers, on_store};
 use crate::tailscale;
 
@@ -62,6 +64,12 @@ pub const CODE_VALID_FOR: Duration = Duration::from_secs(10 * 60);
 
 /// How often an open link checks that its machine is still admitted.
 pub const RECHECK: Duration = Duration::from_secs(1);
+
+/// How long a machine keeps a removed machine's key after it first sees the removal: two sync
+/// rounds (`TICK` in [`crate::sync`] is one second). Its links with that machine send it the copy
+/// that removed it, then close, at the next sync round; revoking first would close them before
+/// that send.
+pub const REMOVAL_SENT: Duration = Duration::from_secs(2);
 
 /// The path a joining machine posts its code to.
 pub const JOIN_PATH: &str = "/api/join";
@@ -604,6 +612,9 @@ struct KeysInner {
     taken: AtomicU64,
     /// The machines listed with a key that does not parse, each warned about once.
     unparsed: Mutex<BTreeSet<MachineId>>,
+    /// Counts the key tables saved, so a link waiting to learn its machine was revoked hears of
+    /// it at once instead of at its next check.
+    changed: tokio::sync::watch::Sender<u64>,
 }
 
 struct Held {
@@ -636,6 +647,26 @@ impl Shown {
     }
 }
 
+/// The machines `settings` shows removed from the machine list: each with a `Machine` stamp
+/// and no list entry. The one definition of removed: a machine an edit listed has the stamp and
+/// an entry, and is not. A removal is one-way: no merge or acting machine lists a removed
+/// machine again ([`crate::coordinator::merge`]).
+pub fn removed(settings: &SharedSettings) -> impl Iterator<Item = MachineId> + '_ {
+    settings.stamps.keys().filter_map(|key| match key {
+        StampKey::Setting(SettingKey::Machine(id))
+            if !settings.machines.iter().any(|m| m.id == *id) =>
+        {
+            Some(*id)
+        }
+        _ => None,
+    })
+}
+
+/// Whether `settings` shows `machine` removed from the machine list: see [`removed`].
+pub fn is_removed(settings: &SharedSettings, machine: MachineId) -> bool {
+    removed(settings).any(|id| id == machine)
+}
+
 impl Keys {
     /// This machine's identity and key table, kept in `secrets`, with no codes outstanding.
     /// A machine with no identity yet is given one, and its own entry is always its own key.
@@ -659,6 +690,7 @@ impl Keys {
                 saving: Mutex::new(()),
                 taken: AtomicU64::new(0),
                 unparsed: Mutex::new(BTreeSet::new()),
+                changed: tokio::sync::watch::channel(0).0,
             }),
         };
         let own = keys.public_key();
@@ -832,39 +864,96 @@ impl Keys {
         })
     }
 
-    /// Admits the keys the machine list in `store` carries, by [`Keys::learn`], whenever the
-    /// settings change, checked every [`RECHECK`], until the returned future is dropped. A
-    /// change it could not save is tried again on the next check, and warned about once until
-    /// one succeeds.
+    /// Revokes each machine `settings` shows removed from the machine list, a machine with a
+    /// `Machine` stamp and no list entry, that the key table holds active. This machine is never
+    /// revoked, and a machine held no key for, or already revoked, stays as it is. All are
+    /// revoked in one save, and nothing is saved when there is nothing to revoke.
+    ///
+    /// Blocks on the secret store, as [`Keys::open`] does, and behind any other change to the
+    /// key table in this process.
+    pub fn refuse_removed(&self, settings: &SharedSettings) -> Result<(), JoinError> {
+        self.refuse_removed_but(settings, &BTreeSet::new())
+    }
+
+    /// [`Keys::refuse_removed`], leaving the machines in `waiting` as they are.
+    fn refuse_removed_but(
+        &self,
+        settings: &SharedSettings,
+        waiting: &BTreeSet<MachineId>,
+    ) -> Result<(), JoinError> {
+        let me = self.me();
+        let held: Vec<MachineId> = {
+            let table = self.held();
+            removed(settings)
+                .filter(|id| *id != me && !waiting.contains(id))
+                .filter(|id| matches!(table.machines.get(id), Some(Entry::Active { .. })))
+                .collect()
+        };
+        if held.is_empty() {
+            return Ok(());
+        }
+        let saving = self.saving()?;
+        self.change(&saving, |machines| {
+            for id in &held {
+                // Only a key held active is revoked, as the stored table has it now.
+                if matches!(machines.get(id), Some(Entry::Active { .. })) {
+                    machines.insert(*id, Entry::Revoked);
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Acts on the machine list in `store` whenever the settings change, checked every
+    /// [`RECHECK`], until the returned future is dropped: first [`Keys::refuse_removed`], then
+    /// admits the keys the list carries by [`Keys::learn`], so a machine removed is never
+    /// admitted again from the list. A removed machine is revoked only [`REMOVAL_SENT`] after
+    /// this first saw it removed, so its links have sent it the removal before revocation closes
+    /// them; the settings are read again every check until then. A change it could not save is
+    /// tried again on the next check, and warned about once until one succeeds.
     pub async fn follow(&self, store: Arc<Mutex<Store>>) {
         let mut seen = None;
         let mut warned = false;
+        // When this first saw each machine removed. A timeout, not an order of records.
+        let mut first_seen: BTreeMap<MachineId, Instant> = BTreeMap::new();
         let mut every = tokio::time::interval(RECHECK);
         loop {
             every.tick().await;
             let prev = seen;
-            let changed = on_store(&store, move |store| {
-                Ok::<_, StoreError>(store.settings_since(prev)?.map(|s| (s.seq, s.machines)))
-            })
-            .await;
-            let (seq, machines) = match changed {
-                Ok(Some(changed)) => changed,
+            let changed = on_store(&store, move |store| store.settings_since(prev)).await;
+            let settings = match changed {
+                Ok(Some(settings)) => settings,
                 Ok(None) => continue,
                 Err(error) => {
                     tracing::warn!("join: cannot read the machine list for its keys: {error}");
                     continue;
                 }
             };
+            let seq = settings.seq;
+            let now = Instant::now();
+            let waiting: BTreeSet<MachineId> = removed(&settings)
+                .filter(|id| {
+                    now.duration_since(*first_seen.entry(*id).or_insert(now)) < REMOVAL_SENT
+                })
+                .collect();
             let keys = self.clone();
-            match tokio::task::spawn_blocking(move || keys.learn(&machines)).await {
+            let young = waiting.clone();
+            let acted = tokio::task::spawn_blocking(move || {
+                keys.refuse_removed_but(&settings, &young)?;
+                keys.learn(&settings.machines)
+            })
+            .await;
+            match acted {
                 Ok(Ok(())) => {
-                    seen = Some(seq);
+                    // Done with this copy only once no removal in it waits: until then every
+                    // check reads it again.
+                    seen = waiting.is_empty().then_some(seq);
                     warned = false;
                 }
                 Ok(Err(error)) => {
                     if !warned {
                         tracing::warn!(
-                            "join: cannot admit the keys the machine list carries, trying again: \
+                            "join: cannot update the keys from the machine list, trying again: \
                              {error}"
                         );
                     }
@@ -873,7 +962,7 @@ impl Keys {
                 Err(error) => {
                     if !warned {
                         tracing::warn!(
-                            "join: admitting the keys the machine list carries stopped, trying \
+                            "join: updating the keys from the machine list stopped, trying \
                              again: {error}"
                         );
                     }
@@ -1051,6 +1140,7 @@ impl Keys {
     ) -> Result<(), JoinError> {
         let machines = change_table(&*self.inner.secrets, edit)?;
         self.held().machines = machines;
+        self.inner.changed.send_modify(|saved| *saved += 1);
         Ok(())
     }
 
@@ -1202,12 +1292,17 @@ async fn relay(outer: Conn, inner: Conn, keys: Keys, peer: MachineId) {
     }
 }
 
-/// Returns once `keys` no longer admits `peer`, checked every [`RECHECK`], so a link with it
-/// selected against this closes.
+/// Returns once `keys` no longer admits `peer`, checked every [`RECHECK`] and whenever this
+/// process saves the key table, so a link with it selected against this closes as soon as the
+/// machine is revoked here.
 async fn revoked(keys: &Keys, peer: MachineId) {
     let mut every = tokio::time::interval(RECHECK);
+    let mut saved = keys.inner.changed.subscribe();
     loop {
-        every.tick().await;
+        tokio::select! {
+            _ = every.tick() => {}
+            _ = saved.changed() => {}
+        }
         if let Err(refused) = keys.admitted(peer) {
             tracing::info!("join: link with {peer} closed: {refused}");
             return;
@@ -1416,7 +1511,7 @@ mod tests {
 
     use foundry_proto::ids::MachineId;
     use foundry_proto::messages::{PROTOCOL, PeerMessage};
-    use foundry_proto::settings::{Machine, SharedSettings};
+    use foundry_proto::settings::{Machine, SettingKey, SharedSettings, Stamp, StampKey};
     use futures::future::BoxFuture;
     use tokio::time::timeout;
 
@@ -2286,6 +2381,244 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         following.abort();
+    }
+
+    /// Settings whose list holds `listed` and that stamp every machine in `removed` as removed
+    /// from it.
+    fn settings_with(seq: u64, listed: Vec<Machine>, removed: &[MachineId]) -> SharedSettings {
+        let mut settings = SharedSettings {
+            seq,
+            machines: listed,
+            ..SharedSettings::default()
+        };
+        for (n, id) in removed.iter().enumerate() {
+            settings.stamps.insert(
+                StampKey::Setting(SettingKey::Machine(*id)),
+                Stamp {
+                    seq: n as u64 + 1,
+                    by: *id,
+                },
+            );
+        }
+        settings
+    }
+
+    #[test]
+    fn a_machine_removed_from_the_list_and_held_active_is_revoked_and_saved() {
+        let secrets = Arc::new(MemorySecrets::default());
+        let host = Keys::open(secrets.clone()).unwrap();
+        let (gone, kept) = (machine_keys(), machine_keys());
+        admit(&host, &gone);
+        admit(&host, &kept);
+        let settings = settings_with(
+            2,
+            vec![listed(kept.me(), kept.public_key().hex())],
+            &[gone.me()],
+        );
+
+        host.refuse_removed(&settings).unwrap();
+
+        assert_eq!(host.state(gone.me()), KeyState::Revoked);
+        assert_eq!(host.state(kept.me()), KeyState::Active);
+        let reopened = Keys::open(secrets).unwrap();
+        assert_eq!(reopened.state(gone.me()), KeyState::Revoked);
+    }
+
+    #[test]
+    fn this_machine_never_revokes_itself_even_when_stamped_removed() {
+        let host = machine_keys();
+        let settings = settings_with(2, vec![], &[host.me()]);
+
+        host.refuse_removed(&settings).unwrap();
+
+        assert_eq!(host.state(host.me()), KeyState::Active);
+    }
+
+    #[test]
+    fn a_removed_machine_with_no_key_or_a_revocation_is_left_as_it_is() {
+        let host = machine_keys();
+        let (unknown, revoked) = (MachineId::random(), machine_keys());
+        admit(&host, &revoked);
+        host.revoke(revoked.me()).unwrap();
+        let settings = settings_with(2, vec![], &[unknown, revoked.me()]);
+
+        host.refuse_removed(&settings).unwrap();
+
+        assert_eq!(host.state(unknown), KeyState::NoKey);
+        assert_eq!(host.state(revoked.me()), KeyState::Revoked);
+    }
+
+    #[test]
+    fn nothing_is_saved_when_no_removed_machine_is_held_active() {
+        let flaky = Arc::new(Flaky::default());
+        let host = Keys::open(flaky.clone()).unwrap();
+        let revoked = machine_keys();
+        admit(&host, &revoked);
+        host.revoke(revoked.me()).unwrap();
+        let settings = settings_with(2, vec![], &[MachineId::random(), revoked.me(), host.me()]);
+        let saved = host.inner.changed.subscribe();
+        // Any save would fail, and bump the signal when it did not.
+        flaky.failing.store(true, Ordering::SeqCst);
+
+        host.refuse_removed(&settings).unwrap();
+
+        assert!(!saved.has_changed().unwrap());
+        assert_eq!(host.state(host.me()), KeyState::Active);
+    }
+
+    #[test]
+    fn a_machine_still_in_the_list_is_not_revoked_whatever_its_stamp() {
+        let host = machine_keys();
+        let peer = machine_keys();
+        admit(&host, &peer);
+        // Removed, then added again: the stamp stays, the list holds it.
+        let settings = settings_with(
+            3,
+            vec![listed(peer.me(), peer.public_key().hex())],
+            &[peer.me()],
+        );
+
+        host.refuse_removed(&settings).unwrap();
+
+        assert_eq!(host.state(peer.me()), KeyState::Active);
+    }
+
+    #[tokio::test]
+    async fn a_machine_revoked_on_removal_stays_revoked_when_listed_again_with_its_key() {
+        let host = machine_keys();
+        let peer = machine_keys();
+        admit(&host, &peer);
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path().join("foundry.db")).unwrap();
+        assert!(
+            store
+                .apply_settings(settings_with(2, vec![], &[peer.me()]))
+                .unwrap()
+        );
+        let store = Arc::new(Mutex::new(store));
+        let following = tokio::spawn({
+            let host = host.clone();
+            let store = store.clone();
+            async move { host.follow(store).await }
+        });
+        let deadline = tokio::time::Instant::now() + RECHECK * 5;
+        while host.state(peer.me()) != KeyState::Revoked {
+            assert!(tokio::time::Instant::now() < deadline, "never revoked");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // A later copy lists it again with its key.
+        let later = settings_with(
+            3,
+            vec![listed(peer.me(), peer.public_key().hex())],
+            &[peer.me()],
+        );
+        assert!(store.lock().unwrap().apply_settings(later.clone()).unwrap());
+        tokio::time::sleep(RECHECK * 3).await;
+        assert_eq!(host.state(peer.me()), KeyState::Revoked);
+        host.learn(&later.machines).unwrap();
+        host.refuse_removed(&later).unwrap();
+        assert_eq!(host.state(peer.me()), KeyState::Revoked);
+        following.abort();
+    }
+
+    #[tokio::test]
+    async fn a_revocation_that_cannot_be_saved_is_tried_again_on_the_next_check() {
+        let flaky = Arc::new(Flaky::default());
+        let host = Keys::open(flaky.clone()).unwrap();
+        let gone = machine_keys();
+        admit(&host, &gone);
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path().join("foundry.db")).unwrap();
+        assert!(
+            store
+                .apply_settings(settings_with(2, vec![], &[gone.me()]))
+                .unwrap()
+        );
+        let store = Arc::new(Mutex::new(store));
+        flaky.failing.store(true, Ordering::SeqCst);
+        let following = tokio::spawn({
+            let host = host.clone();
+            async move { host.follow(store).await }
+        });
+
+        tokio::time::sleep(RECHECK * 3).await;
+        assert_eq!(host.state(gone.me()), KeyState::Active);
+        flaky.failing.store(false, Ordering::SeqCst);
+        let deadline = tokio::time::Instant::now() + RECHECK * 5;
+        while host.state(gone.me()) != KeyState::Revoked {
+            assert!(tokio::time::Instant::now() < deadline, "never revoked");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        following.abort();
+    }
+
+    #[tokio::test]
+    async fn a_removed_machine_keeps_its_key_until_its_links_have_had_time_to_send_it_the_removal()
+    {
+        let host = machine_keys();
+        let gone = machine_keys();
+        admit(&host, &gone);
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path().join("foundry.db")).unwrap();
+        assert!(
+            store
+                .apply_settings(settings_with(2, vec![], &[gone.me()]))
+                .unwrap()
+        );
+        let store = Arc::new(Mutex::new(store));
+        let started = tokio::time::Instant::now();
+        let following = tokio::spawn({
+            let host = host.clone();
+            async move { host.follow(store).await }
+        });
+
+        // No check can see the removal before `started`, so none may revoke it before
+        // REMOVAL_SENT has passed from then.
+        tokio::time::sleep(REMOVAL_SENT - RECHECK / 2).await;
+        assert_eq!(
+            host.state(gone.me()),
+            KeyState::Active,
+            "revoked before its links could send it the removal"
+        );
+        let deadline = started + REMOVAL_SENT + RECHECK * 5;
+        while host.state(gone.me()) != KeyState::Revoked {
+            assert!(tokio::time::Instant::now() < deadline, "never revoked");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        following.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_link_closes_at_once_when_its_machine_is_revoked_not_at_the_next_check() {
+        let host = machine_keys();
+        let peer = machine_keys();
+        admit(&host, &peer);
+        let closing = tokio::spawn({
+            let (host, peer) = (host.clone(), peer.me());
+            async move { revoked(&host, peer).await }
+        });
+        // Past the first check, so the next is a RECHECK away.
+        tokio::time::sleep(RECHECK / 4).await;
+        assert!(!closing.is_finished());
+
+        host.revoke(peer.me()).unwrap();
+
+        timeout(RECHECK / 4, closing)
+            .await
+            .expect("the link closes without waiting for the next check")
+            .unwrap();
+    }
+
+    #[test]
+    fn removed_names_the_machines_stamped_removed_and_not_listed() {
+        let (gone, kept) = (MachineId::random(), MachineId::random());
+        let settings = settings_with(3, vec![machine(kept)], &[gone, kept]);
+
+        assert_eq!(removed(&settings).collect::<Vec<_>>(), [gone]);
+        assert!(is_removed(&settings, gone));
+        assert!(!is_removed(&settings, kept));
+        assert!(!is_removed(&settings, MachineId::random()));
     }
 
     #[tokio::test(start_paused = true)]

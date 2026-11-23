@@ -12,10 +12,10 @@ use std::time::Duration;
 use foundry_proto::ids::MachineId;
 use foundry_proto::messages::{PROTOCOL, PeerMessage};
 use foundry_proto::settings::{Machine, SharedSettings};
-use foundryd::api::machine_add;
 use foundryd::api::machine_names::Listing;
+use foundryd::api::{machine_add, machine_remove};
 use foundryd::coordinator::Coordinator;
-use foundryd::join::{self, KeyState, KeyedDialer, Keys};
+use foundryd::join::{self, KeyState, KeyedDialer, Keys, RECHECK, REMOVAL_SENT};
 use foundryd::lister::Lister;
 use foundryd::secrets::FileSecrets;
 use foundryd::store::Store;
@@ -211,7 +211,12 @@ impl Member {
         let port = listener.local_addr().unwrap().port();
         let lister = Lister::new(self.coordinator.clone(), self.store.clone());
         let app = join::router(self.keys.clone(), lister)
-            .merge(machine_add::router(self.keys.clone(), self.store.clone()));
+            .merge(machine_add::router(self.keys.clone(), self.store.clone()))
+            .merge(machine_remove::router(
+                self.keys.me(),
+                self.coordinator.clone(),
+                self.store.clone(),
+            ));
         tokio::spawn(async move {
             axum::serve(
                 listener,
@@ -221,6 +226,21 @@ impl Member {
             .unwrap()
         });
         port
+    }
+
+    /// The numbers of the record links to `machine` that are open. `Peers` names a link by
+    /// number, from 0, one per link ever opened, and has no read of which are open, so this
+    /// asks after the first 64: far more than a three or four machine test opens.
+    fn open_links(&self, machine: MachineId) -> Vec<u64> {
+        (0..64)
+            .filter(|link| self.peers.is_open(machine, *link))
+            .collect()
+    }
+
+    /// Whether any link to `machine` is open, asking after the links numbered up to `through`
+    /// and 64 more.
+    fn linked_after(&self, machine: MachineId, through: u64) -> bool {
+        (0..=through + 64).any(|link| self.peers.is_open(machine, link))
     }
 
     fn settings(&self) -> SharedSettings {
@@ -536,4 +556,265 @@ async fn hear(peers: &Peers, peer: MachineId) {
     .await;
     drop(theirs);
     accepting.await.unwrap();
+}
+
+/// How often a link sends new records and settings: `TICK` in `foundryd::sync`, which is
+/// private. One sync round.
+const SYNC_ROUND: Duration = Duration::from_secs(1);
+
+/// Scheduling slack on the bounds below, and nothing else: it covers the polling and a busy
+/// machine, not any wait the code is allowed.
+const SLACK: Duration = Duration::from_millis(500);
+
+/// [`until`], polling every 20 ms so a bound is measured to that.
+async fn until_fast(limit: Duration, what: &str, mut done: impl FnMut() -> bool) {
+    let start = tokio::time::Instant::now();
+    while !done() {
+        assert!(
+            start.elapsed() <= limit,
+            "{what}: not done within {limit:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// POSTs the remove of `machine` to the machine serving `port`: the status.
+async fn post_remove(port: u16, machine: MachineId) -> u16 {
+    tokio::task::spawn_blocking(move || {
+        ureq::post(format!(
+            "http://127.0.0.1:{port}/api/machines/{machine}/remove"
+        ))
+        .send_empty()
+        .unwrap()
+        .status()
+        .as_u16()
+    })
+    .await
+    .unwrap()
+}
+
+/// Starts the guarded listing the daemon runs, with no wait for peers, on `member`'s machine:
+/// `looks` looks, a few milliseconds apart.
+async fn list_guarded(member: &Member, looks: usize) {
+    let mut listing = Listing::new(
+        member.keys.me(),
+        member.keys.public_key().hex().to_owned(),
+        member.coordinator.clone(),
+        member.store.clone(),
+        Duration::ZERO,
+        Arc::new(AtomicBool::new(false)),
+    );
+    let mut warned = false;
+    for _ in 0..looks {
+        foundryd::daemon::list_unless_removed(
+            &mut listing,
+            &member.store,
+            member.keys.me(),
+            &mut warned,
+            Ok(own("c", "127.0.0.4")),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn holds_workspace_of(
+    member: &Member,
+    owner: MachineId,
+    id: foundry_proto::ids::WorkspaceId,
+) -> bool {
+    lock(&member.store)
+        .since(owner, 0)
+        .unwrap()
+        .iter()
+        .any(|r| matches!(r, foundry_proto::record::AnyRecord::Workspace(w) if w.body.id == id))
+}
+
+#[tokio::test]
+async fn a_machine_removed_through_a_is_revoked_by_every_machine_and_its_links_close() {
+    let net = Net::default();
+    let dirs: Vec<TempDir> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let a = Member::start(&net, &dirs[0], &a_entry()).await;
+    let port = a.serve().await;
+    let b = joined(&net, &dirs[1], port, own("b", "127.0.0.3")).await;
+    let c = joined(&net, &dirs[2], port, own("c", "127.0.0.4")).await;
+    let (a_id, b_id, c_id) = (a.keys.me(), b.keys.me(), c.keys.me());
+    until(Duration::from_secs(30), "all three linked", || {
+        !a.open_links(b_id).is_empty()
+            && !a.open_links(c_id).is_empty()
+            && !b.open_links(a_id).is_empty()
+            && !b.open_links(c_id).is_empty()
+            && !c.open_links(a_id).is_empty()
+            && !c.open_links(b_id).is_empty()
+    })
+    .await;
+    // C has a record of its own, and it has reached A.
+    let workspace_id = foundry_proto::ids::WorkspaceId::random();
+    {
+        let mut store = lock(&c.store);
+        let version = store.own_next_version().unwrap();
+        store
+            .apply(&crate::workspace(workspace_id, false)(c_id, version), c_id)
+            .unwrap();
+    }
+    until(Duration::from_secs(10), "C's record on A", || {
+        holds_workspace_of(&a, c_id, workspace_id)
+    })
+    .await;
+    // The links with C that are open now: the probe is shown to see them.
+    let (on_a, on_b) = (a.open_links(c_id), b.open_links(c_id));
+    assert!(!on_a.is_empty() && !on_b.is_empty(), "{on_a:?} {on_b:?}");
+    let highest = on_a.iter().chain(&on_b).copied().max().unwrap();
+
+    // In A's UI: remove C. A's links send C the copy that removed it and close at the next sync
+    // round. B hears the removal in one sync round and does the same. C, sent the copy by both,
+    // holds its own removal.
+    assert_eq!(post_remove(port, c_id).await, 204);
+    let removed = tokio::time::Instant::now();
+    let bound = RECHECK + SYNC_ROUND + SLACK;
+    until_fast(
+        bound,
+        "C unlinked on A and B, and holding its removal",
+        || {
+            !a.linked_after(c_id, highest)
+                && !b.linked_after(c_id, highest)
+                && join::is_removed(&c.settings(), c_id)
+        },
+    )
+    .await;
+    eprintln!("closed {:?} after the 204", removed.elapsed());
+    // Each revokes C once its links have had REMOVAL_SENT to send C the removal.
+    until_fast(
+        bound + REMOVAL_SENT + RECHECK,
+        "C revoked on A and B",
+        || a.keys.state(c_id) == KeyState::Revoked && b.keys.state(c_id) == KeyState::Revoked,
+    )
+    .await;
+    eprintln!("revoked {:?} after the 204", removed.elapsed());
+    assert!(on_a.iter().all(|l| !a.peers.is_open(c_id, *l)));
+    assert!(on_b.iter().all(|l| !b.peers.is_open(c_id, *l)));
+    assert_eq!(a.keys.state(b_id), KeyState::Active);
+    assert_eq!(b.keys.state(a_id), KeyState::Active);
+    assert_eq!(a.keys.state(a_id), KeyState::Active);
+    assert!(a.settings().machines.iter().all(|m| m.id != c_id));
+    // What `GET /api/state` reads: A still holds C's records.
+    let state = a.peers.state().await.unwrap();
+    assert!(
+        state.iter().any(|r| r.owner() == c_id),
+        "A lost C's records"
+    );
+    assert!(holds_workspace_of(&a, c_id, workspace_id));
+}
+
+#[tokio::test]
+async fn a_removed_machine_that_holds_its_removal_never_lists_itself_again_and_one_that_missed_it_revokes_it()
+ {
+    let net = Net::default();
+    let dirs: Vec<TempDir> = (0..4).map(|_| tempfile::tempdir().unwrap()).collect();
+    let a = Member::start(&net, &dirs[0], &a_entry()).await;
+    let port = a.serve().await;
+    let b = joined(&net, &dirs[1], port, own("b", "127.0.0.3")).await;
+    let c = joined(&net, &dirs[2], port, own("c", "127.0.0.4")).await;
+    let (b_id, c_id) = (b.keys.me(), c.keys.me());
+    // D joins through A, then starts on a net of its own that reaches nobody, with the list A
+    // holds now, so it holds C's key and is out of touch while C is removed.
+    let d_code = add_localhost(port).await;
+    let d_own = own("d", "127.0.0.5");
+    let d_id = join_with(&dirs[3], port, d_code, d_own.clone())
+        .await
+        .unwrap();
+    until(Duration::from_secs(30), "D listed on A, B and C", || {
+        [&a, &b, &c]
+            .iter()
+            .all(|m| m.settings().machines.iter().any(|x| x.id == d_id))
+            && c.keys.state(d_id) == KeyState::Active
+            && b.keys.state(d_id) == KeyState::Active
+    })
+    .await;
+    {
+        let mut seeded = Store::open(dirs[3].path().join("foundry.db")).unwrap();
+        seeded.apply_settings(a.settings()).unwrap();
+    }
+    let d_net = Net::default();
+    let d = Member::start(&d_net, &dirs[3], &d_own).await;
+    until(Duration::from_secs(10), "D holds C's key", || {
+        d.keys.state(c_id) == KeyState::Active
+    })
+    .await;
+    until(Duration::from_secs(30), "A, B and C linked", || {
+        !a.open_links(c_id).is_empty() && !c.open_links(b_id).is_empty()
+    })
+    .await;
+
+    assert_eq!(post_remove(port, c_id).await, 204);
+    // The links that close on C send it the copy that removed it first.
+    until(Duration::from_secs(10), "C holds its own removal", || {
+        join::is_removed(&c.settings(), c_id)
+    })
+    .await;
+
+    // C acts alone now and runs its listing, as its daemon does, for several looks.
+    list_guarded(&c, 10).await;
+    assert!(
+        c.settings().machines.iter().all(|m| m.id != c_id),
+        "C listed itself again"
+    );
+
+    // D, which never heard of the removal, links with C first. It takes C's copy, which still
+    // has C removed, and revokes it.
+    lock(&d_net.0).insert(
+        c_id,
+        ServedBy {
+            keys: c.keys.clone(),
+            peers: c.peers.clone(),
+        },
+    );
+    until(Duration::from_secs(30), "D revokes C", || {
+        d.keys.state(c_id) == KeyState::Revoked
+    })
+    .await;
+    assert!(d.settings().machines.iter().all(|m| m.id != c_id));
+    assert!(c.settings().machines.iter().all(|m| m.id != c_id));
+}
+
+#[tokio::test]
+async fn a_removed_machine_cannot_join_again_through_a_machine_that_never_held_its_key() {
+    let net = Net::default();
+    let dirs: Vec<TempDir> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let a = Member::start(&net, &dirs[0], &a_entry()).await;
+    let port = a.serve().await;
+    let c_own = own("c", "127.0.0.4");
+    let c = joined(&net, &dirs[1], port, c_own.clone()).await;
+    let c_id = c.keys.me();
+    until(Duration::from_secs(30), "A and C linked", || {
+        !a.open_links(c_id).is_empty()
+    })
+    .await;
+    assert_eq!(post_remove(port, c_id).await, 204);
+    until(Duration::from_secs(10), "A holds the removal", || {
+        join::is_removed(&a.settings(), c_id)
+    })
+    .await;
+
+    // D joins after the removal, so its list never carried C's key, and it holds the removal.
+    let d = joined(&net, &dirs[2], port, own("d", "127.0.0.5")).await;
+    until(Duration::from_secs(10), "D holds the removal", || {
+        join::is_removed(&d.settings(), c_id)
+    })
+    .await;
+    assert_eq!(d.keys.state(c_id), KeyState::NoKey);
+    let d_port = d.serve().await;
+
+    // On D's board, someone adds C again, and C runs the join under its old identity.
+    let code = add_localhost(d_port).await;
+    let rejoined = join_with(&dirs[1], d_port, code, c_own).await;
+
+    assert!(rejoined.is_err(), "a removed machine joined again");
+    assert_ne!(d.keys.state(c_id), KeyState::Active);
+    for member in [&a, &d] {
+        assert!(
+            member.settings().machines.iter().all(|m| m.id != c_id),
+            "C is listed again"
+        );
+    }
 }

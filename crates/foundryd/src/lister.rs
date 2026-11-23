@@ -51,10 +51,10 @@ impl Lister {
             .iter()
             .find(|m| at_address(m) || m.name.trim().to_lowercase() == wanted)
         {
-            // A rename keeps the address, and no machine can be removed yet.
+            // A rename keeps the address, so a machine at that address has to be removed.
             let way_out = if at_address(other) {
-                "a machine cannot be removed from the list yet, so this one cannot join at that \
-                 address"
+                "remove that machine with Remove from fleet on another machine's machines board, \
+                 then run the command again"
             } else {
                 "rename that machine first"
             };
@@ -227,7 +227,11 @@ mod tests {
         let why = listed.lister.list(joining.clone()).await.unwrap_err();
 
         assert!(why.contains("\"trilogy-mac\""), "{why}");
-        assert!(why.contains("cannot join at that address"), "{why}");
+        assert!(
+            why.contains("remove that machine with Remove from fleet"),
+            "{why}"
+        );
+        assert!(!why.contains("cannot be removed"), "{why}");
         assert_eq!(listed.held(joining.id), None);
         let warnings = logged.warnings();
         assert_eq!(warnings.len(), 1, "{warnings:?}");

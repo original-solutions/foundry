@@ -316,6 +316,8 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
         .layer(middleware::from_fn_with_state(api.clone(), api::same_site));
     let machine_limit_routes = api::machine_limits::router(coordinator.clone(), store.clone())
         .layer(middleware::from_fn_with_state(api.clone(), api::same_site));
+    let machine_remove_routes = api::machine_remove::router(me, coordinator.clone(), store.clone())
+        .layer(middleware::from_fn_with_state(api.clone(), api::same_site));
     let app = api::router(api)
         .merge(sessions.router())
         .merge(attention_routes)
@@ -324,6 +326,7 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
         .merge(join_routes)
         .merge(machine_add_routes)
         .merge(machine_limit_routes)
+        .merge(machine_remove_routes)
         .merge(ws::keyed_router(peers.clone(), keys.clone()));
 
     let mut terminate =
@@ -360,7 +363,7 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
     services.spawn(named("the Tailscale address watch", tailscale.watch()));
     services.spawn(named(
         "the machine list entry",
-        list_this_machine(answered, listing),
+        list_this_machine(answered, listing, store.clone(), me, own_entry),
     ));
     services.spawn(named("updates", update::run(home.clone())));
     services.spawn(named("gateway health", gateway_reader.run()));
@@ -532,19 +535,54 @@ fn withdrawn(
 /// to `listing`, which also reads the watch's mark that Tailscale was away. It runs apart from
 /// the watch, so an edit waiting on the coordinator never holds up binding an address.
 ///
+/// `ask` gives what Tailscale calls this machine: [`own_entry`] in the daemon.
+///
 /// `tailscale status` is asked only when [`Told`] has no answer for what `ip` said. Each look
 /// still reads this machine's copy of the settings: that is what moves back an address another
 /// machine's edit put back.
-async fn list_this_machine(
+async fn list_this_machine<F>(
     mut answered: tokio::sync::watch::Receiver<BTreeSet<IpAddr>>,
     mut listing: api::machine_names::Listing,
-) {
+    store: Arc<Mutex<Store>>,
+    me: foundry_proto::ids::MachineId,
+    ask: impl Fn() -> F,
+) where
+    F: Future<Output = Result<Entry, String>>,
+{
     let mut told = Told::default();
+    let mut warned = false;
     while answered.changed().await.is_ok() {
         let ips = answered.borrow_and_update().clone();
-        let entry = told.entry(&ips, own_entry).await;
-        listing.list(entry).await;
+        let entry = told.entry(&ips, &ask).await;
+        list_unless_removed(&mut listing, &store, me, &mut warned, entry).await;
     }
+}
+
+/// [`api::machine_names::Listing::list`], unless this machine's copy of the settings shows it
+/// was removed from the fleet ([`join::is_removed`]): then nothing is listed, so a removed
+/// machine never takes itself back, and it warns once, in `warned`. A machine never listed has
+/// no such stamp, so its first listing is as ever.
+pub async fn list_unless_removed(
+    listing: &mut api::machine_names::Listing,
+    store: &Arc<Mutex<Store>>,
+    me: foundry_proto::ids::MachineId,
+    warned: &mut bool,
+    entry: Result<Entry, String>,
+) {
+    let settings = crate::sync::on_store(store, |store| store.settings()).await;
+    if let Ok(settings) = &settings
+        && join::is_removed(settings, me)
+    {
+        if !*warned {
+            tracing::warn!(
+                "this machine was removed from the fleet and no longer lists itself; it needs a \
+                 new identity to join again"
+            );
+        }
+        *warned = true;
+        return;
+    }
+    listing.list(entry).await;
 }
 
 /// What `tailscale status` last said this machine is, and the addresses `ip` gave just before,
@@ -788,6 +826,9 @@ mod tests {
     use std::time::Duration;
 
     use axum::Router;
+
+    use foundry_proto::ids::MachineId;
+    use foundry_proto::settings::{SettingKey, SharedSettings, StampKey};
 
     use super::*;
     use crate::secrets::SecretsError;
@@ -1496,5 +1537,142 @@ mod tests {
             items.iter().any(|item| item.kind == Kind::PlacementWaiting),
             "{items:?}"
         );
+    }
+
+    /// A coordinator and listing for a machine that acts alone, over a store holding what
+    /// `settings` makes of an empty copy.
+    fn listing_over(
+        settings: impl FnOnce(MachineId, &mut SharedSettings),
+    ) -> (
+        tempfile::TempDir,
+        MachineId,
+        Arc<Mutex<Store>>,
+        api::machine_names::Listing,
+    ) {
+        struct Nobody;
+        impl crate::sync::Dialer for Nobody {
+            fn dial(
+                &self,
+                _: &foundry_proto::settings::Machine,
+            ) -> futures::future::BoxFuture<'static, io::Result<crate::sync::Conn>> {
+                Box::pin(async { Err(io::Error::other("nobody")) })
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let me = foundry_proto::ids::MachineId::random();
+        let mut store = Store::open(dir.path().join("foundry.db")).unwrap();
+        let mut held = store.settings().unwrap();
+        held.seq += 1;
+        settings(me, &mut held);
+        store.apply_settings(held).unwrap();
+        let store = Arc::new(Mutex::new(store));
+        let peers = Peers::new(me, store.clone(), Arc::new(Nobody));
+        let coordinator = Arc::new(crate::coordinator::Coordinator::new(
+            me,
+            store.clone(),
+            peers.clone(),
+        ));
+        peers.coordinate(coordinator.clone());
+        let listing = api::machine_names::Listing::new(
+            me,
+            "ab".repeat(32),
+            coordinator,
+            store.clone(),
+            Duration::ZERO,
+            Arc::new(AtomicBool::new(false)),
+        );
+        (dir, me, store, listing)
+    }
+
+    fn here() -> Entry {
+        Entry {
+            name: "studio".into(),
+            address: "100.64.0.1".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_machine_removed_from_the_fleet_does_not_list_itself_again() {
+        let (_dir, me, store, mut listing) = listing_over(|me, settings| {
+            settings.stamps.insert(
+                StampKey::Setting(SettingKey::Machine(me)),
+                foundry_proto::settings::Stamp { seq: 1, by: me },
+            );
+        });
+        let before = store.lock().unwrap().settings().unwrap();
+        let mut warned = false;
+
+        for _ in 0..5 {
+            list_unless_removed(&mut listing, &store, me, &mut warned, Ok(here())).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let after = store.lock().unwrap().settings().unwrap();
+        assert_eq!(after.seq, before.seq);
+        assert!(after.machines.is_empty());
+        assert!(warned);
+    }
+
+    #[tokio::test]
+    async fn a_machine_never_listed_lists_itself_as_before() {
+        let (_dir, me, store, mut listing) = listing_over(|_, _| {});
+        let mut warned = false;
+
+        list_unless_removed(&mut listing, &store, me, &mut warned, Ok(here())).await;
+
+        let after = store.lock().unwrap().settings().unwrap();
+        assert!(after.machines.iter().any(|m| m.id == me));
+        assert!(!warned);
+    }
+
+    /// Runs the daemon's own listing loop on a lone machine whose Tailscale says it is `here`,
+    /// sends `changes` address changes, and gives the loop time to act.
+    async fn run_loop(
+        settings: impl FnOnce(MachineId, &mut SharedSettings),
+        changes: u8,
+    ) -> (tempfile::TempDir, Arc<Mutex<Store>>, MachineId) {
+        let (dir, me, store, listing) = listing_over(settings);
+        let (sender, answered) = tokio::sync::watch::channel(BTreeSet::new());
+        let looping = tokio::spawn(list_this_machine(
+            answered,
+            listing,
+            store.clone(),
+            me,
+            || async { Ok(here()) },
+        ));
+        for n in 0..changes {
+            sender
+                .send(BTreeSet::from([ip(&format!("100.64.0.{}", n + 1))]))
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        looping.abort();
+        // The directory is returned so it outlives the test's last read of the store.
+        (dir, store, me)
+    }
+
+    #[tokio::test]
+    async fn the_daemons_listing_loop_never_lists_a_machine_that_was_removed() {
+        let (_dir, store, me) = run_loop(
+            |me, settings| {
+                settings.stamps.insert(
+                    StampKey::Setting(SettingKey::Machine(me)),
+                    foundry_proto::settings::Stamp { seq: 1, by: me },
+                );
+            },
+            4,
+        )
+        .await;
+
+        let after = store.lock().unwrap().settings().unwrap();
+        assert!(after.machines.iter().all(|m| m.id != me), "{after:?}");
+    }
+
+    #[tokio::test]
+    async fn the_daemons_listing_loop_lists_a_machine_never_removed() {
+        let (_dir, store, me) = run_loop(|_, _| {}, 2).await;
+
+        let after = store.lock().unwrap().settings().unwrap();
+        assert!(after.machines.iter().any(|m| m.id == me), "{after:?}");
     }
 }
