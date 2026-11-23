@@ -127,11 +127,11 @@ fn secret_set_with_any_other_name_exits_1_and_stores_nothing() {
 
 #[test]
 fn dashboard_with_no_daemon_running_exits_1_and_says_so() {
-    let (_held, port) = refusing_port();
-    assert!(
-        std::net::TcpListener::bind(("127.0.0.1", port)).is_err(),
-        "another socket could listen on the held port {port}"
-    );
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
     let home = tempfile::tempdir().unwrap();
     let out = isolated(&["dashboard"], &home)
         .env("FOUNDRY_PORT", port.to_string())
@@ -144,16 +144,6 @@ fn dashboard_with_no_daemon_running_exits_1_and_says_so() {
         stderr.contains(&format!("no daemon is running on 127.0.0.1:{port}")),
         "stderr: {stderr}"
     );
-}
-
-/// A loopback port that refuses every connection while the returned socket lives. The socket
-/// is bound and never listens, so a connection to the port is refused and no other socket,
-/// another process's `bind(0)` included, is handed the port before the test ends.
-fn refusing_port() -> (tokio::net::TcpSocket, u16) {
-    let socket = tokio::net::TcpSocket::new_v4().unwrap();
-    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
-    let port = socket.local_addr().unwrap().port();
-    (socket, port)
 }
 
 /// Asserts `foundryd <args>` exits 2 and says it is not built yet.
