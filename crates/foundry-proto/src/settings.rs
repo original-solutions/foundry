@@ -1055,6 +1055,31 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn poll_seconds_outside_10_to_60_cannot_be_written() {
+        for seconds in [0, 9, 61, u32::MAX] {
+            let factory = FactorySettings {
+                poll_seconds: seconds,
+                ..FactorySettings::default()
+            };
+            let error = serde_json::to_string(&factory).expect_err("written");
+            assert!(error.to_string().contains("poll_seconds"), "{error}");
+            let mut settings = settings_with_factory();
+            settings.factory = Some(factory.clone());
+            assert!(serde_json::to_string(&settings).is_err(), "{seconds}");
+            assert!(
+                serde_json::to_string(&Edit::SetFactory { settings: factory }).is_err(),
+                "{seconds}"
+            );
+        }
+        for seconds in [10, 60] {
+            assert_round_trip(&FactorySettings {
+                poll_seconds: seconds,
+                ..FactorySettings::default()
+            });
+        }
+    }
+
+    #[test]
     fn shared_settings_hold_the_factory_keys_by_name() {
         let settings = settings_with_factory();
         let project = settings.projects[0].id;

@@ -1088,7 +1088,7 @@ mod tests {
 
     #[test]
     fn an_overwritten_factory_setting_reads_plainly() {
-        use foundry_proto::settings::{FactorySettings, ProjectFactory};
+        use foundry_proto::factory::{FactorySettings, ProjectFactory};
 
         let mut world = World::new();
         let (me, peer) = (world.me, world.peer);
@@ -1117,12 +1117,25 @@ mod tests {
                     login: "rawphp".into(),
                     paused: false,
                 })),
-                lost: None,
+                lost: Some(SettingValue::ProjectFactory(ProjectFactory {
+                    on: false,
+                    login: String::new(),
+                    paused: true,
+                })),
+                lost_stamp: Stamp { seq: 2, by: me },
+            },
+        );
+        let gone = ProjectId::random();
+        world.settings.overwritten.insert(
+            SettingKey::ProjectFactory(gone),
+            Overwritten {
+                kept: None,
+                lost: Some(SettingValue::ProjectFactory(ProjectFactory::default())),
                 lost_stamp: Stamp { seq: 2, by: me },
             },
         );
         let items = world.of(Kind::SettingOverwritten);
-        assert_eq!(items.len(), 2, "{items:?}");
+        assert_eq!(items.len(), 3, "{items:?}");
         let fleet = items.iter().find(|i| i.id.ends_with(":factory")).unwrap();
         assert!(
             fleet.what.contains(
@@ -1139,10 +1152,22 @@ mod tests {
             .unwrap();
         assert!(
             one.what.contains(
-                "edited the factory of the project foundry: kept on as rawphp; replaced removed"
+                "edited the factory of the project foundry: kept on as rawphp; replaced off, \
+                 claims paused"
             ),
             "{}",
             one.what
+        );
+        let unknown = items
+            .iter()
+            .find(|i| i.id.ends_with(&format!("factory:{gone}")))
+            .unwrap();
+        assert!(
+            unknown
+                .what
+                .contains("edited the factory of a project: kept removed; replaced off"),
+            "{}",
+            unknown.what
         );
     }
 

@@ -1451,7 +1451,7 @@ mod tests {
 
     #[test]
     fn a_factory_edit_is_numbered_and_held_like_any_setting() {
-        use foundry_proto::settings::{FactorySettings, ProjectFactory};
+        use foundry_proto::factory::{FactorySettings, ProjectFactory};
 
         let fleet = FactorySettings {
             max_runs: 5,
@@ -1491,6 +1491,48 @@ mod tests {
         // Each is a setting of its own: the other settings are as they were.
         assert_eq!(held.machines, base().machines);
         assert_eq!(held.priority, base().priority);
+    }
+
+    #[test]
+    fn a_factory_setting_survives_a_merge_and_a_split_over_it_is_overwritten() {
+        use foundry_proto::factory::{FactorySettings, ProjectFactory};
+
+        let project = ProjectId(uuid::Uuid::from_u128(7));
+        let fleet = |max_runs| FactorySettings {
+            max_runs,
+            ..FactorySettings::default()
+        };
+        let one = ProjectFactory {
+            on: true,
+            login: "rawphp".into(),
+            paused: false,
+        };
+        let set = numbered(&base(), &Edit::SetFactory { settings: fleet(5) }, id(A));
+        let set = numbered(
+            &set,
+            &Edit::SetProjectFactory {
+                project,
+                factory: one.clone(),
+            },
+            id(A),
+        );
+        // A copy from a machine that has not seen the edits leaves them as they are.
+        let kept = merged(&set, &base());
+        assert_eq!(kept.factory, Some(fleet(5)));
+        assert_eq!(kept.project_factory.get(&project), Some(&one));
+        assert_eq!(kept.stamps, set.stamps);
+        assert!(kept.overwritten.is_empty(), "{:?}", kept.overwritten);
+
+        // Both sides of a split set the fleet's factory settings: one holds, and the other is
+        // kept in a "setting overwritten" item.
+        let a = numbered(&base(), &Edit::SetFactory { settings: fleet(4) }, id(A));
+        let b = numbered(&base(), &Edit::SetFactory { settings: fleet(6) }, id(B));
+        let split = merged(&a, &b);
+        let item = &split.overwritten[&SettingKey::Factory];
+        let kept = split.factory.clone().expect("one side holds");
+        assert_eq!(item.kept, Some(SettingValue::Factory(kept.clone())));
+        let lost = if kept == fleet(4) { fleet(6) } else { fleet(4) };
+        assert_eq!(item.lost, Some(SettingValue::Factory(lost)));
     }
 
     // --- what a waiting edit does next ---
