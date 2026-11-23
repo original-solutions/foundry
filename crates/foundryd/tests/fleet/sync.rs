@@ -55,6 +55,7 @@ fn hello_holding(
         protocol,
         machine,
         versions,
+        factory_versions: Default::default(),
     }
 }
 

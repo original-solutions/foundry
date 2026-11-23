@@ -176,6 +176,7 @@ mod tests {
                 protocol: PROTOCOL,
                 machine: peer,
                 versions: BTreeMap::new(),
+                factory_versions: BTreeMap::new(),
             };
             let nothing = PeerMessage::Records {
                 protocol: PROTOCOL,

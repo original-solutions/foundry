@@ -437,7 +437,7 @@ async fn until_seen(socket: &mut Socket, done: impl Fn(&[AnyRecord]) -> bool) ->
         match next_message(socket).await {
             UiMessage::Record { record, .. } => seen.push(record),
             UiMessage::State { records, .. } => seen.extend(records),
-            UiMessage::Settings { .. } => {}
+            UiMessage::Settings { .. } | UiMessage::FactoryStatus { .. } => {}
         }
     }
     seen
@@ -1767,6 +1767,7 @@ async fn events_follow_a_peer_that_comes_online_writes_and_goes_offline() {
         protocol: PROTOCOL,
         machine: peer,
         versions: Default::default(),
+        factory_versions: BTreeMap::new(),
     };
     mine.send
         .send(serde_json::to_string(&hello).unwrap())
@@ -1903,7 +1904,7 @@ async fn events_send_a_change_once() {
                 !matches!(&record, AnyRecord::Workspace(w) if w.body.id == workspace),
                 "the workspace record was sent again at version {version}: {record:?}"
             ),
-            UiMessage::Settings { .. } => {}
+            UiMessage::Settings { .. } | UiMessage::FactoryStatus { .. } => {}
             UiMessage::State { .. } => panic!("the state was sent again"),
         }
     }
@@ -2303,6 +2304,7 @@ async fn no_response_contains_a_secret() {
                 settings_frames += 1;
                 assert!(settings.projects.iter().any(|p| p.name == "late"));
             }
+            UiMessage::FactoryStatus { .. } => {}
         }
         said.push(text);
     }
@@ -2765,6 +2767,7 @@ async fn a_peer_on_an_older_link_shows_online_and_a_call_for_it_is_503_saying_it
             protocol: 2,
             machine: peer,
             versions: Default::default(),
+            factory_versions: BTreeMap::new(),
         },
         PeerMessage::Records {
             protocol: 2,
@@ -3264,6 +3267,7 @@ async fn a_machine_that_cannot_take_the_call_is_passed_over_for_one_that_can() {
             protocol: 2,
             machine: peer,
             versions: Default::default(),
+            factory_versions: BTreeMap::new(),
         },
         PeerMessage::Records {
             protocol: 2,
