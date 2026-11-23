@@ -473,6 +473,9 @@ describe("Machines", () => {
             <button type="button" onClick={() => setHeld(studioFirst)}>
               deliver
             </button>
+            <button type="button" onClick={() => setHeld(laptopFirst)}>
+              deliver the old order
+            </button>
             <Machines machines={fleet(records, held)} history={{}} here={ME} connected />
           </>
         );
@@ -491,6 +494,15 @@ describe("Machines", () => {
       await waitFor(() => expect(names()).toEqual(["studio", "laptop"]));
       expect(within(card("studio")).getByRole<HTMLButtonElement>("button", { name: "Move studio down in the coordinator order" }).disabled).toBe(false);
       expect(calls).toHaveLength(1);
+
+      // Another machine moves it back: nothing is pending, so the moves are on.
+      fireEvent.click(screen.getByRole("button", { name: "deliver the old order" }));
+
+      await waitFor(() => expect(names()).toEqual(["laptop", "studio"]));
+      expect(moves().filter((b) => b.disabled).map((b) => b.getAttribute("aria-label"))).toEqual([
+        "Move laptop up in the coordinator order",
+        "Move studio down in the coordinator order",
+      ]);
     });
 
     it("posts the whole new order when a machine moves", async () => {
@@ -517,6 +529,7 @@ describe("Machines", () => {
       fireEvent.click(within(card("studio")).getByRole("button", { name: "Move studio up in the coordinator order" }));
 
       expect((await screen.findByRole("alert")).textContent).toBe('no machine "x" in the machine list');
+      expect(within(card("studio")).getByRole<HTMLButtonElement>("button", { name: "Move studio up in the coordinator order" }).disabled).toBe(false);
     });
 
     it("offers no move when fewer than two machines are listed", async () => {
