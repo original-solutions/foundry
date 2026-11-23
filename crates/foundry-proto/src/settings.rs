@@ -773,4 +773,443 @@ pub(crate) mod tests {
             assert!(serde_json::to_string(&settings).is_err(), "{load}");
         }
     }
+
+    // Factory settings (P2, protocol 5).
+
+    pub(crate) fn factory_settings() -> FactorySettings {
+        FactorySettings {
+            paused: true,
+            poll_seconds: 15,
+            feedback_seconds: 300,
+            max_runs: 4,
+            max_gates: 1,
+            model: "sonnet".into(),
+            effort: "medium".into(),
+        }
+    }
+
+    pub(crate) fn project_factory() -> ProjectFactory {
+        ProjectFactory {
+            on: true,
+            login: "rawphp".into(),
+            paused: false,
+        }
+    }
+
+    /// [`settings`] with both factory keys set, stamped and overwritten.
+    pub(crate) fn settings_with_factory() -> SharedSettings {
+        let mut settings = settings();
+        let project = settings.projects[0].id;
+        let mac = settings.machines[0].id;
+        settings.factory = Some(factory_settings());
+        settings.project_factory.insert(project, project_factory());
+        settings.stamps.insert(
+            StampKey::Setting(SettingKey::Factory),
+            Stamp { seq: 43, by: mac },
+        );
+        settings.stamps.insert(
+            StampKey::Setting(SettingKey::ProjectFactory(project)),
+            Stamp { seq: 44, by: mac },
+        );
+        settings.stamps.insert(
+            StampKey::Overwritten(SettingKey::Factory),
+            Stamp { seq: 45, by: mac },
+        );
+        settings.stamps.insert(
+            StampKey::Overwritten(SettingKey::ProjectFactory(project)),
+            Stamp { seq: 46, by: mac },
+        );
+        settings.overwritten.insert(
+            SettingKey::Factory,
+            Overwritten {
+                kept: Some(SettingValue::Factory(factory_settings())),
+                lost: Some(SettingValue::Factory(FactorySettings::default())),
+                lost_stamp: Stamp { seq: 42, by: mac },
+            },
+        );
+        settings.overwritten.insert(
+            SettingKey::ProjectFactory(project),
+            Overwritten {
+                kept: None,
+                lost: Some(SettingValue::ProjectFactory(project_factory())),
+                lost_stamp: Stamp { seq: 41, by: mac },
+            },
+        );
+        settings.seq = 46;
+        settings
+    }
+
+    #[test]
+    fn factory_settings_have_the_spec_defaults() {
+        let defaults = FactorySettings::default();
+        assert_eq!(
+            defaults,
+            FactorySettings {
+                paused: false,
+                poll_seconds: 30,
+                feedback_seconds: 600,
+                max_runs: 3,
+                max_gates: 2,
+                model: "opus".into(),
+                effort: "high".into(),
+            }
+        );
+        assert_eq!(
+            serde_json::from_str::<FactorySettings>("{}").unwrap(),
+            defaults
+        );
+        assert_eq!(
+            serde_json::from_str::<FactorySettings>(r#"{"max_runs":5}"#).unwrap(),
+            FactorySettings {
+                max_runs: 5,
+                ..defaults
+            }
+        );
+        assert_eq!(
+            ProjectFactory::default(),
+            ProjectFactory {
+                on: false,
+                login: String::new(),
+                paused: false,
+            }
+        );
+        assert_eq!(
+            serde_json::from_str::<ProjectFactory>("{}").unwrap(),
+            ProjectFactory::default()
+        );
+    }
+
+    #[test]
+    fn factory_settings_round_trip() {
+        assert_round_trip(&factory_settings());
+        assert_round_trip(&FactorySettings::default());
+        assert_round_trip(&project_factory());
+        assert_round_trip(&settings_with_factory());
+        let json = serde_json::to_value(factory_settings()).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "paused": true,
+                "poll_seconds": 15,
+                "feedback_seconds": 300,
+                "max_runs": 4,
+                "max_gates": 1,
+                "model": "sonnet",
+                "effort": "medium",
+            })
+        );
+    }
+
+    #[test]
+    fn poll_seconds_outside_10_to_60_does_not_parse() {
+        for seconds in [0, 1, 9, 61, 600, u64::from(u32::MAX) + 1] {
+            let error = parse_error::<FactorySettings>(&format!(r#"{{"poll_seconds":{seconds}}}"#));
+            assert!(error.contains("poll_seconds"), "{seconds}: {error}");
+            let mut json = serde_json::to_value(settings_with_factory()).unwrap();
+            json["factory"]["poll_seconds"] = serde_json::json!(seconds);
+            assert!(
+                serde_json::from_value::<SharedSettings>(json).is_err(),
+                "{seconds}"
+            );
+        }
+        parse_error::<FactorySettings>(r#"{"poll_seconds":-10}"#);
+        for seconds in [10, 11, 30, 59, 60] {
+            let read: FactorySettings =
+                serde_json::from_str(&format!(r#"{{"poll_seconds":{seconds}}}"#)).unwrap();
+            assert_eq!(read.poll_seconds, seconds);
+        }
+    }
+
+    #[test]
+    fn shared_settings_hold_the_factory_keys_by_name() {
+        let settings = settings_with_factory();
+        let project = settings.projects[0].id;
+        let json = serde_json::to_value(&settings).unwrap();
+        assert_eq!(json["factory"]["max_runs"], 4, "{json}");
+        assert_eq!(
+            json["project_factory"][project.to_string()]["login"],
+            "rawphp"
+        );
+        assert_eq!(json["stamps"]["factory"]["seq"], 43);
+        assert_eq!(json["stamps"][format!("factory:{project}")]["seq"], 44);
+        assert_eq!(json["stamps"]["overwritten:factory"]["seq"], 45);
+        assert_eq!(json["overwritten"]["factory"]["kept"]["setting"], "factory");
+        assert_eq!(
+            json["overwritten"][format!("factory:{project}")]["lost"]["setting"],
+            "project_factory"
+        );
+    }
+
+    #[test]
+    fn settings_written_before_the_factory_still_parse_and_are_written_as_before() {
+        let mac = "67e55044-10b1-426f-9247-bb680e5fe0c8";
+        let json = format!(
+            r#"{{"seq":5,"machines":[],"priority":["{mac}"],"projects":[],"limits":{{}},
+                "stamps":{{"priority":{{"seq":5,"by":"{mac}"}}}},
+                "seen":{{"{mac}":5}},
+                "overwritten":{{"priority":{{"kept":null,"lost":{{"setting":"priority","value":[]}},"lost_stamp":{{"seq":3,"by":"{mac}"}}}}}}}}"#
+        );
+        let read: SharedSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(read.factory, None);
+        assert!(read.project_factory.is_empty());
+        assert_eq!(read.seq, 5);
+        let written = serde_json::to_value(&read).unwrap();
+        assert!(written.get("factory").is_none(), "{written}");
+        assert!(written.get("project_factory").is_none(), "{written}");
+        let old = serde_json::to_value(SharedSettings::default()).unwrap();
+        assert!(old.get("factory").is_none() && old.get("project_factory").is_none());
+    }
+
+    #[test]
+    fn a_factory_setting_key_is_written_as_text_and_read_back() {
+        let project = ProjectId::random();
+        let keys = [
+            (SettingKey::Factory, "factory".to_owned()),
+            (
+                SettingKey::ProjectFactory(project),
+                format!("factory:{project}"),
+            ),
+        ];
+        for (key, text) in keys {
+            assert_eq!(key.to_string(), text);
+            assert_eq!(text.parse::<SettingKey>().unwrap(), key);
+            assert_round_trip(&key);
+            assert!(key.is_factory(), "{key}");
+            let stamp_key = StampKey::Setting(key.clone());
+            assert_eq!(text.parse::<StampKey>().unwrap(), stamp_key);
+            assert_round_trip(&stamp_key);
+            let item = StampKey::Overwritten(key);
+            assert_eq!(
+                format!("overwritten:{text}").parse::<StampKey>().unwrap(),
+                item
+            );
+            assert_round_trip(&item);
+        }
+        for key in [
+            SettingKey::Machine(MachineId::random()),
+            SettingKey::Priority,
+            SettingKey::Project(project),
+            SettingKey::Limits(MachineId::random()),
+        ] {
+            assert!(!key.is_factory(), "{key}");
+        }
+        for text in ["factory:", "factory:not-a-uuid", "factory:x:y", "factories"] {
+            assert!(text.parse::<SettingKey>().is_err(), "{text}");
+            parse_error::<SettingKey>(&format!("\"{text}\""));
+        }
+    }
+
+    #[test]
+    fn each_factory_edit_names_its_setting_and_the_value_it_leaves() {
+        let project = ProjectId::random();
+        let edits = [
+            (
+                Edit::SetFactory {
+                    settings: factory_settings(),
+                },
+                StampKey::Setting(SettingKey::Factory),
+                Some(SettingValue::Factory(factory_settings())),
+            ),
+            (
+                Edit::SetProjectFactory {
+                    project,
+                    factory: project_factory(),
+                },
+                StampKey::Setting(SettingKey::ProjectFactory(project)),
+                Some(SettingValue::ProjectFactory(project_factory())),
+            ),
+        ];
+        for (edit, key, value) in edits {
+            assert_eq!(edit.key(), key, "{edit:?}");
+            assert_eq!(edit.value(), value, "{edit:?}");
+            assert_round_trip(&edit);
+        }
+        let json = format!(
+            r#"{{"kind":"set_project_factory","project":"{project}","factory":{{"on":true,"login":"rawphp","paused":false}}}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<Edit>(&json).unwrap(),
+            Edit::SetProjectFactory {
+                project,
+                factory: project_factory(),
+            }
+        );
+        parse_error::<Edit>(r#"{"kind":"set_factory","settings":{"poll_seconds":5}}"#);
+    }
+
+    #[test]
+    fn a_copy_for_protocol_5_or_later_is_the_whole_copy() {
+        let settings = settings_with_factory();
+        assert_eq!(settings.for_protocol(5), settings);
+        assert_eq!(settings.for_protocol(6), settings);
+    }
+
+    #[test]
+    fn a_copy_for_protocol_4_drops_the_factory_keys_their_stamps_and_their_items() {
+        let settings = settings_with_factory();
+        for protocol in [1, 2, 3, 4] {
+            let copy = settings.for_protocol(protocol);
+            assert_eq!(copy.factory, None);
+            assert!(copy.project_factory.is_empty());
+            assert!(
+                copy.stamps.keys().all(|key| !match key {
+                    StampKey::Setting(key) | StampKey::Overwritten(key) => key.is_factory(),
+                }),
+                "{:?}",
+                copy.stamps
+            );
+            assert!(copy.overwritten.keys().all(|key| !key.is_factory()));
+            // Everything else is as it was.
+            assert_eq!(copy, without_factory(), "protocol {protocol}");
+        }
+        // Without factory keys a copy loses nothing.
+        let plain = settings();
+        assert_eq!(plain.for_protocol(4), plain);
+
+        fn without_factory() -> SharedSettings {
+            let mut settings = settings_with_factory();
+            settings.factory = None;
+            settings.project_factory.clear();
+            settings.stamps.retain(|key, _| {
+                !matches!(
+                    key,
+                    StampKey::Setting(SettingKey::Factory | SettingKey::ProjectFactory(_))
+                        | StampKey::Overwritten(
+                            SettingKey::Factory | SettingKey::ProjectFactory(_)
+                        )
+                )
+            });
+            settings.overwritten.retain(|key, _| {
+                !matches!(key, SettingKey::Factory | SettingKey::ProjectFactory(_))
+            });
+            settings
+        }
+    }
+
+    #[test]
+    fn a_copy_for_protocol_4_parses_with_the_protocol_4_settings_parser() {
+        let settings = settings_with_factory();
+        // The whole copy does not: protocol 4 refuses a key it does not know.
+        let whole = serde_json::to_string(&settings).unwrap();
+        assert!(serde_json::from_str::<v4::SharedSettings>(&whole).is_err());
+
+        let copy = serde_json::to_string(&settings.for_protocol(4)).unwrap();
+        let read: v4::SharedSettings = serde_json::from_str(&copy).expect(&copy);
+        assert_eq!(read.seq, settings.seq);
+        assert_eq!(read.machines, settings.machines);
+        assert_eq!(read.priority, settings.priority);
+        assert_eq!(read.projects, settings.projects);
+        assert_eq!(read.limits, settings.limits);
+        assert_eq!(read.seen, settings.seen);
+        assert_eq!(read.numbered, settings.numbered);
+        assert_eq!(read.stamps.len(), 3);
+        assert_eq!(read.overwritten.len(), 1);
+    }
+
+    /// The shared settings parser as it stood at `PROTOCOL = 4`, copied, so a copy made for a
+    /// peer on protocol 4 is checked against what that peer runs.
+    mod v4 {
+        // Copied as it stood: the test reads only some of what it parses.
+        #![allow(dead_code)]
+
+        use std::collections::BTreeMap;
+        use std::str::FromStr;
+
+        use serde::{Deserialize, Deserializer};
+
+        use crate::ids::{MachineId, ProjectId};
+        use crate::settings::{EditId, Limits, Machine, Project, Stamp};
+
+        #[derive(Debug, Deserialize)]
+        pub struct SharedSettings {
+            pub seq: u64,
+            pub machines: Vec<Machine>,
+            pub priority: Vec<MachineId>,
+            pub projects: Vec<Project>,
+            pub limits: BTreeMap<MachineId, Limits>,
+            #[serde(default)]
+            pub stamps: BTreeMap<StampKey, Stamp>,
+            #[serde(default)]
+            pub seen: BTreeMap<MachineId, u64>,
+            #[serde(default)]
+            pub overwritten: BTreeMap<SettingKey, Overwritten>,
+            #[serde(default)]
+            pub numbered: BTreeMap<EditId, Stamp>,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub enum SettingKey {
+            Machine(MachineId),
+            Priority,
+            Project(ProjectId),
+            Limits(MachineId),
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub enum StampKey {
+            Setting(SettingKey),
+            Overwritten(SettingKey),
+        }
+
+        impl FromStr for SettingKey {
+            type Err = String;
+
+            fn from_str(text: &str) -> Result<Self, Self::Err> {
+                let refused = || format!("`{text}` names no setting");
+                let id = |rest: &str| rest.parse::<uuid::Uuid>().map_err(|_| refused());
+                if text == "priority" {
+                    return Ok(Self::Priority);
+                }
+                let (kind, rest) = text.split_once(':').ok_or_else(refused)?;
+                match kind {
+                    "machine" => Ok(Self::Machine(MachineId(id(rest)?))),
+                    "project" => Ok(Self::Project(ProjectId(id(rest)?))),
+                    "limits" => Ok(Self::Limits(MachineId(id(rest)?))),
+                    _ => Err(refused()),
+                }
+            }
+        }
+
+        impl FromStr for StampKey {
+            type Err = String;
+
+            fn from_str(text: &str) -> Result<Self, Self::Err> {
+                match text.strip_prefix("overwritten:") {
+                    Some(rest) => rest.parse().map(Self::Overwritten),
+                    None => text.parse().map(Self::Setting),
+                }
+            }
+        }
+
+        macro_rules! from_text {
+            ($key:ty) => {
+                impl<'de> Deserialize<'de> for $key {
+                    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                        String::deserialize(d)?
+                            .parse()
+                            .map_err(serde::de::Error::custom)
+                    }
+                }
+            };
+        }
+
+        from_text!(SettingKey);
+        from_text!(StampKey);
+
+        #[derive(Debug, Deserialize)]
+        #[serde(tag = "setting", content = "value", rename_all = "snake_case")]
+        pub enum SettingValue {
+            Machine(Machine),
+            Priority(Vec<MachineId>),
+            Project(Project),
+            Limits(Limits),
+        }
+
+        #[derive(Debug, Deserialize)]
+        pub struct Overwritten {
+            pub kept: Option<SettingValue>,
+            pub lost: Option<SettingValue>,
+            pub lost_stamp: Stamp,
+        }
+    }
 }

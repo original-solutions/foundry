@@ -137,6 +137,8 @@ impl UiMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::factory::tests::{records as factory_records, status};
+    use crate::factory::{FactoryBody, FactoryRecord, MachineHeld};
     use crate::record::tests::{machine_sample, session, terminal, workspace};
     use crate::settings::tests::settings;
     use crate::settings::{EditId, Outcome, SettingKey, Stamp};
@@ -157,6 +159,17 @@ mod tests {
                 protocol: PROTOCOL,
                 machine: MachineId::random(),
                 versions: [(MachineId::random(), 9), (MachineId::random(), 0)].into(),
+                factory_versions: [(MachineId::random(), 3)].into(),
+            },
+            PeerMessage::Hello {
+                protocol: PROTOCOL,
+                machine: MachineId::random(),
+                versions: BTreeMap::new(),
+                factory_versions: BTreeMap::new(),
+            },
+            PeerMessage::FactoryRecords {
+                protocol: PROTOCOL,
+                records: factory_records(),
             },
             PeerMessage::Records {
                 protocol: PROTOCOL,
@@ -221,9 +234,66 @@ mod tests {
     }
 
     #[test]
-    fn answers_are_carried_from_the_protocol_after_calls_and_this_build_speaks_it() {
+    fn answers_are_carried_from_the_protocol_after_calls() {
         assert_eq!(ANSWERS_SINCE, CALLS_SINCE + 1);
-        assert_eq!(PROTOCOL, ANSWERS_SINCE);
+    }
+
+    #[test]
+    fn factory_records_are_carried_from_protocol_5_and_this_build_speaks_it() {
+        assert_eq!(FACTORY_SINCE, ANSWERS_SINCE + 1);
+        assert_eq!(FACTORY_SINCE, 5);
+        assert_eq!(PROTOCOL, FACTORY_SINCE);
+    }
+
+    #[test]
+    fn a_hello_from_before_protocol_5_reads_with_no_factory_versions() {
+        let machine = "67e55044-10b1-426f-9247-bb680e5fe0c8";
+        let id = MachineId(machine.parse().unwrap());
+        let hello: PeerMessage = serde_json::from_str(&format!(
+            r#"{{"type":"hello","protocol":4,"machine":"{machine}","versions":{{"{machine}":4}}}}"#
+        ))
+        .unwrap();
+        assert_eq!(
+            hello,
+            PeerMessage::Hello {
+                protocol: 4,
+                machine: id,
+                versions: [(id, 4)].into(),
+                factory_versions: BTreeMap::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_hello_carries_its_factory_versions_apart_from_its_record_versions() {
+        let me = MachineId::random();
+        let hello = PeerMessage::Hello {
+            protocol: PROTOCOL,
+            machine: me,
+            versions: [(me, 9)].into(),
+            factory_versions: [(me, 2)].into(),
+        };
+        let json = serde_json::to_value(&hello).unwrap();
+        assert_eq!(json["versions"][me.to_string()], 9, "{json}");
+        assert_eq!(json["factory_versions"][me.to_string()], 2, "{json}");
+    }
+
+    #[test]
+    fn factory_messages_are_written_under_their_names() {
+        let records = PeerMessage::FactoryRecords {
+            protocol: PROTOCOL,
+            records: factory_records(),
+        };
+        let json = serde_json::to_value(&records).unwrap();
+        assert_eq!(json["type"], "factory_records", "{json}");
+        assert_eq!(json["records"][0]["kind"], "run_event", "{json}");
+        let status = UiMessage::FactoryStatus {
+            protocol: PROTOCOL,
+            status: status(),
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["type"], "factory_status", "{json}");
+        assert_eq!(json["status"]["pass"], 41, "{json}");
     }
 
     #[test]
@@ -260,6 +330,10 @@ mod tests {
             UiMessage::Settings {
                 protocol: PROTOCOL,
                 settings: settings(),
+            },
+            UiMessage::FactoryStatus {
+                protocol: PROTOCOL,
+                status: status(),
             },
         ]
     }
@@ -362,6 +436,34 @@ mod tests {
                     protocol: 1,
                     machine: id,
                     versions: [(id, 4)].into(),
+                    factory_versions: BTreeMap::new(),
+                },
+            ),
+            (
+                format!(
+                    r#"{{"type":"hello","protocol":5,"machine":"{machine}","versions":{{}},"factory_versions":{{"{machine}":6}}}}"#
+                ),
+                PeerMessage::Hello {
+                    protocol: 5,
+                    machine: id,
+                    versions: BTreeMap::new(),
+                    factory_versions: [(id, 6)].into(),
+                },
+            ),
+            (
+                format!(
+                    r#"{{"type":"factory_records","protocol":5,"records":[{{"kind":"machine_held","owner":"{machine}","version":2,"body":{{"logins":[],"skill":true}}}}]}}"#
+                ),
+                PeerMessage::FactoryRecords {
+                    protocol: 5,
+                    records: vec![FactoryRecord {
+                        owner: id,
+                        version: 2,
+                        body: FactoryBody::Held(MachineHeld {
+                            logins: vec![],
+                            skill: true,
+                        }),
+                    }],
                 },
             ),
             (
