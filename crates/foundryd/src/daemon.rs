@@ -37,7 +37,7 @@ use crate::sessions::{self, Gateway, Sessions};
 use crate::store::{Store, StoreError};
 use crate::sync::Peers;
 use crate::sync::ws::{self, WsDialer};
-use crate::tailscale::{Entry, host_names, own_entry, tailscale_ips};
+use crate::tailscale::{AskError, Entry, host_names, own_entry, tailscale_ips};
 use crate::terminals::{TerminalError, Terminals};
 use crate::update;
 use crate::workspaces::{WorkspaceError, Workspaces};
@@ -591,6 +591,14 @@ impl Told {
 /// How often Tailscale is asked again for an address that has come up.
 const RESCAN: Duration = Duration::from_secs(5);
 
+/// How many asks of Tailscale in a row may run past their time before the watch takes it as
+/// not answering and stops every server. An ask that times out takes `ASK_WITHIN` (3 s) and
+/// the next waits [`RESCAN`] (5 s), so timed-out asks are about 8 s apart and the third comes
+/// about 24 s after the last answer. The issue chose three about the fleet's offline limit
+/// ([`OFFLINE_AFTER`](crate::sync::OFFLINE_AFTER)): one or two slow asks are not worth
+/// dropping the addresses for, a third is a Tailscale that is not answering.
+const TIMEOUTS_BEFORE_AWAY: u32 = 3;
+
 /// Serves the app on every address Tailscale reports for this machine, now and as they
 /// appear, and stops serving one it no longer reports: the daemon can start before Tailscale
 /// does, and Tailscale can log out or move to another tailnet while it runs.
@@ -601,14 +609,17 @@ struct Tailscale {
     served: BTreeMap<SocketAddr, AbortHandle>,
     /// The addresses that failed to bind, so each is warned about once.
     failed: BTreeSet<SocketAddr>,
-    /// Whether the last ask of Tailscale failed, so a failure is warned about once until it
-    /// answers again.
+    /// Whether the servers were stopped because Tailscale could not be asked, so that is warned
+    /// about once until it answers again.
     unanswered: bool,
+    /// How many asks in a row have run past their time. An answer or a definite failure sets it
+    /// back to zero; at [`TIMEOUTS_BEFORE_AWAY`] the watch is `unanswered`.
+    timeouts: u32,
     servers: JoinSet<SocketAddr>,
     /// Given `ip`'s answer each time Tailscale answers, so the machine list entry is kept up
     /// to date.
     answered: tokio::sync::watch::Sender<BTreeSet<IpAddr>>,
-    /// Set when an ask of Tailscale fails, until the machine list entry's [`Listing`] reads it.
+    /// Set when the watch stops serving because Tailscale cannot be asked, until the machine list entry's [`Listing`] reads it.
     ///
     /// [`Listing`]: api::machine_names::Listing
     away: Arc<AtomicBool>,
@@ -622,6 +633,7 @@ impl Tailscale {
             served: BTreeMap::new(),
             failed: BTreeSet::new(),
             unanswered: false,
+            timeouts: 0,
             servers: JoinSet::new(),
             answered: tokio::sync::watch::Sender::new(BTreeSet::new()),
             away: Arc::new(AtomicBool::new(false)),
@@ -651,9 +663,14 @@ impl Tailscale {
     /// Binds each address in Tailscale's answer, `reported`, not served yet, and stops the
     /// server on each served address the answer leaves out, so it takes no new connection; one
     /// already open is not cut. A server that ended is served again. When Tailscale cannot be
-    /// asked, it counts as reporting nothing: every server is stopped and none is bound until
-    /// it answers. `first` says this is the start, when having none is worth a warning.
-    async fn scan(&mut self, first: bool, reported: Result<BTreeSet<IpAddr>, String>) {
+    /// asked for a definite reason (logged out, stopped, not installed, or it printed what is
+    /// not an address), it counts as reporting nothing: every server is stopped and none is
+    /// bound until it answers. An ask that only ran past its time ([`AskError::TimedOut`]) is
+    /// borne: the servers stay, none is stopped or bound, Tailscale is not marked away and
+    /// nothing is told it answered, until [`TIMEOUTS_BEFORE_AWAY`] asks in a row have timed
+    /// out, which is then a failed ask. `first` says this is the start, when having none is
+    /// worth a warning.
+    async fn scan(&mut self, first: bool, reported: Result<BTreeSet<IpAddr>, AskError>) {
         while let Some(ended) = self.servers.try_join_next() {
             if let Ok(addr) = ended {
                 self.served.remove(&addr);
@@ -662,10 +679,39 @@ impl Tailscale {
         let reported = match reported {
             Ok(reported) => {
                 self.unanswered = false;
+                self.timeouts = 0;
                 self.answered.send_replace(reported.clone());
                 reported
             }
-            Err(why) => {
+            Err(AskError::TimedOut(why)) => {
+                self.timeouts = self.timeouts.saturating_add(1);
+                if self.unanswered {
+                    BTreeSet::new()
+                } else if self.timeouts < TIMEOUTS_BEFORE_AWAY {
+                    if self.timeouts == 1 {
+                        if self.served.is_empty() {
+                            tracing::warn!(
+                                "Tailscale did not answer in time, so no address is listened on yet (peers cannot reach this machine until it answers): {why}"
+                            );
+                        } else {
+                            tracing::warn!(
+                                "Tailscale did not answer in time, so the addresses already listened on stay: {why}"
+                            );
+                        }
+                    }
+                    return;
+                } else {
+                    tracing::warn!(
+                        "Tailscale did not answer {} times in a row, so none is listened on until it answers: {why}",
+                        self.timeouts
+                    );
+                    self.unanswered = true;
+                    self.away.store(true, Ordering::Relaxed);
+                    BTreeSet::new()
+                }
+            }
+            Err(AskError::Failed(why)) => {
+                self.timeouts = 0;
                 if !self.unanswered {
                     tracing::warn!(
                         "cannot ask Tailscale for this machine's addresses, so none is listened on until it answers: {why}"
@@ -745,6 +791,7 @@ mod tests {
 
     use super::*;
     use crate::secrets::SecretsError;
+    use crate::tailscale::AskError;
     use crate::test_log::Logged;
 
     fn os(text: &str) -> Option<OsString> {
@@ -791,6 +838,18 @@ mod tests {
         let error = port_from(os("not-a-port")).unwrap_err();
         assert!(error.contains("FOUNDRY_PORT"), "{error}");
         assert!(error.contains("not-a-port"), "{error}");
+    }
+
+    /// An ask that failed for a definite reason.
+    fn failed(why: &str) -> Result<BTreeSet<IpAddr>, AskError> {
+        Err(AskError::Failed(why.to_owned()))
+    }
+
+    /// An ask that ran past its time.
+    fn timed_out() -> Result<BTreeSet<IpAddr>, AskError> {
+        Err(AskError::TimedOut(
+            "`tailscale ip` did not answer".to_owned(),
+        ))
     }
 
     fn ips<const N: usize>(texts: [&str; N]) -> BTreeSet<IpAddr> {
@@ -1083,11 +1142,117 @@ mod tests {
         let _capture = logged.capture();
         let mut tailscale = serving(addr("100.101.102.103:7433"));
 
-        tailscale.scan(false, Err("logged out".to_owned())).await;
-        tailscale.scan(false, Err("logged out".to_owned())).await;
+        tailscale.scan(false, failed("logged out")).await;
+        tailscale.scan(false, failed("logged out")).await;
 
         assert!(tailscale.served.is_empty());
         assert_eq!(logged.warnings().len(), 1, "{:?}", logged.warnings());
+        assert!(stopped(tailscale).await);
+    }
+
+    /// One ask that runs past its time says nothing about Tailscale: the addresses served stay,
+    /// Tailscale is not marked away and nothing is told it answered.
+    #[tokio::test]
+    async fn one_ask_that_times_out_keeps_the_servers_and_does_not_mark_tailscale_away() {
+        let logged = Logged::default();
+        let _capture = logged.capture();
+        let kept = addr("100.101.102.103:7433");
+        let mut tailscale = serving(kept);
+        let answered = tailscale.answered.subscribe();
+
+        tailscale.scan(false, timed_out()).await;
+
+        assert!(tailscale.served.contains_key(&kept));
+        assert!(!tailscale.away.load(Ordering::Relaxed));
+        assert!(!answered.has_changed().unwrap());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), tailscale.servers.join_next())
+                .await
+                .is_err(),
+            "none aborted"
+        );
+        let warnings = logged.warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("stay"), "{warnings:?}");
+    }
+
+    /// At the start, with nothing served, the first timeout is one warning that says nothing is
+    /// listened on yet, not that addresses stay.
+    #[tokio::test]
+    async fn a_first_ask_that_times_out_at_the_start_warns_once_and_binds_nothing() {
+        let logged = Logged::default();
+        let _capture = logged.capture();
+        let mut tailscale = Tailscale::new(7433, Router::new());
+
+        tailscale.scan(true, timed_out()).await;
+
+        assert!(tailscale.served.is_empty());
+        assert!(tailscale.servers.is_empty());
+        assert!(!tailscale.away.load(Ordering::Relaxed));
+        let warnings = logged.warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("no address is listened on yet"),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("`tailscale ip` did not answer"),
+            "{warnings:?}"
+        );
+        assert!(!warnings[0].contains("stay"), "{warnings:?}");
+    }
+
+    /// Three in a row are a failed ask: every server stops and Tailscale is marked away, with
+    /// one warning at the first and one at the third.
+    #[tokio::test]
+    async fn three_asks_in_a_row_that_time_out_stop_every_server() {
+        let logged = Logged::default();
+        let _capture = logged.capture();
+        let mut tailscale = serving(addr("100.101.102.103:7433"));
+
+        tailscale.scan(false, timed_out()).await;
+        tailscale.scan(false, timed_out()).await;
+        assert!(!tailscale.served.is_empty());
+        assert!(!tailscale.away.load(Ordering::Relaxed));
+        tailscale.scan(false, timed_out()).await;
+
+        assert!(tailscale.served.is_empty());
+        assert!(tailscale.away.load(Ordering::Relaxed));
+        assert_eq!(logged.warnings().len(), 2, "{:?}", logged.warnings());
+        // A fourth changes nothing and says nothing.
+        tailscale.scan(false, timed_out()).await;
+        assert_eq!(logged.warnings().len(), 2, "{:?}", logged.warnings());
+        assert!(stopped(tailscale).await);
+    }
+
+    /// An answer sets the count of timeouts back to zero.
+    #[tokio::test]
+    async fn an_answer_between_timeouts_starts_the_count_again() {
+        let _capture = Logged::default().capture();
+        let kept = addr("100.101.102.103:7433");
+        let mut tailscale = serving(kept);
+
+        tailscale.scan(false, timed_out()).await;
+        tailscale.scan(false, timed_out()).await;
+        tailscale.scan(false, Ok(ips(["100.101.102.103"]))).await;
+        tailscale.scan(false, timed_out()).await;
+        tailscale.scan(false, timed_out()).await;
+
+        assert!(tailscale.served.contains_key(&kept));
+        assert!(!tailscale.away.load(Ordering::Relaxed));
+    }
+
+    /// A definite failure stops at once, after a timeout as before one.
+    #[tokio::test]
+    async fn a_definite_failure_after_a_timeout_stops_the_servers_at_once() {
+        let _capture = Logged::default().capture();
+        let mut tailscale = serving(addr("100.101.102.103:7433"));
+
+        tailscale.scan(false, timed_out()).await;
+        tailscale.scan(false, failed("logged out")).await;
+
+        assert!(tailscale.served.is_empty());
+        assert!(tailscale.away.load(Ordering::Relaxed));
         assert!(stopped(tailscale).await);
     }
 
@@ -1098,7 +1263,7 @@ mod tests {
         let logged = Logged::default();
         let _capture = logged.capture();
         let mut tailscale = Tailscale::new(7433, Router::new());
-        let cannot = || Err::<BTreeSet<IpAddr>, _>("Tailscale is stopped.".to_owned());
+        let cannot = || failed("Tailscale is stopped.");
 
         tailscale.scan(true, cannot()).await;
         tailscale.scan(false, cannot()).await;
@@ -1124,7 +1289,7 @@ mod tests {
         let mut tailscale = Tailscale::new(7433, Router::new());
         assert!(!tailscale.away.load(Ordering::Relaxed));
 
-        tailscale.scan(false, Err("logged out".to_owned())).await;
+        tailscale.scan(false, failed("logged out")).await;
         tailscale.scan(false, Ok(BTreeSet::new())).await;
 
         assert!(tailscale.away.swap(false, Ordering::Relaxed));
@@ -1172,7 +1337,7 @@ mod tests {
         listing.list(here()).await;
 
         tokio::time::sleep(crate::sync::OFFLINE_AFTER).await;
-        tailscale.scan(false, Err("logged out".to_owned())).await;
+        tailscale.scan(false, failed("logged out")).await;
         listing.list(here()).await;
         assert!(!listed(), "the look after Tailscale was away sends nothing");
 
@@ -1196,7 +1361,7 @@ mod tests {
             assert!(answered.has_changed().unwrap());
             assert_eq!(*answered.borrow_and_update(), ips);
         }
-        tailscale.scan(false, Err("logged out".to_owned())).await;
+        tailscale.scan(false, failed("logged out")).await;
         assert!(!answered.has_changed().unwrap());
     }
 
@@ -1266,9 +1431,9 @@ mod tests {
         let _capture = logged.capture();
         let mut tailscale = Tailscale::new(7433, Router::new());
 
-        tailscale.scan(false, Err("not running".to_owned())).await;
+        tailscale.scan(false, failed("not running")).await;
         tailscale.scan(false, Ok(BTreeSet::new())).await;
-        tailscale.scan(false, Err("logged out".to_owned())).await;
+        tailscale.scan(false, failed("logged out")).await;
 
         let warnings = logged.warnings();
         assert_eq!(warnings.len(), 2, "{warnings:?}");
