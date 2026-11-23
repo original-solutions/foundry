@@ -708,6 +708,134 @@ mod tests {
         );
     }
 
+    /// The rule as the spec states it: a word of 24 or more mixed letters and digits reaches a
+    /// comment only as a commit id or a GitHub anchor in a `github.com` link, at the place
+    /// GitHub's own links put one. Each word shape is tried in each place.
+    #[test]
+    fn for_comment_keeps_a_long_mixed_word_only_where_a_github_link_puts_one() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let sha256 = "0123456789abcdef".repeat(4);
+        let other_sha = "fedcba9876543210fedcba9876543210fedcba98";
+        let ids = [sha.to_string(), sha256.clone()];
+        let not_ids = [
+            KEY.to_string(),
+            "0123456789abcdef".repeat(2),
+            format!("{sha}0"),
+            format!("g{}", &sha[1..]),
+        ];
+        let id_places = [
+            "https://github.com/o/r/commit/W",
+            "https://github.com/o/r/commit/W.patch",
+            "https://github.com/o/r/commit/W.diff",
+            "https://github.com/o/r/commits/W",
+            "https://github.com/o/r/blob/W/src/a.rs",
+            "https://github.com/o/r/tree/W",
+            "https://github.com/o/r/blame/W/a.rs#L3-L9",
+            "https://github.com/o/r/raw/W/a.rs",
+            "https://github.com/o/r/compare/W...main",
+            "https://github.com/o/r/compare/main...W",
+            "https://github.com/o/r/compare/main..W",
+            "https://github.com/o/r/pull/12/commits/W",
+            "https://github.com/o/r/pull/12/files/W",
+            "https://github.com/o/r/pull/12/files/W..SHA",
+            "https://github.com/o/r/pull/12/files/SHA..W",
+        ];
+        let anchors = [
+            "issuecomment-1234567890123".to_string(),
+            "discussion_r1234567890123".to_string(),
+            "pullrequestreview-1234567890".to_string(),
+            format!("diff-{sha256}"),
+            format!("diff-{sha256}R12"),
+            format!("diff-{sha256}L3-R20"),
+        ];
+        let not_anchors = [
+            KEY.to_string(),
+            "issuecomment-1234567890abcdefghijk".to_string(),
+            format!("diff-{}", "0123456789abcdef".repeat(2)),
+            format!("diff-{sha256}X12"),
+        ];
+        let anchor_places = [
+            "https://github.com/o/r/pull/1#W",
+            "https://github.com/o/r/pull/1/files#W",
+            "https://github.com/o/r/issues/1#W",
+        ];
+        let other_places = [
+            "W",
+            "at W.",
+            "(W)",
+            "https://github.com/W/r/commit/SHA",
+            "https://github.com/o/W/pull/1",
+            "https://github.com/o/W/commit/SHA",
+            "https://github.com/o/tree/W",
+            "https://github.com/o/commit/W",
+            "https://github.com/commit/W",
+            "https://github.com/o/r/W",
+            "https://github.com/o/r/pull/1/W",
+            "https://github.com/o/r/pull/x/files/W",
+            "https://github.com/o/r/issues/1/commits/W",
+            "https://github.com/o/r/blob/main/W",
+            "https://github.com/o/r/blob/main/tree/W",
+            "https://github.com/o/r/blob/main/files/W",
+            "https://github.com/o/r/tree/main/commit/W",
+            "https://github.com/o/r/blob/SHA/commits/W",
+            "https://github.com/o/r/commit/xW",
+            "https://github.com/o/r/pull/1?sha=W",
+            "https://github.com/o/r/pull/1#x-W",
+            "https://github.com/o/r/pull/1#W&x",
+            "https://W@github.com/o/r/commit/SHA",
+            "https://example.com/o/r/commit/W",
+            "https://example.com/o/r/pull/1#W",
+            "https://gist.github.com/o/r/commit/W",
+            "https://github.com.evil.example/o/r/commit/W",
+        ];
+        let comment = |place: &str, word: &str| {
+            let text = place.replace("SHA", other_sha).replace('W', word);
+            (for_comment(&text), text)
+        };
+        for (words, kept, places) in [
+            (&ids[..], true, &id_places[..]),
+            (&not_ids[..], false, &id_places[..]),
+            (&anchors[..], true, &anchor_places[..]),
+            (&not_anchors[..], false, &anchor_places[..]),
+            (&ids[..], false, &anchor_places[..]),
+            (&anchors[..], false, &id_places[..]),
+            (&ids[..], false, &other_places[..]),
+            (&not_ids[..], false, &other_places[..]),
+            (&anchors[..], false, &other_places[..]),
+            (&not_anchors[..], false, &other_places[..]),
+        ] {
+            for word in words {
+                for place in places {
+                    let (shown, text) = comment(place, word);
+                    if kept {
+                        assert_eq!(shown, text);
+                    } else {
+                        assert!(!shown.contains(word.as_str()), "{text} -> {shown}");
+                        let marked = shown.contains(HIDDEN) || shown.contains("***@");
+                        assert!(marked, "{text} -> {shown}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn for_comment_hides_a_url_password_whatever_characters_it_holds() {
+        for c in [
+            ";", ",", "'", "\"", "(", ")", "[", "]", "<", ">", "{", "}", "|", "^", "\\", "`", "!",
+            "é", "\u{200b}",
+        ] {
+            let text = format!("git push https://bot:hunter{c}2@github.com/o/r and go");
+            assert_eq!(
+                for_comment(&text),
+                "git push https://***@github.com/o/r and go",
+                "{text:?}"
+            );
+        }
+        let ssh = "ssh://git:pa;ss@example.com/r";
+        assert_eq!(for_comment(ssh), "ssh://***@example.com/r");
+    }
+
     #[test]
     fn for_comment_keeps_a_word_glued_to_the_scheme() {
         assert_eq!(for_comment("xhttp://a.b"), "xhttp://a.b");
