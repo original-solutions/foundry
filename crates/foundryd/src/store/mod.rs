@@ -58,6 +58,21 @@ const MIGRATIONS: &[&str] = &[
          seq INTEGER NOT NULL,
          settings TEXT NOT NULL
      );",
+    // 2: factory records keyed by kind and id, and the owner's own factory version counter.
+    // The counter has no row until the first version is taken.
+    "CREATE TABLE factory_records (
+         kind TEXT NOT NULL,
+         id TEXT NOT NULL,
+         owner TEXT NOT NULL,
+         version INTEGER NOT NULL,
+         record TEXT NOT NULL,
+         PRIMARY KEY (kind, id)
+     );
+     CREATE INDEX factory_records_by_owner ON factory_records (owner, version);
+     CREATE TABLE own_factory_version (
+         only INTEGER PRIMARY KEY CHECK (only = 1),
+         version INTEGER NOT NULL
+     );",
 ];
 
 /// What [`Store::apply`] did with a record.

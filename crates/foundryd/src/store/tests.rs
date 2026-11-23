@@ -1675,15 +1675,14 @@ fn the_factory_queries_order_only_by_a_generation_a_version_or_an_owner() {
         found += 1;
         let rest = &source[at + "ORDER BY".len()..];
         let clause = rest.split(['"', ';']).next().unwrap();
-        // A string continued with `\` runs on to the next line.
+        // A string continued with `\` runs on to the next line; LIMIT ends the terms.
         let clause = clause.replace("\\\n", " ");
+        let clause = clause.split("LIMIT").next().unwrap();
+        // The generation's own comma is not a separator between terms.
+        let clause = clause.replace("json_extract(record, '$.body.generation')", "generation");
         for term in clause.split(',') {
             let term = term.trim();
-            let allowed = [
-                "version",
-                "owner",
-                "json_extract(record, '$.body.generation')",
-            ];
+            let allowed = ["version", "owner", "generation"];
             assert!(allowed.contains(&term), "orders by {term:?}");
         }
     }
