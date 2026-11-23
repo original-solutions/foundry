@@ -4733,5 +4733,2584 @@ mod tests {
         }
     }
 
+    // ---- activity_since ----
+
+    const MARKER: &str = "<!-- softfac -->";
+    const STATUS_MARKER: &str = "<!-- softfac:status -->";
+
+    fn drop_of(id: &str, reason: DropReason) -> Dropped {
+        Dropped {
+            id: id.into(),
+            reason,
+        }
+    }
+
+    const ACT_SINCE: &str = "2026-10-04T10:00:00Z";
+    const WRITTEN: &str = "2026-10-04T10:01:00Z";
+    const EDIT_AT: &str = "2026-10-04T10:20:00Z";
+
+    fn comments_call() -> Vec<String> {
+        args(&[
+            "api",
+            &format!("repos/rawphp/softfac/issues/6/comments?since={ACT_SINCE}&per_page=100"),
+            "--paginate",
+        ])
+    }
+
+    fn body_edit_call() -> Vec<String> {
+        args(&[
+            "api",
+            "graphql",
+            "-f",
+            &format!("query={ACTIVITY_QUERY}"),
+            "-f",
+            "owner=rawphp",
+            "-f",
+            "name=softfac",
+            "-F",
+            "number=6",
+        ])
+    }
+
+    fn editor_call(node_ids: &[String]) -> Vec<String> {
+        let mut call = args(&[
+            "api",
+            "graphql",
+            "-f",
+            &format!("query={COMMENT_EDITOR_QUERY}"),
+        ]);
+        for id in node_ids {
+            call.push("-f".into());
+            call.push(format!("ids[]={id}"));
+        }
+        call
+    }
+
+    fn ids(list: &[&str]) -> Vec<String> {
+        list.iter().map(|id| id.to_string()).collect()
+    }
+
+    /// A REST comment as `gh api repos/R/issues/N/comments` prints it.
+    fn rest_node(id: u64, author: Option<&str>, at: &str, body: &str) -> Value {
+        json!({
+            "id": id,
+            "user": author.map(|login| json!({"login": login})),
+            "node_id": format!("IC_{id}"),
+            "created_at": at,
+            "updated_at": at,
+            "body": body,
+        })
+    }
+
+    /// A comment that was edited after it was written.
+    fn edited_rest_node(id: u64, author: &str, created: &str, updated: &str, body: &str) -> Value {
+        let mut node = rest_node(id, Some(author), created, body);
+        node["updated_at"] = json!(updated);
+        node
+    }
+
+    fn rest_reply(nodes: &[Value]) -> String {
+        serde_json::to_string(nodes).unwrap()
+    }
+
+    /// The issue's GraphQL answer with exactly these history nodes (newest first) and this
+    /// total.
+    fn body_reply_raw(body: &str, last: Option<Edit>, nodes: &[Edit], total: usize) -> String {
+        json!({"data": {"repository": {"issue": {
+            "body": body,
+            "lastEditedAt": last.map(|(at, _)| at),
+            "editor": last.map_or(Value::Null, |(_, who)| actor_of(who)),
+            "userContentEdits": edits_json(nodes, total),
+        }}}})
+        .to_string()
+    }
+
+    /// The issue's answer: the creation is the oldest entry of its history, the edit the newest.
+    fn activity_body_reply(body: &str, edited: Option<Edit>) -> String {
+        let mut history = vec![e(CREATED, "tom")];
+        history.extend(edited);
+        body_reply_raw(body, edited, &newest_first(&history), history.len())
+    }
+
+    /// A comment's editor lookup, history given newest first.
+    fn editor_reply_raw(last: Option<Edit>, nodes: &[Edit], total: usize, id: &str) -> String {
+        json!({"data": {"nodes": [{
+            "id": id,
+            "lastEditedAt": last.map(|(at, _)| at),
+            "editor": last.map_or(Value::Null, |(_, who)| actor_of(who)),
+            "userContentEdits": edits_json(nodes, total),
+        }]}})
+        .to_string()
+    }
+
+    /// One lookup answer holding the nodes of several single-comment answers.
+    fn editors_reply(answers: &[String]) -> String {
+        let nodes: Vec<Value> = answers
+            .iter()
+            .flat_map(|answer| {
+                let json: Value = serde_json::from_str(answer).unwrap();
+                json["data"]["nodes"].as_array().unwrap().clone()
+            })
+            .collect();
+        json!({"data": {"nodes": nodes}}).to_string()
+    }
+
+    /// The lookup of a comment written by `tom` and last edited as `last`.
+    fn editor_reply_for(last: Option<Edit>, id: &str) -> String {
+        let mut history = vec![e(CREATED, "tom")];
+        history.extend(last);
+        editor_reply_raw(last, &newest_first(&history), history.len(), id)
+    }
+
+    fn editor_reply(last: Option<Edit>) -> String {
+        editor_reply_for(last, "IC_7")
+    }
+
+    fn editor_reply_history(last: Option<Edit>, oldest_first: &[Edit]) -> String {
+        editor_reply_raw(
+            last,
+            &newest_first(oldest_first),
+            oldest_first.len(),
+            "IC_7",
+        )
+    }
+
+    fn activity_of(fake: &FakeTracker, who: &[&str]) -> Activity {
+        fake.activity_since(REPO, 6, ACT_SINCE, &names(who))
+            .unwrap()
+    }
+
+    fn activity_error(fake: &FakeTracker, who: &[&str]) -> TrackerError {
+        fake.activity_since(REPO, 6, ACT_SINCE, &names(who))
+            .unwrap_err()
+    }
+
+    fn ids_of(activity: &Activity) -> Vec<&str> {
+        activity.comments.iter().map(|c| c.id.as_str()).collect()
+    }
+
+    fn answering(answers: &[String]) -> FakeTracker {
+        FakeTracker::answering(answers.iter().map(|answer| Answer::ok(answer.as_str())))
+    }
+
+    /// Whether an edited comment by `tom` survives, given the answer to the editor lookup.
+    fn kept_after(answer: &str) -> bool {
+        let fake = answering(&[
+            rest_reply(&[edited_rest_node(7, "tom", WRITTEN, EDIT_AT, "x")]),
+            answer.to_string(),
+            activity_body_reply("b", None),
+        ]);
+        // `amy` is an instructor too, so a history that names her is not refused for that.
+        !activity_of(&fake, &["tom", "amy"]).comments.is_empty()
+    }
+
+    /// What an edited comment by `tom` leaves out, with the reason, given the answer to the
+    /// editor lookup.
+    fn dropped_after(answer: &str) -> Vec<Dropped> {
+        let fake = answering(&[
+            rest_reply(&[edited_rest_node(7, "tom", WRITTEN, EDIT_AT, "x")]),
+            answer.to_string(),
+            activity_body_reply("b", None),
+        ]);
+        let activity = activity_of(&fake, &["tom", "amy"]);
+        assert_eq!(
+            activity.comments,
+            vec![],
+            "a dropped comment is not forwardable"
+        );
+        activity.dropped
+    }
+
+    #[test]
+    fn activity_reads_the_real_shapes_and_makes_both_calls() {
+        let real_rest = r#"[{"id":5978910929,"user":{"login":"rawphp","id":1},"created_at":"2026-10-04T10:13:16Z","updated_at":"2026-10-04T10:13:16Z","body":"please use serde"}]"#;
+        let real_graphql = r#"{"data":{"repository":{"issue":{"body":"Outcome text","lastEditedAt":null,"editor":null,"userContentEdits":{"totalCount":1,"nodes":[{"editedAt":"2026-10-04T09:50:06Z","editor":{"__typename":"User","login":"rawphp"}}]}}}}}"#;
+        let fake = answering(&[real_rest.into(), real_graphql.into()]);
+        assert_eq!(
+            activity_of(&fake, &["rawphp"]),
+            Activity {
+                comments: vec![Comment {
+                    id: "5978910929".into(),
+                    author: "rawphp".into(),
+                    created_at: "2026-10-04T10:13:16Z".into(),
+                    body: "please use serde".into(),
+                }],
+                body_edit: None,
+                dropped: vec![],
+            }
+        );
+        assert_eq!(fake.calls(), vec![comments_call(), body_edit_call()]);
+    }
+
+    #[test]
+    fn activity_returns_the_comment_and_the_body_edit_of_an_instructor_with_the_exact_calls() {
+        let fake = answering(&[
+            r#"[{"id":5,"node_id":"IC_5","user":{"login":"rawphp"},"created_at":"2026-10-04T10:13:17Z","updated_at":"2026-10-04T10:13:17Z","body":"hi"}]"#.into(),
+            r#"{"data":{"repository":{"issue":{"body":"b","lastEditedAt":"2026-10-04T10:13:18Z","editor":{"__typename":"User","login":"rawphp"},"userContentEdits":{"totalCount":2,"nodes":[{"editedAt":"2026-10-04T10:13:18Z","editor":{"__typename":"User","login":"rawphp"}},{"editedAt":"2026-10-04T10:00:00Z","editor":{"__typename":"User","login":"rawphp"}}]}}}}}"#.into(),
+        ]);
+        let activity = fake
+            .activity_since(REPO, 6, "2026-10-04T10:13:16Z", &names(&["rawphp"]))
+            .unwrap();
+        assert_eq!(
+            activity,
+            Activity {
+                comments: vec![Comment {
+                    id: "5".into(),
+                    author: "rawphp".into(),
+                    created_at: "2026-10-04T10:13:17Z".into(),
+                    body: "hi".into(),
+                }],
+                body_edit: Some(BodyEdit {
+                    edited_at: "2026-10-04T10:13:18Z".into(),
+                    editor: "rawphp".into(),
+                    body: "b".into(),
+                }),
+                dropped: vec![],
+            }
+        );
+        let calls = fake.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[0],
+            args(&[
+                "api",
+                "repos/rawphp/softfac/issues/6/comments?since=2026-10-04T10:13:16Z&per_page=100",
+                "--paginate"
+            ])
+        );
+        assert_eq!(calls[1][..2], args(&["api", "graphql"])[..]);
+    }
+
+    #[test]
+    fn the_activity_query_asks_only_for_the_body_edit() {
+        for field in [
+            "body",
+            "lastEditedAt",
+            "body lastEditedAt editor { __typename login }",
+            "userContentEdits(first: 100) { totalCount nodes { editedAt editor { __typename login } } }",
+            "$owner",
+            "$name",
+            "$number",
+        ] {
+            assert!(ACTIVITY_QUERY.contains(field), "missing {field}");
+        }
+        assert!(!ACTIVITY_QUERY.contains("comments"));
+    }
+
+    #[test]
+    fn the_comment_editor_query_asks_who_last_edited_a_comment_by_node_id() {
+        for part in [
+            "$ids: [ID!]!",
+            "nodes(ids: $ids)",
+            "... on Comment { id lastEditedAt",
+            "editor { __typename login }",
+            "userContentEdits(first: 100) { totalCount nodes { editedAt editor { __typename login } } }",
+        ] {
+            assert!(COMMENT_EDITOR_QUERY.contains(part), "missing {part}");
+        }
+    }
+
+    #[test]
+    fn the_activity_queries_are_softfacs_byte_for_byte() {
+        assert_eq!(
+            ACTIVITY_QUERY,
+            "query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { issue(number: $number) { body lastEditedAt editor { __typename login } userContentEdits(first: 100) { totalCount nodes { editedAt editor { __typename login } } } } } }"
+        );
+        assert_eq!(
+            COMMENT_EDITOR_QUERY,
+            "query($ids: [ID!]!) { nodes(ids: $ids) { ... on Comment { id lastEditedAt editor { __typename login } userContentEdits(first: 100) { totalCount nodes { editedAt editor { __typename login } } } } } }"
+        );
+    }
+
+    #[test]
+    fn activity_returns_a_comment_that_is_only_on_a_later_page() {
+        let page1 = rest_reply(&[rest_node(1, Some("tom"), "2026-10-04T10:01:00Z", "first")]);
+        let page2 = rest_reply(&[rest_node(2, Some("tom"), "2026-10-04T10:02:00Z", "second")]);
+        // One array per page, as `gh api --paginate` may print them.
+        let paged = answering(&[format!("{page1}{page2}"), activity_body_reply("b", None)]);
+        assert_eq!(ids_of(&activity_of(&paged, &["tom"])), vec!["1", "2"]);
+        // One merged array.
+        let merged = answering(&[
+            rest_reply(&[
+                rest_node(1, Some("tom"), "2026-10-04T10:01:00Z", "first"),
+                rest_node(2, Some("tom"), "2026-10-04T10:02:00Z", "second"),
+            ]),
+            activity_body_reply("b", None),
+        ]);
+        assert_eq!(ids_of(&activity_of(&merged, &["tom"])), vec!["1", "2"]);
+    }
+
+    #[test]
+    fn activity_time_boundary_is_exclusive() {
+        let fake = answering(&[
+            rest_reply(&[
+                rest_node(1, Some("tom"), "2026-10-04T09:59:59Z", "before"),
+                rest_node(2, Some("tom"), ACT_SINCE, "equal"),
+                rest_node(3, Some("tom"), "2026-10-04T10:00:01Z", "after"),
+            ]),
+            activity_body_reply("b", None),
+        ]);
+        assert_eq!(ids_of(&activity_of(&fake, &["tom"])), vec!["3"]);
+    }
+
+    #[test]
+    fn activity_ignores_a_comment_that_was_only_edited_after_since() {
+        // The server filters on updated time; created_at must still be after `since`.
+        let old = edited_rest_node(
+            1,
+            "tom",
+            "2026-10-04T09:00:00Z",
+            "2026-10-04T10:30:00Z",
+            "later",
+        );
+        let fake = answering(&[rest_reply(&[old]), activity_body_reply("b", None)]);
+        assert_eq!(activity_of(&fake, &["tom"]).comments, vec![]);
+        assert_eq!(fake.calls().len(), 2);
+    }
+
+    #[test]
+    fn activity_keeps_only_instructors_case_insensitively() {
+        let fake = answering(&[
+            rest_reply(&[
+                rest_node(1, Some("TomKaczocha"), "2026-10-04T10:01:00Z", "mixed case"),
+                rest_node(
+                    2,
+                    Some("stranger"),
+                    "2026-10-04T10:02:00Z",
+                    "not one of ours",
+                ),
+                rest_node(
+                    3,
+                    Some("tomkaczocha-bot"),
+                    "2026-10-04T10:03:00Z",
+                    "prefix only",
+                ),
+            ]),
+            activity_body_reply("b", None),
+        ]);
+        let activity = activity_of(&fake, &["tomkaczocha"]);
+        let kept: Vec<(&str, &str)> = activity
+            .comments
+            .iter()
+            .map(|c| (c.id.as_str(), c.author.as_str()))
+            .collect();
+        assert_eq!(kept, vec![("1", "TomKaczocha")]);
+    }
+
+    #[test]
+    fn activity_with_no_instructors_returns_nothing() {
+        let fake = answering(&[
+            rest_reply(&[rest_node(1, Some("tom"), "2026-10-04T10:01:00Z", "hi")]),
+            activity_body_reply("b", Some(e("2026-10-04T10:05:00Z", "tom"))),
+        ]);
+        let activity = activity_of(&fake, &[]);
+        assert_eq!(activity.comments, vec![]);
+        assert_eq!(activity.body_edit, None);
+    }
+
+    #[test]
+    fn activity_leaves_out_the_factorys_own_comments_whoever_wrote_them() {
+        // The machine's user is also an instructor here, so authorship cannot tell them apart.
+        let fake = answering(&[
+            rest_reply(&[
+                rest_node(
+                    1,
+                    Some("tom"),
+                    "2026-10-04T10:01:00Z",
+                    &format!("a question\n\n{MARKER}"),
+                ),
+                rest_node(
+                    2,
+                    Some("tom"),
+                    "2026-10-04T10:02:00Z",
+                    &format!("state\n\n{STATUS_MARKER}"),
+                ),
+                rest_node(3, Some("tom"), "2026-10-04T10:03:00Z", "a real instruction"),
+            ]),
+            activity_body_reply("b", None),
+        ]);
+        assert_eq!(ids_of(&activity_of(&fake, &["tom"])), vec!["3"]);
+    }
+
+    #[test]
+    fn activity_ignores_deleted_authors_and_lists_the_comments_oldest_first() {
+        let fake = answering(&[
+            rest_reply(&[
+                rest_node(3, Some("tom"), "2026-10-04T10:03:00Z", "third"),
+                rest_node(4, None, "2026-10-04T10:04:00Z", "ghost"),
+                rest_node(1, Some("tom"), "2026-10-04T10:01:00Z", "first"),
+                rest_node(2, Some("tom"), "2026-10-04T10:02:00Z", "second"),
+            ]),
+            activity_body_reply("b", None),
+        ]);
+        assert_eq!(ids_of(&activity_of(&fake, &["tom"])), vec!["1", "2", "3"]);
+    }
+
+    #[test]
+    fn an_unedited_comment_costs_no_extra_call() {
+        let fake = answering(&[
+            rest_reply(&[rest_node(1, Some("tom"), WRITTEN, "hi")]),
+            activity_body_reply("b", None),
+        ]);
+        assert_eq!(ids_of(&activity_of(&fake, &["tom"])), vec!["1"]);
+        assert_eq!(fake.calls(), vec![comments_call(), body_edit_call()]);
+    }
+
+    #[test]
+    fn a_comment_edited_by_an_instructor_is_kept_after_one_extra_call() {
+        let fake = answering(&[
+            rest_reply(&[edited_rest_node(7, "tom", WRITTEN, EDIT_AT, "fixed")]),
+            editor_reply(Some(e(EDIT_AT, "Tom"))),
+            activity_body_reply("b", None),
+        ]);
+        let activity = activity_of(&fake, &["tom"]);
+        assert_eq!(ids_of(&activity), vec!["7"]);
+        assert_eq!(activity.comments[0].body, "fixed");
+        assert_eq!(
+            fake.calls(),
+            vec![
+                comments_call(),
+                editor_call(&ids(&["IC_7"])),
+                body_edit_call()
+            ]
+        );
+    }
+
+    #[test]
+    fn the_real_comment_edit_history_shape_is_read() {
+        let real = r#"{"data":{"nodes":[{"id":"IC_7","lastEditedAt":"2026-10-04T10:20:00Z","editor":{"__typename":"User","login":"rawphp"},"userContentEdits":{"totalCount":2,"nodes":[{"editedAt":"2026-10-04T10:20:00Z","editor":{"__typename":"User","login":"rawphp"}},{"editedAt":"2026-10-04T10:01:00Z","editor":{"__typename":"User","login":"rawphp"}}]}}]}}"#;
+        let fake = answering(&[
+            rest_reply(&[edited_rest_node(7, "rawphp", WRITTEN, EDIT_AT, "x")]),
+            real.into(),
+            activity_body_reply("b", None),
+        ]);
+        assert_eq!(ids_of(&activity_of(&fake, &["rawphp"])), vec!["7"]);
+    }
+
+    #[test]
+    fn a_comment_edited_by_a_non_instructor_or_a_deleted_account_is_dropped_as_edited_by_someone_else()
+     {
+        // A collaborator with write access can edit an instructor's comment.
+        let fake = answering(&[
+            rest_reply(&[
+                edited_rest_node(7, "tom", WRITTEN, EDIT_AT, "rewritten"),
+                rest_node(8, Some("tom"), "2026-10-04T10:02:00Z", "plain"),
+            ]),
+            editor_reply(Some(e(EDIT_AT, "stranger"))),
+            activity_body_reply("b", None),
+        ]);
+        let activity = activity_of(&fake, &["tom"]);
+        assert_eq!(ids_of(&activity), vec!["8"]);
+        assert_eq!(
+            activity.dropped,
+            vec![drop_of("7", DropReason::EditedByOther)]
+        );
+        assert_eq!(
+            dropped_after(&editor_reply(Some(e(EDIT_AT, NOBODY)))),
+            vec![drop_of("7", DropReason::EditedByOther)]
+        );
+    }
+
+    #[test]
+    fn a_comment_any_non_instructor_edited_is_dropped_though_an_instructor_edited_it_last() {
+        // There is no `since` here: the comment is the instructor's own text from the start.
+        let other = vec![drop_of("7", DropReason::EditedByOther)];
+        assert_eq!(
+            dropped_after(&editor_reply_history(
+                Some(e(EDIT_AT, "tom")),
+                &[e("2026-10-04T09:00:00Z", "stranger"), e(EDIT_AT, "tom")]
+            )),
+            other
+        );
+        assert_eq!(
+            dropped_after(&editor_reply_history(
+                Some(e(EDIT_AT, "tom")),
+                &[
+                    e("2026-10-04T10:05:00Z", "tom"),
+                    e("2026-10-04T10:10:00Z", "stranger"),
+                    e(EDIT_AT, "tom")
+                ]
+            )),
+            other
+        );
+        assert_eq!(
+            dropped_after(&editor_reply_history(
+                Some(e(EDIT_AT, "tom")),
+                &[e("2026-10-04T10:05:00Z", NOBODY), e(EDIT_AT, "tom")]
+            )),
+            other
+        );
+        // The page shows the stranger's edit, so the length does not hide it.
+        assert_eq!(
+            dropped_after(&editor_reply_raw(
+                Some(e(EDIT_AT, "tom")),
+                &[e(EDIT_AT, "tom"), e("2026-10-04T10:10:00Z", "stranger")],
+                150,
+                "IC_7"
+            )),
+            other
+        );
+    }
+
+    #[test]
+    fn a_comment_only_instructors_edited_or_never_edited_is_kept() {
+        assert!(kept_after(&editor_reply_history(
+            Some(e(EDIT_AT, "Tom")),
+            &[e("2026-10-04T10:05:00Z", "tom"), e(EDIT_AT, "Tom")]
+        )));
+        // `lastEditedAt` null, with an empty history or with only the creation entry.
+        assert!(kept_after(&editor_reply_history(None, &[])));
+        assert!(kept_after(&editor_reply_history(
+            None,
+            &[e(CREATED, "tom")]
+        )));
+        // `updated_at` also moves for reasons other than the body: GitHub then has no edit.
+        assert!(kept_after(&editor_reply(None)));
+    }
+
+    #[test]
+    fn a_history_too_long_to_check_drops_the_comment_as_unverifiable() {
+        let times: Vec<String> = (0..100)
+            .map(|i| format!("2026-10-04T10:{}:{}Z", pad(2 + i / 60), pad(i % 60)))
+            .collect();
+        let edits = |n: usize| -> Vec<Edit> { times[..n].iter().map(|t| e(t, "tom")).collect() };
+        // 99 entries are whole; a full page may hide more.
+        assert!(kept_after(&editor_reply_history(
+            Some(e(&times[98], "tom")),
+            &edits(99)
+        )));
+        assert_eq!(
+            dropped_after(&editor_reply_history(
+                Some(e(&times[99], "tom")),
+                &edits(100)
+            )),
+            vec![drop_of("7", DropReason::Unverifiable)]
+        );
+        // A total larger than the page.
+        let nodes = [e(EDIT_AT, "tom"), e(CREATED, "tom")];
+        assert!(kept_after(&editor_reply_raw(
+            Some(e(EDIT_AT, "tom")),
+            &nodes,
+            2,
+            "IC_7"
+        )));
+        assert_eq!(
+            dropped_after(&editor_reply_raw(
+                Some(e(EDIT_AT, "tom")),
+                &nodes,
+                5,
+                "IC_7"
+            )),
+            vec![drop_of("7", DropReason::Unverifiable)]
+        );
+    }
+
+    #[test]
+    fn a_history_whose_newest_entry_is_not_the_latest_edit_is_unverifiable() {
+        let last = e(EDIT_AT, "tom");
+        let create = e(CREATED, "tom");
+        let cases: [&[Edit]; 4] = [
+            &[e("2026-10-04T10:19:00Z", "tom"), create],
+            &[e(EDIT_AT, "amy"), create],
+            &[create],
+            &[],
+        ];
+        for nodes in cases {
+            assert_eq!(
+                dropped_after(&editor_reply_raw(Some(last), nodes, nodes.len(), "IC_7")),
+                vec![drop_of("7", DropReason::Unverifiable)]
+            );
+        }
+        assert!(kept_after(&editor_reply_raw(
+            Some(last),
+            &[e(EDIT_AT, "tom"), create],
+            2,
+            "IC_7"
+        )));
+    }
+
+    #[test]
+    fn a_comment_whose_last_editor_is_not_an_instructor_is_dropped_however_the_history_reads() {
+        let create = e(CREATED, "tom");
+        for who in [Who::User("stranger"), NOBODY] {
+            let last = e(EDIT_AT, who);
+            let cases: [&[Edit]; 4] = [
+                &[],
+                &[e(EDIT_AT, "tom"), create],
+                &[e(EDIT_AT, "amy"), create],
+                &[e(EDIT_AT, who), create],
+            ];
+            for nodes in cases {
+                assert!(
+                    !kept_after(&editor_reply_raw(Some(last), nodes, nodes.len(), "IC_7")),
+                    "{}",
+                    editor_reply_raw(Some(last), nodes, nodes.len(), "IC_7")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_comment_that_cannot_be_looked_up_or_is_gone_is_dropped_and_not_reported() {
+        // No node id, and no `updated_at`: nothing to look up, so no call.
+        let mut no_id = edited_rest_node(7, "tom", WRITTEN, EDIT_AT, "x");
+        no_id["node_id"] = Value::Null;
+        let mut no_update = rest_node(8, Some("tom"), WRITTEN, "y");
+        no_update["updated_at"] = Value::Null;
+        no_update["node_id"] = Value::Null;
+        let fake = answering(&[
+            rest_reply(&[no_id, no_update]),
+            activity_body_reply("b", None),
+        ]);
+        let activity = activity_of(&fake, &["tom"]);
+        assert_eq!(activity.comments, vec![]);
+        assert_eq!(activity.dropped, vec![]);
+        assert_eq!(fake.calls(), vec![comments_call(), body_edit_call()]);
+
+        // The lookup answers `null` for a comment that is gone.
+        let gone = answering(&[
+            rest_reply(&[edited_rest_node(7, "tom", WRITTEN, EDIT_AT, "x")]),
+            r#"{"data":{"nodes":[null]}}"#.into(),
+            activity_body_reply("b", None),
+        ]);
+        let gone_activity = activity_of(&gone, &["tom"]);
+        assert_eq!(gone_activity.comments, vec![]);
+        assert_eq!(gone_activity.dropped, vec![]);
+    }
+
+    #[test]
+    fn only_edited_comments_by_instructors_are_looked_up_in_one_call_oldest_first() {
+        let fake = answering(&[
+            rest_reply(&[
+                edited_rest_node(9, "tom", "2026-10-04T10:03:00Z", EDIT_AT, "c"),
+                edited_rest_node(8, "stranger", "2026-10-04T10:02:00Z", EDIT_AT, "not ours"),
+                edited_rest_node(7, "tom", WRITTEN, EDIT_AT, "a"),
+                rest_node(5, Some("stranger"), "2026-10-04T10:04:00Z", "plain"),
+            ]),
+            // GitHub promises no order for the nodes.
+            editors_reply(&[
+                editor_reply_for(Some(e(EDIT_AT, "stranger")), "IC_9"),
+                editor_reply(Some(e(EDIT_AT, "tom"))),
+            ]),
+            activity_body_reply("b", None),
+        ]);
+        let activity = activity_of(&fake, &["tom"]);
+        assert_eq!(ids_of(&activity), vec!["7"]);
+        assert_eq!(
+            activity.dropped,
+            vec![drop_of("9", DropReason::EditedByOther)]
+        );
+        assert_eq!(
+            fake.calls(),
+            vec![
+                comments_call(),
+                editor_call(&ids(&["IC_7", "IC_9"])),
+                body_edit_call()
+            ]
+        );
+    }
+
+    #[test]
+    fn edited_comments_are_looked_up_100_to_a_call() {
+        let numbers: Vec<u64> = (0..101).map(|i| 1000 + i).collect();
+        let at = |i: usize| format!("2026-10-04T10:{}:{}Z", pad(i / 60), pad(i % 60));
+        let answer = |some: &[u64]| {
+            editors_reply(
+                &some
+                    .iter()
+                    .map(|id| editor_reply_for(Some(e(EDIT_AT, "tom")), &format!("IC_{id}")))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let nodes: Vec<Value> = numbers
+            .iter()
+            .enumerate()
+            .map(|(i, id)| edited_rest_node(*id, "tom", &at(i + 1), EDIT_AT, "x"))
+            .collect();
+        let fake = answering(&[
+            rest_reply(&nodes),
+            answer(&numbers[..100]),
+            answer(&numbers[100..]),
+            activity_body_reply("b", None),
+        ]);
+        let activity = activity_of(&fake, &["tom"]);
+        assert_eq!(activity.comments.len(), 101);
+        let node_ids: Vec<String> = numbers.iter().map(|id| format!("IC_{id}")).collect();
+        assert_eq!(
+            fake.calls(),
+            vec![
+                comments_call(),
+                editor_call(&node_ids[..100]),
+                editor_call(&node_ids[100..]),
+                body_edit_call()
+            ]
+        );
+    }
+
+    #[test]
+    fn dropped_comments_are_listed_oldest_first_beside_the_forwardable_ones_and_the_body_edit_is_left_alone()
+     {
+        let fake = answering(&[
+            rest_reply(&[
+                edited_rest_node(9, "tom", "2026-10-04T10:03:00Z", EDIT_AT, "c"),
+                rest_node(8, Some("tom"), "2026-10-04T10:02:00Z", "kept"),
+                edited_rest_node(7, "tom", "2026-10-04T10:01:00Z", EDIT_AT, "a"),
+            ]),
+            editors_reply(&[
+                editor_reply(Some(e(EDIT_AT, "stranger"))),
+                editor_reply_raw(Some(e(EDIT_AT, "tom")), &[], 0, "IC_9"),
+            ]),
+            activity_body_reply("new body", Some(e(EDIT_AT, "tom"))),
+        ]);
+        let activity = activity_of(&fake, &["tom"]);
+        assert_eq!(ids_of(&activity), vec!["8"]);
+        assert_eq!(
+            activity.dropped,
+            vec![
+                drop_of("7", DropReason::EditedByOther),
+                drop_of("9", DropReason::Unverifiable)
+            ]
+        );
+        assert_eq!(
+            activity.body_edit.map(|edit| edit.body).as_deref(),
+            Some("new body")
+        );
+    }
+
+    #[test]
+    fn a_failing_or_unreadable_editor_lookup_is_an_error() {
+        let list = rest_reply(&[edited_rest_node(7, "tom", WRITTEN, EDIT_AT, "x")]);
+        let failing = FakeTracker::answering([Answer::ok(list.as_str()), Answer::fail(1, "boom")]);
+        let error = activity_error(&failing, &["tom"]);
+        assert_eq!(
+            error,
+            TrackerError::Other(format!(
+                "`{}` exited with status 1: boom",
+                command_text(&editor_call(&ids(&["IC_7"])))
+            ))
+        );
+        let old_shape = r#"{"data":{"nodes":[{"id":"IC_7","lastEditedAt":"2026-10-04T10:20:00Z","editor":{"login":"tom"}}]}}"#;
+        let no_total = r#"{"data":{"nodes":[{"id":"IC_7","lastEditedAt":null,"editor":null,"userContentEdits":{"nodes":[]}}]}}"#;
+        for bad in [
+            old_shape,
+            no_total,
+            "nope",
+            r#"{"errors":[{"message":"x"}]}"#,
+        ] {
+            let fake = answering(&[list.clone(), bad.into()]);
+            let parse = activity_error(&fake, &["tom"]);
+            assert!(
+                is_parse_error_of(Some(parse), &editor_call(&ids(&["IC_7"]))),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_body_edit_by_an_instructor_after_since_is_the_activitys_body_edit() {
+        let fake = answering(&[
+            "[]".into(),
+            activity_body_reply("new body", Some(e("2026-10-04T10:30:00Z", "Tom"))),
+        ]);
+        assert_eq!(
+            activity_of(&fake, &["tom"]).body_edit,
+            Some(BodyEdit {
+                edited_at: "2026-10-04T10:30:00Z".into(),
+                editor: "Tom".into(),
+                body: "new body".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn no_body_edit_when_its_editor_is_not_an_instructor_it_was_never_edited_or_it_is_not_after_since()
+     {
+        let body_edit_of =
+            |reply: String| activity_of(&answering(&["[]".into(), reply]), &["tom"]).body_edit;
+        assert_eq!(
+            body_edit_of(activity_body_reply(
+                "b",
+                Some(e("2026-10-04T10:30:00Z", "stranger"))
+            )),
+            None
+        );
+        assert_eq!(body_edit_of(activity_body_reply("b", None)), None);
+        assert_eq!(
+            body_edit_of(activity_body_reply(
+                "b",
+                Some(e("2026-10-04T09:30:00Z", "tom"))
+            )),
+            None
+        );
+        assert_eq!(
+            body_edit_of(activity_body_reply("b", Some(e(ACT_SINCE, "tom")))),
+            None
+        );
+    }
+
+    #[test]
+    fn a_strangers_edit_after_since_keeps_the_body_from_being_forwarded_whoever_edited_last() {
+        // The body shown is the whole current body: a stranger's edit followed by an
+        // instructor's typo fix would carry the stranger's text under the instructor's name.
+        let last = e("2026-10-04T10:40:00Z", "tom");
+        let history = [
+            e(CREATED, "tom"),
+            e("2026-10-04T10:30:00Z", "stranger"),
+            last,
+        ];
+        let fake = answering(&[
+            "[]".into(),
+            body_reply_raw("b", Some(last), &newest_first(&history), 3),
+        ]);
+        assert_eq!(activity_of(&fake, &["tom"]).body_edit, None);
+        // An edit before since by a stranger does not matter.
+        let early = [e(CREATED, "stranger"), e("2026-10-04T10:30:00Z", "tom")];
+        let fine = answering(&[
+            "[]".into(),
+            body_reply_raw(
+                "b",
+                Some(e("2026-10-04T10:30:00Z", "tom")),
+                &newest_first(&early),
+                2,
+            ),
+        ]);
+        assert_eq!(
+            activity_of(&fine, &["tom"])
+                .body_edit
+                .map(|edit| edit.edited_at)
+                .as_deref(),
+            Some("2026-10-04T10:30:00Z")
+        );
+    }
+
+    #[test]
+    fn a_body_edit_by_an_app_with_an_instructors_login_is_not_forwarded() {
+        let app = bot("tom");
+        let at = "2026-10-04T10:30:00Z";
+        // The last editor is the App.
+        let last_bot = e(at, app);
+        let a = answering(&[
+            "[]".into(),
+            body_reply_raw(
+                "b",
+                Some(last_bot),
+                &newest_first(&[e(CREATED, "tom"), last_bot]),
+                2,
+            ),
+        ]);
+        assert_eq!(activity_of(&a, &["tom"]).body_edit, None);
+        // The last editor is the person, but the App edited in between: the whole body is shown.
+        let last = e("2026-10-04T10:40:00Z", "tom");
+        let history = [e(CREATED, "tom"), last_bot, last];
+        let b = answering(&[
+            "[]".into(),
+            body_reply_raw("b", Some(last), &newest_first(&history), 3),
+        ]);
+        assert_eq!(activity_of(&b, &["tom"]).body_edit, None);
+        // An editor that does not say what it is fails closed.
+        let bare = body_reply_raw(
+            "b",
+            Some(e(at, "tom")),
+            &newest_first(&[e(CREATED, "tom"), e(at, "tom")]),
+            2,
+        )
+        .replace(r#""__typename":"User","#, "");
+        let c = answering(&["[]".into(), bare]);
+        assert_eq!(activity_of(&c, &["tom"]).body_edit, None);
+        // The guard on the last editor alone: an App last editor, a history that looks like the
+        // person's.
+        let guard = answering(&[
+            "[]".into(),
+            body_reply_raw(
+                "b",
+                Some(e(at, app)),
+                &newest_first(&[e(CREATED, "tom"), e(at, "tom")]),
+                2,
+            ),
+        ]);
+        assert_eq!(activity_of(&guard, &["tom"]).body_edit, None);
+        // The person alone is still forwarded.
+        let d = answering(&["[]".into(), activity_body_reply("b", Some(e(at, "tom")))]);
+        assert_eq!(
+            activity_of(&d, &["tom"])
+                .body_edit
+                .map(|edit| edit.edited_at)
+                .as_deref(),
+            Some(at)
+        );
+    }
+
+    #[test]
+    fn a_comment_edited_by_an_app_with_an_instructors_login_is_dropped_once() {
+        let app = bot("tom");
+        assert_eq!(
+            dropped_after(&editor_reply(Some(e(EDIT_AT, app)))),
+            vec![drop_of("7", DropReason::EditedByOther)]
+        );
+        // The person edited last, but the App edited in between.
+        let last = e("2026-10-04T10:25:00Z", "tom");
+        let history = [e(CREATED, "tom"), e(EDIT_AT, app), last];
+        assert_eq!(
+            dropped_after(&editor_reply_history(Some(last), &history)),
+            vec![drop_of("7", DropReason::EditedByOther)]
+        );
+        // The App edited last and the history is cut off: the last editor decides, not the
+        // cut-off.
+        let cut = [e(EDIT_AT, "tom"), e(CREATED, "tom")];
+        assert_eq!(
+            dropped_after(&editor_reply_raw(Some(e(EDIT_AT, app)), &cut, 5, "IC_7")),
+            vec![drop_of("7", DropReason::EditedByOther)]
+        );
+    }
+
+    #[test]
+    fn a_body_edit_history_that_may_be_cut_off_or_whose_newest_entry_is_not_the_latest_edit_is_not_forwarded()
+     {
+        let last = e("2026-10-04T10:05:00Z", "tom");
+        let body_edit =
+            |reply: String| activity_of(&answering(&["[]".into(), reply]), &["tom"]).body_edit;
+        // A total one above the page: one edit is hidden.
+        let nodes = [last, e(CREATED, "tom")];
+        assert!(body_edit(body_reply_raw("b", Some(last), &nodes, 2)).is_some());
+        assert!(body_edit(body_reply_raw("b", Some(last), &nodes, 3)).is_none());
+        // A full page, even when only its newest entry is after since.
+        let older: Vec<String> = (0..99)
+            .map(|i| format!("2026-10-04T09:{}:{}Z", pad(i / 60), pad(i % 60)))
+            .collect();
+        let mut page = vec![last];
+        page.extend(older.iter().rev().map(|t| e(t, "tom")));
+        assert_eq!(page.len(), 100);
+        assert!(body_edit(body_reply_raw("b", Some(last), &page, 100)).is_none());
+        assert!(body_edit(body_reply_raw("b", Some(last), &page[..99], 99)).is_some());
+        // The newest entry is not the latest edit.
+        assert!(
+            body_edit(body_reply_raw(
+                "b",
+                Some(last),
+                &[e("2026-10-04T10:04:00Z", "tom"), e(CREATED, "tom")],
+                2
+            ))
+            .is_none()
+        );
+        assert!(body_edit(body_reply_raw("b", Some(last), &[], 0)).is_none());
+    }
+
+    #[test]
+    fn activity_errors_name_the_call_that_failed_and_a_failed_comments_call_makes_no_second() {
+        let comments = FakeTracker::answering([Answer::fail(1, "Not Found")]);
+        let failed = activity_error(&comments, &["tom"]);
+        assert_eq!(
+            failed,
+            TrackerError::Other(format!(
+                "`{}` exited with status 1: Not Found",
+                command_text(&comments_call())
+            ))
+        );
+        assert_eq!(comments.calls().len(), 1);
+
+        let body = FakeTracker::answering([
+            Answer::ok("[]"),
+            Answer::fail(1, "Could not resolve to an Issue"),
+        ]);
+        let body_failed = activity_error(&body, &["tom"]);
+        assert_eq!(
+            body_failed,
+            TrackerError::Other(format!(
+                "`{}` exited with status 1: Could not resolve to an Issue",
+                command_text(&body_edit_call())
+            ))
+        );
+
+        for bad in [
+            "nope",
+            r#"{"data":{"repository":null}}"#,
+            r#"{"errors":[{"message":"x"}]}"#,
+        ] {
+            let fake = answering(&["[]".into(), bad.into()]);
+            let error = activity_error(&fake, &["tom"]);
+            assert!(is_parse_error_of(Some(error), &body_edit_call()), "{bad}");
+        }
+
+        let not_json = answering(&["not json".into()]);
+        let parse = activity_error(&not_json, &["tom"]);
+        assert!(is_parse_error_of(Some(parse), &comments_call()));
+
+        let spawn = FakeTracker::answering([Answer::NotStarted("no such file".into())]);
+        assert_eq!(
+            activity_error(&spawn, &["tom"]),
+            TrackerError::Other(format!(
+                "cannot start `{}`: no such file",
+                command_text(&comments_call())
+            ))
+        );
+    }
+
+    #[test]
+    fn activity_with_a_malformed_repo_is_a_parse_error_without_calling_gh() {
+        let fake = FakeTracker::new();
+        let error = fake
+            .activity_since("no-slash", 6, ACT_SINCE, &names(&["tom"]))
+            .unwrap_err();
+        assert!(
+            matches!(&error, TrackerError::Other(m) if m.contains("returned unexpected output"))
+        );
+        assert!(fake.calls().is_empty());
+    }
+
+    #[test]
+    fn activity_with_a_malformed_since_is_a_parse_error_without_calling_gh() {
+        for bad in [
+            "",
+            "yesterday",
+            "2026-10-04",
+            "2026-10-04T10:00:00",
+            "2026-10-04T10:00:00+10:00",
+            "2026-10-04 10:00:00Z",
+            "2026-10-04T10:00:00.000Z",
+            "2026-10-04T10:00:00Z&per_page=1",
+            "2026-10-04T10:00:00Z/../../x",
+            "2026-10-04T10:00:00Z\n",
+            "2026-1O-04T10:00:00Z",
+            " 2026-10-04T10:00:00Z",
+            "２０２６-10-04T10:00:00Z",
+        ] {
+            let fake = FakeTracker::new();
+            let error = fake
+                .activity_since(REPO, 6, bad, &names(&["tom"]))
+                .unwrap_err();
+            assert!(
+                matches!(&error, TrackerError::Other(m) if m.contains("returned unexpected output")),
+                "{bad:?}"
+            );
+            assert!(fake.calls().is_empty(), "{bad:?}");
+        }
+    }
+
+    // ---- pr_feedback ----
+
+    /// The moment the feedback tests read from: everything after it is new.
+    const FB_SINCE: &str = "2026-10-04T10:30:00Z";
+
+    fn person(login: &str) -> Value {
+        json!({"__typename": "User", "login": login})
+    }
+
+    fn feedback_call(query: &str, rest: &[&str]) -> Vec<String> {
+        let mut call = args(&[
+            "api",
+            "graphql",
+            "-f",
+            &format!("query={query}"),
+            "-f",
+            "owner=rawphp",
+            "-f",
+            "name=softfac",
+            "-F",
+            "number=6",
+        ]);
+        call.extend(rest.iter().map(|part| part.to_string()));
+        call
+    }
+
+    fn before_call(cursor: &str) -> Vec<String> {
+        feedback_call(REVIEWS_BEFORE_QUERY, &["-f", &format!("before={cursor}")])
+    }
+
+    fn feedback_reply(reviews: &[Value], comments: &[Value]) -> String {
+        json!({"data": {"repository": {"pullRequest": {
+            "reviews": {"nodes": reviews},
+            "comments": {"nodes": comments},
+        }}}})
+        .to_string()
+    }
+
+    /// A reply whose reviews connection says how many there are in all and where its first node
+    /// starts.
+    fn paged_reply(reviews: &[Value], comments: &[Value], total: u64, cursor: &str) -> String {
+        json!({"data": {"repository": {"pullRequest": {
+            "reviews": {"totalCount": total, "pageInfo": {"startCursor": cursor}, "nodes": reviews},
+            "comments": {"nodes": comments},
+        }}}})
+        .to_string()
+    }
+
+    /// A reply to the paging query.
+    fn reviews_page(reviews: &[Value], total: u64, cursor: &str) -> String {
+        json!({"data": {"repository": {"pullRequest": {
+            "reviews": {"totalCount": total, "pageInfo": {"startCursor": cursor}, "nodes": reviews},
+        }}}})
+        .to_string()
+    }
+
+    const GONE: &str = r#"{"data":{"repository":{"pullRequest":null}}}"#;
+
+    fn review_node(
+        id: impl ToString,
+        state: &str,
+        body: &str,
+        at: Option<&str>,
+        author: &str,
+        inline: &[Value],
+    ) -> Value {
+        json!({
+            "fullDatabaseId": id.to_string(),
+            "state": state,
+            "body": body,
+            "submittedAt": at,
+            "author": person(author),
+            "lastEditedAt": null,
+            "editor": null,
+            "comments": {"nodes": inline},
+        })
+    }
+
+    fn inline_node_at(
+        body: &str,
+        path: &str,
+        line: Option<u64>,
+        author: &str,
+        original_line: Option<u64>,
+    ) -> Value {
+        json!({
+            "body": body,
+            "path": path,
+            "line": line,
+            "originalLine": original_line,
+            "author": person(author),
+        })
+    }
+
+    fn inline_node(body: &str, path: &str, line: u64, author: &str) -> Value {
+        inline_node_at(body, path, Some(line), author, Some(5))
+    }
+
+    fn pr_comment_node(id: impl ToString, body: &str, at: &str, author: &str) -> Value {
+        json!({
+            "fullDatabaseId": id.to_string(),
+            "body": body,
+            "createdAt": at,
+            "author": person(author),
+            "lastEditedAt": null,
+            "editor": null,
+        })
+    }
+
+    fn read_with(fake: &FakeTracker, since: &str, floor: &str) -> Vec<Feedback> {
+        fake.pr_feedback(REPO, 6, since, floor, &names(&["rawphp"]))
+            .unwrap()
+    }
+
+    fn read(fake: &FakeTracker) -> Vec<Feedback> {
+        read_with(fake, FB_SINCE, FB_SINCE)
+    }
+
+    fn error_with(fake: &FakeTracker, since: &str, floor: &str) -> TrackerError {
+        fake.pr_feedback(REPO, 6, since, floor, &names(&["rawphp"]))
+            .unwrap_err()
+    }
+
+    fn feedback_error(fake: &FakeTracker) -> TrackerError {
+        error_with(fake, FB_SINCE, FB_SINCE)
+    }
+
+    fn read_feedback(answer: &str) -> Vec<Feedback> {
+        read(&FakeTracker::answering([Answer::ok(answer)]))
+    }
+
+    fn feedback_ids(items: &[Feedback]) -> Vec<&str> {
+        items.iter().map(|f| f.id.as_str()).collect()
+    }
+
+    fn is_parse_error(error: &TrackerError) -> bool {
+        matches!(error, TrackerError::Other(m) if m.contains("returned unexpected output"))
+    }
+
+    #[test]
+    fn pr_feedback_asks_for_the_reviews_and_conversation_comments_with_one_call() {
+        let fake = FakeTracker::answering([Answer::ok(feedback_reply(&[], &[]))]);
+        read(&fake);
+        assert_eq!(fake.calls(), vec![feedback_call(PR_FEEDBACK_QUERY, &[])]);
+    }
+
+    #[test]
+    fn pr_feedback_reads_a_real_answer_to_the_feedback_query_by_the_rules() {
+        let live = include_str!("fixtures/pr_feedback_cli_9000.json");
+        let fake = FakeTracker::answering([Answer::ok(live)]);
+        let items = fake
+            .pr_feedback(
+                REPO,
+                9000,
+                "2024-04-01T00:00:00Z",
+                "2024-04-01T00:00:00Z",
+                &names(&["williammartin"]),
+            )
+            .unwrap();
+        // Review 2028948315 approves with a body that ends in "LGTM!" and no inline comment, so
+        // it is not feedback.
+        assert_eq!(
+            feedback_ids(&items),
+            vec!["pr-comment:2082274688", "review:2028628010"]
+        );
+        assert_eq!(
+            items[1].kind,
+            FeedbackKind::Review {
+                state: "COMMENTED".into()
+            }
+        );
+        let inline: Vec<(&str, Option<u64>)> = items[1]
+            .inline
+            .iter()
+            .map(|c| (c.path.as_str(), c.line))
+            .collect();
+        assert_eq!(
+            inline,
+            vec![
+                ("pkg/cmd/attestation/verify/verify.go", Some(130)),
+                ("pkg/cmdutil/auth_check_test.go", Some(113))
+            ]
+        );
+        // Someone else's review and comments are not feedback.
+        assert!(items.iter().all(|i| i.author == "williammartin"));
+    }
+
+    #[test]
+    fn the_feedback_query_asks_for_what_the_rules_judge() {
+        for part in [
+            "pullRequest(number: $number)",
+            "reviews(last: 50) { totalCount pageInfo { startCursor } nodes {",
+            "comments(last: 100)",
+            "comments(first: 50)",
+            "fullDatabaseId",
+            "submittedAt",
+            "lastEditedAt",
+            "editor { __typename login }",
+            "author { __typename login }",
+            "originalLine",
+            "comments(first: 50) { totalCount nodes { id body path line originalLine",
+            "userContentEdits(first: 20)",
+            "totalCount nodes { editedAt editor { __typename login } }",
+        ] {
+            assert!(PR_FEEDBACK_QUERY.contains(part), "missing {part}");
+        }
+        // The review's and the conversation comment's histories, and no history on the inline
+        // comments: those are read one comment at a time, only where one was edited.
+        assert_eq!(
+            PR_FEEDBACK_QUERY
+                .matches("userContentEdits(first: 20)")
+                .count(),
+            2
+        );
+        assert!(!PR_FEEDBACK_QUERY.contains("reviews(last: 100)"));
+        assert!(!PR_FEEDBACK_QUERY.contains("comments(first: 100)"));
+    }
+
+    #[test]
+    fn the_feedback_queries_are_softfacs_byte_for_byte() {
+        assert_eq!(
+            PR_FEEDBACK_QUERY,
+            "query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { pullRequest(number: $number) { reviews(last: 50) { totalCount pageInfo { startCursor } nodes { fullDatabaseId state body submittedAt author { __typename login } lastEditedAt editor { __typename login } userContentEdits(first: 20) { totalCount nodes { editedAt editor { __typename login } } } comments(first: 50) { totalCount nodes { id body path line originalLine author { __typename login } lastEditedAt } } } } comments(last: 100) { nodes { fullDatabaseId body createdAt author { __typename login } lastEditedAt editor { __typename login } userContentEdits(first: 20) { totalCount nodes { editedAt editor { __typename login } } } } } } } }"
+        );
+        assert_eq!(
+            REVIEWS_BEFORE_QUERY,
+            "query($owner: String!, $name: String!, $number: Int!, $before: String!) { repository(owner: $owner, name: $name) { pullRequest(number: $number) { reviews(last: 50, before: $before) { totalCount pageInfo { startCursor } nodes { fullDatabaseId state body submittedAt author { __typename login } lastEditedAt editor { __typename login } userContentEdits(first: 20) { totalCount nodes { editedAt editor { __typename login } } } comments(first: 50) { totalCount nodes { id body path line originalLine author { __typename login } lastEditedAt } } } } } } }"
+        );
+    }
+
+    /// The text of the `{ ... }` that follows the first `reviews(` in `query`.
+    fn reviews_selection(query: &str) -> &str {
+        let from = query.find("reviews(").unwrap();
+        let open = from + query[from..].find('{').unwrap();
+        let mut depth = 0;
+        for (at, c) in query[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &query[open..open + at + 1];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("no closing brace for the reviews selection in {query}");
+    }
+
+    #[test]
+    fn both_feedback_queries_select_the_same_review_fields() {
+        let first = reviews_selection(PR_FEEDBACK_QUERY);
+        assert!(first.contains("fullDatabaseId"));
+        assert_eq!(first, reviews_selection(REVIEWS_BEFORE_QUERY));
+    }
+
+    #[test]
+    fn the_page_limit_is_twenty_pages_of_fifty_reviews() {
+        assert_eq!(REVIEW_PAGE_LIMIT, 20);
+        assert!(REVIEWS_BEFORE_QUERY.contains("reviews(last: 50, before: $before)"));
+    }
+
+    #[test]
+    fn an_instructor_review_is_feedback_with_its_inline_comments_and_their_path_and_line() {
+        let inline = inline_node("rename this", "src/a.rs", 7, "rawphp");
+        let got = read_feedback(&feedback_reply(
+            &[review_node(
+                11,
+                "CHANGES_REQUESTED",
+                "please fix",
+                Some("2026-10-04T11:00:00Z"),
+                "rawphp",
+                &[inline],
+            )],
+            &[],
+        ));
+        assert_eq!(
+            got,
+            vec![Feedback {
+                id: "review:11".into(),
+                author: "rawphp".into(),
+                kind: FeedbackKind::Review {
+                    state: "CHANGES_REQUESTED".into()
+                },
+                created_at: "2026-10-04T11:00:00Z".into(),
+                body: "please fix".into(),
+                inline: vec![InlineComment {
+                    path: "src/a.rs".into(),
+                    line: Some(7),
+                    body: "rename this".into(),
+                }],
+                inline_unread: 0,
+            }]
+        );
+    }
+
+    #[test]
+    fn ids_past_what_a_32_bit_integer_holds_are_read_from_the_full_database_id() {
+        let got = read_feedback(&feedback_reply(
+            &[review_node(
+                6_082_131_994u64,
+                "COMMENTED",
+                "big",
+                Some("2026-10-04T11:00:00Z"),
+                "rawphp",
+                &[],
+            )],
+            &[pr_comment_node(
+                5_700_000_001u64,
+                "also big",
+                "2026-10-04T11:01:00Z",
+                "rawphp",
+            )],
+        ));
+        assert_eq!(
+            feedback_ids(&got),
+            vec!["review:6082131994", "pr-comment:5700000001"]
+        );
+    }
+
+    #[test]
+    fn a_full_database_id_that_is_a_json_number_is_read_too() {
+        let mut comment = pr_comment_node(21, "hi", "2026-10-04T11:00:00Z", "rawphp");
+        comment["fullDatabaseId"] = json!(5_700_000_001u64);
+        let got = read_feedback(&feedback_reply(&[], &[comment]));
+        assert_eq!(feedback_ids(&got), vec!["pr-comment:5700000001"]);
+    }
+
+    #[test]
+    fn a_commented_review_and_a_conversation_comment_are_feedback_oldest_first() {
+        let got = read_feedback(&feedback_reply(
+            &[review_node(
+                11,
+                "COMMENTED",
+                "later",
+                Some("2026-10-04T12:00:00Z"),
+                "rawphp",
+                &[],
+            )],
+            &[pr_comment_node(
+                21,
+                "first",
+                "2026-10-04T11:00:00Z",
+                "rawphp",
+            )],
+        ));
+        let seen: Vec<(&str, &FeedbackKind)> =
+            got.iter().map(|f| (f.id.as_str(), &f.kind)).collect();
+        assert_eq!(
+            seen,
+            vec![
+                ("pr-comment:21", &FeedbackKind::PrComment),
+                (
+                    "review:11",
+                    &FeedbackKind::Review {
+                        state: "COMMENTED".into()
+                    }
+                ),
+            ]
+        );
+        assert_eq!(got[0].body, "first");
+        assert_eq!(got[0].created_at, "2026-10-04T11:00:00Z");
+    }
+
+    #[test]
+    fn someone_who_is_not_an_instructor_and_a_bot_of_the_same_name_are_not_feedback() {
+        let mut bot_comment = pr_comment_node(22, "hi", "2026-10-04T11:00:00Z", "rawphp");
+        bot_comment["author"] = json!({"__typename": "Bot", "login": "rawphp"});
+        let got = read_feedback(&feedback_reply(
+            &[review_node(
+                11,
+                "CHANGES_REQUESTED",
+                "no",
+                Some("2026-10-04T11:00:00Z"),
+                "stranger",
+                &[],
+            )],
+            &[
+                pr_comment_node(21, "hello", "2026-10-04T11:00:00Z", "stranger"),
+                bot_comment,
+            ],
+        ));
+        assert_eq!(got, vec![]);
+    }
+
+    #[test]
+    fn an_author_who_was_deleted_is_not_feedback() {
+        let mut gone = pr_comment_node(21, "hi", "2026-10-04T11:00:00Z", "rawphp");
+        gone["author"] = Value::Null;
+        assert_eq!(read_feedback(&feedback_reply(&[], &[gone])), vec![]);
+    }
+
+    #[test]
+    fn the_logins_are_compared_without_regard_to_case() {
+        let got = read_feedback(&feedback_reply(
+            &[],
+            &[pr_comment_node(
+                21,
+                "hello",
+                "2026-10-04T11:00:00Z",
+                "RawPHP",
+            )],
+        ));
+        assert_eq!(got.len(), 1);
+    }
+
+    #[test]
+    fn a_comment_with_the_factorys_marker_is_never_feedback() {
+        let got = read_feedback(&feedback_reply(
+            &[review_node(
+                11,
+                "COMMENTED",
+                "ok <!-- softfac -->",
+                Some("2026-10-04T11:00:00Z"),
+                "rawphp",
+                &[],
+            )],
+            &[
+                pr_comment_node(
+                    21,
+                    "gate ok\n\n<!-- softfac -->",
+                    "2026-10-04T11:00:00Z",
+                    "rawphp",
+                ),
+                pr_comment_node(
+                    22,
+                    "<!-- softfac:status -->",
+                    "2026-10-04T11:00:00Z",
+                    "rawphp",
+                ),
+            ],
+        ));
+        assert_eq!(got, vec![]);
+    }
+
+    #[test]
+    fn an_approval_is_feedback_only_with_inline_comments_a_dismissed_review_with_words_or_inline_comments_is_too()
+     {
+        // softfac also counts an approval with a body, so approving with "LGTM!" would send the
+        // pull request back to draft and the issue back to building. This port does not.
+        let inline = inline_node("nit", "src/a.rs", 3, "rawphp");
+        let got = read_feedback(&feedback_reply(
+            &[
+                review_node(
+                    11,
+                    "APPROVED",
+                    "",
+                    Some("2026-10-04T11:00:00Z"),
+                    "rawphp",
+                    &[],
+                ),
+                review_node(
+                    12,
+                    "DISMISSED",
+                    "  \n",
+                    Some("2026-10-04T11:01:00Z"),
+                    "rawphp",
+                    &[],
+                ),
+                review_node(
+                    13,
+                    "APPROVED",
+                    "LGTM!",
+                    Some("2026-10-04T11:02:00Z"),
+                    "rawphp",
+                    &[],
+                ),
+                review_node(
+                    14,
+                    "APPROVED",
+                    "",
+                    Some("2026-10-04T11:03:00Z"),
+                    "rawphp",
+                    std::slice::from_ref(&inline),
+                ),
+                review_node(
+                    15,
+                    "DISMISSED",
+                    "stale",
+                    Some("2026-10-04T11:04:00Z"),
+                    "rawphp",
+                    &[],
+                ),
+                review_node(
+                    16,
+                    "APPROVED",
+                    "one more nit",
+                    Some("2026-10-04T11:05:00Z"),
+                    "rawphp",
+                    std::slice::from_ref(&inline),
+                ),
+            ],
+            &[],
+        ));
+        assert_eq!(
+            feedback_ids(&got),
+            vec!["review:14", "review:15", "review:16"]
+        );
+    }
+
+    #[test]
+    fn a_comment_and_a_commented_review_that_only_say_lgtm_are_still_feedback() {
+        // The factory's login opens the pull requests, so an instructor acting as it can only
+        // comment: only an approval's body is left unread.
+        let got = read_feedback(&feedback_reply(
+            &[review_node(
+                11,
+                "COMMENTED",
+                "looks good",
+                Some("2026-10-04T11:00:00Z"),
+                "rawphp",
+                &[],
+            )],
+            &[pr_comment_node(
+                21,
+                "LGTM, merging after the release",
+                "2026-10-04T11:01:00Z",
+                "rawphp",
+            )],
+        ));
+        assert_eq!(feedback_ids(&got), vec!["review:11", "pr-comment:21"]);
+    }
+
+    #[test]
+    fn a_review_that_is_still_pending_or_has_no_submission_time_is_not_feedback() {
+        let got = read_feedback(&feedback_reply(
+            &[
+                review_node(
+                    11,
+                    "PENDING",
+                    "draft",
+                    Some("2026-10-04T11:00:00Z"),
+                    "rawphp",
+                    &[],
+                ),
+                review_node(12, "COMMENTED", "x", None, "rawphp", &[]),
+            ],
+            &[],
+        ));
+        assert_eq!(got, vec![]);
+    }
+
+    #[test]
+    fn a_review_with_more_inline_comments_than_were_read_says_how_many_are_missing() {
+        let shown: Vec<Value> = (0..100)
+            .map(|i| inline_node(&format!("note {i}"), "src/a.rs", 7, "rawphp"))
+            .collect();
+        let with_total = |mut review: Value, total: u64| {
+            review["comments"]["totalCount"] = json!(total);
+            review
+        };
+        let many = read_feedback(&feedback_reply(
+            &[with_total(
+                review_node(
+                    11,
+                    "COMMENTED",
+                    "many",
+                    Some("2026-10-04T11:00:00Z"),
+                    "rawphp",
+                    &shown,
+                ),
+                150,
+            )],
+            &[],
+        ));
+        assert_eq!(many[0].inline.len(), 100);
+        assert_eq!(many[0].inline_unread, 50);
+        // Read whole, or a count that is no larger than what came: nothing is missing.
+        let whole = read_feedback(&feedback_reply(
+            &[with_total(
+                review_node(
+                    12,
+                    "COMMENTED",
+                    "few",
+                    Some("2026-10-04T11:00:00Z"),
+                    "rawphp",
+                    &[inline_node("a", "src/a.rs", 1, "rawphp")],
+                ),
+                1,
+            )],
+            &[],
+        ));
+        assert_eq!(whole[0].inline_unread, 0);
+    }
+
+    #[test]
+    fn only_inline_comments_by_instructors_without_the_marker_are_kept_and_the_line_falls_back() {
+        let inline = [
+            inline_node("keep", "src/a.rs", 7, "rawphp"),
+            inline_node("stranger", "src/b.rs", 8, "stranger"),
+            inline_node("mine <!-- softfac -->", "src/c.rs", 9, "rawphp"),
+            inline_node_at("outdated", "src/d.rs", None, "rawphp", Some(4)),
+            inline_node_at("nowhere", "src/e.rs", None, "rawphp", None),
+        ];
+        let got = read_feedback(&feedback_reply(
+            &[review_node(
+                11,
+                "COMMENTED",
+                "",
+                Some("2026-10-04T11:00:00Z"),
+                "rawphp",
+                &inline,
+            )],
+            &[],
+        ));
+        let kept: Vec<(&str, Option<u64>, &str)> = got[0]
+            .inline
+            .iter()
+            .map(|c| (c.path.as_str(), c.line, c.body.as_str()))
+            .collect();
+        assert_eq!(
+            kept,
+            vec![
+                ("src/a.rs", Some(7), "keep"),
+                ("src/d.rs", Some(4), "outdated"),
+                ("src/e.rs", None, "nowhere"),
+            ]
+        );
+    }
+
+    #[test]
+    fn only_what_was_written_after_since_is_feedback_the_same_second_is_not_after() {
+        let got = read_feedback(&feedback_reply(
+            &[review_node(
+                11,
+                "COMMENTED",
+                "old",
+                Some("2026-10-04T10:29:59Z"),
+                "rawphp",
+                &[],
+            )],
+            &[
+                pr_comment_node(21, "same second", FB_SINCE, "rawphp"),
+                pr_comment_node(22, "new", "2026-10-04T10:30:01Z", "rawphp"),
+            ],
+        ));
+        assert_eq!(feedback_ids(&got), vec!["pr-comment:22"]);
+    }
+
+    #[test]
+    fn a_pull_request_that_is_gone_has_no_feedback() {
+        assert_eq!(read_feedback(GONE), vec![]);
+    }
+
+    #[test]
+    fn a_since_that_is_not_githubs_form_is_refused_before_gh_runs() {
+        for since in [
+            "",
+            "2026-10-04",
+            "2026-10-04 10:30:00",
+            "2026-10-04T10:30:00.5Z",
+        ] {
+            let fake = FakeTracker::new();
+            let error = error_with(&fake, since, since);
+            assert!(is_parse_error(&error), "{since:?}");
+            assert!(fake.calls().is_empty(), "{since:?}");
+        }
+    }
+
+    #[test]
+    fn a_floor_that_is_not_githubs_form_is_refused_before_gh_runs() {
+        for floor in ["", "2026-10-04", "2026-10-04T10:30:00.5Z"] {
+            let fake = FakeTracker::new();
+            let error = error_with(&fake, FB_SINCE, floor);
+            assert!(is_parse_error(&error), "{floor:?}");
+            assert!(fake.calls().is_empty(), "{floor:?}");
+        }
+    }
+
+    #[test]
+    fn feedback_with_a_time_or_id_it_cannot_read_is_an_error_and_not_a_guess() {
+        let mut no_id = pr_comment_node(21, "hi", "2026-10-04T11:00:00Z", "rawphp");
+        no_id["fullDatabaseId"] = Value::Null;
+        let bad_time = pr_comment_node(21, "hi", "yesterday", "rawphp");
+        let not_a_number = pr_comment_node("abc", "hi", "2026-10-04T11:00:00Z", "rawphp");
+        for comment in [no_id, bad_time, not_a_number] {
+            let fake =
+                FakeTracker::answering([Answer::ok(feedback_reply(&[], &[comment.clone()]))]);
+            assert!(is_parse_error(&feedback_error(&fake)), "{comment}");
+        }
+        let mut no_review_id = review_node(
+            11,
+            "COMMENTED",
+            "x",
+            Some("2026-10-04T11:00:00Z"),
+            "rawphp",
+            &[],
+        );
+        no_review_id["fullDatabaseId"] = Value::Null;
+        let fake = FakeTracker::answering([Answer::ok(feedback_reply(&[no_review_id], &[]))]);
+        assert!(is_parse_error(&feedback_error(&fake)));
+        for garbage in ["", "no", "{}"] {
+            let fake = FakeTracker::answering([Answer::ok(garbage)]);
+            assert!(is_parse_error(&feedback_error(&fake)), "{garbage}");
+        }
+    }
+
+    /// 50 reviews by a stranger at 11:00 to 11:49 on the day of `FB_SINCE`; the first at 09:00
+    /// with `older_first`.
+    fn fifty_reviews(older_first: bool) -> Vec<Value> {
+        (0..50)
+            .map(|i| {
+                let at = if older_first && i == 0 {
+                    "2026-10-04T09:00:00Z".to_string()
+                } else {
+                    format!("2026-10-04T11:{}:00Z", pad(i))
+                };
+                review_node(100 + i, "COMMENTED", "noise", Some(&at), "stranger", &[])
+            })
+            .collect()
+    }
+
+    fn oldest_is_instructors(id: u64, body: &str, at: &str) -> Value {
+        review_node(id, "CHANGES_REQUESTED", body, Some(at), "rawphp", &[])
+    }
+
+    #[test]
+    fn the_oldest_of_the_fifty_reviews_the_query_reads_is_still_read() {
+        // GitHub lists the newest 50 oldest first: the instructor's review is the first of a
+        // full page. With no `totalCount` saying more exist, nothing pages back.
+        let mut reviews = vec![oldest_is_instructors(
+            11,
+            "the oldest",
+            "2026-10-04T11:00:00Z",
+        )];
+        reviews.extend(fifty_reviews(false).into_iter().skip(1));
+        assert_eq!(reviews.len(), 50);
+        let fake = FakeTracker::answering([Answer::ok(feedback_reply(&reviews, &[]))]);
+        assert_eq!(feedback_ids(&read(&fake)), vec!["review:11"]);
+        assert_eq!(fake.calls().len(), 1);
+    }
+
+    #[test]
+    fn a_full_page_of_new_reviews_with_more_behind_it_is_paged_back_to_read_the_51st() {
+        let older = oldest_is_instructors(11, "the 51st", "2026-10-04T10:45:00Z");
+        let fake = FakeTracker::answering([
+            Answer::ok(paged_reply(&fifty_reviews(false), &[], 51, "c1")),
+            Answer::ok(reviews_page(&[older], 51, "c0")),
+        ]);
+        assert_eq!(feedback_ids(&read(&fake)), vec!["review:11"]);
+        assert_eq!(
+            fake.calls(),
+            vec![feedback_call(PR_FEEDBACK_QUERY, &[]), before_call("c1")]
+        );
+    }
+
+    #[test]
+    fn a_pending_oldest_review_does_not_stop_the_paging() {
+        let mut pending = fifty_reviews(false);
+        pending[0]["submittedAt"] = Value::Null;
+        let older = oldest_is_instructors(11, "the 51st", "2026-10-04T10:45:00Z");
+        let fake = FakeTracker::answering([
+            Answer::ok(paged_reply(&pending, &[], 51, "c1")),
+            Answer::ok(reviews_page(&[older], 51, "c0")),
+        ]);
+        assert_eq!(feedback_ids(&read(&fake)), vec!["review:11"]);
+        assert_eq!(
+            fake.calls(),
+            vec![feedback_call(PR_FEEDBACK_QUERY, &[]), before_call("c1")]
+        );
+    }
+
+    #[test]
+    fn an_unreadable_time_on_the_oldest_review_is_an_error_and_pages_no_further() {
+        let mut garbled = fifty_reviews(false);
+        garbled[0]["submittedAt"] = json!("yesterday");
+        let fake = FakeTracker::answering([Answer::ok(paged_reply(&garbled, &[], 51, "c1"))]);
+        assert!(is_parse_error(&feedback_error(&fake)));
+        assert_eq!(fake.calls().len(), 1);
+    }
+
+    #[test]
+    fn paging_back_stops_at_a_review_at_or_before_the_starting_point() {
+        let page = [
+            review_node(
+                10,
+                "COMMENTED",
+                "old",
+                Some("2026-10-04T10:30:00Z"),
+                "rawphp",
+                &[],
+            ),
+            oldest_is_instructors(11, "new", "2026-10-04T10:45:00Z"),
+        ];
+        let fake = FakeTracker::answering([
+            Answer::ok(paged_reply(&fifty_reviews(false), &[], 200, "c1")),
+            Answer::ok(reviews_page(&page, 200, "c0")),
+        ]);
+        assert_eq!(feedback_ids(&read(&fake)), vec!["review:11"]);
+        assert_eq!(fake.calls().len(), 2);
+    }
+
+    #[test]
+    fn paging_back_goes_on_while_the_oldest_review_read_is_still_new() {
+        let page_of_new = |base: u64| -> Vec<Value> {
+            (0..2)
+                .map(|i| {
+                    review_node(
+                        base + i,
+                        "COMMENTED",
+                        "noise",
+                        Some("2026-10-04T10:40:00Z"),
+                        "stranger",
+                        &[],
+                    )
+                })
+                .collect()
+        };
+        let oldest = review_node(
+            1,
+            "COMMENTED",
+            "old",
+            Some("2026-10-04T09:00:00Z"),
+            "stranger",
+            &[],
+        );
+        let mut last = vec![oldest];
+        last.extend(page_of_new(70));
+        let fake = FakeTracker::answering([
+            Answer::ok(paged_reply(&fifty_reviews(false), &[], 54, "c1")),
+            Answer::ok(reviews_page(&page_of_new(60), 54, "c0")),
+            Answer::ok(reviews_page(&last, 54, "cx")),
+        ]);
+        read(&fake);
+        assert_eq!(
+            fake.calls(),
+            vec![
+                feedback_call(PR_FEEDBACK_QUERY, &[]),
+                before_call("c1"),
+                before_call("c0")
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failed_call_for_the_earlier_reviews_is_an_error_and_is_not_retried() {
+        let fake = FakeTracker::answering([
+            Answer::ok(paged_reply(&fifty_reviews(false), &[], 51, "c1")),
+            Answer::fail(1, "boom"),
+        ]);
+        let error = feedback_error(&fake);
+        assert_eq!(
+            error,
+            TrackerError::Other(format!(
+                "`{}` exited with status 1: boom",
+                command_text(&before_call("c1"))
+            ))
+        );
+        assert_eq!(fake.calls().len(), 2);
+    }
+
+    #[test]
+    fn reviews_from_every_page_come_back_oldest_first() {
+        let newer = review_node(
+            30,
+            "COMMENTED",
+            "newer",
+            Some("2026-10-04T11:20:00Z"),
+            "rawphp",
+            &[],
+        );
+        let older_page = [
+            review_node(
+                10,
+                "COMMENTED",
+                "old",
+                Some("2026-10-04T10:30:00Z"),
+                "rawphp",
+                &[],
+            ),
+            review_node(
+                20,
+                "COMMENTED",
+                "older",
+                Some("2026-10-04T10:45:00Z"),
+                "rawphp",
+                &[],
+            ),
+        ];
+        let mut first = vec![newer];
+        first.extend(fifty_reviews(false));
+        let fake = FakeTracker::answering([
+            Answer::ok(paged_reply(&first, &[], 100, "c1")),
+            Answer::ok(reviews_page(&older_page, 100, "c0")),
+        ]);
+        assert_eq!(feedback_ids(&read(&fake)), vec!["review:20", "review:30"]);
+        assert_eq!(fake.calls().len(), 2);
+    }
+
+    /// Replies to the feedback query and to `pages - 1` paging calls, every page one new review
+    /// by a stranger and a total no number of pages reaches, each with a cursor of its own. With
+    /// `old_last` the last page is at or before the starting point.
+    fn endless_reviews(pages: usize, old_last: bool) -> Vec<Answer> {
+        let mut answers = vec![Answer::ok(paged_reply(
+            &fifty_reviews(false),
+            &[],
+            1_000_000,
+            "c1",
+        ))];
+        for i in 1..pages {
+            let at = if old_last && i == pages - 1 {
+                "2026-10-04T09:00:00Z"
+            } else {
+                "2026-10-04T10:40:00Z"
+            };
+            let review = review_node(1000 + i, "COMMENTED", "noise", Some(at), "stranger", &[]);
+            answers.push(Answer::ok(reviews_page(
+                &[review],
+                1_000_000,
+                &format!("c{}", i + 1),
+            )));
+        }
+        answers
+    }
+
+    #[test]
+    fn a_page_with_the_cursor_that_was_just_sent_is_an_error_after_two_calls() {
+        let page = review_node(
+            11,
+            "COMMENTED",
+            "noise",
+            Some("2026-10-04T10:40:00Z"),
+            "stranger",
+            &[],
+        );
+        let fake = FakeTracker::answering([
+            Answer::ok(paged_reply(&fifty_reviews(false), &[], 1000, "c1")),
+            Answer::ok(reviews_page(std::slice::from_ref(&page), 1000, "c1")),
+            Answer::ok(reviews_page(std::slice::from_ref(&page), 1000, "c1")),
+        ]);
+        assert!(is_parse_error(&feedback_error(&fake)));
+        assert_eq!(fake.calls().len(), 2);
+    }
+
+    #[test]
+    fn paging_back_that_would_read_past_the_page_limit_is_an_error_after_the_limit() {
+        let fake = FakeTracker::answering(endless_reviews(REVIEW_PAGE_LIMIT + 5, false));
+        assert!(is_parse_error(&feedback_error(&fake)));
+        assert_eq!(fake.calls().len(), REVIEW_PAGE_LIMIT);
+    }
+
+    #[test]
+    fn paging_back_that_reaches_an_old_review_on_the_last_page_allowed_is_not_an_error() {
+        let fake = FakeTracker::answering(endless_reviews(REVIEW_PAGE_LIMIT, true));
+        read(&fake);
+        assert_eq!(fake.calls().len(), REVIEW_PAGE_LIMIT);
+    }
+
+    #[test]
+    fn a_total_equal_to_the_reviews_read_does_not_page_back() {
+        let fake = FakeTracker::answering([Answer::ok(paged_reply(
+            &fifty_reviews(false),
+            &[],
+            50,
+            "c1",
+        ))]);
+        read(&fake);
+        assert_eq!(fake.calls().len(), 1);
+    }
+
+    #[test]
+    fn a_full_page_whose_oldest_review_is_at_or_before_the_starting_point_does_not_page_back() {
+        let fake =
+            FakeTracker::answering([Answer::ok(paged_reply(&fifty_reviews(true), &[], 51, "c1"))]);
+        read(&fake);
+        assert_eq!(fake.calls().len(), 1);
+    }
+
+    #[test]
+    fn paging_back_stops_at_the_floor_and_still_judges_what_is_after_since() {
+        let older =
+            oldest_is_instructors(11, "after since, before the floor", "2026-10-04T10:45:00Z");
+        let fake = FakeTracker::answering([
+            Answer::ok(paged_reply(&fifty_reviews(false), &[], 1000, "c1")),
+            Answer::ok(reviews_page(&[older], 1000, "c0")),
+        ]);
+        let got = read_with(&fake, FB_SINCE, "2026-10-04T10:50:00Z");
+        assert_eq!(feedback_ids(&got), vec!["review:11"]);
+        assert_eq!(
+            fake.calls(),
+            vec![feedback_call(PR_FEEDBACK_QUERY, &[]), before_call("c1")]
+        );
+    }
+
+    #[test]
+    fn a_full_page_whose_oldest_review_is_at_the_floor_does_not_page_back_and_is_judged() {
+        let page = [
+            oldest_is_instructors(11, "at the floor", "2026-10-04T11:00:00Z"),
+            review_node(
+                12,
+                "COMMENTED",
+                "noise",
+                Some("2026-10-04T11:05:00Z"),
+                "stranger",
+                &[],
+            ),
+        ];
+        let fake = FakeTracker::answering([Answer::ok(paged_reply(&page, &[], 1000, "c1"))]);
+        let got = read_with(&fake, FB_SINCE, "2026-10-04T11:00:00Z");
+        assert_eq!(feedback_ids(&got), vec!["review:11"]);
+        assert_eq!(fake.calls().len(), 1);
+    }
+
+    #[test]
+    fn paging_back_ends_on_an_empty_page_and_fails_on_a_gone_pull_request_or_a_missing_cursor() {
+        let first = paged_reply(&fifty_reviews(false), &[], 99, "c1");
+        // GitHub answers `before:` the oldest cursor with an empty page: the start was reached.
+        let empty = FakeTracker::answering([
+            Answer::ok(first.as_str()),
+            Answer::ok(reviews_page(&[], 99, "c0")),
+        ]);
+        read(&empty);
+        assert_eq!(empty.calls().len(), 2);
+
+        let gone = FakeTracker::answering([Answer::ok(first.as_str()), Answer::ok(GONE)]);
+        assert!(is_parse_error(&feedback_error(&gone)));
+        assert_eq!(gone.calls().len(), 2);
+
+        let no_cursor = FakeTracker::answering([Answer::ok(
+            json!({"data": {"repository": {"pullRequest": {
+                "reviews": {"totalCount": 99, "nodes": fifty_reviews(false)},
+                "comments": {"nodes": []},
+            }}}})
+            .to_string(),
+        )]);
+        assert!(is_parse_error(&feedback_error(&no_cursor)));
+        assert_eq!(no_cursor.calls().len(), 1);
+    }
+
+    const EDITED_AT: &str = "2026-10-04T11:05:00Z";
+
+    fn edit_history(total: u64, shown: &[(&str, &str)]) -> Value {
+        json!({
+            "totalCount": total,
+            "nodes": shown
+                .iter()
+                .map(|(edited_at, who)| json!({"editedAt": edited_at, "editor": person(who)}))
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    const BY_INSTRUCTOR_ONLY: [(&str, &str); 2] =
+        [(EDITED_AT, "rawphp"), ("2026-10-04T11:00:00Z", "rawphp")];
+    const STRANGER_THEN_INSTRUCTOR: [(&str, &str); 3] = [
+        (EDITED_AT, "rawphp"),
+        ("2026-10-04T11:03:00Z", "stranger"),
+        ("2026-10-04T11:00:00Z", "rawphp"),
+    ];
+    const BY_STRANGER: [(&str, &str); 2] =
+        [(EDITED_AT, "stranger"), ("2026-10-04T11:00:00Z", "rawphp")];
+
+    /// A conversation comment by `rawphp`, last edited at 11:05 by `last_editor`, with `history`
+    /// as its edits.
+    fn edited_pr_comment(id: u64, last_editor: &str, history: Value) -> Value {
+        let mut comment = pr_comment_node(id, "text", "2026-10-04T11:00:00Z", "rawphp");
+        comment["lastEditedAt"] = json!(EDITED_AT);
+        comment["editor"] = person(last_editor);
+        comment["userContentEdits"] = history;
+        comment
+    }
+
+    /// A review by `rawphp`, last edited at 11:05 by `last_editor`, with `history` as its edits.
+    fn edited_review(id: u64, last_editor: &str, history: Value) -> Value {
+        let mut review = review_node(
+            id,
+            "COMMENTED",
+            "text",
+            Some("2026-10-04T11:00:00Z"),
+            "rawphp",
+            &[],
+        );
+        review["lastEditedAt"] = json!(EDITED_AT);
+        review["editor"] = person(last_editor);
+        review["userContentEdits"] = history;
+        review
+    }
+
+    /// An inline comment by `rawphp` with node id `id`, edited at 11:05. Its history is read on
+    /// its own.
+    fn edited_inline(body: &str, id: Option<&str>) -> Value {
+        let mut node = json!({
+            "body": body,
+            "path": "src/a.rs",
+            "line": 7,
+            "originalLine": 7,
+            "author": person("rawphp"),
+            "lastEditedAt": EDITED_AT,
+        });
+        if let Some(id) = id {
+            node["id"] = json!(id);
+        }
+        node
+    }
+
+    /// One node of GitHub's answer to the edit-history query.
+    fn edit_node(id: &str, last_editor: &str, history: Value) -> Value {
+        json!({
+            "id": id,
+            "lastEditedAt": EDITED_AT,
+            "editor": person(last_editor),
+            "userContentEdits": history,
+        })
+    }
+
+    fn edit_nodes_reply(nodes: &[Value]) -> String {
+        json!({"data": {"nodes": nodes}}).to_string()
+    }
+
+    fn review_with(at: &str, inline: &[Value]) -> Value {
+        review_node(
+            11,
+            "CHANGES_REQUESTED",
+            "please fix",
+            Some(at),
+            "rawphp",
+            inline,
+        )
+    }
+
+    #[test]
+    fn an_item_edited_by_someone_who_is_not_an_instructor_is_not_feedback() {
+        let by_stranger = edited_pr_comment(21, "stranger", edit_history(2, &BY_STRANGER));
+        let by_instructor = edited_pr_comment(22, "rawphp", edit_history(2, &BY_INSTRUCTOR_ONLY));
+        let mut by_nobody = pr_comment_node(23, "changed", "2026-10-04T11:02:00Z", "rawphp");
+        by_nobody["lastEditedAt"] = json!(EDITED_AT);
+        by_nobody["editor"] = Value::Null;
+        by_nobody["userContentEdits"] = json!({"totalCount": 1, "nodes": []});
+        let mut by_bot = edited_review(11, "rawphp", edit_history(2, &BY_INSTRUCTOR_ONLY));
+        by_bot["editor"] = json!({"__typename": "Bot", "login": "rawphp"});
+        let got = read_feedback(&feedback_reply(
+            &[by_bot],
+            &[by_stranger, by_instructor, by_nobody],
+        ));
+        assert_eq!(feedback_ids(&got), vec!["pr-comment:22"]);
+    }
+
+    #[test]
+    fn a_strangers_edit_followed_by_an_instructors_touch_up_is_not_feedback() {
+        let history = edit_history(3, &STRANGER_THEN_INSTRUCTOR);
+        let got = read_feedback(&feedback_reply(
+            &[edited_review(11, "rawphp", history.clone())],
+            &[edited_pr_comment(21, "rawphp", history)],
+        ));
+        assert_eq!(got, vec![]);
+    }
+
+    #[test]
+    fn an_item_whose_edits_were_all_an_instructors_is_feedback() {
+        let history = edit_history(2, &BY_INSTRUCTOR_ONLY);
+        let got = read_feedback(&feedback_reply(
+            &[edited_review(11, "rawphp", history.clone())],
+            &[edited_pr_comment(21, "rawphp", history)],
+        ));
+        assert_eq!(feedback_ids(&got), vec!["review:11", "pr-comment:21"]);
+    }
+
+    #[test]
+    fn an_edit_history_that_is_cut_off_or_lacks_the_latest_edit_is_not_feedback() {
+        // Three edits, two shown: an older one may be a stranger's.
+        let cut_off = edit_history(3, &BY_INSTRUCTOR_ONLY);
+        // Edited, and no history at all.
+        let mut missing = edited_pr_comment(22, "rawphp", edit_history(2, &BY_INSTRUCTOR_ONLY));
+        missing.as_object_mut().unwrap().remove("userContentEdits");
+        // The newest entry is not the latest edit.
+        let stale = edit_history(1, &[("2026-10-04T11:00:00Z", "rawphp")]);
+        let got = read_feedback(&feedback_reply(
+            &[edited_review(11, "rawphp", cut_off.clone())],
+            &[
+                edited_pr_comment(21, "rawphp", cut_off),
+                missing,
+                edited_pr_comment(23, "rawphp", stale),
+            ],
+        ));
+        assert_eq!(got, vec![]);
+    }
+
+    #[test]
+    fn an_inline_comment_edited_by_a_stranger_is_dropped_and_the_rest_of_the_review_stays() {
+        let inline = [
+            inline_node("untouched", "src/a.rs", 7, "rawphp"),
+            edited_inline("by stranger", Some("C1")),
+            edited_inline("stranger then touch-up", Some("C2")),
+            edited_inline("own touch-up", Some("C3")),
+        ];
+        let fake = FakeTracker::answering([
+            Answer::ok(feedback_reply(
+                &[review_with("2026-10-04T11:00:00Z", &inline)],
+                &[],
+            )),
+            Answer::ok(edit_nodes_reply(&[
+                edit_node("C1", "stranger", edit_history(2, &BY_STRANGER)),
+                edit_node("C2", "rawphp", edit_history(3, &STRANGER_THEN_INSTRUCTOR)),
+                edit_node("C3", "rawphp", edit_history(2, &BY_INSTRUCTOR_ONLY)),
+            ])),
+        ]);
+        let got = read(&fake);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].body, "please fix");
+        let bodies: Vec<&str> = got[0].inline.iter().map(|c| c.body.as_str()).collect();
+        assert_eq!(bodies, vec!["untouched", "own touch-up"]);
+        assert_eq!(
+            fake.calls(),
+            vec![
+                feedback_call(PR_FEEDBACK_QUERY, &[]),
+                editor_call(&ids(&["C1", "C2", "C3"]))
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unedited_inline_comment_costs_no_second_call() {
+        let inline = [inline_node("plain", "src/a.rs", 7, "rawphp")];
+        let fake = FakeTracker::answering([Answer::ok(feedback_reply(
+            &[review_with("2026-10-04T11:00:00Z", &inline)],
+            &[],
+        ))]);
+        let got = read(&fake);
+        assert_eq!(got[0].inline.len(), 1);
+        assert_eq!(fake.calls().len(), 1);
+    }
+
+    #[test]
+    fn an_edited_inline_comment_whose_whole_history_is_an_instructors_is_kept() {
+        let inline = [edited_inline("touched up", Some("PRRC_abc"))];
+        let fake = FakeTracker::answering([
+            Answer::ok(feedback_reply(
+                &[review_with("2026-10-04T11:00:00Z", &inline)],
+                &[],
+            )),
+            Answer::ok(edit_nodes_reply(&[edit_node(
+                "PRRC_abc",
+                "rawphp",
+                edit_history(2, &BY_INSTRUCTOR_ONLY),
+            )])),
+        ]);
+        let got = read(&fake);
+        assert_eq!(got[0].inline[0].body, "touched up");
+        assert_eq!(
+            fake.calls(),
+            vec![
+                feedback_call(PR_FEEDBACK_QUERY, &[]),
+                editor_call(&ids(&["PRRC_abc"]))
+            ]
+        );
+    }
+
+    /// Reads one review whose one inline comment `PRRC_abc` was edited, with this answer to the
+    /// history query.
+    fn inline_kept_given(answer: &str) -> Vec<String> {
+        let inline = [edited_inline("touched up", Some("PRRC_abc"))];
+        let fake = FakeTracker::answering([
+            Answer::ok(feedback_reply(
+                &[review_with("2026-10-04T11:00:00Z", &inline)],
+                &[],
+            )),
+            Answer::ok(answer),
+        ]);
+        let got = read(&fake);
+        assert_eq!(got.len(), 1, "the review stays");
+        got[0].inline.iter().map(|c| c.body.clone()).collect()
+    }
+
+    #[test]
+    fn an_edited_inline_comment_with_a_cut_off_history_is_dropped_and_the_review_stays() {
+        let answer = edit_nodes_reply(&[edit_node(
+            "PRRC_abc",
+            "rawphp",
+            edit_history(3, &BY_INSTRUCTOR_ONLY),
+        )]);
+        assert_eq!(inline_kept_given(&answer), Vec::<String>::new());
+    }
+
+    #[test]
+    fn an_edited_inline_comment_with_a_full_page_of_edits_is_dropped_and_the_review_stays() {
+        // A hundred entries, all the instructor's, and the total says no more: a full page may
+        // still hide older ones.
+        let shown: Vec<(&str, &str)> = (0..100).map(|_| (EDITED_AT, "rawphp")).collect();
+        let answer =
+            edit_nodes_reply(&[edit_node("PRRC_abc", "rawphp", edit_history(100, &shown))]);
+        assert_eq!(inline_kept_given(&answer), Vec::<String>::new());
+    }
+
+    #[test]
+    fn an_edited_inline_comment_touched_by_a_bot_with_an_instructors_login_is_dropped() {
+        let bot = json!({"__typename": "Bot", "login": "rawphp"});
+        let rawphp = person("rawphp");
+        let history = |first: &Value, second: &Value| {
+            json!({
+                "totalCount": 2,
+                "nodes": [
+                    {"editedAt": EDITED_AT, "editor": first},
+                    {"editedAt": "2026-10-04T11:00:00Z", "editor": second},
+                ],
+            })
+        };
+        let last_editor_is_a_bot = json!({
+            "id": "PRRC_abc",
+            "lastEditedAt": EDITED_AT,
+            "editor": bot,
+            "userContentEdits": history(&bot, &rawphp),
+        });
+        assert_eq!(
+            inline_kept_given(&edit_nodes_reply(&[last_editor_is_a_bot])),
+            Vec::<String>::new()
+        );
+        // The bot is one of the earlier edits.
+        let bot_in_the_history = json!({
+            "id": "PRRC_abc",
+            "lastEditedAt": EDITED_AT,
+            "editor": rawphp,
+            "userContentEdits": history(&rawphp, &bot),
+        });
+        assert_eq!(
+            inline_kept_given(&edit_nodes_reply(&[bot_in_the_history])),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_bot_as_the_last_editor_is_dropped_though_the_newest_entry_is_a_user_of_the_same_login() {
+        // The history agrees with the editor by login, but the last editor is not a person.
+        let node = json!({
+            "id": "PRRC_abc",
+            "lastEditedAt": EDITED_AT,
+            "editor": {"__typename": "Bot", "login": "rawphp"},
+            "userContentEdits": edit_history(2, &BY_INSTRUCTOR_ONLY),
+        });
+        assert_eq!(
+            inline_kept_given(&edit_nodes_reply(&[node])),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn an_edited_inline_comment_that_is_gone_or_has_no_id_is_dropped_and_the_review_stays() {
+        let inline = [
+            edited_inline("gone", Some("PRRC_gone")),
+            edited_inline("no id", None),
+        ];
+        let fake = FakeTracker::answering([
+            Answer::ok(feedback_reply(
+                &[review_with("2026-10-04T11:00:00Z", &inline)],
+                &[],
+            )),
+            Answer::ok(edit_nodes_reply(&[Value::Null])),
+        ]);
+        let got = read(&fake);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].inline, vec![]);
+        // Only the one with an id was looked up.
+        assert_eq!(
+            fake.calls(),
+            vec![
+                feedback_call(PR_FEEDBACK_QUERY, &[]),
+                editor_call(&ids(&["PRRC_gone"]))
+            ]
+        );
+    }
+
+    fn edited_inline_list(from: usize, n: usize) -> Vec<Value> {
+        (0..n)
+            .map(|k| {
+                edited_inline(
+                    &format!("note {}", from + k),
+                    Some(&format!("E{}", from + k)),
+                )
+            })
+            .collect()
+    }
+
+    fn whole_history_node(i: usize) -> Value {
+        edit_node(
+            &format!("E{i}"),
+            "rawphp",
+            edit_history(2, &BY_INSTRUCTOR_ONLY),
+        )
+    }
+
+    #[test]
+    fn the_edited_inline_comments_of_every_review_are_read_with_one_extra_call() {
+        let reviews = [
+            review_node(
+                11,
+                "COMMENTED",
+                "one",
+                Some("2026-10-04T11:00:00Z"),
+                "rawphp",
+                &edited_inline_list(0, 3),
+            ),
+            review_node(
+                12,
+                "COMMENTED",
+                "two",
+                Some("2026-10-04T11:01:00Z"),
+                "rawphp",
+                &edited_inline_list(3, 2),
+            ),
+        ];
+        let mut nodes: Vec<Value> = (0..5).map(whole_history_node).collect();
+        // E1's last editor is a stranger.
+        nodes[1] = edit_node("E1", "stranger", edit_history(2, &BY_STRANGER));
+        // The answer comes in any order: it is matched by id, not by position.
+        nodes.reverse();
+        let fake = FakeTracker::answering([
+            Answer::ok(feedback_reply(&reviews, &[])),
+            Answer::ok(edit_nodes_reply(&nodes)),
+        ]);
+        let got = read(&fake);
+        assert_eq!(got.len(), 2);
+        let bodies =
+            |at: usize| -> Vec<&str> { got[at].inline.iter().map(|c| c.body.as_str()).collect() };
+        assert_eq!(bodies(0), vec!["note 0", "note 2"]);
+        assert_eq!(bodies(1), vec!["note 3", "note 4"]);
+        assert_eq!(
+            fake.calls(),
+            vec![
+                feedback_call(PR_FEEDBACK_QUERY, &[]),
+                editor_call(&ids(&["E0", "E1", "E2", "E3", "E4"]))
+            ]
+        );
+    }
+
+    #[test]
+    fn a_hundred_and_one_edited_inline_comments_are_read_with_two_extra_calls() {
+        let review = review_node(
+            11,
+            "COMMENTED",
+            "many",
+            Some("2026-10-04T11:00:00Z"),
+            "rawphp",
+            &edited_inline_list(0, 101),
+        );
+        let fake = FakeTracker::answering([
+            Answer::ok(feedback_reply(&[review], &[])),
+            Answer::ok(edit_nodes_reply(
+                &(0..100).map(whole_history_node).collect::<Vec<_>>(),
+            )),
+            Answer::ok(edit_nodes_reply(&[whole_history_node(100)])),
+        ]);
+        let got = read(&fake);
+        assert_eq!(got[0].inline.len(), 101);
+        let node_ids = |from: usize, to: usize| -> Vec<String> {
+            (from..to).map(|i| format!("E{i}")).collect()
+        };
+        assert_eq!(
+            fake.calls(),
+            vec![
+                feedback_call(PR_FEEDBACK_QUERY, &[]),
+                editor_call(&node_ids(0, 100)),
+                editor_call(&node_ids(100, 101))
+            ]
+        );
+    }
+
+    #[test]
+    fn a_null_entry_or_a_missing_id_drops_only_that_comment() {
+        let review = review_node(
+            11,
+            "COMMENTED",
+            "mixed",
+            Some("2026-10-04T11:00:00Z"),
+            "rawphp",
+            &edited_inline_list(0, 4),
+        );
+        // E1 is null, E2 is not in the answer at all.
+        let fake = FakeTracker::answering([
+            Answer::ok(feedback_reply(&[review], &[])),
+            Answer::ok(edit_nodes_reply(&[
+                whole_history_node(0),
+                Value::Null,
+                whole_history_node(3),
+            ])),
+        ]);
+        let got = read(&fake);
+        let bodies: Vec<&str> = got[0].inline.iter().map(|c| c.body.as_str()).collect();
+        assert_eq!(bodies, vec!["note 0", "note 3"]);
+    }
+
+    #[test]
+    fn an_edited_inline_comment_of_a_review_before_since_makes_no_extra_call() {
+        let inline = [edited_inline("old", Some("PRRC_old"))];
+        let fake = FakeTracker::answering([Answer::ok(feedback_reply(
+            &[review_with("2026-10-04T10:00:00Z", &inline)],
+            &[],
+        ))]);
+        assert_eq!(read(&fake), vec![]);
+        assert_eq!(fake.calls().len(), 1);
+    }
+
+    #[test]
+    fn an_edited_inline_comment_by_a_stranger_makes_no_extra_call() {
+        let mut by_stranger = edited_inline("theirs", Some("PRRC_x"));
+        by_stranger["author"] = person("stranger");
+        let fake = FakeTracker::answering([Answer::ok(feedback_reply(
+            &[review_with("2026-10-04T11:00:00Z", &[by_stranger])],
+            &[],
+        ))]);
+        read(&fake);
+        assert_eq!(fake.calls().len(), 1);
+    }
+
+    #[test]
+    fn a_failed_or_unreadable_edit_history_read_is_an_error() {
+        let main = feedback_reply(
+            &[review_with(
+                "2026-10-04T11:00:00Z",
+                &[edited_inline("touched up", Some("PRRC_abc"))],
+            )],
+            &[],
+        );
+        let failed = FakeTracker::answering([Answer::ok(main.as_str()), Answer::fail(1, "boom")]);
+        let error = feedback_error(&failed);
+        assert!(
+            matches!(&error, TrackerError::Other(m) if m.contains("exited with status 1: boom")),
+            "{error}"
+        );
+        let garbled = FakeTracker::answering([
+            Answer::ok(main.as_str()),
+            Answer::ok(
+                r#"{"data":{"nodes":[{"id":"PRRC_abc","lastEditedAt":"2026-10-04T11:05:00Z"}]}}"#,
+            ),
+        ]);
+        assert!(is_parse_error(&feedback_error(&garbled)));
+    }
+
     // ----- End of part B tests -----
 }
