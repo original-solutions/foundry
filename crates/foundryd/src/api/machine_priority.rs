@@ -260,11 +260,9 @@ mod tests {
 
     #[tokio::test]
     async fn an_empty_order_answers_204() {
-        let mut ids = None;
         let served = Served::new(|settings| {
             let (a, _) = others(settings);
             settings.priority = vec![a];
-            ids = Some(a);
         })
         .await;
         let seq = served.settings().seq;

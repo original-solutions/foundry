@@ -201,8 +201,6 @@ async fn stopping_the_coordinator_moves_the_role_in_time_while_a_session_elsewhe
 /// machine names B as acting within the spec's 15 seconds.
 #[tokio::test]
 async fn setting_b_first_from_the_priority_route_moves_the_role_to_b_in_time() {
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-
     let fleet = Fleet::start_coordinated(3);
     let b = fleet.daemons[1].id;
     settled(&fleet, fleet.daemons[0].id).await;
@@ -214,24 +212,26 @@ async fn setting_b_first_from_the_priority_route_moves_the_role_to_b_in_time() {
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-    let body = format!("{{\"order\":[\"{b}\"]}}");
-    let request = format!(
-        "POST /api/machines/priority HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\
-         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-        body.len()
-    );
-    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-    stream.write_all(request.as_bytes()).await.unwrap();
-    let mut response = Vec::new();
-    tokio::time::timeout(WAIT, stream.read_to_end(&mut response))
-        .await
-        .expect("the route answers in time")
-        .unwrap();
-    let response = String::from_utf8(response).unwrap();
-    assert!(response.starts_with("HTTP/1.1 204"), "{response}");
+    let url = format!("http://{addr}/api/machines/priority");
+    let body = serde_json::json!({ "order": [b.to_string()] });
+    let sent = Instant::now();
+    let (status, answer) = tokio::task::spawn_blocking(move || {
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .timeout_global(Some(WAIT))
+            .build()
+            .into();
+        let mut response = agent.post(&url).send_json(body).unwrap();
+        let status = response.status().as_u16();
+        (status, response.body_mut().read_to_string().unwrap())
+    })
+    .await
+    .unwrap();
+    assert_eq!(status, 204, "{answer}");
 
     for daemon in &fleet.daemons {
-        acting_becomes(&daemon.coordinator(), b, ROLE_MOVES_WITHIN).await;
+        let left = ROLE_MOVES_WITHIN.saturating_sub(sent.elapsed());
+        acting_becomes(&daemon.coordinator(), b, left).await;
     }
     server.abort();
 }
