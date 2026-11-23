@@ -307,8 +307,19 @@ mod tests {
             "https://github.com/o/r/pull/123#pullrequestreview-12345678901234".to_string(),
             format!("https://github.com/o/r/pull/123/files#diff-{sha256}"),
             format!("https://github.com/o/r/pull/123/files#diff-{sha256}R12"),
+            format!("https://github.com/o/r/pull/123/files#diff-{sha256}L3-R20"),
+            format!(
+                "https://github.com/o/r/pull/123/files#diff-{}",
+                "abcdef0123456789".repeat(4)
+            ),
             "https://github.com/o/r/compare/0123456789abcdef0123456789abcdef01234567...main"
                 .to_string(),
+            "https://github.com/o/r/commit/abcdef0123456789abcdef0123456789abcdef01".to_string(),
+            "https://github.com/o/r/pull/1/commits/abcdef0123456789abcdef0123456789abcdef01"
+                .to_string(),
+            "https://github.com/o/r/blame/0123456789abcdef0123456789abcdef01234567/a.rs#L3-L9"
+                .to_string(),
+            format!("https://github.com/o/r/tree/{sha256}/docs"),
         ] {
             assert_eq!(for_comment(&url), url);
         }
@@ -355,6 +366,132 @@ mod tests {
             ),
         ] {
             assert_eq!(for_comment(&text.replace("KEY", KEY)), shown, "{text}");
+        }
+    }
+
+    #[test]
+    fn for_comment_hides_a_hex_key_in_a_github_link_where_no_commit_id_goes() {
+        let hex40 = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b";
+        let hex64 = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+        for hex in [hex40, hex64] {
+            for (text, shown) in [
+                (
+                    "https://github.com/o/r/pull/1?access_token=HEX",
+                    "https://github.com/o/r/pull/1?access_token=•••",
+                ),
+                (
+                    "curl -d \"pr=https://github.com/o/r/pull/1&dd_app_key=HEX\"",
+                    "curl -d \"pr=https://github.com/o/r/pull/1&dd_app_key=•••\"",
+                ),
+                (
+                    "https://github.com/o/r/pull/1#secret=HEX",
+                    "https://github.com/o/r/pull/1#secret=•••",
+                ),
+                (
+                    "https://github.com/o/r/pull/1.HEX",
+                    "https://github.com/o/r/pull/1.•••",
+                ),
+                (
+                    "https://github.com/o/r/pull/1/HEX",
+                    "https://github.com/o/r/pull/1/•••",
+                ),
+                (
+                    "https://github.com/o/r/pull/1https://hooks.example.com/x/HEX",
+                    "https://github.com/o/r/pull/1https://hooks.example.com/x/•••",
+                ),
+                (
+                    "https://github.com/o/r/pull/1?x=HEXL12",
+                    "https://github.com/o/r/pull/1?x=•••",
+                ),
+                (
+                    "https://github.com/o/r/commit/HEX&token=HEX",
+                    "https://github.com/o/r/commit/•••&token=•••",
+                ),
+                (
+                    "https://github.com/o/r/commit/tokenHEX",
+                    "https://github.com/o/r/commit/•••",
+                ),
+                (
+                    "https://github.com/o/r/pull/1#HEX",
+                    "https://github.com/o/r/pull/1#•••",
+                ),
+            ] {
+                assert_eq!(for_comment(&text.replace("HEX", hex)), shown, "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn for_comment_keeps_only_whole_github_anchors_and_commit_ids() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let hex32 = "0123456789abcdef".repeat(2);
+        for (text, shown) in [
+            (
+                format!("https://github.com/o/r/commit/{hex32}"),
+                "https://github.com/o/r/commit/•••",
+            ),
+            (
+                format!("https://github.com/o/r/pull/1#diff-{sha}R"),
+                "https://github.com/o/r/pull/1#•••",
+            ),
+            (
+                format!("https://github.com/o/r/pull/1#diff-{sha}X12"),
+                "https://github.com/o/r/pull/1#•••",
+            ),
+            (
+                format!("https://github.com/o/r/pull/1#diff-{hex32}"),
+                "https://github.com/o/r/pull/1#•••",
+            ),
+            (
+                "https://github.com/o/r/pull/1#ABCDEFGHIJKLMNOPQRSTUVWL123".to_string(),
+                "https://github.com/o/r/pull/1#•••",
+            ),
+            (
+                "https://github.com/o/r/pull/1#issuecomment-1234567890abcdefghijk".to_string(),
+                "https://github.com/o/r/pull/1#•••",
+            ),
+            (
+                format!("https://github.com/o/r/pull/1#issuecomment-{sha}x"),
+                "https://github.com/o/r/pull/1#•••",
+            ),
+            (
+                format!("https://github.com/o/r/pull/1#discussion_r1&{KEY}"),
+                "https://github.com/o/r/pull/1#discussion_r1&•••",
+            ),
+            (
+                format!("https://github.com/o/r/blob/main/docs/{sha}/x"),
+                "https://github.com/o/r/blob/main/docs/•••/x",
+            ),
+            (
+                format!("https://github.com/o/r/compare/{KEY}...{sha}"),
+                format!("https://github.com/o/r/compare/•••...{sha}").leak(),
+            ),
+            (
+                format!(
+                    "https://github.com/o/r/pull/1/files/{}{}",
+                    "a".repeat(99),
+                    "1".repeat(30)
+                ),
+                "https://github.com/o/r/pull/1/files/•••",
+            ),
+        ] {
+            assert_eq!(for_comment(&text), shown, "{text}");
+        }
+    }
+
+    #[test]
+    fn for_comment_ends_a_github_link_before_a_character_no_url_holds() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        for end in [
+            " ", "\t", "\n", "(", ")", "[", "]", "{", "}", "<", ">", "`", "\"", "'", "|", "\\",
+            "^", ",", ";", "\u{200b}", "\u{1b}", "\u{3067}", "\u{2192}",
+        ] {
+            let text = format!("https://github.com/o/r{end}/commit/{sha}");
+            assert_eq!(
+                for_comment(&text),
+                format!("https://github.com/o/r{end}/commit/•••"),
+                "{text:?}"
+            );
         }
     }
 
