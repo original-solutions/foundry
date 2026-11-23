@@ -966,6 +966,260 @@ pub fn is_safe_branch_name(branch: &str) -> bool {
 // Part B: approval history, issue activity and pull request feedback.
 // ---------------------------------------------------------------------------------------------
 
+use crate::factory::lifecycle::approval::Refusal;
+
+/// How many label events and body edits the approval query asks for. A history this long may be
+/// cut off.
+pub const HISTORY_PAGE: usize = 100;
+
+/// Any comment containing this was written by the factory.
+const MARKER_PREFIX: &str = "<!-- softfac";
+
+/// Who applied the issue's labels, who renamed it and who edited its body. `last: 100` of the
+/// timeline items is the newest 100 (GitHub lists them oldest first), and
+/// `userContentEdits(first: 100)` is the newest 100 edits (it lists newest first). Titles are
+/// not asked for. `__typename` on an actor tells a person from a GitHub App.
+pub const APPROVAL_QUERY: &str = concat!(
+    "query($owner: String!, $name: String!, $number: Int!) { ",
+    "repository(owner: $owner, name: $name) { issue(number: $number) { ",
+    "timelineItems(itemTypes: [LABELED_EVENT, UNLABELED_EVENT, RENAMED_TITLE_EVENT], last: 100) { ",
+    "totalCount nodes { ",
+    "__typename ",
+    "... on LabeledEvent { createdAt actor { __typename login } label { name } } ",
+    "... on UnlabeledEvent { createdAt actor { __typename login } label { name } } ",
+    "... on RenamedTitleEvent { createdAt actor { __typename login } } } } ",
+    "lastEditedAt editor { __typename login } ",
+    "userContentEdits(first: 100) { totalCount nodes { editedAt editor { __typename login } } } } } }",
+);
+
+/// The issue's body and who edited it last, with the history of its edits (newest first).
+/// Comments are read separately, from REST.
+pub const ACTIVITY_QUERY: &str = concat!(
+    "query($owner: String!, $name: String!, $number: Int!) { ",
+    "repository(owner: $owner, name: $name) { issue(number: $number) { ",
+    "body lastEditedAt editor { __typename login } ",
+    "userContentEdits(first: 100) { totalCount nodes { editedAt editor { __typename login } } } } } }",
+);
+
+/// Who edited comments, by node id, up to 100 ids in one call: the last editor and the last 100
+/// edits of each. `Comment` is the interface that an issue comment implements. REST names only
+/// the author, and anyone with write access can edit another person's comment. An id of a
+/// comment that is gone answers `null`.
+pub const COMMENT_EDITOR_QUERY: &str = concat!(
+    "query($ids: [ID!]!) { nodes(ids: $ids) { ",
+    "... on Comment { id lastEditedAt editor { __typename login } ",
+    "userContentEdits(first: 100) { totalCount nodes { editedAt editor { __typename login } } } } } }",
+);
+
+/// How many ids one [`COMMENT_EDITOR_QUERY`] call carries: the most `nodes` accepts.
+const COMMENT_EDITOR_IDS: usize = 100;
+
+/// The most pages of 50 reviews one feedback read takes: the newest and up to 19 earlier (20
+/// points). 1,000 reviews is far past the factory's scale, so going on is GitHub misbehaving
+/// and must not hold the pass open. A read pages back only to the last read that found nothing
+/// new, so the limit is hit only by over 1,000 reviews between two such reads, and then every
+/// read fails.
+pub const REVIEW_PAGE_LIMIT: usize = 20;
+
+/// The newest 50 reviews with the first 50 diff comments each, and the newest 100 conversation
+/// comments. `pageInfo { startCursor }` lets `pr_feedback` page back ([`REVIEWS_BEFORE_QUERY`]).
+/// `userContentEdits(first: 20)` keeps the nested query within GitHub's node limit; a longer
+/// history is cut off and untrusted. Inline editors: [`COMMENT_EDITOR_QUERY`]. Priced at 2
+/// points.
+pub const PR_FEEDBACK_QUERY: &str = concat!(
+    "query($owner: String!, $name: String!, $number: Int!) { ",
+    "repository(owner: $owner, name: $name) { pullRequest(number: $number) { ",
+    "reviews(last: 50) { totalCount pageInfo { startCursor } nodes { ",
+    "fullDatabaseId state body submittedAt author { __typename login } ",
+    "lastEditedAt editor { __typename login } ",
+    "userContentEdits(first: 20) { totalCount nodes { editedAt editor { __typename login } } } ",
+    "comments(first: 50) { totalCount nodes { id body path line originalLine author { __typename login } ",
+    "lastEditedAt } } } } ",
+    "comments(last: 100) { nodes { ",
+    "fullDatabaseId body createdAt author { __typename login } ",
+    "lastEditedAt editor { __typename login } ",
+    "userContentEdits(first: 20) { totalCount nodes { editedAt editor { __typename login } } } } } } } }",
+);
+
+/// The 50 reviews before the cursor `$before`, oldest first: the page [`PR_FEEDBACK_QUERY`] cut
+/// off. The review fields are the same as there, and cost the same (1 point).
+pub const REVIEWS_BEFORE_QUERY: &str = concat!(
+    "query($owner: String!, $name: String!, $number: Int!, $before: String!) { ",
+    "repository(owner: $owner, name: $name) { pullRequest(number: $number) { ",
+    "reviews(last: 50, before: $before) { totalCount pageInfo { startCursor } nodes { ",
+    "fullDatabaseId state body submittedAt author { __typename login } ",
+    "lastEditedAt editor { __typename login } ",
+    "userContentEdits(first: 20) { totalCount nodes { editedAt editor { __typename login } } } ",
+    "comments(first: 50) { totalCount nodes { id body path line originalLine author { __typename login } ",
+    "lastEditedAt } } } } } } }",
+);
+
+/// Who did something. `typename` is only there when the query asked for it; a rule that wants
+/// a person needs a `User`.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+pub struct Actor {
+    #[serde(rename = "__typename", default)]
+    pub typename: Option<String>,
+    pub login: String,
+}
+
+/// One entry of an edit history: when, and by whom (`None`: a deleted account).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditEntry {
+    pub edited_at: String,
+    #[serde(default)]
+    pub editor: Option<Actor>,
+}
+
+/// An edit history, newest first, with GitHub's count of all of it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditHistory {
+    pub total_count: u64,
+    pub nodes: Vec<EditEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+pub struct LabelName {
+    pub name: String,
+}
+
+/// A label applied or removed.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LabelChange {
+    pub created_at: String,
+    #[serde(default)]
+    pub actor: Option<Actor>,
+    pub label: LabelName,
+}
+
+/// A title renamed. Only who and when are asked for, never the titles.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Rename {
+    pub created_at: String,
+    #[serde(default)]
+    pub actor: Option<Actor>,
+}
+
+/// One label event or title rename; a node of any other type is an answer this module cannot
+/// read.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(tag = "__typename")]
+pub enum TimelineNode {
+    LabeledEvent(LabelChange),
+    UnlabeledEvent(LabelChange),
+    RenamedTitleEvent(Rename),
+}
+
+impl TimelineNode {
+    fn created_at(&self) -> &str {
+        match self {
+            TimelineNode::LabeledEvent(change) | TimelineNode::UnlabeledEvent(change) => {
+                &change.created_at
+            }
+            TimelineNode::RenamedTitleEvent(rename) => &rename.created_at,
+        }
+    }
+}
+
+/// The timeline page: the newest events, oldest first, with GitHub's count of all of them.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Timeline {
+    pub total_count: u64,
+    pub nodes: Vec<TimelineNode>,
+}
+
+/// GitHub's answer about an issue's label events and edit history.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApprovalIssue {
+    pub timeline_items: Timeline,
+    #[serde(default)]
+    pub last_edited_at: Option<String>,
+    #[serde(default)]
+    pub editor: Option<Actor>,
+    pub user_content_edits: EditHistory,
+}
+
+#[derive(serde::Deserialize)]
+struct ApprovalAnswer {
+    data: ApprovalData,
+}
+
+#[derive(serde::Deserialize)]
+struct ApprovalData {
+    repository: ApprovalRepository,
+}
+
+#[derive(serde::Deserialize)]
+struct ApprovalRepository {
+    issue: ApprovalIssue,
+}
+
+/// An instructor who is a person: GitHub says the actor is a `User`. A GitHub App's GraphQL
+/// login can lack the `[bot]` suffix, so a login that matches an instructor is not enough.
+pub fn is_human_instructor(actor: Option<&Actor>, instructors: &[String]) -> bool {
+    actor.is_some_and(|actor| {
+        actor.typename.as_deref() == Some("User") && is_instructor(Some(&actor.login), instructors)
+    })
+}
+
+/// Whether a page may leave out older entries: it is full, or GitHub counts more than it holds.
+fn is_cut_off(total_count: u64, shown: usize) -> bool {
+    shown >= HISTORY_PAGE || total_count > shown as u64
+}
+
+/// Whether the timeline page shows every event at or after `since`: not cut off, or its oldest
+/// is before `since`.
+pub fn timeline_reaches(issue: &ApprovalIssue, since: &str) -> bool {
+    let _ = (issue, since);
+    todo!("part B")
+}
+
+/// Whether the newest history entry is the last edit, by the last editor.
+fn newest_is_last_edit(
+    edits: &EditHistory,
+    last_edited_at: Option<&str>,
+    editor: Option<&Actor>,
+) -> bool {
+    let _ = (edits, last_edited_at, editor);
+    todo!("part B")
+}
+
+/// Judges every body edit and title rename with time at or after `since`. A moment in the same
+/// second counts as after, because timestamps have no finer order. `reaches` says the renames
+/// on the timeline page cover everything at or after `since`.
+pub fn text_changes_since(
+    issue: &ApprovalIssue,
+    since: &str,
+    instructors: &[String],
+    reaches: bool,
+) -> TextCheck {
+    let _ = (issue, since, instructors, reaches);
+    todo!("part B")
+}
+
+/// Whether the factory may build the issue: an instructor (only ever a `User`) applied the
+/// `ready` label in force now, and every body edit and title rename from that second on was an
+/// instructor's. Only the newest timeline page is read: it holds the label in force and all
+/// after it, and a full page without it is `label-history-incomplete`. Label names match
+/// exactly; times compare as text.
+pub fn judge_approval(issue: &ApprovalIssue, ready: &str, instructors: &[String]) -> Approval {
+    let _ = (issue, ready, instructors, Refusal::LabelNotFound);
+    todo!("part B")
+}
+
+/// Whether anyone, an instructor included, edited the body or renamed the title at or after
+/// `since`. A timeline page that may hide a rename at or after the moment counts as a change.
+pub fn edited_since(issue: &ApprovalIssue, since: &str) -> bool {
+    let _ = (issue, since);
+    todo!("part B")
+}
+
 /// An instructor's comment made during a build.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Comment {
@@ -2626,6 +2880,1720 @@ mod tests {
     // ----- End of part A tests -----
 
     // ----- Part B tests -----
+
+    use crate::factory::github::gh::command_text;
+    use crate::factory::lifecycle::approval::Refusal;
+    use serde_json::{Value, json};
+
+    const REPO: &str = "rawphp/softfac";
+
+    /// When the instructor applied `factory:ready` in most of the approval tests.
+    const LABELED: &str = "2026-10-04T10:00:00Z";
+    /// After LABELED, and before LATER.
+    const AFTER: &str = "2026-10-04T10:30:00Z";
+    const LATER: &str = "2026-10-04T11:00:00Z";
+    /// When the issue was written: the oldest entry of the edit history, by its author.
+    const CREATED: &str = "2026-10-04T08:00:00Z";
+    const BEFORE: &str = "2026-10-04T09:00:00Z";
+    const READY: &str = "factory:ready";
+
+    /// A person by login, or an App (`Bot`) that carries a login, or no one.
+    #[derive(Clone, Copy)]
+    enum Who<'a> {
+        User(&'a str),
+        Bot(&'a str),
+        Nobody,
+    }
+
+    impl<'a> From<&'a str> for Who<'a> {
+        fn from(login: &'a str) -> Self {
+            Who::User(login)
+        }
+    }
+
+    const NOBODY: Who<'static> = Who::Nobody;
+
+    /// A GitHub App whose GraphQL login matches an instructor's.
+    fn bot(login: &str) -> Who<'_> {
+        Who::Bot(login)
+    }
+
+    type Edit<'a> = (&'a str, Who<'a>);
+
+    fn e<'a>(at: &'a str, who: impl Into<Who<'a>>) -> Edit<'a> {
+        (at, who.into())
+    }
+
+    fn pad(n: usize) -> String {
+        format!("{n:02}")
+    }
+
+    fn names(logins: &[&str]) -> Vec<String> {
+        logins.iter().map(|login| login.to_string()).collect()
+    }
+
+    fn actor_of(who: Who) -> Value {
+        match who {
+            Who::Nobody => Value::Null,
+            Who::User(login) => json!({"__typename": "User", "login": login}),
+            Who::Bot(login) => json!({"__typename": "Bot", "login": login}),
+        }
+    }
+
+    fn label_event(kind: &str, at: &str, actor: impl Into<Who<'static>>, label: &str) -> Value {
+        json!({
+            "__typename": kind,
+            "createdAt": at,
+            "actor": actor_of(actor.into()),
+            "label": {"name": label},
+        })
+    }
+
+    /// A RenamedTitleEvent: only who and when are asked for, never the titles.
+    fn rename_event(at: &str, actor: impl Into<Who<'static>>) -> Value {
+        json!({"__typename": "RenamedTitleEvent", "createdAt": at, "actor": actor_of(actor.into())})
+    }
+
+    fn ready_on(at: &str, actor: impl Into<Who<'static>>) -> Value {
+        label_event("LabeledEvent", at, actor, READY)
+    }
+
+    fn ready_off(at: &str, actor: impl Into<Who<'static>>) -> Value {
+        label_event("UnlabeledEvent", at, actor, READY)
+    }
+
+    /// `userContentEdits` as GitHub answers `first: 100`: newest first, with the real total.
+    fn edits_json(newest_first: &[Edit], total: usize) -> Value {
+        json!({
+            "totalCount": total,
+            "nodes": newest_first
+                .iter()
+                .map(|(at, who)| json!({"editedAt": at, "editor": actor_of(*who)}))
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    /// A history written oldest first, as the tests think of it, in GitHub's order.
+    fn newest_first<'a>(oldest_first: &[Edit<'a>]) -> Vec<Edit<'a>> {
+        oldest_first.iter().rev().copied().collect()
+    }
+
+    /// The approval answer with exactly these history nodes (newest first) and this total.
+    fn approval_reply_raw(
+        events: &[Value],
+        total_events: usize,
+        last: Option<Edit>,
+        edit_nodes: &[Edit],
+        total_edits: usize,
+    ) -> String {
+        json!({"data": {"repository": {"issue": {
+            "timelineItems": {"totalCount": total_events, "nodes": events},
+            "lastEditedAt": last.map(|(at, _)| at),
+            "editor": last.map_or(Value::Null, |(_, who)| actor_of(who)),
+            "userContentEdits": edits_json(edit_nodes, total_edits),
+        }}}})
+        .to_string()
+    }
+
+    /// `events` are oldest first, as GitHub lists them. `edits` is the history oldest first.
+    fn approval_reply(
+        events: &[Value],
+        total_events: usize,
+        last: Option<Edit>,
+        edits: &[Edit],
+    ) -> String {
+        approval_reply_raw(
+            events,
+            total_events,
+            last,
+            &newest_first(edits),
+            edits.len(),
+        )
+    }
+
+    /// The events as the tests think of them, with the real total.
+    fn events_reply(events: &[Value], last: Option<Edit>, edits: &[Edit]) -> String {
+        approval_reply(events, events.len(), last, edits)
+    }
+
+    fn creation_only(author: &str) -> Vec<Edit<'_>> {
+        vec![e(CREATED, author)]
+    }
+
+    fn approval_call_for(issue: u64) -> Vec<String> {
+        args(&[
+            "api",
+            "graphql",
+            "-f",
+            &format!("query={APPROVAL_QUERY}"),
+            "-f",
+            "owner=rawphp",
+            "-f",
+            "name=softfac",
+            "-F",
+            &format!("number={issue}"),
+        ])
+    }
+
+    fn approval_call() -> Vec<String> {
+        approval_call_for(6)
+    }
+
+    fn approval_of(answer: &str, who: &[&str]) -> Approval {
+        let fake = FakeTracker::answering([Answer::ok(answer)]);
+        let found = fake.approval(REPO, 6, &names(who)).unwrap();
+        assert_eq!(fake.calls(), vec![approval_call()]);
+        found
+    }
+
+    fn approved(labeled_at: &str, labeled_by: &str) -> Approval {
+        Approval::Approved {
+            labeled_at: labeled_at.into(),
+            labeled_by: labeled_by.into(),
+        }
+    }
+
+    fn refused(refusal: Refusal) -> Approval {
+        Approval::Refused(refusal)
+    }
+
+    fn edited_after(labeled_at: &str) -> Refusal {
+        Refusal::EditedAfterLabel {
+            labeled_at: labeled_at.into(),
+        }
+    }
+
+    fn history_cut(labeled_at: &str) -> Refusal {
+        Refusal::EditHistoryIncomplete {
+            labeled_at: labeled_at.into(),
+        }
+    }
+
+    fn by_non_instructor(by: Option<&str>, labeled_at: &str) -> Refusal {
+        Refusal::LabeledByNonInstructor {
+            by: by.map(String::from),
+            labeled_at: labeled_at.into(),
+        }
+    }
+
+    // ---- approvalHistory.ts: the pure half ----
+
+    fn user(login: &str) -> Actor {
+        Actor {
+            typename: Some("User".into()),
+            login: login.into(),
+        }
+    }
+
+    fn labeled(at: &str, login: &str, name: &str) -> TimelineNode {
+        TimelineNode::LabeledEvent(LabelChange {
+            created_at: at.into(),
+            actor: Some(user(login)),
+            label: LabelName { name: name.into() },
+        })
+    }
+
+    fn unlabeled(at: &str, login: &str) -> TimelineNode {
+        TimelineNode::UnlabeledEvent(LabelChange {
+            created_at: at.into(),
+            actor: Some(user(login)),
+            label: LabelName { name: READY.into() },
+        })
+    }
+
+    fn renamed(at: &str, login: &str) -> TimelineNode {
+        TimelineNode::RenamedTitleEvent(Rename {
+            created_at: at.into(),
+            actor: Some(user(login)),
+        })
+    }
+
+    /// An answer with these events (oldest first) and body edits (newest first), totals as
+    /// given.
+    fn issue_of(
+        events: Vec<TimelineNode>,
+        edits: &[(&str, &str)],
+        events_total: Option<u64>,
+        edits_total: Option<u64>,
+    ) -> ApprovalIssue {
+        ApprovalIssue {
+            timeline_items: Timeline {
+                total_count: events_total.unwrap_or(events.len() as u64),
+                nodes: events,
+            },
+            last_edited_at: edits.first().map(|(at, _)| at.to_string()),
+            editor: edits.first().map(|(_, login)| user(login)),
+            user_content_edits: EditHistory {
+                total_count: edits_total.unwrap_or(edits.len() as u64),
+                nodes: edits
+                    .iter()
+                    .map(|(at, login)| EditEntry {
+                        edited_at: at.to_string(),
+                        editor: Some(user(login)),
+                    })
+                    .collect(),
+            },
+        }
+    }
+
+    #[test]
+    fn the_approval_query_asks_for_label_events_and_the_edit_history() {
+        for part in [
+            "timelineItems(itemTypes: [LABELED_EVENT, UNLABELED_EVENT, RENAMED_TITLE_EVENT], last: 100)",
+            "totalCount",
+            "... on LabeledEvent { createdAt actor { __typename login } label { name } }",
+            "... on UnlabeledEvent { createdAt actor { __typename login } label { name } }",
+            "... on RenamedTitleEvent { createdAt actor { __typename login } }",
+            "lastEditedAt",
+            "editor { __typename login }",
+            "userContentEdits(first: 100) { totalCount nodes { editedAt editor { __typename login } } }",
+            "$owner",
+            "$name",
+            "$number",
+        ] {
+            assert!(APPROVAL_QUERY.contains(part), "missing {part}");
+        }
+        assert!(!APPROVAL_QUERY.contains("comments"));
+        // Titles are attacker-influenced text and are never asked for.
+        assert!(!APPROVAL_QUERY.contains("Title {"));
+        assert!(!APPROVAL_QUERY.contains("currentTitle"));
+        assert!(!APPROVAL_QUERY.contains("previousTitle"));
+    }
+
+    #[test]
+    fn the_approval_query_is_softfacs_byte_for_byte() {
+        assert_eq!(
+            APPROVAL_QUERY,
+            "query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { issue(number: $number) { timelineItems(itemTypes: [LABELED_EVENT, UNLABELED_EVENT, RENAMED_TITLE_EVENT], last: 100) { totalCount nodes { __typename ... on LabeledEvent { createdAt actor { __typename login } label { name } } ... on UnlabeledEvent { createdAt actor { __typename login } label { name } } ... on RenamedTitleEvent { createdAt actor { __typename login } } } } lastEditedAt editor { __typename login } userContentEdits(first: 100) { totalCount nodes { editedAt editor { __typename login } } } } } }"
+        );
+    }
+
+    #[test]
+    fn judge_approval_approves_the_label_in_force_applied_by_an_instructor() {
+        let issue = issue_of(vec![labeled(LABELED, "Tom", READY)], &[], None, None);
+        assert_eq!(
+            judge_approval(&issue, READY, &names(&["tom"])),
+            approved(LABELED, "Tom")
+        );
+    }
+
+    #[test]
+    fn judge_approval_finds_no_label_when_a_later_removal_cancelled_it_or_the_name_differs() {
+        let not_found = refused(Refusal::LabelNotFound);
+        let removed = issue_of(
+            vec![labeled(LABELED, "tom", READY), unlabeled(AFTER, "tom")],
+            &[],
+            None,
+            None,
+        );
+        assert_eq!(judge_approval(&removed, READY, &names(&["tom"])), not_found);
+        let other = issue_of(
+            vec![labeled(LABELED, "tom", "Factory:Ready")],
+            &[],
+            None,
+            None,
+        );
+        assert_eq!(judge_approval(&other, READY, &names(&["tom"])), not_found);
+    }
+
+    #[test]
+    fn judge_approval_says_a_full_page_of_a_longer_history_without_the_label_is_incomplete() {
+        let page: Vec<TimelineNode> = (0..HISTORY_PAGE).map(|_| renamed(BEFORE, "tom")).collect();
+        assert_eq!(
+            judge_approval(
+                &issue_of(page.clone(), &[], Some(HISTORY_PAGE as u64 + 1), None),
+                READY,
+                &names(&["tom"])
+            ),
+            refused(Refusal::LabelHistoryIncomplete)
+        );
+        assert_eq!(
+            judge_approval(&issue_of(page, &[], None, None), READY, &names(&["tom"])),
+            refused(Refusal::LabelNotFound)
+        );
+    }
+
+    #[test]
+    fn judge_approval_refuses_a_label_applied_by_someone_who_is_not_an_instructor() {
+        assert_eq!(
+            judge_approval(
+                &issue_of(vec![labeled(LABELED, "eve", READY)], &[], None, None),
+                READY,
+                &names(&["tom"])
+            ),
+            refused(by_non_instructor(Some("eve"), LABELED))
+        );
+        let app = LabelChange {
+            created_at: LABELED.into(),
+            actor: Some(Actor {
+                typename: Some("Bot".into()),
+                login: "tom".into(),
+            }),
+            label: LabelName { name: READY.into() },
+        };
+        assert_eq!(
+            judge_approval(
+                &issue_of(
+                    vec![TimelineNode::LabeledEvent(app.clone())],
+                    &[],
+                    None,
+                    None
+                ),
+                READY,
+                &names(&["tom"])
+            ),
+            refused(by_non_instructor(Some("tom"), LABELED))
+        );
+        let deleted = LabelChange { actor: None, ..app };
+        assert_eq!(
+            judge_approval(
+                &issue_of(vec![TimelineNode::LabeledEvent(deleted)], &[], None, None),
+                READY,
+                &names(&["tom"])
+            ),
+            refused(by_non_instructor(None, LABELED))
+        );
+    }
+
+    #[test]
+    fn judge_approval_refuses_a_strangers_edit_or_rename_at_or_after_the_label_not_before() {
+        let edited = refused(edited_after(LABELED));
+        let tom = names(&["tom"]);
+        let edit_after = issue_of(
+            vec![labeled(LABELED, "tom", READY)],
+            &[(LABELED, "eve")],
+            None,
+            None,
+        );
+        assert_eq!(judge_approval(&edit_after, READY, &tom), edited);
+        let rename_after = issue_of(
+            vec![labeled(LABELED, "tom", READY), renamed(AFTER, "eve")],
+            &[],
+            None,
+            None,
+        );
+        assert_eq!(judge_approval(&rename_after, READY, &tom), edited);
+        let before = issue_of(
+            vec![renamed(BEFORE, "eve"), labeled(LABELED, "tom", READY)],
+            &[(BEFORE, "eve")],
+            None,
+            None,
+        );
+        assert!(matches!(
+            judge_approval(&before, READY, &tom),
+            Approval::Approved { .. }
+        ));
+        let instructor = issue_of(
+            vec![labeled(LABELED, "tom", READY), renamed(AFTER, "tom")],
+            &[(AFTER, "tom")],
+            None,
+            None,
+        );
+        assert!(matches!(
+            judge_approval(&instructor, READY, &tom),
+            Approval::Approved { .. }
+        ));
+    }
+
+    #[test]
+    fn judge_approval_refuses_an_edit_history_cut_off_after_the_label() {
+        let edits: Vec<(&str, &str)> = (0..HISTORY_PAGE).map(|_| (AFTER, "tom")).collect();
+        assert_eq!(
+            judge_approval(
+                &issue_of(vec![labeled(LABELED, "tom", READY)], &edits, None, None),
+                READY,
+                &names(&["tom"])
+            ),
+            refused(history_cut(LABELED))
+        );
+    }
+
+    #[test]
+    fn edited_since_counts_anyones_edit_or_rename_at_or_after_the_moment() {
+        assert!(!edited_since(
+            &issue_of(vec![renamed(BEFORE, "tom")], &[(BEFORE, "tom")], None, None),
+            LABELED
+        ));
+        assert!(edited_since(
+            &issue_of(vec![], &[(LABELED, "tom")], None, None),
+            LABELED
+        ));
+        assert!(edited_since(
+            &issue_of(vec![renamed(AFTER, "tom")], &[], None, None),
+            LABELED
+        ));
+    }
+
+    #[test]
+    fn edited_since_counts_a_timeline_page_that_may_hide_a_rename_as_a_change() {
+        let page: Vec<TimelineNode> = (0..HISTORY_PAGE)
+            .map(|_| labeled(AFTER, "tom", "other"))
+            .collect();
+        assert!(edited_since(
+            &issue_of(page.clone(), &[], None, None),
+            LABELED
+        ));
+        let mut reaches_back = vec![labeled(BEFORE, "tom", "other")];
+        reaches_back.extend(page.into_iter().skip(1));
+        assert!(!edited_since(
+            &issue_of(reaches_back, &[], None, None),
+            LABELED
+        ));
+    }
+
+    // ---- approval ----
+
+    #[test]
+    fn approval_reads_the_real_shapes_and_sends_one_call() {
+        let real = r#"{"data":{"repository":{"issue":{"timelineItems":{"totalCount":3,"nodes":[{"__typename":"UnlabeledEvent","createdAt":"2026-10-04T11:36:21Z","actor":{"__typename":"User","login":"rawphp"},"label":{"name":"factory:building"}},{"__typename":"LabeledEvent","createdAt":"2026-10-04T11:36:21Z","actor":{"__typename":"User","login":"rawphp"},"label":{"name":"factory:ready"}},{"__typename":"RenamedTitleEvent","createdAt":"2026-10-04T11:48:55Z","actor":{"__typename":"User","login":"rawphp"}}]},"lastEditedAt":null,"editor":null,"userContentEdits":{"totalCount":1,"nodes":[{"editedAt":"2026-10-04T09:50:06Z","editor":{"__typename":"User","login":"outside-user"}}]}}}}}"#;
+        assert_eq!(
+            approval_of(real, &["rawphp"]),
+            approved("2026-10-04T11:36:21Z", "rawphp")
+        );
+    }
+
+    #[test]
+    fn an_outside_authors_unedited_report_labelled_by_an_instructor_is_approved() {
+        // The creation entry is by the author, before the label, and is ignored.
+        let answer = events_reply(
+            &[ready_on(LABELED, "tom")],
+            None,
+            &creation_only("outsider"),
+        );
+        assert_eq!(approval_of(&answer, &["tom"]), approved(LABELED, "tom"));
+    }
+
+    #[test]
+    fn an_issue_with_no_history_at_all_is_approved_when_an_instructor_labelled_it() {
+        let answer = events_reply(&[ready_on(LABELED, "tom")], None, &[]);
+        assert_eq!(approval_of(&answer, &["tom"]), approved(LABELED, "tom"));
+    }
+
+    #[test]
+    fn the_instructor_comparison_ignores_case() {
+        let answer = events_reply(
+            &[ready_on(LABELED, "TomK")],
+            Some(e(AFTER, "TOMK")),
+            &[e(CREATED, "outsider"), e(AFTER, "TOMK")],
+        );
+        assert_eq!(approval_of(&answer, &["tomk"]), approved(LABELED, "TomK"));
+    }
+
+    #[test]
+    fn other_labels_in_the_events_are_ignored() {
+        let answer = events_reply(
+            &[
+                label_event("LabeledEvent", "2026-10-04T09:00:00Z", "eve", "bug"),
+                ready_on(LABELED, "tom"),
+                label_event("UnlabeledEvent", AFTER, "eve", "bug"),
+                label_event("LabeledEvent", AFTER, "eve", "factory:readyish"),
+            ],
+            None,
+            &creation_only("eve"),
+        );
+        assert_eq!(approval_of(&answer, &["tom"]), approved(LABELED, "tom"));
+    }
+
+    #[test]
+    fn a_label_applied_removed_and_applied_again_by_an_instructor_counts_the_later_event() {
+        // A non-instructor applied it first and an instructor reviewed and re-applied it.
+        let answer = events_reply(
+            &[
+                ready_on("2026-10-04T09:00:00Z", "eve"),
+                ready_off("2026-10-04T09:30:00Z", "tom"),
+                ready_on(LABELED, "tom"),
+            ],
+            None,
+            &creation_only("eve"),
+        );
+        assert_eq!(approval_of(&answer, &["tom"]), approved(LABELED, "tom"));
+    }
+
+    #[test]
+    fn a_label_applied_by_an_instructor_then_reapplied_by_a_non_instructor_is_refused() {
+        let answer = events_reply(
+            &[
+                ready_on("2026-10-04T09:00:00Z", "tom"),
+                ready_off("2026-10-04T09:30:00Z", "tom"),
+                ready_on(LABELED, "eve"),
+            ],
+            None,
+            &creation_only("eve"),
+        );
+        assert_eq!(
+            approval_of(&answer, &["tom"]),
+            refused(by_non_instructor(Some("eve"), LABELED))
+        );
+    }
+
+    #[test]
+    fn a_label_applied_by_a_non_instructor_is_refused() {
+        let answer = events_reply(&[ready_on(LABELED, "eve")], None, &creation_only("eve"));
+        assert_eq!(
+            approval_of(&answer, &["tom"]),
+            refused(by_non_instructor(Some("eve"), LABELED))
+        );
+    }
+
+    #[test]
+    fn a_label_applied_by_a_deleted_account_is_refused() {
+        let answer = events_reply(&[ready_on(LABELED, NOBODY)], None, &creation_only("tom"));
+        assert_eq!(
+            approval_of(&answer, &["tom"]),
+            refused(by_non_instructor(None, LABELED))
+        );
+    }
+
+    #[test]
+    fn a_label_that_was_removed_and_not_applied_again_is_not_found() {
+        let answer = events_reply(
+            &[
+                ready_on("2026-10-04T09:00:00Z", "tom"),
+                ready_off(LABELED, "tom"),
+            ],
+            None,
+            &creation_only("tom"),
+        );
+        assert_eq!(
+            approval_of(&answer, &["tom"]),
+            refused(Refusal::LabelNotFound)
+        );
+    }
+
+    #[test]
+    fn no_label_events_at_all_is_not_found() {
+        let answer = events_reply(&[], None, &creation_only("tom"));
+        assert_eq!(
+            approval_of(&answer, &["tom"]),
+            refused(Refusal::LabelNotFound)
+        );
+    }
+
+    /// `n` events about another label, oldest first.
+    fn noise(n: usize) -> Vec<Value> {
+        (0..n)
+            .map(|i| {
+                label_event(
+                    if i % 2 == 0 {
+                        "LabeledEvent"
+                    } else {
+                        "UnlabeledEvent"
+                    },
+                    "2026-10-04T09:00:00Z",
+                    "tom",
+                    "bug",
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_hundred_events_of_a_longer_history_without_the_label_is_incomplete() {
+        let answer = approval_reply(&noise(100), 150, None, &creation_only("tom"));
+        assert_eq!(
+            approval_of(&answer, &["tom"]),
+            refused(Refusal::LabelHistoryIncomplete)
+        );
+    }
+
+    #[test]
+    fn a_label_found_among_the_newest_hundred_is_enough_whatever_the_total() {
+        let mut events = noise(99);
+        events.push(ready_on(LABELED, "tom"));
+        let answer = approval_reply(&events, 400, None, &creation_only("tom"));
+        assert_eq!(approval_of(&answer, &["tom"]), approved(LABELED, "tom"));
+    }
+
+    #[test]
+    fn a_removal_among_the_newest_hundred_is_not_a_missing_history() {
+        // The label was taken off in view: the history is not why it is missing.
+        let mut events = vec![ready_on("2026-10-04T08:30:00Z", "tom")];
+        events.extend(noise(98));
+        events.push(ready_off(LABELED, "tom"));
+        let answer = approval_reply(&events, 100, None, &creation_only("tom"));
+        assert_eq!(
+            approval_of(&answer, &["tom"]),
+            refused(Refusal::LabelNotFound)
+        );
+    }
+
+    #[test]
+    fn a_complete_hundred_or_a_short_page_without_the_label_is_only_not_found() {
+        // Exactly 100 in all: nothing is hidden.
+        let whole = approval_reply(&noise(100), 100, None, &creation_only("tom"));
+        assert_eq!(
+            approval_of(&whole, &["tom"]),
+            refused(Refusal::LabelNotFound)
+        );
+        // A page short of 100 is not the cut-off that rule is about.
+        let short = approval_reply(&noise(99), 120, None, &creation_only("tom"));
+        assert_eq!(
+            approval_of(&short, &["tom"]),
+            refused(Refusal::LabelNotFound)
+        );
+    }
+
+    #[test]
+    fn an_instructor_edit_after_the_label_is_approved() {
+        let answer = events_reply(
+            &[ready_on(LABELED, "tom")],
+            Some(e(AFTER, "amy")),
+            &[e(CREATED, "eve"), e(AFTER, "amy")],
+        );
+        assert_eq!(
+            approval_of(&answer, &["tom", "amy"]),
+            approved(LABELED, "tom")
+        );
+    }
+
+    #[test]
+    fn a_non_instructor_edit_after_the_label_is_refused() {
+        let answer = events_reply(
+            &[ready_on(LABELED, "tom")],
+            Some(e(AFTER, "eve")),
+            &[e(CREATED, "eve"), e(AFTER, "eve")],
+        );
+        assert_eq!(
+            approval_of(&answer, &["tom"]),
+            refused(edited_after(LABELED))
+        );
+    }
+
+    #[test]
+    fn a_non_instructor_edit_followed_by_an_instructor_edit_is_refused() {
+        let answer = events_reply(
+            &[ready_on(LABELED, "tom")],
+            Some(e(LATER, "tom")),
+            &[e(CREATED, "eve"), e(AFTER, "eve"), e(LATER, "tom")],
+        );
+        assert_eq!(
+            approval_of(&answer, &["tom"]),
+            refused(edited_after(LABELED))
+        );
+    }
+
+    #[test]
+    fn an_edit_by_a_deleted_account_after_the_label_is_refused() {
+        let answer = events_reply(
+            &[ready_on(LABELED, "tom")],
+            Some(e(AFTER, NOBODY)),
+            &[e(CREATED, "eve"), e(AFTER, NOBODY)],
+        );
+        assert_eq!(
+            approval_of(&answer, &["tom"]),
+            refused(edited_after(LABELED))
+        );
+    }
+
+    #[test]
+    fn edits_before_the_label_are_ignored_whoever_made_them() {
+        // The instructor approved the text as it stood when they applied the label.
+        let answer = events_reply(
+            &[ready_on(LABELED, "tom")],
+            Some(e("2026-10-04T09:30:00Z", "eve")),
+            &[
+                e(CREATED, "eve"),
+                e("2026-10-04T09:00:00Z", NOBODY),
+                e("2026-10-04T09:30:00Z", "eve"),
+            ],
+        );
+        assert_eq!(approval_of(&answer, &["tom"]), approved(LABELED, "tom"));
+    }
+
+    #[test]
+    fn an_edit_in_the_same_second_as_the_label_counts_as_after_it() {
+        let stranger = events_reply(
+            &[ready_on(LABELED, "tom")],
+            Some(e(LABELED, "eve")),
+            &[e(CREATED, "eve"), e(LABELED, "eve")],
+        );
+        assert_eq!(
+            approval_of(&stranger, &["tom"]),
+            refused(edited_after(LABELED))
+        );
+        // An instructor's edit in that second is fine, and one second earlier is before it.
+        let instructor = events_reply(
+            &[ready_on(LABELED, "tom")],
+            Some(e(LABELED, "tom")),
+            &[e(CREATED, "eve"), e(LABELED, "tom")],
+        );
+        assert_eq!(approval_of(&instructor, &["tom"]), approved(LABELED, "tom"));
+        let before = events_reply(
+            &[ready_on(LABELED, "tom")],
+            Some(e("2026-10-04T09:59:59Z", "eve")),
+            &[e(CREATED, "eve"), e("2026-10-04T09:59:59Z", "eve")],
+        );
+        assert_eq!(approval_of(&before, &["tom"]), approved(LABELED, "tom"));
+    }
+
+    #[test]
+    fn only_the_label_that_is_in_force_sets_the_cut_off_for_edits() {
+        // An edit between an old, removed label and the label now in force is before it.
+        let answer = events_reply(
+            &[
+                ready_on("2026-10-04T09:00:00Z", "tom"),
+                ready_off("2026-10-04T09:10:00Z", "tom"),
+                ready_on(LABELED, "tom"),
+            ],
+            Some(e("2026-10-04T09:30:00Z", "eve")),
+            &[e(CREATED, "eve"), e("2026-10-04T09:30:00Z", "eve")],
+        );
+        assert_eq!(approval_of(&answer, &["tom"]), approved(LABELED, "tom"));
+    }
+
+    /// `n` seconds, one apart, from 10:01:00.
+    fn seconds_after_label(n: usize) -> Vec<String> {
+        (0..n)
+            .map(|i| format!("2026-10-04T10:{}:{}Z", pad(1 + i / 60), pad(i % 60)))
+            .collect()
+    }
+
+    #[test]
+    fn a_full_page_of_edits_is_an_incomplete_history() {
+        let times = seconds_after_label(100);
+        let history = |n: usize| -> Vec<Edit> { times[..n].iter().map(|t| e(t, "tom")).collect() };
+        let last = |n: usize| -> Option<Edit> { Some(e(&times[n - 1], "tom")) };
+        let events = || vec![ready_on(LABELED, "tom")];
+        assert_eq!(
+            approval_of(&events_reply(&events(), last(99), &history(99)), &["tom"]),
+            approved(LABELED, "tom")
+        );
+        assert_eq!(
+            approval_of(&events_reply(&events(), last(100), &history(100)), &["tom"]),
+            refused(history_cut(LABELED))
+        );
+    }
+
+    #[test]
+    fn an_edit_total_above_the_page_is_an_incomplete_history_when_the_label_may_be_hidden() {
+        // Both shown entries are after the label, so older ones could be too.
+        let nodes = [e(LATER, "tom"), e(AFTER, "tom")];
+        let last = Some(e(LATER, "tom"));
+        let run = |total: usize| {
+            approval_of(
+                &approval_reply_raw(&[ready_on(LABELED, "tom")], 1, last, &nodes, total),
+                &["tom"],
+            )
+        };
+        assert_eq!(run(2), approved(LABELED, "tom"));
+        assert_eq!(run(5), refused(history_cut(LABELED)));
+    }
+
+    #[test]
+    fn the_newest_edit_entry_must_be_the_last_edit() {
+        let create = e(CREATED, "tom");
+        let last = Some(e(AFTER, "tom"));
+        let run = |nodes: &[Edit]| {
+            approval_of(
+                &approval_reply_raw(&[ready_on(LABELED, "tom")], 1, last, nodes, nodes.len()),
+                &["tom", "amy"],
+            )
+        };
+        assert_eq!(run(&[e(AFTER, "tom"), create]), approved(LABELED, "tom"));
+        // Another time, another editor (both instructors), or no entry for it.
+        let wrong: [&[Edit]; 4] = [
+            &[e("2026-10-04T10:20:00Z", "tom"), create],
+            &[e(AFTER, "amy"), create],
+            &[create],
+            &[],
+        ];
+        for nodes in wrong {
+            assert_eq!(run(nodes), refused(history_cut(LABELED)));
+        }
+    }
+
+    #[test]
+    fn a_visible_stranger_edit_is_named_even_when_the_history_is_also_cut_off() {
+        let nodes = [e(AFTER, "eve"), e(CREATED, "tom")];
+        let answer = approval_reply_raw(
+            &[ready_on(LABELED, "tom")],
+            1,
+            Some(e(AFTER, "eve")),
+            &nodes,
+            9,
+        );
+        assert_eq!(
+            approval_of(&answer, &["tom"]),
+            refused(edited_after(LABELED))
+        );
+    }
+
+    #[test]
+    fn the_label_is_judged_before_the_edits() {
+        let answer = events_reply(
+            &[ready_on(LABELED, "eve")],
+            Some(e(AFTER, "eve")),
+            &[e(CREATED, "eve"), e(AFTER, "eve")],
+        );
+        assert_eq!(
+            approval_of(&answer, &["tom"]),
+            refused(by_non_instructor(Some("eve"), LABELED))
+        );
+    }
+
+    #[test]
+    fn approval_with_no_instructors_approves_nothing() {
+        let answer = events_reply(&[ready_on(LABELED, "tom")], None, &creation_only("tom"));
+        assert_eq!(
+            approval_of(&answer, &[]),
+            refused(by_non_instructor(Some("tom"), LABELED))
+        );
+    }
+
+    /// The error `approval` gives for this answer, or none when it reads it.
+    fn approval_error(answer: &str) -> Option<TrackerError> {
+        let fake = FakeTracker::answering([Answer::ok(answer)]);
+        fake.approval(REPO, 6, &names(&["tom"])).err()
+    }
+
+    /// Whether `error` is a parse error that names the call with `call`.
+    fn is_parse_error_of(error: Option<TrackerError>, call: &[String]) -> bool {
+        match error {
+            Some(TrackerError::Other(message)) => message.starts_with(&format!(
+                "`{}` returned unexpected output",
+                command_text(call)
+            )),
+            _ => false,
+        }
+    }
+
+    /// Whether `answer` is a parse error that names the approval call.
+    fn is_approval_parse_error(answer: &str) -> bool {
+        is_parse_error_of(approval_error(answer), &approval_call())
+    }
+
+    #[test]
+    fn approval_answers_that_cannot_be_read_are_parse_errors() {
+        let good = |events: Value, edits: Value| {
+            json!({"data": {"repository": {"issue": {
+                "timelineItems": {"totalCount": 1, "nodes": events},
+                "lastEditedAt": null,
+                "editor": null,
+                "userContentEdits": edits,
+            }}}})
+            .to_string()
+        };
+        let edits = edits_json(&[e(CREATED, "tom")], 1);
+        // The control: this one is fine.
+        assert!(!is_approval_parse_error(&good(
+            json!([ready_on(LABELED, "tom")]),
+            edits.clone()
+        )));
+
+        for bad in [
+            "not json",
+            "",
+            "{}",
+            r#"{"data":{"repository":null}}"#,
+            r#"{"errors":[{"message":"x"}]}"#,
+            // No label events, no edit history, no total counts.
+            r#"{"data":{"repository":{"issue":{"lastEditedAt":null,"editor":null,"userContentEdits":{"totalCount":0,"nodes":[]}}}}}"#,
+            r#"{"data":{"repository":{"issue":{"timelineItems":{"totalCount":0,"nodes":[]},"lastEditedAt":null,"editor":null}}}}"#,
+            r#"{"data":{"repository":{"issue":{"timelineItems":{"nodes":[]},"lastEditedAt":null,"editor":null,"userContentEdits":{"totalCount":0,"nodes":[]}}}}}"#,
+        ] {
+            assert!(is_approval_parse_error(bad), "{bad}");
+        }
+        // A node missing its time, its label, or its type, or of a type we did not ask for.
+        for broken in [
+            json!({"__typename": "LabeledEvent", "actor": {"login": "tom"}, "label": {"name": "factory:ready"}}),
+            json!({"__typename": "LabeledEvent", "createdAt": LABELED, "actor": {"login": "tom"}}),
+            json!({"createdAt": LABELED, "actor": {"login": "tom"}, "label": {"name": "factory:ready"}}),
+            json!({"__typename": "ClosedEvent", "createdAt": LABELED}),
+        ] {
+            assert!(
+                is_approval_parse_error(&good(json!([broken.clone()]), edits.clone())),
+                "{broken}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_timestamp_is_a_parse_error() {
+        for at in [
+            "2026-10-04 10:00:00Z",
+            "2026-10-04T10:00:00",
+            "",
+            "yesterday",
+        ] {
+            // In the label event.
+            let in_label = events_reply(&[ready_on(at, "tom")], None, &creation_only("tom"));
+            assert!(is_approval_parse_error(&in_label), "label at {at}");
+            // In the edit history.
+            let in_edit = events_reply(
+                &[ready_on(LABELED, "tom")],
+                Some(e(AFTER, "tom")),
+                &[e(CREATED, "tom"), e(at, "tom")],
+            );
+            assert!(is_approval_parse_error(&in_edit), "edit at {at}");
+            // In lastEditedAt.
+            let in_last = events_reply(
+                &[ready_on(LABELED, "tom")],
+                Some(e(at, "tom")),
+                &[e(CREATED, "tom"), e(at, "tom")],
+            );
+            assert!(is_approval_parse_error(&in_last), "last edit at {at}");
+            let in_rename = events_reply(
+                &[ready_on(LABELED, "tom"), rename_event(at, "tom")],
+                None,
+                &creation_only("tom"),
+            );
+            assert!(is_approval_parse_error(&in_rename), "rename at {at}");
+        }
+    }
+
+    #[test]
+    fn approval_failures_from_gh_are_errors_with_the_call() {
+        let failed = FakeTracker::answering([Answer::fail(1, "HTTP 502")]);
+        let error = failed.approval(REPO, 6, &names(&["tom"])).unwrap_err();
+        assert_eq!(
+            error,
+            TrackerError::Other(format!(
+                "`{}` exited with status 1: HTTP 502",
+                command_text(&approval_call())
+            ))
+        );
+
+        let spawn = FakeTracker::answering([Answer::NotStarted("no such file".into())]);
+        let error = spawn.approval(REPO, 6, &names(&["tom"])).unwrap_err();
+        assert_eq!(
+            error,
+            TrackerError::Other(format!(
+                "cannot start `{}`: no such file",
+                command_text(&approval_call())
+            ))
+        );
+    }
+
+    /// `n` instructor renames after the label, oldest first, one second apart.
+    fn renames_after_label(n: usize) -> Vec<Value> {
+        seconds_after_label(n)
+            .iter()
+            .map(|at| rename_event(at, "tom"))
+            .collect()
+    }
+
+    #[test]
+    fn a_title_renamed_by_a_non_instructor_after_the_label_is_refused() {
+        let answer = events_reply(
+            &[ready_on(LABELED, "tom"), rename_event(AFTER, "eve")],
+            None,
+            &creation_only("eve"),
+        );
+        assert_eq!(
+            approval_of(&answer, &["tom"]),
+            refused(edited_after(LABELED))
+        );
+    }
+
+    #[test]
+    fn a_title_renamed_by_an_instructor_after_the_label_is_approved() {
+        let answer = events_reply(
+            &[ready_on(LABELED, "tom"), rename_event(AFTER, "AMY")],
+            None,
+            &creation_only("eve"),
+        );
+        assert_eq!(
+            approval_of(&answer, &["tom", "amy"]),
+            approved(LABELED, "tom")
+        );
+    }
+
+    #[test]
+    fn a_rename_by_a_deleted_account_after_the_label_is_refused() {
+        let answer = events_reply(
+            &[ready_on(LABELED, "tom"), rename_event(AFTER, NOBODY)],
+            None,
+            &creation_only("eve"),
+        );
+        assert_eq!(
+            approval_of(&answer, &["tom"]),
+            refused(edited_after(LABELED))
+        );
+    }
+
+    #[test]
+    fn a_stranger_rename_followed_by_an_instructor_rename_is_refused() {
+        let answer = events_reply(
+            &[
+                ready_on(LABELED, "tom"),
+                rename_event(AFTER, "eve"),
+                rename_event(LATER, "tom"),
+            ],
+            None,
+            &creation_only("eve"),
+        );
+        assert_eq!(
+            approval_of(&answer, &["tom"]),
+            refused(edited_after(LABELED))
+        );
+    }
+
+    #[test]
+    fn a_stranger_rename_is_refused_even_when_every_body_edit_is_an_instructors() {
+        let answer = events_reply(
+            &[ready_on(LABELED, "tom"), rename_event(LATER, "eve")],
+            Some(e(AFTER, "tom")),
+            &[e(CREATED, "eve"), e(AFTER, "tom")],
+        );
+        assert_eq!(
+            approval_of(&answer, &["tom"]),
+            refused(edited_after(LABELED))
+        );
+    }
+
+    #[test]
+    fn renames_before_the_label_in_force_are_ignored() {
+        // Before the label, and between a removed label and the one in force.
+        let answer = events_reply(
+            &[
+                rename_event("2026-10-04T08:30:00Z", "eve"),
+                ready_on("2026-10-04T09:00:00Z", "tom"),
+                ready_off("2026-10-04T09:10:00Z", "tom"),
+                rename_event("2026-10-04T09:30:00Z", NOBODY),
+                ready_on(LABELED, "tom"),
+            ],
+            None,
+            &creation_only("eve"),
+        );
+        assert_eq!(approval_of(&answer, &["tom"]), approved(LABELED, "tom"));
+    }
+
+    #[test]
+    fn a_rename_in_the_same_second_as_the_label_counts_as_after_it() {
+        let stranger = events_reply(
+            &[ready_on(LABELED, "tom"), rename_event(LABELED, "eve")],
+            None,
+            &creation_only("eve"),
+        );
+        assert_eq!(
+            approval_of(&stranger, &["tom"]),
+            refused(edited_after(LABELED))
+        );
+        let instructor = events_reply(
+            &[
+                rename_event("2026-10-04T09:59:59Z", "eve"),
+                ready_on(LABELED, "tom"),
+                rename_event(LABELED, "tom"),
+            ],
+            None,
+            &creation_only("eve"),
+        );
+        assert_eq!(approval_of(&instructor, &["tom"]), approved(LABELED, "tom"));
+    }
+
+    #[test]
+    fn labels_and_renames_share_the_page_and_the_label_in_force_is_enough() {
+        // The label is the oldest event shown, so every later event, the renames included, is
+        // on the page: events come oldest first and the page is the newest 100. Nothing before
+        // the label matters, whatever the total.
+        let mut events = vec![ready_on(LABELED, "tom")];
+        events.extend(renames_after_label(99));
+        let answer = approval_reply(&events, 400, None, &creation_only("eve"));
+        assert_eq!(approval_of(&answer, &["tom"]), approved(LABELED, "tom"));
+
+        // A stranger's rename on that page is seen.
+        let mut with_stranger = events.clone();
+        with_stranger[50] = rename_event("2026-10-04T10:20:00Z", "eve");
+        let seen = approval_reply(&with_stranger, 400, None, &creation_only("eve"));
+        assert_eq!(approval_of(&seen, &["tom"]), refused(edited_after(LABELED)));
+    }
+
+    #[test]
+    fn a_page_of_renames_without_the_label_is_a_missing_label_history_not_a_stranger_edit() {
+        // The label is older than all 100 shown events. Nothing shown can be told to be after it.
+        let events: Vec<Value> = (0..100).map(|_| rename_event(AFTER, "eve")).collect();
+        let answer = approval_reply(&events, 150, None, &creation_only("eve"));
+        assert_eq!(
+            approval_of(&answer, &["tom"]),
+            refused(Refusal::LabelHistoryIncomplete)
+        );
+    }
+
+    /// `n` seconds, one apart, from `hour`:00:00.
+    fn edit_times(hour: usize, n: usize) -> Vec<String> {
+        (0..n)
+            .map(|i| format!("2026-10-04T{}:{}:{}Z", pad(hour), pad(i / 60), pad(i % 60)))
+            .collect()
+    }
+
+    #[test]
+    fn a_hundred_edits_with_the_oldest_shown_before_the_label_are_judged_by_the_visible_ones() {
+        // 99 entries before the label (09:xx) and the newest, an instructor's, after it.
+        let times = edit_times(9, 99);
+        let mut history: Vec<Edit> = times.iter().map(|t| e(t, "tom")).collect();
+        history.push(e(AFTER, "tom"));
+        let events = || vec![ready_on(LABELED, "tom")];
+        let answer = events_reply(&events(), Some(e(AFTER, "tom")), &history);
+        assert_eq!(approval_of(&answer, &["tom"]), approved(LABELED, "tom"));
+
+        // The same page with the newest edit by a stranger.
+        let mut with_stranger: Vec<Edit> = history[..99].to_vec();
+        with_stranger.push(e(AFTER, "eve"));
+        let refused_answer = events_reply(&events(), Some(e(AFTER, "eve")), &with_stranger);
+        assert_eq!(
+            approval_of(&refused_answer, &["tom"]),
+            refused(edited_after(LABELED))
+        );
+    }
+
+    #[test]
+    fn a_hundred_edits_all_after_the_label_cannot_be_judged() {
+        let times = seconds_after_label(100);
+        let history: Vec<Edit> = times.iter().map(|t| e(t, "tom")).collect();
+        let answer = events_reply(
+            &[ready_on(LABELED, "tom")],
+            Some(e(&times[99], "tom")),
+            &history,
+        );
+        assert_eq!(
+            approval_of(&answer, &["tom"]),
+            refused(history_cut(LABELED))
+        );
+    }
+
+    #[test]
+    fn a_total_above_the_page_is_judged_when_the_oldest_shown_entry_is_before_the_label() {
+        let last = Some(e(LATER, "tom"));
+        let run = |nodes: &[Edit]| {
+            approval_of(
+                &approval_reply_raw(&[ready_on(LABELED, "tom")], 1, last, nodes, 150),
+                &["tom"],
+            )
+        };
+        assert_eq!(
+            run(&[
+                e(LATER, "tom"),
+                e(AFTER, "tom"),
+                e("2026-10-04T09:30:00Z", "tom")
+            ]),
+            approved(LABELED, "tom")
+        );
+        // The oldest shown entry must be strictly before the label.
+        assert_eq!(
+            run(&[e(LATER, "tom"), e(LABELED, "tom")]),
+            refused(history_cut(LABELED))
+        );
+        assert_eq!(
+            run(&[e(LATER, "tom"), e(AFTER, "tom")]),
+            refused(history_cut(LABELED))
+        );
+    }
+
+    #[test]
+    fn a_cut_page_still_needs_its_newest_entry_to_be_the_last_edit() {
+        let times = edit_times(9, 99);
+        let mut nodes: Vec<Edit> = vec![e(LATER, "tom")];
+        nodes.extend(times.iter().rev().map(|t| e(t, "tom")));
+        assert_eq!(nodes.len(), 100);
+        let run = |last: Edit| {
+            approval_of(
+                &approval_reply_raw(&[ready_on(LABELED, "tom")], 1, Some(last), &nodes, 100),
+                &["tom"],
+            )
+        };
+        assert_eq!(run(e(LATER, "tom")), approved(LABELED, "tom"));
+        // GitHub says the last edit was another one.
+        assert_eq!(run(e(AFTER, "tom")), refused(history_cut(LABELED)));
+        assert_eq!(run(e(LATER, "amy")), refused(history_cut(LABELED)));
+    }
+
+    #[test]
+    fn a_label_applied_by_an_actor_that_is_not_a_user_is_refused_whatever_its_login() {
+        for typename in [
+            "Bot",
+            "Organization",
+            "Mannequin",
+            "EnterpriseUserAccount",
+            "",
+        ] {
+            let mut event = ready_on(LABELED, "tom");
+            event["actor"] = json!({"__typename": typename, "login": "tom"});
+            let answer = events_reply(&[event], None, &creation_only("eve"));
+            assert_eq!(
+                approval_of(&answer, &["tom"]),
+                refused(by_non_instructor(Some("tom"), LABELED)),
+                "{typename}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_actor_without_a_typename_is_not_an_instructor() {
+        let mut event = ready_on(LABELED, "tom");
+        event["actor"] = json!({"login": "tom"});
+        let answer = events_reply(&[event], None, &creation_only("eve"));
+        assert_eq!(
+            approval_of(&answer, &["tom"]),
+            refused(by_non_instructor(Some("tom"), LABELED))
+        );
+    }
+
+    /// `answer` with the type of the newest history entry's editor replaced.
+    fn with_editor_typename(answer: &str, typename: &str) -> String {
+        let mut json: Value = serde_json::from_str(answer).unwrap();
+        json["data"]["repository"]["issue"]["userContentEdits"]["nodes"][0]["editor"]["__typename"] =
+            json!(typename);
+        json.to_string()
+    }
+
+    #[test]
+    fn a_body_edit_or_rename_by_something_that_is_not_a_user_after_the_label_is_refused() {
+        let answer = events_reply(
+            &[ready_on(LABELED, "tom")],
+            Some(e(AFTER, "tom")),
+            &[e(CREATED, "eve"), e(AFTER, "tom")],
+        );
+        assert_eq!(approval_of(&answer, &["tom"]), approved(LABELED, "tom"));
+        for typename in ["Bot", "Mannequin", ""] {
+            assert_eq!(
+                approval_of(&with_editor_typename(&answer, typename), &["tom"]),
+                refused(edited_after(LABELED)),
+                "edit by {typename}"
+            );
+        }
+
+        let mut rename = rename_event(AFTER, "tom");
+        rename["actor"] = json!({"__typename": "Bot", "login": "tom"});
+        let renamed = events_reply(
+            &[ready_on(LABELED, "tom"), rename],
+            None,
+            &creation_only("eve"),
+        );
+        assert_eq!(
+            approval_of(&renamed, &["tom"]),
+            refused(edited_after(LABELED))
+        );
+    }
+
+    #[test]
+    fn a_creation_entry_by_something_that_is_not_a_user_before_the_label_is_ignored() {
+        let answer = events_reply(
+            &[ready_on(LABELED, "tom")],
+            None,
+            &creation_only("dependabot"),
+        );
+        assert_eq!(
+            approval_of(&with_editor_typename(&answer, "Bot"), &["tom"]),
+            approved(LABELED, "tom")
+        );
+    }
+
+    #[test]
+    fn approval_for_a_repo_that_is_not_owner_name_makes_no_call() {
+        let fake = FakeTracker::new();
+        let error = fake.approval("softfac", 6, &names(&["tom"])).unwrap_err();
+        assert!(
+            matches!(&error, TrackerError::Other(m) if m.contains("returned unexpected output")),
+            "{error}"
+        );
+        assert!(fake.calls().is_empty());
+    }
+
+    // ---- text_check ----
+
+    fn text_check_of(answer: &str, since: &str, who: &[&str]) -> TextCheck {
+        let fake = FakeTracker::answering([Answer::ok(answer)]);
+        let found = fake.text_check(REPO, 6, since, &names(who)).unwrap();
+        assert_eq!(fake.calls(), vec![approval_call()]);
+        found
+    }
+
+    #[test]
+    fn text_check_tells_unchanged_from_changed_from_unjudged() {
+        // Unchanged: instructors only.
+        let instructors = events_reply(
+            &[ready_on(LABELED, "tom"), rename_event(AFTER, "tom")],
+            Some(e(AFTER, "tom")),
+            &[e(CREATED, "eve"), e(AFTER, "tom")],
+        );
+        assert_eq!(
+            text_check_of(&instructors, LABELED, &["tom"]),
+            TextCheck::Unchanged
+        );
+        // Changed: a stranger's rename, a deleted account's edit.
+        let renamed = events_reply(
+            &[ready_on(LABELED, "tom"), rename_event(AFTER, "eve")],
+            None,
+            &creation_only("eve"),
+        );
+        assert_eq!(
+            text_check_of(&renamed, LABELED, &["tom"]),
+            TextCheck::Changed
+        );
+        let edited = events_reply(
+            &[ready_on(LABELED, "tom")],
+            Some(e(AFTER, NOBODY)),
+            &[e(CREATED, "eve"), e(AFTER, NOBODY)],
+        );
+        assert_eq!(
+            text_check_of(&edited, LABELED, &["tom"]),
+            TextCheck::Changed
+        );
+    }
+
+    #[test]
+    fn text_check_says_unjudged_when_the_histories_cannot_be_read_whole() {
+        // A full page of body edits after the label, all by instructors, with more behind it.
+        let times = seconds_after_label(100);
+        let oldest_first: Vec<Edit> = times.iter().map(|t| e(t, "tom")).collect();
+        let last = Some(e(&times[99], "tom"));
+        let full = events_reply(&[ready_on(LABELED, "tom")], last, &oldest_first);
+        assert_eq!(text_check_of(&full, LABELED, &["tom"]), TextCheck::Unjudged);
+        // A stranger shown on that page is still a change: it wins.
+        let mut with_stranger = oldest_first.clone();
+        with_stranger[50] = e(&times[50], "eve");
+        let stranger = events_reply(&[ready_on(LABELED, "tom")], last, &with_stranger);
+        assert_eq!(
+            text_check_of(&stranger, LABELED, &["tom"]),
+            TextCheck::Changed
+        );
+    }
+
+    #[test]
+    fn text_check_ignores_who_applied_labels_but_not_bots() {
+        // Labels are not text: a stranger's label event is not a change.
+        let labelled = events_reply(
+            &[
+                ready_on(LABELED, "tom"),
+                label_event("LabeledEvent", AFTER, "eve", "bug"),
+            ],
+            None,
+            &creation_only("eve"),
+        );
+        assert_eq!(
+            text_check_of(&labelled, LABELED, &["tom"]),
+            TextCheck::Unchanged
+        );
+        // A bot with an instructor's login is not an instructor.
+        let rename = rename_event(AFTER, bot("tom"));
+        let by_bot = events_reply(
+            &[ready_on(LABELED, "tom"), rename],
+            None,
+            &creation_only("eve"),
+        );
+        assert_eq!(
+            text_check_of(&by_bot, LABELED, &["tom"]),
+            TextCheck::Changed
+        );
+    }
+
+    #[test]
+    fn text_check_cannot_judge_histories_that_may_hide_something() {
+        // A full page of body edits all at or after the moment.
+        let times = seconds_after_label(100);
+        let history: Vec<Edit> = times.iter().map(|t| e(t, "tom")).collect();
+        let edits = events_reply(
+            &[ready_on(LABELED, "tom")],
+            Some(e(&times[99], "tom")),
+            &history,
+        );
+        assert_eq!(
+            text_check_of(&edits, LABELED, &["tom"]),
+            TextCheck::Unjudged
+        );
+
+        // A full timeline page whose oldest event is at or after the moment may hide renames.
+        let events: Vec<Value> = (0..100).map(|_| rename_event(AFTER, "tom")).collect();
+        let full = approval_reply(&events, 150, None, &creation_only("eve"));
+        assert_eq!(text_check_of(&full, LABELED, &["tom"]), TextCheck::Unjudged);
+        // The same page with its oldest event before the moment shows everything after it.
+        let mut reaching = vec![rename_event("2026-10-04T09:00:00Z", "eve")];
+        reaching.extend(events.into_iter().skip(1));
+        let reaching_answer = approval_reply(&reaching, 150, None, &creation_only("eve"));
+        assert_eq!(
+            text_check_of(&reaching_answer, LABELED, &["tom"]),
+            TextCheck::Unchanged
+        );
+
+        // The newest body entry must be the last edit.
+        let stale = approval_reply_raw(
+            &[ready_on(LABELED, "tom")],
+            1,
+            Some(e(AFTER, "tom")),
+            &[e(CREATED, "eve")],
+            1,
+        );
+        assert_eq!(
+            text_check_of(&stale, LABELED, &["tom"]),
+            TextCheck::Unjudged
+        );
+    }
+
+    #[test]
+    fn a_cut_off_timeline_page_whose_oldest_event_is_exactly_at_since_cannot_be_judged() {
+        // Events before `since` could still be hidden at the same second, so the page must
+        // reach strictly before it.
+        let page = |oldest: &str| {
+            let mut events = vec![rename_event(oldest, "tom")];
+            events.extend((0..99).map(|_| rename_event(AFTER, "tom")));
+            approval_reply(&events, 150, None, &creation_only("eve"))
+        };
+        assert_eq!(
+            text_check_of(&page(LABELED), LABELED, &["tom"]),
+            TextCheck::Unjudged
+        );
+        assert_eq!(
+            text_check_of(&page(AFTER), LABELED, &["tom"]),
+            TextCheck::Unjudged
+        );
+        assert_eq!(
+            text_check_of(&page("2026-10-04T09:59:59Z"), LABELED, &["tom"]),
+            TextCheck::Unchanged
+        );
+    }
+
+    #[test]
+    fn each_half_of_the_timeline_cut_off_rule_alone_stops_the_judgement() {
+        let renames =
+            |n: usize| -> Vec<Value> { (0..n).map(|_| rename_event(AFTER, "tom")).collect() };
+        // A full page of 100 with nothing more: still a page that may have been cut.
+        let full = approval_reply(&renames(100), 100, None, &creation_only("eve"));
+        assert_eq!(text_check_of(&full, LABELED, &["tom"]), TextCheck::Unjudged);
+        // Fewer than 100 shown with a larger total: something is hidden.
+        let short = approval_reply(&renames(99), 120, None, &creation_only("eve"));
+        assert_eq!(
+            text_check_of(&short, LABELED, &["tom"]),
+            TextCheck::Unjudged
+        );
+        // The control: 99 shown of a total of 99 is the whole timeline.
+        let whole = approval_reply(&renames(99), 99, None, &creation_only("eve"));
+        assert_eq!(
+            text_check_of(&whole, LABELED, &["tom"]),
+            TextCheck::Unchanged
+        );
+    }
+
+    #[test]
+    fn text_check_is_changed_for_a_stranger_edit_or_rename_at_or_after_the_moment() {
+        let edited = |at: &str, who: Who<'static>| {
+            events_reply(
+                &[ready_on(LABELED, "tom")],
+                Some(e(at, who)),
+                &[e(CREATED, "eve"), e(at, who)],
+            )
+        };
+        let renamed = |at: &str, who: Who<'static>| {
+            events_reply(
+                &[ready_on(LABELED, "tom"), rename_event(at, who)],
+                None,
+                &creation_only("eve"),
+            )
+        };
+        for at in [LABELED, AFTER] {
+            for who in [Who::User("eve"), NOBODY] {
+                assert_eq!(
+                    text_check_of(&edited(at, who), LABELED, &["tom"]),
+                    TextCheck::Changed
+                );
+                assert_eq!(
+                    text_check_of(&renamed(at, who), LABELED, &["tom"]),
+                    TextCheck::Changed
+                );
+            }
+        }
+        // One second before the moment is before it.
+        assert_eq!(
+            text_check_of(
+                &edited("2026-10-04T09:59:59Z", Who::User("eve")),
+                LABELED,
+                &["tom"]
+            ),
+            TextCheck::Unchanged
+        );
+        assert_eq!(
+            text_check_of(
+                &renamed("2026-10-04T09:59:59Z", Who::User("eve")),
+                LABELED,
+                &["tom"]
+            ),
+            TextCheck::Unchanged
+        );
+    }
+
+    #[test]
+    fn text_check_with_a_timestamp_that_is_not_githubs_form_makes_no_call() {
+        for since in ["", "2026-10-04 10:00:00Z", "2026-10-04T10:00:00", "now"] {
+            let fake = FakeTracker::new();
+            let error = fake
+                .text_check(REPO, 6, since, &names(&["tom"]))
+                .unwrap_err();
+            assert!(
+                is_parse_error_of(Some(error), &args(&["api", "graphql"])),
+                "{since}"
+            );
+            assert!(fake.calls().is_empty(), "{since}");
+        }
+    }
+
+    #[test]
+    fn text_check_errors_are_typed() {
+        let bad = FakeTracker::answering([Answer::ok("not json")]);
+        let parse = bad
+            .text_check(REPO, 6, LABELED, &names(&["tom"]))
+            .unwrap_err();
+        assert!(is_parse_error_of(Some(parse), &approval_call()));
+
+        let failed = FakeTracker::answering([Answer::fail(1, "HTTP 502")]);
+        let error = failed
+            .text_check(REPO, 6, LABELED, &names(&["tom"]))
+            .unwrap_err();
+        assert!(
+            matches!(&error, TrackerError::Other(m) if m.contains("exited with status 1")),
+            "{error}"
+        );
+
+        let answer = events_reply(
+            &[ready_on(LABELED, "tom")],
+            Some(e("later", "tom")),
+            &creation_only("tom"),
+        );
+        let malformed = FakeTracker::answering([Answer::ok(answer)]);
+        let error = malformed
+            .text_check(REPO, 6, LABELED, &names(&["tom"]))
+            .unwrap_err();
+        assert!(is_parse_error_of(Some(error), &approval_call()));
+    }
+
+    // ---- text_edited_since ----
+
+    fn edited_since_of(answer: &str, since: &str) -> bool {
+        let fake = FakeTracker::answering([Answer::ok(answer)]);
+        let found = fake.text_edited_since(REPO, 6, since).unwrap();
+        assert_eq!(fake.calls(), vec![approval_call()]);
+        found
+    }
+
+    #[test]
+    fn text_edited_since_is_false_when_nothing_touched_the_text_at_or_after_the_moment() {
+        // An edit and a rename before the moment, by anyone, and a label event after it.
+        let answer = events_reply(
+            &[
+                rename_event("2026-10-04T09:00:00Z", "eve"),
+                ready_on(LABELED, "tom"),
+                label_event("LabeledEvent", AFTER, "eve", "bug"),
+            ],
+            Some(e("2026-10-04T09:59:59Z", "tom")),
+            &[e(CREATED, "eve"), e("2026-10-04T09:59:59Z", "tom")],
+        );
+        assert!(!edited_since_of(&answer, LABELED));
+    }
+
+    #[test]
+    fn text_edited_since_is_true_for_any_edit_or_rename_at_or_after_the_moment_even_an_instructors()
+    {
+        for at in [LABELED, AFTER] {
+            let edited = events_reply(
+                &[ready_on(LABELED, "tom")],
+                Some(e(at, "tom")),
+                &[e(CREATED, "eve"), e(at, "tom")],
+            );
+            assert!(edited_since_of(&edited, LABELED), "edit at {at}");
+            let renamed = events_reply(
+                &[ready_on(LABELED, "tom"), rename_event(at, "tom")],
+                None,
+                &creation_only("eve"),
+            );
+            assert!(edited_since_of(&renamed, LABELED), "rename at {at}");
+        }
+    }
+
+    #[test]
+    fn text_edited_since_is_true_when_the_timeline_may_hide_a_rename() {
+        // A full page of newer label events with more behind it: a rename at the moment could
+        // be among the hidden ones.
+        let events: Vec<Value> = (0..100)
+            .map(|i| {
+                label_event(
+                    "LabeledEvent",
+                    &format!("2026-10-04T11:{}:{}Z", pad(i / 60), pad(i % 60)),
+                    "eve",
+                    "bug",
+                )
+            })
+            .collect();
+        let answer = approval_reply(&events, 150, None, &creation_only("eve"));
+        assert!(edited_since_of(&answer, LABELED));
+    }
+
+    #[test]
+    fn text_edited_since_refuses_a_moment_that_is_not_a_github_timestamp() {
+        let fake = FakeTracker::new();
+        let error = fake.text_edited_since(REPO, 6, "yesterday").unwrap_err();
+        assert!(
+            matches!(&error, TrackerError::Other(m) if m.contains("returned unexpected output"))
+        );
+        assert!(fake.calls().is_empty());
+    }
+
+    #[test]
+    fn approval_sends_one_graphql_call_for_the_issue_and_uses_the_instructors_it_is_given() {
+        let answer = json!({"data": {"repository": {"issue": {
+            "timelineItems": {
+                "totalCount": 1,
+                "nodes": [ready_on("2026-10-04T11:36:21Z", "rawphp")],
+            },
+            "lastEditedAt": null,
+            "editor": null,
+            "userContentEdits": edits_json(&[e("2026-10-04T09:50:06Z", "outsider")], 1),
+        }}}})
+        .to_string();
+        let fake = FakeTracker::answering([Answer::ok(answer)]);
+        let found = fake.approval(REPO, 10, &names(&["rawphp"])).unwrap();
+        assert_eq!(found, approved("2026-10-04T11:36:21Z", "rawphp"));
+        let calls = fake.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0][..2], args(&["api", "graphql"])[..]);
+        assert!(calls[0].contains(&"number=10".to_string()));
+    }
+
+    /// A recorded answer of the approval query: the label at 10:00 and an outsider's rename at
+    /// 10:30.
+    const RENAMED_BY_OUTSIDER: &str = r#"{"data":{"repository":{"issue":{"timelineItems":{"totalCount":2,"nodes":[{"__typename":"LabeledEvent","createdAt":"2026-10-04T10:00:00Z","actor":{"__typename":"User","login":"rawphp"},"label":{"name":"factory:ready"}},{"__typename":"RenamedTitleEvent","createdAt":"2026-10-04T10:30:00Z","actor":{"__typename":"User","login":"outsider"}}]},"lastEditedAt":null,"editor":null,"userContentEdits":{"totalCount":1,"nodes":[{"editedAt":"2026-10-04T09:50:06Z","editor":{"__typename":"User","login":"outsider"}}]}}}}}"#;
+
+    #[test]
+    fn text_check_sends_one_graphql_call_per_check_and_uses_the_instructors_it_is_given() {
+        let fake = FakeTracker::answering([
+            Answer::ok(RENAMED_BY_OUTSIDER),
+            Answer::ok(RENAMED_BY_OUTSIDER),
+            Answer::ok(RENAMED_BY_OUTSIDER),
+        ]);
+        // The rename is at or after the first moment and before the second.
+        assert_eq!(
+            fake.text_check(REPO, 10, "2026-10-04T10:00:00Z", &names(&["rawphp"]))
+                .unwrap(),
+            TextCheck::Changed
+        );
+        assert_eq!(
+            fake.text_check(REPO, 10, "2026-10-04T10:30:01Z", &names(&["rawphp"]))
+                .unwrap(),
+            TextCheck::Unchanged
+        );
+        // The list passed is the one used: with the outsider as an instructor it is unchanged.
+        assert_eq!(
+            fake.text_check(REPO, 10, "2026-10-04T10:00:00Z", &names(&["outsider"]))
+                .unwrap(),
+            TextCheck::Unchanged
+        );
+        let calls = fake.calls();
+        assert_eq!(calls.len(), 3);
+        for call in calls {
+            assert_eq!(call.len(), 10);
+            assert_eq!(call[..3], args(&["api", "graphql", "-f"])[..]);
+            assert!(call[3].starts_with("query=query($owner: String!, $name: String!"));
+            assert!(call[3].contains("RENAMED_TITLE_EVENT"));
+            assert_eq!(
+                call[4..],
+                args(&[
+                    "-f",
+                    "owner=rawphp",
+                    "-f",
+                    "name=softfac",
+                    "-F",
+                    "number=10"
+                ])[..]
+            );
+        }
+    }
 
     // ----- End of part B tests -----
 }
