@@ -199,7 +199,8 @@ impl Terminals {
         Ok((snapshot, output.boxed()))
     }
 
-    /// The end of the terminal's kept scrollback and screen as plain text (see [`plain_tail`]):
+    /// The end of the terminal's kept scrollback and screen as plain text: the output as the
+    /// child wrote it, with escape sequences and control characters removed (see [`plain_tail`]),
     /// at most `max_bytes` bytes, cut on a character boundary. It answers for a terminal whose
     /// child has exited as for a running one, since the holder keeps both until the close; a
     /// holder that is gone is [`TerminalError::Gone`].
@@ -818,6 +819,10 @@ async fn follow(mut stream: UnixStream) -> Followed {
 
 /// Locks `mutex`, taking the value a panicked holder of the lock left: every value kept under
 /// these locks is whole between statements, and SQLite rolls back a transaction a panic cut.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Where [`plain_tail`] is in an escape sequence.
 #[derive(Clone, Copy)]
 enum Escape {
@@ -836,16 +841,15 @@ enum Escape {
 
 /// The terminal output `bytes` as plain text, then its last `max_bytes` bytes cut forward to a
 /// character boundary. Bytes that are not UTF-8 become U+FFFD. Escape sequences, NUL and every
-/// other control character but tab and newline are removed. A carriage return before more text
-/// on its line drops what the line held, as the text after it overwrites it on a screen.
+/// other control character but tab and newline are removed, carriage returns among them. Nothing
+/// is rendered: what a sequence or a carriage return would have moved or erased on a screen is
+/// kept, so a line redrawn in place gives each of its versions.
 ///
 /// A string sequence, such as a window title, also ends at a newline, so one left unterminated
 /// cannot hide the output after it.
 fn plain_tail(bytes: &[u8], max_bytes: usize) -> String {
     let text = String::from_utf8_lossy(bytes);
     let mut out = String::with_capacity(text.len());
-    let mut line_start = 0;
-    let mut returned = false;
     let mut state = Escape::None;
     for c in text.chars() {
         // A byte that cannot continue the sequence it is in ends that sequence and is read
@@ -862,22 +866,8 @@ fn plain_tail(bytes: &[u8], max_bytes: usize) -> String {
             (_, '\u{1b}') => Escape::Esc,
             (_, '\u{9b}') => Escape::Csi,
             (_, '\u{90}' | '\u{98}' | '\u{9d}' | '\u{9e}' | '\u{9f}') => Escape::Str,
-            (_, '\n') => {
-                out.push('\n');
-                line_start = out.len();
-                returned = false;
-                Escape::None
-            }
-            (_, '\r') => {
-                returned = true;
-                Escape::None
-            }
-            (_, c) if c.is_control() && c != '\t' => Escape::None,
+            (_, c) if c.is_control() && c != '\t' && c != '\n' => Escape::None,
             (_, c) => {
-                if returned {
-                    out.truncate(line_start);
-                    returned = false;
-                }
                 out.push(c);
                 Escape::None
             }
@@ -888,10 +878,6 @@ fn plain_tail(bytes: &[u8], max_bytes: usize) -> String {
         at += 1;
     }
     out.split_off(at)
-}
-
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 #[cfg(test)]
