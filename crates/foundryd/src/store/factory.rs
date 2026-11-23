@@ -117,13 +117,27 @@ impl Store {
     }
 
     /// Every run of `repo` (`owner/name`, in any case) that has an event, once each, in order.
+    /// A repo that is not a legal one has no runs.
     pub fn runs_of(&self, repo: &str) -> Result<Vec<RunId>, StoreError> {
-        let repo = repo.to_lowercase();
+        // Normalise as a run id does, so the argument folds exactly as stored repos did.
+        let Ok(probe) = RunId::new(repo, 0, 0) else {
+            return Ok(Vec::new());
+        };
+        let repo = probe.repo();
+        // A run event's id is `<run>/<owner>/<version>`, and a run id holds no `/`, so the run
+        // is the id up to its first `/`: no record is parsed. Every run of the repo starts with
+        // `<owner>__<name>__`, so the keys lie in [prefix, prefix with its last `_` raised to
+        // the next character, a backtick). The range is not exact (a repo name may hold `__`,
+        // so `a/b` also reaches the runs of `a/b__c`), so the repo of each run is still checked.
+        let prefix = probe.to_string();
+        let prefix = &prefix[..prefix.len() - "0__0".len()];
+        let from = prefix.to_owned();
+        let to = format!("{}`", &prefix[..prefix.len() - 1]);
         let mut query = self.conn.prepare_cached(
-            "SELECT DISTINCT json_extract(record, '$.body.run') FROM factory_records
-             WHERE kind = 'run_event'",
+            "SELECT DISTINCT substr(id, 1, instr(id, '/') - 1) FROM factory_records
+             WHERE kind = 'run_event' AND id >= ?1 AND id < ?2",
         )?;
-        let rows = query.query_map([], |row| row.get::<_, String>(0))?;
+        let rows = query.query_map(params![from, to], |row| row.get::<_, String>(0))?;
         let mut runs = BTreeSet::new();
         for text in rows {
             let text = text?;
