@@ -284,7 +284,8 @@ pub struct OpenPullRequest {
 
 /// How one required check stands on a commit: `Passed` when every run completed as `success`
 /// or `neutral`, `Failed` when one completed as anything else, `Pending` when a run has not
-/// completed, and `Missing` when no run of that name has a result.
+/// completed, and `Missing` when no run of that name has a result or a run was skipped and
+/// none failed or is pending.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CheckState {
     Passed,
@@ -1324,27 +1325,27 @@ fn read_history<G: Tracker + ?Sized>(
         )
         .chain(found.last_edited_at.as_deref());
     for at in times {
-        if !is_utc_second(at) {
-            return Err(parse_error(
-                &args,
-                &format!("a timestamp as YYYY-MM-DDTHH:MM:SSZ, got {}", quoted(at)),
-            ));
-        }
+        require_utc_second(&args, "a timestamp", at)?;
     }
     Ok(found)
 }
 
-/// `since` as the one call's argument check: only GitHub's `YYYY-MM-DDTHH:MM:SSZ`, before any
-/// call.
-fn require_utc_second(since: &str) -> Result<(), TrackerError> {
-    if is_utc_second(since) {
+/// `value`, which `name` names in the message, as a check that it is GitHub's
+/// `YYYY-MM-DDTHH:MM:SSZ`, else a parse error of the call with `args`.
+fn require_utc_second(args: &[String], name: &str, value: &str) -> Result<(), TrackerError> {
+    if is_utc_second(value) {
         Ok(())
     } else {
         Err(parse_error(
-            &["api".to_string(), "graphql".to_string()],
-            &format!("`since` as YYYY-MM-DDTHH:MM:SSZ, got {}", quoted(since)),
+            args,
+            &format!("{name} as YYYY-MM-DDTHH:MM:SSZ, got {}", quoted(value)),
         ))
     }
+}
+
+/// The arguments the GraphQL reads are named by in errors raised before any call.
+fn graphql_args() -> Vec<String> {
+    vec!["api".to_string(), "graphql".to_string()]
 }
 
 /// Whether an edit history can be trusted to show every edit up to the latest one: it is not
@@ -1715,7 +1716,7 @@ pub fn text_check<G: Tracker + ?Sized>(
     since: &str,
     instructors: &[String],
 ) -> Result<TextCheck, TrackerError> {
-    require_utc_second(since)?;
+    require_utc_second(&graphql_args(), "`since`", since)?;
     let found = read_history(gh, repo, issue)?;
     Ok(text_changes_since(
         &found,
@@ -1732,7 +1733,7 @@ pub fn text_edited_since<G: Tracker + ?Sized>(
     issue: u64,
     since: &str,
 ) -> Result<bool, TrackerError> {
-    require_utc_second(since)?;
+    require_utc_second(&graphql_args(), "`since`", since)?;
     Ok(edited_since(&read_history(gh, repo, issue)?, since))
 }
 
@@ -1746,12 +1747,11 @@ pub fn activity_since<G: Tracker + ?Sized>(
 ) -> Result<Activity, TrackerError> {
     let comments_path = format!("repos/{repo}/issues/{issue}/comments");
     let query = issue_query_args(repo, ACTIVITY_QUERY, issue)?;
-    if !is_utc_second(since) {
-        return Err(parse_error(
-            &["api".to_string(), comments_path],
-            &format!("`since` as YYYY-MM-DDTHH:MM:SSZ, got {}", quoted(since)),
-        ));
-    }
+    require_utc_second(
+        &["api".to_string(), comments_path.clone()],
+        "`since`",
+        since,
+    )?;
     let listed: Vec<ActivityRow> = gh_pages(
         gh,
         &[
@@ -1918,12 +1918,7 @@ pub fn pr_feedback<G: Tracker + ?Sized>(
     instructors: &[String],
 ) -> Result<Vec<Feedback>, TrackerError> {
     for (name, time) in [("since", since), ("floor", floor)] {
-        if !is_utc_second(time) {
-            return Err(parse_error(
-                &["api".to_string(), "graphql".to_string()],
-                &format!("`{name}` as YYYY-MM-DDTHH:MM:SSZ, got {}", quoted(time)),
-            ));
-        }
+        require_utc_second(&graphql_args(), &format!("`{name}`"), time)?;
     }
     let args = issue_query_args(repo, PR_FEEDBACK_QUERY, pr)?;
     let answer: FeedbackAnswer = gh_json(gh, &args, "a GraphQL response with the pull request")?;
@@ -1954,9 +1949,7 @@ pub fn pr_feedback<G: Tracker + ?Sized>(
         let Some(at) = review.submitted_at.clone() else {
             continue;
         };
-        if !is_utc_second(&at) {
-            return Err(unreadable("a review time as YYYY-MM-DDTHH:MM:SSZ", &at));
-        }
+        require_utc_second(&args, "a review time", &at)?;
         if at.as_str() <= since {
             continue;
         }
@@ -2061,12 +2054,7 @@ pub fn pr_feedback<G: Tracker + ?Sized>(
         {
             continue;
         }
-        if !is_utc_second(&comment.created_at) {
-            return Err(unreadable(
-                "a comment time as YYYY-MM-DDTHH:MM:SSZ",
-                &comment.created_at,
-            ));
-        }
+        require_utc_second(&args, "a comment time", &comment.created_at)?;
         if comment.created_at.as_str() <= since {
             continue;
         }
@@ -2111,12 +2099,7 @@ fn reviews_since<G: Tracker + ?Sized>(
     while total > reviews.len() as u64 {
         // The oldest review read is proven old only by a submission time at or before `floor`.
         if let Some(at) = reviews.first().and_then(|r| r.submitted_at.as_deref()) {
-            if !is_utc_second(at) {
-                return Err(parse_error(
-                    args,
-                    &format!("a review time as YYYY-MM-DDTHH:MM:SSZ, got {}", quoted(at)),
-                ));
-            }
+            require_utc_second(args, "a review time", at)?;
             if at <= floor {
                 break;
             }

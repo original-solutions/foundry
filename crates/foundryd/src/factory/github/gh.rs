@@ -86,8 +86,9 @@ impl Answer {
 }
 
 /// The command for error messages. Comment bodies (the value after `--body`, or a `body=` raw
-/// field) are shown as their size in bytes, and newlines are escaped, so one error stays one
-/// line.
+/// field) are shown as their size in bytes, and newlines in the other arguments are escaped, so
+/// the command part stays on one line. The stderr an error quotes after it is as `gh` printed
+/// it, as the runner does.
 pub fn command_text(args: &[String]) -> String {
     let mut shown = vec!["gh".to_string()];
     let mut after_body_flag = false;
