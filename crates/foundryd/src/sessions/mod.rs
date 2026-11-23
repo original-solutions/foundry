@@ -12,6 +12,10 @@
 //! A session's record is written whenever its state changes, under the session's own lock, so
 //! one session's writes never cross. The gateway key reaches the child's environment only: it
 //! is in no file and no log line, and [`Gateway`]'s `Debug` hides it.
+//!
+//! A daemon that starts again takes up the sessions the one before it left running
+//! ([`Sessions::adopt`]): the terminal holders outlive the daemon, so their sessions go on, and
+//! their hooks still post to the same port with the same token.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -24,7 +28,7 @@ use axum::Router;
 use axum::routing::post;
 use bytes::Bytes;
 use foundry_proto::ids::{MachineId, SessionId, TerminalId, WorkspaceId};
-use foundry_proto::record::{AnyRecord, Record, Session};
+use foundry_proto::record::{AnyRecord, Record, Session, Terminal};
 use foundry_proto::state::{SessionState, TerminalState};
 use futures::StreamExt as _;
 use tokio::sync::watch;
@@ -157,9 +161,12 @@ struct Inner {
     /// Tests: how many of the next reads of a terminal's exit fail.
     #[cfg(test)]
     fail_exit_reads: std::sync::atomic::AtomicUsize,
+    /// Tests: how many of the next reads of the sessions to adopt fail.
+    #[cfg(test)]
+    fail_adopt_reads: std::sync::atomic::AtomicUsize,
 }
 
-/// A session this daemon started.
+/// A session this daemon started, or took up from the daemon before it.
 struct Live {
     id: SessionId,
     /// What the session's hooks present as a bearer token.
@@ -202,6 +209,8 @@ impl Sessions {
                 fail_writes: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(test)]
                 fail_exit_reads: std::sync::atomic::AtomicUsize::new(0),
+                #[cfg(test)]
+                fail_adopt_reads: std::sync::atomic::AtomicUsize::new(0),
             }),
         }
     }
@@ -242,6 +251,21 @@ impl Sessions {
                 .await
         })
         .await?
+    }
+
+    /// Takes up this machine's sessions that a daemon before this one started and that have
+    /// not failed: call it once, after the terminals are reattached and before the hooks are
+    /// served. A finished session whose files are still there is among them, since its child
+    /// can still exit badly and its files go only with the child. A session whose terminal is gone or has exited is ended,
+    /// its record written as the exit makes it and its files removed; an end the store refuses
+    /// is written later, in a task of the session's own. Any other is followed again as
+    /// [`Sessions::start`] follows a new one, its curl config is written again with this
+    /// daemon's hook URL, and its hooks are taken with the token in that config. A session
+    /// whose curl config holds no token is still followed to its end, but its hooks stay
+    /// refused. A busy store is read again until it answers; any other failure to read it is
+    /// logged and nothing is taken up, so the daemon still starts.
+    pub async fn adopt(&self) {
+        self.inner.adopt().await;
     }
 
     /// `POST /hooks/{session}`, the endpoint a session's hooks post to.
@@ -292,14 +316,9 @@ impl Inner {
         prompt: Option<&str>,
     ) -> Result<SessionId, SessionError> {
         let id = SessionId::random();
-        let token = format!(
-            "{}{}",
-            uuid::Uuid::new_v4().simple(),
-            uuid::Uuid::new_v4().simple()
-        );
-        let settings = self.dir.join(format!("{id}.json"));
-        let curl = self.dir.join(format!("{id}.curl"));
-        let url = format!("http://127.0.0.1:{}/hooks/{id}", self.config.hook_port);
+        let token = new_token();
+        let (settings, curl) = self.files(id);
+        let url = self.hook_url(id);
         let written = {
             let (settings, curl, token) = (settings.clone(), curl.clone(), token.clone());
             blocking(move || {
@@ -369,14 +388,179 @@ impl Inner {
         }
         drop(body);
 
-        let first = FirstPrompt::new(prompt);
+        self.run(&live, terminal, floor, FirstPrompt::new(prompt));
+        tracing::info!(session = %id, workspace = %workspace, model, "session started");
+        Ok(id)
+    }
+
+    /// Starts following the live session's `terminal` from above `cursor`, and its stuck
+    /// timer.
+    fn run(
+        self: &Arc<Self>,
+        live: &Arc<Live>,
+        terminal: TerminalId,
+        cursor: u64,
+        first: FirstPrompt,
+    ) {
         let tasks = [
-            tokio::spawn(follow(self.clone(), live.clone(), terminal, floor, first)).abort_handle(),
+            tokio::spawn(follow(self.clone(), live.clone(), terminal, cursor, first))
+                .abort_handle(),
             tokio::spawn(watch_for_stuck(self.clone(), live.clone())).abort_handle(),
         ];
         lock(&live.tasks).extend(tasks);
-        tracing::info!(session = %id, workspace = %workspace, model, "session started");
-        Ok(id)
+    }
+
+    /// [`Sessions::adopt`]. A busy store is read again, each wait longer, until it answers: a
+    /// session left out would be refused and counted for the daemon's whole run. Any other
+    /// failure would fail the same way every time, and the daemon must still start.
+    async fn adopt(self: &Arc<Self>) {
+        let mut backoff = Backoff::new();
+        let (open, cursor) = loop {
+            match self.open_sessions().await {
+                Ok(found) => break found,
+                Err(SessionError::Store(error)) if is_busy(&error) => {
+                    if backoff.first_failure() {
+                        tracing::warn!(%error, "the sessions from before this daemon started were not read; trying again");
+                    }
+                    tokio::time::sleep(backoff.next_wait()).await;
+                }
+                Err(error) => {
+                    tracing::error!(%error, "the sessions from before this daemon started cannot be read, so none is taken up");
+                    return;
+                }
+            }
+        };
+        for (session, exit) in open {
+            match exit {
+                Some(code) => self.end(session, code).await,
+                None => self.take_up(session, cursor).await,
+            }
+        }
+    }
+
+    /// This machine's sessions that are not deleted, have not failed and, when finished, still
+    /// have a file, each with its terminal's exit code when the terminal is gone or has
+    /// exited, and this machine's newest version. One store call reads them all, so an exit
+    /// recorded after it is above that version, and a follower reading from there does not
+    /// miss it. Only session rows are read, and a terminal only for a session kept, so the
+    /// work grows with the sessions still open rather than with every session ever run. A
+    /// session whose terminal row cannot be read is left as it is, with a warning.
+    async fn open_sessions(&self) -> Result<OpenSessions, SessionError> {
+        #[cfg(test)]
+        if take_one(&self.fail_adopt_reads) {
+            return Err(busy().into());
+        }
+        let (me, dir) = (self.me, self.dir.clone());
+        self.on_store(move |store| {
+            let cursor = store.versions()?.get(&me).copied().unwrap_or(0);
+            let mut open = Vec::new();
+            for record in store.sessions_of(me)? {
+                let done = match record.body.state {
+                    SessionState::Failed => true,
+                    // Its exit was applied once its files are gone: `event` removes them then.
+                    SessionState::Finished => {
+                        let (settings, curl) = files(&dir, record.body.id);
+                        !settings.exists() && !curl.exists()
+                    }
+                    _ => false,
+                };
+                if done {
+                    continue;
+                }
+                let terminal = match store.terminal(record.body.terminal) {
+                    Ok(terminal) => terminal,
+                    Err(error) if is_busy(&error) => return Err(error),
+                    Err(error) => {
+                        tracing::warn!(session = %record.body.id, %error, "the session's terminal cannot be read, so the session is not taken up");
+                        continue;
+                    }
+                };
+                let exit = match terminal {
+                    Some(t) if !has_ended(&t) => None,
+                    terminal => Some(terminal.and_then(|t| t.body.exit_code)),
+                };
+                open.push((record.body, exit));
+            }
+            Ok((open, cursor))
+        })
+        .await
+    }
+
+    /// Ends `session`, whose terminal is gone or exited with `code`, as its follower would:
+    /// [`Inner::event`] writes the record and removes its files. A write the store does not
+    /// take is tried again in a task of the session's own until it holds.
+    async fn end(self: &Arc<Self>, session: Session, code: Option<i32>) {
+        // The child is gone, so no hook can come: nobody holds this token.
+        let live = self.adopted(session, new_token());
+        if self.event(&live, Event::Exited(code)).await.is_err() {
+            let task = tokio::spawn({
+                let (inner, live) = (self.clone(), live.clone());
+                async move { record_exit(&inner, &live, code).await }
+            });
+            lock(&live.tasks).push(task.abort_handle());
+        }
+    }
+
+    /// Follows `session`, which a daemon before this one started and whose terminal still
+    /// runs, from above `cursor`, and takes its hooks with the token in its curl config. The
+    /// config is written again with this daemon's hook URL, as [`Inner::start`] writes a new
+    /// one, so the hooks reach this daemon on whatever port it took.
+    async fn take_up(self: &Arc<Self>, session: Session, cursor: u64) {
+        let (id, terminal) = (session.id, session.terminal);
+        let (_, curl) = self.files(id);
+        let url = self.hook_url(id);
+        let token = blocking(move || {
+            let token = claude::curl_token(&curl)?;
+            Some((claude::rewrite_curl_config(&curl, &url, &token), token))
+        })
+        .await
+        .ok()
+        .flatten();
+        // No hook can present a token nobody has, so its hooks stay refused.
+        let token = match token {
+            Some((written, token)) => {
+                if let Err(error) = written {
+                    tracing::warn!(session = %id, %error, "the session's curl config was not written again, so its hooks may not reach this daemon");
+                }
+                token
+            }
+            None => {
+                tracing::warn!(session = %id, "the session's curl config holds no token, so its hooks are refused; it is followed to its end");
+                new_token()
+            }
+        };
+        let live = self.adopted(session, token);
+        self.run(&live, terminal, cursor, FirstPrompt::new(None));
+        tracing::info!(session = %id, "session taken up from the daemon before");
+    }
+
+    /// Makes `session`, from a daemon before this one, live again with `token`.
+    fn adopted(&self, session: Session, token: String) -> Arc<Live> {
+        let id = session.id;
+        let (settings, curl) = self.files(id);
+        let live = Arc::new(Live {
+            id,
+            token,
+            settings,
+            curl,
+            body: tokio::sync::Mutex::new(session),
+            activity: watch::Sender::new(Instant::now()),
+            started: watch::Sender::new(None),
+            brief: Mutex::default(),
+            tasks: Mutex::default(),
+        });
+        lock(&self.live).insert(id, live.clone());
+        live
+    }
+
+    /// The URL session `id`'s hooks post to.
+    fn hook_url(&self, id: SessionId) -> String {
+        format!("http://127.0.0.1:{}/hooks/{id}", self.config.hook_port)
+    }
+
+    /// The settings file and curl config of session `id`.
+    fn files(&self, id: SessionId) -> (PathBuf, PathBuf) {
+        files(&self.dir, id)
     }
 
     /// Starts the terminal, and gives it with the highest version this machine has written
@@ -521,7 +705,7 @@ impl Inner {
                     newest = newest.max(record.version());
                     if let AnyRecord::Terminal(r) = record
                         && r.body.id == terminal
-                        && (r.body.state == TerminalState::Exited || r.deleted)
+                        && has_ended(&r)
                     {
                         exit = Some(r.body.exit_code);
                     }
@@ -533,6 +717,10 @@ impl Inner {
         Ok(exit)
     }
 }
+
+/// This machine's sessions to adopt, each with its terminal's exit code when the terminal is
+/// gone, and this machine's newest version.
+type OpenSessions = (Vec<(Session, Option<Option<i32>>)>, u64);
 
 /// Follows the session's terminal: each chunk of output is an [`Event::Output`], and the end of
 /// the child is an [`Event::Exited`]. The first prompt is typed on the way, once it is ready.
@@ -729,8 +917,12 @@ async fn exited(inner: &Inner, live: &Arc<Live>, terminal: TerminalId, cursor: &
         };
         tokio::time::sleep(wait).await;
     };
-    // The end is not given up on: a session left running after its child is gone is wrong for
-    // good. It stops once the session is no longer live.
+    record_exit(inner, live, code).await;
+}
+
+/// Reports the child's exit with `code`. The end is not given up on: a session left running
+/// after its child is gone is wrong for good. It stops once the session is no longer live.
+async fn record_exit(inner: &Inner, live: &Arc<Live>, code: Option<i32>) {
     let mut backoff = Backoff::new();
     while let Err(error) = inner.event(live, Event::Exited(code)).await {
         if !inner.is_live(live) {
@@ -810,6 +1002,38 @@ fn busy() -> StoreError {
     ))
 }
 
+/// A new session's token: two random UUIDs, as hex.
+fn new_token() -> String {
+    format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
+/// Whether `terminal`'s child is gone: its record says it exited, or was deleted.
+fn has_ended(terminal: &Record<Terminal>) -> bool {
+    terminal.deleted || terminal.body.state == TerminalState::Exited
+}
+
+/// The settings file and curl config of session `id`, in the sessions folder `dir`.
+fn files(dir: &Path, id: SessionId) -> (PathBuf, PathBuf) {
+    (
+        dir.join(format!("{id}.json")),
+        dir.join(format!("{id}.curl")),
+    )
+}
+
+/// Whether `error` is the store being busy, which passes, rather than one that comes back on
+/// every read.
+fn is_busy(error: &StoreError) -> bool {
+    matches!(
+        error,
+        StoreError::Sqlite(rusqlite::Error::SqliteFailure(e, _))
+            if matches!(e.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    )
+}
+
 fn is_final(state: SessionState) -> bool {
     matches!(state, SessionState::Finished | SessionState::Failed)
 }
@@ -825,4 +1049,370 @@ async fn blocking<T: Send + 'static>(
 /// these locks is whole between statements.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// [`Sessions::adopt`] against a store that is busy for a while. The sessions are ones whose
+/// terminal has exited, so no holder is needed.
+#[cfg(test)]
+mod adopt_tests {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    use super::*;
+
+    /// Sessions of a new machine whose store holds one `Working` session, with its settings
+    /// file and curl config, whose terminal exited with code 0.
+    fn with_a_session_whose_terminal_exited() -> (tempfile::TempDir, Sessions, SessionId) {
+        with_a_session(Some((false, TerminalState::Exited, Some(0))))
+    }
+
+    /// [`with_a_session_whose_terminal_exited`], with the session's terminal record deleted or
+    /// not, in a state and with an exit code, or with no terminal record at all.
+    fn with_a_session(
+        terminal_record: Option<(bool, TerminalState, Option<i32>)>,
+    ) -> (tempfile::TempDir, Sessions, SessionId) {
+        with_a_session_record(terminal_record, WORKING)
+    }
+
+    /// The session's own record: its state, whether it is deleted, and whether a peer owns it
+    /// rather than this machine.
+    #[derive(Clone, Copy)]
+    struct Seed {
+        state: SessionState,
+        deleted: bool,
+        peer: bool,
+    }
+
+    const WORKING: Seed = Seed {
+        state: SessionState::Working,
+        deleted: false,
+        peer: false,
+    };
+
+    /// [`with_a_session`], with the session's record seeded as `seed` says.
+    fn with_a_session_record(
+        terminal_record: Option<(bool, TerminalState, Option<i32>)>,
+        seed: Seed,
+    ) -> (tempfile::TempDir, Sessions, SessionId) {
+        let data = tempfile::tempdir().unwrap();
+        let me = MachineId::random();
+        let owner = if seed.peer { MachineId::random() } else { me };
+        let mut store = Store::open(data.path().join("foundry.db")).unwrap();
+        let (workspace, terminal, id) = (
+            WorkspaceId::random(),
+            TerminalId::random(),
+            SessionId::random(),
+        );
+        let mut records = Vec::new();
+        if let Some((deleted, state, exit_code)) = terminal_record {
+            records.push(AnyRecord::Terminal(Record {
+                owner: me,
+                version: store.own_next_version().unwrap(),
+                deleted,
+                body: Terminal {
+                    id: terminal,
+                    workspace,
+                    state,
+                    exit_code,
+                },
+            }));
+        }
+        records.push(AnyRecord::Session(Record {
+            owner,
+            version: store.own_next_version().unwrap(),
+            deleted: seed.deleted,
+            body: Session {
+                id,
+                workspace,
+                terminal,
+                model: "test-model".into(),
+                state: seed.state,
+            },
+        }));
+        for record in &records {
+            store.apply(record, record.owner()).unwrap();
+        }
+        let store = Arc::new(Mutex::new(store));
+        let terminals = Arc::new(Terminals::new(
+            me,
+            store.clone(),
+            data.path(),
+            data.path().join("no-holder"),
+        ));
+        let config = Config {
+            claude: vec!["claude".into()],
+            claude_json: data.path().join(".claude.json"),
+            hook_port: 9,
+            gateway: Gateway {
+                base_url: String::new(),
+                key: String::new(),
+            },
+        };
+        let sessions = Sessions::new(me, store, terminals, data.path(), config);
+        let (settings, curl) = sessions.inner.files(id);
+        claude::write_curl_config(&curl, "http://127.0.0.1:9/hooks/x", "t0ken").unwrap();
+        claude::write_settings(&settings, &claude::settings_json(&curl)).unwrap();
+        (data, sessions, id)
+    }
+
+    fn state(sessions: &Sessions, id: SessionId) -> Option<SessionState> {
+        record(sessions, id).map(|r| r.body.state)
+    }
+
+    /// Session `id`'s record, from whichever machine owns it.
+    fn record(sessions: &Sessions, id: SessionId) -> Option<Record<Session>> {
+        let store = lock(&sessions.inner.store);
+        let owners = store.versions().unwrap().into_keys();
+        owners
+            .flat_map(|owner| store.since(owner, 0).unwrap())
+            .find_map(|record| match record {
+                AnyRecord::Session(r) if r.body.id == id => Some(r),
+                _ => None,
+            })
+    }
+
+    fn files_gone(sessions: &Sessions, id: SessionId) -> bool {
+        let (settings, curl) = sessions.inner.files(id);
+        !settings.exists() && !curl.exists()
+    }
+
+    #[tokio::test]
+    async fn a_session_whose_terminal_is_gone_is_ended_with_the_state_its_exit_gives() {
+        use TerminalState::{Exited, Running};
+        let cases = [
+            (Some((false, Exited, Some(0))), SessionState::Finished),
+            (Some((false, Exited, Some(3))), SessionState::Failed),
+            (Some((false, Exited, None)), SessionState::Failed),
+            (Some((true, Running, None)), SessionState::Failed),
+            (Some((true, Exited, Some(0))), SessionState::Finished),
+            (None, SessionState::Failed),
+        ];
+        for (terminal, wanted) in cases {
+            let (_data, sessions, id) = with_a_session(terminal);
+
+            sessions.adopt().await;
+
+            assert_eq!(state(&sessions, id), Some(wanted), "{terminal:?}");
+            assert!(files_gone(&sessions, id), "{terminal:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_deleted_session_is_left_alone() {
+        let exited = Some((false, TerminalState::Exited, Some(0)));
+        let deleted = Seed {
+            deleted: true,
+            ..WORKING
+        };
+        let (_data, sessions, id) = with_a_session_record(exited, deleted);
+
+        sessions.adopt().await;
+
+        assert_eq!(state(&sessions, id), Some(SessionState::Working));
+        let (settings, curl) = sessions.inner.files(id);
+        assert!(settings.exists() && curl.exists());
+        assert!(!lock(&sessions.inner.live).contains_key(&id));
+    }
+
+    #[tokio::test]
+    async fn a_gone_session_whose_end_cannot_be_written_is_ended_once_the_store_answers() {
+        let (_data, sessions, id) = with_a_session_whose_terminal_exited();
+        sessions.inner.fail_writes.store(3, SeqCst);
+
+        sessions.adopt().await;
+
+        let end = Instant::now() + Duration::from_secs(20);
+        while state(&sessions, id) != Some(SessionState::Finished) || !files_gone(&sessions, id) {
+            assert!(Instant::now() < end, "the session was not ended");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(sessions.inner.fail_writes.load(SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_store_that_cannot_be_read_at_first_is_read_again_before_adopt_returns() {
+        let (_data, sessions, id) = with_a_session_whose_terminal_exited();
+        sessions.inner.fail_adopt_reads.store(2, SeqCst);
+
+        sessions.adopt().await;
+
+        assert_eq!(state(&sessions, id), Some(SessionState::Finished));
+        assert!(files_gone(&sessions, id));
+        assert_eq!(sessions.inner.fail_adopt_reads.load(SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_finished_session_whose_terminal_is_gone_is_ended_with_the_state_its_exit_gives() {
+        let finished = Seed {
+            state: SessionState::Finished,
+            ..WORKING
+        };
+        for (code, wanted) in [
+            (Some(3), SessionState::Failed),
+            (Some(0), SessionState::Finished),
+        ] {
+            let exited = Some((false, TerminalState::Exited, code));
+            let (_data, sessions, id) = with_a_session_record(exited, finished);
+
+            sessions.adopt().await;
+
+            assert_eq!(state(&sessions, id), Some(wanted), "{code:?}");
+            assert!(files_gone(&sessions, id), "{code:?}");
+            assert!(!lock(&sessions.inner.live).contains_key(&id), "{code:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_session_is_left_alone() {
+        let exited = Some((false, TerminalState::Exited, Some(0)));
+        let failed = Seed {
+            state: SessionState::Failed,
+            ..WORKING
+        };
+        let (_data, sessions, id) = with_a_session_record(exited, failed);
+        let before = record(&sessions, id).unwrap();
+
+        sessions.adopt().await;
+
+        assert_eq!(record(&sessions, id), Some(before));
+        assert!(!lock(&sessions.inner.live).contains_key(&id));
+    }
+
+    #[tokio::test]
+    async fn another_machines_session_is_left_alone() {
+        let peer = Seed {
+            peer: true,
+            ..WORKING
+        };
+        let (_data, sessions, id) = with_a_session_record(None, peer);
+        let before = record(&sessions, id).unwrap();
+
+        sessions.adopt().await;
+
+        assert_eq!(record(&sessions, id), Some(before));
+        let (settings, curl) = sessions.inner.files(id);
+        assert!(settings.exists() && curl.exists());
+        assert!(!lock(&sessions.inner.live).contains_key(&id));
+    }
+
+    #[tokio::test]
+    async fn a_running_sessions_curl_config_is_written_again_with_this_daemons_hook_url() {
+        let running = Some((false, TerminalState::Running, None));
+        let (_data, sessions, id) = with_a_session(running);
+
+        sessions.adopt().await;
+
+        assert!(lock(&sessions.inner.live).contains_key(&id));
+        let (_, curl) = sessions.inner.files(id);
+        assert_eq!(claude::curl_token(&curl).as_deref(), Some("t0ken"));
+        let config = std::fs::read_to_string(&curl).unwrap();
+        let url = format!("url = \"http://127.0.0.1:9/hooks/{id}\"\n");
+        assert!(config.contains(&url), "{config}");
+    }
+
+    #[tokio::test]
+    async fn a_store_that_fails_other_than_busy_is_not_read_again_and_nothing_is_taken_up() {
+        let (data, sessions, id) = with_a_session_whose_terminal_exited();
+        rusqlite::Connection::open(data.path().join("foundry.db"))
+            .unwrap()
+            .execute_batch("DROP TABLE records")
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(10), sessions.adopt())
+            .await
+            .expect("adopt kept reading a store that cannot answer");
+
+        assert!(!lock(&sessions.inner.live).contains_key(&id));
+    }
+
+    #[tokio::test]
+    async fn a_finished_session_whose_child_still_runs_is_followed_and_fails_when_it_exits_badly() {
+        let running = Some((false, TerminalState::Running, None));
+        let finished = Seed {
+            state: SessionState::Finished,
+            ..WORKING
+        };
+        let (_data, sessions, id) = with_a_session_record(running, finished);
+
+        sessions.adopt().await;
+
+        assert!(lock(&sessions.inner.live).contains_key(&id));
+        let session = record(&sessions, id).unwrap().body;
+        {
+            let mut store = lock(&sessions.inner.store);
+            let exit = AnyRecord::Terminal(Record {
+                owner: sessions.inner.me,
+                version: store.own_next_version().unwrap(),
+                deleted: false,
+                body: Terminal {
+                    id: session.terminal,
+                    workspace: session.workspace,
+                    state: TerminalState::Exited,
+                    exit_code: Some(1),
+                },
+            });
+            store.apply(&exit, sessions.inner.me).unwrap();
+        }
+        let end = Instant::now() + Duration::from_secs(20);
+        while state(&sessions, id) != Some(SessionState::Failed) || !files_gone(&sessions, id) {
+            assert!(Instant::now() < end, "the session did not fail");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_finished_session_whose_files_are_gone_is_not_read_again() {
+        let running = Some((false, TerminalState::Running, None));
+        let finished = Seed {
+            state: SessionState::Finished,
+            ..WORKING
+        };
+        let (_data, sessions, id) = with_a_session_record(running, finished);
+        let (settings, curl) = sessions.inner.files(id);
+        std::fs::remove_file(settings).unwrap();
+        std::fs::remove_file(curl).unwrap();
+
+        sessions.adopt().await;
+
+        assert!(!lock(&sessions.inner.live).contains_key(&id));
+    }
+
+    #[tokio::test]
+    async fn a_session_whose_terminal_row_cannot_be_read_is_left_alone_and_the_rest_adopted() {
+        let (data, sessions, ended) = with_a_session_whose_terminal_exited();
+        let me = sessions.inner.me;
+        let unreadable = SessionId::random();
+        let terminal = TerminalId::random();
+        {
+            let mut store = lock(&sessions.inner.store);
+            let session = AnyRecord::Session(Record {
+                owner: me,
+                version: store.own_next_version().unwrap(),
+                deleted: false,
+                body: Session {
+                    id: unreadable,
+                    workspace: WorkspaceId::random(),
+                    terminal,
+                    model: "test-model".into(),
+                    state: SessionState::Working,
+                },
+            });
+            store.apply(&session, me).unwrap();
+        }
+        let db = rusqlite::Connection::open(data.path().join("foundry.db")).unwrap();
+        db.execute(
+            "INSERT INTO records (kind, id, owner, version, record) \
+             VALUES ('terminal', ?1, ?2, 1000, '{\"from\":\"a newer build\"}')",
+            rusqlite::params![terminal.to_string(), me.to_string()],
+        )
+        .unwrap();
+
+        sessions.adopt().await;
+
+        // The states are read with every record, which the unreadable row would stop.
+        db.execute("DELETE FROM records WHERE version = 1000", [])
+            .unwrap();
+        assert_eq!(state(&sessions, ended), Some(SessionState::Finished));
+        assert_eq!(state(&sessions, unreadable), Some(SessionState::Working));
+        assert!(!lock(&sessions.inner.live).contains_key(&unreadable));
+    }
 }
