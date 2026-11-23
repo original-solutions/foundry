@@ -17,14 +17,19 @@ use crate::ids::{MachineId, ProjectId, SessionId, WorkspaceId};
 /// One run: a repo, an issue in it, and which attempt at that issue this is. Shown and parsed
 /// as `<owner>__<repo>__<issue>__<attempt>`, the runner's run id, which names its run file.
 ///
-/// `repo` is lowercase `owner/name`, as [`RunId::new`] makes it. GitHub names are
-/// case-insensitive, and so are macOS file systems, so one repo must be one run id. An id built
-/// by hand that is not in that form cannot be written.
+/// [`RunId::repo`] is lowercase `owner/name`, as [`RunId::new`] makes it. GitHub names are
+/// case-insensitive, and so are macOS file systems, so one repo must be one run id. The fields
+/// are private, so [`RunId::new`] and parsing, which both check the repo, are the only ways to
+/// make one outside this module:
+///
+/// ```compile_fail,E0451
+/// let id = foundry_proto::factory::RunId { repo: "Rawphp/SoftFac".into(), issue: 8, attempt: 1 };
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RunId {
-    pub repo: String,
-    pub issue: u64,
-    pub attempt: u32,
+    repo: String,
+    issue: u64,
+    attempt: u32,
 }
 
 const SHAPE: &str = "expected <owner>__<repo>__<issue>__<attempt>";
@@ -41,8 +46,24 @@ impl RunId {
         })
     }
 
+    /// The repo, lowercase `owner/name`.
+    pub fn repo(&self) -> &str {
+        &self.repo
+    }
+
+    /// The issue number in the repo.
+    pub fn issue(&self) -> u64 {
+        self.issue
+    }
+
+    /// Which attempt at the issue this run is.
+    pub fn attempt(&self) -> u32 {
+        self.attempt
+    }
+
     /// True when the repo is already in the form [`RunId::new`] makes, so the id names one
-    /// file and cannot leave the directory it is written in.
+    /// file and cannot leave the directory it is written in. Only code in this module can build
+    /// one that is not.
     fn is_valid(&self) -> bool {
         normalise_repo(&self.repo).as_deref() == Some(self.repo.as_str())
     }
@@ -455,6 +476,10 @@ pub(crate) mod tests {
         assert_eq!(id.to_string(), "rawphp__softfac__8__1");
         assert_eq!(run("rawphp__softfac__8__1"), id);
         assert_eq!(new_run("rawphp/softfac", 8, 1), id);
+        assert_eq!(
+            (id.repo(), id.issue(), id.attempt()),
+            ("rawphp/softfac", 8, 1)
+        );
     }
 
     #[test]
@@ -512,7 +537,7 @@ pub(crate) mod tests {
             ("a_b_c/_x_", "a_b_c___x___8__1"),
         ] {
             let id = new_run(repo, 8, 1);
-            assert_eq!(id.repo, repo);
+            assert_eq!(id.repo(), repo);
             assert_eq!(id.to_string(), text);
             assert_eq!(run(text), id);
         }
@@ -560,7 +585,7 @@ pub(crate) mod tests {
             ("rawphp/softfac__8__1", "rawphp__softfac__8__1__8__1"),
         ] {
             let id = new_run(repo, 8, 1);
-            assert_eq!(id.repo, repo);
+            assert_eq!(id.repo(), repo);
             assert_eq!(id.to_string(), text, "{repo}");
             assert_eq!(run(text), id, "{repo}");
         }
@@ -571,7 +596,7 @@ pub(crate) mod tests {
         let mixed = new_run("Rawphp/SoftFac", 8, 1);
         let lower = new_run("rawphp/softfac", 8, 1);
         assert_eq!(mixed, lower);
-        assert_eq!(mixed.repo, "rawphp/softfac");
+        assert_eq!(mixed.repo(), "rawphp/softfac");
         assert_eq!(mixed.to_string(), "rawphp__softfac__8__1");
         assert_eq!(run("Rawphp__SoftFac__8__1"), lower);
         assert_eq!(
