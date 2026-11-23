@@ -33,7 +33,11 @@ pub(crate) fn decode<T: DeserializeOwned>(
     text: &str,
 ) -> Result<T, TrackerError> {
     serde_json::from_str(text).map_err(|error| {
-        let why = error.to_string().split_whitespace().collect::<Vec<_>>().join(" ");
+        let why = error
+            .to_string()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         parse_error(args, &format!("{expected} ({why})"))
     })
 }
@@ -582,8 +586,8 @@ mod tests {
         #[derive(Debug, serde::Deserialize)]
         struct Row {}
         let fake = FakeTracker::answering([Answer::ok(" \n")]);
-        let error = gh_pages::<Row, _>(&fake, &args(&["api", "x"]), "JSON arrays of rows")
-            .unwrap_err();
+        let error =
+            gh_pages::<Row, _>(&fake, &args(&["api", "x"]), "JSON arrays of rows").unwrap_err();
         assert_eq!(
             error.to_string(),
             "`gh api x` returned unexpected output: JSON arrays of rows (output was empty)"
@@ -611,7 +615,9 @@ mod tests {
     #[test]
     fn a_graphql_call_for_a_repo_that_is_not_owner_name_is_a_parse_error() {
         assert_eq!(
-            issue_query_args("softfac", "query", 6).unwrap_err().to_string(),
+            issue_query_args("softfac", "query", 6)
+                .unwrap_err()
+                .to_string(),
             "`gh api graphql` returned unexpected output: a repo written as owner/name, got `softfac`"
         );
         assert_eq!(

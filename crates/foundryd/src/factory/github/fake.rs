@@ -136,7 +136,9 @@ mod tests {
         let fake = FakeTracker::new();
         assert_eq!(
             fake.gh(&args(&["api", "user"])).unwrap_err(),
-            TrackerError::Other("cannot start `gh api user`: no answer scripted for `gh api user`".into())
+            TrackerError::Other(
+                "cannot start `gh api user`: no answer scripted for `gh api user`".into()
+            )
         );
     }
 

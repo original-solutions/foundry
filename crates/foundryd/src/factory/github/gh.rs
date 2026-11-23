@@ -273,9 +273,7 @@ impl Gh {
         let status = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break status,
-                Ok(None) if self.clock.now().saturating_sub(started) < LIMIT => {
-                    thread::sleep(POLL)
-                }
+                Ok(None) if self.clock.now().saturating_sub(started) < LIMIT => thread::sleep(POLL),
                 Ok(None) => {
                     kill_group(&mut child);
                     // The readers end when the group's last holder of the pipes is gone.
@@ -318,10 +316,7 @@ fn kill_group(child: &mut Child) {
 
 /// Reads `pipe` to its end on a thread of its own, keeping at most `limit` bytes, and says
 /// whether there was more.
-fn drain<R: Read + Send + 'static>(
-    pipe: Option<R>,
-    limit: usize,
-) -> JoinHandle<(Vec<u8>, bool)> {
+fn drain<R: Read + Send + 'static>(pipe: Option<R>, limit: usize) -> JoinHandle<(Vec<u8>, bool)> {
     thread::spawn(move || {
         let mut kept = Vec::new();
         let mut over = false;
@@ -378,8 +373,7 @@ mod tests {
     // The runner's "runs gh with the config dir, a 60 s limit and separate stderr on every
     // call": Foundry gives the token in the environment and a 30 s limit.
     #[test]
-    fn runs_gh_with_the_token_in_its_environment_a_30_s_limit_and_separate_stderr_on_every_call()
-    {
+    fn runs_gh_with_the_token_in_its_environment_a_30_s_limit_and_separate_stderr_on_every_call() {
         let dir = tempfile::tempdir().unwrap();
         let seen = dir.path().join("seen");
         let program = fake_gh(
@@ -427,7 +421,10 @@ mod tests {
         // A distinctive duration, so a stray is easy to tell from any other sleep.
         let program = fake_gh(
             dir.path(),
-            &format!("echo $$ > '{}'\nsleep 47.3191\necho late", pid_file.display()),
+            &format!(
+                "echo $$ > '{}'\nsleep 47.3191\necho late",
+                pid_file.display()
+            ),
         );
         let clock = Arc::new(FakeClock::new());
         let gh = gh_at(&program, clock.clone());
@@ -464,7 +461,11 @@ mod tests {
         );
 
         // The group went with it: the shell's pid answers no signal.
-        let pid: i32 = fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
+        let pid: i32 = fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
         let gone = Instant::now();
         while nix::sys::signal::kill(Pid::from_raw(pid), None).is_ok()
             && gone.elapsed() < Duration::from_secs(5)
@@ -498,7 +499,10 @@ mod tests {
 
         let exact = fake_gh(dir.path(), &format!("head -c {OUTPUT_LIMIT} /dev/zero"));
         let gh = gh_at(&exact, Arc::new(FakeClock::new()));
-        assert_eq!(gh.gh(&args(&["issue", "list"])).unwrap().len(), OUTPUT_LIMIT);
+        assert_eq!(
+            gh.gh(&args(&["issue", "list"])).unwrap().len(),
+            OUTPUT_LIMIT
+        );
     }
 
     #[test]
@@ -508,7 +512,10 @@ mod tests {
         let TrackerError::Other(message) = gh.gh(&args(&["api", "user"])).unwrap_err() else {
             panic!("not Other");
         };
-        assert!(message.starts_with("cannot start `gh api user`: "), "{message}");
+        assert!(
+            message.starts_with("cannot start `gh api user`: "),
+            "{message}"
+        );
     }
 
     #[test]
@@ -542,7 +549,10 @@ mod tests {
     #[test]
     fn neither_debug_nor_an_error_shows_the_token() {
         let dir = tempfile::tempdir().unwrap();
-        let program = fake_gh(dir.path(), "echo \"bad: $GH_TOKEN\" >/dev/null; echo nope >&2; exit 1");
+        let program = fake_gh(
+            dir.path(),
+            "echo \"bad: $GH_TOKEN\" >/dev/null; echo nope >&2; exit 1",
+        );
         let gh = gh_at(&program, Arc::new(FakeClock::new()));
         let shown = format!("{gh:?}");
         assert!(!shown.contains(TOKEN), "{shown}");
@@ -660,9 +670,7 @@ mod tests {
             );
             assert_eq!(
                 error.to_string(),
-                format!(
-                    "`gh issue list --repo rawphp/softfac` hit GitHub's rate limit: {stderr}"
-                )
+                format!("`gh issue list --repo rawphp/softfac` hit GitHub's rate limit: {stderr}")
             );
         }
         let other = finish(&call, Answer::fail(1, "HTTP 404: Not Found")).unwrap_err();
@@ -733,12 +741,22 @@ mod tests {
             "hello\nworld\n\n<!-- softfac -->",
         ]);
         assert_eq!(
-            finish(&call, Answer::fail(1, "boom")).unwrap_err().to_string(),
+            finish(&call, Answer::fail(1, "boom"))
+                .unwrap_err()
+                .to_string(),
             "`gh issue comment 6 --repo rawphp/softfac --body <29 bytes>` exited with status 1: boom"
         );
         // Counted in bytes, not characters: "héllo ✓" is 7 chars and 10 bytes, plus 18.
-        let utf8 = args(&["issue", "comment", "6", "--body", "héllo ✓\n\n<!-- softfac -->"]);
-        let shown = finish(&utf8, Answer::fail(1, "boom")).unwrap_err().to_string();
+        let utf8 = args(&[
+            "issue",
+            "comment",
+            "6",
+            "--body",
+            "héllo ✓\n\n<!-- softfac -->",
+        ]);
+        let shown = finish(&utf8, Answer::fail(1, "boom"))
+            .unwrap_err()
+            .to_string();
         assert!(shown.contains("--body <28 bytes>"), "{shown}");
         assert!(!shown.contains("llo"), "{shown}");
     }
@@ -753,7 +771,9 @@ mod tests {
             "-f",
             "body=private status\n\n<!-- softfac:status -->",
         ]);
-        let shown = finish(&call, Answer::fail(1, "gone")).unwrap_err().to_string();
+        let shown = finish(&call, Answer::fail(1, "gone"))
+            .unwrap_err()
+            .to_string();
         assert!(
             shown.contains("repos/rawphp/softfac/issues/comments/77 -f body=<39 bytes>"),
             "{shown}"
