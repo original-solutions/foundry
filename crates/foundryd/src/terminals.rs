@@ -199,6 +199,16 @@ impl Terminals {
         Ok((snapshot, output.boxed()))
     }
 
+    /// The end of the terminal's kept scrollback and screen as plain text: the output as the
+    /// child wrote it, with escape sequences and control characters removed (see [`plain_tail`]),
+    /// at most `max_bytes` bytes, cut on a character boundary. It answers for a terminal whose
+    /// child has exited as for a running one, since the holder keeps both until the close; a
+    /// holder that is gone is [`TerminalError::Gone`].
+    pub async fn tail(&self, id: TerminalId, max_bytes: usize) -> Result<String, TerminalError> {
+        let (snapshot, _) = self.attach(id).await?;
+        Ok(tokio::task::spawn_blocking(move || plain_tail(&snapshot.bytes, max_bytes)).await?)
+    }
+
     /// Bytes typed into the terminal. Input the holder refuses, because the child has left too
     /// much unread, is [`TerminalError::Refused`]; none of it reaches the child. Input to a
     /// child that has exited is dropped with no error, as typing into a finished terminal is.
@@ -811,6 +821,63 @@ async fn follow(mut stream: UnixStream) -> Followed {
 /// these locks is whole between statements, and SQLite rolls back a transaction a panic cut.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Where [`plain_tail`] is in an escape sequence.
+#[derive(Clone, Copy)]
+enum Escape {
+    /// In text.
+    None,
+    /// After `ESC`.
+    Esc,
+    /// After `ESC` and one or more intermediate bytes, until a final byte.
+    EscIntermediate,
+    /// In a control sequence (`ESC [` or C1 CSI), until a final byte.
+    Csi,
+    /// In a string (OSC, DCS, SOS, PM or APC), until BEL, ST or a newline. `ESC` in a string
+    /// starts a sequence, and `ESC \`, ST, is one.
+    Str,
+}
+
+/// The terminal output `bytes` as plain text, then its last `max_bytes` bytes cut forward to a
+/// character boundary. Bytes that are not UTF-8 become U+FFFD. Escape sequences, NUL and every
+/// other control character but tab and newline are removed, carriage returns among them. Nothing
+/// is rendered: what a sequence or a carriage return would have moved or erased on a screen is
+/// kept, so a line redrawn in place gives each of its versions.
+///
+/// A string sequence, such as a window title, also ends at a newline, so one left unterminated
+/// cannot hide the output after it.
+fn plain_tail(bytes: &[u8], max_bytes: usize) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let mut out = String::with_capacity(text.len());
+    let mut state = Escape::None;
+    for c in text.chars() {
+        // A byte that cannot continue the sequence it is in ends that sequence and is read
+        // again as text.
+        state = match (state, c) {
+            (Escape::Esc, '[') => Escape::Csi,
+            (Escape::Esc, ']' | 'P' | 'X' | '^' | '_') => Escape::Str,
+            (Escape::Esc | Escape::EscIntermediate, ' '..='/') => Escape::EscIntermediate,
+            (Escape::Esc | Escape::EscIntermediate, '0'..='~') => Escape::None,
+            (Escape::Csi, ' '..='?') => Escape::Csi,
+            (Escape::Csi, '@'..='~') => Escape::None,
+            (Escape::Str, '\u{7}' | '\u{9c}') => Escape::None,
+            (Escape::Str, c) if c != '\n' && c != '\u{1b}' => Escape::Str,
+            (_, '\u{1b}') => Escape::Esc,
+            (_, '\u{9b}') => Escape::Csi,
+            (_, '\u{90}' | '\u{98}' | '\u{9d}' | '\u{9e}' | '\u{9f}') => Escape::Str,
+            (_, c) if c.is_control() && c != '\t' && c != '\n' => Escape::None,
+            (_, c) => {
+                out.push(c);
+                Escape::None
+            }
+        };
+    }
+    let mut at = out.len().saturating_sub(max_bytes);
+    while !out.is_char_boundary(at) {
+        at += 1;
+    }
+    out.split_off(at)
 }
 
 #[cfg(test)]
@@ -2491,5 +2558,174 @@ mod tests {
             "{results:?}"
         );
         assert!(held(&store, setup.me, id).unwrap().deleted);
+    }
+
+    /// The terminal's tail once `done` holds for it.
+    async fn tail_until(
+        terminals: &Terminals,
+        id: TerminalId,
+        max_bytes: usize,
+        done: impl Fn(&str) -> bool,
+    ) -> String {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let tail = terminals.tail(id, max_bytes).await.unwrap();
+            if done(&tail) {
+                return tail;
+            }
+            assert!(Instant::now() < deadline, "timed out; tail: {tail:?}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn the_tail_of_coloured_output_has_no_escape_byte() {
+        let setup = Setup::new();
+        let (terminals, _store) = setup.daemon();
+        let id = setup
+            .start(
+                &terminals,
+                r"printf '\033[1;31mred\033[0m \033]0;title\007plain\000text\n'; sleep 60",
+            )
+            .await;
+        let tail = tail_until(&terminals, id, 64 * 1024, |tail| tail.contains("plaintext")).await;
+        assert!(tail.contains("red plaintext"), "{tail:?}");
+        assert!(!tail.contains('\u{1b}'), "an escape byte is left: {tail:?}");
+        assert!(!tail.contains('\0'), "a NUL byte is left: {tail:?}");
+        assert!(!tail.contains("title"), "a window title is left: {tail:?}");
+    }
+
+    #[tokio::test]
+    async fn two_megabytes_of_output_give_at_most_64_kb_ending_with_the_last_line() {
+        const MAX: usize = 64 * 1024;
+        let setup = Setup::new();
+        let (terminals, _store) = setup.daemon();
+        let line = "0123456789".repeat(10);
+        let id = setup
+            .start(
+                &terminals,
+                &format!("yes {line} | head -n 21000; echo the last line; sleep 60"),
+            )
+            .await;
+        let tail = tail_until(&terminals, id, MAX, |tail| {
+            tail.trim_end().ends_with("the last line")
+        })
+        .await;
+        assert!(tail.len() <= MAX, "{} bytes", tail.len());
+        assert!(
+            tail.len() > MAX - line.len() - 2,
+            "the tail is cut short: {} bytes",
+            tail.len()
+        );
+        assert!(!tail.contains('\r'), "a carriage return is left");
+    }
+
+    #[tokio::test]
+    async fn a_multi_byte_character_at_the_cut_is_not_split() {
+        let setup = Setup::new();
+        let (terminals, _store) = setup.daemon();
+        let id = setup.start(&terminals, "printf '€€€€\\n'; sleep 60").await;
+        tail_until(&terminals, id, 64, |tail| tail == "€€€€\n").await;
+        // "€€€€\n" is 13 bytes, a character starting at each of 0, 3, 6 and 9: the last 8 start
+        // inside the second, which is left out whole.
+        assert_eq!(terminals.tail(id, 8).await.unwrap(), "€€\n");
+        assert_eq!(terminals.tail(id, 9).await.unwrap(), "€€\n");
+        assert_eq!(terminals.tail(id, 10).await.unwrap(), "€€€\n");
+        assert_eq!(terminals.tail(id, 3).await.unwrap(), "\n");
+        assert_eq!(terminals.tail(id, 0).await.unwrap(), "");
+    }
+
+    #[tokio::test]
+    async fn an_exited_terminal_still_answers_with_its_tail() {
+        let setup = Setup::new();
+        let (terminals, store) = setup.daemon();
+        let id = setup
+            .start(&terminals, "echo first; echo final words; exit 4")
+            .await;
+        until("the record to say exited", || {
+            held(&store, setup.me, id).unwrap().body.state == TerminalState::Exited
+        })
+        .await;
+        assert_eq!(
+            terminals.tail(id, 1024).await.unwrap(),
+            "first\nfinal words\n"
+        );
+
+        // And after a restart of the daemon.
+        drop(terminals);
+        let (terminals, _store) = setup.daemon();
+        terminals.reattach_all().await.unwrap();
+        assert_eq!(
+            terminals.tail(id, 1024).await.unwrap(),
+            "first\nfinal words\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_tail_of_a_terminal_that_is_not_live_is_unknown() {
+        let setup = Setup::new();
+        let (terminals, _store) = setup.daemon();
+        let id = TerminalId::random();
+        assert!(matches!(
+            terminals.tail(id, 1024).await,
+            Err(TerminalError::Unknown(unknown)) if unknown == id
+        ));
+    }
+
+    #[test]
+    fn plain_tail_removes_every_kind_of_escape_sequence() {
+        let cases: &[(&[u8], &str)] = &[
+            (b"\x1b[1;31mred\x1b[0m", "red"),
+            (b"\x1b[?25lhidden cursor\x1b[?25h", "hidden cursor"),
+            (b"\x1b[2 qcursor shape", "cursor shape"),
+            (b"\x1b]0;title\x07text", "text"),
+            (b"\x1b]8;;https://x.test\x1b\\link\x1b]8;;\x1b\\", "link"),
+            (b"\x1bPq#0;2;0;0;0\x1b\\after dcs", "after dcs"),
+            (b"\x1b_kitty\x1b\\after apc", "after apc"),
+            (b"\x1b(Bcharset\x1b=keypad\x1b>", "charsetkeypad"),
+            ("\u{9b}31mc1 csi".as_bytes(), "c1 csi"),
+            ("\u{9d}0;title\u{9c}c1 osc".as_bytes(), "c1 osc"),
+            (b"n\0u\0l", "nul"),
+            (b"bell\x07 back\x08space", "bell backspace"),
+            (b"a\tb", "a\tb"),
+            (b"one\r\ntwo\r\n", "one\ntwo\n"),
+            (
+                b"progress 10%\rprogress 100%\r\ndone",
+                "progress 10%progress 100%\ndone",
+            ),
+            (
+                b"frame 1\n\x1b[2K\x1b[1A\x1b[2K\x1b[Gframe 2\n",
+                "frame 1\nframe 2\n",
+            ),
+            (b"\x1bXsos\x1b\\a", "a"),
+            (b"\x1b^pm\x07b", "b"),
+            ("\u{90}dcs\u{9c}c".as_bytes(), "c"),
+            ("\u{98}sos\u{9c}d".as_bytes(), "d"),
+            ("\u{9e}pm\u{9c}e".as_bytes(), "e"),
+            ("\u{9f}apc\u{9c}f".as_bytes(), "f"),
+            (b"\x1b[31", ""),
+            (b"\x1b]0;never ended\nnext line", "\nnext line"),
+            (b"\x1b[3\x1b[0mkept", "kept"),
+            (b"bad \xff byte", "bad \u{fffd} byte"),
+        ];
+        for (bytes, plain) in cases {
+            assert_eq!(
+                plain_tail(bytes, usize::MAX),
+                *plain,
+                "{:?}",
+                String::from_utf8_lossy(bytes)
+            );
+        }
+    }
+
+    #[test]
+    fn plain_tail_cuts_on_a_character_boundary_after_removing_escapes() {
+        assert_eq!(plain_tail("aé".as_bytes(), 2), "é");
+        assert_eq!(plain_tail("aé".as_bytes(), 1), "");
+        assert_eq!(plain_tail("a🙂".as_bytes(), 3), "");
+        assert_eq!(plain_tail("a🙂".as_bytes(), 4), "🙂");
+        assert_eq!(plain_tail(b"ab\x1b[31mcd", 3), "bcd");
+        assert_eq!(plain_tail(b"short", 64), "short");
+        assert_eq!(plain_tail(b"", 64), "");
     }
 }
