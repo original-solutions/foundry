@@ -161,10 +161,11 @@ fn push_commit(out: &mut String, segment: &str) {
 }
 
 /// The path, query and fragment of a `github.com` URL as a comment may show them. A commit id
-/// is kept whole only as the path segment after one of [`GITHUB_COMMIT_AFTER`] ([`push_commit`]),
-/// or as one side of a compare's `...` or `..`; a fragment only when the whole of it is a GitHub
-/// anchor ([`is_github_anchor`]). Everything else, the owner, the repo, branch and file names
-/// and the query included, goes through the word rule.
+/// is kept whole only as the path segment right after a segment named in
+/// [`GITHUB_COMMIT_AFTER`], wherever that falls in the path ([`push_commit`]), or as one side of
+/// a compare's `...` or `..`; a fragment only when the whole of it is a GitHub anchor
+/// ([`is_github_anchor`]). Every other word, the owner, the repo, branch and file names and the
+/// query included, goes through the word rule.
 fn push_github(out: &mut String, rest: &str) {
     let (path, rest) = rest.split_at(rest.find(['?', '#']).unwrap_or(rest.len()));
     let mut after = "";
@@ -229,7 +230,8 @@ fn push_url(out: &mut String, url: &str) {
 /// `-` and `_` that is at least 24 long and mixes letters and digits is hidden, as P1 hides
 /// them. Keys, tokens, commit ids and hashes look like that; words and paths do not. Inside an
 /// `http://` or `https://` URL the same holds, except that a `github.com` URL keeps a commit id
-/// where a link puts one ([`GITHUB_COMMIT_AFTER`]) and an anchor a review, comment or diff link
+/// in the path segment after one named in [`GITHUB_COMMIT_AFTER`], wherever it falls, and an
+/// anchor a review, comment or diff link
 /// ends in ([`is_github_anchor`]). So a pull request, commit, blob or review link comes through
 /// whole unless its owner, repo, branch or file name has a word of 24 or more mixed letters and
 /// digits, which is then hidden. A URL's userinfo is hidden as
