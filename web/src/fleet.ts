@@ -159,8 +159,8 @@ export function fleet(records: AnyRecord[], settings: SharedSettings, briefs: Br
         break;
       }
       case "workspace": {
-        if (r.owner === here && !machineNames.has(here)) otherSet.add(here);
         if (!r.deleted) {
+          if (r.owner === here && !machineNames.has(here)) otherSet.add(here);
           let list = workspacesByOwner.get(r.owner);
           if (!list) {
             list = [];
