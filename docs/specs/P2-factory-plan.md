@@ -160,7 +160,7 @@ Dependencies are in brackets. Tasks with no dependency between them can build at
 - **Spec:** `factory::lifecycle`, GitHub tokens (comments), F13.
 - **Files:** `crates/foundryd/src/factory/lifecycle/*`, `crates/foundryd/src/factory/text.rs`.
 - **Ports:** `src/domain/{lifecycle,approval,dependsOn,base,resultLine}.ts` with their tests, and `src/text.ts`.
-- **Produces:** `State` with the seven states and `label()`; `transition(state, event) -> Result<(State, Vec<Action>), InvalidTransition>`; `approval::refusal(...)`; `depends_on::blockers(body)`; `base::of(body)`; `result_line::read(message, repo) -> SessionResult::{Done { pr, url }, NeedsInfo { questions }, Stuck { reason, session_text }}`. `text::tail(text, max_chars)` cut on a character boundary. `text::for_comment(text)`: hides every word of 24 or more mixed letters and digits, inside a URL too; the only such word it keeps is a commit id or a comment, review or diff anchor in a `github.com` link, at the place GitHub's own links put one. `text::elapsed_ms(from_ms, to_ms) -> u64`, never negative.
+- **Produces:** `State` with the seven states and `label()`; `transition(state, event) -> Result<(State, Vec<Action>), InvalidTransition>`; `approval::Refusal` with `refusal_reason(&Refusal)` and `unapproved_comment(&Refusal)`; `depends_on::blockers(body)`; `base::of(body)`; `result_line::read(message, repo) -> SessionResult::{Done { pr, url }, NeedsInfo { questions }, Stuck { reason, session_text }}`. `text::tail(text, max_chars)` cut on a character boundary. `text::for_comment(text)`: hides every word of 24 or more mixed letters and digits, inside a URL too; the only such word it keeps is a commit id or a comment, review or diff anchor in a `github.com` link, at the place GitHub's own links put one. `text::elapsed_ms(from_ms, to_ms) -> u64`, never negative.
 - **Tests:** the runner's cases, same names. A `FACTORY-DONE` line that is not the last line is not a result (review focus 1). A pull request URL on another repo is `Stuck`. `for_comment` hides a 30-character key and keeps `https://github.com/o/r/pull/123` and a URL with a long path whole. `elapsed_ms` of a later `from` is 0 (review focus 5).
 
 ### 10. Repo config [1]
@@ -405,7 +405,7 @@ Dependencies are in brackets. Tasks with no dependency between them can build at
   - a feedback round on the machine that built the run
   - a pull request whose branch changes `provision` and `gate`: the default branch's commands ran, and the failure sent back says the configs differ
   - a gate terminal whose environment holds no token and whose `git` gets none from a helper set for the machine
-  - a token and a made-up 30-character key in gate output and in a session's questions: the token is in no comment, message or event; the key is hidden in the comment and whole in the event; a URL in the same comment is whole
+  - a token and a made-up 30-character key in gate output and in a session's questions: the token is in no comment, message or event; the key is hidden in the comment and whole in the event; a `github.com` pull request or commit link in the same comment is whole
 - **Tests:** those.
 
 ### 38. Fleet tests: coordinators and leases [37]
