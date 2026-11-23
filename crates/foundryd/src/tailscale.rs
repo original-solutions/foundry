@@ -420,7 +420,8 @@ mod tests {
 
         let why = ask_cli(&cli, Duration::from_secs(10)).await.unwrap_err();
 
-        assert!(why.contains("Tailscale is stopped."), "{why}");
+        assert!(matches!(why, AskError::Failed(_)), "{why:?}");
+        assert!(why.to_string().contains("Tailscale is stopped."), "{why}");
     }
 
     #[tokio::test]
@@ -430,7 +431,11 @@ mod tests {
 
         let why = ask_cli(&cli, Duration::from_secs(10)).await.unwrap_err();
 
-        assert!(why.contains(&cli.display().to_string()), "{why}");
+        assert!(matches!(why, AskError::Failed(_)), "{why:?}");
+        assert!(
+            why.to_string().contains(&cli.display().to_string()),
+            "{why}"
+        );
     }
 
     #[tokio::test]
@@ -440,7 +445,8 @@ mod tests {
 
         let why = ask_cli(&cli, Duration::from_secs(10)).await.unwrap_err();
 
-        assert!(why.contains("not an address"), "{why}");
+        assert!(matches!(why, AskError::Failed(_)), "{why:?}");
+        assert!(why.to_string().contains("not an address"), "{why}");
     }
 
     #[tokio::test]
@@ -451,6 +457,7 @@ mod tests {
 
         let why = ask_cli(&cli, Duration::from_millis(200)).await.unwrap_err();
 
-        assert!(why.contains("did not answer"), "{why}");
+        assert!(matches!(why, AskError::TimedOut(_)), "{why:?}");
+        assert!(why.to_string().contains("did not answer"), "{why}");
     }
 }

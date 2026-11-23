@@ -745,6 +745,7 @@ mod tests {
 
     use super::*;
     use crate::secrets::SecretsError;
+    use crate::tailscale::AskError;
     use crate::test_log::Logged;
 
     fn os(text: &str) -> Option<OsString> {
@@ -791,6 +792,18 @@ mod tests {
         let error = port_from(os("not-a-port")).unwrap_err();
         assert!(error.contains("FOUNDRY_PORT"), "{error}");
         assert!(error.contains("not-a-port"), "{error}");
+    }
+
+    /// An ask that failed for a definite reason.
+    fn failed(why: &str) -> Result<BTreeSet<IpAddr>, AskError> {
+        Err(AskError::Failed(why.to_owned()))
+    }
+
+    /// An ask that ran past its time.
+    fn timed_out() -> Result<BTreeSet<IpAddr>, AskError> {
+        Err(AskError::TimedOut(
+            "`tailscale ip` did not answer".to_owned(),
+        ))
     }
 
     fn ips<const N: usize>(texts: [&str; N]) -> BTreeSet<IpAddr> {
@@ -1083,11 +1096,87 @@ mod tests {
         let _capture = logged.capture();
         let mut tailscale = serving(addr("100.101.102.103:7433"));
 
-        tailscale.scan(false, Err("logged out".to_owned())).await;
-        tailscale.scan(false, Err("logged out".to_owned())).await;
+        tailscale.scan(false, failed("logged out")).await;
+        tailscale.scan(false, failed("logged out")).await;
 
         assert!(tailscale.served.is_empty());
         assert_eq!(logged.warnings().len(), 1, "{:?}", logged.warnings());
+        assert!(stopped(tailscale).await);
+    }
+
+    /// One ask that runs past its time says nothing about Tailscale: the addresses served stay,
+    /// Tailscale is not marked away and nothing is told it answered.
+    #[tokio::test]
+    async fn one_ask_that_times_out_keeps_the_servers_and_does_not_mark_tailscale_away() {
+        let logged = Logged::default();
+        let _capture = logged.capture();
+        let kept = addr("100.101.102.103:7433");
+        let mut tailscale = serving(kept);
+        let mut answered = tailscale.answered.subscribe();
+
+        tailscale.scan(false, timed_out()).await;
+
+        assert!(tailscale.served.contains_key(&kept));
+        assert!(!tailscale.away.load(Ordering::Relaxed));
+        assert!(!answered.has_changed().unwrap());
+        assert!(tailscale.servers.try_join_next().is_none(), "none aborted");
+        let warnings = logged.warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("stay"), "{warnings:?}");
+    }
+
+    /// Three in a row are a failed ask: every server stops and Tailscale is marked away, with
+    /// one warning at the first and one at the third.
+    #[tokio::test]
+    async fn three_asks_in_a_row_that_time_out_stop_every_server() {
+        let logged = Logged::default();
+        let _capture = logged.capture();
+        let mut tailscale = serving(addr("100.101.102.103:7433"));
+
+        tailscale.scan(false, timed_out()).await;
+        tailscale.scan(false, timed_out()).await;
+        assert!(!tailscale.served.is_empty());
+        assert!(!tailscale.away.load(Ordering::Relaxed));
+        tailscale.scan(false, timed_out()).await;
+
+        assert!(tailscale.served.is_empty());
+        assert!(tailscale.away.load(Ordering::Relaxed));
+        assert_eq!(logged.warnings().len(), 2, "{:?}", logged.warnings());
+        // A fourth changes nothing and says nothing.
+        tailscale.scan(false, timed_out()).await;
+        assert_eq!(logged.warnings().len(), 2, "{:?}", logged.warnings());
+        assert!(stopped(tailscale).await);
+    }
+
+    /// An answer sets the count of timeouts back to zero.
+    #[tokio::test]
+    async fn an_answer_between_timeouts_starts_the_count_again() {
+        let _capture = Logged::default().capture();
+        let kept = addr("100.101.102.103:7433");
+        let mut tailscale = serving(kept);
+
+        tailscale.scan(false, timed_out()).await;
+        tailscale.scan(false, timed_out()).await;
+        tailscale.scan(false, Ok(ips(["100.101.102.103"]))).await;
+        tailscale.scan(false, timed_out()).await;
+        tailscale.scan(false, timed_out()).await;
+
+        assert!(tailscale.served.contains_key(&kept));
+        assert!(!tailscale.away.load(Ordering::Relaxed));
+    }
+
+    /// A definite failure stops at once, after a timeout as before one, and starts the count
+    /// again.
+    #[tokio::test]
+    async fn a_definite_failure_after_a_timeout_stops_the_servers_at_once() {
+        let _capture = Logged::default().capture();
+        let mut tailscale = serving(addr("100.101.102.103:7433"));
+
+        tailscale.scan(false, timed_out()).await;
+        tailscale.scan(false, failed("logged out")).await;
+
+        assert!(tailscale.served.is_empty());
+        assert!(tailscale.away.load(Ordering::Relaxed));
         assert!(stopped(tailscale).await);
     }
 
@@ -1098,7 +1187,7 @@ mod tests {
         let logged = Logged::default();
         let _capture = logged.capture();
         let mut tailscale = Tailscale::new(7433, Router::new());
-        let cannot = || Err::<BTreeSet<IpAddr>, _>("Tailscale is stopped.".to_owned());
+        let cannot = || failed("Tailscale is stopped.");
 
         tailscale.scan(true, cannot()).await;
         tailscale.scan(false, cannot()).await;
@@ -1124,7 +1213,7 @@ mod tests {
         let mut tailscale = Tailscale::new(7433, Router::new());
         assert!(!tailscale.away.load(Ordering::Relaxed));
 
-        tailscale.scan(false, Err("logged out".to_owned())).await;
+        tailscale.scan(false, failed("logged out")).await;
         tailscale.scan(false, Ok(BTreeSet::new())).await;
 
         assert!(tailscale.away.swap(false, Ordering::Relaxed));
@@ -1172,7 +1261,7 @@ mod tests {
         listing.list(here()).await;
 
         tokio::time::sleep(crate::sync::OFFLINE_AFTER).await;
-        tailscale.scan(false, Err("logged out".to_owned())).await;
+        tailscale.scan(false, failed("logged out")).await;
         listing.list(here()).await;
         assert!(!listed(), "the look after Tailscale was away sends nothing");
 
@@ -1196,7 +1285,7 @@ mod tests {
             assert!(answered.has_changed().unwrap());
             assert_eq!(*answered.borrow_and_update(), ips);
         }
-        tailscale.scan(false, Err("logged out".to_owned())).await;
+        tailscale.scan(false, failed("logged out")).await;
         assert!(!answered.has_changed().unwrap());
     }
 
@@ -1266,9 +1355,9 @@ mod tests {
         let _capture = logged.capture();
         let mut tailscale = Tailscale::new(7433, Router::new());
 
-        tailscale.scan(false, Err("not running".to_owned())).await;
+        tailscale.scan(false, failed("not running")).await;
         tailscale.scan(false, Ok(BTreeSet::new())).await;
-        tailscale.scan(false, Err("logged out".to_owned())).await;
+        tailscale.scan(false, failed("logged out")).await;
 
         let warnings = logged.warnings();
         assert_eq!(warnings.len(), 2, "{warnings:?}");
