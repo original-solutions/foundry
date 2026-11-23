@@ -1056,6 +1056,66 @@ mod tests {
     }
 
     #[test]
+    fn an_overwritten_factory_setting_reads_plainly() {
+        use foundry_proto::settings::{FactorySettings, ProjectFactory};
+
+        let mut world = World::new();
+        let (me, peer) = (world.me, world.peer);
+        let project = Project {
+            id: ProjectId::random(),
+            name: "foundry".into(),
+            repo: "https://github.com/o/foundry.git".into(),
+        };
+        world.settings.projects.push(project.clone());
+        world.settings.overwritten.insert(
+            SettingKey::Factory,
+            Overwritten {
+                kept: Some(SettingValue::Factory(FactorySettings {
+                    paused: true,
+                    ..FactorySettings::default()
+                })),
+                lost: Some(SettingValue::Factory(FactorySettings::default())),
+                lost_stamp: Stamp { seq: 2, by: peer },
+            },
+        );
+        world.settings.overwritten.insert(
+            SettingKey::ProjectFactory(project.id),
+            Overwritten {
+                kept: Some(SettingValue::ProjectFactory(ProjectFactory {
+                    on: true,
+                    login: "rawphp".into(),
+                    paused: false,
+                })),
+                lost: None,
+                lost_stamp: Stamp { seq: 2, by: me },
+            },
+        );
+        let items = world.of(Kind::SettingOverwritten);
+        assert_eq!(items.len(), 2, "{items:?}");
+        let fleet = items.iter().find(|i| i.id.ends_with(":factory")).unwrap();
+        assert!(
+            fleet.what.contains(
+                "edited the factory settings: kept claims paused, 3 runs, 2 gates, a pass \
+                 every 30 s, feedback every 600 s, opus at high effort; replaced 3 runs, 2 \
+                 gates, a pass every 30 s, feedback every 600 s, opus at high effort"
+            ),
+            "{}",
+            fleet.what
+        );
+        let one = items
+            .iter()
+            .find(|i| i.id.ends_with(&format!("factory:{}", project.id)))
+            .unwrap();
+        assert!(
+            one.what.contains(
+                "edited the factory of the project foundry: kept on as rawphp; replaced removed"
+            ),
+            "{}",
+            one.what
+        );
+    }
+
+    #[test]
     fn a_dismissed_setting_clears_setting_overwritten() {
         let mut world = World::new();
         let (key, _) = overwrite_project(&mut world);

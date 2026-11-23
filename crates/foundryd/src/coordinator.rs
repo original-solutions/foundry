@@ -1429,6 +1429,50 @@ mod tests {
         ab
     }
 
+    #[test]
+    fn a_factory_edit_is_numbered_and_held_like_any_setting() {
+        use foundry_proto::settings::{FactorySettings, ProjectFactory};
+
+        let fleet = FactorySettings {
+            max_runs: 5,
+            ..FactorySettings::default()
+        };
+        let one = ProjectFactory {
+            on: true,
+            login: "rawphp".into(),
+            paused: false,
+        };
+        let project = ProjectId(uuid::Uuid::from_u128(7));
+        let held = numbered(
+            &base(),
+            &Edit::SetFactory {
+                settings: fleet.clone(),
+            },
+            id(A),
+        );
+        let held = numbered(
+            &held,
+            &Edit::SetProjectFactory {
+                project,
+                factory: one.clone(),
+            },
+            id(A),
+        );
+        assert_eq!(held.factory, Some(fleet));
+        assert_eq!(held.project_factory.get(&project), Some(&one));
+        assert_eq!(
+            held.stamps[&StampKey::Setting(SettingKey::Factory)],
+            Stamp { seq: 2, by: id(A) }
+        );
+        assert_eq!(
+            held.stamps[&StampKey::Setting(SettingKey::ProjectFactory(project))],
+            Stamp { seq: 3, by: id(A) }
+        );
+        // Each is a setting of its own: the other settings are as they were.
+        assert_eq!(held.machines, base().machines);
+        assert_eq!(held.priority, base().priority);
+    }
+
     // --- what a waiting edit does next ---
 
     const EARLY: Duration = Duration::from_secs(1);
