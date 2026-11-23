@@ -26,7 +26,7 @@ Paths in this plan that start with `src/` are in that checkout. Clone it outside
 - Nothing orders records by wall-clock time. Run events order by lease generation, then the writer's factory version.
 - Every age and wait the factory measures uses the sleep-counting clock of task 3, never `Instant` or `tokio::time`. Tests move a fake clock.
 - A token reaches a child process only through its environment. It is never an argument, a log line, an error, a record or an API response.
-- Text that leaves a machine's memory for a comment, a message to a session or an event first goes through `secrets::hide_known`. A comment also goes through `text::for_comment`.
+- Text that leaves a machine's memory for a comment, a message to a session or an event first goes through `secrets::hide_known`. A comment also goes through `text::for_comment`, and the factory's own markers are added after it.
 - Every `gh` call and every lease push ends within 30 seconds or counts as failed.
 - The lease age is checked before every change the factory makes on GitHub or asks of a worker.
 - No step of a pass waits on a worker. It records, returns, and looks again next pass.
@@ -192,7 +192,7 @@ Dependencies are in brackets. Tasks with no dependency between them can build at
 - **Spec:** A run (claim), F13, Two factories at once.
 - **Files:** `crates/foundryd/src/factory/github/write.rs`, `crates/foundryd/src/factory/github/mod.rs`, `crates/foundryd/src/factory/github/fake.rs`.
 - **Ports:** the writing half of `src/tracker/github.ts` with its tests.
-- **Produces:** on `Tracker`: swap a state label, assign and unassign, post and update comments, mark a pull request ready or draft, ensure the labels exist. `claim_comment(run, machine)` with `<!-- foundry:claim <run id> <machine> -->` as its last line, and `newest_claim(comments, login) -> Option<Claim::{Foundry { run, machine }, Foreign { comment_id }}>`. The status comment keeps the runner's `<!-- softfac:status -->` marker and format. Every comment body goes through the hider the tracker was built with (`secrets::hide_known`) and then `text::for_comment`.
+- **Produces:** on `Tracker`: swap a state label, assign and unassign, post and update comments, mark a pull request ready or draft, ensure the labels exist. `claim_comment(run, machine)` with `<!-- foundry:claim <run id> <machine> -->` as its last line, and `newest_claim(comments, login) -> Option<Claim::{Foundry { run, machine }, Foreign { comment_id }}>`. The status comment keeps the runner's `<!-- softfac:status -->` marker and format. Every comment body goes through the hider the tracker was built with (`secrets::hide_known`) and then `text::for_comment`; the factory's own markers (the claim line, `<!-- softfac:status -->`) are added after that, since `for_comment` would hide the run id and the machine in the claim line.
 - **Tests:** the runner's write cases. A comment with Foundry's marker written by another login is not Foundry's claim (review focus 1). The runner's `<!-- softfac:claim … -->` comment is `Foreign`. Of two claim comments the newest counts.
 
 ### 14. Workspaces: checkouts, setup kinds and folders by id [8]
