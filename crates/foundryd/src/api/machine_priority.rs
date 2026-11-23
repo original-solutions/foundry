@@ -14,11 +14,13 @@ use std::sync::{Arc, Mutex};
 use axum::Router;
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::routing::post;
+use foundry_proto::ids::MachineId;
+use foundry_proto::settings::Edit;
 use serde::Deserialize;
 
-use super::{ApiError, Body};
+use super::{ApiError, Body, edit_status, on_store, unprocessable};
 use crate::coordinator::Coordinator;
 use crate::store::Store;
 
@@ -42,13 +44,29 @@ struct Wanted {
 }
 
 async fn set(
-    State(_held): State<Arc<Held>>,
-    Body(_wanted): Body<Wanted>,
+    State(held): State<Arc<Held>>,
+    Body(wanted): Body<Wanted>,
 ) -> Result<Response, ApiError> {
-    Err(ApiError::Rejected(
-        StatusCode::NOT_IMPLEMENTED,
-        "not built".to_owned(),
-    ))
+    let listed = on_store(&held.store, |store| store.settings())
+        .await?
+        .machines;
+    let mut order: Vec<MachineId> = Vec::with_capacity(wanted.order.len());
+    for text in &wanted.order {
+        let id = text
+            .parse::<uuid::Uuid>()
+            .map(MachineId)
+            .ok()
+            .filter(|id| listed.iter().any(|m| m.id == *id))
+            .ok_or_else(|| unprocessable(format!("no machine {text:?} in the machine list")))?;
+        if order.contains(&id) {
+            return Err(unprocessable(format!("{id} is in the order twice")));
+        }
+        order.push(id);
+    }
+    match held.coordinator.edit(Edit::Priority { order }).await {
+        Ok(_) => Ok(StatusCode::NO_CONTENT.into_response()),
+        Err(e) => Err(ApiError::Rejected(edit_status(&e), e.to_string())),
+    }
 }
 
 #[cfg(test)]
@@ -187,7 +205,7 @@ mod tests {
         let before = served.settings();
         let stranger = MachineId::random().to_string();
 
-        let (status, body) = served.post(&order(&[stranger.clone()])).await;
+        let (status, body) = served.post(&order(std::slice::from_ref(&stranger))).await;
 
         assert_eq!(status, 422, "{body}");
         let json: Value = serde_json::from_str(&body).unwrap();
