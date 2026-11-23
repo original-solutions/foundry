@@ -197,6 +197,45 @@ async fn stopping_the_coordinator_moves_the_role_in_time_while_a_session_elsewhe
     reader.abort();
 }
 
+/// The priority route, served from a machine that does not act, sets B first, and every
+/// machine names B as acting within the spec's 15 seconds.
+#[tokio::test]
+async fn setting_b_first_from_the_priority_route_moves_the_role_to_b_in_time() {
+    let fleet = Fleet::start_coordinated(3);
+    let b = fleet.daemons[1].id;
+    settled(&fleet, fleet.daemons[0].id).await;
+
+    // Daemon 2 does not act, so the edit is forwarded.
+    let daemon = &fleet.daemons[2];
+    let app = foundryd::api::machine_priority::router(daemon.coordinator(), daemon.store.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let url = format!("http://{addr}/api/machines/priority");
+    let body = serde_json::json!({ "order": [b.to_string()] });
+    let sent = Instant::now();
+    let (status, answer) = tokio::task::spawn_blocking(move || {
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .timeout_global(Some(WAIT))
+            .build()
+            .into();
+        let mut response = agent.post(&url).send_json(body).unwrap();
+        let status = response.status().as_u16();
+        (status, response.body_mut().read_to_string().unwrap())
+    })
+    .await
+    .unwrap();
+    assert_eq!(status, 204, "{answer}");
+
+    for daemon in &fleet.daemons {
+        let left = ROLE_MOVES_WITHIN.saturating_sub(sent.elapsed());
+        acting_becomes(&daemon.coordinator(), b, left).await;
+    }
+    server.abort();
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_returning_higher_priority_machine_takes_the_role_back() {
     let fleet = Fleet::start_coordinated(3);

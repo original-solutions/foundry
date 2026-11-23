@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { AnyRecord, UiMessage } from "./api";
-import { apply, byUrgency, emptyState, fleet, locate, machineNumbers, machineStats, rows, terminalRunning } from "./fleet";
+import { apply, byUrgency, coordinatorOrder, emptyState, fleet, locate, machineNumbers, machineStats, rows, terminalRunning } from "./fleet";
 import type { Glyph } from "./labels";
 import { ME, OTHER, sample, session, settings, terminal, workspace } from "./test-fixtures";
 
@@ -472,3 +472,49 @@ describe("briefs", () => {
     expect(rows(machine.workspaces[0]).every((r) => r.title === undefined && r.now === undefined)).toBe(true);
   });
 });
+
+describe("the coordinator order", () => {
+  const A = "00000000-0000-4000-8000-00000000000a";
+  const B = "00000000-0000-4000-8000-00000000000b";
+  const C = "00000000-0000-4000-8000-00000000000c";
+  const named = (...ids: string[]) => ids.map((id) => ({ id, name: `m-${id.slice(-1)}`, address: "" }));
+  const view = (machines: string[], priority: string[], online?: string[]) =>
+    fleet([], settings({ machines: named(...machines), priority }), {}, online);
+  const rank = (views: ReturnType<typeof view>) => Object.fromEntries(views.map((m) => [m.id.slice(-1), m.rank]));
+
+  it("orders the listed machines by the priority, then the rest by id, and ranks no unlisted machine", () => {
+    expect(coordinatorOrder([C], [A, B, C])).toEqual([C, A, B]);
+    expect(coordinatorOrder([], [B, A])).toEqual([A, B]);
+    // An id the machine list does not hold is skipped, and an id listed twice counts once.
+    expect(coordinatorOrder(["gone", B, B], [A, B, C])).toEqual([B, A, C]);
+  });
+
+  it("gives each listed machine its place, with a partial priority and an unlisted id in it", () => {
+    expect(rank(view([A, B, C], [C, "gone", B]))).toEqual({ a: 2, b: 1, c: 0 });
+    const unlisted = fleet([sampleOf("stranger")], settings({ machines: named(A), priority: [A] }));
+    expect(unlisted.find((m) => m.id === "stranger")?.rank).toBeUndefined();
+  });
+
+  it("marks the first machine of the priority that is online as acting", () => {
+    const views = view([A, B, C], [A, B, C], [B, C]);
+    expect(views.filter((m) => m.acting).map((m) => m.id)).toEqual([B]);
+  });
+
+  it("marks the lowest online id when the priority names none that is online", () => {
+    expect(view([A, B, C], [], [C, B]).find((m) => m.acting)?.id).toBe(B);
+    expect(view([A, B, C], [A], [C, B]).find((m) => m.acting)?.id).toBe(B);
+  });
+
+  it("marks the first of the priority when nothing is online, and nothing when it is empty too", () => {
+    expect(view([A, B], [B, A], []).find((m) => m.acting)?.id).toBe(B);
+    expect(view([A, B], [], []).some((m) => m.acting)).toBe(false);
+  });
+
+  it("marks no machine when the state did not say which are online", () => {
+    expect(view([A, B], [A, B]).some((m) => m.acting)).toBe(false);
+  });
+});
+
+function sampleOf(owner: string): AnyRecord {
+  return sample(owner, 1);
+}

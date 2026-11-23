@@ -88,9 +88,29 @@ export interface MachineView {
   address?: string;
   /** The limits the settings hold for it, if any. */
   limits?: Limits;
+  /** Its place (from 0) in the coordinator order, for a listed machine only. */
+  rank?: number;
+  /** Whether it holds the coordinator role; only marked when the state said which machines are online. */
+  acting?: boolean;
   status: "online" | "offline" | "unknown";
   sample: MachineSample | null;
   workspaces: WorkspaceView[];
+}
+
+/**
+ * The listed machines in the order they take the coordinator role: the ids of `priority` that
+ * `listed` holds, each once, then the other listed machines by id.
+ */
+export function coordinatorOrder(priority: string[], listed: string[]): string[] {
+  const held = new Set(listed);
+  const first = priority.filter((id, i) => held.has(id) && priority.indexOf(id) === i);
+  const rest = listed.filter((id) => !first.includes(id)).sort();
+  return [...first, ...rest];
+}
+
+/** The machine that holds the coordinator role, as `coordinator::acting` picks it. */
+function actingMachine(priority: string[], online: string[]): string | undefined {
+  return priority.find((id) => online.includes(id)) ?? [...online].sort()[0] ?? priority[0];
 }
 
 /**
@@ -206,12 +226,16 @@ export function fleet(records: AnyRecord[], settings: SharedSettings, briefs: Br
     [...list].sort((a, b) => (opened.get(terminal(a)) ?? Infinity) - (opened.get(terminal(b)) ?? Infinity));
 
   const others = [...otherSet].sort();
+  const ranks = new Map(coordinatorOrder(settings.priority, listed).map((id, i) => [id, i]));
+  const acting = online ? actingMachine(settings.priority, online) : undefined;
   return [...listed, ...others].map((id) => ({
     id,
     name: machineNames.get(id) ?? shortId(id),
     listed: machineNames.has(id),
     address: machineAddresses.get(id),
     limits: settings.limits[id],
+    rank: ranks.get(id),
+    acting: acting === undefined ? undefined : id === acting,
     status: online ? (online.includes(id) ? "online" : "offline") : (statusByOwner.get(id) ?? "unknown"),
     sample: samplesByOwner.get(id)?.body ?? null,
     workspaces: (settings.machines.length > 0 && !machineNames.has(id) && id !== here ? [] : (workspacesByOwner.get(id) ?? [])).map((w) => {
