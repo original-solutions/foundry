@@ -1,9 +1,16 @@
 //! Every message the factory sends, as a line and a body.
 //!
 //! Ported from the runner's `src/runner/messages.ts`; the wording is the contract with the people
-//! who read the issues and with the `factory-build` skill, so it is copied as is. Where the
-//! runner names Paradev, T3 or this Mac, Foundry names itself, and the runner's host and cloud
-//! launches, which Foundry does not have, are left out.
+//! who read the issues and with the `factory-build` skill, so it is copied as is, except:
+//!
+//! - Where the runner names Paradev, T3 or this Mac, Foundry names itself.
+//! - The runner's host and cloud launches, which Foundry does not have, are left out.
+//! - A branch or base name in a comment's own sentence is one line of at most 200 characters,
+//!   shown as code, where the runner showed it as it came.
+//! - Output quoted in a comment keeps its last 20,000 characters, where the runner kept 6,000.
+//! - A failed check's name, result and link are cut at 200 characters, and ten checks are
+//!   listed, the rest counted.
+//! - A body that would pass 64 KB has its untrusted part cut first, so its fixed words arrive.
 //!
 //! A message to a session is a short line typed into its terminal and a body the worker writes
 //! to a file the line names (F12): a launch, a resume and a feedback round load the skill with
@@ -165,8 +172,9 @@ pub fn questions(prepared: &str) -> String {
     )
 }
 
-/// Where a stopped session's work is: the branch, already through [`prepare_session_text`], and
-/// how far it is ahead of `base` when that is known.
+/// Where a stopped session's work is: the branch, and how far it is ahead of `base` when that is
+/// known. Both are raw names, as git or the session gives them: the comment cleans, cuts and
+/// escapes them itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkLeft {
     pub branch: String,
@@ -208,8 +216,8 @@ fn code_span(text: &str) -> String {
 /// Says where the work is. A new attempt starts from the base branch, so this does not promise
 /// that it continues from there.
 fn work_left_sentence(work: &WorkLeft) -> String {
-    let branch = name_in_prose(&work.branch);
-    let base = name_in_prose(&work.base);
+    let branch = code_span(&name_in_prose(&work.branch));
+    let base = code_span(&name_in_prose(&work.base));
     match work.commits_ahead {
         None => format!("The work so far is on branch {branch}."),
         Some(1) => format!("The work so far is on branch {branch} (1 commit ahead of {base})."),
@@ -912,6 +920,23 @@ pub const REFUSED_BODY_EDIT: &str = "The factory did not send the edited issue b
 pub const CHECKS_HEAD_MOVED: &str =
     "the pull request's head changed while the factory waited for the required checks";
 
+/// The most failed checks a message lists.
+const MAX_LISTED_CHECKS: usize = 10;
+
+/// The longest name, result or link of a failed check a message shows, in characters.
+const MAX_CHECK_CHARS: usize = 200;
+
+/// A check's name, result or link as one line of at most [`MAX_CHECK_CHARS`] characters.
+fn check_field(text: &str) -> String {
+    let line = sanitize(text, false);
+    let shown = head_chars(&line, MAX_CHECK_CHARS);
+    if shown.len() < line.len() {
+        format!("{shown}\u{2026}")
+    } else {
+        line
+    }
+}
+
 /// A required check that did not pass. `conclusion` is empty when GitHub gave none.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FailedCheck {
@@ -922,20 +947,27 @@ pub struct FailedCheck {
 
 /// What to tell the session when required checks failed on the commit that was gated. The
 /// check names come from the project config and the rest from GitHub, so all of it is cleaned
-/// like other untrusted text. A check with no result or link has no line for it.
+/// like other untrusted text, and each is cut at 200 characters. At most ten checks are listed,
+/// the rest counted. A check with no result or link has no line for it.
 pub fn checks_failure_text(sha: &str, failed: &[FailedCheck]) -> String {
     let mut text = format!(
         "The factory gate failed. A required check did not pass on commit {}. Fix the cause, commit, push, and reply when done. Do not weaken or skip the check.",
         short_sha(sha)
     );
-    for check in failed {
-        text.push_str(&format!("\n\nCheck: {}", sanitize(&check.name, false)));
+    for check in failed.iter().take(MAX_LISTED_CHECKS) {
+        text.push_str(&format!("\n\nCheck: {}", check_field(&check.name)));
         if !check.conclusion.is_empty() {
-            text.push_str(&format!("\nResult: {}", sanitize(&check.conclusion, false)));
+            text.push_str(&format!("\nResult: {}", check_field(&check.conclusion)));
         }
         if let Some(url) = &check.url {
-            text.push_str(&format!("\nDetails: {}", sanitize(url, false)));
+            text.push_str(&format!("\nDetails: {}", check_field(url)));
         }
+    }
+    if failed.len() > MAX_LISTED_CHECKS {
+        text.push_str(&format!(
+            "\n\nand {} more",
+            failed.len() - MAX_LISTED_CHECKS
+        ));
     }
     text
 }
