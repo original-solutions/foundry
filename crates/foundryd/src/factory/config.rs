@@ -528,6 +528,7 @@ factory:
                         .limits
                         .checks_minutes
                 };
+                assert_eq!(project(PROJECT).limits.checks_minutes, 30);
                 assert_eq!(at("45"), 45);
                 assert_eq!(at("1"), 1);
             }
@@ -541,6 +542,7 @@ factory:
             }
         }
 
+        // The runner's test names are kept; the owner value is read only as `owner_set` (spec F9: the owner is ignored).
         mod the_owner {
             use super::*;
 
@@ -561,16 +563,14 @@ factory:
 
             #[test]
             fn project_owner_parses_sets_owner_set_and_changes_nothing_else() {
-                let c = project(&edit(PROJECT, |t| set(t, OWNER, "t3fac")));
-                let base = project(PROJECT);
-                assert!(c.owner_set);
-                assert!(!base.owner_set);
-                assert_eq!(c.instructors, base.instructors);
-                assert_eq!(c.base, base.base);
-                assert_eq!(c.provision, base.provision);
-                assert_eq!(c.gate, base.gate);
-                assert_eq!(c.required_checks, base.required_checks);
-                assert_eq!(c.limits, base.limits);
+                assert!(!project(PROJECT).owner_set);
+                assert_eq!(
+                    parse(&edit(PROJECT, |t| set(t, OWNER, "t3fac"))).unwrap(),
+                    ProjectConfig {
+                        owner_set: true,
+                        ..project(PROJECT)
+                    }
+                );
             }
 
             #[test]
@@ -832,6 +832,75 @@ factory:
             assert_eq!(
                 fields(&errs),
                 ["factory.base", "factory.limits.minutes", "factory.autonomy"]
+            );
+        }
+
+        #[test]
+        fn project_error_texts_match_the_runner() {
+            let cases: [(&str, &str, &str); 6] = [
+                ("factory.limits", "90", "must be a mapping"),
+                ("factory.gate", "cargo test", "must be a list of strings"),
+                ("factory.gate", "[]", "must not be empty"),
+                ("factory.base", "\"\"", "must not be empty"),
+                ("factory.instructors", "[\"\"]", "must not be empty"),
+                ("factory.limits.minutes", "\"ninety\"", "must be an integer"),
+            ];
+            for (path, yaml, message) in cases {
+                let errs = project_err(&edit(PROJECT, |t| set(t, path, yaml)));
+                assert_eq!(errs.len(), 1, "{path}: {errs:?}");
+                assert_eq!(errs[0].message, message, "{path}");
+                if path == "factory.instructors" {
+                    assert_eq!(errs[0].field.as_deref(), Some("factory.instructors[0]"));
+                }
+            }
+            let errs = project_err("factory: 3\n");
+            assert_eq!(errs.len(), 1, "{errs:?}");
+            assert_eq!(errs[0].message, "must be a mapping");
+        }
+
+        #[test]
+        fn config_errors_list_each_error_on_its_own_line() {
+            let t = edit(PROJECT, |tree| {
+                remove(tree, "factory.base");
+                set(tree, "factory.limits.minutes", "0");
+                set(tree, "factory.autonomy", "merge");
+            });
+            let err = parse(&t).unwrap_err();
+            assert_eq!(err.file, PATH);
+            assert_eq!(
+                err.to_string(),
+                ".dw/config.yml: factory.base: is missing\n.dw/config.yml: factory.limits.minutes: must be an integer of at least 1\n.dw/config.yml: factory.autonomy: unsupported value `merge`; only `pr` is accepted in phase 1"
+            );
+            assert_eq!(
+                parse("tracker: x\n").unwrap_err().to_string(),
+                ".dw/config.yml: factory: is missing"
+            );
+        }
+
+        #[test]
+        fn project_errors_follow_the_runners_check_order() {
+            let t = edit(PROJECT, |tree| {
+                set(tree, "factory.owner", "\"\"");
+                set(tree, "factory.autonomy", "merge");
+                remove(tree, "factory.limits.gate_retries");
+                set(tree, "factory.required_checks", "5");
+                set(tree, "factory.gate", "[]");
+                set(tree, "factory.provision", "5");
+                set(tree, "factory.base", "\"\"");
+                set(tree, "factory.instructors", "[]");
+            });
+            assert_eq!(
+                fields(&project_err(&t)),
+                [
+                    "factory.instructors",
+                    "factory.base",
+                    "factory.provision",
+                    "factory.gate",
+                    "factory.required_checks",
+                    "factory.limits.gate_retries",
+                    "factory.autonomy",
+                    "factory.owner"
+                ]
             );
         }
 
