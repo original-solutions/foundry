@@ -94,9 +94,9 @@ Dependencies are in brackets. Tasks with no dependency between them can build at
 
 ### 1. Scaffold
 
-- **Files:** `crates/foundryd/src/lib.rs`, `crates/foundryd/src/main.rs`, `Cargo.toml`, `Cargo.lock`, a stub for every new file in the file structure, `crates/foundryd/src/api/mod.rs` (mounts `api::factory::router()`), `crates/foundryd/tests/fleet/main.rs` (registers `mod factory`), `AGENTS.md`.
+- **Files:** `crates/foundryd/src/lib.rs`, `crates/foundryd/src/main.rs`, `crates/foundryd/tests/cli.rs`, `Cargo.toml`, `Cargo.lock`, a stub for every new file in the file structure, `crates/foundryd/src/api/mod.rs` (mounts `api::factory::router()`), `crates/foundryd/tests/fleet/main.rs` (registers `mod factory`), `AGENTS.md`.
 - **Produces:** every module registered, so later tasks fill their own files. `nix` gains its `time` feature. New commands that exit 2 with "not built yet" and each call one function a later task fills: `foundryd github default <login>` (`secrets::github_default_command`), `foundryd factory export <dir>` (`factory::ledger::export::command`). `AGENTS.md` names the P2 spec and this plan beside P1's.
-- **Tests:** each new command exits 2 and prints "not built yet". The gate passes.
+- **Tests:** in `crates/foundryd/tests/cli.rs`, one test per new command, named for it, that it exits 2 and prints "not built yet". The task that builds a command removes that command's test and no other. The gate passes.
 
 ### 2. Factory types and protocol 5 [1]
 
@@ -144,7 +144,7 @@ Dependencies are in brackets. Tasks with no dependency between them can build at
 ### 7. GitHub logins and what a machine holds [4]
 
 - **Spec:** GitHub tokens, G9, G11.
-- **Files:** `crates/foundryd/src/secrets.rs`, `crates/foundryd/src/factory/held.rs`, `crates/foundryd/src/daemon.rs` (one line under `// services`).
+- **Files:** `crates/foundryd/src/secrets.rs`, `crates/foundryd/src/factory/held.rs`, `crates/foundryd/src/daemon.rs` (one line under `// services`), `crates/foundryd/tests/cli.rs` (its own command's test).
 - **Produces:** `secret set github:<login>` accepted; a login is letters, digits and `-`. `Secrets::names() -> Vec<String>`. `secrets::github_logins(&dyn Secrets)`, `secrets::github_token(&dyn Secrets, login)`. `secrets::hide_known(text, &dyn Secrets) -> String`, which hides the gateway keys and every `github:*` token the store holds at the time of the call, and URL passwords as `redact` does. `secrets::github_default_command(login)` stores the machine's default login, and `github_default(&dyn Secrets) -> Option<String>` reads it. `held::run(...)`: writes this machine's `MachineHeld` at start and whenever the logins or the skill change, checked every 5 seconds; `skill` is true when `~/.claude/skills/factory-build/SKILL.md` exists for the service user.
 - **Tests:** `secret set github:bad/name` is refused. `names()` lists what was set and no value. `hide_known` hides a token set after the daemon started, leaves a 40-character commit id alone, and leaves a pull request URL whole. A token appears in no log line of the test. `MachineHeld` changes within 5 seconds of a `secret set`.
 
@@ -351,7 +351,7 @@ Dependencies are in brackets. Tasks with no dependency between them can build at
   A tracker error ends that project's pass and the next project still runs; three failed passes running set the status's idle reason.
 - **Tests:** the runner's `pass.test.ts` cases that apply. With the fakes: a project with no token writes "no token" and touches nothing on GitHub. A `Guard` that fails in the middle of a pass stops every further change. A paused project claims nothing and its runs carry on. A foreign claim is listed and its issue untouched. A slow `gh` in one project does not hold up the next (review focus 4).
 
-### 31. Cut-off [15, 29]
+### 31. Cut-off [15, 29, 30]
 
 - **Spec:** G10, When things go wrong (the second bullet and its five cases).
 - **Files:** `crates/foundryd/src/factory/cutoff.rs`, `crates/foundryd/src/daemon.rs` (one line under `// services`).
@@ -389,7 +389,7 @@ Dependencies are in brackets. Tasks with no dependency between them can build at
 ### 36. Export [20]
 
 - **Spec:** Factory records (the export), Testing (the export test).
-- **Files:** `crates/foundryd/src/factory/ledger/export.rs`, `crates/foundryd/tests/fixtures/runner/README.md`.
+- **Files:** `crates/foundryd/src/factory/ledger/export.rs`, `crates/foundryd/tests/fixtures/runner/README.md`, `crates/foundryd/tests/cli.rs` (its own command's test).
 - **Produces:** `foundryd factory export <dir>`: every run this machine holds as `runs/<owner>__<repo>__<N>__<attempt>.jsonl`, one line per event with the runner's keys in the runner's key order, in generation then version order. The lease generation is not written.
 - **Tests:** the events of the run file in `tests/fixtures/runner/` (committed before this issue is filed, see "Not factory issues"), loaded into a store and exported, equal that file byte for byte. A run written by two machines exports in order.
 
@@ -460,7 +460,7 @@ Done by a person, or outside this repo.
 23, 25, 26 ── 27 ── 28
 6, 18, 21, 24, 28, 29 ── 30 ── 33 ─┬─ 34 ── 35 (with 32)
                                    └─ 41
-15, 29 ── 31
+15, 29, 30 ── 31
 30, 31 ── 37 ─┬─ 38
               └─ 39
 17 ── 40
