@@ -273,10 +273,86 @@ mod tests {
         let url = "https://github.com/original-solutions/foundry/blob/0123456789abcdef0123456789abcdef01234567/crates/foundryd/src/factory/text.rs#L12";
         let text = format!("See {url}\nand {KEY}");
         assert_eq!(for_comment(&text), format!("See {url}\nand •••"));
-        let review = "https://github.com/o/r/pull/123#discussion_r1234567890abcdefgh";
-        assert_eq!(for_comment(review), review);
         let upper = "HTTPS://GitHub.com/o/r/commit/0123456789abcdef0123456789abcdef01234567";
         assert_eq!(for_comment(upper), upper);
+    }
+
+    #[test]
+    fn for_comment_keeps_the_ids_a_github_link_holds() {
+        let sha256 = "0123456789abcdef".repeat(4);
+        for url in [
+            "https://github.com/o/r/pull/123#discussion_r1234567890123".to_string(),
+            "https://github.com/o/r/pull/123#issuecomment-71015707501234".to_string(),
+            "https://github.com/o/r/pull/123#pullrequestreview-12345678901234".to_string(),
+            format!("https://github.com/o/r/pull/123/files#diff-{sha256}"),
+            format!("https://github.com/o/r/pull/123/files#diff-{sha256}R12"),
+            "https://github.com/o/r/compare/0123456789abcdef0123456789abcdef01234567...main"
+                .to_string(),
+        ] {
+            assert_eq!(for_comment(&url), url);
+        }
+    }
+
+    #[test]
+    fn for_comment_hides_a_key_glued_to_a_github_link_by_url_characters() {
+        for (text, shown) in [
+            (
+                "curl -d \"pr=https://github.com/o/r/pull/1&token=KEY\"",
+                "curl -d \"pr=https://github.com/o/r/pull/1&token=•••\"",
+            ),
+            (
+                "https://github.com/o/r/pull/1&access_token=KEY",
+                "https://github.com/o/r/pull/1&access_token=•••",
+            ),
+            (
+                "repo=https://github.com/o/r&api_key=KEY",
+                "repo=https://github.com/o/r&api_key=•••",
+            ),
+            (
+                "https://github.com/o/r/pull/1https://hooks.slack.com/services/T0/B0/KEY",
+                "https://github.com/o/r/pull/1https://hooks.slack.com/services/T0/B0/•••",
+            ),
+            (
+                "https://github.com/o/r/pull/1%0AGH_TOKEN%3DKEY",
+                "https://github.com/o/r/pull/1%0AGH_TOKEN%•••",
+            ),
+            (
+                "https://github.com/o/r/pull/1#access_token=KEY",
+                "https://github.com/o/r/pull/1#access_token=•••",
+            ),
+            (
+                "https://github.com/o/r/pull/1.KEY",
+                "https://github.com/o/r/pull/1.•••",
+            ),
+            (
+                "https://github.com/o/r/pull/1/KEY",
+                "https://github.com/o/r/pull/1/•••",
+            ),
+            (
+                "https://github.com/o/r/pull/1#ghp_AbCdEf0123456789AbCdEf0123456789",
+                "https://github.com/o/r/pull/1#•••",
+            ),
+        ] {
+            assert_eq!(for_comment(&text.replace("KEY", KEY)), shown, "{text}");
+        }
+    }
+
+    #[test]
+    fn for_comment_keeps_github_ids_whole_only_on_github_com() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        for host in [
+            "notgithub.com",
+            "github.com.evil.example",
+            "gist.github.com",
+            "github.com:443",
+            "github.com@evil.example",
+        ] {
+            let url = format!("https://{host}/o/r/commit/{sha}");
+            let shown = for_comment(&url);
+            assert!(shown.ends_with("/o/r/commit/•••"), "{url} -> {shown}");
+        }
+        let url = format!("https://github.com/o/r/commit/{sha}");
+        assert_eq!(for_comment(&url), url);
     }
 
     #[test]
@@ -285,9 +361,14 @@ mod tests {
             ("https://a.example\\nKEY=", ""),
             ("https://github.com/o/r/pull/1\u{200b}", ""),
             ("https://github.com/o/r/pull/1\u{1b}", ""),
-            ("https://x.example/a\u{2192}", ""),
-            ("https://x.example/a\\", ""),
-            ("https://x.example/a^", ""),
+            ("https://github.com/o/r/pull/1\u{2192}", ""),
+            ("https://github.com/o/r/pull/1\\", ""),
+            ("https://github.com/o/r/pull/1^", ""),
+            ("https://github.com/o/r/pull/1\t", ""),
+            ("https://github.com/o/r/pull/1 ", ""),
+            ("https://github.com/o/r/pull/1|", ""),
+            ("https://github.com/o/r/pull/1}", ""),
+            ("https://github.com/o/r/pull/1'", ""),
             (
                 "PR\u{306f}https://github.com/o/r/pull/1\u{3067}\u{3059}\u{3002}",
                 "\u{3067}\u{3059}",
@@ -295,9 +376,10 @@ mod tests {
             ("endpoint=https://api.example.com,key=", ""),
             ("https://github.com/o/r/pull/1,GH_TOKEN=", ""),
             ("https://github.com/o/r/pull/1;", ""),
-            ("`https://x/a`", ""),
-            ("\"https://x/a\"", ""),
-            ("[https://x/a]", ""),
+            ("`https://github.com/o/r/pull/1`", ""),
+            ("\"https://github.com/o/r/pull/1\"", ""),
+            ("[https://github.com/o/r/pull/1]", ""),
+            ("(https://github.com/o/r/pull/1)", ""),
         ] {
             let text = format!("{before}{KEY}{after}");
             assert_eq!(for_comment(&text), format!("{before}•••{after}"), "{text}");
@@ -325,6 +407,11 @@ mod tests {
         );
         let userinfo = "git push https://bot:short@github.com/o/r";
         assert_eq!(for_comment(userinfo), "git push https://***@github.com/o/r");
+        let nested = "https://example.com/login?next=https://bot:hunter2@github.com/o/r";
+        assert_eq!(
+            for_comment(nested),
+            "https://example.com/login?next=https://***@github.com/o/r"
+        );
         let token_user = format!("https://{KEY}@github.com/o/r/pull/1");
         assert_eq!(
             for_comment(&token_user),
