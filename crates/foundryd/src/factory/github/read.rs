@@ -4,11 +4,13 @@
 //! fake are read alike. Ported from the reading half of the runner's `src/tracker/github.ts`,
 //! and from `src/tracker/approvalHistory.ts`, the pure half of the approval rule.
 
+use std::collections::{HashMap, HashSet};
+
 use serde::de::DeserializeOwned;
 
 use super::gh::{invalid_argument, one_line, parse_error};
 use super::{Tracker, TrackerError};
-use crate::factory::lifecycle::approval::{Approval, TextCheck};
+use crate::factory::lifecycle::approval::{Approval, Refusal, TextCheck};
 use crate::factory::lifecycle::{State, depends_on};
 use crate::factory::text::is_commit_id;
 
@@ -182,9 +184,7 @@ pub fn is_instructor(login: Option<&str>, instructors: &[String]) -> bool {
     })
 }
 
-// ---------------------------------------------------------------------------------------------
-// Part A: listings, one issue, blockers, pull requests, checks, branches and files.
-// ---------------------------------------------------------------------------------------------
+// Listings, one issue, blockers, pull requests, checks, branches and files.
 
 /// How many issues one listing of a label reads; past this the oldest are left out.
 pub const LIST_LIMIT: usize = 200;
@@ -925,7 +925,6 @@ pub fn file_at<G: Tracker + ?Sized>(
 }
 
 /// Whether `branch` can be a path under `refs/heads/` in the API: no empty or dot segment.
-/// Whether `branch` can be a path under `refs/heads/` in the API: no empty or dot segment.
 /// `branch_tip` refuses any other name; a caller that wants its own words for the refusal
 /// asks this first.
 pub fn is_branch_path(branch: &str) -> bool {
@@ -934,7 +933,6 @@ pub fn is_branch_path(branch: &str) -> bool {
         .any(|part| part.is_empty() || part == "." || part == "..")
 }
 
-/// Whether `name` can go into a ref the factory passes to git.
 /// Whether `name` can go into a ref the factory passes to git: not empty, not an option, no
 /// whitespace or control character, no `..`.
 pub fn is_plain_ref_name(name: &str) -> bool {
@@ -944,7 +942,6 @@ pub fn is_plain_ref_name(name: &str) -> bool {
         && !name.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
-/// Whether `branch` is only the characters of an ordinary branch name.
 /// Whether `branch` can be written into a command a session runs (`git push origin
 /// HEAD:<branch>` in a launch message): only the characters of an ordinary branch name, not an
 /// option, no `..`. Stricter than [`is_plain_ref_name`], which only keeps a name safe as one
@@ -958,17 +955,7 @@ pub fn is_safe_branch_name(branch: &str) -> bool {
         && !branch.contains("..")
 }
 
-// ---------------------------------------------------------------------------------------------
-// End of part A.
-// ---------------------------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------------------------
-// Part B: approval history, issue activity and pull request feedback.
-// ---------------------------------------------------------------------------------------------
-
-use std::collections::{HashMap, HashSet};
-
-use crate::factory::lifecycle::approval::Refusal;
+// Approval history, issue activity and pull request feedback.
 
 /// How many label events and body edits the approval query asks for. A history this long may be
 /// cut off.
@@ -2181,13 +2168,12 @@ fn reviews_since<G: Tracker + ?Sized>(
     Ok(reviews)
 }
 
-// ---------------------------------------------------------------------------------------------
-// End of part B.
-// ---------------------------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
+    use serde_json::{Value, json};
+
     use super::*;
+    use crate::factory::github::gh::command_text;
     use crate::factory::github::{Answer, FakeTracker};
 
     fn args(parts: &[&str]) -> Vec<String> {
@@ -2268,8 +2254,6 @@ mod tests {
             ])
         );
     }
-
-    // ----- Part A tests -----
 
     const REPO: &str = "rawphp/softfac";
     const BASE_SHA: &str = "9f8e7d6c5b4a39281706f5e4d3c2b1a098765432";
@@ -3735,14 +3719,6 @@ mod tests {
             assert!(is_parse(&error), "{text}: {error}");
         }
     }
-
-    // ----- End of part A tests -----
-
-    // ----- Part B tests -----
-
-    use crate::factory::github::gh::command_text;
-    use crate::factory::lifecycle::approval::Refusal;
-    use serde_json::{Value, json};
 
     /// When the instructor applied `factory:ready` in most of the approval tests.
     const LABELED: &str = "2026-10-04T10:00:00Z";
@@ -6674,10 +6650,6 @@ mod tests {
         items.iter().map(|f| f.id.as_str()).collect()
     }
 
-    fn is_parse_error(error: &TrackerError) -> bool {
-        matches!(error, TrackerError::Other(m) if m.contains("returned unexpected output"))
-    }
-
     #[test]
     fn pr_feedback_asks_for_the_reviews_and_conversation_comments_with_one_call() {
         let fake = FakeTracker::answering([Answer::ok(feedback_reply(&[], &[]))]);
@@ -6878,7 +6850,7 @@ mod tests {
         let mut past = pr_comment_node(22, "hi", "2026-10-04T11:00:00Z", "rawphp");
         past["fullDatabaseId"] = json!(9_007_199_254_740_992u64);
         let fake = FakeTracker::answering([Answer::ok(feedback_reply(&[], &[past]))]);
-        assert!(is_parse_error(&feedback_error(&fake)));
+        assert!(is_parse(&feedback_error(&fake)));
     }
 
     #[test]
@@ -7229,7 +7201,7 @@ mod tests {
         ] {
             let fake = FakeTracker::new();
             let error = error_with(&fake, since, since);
-            assert!(is_parse_error(&error), "{since:?}");
+            assert!(is_parse(&error), "{since:?}");
             assert!(fake.calls().is_empty(), "{since:?}");
         }
     }
@@ -7239,7 +7211,7 @@ mod tests {
         for floor in ["", "2026-10-04", "2026-10-04T10:30:00.5Z"] {
             let fake = FakeTracker::new();
             let error = error_with(&fake, FB_SINCE, floor);
-            assert!(is_parse_error(&error), "{floor:?}");
+            assert!(is_parse(&error), "{floor:?}");
             assert!(fake.calls().is_empty(), "{floor:?}");
         }
     }
@@ -7255,7 +7227,7 @@ mod tests {
                 &[],
                 std::slice::from_ref(&comment),
             ))]);
-            assert!(is_parse_error(&feedback_error(&fake)), "{comment}");
+            assert!(is_parse(&feedback_error(&fake)), "{comment}");
         }
         let mut no_review_id = review_node(
             11,
@@ -7267,10 +7239,10 @@ mod tests {
         );
         no_review_id["fullDatabaseId"] = Value::Null;
         let fake = FakeTracker::answering([Answer::ok(feedback_reply(&[no_review_id], &[]))]);
-        assert!(is_parse_error(&feedback_error(&fake)));
+        assert!(is_parse(&feedback_error(&fake)));
         for garbage in ["", "no", "{}"] {
             let fake = FakeTracker::answering([Answer::ok(garbage)]);
-            assert!(is_parse_error(&feedback_error(&fake)), "{garbage}");
+            assert!(is_parse(&feedback_error(&fake)), "{garbage}");
         }
     }
 
@@ -7344,7 +7316,7 @@ mod tests {
         let mut garbled = fifty_reviews(false);
         garbled[0]["submittedAt"] = json!("yesterday");
         let fake = FakeTracker::answering([Answer::ok(paged_reply(&garbled, &[], 51, "c1"))]);
-        assert!(is_parse_error(&feedback_error(&fake)));
+        assert!(is_parse(&feedback_error(&fake)));
         assert_eq!(fake.calls().len(), 1);
     }
 
@@ -7507,14 +7479,14 @@ mod tests {
             Answer::ok(reviews_page(std::slice::from_ref(&page), 1000, "c1")),
             Answer::ok(reviews_page(std::slice::from_ref(&page), 1000, "c1")),
         ]);
-        assert!(is_parse_error(&feedback_error(&fake)));
+        assert!(is_parse(&feedback_error(&fake)));
         assert_eq!(fake.calls().len(), 2);
     }
 
     #[test]
     fn paging_back_that_would_read_past_the_page_limit_is_an_error_after_the_limit() {
         let fake = FakeTracker::answering(endless_reviews(REVIEW_PAGE_LIMIT + 5, false));
-        assert!(is_parse_error(&feedback_error(&fake)));
+        assert!(is_parse(&feedback_error(&fake)));
         assert_eq!(fake.calls().len(), REVIEW_PAGE_LIMIT);
     }
 
@@ -7592,7 +7564,7 @@ mod tests {
         assert_eq!(empty.calls().len(), 2);
 
         let gone = FakeTracker::answering([Answer::ok(first.as_str()), Answer::ok(GONE)]);
-        assert!(is_parse_error(&feedback_error(&gone)));
+        assert!(is_parse(&feedback_error(&gone)));
         assert_eq!(gone.calls().len(), 2);
 
         let no_cursor = FakeTracker::answering([Answer::ok(
@@ -7602,7 +7574,7 @@ mod tests {
             }}}})
             .to_string(),
         )]);
-        assert!(is_parse_error(&feedback_error(&no_cursor)));
+        assert!(is_parse(&feedback_error(&no_cursor)));
         assert_eq!(no_cursor.calls().len(), 1);
     }
 
@@ -8099,8 +8071,6 @@ mod tests {
                 r#"{"data":{"nodes":[{"id":"PRRC_abc","lastEditedAt":"2026-10-04T11:05:00Z"}]}}"#,
             ),
         ]);
-        assert!(is_parse_error(&feedback_error(&garbled)));
+        assert!(is_parse(&feedback_error(&garbled)));
     }
-
-    // ----- End of part B tests -----
 }
