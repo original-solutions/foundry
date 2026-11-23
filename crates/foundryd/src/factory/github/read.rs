@@ -8,8 +8,9 @@ use serde::de::DeserializeOwned;
 
 use super::gh::{invalid_argument, one_line, parse_error};
 use super::{Tracker, TrackerError};
-use crate::factory::lifecycle::State;
 use crate::factory::lifecycle::approval::{Approval, TextCheck};
+use crate::factory::lifecycle::{State, depends_on};
+use crate::factory::text::is_commit_id;
 
 // ---------------------------------------------------------------------------------------------
 // Shared: running a read and decoding its answer.
@@ -305,14 +306,269 @@ pub struct CheckStatus {
     pub url: Option<String>,
 }
 
+/// The fields `open_pull_requests_on_head` asks `gh pr list` for.
+const PR_LIST_FIELDS: &str = "number,url,headRefName,baseRefName,isCrossRepository,author";
+
+#[derive(serde::Deserialize)]
+struct RawLogin {
+    login: String,
+}
+
+#[derive(serde::Deserialize)]
+struct RawLabel {
+    name: String,
+}
+
+#[derive(serde::Deserialize)]
+struct RawIssueSummary {
+    number: u64,
+    title: String,
+    assignees: Vec<RawLogin>,
+    labels: Vec<RawLabel>,
+}
+
+#[derive(serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "UPPERCASE")]
+enum IssueState {
+    Open,
+    Closed,
+}
+
+#[derive(serde::Deserialize)]
+struct RawIssueView {
+    number: u64,
+    title: String,
+    #[serde(default)]
+    body: Option<String>,
+    labels: Vec<RawLabel>,
+    assignees: Vec<RawLogin>,
+    state: IssueState,
+    #[serde(default)]
+    author: Option<RawLogin>,
+}
+
+#[derive(serde::Deserialize)]
+struct RawBlocker {
+    number: u64,
+    state: String,
+    #[serde(default)]
+    repository_url: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct RawIssueBody {
+    #[serde(default)]
+    body: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct RawRestState {
+    state: String,
+}
+
+#[derive(serde::Deserialize)]
+struct RawRepoView {
+    #[serde(default)]
+    default_branch: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct RawRefObject {
+    sha: String,
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+#[derive(serde::Deserialize)]
+struct RawRefView {
+    object: RawRefObject,
+}
+
+#[derive(serde::Deserialize)]
+struct RawPullRequest {
+    number: u64,
+    #[serde(rename = "isDraft")]
+    is_draft: bool,
+    state: String,
+    #[serde(rename = "headRefName")]
+    head_ref_name: String,
+    #[serde(rename = "isCrossRepository")]
+    is_cross_repository: bool,
+    #[serde(rename = "baseRefName")]
+    base_ref_name: String,
+    #[serde(rename = "headRefOid")]
+    head_ref_oid: String,
+    mergeable: String,
+    #[serde(rename = "createdAt")]
+    created_at: String,
+}
+
+#[derive(serde::Deserialize)]
+struct RawListedAuthor {
+    login: String,
+    /// `__typename` comes from GraphQL alone: `gh pr list` already writes a bot as `app/<slug>`.
+    #[serde(rename = "__typename", default)]
+    typename: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct RawListedPullRequest {
+    number: u64,
+    url: String,
+    #[serde(rename = "headRefName")]
+    head_ref_name: String,
+    #[serde(rename = "baseRefName")]
+    base_ref_name: String,
+    #[serde(rename = "isCrossRepository")]
+    is_cross_repository: bool,
+    #[serde(default)]
+    author: Option<RawListedAuthor>,
+}
+
+#[derive(serde::Deserialize)]
+struct RawCheckRun {
+    name: String,
+    status: String,
+    #[serde(default)]
+    conclusion: Option<String>,
+    #[serde(default)]
+    html_url: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct RawFileView {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    encoding: Option<String>,
+    size: u64,
+    #[serde(default)]
+    content: Option<String>,
+}
+
+/// Failed beats pending beats missing beats passed: a check passes only when every run passed.
+fn check_rank(state: CheckState) -> u8 {
+    match state {
+        CheckState::Failed => 3,
+        CheckState::Pending => 2,
+        CheckState::Missing => 1,
+        CheckState::Passed => 0,
+    }
+}
+
+/// The state one check run decides, and the word GitHub gave for it.
+fn check_outcome(status: &str, conclusion: Option<&str>) -> (CheckState, String) {
+    if status != "completed" {
+        return (CheckState::Pending, status.to_string());
+    }
+    match conclusion {
+        Some(word @ ("success" | "neutral")) => (CheckState::Passed, word.to_string()),
+        // Nothing ran. The factory's pull request is a draft until the checks pass, and a job
+        // guarded by "not a draft" is skipped on it.
+        Some("skipped") => (CheckState::Missing, "skipped".to_string()),
+        other => (CheckState::Failed, other.unwrap_or("completed").to_string()),
+    }
+}
+
+/// Standard base64 as GitHub's contents API writes it: wrapped with newlines, padded with `=`.
+/// `None` for anything else, including data after padding and padding that does not fit the
+/// length.
+fn decode_base64(text: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut bits: u32 = 0;
+    let mut have: u32 = 0;
+    let mut padding = 0;
+    for c in text.chars() {
+        let value = match c {
+            'A'..='Z' => c as u32 - 'A' as u32,
+            'a'..='z' => c as u32 - 'a' as u32 + 26,
+            '0'..='9' => c as u32 - '0' as u32 + 52,
+            '+' => 62,
+            '/' => 63,
+            '=' => {
+                padding += 1;
+                continue;
+            }
+            '\n' | '\r' => continue,
+            _ => return None,
+        };
+        // Nothing may follow padding.
+        if padding > 0 {
+            return None;
+        }
+        bits = (bits << 6) | value;
+        have += 6;
+        if have >= 8 {
+            have -= 8;
+            out.push(((bits >> have) & 0xff) as u8);
+            bits &= (1 << have) - 1;
+        }
+    }
+    // What is left over is padding bits, which must be zero, and the padding must fit.
+    let fits =
+        (have == 0 && padding == 0) || (have == 4 && padding == 2) || (have == 2 && padding == 1);
+    (fits && bits == 0).then_some(out)
+}
+
+/// A branch name as a path under `refs/heads/` in the API; `None` for a name that could leave
+/// it.
+fn encode_branch(branch: &str) -> Option<String> {
+    if !is_branch_path(branch) {
+        return None;
+    }
+    let mut out = String::new();
+    for byte in branch.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    Some(out)
+}
+
+fn is_plain_segment(part: &str) -> bool {
+    part != "."
+        && part != ".."
+        && !part.is_empty()
+        && part
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
 /// The open issues with `state`'s label.
 pub fn list_issues<G: Tracker + ?Sized>(
     gh: &G,
     repo: &str,
     state: State,
 ) -> Result<Listing<IssueSummary>, TrackerError> {
-    let _ = (gh, repo, state);
-    todo!("part A")
+    let args = vec![
+        "issue".to_string(),
+        "list".into(),
+        "--repo".into(),
+        repo.into(),
+        "--state".into(),
+        "open".into(),
+        "--label".into(),
+        state.label().into(),
+        "--limit".into(),
+        (LIST_LIMIT + 1).to_string(),
+        "--json".into(),
+        "number,title,assignees,labels".into(),
+    ];
+    let raw: Vec<RawIssueSummary> = gh_json(gh, &args, "a JSON array of issues")?;
+    let cut = raw.len() > LIST_LIMIT;
+    let items = raw
+        .into_iter()
+        .take(LIST_LIMIT)
+        .map(|item| IssueSummary {
+            number: item.number,
+            title: item.title,
+            assignees: item.assignees.into_iter().map(|a| a.login).collect(),
+            labels: item.labels.into_iter().map(|l| l.name).collect(),
+        })
+        .collect();
+    Ok(Listing { items, cut })
 }
 
 /// One issue with its labels, assignees, body, author and state.
@@ -321,8 +577,35 @@ pub fn issue<G: Tracker + ?Sized>(
     repo: &str,
     number: u64,
 ) -> Result<IssueDetail, TrackerError> {
-    let _ = (gh, repo, number);
-    todo!("part A")
+    let args = vec![
+        "issue".to_string(),
+        "view".into(),
+        number.to_string(),
+        "--repo".into(),
+        repo.into(),
+        "--json".into(),
+        "number,title,body,labels,assignees,state,author".into(),
+    ];
+    let raw: RawIssueView = gh_json(gh, &args, "an object describing an issue")?;
+    let labels: Vec<String> = raw.labels.into_iter().map(|l| l.name).collect();
+    let factory: Vec<&String> = labels
+        .iter()
+        .filter(|name| name.starts_with("factory:"))
+        .collect();
+    let state = match factory.as_slice() {
+        [one] => State::from_label(one),
+        _ => None,
+    };
+    Ok(IssueDetail {
+        number: raw.number,
+        title: raw.title,
+        body: raw.body.unwrap_or_default(),
+        assignees: raw.assignees.into_iter().map(|a| a.login).collect(),
+        author: raw.author.map(|a| a.login),
+        state,
+        closed: raw.state == IssueState::Closed,
+        labels,
+    })
 }
 
 /// The open issues GitHub's dependency links say block `issue`.
@@ -331,8 +614,37 @@ pub fn open_blockers<G: Tracker + ?Sized>(
     repo: &str,
     issue: u64,
 ) -> Result<Vec<Blocker>, TrackerError> {
-    let _ = (gh, repo, issue);
-    todo!("part A")
+    let args = vec![
+        "api".to_string(),
+        format!("repos/{repo}/issues/{issue}/dependencies/blocked_by"),
+        "--paginate".into(),
+    ];
+    let listed: Vec<RawBlocker> = gh_pages(gh, &args, "JSON arrays of issues")?;
+    let mut open = Vec::new();
+    for raw in listed.into_iter().filter(|row| row.state != "closed") {
+        // The blocker's repo is named in `repository_url`. Without it the caller would have to
+        // guess, so the answer is an error and the issue is not claimed.
+        let url = raw.repository_url.unwrap_or_default();
+        let named = url
+            .find("/repos/")
+            .map(|cut| &url[cut + "/repos/".len()..])
+            .unwrap_or("");
+        let parts: Vec<&str> = named.split('/').collect();
+        if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+            return Err(parse_error(
+                &args,
+                &format!(
+                    "issues that each name their repo in repository_url (#{} did not)",
+                    raw.number
+                ),
+            ));
+        }
+        open.push(Blocker {
+            repo: named.to_string(),
+            number: raw.number,
+        });
+    }
+    Ok(open)
 }
 
 /// The issues the body's `## Depends on` section names that are not closed.
@@ -341,8 +653,42 @@ pub fn text_blockers<G: Tracker + ?Sized>(
     repo: &str,
     issue: u64,
 ) -> Result<Vec<Blocker>, TrackerError> {
-    let _ = (gh, repo, issue);
-    todo!("part A")
+    let body_args = vec![
+        "issue".to_string(),
+        "view".into(),
+        issue.to_string(),
+        "--repo".into(),
+        repo.into(),
+        "--json".into(),
+        "body".into(),
+    ];
+    let raw: RawIssueBody = gh_json(gh, &body_args, "an object with the issue's body")?;
+    let named = depends_on::blockers(raw.body.as_deref().unwrap_or(""));
+    if named.len() > MAX_DEPENDS_ON {
+        return Err(parse_error(
+            &body_args,
+            &format!(
+                "a Depends on section naming at most {MAX_DEPENDS_ON} issues, got {}",
+                named.len()
+            ),
+        ));
+    }
+    let mut open = Vec::new();
+    for reference in named {
+        let named_repo = reference.repo.unwrap_or_else(|| repo.to_string());
+        let args = vec![
+            "api".to_string(),
+            format!("repos/{named_repo}/issues/{}", reference.number),
+        ];
+        let read: RawRestState = gh_json(gh, &args, "an object with the issue's state")?;
+        if read.state != "closed" {
+            open.push(Blocker {
+                repo: named_repo,
+                number: reference.number,
+            });
+        }
+    }
+    Ok(open)
 }
 
 /// The pull request; `None` for a number the repo does not have.
@@ -351,8 +697,57 @@ pub fn pull_request<G: Tracker + ?Sized>(
     repo: &str,
     number: u64,
 ) -> Result<Option<PullRequest>, TrackerError> {
-    let _ = (gh, repo, number);
-    todo!("part A")
+    let args = vec![
+        "pr".to_string(),
+        "view".into(),
+        number.to_string(),
+        "--repo".into(),
+        repo.into(),
+        "--json".into(),
+        "number,isDraft,state,headRefName,isCrossRepository,baseRefName,headRefOid,mergeable,createdAt"
+            .into(),
+    ];
+    let stdout = match gh.gh(&args) {
+        Ok(stdout) => stdout,
+        Err(error @ (TrackerError::Other(_) | TrackerError::NotFound { .. }))
+            if error
+                .to_string()
+                .to_lowercase()
+                .contains("could not resolve to a pullrequest") =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let raw: RawPullRequest = decode(&args, "an object describing a pull request", &stdout)?;
+    if !is_commit_id(&raw.head_ref_oid) {
+        return Err(parse_error(
+            &args,
+            "a pull request and its full head commit id",
+        ));
+    }
+    if !is_utc_second(&raw.created_at) {
+        return Err(parse_error(
+            &args,
+            "a pull request's creation time as YYYY-MM-DDTHH:MM:SSZ",
+        ));
+    }
+    Ok(Some(PullRequest {
+        number: raw.number,
+        is_draft: raw.is_draft,
+        open: raw.state == "OPEN",
+        merged: raw.state == "MERGED",
+        head_ref: raw.head_ref_name,
+        cross_repository: raw.is_cross_repository,
+        base_ref: raw.base_ref_name,
+        head_sha: raw.head_ref_oid,
+        mergeable: match raw.mergeable.as_str() {
+            "MERGEABLE" => Mergeable::Mergeable,
+            "CONFLICTING" => Mergeable::Conflicting,
+            _ => Mergeable::Unknown,
+        },
+        created_at: raw.created_at,
+    }))
 }
 
 /// The open pull requests from a branch named `head`, forks included.
@@ -361,8 +756,44 @@ pub fn open_pull_requests_on_head<G: Tracker + ?Sized>(
     repo: &str,
     head: &str,
 ) -> Result<Vec<OpenPullRequest>, TrackerError> {
-    let _ = (gh, repo, head, invalid_argument);
-    todo!("part A")
+    if !is_plain_ref_name(head) {
+        return Err(invalid_argument(head, "a plain branch name"));
+    }
+    let args = vec![
+        "pr".to_string(),
+        "list".into(),
+        "--repo".into(),
+        repo.into(),
+        "--state".into(),
+        "open".into(),
+        "--head".into(),
+        head.into(),
+        "--limit".into(),
+        "100".into(),
+        "--json".into(),
+        PR_LIST_FIELDS.into(),
+    ];
+    let rows: Vec<RawListedPullRequest> = gh_json(gh, &args, "a JSON array of pull requests")?;
+    Ok(rows
+        .into_iter()
+        .map(|node| OpenPullRequest {
+            number: node.number,
+            url: node.url,
+            head_ref: node.head_ref_name,
+            base_ref: node.base_ref_name,
+            cross_repository: node.is_cross_repository,
+            author: match node.author {
+                Some(author) if !author.login.is_empty() => {
+                    if author.typename.as_deref() == Some("Bot") {
+                        Some(format!("app/{}", author.login))
+                    } else {
+                        Some(author.login)
+                    }
+                }
+                _ => None,
+            },
+        })
+        .collect())
 }
 
 /// How each check in `names` stands on the commit `sha`.
@@ -372,14 +803,62 @@ pub fn checks<G: Tracker + ?Sized>(
     sha: &str,
     names: &[String],
 ) -> Result<Vec<CheckStatus>, TrackerError> {
-    let _ = (gh, repo, sha, names);
-    todo!("part A")
+    if !is_commit_id(sha) {
+        return Err(invalid_argument(sha, "a full commit id"));
+    }
+    let args = vec![
+        "api".to_string(),
+        format!("repos/{repo}/commits/{sha}/check-runs?per_page=100&filter=latest"),
+        "--paginate".into(),
+        "--jq".into(),
+        "[.check_runs[] | {name, status, conclusion, html_url}]".into(),
+    ];
+    let runs: Vec<RawCheckRun> = gh_pages(gh, &args, "JSON arrays of check runs")?;
+    Ok(names
+        .iter()
+        .map(|name| {
+            let mut found: Option<CheckStatus> = None;
+            for run in runs.iter().filter(|run| &run.name == name) {
+                let (state, conclusion) = check_outcome(&run.status, run.conclusion.as_deref());
+                if found
+                    .as_ref()
+                    .is_none_or(|f| check_rank(state) > check_rank(f.state))
+                {
+                    // A link that does not point at GitHub is not passed on.
+                    let url = run
+                        .html_url
+                        .as_ref()
+                        .filter(|url| url.starts_with("https://github.com/"))
+                        .cloned();
+                    found = Some(CheckStatus {
+                        name: name.clone(),
+                        state,
+                        conclusion,
+                        url,
+                    });
+                }
+            }
+            found.unwrap_or_else(|| CheckStatus {
+                name: name.clone(),
+                state: CheckState::Missing,
+                conclusion: String::new(),
+                url: None,
+            })
+        })
+        .collect())
 }
 
 /// The repo's default branch.
 pub fn default_branch<G: Tracker + ?Sized>(gh: &G, repo: &str) -> Result<String, TrackerError> {
-    let _ = (gh, repo);
-    todo!("part A")
+    let args = vec!["api".to_string(), format!("repos/{repo}")];
+    let view: RawRepoView = gh_json(gh, &args, "an object with the repo's default branch")?;
+    match view.default_branch {
+        Some(branch) if !branch.is_empty() => Ok(branch),
+        _ => Err(parse_error(
+            &args,
+            "an object with the repo's default branch (it had none)",
+        )),
+    }
 }
 
 /// The full commit id at the tip of `branch`.
@@ -388,8 +867,24 @@ pub fn branch_tip<G: Tracker + ?Sized>(
     repo: &str,
     branch: &str,
 ) -> Result<String, TrackerError> {
-    let _ = (gh, repo, branch);
-    todo!("part A")
+    let Some(encoded) = encode_branch(branch) else {
+        return Err(invalid_argument(
+            branch,
+            "a branch name without empty or dot segments",
+        ));
+    };
+    let args = vec![
+        "api".to_string(),
+        format!("repos/{repo}/git/ref/heads/{encoded}"),
+    ];
+    let view: RawRefView = gh_json(gh, &args, "an object with the commit the ref points at")?;
+    if view.object.kind != "commit" || !is_commit_id(&view.object.sha) {
+        return Err(parse_error(
+            &args,
+            "a commit and its full 40 or 64 digit id",
+        ));
+    }
+    Ok(view.object.sha)
 }
 
 /// The text of the file at `path` in the commit `sha`.
@@ -399,26 +894,68 @@ pub fn file_at<G: Tracker + ?Sized>(
     path: &str,
     sha: &str,
 ) -> Result<String, TrackerError> {
-    let _ = (gh, repo, path, sha);
-    todo!("part A")
+    if !path.split('/').all(is_plain_segment) {
+        return Err(invalid_argument(path, "a plain file path"));
+    }
+    if !is_commit_id(sha) {
+        return Err(invalid_argument(sha, "a full commit id"));
+    }
+    let args = vec![
+        "api".to_string(),
+        format!("repos/{repo}/contents/{path}?ref={sha}"),
+    ];
+    let file: RawFileView = gh_json(gh, &args, "an object describing a file")?;
+    let bad = |why: &str| parse_error(&args, &format!("a regular file read whole ({why})"));
+    if file.kind != "file" {
+        return Err(bad("it is not a regular file"));
+    }
+    if file.size > MAX_FILE_BYTES {
+        return Err(bad("it is too big"));
+    }
+    if file.encoding.as_deref() != Some("base64") {
+        return Err(bad("its content did not come as base64"));
+    }
+    let Some(bytes) = decode_base64(file.content.as_deref().unwrap_or("")) else {
+        return Err(bad("its content is not valid base64"));
+    };
+    if bytes.len() as u64 != file.size {
+        return Err(bad("its content is not as long as its size says"));
+    }
+    String::from_utf8(bytes).map_err(|_| bad("it is not UTF-8"))
 }
 
 /// Whether `branch` can be a path under `refs/heads/` in the API: no empty or dot segment.
+/// Whether `branch` can be a path under `refs/heads/` in the API: no empty or dot segment.
+/// `branch_tip` refuses any other name; a caller that wants its own words for the refusal
+/// asks this first.
 pub fn is_branch_path(branch: &str) -> bool {
-    let _ = branch;
-    todo!("part A")
+    !branch
+        .split('/')
+        .any(|part| part.is_empty() || part == "." || part == "..")
 }
 
 /// Whether `name` can go into a ref the factory passes to git.
+/// Whether `name` can go into a ref the factory passes to git: not empty, not an option, no
+/// whitespace or control character, no `..`.
 pub fn is_plain_ref_name(name: &str) -> bool {
-    let _ = name;
-    todo!("part A")
+    !name.is_empty()
+        && !name.starts_with('-')
+        && !name.contains("..")
+        && !name.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
 /// Whether `branch` is only the characters of an ordinary branch name.
+/// Whether `branch` can be written into a command a session runs (`git push origin
+/// HEAD:<branch>` in a launch message): only the characters of an ordinary branch name, not an
+/// option, no `..`. Stricter than [`is_plain_ref_name`], which only keeps a name safe as one
+/// argument to git.
 pub fn is_safe_branch_name(branch: &str) -> bool {
-    let _ = branch;
-    todo!("part A")
+    !branch.is_empty()
+        && branch
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-'))
+        && !branch.starts_with('-')
+        && !branch.contains("..")
 }
 
 // ---------------------------------------------------------------------------------------------
