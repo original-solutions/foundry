@@ -3708,8 +3708,6 @@ mod tests {
     use crate::factory::lifecycle::approval::Refusal;
     use serde_json::{Value, json};
 
-    const REPO: &str = "rawphp/softfac";
-
     /// When the instructor applied `factory:ready` in most of the approval tests.
     const LABELED: &str = "2026-10-04T10:00:00Z";
     /// After LABELED, and before LATER.
@@ -3749,10 +3747,6 @@ mod tests {
 
     fn pad(n: usize) -> String {
         format!("{n:02}")
-    }
-
-    fn names(logins: &[&str]) -> Vec<String> {
-        logins.iter().map(|login| login.to_string()).collect()
     }
 
     fn actor_of(who: Who) -> Value {
