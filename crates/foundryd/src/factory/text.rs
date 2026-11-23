@@ -218,8 +218,72 @@ mod tests {
         let url = "https://github.com/original-solutions/foundry/blob/0123456789abcdef0123456789abcdef01234567/crates/foundryd/src/factory/text.rs#L12";
         let text = format!("See {url}\nand {KEY}");
         assert_eq!(for_comment(&text), format!("See {url}\nand •••"));
-        let http = "http://example.com/runs/aB3dE5gH7jK9mN1pQ3sT5vX7zA9cD1/log";
-        assert_eq!(for_comment(http), http);
+        let review = "https://github.com/o/r/pull/123#discussion_r1234567890abcdefgh";
+        assert_eq!(for_comment(review), review);
+        let upper = "HTTPS://GitHub.com/o/r/commit/0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(for_comment(upper), upper);
+    }
+
+    #[test]
+    fn for_comment_ends_a_url_at_a_character_no_url_holds() {
+        for (before, after) in [
+            ("https://a.example\\nKEY=", ""),
+            ("https://github.com/o/r/pull/1\u{200b}", ""),
+            ("https://github.com/o/r/pull/1\u{1b}", ""),
+            ("https://x.example/a\u{2192}", ""),
+            ("https://x.example/a\\", ""),
+            ("https://x.example/a^", ""),
+            (
+                "PR\u{306f}https://github.com/o/r/pull/1\u{3067}\u{3059}\u{3002}",
+                "\u{3067}\u{3059}",
+            ),
+            ("endpoint=https://api.example.com,key=", ""),
+            ("https://github.com/o/r/pull/1,GH_TOKEN=", ""),
+            ("https://github.com/o/r/pull/1;", ""),
+            ("`https://x/a`", ""),
+            ("\"https://x/a\"", ""),
+            ("[https://x/a]", ""),
+        ] {
+            let text = format!("{before}{KEY}{after}");
+            assert_eq!(for_comment(&text), format!("{before}•••{after}"), "{text}");
+        }
+    }
+
+    #[test]
+    fn for_comment_hides_a_token_in_a_url_query_userinfo_or_another_hosts_path() {
+        let webhook = format!("https://hooks.slack.com/services/T0000/B0000/{KEY}");
+        assert_eq!(
+            for_comment(&webhook),
+            "https://hooks.slack.com/services/T0000/B0000/•••"
+        );
+        let log = "http://example.com/runs/aB3dE5gH7jK9mN1pQ3sT5vX7zA9cD1/log";
+        assert_eq!(for_comment(log), "http://example.com/runs/•••/log");
+        let query = format!("https://github.com/o/r/pull/1?access_token={KEY}#top");
+        assert_eq!(
+            for_comment(&query),
+            "https://github.com/o/r/pull/1?access_token=•••#top"
+        );
+        let signed = format!("https://bucket.s3.amazonaws.com/a?X-Amz-Signature={KEY}");
+        assert_eq!(
+            for_comment(&signed),
+            "https://bucket.s3.amazonaws.com/a?X-Amz-Signature=•••"
+        );
+        let userinfo = "git push https://bot:short@github.com/o/r";
+        assert_eq!(for_comment(userinfo), "git push https://***@github.com/o/r");
+        let token_user = format!("https://{KEY}@github.com/o/r/pull/1");
+        assert_eq!(
+            for_comment(&token_user),
+            "https://***@github.com/o/r/pull/1"
+        );
+    }
+
+    #[test]
+    fn for_comment_keeps_a_word_glued_to_the_scheme() {
+        assert_eq!(for_comment("xhttp://a.b"), "xhttp://a.b");
+        assert_eq!(
+            for_comment(&format!("{KEY}https://github.com/o/r/pull/1")),
+            "•••https://github.com/o/r/pull/1"
+        );
     }
 
     #[test]
@@ -280,6 +344,43 @@ mod tests {
             "a b c d e f g"
         );
         assert_eq!(sanitize("a\rb", true), "a b");
+    }
+
+    /// The runner's case, from its `src/gate.test.ts`.
+    #[test]
+    fn sanitize_turns_control_and_hidden_text_characters_into_spaces() {
+        assert_eq!(sanitize("a\u{1b}b\u{0}c\u{7f}d\u{85}e", false), "a b c d e");
+        assert_eq!(sanitize("a\nb\tc", false), "a b c");
+        assert_eq!(sanitize("a\nb\tc", true), "a\nb\tc");
+        assert_eq!(
+            sanitize(
+                "x\u{2028}y\u{2029}z\u{200b}w\u{200f}\u{202a}\u{2069}\u{feff}v",
+                true
+            ),
+            "x y z w    v"
+        );
+    }
+
+    #[test]
+    fn sanitize_replaces_both_ends_of_each_range_and_keeps_their_neighbours() {
+        for c in [
+            '\u{0}', '\u{1f}', '\u{7f}', '\u{9f}', '\u{200b}', '\u{200f}', '\u{202a}', '\u{202e}',
+            '\u{2066}', '\u{2069}', '\u{2028}', '\u{2029}', '\u{feff}',
+        ] {
+            assert_eq!(
+                sanitize(&format!("a{c}b"), false),
+                "a b",
+                "{:x}",
+                u32::from(c)
+            );
+        }
+        for c in [
+            '\u{20}', '\u{7e}', '\u{a0}', '\u{200a}', '\u{2010}', '\u{2027}', '\u{202f}',
+            '\u{2065}', '\u{206a}', '\u{fefe}',
+        ] {
+            let text = format!("a{c}b");
+            assert_eq!(sanitize(&text, false), text, "{:x}", u32::from(c));
+        }
     }
 
     #[test]

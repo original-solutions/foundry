@@ -408,6 +408,82 @@ mod tests {
         assert_eq!(State::from_label("Factory:ready"), None);
     }
 
+    #[test]
+    fn states_round_trip_by_name() {
+        for state in State::ALL {
+            assert_eq!(State::from_name(state.name()), Some(state));
+        }
+        assert_eq!(State::from_name("factory:ready"), None);
+        assert_eq!(State::from_name("Ready"), None);
+        assert_eq!(State::from_name(""), None);
+    }
+
+    #[test]
+    fn action_names_are_pinned() {
+        let actions = [
+            (Action::AssignToMachine, "assign-to-machine"),
+            (Action::Unassign, "unassign"),
+            (
+                Action::SetLabel {
+                    state: State::Ready,
+                },
+                "set-label",
+            ),
+            (Action::LaunchSession, "launch-session"),
+            (Action::UpdateStatusComment, "update-status-comment"),
+            (
+                Action::PostQuestions {
+                    questions: "q".into(),
+                },
+                "post-questions",
+            ),
+            (
+                Action::PostStuckComment { reason: "r".into() },
+                "post-stuck-comment",
+            ),
+            (
+                Action::ForwardComment {
+                    comment_id: "1".into(),
+                },
+                "forward-comment",
+            ),
+            (Action::ForwardBodyEdit, "forward-body-edit"),
+            (
+                Action::SendGateFailure { output: "o".into() },
+                "send-gate-failure",
+            ),
+            (Action::MarkPrReady { pr: 1 }, "mark-pr-ready"),
+            (Action::MarkPrDraft { pr: 1 }, "mark-pr-draft"),
+            (Action::PostGateResults { pr: 1 }, "post-gate-results"),
+            (
+                Action::PostUnapproved { reason: "r".into() },
+                "post-unapproved",
+            ),
+        ];
+        for (action, name) in &actions {
+            assert_eq!(action.name(), *name);
+        }
+        // A match with no wildcard, so adding an `Action` kind fails to compile until it is listed.
+        let place = |action: &Action| match action {
+            Action::AssignToMachine => 0,
+            Action::Unassign => 1,
+            Action::SetLabel { .. } => 2,
+            Action::LaunchSession => 3,
+            Action::UpdateStatusComment => 4,
+            Action::PostQuestions { .. } => 5,
+            Action::PostStuckComment { .. } => 6,
+            Action::ForwardComment { .. } => 7,
+            Action::ForwardBodyEdit => 8,
+            Action::SendGateFailure { .. } => 9,
+            Action::MarkPrReady { .. } => 10,
+            Action::MarkPrDraft { .. } => 11,
+            Action::PostGateResults { .. } => 12,
+            Action::PostUnapproved { .. } => 13,
+        };
+        let places: Vec<usize> = actions.iter().map(|(a, _)| place(a)).collect();
+        assert_eq!(places, (0..14).collect::<Vec<_>>());
+    }
+
     // lifecycle transitions
 
     #[test]
