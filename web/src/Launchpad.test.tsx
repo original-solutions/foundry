@@ -55,7 +55,7 @@ describe("Launchpad", () => {
     await waitFor(() => expect(calls).toHaveLength(2));
     expect(calls[0]).toEqual({ url: "/api/workspaces", method: "POST", body: { project: "p2", base: "main", name: "fix the login redirect" } });
     expect(calls[1]).toEqual({ url: "/api/workspaces/w1/sessions", method: "POST", body: { model: "opus", prompt: "Fix the login redirect.\nKeep it small." } });
-    await waitFor(() => expect(created).toHaveBeenCalledWith("s1"));
+    await waitFor(() => expect(created).toHaveBeenCalledWith("s1", null));
   });
 
   it("takes a typed name, base and model over what it would pick", async () => {
