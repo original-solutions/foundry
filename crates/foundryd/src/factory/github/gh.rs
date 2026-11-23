@@ -324,8 +324,9 @@ impl Tracker for Gh {
     }
 }
 
-/// Kills the child's process group and reaps the child. The child is not reaped before the
-/// kill, so its id still names its group.
+/// Kills the child's process group and reaps the child. The leader may already be reaped when
+/// a descendant still holds a pipe; its id still names the group while any member is alive,
+/// which an unfinished reader means unless the holder left the group.
 fn kill_group(child: &mut Child) {
     if let Ok(pid) = i32::try_from(child.id()) {
         let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
@@ -525,40 +526,43 @@ mod tests {
 
     #[test]
     fn a_descendant_holding_the_pipes_after_the_leader_exits_is_still_killed_at_30_seconds() {
-        let dir = tempfile::tempdir().unwrap();
-        let gpid_file = dir.path().join("gpid");
-        // The leader exits at once; the background sleep keeps stdout open.
-        let program = fake_gh(
-            dir.path(),
-            &format!(
-                "sleep 47.3191 &\necho $! > '{}'\nprintf ok",
-                gpid_file.display()
-            ),
-        );
-        let clock = Arc::new(FakeClock::new());
-        let gh = gh_at(&program, clock.clone());
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let _ = tx.send(gh.gh(&args(&["issue", "list", "--repo", "rawphp/softfac"])));
-        });
-        let gpid = pid_in(&gpid_file);
+        // The leader exits at once; the background sleep keeps both pipes, then only stdout,
+        // then only stderr open.
+        for redirect in ["", " 2>/dev/null", " >/dev/null"] {
+            let dir = tempfile::tempdir().unwrap();
+            let gpid_file = dir.path().join("gpid");
+            let program = fake_gh(
+                dir.path(),
+                &format!(
+                    "sleep 47.3191{redirect} &\necho $! > '{}'\nprintf ok",
+                    gpid_file.display()
+                ),
+            );
+            let clock = Arc::new(FakeClock::new());
+            let gh = gh_at(&program, clock.clone());
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let _ = tx.send(gh.gh(&args(&["issue", "list", "--repo", "rawphp/softfac"])));
+            });
+            let gpid = pid_in(&gpid_file);
 
-        clock.advance(Duration::from_millis(29_999));
-        assert!(
-            rx.recv_timeout(Duration::from_millis(300)).is_err(),
-            "answered before 30 s on the clock"
-        );
-        clock.advance(Duration::from_millis(1));
-        let error = rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("answered once 30 s passed on the clock")
-            .unwrap_err();
-        assert!(matches!(error, TrackerError::Timeout { .. }), "{error:?}");
-        assert!(goes_away(gpid), "the descendant outlived the call");
+            clock.advance(Duration::from_millis(29_999));
+            assert!(
+                rx.recv_timeout(Duration::from_millis(300)).is_err(),
+                "answered before 30 s on the clock with `{redirect}`"
+            );
+            clock.advance(Duration::from_millis(1));
+            let error = rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("answered once 30 s passed on the clock")
+                .unwrap_err();
+            assert!(matches!(error, TrackerError::Timeout { .. }), "{error:?}");
+            assert!(goes_away(gpid), "the descendant outlived the call");
+        }
     }
 
     #[test]
-    fn the_command_sets_the_token_and_clears_every_other_source_of_credentials() {
+    fn the_command_sets_the_token_and_clears_every_other_credential_variable() {
         let gh = Gh::new("rawphp", TOKEN, Arc::new(FakeClock::new()));
         let command = gh.command(&args(&["api", "user"]));
         let envs: std::collections::HashMap<_, _> = command
