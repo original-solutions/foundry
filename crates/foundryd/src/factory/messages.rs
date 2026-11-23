@@ -1682,6 +1682,19 @@ mod tests {
         }
 
         #[test]
+        fn ten_checks_are_all_listed_with_none_counted() {
+            let checks: Vec<FailedCheck> = (0..10)
+                .map(|i| failed(&format!("check {i}"), "failure", None))
+                .collect();
+            let text = checks_failure_text(SHA, &checks);
+            assert!(
+                text.ends_with("\n\nCheck: check 9\nResult: failure"),
+                "{text}"
+            );
+            assert!(!text.contains("more"));
+        }
+
+        #[test]
         fn shows_only_the_first_seven_hex_digits_of_the_commit_whatever_the_case() {
             assert!(
                 checks_failure_text("ABC-DEF0123", &[]).contains("on commit ABCDEF0."),
@@ -2298,12 +2311,13 @@ mod tests {
 
         #[test]
         fn fixed_words_cut_to_fit_are_cut_between_characters() {
-            // Paths of two- and three-byte characters, in counts that put the cut at every
-            // offset inside one.
-            for n in 300..306 {
-                let items: Vec<Feedback> = (0..n)
-                    .map(|_| {
-                        changes_requested(
+            // Paths of two- and three-byte characters, with logins whose length moves the cut
+            // through the bytes of those characters.
+            for login in 1..7 {
+                let items: Vec<Feedback> = (0..300)
+                    .map(|_| Feedback {
+                        author: "x".repeat(login),
+                        ..changes_requested(
                             "x",
                             vec![inline_comment(&"é€".repeat(100), Some(1), "y")],
                         )
