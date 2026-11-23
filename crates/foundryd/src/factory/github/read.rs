@@ -966,6 +966,8 @@ pub fn is_safe_branch_name(branch: &str) -> bool {
 // Part B: approval history, issue activity and pull request feedback.
 // ---------------------------------------------------------------------------------------------
 
+use std::collections::{HashMap, HashSet};
+
 use crate::factory::lifecycle::approval::Refusal;
 
 /// How many label events and body edits the approval query asks for. A history this long may be
@@ -1352,6 +1354,277 @@ fn require_utc_second(since: &str) -> Result<(), TrackerError> {
     }
 }
 
+/// Whether an edit history can be trusted to show every edit up to the latest one: it is not
+/// cut off (a full page, or a total larger than the page, may hide entries) and, when there is
+/// a latest edit, the newest entry is that edit by that editor.
+fn edits_whole(edits: &EditHistory, last_edited_at: Option<&str>, editor: Option<&Actor>) -> bool {
+    !is_cut_off(edits.total_count, edits.nodes.len())
+        && newest_is_last_edit(edits, last_edited_at, editor)
+}
+
+/// Whether the text of a review, a comment or an inline comment is its instructor's alone: it
+/// was never edited, or the person who last edited it and every person in its edit history is a
+/// human instructor (the creation is the oldest entry, by the author) and the history is whole.
+/// One that GitHub shows no history for, or shows cut off, is not trusted.
+fn text_is_instructors(
+    last_edited_at: Option<&str>,
+    editor: Option<&Actor>,
+    edits: Option<&EditHistory>,
+    instructors: &[String],
+) -> bool {
+    if last_edited_at.is_none() {
+        return true;
+    }
+    is_human_instructor(editor, instructors)
+        && edits.is_some_and(|edits| {
+            edits_whole(edits, last_edited_at, editor)
+                && edits
+                    .nodes
+                    .iter()
+                    .all(|edit| is_human_instructor(edit.editor.as_ref(), instructors))
+        })
+}
+
+/// One comment of the REST listing. `user` is null for a deleted account.
+#[derive(serde::Deserialize)]
+struct ActivityRow {
+    id: u64,
+    #[serde(default)]
+    node_id: Option<String>,
+    #[serde(default)]
+    user: Option<RestUser>,
+    #[serde(default)]
+    created_at: Option<String>,
+    #[serde(default)]
+    updated_at: Option<String>,
+    #[serde(default)]
+    body: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct RestUser {
+    login: String,
+}
+
+#[derive(serde::Deserialize)]
+struct ActivityAnswer {
+    data: ActivityData,
+}
+
+#[derive(serde::Deserialize)]
+struct ActivityData {
+    repository: ActivityRepository,
+}
+
+#[derive(serde::Deserialize)]
+struct ActivityRepository {
+    issue: ActivityIssue,
+}
+
+/// The issue's body and who edited it last, with the history of its edits.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ActivityIssue {
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    last_edited_at: Option<String>,
+    #[serde(default)]
+    editor: Option<Actor>,
+    user_content_edits: EditHistory,
+}
+
+/// One entry for each id asked for, in no promised order; `null` for a comment that is gone.
+#[derive(serde::Deserialize)]
+struct CommentEditorsAnswer {
+    data: CommentEditorsData,
+}
+
+#[derive(serde::Deserialize)]
+struct CommentEditorsData {
+    nodes: Vec<Option<CommentEditors>>,
+}
+
+/// The last editor and the edit history of one comment.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CommentEditors {
+    id: String,
+    #[serde(default)]
+    last_edited_at: Option<String>,
+    #[serde(default)]
+    editor: Option<Actor>,
+    user_content_edits: EditHistory,
+}
+
+/// A GraphQL `fullDatabaseId` is a BigInt that GraphQL sends as a decimal string; a number is
+/// read too.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum DatabaseId {
+    Text(String),
+    Number(serde_json::Number),
+}
+
+/// A comment a review left on a line of the diff. Its edit history is read on its own.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FeedbackInline {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    line: Option<u64>,
+    #[serde(default)]
+    original_line: Option<u64>,
+    #[serde(default)]
+    author: Option<Actor>,
+    #[serde(default)]
+    last_edited_at: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FeedbackInlineComments {
+    #[serde(default)]
+    total_count: Option<u64>,
+    nodes: Vec<FeedbackInline>,
+}
+
+/// `submitted_at` is null for a review still pending; the author and editor for a deleted
+/// account.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FeedbackReview {
+    #[serde(default)]
+    full_database_id: Option<DatabaseId>,
+    state: String,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    submitted_at: Option<String>,
+    #[serde(default)]
+    author: Option<Actor>,
+    #[serde(default)]
+    last_edited_at: Option<String>,
+    #[serde(default)]
+    editor: Option<Actor>,
+    #[serde(default)]
+    user_content_edits: Option<EditHistory>,
+    comments: FeedbackInlineComments,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PageInfo {
+    #[serde(default)]
+    start_cursor: Option<String>,
+}
+
+/// A page of reviews, oldest first, with the cursor of its first review.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FeedbackReviews {
+    #[serde(default)]
+    total_count: Option<u64>,
+    #[serde(default)]
+    page_info: Option<PageInfo>,
+    nodes: Vec<FeedbackReview>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FeedbackPrComment {
+    #[serde(default)]
+    full_database_id: Option<DatabaseId>,
+    #[serde(default)]
+    body: Option<String>,
+    created_at: String,
+    #[serde(default)]
+    author: Option<Actor>,
+    #[serde(default)]
+    last_edited_at: Option<String>,
+    #[serde(default)]
+    editor: Option<Actor>,
+    #[serde(default)]
+    user_content_edits: Option<EditHistory>,
+}
+
+#[derive(serde::Deserialize)]
+struct FeedbackComments {
+    nodes: Vec<FeedbackPrComment>,
+}
+
+#[derive(serde::Deserialize)]
+struct FeedbackPull {
+    reviews: FeedbackReviews,
+    comments: FeedbackComments,
+}
+
+#[derive(serde::Deserialize)]
+struct FeedbackAnswer {
+    data: FeedbackData,
+}
+
+#[derive(serde::Deserialize)]
+struct FeedbackData {
+    repository: FeedbackRepository,
+}
+
+/// `pullRequest` is null when the pull request is gone.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FeedbackRepository {
+    #[serde(default)]
+    pull_request: Option<FeedbackPull>,
+}
+
+#[derive(serde::Deserialize)]
+struct ReviewsBeforeAnswer {
+    data: ReviewsBeforeData,
+}
+
+#[derive(serde::Deserialize)]
+struct ReviewsBeforeData {
+    repository: ReviewsBeforeRepository,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReviewsBeforeRepository {
+    #[serde(default)]
+    pull_request: Option<ReviewsOnly>,
+}
+
+#[derive(serde::Deserialize)]
+struct ReviewsOnly {
+    reviews: FeedbackReviews,
+}
+
+/// The review states whose inline comments are read: every submitted one.
+const FEEDBACK_STATES: [&str; 4] = ["CHANGES_REQUESTED", "COMMENTED", "APPROVED", "DISMISSED"];
+
+/// The id of a review or comment as the decimal digits GitHub gave, or `None` when it is not a
+/// number.
+fn database_id(id: Option<&DatabaseId>) -> Option<String> {
+    match id? {
+        // A JSON number is read only as a whole number JavaScript also holds exactly.
+        DatabaseId::Number(number) => number
+            .as_u64()
+            .filter(|id| *id < (1 << 53))
+            .map(|id| id.to_string()),
+        DatabaseId::Text(text) => {
+            if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            text.parse::<u64>().ok().map(|id| id.to_string())
+        }
+    }
+}
+
 /// An instructor's comment made during a build.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Comment {
@@ -1478,8 +1751,172 @@ pub fn activity_since<G: Tracker + ?Sized>(
     since: &str,
     instructors: &[String],
 ) -> Result<Activity, TrackerError> {
-    let _ = (gh, repo, issue, since, instructors);
-    todo!("part B")
+    let comments_path = format!("repos/{repo}/issues/{issue}/comments");
+    let query = issue_query_args(repo, ACTIVITY_QUERY, issue)?;
+    if !is_utc_second(since) {
+        return Err(parse_error(
+            &["api".to_string(), comments_path],
+            &format!("`since` as YYYY-MM-DDTHH:MM:SSZ, got {}", quoted(since)),
+        ));
+    }
+    let listed: Vec<ActivityRow> = gh_pages(
+        gh,
+        &[
+            "api".to_string(),
+            format!("{comments_path}?since={since}&per_page=100"),
+            "--paginate".to_string(),
+        ],
+        "JSON arrays of comments",
+    )?;
+    let mut written: Vec<&ActivityRow> = listed
+        .iter()
+        .filter(|c| c.created_at.as_deref().is_some_and(|at| at > since))
+        .filter(|c| is_instructor(c.user.as_ref().map(|u| u.login.as_str()), instructors))
+        .filter(|c| {
+            !c.body
+                .as_deref()
+                .unwrap_or_default()
+                .contains(MARKER_PREFIX)
+        })
+        .collect();
+    // Stable, so comments of the same second keep the order they were read in.
+    written.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    let edited = |c: &ActivityRow| c.updated_at != c.created_at;
+    // Who edited the edited ones, in one call for each 100 of them.
+    let edited_ids: Vec<&str> = written
+        .iter()
+        .filter(|c| edited(c))
+        .filter_map(|c| c.node_id.as_deref())
+        .collect();
+    let editors = comment_editors(gh, &edited_ids)?;
+    let mut comments = Vec::new();
+    let mut dropped = Vec::new();
+    for c in written {
+        if edited(c) {
+            let node = c.node_id.as_deref().and_then(|id| editors.get(id));
+            let reason = match check_edits(node, instructors) {
+                EditVerdict::Instructors => None,
+                EditVerdict::Other => Some(DropReason::EditedByOther),
+                EditVerdict::Unverifiable => Some(DropReason::Unverifiable),
+                // Not forwardable and not reported: there is nothing to point a notice at.
+                EditVerdict::Gone => continue,
+            };
+            if let Some(reason) = reason {
+                dropped.push(Dropped {
+                    id: c.id.to_string(),
+                    reason,
+                });
+                continue;
+            }
+        }
+        comments.push(Comment {
+            id: c.id.to_string(),
+            author: c.user.as_ref().map(|u| u.login.clone()).unwrap_or_default(),
+            created_at: c.created_at.clone().unwrap_or_default(),
+            body: c.body.clone().unwrap_or_default(),
+        });
+    }
+
+    let answer: ActivityAnswer = gh_json(gh, &query, "a GraphQL response with the issue")?;
+    let found = answer.data.repository.issue;
+    // The history comes newest first, so a page that is full or short of the total may be
+    // missing the latest edits, and a newest entry that is not the latest edit means the same:
+    // fail closed. The creation entry is before `since` for an issue that existed before the
+    // run.
+    let only_instructors = edits_whole(
+        &found.user_content_edits,
+        found.last_edited_at.as_deref(),
+        found.editor.as_ref(),
+    ) && found
+        .user_content_edits
+        .nodes
+        .iter()
+        .filter(|edit| edit.edited_at.as_str() > since)
+        .all(|edit| is_human_instructor(edit.editor.as_ref(), instructors));
+    let body_edit = match (&found.last_edited_at, &found.editor) {
+        (Some(edited_at), Some(editor))
+            if only_instructors
+                && edited_at.as_str() > since
+                && is_human_instructor(Some(editor), instructors) =>
+        {
+            Some(BodyEdit {
+                edited_at: edited_at.clone(),
+                editor: editor.login.clone(),
+                body: found.body.clone().unwrap_or_default(),
+            })
+        }
+        _ => None,
+    };
+    Ok(Activity {
+        comments,
+        body_edit,
+        dropped,
+    })
+}
+
+/// How far an edited comment can be trusted, from its entry in [`comment_editors`].
+enum EditVerdict {
+    Instructors,
+    Other,
+    Unverifiable,
+    Gone,
+}
+
+/// Whether a comment updated after it was written may be trusted: GitHub has no edit of it, or
+/// every edit is by an instructor who is a `User`. There is no `since` cut-off: any other editor
+/// at any time makes it `Other`, even with a too-long history; a history that may hide more is
+/// `Unverifiable`, no entry `Gone`.
+fn check_edits(node: Option<&CommentEditors>, instructors: &[String]) -> EditVerdict {
+    let Some(node) = node else {
+        return EditVerdict::Gone;
+    };
+    let last_other =
+        node.last_edited_at.is_some() && !is_human_instructor(node.editor.as_ref(), instructors);
+    // Every entry, the creation included (its editor is the author, an instructor).
+    let any_other = node
+        .user_content_edits
+        .nodes
+        .iter()
+        .any(|edit| !is_human_instructor(edit.editor.as_ref(), instructors));
+    if last_other || any_other {
+        EditVerdict::Other
+    } else if edits_whole(
+        &node.user_content_edits,
+        node.last_edited_at.as_deref(),
+        node.editor.as_ref(),
+    ) {
+        EditVerdict::Instructors
+    } else {
+        EditVerdict::Unverifiable
+    }
+}
+
+/// The last editor and the last 100 edits of the comments with these node ids, by id: one call
+/// for each 100 ids, and none for no ids. A comment that is gone is not in the map. A call that
+/// fails fails the read.
+fn comment_editors<G: Tracker + ?Sized>(
+    gh: &G,
+    ids: &[&str],
+) -> Result<HashMap<String, CommentEditors>, TrackerError> {
+    let mut found = HashMap::new();
+    for chunk in ids.chunks(COMMENT_EDITOR_IDS) {
+        let mut args = vec![
+            "api".to_string(),
+            "graphql".to_string(),
+            "-f".to_string(),
+            format!("query={COMMENT_EDITOR_QUERY}"),
+        ];
+        for id in chunk {
+            args.push("-f".to_string());
+            args.push(format!("ids[]={id}"));
+        }
+        let answer: CommentEditorsAnswer =
+            gh_json(gh, &args, "a GraphQL response with the comments")?;
+        for node in answer.data.nodes.into_iter().flatten() {
+            found.insert(node.id.clone(), node);
+        }
+    }
+    Ok(found)
 }
 
 /// The instructors' feedback on pull request `pr` after `since`, reading back no further than
@@ -1492,8 +1929,256 @@ pub fn pr_feedback<G: Tracker + ?Sized>(
     floor: &str,
     instructors: &[String],
 ) -> Result<Vec<Feedback>, TrackerError> {
-    let _ = (gh, repo, pr, since, floor, instructors);
-    todo!("part B")
+    for (name, time) in [("since", since), ("floor", floor)] {
+        if !is_utc_second(time) {
+            return Err(parse_error(
+                &["api".to_string(), "graphql".to_string()],
+                &format!("`{name}` as YYYY-MM-DDTHH:MM:SSZ, got {}", quoted(time)),
+            ));
+        }
+    }
+    let args = issue_query_args(repo, PR_FEEDBACK_QUERY, pr)?;
+    let answer: FeedbackAnswer = gh_json(gh, &args, "a GraphQL response with the pull request")?;
+    let Some(pull) = answer.data.repository.pull_request else {
+        return Ok(Vec::new());
+    };
+    let unreadable =
+        |what: &str, got: &str| parse_error(&args, &format!("{what}, got {}", quoted(got)));
+    // Written by an instructor who is a person, and not by the factory.
+    let theirs = |author: Option<&Actor>, body: Option<&str>| {
+        is_human_instructor(author, instructors)
+            && !body.unwrap_or_default().contains(MARKER_PREFIX)
+    };
+
+    let reviews = reviews_since(gh, repo, pr, floor, &args, pull.reviews)?;
+    // The reviews to judge, with the time each was submitted.
+    let mut judged: Vec<(FeedbackReview, String)> = Vec::new();
+    for review in reviews {
+        if !theirs(review.author.as_ref(), review.body.as_deref())
+            || !text_is_instructors(
+                review.last_edited_at.as_deref(),
+                review.editor.as_ref(),
+                review.user_content_edits.as_ref(),
+                instructors,
+            )
+        {
+            continue;
+        }
+        let Some(at) = review.submitted_at.clone() else {
+            continue;
+        };
+        if !is_utc_second(&at) {
+            return Err(unreadable("a review time as YYYY-MM-DDTHH:MM:SSZ", &at));
+        }
+        if at.as_str() <= since {
+            continue;
+        }
+        judged.push((review, at));
+    }
+
+    // The edit history of every edited inline comment of those reviews, read together.
+    let mut edited_ids: Vec<&str> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for (review, _) in &judged {
+        if !FEEDBACK_STATES.contains(&review.state.as_str()) {
+            continue;
+        }
+        for c in &review.comments.nodes {
+            if let Some(id) = c.id.as_deref()
+                && c.last_edited_at.is_some()
+                && theirs(c.author.as_ref(), c.body.as_deref())
+                && seen.insert(id)
+            {
+                edited_ids.push(id);
+            }
+        }
+    }
+    let histories = comment_editors(gh, &edited_ids)?;
+
+    let mut found: Vec<Feedback> = Vec::new();
+    for (review, at) in &judged {
+        let body = review.body.clone().unwrap_or_default();
+        let inline_unread = review
+            .comments
+            .total_count
+            .unwrap_or(0)
+            .saturating_sub(review.comments.nodes.len() as u64);
+        let mut inline = Vec::new();
+        for c in &review.comments.nodes {
+            if !theirs(c.author.as_ref(), c.body.as_deref()) {
+                continue;
+            }
+            // One that was never edited needs no history; an edited one with no node id, or
+            // whose history the answer does not have (it is gone), is not trusted.
+            if c.last_edited_at.is_some() {
+                let node = c.id.as_deref().and_then(|id| histories.get(id));
+                let trusted = node.is_some_and(|node| {
+                    text_is_instructors(
+                        node.last_edited_at.as_deref(),
+                        node.editor.as_ref(),
+                        Some(&node.user_content_edits),
+                        instructors,
+                    )
+                });
+                if !trusted {
+                    continue;
+                }
+            }
+            inline.push(InlineComment {
+                path: c.path.clone().unwrap_or_default(),
+                line: c.line.or(c.original_line),
+                body: c.body.clone().unwrap_or_default(),
+            });
+        }
+        // An approval's body is not read, so "LGTM!" does not send the pull request back to
+        // draft. A comment and a `COMMENTED` review always count: the factory's login opens
+        // the pull requests, so an instructor acting as it cannot approve or request changes
+        // and comments are its only way to ask.
+        let counts = match review.state.as_str() {
+            "CHANGES_REQUESTED" | "COMMENTED" => true,
+            "APPROVED" => !inline.is_empty(),
+            "DISMISSED" => !body.trim().is_empty() || !inline.is_empty(),
+            _ => false,
+        };
+        if !counts {
+            continue;
+        }
+        let Some(id) = database_id(review.full_database_id.as_ref()) else {
+            return Err(unreadable("a review with an id", &review.state));
+        };
+        found.push(Feedback {
+            id: format!("review:{id}"),
+            author: review
+                .author
+                .as_ref()
+                .map(|a| a.login.clone())
+                .unwrap_or_default(),
+            kind: FeedbackKind::Review {
+                state: review.state.clone(),
+            },
+            created_at: at.clone(),
+            body,
+            inline,
+            inline_unread,
+        });
+    }
+
+    for comment in &pull.comments.nodes {
+        if !theirs(comment.author.as_ref(), comment.body.as_deref())
+            || !text_is_instructors(
+                comment.last_edited_at.as_deref(),
+                comment.editor.as_ref(),
+                comment.user_content_edits.as_ref(),
+                instructors,
+            )
+        {
+            continue;
+        }
+        if !is_utc_second(&comment.created_at) {
+            return Err(unreadable(
+                "a comment time as YYYY-MM-DDTHH:MM:SSZ",
+                &comment.created_at,
+            ));
+        }
+        if comment.created_at.as_str() <= since {
+            continue;
+        }
+        let Some(id) = database_id(comment.full_database_id.as_ref()) else {
+            return Err(unreadable("a comment with an id", &comment.created_at));
+        };
+        found.push(Feedback {
+            id: format!("pr-comment:{id}"),
+            author: comment
+                .author
+                .as_ref()
+                .map(|a| a.login.clone())
+                .unwrap_or_default(),
+            kind: FeedbackKind::PrComment,
+            created_at: comment.created_at.clone(),
+            body: comment.body.clone().unwrap_or_default(),
+            inline: Vec::new(),
+            inline_unread: 0,
+        });
+    }
+    // Stable, so a review and a comment of the same second keep the order they were read in.
+    found.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    Ok(found)
+}
+
+/// Every review of pull request `pr` that may be new, oldest first: the newest page `first` and
+/// the pages before it, read with `before:` until one starts at or before `floor` or is empty.
+/// A repeated cursor, a page past [`REVIEW_PAGE_LIMIT`], a missing cursor or a vanished pull
+/// request is an error (`args` names the call): a read short of `floor` must not pass as empty.
+fn reviews_since<G: Tracker + ?Sized>(
+    gh: &G,
+    repo: &str,
+    pr: u64,
+    floor: &str,
+    args: &[String],
+    first: FeedbackReviews,
+) -> Result<Vec<FeedbackReview>, TrackerError> {
+    let total = first.total_count.unwrap_or(0);
+    let mut cursor = first.page_info.and_then(|info| info.start_cursor);
+    let mut reviews = first.nodes;
+    let mut pages = 1;
+    while total > reviews.len() as u64 {
+        // The oldest review read is proven old only by a submission time at or before `floor`.
+        if let Some(at) = reviews.first().and_then(|r| r.submitted_at.as_deref()) {
+            if !is_utc_second(at) {
+                return Err(parse_error(
+                    args,
+                    &format!("a review time as YYYY-MM-DDTHH:MM:SSZ, got {}", quoted(at)),
+                ));
+            }
+            if at <= floor {
+                break;
+            }
+        }
+        let Some(before) = cursor.take() else {
+            return Err(parse_error(
+                args,
+                &format!(
+                    "a cursor for the reviews before the oldest one read, since there are {total} and {} were read",
+                    reviews.len()
+                ),
+            ));
+        };
+        if pages >= REVIEW_PAGE_LIMIT {
+            return Err(parse_error(
+                args,
+                &format!("the reviews since {floor} within {REVIEW_PAGE_LIMIT} pages of 50"),
+            ));
+        }
+        let mut page_args = issue_query_args(repo, REVIEWS_BEFORE_QUERY, pr)?;
+        page_args.push("-f".to_string());
+        page_args.push(format!("before={before}"));
+        let answer: ReviewsBeforeAnswer = gh_json(
+            gh,
+            &page_args,
+            "a GraphQL response with the earlier reviews",
+        )?;
+        pages += 1;
+        let Some(pull) = answer.data.repository.pull_request else {
+            return Err(parse_error(
+                &page_args,
+                "the pull request on every page of its reviews",
+            ));
+        };
+        // GitHub answers `before:` the oldest cursor with an empty page: the start of the list
+        // was reached, and everything was read even if `totalCount` counted more.
+        if pull.reviews.nodes.is_empty() {
+            break;
+        }
+        cursor = pull.reviews.page_info.and_then(|info| info.start_cursor);
+        if cursor.as_deref() == Some(before.as_str()) {
+            return Err(parse_error(
+                &page_args,
+                &format!("a new cursor for the reviews before {before}, got the same one again"),
+            ));
+        }
+        reviews.splice(0..0, pull.reviews.nodes);
+    }
+    Ok(reviews)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -6463,8 +7148,10 @@ mod tests {
         let bad_time = pr_comment_node(21, "hi", "yesterday", "rawphp");
         let not_a_number = pr_comment_node("abc", "hi", "2026-10-04T11:00:00Z", "rawphp");
         for comment in [no_id, bad_time, not_a_number] {
-            let fake =
-                FakeTracker::answering([Answer::ok(feedback_reply(&[], &[comment.clone()]))]);
+            let fake = FakeTracker::answering([Answer::ok(feedback_reply(
+                &[],
+                std::slice::from_ref(&comment),
+            ))]);
             assert!(is_parse_error(&feedback_error(&fake)), "{comment}");
         }
         let mut no_review_id = review_node(
