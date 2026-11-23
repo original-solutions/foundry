@@ -298,7 +298,8 @@ fn fail(errors: Vec<ConfigError>) -> ConfigErrors {
 }
 
 /// Parse the text of a project's `.dw/config.yml`, reporting every problem found in one pass.
-/// Keys the factory does not read are ignored; `factory.owner` only sets `owner_set`.
+/// Keys the factory does not read are ignored. `factory.owner`, when present, must be a non-empty
+/// string; its value is dropped and it only sets `owner_set`.
 pub fn parse(yaml: &str) -> Result<ProjectConfig, ConfigErrors> {
     let mut c = Checker::default();
     let value = match serde_yaml_ng::from_str::<Value>(yaml) {
@@ -542,7 +543,8 @@ factory:
             }
         }
 
-        // The runner's test names are kept; the owner value is read only as `owner_set` (spec F9: the owner is ignored).
+        // The runner's test names are kept. The owner must still be a non-empty string when present,
+        // but its value is dropped and only `owner_set` is kept (spec F9: the owner does not decide who acts).
         mod the_owner {
             use super::*;
 
@@ -882,7 +884,10 @@ factory:
             let t = edit(PROJECT, |tree| {
                 set(tree, "factory.owner", "\"\"");
                 set(tree, "factory.autonomy", "merge");
+                set(tree, "factory.limits.interruption_resumes", "-1");
+                set(tree, "factory.limits.checks_minutes", "0");
                 remove(tree, "factory.limits.gate_retries");
+                set(tree, "factory.limits.minutes", "0");
                 set(tree, "factory.required_checks", "5");
                 set(tree, "factory.gate", "[]");
                 set(tree, "factory.provision", "5");
@@ -897,7 +902,10 @@ factory:
                     "factory.provision",
                     "factory.gate",
                     "factory.required_checks",
+                    "factory.limits.minutes",
                     "factory.limits.gate_retries",
+                    "factory.limits.checks_minutes",
+                    "factory.limits.interruption_resumes",
                     "factory.autonomy",
                     "factory.owner"
                 ]
