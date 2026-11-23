@@ -360,7 +360,7 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
     services.spawn(named("the Tailscale address watch", tailscale.watch()));
     services.spawn(named(
         "the machine list entry",
-        list_this_machine(answered, listing, store.clone(), me),
+        list_this_machine(answered, listing, store.clone(), me, own_entry),
     ));
     services.spawn(named("updates", update::run(home.clone())));
     services.spawn(named("gateway health", gateway_reader.run()));
@@ -652,20 +652,25 @@ pub(crate) async fn own_entry() -> Result<api::machine_names::Entry, String> {
 /// to `listing`, which also reads the watch's mark that Tailscale was away. It runs apart from
 /// the watch, so an edit waiting on the coordinator never holds up binding an address.
 ///
+/// `ask` gives what Tailscale calls this machine: [`own_entry`] in the daemon.
+///
 /// `tailscale status` is asked only when [`Told`] has no answer for what `ip` said. Each look
 /// still reads this machine's copy of the settings: that is what moves back an address another
 /// machine's edit put back.
-async fn list_this_machine(
+async fn list_this_machine<F>(
     mut answered: tokio::sync::watch::Receiver<BTreeSet<IpAddr>>,
     mut listing: api::machine_names::Listing,
     store: Arc<Mutex<Store>>,
     me: foundry_proto::ids::MachineId,
-) {
+    ask: impl Fn() -> F,
+) where
+    F: Future<Output = Result<api::machine_names::Entry, String>>,
+{
     let mut told = Told::default();
     let mut warned = false;
     while answered.changed().await.is_ok() {
         let ips = answered.borrow_and_update().clone();
-        let entry = told.entry(&ips, own_entry).await;
+        let entry = told.entry(&ips, &ask).await;
         list_unless_removed(&mut listing, &store, me, &mut warned, entry).await;
     }
 }
