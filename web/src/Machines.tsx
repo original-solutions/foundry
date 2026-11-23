@@ -59,14 +59,14 @@ export function Machines({ machines, history, here, connected }: Props) {
       </div>
       <div className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,24rem),1fr))] gap-4">
         {machines.map((machine) => (
-          <MachineCard key={machine.id} machine={machine} points={history[machine.id]?.points ?? []} heard={history[machine.id]?.heard} here={machine.id === here} now={now} />
+          <MachineCard key={machine.id} machine={machine} points={history[machine.id]?.points ?? []} heard={history[machine.id]?.heard} here={machine.id === here} known={here !== undefined} now={now} />
         ))}
       </div>
     </section>
   );
 }
 
-function MachineCard({ machine, points, heard, here, now }: { machine: MachineView; points: Point[]; heard?: number; here: boolean; now: number }) {
+function MachineCard({ machine, points, heard, here, known, now }: { machine: MachineView; points: Point[]; heard?: number; here: boolean; known: boolean; now: number }) {
   const { sample, status } = machine;
   const away = status === "offline";
   const all = machine.workspaces.flatMap(rows);
@@ -112,7 +112,7 @@ function MachineCard({ machine, points, heard, here, now }: { machine: MachineVi
         <p className="min-w-0 text-xs text-neutral-400">{machine.limits ? limitsText(machine.limits) : "No limits"}</p>
         {machine.listed && <LimitsDialog machine={machine} />}
       </div>
-      {machine.listed && !here && (
+      {machine.listed && known && !here && (
         <div className="flex justify-end px-4 pt-1.5">
           <RemoveDialog machine={machine} />
         </div>
