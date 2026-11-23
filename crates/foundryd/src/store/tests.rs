@@ -1475,7 +1475,7 @@ fn run_events_hold_one_run_and_only_events() {
     let longer = run_id("a/b", 1, 10);
     assert_eq!(longer.to_string(), format!("{run}0"));
     let mut version = 0;
-    let mut put = |store: &mut Store, record: FactoryRecord| {
+    let put = |store: &mut Store, record: FactoryRecord| {
         store.apply_factory(&record, owner).unwrap();
     };
     for (run, generation) in [(&run, 1), (&longer, 1), (&run, 2)] {
