@@ -776,3 +776,45 @@ async fn a_removed_machine_that_holds_its_removal_never_lists_itself_again_and_o
     assert!(d.settings().machines.iter().all(|m| m.id != c_id));
     assert!(c.settings().machines.iter().all(|m| m.id != c_id));
 }
+
+#[tokio::test]
+async fn a_removed_machine_cannot_join_again_through_a_machine_that_never_held_its_key() {
+    let net = Net::default();
+    let dirs: Vec<TempDir> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let a = Member::start(&net, &dirs[0], &a_entry()).await;
+    let port = a.serve().await;
+    let c_own = own("c", "127.0.0.4");
+    let c = joined(&net, &dirs[1], port, c_own.clone()).await;
+    let c_id = c.keys.me();
+    until(Duration::from_secs(30), "A and C linked", || {
+        !a.open_links(c_id).is_empty()
+    })
+    .await;
+    assert_eq!(post_remove(port, c_id).await, 204);
+    until(Duration::from_secs(10), "A holds the removal", || {
+        join::is_removed(&a.settings(), c_id)
+    })
+    .await;
+
+    // D joins after the removal, so its list never carried C's key, and it holds the removal.
+    let d = joined(&net, &dirs[2], port, own("d", "127.0.0.5")).await;
+    until(Duration::from_secs(10), "D holds the removal", || {
+        join::is_removed(&d.settings(), c_id)
+    })
+    .await;
+    assert_eq!(d.keys.state(c_id), KeyState::NoKey);
+    let d_port = d.serve().await;
+
+    // On D's board, someone adds C again, and C runs the join under its old identity.
+    let code = add_localhost(d_port).await;
+    let rejoined = join_with(&dirs[1], d_port, code, c_own).await;
+
+    assert!(rejoined.is_err(), "a removed machine joined again");
+    assert_ne!(d.keys.state(c_id), KeyState::Active);
+    for member in [&a, &d] {
+        assert!(
+            member.settings().machines.iter().all(|m| m.id != c_id),
+            "C is listed again"
+        );
+    }
+}
