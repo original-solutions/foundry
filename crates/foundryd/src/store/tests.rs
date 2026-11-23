@@ -863,11 +863,11 @@ fn no_column_in_the_schema_holds_a_time() {
     }
 }
 
-/// Review focus 3, checked in the queries themselves: every `ORDER BY` in `mod.rs` orders
-/// by a version. It reads only `mod.rs`, which holds every query of the store today.
+/// Review focus 3, checked in the queries themselves: every `ORDER BY` in `mod.rs` (P1's
+/// queries) orders by a version. The factory table's queries are in `factory.rs`; see
+/// `the_factory_queries_order_only_by_a_generation_a_version_or_an_owner`.
 #[test]
 fn every_query_that_orders_orders_by_version() {
-    // mod.rs holds P1's queries; the factory table's are in factory.rs, checked below.
     let source = include_str!("mod.rs").to_uppercase();
     let mut found = 0;
     for (at, _) in source.match_indices("ORDER BY") {
@@ -1333,6 +1333,7 @@ fn factory_since_gives_one_owners_records_above_a_version_lowest_first_up_to_a_l
         store.factory_since(owner, 0, 10).unwrap(),
         vec![held(owner, 5, &["x"])]
     );
+    assert!(store.factory_since(owner, u64::MAX, 100).unwrap().is_empty());
 
     let run = run_id("a/b", 1, 1);
     for version in [10, 8, 9, 7] {
@@ -1413,12 +1414,32 @@ fn p1_reads_never_return_or_count_a_factory_record() {
         store.apply_factory(&record, owner).unwrap();
     }
     // A turn for the owner's session from a second machine is refused, not stored.
-    store
-        .apply_factory(
-            &turn_record(factory_owner, 60, session_id, 3),
-            factory_owner,
-        )
-        .unwrap();
+    assert_eq!(
+        store
+            .apply_factory(
+                &turn_record(factory_owner, 60, session_id, 3),
+                factory_owner,
+            )
+            .unwrap(),
+        Applied::NotOwner
+    );
+    // And a record the second machine really owns, stored, is still no P1 record.
+    assert_eq!(
+        store
+            .apply_factory(&held(factory_owner, 61, &["x"]), factory_owner)
+            .unwrap(),
+        Applied::Stored
+    );
+    assert_eq!(
+        store
+            .apply_factory(
+                &turn_record(factory_owner, 62, SessionId(uuid::Uuid::from_u128(9)), 1),
+                factory_owner,
+            )
+            .unwrap(),
+        Applied::Stored
+    );
+    assert!(!store.factory_since(factory_owner, 0, 10).unwrap().is_empty());
     assert_eq!(store.since(owner, 0).unwrap(), before_since);
     assert!(store.since(factory_owner, 0).unwrap().is_empty());
     assert_eq!(store.versions().unwrap(), before_versions);
@@ -1436,15 +1457,36 @@ fn run_events_read_back_in_generation_order_whatever_the_versions_and_times() {
     // Generation 2 has the lower version and the earlier time.
     let late = run_event(first, 9, &run, 1, 9_000);
     let early = run_event(second, 1, &run, 2, 1_000);
+    // Generation 10 has the lowest version of all and a misleading time.
+    let tenth = run_event(first, 0, &run, 10, 500);
     store.apply_factory(&early, second).unwrap();
     store.apply_factory(&late, first).unwrap();
+    store.apply_factory(&tenth, first).unwrap();
     let events = store.run_events(&run).unwrap();
-    assert_eq!(events.len(), 2);
+    assert_eq!(events.len(), 3);
     assert_eq!(
         events.iter().map(|e| e.generation).collect::<Vec<_>>(),
-        [1, 2]
+        [1, 2, 10]
     );
     assert_eq!(events[0].ms, 9_000);
+}
+
+#[test]
+fn run_events_of_one_generation_and_version_come_back_in_owner_order() {
+    let (_dir, mut store) = open();
+    let run = run_id("a/b", 1, 1);
+    let mut owners = [MachineId::random(), MachineId::random()];
+    owners.sort_by_key(|o| o.to_string());
+    let [low, high] = owners;
+    // Applied in reverse owner order; the ms tells whose event is whose.
+    store
+        .apply_factory(&run_event(high, 5, &run, 3, 222), high)
+        .unwrap();
+    store
+        .apply_factory(&run_event(low, 5, &run, 3, 111), low)
+        .unwrap();
+    let events = store.run_events(&run).unwrap();
+    assert_eq!(events.iter().map(|e| e.ms).collect::<Vec<_>>(), [111, 222]);
 }
 
 #[test]
@@ -1517,6 +1559,39 @@ fn runs_of_gives_each_run_of_the_repo_once_in_order() {
     assert_eq!(store.runs_of("rawphp/softfac").unwrap(), expected);
     assert_eq!(store.runs_of("RawPHP/SoftFac").unwrap(), expected);
     assert!(store.runs_of("rawphp/none").unwrap().is_empty());
+}
+
+#[test]
+fn runs_of_reads_the_run_from_the_key_and_never_parses_another_repos_records() {
+    let (_dir, mut store) = open();
+    let owner = MachineId::random();
+    let run = run_id("rawphp/softfac", 2, 1);
+    store
+        .apply_factory(&run_event(owner, 1, &run, 1, 1), owner)
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO factory_records (kind, id, owner, version, record) \
+             VALUES ('run_event', ?1, ?2, 2, 'not json')",
+            params![format!("other__repo__1__1/{owner}/2"), owner.to_string()],
+        )
+        .unwrap();
+    assert_eq!(store.runs_of("rawphp/softfac").unwrap(), vec![run]);
+}
+
+#[test]
+fn runs_of_folds_the_repo_as_a_run_id_does() {
+    let (_dir, mut store) = open();
+    let owner = MachineId::random();
+    let run = run_id("rawphp/softfack", 2, 1);
+    store
+        .apply_factory(&run_event(owner, 1, &run, 1, 1), owner)
+        .unwrap();
+    assert_eq!(store.runs_of("RawPHP/SoftFacK").unwrap(), vec![run]);
+    // U+212A KELVIN SIGN lowercases to `k` in Unicode, but is no legal repo character.
+    assert!(store.runs_of("rawphp/softfac\u{212A}").unwrap().is_empty());
+    assert!(store.runs_of("not a repo").unwrap().is_empty());
 }
 
 #[test]
@@ -1667,9 +1742,9 @@ fn the_factory_migration_runs_on_a_p1_database_and_leaves_records_untouched() {
 
 #[test]
 fn the_factory_queries_order_only_by_a_generation_a_version_or_an_owner() {
-    let source = include_str!("factory.rs");
-    assert!(!source.contains("$.body.ts"));
-    assert!(!source.contains("$.body.ms"));
+    let source = include_str!("factory.rs").to_uppercase();
+    assert!(!source.contains("$.BODY.TS"));
+    assert!(!source.contains("$.BODY.MS"));
     let mut found = 0;
     for (at, _) in source.match_indices("ORDER BY") {
         found += 1;
@@ -1679,10 +1754,10 @@ fn the_factory_queries_order_only_by_a_generation_a_version_or_an_owner() {
         let clause = clause.replace("\\\n", " ");
         let clause = clause.split("LIMIT").next().unwrap();
         // The generation's own comma is not a separator between terms.
-        let clause = clause.replace("json_extract(record, '$.body.generation')", "generation");
+        let clause = clause.replace("JSON_EXTRACT(RECORD, '$.BODY.GENERATION')", "GENERATION");
         for term in clause.split(',') {
             let term = term.trim();
-            let allowed = ["version", "owner", "generation"];
+            let allowed = ["VERSION", "OWNER", "GENERATION"];
             assert!(allowed.contains(&term), "orders by {term:?}");
         }
     }
