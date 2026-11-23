@@ -974,8 +974,14 @@ use crate::factory::lifecycle::approval::Refusal;
 /// cut off.
 pub const HISTORY_PAGE: usize = 100;
 
-/// Any comment containing this was written by the factory.
-const MARKER_PREFIX: &str = "<!-- softfac";
+/// Any comment containing one of these was written by the factory: the runner's markers, and
+/// Foundry's own (such as its claim comment).
+const MARKER_PREFIXES: [&str; 2] = ["<!-- softfac", "<!-- foundry:"];
+
+/// Whether `body` was written by the factory.
+fn is_factory_comment(body: &str) -> bool {
+    MARKER_PREFIXES.iter().any(|prefix| body.contains(prefix))
+}
 
 /// Who applied the issue's labels, who renamed it and who edited its body. `last: 100` of the
 /// timeline items is the newest 100 (GitHub lists them oldest first), and
@@ -1772,12 +1778,7 @@ pub fn activity_since<G: Tracker + ?Sized>(
         .iter()
         .filter(|c| c.created_at.as_deref().is_some_and(|at| at > since))
         .filter(|c| is_instructor(c.user.as_ref().map(|u| u.login.as_str()), instructors))
-        .filter(|c| {
-            !c.body
-                .as_deref()
-                .unwrap_or_default()
-                .contains(MARKER_PREFIX)
-        })
+        .filter(|c| !is_factory_comment(c.body.as_deref().unwrap_or_default()))
         .collect();
     // Stable, so comments of the same second keep the order they were read in.
     written.sort_by(|a, b| a.created_at.cmp(&b.created_at));
@@ -1947,7 +1948,7 @@ pub fn pr_feedback<G: Tracker + ?Sized>(
     // Written by an instructor who is a person, and not by the factory.
     let theirs = |author: Option<&Actor>, body: Option<&str>| {
         is_human_instructor(author, instructors)
-            && !body.unwrap_or_default().contains(MARKER_PREFIX)
+            && !is_factory_comment(body.unwrap_or_default())
     };
 
     let reviews = reviews_since(gh, repo, pr, floor, &args, pull.reviews)?;
