@@ -592,9 +592,11 @@ impl Told {
 const RESCAN: Duration = Duration::from_secs(5);
 
 /// How many asks of Tailscale in a row may run past their time before the watch takes it as
-/// not answering and stops every server. The asks are [`RESCAN`] apart, so three are about 15
-/// seconds, the fleet's offline limit ([`OFFLINE_AFTER`](crate::sync::OFFLINE_AFTER)): a
-/// peer would see this machine go offline by then anyway.
+/// not answering and stops every server. An ask that times out takes `ASK_WITHIN` (3 s) and
+/// the next waits [`RESCAN`] (5 s), so timed-out asks are about 8 s apart and the third comes
+/// about 24 s after the last answer. The issue chose three about the fleet's offline limit
+/// ([`OFFLINE_AFTER`](crate::sync::OFFLINE_AFTER)): one or two slow asks are not worth
+/// dropping the addresses for, a third is a Tailscale that is not answering.
 const TIMEOUTS_BEFORE_AWAY: u32 = 3;
 
 /// Serves the app on every address Tailscale reports for this machine, now and as they
@@ -687,14 +689,15 @@ impl Tailscale {
                     BTreeSet::new()
                 } else if self.timeouts < TIMEOUTS_BEFORE_AWAY {
                     if self.timeouts == 1 {
-                        tracing::warn!(
-                            "Tailscale did not answer in time, so the addresses already listened on stay: {why}"
-                        );
-                    }
-                    if first && self.served.is_empty() {
-                        tracing::warn!(
-                            "no Tailscale address is bound yet, so peers cannot reach this machine until one appears"
-                        );
+                        if self.served.is_empty() {
+                            tracing::warn!(
+                                "Tailscale did not answer in time, so no address is listened on yet (peers cannot reach this machine until it answers): {why}"
+                            );
+                        } else {
+                            tracing::warn!(
+                                "Tailscale did not answer in time, so the addresses already listened on stay: {why}"
+                            );
+                        }
                     }
                     return;
                 } else {
@@ -1162,7 +1165,12 @@ mod tests {
         assert!(tailscale.served.contains_key(&kept));
         assert!(!tailscale.away.load(Ordering::Relaxed));
         assert!(!answered.has_changed().unwrap());
-        assert!(tailscale.servers.try_join_next().is_none(), "none aborted");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), tailscale.servers.join_next())
+                .await
+                .is_err(),
+            "none aborted"
+        );
         let warnings = logged.warnings();
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("stay"), "{warnings:?}");
@@ -1234,8 +1242,7 @@ mod tests {
         assert!(!tailscale.away.load(Ordering::Relaxed));
     }
 
-    /// A definite failure stops at once, after a timeout as before one, and starts the count
-    /// again.
+    /// A definite failure stops at once, after a timeout as before one.
     #[tokio::test]
     async fn a_definite_failure_after_a_timeout_stops_the_servers_at_once() {
         let _capture = Logged::default().capture();

@@ -115,32 +115,22 @@ fn choose_cli(set: Option<OsString>, taken: bool, known: &[&str]) -> PathBuf {
 }
 
 /// How long a `tailscale` ask may take before it is stopped. An ask that runs past it is
-/// [`AskError::TimedOut`], which the daemon's watch bears a few times in a row before it
-/// stops serving (see `Tailscale::scan`); any other failure it acts on at once.
+/// [`AskError::TimedOut`]. The daemon's watch keeps the served addresses through the first two
+/// timeouts in a row and stops them at the third (`TIMEOUTS_BEFORE_AWAY` in daemon.rs); any
+/// other failure it acts on at once.
 const ASK_WITHIN: Duration = Duration::from_secs(3);
 
 /// Why an ask of the Tailscale CLI got no answer. A timeout is told apart from every other
 /// failure by its kind, not its message: a slow CLI says nothing about whether Tailscale is up,
 /// where a CLI that fails, is missing or prints nonsense is a definite answer.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum AskError {
     /// The CLI did not answer within its time.
+    #[error("{0}")]
     TimedOut(String),
     /// The CLI exited non-zero, could not be run, or printed what was not expected.
+    #[error("{0}")]
     Failed(String),
-}
-
-impl std::fmt::Display for AskError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let (Self::TimedOut(why) | Self::Failed(why)) = self;
-        f.write_str(why)
-    }
-}
-
-impl From<AskError> for String {
-    fn from(error: AskError) -> Self {
-        error.to_string()
-    }
 }
 
 /// The addresses Tailscale reports for this machine, or why it cannot say.
@@ -214,7 +204,9 @@ async fn run_cli(cli: &Path, args: &[&str], within: Duration) -> Result<Vec<u8>,
 /// called and its address, read by [`entry`]. The one source of the entry
 /// the daemon lists and the one `foundryd join` sends, so the two never differ.
 pub(crate) async fn own_entry() -> Result<Entry, String> {
-    let status = ask_status(&tailscale_cli(), ASK_WITHIN).await?;
+    let status = ask_status(&tailscale_cli(), ASK_WITHIN)
+        .await
+        .map_err(|error| error.to_string())?;
     entry(&status, host_names().first().map(String::as_str))
 }
 
