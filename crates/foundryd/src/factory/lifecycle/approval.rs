@@ -1,4 +1,82 @@
 //! Whether an issue is approved for the factory. Pure.
+//!
+//! The approval rule's verdicts and the words the factory says when it refuses. The rule itself
+//! reads GitHub's history and lives with the tracker; this file holds what it concludes and
+//! what is then written on the issue. Ported from the runner's `src/domain/approval.ts`.
+
+/// Why an issue is not approved. A fixed set, so nothing from the issue can reach a comment.
+/// Times are GitHub's `YYYY-MM-DDTHH:MM:SSZ`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// No `factory:ready` event in force among the label events read. It has no label time.
+    LabelNotFound,
+    /// A full page of a longer label history without the event in force. It has no label time.
+    LabelHistoryIncomplete,
+    /// The label in force was applied by someone who is not an instructor (`by` `None`: a
+    /// deleted account).
+    LabeledByNonInstructor {
+        by: Option<String>,
+        labeled_at: String,
+    },
+    /// Someone who is not an instructor edited the body or renamed the title after the label.
+    EditedAfterLabel { labeled_at: String },
+    /// The body's edit history is cut off, so it cannot show every edit.
+    EditHistoryIncomplete { labeled_at: String },
+}
+
+/// Whether the factory may build the issue: an instructor applied the label in force, and
+/// every edit and rename since was an instructor's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Approval {
+    Approved {
+        labeled_at: String,
+        labeled_by: String,
+    },
+    Refused(Refusal),
+}
+
+/// Whether the issue text is as an instructor left it: `Unchanged`, `Changed` by someone who
+/// is not an instructor, or `Unjudged` when the histories do not reach back far enough to tell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextCheck {
+    Unchanged,
+    Changed,
+    Unjudged,
+}
+
+/// The fixed reason for a refusal. Nothing from the issue, not even a login, is in it.
+pub fn refusal_reason(refusal: &Refusal) -> &'static str {
+    match refusal {
+        Refusal::LabeledByNonInstructor { .. } => "factory:ready was not applied by an instructor",
+        Refusal::EditedAfterLabel { .. } => {
+            "the issue text was edited after factory:ready was applied by someone who is not an instructor"
+        }
+        Refusal::LabelNotFound | Refusal::LabelHistoryIncomplete => {
+            "the factory could not read who applied factory:ready"
+        }
+        Refusal::EditHistoryIncomplete { .. } => {
+            "the factory could not read the full edit history of the issue text"
+        }
+    }
+}
+
+/// The comment on an issue the factory refused to build: its own fixed text, quoting nothing
+/// from the issue.
+pub fn unapproved_comment(refusal: &Refusal) -> String {
+    let what_to_do = match refusal {
+        // Applying the label again cannot help: the history only grows.
+        Refusal::EditHistoryIncomplete { .. } => {
+            "The issue's edit history is too long for the factory to check. File a new issue with the final text and apply `factory:ready` to it."
+        }
+        _ => {
+            "Review the issue text, then apply `factory:ready` again. An instructor must apply the label, and the text must not be edited afterwards by anyone who is not an instructor."
+        }
+    };
+    format!(
+        "The factory did not start on this issue and has moved it back to `factory:proposed`.\n\nReason: {}\n\n{what_to_do}",
+        refusal_reason(refusal)
+    )
+}
 
 #[cfg(test)]
 mod tests {

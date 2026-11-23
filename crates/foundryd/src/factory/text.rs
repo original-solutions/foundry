@@ -1,4 +1,170 @@
 //! Cutting a tail, and hiding secrets in a comment.
+//!
+//! Also the rest of the runner's `src/text.ts`: text from a session, a config or a repo, made
+//! safe to store and to show.
+
+use ring::digest;
+
+use crate::sessions::brief::HIDDEN;
+
+/// The shortest run of letters, digits, `-` and `_` [`for_comment`] hides when it mixes letters
+/// and digits, as P1 hides them in a session's brief.
+const TOKEN_LENGTH: usize = 24;
+/// The longest command shown in a gate message or a results table, in characters.
+const MAX_COMMAND_CHARS: usize = 300;
+
+/// The last `max_chars` characters of `text`, cut on a character boundary: the whole text when
+/// it is no longer than that.
+pub fn tail(text: &str, max_chars: usize) -> &str {
+    if max_chars == 0 {
+        return "";
+    }
+    match text.char_indices().rev().nth(max_chars - 1) {
+        Some((at, _)) => &text[at..],
+        None => text,
+    }
+}
+
+/// The milliseconds from `from_ms` to `to_ms`, never negative: a clock that stepped back
+/// counts 0, not a negative span.
+pub fn elapsed_ms(from_ms: u64, to_ms: u64) -> u64 {
+    to_ms.saturating_sub(from_ms)
+}
+
+fn is_word(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '-' || c == '_'
+}
+
+/// Where a URL ends: at whitespace, or at a character that closes or quotes it in prose or
+/// markdown.
+fn ends_url(c: char) -> bool {
+    c.is_whitespace()
+        || matches!(
+            c,
+            '<' | '>' | '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | '|'
+        )
+}
+
+/// The length in bytes of the URL `text` starts with, or 0 when it does not start with one.
+fn url_len(text: &str) -> usize {
+    let lower = |prefix: &str| {
+        text.get(..prefix.len())
+            .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+    };
+    if !(lower("https://") || lower("http://")) {
+        return 0;
+    }
+    text.find(ends_url).unwrap_or(text.len())
+}
+
+fn push_word(out: &mut String, word: &str) {
+    let letters = word.bytes().any(|b| b.is_ascii_alphabetic());
+    let digits = word.bytes().any(|b| b.is_ascii_digit());
+    if word.len() >= TOKEN_LENGTH && letters && digits {
+        out.push_str(HIDDEN);
+    } else {
+        out.push_str(word);
+    }
+}
+
+/// `text` as a comment the factory posts on GitHub may show it: every run of letters, digits,
+/// `-` and `_` that is at least 24 long and mixes letters and digits is hidden, as P1 hides
+/// them, except inside an `http://` or `https://` URL, which is kept whole. Keys, tokens,
+/// commit ids and hashes look like that; words, paths and pull request URLs do not. Known
+/// secrets are hidden before this, by `secrets::hide_known`.
+pub fn for_comment(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut word_start: Option<usize> = None;
+    let mut at = 0;
+    while at < text.len() {
+        let rest = &text[at..];
+        let url = url_len(rest);
+        if url > 0 {
+            if let Some(start) = word_start.take() {
+                push_word(&mut out, &text[start..at]);
+            }
+            out.push_str(&rest[..url]);
+            at += url;
+            continue;
+        }
+        let Some(c) = rest.chars().next() else {
+            break;
+        };
+        if is_word(c) {
+            word_start.get_or_insert(at);
+        } else {
+            if let Some(start) = word_start.take() {
+                push_word(&mut out, &text[start..at]);
+            }
+            out.push(c);
+        }
+        at += c.len_utf8();
+    }
+    if let Some(start) = word_start {
+        push_word(&mut out, &text[start..]);
+    }
+    out
+}
+
+fn is_control(c: char) -> bool {
+    let cp = u32::from(c);
+    cp <= 0x1f || (0x7f..=0x9f).contains(&cp)
+}
+
+/// Characters that could fake a line break or hide text, besides the control characters.
+fn is_invisible_or_separator(c: char) -> bool {
+    matches!(
+        u32::from(c),
+        0x2028 | 0x2029 | 0x200b..=0x200f | 0x202a..=0x202e | 0x2066..=0x2069 | 0xfeff
+    )
+}
+
+/// `text` with what could fake a line break, hide text or drive a terminal replaced with a
+/// space. Newline and tab are kept only when `keep_layout` is set.
+pub fn sanitize(text: &str, keep_layout: bool) -> String {
+    text.chars()
+        .map(|c| {
+            let layout = c == '\n' || c == '\t';
+            if (is_control(c) && !(keep_layout && layout)) || is_invisible_or_separator(c) {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// A command as one short line: sanitised, newlines and tabs turned into spaces, cut at 300
+/// characters.
+pub fn command_line(command: &str) -> String {
+    let clean = sanitize(command, false);
+    match clean.char_indices().nth(MAX_COMMAND_CHARS) {
+        Some((at, _)) => format!("{}\u{2026}", &clean[..at]),
+        None => clean,
+    }
+}
+
+/// The first seven hex digits of a commit id, as the words for people and the session name it.
+pub fn short_sha(sha: &str) -> String {
+    sha.chars()
+        .filter(char::is_ascii_hexdigit)
+        .take(7)
+        .collect()
+}
+
+/// Whether `text` is a full commit id: 40 hex digits (64 in a SHA-256 repo).
+pub fn is_commit_id(text: &str) -> bool {
+    matches!(text.len(), 40 | 64) && text.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// The sha256 of `text`, as lowercase hex.
+pub fn sha256(text: &str) -> String {
+    digest::digest(&digest::SHA256, text.as_bytes())
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
 
 #[cfg(test)]
 mod tests {

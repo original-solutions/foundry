@@ -1,4 +1,295 @@
 //! The factory states of an issue and the moves between them. Pure.
+//!
+//! [`transition`] takes a state and an event and answers the next state and the actions for the
+//! caller to perform, in order, or [`InvalidTransition`] for a pair that is not in the table.
+//! Ported from the runner's `src/domain/lifecycle.ts`.
+
+use std::fmt;
+
+/// The `factory:` label that holds an issue, without its `factory:` prefix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum State {
+    Proposed,
+    Ready,
+    Triage,
+    NeedsInfo,
+    Building,
+    PrOpen,
+    Stuck,
+}
+
+impl State {
+    /// Every state, in lifecycle order.
+    pub const ALL: [State; 7] = [
+        State::Proposed,
+        State::Ready,
+        State::Triage,
+        State::NeedsInfo,
+        State::Building,
+        State::PrOpen,
+        State::Stuck,
+    ];
+
+    /// The state's name, as in its label and in error messages, e.g. `needs-info`.
+    pub fn name(self) -> &'static str {
+        match self {
+            State::Proposed => "proposed",
+            State::Ready => "ready",
+            State::Triage => "triage",
+            State::NeedsInfo => "needs-info",
+            State::Building => "building",
+            State::PrOpen => "pr-open",
+            State::Stuck => "stuck",
+        }
+    }
+
+    /// The GitHub label for the state, e.g. `factory:needs-info`.
+    pub fn label(self) -> &'static str {
+        match self {
+            State::Proposed => "factory:proposed",
+            State::Ready => "factory:ready",
+            State::Triage => "factory:triage",
+            State::NeedsInfo => "factory:needs-info",
+            State::Building => "factory:building",
+            State::PrOpen => "factory:pr-open",
+            State::Stuck => "factory:stuck",
+        }
+    }
+
+    /// The state for a `factory:` label (exact, case-sensitive), or `None` if it is not ours.
+    pub fn from_label(label: &str) -> Option<State> {
+        State::ALL.into_iter().find(|state| state.label() == label)
+    }
+
+    /// The label's colour on GitHub: six lowercase hex digits without the `#`.
+    pub fn color(self) -> &'static str {
+        match self {
+            State::Proposed => "c5def5",
+            State::Ready => "0e8a16",
+            State::Triage => "fbca04",
+            State::NeedsInfo => "d93f0b",
+            State::Building => "1d76db",
+            State::PrOpen => "5319e7",
+            State::Stuck => "b60205",
+        }
+    }
+
+    /// What the label means: the label table's text in the lifecycle docs and the label's
+    /// GitHub description.
+    pub fn description(self) -> &'static str {
+        match self {
+            State::Proposed => {
+                "A bot filed it. The factory ignores it until a person sets `factory:ready`."
+            }
+            State::Ready => "Approved for the factory.",
+            State::Triage => "Claimed. The session is being launched.",
+            State::NeedsInfo => {
+                "The factory asked questions on the issue. Answer them, then set `factory:ready`."
+            }
+            State::Building => "A session is building it.",
+            State::PrOpen => "The PR is open and has passed the gate.",
+            State::Stuck => "The factory gave up and said why in a comment.",
+        }
+    }
+}
+
+impl fmt::Display for State {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// Something that happened to an issue. The caller decides which one; this module only reacts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Event {
+    Approved,
+    Claimed,
+    SessionStarting,
+    QuestionsRaised {
+        questions: String,
+    },
+    Failed {
+        reason: String,
+    },
+    InstructorCommented {
+        comment_id: String,
+    },
+    BodyEdited,
+    GateFailed {
+        output: String,
+    },
+    PrReady {
+        pr: u64,
+    },
+    /// The factory refused to build a `ready` issue: it was not approved by an instructor.
+    Unapproved {
+        reason: String,
+    },
+    /// A pull request that was ready for review failed the gate again on the moved base
+    /// branch. `output` is what goes into the session.
+    RegateFailed {
+        pr: u64,
+        output: String,
+    },
+    /// An instructor left feedback on a pull request that was ready for review, or on its
+    /// issue. The feedback goes to a new session, not through the lifecycle.
+    InstructorFeedback {
+        pr: u64,
+    },
+}
+
+impl Event {
+    /// The event's kebab-case name, as used in error messages.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Event::Approved => "approved",
+            Event::Claimed => "claimed",
+            Event::SessionStarting => "session-starting",
+            Event::QuestionsRaised { .. } => "questions-raised",
+            Event::Failed { .. } => "failed",
+            Event::InstructorCommented { .. } => "instructor-commented",
+            Event::BodyEdited => "body-edited",
+            Event::GateFailed { .. } => "gate-failed",
+            Event::PrReady { .. } => "pr-ready",
+            Event::Unapproved { .. } => "unapproved",
+            Event::RegateFailed { .. } => "regate-failed",
+            Event::InstructorFeedback { .. } => "instructor-feedback",
+        }
+    }
+}
+
+/// A side effect for the caller to perform, in order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Action {
+    AssignToMachine,
+    Unassign,
+    SetLabel { state: State },
+    LaunchSession,
+    UpdateStatusComment,
+    PostQuestions { questions: String },
+    PostStuckComment { reason: String },
+    ForwardComment { comment_id: String },
+    ForwardBodyEdit,
+    SendGateFailure { output: String },
+    MarkPrReady { pr: u64 },
+    MarkPrDraft { pr: u64 },
+    PostGateResults { pr: u64 },
+    PostUnapproved { reason: String },
+}
+
+/// The failure of [`transition`]: the event is not valid in the current state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("event `{event}` is not valid in state `{state}`")]
+pub struct InvalidTransition {
+    pub state: State,
+    /// The event's [`Event::name`].
+    pub event: &'static str,
+}
+
+fn set_label(state: State) -> Action {
+    Action::SetLabel { state }
+}
+
+/// Next state and actions for `event` arriving while an issue is in `state`. Does no I/O.
+/// Fails with [`InvalidTransition`] for a pair that is not in the table.
+pub fn transition(state: State, event: &Event) -> Result<(State, Vec<Action>), InvalidTransition> {
+    use State::*;
+    let row = match (state, event) {
+        // softfac's table has no needs-info pair; its docs say an answered issue leaves
+        // needs-info when a person sets `factory:ready`. This follows the docs, not the table.
+        (Proposed | NeedsInfo | Stuck, Event::Approved) => (Ready, vec![]),
+        (Ready, Event::Unapproved { reason }) => (
+            Proposed,
+            vec![
+                Action::PostUnapproved {
+                    reason: reason.clone(),
+                },
+                set_label(Proposed),
+            ],
+        ),
+        (Ready, Event::Claimed) => (Triage, vec![Action::AssignToMachine, set_label(Triage)]),
+        (Triage, Event::SessionStarting) => (
+            Building,
+            vec![
+                set_label(Building),
+                Action::LaunchSession,
+                Action::UpdateStatusComment,
+            ],
+        ),
+        (Triage | Building, Event::QuestionsRaised { questions }) => (
+            NeedsInfo,
+            vec![
+                Action::PostQuestions {
+                    questions: questions.clone(),
+                },
+                set_label(NeedsInfo),
+                Action::Unassign,
+                Action::UpdateStatusComment,
+            ],
+        ),
+        (Triage | Building | PrOpen, Event::Failed { reason }) => (
+            Stuck,
+            vec![
+                Action::PostStuckComment {
+                    reason: reason.clone(),
+                },
+                set_label(Stuck),
+                Action::Unassign,
+                Action::UpdateStatusComment,
+            ],
+        ),
+        (Building, Event::InstructorCommented { comment_id }) => (
+            Building,
+            vec![Action::ForwardComment {
+                comment_id: comment_id.clone(),
+            }],
+        ),
+        (Building, Event::BodyEdited) => (Building, vec![Action::ForwardBodyEdit]),
+        (Building, Event::GateFailed { output }) => (
+            Building,
+            vec![Action::SendGateFailure {
+                output: output.clone(),
+            }],
+        ),
+        (Building, Event::PrReady { pr }) => (
+            PrOpen,
+            vec![
+                Action::MarkPrReady { pr: *pr },
+                Action::PostGateResults { pr: *pr },
+                set_label(PrOpen),
+                Action::UpdateStatusComment,
+            ],
+        ),
+        (PrOpen, Event::RegateFailed { pr, output }) => (
+            Building,
+            vec![
+                Action::MarkPrDraft { pr: *pr },
+                Action::AssignToMachine,
+                set_label(Building),
+                Action::SendGateFailure {
+                    output: output.clone(),
+                },
+                Action::UpdateStatusComment,
+            ],
+        ),
+        (PrOpen, Event::InstructorFeedback { pr }) => (
+            Building,
+            vec![
+                Action::MarkPrDraft { pr: *pr },
+                Action::AssignToMachine,
+                set_label(Building),
+                Action::UpdateStatusComment,
+            ],
+        ),
+        _ => {
+            return Err(InvalidTransition {
+                state,
+                event: event.name(),
+            });
+        }
+    };
+    Ok(row)
+}
 
 #[cfg(test)]
 mod tests {

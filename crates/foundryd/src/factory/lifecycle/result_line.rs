@@ -1,4 +1,143 @@
 //! The result line a session's final message ends with. Pure.
+//!
+//! How a factory session ended, read from the last line of its last assistant message. The
+//! message is agent output shaped by issue text, so it is untrusted: only the exact markers
+//! count, and only as the whole last non-empty line, so an issue body that quotes
+//! `FACTORY-DONE:` is not a result. A pull request URL is accepted only when it is a pull
+//! request on the repo. Ported from the runner's `src/domain/resultLine.ts`.
+
+/// The last line of a finished session: `FACTORY-DONE: <PR URL>`.
+const DONE_MARKER: &str = "FACTORY-DONE: ";
+/// The last line of a session that needs answers, after its numbered questions.
+const NEEDS_INFO_LINE: &str = "FACTORY-STOP: needs-info";
+/// The last line of a session that gave up.
+const STUCK_LINE: &str = "FACTORY-STOP: stuck";
+
+/// The public reason when the session's run ended with no assistant message at all.
+pub const NO_MESSAGE: &str = "the session ended without a final message";
+/// The public reason when the session's last message has no result line.
+pub const NO_RESULT_LINE: &str = "the session ended without a FACTORY-DONE or FACTORY-STOP line";
+/// The public reason when the session stopped and said it was stuck.
+pub const SAID_STUCK: &str = "the session stopped and said it was stuck";
+/// The public reason when the reported pull request is on another repo.
+pub const NOT_ON_REPO: &str = "the session reported a pull request that is not on this repo";
+/// The public reason when the reported pull request URL is not exactly a GitHub pull request URL.
+pub const MALFORMED_URL: &str = "the session reported a malformed pull request URL";
+/// The public reason when the session asked for information without writing any questions.
+pub const NO_QUESTIONS: &str = "the session asked for information but gave no questions";
+
+/// How a session ended. `Done` carries the pull request number and the URL as the session
+/// wrote it. `Stuck::reason` is the factory's own fixed words; `session_text` is what the
+/// session said, raw, when there is anything to show.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SessionResult {
+    Done {
+        pr: u64,
+        url: String,
+    },
+    NeedsInfo {
+        questions: String,
+    },
+    Stuck {
+        reason: &'static str,
+        session_text: Option<String>,
+    },
+}
+
+/// A pull request URL taken apart: `https://github.com/<owner>/<name>/pull/<pr>`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PullRequestUrl {
+    pub owner: String,
+    pub name: String,
+    pub pr: u64,
+}
+
+const PULL_URL_PREFIX: &str = "https://github.com/";
+/// The largest pull request number taken, as the runner takes it: past 2^53 it is not one
+/// GitHub writes.
+const MAX_PR: u64 = (1 << 53) - 1;
+
+/// The raw text before the last non-empty line, and that line with trailing whitespace (and
+/// the `\r` of a CRLF) removed. `None` when the message is blank.
+pub fn split_last_line(message: &str) -> Option<(&str, &str)> {
+    let trimmed = message.trim_end();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match trimmed.rfind('\n') {
+        None => Some(("", trimmed)),
+        Some(index) => Some((&trimmed[..index], trimmed[index + 1..].trim_end())),
+    }
+}
+
+fn is_name(text: &str) -> bool {
+    !text.is_empty()
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// The owner, name and pull request number if `url` is exactly
+/// `https://github.com/<owner>/<name>/pull/<n>`. The number is written the way GitHub writes
+/// it: positive, no leading zeros, and no larger than 2^53 - 1.
+pub fn pull_request_url(url: &str) -> Option<PullRequestUrl> {
+    let rest = url.strip_prefix(PULL_URL_PREFIX)?;
+    let mut parts = rest.split('/');
+    let (owner, name, pull, number) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() || pull != "pull" || !is_name(owner) || !is_name(name) {
+        return None;
+    }
+    if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let pr: u64 = number.parse().ok()?;
+    // `007` is not the number 7 as GitHub writes it.
+    if pr == 0 || pr > MAX_PR || pr.to_string() != number {
+        return None;
+    }
+    Some(PullRequestUrl {
+        owner: owner.to_string(),
+        name: name.to_string(),
+        pr,
+    })
+}
+
+/// Reads the session's last assistant message. The marker must be the whole last non-empty
+/// line. A pull request URL counts only when it is a pull request on `repo` (`owner/name`,
+/// compared ASCII case-insensitively).
+pub fn read(message: Option<&str>, repo: &str) -> SessionResult {
+    let stuck = |reason: &'static str, session_text: Option<&str>| SessionResult::Stuck {
+        reason,
+        session_text: session_text.map(str::to_string),
+    };
+    let Some((whole, (before, last))) = message.and_then(|m| Some((m, split_last_line(m)?))) else {
+        return stuck(NO_MESSAGE, None);
+    };
+    if let Some(url) = last.strip_prefix(DONE_MARKER) {
+        let Some(parsed) = pull_request_url(url) else {
+            return stuck(MALFORMED_URL, Some(whole));
+        };
+        if !format!("{}/{}", parsed.owner, parsed.name).eq_ignore_ascii_case(repo) {
+            return stuck(NOT_ON_REPO, Some(whole));
+        }
+        return SessionResult::Done {
+            pr: parsed.pr,
+            url: url.to_string(),
+        };
+    }
+    let before = before.trim();
+    let said = (!before.is_empty()).then_some(before);
+    match last {
+        NEEDS_INFO_LINE => match said {
+            None => stuck(NO_QUESTIONS, None),
+            Some(questions) => SessionResult::NeedsInfo {
+                questions: questions.to_string(),
+            },
+        },
+        STUCK_LINE => stuck(SAID_STUCK, said),
+        _ => stuck(NO_RESULT_LINE, Some(whole)),
+    }
+}
 
 #[cfg(test)]
 mod tests {

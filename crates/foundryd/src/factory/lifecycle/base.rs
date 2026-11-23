@@ -1,4 +1,19 @@
 //! The branch a run starts from: an issue's `## Base` or the project's base. Pure.
+//!
+//! Text parsing of the issue body, no `gh` call. Ported from the runner's `src/domain/base.ts`.
+
+use super::depends_on::section_lines;
+
+/// The branch the issue's work lands on, as its `## Base` section names it: the section's first
+/// non-blank line, trimmed. `None` for no section, an empty one, or `None.` (any case), which
+/// leave the run on the project's `factory.base`. The name is not checked here.
+pub fn of(body: &str) -> Option<String> {
+    let first = section_lines(body, "base")
+        .into_iter()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?;
+    (first.to_lowercase() != "none.").then(|| first.to_string())
+}
 
 #[cfg(test)]
 mod tests {

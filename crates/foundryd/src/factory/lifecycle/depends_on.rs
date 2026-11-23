@@ -1,4 +1,111 @@
 //! An issue's `Depends on` section and whether it is met. Pure.
+//!
+//! Text parsing of the issue body, no `gh` call. Ported from the runner's
+//! `src/domain/dependsOn.ts`.
+
+/// An issue named in the `## Depends on` section of an issue body.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct IssueRef {
+    /// `owner/name` when the text names a repo; `None` means the repo of the issue it was
+    /// written in.
+    pub repo: Option<String>,
+    pub number: u64,
+}
+
+/// The largest number taken, as the runner takes it: past 2^53 a number is not exact there.
+const MAX_NUMBER: u64 = (1 << 53) - 1;
+
+fn is_repo_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+}
+
+fn is_dots(segment: &str) -> bool {
+    !segment.is_empty() && segment.bytes().all(|b| b == b'.')
+}
+
+/// A markdown heading: `#`s then a space, a tab or the end of the line. `#13` is a reference.
+fn is_heading(line: &str) -> bool {
+    let rest = line.trim_start_matches('#');
+    rest.len() < line.len() && (rest.is_empty() || rest.starts_with([' ', '\t']))
+}
+
+/// The lines of the issue body's `## <name>` section (`name` in lower case): after its
+/// heading, up to the next heading line. Empty when the body has no such section.
+pub fn section_lines<'a>(body: &'a str, name: &str) -> Vec<&'a str> {
+    let mut lines = Vec::new();
+    let mut in_section = false;
+    for line in body.lines() {
+        if in_section {
+            if is_heading(line) {
+                break;
+            }
+            lines.push(line);
+        } else {
+            in_section = (line.starts_with("## ") || line.starts_with("##\t"))
+                && line[3..].trim().to_lowercase() == name;
+        }
+    }
+    lines
+}
+
+/// The issues named in the `## Depends on` section of an issue body, in order of first
+/// appearance, each once. The section runs from its heading to the next heading line. It names
+/// `#<n>` and `<owner>/<repo>#<n>`; "None", an empty section and no section name nothing.
+pub fn blockers(body: &str) -> Vec<IssueRef> {
+    let mut found: Vec<IssueRef> = Vec::new();
+    for line in section_lines(body, "depends on") {
+        let bytes = line.as_bytes();
+        for at in 0..bytes.len() {
+            if bytes[at] != b'#' {
+                continue;
+            }
+            let mut end = at + 1;
+            while end < bytes.len() && bytes[end].is_ascii_digit() {
+                end += 1;
+            }
+            if end == at + 1 {
+                continue;
+            }
+            let Some(number) = line[at + 1..end]
+                .parse::<u64>()
+                .ok()
+                .filter(|n| *n <= MAX_NUMBER)
+            else {
+                continue;
+            };
+            let mut repo_start = at;
+            while repo_start > 0 && is_repo_byte(bytes[repo_start - 1]) {
+                repo_start -= 1;
+            }
+            let repo = if repo_start < at && repo_start > 0 && bytes[repo_start - 1] == b'/' {
+                let mut owner_start = repo_start - 1;
+                while owner_start > 0 && is_repo_byte(bytes[owner_start - 1]) {
+                    owner_start -= 1;
+                }
+                if owner_start == repo_start - 1 {
+                    continue;
+                }
+                let owner = &line[owner_start..repo_start - 1];
+                let name = &line[repo_start..at];
+                // `.` and `..` would step out of `repos/<owner>/<name>` in the API path: not a repo.
+                if is_dots(owner) || is_dots(name) {
+                    continue;
+                }
+                Some(format!("{owner}/{name}"))
+            } else if repo_start < at {
+                // Word characters run straight into the `#`, as in `page#12`: not an issue.
+                continue;
+            } else {
+                None
+            };
+            let issue = IssueRef { repo, number };
+            if !found.contains(&issue) {
+                found.push(issue);
+            }
+        }
+    }
+    found
+}
 
 #[cfg(test)]
 mod tests {
