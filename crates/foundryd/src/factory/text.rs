@@ -373,8 +373,30 @@ mod tests {
             "https://github.com/o/r/blame/0123456789abcdef0123456789abcdef01234567/a.rs#L3-L9"
                 .to_string(),
             format!("https://github.com/o/r/tree/{sha256}/docs"),
+            "https://github.com/o/r/raw/0123456789abcdef0123456789abcdef01234567/a.rs".to_string(),
+            "https://github.com/o/r/compare/0123456789abcdef0123456789abcdef01234567..abcdef0123456789abcdef0123456789abcdef01".to_string(),
+            "https://github.com/o/r/commit/0123456789abcdef0123456789abcdef01234567.patch"
+                .to_string(),
+            "https://github.com/o/r/commit/0123456789abcdef0123456789abcdef01234567.diff"
+                .to_string(),
+            "https://github.com/o/r/pull/12/files/0123456789abcdef0123456789abcdef01234567"
+                .to_string(),
         ] {
             assert_eq!(for_comment(&url), url);
+        }
+    }
+
+    #[test]
+    fn for_comment_leaves_sentence_punctuation_after_a_github_link_out_of_it() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let sha256 = "0123456789abcdef".repeat(4);
+        for end in [".", ":", "!", "?", "...", ".)"] {
+            for text in [
+                format!("Pushed https://github.com/o/r/commit/{sha}{end}"),
+                format!("See https://github.com/o/r/pull/1/files#diff-{sha256}{end}"),
+            ] {
+                assert_eq!(for_comment(&text), text);
+            }
         }
     }
 
@@ -482,6 +504,26 @@ mod tests {
             (
                 format!("https://github.com/o/r/commit/{hex32}"),
                 "https://github.com/o/r/commit/•••",
+            ),
+            (
+                format!("https://github.com/o/r/pull/1#diff-{sha}L3-{KEY}"),
+                "https://github.com/o/r/pull/1#•••",
+            ),
+            (
+                format!("https://github.com/o/r/pull/1#diff-{sha}L{KEY}-R20"),
+                "https://github.com/o/r/pull/1#•••",
+            ),
+            (
+                format!("https://github.com/o/r/pull/1#diff-{sha}L3-R"),
+                "https://github.com/o/r/pull/1#•••",
+            ),
+            (
+                format!("https://github.com/o/r/commit/{sha}...{sha}"),
+                "https://github.com/o/r/commit/•••...•••",
+            ),
+            (
+                format!("https://github.com/o/r/commit/{sha}.exe"),
+                "https://github.com/o/r/commit/•••.exe",
             ),
             (
                 format!("https://github.com/o/r/pull/1#diff-{sha}R"),
