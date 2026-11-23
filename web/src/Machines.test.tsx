@@ -388,6 +388,13 @@ describe("Machines", () => {
       expect(within(unlisted).queryByRole("button", { name: "Remove from fleet" })).toBeNull();
     });
 
+    it("offers no Remove on any card while this machine is not known yet", async () => {
+      await renderApp(<Machines machines={fleet(records, twoMachines)} history={{}} connected />);
+
+      expect(screen.getAllByRole("article")).toHaveLength(2);
+      expect(screen.queryByRole("button", { name: "Remove from fleet" })).toBeNull();
+    });
+
     it("asks first, with the name, and posts nothing until confirmed", async () => {
       const calls = mockFetch();
       await showListed();
