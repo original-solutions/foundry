@@ -129,10 +129,19 @@ describe("fleet", () => {
     });
 
     it("hides it as any other machine while the serving machine is not known", () => {
-      const machines = fleet(records, listed);
-      expect(fleet(records, listed, {}, undefined, undefined)).toEqual(machines);
-      expect(card(machines, ME)?.workspaces).toEqual([]);
-      expect(card(machines, X)?.workspaces).toEqual([]);
+      const machines = fleet(records, listed, {}, undefined, undefined);
+      expect(machines.map((m) => [m.id, m.workspaces.length])).toEqual([
+        [OTHER, 0],
+        [ME, 0],
+        [X, 0],
+      ]);
+      // Before its first sample it has no card at all.
+      expect(card(fleet(mine, listed), ME)).toBeUndefined();
+    });
+
+    it("gets no card of its own from workspaces it has deleted alone", () => {
+      const deleted = [workspace(ME, "w1", "mine", { deleted: true })];
+      expect(card(fleet(deleted, listed, {}, undefined, ME), ME)).toBeUndefined();
     });
   });
 

@@ -145,12 +145,12 @@ describe("App", () => {
     expect(screen.getByText(/no longer running/i)).toBeDefined();
   });
 
-  async function open(path: string, records: UiMessage & { type: "state" }, me: string = ME) {
+  async function open(path: string, records: UiMessage & { type: "state" }, me: string | null = ME) {
     const fresh = createRouter({ routeTree, history: createMemoryHistory({ initialEntries: [path] }) });
     await fresh.load();
-    // The UI is served by machine `me`, ME unless a test says otherwise.
+    // The UI is served by machine `me`, ME unless a test says otherwise; with null the machine query asks the daemon.
     const client = new QueryClient();
-    client.setQueryData(machineQuery.queryKey, me);
+    if (me !== null) client.setQueryData(machineQuery.queryKey, me);
     render(
       <QueryClientProvider client={client}>
         <RouterProvider router={fresh} />
@@ -682,6 +682,33 @@ describe("App", () => {
     const group = await within(sidebar).findByRole("group", { name: "still here" });
     fireEvent.click(within(group).getByTitle("Unfold"));
     expect(within(group).getByText("sonnet")).toBeDefined();
+  });
+
+  it("lists this machine's own session once the machine query answers after the state, with no record arriving", async () => {
+    mockActions();
+    const answered = fetch;
+    let answer: (response: Response) => void = () => {};
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string, init?: RequestInit) => (url.endsWith("/api/machine") ? new Promise<Response>((resolve) => (answer = resolve)) : answered(url, init))),
+    );
+    await open(
+      "/",
+      {
+        type: "state",
+        protocol: 1,
+        records: [sample("c", 1), workspace("c", "w9", "still here"), terminal("c", "t9", "w9", "running"), session("c", "s9", "w9", "t9", "waiting_for_you")],
+        settings: settings(),
+      },
+      null,
+    );
+    const sidebar = screen.getByRole("navigation", { name: "Workspaces" });
+    // Until the machine query answers, c is a machine the list does not hold. Let every other read settle first.
+    await act(() => new Promise((resolve) => setTimeout(resolve, 50)));
+    expect(within(sidebar).queryByRole("group", { name: "still here" })).toBeNull();
+
+    await act(async () => answer(json(200, { id: "c" })));
+    expect(await within(sidebar).findByRole("group", { name: "still here" })).toBeDefined();
   });
 
   it("shows each machine online or offline by the machines the daemon hears, before any terminal", async () => {
