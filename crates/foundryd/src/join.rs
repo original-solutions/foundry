@@ -2450,6 +2450,24 @@ mod tests {
     }
 
     #[test]
+    fn nothing_is_saved_when_no_removed_machine_is_held_active() {
+        let flaky = Arc::new(Flaky::default());
+        let host = Keys::open(flaky.clone()).unwrap();
+        let revoked = machine_keys();
+        admit(&host, &revoked);
+        host.revoke(revoked.me()).unwrap();
+        let settings = settings_with(2, vec![], &[MachineId::random(), revoked.me(), host.me()]);
+        let mut saved = host.inner.changed.subscribe();
+        // Any save would fail, and bump the signal when it did not.
+        flaky.failing.store(true, Ordering::SeqCst);
+
+        host.refuse_removed(&settings).unwrap();
+
+        assert!(!saved.has_changed().unwrap());
+        assert_eq!(host.state(host.me()), KeyState::Active);
+    }
+
+    #[test]
     fn a_machine_still_in_the_list_is_not_revoked_whatever_its_stamp() {
         let host = machine_keys();
         let peer = machine_keys();
