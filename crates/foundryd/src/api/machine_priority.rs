@@ -71,10 +71,12 @@ async fn set(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::io;
     use std::time::Duration;
 
     use foundry_proto::ids::MachineId;
+    use foundry_proto::messages::{PROTOCOL, PeerMessage};
     use foundry_proto::settings::{Machine, SharedSettings};
     use futures::future::BoxFuture;
     use serde_json::Value;
@@ -95,6 +97,7 @@ mod tests {
     struct Served {
         _data: tempfile::TempDir,
         store: Arc<Mutex<Store>>,
+        peers: Peers,
         addr: std::net::SocketAddr,
         _server: tokio::task::JoinHandle<()>,
     }
@@ -120,6 +123,7 @@ mod tests {
             let coordinator = Arc::new(Coordinator::new(me, store.clone(), peers.clone()));
             peers.coordinate(coordinator.clone());
             let app = router(coordinator, store.clone());
+            let served_peers = peers.clone();
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let server = tokio::spawn(async move {
@@ -128,6 +132,7 @@ mod tests {
             Self {
                 _data: data,
                 store,
+                peers: served_peers,
                 addr,
                 _server: server,
             }
@@ -135,6 +140,42 @@ mod tests {
 
         fn settings(&self) -> SharedSettings {
             self.store.lock().unwrap().settings().unwrap()
+        }
+
+        /// Hears `peer` once, so it counts as online, then drops the line: an edit sent to it
+        /// finds no one to answer.
+        async fn hear(&self, peer: MachineId) {
+            let (ours, theirs) = Conn::pair();
+            let accepting = tokio::spawn({
+                let peers = self.peers.clone();
+                async move { peers.accept(ours).await }
+            });
+            let hello = PeerMessage::Hello {
+                protocol: PROTOCOL,
+                machine: peer,
+                versions: BTreeMap::new(),
+            };
+            let nothing = PeerMessage::Records {
+                protocol: PROTOCOL,
+                records: Vec::new(),
+            };
+            for message in [hello, nothing] {
+                theirs
+                    .send
+                    .send(serde_json::to_string(&message).unwrap())
+                    .await
+                    .unwrap();
+            }
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while !self.peers.online().contains(&peer) {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the peer was not heard"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            drop(theirs);
+            accepting.await.unwrap();
         }
 
         /// `(status, body)` of a POST of the JSON `body` to the priority route.
@@ -273,5 +314,40 @@ mod tests {
         let after = served.settings();
         assert!(after.priority.is_empty());
         assert!(after.seq > seq);
+    }
+
+    #[tokio::test]
+    async fn an_order_the_coordinator_cannot_send_answers_503_and_stores_nothing() {
+        let acting = MachineId::random();
+        let mut ids = None;
+        let served = Served::new(|settings| {
+            ids = Some(others(settings));
+            settings.machines.push(Machine {
+                id: acting,
+                name: "x".into(),
+                address: "100.64.0.9".into(),
+                key: String::new(),
+            });
+            // An unreachable machine ahead in priority acts as coordinator.
+            settings.priority = vec![acting, settings.machines[0].id];
+        })
+        .await;
+        let (a, b) = ids.unwrap();
+        served.hear(acting).await;
+        let before = served.settings();
+
+        let (status, body) = served.post(&order(&[b.to_string(), a.to_string()])).await;
+
+        assert_eq!(status, 503, "{body}");
+        let json: Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap()
+                .contains(&acting.to_string())
+        );
+        let after = served.settings();
+        assert_eq!(after.seq, before.seq);
+        assert_eq!(after.priority, before.priority);
     }
 }

@@ -514,6 +514,31 @@ describe("Machines", () => {
       await waitFor(() => expect(calls).toEqual([{ url: "/api/machines/priority", method: "POST", body: { order: [ME, OTHER] } }]));
     });
 
+    // With three machines a wrong neighbour no longer looks right: each move swaps with the next one.
+    it.each([
+      ["laptop", "up", ["machine-2", "machine-1", "machine-3"]],
+      ["desk", "up", ["machine-1", "machine-3", "machine-2"]],
+      ["studio", "down", ["machine-2", "machine-1", "machine-3"]],
+      ["laptop", "down", ["machine-1", "machine-3", "machine-2"]],
+    ])("posts the order with %s moved %s one place among three machines", async (name, way, posted) => {
+      const calls = mockFetch(new Response(null, { status: 204 }));
+      await order(
+        settings({
+          machines: [
+            { id: ME, name: "studio", address: "" },
+            { id: OTHER, name: "laptop", address: "" },
+            { id: "machine-3", name: "desk", address: "" },
+          ],
+          priority: [ME, OTHER, "machine-3"],
+        }),
+      );
+      expect(names()).toEqual(["studio", "laptop", "desk"]);
+
+      fireEvent.click(within(card(name)).getByRole("button", { name: `Move ${name} ${way} in the coordinator order` }));
+
+      await waitFor(() => expect(calls).toEqual([{ url: "/api/machines/priority", method: "POST", body: { order: posted } }]));
+    });
+
     it("disables the top machine's up and the bottom machine's down", async () => {
       await order();
 
