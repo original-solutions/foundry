@@ -333,11 +333,27 @@ pub enum HeldUpKind {
 pub struct FinishedRun {
     pub run: RunId,
     pub title: String,
-    /// `pr-open`, `stuck` or `needs-info`.
-    pub outcome: String,
-    /// `merged` or `closed`, for a run that ended because its pull request did.
-    pub pr_end: Option<String>,
+    pub outcome: RunOutcome,
+    /// Set for a run that ended because its pull request did.
+    pub pr_end: Option<PrEnd>,
     pub pr_url: Option<String>,
+}
+
+/// How a run ended: the runner's `Outcome`, written as the runner writes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RunOutcome {
+    PrOpen,
+    Stuck,
+    NeedsInfo,
+}
+
+/// How a run's pull request ended: the runner's `PrEnd`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PrEnd {
+    Merged,
+    Closed,
 }
 
 /// An issue claimed by something other than Foundry.
@@ -781,8 +797,8 @@ pub(crate) mod tests {
             finished: vec![FinishedRun {
                 run: new_run("original-solutions/foundry", 99, 1),
                 title: "fix: a typo".into(),
-                outcome: "pr-open".into(),
-                pr_end: Some("merged".into()),
+                outcome: RunOutcome::PrOpen,
+                pr_end: Some(PrEnd::Merged),
                 pr_url: Some("https://github.com/original-solutions/foundry/pull/7".into()),
             }],
             foreign: vec![ForeignClaim {
@@ -835,6 +851,51 @@ pub(crate) mod tests {
                 body: FactoryBody::Turn(turn()),
             },
         ]
+    }
+
+    /// The runner's `Outcome` and `PrEnd` in `src/ledger/events.ts` at 8ed9bef, and nothing else.
+    #[test]
+    fn a_finished_run_takes_only_the_runners_outcomes_and_pull_request_ends() {
+        let finished = |outcome: &str, pr_end: serde_json::Value| {
+            serde_json::json!({
+                "run": "rawphp__softfac__8__1",
+                "title": "feat: x",
+                "outcome": outcome,
+                "pr_end": pr_end,
+                "pr_url": null,
+            })
+        };
+        for (text, outcome) in [
+            ("pr-open", RunOutcome::PrOpen),
+            ("stuck", RunOutcome::Stuck),
+            ("needs-info", RunOutcome::NeedsInfo),
+        ] {
+            let read: FinishedRun =
+                serde_json::from_value(finished(text, serde_json::Value::Null)).unwrap();
+            assert_eq!(read.outcome, outcome);
+            assert_eq!(read.pr_end, None);
+            assert_eq!(serde_json::to_value(&read).unwrap()["outcome"], text);
+        }
+        for (text, pr_end) in [("merged", PrEnd::Merged), ("closed", PrEnd::Closed)] {
+            let read: FinishedRun =
+                serde_json::from_value(finished("pr-open", text.into())).unwrap();
+            assert_eq!(read.pr_end, Some(pr_end));
+            assert_eq!(serde_json::to_value(&read).unwrap()["pr_end"], text);
+        }
+        for outcome in ["needs_info", "Stuck", "merged", ""] {
+            let json = finished(outcome, serde_json::Value::Null);
+            assert!(
+                serde_json::from_value::<FinishedRun>(json).is_err(),
+                "{outcome}"
+            );
+        }
+        for pr_end in ["open", "Merged", ""] {
+            let json = finished("pr-open", pr_end.into());
+            assert!(
+                serde_json::from_value::<FinishedRun>(json).is_err(),
+                "{pr_end}"
+            );
+        }
     }
 
     #[test]

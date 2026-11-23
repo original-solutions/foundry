@@ -1192,22 +1192,38 @@ fn text(value: &Option<Value>) -> String {
 
 /// Every setting `settings` holds a value or a stamp for.
 fn keys(settings: &SharedSettings) -> BTreeSet<StampKey> {
-    let mut keys: BTreeSet<StampKey> = settings.stamps.keys().cloned().collect();
+    // Every field is named, so a new kind of setting does not compile until it is listed here.
+    let SharedSettings {
+        seq: _,
+        machines,
+        priority,
+        projects,
+        limits,
+        stamps,
+        seen: _,
+        overwritten,
+        numbered: _,
+        factory,
+        project_factory,
+    } = settings;
+    let mut keys: BTreeSet<StampKey> = stamps.keys().cloned().collect();
     let mut plain: Vec<SettingKey> = Vec::new();
-    plain.extend(settings.machines.iter().map(|m| SettingKey::Machine(m.id)));
-    plain.extend(settings.projects.iter().map(|p| SettingKey::Project(p.id)));
-    plain.extend(settings.limits.keys().map(|id| SettingKey::Limits(*id)));
-    if !settings.priority.is_empty() {
+    plain.extend(machines.iter().map(|m| SettingKey::Machine(m.id)));
+    plain.extend(projects.iter().map(|p| SettingKey::Project(p.id)));
+    plain.extend(limits.keys().map(|id| SettingKey::Limits(*id)));
+    if !priority.is_empty() {
         plain.push(SettingKey::Priority);
     }
-    keys.extend(plain.into_iter().map(StampKey::Setting));
-    keys.extend(
-        settings
-            .overwritten
+    if factory.is_some() {
+        plain.push(SettingKey::Factory);
+    }
+    plain.extend(
+        project_factory
             .keys()
-            .cloned()
-            .map(StampKey::Overwritten),
+            .map(|id| SettingKey::ProjectFactory(*id)),
     );
+    keys.extend(plain.into_iter().map(StampKey::Setting));
+    keys.extend(overwritten.keys().cloned().map(StampKey::Overwritten));
     keys
 }
 
@@ -2143,6 +2159,29 @@ mod tests {
         // Remembering a newer id forgets one that falls out of the window.
         remember(&mut a, new, high);
         assert_eq!(a.numbered, [(new, high)].into());
+    }
+
+    #[test]
+    fn a_factory_setting_with_no_stamp_is_kept_by_a_merge() {
+        use foundry_proto::factory::{FactorySettings, ProjectFactory};
+
+        let project = ProjectId(uuid::Uuid::from_u128(7));
+        let fleet = FactorySettings {
+            max_runs: 5,
+            ..FactorySettings::default()
+        };
+        let one = ProjectFactory {
+            on: true,
+            login: "rawphp".into(),
+            paused: false,
+        };
+        let mut a = base();
+        a.factory = Some(fleet.clone());
+        a.project_factory.insert(project, one.clone());
+        let out = merged(&a, &base());
+        assert_eq!(out.factory, Some(fleet));
+        assert_eq!(out.project_factory.get(&project), Some(&one));
+        assert!(out.overwritten.is_empty(), "{:?}", out.overwritten);
     }
 
     #[test]
