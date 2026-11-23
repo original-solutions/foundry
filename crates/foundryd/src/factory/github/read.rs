@@ -1176,8 +1176,12 @@ fn is_cut_off(total_count: u64, shown: usize) -> bool {
 /// Whether the timeline page shows every event at or after `since`: not cut off, or its oldest
 /// is before `since`.
 pub fn timeline_reaches(issue: &ApprovalIssue, since: &str) -> bool {
-    let _ = (issue, since);
-    todo!("part B")
+    let timeline = &issue.timeline_items;
+    !is_cut_off(timeline.total_count, timeline.nodes.len())
+        || timeline
+            .nodes
+            .first()
+            .is_some_and(|oldest| oldest.created_at() < since)
 }
 
 /// Whether the newest history entry is the last edit, by the last editor.
@@ -1186,8 +1190,30 @@ fn newest_is_last_edit(
     last_edited_at: Option<&str>,
     editor: Option<&Actor>,
 ) -> bool {
-    let _ = (edits, last_edited_at, editor);
-    todo!("part B")
+    let Some(last) = last_edited_at else {
+        return true;
+    };
+    edits.nodes.first().is_some_and(|newest| {
+        newest.edited_at == last
+            && newest.editor.as_ref().map(|actor| &actor.login) == editor.map(|actor| &actor.login)
+    })
+}
+
+/// Whether the body's edit history can be trusted for every edit at or after `since`: the
+/// entries come newest first, so when it is cut off the oldest one shown must be before `since`.
+fn edits_whole_since(issue: &ApprovalIssue, since: &str) -> bool {
+    let edits = &issue.user_content_edits;
+    let reaches_back = !is_cut_off(edits.total_count, edits.nodes.len())
+        || edits
+            .nodes
+            .last()
+            .is_some_and(|oldest| oldest.edited_at.as_str() < since);
+    reaches_back
+        && newest_is_last_edit(
+            edits,
+            issue.last_edited_at.as_deref(),
+            issue.editor.as_ref(),
+        )
 }
 
 /// Judges every body edit and title rename with time at or after `since`. A moment in the same
@@ -1199,8 +1225,23 @@ pub fn text_changes_since(
     instructors: &[String],
     reaches: bool,
 ) -> TextCheck {
-    let _ = (issue, since, instructors, reaches);
-    todo!("part B")
+    let edit_by_stranger = issue.user_content_edits.nodes.iter().any(|edit| {
+        edit.edited_at.as_str() >= since && !is_human_instructor(edit.editor.as_ref(), instructors)
+    });
+    let rename_by_stranger = issue.timeline_items.nodes.iter().any(|event| match event {
+        TimelineNode::RenamedTitleEvent(rename) => {
+            rename.created_at.as_str() >= since
+                && !is_human_instructor(rename.actor.as_ref(), instructors)
+        }
+        _ => false,
+    });
+    if edit_by_stranger || rename_by_stranger {
+        TextCheck::Changed
+    } else if edits_whole_since(issue, since) && reaches {
+        TextCheck::Unchanged
+    } else {
+        TextCheck::Unjudged
+    }
 }
 
 /// Whether the factory may build the issue: an instructor (only ever a `User`) applied the
@@ -1209,15 +1250,106 @@ pub fn text_changes_since(
 /// after it, and a full page without it is `label-history-incomplete`. Label names match
 /// exactly; times compare as text.
 pub fn judge_approval(issue: &ApprovalIssue, ready: &str, instructors: &[String]) -> Approval {
-    let _ = (issue, ready, instructors, Refusal::LabelNotFound);
-    todo!("part B")
+    let mut in_force: Option<&LabelChange> = None;
+    for event in &issue.timeline_items.nodes {
+        match event {
+            TimelineNode::LabeledEvent(change) if change.label.name == ready => {
+                in_force = Some(change);
+            }
+            TimelineNode::UnlabeledEvent(change) if change.label.name == ready => {
+                in_force = None;
+            }
+            _ => {}
+        }
+    }
+    let Some(label) = in_force else {
+        let timeline = &issue.timeline_items;
+        let cut_off =
+            timeline.nodes.len() >= HISTORY_PAGE && timeline.total_count > HISTORY_PAGE as u64;
+        return Approval::Refused(if cut_off {
+            Refusal::LabelHistoryIncomplete
+        } else {
+            Refusal::LabelNotFound
+        });
+    };
+    let labeled_at = label.created_at.clone();
+    let actor = label.actor.as_ref();
+    let Some(applied_by) = actor.filter(|actor| is_human_instructor(Some(actor), instructors))
+    else {
+        return Approval::Refused(Refusal::LabeledByNonInstructor {
+            by: actor.map(|actor| actor.login.clone()),
+            labeled_at,
+        });
+    };
+    // The label is on the page, so the renames at or after it are too.
+    match text_changes_since(issue, &labeled_at, instructors, true) {
+        TextCheck::Changed => Approval::Refused(Refusal::EditedAfterLabel { labeled_at }),
+        TextCheck::Unjudged => Approval::Refused(Refusal::EditHistoryIncomplete { labeled_at }),
+        TextCheck::Unchanged => Approval::Approved {
+            labeled_at,
+            labeled_by: applied_by.login.clone(),
+        },
+    }
 }
 
 /// Whether anyone, an instructor included, edited the body or renamed the title at or after
 /// `since`. A timeline page that may hide a rename at or after the moment counts as a change.
 pub fn edited_since(issue: &ApprovalIssue, since: &str) -> bool {
-    let _ = (issue, since);
-    todo!("part B")
+    let edited = issue
+        .last_edited_at
+        .as_deref()
+        .is_some_and(|edited_at| edited_at >= since);
+    let renamed = issue.timeline_items.nodes.iter().any(|event| match event {
+        TimelineNode::RenamedTitleEvent(rename) => rename.created_at.as_str() >= since,
+        _ => false,
+    });
+    edited || renamed || !timeline_reaches(issue, since)
+}
+
+/// Runs the approval query for the issue and checks every timestamp in the answer.
+fn read_history<G: Tracker + ?Sized>(
+    gh: &G,
+    repo: &str,
+    issue: u64,
+) -> Result<ApprovalIssue, TrackerError> {
+    let args = issue_query_args(repo, APPROVAL_QUERY, issue)?;
+    let answer: ApprovalAnswer = gh_json(gh, &args, "a GraphQL response with the issue")?;
+    let found = answer.data.repository.issue;
+    let times = found
+        .timeline_items
+        .nodes
+        .iter()
+        .map(TimelineNode::created_at)
+        .chain(
+            found
+                .user_content_edits
+                .nodes
+                .iter()
+                .map(|edit| edit.edited_at.as_str()),
+        )
+        .chain(found.last_edited_at.as_deref());
+    for at in times {
+        if !is_utc_second(at) {
+            return Err(parse_error(
+                &args,
+                &format!("a timestamp as YYYY-MM-DDTHH:MM:SSZ, got {}", quoted(at)),
+            ));
+        }
+    }
+    Ok(found)
+}
+
+/// `since` as the one call's argument check: only GitHub's `YYYY-MM-DDTHH:MM:SSZ`, before any
+/// call.
+fn require_utc_second(since: &str) -> Result<(), TrackerError> {
+    if is_utc_second(since) {
+        Ok(())
+    } else {
+        Err(parse_error(
+            &["api".to_string(), "graphql".to_string()],
+            &format!("`since` as YYYY-MM-DDTHH:MM:SSZ, got {}", quoted(since)),
+        ))
+    }
 }
 
 /// An instructor's comment made during a build.
@@ -1305,8 +1437,8 @@ pub fn approval<G: Tracker + ?Sized>(
     issue: u64,
     instructors: &[String],
 ) -> Result<Approval, TrackerError> {
-    let _ = (gh, repo, issue, instructors, issue_query_args, quoted);
-    todo!("part B")
+    let found = read_history(gh, repo, issue)?;
+    Ok(judge_approval(&found, State::Ready.label(), instructors))
 }
 
 /// Whether the issue text is as an instructor left it at `since`.
@@ -1317,8 +1449,14 @@ pub fn text_check<G: Tracker + ?Sized>(
     since: &str,
     instructors: &[String],
 ) -> Result<TextCheck, TrackerError> {
-    let _ = (gh, repo, issue, since, instructors);
-    todo!("part B")
+    require_utc_second(since)?;
+    let found = read_history(gh, repo, issue)?;
+    Ok(text_changes_since(
+        &found,
+        since,
+        instructors,
+        timeline_reaches(&found, since),
+    ))
 }
 
 /// Whether anyone edited the body or renamed the title at or after `since`.
@@ -1328,8 +1466,8 @@ pub fn text_edited_since<G: Tracker + ?Sized>(
     issue: u64,
     since: &str,
 ) -> Result<bool, TrackerError> {
-    let _ = (gh, repo, issue, since);
-    todo!("part B")
+    require_utc_second(since)?;
+    Ok(edited_since(&read_history(gh, repo, issue)?, since))
 }
 
 /// What the instructors wrote on the issue after `since`.
