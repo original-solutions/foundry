@@ -1,6 +1,7 @@
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { matches, MD, useMediaQuery } from "./media";
+import { useWide } from "./Peek";
 
 /** A `matchMedia` whose answer for `query` is `on()` (and `false` for any other), keeping the `change` listeners added through it. */
 function stubMedia(query: string, on: () => boolean) {
@@ -111,5 +112,19 @@ describe("useMediaQuery", () => {
     unmount();
     expect(media.removed).toHaveBeenCalledWith("change", media.added.mock.calls[0][1]);
     expect(media.listeners.size).toBe(0);
+  });
+});
+
+describe("useWide, the palette's preview", () => {
+  it("counts a browser with no matchMedia as narrow", () => {
+    vi.stubGlobal("matchMedia", undefined);
+    const { result } = renderHook(() => useWide());
+    expect(result.current).toBe(false);
+  });
+
+  it("is wide from the md breakpoint up", () => {
+    stubMedia(MD, () => true);
+    const { result } = renderHook(() => useWide());
+    expect(result.current).toBe(true);
   });
 });
