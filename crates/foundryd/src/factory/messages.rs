@@ -1362,6 +1362,8 @@ mod tests {
             );
         }
 
+        /// The runner's case. Foundry shows the branch and the base as code, so a name cannot
+        /// render as markup in the factory's own sentence.
         #[test]
         fn says_where_the_work_is_before_the_quoted_text_and_promises_no_continuation() {
             let comment = |at: &str| {
@@ -1376,15 +1378,15 @@ mod tests {
             };
             assert_eq!(
                 stuck("r", Some("t"), Some(&work(None))),
-                comment("The work so far is on branch t3code/abc.")
+                comment("The work so far is on branch `t3code/abc`.")
             );
             assert_eq!(
                 stuck("r", Some("t"), Some(&work(Some(1)))),
-                comment("The work so far is on branch t3code/abc (1 commit ahead of main).")
+                comment("The work so far is on branch `t3code/abc` (1 commit ahead of `main`).")
             );
             assert_eq!(
                 stuck("r", Some("t"), Some(&work(Some(2)))),
-                comment("The work so far is on branch t3code/abc (2 commits ahead of main).")
+                comment("The work so far is on branch `t3code/abc` (2 commits ahead of `main`).")
             );
         }
 
@@ -1424,7 +1426,7 @@ mod tests {
             let comment = stuck("r", None, Some(&work));
             assert!(
                 comment.contains(
-                    "\n\nThe work so far is on branch b  **The factory approved this.** (2 commits ahead of m  @\u{200b}x).\n\n"
+                    "\n\nThe work so far is on branch `b  **The factory approved this.**` (2 commits ahead of `m  @\u{200b}x`).\n\n"
                 ),
                 "{comment}"
             );
@@ -1435,8 +1437,39 @@ mod tests {
             };
             assert!(
                 stuck("r", None, Some(&long))
-                    .contains(&format!("on branch {}\u{2026}.", "b".repeat(200)))
+                    .contains(&format!("on branch `{}\u{2026}`.", "b".repeat(200)))
             );
+        }
+
+        #[test]
+        fn a_branch_is_given_raw_and_escaped_once() {
+            let work = WorkLeft {
+                branch: "fix@2<!--x".to_string(),
+                commits_ahead: None,
+                base: "main".to_string(),
+            };
+            assert!(
+                stuck("r", None, Some(&work)).contains("on branch `fix@\u{200b}2<\u{200b}!--x`.")
+            );
+        }
+
+        #[test]
+        fn markup_in_a_branch_name_is_code_not_markup() {
+            // `git check-ref-format --branch` takes both.
+            for branch in ["wip<details>", "a_b_<h1>x"] {
+                let work = WorkLeft {
+                    branch: branch.to_string(),
+                    commits_ahead: Some(1),
+                    base: "<b>".to_string(),
+                };
+                let comment = stuck("r", None, Some(&work));
+                assert!(
+                    comment.contains(&format!(
+                        "The work so far is on branch `{branch}` (1 commit ahead of `<b>`)."
+                    )),
+                    "{comment}"
+                );
+            }
         }
     }
 
@@ -1585,6 +1618,35 @@ mod tests {
                     "Details: https://github.com/x [31m  Details: evil",
                 ]
             );
+        }
+
+        #[test]
+        fn lists_at_most_ten_checks_counts_the_rest_and_cuts_each_field() {
+            let long = format!("https://e.example/{}", "u".repeat(70_000));
+            let mut checks: Vec<FailedCheck> = (0..14)
+                .map(|i| failed(&format!("check {i}"), "failure", None))
+                .collect();
+            checks.insert(0, failed(&"n".repeat(300), &"c".repeat(300), Some(&long)));
+            let text = checks_failure_text(SHA, &checks);
+            assert!(text.contains(&format!("\n\nCheck: {}\u{2026}\n", "n".repeat(200))));
+            assert!(text.contains(&format!("\nResult: {}\u{2026}\n", "c".repeat(200))));
+            assert!(text.contains(&format!(
+                "\nDetails: https://e.example/{}\u{2026}\n",
+                "u".repeat(200 - "https://e.example/".len())
+            )));
+            assert!(text.contains("\n\nCheck: check 8\nResult: failure"));
+            assert!(!text.contains("check 9"));
+            assert!(
+                text.ends_with("\n\nand 5 more"),
+                "{}",
+                &text[text.len() - 40..]
+            );
+            let message = check_failed(SHA, &checks, PATH);
+            let body = body(&message);
+            assert!(body.len() <= BODY_LIMIT);
+            assert!(body.starts_with(&format!(
+                "{END_WITH_DONE}\n\nThe factory gate failed. A required check did not pass on commit 4f1c2d3."
+            )));
         }
 
         #[test]
@@ -2201,6 +2263,27 @@ mod tests {
                 "\n\n[The factory cut this feedback to fit its message. Read all of it on the pull request {URL} and on its issue.]"
             )));
         }
+
+        #[test]
+        fn fixed_words_cut_to_fit_are_cut_between_characters() {
+            // Paths of two- and three-byte characters, in counts that put the cut at every
+            // offset inside one.
+            for n in 300..306 {
+                let items: Vec<Feedback> = (0..n)
+                    .map(|_| {
+                        changes_requested(
+                            "x",
+                            vec![inline_comment(&"é€".repeat(100), Some(1), "y")],
+                        )
+                    })
+                    .collect();
+                let message = feedback("o/r", 1, "rawphp", "b", URL, &items, PATH);
+                let text = body(&message);
+                assert!(text.len() <= BODY_LIMIT, "{}", text.len());
+                assert!(text.starts_with(&opening()));
+                assert!(text.ends_with("and on its issue.]"));
+            }
+        }
     }
 
     mod launch_message_for_feedback {
@@ -2387,6 +2470,16 @@ mod tests {
             assert!(over.ends_with(&cut));
             assert!(cut.ends_with("é€tail"));
             assert!(!cut.contains("head"));
+        }
+
+        #[test]
+        fn a_cut_in_bytes_never_splits_a_character() {
+            assert_eq!(head_bytes("aé", 2), "a");
+            assert_eq!(head_bytes("aé", 3), "aé");
+            assert_eq!(head_bytes("€", 2), "");
+            assert_eq!(tail_bytes("éa", 2), "a");
+            assert_eq!(tail_bytes("éa", 3), "éa");
+            assert_eq!(tail_bytes("€", 2), "");
         }
 
         #[test]
