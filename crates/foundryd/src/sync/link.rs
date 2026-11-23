@@ -58,7 +58,9 @@ pub(super) async fn run(
 
 /// Sends this machine's new records every [`TICK`] until the peer is no longer one this machine
 /// links with ([`links_with`]: it is listed, or this machine's list holds no machine but
-/// itself) or stops taking them.
+/// itself) or stops taking them. Changed settings go first in each round, so a peer just removed
+/// from the list is sent the copy that removed it before its link closes, and holds its own
+/// removal.
 async fn sending(inner: &Inner, send: &Sender<String>, open: &Open) {
     let mut sent = open.sent;
     let mut settings_sent: Option<u64> = None;
@@ -66,11 +68,11 @@ async fn sending(inner: &Inner, send: &Sender<String>, open: &Open) {
     let mut every = tokio::time::interval(TICK);
     loop {
         every.tick().await;
-        if !links_with(inner, open.peer).await {
-            tracing::info!("sync: {} left the machine list; link closed", open.peer);
+        if !send_settings(inner, send, open, &mut settings_sent).await {
             return;
         }
-        if !send_settings(inner, send, open, &mut settings_sent).await {
+        if !links_with(inner, open.peer).await {
+            tracing::info!("sync: {} left the machine list; link closed", open.peer);
             return;
         }
         if !send_own(inner, send, open, &mut sent, &mut warned).await {

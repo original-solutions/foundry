@@ -648,8 +648,9 @@ impl Shown {
 }
 
 /// The machines `settings` shows removed from the machine list: each with a `Machine` stamp
-/// and no list entry. The one definition of removed: a machine removed and added again has the
-/// stamp and an entry, and is not.
+/// and no list entry. The one definition of removed: a machine an edit listed has the stamp and
+/// an entry, and is not. A removal is one-way: no merge or acting machine lists a removed
+/// machine again ([`crate::coordinator::merge`]).
 pub fn removed(settings: &SharedSettings) -> impl Iterator<Item = MachineId> + '_ {
     settings.stamps.keys().filter_map(|key| match key {
         StampKey::Setting(SettingKey::Machine(id))
@@ -871,11 +872,20 @@ impl Keys {
     /// Blocks on the secret store, as [`Keys::open`] does, and behind any other change to the
     /// key table in this process.
     pub fn refuse_removed(&self, settings: &SharedSettings) -> Result<(), JoinError> {
+        self.refuse_removed_but(settings, &BTreeSet::new())
+    }
+
+    /// [`Keys::refuse_removed`], leaving the machines in `waiting` as they are.
+    fn refuse_removed_but(
+        &self,
+        settings: &SharedSettings,
+        waiting: &BTreeSet<MachineId>,
+    ) -> Result<(), JoinError> {
         let me = self.me();
         let held: Vec<MachineId> = {
             let table = self.held();
             removed(settings)
-                .filter(|id| *id != me)
+                .filter(|id| *id != me && !waiting.contains(id))
                 .filter(|id| matches!(table.machines.get(id), Some(Entry::Active { .. })))
                 .collect()
         };
@@ -897,11 +907,15 @@ impl Keys {
     /// Acts on the machine list in `store` whenever the settings change, checked every
     /// [`RECHECK`], until the returned future is dropped: first [`Keys::refuse_removed`], then
     /// admits the keys the list carries by [`Keys::learn`], so a machine removed is never
-    /// admitted again from the list. A change it could not save is tried again on the next
-    /// check, and warned about once until one succeeds.
+    /// admitted again from the list. A removed machine is revoked only [`REMOVAL_SENT`] after
+    /// this first saw it removed, so its links have sent it the removal before revocation closes
+    /// them; the settings are read again every check until then. A change it could not save is
+    /// tried again on the next check, and warned about once until one succeeds.
     pub async fn follow(&self, store: Arc<Mutex<Store>>) {
         let mut seen = None;
         let mut warned = false;
+        // When this first saw each machine removed. A timeout, not an order of records.
+        let mut first_seen: BTreeMap<MachineId, Instant> = BTreeMap::new();
         let mut every = tokio::time::interval(RECHECK);
         loop {
             every.tick().await;
@@ -916,15 +930,24 @@ impl Keys {
                 }
             };
             let seq = settings.seq;
+            let now = Instant::now();
+            let waiting: BTreeSet<MachineId> = removed(&settings)
+                .filter(|id| {
+                    now.duration_since(*first_seen.entry(*id).or_insert(now)) < REMOVAL_SENT
+                })
+                .collect();
             let keys = self.clone();
+            let young = waiting.clone();
             let acted = tokio::task::spawn_blocking(move || {
-                keys.refuse_removed(&settings)?;
+                keys.refuse_removed_but(&settings, &young)?;
                 keys.learn(&settings.machines)
             })
             .await;
             match acted {
                 Ok(Ok(())) => {
-                    seen = Some(seq);
+                    // Done with this copy only once no removal in it waits: until then every
+                    // check reads it again.
+                    seen = waiting.is_empty().then_some(seq);
                     warned = false;
                 }
                 Ok(Err(error)) => {
