@@ -244,7 +244,7 @@ fn said(text: &str, secrets: &[&str]) -> Option<String> {
 /// `text` with each run of letters, digits, `-` and `_` that is at least [`TOKEN_LENGTH`] long
 /// and mixes letters and digits hidden: API keys, bearer tokens and hashes look like that, words
 /// and paths do not.
-fn tokens_hidden(text: &str) -> String {
+pub(crate) fn tokens_hidden(text: &str) -> String {
     let word = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
     let mut out = String::with_capacity(text.len());
     let mut run = String::new();

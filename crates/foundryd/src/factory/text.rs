@@ -5,11 +5,8 @@
 
 use ring::digest;
 
-use crate::sessions::brief::HIDDEN;
+use crate::sessions::brief::tokens_hidden;
 
-/// The shortest run of letters, digits, `-` and `_` [`for_comment`] hides when it mixes letters
-/// and digits, as P1 hides them in a session's brief.
-const TOKEN_LENGTH: usize = 24;
 /// The longest command shown in a gate message or a results table, in characters.
 const MAX_COMMAND_CHARS: usize = 300;
 
@@ -29,10 +26,6 @@ pub fn tail(text: &str, max_chars: usize) -> &str {
 /// counts 0, not a negative span.
 pub fn elapsed_ms(from_ms: u64, to_ms: u64) -> u64 {
     to_ms.saturating_sub(from_ms)
-}
-
-fn is_word(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '-' || c == '_'
 }
 
 /// Whether `c` can be part of a URL as [`for_comment`] reads one: an ASCII letter or digit, or
@@ -76,33 +69,11 @@ fn url_len(text: &str) -> usize {
     scheme.len() + rest.trim_end_matches(['.', ':', '!', '?']).len()
 }
 
-fn push_word(out: &mut String, word: &str) {
-    let letters = word.bytes().any(|b| b.is_ascii_alphabetic());
-    let digits = word.bytes().any(|b| b.is_ascii_digit());
-    if word.len() >= TOKEN_LENGTH && letters && digits {
-        out.push_str(HIDDEN);
-    } else {
-        out.push_str(word);
-    }
-}
-
 /// `text` with every run of letters, digits, `-` and `_` that is at least 24 long and mixes
-/// letters and digits hidden, and everything else as it is.
+/// letters and digits hidden, and everything else as it is: the one word rule P1 hides a
+/// session's brief with ([`tokens_hidden`]), so a brief and a comment hide the same words.
 fn push_hidden(out: &mut String, text: &str) {
-    let mut word_start: Option<usize> = None;
-    for (at, c) in text.char_indices() {
-        if is_word(c) {
-            word_start.get_or_insert(at);
-        } else {
-            if let Some(start) = word_start.take() {
-                push_word(out, &text[start..at]);
-            }
-            out.push(c);
-        }
-    }
-    if let Some(start) = word_start {
-        push_word(out, &text[start..]);
-    }
+    out.push_str(&tokens_hidden(text));
 }
 
 /// The anchors a GitHub page links to that end in a number: an issue comment, a review comment
@@ -356,6 +327,7 @@ pub fn sha256(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sessions::brief::HIDDEN;
 
     const KEY: &str = "sk9AbC3dEf5GhI7jKl1MnO2pQr4StU"; // 30 mixed letters and digits
 
