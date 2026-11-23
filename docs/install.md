@@ -103,7 +103,7 @@ Run `foundryd join` from a release at least as new as the one on the machine you
 
 Open the machines board of another machine in the fleet, click **Remove from fleet** on the card of the machine to remove, and confirm. A machine cannot be removed from its own UI. Every machine then refuses it: each revokes its key and closes its links, and the board stops listing its workspaces, terminals and sessions. Its workspaces stay on its disk.
 
-The removed machine stops listing itself once it holds the removal. Known gap, being fixed separately: the removal is usually not sent to the removed machine, because its links close first, so an edit of its own entry made while it is cut off (a new Tailscale address, or a rename on its own UI) can list it again through a machine that missed the removal. Until that is fixed, leave the removed machine off the tailnet or stop its service.
+The removed machine is sent its removal before its links close, and stops listing itself. A removal cannot be undone: a machine that missed it, or that took an entry the removed machine wrote for itself while cut off, drops that entry as soon as it hears from a machine that holds the removal.
 
 A removed machine has to be given a new identity before it can join again. That is not built yet, so for now a removed machine cannot rejoin.
 
