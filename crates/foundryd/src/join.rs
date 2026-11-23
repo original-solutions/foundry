@@ -606,6 +606,9 @@ struct KeysInner {
     taken: AtomicU64,
     /// The machines listed with a key that does not parse, each warned about once.
     unparsed: Mutex<BTreeSet<MachineId>>,
+    /// Counts the key tables saved, so a link waiting to learn its machine was revoked hears of
+    /// it at once instead of at its next check.
+    changed: tokio::sync::watch::Sender<u64>,
 }
 
 struct Held {
@@ -638,6 +641,25 @@ impl Shown {
     }
 }
 
+/// The machines `settings` shows removed from the machine list: each with a `Machine` stamp
+/// and no list entry. The one definition of removed: a machine removed and added again has the
+/// stamp and an entry, and is not.
+pub fn removed(settings: &SharedSettings) -> impl Iterator<Item = MachineId> + '_ {
+    settings.stamps.keys().filter_map(|key| match key {
+        StampKey::Setting(SettingKey::Machine(id))
+            if !settings.machines.iter().any(|m| m.id == *id) =>
+        {
+            Some(*id)
+        }
+        _ => None,
+    })
+}
+
+/// Whether `settings` shows `machine` removed from the machine list: see [`removed`].
+pub fn is_removed(settings: &SharedSettings, machine: MachineId) -> bool {
+    removed(settings).any(|id| id == machine)
+}
+
 impl Keys {
     /// This machine's identity and key table, kept in `secrets`, with no codes outstanding.
     /// A machine with no identity yet is given one, and its own entry is always its own key.
@@ -661,6 +683,7 @@ impl Keys {
                 saving: Mutex::new(()),
                 taken: AtomicU64::new(0),
                 unparsed: Mutex::new(BTreeSet::new()),
+                changed: tokio::sync::watch::channel(0).0,
             }),
         };
         let own = keys.public_key();
@@ -843,26 +866,17 @@ impl Keys {
     /// key table in this process.
     pub fn refuse_removed(&self, settings: &SharedSettings) -> Result<(), JoinError> {
         let me = self.me();
-        let removed: Vec<MachineId> = settings
-            .stamps
-            .keys()
-            .filter_map(|key| match key {
-                StampKey::Setting(SettingKey::Machine(id)) => Some(*id),
-                _ => None,
-            })
-            .filter(|id| *id != me && !settings.machines.iter().any(|m| m.id == *id))
-            .collect();
-        let saving = self.saving()?;
         let held: Vec<MachineId> = {
             let table = self.held();
-            removed
-                .into_iter()
+            removed(settings)
+                .filter(|id| *id != me)
                 .filter(|id| matches!(table.machines.get(id), Some(Entry::Active { .. })))
                 .collect()
         };
         if held.is_empty() {
             return Ok(());
         }
+        let saving = self.saving()?;
         self.change(&saving, |machines| {
             for id in &held {
                 // Only a key held active is revoked, as the stored table has it now.
@@ -1097,6 +1111,7 @@ impl Keys {
     ) -> Result<(), JoinError> {
         let machines = change_table(&*self.inner.secrets, edit)?;
         self.held().machines = machines;
+        self.inner.changed.send_modify(|saved| *saved += 1);
         Ok(())
     }
 
@@ -1248,12 +1263,17 @@ async fn relay(outer: Conn, inner: Conn, keys: Keys, peer: MachineId) {
     }
 }
 
-/// Returns once `keys` no longer admits `peer`, checked every [`RECHECK`], so a link with it
-/// selected against this closes.
+/// Returns once `keys` no longer admits `peer`, checked every [`RECHECK`] and whenever this
+/// process saves the key table, so a link with it selected against this closes as soon as the
+/// machine is revoked here.
 async fn revoked(keys: &Keys, peer: MachineId) {
     let mut every = tokio::time::interval(RECHECK);
+    let mut saved = keys.inner.changed.subscribe();
     loop {
-        every.tick().await;
+        tokio::select! {
+            _ = every.tick() => {}
+            _ = saved.changed() => {}
+        }
         if let Err(refused) = keys.admitted(peer) {
             tracing::info!("join: link with {peer} closed: {refused}");
             return;

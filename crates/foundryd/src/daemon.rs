@@ -360,7 +360,7 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
     services.spawn(named("the Tailscale address watch", tailscale.watch()));
     services.spawn(named(
         "the machine list entry",
-        list_this_machine(answered, listing),
+        list_this_machine(answered, listing, store.clone(), me),
     ));
     services.spawn(named("updates", update::run(home.clone())));
     services.spawn(named("gateway health", gateway_reader.run()));
@@ -658,13 +658,43 @@ pub(crate) async fn own_entry() -> Result<api::machine_names::Entry, String> {
 async fn list_this_machine(
     mut answered: tokio::sync::watch::Receiver<BTreeSet<IpAddr>>,
     mut listing: api::machine_names::Listing,
+    store: Arc<Mutex<Store>>,
+    me: foundry_proto::ids::MachineId,
 ) {
     let mut told = Told::default();
+    let mut warned = false;
     while answered.changed().await.is_ok() {
         let ips = answered.borrow_and_update().clone();
         let entry = told.entry(&ips, own_entry).await;
-        listing.list(entry).await;
+        list_unless_removed(&mut listing, &store, me, &mut warned, entry).await;
     }
+}
+
+/// [`api::machine_names::Listing::list`], unless this machine's copy of the settings shows it
+/// was removed from the fleet ([`join::is_removed`]): then nothing is listed, so a removed
+/// machine never takes itself back, and it warns once, in `warned`. A machine never listed has
+/// no such stamp, so its first listing is as ever.
+pub async fn list_unless_removed(
+    listing: &mut api::machine_names::Listing,
+    store: &Arc<Mutex<Store>>,
+    me: foundry_proto::ids::MachineId,
+    warned: &mut bool,
+    entry: Result<api::machine_names::Entry, String>,
+) {
+    let settings = crate::sync::on_store(store, |store| store.settings()).await;
+    if let Ok(settings) = &settings
+        && join::is_removed(settings, me)
+    {
+        if !*warned {
+            tracing::warn!(
+                "this machine was removed from the fleet and no longer lists itself; it needs a \
+                 new identity to join again"
+            );
+        }
+        *warned = true;
+        return;
+    }
+    listing.list(entry).await;
 }
 
 /// What `tailscale status` last said this machine is, and the addresses `ip` gave just before,

@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use foundry_proto::ids::MachineId;
 use foundry_proto::messages::{PROTOCOL, PeerMessage};
-use foundry_proto::settings::{Machine, SettingKey, SharedSettings, StampKey};
+use foundry_proto::settings::{Machine, SharedSettings};
 use foundryd::api::machine_names::{Entry, Listing};
 use foundryd::api::{machine_add, machine_remove};
 use foundryd::coordinator::Coordinator;
@@ -732,18 +732,16 @@ async fn a_removed_machine_never_lists_itself_again_and_one_that_missed_the_remo
     .await;
 
     assert_eq!(post_remove(port, c_id).await, 204);
-    until(
-        Duration::from_secs(10),
-        "C holds the copy that removes it",
-        || {
-            let held = c.settings();
-            held.machines.iter().all(|m| m.id != c_id)
-                && held
-                    .stamps
-                    .contains_key(&StampKey::Setting(SettingKey::Machine(c_id)))
-        },
-    )
+    // A closes its link with C within about a second, which can be before its next send of the
+    // settings, so C may never receive the removal over a link. The copy is handed to C as a
+    // link would: the guard is for the machine that holds it.
+    until(Duration::from_secs(10), "A holds the removal", || {
+        join::is_removed(&a.settings(), c_id)
+    })
     .await;
+    // False when the copy had already arrived over the link.
+    lock(&c.store).apply_settings(a.settings()).unwrap();
+    assert!(join::is_removed(&c.settings(), c_id));
 
     // C acts alone now and runs its listing, as its daemon does, for several looks.
     list_guarded(&c, 10).await;

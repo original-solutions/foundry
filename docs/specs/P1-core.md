@@ -2,7 +2,7 @@
 
 Product: Foundry, a dark software factory that also runs manual sessions.
 
-Status: built and running on one machine, except joining a fleet, machine limits and removing a machine, which are being built. The acceptance run (plan task 19) comes after them. To install it, see [install.md](../install.md).
+Status: built and running, with joining a fleet, machine limits and removing a machine. The acceptance run (plan task 19) is next. To install it, see [install.md](../install.md).
 
 ## Why
 
@@ -229,7 +229,7 @@ In either grouping, under an idle session of this machine a card offers the next
 
 ### Machines
 
-The board also switches to its machines (`/machines`, or a machine's name in the sidebar). Each machine is a card: online, offline or unknown as the sidebar says it, when this page last heard a new sample from it, its load per core as a line over the samples this page received (up to ten minutes; the browser keeps them in memory only), its free memory and disk and its session count, its terminals counted by state, and its workspaces, each opening its most urgent terminal. An offline machine keeps its card with its last known numbers and says how many of its terminals are unreachable. No new read: it is drawn from the samples and records on the events socket.
+The board also switches to its machines (`/machines`, or a machine's name in the sidebar). Each machine is a card: online, offline or unknown as the sidebar says it, when this page last heard a new sample from it, its load per core as a line over the samples this page received (up to ten minutes; the browser keeps them in memory only), its free memory and disk and its session count, its terminals counted by state, and its workspaces, each opening its most urgent terminal. An offline machine keeps its card with its last known numbers and says how many of its terminals are unreachable. No new read: it is drawn from the samples and records on the events socket. Another listed machine's card offers **Remove from fleet**; this machine's card never does, since a machine is removed from another machine's UI. The UI lists no workspaces, terminals or sessions of a machine that is not in the machine list, once that list is not empty.
 
 ### Ending terminals
 
@@ -273,7 +273,7 @@ P2 adds a lease per project on GitHub, so that claiming issues can never happen 
 ## Security
 
 - The daemon binds to the machine's Tailscale address and to localhost. It refuses to start bound to anything else.
-- A new machine joins with a one-time code made for it, by its Tailscale name, in the Add machine dialog of a machine already in the fleet. The code works only from an address that name resolves to. As with all access in P1, anyone on the tailnet who can reach a fleet machine's UI can add a machine. Joining gives it a key of its own. A machine is removed from the machines board of another machine, and every machine then refuses it: each revokes the key it holds for it and closes its links. A machine whose list holds only itself, or is empty, takes a record link from any machine whose key it holds, whenever that is, not only just after it joined. Once its list holds another machine, it follows the machine list.
+- A new machine joins with a one-time code made for it, by its Tailscale name, in the Add machine dialog of a machine already in the fleet. The code works only from an address that name resolves to. As with all access in P1, anyone on the tailnet who can reach a fleet machine's UI can add a machine. Joining gives it a key of its own. A machine is removed from the machines board of another machine, and every machine then refuses it: each revokes the key it holds for it and closes its links. A machine whose list holds only itself, or is empty, takes a record link from any machine whose key it holds, whenever that is, not only just after it joined. Once its list holds another machine, it follows the machine list. A removed machine stops listing itself, so it cannot take its place back, and needs a new identity to join again.
 - Each machine's public key travels in its machine-list entry, so a machine admitted by one is admitted by all. Every machine admits the keys its list carries, and never over a key it has revoked or holds otherwise. A join is answered only once the new machine is in the list; when it cannot be listed, the join command says so and can be run again.
 - Each machine keeps the gateway key and the gateway's management key in its own secret store, set with `foundryd secret set gateway` and `foundryd secret set gateway-management`: a file readable only by the service user, on every OS. A Mac that kept them in the login keychain before copies them into that file once, never while an update is on trial (so it takes a hand install, and an automatic rollback never crosses the copy), and from then on a rebuilt or updated binary never stops at a keychain prompt. They are never written to a log or shown in the UI after they are entered.
 - Hook calls are accepted only on localhost and only with the per-session token the daemon wrote for that session. The token is kept in a 0600 curl config (`<data dir>/sessions/<id>.curl`), which the hook command in the session's settings file reads with `curl -K`, so it never sits on a command line.
