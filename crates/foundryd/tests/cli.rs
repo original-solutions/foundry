@@ -1,6 +1,6 @@
-//! The command line: `--version` works, `join` names a bad port, and `secret set`
-//! stores a gateway key without printing it. Every test that runs the binary uses a temporary
-//! data directory and skips the copy from the login keychain.
+//! The command line: `--version` works, `join` names a bad port, `secret set` stores a gateway
+//! key without printing it, and each command a later task fills exits 2. Every test that runs the
+//! binary uses a temporary data directory and skips the copy from the login keychain.
 
 // A release build ignores `FOUNDRY_SECRETS`, so on macOS these runs of the binary would move
 // secrets out of the login keychain.
@@ -144,4 +144,32 @@ fn dashboard_with_no_daemon_running_exits_1_and_says_so() {
         stderr.contains(&format!("no daemon is running on 127.0.0.1:{port}")),
         "stderr: {stderr}"
     );
+}
+
+/// Asserts `foundryd <args>` exits 2 and says it is not built yet.
+fn assert_not_built(args: &[&str]) {
+    let out = foundryd(args);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{args:?} exit: {:?}",
+        out.status
+    );
+    assert!(
+        stderr.contains("not built yet"),
+        "{args:?} stderr: {stderr}"
+    );
+}
+
+#[test]
+fn github_default_exits_2_and_says_not_built_yet() {
+    assert_not_built(&["github", "default", "octocat"]);
+}
+
+#[test]
+fn factory_export_exits_2_and_says_not_built_yet() {
+    let out = tempfile::tempdir().unwrap();
+    assert_not_built(&["factory", "export", out.path().to_str().unwrap()]);
 }
