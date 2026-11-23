@@ -953,6 +953,7 @@ mod tests {
     use super::*;
     use crate::factory::lifecycle::State;
     use crate::factory::lifecycle::approval::{Refusal, unapproved_comment};
+    use foundry_proto::factory::RunId;
 
     const PATH: &str = "/var/lib/foundry/sessions/s1/message-1.md";
 
@@ -975,7 +976,7 @@ mod tests {
     }
 
     fn earlier_run(after: &str) -> ResumeFrom {
-        let run = "acme__widgets__42__1".to_string();
+        let run = RunId::new("Acme/Widgets", 42, 1).expect("a run id");
         let branch = "t3code/abc".to_string();
         match after {
             "time-limit" => ResumeFrom::TimeLimit { run, branch },
