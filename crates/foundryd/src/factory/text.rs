@@ -5,7 +5,6 @@
 
 use ring::digest;
 
-use crate::secrets::redact;
 use crate::sessions::brief::HIDDEN;
 
 /// The shortest run of letters, digits, `-` and `_` [`for_comment`] hides when it mixes letters
@@ -106,12 +105,6 @@ fn push_hidden(out: &mut String, text: &str) {
     }
 }
 
-/// The path segments a GitHub link puts a commit id after, as in `commit/<id>`, `blob/<id>/…`,
-/// `pull/<n>/files/<id>` or `compare/<id>...<id>`.
-const GITHUB_COMMIT_AFTER: [&str; 8] = [
-    "commit", "commits", "blob", "tree", "blame", "raw", "files", "compare",
-];
-
 /// The anchors a GitHub page links to that end in a number: an issue comment, a review comment
 /// and a review.
 const GITHUB_NUMBERED_ANCHORS: [&str; 3] = ["issuecomment-", "discussion_r", "pullrequestreview-"];
@@ -146,6 +139,21 @@ fn is_github_anchor(fragment: &str) -> bool {
     is_commit_id(id) && is_diff_lines(lines)
 }
 
+/// Where a `github.com` link's path puts a commit id: the index of that segment, counting the
+/// empty one before the first `/`, and whether it can hold a range, `<id>...<id>` or
+/// `<id>..<id>`. After the owner and the repo: `commit/<id>`, `commits/<id>`, `blob/<id>/…`,
+/// `tree/<id>/…`, `blame/<id>/…`, `raw/<id>/…` and `compare/<range>`. After a pull request's
+/// number: `commits/<id>` and `files/<range>`. No other segment holds one.
+fn github_commit_place(segments: &[&str]) -> Option<(usize, bool)> {
+    match segments.get(3..)? {
+        ["commit" | "commits" | "blob" | "tree" | "blame" | "raw", ..] => Some((4, false)),
+        ["compare", ..] => Some((4, true)),
+        ["pull", number, "commits", ..] if is_number(number) => Some((6, false)),
+        ["pull", number, "files", ..] if is_number(number) => Some((6, true)),
+        _ => None,
+    }
+}
+
 /// A path segment where a GitHub link puts a commit id: kept whole when it is one, alone or as
 /// a `.patch` or `.diff` of it, and through the word rule otherwise.
 fn push_commit(out: &mut String, segment: &str) {
@@ -161,38 +169,40 @@ fn push_commit(out: &mut String, segment: &str) {
 }
 
 /// The path, query and fragment of a `github.com` URL as a comment may show them. A commit id
-/// is kept whole only as the path segment right after a segment named in
-/// [`GITHUB_COMMIT_AFTER`], wherever that falls in the path ([`push_commit`]), or as one side of
-/// a compare's `...` or `..`; a fragment only when the whole of it is a GitHub anchor
-/// ([`is_github_anchor`]). Every other word, the owner, the repo, branch and file names and the
-/// query included, goes through the word rule.
+/// is kept whole only in the one segment where the link's shape puts one
+/// ([`github_commit_place`]), alone or as one side of a range; a fragment only when the whole
+/// of it is a GitHub anchor ([`is_github_anchor`]). Every other word, the owner, the repo,
+/// branch and file names and the query included, goes through the word rule.
 fn push_github(out: &mut String, rest: &str) {
     let (path, rest) = rest.split_at(rest.find(['?', '#']).unwrap_or(rest.len()));
-    let mut after = "";
-    for (n, segment) in path.split('/').enumerate() {
+    let segments: Vec<&str> = path.split('/').collect();
+    let place = github_commit_place(&segments);
+    for (n, segment) in segments.into_iter().enumerate() {
         if n > 0 {
             out.push('/');
         }
-        if GITHUB_COMMIT_AFTER.contains(&after) {
-            let compare = (after == "compare")
-                .then(|| {
-                    segment
-                        .split_once("...")
-                        .or_else(|| segment.split_once(".."))
-                })
-                .flatten();
-            match compare {
-                Some((base, head)) => {
-                    push_commit(out, base);
-                    out.push_str(&segment[base.len()..segment.len() - head.len()]);
-                    push_commit(out, head);
-                }
-                None => push_commit(out, segment),
+        let range = match place {
+            Some((at, range)) if at == n => range,
+            _ => {
+                push_hidden(out, segment);
+                continue;
             }
-        } else {
-            push_hidden(out, segment);
+        };
+        let sides = range
+            .then(|| {
+                segment
+                    .split_once("...")
+                    .or_else(|| segment.split_once(".."))
+            })
+            .flatten();
+        match sides {
+            Some((base, head)) => {
+                push_commit(out, base);
+                out.push_str(&segment[base.len()..segment.len() - head.len()]);
+                push_commit(out, head);
+            }
+            None => push_commit(out, segment),
         }
-        after = segment;
     }
     let (query, fragment) = rest.split_at(rest.find('#').unwrap_or(rest.len()));
     push_hidden(out, query);
@@ -206,8 +216,7 @@ fn push_github(out: &mut String, rest: &str) {
     }
 }
 
-/// A URL, its userinfo already hidden by [`redact`](crate::secrets::redact), as a comment may
-/// show it. Every part goes through the word rule like the rest of the text, since a webhook,
+/// A URL, its userinfo already hidden ([`hide_userinfo`]), as a comment may show it. Every part goes through the word rule like the rest of the text, since a webhook,
 /// a signed link or an `?access_token=` carries its secret there. Only a `github.com` URL keeps
 /// the commit ids and anchors its links hold ([`push_github`]).
 fn push_url(out: &mut String, url: &str) {
@@ -229,19 +238,19 @@ fn push_url(out: &mut String, url: &str) {
 /// `text` as a comment the factory posts on GitHub may show it: every run of letters, digits,
 /// `-` and `_` that is at least 24 long and mixes letters and digits is hidden, as P1 hides
 /// them. Keys, tokens, commit ids and hashes look like that; words and paths do not. Inside an
-/// `http://` or `https://` URL the same holds, except that a `github.com` URL keeps a commit id
-/// in the path segment after one named in [`GITHUB_COMMIT_AFTER`], wherever it falls, and an
-/// anchor a review, comment or diff link
-/// ends in ([`is_github_anchor`]). So a pull request, commit, blob or review link comes through
-/// whole unless its owner, repo, branch or file name has a word of 24 or more mixed letters and
-/// digits, which is then hidden. A URL's userinfo is hidden as
-/// [`redact`](crate::secrets::redact) hides it. A URL ends at the first character no URL holds,
-/// at `,` and `;`, and before the `.`, `:`, `!` or `?` that ends a sentence after it.
+/// `http://` or `https://` URL the same holds. The only such word a comment keeps is a commit
+/// id or a comment, review or diff anchor in a `github.com` link, at the place GitHub's own
+/// links put one ([`github_commit_place`], [`is_github_anchor`]). So a pull request, commit,
+/// blob or review link comes through whole unless its owner, repo, branch or file name has a
+/// word of 24 or more mixed letters and digits, which is then hidden. Every URL's user and
+/// password are hidden first ([`hide_userinfo`]). A URL ends at the first character no URL
+/// holds, at `,` and `;`, and before the `.`, `:`, `!` or `?` that ends a sentence after it.
 ///
 /// The caller hides the secrets it knows (held tokens, gateway keys, URL passwords) before
 /// this, and adds the factory's own markers, such as `<!-- foundry:claim <run id> <machine> -->`,
 /// after it: a run id and a machine id are token-shaped, and this would hide them.
 pub fn for_comment(text: &str) -> String {
+    let text = &hide_userinfo(text);
     let mut out = String::with_capacity(text.len());
     let mut plain = 0;
     let mut at = 0;
@@ -249,7 +258,7 @@ pub fn for_comment(text: &str) -> String {
         let url = url_len(&text[at..]);
         if url > 0 {
             push_hidden(&mut out, &text[plain..at]);
-            push_url(&mut out, &redact(&text[at..at + url]));
+            push_url(&mut out, &text[at..at + url]);
             at += url;
             plain = at;
         } else {
@@ -257,6 +266,30 @@ pub fn for_comment(text: &str) -> String {
         }
     }
     push_hidden(&mut out, &text[plain..]);
+    out
+}
+
+/// `text` with the user and password of every URL hidden, `scheme://user:pass@host` shown as
+/// `scheme://***@host`, as [`redact`](crate::secrets::redact) hides them. Here the authority
+/// runs from `://` to the first `/`, `?`, `#` or whitespace, whatever comes before it, so a
+/// password that holds a quote, a `,` or a `;`, where a URL ends in prose, is hidden whole.
+fn hide_userinfo(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("://") {
+        let (before, after) = rest.split_at(at + 3);
+        out.push_str(before);
+        let end = after
+            .find(|c: char| matches!(c, '/' | '?' | '#') || c.is_whitespace())
+            .unwrap_or(after.len());
+        let host = after[..end].rfind('@').map_or(0, |user_end| {
+            out.push_str("***");
+            user_end
+        });
+        out.push_str(&after[host..end]);
+        rest = &after[end..];
+    }
+    out.push_str(rest);
     out
 }
 
