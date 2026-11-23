@@ -7,6 +7,10 @@ use serde_yaml_ng::{Mapping, Value};
 /// Where the coordinator reads a project's config, on the default branch.
 pub const PATH: &str = ".dw/config.yml";
 
+const DEFAULT_MINUTES: u64 = 180;
+const DEFAULT_CHECKS_MINUTES: u64 = 30;
+const DEFAULT_INTERRUPTION_RESUMES: u64 = 2;
+
 /// One problem found in the config: the file, the field it is about (none for a whole-file
 /// problem) and what is wrong with it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,7 +23,10 @@ pub struct ConfigError {
 impl fmt::Display for ConfigError {
     /// `<file>: <field>: <message>`, or `<file>: <message>` with no field.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!()
+        match &self.field {
+            Some(field) => write!(f, "{}: {}: {}", self.file, field, self.message),
+            None => write!(f, "{}: {}", self.file, self.message),
+        }
     }
 }
 
@@ -33,7 +40,13 @@ pub struct ConfigErrors {
 impl fmt::Display for ConfigErrors {
     /// Each error on its own line.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!()
+        for (i, error) in self.errors.iter().enumerate() {
+            if i > 0 {
+                writeln!(f)?;
+            }
+            write!(f, "{error}")?;
+        }
+        Ok(())
     }
 }
 
@@ -61,10 +74,248 @@ pub struct ProjectConfig {
     pub owner_set: bool,
 }
 
-/// Parse the text of a project's `.dw/config.yml`.
+fn join(path: &str, key: &str) -> String {
+    if path.is_empty() {
+        key.to_string()
+    } else {
+        format!("{path}.{key}")
+    }
+}
+
+fn get<'a>(parent: &'a Mapping, key: &str) -> Option<&'a Value> {
+    parent.get(Value::String(key.to_string()))
+}
+
+/// Collects every problem of one file. `None` stands for "no value": an absent key or a parent
+/// that was already reported.
+#[derive(Default)]
+struct Checker {
+    errors: Vec<ConfigError>,
+}
+
+impl Checker {
+    fn err(&mut self, field: &str, message: &str) {
+        self.errors.push(ConfigError {
+            file: PATH.to_string(),
+            field: (!field.is_empty()).then(|| field.to_string()),
+            message: message.to_string(),
+        });
+    }
+
+    fn child<'a>(
+        &mut self,
+        parent: Option<&'a Mapping>,
+        path: &str,
+        key: &str,
+    ) -> Option<&'a Value> {
+        let parent = parent?;
+        let found = get(parent, key);
+        if found.is_none() {
+            self.err(&join(path, key), "is missing");
+        }
+        found
+    }
+
+    fn mapping<'a>(&mut self, value: Option<&'a Value>, path: &str) -> Option<&'a Mapping> {
+        let value = value?;
+        match value.as_mapping() {
+            Some(m) => Some(m),
+            None => {
+                self.err(path, "must be a mapping");
+                None
+            }
+        }
+    }
+
+    fn non_empty_string(&mut self, value: Option<&Value>, path: &str) -> Option<String> {
+        let value = value?;
+        match value.as_str() {
+            None => {
+                self.err(path, "must be a string");
+                None
+            }
+            Some("") => {
+                self.err(path, "must not be empty");
+                None
+            }
+            Some(s) => Some(s.to_string()),
+        }
+    }
+
+    /// An integer at or above `min`. A float, even a whole one, is not an integer.
+    fn uint(&mut self, value: Option<&Value>, path: &str, min: u64) -> Option<u64> {
+        let value = value?;
+        match value {
+            Value::Number(n) => match n.as_u64() {
+                Some(v) if v >= min => Some(v),
+                _ => {
+                    self.err(path, &format!("must be an integer of at least {min}"));
+                    None
+                }
+            },
+            _ => {
+                self.err(path, "must be an integer");
+                None
+            }
+        }
+    }
+
+    /// Like `uint` for `key` under `parent`, but an absent key takes `fallback`.
+    fn optional_uint(
+        &mut self,
+        parent: Option<&Mapping>,
+        path: &str,
+        key: &str,
+        fallback: u64,
+        min: u64,
+    ) -> Option<u64> {
+        let parent = parent?;
+        match get(parent, key) {
+            None => Some(fallback),
+            found => self.uint(found, &join(path, key), min),
+        }
+    }
+
+    fn string_list(
+        &mut self,
+        value: Option<&Value>,
+        path: &str,
+        allow_empty: bool,
+    ) -> Option<Vec<String>> {
+        let value = value?;
+        let Some(items) = value.as_sequence() else {
+            self.err(path, "must be a list of strings");
+            return None;
+        };
+        if items.is_empty() && !allow_empty {
+            self.err(path, "must not be empty");
+            return None;
+        }
+        let before = self.errors.len();
+        let out: Vec<String> = items
+            .iter()
+            .enumerate()
+            .filter_map(|(i, item)| self.non_empty_string(Some(item), &format!("{path}[{i}]")))
+            .collect();
+        (self.errors.len() == before).then_some(out)
+    }
+
+    fn autonomy(&mut self, value: Option<&Value>, path: &str) -> Option<()> {
+        let value = value?;
+        match value.as_str() {
+            Some("pr") => Some(()),
+            Some(other) => {
+                self.err(
+                    path,
+                    &format!("unsupported value `{other}`; only `pr` is accepted in phase 1"),
+                );
+                None
+            }
+            None => {
+                self.err(path, "must be a string; only `pr` is accepted in phase 1");
+                None
+            }
+        }
+    }
+
+    fn limits(&mut self, limits: Option<&Mapping>, path: &str) -> Option<Limits> {
+        let minutes = self.optional_uint(limits, path, "minutes", DEFAULT_MINUTES, 1);
+        let gate_retries = {
+            let found = self.child(limits, path, "gate_retries");
+            self.uint(found, &join(path, "gate_retries"), 0)
+        };
+        let checks_minutes =
+            self.optional_uint(limits, path, "checks_minutes", DEFAULT_CHECKS_MINUTES, 1);
+        let interruption_resumes = self.optional_uint(
+            limits,
+            path,
+            "interruption_resumes",
+            DEFAULT_INTERRUPTION_RESUMES,
+            0,
+        );
+        Some(Limits {
+            minutes: minutes?,
+            gate_retries: gate_retries?,
+            checks_minutes: checks_minutes?,
+            interruption_resumes: interruption_resumes?,
+        })
+    }
+
+    fn project(&mut self, root: &Mapping) -> Option<ProjectConfig> {
+        let found = self.child(Some(root), "", "factory");
+        let factory = self.mapping(found, "factory");
+
+        let found = self.child(factory, "factory", "instructors");
+        let instructors = self.string_list(found, "factory.instructors", false);
+        let found = self.child(factory, "factory", "base");
+        let base = self.non_empty_string(found, "factory.base");
+        let found = self.child(factory, "factory", "provision");
+        let provision = self.string_list(found, "factory.provision", true);
+        let found = self.child(factory, "factory", "gate");
+        let gate = self.string_list(found, "factory.gate", false);
+
+        let required_checks = match factory {
+            None => None,
+            Some(f) => match get(f, "required_checks") {
+                None => Some(Vec::new()),
+                found => self.string_list(found, "factory.required_checks", true),
+            },
+        };
+
+        let found = self.child(factory, "factory", "limits");
+        let limits_map = self.mapping(found, "factory.limits");
+        let limits = self.limits(limits_map, "factory.limits");
+
+        let found = self.child(factory, "factory", "autonomy");
+        let autonomy = self.autonomy(found, "factory.autonomy");
+
+        let owner_set = match factory {
+            None => None,
+            Some(f) => match get(f, "owner") {
+                None => Some(false),
+                found => self.non_empty_string(found, "factory.owner").map(|_| true),
+            },
+        };
+
+        autonomy?;
+        Some(ProjectConfig {
+            instructors: instructors?,
+            base: base?,
+            provision: provision?,
+            gate: gate?,
+            required_checks: required_checks?,
+            limits: limits?,
+            owner_set: owner_set?,
+        })
+    }
+}
+
+fn fail(errors: Vec<ConfigError>) -> ConfigErrors {
+    ConfigErrors {
+        file: PATH.to_string(),
+        errors,
+    }
+}
+
+/// Parse the text of a project's `.dw/config.yml`, reporting every problem found in one pass.
+/// Keys the factory does not read are ignored; `factory.owner` only sets `owner_set`.
 pub fn parse(yaml: &str) -> Result<ProjectConfig, ConfigErrors> {
-    let _ = (yaml, Mapping::new(), Value::Null);
-    todo!()
+    let mut c = Checker::default();
+    let value = match serde_yaml_ng::from_str::<Value>(yaml) {
+        Ok(value) => value,
+        Err(cause) => {
+            c.err("", &format!("not valid YAML: {cause}"));
+            return Err(fail(c.errors));
+        }
+    };
+    let Some(root) = value.as_mapping() else {
+        c.err("", "top level must be a mapping");
+        return Err(fail(c.errors));
+    };
+    match c.project(root) {
+        Some(config) if c.errors.is_empty() => Ok(config),
+        _ => Err(fail(c.errors)),
+    }
 }
 
 #[cfg(test)]
@@ -330,10 +581,7 @@ factory:
             #[test]
             fn project_owner_must_be_a_non_empty_string() {
                 for bad in ["\"\"", "5", "null", "[t3fac]", "{ name: t3fac }", "true"] {
-                    assert_one(
-                        &project_err(&edit(PROJECT, |t| set(t, OWNER, bad))),
-                        OWNER,
-                    );
+                    assert_one(&project_err(&edit(PROJECT, |t| set(t, OWNER, bad))), OWNER);
                 }
             }
         }
