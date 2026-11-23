@@ -433,16 +433,24 @@ mod tests {
         assert!(argv.ends_with("api\nuser\n"), "{argv}");
     }
 
+    /// The token is in neither the message nor the debug form of `error`.
+    fn assert_no_token(error: &TrackerError) {
+        assert!(!error.to_string().contains(TOKEN), "{error}");
+        assert!(!format!("{error:?}").contains(TOKEN), "{error:?}");
+    }
+
     #[test]
     fn a_gh_that_sleeps_is_killed_at_30_seconds_on_the_fake_clock_and_is_timeout() {
         let dir = tempfile::tempdir().unwrap();
         let pid_file = dir.path().join("pid");
+        let gpid_file = dir.path().join("gpid");
         // A distinctive duration, so a stray is easy to tell from any other sleep.
         let program = fake_gh(
             dir.path(),
             &format!(
-                "echo $$ > '{}'\nsleep 47.3191\necho late",
-                pid_file.display()
+                "echo $$ > '{}'\nsleep 47.3191 &\necho $! > '{}'\nwait\necho late",
+                pid_file.display(),
+                gpid_file.display()
             ),
         );
         let clock = Arc::new(FakeClock::new());
@@ -452,10 +460,13 @@ mod tests {
             let _ = tx.send(gh.gh(&args(&["issue", "list", "--repo", "rawphp/softfac"])));
         });
 
-        let begun = Instant::now();
-        while !pid_file.exists() && begun.elapsed() < Duration::from_secs(10) {
-            thread::sleep(Duration::from_millis(10));
-        }
+        let pid = pid_in(&pid_file);
+        let gpid = pid_in(&gpid_file);
+        // The sleeper is in the shell's group, so the kill that takes the shell takes it.
+        assert_eq!(
+            nix::unistd::getpgid(Some(Pid::from_raw(gpid))).unwrap(),
+            Pid::from_raw(pid)
+        );
         clock.advance(Duration::from_millis(29_999));
         assert!(
             rx.recv_timeout(Duration::from_millis(300)).is_err(),
@@ -467,6 +478,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(10))
             .expect("killed once 30 s passed on the clock");
         let error = result.unwrap_err();
+        assert_no_token(&error);
         assert_eq!(
             error,
             TrackerError::Timeout {
@@ -479,19 +491,9 @@ mod tests {
             "`gh issue list --repo rawphp/softfac` timed out after 30 s"
         );
 
-        // The group went with it: the shell's pid answers no signal.
-        let pid: i32 = fs::read_to_string(&pid_file)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        let gone = Instant::now();
-        while nix::sys::signal::kill(Pid::from_raw(pid), None).is_ok()
-            && gone.elapsed() < Duration::from_secs(5)
-        {
-            thread::sleep(Duration::from_millis(10));
-        }
-        assert!(nix::sys::signal::kill(Pid::from_raw(pid), None).is_err());
+        // The group went with it: neither the shell's pid nor the sleeper's answers a signal.
+        assert!(goes_away(pid), "the shell outlived the call");
+        assert!(goes_away(gpid), "the grandchild outlived the call");
     }
 
     /// The pid the script wrote to `file`, once it has.
@@ -609,6 +611,7 @@ mod tests {
         );
         let gh = gh_at(&program, Arc::new(FakeClock::new()));
         let error = gh.gh(&args(&["issue", "list"])).unwrap_err();
+        assert_no_token(&error);
         assert_eq!(
             error.to_string(),
             format!("`gh issue list` printed more than {OUTPUT_LIMIT} bytes")
@@ -626,7 +629,9 @@ mod tests {
     fn a_gh_that_cannot_be_found_is_a_spawn_error() {
         let dir = tempfile::tempdir().unwrap();
         let gh = gh_at(&dir.path().join("no-such-gh"), Arc::new(FakeClock::new()));
-        let TrackerError::Other(message) = gh.gh(&args(&["api", "user"])).unwrap_err() else {
+        let error = gh.gh(&args(&["api", "user"])).unwrap_err();
+        assert_no_token(&error);
+        let TrackerError::Other(message) = error else {
             panic!("not Other");
         };
         assert!(
@@ -648,7 +653,7 @@ mod tests {
     }
 
     #[test]
-    fn an_argument_with_a_nul_byte_is_refused_before_any_call() {
+    fn a_nul_byte_in_an_argument_is_refused_before_gh_starts_and_never_reaches_the_message() {
         let dir = tempfile::tempdir().unwrap();
         let ran = dir.path().join("ran");
         let program = fake_gh(dir.path(), &format!("touch '{}'", ran.display()));
@@ -660,6 +665,7 @@ mod tests {
             error.to_string(),
             "cannot start `gh issue comment 6 --body <11 bytes>`: an argument contains a NUL byte"
         );
+        assert!(!error.to_string().contains("secret"), "{error}");
         assert!(!ran.exists());
     }
 
@@ -708,8 +714,12 @@ mod tests {
         }
         let error = finish(&call, Answer::fail(4, "HTTP 404: Not Found\n")).unwrap_err();
         assert_eq!(
-            error.to_string(),
-            "`gh api repos/rawphp/softfac/branches/x` exited with status 4: HTTP 404: Not Found"
+            error,
+            TrackerError::NotFound {
+                command: "gh api repos/rawphp/softfac/branches/x".into(),
+                status: 4,
+                stderr: "HTTP 404: Not Found\n".into(),
+            }
         );
         for other in [
             Answer::fail(1, "gh: Server Error (HTTP 500)"),
