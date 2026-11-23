@@ -322,6 +322,14 @@ pub fn transition(state: State, event: &Event) -> Result<(State, Vec<Action>), I
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::factory::lifecycle::approval::Refusal;
+
+    /// A refusal for an issue edited after its label, as `ready_unapproved` uses.
+    fn edited() -> Refusal {
+        Refusal::EditedAfterLabel {
+            labeled_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
 
     /// The label table of softfac's docs/lifecycle.md, pinned: the first two columns of each row.
     const LABEL_TABLE_ROWS: [&str; 7] = [
@@ -484,7 +492,9 @@ mod tests {
             (Action::MarkPrDraft { pr: 1 }, "mark-pr-draft"),
             (Action::PostGateResults { pr: 1 }, "post-gate-results"),
             (
-                Action::PostUnapproved { reason: "r".into() },
+                Action::PostUnapproved {
+                    refusal: Refusal::LabelNotFound,
+                },
                 "post-unapproved",
             ),
         ];
@@ -523,19 +533,12 @@ mod tests {
 
     #[test]
     fn ready_unapproved() {
-        let (next, actions) = ok(
-            State::Ready,
-            Event::Unapproved {
-                reason: "edited".into(),
-            },
-        );
+        let (next, actions) = ok(State::Ready, Event::Unapproved { refusal: edited() });
         assert_eq!(next, State::Proposed);
         assert_eq!(
             actions,
             vec![
-                Action::PostUnapproved {
-                    reason: "edited".into()
-                },
+                Action::PostUnapproved { refusal: edited() },
                 Action::SetLabel {
                     state: State::Proposed
                 },
@@ -768,7 +771,12 @@ mod tests {
             (Event::BodyEdited, "body-edited"),
             (Event::GateFailed { output: "o".into() }, "gate-failed"),
             (Event::PrReady { pr: 2 }, "pr-ready"),
-            (Event::Unapproved { reason: "r".into() }, "unapproved"),
+            (
+                Event::Unapproved {
+                    refusal: Refusal::LabelNotFound,
+                },
+                "unapproved",
+            ),
             (
                 Event::RegateFailed {
                     pr: 3,

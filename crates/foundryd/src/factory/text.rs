@@ -327,6 +327,7 @@ pub fn sha256(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secrets::redact;
     use crate::sessions::brief::HIDDEN;
 
     const KEY: &str = "sk9AbC3dEf5GhI7jKl1MnO2pQr4StU"; // 30 mixed letters and digits
@@ -839,6 +840,28 @@ mod tests {
         }
         let ssh = "ssh://git:pa;ss@example.com/r";
         assert_eq!(for_comment(ssh), "ssh://***@example.com/r");
+    }
+
+    /// A comment hides at least what P1's `secrets::redact` hides: running `redact` before
+    /// `for_comment` changes nothing, whatever the text.
+    #[test]
+    fn for_comment_hides_everything_redact_hides() {
+        for text in [
+            "fatal: unable to access 'https://x-access-token:ghp_s3cret@github.com/o/r.git/'",
+            "https://ghp_t0ken@github.com/o/r.git",
+            "ssh://deploy:hunter2@host/r.git and more",
+            "git push https://bot:pa\"ss@github.com/o/r",
+            "git push https://bot:pa'ss@github.com/o/r",
+            "git push https://bot:pa;ss@github.com/o/r",
+            "clone \"https://bot:hunter2@github.com/o/r\" now",
+            "clone 'https://bot:hunter2@github.com/o/r' now",
+            "'https://example.com/a'@b and \"https://x.example\"@y",
+            "https://example.com/login?next=https://bot:hunter2@github.com/o/r",
+            "git@github.com:o/r.git",
+            "no url here",
+        ] {
+            assert_eq!(for_comment(&redact(text)), for_comment(text), "{text}");
+        }
     }
 
     #[test]
