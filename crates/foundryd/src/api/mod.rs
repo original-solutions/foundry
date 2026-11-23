@@ -118,6 +118,7 @@ mod machine;
 pub mod machine_add;
 pub mod machine_limits;
 pub mod machine_names;
+pub mod machine_priority;
 pub mod machine_remove;
 mod pr;
 pub mod projects;

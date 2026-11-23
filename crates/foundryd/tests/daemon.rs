@@ -1741,3 +1741,51 @@ fn the_remove_route_is_served_and_refuses_a_request_from_another_site() {
     assert_eq!(ask(&remove, &here, Some("http://evil.example")).0, 403);
     assert_eq!(ask(&remove, "evil.example", None).0, 403);
 }
+
+/// The settings `GET /api/state` returns, once it answers 200.
+fn settings_of(fixture: &Fixture) -> SharedSettings {
+    let (status, body) = fixture.call("GET", "/api/state", None);
+    assert_eq!(status, 200, "{body}");
+    match serde_json::from_str(&body).unwrap() {
+        UiMessage::State { settings, .. } => settings,
+        other => panic!("not a state: {other:?}"),
+    }
+}
+
+#[test]
+fn the_priority_route_is_served_and_refuses_a_request_from_another_site() {
+    use std::io::{Read as _, Write as _};
+    let mut fixture = Fixture::new();
+    fixture.start();
+    let ask = |host: &str, origin: Option<&str>, body: &str| {
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", fixture.port)).unwrap();
+        let origin = origin.map_or_else(String::new, |o| format!("Origin: {o}\r\n"));
+        write!(
+            stream,
+            "POST /api/machines/priority HTTP/1.1\r\nHost: {host}\r\n{origin}Connection: close\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        let status = response.split(' ').nth(1).unwrap().parse::<u16>().unwrap();
+        (status, response)
+    };
+    let here = format!("127.0.0.1:{}", fixture.port);
+    // Served here: an id the machine list does not hold is refused by the route itself, not as
+    // an unrouted path.
+    let stranger = format!(r#"{{"order": ["{}"]}}"#, MachineId::random());
+    let (status, answer) = ask(&here, None, &stranger);
+    assert_eq!(status, 422, "{answer}");
+    assert!(answer.contains("machine list"), "{answer}");
+    // An order the route would take from this site, sent from another: refused, nothing set.
+    let before = settings_of(&fixture);
+    let (status, answer) = ask(&here, Some("http://evil.example"), r#"{"order": []}"#);
+    assert_eq!(status, 403, "{answer}");
+    let (status, answer) = ask("evil.example", None, r#"{"order": []}"#);
+    assert_eq!(status, 403, "{answer}");
+    let after = settings_of(&fixture);
+    assert_eq!(after.seq, before.seq);
+    assert_eq!(after.priority, before.priority);
+}
