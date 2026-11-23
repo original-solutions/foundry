@@ -6,6 +6,8 @@
 
 use std::fmt;
 
+use super::approval::Refusal;
+
 /// The `factory:` label that holds an issue, without its `factory:` prefix.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum State {
@@ -127,9 +129,12 @@ pub enum Event {
     PrReady {
         pr: u64,
     },
-    /// The factory refused to build a `ready` issue: it was not approved by an instructor.
+    /// The factory refused to build a `ready` issue: it was not approved by an instructor. It
+    /// carries the verdict, not text, so the comment can only be
+    /// [`unapproved_comment`](super::approval::unapproved_comment)'s own words. The runner's
+    /// event carries `refusalReason(refusal)` as a string.
     Unapproved {
-        reason: String,
+        refusal: Refusal,
     },
     /// A pull request that was ready for review failed the gate again on the moved base
     /// branch. `output` is what goes into the session.
@@ -180,7 +185,7 @@ pub enum Action {
     MarkPrReady { pr: u64 },
     MarkPrDraft { pr: u64 },
     PostGateResults { pr: u64 },
-    PostUnapproved { reason: String },
+    PostUnapproved { refusal: Refusal },
 }
 
 impl Action {
@@ -226,11 +231,11 @@ pub fn transition(state: State, event: &Event) -> Result<(State, Vec<Action>), I
         // softfac's table has no needs-info pair; its docs say an answered issue leaves
         // needs-info when a person sets `factory:ready`. This follows the docs, not the table.
         (Proposed | NeedsInfo | Stuck, Event::Approved) => (Ready, vec![]),
-        (Ready, Event::Unapproved { reason }) => (
+        (Ready, Event::Unapproved { refusal }) => (
             Proposed,
             vec![
                 Action::PostUnapproved {
-                    reason: reason.clone(),
+                    refusal: refusal.clone(),
                 },
                 set_label(Proposed),
             ],

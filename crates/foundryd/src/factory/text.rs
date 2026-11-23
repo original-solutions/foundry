@@ -5,6 +5,7 @@
 
 use ring::digest;
 
+use crate::secrets::redact;
 use crate::sessions::brief::tokens_hidden;
 
 /// The longest command shown in a gate message or a results table, in characters.
@@ -187,9 +188,10 @@ fn push_github(out: &mut String, rest: &str) {
     }
 }
 
-/// A URL, its userinfo already hidden ([`hide_userinfo`]), as a comment may show it. Every part goes through the word rule like the rest of the text, since a webhook,
-/// a signed link or an `?access_token=` carries its secret there. Only a `github.com` URL keeps
-/// the commit ids and anchors its links hold ([`push_github`]).
+/// A URL, its userinfo already hidden ([`hide_userinfo`]), as a comment may show it. Every
+/// part goes through the word rule like the rest of the text, since a webhook, a signed link or
+/// an `?access_token=` carries its secret there. Only a `github.com` URL keeps the commit ids
+/// and anchors its links hold ([`push_github`]).
 fn push_url(out: &mut String, url: &str) {
     let scheme = url.find("://").map_or(0, |at| at + 3);
     out.push_str(&url[..scheme]);
@@ -214,14 +216,17 @@ fn push_url(out: &mut String, url: &str) {
 /// links put one ([`github_commit_place`], [`is_github_anchor`]). So a pull request, commit,
 /// blob or review link comes through whole unless its owner, repo, branch or file name has a
 /// word of 24 or more mixed letters and digits, which is then hidden. Every URL's user and
-/// password are hidden first ([`hide_userinfo`]). A URL ends at the first character no URL
-/// holds, at `,` and `;`, and before the `.`, `:`, `!` or `?` that ends a sentence after it.
+/// password are hidden first, as [`redact`] hides them and then up to the last `@` before the
+/// authority's end ([`hide_userinfo`]), so a comment hides all `redact` hides and more. A URL
+/// ends at the first character no URL holds, at `,` and `;`, and before the `.`, `:`, `!` or
+/// `?` that ends a sentence after it.
 ///
 /// The caller hides the secrets it knows (held tokens, gateway keys, URL passwords) before
 /// this, and adds the factory's own markers, such as `<!-- foundry:claim <run id> <machine> -->`,
 /// after it: a run id and a machine id are token-shaped, and this would hide them.
 pub fn for_comment(text: &str) -> String {
-    let text = &hide_userinfo(text);
+    // P1's rule first, so whatever it learns to hide a comment hides too; then the wider end.
+    let text = &hide_userinfo(&redact(text));
     let mut out = String::with_capacity(text.len());
     let mut plain = 0;
     let mut at = 0;
@@ -241,7 +246,7 @@ pub fn for_comment(text: &str) -> String {
 }
 
 /// `text` with the user and password of every URL hidden, `scheme://user:pass@host` shown as
-/// `scheme://***@host`, as [`redact`](crate::secrets::redact) hides them. Here the authority
+/// `scheme://***@host`, as [`redact`] hides them. Here the authority
 /// runs from `://` to the first `/`, `?`, `#` or whitespace, whatever comes before it, so a
 /// password that holds a quote, a `,` or a `;`, where a URL ends in prose, is hidden whole.
 fn hide_userinfo(text: &str) -> String {
@@ -327,7 +332,6 @@ pub fn sha256(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::secrets::redact;
     use crate::sessions::brief::HIDDEN;
 
     const KEY: &str = "sk9AbC3dEf5GhI7jKl1MnO2pQr4StU"; // 30 mixed letters and digits
