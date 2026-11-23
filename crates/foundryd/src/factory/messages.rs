@@ -60,6 +60,15 @@ fn tail_bytes(text: &str, max: usize) -> &str {
     &text[at..]
 }
 
+/// The first `max` bytes of `text` at most, cut on a character boundary.
+fn head_bytes(text: &str, max: usize) -> &str {
+    let mut at = max.min(text.len());
+    while !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    &text[..at]
+}
+
 /// A name or a path as part of a typed line: anything that could break the line is a space.
 fn on_the_line(text: &str) -> String {
     sanitize(text, false)
@@ -164,15 +173,43 @@ pub struct WorkLeft {
     pub base: String,
 }
 
+/// The longest name of a branch a comment shows in its own sentences, in characters.
+const NAME_LIMIT: usize = 200;
+
+/// A branch name from git, a session or an issue as one line of a comment's prose: cleaned to
+/// one line, cut at [`NAME_LIMIT`] characters, and escaped so it pings nobody and forges no
+/// marker.
+fn name_in_prose(name: &str) -> String {
+    let line = sanitize(name, false);
+    let shown = head_chars(&line, NAME_LIMIT);
+    let cut = if shown.len() < line.len() {
+        "\u{2026}"
+    } else {
+        ""
+    };
+    format!("{}{cut}", escape_for_github(shown))
+}
+
+/// `text` as an inline code span, so no link, image or emphasis in it renders. The run of
+/// backticks around it is longer than any inside it, with a space inside each end when the
+/// text starts or ends with a backtick.
+fn code_span(text: &str) -> String {
+    let longest = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let ticks = "`".repeat(longest + 1);
+    let pad = if text.starts_with('`') || text.ends_with('`') {
+        " "
+    } else {
+        ""
+    };
+    format!("{ticks}{pad}{text}{pad}{ticks}")
+}
+
 /// Says where the work is. A new attempt starts from the base branch, so this does not promise
 /// that it continues from there.
 fn work_left_sentence(work: &WorkLeft) -> String {
-    let WorkLeft {
-        branch,
-        commits_ahead,
-        base,
-    } = work;
-    match commits_ahead {
+    let branch = name_in_prose(&work.branch);
+    let base = name_in_prose(&work.base);
+    match work.commits_ahead {
         None => format!("The work so far is on branch {branch}."),
         Some(1) => format!("The work so far is on branch {branch} (1 commit ahead of {base})."),
         Some(n) => {
@@ -182,10 +219,10 @@ fn work_left_sentence(work: &WorkLeft) -> String {
 }
 
 /// The comment that says why the factory gave up on an issue. `reason` is one of the factory's
-/// own fixed one-line strings, never session text. `prepared` comes from
-/// [`prepare_session_text`] or [`prepare_output_tail`]; without it the comment has no code
-/// block. `work`, when the session had a branch, adds a paragraph after the reason that says
-/// where the work is.
+/// own fixed one-line strings, or one of the reasons this module builds, never session text.
+/// `prepared` comes from [`prepare_session_text`] or [`prepare_output_tail`]; without it the
+/// comment has no code block. `work`, when the session had a branch, adds a paragraph after the
+/// reason that says where the work is.
 pub fn stuck(reason: &str, prepared: Option<&str>, work: Option<&WorkLeft>) -> String {
     let at = work.map_or(String::new(), |work| {
         format!("{}\n\n", work_left_sentence(work))
@@ -218,17 +255,22 @@ pub const TEXT_CHANGED: &str = "the issue text was changed while the factory was
 /// The public reason when the launch was refused. The detail stays in the ledger.
 pub const LAUNCH_FAILED: &str = "the factory could not launch a session";
 
-/// The public reason when the issue's `## Base` cannot be a branch name.
+/// The public reason when the issue's `## Base` cannot be a branch name. The name is the
+/// issue's text, so it is shown as code on one line.
 pub fn base_not_a_branch(base: &str) -> String {
     format!(
         "base branch {} is not a branch name",
-        escape_for_github(base)
+        code_span(&name_in_prose(base))
     )
 }
 
-/// The public reason when `origin` has no branch by the issue's `## Base` name.
+/// The public reason when `origin` has no branch by the issue's `## Base` name, shown as code
+/// on one line.
 pub fn base_not_on_origin(base: &str) -> String {
-    format!("base branch {} is not on origin", escape_for_github(base))
+    format!(
+        "base branch {} is not on origin",
+        code_span(&name_in_prose(base))
+    )
 }
 
 /// The words a stuck run's ledger reason carries when a launch attempt may have started a
@@ -243,18 +285,16 @@ pub fn session_may_exist_note(what: &str, command_id: &str) -> String {
 /// How the first line of a stuck session's message begins when gh acts as another account.
 pub const WRONG_ACCOUNT_PREFIX: &str = "the session's gh account is ";
 
-/// What a launch continues from, and why. The worktree is made from `branch`. `TimeLimit` and
+/// What a resumed launch continues from. The worktree is made from `branch`. `TimeLimit` and
 /// `Interrupted` continue an earlier run (`run`, its id as the ledger spells it); `ExistingPr`
-/// continues the open pull request at `pr_url` that an earlier attempt opened; `FailedRegate`
-/// and `Feedback` continue the run's own pull request at `pr_url`. A resume names the branch to
-/// push to and says not to open another one.
+/// continues the open pull request at `pr_url` that an earlier attempt opened. A feedback round
+/// and a failed re-gate continue the run's own pull request with text of their own below, so
+/// they have their own messages, [`feedback`] and [`regate`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ResumeFrom {
     TimeLimit { run: String, branch: String },
     Interrupted { run: String, branch: String },
     ExistingPr { branch: String, pr_url: String },
-    Feedback { branch: String, pr_url: String },
-    FailedRegate { branch: String, pr_url: String },
 }
 
 /// Where a session resumed from an earlier run's branch pushes: that branch, so a pull request
@@ -280,13 +320,21 @@ fn resume_paragraph(from: &ResumeFrom) -> String {
         ResumeFrom::ExistingPr { branch, pr_url } => format!(
             "An earlier attempt of this issue opened the pull request {pr_url}, which is still open. The worktree holds that pull request's branch at its tip on origin: continue from its commits, do not start over, and push your commits to the same branch with `git push origin HEAD:{branch}`, so the same pull request is updated. Do not open another pull request."
         ),
-        ResumeFrom::Feedback { branch, pr_url } => format!(
-            "The pull request {pr_url} of this issue passed the gate and waits for review, and an instructor left feedback on it or on the issue, below. The worktree holds that pull request's branch at its tip on origin. Address the feedback from there and push your commits to the same branch with `git push origin HEAD:{branch}`, so the same pull request is updated. Do not open another pull request."
-        ),
-        ResumeFrom::FailedRegate { branch, pr_url } => format!(
-            "The pull request {pr_url} of this issue passed the gate, and the gate failed when it ran again. The worktree holds that pull request's branch at its tip on origin. Fix the failure below from there and push your commits to the same branch with `git push origin HEAD:{branch}`, so the same pull request is updated. Do not open another pull request."
-        ),
     }
+}
+
+/// The paragraph of a feedback round on the pull request at `pr_url`, whose branch is `branch`.
+fn feedback_paragraph(branch: &str, pr_url: &str) -> String {
+    format!(
+        "The pull request {pr_url} of this issue passed the gate and waits for review, and an instructor left feedback on it or on the issue, below. The worktree holds that pull request's branch at its tip on origin. Address the feedback from there and push your commits to the same branch with `git push origin HEAD:{branch}`, so the same pull request is updated. Do not open another pull request."
+    )
+}
+
+/// The paragraph of a relaunch after the gate failed again on the pull request at `pr_url`.
+fn regate_paragraph(branch: &str, pr_url: &str) -> String {
+    format!(
+        "The pull request {pr_url} of this issue passed the gate, and the gate failed when it ran again. The worktree holds that pull request's branch at its tip on origin. Fix the failure below from there and push your commits to the same branch with `git push origin HEAD:{branch}`, so the same pull request is updated. Do not open another pull request."
+    )
 }
 
 /// Keeps the session on the branch its worktree was launched on. A resume's own
@@ -295,16 +343,14 @@ const STAY_ON_BRANCH: &str = "Stay on the branch the worktree was launched on: n
 
 /// The body of a launch: says nobody is in the chat, tells the session to stay on its branch,
 /// names the base branch when the issue's `## Base` differs from the repo's (`base`), adds the
-/// resume paragraph for a continued branch, and names the GitHub identity the session acts as
-/// (`login`) with what to do when `gh` says otherwise. Foundry set `GH_TOKEN` for `login` when
-/// it started the session.
-fn launch_body(login: &str, resumed: Option<&ResumeFrom>, base: Option<&str>) -> String {
+/// paragraph that says what a resumed launch continues from (`resume`), and names the GitHub
+/// identity the session acts as (`login`) with what to do when `gh` says otherwise. Foundry set
+/// `GH_TOKEN` for `login` when it started the session.
+fn launch_body(login: &str, resume: Option<String>, base: Option<&str>) -> String {
     let base = base.map_or(String::new(), |base| {
         format!(" Open the pull request against {base}, not the repo's default base.")
     });
-    let resume = resumed.map_or(String::new(), |from| {
-        format!("\n\n{}", resume_paragraph(from))
-    });
+    let resume = resume.map_or(String::new(), |paragraph| format!("\n\n{paragraph}"));
     format!(
         "The factory daemon launched this session unattended, in a worktree it created for you. Nobody is in the chat. The daemon owns the issue's labels and comments and runs its own gate after your draft PR. {STAY_ON_BRANCH}{base}{resume}\n\nYou act on GitHub as {login}. Foundry set GH_TOKEN for {login} when it started this session. Before anything else run gh api user --jq .login exactly as written, in the environment you were started with. Never set GH_CONFIG_DIR, GH_TOKEN or GH_HOST, and never use gh auth token or gh auth switch, on any command. If it prints any other login, end with FACTORY-STOP: stuck and make the first line of your message \"{WRONG_ACCOUNT_PREFIX}<x>, not {login}\"."
     )
@@ -332,13 +378,21 @@ pub fn resumed(
 ) -> Message {
     Message::new(
         skill_line(repo, issue, body_path),
-        launch_body(login, Some(from), base),
+        launch_body(login, Some(resume_paragraph(from)), base),
+    )
+}
+
+/// The note that ends feedback cut to fit the body when even its fixed words do not.
+fn feedback_cut_note(pr_url: &str) -> String {
+    format!(
+        "[The factory cut this feedback to fit its message. Read all of it on the pull request {pr_url} and on its issue.]"
     )
 }
 
 /// The first message of a feedback round on the pull request at `pr_url`, whose branch is
 /// `branch`: the resumed launch, the words to end with, then the feedback. Feedback that would
-/// pass [`BODY_LIMIT`] is cut at fewer characters, so the launch's own words always arrive.
+/// pass [`BODY_LIMIT`] is cut at fewer characters, and when even its fixed words would pass it
+/// they are cut too, so the launch's own words always arrive.
 pub fn feedback(
     repo: &str,
     issue: u64,
@@ -348,22 +402,56 @@ pub fn feedback(
     items: &[Feedback],
     body_path: &str,
 ) -> Message {
-    let from = ResumeFrom::Feedback {
-        branch: branch.to_string(),
-        pr_url: pr_url.to_string(),
-    };
     let head = format!(
         "{}\n\n{END_WITH_DONE}\n\n",
-        launch_body(login, Some(&from), None)
+        launch_body(login, Some(feedback_paragraph(branch, pr_url)), None)
     );
-    let mut limit = INSTRUCTION_LIMIT;
-    let mut text = feedback_text_at(pr_url, items, limit);
-    while head.len() + text.len() > BODY_LIMIT && limit > 0 {
-        let room = BODY_LIMIT.saturating_sub(head.len());
-        // Each step cuts at least in half, and more when the text is far over its room.
-        limit = (limit / 2).min(limit * room / text.len());
-        text = feedback_text_at(pr_url, items, limit);
+    let room = BODY_LIMIT.saturating_sub(head.len());
+    let mut text = feedback_text_at(pr_url, items, INSTRUCTION_LIMIT);
+    if text.len() > room {
+        // The text only grows with the limit: the largest limit that fits, by halving the range.
+        let (mut fits, mut over) = (0, INSTRUCTION_LIMIT);
+        while over - fits > 1 {
+            let mid = fits + (over - fits) / 2;
+            if feedback_text_at(pr_url, items, mid).len() <= room {
+                fits = mid;
+            } else {
+                over = mid;
+            }
+        }
+        text = feedback_text_at(pr_url, items, fits);
     }
+    if text.len() > room {
+        let note = feedback_cut_note(pr_url);
+        let kept = head_bytes(&text, room.saturating_sub(note.len() + 2));
+        text = format!("{kept}\n\n{note}");
+    }
+    Message::new(skill_line(repo, issue, body_path), format!("{head}{text}"))
+}
+
+/// The first message of a session relaunched on the pull request at `pr_url`, whose branch is
+/// `branch`, after the gate failed when it ran again: the resumed launch, the words to end
+/// with, then the failure. Command output is cut to fit, so the launch's own words always
+/// arrive.
+pub fn regate(
+    repo: &str,
+    issue: u64,
+    login: &str,
+    branch: &str,
+    pr_url: &str,
+    failure: &GateFailure,
+    body_path: &str,
+) -> Message {
+    let head = format!(
+        "{}\n\n{END_WITH_DONE}\n\n",
+        launch_body(login, Some(regate_paragraph(branch, pr_url)), None)
+    );
+    let text = match failure {
+        GateFailure::Command(failure) => {
+            failure_text_within(failure, BODY_LIMIT.saturating_sub(head.len()))
+        }
+        GateFailure::Conflict { base, paths } => merge_conflict_text(base, paths),
+    };
     Message::new(skill_line(repo, issue, body_path), format!("{head}{text}"))
 }
 
