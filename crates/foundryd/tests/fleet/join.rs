@@ -693,7 +693,8 @@ async fn a_machine_removed_through_a_is_revoked_by_every_machine_and_its_links_c
 }
 
 #[tokio::test]
-async fn a_removed_machine_never_lists_itself_again_and_one_that_missed_the_removal_revokes_it() {
+async fn a_removed_machine_that_holds_its_removal_never_lists_itself_again_and_one_that_missed_it_revokes_it()
+ {
     let net = Net::default();
     let dirs: Vec<TempDir> = (0..4).map(|_| tempfile::tempdir().unwrap()).collect();
     let a = Member::start(&net, &dirs[0], &a_entry()).await;

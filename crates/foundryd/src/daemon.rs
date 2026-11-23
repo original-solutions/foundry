@@ -1787,8 +1787,8 @@ mod tests {
     async fn run_loop(
         settings: impl FnOnce(MachineId, &mut SharedSettings),
         changes: u8,
-    ) -> (Arc<Mutex<Store>>, MachineId) {
-        let (_dir, me, store, listing) = listing_over(settings);
+    ) -> (tempfile::TempDir, Arc<Mutex<Store>>, MachineId) {
+        let (dir, me, store, listing) = listing_over(settings);
         let (sender, answered) = tokio::sync::watch::channel(BTreeSet::new());
         let looping = tokio::spawn(list_this_machine(
             answered,
@@ -1804,12 +1804,13 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         looping.abort();
-        (store, me)
+        // The directory is returned so it outlives the test's last read of the store.
+        (dir, store, me)
     }
 
     #[tokio::test]
     async fn the_daemons_listing_loop_never_lists_a_machine_that_was_removed() {
-        let (store, me) = run_loop(
+        let (_dir, store, me) = run_loop(
             |me, settings| {
                 settings.stamps.insert(
                     StampKey::Setting(SettingKey::Machine(me)),
@@ -1826,7 +1827,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_daemons_listing_loop_lists_a_machine_never_removed() {
-        let (store, me) = run_loop(|_, _| {}, 2).await;
+        let (_dir, store, me) = run_loop(|_, _| {}, 2).await;
 
         let after = store.lock().unwrap().settings().unwrap();
         assert!(after.machines.iter().any(|m| m.id == me), "{after:?}");
