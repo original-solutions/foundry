@@ -114,37 +114,68 @@ fn choose_cli(set: Option<OsString>, taken: bool, known: &[&str]) -> PathBuf {
         .map_or_else(|| PathBuf::from("tailscale"), Path::to_path_buf)
 }
 
-/// How long `tailscale ip` may take before it is stopped and Tailscale counts as not answering.
+/// How long a `tailscale` ask may take before it is stopped. An ask that runs past it is
+/// [`AskError::TimedOut`], which the daemon's watch bears a few times in a row before it
+/// stops serving (see `Tailscale::scan`); any other failure it acts on at once.
 const ASK_WITHIN: Duration = Duration::from_secs(3);
 
+/// Why an ask of the Tailscale CLI got no answer. A timeout is told apart from every other
+/// failure by its kind, not its message: a slow CLI says nothing about whether Tailscale is up,
+/// where a CLI that fails, is missing or prints nonsense is a definite answer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AskError {
+    /// The CLI did not answer within its time.
+    TimedOut(String),
+    /// The CLI exited non-zero, could not be run, or printed what was not expected.
+    Failed(String),
+}
+
+impl std::fmt::Display for AskError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (Self::TimedOut(why) | Self::Failed(why)) = self;
+        f.write_str(why)
+    }
+}
+
+impl From<AskError> for String {
+    fn from(error: AskError) -> Self {
+        error.to_string()
+    }
+}
+
 /// The addresses Tailscale reports for this machine, or why it cannot say.
-pub(crate) async fn tailscale_ips() -> Result<BTreeSet<IpAddr>, String> {
+pub(crate) async fn tailscale_ips() -> Result<BTreeSet<IpAddr>, AskError> {
     ask_cli(&tailscale_cli(), ASK_WITHIN).await
 }
 
 /// Runs `<cli> ip`, which prints one of this machine's Tailscale addresses a line, and reads
-/// them. A CLI that fails, is missing, prints anything else or runs past `within` gives why.
-async fn ask_cli(cli: &Path, within: Duration) -> Result<BTreeSet<IpAddr>, String> {
+/// them. A CLI that fails, is missing or prints anything else gives why as
+/// [`AskError::Failed`]; one that runs past `within` as [`AskError::TimedOut`].
+async fn ask_cli(cli: &Path, within: Duration) -> Result<BTreeSet<IpAddr>, AskError> {
     String::from_utf8_lossy(&run_cli(cli, &["ip"], within).await?)
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .map(|line| {
-            line.parse()
-                .map_err(|_| format!("`{} ip` printed {line:?}, not an address", cli.display()))
+            line.parse().map_err(|_| {
+                AskError::Failed(format!(
+                    "`{} ip` printed {line:?}, not an address",
+                    cli.display()
+                ))
+            })
         })
         .collect()
 }
 
 /// Runs `<cli> status --self --json`, which says what Tailscale calls this machine and its
 /// addresses, and gives what it printed, or why it cannot, as [`run_cli`] does.
-async fn ask_status(cli: &Path, within: Duration) -> Result<Vec<u8>, String> {
+async fn ask_status(cli: &Path, within: Duration) -> Result<Vec<u8>, AskError> {
     run_cli(cli, &["status", "--self", "--json"], within).await
 }
 
-/// Runs `<cli> <args>` and gives what it printed. A CLI that fails, is missing or runs past
-/// `within` gives why.
-async fn run_cli(cli: &Path, args: &[&str], within: Duration) -> Result<Vec<u8>, String> {
+/// Runs `<cli> <args>` and gives what it printed. A CLI that fails or is missing gives why as
+/// [`AskError::Failed`]; one that runs past `within` is stopped and gives [`AskError::TimedOut`].
+async fn run_cli(cli: &Path, args: &[&str], within: Duration) -> Result<Vec<u8>, AskError> {
     let asked = format!("{} {}", cli.display(), args.join(" "));
     let run = tokio::process::Command::new(cli)
         .args(args)
@@ -156,20 +187,25 @@ async fn run_cli(cli: &Path, args: &[&str], within: Duration) -> Result<Vec<u8>,
         .output();
     let out = match tokio::time::timeout(within, run).await {
         Ok(Ok(out)) => out,
-        Ok(Err(error)) => return Err(format!("{} could not be run: {error}", cli.display())),
+        Ok(Err(error)) => {
+            return Err(AskError::Failed(format!(
+                "{} could not be run: {error}",
+                cli.display()
+            )));
+        }
         Err(_) => {
-            return Err(format!(
+            return Err(AskError::TimedOut(format!(
                 "`{asked}` did not answer within {} s",
                 within.as_secs_f32()
-            ));
+            )));
         }
     };
     if !out.status.success() {
-        return Err(format!(
+        return Err(AskError::Failed(format!(
             "`{asked}` failed ({}): {}",
             out.status,
             String::from_utf8_lossy(&out.stderr).trim()
-        ));
+        )));
     }
     Ok(out.stdout)
 }

@@ -37,7 +37,7 @@ use crate::sessions::{self, Gateway, Sessions};
 use crate::store::{Store, StoreError};
 use crate::sync::Peers;
 use crate::sync::ws::{self, WsDialer};
-use crate::tailscale::{Entry, host_names, own_entry, tailscale_ips};
+use crate::tailscale::{AskError, Entry, host_names, own_entry, tailscale_ips};
 use crate::terminals::{TerminalError, Terminals};
 use crate::update;
 use crate::workspaces::{WorkspaceError, Workspaces};
@@ -591,6 +591,12 @@ impl Told {
 /// How often Tailscale is asked again for an address that has come up.
 const RESCAN: Duration = Duration::from_secs(5);
 
+/// How many asks of Tailscale in a row may run past their time before the watch takes it as
+/// not answering and stops every server. The asks are [`RESCAN`] apart, so three are about 15
+/// seconds, the fleet's offline limit ([`OFFLINE_AFTER`](crate::sync::OFFLINE_AFTER)): a
+/// peer would see this machine go offline by then anyway.
+const TIMEOUTS_BEFORE_AWAY: u32 = 3;
+
 /// Serves the app on every address Tailscale reports for this machine, now and as they
 /// appear, and stops serving one it no longer reports: the daemon can start before Tailscale
 /// does, and Tailscale can log out or move to another tailnet while it runs.
@@ -601,14 +607,17 @@ struct Tailscale {
     served: BTreeMap<SocketAddr, AbortHandle>,
     /// The addresses that failed to bind, so each is warned about once.
     failed: BTreeSet<SocketAddr>,
-    /// Whether the last ask of Tailscale failed, so a failure is warned about once until it
-    /// answers again.
+    /// Whether the servers were stopped because Tailscale could not be asked, so that is warned
+    /// about once until it answers again.
     unanswered: bool,
+    /// How many asks in a row have run past their time. An answer or a definite failure sets it
+    /// back to zero; at [`TIMEOUTS_BEFORE_AWAY`] the watch is `unanswered`.
+    timeouts: u32,
     servers: JoinSet<SocketAddr>,
     /// Given `ip`'s answer each time Tailscale answers, so the machine list entry is kept up
     /// to date.
     answered: tokio::sync::watch::Sender<BTreeSet<IpAddr>>,
-    /// Set when an ask of Tailscale fails, until the machine list entry's [`Listing`] reads it.
+    /// Set when the watch stops serving because Tailscale cannot be asked, until the machine list entry's [`Listing`] reads it.
     ///
     /// [`Listing`]: api::machine_names::Listing
     away: Arc<AtomicBool>,
@@ -622,6 +631,7 @@ impl Tailscale {
             served: BTreeMap::new(),
             failed: BTreeSet::new(),
             unanswered: false,
+            timeouts: 0,
             servers: JoinSet::new(),
             answered: tokio::sync::watch::Sender::new(BTreeSet::new()),
             away: Arc::new(AtomicBool::new(false)),
@@ -651,9 +661,14 @@ impl Tailscale {
     /// Binds each address in Tailscale's answer, `reported`, not served yet, and stops the
     /// server on each served address the answer leaves out, so it takes no new connection; one
     /// already open is not cut. A server that ended is served again. When Tailscale cannot be
-    /// asked, it counts as reporting nothing: every server is stopped and none is bound until
-    /// it answers. `first` says this is the start, when having none is worth a warning.
-    async fn scan(&mut self, first: bool, reported: Result<BTreeSet<IpAddr>, String>) {
+    /// asked for a definite reason (logged out, stopped, not installed, or it printed what is
+    /// not an address), it counts as reporting nothing: every server is stopped and none is
+    /// bound until it answers. An ask that only ran past its time ([`AskError::TimedOut`]) is
+    /// borne: the servers stay, none is stopped or bound, Tailscale is not marked away and
+    /// nothing is told it answered, until [`TIMEOUTS_BEFORE_AWAY`] asks in a row have timed
+    /// out, which is then a failed ask. `first` says this is the start, when having none is
+    /// worth a warning.
+    async fn scan(&mut self, first: bool, reported: Result<BTreeSet<IpAddr>, AskError>) {
         while let Some(ended) = self.servers.try_join_next() {
             if let Ok(addr) = ended {
                 self.served.remove(&addr);
@@ -662,10 +677,38 @@ impl Tailscale {
         let reported = match reported {
             Ok(reported) => {
                 self.unanswered = false;
+                self.timeouts = 0;
                 self.answered.send_replace(reported.clone());
                 reported
             }
-            Err(why) => {
+            Err(AskError::TimedOut(why)) => {
+                self.timeouts = self.timeouts.saturating_add(1);
+                if self.unanswered {
+                    BTreeSet::new()
+                } else if self.timeouts < TIMEOUTS_BEFORE_AWAY {
+                    if self.timeouts == 1 {
+                        tracing::warn!(
+                            "Tailscale did not answer in time, so the addresses already listened on stay: {why}"
+                        );
+                    }
+                    if first && self.served.is_empty() {
+                        tracing::warn!(
+                            "no Tailscale address is bound yet, so peers cannot reach this machine until one appears"
+                        );
+                    }
+                    return;
+                } else {
+                    tracing::warn!(
+                        "Tailscale did not answer {} times in a row, so none is listened on until it answers: {why}",
+                        self.timeouts
+                    );
+                    self.unanswered = true;
+                    self.away.store(true, Ordering::Relaxed);
+                    BTreeSet::new()
+                }
+            }
+            Err(AskError::Failed(why)) => {
+                self.timeouts = 0;
                 if !self.unanswered {
                     tracing::warn!(
                         "cannot ask Tailscale for this machine's addresses, so none is listened on until it answers: {why}"
@@ -1112,7 +1155,7 @@ mod tests {
         let _capture = logged.capture();
         let kept = addr("100.101.102.103:7433");
         let mut tailscale = serving(kept);
-        let mut answered = tailscale.answered.subscribe();
+        let answered = tailscale.answered.subscribe();
 
         tailscale.scan(false, timed_out()).await;
 
