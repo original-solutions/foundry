@@ -128,10 +128,12 @@ fn secret_set_with_any_other_name_exits_1_and_stores_nothing() {
 #[test]
 fn dashboard_with_no_daemon_running_exits_1_and_says_so() {
     let (_held, port) = refusing_port();
-    assert!(
-        std::net::TcpListener::bind(("127.0.0.1", port)).is_err(),
-        "another socket could listen on the held port {port}"
-    );
+    for address in ["127.0.0.1", "0.0.0.0"] {
+        assert!(
+            std::net::TcpListener::bind((address, port)).is_err(),
+            "another socket could listen on the held port {port} at {address}"
+        );
+    }
     let home = tempfile::tempdir().unwrap();
     let out = isolated(&["dashboard"], &home)
         .env("FOUNDRY_PORT", port.to_string())
@@ -146,14 +148,26 @@ fn dashboard_with_no_daemon_running_exits_1_and_says_so() {
     );
 }
 
-/// A loopback port that refuses every connection while the returned socket lives. The socket
-/// is bound and never listens, so a connection to the port is refused and no other socket,
-/// another process's `bind(0)` included, is handed the port before the test ends.
-fn refusing_port() -> (tokio::net::TcpSocket, u16) {
-    let socket = tokio::net::TcpSocket::new_v4().unwrap();
-    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
-    let port = socket.local_addr().unwrap().port();
-    (socket, port)
+/// A loopback port that refuses every connection while the returned sockets live. The sockets
+/// are bound and never listen, so a connection to the port is refused and no other socket,
+/// another process's `bind(0)` included, is handed the port before the test ends. One holds
+/// the port on every address. Where a listener with `SO_REUSEADDR` may still bind one address
+/// under a socket on every address (macOS), a second, with `SO_REUSEADDR` itself, holds it on
+/// loopback; where that bind is refused (Linux), the first already keeps loopback.
+fn refusing_port() -> (Vec<tokio::net::TcpSocket>, u16) {
+    let every = tokio::net::TcpSocket::new_v4().unwrap();
+    every.bind("0.0.0.0:0".parse().unwrap()).unwrap();
+    let port = every.local_addr().unwrap().port();
+    let mut held = vec![every];
+    let loopback = tokio::net::TcpSocket::new_v4().unwrap();
+    loopback.set_reuseaddr(true).unwrap();
+    if loopback
+        .bind(std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+        .is_ok()
+    {
+        held.push(loopback);
+    }
+    (held, port)
 }
 
 /// Asserts `foundryd <args>` exits 2 and says it is not built yet.
