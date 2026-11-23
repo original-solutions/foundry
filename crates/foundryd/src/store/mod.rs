@@ -15,6 +15,7 @@ use foundry_proto::state::SessionState;
 use rusqlite::types::Type;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
+pub mod factory;
 #[cfg(test)]
 mod tests;
 

@@ -4,7 +4,9 @@
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use foundryd::{daemon, dashboard, join, secrets, service, status};
+use std::path::PathBuf;
+
+use foundryd::{daemon, dashboard, factory, join, secrets, service, status};
 
 #[derive(Parser)]
 #[command(name = "foundryd", version, about)]
@@ -37,6 +39,16 @@ enum Command {
         #[command(subcommand)]
         command: SecretCommand,
     },
+    /// The GitHub logins this machine holds for the factory (`foundryd secret set github:<login>`).
+    Github {
+        #[command(subcommand)]
+        command: GithubCommand,
+    },
+    /// The factory's runs.
+    Factory {
+        #[command(subcommand)]
+        command: FactoryCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -46,6 +58,25 @@ enum SecretCommand {
     Set {
         /// The secret's name: `gateway` or `gateway-management`.
         name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum GithubCommand {
+    /// Name `login` as this machine's default, read when a project's factory is turned on while
+    /// this machine is coordinator.
+    Default {
+        /// The GitHub login.
+        login: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum FactoryCommand {
+    /// Write every run this machine holds into `dir`, in the runner's layout.
+    Export {
+        /// The directory to write into.
+        dir: PathBuf,
     },
 }
 
@@ -60,5 +91,11 @@ fn main() -> ExitCode {
         Command::Secret {
             command: SecretCommand::Set { name },
         } => secrets::set_command(&name),
+        Command::Github {
+            command: GithubCommand::Default { login },
+        } => secrets::github_default_command(&login),
+        Command::Factory {
+            command: FactoryCommand::Export { dir },
+        } => factory::ledger::export::command(&dir),
     }
 }

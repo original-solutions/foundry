@@ -41,10 +41,12 @@ use state::{Event, Hook, next_state};
 
 pub mod brief;
 pub mod claude;
+pub mod factory;
 mod hooks;
 pub mod state;
 #[cfg(test)]
 mod tests;
+pub mod turns;
 
 /// A working session with no output and no hook for this long is stuck.
 pub const STUCK_AFTER: Duration = Duration::from_secs(10 * 60);

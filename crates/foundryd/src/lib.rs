@@ -4,10 +4,13 @@ use std::process::ExitCode;
 
 pub mod api;
 pub mod attention;
+pub mod clock;
 pub mod coordinator;
 pub mod daemon;
 pub mod dashboard;
+pub mod factory;
 pub mod gateway;
+pub mod git_auth;
 pub mod join;
 pub mod lister;
 pub mod machine;

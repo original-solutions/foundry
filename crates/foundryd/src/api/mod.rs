@@ -112,6 +112,7 @@ mod briefs;
 mod carry;
 pub(crate) use carry::carries;
 mod changes;
+pub mod factory;
 mod files;
 mod machine;
 pub mod machine_add;
@@ -195,6 +196,7 @@ pub fn router(api: Api) -> Router {
         .route("/api/sessions/{id}/trail", get(trail::trail))
         .route("/api/placements", get(placement::list))
         .route("/api/placements/{id}/cancel", post(placement::cancel))
+        .merge(factory::router())
         .fallback(assets::serve)
         .method_not_allowed_fallback(wrong_method)
         .layer(middleware::from_fn_with_state(api.clone(), carry::carry))

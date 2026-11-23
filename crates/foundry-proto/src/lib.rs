@@ -1,5 +1,6 @@
 //! Types shared by every Foundry crate. No I/O.
 
+pub mod factory;
 pub mod ids;
 pub mod messages;
 pub mod record;
