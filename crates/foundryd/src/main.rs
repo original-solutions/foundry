@@ -1,10 +1,10 @@
 //! `foundryd`: the command line. Each command calls the module that owns it; one whose plan task
 //! is not done yet exits 2.
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
 
 use foundryd::{daemon, dashboard, factory, join, secrets, service, status};
 
@@ -39,7 +39,7 @@ enum Command {
         #[command(subcommand)]
         command: SecretCommand,
     },
-    /// The GitHub logins this machine holds for the factory (`foundryd secret set github:<login>`).
+    /// The GitHub logins this machine holds for the factory.
     Github {
         #[command(subcommand)]
         command: GithubCommand,
