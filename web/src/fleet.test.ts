@@ -92,6 +92,59 @@ describe("fleet", () => {
     });
   });
 
+  describe("the serving machine, when the machine list does not hold it", () => {
+    const X = "machine-x";
+    // The list holds OTHER alone: ME, the machine serving the page, was removed or has not reached it yet.
+    const listed = settings({ machines: [{ id: OTHER, name: "laptop", address: "" }] });
+    const mine = [workspace(ME, "w1", "mine"), terminal(ME, "t1", "w1"), session(ME, "s1", "w1", "t1"), terminal(ME, "sh1", "w1")];
+    const records = [
+      sample(ME, 1),
+      ...mine,
+      sample(X, 1),
+      workspace(X, "w2", "gone"),
+      terminal(X, "t2", "w2"),
+      session(X, "s2", "w2", "t2"),
+      terminal(X, "sh2", "w2"),
+    ];
+    const card = (machines: ReturnType<typeof fleet>, id: string) => machines.find((m) => m.id === id);
+
+    it("lists its own workspaces, sessions and terminals under its card", () => {
+      const here = card(fleet(records, listed, {}, undefined, ME), ME);
+      expect(here?.listed).toBe(false);
+      expect(here?.workspaces.map((w) => w.name)).toEqual(["mine"]);
+      expect(here?.workspaces[0].sessions.map((s) => [s.id, s.terminal])).toEqual([["s1", "t1"]]);
+      expect(here?.workspaces[0].shells.map((t) => t.id)).toEqual(["sh1"]);
+    });
+
+    it("still lists none for another machine the list does not hold", () => {
+      const away = card(fleet(records, listed, {}, undefined, ME), X);
+      expect(away?.sample).not.toBeNull();
+      expect(away?.workspaces).toEqual([]);
+    });
+
+    it("keeps its card and its records before its own first sample", () => {
+      const here = card(fleet([...mine, sample(X, 1)], listed, {}, undefined, ME), ME);
+      expect(here?.sample).toBeNull();
+      expect(here?.workspaces.map((w) => w.name)).toEqual(["mine"]);
+    });
+
+    it("hides it as any other machine while the serving machine is not known", () => {
+      const machines = fleet(records, listed, {}, undefined, undefined);
+      expect(machines.map((m) => [m.id, m.workspaces.length])).toEqual([
+        [OTHER, 0],
+        [ME, 0],
+        [X, 0],
+      ]);
+      // Before its first sample it has no card at all.
+      expect(card(fleet(mine, listed), ME)).toBeUndefined();
+    });
+
+    it("gets no card of its own from workspaces it has deleted alone", () => {
+      const deleted = [workspace(ME, "w1", "mine", { deleted: true })];
+      expect(card(fleet(deleted, listed, {}, undefined, ME), ME)).toBeUndefined();
+    });
+  });
+
   it("lists machines in settings order, then others that have a sample, named by id", () => {
     const s = settings({
       machines: [
