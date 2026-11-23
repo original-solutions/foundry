@@ -656,6 +656,7 @@ async fn raw_link_speaking(daemon: &Daemon, machine: MachineId, protocol: u16) -
             protocol,
             machine,
             versions: Default::default(),
+            factory_versions: Default::default(),
         },
     )
     .await;

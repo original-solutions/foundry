@@ -1,8 +1,8 @@
 //! Shared settings, their sequence number, and the stamps that say which edit set each one.
 //!
 //! A setting is one first-level entry: one machine, the priority order, one project, one
-//! machine's limits, each named by a [`SettingKey`], or the "setting overwritten" item about
-//! one of those. The acting coordinator numbers every edit and stamps what it changed with a
+//! machine's limits, the fleet's factory settings, one project's factory setting, each named by
+//! a [`SettingKey`], or the "setting overwritten" item about one of those. The acting coordinator numbers every edit and stamps what it changed with a
 //! [`Stamp`], kept under a [`StampKey`]; a removed setting keeps its stamp, so a merge does not
 //! bring it back.
 
@@ -38,6 +38,14 @@ pub struct SharedSettings {
     /// numbered twice and its sender can find its stamp in a copy.
     #[serde(default)]
     pub numbered: BTreeMap<EditId, Stamp>,
+    /// The fleet's factory settings, once set. Never sent to a peer before
+    /// [`FACTORY_SINCE`](crate::messages::FACTORY_SINCE), and not written when unset, so a copy
+    /// without them is written as it was before them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub factory: Option<FactorySettings>,
+    /// Each project's factory setting, by project.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub project_factory: BTreeMap<ProjectId, ProjectFactory>,
 }
 
 impl SharedSettings {
@@ -48,6 +56,21 @@ impl SharedSettings {
         self.projects
             .iter()
             .find(|p| p.name.trim().to_lowercase() == wanted)
+    }
+
+    /// A copy for a peer that speaks `protocol`. A peer before
+    /// [`FACTORY_SINCE`](crate::messages::FACTORY_SINCE) refuses a setting key it does not
+    /// know, so its copy has no factory setting, no stamp of one or of its item, and no
+    /// "setting overwritten" item about one. Every other setting is as it is here.
+    pub fn for_protocol(&self, protocol: u16) -> SharedSettings {
+        let mut copy = self.clone();
+        if protocol < crate::messages::FACTORY_SINCE {
+            copy.factory = None;
+            copy.project_factory.clear();
+            copy.stamps.retain(|key, _| !key.setting().is_factory());
+            copy.overwritten.retain(|key, _| !key.is_factory());
+        }
+        copy
     }
 }
 
@@ -90,14 +113,26 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
-/// One first-level setting. Written as text: `machine:<id>`, `priority`, `project:<id>` or
-/// `limits:<id>`.
+/// One first-level setting. Written as text: `machine:<id>`, `priority`, `project:<id>`,
+/// `limits:<id>`, `factory` or `factory:<project id>`.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SettingKey {
     Machine(MachineId),
     Priority,
     Project(ProjectId),
     Limits(MachineId),
+    /// The fleet's factory settings.
+    Factory,
+    /// One project's factory setting.
+    ProjectFactory(ProjectId),
+}
+
+impl SettingKey {
+    /// True for a factory key, which a peer before
+    /// [`FACTORY_SINCE`](crate::messages::FACTORY_SINCE) cannot read.
+    pub fn is_factory(&self) -> bool {
+        matches!(self, Self::Factory | Self::ProjectFactory(_))
+    }
 }
 
 /// What a stamp is kept for: a setting, or the "setting overwritten" item about one. Written
@@ -108,6 +143,15 @@ pub enum StampKey {
     Overwritten(SettingKey),
 }
 
+impl StampKey {
+    /// The setting this stamp is for, or the one its item is about.
+    pub fn setting(&self) -> &SettingKey {
+        match self {
+            Self::Setting(key) | Self::Overwritten(key) => key,
+        }
+    }
+}
+
 impl fmt::Display for SettingKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -115,6 +159,8 @@ impl fmt::Display for SettingKey {
             Self::Priority => f.write_str("priority"),
             Self::Project(id) => write!(f, "project:{id}"),
             Self::Limits(id) => write!(f, "limits:{id}"),
+            Self::Factory => f.write_str("factory"),
+            Self::ProjectFactory(id) => write!(f, "factory:{id}"),
         }
     }
 }
@@ -125,14 +171,17 @@ impl FromStr for SettingKey {
     fn from_str(text: &str) -> Result<Self, Self::Err> {
         let refused = || format!("`{text}` names no setting");
         let id = |rest: &str| rest.parse::<uuid::Uuid>().map_err(|_| refused());
-        if text == "priority" {
-            return Ok(Self::Priority);
+        match text {
+            "priority" => return Ok(Self::Priority),
+            "factory" => return Ok(Self::Factory),
+            _ => {}
         }
         let (kind, rest) = text.split_once(':').ok_or_else(refused)?;
         match kind {
             "machine" => Ok(Self::Machine(MachineId(id(rest)?))),
             "project" => Ok(Self::Project(ProjectId(id(rest)?))),
             "limits" => Ok(Self::Limits(MachineId(id(rest)?))),
+            "factory" => Ok(Self::ProjectFactory(ProjectId(id(rest)?))),
             _ => Err(refused()),
         }
     }
@@ -225,6 +274,8 @@ pub enum SettingValue {
     Priority(Vec<MachineId>),
     Project(Project),
     Limits(Limits),
+    Factory(FactorySettings),
+    ProjectFactory(ProjectFactory),
 }
 
 /// Two sides of a split both edited a setting: the value that holds and the one it replaced.
@@ -269,6 +320,15 @@ pub enum Edit {
     Dismiss {
         setting: SettingKey,
     },
+    /// Sets the fleet's factory settings.
+    SetFactory {
+        settings: FactorySettings,
+    },
+    /// Sets one project's factory setting.
+    SetProjectFactory {
+        project: ProjectId,
+        factory: ProjectFactory,
+    },
 }
 
 impl Edit {
@@ -284,6 +344,8 @@ impl Edit {
                 SettingKey::Limits(*machine)
             }
             Self::Dismiss { setting } => return StampKey::Overwritten(setting.clone()),
+            Self::SetFactory { .. } => SettingKey::Factory,
+            Self::SetProjectFactory { project, .. } => SettingKey::ProjectFactory(*project),
         };
         StampKey::Setting(setting)
     }
@@ -295,6 +357,10 @@ impl Edit {
             Self::Priority { order } => Some(SettingValue::Priority(order.clone())),
             Self::SetProject { project } => Some(SettingValue::Project(project.clone())),
             Self::SetLimits { limits, .. } => Some(SettingValue::Limits(limits.clone())),
+            Self::SetFactory { settings } => Some(SettingValue::Factory(settings.clone())),
+            Self::SetProjectFactory { factory, .. } => {
+                Some(SettingValue::ProjectFactory(factory.clone()))
+            }
             Self::RemoveMachine { .. }
             | Self::RemoveProject { .. }
             | Self::RemoveLimits { .. }
@@ -334,6 +400,72 @@ pub struct Limits {
     pub max_load_per_core: f64,
     /// Bytes.
     pub min_free_disk: u64,
+}
+
+/// The fleet's factory settings. A field left out reads as its default.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FactorySettings {
+    /// Claims are paused for every project.
+    pub paused: bool,
+    /// How often a pass runs: from [`POLL_SECONDS_MIN`] to [`POLL_SECONDS_MAX`], and nothing
+    /// else parses.
+    #[serde(deserialize_with = "poll_seconds")]
+    pub poll_seconds: u32,
+    /// How often a run in `pr-open` reads new feedback.
+    pub feedback_seconds: u64,
+    /// Runs that hold a slot at once.
+    pub max_runs: u32,
+    /// Gates that run at once.
+    pub max_gates: u32,
+    /// The model a factory session starts with.
+    pub model: String,
+    /// The effort a factory session starts with.
+    pub effort: String,
+}
+
+/// The shortest `poll_seconds`.
+pub const POLL_SECONDS_MIN: u32 = 10;
+/// The longest `poll_seconds`.
+pub const POLL_SECONDS_MAX: u32 = 60;
+
+fn poll_seconds<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    let seconds = u64::deserialize(d)?;
+    u32::try_from(seconds)
+        .ok()
+        .filter(|s| (POLL_SECONDS_MIN..=POLL_SECONDS_MAX).contains(s))
+        .ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "poll_seconds is {seconds}: it must be from {POLL_SECONDS_MIN} to {POLL_SECONDS_MAX}"
+            ))
+        })
+}
+
+impl Default for FactorySettings {
+    fn default() -> Self {
+        Self {
+            paused: false,
+            poll_seconds: 30,
+            feedback_seconds: 600,
+            max_runs: 3,
+            max_gates: 2,
+            model: "opus".into(),
+            effort: "high".into(),
+        }
+    }
+}
+
+/// One project's factory setting. A field left out reads as its default: off, no login, not
+/// paused.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProjectFactory {
+    /// The factory watches the project.
+    pub on: bool,
+    /// The GitHub login the project acts as, written when the factory is turned on.
+    pub login: String,
+    /// Claims are paused for this project.
+    pub paused: bool,
 }
 
 #[cfg(test)]
@@ -405,6 +537,8 @@ pub(crate) mod tests {
             )]
             .into(),
             numbered: [(EditId::random(), Stamp { seq: 42, by: mac })].into(),
+            factory: None,
+            project_factory: BTreeMap::new(),
         }
     }
 
@@ -1060,14 +1194,14 @@ pub(crate) mod tests {
             );
             assert!(copy.overwritten.keys().all(|key| !key.is_factory()));
             // Everything else is as it was.
-            assert_eq!(copy, without_factory(), "protocol {protocol}");
+            assert_eq!(copy, without_factory(&settings), "protocol {protocol}");
         }
         // Without factory keys a copy loses nothing.
-        let plain = settings();
+        let plain = super::tests::settings();
         assert_eq!(plain.for_protocol(4), plain);
 
-        fn without_factory() -> SharedSettings {
-            let mut settings = settings_with_factory();
+        fn without_factory(settings: &SharedSettings) -> SharedSettings {
+            let mut settings = settings.clone();
             settings.factory = None;
             settings.project_factory.clear();
             settings.stamps.retain(|key, _| {

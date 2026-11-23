@@ -26,6 +26,7 @@ use serde::Serialize;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{Instant, timeout, timeout_at};
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use super::{BATCH, Conn, Inner, OFFLINE_AFTER, RETRY_REFUSED, TICK, on_store};
@@ -271,6 +272,7 @@ async fn hello(
         protocol,
         machine,
         versions,
+        ..
     }) = first
     else {
         tracing::warn!("sync: a link opened without a hello");
@@ -301,6 +303,8 @@ async fn own_hello(inner: &Inner, protocol: u16) -> Option<PeerMessage> {
             protocol,
             machine: inner.me,
             versions,
+            // Factory records are not kept yet, so this machine holds none.
+            factory_versions: BTreeMap::new(),
         }),
         Err(error) => {
             tracing::warn!("sync: cannot read the versions held: {error}");
@@ -434,6 +438,9 @@ async fn take(
         PeerMessage::Hello { .. } | PeerMessage::Relay { .. } | PeerMessage::Call { .. } => {
             return Ok(());
         }
+        // Factory records are not kept yet: one that arrives is dropped, and the hello says
+        // this machine holds none, so a peer sends them again once they are.
+        PeerMessage::FactoryRecords { .. } => return Ok(()),
     };
     on_store(&inner.store, move |store| {
         store
@@ -520,6 +527,7 @@ mod tests {
                 protocol: PROTOCOL,
                 machine: peer,
                 versions: BTreeMap::new(),
+                factory_versions: BTreeMap::new(),
             };
             theirs
                 .send
@@ -618,6 +626,7 @@ mod tests {
             protocol: PROTOCOL,
             machine: peer,
             versions: BTreeMap::new(),
+            factory_versions: BTreeMap::new(),
         };
         theirs
             .send

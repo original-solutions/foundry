@@ -705,6 +705,7 @@ async fn the_daemons_peer_route_refuses_a_link_with_no_key_proof() {
         protocol: PROTOCOL,
         machine: peer,
         versions: Default::default(),
+        factory_versions: Default::default(),
     };
     socket
         .send(Message::text(serde_json::to_string(&hello).unwrap()))
@@ -991,6 +992,7 @@ async fn keyed_peer_link(fixture: &mut Fixture) -> (Conn, MachineId, TempDir) {
         protocol: PROTOCOL,
         machine: peer_id,
         versions: Default::default(),
+        factory_versions: Default::default(),
     };
     conn.send
         .send(serde_json::to_string(&hello).unwrap())

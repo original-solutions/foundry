@@ -300,6 +300,13 @@ pub fn fleet_items(fleet: &Fleet) -> Vec<Item> {
                     None => "a project".to_owned(),
                 }
             }
+            SettingKey::Factory => "the factory settings".to_owned(),
+            SettingKey::ProjectFactory(id) => {
+                match fleet.settings.projects.iter().find(|p| p.id == *id) {
+                    Some(project) => format!("the factory of the project {}", project.name),
+                    None => "the factory of a project".to_owned(),
+                }
+            }
         };
         items.push(fleet.item(
             Kind::SettingOverwritten,
@@ -339,6 +346,30 @@ fn value_text(fleet: &Fleet, value: Option<&SettingValue>) -> String {
             limits.max_load_per_core,
             limits.min_free_disk as f64 / 1e9
         ),
+        Some(SettingValue::Factory(factory)) => format!(
+            "{}{} runs, {} gates, a pass every {} s, feedback every {} s, {} at {} effort",
+            if factory.paused {
+                "claims paused, "
+            } else {
+                ""
+            },
+            factory.max_runs,
+            factory.max_gates,
+            factory.poll_seconds,
+            factory.feedback_seconds,
+            factory.model,
+            factory.effort
+        ),
+        Some(SettingValue::ProjectFactory(factory)) => {
+            let mut text = if factory.on { "on" } else { "off" }.to_owned();
+            if !factory.login.is_empty() {
+                text.push_str(&format!(" as {}", factory.login));
+            }
+            if factory.paused {
+                text.push_str(", claims paused");
+            }
+            text
+        }
     }
 }
 
@@ -1255,6 +1286,7 @@ mod tests {
                 protocol: PROTOCOL,
                 machine: peer,
                 versions: BTreeMap::new(),
+                factory_versions: BTreeMap::new(),
             };
             let nothing = PeerMessage::Records {
                 protocol: PROTOCOL,
@@ -1292,6 +1324,7 @@ mod tests {
                 protocol: PROTOCOL,
                 machine: peer,
                 versions: BTreeMap::new(),
+                factory_versions: BTreeMap::new(),
             };
             let nothing = PeerMessage::Records {
                 protocol: PROTOCOL,

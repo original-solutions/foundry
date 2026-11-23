@@ -1,4 +1,349 @@
-//! Factory records, factory settings and run ids.
+//! Factory records and run ids.
+//!
+//! Factory records are kept and synced apart from P1's records, on a version per owner of their
+//! own, and only on links whose two ends speak protocol 5. Each is written only by its owner,
+//! and none is ever deleted. The factory settings are in [`crate::settings`].
+
+use std::fmt;
+use std::str::FromStr;
+
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::Value;
+
+use crate::ids::{MachineId, ProjectId, SessionId, WorkspaceId};
+
+/// One run: a repo, an issue in it, and which attempt at that issue this is. Shown and parsed
+/// as `<owner>__<repo>__<issue>__<attempt>`, the runner's run id, which names its run file.
+///
+/// `repo` is lowercase `owner/name`, as [`RunId::new`] makes it. GitHub names are
+/// case-insensitive, and so are macOS file systems, so one repo must be one run id. An id built
+/// by hand that is not in that form cannot be written.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RunId {
+    pub repo: String,
+    pub issue: u64,
+    pub attempt: u32,
+}
+
+const SHAPE: &str = "expected <owner>__<repo>__<issue>__<attempt>";
+const REPO_REASON: &str = "the repo must be <owner>/<name>: the owner uses letters, digits and `-` plus single `_` between them, the name uses letters, digits, `.`, `_` and `-` and is not `.` or `..`";
+
+impl RunId {
+    /// A run id for `owner/name`, lowercased. Refuses a repo that is not a legal GitHub one.
+    pub fn new(repo: &str, issue: u64, attempt: u32) -> Result<Self, String> {
+        let repo = normalise_repo(repo).ok_or_else(|| refused(repo, REPO_REASON))?;
+        Ok(Self {
+            repo,
+            issue,
+            attempt,
+        })
+    }
+
+    /// True when the repo is already in the form [`RunId::new`] makes, so the id names one
+    /// file and cannot leave the directory it is written in.
+    fn is_valid(&self) -> bool {
+        normalise_repo(&self.repo).as_deref() == Some(self.repo.as_str())
+    }
+}
+
+fn refused(input: &str, reason: &str) -> String {
+    format!("{input:?} is not a run id: {reason}")
+}
+
+/// Lowercase `owner/name` after checking both parts, lowercasing ASCII letters only: a Unicode
+/// lowercase would fold U+212A (Kelvin) into a `k`. GitHub owners use `[A-Za-z0-9-]`, and
+/// Enterprise Managed User logins add a `_`, so an owner may hold single underscores between
+/// other characters: none first, none last, never `__`. That is what lets a parse end the owner
+/// at the first `__`. Repo names use `[A-Za-z0-9._-]`.
+fn normalise_repo(input: &str) -> Option<String> {
+    let repo = input.to_ascii_lowercase();
+    let (owner, name) = repo.split_once('/')?;
+    let owner_ok = !owner.is_empty()
+        && !owner.starts_with('_')
+        && !owner.ends_with('_')
+        && !owner.contains("__")
+        && owner
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_');
+    let name_ok = !name.is_empty()
+        && name != "."
+        && name != ".."
+        && name.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-')
+        });
+    (owner_ok && name_ok).then_some(repo)
+}
+
+/// A number the way the runner writes it: digits, no sign, no leading zero.
+fn canonical<T: FromStr>(text: &str) -> Option<T> {
+    let digits = !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+    let leading_zero = text.len() > 1 && text.starts_with('0');
+    if digits && !leading_zero {
+        text.parse().ok()
+    } else {
+        None
+    }
+}
+
+impl fmt::Display for RunId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (owner, name) = self.repo.split_once('/').unwrap_or((&self.repo, ""));
+        write!(f, "{owner}__{name}__{}__{}", self.issue, self.attempt)
+    }
+}
+
+impl FromStr for RunId {
+    type Err = String;
+
+    /// Parses `<owner>__<repo>__<issue>__<attempt>`, lowercasing the owner and repo. The owner
+    /// never holds `__`, so it ends at the first `__`. The last two fields are numbers, so they
+    /// are taken from the right. What is left in the middle is the repo name, which may itself
+    /// hold `__`.
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let bad = || refused(text, SHAPE);
+        let (owner, rest) = text.split_once("__").ok_or_else(bad)?;
+        let (rest, attempt) = rest.rsplit_once("__").ok_or_else(bad)?;
+        let (name, issue) = rest.rsplit_once("__").ok_or_else(bad)?;
+        let attempt = canonical(attempt).ok_or_else(bad)?;
+        let issue = canonical(issue).ok_or_else(bad)?;
+        let repo = format!("{owner}/{name}");
+        let repo = normalise_repo(&repo).ok_or_else(|| refused(text, REPO_REASON))?;
+        Ok(Self {
+            repo,
+            issue,
+            attempt,
+        })
+    }
+}
+
+impl Serialize for RunId {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        if !self.is_valid() {
+            return Err(serde::ser::Error::custom(refused(&self.repo, REPO_REASON)));
+        }
+        s.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for RunId {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        String::deserialize(d)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// A factory record: written only by its owner, under the owner's factory version, which only
+/// goes up and is apart from its version for P1's records. Written with the body's `kind` beside
+/// the owner and version, as P1's records are.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FactoryRecord {
+    pub owner: MachineId,
+    pub version: u64,
+    #[serde(flatten)]
+    pub body: FactoryBody,
+}
+
+/// What a factory record holds, tagged by `kind`. A kind this build does not know is an error.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "body")]
+pub enum FactoryBody {
+    /// One step of a run.
+    #[serde(rename = "run_event")]
+    RunEvent(RunEvent),
+    /// What the factory of one project looks like to the machine that wrote it.
+    #[serde(rename = "factory_status")]
+    Status(FactoryStatus),
+    /// The GitHub logins the owner holds a token for, and whether it has the skill.
+    #[serde(rename = "machine_held")]
+    Held(MachineHeld),
+    /// The newest turn of one of the owner's factory sessions.
+    #[serde(rename = "session_turn")]
+    Turn(SessionTurn),
+}
+
+impl FactoryBody {
+    /// The `kind` the body is written under.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::RunEvent(_) => "run_event",
+            Self::Status(_) => "factory_status",
+            Self::Held(_) => "machine_held",
+            Self::Turn(_) => "session_turn",
+        }
+    }
+}
+
+/// What makes a factory record one record: its kind and an id within the kind. A newer version
+/// of a key from the same owner replaces the one held.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct FactoryKey {
+    pub kind: &'static str,
+    pub id: String,
+}
+
+impl FactoryRecord {
+    /// The record's key. Every run event is a record of its own, `<run>/<owner>/<version>`, as
+    /// no event is ever rewritten. A status is one per project and writer,
+    /// `<project>/<owner>`. A machine's logins held are keyed by the machine, and a session's
+    /// turn by the session.
+    pub fn key(&self) -> FactoryKey {
+        let id = match &self.body {
+            FactoryBody::RunEvent(event) => {
+                format!("{}/{}/{}", event.run, self.owner, self.version)
+            }
+            FactoryBody::Status(status) => format!("{}/{}", status.project, self.owner),
+            FactoryBody::Held(_) => self.owner.to_string(),
+            FactoryBody::Turn(turn) => turn.session.to_string(),
+        };
+        FactoryKey {
+            kind: self.body.kind(),
+            id,
+        }
+    }
+}
+
+/// One step of a run. `ts`, `ms`, `event`, `data` and `cause` are a line of the runner's ledger,
+/// unchanged, so the line is this written without `run` and `generation`. A run's events are
+/// ordered by `generation`, then by the writer's factory version; never by `ts` or `ms`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RunEvent {
+    pub run: RunId,
+    /// The lease generation the event was written under.
+    pub generation: u64,
+    /// The writer's wall-clock time, as the runner formats it.
+    pub ts: String,
+    /// The same time as Unix epoch milliseconds.
+    pub ms: u64,
+    pub event: String,
+    pub data: Value,
+    /// Which part of the factory wrote the line, and why. Left out of the line when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<Value>,
+}
+
+/// One project's factory as one machine sees it, written by the acting coordinator each pass.
+/// A writer that does not hold the lease says why in `not_holding`, and nothing more.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FactoryStatus {
+    pub project: ProjectId,
+    /// The writer's pass count, which only rises.
+    pub pass: u64,
+    /// Whether the writer holds the project's lease.
+    pub holds: bool,
+    /// The lease generation the writer holds, or the highest it has seen.
+    pub generation: u64,
+    pub not_holding: Option<NotHolding>,
+    /// Why the factory is idle, when it is.
+    pub idle: Option<String>,
+    /// The repo sets a `factory.owner`, which is ignored.
+    pub owner_ignored: bool,
+    /// The ready queue in claim order, each with why it waits.
+    pub ready: Vec<Waiting>,
+    /// Feedback rounds that wait to start.
+    pub feedback_waiting: Vec<Waiting>,
+    pub runs: Vec<LiveRun>,
+    /// Runs that are stuck or wait for answers.
+    pub held_up: Vec<HeldUp>,
+    /// Runs with a gate that could not run at all.
+    pub gate_infra: Vec<RunId>,
+    /// The last finished runs, newest first.
+    pub finished: Vec<FinishedRun>,
+    /// Issues in `triage` or `building` whose newest claim is not Foundry's.
+    pub foreign: Vec<ForeignClaim>,
+}
+
+/// Why a writer does not hold a project's lease.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum NotHolding {
+    /// It holds no token for the project's login.
+    NoToken { login: String },
+    /// The lease ref names this holder at this generation.
+    HeldBy { machine: MachineId, generation: u64 },
+}
+
+/// An issue, or a run's feedback round, that waits to start, and why.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Waiting {
+    pub issue: u64,
+    pub title: String,
+    pub reason: String,
+    /// The run a feedback round belongs to. `None` for a ready issue, which has no run yet.
+    #[serde(default)]
+    pub run: Option<RunId>,
+}
+
+/// A run in progress.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveRun {
+    pub run: RunId,
+    pub title: String,
+    pub step: String,
+    /// The machine its active workspace is on.
+    pub machine: MachineId,
+    pub gate_retries_used: u32,
+    pub minutes_used: u64,
+    pub workspaces: Vec<WorkspaceId>,
+    pub sessions: Vec<SessionId>,
+}
+
+/// A run that waits on a person.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeldUp {
+    pub run: RunId,
+    pub kind: HeldUpKind,
+    pub reason: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HeldUpKind {
+    Stuck,
+    NeedsInfo,
+}
+
+/// A run that ended, and how, as the runner's `finished` event says it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FinishedRun {
+    pub run: RunId,
+    pub title: String,
+    /// `pr-open`, `stuck` or `needs-info`.
+    pub outcome: String,
+    /// `merged` or `closed`, for a run that ended because its pull request did.
+    pub pr_end: Option<String>,
+    pub pr_url: Option<String>,
+}
+
+/// An issue claimed by something other than Foundry.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForeignClaim {
+    pub issue: u64,
+    pub title: String,
+    /// The factory label it is in, without the `factory:` prefix.
+    pub state: String,
+}
+
+/// The GitHub logins a machine holds a token for, and whether it has the `factory-build` skill.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MachineHeld {
+    pub logins: Vec<String>,
+    pub skill: bool,
+}
+
+/// The newest turn of a factory session, written by its machine.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionTurn {
+    pub session: SessionId,
+    pub workspace: WorkspaceId,
+    pub project: ProjectId,
+    /// The newest turn's number, which only rises.
+    pub turn: u64,
+    /// How many prompts the session has had submitted.
+    pub prompts: u64,
+    /// Whether a question waits.
+    pub question: bool,
+}
 
 #[cfg(test)]
 pub(crate) mod tests {

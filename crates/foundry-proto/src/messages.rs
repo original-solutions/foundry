@@ -4,12 +4,13 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::factory::{FactoryRecord, FactoryStatus};
 use crate::ids::{MachineId, TerminalId};
 use crate::record::AnyRecord;
 use crate::settings::{Edit, EditId, Outcome, SharedSettings};
 
 /// The protocol number this build speaks.
-pub const PROTOCOL: u16 = 4;
+pub const PROTOCOL: u16 = 5;
 
 /// The first protocol whose links carry the shared settings and edits. A link in an older
 /// protocol carries neither: a machine on it has no coordinator, and refuses a message whose
@@ -26,15 +27,25 @@ pub const CALLS_SINCE: u16 = 3;
 /// later.
 pub const ANSWERS_SINCE: u16 = 4;
 
+/// The first protocol whose links carry factory records and factory settings. A machine sends
+/// neither on a link in an older protocol: such a peer refuses a record kind, a message `type`
+/// and a settings key it does not know. Its settings copy goes through
+/// [`SharedSettings::for_protocol`].
+pub const FACTORY_SINCE: u16 = 5;
+
 /// A message between two machines' daemons, tagged by `type`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PeerMessage {
-    /// Opens a link: who is speaking and the highest version it holds per owner.
+    /// Opens a link: who is speaking and the highest version it holds per owner, of P1's
+    /// records and of factory records. A hello from before [`FACTORY_SINCE`] has no
+    /// `factory_versions` and reads as holding none.
     Hello {
         protocol: u16,
         machine: MachineId,
         versions: BTreeMap<MachineId, u64>,
+        #[serde(default)]
+        factory_versions: BTreeMap<MachineId, u64>,
     },
     /// Records the receiver may not have yet.
     Records {
@@ -74,6 +85,12 @@ pub enum PeerMessage {
         machine: MachineId,
         call: Call,
     },
+    /// Factory records the receiver may not have yet. Sent only on a link in
+    /// [`FACTORY_SINCE`] or later.
+    FactoryRecords {
+        protocol: u16,
+        records: Vec<FactoryRecord>,
+    },
 }
 
 /// A `POST` to another machine's API, carried to it as it was made.
@@ -96,7 +113,8 @@ impl PeerMessage {
             | Self::Relay { protocol, .. }
             | Self::Edit { protocol, .. }
             | Self::Answer { protocol, .. }
-            | Self::Call { protocol, .. } => *protocol,
+            | Self::Call { protocol, .. }
+            | Self::FactoryRecords { protocol, .. } => *protocol,
         }
     }
 }
@@ -122,6 +140,11 @@ pub enum UiMessage {
         protocol: u16,
         settings: SharedSettings,
     },
+    /// The status believed for one project's factory changed.
+    FactoryStatus {
+        protocol: u16,
+        status: FactoryStatus,
+    },
 }
 
 impl UiMessage {
@@ -129,7 +152,8 @@ impl UiMessage {
         match self {
             Self::State { protocol, .. }
             | Self::Record { protocol, .. }
-            | Self::Settings { protocol, .. } => *protocol,
+            | Self::Settings { protocol, .. }
+            | Self::FactoryStatus { protocol, .. } => *protocol,
         }
     }
 }

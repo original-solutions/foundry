@@ -1240,6 +1240,12 @@ fn get(settings: &SharedSettings, key: &StampKey) -> Option<Value> {
             .cloned()
             .map(SettingValue::Project),
         SettingKey::Limits(id) => settings.limits.get(id).cloned().map(SettingValue::Limits),
+        SettingKey::Factory => settings.factory.clone().map(SettingValue::Factory),
+        SettingKey::ProjectFactory(id) => settings
+            .project_factory
+            .get(id)
+            .cloned()
+            .map(SettingValue::ProjectFactory),
     };
     value.map(Value::Setting)
 }
@@ -1279,6 +1285,20 @@ fn put(settings: &mut SharedSettings, key: &StampKey, value: Option<Value>, stam
             }
             _ => {
                 settings.limits.remove(id);
+            }
+        },
+        StampKey::Setting(SettingKey::Factory) => {
+            settings.factory = match value {
+                Some(Value::Setting(SettingValue::Factory(factory))) => Some(factory),
+                _ => None,
+            };
+        }
+        StampKey::Setting(SettingKey::ProjectFactory(id)) => match value {
+            Some(Value::Setting(SettingValue::ProjectFactory(factory))) => {
+                settings.project_factory.insert(*id, factory);
+            }
+            _ => {
+                settings.project_factory.remove(id);
             }
         },
         StampKey::Overwritten(inner) => match value {

@@ -537,6 +537,7 @@ async fn a_call_to_a_peer_on_an_older_link_or_on_no_link_is_refused_before_any_l
             protocol: 2,
             machine: old,
             versions: Default::default(),
+            factory_versions: Default::default(),
         },
         PeerMessage::Records {
             protocol: 2,
