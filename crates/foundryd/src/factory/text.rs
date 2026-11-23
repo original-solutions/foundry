@@ -76,10 +76,10 @@ fn url_len(text: &str) -> usize {
     scheme.len() + rest.find(|c| !in_url(c)).unwrap_or(rest.len())
 }
 
-fn push_word(out: &mut String, word: &str, keep: fn(&str) -> bool) {
+fn push_word(out: &mut String, word: &str) {
     let letters = word.bytes().any(|b| b.is_ascii_alphabetic());
     let digits = word.bytes().any(|b| b.is_ascii_digit());
-    if word.len() >= TOKEN_LENGTH && letters && digits && !keep(word) {
+    if word.len() >= TOKEN_LENGTH && letters && digits {
         out.push_str(HIDDEN);
     } else {
         out.push_str(word);
@@ -87,54 +87,107 @@ fn push_word(out: &mut String, word: &str, keep: fn(&str) -> bool) {
 }
 
 /// `text` with every run of letters, digits, `-` and `_` that is at least 24 long and mixes
-/// letters and digits hidden, unless `keep` takes it, and everything else as it is.
-fn push_words(out: &mut String, text: &str, keep: fn(&str) -> bool) {
+/// letters and digits hidden, and everything else as it is.
+fn push_hidden(out: &mut String, text: &str) {
     let mut word_start: Option<usize> = None;
     for (at, c) in text.char_indices() {
         if is_word(c) {
             word_start.get_or_insert(at);
         } else {
             if let Some(start) = word_start.take() {
-                push_word(out, &text[start..at], keep);
+                push_word(out, &text[start..at]);
             }
             out.push(c);
         }
     }
     if let Some(start) = word_start {
-        push_word(out, &text[start..], keep);
+        push_word(out, &text[start..]);
     }
 }
 
-fn push_hidden(out: &mut String, text: &str) {
-    push_words(out, text, |_| false);
+/// The path segments a GitHub link puts a commit id after, as in `commit/<id>`, `blob/<id>/…`
+/// or `compare/<id>...<id>`.
+const GITHUB_COMMIT_AFTER: [&str; 7] = [
+    "commit", "commits", "blob", "tree", "blame", "raw", "compare",
+];
+
+/// The anchors a GitHub page links to that end in a number: an issue comment, a review comment
+/// and a review.
+const GITHUB_NUMBERED_ANCHORS: [&str; 3] = ["issuecomment-", "discussion_r", "pullrequestreview-"];
+
+fn is_number(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// The longest word [`github_id`] looks at: longer than any id a GitHub link holds.
-const GITHUB_ID_LONGEST: usize = 128;
+/// Whether `lines` is empty or a line of a diff, `L12` or `R12`, or a range of them, `L3-R20`.
+fn is_diff_lines(lines: &str) -> bool {
+    let line = |line: &str| line.strip_prefix(['L', 'R']).is_some_and(is_number);
+    lines.is_empty()
+        || match lines.split_once('-') {
+            Some((from, to)) => line(from) && line(to),
+            None => line(lines),
+        }
+}
 
-/// Whether `word` is an id a GitHub link holds: a commit id or a number, after an optional name
-/// such as `diff-`, `issuecomment-` or `discussion_r`, and before an optional line such as `R12`.
-fn github_id(word: &str) -> bool {
-    if word.len() > GITHUB_ID_LONGEST {
+/// Whether the whole of `fragment`, after its `#`, is an anchor a GitHub page links to: a
+/// numbered comment or review, or a file of a diff, `diff-<id>`, with an optional line.
+fn is_github_anchor(fragment: &str) -> bool {
+    if let Some(number) = GITHUB_NUMBERED_ANCHORS
+        .iter()
+        .find_map(|name| fragment.strip_prefix(name))
+    {
+        return is_number(number);
+    }
+    let Some(diff) = fragment.strip_prefix("diff-") else {
         return false;
-    }
-    let is_id = |id: &str| {
-        let line = id
-            .rfind(['L', 'R'])
-            .filter(|&at| at + 1 < id.len() && id[at + 1..].bytes().all(|b| b.is_ascii_digit()));
-        let id = line.map_or(id, |at| &id[..at]);
-        is_commit_id(id) || (!id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
     };
-    let name = word
-        .find(|c: char| !(c.is_ascii_alphabetic() || c == '-' || c == '_'))
-        .unwrap_or(word.len());
-    (0..=name).any(|at| is_id(&word[at..]))
+    let (id, lines) = diff.split_at(diff.find(['L', 'R']).unwrap_or(diff.len()));
+    is_commit_id(id) && is_diff_lines(lines)
+}
+
+/// The path, query and fragment of a `github.com` URL as a comment may show them. A commit id
+/// is kept whole only as the whole path segment after one of [`GITHUB_COMMIT_AFTER`], or as
+/// one side of a compare's `...`; a fragment only when the whole of it is a GitHub anchor.
+/// Everything else, the query included, goes through the word rule.
+fn push_github(out: &mut String, rest: &str) {
+    let (path, rest) = rest.split_at(rest.find(['?', '#']).unwrap_or(rest.len()));
+    let mut after = "";
+    for (n, segment) in path.split('/').enumerate() {
+        if n > 0 {
+            out.push('/');
+        }
+        if GITHUB_COMMIT_AFTER.contains(&after) {
+            for (n, side) in segment.split("...").enumerate() {
+                if n > 0 {
+                    out.push_str("...");
+                }
+                if is_commit_id(side) {
+                    out.push_str(side);
+                } else {
+                    push_hidden(out, side);
+                }
+            }
+        } else {
+            push_hidden(out, segment);
+        }
+        after = segment;
+    }
+    let (query, fragment) = rest.split_at(rest.find('#').unwrap_or(rest.len()));
+    push_hidden(out, query);
+    if let Some(anchor) = fragment.strip_prefix('#') {
+        out.push('#');
+        if is_github_anchor(anchor) {
+            out.push_str(anchor);
+        } else {
+            push_hidden(out, anchor);
+        }
+    }
 }
 
 /// A URL, its userinfo already hidden by [`redact`](crate::secrets::redact), as a comment may
 /// show it. Every part goes through the word rule like the rest of the text, since a webhook,
-/// a signed link or an `?access_token=` carries its secret there. Only on `github.com` are the
-/// ids its pull request, commit, blob and review links hold kept whole.
+/// a signed link or an `?access_token=` carries its secret there. Only a `github.com` URL keeps
+/// the ids its commit, blob, compare and review links hold ([`push_github`]).
 fn push_url(out: &mut String, url: &str) {
     let scheme = url.find("://").map_or(0, |at| at + 3);
     out.push_str(&url[..scheme]);
@@ -145,7 +198,7 @@ fn push_url(out: &mut String, url: &str) {
     push_hidden(out, userinfo);
     push_hidden(out, host);
     if host.eq_ignore_ascii_case("github.com") {
-        push_words(out, rest, github_id);
+        push_github(out, rest);
     } else {
         push_hidden(out, rest);
     }
@@ -154,9 +207,9 @@ fn push_url(out: &mut String, url: &str) {
 /// `text` as a comment the factory posts on GitHub may show it: every run of letters, digits,
 /// `-` and `_` that is at least 24 long and mixes letters and digits is hidden, as P1 hides
 /// them. Keys, tokens, commit ids and hashes look like that; words and paths do not. Inside an
-/// `http://` or `https://` URL the same holds, except that a `github.com` URL keeps the commit
-/// ids and numbered anchors its links hold, so a pull request, commit, blob or review link
-/// comes through whole, and the URL's userinfo is hidden as
+/// `http://` or `https://` URL the same holds, except that a `github.com` URL keeps a commit id
+/// where its commit, blob, tree and compare links put one, and an anchor its review and diff
+/// links end in, so those links come through whole. A URL's userinfo is hidden as
 /// [`redact`](crate::secrets::redact) hides it. A URL ends at the first character no URL holds,
 /// and at `,` and `;`.
 ///
@@ -463,10 +516,6 @@ mod tests {
                 "https://github.com/o/r/blob/main/docs/•••/x",
             ),
             (
-                format!("https://github.com/o/r/compare/{KEY}...{sha}"),
-                format!("https://github.com/o/r/compare/•••...{sha}").leak(),
-            ),
-            (
                 format!(
                     "https://github.com/o/r/pull/1/files/{}{}",
                     "a".repeat(99),
@@ -477,6 +526,11 @@ mod tests {
         ] {
             assert_eq!(for_comment(&text), shown, "{text}");
         }
+        let compare = format!("https://github.com/o/r/compare/{KEY}...{sha}");
+        assert_eq!(
+            for_comment(&compare),
+            format!("https://github.com/o/r/compare/•••...{sha}")
+        );
     }
 
     #[test]
