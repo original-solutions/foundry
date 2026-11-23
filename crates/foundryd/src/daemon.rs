@@ -1781,4 +1781,54 @@ mod tests {
         assert!(after.machines.iter().any(|m| m.id == me));
         assert!(!warned);
     }
+
+    /// Runs the daemon's own listing loop on a lone machine whose Tailscale says it is `here`,
+    /// sends `changes` address changes, and gives the loop time to act.
+    async fn run_loop(
+        settings: impl FnOnce(MachineId, &mut SharedSettings),
+        changes: u8,
+    ) -> (Arc<Mutex<Store>>, MachineId) {
+        let (_dir, me, store, listing) = listing_over(settings);
+        let (sender, answered) = tokio::sync::watch::channel(BTreeSet::new());
+        let looping = tokio::spawn(list_this_machine(
+            answered,
+            listing,
+            store.clone(),
+            me,
+            || async { Ok(here()) },
+        ));
+        for n in 0..changes {
+            sender
+                .send(BTreeSet::from([ip(&format!("100.64.0.{}", n + 1))]))
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        looping.abort();
+        (store, me)
+    }
+
+    #[tokio::test]
+    async fn the_daemons_listing_loop_never_lists_a_machine_that_was_removed() {
+        let (store, me) = run_loop(
+            |me, settings| {
+                settings.stamps.insert(
+                    StampKey::Setting(SettingKey::Machine(me)),
+                    foundry_proto::settings::Stamp { seq: 1, by: me },
+                );
+            },
+            4,
+        )
+        .await;
+
+        let after = store.lock().unwrap().settings().unwrap();
+        assert!(after.machines.iter().all(|m| m.id != me), "{after:?}");
+    }
+
+    #[tokio::test]
+    async fn the_daemons_listing_loop_lists_a_machine_never_removed() {
+        let (store, me) = run_loop(|_, _| {}, 2).await;
+
+        let after = store.lock().unwrap().settings().unwrap();
+        assert!(after.machines.iter().any(|m| m.id == me), "{after:?}");
+    }
 }
