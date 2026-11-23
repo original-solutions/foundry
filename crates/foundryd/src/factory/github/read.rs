@@ -1947,8 +1947,7 @@ pub fn pr_feedback<G: Tracker + ?Sized>(
         |what: &str, got: &str| parse_error(&args, &format!("{what}, got {}", quoted(got)));
     // Written by an instructor who is a person, and not by the factory.
     let theirs = |author: Option<&Actor>, body: Option<&str>| {
-        is_human_instructor(author, instructors)
-            && !is_factory_comment(body.unwrap_or_default())
+        is_human_instructor(author, instructors) && !is_factory_comment(body.unwrap_or_default())
     };
 
     let reviews = reviews_since(gh, repo, pr, floor, &args, pull.reviews)?;
@@ -2618,6 +2617,22 @@ mod tests {
                 "number,title,assignees,labels",
             ])]
         );
+    }
+
+    #[test]
+    fn a_spawn_failure_is_a_spawn_error_carrying_the_args() {
+        let fake = FakeTracker::answering([Answer::NotStarted("gh not found".into())]);
+        let error = list_issues(&fake, REPO, State::Ready).unwrap_err();
+        assert_eq!(
+            fake.calls()[0][..4],
+            args(&["issue", "list", "--repo", REPO])[..]
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("gh issue list --repo rawphp/softfac"),
+            "{message}"
+        );
+        assert!(message.contains("gh not found"), "{message}");
     }
 
     #[test]
@@ -3619,19 +3634,39 @@ mod tests {
         assert_eq!(fake.calls(), vec![pr_list_call("t3code/abc")]);
     }
 
+    // The runner's case, `gh pr list` half: it prints a bot as `app/<slug>` already, and the
+    // GraphQL shape (`__typename`) is read alike. The runner's other half, the listing
+    // `openPullRequestsClosing`, is not ported, so only this listing applies.
     #[test]
-    fn open_pull_requests_on_head_names_a_bot_author_as_app_slash_login() {
-        let bot = serde_json::json!({
-            "number": 16,
-            "url": "https://github.com/rawphp/softfac/pull/16",
-            "headRefName": "t3code/abc",
-            "baseRefName": "main",
-            "isCrossRepository": false,
-            "author": {"login": "dependabot", "__typename": "Bot"},
-        });
-        let fake = FakeTracker::answering([Answer::ok(format!("[{bot}]"))]);
-        let got = open_pull_requests_on_head(&fake, REPO, "t3code/abc").unwrap();
-        assert_eq!(got[0].author.as_deref(), Some("app/dependabot"));
+    fn a_pull_request_a_github_app_opened_is_by_app_slug_in_both_listings_as_gh_pr_list_names_it() {
+        let pull = |author: serde_json::Value| {
+            serde_json::json!({
+                "number": 16,
+                "url": "https://github.com/rawphp/softfac/pull/16",
+                "headRefName": "t3code/abc",
+                "baseRefName": "main",
+                "isCrossRepository": false,
+                "author": author,
+            })
+        };
+        for (author, expected) in [
+            (
+                serde_json::json!({"id": "", "is_bot": true, "login": "app/superset-app", "name": ""}),
+                "app/superset-app",
+            ),
+            (
+                serde_json::json!({"__typename": "User", "login": "superset-app"}),
+                "superset-app",
+            ),
+            (
+                serde_json::json!({"__typename": "Bot", "login": "superset-app"}),
+                "app/superset-app",
+            ),
+        ] {
+            let fake = FakeTracker::answering([Answer::ok(format!("[{}]", pull(author.clone())))]);
+            let got = open_pull_requests_on_head(&fake, REPO, "t3code/abc").unwrap();
+            assert_eq!(got[0].author.as_deref(), Some(expected), "{author}");
+        }
     }
 
     #[test]
@@ -4656,6 +4691,29 @@ mod tests {
                 &creation_only("tom"),
             );
             assert!(is_approval_parse_error(&in_rename), "rename at {at}");
+        }
+    }
+
+    #[test]
+    fn a_malformed_last_edited_at_alone_is_a_parse_error() {
+        for at in ["2026-10-04 10:00:00Z", "", "yesterday"] {
+            // Every edit node is well formed; only lastEditedAt is not.
+            let answer = events_reply(
+                &[ready_on(LABELED, "tom")],
+                Some(e(at, "tom")),
+                &[e(CREATED, "tom"), e(AFTER, "tom")],
+            );
+            assert!(
+                is_approval_parse_error(&answer),
+                "approval, last edit at {at:?}"
+            );
+
+            let fake = FakeTracker::answering([Answer::ok(answer)]);
+            let error = fake.text_edited_since(REPO, 6, BEFORE).unwrap_err();
+            assert!(
+                is_parse_error_of(Some(error), &approval_call()),
+                "text_edited_since, last edit at {at:?}"
+            );
         }
     }
 
@@ -6808,6 +6866,19 @@ mod tests {
         comment["fullDatabaseId"] = json!(5_700_000_001u64);
         let got = read_feedback(&feedback_reply(&[], &[comment]));
         assert_eq!(feedback_ids(&got), vec!["pr-comment:5700000001"]);
+    }
+
+    #[test]
+    fn a_numeric_full_database_id_is_read_up_to_the_largest_exact_json_integer() {
+        let mut comment = pr_comment_node(21, "hi", "2026-10-04T11:00:00Z", "rawphp");
+        comment["fullDatabaseId"] = json!(9_007_199_254_740_991u64);
+        let got = read_feedback(&feedback_reply(&[], &[comment]));
+        assert_eq!(feedback_ids(&got), vec!["pr-comment:9007199254740991"]);
+
+        let mut past = pr_comment_node(22, "hi", "2026-10-04T11:00:00Z", "rawphp");
+        past["fullDatabaseId"] = json!(9_007_199_254_740_992u64);
+        let fake = FakeTracker::answering([Answer::ok(feedback_reply(&[], &[past]))]);
+        assert!(is_parse_error(&feedback_error(&fake)));
     }
 
     #[test]
