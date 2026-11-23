@@ -430,14 +430,14 @@ describe("Machines", () => {
   });
 
   describe("the coordinator order", () => {
-    const three = settings({
+    const laptopFirst = settings({
       machines: [
         { id: ME, name: "studio", address: "" },
         { id: OTHER, name: "laptop", address: "" },
       ],
       priority: [OTHER, ME],
     });
-    const order = (given = three, online?: string[]) => renderApp(<Machines machines={fleet(records, given, {}, online)} history={{}} here={ME} connected />);
+    const order = (given = laptopFirst, online?: string[]) => renderApp(<Machines machines={fleet(records, given, {}, online)} history={{}} here={ME} connected />);
     const names = () => screen.getAllByRole("article").map((a) => a.getAttribute("aria-label"));
 
     it("lists machines in priority order, listed ones before the rest", async () => {
@@ -447,12 +447,50 @@ describe("Machines", () => {
     });
 
     it("marks the machine that holds the coordinator role", async () => {
-      await order(three, [ME, OTHER]);
+      await order(laptopFirst, [ME, OTHER]);
 
       expect(within(card("laptop")).getByText("Coordinator")).toBeDefined();
       expect(within(card("studio")).queryByText("Coordinator")).toBeNull();
       expect(within(card("laptop")).getByText("Coordinator order 1 of 2")).toBeDefined();
       expect(within(card("studio")).getByText("Coordinator order 2 of 2")).toBeDefined();
+    });
+
+    it("puts the badge on the machine that holds the role, not on the first of the order", async () => {
+      await order(laptopFirst, [ME]);
+
+      expect(within(card("laptop")).getByText("Coordinator order 1 of 2")).toBeDefined();
+      expect(within(card("laptop")).queryByText("Coordinator")).toBeNull();
+      expect(within(card("studio")).getByText("Coordinator")).toBeDefined();
+    });
+
+    it("keeps both moves disabled after a 204 until the new order arrives", async () => {
+      const calls = mockFetch(new Response(null, { status: 204 }));
+      const studioFirst = settings({ machines: laptopFirst.machines, priority: [ME, OTHER] });
+      function Board() {
+        const [held, setHeld] = useState(laptopFirst);
+        return (
+          <>
+            <button type="button" onClick={() => setHeld(studioFirst)}>
+              deliver
+            </button>
+            <Machines machines={fleet(records, held)} history={{}} here={ME} connected />
+          </>
+        );
+      }
+      await renderApp(<Board />);
+      const moves = () => screen.getAllByRole<HTMLButtonElement>("button", { name: /in the coordinator order/ });
+
+      fireEvent.click(within(card("laptop")).getByRole("button", { name: "Move laptop down in the coordinator order" }));
+      await waitFor(() => expect(calls).toHaveLength(1));
+      await act(async () => {});
+
+      expect(moves().every((b) => b.disabled)).toBe(true);
+
+      fireEvent.click(screen.getByRole("button", { name: "deliver" }));
+
+      await waitFor(() => expect(names()).toEqual(["studio", "laptop"]));
+      expect(within(card("studio")).getByRole<HTMLButtonElement>("button", { name: "Move studio down in the coordinator order" }).disabled).toBe(false);
+      expect(calls).toHaveLength(1);
     });
 
     it("posts the whole new order when a machine moves", async () => {
