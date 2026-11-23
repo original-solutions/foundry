@@ -509,6 +509,7 @@ async fn a_listed_key_never_admits_a_revoked_machine_or_replaces_a_key_held() {
         protocol: PROTOCOL,
         machine: held.me(),
         versions: BTreeMap::new(),
+        factory_versions: Default::default(),
     };
     let nothing = PeerMessage::Records {
         protocol: PROTOCOL,
@@ -538,6 +539,7 @@ async fn hear(peers: &Peers, peer: MachineId) {
         protocol: PROTOCOL,
         machine: peer,
         versions: BTreeMap::new(),
+        factory_versions: Default::default(),
     };
     let nothing = PeerMessage::Records {
         protocol: PROTOCOL,

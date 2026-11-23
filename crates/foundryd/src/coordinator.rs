@@ -1192,22 +1192,38 @@ fn text(value: &Option<Value>) -> String {
 
 /// Every setting `settings` holds a value or a stamp for.
 fn keys(settings: &SharedSettings) -> BTreeSet<StampKey> {
-    let mut keys: BTreeSet<StampKey> = settings.stamps.keys().cloned().collect();
+    // Every field is named, so a new kind of setting does not compile until it is listed here.
+    let SharedSettings {
+        seq: _,
+        machines,
+        priority,
+        projects,
+        limits,
+        stamps,
+        seen: _,
+        overwritten,
+        numbered: _,
+        factory,
+        project_factory,
+    } = settings;
+    let mut keys: BTreeSet<StampKey> = stamps.keys().cloned().collect();
     let mut plain: Vec<SettingKey> = Vec::new();
-    plain.extend(settings.machines.iter().map(|m| SettingKey::Machine(m.id)));
-    plain.extend(settings.projects.iter().map(|p| SettingKey::Project(p.id)));
-    plain.extend(settings.limits.keys().map(|id| SettingKey::Limits(*id)));
-    if !settings.priority.is_empty() {
+    plain.extend(machines.iter().map(|m| SettingKey::Machine(m.id)));
+    plain.extend(projects.iter().map(|p| SettingKey::Project(p.id)));
+    plain.extend(limits.keys().map(|id| SettingKey::Limits(*id)));
+    if !priority.is_empty() {
         plain.push(SettingKey::Priority);
     }
-    keys.extend(plain.into_iter().map(StampKey::Setting));
-    keys.extend(
-        settings
-            .overwritten
+    if factory.is_some() {
+        plain.push(SettingKey::Factory);
+    }
+    plain.extend(
+        project_factory
             .keys()
-            .cloned()
-            .map(StampKey::Overwritten),
+            .map(|id| SettingKey::ProjectFactory(*id)),
     );
+    keys.extend(plain.into_iter().map(StampKey::Setting));
+    keys.extend(overwritten.keys().cloned().map(StampKey::Overwritten));
     keys
 }
 
@@ -1240,6 +1256,12 @@ fn get(settings: &SharedSettings, key: &StampKey) -> Option<Value> {
             .cloned()
             .map(SettingValue::Project),
         SettingKey::Limits(id) => settings.limits.get(id).cloned().map(SettingValue::Limits),
+        SettingKey::Factory => settings.factory.clone().map(SettingValue::Factory),
+        SettingKey::ProjectFactory(id) => settings
+            .project_factory
+            .get(id)
+            .cloned()
+            .map(SettingValue::ProjectFactory),
     };
     value.map(Value::Setting)
 }
@@ -1279,6 +1301,20 @@ fn put(settings: &mut SharedSettings, key: &StampKey, value: Option<Value>, stam
             }
             _ => {
                 settings.limits.remove(id);
+            }
+        },
+        StampKey::Setting(SettingKey::Factory) => {
+            settings.factory = match value {
+                Some(Value::Setting(SettingValue::Factory(factory))) => Some(factory),
+                _ => None,
+            };
+        }
+        StampKey::Setting(SettingKey::ProjectFactory(id)) => match value {
+            Some(Value::Setting(SettingValue::ProjectFactory(factory))) => {
+                settings.project_factory.insert(*id, factory);
+            }
+            _ => {
+                settings.project_factory.remove(id);
             }
         },
         StampKey::Overwritten(inner) => match value {
@@ -1427,6 +1463,92 @@ mod tests {
         );
         assert_eq!(merge(&ab, &ab), ab, "a merge with itself changes it");
         ab
+    }
+
+    #[test]
+    fn a_factory_edit_is_numbered_and_held_like_any_setting() {
+        use foundry_proto::factory::{FactorySettings, ProjectFactory};
+
+        let fleet = FactorySettings {
+            max_runs: 5,
+            ..FactorySettings::default()
+        };
+        let one = ProjectFactory {
+            on: true,
+            login: "rawphp".into(),
+            paused: false,
+        };
+        let project = ProjectId(uuid::Uuid::from_u128(7));
+        let held = numbered(
+            &base(),
+            &Edit::SetFactory {
+                settings: fleet.clone(),
+            },
+            id(A),
+        );
+        let held = numbered(
+            &held,
+            &Edit::SetProjectFactory {
+                project,
+                factory: one.clone(),
+            },
+            id(A),
+        );
+        assert_eq!(held.factory, Some(fleet));
+        assert_eq!(held.project_factory.get(&project), Some(&one));
+        assert_eq!(
+            held.stamps[&StampKey::Setting(SettingKey::Factory)],
+            Stamp { seq: 2, by: id(A) }
+        );
+        assert_eq!(
+            held.stamps[&StampKey::Setting(SettingKey::ProjectFactory(project))],
+            Stamp { seq: 3, by: id(A) }
+        );
+        // Each is a setting of its own: the other settings are as they were.
+        assert_eq!(held.machines, base().machines);
+        assert_eq!(held.priority, base().priority);
+    }
+
+    #[test]
+    fn a_factory_setting_survives_a_merge_and_a_split_over_it_is_overwritten() {
+        use foundry_proto::factory::{FactorySettings, ProjectFactory};
+
+        let project = ProjectId(uuid::Uuid::from_u128(7));
+        let fleet = |max_runs| FactorySettings {
+            max_runs,
+            ..FactorySettings::default()
+        };
+        let one = ProjectFactory {
+            on: true,
+            login: "rawphp".into(),
+            paused: false,
+        };
+        let set = numbered(&base(), &Edit::SetFactory { settings: fleet(5) }, id(A));
+        let set = numbered(
+            &set,
+            &Edit::SetProjectFactory {
+                project,
+                factory: one.clone(),
+            },
+            id(A),
+        );
+        // A copy from a machine that has not seen the edits leaves them as they are.
+        let kept = merged(&set, &base());
+        assert_eq!(kept.factory, Some(fleet(5)));
+        assert_eq!(kept.project_factory.get(&project), Some(&one));
+        assert_eq!(kept.stamps, set.stamps);
+        assert!(kept.overwritten.is_empty(), "{:?}", kept.overwritten);
+
+        // Both sides of a split set the fleet's factory settings: one holds, and the other is
+        // kept in a "setting overwritten" item.
+        let a = numbered(&base(), &Edit::SetFactory { settings: fleet(4) }, id(A));
+        let b = numbered(&base(), &Edit::SetFactory { settings: fleet(6) }, id(B));
+        let split = merged(&a, &b);
+        let item = &split.overwritten[&SettingKey::Factory];
+        let kept = split.factory.clone().expect("one side holds");
+        assert_eq!(item.kept, Some(SettingValue::Factory(kept.clone())));
+        let lost = if kept == fleet(4) { fleet(6) } else { fleet(4) };
+        assert_eq!(item.lost, Some(SettingValue::Factory(lost)));
     }
 
     // --- what a waiting edit does next ---
@@ -2037,6 +2159,29 @@ mod tests {
         // Remembering a newer id forgets one that falls out of the window.
         remember(&mut a, new, high);
         assert_eq!(a.numbered, [(new, high)].into());
+    }
+
+    #[test]
+    fn a_factory_setting_with_no_stamp_is_kept_by_a_merge() {
+        use foundry_proto::factory::{FactorySettings, ProjectFactory};
+
+        let project = ProjectId(uuid::Uuid::from_u128(7));
+        let fleet = FactorySettings {
+            max_runs: 5,
+            ..FactorySettings::default()
+        };
+        let one = ProjectFactory {
+            on: true,
+            login: "rawphp".into(),
+            paused: false,
+        };
+        let mut a = base();
+        a.factory = Some(fleet.clone());
+        a.project_factory.insert(project, one.clone());
+        let out = merged(&a, &base());
+        assert_eq!(out.factory, Some(fleet));
+        assert_eq!(out.project_factory.get(&project), Some(&one));
+        assert!(out.overwritten.is_empty(), "{:?}", out.overwritten);
     }
 
     #[test]

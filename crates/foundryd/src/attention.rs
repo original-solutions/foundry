@@ -300,6 +300,13 @@ pub fn fleet_items(fleet: &Fleet) -> Vec<Item> {
                     None => "a project".to_owned(),
                 }
             }
+            SettingKey::Factory => "the factory settings".to_owned(),
+            SettingKey::ProjectFactory(id) => {
+                match fleet.settings.projects.iter().find(|p| p.id == *id) {
+                    Some(project) => format!("the factory of the project {}", project.name),
+                    None => "the factory of a project".to_owned(),
+                }
+            }
         };
         items.push(fleet.item(
             Kind::SettingOverwritten,
@@ -339,6 +346,30 @@ fn value_text(fleet: &Fleet, value: Option<&SettingValue>) -> String {
             limits.max_load_per_core,
             limits.min_free_disk as f64 / 1e9
         ),
+        Some(SettingValue::Factory(factory)) => format!(
+            "{}{} runs, {} gates, a pass every {} s, feedback every {} s, {} at {} effort",
+            if factory.paused {
+                "claims paused, "
+            } else {
+                ""
+            },
+            factory.max_runs,
+            factory.max_gates,
+            factory.poll_seconds,
+            factory.feedback_seconds,
+            factory.model,
+            factory.effort
+        ),
+        Some(SettingValue::ProjectFactory(factory)) => {
+            let mut text = if factory.on { "on" } else { "off" }.to_owned();
+            if !factory.login.is_empty() {
+                text.push_str(&format!(" as {}", factory.login));
+            }
+            if factory.paused {
+                text.push_str(", claims paused");
+            }
+            text
+        }
     }
 }
 
@@ -1056,6 +1087,91 @@ mod tests {
     }
 
     #[test]
+    fn an_overwritten_factory_setting_reads_plainly() {
+        use foundry_proto::factory::{FactorySettings, ProjectFactory};
+
+        let mut world = World::new();
+        let (me, peer) = (world.me, world.peer);
+        let project = Project {
+            id: ProjectId::random(),
+            name: "foundry".into(),
+            repo: "https://github.com/o/foundry.git".into(),
+        };
+        world.settings.projects.push(project.clone());
+        world.settings.overwritten.insert(
+            SettingKey::Factory,
+            Overwritten {
+                kept: Some(SettingValue::Factory(FactorySettings {
+                    paused: true,
+                    ..FactorySettings::default()
+                })),
+                lost: Some(SettingValue::Factory(FactorySettings::default())),
+                lost_stamp: Stamp { seq: 2, by: peer },
+            },
+        );
+        world.settings.overwritten.insert(
+            SettingKey::ProjectFactory(project.id),
+            Overwritten {
+                kept: Some(SettingValue::ProjectFactory(ProjectFactory {
+                    on: true,
+                    login: "rawphp".into(),
+                    paused: false,
+                })),
+                lost: Some(SettingValue::ProjectFactory(ProjectFactory {
+                    on: false,
+                    login: String::new(),
+                    paused: true,
+                })),
+                lost_stamp: Stamp { seq: 2, by: me },
+            },
+        );
+        let gone = ProjectId::random();
+        world.settings.overwritten.insert(
+            SettingKey::ProjectFactory(gone),
+            Overwritten {
+                kept: None,
+                lost: Some(SettingValue::ProjectFactory(ProjectFactory::default())),
+                lost_stamp: Stamp { seq: 2, by: me },
+            },
+        );
+        let items = world.of(Kind::SettingOverwritten);
+        assert_eq!(items.len(), 3, "{items:?}");
+        let fleet = items.iter().find(|i| i.id.ends_with(":factory")).unwrap();
+        assert!(
+            fleet.what.contains(
+                "edited the factory settings: kept claims paused, 3 runs, 2 gates, a pass \
+                 every 30 s, feedback every 600 s, opus at high effort; replaced 3 runs, 2 \
+                 gates, a pass every 30 s, feedback every 600 s, opus at high effort"
+            ),
+            "{}",
+            fleet.what
+        );
+        let one = items
+            .iter()
+            .find(|i| i.id.ends_with(&format!("factory:{}", project.id)))
+            .unwrap();
+        assert!(
+            one.what.contains(
+                "edited the factory of the project foundry: kept on as rawphp; replaced off, \
+                 claims paused"
+            ),
+            "{}",
+            one.what
+        );
+        let unknown = items
+            .iter()
+            .find(|i| i.id.ends_with(&format!("factory:{gone}")))
+            .unwrap();
+        assert!(
+            unknown
+                .what
+                .contains("edited the factory of a project: kept removed; replaced off"),
+            "{}",
+            unknown.what
+        );
+    }
+
+    #[test]
     fn a_dismissed_setting_clears_setting_overwritten() {
         let mut world = World::new();
         let (key, _) = overwrite_project(&mut world);
@@ -1195,6 +1311,7 @@ mod tests {
                 protocol: PROTOCOL,
                 machine: peer,
                 versions: BTreeMap::new(),
+                factory_versions: BTreeMap::new(),
             };
             let nothing = PeerMessage::Records {
                 protocol: PROTOCOL,
@@ -1232,6 +1349,7 @@ mod tests {
                 protocol: PROTOCOL,
                 machine: peer,
                 versions: BTreeMap::new(),
+                factory_versions: BTreeMap::new(),
             };
             let nothing = PeerMessage::Records {
                 protocol: PROTOCOL,
