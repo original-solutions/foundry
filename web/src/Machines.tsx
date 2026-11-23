@@ -54,12 +54,19 @@ export function Machines({ machines, history, here, connected }: Props) {
   const sorted = [...ranked, ...machines.filter((m) => m.rank === undefined)];
   const order = ranked.map((m) => m.id);
   // One move at a time; the board reorders when the new settings arrive.
+  // The order last posted and accepted, with the order the board showed then: the moves wait
+  // until the board shows another order, so a second move is never computed from the old one.
+  // Any change of the board's order ends the wait, whatever it is.
+  const [posted, setPosted] = useState<{ from: string }>();
+  const shown = order.join(",");
   const move = useMutation({
     mutationFn: async (next: string[]) => {
       const { status, json } = await post("/api/machines/priority", { order: next });
       if (status !== 204) throw refused(status, json);
+      setPosted({ from: shown });
     },
   });
+  const waiting = move.isPending || posted?.from === shown;
   return (
     <section aria-label="Machines" className="flex flex-col gap-6">
       {!connected && (
@@ -81,7 +88,7 @@ export function Machines({ machines, history, here, connected }: Props) {
             key={machine.id}
             machine={machine}
             order={order}
-            moving={move.isPending}
+            moving={waiting}
             onMove={(next) => move.mutate(next)}
             points={history[machine.id]?.points ?? []}
             heard={history[machine.id]?.heard}
