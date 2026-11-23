@@ -5,6 +5,7 @@
 
 use ring::digest;
 
+use crate::secrets::redact;
 use crate::sessions::brief::HIDDEN;
 
 /// The shortest run of letters, digits, `-` and `_` [`for_comment`] hides when it mixes letters
@@ -75,10 +76,10 @@ fn url_len(text: &str) -> usize {
     scheme.len() + rest.find(|c| !in_url(c)).unwrap_or(rest.len())
 }
 
-fn push_word(out: &mut String, word: &str) {
+fn push_word(out: &mut String, word: &str, keep: fn(&str) -> bool) {
     let letters = word.bytes().any(|b| b.is_ascii_alphabetic());
     let digits = word.bytes().any(|b| b.is_ascii_digit());
-    if word.len() >= TOKEN_LENGTH && letters && digits {
+    if word.len() >= TOKEN_LENGTH && letters && digits && !keep(word) {
         out.push_str(HIDDEN);
     } else {
         out.push_str(word);
@@ -86,58 +87,78 @@ fn push_word(out: &mut String, word: &str) {
 }
 
 /// `text` with every run of letters, digits, `-` and `_` that is at least 24 long and mixes
-/// letters and digits hidden, and everything else as it is.
-fn push_hidden(out: &mut String, text: &str) {
+/// letters and digits hidden, unless `keep` takes it, and everything else as it is.
+fn push_words(out: &mut String, text: &str, keep: fn(&str) -> bool) {
     let mut word_start: Option<usize> = None;
     for (at, c) in text.char_indices() {
         if is_word(c) {
             word_start.get_or_insert(at);
         } else {
             if let Some(start) = word_start.take() {
-                push_word(out, &text[start..at]);
+                push_word(out, &text[start..at], keep);
             }
             out.push(c);
         }
     }
     if let Some(start) = word_start {
-        push_word(out, &text[start..]);
+        push_word(out, &text[start..], keep);
     }
 }
 
-/// A URL as a comment may show it. Only the path and fragment of a `github.com` URL are kept
-/// whole: its pull request, commit and blob links hold long ids. Its userinfo is hidden as
-/// [`redact`](crate::secrets::redact) hides it. Its host, its query and every other host's path
-/// go through the word rule like the rest of the text, since a webhook, a signed link or an
-/// `?access_token=` carries its secret there.
+fn push_hidden(out: &mut String, text: &str) {
+    push_words(out, text, |_| false);
+}
+
+/// The longest word [`github_id`] looks at: longer than any id a GitHub link holds.
+const GITHUB_ID_LONGEST: usize = 128;
+
+/// Whether `word` is an id a GitHub link holds: a commit id or a number, after an optional name
+/// such as `diff-`, `issuecomment-` or `discussion_r`, and before an optional line such as `R12`.
+fn github_id(word: &str) -> bool {
+    if word.len() > GITHUB_ID_LONGEST {
+        return false;
+    }
+    let is_id = |id: &str| {
+        let line = id
+            .rfind(['L', 'R'])
+            .filter(|&at| at + 1 < id.len() && id[at + 1..].bytes().all(|b| b.is_ascii_digit()));
+        let id = line.map_or(id, |at| &id[..at]);
+        is_commit_id(id) || (!id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+    };
+    let name = word
+        .find(|c: char| !(c.is_ascii_alphabetic() || c == '-' || c == '_'))
+        .unwrap_or(word.len());
+    (0..=name).any(|at| is_id(&word[at..]))
+}
+
+/// A URL, its userinfo already hidden by [`redact`](crate::secrets::redact), as a comment may
+/// show it. Every part goes through the word rule like the rest of the text, since a webhook,
+/// a signed link or an `?access_token=` carries its secret there. Only on `github.com` are the
+/// ids its pull request, commit, blob and review links hold kept whole.
 fn push_url(out: &mut String, url: &str) {
     let scheme = url.find("://").map_or(0, |at| at + 3);
     out.push_str(&url[..scheme]);
     let rest = &url[scheme..];
     let (authority, rest) = rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
-    let host = match authority.rfind('@') {
-        Some(at) => {
-            out.push_str("***@");
-            &authority[at + 1..]
-        }
-        None => authority,
-    };
+    let host = authority.rfind('@').map_or(0, |at| at + 1);
+    let (userinfo, host) = authority.split_at(host);
+    push_hidden(out, userinfo);
     push_hidden(out, host);
-    if !host.eq_ignore_ascii_case("github.com") {
+    if host.eq_ignore_ascii_case("github.com") {
+        push_words(out, rest, github_id);
+    } else {
         push_hidden(out, rest);
-        return;
     }
-    let (path, rest) = rest.split_at(rest.find(['?', '#']).unwrap_or(rest.len()));
-    out.push_str(path);
-    let (query, fragment) = rest.split_at(rest.find('#').unwrap_or(rest.len()));
-    push_hidden(out, query);
-    out.push_str(fragment);
 }
 
 /// `text` as a comment the factory posts on GitHub may show it: every run of letters, digits,
 /// `-` and `_` that is at least 24 long and mixes letters and digits is hidden, as P1 hides
-/// them, except inside the path or fragment of an `http://` or `https://` URL on `github.com`,
-/// which is kept whole. Keys, tokens, commit ids and hashes look like that; words, paths and
-/// pull request URLs do not. A URL ends at the first character no URL holds, and at `,` and `;`.
+/// them. Keys, tokens, commit ids and hashes look like that; words and paths do not. Inside an
+/// `http://` or `https://` URL the same holds, except that a `github.com` URL keeps the commit
+/// ids and numbered anchors its links hold, so a pull request, commit, blob or review link
+/// comes through whole, and the URL's userinfo is hidden as
+/// [`redact`](crate::secrets::redact) hides it. A URL ends at the first character no URL holds,
+/// and at `,` and `;`.
 ///
 /// The caller hides the secrets it knows (held tokens, gateway keys, URL passwords) before
 /// this, and adds the factory's own markers, such as `<!-- foundry:claim <run id> <machine> -->`,
@@ -150,7 +171,7 @@ pub fn for_comment(text: &str) -> String {
         let url = url_len(&text[at..]);
         if url > 0 {
             push_hidden(&mut out, &text[plain..at]);
-            push_url(&mut out, &text[at..at + url]);
+            push_url(&mut out, &redact(&text[at..at + url]));
             at += url;
             plain = at;
         } else {
