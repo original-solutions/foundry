@@ -596,6 +596,16 @@ mod tests {
             for_comment(&compare),
             format!("https://github.com/o/r/compare/•••...{sha}")
         );
+        let head = format!("https://github.com/o/r/compare/{sha}...{KEY}");
+        assert_eq!(
+            for_comment(&head),
+            format!("https://github.com/o/r/compare/{sha}...•••")
+        );
+        let two_dot = format!("https://github.com/o/r/compare/main..{KEY}");
+        assert_eq!(
+            for_comment(&two_dot),
+            "https://github.com/o/r/compare/main..•••"
+        );
     }
 
     #[test]
