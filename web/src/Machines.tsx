@@ -54,11 +54,13 @@ export function Machines({ machines, history, here, connected }: Props) {
   const sorted = [...ranked, ...machines.filter((m) => m.rank === undefined)];
   const order = ranked.map((m) => m.id);
   // One move at a time; the board reorders when the new settings arrive.
-  // The order last posted and accepted, with the order the board showed then: the moves wait
-  // until the board shows another order, so a second move is never computed from the old one.
-  // Any change of the board's order ends the wait, whatever it is.
+  // The order the board showed when a move was accepted: the moves wait until the board shows
+  // another order, so a second move is never computed from the old one. The wait ends the first
+  // time the shown order differs, and is forgotten then, so the old order coming back later
+  // (moved elsewhere) does not start it again.
   const [posted, setPosted] = useState<{ from: string }>();
   const shown = order.join(",");
+  if (posted !== undefined && posted.from !== shown) setPosted(undefined);
   const move = useMutation({
     mutationFn: async (next: string[]) => {
       const { status, json } = await post("/api/machines/priority", { order: next });
