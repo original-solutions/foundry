@@ -429,6 +429,65 @@ describe("Machines", () => {
     });
   });
 
+  describe("the coordinator order", () => {
+    const three = settings({
+      machines: [
+        { id: ME, name: "studio", address: "" },
+        { id: OTHER, name: "laptop", address: "" },
+      ],
+      priority: [OTHER, ME],
+    });
+    const order = (given = three, online?: string[]) => renderApp(<Machines machines={fleet(records, given, {}, online)} history={{}} here={ME} connected />);
+    const names = () => screen.getAllByRole("article").map((a) => a.getAttribute("aria-label"));
+
+    it("lists machines in priority order, listed ones before the rest", async () => {
+      await order();
+
+      expect(names()).toEqual(["laptop", "studio"]);
+    });
+
+    it("marks the machine that holds the coordinator role", async () => {
+      await order(three, [ME, OTHER]);
+
+      expect(within(card("laptop")).getByText("Coordinator")).toBeDefined();
+      expect(within(card("studio")).queryByText("Coordinator")).toBeNull();
+      expect(within(card("laptop")).getByText("Coordinator order 1 of 2")).toBeDefined();
+      expect(within(card("studio")).getByText("Coordinator order 2 of 2")).toBeDefined();
+    });
+
+    it("posts the whole new order when a machine moves", async () => {
+      const calls = mockFetch(new Response(null, { status: 204 }));
+      await order();
+
+      fireEvent.click(within(card("laptop")).getByRole("button", { name: "Move laptop down in the coordinator order" }));
+
+      await waitFor(() => expect(calls).toEqual([{ url: "/api/machines/priority", method: "POST", body: { order: [ME, OTHER] } }]));
+    });
+
+    it("disables the top machine's up and the bottom machine's down", async () => {
+      await order();
+
+      expect((within(card("laptop")).getByRole("button", { name: "Move laptop up in the coordinator order" }) as HTMLButtonElement).disabled).toBe(true);
+      expect((within(card("studio")).getByRole("button", { name: "Move studio down in the coordinator order" }) as HTMLButtonElement).disabled).toBe(true);
+      expect((within(card("studio")).getByRole("button", { name: "Move studio up in the coordinator order" }) as HTMLButtonElement).disabled).toBe(false);
+    });
+
+    it("shows a refusal's error in an alert", async () => {
+      mockFetch(json(422, { error: "no machine \"x\" in the machine list" }));
+      await order();
+
+      fireEvent.click(within(card("studio")).getByRole("button", { name: "Move studio up in the coordinator order" }));
+
+      expect((await screen.findByRole("alert")).textContent).toBe('no machine "x" in the machine list');
+    });
+
+    it("offers no move when fewer than two machines are listed", async () => {
+      await order(settings({ machines: [{ id: ME, name: "studio", address: "" }], priority: [ME] }));
+
+      expect(screen.queryByRole("button", { name: /in the coordinator order/ })).toBeNull();
+    });
+  });
+
   describe("adding a machine", () => {
     const added = { code: "K7QX3M9PRT", command: "foundryd join 100.101.102.103 K7QX3M9PRT", expires_in_secs: 600 };
     const nameField = () => screen.getByRole<HTMLInputElement>("textbox", { name: "Name" });
