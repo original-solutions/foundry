@@ -28,6 +28,7 @@ import { Toasts } from "./Toasts";
 import { Rail } from "./Rail";
 import { loadRail, saveRail } from "./collapsed";
 import { useMemory } from "./memory";
+import { MD, useMediaQuery } from "./media";
 import { AttentionList } from "./attention/AttentionList";
 import { WaitingList } from "./placement/WaitingList";
 
@@ -445,23 +446,12 @@ function Layout() {
   );
 }
 
-const WIDE = "(min-width: 768px)";
-
 /**
  * Whether the screen is narrow, following it as it changes. A browser with no `matchMedia` counts
  * as wide.
  */
 function useNarrow(): boolean {
-  const [narrow, setNarrow] = useState(() => typeof matchMedia === "function" && !matchMedia(WIDE).matches);
-  useLayoutEffect(() => {
-    if (typeof matchMedia !== "function") return;
-    const media = matchMedia(WIDE);
-    const change = () => setNarrow(!media.matches);
-    change();
-    media.addEventListener?.("change", change);
-    return () => media.removeEventListener?.("change", change);
-  }, []);
-  return narrow;
+  return !useMediaQuery(MD, true);
 }
 
 const rootRoute = createRootRoute({ component: Layout });

@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { useEffect, useLayoutEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import { machineQuery, sessionTrail } from "./api";
 import { useLeaving } from "./Archive";
 import { changesQuery } from "./ChangesPanel";
@@ -8,6 +8,7 @@ import { locate, rows, type MachineView, type WorkspaceView } from "./fleet";
 import type { Destination } from "./jump";
 import { addsSteps, words, type Glyph } from "./labels";
 import { topFiles } from "./lanes";
+import { MD, useMediaQuery } from "./media";
 import { Now } from "./Now";
 import { BOARD_BUSY_EVERY, pollEvery } from "./poll";
 import { glyphText, StateGlyph } from "./StateGlyph";
@@ -21,16 +22,7 @@ export const PEEK_REST = 180;
 
 /** Whether the screen is wide enough for the palette's preview beside its list. */
 export function useWide(): boolean {
-  const query = "(min-width: 768px)";
-  const [wide, setWide] = useState(() => typeof matchMedia === "function" && matchMedia(query).matches);
-  useLayoutEffect(() => {
-    if (typeof matchMedia !== "function") return;
-    const media = matchMedia(query);
-    const change = () => setWide(media.matches);
-    media.addEventListener?.("change", change);
-    return () => media.removeEventListener?.("change", change);
-  }, []);
-  return wide;
+  return useMediaQuery(MD, false);
 }
 
 /** `key`, once it has stayed the same for `ms`; so arrowing through a list reads only where it stops. */
