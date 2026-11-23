@@ -1,8 +1,10 @@
-//! Factory records and run ids.
+//! Factory records, factory settings and run ids.
 //!
 //! Factory records are kept and synced apart from P1's records, on a version per owner of their
 //! own, and only on links whose two ends speak protocol 5. Each is written only by its owner,
-//! and none is ever deleted. The factory settings are in [`crate::settings`].
+//! and none is ever deleted. The factory settings are shared settings of their own, under the
+//! keys [`SettingKey::Factory`](crate::settings::SettingKey::Factory) and
+//! [`SettingKey::ProjectFactory`](crate::settings::SettingKey::ProjectFactory).
 
 use std::fmt;
 use std::str::FromStr;
@@ -204,7 +206,9 @@ impl FactoryRecord {
 }
 
 /// One step of a run. `ts`, `ms`, `event`, `data` and `cause` are a line of the runner's ledger,
-/// unchanged, so the line is this written without `run` and `generation`. A run's events are
+/// unchanged: written without `run` and `generation`, this has the line's keys and values. Keys
+/// inside `data` and `cause` are written in sorted order, which the runner's reader does not
+/// depend on. A run's events are
 /// ordered by `generation`, then by the writer's factory version; never by `ts` or `ms`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RunEvent {
@@ -343,6 +347,85 @@ pub struct SessionTurn {
     pub prompts: u64,
     /// Whether a question waits.
     pub question: bool,
+}
+
+/// The fleet's factory settings. A field left out reads as its default.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FactorySettings {
+    /// Claims are paused for every project.
+    pub paused: bool,
+    /// How often a pass runs: from [`POLL_SECONDS_MIN`] to [`POLL_SECONDS_MAX`]. Nothing else
+    /// parses, and nothing else is written.
+    #[serde(
+        serialize_with = "write_poll_seconds",
+        deserialize_with = "read_poll_seconds"
+    )]
+    pub poll_seconds: u32,
+    /// How often a run in `pr-open` reads new feedback.
+    pub feedback_seconds: u64,
+    /// Runs that hold a slot at once.
+    pub max_runs: u32,
+    /// Gates that run at once.
+    pub max_gates: u32,
+    /// The model a factory session starts with.
+    pub model: String,
+    /// The effort a factory session starts with.
+    pub effort: String,
+}
+
+/// The shortest `poll_seconds`.
+pub const POLL_SECONDS_MIN: u32 = 10;
+/// The longest `poll_seconds`.
+pub const POLL_SECONDS_MAX: u32 = 60;
+
+fn poll_seconds_refused(seconds: impl fmt::Display) -> String {
+    format!("poll_seconds is {seconds}: it must be from {POLL_SECONDS_MIN} to {POLL_SECONDS_MAX}")
+}
+
+/// Refuses to write a `poll_seconds` that would not read back: the receiver would refuse the
+/// whole settings copy, as [`crate::serialize_finite`] says of a non-finite number.
+fn write_poll_seconds<S: Serializer>(seconds: &u32, s: S) -> Result<S::Ok, S::Error> {
+    if (POLL_SECONDS_MIN..=POLL_SECONDS_MAX).contains(seconds) {
+        s.serialize_u32(*seconds)
+    } else {
+        Err(serde::ser::Error::custom(poll_seconds_refused(seconds)))
+    }
+}
+
+fn read_poll_seconds<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    let seconds = u64::deserialize(d)?;
+    u32::try_from(seconds)
+        .ok()
+        .filter(|s| (POLL_SECONDS_MIN..=POLL_SECONDS_MAX).contains(s))
+        .ok_or_else(|| serde::de::Error::custom(poll_seconds_refused(seconds)))
+}
+
+impl Default for FactorySettings {
+    fn default() -> Self {
+        Self {
+            paused: false,
+            poll_seconds: 30,
+            feedback_seconds: 600,
+            max_runs: 3,
+            max_gates: 2,
+            model: "opus".into(),
+            effort: "high".into(),
+        }
+    }
+}
+
+/// One project's factory setting. A field left out reads as its default: off, no login, not
+/// paused.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProjectFactory {
+    /// The factory watches the project.
+    pub on: bool,
+    /// The GitHub login the project acts as, written when the factory is turned on.
+    pub login: String,
+    /// Claims are paused for this project.
+    pub paused: bool,
 }
 
 #[cfg(test)]
@@ -564,8 +647,9 @@ pub(crate) mod tests {
 
     // Factory records.
 
-    /// Lines of the runner's `src/ledger/ledger.test.ts` at 8ed9bef: one with a cause, one
-    /// without, and one whose data holds a nested object, a null and a negative number.
+    /// Two lines of the runner's `src/ledger/ledger.test.ts` at 8ed9bef, one with a cause and one
+    /// without, and a third made for this test from its `gate_command` data, with a null and a
+    /// negative number added.
     const LEDGER_LINES: [&str; 3] = [
         r#"{"ts":"2026-10-04T10:13:16.123Z","ms":1791108796123,"event":"step_changed","data":{"step":"red"},"cause":{"step":"pass","reason":"claimed"}}"#,
         r#"{"ts":"2026-10-04T10:13:16.123Z","ms":1791108796123,"event":"step_changed","data":{"step":"red"}}"#,

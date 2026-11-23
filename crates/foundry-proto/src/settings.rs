@@ -12,6 +12,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::factory::{FactorySettings, ProjectFactory};
 use crate::ids::{MachineId, ProjectId};
 
 /// Settings every machine shares, changed only through the acting coordinator.
@@ -400,72 +401,6 @@ pub struct Limits {
     pub max_load_per_core: f64,
     /// Bytes.
     pub min_free_disk: u64,
-}
-
-/// The fleet's factory settings. A field left out reads as its default.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct FactorySettings {
-    /// Claims are paused for every project.
-    pub paused: bool,
-    /// How often a pass runs: from [`POLL_SECONDS_MIN`] to [`POLL_SECONDS_MAX`], and nothing
-    /// else parses.
-    #[serde(deserialize_with = "poll_seconds")]
-    pub poll_seconds: u32,
-    /// How often a run in `pr-open` reads new feedback.
-    pub feedback_seconds: u64,
-    /// Runs that hold a slot at once.
-    pub max_runs: u32,
-    /// Gates that run at once.
-    pub max_gates: u32,
-    /// The model a factory session starts with.
-    pub model: String,
-    /// The effort a factory session starts with.
-    pub effort: String,
-}
-
-/// The shortest `poll_seconds`.
-pub const POLL_SECONDS_MIN: u32 = 10;
-/// The longest `poll_seconds`.
-pub const POLL_SECONDS_MAX: u32 = 60;
-
-fn poll_seconds<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
-    let seconds = u64::deserialize(d)?;
-    u32::try_from(seconds)
-        .ok()
-        .filter(|s| (POLL_SECONDS_MIN..=POLL_SECONDS_MAX).contains(s))
-        .ok_or_else(|| {
-            serde::de::Error::custom(format!(
-                "poll_seconds is {seconds}: it must be from {POLL_SECONDS_MIN} to {POLL_SECONDS_MAX}"
-            ))
-        })
-}
-
-impl Default for FactorySettings {
-    fn default() -> Self {
-        Self {
-            paused: false,
-            poll_seconds: 30,
-            feedback_seconds: 600,
-            max_runs: 3,
-            max_gates: 2,
-            model: "opus".into(),
-            effort: "high".into(),
-        }
-    }
-}
-
-/// One project's factory setting. A field left out reads as its default: off, no login, not
-/// paused.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ProjectFactory {
-    /// The factory watches the project.
-    pub on: bool,
-    /// The GitHub login the project acts as, written when the factory is turned on.
-    pub login: String,
-    /// Claims are paused for this project.
-    pub paused: bool,
 }
 
 #[cfg(test)]
