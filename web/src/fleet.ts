@@ -6,6 +6,8 @@ export interface FleetState {
   settings: SharedSettings;
   /** True once a full state has arrived, so a missing record means it is not there. */
   synced: boolean;
+  /** Every machine the daemon serving the page hears, itself included, when its state carries it. */
+  online?: string[];
 }
 
 export const emptyState: FleetState = {
@@ -21,7 +23,7 @@ const key = (record: AnyRecord) => (record.kind === "machine_sample" ? `sample:$
 export function apply(state: FleetState, message: UiMessage): FleetState {
   switch (message.type) {
     case "state":
-      return { records: message.records, settings: message.settings, synced: true };
+      return { records: message.records, settings: message.settings, synced: true, online: message.online };
     case "settings":
       return { ...state, settings: message.settings };
     case "record": {
@@ -93,13 +95,15 @@ export interface MachineView {
 
 /**
  * The model the sidebar, the board and the machines board share. Machine rules follow `foundryd
- * status`. `briefs` name sessions by what they were asked. Once the machine list holds a machine,
- * a machine it does not hold (a removed one) has no workspaces, so none of its workspaces,
- * terminals or sessions show anywhere; its card stays, named by id with its last sample. Its
- * records stay in the state. While the list is empty (a lone machine that has not listed itself
- * yet) nothing is hidden.
+ * status`. `briefs` name sessions by what they were asked. With `online`, the machines the daemon
+ * hears, a machine is online when the set holds it and offline when not, whatever its records say.
+ * Without it, a machine is offline when one of its records is unreachable, online when one is not,
+ * else unknown. Once the machine list holds a machine, a machine it does not hold (a removed one)
+ * has no workspaces, so none of its workspaces, terminals or sessions show anywhere; its card
+ * stays, named by id with its last sample. Its records stay in the state. While the list is empty
+ * (a lone machine that has not listed itself yet) nothing is hidden.
  */
-export function fleet(records: AnyRecord[], settings: SharedSettings, briefs: Briefs = {}): MachineView[] {
+export function fleet(records: AnyRecord[], settings: SharedSettings, briefs: Briefs = {}, online?: string[]): MachineView[] {
   const machineNames = new Map<string, string>();
   const machineAddresses = new Map<string, string>();
   const listed: string[] = [];
@@ -205,7 +209,7 @@ export function fleet(records: AnyRecord[], settings: SharedSettings, briefs: Br
     listed: machineNames.has(id),
     address: machineAddresses.get(id),
     limits: settings.limits[id],
-    status: statusByOwner.get(id) ?? "unknown",
+    status: online ? (online.includes(id) ? "online" : "offline") : (statusByOwner.get(id) ?? "unknown"),
     sample: samplesByOwner.get(id)?.body ?? null,
     workspaces: (settings.machines.length > 0 && !machineNames.has(id) ? [] : (workspacesByOwner.get(id) ?? [])).map((w) => {
       const mine = byOpening(sessionsByWorkspace.get(w.id) ?? [], (s) => s.terminal);

@@ -92,8 +92,8 @@ export function Board({
   /** The fleet's projects, which a new task is started in. */
   projects: Project[];
   onJump: () => void;
-  /** Called with the session a new task started, so the layout lands in it. */
-  onCreated: (session: string) => void;
+  /** Called with the session a new task started, so the layout lands in it, and the daemon's warning about its create, if any. */
+  onCreated: (session: string, warning: string | null) => void;
   onChanges: (workspace: string) => void;
   /** Opens a terminal with its steps column. */
   onSteps: (terminal: string) => void;
@@ -153,7 +153,7 @@ export function Board({
               <StateGlyph glyph={needs ? "waiting" : "ready"} still />
               {glance(board)}
             </p>
-            <Composer mode="bar" id="board-task" projects={projects} workspaces={workspaces} launch={launch} onCreated={(session) => onCreated(session)} onJump={onJump} doneLabel="Clear" />
+            <Composer mode="bar" id="board-task" projects={projects} workspaces={workspaces} launch={launch} onCreated={(session, warning) => onCreated(session, warning)} onJump={onJump} doneLabel="Clear" />
             <div className="hidden items-center gap-3 px-1 md:flex">
               <p className="min-w-0 flex-1 text-xs text-neutral-500">{counts}</p>
               <ViewSwitch view={view} onPick={pick} />

@@ -529,6 +529,7 @@ async fn full_state_for(
         protocol: PROTOCOL,
         records,
         settings: shown(settings),
+        online: Some(online.iter().copied().collect()),
     };
     Ok((state, versions))
 }

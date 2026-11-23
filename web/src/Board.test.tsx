@@ -537,7 +537,7 @@ describe("The task bar", () => {
     fireEvent.change(bar(), { target: { value: "Add a footer.\nKeep it small." } });
     fireEvent.keyDown(bar(), { key: "Enter", metaKey: true });
 
-    await waitFor(() => expect(created).toHaveBeenCalledWith("s9"));
+    await waitFor(() => expect(created).toHaveBeenCalledWith("s9", null));
     expect(posts).toEqual([
       { url: "/api/workspaces", body: { project: "p1", base: "main", name: "add a footer" } },
       { url: "/api/workspaces/w9/sessions", body: { model: "opus", prompt: "Add a footer.\nKeep it small." } },

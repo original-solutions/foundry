@@ -72,12 +72,18 @@ pub fn shell_quote(text: &str) -> String {
 /// neither the user's curl settings nor a proxy variable in the session's environment can send
 /// the token anywhere but this daemon.
 ///
+/// A post refused because nothing listens, as while the daemon restarts, is sent again each
+/// second, up to [`HOOK_RETRIES`] times, so a short restart loses no hook; while the daemon
+/// stays down each hook holds the agent up for that long. Only a refusal is sent again (curl's
+/// exit 7): a daemon that answered, even with an error, has seen the hook, so it goes once.
+///
 /// The command's stdout goes to /dev/null, because Claude Code adds the stdout of some hooks
-/// to the model's context. It ends in `|| true`, because a hook that exits 2 blocks the tool
-/// call, and posting must never block the agent.
+/// to the model's context. It ends in `true`, because a hook that exits 2 blocks the tool
+/// call, and a post that fails must never stop the agent.
 pub fn settings_json(curl_config: &Path) -> Value {
     let command = format!(
-        "curl -q -sS -m 5 -K {} -X POST --data-binary @- >/dev/null 2>&1 || true",
+        "p=$(cat); n=0; while printf '%s' \"$p\" | curl -q -sS -m 5 -K {} -X POST --data-binary @- \
+         >/dev/null 2>&1; [ $? -eq 7 ] && [ $n -lt {HOOK_RETRIES} ]; do n=$((n+1)); sleep 1; done; true",
         shell_quote(&curl_config.to_string_lossy())
     );
     let hooks: Map<String, Value> = EVENTS
@@ -140,6 +146,35 @@ pub fn write_curl_config(path: &Path, url: &str, token: &str) -> Result<(), Sess
          noproxy = \"*\"\n"
     );
     write_new_private(path, config.as_bytes())
+}
+
+/// How many times a hook is sent again, a second apart, while nothing listens.
+pub const HOOK_RETRIES: u32 = 10;
+
+/// Replaces the curl config at `path` with one [`write_curl_config`] writes for `url` and
+/// `token`. The new file is written beside it and renamed over it, so a hook reading it at
+/// that moment reads the old config or the new one, never a part.
+pub fn rewrite_curl_config(path: &Path, url: &str, token: &str) -> Result<(), SessionError> {
+    let new = path.with_extension("curl.new");
+    // One left by a write that stopped part way would refuse this one.
+    let _ = std::fs::remove_file(&new);
+    write_curl_config(&new, url, token)?;
+    std::fs::rename(&new, path).map_err(|source| SessionError::Io {
+        what: format!("{}: replace the file", path.display()),
+        source,
+    })
+}
+
+/// The bearer token in the curl config [`write_curl_config`] wrote at `path`, or `None` when
+/// the file cannot be read or holds no `Authorization: Bearer` header line.
+pub fn curl_token(path: &Path) -> Option<String> {
+    let config = std::fs::read_to_string(path).ok()?;
+    config.lines().find_map(|line| {
+        line.strip_prefix("header = \"Authorization: Bearer ")?
+            .strip_suffix('"')
+            .filter(|token| !token.is_empty())
+            .map(str::to_owned)
+    })
 }
 
 /// [`mark_trusted`] while holding `lock`, so two marks made by this process never read the file
@@ -384,7 +419,9 @@ mod tests {
     fn the_hook_command_posts_stdin_through_a_curl_config_quietly_and_never_blocks_the_agent() {
         let settings = settings_json(Path::new(CURL));
         let want = format!(
-            "curl -q -sS -m 5 -K '{CURL}' -X POST --data-binary @- >/dev/null 2>&1 || true"
+            "p=$(cat); n=0; while printf '%s' \"$p\" | curl -q -sS -m 5 -K '{CURL}' -X POST \
+             --data-binary @- >/dev/null 2>&1; [ $? -eq 7 ] && [ $n -lt 10 ]; \
+             do n=$((n+1)); sleep 1; done; true"
         );
         for event in ["SessionStart", "PreToolUse", "SessionEnd"] {
             assert_eq!(command(&settings, event), want);
@@ -475,6 +512,64 @@ mod tests {
         request
     }
 
+    /// Runs a session's hook command through `sh` against a listener on loopback that answers
+    /// every request with `status`, and gives how many requests reached it.
+    fn hook_posts_answered_with(status: &str) -> usize {
+        use std::io::{Read as _, Write as _};
+        let dir = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let curl = dir.path().join("sessions").join("s.curl");
+        let url = format!("http://127.0.0.1:{port}/hooks/67e55044-10b1-426f-9247-bb680e5fe0c8");
+        write_curl_config(&curl, &url, TOKEN).unwrap();
+        let answer = format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut posts, end) = (
+                0,
+                std::time::Instant::now() + std::time::Duration::from_secs(4),
+            );
+            while std::time::Instant::now() < end {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        let mut seen = Vec::new();
+                        let mut chunk = [0u8; 4096];
+                        while !String::from_utf8_lossy(&seen).contains(r#""Stop"}"#) {
+                            let n = stream.read(&mut chunk).unwrap();
+                            assert!(n > 0, "the request ended early");
+                            seen.extend_from_slice(&chunk[..n]);
+                        }
+                        stream.write_all(answer.as_bytes()).unwrap();
+                        posts += 1;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("accept: {e}"),
+                }
+            }
+            posts
+        });
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(command(&settings_json(&curl), "Stop"))
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(br#"{"hook_event_name":"Stop"}"#).unwrap();
+        drop(stdin);
+        assert!(child.wait().unwrap().success(), "the hook command fails");
+        server.join().unwrap()
+    }
+
+    #[test]
+    fn a_hook_the_daemon_answers_with_a_server_error_is_posted_once() {
+        assert_eq!(hook_posts_answered_with("500 Internal Server Error"), 1);
+        assert_eq!(hook_posts_answered_with("503 Service Unavailable"), 1);
+    }
+
     #[test]
     fn the_hook_command_reads_no_curlrc_and_uses_no_proxy() {
         let request = hook_request_with_a_curlrc_and_proxies_set()
@@ -534,6 +629,45 @@ mod tests {
             write_curl_config(&path, URL, TOKEN).is_err(),
             "a second write"
         );
+    }
+
+    #[test]
+    fn a_rewritten_curl_config_holds_the_new_url_and_stays_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions").join("s.curl");
+        write_curl_config(&path, "http://127.0.0.1:1/hooks/old", TOKEN).unwrap();
+        std::fs::write(path.with_extension("curl.new"), "left part way").unwrap();
+
+        rewrite_curl_config(&path, URL, TOKEN).unwrap();
+
+        let fresh = dir.path().join("fresh.curl");
+        write_curl_config(&fresh, URL, TOKEN).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            std::fs::read_to_string(&fresh).unwrap()
+        );
+        assert_eq!(mode(&path), 0o600);
+        assert!(!path.with_extension("curl.new").exists());
+    }
+
+    #[test]
+    fn the_token_is_read_back_from_the_curl_config_and_is_none_with_no_bearer_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions").join("s.curl");
+        write_curl_config(&path, URL, TOKEN).unwrap();
+        assert_eq!(curl_token(&path).as_deref(), Some(TOKEN));
+
+        let bare = dir.path().join("bare.curl");
+        std::fs::write(
+            &bare,
+            format!("header = \"Content-Type: application/json\"\nurl = \"{URL}\"\n"),
+        )
+        .unwrap();
+        assert_eq!(curl_token(&bare), None);
+        let empty = dir.path().join("empty.curl");
+        std::fs::write(&empty, "header = \"Authorization: Bearer \"\n").unwrap();
+        assert_eq!(curl_token(&empty), None, "an empty bearer value");
+        assert_eq!(curl_token(&dir.path().join("missing.curl")), None);
     }
 
     #[test]

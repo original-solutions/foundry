@@ -2,10 +2,10 @@
 //! short name, and anyone can rename a listed machine from the UI. Both go through the acting
 //! coordinator, as every shared-settings change does.
 //!
-//! - [`Listing`] keeps this machine in the list. Fed what [`entry`] reads from
-//!   `tailscale status --self --json`, it adds the machine with its public key when the list
-//!   does not hold it, moves its address when that changed, puts its key back when the entry
-//!   holds none or another, and never touches a name it has seen set.
+//! - [`Listing`] keeps this machine in the list. Fed what [`entry`](crate::tailscale::entry)
+//!   reads from `tailscale status --self --json`, it adds the machine with its public key when
+//!   the list does not hold it, moves its address when that changed, puts its key back when the
+//!   entry holds none or another, and never touches a name it has seen set.
 //! - `POST /api/machines/{id}/rename` `{name}`: sets a listed machine's name, trimmed, and
 //!   keeps its address, `204`. A name that is blank, over [`NAME_AT_MOST`] characters or holds
 //!   a control character is `422`; a name another machine has, compared trimmed and in any
@@ -25,7 +25,6 @@
 //! have linked again. The default name is not checked as a rename is: a default another machine already
 //! has, or one over [`NAME_AT_MOST`] characters, is listed as it is, and a rename sets it right.
 
-use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -43,6 +42,7 @@ use tokio::time::Instant;
 use super::{ApiError, Body, edit_status, on_store, parse_id, unprocessable};
 use crate::coordinator::{Coordinator, CoordinatorError};
 use crate::store::Store;
+use crate::tailscale::Entry;
 
 /// The most characters a machine's name holds.
 pub const NAME_AT_MOST: usize = 60;
@@ -51,55 +51,6 @@ pub const NAME_AT_MOST: usize = 60;
 /// still holds none. A machine from before keys were listed drops the key from an edit it
 /// numbers, so while one acts, a key sent at once each look would go round forever.
 pub const KEY_AGAIN_AFTER: Duration = Duration::from_secs(10 * 60);
-
-/// What Tailscale says this machine is called and where it is.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Entry {
-    /// Its default name: the first label of its MagicDNS name.
-    pub name: String,
-    /// Its Tailscale IPv4 address.
-    pub address: String,
-}
-
-/// Reads `tailscale status --self --json`: the first label of `Self.DNSName` as the name
-/// (`personal-mac.tail459612.ts.net.` gives `personal-mac`), else `host`, and the first IPv4
-/// in `Self.TailscaleIPs` as the address.
-/// `Self.HostName` is a display name with spaces, so it is not used.
-pub fn entry(status: &[u8], host: Option<&str>) -> Result<Entry, String> {
-    #[derive(Deserialize)]
-    struct Status {
-        #[serde(rename = "Self")]
-        me: Node,
-    }
-    #[derive(Deserialize)]
-    struct Node {
-        #[serde(rename = "DNSName", default)]
-        dns_name: String,
-        #[serde(rename = "TailscaleIPs", default)]
-        ips: Vec<String>,
-    }
-    let status: Status = serde_json::from_slice(status).map_err(|e| {
-        format!("`tailscale status --self --json` did not say what this machine is: {e}")
-    })?;
-    let name = status
-        .me
-        .dns_name
-        .split('.')
-        .next()
-        .filter(|label| !label.is_empty())
-        .or(host.filter(|host| !host.is_empty()))
-        .ok_or("Tailscale gives this machine no DNS name and it has no host name")?;
-    let address = status
-        .me
-        .ips
-        .iter()
-        .find(|ip| ip.parse::<Ipv4Addr>().is_ok())
-        .ok_or("Tailscale reports no IPv4 address for this machine")?;
-    Ok(Entry {
-        name: name.to_owned(),
-        address: address.clone(),
-    })
-}
 
 /// Keeps this machine in the shared machine list, at the address Tailscale gives it.
 pub struct Listing {
@@ -325,90 +276,7 @@ mod tests {
 
     use super::*;
     use crate::sync::{Conn, Dialer, Peers};
-
-    /// `tailscale status --self --json` from a real Mac, cut to the fields read and a few
-    /// beside them.
-    const STATUS: &str = r#"{
-        "Version": "1.90.6",
-        "BackendState": "Running",
-        "Self": {
-            "ID": "n1",
-            "HostName": "Personal Mac",
-            "DNSName": "personal-mac.tail459612.ts.net.",
-            "OS": "macOS",
-            "TailscaleIPs": ["100.91.54.18", "fd7a:115c:a1e0::e832:3612"],
-            "Online": true
-        },
-        "MagicDNSSuffix": "tail459612.ts.net"
-    }"#;
-
-    #[test]
-    fn the_name_is_the_first_label_of_the_dns_name_and_the_address_the_first_ipv4() {
-        assert_eq!(
-            entry(STATUS.as_bytes(), Some("personal-mac-host")),
-            Ok(Entry {
-                name: "personal-mac".into(),
-                address: "100.91.54.18".into(),
-            })
-        );
-    }
-
-    #[test]
-    fn the_ipv4_is_taken_wherever_it_sits_among_the_addresses() {
-        let status = STATUS.replace(
-            r#"["100.91.54.18", "fd7a:115c:a1e0::e832:3612"]"#,
-            r#"["fd7a:115c:a1e0::e832:3612", "100.91.54.18"]"#,
-        );
-        assert_eq!(
-            entry(status.as_bytes(), None).map(|e| e.address),
-            Ok("100.91.54.18".to_owned())
-        );
-    }
-
-    #[test]
-    fn with_no_dns_name_the_host_name_is_the_name() {
-        for blank in [r#""DNSName": "","#, ""] {
-            let status = STATUS.replace(r#""DNSName": "personal-mac.tail459612.ts.net.","#, blank);
-            assert_eq!(
-                entry(status.as_bytes(), Some("personal-mac-host")),
-                Ok(Entry {
-                    name: "personal-mac-host".into(),
-                    address: "100.91.54.18".into(),
-                }),
-                "{blank:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn with_no_dns_name_and_no_host_name_there_is_no_entry() {
-        let status = STATUS.replace(r#""DNSName": "personal-mac.tail459612.ts.net.","#, "");
-        assert!(entry(status.as_bytes(), None).is_err());
-    }
-
-    #[test]
-    fn the_name_is_the_whole_first_label_however_long() {
-        let label = "m".repeat(63);
-        let status = STATUS.replace("personal-mac.tail", &format!("{label}.tail"));
-        assert_eq!(entry(status.as_bytes(), None).map(|e| e.name), Ok(label));
-    }
-
-    #[test]
-    fn with_no_ipv4_there_is_no_entry() {
-        let status = STATUS.replace(r#""100.91.54.18", "#, "");
-        let why = entry(status.as_bytes(), Some("host")).unwrap_err();
-        assert!(why.contains("IPv4"), "{why}");
-    }
-
-    #[test]
-    fn an_answer_that_is_not_status_json_is_no_entry() {
-        for answer in ["", "Tailscale is stopped.", r#"{"Version": "1.90.6"}"#] {
-            assert!(
-                entry(answer.as_bytes(), Some("host")).is_err(),
-                "{answer:?}"
-            );
-        }
-    }
+    use crate::test_log::Logged;
 
     struct NoDial;
 
@@ -583,42 +451,6 @@ mod tests {
     fn error_of(body: &str) -> String {
         let json: Value = serde_json::from_str(body).unwrap();
         json["error"].as_str().unwrap().to_owned()
-    }
-
-    /// Everything logged while it is set, as plain text.
-    #[derive(Clone, Default)]
-    struct Logged(Arc<Mutex<Vec<u8>>>);
-
-    impl io::Write for Logged {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl Logged {
-        /// Captures this thread's log until the guard drops.
-        fn capture(&self) -> tracing::subscriber::DefaultGuard {
-            let logged = self.clone();
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(move || logged.clone())
-                .with_ansi(false)
-                .without_time()
-                .finish();
-            tracing::subscriber::set_default(subscriber)
-        }
-
-        fn warnings(&self) -> Vec<String> {
-            String::from_utf8_lossy(&self.0.lock().unwrap())
-                .lines()
-                .filter(|line| line.contains("WARN"))
-                .map(str::to_owned)
-                .collect()
-        }
     }
 
     // --- listing this machine ---
