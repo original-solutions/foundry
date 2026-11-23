@@ -680,6 +680,7 @@ describe("App", () => {
 
     const sidebar = screen.getByRole("navigation", { name: "Workspaces" });
     const group = await within(sidebar).findByRole("group", { name: "still here" });
+    fireEvent.click(within(group).getByTitle("Unfold"));
     expect(within(group).getByText("sonnet")).toBeDefined();
   });
 
