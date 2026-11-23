@@ -145,12 +145,12 @@ describe("App", () => {
     expect(screen.getByText(/no longer running/i)).toBeDefined();
   });
 
-  async function open(path: string, records: UiMessage & { type: "state" }) {
+  async function open(path: string, records: UiMessage & { type: "state" }, me: string = ME) {
     const fresh = createRouter({ routeTree, history: createMemoryHistory({ initialEntries: [path] }) });
     await fresh.load();
-    // The UI is served by machine ME.
+    // The UI is served by machine `me`, ME unless a test says otherwise.
     const client = new QueryClient();
-    client.setQueryData(machineQuery.queryKey, ME);
+    client.setQueryData(machineQuery.queryKey, me);
     render(
       <QueryClientProvider client={client}>
         <RouterProvider router={fresh} />
@@ -663,6 +663,24 @@ describe("App", () => {
     fireEvent.click(name);
     await waitFor(() => expect(router.state.location.pathname).toBe("/machines"));
     expect(screen.getByRole("region", { name: "Machines" })).toBeDefined();
+  });
+
+  it("lists this machine's own session in the sidebar when the machine list does not hold this machine", async () => {
+    mockActions();
+    await open(
+      "/",
+      {
+        type: "state",
+        protocol: 1,
+        records: [sample("c", 1), workspace("c", "w9", "still here"), terminal("c", "t9", "w9", "running"), session("c", "s9", "w9", "t9", "waiting_for_you", { model: "sonnet" })],
+        settings: settings(),
+      },
+      "c",
+    );
+
+    const sidebar = screen.getByRole("navigation", { name: "Workspaces" });
+    const group = await within(sidebar).findByRole("group", { name: "still here" });
+    expect(within(group).getByText("sonnet")).toBeDefined();
   });
 
   it("shows each machine online or offline by the machines the daemon hears, before any terminal", async () => {
