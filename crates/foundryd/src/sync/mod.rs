@@ -55,6 +55,7 @@ use crate::store::{Store, StoreError};
 use crate::terminals::Terminals;
 
 pub mod call;
+pub mod factory;
 mod link;
 pub mod relay;
 pub mod ws;

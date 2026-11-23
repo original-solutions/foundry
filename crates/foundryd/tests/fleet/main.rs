@@ -6,6 +6,7 @@
 
 mod call;
 mod coordinator;
+mod factory;
 mod join;
 mod relay;
 mod sync;
