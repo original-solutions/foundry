@@ -41,12 +41,25 @@ interface Props {
  * Every machine in the fleet as a card: online or offline and when this page last heard from it,
  * its load per core drawn over the last ten minutes (or since the page opened), its free memory and disk, its terminals
  * counted by state and its workspaces, each opening its most urgent terminal. An offline machine
- * keeps its card, greyed, with its last known numbers; nothing of it is hidden. The home's third view,
- * under the head it shares with the board and the timeline.
+ * keeps its card, greyed, with its last known numbers; nothing of it is hidden. Cards run in the
+ * order machines take the coordinator role, the one holding it marked, and each listed machine
+ * moves up or down that order (the whole new order is posted, and the board follows the settings
+ * that come back). The home's third view, under the head it shares with the board and the timeline.
  */
 export function Machines({ machines, history, here, connected }: Props) {
   // Moved on every second, for "heard 4 s ago" and the lines' sliding window.
   const now = useNow(1000);
+  // Listed machines in the order they take the coordinator role, then the rest as given.
+  const ranked = machines.filter((m) => m.rank !== undefined).sort((a, b) => a.rank! - b.rank!);
+  const sorted = [...ranked, ...machines.filter((m) => m.rank === undefined)];
+  const order = ranked.map((m) => m.id);
+  // One move at a time; the board reorders when the new settings arrive.
+  const move = useMutation({
+    mutationFn: async (next: string[]) => {
+      const { status, json } = await post("/api/machines/priority", { order: next });
+      if (status !== 204) throw refused(status, json);
+    },
+  });
   return (
     <section aria-label="Machines" className="flex flex-col gap-6">
       {!connected && (
@@ -57,16 +70,54 @@ export function Machines({ machines, history, here, connected }: Props) {
       <div className="flex justify-end">
         <AddMachine machines={machines} />
       </div>
+      {move.error && (
+        <p role="alert" className="rounded-lg border border-red-400/30 bg-red-400/10 px-3 py-2 text-xs text-red-300">
+          {move.error.message}
+        </p>
+      )}
       <div className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,24rem),1fr))] gap-4">
-        {machines.map((machine) => (
-          <MachineCard key={machine.id} machine={machine} points={history[machine.id]?.points ?? []} heard={history[machine.id]?.heard} here={machine.id === here} known={here !== undefined} now={now} />
+        {sorted.map((machine) => (
+          <MachineCard
+            key={machine.id}
+            machine={machine}
+            order={order}
+            moving={move.isPending}
+            onMove={(next) => move.mutate(next)} points={history[machine.id]?.points ?? []}
+            heard={history[machine.id]?.heard} here={machine.id === here} known={here !== undefined} now={now} />
         ))}
       </div>
     </section>
   );
 }
 
-function MachineCard({ machine, points, heard, here, known, now }: { machine: MachineView; points: Point[]; heard?: number; here: boolean; known: boolean; now: number }) {
+/** `order` with the machines at `from` and `to` swapped. */
+function swapped(order: string[], from: number, to: number): string[] {
+  const next = order.slice();
+  [next[from], next[to]] = [next[to], next[from]];
+  return next;
+}
+
+function MachineCard({
+  machine,
+  order,
+  moving,
+  onMove,
+  points,
+  heard,
+  here,
+  known,
+  now,
+}: {
+  machine: MachineView;
+  order: string[];
+  moving: boolean;
+  onMove: (order: string[]) => void;
+  points: Point[];
+  heard?: number;
+  here: boolean;
+  known: boolean;
+  now: number;
+}) {
   const { sample, status } = machine;
   const away = status === "offline";
   const all = machine.workspaces.flatMap(rows);
@@ -102,6 +153,7 @@ function MachineCard({ machine, points, heard, here, known, now }: { machine: Ma
           )}
         </MachineName>
         {here && <span className="rounded-full bg-neutral-800 px-2 py-px text-[11px] font-medium text-neutral-300">This machine</span>}
+        {machine.acting && <span className="rounded-full bg-sky-400/10 px-2 py-px text-[11px] font-medium text-sky-300">Coordinator</span>}
         <span className="ml-auto flex items-baseline gap-1.5 text-xs">
           <span className={statusText[status]}>{status}</span>
           {ago && <span className="text-neutral-500">· heard {ago}</span>}
@@ -112,6 +164,33 @@ function MachineCard({ machine, points, heard, here, known, now }: { machine: Ma
         <p className="min-w-0 text-xs text-neutral-400">{machine.limits ? limitsText(machine.limits) : "No limits"}</p>
         {machine.listed && <LimitsDialog machine={machine} />}
       </div>
+      {machine.rank !== undefined && order.length >= 2 && (
+        <div className="flex items-center justify-between gap-2 px-4 pt-1.5">
+          <p className="min-w-0 text-xs text-neutral-400">
+            Coordinator order {machine.rank + 1} of {order.length}
+          </p>
+          <span className="flex gap-1">
+            <button
+              type="button"
+              className={button}
+              aria-label={`Move ${machine.name} up in the coordinator order`}
+              disabled={moving || machine.rank === 0}
+              onClick={() => onMove(swapped(order, machine.rank!, machine.rank! - 1))}
+            >
+              ↑
+            </button>
+            <button
+              type="button"
+              className={button}
+              aria-label={`Move ${machine.name} down in the coordinator order`}
+              disabled={moving || machine.rank === order.length - 1}
+              onClick={() => onMove(swapped(order, machine.rank!, machine.rank! + 1))}
+            >
+              ↓
+            </button>
+          </span>
+        </div>
+      )}
       {machine.listed && known && !here && (
         <div className="flex justify-end px-4 pt-1.5">
           <RemoveDialog machine={machine} />
