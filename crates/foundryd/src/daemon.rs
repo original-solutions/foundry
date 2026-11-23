@@ -1168,6 +1168,32 @@ mod tests {
         assert!(warnings[0].contains("stay"), "{warnings:?}");
     }
 
+    /// At the start, with nothing served, the first timeout is one warning that says nothing is
+    /// listened on yet, not that addresses stay.
+    #[tokio::test]
+    async fn a_first_ask_that_times_out_at_the_start_warns_once_and_binds_nothing() {
+        let logged = Logged::default();
+        let _capture = logged.capture();
+        let mut tailscale = Tailscale::new(7433, Router::new());
+
+        tailscale.scan(true, timed_out()).await;
+
+        assert!(tailscale.served.is_empty());
+        assert!(tailscale.servers.is_empty());
+        assert!(!tailscale.away.load(Ordering::Relaxed));
+        let warnings = logged.warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("no address is listened on yet"),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("`tailscale ip` did not answer"),
+            "{warnings:?}"
+        );
+        assert!(!warnings[0].contains("stay"), "{warnings:?}");
+    }
+
     /// Three in a row are a failed ask: every server stops and Tailscale is marked away, with
     /// one warning at the first and one at the third.
     #[tokio::test]
