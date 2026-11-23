@@ -89,9 +89,20 @@ impl Answer {
 /// field) are shown as their size in bytes, and newlines are escaped, so one error stays one
 /// line.
 pub fn command_text(args: &[String]) -> String {
-        let _ = args;
-        todo!()
+    let mut shown = vec!["gh".to_string()];
+    let mut after_body_flag = false;
+    for arg in args {
+        if after_body_flag {
+            shown.push(format!("<{} bytes>", arg.len()));
+        } else if let Some(body) = arg.strip_prefix("body=") {
+            shown.push(format!("body=<{} bytes>", body.len()));
+        } else {
+            shown.push(one_line(arg));
+        }
+        after_body_flag = arg == "--body";
     }
+    shown.join(" ")
+}
 
 /// `text` with `\r` and `\n` written as escapes.
 pub fn one_line(text: &str) -> String {
@@ -138,9 +149,58 @@ fn auth_refused(stderr: &str) -> bool {
 
 /// Reads how the call with `args` ended: its stdout, or the error it is.
 pub fn finish(args: &[String], answer: Answer) -> Result<String, TrackerError> {
-        let _ = (args, answer);
-        todo!()
+    let command = command_text(args);
+    match answer {
+        Answer::NotStarted(why) => Err(TrackerError::Other(format!(
+            "cannot start `{command}`: {why}"
+        ))),
+        Answer::TimedOut => Err(TrackerError::Timeout {
+            command,
+            seconds: LIMIT.as_secs(),
+        }),
+        Answer::TooLarge => Err(TrackerError::Other(format!(
+            "`{command}` printed more than {OUTPUT_LIMIT} bytes"
+        ))),
+        Answer::Exit {
+            status: Some(0),
+            stdout,
+            ..
+        } => Ok(stdout),
+        // A shell's "command not found" and "not executable"; gh itself never exits so.
+        Answer::Exit {
+            status: Some(status @ (126 | 127)),
+            stderr,
+            ..
+        } => {
+            let why = match stderr.trim() {
+                "" => format!("the shell exited with status {status}"),
+                said => said.to_string(),
+            };
+            Err(TrackerError::Other(format!(
+                "cannot start `{command}`: {why}"
+            )))
+        }
+        Answer::Exit { status, stderr, .. } => {
+            let status = status.unwrap_or(-1);
+            if rate_limited(&stderr) {
+                Err(TrackerError::RateLimited { command, stderr })
+            } else if auth_refused(&stderr) {
+                Err(TrackerError::Auth { command, stderr })
+            } else if stderr.contains("HTTP 404") {
+                Err(TrackerError::NotFound {
+                    command,
+                    status,
+                    stderr,
+                })
+            } else {
+                Err(TrackerError::Other(format!(
+                    "`{command}` exited with status {status}: {}",
+                    stderr.trim_end()
+                )))
+            }
+        }
     }
+}
 
 /// The tracker for one GitHub login, through the `gh` CLI.
 pub struct Gh {
@@ -184,8 +244,59 @@ impl Gh {
     /// Runs the program once with `args` and the token in its environment, killing it at
     /// [`LIMIT`] on the clock.
     fn run(&self, args: &[String]) -> Answer {
-        let _ = args;
-        todo!()
+        // The OS refuses such an argument with an error that quotes it, and it could be a body.
+        if args.iter().any(|arg| arg.contains('\0')) {
+            return Answer::NotStarted("an argument contains a NUL byte".into());
+        }
+        let mut command = Command::new(&self.program);
+        command
+            .args(args)
+            .env("GH_TOKEN", &self.token)
+            .env("GH_PROMPT_DISABLED", "1")
+            .env("GH_NO_UPDATE_NOTIFIER", "1")
+            // Another host or token in the daemon's environment would act as someone else.
+            .env_remove("GH_HOST")
+            .env_remove("GH_ENTERPRISE_TOKEN")
+            .env_remove("GITHUB_ENTERPRISE_TOKEN")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            // Its own process group, so a call killed at the limit takes what it started too.
+            .process_group(0);
+        let started = self.clock.now();
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => return Answer::NotStarted(error.to_string()),
+        };
+        let stdout = drain(child.stdout.take(), OUTPUT_LIMIT);
+        let stderr = drain(child.stderr.take(), OUTPUT_LIMIT);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if self.clock.now().saturating_sub(started) < LIMIT => {
+                    thread::sleep(POLL)
+                }
+                Ok(None) => {
+                    kill_group(&mut child);
+                    // The readers end when the group's last holder of the pipes is gone.
+                    return Answer::TimedOut;
+                }
+                Err(error) => {
+                    kill_group(&mut child);
+                    return Answer::NotStarted(error.to_string());
+                }
+            }
+        };
+        let (stdout, over) = stdout.join().unwrap_or_default();
+        let (stderr, _) = stderr.join().unwrap_or_default();
+        if over {
+            return Answer::TooLarge;
+        }
+        Answer::Exit {
+            status: status.code(),
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        }
     }
 }
 

@@ -76,8 +76,20 @@ impl FakeTracker {
 
 impl Tracker for FakeTracker {
     fn gh(&self, args: &[String]) -> Result<String, TrackerError> {
-        let _ = args;
-        todo!()
+        let answer = {
+            let mut script = self.lock();
+            script.calls.push(args.to_vec());
+            let scripted = script
+                .by_args
+                .iter_mut()
+                .find(|(known, answers)| known.as_slice() == args && !answers.is_empty())
+                .and_then(|(_, answers)| answers.pop_front());
+            scripted.or_else(|| script.next.pop_front())
+        };
+        let answer = answer.unwrap_or_else(|| {
+            Answer::NotStarted(format!("no answer scripted for `{}`", command_text(args)))
+        });
+        finish(args, answer)
     }
 }
 
