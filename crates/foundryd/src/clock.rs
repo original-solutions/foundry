@@ -105,7 +105,7 @@ mod tests {
 
     #[test]
     fn the_system_clock_moves_forward_while_time_passes() {
-        let clock = SystemClock;
+        let clock = system();
         let before = clock.now();
         std::thread::sleep(Duration::from_millis(20));
         assert!(clock.now() - before >= Duration::from_millis(20));
