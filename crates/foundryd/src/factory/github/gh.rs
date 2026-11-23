@@ -241,13 +241,9 @@ impl Gh {
         &self.login
     }
 
-    /// Runs the program once with `args` and the token in its environment, killing it at
-    /// [`LIMIT`] on the clock.
-    fn run(&self, args: &[String]) -> Answer {
-        // The OS refuses such an argument with an error that quotes it, and it could be a body.
-        if args.iter().any(|arg| arg.contains('\0')) {
-            return Answer::NotStarted("an argument contains a NUL byte".into());
-        }
+    /// The command for one call: the token and the settings that keep `gh` from prompting, and
+    /// no other host or token that the daemon's environment may hold.
+    fn command(&self, args: &[String]) -> Command {
         let mut command = Command::new(&self.program);
         command
             .args(args)
@@ -258,40 +254,63 @@ impl Gh {
             .env_remove("GH_HOST")
             .env_remove("GH_ENTERPRISE_TOKEN")
             .env_remove("GITHUB_ENTERPRISE_TOKEN")
+            .env_remove("GITHUB_TOKEN")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             // Its own process group, so a call killed at the limit takes what it started too.
             .process_group(0);
+        command
+    }
+
+    /// Runs the program once with `args` and the token in its environment. The call is killed,
+    /// with everything it started, once [`LIMIT`] has passed on the clock before `gh` has
+    /// exited and closed its output.
+    fn run(&self, args: &[String]) -> Answer {
+        // Without a token `gh` would use `GITHUB_TOKEN` or the machine's stored login.
+        if self.token.trim().is_empty() {
+            return Answer::NotStarted(format!("no token for {}", self.login));
+        }
+        // The OS refuses such an argument with an error that quotes it, and it could be a body.
+        if args.iter().any(|arg| arg.contains('\0')) {
+            return Answer::NotStarted("an argument contains a NUL byte".into());
+        }
         let started = self.clock.now();
-        let mut child = match command.spawn() {
+        let mut child = match self.command(args).spawn() {
             Ok(child) => child,
             Err(error) => return Answer::NotStarted(error.to_string()),
         };
         let stdout = drain(child.stdout.take(), OUTPUT_LIMIT);
         let stderr = drain(child.stderr.take(), OUTPUT_LIMIT);
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) if self.clock.now().saturating_sub(started) < LIMIT => thread::sleep(POLL),
-                Ok(None) => {
-                    kill_group(&mut child);
-                    // The readers end when the group's last holder of the pipes is gone.
-                    return Answer::TimedOut;
-                }
-                Err(error) => {
-                    kill_group(&mut child);
-                    return Answer::NotStarted(error.to_string());
+        // The leader's exit does not end the call: a descendant may still hold the pipes, and the
+        // limit holds until both are read to their end.
+        let mut status = None;
+        loop {
+            if status.is_none() {
+                match child.try_wait() {
+                    Ok(found) => status = found,
+                    Err(error) => {
+                        kill_group(&mut child);
+                        return Answer::NotStarted(error.to_string());
+                    }
                 }
             }
-        };
+            if status.is_some() && stdout.is_finished() && stderr.is_finished() {
+                break;
+            }
+            if self.clock.now().saturating_sub(started) >= LIMIT {
+                kill_group(&mut child);
+                return Answer::TimedOut;
+            }
+            thread::sleep(POLL);
+        }
         let (stdout, over) = stdout.join().unwrap_or_default();
         let (stderr, _) = stderr.join().unwrap_or_default();
         if over {
             return Answer::TooLarge;
         }
         Answer::Exit {
-            status: status.code(),
+            status: status.and_then(|status| status.code()),
             stdout: String::from_utf8_lossy(&stdout).into_owned(),
             stderr: String::from_utf8_lossy(&stderr).into_owned(),
         }
