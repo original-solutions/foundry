@@ -5,6 +5,7 @@ import { closeTerminal, machineQuery, startShell } from "./api";
 import { couldNot } from "./labels";
 import { ArchiveDialog } from "./Archive";
 import { ended, endOf } from "./ends";
+import { matches, MD } from "./media";
 import { locate, type Located, type MachineView } from "./fleet";
 import { button, dangerButton, Modal } from "./Modal";
 import { StateGlyph } from "./StateGlyph";
@@ -123,7 +124,7 @@ export function TerminalActions({ children, ...actions }: Actions & { children: 
 
 /** Whether the screen is wide: room for a second terminal beside the first, and for Find in the header. */
 function wide(): boolean {
-  return typeof matchMedia !== "function" || matchMedia("(min-width: 768px)").matches;
+  return matches(MD, true);
 }
 
 const menu =
