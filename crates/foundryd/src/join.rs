@@ -65,6 +65,12 @@ pub const CODE_VALID_FOR: Duration = Duration::from_secs(10 * 60);
 /// How often an open link checks that its machine is still admitted.
 pub const RECHECK: Duration = Duration::from_secs(1);
 
+/// How long a machine keeps a removed machine's key after it first sees the removal: two sync
+/// rounds (`TICK` in [`crate::sync`] is one second). Its links with that machine send it the copy
+/// that removed it, then close, at the next sync round; revoking first would close them before
+/// that send.
+pub const REMOVAL_SENT: Duration = Duration::from_secs(2);
+
 /// The path a joining machine posts its code to.
 pub const JOIN_PATH: &str = "/api/join";
 
@@ -2517,6 +2523,42 @@ mod tests {
         assert_eq!(host.state(gone.me()), KeyState::Active);
         flaky.failing.store(false, Ordering::SeqCst);
         let deadline = tokio::time::Instant::now() + RECHECK * 5;
+        while host.state(gone.me()) != KeyState::Revoked {
+            assert!(tokio::time::Instant::now() < deadline, "never revoked");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        following.abort();
+    }
+
+    #[tokio::test]
+    async fn a_removed_machine_keeps_its_key_until_its_links_have_had_time_to_send_it_the_removal()
+    {
+        let host = machine_keys();
+        let gone = machine_keys();
+        admit(&host, &gone);
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path().join("foundry.db")).unwrap();
+        assert!(
+            store
+                .apply_settings(settings_with(2, vec![], &[gone.me()]))
+                .unwrap()
+        );
+        let store = Arc::new(Mutex::new(store));
+        let started = tokio::time::Instant::now();
+        let following = tokio::spawn({
+            let host = host.clone();
+            async move { host.follow(store).await }
+        });
+
+        // No check can see the removal before `started`, so none may revoke it before
+        // REMOVAL_SENT has passed from then.
+        tokio::time::sleep(REMOVAL_SENT - RECHECK / 2).await;
+        assert_eq!(
+            host.state(gone.me()),
+            KeyState::Active,
+            "revoked before its links could send it the removal"
+        );
+        let deadline = started + REMOVAL_SENT + RECHECK * 5;
         while host.state(gone.me()) != KeyState::Revoked {
             assert!(tokio::time::Instant::now() < deadline, "never revoked");
             tokio::time::sleep(Duration::from_millis(50)).await;

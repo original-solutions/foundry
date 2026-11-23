@@ -15,7 +15,7 @@ use foundry_proto::settings::{Machine, SharedSettings};
 use foundryd::api::machine_names::Listing;
 use foundryd::api::{machine_add, machine_remove};
 use foundryd::coordinator::Coordinator;
-use foundryd::join::{self, KeyState, KeyedDialer, Keys, RECHECK};
+use foundryd::join::{self, KeyState, KeyedDialer, Keys, RECHECK, REMOVAL_SENT};
 use foundryd::lister::Lister;
 use foundryd::secrets::FileSecrets;
 use foundryd::store::Store;
@@ -666,19 +666,31 @@ async fn a_machine_removed_through_a_is_revoked_by_every_machine_and_its_links_c
     assert!(!on_a.is_empty() && !on_b.is_empty(), "{on_a:?} {on_b:?}");
     let highest = on_a.iter().chain(&on_b).copied().max().unwrap();
 
-    // In A's UI: remove C. A revokes at its next list check and closes the link at once. B hears
-    // the removal in one sync round, then revokes at its next list check.
+    // In A's UI: remove C. A's links send C the copy that removed it and close at the next sync
+    // round. B hears the removal in one sync round and does the same. C, sent the copy by both,
+    // holds its own removal.
     assert_eq!(post_remove(port, c_id).await, 204);
     let removed = tokio::time::Instant::now();
     let bound = RECHECK + SYNC_ROUND + SLACK;
-    until_fast(bound, "C revoked and unlinked on A and B", || {
-        a.keys.state(c_id) == KeyState::Revoked
-            && b.keys.state(c_id) == KeyState::Revoked
-            && !a.linked_after(c_id, highest)
-            && !b.linked_after(c_id, highest)
-    })
+    until_fast(
+        bound,
+        "C unlinked on A and B, and holding its removal",
+        || {
+            !a.linked_after(c_id, highest)
+                && !b.linked_after(c_id, highest)
+                && join::is_removed(&c.settings(), c_id)
+        },
+    )
     .await;
     eprintln!("closed {:?} after the 204", removed.elapsed());
+    // Each revokes C once its links have had REMOVAL_SENT to send C the removal.
+    until_fast(
+        bound + REMOVAL_SENT + RECHECK,
+        "C revoked on A and B",
+        || a.keys.state(c_id) == KeyState::Revoked && b.keys.state(c_id) == KeyState::Revoked,
+    )
+    .await;
+    eprintln!("revoked {:?} after the 204", removed.elapsed());
     assert!(on_a.iter().all(|l| !a.peers.is_open(c_id, *l)));
     assert!(on_b.iter().all(|l| !b.peers.is_open(c_id, *l)));
     assert_eq!(a.keys.state(b_id), KeyState::Active);
@@ -735,17 +747,11 @@ async fn a_removed_machine_that_holds_its_removal_never_lists_itself_again_and_o
     .await;
 
     assert_eq!(post_remove(port, c_id).await, 204);
-    // Today the removed machine is not sent the copy over a link: a link to a machine that left
-    // the list closes before the send (sync/link.rs), so C usually never holds the removal. The
-    // copy is handed to C here to cover the case where it does hold it, which is when the guard
-    // acts.
-    until(Duration::from_secs(10), "A holds the removal", || {
-        join::is_removed(&a.settings(), c_id)
+    // The links that close on C send it the copy that removed it first.
+    until(Duration::from_secs(10), "C holds its own removal", || {
+        join::is_removed(&c.settings(), c_id)
     })
     .await;
-    // False when the copy had already arrived over the link.
-    lock(&c.store).apply_settings(a.settings()).unwrap();
-    assert!(join::is_removed(&c.settings(), c_id));
 
     // C acts alone now and runs its listing, as its daemon does, for several looks.
     list_guarded(&c, 10).await;

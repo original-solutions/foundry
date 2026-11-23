@@ -1773,6 +1773,105 @@ mod tests {
         );
     }
 
+    fn listed_machine(n: u128, address: &str) -> Machine {
+        Machine {
+            id: id(n),
+            name: format!("m{n}"),
+            address: address.into(),
+            key: String::new(),
+        }
+    }
+
+    fn lists(settings: &SharedSettings, n: u128) -> bool {
+        settings.machines.iter().any(|m| m.id == id(n))
+    }
+
+    #[test]
+    fn a_machine_removed_on_one_side_stays_removed_though_it_listed_itself_later_on_the_other() {
+        const C: u128 = 9;
+        let key = StampKey::Setting(SettingKey::Machine(id(C)));
+        let synced = numbered(
+            &base(),
+            &Edit::SetMachine {
+                machine: listed_machine(C, "100.64.0.9"),
+            },
+            id(A),
+        );
+        let removed = numbered(&synced, &Edit::RemoveMachine { id: id(C) }, id(A));
+        // C missed the removal and, acting alone, lists itself again at new addresses: its
+        // stamp is the higher one.
+        let mut on_c = synced.clone();
+        for n in 0..3 {
+            let machine = listed_machine(C, &format!("100.64.1.{n}"));
+            on_c = numbered(&on_c, &Edit::SetMachine { machine }, id(C));
+        }
+        assert!(stamp(&on_c, &key) > stamp(&removed, &key));
+
+        let out = merged(&removed, &on_c);
+
+        assert!(!lists(&out, C), "the removed machine is listed again");
+        assert!(crate::join::is_removed(&out, id(C)));
+    }
+
+    #[test]
+    fn a_machine_that_missed_a_removal_and_took_the_removed_machines_copy_drops_it_on_meeting_the_removal()
+     {
+        const C: u128 = 9;
+        const D: u128 = 7;
+        let synced = numbered(
+            &base(),
+            &Edit::SetMachine {
+                machine: listed_machine(C, "100.64.0.9"),
+            },
+            id(A),
+        );
+        // A and B hold the removal. C missed it and lists itself again; D, offline during the
+        // removal, links with C first and takes C's copy.
+        let removed = numbered(&synced, &Edit::RemoveMachine { id: id(C) }, id(A));
+        let mut on_c = synced.clone();
+        for n in 0..2 {
+            let machine = listed_machine(C, &format!("100.64.1.{n}"));
+            on_c = numbered(&on_c, &Edit::SetMachine { machine }, id(C));
+        }
+        let on_d = merged(&synced, &on_c);
+        assert!(lists(&on_d, C), "D lists C until it hears of the removal");
+
+        // D meets a machine that holds the removal: C is removed on both, in either order, and
+        // merging every copy in any grouping gives the same result.
+        let out = merged(&on_d, &removed);
+        assert!(!lists(&out, C) && crate::join::is_removed(&out, id(C)));
+        let other_grouping = merged(&merged(&removed, &on_c), &on_d);
+        assert_eq!(out.machines, other_grouping.machines);
+        assert_eq!(out.stamps, other_grouping.stamps);
+    }
+
+    #[test]
+    fn two_removals_of_one_machine_keep_the_higher_stamp() {
+        const C: u128 = 9;
+        let key = StampKey::Setting(SettingKey::Machine(id(C)));
+        let synced = numbered(
+            &base(),
+            &Edit::SetMachine {
+                machine: listed_machine(C, "100.64.0.9"),
+            },
+            id(A),
+        );
+        let on_a = numbered(&synced, &Edit::RemoveMachine { id: id(C) }, id(A));
+        let on_b = numbered(
+            &numbered(&synced, &Edit::RemoveLimits { machine: id(B) }, id(B)),
+            &Edit::RemoveMachine { id: id(C) },
+            id(B),
+        );
+
+        let out = merged(&on_a, &on_b);
+
+        assert!(!lists(&out, C));
+        assert_eq!(
+            stamp(&out, &key),
+            stamp(&on_a, &key).max(stamp(&on_b, &key))
+        );
+    }
+
     #[test]
     fn a_dismissed_item_stays_dismissed_when_it_meets_a_copy_that_still_holds_it() {
         let a = numbered(&base(), &set_project(7, "from a"), id(A));
@@ -2455,6 +2554,39 @@ mod tests {
             "{made:?}"
         );
         assert_eq!(coordinator.held().await.unwrap().projects.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_acting_machine_refuses_to_list_a_machine_its_copy_shows_removed() {
+        let (_dir, coordinator) = alone();
+        let c = MachineId::random();
+        let entry = |address: &str| Edit::SetMachine {
+            machine: Machine {
+                id: c,
+                name: "c".into(),
+                address: address.into(),
+                key: String::new(),
+            },
+        };
+        for edit in [entry("100.64.0.9"), Edit::RemoveMachine { id: c }] {
+            coordinator
+                .number(Some(EditId::random()), &edit)
+                .await
+                .unwrap_or_else(|_| panic!("not numbered"));
+        }
+
+        let again = coordinator
+            .number(Some(EditId::random()), &entry("100.64.1.1"))
+            .await;
+
+        assert!(
+            matches!(again, Err(Unnumbered::Breaks(_))),
+            "a removed machine was listed again"
+        );
+        assert!(crate::join::is_removed(
+            &coordinator.held().await.unwrap(),
+            c
+        ));
     }
 
     #[tokio::test]
