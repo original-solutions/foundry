@@ -732,9 +732,10 @@ async fn a_removed_machine_never_lists_itself_again_and_one_that_missed_the_remo
     .await;
 
     assert_eq!(post_remove(port, c_id).await, 204);
-    // A closes its link with C within about a second, which can be before its next send of the
-    // settings, so C may never receive the removal over a link. The copy is handed to C as a
-    // link would: the guard is for the machine that holds it.
+    // Today the removed machine is not sent the copy over a link: a link to a machine that left
+    // the list closes before the send (sync/link.rs), so C usually never holds the removal. The
+    // copy is handed to C here to cover the case where it does hold it, which is when the guard
+    // acts.
     until(Duration::from_secs(10), "A holds the removal", || {
         join::is_removed(&a.settings(), c_id)
     })
