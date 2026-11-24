@@ -351,6 +351,10 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
     let mut services: JoinSet<&'static str> = JoinSet::new();
     // services
     services.spawn(named(
+        "the logins and skill this machine holds",
+        crate::factory::held::run(store.clone(), me, secrets.clone()),
+    ));
+    services.spawn(named(
         "machine sampling",
         machine::run(store.clone(), me, home.clone()),
     ));

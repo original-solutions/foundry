@@ -1,6 +1,7 @@
 //! The command line: `--version` works, `join` names a bad port, `secret set` stores a gateway
-//! key without printing it, and each command a later task fills exits 2. Every test that runs the
-//! binary uses a temporary data directory and skips the copy from the login keychain.
+//! key or a GitHub token without printing it, `github default` stores a login, and each command
+//! a later task fills exits 2. Every test that runs the binary uses a temporary data directory
+//! and skips the copy from the login keychain.
 
 // A release build ignores `FOUNDRY_SECRETS`, so on macOS these runs of the binary would move
 // secrets out of the login keychain.
@@ -164,8 +165,58 @@ fn assert_not_built(args: &[&str]) {
 }
 
 #[test]
-fn github_default_exits_2_and_says_not_built_yet() {
-    assert_not_built(&["github", "default", "octocat"]);
+fn github_default_stores_the_login() {
+    let home = tempfile::tempdir().unwrap();
+
+    let out = isolated(&["github", "default", "octocat"], &home)
+        .output()
+        .expect("foundryd runs");
+
+    assert_eq!(out.status.code(), Some(0), "exit: {:?}", out.status);
+    assert_eq!(held(&home, "github-default").as_deref(), Some("octocat"));
+}
+
+#[test]
+fn github_default_with_a_bad_login_exits_1_and_stores_nothing() {
+    let home = tempfile::tempdir().unwrap();
+
+    let out = isolated(&["github", "default", "bad/name"], &home)
+        .output()
+        .expect("foundryd runs");
+
+    assert_eq!(out.status.code(), Some(1), "exit: {:?}", out.status);
+    assert_eq!(held(&home, "github-default"), None);
+}
+
+#[test]
+fn secret_set_stores_a_github_token_and_never_prints_it() {
+    let home = tempfile::tempdir().unwrap();
+
+    let out = secret_set(&home, "github:octocat", "ghp_clitoken\n");
+
+    assert_eq!(out.status.code(), Some(0), "exit: {:?}", out.status);
+    let printed = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!printed.contains("ghp_clitoken"), "printed: {printed}");
+    assert_eq!(
+        held(&home, "github:octocat").as_deref(),
+        Some("ghp_clitoken")
+    );
+}
+
+#[test]
+fn secret_set_with_a_bad_github_login_exits_1_and_stores_nothing() {
+    for name in ["github:bad/name", "github:"] {
+        let home = tempfile::tempdir().unwrap();
+
+        let out = secret_set(&home, name, "ghp_clitoken\n");
+
+        assert_eq!(out.status.code(), Some(1), "{name}: {:?}", out.status);
+        assert_eq!(held(&home, name), None, "{name} was stored");
+    }
 }
 
 #[test]

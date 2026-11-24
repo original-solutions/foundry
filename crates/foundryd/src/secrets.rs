@@ -66,6 +66,12 @@ pub trait Secrets: Send + Sync {
     /// the value to set, or `None` to leave the store as it is. No other change to the store,
     /// from this process or another, lands between the read and the write.
     fn update(&self, name: &str, edit: Edit<'_>) -> Result<(), SecretsError>;
+    /// The names of the secrets held, sorted, and never a value. A store that cannot list its
+    /// names lists none; one that can but fails to read gives the error, so a failed read is
+    /// never taken for an empty store.
+    fn names(&self) -> Result<Vec<String>, SecretsError> {
+        Ok(Vec::new())
+    }
 }
 
 /// What [`Secrets::update`] does to a secret: given its value now, the value to set, or `None`
@@ -110,6 +116,95 @@ pub const GATEWAY: &str = "gateway";
 
 /// The secret the gateway's management key is held under.
 pub const GATEWAY_MANAGEMENT: &str = "gateway-management";
+
+/// The prefix of the secret a GitHub token is held under: `github:<login>`.
+pub const GITHUB_PREFIX: &str = "github:";
+
+/// The secret the machine's default GitHub login is held under. It holds a login, not a token.
+pub const GITHUB_DEFAULT: &str = "github-default";
+
+/// What [`hide_known`] gives when the secret store cannot be read: nothing of the text can be
+/// told safe, so none of it is shown.
+pub const HIDDEN_UNREADABLE: &str = "[hidden: the secret store could not be read]";
+
+/// Whether `login` is a GitHub login as foundry takes it: letters, digits and `-`, and not empty.
+pub fn is_login(login: &str) -> bool {
+    !login.is_empty() && login.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// The logins a GitHub token is held for, sorted. A `github:` name whose rest is no login is
+/// not listed.
+pub fn github_logins(secrets: &dyn Secrets) -> Result<Vec<String>, SecretsError> {
+    let mut logins: Vec<String> = secrets
+        .names()?
+        .iter()
+        .filter_map(|name| name.strip_prefix(GITHUB_PREFIX))
+        .filter(|login| is_login(login))
+        .map(str::to_owned)
+        .collect();
+    logins.sort();
+    Ok(logins)
+}
+
+/// The token held for `login`: `None` when none is set, and for a `login` that is none, which
+/// reads nothing.
+pub fn github_token(secrets: &dyn Secrets, login: &str) -> Result<Option<String>, SecretsError> {
+    if !is_login(login) {
+        return Ok(None);
+    }
+    secrets.get(&format!("{GITHUB_PREFIX}{login}"))
+}
+
+/// This machine's default GitHub login: `None` when none is stored, when what is stored is no
+/// login, and when the store cannot be read (which is logged).
+pub fn github_default(secrets: &dyn Secrets) -> Option<String> {
+    match secrets.get(GITHUB_DEFAULT) {
+        Ok(login) => login.filter(|login| is_login(login)),
+        Err(error) => {
+            tracing::warn!(%error, "the default GitHub login could not be read");
+            None
+        }
+    }
+}
+
+/// `text` with every secret this store holds now hidden as `***`: the gateway keys and the token
+/// of each `github:<login>`, read at this call so a token set after the daemon started is
+/// hidden too, and then the passwords of URLs as [`redact`] hides them. When the store cannot
+/// be read, none of `text` is shown: [`HIDDEN_UNREADABLE`] is given instead.
+pub fn hide_known(text: &str, secrets: &dyn Secrets) -> String {
+    match known_values(secrets) {
+        Ok(mut values) => {
+            // The longest first, so a token that is the start of another leaves no tail of it.
+            values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+            let mut hidden = text.to_owned();
+            for value in values {
+                hidden = hidden.replace(&value, "***");
+            }
+            redact(&hidden)
+        }
+        Err(error) => {
+            tracing::warn!(%error, "text hidden: the secret store could not be read");
+            HIDDEN_UNREADABLE.to_owned()
+        }
+    }
+}
+
+/// The values of the secrets `hide_known` hides, none of them empty.
+fn known_values(secrets: &dyn Secrets) -> Result<Vec<String>, SecretsError> {
+    let mut names = vec![GATEWAY.to_owned(), GATEWAY_MANAGEMENT.to_owned()];
+    names.extend(
+        github_logins(secrets)?
+            .into_iter()
+            .map(|login| format!("{GITHUB_PREFIX}{login}")),
+    );
+    let mut values = Vec::new();
+    for name in names {
+        if let Some(value) = secrets.get(&name)?.filter(|value| !value.is_empty()) {
+            values.push(value);
+        }
+    }
+    Ok(values)
+}
 
 /// The secret store this machine uses: the file `secrets.json` in `home`, readable only by the
 /// service user, on every OS.
@@ -219,7 +314,10 @@ fn move_secrets(old: &dyn OldStore, new: &FileSecrets) -> Result<(), SecretsErro
 
 #[derive(Debug, thiserror::Error)]
 pub enum SetError {
-    #[error("{name} is not a secret to set here; the names are {GATEWAY} and {GATEWAY_MANAGEMENT}")]
+    #[error(
+        "{name} is not a secret to set here; the names are {GATEWAY}, {GATEWAY_MANAGEMENT} and \
+         {GITHUB_PREFIX}<login>, where a login is letters, digits and -"
+    )]
     UnknownName { name: String },
     #[error("no value on stdin for {name}")]
     NoValue { name: String },
@@ -243,7 +341,13 @@ pub fn set_command(name: &str) -> ExitCode {
     };
     match result {
         Ok(()) => {
-            println!("foundryd secret set {name}: stored; restart foundryd so new sessions use it");
+            if name.starts_with(GITHUB_PREFIX) {
+                println!("foundryd secret set {name}: stored; no restart is needed");
+            } else {
+                println!(
+                    "foundryd secret set {name}: stored; restart foundryd so new sessions use it"
+                );
+            }
             ExitCode::SUCCESS
         }
         Err(error) => {
@@ -253,20 +357,42 @@ pub fn set_command(name: &str) -> ExitCode {
     }
 }
 
-/// `foundryd github default <login>`. Not built yet: exits 2.
-pub fn github_default_command(_login: &str) -> ExitCode {
-    crate::not_built("github default")
+/// `foundryd github default <login>`: stores `login` as this machine's default GitHub login.
+/// A `login` that is none is refused and nothing is stored.
+pub fn github_default_command(login: &str) -> ExitCode {
+    if !is_login(login) {
+        eprintln!(
+            "foundryd github default: {login:?} is not a login; a login is letters, digits and -"
+        );
+        return ExitCode::FAILURE;
+    }
+    let Some(home) = crate::daemon::home() else {
+        eprintln!("foundryd github default: set FOUNDRY_HOME or HOME");
+        return ExitCode::FAILURE;
+    };
+    match for_this_machine(&home).and_then(|secrets| secrets.set(GITHUB_DEFAULT, login)) {
+        Ok(()) => {
+            println!("foundryd github default: {login} is this machine's default login");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("foundryd github default: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// Stores the first line of `input` as the secret `name`, without its line ending. Only the
-/// gateway secrets can be set: the name is checked before `input` is read, so any other name
-/// leaves the store untouched, and the machine's own identity and key table stay out of reach.
+/// gateway secrets and `github:<login>` tokens can be set: the name is checked before `input` is
+/// read, so any other name leaves the store untouched, and the machine's own identity and key
+/// table stay out of reach.
 pub fn set_from(
     secrets: &dyn Secrets,
     name: &str,
     mut input: impl BufRead,
 ) -> Result<(), SetError> {
-    if name != GATEWAY && name != GATEWAY_MANAGEMENT {
+    let github = name.strip_prefix(GITHUB_PREFIX).is_some_and(is_login);
+    if name != GATEWAY && name != GATEWAY_MANAGEMENT && !github {
         return Err(SetError::UnknownName {
             name: name.to_owned(),
         });
@@ -402,6 +528,10 @@ impl Secrets for FileSecrets {
         secrets.insert(name.to_owned(), value);
         self.write(&secrets)
     }
+
+    fn names(&self) -> Result<Vec<String>, SecretsError> {
+        Ok(self.read()?.into_keys().collect())
+    }
 }
 
 /// An exclusive lock on the file at `path`, made 0600 with its directory (0700, as `foundryd
@@ -508,6 +638,10 @@ impl Secrets for MemorySecrets {
             secrets.insert(name.to_owned(), value);
         }
         Ok(())
+    }
+
+    fn names(&self) -> Result<Vec<String>, SecretsError> {
+        Ok(self.lock().keys().cloned().collect())
     }
 }
 

@@ -1,4 +1,110 @@
 //! The GitHub logins and the skill this machine holds.
+//!
+//! Every [`CHECK_EVERY`] this machine reads the logins it holds a token for and whether the
+//! `factory-build` skill is installed for the service user, and writes a [`MachineHeld`] record
+//! when either differs from what it last wrote, the first check at once. The age between checks
+//! is read on the sleep-counting clock of [`crate::clock`]. A token is never read here, let
+//! alone logged: only the names of the logins are.
+
+use std::ffi::OsString;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
+
+use foundry_proto::factory::{FactoryBody, FactoryRecord, MachineHeld};
+use foundry_proto::ids::MachineId;
+
+use crate::clock::Clock;
+use crate::secrets::{self, Secrets};
+use crate::store::Store;
+
+/// How often the logins and the skill are checked.
+pub const CHECK_EVERY: Duration = Duration::from_secs(5);
+
+/// How often the clock is read while waiting. It only paces the reads: the wait is measured on
+/// the clock.
+const POLL: Duration = Duration::from_millis(100);
+
+/// What the skill is called under the service user's home.
+const SKILL: &str = ".claude/skills/factory-build/SKILL.md";
+
+/// Keeps this machine's [`MachineHeld`] record current, for ever.
+pub async fn run(store: Arc<Mutex<Store>>, me: MachineId, secrets: Arc<dyn Secrets>) {
+    let skill = skill_file(std::env::var_os("HOME"));
+    run_with(store, me, secrets, skill, crate::clock::system()).await;
+}
+
+/// The skill file of the service user: under `home`, or when that is unset or empty under the
+/// home the password database gives. `None` when neither is known.
+pub fn skill_file(home: Option<OsString>) -> Option<PathBuf> {
+    let home = home
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .or_else(passwd_home)?;
+    Some(home.join(SKILL))
+}
+
+fn passwd_home() -> Option<PathBuf> {
+    let user = nix::unistd::User::from_uid(nix::unistd::getuid()).ok()??;
+    (!user.dir.as_os_str().is_empty()).then_some(user.dir)
+}
+
+/// [`run`] with the skill file and the clock given.
+pub(crate) async fn run_with(
+    store: Arc<Mutex<Store>>,
+    me: MachineId,
+    secrets: Arc<dyn Secrets>,
+    skill: Option<PathBuf>,
+    clock: Arc<dyn Clock>,
+) {
+    let mut written: Option<MachineHeld> = None;
+    loop {
+        let checked = clock.now();
+        let (store, secrets, skill, last) = (
+            store.clone(),
+            secrets.clone(),
+            skill.clone(),
+            written.clone(),
+        );
+        match tokio::task::spawn_blocking(move || check(&store, me, &*secrets, skill, last)).await {
+            Ok(Ok(held)) => written = Some(held),
+            Ok(Err(error)) => tracing::warn!(%error, "what this machine holds not written"),
+            Err(error) => tracing::warn!(%error, "what this machine holds not written"),
+        }
+        while clock.now().saturating_sub(checked) < CHECK_EVERY {
+            tokio::time::sleep(POLL).await;
+        }
+    }
+}
+
+/// One check: what is held now, written when it is not what `last` says was written. Gives
+/// what the record holds.
+fn check(
+    store: &Mutex<Store>,
+    me: MachineId,
+    secrets: &dyn Secrets,
+    skill: Option<PathBuf>,
+    last: Option<MachineHeld>,
+) -> Result<MachineHeld, Box<dyn std::error::Error + Send + Sync>> {
+    let held = MachineHeld {
+        logins: secrets::github_logins(secrets)?,
+        skill: skill.is_some_and(|path| path.exists()),
+    };
+    if last.as_ref() == Some(&held) {
+        return Ok(held);
+    }
+    let mut store = store.lock().unwrap_or_else(PoisonError::into_inner);
+    let version = store.own_next_factory_version()?;
+    store.apply_factory(
+        &FactoryRecord {
+            owner: me,
+            version,
+            body: FactoryBody::Held(held.clone()),
+        },
+        me,
+    )?;
+    Ok(held)
+}
 
 #[cfg(test)]
 mod tests {
@@ -180,7 +286,12 @@ mod tests {
         assert!(version_after(&rig, first).await > first);
         assert_eq!(held(&rig).unwrap().logins, ["octocat"]);
         let text = logged.text();
-        for token in ["ghp_held_one", "ghp_held_two", "ghp_held_three", "ghp_held_four"] {
+        for token in [
+            "ghp_held_one",
+            "ghp_held_two",
+            "ghp_held_three",
+            "ghp_held_four",
+        ] {
             assert!(!text.contains(token), "{text}");
         }
     }
