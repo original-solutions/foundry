@@ -529,8 +529,15 @@ fn is_unsafe(c: char) -> bool {
 }
 
 /// `text` on one line with no control or bidi characters.
-pub(super) fn strip(text: &str) -> String {
+fn strip(text: &str) -> String {
     text.chars().filter(|c| !is_unsafe(*c)).collect()
+}
+
+/// `text` with no control or bidi characters but its white space: its lines and tabs stay.
+pub(super) fn strip_inline(text: &str) -> String {
+    text.chars()
+        .filter(|c| c.is_whitespace() || !is_unsafe(*c))
+        .collect()
 }
 
 #[cfg(test)]
