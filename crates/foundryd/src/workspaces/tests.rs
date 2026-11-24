@@ -3763,6 +3763,49 @@ async fn a_second_worktree_on_a_branch_is_refused_while_the_first_exists() {
 }
 
 #[tokio::test]
+async fn a_branch_a_live_workspace_names_is_refused_after_git_forgot_its_worktree() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    remote.push("feature", &[("F.md", "one\n")]);
+    let clone = setup.clone_of(remote.project);
+    // One live workspace on `feature`, and one on a new branch `Fix`, which differs from the
+    // remote's `fix` only in case.
+    remote.push("fix", &[("X.md", "one\n")]);
+    let first = setup
+        .make(&remote, "first", existing("feature"), Provision::Own, None)
+        .await
+        .unwrap();
+    let cased = setup
+        .make(
+            &remote,
+            "cased",
+            new_branch("main", "Fix"),
+            Provision::Own,
+            None,
+        )
+        .await
+        .unwrap();
+    // Both folders are removed by hand and git forgets them; the records stay live.
+    for id in [first, cased] {
+        std::fs::remove_dir_all(setup.workspaces.worktree(id).await.unwrap()).unwrap();
+    }
+    git(&clone, &["worktree", "prune"]);
+    assert!(!git(&clone, &["worktree", "list", "--porcelain"]).contains("refs/heads/"));
+
+    for name in ["feature", "fix"] {
+        let err = setup
+            .make(&remote, "again", existing(name), Provision::Own, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, WorkspaceError::BranchCheckedOut(ref b) if b == name),
+            "{name}: {err:?}"
+        );
+    }
+    assert_eq!(setup.workspace_records().len(), 2);
+}
+
+#[tokio::test]
 async fn a_branch_checkout_moves_a_stale_local_branch_to_origins_once_the_first_is_archived() {
     let setup = Setup::new();
     let remote = setup.project(&[("README.md", "hello\n")]);
@@ -3928,6 +3971,62 @@ async fn a_clean_commit_checkout_archives_without_force() {
     setup.workspaces.archive(id, false).await.unwrap();
 
     assert!(!worktree.exists());
+}
+
+#[tokio::test]
+async fn a_commit_checkouts_changes_and_shipping_count_from_the_commit_and_never_ask_github() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "one\n")]);
+    let sha = setup.remote_at(&remote, "refs/heads/main");
+    let id = setup
+        .make(&remote, "gate", commit_of(&sha), Provision::Own, None)
+        .await
+        .unwrap();
+    let worktree = setup.workspaces.worktree(id).await.unwrap();
+    let (workspaces, asked) = with_gh(&setup, "[]");
+
+    let fresh = workspaces.changes(id).await.unwrap();
+    assert_eq!(fresh.base, sha);
+    assert!(fresh.commits.is_empty(), "{fresh:?}");
+    assert!(fresh.files.is_empty(), "{fresh:?}");
+    let fresh = workspaces.shipping(id).await.unwrap();
+    assert_eq!(fresh.branch, "");
+    assert!(!fresh.pushed);
+    assert_eq!(fresh.unpushed, 0);
+    assert_eq!(fresh.pr, None);
+    assert!(!fresh.unreachable);
+
+    // A commit made in it is its own change, as on a branch, and is not pushed anywhere.
+    std::fs::write(worktree.join("a.txt"), "a\n").unwrap();
+    git(&worktree, &["add", "a.txt"]);
+    git(&worktree, &["commit", "-q", "-m", "only here"]);
+    let read = workspaces.changes(id).await.unwrap();
+    assert_eq!(
+        read.commits
+            .iter()
+            .map(|c| c.subject.as_str())
+            .collect::<Vec<_>>(),
+        ["only here"]
+    );
+    assert_eq!(
+        read.files
+            .iter()
+            .map(|f| f.path.as_str())
+            .collect::<Vec<_>>(),
+        ["a.txt"]
+    );
+    let one = workspaces.commit(id, &read.commits[0].hash).await.unwrap();
+    assert_eq!(one.files.len(), 1);
+    let read = workspaces.shipping(id).await.unwrap();
+    assert_eq!(read.branch, "");
+    assert!(!read.pushed);
+    assert_eq!(read.unpushed, 1);
+    assert_eq!(read.pr, None);
+    assert!(!read.unreachable);
+    assert!(
+        !asked.exists(),
+        "GitHub was asked about a workspace with no branch"
+    );
 }
 
 #[tokio::test]
