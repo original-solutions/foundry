@@ -21,12 +21,14 @@
 //! folder, `<workspace id>.factory`, so a create with the same tag and name answers with the
 //! workspace already made and makes nothing new: no fetch, no branch. The marker holds what the
 //! first create's setup was due to run, the command line it resolved or none, and is written
-//! before the record and before the setup starts. A same-tag create finds one of three states
-//! and ignores its own setup: the record names a setup terminal, and the answer is the id; the
-//! record names none but a terminal of the workspace is open, which the first create started and
-//! did not record, and that terminal is recorded as the setup and nothing is started; there is
-//! no terminal, and the marker's command line, if it holds one, is started and recorded as a
-//! create does, and if it holds none nothing is started. A marker that cannot be parsed is
+//! before the record and before the setup starts. A same-tag create ignores its own setup and
+//! finds one of four states: the record names a setup terminal, and the answer is the id; the
+//! marker holds no command line, the first create had no setup due, and the answer is the id
+//! with nothing written and nothing started; the record names none, a setup was due, and an
+//! open terminal of the workspace that no session record of it names is there, which the first
+//! create started and did not record, so the earliest such terminal by record version is
+//! recorded as the setup and nothing is started; or there is no such terminal, and the marker's
+//! command line is started and recorded as a create does. A marker that cannot be parsed is
 //! skipped and logged; a folder or the store that cannot be read fails the create, so it never
 //! makes a second workspace for a tag that may have one.
 //! Its setup terminal gets no token in its environment and has git's credential helpers turned
@@ -39,11 +41,12 @@
 //! clone's config is shared with every worktree, so the token never goes to it. Every token
 //! fetch gets a new repo: under the project's lock, whatever is at
 //! `<data dir>/fetches/<project>.git` is removed, a bare repo is made there with no template, so
-//! no hook, info file or config comes with it, and the call runs with `GIT_DIR` and `GIT_COMMON_DIR` set to it after the token's
-//! hardening, so no file in it and no discovery from the folder the call runs in can lead git to
-//! another repo. It fetches by the project's URL with explicit refspecs into that repo, the
-//! clone then fetches from it without the token, branches and tags, and the repo is removed. As
-//! the runner's gate does, each token fetch downloads the repo's branches whole.
+//! no hook, info file or config comes with it, and the call runs with `GIT_DIR` and
+//! `GIT_COMMON_DIR` set to it after the token's hardening, so no file in it and no discovery
+//! from the folder the call runs in can lead git to another repo. It fetches by the project's
+//! URL with explicit refspecs into that repo, the clone then fetches from it without the token,
+//! branches and tags, and the repo is removed. As the runner's gate does, a token fetch
+//! downloads the repo's branches whole every time.
 //!
 //! A create never touches what it did not make, with one exception the spec asks for: a
 //! [`Checkout::Branch`] moves a local branch of that name to `origin`'s, and logs the commits
@@ -114,7 +117,8 @@ pub use pr::{Checks, PrState, PullRequest, Review, Shipping};
 const BRANCH_AT_MOST: usize = 100;
 
 /// How long any one git call may run before it is killed and fails. A first fetch downloads the
-/// whole repo, so this is generous; it is there so a remote that stops answering cannot hold a
+/// whole repo, and a token fetch downloads the repo's branches whole every time, so this is
+/// generous; it is there so a remote that stops answering cannot hold a
 /// project's lock for good.
 const GIT_WITHIN: Duration = Duration::from_secs(10 * 60);
 
@@ -522,10 +526,12 @@ impl Workspaces {
     /// setup `setup` says, and starts the setup. A branch the caller gives, or a commit, that
     /// is no plain name or full object id is refused before git runs. With a `factory` tag, a
     /// workspace this machine already made for the same tag and name, and not archived, is the
-    /// answer, and nothing new is made; but one whose setup never started, so its record names
-    /// no setup terminal, has its setup started now. Returns once the setup has started, not finished, with the
-    /// same errors as [`Workspaces::create`]. The create finishes even when the caller stops
-    /// waiting.
+    /// answer, and nothing new is made. A same-tag create answers with the first workspace's id
+    /// and ignores its own `checkout` and `setup`. When the first create had a setup due that no
+    /// record names, an open terminal of the workspace that no session names is recorded as the
+    /// setup, or else the setup the first create resolved, as its marker holds it, is started.
+    /// Returns once the setup has started, not finished, with the same errors as
+    /// [`Workspaces::create`]. The create finishes even when the caller stops waiting.
     pub async fn create_with(
         &self,
         project: ProjectId,
@@ -546,10 +552,10 @@ impl Workspaces {
 
     /// Closes the workspace's terminals, removes its worktree and keeps its branch. Unless
     /// `force`, refuses with [`WorkspaceError::Dirty`] while there is uncommitted or unpushed
-    /// work or a checked-out submodule, and changes nothing. Work that appears while the terminals close is refused with
-    /// [`WorkspaceError::Dirty`] too, and then the terminals are already closed. The archive
-    /// finishes even when the caller stops waiting, and holds the workspace's lifecycle lock
-    /// throughout, so no [`Workspaces::start_in`] runs beside it.
+    /// work or a checked-out submodule, and changes nothing. Work that appears while the
+    /// terminals close is refused with [`WorkspaceError::Dirty`] too, and then the terminals are
+    /// already closed. The archive finishes even when the caller stops waiting, and holds the
+    /// workspace's lifecycle lock throughout, so no [`Workspaces::start_in`] runs beside it.
     pub async fn archive(&self, id: WorkspaceId, force: bool) -> Result<(), WorkspaceError> {
         let inner = self.inner.clone();
         self.locked(id, async move { inner.archive(id, force).await })
@@ -621,8 +627,9 @@ impl Workspaces {
     /// settings, that no live workspace record in the store names, whatever left it: a create
     /// that died before writing its record leaves one. One that passes the checks of an
     /// unforced archive and holds no file git ignores, which such a create never leaves, is
-    /// removed without `--force` and its branch kept; any other, or one git will not remove, is left as it is and logged with what
-    /// holds it. One named only by another owner's record is left and logged too. A worktree
+    /// removed without `--force` and its branch kept; any other, or one git will not remove, is
+    /// left as it is and logged with what holds it. One named only by another owner's record is
+    /// left and logged too. A worktree
     /// whose folder is gone is checked by the `HEAD` git keeps for it. Branches are never
     /// touched. A store that cannot be read skips the sweep, and a clone that cannot be read or
     /// whose worktrees cannot be listed is passed over, each with a log line. After
@@ -870,20 +877,25 @@ impl Inner {
     }
 
     /// The answer to a create whose tag and name made `made` before, with `due` the setup that
-    /// create was to run. A record that names a setup terminal is answered as it is. Else a
-    /// terminal of the workspace that is not closed, started by that create but not recorded,
-    /// is recorded as its setup and nothing is started. Else `due` is started and recorded as a
-    /// create does, and when there is none nothing is.
+    /// create was to run. A record that names a setup terminal is answered as it is, and so is
+    /// one with no setup due: nothing is written and nothing is started. With a setup due and
+    /// none named, the open terminals of the workspace that no session record of it names are
+    /// the ones the first create may have started and not recorded; the earliest of them by
+    /// record version is recorded as the setup and nothing is started. When none is left, `due`
+    /// is started and recorded as a create does.
     async fn retry_setup(
         &self,
         made: Workspace,
         due: Option<Vec<String>>,
     ) -> Result<WorkspaceId, WorkspaceError> {
         let id = made.id;
+        let Some(due) = due else {
+            return Ok(id);
+        };
         if made.setup.is_some() {
             return Ok(id);
         }
-        if let Some(terminal) = self.terminals_of(id).await?.into_iter().next() {
+        if let Some(terminal) = self.unrecorded_setup(id).await? {
             let body = Workspace {
                 setup: Some(terminal),
                 ..made
@@ -892,7 +904,7 @@ impl Inner {
             return Ok(id);
         }
         let folder = self.folder(&made).await;
-        self.start_setup(made, &folder, due, true).await
+        self.start_setup(made, &folder, Some(due), true).await
     }
 
     /// The command line `provision` says to run in `folder`: the worktree's own list for
@@ -1183,7 +1195,6 @@ impl Inner {
     async fn fetch_repo(&self, project: ProjectId) -> Result<PathBuf, WorkspaceError> {
         let parent = self.data.join("fetches");
         let bare = parent.join(format!("{project}.git"));
-        tokio::fs::create_dir_all(&parent).await?;
         remove_any(&bare).await?;
         let partial = self.partial_bare(&parent, project, false).await?;
         tokio::fs::rename(&partial, &bare).await?;
@@ -1226,8 +1237,9 @@ impl Inner {
     }
 
     /// The live workspace of this machine that a create with `tag` and `name` was made for
-    /// before, if there is one, with the setup its marker says that create was to run. A marker that cannot be parsed is skipped and logged, since it
-    /// cannot name a tag; one whose workspace is not live answers for nothing. A folder, a
+    /// before, if there is one, with the setup its marker says that create was to run. A marker
+    /// that cannot be parsed is skipped and logged, since it cannot name a tag; one whose
+    /// workspace is not live answers for nothing. A folder, a
     /// marker or the store that cannot be read is an error, never "no workspace yet".
     async fn answered(
         &self,
@@ -1812,9 +1824,10 @@ impl Inner {
     }
 
     /// [`Inner::git`] with `auth`'s token and hardening, for a call that only runs in a fetch
-    /// repo made for it alone ([`GitAuth::apply`]), which `GIT_DIR` and `GIT_COMMON_DIR` name. It allows `https` only, and `file` too when
-    /// `repo` is a folder of this machine or a `file://` URL, as a test's remote is. Neither the
-    /// token nor the command, which holds it, is ever in the error.
+    /// repo made for it alone ([`GitAuth::apply`]), which `GIT_DIR` and `GIT_COMMON_DIR` name. It
+    /// allows `https` only, and `file` too when `repo` is a folder of this machine or a
+    /// `file://` URL, as a test's remote is. Neither the token nor the command, which holds it,
+    /// is ever in the error.
     async fn git_with<I, S>(
         &self,
         dir: &Path,
@@ -1932,10 +1945,7 @@ impl Inner {
     ) -> Result<PathBuf, WorkspaceError> {
         tokio::fs::create_dir_all(parent).await?;
         let partial = parent.join(format!("{project}.partial"));
-        match tokio::fs::remove_dir_all(&partial).await {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
-            _ => {}
-        }
+        remove_any(&partial).await?;
         let mut args = vec![OsStr::new("--quiet"), OsStr::new("--bare")];
         if !template {
             args.push(OsStr::new("--template="));
@@ -2007,6 +2017,31 @@ impl Inner {
                 .filter(|r| !r.deleted)
                 .map(|r| r.body.id)
                 .collect())
+        })
+        .await
+    }
+
+    /// The earliest, by record version, of the terminals of workspace `id` that are not closed
+    /// and that no session record of the workspace names, if there is one.
+    async fn unrecorded_setup(
+        &self,
+        id: WorkspaceId,
+    ) -> Result<Option<TerminalId>, WorkspaceError> {
+        let me = self.me;
+        self.with_store(move |store| {
+            let sessions: Vec<TerminalId> = store
+                .sessions_of(me)?
+                .into_iter()
+                .filter(|r| r.body.workspace == id)
+                .map(|r| r.body.terminal)
+                .collect();
+            // `terminals_in` lists the lowest version first.
+            Ok(store
+                .terminals_in(me, id)?
+                .into_iter()
+                .filter(|r| !r.deleted && !sessions.contains(&r.body.id))
+                .map(|r| r.body.id)
+                .next())
         })
         .await
     }
