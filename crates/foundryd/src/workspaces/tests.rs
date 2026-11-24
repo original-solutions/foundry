@@ -5,10 +5,10 @@ use std::time::{Duration, Instant};
 
 use foundry_holder::protocol::Request;
 use foundry_proto::factory::ProjectFactory;
-use foundry_proto::ids::{MachineId, ProjectId, TerminalId, WorkspaceId};
-use foundry_proto::record::{AnyRecord, Record, Terminal, Workspace};
+use foundry_proto::ids::{MachineId, ProjectId, SessionId, TerminalId, WorkspaceId};
+use foundry_proto::record::{AnyRecord, Record, Session, Terminal, Workspace};
 use foundry_proto::settings::Project;
-use foundry_proto::state::TerminalState;
+use foundry_proto::state::{SessionState, TerminalState};
 use tempfile::TempDir;
 
 use super::Setup as Provision;
@@ -115,8 +115,9 @@ impl Remote {
 }
 
 /// A script in `dir` that stands in for git: it appends to `git-calls.log` there, per call,
-/// whether `FOUNDRY_GIT_TOKEN` is set (never its value), the folder and the arguments, then runs
-/// the git found before the wrapper was in place.
+/// whether `FOUNDRY_GIT_TOKEN` is set (never its value), the folder, `GIT_DIR` and
+/// `GIT_COMMON_DIR` (paths, empty when unset) and the arguments, then runs the git found before
+/// the wrapper was in place.
 fn git_wrapper(dir: &Path) -> PathBuf {
     use std::os::unix::fs::PermissionsExt as _;
     let real = Command::new("sh")
@@ -129,7 +130,8 @@ fn git_wrapper(dir: &Path) -> PathBuf {
         &script,
         format!(
             "#!/bin/sh\nif [ -n \"$FOUNDRY_GIT_TOKEN\" ]; then t=token; else t=none; fi\n\
-             printf '%s\\t%s\\t%s\\n' \"$t\" \"$(pwd -P)\" \"$*\" >> '{}'\n\
+             printf '%s\\t%s\\t%s\\t%s\\t%s\\n' \"$t\" \"$(pwd -P)\" \"$GIT_DIR\" \
+             \"$GIT_COMMON_DIR\" \"$*\" >> '{}'\n\
              exec '{}' \"$@\"\n",
             dir.join("git-calls.log").display(),
             real.trim()
@@ -216,18 +218,22 @@ impl Setup {
     }
 
     /// Every git call a [`Setup::with_git_log`] setup made, oldest first: whether it held the
-    /// token, the folder it ran in, and its arguments.
-    fn git_calls(&self) -> Vec<(bool, PathBuf, String)> {
+    /// token, the folder it ran in, its arguments, and the `GIT_DIR` and `GIT_COMMON_DIR` it ran
+    /// with, empty when unset.
+    fn git_calls(&self) -> Vec<(bool, PathBuf, String, String, String)> {
         let log =
             std::fs::read_to_string(self.data.path().join("git-calls.log")).unwrap_or_default();
         log.lines()
             .map(|line| {
-                let mut parts = line.splitn(3, '\t');
-                let (token, dir, args) = (parts.next(), parts.next(), parts.next());
+                let mut parts = line.splitn(5, '\t');
+                let (token, dir) = (parts.next(), parts.next());
+                let (git_dir, common, args) = (parts.next(), parts.next(), parts.next());
                 (
                     token == Some("token"),
                     PathBuf::from(dir.unwrap()),
                     args.unwrap_or_default().to_owned(),
+                    git_dir.unwrap_or_default().to_owned(),
+                    common.unwrap_or_default().to_owned(),
                 )
             })
             .collect()
@@ -4513,7 +4519,8 @@ async fn the_token_fetch_reads_nothing_planted_in_the_fetch_repo_and_leaves_none
     );
     assert!(!fetches.exists());
 
-    // A `commondir` file that names a repo whose config does.
+    // A `commondir` file that names a repo whose config does. The repo is made anew before git
+    // runs, so the file is gone and the create reads the real remote.
     let common = setup.remotes.path().join("common.git");
     git(
         setup.remotes.path(),
@@ -4662,6 +4669,55 @@ async fn a_retry_starts_no_setup_for_a_create_that_chose_none() {
     assert!(setup.terminals_of(none).is_empty());
 }
 
+impl Setup {
+    /// Starts `sh -c script` in workspace `id`'s worktree as a terminal, as a create's setup
+    /// would be, and records nothing about it in the workspace.
+    async fn start_terminal(&self, id: WorkspaceId, script: &str) -> TerminalId {
+        let argv = ["/bin/sh", "-c", script].map(String::from);
+        self.terminals
+            .start(id, &self.workspaces.worktree(id).await.unwrap(), &argv, &[])
+            .await
+            .unwrap()
+    }
+
+    /// Writes workspace `id`'s record again with no setup terminal, as it stood when the
+    /// daemon died between starting the setup and recording it.
+    async fn forget_setup(&self, id: WorkspaceId) {
+        let body = Workspace {
+            setup: None,
+            ..self.body(id)
+        };
+        self.workspaces.inner.write(body, false).await.unwrap();
+    }
+
+    /// Writes a session record of workspace `id` that names `terminal`.
+    fn session_on(&self, id: WorkspaceId, terminal: TerminalId) {
+        let mut store = self.store.lock().unwrap();
+        let record = AnyRecord::Session(Record {
+            owner: self.me,
+            version: store.own_next_version().unwrap(),
+            deleted: false,
+            body: Session {
+                id: SessionId::random(),
+                workspace: id,
+                terminal,
+                model: "claude-opus-5-5".into(),
+                state: SessionState::Working,
+            },
+        });
+        store.apply(&record, self.me).unwrap();
+    }
+
+    /// The terminals of workspace `id` that are not deleted.
+    fn open_terminals(&self, id: WorkspaceId) -> Vec<TerminalId> {
+        self.terminals_of(id)
+            .into_iter()
+            .filter(|t| !t.deleted)
+            .map(|t| t.body.id)
+            .collect()
+    }
+}
+
 #[tokio::test]
 async fn a_retry_records_a_terminal_the_first_create_left_unrecorded_and_starts_no_second() {
     let setup = Setup::new();
@@ -4675,32 +4731,76 @@ async fn a_retry_records_a_terminal_the_first_create_left_unrecorded_and_starts_
             tag(remote.project, "run"),
         )
     };
-    let id = make(Provision::None).await.unwrap();
-    // The daemon died between starting the setup and recording it: a terminal runs, the
-    // record names none.
-    let argv = ["/bin/sh", "-c", "sleep 3193"].map(String::from);
-    let running = setup
-        .terminals
-        .start(
-            id,
-            &setup.workspaces.worktree(id).await.unwrap(),
-            &argv,
-            &[],
-        )
-        .await
-        .unwrap();
+    // The first create is due to run a setup; the daemon dies between starting it and
+    // recording it, so a terminal runs and the record names none.
+    let id = make(commands(&["sleep 3193"], 30)).await.unwrap();
+    let running = setup.body(id).setup.expect("the setup is recorded");
+    setup.forget_setup(id).await;
     assert_eq!(setup.body(id).setup, None);
 
     let again = make(commands(&["true"], 30)).await.unwrap();
 
     assert_eq!(again, id);
-    let live: Vec<_> = setup
-        .terminals_of(id)
-        .into_iter()
-        .filter(|t| !t.deleted)
-        .collect();
-    assert_eq!(live.len(), 1, "{live:?}");
+    assert_eq!(setup.open_terminals(id), [running]);
     assert_eq!(setup.body(id).setup, Some(running));
+}
+
+#[tokio::test]
+async fn a_retry_of_a_create_due_to_run_no_setup_adopts_no_terminal_and_starts_none() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let make = |provision| {
+        setup.make(
+            &remote,
+            "run",
+            new_branch("main", "fac/7-2"),
+            provision,
+            tag(remote.project, "run"),
+        )
+    };
+    let id = make(Provision::None).await.unwrap();
+    // A terminal somebody opened in the workspace, such as a person's shell.
+    let shell = setup.start_terminal(id, "sleep 3197").await;
+
+    let again = make(commands(&["true"], 30)).await.unwrap();
+
+    assert_eq!(again, id);
+    assert_eq!(setup.body(id).setup, None);
+    assert_eq!(setup.open_terminals(id), [shell]);
+}
+
+#[tokio::test]
+async fn a_retry_does_not_adopt_a_sessions_terminal_and_starts_the_setup_due() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let make = |provision| {
+        setup.make(
+            &remote,
+            "run",
+            new_branch("main", "fac/7-3"),
+            provision,
+            tag(remote.project, "run"),
+        )
+    };
+    let id = make(commands(&["true"], 30)).await.unwrap();
+    let first = setup.body(id).setup.expect("the setup is recorded");
+    // The setup's terminal is gone and the record names none; a session opened a terminal.
+    setup.setup_ended(id).await;
+    setup.terminals.close(first).await.unwrap();
+    setup.forget_setup(id).await;
+    let session = setup.start_terminal(id, "sleep 3199").await;
+    setup.session_on(id, session);
+
+    let again = make(commands(&["false"], 30)).await.unwrap();
+
+    assert_eq!(again, id);
+    let recorded = setup.body(id).setup.expect("the due setup is recorded");
+    assert_ne!(recorded, session);
+    let mut open = setup.open_terminals(id);
+    open.sort_by_key(|t| t.0);
+    let mut want = [session, recorded];
+    want.sort_by_key(|t| t.0);
+    assert_eq!(open, want);
 }
 
 #[test]
@@ -4897,17 +4997,18 @@ async fn only_the_token_fetch_in_the_fetch_repo_carries_the_token() {
     let calls = setup.git_calls();
     let with: Vec<_> = calls.iter().filter(|(token, ..)| *token).collect();
     assert_eq!(with.len(), 1, "{calls:#?}");
-    let (_, dir, args) = with[0];
-    assert_eq!(
-        dir,
-        &data.join("fetches").join(format!("{}.git", remote.project))
-    );
+    let (_, dir, args, git_dir, common) = with[0];
+    let fetch_repo = data.join("fetches").join(format!("{}.git", remote.project));
+    assert_eq!(dir, &fetch_repo);
+    // The call is pinned to the fetch repo, so no discovery can lead it to another.
+    assert_eq!(Path::new(git_dir), fetch_repo);
+    assert_eq!(Path::new(common), fetch_repo);
     assert!(args.contains(" fetch --quiet "), "{args}");
     assert!(!args.contains(TOKEN), "{args}");
     // Every call in the shared clone or a worktree has none, and there were some.
     let shared: Vec<_> = calls
         .iter()
-        .filter(|(_, dir, _)| {
+        .filter(|(_, dir, ..)| {
             dir.starts_with(data.join("clones")) || dir.starts_with(data.join("worktrees"))
         })
         .collect();
@@ -4981,6 +5082,14 @@ async fn a_token_fetch_that_fails_never_shows_the_token() {
     assert!(!format!("{err:?}").contains(TOKEN), "{err:?}");
     assert!(!logs.text().contains(TOKEN));
     assert!(setup.workspace_records().is_empty());
+    assert!(
+        !setup
+            .data
+            .path()
+            .join("fetches")
+            .join(format!("{}.git", remote.project))
+            .exists()
+    );
 }
 
 #[tokio::test]
