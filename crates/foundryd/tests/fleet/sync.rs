@@ -1314,11 +1314,11 @@ async fn a_factory_catch_up_of_large_run_events_goes_in_messages_a_link_can_carr
                 "a message of {} bytes",
                 text.len()
             );
-            // A link that carries 70 KB a second takes a whole message before the other end's
-            // silence limit ends it.
+            // One message being written and one queued behind it cross a 70 KB a second path
+            // that a pair's two links share before the other end's silence limit ends them.
             assert!(
-                text.len() as u64 <= 70_000 * OFFLINE_AFTER.as_secs(),
-                "a message of {} bytes does not cross a slow link within {OFFLINE_AFTER:?}",
+                2 * text.len() as u64 <= 70_000 * OFFLINE_AFTER.as_secs() / 2,
+                "two messages of {} bytes do not cross a shared slow path within {OFFLINE_AFTER:?}",
                 text.len()
             );
             received.extend(
@@ -1613,4 +1613,118 @@ async fn a_factory_catch_up_of_several_batches_goes_without_waiting_a_tick_betwe
         took < Duration::from_secs(1),
         "the catch-up waited between messages: {took:?}"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn over_a_slow_link_a_factory_catch_up_keeps_p1_records_behind_at_most_one_factory_message() {
+    let peer = MachineId::random();
+    let fleet = Fleet::start_with(1, &[peer]);
+    let a = &fleet.daemons[0];
+    let run = RunId::new("original-solutions/foundry", 132, 1).unwrap();
+    let total = 40;
+    for i in 0..total {
+        write_factory(a, large_event(&run, &format!("gate-{i}"), 64 * 1024));
+    }
+
+    // The peer's end works as a socket writer does: it takes each message off the link's queue
+    // at once, then spends the message's time on a 70 KB a second wire before it takes another.
+    let mut conn = raw_link(&a.peers);
+    send(&conn, &hello(PROTOCOL, peer)).await;
+    let ids = Ids::random();
+    let (mut written, mut arrived) = (false, false);
+    let (mut ahead, mut received) = (0, 0);
+    let mut others = 0;
+    let start = Instant::now();
+    while received < total || !arrived {
+        let text = timeout(OFFLINE_AFTER, conn.recv.recv())
+            .await
+            .expect("a message within the offline limit")
+            .expect("the link stays open");
+        let _ = conn.send.try_send(heartbeat());
+        let message: serde_json::Value = serde_json::from_str(&text).unwrap();
+        if message["type"] == "factory_records" {
+            received += message["records"].as_array().unwrap().len();
+            if written && !arrived {
+                ahead += 1;
+            } else if !written {
+                a.write(workspace(ids.workspace, false));
+                written = true;
+            }
+        } else {
+            others += 1;
+            arrived |= message["type"] == "records"
+                && message["records"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r["body"]["id"] == ids.workspace.to_string());
+        }
+        let wire = Duration::from_secs_f64(text.len() as f64 / 70_000.0);
+        tokio::time::sleep(wire).await;
+    }
+    assert_eq!(received, total, "every factory record arrived");
+    // A round a tick, not a round each time the queue empties.
+    assert!(
+        others as u64 <= start.elapsed().as_secs() + 5,
+        "{others} other messages in {:?}",
+        start.elapsed()
+    );
+    assert!(
+        ahead <= 1,
+        "the P1 record waited behind {ahead} factory messages besides the one being written"
+    );
+}
+
+/// Makes the factory row of `owner`'s `version` on `daemon` one this build cannot read back:
+/// its owner is not a machine id.
+fn spoil_owner(daemon: &Daemon, owner: MachineId, version: u64) {
+    let db = rusqlite::Connection::open(&daemon.db).unwrap();
+    let changed = db
+        .execute(
+            "UPDATE factory_records SET owner = 'not a machine' WHERE owner = ?1 AND version = ?2",
+            rusqlite::params![owner.to_string(), version as i64],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_factory_row_of_another_owner_that_cannot_be_read_does_not_stop_factory_changes_for_own_writes()
+ {
+    let mut fleet = Fleet::start(2);
+    let run = RunId::new("original-solutions/foundry", 132, 1).unwrap();
+    let (a_id, b_id) = (fleet.daemons[0].id, fleet.daemons[1].id);
+    let from_b = write_factory(&fleet.daemons[1], run_event(&run, "from b"));
+    until(Duration::from_secs(10), "factory sync", || {
+        lock(&fleet.daemons[0].store)
+            .run_events(&run)
+            .unwrap()
+            .len()
+            == 1
+    })
+    .await;
+    spoil_owner(&fleet.daemons[0], b_id, from_b.version);
+
+    let a = &fleet.daemons[0];
+    let mut changes = a.peers.factory_changes();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    changes.borrow_and_update();
+    write_factory(a, run_event(&run, "own, while running"));
+    timeout(Duration::from_secs(5), changes.changed())
+        .await
+        .expect("an own write was not told past another owner's unreadable row")
+        .unwrap();
+
+    // So too after a restart, with the row there from the start.
+    fleet.restart(0).await;
+    let a = &fleet.daemons[0];
+    assert_eq!(a.id, a_id);
+    let mut changes = a.peers.factory_changes();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    changes.borrow_and_update();
+    write_factory(a, run_event(&run, "own, after a restart"));
+    timeout(Duration::from_secs(5), changes.changed())
+        .await
+        .expect("after a restart, an own write was not told past another owner's unreadable row")
+        .unwrap();
 }
