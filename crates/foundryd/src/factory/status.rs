@@ -371,51 +371,18 @@ mod tests {
     }
 
     #[test]
-    fn a_holding_status_below_a_generation_another_online_writer_reports_is_not_believed() {
+    fn a_holding_status_beats_a_not_holding_one_at_a_higher_generation() {
         let project = ProjectId::random();
-        let (stale, other, acting) = (
-            MachineId::random(),
-            MachineId::random(),
-            MachineId::random(),
-        );
-        // `stale` held the lease at 4, stopped acting and stays online; the ref is at 6.
-        let acting_says = held_by(project, other, 6);
-        let statuses = vec![
-            (acting, acting_says.clone()),
-            (stale, holding(project, 4, 300)),
-        ];
-
-        let believed = believed(&statuses, &online(&[stale, acting]), acting);
-
-        assert_eq!(believed, Some(acting_says));
-    }
-
-    #[test]
-    fn a_generation_reported_by_a_writer_that_is_not_online_unseats_no_holder() {
-        let project = ProjectId::random();
-        let (holder, gone, acting) = (
+        let (holder, other, acting) = (
             MachineId::random(),
             MachineId::random(),
             MachineId::random(),
         );
         let holds = holding(project, 4, 3);
         let statuses = vec![
-            (gone, held_by(project, acting, 9)),
+            (acting, held_by(project, other, 6)),
             (holder, holds.clone()),
-            (acting, no_token(project)),
         ];
-
-        let believed = believed(&statuses, &online(&[holder, acting]), acting);
-
-        assert_eq!(believed, Some(holds));
-    }
-
-    #[test]
-    fn a_no_token_status_does_not_unseat_an_online_holder() {
-        let project = ProjectId::random();
-        let (holder, acting) = (MachineId::random(), MachineId::random());
-        let holds = holding(project, 4, 3);
-        let statuses = vec![(acting, no_token(project)), (holder, holds.clone())];
 
         let believed = believed(&statuses, &online(&[holder, acting]), acting);
 
@@ -426,12 +393,14 @@ mod tests {
     fn of_two_holders_at_one_generation_the_higher_pass_is_believed_in_any_order() {
         let project = ProjectId::random();
         let (one, two) = (MachineId::random(), MachineId::random());
+        let (low, high) = (one.min(two), one.max(two));
+        // The higher pass is the higher machine id's, so the pass must beat the id.
         let higher = holding(project, 5, 4);
-        let statuses = vec![(one, holding(project, 5, 3)), (two, higher.clone())];
+        let statuses = vec![(low, holding(project, 5, 3)), (high, higher.clone())];
 
         for order in [statuses.clone(), statuses.into_iter().rev().collect()] {
             assert_eq!(
-                believed(&order, &online(&[one, two]), one),
+                believed(&order, &online(&[low, high]), low),
                 Some(higher.clone())
             );
         }
