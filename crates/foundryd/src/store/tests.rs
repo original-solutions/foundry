@@ -1,5 +1,8 @@
 use std::collections::BTreeMap;
 
+use foundry_proto::factory::{
+    FactoryBody, FactoryRecord, FactoryStatus, MachineHeld, RunEvent, RunId, SessionTurn,
+};
 use foundry_proto::ids::{MachineId, ProjectId, SessionId, TerminalId, WorkspaceId};
 use foundry_proto::record::{AnyRecord, MachineSample, Record, Session, Terminal, Workspace};
 use foundry_proto::settings::{Limits, Machine, SharedSettings};
@@ -860,8 +863,9 @@ fn no_column_in_the_schema_holds_a_time() {
     }
 }
 
-/// Review focus 3, checked in the queries themselves: every `ORDER BY` in `mod.rs` orders
-/// by a version. It reads only `mod.rs`, which holds every query of the store today.
+/// Review focus 3, checked in the queries themselves: every `ORDER BY` in `mod.rs` (P1's
+/// queries) orders by a version. The factory table's queries are in `factory.rs`; see
+/// `the_factory_queries_order_only_by_a_generation_a_version_or_an_owner`.
 #[test]
 fn every_query_that_orders_orders_by_version() {
     let source = include_str!("mod.rs").to_uppercase();
@@ -1039,4 +1043,1048 @@ fn apply_batch_stores_valid_prefix_skips_stale_and_reports_not_owner() {
         store.since(owner, 0).unwrap(),
         vec![workspace(owner, 2), terminal(owner, 3)]
     );
+}
+
+// Factory records.
+
+fn run_id(repo: &str, issue: u64, attempt: u32) -> RunId {
+    RunId::new(repo, issue, attempt).unwrap()
+}
+
+fn fr(owner: MachineId, version: u64, body: FactoryBody) -> FactoryRecord {
+    FactoryRecord {
+        owner,
+        version,
+        body,
+    }
+}
+
+/// A run event whose `ts` and `ms` are given, so a test can make the times disagree with the
+/// versions.
+fn run_event(
+    owner: MachineId,
+    version: u64,
+    run: &RunId,
+    generation: u64,
+    ms: u64,
+) -> FactoryRecord {
+    fr(
+        owner,
+        version,
+        FactoryBody::RunEvent(RunEvent {
+            run: run.clone(),
+            generation,
+            ts: format!("2026-10-04T10:00:{:02}.000Z", ms % 60),
+            ms,
+            event: "step_changed".into(),
+            data: serde_json::json!({"step": "red"}),
+            cause: None,
+        }),
+    )
+}
+
+fn status_body(project: ProjectId, pass: u64, generation: u64) -> FactoryStatus {
+    FactoryStatus {
+        project,
+        pass,
+        holds: true,
+        generation,
+        not_holding: None,
+        idle: None,
+        owner_ignored: false,
+        ready: vec![],
+        feedback_waiting: vec![],
+        runs: vec![],
+        held_up: vec![],
+        gate_infra: vec![],
+        finished: vec![],
+        foreign: vec![],
+    }
+}
+
+fn status(
+    owner: MachineId,
+    version: u64,
+    project: ProjectId,
+    pass: u64,
+    generation: u64,
+) -> FactoryRecord {
+    fr(
+        owner,
+        version,
+        FactoryBody::Status(status_body(project, pass, generation)),
+    )
+}
+
+fn held_body(logins: &[&str]) -> MachineHeld {
+    MachineHeld {
+        logins: logins.iter().map(|l| (*l).to_owned()).collect(),
+        skill: true,
+    }
+}
+
+fn held(owner: MachineId, version: u64, logins: &[&str]) -> FactoryRecord {
+    fr(owner, version, FactoryBody::Held(held_body(logins)))
+}
+
+fn turn_body(session: SessionId, turn: u64) -> SessionTurn {
+    SessionTurn {
+        session,
+        workspace: WorkspaceId(uuid::Uuid::from_u128(1)),
+        project: ProjectId(uuid::Uuid::from_u128(2)),
+        turn,
+        prompts: turn,
+        question: false,
+    }
+}
+
+fn turn_record(owner: MachineId, version: u64, session: SessionId, turn: u64) -> FactoryRecord {
+    fr(owner, version, FactoryBody::Turn(turn_body(session, turn)))
+}
+
+fn every_factory_kind(owner: MachineId, version: u64) -> Vec<FactoryRecord> {
+    vec![
+        run_event(owner, version, &run_id("a/b", 1, 1), 1, 5),
+        status(owner, version, ProjectId(uuid::Uuid::from_u128(2)), 1, 1),
+        held(owner, version, &["tomkaczocha"]),
+        turn_record(owner, version, SessionId(uuid::Uuid::from_u128(4)), 1),
+    ]
+}
+
+fn factory_rows(store: &Store) -> i64 {
+    store
+        .conn
+        .query_row("SELECT COUNT(*) FROM factory_records", [], |row| row.get(0))
+        .unwrap()
+}
+
+#[test]
+fn apply_factory_stores_every_kind_from_its_owner() {
+    let (_dir, mut store) = open();
+    let owner = MachineId::random();
+    for record in every_factory_kind(owner, 1) {
+        assert_eq!(
+            store.apply_factory(&record, owner).unwrap(),
+            Applied::Stored,
+            "{record:?}"
+        );
+    }
+    assert_eq!(factory_rows(&store), 4);
+    assert_eq!(
+        store.factory_since(owner, 0, usize::MAX).unwrap(),
+        every_factory_kind(owner, 1)
+    );
+}
+
+#[test]
+fn apply_factory_refuses_a_record_from_a_machine_that_is_not_its_owner() {
+    let (_dir, mut store) = open();
+    let owner = MachineId::random();
+    let other = MachineId::random();
+    for record in every_factory_kind(owner, 1) {
+        assert_eq!(
+            store.apply_factory(&record, other).unwrap(),
+            Applied::NotOwner
+        );
+    }
+    assert_eq!(factory_rows(&store), 0);
+}
+
+#[test]
+fn apply_factory_refuses_to_take_a_key_another_owner_holds() {
+    let (_dir, mut store) = open();
+    let first = MachineId::random();
+    let second = MachineId::random();
+    let session = SessionId::random();
+    let theirs = turn_record(first, 1, session, 1);
+    assert_eq!(
+        store.apply_factory(&theirs, first).unwrap(),
+        Applied::Stored
+    );
+    let claim = turn_record(second, 9, session, 2);
+    assert_eq!(
+        store.apply_factory(&claim, second).unwrap(),
+        Applied::NotOwner
+    );
+    assert_eq!(factory_rows(&store), 1);
+    assert_eq!(
+        store.session_turn(session).unwrap(),
+        Some(turn_body(session, 1))
+    );
+    assert!(store.factory_since(second, 0, 10).unwrap().is_empty());
+}
+
+#[test]
+fn apply_factory_takes_only_a_higher_version() {
+    let (_dir, mut store) = open();
+    let owner = MachineId::random();
+    let project = ProjectId::random();
+    let session = SessionId::random();
+    let status_at = |version, pass| status(owner, version, project, pass, 1);
+    let turn_at = |version, turn| turn_record(owner, version, session, turn);
+
+    assert_eq!(
+        store.apply_factory(&status_at(5, 10), owner).unwrap(),
+        Applied::Stored
+    );
+    assert_eq!(
+        store.apply_factory(&turn_at(6, 1), owner).unwrap(),
+        Applied::Stored
+    );
+    for version in [5, 4, 1] {
+        assert_eq!(
+            store.apply_factory(&status_at(version, 99), owner).unwrap(),
+            Applied::Stale
+        );
+        assert_eq!(
+            store
+                .apply_factory(&turn_at(version + 1, 99), owner)
+                .unwrap(),
+            Applied::Stale
+        );
+    }
+    assert_eq!(store.statuses(project).unwrap()[0].1.pass, 10);
+    assert_eq!(store.session_turn(session).unwrap().unwrap().turn, 1);
+
+    assert_eq!(
+        store.apply_factory(&status_at(6, 11), owner).unwrap(),
+        Applied::Stored
+    );
+    assert_eq!(
+        store.apply_factory(&turn_at(7, 2), owner).unwrap(),
+        Applied::Stored
+    );
+    assert_eq!(store.statuses(project).unwrap()[0].1.pass, 11);
+    assert_eq!(store.session_turn(session).unwrap().unwrap().turn, 2);
+    assert_eq!(factory_rows(&store), 2);
+}
+
+#[test]
+fn applying_a_factory_record_twice_changes_nothing() {
+    let (_dir, mut store) = open();
+    let owner = MachineId::random();
+    for record in every_factory_kind(owner, 3) {
+        assert_eq!(
+            store.apply_factory(&record, owner).unwrap(),
+            Applied::Stored
+        );
+        assert_eq!(store.apply_factory(&record, owner).unwrap(), Applied::Stale);
+    }
+    assert_eq!(factory_rows(&store), 4);
+    assert_eq!(
+        store.factory_since(owner, 0, usize::MAX).unwrap(),
+        every_factory_kind(owner, 3)
+    );
+}
+
+#[test]
+fn apply_factory_refuses_a_version_above_what_the_store_can_hold() {
+    let (_dir, mut store) = open();
+    let owner = MachineId::random();
+    let record = held(owner, 1u64 << 63, &["a"]);
+    assert!(matches!(
+        store.apply_factory(&record, owner),
+        Err(StoreError::TooLarge { .. })
+    ));
+    assert_eq!(factory_rows(&store), 0);
+}
+
+#[test]
+fn own_next_factory_version_rises_and_survives_a_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("foundry.db");
+    let mut store = Store::open(&path).unwrap();
+    let first = store.own_next_factory_version().unwrap();
+    let second = store.own_next_factory_version().unwrap();
+    assert!(second > first);
+    drop(store);
+    let mut store = Store::open(&path).unwrap();
+    assert!(store.own_next_factory_version().unwrap() > second);
+}
+
+#[test]
+fn the_factory_version_and_the_p1_version_count_apart() {
+    let (_dir, mut store) = open();
+    let p1: Vec<u64> = (0..3).map(|_| store.own_next_version().unwrap()).collect();
+    assert_eq!(p1, [1, 2, 3]);
+    let first = store.own_next_factory_version().unwrap();
+    assert_eq!(store.own_next_factory_version().unwrap(), first + 1);
+    // The factory counter did not move P1's.
+    assert_eq!(store.own_next_version().unwrap(), 4);
+    let next = store.own_next_factory_version().unwrap();
+    assert_eq!(next, first + 2);
+}
+
+#[test]
+fn factory_since_gives_one_owners_records_above_a_version_lowest_first_up_to_a_limit() {
+    let (_dir, mut store) = open();
+    let owner = MachineId::random();
+    let other = MachineId::random();
+    for version in [4, 2, 5, 3, 1] {
+        let record = held(owner, version, &["x"]);
+        store.apply_factory(&record, owner).unwrap();
+    }
+    let project = ProjectId::random();
+    store
+        .apply_factory(&status(other, 2, project, 1, 1), other)
+        .unwrap();
+    // One key per owner for `held`, so only the last stored version of it remains.
+    assert_eq!(
+        store.factory_since(owner, 0, 10).unwrap(),
+        vec![held(owner, 5, &["x"])]
+    );
+    assert!(
+        store
+            .factory_since(owner, u64::MAX, 100)
+            .unwrap()
+            .is_empty()
+    );
+
+    let run = run_id("a/b", 1, 1);
+    for version in [10, 8, 9, 7] {
+        let record = run_event(owner, version, &run, 1, 1);
+        store.apply_factory(&record, owner).unwrap();
+    }
+    let versions =
+        |records: Vec<FactoryRecord>| -> Vec<u64> { records.iter().map(|r| r.version).collect() };
+    assert_eq!(
+        versions(store.factory_since(owner, 0, 100).unwrap()),
+        [5, 7, 8, 9, 10]
+    );
+    assert_eq!(
+        versions(store.factory_since(owner, 7, 100).unwrap()),
+        [8, 9, 10]
+    );
+    assert_eq!(versions(store.factory_since(owner, 0, 2).unwrap()), [5, 7]);
+    assert_eq!(versions(store.factory_since(other, 0, 100).unwrap()), [2]);
+    assert!(store.factory_since(owner, 10, 100).unwrap().is_empty());
+}
+
+#[test]
+fn factory_since_fails_on_a_row_of_a_kind_it_does_not_know() {
+    let (_dir, mut store) = open();
+    let owner = MachineId::random();
+    store.apply_factory(&held(owner, 1, &["a"]), owner).unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO factory_records (kind, id, owner, version, record)
+             VALUES ('mystery', 'x', ?1, 2, ?2)",
+            params![
+                owner.to_string(),
+                format!(r#"{{"owner":"{owner}","version":2,"kind":"mystery","body":{{}}}}"#)
+            ],
+        )
+        .unwrap();
+    assert!(matches!(
+        store.factory_since(owner, 0, 10),
+        Err(StoreError::Json(_))
+    ));
+    // A limit that stops before the row does not read it.
+    assert_eq!(store.factory_since(owner, 0, 1).unwrap().len(), 1);
+}
+
+#[test]
+fn factory_versions_gives_the_highest_per_owner_from_the_factory_table_only() {
+    let (_dir, mut store) = open();
+    let one = MachineId::random();
+    let two = MachineId::random();
+    let three = MachineId::random();
+    assert!(store.factory_versions().unwrap().is_empty());
+    store.apply(&workspace(three, 77), three).unwrap();
+    store.apply_factory(&held(one, 3, &["a"]), one).unwrap();
+    store
+        .apply_factory(&run_event(one, 8, &run_id("a/b", 1, 1), 1, 1), one)
+        .unwrap();
+    store.apply_factory(&held(two, 2, &["a"]), two).unwrap();
+    let versions = store.factory_versions().unwrap();
+    assert_eq!(versions, BTreeMap::from([(one, 8), (two, 2)]));
+    // And P1's `versions` does not show the factory owners.
+    assert_eq!(store.versions().unwrap(), BTreeMap::from([(three, 77)]));
+}
+
+#[test]
+fn p1_reads_never_return_or_count_a_factory_record() {
+    let (_dir, mut store) = open();
+    let owner = MachineId::random();
+    let session_id = SessionId(uuid::Uuid::from_u128(4));
+    store.apply(&session(owner, 1), owner).unwrap();
+    let before_since = store.since(owner, 0).unwrap();
+    let before_versions = store.versions().unwrap();
+    let before_live = store.live_session_count(owner).unwrap();
+    assert_eq!(before_live, 1);
+
+    let factory_owner = MachineId::random();
+    for record in every_factory_kind(owner, 50) {
+        store.apply_factory(&record, owner).unwrap();
+    }
+    // A turn for the owner's session from a second machine is refused, not stored.
+    assert_eq!(
+        store
+            .apply_factory(
+                &turn_record(factory_owner, 60, session_id, 3),
+                factory_owner,
+            )
+            .unwrap(),
+        Applied::NotOwner
+    );
+    // And a record the second machine really owns, stored, is still no P1 record.
+    assert_eq!(
+        store
+            .apply_factory(&held(factory_owner, 61, &["x"]), factory_owner)
+            .unwrap(),
+        Applied::Stored
+    );
+    assert_eq!(
+        store
+            .apply_factory(
+                &turn_record(factory_owner, 62, SessionId(uuid::Uuid::from_u128(9)), 1),
+                factory_owner,
+            )
+            .unwrap(),
+        Applied::Stored
+    );
+    assert!(
+        !store
+            .factory_since(factory_owner, 0, 10)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(store.since(owner, 0).unwrap(), before_since);
+    assert!(store.since(factory_owner, 0).unwrap().is_empty());
+    assert_eq!(store.versions().unwrap(), before_versions);
+    assert_eq!(store.live_session_count(owner).unwrap(), before_live);
+    assert_eq!(store.live_session_count(factory_owner).unwrap(), 0);
+    assert!(store.sessions_of(factory_owner).unwrap().is_empty());
+}
+
+#[test]
+fn run_events_read_back_in_generation_order_whatever_the_versions_and_times() {
+    let (_dir, mut store) = open();
+    let first = MachineId::random();
+    let second = MachineId::random();
+    let run = run_id("a/b", 1, 1);
+    // Generation 2 has the lower version and the earlier time.
+    let late = run_event(first, 9, &run, 1, 9_000);
+    let early = run_event(second, 1, &run, 2, 1_000);
+    // Generation 10 has the lowest version of all and a misleading time.
+    let tenth = run_event(first, 0, &run, 10, 500);
+    store.apply_factory(&early, second).unwrap();
+    store.apply_factory(&late, first).unwrap();
+    store.apply_factory(&tenth, first).unwrap();
+    let events = store.run_events(&run).unwrap();
+    assert_eq!(events.len(), 3);
+    assert_eq!(
+        events.iter().map(|e| e.generation).collect::<Vec<_>>(),
+        [1, 2, 10]
+    );
+    assert_eq!(events[0].ms, 9_000);
+}
+
+// Pins the read order should the query plan change: the primary-key range read yields
+// `<run>/<owner>/<version>` in owner order by itself today.
+#[test]
+fn run_events_of_one_generation_and_version_come_back_in_owner_order() {
+    let (_dir, mut store) = open();
+    let run = run_id("a/b", 1, 1);
+    let mut owners = [MachineId::random(), MachineId::random()];
+    owners.sort_by_key(|o| o.to_string());
+    let [low, high] = owners;
+    // Applied in reverse owner order; the ms tells whose event is whose.
+    store
+        .apply_factory(&run_event(high, 5, &run, 3, 222), high)
+        .unwrap();
+    store
+        .apply_factory(&run_event(low, 5, &run, 3, 111), low)
+        .unwrap();
+    let events = store.run_events(&run).unwrap();
+    assert_eq!(events.iter().map(|e| e.ms).collect::<Vec<_>>(), [111, 222]);
+}
+
+#[test]
+fn run_events_of_one_generation_come_back_in_version_order() {
+    let (_dir, mut store) = open();
+    let owner = MachineId::random();
+    let run = run_id("a/b", 1, 1);
+    // Applied out of order, with times that run the other way.
+    for (version, ms) in [(3, 100), (1, 300), (2, 200)] {
+        let record = run_event(owner, version, &run, 4, ms);
+        assert_eq!(
+            store.apply_factory(&record, owner).unwrap(),
+            Applied::Stored
+        );
+    }
+    let events = store.run_events(&run).unwrap();
+    assert_eq!(
+        events.iter().map(|e| e.ms).collect::<Vec<_>>(),
+        [300, 200, 100]
+    );
+}
+
+#[test]
+fn run_events_hold_one_run_and_only_events() {
+    let (_dir, mut store) = open();
+    let owner = MachineId::random();
+    let run = run_id("a/b", 1, 1);
+    let longer = run_id("a/b", 1, 10);
+    assert_eq!(longer.to_string(), format!("{run}0"));
+    let mut version = 0;
+    let put = |store: &mut Store, record: FactoryRecord| {
+        store.apply_factory(&record, owner).unwrap();
+    };
+    for (run, generation) in [(&run, 1), (&longer, 1), (&run, 2)] {
+        version += 1;
+        put(&mut store, run_event(owner, version, run, generation, 1));
+    }
+    put(&mut store, held(owner, 10, &["a"]));
+    put(&mut store, status(owner, 11, ProjectId::random(), 1, 1));
+    let events = store.run_events(&run).unwrap();
+    assert_eq!(events.len(), 2);
+    assert!(events.iter().all(|e| e.run == run));
+    let longer_events = store.run_events(&longer).unwrap();
+    assert_eq!(longer_events.len(), 1);
+    assert!(store.run_events(&run_id("a/b", 2, 1)).unwrap().is_empty());
+}
+
+#[test]
+fn runs_of_gives_each_run_of_the_repo_once_in_order() {
+    let (_dir, mut store) = open();
+    let owner = MachineId::random();
+    let other = MachineId::random();
+    let mut version = 0;
+    let mut put = |store: &mut Store, from: MachineId, run: &RunId, generation| {
+        version += 1;
+        store
+            .apply_factory(&run_event(from, version, run, generation, 1), from)
+            .unwrap();
+    };
+    let two = run_id("Rawphp/SoftFac", 2, 1);
+    let ten = run_id("rawphp/softfac", 10, 1);
+    put(&mut store, owner, &two, 1);
+    put(&mut store, owner, &two, 1);
+    put(&mut store, other, &two, 2);
+    put(&mut store, owner, &ten, 1);
+    put(&mut store, owner, &run_id("rawphp/softfac-extra", 3, 1), 1);
+    put(&mut store, owner, &run_id("rawphp/soft", 4, 1), 1);
+    put(&mut store, owner, &run_id("other/softfac", 5, 1), 1);
+    let expected = vec![two.clone(), ten.clone()];
+    assert_eq!(store.runs_of("rawphp/softfac").unwrap(), expected);
+    assert_eq!(store.runs_of("RawPHP/SoftFac").unwrap(), expected);
+    assert!(store.runs_of("rawphp/none").unwrap().is_empty());
+}
+
+#[test]
+fn runs_of_keeps_out_a_repo_whose_name_extends_the_one_asked_for() {
+    let (_dir, mut store) = open();
+    let owner = MachineId::random();
+    let mut version = 0;
+    let mut put = |store: &mut Store, run: &RunId| {
+        version += 1;
+        store
+            .apply_factory(&run_event(owner, version, run, 1, 1), owner)
+            .unwrap();
+    };
+    let plain = run_id("rawphp/softfac", 8, 1);
+    let own = run_id("rawphp/softfac__x", 1, 1);
+    // Its key, `rawphp__softfac__8__1__3__1`, reads like a run of `rawphp/softfac`.
+    let lookalike = run_id("rawphp/softfac__8__1", 3, 1);
+    for run in [&plain, &own, &lookalike] {
+        put(&mut store, run);
+    }
+    assert_eq!(store.runs_of("rawphp/softfac").unwrap(), vec![plain]);
+    assert_eq!(store.runs_of("rawphp/softfac__x").unwrap(), vec![own]);
+    assert_eq!(
+        store.runs_of("rawphp/softfac__8__1").unwrap(),
+        vec![lookalike]
+    );
+}
+
+#[test]
+fn runs_of_reads_the_run_from_the_key_and_never_parses_another_repos_records() {
+    let (_dir, mut store) = open();
+    let owner = MachineId::random();
+    let run = run_id("rawphp/softfac", 2, 1);
+    store
+        .apply_factory(&run_event(owner, 1, &run, 1, 1), owner)
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO factory_records (kind, id, owner, version, record) \
+             VALUES ('run_event', ?1, ?2, 2, 'not json')",
+            params![format!("other__repo__1__1/{owner}/2"), owner.to_string()],
+        )
+        .unwrap();
+    assert_eq!(store.runs_of("rawphp/softfac").unwrap(), vec![run]);
+}
+
+#[test]
+fn runs_of_folds_the_repo_as_a_run_id_does() {
+    let (_dir, mut store) = open();
+    let owner = MachineId::random();
+    let run = run_id("rawphp/softfack", 2, 1);
+    store
+        .apply_factory(&run_event(owner, 1, &run, 1, 1), owner)
+        .unwrap();
+    assert_eq!(store.runs_of("RawPHP/SoftFacK").unwrap(), vec![run]);
+    // U+212A KELVIN SIGN lowercases to `k` in Unicode, but is no legal repo character.
+    assert!(store.runs_of("rawphp/softfac\u{212A}").unwrap().is_empty());
+    assert!(store.runs_of("not a repo").unwrap().is_empty());
+}
+
+#[test]
+fn statuses_gives_every_writers_status_of_the_project_by_machine() {
+    let (_dir, mut store) = open();
+    let project = ProjectId::random();
+    let elsewhere = ProjectId::random();
+    let mut machines = [
+        MachineId::random(),
+        MachineId::random(),
+        MachineId::random(),
+    ];
+    for (at, machine) in machines.iter().enumerate() {
+        let record = status(*machine, 1, project, at as u64, 1);
+        store.apply_factory(&record, *machine).unwrap();
+    }
+    store
+        .apply_factory(&status(machines[0], 2, elsewhere, 7, 1), machines[0])
+        .unwrap();
+    let statuses = store.statuses(project).unwrap();
+    machines.sort();
+    assert_eq!(
+        statuses.iter().map(|(m, _)| *m).collect::<Vec<_>>(),
+        machines
+    );
+    assert!(statuses.iter().all(|(_, s)| s.project == project));
+    assert_eq!(store.statuses(elsewhere).unwrap().len(), 1);
+    assert!(store.statuses(ProjectId::random()).unwrap().is_empty());
+}
+
+#[test]
+fn highest_generation_is_the_highest_any_writer_has_for_the_project() {
+    let (_dir, mut store) = open();
+    let project = ProjectId::random();
+    let elsewhere = ProjectId::random();
+    let one = MachineId::random();
+    let two = MachineId::random();
+    assert_eq!(store.highest_generation(project).unwrap(), 0);
+    store
+        .apply_factory(&status(one, 1, project, 1, 3), one)
+        .unwrap();
+    store
+        .apply_factory(&status(two, 1, project, 1, 7), two)
+        .unwrap();
+    store
+        .apply_factory(&status(one, 2, elsewhere, 1, 90), one)
+        .unwrap();
+    assert_eq!(store.highest_generation(project).unwrap(), 7);
+    assert_eq!(store.highest_generation(elsewhere).unwrap(), 90);
+    // A run event's generation is not a status's.
+    store
+        .apply_factory(&run_event(one, 3, &run_id("a/b", 1, 1), 99, 1), one)
+        .unwrap();
+    assert_eq!(store.highest_generation(project).unwrap(), 7);
+}
+
+#[test]
+fn held_and_session_turn_are_read_by_their_key() {
+    let (_dir, mut store) = open();
+    let owner = MachineId::random();
+    let other = MachineId::random();
+    let session = SessionId::random();
+    assert_eq!(store.held(owner).unwrap(), None);
+    assert_eq!(store.session_turn(session).unwrap(), None);
+    store
+        .apply_factory(&held(owner, 1, &["tomkaczocha", "rawphp"]), owner)
+        .unwrap();
+    store
+        .apply_factory(&turn_record(owner, 2, session, 6), owner)
+        .unwrap();
+    assert_eq!(
+        store.held(owner).unwrap(),
+        Some(held_body(&["tomkaczocha", "rawphp"]))
+    );
+    assert_eq!(store.held(other).unwrap(), None);
+    assert_eq!(
+        store.session_turn(session).unwrap(),
+        Some(turn_body(session, 6))
+    );
+    assert_eq!(store.session_turn(SessionId::random()).unwrap(), None);
+}
+
+/// Puts a factory row this build cannot read under `kind` and `id`, as a newer build would
+/// have left it before a rollback: `body` is the record's body with a change this build does
+/// not know.
+fn insert_unreadable_factory(
+    store: &Store,
+    owner: MachineId,
+    version: u64,
+    kind: &str,
+    id: &str,
+    body: serde_json::Value,
+) {
+    let record = serde_json::json!({
+        "owner": owner.to_string(),
+        "version": version,
+        "kind": kind,
+        "body": body,
+    });
+    assert!(serde_json::from_value::<FactoryRecord>(record.clone()).is_err());
+    store
+        .conn
+        .execute(
+            "INSERT INTO factory_records (kind, id, owner, version, record)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                kind,
+                id,
+                owner.to_string(),
+                version as i64,
+                record.to_string()
+            ],
+        )
+        .unwrap();
+}
+
+/// One writer's status this build cannot read must not hide the other writers' statuses, as
+/// `sessions_of` leaves out a session it cannot read. Its generation still counts: a lease
+/// checked against a lower one could be taken from a writer that holds a higher one.
+#[test]
+fn statuses_leave_out_a_status_they_cannot_read_and_give_the_rest() {
+    let (_dir, mut store) = open();
+    let project = ProjectId::random();
+    let one = MachineId::random();
+    let two = MachineId::random();
+    let newer = MachineId::random();
+    store
+        .apply_factory(&status(one, 1, project, 1, 3), one)
+        .unwrap();
+    store
+        .apply_factory(&status(two, 1, project, 1, 7), two)
+        .unwrap();
+    let mut body = serde_json::to_value(status_body(project, 1, 99)).unwrap();
+    body["ready"] = serde_json::json!([{"from": "a newer build"}]);
+    insert_unreadable_factory(
+        &store,
+        newer,
+        1,
+        "factory_status",
+        &format!("{project}/{newer}"),
+        body,
+    );
+
+    let statuses = store.statuses(project).unwrap();
+    let mut expected = vec![
+        (one, status_body(project, 1, 3)),
+        (two, status_body(project, 1, 7)),
+    ];
+    expected.sort_by_key(|(machine, _)| *machine);
+    assert_eq!(statuses, expected);
+    assert_eq!(store.highest_generation(project).unwrap(), 99);
+}
+
+/// When a status's generation itself cannot be read, the highest generation is not known, so
+/// it is an error rather than the highest of the rest.
+#[test]
+fn highest_generation_fails_on_a_status_whose_generation_it_cannot_read() {
+    let (_dir, mut store) = open();
+    let project = ProjectId::random();
+    let one = MachineId::random();
+    let newer = MachineId::random();
+    store
+        .apply_factory(&status(one, 1, project, 1, 7), one)
+        .unwrap();
+    for (at, generation) in [
+        serde_json::json!("from a newer build"),
+        serde_json::json!(-1),
+        serde_json::Value::Null,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut body = serde_json::to_value(status_body(project, 1, 0)).unwrap();
+        body["generation"] = generation.clone();
+        store
+            .conn
+            .execute(
+                "DELETE FROM factory_records WHERE owner = ?1",
+                params![newer.to_string()],
+            )
+            .unwrap();
+        insert_unreadable_factory(
+            &store,
+            newer,
+            at as u64 + 1,
+            "factory_status",
+            &format!("{project}/{newer}"),
+            body,
+        );
+        assert!(
+            store.highest_generation(project).is_err(),
+            "generation {generation} was read as a number"
+        );
+        assert_eq!(store.statuses(project).unwrap().len(), 1);
+    }
+}
+
+/// A run with an event left out would read as another run, so an event this build cannot
+/// read is an error, as it is for `factory_since`.
+#[test]
+fn run_events_fail_on_an_event_they_cannot_read() {
+    let (_dir, mut store) = open();
+    let owner = MachineId::random();
+    let run = run_id("a/b", 1, 1);
+    store
+        .apply_factory(&run_event(owner, 1, &run, 1, 1), owner)
+        .unwrap();
+    let FactoryBody::RunEvent(event) = run_event(owner, 2, &run, 1, 2).body else {
+        unreachable!()
+    };
+    let mut body = serde_json::to_value(event).unwrap();
+    body["generation"] = serde_json::json!("from a newer build");
+    insert_unreadable_factory(
+        &store,
+        owner,
+        2,
+        "run_event",
+        &format!("{run}/{owner}/2"),
+        body,
+    );
+    assert!(matches!(store.run_events(&run), Err(StoreError::Json(_))));
+}
+
+/// A record read by its key that this build cannot read is an error, never read as absent.
+#[test]
+fn held_fails_on_a_record_it_cannot_read() {
+    let (_dir, store) = open();
+    let owner = MachineId::random();
+    let mut body = serde_json::to_value(held_body(&["a"])).unwrap();
+    body["logins"] = serde_json::json!("from a newer build");
+    insert_unreadable_factory(&store, owner, 1, "machine_held", &owner.to_string(), body);
+    assert!(matches!(store.held(owner), Err(StoreError::Json(_))));
+}
+
+#[test]
+fn session_turn_fails_on_a_turn_it_cannot_read() {
+    let (_dir, store) = open();
+    let owner = MachineId::random();
+    let session = SessionId::random();
+    let mut body = serde_json::to_value(turn_body(session, 1)).unwrap();
+    body["turn"] = serde_json::json!("from a newer build");
+    insert_unreadable_factory(&store, owner, 1, "session_turn", &session.to_string(), body);
+    assert!(matches!(
+        store.session_turn(session),
+        Err(StoreError::Json(_))
+    ));
+}
+
+/// Puts `record` under `kind` and `id` whatever its own kind: a row `apply_factory` never
+/// writes, since it keys every record by `FactoryRecord::key`.
+fn insert_under_kind(store: &Store, kind: &str, id: &str, record: &FactoryRecord) {
+    assert_ne!(record.body.kind(), kind);
+    store
+        .conn
+        .execute(
+            "INSERT INTO factory_records (kind, id, owner, version, record)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                kind,
+                id,
+                record.owner.to_string(),
+                record.version as i64,
+                serde_json::to_string(record).unwrap()
+            ],
+        )
+        .unwrap();
+}
+
+/// A row of one kind that holds another kind of record is an error for the reads that give
+/// every row they find, never a row left out or read as absent.
+#[test]
+fn run_events_held_and_session_turn_fail_on_a_row_that_holds_another_kind() {
+    let (_dir, mut store) = open();
+    let owner = MachineId::random();
+    let run = run_id("a/b", 1, 1);
+    store
+        .apply_factory(&run_event(owner, 1, &run, 1, 1), owner)
+        .unwrap();
+    insert_under_kind(
+        &store,
+        "run_event",
+        &format!("{run}/{owner}/2"),
+        &held(owner, 2, &["a"]),
+    );
+    assert!(matches!(store.run_events(&run), Err(StoreError::Sqlite(_))));
+
+    let machine = MachineId::random();
+    insert_under_kind(
+        &store,
+        "machine_held",
+        &machine.to_string(),
+        &turn_record(machine, 1, SessionId::random(), 1),
+    );
+    assert!(matches!(store.held(machine), Err(StoreError::Sqlite(_))));
+
+    let session = SessionId::random();
+    insert_under_kind(
+        &store,
+        "session_turn",
+        &session.to_string(),
+        &held(machine, 2, &["a"]),
+    );
+    assert!(matches!(
+        store.session_turn(session),
+        Err(StoreError::Sqlite(_))
+    ));
+}
+
+/// A status row that holds another kind of record is left out, as a status this build cannot
+/// read is: one bad row never hides the other writers' statuses.
+#[test]
+fn statuses_leave_out_a_row_that_holds_another_kind() {
+    let (_dir, mut store) = open();
+    let project = ProjectId::random();
+    let one = MachineId::random();
+    let other = MachineId::random();
+    store
+        .apply_factory(&status(one, 1, project, 1, 3), one)
+        .unwrap();
+    insert_under_kind(
+        &store,
+        "factory_status",
+        &format!("{project}/{other}"),
+        &held(other, 1, &["a"]),
+    );
+    assert_eq!(
+        store.statuses(project).unwrap(),
+        vec![(one, status_body(project, 1, 3))]
+    );
+}
+
+/// A generation is stored inside the record, where the store reads it as a number it can
+/// hold, so a status or run event whose generation it cannot hold is refused as a version
+/// is.
+#[test]
+fn apply_factory_refuses_a_generation_above_what_the_store_can_hold() {
+    let (_dir, mut store) = open();
+    let owner = MachineId::random();
+    let project = ProjectId::random();
+    let run = run_id("a/b", 1, 1);
+    let too_large = 1u64 << 63;
+    for record in [
+        status(owner, 1, project, 1, too_large),
+        run_event(owner, 2, &run, too_large, 1),
+    ] {
+        assert!(matches!(
+            store.apply_factory(&record, owner),
+            Err(StoreError::TooLarge {
+                what: "generation",
+                ..
+            })
+        ));
+    }
+    assert_eq!(factory_rows(&store), 0);
+
+    let highest = too_large - 1;
+    for record in [
+        status(owner, 3, project, 1, highest),
+        run_event(owner, 4, &run, highest, 1),
+    ] {
+        assert_eq!(
+            store.apply_factory(&record, owner).unwrap(),
+            Applied::Stored
+        );
+    }
+    assert_eq!(store.highest_generation(project).unwrap(), highest);
+    assert_eq!(store.run_events(&run).unwrap()[0].generation, highest);
+}
+
+#[test]
+fn the_factory_migration_runs_on_an_empty_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("foundry.db");
+    std::fs::File::create(&path).unwrap();
+    let mut store = Store::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), MIGRATIONS.len());
+    assert!(MIGRATIONS.len() >= 2);
+    let owner = MachineId::random();
+    assert_eq!(
+        store.apply_factory(&held(owner, 1, &[]), owner).unwrap(),
+        Applied::Stored
+    );
+    assert_eq!(store.own_next_factory_version().unwrap(), 1);
+}
+
+#[test]
+fn the_factory_migration_runs_on_a_p1_database_and_leaves_records_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("foundry.db");
+    let owner = MachineId::random();
+    let snapshot = |conn: &rusqlite::Connection| -> Vec<(String, String, String, i64, String)> {
+        let mut query = conn
+            .prepare("SELECT kind, id, owner, version, record FROM records ORDER BY kind, id")
+            .unwrap();
+        query
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    let before;
+    {
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        migrate(&mut conn, 1).unwrap();
+        let mut p1 = Store { conn };
+        for record in every_kind(owner, 5) {
+            assert_eq!(p1.apply(&record, owner).unwrap(), Applied::Stored);
+        }
+        assert_eq!(p1.own_next_version().unwrap(), 1);
+        before = snapshot(&p1.conn);
+        assert_eq!(before.len(), 4);
+        assert_eq!(user_version(&p1.conn).unwrap(), 1);
+    }
+    let mut store = Store::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), MIGRATIONS.len());
+    assert_eq!(snapshot(&store.conn), before);
+    assert_eq!(store.own_next_version().unwrap(), 2);
+    assert_eq!(store.since(owner, 0).unwrap(), every_kind(owner, 5));
+    for record in every_factory_kind(owner, 1) {
+        assert_eq!(
+            store.apply_factory(&record, owner).unwrap(),
+            Applied::Stored
+        );
+    }
+    assert_eq!(snapshot(&store.conn), before);
+}
+
+#[test]
+fn the_factory_queries_order_only_by_a_generation_a_version_or_an_owner() {
+    let source = include_str!("factory.rs").to_uppercase();
+    assert!(!source.contains("$.BODY.TS"));
+    assert!(!source.contains("$.BODY.MS"));
+    let mut found = 0;
+    for (at, _) in source.match_indices("ORDER BY") {
+        found += 1;
+        let rest = &source[at + "ORDER BY".len()..];
+        let clause = rest.split(['"', ';']).next().unwrap();
+        // A string continued with `\` runs on to the next line; LIMIT ends the terms.
+        let clause = clause.replace("\\\n", " ");
+        let clause = clause.split("LIMIT").next().unwrap();
+        // The generation's own comma is not a separator between terms.
+        let clause = clause.replace("JSON_EXTRACT(RECORD, '$.BODY.GENERATION')", "GENERATION");
+        for term in clause.split(',') {
+            let term = term.trim();
+            let allowed = ["VERSION", "OWNER", "GENERATION"];
+            assert!(allowed.contains(&term), "orders by {term:?}");
+        }
+    }
+    assert!(found > 0, "run_events orders its result");
 }
