@@ -32,6 +32,9 @@
 //! Sending stops at the highest version sent, so a machine's own records must be stored in
 //! the order of their versions: a writer takes [`Store::own_next_version`] and applies the
 //! record while holding the store's lock once.
+//!
+//! A link whose two ends speak protocol 5 also carries factory records, on a cursor of their
+//! own and under the same rules ([`factory`]). A link in an older protocol carries none.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -46,7 +49,7 @@ use foundry_proto::record::AnyRecord;
 use foundry_proto::settings::{Edit, EditId, Machine, Outcome};
 use foundry_proto::state::{SessionState, TerminalState};
 use futures::future::BoxFuture;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
@@ -159,6 +162,8 @@ struct Inner {
     /// Each open record link past its hellos, by peer and link number.
     links: Mutex<BTreeMap<MachineId, BTreeMap<u64, Link>>>,
     next_link: AtomicU64,
+    /// Rises each time a factory record is stored: see [`Peers::factory_changes`].
+    factory_changed: watch::Sender<u64>,
 }
 
 impl Peers {
@@ -175,6 +180,7 @@ impl Peers {
                 coordinator: Mutex::new(None),
                 links: Mutex::new(BTreeMap::new()),
                 next_link: AtomicU64::new(0),
+                factory_changed: watch::Sender::new(0),
             }),
         }
     }
@@ -183,7 +189,18 @@ impl Peers {
     /// ends, until the returned future is dropped. A machine added to the list is dialed
     /// within [`REDIAL`]. A machine removed from it is no longer dialed, and every link to it,
     /// dialed or served, closes within a second.
+    ///
+    /// While it runs, it also tells [`Peers::factory_changes`] of the factory records this
+    /// machine writes itself.
     pub async fn run(&self) {
+        tokio::select! {
+            () = self.keep_linked() => {}
+            () = factory::watch_own(&self.inner) => {}
+        }
+    }
+
+    /// The link-keeping half of [`Peers::run`].
+    async fn keep_linked(&self) {
         let mut links: BTreeMap<MachineId, (Machine, Task)> = BTreeMap::new();
         let mut last_seq: Option<u64> = None;
         let mut every = tokio::time::interval(REDIAL);
@@ -304,6 +321,13 @@ impl Peers {
             }
         }
         Err(unsent)
+    }
+
+    /// A value that rises each time this machine stores a factory record: at once for one
+    /// taken from a peer, and within a second for one of its own while [`Peers::run`] runs.
+    /// The number itself means nothing; a reader waits for it to change, then reads the store.
+    pub fn factory_changes(&self) -> watch::Receiver<u64> {
+        self.inner.factory_changed.subscribe()
     }
 
     /// Whether record link `link` to `machine`, as [`Peers::send_edit`] numbered it, is still
@@ -443,6 +467,11 @@ impl Inner {
             return Err(Unopened::Down);
         }
         Ok(conn)
+    }
+
+    /// Tells [`Peers::factory_changes`] that a factory record was stored.
+    fn factory_changed(&self) {
+        self.factory_changed.send_modify(|n| *n = n.wrapping_add(1));
     }
 
     fn heard_from(&self, peer: MachineId) {

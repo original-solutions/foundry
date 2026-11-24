@@ -18,6 +18,11 @@
 //! sent goes to the coordinator that waits for it; with none set they are ignored. A link in
 //! protocol 4 or later ([`foundry_proto::messages::ANSWERS_SINCE`]) carries an edit's id and its
 //! answer; an older one carries neither.
+//!
+//! A link in protocol 5 or later ([`foundry_proto::messages::FACTORY_SINCE`]) also carries
+//! factory records ([`super::factory`]): each hello names the factory versions it holds, and
+//! each round sends this machine's new factory records after its P1 records, on a cursor of
+//! their own. An older link carries none, and its P1 catch-up is as it was.
 
 use foundry_proto::ids::MachineId;
 use foundry_proto::messages::{EDITS_SINCE, PROTOCOL, PeerMessage};
@@ -26,9 +31,9 @@ use serde::Serialize;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{Instant, timeout, timeout_at};
 
-use std::collections::BTreeMap;
 use std::time::Duration;
 
+use super::factory::{self, Cursor};
 use super::{BATCH, Conn, Inner, OFFLINE_AFTER, RETRY_REFUSED, TICK, on_store};
 
 /// How often a link repeats the warning that this machine's records cannot be read.
@@ -61,9 +66,10 @@ pub(super) async fn run(
 /// links with ([`links_with`]: it is listed, or this machine's list holds no machine but
 /// itself) or stops taking them. Changed settings go first in each round, so a peer just removed
 /// from the list is sent the copy that removed it before its link closes, and holds its own
-/// removal.
+/// removal. New factory records go last, on a link that carries them.
 async fn sending(inner: &Inner, send: &Sender<String>, open: &Open) {
     let mut sent = open.sent;
+    let mut factory_sent = Cursor::new(open.factory_sent);
     let mut settings_sent: Option<u64> = None;
     let mut warned: Option<Instant> = None;
     let mut every = tokio::time::interval(TICK);
@@ -77,6 +83,9 @@ async fn sending(inner: &Inner, send: &Sender<String>, open: &Open) {
             return;
         }
         if !send_own(inner, send, open, &mut sent, &mut warned).await {
+            return;
+        }
+        if !factory::send_own(inner, send, open.peer, open.speak, &mut factory_sent).await {
             return;
         }
     }
@@ -237,6 +246,9 @@ struct Open {
     speak: u16,
     /// The highest version of this machine's records the peer holds.
     sent: u64,
+    /// The highest version of this machine's factory records the peer holds: none on a link
+    /// that carries no factory record.
+    factory_sent: u64,
 }
 
 /// Exchanges hellos, and refuses a peer that is not in the machine list ([`links_with`]), is
@@ -272,7 +284,7 @@ async fn hello(
         protocol,
         machine,
         versions,
-        ..
+        factory_versions,
     }) = first
     else {
         tracing::warn!("sync: a link opened without a hello");
@@ -294,17 +306,24 @@ async fn hello(
         peer: machine,
         speak,
         sent: versions.get(&inner.me).copied().unwrap_or(0),
+        factory_sent: if factory::carried(speak) {
+            factory_versions.get(&inner.me).copied().unwrap_or(0)
+        } else {
+            0
+        },
     })
 }
 
+/// This machine's hello in `protocol`: the P1 versions it holds, and the factory versions when
+/// the protocol carries factory records. A dialing end says hello in this build's protocol
+/// before it knows the peer's, so an older peer is sent factory versions it does not read.
 async fn own_hello(inner: &Inner, protocol: u16) -> Option<PeerMessage> {
     match on_store(&inner.store, |store| store.versions()).await {
         Ok(versions) => Some(PeerMessage::Hello {
             protocol,
             machine: inner.me,
             versions,
-            // Factory records are not kept yet, so this machine holds none.
-            factory_versions: BTreeMap::new(),
+            factory_versions: factory::versions(inner, protocol).await,
         }),
         Err(error) => {
             tracing::warn!("sync: cannot read the versions held: {error}");
@@ -438,9 +457,9 @@ async fn take(
         PeerMessage::Hello { .. } | PeerMessage::Relay { .. } | PeerMessage::Call { .. } => {
             return Ok(());
         }
-        // Factory records are not kept yet: one that arrives is dropped, and the hello says
-        // this machine holds none, so a peer sends them again once they are.
-        PeerMessage::FactoryRecords { .. } => return Ok(()),
+        PeerMessage::FactoryRecords { records, .. } => {
+            return factory::take(inner, peer, speak, records).await;
+        }
     };
     on_store(&inner.store, move |store| {
         store
