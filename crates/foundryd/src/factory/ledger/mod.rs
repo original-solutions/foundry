@@ -2500,6 +2500,7 @@ mod tests {
             cold.write(&run(8), &step("red"), &test_cause()),
             Err(LedgerError::AlreadyFinished { .. })
         ));
+        assert_eq!(tally(&cold, &run(8)), (true, Default::default()));
         assert!(matches!(
             cold.finish(&run(8), Outcome::Stuck, None, None, &test_cause(), None),
             Err(LedgerError::AlreadyFinished { .. })
@@ -2632,13 +2633,67 @@ mod tests {
             )
             .unwrap();
             let ledger = ledger(&store, MachineId::random(), 2, ticking(T0, 1000));
+            // The first write and every one after it.
+            for _ in 0..2 {
+                assert!(
+                    matches!(
+                        ledger.write(&run(8), &step("red"), &test_cause()),
+                        Err(LedgerError::Store(_))
+                    ),
+                    "finished by {finisher}"
+                );
+            }
             assert!(
                 matches!(
-                    ledger.write(&run(8), &step("red"), &test_cause()),
+                    ledger.finish(&run(8), Outcome::Stuck, None, None, &test_cause(), None),
                     Err(LedgerError::Store(_))
                 ),
                 "finished by {finisher}"
             );
         }
+    }
+
+    #[test]
+    fn a_finished_event_synced_in_from_a_lower_writer_does_not_make_the_ledger_reread_the_others() {
+        let (_dir, store) = open_store();
+        let (low, high) = (
+            MachineId(uuid::Uuid::from_u128(1)),
+            MachineId(uuid::Uuid::from_u128(u128::MAX)),
+        );
+        for version in 1..=1000 {
+            put(
+                &store,
+                high,
+                version,
+                &run(8),
+                1,
+                T0,
+                "step_changed",
+                json!({}),
+                None,
+            );
+        }
+        let ledger = ledger(&store, MachineId::random(), 2, ticking(T0, 1000));
+        ledger.write(&run(8), &step("red"), &test_cause()).unwrap();
+        // A writer whose id sorts first finishes the run, and it syncs in.
+        put(
+            &store,
+            low,
+            1,
+            &run(8),
+            1,
+            T0,
+            "finished",
+            json!({"outcome": "stuck"}),
+            None,
+        );
+        let before = Store::run_rows_read();
+        assert!(matches!(
+            ledger.write(&run(8), &step("green"), &test_cause()),
+            Err(LedgerError::AlreadyFinished { .. })
+        ));
+        // The three writers' ids and the one new event: none of the others' events again.
+        assert_eq!(Store::run_rows_read() - before, 3 + 1);
+        assert_eq!(tally(&ledger, &run(8)), (true, Default::default()));
     }
 }
