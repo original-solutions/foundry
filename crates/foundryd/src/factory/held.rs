@@ -3,8 +3,8 @@
 //! Every [`CHECK_EVERY`] this machine reads the logins it holds a token for and whether the
 //! `factory-build` skill is installed for the service user, and writes a [`MachineHeld`] record
 //! when either differs from what it last wrote, the first check at once. The age between checks
-//! is read on the sleep-counting clock of [`crate::clock`]. A token is never read here, let
-//! alone logged: only the names of the logins are.
+//! is read on the sleep-counting clock of [`crate::clock`]. Only the names of the secrets are
+//! listed here: no token is read, and none is ever logged.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -15,8 +15,20 @@ use foundry_proto::factory::{FactoryBody, FactoryRecord, MachineHeld};
 use foundry_proto::ids::MachineId;
 
 use crate::clock::Clock;
+use crate::secrets::SecretsError;
 use crate::secrets::{self, Secrets};
-use crate::store::Store;
+use crate::store::{Applied, Store, StoreError};
+
+/// Why a check wrote nothing.
+#[derive(Debug, thiserror::Error)]
+enum HeldError {
+    #[error(transparent)]
+    Secrets(#[from] SecretsError),
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    #[error("the store did not take the record: {0:?}")]
+    NotStored(Applied),
+}
 
 /// How often the logins and the skill are checked.
 pub const CHECK_EVERY: Duration = Duration::from_secs(5);
@@ -58,6 +70,8 @@ pub(crate) async fn run_with(
     clock: Arc<dyn Clock>,
 ) {
     let mut written: Option<MachineHeld> = None;
+    // What the last failed check said, while checks keep failing.
+    let mut failing: Option<String> = None;
     loop {
         let checked = clock.now();
         let (store, secrets, skill, last) = (
@@ -67,13 +81,26 @@ pub(crate) async fn run_with(
             written.clone(),
         );
         match tokio::task::spawn_blocking(move || check(&store, me, &*secrets, skill, last)).await {
-            Ok(Ok(held)) => written = Some(held),
-            Ok(Err(error)) => tracing::warn!(%error, "what this machine holds not written"),
-            Err(error) => tracing::warn!(%error, "what this machine holds not written"),
+            Ok(Ok(held)) => {
+                if failing.take().is_some() {
+                    tracing::info!("what this machine holds can be read and written again");
+                }
+                written = Some(held);
+            }
+            Ok(Err(error)) => note_failure(&mut failing, error.to_string()),
+            Err(error) => note_failure(&mut failing, error.to_string()),
         }
         while clock.now().saturating_sub(checked) < CHECK_EVERY {
             tokio::time::sleep(POLL).await;
         }
+    }
+}
+
+/// Warns when checks start failing or the reason changes, not on every failed check.
+fn note_failure(failing: &mut Option<String>, error: String) {
+    if failing.as_ref() != Some(&error) {
+        tracing::warn!(%error, "what this machine holds not written");
+        *failing = Some(error);
     }
 }
 
@@ -85,7 +112,7 @@ fn check(
     secrets: &dyn Secrets,
     skill: Option<PathBuf>,
     last: Option<MachineHeld>,
-) -> Result<MachineHeld, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<MachineHeld, HeldError> {
     let held = MachineHeld {
         logins: secrets::github_logins(secrets)?,
         skill: skill.is_some_and(|path| path.exists()),
@@ -95,15 +122,17 @@ fn check(
     }
     let mut store = store.lock().unwrap_or_else(PoisonError::into_inner);
     let version = store.own_next_factory_version()?;
-    store.apply_factory(
+    match store.apply_factory(
         &FactoryRecord {
             owner: me,
             version,
             body: FactoryBody::Held(held.clone()),
         },
         me,
-    )?;
-    Ok(held)
+    )? {
+        Applied::Stored => Ok(held),
+        other => Err(HeldError::NotStored(other)),
+    }
 }
 
 #[cfg(test)]

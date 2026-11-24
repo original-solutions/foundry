@@ -67,10 +67,11 @@ pub trait Secrets: Send + Sync {
     /// from this process or another, lands between the read and the write.
     fn update(&self, name: &str, edit: Edit<'_>) -> Result<(), SecretsError>;
     /// The names of the secrets held, sorted, and never a value. A store that cannot list its
-    /// names lists none; one that can but fails to read gives the error, so a failed read is
-    /// never taken for an empty store.
+    /// names gives [`SecretsError::CannotList`], and so does one that fails to read, so neither
+    /// is ever taken for an empty store: [`hide_known`] then fails closed and the held record
+    /// writes nothing.
     fn names(&self) -> Result<Vec<String>, SecretsError> {
-        Ok(Vec::new())
+        Err(SecretsError::CannotList)
     }
 }
 
@@ -102,6 +103,8 @@ pub enum SecretsError {
          keychain prompts (docs/install.md)"
     )]
     NotMoved,
+    #[error("this secret store cannot list its names")]
+    CannotList,
     #[error("the keychain could not {action} the secret {name}: {reason}")]
     Keychain {
         action: &'static str,
@@ -167,8 +170,8 @@ pub fn github_default(secrets: &dyn Secrets) -> Option<String> {
     }
 }
 
-/// `text` with every secret this store holds now hidden as `***`: the gateway keys and the token
-/// of each `github:<login>`, read at this call so a token set after the daemon started is
+/// `text` with the gateway keys and every `github:*` token this store holds now hidden as `***`
+/// (whatever follows `github:`, a login or not), read at this call so a token set after the daemon started is
 /// hidden too, and then the passwords of URLs as [`redact`] hides them. When the store cannot
 /// be read, none of `text` is shown: [`HIDDEN_UNREADABLE`] is given instead.
 pub fn hide_known(text: &str, secrets: &dyn Secrets) -> String {
@@ -193,9 +196,10 @@ pub fn hide_known(text: &str, secrets: &dyn Secrets) -> String {
 fn known_values(secrets: &dyn Secrets) -> Result<Vec<String>, SecretsError> {
     let mut names = vec![GATEWAY.to_owned(), GATEWAY_MANAGEMENT.to_owned()];
     names.extend(
-        github_logins(secrets)?
+        secrets
+            .names()?
             .into_iter()
-            .map(|login| format!("{GITHUB_PREFIX}{login}")),
+            .filter(|name| name.starts_with(GITHUB_PREFIX)),
     );
     let mut values = Vec::new();
     for name in names {
@@ -361,8 +365,10 @@ pub fn set_command(name: &str) -> ExitCode {
 /// A `login` that is none is refused and nothing is stored.
 pub fn github_default_command(login: &str) -> ExitCode {
     if !is_login(login) {
+        // The argument is not echoed: it may be a token pasted in place of a login.
         eprintln!(
-            "foundryd github default: {login:?} is not a login; a login is letters, digits and -"
+            "foundryd github default: the argument is not a GitHub login; a login is letters, \
+             digits and -"
         );
         return ExitCode::FAILURE;
     }
