@@ -242,14 +242,18 @@ fn write_askpass(dir: &Path, path: &Path) -> io::Result<()> {
 /// The environment that turns git's credential helpers off for a terminal: no system or global
 /// config, where the machine's helpers (a keychain, `gh`) are named; no config the daemon's
 /// own environment may carry in; an empty `GIT_ASKPASS`, with which git asks neither
-/// `core.askPass` nor `SSH_ASKPASS`, and an empty `SSH_ASKPASS` for ssh itself; no token
-/// `gh` would take from the daemon's environment, and no `gh` config, so `gh` finds no stored
-/// login either (and so neither does `gh auth git-credential`); and no terminal prompt, so a
-/// git call that needs a login fails at once. Each is a value, since a terminal's environment is set over
-/// the daemon's and cannot remove a variable: git and `gh` take an empty one as none. It
-/// holds no token. A helper that code in the terminal writes into the repository's own config
-/// is that code's doing: it could as well run the helper itself, which no environment
-/// prevents.
+/// `core.askPass` nor `SSH_ASKPASS`, and an empty `SSH_ASKPASS` for ssh itself; no token `gh`
+/// would take from the daemon's environment; and no terminal prompt, so a git call that needs
+/// a login fails at once. Each is a value, since a terminal's environment is set over the
+/// daemon's and cannot remove a variable: git and `gh` take an empty one as none. It holds no
+/// token. A helper that code in the terminal writes into the repository's own config is that
+/// code's doing: it could as well run the helper itself, which no environment prevents.
+///
+/// `gh` does not run at all in this environment: its config directory is `/dev/null`, so
+/// every `gh` command, and `gh auth git-credential` as a helper, fails reading its config
+/// before it looks for a login. A missing or empty directory would not do, since `gh` would
+/// then start and ask the keyring for the machine's login. So this is never the environment
+/// of a terminal that is meant to run `gh`, with a `GH_TOKEN` or without one.
 pub fn helpers_off_env() -> Vec<(String, String)> {
     [
         ("GIT_CONFIG_NOSYSTEM", "1"),
@@ -262,7 +266,7 @@ pub fn helpers_off_env() -> Vec<(String, String)> {
         ("GITHUB_TOKEN", ""),
         ("GH_ENTERPRISE_TOKEN", ""),
         ("GITHUB_ENTERPRISE_TOKEN", ""),
-        // gh reads its logins from this directory: here there is none to read.
+        // Not a directory: gh stops at its config, before the keyring (see the doc above).
         ("GH_CONFIG_DIR", "/dev/null"),
         ("GIT_TERMINAL_PROMPT", "0"),
     ]
