@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
 use axum::Router;
@@ -35,8 +35,10 @@ use tokio::sync::watch;
 use tokio::task::AbortHandle;
 use tokio::time::Instant;
 
+use crate::secrets::Secrets;
 use crate::store::{Store, StoreError};
 use crate::terminals::{TerminalError, Terminals};
+use factory::FactoryLaunch;
 use state::{Event, Hook, next_state};
 
 pub mod brief;
@@ -107,8 +109,25 @@ pub enum SessionError {
     },
     #[error("sessions: Claude Code's state file {} cannot be used: {reason}", path.display())]
     ClaudeState { path: PathBuf, reason: String },
+    #[error(transparent)]
+    NoToken(#[from] crate::git_auth::NoToken),
+    #[error("sessions: git_auth gave a factory start no askpass or token")]
+    NoAskpass,
+    #[error("sessions: a factory session's first message cannot carry a body yet")]
+    FirstMessageBody,
+    #[error("sessions: the workspace's factory sessions were ended while this one was starting")]
+    Ended,
+    #[error(transparent)]
+    GitSetup(#[from] factory::GitRefused),
     #[error("sessions: a step run apart from its caller did not finish: {0}")]
     Interrupted(#[from] tokio::task::JoinError),
+}
+
+/// A first prompt's text: trimmed, and none when blank.
+fn first_prompt(text: &str) -> Option<String> {
+    Some(text.trim())
+        .filter(|t| !t.is_empty())
+        .map(str::to_owned)
 }
 
 /// The model gateway a session's Claude Code talks to.
@@ -153,6 +172,17 @@ struct Inner {
     terminals: Arc<Terminals>,
     /// Where settings files live, `<data dir>/sessions`.
     dir: PathBuf,
+    /// The data dir: where the askpass script lives.
+    data: PathBuf,
+    /// Where a factory start reads its token from. Set once, by [`Sessions::with_secrets`].
+    secrets: OnceLock<Arc<dyn Secrets>>,
+    /// Tests: the home folder the factory start's check of the owner's git setup reads, in
+    /// place of the real one.
+    #[cfg(test)]
+    git_home: OnceLock<PathBuf>,
+    /// The factory sessions and the ends asked for, under one lock so a start and an end are
+    /// ordered: whichever takes it first wins.
+    factory: Mutex<factory::FactoryState>,
     config: Config,
     /// Held while a worktree is marked trusted, so two starts never overwrite each other.
     trust: Mutex<()>,
@@ -204,6 +234,11 @@ impl Sessions {
                 store,
                 terminals,
                 dir: data_dir.join("sessions"),
+                data: data_dir.to_path_buf(),
+                secrets: OnceLock::new(),
+                #[cfg(test)]
+                git_home: OnceLock::new(),
+                factory: Mutex::default(),
                 config,
                 trust: Mutex::new(()),
                 live: Mutex::default(),
@@ -215,6 +250,21 @@ impl Sessions {
                 fail_adopt_reads: std::sync::atomic::AtomicUsize::new(0),
             }),
         }
+    }
+
+    /// Gives these sessions the secret store a factory start reads its token from.
+    /// Only the first store given is kept. With none, a factory start is refused as having no
+    /// token.
+    pub fn with_secrets(self, secrets: Arc<dyn Secrets>) -> Self {
+        let _ = self.inner.secrets.set(secrets);
+        self
+    }
+
+    /// Tests: makes a factory start check the git setup of `home`, not the real one.
+    #[cfg(test)]
+    pub fn with_git_home(self, home: PathBuf) -> Self {
+        let _ = self.inner.git_home.set(home);
+        self
     }
 
     /// Starts Claude Code with `model` in a new terminal in `worktree`, the worktree of
@@ -243,13 +293,10 @@ impl Sessions {
     ) -> Result<SessionId, SessionError> {
         let inner = self.inner.clone();
         let (worktree, model) = (worktree.to_path_buf(), model.to_string());
-        let prompt = prompt
-            .map(str::trim)
-            .filter(|p| !p.is_empty())
-            .map(str::to_owned);
+        let prompt = prompt.and_then(first_prompt);
         tokio::spawn(async move {
             inner
-                .start(workspace, &worktree, &model, prompt.as_deref())
+                .start(workspace, &worktree, &model, prompt.as_deref(), None)
                 .await
         })
         .await?
@@ -316,6 +363,7 @@ impl Inner {
         worktree: &Path,
         model: &str,
         prompt: Option<&str>,
+        factory: Option<&FactoryLaunch>,
     ) -> Result<SessionId, SessionError> {
         let id = SessionId::random();
         let token = new_token();
@@ -323,14 +371,24 @@ impl Inner {
         let url = self.hook_url(id);
         let written = {
             let (settings, curl, token) = (settings.clone(), curl.clone(), token.clone());
+            let marked = factory.map(|f| (factory::mark_file(&self.dir, id), f.project));
             blocking(move || {
                 claude::write_curl_config(&curl, &url, &token)?;
-                claude::write_settings(&settings, &claude::settings_json(&curl))
+                let json = if marked.is_some() {
+                    claude::factory_settings_json(&curl)
+                } else {
+                    claude::settings_json(&curl)
+                };
+                claude::write_settings(&settings, &json)?;
+                match marked {
+                    Some((mark, project)) => factory::write_mark(&mark, project),
+                    None => Ok(()),
+                }
             })
             .await
         };
         if let Err(error) = written.and_then(|r| r) {
-            self.remove_files(&settings, &curl).await;
+            self.discard(id, &settings, &curl).await;
             return Err(error);
         }
         let trusted = {
@@ -342,7 +400,7 @@ impl Inner {
             blocking(move || claude::mark_trusted_locked(&me.trust, &json, &worktree)).await
         };
         if let Err(error) = trusted.and_then(|r| r) {
-            self.remove_files(&settings, &curl).await;
+            self.discard(id, &settings, &curl).await;
             return Err(error);
         }
 
@@ -369,23 +427,45 @@ impl Inner {
         // of `Starting`.
         let mut body = live.body.lock().await;
         lock(&self.live).insert(id, live.clone());
+        // Found by `end_factory` from here on, which then waits on `body`: unless it ran since
+        // this start began, which then does not go on. Under one lock, so one of them is first.
+        if let Some(factory) = factory {
+            let ended = {
+                let mut state = lock(&self.factory);
+                let ended = state.ended.get(&workspace).copied().unwrap_or(0) != factory.generation;
+                if !ended {
+                    state.marks.insert(id, factory.project);
+                }
+                ended
+            };
+            if ended {
+                lock(&self.live).remove(&id);
+                drop(body);
+                self.discard(id, &settings, &curl).await;
+                return Err(SessionError::Ended);
+            }
+        }
 
-        let started = self.launch(&settings, workspace, worktree, model).await;
+        let started = self
+            .launch(&settings, workspace, worktree, model, factory)
+            .await;
         let (terminal, floor) = match started {
             Ok(started) => started,
             Err(error) => {
                 lock(&self.live).remove(&id);
+                lock(&self.factory).marks.remove(&id);
                 drop(body);
-                self.remove_files(&settings, &curl).await;
+                self.discard(id, &settings, &curl).await;
                 return Err(error);
             }
         };
         body.terminal = terminal;
         if let Err(error) = self.write(body.clone()).await {
             lock(&self.live).remove(&id);
+            lock(&self.factory).marks.remove(&id);
             drop(body);
             let _ = self.terminals.close(terminal).await;
-            self.remove_files(&settings, &curl).await;
+            self.discard(id, &settings, &curl).await;
             return Err(error);
         }
         drop(body);
@@ -416,6 +496,8 @@ impl Inner {
     /// session left out would be refused and counted for the daemon's whole run. Any other
     /// failure would fail the same way every time, and the daemon must still start.
     async fn adopt(self: &Arc<Self>) {
+        // Before the store is read, so a store that fails still leaves the marks known.
+        self.adopt_marks().await;
         let mut backoff = Backoff::new();
         let (open, cursor) = loop {
             match self.open_sessions().await {
@@ -573,6 +655,7 @@ impl Inner {
         workspace: WorkspaceId,
         worktree: &Path,
         model: &str,
+        factory: Option<&FactoryLaunch>,
     ) -> Result<(TerminalId, u64), SessionError> {
         let me = self.me;
         let floor = self
@@ -585,7 +668,7 @@ impl Inner {
             "--model".into(),
             model.to_string(),
         ]);
-        let env = [
+        let mut env = vec![
             (
                 "ANTHROPIC_BASE_URL".to_string(),
                 self.config.gateway.base_url.clone(),
@@ -595,6 +678,10 @@ impl Inner {
                 self.config.gateway.key.clone(),
             ),
         ];
+        if let Some(factory) = factory {
+            argv.extend(claude::factory_args(&factory.effort));
+            env.extend(factory.env.iter().cloned());
+        }
         let terminal = self
             .terminals
             .start(workspace, worktree, &argv, &env)
@@ -673,6 +760,14 @@ impl Inner {
     ) -> Result<T, SessionError> {
         let store = self.store.clone();
         Ok(blocking(move || work(&mut lock(&store))).await??)
+    }
+
+    /// Removes everything a start that failed wrote: the settings file, the curl config and a
+    /// factory session's folder.
+    async fn discard(&self, id: SessionId, settings: &Path, curl: &Path) {
+        self.remove_files(settings, curl).await;
+        let folder = factory::folder(&self.dir, id);
+        let _ = blocking(move || std::fs::remove_dir_all(folder)).await;
     }
 
     /// Removes a session's settings file and curl config. Missing is fine, and nothing else can
