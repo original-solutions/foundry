@@ -1286,6 +1286,15 @@ async fn factory_changes_rises_for_a_record_from_a_peer_and_for_one_this_machine
         .unwrap();
 }
 
+/// A run event of `run` whose output takes `bytes`.
+fn large_event(run: &RunId, event: &str, bytes: usize) -> FactoryBody {
+    let mut body = run_event(run, event);
+    if let FactoryBody::RunEvent(event) = &mut body {
+        event.data = serde_json::json!({ "output": "x".repeat(bytes) });
+    }
+    body
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_factory_catch_up_of_large_run_events_goes_in_messages_a_link_can_carry() {
     let peer = MachineId::random();
@@ -1296,11 +1305,7 @@ async fn a_factory_catch_up_of_large_run_events_goes_in_messages_a_link_can_carr
     // end takes in one message.
     let total = 200;
     for i in 0..total {
-        let mut body = run_event(&run, &format!("gate-{i}"));
-        if let FactoryBody::RunEvent(event) = &mut body {
-            event.data = serde_json::json!({ "output": "x".repeat(64 * 1024) });
-        }
-        write_factory(a, body);
+        write_factory(a, large_event(&run, &format!("gate-{i}"), 64 * 1024));
     }
 
     let mut conn = raw_link(&a.peers);
@@ -1529,15 +1534,6 @@ async fn a_machine_with_an_unreadable_factory_record_of_its_own_stays_online_and
         .await
         .expect("an own factory write past an unreadable row was not told")
         .unwrap();
-}
-
-/// A run event of `run` whose output takes `bytes`.
-fn large_event(run: &RunId, event: &str, bytes: usize) -> FactoryBody {
-    let mut body = run_event(run, event);
-    if let FactoryBody::RunEvent(event) = &mut body {
-        event.data = serde_json::json!({ "output": "x".repeat(bytes) });
-    }
-    body
 }
 
 #[tokio::test(start_paused = true)]
