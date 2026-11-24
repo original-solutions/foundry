@@ -199,10 +199,11 @@ pub fn github_default(secrets: &dyn Secrets) -> Option<String> {
 ///
 /// A held value of at least [`SPLIT_MIN`] characters is hidden also when gaps sit inside it,
 /// as a tool that wraps to the terminal's width or colours part of a word leaves them, and is
-/// then matched on its characters that are no gap: each gap at most [`GAP_MAX`] characters of space, tab, LF, CR, VT, FF and NEL,
-/// the other C0 and C1 controls and DEL, the bidi and zero-width characters U+200B to U+200F,
-/// U+202A to U+202E, U+2066 to U+2069 and U+FEFF ([`is_gap`]; no other white space, bidi or
-/// zero-width character), and whole escape sequences. Any other value is hidden only whole.
+/// then matched on its characters that are no gap: each gap at most [`GAP_MAX`] characters of
+/// space, tab, LF, CR, VT, FF and NEL, the other C0 and C1 controls and DEL, the bidi and
+/// zero-width characters U+200B to U+200F, U+202A to U+202E, U+2066 to U+2069 and U+FEFF
+/// ([`is_gap`]; no other white space, bidi or zero-width character), and whole escape
+/// sequences. Any other value is hidden only whole.
 /// Only the span from the value's first character to its last becomes `***`; every other line
 /// and character of `text` stays as it was, and [`redact`] then reads the lines as they came.
 pub fn hide_known(text: &str, secrets: &dyn Secrets) -> String {
@@ -216,8 +217,8 @@ pub fn hide_known(text: &str, secrets: &dyn Secrets) -> String {
 }
 
 /// A held value this many characters long, or longer, is hidden also with gaps inside it. A
-/// shorter one could too easily be put together from pieces of text that merely
-/// sit near each other, so it is hidden only whole.
+/// shorter one could too easily be put together from pieces of text that merely sit near each
+/// other, so it is hidden only whole.
 const SPLIT_MIN: usize = 16;
 
 /// The most characters one gap inside a held value may hold.
