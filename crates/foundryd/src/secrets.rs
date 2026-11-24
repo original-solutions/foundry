@@ -704,6 +704,21 @@ mod tests {
     }
 
     #[test]
+    fn the_login_rule_gives_the_limit_and_is_what_a_refusal_says() {
+        assert!(
+            LOGIN_RULE.contains(&format!("at most {LOGIN_MAX} characters")),
+            "{LOGIN_RULE}"
+        );
+        let refused = set_from(
+            &MemorySecrets::default(),
+            "github:bad/name",
+            "x\n".as_bytes(),
+        );
+        let text = refused.unwrap_err().to_string();
+        assert!(text.contains(LOGIN_RULE), "{text}");
+    }
+
+    #[test]
     fn is_login_takes_39_characters_and_refuses_40() {
         assert!(is_login(&"a".repeat(39)));
         assert!(!is_login(&"a".repeat(40)));

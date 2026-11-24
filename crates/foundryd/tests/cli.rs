@@ -13,7 +13,7 @@ compile_error!(
 use std::io::Write as _;
 use std::process::{Command, Output, Stdio};
 
-use foundryd::secrets::{FileSecrets, Secrets};
+use foundryd::secrets::{FileSecrets, LOGIN_RULE, Secrets};
 
 /// `foundryd` with a data directory and `HOME` of its own and no copy from the keychain, so no
 /// run touches the login keychain or the real home.
@@ -201,6 +201,7 @@ fn github_default_refusing_an_argument_does_not_print_it() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!stderr.contains("ghp_secret_like"), "stderr: {stderr}");
     assert!(stderr.contains("not a GitHub login"), "stderr: {stderr}");
+    assert!(words(&out.stderr).contains(LOGIN_RULE), "stderr: {stderr}");
 }
 
 #[test]
@@ -245,14 +246,19 @@ fn secret_set_help_names_github_tokens() {
 
     let out = foundryd(&["secret", "set", "--help"]);
     assert!(out.status.success(), "exit: {:?}", out.status);
-    let help = String::from_utf8_lossy(&out.stdout);
-    for words in [
-        "gateway-management",
-        "github:<login>",
-        "at most 39 characters",
-    ] {
+    // Help is wrapped to the terminal: compare with its white space made single spaces.
+    let help = words(&out.stdout);
+    for words in ["gateway-management", "github:<login>", LOGIN_RULE] {
         assert!(help.contains(words), "{words} missing from help: {help}");
     }
+}
+
+/// `bytes` as text with every run of white space made one space.
+fn words(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[test]
