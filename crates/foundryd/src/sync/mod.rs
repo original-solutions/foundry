@@ -34,7 +34,9 @@
 //! record while holding the store's lock once.
 //!
 //! A link whose two ends speak protocol 5 also carries factory records, on a cursor of their
-//! own and under the same rules ([`factory`]). A link in an older protocol carries none.
+//! own and under the same owner and version rules ([`factory`]). A link in an older protocol
+//! carries none. A factory record this machine refuses stops only the factory records on that
+//! link: the peer's P1 records are still taken, and it still shows online.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;

@@ -165,8 +165,15 @@ async fn send_settings(
 /// resent once per link rather than once a second. Shared settings, edits and answers do not
 /// depend on records, so a refused link still takes them: an edit sent on it is still numbered,
 /// and the answer to one still arrives.
+///
+/// Factory records are refused apart ([`factory::take`]): after a factory record the store
+/// refuses, the link takes no more factory records from the peer, so the store keeps a prefix
+/// of them, but it goes on taking everything else and counting the peer as heard. It ends
+/// [`RETRY_REFUSED`] later all the same, so the next link's hello asks again for the factory
+/// records past that prefix.
 async fn reading(inner: &Inner, recv: &mut Receiver<String>, peer: MachineId, speak: u16) {
     let mut refused: Option<Instant> = None;
+    let mut factory_refused: Option<Instant> = None;
     loop {
         let text = match timeout(OFFLINE_AFTER, recv.recv()).await {
             Ok(Some(text)) => text,
@@ -193,7 +200,23 @@ async fn reading(inner: &Inner, recv: &mut Receiver<String>, peer: MachineId, sp
             }
             continue;
         }
-        match receive(inner, peer, speak, &text).await {
+        let taken = match serde_json::from_str::<PeerMessage>(&text) {
+            Ok(PeerMessage::FactoryRecords { records, .. }) => {
+                if factory_refused.is_none()
+                    && let Err(error) = factory::take(inner, peer, speak, records).await
+                {
+                    tracing::warn!(
+                        "sync: {error}; no more factory records are taken from {peer} on this \
+                         link, which closes in {RETRY_REFUSED:?} to ask again"
+                    );
+                    factory_refused = Some(Instant::now());
+                }
+                Ok(())
+            }
+            Ok(message) => take(inner, peer, speak, message).await,
+            Err(error) => Err(format!("a message from {peer} could not be read: {error}")),
+        };
+        match taken {
             Ok(()) => inner.heard_from(peer),
             Err(error) => {
                 tracing::warn!(
@@ -203,6 +226,12 @@ async fn reading(inner: &Inner, recv: &mut Receiver<String>, peer: MachineId, sp
                 );
                 refused = Some(Instant::now());
             }
+        }
+        if refused.is_none() && factory_refused.is_some_and(|at| at.elapsed() >= RETRY_REFUSED) {
+            tracing::info!(
+                "sync: link to {peer} closed to ask again for the factory records it refused"
+            );
+            return;
         }
     }
 }
@@ -438,21 +467,12 @@ pub(super) async fn send_text(send: &Sender<String>, text: String) -> bool {
     matches!(timeout(OFFLINE_AFTER, send.send(text)).await, Ok(Ok(())))
 }
 
-/// Takes the records in a message from `peer`, each only if `peer` owns it and it is newer.
-/// A message that cannot be read, or a record that cannot be stored, is an error, and nothing
-/// after it is taken: the store then holds a prefix of the peer's records.
+/// Takes one message from `peer`, which sent it on a link in protocol `speak`: the records in
+/// it, each only if `peer` owns it and it is newer. A record that cannot be stored is an error,
+/// and nothing after it is taken: the store then holds a prefix of the peer's records.
 ///
 /// Shared settings are merged by the coordinator, an edit is handed to it to number or pass
 /// on, and an answer to the edit it waits on; with no coordinator set all three are ignored.
-async fn receive(inner: &Inner, peer: MachineId, speak: u16, text: &str) -> Result<(), String> {
-    match serde_json::from_str::<PeerMessage>(text) {
-        Ok(message) => take(inner, peer, speak, message).await,
-        Err(error) => Err(format!("a message from {peer} could not be read: {error}")),
-    }
-}
-
-/// Takes one message from `peer`, which sent it on a link in protocol `speak`, as [`receive`]
-/// says.
 async fn take(
     inner: &Inner,
     peer: MachineId,
