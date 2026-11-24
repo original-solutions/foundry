@@ -899,6 +899,17 @@ mod tests {
     }
 
     #[test]
+    fn helpers_off_env_gives_gh_a_config_directory_it_cannot_read() {
+        // gh takes a config file that is not there as no config, and then still asks the
+        // keyring; one it cannot open for another reason stops it before it reads a token.
+        let env: BTreeMap<String, String> = helpers_off_env().into_iter().collect();
+        let dir = Path::new(&env["GH_CONFIG_DIR"]);
+        assert!(dir.exists() && !dir.is_dir(), "{}", dir.display());
+        let error = fs::File::open(dir.join("config.yml")).unwrap_err();
+        assert_ne!(error.kind(), io::ErrorKind::NotFound, "{error}");
+    }
+
+    #[test]
     fn helpers_off_env_leaves_git_no_credential_helper_from_the_global_or_system_config() {
         let machine = Machine::new();
         // The repository's own helpers are not the machine's config; these are.
