@@ -1768,6 +1768,12 @@ async fn an_acting_machine_on_the_protocol_before_answers_is_sent_no_edit() {
         .unwrap_err();
     assert!(error.to_string().contains(&older.to_string()), "{error}");
     assert!(error.to_string().contains("protocol"), "{error}");
+    // The reason is that it answers no edit, not anything of the factory.
+    assert!(
+        error.to_string().contains("does not answer edits"),
+        "{error}"
+    );
+    assert!(!error.to_string().contains("factory"), "{error}");
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert!(edits_sent(&said).is_empty());
 }
@@ -2771,7 +2777,7 @@ async fn a_factory_edit_is_refused_with_the_reason_while_the_acting_machine_spea
     let (conn, said) = recorded(raw_link_speaking(daemon, older, BEFORE_FACTORY).await);
     let theirs = ordered_by(&daemon.settings(), older, vec![older, daemon.id]);
     say(&conn, &older_settings(&theirs)).await;
-    let _beating = beating(conn.clone());
+    let beat = beating(conn.clone());
     acting_becomes(&daemon.coordinator(), older, WAIT).await;
 
     for edit in [set_factory(5), set_project_factory(7, "rawphp")] {
@@ -2798,6 +2804,26 @@ async fn a_factory_edit_is_refused_with_the_reason_while_the_acting_machine_spea
     })
     .await;
     other.abort();
+
+    // The older machine is updated: its protocol 4 link closes and it links again on 5,
+    // still acting. A factory edit now goes to it.
+    beat.abort();
+    drop(conn);
+    let (conn, said) = recorded(raw_link(daemon, older).await);
+    say(&conn, &settings_message(daemon.settings())).await;
+    let _beating = beating(conn.clone());
+    let factory = tokio::spawn({
+        let coordinator = daemon.coordinator();
+        async move { coordinator.edit(set_factory(5)).await }
+    });
+    until(Duration::from_secs(2), "the factory edit is sent", || {
+        edits_sent(&said)
+            .iter()
+            .any(|(_, edit)| matches!(edit, Edit::SetFactory { .. }))
+    })
+    .await;
+    assert!(!factory.is_finished(), "{:?}", factory.await);
+    factory.abort();
 }
 
 #[tokio::test(start_paused = true)]

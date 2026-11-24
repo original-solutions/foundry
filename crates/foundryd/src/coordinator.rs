@@ -1636,6 +1636,65 @@ mod tests {
         assert_eq!(item.lost, Some(SettingValue::Factory(lost)));
     }
 
+    #[test]
+    fn a_copy_from_before_factory_settings_takes_them_back_whole_and_merges_to_the_held_copy() {
+        use foundry_proto::factory::{FactorySettings, ProjectFactory};
+
+        let project = ProjectId(uuid::Uuid::from_u128(7));
+        let fleet = |max_runs| FactorySettings {
+            max_runs,
+            ..FactorySettings::default()
+        };
+        // A split over the fleet's factory settings leaves an item, then a project's factory
+        // setting is set and a (stale) item about it dismissed, which leaves a stamp alone.
+        let a = numbered(&base(), &Edit::SetFactory { settings: fleet(4) }, id(A));
+        let b = numbered(&base(), &Edit::SetFactory { settings: fleet(6) }, id(B));
+        let held = merged(&a, &b);
+        let held = numbered(
+            &held,
+            &Edit::SetProjectFactory {
+                project,
+                factory: ProjectFactory {
+                    on: true,
+                    login: "rawphp".into(),
+                    paused: false,
+                },
+            },
+            id(A),
+        );
+        let held = numbered(
+            &held,
+            &Edit::Dismiss {
+                setting: SettingKey::ProjectFactory(project),
+            },
+            id(A),
+        );
+        assert!(held.overwritten.contains_key(&SettingKey::Factory));
+        assert!(
+            held.stamps
+                .contains_key(&StampKey::Overwritten(SettingKey::ProjectFactory(project)))
+        );
+
+        // The copy a protocol 4 machine sends back holds none of it.
+        let mut copy = held.for_protocol(FACTORY_SINCE - 1);
+        assert_ne!(copy, held);
+        keep_factory(&held, &mut copy);
+        assert_eq!(copy, held);
+        assert_eq!(merge(&held, &copy), held, "the number rises");
+
+        // A copy with an edit of its own brings the edit and keeps the factory part.
+        let mut theirs = numbered(&held, &set_project(9, "nine"), id(B)).for_protocol(4);
+        keep_factory(&held, &mut theirs);
+        let out = merge(&held, &theirs);
+        assert_eq!(project_named(&out, 9).as_deref(), Some("nine"));
+        assert_eq!(out.factory, held.factory);
+        assert_eq!(out.project_factory, held.project_factory);
+        assert_eq!(out.overwritten, held.overwritten);
+        for (key, stamp) in held.stamps.iter().filter(|(k, _)| k.setting().is_factory()) {
+            assert_eq!(out.stamps.get(key), Some(stamp), "{key}");
+        }
+    }
+
     // --- what a waiting edit does next ---
 
     const EARLY: Duration = Duration::from_secs(1);
