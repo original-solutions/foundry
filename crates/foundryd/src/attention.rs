@@ -2272,18 +2272,31 @@ mod tests {
         workspaces: Vec<WorkspaceId>,
         sessions: Vec<SessionId>,
     ) {
-        let mut status = holding(project, 3, 7);
+        let status = naming(project, 3, world.peer, workspaces, sessions);
+        world.status(world.peer, status);
+    }
+
+    /// A status that holds `project`'s lease at `generation` and names `workspaces` and
+    /// `sessions` in a live run built on `machine`.
+    fn naming(
+        project: ProjectId,
+        generation: u64,
+        machine: MachineId,
+        workspaces: Vec<WorkspaceId>,
+        sessions: Vec<SessionId>,
+    ) -> FactoryStatus {
+        let mut status = holding(project, generation, 7);
         status.runs.push(LiveRun {
             run: run(12),
             title: "fix login".into(),
             step: "building".into(),
-            machine: world.peer,
+            machine,
             gate_retries_used: 0,
             minutes_used: 4,
             workspaces,
             sessions,
         });
-        world.status(world.peer, status);
+        status
     }
 
     #[test]
@@ -2365,6 +2378,55 @@ mod tests {
             "{:?}",
             world.items()
         );
+    }
+
+    #[test]
+    fn a_superseded_holder_that_stays_online_names_no_factory_work() {
+        let mut world = World::new();
+        let project = world.factory_project(true);
+        let (me, peer) = (world.me, world.peer);
+        // The peer held the lease at generation 2 with a run, then stopped writing. This
+        // machine took it at generation 3, and its status names no run.
+        let session = world.session(peer, SessionState::Stuck);
+        let (setup_workspace, _) = setup_exited(&mut world, Some(1));
+        let old = naming(project, 2, peer, vec![setup_workspace], vec![session.id]);
+        world.status(peer, old);
+        world.status(me, holding(project, 3, 1));
+        let mut kinds: Vec<Kind> = world.items().into_iter().map(|i| i.kind).collect();
+        kinds.sort();
+        assert_eq!(
+            kinds,
+            [Kind::SessionStuck, Kind::SetupFailed],
+            "{:?}",
+            world.items()
+        );
+    }
+
+    #[test]
+    fn an_offline_holder_names_its_runs_until_a_newer_holder_takes_over() {
+        let mut world = World::new();
+        let project = world.factory_project(true);
+        let (me, peer) = (world.me, world.peer);
+        let session = world.session(me, SessionState::Stuck);
+        world.status(peer, naming(project, 3, me, Vec::new(), vec![session.id]));
+        world.online.remove(&peer);
+        // This machine acts, and sees the lease still held by the peer at generation 3.
+        let waiting = not_holding(
+            project,
+            NotHolding::HeldBy {
+                machine: peer,
+                generation: 3,
+            },
+        );
+        world.status(me, waiting);
+        assert!(
+            world.of(Kind::SessionStuck).is_empty(),
+            "{:?}",
+            world.items()
+        );
+        // This machine takes the lease at generation 4, and its status names no run.
+        world.status(me, holding(project, 4, 1));
+        assert_eq!(world.of(Kind::SessionStuck).len(), 1, "{:?}", world.items());
     }
 
     #[test]
