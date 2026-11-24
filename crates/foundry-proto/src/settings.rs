@@ -47,6 +47,19 @@ pub struct SharedSettings {
     /// Each project's factory setting, by project.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub project_factory: BTreeMap<ProjectId, ProjectFactory>,
+    /// The highest number each coordinator gave a factory edit that this copy includes: the
+    /// factory counterpart of `seen`. A protocol 4 machine passes `seen` on without the factory
+    /// edits it counts, so only this says whether a copy holds a factory edit. Raised only by
+    /// numbering a factory edit and by a copy from a peer on
+    /// [`FACTORY_SINCE`](crate::messages::FACTORY_SINCE) or later; never sent to a peer before
+    /// it, and not written when empty. Boxed so a settings message stays within the size the
+    /// other peer messages are held to.
+    #[serde(default, skip_serializing_if = "is_unseen")]
+    pub factory_seen: Box<BTreeMap<MachineId, u64>>,
+}
+
+fn is_unseen(seen: &BTreeMap<MachineId, u64>) -> bool {
+    seen.is_empty()
 }
 
 impl SharedSettings {
@@ -61,8 +74,9 @@ impl SharedSettings {
 
     /// A copy for a peer that speaks `protocol`. A peer before
     /// [`FACTORY_SINCE`](crate::messages::FACTORY_SINCE) refuses a setting key it does not
-    /// know, so its copy has no factory setting, no stamp of one or of its item, and no
-    /// "setting overwritten" item about one. Every other setting is as it is here.
+    /// know, so its copy has no factory setting, no stamp of one or of its item, no
+    /// "setting overwritten" item about one, and no factory `seen`. Every other setting is as
+    /// it is here.
     pub fn for_protocol(&self, protocol: u16) -> SharedSettings {
         let mut copy = self.clone();
         if protocol < crate::messages::FACTORY_SINCE {
@@ -70,6 +84,7 @@ impl SharedSettings {
             copy.project_factory.clear();
             copy.stamps.retain(|key, _| !key.setting().is_factory());
             copy.overwritten.retain(|key, _| !key.is_factory());
+            copy.factory_seen.clear();
         }
         copy
     }
@@ -474,6 +489,7 @@ pub(crate) mod tests {
             numbered: [(EditId::random(), Stamp { seq: 42, by: mac })].into(),
             factory: None,
             project_factory: BTreeMap::new(),
+            factory_seen: Box::default(),
         }
     }
 
@@ -1184,7 +1200,7 @@ pub(crate) mod tests {
     fn settings_with_factory_seen() -> SharedSettings {
         let mut settings = settings_with_factory();
         let (mac, vps) = (settings.machines[0].id, settings.machines[1].id);
-        settings.factory_seen = [(mac, 46), (vps, 12)].into();
+        *settings.factory_seen = [(mac, 46), (vps, 12)].into();
         settings
     }
 

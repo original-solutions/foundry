@@ -3012,7 +3012,10 @@ impl Relay {
         for message in got.iter() {
             assert_eq!(message["protocol"], BEFORE_FACTORY, "{message}");
             assert!(!names_the_factory(message), "{message}");
-            assert!(message["settings"].get("factory_seen").is_none(), "{message}");
+            assert!(
+                message["settings"].get("factory_seen").is_none(),
+                "{message}"
+            );
         }
     }
 }
@@ -3070,7 +3073,10 @@ async fn a_factory_edit_split_across_a_protocol_4_relay_is_overwritten_not_lost(
         }
         Split::CReturns => {
             let c_edit = c.coordinator().edit(set_factory(6)).await.unwrap();
-            until(WAIT, "B holds C's copy", || covers(&relay.held().seen, c_edit)).await;
+            until(WAIT, "B holds C's copy", || {
+                covers(&relay.held().seen, c_edit)
+            })
+            .await;
             relay.unlink(c.id);
             let a_edit = a.coordinator().edit(set_factory(4)).await.unwrap();
             (a_edit, c_edit)
@@ -3081,7 +3087,10 @@ async fn a_factory_edit_split_across_a_protocol_4_relay_is_overwritten_not_lost(
         covers(&a.settings().seen, c_edit)
     })
     .await;
-    until(WAIT, "B holds A's copy", || covers(&relay.held().seen, a_edit)).await;
+    until(WAIT, "B holds A's copy", || {
+        covers(&relay.held().seen, a_edit)
+    })
+    .await;
     if let Split::CReturns = split {
         relay.link(c).await;
     }
@@ -3177,6 +3186,9 @@ async fn copies_exchanged_20_times_with_a_protocol_4_machine_stop_changing_the_n
     assert_eq!(newest().seq, last, "{seqs:?}");
     assert_eq!(theirs.seq, last, "{seqs:?}");
     for message in lock(&said).iter().filter(|m| m["type"] == "settings") {
-        assert!(message["settings"].get("factory_seen").is_none(), "{message}");
+        assert!(
+            message["settings"].get("factory_seen").is_none(),
+            "{message}"
+        );
     }
 }
