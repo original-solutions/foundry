@@ -1174,10 +1174,10 @@ pub fn keep_factory(held: &SharedSettings, copy: &mut SharedSettings) {
 ///
 /// The result's `seq` is the higher of the two, plus one unless the result is the settings of
 /// every copy that holds that `seq`, each copy's factory `seen` read as [`factory_seen`] reads
-/// it. That is one more case than "differs from both": a result
-/// that is only the lower copy's settings also takes a new number. A store takes a copy only
-/// with a higher `seq` than it holds, so a store holding the top copy would refuse such a
-/// result if it kept the top `seq`, and the lower copy's edits would never reach it.
+/// it. That is one more case than "differs from both": a result that is only the lower copy's
+/// settings also takes a new number. A store takes a copy only with a higher `seq` than it
+/// holds, so a store holding the top copy would refuse such a result if it kept the top `seq`,
+/// and the lower copy's edits would never reach it.
 pub fn merge(a: &SharedSettings, b: &SharedSettings) -> SharedSettings {
     let mut out = SharedSettings::default();
     let mut conflicts = Vec::new();
@@ -1304,10 +1304,13 @@ fn higher_of_each(
 ///
 /// A copy that holds a factory stamp with no factory `seen` was written by a build before the
 /// field, which counted factory edits in `seen` with every other edit: its `seen` is read in its
-/// place, as that build read it. This build never writes such a copy: whatever it numbers,
-/// merges or takes from a protocol 4 machine stores this map, read from the copy as it stood
-/// before any copy from a protocol 4 machine was merged in. So a `seen` a protocol 4 machine
-/// passes on is never read here, except in a copy from a build before the field.
+/// place, as that build read it. This build stores this map whenever it numbers a factory edit,
+/// merges, or takes a copy from a protocol 4 machine, read from the held copy as it stood before
+/// that copy was merged in; numbering any other edit leaves a copy in the old shape, adding only
+/// this machine's own number to `seen`. So a `seen` a protocol 4 machine passes on after this
+/// build holds the copy is never read here. One written into a copy by a protocol 5 build before
+/// the field still is, and kept: while such a build runs beside a protocol 4 machine, two sides
+/// of a split can each count the other's factory edit, as every machine did before the field.
 fn factory_seen(settings: &SharedSettings) -> BTreeMap<MachineId, u64> {
     let mut stamps = settings
         .stamps
