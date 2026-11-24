@@ -207,6 +207,10 @@ fn gate_attempts(events: &[RunEvent]) -> u32 {
 /// finds a secret only once the control characters that are not white space are gone: then it
 /// is kept without them, with that secret hidden. Line breaks and tabs stay, so two lines are
 /// never joined into something that looks like a secret.
+///
+/// So a known token split by white space (a line break, a tab, a space) is not hidden here, and
+/// is stored as it came. Only `hide` knows the values it hides, so only it can tell a split
+/// token from two lines that merely join into something that looks like one.
 fn hide_texts(value: &mut Value, hide: &(dyn Fn(&str) -> String + Send + Sync)) {
     match value {
         Value::String(text) => {
