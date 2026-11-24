@@ -757,6 +757,40 @@ mod tests {
     }
 
     #[test]
+    fn a_read_above_a_version_keeps_to_the_writers_index_where_the_planner_would_not() {
+        // Statistics under which one writer holds every row and a run's key range looks
+        // narrow: left to itself, SQLite would then read the run's rows by key, its whole
+        // history below the version included.
+        let (_dir, store) = open();
+        store
+            .conn
+            .execute_batch(
+                "ANALYZE;
+                 DELETE FROM sqlite_stat1;
+                 INSERT INTO sqlite_stat1 (tbl, idx, stat) VALUES
+                     ('factory_records', 'factory_records_by_owner', '1000000 1000000 1'),
+                     ('factory_records', 'sqlite_autoindex_factory_records_1', '1000000 250000 1');
+                 ANALYZE sqlite_schema;",
+            )
+            .unwrap();
+        let unhinted = EVENTS_OF_WRITER_ABOVE.replace("INDEXED BY factory_records_by_owner", "");
+        let steps = plan(&store, &unhinted);
+        assert!(
+            !steps
+                .iter()
+                .any(|step| step.contains("factory_records_by_owner")),
+            "the statistics must turn the planner away from the writer's index: {steps:?}"
+        );
+        let steps = plan(&store, EVENTS_OF_WRITER_ABOVE);
+        assert!(
+            steps
+                .iter()
+                .any(|step| step.contains("factory_records_by_owner (owner=? AND version>?)")),
+            "{steps:?}"
+        );
+    }
+
+    #[test]
     fn the_reads_of_a_runs_rows_count_the_rows_they_hand_back() {
         let (_dir, mut store) = open();
         let (a, b) = (MachineId::random(), MachineId::random());
