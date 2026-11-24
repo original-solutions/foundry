@@ -73,20 +73,22 @@ pub struct Ledger {
     generation: u64,
     hide: Hide,
     wall: WallClock,
-    seen: Arc<Mutex<BTreeMap<RunId, Seen>>>,
+    tallies: Arc<Mutex<BTreeMap<RunId, RunTally>>>,
 }
 
 /// What a ledger has read of one run's events: all a write needs, so the run's history is read
 /// once and each later write reads only what was stored since.
 ///
 /// A stored run event never changes or goes (its key holds its writer and version), and each
-/// writer's events are stored in the order of their versions, so what was read stays true and
-/// the highest version read of each writer is where its next read starts. The writers are
+/// writer's records are stored in the order of their versions, so what was read stays true and
+/// the highest version held from a writer is where its next read starts. The writers are
 /// looked for again on every read, so a `finished` event that another machine wrote, synced in
-/// since, is seen.
+/// since, is seen. Once the run is finished nothing more is kept of it, since nothing more is
+/// written to it.
 #[derive(Default)]
-struct Seen {
-    /// The highest version read of each writer's events of the run.
+struct RunTally {
+    /// The version each writer's next read of the run starts above: the highest version held
+    /// from it, of any record, when it was last read.
     read_to: BTreeMap<MachineId, u64>,
     /// The run has its `finished` event, whatever its data.
     finished: bool,
@@ -97,12 +99,18 @@ struct Seen {
     gate_attempts: BTreeSet<u32>,
 }
 
-impl Seen {
-    /// Takes in `event`, which `writer` stored at `version`.
+impl RunTally {
+    /// Takes in `event`, which `writer` stored at `version`. Nothing is kept of a finished run
+    /// but that it is finished.
     fn take(&mut self, writer: MachineId, version: u64, event: &RunEvent) {
-        let read_to = self.read_to.entry(writer).or_insert(version);
-        *read_to = (*read_to).max(version);
-        self.finished |= event.event == names::FINISHED;
+        if event.event == names::FINISHED {
+            self.finished = true;
+        }
+        if self.finished {
+            self.forget_all_but_finished();
+            return;
+        }
+        self.read_to_at_least(writer, version);
         let order = (event.generation, version, writer.to_string());
         if self.first.as_ref().is_none_or(|(first, _)| order < *first) {
             self.first = Some((order, event.ms));
@@ -112,14 +120,39 @@ impl Seen {
         }
     }
 
+    /// Keeps only that the run is finished: nothing more is written to it, so nothing more of
+    /// it is needed.
+    fn forget_all_but_finished(&mut self) {
+        *self = Self {
+            finished: true,
+            ..Self::default()
+        };
+    }
+
+    /// Moves `writer`'s next read to start above `version`, if it does not already.
+    fn read_to_at_least(&mut self, writer: MachineId, version: u64) {
+        let read_to = self.read_to.entry(writer).or_insert(version);
+        *read_to = (*read_to).max(version);
+    }
+
     /// Reads into this what `store` holds of `run` that has not been read yet: every event of
-    /// a writer not read before, and each other writer's events above the highest version
-    /// read. A row this build cannot read is an error, and nothing of its writer is taken.
+    /// a writer not read before, and each other writer's events above where its last read
+    /// ended. A row this build cannot read is an error, and nothing of its writer is taken.
+    ///
+    /// Each writer's next read then starts above the highest version held from it, so the
+    /// records it stores of other runs meanwhile are not visited again by every later write.
+    /// `store` is the locked store, so nothing of a writer is stored between its two reads.
     fn catch_up(&mut self, store: &Store, run: &RunId) -> Result<(), StoreError> {
         for writer in store.run_writers(run)? {
             let above = self.read_to.get(&writer).copied();
             for (version, event) in store.run_events_by(run, writer, above)? {
                 self.take(writer, version, &event);
+            }
+            if self.finished {
+                return Ok(());
+            }
+            if let Some(highest) = store.highest_factory_version(writer)? {
+                self.read_to_at_least(writer, highest);
             }
         }
         Ok(())
@@ -136,7 +169,7 @@ impl Ledger {
             generation,
             hide,
             wall: Arc::new(system_ms),
-            seen: Arc::default(),
+            tallies: Arc::default(),
         }
     }
 
@@ -185,20 +218,23 @@ impl Ledger {
         // run never cross. What the ledger has read of the run is locked inside it, always in
         // that order.
         let mut store = self.lock();
-        let mut runs = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
-        let seen = runs.entry(run.clone()).or_default();
+        let mut tallies = self.tallies.lock().unwrap_or_else(PoisonError::into_inner);
+        let tally = tallies.entry(run.clone()).or_default();
         // Only the events stored since the ledger last read the run are read, so a write does
-        // not read the run's whole history again.
-        seen.catch_up(&store, run)?;
+        // not read the run's whole history again. A run once finished stays finished, so it is
+        // not read again at all.
+        if !tally.finished {
+            tally.catch_up(&store, run)?;
+        }
         // A `finished` event ends the run even when its data cannot be read.
-        if seen.finished {
+        if tally.finished {
             return Err(LedgerError::AlreadyFinished { run: run.clone() });
         }
         let ms = (self.wall)();
         // Two numbers, which need no hiding.
         if let (Event::Finished { .. }, Value::Object(fields)) = (event, &mut data) {
-            let first = seen.first.as_ref().map_or(ms, |(_, first)| *first);
-            let attempts = u32::try_from(seen.gate_attempts.len()).unwrap_or(u32::MAX);
+            let first = tally.first.as_ref().map_or(ms, |(_, first)| *first);
+            let attempts = u32::try_from(tally.gate_attempts.len()).unwrap_or(u32::MAX);
             fields.insert("total_ms".into(), ms.saturating_sub(first).into());
             fields.insert("gate_attempts".into(), attempts.into());
         }
@@ -218,7 +254,7 @@ impl Ledger {
             body: FactoryBody::RunEvent(written.clone()),
         };
         if store.apply_factory(&record, self.me)? == Applied::Stored {
-            seen.take(self.me, version, &written);
+            tally.take(self.me, version, &written);
         }
         Ok(written)
     }

@@ -89,9 +89,15 @@ const EVENTS_OF_WRITER_ABOVE: &str = "SELECT version, record FROM factory_record
 
 /// Whether a run event in [`?1`, `?2`) is named `?3`. No index holds the event name, so SQLite
 /// reads the rows of the range in key order until one is named `?3`, all of them when none is;
-/// only the yes or no comes back.
+/// only the yes or no comes back. A row that is not JSON names no event, so the answer does not
+/// depend on whether such a row comes before the one named `?3`.
 const HAS_EVENT: &str = "SELECT EXISTS (SELECT 1 FROM factory_records WHERE kind = 'run_event' \
-     AND id >= ?1 AND id < ?2 AND json_extract(record, '$.body.event') IS ?3)";
+     AND id >= ?1 AND id < ?2 \
+     AND CASE WHEN json_valid(record) THEN json_extract(record, '$.body.event') END IS ?3)";
+
+/// The highest version held from owner `?1`, of any kind of record, or NULL with none: one seek
+/// of the owner's index.
+const HIGHEST_VERSION: &str = "SELECT MAX(version) FROM factory_records WHERE owner = ?1";
 
 /// The run event stored as `json`. A row that holds another kind of record is an error.
 fn run_event(json: &str) -> Result<RunEvent, StoreError> {
@@ -248,12 +254,21 @@ impl Store {
 
     /// Whether any writer has stored an event of `run` named `event`, whatever its data. The
     /// store answers yes or no and hands back no row of the run, though it reads the run's rows
-    /// up to the first one so named ([`HAS_EVENT`]). A row whose record is not JSON is an error;
-    /// one that is JSON but not a run event this build reads names no event.
+    /// up to the first one so named ([`HAS_EVENT`]). A row this build cannot read as a run
+    /// event, JSON or not, names no event.
     pub fn run_has_event(&self, run: &RunId, event: &str) -> Result<bool, StoreError> {
         let (from, to) = range(&run.to_string());
         let mut query = self.conn.prepare_cached(HAS_EVENT)?;
         Ok(query.query_row(params![from, to, event], |row| row.get(0))?)
+    }
+
+    /// The highest version of any factory record held from `owner`, or `None` with none. A
+    /// writer's records are stored in the order of their versions, so none it wrote can arrive
+    /// later below this.
+    pub fn highest_factory_version(&self, owner: MachineId) -> Result<Option<u64>, StoreError> {
+        let mut query = self.conn.prepare_cached(HIGHEST_VERSION)?;
+        let highest: Option<i64> = query.query_row(params![owner.to_string()], |row| row.get(0))?;
+        Ok(highest.map(from_sql))
     }
 
     /// Every run of `repo` (`owner/name`, in any case) that has an event, once each, in order.
