@@ -460,34 +460,37 @@ exec "$agent" "$@""#;
                 .count()
         }
 
+        fn terminal_of(&self, id: SessionId) -> foundry_proto::ids::TerminalId {
+            let store = self.store.lock().unwrap();
+            store
+                .since(self.me, 0)
+                .unwrap()
+                .into_iter()
+                .filter_map(|record| match record {
+                    AnyRecord::Session(r) if r.body.id == id => Some(r.body.terminal),
+                    _ => None,
+                })
+                .next_back()
+                .unwrap()
+        }
+
         /// What the session's terminal showed, read until `done` holds for it.
         async fn shown(&self, id: SessionId, done: impl Fn(&str) -> bool) -> String {
-            let terminal = {
-                let store = self.store.lock().unwrap();
-                store
-                    .since(self.me, 0)
-                    .unwrap()
-                    .into_iter()
-                    .filter_map(|record| match record {
-                        AnyRecord::Session(r) if r.body.id == id => Some(r.body.terminal),
-                        _ => None,
-                    })
-                    .next_back()
-                    .unwrap()
-            };
+            let terminal = self.terminal_of(id);
             let (snapshot, mut output) = self.terminals.attach(terminal).await.unwrap();
             read_until(&snapshot.bytes, &mut output, done).await
         }
 
         /// That nothing of a refused start is left: no record, no file, nothing live.
-        fn assert_nothing_left(&self, project: ProjectId) {
+        fn assert_nothing_left(&self, sessions: &Sessions, project: ProjectId) {
             assert_eq!(self.session_records(), 0);
             let left: Vec<_> = std::fs::read_dir(self.sessions_dir())
                 .map(|entries| entries.flatten().map(|e| e.path()).collect())
                 .unwrap_or_default();
             assert!(left.is_empty(), "left behind: {left:?}");
-            assert!(crate::sessions::lock(&self.sessions.inner.live).is_empty());
-            assert!(self.sessions.factory_sessions(project).is_empty());
+            assert!(crate::sessions::lock(&sessions.inner.live).is_empty());
+            assert!(crate::sessions::lock(&sessions.inner.factory).is_empty());
+            assert!(sessions.factory_sessions(project).is_empty());
         }
     }
 
@@ -619,7 +622,8 @@ exec "$agent" "$@""#;
         assert_eq!(f.sessions.factory_sessions(project), [id]);
         assert!(f.sessions.factory_sessions(ProjectId::random()).is_empty());
 
-        // A refused start is also logged and returned, and neither holds the token.
+        // A refusal before the token is read: this holds the token only if it leaked earlier.
+        // The failure after the read is checked in the folder test below.
         let refused = f
             .sessions
             .start_factory(
@@ -645,6 +649,157 @@ exec "$agent" "$@""#;
         let seen = f.shown(id, |t| value(t, "PROMPT=").is_some()).await;
         let typed: String = serde_json::from_str(&value(&seen, "PROMPT=").unwrap()).unwrap();
         assert_eq!(typed, FIRST_LINE);
+
+        // The token is in no file: not under the data dir, not in Claude Code's state file.
+        let mut files = vec![f.config.claude_json.clone()];
+        let mut dirs = vec![f.data.path().to_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let kind = entry.file_type().unwrap();
+                if kind.is_dir() {
+                    dirs.push(entry.path());
+                } else if kind.is_file() {
+                    files.push(entry.path());
+                }
+            }
+        }
+        assert!(files.len() > 3, "{files:?}");
+        for file in files {
+            let bytes = std::fs::read(&file).unwrap_or_default();
+            assert!(
+                !bytes.windows(TOKEN.len()).any(|w| w == TOKEN.as_bytes()),
+                "the token is in {}",
+                file.display()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn each_start_reads_the_token_again() {
+        let f = Fx::new("- print_env: GH_TOKEN\n- wait_input\n").await;
+        let other = "ghp_anotherMadeUpToken0987654321zyxwvuTSRQ";
+        f.secrets.set(&format!("github:{LOGIN}"), other).unwrap();
+
+        let id = f
+            .start_factory(WorkspaceId::random(), ProjectId::random())
+            .await;
+
+        let seen = f.shown(id, |t| value(t, "GH_TOKEN=").is_some()).await;
+        assert_eq!(value(&seen, "GH_TOKEN=").as_deref(), Some(other));
+    }
+
+    #[tokio::test]
+    async fn end_factory_is_ok_when_one_terminal_is_already_closed_and_ends_the_other() {
+        let f = Fx::new("- wait_input\n").await;
+        let project = ProjectId::random();
+        let w = WorkspaceId::random();
+        let first = f.start_factory(w, project).await;
+        let second = f.start_factory(w, project).await;
+
+        f.terminals.close(f.terminal_of(first)).await.unwrap();
+        f.sessions.end_factory(w).await.unwrap();
+
+        until("the second session to end", || {
+            matches!(
+                f.state(second),
+                Some(SessionState::Finished | SessionState::Failed)
+            )
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn end_factory_ends_a_start_that_is_still_in_flight() {
+        let f = Arc::new(Fx::new("- wait_input\n").await);
+        let project = ProjectId::random();
+        let w = WorkspaceId::random();
+        // Another thread holds the store, so the start stops in `launch`, after it is live.
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn({
+            let store = f.store.clone();
+            move || {
+                let _held = crate::sessions::lock(&store);
+                held_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            }
+        });
+        held_rx.recv().unwrap();
+        let start = tokio::spawn({
+            let f = f.clone();
+            async move { f.start_factory(w, project).await }
+        });
+        until("the start to be live", || {
+            !crate::sessions::lock(&f.sessions.inner.live).is_empty()
+        })
+        .await;
+        let end = tokio::spawn({
+            let f = f.clone();
+            async move { f.sessions.end_factory(w).await }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+
+        let id = start.await.unwrap();
+        end.await.unwrap().unwrap();
+        until("the session in flight to end", || {
+            matches!(
+                f.state(id),
+                Some(SessionState::Finished | SessionState::Failed)
+            )
+        })
+        .await;
+    }
+
+    /// `git` with HOME at `home`, no way to reach a network by ssh, and the factory env on top.
+    fn factory_git(home: &Path, args: &[&str]) -> Command {
+        let data = tempfile::tempdir().unwrap();
+        let secrets = MemorySecrets::default();
+        secrets.set(&format!("github:{LOGIN}"), TOKEN).unwrap();
+        let env = factory_env(&secrets, LOGIN, data.path()).unwrap();
+        let mut git = Command::new("git");
+        git.args(args)
+            .current_dir(home)
+            .env("HOME", home)
+            .env("XDG_CONFIG_HOME", home)
+            .env("GIT_SSH_COMMAND", "false")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("GIT_CONFIG_GLOBAL");
+        git.env("GIT_CONFIG_PARAMETERS", "'credential.helper'='store'");
+        git.envs(env);
+        git
+    }
+
+    #[test]
+    fn the_factory_env_lets_git_use_https_only_whatever_the_global_config_rewrites() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join(".gitconfig"),
+            "[url \"git@github.com:\"]\n\tinsteadOf = https://github.com/\n",
+        )
+        .unwrap();
+
+        let out = factory_git(home.path(), &["ls-remote", "https://github.com/o/r.git"])
+            .output()
+            .unwrap();
+
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success());
+        assert!(err.contains("transport 'ssh' not allowed"), "{err}");
+    }
+
+    #[test]
+    fn the_factory_env_drops_a_credential_helper_named_in_git_config_parameters() {
+        let home = tempfile::tempdir().unwrap();
+
+        let out = factory_git(home.path(), &["config", "--get-all", "credential.helper"])
+            .output()
+            .unwrap();
+
+        let helpers = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(helpers.lines().last(), Some(""), "{helpers:?}");
+        assert!(out.status.success());
     }
 
     #[tokio::test]
@@ -663,7 +818,7 @@ exec "$agent" "$@""#;
             .unwrap_err();
 
         assert!(matches!(error, SessionError::NoToken(_)), "{error}");
-        f.assert_nothing_left(project);
+        f.assert_nothing_left(&f.sessions, project);
     }
 
     #[tokio::test]
@@ -683,7 +838,7 @@ exec "$agent" "$@""#;
             .unwrap_err();
 
         assert!(matches!(error, SessionError::NoToken(_)), "{error}");
-        f.assert_nothing_left(project);
+        f.assert_nothing_left(&bare, project);
     }
 
     #[tokio::test]
@@ -703,7 +858,7 @@ exec "$agent" "$@""#;
             .unwrap_err();
 
         assert!(matches!(error, SessionError::FirstMessageBody), "{error}");
-        f.assert_nothing_left(project);
+        f.assert_nothing_left(&f.sessions, project);
     }
 
     #[tokio::test]
@@ -778,7 +933,12 @@ exec "$agent" "$@""#;
             .await
             .unwrap();
 
-        let seen = f.shown(id, |t| t.contains("GH_TOKEN")).await;
+        let seen = f
+            .shown(id, |t| {
+                value(t, "GH_TOKEN=").is_some()
+                    || t.lines().any(|l| l.trim_end() == "GH_TOKEN unset")
+            })
+            .await;
         let args = args(&seen);
         assert!(args.contains(&"--model".to_string()), "{args:?}");
         assert!(
@@ -802,6 +962,7 @@ exec "$agent" "$@""#;
 
     #[tokio::test]
     async fn a_start_that_fails_after_its_folder_is_written_removes_the_folder_too() {
+        let logged = Logged::everywhere();
         let f = Fx::new("- wait_input\n").await;
         let project = ProjectId::random();
         std::fs::write(&f.config.claude_json, "not json").unwrap();
@@ -817,8 +978,11 @@ exec "$agent" "$@""#;
             .await
             .unwrap_err();
 
+        // The token was read before this failure, so this is a check that it did not leak.
         assert!(matches!(error, SessionError::ClaudeState { .. }), "{error}");
-        f.assert_nothing_left(project);
+        assert!(!format!("{error} {error:?}").contains(TOKEN));
+        assert!(!logged.text().contains(TOKEN));
+        f.assert_nothing_left(&f.sessions, project);
         assert_eq!(f.sessions.is_factory(SessionId::random()), None);
     }
 }
