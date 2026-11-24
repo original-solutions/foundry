@@ -31,6 +31,8 @@ use serde::Serialize;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{Instant, timeout, timeout_at};
 
+use std::time::Duration;
+
 use super::factory::{self, Cursor, Sent};
 use super::{BATCH, Conn, Inner, OFFLINE_AFTER, RETRY_REFUSED, TICK, WARN_EVERY, on_store};
 
@@ -61,8 +63,9 @@ pub(super) async fn run(
 /// links with ([`links_with`]: it is listed, or this machine's list holds no machine but
 /// itself) or stops taking them. Changed settings go first in each round, so a peer just removed
 /// from the list is sent the copy that removed it before its link closes, and holds its own
-/// removal. New factory records go last, on a link that carries them, one message a round; while
-/// more of them wait the next round starts at once.
+/// removal. New factory records go last, on a link that carries them, one message a round and
+/// only into an empty queue; while more of them wait, the next round starts as soon as the queue
+/// is empty.
 async fn sending(inner: &Inner, send: &Sender<String>, open: &Open) {
     let mut sent = open.sent;
     let mut factory_sent = Cursor::new(open.factory_sent);
@@ -71,6 +74,7 @@ async fn sending(inner: &Inner, send: &Sender<String>, open: &Open) {
     let mut every = tokio::time::interval(TICK);
     loop {
         every.tick().await;
+        let room = send.capacity() == send.max_capacity();
         if !send_settings(inner, send, open, &mut settings_sent).await {
             return;
         }
@@ -81,13 +85,34 @@ async fn sending(inner: &Inner, send: &Sender<String>, open: &Open) {
         if !send_own(inner, send, open, &mut sent, &mut warned).await {
             return;
         }
-        match factory::send_own(inner, send, open.peer, open.speak, &mut factory_sent).await {
+        match factory::send_own(inner, send, open.peer, open.speak, &mut factory_sent, room).await {
             Sent::Closed => return,
-            Sent::More => every.reset_immediately(),
-            Sent::Done => {}
+            Sent::More if drained(send).await => every.reset_immediately(),
+            Sent::More | Sent::Done => {}
         }
     }
 }
+
+/// Waits until the peer's end has taken everything queued on `send`, for at most a [`TICK`],
+/// and says whether it did.
+async fn drained(send: &Sender<String>) -> bool {
+    let start = Instant::now();
+    loop {
+        if send.is_closed() {
+            return false;
+        }
+        if send.capacity() == send.max_capacity() {
+            return true;
+        }
+        if start.elapsed() >= TICK {
+            return false;
+        }
+        tokio::time::sleep(DRAIN_POLL).await;
+    }
+}
+
+/// How often [`drained`] looks at a link's queue.
+const DRAIN_POLL: Duration = Duration::from_millis(10);
 
 /// Sends the shared settings this machine holds when a coordinator is set, the link speaks
 /// [`EDITS_SINCE`] or later, and their `seq` is not the one last sent on this link (`last`),

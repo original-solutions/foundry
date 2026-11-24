@@ -473,11 +473,6 @@ impl Inner {
         Ok(conn)
     }
 
-    /// Tells [`Peers::factory_changes`] that a factory record was stored.
-    fn factory_changed(&self) {
-        self.factory_changed.send_modify(|n| *n = n.wrapping_add(1));
-    }
-
     fn heard_from(&self, peer: MachineId) {
         lock(&self.heard).insert(peer, Instant::now());
     }
@@ -519,6 +514,11 @@ impl Drop for Opened<'_> {
             }
         }
     }
+}
+
+/// Tells the readers of [`Peers::factory_changes`] that a factory record was stored.
+fn tell(changed: &watch::Sender<u64>) {
+    changed.send_modify(|n| *n = n.wrapping_add(1));
 }
 
 /// `record` as a machine shows it: a session or terminal whose owner is offline is
