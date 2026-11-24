@@ -27,7 +27,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::routing::post;
 use bytes::Bytes;
-use foundry_proto::ids::{MachineId, ProjectId, SessionId, TerminalId, WorkspaceId};
+use foundry_proto::ids::{MachineId, SessionId, TerminalId, WorkspaceId};
 use foundry_proto::record::{AnyRecord, Record, Session, Terminal};
 use foundry_proto::state::{SessionState, TerminalState};
 use futures::StreamExt as _;
