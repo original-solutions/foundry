@@ -443,11 +443,12 @@ mod tests {
                 .count()
         };
         let before = lists.load(Ordering::SeqCst);
-        // Three checks fail; a fourth starting means the third has been handled.
-        for _ in 0..4 {
+        // Three checks fail; a fourth starting means the third has been handled. Each pass waits
+        // for its check to start, so two passes never fold into one check.
+        for checks in 1..=4 {
             pass(&rig, CHECK_EVERY).await;
+            wait_for(|| lists.load(Ordering::SeqCst) >= before + checks).await;
         }
-        wait_for(|| lists.load(Ordering::SeqCst) >= before + 4).await;
         assert!(lists.load(Ordering::SeqCst) >= before + 4, "checks ran");
         assert_eq!(warnings(&logged), 1, "{}", logged.text());
 
