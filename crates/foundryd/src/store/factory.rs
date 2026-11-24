@@ -19,7 +19,7 @@ use foundry_proto::factory::{
 };
 use foundry_proto::ids::{MachineId, ProjectId, SessionId};
 use rusqlite::types::Type;
-use rusqlite::{OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use super::{Applied, Store, StoreError, from_sql, to_sql};
 
@@ -38,12 +38,6 @@ fn wrong_kind(kind: &str, body: &FactoryBody) -> StoreError {
         Type::Text,
         format!("a {kind} row holds a {} record", body.kind()).into(),
     ))
-}
-
-fn parse_machine(index: usize, text: &str) -> rusqlite::Result<MachineId> {
-    text.parse()
-        .map(MachineId)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(index, Type::Text, Box::new(e)))
 }
 
 impl Store {
@@ -103,15 +97,30 @@ impl Store {
     }
 
     /// The highest factory version held from each owner.
+    ///
+    /// An owner this build cannot read as a machine id, which only a corrupt file or a newer
+    /// build's id format leaves, is left out: one such row must not make the machine's hello
+    /// say it holds no factory record, which would have every peer send it all of theirs again
+    /// on every link. Each such owner is warned of once while the store is open
+    /// (`warn_unreadable_owner`).
     pub fn factory_versions(&self) -> Result<BTreeMap<MachineId, u64>, StoreError> {
         let mut query = self
             .conn
             .prepare_cached("SELECT owner, MAX(version) FROM factory_records GROUP BY owner")?;
         let rows = query.query_map([], |row| {
-            let owner: String = row.get(0)?;
-            Ok((parse_machine(0, &owner)?, from_sql(row.get(1)?)))
+            Ok((row.get::<_, String>(0)?, from_sql(row.get(1)?)))
         })?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        let mut versions = BTreeMap::new();
+        for row in rows {
+            let (owner, version) = row?;
+            match owner.parse() {
+                Ok(id) => {
+                    versions.insert(MachineId(id), version);
+                }
+                Err(_) => warn_unreadable_owner(&self.conn, &owner),
+            }
+        }
+        Ok(versions)
     }
 
     /// The events of `run`, from every writer, by the lease generation they were written under,
@@ -284,6 +293,30 @@ impl Store {
         };
         let record: FactoryRecord = serde_json::from_str(&json)?;
         Ok(Some(record.body))
+    }
+}
+
+/// Warns that a factory row whose owner this build cannot read is left out of the versions
+/// held, once per owner while `conn` is open, which is once a start: the owners warned of are
+/// kept in a table of the connection's own, which goes when it closes. Should that table fail,
+/// the warning goes anyway. The line holds nothing of the row: not the owner, not its version,
+/// and not the parse error, which quotes the owner.
+fn warn_unreadable_owner(conn: &Connection, owner: &str) {
+    let inserted = conn
+        .execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS factory_owners_warned (owner TEXT PRIMARY KEY)",
+        )
+        .and_then(|()| {
+            conn.prepare_cached(
+                "INSERT OR IGNORE INTO temp.factory_owners_warned (owner) VALUES (?1)",
+            )?
+            .execute(params![owner])
+        });
+    if !matches!(inserted, Ok(0)) {
+        tracing::warn!(
+            "a factory row whose owner this build cannot read is left out of the factory \
+             versions held; told once a start"
+        );
     }
 }
 
