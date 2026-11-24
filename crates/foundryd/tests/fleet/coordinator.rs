@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use foundry_proto::factory::{FactorySettings, ProjectFactory};
 use foundry_proto::ids::{MachineId, ProjectId, WorkspaceId};
-use foundry_proto::messages::{ANSWERS_SINCE, EDITS_SINCE, PROTOCOL, PeerMessage};
+use foundry_proto::messages::{ANSWERS_SINCE, EDITS_SINCE, FACTORY_SINCE, PROTOCOL, PeerMessage};
 use foundry_proto::record::AnyRecord;
 use foundry_proto::settings::{
     Edit, EditId, Limits, Outcome, Overwritten, Project, SettingKey, SettingValue, SharedSettings,
@@ -2572,4 +2573,301 @@ async fn goes_after_the_edit_before_it(first_without_id: bool, second_without_id
         &["a", "b"]
     };
     assert_eq!(names, want, "in the order they arrived");
+}
+
+// --- factory settings ---
+
+/// The protocol before factory settings.
+const BEFORE_FACTORY: u16 = FACTORY_SINCE - 1;
+
+fn set_factory(max_runs: u32) -> Edit {
+    Edit::SetFactory {
+        settings: FactorySettings {
+            max_runs,
+            ..FactorySettings::default()
+        },
+    }
+}
+
+fn set_project_factory(n: u128, login: &str) -> Edit {
+    Edit::SetProjectFactory {
+        project: project(n, "").id,
+        factory: ProjectFactory {
+            on: true,
+            login: login.into(),
+            paused: false,
+        },
+    }
+}
+
+fn max_runs(settings: &SharedSettings) -> Option<u32> {
+    settings.factory.as_ref().map(|f| f.max_runs)
+}
+
+fn login_of(settings: &SharedSettings, n: u128) -> Option<String> {
+    settings
+        .project_factory
+        .get(&project(n, "").id)
+        .map(|f| f.login.clone())
+}
+
+/// `settings` as a machine on the protocol before factory settings sends them.
+fn older_settings(settings: &SharedSettings) -> PeerMessage {
+    PeerMessage::Settings {
+        protocol: BEFORE_FACTORY,
+        settings: settings.for_protocol(BEFORE_FACTORY),
+    }
+}
+
+/// Whether `json`, a settings message, names anything of the factory: a key, a stamp or a
+/// "setting overwritten" item.
+fn names_the_factory(json: &serde_json::Value) -> bool {
+    let settings = json["settings"].as_object().expect("settings");
+    let keys_of = |field: &str| {
+        settings
+            .get(field)
+            .and_then(|v| v.as_object())
+            .map(|o| o.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default()
+    };
+    settings.contains_key("factory")
+        || settings.contains_key("project_factory")
+        || keys_of("stamps")
+            .iter()
+            .chain(keys_of("overwritten").iter())
+            .any(|key| key.contains("factory"))
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_factory_setting_edited_on_one_machine_reaches_the_others() {
+    let fleet = Fleet::start_coordinated(3);
+    let first = fleet.daemons[0].id;
+    settled(&fleet, first).await;
+    // One edit on a machine that does not act, so it is forwarded, and one on the acting one.
+    let fleet_stamp = fleet.daemons[2]
+        .coordinator()
+        .edit(set_factory(5))
+        .await
+        .unwrap();
+    let project_stamp = fleet.daemons[0]
+        .coordinator()
+        .edit(set_project_factory(7, "rawphp"))
+        .await
+        .unwrap();
+    until(WAIT, "the factory settings reach every machine", || {
+        fleet.daemons.iter().all(|d| {
+            let settings = d.settings();
+            max_runs(&settings) == Some(5) && login_of(&settings, 7).as_deref() == Some("rawphp")
+        })
+    })
+    .await;
+    let settings = agreed(&fleet, &[0, 1, 2], "every machine agrees").await;
+    assert_eq!(
+        settings.stamps[&StampKey::Setting(SettingKey::Factory)],
+        fleet_stamp
+    );
+    assert_eq!(
+        settings.stamps[&StampKey::Setting(SettingKey::ProjectFactory(project(7, "").id))],
+        project_stamp
+    );
+    // Numbered by the acting machine, like any setting.
+    assert_eq!(fleet_stamp.by, first);
+    assert_eq!(project_stamp.by, first);
+    assert!(fleet_stamp.seq < project_stamp.seq);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_peer_on_protocol_4_is_sent_no_factory_setting_and_its_copy_leaves_them_as_they_are() {
+    let older = MachineId::random();
+    let fleet = Fleet::start_coordinated_with(1, &[older]);
+    let daemon = &fleet.daemons[0];
+    let Conn { send, mut recv } = raw_link_speaking(daemon, older, BEFORE_FACTORY).await;
+    // A machine on protocol 4 keeps every copy it is sent, and sends back what it can hold.
+    let sent = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+    tokio::spawn({
+        let (send, sent) = (send.clone(), sent.clone());
+        async move {
+            while let Some(text) = recv.recv().await {
+                let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if json["type"] != "settings" {
+                    continue;
+                }
+                lock(&sent).push(json.clone());
+                let theirs: SharedSettings =
+                    serde_json::from_value(json["settings"].clone()).unwrap();
+                let back = serde_json::to_string(&older_settings(&theirs)).unwrap();
+                if send.send(back).await.is_err() {
+                    return;
+                }
+            }
+        }
+    });
+    say(&send, &older_settings(&daemon.settings())).await;
+    let _beating = beating(send.clone());
+    until(WAIT, "the peer is online", || {
+        daemon.peers.online().contains(&older)
+    })
+    .await;
+    assert_eq!(daemon.coordinator().acting().await.unwrap(), daemon.id);
+
+    let coordinator = daemon.coordinator();
+    let fleet_stamp = coordinator.edit(set_factory(5)).await.unwrap();
+    let project_stamp = coordinator
+        .edit(set_project_factory(7, "rawphp"))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let seq = daemon.settings().seq;
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let held = daemon.settings();
+    assert_eq!(held.seq, seq, "the number keeps rising");
+    assert_eq!(max_runs(&held), Some(5));
+    assert_eq!(login_of(&held, 7).as_deref(), Some("rawphp"));
+    assert_eq!(
+        held.stamps[&StampKey::Setting(SettingKey::Factory)],
+        fleet_stamp
+    );
+    assert_eq!(
+        held.stamps[&StampKey::Setting(SettingKey::ProjectFactory(project(7, "").id))],
+        project_stamp
+    );
+
+    // The older machine numbers an edit of its own; its copy, which holds no factory setting,
+    // brings the edit and leaves the factory settings as they are.
+    let mut theirs = held.for_protocol(BEFORE_FACTORY);
+    theirs.seq += 1;
+    theirs.projects.push(project(9, "from the older machine"));
+    theirs.stamps.insert(
+        project_key(9),
+        Stamp {
+            seq: theirs.seq,
+            by: older,
+        },
+    );
+    theirs.seen.insert(older, theirs.seq);
+    say(&send, &older_settings(&theirs)).await;
+    let after = holds_project(daemon, 9, Duration::from_secs(2)).await;
+    assert_eq!(max_runs(&after), Some(5));
+    assert_eq!(login_of(&after, 7).as_deref(), Some("rawphp"));
+    assert_eq!(
+        after.stamps[&StampKey::Setting(SettingKey::Factory)],
+        fleet_stamp
+    );
+    assert!(after.overwritten.is_empty(), "{:?}", after.overwritten);
+
+    let sent = lock(&sent);
+    assert!(!sent.is_empty(), "no settings were sent");
+    for message in sent.iter() {
+        assert_eq!(message["protocol"], BEFORE_FACTORY, "{message}");
+        assert!(!names_the_factory(message), "{message}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_factory_edit_is_refused_with_the_reason_while_the_acting_machine_speaks_protocol_4() {
+    let older = MachineId::random();
+    let fleet = Fleet::start_coordinated_with(1, &[older]);
+    let daemon = &fleet.daemons[0];
+    let (conn, said) = recorded(raw_link_speaking(daemon, older, BEFORE_FACTORY).await);
+    let theirs = ordered_by(&daemon.settings(), older, vec![older, daemon.id]);
+    say(&conn, &older_settings(&theirs)).await;
+    let _beating = beating(conn.clone());
+    acting_becomes(&daemon.coordinator(), older, WAIT).await;
+
+    for edit in [set_factory(5), set_project_factory(7, "rawphp")] {
+        let error = tokio::time::timeout(Duration::from_secs(2), daemon.coordinator().edit(edit))
+            .await
+            .expect("the edit waited for an answer the older machine cannot give")
+            .unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains(&older.to_string()), "{text}");
+        assert!(text.contains("protocol 4"), "{text}");
+        assert!(text.contains("factory"), "{text}");
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(edits_sent(&said).is_empty(), "{:?}", edits_sent(&said));
+    assert_eq!(daemon.settings().factory, None);
+
+    // Any other setting still goes to it.
+    let other = tokio::spawn({
+        let coordinator = daemon.coordinator();
+        async move { coordinator.edit(set_project(7, "p")).await }
+    });
+    until(Duration::from_secs(2), "the edit is sent", || {
+        edits_sent(&said).len() == 1
+    })
+    .await;
+    other.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_forwarded_factory_edit_is_refused_with_the_reason_while_the_acting_machine_speaks_protocol_4()
+ {
+    let (older, peer) = (MachineId::random(), MachineId::random());
+    let fleet = Fleet::start_coordinated_with(1, &[older, peer]);
+    let daemon = &fleet.daemons[0];
+    let theirs = ordered_by(&daemon.settings(), older, vec![older, daemon.id, peer]);
+    let (older_conn, older_said) = recorded(raw_link_speaking(daemon, older, BEFORE_FACTORY).await);
+    say(&older_conn, &older_settings(&theirs)).await;
+    let _older_beat = beating(older_conn);
+    let (conn, said) = recorded(raw_link(daemon, peer).await);
+    say(&conn, &settings_message(theirs)).await;
+    let _beat = beating(conn.clone());
+    acting_becomes(&daemon.coordinator(), older, WAIT).await;
+
+    let id = EditId::random();
+    say(&conn, &edit_with(id, set_factory(5))).await;
+    let (answered, outcome) = the_answer(&said).await;
+    assert_eq!(answered, id);
+    let Outcome::Refused { reason, .. } = outcome else {
+        panic!("{outcome:?}");
+    };
+    assert!(reason.contains(&older.to_string()), "{reason}");
+    assert!(reason.contains("protocol 4"), "{reason}");
+    assert!(reason.contains("factory"), "{reason}");
+    assert!(edits_sent(&older_said).is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn after_a_split_with_a_factory_setting_edited_on_each_side_an_item_shows_both() {
+    let fleet = Fleet::start_coordinated(3);
+    settled(&fleet, fleet.daemons[0].id).await;
+    split(&fleet).await;
+    fleet.daemons[0]
+        .coordinator()
+        .edit(set_factory(4))
+        .await
+        .unwrap();
+    let cut_edit = Stamp {
+        seq: fleet.daemons[0].settings().seq,
+        by: fleet.daemons[0].id,
+    };
+    // The other side edits something else first, so its edit to the factory is the later one.
+    let other = fleet.daemons[1].coordinator();
+    other
+        .edit(set_limits(fleet.daemons[2].id, 4))
+        .await
+        .unwrap();
+    other.edit(set_factory(6)).await.unwrap();
+    agreed(&fleet, &[1, 2], "the rest agree").await;
+
+    fleet.heal(0);
+    let settings = agreed(&fleet, &[0, 1, 2], "the sides rejoin").await;
+    assert_eq!(max_runs(&settings), Some(6));
+    let factory = |max_runs| match set_factory(max_runs) {
+        Edit::SetFactory { settings } => SettingValue::Factory(settings),
+        _ => unreachable!(),
+    };
+    assert_eq!(
+        settings.overwritten,
+        [(
+            SettingKey::Factory,
+            Overwritten {
+                kept: Some(factory(6)),
+                lost: Some(factory(4)),
+                lost_stamp: cut_edit,
+            }
+        )]
+        .into()
+    );
 }
