@@ -142,10 +142,11 @@ pub struct Coordinator {
     /// is heard from. Written and read for a waiting edit under the store's lock, with the
     /// settings, so a copy counted here is always in the settings read with it.
     taken: Arc<Mutex<BTreeMap<MachineId, Instant>>>,
-    /// The protocol of the link each machine's last copy of the settings came on. A machine is
-    /// never heard from on a link that carries settings before its copy is taken, so this holds
-    /// every reachable machine but one linked only before
-    /// [`foundry_proto::messages::EDITS_SINCE`].
+    /// The protocol of the link each machine's last copy of the settings came on, kept until its
+    /// next copy. A machine is never heard from on a link that carries settings before its copy
+    /// is taken, so this holds every reachable machine but one linked only before
+    /// [`foundry_proto::messages::EDITS_SINCE`]; while a machine links again in another
+    /// protocol, it holds the old one until the first copy on the new link.
     speaks: Mutex<BTreeMap<MachineId, u16>>,
     /// When this machine started. Until every listed machine's copy is in, or
     /// [`OFFLINE_AFTER`] has passed, its own copy may be an old one.
@@ -718,8 +719,13 @@ impl Coordinator {
 
     /// The protocol `acting` speaks when it is older than [`FACTORY_SINCE`] and `edit` changes a
     /// factory setting, which such a machine cannot read: the edit is not sent to it. `None`
-    /// when the edit may go, also when this machine has taken no copy from `acting` yet, as
-    /// [`crate::sync::Peers::send_edit`] then says why it cannot.
+    /// when the edit may go, and when this machine has taken no copy from `acting` yet.
+    ///
+    /// This reads the protocol of `acting`'s last copy ([`Coordinator::speaks`]), not of the link
+    /// [`crate::sync::Peers::send_edit`] will choose, which checks only [`ANSWERS_SINCE`]. So in
+    /// the moment after `acting` links again in another protocol, before its first copy on the
+    /// new link is taken, a factory edit can be refused for a link now on protocol 5, or sent on
+    /// one now on protocol 4. Deciding on the chosen link needs a change to `send_edit`.
     fn uncarried(&self, acting: MachineId, edit: &Edit) -> Option<u16> {
         if !edit.key().setting().is_factory() {
             return None;
