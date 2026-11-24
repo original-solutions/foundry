@@ -45,13 +45,20 @@
 //! machine it can reach, except one linked only in a protocol that carries no settings, so a
 //! returning machine catches up before it edits; an edit that reaches it before then waits,
 //! at most [`OFFLINE_AFTER`].
+//!
+//! Factory settings ([`SettingKey::is_factory`]) are numbered like any setting, but a machine
+//! before [`FACTORY_SINCE`] cannot read them. Links send such a peer the copy without them
+//! ([`SharedSettings::for_protocol`]), and a copy it sends back leaves the ones held here as
+//! they are ([`keep_factory`]). An edit of one is not sent to an acting machine whose link
+//! speaks an older protocol: this machine's own fails with [`CoordinatorError::Older`], and a
+//! forwarded one is refused, both naming the protocol.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use foundry_proto::ids::{MachineId, ProjectId};
-use foundry_proto::messages::ANSWERS_SINCE;
+use foundry_proto::messages::{ANSWERS_SINCE, FACTORY_SINCE};
 use foundry_proto::record::{Record, Workspace};
 use foundry_proto::settings::{
     Edit, EditId, Outcome, Overwritten, SettingKey, SettingValue, SharedSettings, Stamp, StampKey,
@@ -86,10 +93,10 @@ const NUMBERED_KEPT: u64 = 128;
 pub enum CoordinatorError {
     #[error("no link to {0}, the acting coordinator, is open, so the edit was not sent")]
     NotLinked(MachineId),
-    #[error(
-        "{acting}, the acting coordinator, speaks protocol {speaks}, which does not answer \
-         edits, so the edit was not sent"
-    )]
+    /// The acting machine's link speaks a protocol older than the edit needs: one before
+    /// [`ANSWERS_SINCE`] answers no edit, and one before [`FACTORY_SINCE`] carries no factory
+    /// setting, which is the only edit [`ANSWERS_SINCE`] or later refuses this way.
+    #[error("{acting}, the acting coordinator, speaks protocol {speaks}, {}", older(*speaks))]
     Older { acting: MachineId, speaks: u16 },
     #[error("the edit was refused: {reason}")]
     Refused { reason: String },
@@ -111,6 +118,19 @@ pub enum CoordinatorError {
     Store(#[from] StoreError),
 }
 
+/// Why an acting machine that speaks `speaks` was not sent an edit, for
+/// [`CoordinatorError::Older`].
+fn older(speaks: u16) -> String {
+    if speaks < ANSWERS_SINCE {
+        "which does not answer edits, so the edit was not sent".to_owned()
+    } else {
+        format!(
+            "which does not carry factory settings, so the edit was not sent; a factory \
+             setting can be edited once the acting coordinator speaks protocol {FACTORY_SINCE}"
+        )
+    }
+}
+
 /// This machine's part in the coordinator role: it numbers edits while it acts, forwards them
 /// while another machine does, and merges every copy of the settings a peer sends.
 pub struct Coordinator {
@@ -122,6 +142,11 @@ pub struct Coordinator {
     /// is heard from. Written and read for a waiting edit under the store's lock, with the
     /// settings, so a copy counted here is always in the settings read with it.
     taken: Arc<Mutex<BTreeMap<MachineId, Instant>>>,
+    /// The protocol of the link each machine's last copy of the settings came on. A machine is
+    /// never heard from on a link that carries settings before its copy is taken, so this holds
+    /// every reachable machine but one linked only before
+    /// [`foundry_proto::messages::EDITS_SINCE`].
+    speaks: Mutex<BTreeMap<MachineId, u16>>,
     /// When this machine started. Until every listed machine's copy is in, or
     /// [`OFFLINE_AFTER`] has passed, its own copy may be an old one.
     started: Instant,
@@ -139,6 +164,7 @@ impl Coordinator {
             store,
             peers,
             taken: Arc::new(Mutex::new(BTreeMap::new())),
+            speaks: Mutex::new(BTreeMap::new()),
             started: Instant::now(),
             queue: Mutex::new(Queue::default()),
             known: Mutex::new(BTreeMap::new()),
@@ -181,7 +207,9 @@ impl Coordinator {
     ///
     /// A copy that came on a link in a protocol before [`ANSWERS_SINCE`] cannot carry the ids
     /// of numbered edits, so it is taken as holding the ones this copy holds: without that every
-    /// merge with it would differ from both copies and raise the number again.
+    /// merge with it would differ from both copies and raise the number again. A copy that came
+    /// in a protocol before [`FACTORY_SINCE`] cannot carry factory settings, so it is taken as
+    /// holding the ones held here, for the same reason ([`keep_factory`]).
     pub(crate) async fn take_settings(
         &self,
         peer: MachineId,
@@ -189,10 +217,14 @@ impl Coordinator {
         mut settings: SharedSettings,
     ) -> Result<(), StoreError> {
         let (taken, at) = (Arc::clone(&self.taken), Instant::now());
+        lock(&self.speaks).insert(peer, speak);
         on_store(&self.store, move |store| {
             let held = store.settings()?;
             if speak < ANSWERS_SINCE {
                 settings.numbered = held.numbered.clone();
+            }
+            if speak < FACTORY_SINCE {
+                keep_factory(&held, &mut settings);
             }
             keep_keys(&held, &mut settings);
             let merged = merge(&held, &settings);
@@ -424,7 +456,12 @@ impl Coordinator {
                                 to == acting && self.peers.is_open(acting, link)
                             });
                             if !on_its_way {
-                                match self.peers.send_edit(acting, Some(id), &edit, on).await {
+                                let uncarried = self.uncarried(acting, &edit);
+                                let result = match uncarried {
+                                    Some(speaks) => Err(Unsent::Older(speaks)),
+                                    None => self.peers.send_edit(acting, Some(id), &edit, on).await,
+                                };
+                                match result {
                                     Ok(link) => {
                                         sent = Some((acting, link));
                                         self.sent_to(id, acting);
@@ -441,6 +478,16 @@ impl Coordinator {
                                     }
                                     Err(Unsent::Unwritable(error)) => {
                                         return Err(CoordinatorError::Unwritable(error));
+                                    }
+                                    Err(Unsent::Older(speaks))
+                                        if uncarried.is_some()
+                                            && self.may_refuse(id, from, Cause::Here) =>
+                                    {
+                                        return Err(self.refused(&format!(
+                                            "cannot pass a factory setting on to {acting}, the \
+                                             acting coordinator, which speaks protocol {speaks}: \
+                                             factory settings need protocol {FACTORY_SINCE}"
+                                        )));
                                     }
                                     Err(Unsent::NotLinked) if sent.is_none() && from.is_none() => {
                                         return Err(CoordinatorError::NotLinked(acting));
@@ -667,6 +714,20 @@ impl Coordinator {
             Ok((held, spoke))
         })
         .await
+    }
+
+    /// The protocol `acting` speaks when it is older than [`FACTORY_SINCE`] and `edit` changes a
+    /// factory setting, which such a machine cannot read: the edit is not sent to it. `None`
+    /// when the edit may go, also when this machine has taken no copy from `acting` yet, as
+    /// [`crate::sync::Peers::send_edit`] then says why it cannot.
+    fn uncarried(&self, acting: MachineId, edit: &Edit) -> Option<u16> {
+        if !edit.key().setting().is_factory() {
+            return None;
+        }
+        lock(&self.speaks)
+            .get(&acting)
+            .copied()
+            .filter(|speaks| *speaks < FACTORY_SINCE)
     }
 
     async fn held(&self) -> Result<SharedSettings, StoreError> {
@@ -1049,6 +1110,30 @@ pub fn keep_keys(held: &SharedSettings, copy: &mut SharedSettings) {
             machine.key.clone_from(&kept.key);
         }
     }
+}
+
+/// Puts in `copy` the factory settings `held` holds, with their stamps and their "setting
+/// overwritten" items, in place of any `copy` has: `copy` came from a machine before
+/// [`FACTORY_SINCE`], which is sent none and cannot hold one ([`SharedSettings::for_protocol`]).
+/// Without this the copy would differ from the held one at the same `seq`, and every merge
+/// with that machine would take a new number.
+pub fn keep_factory(held: &SharedSettings, copy: &mut SharedSettings) {
+    copy.factory.clone_from(&held.factory);
+    copy.project_factory.clone_from(&held.project_factory);
+    copy.stamps.retain(|key, _| !key.setting().is_factory());
+    copy.stamps.extend(
+        held.stamps
+            .iter()
+            .filter(|(key, _)| key.setting().is_factory())
+            .map(|(key, stamp)| (key.clone(), *stamp)),
+    );
+    copy.overwritten.retain(|key, _| !key.is_factory());
+    copy.overwritten.extend(
+        held.overwritten
+            .iter()
+            .filter(|(key, _)| key.is_factory())
+            .map(|(key, item)| (key.clone(), item.clone())),
+    );
 }
 
 /// One copy of the settings from two, setting by setting: the higher stamp's value holds, except
