@@ -192,12 +192,14 @@ pub fn github_default(secrets: &dyn Secrets) -> Option<String> {
 /// daemon started is hidden too, and then the passwords of URLs as [`redact`] hides them. When
 /// the store cannot be read, none of `text` is shown: [`HIDDEN_UNREADABLE`] is given instead.
 ///
-/// A held value of at least [`SPLIT_MIN`] characters is hidden also when gaps sit inside it,
-/// as a tool that wraps to the terminal's width or colours part of a word leaves them: each gap
-/// at most [`GAP_MAX`] characters of white space, controls, bidi and zero-width characters
-/// ([`is_gap`]) and whole escape sequences. A shorter value is hidden only whole. Only the
-/// span from the value's first character to its last becomes `***`; every other line and
-/// character of `text` stays as it was, and [`redact`] then reads the lines as they came.
+/// A held value with at least [`SPLIT_MIN`] characters that are no gap is hidden also when
+/// gaps sit inside it, as a tool that wraps to the terminal's width or colours part of a word
+/// leaves them: each gap at most [`GAP_MAX`] characters of space, tab, LF, CR, VT, FF and NEL,
+/// the other C0 and C1 controls and DEL, the bidi and zero-width characters ([`is_gap`]; no
+/// other Unicode white space), and whole escape sequences. Any other value is hidden only
+/// whole. Only the span from the value's first character to its last becomes `***`; every
+/// other line and character of `text` stays as it was, and [`redact`] then reads the lines as
+/// they came.
 pub fn hide_known(text: &str, secrets: &dyn Secrets) -> String {
     match known_values(secrets) {
         Ok(values) => redact(&hide_values(text, &values, &mut 0)),
@@ -208,31 +210,33 @@ pub fn hide_known(text: &str, secrets: &dyn Secrets) -> String {
     }
 }
 
-/// A held value this many characters long, or longer, is hidden also with gaps inside it. A
-/// shorter one could too easily be put together from pieces of text that merely sit near
-/// each other, so it is hidden only whole.
+/// A held value with this many characters that are no gap, or more, is hidden also with gaps
+/// inside it. A shorter one could too easily be put together from pieces of text that merely
+/// sit near each other, so it is hidden only whole.
 const SPLIT_MIN: usize = 16;
 
 /// The most characters one gap inside a held value may hold.
 const GAP_MAX: usize = 32;
 
-/// `text` with each span that holds one of `values` as `***`, read in one pass: every value is
-/// looked for whole, and one of at least [`SPLIT_MIN`] characters with no gap character of
-/// its own also with gaps inside it. Spans that overlap are hidden as one. `work` counts the
-/// characters read and the matchers' steps, so a test can bound them.
+/// `text` with each span that holds one of `values` as `***`, read in one pass. Every value is
+/// looked for whole. One with at least [`SPLIT_MIN`] characters that are no gap is looked for
+/// also as those characters with gaps between them, in two readings of the text at once: one
+/// that takes each gap character alone, and one that takes a whole escape sequence as one gap.
+/// An escape's introducer is a gap character itself, and the characters after it may be the
+/// value's own (`ESC a`, `CSI 9 j`), so a match in either reading is hidden. Spans that overlap
+/// are hidden as one. `work` counts the characters read and the matchers' steps, so a test can
+/// bound them.
 fn hide_values(text: &str, values: &[String], work: &mut usize) -> String {
     let values = values.iter().filter(|value| !value.is_empty());
     let mut whole: Vec<Matcher> = values.clone().map(|value| Matcher::new(value)).collect();
-    let mut split: Vec<Matcher> = values
-        .filter(|value| value.chars().count() >= SPLIT_MIN && !value.chars().any(is_gap))
-        .map(|value| Matcher::new(value))
+    let split: Vec<String> = values
+        .map(|value| value.chars().filter(|c| !is_gap(*c)).collect::<String>())
+        .filter(|kept| kept.chars().count() >= SPLIT_MIN)
         .collect();
-    // The byte offset of each character of `text` that is no gap, in order.
-    let mut kept: Vec<usize> = Vec::new();
+    let mut single = Reading::new(&split);
+    let mut sequences = Reading::new(&split);
     let mut spans: Vec<(usize, usize)> = Vec::new();
-    // The characters of gap since the last character that is no gap.
-    let mut gap = 0;
-    // Where the escape sequence being read ends.
+    // Where the escape sequence that `sequences` is reading ends.
     let mut escape_end = 0;
     for (at, c) in text.char_indices() {
         *work += 1;
@@ -242,26 +246,20 @@ fn hide_values(text: &str, values: &[String], work: &mut usize) -> String {
                 spans.push((end - matcher.bytes, end));
             }
         }
+        if is_gap(c) {
+            single.gap += 1;
+        } else {
+            single.keep(at, c, &mut spans, work);
+        }
         if at < escape_end {
             continue;
         }
         if is_gap(c) {
             let (bytes, chars) = escape(&text[at..], work).unwrap_or((c.len_utf8(), 1));
             escape_end = at + bytes;
-            gap += chars;
-            continue;
-        }
-        if gap > GAP_MAX {
-            for matcher in &mut split {
-                matcher.matched = 0;
-            }
-        }
-        gap = 0;
-        kept.push(at);
-        for matcher in &mut split {
-            if matcher.feed(c, work) {
-                spans.push((kept[kept.len() - matcher.value.len()], end));
-            }
+            sequences.gap += chars;
+        } else {
+            sequences.keep(at, c, &mut spans, work);
         }
     }
     spans.sort_unstable();
@@ -279,9 +277,48 @@ fn hide_values(text: &str, values: &[String], work: &mut usize) -> String {
     hidden
 }
 
-/// Whether `c` may sit in a gap inside a held value: white space, the C0 and C1 controls and
-/// DEL, and the bidi and zero-width characters. The introducer of an escape sequence is one,
-/// and a whole sequence is a gap of its own length ([`escape`]).
+/// One reading of where the gaps in a text are, with a matcher for each value's characters
+/// that are no gap.
+struct Reading {
+    matchers: Vec<Matcher>,
+    /// The byte offset of each character this reading has kept, in order.
+    kept: Vec<usize>,
+    /// The characters of gap since the last one kept.
+    gap: usize,
+}
+
+impl Reading {
+    fn new(values: &[String]) -> Self {
+        Self {
+            matchers: values.iter().map(|value| Matcher::new(value)).collect(),
+            kept: Vec::new(),
+            gap: 0,
+        }
+    }
+
+    /// Reads `c`, at byte `at`, as a character that is no gap, and adds the span of each value
+    /// it ends to `spans`. A gap longer than [`GAP_MAX`] before it ends every partial match.
+    fn keep(&mut self, at: usize, c: char, spans: &mut Vec<(usize, usize)>, work: &mut usize) {
+        if self.gap > GAP_MAX {
+            for matcher in &mut self.matchers {
+                matcher.matched = 0;
+            }
+        }
+        self.gap = 0;
+        self.kept.push(at);
+        for matcher in &mut self.matchers {
+            if matcher.feed(c, work) {
+                let start = self.kept[self.kept.len() - matcher.value.len()];
+                spans.push((start, at + c.len_utf8()));
+            }
+        }
+    }
+}
+
+/// Whether `c` may sit in a gap inside a held value: space, the C0 and C1 controls (tab, LF,
+/// CR, VT, FF and NEL among them) and DEL, and the bidi and zero-width characters. The
+/// introducer of an escape sequence is one, and a whole sequence is a gap of its own length
+/// ([`escape`]).
 fn is_gap(c: char) -> bool {
     matches!(
         c,

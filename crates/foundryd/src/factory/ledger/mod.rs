@@ -36,7 +36,7 @@ pub mod read;
 pub const OUTPUT_LIMIT: usize = 64 * 1024;
 
 /// Hides the secrets this machine holds in a text. The daemon's must hide every `github:*`
-/// token and gateway key in its secret store at the time of the call, also with white space,
+/// token and gateway key in its secret store at the time of the call, also with gaps of spaces,
 /// controls or escape sequences inside it, and URL passwords, as `secrets::hide_known` does;
 /// the ledger is given it when it is made, and gives it each text once.
 pub type Hide = Arc<dyn Fn(&str) -> String + Send + Sync>;
@@ -205,8 +205,8 @@ fn gate_attempts(events: &[RunEvent]) -> u32 {
 /// Every text in `value` through `hide` once, as it came, then cut to its last
 /// [`OUTPUT_LIMIT`] bytes. Hiding comes first, so a cut can never leave the end of a secret
 /// that the hiding would no longer recognise. A text keeps its lines and control characters:
-/// a known token split by white space, a control character or an escape sequence is found by
-/// `hide` itself (`secrets::hide_known` matches a held value across such gaps), since only it
+/// a known token split by spaces, line breaks, control characters or escape sequences is found
+/// by `hide` itself (`secrets::hide_known` matches a held value across such gaps), since only it
 /// knows the values it hides and so can tell a split token from two lines that merely join
 /// into something that looks like one.
 fn hide_texts(value: &mut Value, hide: &(dyn Fn(&str) -> String + Send + Sync)) {
