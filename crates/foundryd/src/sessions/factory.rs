@@ -502,9 +502,10 @@ fn names_github(text: &str) -> bool {
 
 /// The findings of the netrc at `path`. It errs toward refusing and does not parse the netrc as
 /// any one curl version does, since they differ (comments, `macdef`, quotes, escapes). It looks
-/// at the text lower-cased with every `"` and `\` removed: `github.com` as a host of its own
-/// there (not `api.github.com` or `github.com.example`) is a finding, and `default` anywhere
-/// is one, in a comment or a value too. The finding names the file, never contents. A netrc
+/// at the text lower-cased with every `\` removed and every `"` read as a space, since a
+/// closing quote can end a host (`"github.com"x`): `github.com` as a host of its own there
+/// (not `api.github.com` or `github.com.example`) is a finding, and `default` anywhere is
+/// one, in a comment or a value too. The finding names the file, never contents. A netrc
 /// that is not there has none; one that cannot be read is refused.
 fn netrc_findings(path: &Path) -> Vec<Finding> {
     let file = path.display().to_string();
@@ -522,7 +523,8 @@ fn netrc_findings(path: &Path) -> Vec<Finding> {
     let text: String = String::from_utf8_lossy(&bytes)
         .to_ascii_lowercase()
         .chars()
-        .filter(|c| *c != '"' && *c != '\\')
+        .filter(|c| *c != '\\')
+        .map(|c| if c == '"' { ' ' } else { c })
         .collect();
     let mut found = Vec::new();
     if names_github(&text) {
@@ -1954,6 +1956,7 @@ exec "$agent" "$@""#;
             format!("\"machine\"Xgithub.com password {SECRET}\n"),
             format!("machine example.com login \"a\\\"\" machine github.com password {SECRET}\n"),
             format!("machine \"git\\hub.com\" password {SECRET}\n"),
+            format!("machine \"github.com\"x login bob password {SECRET}\n"),
             format!("# machine github.com login u password {SECRET}\n"),
             format!("machine example.com password {SECRET}\n# default\n"),
             format!("machine example.com password {SECRET}\n\"default\"\n"),
