@@ -489,54 +489,23 @@ fn mask_user_info(key: &str) -> String {
     }
 }
 
-/// The tokens of a netrc line, as curl reads them, with no comment or `macdef` skipping:
-/// white space separates; an unquoted token runs to the next white space with backslashes
-/// literal; a double-quoted token ends at its closing quote and has escapes only inside it
-/// (`\n`, `\r`, `\t`, otherwise the next character itself).
-fn netrc_tokens(line: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut chars = line.chars().peekable();
-    while let Some(&first) = chars.peek() {
-        let mut token = String::new();
-        if first.is_whitespace() {
-            chars.next();
-            continue;
-        } else if first == '"' {
-            chars.next();
-            while let Some(c) = chars.next() {
-                match c {
-                    '"' => break,
-                    '\\' => match chars.next() {
-                        Some('n') => token.push('\n'),
-                        Some('r') => token.push('\r'),
-                        Some('t') => token.push('\t'),
-                        Some(other) => token.push(other),
-                        None => {}
-                    },
-                    other => token.push(other),
-                }
-            }
-        } else {
-            while let Some(&c) = chars.peek() {
-                if c.is_whitespace() {
-                    break;
-                }
-                token.push(c);
-                chars.next();
-            }
-        }
-        tokens.push(token);
-    }
-    tokens
+/// Whether `text` (already normalized) holds `github.com` as a host of its own: not after a
+/// `.` (`api.github.com`) and not before a letter, digit, `.` or `-` (`github.com.example`).
+fn names_github(text: &str) -> bool {
+    text.match_indices("github.com").any(|(at, found)| {
+        let before = text[..at].chars().next_back();
+        let after = text[at + found.len()..].chars().next();
+        before != Some('.')
+            && !after.is_some_and(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+    })
 }
 
-/// The findings of the netrc at `path`. It errs toward refusing, because curl versions read a
-/// netrc differently (comments, `macdef`, quotes, escapes): a netrc that names github.com or
-/// `default` anywhere, even in a comment or a value, refuses, and the refusal names the file and
-/// never its contents. It names github.com when its raw text holds it in any case, or when a
-/// token as curl reads it is it (`"git\hub.com"`); it names `default` when a white-space-
-/// separated word, quotes stripped, or a token is it. A netrc that is not there has none; one
-/// that cannot be read is refused.
+/// The findings of the netrc at `path`. It errs toward refusing and does not parse the netrc as
+/// any one curl version does, since they differ (comments, `macdef`, quotes, escapes). It looks
+/// at the text lower-cased with every `"` and `\` removed: `github.com` as a host of its own
+/// there (not `api.github.com` or `github.com.example`) is a finding, and `default` anywhere
+/// is one, in a comment or a value too. The finding names the file, never contents. A netrc
+/// that is not there has none; one that cannot be read is refused.
 fn netrc_findings(path: &Path) -> Vec<Finding> {
     let file = path.display().to_string();
     let bytes = match std::fs::read(path) {
@@ -550,26 +519,20 @@ fn netrc_findings(path: &Path) -> Vec<Finding> {
             }];
         }
     };
-    let text = String::from_utf8_lossy(&bytes);
-    let tokens: Vec<String> = text.lines().flat_map(netrc_tokens).collect();
+    let text: String = String::from_utf8_lossy(&bytes)
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| *c != '"' && *c != '\\')
+        .collect();
     let mut found = Vec::new();
-    let github = text.to_ascii_lowercase().contains("github.com")
-        || tokens
-            .iter()
-            .any(|token| token.eq_ignore_ascii_case("github.com"));
-    if github {
+    if names_github(&text) {
         found.push(Finding {
             what: "a netrc entry for github.com",
-            key: "machine github.com".into(),
+            key: "github.com".into(),
             file: file.clone(),
         });
     }
-    let default = text
-        .split_whitespace()
-        .map(|word| word.trim_matches('"'))
-        .chain(tokens.iter().map(String::as_str))
-        .any(|word| word.eq_ignore_ascii_case("default"));
-    if default {
+    if text.contains("default") {
         found.push(Finding {
             what: "a netrc default entry",
             key: "default".into(),
@@ -2262,7 +2225,10 @@ exec "$agent" "$@""#;
 
         let said = said(check(home.path(), repo.path()));
 
-        assert!(said.contains("machine github.com"), "{said}");
+        assert!(
+            said.contains("a netrc entry for github.com (github.com in "),
+            "{said}"
+        );
         assert!(said.contains(".netrc"), "{said}");
         assert!(!said.contains(SECRET), "{said}");
     }
