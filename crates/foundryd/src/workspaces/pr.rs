@@ -97,7 +97,7 @@ impl Workspaces {
     /// [`WorkspaceError::Unknown`], never a half-read of a half-removed worktree.
     pub async fn shipping(&self, id: WorkspaceId) -> Result<Shipping, WorkspaceError> {
         let body = self.inner.live(id).await?;
-        let worktree = self.inner.worktree(body.project, &body.branch);
+        let worktree = self.inner.folder(&body).await;
         let read = self.shipping_of(&worktree, body).await;
         self.read(id, &worktree, read).await
     }

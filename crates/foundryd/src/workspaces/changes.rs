@@ -1,7 +1,8 @@
 //! What a workspace has changed since it left its base: [`Workspaces::changes`].
 //!
 //! The changes are the worktree as it is on disk, committed or not, against the commit where its
-//! branch left `origin/<base>`, plus each new file git does not ignore. A read changes nothing in
+//! branch left `origin/<base>`, or the commit a commit checkout was made at, plus each new file
+//! git does not ignore. A read changes nothing in
 //! the worktree, its index or its refs, and takes no lock. It works on its own copy of the index,
 //! so it never takes git's index lock, which an agent's own git command in the worktree needs.
 //! It does not take the workspace's lifecycle lock, so it never holds up a start or an archive.
@@ -101,7 +102,7 @@ impl Workspaces {
     /// Live workspace `id`'s worktree and base, to read.
     async fn reading(&self, id: WorkspaceId) -> Result<(PathBuf, String), WorkspaceError> {
         let body = self.inner.live(id).await?;
-        Ok((self.inner.worktree(body.project, &body.branch), body.base))
+        Ok((self.inner.folder(&body).await, body.base))
     }
 
     /// `read` of workspace `id`, or [`WorkspaceError::Unknown`] when an archive's removal of the
@@ -125,19 +126,19 @@ impl Workspaces {
 }
 
 impl Inner {
-    /// Where the branch left its base; with the base gone from the remote, the last commit.
+    /// Where the branch left its base; with the base gone from the remote, the last commit. A
+    /// commit checkout's base is the commit it was made at, which no remote branch is named.
     async fn left_base(&self, worktree: &Path, base: &str) -> String {
-        match self
-            .git(
-                worktree,
-                "merge-base",
-                ["HEAD", &format!("refs/remotes/origin/{base}")],
-            )
-            .await
-        {
-            Ok(out) => out.trim().to_owned(),
-            Err(_) => "HEAD".to_owned(),
+        let mut from = vec![format!("refs/remotes/origin/{base}")];
+        if super::is_commit_id(base) {
+            from.push(format!("{base}^{{commit}}"));
         }
+        for from in from {
+            if let Ok(out) = self.git(worktree, "merge-base", ["HEAD", &from]).await {
+                return out.trim().to_owned();
+            }
+        }
+        "HEAD".to_owned()
     }
 
     /// The commits on `HEAD` since `from`, newest first.
