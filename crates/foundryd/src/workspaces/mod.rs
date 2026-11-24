@@ -22,15 +22,16 @@
 //! workspace already made and makes nothing new: no fetch, no branch. The marker holds what the
 //! first create's setup was due to run, the command line it resolved or none, and is written
 //! before the record and before the setup starts. A same-tag create ignores its own setup and
-//! finds one of four states: the record names a setup terminal, and the answer is the id; the
-//! marker holds no command line, the first create had no setup due, and the answer is the id
-//! with nothing written and nothing started; the record names none, a setup was due, and an
-//! open terminal of the workspace that no session record of it names is there, which the first
-//! create started and did not record, so the earliest such terminal by record version is
-//! recorded as the setup and nothing is started; or there is no such terminal, and the marker's
-//! command line is started and recorded as a create does. A marker that cannot be parsed is
-//! skipped and logged; a folder or the store that cannot be read fails the create, so it never
-//! makes a second workspace for a tag that may have one.
+//! finds one of three states, and never adopts a terminal: the record names a setup terminal,
+//! and the answer is the id; the record names none and the marker holds no command line, so the
+//! first create had no setup due, and the answer is the id with nothing written and nothing
+//! started; or the record names none and the marker holds a command line, which is started and
+//! recorded as a create does. One case this does not cover: a daemon that stops between
+//! starting a setup terminal and recording it leaves that terminal running unrecorded, and a
+//! retry starts the setup again beside it. The record names only the new one, so the factory
+//! reads only the new one's exit. A marker that cannot be parsed is skipped and logged; a
+//! folder or the store that cannot be read fails the create, so it never makes a second
+//! workspace for a tag that may have one.
 //! Its setup terminal gets no token in its environment and has git's credential helpers turned
 //! off ([`crate::git_auth::helpers_off_env`]). That is the environment only. The terminal runs
 //! as the daemon's user, so code in it can read what that user can, the machine's secret store
@@ -118,8 +119,8 @@ const BRANCH_AT_MOST: usize = 100;
 
 /// How long any one git call may run before it is killed and fails. A first fetch downloads the
 /// whole repo, and a token fetch downloads the repo's branches whole every time, so this is
-/// generous; it is there so a remote that stops answering cannot hold a
-/// project's lock for good.
+/// generous; it is there so a remote that stops answering cannot hold a project's lock for
+/// good.
 const GIT_WITHIN: Duration = Duration::from_secs(10 * 60);
 
 /// How long the sweep at start may run in all, so a git call that hangs cannot hold the daemon's
@@ -528,8 +529,10 @@ impl Workspaces {
     /// workspace this machine already made for the same tag and name, and not archived, is the
     /// answer, and nothing new is made. A same-tag create answers with the first workspace's id
     /// and ignores its own `checkout` and `setup`. When the first create had a setup due that no
-    /// record names, an open terminal of the workspace that no session names is recorded as the
-    /// setup, or else the setup the first create resolved, as its marker holds it, is started.
+    /// record names, the setup it resolved, as its marker holds it, is started and recorded; no
+    /// terminal is ever adopted, so one the first create started and did not record, because
+    /// the daemon stopped between the two, keeps running beside the new one and the record
+    /// names only the new one.
     /// Returns once the setup has started, not finished, with the same errors as
     /// [`Workspaces::create`]. The create finishes even when the caller stops waiting.
     pub async fn create_with(
@@ -629,12 +632,11 @@ impl Workspaces {
     /// unforced archive and holds no file git ignores, which such a create never leaves, is
     /// removed without `--force` and its branch kept; any other, or one git will not remove, is
     /// left as it is and logged with what holds it. One named only by another owner's record is
-    /// left and logged too. A worktree
-    /// whose folder is gone is checked by the `HEAD` git keeps for it. Branches are never
-    /// touched. A store that cannot be read skips the sweep, and a clone that cannot be read or
-    /// whose worktrees cannot be listed is passed over, each with a log line. After
-    /// [`SWEEP_WITHIN`] in all it stops where it is, says which clone it stopped in, and leaves
-    /// the rest for the next start.
+    /// left and logged too. A worktree whose folder is gone is checked by the `HEAD` git keeps
+    /// for it. Branches are never touched. A store that cannot be read skips the sweep, and a
+    /// clone that cannot be read or whose worktrees cannot be listed is passed over, each with
+    /// a log line. After [`SWEEP_WITHIN`] in all it stops where it is, says which clone it
+    /// stopped in, and leaves the rest for the next start.
     pub async fn sweep(&self) -> Result<(), WorkspaceError> {
         self.inner.sweep(SWEEP_WITHIN).await
     }
@@ -879,10 +881,8 @@ impl Inner {
     /// The answer to a create whose tag and name made `made` before, with `due` the setup that
     /// create was to run. A record that names a setup terminal is answered as it is, and so is
     /// one with no setup due: nothing is written and nothing is started. With a setup due and
-    /// none named, the open terminals of the workspace that no session record of it names are
-    /// the ones the first create may have started and not recorded; the earliest of them by
-    /// record version is recorded as the setup and nothing is started. When none is left, `due`
-    /// is started and recorded as a create does.
+    /// none named, `due` is started and recorded as a create does. No terminal is adopted: one
+    /// the first create started and did not record keeps running beside the new one.
     async fn retry_setup(
         &self,
         made: Workspace,
@@ -893,14 +893,6 @@ impl Inner {
             return Ok(id);
         };
         if made.setup.is_some() {
-            return Ok(id);
-        }
-        if let Some(terminal) = self.unrecorded_setup(id).await? {
-            let body = Workspace {
-                setup: Some(terminal),
-                ..made
-            };
-            self.write(body, false).await?;
             return Ok(id);
         }
         let folder = self.folder(&made).await;
@@ -1239,8 +1231,8 @@ impl Inner {
     /// The live workspace of this machine that a create with `tag` and `name` was made for
     /// before, if there is one, with the setup its marker says that create was to run. A marker
     /// that cannot be parsed is skipped and logged, since it cannot name a tag; one whose
-    /// workspace is not live answers for nothing. A folder, a
-    /// marker or the store that cannot be read is an error, never "no workspace yet".
+    /// workspace is not live answers for nothing. A folder, a marker or the store that cannot
+    /// be read is an error, never "no workspace yet".
     async fn answered(
         &self,
         project: ProjectId,
@@ -2017,31 +2009,6 @@ impl Inner {
                 .filter(|r| !r.deleted)
                 .map(|r| r.body.id)
                 .collect())
-        })
-        .await
-    }
-
-    /// The earliest, by record version, of the terminals of workspace `id` that are not closed
-    /// and that no session record of the workspace names, if there is one.
-    async fn unrecorded_setup(
-        &self,
-        id: WorkspaceId,
-    ) -> Result<Option<TerminalId>, WorkspaceError> {
-        let me = self.me;
-        self.with_store(move |store| {
-            let sessions: Vec<TerminalId> = store
-                .sessions_of(me)?
-                .into_iter()
-                .filter(|r| r.body.workspace == id)
-                .map(|r| r.body.terminal)
-                .collect();
-            // `terminals_in` lists the lowest version first.
-            Ok(store
-                .terminals_in(me, id)?
-                .into_iter()
-                .filter(|r| !r.deleted && !sessions.contains(&r.body.id))
-                .map(|r| r.body.id)
-                .next())
         })
         .await
     }
