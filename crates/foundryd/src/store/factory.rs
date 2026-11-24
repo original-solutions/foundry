@@ -325,3 +325,112 @@ fn apply_factory_in_tx(
     .execute(params![key.kind, key.id, owner, version, json])?;
     Ok(Applied::Stored)
 }
+
+#[cfg(test)]
+mod tests {
+    use foundry_proto::factory::{FactoryBody, FactoryRecord, RunEvent, RunId};
+    use foundry_proto::ids::MachineId;
+    use rusqlite::params;
+    use tempfile::TempDir;
+
+    use crate::store::{Applied, Store};
+    use crate::test_log::Logged;
+
+    /// An owner this build cannot read, as a newer build's id format or a corrupt file leaves.
+    const UNREADABLE: &str = "owner-from-a-newer-build";
+
+    fn open() -> (TempDir, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("foundry.db")).unwrap();
+        (dir, store)
+    }
+
+    fn store_event(store: &mut Store, owner: MachineId, version: u64, event: &str) {
+        let record = FactoryRecord {
+            owner,
+            version,
+            body: FactoryBody::RunEvent(RunEvent {
+                run: RunId::new("original-solutions/foundry", 192, 1).unwrap(),
+                generation: 1,
+                ts: "2026-11-24T05:16:30.000Z".into(),
+                ms: 1_795_497_390_000,
+                event: event.into(),
+                data: serde_json::json!({ "step": event }),
+                cause: None,
+            }),
+        };
+        assert_eq!(
+            store.apply_factory(&record, owner).unwrap(),
+            Applied::Stored
+        );
+    }
+
+    /// Makes every factory row of `owner` one whose owner this build cannot read.
+    fn spoil_owner(store: &Store, owner: MachineId) {
+        let changed = store
+            .conn
+            .execute(
+                "UPDATE factory_records SET owner = ?1 WHERE owner = ?2",
+                params![UNREADABLE, owner.to_string()],
+            )
+            .unwrap();
+        assert!(changed > 0);
+    }
+
+    #[test]
+    fn factory_versions_leaves_out_an_owner_that_cannot_be_read_and_gives_the_others() {
+        let (_dir, mut store) = open();
+        let (a, b, spoiled) = (
+            MachineId::random(),
+            MachineId::random(),
+            MachineId::random(),
+        );
+        store_event(&mut store, a, 1, "a-1");
+        store_event(&mut store, a, 2, "a-2");
+        store_event(&mut store, b, 3, "b-3");
+        store_event(&mut store, spoiled, 5, "spoiled-5");
+        spoil_owner(&store, spoiled);
+
+        assert_eq!(
+            store.factory_versions().unwrap(),
+            [(a, 2), (b, 3)].into(),
+            "the readable owners' versions, and no error"
+        );
+    }
+
+    #[test]
+    fn an_owner_that_cannot_be_read_is_warned_of_once_per_start_with_nothing_of_its_row() {
+        let (dir, mut store) = open();
+        let (a, spoiled) = (MachineId::random(), MachineId::random());
+        store_event(&mut store, a, 1, "a-1");
+        store_event(&mut store, spoiled, 4242, "a-step-only-the-row-holds");
+        spoil_owner(&store, spoiled);
+
+        let logged = Logged::default();
+        let _capture = logged.capture();
+        for _ in 0..3 {
+            assert_eq!(store.factory_versions().unwrap(), [(a, 1)].into());
+        }
+        let warnings = logged.warnings();
+        assert_eq!(warnings.len(), 1, "once, not once per call: {warnings:?}");
+        for row_data in [
+            UNREADABLE,
+            "4242",
+            "a-step-only-the-row-holds",
+            &spoiled.to_string(),
+        ] {
+            assert!(
+                !warnings[0].contains(row_data),
+                "the warning holds {row_data:?}: {warnings:?}"
+            );
+        }
+
+        // The next start warns again, once.
+        drop(store);
+        let store = Store::open(dir.path().join("foundry.db")).unwrap();
+        for _ in 0..3 {
+            assert_eq!(store.factory_versions().unwrap(), [(a, 1)].into());
+        }
+        assert_eq!(logged.warnings().len(), 2, "{:?}", logged.warnings());
+    }
+}
