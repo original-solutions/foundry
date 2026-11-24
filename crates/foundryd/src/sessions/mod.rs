@@ -115,6 +115,8 @@ pub enum SessionError {
     NoAskpass,
     #[error("sessions: a factory session's first message cannot carry a body yet")]
     FirstMessageBody,
+    #[error("sessions: the workspace's factory sessions were ended while this one was starting")]
+    Ended,
     #[error("sessions: a step run apart from its caller did not finish: {0}")]
     Interrupted(#[from] tokio::task::JoinError),
 }
@@ -172,9 +174,9 @@ struct Inner {
     data: PathBuf,
     /// Where a factory start reads its token from. Set once, by [`Sessions::with_secrets`].
     secrets: OnceLock<Arc<dyn Secrets>>,
-    /// The factory sessions, live or ended, and the project each is for. A session is in it
-    /// only once its start has succeeded, or when [`Sessions::adopt`] found its mark.
-    factory: Mutex<HashMap<SessionId, ProjectId>>,
+    /// The factory sessions and the ends asked for, under one lock so a start and an end are
+    /// ordered: whichever takes it first wins.
+    factory: Mutex<factory::FactoryState>,
     config: Config,
     /// Held while a worktree is marked trusted, so two starts never overwrite each other.
     trust: Mutex<()>,
@@ -412,7 +414,7 @@ impl Inner {
         lock(&self.live).insert(id, live.clone());
         // Found by `end_factory` from here on, which then waits on `body`.
         if let Some(factory) = factory {
-            lock(&self.factory).insert(id, factory.project);
+            lock(&self.factory).marks.insert(id, factory.project);
         }
 
         let started = self
@@ -422,7 +424,7 @@ impl Inner {
             Ok(started) => started,
             Err(error) => {
                 lock(&self.live).remove(&id);
-                lock(&self.factory).remove(&id);
+                lock(&self.factory).marks.remove(&id);
                 drop(body);
                 self.discard(id, &settings, &curl).await;
                 return Err(error);
@@ -431,7 +433,7 @@ impl Inner {
         body.terminal = terminal;
         if let Err(error) = self.write(body.clone()).await {
             lock(&self.live).remove(&id);
-            lock(&self.factory).remove(&id);
+            lock(&self.factory).marks.remove(&id);
             drop(body);
             if let Err(close) = self.terminals.close(terminal).await {
                 tracing::warn!(session = %id, error = %close, "the terminal of a start whose record failed was not closed");
