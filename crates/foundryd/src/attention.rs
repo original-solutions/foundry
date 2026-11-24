@@ -974,7 +974,9 @@ mod tests {
     use foundry_proto::ids::{ProjectId, SessionId, WorkspaceId};
     use foundry_proto::messages::{PROTOCOL, PeerMessage};
     use foundry_proto::record::{MachineSample, Record, Session, Workspace};
-    use foundry_proto::settings::{Limits, Machine, Outcome, Overwritten, Project, Stamp};
+    use foundry_proto::settings::{
+        Limits, Machine, Outcome, Overwritten, Project, Stamp, StampKey,
+    };
     use futures::future::BoxFuture;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -994,17 +996,17 @@ mod tests {
     /// What this machine marks as factory work, in a test.
     #[derive(Default)]
     struct Marked {
-        sessions: BTreeSet<SessionId>,
-        workspaces: BTreeSet<WorkspaceId>,
+        sessions: BTreeMap<SessionId, ProjectId>,
+        workspaces: BTreeMap<WorkspaceId, ProjectId>,
     }
 
     impl Marks for Marked {
-        fn factory_session(&self, session: SessionId) -> bool {
-            self.sessions.contains(&session)
+        fn factory_session(&self, session: SessionId) -> Option<ProjectId> {
+            self.sessions.get(&session).copied()
         }
 
-        fn factory_workspace(&self, workspace: WorkspaceId) -> bool {
-            self.workspaces.contains(&workspace)
+        fn factory_workspace(&self, workspace: WorkspaceId) -> Option<ProjectId> {
+            self.workspaces.get(&workspace).copied()
         }
     }
 
@@ -1057,13 +1059,21 @@ mod tests {
             id
         }
 
-        /// Turns `project`'s factory `on` or off.
+        /// Turns `project`'s factory `on` or off, with a new stamp, as an edit does.
         fn turn(&mut self, project: ProjectId, on: bool) {
             self.settings
                 .project_factory
                 .get_mut(&project)
                 .expect("a factory project")
                 .on = on;
+            self.settings.seq += 1;
+            self.settings.stamps.insert(
+                StampKey::Setting(SettingKey::ProjectFactory(project)),
+                Stamp {
+                    seq: self.settings.seq,
+                    by: self.me,
+                },
+            );
         }
 
         /// Puts `status` in place of any status `writer` wrote of its project.
@@ -1073,13 +1083,10 @@ mod tests {
             held.push((writer, status));
         }
 
-        /// Gives this machine a freshness and a quiet on a fake clock, reads the list once so
-        /// each project whose factory is on is seen on at the clock's start, and returns the
-        /// clock.
+        /// Gives this machine a freshness and a quiet on a fake clock, and returns the clock.
         fn keep_freshness(&mut self) -> Arc<FakeClock> {
             let (clock, freshness, quiet) = fake_quiet();
             self.quiet = Some((freshness, quiet));
-            self.items();
             clock
         }
 
@@ -1917,6 +1924,33 @@ mod tests {
     }
 
     #[test]
+    fn a_first_read_long_after_the_start_raises_factory_idle_at_once() {
+        let mut world = World::new();
+        world.factory_project(true);
+        let clock = world.keep_freshness();
+        clock.advance(30 * MINUTE);
+        assert_eq!(world.of(Kind::FactoryIdle).len(), 1, "{:?}", world.items());
+    }
+
+    #[test]
+    fn a_factory_turned_off_and_on_between_two_reads_counts_from_the_second() {
+        let mut world = World::new();
+        let project = world.factory_project(true);
+        let clock = world.keep_freshness();
+        assert!(world.of(Kind::FactoryIdle).is_empty());
+        clock.advance(60 * MINUTE);
+        world.turn(project, false);
+        world.turn(project, true);
+        assert!(
+            world.of(Kind::FactoryIdle).is_empty(),
+            "{:?}",
+            world.items()
+        );
+        clock.advance(10 * MINUTE);
+        assert_eq!(world.of(Kind::FactoryIdle).len(), 1);
+    }
+
+    #[test]
     fn a_holder_that_is_believed_but_sends_nothing_new_for_ten_minutes_raises_factory_idle() {
         let mut world = World::new();
         let project = world.factory_project(true);
@@ -2224,7 +2258,7 @@ mod tests {
         name_in_status(&mut world, project, vec![named.workspace], Vec::new());
         // And one in a workspace this machine marks as factory.
         let marked = world.session(me, SessionState::Stuck);
-        world.marked.workspaces.insert(marked.workspace);
+        world.marked.workspaces.insert(marked.workspace, project);
         let mut kinds: Vec<(Kind, String)> =
             world.items().into_iter().map(|i| (i.kind, i.id)).collect();
         kinds.sort();
@@ -2241,15 +2275,27 @@ mod tests {
     }
 
     #[test]
-    fn a_status_that_is_not_believed_names_no_factory_work() {
+    fn a_status_of_a_holder_that_is_offline_still_names_factory_work() {
         let mut world = World::new();
         let project = world.factory_project(true);
         let me = world.me;
         let session = world.session(me, SessionState::Stuck);
         name_in_status(&mut world, project, Vec::new(), vec![session.id]);
-        assert!(world.of(Kind::SessionStuck).is_empty());
         world.online.remove(&world.peer);
-        assert_eq!(world.of(Kind::SessionStuck).len(), 1, "{:?}", world.items());
+        // The acting coordinator's status is believed now, and names no run.
+        let status = not_holding(
+            project,
+            NotHolding::HeldBy {
+                machine: world.peer,
+                generation: 3,
+            },
+        );
+        world.status(me, status);
+        assert!(
+            world.of(Kind::SessionStuck).is_empty(),
+            "{:?}",
+            world.items()
+        );
     }
 
     #[test]
@@ -2265,6 +2311,7 @@ mod tests {
     #[test]
     fn sessions_and_workspaces_this_machine_marks_as_factory_raise_no_p1_item() {
         let mut world = World::new();
+        let project = world.factory_project(true);
         let me = world.me;
         let stuck = world.session(me, SessionState::Stuck);
         let waiting = world.session(me, SessionState::WaitingForYou);
@@ -2273,15 +2320,30 @@ mod tests {
         world.terminal(me, setup, workspace, Some(Some(1)), false);
         assert_eq!(world.items().len(), 3, "{:?}", world.items());
 
-        world.marked.sessions.insert(stuck.id);
-        world.marked.sessions.insert(waiting.id);
-        world.marked.workspaces.insert(workspace);
+        world.marked.sessions.insert(stuck.id, project);
+        world.marked.sessions.insert(waiting.id, project);
+        world.marked.workspaces.insert(workspace, project);
         assert!(world.items().is_empty(), "{:?}", world.items());
+    }
+
+    #[test]
+    fn factory_work_this_machine_marks_for_a_project_whose_factory_is_off_still_raises_p1_items() {
+        let mut world = World::new();
+        let project = world.factory_project(false);
+        let me = world.me;
+        let stuck = world.session(me, SessionState::Stuck);
+        let setup = TerminalId::random();
+        let workspace = world.workspace(me, Some(setup));
+        world.terminal(me, setup, workspace, Some(Some(1)), false);
+        world.marked.sessions.insert(stuck.id, project);
+        world.marked.workspaces.insert(workspace, project);
+        assert_eq!(world.items().len(), 2, "{:?}", world.items());
     }
 
     #[test]
     fn the_setup_of_a_workspace_with_a_marked_factory_session_raises_nothing() {
         let mut world = World::new();
+        let project = world.factory_project(true);
         let me = world.me;
         let setup = TerminalId::random();
         let workspace = world.workspace(me, Some(setup));
@@ -2295,17 +2357,18 @@ mod tests {
         };
         world.put_session(me, session.clone(), false);
         assert_eq!(world.of(Kind::SetupFailed).len(), 1);
-        world.marked.sessions.insert(session.id);
+        world.marked.sessions.insert(session.id, project);
         assert!(world.items().is_empty(), "{:?}", world.items());
     }
 
     #[test]
     fn this_machines_marks_say_nothing_of_a_peers_records() {
         let mut world = World::new();
+        let project = world.factory_project(true);
         let peer = world.peer;
         let session = world.session(peer, SessionState::Stuck);
-        world.marked.sessions.insert(session.id);
-        world.marked.workspaces.insert(session.workspace);
+        world.marked.sessions.insert(session.id, project);
+        world.marked.workspaces.insert(session.workspace, project);
         assert_eq!(world.of(Kind::SessionStuck).len(), 1, "{:?}", world.items());
     }
 
@@ -2670,7 +2733,7 @@ mod tests {
         });
         store.apply(&record, me).unwrap();
         let mut marked = Marked::default();
-        marked.sessions.insert(session.id);
+        marked.sessions.insert(session.id, project);
         let store = Arc::new(Mutex::new(store));
         let peers = Peers::new(me, store.clone(), Arc::new(NoDial));
         let coordinator = Arc::new(Coordinator::new(me, store.clone(), peers.clone()));
