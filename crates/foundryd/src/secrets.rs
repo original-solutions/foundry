@@ -675,6 +675,7 @@ impl OldStore for MemorySecrets {
 mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
 
@@ -1544,19 +1545,11 @@ mod tests {
         }
     }
 
-    /// A store that lists a name but cannot read any value.
-    struct CannotGet {
-        fail_on: &'static str,
-    }
-    impl Secrets for CannotGet {
-        fn get(&self, name: &str) -> Result<Option<String>, SecretsError> {
-            if name == self.fail_on {
-                Err(SecretsError::Unreadable {
-                    path: "secrets.json".into(),
-                })
-            } else {
-                Ok(None)
-            }
+    /// A store that lists its names and reads each one, but cannot be read whole.
+    struct CannotReadWhole;
+    impl Secrets for CannotReadWhole {
+        fn get(&self, _: &str) -> Result<Option<String>, SecretsError> {
+            Ok(None)
         }
         fn set(&self, _: &str, _: &str) -> Result<(), SecretsError> {
             Ok(())
@@ -1567,18 +1560,57 @@ mod tests {
         fn names(&self) -> Result<Vec<String>, SecretsError> {
             Ok(vec!["github:octocat".into()])
         }
+        fn entries(&self) -> Result<BTreeMap<String, String>, SecretsError> {
+            Err(SecretsError::Unreadable {
+                path: "secrets.json".into(),
+            })
+        }
     }
 
     #[test]
-    fn hide_known_fails_closed_when_a_listed_secret_cannot_be_read() {
-        for fail_on in ["github:octocat", GATEWAY] {
-            let store = CannotGet { fail_on };
-            assert_eq!(
-                hide_known("carrying ghp_x", &store),
-                HIDDEN_UNREADABLE,
-                "{fail_on}"
-            );
+    fn hide_known_fails_closed_when_the_store_cannot_be_read_whole() {
+        assert_eq!(
+            hide_known("carrying ghp_x", &CannotReadWhole),
+            HIDDEN_UNREADABLE
+        );
+    }
+
+    /// The in-memory store, read only whole: reading one secret, or the names alone, panics.
+    #[derive(Default)]
+    struct WholeOnly {
+        inner: MemorySecrets,
+        reads: AtomicUsize,
+    }
+    impl Secrets for WholeOnly {
+        fn get(&self, name: &str) -> Result<Option<String>, SecretsError> {
+            panic!("{name} was read on its own");
         }
+        fn set(&self, name: &str, value: &str) -> Result<(), SecretsError> {
+            self.inner.set(name, value)
+        }
+        fn update(&self, name: &str, edit: Edit<'_>) -> Result<(), SecretsError> {
+            self.inner.update(name, edit)
+        }
+        fn names(&self) -> Result<Vec<String>, SecretsError> {
+            panic!("the names were listed on their own");
+        }
+        fn entries(&self) -> Result<BTreeMap<String, String>, SecretsError> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.inner.entries()
+        }
+    }
+
+    #[test]
+    fn hide_known_reads_the_store_once_per_call() {
+        let secrets = WholeOnly::default();
+        secrets.set(GATEWAY, "gw-key-1").unwrap();
+        secrets.set(GATEWAY_MANAGEMENT, "gm-key-2").unwrap();
+        secrets.set("github:alice", "ghp_one").unwrap();
+        secrets.set("github:zed", "ghp_two").unwrap();
+        secrets.set("machine", "machine-own").unwrap();
+        let text = "gw-key-1 gm-key-2 ghp_one ghp_two machine-own";
+        assert_eq!(hide_known(text, &secrets), "*** *** *** *** machine-own");
+        assert_eq!(secrets.reads.load(Ordering::SeqCst), 1);
     }
 
     #[test]
