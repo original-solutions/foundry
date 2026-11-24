@@ -292,7 +292,8 @@ pub(super) async fn watch_own(inner: &Inner) {
 /// The highest version of `me`'s own factory records: the newest of at most [`BATCH`] above
 /// `seen`, so a burst is read a batch a tick, or, with nothing seen yet or a record above `seen`
 /// that cannot be read, the highest version held, which parses no record. When that cannot be
-/// read either, which a row of another owner's can cause, `me`'s own records above `seen` are
+/// read either, which a row of another owner's whose version is not a whole number can cause
+/// (an owner that cannot be read is left out of it instead), `me`'s own records above `seen` are
 /// read to the last.
 fn newest_own(store: &mut Store, me: MachineId, seen: Option<u64>) -> Result<u64, StoreError> {
     if let Some(seen) = seen

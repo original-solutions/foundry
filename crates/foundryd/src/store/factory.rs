@@ -98,26 +98,40 @@ impl Store {
 
     /// The highest factory version held from each owner.
     ///
-    /// An owner this build cannot read as a machine id, which only a corrupt file or a newer
-    /// build's id format leaves, is left out: one such row must not make the machine's hello
-    /// say it holds no factory record, which would have every peer send it all of theirs again
-    /// on every link. Each such owner is warned of once while the store is open
+    /// An owner is read only as this build writes it: text that is a machine id in the
+    /// spelling `apply_factory` stores and `factory_since` looks it up by. Any other owner cell
+    /// (a blob, text that is not UTF-8 or not a machine id, or a machine id spelt otherwise),
+    /// which only a corrupt file or a newer build's id format leaves, is left out: one such row
+    /// must not make the machine's hello say it holds no factory record, which would have every
+    /// peer send it all of theirs again on every link, and it must not stand in for the version
+    /// of an owner it may spell. Each such owner is warned of once while the store is open
     /// (`warn_unreadable_owner`).
     pub fn factory_versions(&self) -> Result<BTreeMap<MachineId, u64>, StoreError> {
-        let mut query = self
-            .conn
-            .prepare_cached("SELECT owner, MAX(version) FROM factory_records GROUP BY owner")?;
-        let rows = query.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, from_sql(row.get(1)?)))
-        })?;
+        let mut query = self.conn.prepare_cached(
+            "SELECT owner, MAX(version) FROM factory_records GROUP BY owner ORDER BY owner",
+        )?;
+        // Read to the end before warning, so the warning's own writes never run inside the read.
+        let rows = query
+            .query_map([], |row| {
+                let owner = row.get_ref(0)?;
+                let id = owner.as_str().ok().and_then(|text| {
+                    text.parse()
+                        .ok()
+                        .map(MachineId)
+                        .filter(|id| id.to_string() == text)
+                });
+                // The column is TEXT and NOT NULL, so text and blobs are all a cell holds.
+                let owner = id.ok_or_else(|| owner.as_bytes().unwrap_or_default().to_vec());
+                Ok((owner, from_sql(row.get(1)?)))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
         let mut versions = BTreeMap::new();
-        for row in rows {
-            let (owner, version) = row?;
-            match owner.parse() {
+        for (owner, version) in rows {
+            match owner {
                 Ok(id) => {
-                    versions.insert(MachineId(id), version);
+                    versions.insert(id, version);
                 }
-                Err(_) => warn_unreadable_owner(&self.conn, &owner),
+                Err(cell) => warn_unreadable_owner(&self.conn, &cell),
             }
         }
         Ok(versions)
@@ -297,14 +311,16 @@ impl Store {
 }
 
 /// Warns that a factory row whose owner this build cannot read is left out of the versions
-/// held, once per owner while `conn` is open, which is once a start: the owners warned of are
-/// kept in a table of the connection's own, which goes when it closes. Should that table fail,
-/// the warning goes anyway. The line holds nothing of the row: not the owner, not its version,
-/// and not the parse error, which quotes the owner.
-fn warn_unreadable_owner(conn: &Connection, owner: &str) {
+/// held, once per owner cell (its bytes) while `conn` is open, which is once a start: the owners
+/// warned of are kept in a table of the connection's own, which goes when it closes. That table
+/// holds at most one row per unreadable owner the store holds, and no peer can add one, since a
+/// record is stored under the machine id it came from, in this build's spelling. Should that
+/// table fail, the warning goes anyway. The line holds nothing of the row: not the owner and not
+/// its version.
+fn warn_unreadable_owner(conn: &Connection, owner: &[u8]) {
     let inserted = conn
         .execute_batch(
-            "CREATE TEMP TABLE IF NOT EXISTS factory_owners_warned (owner TEXT PRIMARY KEY)",
+            "CREATE TEMP TABLE IF NOT EXISTS factory_owners_warned (owner BLOB PRIMARY KEY)",
         )
         .and_then(|()| {
             conn.prepare_cached(
@@ -529,8 +545,9 @@ mod tests {
         store_event(&mut store, b, 3, "b-3");
         store_event(&mut store, first, 4, "first-4");
         store_event(&mut store, last, 5, "last-5");
-        // Owners are read in their order: one bad owner comes before both readable ones, and
-        // one after, so a read that stops at a bad owner rather than going past it fails here.
+        // The query reads owners in their order: one bad owner comes before both readable ones,
+        // and one after, so a read that stops at a bad owner rather than going past it fails
+        // here.
         spoil_owner(&store, first, UNREADABLE_FIRST);
         spoil_owner(&store, last, UNREADABLE);
 
