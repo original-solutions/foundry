@@ -27,7 +27,6 @@
 //! [`Store::own_next_factory_version`]: crate::store::Store::own_next_factory_version
 
 use std::collections::BTreeMap;
-use std::time::Duration;
 
 use foundry_proto::factory::FactoryRecord;
 use foundry_proto::ids::MachineId;
@@ -36,17 +35,15 @@ use tokio::sync::mpsc::Sender;
 use tokio::time::Instant;
 
 use super::link::send_message;
-use super::{BATCH, Inner, TICK, on_store};
-use crate::store::{Applied, StoreError};
+use super::{BATCH, Inner, TICK, WARN_EVERY, on_store};
+use crate::store::Applied;
 
 /// The most bytes of records, as JSON, one factory message carries, past its first record. A
-/// record larger than this goes in a message of its own. Kept well under the 16 MiB frame a
-/// WebSocket end takes by default.
-pub const FACTORY_BATCH_BYTES: usize = 4 << 20;
-
-/// How often a link, or [`watch_own`], repeats the warning that this machine's factory records
-/// cannot be read.
-const WARN_EVERY: Duration = Duration::from_secs(60);
+/// record larger than this goes in a message of its own. The other end ends a link it hears
+/// nothing on for [`OFFLINE_AFTER`](super::OFFLINE_AFTER), and a message is heard only once it
+/// has all arrived, so this crosses a link of 70 KB a second within that limit. It also bounds a
+/// link's buffer of [`BUFFER`](super::BUFFER) messages at 64 MiB.
+pub const FACTORY_BATCH_BYTES: usize = 1 << 20;
 
 /// Whether a link in protocol `speak` carries factory records.
 pub(super) fn carried(speak: u16) -> bool {
@@ -72,8 +69,10 @@ pub(super) async fn versions(inner: &Inner, speak: u16) -> BTreeMap<MachineId, u
 
 /// Where a link is in sending this machine's factory records.
 pub(super) struct Cursor {
-    /// The highest version of this machine's factory records the peer holds.
+    /// The highest version of this machine's factory records the peer has been sent.
     sent: u64,
+    /// Records read above `sent`, in version order, that did not fit in the last message.
+    pending: Vec<FactoryRecord>,
     /// When the warning that they cannot be read last went.
     warned: Option<Instant>,
 }
@@ -83,16 +82,30 @@ impl Cursor {
     pub(super) fn new(held: u64) -> Self {
         Self {
             sent: held,
+            pending: Vec::new(),
             warned: None,
         }
     }
 }
 
-/// Sends this machine's factory records above the cursor to `peer`, on a link in protocol
-/// `speak`, reading one batch of at most [`BATCH`] at a time and sending it in messages of at
-/// most [`FACTORY_BATCH_BYTES`], moving the cursor past each one sent, and says whether the
-/// link is still open. Nothing goes on a link that carries no factory record, and nothing goes
-/// when nothing is new: the P1 heartbeat keeps the link alive.
+/// What one round of [`send_own`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Sent {
+    /// The link closed.
+    Closed,
+    /// Every factory record of this machine's that could be read has been sent.
+    Done,
+    /// A message went and more wait: the next round should not wait a [`TICK`].
+    More,
+}
+
+/// Sends one message of this machine's factory records above the cursor to `peer`, on a link
+/// in protocol `speak`: as many as fit in [`FACTORY_BATCH_BYTES`], from a batch of at most
+/// [`BATCH`] read and kept on the cursor until all of it is sent. One message a round, so a
+/// long catch-up leaves room in every round for the link's settings, its check of the machine
+/// list and P1's records, and says [`Sent::More`] so the round comes again at once. Nothing goes
+/// on a link that carries no factory record, and nothing goes when nothing is new: the P1
+/// heartbeat keeps the link alive.
 ///
 /// A factory record of this machine's own that cannot be read stops the send at the batch that
 /// holds it, as it does for P1's records, with a warning once a minute.
@@ -102,18 +115,22 @@ pub(super) async fn send_own(
     peer: MachineId,
     speak: u16,
     cursor: &mut Cursor,
-) -> bool {
+) -> Sent {
     if !carried(speak) {
-        return true;
+        return Sent::Done;
     }
-    loop {
+    let mut full = false;
+    if cursor.pending.is_empty() {
         let (me, above) = (inner.me, cursor.sent);
-        let batch = match on_store(&inner.store, move |store| {
+        match on_store(&inner.store, move |store| {
             store.factory_since(me, above, BATCH)
         })
         .await
         {
-            Ok(batch) => batch,
+            Ok(batch) => {
+                full = batch.len() == BATCH;
+                cursor.pending = batch;
+            }
             Err(error) => {
                 if cursor.warned.is_none_or(|at| at.elapsed() >= WARN_EVERY) {
                     tracing::warn!(
@@ -122,29 +139,29 @@ pub(super) async fn send_own(
                     );
                     cursor.warned = Some(Instant::now());
                 }
-                return true;
+                return Sent::Done;
             }
-        };
-        let full = batch.len() == BATCH;
-        let mut rest = batch;
-        while !rest.is_empty() {
-            let tail = rest.split_off(fitting(&rest, FACTORY_BATCH_BYTES));
-            let Some(newest) = rest.last().map(|record| record.version) else {
-                break;
-            };
-            let message = PeerMessage::FactoryRecords {
-                protocol: speak,
-                records: rest,
-            };
-            if !send_message(send, &message).await {
-                return false;
-            }
-            cursor.sent = newest;
-            rest = tail;
         }
-        if !full {
-            return true;
-        }
+    }
+    let rest = cursor
+        .pending
+        .split_off(fitting(&cursor.pending, FACTORY_BATCH_BYTES));
+    let records = std::mem::replace(&mut cursor.pending, rest);
+    let Some(newest) = records.last().map(|record| record.version) else {
+        return Sent::Done;
+    };
+    let message = PeerMessage::FactoryRecords {
+        protocol: speak,
+        records,
+    };
+    if !send_message(send, &message).await {
+        return Sent::Closed;
+    }
+    cursor.sent = newest;
+    if full || !cursor.pending.is_empty() {
+        Sent::More
+    } else {
+        Sent::Done
     }
 }
 
@@ -164,9 +181,13 @@ fn fitting(records: &[FactoryRecord], budget: usize) -> usize {
 /// Takes the factory records in a message from `peer`, which sent it on a link in protocol
 /// `speak`, each only if `peer` owns it and it is newer, and tells
 /// [`Peers::factory_changes`](super::Peers::factory_changes) when any was stored. A record
-/// `peer` does not own is refused with a warning, as a P1 record is. A record that cannot be
-/// stored is an error, and nothing after it is taken: the store then holds a prefix of the
-/// peer's factory records, and the next link's hello asks again for the rest.
+/// `peer` does not own, or whose key another machine holds, is refused with a warning, as a P1
+/// record is. A record that cannot be stored is an error, and nothing after it is taken: the
+/// store then holds a prefix of the peer's factory records, and the next link's hello asks
+/// again for the rest.
+///
+/// Each record is stored under the store's lock taken for it alone, since each commits on its
+/// own, so a catch-up never holds the store from its other users for a whole message.
 ///
 /// A link in a protocol before [`FACTORY_SINCE`] carries no factory record, so one that
 /// arrives on it is dropped.
@@ -180,31 +201,31 @@ pub(super) async fn take(
         tracing::debug!("sync: {peer} sent factory records on a protocol {speak} link; dropped");
         return Ok(());
     }
-    if records.is_empty() {
-        return Ok(());
-    }
-    let (stored, result) = on_store(&inner.store, move |store| {
-        let mut stored = false;
-        for record in &records {
-            match store.apply_factory(record, peer) {
-                Ok(Applied::Stored) => stored = true,
-                Ok(Applied::Stale) => {}
-                Ok(Applied::NotOwner) => tracing::warn!(
-                    "sync: {peer} sent a {} factory record of {} that it does not own; refused",
-                    record.body.kind(),
-                    record.owner
-                ),
-                Err(error) => {
-                    return (
-                        stored,
-                        Err(format!("a factory record from {peer} not stored: {error}")),
-                    );
-                }
+    let mut stored = false;
+    let mut result = Ok(());
+    for record in records {
+        let (applied, record) = on_store(&inner.store, move |store| {
+            (store.apply_factory(&record, peer), record)
+        })
+        .await;
+        match applied {
+            Ok(Applied::Stored) => stored = true,
+            Ok(Applied::Stale) => {}
+            Ok(Applied::NotOwner) if record.owner == peer => tracing::warn!(
+                "sync: {peer} sent a {} factory record whose key another machine holds; refused",
+                record.body.kind()
+            ),
+            Ok(Applied::NotOwner) => tracing::warn!(
+                "sync: {peer} sent a {} factory record owned by {}; refused",
+                record.body.kind(),
+                record.owner
+            ),
+            Err(error) => {
+                result = Err(format!("a factory record from {peer} not stored: {error}"));
+                break;
             }
         }
-        (stored, Ok(()))
-    })
-    .await;
+    }
     if stored {
         inner.factory_changed();
     }
@@ -213,7 +234,8 @@ pub(super) async fn take(
 
 /// Tells [`Peers::factory_changes`](super::Peers::factory_changes) within a [`TICK`] each time
 /// this machine has stored factory records of its own, until the returned future is dropped.
-/// What is held when it starts is not told.
+/// What is held when it starts is not told. It reads only the highest version held per owner,
+/// so a factory record of its own that this build cannot read does not stop it.
 pub(super) async fn watch_own(inner: &Inner) {
     let me = inner.me;
     let mut seen: Option<u64> = None;
@@ -221,19 +243,23 @@ pub(super) async fn watch_own(inner: &Inner) {
     let mut every = tokio::time::interval(TICK);
     loop {
         every.tick().await;
-        let above = seen;
-        let newest = on_store(&inner.store, move |store| newest_own(store, me, above)).await;
+        let newest = on_store(&inner.store, move |store| {
+            store
+                .factory_versions()
+                .map(|versions| versions.get(&me).copied().unwrap_or(0))
+        })
+        .await;
         match newest {
             Ok(newest) => {
-                if seen.is_some() && newest != seen {
+                if seen.is_some_and(|seen| seen != newest) {
                     inner.factory_changed();
                 }
-                seen = newest.or(seen);
+                seen = Some(newest);
             }
             Err(error) => {
                 if warned.is_none_or(|at| at.elapsed() >= WARN_EVERY) {
                     tracing::warn!(
-                        "sync: cannot read this machine's factory records to tell of changes: \
+                        "sync: cannot read this machine's factory versions to tell of changes: \
                          {error}"
                     );
                     warned = Some(Instant::now());
@@ -241,24 +267,6 @@ pub(super) async fn watch_own(inner: &Inner) {
             }
         }
     }
-}
-
-/// The highest version of `me`'s own factory records: read from every owner's versions the
-/// first time (`above` is `None`), so nothing held is parsed, and after that from one batch of
-/// at most [`BATCH`] above `above`, so a backlog is read a batch a tick. `None` the first time
-/// means none is held; after that, `above` again when nothing is new.
-fn newest_own(
-    store: &mut crate::store::Store,
-    me: MachineId,
-    above: Option<u64>,
-) -> Result<Option<u64>, StoreError> {
-    let Some(above) = above else {
-        return Ok(Some(
-            store.factory_versions()?.get(&me).copied().unwrap_or(0),
-        ));
-    };
-    let batch = store.factory_since(me, above, BATCH)?;
-    Ok(Some(batch.last().map_or(above, |record| record.version)))
 }
 
 #[cfg(test)]
@@ -314,6 +322,9 @@ mod tests {
             records: records[..n].to_vec(),
         };
         let size = serde_json::to_vec(&message).unwrap().len();
-        assert!(size <= FACTORY_BATCH_BYTES + 1024, "a message of {size} bytes");
+        assert!(
+            size <= FACTORY_BATCH_BYTES + 1024,
+            "a message of {size} bytes"
+        );
     }
 }

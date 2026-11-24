@@ -31,13 +31,8 @@ use serde::Serialize;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{Instant, timeout, timeout_at};
 
-use std::time::Duration;
-
-use super::factory::{self, Cursor};
-use super::{BATCH, Conn, Inner, OFFLINE_AFTER, RETRY_REFUSED, TICK, on_store};
-
-/// How often a link repeats the warning that this machine's records cannot be read.
-const WARN_EVERY: Duration = Duration::from_secs(60);
+use super::factory::{self, Cursor, Sent};
+use super::{BATCH, Conn, Inner, OFFLINE_AFTER, RETRY_REFUSED, TICK, WARN_EVERY, on_store};
 
 /// Runs a link until it closes, the peer is silent for [`OFFLINE_AFTER`], the peer is not (or
 /// is no longer) one this machine links with ([`links_with`]: it is listed, or this machine's
@@ -66,7 +61,8 @@ pub(super) async fn run(
 /// links with ([`links_with`]: it is listed, or this machine's list holds no machine but
 /// itself) or stops taking them. Changed settings go first in each round, so a peer just removed
 /// from the list is sent the copy that removed it before its link closes, and holds its own
-/// removal. New factory records go last, on a link that carries them.
+/// removal. New factory records go last, on a link that carries them, one message a round; while
+/// more of them wait the next round starts at once.
 async fn sending(inner: &Inner, send: &Sender<String>, open: &Open) {
     let mut sent = open.sent;
     let mut factory_sent = Cursor::new(open.factory_sent);
@@ -85,8 +81,10 @@ async fn sending(inner: &Inner, send: &Sender<String>, open: &Open) {
         if !send_own(inner, send, open, &mut sent, &mut warned).await {
             return;
         }
-        if !factory::send_own(inner, send, open.peer, open.speak, &mut factory_sent).await {
-            return;
+        match factory::send_own(inner, send, open.peer, open.speak, &mut factory_sent).await {
+            Sent::Closed => return,
+            Sent::More => every.reset_immediately(),
+            Sent::Done => {}
         }
     }
 }
@@ -479,6 +477,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::io;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use foundry_proto::settings::Machine;
     use futures::future::BoxFuture;
