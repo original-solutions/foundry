@@ -2307,12 +2307,13 @@ mod tests {
     #[test]
     fn hide_known_hides_a_value_with_gap_characters_of_its_own_across_other_gaps() {
         let secrets = MemorySecrets::default();
-        // 18 characters that are no gap: matched across gaps too.
+        // At least 16 characters, counting its own spaces: matched across gaps, on the
+        // characters of it that are no gap.
         secrets.set(GATEWAY, "a key with spaces in it").unwrap();
-        // 9 characters that are no gap: only whole.
         secrets
             .set(GATEWAY_MANAGEMENT, "a b c d e f g h i")
             .unwrap();
+        assert_eq!("a b c d e f g h i".len(), 17);
         assert_eq!(hide_known("[a key with spaces in it]", &secrets), "[***]");
         assert_eq!(
             hide_known("[a key with\n  spaces in it]", &secrets),
@@ -2323,8 +2324,15 @@ mod tests {
             "[***]"
         );
         assert_eq!(hide_known("[a b c d e f g h i]", &secrets), "[***]");
-        let text = "[a b c d\ne f g h i]";
-        assert_eq!(hide_known(text, &secrets), text);
+        assert_eq!(hide_known("[a b c d\ne f g h i]", &secrets), "[***]");
+        // A value of gap characters only is hidden whole, and nothing else of it.
+        let secrets = MemorySecrets::default();
+        secrets.set(GATEWAY, &" ".repeat(20)).unwrap();
+        assert_eq!(
+            hide_known(&format!("[{}]", " ".repeat(20)), &secrets),
+            "[***]"
+        );
+        assert_eq!(hide_known("[a b]", &secrets), "[a b]");
     }
 
     #[test]
@@ -2500,25 +2508,43 @@ mod tests {
 
     #[test]
     fn a_split_keeps_only_the_characters_a_partial_match_can_still_use() {
-        // Log-like text with near misses of the token's head, and the token split near the end.
-        let mut text = String::new();
-        while text.len() < 64 * 1024 - 200 {
-            text.push_str("2026-11-24 compiling foundryd ghp_A1b2 \u{1b}[32mok\u{1b}[0m\n");
+        // Texts that keep a partial match alive all the way through, and log-like text with
+        // near misses, each with the token split near the end.
+        let token_lines = format!("{TOKEN}\n").repeat(1500);
+        let long_escape = format!("{}\u{1b}]{}\u{7}x", &TOKEN[..39], "y".repeat(25));
+        for (name, filler) in [
+            ("g", "g".to_owned()),
+            ("g space", "g ".to_owned()),
+            ("ghp_", "ghp_".to_owned()),
+            ("tokens", token_lines),
+            ("escape", long_escape),
+            (
+                "log",
+                "2026-11-24 compiling foundryd ghp_A1b2 \u{1b}[32mok\u{1b}[0m\n".to_owned(),
+            ),
+        ] {
+            let mut text = String::new();
+            while text.len() < 64 * 1024 - 200 {
+                text.push_str(&filler);
+            }
+            text.push_str(&format!("\nT={}\n{}\n", &TOKEN[..20], &TOKEN[20..]));
+            let mut split = Split::new(TOKEN);
+            let (mut spans, mut work, mut most) = (Vec::new(), 0, 0);
+            for (at, c) in text.char_indices() {
+                let escape = if is_gap(c) {
+                    escape(&text[at..], &mut work)
+                } else {
+                    None
+                };
+                split.read(at, c, escape, &mut spans, &mut work);
+                most = most.max(split.held());
+            }
+            assert!(
+                spans.contains(&(text.len() - 42, text.len() - 1)),
+                "{name}: {spans:?}"
+            );
+            assert!(most <= 2 * TOKEN.len(), "{name}: {most} characters held");
         }
-        text.push_str(&format!("T={}\n{}\n", &TOKEN[..20], &TOKEN[20..]));
-        let mut split = Split::new(TOKEN);
-        let (mut spans, mut work, mut most) = (Vec::new(), 0, 0);
-        for (at, c) in text.char_indices() {
-            let escape = if is_gap(c) {
-                escape(&text[at..], &mut work)
-            } else {
-                None
-            };
-            split.read(at, c, escape, &mut spans, &mut work);
-            most = most.max(split.kept.len());
-        }
-        assert_eq!(spans.len(), 1);
-        assert!(most <= 2 * TOKEN.len(), "{most} characters kept");
     }
 
     #[test]
