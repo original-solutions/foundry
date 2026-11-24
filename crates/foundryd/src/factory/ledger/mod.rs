@@ -37,8 +37,10 @@ pub mod read;
 pub const OUTPUT_LIMIT: usize = 64 * 1024;
 
 /// Hides the secrets this machine holds in a text. The daemon's must hide every `github:*`
-/// token and gateway key in its secret store at the time of the call, and URL passwords, as
-/// task 7's `secrets::hide_known` will; the ledger is given it when it is made.
+/// token and gateway key in its secret store at the time of the call, also with gaps of spaces,
+/// controls or escape sequences inside it, and URL passwords, as `secrets::hide_known` does;
+/// the ledger is given it when it is made, and gives it each text once as it came, and a cause's
+/// text once more when the cause's strip changed it ([`Cause::cleaned_with`]).
 pub type Hide = Arc<dyn Fn(&str) -> String + Send + Sync>;
 
 /// The wall-clock time as Unix epoch milliseconds: what an event is stamped with.
@@ -296,24 +298,18 @@ fn gate_attempt(event: &RunEvent) -> Option<u32> {
     }
 }
 
-/// Every text in `value` through `hide`, then cut to its last [`OUTPUT_LIMIT`] bytes. Hiding
-/// comes first, so a cut can never leave the end of a secret that the hiding would no longer
-/// recognise. A text is kept as it is, its lines and control characters too, unless `hide`
-/// finds a secret only once the control characters that are not white space are gone: then it
-/// is kept without them, with that secret hidden. Line breaks and tabs stay, so two lines are
-/// never joined into something that looks like a secret.
-///
-/// So a known token split by white space (a line break, a tab, a space) is not hidden here, and
-/// is stored as it came. Only `hide` knows the values it hides, so only it can tell a split
-/// token from two lines that merely join into something that looks like one.
+/// Every text in `value` through `hide` once, as it came, then cut to its last
+/// [`OUTPUT_LIMIT`] bytes. Hiding comes first, so a cut can never leave the end of a secret
+/// that the hiding would no longer recognise. A text keeps its lines and control characters:
+/// a known token split by spaces, line breaks, control characters or escape sequences is found
+/// by `hide` itself (`secrets::hide_known` matches a held value across such gaps), since only it
+/// knows the values it hides and so can tell a split token from two lines that merely join
+/// into something that looks like one.
 fn hide_texts(value: &mut Value, hide: &(dyn Fn(&str) -> String + Send + Sync)) {
     match value {
         Value::String(text) => {
             let hidden = hide(text);
-            let stripped = events::strip_inline(&hidden);
-            let again = hide(&stripped);
-            let kept = if again == stripped { hidden } else { again };
-            *text = cut_output(&kept).to_owned();
+            *text = cut_output(&hidden).to_owned();
         }
         Value::Array(items) => {
             for item in items {
@@ -478,6 +474,14 @@ pub(crate) mod testing {
     /// Hides nothing.
     pub fn shown() -> Hide {
         Arc::new(|text: &str| text.to_owned())
+    }
+
+    /// Hides as the daemon's ledger will: `secrets::hide_known` over a store that holds
+    /// `token` for `octocat`.
+    pub fn hiding(token: &str) -> Hide {
+        let secrets = crate::secrets::MemorySecrets::default();
+        crate::secrets::Secrets::set(&secrets, "github:octocat", token).unwrap();
+        Arc::new(move |text: &str| crate::secrets::hide_known(text, &secrets))
     }
 
     /// A store of its own in a directory that lives as long as the returned guard.
@@ -1959,9 +1963,8 @@ mod tests {
     fn a_secret_across_the_cut_of_a_cause_text_is_hidden_before_the_text_is_cut() {
         let (_dir, store) = open_store();
         let token = "ghp_0123456789abcdefghij";
-        let hide: Hide = std::sync::Arc::new(move |text: &str| text.replace(token, "***"));
-        let ledger =
-            Ledger::new(store.clone(), MachineId::random(), 1, hide).with_wall(ticking(T0, 1000));
+        let ledger = Ledger::new(store.clone(), MachineId::random(), 1, hiding(token))
+            .with_wall(ticking(T0, 1000));
         // Each text holds the secret across the place its cut falls: 100 characters for the
         // reason, actor and label, 1000 for the command.
         let short = |fill: &str| format!("{}{token}", fill.repeat(95));
@@ -2000,9 +2003,8 @@ mod tests {
     fn a_secret_split_by_a_control_character_is_hidden_in_the_data_too() {
         let (_dir, store) = open_store();
         let token = "ghp_0123456789abcdefghij";
-        let hide: Hide = std::sync::Arc::new(move |text: &str| text.replace(token, "***"));
-        let ledger =
-            Ledger::new(store.clone(), MachineId::random(), 1, hide).with_wall(ticking(T0, 1000));
+        let ledger = Ledger::new(store.clone(), MachineId::random(), 1, hiding(token))
+            .with_wall(ticking(T0, 1000));
         let written = ledger
             .write(
                 &run(8),
@@ -2035,13 +2037,16 @@ mod tests {
 
     #[test]
     fn output_whose_lines_only_join_into_a_url_password_keeps_its_lines() {
-        // A Hide that hides URL passwords as `secrets::redact` does, beside a known token.
+        // `secrets::hide_known` hides URL passwords as `secrets::redact` does, beside a known
+        // token.
         let (_dir, store) = open_store();
-        let hide: Hide = std::sync::Arc::new(|text: &str| {
-            crate::secrets::redact(text).replace("ghp_0123456789abcdefghij", "***")
-        });
-        let ledger =
-            Ledger::new(store.clone(), MachineId::random(), 1, hide).with_wall(ticking(T0, 1000));
+        let ledger = Ledger::new(
+            store.clone(),
+            MachineId::random(),
+            1,
+            hiding("ghp_0123456789abcdefghij"),
+        )
+        .with_wall(ticking(T0, 1000));
         let output =
             "fetching https://registry.example.com\nadmin@example.com wrote\r\n\tok\u{0007}";
         let written = ledger
@@ -2058,6 +2063,110 @@ mod tests {
             )
             .unwrap();
         assert_eq!(written.data["reason"], json!("a\nT=***\nb"));
+    }
+
+    #[test]
+    fn a_secret_split_by_white_space_or_a_colour_sequence_is_hidden_in_the_data_and_the_cause() {
+        let (_dir, store) = open_store();
+        let token = "ghp_0123456789abcdefghij";
+        let ledger = Ledger::new(store.clone(), MachineId::random(), 1, hiding(token))
+            .with_wall(ticking(T0, 1000));
+        for split in ["\n", "\t", " ", "\r\n", "\n    ", "\u{1b}[31m"] {
+            let text = format!("one\nT=ghp_0123456789{split}abcdefghij\ntwo");
+            let cause = Cause::new(CauseStep::Gate, &text)
+                .actor(&text)
+                .command(&text)
+                .label(&text);
+            let written = ledger.write(&run(8), &stuck(&text), &cause).unwrap();
+            assert_eq!(
+                written.data["reason"],
+                json!("one\nT=***\ntwo"),
+                "{split:?}"
+            );
+            let cause = written.cause.unwrap();
+            for field in ["reason", "actor", "command", "label"] {
+                assert_eq!(cause[field], json!("oneT=***two"), "{split:?} {field}");
+            }
+        }
+        let stored = serde_json::to_string(&held(&store, &run(8))).unwrap();
+        assert!(!stored.contains("ghp_"), "{stored}");
+        assert!(!stored.contains("abcdefghij"), "{stored}");
+    }
+
+    #[test]
+    fn a_secret_split_by_a_lone_escape_or_c1_introducer_is_hidden_in_the_data_and_the_cause() {
+        let (_dir, store) = open_store();
+        let token = "ghp_0123456789abcdefghij";
+        let ledger = Ledger::new(store.clone(), MachineId::random(), 1, hiding(token))
+            .with_wall(ticking(T0, 1000));
+        for (split, end) in [
+            ("\u{1b}", ""),
+            ("\u{9b}", ""),
+            ("\u{90}", "\u{7}"),
+            ("\u{9d}", "\u{9c}"),
+        ] {
+            let text = format!("one\nT=ghp_0123456789{split}abcdefghij{end}\ntwo");
+            let cause = Cause::new(CauseStep::Gate, &text).command(&text);
+            let written = ledger.write(&run(8), &stuck(&text), &cause).unwrap();
+            assert_eq!(
+                written.data["reason"],
+                json!(format!("one\nT=***{end}\ntwo")),
+                "{split:?}"
+            );
+            let cause = written.cause.unwrap();
+            for field in ["reason", "command"] {
+                assert_eq!(cause[field], json!("oneT=***two"), "{split:?} {field}");
+            }
+        }
+        // A colour sequence and a lone ESC in one token.
+        let text = "one\nT=ghp_01234\u{1b}[31m56789\u{1b}abcdefghij\ntwo";
+        let cause = Cause::new(CauseStep::Gate, text).command(text);
+        let written = ledger.write(&run(8), &stuck(text), &cause).unwrap();
+        assert_eq!(written.data["reason"], json!("one\nT=***\ntwo"));
+        assert_eq!(written.cause.unwrap()["command"], json!("oneT=***two"));
+        let stored = serde_json::to_string(&held(&store, &run(8))).unwrap();
+        assert!(!stored.contains("ghp_"), "{stored}");
+        assert!(!stored.contains("abcdefghij"), "{stored}");
+    }
+
+    #[test]
+    fn a_write_gives_its_data_to_its_hider_once_and_a_cause_again_when_its_strip_changed_it() {
+        let (_dir, store) = open_store();
+        let seen = std::sync::Arc::new(Mutex::new(Vec::<String>::new()));
+        let hide: Hide = {
+            let seen = seen.clone();
+            std::sync::Arc::new(move |text: &str| {
+                seen.lock().unwrap().push(text.to_owned());
+                text.to_owned()
+            })
+        };
+        let ledger =
+            Ledger::new(store.clone(), MachineId::random(), 1, hide).with_wall(ticking(T0, 1000));
+        let cause = Cause::new(CauseStep::Gate, "r\u{7}\nr")
+            .actor("a\u{202e}a")
+            .command("c\tc")
+            .label("l\u{1b}[0ml");
+        ledger
+            .write(
+                &run(8),
+                &stuck(&format!("{}\u{7}\nend", "o".repeat(OUTPUT_LIMIT))),
+                &cause,
+            )
+            .unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                format!("{}\u{7}\nend", "o".repeat(OUTPUT_LIMIT)),
+                "r\u{7}\nr".to_owned(),
+                "rr".to_owned(),
+                "a\u{202e}a".to_owned(),
+                "aa".to_owned(),
+                "c\tc".to_owned(),
+                "cc".to_owned(),
+                "l\u{1b}[0ml".to_owned(),
+                "l[0ml".to_owned(),
+            ]
+        );
     }
 
     #[test]
