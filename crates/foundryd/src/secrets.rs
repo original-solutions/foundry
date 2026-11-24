@@ -733,6 +733,20 @@ mod tests {
         );
     }
 
+    /// A quote with no `@` after it still ends a URL, so a URL quoted right after it is read as
+    /// one and its password hidden.
+    #[test]
+    fn redact_hides_the_password_of_a_url_quoted_right_after_another() {
+        assert_eq!(
+            redact("[\"https://a.example\",\"https://u:p@b.example\"]"),
+            "[\"https://a.example\",\"https://***@b.example\"]"
+        );
+        assert_eq!(
+            redact("['https://x@a','https://u:p@b']"),
+            "['https://***@a','https://***@b']"
+        );
+    }
+
     #[test]
     fn the_login_rule_gives_the_limit_and_is_what_a_refusal_says() {
         assert!(
