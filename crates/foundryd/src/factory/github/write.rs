@@ -1,4 +1,464 @@
 //! Writes to GitHub: labels, comments and claims.
+//!
+//! Each write runs `gh` through [`Tracker::gh`], so the real `gh` and the fake are written to
+//! alike. Ported from the writing half of the runner's `src/tracker/github.ts`. Every comment
+//! body goes through the tracker's hider ([`Tracker::hide`]) and then [`text::for_comment`], and
+//! the factory's own marker is added after both, since `for_comment` would hide the run id and
+//! the machine id in a claim marker.
+//!
+//! A claim is Foundry's when the newest claim comment on the issue carries Foundry's marker,
+//! `<!-- foundry:claim <run id> <machine> -->`, as its last line and was written by the
+//! project's login ([`newest_claim`]). Any other claim, the runner's
+//! `<!-- softfac:claim <machine> -->` among them, belongs to another factory.
+
+use std::str::FromStr;
+
+use foundry_proto::factory::RunId;
+use foundry_proto::ids::MachineId;
+use serde::Deserialize;
+
+use super::read::{gh_json, gh_pages, pull_request};
+use super::{OtherKind, Tracker, TrackerError};
+use crate::factory::lifecycle::State;
+use crate::factory::text;
+
+/// Ends every comment the factory posts, so it can tell its own comments from instructors'.
+pub const MARKER: &str = "<!-- softfac -->";
+
+/// Ends the issue's one status comment in place of [`MARKER`], as the runner's does.
+pub const STATUS_MARKER: &str = "<!-- softfac:status -->";
+
+/// How Foundry's claim marker starts: `<!-- foundry:claim <run id> <machine> -->`.
+const CLAIM_PREFIX: &str = "<!-- foundry:claim ";
+
+/// How the runner's claim marker starts: `<!-- softfac:claim <machine> -->`.
+const RUNNER_CLAIM_PREFIX: &str = "<!-- softfac:claim ";
+
+/// How every claim marker ends.
+const MARKER_END: &str = " -->";
+
+/// What Foundry's claim comment says above its marker. Fixed words: nothing in them is hidden.
+const CLAIM_TEXT: &str = "Claimed by Foundry.";
+
+/// The comment authors GitHub reports as able to work the repo, whose claim comments count
+/// beside the project's login's own, as the runner counts them.
+const CLAIM_ASSOCIATIONS: [&str; 3] = ["OWNER", "MEMBER", "COLLABORATOR"];
+
+/// `body` and then `marker`, after a blank line.
+fn with_marker(body: &str, marker: &str) -> String {
+    format!("{body}\n\n{marker}")
+}
+
+/// `body` as a comment may carry it: through the tracker's hider and then
+/// [`text::for_comment`], and then `marker` after both.
+fn comment_body<G: Tracker + ?Sized>(gh: &G, body: &str, marker: &str) -> String {
+    with_marker(&text::for_comment(&gh.hide(body)), marker)
+}
+
+/// `parts` and then `--repo <repo>`.
+fn repo_args(parts: &[&str], repo: &str) -> Vec<String> {
+    let mut args: Vec<String> = parts.iter().map(|part| part.to_string()).collect();
+    args.push("--repo".into());
+    args.push(repo.into());
+    args
+}
+
+/// Runs a write and drops its stdout.
+fn call<G: Tracker + ?Sized>(gh: &G, args: &[String]) -> Result<(), TrackerError> {
+    gh.gh(args).map(drop)
+}
+
+/// Whether `error` is `gh` failing with `said` on stderr.
+fn failed_saying(error: &TrackerError, said: &str) -> bool {
+    matches!(error, TrackerError::Other { kind: OtherKind::Failed, message } if message.contains(said))
+}
+
+// ---------------------------------------------------------------------------------------------
+// The state label and assignees.
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct LabelsView {
+    labels: Vec<LabelRow>,
+}
+
+#[derive(Deserialize)]
+struct LabelRow {
+    name: String,
+}
+
+/// Moves the issue to `state`: adds its label, removes every other `factory:*` label, and
+/// touches nothing else. Makes no edit when the labels are already so.
+pub fn set_state<G: Tracker + ?Sized>(
+    gh: &G,
+    repo: &str,
+    issue: u64,
+    state: State,
+) -> Result<(), TrackerError> {
+    let number = issue.to_string();
+    let label = state.label();
+    let mut view = repo_args(&["issue", "view", &number], repo);
+    view.extend(["--json".to_string(), "labels".to_string()]);
+    let current: LabelsView = gh_json(gh, &view, "an object with `labels`")?;
+    let present = current.labels.iter().any(|row| row.name == label);
+    let stale: Vec<&str> = current
+        .labels
+        .iter()
+        .map(|row| row.name.as_str())
+        .filter(|name| name.starts_with("factory:") && *name != label)
+        .collect();
+    if present && stale.is_empty() {
+        return Ok(());
+    }
+    let mut edit = repo_args(&["issue", "edit", &number], repo);
+    if !present {
+        edit.extend(["--add-label".to_string(), label.to_string()]);
+    }
+    for name in stale {
+        edit.extend(["--remove-label".to_string(), name.to_string()]);
+    }
+    call(gh, &edit)
+}
+
+/// Assigns `login` to the issue.
+pub fn assign<G: Tracker + ?Sized>(
+    gh: &G,
+    repo: &str,
+    issue: u64,
+    login: &str,
+) -> Result<(), TrackerError> {
+    let mut args = repo_args(&["issue", "edit", &issue.to_string()], repo);
+    args.extend(["--add-assignee".to_string(), login.to_string()]);
+    call(gh, &args)
+}
+
+/// Takes `login` off the issue's assignees.
+pub fn unassign<G: Tracker + ?Sized>(
+    gh: &G,
+    repo: &str,
+    issue: u64,
+    login: &str,
+) -> Result<(), TrackerError> {
+    let mut args = repo_args(&["issue", "edit", &issue.to_string()], repo);
+    args.extend(["--remove-assignee".to_string(), login.to_string()]);
+    call(gh, &args)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Comments.
+// ---------------------------------------------------------------------------------------------
+
+/// One comment on an issue as GitHub's REST listing gives it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IssueComment {
+    /// GitHub's id for the comment. Ids only rise, so a higher one is a newer comment.
+    pub id: u64,
+    /// Its author's login; `None` for a deleted account.
+    pub author: Option<String>,
+    /// How GitHub says the author relates to the repo, e.g. `MEMBER`; empty when not given.
+    pub association: String,
+    /// When GitHub made it, as GitHub writes it; empty when not given.
+    pub created_at: String,
+    pub body: String,
+}
+
+#[derive(Deserialize)]
+struct CommentRow {
+    id: u64,
+    #[serde(default)]
+    user: Option<UserRow>,
+    #[serde(default)]
+    author_association: Option<String>,
+    #[serde(default)]
+    created_at: Option<String>,
+    #[serde(default)]
+    body: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct UserRow {
+    login: String,
+}
+
+/// The call that lists every comment on the issue.
+fn comments_call(repo: &str, issue: u64) -> Vec<String> {
+    vec![
+        "api".into(),
+        format!("repos/{repo}/issues/{issue}/comments"),
+        "--paginate".into(),
+    ]
+}
+
+/// Every comment on the issue, in the order GitHub lists them.
+pub fn issue_comments<G: Tracker + ?Sized>(
+    gh: &G,
+    repo: &str,
+    issue: u64,
+) -> Result<Vec<IssueComment>, TrackerError> {
+    let rows: Vec<CommentRow> =
+        gh_pages(gh, &comments_call(repo, issue), "JSON arrays of comments")?;
+    Ok(rows
+        .into_iter()
+        .map(|row| IssueComment {
+            id: row.id,
+            author: row.user.map(|user| user.login),
+            association: row.author_association.unwrap_or_default(),
+            created_at: row.created_at.unwrap_or_default(),
+            body: row.body.unwrap_or_default(),
+        })
+        .collect())
+}
+
+/// Posts a comment on the issue, hidden, ending with [`MARKER`].
+pub fn post_comment<G: Tracker + ?Sized>(
+    gh: &G,
+    repo: &str,
+    issue: u64,
+    body: &str,
+) -> Result<(), TrackerError> {
+    let mut args = repo_args(&["issue", "comment", &issue.to_string()], repo);
+    args.extend(["--body".to_string(), comment_body(gh, body, MARKER)]);
+    call(gh, &args)
+}
+
+/// Posts a comment on pull request `pr`, hidden, ending with [`MARKER`].
+pub fn comment_on_pr<G: Tracker + ?Sized>(
+    gh: &G,
+    repo: &str,
+    pr: u64,
+    body: &str,
+) -> Result<(), TrackerError> {
+    let mut args = repo_args(&["pr", "comment", &pr.to_string()], repo);
+    args.extend(["--body".to_string(), comment_body(gh, body, MARKER)]);
+    call(gh, &args)
+}
+
+/// Writes the issue's one status comment, hidden, ending with [`STATUS_MARKER`]: edits
+/// `login`'s existing one in place, or posts it. Only a comment by `login`, matched ignoring
+/// ASCII case, that ends with the status marker counts, so nobody else can take it over. A
+/// list and then a write, so two callers at once could still post two.
+pub fn upsert_status_comment<G: Tracker + ?Sized>(
+    gh: &G,
+    repo: &str,
+    issue: u64,
+    login: &str,
+    body: &str,
+) -> Result<(), TrackerError> {
+    let existing = issue_comments(gh, repo, issue)?;
+    let status = existing.iter().find(|comment| {
+        comment
+            .author
+            .as_deref()
+            .is_some_and(|author| author.eq_ignore_ascii_case(login))
+            && comment.body.trim_end().ends_with(STATUS_MARKER)
+    });
+    let text = comment_body(gh, body, STATUS_MARKER);
+    match status {
+        None => {
+            let mut args = repo_args(&["issue", "comment", &issue.to_string()], repo);
+            args.extend(["--body".to_string(), text]);
+            call(gh, &args)
+        }
+        Some(status) => call(
+            gh,
+            &[
+                "api".into(),
+                "-X".into(),
+                "PATCH".into(),
+                format!("repos/{repo}/issues/comments/{}", status.id),
+                "-f".into(),
+                format!("body={text}"),
+            ],
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Claims.
+// ---------------------------------------------------------------------------------------------
+
+/// Whose an issue's newest claim comment says the issue is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Claim {
+    /// Foundry's own: the run and the machine its marker names.
+    Foundry { run: RunId, machine: MachineId },
+    /// Another factory's: the runner's, another login's, or a marker that does not parse.
+    Foreign { comment_id: u64 },
+}
+
+/// Foundry's claim marker for `run` on `machine`: `<!-- foundry:claim <run id> <machine> -->`.
+pub fn claim_marker(run: &RunId, machine: &MachineId) -> String {
+    format!("{CLAIM_PREFIX}{run} {machine}{MARKER_END}")
+}
+
+/// Foundry's claim comment for `run` on `machine`, with [`claim_marker`] as its last line.
+pub fn claim_comment(run: &RunId, machine: &MachineId) -> String {
+    with_marker(CLAIM_TEXT, &claim_marker(run, machine))
+}
+
+/// Posts Foundry's claim comment for `run` on `machine`. Its words go through the hider and
+/// [`text::for_comment`] like any comment's; its marker is added after them, whole.
+pub fn post_claim<G: Tracker + ?Sized>(
+    gh: &G,
+    repo: &str,
+    issue: u64,
+    run: &RunId,
+    machine: &MachineId,
+) -> Result<(), TrackerError> {
+    let mut args = repo_args(&["issue", "comment", &issue.to_string()], repo);
+    args.extend([
+        "--body".to_string(),
+        comment_body(gh, CLAIM_TEXT, &claim_marker(run, machine)),
+    ]);
+    call(gh, &args)
+}
+
+/// What a comment's last line says when it is a claim marker: Foundry's, with what it names
+/// when that parses, or another factory's.
+enum Marker {
+    Foundry(Option<(RunId, MachineId)>),
+    Runner,
+}
+
+/// The claim marker that is `body`'s last line, after trailing whitespace, if there is one.
+fn claim_marker_of(body: &str) -> Option<Marker> {
+    let last = body.trim_end().lines().last()?.trim();
+    if let Some(named) = last
+        .strip_prefix(CLAIM_PREFIX)
+        .and_then(|rest| rest.strip_suffix(MARKER_END))
+    {
+        return Some(Marker::Foundry(parse_foundry_claim(named)));
+    }
+    let named = last
+        .strip_prefix(RUNNER_CLAIM_PREFIX)?
+        .strip_suffix(MARKER_END)?;
+    (!named.is_empty() && !named.contains(char::is_whitespace)).then_some(Marker::Runner)
+}
+
+/// The run and machine of Foundry's marker, `<run id> <machine>`, each in the one form Foundry
+/// writes it.
+fn parse_foundry_claim(named: &str) -> Option<(RunId, MachineId)> {
+    let (run, machine) = named.split_once(' ')?;
+    let parsed_run = RunId::from_str(run).ok()?;
+    let parsed_machine = MachineId(uuid::Uuid::parse_str(machine).ok()?);
+    (parsed_run.to_string() == run && parsed_machine.to_string() == machine)
+        .then_some((parsed_run, parsed_machine))
+}
+
+/// Whose the issue is by its newest claim comment, or `None` when it has none.
+///
+/// A claim comment is one whose last line is a claim marker, Foundry's or the runner's, written
+/// by `login` (ignoring ASCII case) or by someone GitHub says can work the repo, as the runner
+/// counts them; anyone else's marker counts for nothing. The newest is the one with the highest
+/// id, never by time. It is Foundry's only when it carries Foundry's marker, the marker parses,
+/// and `login` wrote it: a marker by any other login is another factory's.
+pub fn newest_claim(comments: &[IssueComment], login: &str) -> Option<Claim> {
+    let by_login = |comment: &IssueComment| {
+        comment
+            .author
+            .as_deref()
+            .is_some_and(|author| author.eq_ignore_ascii_case(login))
+    };
+    let (comment, marker) = comments
+        .iter()
+        .filter(|comment| comment.author.is_some())
+        .filter(|comment| {
+            by_login(comment) || CLAIM_ASSOCIATIONS.contains(&comment.association.as_str())
+        })
+        .filter_map(|comment| claim_marker_of(&comment.body).map(|marker| (comment, marker)))
+        .max_by_key(|(comment, _)| comment.id)?;
+    Some(match marker {
+        Marker::Foundry(Some((run, machine))) if by_login(comment) => {
+            Claim::Foundry { run, machine }
+        }
+        _ => Claim::Foreign {
+            comment_id: comment.id,
+        },
+    })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Labels.
+// ---------------------------------------------------------------------------------------------
+
+/// The names of every label the repo has.
+pub fn label_names<G: Tracker + ?Sized>(gh: &G, repo: &str) -> Result<Vec<String>, TrackerError> {
+    let args = vec![
+        "api".to_string(),
+        format!("repos/{repo}/labels?per_page=100"),
+        "--paginate".to_string(),
+    ];
+    let rows: Vec<LabelRow> = gh_pages(gh, &args, "JSON arrays of labels")?;
+    Ok(rows.into_iter().map(|row| row.name).collect())
+}
+
+/// Creates a label. `color` is six hex digits without the `#`. One that exists is an error.
+pub fn create_label<G: Tracker + ?Sized>(
+    gh: &G,
+    repo: &str,
+    name: &str,
+    color: &str,
+    description: &str,
+) -> Result<(), TrackerError> {
+    let mut args = repo_args(&["label", "create", name], repo);
+    args.extend([
+        "--color".to_string(),
+        color.to_string(),
+        "--description".to_string(),
+        description.to_string(),
+    ]);
+    call(gh, &args)
+}
+
+/// Creates the factory labels the repo lacks, in lifecycle order, and answers their states.
+/// Stops at the first that fails.
+pub fn ensure_labels<G: Tracker + ?Sized>(gh: &G, repo: &str) -> Result<Vec<State>, TrackerError> {
+    let existing = label_names(gh, repo)?;
+    let mut created = Vec::new();
+    for state in State::ALL {
+        if existing.iter().any(|name| name == state.label()) {
+            continue;
+        }
+        create_label(gh, repo, state.label(), state.color(), state.description())?;
+        created.push(state);
+    }
+    Ok(created)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Pull requests: ready and draft.
+// ---------------------------------------------------------------------------------------------
+
+/// Takes pull request `pr` out of draft. One that is already ready counts as done: `gh` warns
+/// `Pull request <repo>#<n> is already "ready for review"` and exits 0, and should a version
+/// fail on it the pull request is still ready. An answer lost on the way back leaves a caller
+/// asking again.
+pub fn mark_pr_ready<G: Tracker + ?Sized>(gh: &G, repo: &str, pr: u64) -> Result<(), TrackerError> {
+    match call(gh, &repo_args(&["pr", "ready", &pr.to_string()], repo)) {
+        Err(error) if failed_saying(&error, "is already \"ready for review\"") => Ok(()),
+        done => done,
+    }
+}
+
+/// Puts pull request `pr` back to draft (`gh pr ready --undo`). One already a draft counts as
+/// done (`gh` warns and exits 0), and so does one no longer open, so a resumed decision does
+/// not fail on it. On any other failure the pull request is read and its state decides, not
+/// the error's words; a failed read, one that is gone or one still open leaves the original
+/// error.
+pub fn mark_pr_draft<G: Tracker + ?Sized>(gh: &G, repo: &str, pr: u64) -> Result<(), TrackerError> {
+    let mut args = repo_args(&["pr", "ready", &pr.to_string()], repo);
+    args.push("--undo".into());
+    let Err(original) = call(gh, &args) else {
+        return Ok(());
+    };
+    if failed_saying(&original, "is already \"in draft\"") {
+        return Ok(());
+    }
+    match pull_request(gh, repo, pr) {
+        Ok(Some(pull)) if !pull.open => Ok(()),
+        _ => Err(original),
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -46,7 +506,11 @@ mod tests {
     }
 
     fn list_comments_call() -> Vec<String> {
-        args(&["api", "repos/rawphp/softfac/issues/6/comments", "--paginate"])
+        args(&[
+            "api",
+            "repos/rawphp/softfac/issues/6/comments",
+            "--paginate",
+        ])
     }
 
     fn patch_call(id: &str, body: &str) -> Vec<String> {
@@ -68,15 +532,27 @@ mod tests {
             "A bot filed it. The factory ignores it until a person sets `factory:ready`.",
         ),
         ("ready", "0e8a16", "Approved for the factory."),
-        ("triage", "fbca04", "Claimed. The session is being launched."),
+        (
+            "triage",
+            "fbca04",
+            "Claimed. The session is being launched.",
+        ),
         (
             "needs-info",
             "d93f0b",
             "The factory asked questions on the issue. Answer them, then set `factory:ready`.",
         ),
         ("building", "1d76db", "A session is building it."),
-        ("pr-open", "5319e7", "The PR is open and has passed the gate."),
-        ("stuck", "b60205", "The factory gave up and said why in a comment."),
+        (
+            "pr-open",
+            "5319e7",
+            "The PR is open and has passed the gate.",
+        ),
+        (
+            "stuck",
+            "b60205",
+            "The factory gave up and said why in a comment.",
+        ),
     ];
 
     fn create_call(state: &str, color: &str, description: &str) -> Vec<String> {
@@ -142,7 +618,11 @@ mod tests {
         assert_eq!(fake.label_names(REPO).unwrap(), vec!["bug".to_string()]);
         assert_eq!(
             fake.calls()[0],
-            args(&["api", "repos/rawphp/softfac/labels?per_page=100", "--paginate"])
+            args(&[
+                "api",
+                "repos/rawphp/softfac/labels?per_page=100",
+                "--paginate"
+            ])
         );
         // One array per page reads the same as one merged array.
         fake.label_names(REPO).unwrap();
@@ -447,7 +927,9 @@ mod tests {
             ),
             Answer::ok(""),
         ]);
-        patch.upsert_status_comment(REPO, 6, "rawphp", nasty).unwrap();
+        patch
+            .upsert_status_comment(REPO, 6, "rawphp", nasty)
+            .unwrap();
         assert_eq!(patch.calls()[1], patch_call("77", &status));
     }
 
@@ -486,10 +968,7 @@ mod tests {
             fake.calls(),
             vec![
                 list_comments_call(),
-                patch_call(
-                    "5978910929",
-                    "state: building\n\n<!-- softfac:status -->"
-                ),
+                patch_call("5978910929", "state: building\n\n<!-- softfac:status -->"),
             ]
         );
     }
@@ -505,8 +984,10 @@ mod tests {
             Answer::ok(created),
             Answer::ok("{}"),
         ]);
-        fake.upsert_status_comment(REPO, 6, "rawphp", "one").unwrap();
-        fake.upsert_status_comment(REPO, 6, "rawphp", "two").unwrap();
+        fake.upsert_status_comment(REPO, 6, "rawphp", "one")
+            .unwrap();
+        fake.upsert_status_comment(REPO, 6, "rawphp", "two")
+            .unwrap();
         let calls = fake.calls();
         assert_eq!(calls.len(), 4);
         assert_eq!(
@@ -768,8 +1249,12 @@ mod tests {
     #[test]
     fn a_tracker_built_without_a_hider_still_hides_for_comment() {
         let fake = FakeTracker::answering([Answer::ok("")]);
-        fake.post_comment(REPO, 6, &format!("key {KEY} at https://user:pw@example.com/x"))
-            .unwrap();
+        fake.post_comment(
+            REPO,
+            6,
+            &format!("key {KEY} at https://user:pw@example.com/x"),
+        )
+        .unwrap();
         let body = fake.calls()[0][6].clone();
         assert!(!body.contains(KEY), "{body}");
         assert!(!body.contains("pw@"), "{body}");
@@ -780,7 +1265,10 @@ mod tests {
     fn hiders_compose_and_a_pull_request_url_stays_whole() {
         let fake = Arc::new(FakeTracker::answering([Answer::ok("")]));
         let inner: Arc<dyn Tracker> = Arc::new(Hiding::new(fake.clone(), hider()));
-        let outer = Hiding::new(inner, Arc::new(|text: &str| text.replace("swordfish", "[k2]")));
+        let outer = Hiding::new(
+            inner,
+            Arc::new(|text: &str| text.replace("swordfish", "[k2]")),
+        );
         outer
             .post_comment(
                 REPO,
@@ -988,7 +1476,12 @@ mod tests {
     }
 
     fn foundry_claim(id: u64, author: &str, association: &str) -> IssueComment {
-        comment(id, Some(author), association, &claim_comment(&run(), &machine()))
+        comment(
+            id,
+            Some(author),
+            association,
+            &claim_comment(&run(), &machine()),
+        )
     }
 
     fn runner_claim(id: u64, author: &str, association: &str) -> IssueComment {
@@ -1016,7 +1509,9 @@ mod tests {
         );
         assert_eq!(
             body,
-            format!("Claimed by Foundry.\n\n<!-- foundry:claim rawphp__softfac__6__1 {MACHINE} -->")
+            format!(
+                "Claimed by Foundry.\n\n<!-- foundry:claim rawphp__softfac__6__1 {MACHINE} -->"
+            )
         );
     }
 
@@ -1124,10 +1619,7 @@ mod tests {
 
     #[test]
     fn a_marker_that_is_not_the_last_line_is_no_claim() {
-        let quoted = format!(
-            "{}\n\nquoted above",
-            claim_comment(&run(), &machine())
-        );
+        let quoted = format!("{}\n\nquoted above", claim_comment(&run(), &machine()));
         let comments = [
             comment(5, Some("rawphp"), "OWNER", &quoted),
             comment(
@@ -1158,7 +1650,12 @@ mod tests {
             "<!-- foundry:claim rawphp__softfac__6__1 6f1c2a8e-3b4d-4e5f-9a0b-1c2d3e4f5a6b extra -->",
             "<!-- foundry:claim rawphp__softfac__6__1 6F1C2A8E-3B4D-4E5F-9A0B-1C2D3E4F5A6B -->",
         ] {
-            let comments = [comment(5, Some("rawphp"), "OWNER", &format!("x\n\n{marker}"))];
+            let comments = [comment(
+                5,
+                Some("rawphp"),
+                "OWNER",
+                &format!("x\n\n{marker}"),
+            )];
             assert_eq!(
                 newest_claim(&comments, "rawphp"),
                 Some(Claim::Foreign { comment_id: 5 }),
