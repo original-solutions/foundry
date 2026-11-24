@@ -1213,4 +1213,189 @@ mod tests {
         let input = io::BufReader::new(Unreadable);
         assert!(set_from(&secrets, "machine", input).is_err());
     }
+
+    #[test]
+    fn set_from_accepts_a_github_login() {
+        let (_dir, secrets) = file();
+        for login in ["octocat", "a-b-1", "A9"] {
+            let name = format!("github:{login}");
+            set_from(&secrets, &name, "ghp_x\n".as_bytes()).unwrap();
+            assert_eq!(stored(&secrets, &name).as_deref(), Some("ghp_x"), "{name}");
+        }
+    }
+
+    #[test]
+    fn set_from_refuses_a_bad_login_before_it_reads_stdin() {
+        struct Unreadable;
+        impl io::Read for Unreadable {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                panic!("stdin was read");
+            }
+        }
+        let (_dir, secrets) = file();
+        for name in [
+            "github:bad/name",
+            "github:",
+            "github:\u{fc}",
+            "github:a b",
+            "github-default",
+        ] {
+            let input = io::BufReader::new(Unreadable);
+            let error = set_from(&secrets, name, input).unwrap_err();
+            assert!(matches!(error, SetError::UnknownName { .. }), "{name}");
+            assert!(error.to_string().contains("github:<login>"), "{error}");
+            assert_eq!(stored(&secrets, name), None, "{name}");
+        }
+        assert!(secrets.names().unwrap().is_empty());
+    }
+
+    #[test]
+    fn names_lists_what_was_set_sorted_and_no_value() {
+        let (_dir, secrets) = file();
+        assert!(secrets.names().unwrap().is_empty());
+        secrets.set("gateway", "value-one").unwrap();
+        secrets.set("github:octocat", "value-two").unwrap();
+        secrets.set("github:alice", "value-three").unwrap();
+        let names = secrets.names().unwrap();
+        assert_eq!(names, ["gateway", "github:alice", "github:octocat"]);
+        let text = names.join(" ");
+        assert!(!text.contains("value-"), "{text}");
+    }
+
+    #[test]
+    fn names_of_an_open_file_is_an_error_not_an_empty_list() {
+        let (dir, secrets) = file();
+        secrets.set("gateway", "sk-one").unwrap();
+        let path = dir.path().join("secrets.json");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            secrets.names().unwrap_err(),
+            SecretsError::TooOpen { .. }
+        ));
+    }
+
+    #[test]
+    fn the_in_memory_fake_lists_its_names() {
+        let secrets = MemorySecrets::default();
+        secrets.set("b", "1").unwrap();
+        secrets.set("a", "2").unwrap();
+        assert_eq!(secrets.names().unwrap(), ["a", "b"]);
+    }
+
+    #[test]
+    fn github_logins_lists_only_valid_github_names() {
+        let (_dir, secrets) = file();
+        for name in [
+            "gateway",
+            "github:zed",
+            "github:octocat",
+            "github:bad/name",
+            "github:",
+            "github-default",
+        ] {
+            secrets.set(name, "v").unwrap();
+        }
+        assert_eq!(github_logins(&secrets).unwrap(), ["octocat", "zed"]);
+    }
+
+    #[test]
+    fn github_token_gets_the_token_and_none_for_unset_or_invalid() {
+        let (_dir, secrets) = file();
+        secrets.set("github:octocat", "ghp_tok").unwrap();
+        secrets.set("github:bad/name", "ghp_other").unwrap();
+        assert_eq!(
+            github_token(&secrets, "octocat").unwrap().as_deref(),
+            Some("ghp_tok")
+        );
+        assert_eq!(github_token(&secrets, "nobody").unwrap(), None);
+        assert_eq!(github_token(&secrets, "bad/name").unwrap(), None);
+        assert_eq!(github_token(&secrets, "").unwrap(), None);
+    }
+
+    #[test]
+    fn github_default_is_none_until_stored_then_the_login() {
+        let (_dir, secrets) = file();
+        assert_eq!(github_default(&secrets), None);
+        secrets.set(GITHUB_DEFAULT, "octocat").unwrap();
+        assert_eq!(github_default(&secrets).as_deref(), Some("octocat"));
+    }
+
+    #[test]
+    fn github_default_is_none_for_a_stored_value_that_is_no_login() {
+        let (_dir, secrets) = file();
+        for value in ["bad/name", "", "ghp_a b"] {
+            secrets.set(GITHUB_DEFAULT, value).unwrap();
+            assert_eq!(github_default(&secrets), None, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn github_default_is_not_a_name_secret_set_takes() {
+        let (_dir, secrets) = file();
+        assert!(set_from(&secrets, GITHUB_DEFAULT, "octocat\n".as_bytes()).is_err());
+        assert_eq!(stored(&secrets, GITHUB_DEFAULT), None);
+    }
+
+    #[test]
+    fn hide_known_hides_the_gateway_keys_and_every_github_token() {
+        let (_dir, secrets) = file();
+        secrets.set(GATEWAY, "gw-key-1").unwrap();
+        secrets.set(GATEWAY_MANAGEMENT, "gm-key-2").unwrap();
+        secrets.set("github:octocat", "ghp_abc").unwrap();
+        secrets.set("github:alice", "ghp_abcdef").unwrap();
+        let text = "a gw-key-1 b gm-key-2 c ghp_abc d ghp_abcdef e";
+        assert_eq!(hide_known(text, &secrets), "a *** b *** c *** d *** e");
+    }
+
+    #[test]
+    fn hide_known_hides_a_token_set_after_the_store_was_opened() {
+        let (dir, daemon) = file();
+        daemon.set(GATEWAY, "gw-key-1").unwrap();
+        let text = "pushing with ghp_late now";
+        assert_eq!(hide_known(text, &daemon), text);
+        let cli = FileSecrets::new(dir.path().join("secrets.json"));
+        set_from(&cli, "github:octocat", "ghp_late\n".as_bytes()).unwrap();
+        assert_eq!(hide_known(text, &daemon), "pushing with *** now");
+    }
+
+    #[test]
+    fn hide_known_leaves_a_commit_id_and_a_pull_request_url_alone() {
+        let (_dir, secrets) = file();
+        secrets.set("github:octocat", "ghp_abc").unwrap();
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        let url = "https://github.com/original-solutions/foundry/pull/134";
+        let text = format!("commit {commit} is in {url}");
+        assert_eq!(commit.len(), 40);
+        assert_eq!(hide_known(&text, &secrets), text);
+    }
+
+    #[test]
+    fn hide_known_hides_a_url_password_as_redact_does() {
+        let (_dir, secrets) = file();
+        let text = "clone https://user:pw123@github.com/x/y.git";
+        assert_eq!(hide_known(text, &secrets), redact(text));
+        assert!(!hide_known(text, &secrets).contains("pw123"));
+    }
+
+    #[test]
+    fn hide_known_with_an_empty_stored_value_hides_nothing() {
+        let secrets = MemorySecrets::default();
+        secrets.set(GATEWAY, "").unwrap();
+        secrets.set("github:octocat", "").unwrap();
+        assert_eq!(hide_known("plain text", &secrets), "plain text");
+    }
+
+    #[test]
+    fn hide_known_with_an_unreadable_store_gives_the_fixed_text_never_the_input() {
+        let (dir, secrets) = file();
+        secrets.set("github:octocat", "ghp_unreadable").unwrap();
+        let path = dir.path().join("secrets.json");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let text = "carrying ghp_unreadable";
+        let hidden = hide_known(text, &secrets);
+        assert_eq!(hidden, HIDDEN_UNREADABLE);
+        assert!(!hidden.contains("ghp_unreadable"));
+        let logged = crate::test_log::Logged::everywhere().text();
+        assert!(!logged.contains("ghp_unreadable"), "{logged}");
+    }
 }
