@@ -255,14 +255,7 @@ mod tests {
 
     /// Each check runs on the blocking pool: wait in real time, up to 5 s, for the version.
     async fn version_after(rig: &Rig, before: Option<u64>) -> Option<u64> {
-        for _ in 0..1_000 {
-            let now = version(rig);
-            if now != before {
-                return now;
-            }
-            tokio::task::yield_now().await;
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        wait_for(|| version(rig) != before).await;
         version(rig)
     }
 

@@ -130,9 +130,15 @@ pub const GITHUB_DEFAULT: &str = "github-default";
 /// told safe, so none of it is shown.
 pub const HIDDEN_UNREADABLE: &str = "[hidden: the secret store could not be read]";
 
-/// Whether `login` is a GitHub login as foundry takes it: letters, digits and `-`, and not empty.
+/// The longest GitHub login. A 40-character string is a legacy token, never a login.
+const LOGIN_MAX: usize = 39;
+
+/// Whether `login` is a GitHub login as foundry takes it: letters, digits and `-`, not empty and
+/// at most 39 characters (GitHub's own limit).
 pub fn is_login(login: &str) -> bool {
-    !login.is_empty() && login.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    !login.is_empty()
+        && login.len() <= LOGIN_MAX
+        && login.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
 /// The logins a GitHub token is held for, sorted. A `github:` name whose rest is no login is
@@ -320,7 +326,7 @@ fn move_secrets(old: &dyn OldStore, new: &FileSecrets) -> Result<(), SecretsErro
 pub enum SetError {
     #[error(
         "the name is not a secret to set here; the names are {GATEWAY}, {GATEWAY_MANAGEMENT} and \
-         {GITHUB_PREFIX}<login>, where a login is letters, digits and -"
+         {GITHUB_PREFIX}<login>, where a login is letters, digits and -, at most 39 characters"
     )]
     // No field: the refused name may be a token pasted in place of a login, so it is never quoted.
     UnknownName,
@@ -369,7 +375,7 @@ pub fn github_default_command(login: &str) -> ExitCode {
         // The argument is not echoed: it may be a token pasted in place of a login.
         eprintln!(
             "foundryd github default: the argument is not a GitHub login; a login is letters, \
-             digits and -"
+             digits and -, at most 39 characters"
         );
         return ExitCode::FAILURE;
     }
