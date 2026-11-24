@@ -1518,10 +1518,10 @@ fn the_project_routes_refuse_a_request_from_another_site() {
     use std::io::{Read as _, Write as _};
     let mut fixture = Fixture::new();
     fixture.start();
-    // As in the rename route's test: only a request the route serves sends a body.
-    let ask = |path: &str, host: &str, origin: Option<&str>, body: &str| {
+    let ask = |path: &str, host: &str, origin: Option<&str>| {
         let mut stream = std::net::TcpStream::connect(("127.0.0.1", fixture.port)).unwrap();
         let origin = origin.map_or_else(String::new, |o| format!("Origin: {o}\r\n"));
+        let body = r#"{"name": "", "repo": ""}"#;
         write!(
             stream,
             "POST {path} HTTP/1.1\r\nHost: {host}\r\n{origin}Connection: close\r\n\
@@ -1536,13 +1536,12 @@ fn the_project_routes_refuse_a_request_from_another_site() {
     let here = format!("127.0.0.1:{}", fixture.port);
     let foreign = Some("http://evil.example");
     // Served here: a project with no name is refused by the route itself.
-    let nameless = r#"{"name": "", "repo": ""}"#;
-    assert_eq!(ask("/api/projects", &here, None, nameless), 422);
-    assert_eq!(ask("/api/projects", &here, foreign, ""), 403);
-    assert_eq!(ask("/api/projects", "evil.example", None, ""), 403);
+    assert_eq!(ask("/api/projects", &here, None), 422);
+    assert_eq!(ask("/api/projects", &here, foreign), 403);
+    assert_eq!(ask("/api/projects", "evil.example", None), 403);
     let remove = format!("/api/projects/{}/remove", ProjectId::random());
-    assert_eq!(ask(&remove, &here, foreign, ""), 403);
-    assert_eq!(ask(&remove, "evil.example", None, ""), 403);
+    assert_eq!(ask(&remove, &here, foreign), 403);
+    assert_eq!(ask(&remove, "evil.example", None), 403);
 }
 
 /// `GET /api/machines` once it answers 200: which machine is this one, and the list.
@@ -1780,13 +1779,11 @@ fn the_priority_route_is_served_and_refuses_a_request_from_another_site() {
     let (status, answer) = ask(&here, None, &stranger);
     assert_eq!(status, 422, "{answer}");
     assert!(answer.contains("machine list"), "{answer}");
-    // From another site: refused before the route reads a body, nothing set. As in the rename
-    // route's test, only a request the route serves sends a body: a body the daemon refuses
-    // unread can make it close with a reset, and macOS then drops the answer before it is read.
+    // An order the route would take from this site, sent from another: refused, nothing set.
     let before = settings_of(&fixture);
-    let (status, answer) = ask(&here, Some("http://evil.example"), "");
+    let (status, answer) = ask(&here, Some("http://evil.example"), r#"{"order": []}"#);
     assert_eq!(status, 403, "{answer}");
-    let (status, answer) = ask("evil.example", None, "");
+    let (status, answer) = ask("evil.example", None, r#"{"order": []}"#);
     assert_eq!(status, 403, "{answer}");
     let after = settings_of(&fixture);
     assert_eq!(after.seq, before.seq);
