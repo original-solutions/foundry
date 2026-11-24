@@ -8,7 +8,7 @@
 //! never deleted, so a release that reads only the keychain still finds them. A secret's value
 //! never reaches an error message: errors name the secret or the file, never what it holds.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 #[cfg(any(target_os = "macos", test))]
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
@@ -197,9 +197,9 @@ pub fn github_default(secrets: &dyn Secrets) -> Option<String> {
 /// daemon started is hidden too, and then the passwords of URLs as [`redact`] hides them. When
 /// the store cannot be read, none of `text` is shown: [`HIDDEN_UNREADABLE`] is given instead.
 ///
-/// A held value with at least [`SPLIT_MIN`] characters that are no gap is hidden also when
-/// gaps sit inside it, as a tool that wraps to the terminal's width or colours part of a word
-/// leaves them: each gap at most [`GAP_MAX`] characters of space, tab, LF, CR, VT, FF and NEL,
+/// A held value of at least [`SPLIT_MIN`] characters is hidden also when gaps sit inside it,
+/// as a tool that wraps to the terminal's width or colours part of a word leaves them, and is
+/// then matched on its characters that are no gap: each gap at most [`GAP_MAX`] characters of space, tab, LF, CR, VT, FF and NEL,
 /// the other C0 and C1 controls and DEL, the bidi and zero-width characters U+200B to U+200F,
 /// U+202A to U+202E, U+2066 to U+2069 and U+FEFF ([`is_gap`]; no other white space, bidi or
 /// zero-width character), and whole escape sequences. Any other value is hidden only whole.
@@ -215,8 +215,8 @@ pub fn hide_known(text: &str, secrets: &dyn Secrets) -> String {
     }
 }
 
-/// A held value with this many characters that are no gap, or more, is hidden also with gaps
-/// inside it. A shorter one could too easily be put together from pieces of text that merely
+/// A held value this many characters long, or longer, is hidden also with gaps inside it. A
+/// shorter one could too easily be put together from pieces of text that merely
 /// sit near each other, so it is hidden only whole.
 const SPLIT_MIN: usize = 16;
 
@@ -224,8 +224,8 @@ const SPLIT_MIN: usize = 16;
 const GAP_MAX: usize = 32;
 
 /// `text` with each span that holds one of `values` as `***`, read in one pass. Every value is
-/// looked for whole. One with at least [`SPLIT_MIN`] characters that are no gap is looked for
-/// also as those characters with gaps between them ([`Split`]). Spans that overlap are hidden
+/// looked for whole. One of at least [`SPLIT_MIN`] characters is looked for also as its
+/// characters that are no gap, with gaps between them ([`Split`]). Spans that overlap are hidden
 /// as one. `work` counts the characters read and the matchers' steps, so a test can bound them.
 fn hide_values(text: &str, values: &[String], work: &mut usize) -> String {
     let values = values.iter().filter(|value| !value.is_empty());
@@ -234,8 +234,9 @@ fn hide_values(text: &str, values: &[String], work: &mut usize) -> String {
         .map(|value| (Pattern::new(value), 0))
         .collect();
     let mut split: Vec<Split> = values
+        .filter(|value| value.chars().count() >= SPLIT_MIN)
         .map(|value| value.chars().filter(|c| !is_gap(*c)).collect::<String>())
-        .filter(|kept| kept.chars().count() >= SPLIT_MIN)
+        .filter(|kept| !kept.is_empty())
         .map(|kept| Split::new(&kept))
         .collect();
     let mut spans: Vec<(usize, usize)> = Vec::new();
@@ -281,7 +282,8 @@ fn hide_values(text: &str, values: &[String], work: &mut usize) -> String {
 /// both ways: with the introducer alone as a gap, and with the whole sequence as one. Partial
 /// matches of the same length are one, the one with the shorter gap since its last character
 /// kept, so there is at most one for each length from none to the whole value, and the text
-/// is read once.
+/// is read once. Each holds the places of the characters it has matched and no others, so
+/// what a `Split` holds is bounded by its value, never by the text.
 struct Split {
     pattern: Pattern,
     /// The partial matches at the character being read.
@@ -289,23 +291,16 @@ struct Split {
     /// Partial matches that took a whole escape sequence as a gap, with the byte offset of
     /// the character after it, where they go on.
     waiting: Vec<(usize, State)>,
-    /// The characters the partial matches have kept, each as its byte offset and the index of
-    /// the one kept before it: one list that partial matches with a common past share. A
-    /// character no partial match goes on from is not kept, and the list is emptied whenever
-    /// no partial match is left.
-    kept: Vec<(usize, usize)>,
 }
 
 /// One partial match of a [`Split`].
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct State {
-    /// How many of the value's first characters it has matched.
-    matched: usize,
+    /// The byte offset of each character of the value it has matched, in order: as many as
+    /// it has matched.
+    kept: VecDeque<usize>,
     /// The characters of gap since the last character it kept.
     gap: usize,
-    /// The index in [`Split::kept`] of the last character it kept; `usize::MAX` when it has
-    /// matched none.
-    last: usize,
 }
 
 impl Split {
@@ -313,12 +308,10 @@ impl Split {
         Self {
             pattern: Pattern::new(value),
             states: vec![State {
-                matched: 0,
+                kept: VecDeque::new(),
                 gap: 0,
-                last: usize::MAX,
             }],
             waiting: Vec::new(),
-            kept: Vec::new(),
         }
     }
 
@@ -347,29 +340,24 @@ impl Split {
             *work += 1;
             if is_gap(c) {
                 if let Some((bytes, chars)) = escape {
-                    self.waiting.push((at + bytes, gapped(state, chars)));
+                    *work += state.kept.len();
+                    self.waiting
+                        .push((at + bytes, gapped(state.clone(), chars)));
                 }
                 state = gapped(state, 1);
             } else {
-                state.matched = self.pattern.next(state.matched, c, work);
+                let matched = self.pattern.next(state.kept.len(), c, work);
                 state.gap = 0;
-                if state.matched == 0 {
-                    state.last = usize::MAX;
-                } else {
-                    self.kept.push((at, state.last));
-                    state.last = self.kept.len() - 1;
+                state.kept.push_back(at);
+                while state.kept.len() > matched {
+                    *work += 1;
+                    state.kept.pop_front();
                 }
-                if state.matched == self.pattern.value.len() {
-                    spans.push((self.start(state.last, work), at + c.len_utf8()));
+                if matched == self.pattern.value.len() {
+                    spans.push((state.kept[0], at + c.len_utf8()));
                 }
             }
             self.insert(state);
-        }
-        // With no partial match left, nothing kept can be part of a match any more.
-        if self.states.iter().all(|state| state.matched == 0)
-            && self.waiting.iter().all(|(_, state)| state.matched == 0)
-        {
-            self.kept.clear();
         }
     }
 
@@ -378,7 +366,7 @@ impl Split {
         match self
             .states
             .iter_mut()
-            .find(|held| held.matched == state.matched)
+            .find(|held| held.kept.len() == state.kept.len())
         {
             Some(held) if state.gap < held.gap => *held = state,
             Some(_) => {}
@@ -386,14 +374,12 @@ impl Split {
         }
     }
 
-    /// The byte offset of the first character of the match whose last kept character is at
-    /// index `last` of [`Self::kept`].
-    fn start(&self, mut last: usize, work: &mut usize) -> usize {
-        for _ in 1..self.pattern.value.len() {
-            *work += 1;
-            last = self.kept[last].1;
-        }
-        self.kept[last].0
+    /// How many places of matched characters the partial matches hold, waiting ones too.
+    #[cfg(test)]
+    fn held(&self) -> usize {
+        let waiting = self.waiting.iter().map(|(_, state)| state.kept.len());
+        let states = self.states.iter().map(|state| state.kept.len());
+        waiting.chain(states).sum()
     }
 }
 
@@ -402,9 +388,8 @@ impl Split {
 fn gapped(mut state: State, chars: usize) -> State {
     state.gap += chars;
     if state.gap > GAP_MAX {
-        state.matched = 0;
+        state.kept.clear();
         state.gap = 0;
-        state.last = usize::MAX;
     }
     state
 }
