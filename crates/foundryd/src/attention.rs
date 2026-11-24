@@ -212,19 +212,24 @@ pub trait Marks: Send + Sync {
 ///
 /// A change is read from the setting's stamp, which every edit of it renews, so a factory
 /// turned off and on between two reads of the list still counts from the read that finds the
-/// new stamp. A project whose setting is first read here counts from when this was made, as
-/// [`Freshness`] counts a project never heard from. So a factory turned on before this
-/// machine's first read since it started is counted from the start, and any edit of a
-/// project's factory setting, a new login too, starts its count again at the next read.
+/// new stamp. A project whose setting is there at the first read counts from when this was
+/// made, as [`Freshness`] counts a project never heard from; one whose setting first appears
+/// at a later read counts from that read. So a factory turned on before this machine's first
+/// read since it started is counted from the start, a factory setting that arrives later is
+/// not idle for the time before it arrived, and any edit of a project's factory setting, a
+/// new login too, starts its count again at the next read.
 pub struct Quiet {
     clock: Arc<dyn Clock>,
     freshness: Arc<Freshness>,
     /// The clock's reading when this was made.
     made: Duration,
-    /// Each project's factory setting as last read: its stamp, and the clock's reading its
-    /// count starts from.
-    seen: Mutex<BTreeMap<ProjectId, (Option<Stamp>, Duration)>>,
+    /// Each project's factory setting as last read. `None` until the first read.
+    seen: Mutex<Option<Counts>>,
 }
+
+/// Each project's factory setting as [`Quiet`] last read it: its stamp, and the clock's reading
+/// its count starts from.
+type Counts = BTreeMap<ProjectId, (Option<Stamp>, Duration)>;
 
 impl Quiet {
     /// Reads `freshness`, which must count on `clock`.
@@ -234,7 +239,7 @@ impl Quiet {
             clock,
             freshness,
             made,
-            seen: Mutex::new(BTreeMap::new()),
+            seen: Mutex::new(None),
         }
     }
 
@@ -246,18 +251,22 @@ impl Quiet {
     ) -> BTreeMap<ProjectId, Duration> {
         let now = self.clock.now();
         let mut seen = lock(&self.seen);
+        // A setting there at the first read counts from when this was made; one that appears
+        // later, from the read that first finds it.
+        let first_seen = if seen.is_some() { now } else { self.made };
+        let seen = seen.get_or_insert_with(Counts::new);
         seen.retain(|project, _| settings.project_factory.contains_key(project));
         for project in settings.project_factory.keys() {
             let key = StampKey::Setting(SettingKey::ProjectFactory(*project));
             let stamp = settings.stamps.get(&key).copied();
-            let held = seen.entry(*project).or_insert((stamp, self.made));
+            let held = seen.entry(*project).or_insert((stamp, first_seen));
             if held.0 != stamp {
                 *held = (stamp, now);
             }
         }
         on.iter()
             .map(|project| {
-                let since = seen.get(project).map_or(self.made, |(_, since)| *since);
+                let since = seen.get(project).map_or(first_seen, |(_, since)| *since);
                 let quiet = now.saturating_sub(since);
                 (*project, quiet.min(self.freshness.since_holding(*project)))
             })
