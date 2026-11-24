@@ -9,8 +9,9 @@
 //! Only a tracker built with a hider can post a comment: the comment writes are on
 //! [`Commenting`], which [`Hiding`] implements and a bare [`Gh`] or [`FakeTracker`] does not.
 //! Every comment body goes through the hider and then `text::for_comment`, and the factory's
-//! own markers are added after both. The factory builds its tracker with a hider that calls
-//! `secrets::hide_known` on the machine's store.
+//! own markers are added after both. Nothing in the daemon builds a [`Hiding`] yet: the run
+//! code that will (tasks 22 and on) is to pass a hider that calls `secrets::hide_known` on the
+//! machine's store (task 7), and neither that function nor that code exists today.
 
 pub mod fake;
 pub mod gh;
@@ -36,8 +37,9 @@ pub use write::{
     Claim, IssueComment, MARKER, STATUS_MARKER, claim_comment, claim_marker, newest_claim,
 };
 
-/// Hides the secrets it knows in text that is about to leave the machine: the factory's is
-/// `secrets::hide_known` over the machine's secret store, read at the time of each call.
+/// Hides the secrets it knows in text that is about to leave the machine. The factory's is to
+/// be `secrets::hide_known` over the machine's secret store, read at the time of each call;
+/// that function and the code that passes it are not written yet.
 pub type Hider = Arc<dyn Fn(&str) -> String + Send + Sync>;
 
 /// A tracker built with a hider: `gh` as the tracker it wraps, and every comment body through
@@ -285,8 +287,14 @@ pub trait Tracker: Send + Sync {
 }
 
 /// A tracker that may post comments: one built with a hider. Every body goes through
-/// [`Commenting::hide`] and then `text::for_comment`, and the marker is added after both. In the
-/// daemon only [`Hiding`] implements it, so a tracker built without a hider cannot post:
+/// [`Commenting::hide`] and then `text::for_comment`, and the marker is added after both.
+///
+/// A post is not idempotent. An error once `gh` has run, a [`TrackerError::Timeout`] above all,
+/// does not say whether GitHub made the comment, so posting again can post it twice. A caller
+/// that must not double a comment reads [`Tracker::issue_comments`] before it posts again: for a
+/// claim, [`newest_claim`] says whether its marker is already there.
+///
+/// In the daemon only [`Hiding`] implements it, so a tracker built without a hider cannot post:
 ///
 /// ```compile_fail
 /// use foundryd::factory::github::{Commenting, FakeTracker};

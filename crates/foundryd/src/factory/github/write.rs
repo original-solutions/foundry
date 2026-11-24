@@ -175,7 +175,7 @@ struct UserRow {
 fn comments_call(repo: &str, issue: u64) -> Vec<String> {
     vec![
         "api".into(),
-        format!("repos/{repo}/issues/{issue}/comments"),
+        format!("repos/{repo}/issues/{issue}/comments?per_page=100"),
         "--paginate".into(),
     ]
 }
@@ -497,7 +497,7 @@ mod tests {
     fn list_comments_call() -> Vec<String> {
         args(&[
             "api",
-            "repos/rawphp/softfac/issues/6/comments",
+            "repos/rawphp/softfac/issues/6/comments?per_page=100",
             "--paginate",
         ])
     }
@@ -1022,6 +1022,24 @@ mod tests {
     }
 
     #[test]
+    fn of_several_status_comments_by_the_login_the_first_listed_is_patched() {
+        // The runner takes the first in the listing: not the last, and not the highest or
+        // lowest id.
+        let listing = "[{\"id\":20,\"user\":{\"login\":\"rawphp\"},\"body\":\"a\\n\\n<!-- softfac:status -->\"},{\"id\":10,\"user\":{\"login\":\"rawphp\"},\"body\":\"b\\n\\n<!-- softfac:status -->\"},{\"id\":30,\"user\":{\"login\":\"rawphp\"},\"body\":\"c\\n\\n<!-- softfac:status -->\"}]";
+        let fake = FakeTracker::answering([Answer::ok(listing), Answer::ok("{}")]);
+        plain(&fake)
+            .upsert_status_comment(REPO, 6, "rawphp", "s")
+            .unwrap();
+        assert_eq!(
+            fake.calls(),
+            vec![
+                list_comments_call(),
+                patch_call("20", "s\n\n<!-- softfac:status -->"),
+            ]
+        );
+    }
+
+    #[test]
     fn a_status_marker_posted_by_someone_else_is_not_adopted() {
         let listing = "[{\"id\":10,\"user\":{\"login\":\"stranger\"},\"created_at\":\"2026-10-04T10:13:16Z\",\"body\":\"gotcha\\n\\n<!-- softfac:status -->\"},{\"id\":11,\"user\":null,\"created_at\":\"2026-10-04T10:14:16Z\",\"body\":\"ghost\\n\\n<!-- softfac:status -->\"}]";
         let fake = FakeTracker::answering([Answer::ok(listing), Answer::ok("")]);
@@ -1120,7 +1138,9 @@ mod tests {
         assert!(is_parse(&error), "{error}");
         let message = error.to_string();
         assert!(
-            message.starts_with("`gh api repos/rawphp/softfac/issues/6/comments --paginate`"),
+            message.starts_with(
+                "`gh api repos/rawphp/softfac/issues/6/comments?per_page=100 --paginate`"
+            ),
             "{message}"
         );
         assert!(message.contains("output was empty"), "{message}");
@@ -1207,7 +1227,7 @@ mod tests {
     // Hiding what a comment carries.
     // -----------------------------------------------------------------------------------------
 
-    /// A hider that knows one secret, as `secrets::hide_known` knows the machine's tokens.
+    /// A hider that knows one secret, in place of the store-backed hider the run code will pass.
     fn hider() -> Hider {
         Arc::new(|text: &str| text.replace("hunter2", "[known]"))
     }
