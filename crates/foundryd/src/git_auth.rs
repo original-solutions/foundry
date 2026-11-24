@@ -212,11 +212,11 @@ mod tests {
     use std::ffi::OsString;
     use std::fs;
     use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
-    use std::process::{Command, Stdio};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::process::{Child, Command, Output, Stdio};
 
     use super::*;
-    use crate::secrets::MemorySecrets;
+    use crate::secrets::{Edit, MemorySecrets};
 
     const LOGIN: &str = "rawphp";
     const TOKEN: &str = "ghp_madeUpToken1234567890abcdefABCDEF";
@@ -232,32 +232,48 @@ mod tests {
         GitAuth::for_login(&secrets_with(LOGIN, TOKEN), LOGIN, data_dir).unwrap()
     }
 
+    /// Writes an executable `sh` script at `path`.
+    fn script(path: &Path, body: &str) {
+        fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Spawns `command`, again while the OS says its program is still open for writing:
+    /// another test's child can hold a script this test just wrote until that child execs.
+    fn spawn(command: &mut Command) -> Child {
+        for _ in 0..50 {
+            match command.spawn() {
+                Err(error) if error.raw_os_error() == Some(nix::errno::Errno::ETXTBSY as i32) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                spawned => return spawned.unwrap(),
+            }
+        }
+        panic!("the program stayed busy");
+    }
+
     /// What a fake git saw: its arguments, one per line, and its environment.
     struct Seen {
         argv: String,
         env: BTreeMap<String, String>,
     }
 
-    /// Runs a fake git through `sh`, with `auth` applied and then `args`, and gives back what
-    /// it saw. `sh <script>` takes the script's arguments as git takes its own, so the order
-    /// of the hardening and the subcommand is what a real git would get.
+    /// Runs a fake git, with `auth` applied and then `args`, and gives back what it saw.
     fn run_fake_git(auth: &GitAuth, args: &[&str]) -> Seen {
         let dir = tempfile::tempdir().unwrap();
-        let script = dir.path().join("git");
+        let git = dir.path().join("git");
         let out = dir.path().join("out");
-        fs::write(
-            &script,
-            format!(
-                "printf '%s\\n' \"$@\" > '{out}.argv'\nenv -0 > '{out}.env'\n",
+        script(
+            &git,
+            &format!(
+                "printf '%s\\n' \"$@\" > '{out}.argv'\nenv -0 > '{out}.env'",
                 out = out.display()
             ),
-        )
-        .unwrap();
-        let mut command = Command::new("sh");
-        command.arg(&script);
+        );
+        let mut command = Command::new(&git);
         auth.apply(&mut command);
-        let status = command.args(args).status().unwrap();
-        assert!(status.success());
+        command.args(args);
+        assert!(spawn(&mut command).wait().unwrap().success());
         let argv = fs::read_to_string(format!("{}.argv", out.display())).unwrap();
         let env = fs::read(format!("{}.env", out.display())).unwrap();
         let env = env
@@ -272,52 +288,108 @@ mod tests {
         Seen { argv, env }
     }
 
-    fn git(dir: &Path, home: &Path, args: &[&str]) -> Command {
-        let mut command = Command::new("git");
-        command
-            .current_dir(dir)
-            .env("HOME", home)
-            .env_remove("XDG_CONFIG_HOME")
-            .env_remove("GIT_CONFIG_GLOBAL")
-            .env_remove("GIT_CONFIG_NOSYSTEM")
-            .env_remove("GIT_CONFIG_PARAMETERS")
-            .env_remove("GIT_CONFIG_COUNT")
-            .args(args);
-        command
+    /// A machine for real git: a home whose global config, and a system config, each name a
+    /// `store` helper that holds `OTHER_TOKEN` for github.com, and a repository whose own
+    /// config names that helper too, once for every host and once for github.com.
+    struct Machine {
+        _root: tempfile::TempDir,
+        home: PathBuf,
+        system: PathBuf,
+        repo: PathBuf,
+        helper: String,
     }
 
-    /// A home whose global config has a `store` helper that holds `OTHER_TOKEN` for
-    /// github.com, and a repository in it whose own config names that helper too.
-    fn home_with_a_helper(root: &Path) -> (PathBuf, PathBuf) {
-        let home = root.join("home");
-        fs::create_dir(&home).unwrap();
-        let store = home.join(".git-credentials");
-        fs::write(
-            &store,
-            format!("https://someone-else:{OTHER_TOKEN}@github.com\n"),
-        )
-        .unwrap();
-        let helper = format!("store --file={}", store.display());
-        fs::write(
-            home.join(".gitconfig"),
-            format!("[credential]\n\thelper = {helper}\n"),
-        )
-        .unwrap();
-        let repo = root.join("repo");
-        fs::create_dir(&repo).unwrap();
-        assert!(
-            git(&repo, &home, &["init", "-q"])
-                .status()
-                .unwrap()
-                .success()
-        );
-        assert!(
-            git(&repo, &home, &["config", "credential.helper", &helper])
-                .status()
-                .unwrap()
-                .success()
-        );
-        (home, repo)
+    impl Machine {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let home = root.path().join("home");
+            fs::create_dir(&home).unwrap();
+            let store = root.path().join("git-credentials");
+            fs::write(
+                &store,
+                format!("https://someone-else:{OTHER_TOKEN}@github.com\n"),
+            )
+            .unwrap();
+            let helper = format!("store --file={}", store.display());
+            let config = format!("[credential]\n\thelper = {helper}\n");
+            fs::write(home.join(".gitconfig"), &config).unwrap();
+            let system = root.path().join("system-gitconfig");
+            fs::write(&system, &config).unwrap();
+            let repo = root.path().join("repo");
+            fs::create_dir(&repo).unwrap();
+            let machine = Machine {
+                home,
+                system,
+                repo,
+                helper,
+                _root: root,
+            };
+            machine.git_ok(&["init", "-q"]);
+            machine.git_ok(&["config", "credential.helper", &machine.helper]);
+            machine.git_ok(&[
+                "config",
+                "credential.https://github.com.helper",
+                &machine.helper,
+            ]);
+            machine
+        }
+
+        /// git in the repository, with this machine's home and system config and nothing
+        /// from the test's own environment that changes which config git reads.
+        fn git(&self, args: &[&str]) -> Command {
+            let mut command = Command::new("git");
+            command
+                .current_dir(&self.repo)
+                .env("HOME", &self.home)
+                .env("GIT_CONFIG_SYSTEM", &self.system)
+                .env_remove("XDG_CONFIG_HOME")
+                .env_remove("GIT_CONFIG_GLOBAL")
+                .env_remove("GIT_CONFIG_NOSYSTEM")
+                .env_remove("GIT_CONFIG_PARAMETERS")
+                .env_remove("GIT_CONFIG_COUNT")
+                .env_remove("GIT_ASKPASS")
+                .env_remove("SSH_ASKPASS")
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .args(args);
+            command
+        }
+
+        fn git_ok(&self, args: &[&str]) {
+            assert!(self.git(args).status().unwrap().success(), "git {args:?}");
+        }
+
+        /// The same environment as [`Machine::git`], for a command `apply` hardens, which
+        /// must have no arguments yet.
+        fn hardened(&self, auth: &GitAuth) -> Command {
+            let mut command = self.git(&[]);
+            auth.apply(&mut command);
+            command
+        }
+    }
+
+    /// Asks `git credential fill`, given as a command with no `stdin` set, for `host` over
+    /// HTTPS.
+    fn fill(command: &mut Command, host: &str) -> Output {
+        command
+            .args(["credential", "fill"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = spawn(command);
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(format!("protocol=https\nhost={host}\n\n").as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    }
+
+    /// Which of the two tokens `out` holds, and never the text itself, so no assertion prints
+    /// a credential that a real helper may have given.
+    fn tokens_in(out: &Output) -> (bool, bool) {
+        let text = String::from_utf8_lossy(&out.stdout);
+        (text.contains(TOKEN), text.contains(OTHER_TOKEN))
     }
 
     #[test]
@@ -345,6 +417,12 @@ mod tests {
                 "protocol.ext.allow=never",
                 "-c",
                 "core.alternateRefsCommand=",
+                "-c",
+                "protocol.allow=never",
+                "-c",
+                "protocol.https.allow=always",
+                "-c",
+                "http.sslVerify=true",
                 "fetch",
                 "--",
                 "origin",
@@ -363,6 +441,32 @@ mod tests {
         ] {
             assert_eq!(seen.env.get(key).map(String::as_str), Some(value), "{key}");
         }
+    }
+
+    #[test]
+    fn a_local_fetch_is_allowed_only_when_asked_for() {
+        let data = tempfile::tempdir().unwrap();
+        let plain = run_fake_git(&auth(data.path()), &["fetch"]);
+        assert!(
+            !plain.argv.contains("protocol.file.allow"),
+            "{}",
+            plain.argv
+        );
+        let local = run_fake_git(&auth(data.path()).allow_file_transport(), &["fetch"]);
+        let argv: Vec<&str> = local.argv.lines().collect();
+        assert_eq!(
+            argv[argv.len() - 3..],
+            ["-c", "protocol.file.allow=always", "fetch"]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "before any argument")]
+    fn apply_refuses_a_command_that_already_has_arguments() {
+        let data = tempfile::tempdir().unwrap();
+        let mut command = Command::new("git");
+        command.arg("clone");
+        auth(data.path()).apply(&mut command);
     }
 
     #[test]
@@ -389,15 +493,37 @@ mod tests {
         let mut command = Command::new("true");
         command
             .env("GIT_CONFIG_PARAMETERS", "'credential.helper'='osxkeychain'")
-            .env("GIT_CONFIG_COUNT", "1");
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_SSL_NO_VERIFY", "1");
         auth.apply(&mut command);
         let envs: BTreeMap<OsString, Option<OsString>> = command
             .get_envs()
             .map(|(key, value)| (key.to_owned(), value.map(ToOwned::to_owned)))
             .collect();
-        for key in ["GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"] {
+        for key in [
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_CONFIG_COUNT",
+            "GIT_SSL_NO_VERIFY",
+        ] {
             assert_eq!(envs.get(&OsString::from(key)), Some(&None), "{key}");
         }
+    }
+
+    #[test]
+    fn askpass_env_names_the_script_and_the_token_and_nothing_else() {
+        let data = tempfile::tempdir().unwrap();
+        let env = auth(data.path()).askpass_env();
+        let askpass = data.path().join(ASKPASS);
+        assert_eq!(
+            env,
+            [
+                (
+                    "GIT_ASKPASS".to_owned(),
+                    askpass.to_str().unwrap().to_owned()
+                ),
+                (TOKEN_VAR.to_owned(), TOKEN.to_owned()),
+            ]
+        );
     }
 
     #[test]
@@ -414,7 +540,7 @@ mod tests {
     }
 
     #[test]
-    fn the_askpass_script_answers_the_password_prompt_with_the_token_of_its_child() {
+    fn the_askpass_script_answers_github_over_https_and_no_other_prompt() {
         let data = tempfile::tempdir().unwrap();
         auth(data.path());
         let askpass = data.path().join(ASKPASS);
@@ -425,60 +551,78 @@ mod tests {
                 .env(TOKEN_VAR, TOKEN)
                 .output()
                 .unwrap();
-            assert!(out.status.success());
-            String::from_utf8(out.stdout).unwrap()
+            (out.status.success(), String::from_utf8(out.stdout).unwrap())
         };
         assert_eq!(
             ask("Password for 'https://x-access-token@github.com': "),
-            format!("{TOKEN}\n")
+            (true, format!("{TOKEN}\n"))
         );
         assert_eq!(
             ask("Username for 'https://github.com': "),
-            "x-access-token\n"
+            (true, "x-access-token\n".to_owned())
         );
+        for prompt in [
+            "Password for 'https://x-access-token@evil.example': ",
+            "Password for 'https://x-access-token@github.com.evil.example': ",
+            "Password for 'https://x-access-token@evil.example/@github.com': ",
+            "Password for 'http://x-access-token@github.com': ",
+            "Password for 'https://someone@github.com': ",
+            "Username for 'https://evil.example': ",
+            "Are you sure you want to continue connecting (yes/no)? ",
+            "",
+        ] {
+            let (ok, out) = ask(prompt);
+            assert!(!ok, "{prompt:?} was answered");
+            assert_eq!(out, "", "{prompt:?}");
+        }
     }
 
     #[test]
-    fn real_git_gets_the_token_from_askpass_and_not_from_a_global_or_repo_helper() {
-        let root = tempfile::tempdir().unwrap();
-        let (home, repo) = home_with_a_helper(root.path());
-        // The setup works: without the hardening, the helper answers with its own token.
-        let unhardened = git(&repo, &home, &["credential", "fill"])
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let answer = fill(unhardened);
-        assert!(answer.contains(OTHER_TOKEN), "{answer}");
+    fn real_git_gets_the_token_from_askpass_and_from_no_helper_of_any_config() {
+        let machine = Machine::new();
+        // The setup works: without the hardening, a helper answers with its own token.
+        let unhardened = fill(&mut machine.git(&[]), "github.com");
+        assert_eq!(tokens_in(&unhardened), (false, true), "no helper answered");
 
         let data = tempfile::tempdir().unwrap();
-        let auth = auth(data.path());
-        let mut command = Command::new("git");
-        command.current_dir(&repo).env("HOME", &home);
-        auth.apply(&mut command);
-        let hardened = command
-            .args(["credential", "fill"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let answer = fill(hardened);
-        assert!(answer.contains(&format!("password={TOKEN}\n")), "{answer}");
-        assert!(!answer.contains(OTHER_TOKEN), "{answer}");
+        let hardened = fill(&mut machine.hardened(&auth(data.path())), "github.com");
+        assert!(hardened.status.success(), "{:?}", hardened.status);
+        assert_eq!(tokens_in(&hardened), (true, false));
+        assert!(String::from_utf8_lossy(&hardened.stdout).contains("username=x-access-token\n"));
     }
 
-    /// Asks `git credential fill`, already started, for github.com over HTTPS.
-    fn fill(mut child: std::process::Child) -> String {
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(b"protocol=https\nhost=github.com\n\n")
-            .unwrap();
-        let out = child.wait_with_output().unwrap();
-        assert!(out.status.success(), "{out:?}");
-        String::from_utf8(out.stdout).unwrap()
+    #[test]
+    fn real_git_gives_the_token_to_no_host_but_github() {
+        let machine = Machine::new();
+        let data = tempfile::tempdir().unwrap();
+        let out = fill(&mut machine.hardened(&auth(data.path())), "evil.example");
+        assert!(!out.status.success(), "{:?}", out.status);
+        assert_eq!(tokens_in(&out), (false, false));
+    }
+
+    #[test]
+    fn a_command_the_repos_config_names_never_runs_with_the_token() {
+        let machine = Machine::new();
+        let dir = tempfile::tempdir().unwrap();
+        let spy = dir.path().join("spy");
+        let seen = dir.path().join("seen");
+        fs::write(&spy, format!("env > '{}'\nexit 1\n", seen.display())).unwrap();
+        let spy_command = format!("sh {}", spy.display());
+        machine.git_ok(&["config", "core.sshCommand", &spy_command]);
+        machine.git_ok(&["config", "core.gitProxy", &spy_command]);
+        machine.git_ok(&["config", "remote.origin.url", "ssh://example.invalid/x.git"]);
+        machine.git_ok(&["config", "remote.plain.url", "git://example.invalid/x.git"]);
+        let data = tempfile::tempdir().unwrap();
+        let auth = auth(data.path());
+        for remote in ["origin", "plain"] {
+            let out = machine
+                .hardened(&auth)
+                .args(["fetch", "--", remote])
+                .output()
+                .unwrap();
+            assert!(!out.status.success(), "{remote}");
+            assert!(!seen.exists(), "{remote}: the repo's command ran");
+        }
     }
 
     #[test]
@@ -492,6 +636,32 @@ mod tests {
         let blank = secrets_with(LOGIN, "  \n");
         let error = GitAuth::for_login(&blank, LOGIN, data.path()).unwrap_err();
         assert!(matches!(error, NoToken::Unset { .. }), "{error:?}");
+        assert!(!data.path().join(ASKPASS).exists());
+    }
+
+    /// A store whose every read fails.
+    struct Unreadable;
+
+    impl Secrets for Unreadable {
+        fn get(&self, _: &str) -> Result<Option<String>, SecretsError> {
+            Err(SecretsError::Unreadable {
+                path: PathBuf::from("/secrets.json"),
+            })
+        }
+        fn set(&self, _: &str, _: &str) -> Result<(), SecretsError> {
+            unreachable!()
+        }
+        fn update(&self, _: &str, _: Edit<'_>) -> Result<(), SecretsError> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn a_store_that_cannot_be_read_is_a_store_error_and_nothing_is_written() {
+        let data = tempfile::tempdir().unwrap();
+        let error = GitAuth::for_login(&Unreadable, LOGIN, data.path()).unwrap_err();
+        assert!(matches!(error, NoToken::Store { .. }), "{error:?}");
+        assert!(error.to_string().contains(LOGIN), "{error}");
         assert!(!data.path().join(ASKPASS).exists());
     }
 
@@ -530,7 +700,7 @@ mod tests {
     }
 
     #[test]
-    fn neither_the_debug_form_nor_an_error_shows_the_token() {
+    fn the_debug_form_shows_the_login_and_not_the_token() {
         let data = tempfile::tempdir().unwrap();
         let shown = format!("{:?}", auth(data.path()));
         assert!(!shown.contains(TOKEN), "{shown}");
@@ -538,27 +708,57 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_askpass_script_is_replaced() {
+    fn an_askpass_script_as_it_should_be_is_left_as_it_is() {
         let data = tempfile::tempdir().unwrap();
-        let askpass = data.path().join(ASKPASS);
-        fs::write(&askpass, "#!/bin/sh\necho stale\n").unwrap();
-        fs::set_permissions(&askpass, fs::Permissions::from_mode(0o777)).unwrap();
         auth(data.path());
-        let meta = fs::symlink_metadata(&askpass).unwrap();
-        assert_eq!(meta.permissions().mode() & 0o7777, 0o700);
-        assert!(fs::read_to_string(&askpass).unwrap().contains(TOKEN_VAR));
+        let askpass = data.path().join(ASKPASS);
+        let before = fs::symlink_metadata(&askpass).unwrap().ino();
+        auth(data.path());
+        assert_eq!(fs::symlink_metadata(&askpass).unwrap().ino(), before);
+    }
+
+    #[test]
+    fn an_askpass_script_with_another_mode_or_content_is_replaced() {
+        let data = tempfile::tempdir().unwrap();
+        auth(data.path());
+        let askpass = data.path().join(ASKPASS);
+        let script = fs::read(&askpass).unwrap();
+        for (mode, content) in [
+            (0o755, script.clone()),
+            (0o700, b"#!/bin/sh\necho stale\n".to_vec()),
+        ] {
+            fs::remove_file(&askpass).unwrap();
+            fs::write(&askpass, &content).unwrap();
+            fs::set_permissions(&askpass, fs::Permissions::from_mode(mode)).unwrap();
+            auth(data.path());
+            let meta = fs::symlink_metadata(&askpass).unwrap();
+            assert_eq!(meta.permissions().mode() & 0o7777, 0o700, "{mode:o}");
+            assert_eq!(fs::read(&askpass).unwrap(), script, "{mode:o}");
+        }
     }
 
     #[test]
     fn a_symlink_in_place_of_the_askpass_script_is_replaced_not_followed() {
         let data = tempfile::tempdir().unwrap();
-        let target = data.path().join("elsewhere");
-        fs::write(&target, "left alone\n").unwrap();
-        std::os::unix::fs::symlink(&target, data.path().join(ASKPASS)).unwrap();
         auth(data.path());
-        assert_eq!(fs::read_to_string(&target).unwrap(), "left alone\n");
-        let meta = fs::symlink_metadata(data.path().join(ASKPASS)).unwrap();
-        assert!(meta.file_type().is_file());
+        let askpass = data.path().join(ASKPASS);
+        // A link to a copy of the script itself, 0700, is still not the script.
+        let target = data.path().join("elsewhere");
+        fs::rename(&askpass, &target).unwrap();
+        let held = fs::read(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &askpass).unwrap();
+        auth(data.path());
+        assert!(
+            fs::symlink_metadata(&askpass)
+                .unwrap()
+                .file_type()
+                .is_file()
+        );
+        assert_eq!(fs::read(&target).unwrap(), held);
+        assert_eq!(
+            fs::symlink_metadata(&target).unwrap().permissions().mode() & 0o7777,
+            0o700
+        );
     }
 
     #[test]
@@ -585,72 +785,91 @@ mod tests {
     }
 
     #[test]
-    fn helpers_off_env_holds_no_token() {
-        let env = helpers_off_env();
-        assert!(!env.is_empty());
+    fn helpers_off_env_holds_no_token_and_blanks_every_askpass() {
+        let env: BTreeMap<String, String> = helpers_off_env().into_iter().collect();
+        for key in [TOKEN_VAR, "GH_TOKEN", "GITHUB_TOKEN"] {
+            assert!(!env.contains_key(key), "{key}");
+        }
         for (key, value) in &env {
-            assert!(
-                !matches!(
-                    key.as_str(),
-                    TOKEN_VAR | "GIT_ASKPASS" | "GH_TOKEN" | "GITHUB_TOKEN"
-                ),
-                "{key}"
-            );
             assert!(!value.contains(TOKEN), "{key}");
+        }
+        for (key, value) in [
+            ("GIT_ASKPASS", ""),
+            ("SSH_ASKPASS", ""),
+            ("GIT_TERMINAL_PROMPT", "0"),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+            ("GIT_CONFIG_GLOBAL", "/dev/null"),
+            ("GIT_CONFIG_COUNT", "0"),
+            ("GIT_CONFIG_PARAMETERS", ""),
+        ] {
+            assert_eq!(env.get(key).map(String::as_str), Some(value), "{key}");
         }
     }
 
     #[test]
-    fn helpers_off_env_leaves_git_no_credential_helper_from_the_global_config() {
-        let root = tempfile::tempdir().unwrap();
-        let (home, repo) = home_with_a_helper(root.path());
-        // The repo's own helper is the repo's; only the global one is the machine's.
-        assert!(
-            git(&repo, &home, &["config", "--unset", "credential.helper"])
-                .status()
-                .unwrap()
-                .success()
-        );
+    fn helpers_off_env_leaves_git_no_credential_helper_from_the_global_or_system_config() {
+        let machine = Machine::new();
+        // The repository's own helpers are not the machine's config; these are.
+        machine.git_ok(&["config", "--unset", "credential.helper"]);
+        machine.git_ok(&["config", "--unset", "credential.https://github.com.helper"]);
         let get = |env: &[(String, String)]| {
-            let out = git(&repo, &home, &["config", "--get-all", "credential.helper"])
+            let out = machine
+                .git(&["config", "--get-all", "credential.helper"])
                 .envs(env.iter().map(|(key, value)| (key, value)))
                 .output()
                 .unwrap();
             String::from_utf8(out.stdout).unwrap()
         };
-        assert!(get(&[]).starts_with("store"), "the setup has no helper");
+        let helper = &machine.helper;
+        assert_eq!(get(&[]), format!("{helper}\n{helper}\n"), "the setup");
+        for (key, value) in [
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+            ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ] {
+            let one = [(key.to_owned(), value.to_owned())];
+            assert_eq!(get(&one), format!("{helper}\n"), "{key} alone");
+        }
         assert_eq!(get(&helpers_off_env()), "");
     }
 
     #[test]
-    fn helpers_off_env_keeps_a_terminals_git_from_asking_anyone() {
-        let root = tempfile::tempdir().unwrap();
-        let (home, repo) = home_with_a_helper(root.path());
-        assert!(
-            git(&repo, &home, &["config", "--unset", "credential.helper"])
-                .status()
-                .unwrap()
-                .success()
-        );
-        let child = git(&repo, &home, &["credential", "fill"])
-            .envs(helpers_off_env())
-            .env_remove("GIT_ASKPASS")
-            .env_remove("SSH_ASKPASS")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut child = child;
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(b"protocol=https\nhost=github.com\n\n")
-            .unwrap();
-        let out = child.wait_with_output().unwrap();
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(!out.status.success(), "{stdout}");
-        assert!(!stdout.contains(OTHER_TOKEN), "{stdout}");
+    fn helpers_off_env_keeps_a_terminals_git_from_an_askpass_or_helper_it_inherits() {
+        let machine = Machine::new();
+        machine.git_ok(&["config", "--unset", "credential.helper"]);
+        machine.git_ok(&["config", "--unset", "credential.https://github.com.helper"]);
+        let dir = tempfile::tempdir().unwrap();
+        let answers = dir.path().join("answers");
+        script(&answers, &format!("printf '%s\\n' '{OTHER_TOKEN}'"));
+        let answers = answers.to_str().unwrap().to_owned();
+        let helper = machine.helper.clone();
+        let inherited: [&[(&str, &str)]; 4] = [
+            &[("GIT_ASKPASS", &answers)],
+            &[("SSH_ASKPASS", &answers)],
+            &[
+                ("GIT_CONFIG_COUNT", "1"),
+                ("GIT_CONFIG_KEY_0", "credential.helper"),
+                ("GIT_CONFIG_VALUE_0", &helper),
+            ],
+            &[(
+                "GIT_CONFIG_PARAMETERS",
+                &format!("'credential.helper'='{helper}'"),
+            )],
+        ];
+        for env in inherited {
+            // In the daemon's environment, with the global and system config off.
+            let terminal = || {
+                let mut command = machine.git(&[]);
+                command
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .envs(env.iter().copied());
+                command
+            };
+            let unguarded = fill(&mut terminal(), "github.com");
+            assert_eq!(tokens_in(&unguarded), (false, true), "{env:?}: the setup");
+            let guarded = fill(terminal().envs(helpers_off_env()), "github.com");
+            assert!(!guarded.status.success(), "{env:?}");
+            assert_eq!(tokens_in(&guarded), (false, false), "{env:?}");
+        }
     }
 }
