@@ -764,13 +764,29 @@ impl Inner {
                     base,
                 } => {
                     // Git refuses a branch that is already there, by any spelling it reads as
-                    // the same.
-                    self.git(
-                        &clone,
-                        "branch",
-                        ["--quiet", "--no-track", "--", branch, start],
-                    )
-                    .await?;
+                    // the same: on a disk that ignores case or Unicode normalization, a name the
+                    // listing above did not match can still be another branch's ref file. Git
+                    // then resolves the ref by this spelling too, so the refusal is the
+                    // branch's, not a failure of git.
+                    let branch_made = self
+                        .git(
+                            &clone,
+                            "branch",
+                            ["--quiet", "--no-track", "--", branch, start],
+                        )
+                        .await;
+                    if let Err(error) = branch_made {
+                        return Err(
+                            if self
+                                .has_ref(&clone, &format!("refs/heads/{branch}"))
+                                .await?
+                            {
+                                WorkspaceError::BranchExists(branch.clone())
+                            } else {
+                                error
+                            },
+                        );
+                    }
                     branched = Some(Branched {
                         reference: format!("refs/heads/{branch}"),
                         made_at: start.clone(),
