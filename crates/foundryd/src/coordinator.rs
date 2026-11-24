@@ -2052,35 +2052,38 @@ mod tests {
 
     #[test]
     fn a_protocol_4_relay_after_the_update_cannot_hide_a_split_between_copies_stored_before_it() {
-        // A and C hold the copy stored before this build, and are split; B, on protocol 4,
-        // reaches both.
+        // Machines A and C hold the copy stored before this build, and are split; a protocol 4
+        // machine reaches both. A sets the factory settings to 5 and C to 6.
+        let c_id = id(3);
+        let shows_both = |out: &SharedSettings| {
+            let item = &out.overwritten[&SettingKey::Factory];
+            let kept = out.factory.clone().expect("one side holds");
+            let lost = if kept == factory_settings(5) { 6 } else { 5 };
+            assert_eq!(item.kept, Some(SettingValue::Factory(kept)));
+            assert_eq!(item.lost, Some(factory_value(lost)));
+        };
         let (held, _) = stored_held_and_behind();
         let a = numbered(&held, &set_factory(5), id(A));
-        // B passes A's `seen` to C before C edits.
-        let b = merge(&a.for_protocol(4), &held.for_protocol(4));
-        let c = took_from_protocol_4(&held, &b);
+        // The relay passes A's `seen` to C before C edits.
+        let relay = merge(&a.for_protocol(4), &held.for_protocol(4));
+        let c = took_from_protocol_4(&held, &relay);
         assert!(c.seen[&id(A)] >= 4, "{:?}", c.seen);
         assert_eq!(*c.factory_seen, [(id(8), 2), (id(9), 3)].into());
-        let c = numbered(&c, &set_factory(6), id(B));
+        let c = numbered(&c, &set_factory(6), c_id);
         // And C's back to A.
-        let b = merge(&b, &c.for_protocol(4));
-        let a = took_from_protocol_4(&a, &b);
+        let relay = merge(&relay, &c.for_protocol(4));
+        let a = took_from_protocol_4(&a, &relay);
         assert_eq!(a.factory, Some(factory_settings(5)));
+        shows_both(&merged(&a, &c));
 
-        let out = merged(&a, &c);
-
-        let item = &out.overwritten[&SettingKey::Factory];
-        let (kept, lost) = (out.factory.clone().unwrap(), item.lost.clone());
-        assert_eq!(item.kept, Some(SettingValue::Factory(kept.clone())));
-        let other = if kept == factory_settings(5) { 6 } else { 5 };
-        assert_eq!(lost, Some(factory_value(other)));
-
-        // The same when both edit before B passes anything on.
+        // The same when both edit before the relay passes anything on.
         let a = numbered(&held, &set_factory(5), id(A));
-        let c = numbered(&held, &set_factory(6), id(B));
-        let b = merge(&a.for_protocol(4), &c.for_protocol(4));
-        let out = merged(&took_from_protocol_4(&a, &b), &took_from_protocol_4(&c, &b));
-        assert!(out.overwritten.contains_key(&SettingKey::Factory));
+        let c = numbered(&held, &set_factory(6), c_id);
+        let relay = merge(&a.for_protocol(4), &c.for_protocol(4));
+        shows_both(&merged(
+            &took_from_protocol_4(&a, &relay),
+            &took_from_protocol_4(&c, &relay),
+        ));
     }
 
     #[test]
