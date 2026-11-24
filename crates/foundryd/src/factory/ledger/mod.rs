@@ -1886,6 +1886,32 @@ mod tests {
     }
 
     #[test]
+    fn a_secret_split_by_a_control_character_is_hidden_in_the_data_too() {
+        let (_dir, store) = open_store();
+        let token = "ghp_0123456789abcdefghij";
+        let hide: Hide = std::sync::Arc::new(move |text: &str| text.replace(token, "***"));
+        let ledger =
+            Ledger::new(store.clone(), MachineId::random(), 1, hide).with_wall(ticking(T0, 1000));
+        let written = ledger
+            .write(
+                &run(8),
+                &stuck("setup failed:\nexport T=ghp_0123456789\u{0007}abcdefghij\ndone"),
+                &test_cause(),
+            )
+            .unwrap();
+        let stored = serde_json::to_string(&held(&store, &run(8))).unwrap();
+        for text in [serde_json::to_string(&written).unwrap(), stored] {
+            assert!(!text.contains("ghp_"), "{text}");
+            assert!(!text.contains("abcdefghij"), "{text}");
+        }
+        // Output with no secret in it keeps its lines and control characters.
+        let written = ledger
+            .write(&run(8), &stuck("one\ntwo\u{0007}"), &test_cause())
+            .unwrap();
+        assert_eq!(written.data["reason"], json!("one\ntwo\u{0007}"));
+    }
+
+    #[test]
     fn the_ledger_lists_and_counts_the_runs_its_store_holds() {
         let (_dir, store) = open_store();
         let ledger = ledger(&store, MachineId::random(), 1, ticking(T0, 1000));
