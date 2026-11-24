@@ -280,7 +280,8 @@ fn hide_values(text: &str, values: &[String], work: &mut usize) -> String {
 /// be the value's own (`ESC a`, `CSI 9 j`), so at each introducer every partial match goes on
 /// both ways: with the introducer alone as a gap, and with the whole sequence as one. Partial
 /// matches of the same length are one, the one with the shorter gap since its last character
-/// kept, so there are never more than the value has characters, and the text is read once.
+/// kept, so there is at most one for each length from none to the whole value, and the text
+/// is read once.
 struct Split {
     pattern: Pattern,
     /// The partial matches at the character being read.
@@ -289,7 +290,9 @@ struct Split {
     /// the character after it, where they go on.
     waiting: Vec<(usize, State)>,
     /// The characters the partial matches have kept, each as its byte offset and the index of
-    /// the one kept before it: one list that partial matches with a common past share.
+    /// the one kept before it: one list that partial matches with a common past share. A
+    /// character no partial match goes on from is not kept, and the list is emptied whenever
+    /// no partial match is left.
     kept: Vec<(usize, usize)>,
 }
 
@@ -300,7 +303,8 @@ struct State {
     matched: usize,
     /// The characters of gap since the last character it kept.
     gap: usize,
-    /// The index in [`Split::kept`] of the last character it kept.
+    /// The index in [`Split::kept`] of the last character it kept; `usize::MAX` when it has
+    /// matched none.
     last: usize,
 }
 
@@ -349,13 +353,23 @@ impl Split {
             } else {
                 state.matched = self.pattern.next(state.matched, c, work);
                 state.gap = 0;
-                self.kept.push((at, state.last));
-                state.last = self.kept.len() - 1;
+                if state.matched == 0 {
+                    state.last = usize::MAX;
+                } else {
+                    self.kept.push((at, state.last));
+                    state.last = self.kept.len() - 1;
+                }
                 if state.matched == self.pattern.value.len() {
                     spans.push((self.start(state.last, work), at + c.len_utf8()));
                 }
             }
             self.insert(state);
+        }
+        // With no partial match left, nothing kept can be part of a match any more.
+        if self.states.iter().all(|state| state.matched == 0)
+            && self.waiting.iter().all(|(_, state)| state.matched == 0)
+        {
+            self.kept.clear();
         }
     }
 
@@ -390,6 +404,7 @@ fn gapped(mut state: State, chars: usize) -> State {
     if state.gap > GAP_MAX {
         state.matched = 0;
         state.gap = 0;
+        state.last = usize::MAX;
     }
     state
 }
