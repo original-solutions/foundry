@@ -68,9 +68,16 @@ pub trait Secrets: Send + Sync {
     fn update(&self, name: &str, edit: Edit<'_>) -> Result<(), SecretsError>;
     /// The names of the secrets held, sorted, and never a value. The default, for a store that
     /// cannot list its names, gives [`SecretsError::CannotList`]; a store that can list but
-    /// fails to read gives its read error. Neither is ever taken for an empty store:
-    /// [`hide_known`] then fails closed and the held record writes nothing.
+    /// fails to read gives its read error. Neither is ever taken for an empty store: the held
+    /// record then writes nothing.
     fn names(&self) -> Result<Vec<String>, SecretsError> {
+        Err(SecretsError::CannotList)
+    }
+    /// Every secret held, names and values, read in one go, so all of them come from one
+    /// state of the store. [`hide_known`] reads this once per call. The default, for a store
+    /// that cannot list its names, gives [`SecretsError::CannotList`], and an error is never
+    /// taken for an empty store: [`hide_known`] then fails closed.
+    fn entries(&self) -> Result<BTreeMap<String, String>, SecretsError> {
         Err(SecretsError::CannotList)
     }
 }
@@ -198,22 +205,20 @@ pub fn hide_known(text: &str, secrets: &dyn Secrets) -> String {
     }
 }
 
-/// The values of the secrets `hide_known` hides, none of them empty.
+/// The values of the secrets `hide_known` hides, none of them empty, from one read of the
+/// store.
 fn known_values(secrets: &dyn Secrets) -> Result<Vec<String>, SecretsError> {
-    let mut names = vec![GATEWAY.to_owned(), GATEWAY_MANAGEMENT.to_owned()];
-    names.extend(
-        secrets
-            .names()?
-            .into_iter()
-            .filter(|name| name.starts_with(GITHUB_PREFIX)),
-    );
-    let mut values = Vec::new();
-    for name in names {
-        if let Some(value) = secrets.get(&name)?.filter(|value| !value.is_empty()) {
-            values.push(value);
-        }
-    }
-    Ok(values)
+    Ok(secrets
+        .entries()?
+        .into_iter()
+        .filter(|(name, value)| {
+            !value.is_empty()
+                && (name == GATEWAY
+                    || name == GATEWAY_MANAGEMENT
+                    || name.starts_with(GITHUB_PREFIX))
+        })
+        .map(|(_, value)| value)
+        .collect())
 }
 
 /// The secret store this machine uses: the file `secrets.json` in `home`, readable only by the
@@ -326,7 +331,8 @@ fn move_secrets(old: &dyn OldStore, new: &FileSecrets) -> Result<(), SecretsErro
 pub enum SetError {
     #[error(
         "the name is not a secret to set here; the names are {GATEWAY}, {GATEWAY_MANAGEMENT} and \
-         {GITHUB_PREFIX}<login>, where a login is letters, digits and -, at most 39 characters"
+         {GITHUB_PREFIX}<login>, where a login is letters, digits and -, at most {LOGIN_MAX} \
+         characters"
     )]
     // No field: the refused name may be a token pasted in place of a login, so it is never quoted.
     UnknownName,
@@ -375,7 +381,7 @@ pub fn github_default_command(login: &str) -> ExitCode {
         // The argument is not echoed: it may be a token pasted in place of a login.
         eprintln!(
             "foundryd github default: the argument is not a GitHub login; a login is letters, \
-             digits and -, at most 39 characters"
+             digits and -, at most {LOGIN_MAX} characters"
         );
         return ExitCode::FAILURE;
     }
@@ -543,6 +549,10 @@ impl Secrets for FileSecrets {
     fn names(&self) -> Result<Vec<String>, SecretsError> {
         Ok(self.read()?.into_keys().collect())
     }
+
+    fn entries(&self) -> Result<BTreeMap<String, String>, SecretsError> {
+        self.read()
+    }
 }
 
 /// An exclusive lock on the file at `path`, made 0600 with its directory (0700, as `foundryd
@@ -653,6 +663,10 @@ impl Secrets for MemorySecrets {
 
     fn names(&self) -> Result<Vec<String>, SecretsError> {
         Ok(self.lock().keys().cloned().collect())
+    }
+
+    fn entries(&self) -> Result<BTreeMap<String, String>, SecretsError> {
+        Ok(self.lock().clone())
     }
 }
 
