@@ -114,6 +114,32 @@ impl Remote {
     }
 }
 
+/// A script in `dir` that stands in for git: it appends to `git-calls.log` there, per call,
+/// whether `FOUNDRY_GIT_TOKEN` is set (never its value), the folder and the arguments, then runs
+/// the git found before the wrapper was in place.
+fn git_wrapper(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let real = Command::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .unwrap();
+    let real = String::from_utf8(real.stdout).unwrap();
+    let script = dir.join("git-wrapper.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nif [ -n \"$FOUNDRY_GIT_TOKEN\" ]; then t=token; else t=none; fi\n\
+             printf '%s\\t%s\\t%s\\n' \"$t\" \"$(pwd -P)\" \"$*\" >> '{}'\n\
+             exec '{}' \"$@\"\n",
+            dir.join("git-calls.log").display(),
+            real.trim()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    script
+}
+
 /// A data directory, the daemon parts workspaces need, and a folder for remotes. Dropping it
 /// closes every holder left under the data directory, so no test leaves a process behind.
 struct Setup {
@@ -132,15 +158,26 @@ impl Setup {
 
     /// Terminals started with the holder binary at `holder`, and git calls given `git_within`.
     fn with(holder: PathBuf, git_within: Duration) -> Self {
-        Self::build(holder, git_within, None)
+        Self::build(holder, git_within, None, false)
+    }
+
+    /// A setup whose git calls are logged, as [`Setup::git_calls`] reads them, and whose
+    /// workspaces read GitHub tokens from `secrets`.
+    fn with_git_log(secrets: Option<Arc<dyn Secrets>>) -> Self {
+        Self::build(holder(), GIT_WITHIN, secrets, true)
     }
 
     /// A setup whose workspaces read GitHub tokens from `secrets`.
     fn with_secrets(secrets: Arc<dyn Secrets>) -> Self {
-        Self::build(holder(), GIT_WITHIN, Some(secrets))
+        Self::build(holder(), GIT_WITHIN, Some(secrets), false)
     }
 
-    fn build(holder: PathBuf, git_within: Duration, secrets: Option<Arc<dyn Secrets>>) -> Self {
+    fn build(
+        holder: PathBuf,
+        git_within: Duration,
+        secrets: Option<Arc<dyn Secrets>>,
+        log_git: bool,
+    ) -> Self {
         // A Unix socket path is at most about 100 bytes, which the system's own temporary
         // folder on macOS would take most of.
         let data = tempfile::Builder::new()
@@ -163,6 +200,11 @@ impl Setup {
             Some(secrets) => workspaces.with_secrets(secrets),
             None => workspaces,
         };
+        let workspaces = if log_git {
+            workspaces.with_git(&git_wrapper(data.path()))
+        } else {
+            workspaces
+        };
         Setup {
             data,
             remotes: tempfile::tempdir().unwrap(),
@@ -171,6 +213,24 @@ impl Setup {
             terminals,
             workspaces,
         }
+    }
+
+    /// Every git call a [`Setup::with_git_log`] setup made, oldest first: whether it held the
+    /// token, the folder it ran in, and its arguments.
+    fn git_calls(&self) -> Vec<(bool, PathBuf, String)> {
+        let log =
+            std::fs::read_to_string(self.data.path().join("git-calls.log")).unwrap_or_default();
+        log.lines()
+            .map(|line| {
+                let mut parts = line.splitn(3, '\t');
+                let (token, dir, args) = (parts.next(), parts.next(), parts.next());
+                (
+                    token == Some("token"),
+                    PathBuf::from(dir.unwrap()),
+                    args.unwrap_or_default().to_owned(),
+                )
+            })
+            .collect()
     }
 
     /// A project in the shared settings whose remote has `files` on `main`.
@@ -4117,9 +4177,15 @@ async fn the_same_tag_and_name_twice_make_one_workspace() {
         )
     };
     let first = make().await.unwrap();
+    let clone = setup.clone_of(remote.project);
+    let fetched = git(&clone, &["rev-parse", "refs/remotes/origin/main"]);
     // The remote moves on: an answer from the first does not even fetch.
     remote.push("main", &[("NEW.md", "new\n")]);
     let second = make().await.unwrap();
+    assert_eq!(
+        git(&clone, &["rev-parse", "refs/remotes/origin/main"]),
+        fetched
+    );
 
     assert_eq!(first, second);
     assert_eq!(setup.workspace_records().len(), 1);
@@ -4235,15 +4301,8 @@ async fn a_tag_whose_workspace_was_archived_answers_for_nothing() {
     assert_ne!(first, second);
 }
 
-/// The value the terminal's `env` printed for `name`, if it printed one.
-fn env_value(screen: &str, name: &str) -> Option<String> {
-    screen
-        .lines()
-        .find_map(|l| l.strip_prefix(&format!("{name}=")).map(str::to_owned))
-}
-
 #[tokio::test]
-async fn a_factory_workspaces_setup_terminal_holds_no_token_and_no_askpass() {
+async fn a_factory_workspaces_setup_terminal_environment_holds_no_token_and_no_askpass() {
     const TOKEN: &str = "ghp_madeUpToken1234567890abcdefABCDEF";
     let secrets = Arc::new(MemorySecrets::default());
     secrets.set("github:rawphp", TOKEN).unwrap();
@@ -4266,13 +4325,14 @@ async fn a_factory_workspaces_setup_terminal_holds_no_token_and_no_askpass() {
     let screen = setup.screen(terminal.id).await;
     assert!(screen.contains("PATH="), "env printed nothing: {screen:?}");
     assert!(!screen.contains(TOKEN), "{screen:?}");
-    assert!(!screen.contains("FOUNDRY_GIT_TOKEN"), "{screen:?}");
-    for name in ["GIT_ASKPASS", "GH_TOKEN", "GITHUB_TOKEN"] {
-        assert_eq!(env_value(&screen, name).unwrap_or_default(), "", "{name}");
+    // The variables are there, as `helpers_off_env` sets them: empty, so git and gh take none.
+    let lines: Vec<&str> = screen.lines().map(str::trim_end).collect();
+    for want in ["GIT_ASKPASS=", "GH_TOKEN=", "GH_CONFIG_DIR=/dev/null"] {
+        assert!(lines.contains(&want), "no line {want:?} in {screen:?}");
     }
-    assert_eq!(
-        env_value(&screen, "GIT_CONFIG_GLOBAL").as_deref(),
-        Some("/dev/null")
+    assert!(
+        !lines.iter().any(|l| l.starts_with("FOUNDRY_GIT_TOKEN=")),
+        "{screen:?}"
     );
 }
 
@@ -4296,13 +4356,8 @@ async fn a_factory_project_with_no_token_is_refused_and_nothing_is_made() {
     assert!(setup.folders(remote.project).is_empty());
     assert!(setup.workspace_records().is_empty());
     assert!(!setup.data.path().join("fetches").exists());
-    if setup.clone_of(remote.project).exists() {
-        let branches = git(
-            &setup.clone_of(remote.project),
-            &["for-each-ref", "--format=%(refname)", "refs/heads/"],
-        );
-        assert_eq!(branches, "");
-    }
+    // The token is looked for before the clone is made, so there is none to hold a branch.
+    assert!(!setup.clone_of(remote.project).exists());
 
     // With no secret store at all, the same.
     let setup = Setup::new();
@@ -4311,6 +4366,7 @@ async fn a_factory_project_with_no_token_is_refused_and_nothing_is_made() {
     let err = setup.workspaces.create(remote.project, "main", "run").await;
     assert!(matches!(err, Err(WorkspaceError::NoToken(_))), "{err:?}");
     assert!(setup.workspace_records().is_empty());
+    assert!(!setup.clone_of(remote.project).exists());
 }
 
 #[tokio::test]
@@ -4642,4 +4698,329 @@ async fn a_marker_that_cannot_be_parsed_is_skipped_and_logged() {
         .unwrap();
 
     assert!(logs.text().contains(&broken), "{}", logs.text());
+}
+#[tokio::test]
+async fn a_fetch_repo_made_for_one_repo_forgets_its_branches_once_the_project_moves() {
+    let secrets = Arc::new(MemorySecrets::default());
+    secrets
+        .set("github:rawphp", "ghp_madeUpToken1234567890abcdefABCDEF")
+        .unwrap();
+    let setup = Setup::with_secrets(secrets);
+    let old = setup.project(&[("README.md", "old\n")]);
+    old.push("only-old", &[("OLD.md", "old\n")]);
+    setup.factory_on(old.project, "rawphp");
+    setup.create(&old, "main", "before").await;
+    let new = other_repo(&setup, "new\n");
+    {
+        let mut store = setup.store.lock().unwrap();
+        let mut settings = store.settings().unwrap();
+        settings.seq += 1;
+        let project = settings
+            .projects
+            .iter_mut()
+            .find(|p| p.id == old.project)
+            .unwrap();
+        project.repo = new.to_string_lossy().into_owned();
+        assert!(store.apply_settings(settings).unwrap());
+    }
+
+    let id = setup.create(&old, "main", "after").await;
+    assert_eq!(
+        readme(&setup.workspaces.worktree(id).await.unwrap()),
+        "new\n"
+    );
+    // The old repo's branch came through neither repo again.
+    let err = setup
+        .workspaces
+        .create(old.project, "only-old", "stale")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, WorkspaceError::UnknownBase(b) if b == "only-old"),
+        "{err}"
+    );
+}
+
+const TOKEN: &str = "ghp_testtokenvalue0123456789abcdef";
+
+fn secrets_with_token() -> Arc<MemorySecrets> {
+    let secrets = Arc::new(MemorySecrets::default());
+    secrets.set("github:rawphp", TOKEN).unwrap();
+    secrets
+}
+
+/// Settings with `project`'s repo at `repo`.
+fn move_repo(setup: &Setup, project: ProjectId, repo: &str) {
+    let mut store = setup.store.lock().unwrap();
+    let mut settings = store.settings().unwrap();
+    settings.seq += 1;
+    settings
+        .projects
+        .iter_mut()
+        .find(|p| p.id == project)
+        .unwrap()
+        .repo = repo.to_owned();
+    assert!(store.apply_settings(settings).unwrap());
+}
+
+#[tokio::test]
+async fn only_the_token_fetch_in_the_fetch_repo_carries_the_token() {
+    let setup = Setup::with_git_log(Some(secrets_with_token()));
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    setup.factory_on(remote.project, "rawphp");
+    let id = setup
+        .make(
+            &remote,
+            "run",
+            new_branch("main", "fac/3-1"),
+            Provision::None,
+            tag(remote.project, "run"),
+        )
+        .await
+        .unwrap();
+    setup.workspaces.archive(id, false).await.unwrap();
+
+    let data = std::fs::canonicalize(setup.data.path()).unwrap();
+    let calls = setup.git_calls();
+    let with: Vec<_> = calls.iter().filter(|(token, ..)| *token).collect();
+    assert_eq!(with.len(), 1, "{calls:#?}");
+    let (_, dir, args) = with[0];
+    assert_eq!(
+        dir,
+        &data.join("fetches").join(format!("{}.git", remote.project))
+    );
+    assert!(args.contains(" fetch --quiet "), "{args}");
+    assert!(!args.contains(TOKEN), "{args}");
+    // Every call in the shared clone or a worktree has none, and there were some.
+    let shared: Vec<_> = calls
+        .iter()
+        .filter(|(_, dir, _)| {
+            dir.starts_with(data.join("clones")) || dir.starts_with(data.join("worktrees"))
+        })
+        .collect();
+    assert!(shared.len() > 3, "{calls:#?}");
+    assert!(shared.iter().all(|(token, ..)| !token), "{shared:#?}");
+}
+
+#[tokio::test]
+async fn a_project_whose_factory_is_off_but_has_a_login_works_as_before_and_no_call_has_the_token()
+{
+    // No secret store at all: the factory is off, so no token is wanted.
+    let setup = Setup::with_git_log(None);
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    {
+        let mut store = setup.store.lock().unwrap();
+        let mut settings = store.settings().unwrap();
+        settings.seq += 1;
+        settings.project_factory.insert(
+            remote.project,
+            ProjectFactory {
+                on: false,
+                login: "rawphp".into(),
+                paused: false,
+            },
+        );
+        assert!(store.apply_settings(settings).unwrap());
+    }
+
+    let id = setup.create(&remote, "main", "run").await;
+
+    assert!(
+        setup
+            .workspaces
+            .worktree(id)
+            .await
+            .unwrap()
+            .join("README.md")
+            .exists()
+    );
+    assert!(!setup.data.path().join("fetches").exists());
+    let calls = setup.git_calls();
+    assert!(!calls.is_empty());
+    assert!(calls.iter().all(|(token, ..)| !token), "{calls:#?}");
+}
+
+#[tokio::test]
+async fn a_token_fetch_that_fails_never_shows_the_token() {
+    let logs = Logged::everywhere();
+    let setup = Setup::with_secrets(secrets_with_token());
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    setup.factory_on(remote.project, "rawphp");
+    move_repo(&setup, remote.project, "/no/such/place/repo.git");
+
+    let err = setup
+        .workspaces
+        .create(remote.project, "main", "run")
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            &err,
+            WorkspaceError::Git {
+                command: "fetch",
+                ..
+            }
+        ),
+        "{err}"
+    );
+    assert!(!err.to_string().contains(TOKEN), "{err}");
+    assert!(!format!("{err:?}").contains(TOKEN), "{err:?}");
+    assert!(!logs.text().contains(TOKEN));
+    assert!(setup.workspace_records().is_empty());
+}
+
+#[tokio::test]
+async fn two_creates_of_one_tag_and_name_at_once_make_one_workspace() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let make = || {
+        setup.make(
+            &remote,
+            "run",
+            new_branch("main", "fac/4-1"),
+            commands(&["true"], 30),
+            tag(remote.project, "run"),
+        )
+    };
+
+    let (a, b) = tokio::join!(make(), make());
+
+    let (a, b) = (a.unwrap(), b.unwrap());
+    assert_eq!(a, b);
+    assert_eq!(setup.workspace_records().len(), 1);
+    let mut want = vec![a.to_string(), format!("{a}.factory")];
+    want.sort();
+    assert_eq!(setup.folders(remote.project), want);
+    assert_eq!(setup.terminals_of(a).len(), 1);
+}
+
+#[tokio::test]
+async fn a_folder_a_p1_workspace_left_makes_a_new_branch_of_its_name_fail_and_stays() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let legacy = setup.legacy(remote.project, "old-work");
+    std::fs::create_dir_all(&legacy).unwrap();
+    std::fs::write(legacy.join("notes.txt"), "mine\n").unwrap();
+
+    let err = setup
+        .make(
+            &remote,
+            "again",
+            new_branch("main", "old-work"),
+            Provision::Own,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(&err, WorkspaceError::BranchExists(b) if b == "old-work"),
+        "{err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(legacy.join("notes.txt")).unwrap(),
+        "mine\n"
+    );
+    assert_eq!(setup.folders(remote.project), ["old-work"]);
+    assert!(setup.workspace_records().is_empty());
+}
+
+#[tokio::test]
+async fn a_command_that_ended_in_time_leaves_no_watcher_behind() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup
+        .make(
+            &remote,
+            "quick",
+            new_branch("main", "quick"),
+            commands(&["true"], 3187),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let terminal = setup.setup_ended(id).await;
+    assert_eq!(terminal.exit_code, Some(0));
+    // The watcher is stopped as the terminal ends; the kill is asynchronous.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let left = Setup::processes_with("sleep 3187");
+        if left.is_empty() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "left running: {left:?}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn an_empty_list_of_commands_is_no_setup() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup
+        .make(
+            &remote,
+            "none",
+            new_branch("main", "none"),
+            commands(&[], 30),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(setup.body(id).setup, None);
+    assert!(setup.terminals_of(id).is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_tagged_create_takes_its_marker_back() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let first = setup.create(&remote, "main", "first").await;
+
+    // The store cannot make its journal in a folder it may not write, after the marker is.
+    let mode = |m| {
+        std::fs::set_permissions(setup.data.path(), std::fs::Permissions::from_mode(m)).unwrap()
+    };
+    mode(0o500);
+    let err = setup
+        .make(
+            &remote,
+            "second",
+            new_branch("main", "fac/5-2"),
+            Provision::Own,
+            tag(remote.project, "run"),
+        )
+        .await;
+    mode(0o700);
+
+    assert!(matches!(err, Err(WorkspaceError::Store(_))), "{err:?}");
+    assert_eq!(setup.folders(remote.project), [first.to_string()]);
+}
+
+#[tokio::test]
+async fn a_folder_of_worktrees_that_cannot_be_read_fails_a_tagged_create() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let sha = setup.remote_at(&remote, "refs/heads/main");
+    // Not a folder: what lists no marker is no reason to make a second workspace.
+    let worktrees = setup.data.path().join("worktrees");
+    std::fs::create_dir_all(&worktrees).unwrap();
+    std::fs::write(worktrees.join(remote.project.to_string()), "").unwrap();
+
+    let err = setup
+        .make(
+            &remote,
+            "a",
+            commit_of(&sha),
+            Provision::None,
+            tag(remote.project, "run"),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, WorkspaceError::Io(_)), "{err:?}");
+    assert!(setup.workspace_records().is_empty());
 }
