@@ -13,6 +13,7 @@ use foundry_proto::messages::{PROTOCOL, PeerMessage};
 use foundry_proto::record::AnyRecord;
 use foundry_proto::settings::Machine;
 use foundry_proto::state::{SessionState, TerminalState};
+use foundryd::sync::factory::FACTORY_BATCH_BYTES;
 use foundryd::sync::ws::{WsDialer, router};
 use foundryd::sync::{BATCH, Conn, Dialer, OFFLINE_AFTER, Peers, RETRY_REFUSED};
 use futures::future::BoxFuture;
@@ -1231,4 +1232,43 @@ async fn factory_changes_rises_for_a_record_from_a_peer_and_for_one_this_machine
         .await
         .expect("no change within 5 s of its own record")
         .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_factory_catch_up_of_large_run_events_goes_in_messages_a_link_can_carry() {
+    let peer = MachineId::random();
+    let fleet = Fleet::start_with(1, &[peer]);
+    let a = &fleet.daemons[0];
+    let run = RunId::new("original-solutions/foundry", 132, 1).unwrap();
+    // Each event keeps a gate's 64 KB of output: a batch of them is far past what a WebSocket
+    // end takes in one message.
+    let total = 200;
+    for i in 0..total {
+        let mut body = run_event(&run, &format!("gate-{i}"));
+        if let FactoryBody::RunEvent(event) = &mut body {
+            event.data = serde_json::json!({ "output": "x".repeat(64 * 1024) });
+        }
+        write_factory(a, body);
+    }
+
+    let mut conn = raw_link(&a.peers);
+    send(&conn, &hello(PROTOCOL, peer)).await;
+    let mut received = Vec::new();
+    while received.len() < total {
+        let text = timeout(OFFLINE_AFTER * 2, conn.recv.recv())
+            .await
+            .expect("a message within the offline limit")
+            .expect("the link stays open");
+        let _ = conn.send.try_send(heartbeat());
+        let message: serde_json::Value = serde_json::from_str(&text).unwrap();
+        if message["type"] == "factory_records" {
+            assert!(
+                text.len() <= FACTORY_BATCH_BYTES + 1024,
+                "a message of {} bytes",
+                text.len()
+            );
+            received.extend(factory_records_in(&[message]).into_iter().map(|r| r.version));
+        }
+    }
+    assert_eq!(received, (1..=total as u64).collect::<Vec<_>>());
 }
