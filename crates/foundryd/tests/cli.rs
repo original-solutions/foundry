@@ -386,43 +386,89 @@ fn factory_export_never_writes_the_store_even_one_older_than_this_build() {
     assert_eq!(left, ["runs"], "left in the export folder: {left:?}");
 }
 
-/// The store is copied beside itself, in the data directory only its owner can read, never into
-/// the export directory: so an export directory whose name SQLite cannot take still exports.
-#[cfg(unix)]
-#[test]
-fn factory_export_copies_the_store_beside_it_and_not_into_the_export_directory() {
-    use std::os::unix::ffi::OsStrExt as _;
-
-    let home = tempfile::tempdir().unwrap();
-    store_runner_run(&home);
-    let out = tempfile::tempdir().unwrap();
-    let dir = out
-        .path()
-        .join(std::ffi::OsStr::from_bytes(b"not-utf-8-\xff"));
-    if std::fs::create_dir(&dir).is_err() {
-        // This file system refuses a name that is not UTF-8, so no export directory has one.
-        return;
-    }
-
-    let ran = isolated(&["factory", "export"], &home)
-        .arg(&dir)
+/// Runs `foundryd factory export <dir>` with the data directory `home`.
+fn export(home: &tempfile::TempDir, dir: &std::path::Path) -> Output {
+    isolated(&["factory", "export"], home)
+        .arg(dir)
         .output()
-        .expect("foundryd runs");
+        .expect("foundryd runs")
+}
 
+fn assert_exported_runner_run(ran: &Output, dir: &std::path::Path) {
     assert!(
         ran.status.success(),
         "exit: {:?} stderr: {}",
         ran.status,
         words(&ran.stderr)
     );
-    let exported = std::fs::read(dir.join("runs").join(format!("{RUNNER_RUN}.jsonl"))).unwrap();
-    assert!(exported == runner_file());
-    let held: Vec<_> = std::fs::read_dir(home.path())
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-        .filter(|name| name.contains("sqlite"))
-        .collect();
-    assert_eq!(held, ["store.sqlite"], "left beside the store: {held:?}");
+    let exported = std::fs::read(dir.join("runs").join(format!("{RUNNER_RUN}.jsonl")))
+        .expect("the run's file was written");
+    assert!(
+        exported == runner_file(),
+        "exported:\n{}",
+        String::from_utf8_lossy(&exported)
+    );
+}
+
+/// The store is copied in memory, never to a file: an export runs with neither the data
+/// directory nor the export directory open to new files, only its `runs` folder.
+#[cfg(unix)]
+#[test]
+fn factory_export_makes_no_copy_of_the_store_on_disk() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    if nix::unistd::geteuid().is_root() {
+        // Root writes into a folder whatever its mode, so nothing here would be refused.
+        eprintln!("skipped: run as root");
+        return;
+    }
+    let home = tempfile::tempdir().unwrap();
+    store_runner_run(&home);
+    let out = tempfile::tempdir().unwrap();
+    std::fs::create_dir(out.path().join("runs")).unwrap();
+    let mode = |path: &std::path::Path, mode| {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    mode(home.path(), 0o500);
+    mode(out.path(), 0o500);
+
+    let ran = export(&home, out.path());
+
+    mode(home.path(), 0o700);
+    mode(out.path(), 0o700);
+    assert_exported_runner_run(&ran, out.path());
+}
+
+/// A daemon killed in the middle of a write leaves its rollback journal beside the store. The
+/// export still reads the store as it stood before that write, as the daemon will.
+#[test]
+fn factory_export_reads_a_store_a_killed_daemon_left_in_the_middle_of_a_write() {
+    let home = tempfile::tempdir().unwrap();
+    store_runner_run(&home);
+    let live = home.path().join("store.sqlite");
+    let writer = rusqlite::Connection::open(&live).unwrap();
+    writer
+        .execute_batch("CREATE TABLE scratch (x BLOB); PRAGMA cache_size = 2; BEGIN IMMEDIATE;")
+        .unwrap();
+    for _ in 0..200 {
+        writer
+            .execute("INSERT INTO scratch VALUES (zeroblob(4096))", [])
+            .unwrap();
+    }
+    // The store and its journal as a kill at this moment leaves them.
+    let crashed = tempfile::tempdir().unwrap();
+    std::fs::copy(&live, crashed.path().join("store.sqlite")).unwrap();
+    std::fs::copy(
+        home.path().join("store.sqlite-journal"),
+        crashed.path().join("store.sqlite-journal"),
+    )
+    .unwrap();
+    writer.execute_batch("ROLLBACK").unwrap();
+    let out = tempfile::tempdir().unwrap();
+
+    let ran = export(&crashed, out.path());
+
+    assert_exported_runner_run(&ran, out.path());
 }
 
 #[test]

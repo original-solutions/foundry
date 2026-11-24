@@ -226,10 +226,10 @@ mod tests {
     fn a_run_written_by_two_machines_exports_in_generation_order_whatever_their_clocks() {
         let (_a_dir, a) = open_store();
         let (_b_dir, b) = open_store();
-        // The machine that writes at generation 2 has the lower id and a clock an hour behind
-        // the first holder's, and each writer's versions are 1 and 2. So writer order, time
-        // order and version order would each put its events first; only the generation does
-        // not.
+        // The machine that writes at generation 2 has the lower id, a clock an hour behind the
+        // first holder's, and the same versions, 1 and 2; and the exporting store holds its
+        // events before the first holder's arrive. So writer order, time order, version order
+        // and arrival order would each put its events first; only the generation does not.
         let (first, second) = (machine(2), machine(1));
         let earlier = ledger(&a, first, 1, ticking(T0 + HOUR, 1));
         earlier
@@ -238,12 +238,12 @@ mod tests {
         earlier
             .write(&run(7), &step("launched"), &test_cause())
             .unwrap();
-        sync(&a, first, &b);
         let later = ledger(&b, second, 2, ticking(T0, 1));
         later
             .write(&run(7), &step("resumed"), &test_cause())
             .unwrap();
         later.write(&run(7), &step("gated"), &test_cause()).unwrap();
+        sync(&a, first, &b);
         let out = tempfile::tempdir().unwrap();
 
         exported(&b, out.path());
@@ -278,8 +278,9 @@ mod tests {
 
         let error = export(&store.lock().unwrap(), out.path()).unwrap_err();
 
+        let file = out.path().join("runs/rawphp__softfac__7__1.jsonl");
         assert!(
-            error.to_string().contains("rawphp__softfac__7__1.jsonl"),
+            matches!(&error, ExportError::Write { path, .. } if *path == file),
             "error: {error}"
         );
         assert_eq!(names(out.path()), ["rawphp__softfac__7__1.jsonl"]);
@@ -484,5 +485,35 @@ mod tests {
         let error = export(&store.lock().unwrap(), &blocked).unwrap_err();
 
         assert!(error.to_string().contains("blocked"), "error: {error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_planted_where_the_part_file_goes_is_replaced_and_not_written_through() {
+        let (_dir, store) = open_store();
+        put(
+            &store,
+            machine(1),
+            1,
+            &run(7),
+            1,
+            T0,
+            "step_changed",
+            json!({"step": "a"}),
+            None,
+        );
+        let out = tempfile::tempdir().unwrap();
+        let runs = out.path().join("runs");
+        fs::create_dir_all(&runs).unwrap();
+        let theirs = out.path().join("theirs");
+        fs::write(&theirs, "kept\n").unwrap();
+        let part = format!(".rawphp__softfac__7__1.jsonl.{}.part", std::process::id());
+        std::os::unix::fs::symlink(&theirs, runs.join(part)).unwrap();
+
+        exported(&store, out.path());
+
+        assert_eq!(fs::read_to_string(&theirs).unwrap(), "kept\n");
+        assert_eq!(file(out.path(), &run(7)).lines().count(), 1);
+        assert_eq!(names(out.path()), ["rawphp__softfac__7__1.jsonl"]);
     }
 }
