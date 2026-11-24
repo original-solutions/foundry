@@ -286,13 +286,31 @@ mod tests {
     }
 
     fn auth(data_dir: &Path) -> GitAuth {
-        GitAuth::for_login(&secrets_with(LOGIN, TOKEN), LOGIN, data_dir).unwrap()
+        let auth = GitAuth::for_login(&secrets_with(LOGIN, TOKEN), LOGIN, data_dir).unwrap();
+        // A prompt it does not answer, so the run has no effect.
+        settle(Command::new(data_dir.join(ASKPASS)).arg("probe"));
+        auth
     }
 
-    /// Writes an executable `sh` script at `path`.
+    /// Writes an executable `sh` script at `path`, which exits at once when `PROBE` is set.
     fn script(path: &Path, body: &str) {
-        fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::write(
+            path,
+            format!("#!/bin/sh\n[ -z \"$PROBE\" ] || exit 0\n{body}\n"),
+        )
+        .unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        settle(Command::new(path).env("PROBE", "1"));
+    }
+
+    /// Runs `probe`, a script just written, once through [`spawn`]. A child that another test
+    /// forked while the script was open for writing holds it open until that child execs, and
+    /// git cannot run the script meanwhile. Once one run has started, no such child is left,
+    /// and nothing opens the script for writing again, so git can run it from then on.
+    fn settle(probe: &mut Command) {
+        spawn(probe.stdout(Stdio::null()).stderr(Stdio::null()))
+            .wait()
+            .unwrap();
     }
 
     /// Spawns `command`, again while the OS says its program is still open for writing:
@@ -626,13 +644,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let spy = dir.path().join("spy");
         let seen = dir.path().join("seen");
-        fs::write(&spy, format!("env > '{}'\nexit 1\n", seen.display())).unwrap();
-        let spy_command = format!("sh {}", spy.display());
-        let upload_pack = format!("{spy_command}; git-upload-pack");
+        script(&spy, &format!("env > '{}'\nexit 1", seen.display()));
+        // git runs `core.gitProxy` itself and the other two through a shell.
+        let spy_command = spy.to_str().unwrap();
+        let upload_pack = format!("sh {spy_command}; git-upload-pack");
         // The repository turns each transport back on by name, too.
         for (key, value) in [
-            ("core.sshCommand", spy_command.as_str()),
-            ("core.gitProxy", spy_command.as_str()),
+            ("core.sshCommand", spy_command),
+            ("core.gitProxy", spy_command),
             ("protocol.ssh.allow", "always"),
             ("protocol.git.allow", "always"),
             ("protocol.file.allow", "always"),
@@ -642,6 +661,12 @@ mod tests {
             ("remote.local.uploadpack", upload_pack.as_str()),
         ] {
             machine.git_ok(&["config", key, value]);
+        }
+        // The setup works: without the hardening, each remote runs the repository's command.
+        for remote in ["origin", "plain", "local"] {
+            let _ = machine.git(&["fetch", "--", remote]).output().unwrap();
+            assert!(seen.exists(), "{remote}: the setup");
+            fs::remove_file(&seen).unwrap();
         }
         let data = tempfile::tempdir().unwrap();
         let auth = auth(data.path());
@@ -654,6 +679,31 @@ mod tests {
             assert!(!out.status.success(), "{remote}");
             assert!(!seen.exists(), "{remote}: the repo's command ran");
         }
+    }
+
+    #[test]
+    fn a_fetch_from_a_local_repository_needs_the_file_transport_set_after_apply() {
+        let machine = Machine::new();
+        let origin = machine.repo.to_str().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let auth = auth(data.path());
+        let refused = machine
+            .hardened(&auth)
+            .args(["ls-remote", "--", origin])
+            .output()
+            .unwrap();
+        assert!(!refused.status.success());
+        assert!(
+            String::from_utf8_lossy(&refused.stderr).contains("transport 'file' not allowed"),
+            "{refused:?}"
+        );
+        let allowed = machine
+            .hardened(&auth)
+            .env("GIT_ALLOW_PROTOCOL", "https:file")
+            .args(["ls-remote", "--", origin])
+            .output()
+            .unwrap();
+        assert!(allowed.status.success(), "{allowed:?}");
     }
 
     #[test]
@@ -827,6 +877,7 @@ mod tests {
             ("GITHUB_TOKEN", ""),
             ("GH_ENTERPRISE_TOKEN", ""),
             ("GITHUB_ENTERPRISE_TOKEN", ""),
+            ("GH_CONFIG_DIR", "/dev/null"),
             ("GIT_ASKPASS", ""),
             ("SSH_ASKPASS", ""),
             ("GIT_TERMINAL_PROMPT", "0"),
