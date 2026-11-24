@@ -22,7 +22,10 @@
 //! A link in protocol 5 or later ([`foundry_proto::messages::FACTORY_SINCE`]) also carries
 //! factory records ([`super::factory`]): each hello names the factory versions it holds, and
 //! each round sends this machine's new factory records after its P1 records, on a cursor of
-//! their own. An older link carries none, and its P1 catch-up is as it was.
+//! their own. An older link carries none, and its P1 catch-up is as it was. It carries no
+//! factory setting either: the settings it sends are the copy for its protocol, and a copy it
+//! receives leaves the factory settings held here as they are
+//! ([`crate::coordinator::keep_factory`]).
 
 use std::time::Duration;
 
@@ -122,7 +125,9 @@ const DRAIN_POLL: Duration = Duration::from_millis(10);
 
 /// Sends the shared settings this machine holds when a coordinator is set, the link speaks
 /// [`EDITS_SINCE`] or later, and their `seq` is not the one last sent on this link (`last`),
-/// and says whether the link is still open.
+/// and says whether the link is still open. The copy is the one for the link's protocol
+/// ([`foundry_proto::settings::SharedSettings::for_protocol`]), so a peer before
+/// [`foundry_proto::messages::FACTORY_SINCE`] is sent no factory setting.
 async fn send_settings(
     inner: &Inner,
     send: &Sender<String>,
@@ -144,7 +149,7 @@ async fn send_settings(
     let seq = settings.seq;
     let message = PeerMessage::Settings {
         protocol: open.speak,
-        settings,
+        settings: settings.for_protocol(open.speak),
     };
     if !send_message(send, &message).await {
         return false;
