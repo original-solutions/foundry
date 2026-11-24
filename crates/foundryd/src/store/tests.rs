@@ -1508,7 +1508,8 @@ fn p1_reads_never_return_or_count_a_factory_record() {
     for record in every_factory_kind(owner, 50) {
         store.apply_factory(&record, owner).unwrap();
     }
-    // A turn for the owner's session from a second machine is refused, not stored.
+    // A turn for the owner's session from a second machine is stored under a key of its own,
+    // and never reads as the session's turn.
     assert_eq!(
         store
             .apply_factory(
@@ -1516,7 +1517,11 @@ fn p1_reads_never_return_or_count_a_factory_record() {
                 factory_owner,
             )
             .unwrap(),
-        Applied::NotOwner
+        Applied::Stored
+    );
+    assert_eq!(
+        store.session_turn(session_id).unwrap(),
+        Some(turn_body(session_id, 1))
     );
     // And a record the second machine really owns, stored, is still no P1 record.
     assert_eq!(

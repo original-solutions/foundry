@@ -208,8 +208,10 @@ pub struct FactoryKey {
 impl FactoryRecord {
     /// The record's key. Every run event is a record of its own, `<run>/<owner>/<version>`, as
     /// no event is ever rewritten. A status is one per project and writer,
-    /// `<project>/<owner>`. A machine's logins held are keyed by the machine, and a session's
-    /// turn by the session.
+    /// `<project>/<owner>`. A machine's logins held are keyed by the machine. A session's turn
+    /// is one per session and writer, `<session>/<owner>`, so a machine that does not own a
+    /// session never takes the key its owner writes the session's turns under; the reader takes
+    /// the turn of the machine that owns the session's P1 record.
     pub fn key(&self) -> FactoryKey {
         let id = match &self.body {
             FactoryBody::RunEvent(event) => {
@@ -217,7 +219,7 @@ impl FactoryRecord {
             }
             FactoryBody::Status(status) => format!("{}/{}", status.project, self.owner),
             FactoryBody::Held(_) => self.owner.to_string(),
-            FactoryBody::Turn(turn) => turn.session.to_string(),
+            FactoryBody::Turn(turn) => format!("{}/{}", turn.session, self.owner),
         };
         FactoryKey {
             kind: self.body.kind(),
