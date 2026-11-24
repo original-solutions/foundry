@@ -331,7 +331,7 @@ impl Split {
             *work += 1;
             if self.waiting[i].0 == at {
                 let (_, state) = self.waiting.swap_remove(i);
-                self.insert(state);
+                self.insert(state, work);
             } else {
                 i += 1;
             }
@@ -358,17 +358,17 @@ impl Split {
                     spans.push((state.kept[0], at + c.len_utf8()));
                 }
             }
-            self.insert(state);
+            self.insert(state, work);
         }
     }
 
-    /// Adds `state` to the partial matches, as one with any of the same length.
-    fn insert(&mut self, state: State) {
-        match self
-            .states
-            .iter_mut()
-            .find(|held| held.kept.len() == state.kept.len())
-        {
+    /// Adds `state` to the partial matches, as one with any of the same length. `work` counts
+    /// the partial matches looked at.
+    fn insert(&mut self, state: State, work: &mut usize) {
+        match self.states.iter_mut().find(|held| {
+            *work += 1;
+            held.kept.len() == state.kept.len()
+        }) {
             Some(held) if state.gap < held.gap => *held = state,
             Some(_) => {}
             None => self.states.push(state),
@@ -2192,6 +2192,9 @@ mod tests {
             "\u{1b}7",
             "\u{1b}]8;;http://x\u{7}",
             "\u{1b}]8;;\u{1b}\\",
+            "\u{1b}]8;;http://x\n\u{7}",
+            "\u{1b}]0;t\tx\u{1b}\\",
+            "\u{1b}[1 q",
             " \u{1b}[0m\n  ",
         ] {
             hidden_across(gap);
@@ -2270,8 +2273,16 @@ mod tests {
     fn hide_known_does_not_match_across_a_character_that_is_no_gap() {
         let secrets = holding_token();
         let (head, tail) = TOKEN.split_at(20);
-        // `|` prefixes a line, and is no gap; nor is a no-break space or a line separator.
-        for gap in ["\n| ", "\u{a0}", "\u{2028}", "\u{1b}[31", "x"] {
+        // `|` prefixes a line, and is no gap; nor is a no-break space or a line separator. A
+        // control sequence with a parameter after an intermediate is not one whole sequence.
+        for gap in [
+            "\n| ",
+            "\u{a0}",
+            "\u{2028}",
+            "\u{1b}[31",
+            "\u{1b}[1 1q",
+            "x",
+        ] {
             let text = format!("{head}{gap}{tail}");
             assert_eq!(hide_known(&text, &secrets), text, "{gap:?}");
         }
@@ -2392,8 +2403,8 @@ mod tests {
             &hidden[hidden.len() - 80..]
         );
         assert!(!hidden.contains(TOKEN));
-        // Each character is read a bounded number of times for each value, however long the
-        // value: linear in the text, never a pass per place a match could start.
+        // Each character is read a bounded number of times for each value: linear in the text,
+        // never a pass per place a match could start.
         let bound = 6 * text.chars().count() * (values.len() + 1);
         assert!(work <= bound, "{work} steps for {} characters", text.len());
     }
@@ -2566,5 +2577,221 @@ mod tests {
         // Two matches that overlap are hidden as one.
         assert_eq!(hide_known("<abcabcabcabcabcabcabc>", &secrets), "<***>");
         assert_eq!(hide_known("<abcabcabc\tabcabcabcabc>", &secrets), "<***>");
+    }
+
+    #[test]
+    fn hide_known_hides_held_values_that_hold_or_overlap_each_other_as_one_span() {
+        // A held value that is the start of another, and one that is its end.
+        let secrets = holding_token();
+        let (head, tail) = TOKEN.split_at(20);
+        secrets.set("github:head", head).unwrap();
+        secrets.set("github:tail", tail).unwrap();
+        for text in [
+            format!("<{TOKEN}>"),
+            format!("<{head}\n{tail}>"),
+            format!("<{}\u{1b}[31m{}>", &TOKEN[..10], &TOKEN[10..]),
+            format!("<{}\n{}\n{}>", &TOKEN[..15], &TOKEN[15..25], &TOKEN[25..]),
+        ] {
+            assert_eq!(hide_known(&text, &secrets), "<***>", "{text:?}");
+        }
+        assert_eq!(
+            hide_known(&format!("<{head}> <{tail}>"), &secrets),
+            "<***> <***>"
+        );
+        let text = format!(
+            "<{}\n{}> <{}\t{}>",
+            &head[..8],
+            &head[8..],
+            &tail[..9],
+            &tail[9..]
+        );
+        assert_eq!(hide_known(&text, &secrets), "<***> <***>");
+        // Two held values that overlap in the text are one span, and nothing of either is left.
+        let secrets = MemorySecrets::default();
+        secrets.set(GATEWAY, "Aa1Bb2Cc3Dd4Ee5Ff6Gg").unwrap();
+        secrets
+            .set(GATEWAY_MANAGEMENT, "Ff6Gg7Hh8Ii9Jj0Kk1Ll")
+            .unwrap();
+        for text in [
+            "<Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0Kk1Ll>",
+            "<Aa1Bb2Cc3Dd4Ee5Ff\n6Gg7Hh8Ii9Jj0Kk1Ll>",
+            "<Aa1Bb2Cc3\tDd4Ee5Ff6Gg7Hh8Ii9Jj0K\u{1b}[0mk1Ll>",
+        ] {
+            assert_eq!(hide_known(text, &secrets), "<***>", "{text:?}");
+        }
+    }
+
+    #[test]
+    fn hide_known_replaces_exactly_the_matched_span_wherever_the_gap_falls() {
+        // Every place a gap can fall inside the token, beside characters the token starts or
+        // ends with, gap characters, escape sequences and characters of more than one byte:
+        // the token goes whole and nothing around it does.
+        let secrets = holding_token();
+        for at in 1..TOKEN.len() {
+            let (head, tail) = TOKEN.split_at(at);
+            for gap in ["\n", " \u{1b}[31m", "\u{200b}"] {
+                for (before, after) in [
+                    ("gg", "88"),
+                    (" \n", "\r\n "),
+                    ("é", "€"),
+                    ("\u{1b}[0m", "\u{1b}[0m"),
+                ] {
+                    let text = format!("{before}{head}{gap}{tail}{after}");
+                    assert_eq!(
+                        hide_known(&text, &secrets),
+                        format!("{before}***{after}"),
+                        "{text:?}"
+                    );
+                }
+            }
+        }
+        // The opposite failure: with any one of its characters changed, the token is no match,
+        // and nothing is hidden.
+        for at in 0..TOKEN.len() {
+            let mut changed = TOKEN.to_owned();
+            changed.replace_range(at..=at, "#");
+            let (head, tail) = changed.split_at(20);
+            for gap in ["", "\n", " \u{1b}[31m"] {
+                let text = format!("gg{head}{gap}{tail}88");
+                assert_eq!(hide_known(&text, &secrets), text, "{text:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn hide_known_logs_nothing_of_what_it_hides() {
+        let logged = crate::test_log::Logged::default();
+        let _guard = logged.capture();
+        let secrets = holding_token();
+        let (head, tail) = TOKEN.split_at(20);
+        let text = format!("a {head}\u{1b}[31m{tail} b {TOKEN} c ghp_A1b2C3d4E5");
+        assert_eq!(hide_known(&text, &secrets), "a *** b *** c ghp_A1b2C3d4E5");
+        assert_eq!(logged.text(), "");
+    }
+
+    #[test]
+    fn hide_known_reads_64_kb_of_gap_characters_in_bounded_work() {
+        let values = vec![TOKEN.to_owned()];
+        for unit in [
+            " ",
+            "\n",
+            "\u{7}",
+            "\u{1b}",
+            "\u{9b}",
+            "\u{1b}[",
+            "\u{1b}[1;",
+            "\u{1b}]",
+            "\u{1b}]8;;x",
+            "\u{90}",
+            "\u{200b}",
+        ] {
+            let mut text = String::new();
+            while text.len() < 64 * 1024 - 100 {
+                text.push_str(unit);
+            }
+            text.push_str(&format!("\n{}\n{}\n", &TOKEN[..20], &TOKEN[20..]));
+            let mut work = 0;
+            let hidden = hide_values(&text, &values, &mut work);
+            assert!(hidden.ends_with("\n***\n"), "{unit:?}");
+            let bound = 8 * text.chars().count() * (values.len() + 1);
+            assert!(work <= bound, "{unit:?}: {work} steps");
+        }
+    }
+
+    /// The steps `hide_values` takes on `text`, and the most places of matched characters
+    /// that each value's [`Split`] holds at once, summed over the values.
+    fn work_and_held(text: &str, values: &[String]) -> (usize, usize) {
+        let mut work = 0;
+        hide_values(text, values, &mut work);
+        let mut held = 0;
+        for value in values {
+            let mut split = Split::new(value);
+            let (mut spans, mut steps, mut most) = (Vec::new(), 0, 0);
+            for (at, c) in text.char_indices() {
+                let escape = if is_gap(c) {
+                    escape(&text[at..], &mut steps)
+                } else {
+                    None
+                };
+                split.read(at, c, escape, &mut spans, &mut steps);
+                most = most.max(split.held());
+            }
+            held += most;
+        }
+        (work, held)
+    }
+
+    #[test]
+    fn partial_matches_that_fork_at_every_escape_keep_the_work_linear_in_the_text() {
+        // Each `ESC x` reads two ways: a lone ESC before the value's own `x`, and a whole
+        // two-character escape. A value that repeats itself, or one the text spells out with an
+        // ESC before each character, so keeps a partial match of nearly every length alive.
+        let spelled: String = TOKEN.chars().flat_map(|c| ['\u{1b}', c]).collect();
+        let tokens: Vec<String> = (0..50)
+            .map(|i| format!("ghp_{i:02}A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7"))
+            .collect();
+        for (name, unit, values) in [
+            ("a", "\u{1b}a".to_owned(), vec!["a".repeat(64)]),
+            ("ab", "\u{1b}a\u{1b}b".to_owned(), vec!["ab".repeat(32)]),
+            ("csi", "\u{9b}a".to_owned(), vec!["a".repeat(64)]),
+            ("spelled", spelled, vec![TOKEN.to_owned()]),
+            ("tokens", "\u{1b}g\u{1b}h\u{1b}p\u{1b}_".to_owned(), tokens),
+        ] {
+            let fill = |bytes: usize| {
+                let mut text = String::new();
+                while text.len() + unit.len() <= bytes {
+                    text.push_str(&unit);
+                }
+                text
+            };
+            let (short, long) = (fill(16 * 1024), fill(64 * 1024));
+            let (short_work, short_held) = work_and_held(&short, &values);
+            let (long_work, long_held) = work_and_held(&long, &values);
+            let (short_chars, long_chars) = (short.chars().count(), long.chars().count());
+            // Four times the characters is about four times the work.
+            assert!(
+                long_work * short_chars <= short_work * long_chars * 11 / 10,
+                "{name}: {short_work} steps for {short_chars}, {long_work} for {long_chars}"
+            );
+            // What the matchers hold is bounded by the values, never by the text.
+            assert_eq!(long_held, short_held, "{name}");
+            let most: usize = values
+                .iter()
+                .map(|value| (value.chars().count() + 1).pow(2))
+                .sum();
+            assert!(short_held <= most, "{name}: {short_held} held");
+            // A character costs at most each value's length squared: a fork copies the places
+            // each partial match holds.
+            assert!(
+                long_work <= long_chars * most,
+                "{name}: {long_work} steps for {long_chars} characters"
+            );
+        }
+    }
+
+    #[test]
+    fn a_character_costs_work_in_proportion_to_the_partial_matches_held_not_their_square() {
+        // Forks at `ESC a` keep a partial match of nearly every length of `a`s alive. One more
+        // `a` moves each of them on once, and finds each its place among the others in a step.
+        let mut split = Split::new(&"a".repeat(64));
+        let text = "\u{1b}a".repeat(100);
+        let (mut spans, mut work) = (Vec::new(), 0);
+        for (at, c) in text.char_indices() {
+            let escape = if is_gap(c) {
+                escape(&text[at..], &mut work)
+            } else {
+                None
+            };
+            split.read(at, c, escape, &mut spans, &mut work);
+        }
+        let held = split.states.len() + split.waiting.len();
+        assert!(held >= 64, "{held} partial matches");
+        let before = work;
+        split.read(text.len(), 'a', None, &mut spans, &mut work);
+        assert!(
+            work - before <= 6 * (held + 1),
+            "{} steps for {held} partial matches",
+            work - before
+        );
     }
 }
