@@ -1961,7 +1961,7 @@ exec "$agent" "$@""#;
     }
 
     #[test]
-    fn netrc_keywords_and_hosts_are_read_as_curl_reads_them() {
+    fn a_netrc_that_names_github_com_or_default_anywhere_refuses() {
         for netrc in [
             format!("MACHINE github.com LOGIN bob PASSWORD {SECRET}\n"),
             format!("machine \"github.com\" login bob password {SECRET}\n"),
@@ -1973,6 +1973,16 @@ exec "$agent" "$@""#;
             format!("machine example.com account machine github.com password {SECRET}\n"),
             format!("# GitHub login\nmachine github.com login bob password {SECRET}\n"),
             format!("machine example.com\n  login a\nmachine\ngithub.com password {SECRET}\n"),
+            format!("machine macdef login a\nmachine github.com password {SECRET}\n"),
+            format!("\"machine\"Xgithub.com password {SECRET}\n"),
+            format!("machine example.com login \"a\\\"\" machine github.com password {SECRET}\n"),
+            format!("machine \"git\\hub.com\" password {SECRET}\n"),
+            format!("# machine github.com login u password {SECRET}\n"),
+            format!("machine example.com password {SECRET}\n# default\n"),
+            format!("machine example.com password {SECRET}\n\"default\"\n"),
+            format!(
+                "machine example.com login a\nmacdef init\nmachine github.com\n\nmachine other.example password {SECRET}\n"
+            ),
         ] {
             let (home, repo) = setup("");
             std::fs::write(home.path().join(".netrc"), &netrc).unwrap();
@@ -1985,14 +1995,12 @@ exec "$agent" "$@""#;
     }
 
     #[test]
-    fn a_netrc_with_no_entry_for_github_com_is_not_refused() {
+    fn a_netrc_that_names_neither_github_com_nor_default_is_not_refused() {
         for netrc in [
-            format!("# machine github.com login u password {SECRET}\n"),
-            format!("machine example.com login \"a\\\" machine github.com\" password {SECRET}\n"),
-            format!(
-                "machine example.com login a\nmacdef init\nmachine github.com\n\nmachine other.example password {SECRET}\n"
-            ),
-            format!("machine github.com.example login a password {SECRET}\n"),
+            format!("machine example.com login u password {SECRET}\n"),
+            format!("machine gitlab.com login a password {SECRET}\n"),
+            format!("machine github.com.example login a password {SECRET}\n")
+                .replace("github.com", "git-hub.com"),
         ] {
             let (home, repo) = setup("");
             std::fs::write(home.path().join(".netrc"), &netrc).unwrap();
@@ -2060,6 +2068,78 @@ exec "$agent" "$@""#;
         assert!(said.contains("remotes/origin"), "{said}");
         assert!(!said.contains(SECRET), "{said}");
         assert!(!said.contains("after a URL rewrite"), "{said}");
+    }
+
+    #[test]
+    fn a_legacy_branches_file_with_a_user_name_refuses_and_names_the_file() {
+        let (home, repo) = setup("");
+        let dir = repo.path().join(".git/branches");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("origin"),
+            format!("https://bob:{SECRET}@github.com/o/r.git#main\n"),
+        )
+        .unwrap();
+
+        let said = said(check(home.path(), repo.path()));
+
+        assert!(said.contains("branches/origin"), "{said}");
+        assert!(said.contains("the file's URL"), "{said}");
+        assert!(!said.contains(SECRET), "{said}");
+    }
+
+    #[test]
+    fn a_legacy_remote_file_is_found_from_a_linked_worktree() {
+        let (home, repo) = setup("");
+        let git = owner_git(home.path());
+        run(
+            &git,
+            repo.path(),
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@e",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "x",
+            ],
+        );
+        let linked = tempfile::tempdir().unwrap();
+        let tree = linked.path().join("tree");
+        run(
+            &git,
+            repo.path(),
+            &["worktree", "add", "-q", tree.to_str().unwrap()],
+        );
+        let remotes = repo.path().join(".git/remotes");
+        std::fs::create_dir_all(&remotes).unwrap();
+        std::fs::write(
+            remotes.join("origin"),
+            format!("URL: https://bob:{SECRET}@github.com/o/r.git\n"),
+        )
+        .unwrap();
+
+        let said = said(check(home.path(), &tree));
+
+        assert!(said.contains(".git/remotes/origin"), "{said}");
+        assert!(!said.contains(SECRET), "{said}");
+    }
+
+    #[test]
+    fn a_legacy_file_without_a_user_name_is_not_named_when_a_rewrite_adds_one() {
+        let (home, repo) =
+            setup("[url \"https://bob@github.com/\"]\n\tinsteadOf = https://gh.example/\n");
+        let remotes = repo.path().join(".git/remotes");
+        std::fs::create_dir_all(&remotes).unwrap();
+        std::fs::write(remotes.join("origin"), "URL: https://gh.example/o/r.git\n").unwrap();
+
+        let said = said(check(home.path(), repo.path()));
+
+        assert!(!said.contains("remotes/origin"), "{said}");
+        assert!(said.contains("git remote get-url origin"), "{said}");
     }
 
     #[tokio::test]
@@ -2215,7 +2295,7 @@ exec "$agent" "$@""#;
         ));
         std::fs::write(
             home.path().join(".netrc"),
-            "# machine github.com login u password pw\nmachine example.com login \"a\\\" machine github.com\" password pw\nmacdef init\nmachine github.com\n\n",
+            "machine example.com login u password pw\n",
         )
         .unwrap();
         run(
