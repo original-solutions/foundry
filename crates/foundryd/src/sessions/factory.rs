@@ -12,6 +12,7 @@
 //! again, so a daemon that starts again still knows its factory sessions.
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -80,22 +81,22 @@ pub(super) fn write_mark(path: &Path, project: ProjectId) -> Result<(), SessionE
 /// askpass's answer, the askpass script, and git's credential helpers emptied. The askpass and
 /// the token are read from what [`GitAuth`] gives a git child, so there is one source of them.
 ///
-/// The invariant: the session's git pushes as `login` and no one else. So it reads no system
-/// and no global config (`GIT_CONFIG_NOSYSTEM`, `GIT_CONFIG_GLOBAL=/dev/null`, as
-/// [`GitAuth`] sets them): nothing there, whether a helper, a URL rewrite that carries
-/// credentials, an `extraHeader` or an ssh command, can answer for the machine's owner. Only
-/// the owner's `identity` (`user.name` and `user.email`, from [`owner_identity`]) is carried in,
-/// as `GIT_CONFIG_COUNT` pins after the emptied helper. `GIT_ALLOW_PROTOCOL=https` is read from
-/// [`GitAuth`] too: a repository's own config can still rewrite a URL, and it cannot reach ssh.
-/// An inherited `GIT_CONFIG_PARAMETERS` is read after `GIT_CONFIG_COUNT`, so it is emptied. The
-/// other GitHub tokens that `gh` and git's helpers read are blanked, the ones
-/// [`git_auth::helpers_off_env`] blanks.
+/// The session's git keeps the machine owner's config: system and global, so the owner's
+/// identity, global ignore file and hooks work as in a P1 session. It is hardened only as
+/// the spec's check 3 says: credential helpers emptied (`GIT_CONFIG_COUNT` pins one empty
+/// `credential.helper`, which resets the list), `GIT_ALLOW_PROTOCOL=https` read from
+/// [`GitAuth`] so a repository's config cannot reach ssh, an inherited `GIT_CONFIG_PARAMETERS`
+/// (read after `GIT_CONFIG_COUNT`) emptied, and the other GitHub tokens that `gh` and git's
+/// helpers read blanked, the ones [`git_auth::helpers_off_env`] blanks.
+///
+/// What the askpass cannot cover is a setup of the owner's that answers github.com before git
+/// asks it: a URL rewrite, an `extraHeader`, a user name in a remote's URL, a netrc entry. A
+/// factory start refuses those, before it reads the token ([`git_refusal`]).
 fn factory_env(
     secrets: &dyn crate::secrets::Secrets,
     login: &str,
     data: &Path,
 ) -> Result<Vec<(String, String)>, SessionError> {
-    let identity: &[(String, String)] = &[];
     let auth = GitAuth::for_login(secrets, login, data)?;
     let mut git = Command::new("git");
     auth.apply(&mut git);
@@ -106,12 +107,10 @@ fn factory_env(
             .and_then(|(_, value)| value)
             .map(|value| value.to_string_lossy().into_owned())
     };
-    let (Some(askpass), Some(token), Some(protocol), Some(global), Some(no_system)) = (
+    let (Some(askpass), Some(token), Some(protocol)) = (
         get("GIT_ASKPASS"),
         get(git_auth::TOKEN_VAR),
         get("GIT_ALLOW_PROTOCOL"),
-        get("GIT_CONFIG_GLOBAL"),
-        get("GIT_CONFIG_NOSYSTEM"),
     ) else {
         return Err(SessionError::NoAskpass);
     };
@@ -119,18 +118,12 @@ fn factory_env(
         ("GH_TOKEN".to_owned(), token.clone()),
         ("GIT_ASKPASS".into(), askpass),
         (git_auth::TOKEN_VAR.into(), token),
-        ("GIT_CONFIG_NOSYSTEM".into(), no_system),
-        ("GIT_CONFIG_GLOBAL".into(), global),
-        ("GIT_CONFIG_COUNT".into(), (1 + identity.len()).to_string()),
+        ("GIT_CONFIG_COUNT".into(), "1".into()),
         ("GIT_CONFIG_KEY_0".into(), "credential.helper".into()),
         ("GIT_CONFIG_VALUE_0".into(), String::new()),
         ("GIT_CONFIG_PARAMETERS".into(), String::new()),
         ("GIT_ALLOW_PROTOCOL".into(), protocol),
     ];
-    for (n, (key, value)) in identity.iter().enumerate() {
-        env.push((format!("GIT_CONFIG_KEY_{}", n + 1), key.clone()));
-        env.push((format!("GIT_CONFIG_VALUE_{}", n + 1), value.clone()));
-    }
     env.extend(
         git_auth::helpers_off_env()
             .into_iter()
@@ -141,18 +134,306 @@ fn factory_env(
     Ok(env)
 }
 
-/// What a factory start found in the owner's git setup that would answer github.com before the
-/// askpass is asked.
-#[derive(Debug, thiserror::Error)]
-#[error("sessions: a factory start is refused")]
-pub struct GitRefused;
+/// [`git_refusal`] for the real setup: the process's `git`, with the session's overrides of
+/// config out of it, and `$HOME/.netrc`. With `home` (tests), that folder is HOME and
+/// XDG_CONFIG_HOME, there is no system config, and the netrc is `<home>/.netrc`.
+fn owner_setup_refusal(home: Option<&Path>, worktree: &Path) -> Result<(), SessionError> {
+    let git = || {
+        let mut git = Command::new("git");
+        git.env_remove("GIT_CONFIG_PARAMETERS")
+            .env_remove("GIT_CONFIG_COUNT");
+        if let Some(home) = home {
+            git.env("HOME", home)
+                .env("XDG_CONFIG_HOME", home)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env_remove("GIT_CONFIG_GLOBAL")
+                .env_remove("GIT_CONFIG_SYSTEM");
+        }
+        git
+    };
+    let netrc = home
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+        .map(|home| home.join(".netrc"));
+    git_refusal(git, netrc.as_deref(), worktree)
+}
 
+/// One thing in the owner's git setup that would answer github.com before the askpass: what it
+/// is, the config key (or netrc entry) it is in, and the file. No value: a header, a URL's
+/// password and a netrc password are secrets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Finding {
+    what: &'static str,
+    key: String,
+    file: String,
+}
+
+/// The findings that refuse a factory start. Names only, never a value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitRefused(Vec<Finding>);
+
+impl std::fmt::Display for GitRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "sessions: a factory start is refused: the owner's git setup would answer github.com \
+             before the askpass is asked: "
+        )?;
+        for (n, found) in self.0.iter().enumerate() {
+            let sep = if n == 0 { "" } else { "; " };
+            write!(f, "{sep}{} ({} in {})", found.what, found.key, found.file)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for GitRefused {}
+
+const GITHUB: &str = "https://github.com/";
+
+/// Runs `git` with `args`, giving its stdout when it succeeds.
+fn git_out(mut git: Command, args: &[&OsStr]) -> Option<Vec<u8>> {
+    let out = git
+        .args(args)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    out.status.success().then_some(out.stdout)
+}
+
+/// Refuses the start when the owner's git setup would answer github.com before the askpass is
+/// asked: in the git config in effect in `worktree` (system, global, repo and included files),
+/// a `url.<base>.insteadOf` or `pushInsteadOf` that rewrites `https://github.com/`, an
+/// `http.extraHeader` that covers it, a `origin` URL or push URL that carries a user name; and
+/// in `netrc`, a `machine github.com` or `default` entry. `git` gives a git command with the
+/// session's overrides of config (`GIT_CONFIG_PARAMETERS`) not in it. Git that cannot read the
+/// config refuses too. The message names each finding and where, never a value.
 fn git_refusal(
-    _git: impl Fn() -> Command,
-    _netrc: Option<&Path>,
-    _worktree: &Path,
+    git: impl Fn() -> Command,
+    netrc: Option<&Path>,
+    worktree: &Path,
 ) -> Result<(), SessionError> {
-    Ok(())
+    let mut found = Vec::new();
+    let listed = git_out(
+        git(),
+        &[
+            OsStr::new("-C"),
+            worktree.as_os_str(),
+            OsStr::new("config"),
+            OsStr::new("--list"),
+            OsStr::new("--show-origin"),
+            OsStr::new("-z"),
+        ],
+    );
+    let Some(listed) = listed else {
+        found.push(Finding {
+            what: "the git config could not be read",
+            key: "git config --list".into(),
+            file: worktree.display().to_string(),
+        });
+        return Err(GitRefused(found).into());
+    };
+    let entries = config_entries(&listed);
+    for entry in &entries {
+        if let Some(what) = config_finding(&entry.key, &entry.value) {
+            found.push(Finding {
+                what,
+                key: mask_user_info(&entry.key),
+                file: entry.file.clone(),
+            });
+        }
+    }
+    for (flag, key) in [
+        (None, "remote.origin.url"),
+        (Some("--push"), "remote.origin.pushurl"),
+    ] {
+        let mut args: Vec<&OsStr> = vec![
+            OsStr::new("-C"),
+            worktree.as_os_str(),
+            OsStr::new("remote"),
+            OsStr::new("get-url"),
+        ];
+        args.extend(flag.map(OsStr::new));
+        args.extend([OsStr::new("--all"), OsStr::new("origin")]);
+        let urls = git_out(git(), &args).unwrap_or_default();
+        if String::from_utf8_lossy(&urls).lines().any(has_user_name) {
+            let file = entries
+                .iter()
+                .find(|entry| entry.key == key)
+                .map_or("the git config", |entry| entry.file.as_str());
+            found.push(Finding {
+                what: "a user name in the origin URL",
+                key: key.into(),
+                file: file.into(),
+            });
+        }
+    }
+    if let Some(netrc) = netrc {
+        found.extend(netrc_findings(netrc));
+    }
+    if found.is_empty() {
+        Ok(())
+    } else {
+        Err(GitRefused(found).into())
+    }
+}
+
+/// One entry of `git config --list --show-origin -z`.
+struct Entry {
+    file: String,
+    key: String,
+    value: String,
+}
+
+/// The entries of `git config --list --show-origin -z`: `<origin>\0<key>\n<value>\0` each, and
+/// just `<key>` for a key with no value.
+fn config_entries(listed: &[u8]) -> Vec<Entry> {
+    let text = String::from_utf8_lossy(listed);
+    let mut parts = text.split('\0');
+    let mut entries = Vec::new();
+    while let (Some(origin), Some(entry)) = (parts.next(), parts.next()) {
+        let (key, value) = entry.split_once('\n').unwrap_or((entry, ""));
+        entries.push(Entry {
+            file: origin.strip_prefix("file:").unwrap_or(origin).to_owned(),
+            key: key.to_owned(),
+            value: value.to_owned(),
+        });
+    }
+    entries
+}
+
+/// What `key = value` of the config does that is refused, if it does. `key` has its section
+/// and variable in lower case, as git lists it.
+fn config_finding(key: &str, value: &str) -> Option<&'static str> {
+    if value.is_empty() {
+        return None;
+    }
+    let url_key = |suffix: &str| {
+        key.strip_prefix("url.")
+            .is_some_and(|rest| rest.ends_with(suffix))
+    };
+    if url_key(".insteadof") || url_key(".pushinsteadof") {
+        return (GITHUB.starts_with(value) || value.starts_with(GITHUB))
+            .then_some("a URL rewrite of https://github.com/");
+    }
+    if key == "http.extraheader" {
+        return Some("an extra HTTP header");
+    }
+    let url = key.strip_prefix("http.")?.strip_suffix(".extraheader")?;
+    covers_github(url).then_some("an extra HTTP header for github.com")
+}
+
+/// Whether the `http.<url>.` section's `url` covers `https://github.com/`: https, the host
+/// `github.com` or a pattern whose `*` stands for a whole label, no port or 443, any user and
+/// path.
+fn covers_github(url: &str) -> bool {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("https") {
+        return false;
+    }
+    let authority = rest.split('/').next().unwrap_or("");
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let (host, port) = match host_port.rsplit_once(':') {
+        Some((host, port)) if !host.ends_with(']') || host.starts_with('[') => (host, Some(port)),
+        _ => (host_port, None),
+    };
+    if port.is_some_and(|port| port != "443") {
+        return false;
+    }
+    let labels: Vec<&str> = host.split('.').collect();
+    let github = ["github", "com"];
+    labels.len() == github.len()
+        && labels
+            .iter()
+            .zip(github)
+            .all(|(label, want)| *label == "*" || label.eq_ignore_ascii_case(want))
+}
+
+/// Whether the remote URL `url` carries a user name: `scheme://user@host/...` or `user@host:path`.
+fn has_user_name(url: &str) -> bool {
+    if let Some((_, rest)) = url.split_once("://") {
+        return rest
+            .split('/')
+            .next()
+            .is_some_and(|auth| auth.contains('@'));
+    }
+    match (url.find(':'), url.find('/')) {
+        (Some(colon), slash) if slash.is_none_or(|slash| colon < slash) => {
+            url[..colon].contains('@')
+        }
+        _ => false,
+    }
+}
+
+/// `key` with the user info of a URL in it replaced, so a password in a config key is not
+/// printed: everything between `://` and the last `@` after it.
+fn mask_user_info(key: &str) -> String {
+    let Some(start) = key.find("://").map(|at| at + 3) else {
+        return key.to_owned();
+    };
+    match key[start..].rfind('@') {
+        Some(at) => format!("{}***{}", &key[..start], &key[start + at..]),
+        None => key.to_owned(),
+    }
+}
+
+/// The entries of the netrc at `path` that answer github.com: a `machine github.com` and a
+/// `default`. A netrc that is not there has none; one that cannot be read is refused.
+fn netrc_findings(path: &Path) -> Vec<Finding> {
+    let file = path.display().to_string();
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(_) => {
+            return vec![Finding {
+                what: "a netrc that could not be read",
+                key: "netrc".into(),
+                file,
+            }];
+        }
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let mut found = Vec::new();
+    let (mut macdef, mut machine, mut skip) = (false, false, false);
+    for line in text.lines() {
+        if macdef {
+            macdef = !line.trim().is_empty();
+            continue;
+        }
+        for token in line.split_whitespace() {
+            if std::mem::take(&mut skip) {
+                continue;
+            }
+            if std::mem::take(&mut machine) {
+                if token.eq_ignore_ascii_case("github.com") {
+                    found.push(Finding {
+                        what: "a netrc entry for github.com",
+                        key: "machine github.com".into(),
+                        file: file.clone(),
+                    });
+                }
+                continue;
+            }
+            match token {
+                "macdef" => {
+                    macdef = true;
+                    break;
+                }
+                "machine" => machine = true,
+                "login" | "password" | "account" => skip = true,
+                "default" => found.push(Finding {
+                    what: "a netrc default entry",
+                    key: "default".into(),
+                    file: file.clone(),
+                }),
+                _ => {}
+            }
+        }
+    }
+    found
 }
 
 impl Sessions {
@@ -161,7 +442,9 @@ impl Sessions {
     /// and mark of a factory session. `first`'s line is its first prompt, typed as
     /// [`Sessions::start_with`] types one.
     ///
-    /// The token is read first: a login the machine holds no token for is
+    /// A start is refused with [`SessionError::GitSetup`] when the owner's git setup would
+    /// answer github.com before the askpass is asked ([`git_refusal`]); it is checked here, at
+    /// the start only. Then the token is read: a login the machine holds no token for is
     /// [`SessionError::NoToken`], and so is a machine with no secret store. A start that fails
     /// leaves no terminal, no file, no folder and no record.
     ///
@@ -190,9 +473,14 @@ impl Sessions {
         tokio::spawn(async move {
             let secrets = inner.secrets.get().cloned();
             let (login, data) = (start.login.clone(), inner.data.clone());
-            let env = blocking(move || match secrets {
-                Some(secrets) => factory_env(secrets.as_ref(), &login, &data),
-                None => Err(crate::git_auth::NoToken::Unset { login }.into()),
+            let (home, checked) = (inner.git_home(), worktree.clone());
+            let env = blocking(move || {
+                // First, before the token is read or anything is written.
+                owner_setup_refusal(home.as_deref(), &checked)?;
+                match secrets {
+                    Some(secrets) => factory_env(secrets.as_ref(), &login, &data),
+                    None => Err(crate::git_auth::NoToken::Unset { login }.into()),
+                }
             })
             .await??;
             let launch = FactoryLaunch {
@@ -273,6 +561,18 @@ impl Sessions {
 }
 
 impl Inner {
+    /// Tests: the home the check of the owner's git setup reads. Never set outside tests.
+    fn git_home(&self) -> Option<PathBuf> {
+        #[cfg(test)]
+        {
+            self.git_home.get().cloned()
+        }
+        #[cfg(not(test))]
+        {
+            None
+        }
+    }
+
     /// Reads the marks of the factory sessions an earlier daemon started, so they are still
     /// factory sessions. A mark that cannot be read, or holds no project, is skipped with a
     /// warning that does not show its contents.
