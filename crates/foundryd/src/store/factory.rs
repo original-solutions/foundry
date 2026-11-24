@@ -418,6 +418,107 @@ mod tests {
         assert!(changed > 0);
     }
 
+    /// Makes the owner cell of `owner`'s row of `version` hold `cell`, an SQL expression in
+    /// which `?1` is the owner as this build writes it, and gives the cell's SQL type.
+    fn respell(store: &Store, owner: MachineId, version: u64, cell: &str) -> String {
+        let changed = store
+            .conn
+            .execute(
+                &format!(
+                    "UPDATE factory_records SET owner = {cell} WHERE owner = ?1 AND version = ?2"
+                ),
+                params![owner.to_string(), i64::try_from(version).unwrap()],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+        store
+            .conn
+            .query_row(
+                "SELECT typeof(owner) FROM factory_records WHERE version = ?1",
+                params![i64::try_from(version).unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn factory_versions_leaves_out_an_owner_stored_as_a_blob_or_as_text_that_is_not_utf_8() {
+        let (_dir, mut store) = open();
+        let (a, blob, not_utf_8) = (
+            MachineId::random(),
+            MachineId::random(),
+            MachineId::random(),
+        );
+        store_event(&mut store, a, 1, "a-1");
+        store_event(&mut store, blob, 2, "blob-2");
+        store_event(&mut store, not_utf_8, 3, "not-utf-8-3");
+        assert_eq!(respell(&store, blob, 2, "x'00ff'"), "blob");
+        assert_eq!(respell(&store, not_utf_8, 3, "CAST(x'ff' AS TEXT)"), "text");
+
+        let logged = Logged::default();
+        let _capture = logged.capture();
+        assert_eq!(
+            store.factory_versions().unwrap(),
+            [(a, 1)].into(),
+            "the readable owner's version, and no error"
+        );
+        assert_eq!(logged.warnings().len(), 2, "{:?}", logged.warnings());
+    }
+
+    #[test]
+    fn a_row_whose_owner_is_spelt_otherwise_than_this_build_writes_it_never_lowers_its_version() {
+        let (_dir, mut store) = open();
+        let a = MachineId::random();
+        for version in 1..=3 {
+            store_event(&mut store, a, version, &format!("a-{version}"));
+        }
+        // Two of a's rows, below its highest, with its id spelt as this build never writes it.
+        // Both sort after a's own spelling, so a read that took either as a's would lower it.
+        assert_eq!(respell(&store, a, 1, "CAST(?1 AS BLOB)"), "blob");
+        assert_eq!(respell(&store, a, 2, "'{' || ?1 || '}'"), "text");
+
+        let logged = Logged::default();
+        let _capture = logged.capture();
+        assert_eq!(store.factory_versions().unwrap(), [(a, 3)].into());
+        assert_eq!(logged.warnings().len(), 2, "{:?}", logged.warnings());
+    }
+
+    #[test]
+    fn each_owner_that_cannot_be_read_is_warned_of_once_and_one_found_later_then() {
+        let (_dir, mut store) = open();
+        let (a, first, last, later) = (
+            MachineId::random(),
+            MachineId::random(),
+            MachineId::random(),
+            MachineId::random(),
+        );
+        store_event(&mut store, a, 1, "a-1");
+        store_event(&mut store, first, 2, "first-2");
+        store_event(&mut store, last, 3, "last-3");
+        spoil_owner(&store, first, UNREADABLE_FIRST);
+        spoil_owner(&store, last, UNREADABLE);
+
+        let logged = Logged::default();
+        let _capture = logged.capture();
+        for _ in 0..3 {
+            assert_eq!(store.factory_versions().unwrap(), [(a, 1)].into());
+        }
+        assert_eq!(
+            logged.warnings().len(),
+            2,
+            "once for each owner: {:?}",
+            logged.warnings()
+        );
+
+        // An owner first found unreadable while the store is open is warned of then, once.
+        store_event(&mut store, later, 4, "later-4");
+        spoil_owner(&store, later, "owner-found-later");
+        for _ in 0..3 {
+            assert_eq!(store.factory_versions().unwrap(), [(a, 1)].into());
+        }
+        assert_eq!(logged.warnings().len(), 3, "{:?}", logged.warnings());
+    }
+
     #[test]
     fn factory_versions_leaves_out_an_owner_that_cannot_be_read_and_gives_the_others() {
         let (_dir, mut store) = open();

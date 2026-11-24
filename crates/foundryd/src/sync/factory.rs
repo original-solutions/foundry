@@ -418,6 +418,44 @@ mod tests {
     }
 
     #[test]
+    fn newest_own_reads_its_own_records_to_the_last_when_another_owners_row_stops_the_versions_held()
+     {
+        let data = tempfile::tempdir().unwrap();
+        let path = data.path().join("foundry.db");
+        let mut store = Store::open(&path).unwrap();
+        let (me, other) = (MachineId::random(), MachineId::random());
+        let own = u64::try_from(BATCH).unwrap() + 1;
+        for version in 1..=own {
+            let record = FactoryRecord {
+                owner: me,
+                ..event(version, 10)
+            };
+            assert_eq!(store.apply_factory(&record, me).unwrap(), Applied::Stored);
+        }
+        let record = FactoryRecord {
+            owner: other,
+            ..event(7, 10)
+        };
+        assert_eq!(
+            store.apply_factory(&record, other).unwrap(),
+            Applied::Stored
+        );
+        // A version that is not a whole number, which only a corrupt file leaves, on the other
+        // owner's row: the highest version held per owner cannot be read, `me`'s records can.
+        let changed = rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE factory_records SET version = 'seven' WHERE owner = ?1",
+                rusqlite::params![other.to_string()],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+        assert!(store.factory_versions().is_err());
+
+        assert_eq!(newest_own(&mut store, me, None).unwrap(), own);
+    }
+
+    #[test]
     fn a_record_larger_than_the_budget_goes_alone() {
         let records = vec![event(1, 5000), event(2, 10)];
         assert_eq!(fitting(&records, 100), 1);
