@@ -1980,6 +1980,37 @@ mod tests {
     }
 
     #[test]
+    fn a_factory_setting_first_seen_after_a_read_counts_from_that_read() {
+        let mut world = World::new();
+        let first = world.factory_project(true);
+        let clock = world.keep_freshness();
+        let idle = |world: &World| {
+            let mut ids: Vec<String> = world
+                .of(Kind::FactoryIdle)
+                .into_iter()
+                .map(|i| i.id)
+                .collect();
+            ids.sort();
+            ids
+        };
+        assert!(idle(&world).is_empty());
+        clock.advance(30 * MINUTE);
+        // A second project's factory setting arrives after that read, already on. The first
+        // project, there at the first read, still counts from the start.
+        let second = world.factory_project(true);
+        assert_eq!(idle(&world), [format!("factory_idle:{first}")]);
+        clock.advance(9 * MINUTE);
+        assert_eq!(idle(&world), [format!("factory_idle:{first}")]);
+        clock.advance(MINUTE);
+        let mut both = vec![
+            format!("factory_idle:{first}"),
+            format!("factory_idle:{second}"),
+        ];
+        both.sort();
+        assert_eq!(idle(&world), both);
+    }
+
+    #[test]
     fn a_holder_that_is_believed_but_sends_nothing_new_for_ten_minutes_raises_factory_idle() {
         let mut world = World::new();
         let project = world.factory_project(true);
@@ -2399,6 +2430,54 @@ mod tests {
         world.marked.sessions.insert(session.id, project);
         world.marked.workspaces.insert(session.workspace, project);
         assert_eq!(world.of(Kind::SessionStuck).len(), 1, "{:?}", world.items());
+    }
+
+    #[test]
+    fn marks_and_statuses_count_only_for_their_own_projects_factory() {
+        let mut world = World::new();
+        let on = world.factory_project(true);
+        let off = world.factory_project(false);
+        let (me, peer) = (world.me, world.peer);
+        let failed_setup = |world: &mut World| {
+            let setup = TerminalId::random();
+            let workspace = world.workspace(me, Some(setup));
+            world.terminal(me, setup, workspace, Some(Some(1)), false);
+            workspace
+        };
+        // This machine marks a stuck session and a failed setup of each project.
+        let (marked_on, marked_off) = (
+            world.session(me, SessionState::Stuck),
+            world.session(me, SessionState::Stuck),
+        );
+        let (setup_on, setup_off) = (failed_setup(&mut world), failed_setup(&mut world));
+        world.marked.sessions.insert(marked_on.id, on);
+        world.marked.sessions.insert(marked_off.id, off);
+        world.marked.workspaces.insert(setup_on, on);
+        world.marked.workspaces.insert(setup_off, off);
+        // Each project's status names a waiting session of the peer.
+        let (named_on, named_off) = (
+            world.session(peer, SessionState::WaitingForYou),
+            world.session(peer, SessionState::WaitingForYou),
+        );
+        name_in_status(&mut world, on, Vec::new(), vec![named_on.id]);
+        name_in_status(&mut world, off, Vec::new(), vec![named_off.id]);
+
+        let mut p1: Vec<String> = world
+            .items()
+            .into_iter()
+            .filter(|i| {
+                [Kind::SessionStuck, Kind::SessionWaiting, Kind::SetupFailed].contains(&i.kind)
+            })
+            .map(|i| i.id)
+            .collect();
+        p1.sort();
+        let mut want = vec![
+            format!("session_stuck:{}", marked_off.id),
+            format!("setup_failed:{setup_off}"),
+            format!("session_waiting:{}", named_off.id),
+        ];
+        want.sort();
+        assert_eq!(p1, want, "{:?}", world.items());
     }
 
     // --- the list and its routes ---
