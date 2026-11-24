@@ -2619,9 +2619,14 @@ fn login_of(settings: &SharedSettings, n: u128) -> Option<String> {
 
 /// `settings` as a machine on the protocol before factory settings sends them.
 fn older_settings(settings: &SharedSettings) -> PeerMessage {
+    settings_speaking(settings, BEFORE_FACTORY)
+}
+
+/// `settings` as a machine on `protocol` sends them.
+fn settings_speaking(settings: &SharedSettings, protocol: u16) -> PeerMessage {
     PeerMessage::Settings {
-        protocol: BEFORE_FACTORY,
-        settings: settings.for_protocol(BEFORE_FACTORY),
+        protocol,
+        settings: settings.for_protocol(protocol),
     }
 }
 
@@ -2684,10 +2689,23 @@ async fn a_factory_setting_edited_on_one_machine_reaches_the_others() {
 
 #[tokio::test(start_paused = true)]
 async fn a_peer_on_protocol_4_is_sent_no_factory_setting_and_its_copy_leaves_them_as_they_are() {
+    a_peer_before_factory_settings_is_sent_none_and_its_copy_leaves_them(BEFORE_FACTORY).await;
+}
+
+/// A copy from before [`ANSWERS_SINCE`] has its numbered edits taken from the held copy too,
+/// and must keep the factory settings all the same.
+#[tokio::test(start_paused = true)]
+async fn a_peer_on_protocol_3_is_sent_no_factory_setting_and_its_copy_leaves_them_as_they_are() {
+    a_peer_before_factory_settings_is_sent_none_and_its_copy_leaves_them(ANSWERS_SINCE - 1).await;
+}
+
+/// A peer on `protocol`, before [`FACTORY_SINCE`], is sent copies with no factory setting, and
+/// the copies it sends back neither remove the ones held nor raise the number.
+async fn a_peer_before_factory_settings_is_sent_none_and_its_copy_leaves_them(protocol: u16) {
     let older = MachineId::random();
     let fleet = Fleet::start_coordinated_with(1, &[older]);
     let daemon = &fleet.daemons[0];
-    let Conn { send, mut recv } = raw_link_speaking(daemon, older, BEFORE_FACTORY).await;
+    let Conn { send, mut recv } = raw_link_speaking(daemon, older, protocol).await;
     // A machine on protocol 4 keeps every copy it is sent, and sends back what it can hold.
     let sent = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
     tokio::spawn({
@@ -2701,14 +2719,14 @@ async fn a_peer_on_protocol_4_is_sent_no_factory_setting_and_its_copy_leaves_the
                 lock(&sent).push(json.clone());
                 let theirs: SharedSettings =
                     serde_json::from_value(json["settings"].clone()).unwrap();
-                let back = serde_json::to_string(&older_settings(&theirs)).unwrap();
+                let back = serde_json::to_string(&settings_speaking(&theirs, protocol)).unwrap();
                 if send.send(back).await.is_err() {
                     return;
                 }
             }
         }
     });
-    say(&send, &older_settings(&daemon.settings())).await;
+    say(&send, &settings_speaking(&daemon.settings(), protocol)).await;
     let _beating = beating(send.clone());
     until(WAIT, "the peer is online", || {
         daemon.peers.online().contains(&older)
@@ -2740,7 +2758,7 @@ async fn a_peer_on_protocol_4_is_sent_no_factory_setting_and_its_copy_leaves_the
 
     // The older machine numbers an edit of its own; its copy, which holds no factory setting,
     // brings the edit and leaves the factory settings as they are.
-    let mut theirs = held.for_protocol(BEFORE_FACTORY);
+    let mut theirs = held.for_protocol(protocol);
     theirs.seq += 1;
     theirs.projects.push(project(9, "from the older machine"));
     theirs.stamps.insert(
@@ -2751,7 +2769,7 @@ async fn a_peer_on_protocol_4_is_sent_no_factory_setting_and_its_copy_leaves_the
         },
     );
     theirs.seen.insert(older, theirs.seq);
-    say(&send, &older_settings(&theirs)).await;
+    say(&send, &settings_speaking(&theirs, protocol)).await;
     let after = holds_project(daemon, 9, Duration::from_secs(2)).await;
     assert_eq!(max_runs(&after), Some(5));
     assert_eq!(login_of(&after, 7).as_deref(), Some("rawphp"));
@@ -2764,7 +2782,7 @@ async fn a_peer_on_protocol_4_is_sent_no_factory_setting_and_its_copy_leaves_the
     let sent = lock(&sent);
     assert!(!sent.is_empty(), "no settings were sent");
     for message in sent.iter() {
-        assert_eq!(message["protocol"], BEFORE_FACTORY, "{message}");
+        assert_eq!(message["protocol"], protocol, "{message}");
         assert!(!names_the_factory(message), "{message}");
     }
 }
@@ -2780,7 +2798,17 @@ async fn a_factory_edit_is_refused_with_the_reason_while_the_acting_machine_spea
     let beat = beating(conn.clone());
     acting_becomes(&daemon.coordinator(), older, WAIT).await;
 
-    for edit in [set_factory(5), set_project_factory(7, "rawphp")] {
+    // A dismissal of a factory item is an edit of a factory setting too.
+    for edit in [
+        set_factory(5),
+        set_project_factory(7, "rawphp"),
+        Edit::Dismiss {
+            setting: SettingKey::Factory,
+        },
+        Edit::Dismiss {
+            setting: SettingKey::ProjectFactory(project(7, "").id),
+        },
+    ] {
         let error = tokio::time::timeout(Duration::from_secs(2), daemon.coordinator().edit(edit))
             .await
             .expect("the edit waited for an answer the older machine cannot give")
