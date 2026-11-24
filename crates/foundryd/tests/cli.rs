@@ -237,6 +237,25 @@ fn secret_set_with_a_bad_github_login_exits_1_and_stores_nothing() {
 }
 
 #[test]
+fn secret_set_help_names_github_tokens() {
+    let out = foundryd(&["secret", "--help"]);
+    assert!(out.status.success(), "exit: {:?}", out.status);
+    let help = String::from_utf8_lossy(&out.stdout);
+    assert!(help.contains("GitHub token"), "help: {help}");
+
+    let out = foundryd(&["secret", "set", "--help"]);
+    assert!(out.status.success(), "exit: {:?}", out.status);
+    let help = String::from_utf8_lossy(&out.stdout);
+    for words in [
+        "gateway-management",
+        "github:<login>",
+        "at most 39 characters",
+    ] {
+        assert!(help.contains(words), "{words} missing from help: {help}");
+    }
+}
+
+#[test]
 fn factory_export_exits_2_and_says_not_built_yet() {
     let out = tempfile::tempdir().unwrap();
     assert_not_built(&["factory", "export", out.path().to_str().unwrap()]);
