@@ -49,8 +49,9 @@ pub struct SharedSettings {
     pub project_factory: BTreeMap<ProjectId, ProjectFactory>,
     /// The highest number each coordinator gave a factory edit that this copy includes: the
     /// factory counterpart of `seen`. A protocol 4 machine passes `seen` on without the factory
-    /// edits it counts, so only this says whether a copy holds a factory edit. Raised only by
-    /// numbering a factory edit and by a copy from a peer on
+    /// edits it counts, so this, with the factory stamps the copy holds, says which factory
+    /// edits a copy includes (`foundryd`'s coordinator reads both). Raised only by numbering a
+    /// factory edit and by a copy from a peer on
     /// [`FACTORY_SINCE`](crate::messages::FACTORY_SINCE) or later; never sent to a peer before
     /// it, and not written when empty. Boxed so a settings message stays within the size the
     /// other peer messages are held to.
