@@ -1558,10 +1558,10 @@ fn the_project_routes_refuse_a_request_from_another_site() {
     use std::io::{Read as _, Write as _};
     let mut fixture = Fixture::new();
     fixture.start();
-    let ask = |path: &str, host: &str, origin: Option<&str>| {
+    // As in the rename route's test: only a request the route serves sends a body.
+    let ask = |path: &str, host: &str, origin: Option<&str>, body: &str| {
         let mut stream = std::net::TcpStream::connect(("127.0.0.1", fixture.port)).unwrap();
         let origin = origin.map_or_else(String::new, |o| format!("Origin: {o}\r\n"));
-        let body = r#"{"name": "", "repo": ""}"#;
         write!(
             stream,
             "POST {path} HTTP/1.1\r\nHost: {host}\r\n{origin}Connection: close\r\n\
@@ -1576,12 +1576,13 @@ fn the_project_routes_refuse_a_request_from_another_site() {
     let here = format!("127.0.0.1:{}", fixture.port);
     let foreign = Some("http://evil.example");
     // Served here: a project with no name is refused by the route itself.
-    assert_eq!(ask("/api/projects", &here, None), 422);
-    assert_eq!(ask("/api/projects", &here, foreign), 403);
-    assert_eq!(ask("/api/projects", "evil.example", None), 403);
+    let nameless = r#"{"name": "", "repo": ""}"#;
+    assert_eq!(ask("/api/projects", &here, None, nameless), 422);
+    assert_eq!(ask("/api/projects", &here, foreign, ""), 403);
+    assert_eq!(ask("/api/projects", "evil.example", None, ""), 403);
     let remove = format!("/api/projects/{}/remove", ProjectId::random());
-    assert_eq!(ask(&remove, &here, foreign), 403);
-    assert_eq!(ask(&remove, "evil.example", None), 403);
+    assert_eq!(ask(&remove, &here, foreign, ""), 403);
+    assert_eq!(ask(&remove, "evil.example", None, ""), 403);
 }
 
 /// `GET /api/machines` once it answers 200: which machine is this one, and the list.
@@ -1797,35 +1798,51 @@ fn the_priority_route_is_served_and_refuses_a_request_from_another_site() {
     use std::io::{Read as _, Write as _};
     let mut fixture = Fixture::new();
     fixture.start();
+    // The answer, or `None` when the daemon reset the link before it was read. A refused request
+    // is answered before its body is read; a body that arrives after the daemon closed resets
+    // the link, and macOS then drops an answer not yet read. Sent in one write, the body comes
+    // with the head, so that is rare, and the settings below say whether anything was stored.
     let ask = |host: &str, origin: Option<&str>, body: &str| {
         let mut stream = std::net::TcpStream::connect(("127.0.0.1", fixture.port)).unwrap();
         let origin = origin.map_or_else(String::new, |o| format!("Origin: {o}\r\n"));
-        write!(
-            stream,
+        let request = format!(
             "POST /api/machines/priority HTTP/1.1\r\nHost: {host}\r\n{origin}Connection: close\r\n\
              Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
-        )
-        .unwrap();
+        );
+        stream.write_all(request.as_bytes()).unwrap();
         let mut response = String::new();
-        stream.read_to_string(&mut response).unwrap();
+        match stream.read_to_string(&mut response) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => return None,
+            Err(e) => panic!("reading the answer: {e}"),
+        }
         let status = response.split(' ').nth(1).unwrap().parse::<u16>().unwrap();
-        (status, response)
+        Some((status, response))
     };
     let here = format!("127.0.0.1:{}", fixture.port);
     // Served here: an id the machine list does not hold is refused by the route itself, not as
     // an unrouted path.
     let stranger = format!(r#"{{"order": ["{}"]}}"#, MachineId::random());
-    let (status, answer) = ask(&here, None, &stranger);
+    let (status, answer) = ask(&here, None, &stranger).expect("the route reads what it refuses");
     assert_eq!(status, 422, "{answer}");
     assert!(answer.contains("machine list"), "{answer}");
     // An order the route would take from this site, sent from another: refused, nothing set.
+    let order = r#"{"order": []}"#;
     let before = settings_of(&fixture);
-    let (status, answer) = ask(&here, Some("http://evil.example"), r#"{"order": []}"#);
-    assert_eq!(status, 403, "{answer}");
-    let (status, answer) = ask("evil.example", None, r#"{"order": []}"#);
-    assert_eq!(status, 403, "{answer}");
+    for (host, origin) in [
+        (here.as_str(), Some("http://evil.example")),
+        ("evil.example", None),
+    ] {
+        if let Some((status, answer)) = ask(host, origin, order) {
+            assert_eq!(status, 403, "{answer}");
+        }
+    }
     let after = settings_of(&fixture);
     assert_eq!(after.seq, before.seq);
     assert_eq!(after.priority, before.priority);
+    // The same order from this site is stored, so the unchanged settings above are the refusal.
+    let (status, answer) = ask(&here, None, order).expect("the route reads what it stores");
+    assert_eq!(status, 204, "{answer}");
+    assert_ne!(settings_of(&fixture).seq, before.seq);
 }
