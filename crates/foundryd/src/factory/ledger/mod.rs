@@ -2601,4 +2601,42 @@ mod tests {
         assert!(tallies[&run(8)].first.is_none());
         assert!(tallies[&run(8)].gate_attempts.is_empty());
     }
+
+    #[test]
+    fn a_finished_run_holding_a_row_this_build_cannot_read_is_a_store_error_whatever_its_key_order()
+    {
+        let (low, high) = (
+            MachineId(uuid::Uuid::from_u128(1)),
+            MachineId(uuid::Uuid::from_u128(u128::MAX)),
+        );
+        for (finisher, damaged) in [(low, high), (high, low)] {
+            let (dir, store) = open_store();
+            put(
+                &store,
+                finisher,
+                1,
+                &run(8),
+                1,
+                T0,
+                "finished",
+                json!({"outcome": "stuck"}),
+                None,
+            );
+            let conn = rusqlite::Connection::open(dir.path().join("foundry.db")).unwrap();
+            conn.execute(
+                "INSERT INTO factory_records (kind, id, owner, version, record)
+                 VALUES ('run_event', ?1, ?2, 1, '{\"kind\":\"run_event\",\"later\":true}')",
+                rusqlite::params![format!("{}/{damaged}/1", run(8)), damaged.to_string()],
+            )
+            .unwrap();
+            let ledger = ledger(&store, MachineId::random(), 2, ticking(T0, 1000));
+            assert!(
+                matches!(
+                    ledger.write(&run(8), &step("red"), &test_cause()),
+                    Err(LedgerError::Store(_))
+                ),
+                "finished by {finisher}"
+            );
+        }
+    }
 }
