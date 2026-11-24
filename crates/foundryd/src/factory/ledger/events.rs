@@ -5,9 +5,14 @@
 //! where the runner writes `null`, and a field the runner leaves out when absent left out here
 //! too. The runner's `docs/reference/ledger.md` (softfac's) is the spec of both.
 //!
+//! The store keeps an event's `data` and cause as JSON objects whose keys are sorted (the
+//! `run_event` record says so). The runner's key order is [`FIELDS`], [`RESUMED_FROM_FIELDS`],
+//! [`CHECK_FIELDS`] and [`CAUSE_FIELDS`], and
+//! [`read::runner_line`](super::read::runner_line) writes a stored event in it.
+//!
 //! A [`Cause`] says which part of the factory wrote an event and why. Its text is cleaned and
 //! cut as the runner's `makeCause` and `causeObject` do, so no text from a comment, a prompt
-//! or a session reaches a cause whole.
+//! or a session reaches a cause whole; the ledger hides secrets in it first.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -270,19 +275,54 @@ mod state_name {
 }
 
 impl Event {
-    /// The event's name and its `data`, as the ledger stores them.
+    /// The event's name, as it is written.
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Event::Claimed { .. } => "claimed",
+            Event::TriageResult { .. } => "triage_result",
+            Event::QuestionsPosted { .. } => "questions_posted",
+            Event::AnswerReceived { .. } => "answer_received",
+            Event::SessionLaunched { .. } => "session_launched",
+            Event::CommentForwarded { .. } => "comment_forwarded",
+            Event::SessionInterrupted { .. } => "session_interrupted",
+            Event::SessionRateLimited { .. } => "session_rate_limited",
+            Event::SessionPaused { .. } => "session_paused",
+            Event::StopRequested { .. } => "stop_requested",
+            Event::StepChanged { .. } => "step_changed",
+            Event::PrOpened { .. } => "pr_opened",
+            Event::PrLeft { .. } => "pr_left",
+            Event::PrAdopted { .. } => "pr_adopted",
+            Event::BranchBound { .. } => "branch_bound",
+            Event::PrSetDraft { .. } => "pr_set_draft",
+            Event::PrReadyOutside { .. } => "pr_ready_outside",
+            Event::GateCommand { .. } => "gate_command",
+            Event::GateSentBack { .. } => "gate_sent_back",
+            Event::GateCheckout { .. } => "gate_checkout",
+            Event::GateFinished { .. } => "gate_finished",
+            Event::GateRegate { .. } => "gate_regate",
+            Event::RegateRelaunching { .. } => "regate_relaunching",
+            Event::FeedbackRelaunching { .. } => "feedback_relaunching",
+            Event::FeedbackForwarding { .. } => "feedback_forwarding",
+            Event::GateCleanupFailed { .. } => "gate_cleanup_failed",
+            Event::WorktreeRemoved { .. } => "worktree_removed",
+            Event::WorktreeRemoveFailed { .. } => "worktree_remove_failed",
+            Event::ChecksRead { .. } => "checks_read",
+            Event::StateChanged { .. } => "state_changed",
+            Event::Stuck { .. } => "stuck",
+            Event::Error { .. } => "error",
+            Event::Finished { .. } => "finished",
+        }
+    }
+
+    /// The event's name and its `data`, as the ledger stores them: `data` is a JSON object,
+    /// whose keys the store keeps sorted. [`read::runner_line`](super::read::runner_line)
+    /// writes them in the runner's order again.
     pub fn parts(&self) -> (&'static str, Value) {
-        let Ok(Value::Object(mut whole)) = serde_json::to_value(self) else {
-            unreachable!("an event is an object of strings, numbers, flags and lists");
+        let data = match serde_json::to_value(self) {
+            Ok(Value::Object(mut whole)) => whole.remove("data").unwrap_or(Value::Null),
+            _ => unreachable!("an event is an object of strings, numbers, flags and lists"),
         };
-        let name = whole
-            .get("event")
-            .and_then(Value::as_str)
-            .and_then(|name| FIELDS.iter().find(|(known, _)| *known == name))
-            .map(|(known, _)| *known)
-            .expect("every event is in the field table");
-        let data = whole.remove("data").unwrap_or(Value::Null);
-        (name, data)
+        (self.name(), data)
     }
 
     /// The event a stored name and `data` hold, or `None` when this build does not know the
@@ -429,15 +469,16 @@ impl Cause {
         }
     }
 
-    /// Who did it, cleaned and cut at 100 characters.
+    /// Who did it. Kept as given; [`cleaned`](Self::cleaned) cuts it at 100 characters.
     pub fn actor(mut self, actor: &str) -> Self {
-        self.actor = Some(clean(actor, CAUSE_FIELD_LIMIT));
+        self.actor = Some(actor.to_owned());
         self
     }
 
-    /// Which gate command, cleaned and cut at 1000 characters.
+    /// Which gate command. Kept as given; [`cleaned`](Self::cleaned) cuts it at 1000
+    /// characters.
     pub fn command(mut self, command: &str) -> Self {
-        self.command = Some(clean(command, CAUSE_COMMAND_LIMIT));
+        self.command = Some(command.to_owned());
         self
     }
 
@@ -447,16 +488,28 @@ impl Cause {
         self
     }
 
-    /// Which label, cleaned and cut at 100 characters.
+    /// Which label. Kept as given; [`cleaned`](Self::cleaned) cuts it at 100 characters.
     pub fn label(mut self, label: &str) -> Self {
-        self.label = Some(clean(label, CAUSE_FIELD_LIMIT));
+        self.label = Some(label.to_owned());
         self
     }
 
-    /// The cause as it is written: its text cleaned and cut again, so a cause built by hand
-    /// cannot put session or comment text in the ledger. `reason`, `actor` and `label` are cut
-    /// at 100 characters, `command` at 1000.
+    /// The cause as it is written: its text on one line with no control or bidi characters,
+    /// and cut, so a cause cannot put session or comment text in the ledger whole. `reason`,
+    /// `actor` and `label` are cut at 100 characters, `command` at 1000.
     pub fn cleaned(&self) -> Cause {
+        self.cleaned_with(&|text: &str| text.to_owned())
+    }
+
+    /// [`cleaned`](Self::cleaned), with every text through `hide` before it is cut, so a cut
+    /// never leaves part of a secret that `hide` would no longer recognise. `hide` sees the text
+    /// as given and again once its control characters are gone, so one placed inside a secret
+    /// cannot keep it from being hidden.
+    pub fn cleaned_with(&self, hide: &dyn Fn(&str) -> String) -> Cause {
+        let clean = |text: &str, limit: usize| -> String {
+            let hidden = hide(&strip(&hide(text)));
+            strip(&hidden).chars().take(limit).collect()
+        };
         let cut = |text: &Option<String>, limit| text.as_deref().map(|text| clean(text, limit));
         Cause {
             step: self.step,
@@ -475,12 +528,9 @@ fn is_unsafe(c: char) -> bool {
     matches!(c, '\u{0}'..='\u{1f}' | '\u{7f}'..='\u{9f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
 }
 
-/// `text` on one line with no control or bidi characters, cut at `limit` characters.
-fn clean(text: &str, limit: usize) -> String {
-    text.chars()
-        .filter(|c| !is_unsafe(*c))
-        .take(limit)
-        .collect()
+/// `text` on one line with no control or bidi characters.
+fn strip(text: &str) -> String {
+    text.chars().filter(|c| !is_unsafe(*c)).collect()
 }
 
 #[cfg(test)]

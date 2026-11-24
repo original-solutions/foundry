@@ -15,17 +15,14 @@ use foundry_proto::factory::{RunEvent, RunId};
 use serde_json::Value;
 
 use super::Ledger;
+use super::events::{CAUSE_FIELDS, CHECK_FIELDS, RESUMED_FROM_FIELDS, fields as fields_of};
 use crate::store::{Store, StoreError};
 
 impl Ledger {
     /// The events of `run`, from every writer, in order: by the lease generation each was
     /// written under, then by its writer's factory version. Never by time.
     pub fn read(&self, run: &RunId) -> Result<Vec<RunEvent>, StoreError> {
-        let store = self
-            .store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        events(&store, run)
+        events(&self.lock(), run)
     }
 }
 
@@ -62,6 +59,102 @@ fn is_cause(cause: Option<&Value>) -> bool {
         && text_or_absent("command")
         && text_or_absent("label")
         && attempt_ok
+}
+
+/// `event` as a line of the runner's run file, without its newline: `ts`, `ms`, `event`,
+/// `data` and `cause`, with the keys of `data`, of its nested shapes and of the cause in the
+/// runner's order. Keys the runner does not list, of an event this build does not know or
+/// added by a newer one, follow in the order the store holds them. A cause that is absent is
+/// left out, as the runner leaves out one from before causes existed.
+pub fn runner_line(event: &RunEvent) -> String {
+    let mut text = format!(
+        "{{\"ts\":{},\"ms\":{},\"event\":{},\"data\":",
+        Value::from(event.ts.as_str()),
+        event.ms,
+        Value::from(event.event.as_str()),
+    );
+    write_data(&mut text, &event.event, &event.data);
+    if let Some(cause) = &event.cause {
+        text.push_str(",\"cause\":");
+        write_ordered(&mut text, cause, &CAUSE_FIELDS);
+    }
+    text.push('}');
+    text
+}
+
+/// `data` of the event called `name`, in the runner's order. The data of an event this build
+/// does not know is written with its keys as held.
+fn write_data(text: &mut String, name: &str, data: &Value) {
+    let (Some(order), Value::Object(fields)) = (fields_of(name), data) else {
+        text.push_str(&data.to_string());
+        return;
+    };
+    text.push('{');
+    let mut first = true;
+    let mut put = |text: &mut String, key: &str, value: &Value| {
+        if !first {
+            text.push(',');
+        }
+        first = false;
+        text.push_str(&Value::from(key).to_string());
+        text.push(':');
+        match (name, key, value) {
+            ("session_launched", "resumed_from", Value::Object(_)) => {
+                write_ordered(text, value, &RESUMED_FROM_FIELDS);
+            }
+            ("checks_read", "checks", Value::Array(checks)) => {
+                text.push('[');
+                for (i, check) in checks.iter().enumerate() {
+                    if i > 0 {
+                        text.push(',');
+                    }
+                    write_ordered(text, check, &CHECK_FIELDS);
+                }
+                text.push(']');
+            }
+            _ => text.push_str(&value.to_string()),
+        }
+    };
+    for key in order {
+        if let Some(value) = fields.get(*key) {
+            put(text, key, value);
+        }
+    }
+    for (key, value) in fields {
+        if !order.contains(&key.as_str()) {
+            put(text, key, value);
+        }
+    }
+    text.push('}');
+}
+
+/// `value` with the keys in `order` first, in that order, then the rest as held. A value that
+/// is not an object is written as it is.
+fn write_ordered(text: &mut String, value: &Value, order: &[&str]) {
+    let Value::Object(fields) = value else {
+        text.push_str(&value.to_string());
+        return;
+    };
+    let keys = order
+        .iter()
+        .copied()
+        .filter(|key| fields.contains_key(*key))
+        .chain(
+            fields
+                .keys()
+                .map(String::as_str)
+                .filter(|key| !order.contains(key)),
+        );
+    text.push('{');
+    for (i, key) in keys.enumerate() {
+        if i > 0 {
+            text.push(',');
+        }
+        text.push_str(&Value::from(key).to_string());
+        text.push(':');
+        text.push_str(&fields[key].to_string());
+    }
+    text.push('}');
 }
 
 /// The value at `key` of an event's `data`; `None` when the data is not an object with it.

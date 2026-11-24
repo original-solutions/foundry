@@ -13,10 +13,10 @@
 //! machine whose clock is behind cannot move its events before an earlier holder's.
 //!
 //! Before an event is stored, every text in its data and cause goes through the ledger's
-//! [`Hide`], which hides the secrets this machine holds, and then each text of the data is cut
-//! to its last [`OUTPUT_LIMIT`] bytes.
+//! [`Hide`], which hides the secrets this machine holds, and only then is it cut: each text of
+//! the data to its last [`OUTPUT_LIMIT`] bytes, and the cause's as the runner cuts them.
 
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use foundry_proto::factory::{FactoryBody, FactoryRecord, RunEvent, RunId};
@@ -35,8 +35,9 @@ pub mod read;
 /// The most output an event keeps, in bytes: a gate or setup tail is cut to its last 64 KB.
 pub const OUTPUT_LIMIT: usize = 64 * 1024;
 
-/// Hides the secrets this machine holds in a text. The daemon's hides every `github:*` token
-/// and gateway key in its secret store at the time of the call (`secrets::hide_known`).
+/// Hides the secrets this machine holds in a text. The daemon's must hide every `github:*`
+/// token and gateway key in its secret store at the time of the call, and URL passwords, as
+/// task 7's `secrets::hide_known` will; the ledger is given it when it is made.
 pub type Hide = Arc<dyn Fn(&str) -> String + Send + Sync>;
 
 /// The wall-clock time as Unix epoch milliseconds: what an event is stamped with.
@@ -103,6 +104,12 @@ impl Ledger {
         self.generation
     }
 
+    /// The store, locked. A task that panicked while holding it leaves it consistent: SQLite
+    /// rolls back what it did not commit.
+    fn lock(&self) -> MutexGuard<'_, Store> {
+        self.store.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Writes `event` as the next event of `run`, stamped with this ledger's generation and the
     /// time, and gives back what was stored. A `finished` event gets the run's own `total_ms`,
     /// the time from its first event (never negative), and `gate_attempts`, the distinct
@@ -115,10 +122,9 @@ impl Ledger {
         cause: &Cause,
     ) -> Result<RunEvent, LedgerError> {
         let (name, mut data) = event.parts();
-        // A task that panicked while holding the store leaves it consistent: SQLite rolls back
-        // what it did not commit. The lock is held from the read to the write, so this
-        // machine's own writes of one run never cross.
-        let mut store = self.store.lock().unwrap_or_else(PoisonError::into_inner);
+        // The lock is held from the read to the write, so this machine's own writes of one
+        // run never cross.
+        let mut store = self.lock();
         let held = store.run_events(run)?;
         // A `finished` event ends the run even when its data cannot be read.
         if held.iter().any(|event| event.event == "finished") {
@@ -130,10 +136,9 @@ impl Ledger {
             fields.insert("total_ms".into(), ms.saturating_sub(first).into());
             fields.insert("gate_attempts".into(), gate_attempts(&held).into());
         }
-        hide_texts(&mut data, &*self.hide, true);
-        let mut cause = serde_json::to_value(cause.cleaned())
+        hide_texts(&mut data, &*self.hide);
+        let cause = serde_json::to_value(cause.cleaned_with(&*self.hide))
             .expect("a cause is an object of strings and a number");
-        hide_texts(&mut cause, &*self.hide, false);
         let written = RunEvent {
             run: run.clone(),
             generation: self.generation,
@@ -176,47 +181,37 @@ impl Ledger {
     }
 }
 
-/// The distinct attempts among `events`' `gate_command` events. Only one the runner's reader
-/// would read whole counts: an attempt that is a u32, a command, an exit code that is an i32
-/// and a duration that is a u64.
+/// The distinct attempts among `events`' `gate_command` events. Only one that reads whole as
+/// its typed event counts, as only one the runner's reader reads whole does: an attempt that
+/// is a u32, a command, an exit code that is an i32 and a duration that is a u64.
 fn gate_attempts(events: &[RunEvent]) -> u32 {
-    let attempts: std::collections::BTreeSet<u64> = events
+    let attempts: std::collections::BTreeSet<u32> = events
         .iter()
         .filter(|event| event.event == "gate_command")
-        .filter_map(|event| {
-            let data = &event.data;
-            let attempt = data.get("attempt")?.as_u64()?;
-            u32::try_from(attempt).ok()?;
-            data.get("command")?.as_str()?;
-            i32::try_from(data.get("exit_code")?.as_i64()?).ok()?;
-            data.get("duration_ms")?.as_u64()?;
-            Some(attempt)
-        })
+        .filter_map(
+            |event| match Event::from_parts(&event.event, &event.data)? {
+                Event::GateCommand { attempt, .. } => Some(attempt),
+                _ => None,
+            },
+        )
         .collect();
     u32::try_from(attempts.len()).unwrap_or(u32::MAX)
 }
 
-/// Every text in `value` through `hide`, and, when `cut`, then cut to its last
-/// [`OUTPUT_LIMIT`] bytes. Hiding comes first, so a cut can never leave the end of a secret
-/// that the hiding would no longer recognise.
-fn hide_texts(value: &mut Value, hide: &(dyn Fn(&str) -> String + Send + Sync), cut: bool) {
+/// Every text in `value` through `hide`, then cut to its last [`OUTPUT_LIMIT`] bytes. Hiding
+/// comes first, so a cut can never leave the end of a secret that the hiding would no longer
+/// recognise.
+fn hide_texts(value: &mut Value, hide: &(dyn Fn(&str) -> String + Send + Sync)) {
     match value {
-        Value::String(text) => {
-            let hidden = hide(text);
-            *text = if cut {
-                cut_output(&hidden).to_owned()
-            } else {
-                hidden
-            };
-        }
+        Value::String(text) => *text = cut_output(&hide(text)).to_owned(),
         Value::Array(items) => {
             for item in items {
-                hide_texts(item, hide, cut);
+                hide_texts(item, hide);
             }
         }
         Value::Object(fields) => {
             for item in fields.values_mut() {
-                hide_texts(item, hide, cut);
+                hide_texts(item, hide);
             }
         }
         Value::Null | Value::Bool(_) | Value::Number(_) => {}

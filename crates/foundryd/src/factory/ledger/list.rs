@@ -12,6 +12,7 @@
 
 use foundry_proto::factory::{RunEvent, RunId};
 
+use super::Ledger;
 use super::events::PrEnd;
 use super::read::{events, field, text};
 use crate::factory::lifecycle::State;
@@ -25,6 +26,28 @@ const LAUNCH_SENDING: &str = "launch-sending";
 
 /// The step written before a launch that carries on from an earlier branch is sent.
 const LAUNCH_SENDING_RESUMED: &str = "launch-sending resumed-from ";
+
+impl Ledger {
+    /// [`runs`] of the ledger's store.
+    pub fn runs(&self, repo: &str) -> Result<Vec<RunInfo>, StoreError> {
+        runs(&self.lock(), repo)
+    }
+
+    /// [`issue_runs`] of the ledger's store.
+    pub fn issue_runs(&self, repo: &str, issue: u64) -> Result<Vec<RunInfo>, StoreError> {
+        issue_runs(&self.lock(), repo, issue)
+    }
+
+    /// [`next_attempt`] of the ledger's store.
+    pub fn next_attempt(&self, repo: &str, issue: u64) -> Result<u32, StoreError> {
+        next_attempt(&self.lock(), repo, issue)
+    }
+
+    /// [`summaries`] of the ledger's store.
+    pub fn summaries(&self, repo: &str) -> Result<Vec<RunSummary>, StoreError> {
+        summaries(&self.lock(), repo)
+    }
+}
 
 /// The longest reason a summary carries, in characters.
 pub const REASON_MAX_CHARS: usize = 300;
@@ -144,6 +167,10 @@ fn unreadable(id: RunId) -> RunInfo {
 }
 
 /// The unfinished runs among `ids`, unreadable ones last.
+///
+/// Each run's events are read whole, finished runs' too, since the store has no read of a
+/// run's last event yet. The runner reads only a finished file's tail; a read of the runs of a
+/// repo that have a `finished` event, in the store, would let this skip them the same way.
 fn unfinished(store: &Store, ids: Vec<RunId>) -> Vec<RunInfo> {
     let (mut readable, mut rest) = (Vec::new(), Vec::new());
     for id in ids {
