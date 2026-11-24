@@ -4388,3 +4388,243 @@ async fn the_token_fetch_reads_no_config_a_worktree_can_write() {
         "real again\n"
     );
 }
+
+// ---- Review cycle 1 ----
+
+/// A bare repo with `README.md` holding `text` on `main`, standing in for another remote.
+fn other_repo(setup: &Setup, text: &str) -> PathBuf {
+    let other = setup.remotes.path().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    git(&other, &["init", "-q", "--bare", "other.git"]);
+    git(&other, &["clone", "-q", "other.git", "src"]);
+    std::fs::write(other.join("src/README.md"), text).unwrap();
+    git(&other.join("src"), &["add", "-A"]);
+    git(&other.join("src"), &["commit", "-q", "-m", "other"]);
+    git(
+        &other.join("src"),
+        &["push", "-q", "origin", "HEAD:refs/heads/main"],
+    );
+    other.join("other.git")
+}
+
+fn fetch_repo_of(setup: &Setup, project: ProjectId) -> PathBuf {
+    setup
+        .data
+        .path()
+        .join("fetches")
+        .join(format!("{project}.git"))
+}
+
+fn readme(worktree: &Path) -> String {
+    std::fs::read_to_string(worktree.join("README.md")).unwrap()
+}
+
+#[tokio::test]
+async fn the_token_fetch_reads_no_config_planted_in_the_fetch_repo() {
+    let secrets = Arc::new(MemorySecrets::default());
+    secrets
+        .set("github:rawphp", "ghp_madeUpToken1234567890abcdefABCDEF")
+        .unwrap();
+    let setup = Setup::with_secrets(secrets);
+    let remote = setup.project(&[("README.md", "real\n")]);
+    setup.factory_on(remote.project, "rawphp");
+    setup.create(&remote, "main", "first").await;
+    let other = other_repo(&setup, "evil\n");
+    let fetches = fetch_repo_of(&setup, remote.project);
+    let repo = remote.bare.to_str().unwrap();
+    let key = format!("url.{}.insteadOf", other.display());
+
+    // Another process of the daemon's user rewrites the repo's URL in the fetch repo's config.
+    git(&fetches, &["config", &key, repo]);
+    remote.push("main", &[("README.md", "real again\n")]);
+    let id = setup.create(&remote, "main", "second").await;
+    assert_eq!(
+        readme(&setup.workspaces.worktree(id).await.unwrap()),
+        "real again\n"
+    );
+
+    // Or has it read a file that does.
+    let included = setup.remotes.path().join("included");
+    std::fs::write(
+        &included,
+        format!("[url \"{}\"]\n\tinsteadOf = {repo}\n", other.display()),
+    )
+    .unwrap();
+    git(
+        &fetches,
+        &["config", "include.path", included.to_str().unwrap()],
+    );
+    remote.push("main", &[("README.md", "real a third time\n")]);
+    let id = setup.create(&remote, "main", "third").await;
+    assert_eq!(
+        readme(&setup.workspaces.worktree(id).await.unwrap()),
+        "real a third time\n"
+    );
+}
+
+#[tokio::test]
+async fn a_retry_of_a_tag_whose_setup_never_started_starts_it() {
+    // A holder that is not there yet, so the first create makes the workspace and no setup.
+    let dir = tempfile::Builder::new()
+        .prefix("fh")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let at = dir.path().join("foundry-holder");
+    let setup = Setup::with(at.clone(), GIT_WITHIN);
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let make = || {
+        setup.make(
+            &remote,
+            "run",
+            new_branch("main", "fac/5-1"),
+            commands(&["true"], 30),
+            tag(remote.project, "run"),
+        )
+    };
+    let err = make().await.unwrap_err();
+    let WorkspaceError::SetupNotStarted { workspace, .. } = err else {
+        panic!("{err}");
+    };
+    assert_eq!(setup.body(workspace).setup, None);
+
+    std::os::unix::fs::symlink(holder(), &at).unwrap();
+    let again = make().await.unwrap();
+
+    assert_eq!(again, workspace);
+    assert_eq!(setup.workspace_records().len(), 1, "no new workspace");
+    let named = setup
+        .body(workspace)
+        .setup
+        .expect("the record names a setup");
+    let ended = setup.setup_ended(workspace).await;
+    assert_eq!(ended.id, named);
+    assert_eq!(ended.exit_code, Some(0));
+    // A third call finds the setup named and starts nothing more.
+    assert_eq!(make().await.unwrap(), workspace);
+    assert_eq!(setup.terminals_of(workspace).len(), 1);
+}
+
+#[test]
+fn checkout_setup_and_tag_have_the_wire_shape_a_carried_call_sends() {
+    fn pin<T>(value: T, json: serde_json::Value)
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
+    {
+        assert_eq!(serde_json::to_value(&value).unwrap(), json);
+        assert_eq!(serde_json::from_value::<T>(json).unwrap(), value);
+    }
+    use serde_json::json;
+    pin(
+        Checkout::NewBranch {
+            base: "main".into(),
+            branch: None,
+        },
+        json!({"kind": "new_branch", "base": "main", "branch": null}),
+    );
+    pin(
+        Checkout::NewBranch {
+            base: "main".into(),
+            branch: Some("fac/1".into()),
+        },
+        json!({"kind": "new_branch", "base": "main", "branch": "fac/1"}),
+    );
+    pin(
+        Checkout::Branch { name: "x".into() },
+        json!({"kind": "branch", "name": "x"}),
+    );
+    pin(
+        Checkout::Commit {
+            sha: "a".repeat(40),
+        },
+        json!({"kind": "commit", "sha": "a".repeat(40)}),
+    );
+    pin(Provision::Own, json!({"kind": "own"}));
+    pin(
+        Provision::Commands {
+            commands: vec!["a".into()],
+            limit_secs: 5,
+        },
+        json!({"kind": "commands", "commands": ["a"], "limit_secs": 5}),
+    );
+    pin(Provision::None, json!({"kind": "none"}));
+    let project = ProjectId::random();
+    pin(
+        FactoryTag {
+            project,
+            run: "owner__repo__1__1".into(),
+        },
+        json!({"project": project.to_string(), "run": "owner__repo__1__1"}),
+    );
+}
+
+#[tokio::test]
+async fn a_branch_checkout_that_moves_a_local_branch_logs_the_commits_no_remote_has() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    remote.push("feature", &[("F.md", "one\n")]);
+    let first = setup
+        .make(&remote, "first", existing("feature"), Provision::Own, None)
+        .await
+        .unwrap();
+    let worktree = setup.workspaces.worktree(first).await.unwrap();
+    git(
+        &worktree,
+        &[
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "only on this machine",
+        ],
+    );
+    setup.workspaces.archive(first, true).await.unwrap();
+    remote.push("feature", &[("F.md", "two\n")]);
+
+    let logs = Logged::default();
+    let _guard = logs.capture();
+    let again = setup
+        .make(&remote, "again", existing("feature"), Provision::Own, None)
+        .await
+        .unwrap();
+
+    // Moved, as the spec has it, and said so.
+    assert_eq!(
+        setup.branch_at(remote.project, "feature").trim(),
+        setup.remote_at(&remote, "refs/heads/feature")
+    );
+    let text = logs.text();
+    assert!(text.contains("WARN"), "{text}");
+    assert!(text.contains("feature"), "{text}");
+    assert!(text.contains("only on this machine"), "{text}");
+    let _ = again;
+}
+
+#[tokio::test]
+async fn a_marker_that_cannot_be_parsed_is_skipped_and_logged() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let sha = setup.remote_at(&remote, "refs/heads/main");
+    let folder = setup
+        .data
+        .path()
+        .join("worktrees")
+        .join(remote.project.to_string());
+    std::fs::create_dir_all(&folder).unwrap();
+    let broken = format!("{}.factory", WorkspaceId::random());
+    std::fs::write(folder.join(&broken), "{ not json").unwrap();
+
+    let logs = Logged::default();
+    let _guard = logs.capture();
+    setup
+        .make(
+            &remote,
+            "a",
+            commit_of(&sha),
+            Provision::None,
+            tag(remote.project, "run"),
+        )
+        .await
+        .unwrap();
+
+    assert!(logs.text().contains(&broken), "{}", logs.text());
+}
