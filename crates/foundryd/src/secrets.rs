@@ -706,6 +706,34 @@ mod tests {
     }
 
     #[test]
+    fn redact_hides_a_password_that_holds_a_quote() {
+        for text in [
+            "https://bot:pa\"ss@github.com/o/r",
+            "https://bot:pa'ss@github.com/o/r",
+        ] {
+            let shown = redact(text);
+            for part in ["bot", "pa", "ss"] {
+                assert!(!shown.contains(part), "{text} → {shown}");
+            }
+            assert!(shown.contains("@github.com/o/r"), "{text} → {shown}");
+        }
+    }
+
+    #[test]
+    fn redact_keeps_the_quotes_around_a_url_quoted_in_text() {
+        let shown = redact("see \"https://u:p@host/x\" now");
+        assert!(!shown.contains("u:p"), "{shown}");
+        assert_eq!(shown, "see \"https://***@host/x\" now");
+        let shown = redact("see 'https://u:p@host' now");
+        assert_eq!(shown, "see 'https://***@host' now");
+        assert_eq!(redact("'https://host/x'"), "'https://host/x'");
+        assert_eq!(
+            redact("\"https://host\" and 'https://h'"),
+            "\"https://host\" and 'https://h'"
+        );
+    }
+
+    #[test]
     fn the_login_rule_gives_the_limit_and_is_what_a_refusal_says() {
         assert!(
             LOGIN_RULE.contains(&format!("at most {LOGIN_MAX} characters")),
