@@ -134,10 +134,16 @@ fn factory_env(
     Ok(env)
 }
 
-/// The netrc of the owner whose HOME is `home`: `<home>/.netrc`. None without a HOME.
-fn netrc_of(home: Option<std::ffi::OsString>) -> Option<PathBuf> {
-    home.filter(|home| !home.is_empty())
-        .map(|home| PathBuf::from(home).join(".netrc"))
+/// The netrc the check reads.
+fn owner_netrc(
+    test_home: Option<&Path>,
+    env_home: Option<std::ffi::OsString>,
+    _passwd_home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    let home = test_home
+        .map(Path::to_path_buf)
+        .or(env_home.map(PathBuf::from))?;
+    Some(home.join(".netrc"))
 }
 
 /// The check's git: `base` with what the session overrides out of it, so it lists the config
@@ -163,9 +169,13 @@ fn check_git(mut git: Command, home: Option<&Path>) -> Command {
 /// `$HOME/.netrc`. With `home` (tests), that folder stands for HOME.
 fn owner_setup_refusal(home: Option<&Path>, worktree: &Path) -> Result<(), SessionError> {
     let git = || check_git(Command::new("git"), home);
-    let netrc = netrc_of(
-        home.map(|home| home.as_os_str().to_owned())
-            .or_else(|| std::env::var_os("HOME")),
+    let netrc = owner_netrc(
+        home,
+        std::env::var_os("HOME"),
+        nix::unistd::User::from_uid(nix::unistd::geteuid())
+            .ok()
+            .flatten()
+            .map(|user| user.dir),
     );
     git_refusal(git, netrc.as_deref(), worktree)
 }
@@ -1648,15 +1658,8 @@ exec "$agent" "$@""#;
     /// session's own overrides.
     fn owner_git(home: &Path) -> impl Fn() -> Command + '_ {
         move || {
-            let mut git = Command::new("git");
-            git.env("HOME", home)
-                .env("XDG_CONFIG_HOME", home)
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env_remove("GIT_CONFIG_GLOBAL")
-                .env_remove("GIT_CONFIG_SYSTEM")
-                .env_remove("GIT_CONFIG_PARAMETERS")
-                .env_remove("GIT_CONFIG_COUNT");
-            git
+            let git = Command::new("git");
+            check_git(git, Some(home))
         }
     }
 
@@ -1930,9 +1933,12 @@ exec "$agent" "$@""#;
             format!("machine \"github.com\" login bob password {SECRET}\n"),
             format!("Machine GITHUB.COM login bob password {SECRET}\n"),
             format!("Default login bob password {SECRET}\n"),
-            format!(
-                "machine example.com login a\\ b password x\nmachine github.com password {SECRET}\n"
-            ),
+            format!("machine example.com login a\\ machine github.com password {SECRET}\n"),
+            format!("machine example.com login machine github.com password {SECRET}\n"),
+            format!("machine example.com password machine github.com login {SECRET}\n"),
+            format!("machine example.com account machine github.com password {SECRET}\n"),
+            format!("# GitHub login\nmachine github.com login bob password {SECRET}\n"),
+            format!("machine example.com\n  login a\nmachine\ngithub.com password {SECRET}\n"),
         ] {
             let (home, repo) = setup("");
             std::fs::write(home.path().join(".netrc"), &netrc).unwrap();
@@ -1941,6 +1947,23 @@ exec "$agent" "$@""#;
 
             assert!(said.contains(".netrc"), "{netrc:?} {said}");
             assert!(!said.contains(SECRET), "{said}");
+        }
+    }
+
+    #[test]
+    fn a_netrc_with_no_entry_for_github_com_is_not_refused() {
+        for netrc in [
+            format!("# machine github.com login u password {SECRET}\n"),
+            format!("machine example.com login \"a\\\" machine github.com\" password {SECRET}\n"),
+            format!(
+                "machine example.com login a\nmacdef init\nmachine github.com\n\nmachine other.example password {SECRET}\n"
+            ),
+            format!("machine github.com.example login a password {SECRET}\n"),
+        ] {
+            let (home, repo) = setup("");
+            std::fs::write(home.path().join(".netrc"), &netrc).unwrap();
+
+            check(home.path(), repo.path()).unwrap_or_else(|e| panic!("{netrc:?}: {e}"));
         }
     }
 
@@ -1967,12 +1990,42 @@ exec "$agent" "$@""#;
     }
 
     #[test]
-    fn the_netrc_is_in_the_home_given_and_none_without_one() {
+    fn the_netrc_is_in_the_test_home_or_the_env_home_or_the_passwd_home() {
+        let some = |p: &str| Some(PathBuf::from(p));
+        let os = |p: &str| Some(std::ffi::OsString::from(p));
         assert_eq!(
-            netrc_of(Some("/home/o".into())),
-            Some(PathBuf::from("/home/o/.netrc"))
+            owner_netrc(None, os("/home/o"), None),
+            some("/home/o/.netrc")
         );
-        assert_eq!(netrc_of(None), None);
+        assert_eq!(
+            owner_netrc(Some(Path::new("/t")), os("/home/o"), some("/pw")),
+            some("/t/.netrc")
+        );
+        assert_eq!(
+            owner_netrc(None, os("/home/o"), some("/pw")),
+            some("/home/o/.netrc")
+        );
+        assert_eq!(owner_netrc(None, None, some("/pw")), some("/pw/.netrc"));
+        assert_eq!(owner_netrc(None, os(""), some("/pw")), some("/pw/.netrc"));
+        assert_eq!(owner_netrc(None, None, None), None);
+    }
+
+    #[test]
+    fn a_legacy_remote_file_with_a_user_name_refuses_and_names_the_file() {
+        let (home, repo) = setup("");
+        let remotes = repo.path().join(".git/remotes");
+        std::fs::create_dir_all(&remotes).unwrap();
+        std::fs::write(
+            remotes.join("origin"),
+            format!("URL: https://bob:{SECRET}@github.com/o/r.git\n"),
+        )
+        .unwrap();
+
+        let said = said(check(home.path(), repo.path()));
+
+        assert!(said.contains("remotes/origin"), "{said}");
+        assert!(!said.contains(SECRET), "{said}");
+        assert!(!said.contains("after a URL rewrite"), "{said}");
     }
 
     #[tokio::test]
@@ -2128,7 +2181,7 @@ exec "$agent" "$@""#;
         ));
         std::fs::write(
             home.path().join(".netrc"),
-            "machine example.com login a password default\nmacdef init\nmachine github.com\n\n",
+            "# machine github.com login u password pw\nmachine example.com login \"a\\\" machine github.com\" password pw\nmacdef init\nmachine github.com\n\n",
         )
         .unwrap();
         run(
