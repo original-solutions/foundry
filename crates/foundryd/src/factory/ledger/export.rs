@@ -1,11 +1,134 @@
 //! `foundryd factory export <dir>`: every run this machine holds, written in the runner's layout.
+//!
+//! The runner keeps each run as a file, `runs/<owner>__<repo>__<N>__<attempt>.jsonl`, of one
+//! line per event, and its `retro` reads a folder of them. The export writes each run the store
+//! holds, from every writer, as that file: its events in the ledger's order (the lease
+//! generation each was written under, then its writer's factory version, never a time), each
+//! as [`runner_line`] writes it, with the runner's keys in the runner's order. The generation
+//! is not written: the runner's lines have none.
+//!
+//! The export only reads the store. Each run's file is written whole beside its place and then
+//! moved into it, so a `retro` reading the folder meanwhile never finds half a run. Files in
+//! `runs/` that are not a run of this store are left as they are.
 
-use std::path::Path;
+use std::collections::BTreeSet;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-/// `foundryd factory export <dir>`. Not built yet: exits 2.
-pub fn command(_dir: &Path) -> ExitCode {
-    crate::not_built("factory export")
+use foundry_proto::factory::{FactoryBody, RunId};
+
+use super::read::{events, runner_line};
+use crate::store::{Store, StoreError};
+
+/// The folder under the export's directory that holds the run files, as in the runner's.
+pub const RUNS: &str = "runs";
+
+/// How many factory records one read of the store hands back while the runs are looked for.
+const PAGE: usize = 512;
+
+/// Why an export stopped.
+#[derive(Debug, thiserror::Error)]
+pub enum ExportError {
+    #[error("reading the store: {0}")]
+    Store(#[from] StoreError),
+    #[error("writing {}: {source}", path.display())]
+    Write { path: PathBuf, source: io::Error },
+}
+
+/// `foundryd factory export <dir>`: writes every run this machine's store holds into `dir`.
+/// A machine with no store yet holds no run: `dir/runs` is made empty, and no store is made.
+pub fn command(dir: &Path) -> ExitCode {
+    let Some(home) = crate::daemon::home() else {
+        eprintln!("foundryd factory export: set FOUNDRY_HOME or HOME");
+        return ExitCode::FAILURE;
+    };
+    let path = home.join("store.sqlite");
+    let written = if path.exists() {
+        Store::open(&path)
+            .map_err(ExportError::from)
+            .and_then(|store| export(&store, dir))
+    } else {
+        make_dir(&dir.join(RUNS)).map(|()| 0)
+    };
+    match written {
+        Ok(count) => {
+            let runs = if count == 1 { "run" } else { "runs" };
+            println!(
+                "foundryd factory export: {count} {runs} written to {}",
+                dir.join(RUNS).display()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("foundryd factory export: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Writes every run `store` holds as `dir/runs/<run>.jsonl`, each line an event as the runner
+/// writes it, in the ledger's order. Returns how many runs it wrote.
+pub fn export(store: &Store, dir: &Path) -> Result<usize, ExportError> {
+    let runs_dir = dir.join(RUNS);
+    make_dir(&runs_dir)?;
+    let runs = runs_by_page(store, PAGE)?;
+    for run in &runs {
+        let mut text = String::new();
+        for event in events(store, run)? {
+            text.push_str(&runner_line(&event));
+            text.push('\n');
+        }
+        write_whole(&runs_dir, &format!("{run}.jsonl"), &text)?;
+    }
+    Ok(runs.len())
+}
+
+/// Every run that `store` holds an event of, from any writer, once each, in order. Each
+/// writer's records are read `page` at a time, so the store is never read whole at once.
+fn runs_by_page(store: &Store, page: usize) -> Result<Vec<RunId>, StoreError> {
+    let mut runs = BTreeSet::new();
+    for owner in store.factory_versions()?.into_keys() {
+        let mut above = 0;
+        loop {
+            let records = store.factory_since(owner, above, page)?;
+            let Some(last) = records.last() else {
+                break;
+            };
+            above = last.version;
+            for record in records {
+                if let FactoryBody::RunEvent(event) = record.body {
+                    runs.insert(event.run);
+                }
+            }
+        }
+    }
+    Ok(runs.into_iter().collect())
+}
+
+fn make_dir(dir: &Path) -> Result<(), ExportError> {
+    fs::create_dir_all(dir).map_err(|source| ExportError::Write {
+        path: dir.to_owned(),
+        source,
+    })
+}
+
+/// Writes `text` as `dir/name`: whole into a file beside it first, then moved into place, so
+/// the file is either as it was or all of `text`.
+fn write_whole(dir: &Path, name: &str, text: &str) -> Result<(), ExportError> {
+    let path = dir.join(name);
+    let part = dir.join(format!(".{name}.part"));
+    let failed = |source| ExportError::Write {
+        path: path.clone(),
+        source,
+    };
+    if let Err(error) = fs::write(&part, text).and_then(|()| fs::rename(&part, &path)) {
+        // Best effort: what is left of the part file is no run file, whatever is in it.
+        let _ = fs::remove_file(&part);
+        return Err(failed(error));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
