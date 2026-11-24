@@ -170,6 +170,11 @@ impl GitAuth {
     /// repository the daemon made for it, as the runner's gate does (`git init --template=`
     /// then `git fetch <url>`). Never a fetch in a repository that a worktree, a session or a
     /// gate shares.
+    ///
+    /// Only HTTPS is allowed. A caller whose remote is a repository on this machine, as a
+    /// test's is, sets `GIT_ALLOW_PROTOCOL=https:file` on the command after this, as the runner
+    /// allows a `file://` base; both repositories must then be ones only the daemon writes,
+    /// since the calling one can name an `uploadpack` to run with the token.
     pub fn apply(&self, command: &mut Command) {
         assert!(
             command.get_args().len() == 0,
@@ -238,8 +243,9 @@ fn write_askpass(dir: &Path, path: &Path) -> io::Result<()> {
 /// config, where the machine's helpers (a keychain, `gh`) are named; no config the daemon's
 /// own environment may carry in; an empty `GIT_ASKPASS`, with which git asks neither
 /// `core.askPass` nor `SSH_ASKPASS`, and an empty `SSH_ASKPASS` for ssh itself; no token
-/// `gh` would take from the daemon's environment; and no terminal prompt, so a git call that
-/// needs a login fails at once. Each is a value, since a terminal's environment is set over
+/// `gh` would take from the daemon's environment, and no `gh` config, so `gh` finds no stored
+/// login either (and so neither does `gh auth git-credential`); and no terminal prompt, so a
+/// git call that needs a login fails at once. Each is a value, since a terminal's environment is set over
 /// the daemon's and cannot remove a variable: git and `gh` take an empty one as none. It
 /// holds no token. A helper that code in the terminal writes into the repository's own config
 /// is that code's doing: it could as well run the helper itself, which no environment
@@ -256,6 +262,8 @@ pub fn helpers_off_env() -> Vec<(String, String)> {
         ("GITHUB_TOKEN", ""),
         ("GH_ENTERPRISE_TOKEN", ""),
         ("GITHUB_ENTERPRISE_TOKEN", ""),
+        // gh reads its logins from this directory: here there is none to read.
+        ("GH_CONFIG_DIR", "/dev/null"),
         ("GIT_TERMINAL_PROMPT", "0"),
     ]
     .into_iter()
