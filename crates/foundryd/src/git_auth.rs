@@ -103,13 +103,15 @@ const ENV: [(&str, &str); 9] = [
 ///
 /// git's repo-local variables never cross into this call; a caller that wants one sets it after
 /// [`GitAuth::apply`]. They are every variable git lists as describing the current repository
-/// (`git rev-parse --local-env-vars`, read from git 2.54) except `GIT_NO_REPLACE_OBJECTS`,
-/// which [`ENV`] pins, plus `GIT_NAMESPACE`. Each makes the call read other config, objects or
-/// refs than those of the repository it runs in, and other config could turn TLS verification
-/// off for github.com. A test fails when the installed git lists a name that is missing here.
+/// (`git rev-parse --local-env-vars`) except `GIT_NO_REPLACE_OBJECTS`, which [`ENV`] pins,
+/// plus `GIT_NAMESPACE`. The list is the union of what git 2.39 and git 2.54 report, read from
+/// git 2.39.5 and git 2.54: git 2.39 also lists `GIT_INTERNAL_SUPER_PREFIX`, which later gits
+/// dropped from the list. Each makes the call read other config, objects or refs than those of
+/// the repository it runs in, and other config could turn TLS verification off for
+/// github.com. A test fails when the installed git lists a name that is missing here.
 ///
 /// Last, `GIT_SSL_NO_VERIFY`, which turns TLS verification off itself.
-const INHERITED: [&str; 16] = [
+const INHERITED: [&str; 17] = [
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_CONFIG",
     "GIT_CONFIG_PARAMETERS",
@@ -122,6 +124,7 @@ const INHERITED: [&str; 16] = [
     "GIT_INDEX_FILE",
     "GIT_REPLACE_REF_BASE",
     "GIT_PREFIX",
+    "GIT_INTERNAL_SUPER_PREFIX",
     "GIT_SHALLOW_FILE",
     "GIT_COMMON_DIR",
     "GIT_NAMESPACE",
@@ -593,7 +596,9 @@ mod tests {
     }
 
     /// Every variable `apply` drops when it is inherited: the whole list in the code, so a name
-    /// added to it later is tested too, and the ones git does not list, by name.
+    /// added to it later is tested too, and by name the ones that must stay dropped whatever git
+    /// is installed: those that inject config, name another repository or turn TLS verification
+    /// off, and `GIT_INTERNAL_SUPER_PREFIX`, which git 2.39 lists and git 2.54 does not.
     fn dropped() -> Vec<&'static str> {
         let mut names = INHERITED.to_vec();
         names.extend([
@@ -603,6 +608,7 @@ mod tests {
             "GIT_NAMESPACE",
             "GIT_DIR",
             "GIT_COMMON_DIR",
+            "GIT_INTERNAL_SUPER_PREFIX",
         ]);
         names.sort_unstable();
         names.dedup();
