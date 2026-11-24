@@ -4303,10 +4303,7 @@ async fn a_tag_whose_workspace_was_archived_answers_for_nothing() {
 
 #[tokio::test]
 async fn a_factory_workspaces_setup_terminal_environment_holds_no_token_and_no_askpass() {
-    const TOKEN: &str = "ghp_madeUpToken1234567890abcdefABCDEF";
-    let secrets = Arc::new(MemorySecrets::default());
-    secrets.set("github:rawphp", TOKEN).unwrap();
-    let setup = Setup::with_secrets(secrets);
+    let setup = Setup::with_secrets(secrets_with_token());
     let remote = setup.project(&[("README.md", "hello\n")]);
     setup.factory_on(remote.project, "rawphp");
     let id = setup
@@ -4370,15 +4367,17 @@ async fn a_factory_project_with_no_token_is_refused_and_nothing_is_made() {
 }
 
 #[tokio::test]
-async fn a_factory_project_with_a_token_is_fetched_through_a_repo_only_the_daemon_writes() {
-    const TOKEN: &str = "ghp_madeUpToken1234567890abcdefABCDEF";
-    let secrets = Arc::new(MemorySecrets::default());
-    secrets.set("github:rawphp", TOKEN).unwrap();
-    let setup = Setup::with_secrets(secrets);
+async fn a_factory_project_with_a_token_is_fetched_through_a_new_repo_each_time_and_it_is_gone_after()
+ {
+    let setup = Setup::with_secrets(secrets_with_token());
     let remote = setup.project(&[("README.md", "hello\n")]);
     setup.factory_on(remote.project, "rawphp");
     let logs = Logged::default();
     let _guard = logs.capture();
+
+    // A tag on the remote comes through the fetch repo into the clone.
+    git(&remote.src, &["tag", "v1"]);
+    git(&remote.src, &["push", "-q", "origin", "v1"]);
 
     let id = setup.create(&remote, "main", "run").await;
     let worktree = setup.workspaces.worktree(id).await.unwrap();
@@ -4386,14 +4385,14 @@ async fn a_factory_project_with_a_token_is_fetched_through_a_repo_only_the_daemo
         std::fs::read_to_string(worktree.join("README.md")).unwrap(),
         "hello\n"
     );
-    assert!(
-        setup
-            .data
-            .path()
-            .join("fetches")
-            .join(format!("{}.git", remote.project))
-            .exists()
+    assert_eq!(
+        git(
+            &setup.clone_of(remote.project),
+            &["rev-parse", "refs/tags/v1"]
+        ),
+        git(&remote.bare, &["rev-parse", "refs/tags/v1"])
     );
+    assert!(!fetch_repo_of(&setup, remote.project).exists());
 
     // A later fetch brings what the remote gained.
     remote.push("next", &[("NEXT.md", "two\n")]);
@@ -4403,33 +4402,21 @@ async fn a_factory_project_with_a_token_is_fetched_through_a_repo_only_the_daemo
         std::fs::read_to_string(worktree.join("NEXT.md")).unwrap(),
         "two\n"
     );
+    assert!(!fetch_repo_of(&setup, remote.project).exists());
     assert!(!logs.text().contains(TOKEN));
 }
 
 #[tokio::test]
 async fn the_token_fetch_reads_no_config_a_worktree_can_write() {
-    const TOKEN: &str = "ghp_madeUpToken1234567890abcdefABCDEF";
-    let secrets = Arc::new(MemorySecrets::default());
-    secrets.set("github:rawphp", TOKEN).unwrap();
-    let setup = Setup::with_secrets(secrets);
+    let setup = Setup::with_secrets(secrets_with_token());
     let remote = setup.project(&[("README.md", "real\n")]);
     setup.factory_on(remote.project, "rawphp");
     setup.create(&remote, "main", "first").await;
 
     // What a session in a worktree could write into the shared clone's config: another repo,
     // holding other content on `main`, in place of the project's.
-    let other = setup.remotes.path().join("other");
-    std::fs::create_dir_all(&other).unwrap();
-    git(&other, &["init", "-q", "--bare", "other.git"]);
-    git(&other, &["clone", "-q", "other.git", "src"]);
-    std::fs::write(other.join("src/README.md"), "evil\n").unwrap();
-    git(&other.join("src"), &["add", "-A"]);
-    git(&other.join("src"), &["commit", "-q", "-m", "evil"]);
-    git(
-        &other.join("src"),
-        &["push", "-q", "origin", "HEAD:refs/heads/main"],
-    );
-    let key = format!("url.{}.insteadOf", other.join("other.git").display());
+    let other = other_repo(&setup, "evil\n");
+    let key = format!("url.{}.insteadOf", other.display());
     git(
         &setup.clone_of(remote.project),
         &["config", &key, remote.bare.to_str().unwrap()],
@@ -4445,7 +4432,7 @@ async fn the_token_fetch_reads_no_config_a_worktree_can_write() {
     );
 }
 
-// ---- Review cycle 1 ----
+// ---- The token fetch, same-tag retries, the wire shape and other create paths ----
 
 /// A bare repo with `README.md` holding `text` on `main`, standing in for another remote.
 fn other_repo(setup: &Setup, text: &str) -> PathBuf {
@@ -4475,51 +4462,96 @@ fn readme(worktree: &Path) -> String {
     std::fs::read_to_string(worktree.join("README.md")).unwrap()
 }
 
+/// `<data>/fetches/<project>.git` as a bare repo another process of the daemon's user made
+/// before a create, for a test to plant files in.
+fn plant_fetch_repo(setup: &Setup, project: ProjectId) -> PathBuf {
+    let fetches = fetch_repo_of(setup, project);
+    std::fs::create_dir_all(fetches.parent().unwrap()).unwrap();
+    git(
+        fetches.parent().unwrap(),
+        &["init", "-q", "--bare", fetches.to_str().unwrap()],
+    );
+    fetches
+}
+
 #[tokio::test]
-async fn the_token_fetch_reads_no_config_planted_in_the_fetch_repo() {
-    let secrets = Arc::new(MemorySecrets::default());
-    secrets
-        .set("github:rawphp", "ghp_madeUpToken1234567890abcdefABCDEF")
-        .unwrap();
-    let setup = Setup::with_secrets(secrets);
+async fn the_token_fetch_reads_nothing_planted_in_the_fetch_repo_and_leaves_none() {
+    let setup = Setup::with_secrets(secrets_with_token());
     let remote = setup.project(&[("README.md", "real\n")]);
     setup.factory_on(remote.project, "rawphp");
-    setup.create(&remote, "main", "first").await;
     let other = other_repo(&setup, "evil\n");
-    let fetches = fetch_repo_of(&setup, remote.project);
     let repo = remote.bare.to_str().unwrap();
     let key = format!("url.{}.insteadOf", other.display());
 
-    // Another process of the daemon's user rewrites the repo's URL in the fetch repo's config.
+    // A config that rewrites the repo's URL.
+    let fetches = plant_fetch_repo(&setup, remote.project);
     git(&fetches, &["config", &key, repo]);
-    remote.push("main", &[("README.md", "real again\n")]);
-    let id = setup.create(&remote, "main", "second").await;
+    let id = setup.create(&remote, "main", "first").await;
     assert_eq!(
         readme(&setup.workspaces.worktree(id).await.unwrap()),
-        "real again\n"
+        "real\n"
     );
+    assert!(!fetches.exists());
 
-    // Or has it read a file that does.
+    // A config that includes a file that does.
     let included = setup.remotes.path().join("included");
     std::fs::write(
         &included,
         format!("[url \"{}\"]\n\tinsteadOf = {repo}\n", other.display()),
     )
     .unwrap();
+    let fetches = plant_fetch_repo(&setup, remote.project);
     git(
         &fetches,
         &["config", "include.path", included.to_str().unwrap()],
     );
+    remote.push("main", &[("README.md", "real again\n")]);
+    let id = setup.create(&remote, "main", "second").await;
+    assert_eq!(
+        readme(&setup.workspaces.worktree(id).await.unwrap()),
+        "real again\n"
+    );
+    assert!(!fetches.exists());
+
+    // A `commondir` file that names a repo whose config does.
+    let common = setup.remotes.path().join("common.git");
+    git(
+        setup.remotes.path(),
+        &["init", "-q", "--bare", common.to_str().unwrap()],
+    );
+    git(&common, &["config", &key, repo]);
+    let fetches = plant_fetch_repo(&setup, remote.project);
+    std::fs::write(fetches.join("commondir"), common.to_str().unwrap()).unwrap();
     remote.push("main", &[("README.md", "real a third time\n")]);
     let id = setup.create(&remote, "main", "third").await;
     assert_eq!(
         readme(&setup.workspaces.worktree(id).await.unwrap()),
         "real a third time\n"
     );
+    assert!(!fetches.exists());
+
+    // A file, or a link, where the repo goes.
+    std::fs::write(&fetches, "not a repo").unwrap();
+    remote.push("main", &[("README.md", "fourth\n")]);
+    let id = setup.create(&remote, "main", "fourth").await;
+    assert_eq!(
+        readme(&setup.workspaces.worktree(id).await.unwrap()),
+        "fourth\n"
+    );
+    assert!(!fetches.exists());
+    std::os::unix::fs::symlink(&other, &fetches).unwrap();
+    remote.push("main", &[("README.md", "fifth\n")]);
+    let id = setup.create(&remote, "main", "fifth").await;
+    assert_eq!(
+        readme(&setup.workspaces.worktree(id).await.unwrap()),
+        "fifth\n"
+    );
+    assert!(std::fs::symlink_metadata(&fetches).is_err());
+    assert!(other.exists(), "the link's target is left alone");
 }
 
 #[tokio::test]
-async fn a_retry_of_a_tag_whose_setup_never_started_starts_it() {
+async fn a_retry_of_a_tag_whose_setup_never_started_runs_the_first_creates_setup() {
     // A holder that is not there yet, so the first create makes the workspace and no setup.
     let dir = tempfile::Builder::new()
         .prefix("fh")
@@ -4528,23 +4560,24 @@ async fn a_retry_of_a_tag_whose_setup_never_started_starts_it() {
     let at = dir.path().join("foundry-holder");
     let setup = Setup::with(at.clone(), GIT_WITHIN);
     let remote = setup.project(&[("README.md", "hello\n")]);
-    let make = || {
+    let make = |provision| {
         setup.make(
             &remote,
             "run",
             new_branch("main", "fac/5-1"),
-            commands(&["true"], 30),
+            provision,
             tag(remote.project, "run"),
         )
     };
-    let err = make().await.unwrap_err();
+    let err = make(commands(&["env"], 30)).await.unwrap_err();
     let WorkspaceError::SetupNotStarted { workspace, .. } = err else {
         panic!("{err}");
     };
     assert_eq!(setup.body(workspace).setup, None);
 
     std::os::unix::fs::symlink(holder(), &at).unwrap();
-    let again = make().await.unwrap();
+    // Another provision than the first create's: the retry runs the first's.
+    let again = make(commands(&["true"], 30)).await.unwrap();
 
     assert_eq!(again, workspace);
     assert_eq!(setup.workspace_records().len(), 1, "no new workspace");
@@ -4569,10 +4602,105 @@ async fn a_retry_of_a_tag_whose_setup_never_started_starts_it() {
         assert!(Instant::now() < deadline, "timed out waiting for setup");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    // It ran `env`, in the environment a factory setup gets.
+    let screen = setup.screen(named).await;
+    let lines: Vec<&str> = screen.lines().map(str::trim_end).collect();
+    for want in ["GIT_ASKPASS=", "GH_TOKEN=", "GH_CONFIG_DIR=/dev/null"] {
+        assert!(lines.contains(&want), "no line {want:?} in {screen:?}");
+    }
+    assert!(
+        !lines.iter().any(|l| l.starts_with("FOUNDRY_GIT_TOKEN=")),
+        "{screen:?}"
+    );
     // A third call finds the setup named and starts nothing more.
     let before = setup.terminals_of(workspace).len();
-    assert_eq!(make().await.unwrap(), workspace);
+    assert_eq!(make(commands(&["env"], 30)).await.unwrap(), workspace);
     assert_eq!(setup.terminals_of(workspace).len(), before);
+}
+
+#[tokio::test]
+async fn a_retry_starts_no_setup_for_a_create_that_chose_none() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let make = |name: &'static str, provision| {
+        setup.make(
+            &remote,
+            name,
+            new_branch("main", &format!("fac/6-{name}")),
+            provision,
+            tag(remote.project, name),
+        )
+    };
+    let none = make("none", Provision::None).await.unwrap();
+    // No config in the worktree: `Own` has nothing to run.
+    let own = make("own", Provision::Own).await.unwrap();
+    assert_ne!(none, own);
+
+    for (name, id) in [("none", none), ("own", own)] {
+        let again = make(name, commands(&["true"], 30)).await.unwrap();
+        assert_eq!(again, id);
+        assert!(setup.terminals_of(id).is_empty(), "{name}");
+        assert_eq!(setup.body(id).setup, None, "{name}");
+    }
+
+    // A marker of the shape before it held a setup reads as none due.
+    let old = setup
+        .data
+        .path()
+        .join("worktrees")
+        .join(remote.project.to_string())
+        .join(format!("{none}.factory"));
+    std::fs::write(
+        &old,
+        format!(
+            r#"{{"project":"{}","run":"none","name":"none"}}"#,
+            remote.project
+        ),
+    )
+    .unwrap();
+    assert_eq!(make("none", commands(&["true"], 30)).await.unwrap(), none);
+    assert!(setup.terminals_of(none).is_empty());
+}
+
+#[tokio::test]
+async fn a_retry_records_a_terminal_the_first_create_left_unrecorded_and_starts_no_second() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let make = |provision| {
+        setup.make(
+            &remote,
+            "run",
+            new_branch("main", "fac/7-1"),
+            provision,
+            tag(remote.project, "run"),
+        )
+    };
+    let id = make(Provision::None).await.unwrap();
+    // The daemon died between starting the setup and recording it: a terminal runs, the
+    // record names none.
+    let argv = ["/bin/sh", "-c", "sleep 3193"].map(String::from);
+    let running = setup
+        .terminals
+        .start(
+            id,
+            &setup.workspaces.worktree(id).await.unwrap(),
+            &argv,
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(setup.body(id).setup, None);
+
+    let again = make(commands(&["true"], 30)).await.unwrap();
+
+    assert_eq!(again, id);
+    let live: Vec<_> = setup
+        .terminals_of(id)
+        .into_iter()
+        .filter(|t| !t.deleted)
+        .collect();
+    assert_eq!(live.len(), 1, "{live:?}");
+    assert_eq!(setup.body(id).setup, Some(running));
 }
 
 #[test]
@@ -4700,36 +4828,21 @@ async fn a_marker_that_cannot_be_parsed_is_skipped_and_logged() {
     assert!(logs.text().contains(&broken), "{}", logs.text());
 }
 #[tokio::test]
-async fn a_fetch_repo_made_for_one_repo_forgets_its_branches_once_the_project_moves() {
-    let secrets = Arc::new(MemorySecrets::default());
-    secrets
-        .set("github:rawphp", "ghp_madeUpToken1234567890abcdefABCDEF")
-        .unwrap();
-    let setup = Setup::with_secrets(secrets);
+async fn a_project_moved_to_another_repo_forgets_the_old_repos_branches() {
+    let setup = Setup::with_secrets(secrets_with_token());
     let old = setup.project(&[("README.md", "old\n")]);
     old.push("only-old", &[("OLD.md", "old\n")]);
     setup.factory_on(old.project, "rawphp");
     setup.create(&old, "main", "before").await;
     let new = other_repo(&setup, "new\n");
-    {
-        let mut store = setup.store.lock().unwrap();
-        let mut settings = store.settings().unwrap();
-        settings.seq += 1;
-        let project = settings
-            .projects
-            .iter_mut()
-            .find(|p| p.id == old.project)
-            .unwrap();
-        project.repo = new.to_string_lossy().into_owned();
-        assert!(store.apply_settings(settings).unwrap());
-    }
+    move_repo(&setup, old.project, new.to_str().unwrap());
 
     let id = setup.create(&old, "main", "after").await;
     assert_eq!(
         readme(&setup.workspaces.worktree(id).await.unwrap()),
         "new\n"
     );
-    // The old repo's branch came through neither repo again.
+    // The old repo's branch is gone from the clone.
     let err = setup
         .workspaces
         .create(old.project, "only-old", "stale")
