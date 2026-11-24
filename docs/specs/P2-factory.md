@@ -125,7 +125,7 @@ P1 as built on `main` cannot carry a run that lives on another machine than the 
 | G10 | `sessions` | A session cut off from the fleet runs on | A machine ends its factory sessions of a project when it has neither held that project's lease nor received a fresh `factory_status` marked as holding it for 10 minutes (see "When things go wrong") |
 | G11 | `secrets` | `secret set` takes only `gateway` and `gateway-management`. The store cannot list its names. `sessions` reads no secret after start | `secret set` takes `github:<login>`. The store lists its names. `sessions` reads the store at each session start and each time it hides secrets, so a new token needs no restart |
 | G12 | `sessions`, `api` | A session start takes a model and a prompt | A factory start, made only by the factory and never offered in the UI, also takes: skip permissions, effort, the login whose token becomes `GH_TOKEN`, and the project. The machine keeps "factory session of project P" with the session's files on disk |
-| G13 | `attention` | A stuck, failed or waiting session and a failed setup each raise an item | They raise none for a session or workspace a `factory_status` names, or that its own machine knows as a factory session |
+| G13 | `attention` | A stuck, failed or waiting session and a failed setup each raise an item | For a project whose factory is on, they raise none for a session or workspace a `factory_status` names, or that its own machine knows as a factory session. For a project whose factory is off, they raise as for any other session or workspace. |
 | G14 | `web` | The board puts a session P1 marks stuck under "needs you" | A factory session P1 marks stuck stays under "working", shown as quiet with how long. Only the run's own state moves its card to "needs you" |
 
 A fleet in the middle of an update has machines on both protocols. The factory runs only when the acting coordinator speaks protocol 5, and it places runs and gates only on machines that do.
@@ -281,7 +281,7 @@ Every machine works these out from `factory_status`, as it works out P1's items 
 | Foreign claim | The status lists one | The issue is closed or leaves `triage` and `building` |
 | Gate infra | A gate could not run at all | A gate of that run starts, or the run ends |
 
-A factory session's "stuck", "failed" and "waiting for you", and a failed setup of a factory workspace, raise no P1 item of their own (G13). The run's item covers them.
+For a project whose factory is on, a factory session's "stuck", "failed" and "waiting for you", and a failed setup of a factory workspace, raise no P1 item of their own (G13). The run's item covers them. With the factory off no run item is raised, so they raise P1's items.
 
 ## Testing
 
