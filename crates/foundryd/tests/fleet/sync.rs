@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use foundry_proto::factory::{FactoryBody, FactoryRecord, RunEvent, RunId};
 use foundry_proto::ids::{MachineId, WorkspaceId};
 use foundry_proto::messages::{PROTOCOL, PeerMessage};
 use foundry_proto::record::AnyRecord;
@@ -918,4 +919,316 @@ async fn a_busy_store_never_stalls_the_async_workers() {
         worst < Duration::from_secs(1),
         "a 20 ms sleep took {worst:?} while the store was busy"
     );
+}
+
+/// A run event of `run` written under lease generation 1.
+fn run_event(run: &RunId, event: &str) -> FactoryBody {
+    FactoryBody::RunEvent(RunEvent {
+        run: run.clone(),
+        generation: 1,
+        ts: "2026-11-24T05:16:30.000Z".into(),
+        ms: 1_795_497_390_000,
+        event: event.into(),
+        data: serde_json::json!({ "step": event }),
+        cause: None,
+    })
+}
+
+/// Writes one of `daemon`'s own factory records under its next factory version, as a writer
+/// must: the version taken and the record stored under the store's lock held once.
+fn write_factory(daemon: &Daemon, body: FactoryBody) -> FactoryRecord {
+    let mut store = lock(&daemon.store);
+    let version = store.own_next_factory_version().unwrap();
+    let record = FactoryRecord {
+        owner: daemon.id,
+        version,
+        body,
+    };
+    assert_eq!(
+        store.apply_factory(&record, daemon.id).unwrap(),
+        Applied::Stored
+    );
+    record
+}
+
+fn hello_factory(
+    protocol: u16,
+    machine: MachineId,
+    versions: BTreeMap<MachineId, u64>,
+    factory_versions: BTreeMap<MachineId, u64>,
+) -> PeerMessage {
+    PeerMessage::Hello {
+        protocol,
+        machine,
+        versions,
+        factory_versions,
+    }
+}
+
+/// Every message `conn` receives for `long`, while the test sends a heartbeat each second so
+/// the link stays open.
+async fn messages_for(conn: &mut Conn, long: Duration) -> Vec<serde_json::Value> {
+    let mut messages = Vec::new();
+    let start = Instant::now();
+    while start.elapsed() < long {
+        let _ = conn.send.try_send(heartbeat());
+        loop {
+            match conn.recv.try_recv() {
+                Ok(text) => messages.push(serde_json::from_str(&text).unwrap()),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => panic!("the link closed"),
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    messages
+}
+
+/// The factory records in `messages`, in the order sent.
+fn factory_records_in(messages: &[serde_json::Value]) -> Vec<FactoryRecord> {
+    messages
+        .iter()
+        .filter(|m| m["type"] == "factory_records")
+        .flat_map(|m| serde_json::from_value::<Vec<FactoryRecord>>(m["records"].clone()).unwrap())
+        .collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn three_daemons_converge_on_a_run_event() {
+    let fleet = Fleet::start(3);
+    let run = RunId::new("original-solutions/foundry", 132, 1).unwrap();
+    // Each writes one before the links are up, so each is sent in a catch-up.
+    let before: Vec<FactoryRecord> = fleet
+        .daemons
+        .iter()
+        .map(|daemon| write_factory(daemon, run_event(&run, "claimed")))
+        .collect();
+    let holds_all = |events: &[RunEvent], records: &[FactoryRecord]| {
+        records.iter().all(|record| match &record.body {
+            FactoryBody::RunEvent(event) => events.contains(event),
+            _ => false,
+        })
+    };
+    until(Duration::from_secs(10), "factory catch-up", || {
+        fleet
+            .daemons
+            .iter()
+            .all(|d| holds_all(&lock(&d.store).run_events(&run).unwrap(), &before))
+    })
+    .await;
+
+    // One written once the links are up reaches every peer by a live send.
+    let live = write_factory(&fleet.daemons[1], run_event(&run, "launched"));
+    until(Duration::from_secs(5), "live factory send", || {
+        fleet.daemons.iter().all(|d| {
+            holds_all(
+                &lock(&d.store).run_events(&run).unwrap(),
+                std::slice::from_ref(&live),
+            )
+        })
+    })
+    .await;
+    let first = lock(&fleet.daemons[0].store).run_events(&run).unwrap();
+    assert_eq!(first.len(), 4);
+    for daemon in &fleet.daemons {
+        assert_eq!(lock(&daemon.store).run_events(&run).unwrap(), first);
+        assert_eq!(
+            lock(&daemon.store).factory_versions().unwrap(),
+            lock(&fleet.daemons[0].store).factory_versions().unwrap()
+        );
+    }
+    // P1's records carry none of it.
+    assert!(fleet.daemons.iter().all(|d| d.dump().is_empty()));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_peer_on_protocol_4_receives_no_factory_record_and_on_5_with_empty_factory_versions_receives_every_one()
+ {
+    let old = MachineId::random();
+    let fleet = Fleet::start_with(1, &[old]);
+    let a = &fleet.daemons[0];
+    populate(a, Ids::random(), SessionState::Idle);
+    let run = RunId::new("original-solutions/foundry", 132, 1).unwrap();
+    let written: Vec<FactoryRecord> = ["claimed", "launched", "gated"]
+        .into_iter()
+        .map(|event| write_factory(a, run_event(&run, event)))
+        .collect();
+
+    // On protocol 4: the P1 catch-up as before, in protocol 4, and nothing factory.
+    let mut conn = raw_link(&a.peers);
+    send(&conn, &hello(4, old)).await;
+    let messages = messages_for(&mut conn, Duration::from_secs(10)).await;
+    let mut p1 = Vec::new();
+    for message in &messages {
+        assert_eq!(message["protocol"], 4, "{message}");
+        assert!(
+            message["type"] == "hello" || message["type"] == "records",
+            "a protocol 4 peer was sent {message}"
+        );
+        if message["type"] == "records" {
+            let records: Vec<AnyRecord> =
+                serde_json::from_value(message["records"].clone()).unwrap();
+            p1.extend(records.iter().map(AnyRecord::version));
+        }
+    }
+    assert_eq!(p1, [1, 2, 3, 4], "the P1 catch-up changed");
+    drop(conn);
+
+    // The peer updates, and says hello on 5 holding every P1 record and no factory record.
+    let mut conn = raw_link(&a.peers);
+    send(
+        &conn,
+        &hello_factory(PROTOCOL, old, [(a.id, 4)].into(), BTreeMap::new()),
+    )
+    .await;
+    let messages = messages_for(&mut conn, Duration::from_secs(10)).await;
+    assert_eq!(factory_records_in(&messages), written);
+    assert!(
+        messages
+            .iter()
+            .filter(|m| m["type"] == "records")
+            .all(|m| m["records"].as_array().unwrap().is_empty()),
+        "P1 records it holds were sent again"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_factory_catch_up_starts_from_the_factory_versions_in_the_hello() {
+    let peer = MachineId::random();
+    let fleet = Fleet::start_with(1, &[peer]);
+    let a = &fleet.daemons[0];
+    let p1: Vec<u64> = (0..3)
+        .map(|_| a.write(workspace(WorkspaceId::random(), false)).version())
+        .collect();
+    let run = RunId::new("original-solutions/foundry", 132, 1).unwrap();
+    let written: Vec<FactoryRecord> = (0..4)
+        .map(|i| write_factory(a, run_event(&run, &format!("step-{i}"))))
+        .collect();
+
+    // The two cursors are apart: holding P1 version 1 says nothing of factory version 1.
+    let mut conn = raw_link(&a.peers);
+    send(
+        &conn,
+        &hello_factory(
+            PROTOCOL,
+            peer,
+            [(a.id, p1[0])].into(),
+            [(a.id, written[1].version)].into(),
+        ),
+    )
+    .await;
+    let messages = messages_for(&mut conn, Duration::from_secs(5)).await;
+    assert_eq!(factory_records_in(&messages), written[2..]);
+    let p1_sent: Vec<u64> = messages
+        .iter()
+        .filter(|m| m["type"] == "records")
+        .flat_map(|m| serde_json::from_value::<Vec<AnyRecord>>(m["records"].clone()).unwrap())
+        .map(|r| r.version())
+        .collect();
+    assert_eq!(p1_sent, p1[1..]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_factory_record_from_a_machine_that_is_not_its_owner_is_refused() {
+    let liar = MachineId::random();
+    let fleet = Fleet::start_with(2, &[liar]);
+    let (a, b) = (&fleet.daemons[0], &fleet.daemons[1]);
+    let run = RunId::new("original-solutions/foundry", 132, 1).unwrap();
+    // A record b owns, that a has not been sent: the liar claims to relay it, beside one of
+    // its own.
+    let forged = FactoryRecord {
+        owner: b.id,
+        version: 1,
+        body: run_event(&run, "forged"),
+    };
+    let own = FactoryRecord {
+        owner: liar,
+        version: 1,
+        body: run_event(&run, "own"),
+    };
+
+    let mut conn = raw_link(&a.peers);
+    send(&conn, &hello(PROTOCOL, liar)).await;
+    next(&mut conn).await.expect("a hello back");
+    send(
+        &conn,
+        &PeerMessage::FactoryRecords {
+            protocol: PROTOCOL,
+            records: vec![forged, own.clone()],
+        },
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let FactoryBody::RunEvent(own_event) = own.body else {
+        unreachable!()
+    };
+    assert_eq!(
+        lock(&a.store).run_events(&run).unwrap(),
+        [own_event],
+        "the forged record was taken, or the liar's own was not"
+    );
+    assert_eq!(
+        lock(&a.store).factory_versions().unwrap(),
+        BTreeMap::from([(liar, 1)])
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_peer_on_protocol_4_that_sends_factory_records_has_none_taken() {
+    let old = MachineId::random();
+    let fleet = Fleet::start_with(1, &[old]);
+    let a = &fleet.daemons[0];
+    let run = RunId::new("original-solutions/foundry", 132, 1).unwrap();
+
+    let mut conn = raw_link(&a.peers);
+    send(&conn, &hello(4, old)).await;
+    next(&mut conn).await.expect("a hello back");
+    send(
+        &conn,
+        &PeerMessage::FactoryRecords {
+            protocol: 4,
+            records: vec![FactoryRecord {
+                owner: old,
+                version: 1,
+                body: run_event(&run, "claimed"),
+            }],
+        },
+    )
+    .await;
+    assert!(keep_talking(&mut conn, Duration::from_secs(3)).await);
+    assert!(lock(&a.store).factory_versions().unwrap().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn factory_changes_rises_for_a_record_from_a_peer_and_for_one_this_machine_writes() {
+    let fleet = Fleet::start(2);
+    let (a, b) = (&fleet.daemons[0], &fleet.daemons[1]);
+    let run = RunId::new("original-solutions/foundry", 132, 1).unwrap();
+    let mut changes = a.peers.factory_changes();
+    // Let the links come up and anything they find at the start pass.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    changes.borrow_and_update();
+
+    write_factory(b, run_event(&run, "from a peer"));
+    timeout(Duration::from_secs(5), changes.changed())
+        .await
+        .expect("no change within 5 s of a peer's record")
+        .unwrap();
+    assert_eq!(lock(&a.store).run_events(&run).unwrap().len(), 1);
+
+    // Nothing more happens, so nothing more is told.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    changes.borrow_and_update();
+    assert!(
+        timeout(Duration::from_secs(5), changes.changed())
+            .await
+            .is_err(),
+        "a change was told with nothing written"
+    );
+
+    write_factory(a, run_event(&run, "its own"));
+    timeout(Duration::from_secs(5), changes.changed())
+        .await
+        .expect("no change within 5 s of its own record")
+        .unwrap();
 }
