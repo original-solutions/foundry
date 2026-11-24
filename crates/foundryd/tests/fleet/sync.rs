@@ -1642,14 +1642,19 @@ async fn over_a_slow_link_a_factory_catch_up_keeps_p1_records_behind_at_most_one
             .expect("the link stays open");
         let _ = conn.send.try_send(heartbeat());
         let message: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let wire = Duration::from_secs_f64(text.len() as f64 / 70_000.0);
         if message["type"] == "factory_records" {
             factory_messages += 1;
             received += message["records"].as_array().unwrap().len();
             if written && !arrived {
                 ahead += 1;
-            } else if !written {
+            } else if factory_messages == 2 {
+                // Written while the writer is busy with a message and rounds run on the tick.
+                tokio::time::sleep(wire / 2).await;
                 a.write(workspace(ids.workspace, false));
                 written = true;
+                tokio::time::sleep(wire / 2).await;
+                continue;
             }
         } else {
             others += 1;
@@ -1660,7 +1665,6 @@ async fn over_a_slow_link_a_factory_catch_up_keeps_p1_records_behind_at_most_one
                     .iter()
                     .any(|r| r["body"]["id"] == ids.workspace.to_string());
         }
-        let wire = Duration::from_secs_f64(text.len() as f64 / 70_000.0);
         tokio::time::sleep(wire).await;
     }
     assert_eq!(received, total, "every factory record arrived");
@@ -1722,8 +1726,14 @@ async fn a_factory_row_of_another_owner_that_cannot_be_read_does_not_stop_factor
     let a = &fleet.daemons[0];
     assert_eq!(a.id, a_id);
     let mut changes = a.peers.factory_changes();
-    tokio::time::sleep(Duration::from_secs(2)).await;
     changes.borrow_and_update();
+    // What it held when it started is not told.
+    assert!(
+        timeout(Duration::from_secs(3), changes.changed())
+            .await
+            .is_err(),
+        "after a restart, records already held were told"
+    );
     write_factory(a, run_event(&run, "own, after a restart"));
     timeout(Duration::from_secs(5), changes.changed())
         .await
