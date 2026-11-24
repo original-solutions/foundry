@@ -1030,13 +1030,11 @@ async fn three_daemons_converge_on_a_run_event() {
     })
     .await;
     let first = lock(&fleet.daemons[0].store).run_events(&run).unwrap();
+    let versions = lock(&fleet.daemons[0].store).factory_versions().unwrap();
     assert_eq!(first.len(), 4);
     for daemon in &fleet.daemons {
         assert_eq!(lock(&daemon.store).run_events(&run).unwrap(), first);
-        assert_eq!(
-            lock(&daemon.store).factory_versions().unwrap(),
-            lock(&fleet.daemons[0].store).factory_versions().unwrap()
-        );
+        assert_eq!(lock(&daemon.store).factory_versions().unwrap(), versions);
     }
     // P1's records carry none of it.
     assert!(fleet.daemons.iter().all(|d| d.dump().is_empty()));
