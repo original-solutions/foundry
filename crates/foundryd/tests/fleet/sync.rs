@@ -1373,7 +1373,7 @@ async fn a_factory_catch_up_goes_one_message_a_round_so_p1_records_go_between() 
 }
 
 #[tokio::test(start_paused = true)]
-async fn after_a_factory_record_the_store_cannot_take_a_link_takes_nothing_more_and_the_peer_shows_offline()
+async fn after_a_factory_record_the_store_cannot_take_a_link_takes_no_more_factory_records_and_still_takes_p1_ones()
  {
     let peer = MachineId::random();
     let fleet = Fleet::start_with(1, &[peer]);
@@ -1384,6 +1384,7 @@ async fn after_a_factory_record_the_store_cannot_take_a_link_takes_nothing_more_
         version,
         body: run_event(&run, event),
     };
+    let ws = WorkspaceId::random();
 
     let mut conn = raw_link(&a.peers);
     send(&conn, &hello(PROTOCOL, peer)).await;
@@ -1409,14 +1410,27 @@ async fn after_a_factory_record_the_store_cannot_take_a_link_takes_nothing_more_
         },
     )
     .await;
+    send(
+        &conn,
+        &PeerMessage::Records {
+            protocol: PROTOCOL,
+            records: vec![workspace(ws, false)(peer, 1)],
+        },
+    )
+    .await;
 
     assert!(
         keep_talking(&mut conn, OFFLINE_AFTER * 2).await,
         "the link stays open"
     );
     assert!(
-        !a.peers.online().contains(&peer),
-        "a peer whose factory records are refused shows offline"
+        a.peers.online().contains(&peer),
+        "a peer whose factory records are refused still shows online"
+    );
+    assert!(
+        a.held(|record: &AnyRecord| record.owner() == peer)
+            .is_some(),
+        "its P1 records are still taken"
     );
     let held: Vec<String> = lock(&a.store)
         .run_events(&run)
@@ -1424,11 +1438,77 @@ async fn after_a_factory_record_the_store_cannot_take_a_link_takes_nothing_more_
         .into_iter()
         .map(|e| e.event)
         .collect();
-    assert_eq!(held, ["first"], "only the records before it are kept");
+    assert_eq!(
+        held,
+        ["first"],
+        "only the factory records before it are kept"
+    );
+
+    // The link ends a while later, so the next link's hello asks again from the factory record
+    // refused.
+    assert!(
+        !keep_talking(&mut conn, RETRY_REFUSED).await,
+        "the link ends to ask again"
+    );
+    let mut conn = raw_link(&a.peers);
+    send(&conn, &hello(PROTOCOL, peer)).await;
+    let back = next(&mut conn).await.expect("a hello back");
+    assert_eq!(
+        back["factory_versions"][peer.to_string()],
+        serde_json::json!(1),
+        "the next hello asks again from the factory record refused"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn after_a_p1_record_the_store_cannot_take_a_link_takes_no_factory_record_either_and_the_peer_shows_offline()
+ {
+    let peer = MachineId::random();
+    let fleet = Fleet::start_with(1, &[peer]);
+    let a = &fleet.daemons[0];
+    let run = RunId::new("original-solutions/foundry", 132, 1).unwrap();
+
+    let mut conn = raw_link(&a.peers);
+    send(&conn, &hello(PROTOCOL, peer)).await;
+    next(&mut conn).await.expect("a hello back");
+    // The store holds versions only up to i64::MAX, so the P1 record cannot be stored.
+    send(
+        &conn,
+        &PeerMessage::Records {
+            protocol: PROTOCOL,
+            records: vec![workspace(WorkspaceId::random(), false)(peer, u64::MAX)],
+        },
+    )
+    .await;
+    send(
+        &conn,
+        &PeerMessage::FactoryRecords {
+            protocol: PROTOCOL,
+            records: vec![FactoryRecord {
+                owner: peer,
+                version: 1,
+                body: run_event(&run, "after"),
+            }],
+        },
+    )
+    .await;
+
+    assert!(
+        keep_talking(&mut conn, OFFLINE_AFTER * 2).await,
+        "the link stays open"
+    );
+    assert!(
+        !a.peers.online().contains(&peer),
+        "a peer whose P1 records are refused shows offline"
+    );
     assert_eq!(
         lock(&a.store).factory_versions().unwrap(),
-        BTreeMap::from([(peer, 1)]),
-        "the next hello asks again from the record refused"
+        BTreeMap::new(),
+        "no factory record is taken after a refused P1 record"
+    );
+    assert!(
+        !keep_talking(&mut conn, RETRY_REFUSED).await,
+        "the refusing link ends"
     );
 }
 
