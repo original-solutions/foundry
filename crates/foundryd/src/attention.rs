@@ -20,7 +20,7 @@
 //! | Gateway unhealthy | this machine's read of the gateway fails | [`crate::gateway`] |
 //! | Run stuck | the believed status lists a stuck run | the factory statuses |
 //! | Run needs info | the believed status lists a run that asked questions | the factory statuses |
-//! | Factory idle | the believed status gives a reason, or for [`IDLE_AFTER`] since it saw the factory on this machine has neither held the lease nor heard from its holder | the factory statuses and [`Quiet`] |
+//! | Factory idle | the believed status gives a reason, or for [`IDLE_AFTER`] since it saw the factory on this machine has neither held the lease nor heard from its holder | the factory statuses and [`Quiet`], given by [`Attention::with_factory`] |
 //! | Foreign claim | the believed status lists an issue claimed by something other than Foundry | the factory statuses |
 //! | Gate infra | the believed status lists a run whose gate could not run at all | the factory statuses |
 //!
@@ -34,10 +34,11 @@
 //! work of such a project raises none of P1's rows for it (G13), since the run's own row
 //! covers it:
 //!
-//! - a session any status held of the project names in a live run, whoever wrote it, or that
-//!   this machine's [`Marks`] say is one of its factory sessions of the project, raises no
-//!   session stuck, waiting or failed item. A holder that went offline still names its runs'
-//!   sessions, so they do not raise P1's items while the lease waits for a new holder. Another
+//! - a session named in a live run by the believed status or by any status of the project at
+//!   the highest lease generation, or that this machine's [`Marks`] say is one of its factory
+//!   sessions of the project, raises no session stuck, waiting or failed item. So a holder
+//!   that went offline names its runs' sessions until a newer holder takes over, and a writer
+//!   a newer holder superseded names none. Another
 //!   session in a factory workspace, such as one a person starts in a stuck run's workspace,
 //!   still raises its items;
 //! - a workspace such a status names, that [`Marks`] say is one of this machine's factory
@@ -331,16 +332,32 @@ struct FactoryWork {
 }
 
 impl FactoryWork {
-    /// For each project whose factory is on: what any status held of it names in a live run,
-    /// whoever wrote it, so a holder that went offline still names its runs' work; and what
-    /// this machine marks of its own records as the project's. Then each workspace that holds
-    /// such a session.
+    /// For each project whose factory is on: what its believed status names in a live run,
+    /// and what any status of it at the highest lease generation names, so a holder that went
+    /// offline names its runs' work until a newer holder takes over; and what this machine
+    /// marks of its own records as the project's. Then each workspace that holds such a
+    /// session.
     fn of(fleet: &Fleet, factory: &FactoryFleet<'_>, on: &[OnProject<'_>]) -> Self {
         let mut work = Self::default();
         let on_ids: BTreeSet<ProjectId> = on.iter().map(|p| p.project.id).collect();
-        for project in &on_ids {
-            let statuses = factory.statuses.get(project).into_iter().flatten();
-            for run in statuses.flat_map(|(_, status)| &status.runs) {
+        for project in on {
+            let statuses = factory
+                .statuses
+                .get(&project.project.id)
+                .map_or(&[][..], Vec::as_slice);
+            // An online writer's status at the top generation is the believed one, so only an
+            // offline holder's adds to it.
+            let top = statuses.iter().map(|(_, status)| status.generation).max();
+            let at_top = statuses
+                .iter()
+                .filter(|(_, status)| Some(status.generation) == top)
+                .map(|(_, status)| status);
+            let naming = project
+                .believed
+                .map(|(_, status)| status)
+                .into_iter()
+                .chain(at_top);
+            for run in naming.flat_map(|status| &status.runs) {
                 work.sessions.extend(&run.sessions);
                 work.workspaces.extend(&run.workspaces);
             }
@@ -658,6 +675,8 @@ fn believed_of<'a>(
     acting: MachineId,
 ) -> Option<(MachineId, &'a FactoryStatus)> {
     let status = believed(statuses, online, acting)?;
+    // `believed` gives no writer, so it is picked again by the same rule here; #196 has
+    // `believed` return it and removes this.
     // A holding status is believed from the lowest machine id among equals; any other is the
     // acting coordinator's.
     statuses
@@ -2427,6 +2446,24 @@ mod tests {
         // This machine takes the lease at generation 4, and its status names no run.
         world.status(me, holding(project, 4, 1));
         assert_eq!(world.of(Kind::SessionStuck).len(), 1, "{:?}", world.items());
+    }
+
+    #[test]
+    fn the_believed_status_names_its_runs_below_the_top_generation() {
+        let mut world = World::new();
+        let project = world.factory_project(true);
+        let peer = world.peer;
+        // The peer is online and holds at generation 2, so it is believed over a machine that
+        // went offline holding at generation 3. The run items are read from the peer's status,
+        // so the sessions it names raise none of P1's.
+        let session = world.session(peer, SessionState::Stuck);
+        world.status(peer, naming(project, 2, peer, Vec::new(), vec![session.id]));
+        world.status(MachineId::random(), holding(project, 3, 1));
+        assert!(
+            world.of(Kind::SessionStuck).is_empty(),
+            "{:?}",
+            world.items()
+        );
     }
 
     #[test]
