@@ -1232,6 +1232,32 @@ async fn a_peer_on_protocol_4_that_sends_factory_records_has_none_taken() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_peer_on_protocol_4_that_sends_a_factory_message_this_build_cannot_read_has_its_link_kept()
+ {
+    let old = MachineId::random();
+    let fleet = Fleet::start_with(1, &[old]);
+    let a = &fleet.daemons[0];
+
+    let mut conn = raw_link(&a.peers);
+    send(&conn, &hello(4, old)).await;
+    next(&mut conn).await.expect("a hello back");
+    let unreadable = serde_json::json!({
+        "type": "factory_records",
+        "protocol": 4,
+        "records": [{ "kind": "lease_note" }],
+    });
+    conn.send.send(unreadable.to_string()).await.unwrap();
+
+    // A link that carries no factory record drops it as it drops one it can read, so nothing
+    // on it was refused and it does not end to ask again.
+    assert!(
+        keep_talking(&mut conn, RETRY_REFUSED * 2).await,
+        "the link stays open"
+    );
+    assert!(a.peers.online().contains(&old));
+}
+
+#[tokio::test(start_paused = true)]
 async fn factory_changes_rises_for_a_record_from_a_peer_and_for_one_this_machine_writes() {
     let fleet = Fleet::start(2);
     let (a, b) = (&fleet.daemons[0], &fleet.daemons[1]);
@@ -1457,6 +1483,80 @@ async fn after_a_factory_record_the_store_cannot_take_a_link_takes_no_more_facto
         back["factory_versions"][peer.to_string()],
         serde_json::json!(1),
         "the next hello asks again from the factory record refused"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn after_a_factory_message_this_build_cannot_read_a_link_takes_no_more_factory_records_and_still_takes_p1_ones()
+ {
+    let peer = MachineId::random();
+    let fleet = Fleet::start_with(1, &[peer]);
+    let a = &fleet.daemons[0];
+    let run = RunId::new("original-solutions/foundry", 132, 1).unwrap();
+    let record = |version: u64, event: &str| FactoryRecord {
+        owner: peer,
+        version,
+        body: run_event(&run, event),
+    };
+
+    let mut conn = raw_link(&a.peers);
+    send(&conn, &hello(PROTOCOL, peer)).await;
+    next(&mut conn).await.expect("a hello back");
+    send(
+        &conn,
+        &PeerMessage::FactoryRecords {
+            protocol: PROTOCOL,
+            records: vec![record(1, "first")],
+        },
+    )
+    .await;
+    // A newer build that still speaks this protocol sends a factory record of a kind this build
+    // does not know, so the message cannot be read.
+    let mut unreadable = serde_json::to_value(PeerMessage::FactoryRecords {
+        protocol: PROTOCOL,
+        records: vec![record(2, "unknown")],
+    })
+    .unwrap();
+    unreadable["records"][0]["kind"] = serde_json::json!("lease_note");
+    conn.send.send(unreadable.to_string()).await.unwrap();
+    send(
+        &conn,
+        &PeerMessage::FactoryRecords {
+            protocol: PROTOCOL,
+            records: vec![record(3, "later")],
+        },
+    )
+    .await;
+    send(
+        &conn,
+        &PeerMessage::Records {
+            protocol: PROTOCOL,
+            records: vec![workspace(WorkspaceId::random(), false)(peer, 1)],
+        },
+    )
+    .await;
+
+    assert!(
+        keep_talking(&mut conn, OFFLINE_AFTER * 2).await,
+        "the link stays open"
+    );
+    assert!(
+        a.peers.online().contains(&peer),
+        "a peer whose factory message cannot be read still shows online"
+    );
+    assert!(
+        a.held(|record: &AnyRecord| record.owner() == peer)
+            .is_some(),
+        "its P1 records are still taken"
+    );
+    assert_eq!(
+        lock(&a.store).factory_versions().unwrap(),
+        BTreeMap::from([(peer, 1)]),
+        "no factory record after the unreadable message is taken"
+    );
+    assert!(
+        !keep_talking(&mut conn, RETRY_REFUSED).await,
+        "the link ends to ask again"
     );
 }
 
