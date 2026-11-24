@@ -1334,7 +1334,7 @@ mod tests {
         let (_dir, secrets) = file();
         for name in ["machine", "machine-keys", "other"] {
             let error = set_from(&secrets, name, "x\n".as_bytes()).unwrap_err();
-            let text = error.to_string();
+            assert!(!text.contains(name), "{text}");
             assert!(text.contains(name), "{text}");
             assert!(text.contains("gateway-management"), "{text}");
             assert_eq!(stored(&secrets, name), None);
