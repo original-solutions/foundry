@@ -49,9 +49,11 @@
 //! Factory settings ([`SettingKey::is_factory`]) are numbered like any setting, but a machine
 //! before [`FACTORY_SINCE`] cannot read them. Links send such a peer the copy without them
 //! ([`SharedSettings::for_protocol`]), and a copy it sends back leaves the ones held here as
-//! they are ([`keep_factory`]). An edit of one is not sent to an acting machine whose link
-//! speaks an older protocol: this machine's own fails with [`CoordinatorError::Older`], and a
-//! forwarded one is refused, both naming the protocol.
+//! they are ([`keep_factory`]). An edit of one is not sent to an acting machine whose last copy
+//! came on a link in an older protocol: this machine's own fails with
+//! [`CoordinatorError::Older`], and a forwarded one is refused, both naming the protocol. Until
+//! the first copy on a link in another protocol is taken, the old one decides
+//! ([`Coordinator::uncarried`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
