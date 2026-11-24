@@ -1,4 +1,487 @@
 //! The events a run's ledger holds.
+//!
+//! Ported from the runner's `src/ledger/events.ts`. Each event is a typed value that writes
+//! the runner's `event` and `data`: the same names, the same fields in the same order, `null`
+//! where the runner writes `null`, and a field the runner leaves out when absent left out here
+//! too. The runner's `docs/reference/ledger.md` (softfac's) is the spec of both.
+//!
+//! A [`Cause`] says which part of the factory wrote an event and why. Its text is cleaned and
+//! cut as the runner's `makeCause` and `causeObject` do, so no text from a comment, a prompt
+//! or a session reaches a cause whole.
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+pub use foundry_proto::factory::{PrEnd, RunOutcome as Outcome};
+
+use crate::factory::lifecycle::State;
+
+/// Which part of the factory wrote an event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CauseStep {
+    Start,
+    Watch,
+    Forward,
+    Advance,
+    Gate,
+    Pass,
+    Retro,
+    Operator,
+}
+
+/// What an `error` event was about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ErrorKind {
+    Github,
+    Tracker,
+    T3,
+    Git,
+    Gate,
+    Ledger,
+    Config,
+}
+
+/// One required check in a `checks_read` event.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckRead {
+    pub name: String,
+    pub state: String,
+}
+
+/// The earlier run and branch a launch carried on from.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResumedFrom {
+    pub run: String,
+    pub branch: String,
+}
+
+/// A provider option a launch sent with its model, such as a reasoning effort.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelOption {
+    pub id: String,
+    pub value: OptionValue,
+}
+
+/// The value of a [`ModelOption`]: text or a flag.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum OptionValue {
+    Text(String),
+    Flag(bool),
+}
+
+/// Something that happened in a run, written as the runner's `{ event, data }`. The variants
+/// and their fields are in the runner's order, which is the order they are written in.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "event", content = "data", rename_all = "snake_case")]
+pub enum Event {
+    Claimed {
+        machine: String,
+        github_user: String,
+    },
+    TriageResult {
+        passed: bool,
+        reasons: Vec<String>,
+    },
+    QuestionsPosted {
+        questions: String,
+    },
+    AnswerReceived {
+        comment_id: Option<String>,
+        body_edited: bool,
+    },
+    SessionLaunched {
+        thread_id: String,
+        worktree: Option<String>,
+        branch: Option<String>,
+        model_instance: Option<String>,
+        model: Option<String>,
+        model_options: Option<Vec<ModelOption>>,
+        resumed_from: Option<ResumedFrom>,
+        /// The branch the run lands on. Left out when absent, as the runner's older lines are.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base: Option<String>,
+        /// The issue's title at the launch. Left out when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+    },
+    CommentForwarded {
+        comment_id: String,
+    },
+    SessionInterrupted {
+        resumes: u32,
+        relaunch: bool,
+        run_ordinal: Option<u32>,
+        branch: Option<String>,
+        t3_error: Option<String>,
+        ended_in_pass: u64,
+    },
+    SessionRateLimited {
+        run_ordinal: u32,
+        branch: Option<String>,
+        resumes: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+    },
+    SessionPaused {
+        run_ordinal: Option<u32>,
+    },
+    StopRequested {
+        by: String,
+    },
+    StepChanged {
+        step: String,
+    },
+    PrOpened {
+        pr: u64,
+        url: String,
+    },
+    PrLeft {
+        pr: u64,
+        url: String,
+    },
+    PrAdopted {
+        pr: u64,
+        branch: String,
+        run: String,
+    },
+    BranchBound {
+        pr: u64,
+        branch: String,
+    },
+    PrSetDraft {
+        pr: u64,
+    },
+    PrReadyOutside {
+        pr: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by: Option<String>,
+    },
+    GateCommand {
+        attempt: u32,
+        command: String,
+        exit_code: i32,
+        duration_ms: u64,
+    },
+    GateSentBack {
+        attempt: u32,
+        run_ordinal: u32,
+    },
+    GateCheckout {
+        attempt: u32,
+        dir: String,
+        sha: String,
+        base_sha: String,
+    },
+    GateFinished {
+        attempt: u32,
+        total_ms: u64,
+    },
+    GateRegate {
+        sha: String,
+        base_sha: String,
+        previous_base_sha: String,
+        /// GitHub said the pull request conflicts with its base. Written only when true.
+        #[serde(default, skip_serializing_if = "is_false")]
+        conflict: bool,
+    },
+    RegateRelaunching {
+        attempt: u32,
+        branch: String,
+        message: String,
+    },
+    FeedbackRelaunching {
+        n: u32,
+        branch: String,
+        items: Vec<String>,
+        message: String,
+    },
+    FeedbackForwarding {
+        n: u32,
+        run_ordinal: Option<u32>,
+        items: Vec<String>,
+        message: String,
+    },
+    GateCleanupFailed {
+        dir: String,
+        error: String,
+    },
+    WorktreeRemoved {
+        path: String,
+    },
+    WorktreeRemoveFailed {
+        path: String,
+        error: String,
+    },
+    ChecksRead {
+        sha: String,
+        checks: Vec<CheckRead>,
+    },
+    StateChanged {
+        #[serde(with = "state_name")]
+        from: State,
+        #[serde(with = "state_name")]
+        to: State,
+    },
+    Stuck {
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        commits_ahead: Option<u32>,
+    },
+    Error {
+        step: CauseStep,
+        kind: ErrorKind,
+        message: String,
+    },
+    /// The run's last event. The ledger fills in `total_ms` and `gate_attempts` itself.
+    Finished {
+        outcome: Outcome,
+        total_ms: u64,
+        gate_attempts: u32,
+        review_cycles: Option<u32>,
+        pr_url: Option<String>,
+        pr_end: Option<PrEnd>,
+    },
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// A [`State`] written by its name, `needs-info`, as the runner writes a state.
+mod state_name {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    use crate::factory::lifecycle::State;
+
+    pub fn serialize<S: Serializer>(state: &State, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(state.name())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<State, D::Error> {
+        let name = String::deserialize(d)?;
+        State::from_name(&name)
+            .ok_or_else(|| serde::de::Error::custom(format!("{name:?} is not a state")))
+    }
+}
+
+impl Event {
+    /// The event's name and its `data`, as the ledger stores them.
+    pub fn parts(&self) -> (&'static str, Value) {
+        let Ok(Value::Object(mut whole)) = serde_json::to_value(self) else {
+            unreachable!("an event is an object of strings, numbers, flags and lists");
+        };
+        let name = whole
+            .get("event")
+            .and_then(Value::as_str)
+            .and_then(|name| FIELDS.iter().find(|(known, _)| *known == name))
+            .map(|(known, _)| *known)
+            .expect("every event is in the field table");
+        let data = whole.remove("data").unwrap_or(Value::Null);
+        (name, data)
+    }
+
+    /// The event a stored name and `data` hold, or `None` when this build does not know the
+    /// name or the data is not that event's.
+    pub fn from_parts(name: &str, data: &Value) -> Option<Event> {
+        let whole = serde_json::json!({ "event": name, "data": data });
+        serde_json::from_value(whole).ok()
+    }
+}
+
+/// The 33 events, each with the names of its `data` fields in the order the runner writes them.
+pub const FIELDS: [(&str, &[&str]); 33] = [
+    ("claimed", &["machine", "github_user"]),
+    ("triage_result", &["passed", "reasons"]),
+    ("questions_posted", &["questions"]),
+    ("answer_received", &["comment_id", "body_edited"]),
+    (
+        "session_launched",
+        &[
+            "thread_id",
+            "worktree",
+            "branch",
+            "model_instance",
+            "model",
+            "model_options",
+            "resumed_from",
+            "base",
+            "title",
+        ],
+    ),
+    ("comment_forwarded", &["comment_id"]),
+    (
+        "session_interrupted",
+        &[
+            "resumes",
+            "relaunch",
+            "run_ordinal",
+            "branch",
+            "t3_error",
+            "ended_in_pass",
+        ],
+    ),
+    (
+        "session_rate_limited",
+        &["run_ordinal", "branch", "resumes", "model"],
+    ),
+    ("session_paused", &["run_ordinal"]),
+    ("stop_requested", &["by"]),
+    ("step_changed", &["step"]),
+    ("pr_opened", &["pr", "url"]),
+    ("pr_left", &["pr", "url"]),
+    ("pr_adopted", &["pr", "branch", "run"]),
+    ("branch_bound", &["pr", "branch"]),
+    ("pr_set_draft", &["pr"]),
+    ("pr_ready_outside", &["pr", "by"]),
+    (
+        "gate_command",
+        &["attempt", "command", "exit_code", "duration_ms"],
+    ),
+    ("gate_sent_back", &["attempt", "run_ordinal"]),
+    ("gate_checkout", &["attempt", "dir", "sha", "base_sha"]),
+    ("gate_finished", &["attempt", "total_ms"]),
+    (
+        "gate_regate",
+        &["sha", "base_sha", "previous_base_sha", "conflict"],
+    ),
+    ("regate_relaunching", &["attempt", "branch", "message"]),
+    ("feedback_relaunching", &["n", "branch", "items", "message"]),
+    (
+        "feedback_forwarding",
+        &["n", "run_ordinal", "items", "message"],
+    ),
+    ("gate_cleanup_failed", &["dir", "error"]),
+    ("worktree_removed", &["path"]),
+    ("worktree_remove_failed", &["path", "error"]),
+    ("checks_read", &["sha", "checks"]),
+    ("state_changed", &["from", "to"]),
+    ("stuck", &["reason", "branch", "commits_ahead"]),
+    ("error", &["step", "kind", "message"]),
+    (
+        "finished",
+        &[
+            "outcome",
+            "total_ms",
+            "gate_attempts",
+            "review_cycles",
+            "pr_url",
+            "pr_end",
+        ],
+    ),
+];
+
+/// The fields of a `session_launched` event's `resumed_from`, in the runner's order.
+pub const RESUMED_FROM_FIELDS: [&str; 2] = ["run", "branch"];
+
+/// The fields of each check in a `checks_read` event, in the runner's order.
+pub const CHECK_FIELDS: [&str; 2] = ["name", "state"];
+
+/// The fields of a cause, in the runner's order.
+pub const CAUSE_FIELDS: [&str; 6] = ["step", "reason", "actor", "command", "attempt", "label"];
+
+/// The `data` fields of the event called `name` in the runner's order, or `None` for a name the
+/// runner does not list.
+pub fn fields(name: &str) -> Option<&'static [&'static str]> {
+    FIELDS
+        .iter()
+        .find(|(known, _)| *known == name)
+        .map(|(_, fields)| *fields)
+}
+
+/// The longest `reason`, `actor` or `label` a cause keeps, in characters.
+const CAUSE_FIELD_LIMIT: usize = 100;
+
+/// The longest `command` a cause keeps, in characters.
+const CAUSE_COMMAND_LIMIT: usize = 1_000;
+
+/// Why an event was written: the part of the factory that wrote it, a reason code from the
+/// runner's lists, and, only when they apply, who did something, which gate command, which
+/// attempt and which label. None of it is text from a comment, a prompt or a session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Cause {
+    pub step: CauseStep,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+impl Cause {
+    /// A cause with no extras.
+    pub fn new(step: CauseStep, reason: impl Into<String>) -> Self {
+        Self {
+            step,
+            reason: reason.into(),
+            actor: None,
+            command: None,
+            attempt: None,
+            label: None,
+        }
+    }
+
+    /// Who did it, cleaned and cut at 100 characters.
+    pub fn actor(mut self, actor: &str) -> Self {
+        self.actor = Some(clean(actor, CAUSE_FIELD_LIMIT));
+        self
+    }
+
+    /// Which gate command, cleaned and cut at 1000 characters.
+    pub fn command(mut self, command: &str) -> Self {
+        self.command = Some(clean(command, CAUSE_COMMAND_LIMIT));
+        self
+    }
+
+    /// Which attempt.
+    pub fn attempt(mut self, attempt: u32) -> Self {
+        self.attempt = Some(attempt);
+        self
+    }
+
+    /// Which label, cleaned and cut at 100 characters.
+    pub fn label(mut self, label: &str) -> Self {
+        self.label = Some(clean(label, CAUSE_FIELD_LIMIT));
+        self
+    }
+
+    /// The cause as it is written: its text cleaned and cut again, so a cause built by hand
+    /// cannot put session or comment text in the ledger. `reason`, `actor` and `label` are cut
+    /// at 100 characters, `command` at 1000.
+    pub fn cleaned(&self) -> Cause {
+        let cut = |text: &Option<String>, limit| text.as_deref().map(|text| clean(text, limit));
+        Cause {
+            step: self.step,
+            reason: clean(&self.reason, CAUSE_FIELD_LIMIT),
+            actor: cut(&self.actor, CAUSE_FIELD_LIMIT),
+            command: cut(&self.command, CAUSE_COMMAND_LIMIT),
+            attempt: self.attempt,
+            label: cut(&self.label, CAUSE_FIELD_LIMIT),
+        }
+    }
+}
+
+/// A character that must not reach a terminal as itself: C0 and C1 controls, DEL, and the bidi
+/// controls that can make text read in another order than it is stored.
+fn is_unsafe(c: char) -> bool {
+    matches!(c, '\u{0}'..='\u{1f}' | '\u{7f}'..='\u{9f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+/// `text` on one line with no control or bidi characters, cut at `limit` characters.
+fn clean(text: &str, limit: usize) -> String {
+    text.chars()
+        .filter(|c| !is_unsafe(*c))
+        .take(limit)
+        .collect()
+}
 
 #[cfg(test)]
 mod tests {
@@ -57,7 +540,11 @@ mod tests {
             let text = serde_json::to_string(&event).unwrap();
             let (name, written) = event.parts();
             assert_eq!(text, format!(r#"{{"event":"{name}","data":{data}}}"#));
-            assert_eq!(written, serde_json::from_str::<Value>(&data).unwrap(), "{name}");
+            assert_eq!(
+                written,
+                serde_json::from_str::<Value>(&data).unwrap(),
+                "{name}"
+            );
             let fields = fields(name).unwrap();
             // A field that is left out is not written; every other one is, in order.
             let expected: Vec<String> = fields
@@ -71,8 +558,7 @@ mod tests {
     }
 
     #[test]
-    fn append_writes_the_fields_in_the_doc_order_whatever_order_the_caller_built_the_object_in()
-    {
+    fn append_writes_the_fields_in_the_doc_order_whatever_order_the_caller_built_the_object_in() {
         // The runner reorders a hand-built object; here the type has one order, and the nested
         // shapes keep the runner's order too.
         let event: Event = serde_json::from_value(json!({

@@ -1,4 +1,319 @@
 //! Listing the runs in the ledger.
+//!
+//! The runner's `src/ledger/listRuns.ts`, and `nextAttempt` of its `runId.ts`, over the
+//! store. A run is listed once it has an event. The runner lists runs oldest first by the
+//! wall-clock time of each run's first line; nothing here orders by wall-clock time, so runs
+//! are listed by run id: the repo, then the issue and the attempt as numbers. A run whose
+//! events the store holds but this build cannot read is still listed, flagged `unreadable`,
+//! after the others.
+//!
+//! The runner's progress read (`runner/progress.ts`, `Seen`) is not ported yet; the few facts
+//! of it a listing needs are read here, by the runner's rules.
+
+use foundry_proto::factory::{RunEvent, RunId};
+
+use super::events::PrEnd;
+use super::read::{events, field, text};
+use crate::factory::lifecycle::State;
+use crate::store::{Store, StoreError};
+
+/// The step the runner writes when it approves a run: `approved <when>`.
+const APPROVED: &str = "approved ";
+
+/// The step written before a launch is sent.
+const LAUNCH_SENDING: &str = "launch-sending";
+
+/// The step written before a launch that carries on from an earlier branch is sent.
+const LAUNCH_SENDING_RESUMED: &str = "launch-sending resumed-from ";
+
+/// The longest reason a summary carries, in characters.
+pub const REASON_MAX_CHARS: usize = 300;
+
+/// One unfinished run as the pass sees it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunInfo {
+    pub id: RunId,
+    /// The `to` of the last `state_changed`; `None` before any, or for a state this build does
+    /// not know.
+    pub state: Option<State>,
+    /// The run's events could not be read, so the rest is not known.
+    pub unreadable: bool,
+    /// The run records what approved it or the session it launched. A run with neither can
+    /// never launch one.
+    pub confirmed: bool,
+    /// A session may be running for it: the run records a launched session, or a launch that
+    /// was sent.
+    pub session: bool,
+    /// The session reported its pull request since the run last entered `building`: its work
+    /// is done and waits for the gate.
+    pub pr_reported: bool,
+    /// The base branch the run's newest launch that names one recorded.
+    pub base: Option<String>,
+}
+
+/// Whether a run holds one of the machine's run slots: it is confirmed, not finished and not
+/// waiting on a pull request (`pr-open`, or reported and waiting for the gate). A run whose
+/// events cannot be read counts. Finished runs are not listed.
+pub fn holds_slot(run: &RunInfo) -> bool {
+    run.unreadable || (run.confirmed && run.state != Some(State::PrOpen) && !run.pr_reported)
+}
+
+/// What a listing reads of a run's events, by the runner's progress rules.
+#[derive(Default)]
+struct Facts {
+    state: Option<State>,
+    approved: bool,
+    thread: bool,
+    launch_sent: bool,
+    pr_reported: bool,
+    base: Option<String>,
+    finished: bool,
+}
+
+impl Facts {
+    fn of(events: &[RunEvent]) -> Self {
+        let mut facts = Facts::default();
+        for event in events {
+            let data = &event.data;
+            match event.event.as_str() {
+                "step_changed" => {
+                    let Some(step) = text(data, "step") else {
+                        continue;
+                    };
+                    if step.starts_with(APPROVED) {
+                        facts.approved = true;
+                    }
+                    if step == LAUNCH_SENDING || step.starts_with(LAUNCH_SENDING_RESUMED) {
+                        facts.launch_sent = true;
+                    }
+                }
+                "state_changed" => {
+                    let to = text(data, "to");
+                    facts.state = to.and_then(State::from_name);
+                    if to == Some(State::Building.name()) {
+                        facts.pr_reported = false;
+                    }
+                }
+                "session_launched" => {
+                    if text(data, "thread_id").is_some() {
+                        facts.thread = true;
+                    }
+                    if let Some(base) = text(data, "base") {
+                        facts.base = Some(base.to_owned());
+                    }
+                }
+                "pr_opened" => {
+                    if field(data, "pr").is_some_and(|pr| pr.is_number())
+                        && text(data, "url").is_some()
+                    {
+                        facts.pr_reported = true;
+                    }
+                }
+                "gate_sent_back" => facts.pr_reported = false,
+                "finished" => facts.finished = true,
+                _ => {}
+            }
+        }
+        facts
+    }
+
+    fn info(self, id: RunId) -> RunInfo {
+        RunInfo {
+            id,
+            state: self.state,
+            unreadable: false,
+            confirmed: self.approved || self.thread,
+            session: self.thread || self.launch_sent,
+            pr_reported: self.pr_reported,
+            base: self.base,
+        }
+    }
+}
+
+/// A run whose events could not be read.
+fn unreadable(id: RunId) -> RunInfo {
+    RunInfo {
+        id,
+        state: None,
+        unreadable: true,
+        confirmed: false,
+        session: false,
+        pr_reported: false,
+        base: None,
+    }
+}
+
+/// The unfinished runs among `ids`, unreadable ones last.
+fn unfinished(store: &Store, ids: Vec<RunId>) -> Vec<RunInfo> {
+    let (mut readable, mut rest) = (Vec::new(), Vec::new());
+    for id in ids {
+        match events(store, &id) {
+            Ok(events) => {
+                let facts = Facts::of(&events);
+                if !facts.finished {
+                    readable.push(facts.info(id));
+                }
+            }
+            Err(error) => {
+                tracing::warn!(run = %id, %error, "a run whose events cannot be read is listed as unreadable");
+                rest.push(unreadable(id));
+            }
+        }
+    }
+    readable.extend(rest);
+    readable
+}
+
+/// Every run of `repo` (`owner/name`, in any case) that is not finished, in run id order, with
+/// any whose events cannot be read last.
+pub fn runs(store: &Store, repo: &str) -> Result<Vec<RunInfo>, StoreError> {
+    Ok(unfinished(store, store.runs_of(repo)?))
+}
+
+/// The unfinished runs of `issue` in `repo`, as [`runs`] lists them. Only that issue's runs
+/// are read.
+pub fn issue_runs(store: &Store, repo: &str, issue: u64) -> Result<Vec<RunInfo>, StoreError> {
+    let ids = store
+        .runs_of(repo)?
+        .into_iter()
+        .filter(|id| id.issue() == issue)
+        .collect();
+    Ok(unfinished(store, ids))
+}
+
+/// The attempt number for a new run of `issue` in `repo`: one past the highest attempt the
+/// ledger holds, never above the largest, or 1 when there is none.
+pub fn next_attempt(store: &Store, repo: &str, issue: u64) -> Result<u32, StoreError> {
+    let highest = store
+        .runs_of(repo)?
+        .into_iter()
+        .filter(|id| id.issue() == issue)
+        .map(|id| id.attempt())
+        .max();
+    Ok(highest.map_or(1, |attempt| attempt.saturating_add(1)))
+}
+
+/// A run in one row, as the runner's `runs list` shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunSummary {
+    pub id: RunId,
+    /// The first event's `ts`.
+    pub started_ts: Option<String>,
+    /// The name of the last event.
+    pub last_event: Option<String>,
+    /// The issue title the run's first `session_launched` recorded: `None` when that event has
+    /// none, or before the run launched.
+    pub title: Option<String>,
+    /// Why the run waits for a person: the `reason` of the newest `stuck` while its last state
+    /// is `stuck`, the `questions` of the newest `questions_posted` while it is `needs-info`.
+    /// Cut to [`REASON_MAX_CHARS`] characters.
+    pub reason: Option<String>,
+    /// The `to` of the last `state_changed`, when this build knows it.
+    pub state: Option<State>,
+    /// The `step` of the last `step_changed`; `None` before any and for a finished run.
+    pub step: Option<String>,
+    /// The `finished` event's pull request URL, else the last `pr_opened` URL.
+    pub pr_url: Option<String>,
+    /// How the run's pull request ended, from the `finished` event.
+    pub pr_end: Option<PrEnd>,
+    pub finished: bool,
+    /// The `finished` event's `total_ms`.
+    pub total_ms: Option<u64>,
+    /// The run's events could not be read; every other field is empty.
+    pub unreadable: bool,
+}
+
+impl RunSummary {
+    fn unreadable(id: RunId) -> Self {
+        Self {
+            id,
+            started_ts: None,
+            last_event: None,
+            title: None,
+            reason: None,
+            state: None,
+            step: None,
+            pr_url: None,
+            pr_end: None,
+            finished: false,
+            total_ms: None,
+            unreadable: true,
+        }
+    }
+
+    fn of(id: RunId, events: &[RunEvent]) -> Self {
+        let facts = Facts::of(events);
+        let last = |name: &str| events.iter().rev().find(|event| event.event == name);
+        let end = last("finished");
+        let reason_source = match facts.state {
+            Some(State::Stuck) => Some(("stuck", "reason")),
+            Some(State::NeedsInfo) => Some(("questions_posted", "questions")),
+            _ => None,
+        };
+        let reason = reason_source
+            .and_then(|(name, key)| text(&last(name)?.data, key))
+            .map(cap_reason);
+        let last_pr = events
+            .iter()
+            .rev()
+            .filter(|event| event.event == "pr_opened")
+            .filter(|event| field(&event.data, "pr").is_some_and(|pr| pr.is_number()))
+            .find_map(|event| text(&event.data, "url"));
+        let step = (!facts.finished)
+            .then(|| last("step_changed").and_then(|event| text(&event.data, "step")))
+            .flatten();
+        Self {
+            started_ts: events.first().map(|event| event.ts.clone()),
+            last_event: events.last().map(|event| event.event.clone()),
+            title: events
+                .iter()
+                .find(|event| event.event == "session_launched")
+                .and_then(|event| text(&event.data, "title"))
+                .map(str::to_owned),
+            reason,
+            state: facts.state,
+            step: step.map(str::to_owned),
+            pr_url: end
+                .and_then(|end| text(&end.data, "pr_url"))
+                .or(last_pr)
+                .map(str::to_owned),
+            pr_end: end
+                .and_then(|end| field(&end.data, "pr_end"))
+                .and_then(|pr_end| serde_json::from_value(pr_end.clone()).ok()),
+            finished: facts.finished,
+            total_ms: end.and_then(|end| field(&end.data, "total_ms")?.as_u64()),
+            unreadable: false,
+            id,
+        }
+    }
+}
+
+/// `reason` cut to [`REASON_MAX_CHARS`] characters, ending in an ellipsis when cut.
+fn cap_reason(reason: &str) -> String {
+    if reason.chars().count() <= REASON_MAX_CHARS {
+        return reason.to_owned();
+    }
+    let mut capped: String = reason.chars().take(REASON_MAX_CHARS - 1).collect();
+    capped.push('\u{2026}');
+    capped
+}
+
+/// One summary per run of `repo` (`owner/name`, in any case), finished runs included, in run
+/// id order with any whose events cannot be read last.
+pub fn summaries(store: &Store, repo: &str) -> Result<Vec<RunSummary>, StoreError> {
+    let (mut readable, mut rest) = (Vec::new(), Vec::new());
+    for id in store.runs_of(repo)? {
+        match events(store, &id) {
+            Ok(events) => readable.push(RunSummary::of(id, &events)),
+            Err(error) => {
+                tracing::warn!(run = %id, %error, "a run whose events cannot be read is listed as unreadable");
+                rest.push(RunSummary::unreadable(id));
+            }
+        }
+    }
+    readable.extend(rest);
+    Ok(readable)
+}
 
 #[cfg(test)]
 mod tests {
@@ -135,9 +450,23 @@ mod tests {
         // Nothing orders records by wall-clock time: runs are listed in run id order, the issue
         // and attempt as numbers. Issue numbers rise as issues are filed.
         let (_dir, store) = open_store();
-        run_at(&store, &softfac(3), T0 + 20_000, Some(State::Building), false, true);
+        run_at(
+            &store,
+            &softfac(3),
+            T0 + 20_000,
+            Some(State::Building),
+            false,
+            true,
+        );
         run_at(&store, &softfac(1), T0, Some(State::Triage), false, true);
-        run_at(&store, &softfac(2), T0 + 10_000, Some(State::PrOpen), true, true);
+        run_at(
+            &store,
+            &softfac(2),
+            T0 + 10_000,
+            Some(State::PrOpen),
+            true,
+            true,
+        );
         run_at(&store, &softfac(4), T0 + 30_000, None, false, true);
         assert_eq!(
             listed(&store, "rawphp/softfac"),
@@ -159,7 +488,14 @@ mod tests {
     #[test]
     fn a_run_whose_file_cannot_be_read_is_still_listed_flagged_unreadable_after_the_others() {
         let (dir, store) = open_store();
-        run_at(&store, &softfac(7), T0 + 5_000, Some(State::Building), false, true);
+        run_at(
+            &store,
+            &softfac(7),
+            T0 + 5_000,
+            Some(State::Building),
+            false,
+            true,
+        );
         unreadable_run(dir.path(), &softfac(6));
         assert_eq!(
             listed(&store, "rawphp/softfac"),
@@ -215,7 +551,14 @@ mod tests {
             false,
             true,
         );
-        run_at(&store, &softfac(2), T0 + 2_000, Some(State::Triage), false, true);
+        run_at(
+            &store,
+            &softfac(2),
+            T0 + 2_000,
+            Some(State::Triage),
+            false,
+            true,
+        );
         run_at(
             &store,
             &rid(1, "rawphp/other", 1),
@@ -258,9 +601,30 @@ mod tests {
     fn is_set_by_a_launched_session_or_a_launch_that_was_sent_and_not_by_the_claim_alone() {
         let (_dir, store) = open_store();
         run_at(&store, &softfac(1), T0, Some(State::Triage), false, true);
-        run_at(&store, &softfac(2), T0 + 10_000, Some(State::Triage), false, true);
-        run_at(&store, &softfac(3), T0 + 20_000, Some(State::Triage), false, true);
-        run_at(&store, &softfac(4), T0 + 20_000, Some(State::Triage), false, false);
+        run_at(
+            &store,
+            &softfac(2),
+            T0 + 10_000,
+            Some(State::Triage),
+            false,
+            true,
+        );
+        run_at(
+            &store,
+            &softfac(3),
+            T0 + 20_000,
+            Some(State::Triage),
+            false,
+            true,
+        );
+        run_at(
+            &store,
+            &softfac(4),
+            T0 + 20_000,
+            Some(State::Triage),
+            false,
+            false,
+        );
         let later = at(&store, T0 + 30_000);
         later
             .write(&softfac(2), &step("launch-sending"), &test_cause())
@@ -282,7 +646,12 @@ mod tests {
         // A launched session confirms a run that recorded no approval; a launch sent does not.
         assert_eq!(
             sessions,
-            [(1, false, true), (2, true, true), (3, true, true), (4, true, false)]
+            [
+                (1, false, true),
+                (2, true, true),
+                (3, true, true),
+                (4, true, false)
+            ]
         );
     }
 
@@ -383,7 +752,7 @@ mod tests {
 
     #[test]
     fn a_building_run_whose_session_reported_its_pull_request_holds_no_slot_it_waits_for_the_gate()
-     {
+    {
         assert!(!holds_slot(&RunInfo {
             pr_reported: true,
             ..info(softfac(1), Some(State::Building), true)
@@ -481,7 +850,9 @@ mod tests {
     fn reads_the_step_from_the_last_step_changed_of_a_run_read_whole_null_before_any() {
         let (_dir, store) = open_store();
         let ledger = at(&store, T0);
-        ledger.write(&softfac(8), &claimed(), &test_cause()).unwrap();
+        ledger
+            .write(&softfac(8), &claimed(), &test_cause())
+            .unwrap();
         assert_eq!(summaries_of(&store, "rawphp/softfac")[0].step, None);
         ledger
             .write(&softfac(8), &step("launch-sending"), &test_cause())
@@ -489,7 +860,9 @@ mod tests {
         ledger
             .write(&softfac(8), &step("gate-passed"), &test_cause())
             .unwrap();
-        ledger.write(&softfac(8), &claimed(), &test_cause()).unwrap();
+        ledger
+            .write(&softfac(8), &claimed(), &test_cause())
+            .unwrap();
         assert_eq!(
             summaries_of(&store, "rawphp/softfac")[0].step.as_deref(),
             Some("gate-passed")
@@ -709,9 +1082,15 @@ mod tests {
     fn reads_the_title_and_reason_of_a_run_that_is_not_finished() {
         let (_dir, store) = open_store();
         let ledger = at(&store, T0);
-        ledger.write(&softfac(1), &claimed(), &test_cause()).unwrap();
         ledger
-            .write(&softfac(1), &launched(Some("Open run"), None), &test_cause())
+            .write(&softfac(1), &claimed(), &test_cause())
+            .unwrap();
+        ledger
+            .write(
+                &softfac(1),
+                &launched(Some("Open run"), None),
+                &test_cause(),
+            )
             .unwrap();
         ledger
             .write(&softfac(1), &stuck("gate failed"), &test_cause())
@@ -746,8 +1125,12 @@ mod tests {
             Outcome::NeedsInfo,
         );
         let ledger = at(&store, T0);
-        ledger.write(&softfac(3), &claimed(), &test_cause()).unwrap();
-        ledger.write(&softfac(3), &stuck(&long), &test_cause()).unwrap();
+        ledger
+            .write(&softfac(3), &claimed(), &test_cause())
+            .unwrap();
+        ledger
+            .write(&softfac(3), &stuck(&long), &test_cause())
+            .unwrap();
         ledger
             .write(
                 &softfac(3),
@@ -769,7 +1152,7 @@ mod tests {
 
     #[test]
     fn leaves_a_reason_of_exactly_300_characters_whole_and_cuts_one_of_301_to_299_and_an_ellipsis()
-     {
+    {
         let (_dir, store) = open_store();
         let exact = "\u{1F600}".repeat(300);
         finished_run(
@@ -831,11 +1214,17 @@ mod tests {
     }
 
     #[test]
-    fn next_attempt_matches_a_linear_identifier_in_any_case_and_never_passes_the_largest_attempt()
-    {
+    fn next_attempt_matches_a_linear_identifier_in_any_case_and_never_passes_the_largest_attempt() {
         // Foundry's issues are GitHub numbers: the repo is what is matched in any case.
         let (_dir, store) = open_store();
-        run_at(&store, &rid(8, "rawphp/softfac", u32::MAX), T0, None, false, true);
+        run_at(
+            &store,
+            &rid(8, "rawphp/softfac", u32::MAX),
+            T0,
+            None,
+            false,
+            true,
+        );
         assert_eq!(
             next_attempt(&store.lock().unwrap(), "RawPHP/SoftFac", 8).unwrap(),
             u32::MAX

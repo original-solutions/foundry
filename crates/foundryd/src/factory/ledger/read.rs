@@ -1,4 +1,78 @@
 //! Reading a run's ledger back.
+//!
+//! The read half of the runner's `src/ledger/read.ts`. An event is read back as it was
+//! written: an event name this build does not know, or data that is not what the name says,
+//! is kept as it is, so a run written by a newer build reads whole. Only a cause that is not
+//! an object with a text `step` and `reason`, and the right types for the rest, reads as no
+//! cause, as the runner's `readCause` has it.
+//!
+//! The runner's file cases (cut-off and invalid lines, blank lines, symlinks) have no
+//! counterpart: each event is a record the store has already parsed. A record this build
+//! cannot parse at all is an error, never skipped, since a run with an event left out reads
+//! as another run.
+
+use foundry_proto::factory::{RunEvent, RunId};
+use serde_json::Value;
+
+use super::Ledger;
+use crate::store::{Store, StoreError};
+
+impl Ledger {
+    /// The events of `run`, from every writer, in order: by the lease generation each was
+    /// written under, then by its writer's factory version. Never by time.
+    pub fn read(&self, run: &RunId) -> Result<Vec<RunEvent>, StoreError> {
+        let store = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        events(&store, run)
+    }
+}
+
+/// The events of `run` that `store` holds, in order, as [`Ledger::read`] reads them.
+pub fn events(store: &Store, run: &RunId) -> Result<Vec<RunEvent>, StoreError> {
+    let mut events = store.run_events(run)?;
+    for event in &mut events {
+        if !is_cause(event.cause.as_ref()) {
+            event.cause = None;
+        }
+    }
+    Ok(events)
+}
+
+/// Whether `cause` reads as a cause: an object with a text `step` and `reason`, an `actor`,
+/// `command` and `label` that are text when present, and an `attempt` that is a u32. Any
+/// other key is kept, so a cause from a newer build reads as it was written.
+fn is_cause(cause: Option<&Value>) -> bool {
+    let Some(Value::Object(fields)) = cause else {
+        return false;
+    };
+    let text = |key: &str| fields.get(key).is_some_and(Value::is_string);
+    let text_or_absent =
+        |key: &str| matches!(fields.get(key), None | Some(Value::Null)) || text(key);
+    let attempt_ok = match fields.get("attempt") {
+        None | Some(Value::Null) => true,
+        Some(attempt) => attempt
+            .as_u64()
+            .is_some_and(|attempt| u32::try_from(attempt).is_ok()),
+    };
+    text("step")
+        && text("reason")
+        && text_or_absent("actor")
+        && text_or_absent("command")
+        && text_or_absent("label")
+        && attempt_ok
+}
+
+/// The value at `key` of an event's `data`; `None` when the data is not an object with it.
+pub fn field<'a>(data: &'a Value, key: &str) -> Option<&'a Value> {
+    data.as_object()?.get(key)
+}
+
+/// The text at `key` of an event's `data`; `None` when it is not text.
+pub fn text<'a>(data: &'a Value, key: &str) -> Option<&'a str> {
+    field(data, key)?.as_str()
+}
 
 #[cfg(test)]
 mod tests {
@@ -101,7 +175,17 @@ mod tests {
     fn read_keeps_a_known_type_with_the_wrong_data_and_a_missing_data_key_as_written() {
         let (_dir, store) = open_store();
         let other = MachineId::random();
-        put(&store, other, 1, &run(8), 1, T0, "claimed", json!({"machine": 1}), None);
+        put(
+            &store,
+            other,
+            1,
+            &run(8),
+            1,
+            T0,
+            "claimed",
+            json!({"machine": 1}),
+            None,
+        );
         put(&store, other, 2, &run(8), 1, T0, "stuck", Value::Null, None);
         assert_eq!(
             events(&store.lock().unwrap(), &run(8)).unwrap(),
@@ -151,8 +235,28 @@ mod tests {
             "pr_url": null,
         });
         let cause = Some(json!({"step": "pass", "reason": "claimed"}));
-        put(&store, other, 1, &run(8), 1, T0, "session_launched", launched.clone(), cause.clone());
-        put(&store, other, 2, &run(8), 1, T0, "finished", finished.clone(), cause.clone());
+        put(
+            &store,
+            other,
+            1,
+            &run(8),
+            1,
+            T0,
+            "session_launched",
+            launched.clone(),
+            cause.clone(),
+        );
+        put(
+            &store,
+            other,
+            2,
+            &run(8),
+            1,
+            T0,
+            "finished",
+            finished.clone(),
+            cause.clone(),
+        );
         let read = events(&store.lock().unwrap(), &run(8)).unwrap();
         assert_eq!(read[0].data, launched);
         assert_eq!(read[1].data, finished);
@@ -173,7 +277,10 @@ mod tests {
             read[0].data,
             json!({"reason": "the run passed its time limit", "branch": "t3code/abc", "commits_ahead": 2})
         );
-        assert_eq!(Event::from_parts(&read[0].event, &read[0].data), Some(event));
+        assert_eq!(
+            Event::from_parts(&read[0].event, &read[0].data),
+            Some(event)
+        );
 
         let old = json!({"reason": "gate failed 3 times"});
         assert_eq!(

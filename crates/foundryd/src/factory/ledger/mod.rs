@@ -1,9 +1,339 @@
 //! The ledger: each run's events, read back, listed and exported.
+//!
+//! A port of the runner's `src/ledger/` (`ledger.ts`, `time.ts` and `limits.ts` here, with
+//! `events.ts`, `read.ts` and `listRuns.ts` in the modules below). The runner appends each
+//! event as one line of a run file; here each event is a `run_event` factory record of the
+//! machine that wrote it, so the store, which syncs them, replaces the files
+//! (`appendFile.ts` and `machineLog.ts` are not ported).
+//!
+//! A run may be written by more than one machine over its life, one lease generation after
+//! another. Its events are read in order of the generation they were written under, then of
+//! the writer's factory version (F6). The wall-clock time each event carries is what the
+//! runner records and what `limits.minutes` counts from; it never orders anything, so a
+//! machine whose clock is behind cannot move its events before an earlier holder's.
+//!
+//! Before an event is stored, every text in its data and cause goes through the ledger's
+//! [`Hide`], which hides the secrets this machine holds, and then each text of the data is cut
+//! to its last [`OUTPUT_LIMIT`] bytes.
+
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use foundry_proto::factory::{FactoryBody, FactoryRecord, RunEvent, RunId};
+use foundry_proto::ids::MachineId;
+use serde_json::Value;
+
+use crate::store::{Store, StoreError};
+
+use events::{Cause, Event, Outcome, PrEnd};
 
 pub mod events;
 pub mod export;
 pub mod list;
 pub mod read;
+
+/// The most output an event keeps, in bytes: a gate or setup tail is cut to its last 64 KB.
+pub const OUTPUT_LIMIT: usize = 64 * 1024;
+
+/// Hides the secrets this machine holds in a text. The daemon's hides every `github:*` token
+/// and gateway key in its secret store at the time of the call (`secrets::hide_known`).
+pub type Hide = Arc<dyn Fn(&str) -> String + Send + Sync>;
+
+/// The wall-clock time as Unix epoch milliseconds: what an event is stamped with.
+pub type WallClock = Arc<dyn Fn() -> u64 + Send + Sync>;
+
+/// This machine's wall-clock time as Unix epoch milliseconds; 0 for a clock set before 1970.
+pub fn system_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+/// Why the ledger did not write an event.
+#[derive(Debug, thiserror::Error)]
+pub enum LedgerError {
+    /// The run has its `finished` event; nothing more is written to it.
+    #[error("run {run} is already finished")]
+    AlreadyFinished { run: RunId },
+    #[error(transparent)]
+    Store(#[from] StoreError),
+}
+
+/// Writes a run's events as this machine's `run_event` records, under the lease generation it
+/// was given. Cheap to clone: every clone writes to the same store.
+#[derive(Clone)]
+pub struct Ledger {
+    store: Arc<Mutex<Store>>,
+    me: MachineId,
+    generation: u64,
+    hide: Hide,
+    wall: WallClock,
+}
+
+impl Ledger {
+    /// A ledger of machine `me` that writes at lease `generation`, hiding text with `hide` and
+    /// stamping events with the system's wall clock.
+    pub fn new(store: Arc<Mutex<Store>>, me: MachineId, generation: u64, hide: Hide) -> Self {
+        Self {
+            store,
+            me,
+            generation,
+            hide,
+            wall: Arc::new(system_ms),
+        }
+    }
+
+    /// The same ledger, stamping events with `wall`.
+    pub fn with_wall(self, wall: WallClock) -> Self {
+        Self { wall, ..self }
+    }
+
+    /// The same ledger at lease `generation`.
+    pub fn at(&self, generation: u64) -> Self {
+        Self {
+            generation,
+            ..self.clone()
+        }
+    }
+
+    /// The lease generation this ledger writes at.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Writes `event` as the next event of `run`, stamped with this ledger's generation and the
+    /// time, and gives back what was stored. A `finished` event gets the run's own `total_ms`,
+    /// the time from its first event (never negative), and `gate_attempts`, the distinct
+    /// attempts among its `gate_command` events; see [`finish`](Self::finish). Nothing is
+    /// written to a run that has its `finished` event, whoever wrote it.
+    pub fn write(
+        &self,
+        run: &RunId,
+        event: &Event,
+        cause: &Cause,
+    ) -> Result<RunEvent, LedgerError> {
+        let (name, mut data) = event.parts();
+        // A task that panicked while holding the store leaves it consistent: SQLite rolls back
+        // what it did not commit. The lock is held from the read to the write, so this
+        // machine's own writes of one run never cross.
+        let mut store = self.store.lock().unwrap_or_else(PoisonError::into_inner);
+        let held = store.run_events(run)?;
+        // A `finished` event ends the run even when its data cannot be read.
+        if held.iter().any(|event| event.event == "finished") {
+            return Err(LedgerError::AlreadyFinished { run: run.clone() });
+        }
+        let ms = (self.wall)();
+        if let (Event::Finished { .. }, Value::Object(fields)) = (event, &mut data) {
+            let first = held.first().map_or(ms, |event| event.ms);
+            fields.insert("total_ms".into(), ms.saturating_sub(first).into());
+            fields.insert("gate_attempts".into(), gate_attempts(&held).into());
+        }
+        hide_texts(&mut data, &*self.hide, true);
+        let mut cause = serde_json::to_value(cause.cleaned())
+            .expect("a cause is an object of strings and a number");
+        hide_texts(&mut cause, &*self.hide, false);
+        let written = RunEvent {
+            run: run.clone(),
+            generation: self.generation,
+            ts: format_ts(ms),
+            ms,
+            event: name.to_owned(),
+            data,
+            cause: Some(cause),
+        };
+        let record = FactoryRecord {
+            owner: self.me,
+            version: store.own_next_factory_version()?,
+            body: FactoryBody::RunEvent(written.clone()),
+        };
+        store.apply_factory(&record, self.me)?;
+        Ok(written)
+    }
+
+    /// Writes the `finished` event that ends `run`. The ledger fills in the total time since
+    /// the run's first event and the number of distinct gate attempts. `pr_end` is how the
+    /// pull request ended, for a run that ended because it did.
+    pub fn finish(
+        &self,
+        run: &RunId,
+        outcome: Outcome,
+        review_cycles: Option<u32>,
+        pr_url: Option<&str>,
+        cause: &Cause,
+        pr_end: Option<PrEnd>,
+    ) -> Result<RunEvent, LedgerError> {
+        let event = Event::Finished {
+            outcome,
+            total_ms: 0,
+            gate_attempts: 0,
+            review_cycles,
+            pr_url: pr_url.map(str::to_owned),
+            pr_end,
+        };
+        self.write(run, &event, cause)
+    }
+}
+
+/// The distinct attempts among `events`' `gate_command` events. Only one the runner's reader
+/// would read whole counts: an attempt that is a u32, a command, an exit code that is an i32
+/// and a duration that is a u64.
+fn gate_attempts(events: &[RunEvent]) -> u32 {
+    let attempts: std::collections::BTreeSet<u64> = events
+        .iter()
+        .filter(|event| event.event == "gate_command")
+        .filter_map(|event| {
+            let data = &event.data;
+            let attempt = data.get("attempt")?.as_u64()?;
+            u32::try_from(attempt).ok()?;
+            data.get("command")?.as_str()?;
+            i32::try_from(data.get("exit_code")?.as_i64()?).ok()?;
+            data.get("duration_ms")?.as_u64()?;
+            Some(attempt)
+        })
+        .collect();
+    u32::try_from(attempts.len()).unwrap_or(u32::MAX)
+}
+
+/// Every text in `value` through `hide`, and, when `cut`, then cut to its last
+/// [`OUTPUT_LIMIT`] bytes. Hiding comes first, so a cut can never leave the end of a secret
+/// that the hiding would no longer recognise.
+fn hide_texts(value: &mut Value, hide: &(dyn Fn(&str) -> String + Send + Sync), cut: bool) {
+    match value {
+        Value::String(text) => {
+            let hidden = hide(text);
+            *text = if cut {
+                cut_output(&hidden).to_owned()
+            } else {
+                hidden
+            };
+        }
+        Value::Array(items) => {
+            for item in items {
+                hide_texts(item, hide, cut);
+            }
+        }
+        Value::Object(fields) => {
+            for item in fields.values_mut() {
+                hide_texts(item, hide, cut);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+/// The last [`OUTPUT_LIMIT`] bytes of `text`, cut on a character boundary: the whole text when
+/// it is no longer than that.
+pub fn cut_output(text: &str) -> &str {
+    let mut at = text.len().saturating_sub(OUTPUT_LIMIT);
+    while !text.is_char_boundary(at) {
+        at += 1;
+    }
+    &text[at..]
+}
+
+// The runner's `time.ts`.
+
+/// Unix epoch milliseconds as RFC 3339 UTC with millisecond precision, as the runner writes
+/// an event's `ts`.
+pub fn format_ts(ms: u64) -> String {
+    // Every u64 of milliseconds is under 2^64 / 86 400 000 days, which fits an i64 with room.
+    let ms = i64::try_from(ms).unwrap_or(i64::MAX);
+    let secs = ms.div_euclid(1000);
+    let millis = ms.rem_euclid(1000);
+    let days = secs.div_euclid(86_400);
+    let of_day = secs.rem_euclid(86_400);
+    let (hour, minute, second) = (of_day / 3_600, of_day % 3_600 / 60, of_day % 60);
+    // Days since 1970-01-01 to a civil date (Howard Hinnant's `civil_from_days`).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let mp = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
+}
+
+/// Unix epoch milliseconds from RFC 3339 UTC as [`format_ts`] writes it,
+/// `YYYY-MM-DDTHH:MM:SSZ` with a fraction of one to three digits before the `Z` when there is
+/// one. Anything else, such as an offset in place of the `Z`, a date that is not on the
+/// calendar, a trailing newline or a time before the epoch, is `None`.
+pub fn parse_ts(text: &str) -> Option<u64> {
+    let body = text.strip_suffix('Z')?;
+    let (whole, fraction) = match body.split_once('.') {
+        Some((whole, fraction)) => (whole, Some(fraction)),
+        None => (body, None),
+    };
+    let bytes = whole.as_bytes();
+    if bytes.len() != 19 {
+        return None;
+    }
+    let shape_ok = bytes.iter().enumerate().all(|(i, b)| match i {
+        4 | 7 => *b == b'-',
+        10 => *b == b'T',
+        13 | 16 => *b == b':',
+        _ => b.is_ascii_digit(),
+    });
+    if !shape_ok {
+        return None;
+    }
+    let number = |from: usize, to: usize| -> i64 {
+        whole[from..to]
+            .bytes()
+            .fold(0, |n, b| n * 10 + i64::from(b - b'0'))
+    };
+    let (year, month, day) = (number(0, 4), number(5, 7), number(8, 10));
+    let (hour, minute, second) = (number(11, 13), number(14, 16), number(17, 19));
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let month_days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if day < 1 || day > month_days || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    let millis = match fraction {
+        None => 0,
+        Some(digits) => {
+            if digits.is_empty() || digits.len() > 3 || !digits.bytes().all(|b| b.is_ascii_digit())
+            {
+                return None;
+            }
+            // `.1` is a tenth of a second: pad on the right to three digits.
+            format!("{digits:0<3}").parse::<i64>().ok()?
+        }
+    };
+    // A civil date to days since 1970-01-01 (Howard Hinnant's `days_from_civil`).
+    let y = year - i64::from(month <= 2);
+    let era = y.div_euclid(400);
+    let year_of_era = y - era * 400;
+    let mp = (month + 9) % 12;
+    let day_of_year = (153 * mp + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    let ms = (days * 86_400 + hour * 3_600 + minute * 60 + second) * 1000 + millis;
+    u64::try_from(ms).ok()
+}
+
+/// A length of time as the runner prints it: `12s`, `5m`, `2h05m` or `1d01h`, by the largest
+/// unit that fits.
+pub fn duration(ms: u64) -> String {
+    let secs = ms / 1000;
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3_600 => format!("{}m", secs / 60),
+        3_600..86_400 => format!("{}h{:02}m", secs / 3_600, secs % 3_600 / 60),
+        _ => format!("{}d{:02}h", secs / 86_400, secs % 86_400 / 3_600),
+    }
+}
 
 /// What the ledger's tests share: a store, clocks the test moves, and the runner's samples.
 #[cfg(test)]
@@ -147,9 +477,7 @@ pub(crate) mod testing {
     /// `finished` is last, as written as the only event of a run: the ledger fills in its
     /// summary.
     pub fn samples() -> Vec<(Event, String)> {
-        use super::events::{
-            CheckRead, ErrorKind, ModelOption, OptionValue, Outcome, ResumedFrom,
-        };
+        use super::events::{CheckRead, ErrorKind, ModelOption, OptionValue, Outcome, ResumedFrom};
         use crate::factory::lifecycle::State;
 
         vec![
@@ -774,11 +1102,15 @@ mod tests {
         let me = MachineId::random();
         let first = ledger(&store, me, 1, ticking(T0, 1000));
         first.write(&run(8), &step("red"), &test_cause()).unwrap();
-        first.write(&run(8), &gate(1, "cargo test"), &test_cause()).unwrap();
+        first
+            .write(&run(8), &gate(1, "cargo test"), &test_cause())
+            .unwrap();
         drop(first);
 
         let second = ledger(&store, me, 1, ticking(T0 + 60_000, 1000));
-        second.write(&run(8), &gate(2, "cargo test"), &test_cause()).unwrap();
+        second
+            .write(&run(8), &gate(2, "cargo test"), &test_cause())
+            .unwrap();
         second
             .finish(&run(8), Outcome::PrOpen, None, None, &test_cause(), None)
             .unwrap();
@@ -801,7 +1133,10 @@ mod tests {
         let error = second
             .write(&run(8), &stuck("r"), &test_cause())
             .unwrap_err();
-        assert!(matches!(error, LedgerError::AlreadyFinished { .. }), "{error}");
+        assert!(
+            matches!(error, LedgerError::AlreadyFinished { .. }),
+            "{error}"
+        );
         assert_eq!(held(&store, &run(8)), before);
     }
 
@@ -809,7 +1144,17 @@ mod tests {
     fn a_finished_line_this_code_cannot_read_still_ends_the_run_after_open() {
         let (_dir, store) = open_store();
         let newer = MachineId::random();
-        put(&store, newer, 1, &run(8), 1, T0, "step_changed", json!({"step": "red"}), None);
+        put(
+            &store,
+            newer,
+            1,
+            &run(8),
+            1,
+            T0,
+            "step_changed",
+            json!({"step": "red"}),
+            None,
+        );
         put(
             &store,
             newer,
@@ -851,7 +1196,8 @@ mod tests {
                 None,
             );
         }
-        let ledger = ledger(&store, MachineId::random(), 1, ticking(T0 + 5000, 1000));
+        // The earlier holder wrote at generation 1; within a generation only one machine writes.
+        let ledger = ledger(&store, MachineId::random(), 2, ticking(T0 + 5000, 1000));
         ledger
             .write(&run(8), &gate(1, "cargo test"), &test_cause())
             .unwrap();
@@ -885,9 +1231,20 @@ mod tests {
             json!({"attempt": 4_294_967_296_u64, "command": "c", "exit_code": 0, "duration_ms": 5}),
         ];
         for (version, data) in (1..).zip(lines) {
-            put(&store, other, version, &run(8), 1, T0, "gate_command", data, None);
+            put(
+                &store,
+                other,
+                version,
+                &run(8),
+                1,
+                T0,
+                "gate_command",
+                data,
+                None,
+            );
         }
-        let ledger = ledger(&store, MachineId::random(), 1, ticking(T0 + 5000, 1000));
+        // The earlier holder wrote at generation 1; within a generation only one machine writes.
+        let ledger = ledger(&store, MachineId::random(), 2, ticking(T0 + 5000, 1000));
         ledger
             .write(&run(8), &gate(1, "cargo test"), &test_cause())
             .unwrap();
@@ -946,8 +1303,12 @@ mod tests {
         let first = ledger(&store, me, 1, ticking(T0, 10_000));
         let second = ledger(&store, me, 1, ticking(T0 + 1000, 10_000));
         first.write(&run(8), &step("red"), &test_cause()).unwrap();
-        second.write(&run(8), &step("green"), &test_cause()).unwrap();
-        first.write(&run(8), &step("refactor"), &test_cause()).unwrap();
+        second
+            .write(&run(8), &step("green"), &test_cause())
+            .unwrap();
+        first
+            .write(&run(8), &step("refactor"), &test_cause())
+            .unwrap();
         second.write(&run(8), &step("ship"), &test_cause()).unwrap();
         assert_eq!(
             held(&store, &run(8)),
@@ -1121,7 +1482,14 @@ mod tests {
             .write(&run(8), &gate(3, "cargo test"), &test_cause())
             .unwrap();
         ledger
-            .finish(&run(8), Outcome::NeedsInfo, Some(0), None, &test_cause(), None)
+            .finish(
+                &run(8),
+                Outcome::NeedsInfo,
+                Some(0),
+                None,
+                &test_cause(),
+                None,
+            )
             .unwrap();
         assert_eq!(
             last(&store),
@@ -1247,7 +1615,9 @@ mod tests {
             .unwrap();
         let before = held(&store, &run(8));
         let errors = [
-            ledger.write(&run(8), &stuck("r"), &test_cause()).unwrap_err(),
+            ledger
+                .write(&run(8), &stuck("r"), &test_cause())
+                .unwrap_err(),
             ledger
                 .finish(&run(8), Outcome::Stuck, None, None, &test_cause(), None)
                 .unwrap_err(),
@@ -1302,9 +1672,9 @@ mod tests {
                 pr_end: Some(pr_end),
             };
             assert!(
-                serde_json::to_string(&event)
-                    .unwrap()
-                    .ends_with(&format!(r#""pr_url":"https://x/pull/1","pr_end":{name}}}}}"#)),
+                serde_json::to_string(&event).unwrap().ends_with(&format!(
+                    r#""pr_url":"https://x/pull/1","pr_end":{name}}}}}"#
+                )),
                 "{pr_end:?}"
             );
         }
@@ -1367,7 +1737,9 @@ mod tests {
         let me = MachineId::random();
         let ledger = ledger(&store, me, 1, ticking(T0, 1000));
         ledger.write(&run(8), &step("red"), &test_cause()).unwrap();
-        ledger.write(&run(9), &step("green"), &test_cause()).unwrap();
+        ledger
+            .write(&run(9), &step("green"), &test_cause())
+            .unwrap();
         let records = store
             .lock()
             .unwrap()
@@ -1403,7 +1775,16 @@ mod tests {
                 .into_iter()
                 .map(|event| event.data["step"].clone())
                 .collect();
-            assert_eq!(steps, [json!("a1"), json!("a2"), json!("a3"), json!("b1"), json!("b2")]);
+            assert_eq!(
+                steps,
+                [
+                    json!("a1"),
+                    json!("a2"),
+                    json!("a3"),
+                    json!("b1"),
+                    json!("b2")
+                ]
+            );
             assert_eq!(held(store, &run(8)).len(), 5);
         }
         // Its finish counts no negative time from the first holder's start.
@@ -1422,7 +1803,10 @@ mod tests {
             .write(&run(8), &stuck(&output), &test_cause())
             .unwrap();
         assert_eq!(written.data["reason"], json!("t".repeat(OUTPUT_LIMIT)));
-        assert_eq!(held(&store, &run(8))[0].data["reason"], written.data["reason"]);
+        assert_eq!(
+            held(&store, &run(8))[0].data["reason"],
+            written.data["reason"]
+        );
         // Output of exactly 64 KB is kept whole, and every text in the event is cut alike.
         let exact = "x".repeat(OUTPUT_LIMIT);
         let written = ledger
@@ -1459,8 +1843,8 @@ mod tests {
     fn known_secrets_are_hidden_in_the_data_and_the_cause_before_the_output_is_cut() {
         let (_dir, store) = open_store();
         let hide: Hide = std::sync::Arc::new(|text: &str| text.replace("s3cr3t-token", "***"));
-        let ledger = Ledger::new(store.clone(), MachineId::random(), 1, hide)
-            .with_wall(ticking(T0, 1000));
+        let ledger =
+            Ledger::new(store.clone(), MachineId::random(), 1, hide).with_wall(ticking(T0, 1000));
         // The secret sits across the place the cut would make if it came before the hiding.
         let output = format!(
             "{}s3cr3t-token{}",
@@ -1483,12 +1867,18 @@ mod tests {
             .unwrap();
         let text = serde_json::to_string(&written).unwrap();
         assert!(!text.contains("s3cr3t"), "{text}");
-        assert!(!text.contains("token"), "a cut left part of the secret: {text}");
+        assert!(
+            !text.contains("token"),
+            "a cut left part of the secret: {text}"
+        );
         assert_eq!(written.data["items"], json!(["review:1 ***"]));
         let message = written.data["message"].as_str().unwrap();
         assert_eq!(message.len(), OUTPUT_LIMIT);
         assert!(message.ends_with(&"t".repeat(OUTPUT_LIMIT - 6)));
-        assert_eq!(written.cause.as_ref().unwrap()["command"], json!("curl -H '***'"));
+        assert_eq!(
+            written.cause.as_ref().unwrap()["command"],
+            json!("curl -H '***'")
+        );
         assert_eq!(written.cause.as_ref().unwrap()["actor"], json!("***"));
         let stored = serde_json::to_string(&held(&store, &run(8))).unwrap();
         assert!(!stored.contains("s3cr3t"), "{stored}");
