@@ -191,21 +191,211 @@ pub fn github_default(secrets: &dyn Secrets) -> Option<String> {
 /// (whatever follows `github:`, a login or not), read at this call so a token set after the
 /// daemon started is hidden too, and then the passwords of URLs as [`redact`] hides them. When
 /// the store cannot be read, none of `text` is shown: [`HIDDEN_UNREADABLE`] is given instead.
+///
+/// A held value of at least [`SPLIT_MIN`] characters is hidden also when gaps sit inside it,
+/// as a tool that wraps to the terminal's width or colours part of a word leaves them: each gap
+/// at most [`GAP_MAX`] characters of white space, controls, bidi and zero-width characters
+/// ([`is_gap`]) and whole escape sequences. A shorter value is hidden only whole. Only the
+/// span from the value's first character to its last becomes `***`; every other line and
+/// character of `text` stays as it was, and [`redact`] then reads the lines as they came.
 pub fn hide_known(text: &str, secrets: &dyn Secrets) -> String {
     match known_values(secrets) {
-        Ok(mut values) => {
-            // The longest first, so a token that is the start of another leaves no tail of it.
-            values.sort_by_key(|value| std::cmp::Reverse(value.len()));
-            let mut hidden = text.to_owned();
-            for value in values {
-                hidden = hidden.replace(&value, "***");
-            }
-            redact(&hidden)
-        }
+        Ok(values) => redact(&hide_values(text, &values, &mut 0)),
         Err(error) => {
             tracing::warn!(%error, "text hidden: the secret store could not be read");
             HIDDEN_UNREADABLE.to_owned()
         }
+    }
+}
+
+/// A held value this many characters long, or longer, is hidden also with gaps inside it. A
+/// shorter one could too easily be put together from pieces of text that merely sit near
+/// each other, so it is hidden only whole.
+const SPLIT_MIN: usize = 16;
+
+/// The most characters one gap inside a held value may hold.
+const GAP_MAX: usize = 32;
+
+/// `text` with each span that holds one of `values` as `***`, read in one pass: every value is
+/// looked for whole, and one of at least [`SPLIT_MIN`] characters with no gap character of
+/// its own also with gaps inside it. Spans that overlap are hidden as one. `work` counts the
+/// characters read and the matchers' steps, so a test can bound them.
+fn hide_values(text: &str, values: &[String], work: &mut usize) -> String {
+    let values = values.iter().filter(|value| !value.is_empty());
+    let mut whole: Vec<Matcher> = values.clone().map(|value| Matcher::new(value)).collect();
+    let mut split: Vec<Matcher> = values
+        .filter(|value| value.chars().count() >= SPLIT_MIN && !value.chars().any(is_gap))
+        .map(|value| Matcher::new(value))
+        .collect();
+    // The byte offset of each character of `text` that is no gap, in order.
+    let mut kept: Vec<usize> = Vec::new();
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    // The characters of gap since the last character that is no gap.
+    let mut gap = 0;
+    // Where the escape sequence being read ends.
+    let mut escape_end = 0;
+    for (at, c) in text.char_indices() {
+        *work += 1;
+        let end = at + c.len_utf8();
+        for matcher in &mut whole {
+            if matcher.feed(c, work) {
+                spans.push((end - matcher.bytes, end));
+            }
+        }
+        if at < escape_end {
+            continue;
+        }
+        if is_gap(c) {
+            let (bytes, chars) = escape(&text[at..], work).unwrap_or((c.len_utf8(), 1));
+            escape_end = at + bytes;
+            gap += chars;
+            continue;
+        }
+        if gap > GAP_MAX {
+            for matcher in &mut split {
+                matcher.matched = 0;
+            }
+        }
+        gap = 0;
+        kept.push(at);
+        for matcher in &mut split {
+            if matcher.feed(c, work) {
+                spans.push((kept[kept.len() - matcher.value.len()], end));
+            }
+        }
+    }
+    spans.sort_unstable();
+    let mut hidden = String::with_capacity(text.len());
+    // How much of `text` is in `hidden`, shown or hidden.
+    let mut done = 0;
+    for (start, end) in spans {
+        if start >= done {
+            hidden.push_str(&text[done..start]);
+            hidden.push_str("***");
+        }
+        done = done.max(end);
+    }
+    hidden.push_str(&text[done..]);
+    hidden
+}
+
+/// Whether `c` may sit in a gap inside a held value: white space, the C0 and C1 controls and
+/// DEL, and the bidi and zero-width characters. The introducer of an escape sequence is one,
+/// and a whole sequence is a gap of its own length ([`escape`]).
+fn is_gap(c: char) -> bool {
+    matches!(
+        c,
+        ' ' | '\u{0}'..='\u{1f}'
+            | '\u{7f}'..='\u{9f}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{feff}'
+    )
+}
+
+/// The length, in bytes and in characters, of the whole ECMA-48 escape sequence `rest` starts
+/// with: a control sequence (`ESC [` or CSI), a control string (`ESC ]`, `P`, `X`, `^`, `_`
+/// or their C1 forms, ended by BEL, ST or `ESC \`), or an escape with its intermediates.
+/// `None` when `rest` starts with none, or with one not whole within [`GAP_MAX`] characters,
+/// which no gap could hold. `work` counts the characters read.
+fn escape(rest: &str, work: &mut usize) -> Option<(usize, usize)> {
+    #[derive(Clone, Copy)]
+    enum Part {
+        Start,
+        Esc,
+        Intermediates,
+        Csi { intermediates: bool },
+        Text,
+        TextEsc,
+    }
+    let mut part = Part::Start;
+    for (read, (at, c)) in rest.char_indices().take(GAP_MAX).enumerate() {
+        *work += 1;
+        let whole = Some((at + c.len_utf8(), read + 1));
+        part = match (part, c) {
+            (Part::Start, '\u{1b}') => Part::Esc,
+            (Part::Start, '\u{9b}') | (Part::Esc, '[') => Part::Csi {
+                intermediates: false,
+            },
+            (Part::Start, '\u{90}' | '\u{98}' | '\u{9d}'..='\u{9f}')
+            | (Part::Esc, ']' | 'P' | 'X' | '^' | '_') => Part::Text,
+            (Part::Esc | Part::Intermediates, '\u{20}'..='\u{2f}') => Part::Intermediates,
+            (Part::Esc | Part::Intermediates, '\u{30}'..='\u{7e}') => return whole,
+            (
+                Part::Csi {
+                    intermediates: false,
+                },
+                '\u{30}'..='\u{3f}',
+            ) => part,
+            (Part::Csi { .. }, '\u{20}'..='\u{2f}') => Part::Csi {
+                intermediates: true,
+            },
+            (Part::Csi { .. }, '\u{40}'..='\u{7e}') => return whole,
+            (Part::Text, '\u{7}' | '\u{9c}') | (Part::TextEsc, '\\') => return whole,
+            (Part::Text, '\u{1b}') => Part::TextEsc,
+            (Part::Text, '\u{8}'..='\u{d}') => part,
+            (Part::Text, c) if !matches!(c, '\u{0}'..='\u{1f}' | '\u{7f}'..='\u{9f}') => part,
+            _ => return None,
+        };
+    }
+    None
+}
+
+/// Finds one value in a stream of characters, each read once (Knuth, Morris and Pratt): it
+/// never goes back in the text, only along the value.
+struct Matcher {
+    value: Vec<char>,
+    /// The value's length in bytes.
+    bytes: usize,
+    /// For each `i`, the length of the longest start of the value, shorter than `i + 1`, that
+    /// `value[..=i]` ends with.
+    back: Vec<usize>,
+    /// How many of the value's first characters the stream now ends with.
+    matched: usize,
+}
+
+impl Matcher {
+    /// A matcher of `value`, which is not empty.
+    fn new(value: &str) -> Self {
+        let value: Vec<char> = value.chars().collect();
+        let mut back = vec![0; value.len()];
+        let mut k = 0;
+        for i in 1..value.len() {
+            while k > 0 && value[i] != value[k] {
+                k = back[k - 1];
+            }
+            if value[i] == value[k] {
+                k += 1;
+            }
+            back[i] = k;
+        }
+        Self {
+            bytes: value.iter().map(|c| c.len_utf8()).sum(),
+            value,
+            back,
+            matched: 0,
+        }
+    }
+
+    /// Reads `c`: whether the stream now ends with the whole value. `work` counts the steps.
+    fn feed(&mut self, c: char, work: &mut usize) -> bool {
+        loop {
+            *work += 1;
+            if self.value[self.matched] == c {
+                self.matched += 1;
+                break;
+            }
+            if self.matched == 0 {
+                break;
+            }
+            self.matched = self.back[self.matched - 1];
+        }
+        if self.matched < self.value.len() {
+            return false;
+        }
+        self.matched = self.back[self.matched - 1];
+        true
     }
 }
 
@@ -1867,7 +2057,7 @@ mod tests {
             "<***>"
         );
         // An escape sequence counts each of its characters.
-        let gap = format!("\u{1b}[{}m", "1;".repeat(14));
+        let gap = format!("\u{1b}[{}1m", "1;".repeat(14));
         assert_eq!(gap.chars().count(), 32);
         assert_eq!(
             hide_known(&format!("<{head}{gap}{tail}>"), &secrets),
@@ -1946,7 +2136,7 @@ mod tests {
         let mut n = 0;
         while text.len() < 64 * 1024 - 200 {
             text.push_str(head);
-            text.push_str(["\n  ", "\u{1b}[1;2;3;4;5;6;7;8;9;0;1;2;3;", " "][n % 3]);
+            text.push_str(["\n  ", "\u{1b}[1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;\n", " "][n % 3]);
             n += 1;
         }
         text.push_str(&format!("{}\n{}{tail}\nend", &TOKEN[..12], &TOKEN[12..39]));

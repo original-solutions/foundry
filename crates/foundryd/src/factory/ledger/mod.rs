@@ -36,8 +36,9 @@ pub mod read;
 pub const OUTPUT_LIMIT: usize = 64 * 1024;
 
 /// Hides the secrets this machine holds in a text. The daemon's must hide every `github:*`
-/// token and gateway key in its secret store at the time of the call, and URL passwords, as
-/// task 7's `secrets::hide_known` will; the ledger is given it when it is made.
+/// token and gateway key in its secret store at the time of the call, also with white space,
+/// controls or escape sequences inside it, and URL passwords, as `secrets::hide_known` does;
+/// the ledger is given it when it is made, and gives it each text once.
 pub type Hide = Arc<dyn Fn(&str) -> String + Send + Sync>;
 
 /// The wall-clock time as Unix epoch milliseconds: what an event is stamped with.
@@ -201,24 +202,18 @@ fn gate_attempts(events: &[RunEvent]) -> u32 {
     u32::try_from(attempts.len()).unwrap_or(u32::MAX)
 }
 
-/// Every text in `value` through `hide`, then cut to its last [`OUTPUT_LIMIT`] bytes. Hiding
-/// comes first, so a cut can never leave the end of a secret that the hiding would no longer
-/// recognise. A text is kept as it is, its lines and control characters too, unless `hide`
-/// finds a secret only once the control characters that are not white space are gone: then it
-/// is kept without them, with that secret hidden. Line breaks and tabs stay, so two lines are
-/// never joined into something that looks like a secret.
-///
-/// So a known token split by white space (a line break, a tab, a space) is not hidden here, and
-/// is stored as it came. Only `hide` knows the values it hides, so only it can tell a split
-/// token from two lines that merely join into something that looks like one.
+/// Every text in `value` through `hide` once, as it came, then cut to its last
+/// [`OUTPUT_LIMIT`] bytes. Hiding comes first, so a cut can never leave the end of a secret
+/// that the hiding would no longer recognise. A text keeps its lines and control characters:
+/// a known token split by white space, a control character or an escape sequence is found by
+/// `hide` itself (`secrets::hide_known` matches a held value across such gaps), since only it
+/// knows the values it hides and so can tell a split token from two lines that merely join
+/// into something that looks like one.
 fn hide_texts(value: &mut Value, hide: &(dyn Fn(&str) -> String + Send + Sync)) {
     match value {
         Value::String(text) => {
             let hidden = hide(text);
-            let stripped = events::strip_inline(&hidden);
-            let again = hide(&stripped);
-            let kept = if again == stripped { hidden } else { again };
-            *text = cut_output(&kept).to_owned();
+            *text = cut_output(&hidden).to_owned();
         }
         Value::Array(items) => {
             for item in items {

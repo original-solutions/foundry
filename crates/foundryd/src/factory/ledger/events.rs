@@ -516,14 +516,13 @@ impl Cause {
         self.cleaned_with(&|text: &str| text.to_owned())
     }
 
-    /// [`cleaned`](Self::cleaned), with every text through `hide` before it is cut, so a cut
-    /// never leaves part of a secret that `hide` would no longer recognise. `hide` sees the text
-    /// as given and again once its control characters are gone, so one placed inside a secret
-    /// cannot keep it from being hidden.
+    /// [`cleaned`](Self::cleaned), with every text through `hide` once, as given, before it is
+    /// stripped or cut, so neither can leave part of a secret that `hide` would no longer
+    /// recognise. A control character or white space inside a secret is `hide`'s to see past
+    /// (`secrets::hide_known` matches a held value across such gaps).
     pub fn cleaned_with(&self, hide: &dyn Fn(&str) -> String) -> Cause {
         let clean = |text: &str, limit: usize| -> String {
-            let hidden = hide(&strip(&hide(text)));
-            strip(&hidden).chars().take(limit).collect()
+            strip(&hide(text)).chars().take(limit).collect()
         };
         let cut = |text: &Option<String>, limit| text.as_deref().map(|text| clean(text, limit));
         Cause {
@@ -546,13 +545,6 @@ fn is_unsafe(c: char) -> bool {
 /// `text` on one line with no control or bidi characters.
 fn strip(text: &str) -> String {
     text.chars().filter(|c| !is_unsafe(*c)).collect()
-}
-
-/// `text` with no control or bidi characters but its white space: its lines and tabs stay.
-pub(super) fn strip_inline(text: &str) -> String {
-    text.chars()
-        .filter(|c| c.is_whitespace() || !is_unsafe(*c))
-        .collect()
 }
 
 #[cfg(test)]
