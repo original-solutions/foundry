@@ -1920,6 +1920,33 @@ mod tests {
     }
 
     #[test]
+    fn output_whose_lines_only_join_into_a_url_password_keeps_its_lines() {
+        // A Hide that hides URL passwords as `secrets::redact` does, beside a known token.
+        let (_dir, store) = open_store();
+        let hide: Hide = std::sync::Arc::new(|text: &str| {
+            crate::secrets::redact(text).replace("ghp_0123456789abcdefghij", "***")
+        });
+        let ledger =
+            Ledger::new(store.clone(), MachineId::random(), 1, hide).with_wall(ticking(T0, 1000));
+        let output =
+            "fetching https://registry.example.com\nadmin@example.com wrote\r\n\tok\u{0007}";
+        let written = ledger
+            .write(&run(8), &stuck(output), &test_cause())
+            .unwrap();
+        assert_eq!(written.data["reason"], json!(output));
+        // A secret split by a control character that is not a line break is still hidden, and
+        // the text keeps its lines.
+        let written = ledger
+            .write(
+                &run(8),
+                &stuck("a\nT=ghp_0123456789\u{0007}abcdefghij\nb"),
+                &test_cause(),
+            )
+            .unwrap();
+        assert_eq!(written.data["reason"], json!("a\nT=***\nb"));
+    }
+
+    #[test]
     fn the_ledger_lists_and_counts_the_runs_its_store_holds() {
         let (_dir, store) = open_store();
         let ledger = ledger(&store, MachineId::random(), 1, ticking(T0, 1000));
