@@ -1123,6 +1123,14 @@ pub fn keep_keys(held: &SharedSettings, copy: &mut SharedSettings) {
 /// [`FACTORY_SINCE`], which is sent none and cannot hold one ([`SharedSettings::for_protocol`]).
 /// Without this the copy would differ from the held one at the same `seq`, and every merge
 /// with that machine would take a new number.
+///
+/// What it cannot put back is `seen`, which such a copy still carries and the older machine
+/// passes on. Two machines on [`FACTORY_SINCE`] that are split from each other, both reach it
+/// and both edit the same factory setting can each come to cover the other's edit without
+/// holding it, so when they meet one edit is lost with no "setting overwritten" item. That is a
+/// known limit of a fleet on both protocols (`docs/specs/P2-factory.md`, G7); a fix needs a
+/// `seen` for factory settings alone in [`SharedSettings`], and the limit ends when every
+/// machine speaks [`FACTORY_SINCE`].
 pub fn keep_factory(held: &SharedSettings, copy: &mut SharedSettings) {
     copy.factory.clone_from(&held.factory);
     copy.project_factory.clone_from(&held.project_factory);
