@@ -129,18 +129,21 @@ impl Ledger {
             .expect("a cause is an object of strings and a number");
         // The lock is held from the read to the write, so this machine's own writes of one
         // run never cross.
+        // Only what the write needs is read, never the run's whole history: whether any writer,
+        // this machine or one whose events synced in, stored its `finished` event, and for a
+        // `finished` event the run's first event and its gate commands.
         let mut store = self.lock();
-        let held = store.run_events(run)?;
         // A `finished` event ends the run even when its data cannot be read.
-        if held.iter().any(|event| event.event == names::FINISHED) {
+        if store.run_finished(run)? {
             return Err(LedgerError::AlreadyFinished { run: run.clone() });
         }
         let ms = (self.wall)();
         // Two numbers, which need no hiding.
         if let (Event::Finished { .. }, Value::Object(fields)) = (event, &mut data) {
-            let first = held.first().map_or(ms, |event| event.ms);
+            let first = store.first_run_event(run)?.map_or(ms, |event| event.ms);
+            let gates = store.run_events_named(run, names::GATE_COMMAND)?;
             fields.insert("total_ms".into(), ms.saturating_sub(first).into());
-            fields.insert("gate_attempts".into(), gate_attempts(&held).into());
+            fields.insert("gate_attempts".into(), gate_attempts(&gates).into());
         }
         let written = RunEvent {
             run: run.clone(),

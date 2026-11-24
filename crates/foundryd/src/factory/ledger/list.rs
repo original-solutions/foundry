@@ -170,9 +170,9 @@ fn unreadable(id: RunId) -> RunInfo {
 
 /// The unfinished runs among `ids`, each run's events got from `read`, unreadable ones last.
 ///
-/// Each run's events are read whole, finished runs' too, since the store has no read of a
-/// run's last event yet. The runner reads only a finished file's tail; a read of the runs of a
-/// repo that have a `finished` event, in the store, would let this skip them the same way.
+/// `ids` are the runs the store holds no `finished` event of, so no finished run's events are
+/// read, as the runner reads only a finished file's tail. A run that finishes after `ids` were
+/// read is still left out here, by its events.
 fn unfinished(
     ids: Vec<RunId>,
     read: impl Fn(&RunId) -> Result<Vec<RunEvent>, StoreError>,
@@ -205,11 +205,12 @@ fn locked(store: &Mutex<Store>) -> MutexGuard<'_, Store> {
 /// any whose events cannot be read last.
 ///
 /// The store's lock is shared by the whole daemon and a repo's history only grows, so a listing
-/// takes it for one read at a time: the run ids, then each run's events. Each run's events are
+/// takes it for one read at a time: the ids of the runs with no `finished` event, then each of
+/// those runs' events, so a finished run's events are never read. Each run's events are
 /// read whole under one lock; a run that gains an event or first appears after its read is
 /// seen as it is by the next listing. The same holds for [`issue_runs`] and [`summaries`].
 pub fn runs(store: &Mutex<Store>, repo: &str) -> Result<Vec<RunInfo>, StoreError> {
-    let ids = locked(store).runs_of(repo)?;
+    let ids = locked(store).unfinished_runs_of(repo)?;
     Ok(unfinished(ids, |id| events(&locked(store), id)))
 }
 
@@ -220,7 +221,7 @@ pub fn issue_runs(
     repo: &str,
     issue: u64,
 ) -> Result<Vec<RunInfo>, StoreError> {
-    let ids = of_issue(locked(store).runs_of(repo)?, issue);
+    let ids = of_issue(locked(store).unfinished_runs_of(repo)?, issue);
     Ok(unfinished(ids, |id| events(&locked(store), id)))
 }
 

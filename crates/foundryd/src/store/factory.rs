@@ -46,6 +46,82 @@ fn parse_machine(index: usize, text: &str) -> rusqlite::Result<MachineId> {
         .map_err(|e| rusqlite::Error::FromSqlConversionFailure(index, Type::Text, Box::new(e)))
 }
 
+/// Counts the run events a read of this thread hands back, for tests that show a read is
+/// bounded. Counted by thread, since each test runs on a thread of its own.
+#[cfg(test)]
+mod counted {
+    use std::cell::Cell;
+
+    thread_local! {
+        static READ: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn add(events: usize) {
+        READ.with(|read| read.set(read.get() + events));
+    }
+
+    pub(super) fn read() -> usize {
+        READ.with(Cell::get)
+    }
+}
+
+#[cfg(not(test))]
+mod counted {
+    pub(super) fn add(_events: usize) {}
+}
+
+/// The run events stored under the JSON of `rows`, in their order. A row that holds another
+/// kind of record is an error.
+fn run_events_of(
+    rows: impl Iterator<Item = rusqlite::Result<String>>,
+) -> Result<Vec<RunEvent>, StoreError> {
+    let mut events = Vec::new();
+    for json in rows {
+        let record: FactoryRecord = serde_json::from_str(&json?)?;
+        match record.body {
+            FactoryBody::RunEvent(event) => events.push(event),
+            other => return Err(wrong_kind("run_event", &other)),
+        }
+    }
+    counted::add(events.len());
+    Ok(events)
+}
+
+/// The run event keys of `repo` (`owner/name`, in any case), as the repo a run id folds it to
+/// and a range of ids that holds every one of them; `None` for a repo that is not a legal one.
+///
+/// A run event's id is `<run>/<owner>/<version>`, and every run of the repo starts with
+/// `<owner>__<name>__`, so the keys lie in [prefix, prefix with its last `_` raised to the
+/// next character, a backtick). The range is not exact (a repo name may hold `__`, so `a/b`
+/// also reaches the runs of `a/b__c`), so the repo of each run read is still checked.
+fn repo_range(repo: &str) -> Option<(String, String, String)> {
+    // Normalise as a run id does, so the argument folds exactly as stored repos did.
+    let probe = RunId::new(repo, 0, 0).ok()?;
+    let prefix = probe.to_string();
+    let prefix = &prefix[..prefix.len() - "0__0".len()];
+    let to = format!("{}`", &prefix[..prefix.len() - 1]);
+    Some((probe.repo().to_owned(), prefix.to_owned(), to))
+}
+
+/// The run ids among `rows`, each the text of a run event id up to its first `/`, that are of
+/// `repo`, once each and in order.
+fn runs_among(
+    rows: impl Iterator<Item = rusqlite::Result<String>>,
+    repo: &str,
+) -> Result<Vec<RunId>, StoreError> {
+    let mut runs = BTreeSet::new();
+    for text in rows {
+        let text = text?;
+        let run: RunId = text.parse().map_err(|e: String| {
+            rusqlite::Error::FromSqlConversionFailure(0, Type::Text, e.into())
+        })?;
+        if run.repo() == repo {
+            runs.insert(run);
+        }
+    }
+    Ok(runs.into_iter().collect())
+}
+
 impl Store {
     /// Stores `record`, received from machine `from`, when `from` owns it, no other machine
     /// holds its key and its version is higher than the copy held. Same rules as
@@ -123,50 +199,80 @@ impl Store {
              ORDER BY json_extract(record, '$.body.generation'), version, owner",
         )?;
         let rows = query.query_map(params![from, to], |row| row.get::<_, String>(0))?;
-        let mut events = Vec::new();
-        for json in rows {
-            let record: FactoryRecord = serde_json::from_str(&json?)?;
-            match record.body {
-                FactoryBody::RunEvent(event) => events.push(event),
-                other => return Err(wrong_kind("run_event", &other)),
-            }
-        }
-        Ok(events)
+        run_events_of(rows)
+    }
+
+    /// The events of `run` named `event`, from every writer, in the order of
+    /// [`run_events`](Self::run_events). Only those rows are handed back and parsed.
+    pub fn run_events_named(&self, run: &RunId, event: &str) -> Result<Vec<RunEvent>, StoreError> {
+        let (from, to) = range(&run.to_string());
+        let mut query = self.conn.prepare_cached(
+            "SELECT record FROM factory_records WHERE kind = 'run_event' AND id >= ?1 AND id < ?2 \
+             AND json_extract(record, '$.body.event') IS ?3 \
+             ORDER BY json_extract(record, '$.body.generation'), version, owner",
+        )?;
+        let rows = query.query_map(params![from, to, event], |row| row.get::<_, String>(0))?;
+        run_events_of(rows)
+    }
+
+    /// The first event of `run` in the order of [`run_events`](Self::run_events), or `None`
+    /// for a run with none. Only that row is handed back and parsed.
+    pub fn first_run_event(&self, run: &RunId) -> Result<Option<RunEvent>, StoreError> {
+        let (from, to) = range(&run.to_string());
+        let mut query = self.conn.prepare_cached(
+            "SELECT record FROM factory_records WHERE kind = 'run_event' AND id >= ?1 AND id < ?2 \
+             ORDER BY json_extract(record, '$.body.generation'), version, owner LIMIT 1",
+        )?;
+        let rows = query.query_map(params![from, to], |row| row.get::<_, String>(0))?;
+        Ok(run_events_of(rows)?.pop())
+    }
+
+    /// Whether any writer has stored a `finished` event of `run`, whatever its data. No event
+    /// is handed back: the store answers yes or no.
+    pub fn run_finished(&self, run: &RunId) -> Result<bool, StoreError> {
+        let (from, to) = range(&run.to_string());
+        let mut query = self.conn.prepare_cached(
+            "SELECT EXISTS (SELECT 1 FROM factory_records WHERE kind = 'run_event' \
+             AND id >= ?1 AND id < ?2 AND json_extract(record, '$.body.event') IS 'finished')",
+        )?;
+        Ok(query.query_row(params![from, to], |row| row.get(0))?)
     }
 
     /// Every run of `repo` (`owner/name`, in any case) that has an event, once each, in order.
     /// A repo that is not a legal one has no runs.
     pub fn runs_of(&self, repo: &str) -> Result<Vec<RunId>, StoreError> {
-        // Normalise as a run id does, so the argument folds exactly as stored repos did.
-        let Ok(probe) = RunId::new(repo, 0, 0) else {
+        let Some((repo, from, to)) = repo_range(repo) else {
             return Ok(Vec::new());
         };
-        let repo = probe.repo();
-        // A run event's id is `<run>/<owner>/<version>`, and a run id holds no `/`, so the run
-        // is the id up to its first `/`: no record is parsed. Every run of the repo starts with
-        // `<owner>__<name>__`, so the keys lie in [prefix, prefix with its last `_` raised to
-        // the next character, a backtick). The range is not exact (a repo name may hold `__`,
-        // so `a/b` also reaches the runs of `a/b__c`), so the repo of each run is still checked.
-        let prefix = probe.to_string();
-        let prefix = &prefix[..prefix.len() - "0__0".len()];
-        let from = prefix.to_owned();
-        let to = format!("{}`", &prefix[..prefix.len() - 1]);
+        // A run id holds no `/`, so the run is the id up to its first `/`: no record is parsed.
         let mut query = self.conn.prepare_cached(
             "SELECT DISTINCT substr(id, 1, instr(id, '/') - 1) FROM factory_records
              WHERE kind = 'run_event' AND id >= ?1 AND id < ?2",
         )?;
         let rows = query.query_map(params![from, to], |row| row.get::<_, String>(0))?;
-        let mut runs = BTreeSet::new();
-        for text in rows {
-            let text = text?;
-            let run: RunId = text.parse().map_err(|e: String| {
-                rusqlite::Error::FromSqlConversionFailure(0, Type::Text, e.into())
-            })?;
-            if run.repo() == repo {
-                runs.insert(run);
-            }
-        }
-        Ok(runs.into_iter().collect())
+        runs_among(rows, &repo)
+    }
+
+    /// The runs of `repo` that [`runs_of`](Self::runs_of) gives, less those with a `finished`
+    /// event from any writer, in order. No event is handed back, so a finished run's history is
+    /// never read; a run none of whose rows this build can read as `finished` is kept.
+    pub fn unfinished_runs_of(&self, repo: &str) -> Result<Vec<RunId>, StoreError> {
+        let Some((repo, from, to)) = repo_range(repo) else {
+            return Ok(Vec::new());
+        };
+        let mut query = self.conn.prepare_cached(
+            "SELECT substr(id, 1, instr(id, '/') - 1) AS run FROM factory_records
+             WHERE kind = 'run_event' AND id >= ?1 AND id < ?2
+             GROUP BY run HAVING SUM(json_extract(record, '$.body.event') IS 'finished') = 0",
+        )?;
+        let rows = query.query_map(params![from, to], |row| row.get::<_, String>(0))?;
+        runs_among(rows, &repo)
+    }
+
+    /// How many run events the reads of this thread have handed back so far.
+    #[cfg(test)]
+    pub fn run_events_read() -> usize {
+        counted::read()
     }
 
     /// Every writer's factory status for `project`, by machine.
