@@ -2437,6 +2437,76 @@ mod tests {
     }
 
     #[test]
+    fn hide_known_caps_each_gap_inside_a_token_not_their_sum() {
+        let secrets = holding_token();
+        // Three gaps of 31 characters each, after 40 characters of gap before the token.
+        let g = format!("{}\u{1b}[38;5;208m", " ".repeat(20));
+        assert_eq!(g.chars().count(), 31);
+        let lead = " \n".repeat(20);
+        let text = format!(
+            "{lead}<{}{g}{}{g}{}{g}{}>",
+            &TOKEN[..10],
+            &TOKEN[10..20],
+            &TOKEN[20..30],
+            &TOKEN[30..]
+        );
+        assert_eq!(hide_known(&text, &secrets), format!("{lead}<***>"));
+        // 31 characters of gap right before the token, and an indented wrap inside it.
+        let text = format!("{}{}\n    {}", " ".repeat(31), &TOKEN[..20], &TOKEN[20..]);
+        assert_eq!(
+            hide_known(&text, &secrets),
+            format!("{}***", " ".repeat(31))
+        );
+    }
+
+    #[test]
+    fn hide_known_counts_spaces_and_an_escape_in_one_gap_together() {
+        let secrets = holding_token();
+        let (head, tail) = TOKEN.split_at(20);
+        assert_eq!(tail.as_bytes()[0], b'I');
+        // 27 spaces and a 5-character colour sequence: 32 characters.
+        let gap = format!("{}\u{1b}[31m", " ".repeat(27));
+        assert_eq!(
+            hide_known(&format!("<{head}{gap}{tail}>"), &secrets),
+            "<***>"
+        );
+        // 28 spaces and the same sequence: 33.
+        let text = format!("<{head}{}\u{1b}[31m{tail}>", " ".repeat(28));
+        assert_eq!(hide_known(&text, &secrets), text);
+        // 31 spaces and a lone ESC before `I`, which also reads as the escape `ESC I`: 32.
+        let gap = format!("{}\u{1b}", " ".repeat(31));
+        assert_eq!(
+            hide_known(&format!("<{head}{gap}{tail}>"), &secrets),
+            "<***>"
+        );
+        let text = format!("<{head}{}\u{1b}{tail}>", " ".repeat(32));
+        assert_eq!(hide_known(&text, &secrets), text);
+    }
+
+    #[test]
+    fn a_split_keeps_only_the_characters_a_partial_match_can_still_use() {
+        // Log-like text with near misses of the token's head, and the token split near the end.
+        let mut text = String::new();
+        while text.len() < 64 * 1024 - 200 {
+            text.push_str("2026-11-24 compiling foundryd ghp_A1b2 \u{1b}[32mok\u{1b}[0m\n");
+        }
+        text.push_str(&format!("T={}\n{}\n", &TOKEN[..20], &TOKEN[20..]));
+        let mut split = Split::new(TOKEN);
+        let (mut spans, mut work, mut most) = (Vec::new(), 0, 0);
+        for (at, c) in text.char_indices() {
+            let escape = if is_gap(c) {
+                escape(&text[at..], &mut work)
+            } else {
+                None
+            };
+            split.read(at, c, escape, &mut spans, &mut work);
+            most = most.max(split.kept.len());
+        }
+        assert_eq!(spans.len(), 1);
+        assert!(most <= 2 * TOKEN.len(), "{most} characters kept");
+    }
+
+    #[test]
     fn hide_known_hides_a_value_that_overlaps_itself() {
         let secrets = MemorySecrets::default();
         secrets.set(GATEWAY, "ghp_abcghp_abcghp_xyz0").unwrap();
