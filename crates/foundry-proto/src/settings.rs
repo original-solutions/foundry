@@ -47,6 +47,21 @@ pub struct SharedSettings {
     /// Each project's factory setting, by project.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub project_factory: BTreeMap<ProjectId, ProjectFactory>,
+    /// The highest number each coordinator gave a factory edit that this copy includes: the
+    /// factory counterpart of `seen`. A protocol 4 machine passes `seen` on without the factory
+    /// edits it counts, so this, with the factory stamps the copy holds, says which factory
+    /// edits a copy includes (`foundryd`'s coordinator reads both). A copy that holds a factory
+    /// stamp and has none was written by a build before it, and its `seen` is read in its
+    /// place. Raised only by numbering a factory edit and by a copy from a peer on
+    /// [`FACTORY_SINCE`](crate::messages::FACTORY_SINCE) or later; never sent to a peer before
+    /// it, and not written when empty. Boxed so a settings message stays within the size the
+    /// other peer messages are held to.
+    #[serde(default, skip_serializing_if = "is_unseen")]
+    pub factory_seen: Box<BTreeMap<MachineId, u64>>,
+}
+
+fn is_unseen(seen: &BTreeMap<MachineId, u64>) -> bool {
+    seen.is_empty()
 }
 
 impl SharedSettings {
@@ -61,8 +76,9 @@ impl SharedSettings {
 
     /// A copy for a peer that speaks `protocol`. A peer before
     /// [`FACTORY_SINCE`](crate::messages::FACTORY_SINCE) refuses a setting key it does not
-    /// know, so its copy has no factory setting, no stamp of one or of its item, and no
-    /// "setting overwritten" item about one. Every other setting is as it is here.
+    /// know, so its copy has no factory setting, no stamp of one or of its item, no
+    /// "setting overwritten" item about one, and no factory `seen`. Every other setting is as
+    /// it is here.
     pub fn for_protocol(&self, protocol: u16) -> SharedSettings {
         let mut copy = self.clone();
         if protocol < crate::messages::FACTORY_SINCE {
@@ -70,6 +86,7 @@ impl SharedSettings {
             copy.project_factory.clear();
             copy.stamps.retain(|key, _| !key.setting().is_factory());
             copy.overwritten.retain(|key, _| !key.is_factory());
+            copy.factory_seen.clear();
         }
         copy
     }
@@ -474,6 +491,7 @@ pub(crate) mod tests {
             numbered: [(EditId::random(), Stamp { seq: 42, by: mac })].into(),
             factory: None,
             project_factory: BTreeMap::new(),
+            factory_seen: Box::default(),
         }
     }
 
@@ -1177,6 +1195,61 @@ pub(crate) mod tests {
                 !matches!(key, SettingKey::Factory | SettingKey::ProjectFactory(_))
             });
             settings
+        }
+    }
+
+    /// [`settings_with_factory`] with a factory `seen` that differs from `seen`.
+    fn settings_with_factory_seen() -> SharedSettings {
+        let mut settings = settings_with_factory();
+        let (mac, vps) = (settings.machines[0].id, settings.machines[1].id);
+        *settings.factory_seen = [(mac, 46), (vps, 12)].into();
+        settings
+    }
+
+    #[test]
+    fn the_factory_seen_round_trips_and_is_written_by_name() {
+        let settings = settings_with_factory_seen();
+        assert_round_trip(&settings);
+        let (mac, vps) = (settings.machines[0].id, settings.machines[1].id);
+        let json = serde_json::to_value(&settings).unwrap();
+        assert_eq!(json["factory_seen"][mac.to_string()], 46, "{json}");
+        assert_eq!(json["factory_seen"][vps.to_string()], 12, "{json}");
+        // It is a map of its own: `seen` is as it was.
+        assert_eq!(json["seen"][vps.to_string()], 41, "{json}");
+    }
+
+    #[test]
+    fn a_copy_without_the_factory_seen_parses_with_it_empty_and_is_written_without_it() {
+        let mac = "67e55044-10b1-426f-9247-bb680e5fe0c8";
+        let json = format!(
+            r#"{{"seq":5,"machines":[],"priority":[],"projects":[],"limits":{{}},
+                "stamps":{{"factory":{{"seq":5,"by":"{mac}"}}}},
+                "seen":{{"{mac}":5}},
+                "factory":{{"max_runs":4}}}}"#
+        );
+        let read: SharedSettings = serde_json::from_str(&json).unwrap();
+        assert!(read.factory_seen.is_empty(), "{:?}", read.factory_seen);
+        assert_eq!(read.seen, [(MachineId(mac.parse().unwrap()), 5)].into());
+        let written = serde_json::to_value(&read).unwrap();
+        assert!(written.get("factory_seen").is_none(), "{written}");
+        let plain = serde_json::to_value(SharedSettings::default()).unwrap();
+        assert!(plain.get("factory_seen").is_none(), "{plain}");
+    }
+
+    #[test]
+    fn a_copy_for_protocol_4_leaves_the_factory_seen_out_and_one_for_5_keeps_it() {
+        let settings = settings_with_factory_seen();
+        assert_eq!(settings.for_protocol(5), settings);
+        assert_eq!(settings.for_protocol(6), settings);
+        for protocol in [1, 2, 3, 4] {
+            let copy = settings.for_protocol(protocol);
+            assert!(copy.factory_seen.is_empty(), "protocol {protocol}");
+            // `seen` is every setting's, so it stays.
+            assert_eq!(copy.seen, settings.seen, "protocol {protocol}");
+            let json = serde_json::to_value(&copy).unwrap();
+            assert!(json.get("factory_seen").is_none(), "{json}");
+            let text = json.to_string();
+            serde_json::from_str::<v4::SharedSettings>(&text).expect(&text);
         }
     }
 
