@@ -593,7 +593,9 @@ mod tests {
     }
 
     /// Every variable `apply` drops when it is inherited: the whole list in the code, so a name
-    /// added to it later is tested too, and the ones git does not list, by name.
+    /// added to it later is tested too, and by name the ones git does not list, plus
+    /// `GIT_INTERNAL_SUPER_PREFIX`, which git 2.39 lists and git 2.54 does not, so a machine
+    /// with a newer git still tests it.
     fn dropped() -> Vec<&'static str> {
         let mut names = INHERITED.to_vec();
         names.extend([
@@ -603,6 +605,7 @@ mod tests {
             "GIT_NAMESPACE",
             "GIT_DIR",
             "GIT_COMMON_DIR",
+            "GIT_INTERNAL_SUPER_PREFIX",
         ]);
         names.sort_unstable();
         names.dedup();
