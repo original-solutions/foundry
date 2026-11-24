@@ -345,6 +345,7 @@ pub fn summaries(store: &Store, repo: &str) -> Result<Vec<RunSummary>, StoreErro
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use foundry_proto::factory::{PrEnd, RunId};
@@ -518,6 +519,39 @@ mod tests {
         let (_dir, store) = open_store();
         run_at(&store, &softfac(5), T0, Some(State::NeedsInfo), true, true);
         assert_eq!(listed(&store, "rawphp/softfac"), []);
+    }
+
+    #[test]
+    fn the_ledgers_listings_lock_the_store_for_each_run_not_for_the_whole_listing() {
+        // The store's lock is shared by the whole daemon, and a repo's history only grows, so
+        // a listing takes the lock for one read at a time. The warning for an unreadable run
+        // is logged between two reads, so the lock must be free when it is.
+        let (dir, store) = open_store();
+        let ledger = run_at(&store, &softfac(1), T0, Some(State::Building), false, true);
+        unreadable_run(dir.path(), &softfac(2));
+        run_at(&store, &softfac(3), T0, Some(State::Building), false, true);
+        let (warned, locked) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let probe = {
+            let (store, warned, locked) = (store.clone(), warned.clone(), locked.clone());
+            move || {
+                warned.fetch_add(1, Ordering::SeqCst);
+                if store.try_lock().is_err() {
+                    locked.fetch_add(1, Ordering::SeqCst);
+                }
+                std::io::sink()
+            }
+        };
+        let _capture = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::WARN)
+                .with_writer(probe)
+                .finish(),
+        );
+        assert_eq!(ledger.runs("rawphp/softfac").unwrap().len(), 3);
+        assert_eq!(ledger.issue_runs("rawphp/softfac", 2).unwrap().len(), 1);
+        assert_eq!(ledger.summaries("rawphp/softfac").unwrap().len(), 3);
+        assert_eq!(warned.load(Ordering::SeqCst), 3);
+        assert_eq!(locked.load(Ordering::SeqCst), 0);
     }
 
     #[test]

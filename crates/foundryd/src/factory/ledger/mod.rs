@@ -1920,6 +1920,17 @@ mod tests {
             assert!(!text.contains("ghp_"), "{text}");
             assert!(!text.contains("abcdefghij"), "{text}");
         }
+        // The same for DEL, a C1 control and the bidi controls, and the lines stay.
+        for split in ['\u{007f}', '\u{0090}', '\u{202e}', '\u{2066}'] {
+            let written = ledger
+                .write(
+                    &run(9),
+                    &stuck(&format!("a\nT=ghp_0123456789{split}abcdefghij\nb")),
+                    &test_cause(),
+                )
+                .unwrap();
+            assert_eq!(written.data["reason"], json!("a\nT=***\nb"), "{split:?}");
+        }
         // Output with no secret in it keeps its lines and control characters.
         let written = ledger
             .write(&run(8), &stuck("one\ntwo\u{0007}"), &test_cause())
