@@ -155,7 +155,8 @@ impl Store {
     ///
     /// A status this build cannot read, one a newer build left before a rollback, is left out
     /// with a warning, as [`sessions_of`](Self::sessions_of) does, so one writer's status
-    /// never hides the others'. The other reads give an error for such a row instead:
+    /// never hides the others'. [`highest_generation`](Self::highest_generation) still counts
+    /// its generation. The other reads give an error for such a row instead:
     /// [`run_events`](Self::run_events) because a run with an event left out reads as another
     /// run, and [`held`](Self::held) and [`session_turn`](Self::session_turn) because they
     /// read one record, which would then read as absent.
@@ -195,14 +196,29 @@ impl Store {
     }
 
     /// The highest lease generation any writer's status for `project` holds, or `0` with none.
-    /// A status [`statuses`](Self::statuses) leaves out does not count.
+    ///
+    /// Only the generation of each status row is read, so a status
+    /// [`statuses`](Self::statuses) leaves out still counts: a lease checked against a lower
+    /// generation could be taken from the writer that holds the higher one. A row whose
+    /// generation is not a whole number from 0 up is an error, since the highest is then not
+    /// known.
     pub fn highest_generation(&self, project: ProjectId) -> Result<u64, StoreError> {
-        Ok(self
-            .statuses(project)?
-            .iter()
-            .map(|(_, status)| status.generation)
-            .max()
-            .unwrap_or(0))
+        let (from, to) = range(&project.to_string());
+        let mut query = self.conn.prepare_cached(
+            "SELECT json_extract(record, '$.body.generation') FROM factory_records \
+             WHERE kind = 'factory_status' AND id >= ?1 AND id < ?2",
+        )?;
+        let rows = query.query_map(params![from, to], |row| {
+            let generation: i64 = row.get(0)?;
+            u64::try_from(generation).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(0, Type::Integer, Box::new(e))
+            })
+        })?;
+        let mut highest = 0;
+        for generation in rows {
+            highest = highest.max(generation?);
+        }
+        Ok(highest)
     }
 
     /// The logins `machine` holds a token for, read by its key.

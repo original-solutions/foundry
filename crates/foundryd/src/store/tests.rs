@@ -1746,8 +1746,9 @@ fn insert_unreadable_factory(
         .unwrap();
 }
 
-/// One writer's status this build cannot read must not hide the other writers' statuses or
-/// the highest generation they hold, as `sessions_of` leaves out a session it cannot read.
+/// One writer's status this build cannot read must not hide the other writers' statuses, as
+/// `sessions_of` leaves out a session it cannot read. Its generation still counts: a lease
+/// checked against a lower one could be taken from a writer that holds a higher one.
 #[test]
 fn statuses_leave_out_a_status_they_cannot_read_and_give_the_rest() {
     let (_dir, mut store) = open();
@@ -1779,7 +1780,51 @@ fn statuses_leave_out_a_status_they_cannot_read_and_give_the_rest() {
     ];
     expected.sort_by_key(|(machine, _)| *machine);
     assert_eq!(statuses, expected);
-    assert_eq!(store.highest_generation(project).unwrap(), 7);
+    assert_eq!(store.highest_generation(project).unwrap(), 99);
+}
+
+/// When a status's generation itself cannot be read, the highest generation is not known, so
+/// it is an error rather than the highest of the rest.
+#[test]
+fn highest_generation_fails_on_a_status_whose_generation_it_cannot_read() {
+    let (_dir, mut store) = open();
+    let project = ProjectId::random();
+    let one = MachineId::random();
+    let newer = MachineId::random();
+    store
+        .apply_factory(&status(one, 1, project, 1, 7), one)
+        .unwrap();
+    for (at, generation) in [
+        serde_json::json!("from a newer build"),
+        serde_json::json!(-1),
+        serde_json::Value::Null,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut body = serde_json::to_value(status_body(project, 1, 0)).unwrap();
+        body["generation"] = generation.clone();
+        store
+            .conn
+            .execute(
+                "DELETE FROM factory_records WHERE owner = ?1",
+                params![newer.to_string()],
+            )
+            .unwrap();
+        insert_unreadable_factory(
+            &store,
+            newer,
+            at as u64 + 1,
+            "factory_status",
+            &format!("{project}/{newer}"),
+            body,
+        );
+        assert!(
+            store.highest_generation(project).is_err(),
+            "generation {generation} was read as a number"
+        );
+        assert_eq!(store.statuses(project).unwrap().len(), 1);
+    }
 }
 
 /// A run with an event left out would read as another run, so an event this build cannot
