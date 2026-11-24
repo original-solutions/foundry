@@ -991,6 +991,12 @@ mod tests {
             };
             assert_eq!(written, expected, "{name}");
             assert_eq!(held(&store, &id), vec![expected], "{name}");
+            // The store keeps `data` as an object whose keys are sorted; the runner's line, in
+            // its key order, is made from it again.
+            let line = format!(
+                r#"{{"ts":"2026-10-04T10:13:16.123Z","ms":1791108796123,"event":"{name}","data":{data},"cause":{{"step":"pass","reason":"claimed"}}}}"#
+            );
+            assert_eq!(read::runner_line(&held(&store, &id)[0]), line, "{name}");
             seen.insert(name);
         }
         // Every one of the 33 event types has at least one exact line.
@@ -1060,10 +1066,14 @@ mod tests {
             assert_eq!(serde_json::to_string(&cause.cleaned()).unwrap(), *line);
             ledger.write(&run(8), &step("s"), cause).unwrap();
         }
-        let read: Vec<Option<Value>> = held(&store, &run(8))
-            .into_iter()
-            .map(|event| event.cause)
-            .collect();
+        let read = held(&store, &run(8));
+        for (event, (_, line)) in read.iter().zip(&causes) {
+            assert!(
+                read::runner_line(event).ends_with(&format!(r#","cause":{line}}}"#)),
+                "{line}"
+            );
+        }
+        let read: Vec<Option<Value>> = read.into_iter().map(|event| event.cause).collect();
         let expected: Vec<Option<Value>> = causes
             .iter()
             .map(|(_, line)| Some(serde_json::from_str(line).unwrap()))
@@ -1837,6 +1847,75 @@ mod tests {
         assert!(cut.len() <= OUTPUT_LIMIT);
         assert_eq!(cut, "€".repeat(OUTPUT_LIMIT / 3));
         assert_eq!(cut_output("short"), "short");
+    }
+
+    #[test]
+    fn a_secret_across_the_cut_of_a_cause_text_is_hidden_before_the_text_is_cut() {
+        let (_dir, store) = open_store();
+        let token = "ghp_0123456789abcdefghij";
+        let hide: Hide = std::sync::Arc::new(move |text: &str| text.replace(token, "***"));
+        let ledger =
+            Ledger::new(store.clone(), MachineId::random(), 1, hide).with_wall(ticking(T0, 1000));
+        // Each text holds the secret across the place its cut falls: 100 characters for the
+        // reason, actor and label, 1000 for the command.
+        let short = |fill: &str| format!("{}{token}", fill.repeat(95));
+        let cause = Cause::new(CauseStep::Gate, short("r"))
+            .actor(&short("a"))
+            .command(&format!("{}{token}", "c".repeat(990)))
+            .label(&short("l"));
+        let written = ledger.write(&run(8), &step("s"), &cause).unwrap();
+        let stored = serde_json::to_string(&held(&store, &run(8))).unwrap();
+        for text in [serde_json::to_string(&written).unwrap(), stored] {
+            assert!(!text.contains("ghp_"), "{text}");
+        }
+        assert_eq!(
+            written.cause,
+            Some(json!({
+                "step": "gate",
+                "reason": format!("{}***", "r".repeat(95)),
+                "actor": format!("{}***", "a".repeat(95)),
+                "command": format!("{}***", "c".repeat(990)),
+                "label": format!("{}***", "l".repeat(95)),
+            }))
+        );
+        // A control character inside a secret cannot hide it from the hiding.
+        let split = "ghp_0123456789\u{0007}abcdefghij";
+        let written = ledger
+            .write(
+                &run(8),
+                &step("t"),
+                &Cause::new(CauseStep::Gate, "gate-command-ran").command(split),
+            )
+            .unwrap();
+        assert_eq!(written.cause.unwrap()["command"], json!("***"));
+    }
+
+    #[test]
+    fn the_ledger_lists_and_counts_the_runs_its_store_holds() {
+        let (_dir, store) = open_store();
+        let ledger = ledger(&store, MachineId::random(), 1, ticking(T0, 1000));
+        let second = RunId::new("rawphp/softfac", 8, 2).unwrap();
+        ledger.write(&run(8), &step("red"), &test_cause()).unwrap();
+        ledger.write(&second, &step("red"), &test_cause()).unwrap();
+        ledger.write(&run(9), &step("red"), &test_cause()).unwrap();
+        ledger
+            .finish(&run(9), Outcome::Stuck, None, None, &test_cause(), None)
+            .unwrap();
+        let ids = |runs: Vec<list::RunInfo>| -> Vec<RunId> {
+            runs.into_iter().map(|run| run.id).collect()
+        };
+        assert_eq!(
+            ids(ledger.runs("RawPHP/softfac").unwrap()),
+            [run(8), second.clone()]
+        );
+        assert_eq!(
+            ids(ledger.issue_runs("rawphp/softfac", 9).unwrap()),
+            Vec::<RunId>::new()
+        );
+        assert_eq!(ledger.next_attempt("rawphp/softfac", 8).unwrap(), 3);
+        let summaries = ledger.summaries("rawphp/softfac").unwrap();
+        assert_eq!(summaries.len(), 3);
+        assert!(summaries[2].finished);
     }
 
     #[test]

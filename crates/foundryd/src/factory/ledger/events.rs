@@ -619,20 +619,30 @@ mod tests {
     #[test]
     fn a_cause_cleans_actor_and_label_of_control_and_bidi_characters_and_cuts_them_at_100_and_cuts_a_command_at_1000()
      {
+        // The builders keep the text as given, so the ledger can hide a secret in it before
+        // it is cut; the cause as written is `cleaned`.
         let actor = Cause::new(CauseStep::Start, "approved")
-            .actor("al\u{0007}i\u{202e}ce\u{2066}\u{0000}\n\u{007f}\u{0085}");
+            .actor("al\u{0007}i\u{202e}ce\u{2066}\u{0000}\n\u{007f}\u{0085}")
+            .cleaned();
         assert_eq!(actor.actor.as_deref(), Some("alice"));
-        let label = Cause::new(CauseStep::Start, "approved").label(&"x".repeat(150));
+        let label = Cause::new(CauseStep::Start, "approved")
+            .label(&"x".repeat(150))
+            .cleaned();
         assert_eq!(label.label, Some("x".repeat(100)));
         // Characters, not bytes.
-        let emoji = Cause::new(CauseStep::Start, "approved").actor(&"\u{1f600}".repeat(150));
+        let emoji = Cause::new(CauseStep::Start, "approved")
+            .actor(&"\u{1f600}".repeat(150))
+            .cleaned();
         assert_eq!(emoji.actor.unwrap().chars().count(), 100);
-        let command = Cause::new(CauseStep::Gate, "gate-command-ran").command(&"c".repeat(1500));
+        let command = Cause::new(CauseStep::Gate, "gate-command-ran")
+            .command(&"c".repeat(1500))
+            .cleaned();
         assert_eq!(command.command, Some("c".repeat(1000)));
         // A command is cleaned the same way as the others: one line, no control characters.
         assert_eq!(
             Cause::new(CauseStep::Gate, "gate-command-ran")
                 .command("a\nb\tc")
+                .cleaned()
                 .command
                 .as_deref(),
             Some("abc")
@@ -642,6 +652,31 @@ mod tests {
             serde_json::to_string(&Cause::new(CauseStep::Pass, "claimed")).unwrap(),
             r#"{"step":"pass","reason":"claimed"}"#
         );
+    }
+
+    #[test]
+    fn a_cause_is_hidden_before_it_is_cut() {
+        let cause = Cause::new(CauseStep::Gate, "gate-command-ran")
+            .command(&format!("{}SECRET-VALUE", "c".repeat(995)));
+        let hide = |text: &str| text.replace("SECRET-VALUE", "***");
+        assert_eq!(
+            cause.cleaned_with(&hide).command,
+            Some(format!("{}***", "c".repeat(995)))
+        );
+        assert_eq!(
+            cause.cleaned().command,
+            Some(format!("{}SECRE", "c".repeat(995)))
+        );
+    }
+
+    #[test]
+    fn every_event_names_itself_as_it_is_written_and_is_in_the_field_table() {
+        for (event, _) in samples() {
+            let name = event.name();
+            assert_eq!(event.parts().0, name);
+            assert_eq!(serde_json::to_value(&event).unwrap()["event"], json!(name));
+            assert!(fields(name).is_some(), "{name}");
+        }
     }
 
     #[test]

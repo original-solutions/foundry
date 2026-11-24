@@ -263,6 +263,167 @@ mod tests {
     }
 
     #[test]
+    fn lines_of_the_answer_step_that_older_versions_wrote_still_read() {
+        // The `answer` step, the `needs-info-nudged` step and the `unanswered` and
+        // `kept-asking` reasons are no longer written. A ledger that holds them reads as it was
+        // written.
+        let (_dir, store) = open_store();
+        let other = MachineId::random();
+        let lines = [
+            (
+                "stuck",
+                json!({"reason": "the questions went unanswered"}),
+                json!({"step": "answer", "reason": "unanswered"}),
+            ),
+            (
+                "step_changed",
+                json!({"step": "needs-info-nudged"}),
+                json!({"step": "answer", "reason": "needs-info-nudged"}),
+            ),
+            (
+                "state_changed",
+                json!({"from": "needs-info", "to": "building"}),
+                json!({"step": "answer", "reason": "reply-received"}),
+            ),
+        ];
+        for (version, (event, data, cause)) in (1..).zip(&lines) {
+            put(
+                &store,
+                other,
+                version,
+                &run(8),
+                1,
+                T0,
+                event,
+                data.clone(),
+                Some(cause.clone()),
+            );
+        }
+        let read: Vec<(String, Value, Option<Value>)> = events(&store.lock().unwrap(), &run(8))
+            .unwrap()
+            .into_iter()
+            .map(|event| (event.event, event.data, event.cause))
+            .collect();
+        let expected: Vec<(String, Value, Option<Value>)> = lines
+            .into_iter()
+            .map(|(event, data, cause)| (event.to_owned(), data, Some(cause)))
+            .collect();
+        assert_eq!(read, expected);
+    }
+
+    #[test]
+    fn lines_written_before_this_change_with_a_numeric_comment_id_still_read() {
+        let (_dir, store) = open_store();
+        let other = MachineId::random();
+        let cause = Some(json!({"step": "pass", "reason": "claimed"}));
+        let answered = json!({"comment_id": 42, "body_edited": false});
+        let forwarded = json!({"comment_id": 42});
+        put(
+            &store,
+            other,
+            1,
+            &run(8),
+            1,
+            T0,
+            "answer_received",
+            answered.clone(),
+            cause.clone(),
+        );
+        put(
+            &store,
+            other,
+            2,
+            &run(8),
+            1,
+            T0,
+            "comment_forwarded",
+            forwarded.clone(),
+            cause.clone(),
+        );
+        assert_eq!(
+            events(&store.lock().unwrap(), &run(8)).unwrap(),
+            [
+                as_left("answer_received", answered, cause.clone()),
+                as_left("comment_forwarded", forwarded, cause),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_stored_event_is_written_as_the_runners_line_in_its_key_order() {
+        let (_dir, store) = open_store();
+        let ledger = ledger(&store, MachineId::random(), 1, ticking(T0, 0));
+        // Built in another key order, nested shapes included, as `append writes the fields in
+        // the doc order whatever order the caller built the object in` builds it.
+        let event: Event = serde_json::from_value(json!({
+            "event": "session_launched",
+            "data": {
+                "resumed_from": {"branch": "t3code/abc", "run": "r"},
+                "model_options": null,
+                "model": "m",
+                "model_instance": "i",
+                "branch": "b",
+                "worktree": "w",
+                "thread_id": "t",
+            },
+        }))
+        .unwrap();
+        ledger
+            .write(
+                &run(8),
+                &event,
+                &Cause::new(CauseStep::Gate, "gate-command-ran")
+                    .label("factory:ready")
+                    .attempt(1)
+                    .command("cargo test")
+                    .actor("alice"),
+            )
+            .unwrap();
+        assert_eq!(
+            runner_line(&ledger.read(&run(8)).unwrap()[0]),
+            r#"{"ts":"2026-10-04T10:13:16.123Z","ms":1791108796123,"event":"session_launched","data":{"thread_id":"t","worktree":"w","branch":"b","model_instance":"i","model":"m","model_options":null,"resumed_from":{"run":"r","branch":"t3code/abc"}},"cause":{"step":"gate","reason":"gate-command-ran","actor":"alice","command":"cargo test","attempt":1,"label":"factory:ready"}}"#
+        );
+    }
+
+    #[test]
+    fn an_event_this_build_does_not_know_is_written_as_the_runners_line_with_its_keys_as_held() {
+        let (_dir, store) = open_store();
+        let other = MachineId::random();
+        put(
+            &store,
+            other,
+            1,
+            &run(8),
+            1,
+            T0,
+            "merged",
+            json!({"sha": "abc", "n": 1}),
+            None,
+        );
+        put(
+            &store,
+            other,
+            2,
+            &run(8),
+            1,
+            T0,
+            "checks_read",
+            json!({"sha": "abc", "checks": [{"state": "passed", "name": "gate", "url": "u"}], "later": true}),
+            Some(json!({"step": "newer", "reason": "r", "extra": 1})),
+        );
+        let read = events(&store.lock().unwrap(), &run(8)).unwrap();
+        assert_eq!(
+            runner_line(&read[0]),
+            r#"{"ts":"2026-10-04T10:13:16.123Z","ms":1791108796123,"event":"merged","data":{"n":1,"sha":"abc"}}"#
+        );
+        // The runner's keys first, in its order, then any others as held.
+        assert_eq!(
+            runner_line(&read[1]),
+            r#"{"ts":"2026-10-04T10:13:16.123Z","ms":1791108796123,"event":"checks_read","data":{"sha":"abc","checks":[{"name":"gate","state":"passed","url":"u"}],"later":true},"cause":{"step":"newer","reason":"r","extra":1}}"#
+        );
+    }
+
+    #[test]
     fn a_stuck_line_with_a_branch_and_commits_round_trips_and_an_old_one_reads_without() {
         let (_dir, store) = open_store();
         let ledger = ledger(&store, MachineId::random(), 1, ticking(T0, 1));
@@ -295,6 +456,9 @@ mod tests {
 
     #[test]
     fn a_cause_attempt_that_is_not_a_u32_is_left_out_so_the_cause_still_reads_back() {
+        // A cause's attempt is a u32 here, so the runner's -1, 1.5, 2^32 and NaN cannot be
+        // written; the largest u32 still reads back. Ones another writer left are read in
+        // the next case.
         let (_dir, store) = open_store();
         let ledger = ledger(&store, MachineId::random(), 1, ticking(T0, 0));
         ledger

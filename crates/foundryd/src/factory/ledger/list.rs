@@ -446,9 +446,10 @@ mod tests {
     }
 
     #[test]
-    fn lists_the_unfinished_runs_oldest_first_with_their_state_and_without_the_finished_ones() {
-        // Nothing orders records by wall-clock time: runs are listed in run id order, the issue
-        // and attempt as numbers. Issue numbers rise as issues are filed.
+    fn lists_the_unfinished_runs_in_run_id_order_with_their_state_and_without_the_finished_ones() {
+        // The runner's "oldest first", by each run's first wall-clock time. Nothing here orders
+        // records by wall-clock time: runs are listed in run id order, the issue and attempt as
+        // numbers, so issue 1, started last, is listed first.
         let (_dir, store) = open_store();
         run_at(
             &store,
@@ -458,7 +459,14 @@ mod tests {
             false,
             true,
         );
-        run_at(&store, &softfac(1), T0, Some(State::Triage), false, true);
+        run_at(
+            &store,
+            &softfac(1),
+            T0 + 90_000,
+            Some(State::Triage),
+            false,
+            true,
+        );
         run_at(
             &store,
             &softfac(2),
@@ -797,15 +805,17 @@ mod tests {
     }
 
     #[test]
-    fn lists_one_summary_per_run_oldest_first_finished_runs_included() {
+    fn lists_one_summary_per_run_in_run_id_order_finished_runs_included() {
+        // The runner's "oldest first"; here in run id order, so issue 8, started an hour after
+        // issue 12, is listed first.
         let (_dir, store) = open_store();
         run_at(&store, &softfac(12), T0 + 60_000, None, false, true);
-        run_at(&store, &softfac(8), T0, None, true, true);
+        run_at(&store, &softfac(8), T0 + 3_600_000, None, true, true);
         assert_eq!(
             summaries_of(&store, "rawphp/softfac"),
             [
                 RunSummary {
-                    started_ts: Some("2026-10-04T10:13:16.123Z".into()),
+                    started_ts: Some("2026-10-04T11:13:16.123Z".into()),
                     last_event: Some("finished".into()),
                     finished: true,
                     total_ms: Some(2000),
@@ -1200,22 +1210,32 @@ mod tests {
         let (_dir, store) = open_store();
         for id in [
             rid(8, "rawphp/softfac", 1),
-            rid(8, "rawphp/softfac", 3),
+            rid(8, "rawphp/softfac", 2),
+            rid(8, "rawphp/softfac", 4),
             rid(9, "rawphp/softfac", 7),
+            rid(8, "rawphp/my_app", 3),
+            rid(8, "rawphp/my__app", 6),
             rid(8, "rawphp/other", 9),
+            rid(8, "someone/softfac", 9),
         ] {
             run_at(&store, &id, T0, None, false, true);
         }
         let store = store.lock().unwrap();
-        assert_eq!(next_attempt(&store, "rawphp/softfac", 8).unwrap(), 4);
+        assert_eq!(next_attempt(&store, "rawphp/softfac", 8).unwrap(), 5);
         assert_eq!(next_attempt(&store, "rawphp/softfac", 9).unwrap(), 8);
         assert_eq!(next_attempt(&store, "rawphp/softfac", 10).unwrap(), 1);
         assert_eq!(next_attempt(&store, "rawphp/other", 8).unwrap(), 10);
+        assert_eq!(next_attempt(&store, "rawphp/my_app", 8).unwrap(), 4);
+        assert_eq!(next_attempt(&store, "Rawphp/My__App", 8).unwrap(), 7);
+        assert_eq!(next_attempt(&store, "RAWPHP/SoftFac", 8).unwrap(), 5);
+        assert_eq!(next_attempt(&store, "../x", 8).unwrap(), 1);
     }
 
     #[test]
     fn next_attempt_matches_a_linear_identifier_in_any_case_and_never_passes_the_largest_attempt() {
-        // Foundry's issues are GitHub numbers: the repo is what is matched in any case.
+        // Foundry's issues are GitHub numbers, so no Linear identifier can be written: the repo
+        // is what is matched in any case. At the largest attempt the answer stays there, as the
+        // runner's `Math.min(highest + 1, U32_MAX)` has it.
         let (_dir, store) = open_store();
         run_at(
             &store,
