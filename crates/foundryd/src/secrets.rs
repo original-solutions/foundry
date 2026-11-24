@@ -732,6 +732,7 @@ mod tests {
         let shown = redact("see 'https://u:p@host' now");
         assert_eq!(shown, "see 'https://***@host' now");
         assert_eq!(redact("'https://host/x'"), "'https://host/x'");
+        assert_eq!(redact("'https://h' by a@b.com"), "'https://h' by a@b.com");
         assert_eq!(
             redact("\"https://host\" and 'https://h'"),
             "\"https://host\" and 'https://h'"
@@ -790,6 +791,7 @@ mod tests {
             "{\"url\":\"https://***@b\"}"
         );
         assert_eq!(redact("'https://h'x@y"), "'https://***@y");
+        assert_eq!(redact("'https://u@h',x@y/r"), "'https://***@y/r");
     }
 
     #[test]
