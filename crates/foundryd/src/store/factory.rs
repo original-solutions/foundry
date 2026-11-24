@@ -40,10 +40,24 @@ fn wrong_kind(kind: &str, body: &FactoryBody) -> StoreError {
     ))
 }
 
+/// The machine id `text` spells, only in the spelling this build writes one. `apply_factory`
+/// keys every record under its owner's id in that spelling, and the reads look an owner's rows
+/// up by it, so an id spelt otherwise (a newer build's or a damaged file's) names rows those
+/// reads would never find, and is an error rather than taken as the id it parses to.
 fn parse_machine(index: usize, text: &str) -> rusqlite::Result<MachineId> {
-    text.parse()
+    let unreadable = |e: Box<dyn std::error::Error + Send + Sync>| {
+        rusqlite::Error::FromSqlConversionFailure(index, Type::Text, e)
+    };
+    let id = text
+        .parse()
         .map(MachineId)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(index, Type::Text, Box::new(e)))
+        .map_err(|e| unreadable(Box::new(e)))?;
+    if id.to_string() != text {
+        return Err(unreadable(
+            "a machine id not spelt as this build writes one".into(),
+        ));
+    }
+    Ok(id)
 }
 
 /// Counts the run event rows the reads of this thread hand back, as events or as ids, for tests
@@ -224,7 +238,8 @@ impl Store {
 
     /// The machines that wrote an event of `run`, each once, in the order of their ids. Read
     /// from the keys alone, one seek per writer, so a run's history is never visited and a row
-    /// whose record cannot be read still names its writer.
+    /// whose record cannot be read still names its writer. A key whose writer is not a machine
+    /// id in the spelling this build writes is an error (`parse_machine`).
     pub fn run_writers(&self, run: &RunId) -> Result<Vec<MachineId>, StoreError> {
         let run = run.to_string();
         let (mut from, to) = range(&run);
