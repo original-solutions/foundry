@@ -5,7 +5,7 @@
 //! wall-clock time of each run's first line; nothing here orders by wall-clock time, so runs
 //! are listed by run id: the repo, then the issue and the attempt as numbers. A run whose
 //! events the store holds but this build cannot read is still listed, flagged `unreadable`,
-//! after the others.
+//! after the others, unless it has a `finished` event.
 //!
 //! The runner's progress read (`runner/progress.ts`, `Seen`) is not ported yet; the few facts
 //! of it a listing needs are read here, by the runner's rules.
@@ -168,24 +168,18 @@ fn unreadable(id: RunId) -> RunInfo {
     }
 }
 
-/// The unfinished runs among `ids`, each run's events got from `read`, unreadable ones last.
-///
-/// Each run's events are read whole, finished runs' too, since the store has no read of a
-/// run's last event yet. The runner reads only a finished file's tail; a read of the runs of a
-/// repo that have a `finished` event, in the store, would let this skip them the same way.
+/// The unfinished runs among `ids`, unreadable ones last. `read` gives each run's events, or
+/// `None` for a finished run, whose events are then never read, as the runner reads only a
+/// finished file's tail.
 fn unfinished(
     ids: Vec<RunId>,
-    read: impl Fn(&RunId) -> Result<Vec<RunEvent>, StoreError>,
+    read: impl Fn(&RunId) -> Result<Option<Vec<RunEvent>>, StoreError>,
 ) -> Vec<RunInfo> {
     let (mut readable, mut rest) = (Vec::new(), Vec::new());
     for id in ids {
         match read(&id) {
-            Ok(events) => {
-                let facts = Facts::of(&events);
-                if !facts.finished {
-                    readable.push(facts.info(id));
-                }
-            }
+            Ok(None) => {}
+            Ok(Some(events)) => readable.push(Facts::of(&events).info(id)),
             Err(error) => {
                 tracing::warn!(run = %id, %error, "a run whose events cannot be read is listed as unreadable");
                 rest.push(unreadable(id));
@@ -208,9 +202,21 @@ fn locked(store: &Mutex<Store>) -> MutexGuard<'_, Store> {
 /// takes it for one read at a time: the run ids, then each run's events. Each run's events are
 /// read whole under one lock; a run that gains an event or first appears after its read is
 /// seen as it is by the next listing. The same holds for [`issue_runs`] and [`summaries`].
+///
+/// Under that same lock the store is first asked whether the run has a `finished` event, and
+/// a finished run's events are not read at all. A run whose rows cannot be read, for the
+/// question or for its events, is listed as unreadable on its own.
 pub fn runs(store: &Mutex<Store>, repo: &str) -> Result<Vec<RunInfo>, StoreError> {
     let ids = locked(store).runs_of(repo)?;
-    Ok(unfinished(ids, |id| events(&locked(store), id)))
+    Ok(unfinished(ids, |id| unless_finished(&locked(store), id)))
+}
+
+/// The events of `run`, or `None` when it has a `finished` event, read under one lock.
+fn unless_finished(store: &Store, run: &RunId) -> Result<Option<Vec<RunEvent>>, StoreError> {
+    if store.run_has_event(run, names::FINISHED)? {
+        return Ok(None);
+    }
+    events(store, run).map(Some)
 }
 
 /// The unfinished runs of `issue` in `repo`, as [`runs`] lists them. Only that issue's runs
@@ -221,7 +227,7 @@ pub fn issue_runs(
     issue: u64,
 ) -> Result<Vec<RunInfo>, StoreError> {
     let ids = of_issue(locked(store).runs_of(repo)?, issue);
-    Ok(unfinished(ids, |id| events(&locked(store), id)))
+    Ok(unfinished(ids, |id| unless_finished(&locked(store), id)))
 }
 
 /// The runs among `ids` of `issue`.
@@ -462,16 +468,30 @@ mod tests {
         ledger
     }
 
-    /// A run event row this build cannot read, as a newer build may leave one.
-    fn unreadable_run(dir: &Path, id: &RunId) {
-        let owner = MachineId::random();
+    /// A run event row of `id` by `owner` that holds `record` as it is.
+    fn raw_run(dir: &Path, id: &RunId, owner: MachineId, record: &str) {
         let conn = rusqlite::Connection::open(dir.join("foundry.db")).unwrap();
         conn.execute(
             "INSERT INTO factory_records (kind, id, owner, version, record)
-             VALUES ('run_event', ?1, ?2, 1, '{\"kind\":\"run_event\",\"later\":true}')",
-            rusqlite::params![format!("{id}/{owner}/1"), owner.to_string()],
+             VALUES ('run_event', ?1, ?2, 1, ?3)",
+            rusqlite::params![format!("{id}/{owner}/1"), owner.to_string(), record],
         )
         .unwrap();
+    }
+
+    /// A run event row this build cannot read, as a newer build may leave one.
+    fn unreadable_run(dir: &Path, id: &RunId) {
+        raw_run(
+            dir,
+            id,
+            MachineId::random(),
+            r#"{"kind":"run_event","later":true}"#,
+        );
+    }
+
+    /// A run event row of `id` by `owner` whose record is not JSON at all.
+    fn damaged_run(dir: &Path, id: &RunId, owner: MachineId) {
+        raw_run(dir, id, owner, "not json");
     }
 
     fn info(id: RunId, state: Option<State>, confirmed: bool) -> RunInfo {
@@ -1350,5 +1370,111 @@ mod tests {
             next_attempt(&store.lock().unwrap(), "RawPHP/SoftFac", 8).unwrap(),
             u32::MAX
         );
+    }
+
+    #[test]
+    fn a_listing_reads_the_events_of_the_unfinished_runs_only() {
+        let (_dir, store) = open_store();
+        let other = MachineId::random();
+        for version in 1..1000 {
+            put(
+                &store,
+                other,
+                version,
+                &softfac(1),
+                1,
+                T0,
+                "step_changed",
+                json!({"step": "red"}),
+                None,
+            );
+        }
+        put(
+            &store,
+            other,
+            1000,
+            &softfac(1),
+            1,
+            T0,
+            "finished",
+            json!({"outcome": "stuck"}),
+            None,
+        );
+        // Three events: approved, claimed and the move to building.
+        run_at(&store, &softfac(2), T0, Some(State::Building), false, true);
+        let read = Store::run_rows_read;
+
+        let before = read();
+        assert_eq!(
+            listed(&store, "rawphp/softfac"),
+            [info(softfac(2), Some(State::Building), true)]
+        );
+        // The two runs' ids, then the unfinished run's three events.
+        assert_eq!(read() - before, 2 + 3);
+
+        let before = read();
+        assert_eq!(
+            issue_runs(&store, "rawphp/softfac", 1).unwrap(),
+            Vec::<RunInfo>::new()
+        );
+        assert_eq!(read() - before, 2);
+    }
+
+    #[test]
+    fn a_row_that_is_not_json_makes_only_its_own_run_unreadable() {
+        let (dir, store) = open_store();
+        run_at(&store, &softfac(7), T0, Some(State::Building), false, true);
+        damaged_run(dir.path(), &softfac(6), MachineId::random());
+        // A repo whose runs' keys lie in the same range is not read at all.
+        damaged_run(
+            dir.path(),
+            &rid(5, "rawphp/softfac__x", 1),
+            MachineId::random(),
+        );
+        let expected = [
+            info(softfac(7), Some(State::Building), true),
+            RunInfo {
+                unreadable: true,
+                ..info(softfac(6), None, false)
+            },
+        ];
+        assert_eq!(listed(&store, "rawphp/softfac"), expected);
+        assert_eq!(
+            issue_runs(&store, "rawphp/softfac", 6).unwrap(),
+            [expected[1].clone()]
+        );
+    }
+
+    #[test]
+    fn a_finished_run_holding_a_row_this_build_cannot_read_is_not_listed() {
+        let (dir, store) = open_store();
+        run_at(&store, &softfac(4), T0, Some(State::Building), true, true);
+        unreadable_run(dir.path(), &softfac(4));
+        assert_eq!(listed(&store, "rawphp/softfac"), []);
+        assert_eq!(issue_runs(&store, "rawphp/softfac", 4).unwrap(), []);
+    }
+
+    #[test]
+    fn a_finished_run_holding_a_row_that_is_not_json_is_not_listed_whatever_its_key_order() {
+        let (dir, store) = open_store();
+        let (low, high) = (
+            MachineId(uuid::Uuid::from_u128(1)),
+            MachineId(uuid::Uuid::from_u128(u128::MAX)),
+        );
+        for (issue, damaged, writer) in [(4, low, high), (5, high, low)] {
+            damaged_run(dir.path(), &softfac(issue), damaged);
+            put(
+                &store,
+                writer,
+                issue,
+                &softfac(issue),
+                1,
+                T0,
+                "finished",
+                json!({"outcome": "stuck"}),
+                None,
+            );
+        }
+        assert_eq!(listed(&store, "rawphp/softfac"), []);
     }
 }

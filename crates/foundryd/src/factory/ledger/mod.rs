@@ -16,6 +16,7 @@
 //! [`Hide`], which hides the secrets this machine holds, and only then is it cut: each text of
 //! the data to its last [`OUTPUT_LIMIT`] bytes, and the cause's as the runner cuts them.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -23,7 +24,7 @@ use foundry_proto::factory::{FactoryBody, FactoryRecord, RunEvent, RunId};
 use foundry_proto::ids::MachineId;
 use serde_json::Value;
 
-use crate::store::{Store, StoreError};
+use crate::store::{Applied, Store, StoreError};
 
 use events::{Cause, Event, Outcome, PrEnd, names};
 
@@ -36,8 +37,10 @@ pub mod read;
 pub const OUTPUT_LIMIT: usize = 64 * 1024;
 
 /// Hides the secrets this machine holds in a text. The daemon's must hide every `github:*`
-/// token and gateway key in its secret store at the time of the call, and URL passwords, as
-/// task 7's `secrets::hide_known` will; the ledger is given it when it is made.
+/// token and gateway key in its secret store at the time of the call, also with gaps of spaces,
+/// controls or escape sequences inside it, and URL passwords, as `secrets::hide_known` does;
+/// the ledger is given it when it is made, and gives it each text once as it came, and a cause's
+/// text once more when the cause's strip changed it ([`Cause::cleaned_with`]).
 pub type Hide = Arc<dyn Fn(&str) -> String + Send + Sync>;
 
 /// The wall-clock time as Unix epoch milliseconds: what an event is stamped with.
@@ -63,7 +66,8 @@ pub enum LedgerError {
 }
 
 /// Writes a run's events as this machine's `run_event` records, under the lease generation it
-/// was given. Cheap to clone: every clone writes to the same store.
+/// was given. Cheap to clone: every clone writes to the same store, and shares what the ledger
+/// has read of each run.
 #[derive(Clone)]
 pub struct Ledger {
     store: Arc<Mutex<Store>>,
@@ -71,6 +75,89 @@ pub struct Ledger {
     generation: u64,
     hide: Hide,
     wall: WallClock,
+    tallies: Arc<Mutex<BTreeMap<RunId, RunTally>>>,
+}
+
+/// What a ledger has read of one run's events: all a write needs, so the run's history is read
+/// once and each later write reads only what was stored since.
+///
+/// A stored run event never changes or goes (its key holds its writer and version), and each
+/// writer's records are stored in the order of their versions, so what was read stays true and
+/// the highest version held from a writer is where its next read starts. The writers are
+/// looked for again on every read, so a `finished` event that another machine wrote, synced in
+/// since, is seen. Once the run is finished nothing more is kept of it, since nothing more is
+/// written to it.
+#[derive(Clone, Default)]
+struct RunTally {
+    /// The version each writer's next read of the run starts above: the highest version held
+    /// from it, of any record, when it was last read.
+    read_to: BTreeMap<MachineId, u64>,
+    /// The run has its `finished` event, whatever its data.
+    finished: bool,
+    /// The run's first event, by generation, then version, then writer, as the store orders
+    /// them: that order and the event's time.
+    first: Option<((u64, u64, String), u64)>,
+    /// The distinct attempts of the run's `gate_command` events that read whole.
+    gate_attempts: BTreeSet<u32>,
+}
+
+impl RunTally {
+    /// Takes in `event`, which `writer` stored at `version`.
+    fn take(&mut self, writer: MachineId, version: u64, event: &RunEvent) {
+        if event.event == names::FINISHED {
+            self.finished = true;
+        }
+        self.read_to_at_least(writer, version);
+        let order = (event.generation, version, writer.to_string());
+        if self.first.as_ref().is_none_or(|(first, _)| order < *first) {
+            self.first = Some((order, event.ms));
+        }
+        if let Some(attempt) = gate_attempt(event) {
+            self.gate_attempts.insert(attempt);
+        }
+    }
+
+    /// Keeps only that the run is finished, once it is: nothing more is written to it, so
+    /// nothing more of it is needed.
+    fn settle(&mut self) {
+        if self.finished {
+            *self = Self {
+                finished: true,
+                ..Self::default()
+            };
+        }
+    }
+
+    /// Moves `writer`'s next read to start above `version`, if it does not already.
+    fn read_to_at_least(&mut self, writer: MachineId, version: u64) {
+        let read_to = self.read_to.entry(writer).or_insert(version);
+        *read_to = (*read_to).max(version);
+    }
+
+    /// Reads into this what `store` holds of `run` that has not been read yet: every event of
+    /// a writer not read before, and each other writer's events above where its last read
+    /// ended. All or nothing: a row this build cannot read, of any writer, is an error and
+    /// leaves this as it was, so every write to the run fails the same way, whichever writer's
+    /// id comes first.
+    ///
+    /// Each writer's next read then starts above the highest version held from it, so the
+    /// records it stores of other runs meanwhile are not visited again by every later write.
+    /// `store` is the locked store, so nothing of a writer is stored between its two reads.
+    fn catch_up(&mut self, store: &Store, run: &RunId) -> Result<(), StoreError> {
+        let mut read = self.clone();
+        for writer in store.run_writers(run)? {
+            let above = read.read_to.get(&writer).copied();
+            for (version, event) in store.run_events_by(run, writer, above)? {
+                read.take(writer, version, &event);
+            }
+            if let Some(highest) = store.highest_factory_version(writer)? {
+                read.read_to_at_least(writer, highest);
+            }
+        }
+        read.settle();
+        *self = read;
+        Ok(())
+    }
 }
 
 impl Ledger {
@@ -83,6 +170,7 @@ impl Ledger {
             generation,
             hide,
             wall: Arc::new(system_ms),
+            tallies: Arc::default(),
         }
     }
 
@@ -128,19 +216,28 @@ impl Ledger {
         let cause = serde_json::to_value(cause.cleaned_with(&*self.hide))
             .expect("a cause is an object of strings and a number");
         // The lock is held from the read to the write, so this machine's own writes of one
-        // run never cross.
+        // run never cross. What the ledger has read of the run is locked inside it, always in
+        // that order.
         let mut store = self.lock();
-        let held = store.run_events(run)?;
+        let mut tallies = self.tallies.lock().unwrap_or_else(PoisonError::into_inner);
+        let tally = tallies.entry(run.clone()).or_default();
+        // Only the events stored since the ledger last read the run are read, so a write does
+        // not read the run's whole history again. A run once finished stays finished, so it is
+        // not read again at all.
+        if !tally.finished {
+            tally.catch_up(&store, run)?;
+        }
         // A `finished` event ends the run even when its data cannot be read.
-        if held.iter().any(|event| event.event == names::FINISHED) {
+        if tally.finished {
             return Err(LedgerError::AlreadyFinished { run: run.clone() });
         }
         let ms = (self.wall)();
         // Two numbers, which need no hiding.
         if let (Event::Finished { .. }, Value::Object(fields)) = (event, &mut data) {
-            let first = held.first().map_or(ms, |event| event.ms);
+            let first = tally.first.as_ref().map_or(ms, |(_, first)| *first);
+            let attempts = u32::try_from(tally.gate_attempts.len()).unwrap_or(u32::MAX);
             fields.insert("total_ms".into(), ms.saturating_sub(first).into());
-            fields.insert("gate_attempts".into(), gate_attempts(&held).into());
+            fields.insert("gate_attempts".into(), attempts.into());
         }
         let written = RunEvent {
             run: run.clone(),
@@ -151,12 +248,16 @@ impl Ledger {
             data,
             cause: Some(cause),
         };
+        let version = store.own_next_factory_version()?;
         let record = FactoryRecord {
             owner: self.me,
-            version: store.own_next_factory_version()?,
+            version,
             body: FactoryBody::RunEvent(written.clone()),
         };
-        store.apply_factory(&record, self.me)?;
+        if store.apply_factory(&record, self.me)? == Applied::Stored {
+            tally.take(self.me, version, &written);
+            tally.settle();
+        }
         Ok(written)
     }
 
@@ -184,41 +285,31 @@ impl Ledger {
     }
 }
 
-/// The distinct attempts among `events`' `gate_command` events. Only one that reads whole as
-/// its typed event counts, as only one the runner's reader reads whole does: an attempt that
-/// is a u32, a command, an exit code that is an i32 and a duration that is a u64.
-fn gate_attempts(events: &[RunEvent]) -> u32 {
-    let attempts: std::collections::BTreeSet<u32> = events
-        .iter()
-        .filter(|event| event.event == names::GATE_COMMAND)
-        .filter_map(
-            |event| match Event::from_parts(&event.event, &event.data)? {
-                Event::GateCommand { attempt, .. } => Some(attempt),
-                _ => None,
-            },
-        )
-        .collect();
-    u32::try_from(attempts.len()).unwrap_or(u32::MAX)
+/// The attempt of `event` when it is a `gate_command` that reads whole as its typed event, as
+/// only one the runner's reader reads whole counts: an attempt that is a u32, a command, an exit
+/// code that is an i32 and a duration that is a u64.
+fn gate_attempt(event: &RunEvent) -> Option<u32> {
+    if event.event != names::GATE_COMMAND {
+        return None;
+    }
+    match Event::from_parts(&event.event, &event.data)? {
+        Event::GateCommand { attempt, .. } => Some(attempt),
+        _ => None,
+    }
 }
 
-/// Every text in `value` through `hide`, then cut to its last [`OUTPUT_LIMIT`] bytes. Hiding
-/// comes first, so a cut can never leave the end of a secret that the hiding would no longer
-/// recognise. A text is kept as it is, its lines and control characters too, unless `hide`
-/// finds a secret only once the control characters that are not white space are gone: then it
-/// is kept without them, with that secret hidden. Line breaks and tabs stay, so two lines are
-/// never joined into something that looks like a secret.
-///
-/// So a known token split by white space (a line break, a tab, a space) is not hidden here, and
-/// is stored as it came. Only `hide` knows the values it hides, so only it can tell a split
-/// token from two lines that merely join into something that looks like one.
+/// Every text in `value` through `hide` once, as it came, then cut to its last
+/// [`OUTPUT_LIMIT`] bytes. Hiding comes first, so a cut can never leave the end of a secret
+/// that the hiding would no longer recognise. A text keeps its lines and control characters:
+/// a known token split by spaces, line breaks, control characters or escape sequences is found
+/// by `hide` itself (`secrets::hide_known` matches a held value across such gaps), since only it
+/// knows the values it hides and so can tell a split token from two lines that merely join
+/// into something that looks like one.
 fn hide_texts(value: &mut Value, hide: &(dyn Fn(&str) -> String + Send + Sync)) {
     match value {
         Value::String(text) => {
             let hidden = hide(text);
-            let stripped = events::strip_inline(&hidden);
-            let again = hide(&stripped);
-            let kept = if again == stripped { hidden } else { again };
-            *text = cut_output(&kept).to_owned();
+            *text = cut_output(&hidden).to_owned();
         }
         Value::Array(items) => {
             for item in items {
@@ -383,6 +474,14 @@ pub(crate) mod testing {
     /// Hides nothing.
     pub fn shown() -> Hide {
         Arc::new(|text: &str| text.to_owned())
+    }
+
+    /// Hides as the daemon's ledger will: `secrets::hide_known` over a store that holds
+    /// `token` for `octocat`.
+    pub fn hiding(token: &str) -> Hide {
+        let secrets = crate::secrets::MemorySecrets::default();
+        crate::secrets::Secrets::set(&secrets, "github:octocat", token).unwrap();
+        Arc::new(move |text: &str| crate::secrets::hide_known(text, &secrets))
     }
 
     /// A store of its own in a directory that lives as long as the returned guard.
@@ -1864,9 +1963,8 @@ mod tests {
     fn a_secret_across_the_cut_of_a_cause_text_is_hidden_before_the_text_is_cut() {
         let (_dir, store) = open_store();
         let token = "ghp_0123456789abcdefghij";
-        let hide: Hide = std::sync::Arc::new(move |text: &str| text.replace(token, "***"));
-        let ledger =
-            Ledger::new(store.clone(), MachineId::random(), 1, hide).with_wall(ticking(T0, 1000));
+        let ledger = Ledger::new(store.clone(), MachineId::random(), 1, hiding(token))
+            .with_wall(ticking(T0, 1000));
         // Each text holds the secret across the place its cut falls: 100 characters for the
         // reason, actor and label, 1000 for the command.
         let short = |fill: &str| format!("{}{token}", fill.repeat(95));
@@ -1905,9 +2003,8 @@ mod tests {
     fn a_secret_split_by_a_control_character_is_hidden_in_the_data_too() {
         let (_dir, store) = open_store();
         let token = "ghp_0123456789abcdefghij";
-        let hide: Hide = std::sync::Arc::new(move |text: &str| text.replace(token, "***"));
-        let ledger =
-            Ledger::new(store.clone(), MachineId::random(), 1, hide).with_wall(ticking(T0, 1000));
+        let ledger = Ledger::new(store.clone(), MachineId::random(), 1, hiding(token))
+            .with_wall(ticking(T0, 1000));
         let written = ledger
             .write(
                 &run(8),
@@ -1940,13 +2037,16 @@ mod tests {
 
     #[test]
     fn output_whose_lines_only_join_into_a_url_password_keeps_its_lines() {
-        // A Hide that hides URL passwords as `secrets::redact` does, beside a known token.
+        // `secrets::hide_known` hides URL passwords as `secrets::redact` does, beside a known
+        // token.
         let (_dir, store) = open_store();
-        let hide: Hide = std::sync::Arc::new(|text: &str| {
-            crate::secrets::redact(text).replace("ghp_0123456789abcdefghij", "***")
-        });
-        let ledger =
-            Ledger::new(store.clone(), MachineId::random(), 1, hide).with_wall(ticking(T0, 1000));
+        let ledger = Ledger::new(
+            store.clone(),
+            MachineId::random(),
+            1,
+            hiding("ghp_0123456789abcdefghij"),
+        )
+        .with_wall(ticking(T0, 1000));
         let output =
             "fetching https://registry.example.com\nadmin@example.com wrote\r\n\tok\u{0007}";
         let written = ledger
@@ -1963,6 +2063,110 @@ mod tests {
             )
             .unwrap();
         assert_eq!(written.data["reason"], json!("a\nT=***\nb"));
+    }
+
+    #[test]
+    fn a_secret_split_by_white_space_or_a_colour_sequence_is_hidden_in_the_data_and_the_cause() {
+        let (_dir, store) = open_store();
+        let token = "ghp_0123456789abcdefghij";
+        let ledger = Ledger::new(store.clone(), MachineId::random(), 1, hiding(token))
+            .with_wall(ticking(T0, 1000));
+        for split in ["\n", "\t", " ", "\r\n", "\n    ", "\u{1b}[31m"] {
+            let text = format!("one\nT=ghp_0123456789{split}abcdefghij\ntwo");
+            let cause = Cause::new(CauseStep::Gate, &text)
+                .actor(&text)
+                .command(&text)
+                .label(&text);
+            let written = ledger.write(&run(8), &stuck(&text), &cause).unwrap();
+            assert_eq!(
+                written.data["reason"],
+                json!("one\nT=***\ntwo"),
+                "{split:?}"
+            );
+            let cause = written.cause.unwrap();
+            for field in ["reason", "actor", "command", "label"] {
+                assert_eq!(cause[field], json!("oneT=***two"), "{split:?} {field}");
+            }
+        }
+        let stored = serde_json::to_string(&held(&store, &run(8))).unwrap();
+        assert!(!stored.contains("ghp_"), "{stored}");
+        assert!(!stored.contains("abcdefghij"), "{stored}");
+    }
+
+    #[test]
+    fn a_secret_split_by_a_lone_escape_or_c1_introducer_is_hidden_in_the_data_and_the_cause() {
+        let (_dir, store) = open_store();
+        let token = "ghp_0123456789abcdefghij";
+        let ledger = Ledger::new(store.clone(), MachineId::random(), 1, hiding(token))
+            .with_wall(ticking(T0, 1000));
+        for (split, end) in [
+            ("\u{1b}", ""),
+            ("\u{9b}", ""),
+            ("\u{90}", "\u{7}"),
+            ("\u{9d}", "\u{9c}"),
+        ] {
+            let text = format!("one\nT=ghp_0123456789{split}abcdefghij{end}\ntwo");
+            let cause = Cause::new(CauseStep::Gate, &text).command(&text);
+            let written = ledger.write(&run(8), &stuck(&text), &cause).unwrap();
+            assert_eq!(
+                written.data["reason"],
+                json!(format!("one\nT=***{end}\ntwo")),
+                "{split:?}"
+            );
+            let cause = written.cause.unwrap();
+            for field in ["reason", "command"] {
+                assert_eq!(cause[field], json!("oneT=***two"), "{split:?} {field}");
+            }
+        }
+        // A colour sequence and a lone ESC in one token.
+        let text = "one\nT=ghp_01234\u{1b}[31m56789\u{1b}abcdefghij\ntwo";
+        let cause = Cause::new(CauseStep::Gate, text).command(text);
+        let written = ledger.write(&run(8), &stuck(text), &cause).unwrap();
+        assert_eq!(written.data["reason"], json!("one\nT=***\ntwo"));
+        assert_eq!(written.cause.unwrap()["command"], json!("oneT=***two"));
+        let stored = serde_json::to_string(&held(&store, &run(8))).unwrap();
+        assert!(!stored.contains("ghp_"), "{stored}");
+        assert!(!stored.contains("abcdefghij"), "{stored}");
+    }
+
+    #[test]
+    fn a_write_gives_its_data_to_its_hider_once_and_a_cause_again_when_its_strip_changed_it() {
+        let (_dir, store) = open_store();
+        let seen = std::sync::Arc::new(Mutex::new(Vec::<String>::new()));
+        let hide: Hide = {
+            let seen = seen.clone();
+            std::sync::Arc::new(move |text: &str| {
+                seen.lock().unwrap().push(text.to_owned());
+                text.to_owned()
+            })
+        };
+        let ledger =
+            Ledger::new(store.clone(), MachineId::random(), 1, hide).with_wall(ticking(T0, 1000));
+        let cause = Cause::new(CauseStep::Gate, "r\u{7}\nr")
+            .actor("a\u{202e}a")
+            .command("c\tc")
+            .label("l\u{1b}[0ml");
+        ledger
+            .write(
+                &run(8),
+                &stuck(&format!("{}\u{7}\nend", "o".repeat(OUTPUT_LIMIT))),
+                &cause,
+            )
+            .unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                format!("{}\u{7}\nend", "o".repeat(OUTPUT_LIMIT)),
+                "r\u{7}\nr".to_owned(),
+                "rr".to_owned(),
+                "a\u{202e}a".to_owned(),
+                "aa".to_owned(),
+                "c\tc".to_owned(),
+                "cc".to_owned(),
+                "l\u{1b}[0ml".to_owned(),
+                "l[0ml".to_owned(),
+            ]
+        );
     }
 
     #[test]
@@ -2096,5 +2300,583 @@ mod tests {
         assert_eq!(written.cause.as_ref().unwrap()["actor"], json!("***"));
         let stored = serde_json::to_string(&held(&store, &run(8))).unwrap();
         assert!(!stored.contains("s3cr3t"), "{stored}");
+    }
+
+    /// A run of 1,000 events another machine wrote at generation 1: a step, then gate commands
+    /// of attempts 1 to 3 every tenth event, the first at `T0` and a second apart.
+    fn a_thousand_events(
+        store: &std::sync::Arc<std::sync::Mutex<crate::store::Store>>,
+    ) -> MachineId {
+        let other = MachineId::random();
+        for version in 1..=1000_u64 {
+            let ms = T0 + (version - 1) * 1000;
+            let (name, data) = if version % 10 == 0 {
+                let attempt = version / 10 % 3 + 1;
+                (
+                    "gate_command",
+                    json!({"attempt": attempt, "command": "cargo test", "exit_code": 0, "duration_ms": 5}),
+                )
+            } else {
+                ("step_changed", json!({"step": "red"}))
+            };
+            put(store, other, version, &run(8), 1, ms, name, data, None);
+        }
+        other
+    }
+
+    /// A run event row of `run` this build cannot read, as a newer build may leave one.
+    fn put_unreadable(dir: &tempfile::TempDir, run: &RunId) {
+        let owner = MachineId::random();
+        let conn = rusqlite::Connection::open(dir.path().join("foundry.db")).unwrap();
+        conn.execute(
+            "INSERT INTO factory_records (kind, id, owner, version, record)
+             VALUES ('run_event', ?1, ?2, 1, '{\"kind\":\"run_event\",\"later\":true}')",
+            rusqlite::params![format!("{run}/{owner}/1"), owner.to_string()],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn the_write_of_event_1001_reads_one_writer_id_and_no_event() {
+        let (_dir, store) = open_store();
+        let ledger = ledger(&store, MachineId::random(), 1, ticking(T0, 1000));
+        for _ in 0..1000 {
+            ledger.write(&run(8), &step("red"), &test_cause()).unwrap();
+        }
+        let before = Store::run_rows_read();
+        ledger
+            .write(&run(8), &step("green"), &test_cause())
+            .unwrap();
+        // This machine's id, the run's only writer, and no event: nothing was stored since.
+        assert_eq!(Store::run_rows_read() - before, 1);
+        assert_eq!(held(&store, &run(8)).len(), 1001);
+    }
+
+    #[test]
+    fn a_ledger_reads_a_runs_history_once_then_only_what_was_stored_since() {
+        let (_dir, store) = open_store();
+        let writer = a_thousand_events(&store);
+        let ledger = ledger(
+            &store,
+            MachineId::random(),
+            2,
+            ticking(T0 + 2_000_000, 1000),
+        );
+        let rows = || Store::run_rows_read();
+
+        // The first write reads the other writer's id and its 1,000 events.
+        let before = rows();
+        ledger
+            .write(&run(8), &step("green"), &test_cause())
+            .unwrap();
+        assert_eq!(rows() - before, 1 + 1000);
+
+        // The next reads the two writers' ids and nothing else.
+        let before = rows();
+        ledger
+            .write(&run(8), &step("refactor"), &test_cause())
+            .unwrap();
+        assert_eq!(rows() - before, 2);
+
+        // An event the other writer stores is the only event the write after it reads.
+        put(
+            &store,
+            writer,
+            1001,
+            &run(8),
+            1,
+            T0,
+            "gate_command",
+            json!({"attempt": 7, "command": "c", "exit_code": 0, "duration_ms": 5}),
+            None,
+        );
+        let before = rows();
+        ledger
+            .finish(&run(8), Outcome::Stuck, None, None, &test_cause(), None)
+            .unwrap();
+        assert_eq!(rows() - before, 2 + 1);
+        // From the other writer's first event at T0, with attempts 1 to 3 and 7.
+        assert_eq!(last(&store).data, finished_data("stuck", 2_002_000, 4));
+    }
+
+    #[test]
+    fn a_finish_after_1000_events_reads_no_event_again() {
+        let (_dir, store) = open_store();
+        a_thousand_events(&store);
+        let ledger = ledger(
+            &store,
+            MachineId::random(),
+            2,
+            ticking(T0 + 2_000_000, 1000),
+        );
+        ledger
+            .write(&run(8), &step("green"), &test_cause())
+            .unwrap();
+        let before = Store::run_rows_read();
+        ledger
+            .finish(&run(8), Outcome::Stuck, None, None, &test_cause(), None)
+            .unwrap();
+        // The two writers' ids.
+        assert_eq!(Store::run_rows_read() - before, 2);
+        assert_eq!(last(&store).data, finished_data("stuck", 2_001_000, 3));
+    }
+
+    #[test]
+    fn a_finished_event_synced_in_after_the_ledger_read_the_run_still_stops_its_next_write() {
+        let (_a_dir, a_store) = open_store();
+        let (_b_dir, b_store) = open_store();
+        let (a, b) = (MachineId::random(), MachineId::random());
+        let first = ledger(&a_store, a, 1, ticking(T0, 1000));
+        let second = ledger(&b_store, b, 2, ticking(T0, 1000));
+        first.write(&run(8), &step("a1"), &test_cause()).unwrap();
+        sync(&a_store, a, &b_store);
+        // The second machine reads the run, the first machine's event included.
+        second.write(&run(8), &step("b1"), &test_cause()).unwrap();
+        // The first machine writes more, then finishes, and its events sync in.
+        first.write(&run(8), &step("a2"), &test_cause()).unwrap();
+        first
+            .finish(&run(8), Outcome::Stuck, None, None, &test_cause(), None)
+            .unwrap();
+        sync(&a_store, a, &b_store);
+        let before = held(&b_store, &run(8));
+        assert!(matches!(
+            second.write(&run(8), &step("b2"), &test_cause()),
+            Err(LedgerError::AlreadyFinished { .. })
+        ));
+        assert!(matches!(
+            second.finish(&run(8), Outcome::Stuck, None, None, &test_cause(), None),
+            Err(LedgerError::AlreadyFinished { .. })
+        ));
+        assert_eq!(held(&b_store, &run(8)), before);
+    }
+
+    #[test]
+    fn a_clone_and_a_second_ledger_of_one_store_each_see_the_others_writes() {
+        let (_dir, store) = open_store();
+        let me = MachineId::random();
+        let first = ledger(&store, me, 1, scripted(&[T0, T0 + 1000, T0 + 9000]));
+        let clone = first.clone();
+        let second = ledger(&store, me, 1, scripted(&[T0 + 2000, T0 + 3000]));
+        first.write(&run(8), &step("red"), &test_cause()).unwrap();
+        second
+            .write(&run(8), &gate(1, "cargo test"), &test_cause())
+            .unwrap();
+        clone
+            .write(&run(8), &gate(2, "cargo test"), &test_cause())
+            .unwrap();
+        second
+            .finish(&run(8), Outcome::Stuck, None, None, &test_cause(), None)
+            .unwrap();
+        assert_eq!(last(&store).data, finished_data("stuck", 3000, 2));
+        assert!(matches!(
+            first.write(&run(8), &step("late"), &test_cause()),
+            Err(LedgerError::AlreadyFinished { .. })
+        ));
+    }
+
+    #[test]
+    fn a_write_to_a_run_holding_a_row_this_build_cannot_read_fails_and_writes_nothing() {
+        let me = MachineId::random();
+        let mine = |store: &std::sync::Arc<std::sync::Mutex<crate::store::Store>>| {
+            store
+                .lock()
+                .unwrap()
+                .factory_since(me, 0, usize::MAX)
+                .unwrap()
+                .len()
+        };
+        // Held before the ledger first reads the run.
+        let (dir, store) = open_store();
+        put_unreadable(&dir, &run(8));
+        let cold = ledger(&store, me, 1, ticking(T0, 1000));
+        assert!(matches!(
+            cold.write(&run(8), &step("red"), &test_cause()),
+            Err(LedgerError::Store(_))
+        ));
+        assert!(matches!(
+            cold.finish(&run(8), Outcome::Stuck, None, None, &test_cause(), None),
+            Err(LedgerError::Store(_))
+        ));
+        assert_eq!(mine(&store), 0);
+
+        // Stored after the ledger read the run.
+        let (dir, store) = open_store();
+        let warm = ledger(&store, me, 1, ticking(T0, 1000));
+        warm.write(&run(9), &step("red"), &test_cause()).unwrap();
+        put_unreadable(&dir, &run(9));
+        assert!(matches!(
+            warm.write(&run(9), &step("green"), &test_cause()),
+            Err(LedgerError::Store(_))
+        ));
+        assert!(matches!(
+            warm.finish(&run(9), Outcome::Stuck, None, None, &test_cause(), None),
+            Err(LedgerError::Store(_))
+        ));
+        assert_eq!(mine(&store), 1);
+    }
+
+    /// A `finished` row of `run` by `owner`, keyed under `spelt`, a spelling of the owner's id
+    /// this build never writes, as a newer build or a damaged file may leave one.
+    fn put_finished_spelt(
+        dir: &tempfile::TempDir,
+        run: &RunId,
+        owner: MachineId,
+        version: u64,
+        spelt: &str,
+    ) {
+        let record = FactoryRecord {
+            owner,
+            version,
+            body: FactoryBody::RunEvent(RunEvent {
+                run: run.clone(),
+                ..stored(T0, "finished", json!({"outcome": "stuck"}))
+            }),
+        };
+        let conn = rusqlite::Connection::open(dir.path().join("foundry.db")).unwrap();
+        conn.execute(
+            "INSERT INTO factory_records (kind, id, owner, version, record)
+             VALUES ('run_event', ?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                format!("{run}/{spelt}/{version}"),
+                owner.to_string(),
+                i64::try_from(version).unwrap(),
+                serde_json::to_string(&record).unwrap()
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_write_to_a_run_whose_finished_row_spells_its_writer_otherwise_fails_and_writes_nothing() {
+        let (me, other) = (MachineId::random(), MachineId::random());
+        let spelt = other.to_string().to_uppercase();
+        let mine = |store: &std::sync::Arc<std::sync::Mutex<crate::store::Store>>| {
+            store
+                .lock()
+                .unwrap()
+                .factory_since(me, 0, usize::MAX)
+                .unwrap()
+                .len()
+        };
+        // Held before the ledger first reads the run.
+        let (dir, store) = open_store();
+        put_finished_spelt(&dir, &run(8), other, 1, &spelt);
+        let cold = ledger(&store, me, 1, ticking(T0, 1000));
+        assert!(matches!(
+            cold.write(&run(8), &step("red"), &test_cause()),
+            Err(LedgerError::Store(_))
+        ));
+        assert_eq!(mine(&store), 0);
+
+        // Stored after the ledger read the run, from a writer it has read.
+        let (dir, store) = open_store();
+        put(
+            &store,
+            other,
+            1,
+            &run(9),
+            1,
+            T0,
+            "step_changed",
+            json!({"step": "red"}),
+            None,
+        );
+        let warm = ledger(&store, me, 1, ticking(T0, 1000));
+        warm.write(&run(9), &step("red"), &test_cause()).unwrap();
+        put_finished_spelt(&dir, &run(9), other, 2, &spelt);
+        assert!(matches!(
+            warm.write(&run(9), &step("green"), &test_cause()),
+            Err(LedgerError::Store(_))
+        ));
+        assert_eq!(mine(&store), 1);
+    }
+
+    /// What `ledger` has read of `run`, as (whether it is finished, the highest version read of
+    /// each writer).
+    fn tally(ledger: &Ledger, run: &RunId) -> (bool, std::collections::BTreeMap<MachineId, u64>) {
+        let tallies = ledger.tallies.lock().unwrap();
+        let tally = &tallies[run];
+        (tally.finished, tally.read_to.clone())
+    }
+
+    #[test]
+    fn a_writers_cursor_moves_to_its_highest_version_so_its_other_records_are_not_visited_again() {
+        let (_dir, store) = open_store();
+        let (me, other) = (MachineId::random(), MachineId::random());
+        for version in 1..=3 {
+            put(
+                &store,
+                other,
+                version,
+                &run(8),
+                1,
+                T0,
+                "step_changed",
+                json!({}),
+                None,
+            );
+        }
+        // The other writer carries on with another run.
+        for version in 4..=1003 {
+            put(
+                &store,
+                other,
+                version,
+                &run(9),
+                1,
+                T0,
+                "step_changed",
+                json!({}),
+                None,
+            );
+        }
+        let ledger = ledger(&store, me, 2, ticking(T0, 1000));
+        ledger.write(&run(8), &step("red"), &test_cause()).unwrap();
+        assert_eq!(tally(&ledger, &run(8)).1[&other], 1003);
+        // And again once more is stored, read from above where it was last seen.
+        put(
+            &store,
+            other,
+            1004,
+            &run(9),
+            1,
+            T0,
+            "step_changed",
+            json!({}),
+            None,
+        );
+        ledger
+            .write(&run(8), &step("green"), &test_cause())
+            .unwrap();
+        assert_eq!(tally(&ledger, &run(8)).1[&other], 1004);
+    }
+
+    #[test]
+    fn a_finished_event_read_before_a_later_event_of_its_writer_still_ends_the_run() {
+        let (_dir, store) = open_store();
+        let other = MachineId::random();
+        put(
+            &store,
+            other,
+            1,
+            &run(8),
+            1,
+            T0,
+            "finished",
+            json!({"outcome": "stuck"}),
+            None,
+        );
+        put(
+            &store,
+            other,
+            2,
+            &run(8),
+            1,
+            T0,
+            "step_changed",
+            json!({"step": "late"}),
+            None,
+        );
+        let cold = ledger(&store, MachineId::random(), 2, ticking(T0, 1000));
+        let before = held(&store, &run(8));
+        assert!(matches!(
+            cold.write(&run(8), &step("red"), &test_cause()),
+            Err(LedgerError::AlreadyFinished { .. })
+        ));
+        assert_eq!(tally(&cold, &run(8)), (true, Default::default()));
+        assert!(matches!(
+            cold.finish(&run(8), Outcome::Stuck, None, None, &test_cause(), None),
+            Err(LedgerError::AlreadyFinished { .. })
+        ));
+        assert_eq!(held(&store, &run(8)), before);
+
+        // The same when the `finished` and the later event are stored after the ledger first
+        // read the run, and read in one catch-up.
+        let (_dir, store) = open_store();
+        let warm = ledger(&store, MachineId::random(), 2, ticking(T0, 1000));
+        warm.write(&run(9), &step("red"), &test_cause()).unwrap();
+        put(
+            &store,
+            other,
+            1,
+            &run(9),
+            1,
+            T0,
+            "finished",
+            json!({"outcome": "stuck"}),
+            None,
+        );
+        put(
+            &store,
+            other,
+            2,
+            &run(9),
+            1,
+            T0,
+            "step_changed",
+            json!({"step": "late"}),
+            None,
+        );
+        let before = held(&store, &run(9));
+        assert!(matches!(
+            warm.write(&run(9), &step("green"), &test_cause()),
+            Err(LedgerError::AlreadyFinished { .. })
+        ));
+        assert_eq!(held(&store, &run(9)), before);
+    }
+
+    #[test]
+    fn the_first_event_is_the_lowest_by_generation_then_version_whatever_order_it_is_read_in() {
+        let (_dir, store) = open_store();
+        let other = MachineId::random();
+        let ledger = ledger(
+            &store,
+            MachineId::random(),
+            2,
+            scripted(&[T0 + 5000, T0 + 9000]),
+        );
+        ledger.write(&run(8), &step("red"), &test_cause()).unwrap();
+        // The earlier holder's events sync in after: generation 1, at versions above the
+        // ledger's own, the first of them at T0.
+        put(
+            &store,
+            other,
+            50,
+            &run(8),
+            1,
+            T0,
+            "step_changed",
+            json!({}),
+            None,
+        );
+        put(
+            &store,
+            other,
+            51,
+            &run(8),
+            1,
+            T0 + 1000,
+            "step_changed",
+            json!({}),
+            None,
+        );
+        ledger
+            .finish(&run(8), Outcome::Stuck, None, None, &test_cause(), None)
+            .unwrap();
+        assert_eq!(last(&store).data, finished_data("stuck", 9000, 0));
+    }
+
+    #[test]
+    fn a_finished_runs_tally_keeps_only_that_it_is_finished_and_reads_nothing_again() {
+        let (_dir, store) = open_store();
+        let ledger = ledger(&store, MachineId::random(), 1, ticking(T0, 1000));
+        ledger
+            .write(&run(8), &gate(1, "cargo test"), &test_cause())
+            .unwrap();
+        ledger
+            .finish(&run(8), Outcome::Stuck, None, None, &test_cause(), None)
+            .unwrap();
+        let before = Store::run_rows_read();
+        assert!(matches!(
+            ledger.write(&run(8), &step("late"), &test_cause()),
+            Err(LedgerError::AlreadyFinished { .. })
+        ));
+        assert_eq!(Store::run_rows_read() - before, 0);
+        assert_eq!(tally(&ledger, &run(8)), (true, Default::default()));
+        let tallies = ledger.tallies.lock().unwrap();
+        assert!(tallies[&run(8)].first.is_none());
+        assert!(tallies[&run(8)].gate_attempts.is_empty());
+    }
+
+    #[test]
+    fn a_finished_run_holding_a_row_this_build_cannot_read_is_a_store_error_whatever_its_key_order()
+    {
+        let (low, high) = (
+            MachineId(uuid::Uuid::from_u128(1)),
+            MachineId(uuid::Uuid::from_u128(u128::MAX)),
+        );
+        for (finisher, damaged) in [(low, high), (high, low)] {
+            let (dir, store) = open_store();
+            put(
+                &store,
+                finisher,
+                1,
+                &run(8),
+                1,
+                T0,
+                "finished",
+                json!({"outcome": "stuck"}),
+                None,
+            );
+            let conn = rusqlite::Connection::open(dir.path().join("foundry.db")).unwrap();
+            conn.execute(
+                "INSERT INTO factory_records (kind, id, owner, version, record)
+                 VALUES ('run_event', ?1, ?2, 1, '{\"kind\":\"run_event\",\"later\":true}')",
+                rusqlite::params![format!("{}/{damaged}/1", run(8)), damaged.to_string()],
+            )
+            .unwrap();
+            let ledger = ledger(&store, MachineId::random(), 2, ticking(T0, 1000));
+            // The first write and every one after it.
+            for _ in 0..2 {
+                assert!(
+                    matches!(
+                        ledger.write(&run(8), &step("red"), &test_cause()),
+                        Err(LedgerError::Store(_))
+                    ),
+                    "finished by {finisher}"
+                );
+            }
+            assert!(
+                matches!(
+                    ledger.finish(&run(8), Outcome::Stuck, None, None, &test_cause(), None),
+                    Err(LedgerError::Store(_))
+                ),
+                "finished by {finisher}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_finished_event_synced_in_from_a_lower_writer_does_not_make_the_ledger_reread_the_others() {
+        let (_dir, store) = open_store();
+        let (low, high) = (
+            MachineId(uuid::Uuid::from_u128(1)),
+            MachineId(uuid::Uuid::from_u128(u128::MAX)),
+        );
+        for version in 1..=1000 {
+            put(
+                &store,
+                high,
+                version,
+                &run(8),
+                1,
+                T0,
+                "step_changed",
+                json!({}),
+                None,
+            );
+        }
+        let ledger = ledger(&store, MachineId::random(), 2, ticking(T0, 1000));
+        ledger.write(&run(8), &step("red"), &test_cause()).unwrap();
+        // A writer whose id sorts first finishes the run, and it syncs in.
+        put(
+            &store,
+            low,
+            1,
+            &run(8),
+            1,
+            T0,
+            "finished",
+            json!({"outcome": "stuck"}),
+            None,
+        );
+        let before = Store::run_rows_read();
+        assert!(matches!(
+            ledger.write(&run(8), &step("green"), &test_cause()),
+            Err(LedgerError::AlreadyFinished { .. })
+        ));
+        // The three writers' ids and the one new event: none of the others' events again.
+        assert_eq!(Store::run_rows_read() - before, 3 + 1);
+        assert_eq!(tally(&ledger, &run(8)), (true, Default::default()));
     }
 }

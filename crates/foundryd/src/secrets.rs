@@ -8,7 +8,7 @@
 //! never deleted, so a release that reads only the keychain still finds them. A secret's value
 //! never reaches an error message: errors name the secret or the file, never what it holds.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 #[cfg(any(target_os = "macos", test))]
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
@@ -196,20 +196,331 @@ pub fn github_default(secrets: &dyn Secrets) -> Option<String> {
 /// (whatever follows `github:`, a login or not), read at this call so a token set after the
 /// daemon started is hidden too, and then the passwords of URLs as [`redact`] hides them. When
 /// the store cannot be read, none of `text` is shown: [`HIDDEN_UNREADABLE`] is given instead.
+///
+/// A held value of at least [`SPLIT_MIN`] characters is hidden also when gaps sit inside it,
+/// as a tool that wraps to the terminal's width or colours part of a word leaves them, and is
+/// then matched on its characters that are no gap: each gap at most [`GAP_MAX`] characters of
+/// space, tab, LF, CR, VT, FF and NEL, the other C0 and C1 controls and DEL, the bidi and
+/// zero-width characters U+200B to U+200F, U+202A to U+202E, U+2066 to U+2069 and U+FEFF
+/// ([`is_gap`]; no other white space, bidi or zero-width character), and whole escape
+/// sequences. Any other value is hidden only whole.
+/// Only the span from the value's first character to its last becomes `***`; every other line
+/// and character of `text` stays as it was, and [`redact`] then reads the lines as they came.
 pub fn hide_known(text: &str, secrets: &dyn Secrets) -> String {
     match known_values(secrets) {
-        Ok(mut values) => {
-            // The longest first, so a token that is the start of another leaves no tail of it.
-            values.sort_by_key(|value| std::cmp::Reverse(value.len()));
-            let mut hidden = text.to_owned();
-            for value in values {
-                hidden = hidden.replace(&value, "***");
-            }
-            redact(&hidden)
-        }
+        Ok(values) => redact(&hide_values(text, &values, &mut 0)),
         Err(error) => {
             tracing::warn!(%error, "text hidden: the secret store could not be read");
             HIDDEN_UNREADABLE.to_owned()
+        }
+    }
+}
+
+/// A held value this many characters long, or longer, is hidden also with gaps inside it. A
+/// shorter one could too easily be put together from pieces of text that merely sit near each
+/// other, so it is hidden only whole.
+const SPLIT_MIN: usize = 16;
+
+/// The most characters one gap inside a held value may hold.
+const GAP_MAX: usize = 32;
+
+/// `text` with each span that holds one of `values` as `***`, read in one pass. Every value is
+/// looked for whole. One of at least [`SPLIT_MIN`] characters is looked for also as its
+/// characters that are no gap, with gaps between them ([`Split`]). Spans that overlap are hidden
+/// as one. `work` counts the characters read and the matchers' steps, so a test can bound them.
+fn hide_values(text: &str, values: &[String], work: &mut usize) -> String {
+    let values = values.iter().filter(|value| !value.is_empty());
+    let mut whole: Vec<(Pattern, usize)> = values
+        .clone()
+        .map(|value| (Pattern::new(value), 0))
+        .collect();
+    let mut split: Vec<Split> = values
+        .filter(|value| value.chars().count() >= SPLIT_MIN)
+        .map(|value| value.chars().filter(|c| !is_gap(*c)).collect::<String>())
+        .filter(|kept| !kept.is_empty())
+        .map(|kept| Split::new(&kept))
+        .collect();
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    for (at, c) in text.char_indices() {
+        *work += 1;
+        let end = at + c.len_utf8();
+        for (pattern, matched) in &mut whole {
+            *matched = pattern.next(*matched, c, work);
+            if *matched == pattern.value.len() {
+                spans.push((end - pattern.bytes, end));
+            }
+        }
+        if split.is_empty() {
+            continue;
+        }
+        let escape = if is_gap(c) {
+            escape(&text[at..], work)
+        } else {
+            None
+        };
+        for split in &mut split {
+            split.read(at, c, escape, &mut spans, work);
+        }
+    }
+    spans.sort_unstable();
+    let mut hidden = String::with_capacity(text.len());
+    // How much of `text` is in `hidden`, shown or hidden.
+    let mut done = 0;
+    for (start, end) in spans {
+        if start >= done {
+            hidden.push_str(&text[done..start]);
+            hidden.push_str("***");
+        }
+        done = done.max(end);
+    }
+    hidden.push_str(&text[done..]);
+    hidden
+}
+
+/// Finds one value in a text with gaps between its characters, every way the gaps can be read
+/// at once. An escape's introducer is a gap character itself, and the characters after it may
+/// be the value's own (`ESC a`, `CSI 9 j`), so at each introducer every partial match goes on
+/// both ways: with the introducer alone as a gap, and with the whole sequence as one. Partial
+/// matches of the same length are one, the one with the shorter gap since its last character
+/// kept, so there is at most one for each length from none to the whole value, and the text
+/// is read once. Each holds the places of the characters it has matched and no others, so
+/// what a `Split` holds is bounded by its value, never by the text. Each character costs a
+/// step for each partial match, and a fork also copies the places each one holds.
+struct Split {
+    pattern: Pattern,
+    /// The partial matches at the character being read.
+    states: Vec<State>,
+    /// For each length from none to the whole value, where in `states` the partial match of
+    /// that length is, if there is one.
+    at_length: Vec<Option<usize>>,
+    /// Partial matches that took a whole escape sequence as a gap, with the byte offset of
+    /// the character after it, where they go on.
+    waiting: Vec<(usize, State)>,
+}
+
+/// One partial match of a [`Split`].
+#[derive(Clone)]
+struct State {
+    /// The byte offset of each character of the value it has matched, in order: as many as
+    /// it has matched.
+    kept: VecDeque<usize>,
+    /// The characters of gap since the last character it kept.
+    gap: usize,
+}
+
+impl Split {
+    fn new(value: &str) -> Self {
+        let pattern = Pattern::new(value);
+        let mut at_length = vec![None; pattern.value.len() + 1];
+        at_length[0] = Some(0);
+        Self {
+            pattern,
+            states: vec![State {
+                kept: VecDeque::new(),
+                gap: 0,
+            }],
+            at_length,
+            waiting: Vec::new(),
+        }
+    }
+
+    /// Reads `c`, at byte `at`, where `escape` is the whole escape sequence that starts there,
+    /// if any, and adds the span of each match that ends with it to `spans`.
+    fn read(
+        &mut self,
+        at: usize,
+        c: char,
+        escape: Option<(usize, usize)>,
+        spans: &mut Vec<(usize, usize)>,
+        work: &mut usize,
+    ) {
+        let mut i = 0;
+        while i < self.waiting.len() {
+            *work += 1;
+            if self.waiting[i].0 == at {
+                let (_, state) = self.waiting.swap_remove(i);
+                self.insert(state, work);
+            } else {
+                i += 1;
+            }
+        }
+        let states = std::mem::take(&mut self.states);
+        for state in &states {
+            self.at_length[state.kept.len()] = None;
+        }
+        for mut state in states {
+            *work += 1;
+            if is_gap(c) {
+                if let Some((bytes, chars)) = escape {
+                    *work += state.kept.len();
+                    self.waiting
+                        .push((at + bytes, gapped(state.clone(), chars)));
+                }
+                state = gapped(state, 1);
+            } else {
+                let matched = self.pattern.next(state.kept.len(), c, work);
+                state.gap = 0;
+                state.kept.push_back(at);
+                while state.kept.len() > matched {
+                    *work += 1;
+                    state.kept.pop_front();
+                }
+                if matched == self.pattern.value.len() {
+                    spans.push((state.kept[0], at + c.len_utf8()));
+                }
+            }
+            self.insert(state, work);
+        }
+    }
+
+    /// Adds `state` to the partial matches, as one with any of the same length, found in one
+    /// step. `work` counts the partial matches looked at.
+    fn insert(&mut self, state: State, work: &mut usize) {
+        *work += 1;
+        let length = state.kept.len();
+        match self.at_length[length] {
+            Some(i) if state.gap < self.states[i].gap => self.states[i] = state,
+            Some(_) => {}
+            None => {
+                self.at_length[length] = Some(self.states.len());
+                self.states.push(state);
+            }
+        }
+    }
+
+    /// How many places of matched characters the partial matches hold, waiting ones too.
+    #[cfg(test)]
+    fn held(&self) -> usize {
+        let waiting = self.waiting.iter().map(|(_, state)| state.kept.len());
+        let states = self.states.iter().map(|state| state.kept.len());
+        waiting.chain(states).sum()
+    }
+}
+
+/// `state` after a gap of `chars` more characters: a gap longer than [`GAP_MAX`] ends its
+/// partial match.
+fn gapped(mut state: State, chars: usize) -> State {
+    state.gap += chars;
+    if state.gap > GAP_MAX {
+        state.kept.clear();
+        state.gap = 0;
+    }
+    state
+}
+
+/// Whether `c` may sit in a gap inside a held value: space, the C0 and C1 controls (tab, LF,
+/// CR, VT, FF and NEL among them) and DEL, and the bidi and zero-width characters U+200B to
+/// U+200F, U+202A to U+202E, U+2066 to U+2069 and U+FEFF. The
+/// introducer of an escape sequence is one, and a whole sequence is a gap of its own length
+/// ([`escape`]).
+fn is_gap(c: char) -> bool {
+    matches!(
+        c,
+        ' ' | '\u{0}'..='\u{1f}'
+            | '\u{7f}'..='\u{9f}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{feff}'
+    )
+}
+
+/// The length, in bytes and in characters, of the whole ECMA-48 escape sequence `rest` starts
+/// with: a control sequence (`ESC [` or CSI), a control string (`ESC ]`, `P`, `X`, `^`, `_`
+/// or their C1 forms, ended by BEL, ST or `ESC \`), or an escape with its intermediates.
+/// `None` when `rest` starts with none, or with one not whole within [`GAP_MAX`] characters,
+/// which no gap could hold. `work` counts the characters read.
+fn escape(rest: &str, work: &mut usize) -> Option<(usize, usize)> {
+    #[derive(Clone, Copy)]
+    enum Part {
+        Start,
+        Esc,
+        Intermediates,
+        Csi { intermediates: bool },
+        Text,
+        TextEsc,
+    }
+    let mut part = Part::Start;
+    for (read, (at, c)) in rest.char_indices().take(GAP_MAX).enumerate() {
+        *work += 1;
+        let whole = Some((at + c.len_utf8(), read + 1));
+        part = match (part, c) {
+            (Part::Start, '\u{1b}') => Part::Esc,
+            (Part::Start, '\u{9b}') | (Part::Esc, '[') => Part::Csi {
+                intermediates: false,
+            },
+            (Part::Start, '\u{90}' | '\u{98}' | '\u{9d}'..='\u{9f}')
+            | (Part::Esc, ']' | 'P' | 'X' | '^' | '_') => Part::Text,
+            (Part::Esc | Part::Intermediates, '\u{20}'..='\u{2f}') => Part::Intermediates,
+            (Part::Esc | Part::Intermediates, '\u{30}'..='\u{7e}') => return whole,
+            (
+                Part::Csi {
+                    intermediates: false,
+                },
+                '\u{30}'..='\u{3f}',
+            ) => part,
+            (Part::Csi { .. }, '\u{20}'..='\u{2f}') => Part::Csi {
+                intermediates: true,
+            },
+            (Part::Csi { .. }, '\u{40}'..='\u{7e}') => return whole,
+            (Part::Text, '\u{7}' | '\u{9c}') | (Part::TextEsc, '\\') => return whole,
+            (Part::Text, '\u{1b}') => Part::TextEsc,
+            (Part::Text, '\u{8}'..='\u{d}') => part,
+            (Part::Text, c) if !matches!(c, '\u{0}'..='\u{1f}' | '\u{7f}'..='\u{9f}') => part,
+            _ => return None,
+        };
+    }
+    None
+}
+
+/// One value to find in a stream of characters, each read once (Knuth, Morris and Pratt): a
+/// match never goes back in the text, only along the value.
+struct Pattern {
+    value: Vec<char>,
+    /// The value's length in bytes.
+    bytes: usize,
+    /// For each `i`, the length of the longest start of the value, shorter than `i + 1`, that
+    /// `value[..=i]` ends with.
+    back: Vec<usize>,
+}
+
+impl Pattern {
+    /// The pattern of `value`, which is not empty.
+    fn new(value: &str) -> Self {
+        let value: Vec<char> = value.chars().collect();
+        let mut back = vec![0; value.len()];
+        let mut k = 0;
+        for i in 1..value.len() {
+            while k > 0 && value[i] != value[k] {
+                k = back[k - 1];
+            }
+            if value[i] == value[k] {
+                k += 1;
+            }
+            back[i] = k;
+        }
+        Self {
+            bytes: value.iter().map(|c| c.len_utf8()).sum(),
+            value,
+            back,
+        }
+    }
+
+    /// How many of the value's first characters a stream ends with, when it ended with
+    /// `matched` of them (the whole value, at most) and then `c`. `work` counts the steps.
+    fn next(&self, mut matched: usize, c: char, work: &mut usize) -> usize {
+        if matched == self.value.len() {
+            matched = self.back[matched - 1];
+        }
+        loop {
+            *work += 1;
+            if self.value[matched] == c {
+                return matched + 1;
+            }
+            if matched == 0 {
+                return 0;
+            }
+            matched = self.back[matched - 1];
         }
     }
 }
@@ -1792,5 +2103,708 @@ mod tests {
         let text = logged.text();
         assert!(text.contains("could not be read"), "{text}");
         assert!(!text.contains("ghp_unreadable"), "{text}");
+    }
+
+    /// A 40-character token, as a classic `ghp_` one is.
+    const TOKEN: &str = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
+
+    /// A store holding `TOKEN` for `octocat`.
+    fn holding_token() -> MemorySecrets {
+        let secrets = MemorySecrets::default();
+        secrets.set("github:octocat", TOKEN).unwrap();
+        secrets
+    }
+
+    /// `TOKEN` with `gap` after its 20th character, in a text with lines of its own around it,
+    /// is hidden, and only that span is replaced.
+    fn hidden_across(gap: &str) {
+        let secrets = holding_token();
+        let (head, tail) = TOKEN.split_at(20);
+        let text = format!("before\r\n\tline\nexport T={head}{gap}{tail} # set\nafter\u{7}\n");
+        assert_eq!(
+            hide_known(&text, &secrets),
+            "before\r\n\tline\nexport T=*** # set\nafter\u{7}\n",
+            "{gap:?}"
+        );
+    }
+
+    #[test]
+    fn hide_known_hides_a_token_split_by_a_space() {
+        hidden_across(" ");
+    }
+
+    #[test]
+    fn hide_known_hides_a_token_split_by_a_tab() {
+        hidden_across("\t");
+    }
+
+    #[test]
+    fn hide_known_hides_a_token_split_by_a_line_feed() {
+        hidden_across("\n");
+    }
+
+    #[test]
+    fn hide_known_hides_a_token_split_by_a_carriage_return() {
+        hidden_across("\r");
+    }
+
+    #[test]
+    fn hide_known_hides_a_token_split_by_a_crlf() {
+        hidden_across("\r\n");
+    }
+
+    #[test]
+    fn hide_known_hides_a_token_split_by_a_vertical_tab() {
+        hidden_across("\u{b}");
+    }
+
+    #[test]
+    fn hide_known_hides_a_token_split_by_a_form_feed() {
+        hidden_across("\u{c}");
+    }
+
+    #[test]
+    fn hide_known_hides_a_token_split_by_a_next_line() {
+        hidden_across("\u{85}");
+    }
+
+    #[test]
+    fn hide_known_hides_a_token_split_by_a_bell() {
+        hidden_across("\u{7}");
+    }
+
+    #[test]
+    fn hide_known_hides_a_token_split_by_a_zero_width_character() {
+        hidden_across("\u{200b}");
+    }
+
+    #[test]
+    fn hide_known_hides_a_token_split_by_a_colour_sequence() {
+        hidden_across("\u{1b}[31m");
+    }
+
+    #[test]
+    fn hide_known_hides_a_token_split_by_the_other_gap_characters() {
+        // DEL, the C0 and C1 controls, the bidi and zero-width ranges at both ends, and the
+        // other whole escape sequences: an 8-bit CSI, a character set, a two-character escape
+        // and an OSC hyperlink.
+        for gap in [
+            "\u{7f}",
+            "\u{0}",
+            "\u{1f}",
+            "\u{80}",
+            "\u{9f}",
+            "\u{200f}",
+            "\u{202a}",
+            "\u{202e}",
+            "\u{2066}",
+            "\u{2069}",
+            "\u{feff}",
+            "\u{9b}1;32m",
+            "\u{1b}(B",
+            "\u{1b}7",
+            "\u{1b}]8;;http://x\u{7}",
+            "\u{1b}]8;;\u{1b}\\",
+            "\u{1b}]8;;http://x\n\u{7}",
+            "\u{1b}]0;t\tx\u{1b}\\",
+            "\u{1b}[1 q",
+            " \u{1b}[0m\n  ",
+        ] {
+            hidden_across(gap);
+        }
+    }
+
+    #[test]
+    fn hide_known_hides_a_token_with_two_gaps_inside_it() {
+        let secrets = holding_token();
+        let text = format!(
+            "x {}\u{1b}[31m{}\u{1b}[0m{} y",
+            &TOKEN[..10],
+            &TOKEN[10..25],
+            &TOKEN[25..]
+        );
+        assert_eq!(hide_known(&text, &secrets), "x *** y");
+    }
+
+    #[test]
+    fn hide_known_hides_a_93_character_token_wrapped_twice() {
+        let secrets = MemorySecrets::default();
+        let token = format!("github_pat_{}", "A1b2C3d4E5".repeat(9).get(..82).unwrap());
+        assert_eq!(token.len(), 93);
+        secrets.set("github:octocat", &token).unwrap();
+        let text = format!(
+            "$ env\nGH_TOKEN={}\n{}\n{}\nHOME=/home/me\n",
+            &token[..31],
+            &token[31..71],
+            &token[71..]
+        );
+        assert_eq!(
+            hide_known(&text, &secrets),
+            "$ env\nGH_TOKEN=***\nHOME=/home/me\n"
+        );
+    }
+
+    #[test]
+    fn hide_known_hides_a_token_wrapped_with_an_indent() {
+        hidden_across("\n    ");
+    }
+
+    #[test]
+    fn hide_known_hides_the_gateway_keys_across_a_gap_too() {
+        let secrets = MemorySecrets::default();
+        secrets.set(GATEWAY, "sk-gw-0123456789abcdef").unwrap();
+        secrets
+            .set(GATEWAY_MANAGEMENT, "sk-gm-0123456789abcdef")
+            .unwrap();
+        let text = "a sk-gw-01234\n56789abcdef b sk-gm-0123456789\tabcdef c";
+        assert_eq!(hide_known(text, &secrets), "a *** b *** c");
+    }
+
+    #[test]
+    fn hide_known_matches_across_a_gap_of_32_characters_and_no_more() {
+        let secrets = holding_token();
+        let (head, tail) = TOKEN.split_at(20);
+        let gap = " ".repeat(32);
+        assert_eq!(
+            hide_known(&format!("<{head}{gap}{tail}>"), &secrets),
+            "<***>"
+        );
+        // An escape sequence counts each of its characters.
+        let gap = format!("\u{1b}[{}1m", "1;".repeat(14));
+        assert_eq!(gap.chars().count(), 32);
+        assert_eq!(
+            hide_known(&format!("<{head}{gap}{tail}>"), &secrets),
+            "<***>"
+        );
+        for gap in [" ".repeat(33), format!("\u{1b}[{}m", "1;".repeat(15))] {
+            let text = format!("<{head}{gap}{tail}>");
+            assert_eq!(hide_known(&text, &secrets), text, "{gap:?}");
+        }
+    }
+
+    #[test]
+    fn hide_known_does_not_match_across_a_character_that_is_no_gap() {
+        let secrets = holding_token();
+        let (head, tail) = TOKEN.split_at(20);
+        // `|` prefixes a line, and is no gap; nor is a no-break space or a line separator. A
+        // control sequence with a parameter after an intermediate is not one whole sequence.
+        for gap in [
+            "\n| ",
+            "\u{a0}",
+            "\u{2028}",
+            "\u{1b}[31",
+            "\u{1b}[1 1q",
+            "x",
+        ] {
+            let text = format!("{head}{gap}{tail}");
+            assert_eq!(hide_known(&text, &secrets), text, "{gap:?}");
+        }
+    }
+
+    #[test]
+    fn hide_known_hides_a_value_shorter_than_16_characters_only_whole() {
+        let secrets = MemorySecrets::default();
+        secrets.set("github:short", "ghp_0123456789a").unwrap();
+        secrets.set("github:edge", "ghp_abcdefghijkl").unwrap();
+        assert_eq!("ghp_0123456789a".len(), 15);
+        assert_eq!("ghp_abcdefghijkl".len(), 16);
+        let split = "a ghp_01234\n56789a b";
+        assert_eq!(hide_known(split, &secrets), split);
+        assert_eq!(hide_known("a ghp_0123456789a b", &secrets), "a *** b");
+        assert_eq!(hide_known("a ghp_abcd\nefghijkl b", &secrets), "a *** b");
+    }
+
+    #[test]
+    fn hide_known_hides_a_value_with_gap_characters_of_its_own_across_other_gaps() {
+        let secrets = MemorySecrets::default();
+        // At least 16 characters, counting its own spaces: matched across gaps, on the
+        // characters of it that are no gap.
+        secrets.set(GATEWAY, "a key with spaces in it").unwrap();
+        secrets
+            .set(GATEWAY_MANAGEMENT, "a b c d e f g h i")
+            .unwrap();
+        assert_eq!("a b c d e f g h i".len(), 17);
+        assert_eq!(hide_known("[a key with spaces in it]", &secrets), "[***]");
+        assert_eq!(
+            hide_known("[a key with\n  spaces in it]", &secrets),
+            "[***]"
+        );
+        assert_eq!(
+            hide_known("[a key\u{7}with spaces in it]", &secrets),
+            "[***]"
+        );
+        assert_eq!(hide_known("[a b c d e f g h i]", &secrets), "[***]");
+        assert_eq!(hide_known("[a b c d\ne f g h i]", &secrets), "[***]");
+        // A value of gap characters only is hidden whole, and nothing else of it.
+        let secrets = MemorySecrets::default();
+        secrets.set(GATEWAY, &" ".repeat(20)).unwrap();
+        assert_eq!(
+            hide_known(&format!("[{}]", " ".repeat(20)), &secrets),
+            "[***]"
+        );
+        assert_eq!(hide_known("[a b]", &secrets), "[a b]");
+    }
+
+    #[test]
+    fn hide_known_leaves_lines_that_only_join_into_a_url_password_as_they_are() {
+        let secrets = holding_token();
+        let text = "fetching https://registry.example.com\nadmin@example.com wrote\r\n\tok\u{7}";
+        assert_eq!(hide_known(text, &secrets), text);
+        // A URL password on one line is still hidden, beside a split token.
+        let (head, tail) = TOKEN.split_at(20);
+        let text = format!("https://u:pw123@h/x\n{head}\n{tail}\n");
+        assert_eq!(hide_known(&text, &secrets), "https://***@h/x\n***\n");
+    }
+
+    #[test]
+    fn hide_known_leaves_a_pull_request_link_a_commit_id_and_an_unheld_key_whole() {
+        let secrets = holding_token();
+        secrets.set(GATEWAY, "sk-0123456789abcdefABCDEF").unwrap();
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        let key = "Zx9-Qw8_Er7Ty6Ui5Op4As3Df2Gh1J";
+        assert_eq!((commit.len(), key.len()), (40, 30));
+        let text = format!(
+            "see https://github.com/original-solutions/foundry/pull/134\n\
+             at {commit}\nwith {key}\n and ghp_A1b2C3d4E5\n"
+        );
+        assert_eq!(hide_known(&text, &secrets), text);
+    }
+
+    #[test]
+    fn hide_known_hides_a_value_near_the_end_of_64_kb_in_one_pass() {
+        // Near misses all through: the token's head, and a long run of the one character a
+        // value repeats, each cut short by a gap or a stray escape. A matcher that went back
+        // to the next place a match could start would read each run once for each of its
+        // characters.
+        let value = format!("{}b", "a".repeat(63));
+        let (head, _) = TOKEN.split_at(39);
+        let runs = "a".repeat(40);
+        let mut text = String::new();
+        let mut n = 0;
+        while text.len() < 64 * 1024 - 300 {
+            text.push_str([head, runs.as_str()][n % 2]);
+            text.push_str(
+                [
+                    "\n  ",
+                    "\u{1b}[1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;\n",
+                    " ",
+                    "\u{1b}[1;2;3;",
+                    "\u{1b}",
+                ][n % 5],
+            );
+            n += 1;
+        }
+        text.push_str(&format!(
+            "\nT={}\n{}\nV={}\u{1b}[0m{}\nend",
+            &TOKEN[..12],
+            &TOKEN[12..],
+            &value[..30],
+            &value[30..]
+        ));
+        assert!(text.len() <= 64 * 1024);
+        let values = vec![
+            TOKEN.to_owned(),
+            value.clone(),
+            "sk-0123456789abcdefABCDEF".to_owned(),
+            "short1".to_owned(),
+        ];
+        let mut work = 0;
+        let hidden = hide_values(&text, &values, &mut work);
+        assert!(
+            hidden.ends_with("\nT=***\nV=***\nend"),
+            "{}",
+            &hidden[hidden.len() - 80..]
+        );
+        assert!(!hidden.contains(TOKEN));
+        // Each character is read a bounded number of times for each value: linear in the text,
+        // never a pass per place a match could start.
+        let bound = 6 * text.chars().count() * (values.len() + 1);
+        assert!(work <= bound, "{work} steps for {} characters", text.len());
+    }
+
+    #[test]
+    fn hide_known_hides_a_token_split_by_a_lone_escape_or_c1_introducer() {
+        // A lone ESC or C1 control is a gap of its own, even where the characters after it
+        // could also be read as the rest of an escape sequence: `ESC I`, `CSI 9 j`.
+        for at in [20, 21] {
+            let secrets = holding_token();
+            let (head, tail) = TOKEN.split_at(at);
+            for gap in ["\u{1b}", "\u{9b}", "\u{1b}\u{1b}", " \u{1b}"] {
+                let text = format!("<{head}{gap}{tail}>");
+                assert_eq!(hide_known(&text, &secrets), "<***>", "{at} {gap:?}");
+            }
+            // A C1 string introducer with a terminator after the token.
+            for gap in ["\u{90}", "\u{98}", "\u{9d}", "\u{9e}", "\u{9f}"] {
+                for end in ["\u{7}", "\u{9c}", "\u{1b}\\"] {
+                    let text = format!("<{head}{gap}{tail}{end}>");
+                    assert_eq!(
+                        hide_known(&text, &secrets),
+                        format!("<***{end}>"),
+                        "{at} {gap:?} {end:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hide_known_hides_a_token_with_a_whole_sequence_and_a_lone_introducer_inside_it() {
+        // Each gap read its own way: `ESC K` after a colour sequence is a lone ESC before the
+        // token's `K`, though it could be read as a whole two-character escape.
+        let secrets = holding_token();
+        for (a, b) in [(14, 24), (10, 30)] {
+            let (one, two, three) = (&TOKEN[..a], &TOKEN[a..b], &TOKEN[b..]);
+            for sequence in ["\u{1b}[31m", "\u{1b}(B", "\u{1b}]8;;x\u{7}", "\u{9b}0m"] {
+                for lone in ["\u{1b}", "\u{9b}", "\u{1b}[0m\u{1b}"] {
+                    for text in [
+                        format!("<{one}{sequence}{two}{lone}{three}>"),
+                        format!("<{one}{lone}{two}{sequence}{three}>"),
+                    ] {
+                        assert_eq!(hide_known(&text, &secrets), "<***>", "{text:?}");
+                    }
+                }
+                let text = format!("<{one}{sequence}{two}\u{90}{three}\u{7}>");
+                assert_eq!(hide_known(&text, &secrets), "<***\u{7}>", "{text:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn hide_known_caps_each_gap_inside_a_token_not_their_sum() {
+        let secrets = holding_token();
+        // Three gaps of 31 characters each, after 40 characters of gap before the token.
+        let g = format!("{}\u{1b}[38;5;208m", " ".repeat(20));
+        assert_eq!(g.chars().count(), 31);
+        let lead = " \n".repeat(20);
+        let text = format!(
+            "{lead}<{}{g}{}{g}{}{g}{}>",
+            &TOKEN[..10],
+            &TOKEN[10..20],
+            &TOKEN[20..30],
+            &TOKEN[30..]
+        );
+        assert_eq!(hide_known(&text, &secrets), format!("{lead}<***>"));
+        // 31 characters of gap right before the token, and an indented wrap inside it.
+        let text = format!("{}{}\n    {}", " ".repeat(31), &TOKEN[..20], &TOKEN[20..]);
+        assert_eq!(
+            hide_known(&text, &secrets),
+            format!("{}***", " ".repeat(31))
+        );
+    }
+
+    #[test]
+    fn hide_known_counts_spaces_and_an_escape_in_one_gap_together() {
+        let secrets = holding_token();
+        let (head, tail) = TOKEN.split_at(20);
+        assert_eq!(tail.as_bytes()[0], b'I');
+        // 27 spaces and a 5-character colour sequence: 32 characters.
+        let gap = format!("{}\u{1b}[31m", " ".repeat(27));
+        assert_eq!(
+            hide_known(&format!("<{head}{gap}{tail}>"), &secrets),
+            "<***>"
+        );
+        // 28 spaces and the same sequence: 33.
+        let text = format!("<{head}{}\u{1b}[31m{tail}>", " ".repeat(28));
+        assert_eq!(hide_known(&text, &secrets), text);
+        // 31 spaces and a lone ESC before `I`, which also reads as the escape `ESC I`: 32.
+        let gap = format!("{}\u{1b}", " ".repeat(31));
+        assert_eq!(
+            hide_known(&format!("<{head}{gap}{tail}>"), &secrets),
+            "<***>"
+        );
+        let text = format!("<{head}{}\u{1b}{tail}>", " ".repeat(32));
+        assert_eq!(hide_known(&text, &secrets), text);
+    }
+
+    #[test]
+    fn a_split_keeps_only_the_characters_a_partial_match_can_still_use() {
+        // Texts that keep a partial match alive all the way through, and log-like text with
+        // near misses, each with the token split near the end.
+        let token_lines = format!("{TOKEN}\n").repeat(1500);
+        let long_escape = format!("{}\u{1b}]{}\u{7}x", &TOKEN[..39], "y".repeat(25));
+        for (name, filler) in [
+            ("g", "g".to_owned()),
+            ("g space", "g ".to_owned()),
+            ("ghp_", "ghp_".to_owned()),
+            ("tokens", token_lines),
+            ("escape", long_escape),
+            (
+                "log",
+                "2026-11-24 compiling foundryd ghp_A1b2 \u{1b}[32mok\u{1b}[0m\n".to_owned(),
+            ),
+        ] {
+            let mut text = String::new();
+            while text.len() < 64 * 1024 - 200 {
+                text.push_str(&filler);
+            }
+            text.push_str(&format!("\nT={}\n{}\n", &TOKEN[..20], &TOKEN[20..]));
+            let mut split = Split::new(TOKEN);
+            let (mut spans, mut work, mut most) = (Vec::new(), 0, 0);
+            for (at, c) in text.char_indices() {
+                let escape = if is_gap(c) {
+                    escape(&text[at..], &mut work)
+                } else {
+                    None
+                };
+                split.read(at, c, escape, &mut spans, &mut work);
+                most = most.max(split.held());
+            }
+            assert!(
+                spans.contains(&(text.len() - 42, text.len() - 1)),
+                "{name}: {spans:?}"
+            );
+            assert!(most <= 2 * TOKEN.len(), "{name}: {most} characters held");
+        }
+    }
+
+    #[test]
+    fn hide_known_keeps_the_reading_with_the_shorter_gap_when_two_meet() {
+        // At `\u{9d}a\u{7}` the partial match `aaaaaaaa` goes on two ways and both reach the
+        // same length: past the whole control string (a gap of 3), and with the lone C1
+        // introducer as the gap and the string's `a` as one of its own (a gap of 1 since). Only
+        // the second leaves room for 31 more characters of gap within 32.
+        let secrets = MemorySecrets::default();
+        secrets.set(GATEWAY, "aaaaaaaabcdefghi").unwrap();
+        let text = format!("<aaaaaaaa\u{9d}a\u{7}{}bcdefghi>", " ".repeat(31));
+        assert_eq!(hide_known(&text, &secrets), "<a***>");
+        let text = format!("<aaaaaaaa\u{9d}a\u{7}{}bcdefghi>", " ".repeat(32));
+        assert_eq!(hide_known(&text, &secrets), text);
+    }
+
+    #[test]
+    fn hide_known_hides_a_value_that_overlaps_itself() {
+        let secrets = MemorySecrets::default();
+        secrets.set(GATEWAY, "ghp_abcghp_abcghp_xyz0").unwrap();
+        secrets
+            .set(GATEWAY_MANAGEMENT, "abcabcabcabcabcabc")
+            .unwrap();
+        // The text starts with a partial match that is the value's own start, again.
+        assert_eq!(
+            hide_known("ghp_abcghp_abcghp_abcghp_abcghp_xyz0", &secrets),
+            "ghp_abcghp_abc***"
+        );
+        assert_eq!(
+            hide_known("ghp_abcghp_abcghp_abcghp_a\nbcghp_xyz0.", &secrets),
+            "ghp_abcghp_abc***."
+        );
+        // Two matches that overlap are hidden as one.
+        assert_eq!(hide_known("<abcabcabcabcabcabcabc>", &secrets), "<***>");
+        assert_eq!(hide_known("<abcabcabc\tabcabcabcabc>", &secrets), "<***>");
+    }
+
+    #[test]
+    fn hide_known_hides_held_values_that_hold_or_overlap_each_other_as_one_span() {
+        // A held value that is the start of another, and one that is its end.
+        let secrets = holding_token();
+        let (head, tail) = TOKEN.split_at(20);
+        secrets.set("github:head", head).unwrap();
+        secrets.set("github:tail", tail).unwrap();
+        for text in [
+            format!("<{TOKEN}>"),
+            format!("<{head}\n{tail}>"),
+            format!("<{}\u{1b}[31m{}>", &TOKEN[..10], &TOKEN[10..]),
+            format!("<{}\n{}\n{}>", &TOKEN[..15], &TOKEN[15..25], &TOKEN[25..]),
+        ] {
+            assert_eq!(hide_known(&text, &secrets), "<***>", "{text:?}");
+        }
+        assert_eq!(
+            hide_known(&format!("<{head}> <{tail}>"), &secrets),
+            "<***> <***>"
+        );
+        let text = format!(
+            "<{}\n{}> <{}\t{}>",
+            &head[..8],
+            &head[8..],
+            &tail[..9],
+            &tail[9..]
+        );
+        assert_eq!(hide_known(&text, &secrets), "<***> <***>");
+        // Two held values that overlap in the text are one span, and nothing of either is left.
+        let secrets = MemorySecrets::default();
+        secrets.set(GATEWAY, "Aa1Bb2Cc3Dd4Ee5Ff6Gg").unwrap();
+        secrets
+            .set(GATEWAY_MANAGEMENT, "Ff6Gg7Hh8Ii9Jj0Kk1Ll")
+            .unwrap();
+        for text in [
+            "<Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0Kk1Ll>",
+            "<Aa1Bb2Cc3Dd4Ee5Ff\n6Gg7Hh8Ii9Jj0Kk1Ll>",
+            "<Aa1Bb2Cc3\tDd4Ee5Ff6Gg7Hh8Ii9Jj0K\u{1b}[0mk1Ll>",
+        ] {
+            assert_eq!(hide_known(text, &secrets), "<***>", "{text:?}");
+        }
+    }
+
+    #[test]
+    fn hide_known_replaces_exactly_the_matched_span_wherever_the_gap_falls() {
+        // Every place a gap can fall inside the token, beside characters the token starts or
+        // ends with, gap characters, escape sequences and characters of more than one byte:
+        // the token goes whole and nothing around it does.
+        let secrets = holding_token();
+        for at in 1..TOKEN.len() {
+            let (head, tail) = TOKEN.split_at(at);
+            for gap in ["\n", " \u{1b}[31m", "\u{200b}"] {
+                for (before, after) in [
+                    ("gg", "88"),
+                    (" \n", "\r\n "),
+                    ("é", "€"),
+                    ("\u{1b}[0m", "\u{1b}[0m"),
+                ] {
+                    let text = format!("{before}{head}{gap}{tail}{after}");
+                    assert_eq!(
+                        hide_known(&text, &secrets),
+                        format!("{before}***{after}"),
+                        "{text:?}"
+                    );
+                }
+            }
+        }
+        // The opposite failure: with any one of its characters changed, the token is no match,
+        // and nothing is hidden.
+        for at in 0..TOKEN.len() {
+            let mut changed = TOKEN.to_owned();
+            changed.replace_range(at..=at, "#");
+            let (head, tail) = changed.split_at(20);
+            for gap in ["", "\n", " \u{1b}[31m"] {
+                let text = format!("gg{head}{gap}{tail}88");
+                assert_eq!(hide_known(&text, &secrets), text, "{text:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn hide_known_logs_nothing_of_what_it_hides() {
+        let logged = crate::test_log::Logged::default();
+        let _guard = logged.capture();
+        let secrets = holding_token();
+        let (head, tail) = TOKEN.split_at(20);
+        let text = format!("a {head}\u{1b}[31m{tail} b {TOKEN} c ghp_A1b2C3d4E5");
+        assert_eq!(hide_known(&text, &secrets), "a *** b *** c ghp_A1b2C3d4E5");
+        assert_eq!(logged.text(), "");
+    }
+
+    #[test]
+    fn hide_known_reads_64_kb_of_gap_characters_in_bounded_work() {
+        let values = vec![TOKEN.to_owned()];
+        for unit in [
+            " ",
+            "\n",
+            "\u{7}",
+            "\u{1b}",
+            "\u{9b}",
+            "\u{1b}[",
+            "\u{1b}[1;",
+            "\u{1b}]",
+            "\u{1b}]8;;x",
+            "\u{90}",
+            "\u{200b}",
+        ] {
+            let mut text = String::new();
+            while text.len() < 64 * 1024 - 100 {
+                text.push_str(unit);
+            }
+            text.push_str(&format!("\n{}\n{}\n", &TOKEN[..20], &TOKEN[20..]));
+            let mut work = 0;
+            let hidden = hide_values(&text, &values, &mut work);
+            assert!(hidden.ends_with("\n***\n"), "{unit:?}");
+            let bound = 8 * text.chars().count() * (values.len() + 1);
+            assert!(work <= bound, "{unit:?}: {work} steps");
+        }
+    }
+
+    /// The steps `hide_values` takes on `text`, and the most places of matched characters
+    /// that each value's [`Split`] holds at once, summed over the values.
+    fn work_and_held(text: &str, values: &[String]) -> (usize, usize) {
+        let mut work = 0;
+        hide_values(text, values, &mut work);
+        let mut held = 0;
+        for value in values {
+            let mut split = Split::new(value);
+            let (mut spans, mut steps, mut most) = (Vec::new(), 0, 0);
+            for (at, c) in text.char_indices() {
+                let escape = if is_gap(c) {
+                    escape(&text[at..], &mut steps)
+                } else {
+                    None
+                };
+                split.read(at, c, escape, &mut spans, &mut steps);
+                most = most.max(split.held());
+            }
+            held += most;
+        }
+        (work, held)
+    }
+
+    #[test]
+    fn partial_matches_that_fork_at_every_escape_keep_the_work_linear_in_the_text() {
+        // Each `ESC x` reads two ways: a lone ESC before the value's own `x`, and a whole
+        // two-character escape. A value that repeats itself, or one the text spells out with an
+        // ESC before each character, so keeps a partial match of nearly every length alive.
+        let spelled: String = TOKEN.chars().flat_map(|c| ['\u{1b}', c]).collect();
+        let tokens: Vec<String> = (0..50)
+            .map(|i| format!("ghp_{i:02}A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7"))
+            .collect();
+        for (name, unit, values) in [
+            ("a", "\u{1b}a".to_owned(), vec!["a".repeat(64)]),
+            ("ab", "\u{1b}a\u{1b}b".to_owned(), vec!["ab".repeat(32)]),
+            ("csi", "\u{9b}a".to_owned(), vec!["a".repeat(64)]),
+            ("spelled", spelled, vec![TOKEN.to_owned()]),
+            ("tokens", "\u{1b}g\u{1b}h\u{1b}p\u{1b}_".to_owned(), tokens),
+        ] {
+            let fill = |bytes: usize| {
+                let mut text = String::new();
+                while text.len() + unit.len() <= bytes {
+                    text.push_str(&unit);
+                }
+                text
+            };
+            let (short, long) = (fill(16 * 1024), fill(64 * 1024));
+            let (short_work, short_held) = work_and_held(&short, &values);
+            let (long_work, long_held) = work_and_held(&long, &values);
+            let (short_chars, long_chars) = (short.chars().count(), long.chars().count());
+            // Four times the characters is about four times the work.
+            assert!(
+                long_work * short_chars <= short_work * long_chars * 11 / 10,
+                "{name}: {short_work} steps for {short_chars}, {long_work} for {long_chars}"
+            );
+            // What the matchers hold is bounded by the values, never by the text.
+            assert_eq!(long_held, short_held, "{name}");
+            let most: usize = values
+                .iter()
+                .map(|value| (value.chars().count() + 1).pow(2))
+                .sum();
+            assert!(short_held <= most, "{name}: {short_held} held");
+            // A character costs at most each value's length squared: a fork copies the places
+            // each partial match holds.
+            assert!(
+                long_work <= long_chars * most,
+                "{name}: {long_work} steps for {long_chars} characters"
+            );
+        }
+    }
+
+    #[test]
+    fn a_character_costs_work_in_proportion_to_the_partial_matches_held_not_their_square() {
+        // Forks at `ESC a` keep a partial match of nearly every length of `a`s alive. One more
+        // `a` moves each of them on once, and finds each its place among the others in a step.
+        let mut split = Split::new(&"a".repeat(64));
+        let text = "\u{1b}a".repeat(100);
+        let (mut spans, mut work) = (Vec::new(), 0);
+        for (at, c) in text.char_indices() {
+            let escape = if is_gap(c) {
+                escape(&text[at..], &mut work)
+            } else {
+                None
+            };
+            split.read(at, c, escape, &mut spans, &mut work);
+        }
+        let held = split.states.len() + split.waiting.len();
+        assert!(held >= 64, "{held} partial matches");
+        let before = work;
+        split.read(text.len(), 'a', None, &mut spans, &mut work);
+        assert!(
+            work - before <= 6 * (held + 1),
+            "{} steps for {held} partial matches",
+            work - before
+        );
     }
 }

@@ -516,14 +516,26 @@ impl Cause {
         self.cleaned_with(&|text: &str| text.to_owned())
     }
 
-    /// [`cleaned`](Self::cleaned), with every text through `hide` before it is cut, so a cut
-    /// never leaves part of a secret that `hide` would no longer recognise. `hide` sees the text
-    /// as given and again once its control characters are gone, so one placed inside a secret
-    /// cannot keep it from being hidden.
+    /// [`cleaned`](Self::cleaned), with every text through `hide` as given, before it is
+    /// stripped or cut, so neither can leave part of a secret that `hide` would no longer
+    /// recognise. A control character, a space or a line break inside a secret is `hide`'s to
+    /// see past (`secrets::hide_known` matches a held value across such gaps).
+    ///
+    /// The strip can still join a secret `hide` left alone: with `hide_known`, a held value too
+    /// short to match across gaps, one split by a longer gap than it allows, or a URL password
+    /// split from its `@` by a line break. So a text the strip changed goes through `hide` once
+    /// more. A cause is one line by design, so hiding what only the join made look like a
+    /// secret costs nothing.
     pub fn cleaned_with(&self, hide: &dyn Fn(&str) -> String) -> Cause {
         let clean = |text: &str, limit: usize| -> String {
-            let hidden = hide(&strip(&hide(text)));
-            strip(&hidden).chars().take(limit).collect()
+            let hidden = hide(text);
+            let stripped = strip(&hidden);
+            let hidden = if stripped == hidden {
+                stripped
+            } else {
+                strip(&hide(&stripped))
+            };
+            hidden.chars().take(limit).collect()
         };
         let cut = |text: &Option<String>, limit| text.as_deref().map(|text| clean(text, limit));
         Cause {
@@ -548,19 +560,13 @@ fn strip(text: &str) -> String {
     text.chars().filter(|c| !is_unsafe(*c)).collect()
 }
 
-/// `text` with no control or bidi characters but its white space: its lines and tabs stay.
-pub(super) fn strip_inline(text: &str) -> String {
-    text.chars()
-        .filter(|c| c.is_whitespace() || !is_unsafe(*c))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::{Value, json};
 
     use super::*;
     use crate::factory::ledger::testing::samples;
+    use crate::secrets::{MemorySecrets, Secrets, hide_known};
 
     /// The keys of `data` in the order `text` writes them.
     fn keys_in_order(text: &str) -> Vec<String> {
@@ -739,6 +745,102 @@ mod tests {
             cause.cleaned().command,
             Some(format!("{}SECRE", "c".repeat(995)))
         );
+    }
+
+    #[test]
+    fn a_cause_gives_each_text_to_its_hider_as_given_and_again_only_when_the_strip_changed_it() {
+        let seen = std::cell::RefCell::new(Vec::new());
+        let hide = |text: &str| {
+            seen.borrow_mut().push(text.to_owned());
+            text.replace("SECRET\nVALUE", "***")
+        };
+        let long = format!("{}SECRET\nVALUE", "c".repeat(995));
+        let cause = Cause::new(CauseStep::Gate, "a\u{7}b")
+            .actor("SECRET\nVALUE")
+            .command(&long)
+            .label("plain label");
+        let cleaned = cause.cleaned_with(&hide);
+        assert_eq!(cleaned.reason, "ab");
+        assert_eq!(cleaned.actor.as_deref(), Some("***"));
+        assert_eq!(cleaned.command, Some(format!("{}***", "c".repeat(995))));
+        assert_eq!(cleaned.label.as_deref(), Some("plain label"));
+        // Each text first as given, before any strip or cut. Only `a\u{7}b` loses a character
+        // to the strip, so only it goes to the hider again, stripped.
+        assert_eq!(
+            *seen.borrow(),
+            [
+                "a\u{7}b".to_owned(),
+                "ab".to_owned(),
+                "SECRET\nVALUE".to_owned(),
+                long,
+                "plain label".to_owned(),
+            ]
+        );
+    }
+
+    /// A cause with `text` in each of its texts, cleaned with `secrets::hide_known` over a store
+    /// holding `ghp_Sh0rtV4lue9` (15 characters) and a 40-character token.
+    fn cleaned_holding_two(text: &str) -> Cause {
+        let secrets = MemorySecrets::default();
+        secrets.set("github:short", SHORT).unwrap();
+        secrets.set("github:long", LONG).unwrap();
+        Cause::new(CauseStep::Gate, text)
+            .actor(text)
+            .command(text)
+            .label(text)
+            .cleaned_with(&|text: &str| hide_known(text, &secrets))
+    }
+
+    const SHORT: &str = "ghp_Sh0rtV4lue9";
+    const LONG: &str = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
+
+    /// Each text of `cause` is `expected`.
+    fn every_text_is(cause: &Cause, expected: &str) {
+        assert_eq!(cause.reason, expected);
+        for text in [&cause.actor, &cause.command, &cause.label] {
+            assert_eq!(text.as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn a_held_value_under_16_characters_split_by_a_control_character_is_hidden_in_a_cause() {
+        assert_eq!(SHORT.len(), 15);
+        for text in ["T=ghp_Sh0rt\u{7}V4lue9 ok", "T=ghp_Sh0rt\nV4lue9 ok"] {
+            every_text_is(&cleaned_holding_two(text), "T=*** ok");
+        }
+    }
+
+    #[test]
+    fn a_held_value_split_by_more_than_32_control_characters_is_hidden_in_a_cause() {
+        let (head, tail) = LONG.split_at(20);
+        for gap in ["\n".repeat(33), "\u{7}".repeat(33)] {
+            every_text_is(
+                &cleaned_holding_two(&format!("T={head}{gap}{tail}")),
+                "T=***",
+            );
+        }
+    }
+
+    #[test]
+    fn a_url_credential_split_from_its_at_sign_by_a_line_break_is_hidden_in_a_cause() {
+        for text in [
+            "https://deploy:pw-Xy12\n@git.example.com/r",
+            "https://deploy:pw-Xy12\r\n@git.example.com/r",
+        ] {
+            every_text_is(&cleaned_holding_two(text), "https://***@git.example.com/r");
+        }
+    }
+
+    #[test]
+    fn a_token_split_by_a_colour_sequence_is_still_hidden_in_a_cause() {
+        // The hider sees the sequence whole before the strip leaves its `[31m` behind.
+        let (head, tail) = LONG.split_at(20);
+        every_text_is(
+            &cleaned_holding_two(&format!("T={head}\u{1b}[31m{tail}")),
+            "T=***",
+        );
+        // Text with no secret in it is only stripped.
+        every_text_is(&cleaned_holding_two("one\u{7}\ntwo"), "onetwo");
     }
 
     #[test]
