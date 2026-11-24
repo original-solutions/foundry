@@ -761,6 +761,44 @@ mod run_read_tests {
         assert!(store.run_events_by(&eight, writer, None).is_err());
     }
 
+    #[test]
+    fn a_writer_whose_key_spells_its_id_otherwise_than_this_build_writes_it_is_an_error() {
+        let a = MachineId::random();
+        let eight = run("rawphp/softfac", 8, 1);
+        let finished = serde_json::to_string(&FactoryRecord {
+            owner: a,
+            version: 1,
+            body: FactoryBody::RunEvent(RunEvent {
+                run: eight.clone(),
+                generation: 1,
+                ts: "2026-10-04T10:00:00.000Z".into(),
+                ms: 1,
+                event: "finished".into(),
+                data: json!({}),
+                cause: None,
+            }),
+        })
+        .unwrap();
+        // Each spelling parses as a's id, but a's reads look its rows up under the spelling
+        // this build writes, so taken as a, this row would never be read.
+        for spelt in [
+            a.to_string().to_uppercase(),
+            format!("{{{a}}}"),
+            a.0.simple().to_string(),
+        ] {
+            let (dir, store) = open();
+            let conn = rusqlite::Connection::open(dir.path().join("foundry.db")).unwrap();
+            conn.execute(
+                "INSERT INTO factory_records (kind, id, owner, version, record)
+                 VALUES ('run_event', ?1, ?2, 1, ?3)",
+                rusqlite::params![format!("{eight}/{spelt}/1"), a.to_string(), finished],
+            )
+            .unwrap();
+            assert!(store.run_has_event(&eight, "finished").unwrap(), "{spelt}");
+            assert!(store.run_writers(&eight).is_err(), "{spelt}");
+        }
+    }
+
     /// What SQLite says it does for `sql`, one line per step.
     fn plan(store: &Store, sql: &str) -> Vec<String> {
         let mut query = store

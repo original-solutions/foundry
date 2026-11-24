@@ -2406,6 +2406,82 @@ mod tests {
         assert_eq!(mine(&store), 1);
     }
 
+    /// A `finished` row of `run` by `owner`, keyed under `spelt`, a spelling of the owner's id
+    /// this build never writes, as a newer build or a damaged file may leave one.
+    fn put_finished_spelt(
+        dir: &tempfile::TempDir,
+        run: &RunId,
+        owner: MachineId,
+        version: u64,
+        spelt: &str,
+    ) {
+        let record = FactoryRecord {
+            owner,
+            version,
+            body: FactoryBody::RunEvent(RunEvent {
+                run: run.clone(),
+                ..stored(T0, "finished", json!({"outcome": "stuck"}))
+            }),
+        };
+        let conn = rusqlite::Connection::open(dir.path().join("foundry.db")).unwrap();
+        conn.execute(
+            "INSERT INTO factory_records (kind, id, owner, version, record)
+             VALUES ('run_event', ?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                format!("{run}/{spelt}/{version}"),
+                owner.to_string(),
+                i64::try_from(version).unwrap(),
+                serde_json::to_string(&record).unwrap()
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_write_to_a_run_whose_finished_row_spells_its_writer_otherwise_fails_and_writes_nothing() {
+        let (me, other) = (MachineId::random(), MachineId::random());
+        let spelt = other.to_string().to_uppercase();
+        let mine = |store: &std::sync::Arc<std::sync::Mutex<crate::store::Store>>| {
+            store
+                .lock()
+                .unwrap()
+                .factory_since(me, 0, usize::MAX)
+                .unwrap()
+                .len()
+        };
+        // Held before the ledger first reads the run.
+        let (dir, store) = open_store();
+        put_finished_spelt(&dir, &run(8), other, 1, &spelt);
+        let cold = ledger(&store, me, 1, ticking(T0, 1000));
+        assert!(matches!(
+            cold.write(&run(8), &step("red"), &test_cause()),
+            Err(LedgerError::Store(_))
+        ));
+        assert_eq!(mine(&store), 0);
+
+        // Stored after the ledger read the run, from a writer it has read.
+        let (dir, store) = open_store();
+        put(
+            &store,
+            other,
+            1,
+            &run(9),
+            1,
+            T0,
+            "step_changed",
+            json!({"step": "red"}),
+            None,
+        );
+        let warm = ledger(&store, me, 1, ticking(T0, 1000));
+        warm.write(&run(9), &step("red"), &test_cause()).unwrap();
+        put_finished_spelt(&dir, &run(9), other, 2, &spelt);
+        assert!(matches!(
+            warm.write(&run(9), &step("green"), &test_cause()),
+            Err(LedgerError::Store(_))
+        ));
+        assert_eq!(mine(&store), 1);
+    }
+
     /// What `ledger` has read of `run`, as (whether it is finished, the highest version read of
     /// each writer).
     fn tally(ledger: &Ledger, run: &RunId) -> (bool, std::collections::BTreeMap<MachineId, u64>) {
