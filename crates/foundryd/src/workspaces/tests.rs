@@ -329,7 +329,12 @@ impl Setup {
             .unwrap();
         String::from_utf8_lossy(&out.stdout)
             .lines()
-            .filter(|l| l.contains(marker))
+            // The command itself, not a holder or shell whose arguments hold the script.
+            .filter(|l| {
+                l.trim_start()
+                    .split_once(' ')
+                    .is_some_and(|(_, args)| args.starts_with(marker))
+            })
             .map(str::to_owned)
             .collect()
     }
@@ -480,8 +485,10 @@ fn every_safe_branch_is_a_valid_branch_and_one_path_part() {
 async fn an_awkward_name_becomes_a_branch_and_its_worktree_is_made() {
     let setup = Setup::new();
     let remote = setup.project(&[("README.md", "hello\n")]);
+    let mut ids = Vec::new();
     for name in ["fix login", "café ☕ täst", "../../escape", "-rf --force"] {
         let id = setup.create(&remote, "main", name).await;
+        ids.push(id.to_string());
         let body = setup.body(id);
         assert_eq!(body.name, name);
         assert_eq!(body.branch, safe_branch(name));
@@ -504,16 +511,9 @@ async fn an_awkward_name_becomes_a_branch_and_its_worktree_is_made() {
         names_in(setup.data.path().join("worktrees").as_path()).len(),
         1
     );
-    assert_eq!(
-        names_in(
-            &setup
-                .data
-                .path()
-                .join("worktrees")
-                .join(remote.project.to_string())
-        ),
-        ["café-täst", "escape", "fix-login", "rf-force"]
-    );
+    // Each folder is named by its workspace's id, whatever the name was.
+    ids.sort();
+    assert_eq!(setup.folders(remote.project), ids);
 }
 
 #[tokio::test]
@@ -592,7 +592,7 @@ async fn a_base_the_remote_does_not_have_is_refused_and_makes_no_workspace() {
         "{err}"
     );
     assert!(err.to_string().contains("no-such-branch"), "{err}");
-    assert!(!setup.worktree(remote.project, "x").exists());
+    assert!(setup.folders(remote.project).is_empty());
     let records = setup.store.lock().unwrap().since(setup.me, 0).unwrap();
     assert!(records.is_empty(), "{records:?}");
 }
@@ -1233,7 +1233,8 @@ async fn a_create_that_cannot_record_its_workspace_leaves_no_branch_behind() {
         &["for-each-ref", "--format=%(refname)", "refs/heads/"],
     );
     assert!(!branches.contains("second"), "{branches}");
-    assert!(!setup.worktree(remote.project, "second").exists());
+    // No folder of the failed create: only the first workspace's is there.
+    assert_eq!(setup.folders(remote.project).len(), 1);
     setup.create(&remote, "main", "second").await;
 }
 
@@ -1293,7 +1294,8 @@ async fn a_create_whose_project_is_removed_before_its_record_is_written_leaves_n
         err.to_string().contains(&remote.project.to_string()),
         "{err}"
     );
-    assert!(!setup.worktree(remote.project, "second").exists());
+    // No folder of the failed create: only the first workspace's is there.
+    assert_eq!(setup.folders(remote.project).len(), 1);
     let clone = setup.clone_of(remote.project);
     let branches = git(
         &clone,
@@ -1336,7 +1338,7 @@ async fn a_name_whose_folder_is_taken_is_refused_and_the_folder_is_untouched() {
     );
     let clone = setup.clone_of(remote.project);
     let worktrees = git(&clone, &["worktree", "list", "--porcelain"]);
-    assert!(worktrees.contains("/fix\n"), "{worktrees}");
+    assert!(worktrees.contains(&format!("/{first}\n")), "{worktrees}");
     let branches = git(
         &clone,
         &["for-each-ref", "--format=%(refname)", "refs/heads/"],
@@ -1359,7 +1361,7 @@ async fn a_name_whose_folder_is_taken_is_refused_and_the_folder_is_untouched() {
         "{err}"
     );
     let worktrees = git(&clone, &["worktree", "list", "--porcelain"]);
-    assert!(worktrees.contains("/fix\n"), "{worktrees}");
+    assert!(worktrees.contains(&format!("/{first}\n")), "{worktrees}");
 }
 
 #[tokio::test]
@@ -1476,7 +1478,7 @@ async fn archiving_one_removed_worktree_leaves_the_others_entries() {
     setup.workspaces.archive(a, false).await.unwrap();
     let clone = setup.clone_of(remote.project);
     let worktrees = git(&clone, &["worktree", "list", "--porcelain"]);
-    assert!(worktrees.contains("/b\n"), "{worktrees}");
+    assert!(worktrees.contains(&format!("/{b}\n")), "{worktrees}");
     let err = setup.workspaces.archive(b, false).await.unwrap_err();
     let WorkspaceError::Dirty(dirty) = err else {
         panic!("{err}");
@@ -2383,7 +2385,7 @@ impl Setup {
 async fn sweep_keeps_the_worktrees_live_records_of_another_identity_name() {
     let setup = Setup::new();
     let remote = setup.project(&[("README.md", "hello\n")]);
-    setup.create(&remote, "main", "mine").await;
+    let id = setup.create(&remote, "main", "mine").await;
     // Clean, with nothing ignored: only the record keeps it.
     let worktree = setup.worktree(remote.project, "mine");
 
@@ -2395,13 +2397,13 @@ async fn sweep_keeps_the_worktrees_live_records_of_another_identity_name() {
     assert!(worktree.exists());
     let listed = setup.listed(remote.project);
     assert!(
-        listed.contains("/mine\0") || listed.contains("/mine\n"),
+        listed.contains(&format!("/{id}\0")) || listed.contains(&format!("/{id}\n")),
         "{listed}"
     );
     let text = logs.text();
     let line = text
         .lines()
-        .find(|l| l.contains(&format!("{}/mine", remote.project)))
+        .find(|l| l.contains(&format!("{}/{id}", remote.project)))
         .unwrap_or_else(|| panic!("no line names the worktree: {text}"));
     assert!(line.contains("WARN"), "{line}");
     assert!(line.contains("another owner"), "{line}");
@@ -3785,7 +3787,8 @@ async fn a_failed_branch_checkout_puts_the_local_branch_back_where_it_was() {
         &["for-each-ref", "--format=%(refname)", "refs/heads/"],
     );
     assert_eq!(branches.trim(), "refs/heads/feature");
-    assert!(setup.folders(remote.project).len() == 1);
+    assert!(setup.folders(remote.project).is_empty());
+    // Only the bare clone is listed.
     assert_eq!(setup.listed(remote.project).matches("worktree ").count(), 1);
 }
 

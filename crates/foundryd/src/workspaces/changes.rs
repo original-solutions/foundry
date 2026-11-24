@@ -101,7 +101,7 @@ impl Workspaces {
     /// Live workspace `id`'s worktree and base, to read.
     async fn reading(&self, id: WorkspaceId) -> Result<(PathBuf, String), WorkspaceError> {
         let body = self.inner.live(id).await?;
-        Ok((self.inner.worktree(body.project, &body.branch), body.base))
+        Ok((self.inner.folder(&body).await, body.base))
     }
 
     /// `read` of workspace `id`, or [`WorkspaceError::Unknown`] when an archive's removal of the
