@@ -85,7 +85,7 @@ pub struct Ledger {
 /// looked for again on every read, so a `finished` event that another machine wrote, synced in
 /// since, is seen. Once the run is finished nothing more is kept of it, since nothing more is
 /// written to it.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct RunTally {
     /// The version each writer's next read of the run starts above: the highest version held
     /// from it, of any record, when it was last read.
@@ -100,15 +100,10 @@ struct RunTally {
 }
 
 impl RunTally {
-    /// Takes in `event`, which `writer` stored at `version`. Nothing is kept of a finished run
-    /// but that it is finished.
+    /// Takes in `event`, which `writer` stored at `version`.
     fn take(&mut self, writer: MachineId, version: u64, event: &RunEvent) {
         if event.event == names::FINISHED {
             self.finished = true;
-        }
-        if self.finished {
-            self.forget_all_but_finished();
-            return;
         }
         self.read_to_at_least(writer, version);
         let order = (event.generation, version, writer.to_string());
@@ -120,13 +115,15 @@ impl RunTally {
         }
     }
 
-    /// Keeps only that the run is finished: nothing more is written to it, so nothing more of
-    /// it is needed.
-    fn forget_all_but_finished(&mut self) {
-        *self = Self {
-            finished: true,
-            ..Self::default()
-        };
+    /// Keeps only that the run is finished, once it is: nothing more is written to it, so
+    /// nothing more of it is needed.
+    fn settle(&mut self) {
+        if self.finished {
+            *self = Self {
+                finished: true,
+                ..Self::default()
+            };
+        }
     }
 
     /// Moves `writer`'s next read to start above `version`, if it does not already.
@@ -137,26 +134,26 @@ impl RunTally {
 
     /// Reads into this what `store` holds of `run` that has not been read yet: every event of
     /// a writer not read before, and each other writer's events above where its last read
-    /// ended. A row this build cannot read is an error, and nothing of its writer is taken.
+    /// ended. All or nothing: a row this build cannot read, of any writer, is an error and
+    /// leaves this as it was, so every write to the run fails the same way, whichever writer's
+    /// id comes first.
     ///
     /// Each writer's next read then starts above the highest version held from it, so the
     /// records it stores of other runs meanwhile are not visited again by every later write.
     /// `store` is the locked store, so nothing of a writer is stored between its two reads.
     fn catch_up(&mut self, store: &Store, run: &RunId) -> Result<(), StoreError> {
+        let mut read = self.clone();
         for writer in store.run_writers(run)? {
-            let above = self.read_to.get(&writer).copied();
+            let above = read.read_to.get(&writer).copied();
             for (version, event) in store.run_events_by(run, writer, above)? {
-                self.take(writer, version, &event);
-            }
-            // Every writer is read, after a `finished` too, so a row this build cannot read is an
-            // error whichever writer's id comes first. Nothing more is kept of a finished run.
-            if self.finished {
-                continue;
+                read.take(writer, version, &event);
             }
             if let Some(highest) = store.highest_factory_version(writer)? {
-                self.read_to_at_least(writer, highest);
+                read.read_to_at_least(writer, highest);
             }
         }
+        read.settle();
+        *self = read;
         Ok(())
     }
 }
@@ -257,6 +254,7 @@ impl Ledger {
         };
         if store.apply_factory(&record, self.me)? == Applied::Stored {
             tally.take(self.me, version, &written);
+            tally.settle();
         }
         Ok(written)
     }
