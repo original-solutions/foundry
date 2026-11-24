@@ -148,8 +148,10 @@ impl RunTally {
             for (version, event) in store.run_events_by(run, writer, above)? {
                 self.take(writer, version, &event);
             }
+            // Every writer is read, after a `finished` too, so a row this build cannot read is an
+            // error whichever writer's id comes first. Nothing more is kept of a finished run.
             if self.finished {
-                return Ok(());
+                continue;
             }
             if let Some(highest) = store.highest_factory_version(writer)? {
                 self.read_to_at_least(writer, highest);
