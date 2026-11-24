@@ -1,7 +1,7 @@
 //! The `foundryd` binary run as a daemon: the data-directory lock, a clean stop that leaves
-//! terminals running, `status`, the peer route's key proof and the gateway settings. Each
-//! test uses its own data directory, a free port and no copy from the keychain, never the
-//! defaults or the login keychain.
+//! terminals running, `status`, the logins and skill it holds, the peer route's key proof and
+//! the gateway settings. Each test uses its own data directory, a free port and no copy from
+//! the keychain, never the defaults or the login keychain.
 
 // A release build ignores `FOUNDRY_SECRETS`, so on macOS these runs of the binary would move
 // secrets out of the login keychain.
@@ -620,6 +620,46 @@ fn status_against_a_running_daemon_prints_this_machine_and_exits_0() {
         text(&out.stdout).contains(&owner.to_string()),
         "stdout: {}",
         text(&out.stdout)
+    );
+}
+
+#[test]
+fn at_start_the_daemon_writes_the_logins_and_the_skill_this_machine_holds() {
+    let mut fixture = Fixture::new();
+    FileSecrets::new(fixture.home.path().join("secrets.json"))
+        .set("github:octocat", "ghp_daemon_held")
+        .unwrap();
+    let skill = fixture
+        .user
+        .path()
+        .join(".claude/skills/factory-build/SKILL.md");
+    fs::create_dir_all(skill.parent().unwrap()).unwrap();
+    fs::write(&skill, "the skill").unwrap();
+    fixture.start();
+    let me = wait_for("a machine sample", || {
+        fixture
+            .state()?
+            .into_iter()
+            .find_map(|record| match record {
+                AnyRecord::MachineSample(sample) => Some(sample.owner),
+                _ => None,
+            })
+    });
+
+    // The daemon holds the store open; a read that finds it busy is tried again.
+    let held = wait_for("this machine's held record", || {
+        Store::open(fixture.home.path().join("store.sqlite"))
+            .ok()?
+            .held(me)
+            .ok()?
+    });
+
+    assert_eq!(held.logins, ["octocat"]);
+    assert!(held.skill);
+    assert!(
+        !fixture.log().contains("ghp_daemon_held"),
+        "{}",
+        fixture.log()
     );
 }
 
