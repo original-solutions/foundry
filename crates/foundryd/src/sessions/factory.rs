@@ -11,6 +11,7 @@
 //! session as a factory session and holds its project. [`Sessions::adopt`] reads the marks
 //! again, so a daemon that starts again still knows its factory sessions.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -36,6 +37,17 @@ pub struct FactoryStart {
     pub model: String,
     /// Claude Code's `--effort`.
     pub effort: String,
+}
+
+/// The factory sessions, live or ended, and the project each is for, and how many times each
+/// workspace's factory sessions were ended.
+#[derive(Default)]
+pub(super) struct FactoryState {
+    /// A session is in it from the moment it is live in its start, is taken out if the start
+    /// fails, or was found by adopt.
+    pub marks: HashMap<SessionId, ProjectId>,
+    /// Per workspace, the number of `end_factory` calls so far.
+    pub ended: HashMap<WorkspaceId, u64>,
 }
 
 /// What [`Inner::start`] adds for a factory session. It holds the token, so it has no `Debug`.
@@ -77,6 +89,7 @@ fn factory_env(
     secrets: &dyn crate::secrets::Secrets,
     login: &str,
     data: &Path,
+    _identity: &[(String, String)],
 ) -> Result<Vec<(String, String)>, SessionError> {
     let auth = GitAuth::for_login(secrets, login, data)?;
     let mut git = Command::new("git");
@@ -104,6 +117,11 @@ fn factory_env(
         ("GH_ENTERPRISE_TOKEN".into(), String::new()),
         ("GITHUB_ENTERPRISE_TOKEN".into(), String::new()),
     ])
+}
+
+/// STUB: the owner's `user.name` and `user.email`, as git config pins.
+fn owner_identity(_git: Command) -> Vec<(String, String)> {
+    Vec::new()
 }
 
 impl Sessions {
@@ -136,7 +154,12 @@ impl Sessions {
             let secrets = inner.secrets.get().cloned();
             let (login, data) = (start.login.clone(), inner.data.clone());
             let env = blocking(move || match secrets {
-                Some(secrets) => factory_env(secrets.as_ref(), &login, &data),
+                Some(secrets) => factory_env(
+                    secrets.as_ref(),
+                    &login,
+                    &data,
+                    &owner_identity(Command::new("git")),
+                ),
                 None => Err(crate::git_auth::NoToken::Unset { login }.into()),
             })
             .await??;
@@ -161,12 +184,13 @@ impl Sessions {
     /// The project session `session` is a factory session of, whether it still runs or has
     /// ended. `None` for a P1 session and for one this daemon knows nothing of.
     pub fn is_factory(&self, session: SessionId) -> Option<ProjectId> {
-        lock(&self.inner.factory).get(&session).copied()
+        lock(&self.inner.factory).marks.get(&session).copied()
     }
 
     /// The factory sessions of `project` that still run, sorted.
     pub fn factory_sessions(&self, project: ProjectId) -> Vec<SessionId> {
         let mut sessions: Vec<_> = lock(&self.inner.factory)
+            .marks
             .iter()
             .filter(|(id, p)| **p == project && self.inner.live(**id).is_some())
             .map(|(id, _)| *id)
@@ -179,7 +203,7 @@ impl Sessions {
     /// and another workspace's factory session are left alone. A terminal already gone counts
     /// as ended. Every close is tried; the first other failure is given.
     pub async fn end_factory(&self, workspace: WorkspaceId) -> Result<(), SessionError> {
-        let marked: Vec<SessionId> = lock(&self.inner.factory).keys().copied().collect();
+        let marked: Vec<SessionId> = lock(&self.inner.factory).marks.keys().copied().collect();
         let mut terminals = Vec::new();
         for id in marked {
             let Some(live) = self.inner.live(id) else {
@@ -254,7 +278,7 @@ impl Inner {
         })
         .await
         .unwrap_or_default();
-        lock(&self.factory).extend(found);
+        lock(&self.factory).marks.extend(found);
     }
 }
 
@@ -516,7 +540,11 @@ exec "$agent" "$@""#;
                 .unwrap_or_default();
             assert!(left.is_empty(), "left behind: {left:?}");
             assert!(crate::sessions::lock(&sessions.inner.live).is_empty());
-            assert!(crate::sessions::lock(&sessions.inner.factory).is_empty());
+            assert!(
+                crate::sessions::lock(&sessions.inner.factory)
+                    .marks
+                    .is_empty()
+            );
             assert!(sessions.factory_sessions(project).is_empty());
         }
     }
@@ -585,6 +613,13 @@ exec "$agent" "$@""#;
 - print_env: GIT_CONFIG_COUNT
 - print_env: GIT_CONFIG_KEY_0
 - print_env: GIT_CONFIG_VALUE_0
+- print_env: GITHUB_TOKEN
+- print_env: GH_ENTERPRISE_TOKEN
+- print_env: GITHUB_ENTERPRISE_TOKEN
+- print_env: GIT_CONFIG_PARAMETERS
+- print_env: GIT_ALLOW_PROTOCOL
+- print_env: GIT_CONFIG_GLOBAL
+- print_env: GIT_CONFIG_NOSYSTEM
 - print_env: FOUNDRY_GIT_TOKEN
 - wait_input
 ";
@@ -624,12 +659,31 @@ exec "$agent" "$@""#;
         assert_eq!(value(&seen, "GH_TOKEN=").as_deref(), Some(TOKEN));
         assert_eq!(value(&seen, "FOUNDRY_GIT_TOKEN=").as_deref(), Some(TOKEN));
         assert_eq!(value(&seen, "ASKPASS=").as_deref(), Some(TOKEN), "{seen}");
-        assert_eq!(value(&seen, "GIT_CONFIG_COUNT=").as_deref(), Some("1"));
+        // One pin for the helper, and one for each of the owner's name and email this machine has.
+        let count: usize = value(&seen, "GIT_CONFIG_COUNT=").unwrap().parse().unwrap();
+        assert!((1..=3).contains(&count), "{count}");
         assert_eq!(
             value(&seen, "GIT_CONFIG_KEY_0=").as_deref(),
             Some("credential.helper")
         );
         assert_eq!(value(&seen, "GIT_CONFIG_VALUE_0=").as_deref(), Some(""));
+        for blank in [
+            "GITHUB_TOKEN=",
+            "GH_ENTERPRISE_TOKEN=",
+            "GITHUB_ENTERPRISE_TOKEN=",
+            "GIT_CONFIG_PARAMETERS=",
+        ] {
+            assert_eq!(value(&seen, blank).as_deref(), Some(""), "{blank} {seen}");
+        }
+        assert_eq!(
+            value(&seen, "GIT_ALLOW_PROTOCOL=").as_deref(),
+            Some("https")
+        );
+        assert_eq!(
+            value(&seen, "GIT_CONFIG_GLOBAL=").as_deref(),
+            Some("/dev/null")
+        );
+        assert_eq!(value(&seen, "GIT_CONFIG_NOSYSTEM=").as_deref(), Some("1"));
 
         let mark = f.mark_file(id);
         assert_eq!(std::fs::read_to_string(&mark).unwrap(), project.to_string());
@@ -705,13 +759,18 @@ exec "$agent" "$@""#;
     async fn each_start_reads_the_token_again() {
         let f = Fx::new("- print_env: GH_TOKEN\n- wait_input\n").await;
         let other = "ghp_anotherMadeUpToken0987654321zyxwvuTSRQ";
-        f.secrets.set(&format!("github:{LOGIN}"), other).unwrap();
 
-        let id = f
+        let first = f
             .start_factory(WorkspaceId::random(), ProjectId::random())
             .await;
+        let seen = f.shown(first, |t| value(t, "GH_TOKEN=").is_some()).await;
+        assert_eq!(value(&seen, "GH_TOKEN=").as_deref(), Some(TOKEN));
 
-        let seen = f.shown(id, |t| value(t, "GH_TOKEN=").is_some()).await;
+        f.secrets.set(&format!("github:{LOGIN}"), other).unwrap();
+        let second = f
+            .start_factory(WorkspaceId::random(), ProjectId::random())
+            .await;
+        let seen = f.shown(second, |t| value(t, "GH_TOKEN=").is_some()).await;
         assert_eq!(value(&seen, "GH_TOKEN=").as_deref(), Some(other));
     }
 
@@ -779,54 +838,169 @@ exec "$agent" "$@""#;
         .await;
     }
 
-    /// `git` with HOME at `home`, no way to reach a network by ssh, and the factory env on top.
-    fn factory_git(home: &Path, args: &[&str]) -> Command {
+    /// `git` run as a factory session's child would, with HOME and XDG_CONFIG_HOME at `home`
+    /// (where the owner's `.gitconfig` is), in the factory env built with `identity`, and over
+    /// a `GIT_CONFIG_PARAMETERS` that names a helper, as an inherited one could.
+    fn factory_git(home: &Path, identity: &[(String, String)], args: &[&str]) -> Command {
         let data = tempfile::tempdir().unwrap();
         let secrets = MemorySecrets::default();
         secrets.set(&format!("github:{LOGIN}"), TOKEN).unwrap();
-        let env = factory_env(&secrets, LOGIN, data.path()).unwrap();
+        let env = factory_env(&secrets, LOGIN, data.path(), identity).unwrap();
         let mut git = Command::new("git");
         git.args(args)
             .current_dir(home)
             .env("HOME", home)
             .env("XDG_CONFIG_HOME", home)
-            .env("GIT_SSH_COMMAND", "false")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env_remove("GIT_CONFIG_GLOBAL");
+            .env("GIT_SSH_COMMAND", "false");
         git.env("GIT_CONFIG_PARAMETERS", "'credential.helper'='store'");
         git.envs(env);
         git
     }
 
-    #[test]
-    fn the_factory_env_lets_git_use_https_only_whatever_the_global_config_rewrites() {
-        let home = tempfile::tempdir().unwrap();
-        std::fs::write(
-            home.path().join(".gitconfig"),
-            "[url \"git@github.com:\"]\n\tinsteadOf = https://github.com/\n",
-        )
-        .unwrap();
-
-        let out = factory_git(home.path(), &["ls-remote", "https://github.com/o/r.git"])
-            .output()
-            .unwrap();
-
-        let err = String::from_utf8_lossy(&out.stderr);
-        assert!(!out.status.success());
-        assert!(err.contains("transport 'ssh' not allowed"), "{err}");
+    /// The owner's git: HOME and XDG_CONFIG_HOME at `home`, no system config.
+    fn owners_git(home: &Path) -> Command {
+        let mut git = Command::new("git");
+        git.env("HOME", home)
+            .env("XDG_CONFIG_HOME", home)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("GIT_CONFIG_GLOBAL")
+            .env_remove("GIT_CONFIG_PARAMETERS")
+            .env_remove("GIT_CONFIG_COUNT");
+        git
     }
 
     #[test]
-    fn the_factory_env_drops_a_credential_helper_named_in_git_config_parameters() {
+    fn a_global_rewrite_that_carries_another_accounts_credentials_does_not_reach_the_session() {
         let home = tempfile::tempdir().unwrap();
-
-        let out = factory_git(home.path(), &["config", "--get-all", "credential.helper"])
+        std::fs::write(
+            home.path().join(".gitconfig"),
+            "[url \"https://other:OTHERTOKEN@github.com/\"]\n\tinsteadOf = https://github.com/\n\
+             [url \"git@github.com:\"]\n\tinsteadOf = https://github.com/\n",
+        )
+        .unwrap();
+        // The owner's own git does rewrite, so the test would show it.
+        let owner = owners_git(home.path())
+            .args(["ls-remote", "--get-url", "https://github.com/o/r.git"])
             .output()
             .unwrap();
+        assert_ne!(
+            String::from_utf8_lossy(&owner.stdout).trim(),
+            "https://github.com/o/r.git"
+        );
 
-        let helpers = String::from_utf8_lossy(&out.stdout);
-        assert_eq!(helpers.lines().last(), Some(""), "{helpers:?}");
-        assert!(out.status.success());
+        let out = factory_git(
+            home.path(),
+            &[],
+            &["ls-remote", "--get-url", "https://github.com/o/r.git"],
+        )
+        .output()
+        .unwrap();
+
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "https://github.com/o/r.git",
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn a_global_header_and_helper_do_not_reach_the_session() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join(".gitconfig"),
+            "[http \"https://github.com/\"]\n\textraHeader = Authorization: Basic T1RIRVI6VE9LRU4=\n\
+             [credential]\n\thelper = store\n",
+        )
+        .unwrap();
+
+        let header = factory_git(
+            home.path(),
+            &[],
+            &[
+                "config",
+                "--get-all",
+                "http.https://github.com/.extraheader",
+            ],
+        )
+        .output()
+        .unwrap();
+        let helpers = factory_git(
+            home.path(),
+            &[],
+            &["config", "--get-all", "credential.helper"],
+        )
+        .output()
+        .unwrap();
+
+        assert_eq!(String::from_utf8_lossy(&header.stdout), "");
+        assert_eq!(String::from_utf8_lossy(&helpers.stdout), "\n");
+    }
+
+    #[test]
+    fn the_owners_name_and_email_are_carried_in_and_nothing_else() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join(".gitconfig"),
+            "[user]\n\tname = Owner Name\n\temail = owner@example.com\n\
+             [url \"https://other:OTHERTOKEN@github.com/\"]\n\tinsteadOf = https://github.com/\n",
+        )
+        .unwrap();
+
+        let pins = owner_identity(owners_git(home.path()));
+
+        assert_eq!(
+            pins,
+            [
+                ("user.name".to_string(), "Owner Name".to_string()),
+                ("user.email".to_string(), "owner@example.com".to_string()),
+            ]
+        );
+        let repo = tempfile::tempdir().unwrap();
+        let init = factory_git(home.path(), &pins, &["init", "-q"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert!(init.status.success());
+        for (key, want) in [
+            ("user.name", "Owner Name"),
+            ("user.email", "owner@example.com"),
+        ] {
+            let out = factory_git(home.path(), &pins, &["config", key])
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), want);
+        }
+        let url = factory_git(
+            home.path(),
+            &pins,
+            &["ls-remote", "--get-url", "https://github.com/o/r.git"],
+        )
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&url.stdout).trim(),
+            "https://github.com/o/r.git"
+        );
+    }
+
+    #[test]
+    fn an_owner_with_no_name_or_email_pins_none() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join(".gitconfig"),
+            "[core]\n\tautocrlf = false\n",
+        )
+        .unwrap();
+        assert!(owner_identity(owners_git(home.path())).is_empty());
+
+        let bare = tempfile::tempdir().unwrap();
+        assert!(owner_identity(owners_git(bare.path())).is_empty());
+
+        // git that cannot run is no identity, not an error.
+        assert!(owner_identity(Command::new("/nonexistent/git")).is_empty());
     }
 
     #[tokio::test]
@@ -1011,5 +1185,112 @@ exec "$agent" "$@""#;
         assert!(!logged.text().contains(TOKEN));
         f.assert_nothing_left(&f.sessions, project);
         assert_eq!(f.sessions.is_factory(SessionId::random()), None);
+    }
+
+    /// Holds the trust lock on another thread, so a start stops after its files are written.
+    /// Dropping the returned sender (or sending) releases it.
+    fn hold_trust(f: &Fx) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let inner = f.sessions.inner.clone();
+        let holder = std::thread::spawn(move || {
+            let _held = crate::sessions::lock(&inner.trust);
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        held_rx.recv().unwrap();
+        (release_tx, holder)
+    }
+
+    fn settings_files(f: &Fx) -> usize {
+        std::fs::read_dir(f.sessions_dir())
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_end_that_comes_while_a_start_waits_for_the_trust_lock_wins() {
+        let f = Arc::new(Fx::new("- wait_input\n").await);
+        let project = ProjectId::random();
+        let w = WorkspaceId::random();
+        let (release, holder) = hold_trust(&f);
+        let start = tokio::spawn({
+            let f = f.clone();
+            async move {
+                f.sessions
+                    .start_factory(w, f.worktree.path(), f.start_for(project), f.line())
+                    .await
+            }
+        });
+        until("the start's settings file", || settings_files(&f) == 1).await;
+
+        f.sessions.end_factory(w).await.unwrap();
+        release.send(()).unwrap();
+        holder.join().unwrap();
+
+        let result = start.await.unwrap();
+        assert!(matches!(result, Err(SessionError::Ended)), "{result:?}");
+        f.assert_nothing_left(&f.sessions, project);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_end_for_one_workspace_leaves_a_start_for_another_alone() {
+        let f = Arc::new(Fx::new("- wait_input\n").await);
+        let project = ProjectId::random();
+        let (w, other) = (WorkspaceId::random(), WorkspaceId::random());
+        let (release, holder) = hold_trust(&f);
+        let starts = [w, other].map(|workspace| {
+            tokio::spawn({
+                let f = f.clone();
+                async move {
+                    f.sessions
+                        .start_factory(workspace, f.worktree.path(), f.start_for(project), f.line())
+                        .await
+                }
+            })
+        });
+        until("both settings files", || settings_files(&f) == 2).await;
+
+        f.sessions.end_factory(w).await.unwrap();
+        release.send(()).unwrap();
+        holder.join().unwrap();
+
+        let [ended, kept] = starts;
+        let ended = ended.await.unwrap();
+        assert!(matches!(ended, Err(SessionError::Ended)), "{ended:?}");
+        let kept = kept.await.unwrap().unwrap();
+        assert_eq!(f.sessions.factory_sessions(project), [kept]);
+        assert_eq!(f.session_records(), 1);
+        // Started after the end, a start for the same workspace is not refused.
+        f.start_factory(w, project).await;
+    }
+
+    #[tokio::test]
+    async fn a_factory_start_whose_record_cannot_be_written_errs_and_leaves_nothing() {
+        let f = Fx::new("- wait_input\n").await;
+        let project = ProjectId::random();
+        f.sessions
+            .inner
+            .fail_writes
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+
+        let error = f
+            .sessions
+            .start_factory(
+                WorkspaceId::random(),
+                f.worktree.path(),
+                f.start_for(project),
+                f.line(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, SessionError::Store(_)), "{error}");
+        f.assert_nothing_left(&f.sessions, project);
     }
 }
