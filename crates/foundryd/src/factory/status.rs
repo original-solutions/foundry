@@ -1,4 +1,253 @@
 //! `factory_status`: writing it, and choosing which one to believe.
+//!
+//! The acting coordinator writes one status per project each pass: [`build`] from the pass's
+//! results when it holds the lease, [`not_holding`] when it does not. Every machine reads the
+//! statuses of the writers that are online and [`believed`] picks the one it draws the Factory
+//! view and the factory's attention items from.
+//!
+//! [`Freshness`] is what the cut-off rule (G10) reads: per project, how long it is since this
+//! machine held the lease itself or heard from the holder, on the sleep-counting clock.
+
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
+
+use foundry_proto::factory::{
+    FactoryStatus, FinishedRun, ForeignClaim, HeldUp, LiveRun, NotHolding, RunId, Waiting,
+};
+use foundry_proto::ids::{MachineId, ProjectId};
+
+use crate::clock::Clock;
+
+/// How many finished runs a status keeps.
+pub const FINISHED_KEPT: usize = 20;
+
+/// The status a machine believes for one project, from every writer's status of it.
+///
+/// Only the statuses of writers in `online` are read. Among those, the one that holds the lease
+/// at the highest generation is believed; when none holds it, the `acting` coordinator's. So a
+/// holder that died does not hide the next coordinator's reason for being idle. `None` when no
+/// online writer holds the lease and the acting coordinator has written no status.
+///
+/// Two holders at one generation should not exist, since one machine writes in a generation.
+/// Should they, the higher pass is believed, then the lower machine id, so every machine
+/// believes the same one whatever order it read them in.
+pub fn believed(
+    statuses: &[(MachineId, FactoryStatus)],
+    online: &BTreeSet<MachineId>,
+    acting: MachineId,
+) -> Option<FactoryStatus> {
+    let heard = || {
+        statuses
+            .iter()
+            .filter(|(writer, _)| online.contains(writer))
+    };
+    heard()
+        .filter(|(_, status)| status.holds)
+        .max_by_key(|(writer, status)| (status.generation, status.pass, Reverse(*writer)))
+        .or_else(|| heard().find(|(writer, _)| *writer == acting))
+        .map(|(_, status)| status.clone())
+}
+
+/// What one pass of a project whose lease this machine holds found, for [`build`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PassResults {
+    pub project: ProjectId,
+    /// The writer's pass count, which only rises.
+    pub pass: u64,
+    /// The lease generation this machine holds.
+    pub generation: u64,
+    /// Why the factory is idle, when it is.
+    pub idle: Option<String>,
+    /// The repo sets a `factory.owner`, which is ignored.
+    pub owner_ignored: bool,
+    /// The ready queue in claim order, each with why it waits.
+    pub ready: Vec<Waiting>,
+    /// Feedback rounds that wait to start.
+    pub feedback_waiting: Vec<Waiting>,
+    pub runs: Vec<LiveRun>,
+    /// Runs that are stuck or wait for answers.
+    pub held_up: Vec<HeldUp>,
+    /// Runs with a gate that could not run at all.
+    pub gate_infra: Vec<RunId>,
+    /// Finished runs, newest first, in the order the runs' events put them. [`build`] keeps the
+    /// first [`FINISHED_KEPT`].
+    pub finished: Vec<FinishedRun>,
+    /// Issues in `triage` or `building` whose newest claim is not Foundry's.
+    pub foreign: Vec<ForeignClaim>,
+}
+
+impl PassResults {
+    /// The results of a pass that found nothing, at pass 0 and generation 0.
+    pub fn new(project: ProjectId) -> Self {
+        Self {
+            project,
+            pass: 0,
+            generation: 0,
+            idle: None,
+            owner_ignored: false,
+            ready: Vec::new(),
+            feedback_waiting: Vec::new(),
+            runs: Vec::new(),
+            held_up: Vec::new(),
+            gate_infra: Vec::new(),
+            finished: Vec::new(),
+            foreign: Vec::new(),
+        }
+    }
+}
+
+/// The status a holder of the lease writes after a pass: it holds the lease, at the pass's
+/// generation, with the newest [`FINISHED_KEPT`] finished runs.
+pub fn build(results: PassResults) -> FactoryStatus {
+    let PassResults {
+        project,
+        pass,
+        generation,
+        idle,
+        owner_ignored,
+        ready,
+        feedback_waiting,
+        runs,
+        held_up,
+        gate_infra,
+        mut finished,
+        foreign,
+    } = results;
+    finished.truncate(FINISHED_KEPT);
+    FactoryStatus {
+        project,
+        pass,
+        holds: true,
+        generation,
+        not_holding: None,
+        idle,
+        owner_ignored,
+        ready,
+        feedback_waiting,
+        runs,
+        held_up,
+        gate_infra,
+        finished,
+        foreign,
+    }
+}
+
+/// The status a writer that does not hold `project`'s lease writes: why, and nothing more.
+///
+/// Its generation is the one the lease ref names when another machine holds it, else 0. Its
+/// pass is 0: no reader counts the passes of a status that does not hold the lease, and a
+/// writer that wants its own count in it sets `pass` on what this returns.
+pub fn not_holding(project: ProjectId, why: NotHolding) -> FactoryStatus {
+    let generation = match &why {
+        NotHolding::HeldBy { generation, .. } => *generation,
+        NotHolding::NoToken { .. } => 0,
+    };
+    FactoryStatus {
+        project,
+        pass: 0,
+        holds: false,
+        generation,
+        not_holding: Some(why),
+        idle: None,
+        owner_ignored: false,
+        ready: Vec::new(),
+        feedback_waiting: Vec::new(),
+        runs: Vec::new(),
+        held_up: Vec::new(),
+        gate_infra: Vec::new(),
+        finished: Vec::new(),
+        foreign: Vec::new(),
+    }
+}
+
+/// Per project, when this machine last held the lease itself or heard from its holder, on the
+/// sleep-counting clock (G10).
+///
+/// Holding is [`held`](Self::held), called on each successful lease push. Hearing is a status
+/// [`received`](Self::received) that holds the lease, at the highest generation this machine has
+/// seen for the project, with a higher pass than any holding status before it at that
+/// generation. The same status received twice, an old holder's status after a takeover and any
+/// status that does not hold the lease therefore never count. A status that does not hold the
+/// lease can still raise the generation seen, so an old holder's status that arrives after it
+/// does not count either.
+pub struct Freshness {
+    clock: Arc<dyn Clock>,
+    /// The clock's reading when this was made: a project never held nor heard counts from it.
+    made: Duration,
+    projects: Mutex<BTreeMap<ProjectId, Heard>>,
+}
+
+/// What [`Freshness`] knows of one project.
+#[derive(Debug, Default)]
+struct Heard {
+    /// The highest lease generation seen for the project.
+    generation: u64,
+    /// The highest pass of a holding status at `generation`.
+    pass: Option<u64>,
+    /// The clock's reading when the lease was last held or its holder last heard from.
+    at: Option<Duration>,
+}
+
+impl Freshness {
+    /// Freshness with nothing held or heard yet, read on `clock`.
+    pub fn new(clock: Arc<dyn Clock>) -> Self {
+        let made = clock.now();
+        Self {
+            clock,
+            made,
+            projects: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// This machine has just pushed `project`'s lease and holds it.
+    pub fn held(&self, project: ProjectId) {
+        let now = self.clock.now();
+        self.projects().entry(project).or_default().at = Some(now);
+    }
+
+    /// A status of its project has arrived from a writer that is online.
+    pub fn received(&self, status: &FactoryStatus) {
+        let now = self.clock.now();
+        let seen = match &status.not_holding {
+            Some(NotHolding::HeldBy { generation, .. }) => status.generation.max(*generation),
+            _ => status.generation,
+        };
+        let mut projects = self.projects();
+        let heard = projects.entry(status.project).or_default();
+        if seen < heard.generation {
+            return;
+        }
+        if seen > heard.generation {
+            heard.generation = seen;
+            heard.pass = None;
+        }
+        if !status.holds {
+            return;
+        }
+        if heard.pass.is_some_and(|pass| status.pass <= pass) {
+            return;
+        }
+        heard.pass = Some(status.pass);
+        heard.at = Some(now);
+    }
+
+    /// How long it is since this machine held `project`'s lease or heard from its holder. A
+    /// project never held nor heard counts from when this was made.
+    pub fn since_holding(&self, project: ProjectId) -> Duration {
+        let at = self
+            .projects()
+            .get(&project)
+            .and_then(|heard| heard.at)
+            .unwrap_or(self.made);
+        self.clock.now().saturating_sub(at)
+    }
+
+    fn projects(&self) -> MutexGuard<'_, BTreeMap<ProjectId, Heard>> {
+        self.projects.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -75,10 +324,7 @@ mod tests {
     {
         let project = ProjectId::random();
         let (dead, acting) = (MachineId::random(), MachineId::random());
-        let statuses = vec![
-            (dead, holding(project, 5, 40)),
-            (acting, no_token(project)),
-        ];
+        let statuses = vec![(dead, holding(project, 5, 40)), (acting, no_token(project))];
 
         let believed = believed(&statuses, &online(&[acting]), acting);
 
@@ -103,7 +349,11 @@ mod tests {
     #[test]
     fn a_holding_status_beats_a_not_holding_one_at_a_higher_generation() {
         let project = ProjectId::random();
-        let (holder, other, acting) = (MachineId::random(), MachineId::random(), MachineId::random());
+        let (holder, other, acting) = (
+            MachineId::random(),
+            MachineId::random(),
+            MachineId::random(),
+        );
         let holds = holding(project, 4, 3);
         let statuses = vec![
             (acting, held_by(project, other, 6)),
@@ -118,7 +368,11 @@ mod tests {
     #[test]
     fn of_two_online_holders_the_one_at_the_highest_generation_is_believed() {
         let project = ProjectId::random();
-        let (old, new, acting) = (MachineId::random(), MachineId::random(), MachineId::random());
+        let (old, new, acting) = (
+            MachineId::random(),
+            MachineId::random(),
+            MachineId::random(),
+        );
         let newer = holding(project, 7, 1);
         let statuses = vec![
             (old, holding(project, 6, 900)),
@@ -138,10 +392,7 @@ mod tests {
         let (other, acting) = (MachineId::random(), MachineId::random());
         let holder = MachineId::random();
         let acting_says = held_by(project, holder, 3);
-        let statuses = vec![
-            (other, no_token(project)),
-            (acting, acting_says.clone()),
-        ];
+        let statuses = vec![(other, no_token(project)), (acting, acting_says.clone())];
 
         let believed = believed(&statuses, &online(&[other, acting]), acting);
 
