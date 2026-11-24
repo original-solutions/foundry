@@ -238,3 +238,24 @@ fn factory_export_exits_2_and_says_not_built_yet() {
     let out = tempfile::tempdir().unwrap();
     assert_not_built(&["factory", "export", out.path().to_str().unwrap()]);
 }
+
+#[test]
+fn secret_set_with_a_token_in_place_of_the_login_never_prints_it() {
+    let home = tempfile::tempdir().unwrap();
+    let name = "github:ghp_secret_like_x_123";
+
+    let out = secret_set(&home, name, "x\n");
+
+    assert_eq!(out.status.code(), Some(1), "{:?}", out.status);
+    assert_eq!(held(&home, name), None, "{name} was stored");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stdout.contains("ghp_secret_like_x_123"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        !stderr.contains("ghp_secret_like_x_123"),
+        "stderr: {stderr}"
+    );
+}

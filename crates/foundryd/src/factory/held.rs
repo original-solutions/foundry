@@ -138,6 +138,7 @@ fn check(
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, PoisonError};
     use std::time::Duration;
 
@@ -165,23 +166,55 @@ mod tests {
         }
     }
 
+    /// Counts how many times a check has listed the names, and gives what the file gives.
+    struct Counting {
+        inner: Arc<FileSecrets>,
+        lists: Arc<AtomicUsize>,
+    }
+
+    impl Secrets for Counting {
+        fn get(&self, name: &str) -> Result<Option<String>, SecretsError> {
+            self.inner.get(name)
+        }
+        fn set(&self, name: &str, value: &str) -> Result<(), SecretsError> {
+            self.inner.set(name, value)
+        }
+        fn update(&self, name: &str, edit: crate::secrets::Edit<'_>) -> Result<(), SecretsError> {
+            self.inner.update(name, edit)
+        }
+        fn names(&self) -> Result<Vec<String>, SecretsError> {
+            self.lists.fetch_add(1, Ordering::SeqCst);
+            self.inner.names()
+        }
+    }
+
     fn rig() -> Rig {
+        rig_counting().0
+    }
+
+    /// A rig, and the number of checks that have started listing names.
+    fn rig_counting() -> (Rig, Arc<AtomicUsize>) {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(Mutex::new(
             Store::open(dir.path().join("foundry.db")).unwrap(),
         ));
         let secrets = Arc::new(FileSecrets::new(dir.path().join("secrets.json")));
+        let lists = Arc::new(AtomicUsize::new(0));
+        let counting = Arc::new(Counting {
+            inner: secrets.clone(),
+            lists: lists.clone(),
+        });
         let clock = Arc::new(FakeClock::new());
         let me = MachineId::random();
         let skill = dir.path().join("SKILL.md");
         let task = tokio::spawn(run_with(
             store.clone(),
             me,
-            secrets.clone(),
+            counting,
             Some(skill.clone()),
             clock.clone(),
         ));
-        Rig {
+        let rig = Rig {
             dir,
             store,
             secrets,
@@ -189,7 +222,8 @@ mod tests {
             me,
             skill,
             task,
-        }
+        };
+        (rig, lists)
     }
 
     fn held(rig: &Rig) -> Option<MachineHeld> {
@@ -384,16 +418,12 @@ mod tests {
     async fn run_warns_once_while_the_store_stays_unreadable() {
         use std::os::unix::fs::PermissionsExt;
         let logged = crate::test_log::Logged::everywhere();
-        let rig = rig();
+        let (rig, lists) = rig_counting();
         let first = version_after(&rig, None).await;
         rig.secrets.set("github:octocat", "ghp_held_seven").unwrap();
         let path = rig.dir.path().join("secrets.json");
         let mark = path.display().to_string();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        for _ in 0..3 {
-            pass(&rig, CHECK_EVERY).await;
-            let_a_check_run();
-        }
         let warnings = |logged: &crate::test_log::Logged| {
             logged
                 .text()
@@ -401,6 +431,13 @@ mod tests {
                 .filter(|line| line.contains(&mark) && line.contains("WARN"))
                 .count()
         };
+        let before = lists.load(Ordering::SeqCst);
+        // Three checks fail; a fourth starting means the third has been handled.
+        for _ in 0..4 {
+            pass(&rig, CHECK_EVERY).await;
+        }
+        wait_for(|| lists.load(Ordering::SeqCst) >= before + 4).await;
+        assert!(lists.load(Ordering::SeqCst) >= before + 4, "checks ran");
         assert_eq!(warnings(&logged), 1, "{}", logged.text());
 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -408,8 +445,49 @@ mod tests {
         assert!(version_after(&rig, first).await > first);
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         pass(&rig, CHECK_EVERY).await;
-        let_a_check_run();
+        wait_for(|| warnings(&logged) >= 2).await;
         assert_eq!(warnings(&logged), 2, "a new failure warns again");
+    }
+
+    /// Waits in real time, up to 5 s, for `done`.
+    async fn wait_for(done: impl Fn() -> bool) {
+        for _ in 0..1_000 {
+            if done() {
+                return;
+            }
+            tokio::task::yield_now().await;
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn check_gives_not_stored_for_a_record_that_is_not_stored_and_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Mutex::new(Store::open(dir.path().join("foundry.db")).unwrap());
+        let secrets = FileSecrets::new(dir.path().join("secrets.json"));
+        let me = MachineId::random();
+        let stale = MachineHeld {
+            logins: vec!["old".into()],
+            skill: true,
+        };
+        let applied = store
+            .lock()
+            .unwrap()
+            .apply_factory(
+                &FactoryRecord {
+                    owner: me,
+                    version: 1_000,
+                    body: FactoryBody::Held(stale.clone()),
+                },
+                me,
+            )
+            .unwrap();
+        assert_eq!(applied, Applied::Stored);
+
+        let result = check(&store, me, &secrets, None, None);
+
+        assert!(matches!(result, Err(HeldError::NotStored(_))), "{result:?}");
+        assert_eq!(store.lock().unwrap().held(me).unwrap(), Some(stale));
     }
 
     #[test]

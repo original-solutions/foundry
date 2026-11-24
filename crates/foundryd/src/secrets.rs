@@ -1384,6 +1384,9 @@ mod tests {
             let error = set_from(&secrets, name, input).unwrap_err();
             assert!(matches!(error, SetError::UnknownName { .. }), "{name}");
             assert!(error.to_string().contains("github:<login>"), "{error}");
+            if name != "github:" {
+                assert!(!error.to_string().contains(name), "{error}");
+            }
             assert_eq!(stored(&secrets, name), None, "{name}");
         }
         assert!(secrets.names().unwrap().is_empty());
@@ -1509,6 +1512,43 @@ mod tests {
         }
         fn update(&self, _: &str, _: Edit<'_>) -> Result<(), SecretsError> {
             Ok(())
+        }
+    }
+
+    /// A store that lists a name but cannot read any value.
+    struct CannotGet {
+        fail_on: &'static str,
+    }
+    impl Secrets for CannotGet {
+        fn get(&self, name: &str) -> Result<Option<String>, SecretsError> {
+            if name == self.fail_on {
+                Err(SecretsError::Unreadable {
+                    path: "secrets.json".into(),
+                })
+            } else {
+                Ok(None)
+            }
+        }
+        fn set(&self, _: &str, _: &str) -> Result<(), SecretsError> {
+            Ok(())
+        }
+        fn update(&self, _: &str, _: Edit<'_>) -> Result<(), SecretsError> {
+            Ok(())
+        }
+        fn names(&self) -> Result<Vec<String>, SecretsError> {
+            Ok(vec!["github:octocat".into()])
+        }
+    }
+
+    #[test]
+    fn hide_known_fails_closed_when_a_listed_secret_cannot_be_read() {
+        for fail_on in ["github:octocat", GATEWAY] {
+            let store = CannotGet { fail_on };
+            assert_eq!(
+                hide_known("carrying ghp_x", &store),
+                HIDDEN_UNREADABLE,
+                "{fail_on}"
+            );
         }
     }
 
