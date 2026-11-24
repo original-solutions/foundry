@@ -2129,7 +2129,7 @@ mod tests {
     }
 
     #[test]
-    fn a_write_gives_each_text_to_its_hider_once_and_as_it_came() {
+    fn a_write_gives_its_data_to_its_hider_once_and_a_cause_again_when_its_strip_changed_it() {
         let (_dir, store) = open_store();
         let seen = std::sync::Arc::new(Mutex::new(Vec::<String>::new()));
         let hide: Hide = {
@@ -2157,9 +2157,13 @@ mod tests {
             [
                 format!("{}\u{7}\nend", "o".repeat(OUTPUT_LIMIT)),
                 "r\u{7}\nr".to_owned(),
+                "rr".to_owned(),
                 "a\u{202e}a".to_owned(),
+                "aa".to_owned(),
                 "c\tc".to_owned(),
+                "cc".to_owned(),
                 "l\u{1b}[0ml".to_owned(),
+                "l[0ml".to_owned(),
             ]
         );
     }
