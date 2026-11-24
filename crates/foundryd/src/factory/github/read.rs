@@ -35,14 +35,17 @@ pub(crate) fn decode<T: DeserializeOwned>(
     expected: &str,
     text: &str,
 ) -> Result<T, TrackerError> {
-    serde_json::from_str(text).map_err(|error| {
-        let why = error
-            .to_string()
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        parse_error(args, &format!("{expected} ({why})"))
-    })
+    serde_json::from_str(text).map_err(|error| decode_error(args, expected, &error))
+}
+
+/// The parse error for the call with `args`, with serde's complaint on one line.
+fn decode_error(args: &[String], expected: &str, error: &serde_json::Error) -> TrackerError {
+    let why = error
+        .to_string()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    parse_error(args, &format!("{expected} ({why})"))
 }
 
 /// Runs `gh api --paginate` and collects the rows of every JSON array in stdout: gh prints
@@ -57,69 +60,16 @@ where
     G: Tracker + ?Sized,
 {
     let stdout = gh.gh(args)?;
-    let pages = split_json_values(&stdout);
-    if pages.is_empty() {
+    let mut rows = Vec::new();
+    let mut pages = 0;
+    for page in serde_json::Deserializer::from_str(&stdout).into_iter::<Vec<T>>() {
+        rows.extend(page.map_err(|error| decode_error(args, expected, &error))?);
+        pages += 1;
+    }
+    if pages == 0 {
         return Err(parse_error(args, &format!("{expected} (output was empty)")));
     }
-    let mut rows = Vec::new();
-    for page in pages {
-        rows.extend(decode::<Vec<T>>(args, expected, page)?);
-    }
     Ok(rows)
-}
-
-fn is_json_space(c: u8) -> bool {
-    matches!(c, b' ' | b'\n' | b'\r' | b'\t')
-}
-
-/// Splits text holding several top-level JSON values (`gh --paginate` prints one array per
-/// page) into the text of each. Brackets and quotes inside strings do not count. A value that
-/// is cut short comes back as is, for the decoder to refuse.
-pub(crate) fn split_json_values(text: &str) -> Vec<&str> {
-    let bytes = text.as_bytes();
-    let mut values = Vec::new();
-    let mut i = 0;
-    loop {
-        while i < bytes.len() && is_json_space(bytes[i]) {
-            i += 1;
-        }
-        if i >= bytes.len() {
-            return values;
-        }
-        let start = i;
-        let mut depth = 0i64;
-        let mut in_string = false;
-        while i < bytes.len() {
-            let c = bytes[i];
-            if in_string {
-                if c == b'\\' {
-                    i += 1;
-                } else if c == b'"' {
-                    in_string = false;
-                    if depth == 0 {
-                        i += 1;
-                        break;
-                    }
-                }
-            } else if c == b'"' {
-                in_string = true;
-            } else if c == b'[' || c == b'{' {
-                depth += 1;
-            } else if c == b']' || c == b'}' {
-                depth -= 1;
-                if depth <= 0 {
-                    i += 1;
-                    break;
-                }
-            } else if depth == 0 && is_json_space(c) {
-                break;
-            }
-            i += 1;
-        }
-        let end = i.min(bytes.len());
-        // Every boundary above is an ASCII byte, so the slice is on character boundaries.
-        values.push(&text[start..end]);
-    }
 }
 
 /// The arguments of a GraphQL `query` about issue or pull request `number` of `repo`, or the
@@ -1017,8 +967,14 @@ const COMMENT_EDITOR_IDS: usize = 100;
 /// read fails.
 pub const REVIEW_PAGE_LIMIT: usize = 20;
 
+/// The most pages of 100 conversation comments one feedback read takes, as for reviews: 2,000
+/// comments between two reads is GitHub misbehaving, and then every read fails.
+pub const COMMENT_PAGE_LIMIT: usize = 20;
+
 /// The newest 50 reviews with the first 50 diff comments each, and the newest 100 conversation
-/// comments. `pageInfo { startCursor }` lets `pr_feedback` page back ([`REVIEWS_BEFORE_QUERY`]).
+/// comments. `totalCount` and `pageInfo { startCursor }` on each let `pr_feedback` page back
+/// ([`REVIEWS_BEFORE_QUERY`], [`COMMENTS_BEFORE_QUERY`]); softfac reads only the newest 100
+/// comments.
 /// `userContentEdits(first: 20)` keeps the nested query within GitHub's node limit; a longer
 /// history is cut off and untrusted. Inline editors: [`COMMENT_EDITOR_QUERY`]. Priced at 2
 /// points.
@@ -1031,7 +987,7 @@ pub const PR_FEEDBACK_QUERY: &str = concat!(
     "userContentEdits(first: 20) { totalCount nodes { editedAt editor { __typename login } } } ",
     "comments(first: 50) { totalCount nodes { id body path line originalLine author { __typename login } ",
     "lastEditedAt } } } } ",
-    "comments(last: 100) { nodes { ",
+    "comments(last: 100) { totalCount pageInfo { startCursor } nodes { ",
     "fullDatabaseId body createdAt author { __typename login } ",
     "lastEditedAt editor { __typename login } ",
     "userContentEdits(first: 20) { totalCount nodes { editedAt editor { __typename login } } } } } } } }",
@@ -1048,6 +1004,17 @@ pub const REVIEWS_BEFORE_QUERY: &str = concat!(
     "userContentEdits(first: 20) { totalCount nodes { editedAt editor { __typename login } } } ",
     "comments(first: 50) { totalCount nodes { id body path line originalLine author { __typename login } ",
     "lastEditedAt } } } } } } }",
+);
+
+/// The 100 conversation comments before the cursor `$before`, oldest first: the page
+/// [`PR_FEEDBACK_QUERY`] cut off. The comment fields are the same as there (1 point).
+pub const COMMENTS_BEFORE_QUERY: &str = concat!(
+    "query($owner: String!, $name: String!, $number: Int!, $before: String!) { ",
+    "repository(owner: $owner, name: $name) { pullRequest(number: $number) { ",
+    "comments(last: 100, before: $before) { totalCount pageInfo { startCursor } nodes { ",
+    "fullDatabaseId body createdAt author { __typename login } ",
+    "lastEditedAt editor { __typename login } ",
+    "userContentEdits(first: 20) { totalCount nodes { editedAt editor { __typename login } } } } } } } }",
 );
 
 /// Who did something. `typename` is only there when the query asked for it; a rule that wants
@@ -1518,15 +1485,16 @@ struct PageInfo {
     start_cursor: Option<String>,
 }
 
-/// A page of reviews, oldest first, with the cursor of its first review.
+/// A page of reviews or conversation comments, oldest first, with GitHub's count of all of them
+/// and the cursor of its first node.
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct FeedbackReviews {
+struct Page<N> {
     #[serde(default)]
     total_count: Option<u64>,
     #[serde(default)]
     page_info: Option<PageInfo>,
-    nodes: Vec<FeedbackReview>,
+    nodes: Vec<N>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1548,14 +1516,9 @@ struct FeedbackPrComment {
 }
 
 #[derive(serde::Deserialize)]
-struct FeedbackComments {
-    nodes: Vec<FeedbackPrComment>,
-}
-
-#[derive(serde::Deserialize)]
 struct FeedbackPull {
-    reviews: FeedbackReviews,
-    comments: FeedbackComments,
+    reviews: Page<FeedbackReview>,
+    comments: Page<FeedbackPrComment>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1576,26 +1539,71 @@ struct FeedbackRepository {
     pull_request: Option<FeedbackPull>,
 }
 
+/// The answer to a paging query: one page of the list it asks for.
 #[derive(serde::Deserialize)]
-struct ReviewsBeforeAnswer {
-    data: ReviewsBeforeData,
+struct BeforeAnswer<N> {
+    data: BeforeData<N>,
 }
 
 #[derive(serde::Deserialize)]
-struct ReviewsBeforeData {
-    repository: ReviewsBeforeRepository,
+struct BeforeData<N> {
+    repository: BeforeRepository<N>,
 }
 
+/// `pullRequest` is null when the pull request is gone.
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ReviewsBeforeRepository {
-    #[serde(default)]
-    pull_request: Option<ReviewsOnly>,
+struct BeforeRepository<N> {
+    pull_request: Option<BeforePull<N>>,
 }
 
+/// The one list a paging query asks for, under GitHub's name for it.
 #[derive(serde::Deserialize)]
-struct ReviewsOnly {
-    reviews: FeedbackReviews,
+struct BeforePull<N> {
+    #[serde(alias = "reviews", alias = "comments")]
+    page: Page<N>,
+}
+
+/// A list of a pull request that [`pr_feedback`] pages back through.
+struct PagedList<N> {
+    /// What the list holds, for error text.
+    name: &'static str,
+    /// What a node's time is called, for error text.
+    time_name: &'static str,
+    /// When a node was written or submitted; `None` for a review still pending.
+    time: fn(&N) -> Option<&str>,
+    /// The query for the page before a cursor.
+    before_query: &'static str,
+    /// How many nodes one page holds.
+    page_size: usize,
+    /// The most pages one read takes.
+    page_limit: usize,
+}
+
+const REVIEWS: PagedList<FeedbackReview> = PagedList {
+    name: "reviews",
+    time_name: "a review time",
+    time: review_time,
+    before_query: REVIEWS_BEFORE_QUERY,
+    page_size: 50,
+    page_limit: REVIEW_PAGE_LIMIT,
+};
+
+const CONVERSATION_COMMENTS: PagedList<FeedbackPrComment> = PagedList {
+    name: "conversation comments",
+    time_name: "a comment time",
+    time: comment_time,
+    before_query: COMMENTS_BEFORE_QUERY,
+    page_size: 100,
+    page_limit: COMMENT_PAGE_LIMIT,
+};
+
+fn review_time(review: &FeedbackReview) -> Option<&str> {
+    review.submitted_at.as_deref()
+}
+
+fn comment_time(comment: &FeedbackPrComment) -> Option<&str> {
+    Some(&comment.created_at)
 }
 
 /// The review states whose inline comments are read: every submitted one.
@@ -1819,7 +1827,9 @@ pub fn activity_since<G: Tracker + ?Sized>(
         .user_content_edits
         .nodes
         .iter()
-        .filter(|edit| edit.edited_at.as_str() > since)
+        // The same second counts as after, as in `text_changes_since`: a stranger's edit in the
+        // second of `since` may have come after the last read.
+        .filter(|edit| edit.edited_at.as_str() >= since)
         .all(|edit| is_human_instructor(edit.editor.as_ref(), instructors));
     let body_edit = match (&found.last_edited_at, &found.editor) {
         (Some(edited_at), Some(editor))
@@ -1932,7 +1942,16 @@ pub fn pr_feedback<G: Tracker + ?Sized>(
         is_human_instructor(author, instructors) && !is_factory_comment(body.unwrap_or_default())
     };
 
-    let reviews = reviews_since(gh, repo, pr, floor, &args, pull.reviews)?;
+    let reviews = page_back(gh, repo, pr, floor, &args, pull.reviews, &REVIEWS)?;
+    let comments = page_back(
+        gh,
+        repo,
+        pr,
+        floor,
+        &args,
+        pull.comments,
+        &CONVERSATION_COMMENTS,
+    )?;
     // The reviews to judge, with the time each was submitted.
     let mut judged: Vec<(FeedbackReview, String)> = Vec::new();
     for review in reviews {
@@ -2043,7 +2062,7 @@ pub fn pr_feedback<G: Tracker + ?Sized>(
         });
     }
 
-    for comment in &pull.comments.nodes {
+    for comment in &comments {
         if !theirs(comment.author.as_ref(), comment.body.as_deref())
             || !text_is_instructors(
                 comment.last_edited_at.as_deref(),
@@ -2080,26 +2099,33 @@ pub fn pr_feedback<G: Tracker + ?Sized>(
     Ok(found)
 }
 
-/// Every review of pull request `pr` that may be new, oldest first: the newest page `first` and
-/// the pages before it, read with `before:` until one starts at or before `floor` or is empty.
-/// A repeated cursor, a page past [`REVIEW_PAGE_LIMIT`], a missing cursor or a vanished pull
-/// request is an error (`args` names the call): a read short of `floor` must not pass as empty.
-fn reviews_since<G: Tracker + ?Sized>(
+/// Every node of `list` on pull request `pr` that may be new, oldest first: the newest page
+/// `first` and the pages before it, read with `before:` until one starts at or before `floor` or
+/// is empty. A repeated cursor, a page past the list's limit, a missing cursor or a vanished
+/// pull request is an error (`args` names the call): a read short of `floor` must not pass as
+/// empty.
+fn page_back<G, N>(
     gh: &G,
     repo: &str,
     pr: u64,
     floor: &str,
     args: &[String],
-    first: FeedbackReviews,
-) -> Result<Vec<FeedbackReview>, TrackerError> {
+    first: Page<N>,
+    list: &PagedList<N>,
+) -> Result<Vec<N>, TrackerError>
+where
+    G: Tracker + ?Sized,
+    N: DeserializeOwned,
+{
+    let name = list.name;
     let total = first.total_count.unwrap_or(0);
     let mut cursor = first.page_info.and_then(|info| info.start_cursor);
-    let mut reviews = first.nodes;
+    let mut nodes = first.nodes;
     let mut pages = 1;
-    while total > reviews.len() as u64 {
-        // The oldest review read is proven old only by a submission time at or before `floor`.
-        if let Some(at) = reviews.first().and_then(|r| r.submitted_at.as_deref()) {
-            require_utc_second(args, "a review time", at)?;
+    while total > nodes.len() as u64 {
+        // The oldest node read is proven old only by a time at or before `floor`.
+        if let Some(at) = nodes.first().and_then(list.time) {
+            require_utc_second(args, list.time_name, at)?;
             if at <= floor {
                 break;
             }
@@ -2108,47 +2134,50 @@ fn reviews_since<G: Tracker + ?Sized>(
             return Err(parse_error(
                 args,
                 &format!(
-                    "a cursor for the reviews before the oldest one read, since there are {total} and {} were read",
-                    reviews.len()
+                    "a cursor for the {name} before the oldest one read, since there are {total} and {} were read",
+                    nodes.len()
                 ),
             ));
         };
-        if pages >= REVIEW_PAGE_LIMIT {
+        if pages >= list.page_limit {
             return Err(parse_error(
                 args,
-                &format!("the reviews since {floor} within {REVIEW_PAGE_LIMIT} pages of 50"),
+                &format!(
+                    "the {name} since {floor} within {} pages of {}",
+                    list.page_limit, list.page_size
+                ),
             ));
         }
-        let mut page_args = issue_query_args(repo, REVIEWS_BEFORE_QUERY, pr)?;
+        let mut page_args = issue_query_args(repo, list.before_query, pr)?;
         page_args.push("-f".to_string());
         page_args.push(format!("before={before}"));
-        let answer: ReviewsBeforeAnswer = gh_json(
+        let answer: BeforeAnswer<N> = gh_json(
             gh,
             &page_args,
-            "a GraphQL response with the earlier reviews",
+            &format!("a GraphQL response with the earlier {name}"),
         )?;
         pages += 1;
         let Some(pull) = answer.data.repository.pull_request else {
             return Err(parse_error(
                 &page_args,
-                "the pull request on every page of its reviews",
+                &format!("the pull request on every page of its {name}"),
             ));
         };
         // GitHub answers `before:` the oldest cursor with an empty page: the start of the list
         // was reached, and everything was read even if `totalCount` counted more.
-        if pull.reviews.nodes.is_empty() {
+        if pull.page.nodes.is_empty() {
             break;
         }
-        cursor = pull.reviews.page_info.and_then(|info| info.start_cursor);
+        cursor = pull.page.page_info.and_then(|info| info.start_cursor);
         if cursor.as_deref() == Some(before.as_str()) {
             return Err(parse_error(
                 &page_args,
-                &format!("a new cursor for the reviews before {before}, got the same one again"),
+                &format!("a new cursor for the {name} before {before}, got the same one again"),
             ));
         }
-        reviews.splice(0..0, pull.reviews.nodes);
+        nodes.splice(0..0, pull.page.nodes);
     }
-    Ok(reviews)
+    Ok(nodes)
 }
 
 #[cfg(test)]
@@ -2166,13 +2195,6 @@ mod tests {
     #[test]
     fn pages_split_correctly_around_brackets_and_quotes_inside_strings() {
         let pages = "[{\"id\":1,\"body\":\"] [ } \\\" {\"}]\n[{\"id\":3,\"body\":\"s\"}]";
-        assert_eq!(
-            split_json_values(pages),
-            vec![
-                "[{\"id\":1,\"body\":\"] [ } \\\" {\"}]",
-                "[{\"id\":3,\"body\":\"s\"}]"
-            ]
-        );
         #[derive(serde::Deserialize)]
         struct Row {
             id: u64,
@@ -2180,6 +2202,23 @@ mod tests {
         let fake = FakeTracker::answering([Answer::ok(pages)]);
         let rows: Vec<Row> = gh_pages(&fake, &args(&["api", "x", "--paginate"]), "rows").unwrap();
         assert_eq!(rows.iter().map(|r| r.id).collect::<Vec<_>>(), vec![1, 3]);
+    }
+
+    #[test]
+    fn pages_printed_back_to_back_are_read_and_a_page_cut_short_is_a_parse_error() {
+        #[derive(Debug, serde::Deserialize)]
+        struct Row {
+            id: u64,
+        }
+        let call = args(&["api", "x", "--paginate"]);
+        let fake = FakeTracker::answering([Answer::ok("[{\"id\":1}][{\"id\":2}]")]);
+        let rows: Vec<Row> = gh_pages(&fake, &call, "rows").unwrap();
+        assert_eq!(rows.iter().map(|r| r.id).collect::<Vec<_>>(), vec![1, 2]);
+        for cut in ["[{\"id\":1}][{\"id\":2}", "[{\"id\":1}] x", "{\"id\":1}"] {
+            let fake = FakeTracker::answering([Answer::ok(cut)]);
+            let error = gh_pages::<Row, _>(&fake, &call, "rows").unwrap_err();
+            assert!(is_parse(&error), "{cut}: {error}");
+        }
     }
 
     #[test]
@@ -2483,6 +2522,14 @@ mod tests {
                 want
             );
         }
+    }
+
+    #[test]
+    fn file_at_refuses_base64_whose_padding_bits_are_not_zero() {
+        // `YR==` fits its padding and its length, but its four leftover bits are not zero.
+        let fake = FakeTracker::answering([Answer::ok(file_reply("file", "base64", 1, "YR=="))]);
+        let error = file_at(&fake, REPO, ".dw/config.yml", FILE_SHA).unwrap_err();
+        assert!(is_parse(&error), "{error}");
     }
 
     #[test]
@@ -6296,6 +6343,28 @@ mod tests {
     }
 
     #[test]
+    fn a_strangers_edit_in_the_same_second_as_since_keeps_the_body_from_being_forwarded() {
+        // Timestamps have no finer order than the second, so a stranger's edit in the second of
+        // `since` may have come after the last read: fail closed, as `text_changes_since` does.
+        let body_edit_with_stranger_at = |at: &str| {
+            let last = e("2026-10-04T10:05:00Z", "tom");
+            let history = [e(CREATED, "tom"), e(at, "stranger"), last];
+            let fake = answering(&[
+                "[]".into(),
+                body_reply_raw("b", Some(last), &newest_first(&history), 3),
+            ]);
+            activity_of(&fake, &["tom"]).body_edit
+        };
+        assert_eq!(body_edit_with_stranger_at(ACT_SINCE), None);
+        assert_eq!(
+            body_edit_with_stranger_at("2026-10-04T09:59:59Z")
+                .map(|edit| edit.edited_at)
+                .as_deref(),
+            Some("2026-10-04T10:05:00Z")
+        );
+    }
+
+    #[test]
     fn a_body_edit_by_an_app_with_an_instructors_login_is_not_forwarded() {
         let app = bot("tom");
         let at = "2026-10-04T10:30:00Z";
@@ -6554,6 +6623,35 @@ mod tests {
         .to_string()
     }
 
+    fn comments_before_call(cursor: &str) -> Vec<String> {
+        feedback_call(COMMENTS_BEFORE_QUERY, &["-f", &format!("before={cursor}")])
+    }
+
+    /// A reply with no reviews whose conversation comments say how many there are in all and
+    /// where the first one starts.
+    fn comments_paged_reply(comments: &[Value], total: u64, cursor: Option<&str>) -> String {
+        json!({"data": {"repository": {"pullRequest": {
+            "reviews": {"nodes": []},
+            "comments": {"totalCount": total, "pageInfo": {"startCursor": cursor}, "nodes": comments},
+        }}}})
+        .to_string()
+    }
+
+    /// A reply to the conversation comments' paging query.
+    fn comments_page(comments: &[Value], total: u64, cursor: &str) -> String {
+        json!({"data": {"repository": {"pullRequest": {
+            "comments": {"totalCount": total, "pageInfo": {"startCursor": cursor}, "nodes": comments},
+        }}}})
+        .to_string()
+    }
+
+    /// A full page of conversation comments by a stranger, all after [`FB_SINCE`].
+    fn hundred_new_comments() -> Vec<Value> {
+        (0..100)
+            .map(|i| pr_comment_node(1000 + i, "noise", "2026-10-04T11:00:00Z", "stranger"))
+            .collect()
+    }
+
     const GONE: &str = r#"{"data":{"repository":{"pullRequest":null}}}"#;
 
     fn review_node(
@@ -6713,10 +6811,16 @@ mod tests {
     }
 
     #[test]
-    fn the_feedback_queries_are_softfacs_byte_for_byte() {
+    fn the_feedback_queries_are_softfacs_with_a_count_and_a_cursor_on_the_conversation_comments() {
+        // softfac reads only the newest 100 conversation comments; this port also asks for the
+        // count and the cursor, to page back as it does for reviews.
+        let softfac = "query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { pullRequest(number: $number) { reviews(last: 50) { totalCount pageInfo { startCursor } nodes { fullDatabaseId state body submittedAt author { __typename login } lastEditedAt editor { __typename login } userContentEdits(first: 20) { totalCount nodes { editedAt editor { __typename login } } } comments(first: 50) { totalCount nodes { id body path line originalLine author { __typename login } lastEditedAt } } } } comments(last: 100) { nodes { fullDatabaseId body createdAt author { __typename login } lastEditedAt editor { __typename login } userContentEdits(first: 20) { totalCount nodes { editedAt editor { __typename login } } } } } } } }";
         assert_eq!(
             PR_FEEDBACK_QUERY,
-            "query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { pullRequest(number: $number) { reviews(last: 50) { totalCount pageInfo { startCursor } nodes { fullDatabaseId state body submittedAt author { __typename login } lastEditedAt editor { __typename login } userContentEdits(first: 20) { totalCount nodes { editedAt editor { __typename login } } } comments(first: 50) { totalCount nodes { id body path line originalLine author { __typename login } lastEditedAt } } } } comments(last: 100) { nodes { fullDatabaseId body createdAt author { __typename login } lastEditedAt editor { __typename login } userContentEdits(first: 20) { totalCount nodes { editedAt editor { __typename login } } } } } } } }"
+            softfac.replace(
+                "comments(last: 100) { nodes {",
+                "comments(last: 100) { totalCount pageInfo { startCursor } nodes {"
+            )
         );
         assert_eq!(
             REVIEWS_BEFORE_QUERY,
@@ -6726,7 +6830,12 @@ mod tests {
 
     /// The text of the `{ ... }` that follows the first `reviews(` in `query`.
     fn reviews_selection(query: &str) -> &str {
-        let from = query.find("reviews(").unwrap();
+        selection_after(query, "reviews(")
+    }
+
+    /// The text of the `{ ... }` that follows the first `start` in `query`.
+    fn selection_after<'a>(query: &'a str, start: &str) -> &'a str {
+        let from = query.find(start).unwrap();
         let open = from + query[from..].find('{').unwrap();
         let mut depth = 0;
         for (at, c) in query[open..].char_indices() {
@@ -6741,7 +6850,7 @@ mod tests {
                 _ => {}
             }
         }
-        panic!("no closing brace for the reviews selection in {query}");
+        panic!("no closing brace after {start} in {query}");
     }
 
     #[test]
@@ -6749,6 +6858,16 @@ mod tests {
         let first = reviews_selection(PR_FEEDBACK_QUERY);
         assert!(first.contains("fullDatabaseId"));
         assert_eq!(first, reviews_selection(REVIEWS_BEFORE_QUERY));
+    }
+
+    #[test]
+    fn both_feedback_queries_select_the_same_conversation_comment_fields() {
+        let first = selection_after(PR_FEEDBACK_QUERY, "comments(last: 100");
+        assert!(first.contains("fullDatabaseId body createdAt"));
+        assert_eq!(
+            first,
+            selection_after(COMMENTS_BEFORE_QUERY, "comments(last: 100")
+        );
     }
 
     #[test]
@@ -7028,6 +7147,22 @@ mod tests {
             feedback_ids(&got),
             vec!["review:14", "review:15", "review:16"]
         );
+    }
+
+    #[test]
+    fn a_dismissed_review_with_a_blank_body_is_feedback_for_its_inline_comments() {
+        let got = read_feedback(&feedback_reply(
+            &[review_node(
+                12,
+                "DISMISSED",
+                "  \n",
+                Some("2026-10-04T11:01:00Z"),
+                "rawphp",
+                &[inline_node("nit", "src/a.rs", 3, "rawphp")],
+            )],
+            &[],
+        ));
+        assert_eq!(feedback_ids(&got), vec!["review:12"]);
     }
 
     #[test]
@@ -7490,6 +7625,129 @@ mod tests {
         ))]);
         read(&fake);
         assert_eq!(fake.calls().len(), 1);
+    }
+
+    #[test]
+    fn an_instructor_comment_pushed_out_of_the_newest_hundred_is_read_from_the_page_before() {
+        let instructors = pr_comment_node(21, "please fix", "2026-10-04T10:31:00Z", "rawphp");
+        let fake = FakeTracker::answering([
+            Answer::ok(comments_paged_reply(
+                &hundred_new_comments(),
+                101,
+                Some("k1"),
+            )),
+            Answer::ok(comments_page(&[instructors], 101, "k0")),
+        ]);
+        assert_eq!(feedback_ids(&read(&fake)), vec!["pr-comment:21"]);
+        assert_eq!(
+            fake.calls(),
+            vec![
+                feedback_call(PR_FEEDBACK_QUERY, &[]),
+                comments_before_call("k1")
+            ]
+        );
+    }
+
+    #[test]
+    fn conversation_comments_page_back_only_while_the_oldest_read_is_after_the_floor() {
+        let mut at_floor = hundred_new_comments();
+        at_floor[0]["createdAt"] = json!(FB_SINCE);
+        for reply in [
+            comments_paged_reply(&at_floor, 500, Some("k1")),
+            comments_paged_reply(&hundred_new_comments(), 100, Some("k1")),
+        ] {
+            let fake = FakeTracker::answering([Answer::ok(reply)]);
+            read(&fake);
+            assert_eq!(fake.calls().len(), 1);
+        }
+        // Past `since` but not yet at the floor, so the page before is read too.
+        let older = pr_comment_node(21, "between", "2026-10-04T10:40:00Z", "rawphp");
+        let fake = FakeTracker::answering([
+            Answer::ok(comments_paged_reply(
+                &hundred_new_comments(),
+                101,
+                Some("k1"),
+            )),
+            Answer::ok(comments_page(&[older], 101, "k0")),
+        ]);
+        let got = read_with(&fake, FB_SINCE, "2026-10-04T10:50:00Z");
+        assert_eq!(feedback_ids(&got), vec!["pr-comment:21"]);
+        assert_eq!(fake.calls().len(), 2);
+    }
+
+    #[test]
+    fn an_empty_page_before_the_cursor_ends_the_conversation_comments() {
+        let fake = FakeTracker::answering([
+            Answer::ok(comments_paged_reply(
+                &hundred_new_comments(),
+                150,
+                Some("k1"),
+            )),
+            Answer::ok(comments_page(&[], 150, "k0")),
+        ]);
+        assert_eq!(read(&fake), vec![]);
+        assert_eq!(fake.calls().len(), 2);
+    }
+
+    #[test]
+    fn conversation_comments_short_of_the_floor_with_no_way_back_are_an_error() {
+        let noise = [pr_comment_node(
+            7,
+            "noise",
+            "2026-10-04T10:40:00Z",
+            "stranger",
+        )];
+        // No cursor for the page before.
+        let fake = FakeTracker::answering([Answer::ok(comments_paged_reply(
+            &hundred_new_comments(),
+            101,
+            None,
+        ))]);
+        assert!(is_parse(&feedback_error(&fake)));
+        assert_eq!(fake.calls().len(), 1);
+        // The cursor that was just sent, again.
+        let fake = FakeTracker::answering([
+            Answer::ok(comments_paged_reply(
+                &hundred_new_comments(),
+                1000,
+                Some("k1"),
+            )),
+            Answer::ok(comments_page(&noise, 1000, "k1")),
+        ]);
+        assert!(is_parse(&feedback_error(&fake)));
+        assert_eq!(fake.calls().len(), 2);
+        // The pull request gone between pages.
+        let fake = FakeTracker::answering([
+            Answer::ok(comments_paged_reply(
+                &hundred_new_comments(),
+                1000,
+                Some("k1"),
+            )),
+            Answer::ok(GONE),
+        ]);
+        assert!(is_parse(&feedback_error(&fake)));
+        // More pages than the limit.
+        let mut answers = vec![Answer::ok(comments_paged_reply(
+            &hundred_new_comments(),
+            1_000_000,
+            Some("k1"),
+        ))];
+        for i in 1..COMMENT_PAGE_LIMIT + 5 {
+            answers.push(Answer::ok(comments_page(
+                &noise,
+                1_000_000,
+                &format!("k{}", i + 1),
+            )));
+        }
+        let fake = FakeTracker::answering(answers);
+        assert!(is_parse(&feedback_error(&fake)));
+        assert_eq!(fake.calls().len(), COMMENT_PAGE_LIMIT);
+    }
+
+    #[test]
+    fn the_page_limit_is_twenty_pages_of_a_hundred_conversation_comments() {
+        assert_eq!(COMMENT_PAGE_LIMIT, 20);
+        assert!(COMMENTS_BEFORE_QUERY.contains("comments(last: 100, before: $before)"));
     }
 
     #[test]
