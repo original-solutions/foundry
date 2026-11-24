@@ -19,11 +19,16 @@
 //!
 //! A workspace made for the factory carries a [`FactoryTag`]. It is marked in a file beside its
 //! folder, `<workspace id>.factory`, so a create with the same tag and name answers with the
-//! workspace already made and makes nothing new: no fetch, no branch, no terminal. Only when
-//! that workspace's record names no setup terminal, because its first create could not start
-//! or record it, does the answer start the setup now, as a create does, before it answers. A
-//! marker that cannot be parsed is skipped and logged; a folder or the store that cannot be
-//! read fails the create, so it never makes a second workspace for a tag that may have one.
+//! workspace already made and makes nothing new: no fetch, no branch. The marker holds what the
+//! first create's setup was due to run, the command line it resolved or none, and is written
+//! before the record and before the setup starts. A same-tag create finds one of three states
+//! and ignores its own setup: the record names a setup terminal, and the answer is the id; the
+//! record names none but a terminal of the workspace is open, which the first create started and
+//! did not record, and that terminal is recorded as the setup and nothing is started; there is
+//! no terminal, and the marker's command line, if it holds one, is started and recorded as a
+//! create does, and if it holds none nothing is started. A marker that cannot be parsed is
+//! skipped and logged; a folder or the store that cannot be read fails the create, so it never
+//! makes a second workspace for a tag that may have one.
 //! Its setup terminal gets no token in its environment and has git's credential helpers turned
 //! off ([`crate::git_auth::helpers_off_env`]). That is the environment only. The terminal runs
 //! as the daemon's user, so code in it can read what that user can, the machine's secret store
@@ -31,16 +36,14 @@
 //!
 //! For a project whose factory is on, the fetch is made with the login's token
 //! ([`crate::git_auth::GitAuth`]), and that call must read no config other code can write. The
-//! clone's config is shared with every worktree, so the token never goes to it. It goes to the
-//! fetch repo, a bare repo at `<data dir>/fetches/<project>.git` that is made with no template,
-//! so no hook or info comes with it, and has no remote. Before every token call its `config`
-//! file is written again with the few lines a bare repo needs, to a file beside it and renamed
-//! over it, so what another process of the daemon's user put there since is gone before git
-//! reads it; this narrows what the call reads and is no lock against such a process. The call
-//! fetches by the project's URL with explicit refspecs into that repo, and the clone then
-//! fetches from it without the token, branches and tags. A file `<project>.url` beside the
-//! fetch repo holds the URL it last fetched; when the project's repo is another, the fetch repo
-//! is made again, so no ref of the old repo reaches the clone.
+//! clone's config is shared with every worktree, so the token never goes to it. Every token
+//! fetch gets a new repo: under the project's lock, whatever is at
+//! `<data dir>/fetches/<project>.git` is removed, a bare repo is made there with no template, so
+//! no hook, info file or config comes with it, and the call runs with `GIT_DIR` and `GIT_COMMON_DIR` set to it after the token's
+//! hardening, so no file in it and no discovery from the folder the call runs in can lead git to
+//! another repo. It fetches by the project's URL with explicit refspecs into that repo, the
+//! clone then fetches from it without the token, branches and tags, and the repo is removed. As
+//! the runner's gate does, each token fetch downloads the repo's branches whole.
 //!
 //! A create never touches what it did not make, with one exception the spec asks for: a
 //! [`Checkout::Branch`] moves a local branch of that name to `origin`'s, and logs the commits
@@ -52,7 +55,7 @@
 //! hold the project as it writes the record, so a project removed while its clone, fetch and
 //! worktree were made fails the create, which takes back what it made.
 //!
-//! //! Archiving refuses while there is uncommitted or unpushed work, unless forced. Uncommitted
+//! Archiving refuses while there is uncommitted or unpushed work, unless forced. Uncommitted
 //! work is a changed, deleted or new file that git does not ignore; ignored files, such as build
 //! output, go with the worktree. Unpushed work is a commit on the branch, or on whatever the
 //! worktree has checked out, that no remote branch has. A checked-out submodule is refused too,
@@ -180,11 +183,6 @@ for command do
   fi
 done
 printf 'setup passed\n'"#;
-
-/// What the fetch repo's `config` holds before every call with a token: what `git init --bare`
-/// writes, and no remote, no URL rewrite and no include.
-const FETCH_CONFIG: &str =
-    "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n";
 
 /// Prints the reason given after it and fails.
 const SETUP_UNREADABLE: &str = r#"printf 'setup failed: %s\n' "$1"; exit 1"#;
@@ -334,6 +332,10 @@ struct Marker {
     project: ProjectId,
     run: String,
     name: String,
+    /// What the first create's setup was due to run, as it resolved it: none when it chose no
+    /// setup or had none to run. A marker made before this field was kept reads as none.
+    #[serde(default)]
+    setup: Option<Vec<String>>,
 }
 
 /// Whether `branch` is no ordinary branch name and must not reach a command: it is empty, starts
@@ -729,15 +731,12 @@ impl Inner {
         let lock = self.lock(project);
         let _held = lock.lock().await;
         if let Some(tag) = factory
-            && let Some(made) = self.answered(project, tag, name).await?
+            && let Some((made, due)) = self.answered(project, tag, name).await?
         {
-            // Made before: nothing new is made, but a setup its first create could not start or
-            // record is started now.
-            if made.setup.is_some() {
-                return Ok(made.id);
-            }
-            let folder = self.folder(&made).await;
-            return self.start_setup(made, &folder, provision, true).await;
+            // Made before: nothing new is made. Only the setup its first create left unstarted
+            // or unrecorded is seen to, as that create resolved it; this call's `provision` is
+            // not used.
+            return self.retry_setup(made, due).await;
         }
         // Before the clone and the fetch, so a project with no token makes nothing.
         let auth = match login {
@@ -848,39 +847,59 @@ impl Inner {
                 base: base.to_owned(),
                 setup: None,
             };
+            // Resolved before the marker, which holds it, and the record, so a retry knows what
+            // the first create was due to run whatever stopped it after this.
+            let argv = self.resolve_setup(&folder, provision).await;
             if let Some(tag) = factory {
-                self.mark(project, id, tag, name).await?;
+                self.mark(project, id, tag, name, argv.clone()).await?;
             }
             self.write_new(body.clone()).await?;
-            Ok(body)
+            Ok((body, argv))
         }
         .await;
-        let body = match made {
-            Ok(body) => body,
+        let (body, argv) = match made {
+            Ok(made) => made,
             Err(e) => {
                 self.undo(&clone, &folder, project, id, branched.as_ref())
                     .await;
                 return Err(e);
             }
         };
-        self.start_setup(body, &folder, provision, factory.is_some())
+        self.start_setup(body, &folder, argv, factory.is_some())
             .await
     }
 
-    /// Starts the setup `provision` says in a terminal in `folder` and records it as the
-    /// workspace's, then answers with its id. No setup, or an empty list of commands, starts no
-    /// terminal. A `tagged` workspace's terminal gets no token and no helper that answers for
-    /// one. Called under the project's lock, so an archive cannot run before the setup's
-    /// terminal is known.
-    async fn start_setup(
+    /// The answer to a create whose tag and name made `made` before, with `due` the setup that
+    /// create was to run. A record that names a setup terminal is answered as it is. Else a
+    /// terminal of the workspace that is not closed, started by that create but not recorded,
+    /// is recorded as its setup and nothing is started. Else `due` is started and recorded as a
+    /// create does, and when there is none nothing is.
+    async fn retry_setup(
         &self,
-        body: Workspace,
-        folder: &Path,
-        provision: Setup,
-        tagged: bool,
+        made: Workspace,
+        due: Option<Vec<String>>,
     ) -> Result<WorkspaceId, WorkspaceError> {
-        let id = body.id;
-        let argv = match provision {
+        let id = made.id;
+        if made.setup.is_some() {
+            return Ok(id);
+        }
+        if let Some(terminal) = self.terminals_of(id).await?.into_iter().next() {
+            let body = Workspace {
+                setup: Some(terminal),
+                ..made
+            };
+            self.write(body, false).await?;
+            return Ok(id);
+        }
+        let folder = self.folder(&made).await;
+        self.start_setup(made, &folder, due, true).await
+    }
+
+    /// The command line `provision` says to run in `folder`: the worktree's own list for
+    /// [`Setup::Own`], the commands given, each stopped past its limit, for [`Setup::Commands`],
+    /// and none for [`Setup::None`], for no config or for an empty list of commands.
+    async fn resolve_setup(&self, folder: &Path, provision: Setup) -> Option<Vec<String>> {
+        match provision {
             Setup::Own => setup(folder).await,
             Setup::Commands { commands, .. } if commands.is_empty() => None,
             Setup::Commands {
@@ -891,7 +910,21 @@ impl Inner {
                 std::iter::once(limit_secs.to_string()).chain(commands),
             )),
             Setup::None => None,
-        };
+        }
+    }
+
+    /// Starts the setup `argv` in a terminal in `folder` and records it as the workspace's, then
+    /// answers with its id. No `argv` starts no terminal. A `tagged` workspace's terminal gets
+    /// no token and no helper that answers for one. Called under the project's lock, so an
+    /// archive cannot run before the setup's terminal is known.
+    async fn start_setup(
+        &self,
+        body: Workspace,
+        folder: &Path,
+        argv: Option<Vec<String>>,
+        tagged: bool,
+    ) -> Result<WorkspaceId, WorkspaceError> {
+        let id = body.id;
         if let Some(argv) = argv {
             let env = if tagged {
                 crate::git_auth::helpers_off_env()
@@ -999,14 +1032,26 @@ impl Inner {
                 if let Some(was) = &was {
                     // The move is the spec's, and no refusal; what only the old branch holds is
                     // logged first, so it can be found.
-                    let only_here = self
+                    let only_here = match self
                         .git(
                             clone,
                             "log",
                             ["--format=%h %s", was, "--not", "--remotes", "--"],
                         )
                         .await
-                        .unwrap_or_default();
+                    {
+                        Ok(listed) => listed,
+                        Err(error) => {
+                            tracing::warn!(
+                                branch = %name,
+                                tip = %was,
+                                %error,
+                                "a local branch is moved to origin's and the commits it holds \
+                                 that no remote branch has could not be listed"
+                            );
+                            String::new()
+                        }
+                    };
                     if !only_here.trim().is_empty() {
                         tracing::warn!(
                             branch = %name,
@@ -1071,10 +1116,10 @@ impl Inner {
         Ok(auth)
     }
 
-    /// `git fetch` of the project's remote into `clone`. With a token, the fetch runs in the
+    /// `git fetch` of the project's remote into `clone`. With a token, the fetch runs in a new
     /// fetch repo ([`Inner::fetch_repo`]), by the project's URL, since the token must not go to
     /// a call that reads a config a worktree can write, and the clone then fetches from that
-    /// repo with no token, tags too.
+    /// repo with no token, tags too. The fetch repo is removed when the fetch is over.
     async fn fetch(
         &self,
         project: ProjectId,
@@ -1089,80 +1134,59 @@ impl Inner {
                 .await?;
             return Ok(());
         };
-        let fetches = self.fetch_repo(project, repo).await?;
-        self.git_with(
-            &fetches,
-            auth,
-            repo,
-            "fetch",
-            [
-                "--quiet",
-                "--no-prune",
-                "--no-tags",
-                "--",
+        let fetches = self.fetch_repo(project).await?;
+        let fetched = async {
+            self.git_with(
+                &fetches,
+                auth,
                 repo,
-                "+refs/heads/*:refs/remotes/origin/*",
-                "+refs/tags/*:refs/tags/*",
-            ],
-        )
-        .await?;
-        self.git(
-            clone,
-            "fetch",
-            [
-                OsStr::new("--quiet"),
-                OsStr::new("--no-prune"),
-                OsStr::new("--"),
-                fetches.as_os_str(),
-                OsStr::new("+refs/remotes/origin/*:refs/remotes/origin/*"),
-                OsStr::new("+refs/tags/*:refs/tags/*"),
-            ],
-        )
-        .await?;
-        Ok(())
-    }
-
-    /// The fetch repo of `project`, `<data dir>/fetches/<project>.git`, ready for a token call:
-    /// a bare repo made with no template and no remote, whose `config` is written again now
-    /// with only what a bare repo needs, to a file beside it that is renamed over it. A repo
-    /// made for another URL than `repo`, as `<project>.url` beside it says, is removed and made
-    /// again, so no ref of the old repo reaches the clone. The URL is written last, so a repo
-    /// that stopped half way is made again by the next call.
-    async fn fetch_repo(&self, project: ProjectId, repo: &str) -> Result<PathBuf, WorkspaceError> {
-        let parent = self.data.join("fetches");
-        let bare = parent.join(format!("{project}.git"));
-        let url = parent.join(format!("{project}.url"));
-        let held = match tokio::fs::read_to_string(&url).await {
-            Ok(held) => Some(held),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e.into()),
-        };
-        if held.as_deref() != Some(repo) || !tokio::fs::try_exists(&bare).await? {
-            for gone in [&url, &bare] {
-                let removed = if gone == &bare {
-                    tokio::fs::remove_dir_all(gone).await
-                } else {
-                    tokio::fs::remove_file(gone).await
-                };
-                match removed {
-                    Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
-                    _ => {}
-                }
-            }
-            let partial = self.partial_bare(&parent, project, false).await?;
-            tokio::fs::rename(&partial, &bare).await?;
-            tokio::fs::write(&url, repo).await?;
-        }
-        let staged = bare.join(format!("config.{}.new", WorkspaceId::random()));
-        let written = async {
-            tokio::fs::write(&staged, FETCH_CONFIG).await?;
-            tokio::fs::rename(&staged, bare.join("config")).await
+                "fetch",
+                [
+                    "--quiet",
+                    "--no-prune",
+                    "--no-tags",
+                    "--",
+                    repo,
+                    "+refs/heads/*:refs/remotes/origin/*",
+                    "+refs/tags/*:refs/tags/*",
+                ],
+            )
+            .await?;
+            self.git(
+                clone,
+                "fetch",
+                [
+                    OsStr::new("--quiet"),
+                    OsStr::new("--no-prune"),
+                    OsStr::new("--"),
+                    fetches.as_os_str(),
+                    OsStr::new("+refs/remotes/origin/*:refs/remotes/origin/*"),
+                    OsStr::new("+refs/tags/*:refs/tags/*"),
+                ],
+            )
+            .await
         }
         .await;
-        if let Err(e) = written {
-            let _ = tokio::fs::remove_file(&staged).await;
-            return Err(e.into());
+        if let Err(e) = remove_any(&fetches).await {
+            tracing::warn!(
+                path = %fetches.display(),
+                error = %e,
+                "a fetch repo could not be removed; the next fetch removes it first"
+            );
         }
+        fetched.map(|_| ())
+    }
+
+    /// A new fetch repo for `project`, `<data dir>/fetches/<project>.git`: whatever is at that
+    /// path, a folder, a file or a link, is removed first, and a bare repo is made there with no
+    /// template, so no hook, info file or config comes with it. Called under the project's lock.
+    async fn fetch_repo(&self, project: ProjectId) -> Result<PathBuf, WorkspaceError> {
+        let parent = self.data.join("fetches");
+        let bare = parent.join(format!("{project}.git"));
+        tokio::fs::create_dir_all(&parent).await?;
+        remove_any(&bare).await?;
+        let partial = self.partial_bare(&parent, project, false).await?;
+        tokio::fs::rename(&partial, &bare).await?;
         Ok(bare)
     }
 
@@ -1174,11 +1198,13 @@ impl Inner {
         id: WorkspaceId,
         tag: &FactoryTag,
         name: &str,
+        setup: Option<Vec<String>>,
     ) -> Result<(), WorkspaceError> {
         let marker = Marker {
             project: tag.project,
             run: tag.run.clone(),
             name: name.to_owned(),
+            setup,
         };
         let json = serde_json::to_vec(&marker).map_err(io::Error::other)?;
         tokio::fs::write(self.marker_path(project, id), json).await?;
@@ -1200,7 +1226,7 @@ impl Inner {
     }
 
     /// The live workspace of this machine that a create with `tag` and `name` was made for
-    /// before, if there is one. A marker that cannot be parsed is skipped and logged, since it
+    /// before, if there is one, with the setup its marker says that create was to run. A marker that cannot be parsed is skipped and logged, since it
     /// cannot name a tag; one whose workspace is not live answers for nothing. A folder, a
     /// marker or the store that cannot be read is an error, never "no workspace yet".
     async fn answered(
@@ -1208,7 +1234,7 @@ impl Inner {
         project: ProjectId,
         tag: &FactoryTag,
         name: &str,
-    ) -> Result<Option<Workspace>, WorkspaceError> {
+    ) -> Result<Option<(Workspace, Option<Vec<String>>)>, WorkspaceError> {
         let dir = self.project_folder(project);
         let mut entries = match tokio::fs::read_dir(&dir).await {
             Ok(entries) => entries,
@@ -1243,7 +1269,7 @@ impl Inner {
             };
             if marker.project == tag.project && marker.run == tag.run && marker.name == name {
                 match self.live(id).await {
-                    Ok(body) if body.project == project => return Ok(Some(body)),
+                    Ok(body) if body.project == project => return Ok(Some((body, marker.setup))),
                     Ok(_) | Err(WorkspaceError::Unknown(_)) => {}
                     Err(e) => return Err(e),
                 }
@@ -1785,8 +1811,8 @@ impl Inner {
         self.run_git(dir, index, None, command, args).await
     }
 
-    /// [`Inner::git`] with `auth`'s token and hardening, for a call that only runs in a repo
-    /// the daemon alone writes ([`GitAuth::apply`]). It allows `https` only, and `file` too when
+    /// [`Inner::git`] with `auth`'s token and hardening, for a call that only runs in a fetch
+    /// repo made for it alone ([`GitAuth::apply`]), which `GIT_DIR` and `GIT_COMMON_DIR` name. It allows `https` only, and `file` too when
     /// `repo` is a folder of this machine or a `file://` URL, as a test's remote is. Neither the
     /// token nor the command, which holds it, is ever in the error.
     async fn git_with<I, S>(
@@ -1824,6 +1850,9 @@ impl Inner {
         let mut run = tokio::process::Command::new(&self.git);
         if let Some((auth, repo)) = auth {
             auth.apply(run.as_std_mut());
+            // After `apply`, which removes any inherited: git reads this repo and no other,
+            // whatever file in it or folder around it says.
+            run.env("GIT_DIR", dir).env("GIT_COMMON_DIR", dir);
             if repo.starts_with('/') || repo.starts_with("file://") {
                 run.env("GIT_ALLOW_PROTOCOL", "https:file");
             }
@@ -2107,6 +2136,19 @@ async fn same_folder(a: &Path, b: &Path) -> bool {
     match (tokio::fs::metadata(a).await, tokio::fs::metadata(b).await) {
         (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
         _ => false,
+    }
+}
+
+/// Removes what is at `path`, a folder, a file or a link, as it is; nothing there is no error.
+async fn remove_any(path: &Path) -> io::Result<()> {
+    let removed = match tokio::fs::symlink_metadata(path).await {
+        Ok(meta) if meta.is_dir() => tokio::fs::remove_dir_all(path).await,
+        Ok(_) => tokio::fs::remove_file(path).await,
+        Err(e) => Err(e),
+    };
+    match removed {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
     }
 }
 
