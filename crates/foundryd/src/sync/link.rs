@@ -24,14 +24,14 @@
 //! each round sends this machine's new factory records after its P1 records, on a cursor of
 //! their own. An older link carries none, and its P1 catch-up is as it was.
 
+use std::time::Duration;
+
 use foundry_proto::ids::MachineId;
 use foundry_proto::messages::{EDITS_SINCE, PROTOCOL, PeerMessage};
 use foundry_proto::record::AnyRecord;
 use serde::Serialize;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{Instant, timeout, timeout_at};
-
-use std::time::Duration;
 
 use super::factory::{self, Cursor, Sent};
 use super::{BATCH, Conn, Inner, OFFLINE_AFTER, RETRY_REFUSED, TICK, WARN_EVERY, on_store};
@@ -64,8 +64,8 @@ pub(super) async fn run(
 /// itself) or stops taking them. Changed settings go first in each round, so a peer just removed
 /// from the list is sent the copy that removed it before its link closes, and holds its own
 /// removal. New factory records go last, on a link that carries them, one message a round and
-/// only into an empty queue; while more of them wait, the next round starts as soon as the queue
-/// is empty.
+/// only into an empty queue; while more of them wait, the next round starts as soon as the
+/// writer has taken everything queued.
 async fn sending(inner: &Inner, send: &Sender<String>, open: &Open) {
     let mut sent = open.sent;
     let mut factory_sent = Cursor::new(open.factory_sent);
@@ -74,7 +74,7 @@ async fn sending(inner: &Inner, send: &Sender<String>, open: &Open) {
     let mut every = tokio::time::interval(TICK);
     loop {
         every.tick().await;
-        let room = send.capacity() == send.max_capacity();
+        let room = empty(send);
         if !send_settings(inner, send, open, &mut settings_sent).await {
             return;
         }
@@ -93,15 +93,21 @@ async fn sending(inner: &Inner, send: &Sender<String>, open: &Open) {
     }
 }
 
-/// Waits until the peer's end has taken everything queued on `send`, for at most a [`TICK`],
-/// and says whether it did.
+/// Whether this end's writer has taken everything queued on `send`. It may still be writing
+/// the last message it took.
+fn empty(send: &Sender<String>) -> bool {
+    send.capacity() == send.max_capacity()
+}
+
+/// Waits until this end's writer has taken everything queued on `send` ([`empty`]), for at most
+/// a [`TICK`], and says whether it did.
 async fn drained(send: &Sender<String>) -> bool {
     let start = Instant::now();
     loop {
         if send.is_closed() {
             return false;
         }
-        if send.capacity() == send.max_capacity() {
+        if empty(send) {
             return true;
         }
         if start.elapsed() >= TICK {

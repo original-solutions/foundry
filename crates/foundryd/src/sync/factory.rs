@@ -39,12 +39,16 @@ use super::{BATCH, Inner, TICK, WARN_EVERY, on_store};
 use crate::store::{Applied, Store, StoreError};
 
 /// The most bytes of records, as JSON, one factory message carries, past its first record. A
-/// record larger than this goes in a message of its own. The other end ends a link it hears
-/// nothing on for [`OFFLINE_AFTER`](super::OFFLINE_AFTER), and a message is heard only once it
-/// has all arrived, so this crosses a path of 70 KB a second in under 8 s: within that limit
-/// even when the two links of a pair share the path. A link queues a factory message only when
-/// its queue is empty ([`send_own`]), so at most one waits ahead of anything sent after it.
-pub const FACTORY_BATCH_BYTES: usize = 512 << 10;
+/// record larger than this goes in a message of its own.
+///
+/// A link queues a factory message only when its queue is empty ([`send_own`]), and the link's
+/// writer takes a message off the queue before it writes it, so anything sent after a factory
+/// message waits behind at most two: one being written and one queued. The other end ends a
+/// link it hears nothing on for [`OFFLINE_AFTER`](super::OFFLINE_AFTER), and a message is heard
+/// only once it has all arrived, so those two cross a path of 70 KB a second in under 8 s:
+/// within that limit even when the two links of a pair share the path. A socket's own send
+/// buffer comes on top of that.
+pub const FACTORY_BATCH_BYTES: usize = 256 << 10;
 
 /// Whether a link in protocol `speak` carries factory records.
 pub(super) fn carried(speak: u16) -> bool {
@@ -280,14 +284,29 @@ pub(super) async fn watch_own(inner: &Inner) {
 
 /// The highest version of `me`'s own factory records: the newest of at most [`BATCH`] above
 /// `seen`, so a burst is read a batch a tick, or, with nothing seen yet or a record above `seen`
-/// that cannot be read, the highest version held, which parses no record.
+/// that cannot be read, the highest version held, which parses no record. When that cannot be
+/// read either, which a row of another owner's can cause, `me`'s own records above `seen` are
+/// read to the last.
 fn newest_own(store: &mut Store, me: MachineId, seen: Option<u64>) -> Result<u64, StoreError> {
     if let Some(seen) = seen
         && let Ok(batch) = store.factory_since(me, seen, BATCH)
     {
         return Ok(batch.last().map_or(seen, |record| record.version));
     }
-    Ok(store.factory_versions()?.get(&me).copied().unwrap_or(0))
+    if let Ok(versions) = store.factory_versions() {
+        return Ok(versions.get(&me).copied().unwrap_or(0));
+    }
+    let mut newest = seen.unwrap_or(0);
+    loop {
+        let batch = store.factory_since(me, newest, BATCH)?;
+        let Some(last) = batch.last() else {
+            return Ok(newest);
+        };
+        newest = last.version;
+        if batch.len() < BATCH {
+            return Ok(newest);
+        }
+    }
 }
 
 #[cfg(test)]
