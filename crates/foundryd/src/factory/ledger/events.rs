@@ -520,9 +520,9 @@ impl Cause {
     /// stripped or cut, so neither can leave part of a secret that `hide` would no longer
     /// recognise. A control character, a space or a line break inside a secret is `hide`'s to
     /// see past (`secrets::hide_known` matches a held value across such gaps). What `hide` does
-    /// not match across a gap, the strip can still join: with `hide_known`, a held value with
-    /// fewer than 16 characters that are no gap, or one split by a gap of more than 32
-    /// characters, broken only by characters the strip removes, is stored whole.
+    /// not match across a gap, the strip can still join: with `hide_known`, a held value too
+    /// short for it to match across gaps, or one split by a longer gap than it allows, broken
+    /// only by characters the strip removes, is stored whole.
     pub fn cleaned_with(&self, hide: &dyn Fn(&str) -> String) -> Cause {
         let clean = |text: &str, limit: usize| -> String {
             strip(&hide(text)).chars().take(limit).collect()
