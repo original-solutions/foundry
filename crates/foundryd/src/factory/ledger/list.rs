@@ -27,15 +27,21 @@ const LAUNCH_SENDING: &str = "launch-sending";
 /// The step written before a launch that carries on from an earlier branch is sent.
 const LAUNCH_SENDING_RESUMED: &str = "launch-sending resumed-from ";
 
+// The store's lock is shared by the whole daemon and a repo's history only grows, so a listing
+// of the ledger's store takes it for one read at a time: the run ids, then each run's events.
+// Each run's events are still read whole under one lock; a run that gains an event or first
+// appears after its read is seen as it is by the next listing.
 impl Ledger {
     /// [`runs`] of the ledger's store.
     pub fn runs(&self, repo: &str) -> Result<Vec<RunInfo>, StoreError> {
-        runs(&self.lock(), repo)
+        let ids = self.lock().runs_of(repo)?;
+        Ok(unfinished(ids, |id| events(&self.lock(), id)))
     }
 
     /// [`issue_runs`] of the ledger's store.
     pub fn issue_runs(&self, repo: &str, issue: u64) -> Result<Vec<RunInfo>, StoreError> {
-        issue_runs(&self.lock(), repo, issue)
+        let ids = of_issue(self.lock().runs_of(repo)?, issue);
+        Ok(unfinished(ids, |id| events(&self.lock(), id)))
     }
 
     /// [`next_attempt`] of the ledger's store.
@@ -45,7 +51,8 @@ impl Ledger {
 
     /// [`summaries`] of the ledger's store.
     pub fn summaries(&self, repo: &str) -> Result<Vec<RunSummary>, StoreError> {
-        summaries(&self.lock(), repo)
+        let ids = self.lock().runs_of(repo)?;
+        Ok(summaries_of(ids, |id| events(&self.lock(), id)))
     }
 }
 
@@ -166,15 +173,18 @@ fn unreadable(id: RunId) -> RunInfo {
     }
 }
 
-/// The unfinished runs among `ids`, unreadable ones last.
+/// The unfinished runs among `ids`, each run's events got from `read`, unreadable ones last.
 ///
 /// Each run's events are read whole, finished runs' too, since the store has no read of a
 /// run's last event yet. The runner reads only a finished file's tail; a read of the runs of a
 /// repo that have a `finished` event, in the store, would let this skip them the same way.
-fn unfinished(store: &Store, ids: Vec<RunId>) -> Vec<RunInfo> {
+fn unfinished(
+    ids: Vec<RunId>,
+    read: impl Fn(&RunId) -> Result<Vec<RunEvent>, StoreError>,
+) -> Vec<RunInfo> {
     let (mut readable, mut rest) = (Vec::new(), Vec::new());
     for id in ids {
-        match events(store, &id) {
+        match read(&id) {
             Ok(events) => {
                 let facts = Facts::of(&events);
                 if !facts.finished {
@@ -194,18 +204,19 @@ fn unfinished(store: &Store, ids: Vec<RunId>) -> Vec<RunInfo> {
 /// Every run of `repo` (`owner/name`, in any case) that is not finished, in run id order, with
 /// any whose events cannot be read last.
 pub fn runs(store: &Store, repo: &str) -> Result<Vec<RunInfo>, StoreError> {
-    Ok(unfinished(store, store.runs_of(repo)?))
+    Ok(unfinished(store.runs_of(repo)?, |id| events(store, id)))
 }
 
 /// The unfinished runs of `issue` in `repo`, as [`runs`] lists them. Only that issue's runs
 /// are read.
 pub fn issue_runs(store: &Store, repo: &str, issue: u64) -> Result<Vec<RunInfo>, StoreError> {
-    let ids = store
-        .runs_of(repo)?
-        .into_iter()
-        .filter(|id| id.issue() == issue)
-        .collect();
-    Ok(unfinished(store, ids))
+    let ids = of_issue(store.runs_of(repo)?, issue);
+    Ok(unfinished(ids, |id| events(store, id)))
+}
+
+/// The runs among `ids` of `issue`.
+fn of_issue(ids: Vec<RunId>, issue: u64) -> Vec<RunId> {
+    ids.into_iter().filter(|id| id.issue() == issue).collect()
 }
 
 /// The attempt number for a new run of `issue` in `repo`: one past the highest attempt the
@@ -328,9 +339,17 @@ fn cap_reason(reason: &str) -> String {
 /// One summary per run of `repo` (`owner/name`, in any case), finished runs included, in run
 /// id order with any whose events cannot be read last.
 pub fn summaries(store: &Store, repo: &str) -> Result<Vec<RunSummary>, StoreError> {
+    Ok(summaries_of(store.runs_of(repo)?, |id| events(store, id)))
+}
+
+/// One summary per run among `ids`, each run's events got from `read`, unreadable ones last.
+fn summaries_of(
+    ids: Vec<RunId>,
+    read: impl Fn(&RunId) -> Result<Vec<RunEvent>, StoreError>,
+) -> Vec<RunSummary> {
     let (mut readable, mut rest) = (Vec::new(), Vec::new());
-    for id in store.runs_of(repo)? {
-        match events(store, &id) {
+    for id in ids {
+        match read(&id) {
             Ok(events) => readable.push(RunSummary::of(id, &events)),
             Err(error) => {
                 tracing::warn!(run = %id, %error, "a run whose events cannot be read is listed as unreadable");
@@ -339,7 +358,7 @@ pub fn summaries(store: &Store, repo: &str) -> Result<Vec<RunSummary>, StoreErro
         }
     }
     readable.extend(rest);
-    Ok(readable)
+    readable
 }
 
 #[cfg(test)]
