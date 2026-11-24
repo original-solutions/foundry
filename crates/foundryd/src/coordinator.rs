@@ -1785,7 +1785,7 @@ mod tests {
 
     /// `held` after it takes `copy` from a machine on protocol 4.
     fn took_from_protocol_4(held: &SharedSettings, copy: &SharedSettings) -> SharedSettings {
-        taken(held, FACTORY_SINCE - 1, copy.clone())
+        with_copy(held, FACTORY_SINCE - 1, copy.clone())
     }
 
     #[test]
@@ -1886,20 +1886,12 @@ mod tests {
         assert_eq!(project_named(&after, 9).as_deref(), Some("nine"));
         assert_eq!(after.factory_seen, held.factory_seen, "from protocol 4");
 
-        // From protocol 5, a copy that differs only in the factory `seen` takes no new number,
-        // so it changes nothing held ([`same_settings`]); one with a change raises it.
-        coordinator
-            .take_settings(id(B), FACTORY_SINCE, theirs.clone())
-            .await
-            .unwrap();
-        assert_eq!(lock(&coordinator.store).settings().unwrap(), after);
-        let theirs = numbered(&theirs, &set_project(10, "ten"), id(B));
+        // From protocol 5 the same copy raises it, though nothing else in it is new.
         coordinator
             .take_settings(id(B), FACTORY_SINCE, theirs)
             .await
             .unwrap();
         let after = lock(&coordinator.store).settings().unwrap();
-        assert_eq!(project_named(&after, 10).as_deref(), Some("ten"));
         assert_eq!(*after.factory_seen, [(id(A), 2), (id(9), 40)].into());
     }
 
@@ -1986,24 +1978,35 @@ mod tests {
     }
 
     /// A copy as the build before the factory `seen` stored it: the fleet's factory settings
-    /// set to `max_runs` by machine 9 at `seq`, counted in `seen` only.
-    fn stored_before_the_factory_seen(max_runs: u32, seq: u64) -> SharedSettings {
+    /// set to `max_runs` by machine `by` at `seq`, with `seen`, and no factory `seen`.
+    fn stored_before_the_factory_seen(
+        by: u128,
+        max_runs: u32,
+        seq: u64,
+        seen: &[(u128, u64)],
+    ) -> SharedSettings {
         let mut copy = base();
         copy.factory = Some(factory_settings(max_runs));
         copy.stamps.insert(
             StampKey::Setting(SettingKey::Factory),
-            Stamp { seq, by: id(9) },
+            Stamp { seq, by: id(by) },
         );
-        copy.seen = [(id(9), seq)].into();
+        copy.seen = seen.iter().map(|(by, seq)| (id(*by), *seq)).collect();
         copy.seq = seq;
         copy
     }
 
+    /// Machines 8 and 9, before this build: 8 set the fleet's factory settings at 2 and 9 set
+    /// them again at 3. Every copy holds 9's edit but one, which missed it.
+    fn stored_held_and_behind() -> (SharedSettings, SharedSettings) {
+        let held = stored_before_the_factory_seen(9, 4, 3, &[(8, 2), (9, 3)]);
+        let behind = stored_before_the_factory_seen(8, 2, 2, &[(8, 2)]);
+        (held, behind)
+    }
+
     #[test]
-    fn a_copy_stored_before_the_factory_seen_has_seen_the_factory_edits_it_holds() {
-        // Every machine holds machine 9's last edit; one missed it and holds 9's edit before.
-        let held = stored_before_the_factory_seen(4, 3);
-        let behind = stored_before_the_factory_seen(2, 2);
+    fn a_copy_stored_before_the_factory_seen_has_seen_the_factory_edits_its_seen_counts() {
+        let (held, behind) = stored_held_and_behind();
         assert!(held.factory_seen.is_empty() && behind.factory_seen.is_empty());
         let caught_up = merged(&held, &behind);
         assert!(
@@ -2012,48 +2015,114 @@ mod tests {
             caught_up.overwritten
         );
         assert_eq!(caught_up.factory, Some(factory_settings(4)));
+        // It is stored with the factory `seen` its copies counted.
+        assert_eq!(*caught_up.factory_seen, [(id(8), 2), (id(9), 3)].into());
 
-        // Another machine numbers the next edit of the setting, over 9's. Every copy takes it
-        // with no item, the one still behind included: it replaced an edit its machine held.
+        // A machine on this build numbers the next edit of the setting, over 9's. Every copy
+        // takes it with no item, the one still behind included.
         let next = numbered(&held, &set_factory(7), id(A));
-        assert_eq!(*next.factory_seen, [(id(A), 4), (id(9), 3)].into());
-        for copy in [&held, &behind] {
+        assert_eq!(
+            *next.factory_seen,
+            [(id(A), 4), (id(8), 2), (id(9), 3)].into()
+        );
+        for copy in [&held, &behind, &caught_up] {
             let out = merged(copy, &next);
             assert!(out.overwritten.is_empty(), "{:?}", out.overwritten);
             assert_eq!(out.factory, Some(factory_settings(7)));
         }
+    }
 
-        // A protocol 4 relay between two such copies still cannot hide a split: each side
-        // holds only its own factory edit.
+    #[test]
+    fn a_protocol_4_relay_after_the_update_cannot_hide_a_split_between_copies_stored_before_it() {
+        // A and C hold the copy stored before this build, and are split; B, on protocol 4,
+        // reaches both.
+        let (held, _) = stored_held_and_behind();
+        let a = numbered(&held, &set_factory(5), id(A));
+        // B passes A's `seen` to C before C edits.
+        let b = merge(&a.for_protocol(4), &held.for_protocol(4));
+        let c = took_from_protocol_4(&held, &b);
+        assert!(c.seen[&id(A)] >= 4, "{:?}", c.seen);
+        assert_eq!(*c.factory_seen, [(id(8), 2), (id(9), 3)].into());
+        let c = numbered(&c, &set_factory(6), id(B));
+        // And C's back to A.
+        let b = merge(&b, &c.for_protocol(4));
+        let a = took_from_protocol_4(&a, &b);
+        assert_eq!(a.factory, Some(factory_settings(5)));
+
+        let out = merged(&a, &c);
+
+        let item = &out.overwritten[&SettingKey::Factory];
+        let (kept, lost) = (out.factory.clone().unwrap(), item.lost.clone());
+        assert_eq!(item.kept, Some(SettingValue::Factory(kept.clone())));
+        let other = if kept == factory_settings(5) { 6 } else { 5 };
+        assert_eq!(lost, Some(factory_value(other)));
+
+        // The same when both edit before B passes anything on.
         let a = numbered(&held, &set_factory(5), id(A));
         let c = numbered(&held, &set_factory(6), id(B));
         let b = merge(&a.for_protocol(4), &c.for_protocol(4));
         let out = merged(&took_from_protocol_4(&a, &b), &took_from_protocol_4(&c, &b));
-        let item = &out.overwritten[&SettingKey::Factory];
-        assert_eq!(item.kept, Some(factory_value(5)));
-        assert_eq!(item.lost, Some(factory_value(6)));
+        assert!(out.overwritten.contains_key(&SettingKey::Factory));
     }
 
     #[test]
-    fn copies_passed_between_this_build_and_a_protocol_5_build_without_the_factory_seen_keep_their_number()
-     {
+    fn a_copy_counts_the_factory_edit_of_each_factory_stamp_it_holds() {
+        let project = ProjectId(uuid::Uuid::from_u128(7));
+        let mut copy = numbered(&base(), &set_factory(4), id(A));
+        copy.stamps.insert(
+            StampKey::Overwritten(SettingKey::Factory),
+            Stamp { seq: 5, by: id(9) },
+        );
+        copy.stamps.insert(
+            StampKey::Setting(SettingKey::ProjectFactory(project)),
+            Stamp { seq: 3, by: id(8) },
+        );
+        copy.stamps.insert(
+            StampKey::Setting(SettingKey::Priority),
+            Stamp { seq: 9, by: id(7) },
+        );
+        assert_eq!(
+            factory_seen(&copy),
+            [(id(A), 2), (id(8), 3), (id(9), 5)].into()
+        );
+    }
+
+    #[test]
+    fn copies_passed_between_this_build_and_a_protocol_5_build_without_the_factory_seen_settle() {
         let held = numbered(&base(), &set_factory(5), id(A));
         let held = numbered(&held, &set_project(7, "p"), id(A));
         let mut newer = held.clone();
-        for exchange in 0..20 {
-            // The older build reads each copy without the factory `seen` and sends it back so.
+        let mut seqs = Vec::new();
+        for _ in 0..20 {
+            // The older build reads each copy without the factory `seen`, and sends it back so.
             let mut older = newer.clone();
             older.factory_seen.clear();
-            newer = taken(&newer, FACTORY_SINCE, older);
-            assert_eq!(newer, held, "exchange {exchange}");
+            let out = with_copy(&newer, FACTORY_SINCE, older);
+            // A store takes a copy only under a higher number.
+            if out.seq > newer.seq {
+                newer = out;
+            }
+            seqs.push(newer.seq);
         }
+        // The first copy back raises the factory `seen` to its `seen`, under one number; then
+        // the number stops.
+        assert!(seqs[0] <= held.seq + 1, "{seqs:?}");
+        assert!(seqs.iter().all(|seq| *seq == seqs[0]), "{seqs:?}");
+        let bare = |copy: &SharedSettings| SharedSettings {
+            seq: 0,
+            factory_seen: Box::default(),
+            ..copy.clone()
+        };
+        assert_eq!(bare(&newer), bare(&held));
 
-        // An edit the older build numbers is taken under its number, the factory `seen` kept.
-        let mut older = numbered(&held, &set_project(8, "q"), id(B));
+        // An edit of a factory setting the older build numbers over A's raises no item: its
+        // `seen` counts the edit it replaced.
+        let mut older = numbered(&held, &set_factory(8), id(B));
         older.factory_seen.clear();
-        let out = taken(&held, FACTORY_SINCE, older.clone());
-        assert_eq!(project_named(&out, 8).as_deref(), Some("q"));
-        assert_eq!(out.factory_seen, held.factory_seen);
+        let out = with_copy(&held, FACTORY_SINCE, older.clone());
+        assert!(out.overwritten.is_empty(), "{:?}", out.overwritten);
+        assert_eq!(out.factory, Some(factory_settings(8)));
+        assert_eq!(*out.factory_seen, [(id(A), 3), (id(B), 4)].into());
         assert_eq!(out.seq, older.seq);
     }
 

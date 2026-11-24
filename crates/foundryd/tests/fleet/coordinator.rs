@@ -3027,10 +3027,10 @@ fn covers(seen: &BTreeMap<MachineId, u64>, stamp: Stamp) -> bool {
 
 /// The value of the fleet's factory settings `set_factory(max_runs)` sets.
 fn factory_value(max_runs: u32) -> SettingValue {
-    match set_factory(max_runs) {
-        Edit::SetFactory { settings } => SettingValue::Factory(settings),
-        _ => unreachable!(),
-    }
+    SettingValue::Factory(FactorySettings {
+        max_runs,
+        ..FactorySettings::default()
+    })
 }
 
 /// In which order the two sides of the split edit, and B passes their copies on.
