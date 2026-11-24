@@ -13,7 +13,7 @@
 use foundry_proto::factory::{RunEvent, RunId};
 
 use super::Ledger;
-use super::events::PrEnd;
+use super::events::{PrEnd, names};
 use super::read::{events, field, text};
 use crate::factory::lifecycle::State;
 use crate::store::{Store, StoreError};
@@ -99,7 +99,7 @@ impl Facts {
         for event in events {
             let data = &event.data;
             match event.event.as_str() {
-                "step_changed" => {
+                names::STEP_CHANGED => {
                     let Some(step) = text(data, "step") else {
                         continue;
                     };
@@ -110,14 +110,14 @@ impl Facts {
                         facts.launch_sent = true;
                     }
                 }
-                "state_changed" => {
+                names::STATE_CHANGED => {
                     let to = text(data, "to");
                     facts.state = to.and_then(State::from_name);
                     if to == Some(State::Building.name()) {
                         facts.pr_reported = false;
                     }
                 }
-                "session_launched" => {
+                names::SESSION_LAUNCHED => {
                     if text(data, "thread_id").is_some() {
                         facts.thread = true;
                     }
@@ -125,15 +125,15 @@ impl Facts {
                         facts.base = Some(base.to_owned());
                     }
                 }
-                "pr_opened" => {
+                names::PR_OPENED => {
                     if field(data, "pr").is_some_and(|pr| pr.is_number())
                         && text(data, "url").is_some()
                     {
                         facts.pr_reported = true;
                     }
                 }
-                "gate_sent_back" => facts.pr_reported = false,
-                "finished" => facts.finished = true,
+                names::GATE_SENT_BACK => facts.pr_reported = false,
+                names::FINISHED => facts.finished = true,
                 _ => {}
             }
         }
@@ -271,10 +271,10 @@ impl RunSummary {
     fn of(id: RunId, events: &[RunEvent]) -> Self {
         let facts = Facts::of(events);
         let last = |name: &str| events.iter().rev().find(|event| event.event == name);
-        let end = last("finished");
+        let end = last(names::FINISHED);
         let reason_source = match facts.state {
-            Some(State::Stuck) => Some(("stuck", "reason")),
-            Some(State::NeedsInfo) => Some(("questions_posted", "questions")),
+            Some(State::Stuck) => Some((names::STUCK, "reason")),
+            Some(State::NeedsInfo) => Some((names::QUESTIONS_POSTED, "questions")),
             _ => None,
         };
         let reason = reason_source
@@ -283,18 +283,18 @@ impl RunSummary {
         let last_pr = events
             .iter()
             .rev()
-            .filter(|event| event.event == "pr_opened")
+            .filter(|event| event.event == names::PR_OPENED)
             .filter(|event| field(&event.data, "pr").is_some_and(|pr| pr.is_number()))
             .find_map(|event| text(&event.data, "url"));
         let step = (!facts.finished)
-            .then(|| last("step_changed").and_then(|event| text(&event.data, "step")))
+            .then(|| last(names::STEP_CHANGED).and_then(|event| text(&event.data, "step")))
             .flatten();
         Self {
             started_ts: events.first().map(|event| event.ts.clone()),
             last_event: events.last().map(|event| event.event.clone()),
             title: events
                 .iter()
-                .find(|event| event.event == "session_launched")
+                .find(|event| event.event == names::SESSION_LAUNCHED)
                 .and_then(|event| text(&event.data, "title"))
                 .map(str::to_owned),
             reason,

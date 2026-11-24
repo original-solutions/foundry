@@ -25,7 +25,7 @@ use serde_json::Value;
 
 use crate::store::{Store, StoreError};
 
-use events::{Cause, Event, Outcome, PrEnd};
+use events::{Cause, Event, Outcome, PrEnd, names};
 
 pub mod events;
 pub mod export;
@@ -122,23 +122,26 @@ impl Ledger {
         cause: &Cause,
     ) -> Result<RunEvent, LedgerError> {
         let (name, mut data) = event.parts();
+        // Hiding reads the secret store, which can be slow, so it is done before the store is
+        // locked. Nothing it hides depends on what the store holds.
+        hide_texts(&mut data, &*self.hide);
+        let cause = serde_json::to_value(cause.cleaned_with(&*self.hide))
+            .expect("a cause is an object of strings and a number");
         // The lock is held from the read to the write, so this machine's own writes of one
         // run never cross.
         let mut store = self.lock();
         let held = store.run_events(run)?;
         // A `finished` event ends the run even when its data cannot be read.
-        if held.iter().any(|event| event.event == "finished") {
+        if held.iter().any(|event| event.event == names::FINISHED) {
             return Err(LedgerError::AlreadyFinished { run: run.clone() });
         }
         let ms = (self.wall)();
+        // Two numbers, which need no hiding.
         if let (Event::Finished { .. }, Value::Object(fields)) = (event, &mut data) {
             let first = held.first().map_or(ms, |event| event.ms);
             fields.insert("total_ms".into(), ms.saturating_sub(first).into());
             fields.insert("gate_attempts".into(), gate_attempts(&held).into());
         }
-        hide_texts(&mut data, &*self.hide);
-        let cause = serde_json::to_value(cause.cleaned_with(&*self.hide))
-            .expect("a cause is an object of strings and a number");
         let written = RunEvent {
             run: run.clone(),
             generation: self.generation,
@@ -187,7 +190,7 @@ impl Ledger {
 fn gate_attempts(events: &[RunEvent]) -> u32 {
     let attempts: std::collections::BTreeSet<u32> = events
         .iter()
-        .filter(|event| event.event == "gate_command")
+        .filter(|event| event.event == names::GATE_COMMAND)
         .filter_map(
             |event| match Event::from_parts(&event.event, &event.data)? {
                 Event::GateCommand { attempt, .. } => Some(attempt),

@@ -274,29 +274,44 @@ mod state_name {
     }
 }
 
+/// The names of the events that the ledger's readers look for, each spelled once. [`Event::name`]
+/// and [`FIELDS`] use them, so a rename reaches every reader.
+pub mod names {
+    pub const QUESTIONS_POSTED: &str = "questions_posted";
+    pub const SESSION_LAUNCHED: &str = "session_launched";
+    pub const STEP_CHANGED: &str = "step_changed";
+    pub const PR_OPENED: &str = "pr_opened";
+    pub const GATE_COMMAND: &str = "gate_command";
+    pub const GATE_SENT_BACK: &str = "gate_sent_back";
+    pub const CHECKS_READ: &str = "checks_read";
+    pub const STATE_CHANGED: &str = "state_changed";
+    pub const STUCK: &str = "stuck";
+    pub const FINISHED: &str = "finished";
+}
+
 impl Event {
     /// The event's name, as it is written.
     pub const fn name(&self) -> &'static str {
         match self {
             Event::Claimed { .. } => "claimed",
             Event::TriageResult { .. } => "triage_result",
-            Event::QuestionsPosted { .. } => "questions_posted",
+            Event::QuestionsPosted { .. } => names::QUESTIONS_POSTED,
             Event::AnswerReceived { .. } => "answer_received",
-            Event::SessionLaunched { .. } => "session_launched",
+            Event::SessionLaunched { .. } => names::SESSION_LAUNCHED,
             Event::CommentForwarded { .. } => "comment_forwarded",
             Event::SessionInterrupted { .. } => "session_interrupted",
             Event::SessionRateLimited { .. } => "session_rate_limited",
             Event::SessionPaused { .. } => "session_paused",
             Event::StopRequested { .. } => "stop_requested",
-            Event::StepChanged { .. } => "step_changed",
-            Event::PrOpened { .. } => "pr_opened",
+            Event::StepChanged { .. } => names::STEP_CHANGED,
+            Event::PrOpened { .. } => names::PR_OPENED,
             Event::PrLeft { .. } => "pr_left",
             Event::PrAdopted { .. } => "pr_adopted",
             Event::BranchBound { .. } => "branch_bound",
             Event::PrSetDraft { .. } => "pr_set_draft",
             Event::PrReadyOutside { .. } => "pr_ready_outside",
-            Event::GateCommand { .. } => "gate_command",
-            Event::GateSentBack { .. } => "gate_sent_back",
+            Event::GateCommand { .. } => names::GATE_COMMAND,
+            Event::GateSentBack { .. } => names::GATE_SENT_BACK,
             Event::GateCheckout { .. } => "gate_checkout",
             Event::GateFinished { .. } => "gate_finished",
             Event::GateRegate { .. } => "gate_regate",
@@ -306,11 +321,11 @@ impl Event {
             Event::GateCleanupFailed { .. } => "gate_cleanup_failed",
             Event::WorktreeRemoved { .. } => "worktree_removed",
             Event::WorktreeRemoveFailed { .. } => "worktree_remove_failed",
-            Event::ChecksRead { .. } => "checks_read",
-            Event::StateChanged { .. } => "state_changed",
-            Event::Stuck { .. } => "stuck",
+            Event::ChecksRead { .. } => names::CHECKS_READ,
+            Event::StateChanged { .. } => names::STATE_CHANGED,
+            Event::Stuck { .. } => names::STUCK,
             Event::Error { .. } => "error",
-            Event::Finished { .. } => "finished",
+            Event::Finished { .. } => names::FINISHED,
         }
     }
 
@@ -337,10 +352,10 @@ impl Event {
 pub const FIELDS: [(&str, &[&str]); 33] = [
     ("claimed", &["machine", "github_user"]),
     ("triage_result", &["passed", "reasons"]),
-    ("questions_posted", &["questions"]),
+    (names::QUESTIONS_POSTED, &["questions"]),
     ("answer_received", &["comment_id", "body_edited"]),
     (
-        "session_launched",
+        names::SESSION_LAUNCHED,
         &[
             "thread_id",
             "worktree",
@@ -371,18 +386,18 @@ pub const FIELDS: [(&str, &[&str]); 33] = [
     ),
     ("session_paused", &["run_ordinal"]),
     ("stop_requested", &["by"]),
-    ("step_changed", &["step"]),
-    ("pr_opened", &["pr", "url"]),
+    (names::STEP_CHANGED, &["step"]),
+    (names::PR_OPENED, &["pr", "url"]),
     ("pr_left", &["pr", "url"]),
     ("pr_adopted", &["pr", "branch", "run"]),
     ("branch_bound", &["pr", "branch"]),
     ("pr_set_draft", &["pr"]),
     ("pr_ready_outside", &["pr", "by"]),
     (
-        "gate_command",
+        names::GATE_COMMAND,
         &["attempt", "command", "exit_code", "duration_ms"],
     ),
-    ("gate_sent_back", &["attempt", "run_ordinal"]),
+    (names::GATE_SENT_BACK, &["attempt", "run_ordinal"]),
     ("gate_checkout", &["attempt", "dir", "sha", "base_sha"]),
     ("gate_finished", &["attempt", "total_ms"]),
     (
@@ -398,12 +413,12 @@ pub const FIELDS: [(&str, &[&str]); 33] = [
     ("gate_cleanup_failed", &["dir", "error"]),
     ("worktree_removed", &["path"]),
     ("worktree_remove_failed", &["path", "error"]),
-    ("checks_read", &["sha", "checks"]),
-    ("state_changed", &["from", "to"]),
-    ("stuck", &["reason", "branch", "commits_ahead"]),
+    (names::CHECKS_READ, &["sha", "checks"]),
+    (names::STATE_CHANGED, &["from", "to"]),
+    (names::STUCK, &["reason", "branch", "commits_ahead"]),
     ("error", &["step", "kind", "message"]),
     (
-        "finished",
+        names::FINISHED,
         &[
             "outcome",
             "total_ms",

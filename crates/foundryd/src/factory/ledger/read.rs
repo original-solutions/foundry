@@ -15,7 +15,7 @@ use foundry_proto::factory::{RunEvent, RunId};
 use serde_json::Value;
 
 use super::Ledger;
-use super::events::{CAUSE_FIELDS, CHECK_FIELDS, RESUMED_FROM_FIELDS, fields as fields_of};
+use super::events::{CAUSE_FIELDS, CHECK_FIELDS, RESUMED_FROM_FIELDS, fields as fields_of, names};
 use crate::store::{Store, StoreError};
 
 impl Ledger {
@@ -99,10 +99,10 @@ fn write_data(text: &mut String, name: &str, data: &Value) {
         text.push_str(&Value::from(key).to_string());
         text.push(':');
         match (name, key, value) {
-            ("session_launched", "resumed_from", Value::Object(_)) => {
+            (names::SESSION_LAUNCHED, "resumed_from", Value::Object(_)) => {
                 write_ordered(text, value, &RESUMED_FROM_FIELDS);
             }
-            ("checks_read", "checks", Value::Array(checks)) => {
+            (names::CHECKS_READ, "checks", Value::Array(checks)) => {
                 text.push('[');
                 for (i, check) in checks.iter().enumerate() {
                     if i > 0 {
