@@ -516,16 +516,26 @@ impl Cause {
         self.cleaned_with(&|text: &str| text.to_owned())
     }
 
-    /// [`cleaned`](Self::cleaned), with every text through `hide` once, as given, before it is
+    /// [`cleaned`](Self::cleaned), with every text through `hide` as given, before it is
     /// stripped or cut, so neither can leave part of a secret that `hide` would no longer
     /// recognise. A control character, a space or a line break inside a secret is `hide`'s to
-    /// see past (`secrets::hide_known` matches a held value across such gaps). What `hide` does
-    /// not match across a gap, the strip can still join: with `hide_known`, a held value too
-    /// short for it to match across gaps, or one split by a longer gap than it allows, broken
-    /// only by characters the strip removes, is stored whole.
+    /// see past (`secrets::hide_known` matches a held value across such gaps).
+    ///
+    /// The strip can still join a secret `hide` left alone: with `hide_known`, a held value too
+    /// short to match across gaps, one split by a longer gap than it allows, or a URL password
+    /// split from its `@` by a line break. So a text the strip changed goes through `hide` once
+    /// more. A cause is one line by design, so hiding what only the join made look like a
+    /// secret costs nothing.
     pub fn cleaned_with(&self, hide: &dyn Fn(&str) -> String) -> Cause {
         let clean = |text: &str, limit: usize| -> String {
-            strip(&hide(text)).chars().take(limit).collect()
+            let hidden = hide(text);
+            let stripped = strip(&hidden);
+            let hidden = if stripped == hidden {
+                stripped
+            } else {
+                strip(&hide(&stripped))
+            };
+            hidden.chars().take(limit).collect()
         };
         let cut = |text: &Option<String>, limit| text.as_deref().map(|text| clean(text, limit));
         Cause {

@@ -39,7 +39,8 @@ pub const OUTPUT_LIMIT: usize = 64 * 1024;
 /// Hides the secrets this machine holds in a text. The daemon's must hide every `github:*`
 /// token and gateway key in its secret store at the time of the call, also with gaps of spaces,
 /// controls or escape sequences inside it, and URL passwords, as `secrets::hide_known` does;
-/// the ledger is given it when it is made, and gives it each text once.
+/// the ledger is given it when it is made, and gives it each text once as it came, and a cause's
+/// text once more when the cause's strip changed it ([`Cause::cleaned_with`]).
 pub type Hide = Arc<dyn Fn(&str) -> String + Send + Sync>;
 
 /// The wall-clock time as Unix epoch milliseconds: what an event is stamped with.
