@@ -40,6 +40,89 @@ fn wrong_kind(kind: &str, body: &FactoryBody) -> StoreError {
     ))
 }
 
+/// The machine id `text` spells, only in the spelling this build writes one. `apply_factory`
+/// keys every record under its owner's id in that spelling, and the reads look an owner's rows
+/// up by it, so an id spelt otherwise (a newer build's or a damaged file's) names rows those
+/// reads would never find, and is an error rather than taken as the id it parses to.
+fn parse_machine(index: usize, text: &str) -> rusqlite::Result<MachineId> {
+    let unreadable = |e: Box<dyn std::error::Error + Send + Sync>| {
+        rusqlite::Error::FromSqlConversionFailure(index, Type::Text, e)
+    };
+    let id = text
+        .parse()
+        .map(MachineId)
+        .map_err(|e| unreadable(Box::new(e)))?;
+    if id.to_string() != text {
+        return Err(unreadable(
+            "a machine id not spelt as this build writes one".into(),
+        ));
+    }
+    Ok(id)
+}
+
+/// Counts the run event rows the reads of this thread hand back, as events or as ids, for tests
+/// that show a read is bounded. Counted by thread, since each test runs on a thread of its own.
+#[cfg(test)]
+mod counted {
+    use std::cell::Cell;
+
+    thread_local! {
+        static READ: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn add(rows: usize) {
+        READ.with(|read| read.set(read.get() + rows));
+    }
+
+    pub(super) fn read() -> usize {
+        READ.with(Cell::get)
+    }
+}
+
+#[cfg(not(test))]
+mod counted {
+    pub(super) fn add(_rows: usize) {}
+}
+
+/// The lowest run event key in [`?1`, `?2`), or NULL with none: one seek of the primary key,
+/// which finds the next writer of a run without visiting the rows of the writer before it.
+const WRITER_PROBE: &str = "SELECT MIN(id) FROM factory_records WHERE kind = 'run_event' \
+     AND id >= ?1 AND id < ?2";
+
+/// The run events in [`?1`, `?2`), one writer's keys of one run, lowest version first.
+const EVENTS_OF_WRITER: &str = "SELECT version, record FROM factory_records \
+     WHERE kind = 'run_event' AND id >= ?1 AND id < ?2 ORDER BY version";
+
+/// The run events in [`?1`, `?2`) that `?3` stored above version `?4`, lowest version first.
+/// Read by the writer's index, so only the records `?3` stored above `?4`, of any run or kind,
+/// are visited, never the rows of the run below it.
+const EVENTS_OF_WRITER_ABOVE: &str = "SELECT version, record FROM factory_records \
+     INDEXED BY factory_records_by_owner \
+     WHERE owner = ?3 AND version > ?4 AND kind = 'run_event' AND id >= ?1 AND id < ?2 \
+     ORDER BY version";
+
+/// Whether a run event in [`?1`, `?2`) is named `?3`. No index holds the event name, so SQLite
+/// reads the rows of the range in key order until one is named `?3`, all of them when none is;
+/// only the yes or no comes back. A row that is not JSON names no event, so the answer does not
+/// depend on whether such a row comes before the one named `?3`.
+const HAS_EVENT: &str = "SELECT EXISTS (SELECT 1 FROM factory_records WHERE kind = 'run_event' \
+     AND id >= ?1 AND id < ?2 \
+     AND CASE WHEN json_valid(record) THEN json_extract(record, '$.body.event') END IS ?3)";
+
+/// The highest version held from owner `?1`, of any kind of record, or NULL with none: one seek
+/// of the owner's index.
+const HIGHEST_VERSION: &str = "SELECT MAX(version) FROM factory_records WHERE owner = ?1";
+
+/// The run event stored as `json`. A row that holds another kind of record is an error.
+fn run_event(json: &str) -> Result<RunEvent, StoreError> {
+    let record: FactoryRecord = serde_json::from_str(json)?;
+    counted::add(1);
+    match record.body {
+        FactoryBody::RunEvent(event) => Ok(event),
+        other => Err(wrong_kind("run_event", &other)),
+    }
+}
+
 impl Store {
     /// Stores `record`, received from machine `from`, when `from` owns it, no other machine
     /// holds its key and its version is higher than the copy held. Same rules as
@@ -148,13 +231,88 @@ impl Store {
         let rows = query.query_map(params![from, to], |row| row.get::<_, String>(0))?;
         let mut events = Vec::new();
         for json in rows {
-            let record: FactoryRecord = serde_json::from_str(&json?)?;
-            match record.body {
-                FactoryBody::RunEvent(event) => events.push(event),
-                other => return Err(wrong_kind("run_event", &other)),
-            }
+            events.push(run_event(&json?)?);
         }
         Ok(events)
+    }
+
+    /// The machines that wrote an event of `run`, each once, in the order of their ids. Read
+    /// from the keys alone, one seek per writer, so a run's history is never visited and a row
+    /// whose record cannot be read still names its writer. A key whose writer is not a machine
+    /// id in the spelling this build writes is an error (`parse_machine`).
+    pub fn run_writers(&self, run: &RunId) -> Result<Vec<MachineId>, StoreError> {
+        let run = run.to_string();
+        let (mut from, to) = range(&run);
+        let mut query = self.conn.prepare_cached(WRITER_PROBE)?;
+        let mut writers = Vec::new();
+        while let Some(id) =
+            query.query_row(params![from, to], |row| row.get::<_, Option<String>>(0))?
+        {
+            counted::add(1);
+            // `<run>/<owner>/<version>`: the writer is the part after the run's `/`, up to the
+            // next one. The next writer's keys start above `<run>/<owner>0`, since `0` is the
+            // character after `/`.
+            let rest = &id[run.len() + 1..];
+            let owner = rest.split('/').next().unwrap_or(rest);
+            writers.push(parse_machine(0, owner)?);
+            from = format!("{run}/{owner}0");
+        }
+        Ok(writers)
+    }
+
+    /// The events of `run` that `writer` stored, each with its version, lowest version first:
+    /// all of them when `above` is `None`, else only those above version `above`.
+    ///
+    /// Above a version, the read goes by the writer's index, so it visits only the records the
+    /// writer stored since that version and never the run's history below it. A writer's
+    /// records are stored in the order of their versions, on its own machine and on each one
+    /// it syncs to, so none of this run's events can arrive later below `above`. A row this
+    /// build cannot parse is an error, never skipped.
+    pub fn run_events_by(
+        &self,
+        run: &RunId,
+        writer: MachineId,
+        above: Option<u64>,
+    ) -> Result<Vec<(u64, RunEvent)>, StoreError> {
+        let (from, to) = range(&format!("{run}/{writer}"));
+        let row = |row: &rusqlite::Row<'_>| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?));
+        let rows: Vec<(i64, String)> = match above {
+            None => self
+                .conn
+                .prepare_cached(EVENTS_OF_WRITER)?
+                .query_map(params![from, to], row)?
+                .collect::<Result<_, _>>()?,
+            Some(version) => {
+                // Nothing stored is above i64::MAX, so a larger `version` correctly finds nothing.
+                let version = i64::try_from(version).unwrap_or(i64::MAX);
+                self.conn
+                    .prepare_cached(EVENTS_OF_WRITER_ABOVE)?
+                    .query_map(params![from, to, writer.to_string(), version], row)?
+                    .collect::<Result<_, _>>()?
+            }
+        };
+        rows.into_iter()
+            .map(|(version, json)| Ok((from_sql(version), run_event(&json)?)))
+            .collect()
+    }
+
+    /// Whether any writer has stored an event of `run` named `event`, whatever its data. The
+    /// store answers yes or no and hands back no row of the run, though it reads the run's rows
+    /// up to the first one so named ([`HAS_EVENT`]). A row this build cannot read as a run
+    /// event, JSON or not, names no event.
+    pub fn run_has_event(&self, run: &RunId, event: &str) -> Result<bool, StoreError> {
+        let (from, to) = range(&run.to_string());
+        let mut query = self.conn.prepare_cached(HAS_EVENT)?;
+        Ok(query.query_row(params![from, to, event], |row| row.get(0))?)
+    }
+
+    /// The highest version of any factory record held from `owner`, or `None` with none. A
+    /// writer's records are stored in the order of their versions, so none it wrote can arrive
+    /// later below this.
+    pub fn highest_factory_version(&self, owner: MachineId) -> Result<Option<u64>, StoreError> {
+        let mut query = self.conn.prepare_cached(HIGHEST_VERSION)?;
+        let highest: Option<i64> = query.query_row(params![owner.to_string()], |row| row.get(0))?;
+        Ok(highest.map(from_sql))
     }
 
     /// Every run of `repo` (`owner/name`, in any case) that has an event, once each, in order.
@@ -182,6 +340,7 @@ impl Store {
         let mut runs = BTreeSet::new();
         for text in rows {
             let text = text?;
+            counted::add(1);
             let run: RunId = text.parse().map_err(|e: String| {
                 rusqlite::Error::FromSqlConversionFailure(0, Type::Text, e.into())
             })?;
@@ -190,6 +349,13 @@ impl Store {
             }
         }
         Ok(runs.into_iter().collect())
+    }
+
+    /// How many run event rows the reads of this thread have handed back so far, as events
+    /// or as ids. A yes or no, such as [`run_has_event`](Self::run_has_event), counts none.
+    #[cfg(test)]
+    pub fn run_rows_read() -> usize {
+        counted::read()
     }
 
     /// Every writer's factory status for `project`, by machine.
@@ -373,6 +539,392 @@ fn apply_factory_in_tx(
     )?
     .execute(params![key.kind, key.id, owner, version, json])?;
     Ok(Applied::Stored)
+}
+
+#[cfg(test)]
+mod run_read_tests {
+    use foundry_proto::factory::{FactoryBody, FactoryRecord, RunEvent, RunId};
+    use foundry_proto::ids::MachineId;
+    use serde_json::{Value, json};
+    use tempfile::TempDir;
+
+    use super::{
+        EVENTS_OF_WRITER, EVENTS_OF_WRITER_ABOVE, HAS_EVENT, HIGHEST_VERSION, WRITER_PROBE,
+    };
+    use crate::store::Store;
+
+    fn open() -> (TempDir, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("foundry.db")).unwrap();
+        (dir, store)
+    }
+
+    fn run(repo: &str, issue: u64, attempt: u32) -> RunId {
+        RunId::new(repo, issue, attempt).unwrap()
+    }
+
+    /// Stores the event `event` of `run` as `owner` left it at `version` and `generation`.
+    fn put(
+        store: &mut Store,
+        owner: MachineId,
+        version: u64,
+        run: &RunId,
+        generation: u64,
+        event: &str,
+        data: Value,
+    ) {
+        let record = FactoryRecord {
+            owner,
+            version,
+            body: FactoryBody::RunEvent(RunEvent {
+                run: run.clone(),
+                generation,
+                ts: "2026-10-04T10:00:00.000Z".into(),
+                ms: version,
+                event: event.into(),
+                data,
+                cause: None,
+            }),
+        };
+        store.apply_factory(&record, owner).unwrap();
+    }
+
+    /// A run event row of `run` that holds `record` as it is, as a newer build or a damaged
+    /// file may leave one.
+    fn put_raw(dir: &TempDir, run: &RunId, record: &str) {
+        put_raw_by(dir, run, MachineId::random(), record);
+    }
+
+    /// [`put_raw`] as `owner`.
+    fn put_raw_by(dir: &TempDir, run: &RunId, owner: MachineId, record: &str) {
+        let conn = rusqlite::Connection::open(dir.path().join("foundry.db")).unwrap();
+        conn.execute(
+            "INSERT INTO factory_records (kind, id, owner, version, record)
+             VALUES ('run_event', ?1, ?2, 1, ?3)",
+            rusqlite::params![format!("{run}/{owner}/1"), owner.to_string(), record],
+        )
+        .unwrap();
+    }
+
+    fn versions(events: &[(u64, RunEvent)]) -> Vec<u64> {
+        events.iter().map(|(version, _)| *version).collect()
+    }
+
+    #[test]
+    fn a_run_has_an_event_once_any_writer_stored_one_of_that_name() {
+        let (_dir, mut store) = open();
+        let (a, b) = (MachineId::random(), MachineId::random());
+        let eight = run("rawphp/softfac", 8, 1);
+        assert!(!store.run_has_event(&eight, "finished").unwrap());
+        put(&mut store, a, 1, &eight, 1, "step_changed", json!({}));
+        assert!(!store.run_has_event(&eight, "finished").unwrap());
+        assert!(store.run_has_event(&eight, "step_changed").unwrap());
+        // Another run whose id starts with this one's is not this run.
+        let eighty = run("rawphp/softfac", 80, 1);
+        put(&mut store, a, 2, &eighty, 1, "finished", json!({}));
+        assert!(!store.run_has_event(&eight, "finished").unwrap());
+        // A `finished` whose data this build cannot read is still a `finished`.
+        put(
+            &mut store,
+            b,
+            1,
+            &eight,
+            2,
+            "finished",
+            json!({"total_ms": "soon"}),
+        );
+        assert!(store.run_has_event(&eight, "finished").unwrap());
+    }
+
+    #[test]
+    fn a_row_this_build_cannot_read_names_no_event_whether_or_not_it_is_json() {
+        let (dir, mut store) = open();
+        let eight = run("rawphp/softfac", 8, 1);
+        put_raw(&dir, &eight, r#"{"kind":"run_event","later":true}"#);
+        assert!(!store.run_has_event(&eight, "finished").unwrap());
+        let nine = run("rawphp/softfac", 9, 1);
+        put_raw(&dir, &nine, "not json");
+        assert!(!store.run_has_event(&nine, "finished").unwrap());
+        // A `finished` is found whether a row that is not JSON comes before it by key or after.
+        let (low, high) = (
+            MachineId(uuid::Uuid::from_u128(1)),
+            MachineId(uuid::Uuid::from_u128(u128::MAX)),
+        );
+        for (issue, damaged, writer) in [(10, low, high), (11, high, low)] {
+            let run = run("rawphp/softfac", issue, 1);
+            put_raw_by(&dir, &run, damaged, "not json");
+            put(&mut store, writer, issue, &run, 1, "finished", json!({}));
+            assert!(store.run_has_event(&run, "finished").unwrap(), "{run}");
+        }
+    }
+
+    #[test]
+    fn a_writers_highest_version_is_its_highest_record_of_any_kind_or_run() {
+        let (_dir, mut store) = open();
+        let (a, b) = (MachineId::random(), MachineId::random());
+        assert_eq!(store.highest_factory_version(a).unwrap(), None);
+        put(
+            &mut store,
+            a,
+            3,
+            &run("rawphp/softfac", 8, 1),
+            1,
+            "step_changed",
+            json!({}),
+        );
+        put(
+            &mut store,
+            a,
+            70,
+            &run("rawphp/other", 1, 1),
+            1,
+            "step_changed",
+            json!({}),
+        );
+        put(
+            &mut store,
+            b,
+            900,
+            &run("rawphp/softfac", 8, 1),
+            1,
+            "step_changed",
+            json!({}),
+        );
+        assert_eq!(store.highest_factory_version(a).unwrap(), Some(70));
+        assert_eq!(store.highest_factory_version(b).unwrap(), Some(900));
+    }
+
+    #[test]
+    fn the_writers_of_a_run_are_read_from_its_keys_once_each_in_order() {
+        let (dir, mut store) = open();
+        let (a, b, c) = (
+            MachineId::random(),
+            MachineId::random(),
+            MachineId::random(),
+        );
+        let eight = run("rawphp/softfac", 8, 1);
+        assert_eq!(store.run_writers(&eight).unwrap(), []);
+        for version in 1..=3 {
+            put(&mut store, a, version, &eight, 1, "step_changed", json!({}));
+            put(&mut store, b, version, &eight, 2, "step_changed", json!({}));
+        }
+        put(
+            &mut store,
+            c,
+            1,
+            &run("rawphp/softfac", 80, 1),
+            1,
+            "step_changed",
+            json!({}),
+        );
+        // A row whose record cannot be read still names its writer by its key.
+        put_raw(&dir, &eight, "not json");
+        let writers = store.run_writers(&eight).unwrap();
+        assert_eq!(writers.len(), 3);
+        assert!(writers.contains(&a) && writers.contains(&b));
+        assert!(!writers.contains(&c));
+        let texts: Vec<String> = writers.iter().map(ToString::to_string).collect();
+        let mut sorted = texts.clone();
+        sorted.sort();
+        assert_eq!(texts, sorted);
+    }
+
+    #[test]
+    fn a_writers_events_of_a_run_are_read_by_version_from_the_start_or_above_one() {
+        let (_dir, mut store) = open();
+        let (a, b) = (MachineId::random(), MachineId::random());
+        let eight = run("rawphp/softfac", 8, 1);
+        let eighty = run("rawphp/softfac", 80, 1);
+        for version in [3, 1, 12, 2] {
+            put(&mut store, a, version, &eight, 1, "step_changed", json!({}));
+        }
+        put(&mut store, a, 4, &eighty, 1, "step_changed", json!({}));
+        put(&mut store, b, 5, &eight, 2, "step_changed", json!({}));
+        let all = store.run_events_by(&eight, a, None).unwrap();
+        assert_eq!(versions(&all), [1, 2, 3, 12]);
+        assert!(all.iter().all(|(_, event)| event.run == eight));
+        assert_eq!(
+            versions(&store.run_events_by(&eight, a, Some(2)).unwrap()),
+            [3, 12]
+        );
+        assert_eq!(
+            versions(&store.run_events_by(&eight, a, Some(12)).unwrap()),
+            Vec::<u64>::new()
+        );
+        assert_eq!(
+            versions(&store.run_events_by(&eight, b, None).unwrap()),
+            [5]
+        );
+        // A version 0 is read from the start, and not above 0.
+        put(&mut store, b, 0, &eight, 2, "step_changed", json!({}));
+        assert_eq!(
+            versions(&store.run_events_by(&eight, b, None).unwrap()),
+            [0, 5]
+        );
+        assert_eq!(
+            versions(&store.run_events_by(&eight, b, Some(0)).unwrap()),
+            [5]
+        );
+    }
+
+    #[test]
+    fn a_writers_row_this_build_cannot_read_is_an_error_never_skipped() {
+        let (dir, store) = open();
+        let eight = run("rawphp/softfac", 8, 1);
+        put_raw(&dir, &eight, r#"{"kind":"run_event","later":true}"#);
+        let writer = store.run_writers(&eight).unwrap()[0];
+        assert!(store.run_events_by(&eight, writer, None).is_err());
+    }
+
+    #[test]
+    fn a_writer_whose_key_spells_its_id_otherwise_than_this_build_writes_it_is_an_error() {
+        let a = MachineId::random();
+        let eight = run("rawphp/softfac", 8, 1);
+        let finished = serde_json::to_string(&FactoryRecord {
+            owner: a,
+            version: 1,
+            body: FactoryBody::RunEvent(RunEvent {
+                run: eight.clone(),
+                generation: 1,
+                ts: "2026-10-04T10:00:00.000Z".into(),
+                ms: 1,
+                event: "finished".into(),
+                data: json!({}),
+                cause: None,
+            }),
+        })
+        .unwrap();
+        // Each spelling parses as a's id, but a's reads look its rows up under the spelling
+        // this build writes, so taken as a, this row would never be read.
+        for spelt in [
+            a.to_string().to_uppercase(),
+            format!("{{{a}}}"),
+            a.0.simple().to_string(),
+        ] {
+            let (dir, store) = open();
+            let conn = rusqlite::Connection::open(dir.path().join("foundry.db")).unwrap();
+            conn.execute(
+                "INSERT INTO factory_records (kind, id, owner, version, record)
+                 VALUES ('run_event', ?1, ?2, 1, ?3)",
+                rusqlite::params![format!("{eight}/{spelt}/1"), a.to_string(), finished],
+            )
+            .unwrap();
+            assert!(store.run_has_event(&eight, "finished").unwrap(), "{spelt}");
+            assert!(store.run_writers(&eight).is_err(), "{spelt}");
+        }
+    }
+
+    /// What SQLite says it does for `sql`, one line per step.
+    fn plan(store: &Store, sql: &str) -> Vec<String> {
+        let mut query = store
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap();
+        let unbound = vec![rusqlite::types::Null; query.parameter_count()];
+        let rows = query
+            .query_map(rusqlite::params_from_iter(unbound), |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap();
+        rows.map(Result::unwrap).collect()
+    }
+
+    #[test]
+    fn the_reads_of_a_runs_rows_seek_an_index_and_never_scan_the_table() {
+        let (_dir, store) = open();
+        for sql in [
+            WRITER_PROBE,
+            EVENTS_OF_WRITER,
+            EVENTS_OF_WRITER_ABOVE,
+            HAS_EVENT,
+            HIGHEST_VERSION,
+        ] {
+            let steps = plan(&store, sql);
+            assert!(
+                steps
+                    .iter()
+                    .any(|step| step.starts_with("SEARCH factory_records USING")),
+                "{sql}: {steps:?}"
+            );
+            assert!(
+                !steps
+                    .iter()
+                    .any(|step| step.starts_with("SCAN factory_records")),
+                "{sql}: {steps:?}"
+            );
+        }
+        // Above a version, only the writer's records stored since are visited, whatever the
+        // run's history holds.
+        let steps = plan(&store, EVENTS_OF_WRITER_ABOVE);
+        assert!(
+            steps
+                .iter()
+                .any(|step| step.contains("factory_records_by_owner (owner=? AND version>?)")),
+            "{steps:?}"
+        );
+    }
+
+    #[test]
+    fn a_read_above_a_version_keeps_to_the_writers_index_where_the_planner_would_not() {
+        // Statistics under which one writer holds every row and a run's key range looks
+        // narrow: left to itself, SQLite would then read the run's rows by key, its whole
+        // history below the version included.
+        let (_dir, store) = open();
+        store
+            .conn
+            .execute_batch(
+                "ANALYZE;
+                 DELETE FROM sqlite_stat1;
+                 INSERT INTO sqlite_stat1 (tbl, idx, stat) VALUES
+                     ('factory_records', 'factory_records_by_owner', '1000000 1000000 1'),
+                     ('factory_records', 'sqlite_autoindex_factory_records_1', '1000000 250000 1');
+                 ANALYZE sqlite_schema;",
+            )
+            .unwrap();
+        let unhinted = EVENTS_OF_WRITER_ABOVE.replace("INDEXED BY factory_records_by_owner", "");
+        let steps = plan(&store, &unhinted);
+        assert!(
+            !steps
+                .iter()
+                .any(|step| step.contains("factory_records_by_owner")),
+            "the statistics must turn the planner away from the writer's index: {steps:?}"
+        );
+        let steps = plan(&store, EVENTS_OF_WRITER_ABOVE);
+        assert!(
+            steps
+                .iter()
+                .any(|step| step.contains("factory_records_by_owner (owner=? AND version>?)")),
+            "{steps:?}"
+        );
+    }
+
+    #[test]
+    fn the_reads_of_a_runs_rows_count_the_rows_they_hand_back() {
+        let (_dir, mut store) = open();
+        let (a, b) = (MachineId::random(), MachineId::random());
+        let eight = run("rawphp/softfac", 8, 1);
+        for version in 1..=3 {
+            put(&mut store, a, version, &eight, 1, "gate_command", json!({}));
+        }
+        put(&mut store, b, 1, &eight, 2, "finished", json!({}));
+        let read = Store::run_rows_read;
+        let before = read();
+        store.run_events(&eight).unwrap();
+        assert_eq!(read() - before, 4);
+        let before = read();
+        store.run_writers(&eight).unwrap();
+        assert_eq!(read() - before, 2);
+        let before = read();
+        store.run_events_by(&eight, a, Some(1)).unwrap();
+        assert_eq!(read() - before, 2);
+        let before = read();
+        store.runs_of("rawphp/softfac").unwrap();
+        assert_eq!(read() - before, 1);
+        // A yes or no hands back no row of the run.
+        let before = read();
+        store.run_has_event(&eight, "finished").unwrap();
+        assert_eq!(read() - before, 0);
+    }
 }
 
 #[cfg(test)]
