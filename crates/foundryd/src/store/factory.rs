@@ -370,7 +370,15 @@ mod tests {
     use crate::test_log::Logged;
 
     /// An owner this build cannot read, as a newer build's id format or a corrupt file leaves.
+    /// It sorts after every machine id, so the owners read before it.
     const UNREADABLE: &str = "owner-from-a-newer-build";
+
+    /// Another, that sorts before every machine id, so the owners read after it.
+    const UNREADABLE_FIRST: &str = "-owner-of-a-corrupt-file";
+
+    /// The whole warning line, so a field added to it fails the test.
+    const WARNING: &str = "foundryd::store::factory: a factory row whose owner this build cannot read \
+                           is left out of the factory versions held";
 
     fn open() -> (TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();
@@ -398,13 +406,13 @@ mod tests {
         );
     }
 
-    /// Makes every factory row of `owner` one whose owner this build cannot read.
-    fn spoil_owner(store: &Store, owner: MachineId) {
+    /// Makes every factory row of `owner` one whose owner reads as `unreadable`.
+    fn spoil_owner(store: &Store, owner: MachineId, unreadable: &str) {
         let changed = store
             .conn
             .execute(
                 "UPDATE factory_records SET owner = ?1 WHERE owner = ?2",
-                params![UNREADABLE, owner.to_string()],
+                params![unreadable, owner.to_string()],
             )
             .unwrap();
         assert!(changed > 0);
@@ -413,16 +421,17 @@ mod tests {
     #[test]
     fn factory_versions_leaves_out_an_owner_that_cannot_be_read_and_gives_the_others() {
         let (_dir, mut store) = open();
-        let (a, b, spoiled) = (
-            MachineId::random(),
-            MachineId::random(),
-            MachineId::random(),
-        );
+        let (a, b) = (MachineId::random(), MachineId::random());
+        let (first, last) = (MachineId::random(), MachineId::random());
         store_event(&mut store, a, 1, "a-1");
         store_event(&mut store, a, 2, "a-2");
         store_event(&mut store, b, 3, "b-3");
-        store_event(&mut store, spoiled, 5, "spoiled-5");
-        spoil_owner(&store, spoiled);
+        store_event(&mut store, first, 4, "first-4");
+        store_event(&mut store, last, 5, "last-5");
+        // Owners are read in their order: one bad owner comes before both readable ones, and
+        // one after, so a read that stops at a bad owner rather than going past it fails here.
+        spoil_owner(&store, first, UNREADABLE_FIRST);
+        spoil_owner(&store, last, UNREADABLE);
 
         assert_eq!(
             store.factory_versions().unwrap(),
@@ -437,7 +446,7 @@ mod tests {
         let (a, spoiled) = (MachineId::random(), MachineId::random());
         store_event(&mut store, a, 1, "a-1");
         store_event(&mut store, spoiled, 4242, "a-step-only-the-row-holds");
-        spoil_owner(&store, spoiled);
+        spoil_owner(&store, spoiled, UNREADABLE);
 
         let logged = Logged::default();
         let _capture = logged.capture();
@@ -446,6 +455,10 @@ mod tests {
         }
         let warnings = logged.warnings();
         assert_eq!(warnings.len(), 1, "once, not once per call: {warnings:?}");
+        assert!(
+            warnings[0].ends_with(WARNING),
+            "the line holds only its message: {warnings:?}"
+        );
         for row_data in [
             UNREADABLE,
             "4242",
