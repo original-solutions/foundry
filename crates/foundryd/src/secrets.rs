@@ -66,10 +66,10 @@ pub trait Secrets: Send + Sync {
     /// the value to set, or `None` to leave the store as it is. No other change to the store,
     /// from this process or another, lands between the read and the write.
     fn update(&self, name: &str, edit: Edit<'_>) -> Result<(), SecretsError>;
-    /// The names of the secrets held, sorted, and never a value. A store that cannot list its
-    /// names gives [`SecretsError::CannotList`], and so does one that fails to read, so neither
-    /// is ever taken for an empty store: [`hide_known`] then fails closed and the held record
-    /// writes nothing.
+    /// The names of the secrets held, sorted, and never a value. The default, for a store that
+    /// cannot list its names, gives [`SecretsError::CannotList`]; a store that can list but
+    /// fails to read gives its read error. Neither is ever taken for an empty store:
+    /// [`hide_known`] then fails closed and the held record writes nothing.
     fn names(&self) -> Result<Vec<String>, SecretsError> {
         Err(SecretsError::CannotList)
     }
@@ -171,9 +171,9 @@ pub fn github_default(secrets: &dyn Secrets) -> Option<String> {
 }
 
 /// `text` with the gateway keys and every `github:*` token this store holds now hidden as `***`
-/// (whatever follows `github:`, a login or not), read at this call so a token set after the daemon started is
-/// hidden too, and then the passwords of URLs as [`redact`] hides them. When the store cannot
-/// be read, none of `text` is shown: [`HIDDEN_UNREADABLE`] is given instead.
+/// (whatever follows `github:`, a login or not), read at this call so a token set after the
+/// daemon started is hidden too, and then the passwords of URLs as [`redact`] hides them. When
+/// the store cannot be read, none of `text` is shown: [`HIDDEN_UNREADABLE`] is given instead.
 pub fn hide_known(text: &str, secrets: &dyn Secrets) -> String {
     match known_values(secrets) {
         Ok(mut values) => {
@@ -319,10 +319,11 @@ fn move_secrets(old: &dyn OldStore, new: &FileSecrets) -> Result<(), SecretsErro
 #[derive(Debug, thiserror::Error)]
 pub enum SetError {
     #[error(
-        "{name} is not a secret to set here; the names are {GATEWAY}, {GATEWAY_MANAGEMENT} and \
+        "the name is not a secret to set here; the names are {GATEWAY}, {GATEWAY_MANAGEMENT} and \
          {GITHUB_PREFIX}<login>, where a login is letters, digits and -"
     )]
-    UnknownName { name: String },
+    // No field: the refused name may be a token pasted in place of a login, so it is never quoted.
+    UnknownName,
     #[error("no value on stdin for {name}")]
     NoValue { name: String },
     #[error("cannot read stdin for {name}: {source}")]
@@ -399,9 +400,7 @@ pub fn set_from(
 ) -> Result<(), SetError> {
     let github = name.strip_prefix(GITHUB_PREFIX).is_some_and(is_login);
     if name != GATEWAY && name != GATEWAY_MANAGEMENT && !github {
-        return Err(SetError::UnknownName {
-            name: name.to_owned(),
-        });
+        return Err(SetError::UnknownName);
     }
     let mut line = String::new();
     input
@@ -1334,8 +1333,8 @@ mod tests {
         let (_dir, secrets) = file();
         for name in ["machine", "machine-keys", "other"] {
             let error = set_from(&secrets, name, "x\n".as_bytes()).unwrap_err();
+            let text = error.to_string();
             assert!(!text.contains(name), "{text}");
-            assert!(text.contains(name), "{text}");
             assert!(text.contains("gateway-management"), "{text}");
             assert_eq!(stored(&secrets, name), None);
         }
@@ -1382,7 +1381,7 @@ mod tests {
         ] {
             let input = io::BufReader::new(Unreadable);
             let error = set_from(&secrets, name, input).unwrap_err();
-            assert!(matches!(error, SetError::UnknownName { .. }), "{name}");
+            assert!(matches!(error, SetError::UnknownName), "{name}");
             assert!(error.to_string().contains("github:<login>"), "{error}");
             if name != "github:" {
                 assert!(!error.to_string().contains(name), "{error}");

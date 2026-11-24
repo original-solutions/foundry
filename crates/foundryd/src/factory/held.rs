@@ -88,7 +88,18 @@ pub(crate) async fn run_with(
                 written = Some(held);
             }
             Ok(Err(error)) => note_failure(&mut failing, error.to_string()),
-            Err(error) => note_failure(&mut failing, error.to_string()),
+            Err(error) => {
+                // JoinError's text carries a task id that differs each time: key on a fixed one.
+                let key = if error.is_panic() {
+                    "the check panicked"
+                } else {
+                    "the check was cancelled"
+                };
+                if failing.as_deref() != Some(key) {
+                    tracing::warn!(%error, "what this machine holds not written");
+                }
+                failing = Some(key.to_owned());
+            }
         }
         while clock.now().saturating_sub(checked) < CHECK_EVERY {
             tokio::time::sleep(POLL).await;
@@ -501,8 +512,16 @@ mod tests {
     #[test]
     fn skill_file_with_an_empty_home_never_uses_the_empty_string() {
         assert_eq!(skill_file(Some("".into())), skill_file(None));
-        let path = skill_file(None).expect("the test user has a passwd entry");
-        assert!(path.is_absolute(), "{}", path.display());
-        assert!(path.ends_with(".claude/skills/factory-build/SKILL.md"));
+        let has_home = nix::unistd::User::from_uid(nix::unistd::getuid())
+            .ok()
+            .flatten()
+            .is_some_and(|user| !user.dir.as_os_str().is_empty());
+        if has_home {
+            let path = skill_file(None).expect("the test user has a passwd entry");
+            assert!(path.is_absolute(), "{}", path.display());
+            assert!(path.ends_with(".claude/skills/factory-build/SKILL.md"));
+        } else {
+            assert_eq!(skill_file(None), None);
+        }
     }
 }
