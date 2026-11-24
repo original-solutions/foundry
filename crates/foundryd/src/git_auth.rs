@@ -578,6 +578,22 @@ mod tests {
     }
 
     #[test]
+    fn a_trace_the_daemon_started_with_cannot_turn_off_the_redaction_of_the_token() {
+        let data = tempfile::tempdir().unwrap();
+        let auth = auth(data.path());
+        let mut command = Command::new("true");
+        command
+            .env("GIT_TRACE_CURL", data.path().join("trace"))
+            .env("GIT_TRACE_REDACT", "0");
+        auth.apply(&mut command);
+        let redact = command
+            .get_envs()
+            .find(|(key, _)| *key == "GIT_TRACE_REDACT")
+            .and_then(|(_, value)| value);
+        assert_eq!(redact, Some(std::ffi::OsStr::new("1")));
+    }
+
+    #[test]
     fn the_askpass_script_is_0700_in_the_data_directory_and_holds_no_token() {
         let data = tempfile::tempdir().unwrap();
         auth(data.path());
