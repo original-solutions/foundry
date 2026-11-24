@@ -5008,9 +5008,17 @@ async fn only_the_token_fetch_in_the_fetch_repo_carries_the_token() {
     let (_, dir, args, git_dir, common) = with[0];
     let fetch_repo = data.join("fetches").join(format!("{}.git", remote.project));
     assert_eq!(dir, &fetch_repo);
-    // The call is pinned to the fetch repo, so no discovery can lead it to another.
-    assert_eq!(Path::new(git_dir), fetch_repo);
-    assert_eq!(Path::new(common), fetch_repo);
+    // The call is pinned to the fetch repo, so no discovery can lead it to another. The variables
+    // hold the path as the daemon spelled it, which on macOS is `/tmp` for what `pwd` resolves to
+    // `/private/tmp`; the repo is gone by now, so its folder is resolved through its parent.
+    let resolved = |path: &str| {
+        let path = Path::new(path);
+        std::fs::canonicalize(path.parent().unwrap())
+            .unwrap()
+            .join(path.file_name().unwrap())
+    };
+    assert_eq!(resolved(git_dir), fetch_repo);
+    assert_eq!(resolved(common), fetch_repo);
     assert!(args.contains(" fetch --quiet "), "{args}");
     assert!(!args.contains(TOKEN), "{args}");
     // Every call in the shared clone or a worktree has none, and there were some.
