@@ -24,8 +24,10 @@
 //! | Foreign claim | the believed status lists an issue claimed by something other than Foundry | the factory statuses |
 //! | Gate infra | the believed status lists a run whose gate could not run at all | the factory statuses |
 //!
-//! Every row but the gateway's and placement's comes from the synced records and shared settings, so each
-//! machine shows the whole fleet's. Records are read as the rest of the UI sees them: an offline
+//! Every row but the gateway's and placement's comes from the synced records, the shared
+//! settings and the factory statuses, so each machine shows the whole fleet's. The one
+//! exception within them is "factory idle" for want of word from a holder: [`Quiet`] counts
+//! what this machine has heard, so one machine can show it while another does not. Records are read as the rest of the UI sees them: an offline
 //! machine's sessions and terminals are unreachable, so they raise nothing while its "machine
 //! offline" item stands. Another module adds rows through a [`Source`].
 //!
@@ -34,11 +36,11 @@
 //! work of such a project raises none of P1's rows for it (G13), since the run's own row
 //! covers it:
 //!
-//! - a session named in a live run by the believed status or by any status of the project at
-//!   the highest lease generation, or that this machine's [`Marks`] say is one of its factory
+//! - a session named in a live run by a status of the project at the highest lease generation
+//!   any of its statuses gives, or that this machine's [`Marks`] say is one of its factory
 //!   sessions of the project, raises no session stuck, waiting or failed item. So a holder
 //!   that went offline names its runs' sessions until a newer holder takes over, and a writer
-//!   a newer holder superseded names none. Another
+//!   a newer holder superseded names none, even while it is believed. Another
 //!   session in a factory workspace, such as one a person starts in a stuck run's workspace,
 //!   still raises its items;
 //! - a workspace such a status names, that [`Marks`] say is one of this machine's factory
@@ -332,31 +334,23 @@ struct FactoryWork {
 }
 
 impl FactoryWork {
-    /// For each project whose factory is on: what its believed status names in a live run,
-    /// and what any status of it at the highest lease generation names, so a holder that went
-    /// offline names its runs' work until a newer holder takes over; and what this machine
-    /// marks of its own records as the project's. Then each workspace that holds such a
-    /// session.
+    /// For each project whose factory is on: what a status of it at the highest lease
+    /// generation any of its statuses gives names in a live run, so a holder that went offline
+    /// names its runs' work until a newer holder takes over and a superseded writer names
+    /// nothing; and what this machine marks of its own records as the project's. Then each
+    /// workspace that holds such a session.
     fn of(fleet: &Fleet, factory: &FactoryFleet<'_>, on: &[OnProject<'_>]) -> Self {
         let mut work = Self::default();
         let on_ids: BTreeSet<ProjectId> = on.iter().map(|p| p.project.id).collect();
-        for project in on {
-            let statuses = factory
-                .statuses
-                .get(&project.project.id)
-                .map_or(&[][..], Vec::as_slice);
-            // An online writer's status at the top generation is the believed one, so only an
-            // offline holder's adds to it.
+        for project in &on_ids {
+            let statuses = factory.statuses.get(project).map_or(&[][..], Vec::as_slice);
+            // A status that does not hold the lease carries the generation the lease ref names
+            // when another machine holds it, so a newer holder seen but not heard from counts.
             let top = statuses.iter().map(|(_, status)| status.generation).max();
-            let at_top = statuses
+            let naming = statuses
                 .iter()
                 .filter(|(_, status)| Some(status.generation) == top)
                 .map(|(_, status)| status);
-            let naming = project
-                .believed
-                .map(|(_, status)| status)
-                .into_iter()
-                .chain(at_top);
             for run in naming.flat_map(|status| &status.runs) {
                 work.sessions.extend(&run.sessions);
                 work.workspaces.extend(&run.workspaces);
@@ -930,7 +924,8 @@ impl Attention {
     }
 
     /// Every item that stands now, ordered by kind and then id. Only the records written since
-    /// the last read are loaded. They are shown as [`Peers::state`] shows them, so an offline
+    /// the last read are loaded, but the factory statuses of each project whose factory is on
+    /// are read in full on every call. Records are shown as [`Peers::state`] shows them, so an offline
     /// machine's sessions and terminals are unreachable and raise nothing but its "machine
     /// offline" item.
     pub async fn items(&self) -> Result<Vec<Item>, StoreError> {
