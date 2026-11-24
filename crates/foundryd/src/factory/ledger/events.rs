@@ -742,6 +742,27 @@ mod tests {
     }
 
     #[test]
+    fn a_cause_gives_each_text_to_its_hider_once_before_it_is_stripped_or_cut() {
+        let seen = std::cell::RefCell::new(Vec::new());
+        let hide = |text: &str| {
+            seen.borrow_mut().push(text.to_owned());
+            text.replace("SECRET\nVALUE", "***")
+        };
+        let long = format!("{}SECRET\nVALUE", "c".repeat(995));
+        let cause = Cause::new(CauseStep::Gate, "a\u{7}b")
+            .actor("SECRET\nVALUE")
+            .command(&long);
+        let cleaned = cause.cleaned_with(&hide);
+        assert_eq!(cleaned.reason, "ab");
+        assert_eq!(cleaned.actor.as_deref(), Some("***"));
+        assert_eq!(cleaned.command, Some(format!("{}***", "c".repeat(995))));
+        assert_eq!(
+            *seen.borrow(),
+            ["a\u{7}b".to_owned(), "SECRET\nVALUE".to_owned(), long]
+        );
+    }
+
+    #[test]
     fn every_event_names_itself_as_it_is_written_and_is_in_the_field_table() {
         for (event, _) in samples() {
             let name = event.name();

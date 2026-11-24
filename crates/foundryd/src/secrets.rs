@@ -1704,4 +1704,269 @@ mod tests {
         assert!(text.contains("could not be read"), "{text}");
         assert!(!text.contains("ghp_unreadable"), "{text}");
     }
+
+    /// A 40-character token, as a classic `ghp_` one is.
+    const TOKEN: &str = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
+
+    /// A store holding `TOKEN` for `octocat`.
+    fn holding_token() -> MemorySecrets {
+        let secrets = MemorySecrets::default();
+        secrets.set("github:octocat", TOKEN).unwrap();
+        secrets
+    }
+
+    /// `TOKEN` with `gap` after its 20th character, in a text with lines of its own around it,
+    /// is hidden, and only that span is replaced.
+    fn hidden_across(gap: &str) {
+        let secrets = holding_token();
+        let (head, tail) = TOKEN.split_at(20);
+        let text = format!("before\r\n\tline\nexport T={head}{gap}{tail} # set\nafter\u{7}\n");
+        assert_eq!(
+            hide_known(&text, &secrets),
+            "before\r\n\tline\nexport T=*** # set\nafter\u{7}\n",
+            "{gap:?}"
+        );
+    }
+
+    #[test]
+    fn hide_known_hides_a_token_split_by_a_space() {
+        hidden_across(" ");
+    }
+
+    #[test]
+    fn hide_known_hides_a_token_split_by_a_tab() {
+        hidden_across("\t");
+    }
+
+    #[test]
+    fn hide_known_hides_a_token_split_by_a_line_feed() {
+        hidden_across("\n");
+    }
+
+    #[test]
+    fn hide_known_hides_a_token_split_by_a_carriage_return() {
+        hidden_across("\r");
+    }
+
+    #[test]
+    fn hide_known_hides_a_token_split_by_a_crlf() {
+        hidden_across("\r\n");
+    }
+
+    #[test]
+    fn hide_known_hides_a_token_split_by_a_vertical_tab() {
+        hidden_across("\u{b}");
+    }
+
+    #[test]
+    fn hide_known_hides_a_token_split_by_a_form_feed() {
+        hidden_across("\u{c}");
+    }
+
+    #[test]
+    fn hide_known_hides_a_token_split_by_a_next_line() {
+        hidden_across("\u{85}");
+    }
+
+    #[test]
+    fn hide_known_hides_a_token_split_by_a_bell() {
+        hidden_across("\u{7}");
+    }
+
+    #[test]
+    fn hide_known_hides_a_token_split_by_a_zero_width_character() {
+        hidden_across("\u{200b}");
+    }
+
+    #[test]
+    fn hide_known_hides_a_token_split_by_a_colour_sequence() {
+        hidden_across("\u{1b}[31m");
+    }
+
+    #[test]
+    fn hide_known_hides_a_token_split_by_the_other_gap_characters() {
+        // DEL, the C0 and C1 controls, the bidi and zero-width ranges at both ends, and the
+        // other whole escape sequences: an 8-bit CSI, a character set, a two-character escape
+        // and an OSC hyperlink.
+        for gap in [
+            "\u{7f}",
+            "\u{0}",
+            "\u{1f}",
+            "\u{80}",
+            "\u{9f}",
+            "\u{200f}",
+            "\u{202a}",
+            "\u{202e}",
+            "\u{2066}",
+            "\u{2069}",
+            "\u{feff}",
+            "\u{9b}1;32m",
+            "\u{1b}(B",
+            "\u{1b}7",
+            "\u{1b}]8;;http://x\u{7}",
+            "\u{1b}]8;;\u{1b}\\",
+            " \u{1b}[0m\n  ",
+        ] {
+            hidden_across(gap);
+        }
+    }
+
+    #[test]
+    fn hide_known_hides_a_token_with_two_gaps_inside_it() {
+        let secrets = holding_token();
+        let text = format!(
+            "x {}\u{1b}[31m{}\u{1b}[0m{} y",
+            &TOKEN[..10],
+            &TOKEN[10..25],
+            &TOKEN[25..]
+        );
+        assert_eq!(hide_known(&text, &secrets), "x *** y");
+    }
+
+    #[test]
+    fn hide_known_hides_a_93_character_token_wrapped_twice() {
+        let secrets = MemorySecrets::default();
+        let token = format!("github_pat_{}", "A1b2C3d4E5".repeat(9).get(..82).unwrap());
+        assert_eq!(token.len(), 93);
+        secrets.set("github:octocat", &token).unwrap();
+        let text = format!(
+            "$ env\nGH_TOKEN={}\n{}\n{}\nHOME=/home/me\n",
+            &token[..31],
+            &token[31..71],
+            &token[71..]
+        );
+        assert_eq!(
+            hide_known(&text, &secrets),
+            "$ env\nGH_TOKEN=***\nHOME=/home/me\n"
+        );
+    }
+
+    #[test]
+    fn hide_known_hides_a_token_wrapped_with_an_indent() {
+        hidden_across("\n    ");
+    }
+
+    #[test]
+    fn hide_known_hides_the_gateway_keys_across_a_gap_too() {
+        let secrets = MemorySecrets::default();
+        secrets.set(GATEWAY, "sk-gw-0123456789abcdef").unwrap();
+        secrets
+            .set(GATEWAY_MANAGEMENT, "sk-gm-0123456789abcdef")
+            .unwrap();
+        let text = "a sk-gw-01234\n56789abcdef b sk-gm-0123456789\tabcdef c";
+        assert_eq!(hide_known(text, &secrets), "a *** b *** c");
+    }
+
+    #[test]
+    fn hide_known_matches_across_a_gap_of_32_characters_and_no_more() {
+        let secrets = holding_token();
+        let (head, tail) = TOKEN.split_at(20);
+        let gap = " ".repeat(32);
+        assert_eq!(
+            hide_known(&format!("<{head}{gap}{tail}>"), &secrets),
+            "<***>"
+        );
+        // An escape sequence counts each of its characters.
+        let gap = format!("\u{1b}[{}m", "1;".repeat(14));
+        assert_eq!(gap.chars().count(), 32);
+        assert_eq!(
+            hide_known(&format!("<{head}{gap}{tail}>"), &secrets),
+            "<***>"
+        );
+        for gap in [" ".repeat(33), format!("\u{1b}[{}m", "1;".repeat(15))] {
+            let text = format!("<{head}{gap}{tail}>");
+            assert_eq!(hide_known(&text, &secrets), text, "{gap:?}");
+        }
+    }
+
+    #[test]
+    fn hide_known_does_not_match_across_a_character_that_is_no_gap() {
+        let secrets = holding_token();
+        let (head, tail) = TOKEN.split_at(20);
+        // `|` prefixes a line, and is no gap; nor is a no-break space or a line separator.
+        for gap in ["\n| ", "\u{a0}", "\u{2028}", "\u{1b}[31", "x"] {
+            let text = format!("{head}{gap}{tail}");
+            assert_eq!(hide_known(&text, &secrets), text, "{gap:?}");
+        }
+    }
+
+    #[test]
+    fn hide_known_hides_a_value_shorter_than_16_characters_only_whole() {
+        let secrets = MemorySecrets::default();
+        secrets.set("github:short", "ghp_0123456789a").unwrap();
+        secrets.set("github:edge", "ghp_abcdefghijkl").unwrap();
+        assert_eq!("ghp_0123456789a".len(), 15);
+        assert_eq!("ghp_abcdefghijkl".len(), 16);
+        let split = "a ghp_01234\n56789a b";
+        assert_eq!(hide_known(split, &secrets), split);
+        assert_eq!(hide_known("a ghp_0123456789a b", &secrets), "a *** b");
+        assert_eq!(hide_known("a ghp_abcd\nefghijkl b", &secrets), "a *** b");
+    }
+
+    #[test]
+    fn hide_known_hides_a_value_with_a_gap_character_of_its_own_only_whole() {
+        let secrets = MemorySecrets::default();
+        secrets.set(GATEWAY, "a key with spaces in it").unwrap();
+        assert_eq!(hide_known("[a key with spaces in it]", &secrets), "[***]");
+        let text = "[a key with  spaces in it]";
+        assert_eq!(hide_known(text, &secrets), text);
+    }
+
+    #[test]
+    fn hide_known_leaves_lines_that_only_join_into_a_url_password_as_they_are() {
+        let secrets = holding_token();
+        let text = "fetching https://registry.example.com\nadmin@example.com wrote\r\n\tok\u{7}";
+        assert_eq!(hide_known(text, &secrets), text);
+        // A URL password on one line is still hidden, beside a split token.
+        let (head, tail) = TOKEN.split_at(20);
+        let text = format!("https://u:pw123@h/x\n{head}\n{tail}\n");
+        assert_eq!(hide_known(&text, &secrets), "https://***@h/x\n***\n");
+    }
+
+    #[test]
+    fn hide_known_leaves_a_pull_request_link_a_commit_id_and_an_unheld_key_whole() {
+        let secrets = holding_token();
+        secrets.set(GATEWAY, "sk-0123456789abcdefABCDEF").unwrap();
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        let key = "Zx9-Qw8_Er7Ty6Ui5Op4As3Df2Gh1J";
+        assert_eq!((commit.len(), key.len()), (40, 30));
+        let text = format!(
+            "see https://github.com/original-solutions/foundry/pull/134\n\
+             at {commit}\nwith {key}\n and ghp_A1b2C3d4E5\n"
+        );
+        assert_eq!(hide_known(&text, &secrets), text);
+    }
+
+    #[test]
+    fn hide_known_hides_a_value_near_the_end_of_64_kb_in_one_pass() {
+        // Near misses all through: the token's head again and again, each cut short by a gap
+        // or a stray escape, so a matcher that went back would read the text many times over.
+        let (head, tail) = TOKEN.split_at(39);
+        let mut text = String::new();
+        let mut n = 0;
+        while text.len() < 64 * 1024 - 200 {
+            text.push_str(head);
+            text.push_str(["\n  ", "\u{1b}[1;2;3;4;5;6;7;8;9;0;1;2;3;", " "][n % 3]);
+            n += 1;
+        }
+        text.push_str(&format!("{}\n{}{tail}\nend", &TOKEN[..12], &TOKEN[12..39]));
+        assert!(text.len() <= 64 * 1024);
+        let values = vec![
+            TOKEN.to_owned(),
+            "sk-0123456789abcdefABCDEF".to_owned(),
+            "short1".to_owned(),
+        ];
+        let mut work = 0;
+        let hidden = hide_values(&text, &values, &mut work);
+        assert!(
+            hidden.ends_with("***\nend"),
+            "{}",
+            &hidden[hidden.len() - 80..]
+        );
+        assert!(!hidden.contains(TOKEN));
+        // Each character is read a bounded number of times for each value, however the text
+        // is laid out: linear in the text, never a pass per place a match could start.
+        let bound = 4 * text.chars().count() * (values.len() + 1);
+        assert!(work <= bound, "{work} steps for {} characters", text.len());
+    }
 }

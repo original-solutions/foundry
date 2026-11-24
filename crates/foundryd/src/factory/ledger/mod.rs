@@ -385,6 +385,14 @@ pub(crate) mod testing {
         Arc::new(|text: &str| text.to_owned())
     }
 
+    /// Hides as the daemon's ledger will: `secrets::hide_known` over a store that holds
+    /// `token` for `octocat`.
+    pub fn hiding(token: &str) -> Hide {
+        let secrets = crate::secrets::MemorySecrets::default();
+        crate::secrets::Secrets::set(&secrets, "github:octocat", token).unwrap();
+        Arc::new(move |text: &str| crate::secrets::hide_known(text, &secrets))
+    }
+
     /// A store of its own in a directory that lives as long as the returned guard.
     pub fn open_store() -> (TempDir, Arc<Mutex<Store>>) {
         let dir = tempfile::tempdir().unwrap();
@@ -1864,9 +1872,8 @@ mod tests {
     fn a_secret_across_the_cut_of_a_cause_text_is_hidden_before_the_text_is_cut() {
         let (_dir, store) = open_store();
         let token = "ghp_0123456789abcdefghij";
-        let hide: Hide = std::sync::Arc::new(move |text: &str| text.replace(token, "***"));
-        let ledger =
-            Ledger::new(store.clone(), MachineId::random(), 1, hide).with_wall(ticking(T0, 1000));
+        let ledger = Ledger::new(store.clone(), MachineId::random(), 1, hiding(token))
+            .with_wall(ticking(T0, 1000));
         // Each text holds the secret across the place its cut falls: 100 characters for the
         // reason, actor and label, 1000 for the command.
         let short = |fill: &str| format!("{}{token}", fill.repeat(95));
@@ -1905,9 +1912,8 @@ mod tests {
     fn a_secret_split_by_a_control_character_is_hidden_in_the_data_too() {
         let (_dir, store) = open_store();
         let token = "ghp_0123456789abcdefghij";
-        let hide: Hide = std::sync::Arc::new(move |text: &str| text.replace(token, "***"));
-        let ledger =
-            Ledger::new(store.clone(), MachineId::random(), 1, hide).with_wall(ticking(T0, 1000));
+        let ledger = Ledger::new(store.clone(), MachineId::random(), 1, hiding(token))
+            .with_wall(ticking(T0, 1000));
         let written = ledger
             .write(
                 &run(8),
@@ -1940,13 +1946,16 @@ mod tests {
 
     #[test]
     fn output_whose_lines_only_join_into_a_url_password_keeps_its_lines() {
-        // A Hide that hides URL passwords as `secrets::redact` does, beside a known token.
+        // `secrets::hide_known` hides URL passwords as `secrets::redact` does, beside a known
+        // token.
         let (_dir, store) = open_store();
-        let hide: Hide = std::sync::Arc::new(|text: &str| {
-            crate::secrets::redact(text).replace("ghp_0123456789abcdefghij", "***")
-        });
-        let ledger =
-            Ledger::new(store.clone(), MachineId::random(), 1, hide).with_wall(ticking(T0, 1000));
+        let ledger = Ledger::new(
+            store.clone(),
+            MachineId::random(),
+            1,
+            hiding("ghp_0123456789abcdefghij"),
+        )
+        .with_wall(ticking(T0, 1000));
         let output =
             "fetching https://registry.example.com\nadmin@example.com wrote\r\n\tok\u{0007}";
         let written = ledger
@@ -1963,6 +1972,70 @@ mod tests {
             )
             .unwrap();
         assert_eq!(written.data["reason"], json!("a\nT=***\nb"));
+    }
+
+    #[test]
+    fn a_secret_split_by_white_space_or_a_colour_sequence_is_hidden_in_the_data_and_the_cause() {
+        let (_dir, store) = open_store();
+        let token = "ghp_0123456789abcdefghij";
+        let ledger = Ledger::new(store.clone(), MachineId::random(), 1, hiding(token))
+            .with_wall(ticking(T0, 1000));
+        for split in ["\n", "\t", " ", "\r\n", "\n    ", "\u{1b}[31m"] {
+            let text = format!("one\nT=ghp_0123456789{split}abcdefghij\ntwo");
+            let cause = Cause::new(CauseStep::Gate, &text)
+                .actor(&text)
+                .command(&text)
+                .label(&text);
+            let written = ledger.write(&run(8), &stuck(&text), &cause).unwrap();
+            assert_eq!(
+                written.data["reason"],
+                json!("one\nT=***\ntwo"),
+                "{split:?}"
+            );
+            let cause = written.cause.unwrap();
+            for field in ["reason", "actor", "command", "label"] {
+                assert_eq!(cause[field], json!("oneT=***two"), "{split:?} {field}");
+            }
+        }
+        let stored = serde_json::to_string(&held(&store, &run(8))).unwrap();
+        assert!(!stored.contains("ghp_"), "{stored}");
+        assert!(!stored.contains("abcdefghij"), "{stored}");
+    }
+
+    #[test]
+    fn a_write_gives_each_text_to_its_hider_once_and_as_it_came() {
+        let (_dir, store) = open_store();
+        let seen = std::sync::Arc::new(Mutex::new(Vec::<String>::new()));
+        let hide: Hide = {
+            let seen = seen.clone();
+            std::sync::Arc::new(move |text: &str| {
+                seen.lock().unwrap().push(text.to_owned());
+                text.to_owned()
+            })
+        };
+        let ledger =
+            Ledger::new(store.clone(), MachineId::random(), 1, hide).with_wall(ticking(T0, 1000));
+        let cause = Cause::new(CauseStep::Gate, "r\u{7}\nr")
+            .actor("a\u{202e}a")
+            .command("c\tc")
+            .label("l\u{1b}[0ml");
+        ledger
+            .write(
+                &run(8),
+                &stuck(&format!("{}\u{7}\nend", "o".repeat(OUTPUT_LIMIT))),
+                &cause,
+            )
+            .unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                format!("{}\u{7}\nend", "o".repeat(OUTPUT_LIMIT)),
+                "r\u{7}\nr".to_owned(),
+                "a\u{202e}a".to_owned(),
+                "c\tc".to_owned(),
+                "l\u{1b}[0ml".to_owned(),
+            ]
+        );
     }
 
     #[test]
