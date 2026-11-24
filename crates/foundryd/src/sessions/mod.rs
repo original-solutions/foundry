@@ -21,13 +21,13 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
 use axum::Router;
 use axum::routing::post;
 use bytes::Bytes;
-use foundry_proto::ids::{MachineId, SessionId, TerminalId, WorkspaceId};
+use foundry_proto::ids::{MachineId, ProjectId, SessionId, TerminalId, WorkspaceId};
 use foundry_proto::record::{AnyRecord, Record, Session, Terminal};
 use foundry_proto::state::{SessionState, TerminalState};
 use futures::StreamExt as _;
@@ -35,8 +35,10 @@ use tokio::sync::watch;
 use tokio::task::AbortHandle;
 use tokio::time::Instant;
 
+use crate::secrets::Secrets;
 use crate::store::{Store, StoreError};
 use crate::terminals::{TerminalError, Terminals};
+use factory::FactoryLaunch;
 use state::{Event, Hook, next_state};
 
 pub mod brief;
@@ -157,6 +159,13 @@ struct Inner {
     terminals: Arc<Terminals>,
     /// Where settings files live, `<data dir>/sessions`.
     dir: PathBuf,
+    /// The data dir: where the askpass script lives.
+    data: PathBuf,
+    /// Where a factory start reads its token from. Set once, by [`Sessions::with_secrets`].
+    secrets: OnceLock<Arc<dyn Secrets>>,
+    /// The factory sessions, live or ended, and the project each is for. A session is in it
+    /// only once its start has succeeded, or when [`Sessions::adopt`] found its mark.
+    factory: Mutex<HashMap<SessionId, ProjectId>>,
     config: Config,
     /// Held while a worktree is marked trusted, so two starts never overwrite each other.
     trust: Mutex<()>,
@@ -208,6 +217,9 @@ impl Sessions {
                 store,
                 terminals,
                 dir: data_dir.join("sessions"),
+                data: data_dir.to_path_buf(),
+                secrets: OnceLock::new(),
+                factory: Mutex::default(),
                 config,
                 trust: Mutex::new(()),
                 live: Mutex::default(),
@@ -222,8 +234,11 @@ impl Sessions {
     }
 
     /// Gives these sessions the secret store a factory start reads its token from.
-    pub fn with_secrets(self, _secrets: Arc<dyn crate::secrets::Secrets>) -> Self {
-        todo!()
+    /// Only the first store given is kept. With none, a factory start is refused as having no
+    /// token.
+    pub fn with_secrets(self, secrets: Arc<dyn Secrets>) -> Self {
+        let _ = self.inner.secrets.set(secrets);
+        self
     }
 
     /// Starts Claude Code with `model` in a new terminal in `worktree`, the worktree of
@@ -258,7 +273,7 @@ impl Sessions {
             .map(str::to_owned);
         tokio::spawn(async move {
             inner
-                .start(workspace, &worktree, &model, prompt.as_deref())
+                .start(workspace, &worktree, &model, prompt.as_deref(), None)
                 .await
         })
         .await?
@@ -325,6 +340,7 @@ impl Inner {
         worktree: &Path,
         model: &str,
         prompt: Option<&str>,
+        factory: Option<&FactoryLaunch>,
     ) -> Result<SessionId, SessionError> {
         let id = SessionId::random();
         let token = new_token();
@@ -332,14 +348,24 @@ impl Inner {
         let url = self.hook_url(id);
         let written = {
             let (settings, curl, token) = (settings.clone(), curl.clone(), token.clone());
+            let marked = factory.map(|f| (factory::mark_file(&self.dir, id), f.project));
             blocking(move || {
                 claude::write_curl_config(&curl, &url, &token)?;
-                claude::write_settings(&settings, &claude::settings_json(&curl))
+                let json = if marked.is_some() {
+                    claude::factory_settings_json(&curl)
+                } else {
+                    claude::settings_json(&curl)
+                };
+                claude::write_settings(&settings, &json)?;
+                match marked {
+                    Some((mark, project)) => factory::write_mark(&mark, project),
+                    None => Ok(()),
+                }
             })
             .await
         };
         if let Err(error) = written.and_then(|r| r) {
-            self.remove_files(&settings, &curl).await;
+            self.discard(id, &settings, &curl).await;
             return Err(error);
         }
         let trusted = {
@@ -351,7 +377,7 @@ impl Inner {
             blocking(move || claude::mark_trusted_locked(&me.trust, &json, &worktree)).await
         };
         if let Err(error) = trusted.and_then(|r| r) {
-            self.remove_files(&settings, &curl).await;
+            self.discard(id, &settings, &curl).await;
             return Err(error);
         }
 
@@ -379,13 +405,15 @@ impl Inner {
         let mut body = live.body.lock().await;
         lock(&self.live).insert(id, live.clone());
 
-        let started = self.launch(&settings, workspace, worktree, model).await;
+        let started = self
+            .launch(&settings, workspace, worktree, model, factory)
+            .await;
         let (terminal, floor) = match started {
             Ok(started) => started,
             Err(error) => {
                 lock(&self.live).remove(&id);
                 drop(body);
-                self.remove_files(&settings, &curl).await;
+                self.discard(id, &settings, &curl).await;
                 return Err(error);
             }
         };
@@ -394,11 +422,14 @@ impl Inner {
             lock(&self.live).remove(&id);
             drop(body);
             let _ = self.terminals.close(terminal).await;
-            self.remove_files(&settings, &curl).await;
+            self.discard(id, &settings, &curl).await;
             return Err(error);
         }
         drop(body);
 
+        if let Some(factory) = factory {
+            lock(&self.factory).insert(id, factory.project);
+        }
         self.run(&live, terminal, floor, FirstPrompt::new(prompt));
         tracing::info!(session = %id, workspace = %workspace, model, "session started");
         Ok(id)
@@ -425,6 +456,8 @@ impl Inner {
     /// session left out would be refused and counted for the daemon's whole run. Any other
     /// failure would fail the same way every time, and the daemon must still start.
     async fn adopt(self: &Arc<Self>) {
+        // Before the store is read, so a store that fails still leaves the marks known.
+        self.adopt_marks().await;
         let mut backoff = Backoff::new();
         let (open, cursor) = loop {
             match self.open_sessions().await {
@@ -582,6 +615,7 @@ impl Inner {
         workspace: WorkspaceId,
         worktree: &Path,
         model: &str,
+        factory: Option<&FactoryLaunch>,
     ) -> Result<(TerminalId, u64), SessionError> {
         let me = self.me;
         let floor = self
@@ -594,7 +628,7 @@ impl Inner {
             "--model".into(),
             model.to_string(),
         ]);
-        let env = [
+        let mut env = vec![
             (
                 "ANTHROPIC_BASE_URL".to_string(),
                 self.config.gateway.base_url.clone(),
@@ -604,6 +638,10 @@ impl Inner {
                 self.config.gateway.key.clone(),
             ),
         ];
+        if let Some(factory) = factory {
+            argv.extend(claude::factory_args(&factory.effort));
+            env.extend(factory.env.iter().cloned());
+        }
         let terminal = self
             .terminals
             .start(workspace, worktree, &argv, &env)
@@ -682,6 +720,14 @@ impl Inner {
     ) -> Result<T, SessionError> {
         let store = self.store.clone();
         Ok(blocking(move || work(&mut lock(&store))).await??)
+    }
+
+    /// Removes everything a start that failed wrote: the settings file, the curl config and a
+    /// factory session's folder.
+    async fn discard(&self, id: SessionId, settings: &Path, curl: &Path) {
+        self.remove_files(settings, curl).await;
+        let folder = factory::folder(&self.dir, id);
+        let _ = blocking(move || std::fs::remove_dir_all(folder)).await;
     }
 
     /// Removes a session's settings file and curl config. Missing is fine, and nothing else can

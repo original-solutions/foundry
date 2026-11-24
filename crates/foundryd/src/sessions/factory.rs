@@ -1,11 +1,28 @@
 //! The factory start of a session, messages to it, and ending factory sessions.
+//!
+//! A factory session is a P1 session started with factory options ([`Inner::start`] does both):
+//! Claude Code runs with `--dangerously-skip-permissions` and an `--effort`, its settings file
+//! holds `skipDangerousModePermissionPrompt`, and its environment holds the project login's
+//! token as `GH_TOKEN` and as the answer of a `GIT_ASKPASS`, read from the secret store at the
+//! start. The token reaches the child's environment only: it is in no argument, file, log line
+//! or error.
+//!
+//! A file `factory` in the session's own folder, `<data dir>/sessions/<session>/`, marks the
+//! session as a factory session and holds its project. [`Sessions::adopt`] reads the marks
+//! again, so a daemon that starts again still knows its factory sessions.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use foundry_proto::ids::{ProjectId, SessionId, WorkspaceId};
 
-use super::{SessionError, Sessions};
+use super::{Inner, SessionError, Sessions, blocking, claude, lock};
 use crate::factory::messages::Message;
+use crate::git_auth::{self, GitAuth, NoToken};
+use crate::terminals::TerminalError;
+
+/// The name of the mark file in a factory session's folder.
+const MARK: &str = "factory";
 
 /// What a factory session is started for. It holds no secret: the token is read from the
 /// secret store at the start.
@@ -21,31 +38,196 @@ pub struct FactoryStart {
     pub effort: String,
 }
 
+/// What [`Inner::start`] adds for a factory session. It holds the token, so it has no `Debug`.
+pub(super) struct FactoryLaunch {
+    pub project: ProjectId,
+    pub effort: String,
+    /// The child's extra environment: the token and the askpass.
+    pub env: Vec<(String, String)>,
+}
+
+/// Session `id`'s own folder, in the sessions folder `dir`.
+pub(super) fn folder(dir: &Path, id: SessionId) -> PathBuf {
+    dir.join(id.to_string())
+}
+
+/// The mark file of session `id`.
+pub(super) fn mark_file(dir: &Path, id: SessionId) -> PathBuf {
+    folder(dir, id).join(MARK)
+}
+
+/// Writes the mark at `path`, which makes the session's folder, readable by this user only.
+pub(super) fn write_mark(path: &Path, project: ProjectId) -> Result<(), SessionError> {
+    claude::write_new_private(path, project.to_string().as_bytes())
+}
+
+/// The environment a factory session's child gets for `login`: the token for `gh` and as the
+/// askpass's answer, the askpass script, and git's credential helpers emptied, so a keychain
+/// helper never answers before the askpass does. The askpass and the token are read from what
+/// [`GitAuth`] gives a git child, so there is one source of them.
+fn factory_env(
+    secrets: &dyn crate::secrets::Secrets,
+    login: &str,
+    data: &Path,
+) -> Result<Vec<(String, String)>, NoToken> {
+    let auth = GitAuth::for_login(secrets, login, data)?;
+    let mut git = Command::new("git");
+    auth.apply(&mut git);
+    // `git` holds the token: it is read from, and never formatted.
+    let get = |name: &str| {
+        git.get_envs()
+            .find(|(key, _)| *key == name)
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_string_lossy().into_owned())
+    };
+    let (Some(askpass), Some(token)) = (get("GIT_ASKPASS"), get(git_auth::TOKEN_VAR)) else {
+        return Err(NoToken::Unset {
+            login: login.to_owned(),
+        });
+    };
+    Ok(vec![
+        ("GH_TOKEN".into(), token.clone()),
+        ("GIT_ASKPASS".into(), askpass),
+        (git_auth::TOKEN_VAR.into(), token),
+        ("GIT_CONFIG_COUNT".into(), "1".into()),
+        ("GIT_CONFIG_KEY_0".into(), "credential.helper".into()),
+        ("GIT_CONFIG_VALUE_0".into(), String::new()),
+    ])
+}
+
 impl Sessions {
-    /// Starts a factory session.
+    /// Starts Claude Code for a factory session in a new terminal in `worktree`, the worktree
+    /// of `workspace`, as [`Sessions::start`] does, with the flags, settings key, environment
+    /// and mark of a factory session. `first`'s line is its first prompt, typed as
+    /// [`Sessions::start_with`] types one.
+    ///
+    /// The token is read first: a login the machine holds no token for is
+    /// [`SessionError::NoToken`], and so is a machine with no secret store. A start that fails
+    /// leaves no terminal, no file, no folder and no record.
+    ///
+    /// A first message with a body is refused with [`SessionError::FirstMessageBody`]: writing
+    /// a body to a file in the session's folder, and typing the line with its path, is what
+    /// the turns and messages unit adds, and it fills this seam.
     pub async fn start_factory(
         &self,
-        _workspace: WorkspaceId,
-        _worktree: &Path,
-        _start: FactoryStart,
-        _first: Message,
+        workspace: WorkspaceId,
+        worktree: &Path,
+        start: FactoryStart,
+        first: Message,
     ) -> Result<SessionId, SessionError> {
-        todo!()
+        if first.body.is_some() {
+            return Err(SessionError::FirstMessageBody);
+        }
+        let inner = self.inner.clone();
+        let worktree = worktree.to_path_buf();
+        let line = first.line.trim().to_owned();
+        let prompt = Some(line).filter(|line| !line.is_empty());
+        tokio::spawn(async move {
+            let secrets = inner.secrets.get().cloned();
+            let (login, data) = (start.login.clone(), inner.data.clone());
+            let env = blocking(move || match secrets {
+                Some(secrets) => factory_env(secrets.as_ref(), &login, &data),
+                None => Err(NoToken::Unset { login }),
+            })
+            .await??;
+            let launch = FactoryLaunch {
+                project: start.project,
+                effort: start.effort,
+                env,
+            };
+            inner
+                .start(
+                    workspace,
+                    &worktree,
+                    &start.model,
+                    prompt.as_deref(),
+                    Some(&launch),
+                )
+                .await
+        })
+        .await?
     }
 
-    /// The project session `session` is a factory session of.
-    pub fn is_factory(&self, _session: SessionId) -> Option<ProjectId> {
-        todo!()
+    /// The project session `session` is a factory session of, whether it still runs or has
+    /// ended. `None` for a P1 session and for one this daemon knows nothing of.
+    pub fn is_factory(&self, session: SessionId) -> Option<ProjectId> {
+        lock(&self.inner.factory).get(&session).copied()
     }
 
-    /// The live factory sessions of `project`, sorted.
-    pub fn factory_sessions(&self, _project: ProjectId) -> Vec<SessionId> {
-        todo!()
+    /// The factory sessions of `project` that still run, sorted.
+    pub fn factory_sessions(&self, project: ProjectId) -> Vec<SessionId> {
+        let mut sessions: Vec<_> = lock(&self.inner.factory)
+            .iter()
+            .filter(|(id, p)| **p == project && self.inner.live(**id).is_some())
+            .map(|(id, _)| *id)
+            .collect();
+        sessions.sort();
+        sessions
     }
 
-    /// Closes each factory terminal of `workspace`.
-    pub async fn end_factory(&self, _workspace: WorkspaceId) -> Result<(), SessionError> {
-        todo!()
+    /// Closes the terminal of each factory session of `workspace` that still runs. A P1 session
+    /// and another workspace's factory session are left alone. A terminal already gone counts
+    /// as ended. Every close is tried; the first other failure is given.
+    pub async fn end_factory(&self, workspace: WorkspaceId) -> Result<(), SessionError> {
+        let marked: Vec<SessionId> = lock(&self.inner.factory).keys().copied().collect();
+        let mut terminals = Vec::new();
+        for id in marked {
+            let Some(live) = self.inner.live(id) else {
+                continue;
+            };
+            let body = live.body.lock().await;
+            if body.workspace == workspace {
+                terminals.push(body.terminal);
+            }
+        }
+        let mut failed = None;
+        for terminal in terminals {
+            match self.inner.terminals.close(terminal).await {
+                Ok(()) | Err(TerminalError::Gone(_) | TerminalError::Unknown(_)) => {}
+                Err(error) => {
+                    failed.get_or_insert(error);
+                }
+            }
+        }
+        failed.map_or(Ok(()), |error| Err(error.into()))
+    }
+}
+
+impl Inner {
+    /// Reads the marks of the factory sessions an earlier daemon started, so they are still
+    /// factory sessions. A mark that cannot be read, or holds no project, is skipped with a
+    /// warning that does not show its contents.
+    pub(super) async fn adopt_marks(&self) {
+        let dir = self.dir.clone();
+        let found = blocking(move || {
+            let mut found = Vec::new();
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                return found;
+            };
+            for entry in entries.flatten() {
+                let mark = entry.path().join(MARK);
+                if !mark.is_file() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let session = uuid::Uuid::parse_str(&name).map(SessionId);
+                let project = std::fs::read_to_string(&mark)
+                    .ok()
+                    .and_then(|text| uuid::Uuid::parse_str(text.trim()).ok())
+                    .map(ProjectId);
+                match (session, project) {
+                    (Ok(session), Some(project)) => found.push((session, project)),
+                    _ => tracing::warn!(
+                        folder = %name,
+                        "a factory mark cannot be read, so the session is not taken as a factory session"
+                    ),
+                }
+            }
+            found
+        })
+        .await
+        .unwrap_or_default();
+        lock(&self.factory).extend(found);
     }
 }
 
@@ -616,5 +798,27 @@ exec "$agent" "$@""#;
         assert_ne!(value(&seen, "GH_TOKEN=").as_deref(), Some(TOKEN));
         assert!(!f.sessions_dir().join(id.to_string()).exists());
         assert_eq!(f.sessions.is_factory(id), None);
+    }
+
+    #[tokio::test]
+    async fn a_start_that_fails_after_its_folder_is_written_removes_the_folder_too() {
+        let f = Fx::new("- wait_input\n").await;
+        let project = ProjectId::random();
+        std::fs::write(&f.config.claude_json, "not json").unwrap();
+
+        let error = f
+            .sessions
+            .start_factory(
+                WorkspaceId::random(),
+                f.worktree.path(),
+                f.start_for(project),
+                f.line(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, SessionError::ClaudeState { .. }), "{error}");
+        f.assert_nothing_left(project);
+        assert_eq!(f.sessions.is_factory(SessionId::random()), None);
     }
 }
