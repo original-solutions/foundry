@@ -529,7 +529,7 @@ fn is_unsafe(c: char) -> bool {
 }
 
 /// `text` on one line with no control or bidi characters.
-fn strip(text: &str) -> String {
+pub(super) fn strip(text: &str) -> String {
     text.chars().filter(|c| !is_unsafe(*c)).collect()
 }
 

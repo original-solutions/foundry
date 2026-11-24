@@ -200,10 +200,18 @@ fn gate_attempts(events: &[RunEvent]) -> u32 {
 
 /// Every text in `value` through `hide`, then cut to its last [`OUTPUT_LIMIT`] bytes. Hiding
 /// comes first, so a cut can never leave the end of a secret that the hiding would no longer
-/// recognise.
+/// recognise. A text is kept as it is, its lines and control characters too, unless `hide`
+/// finds a secret only once the control characters are gone: then it is kept without them,
+/// with that secret hidden.
 fn hide_texts(value: &mut Value, hide: &(dyn Fn(&str) -> String + Send + Sync)) {
     match value {
-        Value::String(text) => *text = cut_output(&hide(text)).to_owned(),
+        Value::String(text) => {
+            let hidden = hide(text);
+            let stripped = events::strip(&hidden);
+            let again = hide(&stripped);
+            let kept = if again == stripped { hidden } else { again };
+            *text = cut_output(&kept).to_owned();
+        }
         Value::Array(items) => {
             for item in items {
                 hide_texts(item, hide);
