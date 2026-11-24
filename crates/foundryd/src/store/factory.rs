@@ -315,7 +315,7 @@ fn warn_unreadable_owner(conn: &Connection, owner: &str) {
     if !matches!(inserted, Ok(0)) {
         tracing::warn!(
             "a factory row whose owner this build cannot read is left out of the factory \
-             versions held; told once a start"
+             versions held"
         );
     }
 }
