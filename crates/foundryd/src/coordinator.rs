@@ -1741,29 +1741,26 @@ mod tests {
 
     // --- the factory `seen` ---
 
+    fn factory_settings(max_runs: u32) -> foundry_proto::factory::FactorySettings {
+        foundry_proto::factory::FactorySettings {
+            max_runs,
+            ..foundry_proto::factory::FactorySettings::default()
+        }
+    }
+
     fn set_factory(max_runs: u32) -> Edit {
         Edit::SetFactory {
-            settings: foundry_proto::factory::FactorySettings {
-                max_runs,
-                ..foundry_proto::factory::FactorySettings::default()
-            },
+            settings: factory_settings(max_runs),
         }
     }
 
     fn factory_value(max_runs: u32) -> SettingValue {
-        match set_factory(max_runs) {
-            Edit::SetFactory { settings } => SettingValue::Factory(settings),
-            _ => unreachable!(),
-        }
+        SettingValue::Factory(factory_settings(max_runs))
     }
 
-    /// `held` after it takes `copy` from a machine on protocol 4, as [`Coordinator::take_settings`]
-    /// takes it.
+    /// `held` after it takes `copy` from a machine on protocol 4.
     fn took_from_protocol_4(held: &SharedSettings, copy: &SharedSettings) -> SharedSettings {
-        let mut copy = copy.clone();
-        keep_factory(held, &mut copy);
-        keep_keys(held, &mut copy);
-        merge(held, &copy)
+        taken(held, FACTORY_SINCE - 1, copy.clone())
     }
 
     #[test]
@@ -1920,12 +1917,12 @@ mod tests {
         let c = took_from_protocol_4(&c, &b);
         // `seen` now covers the other side's edit on both sides; neither holds it.
         assert_eq!(a.seen, c.seen);
-        assert_eq!(a.factory, Some(factory_value_settings(4)));
-        assert_eq!(c.factory, Some(factory_value_settings(6)));
+        assert_eq!(a.factory, Some(factory_settings(4)));
+        assert_eq!(c.factory, Some(factory_settings(6)));
 
         let out = merged(&a, &c);
 
-        assert_eq!(out.factory, Some(factory_value_settings(4)));
+        assert_eq!(out.factory, Some(factory_settings(4)));
         assert_eq!(
             out.overwritten,
             [(
@@ -1938,13 +1935,6 @@ mod tests {
             )]
             .into()
         );
-
-        fn factory_value_settings(max_runs: u32) -> foundry_proto::factory::FactorySettings {
-            match set_factory(max_runs) {
-                Edit::SetFactory { settings } => settings,
-                _ => unreachable!(),
-            }
-        }
     }
 
     #[test]
@@ -1959,6 +1949,78 @@ mod tests {
             assert_eq!(newer, held, "exchange {exchange}");
             assert_eq!(older.seq, held.seq, "exchange {exchange}");
         }
+    }
+
+    /// A copy as the build before the factory `seen` stored it: the fleet's factory settings
+    /// set to `max_runs` by machine 9 at `seq`, counted in `seen` only.
+    fn stored_before_the_factory_seen(max_runs: u32, seq: u64) -> SharedSettings {
+        let mut copy = base();
+        copy.factory = Some(factory_settings(max_runs));
+        copy.stamps.insert(
+            StampKey::Setting(SettingKey::Factory),
+            Stamp { seq, by: id(9) },
+        );
+        copy.seen = [(id(9), seq)].into();
+        copy.seq = seq;
+        copy
+    }
+
+    #[test]
+    fn a_copy_stored_before_the_factory_seen_has_seen_the_factory_edits_it_holds() {
+        // Every machine holds machine 9's last edit; one missed it and holds 9's edit before.
+        let held = stored_before_the_factory_seen(4, 3);
+        let behind = stored_before_the_factory_seen(2, 2);
+        assert!(held.factory_seen.is_empty() && behind.factory_seen.is_empty());
+        let caught_up = merged(&held, &behind);
+        assert!(
+            caught_up.overwritten.is_empty(),
+            "{:?}",
+            caught_up.overwritten
+        );
+        assert_eq!(caught_up.factory, Some(factory_settings(4)));
+
+        // Another machine numbers the next edit of the setting, over 9's. Every copy takes it
+        // with no item, the one still behind included: it replaced an edit its machine held.
+        let next = numbered(&held, &set_factory(7), id(A));
+        assert_eq!(*next.factory_seen, [(id(A), 4), (id(9), 3)].into());
+        for copy in [&held, &behind] {
+            let out = merged(copy, &next);
+            assert!(out.overwritten.is_empty(), "{:?}", out.overwritten);
+            assert_eq!(out.factory, Some(factory_settings(7)));
+        }
+
+        // A protocol 4 relay between two such copies still cannot hide a split: each side
+        // holds only its own factory edit.
+        let a = numbered(&held, &set_factory(5), id(A));
+        let c = numbered(&held, &set_factory(6), id(B));
+        let b = merge(&a.for_protocol(4), &c.for_protocol(4));
+        let out = merged(&took_from_protocol_4(&a, &b), &took_from_protocol_4(&c, &b));
+        let item = &out.overwritten[&SettingKey::Factory];
+        assert_eq!(item.kept, Some(factory_value(5)));
+        assert_eq!(item.lost, Some(factory_value(6)));
+    }
+
+    #[test]
+    fn copies_passed_between_this_build_and_a_protocol_5_build_without_the_factory_seen_keep_their_number()
+     {
+        let held = numbered(&base(), &set_factory(5), id(A));
+        let held = numbered(&held, &set_project(7, "p"), id(A));
+        let mut newer = held.clone();
+        for exchange in 0..20 {
+            // The older build reads each copy without the factory `seen` and sends it back so.
+            let mut older = newer.clone();
+            older.factory_seen.clear();
+            newer = taken(&newer, FACTORY_SINCE, older);
+            assert_eq!(newer, held, "exchange {exchange}");
+        }
+
+        // An edit the older build numbers is taken under its number, the factory `seen` kept.
+        let mut older = numbered(&held, &set_project(8, "q"), id(B));
+        older.factory_seen.clear();
+        let out = taken(&held, FACTORY_SINCE, older.clone());
+        assert_eq!(project_named(&out, 8).as_deref(), Some("q"));
+        assert_eq!(out.factory_seen, held.factory_seen);
+        assert_eq!(out.seq, older.seq);
     }
 
     // --- what a waiting edit does next ---
