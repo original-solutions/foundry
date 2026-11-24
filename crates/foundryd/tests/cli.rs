@@ -1,6 +1,7 @@
 //! The command line: `--version` works, `join` names a bad port, `secret set` stores a gateway
-//! key without printing it, and each command a later task fills exits 2. Every test that runs the
-//! binary uses a temporary data directory and skips the copy from the login keychain.
+//! key or a GitHub token without printing it, `github default` stores a login, and each command
+//! a later task fills exits 2. Every test that runs the binary uses a temporary data directory
+//! and skips the copy from the login keychain.
 
 // A release build ignores `FOUNDRY_SECRETS`, so on macOS these runs of the binary would move
 // secrets out of the login keychain.
@@ -12,7 +13,7 @@ compile_error!(
 use std::io::Write as _;
 use std::process::{Command, Output, Stdio};
 
-use foundryd::secrets::{FileSecrets, Secrets};
+use foundryd::secrets::{FileSecrets, LOGIN_RULE, Secrets};
 
 /// `foundryd` with a data directory and `HOME` of its own and no copy from the keychain, so no
 /// run touches the login keychain or the real home.
@@ -56,6 +57,7 @@ fn join_with_a_port_that_is_not_a_number_exits_1_and_names_it() {
 }
 
 /// Runs `foundryd secret set <name>` with `input` on stdin, in a data directory of its own.
+/// A refused name exits before stdin is read, so the write can find the pipe closed.
 fn secret_set(home: &tempfile::TempDir, name: &str, input: &str) -> Output {
     let mut child = isolated(&["secret", "set", name], home)
         .stdin(Stdio::piped())
@@ -63,12 +65,10 @@ fn secret_set(home: &tempfile::TempDir, name: &str, input: &str) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .expect("foundryd runs");
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(input.as_bytes())
-        .unwrap();
+    match child.stdin.take().unwrap().write_all(input.as_bytes()) {
+        Err(error) if error.kind() != std::io::ErrorKind::BrokenPipe => panic!("stdin: {error}"),
+        _ => {}
+    }
     child.wait_with_output().unwrap()
 }
 
@@ -92,6 +92,8 @@ fn secret_set_stores_the_gateway_keys_and_never_prints_them() {
             String::from_utf8_lossy(&out.stderr)
         );
         assert!(!printed.contains("sk-abc"), "{name} printed: {printed}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("restart foundryd"), "{name}: {stdout}");
         assert_eq!(held(&home, name).as_deref(), Some("sk-abc"));
     }
 }
@@ -164,12 +166,143 @@ fn assert_not_built(args: &[&str]) {
 }
 
 #[test]
-fn github_default_exits_2_and_says_not_built_yet() {
-    assert_not_built(&["github", "default", "octocat"]);
+fn github_default_stores_the_login() {
+    let home = tempfile::tempdir().unwrap();
+
+    let out = isolated(&["github", "default", "octocat"], &home)
+        .output()
+        .expect("foundryd runs");
+
+    assert_eq!(out.status.code(), Some(0), "exit: {:?}", out.status);
+    assert_eq!(held(&home, "github-default").as_deref(), Some("octocat"));
+}
+
+#[test]
+fn github_default_with_a_bad_login_exits_1_and_stores_nothing() {
+    let home = tempfile::tempdir().unwrap();
+
+    let out = isolated(&["github", "default", "bad/name"], &home)
+        .output()
+        .expect("foundryd runs");
+
+    assert_eq!(out.status.code(), Some(1), "exit: {:?}", out.status);
+    assert_eq!(held(&home, "github-default"), None);
+}
+
+#[test]
+fn github_default_refusing_an_argument_does_not_print_it() {
+    let home = tempfile::tempdir().unwrap();
+
+    let out = isolated(&["github", "default", "ghp_secret_like/x"], &home)
+        .output()
+        .expect("foundryd runs");
+
+    assert_eq!(out.status.code(), Some(1), "exit: {:?}", out.status);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("ghp_secret_like"), "stderr: {stderr}");
+    assert!(stderr.contains("not a GitHub login"), "stderr: {stderr}");
+    assert!(words(&out.stderr).contains(LOGIN_RULE), "stderr: {stderr}");
+}
+
+#[test]
+fn secret_set_stores_a_github_token_and_never_prints_it() {
+    let home = tempfile::tempdir().unwrap();
+
+    let out = secret_set(&home, "github:octocat", "ghp_clitoken\n");
+
+    assert_eq!(out.status.code(), Some(0), "exit: {:?}", out.status);
+    let printed = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!printed.contains("ghp_clitoken"), "printed: {printed}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("no restart is needed"), "stdout: {stdout}");
+    assert_eq!(
+        held(&home, "github:octocat").as_deref(),
+        Some("ghp_clitoken")
+    );
+}
+
+#[test]
+fn secret_set_with_a_bad_github_login_exits_1_and_stores_nothing() {
+    for name in ["github:bad/name", "github:"] {
+        let home = tempfile::tempdir().unwrap();
+
+        let out = secret_set(&home, name, "ghp_clitoken\n");
+
+        assert_eq!(out.status.code(), Some(1), "{name}: {:?}", out.status);
+        assert_eq!(held(&home, name), None, "{name} was stored");
+    }
+}
+
+#[test]
+fn secret_set_help_names_github_tokens() {
+    let out = foundryd(&["secret", "--help"]);
+    assert!(out.status.success(), "exit: {:?}", out.status);
+    let help = String::from_utf8_lossy(&out.stdout);
+    assert!(help.contains("GitHub token"), "help: {help}");
+
+    let out = foundryd(&["secret", "set", "--help"]);
+    assert!(out.status.success(), "exit: {:?}", out.status);
+    // Help is wrapped to the terminal: compare with its white space made single spaces.
+    let help = words(&out.stdout);
+    for words in ["gateway-management", "github:<login>", LOGIN_RULE] {
+        assert!(help.contains(words), "{words} missing from help: {help}");
+    }
+}
+
+/// `bytes` as text with every run of white space made one space.
+fn words(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[test]
 fn factory_export_exits_2_and_says_not_built_yet() {
     let out = tempfile::tempdir().unwrap();
     assert_not_built(&["factory", "export", out.path().to_str().unwrap()]);
+}
+
+#[test]
+fn secret_set_with_a_token_in_place_of_the_login_never_prints_it() {
+    let home = tempfile::tempdir().unwrap();
+    let name = "github:ghp_secret_like_x_123";
+
+    let out = secret_set(&home, name, "x\n");
+
+    assert_eq!(out.status.code(), Some(1), "{:?}", out.status);
+    assert_eq!(held(&home, name), None, "{name} was stored");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stdout.contains("ghp_secret_like_x_123"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        !stderr.contains("ghp_secret_like_x_123"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn github_default_with_a_40_character_token_exits_1_and_does_not_print_it() {
+    let home = tempfile::tempdir().unwrap();
+    let token = "0123456789abcdef0123456789abcdef01234567";
+
+    let out = isolated(&["github", "default", token], &home)
+        .output()
+        .expect("foundryd runs");
+
+    assert_eq!(out.status.code(), Some(1), "exit: {:?}", out.status);
+    assert_eq!(held(&home, "github-default"), None);
+    let printed = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!printed.contains(token), "printed: {printed}");
 }

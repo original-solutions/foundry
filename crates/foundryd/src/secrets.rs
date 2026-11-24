@@ -66,6 +66,20 @@ pub trait Secrets: Send + Sync {
     /// the value to set, or `None` to leave the store as it is. No other change to the store,
     /// from this process or another, lands between the read and the write.
     fn update(&self, name: &str, edit: Edit<'_>) -> Result<(), SecretsError>;
+    /// The names of the secrets held, sorted, and never a value. The default, for a store that
+    /// cannot list its names, gives [`SecretsError::CannotList`]; a store that can list but
+    /// fails to read gives its read error. Neither is ever taken for an empty store: the held
+    /// record then writes nothing.
+    fn names(&self) -> Result<Vec<String>, SecretsError> {
+        Err(SecretsError::CannotList)
+    }
+    /// Every secret held, names and values, read in one go, so all of them come from one
+    /// state of the store. [`hide_known`] reads this once per call. The default, for a store
+    /// that cannot list its names, gives [`SecretsError::CannotList`], and an error is never
+    /// taken for an empty store: [`hide_known`] then fails closed.
+    fn entries(&self) -> Result<BTreeMap<String, String>, SecretsError> {
+        Err(SecretsError::CannotList)
+    }
 }
 
 /// What [`Secrets::update`] does to a secret: given its value now, the value to set, or `None`
@@ -96,6 +110,8 @@ pub enum SecretsError {
          keychain prompts (docs/install.md)"
     )]
     NotMoved,
+    #[error("this secret store cannot list its names")]
+    CannotList,
     #[error("the keychain could not {action} the secret {name}: {reason}")]
     Keychain {
         action: &'static str,
@@ -110,6 +126,104 @@ pub const GATEWAY: &str = "gateway";
 
 /// The secret the gateway's management key is held under.
 pub const GATEWAY_MANAGEMENT: &str = "gateway-management";
+
+/// The prefix of the secret a GitHub token is held under: `github:<login>`.
+pub const GITHUB_PREFIX: &str = "github:";
+
+/// The secret the machine's default GitHub login is held under. It holds a login, not a token.
+pub const GITHUB_DEFAULT: &str = "github-default";
+
+/// What [`hide_known`] gives when the secret store cannot be read: nothing of the text can be
+/// told safe, so none of it is shown.
+pub const HIDDEN_UNREADABLE: &str = "[hidden: the secret store could not be read]";
+
+/// The longest GitHub login. A 40-character string is a legacy token, never a login.
+const LOGIN_MAX: usize = 39;
+
+/// What [`is_login`] takes, in words, for every message that refuses a login and for the help
+/// of `secret set`. A test ties it to [`LOGIN_MAX`].
+pub const LOGIN_RULE: &str = "letters, digits and -, at most 39 characters";
+
+/// Whether `login` is a GitHub login as foundry takes it: letters, digits and `-`, not empty and
+/// at most 39 characters (GitHub's own limit).
+pub fn is_login(login: &str) -> bool {
+    !login.is_empty()
+        && login.len() <= LOGIN_MAX
+        && login.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// The logins a GitHub token is held for, sorted. A `github:` name whose rest is no login is
+/// not listed.
+pub fn github_logins(secrets: &dyn Secrets) -> Result<Vec<String>, SecretsError> {
+    let mut logins: Vec<String> = secrets
+        .names()?
+        .iter()
+        .filter_map(|name| name.strip_prefix(GITHUB_PREFIX))
+        .filter(|login| is_login(login))
+        .map(str::to_owned)
+        .collect();
+    logins.sort();
+    Ok(logins)
+}
+
+/// The token held for `login`: `None` when none is set, and for a `login` that is none, which
+/// reads nothing.
+pub fn github_token(secrets: &dyn Secrets, login: &str) -> Result<Option<String>, SecretsError> {
+    if !is_login(login) {
+        return Ok(None);
+    }
+    secrets.get(&format!("{GITHUB_PREFIX}{login}"))
+}
+
+/// This machine's default GitHub login: `None` when none is stored, when what is stored is no
+/// login, and when the store cannot be read (which is logged).
+pub fn github_default(secrets: &dyn Secrets) -> Option<String> {
+    match secrets.get(GITHUB_DEFAULT) {
+        Ok(login) => login.filter(|login| is_login(login)),
+        Err(error) => {
+            tracing::warn!(%error, "the default GitHub login could not be read");
+            None
+        }
+    }
+}
+
+/// `text` with the gateway keys and every `github:*` token this store holds now hidden as `***`
+/// (whatever follows `github:`, a login or not), read at this call so a token set after the
+/// daemon started is hidden too, and then the passwords of URLs as [`redact`] hides them. When
+/// the store cannot be read, none of `text` is shown: [`HIDDEN_UNREADABLE`] is given instead.
+pub fn hide_known(text: &str, secrets: &dyn Secrets) -> String {
+    match known_values(secrets) {
+        Ok(mut values) => {
+            // The longest first, so a token that is the start of another leaves no tail of it.
+            values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+            let mut hidden = text.to_owned();
+            for value in values {
+                hidden = hidden.replace(&value, "***");
+            }
+            redact(&hidden)
+        }
+        Err(error) => {
+            tracing::warn!(%error, "text hidden: the secret store could not be read");
+            HIDDEN_UNREADABLE.to_owned()
+        }
+    }
+}
+
+/// The values of the secrets `hide_known` hides, none of them empty, from one read of the
+/// store.
+fn known_values(secrets: &dyn Secrets) -> Result<Vec<String>, SecretsError> {
+    Ok(secrets
+        .entries()?
+        .into_iter()
+        .filter(|(name, value)| {
+            !value.is_empty()
+                && (name == GATEWAY
+                    || name == GATEWAY_MANAGEMENT
+                    || name.starts_with(GITHUB_PREFIX))
+        })
+        .map(|(_, value)| value)
+        .collect())
+}
 
 /// The secret store this machine uses: the file `secrets.json` in `home`, readable only by the
 /// service user, on every OS.
@@ -219,8 +333,12 @@ fn move_secrets(old: &dyn OldStore, new: &FileSecrets) -> Result<(), SecretsErro
 
 #[derive(Debug, thiserror::Error)]
 pub enum SetError {
-    #[error("{name} is not a secret to set here; the names are {GATEWAY} and {GATEWAY_MANAGEMENT}")]
-    UnknownName { name: String },
+    #[error(
+        "the name is not a secret to set here; the names are {GATEWAY}, {GATEWAY_MANAGEMENT} and \
+         {GITHUB_PREFIX}<login>, where a login is {LOGIN_RULE}"
+    )]
+    // No field: the refused name may be a token pasted in place of a login, so it is never quoted.
+    UnknownName,
     #[error("no value on stdin for {name}")]
     NoValue { name: String },
     #[error("cannot read stdin for {name}: {source}")]
@@ -243,7 +361,13 @@ pub fn set_command(name: &str) -> ExitCode {
     };
     match result {
         Ok(()) => {
-            println!("foundryd secret set {name}: stored; restart foundryd so new sessions use it");
+            if name.starts_with(GITHUB_PREFIX) {
+                println!("foundryd secret set {name}: stored; no restart is needed");
+            } else {
+                println!(
+                    "foundryd secret set {name}: stored; restart foundryd so new sessions use it"
+                );
+            }
             ExitCode::SUCCESS
         }
         Err(error) => {
@@ -253,23 +377,44 @@ pub fn set_command(name: &str) -> ExitCode {
     }
 }
 
-/// `foundryd github default <login>`. Not built yet: exits 2.
-pub fn github_default_command(_login: &str) -> ExitCode {
-    crate::not_built("github default")
+/// `foundryd github default <login>`: stores `login` as this machine's default GitHub login.
+/// A `login` that is none is refused and nothing is stored.
+pub fn github_default_command(login: &str) -> ExitCode {
+    if !is_login(login) {
+        // The argument is not echoed: it may be a token pasted in place of a login.
+        eprintln!(
+            "foundryd github default: the argument is not a GitHub login; a login is {LOGIN_RULE}"
+        );
+        return ExitCode::FAILURE;
+    }
+    let Some(home) = crate::daemon::home() else {
+        eprintln!("foundryd github default: set FOUNDRY_HOME or HOME");
+        return ExitCode::FAILURE;
+    };
+    match for_this_machine(&home).and_then(|secrets| secrets.set(GITHUB_DEFAULT, login)) {
+        Ok(()) => {
+            println!("foundryd github default: {login} is this machine's default login");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("foundryd github default: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// Stores the first line of `input` as the secret `name`, without its line ending. Only the
-/// gateway secrets can be set: the name is checked before `input` is read, so any other name
-/// leaves the store untouched, and the machine's own identity and key table stay out of reach.
+/// gateway secrets and `github:<login>` tokens can be set: the name is checked before `input` is
+/// read, so any other name leaves the store untouched, and the machine's own identity and key
+/// table stay out of reach.
 pub fn set_from(
     secrets: &dyn Secrets,
     name: &str,
     mut input: impl BufRead,
 ) -> Result<(), SetError> {
-    if name != GATEWAY && name != GATEWAY_MANAGEMENT {
-        return Err(SetError::UnknownName {
-            name: name.to_owned(),
-        });
+    let github = name.strip_prefix(GITHUB_PREFIX).is_some_and(is_login);
+    if name != GATEWAY && name != GATEWAY_MANAGEMENT && !github {
+        return Err(SetError::UnknownName);
     }
     let mut line = String::new();
     input
@@ -402,6 +547,14 @@ impl Secrets for FileSecrets {
         secrets.insert(name.to_owned(), value);
         self.write(&secrets)
     }
+
+    fn names(&self) -> Result<Vec<String>, SecretsError> {
+        Ok(self.read()?.into_keys().collect())
+    }
+
+    fn entries(&self) -> Result<BTreeMap<String, String>, SecretsError> {
+        self.read()
+    }
 }
 
 /// An exclusive lock on the file at `path`, made 0600 with its directory (0700, as `foundryd
@@ -509,6 +662,14 @@ impl Secrets for MemorySecrets {
         }
         Ok(())
     }
+
+    fn names(&self) -> Result<Vec<String>, SecretsError> {
+        Ok(self.lock().keys().cloned().collect())
+    }
+
+    fn entries(&self) -> Result<BTreeMap<String, String>, SecretsError> {
+        Ok(self.lock().clone())
+    }
 }
 
 #[cfg(test)]
@@ -530,6 +691,7 @@ impl OldStore for MemorySecrets {
 mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
 
@@ -541,6 +703,45 @@ mod tests {
 
     fn mode(path: &Path) -> u32 {
         fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn the_login_rule_gives_the_limit_and_is_what_a_refusal_says() {
+        assert!(
+            LOGIN_RULE.contains(&format!("at most {LOGIN_MAX} characters")),
+            "{LOGIN_RULE}"
+        );
+        let refused = set_from(
+            &MemorySecrets::default(),
+            "github:bad/name",
+            "x\n".as_bytes(),
+        );
+        let text = refused.unwrap_err().to_string();
+        assert!(text.contains(LOGIN_RULE), "{text}");
+    }
+
+    #[test]
+    fn is_login_takes_39_characters_and_refuses_40() {
+        assert!(is_login(&"a".repeat(39)));
+        assert!(!is_login(&"a".repeat(40)));
+    }
+
+    #[test]
+    fn set_from_refuses_a_40_hex_login_before_reading_stdin() {
+        struct NoRead;
+        impl io::Read for NoRead {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                panic!("stdin was read");
+            }
+        }
+        let (_dir, secrets) = file();
+        let name = format!(
+            "{GITHUB_PREFIX}{}",
+            "0123456789abcdef".repeat(3).get(..40).unwrap()
+        );
+        let result = set_from(&secrets, &name, io::BufReader::new(NoRead));
+        assert!(matches!(result, Err(SetError::UnknownName)), "{result:?}");
+        assert_eq!(secrets.names().unwrap(), Vec::<String>::new());
     }
 
     #[test]
@@ -1195,7 +1396,7 @@ mod tests {
         for name in ["machine", "machine-keys", "other"] {
             let error = set_from(&secrets, name, "x\n".as_bytes()).unwrap_err();
             let text = error.to_string();
-            assert!(text.contains(name), "{text}");
+            assert!(!text.contains(name), "{text}");
             assert!(text.contains("gateway-management"), "{text}");
             assert_eq!(stored(&secrets, name), None);
         }
@@ -1212,5 +1413,295 @@ mod tests {
         let secrets = MemorySecrets::default();
         let input = io::BufReader::new(Unreadable);
         assert!(set_from(&secrets, "machine", input).is_err());
+    }
+
+    #[test]
+    fn set_from_accepts_a_github_login() {
+        let (_dir, secrets) = file();
+        for login in ["octocat", "a-b-1", "A9"] {
+            let name = format!("github:{login}");
+            set_from(&secrets, &name, "ghp_x\n".as_bytes()).unwrap();
+            assert_eq!(stored(&secrets, &name).as_deref(), Some("ghp_x"), "{name}");
+        }
+    }
+
+    #[test]
+    fn set_from_refuses_a_bad_login_before_it_reads_stdin() {
+        struct Unreadable;
+        impl io::Read for Unreadable {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                panic!("stdin was read");
+            }
+        }
+        let (_dir, secrets) = file();
+        for name in [
+            "github:bad/name",
+            "github:",
+            "github:\u{fc}",
+            "github:a b",
+            "github-default",
+        ] {
+            let input = io::BufReader::new(Unreadable);
+            let error = set_from(&secrets, name, input).unwrap_err();
+            assert!(matches!(error, SetError::UnknownName), "{name}");
+            assert!(error.to_string().contains("github:<login>"), "{error}");
+            if name != "github:" {
+                assert!(!error.to_string().contains(name), "{error}");
+            }
+            assert_eq!(stored(&secrets, name), None, "{name}");
+        }
+        assert!(secrets.names().unwrap().is_empty());
+    }
+
+    #[test]
+    fn names_lists_what_was_set_sorted_and_no_value() {
+        let (_dir, secrets) = file();
+        assert!(secrets.names().unwrap().is_empty());
+        secrets.set("gateway", "value-one").unwrap();
+        secrets.set("github:octocat", "value-two").unwrap();
+        secrets.set("github:alice", "value-three").unwrap();
+        let names = secrets.names().unwrap();
+        assert_eq!(names, ["gateway", "github:alice", "github:octocat"]);
+        let text = names.join(" ");
+        assert!(!text.contains("value-"), "{text}");
+    }
+
+    #[test]
+    fn names_of_an_open_file_is_an_error_not_an_empty_list() {
+        let (dir, secrets) = file();
+        secrets.set("gateway", "sk-one").unwrap();
+        let path = dir.path().join("secrets.json");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            secrets.names().unwrap_err(),
+            SecretsError::TooOpen { .. }
+        ));
+    }
+
+    #[test]
+    fn the_in_memory_fake_lists_its_names() {
+        let secrets = MemorySecrets::default();
+        secrets.set("b", "1").unwrap();
+        secrets.set("a", "2").unwrap();
+        assert_eq!(secrets.names().unwrap(), ["a", "b"]);
+    }
+
+    #[test]
+    fn github_logins_lists_only_valid_github_names() {
+        let (_dir, secrets) = file();
+        for name in [
+            "gateway",
+            "github:zed",
+            "github:octocat",
+            "github:bad/name",
+            "github:",
+            "github-default",
+        ] {
+            secrets.set(name, "v").unwrap();
+        }
+        assert_eq!(github_logins(&secrets).unwrap(), ["octocat", "zed"]);
+    }
+
+    #[test]
+    fn github_token_gets_the_token_and_none_for_unset_or_invalid() {
+        let (_dir, secrets) = file();
+        secrets.set("github:octocat", "ghp_tok").unwrap();
+        secrets.set("github:bad/name", "ghp_other").unwrap();
+        assert_eq!(
+            github_token(&secrets, "octocat").unwrap().as_deref(),
+            Some("ghp_tok")
+        );
+        assert_eq!(github_token(&secrets, "nobody").unwrap(), None);
+        assert_eq!(github_token(&secrets, "bad/name").unwrap(), None);
+        assert_eq!(github_token(&secrets, "").unwrap(), None);
+    }
+
+    #[test]
+    fn github_default_is_none_until_stored_then_the_login() {
+        let (_dir, secrets) = file();
+        assert_eq!(github_default(&secrets), None);
+        secrets.set(GITHUB_DEFAULT, "octocat").unwrap();
+        assert_eq!(github_default(&secrets).as_deref(), Some("octocat"));
+    }
+
+    #[test]
+    fn github_default_is_none_for_a_stored_value_that_is_no_login() {
+        let (_dir, secrets) = file();
+        for value in ["bad/name", "", "ghp_a b"] {
+            secrets.set(GITHUB_DEFAULT, value).unwrap();
+            assert_eq!(github_default(&secrets), None, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn github_default_is_not_a_name_secret_set_takes() {
+        let (_dir, secrets) = file();
+        assert!(set_from(&secrets, GITHUB_DEFAULT, "octocat\n".as_bytes()).is_err());
+        assert_eq!(stored(&secrets, GITHUB_DEFAULT), None);
+    }
+
+    #[test]
+    fn hide_known_hides_the_gateway_keys_and_every_github_token() {
+        let (_dir, secrets) = file();
+        secrets.set(GATEWAY, "gw-key-1").unwrap();
+        secrets.set(GATEWAY_MANAGEMENT, "gm-key-2").unwrap();
+        // The shorter token sorts first by name, so only the longest-first order hides both.
+        secrets.set("github:alice", "ghp_abc").unwrap();
+        secrets.set("github:zed", "ghp_abcdef").unwrap();
+        let text = "a gw-key-1 b gm-key-2 c ghp_abc d ghp_abcdef e";
+        assert_eq!(hide_known(text, &secrets), "a *** b *** c *** d *** e");
+    }
+
+    #[test]
+    fn hide_known_hides_a_token_stored_under_a_name_that_is_no_login() {
+        let (_dir, secrets) = file();
+        secrets.set("github:bad/name", "ghp_odd_name").unwrap();
+        assert_eq!(
+            hide_known("carrying ghp_odd_name", &secrets),
+            "carrying ***"
+        );
+    }
+
+    /// A store that implements only what the trait requires.
+    struct CannotList;
+    impl Secrets for CannotList {
+        fn get(&self, _: &str) -> Result<Option<String>, SecretsError> {
+            Ok(None)
+        }
+        fn set(&self, _: &str, _: &str) -> Result<(), SecretsError> {
+            Ok(())
+        }
+        fn update(&self, _: &str, _: Edit<'_>) -> Result<(), SecretsError> {
+            Ok(())
+        }
+    }
+
+    /// A store that lists its names and reads each one, but cannot be read whole.
+    struct CannotReadWhole;
+    impl Secrets for CannotReadWhole {
+        fn get(&self, _: &str) -> Result<Option<String>, SecretsError> {
+            Ok(None)
+        }
+        fn set(&self, _: &str, _: &str) -> Result<(), SecretsError> {
+            Ok(())
+        }
+        fn update(&self, _: &str, _: Edit<'_>) -> Result<(), SecretsError> {
+            Ok(())
+        }
+        fn names(&self) -> Result<Vec<String>, SecretsError> {
+            Ok(vec!["github:octocat".into()])
+        }
+        fn entries(&self) -> Result<BTreeMap<String, String>, SecretsError> {
+            Err(SecretsError::Unreadable {
+                path: "secrets.json".into(),
+            })
+        }
+    }
+
+    #[test]
+    fn hide_known_fails_closed_when_the_store_cannot_be_read_whole() {
+        assert_eq!(
+            hide_known("carrying ghp_x", &CannotReadWhole),
+            HIDDEN_UNREADABLE
+        );
+    }
+
+    /// The in-memory store, read only whole: reading one secret, or the names alone, panics.
+    #[derive(Default)]
+    struct WholeOnly {
+        inner: MemorySecrets,
+        reads: AtomicUsize,
+    }
+    impl Secrets for WholeOnly {
+        fn get(&self, name: &str) -> Result<Option<String>, SecretsError> {
+            panic!("{name} was read on its own");
+        }
+        fn set(&self, name: &str, value: &str) -> Result<(), SecretsError> {
+            self.inner.set(name, value)
+        }
+        fn update(&self, name: &str, edit: Edit<'_>) -> Result<(), SecretsError> {
+            self.inner.update(name, edit)
+        }
+        fn names(&self) -> Result<Vec<String>, SecretsError> {
+            panic!("the names were listed on their own");
+        }
+        fn entries(&self) -> Result<BTreeMap<String, String>, SecretsError> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.inner.entries()
+        }
+    }
+
+    #[test]
+    fn hide_known_reads_the_store_once_per_call() {
+        let secrets = WholeOnly::default();
+        secrets.set(GATEWAY, "gw-key-1").unwrap();
+        secrets.set(GATEWAY_MANAGEMENT, "gm-key-2").unwrap();
+        secrets.set("github:alice", "ghp_one").unwrap();
+        secrets.set("github:zed", "ghp_two").unwrap();
+        secrets.set("machine", "machine-own").unwrap();
+        let text = "gw-key-1 gm-key-2 ghp_one ghp_two machine-own";
+        assert_eq!(hide_known(text, &secrets), "*** *** *** *** machine-own");
+        assert_eq!(secrets.reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_store_that_cannot_list_fails_closed() {
+        assert!(CannotList.names().is_err());
+        assert_eq!(hide_known("carrying ghp_x", &CannotList), HIDDEN_UNREADABLE);
+        assert!(github_logins(&CannotList).is_err());
+    }
+
+    #[test]
+    fn hide_known_hides_a_token_set_after_the_store_was_opened() {
+        let (dir, daemon) = file();
+        daemon.set(GATEWAY, "gw-key-1").unwrap();
+        let text = "pushing with ghp_late now";
+        assert_eq!(hide_known(text, &daemon), text);
+        let cli = FileSecrets::new(dir.path().join("secrets.json"));
+        set_from(&cli, "github:octocat", "ghp_late\n".as_bytes()).unwrap();
+        assert_eq!(hide_known(text, &daemon), "pushing with *** now");
+    }
+
+    #[test]
+    fn hide_known_leaves_a_commit_id_and_a_pull_request_url_alone() {
+        let (_dir, secrets) = file();
+        secrets.set("github:octocat", "ghp_abc").unwrap();
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        let url = "https://github.com/original-solutions/foundry/pull/134";
+        let text = format!("commit {commit} is in {url}");
+        assert_eq!(commit.len(), 40);
+        assert_eq!(hide_known(&text, &secrets), text);
+    }
+
+    #[test]
+    fn hide_known_hides_a_url_password_as_redact_does() {
+        let (_dir, secrets) = file();
+        let text = "clone https://user:pw123@github.com/x/y.git";
+        assert_eq!(hide_known(text, &secrets), redact(text));
+        assert!(!hide_known(text, &secrets).contains("pw123"));
+    }
+
+    #[test]
+    fn hide_known_with_an_empty_stored_value_hides_nothing() {
+        let secrets = MemorySecrets::default();
+        secrets.set(GATEWAY, "").unwrap();
+        secrets.set("github:octocat", "").unwrap();
+        assert_eq!(hide_known("plain text", &secrets), "plain text");
+    }
+
+    #[test]
+    fn hide_known_with_an_unreadable_store_gives_the_fixed_text_never_the_input() {
+        let logged = crate::test_log::Logged::everywhere();
+        let (dir, secrets) = file();
+        secrets.set("github:octocat", "ghp_unreadable").unwrap();
+        let path = dir.path().join("secrets.json");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let text = "carrying ghp_unreadable";
+        let hidden = hide_known(text, &secrets);
+        assert_eq!(hidden, HIDDEN_UNREADABLE);
+        assert!(!hidden.contains("ghp_unreadable"));
+        let text = logged.text();
+        assert!(text.contains("could not be read"), "{text}");
+        assert!(!text.contains("ghp_unreadable"), "{text}");
     }
 }

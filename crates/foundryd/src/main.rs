@@ -52,10 +52,11 @@ enum Command {
 
 #[derive(Subcommand)]
 enum SecretCommand {
-    /// Store the gateway key (`gateway`) or its management key (`gateway-management`), read as
-    /// one line from stdin.
+    /// Store the gateway key (`gateway`), its management key (`gateway-management`) or a GitHub
+    /// token (`github:<login>`), read as one line from stdin.
     Set {
-        /// The secret's name: `gateway` or `gateway-management`.
+        /// The secret's name: `gateway`, `gateway-management` or `github:<login>`, where a login
+        /// is letters, digits and -, at most 39 characters.
         name: String,
     },
 }

@@ -1142,6 +1142,25 @@ fn turn_record(owner: MachineId, version: u64, session: SessionId, turn: u64) ->
     fr(owner, version, FactoryBody::Turn(turn_body(session, turn)))
 }
 
+/// P1's record of `id`, owned by `owner`: the machine whose `session_turn` is the session's.
+fn session_named(owner: MachineId, version: u64, id: SessionId) -> AnyRecord {
+    let AnyRecord::Session(mut record) = session(owner, version) else {
+        unreachable!("`session` gives a session record");
+    };
+    record.body.id = id;
+    AnyRecord::Session(record)
+}
+
+/// Stores P1's record of a new session owned by `owner`, and gives its id.
+fn owned_session(store: &mut Store, owner: MachineId) -> SessionId {
+    let id = SessionId::random();
+    assert_eq!(
+        store.apply(&session_named(owner, 1, id), owner).unwrap(),
+        Applied::Stored
+    );
+    id
+}
+
 fn every_factory_kind(owner: MachineId, version: u64) -> Vec<FactoryRecord> {
     vec![
         run_event(owner, version, &run_id("a/b", 1, 1), 1, 5),
@@ -1190,28 +1209,134 @@ fn apply_factory_refuses_a_record_from_a_machine_that_is_not_its_owner() {
     assert_eq!(factory_rows(&store), 0);
 }
 
+/// A machine that does not own a session writes its turn under a key of its own, so its turn
+/// never stops the owner's from being applied, whichever arrives first, and every replica reads
+/// the owner's turn.
 #[test]
-fn apply_factory_refuses_to_take_a_key_another_owner_holds() {
-    let (_dir, mut store) = open();
-    let first = MachineId::random();
-    let second = MachineId::random();
+fn a_turn_from_a_machine_that_does_not_own_the_session_never_stops_the_owners_turns() {
+    let owner = MachineId::random();
+    let other = MachineId::random();
     let session = SessionId::random();
-    let theirs = turn_record(first, 1, session, 1);
+    let p1 = session_named(owner, 1, session);
+    let honest = [
+        turn_record(owner, 1, session, 1),
+        turn_record(owner, 2, session, 2),
+    ];
+    let claim = turn_record(other, 9, session, 7);
+
+    let (_first_dir, mut claim_first) = open();
+    let (_last_dir, mut claim_last) = open();
+    assert_eq!(claim_first.apply(&p1, owner).unwrap(), Applied::Stored);
     assert_eq!(
-        store.apply_factory(&theirs, first).unwrap(),
+        claim_first.apply_factory(&claim, other).unwrap(),
         Applied::Stored
     );
-    let claim = turn_record(second, 9, session, 2);
+    for turn in &honest {
+        assert_eq!(
+            claim_first.apply_factory(turn, owner).unwrap(),
+            Applied::Stored
+        );
+    }
+    for turn in &honest {
+        assert_eq!(
+            claim_last.apply_factory(turn, owner).unwrap(),
+            Applied::Stored
+        );
+    }
     assert_eq!(
-        store.apply_factory(&claim, second).unwrap(),
+        claim_last.apply_factory(&claim, other).unwrap(),
+        Applied::Stored
+    );
+    assert_eq!(claim_last.apply(&p1, owner).unwrap(), Applied::Stored);
+
+    for store in [&claim_first, &claim_last] {
+        assert_eq!(
+            store.session_turn(session).unwrap(),
+            Some(turn_body(session, 2))
+        );
+        assert_eq!(factory_rows(store), 2);
+        assert_eq!(
+            store.factory_since(other, 0, 10).unwrap(),
+            vec![claim.clone()]
+        );
+    }
+}
+
+/// A session's turn and P1's session record sync apart: an honest turn that arrives first is
+/// applied, and read as the session's turn once the record says whose session it is.
+#[test]
+fn a_turn_that_arrives_before_its_session_record_is_applied_and_read_once_the_record_arrives() {
+    let (_dir, mut store) = open();
+    let owner = MachineId::random();
+    let session = SessionId::random();
+    assert_eq!(
+        store
+            .apply_factory(&turn_record(owner, 1, session, 3), owner)
+            .unwrap(),
+        Applied::Stored
+    );
+    assert_eq!(store.session_turn(session).unwrap(), None);
+    assert_eq!(
+        store
+            .apply(&session_named(owner, 1, session), owner)
+            .unwrap(),
+        Applied::Stored
+    );
+    assert_eq!(
+        store.session_turn(session).unwrap(),
+        Some(turn_body(session, 3))
+    );
+}
+
+/// Only the owner's turn is the session's: another machine's turn for it never reads as one.
+#[test]
+fn a_session_whose_owner_has_written_no_turn_has_none() {
+    let (_dir, mut store) = open();
+    let owner = MachineId::random();
+    let other = MachineId::random();
+    let session = owned_session(&mut store, owner);
+    assert_eq!(
+        store
+            .apply_factory(&turn_record(other, 1, session, 4), other)
+            .unwrap(),
+        Applied::Stored
+    );
+    assert_eq!(store.session_turn(session).unwrap(), None);
+}
+
+/// Every factory key holds its writer, so `apply_factory` never meets another owner's row
+/// under a record's key; should a key ever lose its writer, the row held still wins. The row is
+/// put in by hand, as no key `apply_factory` writes can collide.
+#[test]
+fn apply_factory_refuses_a_key_another_owner_holds() {
+    let (_dir, mut store) = open();
+    let holder = MachineId::random();
+    let sender = MachineId::random();
+    let session = SessionId::random();
+    let held_row = turn_record(holder, 1, session, 1);
+    let claim = turn_record(sender, 9, session, 2);
+    let key = claim.key();
+    store
+        .conn
+        .execute(
+            "INSERT INTO factory_records (kind, id, owner, version, record)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                key.kind,
+                key.id,
+                holder.to_string(),
+                1_i64,
+                serde_json::to_string(&held_row).unwrap()
+            ],
+        )
+        .unwrap();
+    assert_eq!(
+        store.apply_factory(&claim, sender).unwrap(),
         Applied::NotOwner
     );
     assert_eq!(factory_rows(&store), 1);
-    assert_eq!(
-        store.session_turn(session).unwrap(),
-        Some(turn_body(session, 1))
-    );
-    assert!(store.factory_since(second, 0, 10).unwrap().is_empty());
+    assert!(store.factory_since(sender, 0, 10).unwrap().is_empty());
+    assert_eq!(store.factory_since(holder, 0, 10).unwrap(), vec![held_row]);
 }
 
 #[test]
@@ -1219,7 +1344,7 @@ fn apply_factory_takes_only_a_higher_version() {
     let (_dir, mut store) = open();
     let owner = MachineId::random();
     let project = ProjectId::random();
-    let session = SessionId::random();
+    let session = owned_session(&mut store, owner);
     let status_at = |version, pass| status(owner, version, project, pass, 1);
     let turn_at = |version, turn| turn_record(owner, version, session, turn);
 
@@ -1418,7 +1543,8 @@ fn p1_reads_never_return_or_count_a_factory_record() {
     for record in every_factory_kind(owner, 50) {
         store.apply_factory(&record, owner).unwrap();
     }
-    // A turn for the owner's session from a second machine is refused, not stored.
+    // A turn for the owner's session from a second machine is stored under a key of its own,
+    // and never reads as the session's turn.
     assert_eq!(
         store
             .apply_factory(
@@ -1426,7 +1552,11 @@ fn p1_reads_never_return_or_count_a_factory_record() {
                 factory_owner,
             )
             .unwrap(),
-        Applied::NotOwner
+        Applied::Stored
+    );
+    assert_eq!(
+        store.session_turn(session_id).unwrap(),
+        Some(turn_body(session_id, 1))
     );
     // And a record the second machine really owns, stored, is still no P1 record.
     assert_eq!(
@@ -1691,7 +1821,7 @@ fn held_and_session_turn_are_read_by_their_key() {
     let (_dir, mut store) = open();
     let owner = MachineId::random();
     let other = MachineId::random();
-    let session = SessionId::random();
+    let session = owned_session(&mut store, owner);
     assert_eq!(store.held(owner).unwrap(), None);
     assert_eq!(store.session_turn(session).unwrap(), None);
     store
@@ -1866,12 +1996,19 @@ fn held_fails_on_a_record_it_cannot_read() {
 
 #[test]
 fn session_turn_fails_on_a_turn_it_cannot_read() {
-    let (_dir, store) = open();
+    let (_dir, mut store) = open();
     let owner = MachineId::random();
-    let session = SessionId::random();
+    let session = owned_session(&mut store, owner);
     let mut body = serde_json::to_value(turn_body(session, 1)).unwrap();
     body["turn"] = serde_json::json!("from a newer build");
-    insert_unreadable_factory(&store, owner, 1, "session_turn", &session.to_string(), body);
+    insert_unreadable_factory(
+        &store,
+        owner,
+        1,
+        "session_turn",
+        &format!("{session}/{owner}"),
+        body,
+    );
     assert!(matches!(
         store.session_turn(session),
         Err(StoreError::Json(_))
@@ -1925,11 +2062,11 @@ fn run_events_held_and_session_turn_fail_on_a_row_that_holds_another_kind() {
     );
     assert!(matches!(store.held(machine), Err(StoreError::Sqlite(_))));
 
-    let session = SessionId::random();
+    let session = owned_session(&mut store, machine);
     insert_under_kind(
         &store,
         "session_turn",
-        &session.to_string(),
+        &format!("{session}/{machine}"),
         &held(machine, 2, &["a"]),
     );
     assert!(matches!(
