@@ -57,6 +57,7 @@ fn join_with_a_port_that_is_not_a_number_exits_1_and_names_it() {
 }
 
 /// Runs `foundryd secret set <name>` with `input` on stdin, in a data directory of its own.
+/// A refused name exits before stdin is read, so the write can find the pipe closed.
 fn secret_set(home: &tempfile::TempDir, name: &str, input: &str) -> Output {
     let mut child = isolated(&["secret", "set", name], home)
         .stdin(Stdio::piped())
@@ -64,12 +65,10 @@ fn secret_set(home: &tempfile::TempDir, name: &str, input: &str) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .expect("foundryd runs");
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(input.as_bytes())
-        .unwrap();
+    match child.stdin.take().unwrap().write_all(input.as_bytes()) {
+        Err(error) if error.kind() != std::io::ErrorKind::BrokenPipe => panic!("stdin: {error}"),
+        _ => {}
+    }
     child.wait_with_output().unwrap()
 }
 
