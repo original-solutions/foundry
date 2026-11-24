@@ -4,10 +4,13 @@
 //! is in the data directory. [`GitAuth::apply`] gives one git child the token through that
 //! script and turns off what could answer or act in its place: other credential helpers,
 //! hooks, the system and global config, and every transport but HTTPS, as the runner's git
-//! hardening does. The script answers only github.com over HTTPS. The token is only ever in
-//! that child's environment. [`helpers_off_env`] is for a terminal, which gets no token: it
-//! turns the machine's credential helpers and any askpass off, so its keychain answers for
-//! nothing.
+//! hardening does. The script answers only git's prompts for github.com over HTTPS. The token
+//! is only ever in that child's environment, and the child's own children inherit it. The
+//! repository's own config is still read, so a call with the token runs in a repository
+//! whose config only the daemon writes, as the runner's gate fetch does (see
+//! [`GitAuth::apply`]). [`helpers_off_env`] is for a terminal, which gets no token: it turns
+//! the machine's credential helpers, any askpass and any inherited token off, so its keychain
+//! answers for nothing.
 
 use std::fmt;
 use std::fs::{self, OpenOptions};
@@ -44,10 +47,9 @@ esac
 
 /// The `-c` settings of every call: no credential helper but the askpass, no hooks, the rest
 /// of the runner's `HARDENED_GIT_CONFIG` (no fsmonitor, eol conversion, attributes or excludes
-/// files, `ext` transport or alternate refs command), then HTTPS as the only transport and TLS
-/// verified. With no ssh, `git://` or local transport, no `core.sshCommand`, `core.gitProxy`
-/// or `remote.<name>.uploadpack` that a repository's config names runs with the token.
-const CONFIG: [&str; 11] = [
+/// files, `ext` transport or alternate refs command), then TLS verified. HTTPS as the only
+/// transport is `GIT_ALLOW_PROTOCOL` in [`ENV`], which no `protocol.*` config can widen.
+const CONFIG: [&str; 9] = [
     // An empty value drops every helper named before it, in the system, global or repo config,
     // for every URL.
     "credential.helper=",
@@ -58,17 +60,13 @@ const CONFIG: [&str; 11] = [
     "core.excludesFile=/dev/null",
     "protocol.ext.allow=never",
     "core.alternateRefsCommand=",
-    "protocol.allow=never",
-    "protocol.https.allow=always",
     "http.sslVerify=true",
 ];
 
-/// The `-c` setting [`GitAuth::allow_file_transport`] adds.
-const FILE_TRANSPORT: &str = "protocol.file.allow=always";
-
-/// The environment of every call, the runner's `HARDENED_GIT_ENV`: `-c` cannot turn the system
-/// and global config off, and with no terminal prompt a refused token fails the call at once.
-const ENV: [(&str, &str); 7] = [
+/// The environment of every call: the runner's `HARDENED_GIT_ENV`, since `-c` cannot turn the
+/// system and global config off and with no terminal prompt a refused token fails the call at
+/// once, and HTTPS as the only transport.
+const ENV: [(&str, &str); 8] = [
     ("GIT_TERMINAL_PROMPT", "0"),
     ("GIT_CONFIG_NOSYSTEM", "1"),
     ("GIT_CONFIG_GLOBAL", "/dev/null"),
@@ -78,6 +76,11 @@ const ENV: [(&str, &str); 7] = [
     ("GIT_NO_LAZY_FETCH", "1"),
     // Git's messages in English, whatever the locale the daemon started in.
     ("LC_ALL", "C"),
+    // git takes this over every `protocol.<name>.allow` and `protocol.allow` in any config, so
+    // a repository cannot turn ssh, `git://`, the local transport or a remote helper back on,
+    // and no `core.sshCommand`, `core.gitProxy`, `remote.<name>.uploadpack` or
+    // `remote.<name>.vcs` that its config names runs with the token.
+    ("GIT_ALLOW_PROTOCOL", "https"),
 ];
 
 /// What the daemon's own environment may carry in from whatever started it and is not passed
@@ -94,8 +97,7 @@ const INHERITED: [&str; 3] = [
 pub struct GitAuth {
     login: String,
     token: String,
-    askpass: String,
-    file_transport: bool,
+    askpass: PathBuf,
 }
 
 /// Why a git call cannot have a login's token. No variant holds a token.
@@ -132,34 +134,16 @@ impl GitAuth {
         if token.is_empty() || token.chars().any(char::is_control) {
             return Err(unset());
         }
-        let path = data_dir.join(ASKPASS);
-        let askpass_error = |source| NoToken::Askpass {
-            path: path.clone(),
+        let askpass = data_dir.join(ASKPASS);
+        write_askpass(data_dir, &askpass).map_err(|source| NoToken::Askpass {
+            path: askpass.clone(),
             source,
-        };
-        // A terminal's environment is text, so the path must be too.
-        let askpass = path.to_str().map(str::to_owned).ok_or_else(|| {
-            askpass_error(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "the data directory's path is not UTF-8",
-            ))
         })?;
-        write_askpass(data_dir, &path).map_err(askpass_error)?;
         Ok(GitAuth {
             login: login.to_owned(),
             token: token.to_owned(),
             askpass,
-            file_transport: false,
         })
-    }
-
-    /// The same token for calls that may also use the local transport, a path or a `file://`
-    /// URL, as the runner allows a `file://` base: for a fetch from a repository on this
-    /// machine, such as a test's. A repository reached that way can name an `uploadpack` to
-    /// run with the token, so it must be one whose config only the daemon writes.
-    pub fn allow_file_transport(mut self) -> Self {
-        self.file_transport = true;
-        self
     }
 
     /// The login the token is held for.
@@ -176,9 +160,16 @@ impl GitAuth {
     /// command takes it through `as_std_mut()`.
     ///
     /// The command then holds the token: its `Debug` form shows it, so it is never logged or
-    /// put in an error. The repository's own config is still read for every key the `-c`
-    /// settings do not set, and a URL-scoped `http.<url>.*` key there wins over them, so a call
-    /// with the token runs only in a repository whose config untrusted code cannot write.
+    /// put in an error.
+    ///
+    /// git still reads the config of the repository the call runs in, for every key the `-c`
+    /// settings do not set, and a URL-scoped `http.<url>.*` key there wins over them: such a
+    /// config could turn TLS verification off for github.com, or name its own CA and a proxy,
+    /// and read the token. So a call with the token runs only where no config that untrusted
+    /// code can write is read: a `git clone` into a new folder, or a fetch by URL into a
+    /// repository the daemon made for it, as the runner's gate does (`git init --template=`
+    /// then `git fetch <url>`). Never a fetch in a repository that a worktree, a session or a
+    /// gate shares.
     pub fn apply(&self, command: &mut Command) {
         assert!(
             command.get_args().len() == 0,
@@ -187,24 +178,13 @@ impl GitAuth {
         for setting in CONFIG {
             command.arg("-c").arg(setting);
         }
-        if self.file_transport {
-            command.arg("-c").arg(FILE_TRANSPORT);
-        }
         for name in INHERITED {
             command.env_remove(name);
         }
-        command.envs(ENV).envs(self.askpass_env());
-    }
-
-    /// The askpass and the token, as a terminal's environment, for a terminal that acts as the
-    /// login, such as a factory session: its git calls then get the token for github.com over
-    /// HTTPS. It holds the token, so it is never logged. It has none of the hardening, which
-    /// [`apply`](Self::apply) adds for one call.
-    pub fn askpass_env(&self) -> Vec<(String, String)> {
-        vec![
-            ("GIT_ASKPASS".to_owned(), self.askpass.clone()),
-            (TOKEN_VAR.to_owned(), self.token.clone()),
-        ]
+        command
+            .envs(ENV)
+            .env("GIT_ASKPASS", &self.askpass)
+            .env(TOKEN_VAR, &self.token);
     }
 }
 
@@ -213,7 +193,6 @@ impl fmt::Debug for GitAuth {
         f.debug_struct("GitAuth")
             .field("login", &self.login)
             .field("askpass", &self.askpass)
-            .field("file_transport", &self.file_transport)
             .finish_non_exhaustive()
     }
 }
@@ -258,11 +237,13 @@ fn write_askpass(dir: &Path, path: &Path) -> io::Result<()> {
 /// The environment that turns git's credential helpers off for a terminal: no system or global
 /// config, where the machine's helpers (a keychain, `gh`) are named; no config the daemon's
 /// own environment may carry in; an empty `GIT_ASKPASS`, with which git asks neither
-/// `core.askPass` nor `SSH_ASKPASS`, and an empty `SSH_ASKPASS` for ssh itself; and no
-/// terminal prompt, so a git call that needs a login fails at once. Each is a value, since a
-/// terminal's environment is set over the daemon's and cannot remove a variable. It holds no
-/// token. A helper that code in the terminal writes into the repository's own config is that
-/// code's doing: it could as well run the helper itself, which no environment prevents.
+/// `core.askPass` nor `SSH_ASKPASS`, and an empty `SSH_ASKPASS` for ssh itself; no token
+/// `gh` would take from the daemon's environment; and no terminal prompt, so a git call that
+/// needs a login fails at once. Each is a value, since a terminal's environment is set over
+/// the daemon's and cannot remove a variable: git and `gh` take an empty one as none. It
+/// holds no token. A helper that code in the terminal writes into the repository's own config
+/// is that code's doing: it could as well run the helper itself, which no environment
+/// prevents.
 pub fn helpers_off_env() -> Vec<(String, String)> {
     [
         ("GIT_CONFIG_NOSYSTEM", "1"),
@@ -271,6 +252,10 @@ pub fn helpers_off_env() -> Vec<(String, String)> {
         ("GIT_CONFIG_PARAMETERS", ""),
         ("GIT_ASKPASS", ""),
         ("SSH_ASKPASS", ""),
+        ("GH_TOKEN", ""),
+        ("GITHUB_TOKEN", ""),
+        ("GH_ENTERPRISE_TOKEN", ""),
+        ("GITHUB_ENTERPRISE_TOKEN", ""),
         ("GIT_TERMINAL_PROMPT", "0"),
     ]
     .into_iter()
