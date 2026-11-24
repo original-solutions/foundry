@@ -33,23 +33,21 @@ pub const LOCK_WAIT: Duration = Duration::from_secs(5);
 /// becomes `https://***@host`. A git address with no scheme, `git@host:repo`, holds no secret
 /// and is left as it is.
 ///
-/// The authority runs from `://` to the first `/`, `?`, `#` or whitespace, and its last `@`
-/// ends the user and password. A quote after that `@`, or in an authority with no `@`, ends the
-/// URL, as it does for a URL quoted in text. A quote before that `@` is in the password, so it
-/// is hidden with the rest.
+/// The authority runs from `://` to the first `/`, `?`, `#` or whitespace, or to the next `://`,
+/// and everything before its last `@` is hidden, quotes included, since a password can hold a
+/// quote. A URL quoted in text keeps its quotes when a path or a space follows its host. Text
+/// after a closing quote is hidden too when an `@` follows it before any of those.
 pub fn redact(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(at) = rest.find("://") {
         let (before, after) = rest.split_at(at + 3);
         out.push_str(before);
-        let end = after
+        // Never past the next `://`, so the loop still reads the URL that follows.
+        let authority = after
             .find(|c: char| matches!(c, '/' | '?' | '#') || c.is_whitespace())
-            .unwrap_or(after.len());
-        let host = after[..end].rfind('@').map_or(0, |user_end| user_end + 1);
-        let authority = after[host..end]
-            .find(['\'', '"'])
-            .map_or(end, |quote| host + quote);
+            .unwrap_or(after.len())
+            .min(after.find("://").unwrap_or(after.len()));
         match after[..authority].rfind('@') {
             Some(user_end) => {
                 out.push_str("***");
