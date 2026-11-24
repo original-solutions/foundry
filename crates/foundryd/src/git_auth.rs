@@ -3,9 +3,11 @@
 //! [`GitAuth::for_login`] reads the token held for a login and makes sure the askpass script
 //! is in the data directory. [`GitAuth::apply`] gives one git child the token through that
 //! script and turns off what could answer or act in its place: other credential helpers,
-//! hooks, and the system and global config, as the runner's git hardening does. The token is
-//! only ever in that child's environment. [`helpers_off_env`] is for a terminal, which gets no
-//! token: it turns the machine's credential helpers off, so its keychain answers for nothing.
+//! hooks, the system and global config, and every transport but HTTPS, as the runner's git
+//! hardening does. The script answers only github.com over HTTPS. The token is only ever in
+//! that child's environment. [`helpers_off_env`] is for a terminal, which gets no token: it
+//! turns the machine's credential helpers and any askpass off, so its keychain answers for
+//! nothing.
 
 use std::fmt;
 use std::fs::{self, OpenOptions};
@@ -25,21 +27,29 @@ pub const ASKPASS: &str = "git-askpass";
 
 /// The askpass script. git runs it with its prompt as the one argument and reads the answer
 /// from its output. It holds no token: it prints the one in [`TOKEN_VAR`], which only the git
-/// child it was set on and that child's own children have. GitHub takes a token as the
-/// password whatever the user name, so the user name is a fixed one.
+/// child it was set on and that child's own children have. It answers only git's two prompts
+/// for `https://github.com`, each matched whole, so a call that a repository's config sends
+/// to another host, or over plain HTTP, gets nothing and fails. GitHub takes a token as the
+/// password whatever the user name, so the user name is a fixed one, and the password prompt
+/// names it.
 const SCRIPT: &str = "#!/bin/sh
-# Written by foundryd for the git calls it gives a GitHub token to. It holds no token.
+# Written by foundryd for the git calls it gives a GitHub token to. It holds no token, and
+# answers github.com over HTTPS only.
 case \"$1\" in
-Username*) printf '%s\\n' x-access-token ;;
-*) printf '%s\\n' \"$FOUNDRY_GIT_TOKEN\" ;;
+\"Username for 'https://github.com': \") printf '%s\\n' x-access-token ;;
+\"Password for 'https://x-access-token@github.com': \") printf '%s\\n' \"$FOUNDRY_GIT_TOKEN\" ;;
+*) exit 1 ;;
 esac
 ";
 
-/// The `-c` settings of every call: no credential helper but the askpass, no hooks, and the
-/// rest of the runner's `HARDENED_GIT_CONFIG` (no fsmonitor, eol conversion, attributes or
-/// excludes files, `ext` transport or alternate refs command).
-const CONFIG: [&str; 8] = [
-    // An empty value drops every helper named before it, in the system, global or repo config.
+/// The `-c` settings of every call: no credential helper but the askpass, no hooks, the rest
+/// of the runner's `HARDENED_GIT_CONFIG` (no fsmonitor, eol conversion, attributes or excludes
+/// files, `ext` transport or alternate refs command), then HTTPS as the only transport and TLS
+/// verified. With no ssh, `git://` or local transport, no `core.sshCommand`, `core.gitProxy`
+/// or `remote.<name>.uploadpack` that a repository's config names runs with the token.
+const CONFIG: [&str; 11] = [
+    // An empty value drops every helper named before it, in the system, global or repo config,
+    // for every URL.
     "credential.helper=",
     "core.hooksPath=/dev/null",
     "core.fsmonitor=false",
@@ -48,7 +58,13 @@ const CONFIG: [&str; 8] = [
     "core.excludesFile=/dev/null",
     "protocol.ext.allow=never",
     "core.alternateRefsCommand=",
+    "protocol.allow=never",
+    "protocol.https.allow=always",
+    "http.sslVerify=true",
 ];
+
+/// The `-c` setting [`GitAuth::allow_file_transport`] adds.
+const FILE_TRANSPORT: &str = "protocol.file.allow=always";
 
 /// The environment of every call, the runner's `HARDENED_GIT_ENV`: `-c` cannot turn the system
 /// and global config off, and with no terminal prompt a refused token fails the call at once.
@@ -64,16 +80,22 @@ const ENV: [(&str, &str); 7] = [
     ("LC_ALL", "C"),
 ];
 
-/// Config the daemon's own environment may carry in from whatever started it. Each could name
-/// a helper after the call's own `credential.helper=`, so none is passed on.
-const INHERITED_CONFIG: [&str; 2] = ["GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"];
+/// What the daemon's own environment may carry in from whatever started it and is not passed
+/// on: config that could set any key the call's `-c` settings do not (git reads it before
+/// them, so the `-c` ones still win), and the switch that turns TLS verification off.
+const INHERITED: [&str; 3] = [
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_SSL_NO_VERIFY",
+];
 
 /// The token for one login, ready to give to a git child. Its debug form shows the login and
 /// never the token.
 pub struct GitAuth {
     login: String,
     token: String,
-    askpass: PathBuf,
+    askpass: String,
+    file_transport: bool,
 }
 
 /// Why a git call cannot have a login's token. No variant holds a token.
@@ -110,16 +132,34 @@ impl GitAuth {
         if token.is_empty() || token.chars().any(char::is_control) {
             return Err(unset());
         }
-        let askpass = data_dir.join(ASKPASS);
-        write_askpass(data_dir, &askpass).map_err(|source| NoToken::Askpass {
-            path: askpass.clone(),
+        let path = data_dir.join(ASKPASS);
+        let askpass_error = |source| NoToken::Askpass {
+            path: path.clone(),
             source,
+        };
+        // A terminal's environment is text, so the path must be too.
+        let askpass = path.to_str().map(str::to_owned).ok_or_else(|| {
+            askpass_error(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the data directory's path is not UTF-8",
+            ))
         })?;
+        write_askpass(data_dir, &path).map_err(askpass_error)?;
         Ok(GitAuth {
             login: login.to_owned(),
             token: token.to_owned(),
             askpass,
+            file_transport: false,
         })
+    }
+
+    /// The same token for calls that may also use the local transport, a path or a `file://`
+    /// URL, as the runner allows a `file://` base: for a fetch from a repository on this
+    /// machine, such as a test's. A repository reached that way can name an `uploadpack` to
+    /// run with the token, so it must be one whose config only the daemon writes.
+    pub fn allow_file_transport(mut self) -> Self {
+        self.file_transport = true;
+        self
     }
 
     /// The login the token is held for.
@@ -127,22 +167,44 @@ impl GitAuth {
         &self.login
     }
 
-    /// Gives `command`, a git call with no arguments yet, the token and the hardening: the
-    /// `-c` settings go first, so the caller adds the subcommand and its arguments after this.
-    /// `GIT_ASKPASS` names the script and [`TOKEN_VAR`] holds the token, on this command's
-    /// environment only; the daemon's own is never changed. A tokio command takes it through
-    /// `as_std_mut()`.
+    /// Gives `command`, a git call with no arguments yet, the token and the hardening. The
+    /// `-c` settings must come before the subcommand (after it, `git clone -c` would write
+    /// them into the new repository's config), so a command that has an argument already is a
+    /// mistake in the caller, and this panics. `GIT_ASKPASS` names the script and
+    /// [`TOKEN_VAR`] holds the token, on this command's environment only; the daemon's own is
+    /// never changed. A caller that adds `GIT_CONFIG_COUNT` pins does so after this. A tokio
+    /// command takes it through `as_std_mut()`.
+    ///
+    /// The command then holds the token: its `Debug` form shows it, so it is never logged or
+    /// put in an error. The repository's own config is still read for every key the `-c`
+    /// settings do not set, and a URL-scoped `http.<url>.*` key there wins over them, so a call
+    /// with the token runs only in a repository whose config untrusted code cannot write.
     pub fn apply(&self, command: &mut Command) {
+        assert!(
+            command.get_args().len() == 0,
+            "GitAuth::apply goes before any argument of the git call"
+        );
         for setting in CONFIG {
             command.arg("-c").arg(setting);
         }
-        for name in INHERITED_CONFIG {
+        if self.file_transport {
+            command.arg("-c").arg(FILE_TRANSPORT);
+        }
+        for name in INHERITED {
             command.env_remove(name);
         }
-        command
-            .envs(ENV)
-            .env("GIT_ASKPASS", &self.askpass)
-            .env(TOKEN_VAR, &self.token);
+        command.envs(ENV).envs(self.askpass_env());
+    }
+
+    /// The askpass and the token, as a terminal's environment, for a terminal that acts as the
+    /// login, such as a factory session: its git calls then get the token for github.com over
+    /// HTTPS. It holds the token, so it is never logged. It has none of the hardening, which
+    /// [`apply`](Self::apply) adds for one call.
+    pub fn askpass_env(&self) -> Vec<(String, String)> {
+        vec![
+            ("GIT_ASKPASS".to_owned(), self.askpass.clone()),
+            (TOKEN_VAR.to_owned(), self.token.clone()),
+        ]
     }
 }
 
@@ -151,6 +213,7 @@ impl fmt::Debug for GitAuth {
         f.debug_struct("GitAuth")
             .field("login", &self.login)
             .field("askpass", &self.askpass)
+            .field("file_transport", &self.file_transport)
             .finish_non_exhaustive()
     }
 }
@@ -193,12 +256,21 @@ fn write_askpass(dir: &Path, path: &Path) -> io::Result<()> {
 }
 
 /// The environment that turns git's credential helpers off for a terminal: no system or global
-/// config, where the machine's helpers (a keychain, `gh`) are named, and no terminal prompt, so
-/// a git call that needs a login fails at once. It holds no token, and names no askpass.
+/// config, where the machine's helpers (a keychain, `gh`) are named; no config the daemon's
+/// own environment may carry in; an empty `GIT_ASKPASS`, with which git asks neither
+/// `core.askPass` nor `SSH_ASKPASS`, and an empty `SSH_ASKPASS` for ssh itself; and no
+/// terminal prompt, so a git call that needs a login fails at once. Each is a value, since a
+/// terminal's environment is set over the daemon's and cannot remove a variable. It holds no
+/// token. A helper that code in the terminal writes into the repository's own config is that
+/// code's doing: it could as well run the helper itself, which no environment prevents.
 pub fn helpers_off_env() -> Vec<(String, String)> {
     [
         ("GIT_CONFIG_NOSYSTEM", "1"),
         ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ("GIT_CONFIG_COUNT", "0"),
+        ("GIT_CONFIG_PARAMETERS", ""),
+        ("GIT_ASKPASS", ""),
+        ("SSH_ASKPASS", ""),
         ("GIT_TERMINAL_PROMPT", "0"),
     ]
     .into_iter()
