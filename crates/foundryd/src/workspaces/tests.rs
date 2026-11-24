@@ -4719,7 +4719,7 @@ impl Setup {
 }
 
 #[tokio::test]
-async fn a_retry_records_a_terminal_the_first_create_left_unrecorded_and_starts_no_second() {
+async fn a_retry_starts_the_setup_due_beside_a_terminal_the_first_create_left_unrecorded() {
     let setup = Setup::new();
     let remote = setup.project(&[("README.md", "hello\n")]);
     let make = |provision| {
@@ -4734,15 +4734,23 @@ async fn a_retry_records_a_terminal_the_first_create_left_unrecorded_and_starts_
     // The first create is due to run a setup; the daemon dies between starting it and
     // recording it, so a terminal runs and the record names none.
     let id = make(commands(&["sleep 3193"], 30)).await.unwrap();
-    let running = setup.body(id).setup.expect("the setup is recorded");
+    let left = setup.body(id).setup.expect("the setup is recorded");
     setup.forget_setup(id).await;
     assert_eq!(setup.body(id).setup, None);
+    // A person's shell is open in the workspace too.
+    let shell = setup.start_terminal(id, "sleep 3201").await;
 
     let again = make(commands(&["true"], 30)).await.unwrap();
 
     assert_eq!(again, id);
-    assert_eq!(setup.open_terminals(id), [running]);
-    assert_eq!(setup.body(id).setup, Some(running));
+    let recorded = setup.body(id).setup.expect("the due setup is recorded");
+    assert_ne!(recorded, shell);
+    assert_ne!(recorded, left);
+    let mut open = setup.open_terminals(id);
+    open.sort_by_key(|t| t.0);
+    let mut want = [left, shell, recorded];
+    want.sort_by_key(|t| t.0);
+    assert_eq!(open, want);
 }
 
 #[tokio::test]
