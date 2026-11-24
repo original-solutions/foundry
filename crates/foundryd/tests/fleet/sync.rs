@@ -1137,6 +1137,11 @@ async fn the_factory_catch_up_starts_from_the_factory_versions_in_the_hello() {
         .map(|r| r.version())
         .collect();
     assert_eq!(p1_sent, p1[1..]);
+
+    // The cursor moves past what was sent: a record written next goes alone.
+    let later = write_factory(a, run_event(&run, "later"));
+    let messages = messages_for(&mut conn, Duration::from_secs(5)).await;
+    assert_eq!(factory_records_in(&messages), [later]);
 }
 
 #[tokio::test(start_paused = true)]
