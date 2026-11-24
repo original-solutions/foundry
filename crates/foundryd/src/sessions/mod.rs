@@ -464,9 +464,7 @@ impl Inner {
             lock(&self.live).remove(&id);
             lock(&self.factory).marks.remove(&id);
             drop(body);
-            if let Err(close) = self.terminals.close(terminal).await {
-                tracing::warn!(session = %id, error = %close, "the terminal of a start whose record failed was not closed");
-            }
+            let _ = self.terminals.close(terminal).await;
             self.discard(id, &settings, &curl).await;
             return Err(error);
         }

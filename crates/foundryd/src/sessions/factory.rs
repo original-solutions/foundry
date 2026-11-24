@@ -90,7 +90,7 @@ pub(super) fn write_mark(path: &Path, project: ProjectId) -> Result<(), SessionE
 /// helpers read blanked, the ones [`git_auth::helpers_off_env`] blanks.
 ///
 /// What the askpass cannot cover is a setup of the owner's that answers github.com before git
-/// asks it: a URL rewrite, an `extraHeader`, a user name in a remote's URL, a netrc entry. A
+/// asks it: a URL rewrite, an `extraHeader`, a user name in the `origin` remote's URL or push URL, a netrc entry. A
 /// factory start refuses those, before it reads the token ([`git_refusal`]).
 fn factory_env(
     secrets: &dyn crate::secrets::Secrets,
@@ -134,37 +134,39 @@ fn factory_env(
     Ok(env)
 }
 
-/// The netrc of the owner whose HOME is `home`.
-fn netrc_of(_home: Option<std::ffi::OsString>) -> Option<PathBuf> {
-    None
+/// The netrc of the owner whose HOME is `home`: `<home>/.netrc`. None without a HOME.
+fn netrc_of(home: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    home.filter(|home| !home.is_empty())
+        .map(|home| PathBuf::from(home).join(".netrc"))
 }
 
-/// The check's git: `base` with the session's overrides of config out of it.
-fn check_git(base: Command, _home: Option<&Path>) -> Command {
-    base
+/// The check's git: `base` with what the session overrides out of it, so it lists the config
+/// the session's git reads: `GIT_CONFIG_PARAMETERS` and `GIT_CONFIG_COUNT` (the session sets
+/// its own) and `GIT_CONFIG` (`git config` reads only that file when it is set, and `git push`
+/// ignores it). With `home` (tests), that folder is HOME and XDG_CONFIG_HOME and there is no
+/// system config.
+fn check_git(mut git: Command, home: Option<&Path>) -> Command {
+    git.env_remove("GIT_CONFIG_PARAMETERS")
+        .env_remove("GIT_CONFIG_COUNT")
+        .env_remove("GIT_CONFIG");
+    if let Some(home) = home {
+        git.env("HOME", home)
+            .env("XDG_CONFIG_HOME", home)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("GIT_CONFIG_GLOBAL")
+            .env_remove("GIT_CONFIG_SYSTEM");
+    }
+    git
 }
 
-/// [`git_refusal`] for the real setup: the process's `git`, with the session's overrides of
-/// config out of it, and `$HOME/.netrc`. With `home` (tests), that folder is HOME and
-/// XDG_CONFIG_HOME, there is no system config, and the netrc is `<home>/.netrc`.
+/// [`git_refusal`] for the real setup: the process's `git` as [`check_git`] makes it, and
+/// `$HOME/.netrc`. With `home` (tests), that folder stands for HOME.
 fn owner_setup_refusal(home: Option<&Path>, worktree: &Path) -> Result<(), SessionError> {
-    let git = || {
-        let mut git = Command::new("git");
-        git.env_remove("GIT_CONFIG_PARAMETERS")
-            .env_remove("GIT_CONFIG_COUNT");
-        if let Some(home) = home {
-            git.env("HOME", home)
-                .env("XDG_CONFIG_HOME", home)
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env_remove("GIT_CONFIG_GLOBAL")
-                .env_remove("GIT_CONFIG_SYSTEM");
-        }
-        git
-    };
-    let netrc = home
-        .map(Path::to_path_buf)
-        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
-        .map(|home| home.join(".netrc"));
+    let git = || check_git(Command::new("git"), home);
+    let netrc = netrc_of(
+        home.map(|home| home.as_os_str().to_owned())
+            .or_else(|| std::env::var_os("HOME")),
+    );
     git_refusal(git, netrc.as_deref(), worktree)
 }
 
@@ -254,31 +256,7 @@ fn git_refusal(
             });
         }
     }
-    for (flag, key) in [
-        (None, "remote.origin.url"),
-        (Some("--push"), "remote.origin.pushurl"),
-    ] {
-        let mut args: Vec<&OsStr> = vec![
-            OsStr::new("-C"),
-            worktree.as_os_str(),
-            OsStr::new("remote"),
-            OsStr::new("get-url"),
-        ];
-        args.extend(flag.map(OsStr::new));
-        args.extend([OsStr::new("--all"), OsStr::new("origin")]);
-        let urls = git_out(git(), &args).unwrap_or_default();
-        if String::from_utf8_lossy(&urls).lines().any(has_user_name) {
-            let file = entries
-                .iter()
-                .find(|entry| entry.key == key)
-                .map_or("the git config", |entry| entry.file.as_str());
-            found.push(Finding {
-                what: "a user name in the origin URL",
-                key: key.into(),
-                file: file.into(),
-            });
-        }
-    }
+    found.extend(origin_findings(&git, &entries, worktree));
     if let Some(netrc) = netrc {
         found.extend(netrc_findings(netrc));
     }
@@ -287,6 +265,67 @@ fn git_refusal(
     } else {
         Err(GitRefused(found).into())
     }
+}
+
+/// The findings for a user name in the `origin` remote's URL or push URL, named where it is:
+/// the `remote.origin.url` or `pushurl` entry that has one, or the `url.<base>.insteadof` whose
+/// base has one and whose value starts a raw origin URL. The URL git then uses (rewrites
+/// applied) is a safety net: a user name there that none of those explain is one generic
+/// finding.
+fn origin_findings(git: &impl Fn() -> Command, entries: &[Entry], worktree: &Path) -> Vec<Finding> {
+    let mut found = Vec::new();
+    let raw: Vec<&Entry> = entries
+        .iter()
+        .filter(|e| e.key == "remote.origin.url" || e.key == "remote.origin.pushurl")
+        .collect();
+    for entry in &raw {
+        if has_user_name(&entry.value) {
+            found.push(Finding {
+                what: "a user name in the origin URL",
+                key: entry.key.clone(),
+                file: entry.file.clone(),
+            });
+        }
+    }
+    for entry in entries {
+        let base = entry.key.strip_prefix("url.").and_then(|rest| {
+            rest.strip_suffix(".insteadof")
+                .or_else(|| rest.strip_suffix(".pushinsteadof"))
+        });
+        let Some(base) = base else { continue };
+        if has_user_name(base)
+            && !entry.value.is_empty()
+            && raw.iter().any(|url| url.value.starts_with(&entry.value))
+        {
+            found.push(Finding {
+                what: "a user name in the origin URL after a URL rewrite",
+                key: mask_user_info(&entry.key),
+                file: entry.file.clone(),
+            });
+        }
+    }
+    if found.is_empty() {
+        for flag in [None, Some("--push")] {
+            let mut args: Vec<&OsStr> = vec![
+                OsStr::new("-C"),
+                worktree.as_os_str(),
+                OsStr::new("remote"),
+                OsStr::new("get-url"),
+            ];
+            args.extend(flag.map(OsStr::new));
+            args.extend([OsStr::new("--all"), OsStr::new("origin")]);
+            let urls = git_out(git(), &args).unwrap_or_default();
+            if String::from_utf8_lossy(&urls).lines().any(has_user_name) {
+                found.push(Finding {
+                    what: "a user name in the origin URL after a URL rewrite",
+                    key: "remote.origin.url".into(),
+                    file: "the git config".into(),
+                });
+                break;
+            }
+        }
+    }
+    found
 }
 
 /// One entry of `git config --list --show-origin -z`.
@@ -316,16 +355,17 @@ fn config_entries(listed: &[u8]) -> Vec<Entry> {
 /// What `key = value` of the config does that is refused, if it does. `key` has its section
 /// and variable in lower case, as git lists it.
 fn config_finding(key: &str, value: &str) -> Option<&'static str> {
-    if value.is_empty() {
-        return None;
-    }
     let url_key = |suffix: &str| {
         key.strip_prefix("url.")
             .is_some_and(|rest| rest.ends_with(suffix))
     };
     if url_key(".insteadof") || url_key(".pushinsteadof") {
+        // An empty value is a prefix of every URL: it rewrites them all.
         return (GITHUB.starts_with(value) || value.starts_with(GITHUB))
             .then_some("a URL rewrite of https://github.com/");
+    }
+    if value.is_empty() {
+        return None;
     }
     if key == "http.extraheader" {
         return Some("an extra HTTP header");
@@ -390,6 +430,40 @@ fn mask_user_info(key: &str) -> String {
     }
 }
 
+/// The tokens of a netrc line, as curl reads them: split at white space, a token in double
+/// quotes may hold white space, and a backslash makes the next character itself.
+fn netrc_tokens(line: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut chars = line.chars().peekable();
+    while let Some(&first) = chars.peek() {
+        if first.is_whitespace() {
+            chars.next();
+            continue;
+        }
+        let quoted = first == '"';
+        if quoted {
+            chars.next();
+        }
+        let mut token = String::new();
+        while let Some(&c) = chars.peek() {
+            if (quoted && c == '"') || (!quoted && c.is_whitespace()) {
+                chars.next();
+                break;
+            }
+            chars.next();
+            if c == '\\' {
+                if let Some(next) = chars.next() {
+                    token.push(next);
+                }
+            } else {
+                token.push(c);
+            }
+        }
+        tokens.push(token);
+    }
+    tokens
+}
+
 /// The entries of the netrc at `path` that answer github.com: a `machine github.com` and a
 /// `default`. A netrc that is not there has none; one that cannot be read is refused.
 fn netrc_findings(path: &Path) -> Vec<Finding> {
@@ -413,7 +487,7 @@ fn netrc_findings(path: &Path) -> Vec<Finding> {
             macdef = !line.trim().is_empty();
             continue;
         }
-        for token in line.split_whitespace() {
+        for token in netrc_tokens(line) {
             if std::mem::take(&mut skip) {
                 continue;
             }
@@ -427,19 +501,20 @@ fn netrc_findings(path: &Path) -> Vec<Finding> {
                 }
                 continue;
             }
-            match token {
-                "macdef" => {
-                    macdef = true;
-                    break;
-                }
-                "machine" => machine = true,
-                "login" | "password" | "account" => skip = true,
-                "default" => found.push(Finding {
+            let is = |word: &str| token.eq_ignore_ascii_case(word);
+            if is("macdef") {
+                macdef = true;
+                break;
+            } else if is("machine") {
+                machine = true;
+            } else if is("login") || is("password") || is("account") {
+                skip = true;
+            } else if is("default") {
+                found.push(Finding {
                     what: "a netrc default entry",
                     key: "default".into(),
                     file: file.clone(),
-                }),
-                _ => {}
+                });
             }
         }
     }
