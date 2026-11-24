@@ -94,8 +94,8 @@ fn factory_env(
     secrets: &dyn crate::secrets::Secrets,
     login: &str,
     data: &Path,
-    identity: &[(String, String)],
 ) -> Result<Vec<(String, String)>, SessionError> {
+    let identity: &[(String, String)] = &[];
     let auth = GitAuth::for_login(secrets, login, data)?;
     let mut git = Command::new("git");
     auth.apply(&mut git);
@@ -141,35 +141,18 @@ fn factory_env(
     Ok(env)
 }
 
-/// The owner's `user.name` and `user.email`, from the global config `git` reads, as config
-/// pins in that order. One that is not set is left out, and so is both when git cannot run:
-/// no identity is pinned, and nothing is an error.
-fn owner_identity(mut git: Command) -> Vec<(String, String)> {
-    let Ok(out) = git
-        .args([
-            "config",
-            "--global",
-            "--get-regexp",
-            r"^user\.(name|email)$",
-        ])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-    else {
-        return Vec::new();
-    };
-    let text = String::from_utf8_lossy(&out.stdout);
-    let last = |key: &str| {
-        text.lines()
-            .filter_map(|line| line.split_once(' '))
-            .filter(|(k, _)| *k == key)
-            .map(|(_, value)| value.to_owned())
-            .next_back()
-    };
-    ["user.name", "user.email"]
-        .into_iter()
-        .filter_map(|key| last(key).map(|value| (key.to_owned(), value)))
-        .collect()
+/// What a factory start found in the owner's git setup that would answer github.com before the
+/// askpass is asked.
+#[derive(Debug, thiserror::Error)]
+#[error("sessions: a factory start is refused")]
+pub struct GitRefused;
+
+fn git_refusal(
+    _git: impl Fn() -> Command,
+    _netrc: Option<&Path>,
+    _worktree: &Path,
+) -> Result<(), SessionError> {
+    Ok(())
 }
 
 impl Sessions {
@@ -208,12 +191,7 @@ impl Sessions {
             let secrets = inner.secrets.get().cloned();
             let (login, data) = (start.login.clone(), inner.data.clone());
             let env = blocking(move || match secrets {
-                Some(secrets) => factory_env(
-                    secrets.as_ref(),
-                    &login,
-                    &data,
-                    &owner_identity(Command::new("git")),
-                ),
+                Some(secrets) => factory_env(secrets.as_ref(), &login, &data),
                 None => Err(crate::git_auth::NoToken::Unset { login }.into()),
             })
             .await??;
@@ -411,6 +389,8 @@ exec "$agent" "$@""#;
         worktree: TempDir,
         /// Holds Claude Code's state file.
         _home: TempDir,
+        /// The home the factory start's check of the owner's git setup reads.
+        git_home: TempDir,
         me: MachineId,
         store: Arc<Mutex<Store>>,
         terminals: Arc<Terminals>,
@@ -462,6 +442,7 @@ exec "$agent" "$@""#;
             };
             let secrets = Arc::new(MemorySecrets::default());
             secrets.set(&format!("github:{LOGIN}"), TOKEN).unwrap();
+            let git_home = tempfile::tempdir().unwrap();
             let sessions = Sessions::new(
                 me,
                 store.clone(),
@@ -469,6 +450,7 @@ exec "$agent" "$@""#;
                 data.path(),
                 config.clone(),
             )
+            .with_git_home(git_home.path().to_path_buf())
             .with_secrets(secrets.clone());
             let router = sessions.router();
             let server = tokio::spawn(async move {
@@ -483,6 +465,7 @@ exec "$agent" "$@""#;
                 data,
                 worktree: tempfile::tempdir().unwrap(),
                 _home: home,
+                git_home,
                 me,
                 store,
                 terminals,
@@ -501,7 +484,8 @@ exec "$agent" "$@""#;
                 self.terminals.clone(),
                 self.data.path(),
                 self.config.clone(),
-            );
+            )
+            .with_git_home(self.git_home.path().to_path_buf());
             if with_secrets {
                 sessions.with_secrets(self.secrets.clone())
             } else {
@@ -721,9 +705,7 @@ exec "$agent" "$@""#;
         assert_eq!(value(&seen, "GH_TOKEN=").as_deref(), Some(TOKEN));
         assert_eq!(value(&seen, "FOUNDRY_GIT_TOKEN=").as_deref(), Some(TOKEN));
         assert_eq!(value(&seen, "ASKPASS=").as_deref(), Some(TOKEN), "{seen}");
-        // One pin for the helper, and one for each of the owner's name and email this machine has.
-        let count: usize = value(&seen, "GIT_CONFIG_COUNT=").unwrap().parse().unwrap();
-        assert!((1..=3).contains(&count), "{count}");
+        assert_eq!(value(&seen, "GIT_CONFIG_COUNT=").as_deref(), Some("1"));
         assert_eq!(
             value(&seen, "GIT_CONFIG_KEY_0=").as_deref(),
             Some("credential.helper")
@@ -741,11 +723,13 @@ exec "$agent" "$@""#;
             value(&seen, "GIT_ALLOW_PROTOCOL=").as_deref(),
             Some("https")
         );
-        assert_eq!(
+        // The owner's config is kept: we give the session no isolation. (The test process's
+        // own environment is inherited, so only the values we would have set are refused.)
+        assert_ne!(
             value(&seen, "GIT_CONFIG_GLOBAL=").as_deref(),
             Some("/dev/null")
         );
-        assert_eq!(value(&seen, "GIT_CONFIG_NOSYSTEM=").as_deref(), Some("1"));
+        assert_ne!(value(&seen, "GIT_CONFIG_NOSYSTEM=").as_deref(), Some("1"));
 
         let mark = f.mark_file(id);
         assert_eq!(std::fs::read_to_string(&mark).unwrap(), project.to_string());
@@ -901,168 +885,83 @@ exec "$agent" "$@""#;
     }
 
     /// `git` run as a factory session's child would, with HOME and XDG_CONFIG_HOME at `home`
-    /// (where the owner's `.gitconfig` is), in the factory env built with `identity`, and over
-    /// a `GIT_CONFIG_PARAMETERS` that names a helper, as an inherited one could.
-    fn factory_git(home: &Path, identity: &[(String, String)], args: &[&str]) -> Command {
+    /// (where the owner's `.gitconfig` is), and over a `GIT_CONFIG_PARAMETERS` that names a
+    /// helper, as an inherited one could. The test keeps the box's own `/etc/gitconfig` out.
+    fn factory_git(home: &Path, args: &[&str]) -> Command {
         let data = tempfile::tempdir().unwrap();
         let secrets = MemorySecrets::default();
         secrets.set(&format!("github:{LOGIN}"), TOKEN).unwrap();
-        let env = factory_env(&secrets, LOGIN, data.path(), identity).unwrap();
+        let env = factory_env(&secrets, LOGIN, data.path()).unwrap();
         let mut git = Command::new("git");
         git.args(args)
             .current_dir(home)
             .env("HOME", home)
             .env("XDG_CONFIG_HOME", home)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("GIT_CONFIG_GLOBAL")
             .env("GIT_SSH_COMMAND", "false");
         git.env("GIT_CONFIG_PARAMETERS", "'credential.helper'='store'");
         git.envs(env);
         git
     }
 
-    /// The owner's git: HOME and XDG_CONFIG_HOME at `home`, no system config.
-    fn owners_git(home: &Path) -> Command {
-        let mut git = Command::new("git");
-        git.env("HOME", home)
-            .env("XDG_CONFIG_HOME", home)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env_remove("GIT_CONFIG_GLOBAL")
-            .env_remove("GIT_CONFIG_PARAMETERS")
-            .env_remove("GIT_CONFIG_COUNT");
-        git
+    fn out(mut git: Command) -> String {
+        let out = git.output().unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
     #[test]
-    fn a_global_rewrite_that_carries_another_accounts_credentials_does_not_reach_the_session() {
+    fn the_session_keeps_the_owners_git_config_and_has_no_credential_helper() {
         let home = tempfile::tempdir().unwrap();
+        let hooks = home.path().join("hooks");
+        std::fs::write(home.path().join("ignore"), ".env\n").unwrap();
         std::fs::write(
             home.path().join(".gitconfig"),
-            "[url \"https://other:OTHERTOKEN@github.com/\"]\n\tinsteadOf = https://github.com/\n\
-             [url \"git@github.com:\"]\n\tinsteadOf = https://github.com/\n",
+            format!(
+                "[user]\n\tname = Owner Name\n\temail = owner@example.com\n\
+                 [core]\n\texcludesFile = {}\n\thooksPath = {}\n\
+                 [credential]\n\thelper = store\n",
+                home.path().join("ignore").display(),
+                hooks.display()
+            ),
         )
         .unwrap();
-        // The owner's own git does rewrite, so the test would show it.
-        let owner = owners_git(home.path())
-            .args(["ls-remote", "--get-url", "https://github.com/o/r.git"])
-            .output()
-            .unwrap();
-        assert_ne!(
-            String::from_utf8_lossy(&owner.stdout).trim(),
-            "https://github.com/o/r.git"
-        );
-
-        let out = factory_git(
-            home.path(),
-            &[],
-            &["ls-remote", "--get-url", "https://github.com/o/r.git"],
-        )
-        .output()
-        .unwrap();
-
-        assert_eq!(
-            String::from_utf8_lossy(&out.stdout).trim(),
-            "https://github.com/o/r.git",
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
-    #[test]
-    fn a_global_header_and_helper_do_not_reach_the_session() {
-        let home = tempfile::tempdir().unwrap();
-        std::fs::write(
-            home.path().join(".gitconfig"),
-            "[http \"https://github.com/\"]\n\textraHeader = Authorization: Basic T1RIRVI6VE9LRU4=\n\
-             [credential]\n\thelper = store\n",
-        )
-        .unwrap();
-
-        let header = factory_git(
-            home.path(),
-            &[],
-            &[
-                "config",
-                "--get-all",
-                "http.https://github.com/.extraheader",
-            ],
-        )
-        .output()
-        .unwrap();
-        let helpers = factory_git(
-            home.path(),
-            &[],
-            &["config", "--get-all", "credential.helper"],
-        )
-        .output()
-        .unwrap();
-
-        assert_eq!(String::from_utf8_lossy(&header.stdout), "");
-        assert_eq!(String::from_utf8_lossy(&helpers.stdout), "\n");
-    }
-
-    #[test]
-    fn the_owners_name_and_email_are_carried_in_and_nothing_else() {
-        let home = tempfile::tempdir().unwrap();
-        std::fs::write(
-            home.path().join(".gitconfig"),
-            "[user]\n\tname = Owner Name\n\temail = owner@example.com\n\
-             [url \"https://other:OTHERTOKEN@github.com/\"]\n\tinsteadOf = https://github.com/\n",
-        )
-        .unwrap();
-
-        let pins = owner_identity(owners_git(home.path()));
-
-        assert_eq!(
-            pins,
-            [
-                ("user.name".to_string(), "Owner Name".to_string()),
-                ("user.email".to_string(), "owner@example.com".to_string()),
-            ]
-        );
         let repo = tempfile::tempdir().unwrap();
-        let init = factory_git(home.path(), &pins, &["init", "-q"])
-            .current_dir(repo.path())
-            .output()
-            .unwrap();
-        assert!(init.status.success());
-        for (key, want) in [
-            ("user.name", "Owner Name"),
-            ("user.email", "owner@example.com"),
-        ] {
-            let out = factory_git(home.path(), &pins, &["config", key])
-                .current_dir(repo.path())
-                .output()
-                .unwrap();
-            assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), want);
-        }
-        let url = factory_git(
-            home.path(),
-            &pins,
-            &["ls-remote", "--get-url", "https://github.com/o/r.git"],
-        )
-        .current_dir(repo.path())
-        .output()
-        .unwrap();
+        let git = |args: &[&str]| {
+            let mut git = factory_git(home.path(), args);
+            git.current_dir(repo.path());
+            git
+        };
+        assert!(git(&["init", "-q"]).output().unwrap().status.success());
+
+        assert_eq!(out(git(&["config", "user.name"])).trim(), "Owner Name");
         assert_eq!(
-            String::from_utf8_lossy(&url.stdout).trim(),
-            "https://github.com/o/r.git"
+            out(git(&["config", "user.email"])).trim(),
+            "owner@example.com"
         );
-    }
-
-    #[test]
-    fn an_owner_with_no_name_or_email_pins_none() {
-        let home = tempfile::tempdir().unwrap();
-        std::fs::write(
-            home.path().join(".gitconfig"),
-            "[core]\n\tautocrlf = false\n",
-        )
-        .unwrap();
-        assert!(owner_identity(owners_git(home.path())).is_empty());
-
-        let bare = tempfile::tempdir().unwrap();
-        assert!(owner_identity(owners_git(bare.path())).is_empty());
-
-        // git that cannot run is no identity, not an error.
-        assert!(owner_identity(Command::new("/nonexistent/git")).is_empty());
+        assert_eq!(
+            out(git(&["check-ignore", ".env"])).trim(),
+            ".env",
+            "the owner's global ignore file applies"
+        );
+        assert_eq!(
+            out(git(&["config", "core.hooksPath"])).trim(),
+            hooks.to_string_lossy()
+        );
+        // The last value git reads is the empty one: no helper is in effect.
+        let helpers = out(git(&["config", "--get-all", "credential.helper"]));
+        assert_eq!(helpers.lines().last(), Some(""), "{helpers:?}");
+        let protocol = git(&["--version"])
+            .get_envs()
+            .find(|(k, _)| *k == "GIT_ALLOW_PROTOCOL")
+            .and_then(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()));
+        assert_eq!(protocol.as_deref(), Some("https"));
+        let ssh = git(&["ls-remote", "ssh://localhost/x"]).output().unwrap();
+        assert!(
+            String::from_utf8_lossy(&ssh.stderr).contains("not allowed"),
+            "{}",
+            String::from_utf8_lossy(&ssh.stderr)
+        );
     }
 
     #[tokio::test]
@@ -1353,6 +1252,346 @@ exec "$agent" "$@""#;
             .unwrap_err();
 
         assert!(matches!(error, SessionError::Store(_)), "{error}");
+        f.assert_nothing_left(&f.sessions, project);
+    }
+
+    // The start-time refusal of an owner's setup that would answer github.com before the askpass.
+
+    const SECRET: &str = "SECRETPW-4f9a1c";
+
+    /// The owner's git: HOME and XDG_CONFIG_HOME at `home`, no system config, none of the
+    /// session's own overrides.
+    fn owner_git(home: &Path) -> impl Fn() -> Command + '_ {
+        move || {
+            let mut git = Command::new("git");
+            git.env("HOME", home)
+                .env("XDG_CONFIG_HOME", home)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env_remove("GIT_CONFIG_GLOBAL")
+                .env_remove("GIT_CONFIG_SYSTEM")
+                .env_remove("GIT_CONFIG_PARAMETERS")
+                .env_remove("GIT_CONFIG_COUNT");
+            git
+        }
+    }
+
+    /// A made-up home whose `.gitconfig` holds `global`, and a fresh repository.
+    fn setup(global: &str) -> (TempDir, TempDir) {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join(".gitconfig"), global).unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        run(owner_git(home.path()), repo.path(), &["init", "-q"]);
+        (home, repo)
+    }
+
+    fn run(git: impl Fn() -> Command, repo: &Path, args: &[&str]) {
+        let out = git().args(args).current_dir(repo).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn check(home: &Path, repo: &Path) -> Result<(), SessionError> {
+        git_refusal(owner_git(home), Some(&home.join(".netrc")), repo)
+    }
+
+    /// What the refusal says, Display and Debug, when `result` is one.
+    fn said(result: Result<(), SessionError>) -> String {
+        let error = result.expect_err("the start should be refused");
+        assert!(matches!(error, SessionError::GitSetup(_)), "{error}");
+        format!("{error} | {error:?}")
+    }
+
+    #[test]
+    fn a_global_insteadof_that_rewrites_github_refuses_and_names_the_key_and_file() {
+        let (home, repo) = setup(&format!(
+            "[url \"https://other:{SECRET}@mirror.example/\"]\n\tinsteadOf = https://github.com/\n"
+        ));
+
+        let said = said(check(home.path(), repo.path()));
+
+        assert!(
+            said.contains("url.https://***@mirror.example/.insteadof"),
+            "{said}"
+        );
+        assert!(said.contains(".gitconfig"), "{said}");
+        assert!(!said.contains(SECRET), "{said}");
+    }
+
+    #[test]
+    fn a_global_pushinsteadof_that_rewrites_github_refuses() {
+        let (home, repo) =
+            setup("[url \"https://push.example/\"]\n\tpushInsteadOf = https://github.com/org/\n");
+
+        let said = said(check(home.path(), repo.path()));
+
+        assert!(
+            said.contains("url.https://push.example/.pushinsteadof"),
+            "{said}"
+        );
+        assert!(said.contains(".gitconfig"), "{said}");
+    }
+
+    #[test]
+    fn a_system_insteadof_that_rewrites_github_refuses() {
+        let (home, repo) = setup("");
+        let system = home.path().join("system-gitconfig");
+        std::fs::write(
+            &system,
+            "[url \"https://sys.example/\"]\n\tinsteadOf = https://\n",
+        )
+        .unwrap();
+        let git = || {
+            let mut git = owner_git(home.path())();
+            git.env_remove("GIT_CONFIG_NOSYSTEM")
+                .env("GIT_CONFIG_SYSTEM", &system);
+            git
+        };
+
+        let said = said(git_refusal(git, None, repo.path()));
+
+        assert!(
+            said.contains("url.https://sys.example/.insteadof"),
+            "{said}"
+        );
+        assert!(said.contains("system-gitconfig"), "{said}");
+    }
+
+    #[test]
+    fn a_repo_insteadof_that_rewrites_github_refuses() {
+        let (home, repo) = setup("");
+        run(
+            owner_git(home.path()),
+            repo.path(),
+            &[
+                "config",
+                "url.https://repo.example/.insteadOf",
+                "https://github.com",
+            ],
+        );
+
+        let said = said(check(home.path(), repo.path()));
+
+        assert!(
+            said.contains("url.https://repo.example/.insteadof"),
+            "{said}"
+        );
+        assert!(said.contains(".git/config"), "{said}");
+    }
+
+    #[test]
+    fn an_insteadof_in_an_included_file_refuses_and_names_that_file() {
+        let home = tempfile::tempdir().unwrap();
+        let extra = home.path().join("extra-config");
+        std::fs::write(
+            &extra,
+            "[url \"https://inc.example/\"]\n\tinsteadOf = https://github.com/\n",
+        )
+        .unwrap();
+        let (home_with, repo) = {
+            std::fs::write(
+                home.path().join(".gitconfig"),
+                format!("[include]\n\tpath = {}\n", extra.display()),
+            )
+            .unwrap();
+            let repo = tempfile::tempdir().unwrap();
+            run(owner_git(home.path()), repo.path(), &["init", "-q"]);
+            (home, repo)
+        };
+
+        let said = said(check(home_with.path(), repo.path()));
+
+        assert!(
+            said.contains("url.https://inc.example/.insteadof"),
+            "{said}"
+        );
+        assert!(said.contains("extra-config"), "{said}");
+    }
+
+    #[test]
+    fn a_global_extraheader_refuses_and_does_not_print_it() {
+        let (home, repo) = setup(&format!(
+            "[http]\n\textraHeader = Authorization: Basic {SECRET}\n"
+        ));
+
+        let said = said(check(home.path(), repo.path()));
+
+        assert!(said.contains("http.extraheader"), "{said}");
+        assert!(said.contains(".gitconfig"), "{said}");
+        assert!(!said.contains(SECRET), "{said}");
+    }
+
+    #[test]
+    fn an_extraheader_for_github_com_refuses_and_does_not_print_it() {
+        let (home, repo) = setup(&format!(
+            "[http \"https://github.com/\"]\n\textraHeader = Authorization: Basic {SECRET}\n"
+        ));
+
+        let said = said(check(home.path(), repo.path()));
+
+        assert!(
+            said.contains("http.https://github.com/.extraheader"),
+            "{said}"
+        );
+        assert!(!said.contains(SECRET), "{said}");
+    }
+
+    #[test]
+    fn an_origin_url_with_a_password_refuses_and_does_not_print_it() {
+        let (home, repo) = setup("");
+        run(
+            owner_git(home.path()),
+            repo.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                &format!("https://bob:{SECRET}@example.com/o/r.git"),
+            ],
+        );
+
+        let said = said(check(home.path(), repo.path()));
+
+        assert!(said.contains("remote.origin.url"), "{said}");
+        assert!(said.contains(".git/config"), "{said}");
+        assert!(!said.contains(SECRET), "{said}");
+    }
+
+    #[test]
+    fn an_origin_push_url_with_a_user_name_refuses() {
+        let (home, repo) = setup("");
+        let git = owner_git(home.path());
+        run(
+            &git,
+            repo.path(),
+            &["remote", "add", "origin", "https://example.com/o/r.git"],
+        );
+        run(
+            &git,
+            repo.path(),
+            &[
+                "remote",
+                "set-url",
+                "--push",
+                "origin",
+                "https://bob@example.com/o/r.git",
+            ],
+        );
+
+        let said = said(check(home.path(), repo.path()));
+
+        assert!(said.contains("remote.origin.pushurl"), "{said}");
+        assert!(!said.contains("bob"), "{said}");
+    }
+
+    #[test]
+    fn a_netrc_entry_for_github_com_refuses_and_does_not_print_the_password() {
+        let (home, repo) = setup("");
+        std::fs::write(
+            home.path().join(".netrc"),
+            format!("machine example.com login a password b\nmachine GitHub.com login bob password {SECRET}\n"),
+        )
+        .unwrap();
+
+        let said = said(check(home.path(), repo.path()));
+
+        assert!(said.contains("machine github.com"), "{said}");
+        assert!(said.contains(".netrc"), "{said}");
+        assert!(!said.contains(SECRET), "{said}");
+    }
+
+    #[test]
+    fn a_netrc_default_entry_refuses() {
+        let (home, repo) = setup("");
+        std::fs::write(
+            home.path().join(".netrc"),
+            format!("default login bob password {SECRET}\n"),
+        )
+        .unwrap();
+
+        let said = said(check(home.path(), repo.path()));
+
+        assert!(said.contains("default"), "{said}");
+        assert!(said.contains(".netrc"), "{said}");
+        assert!(!said.contains(SECRET), "{said}");
+    }
+
+    #[test]
+    fn a_git_that_cannot_read_the_config_refuses() {
+        let (home, _repo) = setup("");
+        let missing = home.path().join("no-such-worktree");
+
+        let said = said(check(home.path(), &missing));
+
+        assert!(said.contains("could not be read"), "{said}");
+    }
+
+    #[test]
+    fn setups_that_do_not_answer_github_com_are_not_refused() {
+        let hooks = tempfile::tempdir().unwrap();
+        let (home, repo) = setup(&format!(
+            "[user]\n\tname = Owner\n\temail = o@example.com\n\
+             [core]\n\texcludesFile = ~/ignore\n\thooksPath = {}\n\
+             [url \"https://github.com/\"]\n\tinsteadOf = git@github.com:\n\
+             [url \"http://plain.example/\"]\n\tinsteadOf = http://\n\
+             [http \"https://example.com/\"]\n\textraHeader = X-Other: {SECRET}\n\
+             [http \"http://github.com/\"]\n\textraHeader = X-Other: {SECRET}\n\
+             [http \"https://github.com:8443/\"]\n\textraHeader = X-Other: {SECRET}\n\
+             [http \"https://*.github.com/\"]\n\textraHeader = X-Other: {SECRET}\n\
+             [credential]\n\thelper = store\n",
+            hooks.path().display()
+        ));
+        std::fs::write(
+            home.path().join(".netrc"),
+            "machine example.com login a password default\nmacdef init\nmachine github.com\n\n",
+        )
+        .unwrap();
+        run(
+            owner_git(home.path()),
+            repo.path(),
+            &["remote", "add", "origin", "https://github.com/o/r.git"],
+        );
+
+        check(home.path(), repo.path()).unwrap();
+    }
+
+    #[test]
+    fn a_wildcard_extraheader_url_that_covers_github_com_refuses() {
+        let (home, repo) = setup("[http \"https://*.com/\"]\n\textraHeader = X: y\n");
+        assert!(said(check(home.path(), repo.path())).contains("http.https://*.com/.extraheader"));
+    }
+
+    #[tokio::test]
+    async fn a_start_whose_owner_setup_would_answer_github_com_is_refused_and_leaves_nothing() {
+        let logged = Logged::everywhere();
+        let f = Fx::new("- wait_input\n").await;
+        let project = ProjectId::random();
+        std::fs::write(
+            f.git_home.path().join(".gitconfig"),
+            format!(
+                "[url \"https://other:{SECRET}@github.com/\"]\n\tinsteadOf = https://github.com/\n"
+            ),
+        )
+        .unwrap();
+
+        let error = f
+            .sessions
+            .start_factory(
+                WorkspaceId::random(),
+                f.worktree.path(),
+                f.start_for(project),
+                f.line(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, SessionError::GitSetup(_)), "{error}");
+        let said = format!("{error} {error:?}");
+        assert!(!said.contains(TOKEN) && !said.contains(SECRET), "{said}");
+        assert!(!logged.text().contains(TOKEN));
+        assert!(!logged.text().contains(SECRET));
         f.assert_nothing_left(&f.sessions, project);
     }
 }

@@ -117,6 +117,8 @@ pub enum SessionError {
     FirstMessageBody,
     #[error("sessions: the workspace's factory sessions were ended while this one was starting")]
     Ended,
+    #[error(transparent)]
+    GitSetup(#[from] factory::GitRefused),
     #[error("sessions: a step run apart from its caller did not finish: {0}")]
     Interrupted(#[from] tokio::task::JoinError),
 }
@@ -174,6 +176,10 @@ struct Inner {
     data: PathBuf,
     /// Where a factory start reads its token from. Set once, by [`Sessions::with_secrets`].
     secrets: OnceLock<Arc<dyn Secrets>>,
+    /// Tests: the home folder the factory start's check of the owner's git setup reads, in
+    /// place of the real one.
+    #[cfg(test)]
+    git_home: OnceLock<PathBuf>,
     /// The factory sessions and the ends asked for, under one lock so a start and an end are
     /// ordered: whichever takes it first wins.
     factory: Mutex<factory::FactoryState>,
@@ -230,6 +236,8 @@ impl Sessions {
                 dir: data_dir.join("sessions"),
                 data: data_dir.to_path_buf(),
                 secrets: OnceLock::new(),
+                #[cfg(test)]
+                git_home: OnceLock::new(),
                 factory: Mutex::default(),
                 config,
                 trust: Mutex::new(()),
@@ -249,6 +257,13 @@ impl Sessions {
     /// token.
     pub fn with_secrets(self, secrets: Arc<dyn Secrets>) -> Self {
         let _ = self.inner.secrets.set(secrets);
+        self
+    }
+
+    /// Tests: makes a factory start check the git setup of `home`, not the real one.
+    #[cfg(test)]
+    pub fn with_git_home(self, home: PathBuf) -> Self {
+        let _ = self.inner.git_home.set(home);
         self
     }
 
