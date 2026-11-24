@@ -7,9 +7,10 @@
 //!
 //! Every row is written under [`FactoryRecord::key`], and the reads below spell out its kind
 //! names and id layouts (`<run>/<owner>/<version>`, `<project>/<owner>`, the machine,
-//! `<session>/<owner>`) in their queries. Each read's tests store records through `apply_factory`, which
-//! keys them by `FactoryRecord::key`, and read them back here, so a change to a kind name or an
-//! id layout in `foundry-proto` fails those tests rather than leaving a read empty.
+//! `<session>/<owner>`) in their queries. Each read's tests store records through
+//! `apply_factory`, which keys them by `FactoryRecord::key`, and read them back here, so a
+//! change to a kind name or an id layout in `foundry-proto` fails those tests rather than
+//! leaving a read empty.
 
 use std::collections::{BTreeMap, BTreeSet};
 
