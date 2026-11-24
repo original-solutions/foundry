@@ -7,11 +7,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use foundry_proto::factory::{FactoryBody, FactoryRecord, RunEvent, RunId};
 use foundry_proto::ids::{MachineId, WorkspaceId};
 use foundry_proto::messages::{PROTOCOL, PeerMessage};
 use foundry_proto::record::AnyRecord;
 use foundry_proto::settings::Machine;
 use foundry_proto::state::{SessionState, TerminalState};
+use foundryd::sync::factory::FACTORY_BATCH_BYTES;
 use foundryd::sync::ws::{WsDialer, router};
 use foundryd::sync::{BATCH, Conn, Dialer, OFFLINE_AFTER, Peers, RETRY_REFUSED};
 use futures::future::BoxFuture;
@@ -918,4 +920,1004 @@ async fn a_busy_store_never_stalls_the_async_workers() {
         worst < Duration::from_secs(1),
         "a 20 ms sleep took {worst:?} while the store was busy"
     );
+}
+
+/// A run event of `run` written under lease generation 1.
+fn run_event(run: &RunId, event: &str) -> FactoryBody {
+    FactoryBody::RunEvent(RunEvent {
+        run: run.clone(),
+        generation: 1,
+        ts: "2026-11-24T05:16:30.000Z".into(),
+        ms: 1_795_497_390_000,
+        event: event.into(),
+        data: serde_json::json!({ "step": event }),
+        cause: None,
+    })
+}
+
+/// Writes one of `daemon`'s own factory records under its next factory version, as a writer
+/// must: the version taken and the record stored under the store's lock held once.
+fn write_factory(daemon: &Daemon, body: FactoryBody) -> FactoryRecord {
+    let mut store = lock(&daemon.store);
+    let version = store.own_next_factory_version().unwrap();
+    let record = FactoryRecord {
+        owner: daemon.id,
+        version,
+        body,
+    };
+    assert_eq!(
+        store.apply_factory(&record, daemon.id).unwrap(),
+        Applied::Stored
+    );
+    record
+}
+
+fn hello_factory(
+    protocol: u16,
+    machine: MachineId,
+    versions: BTreeMap<MachineId, u64>,
+    factory_versions: BTreeMap<MachineId, u64>,
+) -> PeerMessage {
+    PeerMessage::Hello {
+        protocol,
+        machine,
+        versions,
+        factory_versions,
+    }
+}
+
+/// Every message `conn` receives for `long`, while the test sends a heartbeat each second so
+/// the link stays open.
+async fn messages_for(conn: &mut Conn, long: Duration) -> Vec<serde_json::Value> {
+    let mut messages = Vec::new();
+    let start = Instant::now();
+    while start.elapsed() < long {
+        let _ = conn.send.try_send(heartbeat());
+        loop {
+            match conn.recv.try_recv() {
+                Ok(text) => messages.push(serde_json::from_str(&text).unwrap()),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => panic!("the link closed"),
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    messages
+}
+
+/// The factory records in `messages`, in the order sent.
+fn factory_records_in(messages: &[serde_json::Value]) -> Vec<FactoryRecord> {
+    messages
+        .iter()
+        .filter(|m| m["type"] == "factory_records")
+        .flat_map(|m| serde_json::from_value::<Vec<FactoryRecord>>(m["records"].clone()).unwrap())
+        .collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn three_daemons_converge_on_a_run_event() {
+    let fleet = Fleet::start(3);
+    let run = RunId::new("original-solutions/foundry", 132, 1).unwrap();
+    // Each writes an event of its own before the links are up, so each is sent in a catch-up.
+    for (i, daemon) in fleet.daemons.iter().enumerate() {
+        write_factory(daemon, run_event(&run, &format!("claimed-{i}")));
+    }
+    let events_of = |daemon: &Daemon| lock(&daemon.store).run_events(&run).unwrap();
+    let names = |daemon: &Daemon| -> Vec<String> {
+        let mut names: Vec<String> = events_of(daemon).into_iter().map(|e| e.event).collect();
+        names.sort();
+        names
+    };
+    until(Duration::from_secs(10), "factory catch-up", || {
+        fleet
+            .daemons
+            .iter()
+            .all(|d| names(d) == ["claimed-0", "claimed-1", "claimed-2"])
+    })
+    .await;
+
+    // One written once the links are up reaches every peer by a live send.
+    write_factory(&fleet.daemons[1], run_event(&run, "launched"));
+    until(Duration::from_secs(5), "live factory send", || {
+        fleet
+            .daemons
+            .iter()
+            .all(|d| names(d).contains(&"launched".to_owned()))
+    })
+    .await;
+    let first = events_of(&fleet.daemons[0]);
+    let versions = lock(&fleet.daemons[0].store).factory_versions().unwrap();
+    assert_eq!(first.len(), 4);
+    assert_eq!(
+        versions,
+        fleet
+            .daemons
+            .iter()
+            .map(|d| (d.id, if d.id == fleet.daemons[1].id { 2 } else { 1 }))
+            .collect::<BTreeMap<_, _>>()
+    );
+    for daemon in &fleet.daemons {
+        assert_eq!(events_of(daemon), first);
+        assert_eq!(lock(&daemon.store).factory_versions().unwrap(), versions);
+    }
+    // P1's records carry none of it.
+    assert!(fleet.daemons.iter().all(|d| d.dump().is_empty()));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_peer_on_protocol_4_receives_no_factory_record_and_on_5_with_empty_factory_versions_receives_every_one()
+ {
+    let old = MachineId::random();
+    let fleet = Fleet::start_with(1, &[old]);
+    let a = &fleet.daemons[0];
+    populate(a, Ids::random(), SessionState::Idle);
+    let run = RunId::new("original-solutions/foundry", 132, 1).unwrap();
+    let written: Vec<FactoryRecord> = ["claimed", "launched", "gated"]
+        .into_iter()
+        .map(|event| write_factory(a, run_event(&run, event)))
+        .collect();
+
+    // On protocol 4: the P1 catch-up as before, in protocol 4, and nothing factory.
+    let mut conn = raw_link(&a.peers);
+    send(&conn, &hello(4, old)).await;
+    let messages = messages_for(&mut conn, Duration::from_secs(10)).await;
+    let mut p1 = Vec::new();
+    for message in &messages {
+        assert_eq!(message["protocol"], 4, "{message}");
+        if message["type"] == "hello" {
+            assert!(
+                message["factory_versions"]
+                    .as_object()
+                    .is_none_or(|held| held.is_empty()),
+                "a protocol 4 peer was told factory versions: {message}"
+            );
+        }
+        assert!(
+            message["type"] == "hello" || message["type"] == "records",
+            "a protocol 4 peer was sent {message}"
+        );
+        if message["type"] == "records" {
+            let records: Vec<AnyRecord> =
+                serde_json::from_value(message["records"].clone()).unwrap();
+            p1.extend(records.iter().map(AnyRecord::version));
+        }
+    }
+    assert_eq!(p1, [1, 2, 3, 4], "the P1 catch-up changed");
+    drop(conn);
+
+    // The peer updates, and says hello on 5 holding every P1 record and no factory record.
+    let mut conn = raw_link(&a.peers);
+    send(
+        &conn,
+        &hello_factory(PROTOCOL, old, [(a.id, 4)].into(), BTreeMap::new()),
+    )
+    .await;
+    let messages = messages_for(&mut conn, Duration::from_secs(10)).await;
+    assert_eq!(factory_records_in(&messages), written);
+    assert!(
+        messages
+            .iter()
+            .filter(|m| m["type"] == "records")
+            .all(|m| m["records"].as_array().unwrap().is_empty()),
+        "P1 records it holds were sent again"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_factory_catch_up_starts_from_the_factory_versions_in_the_hello() {
+    let peer = MachineId::random();
+    let fleet = Fleet::start_with(1, &[peer]);
+    let a = &fleet.daemons[0];
+    let p1: Vec<u64> = (0..3)
+        .map(|_| a.write(workspace(WorkspaceId::random(), false)).version())
+        .collect();
+    let run = RunId::new("original-solutions/foundry", 132, 1).unwrap();
+    let written: Vec<FactoryRecord> = (0..4)
+        .map(|i| write_factory(a, run_event(&run, &format!("step-{i}"))))
+        .collect();
+
+    // The two cursors are apart: holding P1 version 1 says nothing of factory version 1.
+    let mut conn = raw_link(&a.peers);
+    send(
+        &conn,
+        &hello_factory(
+            PROTOCOL,
+            peer,
+            [(a.id, p1[0])].into(),
+            [(a.id, written[1].version)].into(),
+        ),
+    )
+    .await;
+    let messages = messages_for(&mut conn, Duration::from_secs(5)).await;
+    assert_eq!(factory_records_in(&messages), written[2..]);
+    let p1_sent: Vec<u64> = messages
+        .iter()
+        .filter(|m| m["type"] == "records")
+        .flat_map(|m| serde_json::from_value::<Vec<AnyRecord>>(m["records"].clone()).unwrap())
+        .map(|r| r.version())
+        .collect();
+    assert_eq!(p1_sent, p1[1..]);
+
+    // The cursor moves past what was sent: a record written next goes alone.
+    let later = write_factory(a, run_event(&run, "later"));
+    let messages = messages_for(&mut conn, Duration::from_secs(5)).await;
+    assert_eq!(factory_records_in(&messages), [later]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_factory_record_from_a_machine_that_is_not_its_owner_is_refused() {
+    let liar = MachineId::random();
+    let fleet = Fleet::start_with(2, &[liar]);
+    let (a, b) = (&fleet.daemons[0], &fleet.daemons[1]);
+    let run = RunId::new("original-solutions/foundry", 132, 1).unwrap();
+    // A record b owns, that a has not been sent: the liar claims to relay it, beside one of
+    // its own.
+    let forged = FactoryRecord {
+        owner: b.id,
+        version: 1,
+        body: run_event(&run, "forged"),
+    };
+    let own = FactoryRecord {
+        owner: liar,
+        version: 1,
+        body: run_event(&run, "own"),
+    };
+
+    let mut conn = raw_link(&a.peers);
+    send(&conn, &hello(PROTOCOL, liar)).await;
+    next(&mut conn).await.expect("a hello back");
+    send(
+        &conn,
+        &PeerMessage::FactoryRecords {
+            protocol: PROTOCOL,
+            records: vec![forged, own.clone()],
+        },
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let FactoryBody::RunEvent(own_event) = own.body else {
+        unreachable!()
+    };
+    assert_eq!(
+        lock(&a.store).run_events(&run).unwrap(),
+        [own_event],
+        "the forged record was taken, or the liar's own was not"
+    );
+    assert_eq!(
+        lock(&a.store).factory_versions().unwrap(),
+        BTreeMap::from([(liar, 1)])
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_peer_on_protocol_4_that_sends_factory_records_has_none_taken() {
+    let old = MachineId::random();
+    let fleet = Fleet::start_with(1, &[old]);
+    let a = &fleet.daemons[0];
+    let run = RunId::new("original-solutions/foundry", 132, 1).unwrap();
+
+    let mut conn = raw_link(&a.peers);
+    send(&conn, &hello(4, old)).await;
+    next(&mut conn).await.expect("a hello back");
+    send(
+        &conn,
+        &PeerMessage::FactoryRecords {
+            protocol: 4,
+            records: vec![FactoryRecord {
+                owner: old,
+                version: 1,
+                body: run_event(&run, "claimed"),
+            }],
+        },
+    )
+    .await;
+    // The link goes on taking the peer's P1 records: nothing on it was refused.
+    let ids = Ids::random();
+    send(
+        &conn,
+        &PeerMessage::Records {
+            protocol: 4,
+            records: vec![workspace(ids.workspace, false)(old, 1)],
+        },
+    )
+    .await;
+    assert!(keep_talking(&mut conn, Duration::from_secs(3)).await);
+    assert!(lock(&a.store).factory_versions().unwrap().is_empty());
+    assert!(a.peers.online().contains(&old));
+    let is_it = |record: &AnyRecord| matches!(record, AnyRecord::Workspace(w) if w.body.id == ids.workspace);
+    assert!(
+        a.held(is_it).is_some(),
+        "the P1 record after them was not taken"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_peer_on_protocol_4_that_sends_a_factory_message_this_build_cannot_read_has_its_link_kept()
+ {
+    let old = MachineId::random();
+    let fleet = Fleet::start_with(1, &[old]);
+    let a = &fleet.daemons[0];
+
+    let mut conn = raw_link(&a.peers);
+    send(&conn, &hello(4, old)).await;
+    next(&mut conn).await.expect("a hello back");
+    let unreadable = serde_json::json!({
+        "type": "factory_records",
+        "protocol": 4,
+        "records": [{ "kind": "lease_note" }],
+    });
+    conn.send.send(unreadable.to_string()).await.unwrap();
+
+    // A link that carries no factory record drops it as it drops one it can read, so nothing
+    // on it was refused and it does not end to ask again.
+    assert!(
+        keep_talking(&mut conn, RETRY_REFUSED * 2).await,
+        "the link stays open"
+    );
+    assert!(a.peers.online().contains(&old));
+}
+
+#[tokio::test(start_paused = true)]
+async fn factory_changes_rises_for_a_record_from_a_peer_and_for_one_this_machine_writes() {
+    let fleet = Fleet::start(2);
+    let (a, b) = (&fleet.daemons[0], &fleet.daemons[1]);
+    let run = RunId::new("original-solutions/foundry", 132, 1).unwrap();
+    let mut changes = a.peers.factory_changes();
+    // Let the links come up and anything they find at the start pass.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    changes.borrow_and_update();
+
+    let from_b = write_factory(b, run_event(&run, "from a peer"));
+    timeout(Duration::from_secs(5), changes.changed())
+        .await
+        .expect("no change within 5 s of a peer's record")
+        .unwrap();
+    assert_eq!(lock(&a.store).run_events(&run).unwrap().len(), 1);
+
+    // The same record sent again stores nothing, so nothing is told.
+    let mut conn = raw_link(&a.peers);
+    send(&conn, &hello(PROTOCOL, b.id)).await;
+    next(&mut conn).await.expect("a hello back");
+    changes.borrow_and_update();
+    send(
+        &conn,
+        &PeerMessage::FactoryRecords {
+            protocol: PROTOCOL,
+            records: vec![from_b],
+        },
+    )
+    .await;
+    assert!(
+        timeout(Duration::from_secs(3), changes.changed())
+            .await
+            .is_err(),
+        "a change was told for a record already held"
+    );
+    drop(conn);
+
+    // Nothing more happens, so nothing more is told.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    changes.borrow_and_update();
+    assert!(
+        timeout(Duration::from_secs(5), changes.changed())
+            .await
+            .is_err(),
+        "a change was told with nothing written"
+    );
+
+    write_factory(a, run_event(&run, "its own"));
+    timeout(Duration::from_secs(5), changes.changed())
+        .await
+        .expect("no change within 5 s of its own record")
+        .unwrap();
+}
+
+/// A run event of `run` whose output takes `bytes`.
+fn large_event(run: &RunId, event: &str, bytes: usize) -> FactoryBody {
+    let mut body = run_event(run, event);
+    if let FactoryBody::RunEvent(event) = &mut body {
+        event.data = serde_json::json!({ "output": "x".repeat(bytes) });
+    }
+    body
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_factory_catch_up_of_large_run_events_goes_in_messages_a_link_can_carry() {
+    let peer = MachineId::random();
+    let fleet = Fleet::start_with(1, &[peer]);
+    let a = &fleet.daemons[0];
+    let run = RunId::new("original-solutions/foundry", 132, 1).unwrap();
+    // Each event keeps a gate's 64 KB of output: a batch of them is far past what a WebSocket
+    // end takes in one message.
+    let total = 200;
+    for i in 0..total {
+        write_factory(a, large_event(&run, &format!("gate-{i}"), 64 * 1024));
+    }
+
+    let mut conn = raw_link(&a.peers);
+    send(&conn, &hello(PROTOCOL, peer)).await;
+    let mut received = Vec::new();
+    while received.len() < total {
+        let text = timeout(OFFLINE_AFTER * 2, conn.recv.recv())
+            .await
+            .expect("a message within the offline limit")
+            .expect("the link stays open");
+        let _ = conn.send.try_send(heartbeat());
+        let message: serde_json::Value = serde_json::from_str(&text).unwrap();
+        if message["type"] == "factory_records" {
+            assert!(
+                text.len() <= FACTORY_BATCH_BYTES + 1024,
+                "a message of {} bytes",
+                text.len()
+            );
+            // One message being written and one queued behind it cross a 70 KB a second path
+            // that a pair's two links share before the other end's silence limit ends them.
+            assert!(
+                2 * text.len() as u64 <= 70_000 * OFFLINE_AFTER.as_secs() / 2,
+                "two messages of {} bytes do not cross a shared slow path within {OFFLINE_AFTER:?}",
+                text.len()
+            );
+            received.extend(
+                factory_records_in(&[message])
+                    .into_iter()
+                    .map(|r| r.version),
+            );
+        }
+    }
+    assert_eq!(received, (1..=total as u64).collect::<Vec<_>>());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_factory_catch_up_goes_one_message_a_round_so_p1_records_go_between() {
+    let peer = MachineId::random();
+    let fleet = Fleet::start_with(1, &[peer]);
+    let a = &fleet.daemons[0];
+    let run = RunId::new("original-solutions/foundry", 132, 1).unwrap();
+    let total = BATCH * 2 + 1;
+    for i in 0..total {
+        write_factory(a, run_event(&run, &format!("step-{i}")));
+    }
+
+    let mut conn = raw_link(&a.peers);
+    send(&conn, &hello(PROTOCOL, peer)).await;
+    let mut received = 0;
+    let mut last = String::new();
+    while received < total {
+        let message = next(&mut conn).await.expect("the link stays open");
+        let _ = conn.send.try_send(heartbeat());
+        let kind = message["type"].as_str().unwrap().to_owned();
+        if kind == "factory_records" {
+            assert_ne!(
+                last, "factory_records",
+                "two factory messages in one round, with no P1 send between them"
+            );
+            received += message["records"].as_array().unwrap().len();
+        }
+        last = kind;
+    }
+    assert_eq!(received, total);
+}
+
+#[tokio::test(start_paused = true)]
+async fn after_a_factory_record_the_store_cannot_take_a_link_takes_no_more_factory_records_and_still_takes_p1_ones()
+ {
+    let peer = MachineId::random();
+    let fleet = Fleet::start_with(1, &[peer]);
+    let a = &fleet.daemons[0];
+    let run = RunId::new("original-solutions/foundry", 132, 1).unwrap();
+    let record = |version: u64, event: &str| FactoryRecord {
+        owner: peer,
+        version,
+        body: run_event(&run, event),
+    };
+    let ws = WorkspaceId::random();
+
+    let mut conn = raw_link(&a.peers);
+    send(&conn, &hello(PROTOCOL, peer)).await;
+    next(&mut conn).await.expect("a hello back");
+    // The store holds versions only up to i64::MAX, so the middle record cannot be stored.
+    send(
+        &conn,
+        &PeerMessage::FactoryRecords {
+            protocol: PROTOCOL,
+            records: vec![
+                record(1, "first"),
+                record(u64::MAX, "refused"),
+                record(2, "after"),
+            ],
+        },
+    )
+    .await;
+    send(
+        &conn,
+        &PeerMessage::FactoryRecords {
+            protocol: PROTOCOL,
+            records: vec![record(3, "later")],
+        },
+    )
+    .await;
+    send(
+        &conn,
+        &PeerMessage::Records {
+            protocol: PROTOCOL,
+            records: vec![workspace(ws, false)(peer, 1)],
+        },
+    )
+    .await;
+
+    assert!(
+        keep_talking(&mut conn, OFFLINE_AFTER * 2).await,
+        "the link stays open"
+    );
+    assert!(
+        a.peers.online().contains(&peer),
+        "a peer whose factory records are refused still shows online"
+    );
+    assert!(
+        a.held(|record: &AnyRecord| record.owner() == peer)
+            .is_some(),
+        "its P1 records are still taken"
+    );
+    let held: Vec<String> = lock(&a.store)
+        .run_events(&run)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.event)
+        .collect();
+    assert_eq!(
+        held,
+        ["first"],
+        "only the factory records before it are kept"
+    );
+
+    // The link ends a while later, so the next link's hello asks again from the factory record
+    // refused.
+    assert!(
+        !keep_talking(&mut conn, RETRY_REFUSED).await,
+        "the link ends to ask again"
+    );
+    let mut conn = raw_link(&a.peers);
+    send(&conn, &hello(PROTOCOL, peer)).await;
+    let back = next(&mut conn).await.expect("a hello back");
+    assert_eq!(
+        back["factory_versions"][peer.to_string()],
+        serde_json::json!(1),
+        "the next hello asks again from the factory record refused"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn after_a_factory_message_this_build_cannot_read_a_link_takes_no_more_factory_records_and_still_takes_p1_ones()
+ {
+    let peer = MachineId::random();
+    let fleet = Fleet::start_with(1, &[peer]);
+    let a = &fleet.daemons[0];
+    let run = RunId::new("original-solutions/foundry", 132, 1).unwrap();
+    let record = |version: u64, event: &str| FactoryRecord {
+        owner: peer,
+        version,
+        body: run_event(&run, event),
+    };
+
+    let mut conn = raw_link(&a.peers);
+    send(&conn, &hello(PROTOCOL, peer)).await;
+    next(&mut conn).await.expect("a hello back");
+    send(
+        &conn,
+        &PeerMessage::FactoryRecords {
+            protocol: PROTOCOL,
+            records: vec![record(1, "first")],
+        },
+    )
+    .await;
+    // A newer build that still speaks this protocol sends a factory record of a kind this build
+    // does not know, so the message cannot be read.
+    let mut unreadable = serde_json::to_value(PeerMessage::FactoryRecords {
+        protocol: PROTOCOL,
+        records: vec![record(2, "unknown")],
+    })
+    .unwrap();
+    unreadable["records"][0]["kind"] = serde_json::json!("lease_note");
+    conn.send.send(unreadable.to_string()).await.unwrap();
+    send(
+        &conn,
+        &PeerMessage::FactoryRecords {
+            protocol: PROTOCOL,
+            records: vec![record(3, "later")],
+        },
+    )
+    .await;
+    send(
+        &conn,
+        &PeerMessage::Records {
+            protocol: PROTOCOL,
+            records: vec![workspace(WorkspaceId::random(), false)(peer, 1)],
+        },
+    )
+    .await;
+
+    assert!(
+        keep_talking(&mut conn, OFFLINE_AFTER * 2).await,
+        "the link stays open"
+    );
+    assert!(
+        a.peers.online().contains(&peer),
+        "a peer whose factory message cannot be read still shows online"
+    );
+    assert!(
+        a.held(|record: &AnyRecord| record.owner() == peer)
+            .is_some(),
+        "its P1 records are still taken"
+    );
+    assert_eq!(
+        lock(&a.store).factory_versions().unwrap(),
+        BTreeMap::from([(peer, 1)]),
+        "no factory record after the unreadable message is taken"
+    );
+    assert!(
+        !keep_talking(&mut conn, RETRY_REFUSED).await,
+        "the link ends to ask again"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn after_a_p1_record_the_store_cannot_take_a_link_takes_no_factory_record_either_and_the_peer_shows_offline()
+ {
+    let peer = MachineId::random();
+    let fleet = Fleet::start_with(1, &[peer]);
+    let a = &fleet.daemons[0];
+    let run = RunId::new("original-solutions/foundry", 132, 1).unwrap();
+
+    let mut conn = raw_link(&a.peers);
+    send(&conn, &hello(PROTOCOL, peer)).await;
+    next(&mut conn).await.expect("a hello back");
+    // The store holds versions only up to i64::MAX, so the P1 record cannot be stored.
+    send(
+        &conn,
+        &PeerMessage::Records {
+            protocol: PROTOCOL,
+            records: vec![workspace(WorkspaceId::random(), false)(peer, u64::MAX)],
+        },
+    )
+    .await;
+    send(
+        &conn,
+        &PeerMessage::FactoryRecords {
+            protocol: PROTOCOL,
+            records: vec![FactoryRecord {
+                owner: peer,
+                version: 1,
+                body: run_event(&run, "after"),
+            }],
+        },
+    )
+    .await;
+
+    assert!(
+        keep_talking(&mut conn, OFFLINE_AFTER * 2).await,
+        "the link stays open"
+    );
+    assert!(
+        !a.peers.online().contains(&peer),
+        "a peer whose P1 records are refused shows offline"
+    );
+    assert_eq!(
+        lock(&a.store).factory_versions().unwrap(),
+        BTreeMap::new(),
+        "no factory record is taken after a refused P1 record"
+    );
+    assert!(
+        !keep_talking(&mut conn, RETRY_REFUSED).await,
+        "the refusing link ends"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_machine_with_an_unreadable_factory_record_of_its_own_stays_online_and_sends_p1_records()
+{
+    let fleet = Fleet::start(2);
+    let (a, b) = (&fleet.daemons[0], &fleet.daemons[1]);
+    let run = RunId::new("original-solutions/foundry", 132, 1).unwrap();
+    write_factory(a, run_event(&run, "claimed"));
+    until(Duration::from_secs(10), "first factory sync", || {
+        lock(&b.store).run_events(&run).unwrap().len() == 1
+    })
+    .await;
+
+    // A row a newer build wrote, of a kind this build does not know, then rolled back.
+    let written = write_factory(a, run_event(&run, "launched"));
+    let mut row = serde_json::to_value(&written).unwrap();
+    row["kind"] = serde_json::json!("dream");
+    let db = rusqlite::Connection::open(&a.db).unwrap();
+    let changed = db
+        .execute(
+            "UPDATE factory_records SET record = ?1 WHERE owner = ?2 AND version = ?3",
+            rusqlite::params![row.to_string(), a.id.to_string(), written.version as i64],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+    let mut changes = a.peers.factory_changes();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    changes.borrow_and_update();
+
+    // A link opened now stays open: the unreadable row closes nothing.
+    let watcher = MachineId::random();
+    let mut fleet_settings = a.settings();
+    fleet_settings.seq += 1;
+    fleet_settings.machines.push(Machine {
+        id: watcher,
+        name: "watcher".into(),
+        address: "100.64.0.9".into(),
+        key: String::new(),
+    });
+    a.set_settings(fleet_settings);
+    let mut conn = raw_link(&a.peers);
+    let p1_held = lock(&a.store).versions().unwrap();
+    send(
+        &conn,
+        &hello_factory(PROTOCOL, watcher, p1_held, [(a.id, 1)].into()),
+    )
+    .await;
+
+    let ids = Ids::random();
+    let start = Instant::now();
+    let mut wrote = false;
+    let mut messages = Vec::new();
+    while start.elapsed() < OFFLINE_AFTER * 4 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _ = conn.send.try_send(heartbeat());
+        while let Ok(text) = conn.recv.try_recv() {
+            messages.push(serde_json::from_str::<serde_json::Value>(&text).unwrap());
+        }
+        assert!(
+            !conn.recv.is_closed(),
+            "a link of a's closed over its unreadable factory row"
+        );
+        assert!(
+            b.peers.online().contains(&a.id),
+            "a is offline on b {:?} after its factory row became unreadable",
+            start.elapsed()
+        );
+        if !wrote && start.elapsed() > OFFLINE_AFTER {
+            a.write(workspace(ids.workspace, false));
+            wrote = true;
+        }
+    }
+    let is_it = |record: &AnyRecord| matches!(record, AnyRecord::Workspace(w) if w.body.id == ids.workspace);
+    assert!(
+        b.held(is_it).is_some(),
+        "a's P1 record did not reach b past its unreadable factory row"
+    );
+    messages.extend(messages_for(&mut conn, Duration::from_secs(3)).await);
+    assert!(
+        messages.iter().any(|m| m["type"] == "records"
+            && m["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["body"]["id"] == ids.workspace.to_string())),
+        "a's P1 record did not reach a link opened past its unreadable factory row"
+    );
+    assert!(
+        factory_records_in(&messages).is_empty(),
+        "the unreadable row, or one above it, was sent"
+    );
+    assert!(
+        keep_talking(&mut conn, OFFLINE_AFTER * 2).await,
+        "a link of a's closed over its unreadable factory row"
+    );
+
+    // Its own factory writes are still told past the unreadable row.
+    changes.borrow_and_update();
+    write_factory(a, run_event(&run, "gated"));
+    timeout(Duration::from_secs(5), changes.changed())
+        .await
+        .expect("an own factory write past an unreadable row was not told")
+        .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_p1_record_written_during_a_factory_catch_up_waits_behind_at_most_one_factory_message() {
+    let peer = MachineId::random();
+    let fleet = Fleet::start_with(1, &[peer]);
+    let a = &fleet.daemons[0];
+    let run = RunId::new("original-solutions/foundry", 132, 1).unwrap();
+    // About a dozen messages of gate output.
+    for i in 0..200 {
+        write_factory(a, large_event(&run, &format!("gate-{i}"), 64 * 1024));
+    }
+
+    // The peer takes a message every 200 ms: slower than a can queue them.
+    let mut conn = raw_link(&a.peers);
+    send(&conn, &hello(PROTOCOL, peer)).await;
+    let ids = Ids::random();
+    let mut written = false;
+    let mut ahead = 0;
+    loop {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let text = timeout(OFFLINE_AFTER, conn.recv.recv())
+            .await
+            .expect("a message within the offline limit")
+            .expect("the link stays open");
+        let _ = conn.send.try_send(heartbeat());
+        let message: serde_json::Value = serde_json::from_str(&text).unwrap();
+        match message["type"].as_str().unwrap() {
+            "factory_records" if written => ahead += 1,
+            "factory_records" => {
+                a.write(workspace(ids.workspace, false));
+                written = true;
+            }
+            "records"
+                if message["records"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r["body"]["id"] == ids.workspace.to_string()) =>
+            {
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        ahead <= 1,
+        "the P1 record waited behind {ahead} factory messages"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_factory_catch_up_of_several_batches_goes_without_waiting_a_tick_between_messages() {
+    let peer = MachineId::random();
+    let fleet = Fleet::start_with(1, &[peer]);
+    let a = &fleet.daemons[0];
+    let run = RunId::new("original-solutions/foundry", 132, 1).unwrap();
+    // Two batches, the first too large for one message.
+    let total = BATCH + 100;
+    for i in 0..total {
+        write_factory(a, large_event(&run, &format!("step-{i}"), 4 * 1024));
+    }
+
+    let mut conn = raw_link(&a.peers);
+    send(&conn, &hello(PROTOCOL, peer)).await;
+    let mut received = 0;
+    let mut started = None;
+    while received < total {
+        let message = next(&mut conn).await.expect("the link stays open");
+        let _ = conn.send.try_send(heartbeat());
+        if message["type"] == "factory_records" {
+            started.get_or_insert_with(Instant::now);
+            received += message["records"].as_array().unwrap().len();
+        }
+    }
+    let took = started.unwrap().elapsed();
+    assert!(
+        took < Duration::from_secs(1),
+        "the catch-up waited between messages: {took:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn over_a_slow_link_a_factory_catch_up_keeps_p1_records_behind_at_most_one_factory_message() {
+    let peer = MachineId::random();
+    let fleet = Fleet::start_with(1, &[peer]);
+    let a = &fleet.daemons[0];
+    let run = RunId::new("original-solutions/foundry", 132, 1).unwrap();
+    let total = 40;
+    for i in 0..total {
+        write_factory(a, large_event(&run, &format!("gate-{i}"), 64 * 1024));
+    }
+
+    // The peer's end works as a socket writer does: it takes each message off the link's queue
+    // at once, then spends the message's time on a 70 KB a second wire before it takes another.
+    let mut conn = raw_link(&a.peers);
+    send(&conn, &hello(PROTOCOL, peer)).await;
+    let ids = Ids::random();
+    let (mut written, mut arrived) = (false, false);
+    let (mut ahead, mut received) = (0, 0);
+    let (mut others, mut factory_messages) = (0, 0);
+    let start = Instant::now();
+    while received < total || !arrived {
+        let text = timeout(OFFLINE_AFTER, conn.recv.recv())
+            .await
+            .expect("a message within the offline limit")
+            .expect("the link stays open");
+        let _ = conn.send.try_send(heartbeat());
+        let message: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let wire = Duration::from_secs_f64(text.len() as f64 / 70_000.0);
+        if message["type"] == "factory_records" {
+            factory_messages += 1;
+            received += message["records"].as_array().unwrap().len();
+            if written && !arrived {
+                ahead += 1;
+            } else if factory_messages == 2 {
+                // Written while the writer is busy with a message and rounds run on the tick.
+                tokio::time::sleep(wire / 2).await;
+                a.write(workspace(ids.workspace, false));
+                written = true;
+                tokio::time::sleep(wire / 2).await;
+                continue;
+            }
+        } else {
+            others += 1;
+            arrived |= message["type"] == "records"
+                && message["records"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r["body"]["id"] == ids.workspace.to_string());
+        }
+        tokio::time::sleep(wire).await;
+    }
+    assert_eq!(received, total, "every factory record arrived");
+    // A round a tick, and one more each time the writer takes a factory message: not a round
+    // each time the queue empties.
+    assert!(
+        others as u64 <= start.elapsed().as_secs() + factory_messages + 5,
+        "{others} other messages with {factory_messages} factory messages in {:?}",
+        start.elapsed()
+    );
+    assert!(
+        ahead <= 1,
+        "the P1 record waited behind {ahead} factory messages besides the one being written"
+    );
+}
+
+/// Makes the factory row of `owner`'s `version` on `daemon` one this build cannot read back:
+/// its owner is not a machine id.
+fn spoil_owner(daemon: &Daemon, owner: MachineId, version: u64) {
+    let db = rusqlite::Connection::open(&daemon.db).unwrap();
+    let changed = db
+        .execute(
+            "UPDATE factory_records SET owner = 'not a machine' WHERE owner = ?1 AND version = ?2",
+            rusqlite::params![owner.to_string(), version as i64],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_factory_row_of_another_owner_that_cannot_be_read_does_not_stop_factory_changes_for_own_writes()
+ {
+    let mut fleet = Fleet::start(2);
+    let run = RunId::new("original-solutions/foundry", 132, 1).unwrap();
+    let (a_id, b_id) = (fleet.daemons[0].id, fleet.daemons[1].id);
+    let from_b = write_factory(&fleet.daemons[1], run_event(&run, "from b"));
+    until(Duration::from_secs(10), "factory sync", || {
+        lock(&fleet.daemons[0].store)
+            .run_events(&run)
+            .unwrap()
+            .len()
+            == 1
+    })
+    .await;
+    spoil_owner(&fleet.daemons[0], b_id, from_b.version);
+
+    let a = &fleet.daemons[0];
+    let mut changes = a.peers.factory_changes();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    changes.borrow_and_update();
+    write_factory(a, run_event(&run, "own, while running"));
+    timeout(Duration::from_secs(5), changes.changed())
+        .await
+        .expect("an own write was not told past another owner's unreadable row")
+        .unwrap();
+
+    // So too after a restart, with the row there from the start.
+    fleet.restart(0).await;
+    let a = &fleet.daemons[0];
+    assert_eq!(a.id, a_id);
+    let mut changes = a.peers.factory_changes();
+    changes.borrow_and_update();
+    // What it held when it started is not told.
+    assert!(
+        timeout(Duration::from_secs(3), changes.changed())
+            .await
+            .is_err(),
+        "after a restart, records already held were told"
+    );
+    write_factory(a, run_event(&run, "own, after a restart"));
+    timeout(Duration::from_secs(5), changes.changed())
+        .await
+        .expect("after a restart, an own write was not told past another owner's unreadable row")
+        .unwrap();
 }

@@ -32,6 +32,11 @@
 //! Sending stops at the highest version sent, so a machine's own records must be stored in
 //! the order of their versions: a writer takes [`Store::own_next_version`] and applies the
 //! record while holding the store's lock once.
+//!
+//! A link whose two ends speak protocol 5 also carries factory records, on a cursor of their
+//! own and under the same owner and version rules ([`factory`]). A link in an older protocol
+//! carries none. A factory record this machine refuses stops only the factory records on that
+//! link: the peer's P1 records are still taken, and it still shows online.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -46,7 +51,7 @@ use foundry_proto::record::AnyRecord;
 use foundry_proto::settings::{Edit, EditId, Machine, Outcome};
 use foundry_proto::state::{SessionState, TerminalState};
 use futures::future::BoxFuture;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
@@ -66,6 +71,10 @@ pub const OFFLINE_AFTER: Duration = Duration::from_secs(15);
 /// How often a link sends this machine's new records. An empty send is the heartbeat that
 /// keeps the machine online on the other end.
 const TICK: Duration = Duration::from_secs(1);
+
+/// How often a link, or the watch on this machine's own factory records, repeats the warning
+/// that this machine's records cannot be read.
+const WARN_EVERY: Duration = Duration::from_secs(60);
 
 /// How long a link that refused a peer's message stays open before it ends, so the next link's
 /// hello asks again for everything past what is stored. A record that can never be stored
@@ -159,6 +168,8 @@ struct Inner {
     /// Each open record link past its hellos, by peer and link number.
     links: Mutex<BTreeMap<MachineId, BTreeMap<u64, Link>>>,
     next_link: AtomicU64,
+    /// Rises each time a factory record is stored: see [`Peers::factory_changes`].
+    factory_changed: watch::Sender<u64>,
 }
 
 impl Peers {
@@ -175,6 +186,7 @@ impl Peers {
                 coordinator: Mutex::new(None),
                 links: Mutex::new(BTreeMap::new()),
                 next_link: AtomicU64::new(0),
+                factory_changed: watch::Sender::new(0),
             }),
         }
     }
@@ -183,7 +195,18 @@ impl Peers {
     /// ends, until the returned future is dropped. A machine added to the list is dialed
     /// within [`REDIAL`]. A machine removed from it is no longer dialed, and every link to it,
     /// dialed or served, closes within a second.
+    ///
+    /// While it runs, it also tells [`Peers::factory_changes`] of the factory records this
+    /// machine writes itself.
     pub async fn run(&self) {
+        tokio::select! {
+            () = self.keep_linked() => {}
+            () = factory::watch_own(&self.inner) => {}
+        }
+    }
+
+    /// The link-keeping half of [`Peers::run`].
+    async fn keep_linked(&self) {
         let mut links: BTreeMap<MachineId, (Machine, Task)> = BTreeMap::new();
         let mut last_seq: Option<u64> = None;
         let mut every = tokio::time::interval(REDIAL);
@@ -304,6 +327,13 @@ impl Peers {
             }
         }
         Err(unsent)
+    }
+
+    /// A value that rises each time this machine stores a factory record: at once for one
+    /// taken from a peer, and within a second for one of its own while [`Peers::run`] runs.
+    /// The number itself means nothing; a reader waits for it to change, then reads the store.
+    pub fn factory_changes(&self) -> watch::Receiver<u64> {
+        self.inner.factory_changed.subscribe()
     }
 
     /// Whether record link `link` to `machine`, as [`Peers::send_edit`] numbered it, is still
@@ -486,6 +516,11 @@ impl Drop for Opened<'_> {
             }
         }
     }
+}
+
+/// Tells the readers of [`Peers::factory_changes`] that a factory record was stored.
+fn tell(changed: &watch::Sender<u64>) {
+    changed.send_modify(|n| *n = n.wrapping_add(1));
 }
 
 /// `record` as a machine shows it: a session or terminal whose owner is offline is

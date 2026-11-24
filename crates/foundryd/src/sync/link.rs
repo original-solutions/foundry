@@ -18,6 +18,13 @@
 //! sent goes to the coordinator that waits for it; with none set they are ignored. A link in
 //! protocol 4 or later ([`foundry_proto::messages::ANSWERS_SINCE`]) carries an edit's id and its
 //! answer; an older one carries neither.
+//!
+//! A link in protocol 5 or later ([`foundry_proto::messages::FACTORY_SINCE`]) also carries
+//! factory records ([`super::factory`]): each hello names the factory versions it holds, and
+//! each round sends this machine's new factory records after its P1 records, on a cursor of
+//! their own. An older link carries none, and its P1 catch-up is as it was.
+
+use std::time::Duration;
 
 use foundry_proto::ids::MachineId;
 use foundry_proto::messages::{EDITS_SINCE, PROTOCOL, PeerMessage};
@@ -26,13 +33,8 @@ use serde::Serialize;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{Instant, timeout, timeout_at};
 
-use std::collections::BTreeMap;
-use std::time::Duration;
-
-use super::{BATCH, Conn, Inner, OFFLINE_AFTER, RETRY_REFUSED, TICK, on_store};
-
-/// How often a link repeats the warning that this machine's records cannot be read.
-const WARN_EVERY: Duration = Duration::from_secs(60);
+use super::factory::{self, Cursor, Sent};
+use super::{BATCH, Conn, Inner, OFFLINE_AFTER, RETRY_REFUSED, TICK, WARN_EVERY, on_store};
 
 /// Runs a link until it closes, the peer is silent for [`OFFLINE_AFTER`], the peer is not (or
 /// is no longer) one this machine links with ([`links_with`]: it is listed, or this machine's
@@ -61,14 +63,18 @@ pub(super) async fn run(
 /// links with ([`links_with`]: it is listed, or this machine's list holds no machine but
 /// itself) or stops taking them. Changed settings go first in each round, so a peer just removed
 /// from the list is sent the copy that removed it before its link closes, and holds its own
-/// removal.
+/// removal. New factory records go last, on a link that carries them, one message a round and
+/// only into an empty queue; while more of them wait, the next round starts as soon as the
+/// writer has taken everything queued.
 async fn sending(inner: &Inner, send: &Sender<String>, open: &Open) {
     let mut sent = open.sent;
+    let mut factory_sent = Cursor::new(open.factory_sent);
     let mut settings_sent: Option<u64> = None;
     let mut warned: Option<Instant> = None;
     let mut every = tokio::time::interval(TICK);
     loop {
         every.tick().await;
+        let room = empty(send);
         if !send_settings(inner, send, open, &mut settings_sent).await {
             return;
         }
@@ -79,8 +85,40 @@ async fn sending(inner: &Inner, send: &Sender<String>, open: &Open) {
         if !send_own(inner, send, open, &mut sent, &mut warned).await {
             return;
         }
+        match factory::send_own(inner, send, open.peer, open.speak, &mut factory_sent, room).await {
+            Sent::Closed => return,
+            Sent::More if drained(send).await => every.reset_immediately(),
+            Sent::More | Sent::Done => {}
+        }
     }
 }
+
+/// Whether this end's writer has taken everything queued on `send`. It may still be writing
+/// the last message it took.
+fn empty(send: &Sender<String>) -> bool {
+    send.capacity() == send.max_capacity()
+}
+
+/// Waits until this end's writer has taken everything queued on `send` ([`empty`]), for at most
+/// a [`TICK`], and says whether it did.
+async fn drained(send: &Sender<String>) -> bool {
+    let start = Instant::now();
+    loop {
+        if send.is_closed() {
+            return false;
+        }
+        if empty(send) {
+            return true;
+        }
+        if start.elapsed() >= TICK {
+            return false;
+        }
+        tokio::time::sleep(DRAIN_POLL).await;
+    }
+}
+
+/// How often [`drained`] looks at a link's queue.
+const DRAIN_POLL: Duration = Duration::from_millis(10);
 
 /// Sends the shared settings this machine holds when a coordinator is set, the link speaks
 /// [`EDITS_SINCE`] or later, and their `seq` is not the one last sent on this link (`last`),
@@ -127,8 +165,15 @@ async fn send_settings(
 /// resent once per link rather than once a second. Shared settings, edits and answers do not
 /// depend on records, so a refused link still takes them: an edit sent on it is still numbered,
 /// and the answer to one still arrives.
+///
+/// Factory records are refused apart ([`factory::take`]): after a factory record the store
+/// refuses, or a factory message this build cannot read, the link takes no more factory records
+/// from the peer, so the store keeps a prefix of them, but it goes on taking everything else
+/// and counting the peer as heard. It ends [`RETRY_REFUSED`] later all the same, so the next
+/// link's hello asks again for the factory records past that prefix.
 async fn reading(inner: &Inner, recv: &mut Receiver<String>, peer: MachineId, speak: u16) {
     let mut refused: Option<Instant> = None;
+    let mut factory_refused: Option<Instant> = None;
     loop {
         let text = match timeout(OFFLINE_AFTER, recv.recv()).await {
             Ok(Some(text)) => text,
@@ -155,7 +200,33 @@ async fn reading(inner: &Inner, recv: &mut Receiver<String>, peer: MachineId, sp
             }
             continue;
         }
-        match receive(inner, peer, speak, &text).await {
+        let taken = match serde_json::from_str::<PeerMessage>(&text) {
+            Ok(PeerMessage::FactoryRecords { records, .. }) => {
+                if factory_refused.is_none()
+                    && let Err(error) = factory::take(inner, peer, speak, records).await
+                {
+                    factory_refused = Some(refuse_factory(peer, &error));
+                }
+                Ok(())
+            }
+            Ok(message) => take(inner, peer, speak, message).await,
+            // A factory message this build cannot read, such as one holding a kind a newer
+            // build writes, is refused as a factory record the store refuses is. On a link that
+            // carries no factory record it is dropped, as one that can be read is.
+            Err(error) if factory::is_message(&text) => {
+                if factory::carried(speak) {
+                    factory_refused.get_or_insert_with(|| {
+                        refuse_factory(
+                            peer,
+                            &format!("a factory message from {peer} could not be read: {error}"),
+                        )
+                    });
+                }
+                Ok(())
+            }
+            Err(error) => Err(format!("a message from {peer} could not be read: {error}")),
+        };
+        match taken {
             Ok(()) => inner.heard_from(peer),
             Err(error) => {
                 tracing::warn!(
@@ -166,7 +237,23 @@ async fn reading(inner: &Inner, recv: &mut Receiver<String>, peer: MachineId, sp
                 refused = Some(Instant::now());
             }
         }
+        if refused.is_none() && factory_refused.is_some_and(|at| at.elapsed() >= RETRY_REFUSED) {
+            tracing::info!(
+                "sync: link to {peer} closed to ask again for the factory records it refused"
+            );
+            return;
+        }
     }
+}
+
+/// Says that no more factory records are taken from `peer` on this link after `error`, and
+/// gives the moment they stopped.
+fn refuse_factory(peer: MachineId, error: &str) -> Instant {
+    tracing::warn!(
+        "sync: {error}; no more factory records are taken from {peer} on this link, which \
+         closes in {RETRY_REFUSED:?} to ask again"
+    );
+    Instant::now()
 }
 
 /// Sends this machine's records above `sent`, reading and sending one message of at most
@@ -237,6 +324,9 @@ struct Open {
     speak: u16,
     /// The highest version of this machine's records the peer holds.
     sent: u64,
+    /// The highest version of this machine's factory records the peer holds: none on a link
+    /// that carries no factory record.
+    factory_sent: u64,
 }
 
 /// Exchanges hellos, and refuses a peer that is not in the machine list ([`links_with`]), is
@@ -272,7 +362,7 @@ async fn hello(
         protocol,
         machine,
         versions,
-        ..
+        factory_versions,
     }) = first
     else {
         tracing::warn!("sync: a link opened without a hello");
@@ -294,17 +384,24 @@ async fn hello(
         peer: machine,
         speak,
         sent: versions.get(&inner.me).copied().unwrap_or(0),
+        factory_sent: if factory::carried(speak) {
+            factory_versions.get(&inner.me).copied().unwrap_or(0)
+        } else {
+            0
+        },
     })
 }
 
+/// This machine's hello in `protocol`: the P1 versions it holds, and the factory versions when
+/// the protocol carries factory records. A dialing end says hello in this build's protocol
+/// before it knows the peer's, so an older peer is sent factory versions it does not read.
 async fn own_hello(inner: &Inner, protocol: u16) -> Option<PeerMessage> {
     match on_store(&inner.store, |store| store.versions()).await {
         Ok(versions) => Some(PeerMessage::Hello {
             protocol,
             machine: inner.me,
             versions,
-            // Factory records are not kept yet, so this machine holds none.
-            factory_versions: BTreeMap::new(),
+            factory_versions: factory::versions(inner, protocol).await,
         }),
         Err(error) => {
             tracing::warn!("sync: cannot read the versions held: {error}");
@@ -390,21 +487,12 @@ pub(super) async fn send_text(send: &Sender<String>, text: String) -> bool {
     matches!(timeout(OFFLINE_AFTER, send.send(text)).await, Ok(Ok(())))
 }
 
-/// Takes the records in a message from `peer`, each only if `peer` owns it and it is newer.
-/// A message that cannot be read, or a record that cannot be stored, is an error, and nothing
-/// after it is taken: the store then holds a prefix of the peer's records.
+/// Takes one message from `peer`, which sent it on a link in protocol `speak`: the records in
+/// it, each only if `peer` owns it and it is newer. A record that cannot be stored is an error,
+/// and nothing after it is taken: the store then holds a prefix of the peer's records.
 ///
 /// Shared settings are merged by the coordinator, an edit is handed to it to number or pass
 /// on, and an answer to the edit it waits on; with no coordinator set all three are ignored.
-async fn receive(inner: &Inner, peer: MachineId, speak: u16, text: &str) -> Result<(), String> {
-    match serde_json::from_str::<PeerMessage>(text) {
-        Ok(message) => take(inner, peer, speak, message).await,
-        Err(error) => Err(format!("a message from {peer} could not be read: {error}")),
-    }
-}
-
-/// Takes one message from `peer`, which sent it on a link in protocol `speak`, as [`receive`]
-/// says.
 async fn take(
     inner: &Inner,
     peer: MachineId,
@@ -438,8 +526,8 @@ async fn take(
         PeerMessage::Hello { .. } | PeerMessage::Relay { .. } | PeerMessage::Call { .. } => {
             return Ok(());
         }
-        // Factory records are not kept yet: one that arrives is dropped, and the hello says
-        // this machine holds none, so a peer sends them again once they are.
+        // `reading` takes factory records itself, so that one refused stops only the factory
+        // records on the link; none reaches this point.
         PeerMessage::FactoryRecords { .. } => return Ok(()),
     };
     on_store(&inner.store, move |store| {
@@ -460,6 +548,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::io;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use foundry_proto::settings::Machine;
     use futures::future::BoxFuture;
