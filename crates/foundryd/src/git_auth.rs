@@ -205,11 +205,12 @@ impl fmt::Debug for GitAuth {
 /// Writes [`SCRIPT`] to `path` in `dir`, 0700, unless a regular file with that mode and
 /// content is there already. A new script goes to a file of its own in `dir` first and is
 /// renamed over `path`, so a git call running the old one never sees half of it, and a symlink
-/// at `path` is replaced, never followed.
+/// at `path` is replaced, never written through.
 fn write_askpass(dir: &Path, path: &Path) -> io::Result<()> {
-    if let Ok(meta) = fs::symlink_metadata(path)
-        && meta.file_type().is_file()
-        && meta.permissions().mode() & 0o7777 == 0o700
+    // The mode and content are those of the file `path` leads to, and the type is that of
+    // `path` itself, so a link to a good copy, whatever the link's own mode, is replaced.
+    if fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file())
+        && fs::metadata(path).is_ok_and(|meta| meta.permissions().mode() & 0o7777 == 0o700)
         && fs::read(path).is_ok_and(|held| held == SCRIPT.as_bytes())
     {
         return Ok(());
