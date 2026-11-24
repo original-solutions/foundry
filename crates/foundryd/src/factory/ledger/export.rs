@@ -7,16 +7,18 @@
 //! as [`runner_line`] writes it, with the runner's keys in the runner's order. The generation
 //! is not written: the runner's lines have none.
 //!
-//! The export never writes the store. It reads a copy: one read of the store, through a
-//! connection that cannot write, copies it beside the store, and only the copy is opened as a
-//! [`Store`]. Opening a store brings its schema up to this build's, so a store an older daemon
-//! still runs on is never moved on under it, and every run is read from the same moment. The
-//! copy holds all the store does, so it stays in the data directory with the store, never in
-//! the export's directory, and is removed when the export ends.
+//! The export changes nothing the store holds. It reads a copy: one read of the store copies it
+//! into a database in this process's memory, and only the copy is opened as a [`Store`]. Opening
+//! a store brings its schema up to this build's, so a store an older daemon still runs on is
+//! never moved on under it, and every run is read from the same moment. The copy holds all the
+//! store does, so it is never written to a file, and goes when the export ends, however it ends.
+//! The store is opened as the daemon opens it, so a write a killed daemon left unfinished is
+//! rolled back first, as the daemon's next start would roll it back; that is the only write the
+//! export can cause there.
 //!
-//! Each run's file is written whole beside its place, synced and then moved into it, so a
-//! `retro` reading the folder meanwhile never finds half a run. Files in `runs/` that are not a
-//! run of this store are left as they are.
+//! Each run's file is written whole into a new file of this process beside its place, synced and
+//! then moved into it, so a `retro` reading the folder meanwhile never finds half a run. Files in
+//! `runs/` that are not a run of this store are left as they are.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -43,14 +45,12 @@ pub enum ExportError {
     Store(#[from] StoreError),
     #[error("copying the store: {0}")]
     Copy(#[from] rusqlite::Error),
-    #[error("copying the store: the data directory {} is not UTF-8", .0.display())]
-    NotUtf8(PathBuf),
     #[error("writing {}: {source}", path.display())]
     Write { path: PathBuf, source: io::Error },
 }
 
 /// `foundryd factory export <dir>`: writes every run this machine's store holds into `dir`.
-/// The store is read from a copy and never written. A machine with no store yet holds no run:
+/// The store is read from a copy in memory. A machine with no store yet holds no run:
 /// `dir/runs` is made empty, and no store is made.
 pub fn command(dir: &Path) -> ExitCode {
     let Some(home) = crate::daemon::home() else {
@@ -96,41 +96,27 @@ pub fn export(store: &Store, dir: &Path) -> Result<usize, ExportError> {
     Ok(runs.len())
 }
 
-/// Exports the store at `live` into `dir` from a copy of it made beside it, which is removed
-/// again.
+/// The database the store is copied into. SQLite's `memdb` file system shares a database whose
+/// name starts with `/` among the connections of one process while one of them is open, so the
+/// copy and the [`Store`] opened on it are one database, in memory, that no other process sees.
+const COPY: &str = "file:/foundryd-export?vfs=memdb";
+
+/// Exports the store at `live` into `dir` from a copy of it in memory.
 fn export_copy(live: &Path, dir: &Path) -> Result<usize, ExportError> {
-    let beside = live.parent().unwrap_or(Path::new(""));
-    let copy = StoreCopy(beside.join(format!(".export-{}.sqlite", std::process::id())));
-    // A copy left by an earlier export that was killed, under the same process id: the copy
-    // below is refused into a file that is not empty.
-    copy.remove();
-    let target = copy
-        .0
-        .to_str()
-        .ok_or_else(|| ExportError::NotUtf8(beside.to_owned()))?;
-    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    Connection::open_with_flags(live, flags)?.execute("VACUUM INTO ?1", [target])?;
-    let store = Store::open(&copy.0)?;
-    export(&store, dir)
-}
-
-/// A copy of the store, removed with whatever SQLite left beside it when dropped.
-struct StoreCopy(PathBuf);
-
-impl StoreCopy {
-    fn remove(&self) {
-        let mut journal = self.0.clone().into_os_string();
-        journal.push("-journal");
-        // Best effort: a copy that cannot be removed holds nothing the store does not.
-        let _ = fs::remove_file(&self.0);
-        let _ = fs::remove_file(journal);
-    }
-}
-
-impl Drop for StoreCopy {
-    fn drop(&mut self) {
-        self.remove();
-    }
+    // Opened first and held to the end: the copy lives while a connection holds it.
+    let held = Connection::open(COPY)?;
+    // Read and write, as the daemon opens the store, so the journal of a killed daemon's write is
+    // rolled back rather than refusing the read; never create, so a store gone meanwhile is not
+    // made; URI names, so the copy's name is read as one.
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | OpenFlags::SQLITE_OPEN_URI;
+    Connection::open_with_flags(live, flags)?.execute("VACUUM INTO ?1", [COPY])?;
+    let store = Store::open(COPY)?;
+    let written = export(&store, dir);
+    drop(store);
+    drop(held);
+    written
 }
 
 /// Every run that `store` holds an event of, from any writer, once each, in order. Each
@@ -162,8 +148,11 @@ fn make_dir(dir: &Path) -> Result<(), ExportError> {
     })
 }
 
-/// Writes `text` as `dir/name`: whole into a file of this process beside it first, synced, then
-/// moved into place, so the file is either as it was or all of `text`.
+/// Writes `text` as `dir/name`: whole into a new file of this process beside it first, synced,
+/// then moved into place, so the file is either as it was or all of `text`.
+///
+/// The part file is made new, never opened through whatever already has its name: that is
+/// removed first, so a link planted there is not written through.
 fn write_whole(dir: &Path, name: &str, text: &str) -> Result<(), ExportError> {
     let path = dir.join(name);
     let part = dir.join(format!(".{name}.{}.part", std::process::id()));
@@ -171,7 +160,14 @@ fn write_whole(dir: &Path, name: &str, text: &str) -> Result<(), ExportError> {
         path: path.clone(),
         source,
     };
-    let written = fs::File::create(&part)
+    match fs::remove_file(&part) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(failed(error)),
+        _ => {}
+    }
+    let written = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&part)
         .and_then(|mut file| {
             file.write_all(text.as_bytes())?;
             file.sync_all()
