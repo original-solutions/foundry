@@ -2,7 +2,9 @@
 //!
 //! An item is not stored. It is read from what holds now, so it is raised as soon as its rule
 //! holds and cleared as soon as it no longer does. The UI polls the list, so a read loads only
-//! the records written since the read before it, never the whole store again:
+//! the records written since the read before it, never the whole store again. The factory
+//! statuses are the exception: each read takes the ones held in full, which is one row per
+//! project and writing machine:
 //!
 //! | Item | Raised while | Read from |
 //! |---|---|---|
@@ -18,7 +20,7 @@
 //! | Gateway unhealthy | this machine's read of the gateway fails | [`crate::gateway`] |
 //! | Run stuck | the believed status lists a stuck run | the factory statuses |
 //! | Run needs info | the believed status lists a run that asked questions | the factory statuses |
-//! | Factory idle | the believed status gives a reason, or for [`IDLE_AFTER`] this machine has neither held the lease nor heard from its holder | the factory statuses and [`Freshness`] |
+//! | Factory idle | the believed status gives a reason, or for [`IDLE_AFTER`] since it saw the factory on this machine has neither held the lease nor heard from its holder | the factory statuses and [`Quiet`] |
 //! | Foreign claim | the believed status lists an issue claimed by something other than Foundry | the factory statuses |
 //! | Gate infra | the believed status lists a run whose gate could not run at all | the factory statuses |
 //!
@@ -28,11 +30,15 @@
 //! offline" item stands. Another module adds rows through a [`Source`].
 //!
 //! The factory's rows are read only for a project whose factory is on, from the status
-//! [`believed`] picks among the online writers' (P2, "Attention items in P2"). A session or
-//! workspace that is factory work raises none of P1's session or setup rows (G13): the run's
-//! own row covers it. Factory work is what any status held names in a live run, a session in
-//! such a workspace and a workspace that holds such a session, and what this machine's
-//! [`Marks`] say of its own sessions and workspaces.
+//! [`believed`] picks among the online writers' (P2, "Attention items in P2"). Factory work
+//! raises none of P1's rows for it (G13), since the run's own row covers it:
+//!
+//! - a session the believed status names in a live run, or that this machine's [`Marks`] say
+//!   is one of its factory sessions, raises no session stuck, waiting or failed item. Another
+//!   session in a factory workspace, such as one a person starts in a stuck run's workspace,
+//!   still does;
+//! - a workspace the believed status names, that [`Marks`] say is one of this machine's, or
+//!   that holds such a factory session, raises no setup failed item.
 //!
 //! - `GET /api/attention`: `{"items": [...]}`, each an [`Item`].
 //! - `POST /api/attention/{id}/dismiss`: dismisses a "setting overwritten" item through the
@@ -54,11 +60,12 @@ use axum::{Json, Router};
 use foundry_proto::factory::{FactoryStatus, HeldUpKind, NotHolding, RunId};
 use foundry_proto::ids::{MachineId, ProjectId, SessionId, TerminalId, WorkspaceId};
 use foundry_proto::record::{AnyRecord, Session, Terminal};
-use foundry_proto::settings::{Edit, SettingKey, SettingValue, SharedSettings};
+use foundry_proto::settings::{Edit, Project, SettingKey, SettingValue, SharedSettings};
 use foundry_proto::state::{SessionState, TerminalState};
 use serde::Serialize;
 
 use crate::api::edit_status;
+use crate::clock::Clock;
 use crate::coordinator::{self, Coordinator};
 use crate::factory::status::{Freshness, believed};
 use crate::machine::{Over, over_limits};
@@ -189,16 +196,91 @@ pub trait Marks: Send + Sync {
     fn factory_workspace(&self, workspace: WorkspaceId) -> bool;
 }
 
+/// How long each project whose factory is on has gone with this machine neither holding its
+/// lease nor hearing from its holder, as [`Freshness`] counts it, but never longer than this
+/// machine has seen the factory on: a factory just turned on is not idle for the time it was
+/// off. Seeing a factory off, or its project gone, forgets when it was seen on.
+///
+/// A factory is seen on at a read of the list, so on a machine whose list nobody reads its
+/// count starts at the first read.
+pub struct Quiet {
+    clock: Arc<dyn Clock>,
+    freshness: Arc<Freshness>,
+    /// The clock's reading when each project's factory was first seen on since it was last
+    /// seen off.
+    on_since: Mutex<BTreeMap<ProjectId, Duration>>,
+}
+
+impl Quiet {
+    /// Reads `freshness`, which must count on `clock`.
+    pub fn new(clock: Arc<dyn Clock>, freshness: Arc<Freshness>) -> Self {
+        Self {
+            clock,
+            freshness,
+            on_since: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// How long each of `on`, the projects whose factory is on, has been quiet.
+    fn of(&self, on: &BTreeSet<ProjectId>) -> BTreeMap<ProjectId, Duration> {
+        let now = self.clock.now();
+        let mut on_since = lock(&self.on_since);
+        on_since.retain(|project, _| on.contains(project));
+        on.iter()
+            .map(|project| {
+                let seen = now.saturating_sub(*on_since.entry(*project).or_insert(now));
+                (*project, seen.min(self.freshness.since_holding(*project)))
+            })
+            .collect()
+    }
+}
+
 /// What the factory's rows read beside the [`Fleet`].
 #[derive(Default)]
 pub struct FactoryFleet<'a> {
     /// Every status held of each project, from every writer, online or not.
     pub statuses: BTreeMap<ProjectId, Vec<(MachineId, FactoryStatus)>>,
-    /// This machine's freshness, when it keeps one. Without it "factory idle" is raised only for
-    /// a reason a status gives.
-    pub freshness: Option<&'a Freshness>,
+    /// This machine's quiet, when it keeps one. Without it "factory idle" is raised only for a
+    /// reason a status gives.
+    pub quiet: Option<&'a Quiet>,
     /// What this machine marks as factory work, when it is told.
     pub marks: Option<&'a dyn Marks>,
+}
+
+/// A project whose factory is on, and the status believed of it with its writer.
+struct OnProject<'a> {
+    project: &'a Project,
+    believed: Option<(MachineId, &'a FactoryStatus)>,
+}
+
+/// Each project whose factory is on, with its believed status.
+fn on_projects<'a>(
+    fleet: &'a Fleet,
+    factory: &'a FactoryFleet<'_>,
+    acting: MachineId,
+) -> Vec<OnProject<'a>> {
+    fleet
+        .settings
+        .projects
+        .iter()
+        .filter(|project| {
+            fleet
+                .settings
+                .project_factory
+                .get(&project.id)
+                .is_some_and(|f| f.on)
+        })
+        .map(|project| {
+            let statuses = factory
+                .statuses
+                .get(&project.id)
+                .map_or(&[][..], Vec::as_slice);
+            OnProject {
+                project,
+                believed: believed_of(statuses, &fleet.online, acting),
+            }
+        })
+        .collect()
 }
 
 /// The sessions and workspaces whose P1 items are left out because they are factory work (G13).
@@ -209,12 +291,12 @@ struct FactoryWork {
 }
 
 impl FactoryWork {
-    /// What any status held names in a live run, whoever wrote it and whether or not it is
-    /// believed, since a run's old workspace stays factory work after the run moves on; what
-    /// this machine marks of its own records; then each workspace that holds such a session.
-    fn of(fleet: &Fleet, factory: &FactoryFleet<'_>) -> Self {
+    /// What the believed status of each project whose factory is on names in a live run, the
+    /// same status the factory's rows are read from; what this machine marks of its own
+    /// records; then each workspace that holds such a session.
+    fn of(fleet: &Fleet, factory: &FactoryFleet<'_>, on: &[OnProject<'_>]) -> Self {
         let mut work = Self::default();
-        for (_, status) in factory.statuses.values().flatten() {
+        for (_, status) in on.iter().filter_map(|p| p.believed) {
             for run in &status.runs {
                 work.sessions.extend(&run.sessions);
                 work.workspaces.extend(&run.workspaces);
@@ -248,7 +330,7 @@ impl FactoryWork {
     }
 
     fn session(&self, session: &Session) -> bool {
-        self.sessions.contains(&session.id) || self.workspaces.contains(&session.workspace)
+        self.sessions.contains(&session.id)
     }
 
     fn workspace(&self, workspace: WorkspaceId) -> bool {
@@ -260,6 +342,8 @@ impl FactoryWork {
 /// row but the gateway's and placement's. A session or workspace that is factory work raises
 /// none of P1's session or setup items.
 pub fn fleet_items(fleet: &Fleet, factory: &FactoryFleet<'_>) -> Vec<Item> {
+    let acting = coordinator::acting(&fleet.settings.priority, &fleet.online);
+    let on = on_projects(fleet, factory, acting);
     let mut items = Vec::new();
     for machine in &fleet.settings.machines {
         if !fleet.online.contains(&machine.id) {
@@ -301,7 +385,7 @@ pub fn fleet_items(fleet: &Fleet, factory: &FactoryFleet<'_>) -> Vec<Item> {
         None => String::new(),
     };
 
-    let work = FactoryWork::of(fleet, factory);
+    let work = FactoryWork::of(fleet, factory, &on);
     for record in &fleet.records {
         match record {
             AnyRecord::Session(r) if !r.deleted && !work.session(&r.body) => {
@@ -432,32 +516,26 @@ pub fn fleet_items(fleet: &Fleet, factory: &FactoryFleet<'_>) -> Vec<Item> {
         ));
     }
 
-    items.extend(factory_items(fleet, factory));
+    items.extend(factory_items(fleet, factory, &on, acting));
     items
 }
 
 /// The factory's rows, for each project whose factory is on.
-fn factory_items(fleet: &Fleet, factory: &FactoryFleet<'_>) -> Vec<Item> {
-    let acting = coordinator::acting(&fleet.settings.priority, &fleet.online);
+fn factory_items(
+    fleet: &Fleet,
+    factory: &FactoryFleet<'_>,
+    on: &[OnProject<'_>],
+    acting: MachineId,
+) -> Vec<Item> {
+    let quiet = factory
+        .quiet
+        .map(|quiet| quiet.of(&on.iter().map(|p| p.project.id).collect()))
+        .unwrap_or_default();
     let mut items = Vec::new();
-    for project in &fleet.settings.projects {
-        let on = fleet
-            .settings
-            .project_factory
+    for &OnProject { project, believed } in on {
+        let quiet = quiet
             .get(&project.id)
-            .is_some_and(|f| f.on);
-        if !on {
-            continue;
-        }
-        let statuses = factory
-            .statuses
-            .get(&project.id)
-            .map_or(&[][..], Vec::as_slice);
-        let believed = believed_of(statuses, &fleet.online, acting);
-        let quiet = factory
-            .freshness
-            .map(|freshness| freshness.since_holding(project.id))
-            .is_some_and(|since| since >= IDLE_AFTER);
+            .is_some_and(|quiet| *quiet >= IDLE_AFTER);
         if let Some(item) = idle(fleet, project.id, &project.name, believed, quiet, acting) {
             items.push(item);
         }
@@ -745,7 +823,7 @@ pub struct Attention {
     coordinator: Arc<Coordinator>,
     sources: Vec<Arc<dyn Source>>,
     held: Arc<Mutex<Held>>,
-    freshness: Option<Arc<Freshness>>,
+    quiet: Option<Arc<Quiet>>,
     marks: Option<Arc<dyn Marks>>,
 }
 
@@ -763,7 +841,7 @@ impl Attention {
             coordinator,
             sources: Vec::new(),
             held: Arc::default(),
-            freshness: None,
+            quiet: None,
             marks: None,
         }
     }
@@ -774,11 +852,16 @@ impl Attention {
         self
     }
 
-    /// Reads this machine's `freshness` for "factory idle" and its `marks` for the factory
-    /// work whose P1 items are left out. Without them the factory's items are still read from
-    /// the statuses.
-    pub fn with_factory(mut self, freshness: Arc<Freshness>, marks: Arc<dyn Marks>) -> Self {
-        self.freshness = Some(freshness);
+    /// Reads this machine's `freshness`, which counts on `clock`, for "factory idle", and its
+    /// `marks` for the factory work whose P1 items are left out. Without them the factory's
+    /// items are still read from the statuses.
+    pub fn with_factory(
+        mut self,
+        clock: Arc<dyn Clock>,
+        freshness: Arc<Freshness>,
+        marks: Arc<dyn Marks>,
+    ) -> Self {
+        self.quiet = Some(Arc::new(Quiet::new(clock, freshness)));
         self.marks = Some(marks);
         self
     }
@@ -817,7 +900,7 @@ impl Attention {
         };
         let factory = FactoryFleet {
             statuses,
-            freshness: self.freshness.as_deref(),
+            quiet: self.quiet.as_deref(),
             marks: self.marks.as_deref(),
         };
         let mut items = fleet_items(&fleet, &factory);
@@ -2142,8 +2225,9 @@ mod tests {
         // And one in a workspace this machine marks as factory.
         let marked = world.session(me, SessionState::Stuck);
         world.marked.workspaces.insert(marked.workspace);
-        let kinds: Vec<(Kind, String)> =
+        let mut kinds: Vec<(Kind, String)> =
             world.items().into_iter().map(|i| (i.kind, i.id)).collect();
+        kinds.sort();
         assert_eq!(
             kinds,
             [
