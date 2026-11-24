@@ -1633,7 +1633,7 @@ async fn over_a_slow_link_a_factory_catch_up_keeps_p1_records_behind_at_most_one
     let ids = Ids::random();
     let (mut written, mut arrived) = (false, false);
     let (mut ahead, mut received) = (0, 0);
-    let mut others = 0;
+    let (mut others, mut factory_messages) = (0, 0);
     let start = Instant::now();
     while received < total || !arrived {
         let text = timeout(OFFLINE_AFTER, conn.recv.recv())
@@ -1643,6 +1643,7 @@ async fn over_a_slow_link_a_factory_catch_up_keeps_p1_records_behind_at_most_one
         let _ = conn.send.try_send(heartbeat());
         let message: serde_json::Value = serde_json::from_str(&text).unwrap();
         if message["type"] == "factory_records" {
+            factory_messages += 1;
             received += message["records"].as_array().unwrap().len();
             if written && !arrived {
                 ahead += 1;
@@ -1663,10 +1664,11 @@ async fn over_a_slow_link_a_factory_catch_up_keeps_p1_records_behind_at_most_one
         tokio::time::sleep(wire).await;
     }
     assert_eq!(received, total, "every factory record arrived");
-    // A round a tick, not a round each time the queue empties.
+    // A round a tick, and one more each time the writer takes a factory message: not a round
+    // each time the queue empties.
     assert!(
-        others as u64 <= start.elapsed().as_secs() + 5,
-        "{others} other messages in {:?}",
+        others as u64 <= start.elapsed().as_secs() + factory_messages + 5,
+        "{others} other messages with {factory_messages} factory messages in {:?}",
         start.elapsed()
     );
     assert!(
