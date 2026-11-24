@@ -2778,6 +2778,7 @@ mod tests {
             protocol: PROTOCOL,
             machine,
             versions: Default::default(),
+            factory_versions: BTreeMap::new(),
         })
         .unwrap()
     }

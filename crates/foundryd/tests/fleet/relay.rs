@@ -830,6 +830,7 @@ async fn hear_from(peers: &Peers, owner: MachineId) -> Conn {
             protocol: PROTOCOL,
             machine: owner,
             versions: Default::default(),
+            factory_versions: Default::default(),
         },
         PeerMessage::Records {
             protocol: PROTOCOL,
