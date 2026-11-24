@@ -4,6 +4,12 @@
 //! from its owner and only when its version is higher than the copy held. The versions are the
 //! owner's own factory counter, which is not P1's. Nothing here reads or orders by a time:
 //! a run's events are ordered by the lease generation they were written under, then by version.
+//!
+//! Every row is written under [`FactoryRecord::key`], and the reads below spell out its kind
+//! names and id layouts (`<run>/<owner>/<version>`, `<project>/<owner>`, the machine, the
+//! session) in their queries. Each read's tests store records through `apply_factory`, which
+//! keys them by `FactoryRecord::key`, and read them back here, so a change to a kind name or an
+//! id layout in `foundry-proto` fails those tests rather than leaving a read empty.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -21,6 +27,16 @@ use super::{Applied, Store, StoreError, from_sql, to_sql};
 /// any character.
 fn range(prefix: &str) -> (String, String) {
     (format!("{prefix}/"), format!("{prefix}0"))
+}
+
+/// The error for a row stored under `kind` whose record is another kind. `apply_factory` never
+/// writes one, since it keys each record by its own kind.
+fn wrong_kind(kind: &str, body: &FactoryBody) -> StoreError {
+    StoreError::Sqlite(rusqlite::Error::FromSqlConversionFailure(
+        0,
+        Type::Text,
+        format!("a {kind} row holds a {} record", body.kind()).into(),
+    ))
 }
 
 fn parse_machine(index: usize, text: &str) -> rusqlite::Result<MachineId> {
@@ -109,8 +125,9 @@ impl Store {
         let mut events = Vec::new();
         for json in rows {
             let record: FactoryRecord = serde_json::from_str(&json?)?;
-            if let FactoryBody::RunEvent(event) = record.body {
-                events.push(event);
+            match record.body {
+                FactoryBody::RunEvent(event) => events.push(event),
+                other => return Err(wrong_kind("run_event", &other)),
             }
         }
         Ok(events)
@@ -155,11 +172,12 @@ impl Store {
     ///
     /// A status this build cannot read, one a newer build left before a rollback, is left out
     /// with a warning, as [`sessions_of`](Self::sessions_of) does, so one writer's status
-    /// never hides the others'. [`highest_generation`](Self::highest_generation) still counts
-    /// its generation. The other reads give an error for such a row instead:
-    /// [`run_events`](Self::run_events) because a run with an event left out reads as another
-    /// run, and [`held`](Self::held) and [`session_turn`](Self::session_turn) because they
-    /// read one record, which would then read as absent.
+    /// never hides the others'; so is a status row that holds another kind of record.
+    /// [`highest_generation`](Self::highest_generation) still counts its generation. The other
+    /// reads give an error for such a row instead: [`run_events`](Self::run_events) because a
+    /// run with an event left out reads as another run, and [`held`](Self::held) and
+    /// [`session_turn`](Self::session_turn) because they read one record, which would then
+    /// read as absent.
     pub fn statuses(
         &self,
         project: ProjectId,
@@ -185,7 +203,10 @@ impl Store {
                     body: FactoryBody::Status(status),
                     ..
                 }) => statuses.push((owner, status)),
-                Ok(_) => {}
+                Ok(record) => {
+                    let kind = record.body.kind();
+                    tracing::warn!(%project, %owner, version, kind, "a factory status row that holds another kind of record is left out");
+                }
                 Err(error) => {
                     tracing::warn!(%project, %owner, version, %error, "a factory status this build cannot read is left out");
                 }
@@ -223,22 +244,20 @@ impl Store {
 
     /// The logins `machine` holds a token for, read by its key.
     pub fn held(&self, machine: MachineId) -> Result<Option<MachineHeld>, StoreError> {
-        Ok(
-            match self.factory_by_key("machine_held", &machine.to_string())? {
-                Some(FactoryBody::Held(held)) => Some(held),
-                _ => None,
-            },
-        )
+        match self.factory_by_key("machine_held", &machine.to_string())? {
+            Some(FactoryBody::Held(held)) => Ok(Some(held)),
+            Some(other) => Err(wrong_kind("machine_held", &other)),
+            None => Ok(None),
+        }
     }
 
     /// The newest turn of `session`, read by its key.
     pub fn session_turn(&self, session: SessionId) -> Result<Option<SessionTurn>, StoreError> {
-        Ok(
-            match self.factory_by_key("session_turn", &session.to_string())? {
-                Some(FactoryBody::Turn(turn)) => Some(turn),
-                _ => None,
-            },
-        )
+        match self.factory_by_key("session_turn", &session.to_string())? {
+            Some(FactoryBody::Turn(turn)) => Ok(Some(turn)),
+            Some(other) => Err(wrong_kind("session_turn", &other)),
+            None => Ok(None),
+        }
     }
 
     fn factory_by_key(&self, kind: &str, id: &str) -> Result<Option<FactoryBody>, StoreError> {
@@ -261,6 +280,16 @@ fn apply_factory_in_tx(
     record: &FactoryRecord,
 ) -> Result<Applied, StoreError> {
     let version = to_sql("version", record.version)?;
+    // A generation is read back from the stored JSON as a whole number SQLite holds (by
+    // `highest_generation` and the order of `run_events`), so one it cannot hold is refused
+    // here, as a version is.
+    match &record.body {
+        FactoryBody::RunEvent(RunEvent { generation, .. })
+        | FactoryBody::Status(FactoryStatus { generation, .. }) => {
+            to_sql("generation", *generation)?;
+        }
+        FactoryBody::Held(_) | FactoryBody::Turn(_) => {}
+    }
     let key = record.key();
     let owner = record.owner.to_string();
 

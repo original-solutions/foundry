@@ -1878,6 +1878,127 @@ fn session_turn_fails_on_a_turn_it_cannot_read() {
     ));
 }
 
+/// Puts `record` under `kind` and `id` whatever its own kind: a row `apply_factory` never
+/// writes, since it keys every record by `FactoryRecord::key`.
+fn insert_under_kind(store: &Store, kind: &str, id: &str, record: &FactoryRecord) {
+    assert_ne!(record.body.kind(), kind);
+    store
+        .conn
+        .execute(
+            "INSERT INTO factory_records (kind, id, owner, version, record)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                kind,
+                id,
+                record.owner.to_string(),
+                record.version as i64,
+                serde_json::to_string(record).unwrap()
+            ],
+        )
+        .unwrap();
+}
+
+/// A row of one kind that holds another kind of record is an error for the reads that give
+/// every row they find, never a row left out or read as absent.
+#[test]
+fn run_events_held_and_session_turn_fail_on_a_row_that_holds_another_kind() {
+    let (_dir, mut store) = open();
+    let owner = MachineId::random();
+    let run = run_id("a/b", 1, 1);
+    store
+        .apply_factory(&run_event(owner, 1, &run, 1, 1), owner)
+        .unwrap();
+    insert_under_kind(
+        &store,
+        "run_event",
+        &format!("{run}/{owner}/2"),
+        &held(owner, 2, &["a"]),
+    );
+    assert!(matches!(store.run_events(&run), Err(StoreError::Sqlite(_))));
+
+    let machine = MachineId::random();
+    insert_under_kind(
+        &store,
+        "machine_held",
+        &machine.to_string(),
+        &turn_record(machine, 1, SessionId::random(), 1),
+    );
+    assert!(matches!(store.held(machine), Err(StoreError::Sqlite(_))));
+
+    let session = SessionId::random();
+    insert_under_kind(
+        &store,
+        "session_turn",
+        &session.to_string(),
+        &held(machine, 2, &["a"]),
+    );
+    assert!(matches!(
+        store.session_turn(session),
+        Err(StoreError::Sqlite(_))
+    ));
+}
+
+/// A status row that holds another kind of record is left out, as a status this build cannot
+/// read is: one bad row never hides the other writers' statuses.
+#[test]
+fn statuses_leave_out_a_row_that_holds_another_kind() {
+    let (_dir, mut store) = open();
+    let project = ProjectId::random();
+    let one = MachineId::random();
+    let other = MachineId::random();
+    store
+        .apply_factory(&status(one, 1, project, 1, 3), one)
+        .unwrap();
+    insert_under_kind(
+        &store,
+        "factory_status",
+        &format!("{project}/{other}"),
+        &held(other, 1, &["a"]),
+    );
+    assert_eq!(
+        store.statuses(project).unwrap(),
+        vec![(one, status_body(project, 1, 3))]
+    );
+}
+
+/// A generation is stored inside the record, where the store reads it as a number it can
+/// hold, so a status or run event whose generation it cannot hold is refused as a version
+/// is.
+#[test]
+fn apply_factory_refuses_a_generation_above_what_the_store_can_hold() {
+    let (_dir, mut store) = open();
+    let owner = MachineId::random();
+    let project = ProjectId::random();
+    let run = run_id("a/b", 1, 1);
+    let too_large = 1u64 << 63;
+    for record in [
+        status(owner, 1, project, 1, too_large),
+        run_event(owner, 2, &run, too_large, 1),
+    ] {
+        assert!(matches!(
+            store.apply_factory(&record, owner),
+            Err(StoreError::TooLarge {
+                what: "generation",
+                ..
+            })
+        ));
+    }
+    assert_eq!(factory_rows(&store), 0);
+
+    let highest = too_large - 1;
+    for record in [
+        status(owner, 3, project, 1, highest),
+        run_event(owner, 4, &run, highest, 1),
+    ] {
+        assert_eq!(
+            store.apply_factory(&record, owner).unwrap(),
+            Applied::Stored
+        );
+    }
+    assert_eq!(store.highest_generation(project).unwrap(), highest);
+    assert_eq!(store.run_events(&run).unwrap()[0].generation, highest);
+}
+
 #[test]
 fn the_factory_migration_runs_on_an_empty_file() {
     let dir = tempfile::tempdir().unwrap();
