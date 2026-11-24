@@ -1475,10 +1475,42 @@ mod tests {
         let (_dir, secrets) = file();
         secrets.set(GATEWAY, "gw-key-1").unwrap();
         secrets.set(GATEWAY_MANAGEMENT, "gm-key-2").unwrap();
-        secrets.set("github:octocat", "ghp_abc").unwrap();
-        secrets.set("github:alice", "ghp_abcdef").unwrap();
+        // The shorter token sorts first by name, so only the longest-first order hides both.
+        secrets.set("github:alice", "ghp_abc").unwrap();
+        secrets.set("github:zed", "ghp_abcdef").unwrap();
         let text = "a gw-key-1 b gm-key-2 c ghp_abc d ghp_abcdef e";
         assert_eq!(hide_known(text, &secrets), "a *** b *** c *** d *** e");
+    }
+
+    #[test]
+    fn hide_known_hides_a_token_stored_under_a_name_that_is_no_login() {
+        let (_dir, secrets) = file();
+        secrets.set("github:bad/name", "ghp_odd_name").unwrap();
+        assert_eq!(
+            hide_known("carrying ghp_odd_name", &secrets),
+            "carrying ***"
+        );
+    }
+
+    /// A store that implements only what the trait requires.
+    struct CannotList;
+    impl Secrets for CannotList {
+        fn get(&self, _: &str) -> Result<Option<String>, SecretsError> {
+            Ok(None)
+        }
+        fn set(&self, _: &str, _: &str) -> Result<(), SecretsError> {
+            Ok(())
+        }
+        fn update(&self, _: &str, _: Edit<'_>) -> Result<(), SecretsError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_store_that_cannot_list_fails_closed() {
+        assert!(CannotList.names().is_err());
+        assert_eq!(hide_known("carrying ghp_x", &CannotList), HIDDEN_UNREADABLE);
+        assert!(github_logins(&CannotList).is_err());
     }
 
     #[test]
@@ -1521,6 +1553,7 @@ mod tests {
 
     #[test]
     fn hide_known_with_an_unreadable_store_gives_the_fixed_text_never_the_input() {
+        let logged = crate::test_log::Logged::everywhere();
         let (dir, secrets) = file();
         secrets.set("github:octocat", "ghp_unreadable").unwrap();
         let path = dir.path().join("secrets.json");
@@ -1529,7 +1562,8 @@ mod tests {
         let hidden = hide_known(text, &secrets);
         assert_eq!(hidden, HIDDEN_UNREADABLE);
         assert!(!hidden.contains("ghp_unreadable"));
-        let logged = crate::test_log::Logged::everywhere().text();
-        assert!(!logged.contains("ghp_unreadable"), "{logged}");
+        let text = logged.text();
+        assert!(text.contains("could not be read"), "{text}");
+        assert!(!text.contains("ghp_unreadable"), "{text}");
     }
 }

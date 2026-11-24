@@ -296,6 +296,93 @@ mod tests {
         }
     }
 
+    fn rig_without_a_task() -> (tempfile::TempDir, Mutex<Store>, FileSecrets, MachineId) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Mutex::new(Store::open(dir.path().join("foundry.db")).unwrap());
+        let secrets = FileSecrets::new(dir.path().join("secrets.json"));
+        (dir, store, secrets, MachineId::random())
+    }
+
+    fn version_of(store: &Mutex<Store>, me: MachineId) -> Option<u64> {
+        store
+            .lock()
+            .unwrap()
+            .factory_versions()
+            .unwrap()
+            .get(&me)
+            .copied()
+    }
+
+    #[test]
+    fn check_writes_nothing_when_what_is_held_is_what_was_written() {
+        let (_dir, store, secrets, me) = rig_without_a_task();
+        let first = check(&store, me, &secrets, None, None).unwrap();
+        let version = version_of(&store, me);
+        assert!(version.is_some());
+        let again = check(&store, me, &secrets, None, Some(first.clone())).unwrap();
+        assert_eq!(again, first);
+        assert_eq!(version_of(&store, me), version);
+    }
+
+    #[test]
+    fn check_with_a_failed_read_writes_nothing_and_errors() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, store, secrets, me) = rig_without_a_task();
+        secrets.set("github:octocat", "ghp_held_five").unwrap();
+        let path = dir.path().join("secrets.json");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(check(&store, me, &secrets, None, None).is_err());
+        assert_eq!(version_of(&store, me), None);
+    }
+
+    #[test]
+    fn check_writes_a_new_version_with_no_logins_when_the_last_login_is_gone() {
+        let (dir, store, secrets, me) = rig_without_a_task();
+        secrets.set("github:octocat", "ghp_held_six").unwrap();
+        let first = check(&store, me, &secrets, None, None).unwrap();
+        assert_eq!(first.logins, ["octocat"]);
+        let version = version_of(&store, me);
+
+        let path = dir.path().join("secrets.json");
+        std::fs::write(&path, "{}").unwrap();
+        let second = check(&store, me, &secrets, None, Some(first)).unwrap();
+        assert!(second.logins.is_empty());
+        assert!(version_of(&store, me) > version);
+        assert_eq!(store.lock().unwrap().held(me).unwrap(), Some(second));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_warns_once_while_the_store_stays_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+        let logged = crate::test_log::Logged::everywhere();
+        let rig = rig();
+        let first = version_after(&rig, None).await;
+        rig.secrets.set("github:octocat", "ghp_held_seven").unwrap();
+        let path = rig.dir.path().join("secrets.json");
+        let mark = path.display().to_string();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        for _ in 0..3 {
+            pass(&rig, CHECK_EVERY).await;
+            let_a_check_run();
+        }
+        let warnings = |logged: &crate::test_log::Logged| {
+            logged
+                .text()
+                .lines()
+                .filter(|line| line.contains(&mark) && line.contains("WARN"))
+                .count()
+        };
+        assert_eq!(warnings(&logged), 1, "{}", logged.text());
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        pass(&rig, CHECK_EVERY).await;
+        assert!(version_after(&rig, first).await > first);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        pass(&rig, CHECK_EVERY).await;
+        let_a_check_run();
+        assert_eq!(warnings(&logged), 2, "a new failure warns again");
+    }
+
     #[test]
     fn skill_file_is_under_the_given_home() {
         assert_eq!(
@@ -306,14 +393,9 @@ mod tests {
 
     #[test]
     fn skill_file_with_an_empty_home_never_uses_the_empty_string() {
-        let path = skill_file(Some("".into()));
-        if let Some(path) = path {
-            assert!(path.is_absolute(), "{}", path.display());
-            assert!(path.ends_with(".claude/skills/factory-build/SKILL.md"));
-        }
-        let none = skill_file(None);
-        if let Some(path) = none {
-            assert!(path.is_absolute(), "{}", path.display());
-        }
+        assert_eq!(skill_file(Some("".into())), skill_file(None));
+        let path = skill_file(None).expect("the test user has a passwd entry");
+        assert!(path.is_absolute(), "{}", path.display());
+        assert!(path.ends_with(".claude/skills/factory-build/SKILL.md"));
     }
 }

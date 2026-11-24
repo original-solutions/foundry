@@ -189,6 +189,20 @@ fn github_default_with_a_bad_login_exits_1_and_stores_nothing() {
 }
 
 #[test]
+fn github_default_refusing_an_argument_does_not_print_it() {
+    let home = tempfile::tempdir().unwrap();
+
+    let out = isolated(&["github", "default", "ghp_secret_like/x"], &home)
+        .output()
+        .expect("foundryd runs");
+
+    assert_eq!(out.status.code(), Some(1), "exit: {:?}", out.status);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("ghp_secret_like"), "stderr: {stderr}");
+    assert!(stderr.contains("not a GitHub login"), "stderr: {stderr}");
+}
+
+#[test]
 fn secret_set_stores_a_github_token_and_never_prints_it() {
     let home = tempfile::tempdir().unwrap();
 
