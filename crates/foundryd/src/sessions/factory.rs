@@ -340,7 +340,9 @@ fn origin_findings(git: &impl Fn() -> Command, entries: &[Entry], worktree: &Pat
 }
 
 /// The legacy `remotes/origin` or `branches/origin` file of the repository of `worktree`, as a
-/// finding, when there is one: where git reads an origin URL from when the config has none.
+/// finding, when its own URL has a user name: the `URL:` line of `remotes/origin`, or the URL
+/// before any `#` of `branches/origin`. Git reads an origin URL from there when the config has
+/// none.
 fn legacy_remote_file(git: &impl Fn() -> Command, worktree: &Path) -> Option<Finding> {
     let dir = git_out(
         git(),
@@ -352,15 +354,33 @@ fn legacy_remote_file(git: &impl Fn() -> Command, worktree: &Path) -> Option<Fin
         ],
     )?;
     let dir = worktree.join(String::from_utf8_lossy(&dir).trim_end());
-    ["remotes", "branches"]
-        .into_iter()
-        .map(|kind| dir.join(kind).join("origin"))
-        .find(|file| file.is_file())
-        .map(|file| Finding {
-            what: "a user name in the origin URL",
-            key: "URL".into(),
-            file: file.display().to_string(),
+    let found = |kind: &str, key: &str, url_of: fn(&str) -> Vec<&str>| {
+        let file = dir.join(kind).join("origin");
+        let text = std::fs::read_to_string(&file).ok()?;
+        url_of(&text)
+            .into_iter()
+            .any(has_user_name)
+            .then(|| Finding {
+                what: "a user name in the origin URL",
+                key: key.into(),
+                file: file.display().to_string(),
+            })
+    };
+    found("remotes", "URL", |text| {
+        text.lines()
+            .filter_map(|line| line.strip_prefix("URL:"))
+            .map(str::trim)
+            .collect()
+    })
+    .or_else(|| {
+        found("branches", "the file's URL", |text| {
+            text.lines()
+                .next()
+                .map(|line| line.split('#').next().unwrap_or("").trim())
+                .into_iter()
+                .collect()
         })
+    })
 }
 
 /// One entry of `git config --list --show-origin -z`.
@@ -469,21 +489,20 @@ fn mask_user_info(key: &str) -> String {
     }
 }
 
-/// The tokens of a netrc line, as curl 7.88 and later read them: white space separates; a token
-/// that starts with `#` outside quotes ends the line; an unquoted token runs to the next white
-/// space with backslashes literal; a double-quoted token ends at its closing quote and has
-/// escapes only inside it (`\n`, `\r`, `\t`, otherwise the next character itself).
+/// The tokens of a netrc line, as curl reads them, with no comment or `macdef` skipping:
+/// white space separates; an unquoted token runs to the next white space with backslashes
+/// literal; a double-quoted token ends at its closing quote and has escapes only inside it
+/// (`\n`, `\r`, `\t`, otherwise the next character itself).
 fn netrc_tokens(line: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut chars = line.chars().peekable();
     while let Some(&first) = chars.peek() {
+        let mut token = String::new();
         if first.is_whitespace() {
             chars.next();
-        } else if first == '#' {
-            break;
+            continue;
         } else if first == '"' {
             chars.next();
-            let mut token = String::new();
             while let Some(c) = chars.next() {
                 match c {
                     '"' => break,
@@ -497,9 +516,7 @@ fn netrc_tokens(line: &str) -> Vec<String> {
                     other => token.push(other),
                 }
             }
-            tokens.push(token);
         } else {
-            let mut token = String::new();
             while let Some(&c) = chars.peek() {
                 if c.is_whitespace() {
                     break;
@@ -507,14 +524,19 @@ fn netrc_tokens(line: &str) -> Vec<String> {
                 token.push(c);
                 chars.next();
             }
-            tokens.push(token);
         }
+        tokens.push(token);
     }
     tokens
 }
 
-/// The entries of the netrc at `path` that answer github.com: a `machine github.com` and a
-/// `default`. A netrc that is not there has none; one that cannot be read is refused.
+/// The findings of the netrc at `path`. It errs toward refusing, because curl versions read a
+/// netrc differently (comments, `macdef`, quotes, escapes): a netrc that names github.com or
+/// `default` anywhere, even in a comment or a value, refuses, and the refusal names the file and
+/// never its contents. It names github.com when its raw text holds it in any case, or when a
+/// token as curl reads it is it (`"git\hub.com"`); it names `default` when a white-space-
+/// separated word, quotes stripped, or a token is it. A netrc that is not there has none; one
+/// that cannot be read is refused.
 fn netrc_findings(path: &Path) -> Vec<Finding> {
     let file = path.display().to_string();
     let bytes = match std::fs::read(path) {
@@ -529,38 +551,30 @@ fn netrc_findings(path: &Path) -> Vec<Finding> {
         }
     };
     let text = String::from_utf8_lossy(&bytes);
+    let tokens: Vec<String> = text.lines().flat_map(netrc_tokens).collect();
     let mut found = Vec::new();
-    // Errs toward refusing: a `machine` token followed by `github.com` refuses wherever it
-    // stands, even in a value position, since curl starts a new entry there. A `default`
-    // token refuses too.
-    let (mut macdef, mut machine) = (false, false);
-    for line in text.lines() {
-        if macdef {
-            macdef = !line.trim().is_empty();
-            continue;
-        }
-        for token in netrc_tokens(line) {
-            let is = |word: &str| token.eq_ignore_ascii_case(word);
-            if std::mem::take(&mut machine) && is("github.com") {
-                found.push(Finding {
-                    what: "a netrc entry for github.com",
-                    key: "machine github.com".into(),
-                    file: file.clone(),
-                });
-            }
-            if is("macdef") {
-                macdef = true;
-                break;
-            } else if is("machine") {
-                machine = true;
-            } else if is("default") {
-                found.push(Finding {
-                    what: "a netrc default entry",
-                    key: "default".into(),
-                    file: file.clone(),
-                });
-            }
-        }
+    let github = text.to_ascii_lowercase().contains("github.com")
+        || tokens
+            .iter()
+            .any(|token| token.eq_ignore_ascii_case("github.com"));
+    if github {
+        found.push(Finding {
+            what: "a netrc entry for github.com",
+            key: "machine github.com".into(),
+            file: file.clone(),
+        });
+    }
+    let default = text
+        .split_whitespace()
+        .map(|word| word.trim_matches('"'))
+        .chain(tokens.iter().map(String::as_str))
+        .any(|word| word.eq_ignore_ascii_case("default"));
+    if default {
+        found.push(Finding {
+            what: "a netrc default entry",
+            key: "default".into(),
+            file,
+        });
     }
     found
 }
