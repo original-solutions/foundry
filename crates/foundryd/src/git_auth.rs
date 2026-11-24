@@ -65,8 +65,8 @@ const CONFIG: [&str; 9] = [
 
 /// The environment of every call: the runner's `HARDENED_GIT_ENV`, since `-c` cannot turn the
 /// system and global config off and with no terminal prompt a refused token fails the call at
-/// once, and HTTPS as the only transport.
-const ENV: [(&str, &str); 8] = [
+/// once, HTTPS as the only transport, and the token redacted from any trace.
+const ENV: [(&str, &str); 9] = [
     ("GIT_TERMINAL_PROMPT", "0"),
     ("GIT_CONFIG_NOSYSTEM", "1"),
     ("GIT_CONFIG_GLOBAL", "/dev/null"),
@@ -81,6 +81,9 @@ const ENV: [(&str, &str); 8] = [
     // and no `core.sshCommand`, `core.gitProxy`, `remote.<name>.uploadpack` or
     // `remote.<name>.vcs` that its config names runs with the token.
     ("GIT_ALLOW_PROTOCOL", "https"),
+    // A trace the daemon's environment turns on (`GIT_TRACE_CURL`, `GIT_CURL_VERBOSE`) shows
+    // the `Authorization:` header git builds from the token unless this is on.
+    ("GIT_TRACE_REDACT", "1"),
 ];
 
 /// What the daemon's own environment may carry in from whatever started it and is not passed
@@ -523,6 +526,7 @@ mod tests {
             ("GIT_NO_LAZY_FETCH", "1"),
             ("LC_ALL", "C"),
             ("GIT_ALLOW_PROTOCOL", "https"),
+            ("GIT_TRACE_REDACT", "1"),
         ] {
             assert_eq!(seen.env.get(key).map(String::as_str), Some(value), "{key}");
         }
