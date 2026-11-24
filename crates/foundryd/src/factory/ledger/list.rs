@@ -468,16 +468,30 @@ mod tests {
         ledger
     }
 
-    /// A run event row this build cannot read, as a newer build may leave one.
-    fn unreadable_run(dir: &Path, id: &RunId) {
-        let owner = MachineId::random();
+    /// A run event row of `id` by `owner` that holds `record` as it is.
+    fn raw_run(dir: &Path, id: &RunId, owner: MachineId, record: &str) {
         let conn = rusqlite::Connection::open(dir.join("foundry.db")).unwrap();
         conn.execute(
             "INSERT INTO factory_records (kind, id, owner, version, record)
-             VALUES ('run_event', ?1, ?2, 1, '{\"kind\":\"run_event\",\"later\":true}')",
-            rusqlite::params![format!("{id}/{owner}/1"), owner.to_string()],
+             VALUES ('run_event', ?1, ?2, 1, ?3)",
+            rusqlite::params![format!("{id}/{owner}/1"), owner.to_string(), record],
         )
         .unwrap();
+    }
+
+    /// A run event row this build cannot read, as a newer build may leave one.
+    fn unreadable_run(dir: &Path, id: &RunId) {
+        raw_run(
+            dir,
+            id,
+            MachineId::random(),
+            r#"{"kind":"run_event","later":true}"#,
+        );
+    }
+
+    /// A run event row of `id` by `owner` whose record is not JSON at all.
+    fn damaged_run(dir: &Path, id: &RunId, owner: MachineId) {
+        raw_run(dir, id, owner, "not json");
     }
 
     fn info(id: RunId, state: Option<State>, confirmed: bool) -> RunInfo {
@@ -1406,25 +1420,17 @@ mod tests {
         assert_eq!(read() - before, 2);
     }
 
-    /// A run event row of `id` whose record is not JSON at all.
-    fn damaged_run(dir: &Path, id: &RunId) {
-        let owner = MachineId::random();
-        let conn = rusqlite::Connection::open(dir.join("foundry.db")).unwrap();
-        conn.execute(
-            "INSERT INTO factory_records (kind, id, owner, version, record)
-             VALUES ('run_event', ?1, ?2, 1, 'not json')",
-            rusqlite::params![format!("{id}/{owner}/1"), owner.to_string()],
-        )
-        .unwrap();
-    }
-
     #[test]
     fn a_row_that_is_not_json_makes_only_its_own_run_unreadable() {
         let (dir, store) = open_store();
         run_at(&store, &softfac(7), T0, Some(State::Building), false, true);
-        damaged_run(dir.path(), &softfac(6));
+        damaged_run(dir.path(), &softfac(6), MachineId::random());
         // A repo whose runs' keys lie in the same range is not read at all.
-        damaged_run(dir.path(), &rid(5, "rawphp/softfac__x", 1));
+        damaged_run(
+            dir.path(),
+            &rid(5, "rawphp/softfac__x", 1),
+            MachineId::random(),
+        );
         let expected = [
             info(softfac(7), Some(State::Building), true),
             RunInfo {
@@ -1446,5 +1452,29 @@ mod tests {
         unreadable_run(dir.path(), &softfac(4));
         assert_eq!(listed(&store, "rawphp/softfac"), []);
         assert_eq!(issue_runs(&store, "rawphp/softfac", 4).unwrap(), []);
+    }
+
+    #[test]
+    fn a_finished_run_holding_a_row_that_is_not_json_is_not_listed_whatever_its_key_order() {
+        let (dir, store) = open_store();
+        let (low, high) = (
+            MachineId(uuid::Uuid::from_u128(1)),
+            MachineId(uuid::Uuid::from_u128(u128::MAX)),
+        );
+        for (issue, damaged, writer) in [(4, low, high), (5, high, low)] {
+            damaged_run(dir.path(), &softfac(issue), damaged);
+            put(
+                &store,
+                writer,
+                issue,
+                &softfac(issue),
+                1,
+                T0,
+                "finished",
+                json!({"outcome": "stuck"}),
+                None,
+            );
+        }
+        assert_eq!(listed(&store, "rawphp/softfac"), []);
     }
 }

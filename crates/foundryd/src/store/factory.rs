@@ -463,7 +463,9 @@ mod tests {
     use serde_json::{Value, json};
     use tempfile::TempDir;
 
-    use super::{EVENTS_OF_WRITER, EVENTS_OF_WRITER_ABOVE, HAS_EVENT, WRITER_PROBE};
+    use super::{
+        EVENTS_OF_WRITER, EVENTS_OF_WRITER_ABOVE, HAS_EVENT, HIGHEST_VERSION, WRITER_PROBE,
+    };
     use crate::store::Store;
 
     fn open() -> (TempDir, Store) {
@@ -505,7 +507,11 @@ mod tests {
     /// A run event row of `run` that holds `record` as it is, as a newer build or a damaged
     /// file may leave one.
     fn put_raw(dir: &TempDir, run: &RunId, record: &str) {
-        let owner = MachineId::random();
+        put_raw_by(dir, run, MachineId::random(), record);
+    }
+
+    /// [`put_raw`] as `owner`.
+    fn put_raw_by(dir: &TempDir, run: &RunId, owner: MachineId, record: &str) {
         let conn = rusqlite::Connection::open(dir.path().join("foundry.db")).unwrap();
         conn.execute(
             "INSERT INTO factory_records (kind, id, owner, version, record)
@@ -546,14 +552,61 @@ mod tests {
     }
 
     #[test]
-    fn a_row_this_build_cannot_read_names_no_event_and_one_that_is_not_json_is_an_error() {
-        let (dir, store) = open();
+    fn a_row_this_build_cannot_read_names_no_event_whether_or_not_it_is_json() {
+        let (dir, mut store) = open();
         let eight = run("rawphp/softfac", 8, 1);
         put_raw(&dir, &eight, r#"{"kind":"run_event","later":true}"#);
         assert!(!store.run_has_event(&eight, "finished").unwrap());
         let nine = run("rawphp/softfac", 9, 1);
         put_raw(&dir, &nine, "not json");
-        assert!(store.run_has_event(&nine, "finished").is_err());
+        assert!(!store.run_has_event(&nine, "finished").unwrap());
+        // A `finished` is found whether a row that is not JSON comes before it by key or after.
+        let (low, high) = (
+            MachineId(uuid::Uuid::from_u128(1)),
+            MachineId(uuid::Uuid::from_u128(u128::MAX)),
+        );
+        for (issue, damaged, writer) in [(10, low, high), (11, high, low)] {
+            let run = run("rawphp/softfac", issue, 1);
+            put_raw_by(&dir, &run, damaged, "not json");
+            put(&mut store, writer, issue, &run, 1, "finished", json!({}));
+            assert!(store.run_has_event(&run, "finished").unwrap(), "{run}");
+        }
+    }
+
+    #[test]
+    fn a_writers_highest_version_is_its_highest_record_of_any_kind_or_run() {
+        let (_dir, mut store) = open();
+        let (a, b) = (MachineId::random(), MachineId::random());
+        assert_eq!(store.highest_factory_version(a).unwrap(), None);
+        put(
+            &mut store,
+            a,
+            3,
+            &run("rawphp/softfac", 8, 1),
+            1,
+            "step_changed",
+            json!({}),
+        );
+        put(
+            &mut store,
+            a,
+            70,
+            &run("rawphp/other", 1, 1),
+            1,
+            "step_changed",
+            json!({}),
+        );
+        put(
+            &mut store,
+            b,
+            900,
+            &run("rawphp/softfac", 8, 1),
+            1,
+            "step_changed",
+            json!({}),
+        );
+        assert_eq!(store.highest_factory_version(a).unwrap(), Some(70));
+        assert_eq!(store.highest_factory_version(b).unwrap(), Some(900));
     }
 
     #[test]
@@ -661,6 +714,7 @@ mod tests {
             EVENTS_OF_WRITER,
             EVENTS_OF_WRITER_ABOVE,
             HAS_EVENT,
+            HIGHEST_VERSION,
         ] {
             let steps = plan(&store, sql);
             assert!(

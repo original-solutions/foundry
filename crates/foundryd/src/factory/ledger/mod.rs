@@ -2369,4 +2369,200 @@ mod tests {
         ));
         assert_eq!(mine(&store), 1);
     }
+
+    /// What `ledger` has read of `run`, as (whether it is finished, the highest version read of
+    /// each writer).
+    fn tally(ledger: &Ledger, run: &RunId) -> (bool, std::collections::BTreeMap<MachineId, u64>) {
+        let tallies = ledger.tallies.lock().unwrap();
+        let tally = &tallies[run];
+        (tally.finished, tally.read_to.clone())
+    }
+
+    #[test]
+    fn a_writers_cursor_moves_to_its_highest_version_so_its_other_records_are_not_visited_again() {
+        let (_dir, store) = open_store();
+        let (me, other) = (MachineId::random(), MachineId::random());
+        for version in 1..=3 {
+            put(
+                &store,
+                other,
+                version,
+                &run(8),
+                1,
+                T0,
+                "step_changed",
+                json!({}),
+                None,
+            );
+        }
+        // The other writer carries on with another run.
+        for version in 4..=1003 {
+            put(
+                &store,
+                other,
+                version,
+                &run(9),
+                1,
+                T0,
+                "step_changed",
+                json!({}),
+                None,
+            );
+        }
+        let ledger = ledger(&store, me, 2, ticking(T0, 1000));
+        ledger.write(&run(8), &step("red"), &test_cause()).unwrap();
+        assert_eq!(tally(&ledger, &run(8)).1[&other], 1003);
+        // And again once more is stored, read from above where it was last seen.
+        put(
+            &store,
+            other,
+            1004,
+            &run(9),
+            1,
+            T0,
+            "step_changed",
+            json!({}),
+            None,
+        );
+        ledger
+            .write(&run(8), &step("green"), &test_cause())
+            .unwrap();
+        assert_eq!(tally(&ledger, &run(8)).1[&other], 1004);
+    }
+
+    #[test]
+    fn a_finished_event_read_before_a_later_event_of_its_writer_still_ends_the_run() {
+        let (_dir, store) = open_store();
+        let other = MachineId::random();
+        put(
+            &store,
+            other,
+            1,
+            &run(8),
+            1,
+            T0,
+            "finished",
+            json!({"outcome": "stuck"}),
+            None,
+        );
+        put(
+            &store,
+            other,
+            2,
+            &run(8),
+            1,
+            T0,
+            "step_changed",
+            json!({"step": "late"}),
+            None,
+        );
+        let cold = ledger(&store, MachineId::random(), 2, ticking(T0, 1000));
+        let before = held(&store, &run(8));
+        assert!(matches!(
+            cold.write(&run(8), &step("red"), &test_cause()),
+            Err(LedgerError::AlreadyFinished { .. })
+        ));
+        assert!(matches!(
+            cold.finish(&run(8), Outcome::Stuck, None, None, &test_cause(), None),
+            Err(LedgerError::AlreadyFinished { .. })
+        ));
+        assert_eq!(held(&store, &run(8)), before);
+
+        // The same when the `finished` and the later event are stored after the ledger first
+        // read the run, and read in one catch-up.
+        let (_dir, store) = open_store();
+        let warm = ledger(&store, MachineId::random(), 2, ticking(T0, 1000));
+        warm.write(&run(9), &step("red"), &test_cause()).unwrap();
+        put(
+            &store,
+            other,
+            1,
+            &run(9),
+            1,
+            T0,
+            "finished",
+            json!({"outcome": "stuck"}),
+            None,
+        );
+        put(
+            &store,
+            other,
+            2,
+            &run(9),
+            1,
+            T0,
+            "step_changed",
+            json!({"step": "late"}),
+            None,
+        );
+        let before = held(&store, &run(9));
+        assert!(matches!(
+            warm.write(&run(9), &step("green"), &test_cause()),
+            Err(LedgerError::AlreadyFinished { .. })
+        ));
+        assert_eq!(held(&store, &run(9)), before);
+    }
+
+    #[test]
+    fn the_first_event_is_the_lowest_by_generation_then_version_whatever_order_it_is_read_in() {
+        let (_dir, store) = open_store();
+        let other = MachineId::random();
+        let ledger = ledger(
+            &store,
+            MachineId::random(),
+            2,
+            scripted(&[T0 + 5000, T0 + 9000]),
+        );
+        ledger.write(&run(8), &step("red"), &test_cause()).unwrap();
+        // The earlier holder's events sync in after: generation 1, at versions above the
+        // ledger's own, the first of them at T0.
+        put(
+            &store,
+            other,
+            50,
+            &run(8),
+            1,
+            T0,
+            "step_changed",
+            json!({}),
+            None,
+        );
+        put(
+            &store,
+            other,
+            51,
+            &run(8),
+            1,
+            T0 + 1000,
+            "step_changed",
+            json!({}),
+            None,
+        );
+        ledger
+            .finish(&run(8), Outcome::Stuck, None, None, &test_cause(), None)
+            .unwrap();
+        assert_eq!(last(&store).data, finished_data("stuck", 9000, 0));
+    }
+
+    #[test]
+    fn a_finished_runs_tally_keeps_only_that_it_is_finished_and_reads_nothing_again() {
+        let (_dir, store) = open_store();
+        let ledger = ledger(&store, MachineId::random(), 1, ticking(T0, 1000));
+        ledger
+            .write(&run(8), &gate(1, "cargo test"), &test_cause())
+            .unwrap();
+        ledger
+            .finish(&run(8), Outcome::Stuck, None, None, &test_cause(), None)
+            .unwrap();
+        let before = Store::run_rows_read();
+        assert!(matches!(
+            ledger.write(&run(8), &step("late"), &test_cause()),
+            Err(LedgerError::AlreadyFinished { .. })
+        ));
+        assert_eq!(Store::run_rows_read() - before, 0);
+        assert_eq!(tally(&ledger, &run(8)), (true, Default::default()));
+        let tallies = ledger.tallies.lock().unwrap();
+        assert!(tallies[&run(8)].first.is_none());
+        assert!(tallies[&run(8)].gate_attempts.is_empty());
+    }
 }
