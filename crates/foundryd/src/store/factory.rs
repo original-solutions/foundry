@@ -152,21 +152,42 @@ impl Store {
     }
 
     /// Every writer's factory status for `project`, by machine.
+    ///
+    /// A status this build cannot read, one a newer build left before a rollback, is left out
+    /// with a warning, as [`sessions_of`](Self::sessions_of) does, so one writer's status
+    /// never hides the others'. The other reads give an error for such a row instead:
+    /// [`run_events`](Self::run_events) because a run with an event left out reads as another
+    /// run, and [`held`](Self::held) and [`session_turn`](Self::session_turn) because they
+    /// read one record, which would then read as absent.
     pub fn statuses(
         &self,
         project: ProjectId,
     ) -> Result<Vec<(MachineId, FactoryStatus)>, StoreError> {
         let (from, to) = range(&project.to_string());
         let mut query = self.conn.prepare_cached(
-            "SELECT record FROM factory_records WHERE kind = 'factory_status' \
+            "SELECT owner, version, record FROM factory_records WHERE kind = 'factory_status' \
              AND id >= ?1 AND id < ?2",
         )?;
-        let rows = query.query_map(params![from, to], |row| row.get::<_, String>(0))?;
+        let rows = query.query_map(params![from, to], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
         let mut statuses = Vec::new();
-        for json in rows {
-            let record: FactoryRecord = serde_json::from_str(&json?)?;
-            if let FactoryBody::Status(status) = record.body {
-                statuses.push((record.owner, status));
+        for row in rows {
+            let (owner, version, json) = row?;
+            match serde_json::from_str::<FactoryRecord>(&json) {
+                Ok(FactoryRecord {
+                    owner,
+                    body: FactoryBody::Status(status),
+                    ..
+                }) => statuses.push((owner, status)),
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%project, %owner, version, %error, "a factory status this build cannot read is left out");
+                }
             }
         }
         statuses.sort_by_key(|(machine, _)| *machine);
@@ -174,6 +195,7 @@ impl Store {
     }
 
     /// The highest lease generation any writer's status for `project` holds, or `0` with none.
+    /// A status [`statuses`](Self::statuses) leaves out does not count.
     pub fn highest_generation(&self, project: ProjectId) -> Result<u64, StoreError> {
         Ok(self
             .statuses(project)?

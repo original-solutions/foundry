@@ -1712,6 +1712,127 @@ fn held_and_session_turn_are_read_by_their_key() {
     assert_eq!(store.session_turn(SessionId::random()).unwrap(), None);
 }
 
+/// Puts a factory row this build cannot read under `kind` and `id`, as a newer build would
+/// have left it before a rollback: `body` is the record's body with a change this build does
+/// not know.
+fn insert_unreadable_factory(
+    store: &Store,
+    owner: MachineId,
+    version: u64,
+    kind: &str,
+    id: &str,
+    body: serde_json::Value,
+) {
+    let record = serde_json::json!({
+        "owner": owner.to_string(),
+        "version": version,
+        "kind": kind,
+        "body": body,
+    });
+    assert!(serde_json::from_value::<FactoryRecord>(record.clone()).is_err());
+    store
+        .conn
+        .execute(
+            "INSERT INTO factory_records (kind, id, owner, version, record)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                kind,
+                id,
+                owner.to_string(),
+                version as i64,
+                record.to_string()
+            ],
+        )
+        .unwrap();
+}
+
+/// One writer's status this build cannot read must not hide the other writers' statuses or
+/// the highest generation they hold, as `sessions_of` leaves out a session it cannot read.
+#[test]
+fn statuses_leave_out_a_status_they_cannot_read_and_give_the_rest() {
+    let (_dir, mut store) = open();
+    let project = ProjectId::random();
+    let one = MachineId::random();
+    let two = MachineId::random();
+    let newer = MachineId::random();
+    store
+        .apply_factory(&status(one, 1, project, 1, 3), one)
+        .unwrap();
+    store
+        .apply_factory(&status(two, 1, project, 1, 7), two)
+        .unwrap();
+    let mut body = serde_json::to_value(status_body(project, 1, 99)).unwrap();
+    body["ready"] = serde_json::json!([{"from": "a newer build"}]);
+    insert_unreadable_factory(
+        &store,
+        newer,
+        1,
+        "factory_status",
+        &format!("{project}/{newer}"),
+        body,
+    );
+
+    let statuses = store.statuses(project).unwrap();
+    let mut expected = vec![
+        (one, status_body(project, 1, 3)),
+        (two, status_body(project, 1, 7)),
+    ];
+    expected.sort_by_key(|(machine, _)| *machine);
+    assert_eq!(statuses, expected);
+    assert_eq!(store.highest_generation(project).unwrap(), 7);
+}
+
+/// A run with an event left out would read as another run, so an event this build cannot
+/// read is an error, as it is for `factory_since`.
+#[test]
+fn run_events_fail_on_an_event_they_cannot_read() {
+    let (_dir, mut store) = open();
+    let owner = MachineId::random();
+    let run = run_id("a/b", 1, 1);
+    store
+        .apply_factory(&run_event(owner, 1, &run, 1, 1), owner)
+        .unwrap();
+    let FactoryBody::RunEvent(event) = run_event(owner, 2, &run, 1, 2).body else {
+        unreachable!()
+    };
+    let mut body = serde_json::to_value(event).unwrap();
+    body["generation"] = serde_json::json!("from a newer build");
+    insert_unreadable_factory(
+        &store,
+        owner,
+        2,
+        "run_event",
+        &format!("{run}/{owner}/2"),
+        body,
+    );
+    assert!(matches!(store.run_events(&run), Err(StoreError::Json(_))));
+}
+
+/// A record read by its key that this build cannot read is an error, never read as absent.
+#[test]
+fn held_fails_on_a_record_it_cannot_read() {
+    let (_dir, store) = open();
+    let owner = MachineId::random();
+    let mut body = serde_json::to_value(held_body(&["a"])).unwrap();
+    body["logins"] = serde_json::json!("from a newer build");
+    insert_unreadable_factory(&store, owner, 1, "machine_held", &owner.to_string(), body);
+    assert!(matches!(store.held(owner), Err(StoreError::Json(_))));
+}
+
+#[test]
+fn session_turn_fails_on_a_turn_it_cannot_read() {
+    let (_dir, store) = open();
+    let owner = MachineId::random();
+    let session = SessionId::random();
+    let mut body = serde_json::to_value(turn_body(session, 1)).unwrap();
+    body["turn"] = serde_json::json!("from a newer build");
+    insert_unreadable_factory(&store, owner, 1, "session_turn", &session.to_string(), body);
+    assert!(matches!(
+        store.session_turn(session),
+        Err(StoreError::Json(_))
+    ));
+}
+
 #[test]
 fn the_factory_migration_runs_on_an_empty_file() {
     let dir = tempfile::tempdir().unwrap();
