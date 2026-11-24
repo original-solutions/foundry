@@ -140,6 +140,10 @@ pub const HIDDEN_UNREADABLE: &str = "[hidden: the secret store could not be read
 /// The longest GitHub login. A 40-character string is a legacy token, never a login.
 const LOGIN_MAX: usize = 39;
 
+/// What [`is_login`] takes, in words, for every message that refuses a login and for the help
+/// of `secret set`. A test ties it to [`LOGIN_MAX`].
+pub const LOGIN_RULE: &str = "letters, digits and -, at most 39 characters";
+
 /// Whether `login` is a GitHub login as foundry takes it: letters, digits and `-`, not empty and
 /// at most 39 characters (GitHub's own limit).
 pub fn is_login(login: &str) -> bool {
@@ -331,8 +335,7 @@ fn move_secrets(old: &dyn OldStore, new: &FileSecrets) -> Result<(), SecretsErro
 pub enum SetError {
     #[error(
         "the name is not a secret to set here; the names are {GATEWAY}, {GATEWAY_MANAGEMENT} and \
-         {GITHUB_PREFIX}<login>, where a login is letters, digits and -, at most {LOGIN_MAX} \
-         characters"
+         {GITHUB_PREFIX}<login>, where a login is {LOGIN_RULE}"
     )]
     // No field: the refused name may be a token pasted in place of a login, so it is never quoted.
     UnknownName,
@@ -380,8 +383,7 @@ pub fn github_default_command(login: &str) -> ExitCode {
     if !is_login(login) {
         // The argument is not echoed: it may be a token pasted in place of a login.
         eprintln!(
-            "foundryd github default: the argument is not a GitHub login; a login is letters, \
-             digits and -, at most {LOGIN_MAX} characters"
+            "foundryd github default: the argument is not a GitHub login; a login is {LOGIN_RULE}"
         );
         return ExitCode::FAILURE;
     }
