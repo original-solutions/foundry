@@ -2534,6 +2534,20 @@ mod tests {
     }
 
     #[test]
+    fn hide_known_keeps_the_reading_with_the_shorter_gap_when_two_meet() {
+        // At `\u{9d}a\u{7}` the partial match `aaaaaaaa` goes on two ways and both reach the
+        // same length: past the whole control string (a gap of 3), and with the lone C1
+        // introducer as the gap and the string's `a` as one of its own (a gap of 1 since). Only
+        // the second leaves room for 31 more characters of gap within 32.
+        let secrets = MemorySecrets::default();
+        secrets.set(GATEWAY, "aaaaaaaabcdefghi").unwrap();
+        let text = format!("<aaaaaaaa\u{9d}a\u{7}{}bcdefghi>", " ".repeat(31));
+        assert_eq!(hide_known(&text, &secrets), "<a***>");
+        let text = format!("<aaaaaaaa\u{9d}a\u{7}{}bcdefghi>", " ".repeat(32));
+        assert_eq!(hide_known(&text, &secrets), text);
+    }
+
+    #[test]
     fn hide_known_hides_a_value_that_overlaps_itself() {
         let secrets = MemorySecrets::default();
         secrets.set(GATEWAY, "ghp_abcghp_abcghp_xyz0").unwrap();
