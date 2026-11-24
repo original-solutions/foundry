@@ -2449,21 +2449,46 @@ mod tests {
     }
 
     #[test]
-    fn the_believed_status_names_its_runs_below_the_top_generation() {
+    fn a_believed_status_below_the_top_generation_names_no_factory_work() {
         let mut world = World::new();
         let project = world.factory_project(true);
         let peer = world.peer;
-        // The peer is online and holds at generation 2, so it is believed over a machine that
-        // went offline holding at generation 3. The run items are read from the peer's status,
-        // so the sessions it names raise none of P1's.
+        // The peer held at generation 2 and stalled while online. A newer holder took the
+        // lease at generation 3 and went offline, so the peer's stale status is believed. It
+        // was superseded all the same, so the sessions it names raise P1's items again.
         let session = world.session(peer, SessionState::Stuck);
         world.status(peer, naming(project, 2, peer, Vec::new(), vec![session.id]));
         world.status(MachineId::random(), holding(project, 3, 1));
+        assert_eq!(world.of(Kind::SessionStuck).len(), 1, "{:?}", world.items());
+    }
+
+    #[test]
+    fn a_newer_holder_the_acting_coordinator_sees_ends_an_offline_holders_cover() {
+        let mut world = World::new();
+        let project = world.factory_project(true);
+        let (me, peer) = (world.me, world.peer);
+        let session = world.session(me, SessionState::Stuck);
+        world.status(peer, naming(project, 3, me, Vec::new(), vec![session.id]));
+        world.online.remove(&peer);
+        let held_by = |machine, generation| {
+            not_holding(
+                project,
+                NotHolding::HeldBy {
+                    machine,
+                    generation,
+                },
+            )
+        };
+        // The lease ref still names the offline peer at generation 3: its runs stay covered.
+        world.status(me, held_by(peer, 3));
         assert!(
             world.of(Kind::SessionStuck).is_empty(),
             "{:?}",
             world.items()
         );
+        // Another machine took it at generation 4, and its status has not arrived yet.
+        world.status(me, held_by(MachineId::random(), 4));
+        assert_eq!(world.of(Kind::SessionStuck).len(), 1, "{:?}", world.items());
     }
 
     #[test]
