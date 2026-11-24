@@ -284,11 +284,15 @@ fn hide_values(text: &str, values: &[String], work: &mut usize) -> String {
 /// matches of the same length are one, the one with the shorter gap since its last character
 /// kept, so there is at most one for each length from none to the whole value, and the text
 /// is read once. Each holds the places of the characters it has matched and no others, so
-/// what a `Split` holds is bounded by its value, never by the text.
+/// what a `Split` holds is bounded by its value, never by the text. Each character costs a
+/// step for each partial match, and a fork also copies the places each one holds.
 struct Split {
     pattern: Pattern,
     /// The partial matches at the character being read.
     states: Vec<State>,
+    /// For each length from none to the whole value, where in `states` the partial match of
+    /// that length is, if there is one.
+    at_length: Vec<Option<usize>>,
     /// Partial matches that took a whole escape sequence as a gap, with the byte offset of
     /// the character after it, where they go on.
     waiting: Vec<(usize, State)>,
@@ -306,12 +310,16 @@ struct State {
 
 impl Split {
     fn new(value: &str) -> Self {
+        let pattern = Pattern::new(value);
+        let mut at_length = vec![None; pattern.value.len() + 1];
+        at_length[0] = Some(0);
         Self {
-            pattern: Pattern::new(value),
+            pattern,
             states: vec![State {
                 kept: VecDeque::new(),
                 gap: 0,
             }],
+            at_length,
             waiting: Vec::new(),
         }
     }
@@ -337,6 +345,9 @@ impl Split {
             }
         }
         let states = std::mem::take(&mut self.states);
+        for state in &states {
+            self.at_length[state.kept.len()] = None;
+        }
         for mut state in states {
             *work += 1;
             if is_gap(c) {
@@ -362,16 +373,18 @@ impl Split {
         }
     }
 
-    /// Adds `state` to the partial matches, as one with any of the same length. `work` counts
-    /// the partial matches looked at.
+    /// Adds `state` to the partial matches, as one with any of the same length, found in one
+    /// step. `work` counts the partial matches looked at.
     fn insert(&mut self, state: State, work: &mut usize) {
-        match self.states.iter_mut().find(|held| {
-            *work += 1;
-            held.kept.len() == state.kept.len()
-        }) {
-            Some(held) if state.gap < held.gap => *held = state,
+        *work += 1;
+        let length = state.kept.len();
+        match self.at_length[length] {
+            Some(i) if state.gap < self.states[i].gap => self.states[i] = state,
             Some(_) => {}
-            None => self.states.push(state),
+            None => {
+                self.at_length[length] = Some(self.states.len());
+                self.states.push(state);
+            }
         }
     }
 
