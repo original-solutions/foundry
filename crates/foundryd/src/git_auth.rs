@@ -575,59 +575,83 @@ mod tests {
         assert!(std::env::var_os(TOKEN_VAR).is_none());
     }
 
-    #[test]
-    fn config_from_the_environment_the_daemon_started_with_is_not_passed_on() {
-        let data = tempfile::tempdir().unwrap();
-        let auth = auth(data.path());
-        let mut command = Command::new("true");
-        command
-            .env("GIT_CONFIG_PARAMETERS", "'credential.helper'='osxkeychain'")
-            .env("GIT_CONFIG_COUNT", "1")
-            .env("GIT_SSL_NO_VERIFY", "1")
-            .env("GIT_DIR", "/elsewhere/.git")
-            .env("GIT_WORK_TREE", "/elsewhere")
-            .env("GIT_INDEX_FILE", "/elsewhere/.git/index");
-        auth.apply(&mut command);
-        let envs: BTreeMap<OsString, Option<OsString>> = command
-            .get_envs()
-            .map(|(key, value)| (key.to_owned(), value.map(ToOwned::to_owned)))
-            .collect();
-        for key in [
+    /// Every variable `apply` drops when it is inherited: the whole list in the code, so a name
+    /// added to it later is tested too, and the ones git does not list, by name.
+    fn dropped() -> Vec<&'static str> {
+        let mut names = INHERITED.to_vec();
+        names.extend([
             "GIT_CONFIG_PARAMETERS",
             "GIT_CONFIG_COUNT",
             "GIT_SSL_NO_VERIFY",
+            "GIT_NAMESPACE",
             "GIT_DIR",
-            "GIT_WORK_TREE",
-            "GIT_INDEX_FILE",
-        ] {
-            assert_eq!(envs.get(&OsString::from(key)), Some(&None), "{key}");
+            "GIT_COMMON_DIR",
+        ]);
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+
+    fn envs_of(command: &Command) -> BTreeMap<OsString, Option<OsString>> {
+        command
+            .get_envs()
+            .map(|(key, value)| (key.to_owned(), value.map(ToOwned::to_owned)))
+            .collect()
+    }
+
+    #[test]
+    fn what_the_daemon_started_with_is_not_passed_on() {
+        let data = tempfile::tempdir().unwrap();
+        let auth = auth(data.path());
+        let mut command = Command::new("true");
+        for name in dropped() {
+            command.env(name, "inherited");
+        }
+        auth.apply(&mut command);
+        let envs = envs_of(&command);
+        for name in dropped() {
+            assert_eq!(envs.get(&OsString::from(name)), Some(&None), "{name}");
         }
     }
 
     #[test]
-    fn the_repository_a_caller_sets_after_apply_is_kept() {
+    fn what_a_caller_sets_after_apply_is_kept() {
         let data = tempfile::tempdir().unwrap();
         let mut command = Command::new("true");
         auth(data.path()).apply(&mut command);
-        command
-            .env("GIT_DIR", "/elsewhere/.git")
-            .env("GIT_WORK_TREE", "/elsewhere")
-            .env("GIT_INDEX_FILE", "/elsewhere/.git/index");
-        let envs: BTreeMap<OsString, Option<OsString>> = command
-            .get_envs()
-            .map(|(key, value)| (key.to_owned(), value.map(ToOwned::to_owned)))
-            .collect();
-        for (key, value) in [
-            ("GIT_DIR", "/elsewhere/.git"),
-            ("GIT_WORK_TREE", "/elsewhere"),
-            ("GIT_INDEX_FILE", "/elsewhere/.git/index"),
-        ] {
+        for name in dropped() {
+            command.env(name, "set after apply");
+        }
+        let envs = envs_of(&command);
+        for name in dropped() {
             assert_eq!(
-                envs.get(&OsString::from(key)),
-                Some(&Some(OsString::from(value))),
-                "{key}"
+                envs.get(&OsString::from(name)),
+                Some(&Some(OsString::from("set after apply"))),
+                "{name}"
             );
         }
+    }
+
+    #[test]
+    fn apply_drops_or_pins_every_variable_git_lists_as_describing_the_repository() {
+        let out = Command::new("git")
+            .args(["rev-parse", "--local-env-vars"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let listed = String::from_utf8(out.stdout).unwrap();
+        assert!(listed.lines().any(|name| name == "GIT_DIR"), "{listed}");
+        let pinned: Vec<&str> = ENV.iter().map(|(name, _)| *name).collect();
+        let missing: Vec<&str> = listed
+            .lines()
+            .filter(|name| !INHERITED.contains(name) && !pinned.contains(name))
+            .collect();
+        let version = Command::new("git").arg("--version").output().unwrap();
+        assert!(
+            missing.is_empty(),
+            "{} lists {missing:?} as describing the repository; add them to INHERITED",
+            String::from_utf8_lossy(&version.stdout).trim()
+        );
     }
 
     #[test]
@@ -769,7 +793,7 @@ mod tests {
     }
 
     #[test]
-    fn an_inherited_git_dir_cannot_point_the_call_at_another_repositorys_config() {
+    fn an_inherited_git_dir_or_common_dir_cannot_point_the_call_at_another_repositorys_config() {
         let machine = Machine::new();
         // A second repository whose config turns TLS verification off for github.com, which
         // a URL-scoped key does over the call's `-c` setting.
@@ -796,24 +820,30 @@ mod tests {
                 .unwrap();
             String::from_utf8(out.stdout).unwrap()
         };
-        // The setup works: git reads the repository GIT_DIR names, not the working directory.
-        assert_eq!(
-            verify(machine.git(&[]).env("GIT_DIR", &git_dir)),
-            "false\n",
-            "the setup"
-        );
         let data = tempfile::tempdir().unwrap();
         let auth = auth(data.path());
-        // Inherited from the daemon's environment: the call reads the repository it runs in.
-        let mut inherited = machine.git(&[]);
-        inherited.env("GIT_DIR", &git_dir);
-        auth.apply(&mut inherited);
-        assert_eq!(verify(&mut inherited), "true\n");
-        // Set by the caller after `apply`: kept.
-        assert_eq!(
-            verify(machine.hardened(&auth).env("GIT_DIR", &git_dir)),
-            "false\n"
-        );
+        // The config file is in the common directory, so either variable picks it.
+        for name in ["GIT_DIR", "GIT_COMMON_DIR"] {
+            // The setup works: git reads the repository the variable names, not the working
+            // directory's.
+            assert_eq!(
+                verify(machine.git(&[]).env(name, &git_dir)),
+                "false\n",
+                "{name}: the setup"
+            );
+            // Inherited from the daemon's environment: the call reads the repository it runs
+            // in.
+            let mut inherited = machine.git(&[]);
+            inherited.env(name, &git_dir);
+            auth.apply(&mut inherited);
+            assert_eq!(verify(&mut inherited), "true\n", "{name}");
+            // Set by the caller after `apply`: kept.
+            assert_eq!(
+                verify(machine.hardened(&auth).env(name, &git_dir)),
+                "false\n",
+                "{name}: set after apply"
+            );
+        }
     }
 
     #[test]
