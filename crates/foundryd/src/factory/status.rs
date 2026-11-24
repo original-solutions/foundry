@@ -336,8 +336,15 @@ mod tests {
         let project = ProjectId::random();
         let (holder, acting) = (MachineId::random(), MachineId::random());
         let holds = holding(project, 5, 3);
+        // The not-holding writer's own pass count is above the holder's: `holds` must decide.
         let statuses = vec![
-            (acting, held_by(project, holder, 5)),
+            (
+                acting,
+                FactoryStatus {
+                    pass: 50,
+                    ..held_by(project, holder, 5)
+                },
+            ),
             (holder, holds.clone()),
         ];
 
@@ -347,22 +354,89 @@ mod tests {
     }
 
     #[test]
-    fn a_holding_status_beats_a_not_holding_one_at_a_higher_generation() {
+    fn a_holding_status_below_a_generation_another_online_writer_reports_is_not_believed() {
         let project = ProjectId::random();
-        let (holder, other, acting) = (
+        let (stale, other, acting) = (
+            MachineId::random(),
+            MachineId::random(),
+            MachineId::random(),
+        );
+        // `stale` held the lease at 4, stopped acting and stays online; the ref is at 6.
+        let acting_says = held_by(project, other, 6);
+        let statuses = vec![
+            (acting, acting_says.clone()),
+            (stale, holding(project, 4, 300)),
+        ];
+
+        let believed = believed(&statuses, &online(&[stale, acting]), acting);
+
+        assert_eq!(believed, Some(acting_says));
+    }
+
+    #[test]
+    fn a_generation_reported_by_a_writer_that_is_not_online_unseats_no_holder() {
+        let project = ProjectId::random();
+        let (holder, gone, acting) = (
             MachineId::random(),
             MachineId::random(),
             MachineId::random(),
         );
         let holds = holding(project, 4, 3);
         let statuses = vec![
-            (acting, held_by(project, other, 6)),
+            (gone, held_by(project, acting, 9)),
             (holder, holds.clone()),
+            (acting, no_token(project)),
         ];
 
         let believed = believed(&statuses, &online(&[holder, acting]), acting);
 
         assert_eq!(believed, Some(holds));
+    }
+
+    #[test]
+    fn a_no_token_status_does_not_unseat_an_online_holder() {
+        let project = ProjectId::random();
+        let (holder, acting) = (MachineId::random(), MachineId::random());
+        let holds = holding(project, 4, 3);
+        let statuses = vec![(acting, no_token(project)), (holder, holds.clone())];
+
+        let believed = believed(&statuses, &online(&[holder, acting]), acting);
+
+        assert_eq!(believed, Some(holds));
+    }
+
+    #[test]
+    fn of_two_holders_at_one_generation_the_higher_pass_is_believed_in_any_order() {
+        let project = ProjectId::random();
+        let (one, two) = (MachineId::random(), MachineId::random());
+        let higher = holding(project, 5, 4);
+        let statuses = vec![(one, holding(project, 5, 3)), (two, higher.clone())];
+
+        for order in [statuses.clone(), statuses.into_iter().rev().collect()] {
+            assert_eq!(
+                believed(&order, &online(&[one, two]), one),
+                Some(higher.clone())
+            );
+        }
+    }
+
+    #[test]
+    fn of_two_holders_at_one_generation_and_pass_the_lower_machine_id_is_believed() {
+        let project = ProjectId::random();
+        let (one, two) = (MachineId::random(), MachineId::random());
+        let (low, high) = (one.min(two), one.max(two));
+        let from_low = FactoryStatus {
+            idle: Some("low".into()),
+            ..holding(project, 5, 3)
+        };
+        let statuses = vec![(high, holding(project, 5, 3)), (low, from_low.clone())];
+
+        for order in [statuses.clone(), statuses.into_iter().rev().collect()] {
+            assert_eq!(
+                believed(&order, &online(&[low, high]), high),
+                Some(from_low.clone())
+            );
+        }
     }
 
     #[test]
@@ -526,6 +600,22 @@ mod tests {
 
         freshness.received(&holding(project, 6, 1));
         assert_eq!(freshness.since_holding(project), Duration::ZERO);
+    }
+
+    #[test]
+    fn the_generation_a_held_by_status_names_is_seen_even_above_its_own() {
+        let project = ProjectId::random();
+        let (clock, freshness) = freshness();
+        freshness.received(&holding(project, 5, 1));
+        freshness.received(&FactoryStatus {
+            generation: 0,
+            ..held_by(project, MachineId::random(), 6)
+        });
+        clock.advance(3 * MINUTE);
+
+        freshness.received(&holding(project, 5, 2));
+
+        assert_eq!(freshness.since_holding(project), 3 * MINUTE);
     }
 
     #[test]
