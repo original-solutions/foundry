@@ -5186,6 +5186,54 @@ async fn a_command_that_ended_in_time_leaves_no_watcher_behind() {
 }
 
 #[tokio::test]
+async fn the_watcher_of_a_command_that_ended_in_time_is_stopped_before_the_next_command_runs() {
+    let setup = Setup::new();
+    let remote = setup.project(&[("README.md", "hello\n")]);
+    let id = setup
+        .make(
+            &remote,
+            "next",
+            new_branch("main", "next"),
+            commands(&["true", "sleep 6"], 3189),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // The terminal's hangup ends any process left behind once the last command ends, so a
+    // first command's watcher that outlived it shows only while a later one still runs.
+    let deadline = Instant::now() + WAIT;
+    let terminal = loop {
+        let terminals = setup.terminals_of(id);
+        if let [terminal] = terminals.as_slice()
+            && setup.screen(terminal.body.id).await.contains("$ sleep 6")
+        {
+            break terminal.body.id;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the second command never started"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    // The first watcher is stopped before the second command is printed; its sleep may take a
+    // moment to be reaped.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let watchers = Setup::processes_with("sleep 3189");
+        if watchers.len() == 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "one watcher, the second command's, should run: {watchers:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    setup.terminals.close(terminal).await.unwrap();
+}
+
+#[tokio::test]
 async fn an_empty_list_of_commands_is_no_setup() {
     let setup = Setup::new();
     let remote = setup.project(&[("README.md", "hello\n")]);
