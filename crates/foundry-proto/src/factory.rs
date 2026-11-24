@@ -208,8 +208,10 @@ pub struct FactoryKey {
 impl FactoryRecord {
     /// The record's key. Every run event is a record of its own, `<run>/<owner>/<version>`, as
     /// no event is ever rewritten. A status is one per project and writer,
-    /// `<project>/<owner>`. A machine's logins held are keyed by the machine, and a session's
-    /// turn by the session.
+    /// `<project>/<owner>`. A machine's logins held are keyed by the machine. A session's turn
+    /// is one per session and writer, `<session>/<owner>`, so a machine that does not own a
+    /// session never takes the key its owner writes the session's turns under; the reader takes
+    /// the turn of the machine that owns the session's P1 record.
     pub fn key(&self) -> FactoryKey {
         let id = match &self.body {
             FactoryBody::RunEvent(event) => {
@@ -217,7 +219,7 @@ impl FactoryRecord {
             }
             FactoryBody::Status(status) => format!("{}/{}", status.project, self.owner),
             FactoryBody::Held(_) => self.owner.to_string(),
-            FactoryBody::Turn(turn) => turn.session.to_string(),
+            FactoryBody::Turn(turn) => format!("{}/{}", turn.session, self.owner),
         };
         FactoryKey {
             kind: self.body.kind(),
@@ -1141,7 +1143,8 @@ pub(crate) mod tests {
         assert_ne!(held_mine.key(), held_theirs.key());
         assert_eq!(held_mine.key().id, owner.to_string());
 
-        // One `SessionTurn` per session.
+        // One `SessionTurn` per session and writer, so a machine that does not own a session
+        // never takes the key its owner writes the session's turns under.
         let turn_one = record(owner, 1, FactoryBody::Turn(turn.clone()));
         let turn_two = record(
             owner,
@@ -1151,8 +1154,10 @@ pub(crate) mod tests {
                 ..turn.clone()
             }),
         );
+        let turn_theirs = record(other, 1, FactoryBody::Turn(turn.clone()));
         assert_eq!(turn_one.key(), turn_two.key());
-        assert_eq!(turn_one.key().id, turn.session.to_string());
+        assert_ne!(turn_one.key(), turn_theirs.key());
+        assert_eq!(turn_one.key().id, format!("{}/{owner}", turn.session));
 
         // Kinds never share a key.
         let keys = [first.key(), mine.key(), held_mine.key(), turn_one.key()];

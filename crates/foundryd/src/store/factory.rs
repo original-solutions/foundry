@@ -6,10 +6,11 @@
 //! a run's events are ordered by the lease generation they were written under, then by version.
 //!
 //! Every row is written under [`FactoryRecord::key`], and the reads below spell out its kind
-//! names and id layouts (`<run>/<owner>/<version>`, `<project>/<owner>`, the machine, the
-//! session) in their queries. Each read's tests store records through `apply_factory`, which
-//! keys them by `FactoryRecord::key`, and read them back here, so a change to a kind name or an
-//! id layout in `foundry-proto` fails those tests rather than leaving a read empty.
+//! names and id layouts (`<run>/<owner>/<version>`, `<project>/<owner>`, the machine,
+//! `<session>/<owner>`) in their queries. Each read's tests store records through
+//! `apply_factory`, which keys them by `FactoryRecord::key`, and read them back here, so a
+//! change to a kind name or an id layout in `foundry-proto` fails those tests rather than
+//! leaving a read empty.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -251,9 +252,20 @@ impl Store {
         }
     }
 
-    /// The newest turn of `session`, read by its key.
+    /// The newest turn of `session` written by the machine that owns P1's record of it, read
+    /// by its key. A turn from any other machine is never the session's. A turn and P1's
+    /// session record sync apart, so a turn held before the record is stored and reads as
+    /// `None` until the record says whose session it is.
     pub fn session_turn(&self, session: SessionId) -> Result<Option<SessionTurn>, StoreError> {
-        match self.factory_by_key("session_turn", &session.to_string())? {
+        let owner: Option<String> = self
+            .conn
+            .prepare_cached("SELECT owner FROM records WHERE kind = 'session' AND id = ?1")?
+            .query_row(params![session.to_string()], |row| row.get(0))
+            .optional()?;
+        let Some(owner) = owner else {
+            return Ok(None);
+        };
+        match self.factory_by_key("session_turn", &format!("{session}/{owner}"))? {
             Some(FactoryBody::Turn(turn)) => Ok(Some(turn)),
             Some(other) => Err(wrong_kind("session_turn", &other)),
             None => Ok(None),
