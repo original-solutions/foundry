@@ -96,6 +96,7 @@ impl Tracker for FakeTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::factory::github::OtherKind;
 
     fn args(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|part| part.to_string()).collect()
@@ -136,9 +137,10 @@ mod tests {
         let fake = FakeTracker::new();
         assert_eq!(
             fake.gh(&args(&["api", "user"])).unwrap_err(),
-            TrackerError::Other(
-                "cannot start `gh api user`: no answer scripted for `gh api user`".into()
-            )
+            TrackerError::Other {
+                kind: OtherKind::NotStarted,
+                message: "cannot start `gh api user`: no answer scripted for `gh api user`".into()
+            }
         );
     }
 

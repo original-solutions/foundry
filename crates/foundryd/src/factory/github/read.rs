@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use serde::de::DeserializeOwned;
 
 use super::gh::{invalid_argument, one_line, parse_error};
-use super::{Tracker, TrackerError};
+use super::{OtherKind, Tracker, TrackerError};
 use crate::factory::lifecycle::approval::{Approval, Refusal, TextCheck};
 use crate::factory::lifecycle::{State, depends_on};
 use crate::factory::text::is_commit_id;
@@ -660,11 +660,16 @@ pub fn pull_request<G: Tracker + ?Sized>(
     ];
     let stdout = match gh.gh(&args) {
         Ok(stdout) => stdout,
-        Err(error @ (TrackerError::Other(_) | TrackerError::NotFound { .. }))
-            if error
-                .to_string()
-                .to_lowercase()
-                .contains("could not resolve to a pullrequest") =>
+        Err(
+            error @ (TrackerError::Other {
+                kind: OtherKind::Failed,
+                ..
+            }
+            | TrackerError::NotFound { .. }),
+        ) if error
+            .to_string()
+            .to_lowercase()
+            .contains("could not resolve to a pullrequest") =>
         {
             return Ok(None);
         }
@@ -2286,16 +2291,33 @@ mod tests {
     const HEAD_SHA: &str = "4f1c2d3e4a5b60718293a4b5c6d7e8f901234567";
 
     fn is_parse(error: &TrackerError) -> bool {
-        matches!(error, TrackerError::Other(m) if m.contains("returned unexpected output"))
+        matches!(
+            error,
+            TrackerError::Other {
+                kind: OtherKind::Parse,
+                ..
+            }
+        )
     }
 
     fn is_refused(error: &TrackerError) -> bool {
-        matches!(error, TrackerError::Other(m)
-            if m.contains("before calling gh") && !m.contains("unexpected output"))
+        matches!(
+            error,
+            TrackerError::Other {
+                kind: OtherKind::InvalidArgument,
+                ..
+            }
+        )
     }
 
     fn is_failed(error: &TrackerError) -> bool {
-        matches!(error, TrackerError::Other(m) if m.contains("exited with status"))
+        matches!(
+            error,
+            TrackerError::Other {
+                kind: OtherKind::Failed,
+                ..
+            }
+        )
     }
 
     fn ref_reply(sha: &str) -> String {
@@ -3033,7 +3055,7 @@ mod tests {
         let fake = FakeTracker::new();
         let error = pull_request(&fake, REPO, 999).unwrap_err();
         assert!(
-            matches!(&error, TrackerError::Other(m) if m.contains("cannot start")),
+            matches!(&error, TrackerError::Other { kind: OtherKind::NotStarted, message: m } if m.contains("cannot start")),
             "{error}"
         );
     }
@@ -3425,7 +3447,7 @@ mod tests {
         let spawn = FakeTracker::new();
         let error = open_blockers(&spawn, REPO, 14).unwrap_err();
         assert!(
-            matches!(&error, TrackerError::Other(m) if m.contains("cannot start")),
+            matches!(&error, TrackerError::Other { kind: OtherKind::NotStarted, message: m } if m.contains("cannot start")),
             "{error}"
         );
 
@@ -4608,7 +4630,10 @@ mod tests {
     /// Whether `error` is a parse error that names the call with `call`.
     fn is_parse_error_of(error: Option<TrackerError>, call: &[String]) -> bool {
         match error {
-            Some(TrackerError::Other(message)) => message.starts_with(&format!(
+            Some(TrackerError::Other {
+                kind: OtherKind::Parse,
+                message,
+            }) => message.starts_with(&format!(
                 "`{}` returned unexpected output",
                 command_text(call)
             )),
@@ -4729,20 +4754,26 @@ mod tests {
         let error = failed.approval(REPO, 6, &names(&["tom"])).unwrap_err();
         assert_eq!(
             error,
-            TrackerError::Other(format!(
-                "`{}` exited with status 1: HTTP 502",
-                command_text(&approval_call())
-            ))
+            TrackerError::Other {
+                kind: OtherKind::Failed,
+                message: format!(
+                    "`{}` exited with status 1: HTTP 502",
+                    command_text(&approval_call())
+                )
+            }
         );
 
         let spawn = FakeTracker::answering([Answer::NotStarted("no such file".into())]);
         let error = spawn.approval(REPO, 6, &names(&["tom"])).unwrap_err();
         assert_eq!(
             error,
-            TrackerError::Other(format!(
-                "cannot start `{}`: no such file",
-                command_text(&approval_call())
-            ))
+            TrackerError::Other {
+                kind: OtherKind::NotStarted,
+                message: format!(
+                    "cannot start `{}`: no such file",
+                    command_text(&approval_call())
+                )
+            }
         );
     }
 
@@ -5065,7 +5096,7 @@ mod tests {
         let fake = FakeTracker::new();
         let error = fake.approval("softfac", 6, &names(&["tom"])).unwrap_err();
         assert!(
-            matches!(&error, TrackerError::Other(m) if m.contains("returned unexpected output")),
+            matches!(&error, TrackerError::Other { kind: OtherKind::Parse, message: m } if m.contains("returned unexpected output")),
             "{error}"
         );
         assert!(fake.calls().is_empty());
@@ -5320,7 +5351,7 @@ mod tests {
             .text_check(REPO, 6, LABELED, &names(&["tom"]))
             .unwrap_err();
         assert!(
-            matches!(&error, TrackerError::Other(m) if m.contains("exited with status 1")),
+            matches!(&error, TrackerError::Other { kind: OtherKind::Failed, message: m } if m.contains("exited with status 1")),
             "{error}"
         );
 
@@ -5402,7 +5433,7 @@ mod tests {
         let fake = FakeTracker::new();
         let error = fake.text_edited_since(REPO, 6, "yesterday").unwrap_err();
         assert!(
-            matches!(&error, TrackerError::Other(m) if m.contains("returned unexpected output"))
+            matches!(&error, TrackerError::Other { kind: OtherKind::Parse, message: m } if m.contains("returned unexpected output"))
         );
         assert!(fake.calls().is_empty());
     }
@@ -6243,10 +6274,13 @@ mod tests {
         let error = activity_error(&failing, &["tom"]);
         assert_eq!(
             error,
-            TrackerError::Other(format!(
-                "`{}` exited with status 1: boom",
-                command_text(&editor_call(&ids(&["IC_7"])))
-            ))
+            TrackerError::Other {
+                kind: OtherKind::Failed,
+                message: format!(
+                    "`{}` exited with status 1: boom",
+                    command_text(&editor_call(&ids(&["IC_7"])))
+                )
+            }
         );
         let old_shape = r#"{"data":{"nodes":[{"id":"IC_7","lastEditedAt":"2026-10-04T10:20:00Z","editor":{"login":"tom"}}]}}"#;
         let no_total = r#"{"data":{"nodes":[{"id":"IC_7","lastEditedAt":null,"editor":null,"userContentEdits":{"nodes":[]}}]}}"#;
@@ -6482,10 +6516,13 @@ mod tests {
         let failed = activity_error(&comments, &["tom"]);
         assert_eq!(
             failed,
-            TrackerError::Other(format!(
-                "`{}` exited with status 1: Not Found",
-                command_text(&comments_call())
-            ))
+            TrackerError::Other {
+                kind: OtherKind::Failed,
+                message: format!(
+                    "`{}` exited with status 1: Not Found",
+                    command_text(&comments_call())
+                )
+            }
         );
         assert_eq!(comments.calls().len(), 1);
 
@@ -6496,10 +6533,13 @@ mod tests {
         let body_failed = activity_error(&body, &["tom"]);
         assert_eq!(
             body_failed,
-            TrackerError::Other(format!(
-                "`{}` exited with status 1: Could not resolve to an Issue",
-                command_text(&body_edit_call())
-            ))
+            TrackerError::Other {
+                kind: OtherKind::Failed,
+                message: format!(
+                    "`{}` exited with status 1: Could not resolve to an Issue",
+                    command_text(&body_edit_call())
+                )
+            }
         );
 
         for bad in [
@@ -6519,10 +6559,13 @@ mod tests {
         let spawn = FakeTracker::answering([Answer::NotStarted("no such file".into())]);
         assert_eq!(
             activity_error(&spawn, &["tom"]),
-            TrackerError::Other(format!(
-                "cannot start `{}`: no such file",
-                command_text(&comments_call())
-            ))
+            TrackerError::Other {
+                kind: OtherKind::NotStarted,
+                message: format!(
+                    "cannot start `{}`: no such file",
+                    command_text(&comments_call())
+                )
+            }
         );
     }
 
@@ -6533,7 +6576,7 @@ mod tests {
             .activity_since("no-slash", 6, ACT_SINCE, &names(&["tom"]))
             .unwrap_err();
         assert!(
-            matches!(&error, TrackerError::Other(m) if m.contains("returned unexpected output"))
+            matches!(&error, TrackerError::Other { kind: OtherKind::Parse, message: m } if m.contains("returned unexpected output"))
         );
         assert!(fake.calls().is_empty());
     }
@@ -6560,7 +6603,7 @@ mod tests {
                 .activity_since(REPO, 6, bad, &names(&["tom"]))
                 .unwrap_err();
             assert!(
-                matches!(&error, TrackerError::Other(m) if m.contains("returned unexpected output")),
+                matches!(&error, TrackerError::Other { kind: OtherKind::Parse, message: m } if m.contains("returned unexpected output")),
                 "{bad:?}"
             );
             assert!(fake.calls().is_empty(), "{bad:?}");
@@ -7510,10 +7553,13 @@ mod tests {
         let error = feedback_error(&fake);
         assert_eq!(
             error,
-            TrackerError::Other(format!(
-                "`{}` exited with status 1: boom",
-                command_text(&before_call("c1"))
-            ))
+            TrackerError::Other {
+                kind: OtherKind::Failed,
+                message: format!(
+                    "`{}` exited with status 1: boom",
+                    command_text(&before_call("c1"))
+                )
+            }
         );
         assert_eq!(fake.calls().len(), 2);
     }
@@ -8303,7 +8349,7 @@ mod tests {
         let failed = FakeTracker::answering([Answer::ok(main.as_str()), Answer::fail(1, "boom")]);
         let error = feedback_error(&failed);
         assert!(
-            matches!(&error, TrackerError::Other(m) if m.contains("exited with status 1: boom")),
+            matches!(&error, TrackerError::Other { kind: OtherKind::Failed, message: m } if m.contains("exited with status 1: boom")),
             "{error}"
         );
         let garbled = FakeTracker::answering([

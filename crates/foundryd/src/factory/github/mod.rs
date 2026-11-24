@@ -42,10 +42,25 @@ pub enum TrackerError {
         status: i32,
         stderr: String,
     },
-    /// Anything else: `gh` could not start, failed, printed too much or printed what the call
-    /// did not expect, or an argument was refused before any call.
-    #[error("{0}")]
-    Other(String),
+    /// Anything else, with its kind: `gh` could not start, failed, printed too much or printed
+    /// what the call did not expect, or an argument was refused before any call.
+    #[error("{message}")]
+    Other { kind: OtherKind, message: String },
+}
+
+/// Which failure a [`TrackerError::Other`] is, so a caller tells them apart without reading the
+/// text. These are the failures the runner tags apart and its callers switch on
+/// (`GitHubSpawnError`, `GitHubInvalidArgument`, `GitHubParse`), and one for the rest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OtherKind {
+    /// `gh` could not be started.
+    NotStarted,
+    /// An argument was refused before any call.
+    InvalidArgument,
+    /// `gh` answered with output the call did not expect.
+    Parse,
+    /// `gh` failed in a way no other variant names, or printed more than its limit.
+    Failed,
 }
 
 /// GitHub read through `gh`. Each call names the repo (`owner/name`) it reads, so one tracker

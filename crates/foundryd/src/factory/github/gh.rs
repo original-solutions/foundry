@@ -18,7 +18,7 @@ use std::time::Duration;
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 
-use super::{Tracker, TrackerError};
+use super::{OtherKind, Tracker, TrackerError};
 use crate::clock::Clock;
 
 /// How long one `gh` call may run before it is killed.
@@ -112,19 +112,25 @@ pub fn one_line(text: &str) -> String {
 
 /// The error for a call whose output was not what it expected.
 pub fn parse_error(args: &[String], expected: &str) -> TrackerError {
-    TrackerError::Other(format!(
-        "`{}` returned unexpected output: {expected}",
-        command_text(args)
-    ))
+    TrackerError::Other {
+        kind: OtherKind::Parse,
+        message: format!(
+            "`{}` returned unexpected output: {expected}",
+            command_text(args)
+        ),
+    }
 }
 
 /// The error for an argument refused before any call, since it could leave the path it is
 /// put in.
 pub fn invalid_argument(argument: &str, expected: &str) -> TrackerError {
-    TrackerError::Other(format!(
-        "refused \"{}\" before calling gh: expected {expected}",
-        one_line(argument)
-    ))
+    TrackerError::Other {
+        kind: OtherKind::InvalidArgument,
+        message: format!(
+            "refused \"{}\" before calling gh: expected {expected}",
+            one_line(argument)
+        ),
+    }
 }
 
 /// Whether `stderr` says GitHub is rate limiting the login.
@@ -152,16 +158,18 @@ fn auth_refused(stderr: &str) -> bool {
 pub fn finish(args: &[String], answer: Answer) -> Result<String, TrackerError> {
     let command = command_text(args);
     match answer {
-        Answer::NotStarted(why) => Err(TrackerError::Other(format!(
-            "cannot start `{command}`: {why}"
-        ))),
+        Answer::NotStarted(why) => Err(TrackerError::Other {
+            kind: OtherKind::NotStarted,
+            message: format!("cannot start `{command}`: {why}"),
+        }),
         Answer::TimedOut => Err(TrackerError::Timeout {
             command,
             seconds: LIMIT.as_secs(),
         }),
-        Answer::TooLarge => Err(TrackerError::Other(format!(
-            "`{command}` printed more than {OUTPUT_LIMIT} bytes"
-        ))),
+        Answer::TooLarge => Err(TrackerError::Other {
+            kind: OtherKind::Failed,
+            message: format!("`{command}` printed more than {OUTPUT_LIMIT} bytes"),
+        }),
         Answer::Exit {
             status: Some(0),
             stdout,
@@ -177,9 +185,10 @@ pub fn finish(args: &[String], answer: Answer) -> Result<String, TrackerError> {
                 "" => format!("the shell exited with status {status}"),
                 said => said.to_string(),
             };
-            Err(TrackerError::Other(format!(
-                "cannot start `{command}`: {why}"
-            )))
+            Err(TrackerError::Other {
+                kind: OtherKind::NotStarted,
+                message: format!("cannot start `{command}`: {why}"),
+            })
         }
         Answer::Exit { status, stderr, .. } => {
             let status = status.unwrap_or(-1);
@@ -194,10 +203,13 @@ pub fn finish(args: &[String], answer: Answer) -> Result<String, TrackerError> {
                     stderr,
                 })
             } else {
-                Err(TrackerError::Other(format!(
-                    "`{command}` exited with status {status}: {}",
-                    stderr.trim_end()
-                )))
+                Err(TrackerError::Other {
+                    kind: OtherKind::Failed,
+                    message: format!(
+                        "`{command}` exited with status {status}: {}",
+                        stderr.trim_end()
+                    ),
+                })
             }
         }
     }
@@ -389,6 +401,36 @@ mod tests {
 
     fn gh_at(program: &Path, clock: Arc<dyn Clock>) -> Gh {
         Gh::new("rawphp", TOKEN, clock).with_program(program)
+    }
+
+    #[test]
+    fn each_other_failure_says_its_kind() {
+        let call = args(&["api", "user"]);
+        let kind = |result: Result<String, TrackerError>| match result.unwrap_err() {
+            TrackerError::Other { kind, .. } => kind,
+            other => panic!("not Other: {other}"),
+        };
+        for (answer, want) in [
+            (
+                Answer::NotStarted("no such file".into()),
+                OtherKind::NotStarted,
+            ),
+            (
+                Answer::fail(127, "sh: gh: not found"),
+                OtherKind::NotStarted,
+            ),
+            (Answer::fail(126, ""), OtherKind::NotStarted),
+            (Answer::TooLarge, OtherKind::Failed),
+            (Answer::fail(1, "boom"), OtherKind::Failed),
+            (Answer::signal_killed(), OtherKind::Failed),
+        ] {
+            assert_eq!(kind(finish(&call, answer.clone())), want, "{answer:?}");
+        }
+        assert_eq!(kind(Err(parse_error(&call, "a user"))), OtherKind::Parse);
+        assert_eq!(
+            kind(Err(invalid_argument("../x", "a branch name"))),
+            OtherKind::InvalidArgument
+        );
     }
 
     // The runner's "runs gh with the config dir, a 60 s limit and separate stderr on every
@@ -591,7 +633,11 @@ mod tests {
             let program = fake_gh(dir.path(), &format!("touch '{}'", ran.display()));
             let gh = Gh::new("rawphp", token, Arc::new(FakeClock::new())).with_program(&program);
             let error = gh.gh(&args(&["api", "user"])).unwrap_err();
-            let TrackerError::Other(message) = error else {
+            let TrackerError::Other {
+                kind: OtherKind::NotStarted,
+                message,
+            } = error
+            else {
                 panic!("not Other: {error:?}");
             };
             assert!(message.contains("no token for rawphp"), "{message}");
@@ -636,7 +682,11 @@ mod tests {
         let gh = gh_at(&dir.path().join("no-such-gh"), Arc::new(FakeClock::new()));
         let error = gh.gh(&args(&["api", "user"])).unwrap_err();
         assert_no_token(&error);
-        let TrackerError::Other(message) = error else {
+        let TrackerError::Other {
+            kind: OtherKind::NotStarted,
+            message,
+        } = error
+        else {
             panic!("not Other");
         };
         assert!(
@@ -653,7 +703,10 @@ mod tests {
         let error = gh.gh(&args(&["issue", "edit", "6"])).unwrap_err();
         assert_eq!(
             error,
-            TrackerError::Other("`gh issue edit 6` exited with status -1: ".into())
+            TrackerError::Other {
+                kind: OtherKind::Failed,
+                message: "`gh issue edit 6` exited with status -1: ".into()
+            }
         );
     }
 
@@ -752,10 +805,13 @@ mod tests {
             let error = finish(&call, Answer::fail(status, stderr)).unwrap_err();
             assert_eq!(
                 error,
-                TrackerError::Other(format!(
-                    "cannot start `gh issue list --repo rawphp/softfac`: {}",
-                    stderr.trim()
-                ))
+                TrackerError::Other {
+                    kind: OtherKind::NotStarted,
+                    message: format!(
+                        "cannot start `gh issue list --repo rawphp/softfac`: {}",
+                        stderr.trim()
+                    )
+                }
             );
         }
         let error = finish(&call, Answer::fail(127, "")).unwrap_err();
