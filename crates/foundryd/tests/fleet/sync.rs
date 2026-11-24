@@ -1446,12 +1446,43 @@ async fn a_machine_with_an_unreadable_factory_record_of_its_own_stays_online_and
         )
         .unwrap();
     assert_eq!(changed, 1);
+    let mut changes = a.peers.factory_changes();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    changes.borrow_and_update();
+
+    // A link opened now stays open: the unreadable row closes nothing.
+    let watcher = MachineId::random();
+    let mut fleet_settings = a.settings();
+    fleet_settings.seq += 1;
+    fleet_settings.machines.push(Machine {
+        id: watcher,
+        name: "watcher".into(),
+        address: "100.64.0.9".into(),
+        key: String::new(),
+    });
+    a.set_settings(fleet_settings);
+    let mut conn = raw_link(&a.peers);
+    let p1_held = lock(&a.store).versions().unwrap();
+    send(
+        &conn,
+        &hello_factory(PROTOCOL, watcher, p1_held, [(a.id, 1)].into()),
+    )
+    .await;
 
     let ids = Ids::random();
     let start = Instant::now();
     let mut wrote = false;
+    let mut messages = Vec::new();
     while start.elapsed() < OFFLINE_AFTER * 4 {
         tokio::time::sleep(Duration::from_millis(100)).await;
+        let _ = conn.send.try_send(heartbeat());
+        while let Ok(text) = conn.recv.try_recv() {
+            messages.push(serde_json::from_str::<serde_json::Value>(&text).unwrap());
+        }
+        assert!(
+            !conn.recv.is_closed(),
+            "a link of a's closed over its unreadable factory row"
+        );
         assert!(
             b.peers.online().contains(&a.id),
             "a is offline on b {:?} after its factory row became unreadable",
@@ -1466,5 +1497,120 @@ async fn a_machine_with_an_unreadable_factory_record_of_its_own_stays_online_and
     assert!(
         b.held(is_it).is_some(),
         "a's P1 record did not reach b past its unreadable factory row"
+    );
+    messages.extend(messages_for(&mut conn, Duration::from_secs(3)).await);
+    assert!(
+        messages.iter().any(|m| m["type"] == "records"
+            && m["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["body"]["id"] == ids.workspace.to_string())),
+        "a's P1 record did not reach a link opened past its unreadable factory row"
+    );
+    assert!(
+        factory_records_in(&messages).is_empty(),
+        "the unreadable row, or one above it, was sent"
+    );
+    assert!(
+        keep_talking(&mut conn, OFFLINE_AFTER * 2).await,
+        "a link of a's closed over its unreadable factory row"
+    );
+
+    // Its own factory writes are still told past the unreadable row.
+    changes.borrow_and_update();
+    write_factory(a, run_event(&run, "gated"));
+    timeout(Duration::from_secs(5), changes.changed())
+        .await
+        .expect("an own factory write past an unreadable row was not told")
+        .unwrap();
+}
+
+/// A run event of `run` whose output takes `bytes`.
+fn large_event(run: &RunId, event: &str, bytes: usize) -> FactoryBody {
+    let mut body = run_event(run, event);
+    if let FactoryBody::RunEvent(event) = &mut body {
+        event.data = serde_json::json!({ "output": "x".repeat(bytes) });
+    }
+    body
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_p1_record_written_during_a_factory_catch_up_waits_behind_at_most_one_factory_message() {
+    let peer = MachineId::random();
+    let fleet = Fleet::start_with(1, &[peer]);
+    let a = &fleet.daemons[0];
+    let run = RunId::new("original-solutions/foundry", 132, 1).unwrap();
+    // About a dozen messages of gate output.
+    for i in 0..200 {
+        write_factory(a, large_event(&run, &format!("gate-{i}"), 64 * 1024));
+    }
+
+    // The peer takes a message every 200 ms: slower than a can queue them.
+    let mut conn = raw_link(&a.peers);
+    send(&conn, &hello(PROTOCOL, peer)).await;
+    let ids = Ids::random();
+    let mut written = false;
+    let mut ahead = 0;
+    loop {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let text = timeout(OFFLINE_AFTER, conn.recv.recv())
+            .await
+            .expect("a message within the offline limit")
+            .expect("the link stays open");
+        let _ = conn.send.try_send(heartbeat());
+        let message: serde_json::Value = serde_json::from_str(&text).unwrap();
+        match message["type"].as_str().unwrap() {
+            "factory_records" if written => ahead += 1,
+            "factory_records" => {
+                a.write(workspace(ids.workspace, false));
+                written = true;
+            }
+            "records"
+                if message["records"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r["body"]["id"] == ids.workspace.to_string()) =>
+            {
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        ahead <= 1,
+        "the P1 record waited behind {ahead} factory messages"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_factory_catch_up_of_several_batches_goes_without_waiting_a_tick_between_messages() {
+    let peer = MachineId::random();
+    let fleet = Fleet::start_with(1, &[peer]);
+    let a = &fleet.daemons[0];
+    let run = RunId::new("original-solutions/foundry", 132, 1).unwrap();
+    // Two batches, the first too large for one message.
+    let total = BATCH + 100;
+    for i in 0..total {
+        write_factory(a, large_event(&run, &format!("step-{i}"), 4 * 1024));
+    }
+
+    let mut conn = raw_link(&a.peers);
+    send(&conn, &hello(PROTOCOL, peer)).await;
+    let mut received = 0;
+    let mut started = None;
+    while received < total {
+        let message = next(&mut conn).await.expect("the link stays open");
+        let _ = conn.send.try_send(heartbeat());
+        if message["type"] == "factory_records" {
+            started.get_or_insert_with(Instant::now);
+            received += message["records"].as_array().unwrap().len();
+        }
+    }
+    let took = started.unwrap().elapsed();
+    assert!(
+        took < Duration::from_secs(1),
+        "the catch-up waited between messages: {took:?}"
     );
 }

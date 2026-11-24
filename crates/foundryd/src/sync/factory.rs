@@ -271,9 +271,69 @@ pub(super) async fn watch_own(inner: &Inner) {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
     use foundry_proto::factory::{FactoryBody, RunEvent, RunId};
+    use foundry_proto::settings::Machine;
+    use futures::future::BoxFuture;
 
     use super::*;
+    use crate::store::Store;
+    use crate::sync::{Conn, Dialer, Peers, lock};
+
+    struct NoDial;
+
+    impl Dialer for NoDial {
+        fn dial(&self, _: &Machine) -> BoxFuture<'static, io::Result<Conn>> {
+            Box::pin(async { Err(io::Error::other("no peers in these tests")) })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn records_a_take_stored_before_it_was_cancelled_still_tell_factory_changes() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open(data.path().join("foundry.db")).unwrap();
+        let peers = Peers::new(
+            MachineId::random(),
+            Arc::new(Mutex::new(store)),
+            Arc::new(NoDial),
+        );
+        let peer = MachineId::random();
+        let records: Vec<FactoryRecord> = (1..=2000)
+            .map(|version| FactoryRecord {
+                owner: peer,
+                ..event(version, 10)
+            })
+            .collect();
+        let mut changes = peers.factory_changes();
+        changes.borrow_and_update();
+
+        let taking = {
+            let peers = peers.clone();
+            tokio::spawn(async move { take(&peers.inner, peer, FACTORY_SINCE, records).await })
+        };
+        // Cancel the take, as a link that ends drops it, once it has stored a record and while
+        // it waits on the store.
+        loop {
+            let store = lock(&peers.inner.store);
+            if store.factory_versions().unwrap().contains_key(&peer) {
+                taking.abort();
+                break;
+            }
+            drop(store);
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(
+            taking.await.is_err_and(|e| e.is_cancelled()),
+            "the take ended first"
+        );
+        assert!(
+            changes.has_changed().unwrap(),
+            "records stored before the cancel were never told"
+        );
+    }
 
     fn event(version: u64, output: usize) -> FactoryRecord {
         FactoryRecord {
