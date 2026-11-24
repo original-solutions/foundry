@@ -55,6 +55,13 @@ pub(super) fn carried(speak: u16) -> bool {
     speak >= FACTORY_SINCE
 }
 
+/// Whether `text`, a message from a peer that could not be read, is a factory message: only
+/// its `type` is read.
+pub(super) fn is_message(text: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(text)
+        .is_ok_and(|message| message["type"] == "factory_records")
+}
+
 /// The highest factory version this machine holds per owner, for its hello in protocol
 /// `speak`. None for a protocol that carries no factory record. A store that cannot be read
 /// gives none, with a warning: the peer then sends every factory record it owns again, and

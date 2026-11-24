@@ -167,10 +167,10 @@ async fn send_settings(
 /// and the answer to one still arrives.
 ///
 /// Factory records are refused apart ([`factory::take`]): after a factory record the store
-/// refuses, the link takes no more factory records from the peer, so the store keeps a prefix
-/// of them, but it goes on taking everything else and counting the peer as heard. It ends
-/// [`RETRY_REFUSED`] later all the same, so the next link's hello asks again for the factory
-/// records past that prefix.
+/// refuses, or a factory message this build cannot read, the link takes no more factory records
+/// from the peer, so the store keeps a prefix of them, but it goes on taking everything else
+/// and counting the peer as heard. It ends [`RETRY_REFUSED`] later all the same, so the next
+/// link's hello asks again for the factory records past that prefix.
 async fn reading(inner: &Inner, recv: &mut Receiver<String>, peer: MachineId, speak: u16) {
     let mut refused: Option<Instant> = None;
     let mut factory_refused: Option<Instant> = None;
@@ -205,15 +205,25 @@ async fn reading(inner: &Inner, recv: &mut Receiver<String>, peer: MachineId, sp
                 if factory_refused.is_none()
                     && let Err(error) = factory::take(inner, peer, speak, records).await
                 {
-                    tracing::warn!(
-                        "sync: {error}; no more factory records are taken from {peer} on this \
-                         link, which closes in {RETRY_REFUSED:?} to ask again"
-                    );
-                    factory_refused = Some(Instant::now());
+                    factory_refused = Some(refuse_factory(peer, &error));
                 }
                 Ok(())
             }
             Ok(message) => take(inner, peer, speak, message).await,
+            // A factory message this build cannot read, such as one holding a kind a newer
+            // build writes, is refused as a factory record the store refuses is. On a link that
+            // carries no factory record it is dropped, as one that can be read is.
+            Err(error) if factory::is_message(&text) => {
+                if factory::carried(speak) {
+                    factory_refused.get_or_insert_with(|| {
+                        refuse_factory(
+                            peer,
+                            &format!("a factory message from {peer} could not be read: {error}"),
+                        )
+                    });
+                }
+                Ok(())
+            }
             Err(error) => Err(format!("a message from {peer} could not be read: {error}")),
         };
         match taken {
@@ -234,6 +244,16 @@ async fn reading(inner: &Inner, recv: &mut Receiver<String>, peer: MachineId, sp
             return;
         }
     }
+}
+
+/// Says that no more factory records are taken from `peer` on this link after `error`, and
+/// gives the moment they stopped.
+fn refuse_factory(peer: MachineId, error: &str) -> Instant {
+    tracing::warn!(
+        "sync: {error}; no more factory records are taken from {peer} on this link, which \
+         closes in {RETRY_REFUSED:?} to ask again"
+    );
+    Instant::now()
 }
 
 /// Sends this machine's records above `sent`, reading and sending one message of at most
@@ -506,9 +526,9 @@ async fn take(
         PeerMessage::Hello { .. } | PeerMessage::Relay { .. } | PeerMessage::Call { .. } => {
             return Ok(());
         }
-        PeerMessage::FactoryRecords { records, .. } => {
-            return factory::take(inner, peer, speak, records).await;
-        }
+        // `reading` takes factory records itself, so that one refused stops only the factory
+        // records on the link; none reaches this point.
+        PeerMessage::FactoryRecords { .. } => return Ok(()),
     };
     on_store(&inner.store, move |store| {
         store
