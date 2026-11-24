@@ -604,11 +604,17 @@ mod tests {
         );
         // A run of another issue that cannot be read is not read, so it is not listed.
         unreadable_run(dir.path(), &softfac(3));
+        // A run of this issue that cannot be read is listed last, so it still holds its slot.
+        unreadable_run(dir.path(), &rid(1, "rawphp/softfac", 3));
         assert_eq!(
             issue_runs(&store.lock().unwrap(), "RawPhp/Softfac", 1).unwrap(),
             [
                 info(softfac(1), Some(State::Triage), true),
                 info(rid(1, "rawphp/softfac", 2), Some(State::Building), true),
+                RunInfo {
+                    unreadable: true,
+                    ..info(rid(1, "rawphp/softfac", 3), None, false)
+                },
             ]
         );
     }

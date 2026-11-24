@@ -1935,7 +1935,7 @@ mod tests {
             .write(&run(8), &stuck(output), &test_cause())
             .unwrap();
         assert_eq!(written.data["reason"], json!(output));
-        // A secret split by a control character that is not a line break is still hidden, and
+        // A secret split by a control character that is not white space is still hidden, and
         // the text keeps its lines.
         let written = ledger
             .write(
@@ -1945,6 +1945,37 @@ mod tests {
             )
             .unwrap();
         assert_eq!(written.data["reason"], json!("a\nT=***\nb"));
+    }
+
+    #[test]
+    fn a_write_hides_its_texts_before_it_takes_the_store_lock() {
+        // The daemon's Hide reads the secret store, which can be slow; the store lock is
+        // shared by the whole daemon, so no Hide call may run while it is held.
+        let (_dir, store) = open_store();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let locked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hide: Hide = {
+            let (store, calls, locked) = (store.clone(), calls.clone(), locked.clone());
+            std::sync::Arc::new(move |text: &str| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if store.try_lock().is_err() {
+                    locked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                text.to_owned()
+            })
+        };
+        let ledger =
+            Ledger::new(store.clone(), MachineId::random(), 1, hide).with_wall(ticking(T0, 1000));
+        let cause = Cause::new(CauseStep::Gate, "gate-command-ran")
+            .actor("someone")
+            .command("make check")
+            .label("factory:building");
+        ledger.write(&run(8), &stuck("output"), &cause).unwrap();
+        ledger
+            .finish(&run(8), Outcome::Stuck, None, None, &cause, None)
+            .unwrap();
+        assert!(calls.load(std::sync::atomic::Ordering::SeqCst) > 0);
+        assert_eq!(locked.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[test]
