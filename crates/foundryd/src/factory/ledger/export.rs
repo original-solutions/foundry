@@ -8,10 +8,11 @@
 //! is not written: the runner's lines have none.
 //!
 //! The export never writes the store. It reads a copy: one read of the store, through a
-//! connection that cannot write, copies it into the export's directory, and only the copy is
-//! opened as a [`Store`]. Opening a store brings its schema up to this build's, so a store an
-//! older daemon still runs on is never moved on under it, and every run is read from the same
-//! moment. The copy is removed when the export ends.
+//! connection that cannot write, copies it beside the store, and only the copy is opened as a
+//! [`Store`]. Opening a store brings its schema up to this build's, so a store an older daemon
+//! still runs on is never moved on under it, and every run is read from the same moment. The
+//! copy holds all the store does, so it stays in the data directory with the store, never in
+//! the export's directory, and is removed when the export ends.
 //!
 //! Each run's file is written whole beside its place, synced and then moved into it, so a
 //! `retro` reading the folder meanwhile never finds half a run. Files in `runs/` that are not a
@@ -42,7 +43,7 @@ pub enum ExportError {
     Store(#[from] StoreError),
     #[error("copying the store: {0}")]
     Copy(#[from] rusqlite::Error),
-    #[error("copying the store: the export directory {} is not UTF-8", .0.display())]
+    #[error("copying the store: the data directory {} is not UTF-8", .0.display())]
     NotUtf8(PathBuf),
     #[error("writing {}: {source}", path.display())]
     Write { path: PathBuf, source: io::Error },
@@ -95,17 +96,18 @@ pub fn export(store: &Store, dir: &Path) -> Result<usize, ExportError> {
     Ok(runs.len())
 }
 
-/// Exports the store at `live` from a copy of it made in `dir`, which is removed again.
+/// Exports the store at `live` into `dir` from a copy of it made beside it, which is removed
+/// again.
 fn export_copy(live: &Path, dir: &Path) -> Result<usize, ExportError> {
-    make_dir(dir)?;
-    let copy = StoreCopy(dir.join(format!(".foundryd-store-{}.sqlite", std::process::id())));
+    let beside = live.parent().unwrap_or(Path::new(""));
+    let copy = StoreCopy(beside.join(format!(".export-{}.sqlite", std::process::id())));
     // A copy left by an earlier export that was killed, under the same process id: the copy
     // below is refused into a file that is not empty.
     copy.remove();
     let target = copy
         .0
         .to_str()
-        .ok_or_else(|| ExportError::NotUtf8(dir.to_owned()))?;
+        .ok_or_else(|| ExportError::NotUtf8(beside.to_owned()))?;
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     Connection::open_with_flags(live, flags)?.execute("VACUUM INTO ?1", [target])?;
     let store = Store::open(&copy.0)?;
