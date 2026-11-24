@@ -1,6 +1,6 @@
 //! The command line: `--version` works, `join` names a bad port, `secret set` stores a gateway
-//! key or a GitHub token without printing it, `github default` stores a login, and each command
-//! a later task fills exits 2. Every test that runs the binary uses a temporary data directory
+//! key or a GitHub token without printing it, `github default` stores a login, and
+//! `factory export` writes the runner's own run file back byte for byte. Every test that runs the binary uses a temporary data directory
 //! and skips the copy from the login keychain.
 
 // A release build ignores `FOUNDRY_SECRETS`, so on macOS these runs of the binary would move
@@ -13,7 +13,10 @@ compile_error!(
 use std::io::Write as _;
 use std::process::{Command, Output, Stdio};
 
+use foundry_proto::factory::{FactoryBody, FactoryRecord, RunEvent, RunId};
+use foundry_proto::ids::MachineId;
 use foundryd::secrets::{FileSecrets, LOGIN_RULE, Secrets};
+use foundryd::store::{Applied, Store};
 
 /// `foundryd` with a data directory and `HOME` of its own and no copy from the keychain, so no
 /// run touches the login keychain or the real home.
@@ -148,23 +151,6 @@ fn dashboard_with_no_daemon_running_exits_1_and_says_so() {
     );
 }
 
-/// Asserts `foundryd <args>` exits 2 and says it is not built yet.
-fn assert_not_built(args: &[&str]) {
-    let out = foundryd(args);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-
-    assert_eq!(
-        out.status.code(),
-        Some(2),
-        "{args:?} exit: {:?}",
-        out.status
-    );
-    assert!(
-        stderr.contains("not built yet"),
-        "{args:?} stderr: {stderr}"
-    );
-}
-
 #[test]
 fn github_default_stores_the_login() {
     let home = tempfile::tempdir().unwrap();
@@ -261,10 +247,124 @@ fn words(bytes: &[u8]) -> String {
         .join(" ")
 }
 
+/// The runner's run file the export test compares with: copied byte for byte from the runner's
+/// own ledger, as `tests/fixtures/runner/README.md` says.
+const RUNNER_RUN: &str = "original-solutions__foundry__179__1";
+
+fn runner_file() -> Vec<u8> {
+    std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/runner")
+            .join(format!("{RUNNER_RUN}.jsonl")),
+    )
+    .unwrap()
+}
+
+/// Stores each line of the runner's run file as a run event of one machine, at lease
+/// generation 1, in the store of the data directory `home`, as the daemon keeps it.
+fn store_runner_run(home: &tempfile::TempDir) {
+    let run: RunId = RUNNER_RUN.parse().unwrap();
+    let owner = MachineId(uuid::Uuid::from_u128(7));
+    let mut store = Store::open(home.path().join("store.sqlite")).unwrap();
+    let file = runner_file();
+    for (n, line) in std::str::from_utf8(&file).unwrap().lines().enumerate() {
+        let mut line: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(line).unwrap();
+        let record = FactoryRecord {
+            owner,
+            version: u64::try_from(n).unwrap() + 1,
+            body: FactoryBody::RunEvent(RunEvent {
+                run: run.clone(),
+                generation: 1,
+                ts: line["ts"].as_str().unwrap().to_owned(),
+                ms: line["ms"].as_u64().unwrap(),
+                event: line["event"].as_str().unwrap().to_owned(),
+                data: line.remove("data").unwrap(),
+                cause: line.remove("cause"),
+            }),
+        };
+        assert_eq!(
+            store.apply_factory(&record, owner).unwrap(),
+            Applied::Stored
+        );
+    }
+}
+
 #[test]
-fn factory_export_exits_2_and_says_not_built_yet() {
+fn factory_export_writes_the_runners_own_run_file_byte_for_byte() {
+    let home = tempfile::tempdir().unwrap();
+    store_runner_run(&home);
     let out = tempfile::tempdir().unwrap();
-    assert_not_built(&["factory", "export", out.path().to_str().unwrap()]);
+
+    let ran = isolated(&["factory", "export", out.path().to_str().unwrap()], &home)
+        .output()
+        .expect("foundryd runs");
+
+    assert!(
+        ran.status.success(),
+        "exit: {:?} stderr: {}",
+        ran.status,
+        words(&ran.stderr)
+    );
+    let exported = std::fs::read(out.path().join("runs").join(format!("{RUNNER_RUN}.jsonl")))
+        .expect("the run's file was written");
+    assert!(
+        exported == runner_file(),
+        "exported:\n{}",
+        String::from_utf8_lossy(&exported)
+    );
+    assert!(
+        words(&ran.stdout).contains("1 run"),
+        "stdout: {}",
+        words(&ran.stdout)
+    );
+}
+
+#[test]
+fn factory_export_on_a_machine_with_no_store_writes_no_run_and_makes_no_store() {
+    let home = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+
+    let ran = isolated(&["factory", "export", out.path().to_str().unwrap()], &home)
+        .output()
+        .expect("foundryd runs");
+
+    assert!(
+        ran.status.success(),
+        "exit: {:?} stderr: {}",
+        ran.status,
+        words(&ran.stderr)
+    );
+    assert_eq!(
+        std::fs::read_dir(out.path().join("runs")).unwrap().count(),
+        0
+    );
+    assert!(!home.path().join("store.sqlite").exists());
+    assert!(
+        words(&ran.stdout).contains("0 runs"),
+        "stdout: {}",
+        words(&ran.stdout)
+    );
+}
+
+#[test]
+fn factory_export_into_a_file_exits_1_and_names_it() {
+    let home = tempfile::tempdir().unwrap();
+    store_runner_run(&home);
+    let out = tempfile::tempdir().unwrap();
+    let blocked = out.path().join("blocked");
+    std::fs::write(&blocked, "a file").unwrap();
+
+    let ran = isolated(&["factory", "export", blocked.to_str().unwrap()], &home)
+        .output()
+        .expect("foundryd runs");
+
+    assert_eq!(ran.status.code(), Some(1), "exit: {:?}", ran.status);
+    assert!(
+        words(&ran.stderr).contains("blocked"),
+        "stderr: {}",
+        words(&ran.stderr)
+    );
 }
 
 #[test]
