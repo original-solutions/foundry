@@ -4,8 +4,8 @@
 //! Claude Code runs with `--dangerously-skip-permissions` and an `--effort`, its settings file
 //! holds `skipDangerousModePermissionPrompt`, and its environment holds the project login's
 //! token as `GH_TOKEN` and as the answer of a `GIT_ASKPASS`, read from the secret store at the
-//! start. The token reaches the child's environment only: it is in no argument, file, log line
-//! or error.
+//! start. The token passes through the terminal's private, short-lived env file, as the
+//! gateway key does; it is in no argument, log line, error or other file.
 //!
 //! A file `factory` in the session's own folder, `<data dir>/sessions/<session>/`, marks the
 //! session as a factory session and holds its project. [`Sessions::adopt`] reads the marks
@@ -18,7 +18,7 @@ use foundry_proto::ids::{ProjectId, SessionId, WorkspaceId};
 
 use super::{Inner, SessionError, Sessions, blocking, claude, lock};
 use crate::factory::messages::Message;
-use crate::git_auth::{self, GitAuth, NoToken};
+use crate::git_auth::{self, GitAuth};
 use crate::terminals::TerminalError;
 
 /// The name of the mark file in a factory session's folder.
@@ -65,11 +65,19 @@ pub(super) fn write_mark(path: &Path, project: ProjectId) -> Result<(), SessionE
 /// askpass's answer, the askpass script, and git's credential helpers emptied, so a keychain
 /// helper never answers before the askpass does. The askpass and the token are read from what
 /// [`GitAuth`] gives a git child, so there is one source of them.
+///
+/// The session's git must also not push as another account. `GIT_ALLOW_PROTOCOL=https` stops a
+/// global `insteadOf` that rewrites `https://github.com/` to `git@github.com:` from sending a
+/// push over ssh as the machine's owner, which never asks the askpass. An inherited
+/// `GIT_CONFIG_PARAMETERS` is read after `GIT_CONFIG_COUNT`, so it is emptied or a helper it
+/// names would answer after the emptied one. The other GitHub tokens that `gh` and git's
+/// helpers read are blanked, as [`git_auth::helpers_off_env`] does. The user's global config
+/// stays readable.
 fn factory_env(
     secrets: &dyn crate::secrets::Secrets,
     login: &str,
     data: &Path,
-) -> Result<Vec<(String, String)>, NoToken> {
+) -> Result<Vec<(String, String)>, SessionError> {
     let auth = GitAuth::for_login(secrets, login, data)?;
     let mut git = Command::new("git");
     auth.apply(&mut git);
@@ -81,9 +89,7 @@ fn factory_env(
             .map(|value| value.to_string_lossy().into_owned())
     };
     let (Some(askpass), Some(token)) = (get("GIT_ASKPASS"), get(git_auth::TOKEN_VAR)) else {
-        return Err(NoToken::Unset {
-            login: login.to_owned(),
-        });
+        return Err(SessionError::NoAskpass);
     };
     Ok(vec![
         ("GH_TOKEN".into(), token.clone()),
@@ -92,6 +98,11 @@ fn factory_env(
         ("GIT_CONFIG_COUNT".into(), "1".into()),
         ("GIT_CONFIG_KEY_0".into(), "credential.helper".into()),
         ("GIT_CONFIG_VALUE_0".into(), String::new()),
+        ("GIT_CONFIG_PARAMETERS".into(), String::new()),
+        ("GIT_ALLOW_PROTOCOL".into(), "https".into()),
+        ("GITHUB_TOKEN".into(), String::new()),
+        ("GH_ENTERPRISE_TOKEN".into(), String::new()),
+        ("GITHUB_ENTERPRISE_TOKEN".into(), String::new()),
     ])
 }
 
@@ -120,14 +131,13 @@ impl Sessions {
         }
         let inner = self.inner.clone();
         let worktree = worktree.to_path_buf();
-        let line = first.line.trim().to_owned();
-        let prompt = Some(line).filter(|line| !line.is_empty());
+        let prompt = super::first_prompt(&first.line);
         tokio::spawn(async move {
             let secrets = inner.secrets.get().cloned();
             let (login, data) = (start.login.clone(), inner.data.clone());
             let env = blocking(move || match secrets {
                 Some(secrets) => factory_env(secrets.as_ref(), &login, &data),
-                None => Err(NoToken::Unset { login }),
+                None => Err(crate::git_auth::NoToken::Unset { login }.into()),
             })
             .await??;
             let launch = FactoryLaunch {
@@ -176,6 +186,11 @@ impl Sessions {
                 continue;
             };
             let body = live.body.lock().await;
+            // A start that failed while this waited is no longer live, and one that has not
+            // yet got its terminal has none to close.
+            if !self.inner.is_live(&live) || body.terminal.0.is_nil() {
+                continue;
+            }
             if body.workspace == workspace {
                 terminals.push(body.terminal);
             }
@@ -201,10 +216,22 @@ impl Inner {
         let dir = self.dir.clone();
         let found = blocking(move || {
             let mut found = Vec::new();
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                return found;
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return found,
+                Err(error) => {
+                    tracing::warn!(%error, "the sessions folder cannot be read, so no factory mark is taken");
+                    return found;
+                }
             };
-            for entry in entries.flatten() {
+            for entry in entries {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        tracing::warn!(%error, "an entry of the sessions folder cannot be read");
+                        continue;
+                    }
+                };
                 let mark = entry.path().join(MARK);
                 if !mark.is_file() {
                     continue;

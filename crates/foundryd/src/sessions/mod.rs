@@ -111,10 +111,19 @@ pub enum SessionError {
     ClaudeState { path: PathBuf, reason: String },
     #[error(transparent)]
     NoToken(#[from] crate::git_auth::NoToken),
+    #[error("sessions: git_auth gave a factory start no askpass or token")]
+    NoAskpass,
     #[error("sessions: a factory session's first message cannot carry a body yet")]
     FirstMessageBody,
     #[error("sessions: a step run apart from its caller did not finish: {0}")]
     Interrupted(#[from] tokio::task::JoinError),
+}
+
+/// A first prompt's text: trimmed, and none when blank.
+fn first_prompt(text: &str) -> Option<String> {
+    Some(text.trim())
+        .filter(|t| !t.is_empty())
+        .map(str::to_owned)
 }
 
 /// The model gateway a session's Claude Code talks to.
@@ -267,10 +276,7 @@ impl Sessions {
     ) -> Result<SessionId, SessionError> {
         let inner = self.inner.clone();
         let (worktree, model) = (worktree.to_path_buf(), model.to_string());
-        let prompt = prompt
-            .map(str::trim)
-            .filter(|p| !p.is_empty())
-            .map(str::to_owned);
+        let prompt = prompt.and_then(first_prompt);
         tokio::spawn(async move {
             inner
                 .start(workspace, &worktree, &model, prompt.as_deref(), None)
@@ -404,6 +410,10 @@ impl Inner {
         // of `Starting`.
         let mut body = live.body.lock().await;
         lock(&self.live).insert(id, live.clone());
+        // Found by `end_factory` from here on, which then waits on `body`.
+        if let Some(factory) = factory {
+            lock(&self.factory).insert(id, factory.project);
+        }
 
         let started = self
             .launch(&settings, workspace, worktree, model, factory)
@@ -412,6 +422,7 @@ impl Inner {
             Ok(started) => started,
             Err(error) => {
                 lock(&self.live).remove(&id);
+                lock(&self.factory).remove(&id);
                 drop(body);
                 self.discard(id, &settings, &curl).await;
                 return Err(error);
@@ -420,16 +431,16 @@ impl Inner {
         body.terminal = terminal;
         if let Err(error) = self.write(body.clone()).await {
             lock(&self.live).remove(&id);
+            lock(&self.factory).remove(&id);
             drop(body);
-            let _ = self.terminals.close(terminal).await;
+            if let Err(close) = self.terminals.close(terminal).await {
+                tracing::warn!(session = %id, error = %close, "the terminal of a start whose record failed was not closed");
+            }
             self.discard(id, &settings, &curl).await;
             return Err(error);
         }
         drop(body);
 
-        if let Some(factory) = factory {
-            lock(&self.factory).insert(id, factory.project);
-        }
         self.run(&live, terminal, floor, FirstPrompt::new(prompt));
         tracing::info!(session = %id, workspace = %workspace, model, "session started");
         Ok(id)
