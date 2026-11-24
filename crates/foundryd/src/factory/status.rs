@@ -30,6 +30,10 @@ pub const FINISHED_KEPT: usize = 20;
 /// holder that died does not hide the next coordinator's reason for being idle. `None` when no
 /// online writer holds the lease and the acting coordinator has written no status.
 ///
+/// A holding status below the highest generation any online status reports, a not-holding
+/// one's included, is not believed: its writer lost the lease and stopped writing while it
+/// stayed online. [`Freshness`] does not count such a status either.
+///
 /// Two holders at one generation should not exist, since one machine writes in a generation.
 /// Should they, the higher pass is believed, then the lower machine id, so every machine
 /// believes the same one whatever order it read them in.
@@ -43,18 +47,34 @@ pub fn believed(
             .iter()
             .filter(|(writer, _)| online.contains(writer))
     };
+    let highest = heard()
+        .map(|(_, status)| generation_seen(status))
+        .max()
+        .unwrap_or(0);
     heard()
-        .filter(|(_, status)| status.holds)
+        .filter(|(_, status)| status.holds && status.generation >= highest)
         .max_by_key(|(writer, status)| (status.generation, status.pass, Reverse(*writer)))
         .or_else(|| heard().find(|(writer, _)| *writer == acting))
         .map(|(_, status)| status.clone())
+}
+
+/// The highest lease generation `status` says its writer has seen: its own, or the one the
+/// lease ref names when another machine holds it.
+fn generation_seen(status: &FactoryStatus) -> u64 {
+    match &status.not_holding {
+        Some(NotHolding::HeldBy { generation, .. }) => status.generation.max(*generation),
+        _ => status.generation,
+    }
 }
 
 /// What one pass of a project whose lease this machine holds found, for [`build`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PassResults {
     pub project: ProjectId,
-    /// The writer's pass count, which only rises.
+    /// The writer's pass count, which only rises, across a restart of the daemon too: a holder
+    /// that restarts renews its lease at the same generation, and [`Freshness`] counts a
+    /// holding status at one generation only when its pass is higher than any before it, so a
+    /// count that started again would read as no word from the holder until it caught up.
     pub pass: u64,
     /// The lease generation this machine holds.
     pub generation: u64,
@@ -210,10 +230,7 @@ impl Freshness {
     /// A status of its project has arrived from a writer that is online.
     pub fn received(&self, status: &FactoryStatus) {
         let now = self.clock.now();
-        let seen = match &status.not_holding {
-            Some(NotHolding::HeldBy { generation, .. }) => status.generation.max(*generation),
-            _ => status.generation,
-        };
+        let seen = generation_seen(status);
         let mut projects = self.projects();
         let heard = projects.entry(status.project).or_default();
         if seen < heard.generation {
