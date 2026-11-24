@@ -1351,4 +1351,51 @@ mod tests {
             u32::MAX
         );
     }
+
+    #[test]
+    fn a_listing_reads_the_events_of_the_unfinished_runs_only() {
+        let (_dir, store) = open_store();
+        let other = MachineId::random();
+        for version in 1..1000 {
+            put(
+                &store,
+                other,
+                version,
+                &softfac(1),
+                1,
+                T0,
+                "step_changed",
+                json!({"step": "red"}),
+                None,
+            );
+        }
+        put(
+            &store,
+            other,
+            1000,
+            &softfac(1),
+            1,
+            T0,
+            "finished",
+            json!({"outcome": "stuck"}),
+            None,
+        );
+        // Three events: approved, claimed and the move to building.
+        run_at(&store, &softfac(2), T0, Some(State::Building), false, true);
+        let read = Store::run_events_read;
+
+        let before = read();
+        assert_eq!(
+            listed(&store, "rawphp/softfac"),
+            [info(softfac(2), Some(State::Building), true)]
+        );
+        assert_eq!(read() - before, 3);
+
+        let before = read();
+        assert_eq!(
+            issue_runs(&store, "rawphp/softfac", 1).unwrap(),
+            Vec::<RunInfo>::new()
+        );
+        assert_eq!(read() - before, 0);
+    }
 }

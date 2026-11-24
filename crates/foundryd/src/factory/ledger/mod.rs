@@ -2097,4 +2097,60 @@ mod tests {
         let stored = serde_json::to_string(&held(&store, &run(8))).unwrap();
         assert!(!stored.contains("s3cr3t"), "{stored}");
     }
+
+    /// A run of 1,000 events another machine wrote at generation 1: a step, then gate commands
+    /// of attempts 1 to 3 every tenth event, the first at `T0` and a second apart.
+    fn a_thousand_events(store: &std::sync::Arc<std::sync::Mutex<crate::store::Store>>) {
+        let other = MachineId::random();
+        for version in 1..=1000_u64 {
+            let ms = T0 + (version - 1) * 1000;
+            let (name, data) = if version % 10 == 0 {
+                let attempt = version / 10 % 3 + 1;
+                (
+                    "gate_command",
+                    json!({"attempt": attempt, "command": "cargo test", "exit_code": 0, "duration_ms": 5}),
+                )
+            } else {
+                ("step_changed", json!({"step": "red"}))
+            };
+            put(store, other, version, &run(8), 1, ms, name, data, None);
+        }
+    }
+
+    #[test]
+    fn the_write_of_event_1001_reads_no_event_of_the_run() {
+        let (_dir, store) = open_store();
+        a_thousand_events(&store);
+        let ledger = ledger(
+            &store,
+            MachineId::random(),
+            2,
+            ticking(T0 + 2_000_000, 1000),
+        );
+        let before = Store::run_events_read();
+        ledger
+            .write(&run(8), &step("green"), &test_cause())
+            .unwrap();
+        assert_eq!(Store::run_events_read() - before, 0);
+        assert_eq!(held(&store, &run(8)).len(), 1001);
+    }
+
+    #[test]
+    fn a_finish_after_1000_events_reads_only_the_first_event_and_the_gate_commands() {
+        let (_dir, store) = open_store();
+        a_thousand_events(&store);
+        let ledger = ledger(
+            &store,
+            MachineId::random(),
+            2,
+            ticking(T0 + 2_000_000, 1000),
+        );
+        let before = Store::run_events_read();
+        ledger
+            .finish(&run(8), Outcome::Stuck, None, None, &test_cause(), None)
+            .unwrap();
+        // The first event, and the 100 gate commands.
+        assert_eq!(Store::run_events_read() - before, 1 + 100);
+        assert_eq!(last(&store).data, finished_data("stuck", 2_000_000, 3));
+    }
 }
