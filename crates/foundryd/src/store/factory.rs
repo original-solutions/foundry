@@ -19,7 +19,7 @@ use foundry_proto::factory::{
 };
 use foundry_proto::ids::{MachineId, ProjectId, SessionId};
 use rusqlite::types::Type;
-use rusqlite::{OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use super::{Applied, Store, StoreError, from_sql, to_sql};
 
@@ -38,12 +38,6 @@ fn wrong_kind(kind: &str, body: &FactoryBody) -> StoreError {
         Type::Text,
         format!("a {kind} row holds a {} record", body.kind()).into(),
     ))
-}
-
-fn parse_machine(index: usize, text: &str) -> rusqlite::Result<MachineId> {
-    text.parse()
-        .map(MachineId)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(index, Type::Text, Box::new(e)))
 }
 
 impl Store {
@@ -103,15 +97,44 @@ impl Store {
     }
 
     /// The highest factory version held from each owner.
+    ///
+    /// An owner is read only as this build writes it: text that is a machine id in the
+    /// spelling `apply_factory` stores and `factory_since` looks it up by. Any other owner cell
+    /// (a blob, text that is not UTF-8 or not a machine id, or a machine id spelt otherwise),
+    /// which only a corrupt file or a newer build's id format leaves, is left out: one such row
+    /// must not make the machine's hello say it holds no factory record, which would have every
+    /// peer send it all of theirs again on every link, and it must not stand in for the version
+    /// of an owner it may spell. Each such owner is warned of once while the store is open
+    /// (`warn_unreadable_owner`).
     pub fn factory_versions(&self) -> Result<BTreeMap<MachineId, u64>, StoreError> {
-        let mut query = self
-            .conn
-            .prepare_cached("SELECT owner, MAX(version) FROM factory_records GROUP BY owner")?;
-        let rows = query.query_map([], |row| {
-            let owner: String = row.get(0)?;
-            Ok((parse_machine(0, &owner)?, from_sql(row.get(1)?)))
-        })?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        let mut query = self.conn.prepare_cached(
+            "SELECT owner, MAX(version) FROM factory_records GROUP BY owner ORDER BY owner",
+        )?;
+        // Read to the end before warning, so the warning's own writes never run inside the read.
+        let rows = query
+            .query_map([], |row| {
+                let owner = row.get_ref(0)?;
+                let id = owner.as_str().ok().and_then(|text| {
+                    text.parse()
+                        .ok()
+                        .map(MachineId)
+                        .filter(|id| id.to_string() == text)
+                });
+                // The column is TEXT and NOT NULL, so text and blobs are all a cell holds.
+                let owner = id.ok_or_else(|| owner.as_bytes().unwrap_or_default().to_vec());
+                Ok((owner, from_sql(row.get(1)?)))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut versions = BTreeMap::new();
+        for (owner, version) in rows {
+            match owner {
+                Ok(id) => {
+                    versions.insert(id, version);
+                }
+                Err(cell) => warn_unreadable_owner(&self.conn, &cell),
+            }
+        }
+        Ok(versions)
     }
 
     /// The events of `run`, from every writer, by the lease generation they were written under,
@@ -287,6 +310,32 @@ impl Store {
     }
 }
 
+/// Warns that a factory row whose owner this build cannot read is left out of the versions
+/// held, once per owner cell (its bytes) while `conn` is open, which is once a start: the owners
+/// warned of are kept in a table of the connection's own, which goes when it closes. That table
+/// holds at most one row per unreadable owner the store holds, and no peer can add one, since a
+/// record is stored under the machine id it came from, in this build's spelling. Should that
+/// table fail, the warning goes anyway. The line holds nothing of the row: not the owner and not
+/// its version.
+fn warn_unreadable_owner(conn: &Connection, owner: &[u8]) {
+    let inserted = conn
+        .execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS factory_owners_warned (owner BLOB PRIMARY KEY)",
+        )
+        .and_then(|()| {
+            conn.prepare_cached(
+                "INSERT OR IGNORE INTO temp.factory_owners_warned (owner) VALUES (?1)",
+            )?
+            .execute(params![owner])
+        });
+    if !matches!(inserted, Ok(0)) {
+        tracing::warn!(
+            "a factory row whose owner this build cannot read is left out of the factory \
+             versions held"
+        );
+    }
+}
+
 fn apply_factory_in_tx(
     tx: &Transaction<'_>,
     record: &FactoryRecord,
@@ -324,4 +373,228 @@ fn apply_factory_in_tx(
     )?
     .execute(params![key.kind, key.id, owner, version, json])?;
     Ok(Applied::Stored)
+}
+
+#[cfg(test)]
+mod tests {
+    use foundry_proto::factory::{FactoryBody, FactoryRecord, RunEvent, RunId};
+    use foundry_proto::ids::MachineId;
+    use rusqlite::params;
+    use tempfile::TempDir;
+
+    use crate::store::{Applied, Store};
+    use crate::test_log::Logged;
+
+    /// An owner this build cannot read, as a newer build's id format or a corrupt file leaves.
+    /// It sorts after every machine id, so the owners read before it.
+    const UNREADABLE: &str = "owner-from-a-newer-build";
+
+    /// Another, that sorts before every machine id, so the owners read after it.
+    const UNREADABLE_FIRST: &str = "-owner-of-a-corrupt-file";
+
+    /// The whole warning line, so a field added to it fails the test.
+    const WARNING: &str = "foundryd::store::factory: a factory row whose owner this build cannot read \
+                           is left out of the factory versions held";
+
+    fn open() -> (TempDir, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("foundry.db")).unwrap();
+        (dir, store)
+    }
+
+    fn store_event(store: &mut Store, owner: MachineId, version: u64, event: &str) {
+        let record = FactoryRecord {
+            owner,
+            version,
+            body: FactoryBody::RunEvent(RunEvent {
+                run: RunId::new("original-solutions/foundry", 192, 1).unwrap(),
+                generation: 1,
+                ts: "2026-11-24T05:16:30.000Z".into(),
+                ms: 1_795_497_390_000,
+                event: event.into(),
+                data: serde_json::json!({ "step": event }),
+                cause: None,
+            }),
+        };
+        assert_eq!(
+            store.apply_factory(&record, owner).unwrap(),
+            Applied::Stored
+        );
+    }
+
+    /// Makes every factory row of `owner` one whose owner reads as `unreadable`.
+    fn spoil_owner(store: &Store, owner: MachineId, unreadable: &str) {
+        let changed = store
+            .conn
+            .execute(
+                "UPDATE factory_records SET owner = ?1 WHERE owner = ?2",
+                params![unreadable, owner.to_string()],
+            )
+            .unwrap();
+        assert!(changed > 0);
+    }
+
+    /// Makes the owner cell of `owner`'s row of `version` hold `cell`, an SQL expression in
+    /// which `?1` is the owner as this build writes it, and gives the cell's SQL type.
+    fn respell(store: &Store, owner: MachineId, version: u64, cell: &str) -> String {
+        let changed = store
+            .conn
+            .execute(
+                &format!(
+                    "UPDATE factory_records SET owner = {cell} WHERE owner = ?1 AND version = ?2"
+                ),
+                params![owner.to_string(), i64::try_from(version).unwrap()],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+        store
+            .conn
+            .query_row(
+                "SELECT typeof(owner) FROM factory_records WHERE version = ?1",
+                params![i64::try_from(version).unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn factory_versions_leaves_out_an_owner_stored_as_a_blob_or_as_text_that_is_not_utf_8() {
+        let (_dir, mut store) = open();
+        let (a, blob, not_utf_8) = (
+            MachineId::random(),
+            MachineId::random(),
+            MachineId::random(),
+        );
+        store_event(&mut store, a, 1, "a-1");
+        store_event(&mut store, blob, 2, "blob-2");
+        store_event(&mut store, not_utf_8, 3, "not-utf-8-3");
+        assert_eq!(respell(&store, blob, 2, "x'00ff'"), "blob");
+        assert_eq!(respell(&store, not_utf_8, 3, "CAST(x'ff' AS TEXT)"), "text");
+
+        let logged = Logged::default();
+        let _capture = logged.capture();
+        assert_eq!(
+            store.factory_versions().unwrap(),
+            [(a, 1)].into(),
+            "the readable owner's version, and no error"
+        );
+        assert_eq!(logged.warnings().len(), 2, "{:?}", logged.warnings());
+    }
+
+    #[test]
+    fn a_row_whose_owner_is_spelt_otherwise_than_this_build_writes_it_never_lowers_its_version() {
+        let (_dir, mut store) = open();
+        let a = MachineId::random();
+        for version in 1..=3 {
+            store_event(&mut store, a, version, &format!("a-{version}"));
+        }
+        // Two of a's rows, below its highest, with its id spelt as this build never writes it.
+        // Both sort after a's own spelling, so a read that took either as a's would lower it.
+        assert_eq!(respell(&store, a, 1, "CAST(?1 AS BLOB)"), "blob");
+        assert_eq!(respell(&store, a, 2, "'{' || ?1 || '}'"), "text");
+
+        let logged = Logged::default();
+        let _capture = logged.capture();
+        assert_eq!(store.factory_versions().unwrap(), [(a, 3)].into());
+        assert_eq!(logged.warnings().len(), 2, "{:?}", logged.warnings());
+    }
+
+    #[test]
+    fn each_owner_that_cannot_be_read_is_warned_of_once_and_one_found_later_then() {
+        let (_dir, mut store) = open();
+        let (a, first, last, later) = (
+            MachineId::random(),
+            MachineId::random(),
+            MachineId::random(),
+            MachineId::random(),
+        );
+        store_event(&mut store, a, 1, "a-1");
+        store_event(&mut store, first, 2, "first-2");
+        store_event(&mut store, last, 3, "last-3");
+        spoil_owner(&store, first, UNREADABLE_FIRST);
+        spoil_owner(&store, last, UNREADABLE);
+
+        let logged = Logged::default();
+        let _capture = logged.capture();
+        for _ in 0..3 {
+            assert_eq!(store.factory_versions().unwrap(), [(a, 1)].into());
+        }
+        assert_eq!(
+            logged.warnings().len(),
+            2,
+            "once for each owner: {:?}",
+            logged.warnings()
+        );
+
+        // An owner first found unreadable while the store is open is warned of then, once.
+        store_event(&mut store, later, 4, "later-4");
+        spoil_owner(&store, later, "owner-found-later");
+        for _ in 0..3 {
+            assert_eq!(store.factory_versions().unwrap(), [(a, 1)].into());
+        }
+        assert_eq!(logged.warnings().len(), 3, "{:?}", logged.warnings());
+    }
+
+    #[test]
+    fn factory_versions_leaves_out_an_owner_that_cannot_be_read_and_gives_the_others() {
+        let (_dir, mut store) = open();
+        let (a, b) = (MachineId::random(), MachineId::random());
+        let (first, last) = (MachineId::random(), MachineId::random());
+        store_event(&mut store, a, 1, "a-1");
+        store_event(&mut store, a, 2, "a-2");
+        store_event(&mut store, b, 3, "b-3");
+        store_event(&mut store, first, 4, "first-4");
+        store_event(&mut store, last, 5, "last-5");
+        // The query reads owners in their order: one bad owner comes before both readable ones,
+        // and one after, so a read that stops at a bad owner rather than going past it fails
+        // here.
+        spoil_owner(&store, first, UNREADABLE_FIRST);
+        spoil_owner(&store, last, UNREADABLE);
+
+        assert_eq!(
+            store.factory_versions().unwrap(),
+            [(a, 2), (b, 3)].into(),
+            "the readable owners' versions, and no error"
+        );
+    }
+
+    #[test]
+    fn an_owner_that_cannot_be_read_is_warned_of_once_per_start_with_nothing_of_its_row() {
+        let (dir, mut store) = open();
+        let (a, spoiled) = (MachineId::random(), MachineId::random());
+        store_event(&mut store, a, 1, "a-1");
+        store_event(&mut store, spoiled, 4242, "a-step-only-the-row-holds");
+        spoil_owner(&store, spoiled, UNREADABLE);
+
+        let logged = Logged::default();
+        let _capture = logged.capture();
+        for _ in 0..3 {
+            assert_eq!(store.factory_versions().unwrap(), [(a, 1)].into());
+        }
+        let warnings = logged.warnings();
+        assert_eq!(warnings.len(), 1, "once, not once per call: {warnings:?}");
+        assert!(
+            warnings[0].ends_with(WARNING),
+            "the line holds only its message: {warnings:?}"
+        );
+        for row_data in [
+            UNREADABLE,
+            "4242",
+            "a-step-only-the-row-holds",
+            &spoiled.to_string(),
+        ] {
+            assert!(
+                !warnings[0].contains(row_data),
+                "the warning holds {row_data:?}: {warnings:?}"
+            );
+        }
+
+        // The next start warns again, once.
+        drop(store);
+        let store = Store::open(dir.path().join("foundry.db")).unwrap();
+        for _ in 0..3 {
+            assert_eq!(store.factory_versions().unwrap(), [(a, 1)].into());
+        }
+        assert_eq!(logged.warnings().len(), 2, "{:?}", logged.warnings());
+    }
 }

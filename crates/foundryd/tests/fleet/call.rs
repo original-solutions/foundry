@@ -558,9 +558,11 @@ async fn a_call_to_a_peer_on_an_older_link_or_on_no_link_is_refused_before_any_l
         other => panic!("not refused as older: {other:?}"),
     }
 
+    // The link speaks protocol 2, so `older()` never lists it: wait on the link itself.
+    assert!(peers.linked().contains(&old), "the old peer's link is open");
     drop(near);
     until(WAIT, "the old peer's link closes", || {
-        peers.older().is_empty()
+        !peers.linked().contains(&old)
     })
     .await;
     assert!(

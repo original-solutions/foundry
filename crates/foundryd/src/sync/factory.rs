@@ -292,7 +292,8 @@ pub(super) async fn watch_own(inner: &Inner) {
 /// The highest version of `me`'s own factory records: the newest of at most [`BATCH`] above
 /// `seen`, so a burst is read a batch a tick, or, with nothing seen yet or a record above `seen`
 /// that cannot be read, the highest version held, which parses no record. When that cannot be
-/// read either, which a row of another owner's can cause, `me`'s own records above `seen` are
+/// read either, which a row of another owner's whose version is not a whole number can cause
+/// (an owner that cannot be read is left out of it instead), `me`'s own records above `seen` are
 /// read to the last.
 fn newest_own(store: &mut Store, me: MachineId, seen: Option<u64>) -> Result<u64, StoreError> {
     if let Some(seen) = seen
@@ -415,6 +416,44 @@ mod tests {
         let one = serde_json::to_vec(&records[0]).unwrap().len();
         assert_eq!(fitting(&records, one * 2 + 1), 2);
         assert_eq!(fitting(&records, one * 2), 2);
+    }
+
+    #[test]
+    fn newest_own_reads_its_own_records_to_the_last_when_another_owners_row_stops_the_versions_held()
+     {
+        let data = tempfile::tempdir().unwrap();
+        let path = data.path().join("foundry.db");
+        let mut store = Store::open(&path).unwrap();
+        let (me, other) = (MachineId::random(), MachineId::random());
+        let own = u64::try_from(BATCH).unwrap() + 1;
+        for version in 1..=own {
+            let record = FactoryRecord {
+                owner: me,
+                ..event(version, 10)
+            };
+            assert_eq!(store.apply_factory(&record, me).unwrap(), Applied::Stored);
+        }
+        let record = FactoryRecord {
+            owner: other,
+            ..event(7, 10)
+        };
+        assert_eq!(
+            store.apply_factory(&record, other).unwrap(),
+            Applied::Stored
+        );
+        // A version that is not a whole number, which only a corrupt file leaves, on the other
+        // owner's row: the highest version held per owner cannot be read, `me`'s records can.
+        let changed = rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE factory_records SET version = 'seven' WHERE owner = ?1",
+                rusqlite::params![other.to_string()],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+        assert!(store.factory_versions().is_err());
+
+        assert_eq!(newest_own(&mut store, me, None).unwrap(), own);
     }
 
     #[test]
