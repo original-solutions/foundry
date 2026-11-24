@@ -1141,7 +1141,8 @@ pub(crate) mod tests {
         assert_ne!(held_mine.key(), held_theirs.key());
         assert_eq!(held_mine.key().id, owner.to_string());
 
-        // One `SessionTurn` per session.
+        // One `SessionTurn` per session and writer, so a machine that does not own a session
+        // never takes the key its owner writes the session's turns under.
         let turn_one = record(owner, 1, FactoryBody::Turn(turn.clone()));
         let turn_two = record(
             owner,
@@ -1151,8 +1152,10 @@ pub(crate) mod tests {
                 ..turn.clone()
             }),
         );
+        let turn_theirs = record(other, 1, FactoryBody::Turn(turn.clone()));
         assert_eq!(turn_one.key(), turn_two.key());
-        assert_eq!(turn_one.key().id, turn.session.to_string());
+        assert_ne!(turn_one.key(), turn_theirs.key());
+        assert_eq!(turn_one.key().id, format!("{}/{owner}", turn.session));
 
         // Kinds never share a key.
         let keys = [first.key(), mine.key(), held_mine.key(), turn_one.key()];
