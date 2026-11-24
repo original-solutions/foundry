@@ -7,17 +7,24 @@
 //! as [`runner_line`] writes it, with the runner's keys in the runner's order. The generation
 //! is not written: the runner's lines have none.
 //!
-//! The export only reads the store. Each run's file is written whole beside its place and then
-//! moved into it, so a `retro` reading the folder meanwhile never finds half a run. Files in
-//! `runs/` that are not a run of this store are left as they are.
+//! The export never writes the store. It reads a copy: one read of the store, through a
+//! connection that cannot write, copies it into the export's directory, and only the copy is
+//! opened as a [`Store`]. Opening a store brings its schema up to this build's, so a store an
+//! older daemon still runs on is never moved on under it, and every run is read from the same
+//! moment. The copy is removed when the export ends.
+//!
+//! Each run's file is written whole beside its place, synced and then moved into it, so a
+//! `retro` reading the folder meanwhile never finds half a run. Files in `runs/` that are not a
+//! run of this store are left as they are.
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::io;
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use foundry_proto::factory::{FactoryBody, RunId};
+use rusqlite::{Connection, OpenFlags};
 
 use super::read::{events, runner_line};
 use crate::store::{Store, StoreError};
@@ -33,12 +40,17 @@ const PAGE: usize = 512;
 pub enum ExportError {
     #[error("reading the store: {0}")]
     Store(#[from] StoreError),
+    #[error("copying the store: {0}")]
+    Copy(#[from] rusqlite::Error),
+    #[error("copying the store: the export directory {} is not UTF-8", .0.display())]
+    NotUtf8(PathBuf),
     #[error("writing {}: {source}", path.display())]
     Write { path: PathBuf, source: io::Error },
 }
 
 /// `foundryd factory export <dir>`: writes every run this machine's store holds into `dir`.
-/// A machine with no store yet holds no run: `dir/runs` is made empty, and no store is made.
+/// The store is read from a copy and never written. A machine with no store yet holds no run:
+/// `dir/runs` is made empty, and no store is made.
 pub fn command(dir: &Path) -> ExitCode {
     let Some(home) = crate::daemon::home() else {
         eprintln!("foundryd factory export: set FOUNDRY_HOME or HOME");
@@ -46,9 +58,7 @@ pub fn command(dir: &Path) -> ExitCode {
     };
     let path = home.join("store.sqlite");
     let written = if path.exists() {
-        Store::open(&path)
-            .map_err(ExportError::from)
-            .and_then(|store| export(&store, dir))
+        export_copy(&path, dir)
     } else {
         make_dir(&dir.join(RUNS)).map(|()| 0)
     };
@@ -85,6 +95,42 @@ pub fn export(store: &Store, dir: &Path) -> Result<usize, ExportError> {
     Ok(runs.len())
 }
 
+/// Exports the store at `live` from a copy of it made in `dir`, which is removed again.
+fn export_copy(live: &Path, dir: &Path) -> Result<usize, ExportError> {
+    make_dir(dir)?;
+    let copy = StoreCopy(dir.join(format!(".foundryd-store-{}.sqlite", std::process::id())));
+    // A copy left by an earlier export that was killed, under the same process id: the copy
+    // below is refused into a file that is not empty.
+    copy.remove();
+    let target = copy
+        .0
+        .to_str()
+        .ok_or_else(|| ExportError::NotUtf8(dir.to_owned()))?;
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    Connection::open_with_flags(live, flags)?.execute("VACUUM INTO ?1", [target])?;
+    let store = Store::open(&copy.0)?;
+    export(&store, dir)
+}
+
+/// A copy of the store, removed with whatever SQLite left beside it when dropped.
+struct StoreCopy(PathBuf);
+
+impl StoreCopy {
+    fn remove(&self) {
+        let mut journal = self.0.clone().into_os_string();
+        journal.push("-journal");
+        // Best effort: a copy that cannot be removed holds nothing the store does not.
+        let _ = fs::remove_file(&self.0);
+        let _ = fs::remove_file(journal);
+    }
+}
+
+impl Drop for StoreCopy {
+    fn drop(&mut self) {
+        self.remove();
+    }
+}
+
 /// Every run that `store` holds an event of, from any writer, once each, in order. Each
 /// writer's records are read `page` at a time, so the store is never read whole at once.
 fn runs_by_page(store: &Store, page: usize) -> Result<Vec<RunId>, StoreError> {
@@ -114,16 +160,22 @@ fn make_dir(dir: &Path) -> Result<(), ExportError> {
     })
 }
 
-/// Writes `text` as `dir/name`: whole into a file beside it first, then moved into place, so
-/// the file is either as it was or all of `text`.
+/// Writes `text` as `dir/name`: whole into a file of this process beside it first, synced, then
+/// moved into place, so the file is either as it was or all of `text`.
 fn write_whole(dir: &Path, name: &str, text: &str) -> Result<(), ExportError> {
     let path = dir.join(name);
-    let part = dir.join(format!(".{name}.part"));
+    let part = dir.join(format!(".{name}.{}.part", std::process::id()));
     let failed = |source| ExportError::Write {
         path: path.clone(),
         source,
     };
-    if let Err(error) = fs::write(&part, text).and_then(|()| fs::rename(&part, &path)) {
+    let written = fs::File::create(&part)
+        .and_then(|mut file| {
+            file.write_all(text.as_bytes())?;
+            file.sync_all()
+        })
+        .and_then(|()| fs::rename(&part, &path));
+    if let Err(error) = written {
         // Best effort: what is left of the part file is no run file, whatever is in it.
         let _ = fs::remove_file(&part);
         return Err(failed(error));
