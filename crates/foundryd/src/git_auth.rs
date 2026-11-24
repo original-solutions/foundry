@@ -11,6 +11,17 @@
 //! [`GitAuth::apply`]). [`helpers_off_env`] is for a terminal, which gets no token: it turns
 //! the machine's credential helpers, any askpass and any inherited token off, so its keychain
 //! answers for nothing.
+//!
+//! The daemon's own environment is trusted as `PATH` is, and `PATH` already picks the git
+//! binary that gets the token. The installed service gets only `FOUNDRY_HOME` and the few
+//! variables `service.rs` copies from the installing shell (`FROM_SHELL`); a daemon started by
+//! hand trusts the shell it was started from. No repository, provision step or session can set
+//! it. So [`GitAuth::apply`] removes or pins only what that shell could carry in that would turn
+//! a safety off by accident: config from the environment, a forgotten `GIT_SSL_NO_VERIFY`, a
+//! trace that is not redacted, a stray `GIT_DIR`. It passes on, on purpose, what picks a
+//! trusted resource: `GIT_EXEC_PATH`, `GIT_SSL_CAINFO` and `GIT_SSL_CAPATH`, `HTTPS_PROXY` and
+//! `ALL_PROXY`, and `LD_PRELOAD` and `DYLD_INSERT_LIBRARIES`. Dropping those would stop no one
+//! who can set them, and a machine behind a TLS-inspecting proxy needs its CA and proxy.
 
 use std::fmt;
 use std::fs::{self, OpenOptions};
@@ -86,13 +97,19 @@ const ENV: [(&str, &str); 9] = [
     ("GIT_TRACE_REDACT", "1"),
 ];
 
-/// What the daemon's own environment may carry in from whatever started it and is not passed
-/// on: config that could set any key the call's `-c` settings do not (git reads it before
-/// them, so the `-c` ones still win), and the switch that turns TLS verification off.
-const INHERITED: [&str; 3] = [
+/// What the shell that started the daemon may carry in by accident and is not passed on (see
+/// the module doc for what is passed on, and why): config that could set any key the call's
+/// `-c` settings do not (git reads it before them, so the `-c` ones still win), the switch
+/// that turns TLS verification off, and the variables that would point the call at another
+/// repository than the one it runs in, whose config could turn verification off for
+/// github.com. A caller that means to name the repository sets them after [`GitAuth::apply`].
+const INHERITED: [&str; 6] = [
     "GIT_CONFIG_PARAMETERS",
     "GIT_CONFIG_COUNT",
     "GIT_SSL_NO_VERIFY",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
 ];
 
 /// The token for one login, ready to give to a git child. Its debug form shows the login and
