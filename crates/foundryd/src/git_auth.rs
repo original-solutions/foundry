@@ -490,10 +490,6 @@ mod tests {
                 "-c",
                 "core.alternateRefsCommand=",
                 "-c",
-                "protocol.allow=never",
-                "-c",
-                "protocol.https.allow=always",
-                "-c",
                 "http.sslVerify=true",
                 "fetch",
                 "--",
@@ -510,26 +506,10 @@ mod tests {
             ("GIT_LFS_SKIP_SMUDGE", "1"),
             ("GIT_NO_LAZY_FETCH", "1"),
             ("LC_ALL", "C"),
+            ("GIT_ALLOW_PROTOCOL", "https"),
         ] {
             assert_eq!(seen.env.get(key).map(String::as_str), Some(value), "{key}");
         }
-    }
-
-    #[test]
-    fn a_local_fetch_is_allowed_only_when_asked_for() {
-        let data = tempfile::tempdir().unwrap();
-        let plain = run_fake_git(&auth(data.path()), &["fetch"]);
-        assert!(
-            !plain.argv.contains("protocol.file.allow"),
-            "{}",
-            plain.argv
-        );
-        let local = run_fake_git(&auth(data.path()).allow_file_transport(), &["fetch"]);
-        let argv: Vec<&str> = local.argv.lines().collect();
-        assert_eq!(
-            argv[argv.len() - 3..],
-            ["-c", "protocol.file.allow=always", "fetch"]
-        );
     }
 
     #[test]
@@ -579,23 +559,6 @@ mod tests {
         ] {
             assert_eq!(envs.get(&OsString::from(key)), Some(&None), "{key}");
         }
-    }
-
-    #[test]
-    fn askpass_env_names_the_script_and_the_token_and_nothing_else() {
-        let data = tempfile::tempdir().unwrap();
-        let env = auth(data.path()).askpass_env();
-        let askpass = data.path().join(ASKPASS);
-        assert_eq!(
-            env,
-            [
-                (
-                    "GIT_ASKPASS".to_owned(),
-                    askpass.to_str().unwrap().to_owned()
-                ),
-                (TOKEN_VAR.to_owned(), TOKEN.to_owned()),
-            ]
-        );
     }
 
     #[test]
@@ -680,13 +643,24 @@ mod tests {
         let seen = dir.path().join("seen");
         fs::write(&spy, format!("env > '{}'\nexit 1\n", seen.display())).unwrap();
         let spy_command = format!("sh {}", spy.display());
-        machine.git_ok(&["config", "core.sshCommand", &spy_command]);
-        machine.git_ok(&["config", "core.gitProxy", &spy_command]);
-        machine.git_ok(&["config", "remote.origin.url", "ssh://example.invalid/x.git"]);
-        machine.git_ok(&["config", "remote.plain.url", "git://example.invalid/x.git"]);
+        let upload_pack = format!("{spy_command}; git-upload-pack");
+        // The repository turns each transport back on by name, too.
+        for (key, value) in [
+            ("core.sshCommand", spy_command.as_str()),
+            ("core.gitProxy", spy_command.as_str()),
+            ("protocol.ssh.allow", "always"),
+            ("protocol.git.allow", "always"),
+            ("protocol.file.allow", "always"),
+            ("remote.origin.url", "ssh://example.invalid/x.git"),
+            ("remote.plain.url", "git://example.invalid/x.git"),
+            ("remote.local.url", machine.repo.to_str().unwrap()),
+            ("remote.local.uploadpack", upload_pack.as_str()),
+        ] {
+            machine.git_ok(&["config", key, value]);
+        }
         let data = tempfile::tempdir().unwrap();
         let auth = auth(data.path());
-        for remote in ["origin", "plain"] {
+        for remote in ["origin", "plain", "local"] {
             let out = machine
                 .hardened(&auth)
                 .args(["fetch", "--", remote])
@@ -857,15 +831,17 @@ mod tests {
     }
 
     #[test]
-    fn helpers_off_env_holds_no_token_and_blanks_every_askpass() {
+    fn helpers_off_env_holds_no_token_and_blanks_every_askpass_and_token_it_could_inherit() {
         let env: BTreeMap<String, String> = helpers_off_env().into_iter().collect();
-        for key in [TOKEN_VAR, "GH_TOKEN", "GITHUB_TOKEN"] {
-            assert!(!env.contains_key(key), "{key}");
-        }
+        assert!(!env.contains_key(TOKEN_VAR));
         for (key, value) in &env {
             assert!(!value.contains(TOKEN), "{key}");
         }
         for (key, value) in [
+            ("GH_TOKEN", ""),
+            ("GITHUB_TOKEN", ""),
+            ("GH_ENTERPRISE_TOKEN", ""),
+            ("GITHUB_ENTERPRISE_TOKEN", ""),
             ("GIT_ASKPASS", ""),
             ("SSH_ASKPASS", ""),
             ("GIT_TERMINAL_PROMPT", "0"),
