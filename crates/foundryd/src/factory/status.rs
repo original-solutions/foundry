@@ -30,9 +30,9 @@ pub const FINISHED_KEPT: usize = 20;
 /// holder that died does not hide the next coordinator's reason for being idle. `None` when no
 /// online writer holds the lease and the acting coordinator has written no status.
 ///
-/// A holding status below the highest generation any online status reports, a not-holding
-/// one's included, is not believed: its writer lost the lease and stopped writing while it
-/// stayed online. [`Freshness`] does not count such a status either.
+/// Any online holding status is believed over every not-holding one, whatever generation a
+/// not-holding status reports. [`Freshness`] differs on purpose: for the cut-off rule it counts
+/// a holding status only at the highest generation this machine has seen.
 ///
 /// Two holders at one generation should not exist, since one machine writes in a generation.
 /// Should they, the higher pass is believed, then the lower machine id, so every machine
@@ -47,12 +47,8 @@ pub fn believed(
             .iter()
             .filter(|(writer, _)| online.contains(writer))
     };
-    let highest = heard()
-        .map(|(_, status)| generation_seen(status))
-        .max()
-        .unwrap_or(0);
     heard()
-        .filter(|(_, status)| status.holds && status.generation >= highest)
+        .filter(|(_, status)| status.holds)
         .max_by_key(|(writer, status)| (status.generation, status.pass, Reverse(*writer)))
         .or_else(|| heard().find(|(writer, _)| *writer == acting))
         .map(|(_, status)| status.clone())
