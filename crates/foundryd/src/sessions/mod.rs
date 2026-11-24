@@ -107,6 +107,10 @@ pub enum SessionError {
     },
     #[error("sessions: Claude Code's state file {} cannot be used: {reason}", path.display())]
     ClaudeState { path: PathBuf, reason: String },
+    #[error(transparent)]
+    NoToken(#[from] crate::git_auth::NoToken),
+    #[error("sessions: a factory session's first message cannot carry a body yet")]
+    FirstMessageBody,
     #[error("sessions: a step run apart from its caller did not finish: {0}")]
     Interrupted(#[from] tokio::task::JoinError),
 }
@@ -215,6 +219,11 @@ impl Sessions {
                 fail_adopt_reads: std::sync::atomic::AtomicUsize::new(0),
             }),
         }
+    }
+
+    /// Gives these sessions the secret store a factory start reads its token from.
+    pub fn with_secrets(self, _secrets: Arc<dyn crate::secrets::Secrets>) -> Self {
+        todo!()
     }
 
     /// Starts Claude Code with `model` in a new terminal in `worktree`, the worktree of
