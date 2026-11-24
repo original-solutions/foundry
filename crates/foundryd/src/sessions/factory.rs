@@ -2013,8 +2013,9 @@ exec "$agent" "$@""#;
         for netrc in [
             format!("machine example.com login u password {SECRET}\n"),
             format!("machine gitlab.com login a password {SECRET}\n"),
-            format!("machine github.com.example login a password {SECRET}\n")
-                .replace("github.com", "git-hub.com"),
+            format!("machine api.github.com login u password {SECRET}\n"),
+            format!("machine gist.github.com login u password {SECRET}\n"),
+            format!("machine github.com.example login u password {SECRET}\n"),
         ] {
             let (home, repo) = setup("");
             std::fs::write(home.path().join(".netrc"), &netrc).unwrap();
