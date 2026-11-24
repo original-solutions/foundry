@@ -1998,6 +1998,36 @@ mod tests {
     }
 
     #[test]
+    fn a_secret_split_by_a_lone_escape_or_c1_introducer_is_hidden_in_the_data_and_the_cause() {
+        let (_dir, store) = open_store();
+        let token = "ghp_0123456789abcdefghij";
+        let ledger = Ledger::new(store.clone(), MachineId::random(), 1, hiding(token))
+            .with_wall(ticking(T0, 1000));
+        for (split, end) in [
+            ("\u{1b}", ""),
+            ("\u{9b}", ""),
+            ("\u{90}", "\u{7}"),
+            ("\u{9d}", "\u{9c}"),
+        ] {
+            let text = format!("one\nT=ghp_0123456789{split}abcdefghij{end}\ntwo");
+            let cause = Cause::new(CauseStep::Gate, &text).command(&text);
+            let written = ledger.write(&run(8), &stuck(&text), &cause).unwrap();
+            assert_eq!(
+                written.data["reason"],
+                json!(format!("one\nT=***{end}\ntwo")),
+                "{split:?}"
+            );
+            let cause = written.cause.unwrap();
+            for field in ["reason", "command"] {
+                assert_eq!(cause[field], json!("oneT=***two"), "{split:?} {field}");
+            }
+        }
+        let stored = serde_json::to_string(&held(&store, &run(8))).unwrap();
+        assert!(!stored.contains("ghp_"), "{stored}");
+        assert!(!stored.contains("abcdefghij"), "{stored}");
+    }
+
+    #[test]
     fn a_write_gives_each_text_to_its_hider_once_and_as_it_came() {
         let (_dir, store) = open_store();
         let seen = std::sync::Arc::new(Mutex::new(Vec::<String>::new()));

@@ -2094,11 +2094,25 @@ mod tests {
     }
 
     #[test]
-    fn hide_known_hides_a_value_with_a_gap_character_of_its_own_only_whole() {
+    fn hide_known_hides_a_value_with_gap_characters_of_its_own_across_other_gaps() {
         let secrets = MemorySecrets::default();
+        // 18 characters that are no gap: matched across gaps too.
         secrets.set(GATEWAY, "a key with spaces in it").unwrap();
+        // 9 characters that are no gap: only whole.
+        secrets
+            .set(GATEWAY_MANAGEMENT, "a b c d e f g h i")
+            .unwrap();
         assert_eq!(hide_known("[a key with spaces in it]", &secrets), "[***]");
-        let text = "[a key with  spaces in it]";
+        assert_eq!(
+            hide_known("[a key with\n  spaces in it]", &secrets),
+            "[***]"
+        );
+        assert_eq!(
+            hide_known("[a key\u{7}with spaces in it]", &secrets),
+            "[***]"
+        );
+        assert_eq!(hide_known("[a b c d e f g h i]", &secrets), "[***]");
+        let text = "[a b c d\ne f g h i]";
         assert_eq!(hide_known(text, &secrets), text);
     }
 
@@ -2129,34 +2143,99 @@ mod tests {
 
     #[test]
     fn hide_known_hides_a_value_near_the_end_of_64_kb_in_one_pass() {
-        // Near misses all through: the token's head again and again, each cut short by a gap
-        // or a stray escape, so a matcher that went back would read the text many times over.
-        let (head, tail) = TOKEN.split_at(39);
+        // Near misses all through: the token's head, and a long run of the one character a
+        // value repeats, each cut short by a gap or a stray escape. A matcher that went back
+        // to the next place a match could start would read each run once for each of its
+        // characters.
+        let value = format!("{}b", "a".repeat(63));
+        let (head, _) = TOKEN.split_at(39);
+        let runs = "a".repeat(40);
         let mut text = String::new();
         let mut n = 0;
-        while text.len() < 64 * 1024 - 200 {
-            text.push_str(head);
-            text.push_str(["\n  ", "\u{1b}[1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;\n", " "][n % 3]);
+        while text.len() < 64 * 1024 - 300 {
+            text.push_str([head, runs.as_str()][n % 2]);
+            text.push_str(
+                [
+                    "\n  ",
+                    "\u{1b}[1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;\n",
+                    " ",
+                    "\u{1b}[1;2;3;",
+                    "\u{1b}",
+                ][n % 5],
+            );
             n += 1;
         }
-        text.push_str(&format!("{}\n{}{tail}\nend", &TOKEN[..12], &TOKEN[12..39]));
+        text.push_str(&format!(
+            "\nT={}\n{}\nV={}\u{1b}[0m{}\nend",
+            &TOKEN[..12],
+            &TOKEN[12..],
+            &value[..30],
+            &value[30..]
+        ));
         assert!(text.len() <= 64 * 1024);
         let values = vec![
             TOKEN.to_owned(),
+            value.clone(),
             "sk-0123456789abcdefABCDEF".to_owned(),
             "short1".to_owned(),
         ];
         let mut work = 0;
         let hidden = hide_values(&text, &values, &mut work);
         assert!(
-            hidden.ends_with("***\nend"),
+            hidden.ends_with("\nT=***\nV=***\nend"),
             "{}",
             &hidden[hidden.len() - 80..]
         );
         assert!(!hidden.contains(TOKEN));
-        // Each character is read a bounded number of times for each value, however the text
-        // is laid out: linear in the text, never a pass per place a match could start.
-        let bound = 4 * text.chars().count() * (values.len() + 1);
+        // Each character is read a bounded number of times for each value, however long the
+        // value: linear in the text, never a pass per place a match could start.
+        let bound = 6 * text.chars().count() * (values.len() + 1);
         assert!(work <= bound, "{work} steps for {} characters", text.len());
+    }
+
+    #[test]
+    fn hide_known_hides_a_token_split_by_a_lone_escape_or_c1_introducer() {
+        // A lone ESC or C1 control is a gap of its own, even where the characters after it
+        // could also be read as the rest of an escape sequence: `ESC I`, `CSI 9 j`.
+        for at in [20, 21] {
+            let secrets = holding_token();
+            let (head, tail) = TOKEN.split_at(at);
+            for gap in ["\u{1b}", "\u{9b}", "\u{1b}\u{1b}", " \u{1b}"] {
+                let text = format!("<{head}{gap}{tail}>");
+                assert_eq!(hide_known(&text, &secrets), "<***>", "{at} {gap:?}");
+            }
+            // A C1 string introducer with a terminator after the token.
+            for gap in ["\u{90}", "\u{98}", "\u{9d}", "\u{9e}", "\u{9f}"] {
+                for end in ["\u{7}", "\u{9c}", "\u{1b}\\"] {
+                    let text = format!("<{head}{gap}{tail}{end}>");
+                    assert_eq!(
+                        hide_known(&text, &secrets),
+                        format!("<***{end}>"),
+                        "{at} {gap:?} {end:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hide_known_hides_a_value_that_overlaps_itself() {
+        let secrets = MemorySecrets::default();
+        secrets.set(GATEWAY, "ghp_abcghp_abcghp_xyz0").unwrap();
+        secrets
+            .set(GATEWAY_MANAGEMENT, "abcabcabcabcabcabc")
+            .unwrap();
+        // The text starts with a partial match that is the value's own start, again.
+        assert_eq!(
+            hide_known("ghp_abcghp_abcghp_abcghp_abcghp_xyz0", &secrets),
+            "ghp_abcghp_abc***"
+        );
+        assert_eq!(
+            hide_known("ghp_abcghp_abcghp_abcghp_a\nbcghp_xyz0.", &secrets),
+            "ghp_abcghp_abc***."
+        );
+        // Two matches that overlap are hidden as one.
+        assert_eq!(hide_known("<abcabcabcabcabcabcabc>", &secrets), "<***>");
+        assert_eq!(hide_known("<abcabcabc\tabcabcabcabc>", &secrets), "<***>");
     }
 }
