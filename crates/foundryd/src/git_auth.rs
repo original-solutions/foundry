@@ -18,10 +18,11 @@
 //! hand trusts the shell it was started from. No repository, provision step or session can set
 //! it. So [`GitAuth::apply`] removes or pins only what that shell could carry in that would turn
 //! a safety off by accident: config from the environment, a forgotten `GIT_SSL_NO_VERIFY`, a
-//! trace that is not redacted, a stray `GIT_DIR`. It passes on, on purpose, what picks a
-//! trusted resource: `GIT_EXEC_PATH`, `GIT_SSL_CAINFO` and `GIT_SSL_CAPATH`, `HTTPS_PROXY` and
-//! `ALL_PROXY`, and `LD_PRELOAD` and `DYLD_INSERT_LIBRARIES`. Dropping those would stop no one
-//! who can set them, and a machine behind a TLS-inspecting proxy needs its CA and proxy.
+//! trace that is not redacted, and git's repo-local variables such as `GIT_DIR`. It passes on,
+//! on purpose, what picks a trusted resource: `GIT_EXEC_PATH`, `GIT_SSL_CAINFO` and
+//! `GIT_SSL_CAPATH`, `HTTPS_PROXY` and `ALL_PROXY`, and `LD_PRELOAD` and
+//! `DYLD_INSERT_LIBRARIES`. Dropping those would stop no one who can set them, and a machine
+//! behind a TLS-inspecting proxy needs its CA and proxy.
 
 use std::fmt;
 use std::fs::{self, OpenOptions};
@@ -98,18 +99,33 @@ const ENV: [(&str, &str); 9] = [
 ];
 
 /// What the shell that started the daemon may carry in by accident and is not passed on (see
-/// the module doc for what is passed on, and why): config that could set any key the call's
-/// `-c` settings do not (git reads it before them, so the `-c` ones still win), the switch
-/// that turns TLS verification off, and the variables that would point the call at another
-/// repository than the one it runs in, whose config could turn verification off for
-/// github.com. A caller that means to name the repository sets them after [`GitAuth::apply`].
-const INHERITED: [&str; 6] = [
+/// the module doc for what is passed on, and why).
+///
+/// git's repo-local variables never cross into this call; a caller that wants one sets it after
+/// [`GitAuth::apply`]. They are every variable git lists as describing the current repository
+/// (`git rev-parse --local-env-vars`, read from git 2.54) except `GIT_NO_REPLACE_OBJECTS`,
+/// which [`ENV`] pins, plus `GIT_NAMESPACE`. Each makes the call read other config, objects or
+/// refs than those of the repository it runs in, and other config could turn TLS verification
+/// off for github.com. A test fails when the installed git lists a name that is missing here.
+///
+/// Last, `GIT_SSL_NO_VERIFY`, which turns TLS verification off itself.
+const INHERITED: [&str; 16] = [
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CONFIG",
     "GIT_CONFIG_PARAMETERS",
     "GIT_CONFIG_COUNT",
-    "GIT_SSL_NO_VERIFY",
+    "GIT_OBJECT_DIRECTORY",
     "GIT_DIR",
     "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_GRAFT_FILE",
     "GIT_INDEX_FILE",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_PREFIX",
+    "GIT_SHALLOW_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_NAMESPACE",
+    "GIT_SSL_NO_VERIFY",
 ];
 
 /// The token for one login, ready to give to a git child. Its debug form shows the login and
@@ -176,8 +192,9 @@ impl GitAuth {
     /// them into the new repository's config), so a command that has an argument already is a
     /// mistake in the caller, and this panics. `GIT_ASKPASS` names the script and
     /// [`TOKEN_VAR`] holds the token, on this command's environment only; the daemon's own is
-    /// never changed. A caller that adds `GIT_CONFIG_COUNT` pins does so after this. A tokio
-    /// command takes it through `as_std_mut()`.
+    /// never changed. This removes any of `INHERITED` the command would pass on, so a caller
+    /// that adds `GIT_CONFIG_COUNT` pins, or names a repository with `GIT_DIR`, does so after
+    /// this. A tokio command takes it through `as_std_mut()`.
     ///
     /// The command then holds the token: its `Debug` form shows it, so it is never logged or
     /// put in an error.
