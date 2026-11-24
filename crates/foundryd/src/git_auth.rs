@@ -7,13 +7,15 @@
 //! only ever in that child's environment. [`helpers_off_env`] is for a terminal, which gets no
 //! token: it turns the machine's credential helpers off, so its keychain answers for nothing.
 
-use std::ffi::OsString;
 use std::fmt;
-use std::io;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::secrets::{Secrets, SecretsError};
+use crate::secrets::{self, Secrets, SecretsError};
 
 /// The variable the askpass script reads the token from. It is set on one child only.
 pub const TOKEN_VAR: &str = "FOUNDRY_GIT_TOKEN";
@@ -21,7 +23,53 @@ pub const TOKEN_VAR: &str = "FOUNDRY_GIT_TOKEN";
 /// The askpass script's name in the data directory.
 pub const ASKPASS: &str = "git-askpass";
 
-/// The token for one login, ready to give to a git child.
+/// The askpass script. git runs it with its prompt as the one argument and reads the answer
+/// from its output. It holds no token: it prints the one in [`TOKEN_VAR`], which only the git
+/// child it was set on and that child's own children have. GitHub takes a token as the
+/// password whatever the user name, so the user name is a fixed one.
+const SCRIPT: &str = "#!/bin/sh
+# Written by foundryd for the git calls it gives a GitHub token to. It holds no token.
+case \"$1\" in
+Username*) printf '%s\\n' x-access-token ;;
+*) printf '%s\\n' \"$FOUNDRY_GIT_TOKEN\" ;;
+esac
+";
+
+/// The `-c` settings of every call: no credential helper but the askpass, no hooks, and the
+/// rest of the runner's `HARDENED_GIT_CONFIG` (no fsmonitor, eol conversion, attributes or
+/// excludes files, `ext` transport or alternate refs command).
+const CONFIG: [&str; 8] = [
+    // An empty value drops every helper named before it, in the system, global or repo config.
+    "credential.helper=",
+    "core.hooksPath=/dev/null",
+    "core.fsmonitor=false",
+    "core.autocrlf=false",
+    "core.attributesFile=/dev/null",
+    "core.excludesFile=/dev/null",
+    "protocol.ext.allow=never",
+    "core.alternateRefsCommand=",
+];
+
+/// The environment of every call, the runner's `HARDENED_GIT_ENV`: `-c` cannot turn the system
+/// and global config off, and with no terminal prompt a refused token fails the call at once.
+const ENV: [(&str, &str); 7] = [
+    ("GIT_TERMINAL_PROMPT", "0"),
+    ("GIT_CONFIG_NOSYSTEM", "1"),
+    ("GIT_CONFIG_GLOBAL", "/dev/null"),
+    ("GIT_NO_REPLACE_OBJECTS", "1"),
+    ("GIT_LFS_SKIP_SMUDGE", "1"),
+    // A partial clone fetches a missing object by running `git fetch` with the repo's config.
+    ("GIT_NO_LAZY_FETCH", "1"),
+    // Git's messages in English, whatever the locale the daemon started in.
+    ("LC_ALL", "C"),
+];
+
+/// Config the daemon's own environment may carry in from whatever started it. Each could name
+/// a helper after the call's own `credential.helper=`, so none is passed on.
+const INHERITED_CONFIG: [&str; 2] = ["GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"];
+
+/// The token for one login, ready to give to a git child. Its debug form shows the login and
+/// never the token.
 pub struct GitAuth {
     login: String,
     token: String,
@@ -31,7 +79,7 @@ pub struct GitAuth {
 /// Why a git call cannot have a login's token. No variant holds a token.
 #[derive(Debug, thiserror::Error)]
 pub enum NoToken {
-    #[error("this machine holds no GitHub token for {login}")]
+    #[error("this machine holds no usable GitHub token for {login}")]
     Unset { login: String },
     #[error("the GitHub token for {login} could not be read: {source}")]
     Store { login: String, source: SecretsError },
@@ -40,18 +88,61 @@ pub enum NoToken {
 }
 
 impl GitAuth {
-    /// The token held for `login` in `secrets`, with the askpass script written to `data_dir`.
+    /// The token held for `login` in `secrets`, read now, with the askpass script written to
+    /// `data_dir` when it is not there as it should be. A login with no token, or one whose
+    /// token is blank or holds a control character that an environment variable or git's
+    /// answer could not carry whole, is [`NoToken::Unset`], and nothing is written.
     pub fn for_login(
-        _secrets: &dyn Secrets,
-        _login: &str,
-        _data_dir: &Path,
+        secrets: &dyn Secrets,
+        login: &str,
+        data_dir: &Path,
     ) -> Result<GitAuth, NoToken> {
-        todo!()
+        let unset = || NoToken::Unset {
+            login: login.to_owned(),
+        };
+        let token = secrets::github_token(secrets, login)
+            .map_err(|source| NoToken::Store {
+                login: login.to_owned(),
+                source,
+            })?
+            .ok_or_else(unset)?;
+        let token = token.trim();
+        if token.is_empty() || token.chars().any(char::is_control) {
+            return Err(unset());
+        }
+        let askpass = data_dir.join(ASKPASS);
+        write_askpass(data_dir, &askpass).map_err(|source| NoToken::Askpass {
+            path: askpass.clone(),
+            source,
+        })?;
+        Ok(GitAuth {
+            login: login.to_owned(),
+            token: token.to_owned(),
+            askpass,
+        })
     }
 
-    /// Gives `command`, a git call with no arguments yet, the token and the hardening.
-    pub fn apply(&self, _command: &mut Command) {
-        todo!()
+    /// The login the token is held for.
+    pub fn login(&self) -> &str {
+        &self.login
+    }
+
+    /// Gives `command`, a git call with no arguments yet, the token and the hardening: the
+    /// `-c` settings go first, so the caller adds the subcommand and its arguments after this.
+    /// `GIT_ASKPASS` names the script and [`TOKEN_VAR`] holds the token, on this command's
+    /// environment only; the daemon's own is never changed. A tokio command takes it through
+    /// `as_std_mut()`.
+    pub fn apply(&self, command: &mut Command) {
+        for setting in CONFIG {
+            command.arg("-c").arg(setting);
+        }
+        for name in INHERITED_CONFIG {
+            command.env_remove(name);
+        }
+        command
+            .envs(ENV)
+            .env("GIT_ASKPASS", &self.askpass)
+            .env(TOKEN_VAR, &self.token);
     }
 }
 
@@ -64,15 +155,61 @@ impl fmt::Debug for GitAuth {
     }
 }
 
-/// The environment that turns git's credential helpers off for a terminal. It holds no token.
+/// Writes [`SCRIPT`] to `path` in `dir`, 0700, unless a regular file with that mode and
+/// content is there already. A new script goes to a file of its own in `dir` first and is
+/// renamed over `path`, so a git call running the old one never sees half of it, and a symlink
+/// at `path` is replaced, never followed.
+fn write_askpass(dir: &Path, path: &Path) -> io::Result<()> {
+    if let Ok(meta) = fs::symlink_metadata(path)
+        && meta.file_type().is_file()
+        && meta.permissions().mode() & 0o7777 == 0o700
+        && fs::read(path).is_ok_and(|held| held == SCRIPT.as_bytes())
+    {
+        return Ok(());
+    }
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let staged = dir.join(format!(
+        ".{ASKPASS}.{}.{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let written = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o700)
+            .open(&staged)?;
+        // The mode a umask may have narrowed, made exact.
+        file.set_permissions(fs::Permissions::from_mode(0o700))?;
+        file.write_all(SCRIPT.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&staged, path)
+    })();
+    if written.is_err() {
+        let _ = fs::remove_file(&staged);
+    }
+    written
+}
+
+/// The environment that turns git's credential helpers off for a terminal: no system or global
+/// config, where the machine's helpers (a keychain, `gh`) are named, and no terminal prompt, so
+/// a git call that needs a login fails at once. It holds no token, and names no askpass.
 pub fn helpers_off_env() -> Vec<(String, String)> {
-    let _ = OsString::new();
-    todo!()
+    [
+        ("GIT_CONFIG_NOSYSTEM", "1"),
+        ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ("GIT_TERMINAL_PROMPT", "0"),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.to_owned(), value.to_owned()))
+    .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::ffi::OsString;
     use std::fs;
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
