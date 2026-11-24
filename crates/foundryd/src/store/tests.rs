@@ -1304,6 +1304,41 @@ fn a_session_whose_owner_has_written_no_turn_has_none() {
     assert_eq!(store.session_turn(session).unwrap(), None);
 }
 
+/// Every factory key holds its writer, so `apply_factory` never meets another owner's row
+/// under a record's key; should a key ever lose its writer, the row held still wins. The row is
+/// put in by hand, as no key `apply_factory` writes can collide.
+#[test]
+fn apply_factory_refuses_a_key_another_owner_holds() {
+    let (_dir, mut store) = open();
+    let holder = MachineId::random();
+    let sender = MachineId::random();
+    let session = SessionId::random();
+    let held_row = turn_record(holder, 1, session, 1);
+    let claim = turn_record(sender, 9, session, 2);
+    let key = claim.key();
+    store
+        .conn
+        .execute(
+            "INSERT INTO factory_records (kind, id, owner, version, record)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                key.kind,
+                key.id,
+                holder.to_string(),
+                1_i64,
+                serde_json::to_string(&held_row).unwrap()
+            ],
+        )
+        .unwrap();
+    assert_eq!(
+        store.apply_factory(&claim, sender).unwrap(),
+        Applied::NotOwner
+    );
+    assert_eq!(factory_rows(&store), 1);
+    assert!(store.factory_since(sender, 0, 10).unwrap().is_empty());
+    assert_eq!(store.factory_since(holder, 0, 10).unwrap(), vec![held_row]);
+}
+
 #[test]
 fn apply_factory_takes_only_a_higher_version() {
     let (_dir, mut store) = open();
