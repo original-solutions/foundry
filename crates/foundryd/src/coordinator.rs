@@ -1711,6 +1711,220 @@ mod tests {
         }
     }
 
+    // --- the factory `seen` ---
+
+    fn set_factory(max_runs: u32) -> Edit {
+        Edit::SetFactory {
+            settings: foundry_proto::factory::FactorySettings {
+                max_runs,
+                ..foundry_proto::factory::FactorySettings::default()
+            },
+        }
+    }
+
+    fn factory_value(max_runs: u32) -> SettingValue {
+        match set_factory(max_runs) {
+            Edit::SetFactory { settings } => SettingValue::Factory(settings),
+            _ => unreachable!(),
+        }
+    }
+
+    /// `held` after it takes `copy` from a machine on protocol 4, as [`Coordinator::take_settings`]
+    /// takes it.
+    fn took_from_protocol_4(held: &SharedSettings, copy: &SharedSettings) -> SharedSettings {
+        let mut copy = copy.clone();
+        keep_factory(held, &mut copy);
+        keep_keys(held, &mut copy);
+        merge(held, &copy)
+    }
+
+    #[test]
+    fn only_a_factory_edit_raises_the_factory_seen_of_the_machine_that_numbers_it() {
+        let held = numbered(&base(), &set_project(7, "p"), id(A));
+        assert!(held.factory_seen.is_empty(), "{:?}", held.factory_seen);
+        assert_eq!(held.seen, [(id(A), 2)].into());
+
+        let held = numbered(&held, &set_factory(5), id(B));
+        assert_eq!(held.factory_seen, [(id(B), 3)].into());
+        assert_eq!(held.seen, [(id(A), 2), (id(B), 3)].into());
+
+        let held = numbered(&held, &set_project(8, "q"), id(A));
+        assert_eq!(held.factory_seen, [(id(B), 3)].into(), "a project edit");
+        let held = numbered(
+            &held,
+            &Edit::SetLimits {
+                machine: id(A),
+                limits: limits(2),
+            },
+            id(B),
+        );
+        assert_eq!(held.factory_seen, [(id(B), 3)].into(), "a limits edit");
+
+        let project = ProjectId(uuid::Uuid::from_u128(7));
+        let held = numbered(
+            &held,
+            &Edit::SetProjectFactory {
+                project,
+                factory: foundry_proto::factory::ProjectFactory::default(),
+            },
+            id(A),
+        );
+        assert_eq!(held.factory_seen, [(id(A), 6), (id(B), 3)].into());
+        // A dismissal of a factory item is a factory edit too.
+        let held = numbered(
+            &held,
+            &Edit::Dismiss {
+                setting: SettingKey::ProjectFactory(project),
+            },
+            id(B),
+        );
+        assert_eq!(held.factory_seen, [(id(A), 6), (id(B), 7)].into());
+        assert_eq!(held.seen, [(id(A), 6), (id(B), 7)].into());
+    }
+
+    #[test]
+    fn a_merge_takes_the_higher_factory_seen_of_each_machine() {
+        let mut a = base();
+        a.factory_seen = [(id(A), 3), (id(B), 1)].into();
+        let mut b = base();
+        b.factory_seen = [(id(B), 4), (id(9), 2)].into();
+        let out = merged(&a, &b);
+        assert_eq!(out.factory_seen, [(id(A), 3), (id(B), 4), (id(9), 2)].into());
+    }
+
+    #[test]
+    fn a_copy_from_protocol_4_never_raises_the_factory_seen() {
+        let held = numbered(&base(), &set_factory(5), id(A));
+        assert_eq!(held.factory_seen, [(id(A), 2)].into());
+        // The older machine numbered edits of its own, and its copy carries a factory `seen`
+        // it cannot have: neither raises the one held.
+        let mut theirs = numbered(&held.for_protocol(4), &set_project(9, "nine"), id(B));
+        theirs.factory_seen = [(id(A), 40), (id(B), 40)].into();
+        theirs.seen.insert(id(9), 30);
+
+        let out = took_from_protocol_4(&held, &theirs);
+
+        assert_eq!(project_named(&out, 9).as_deref(), Some("nine"));
+        assert_eq!(out.seen, [(id(A), 2), (id(B), 3), (id(9), 30)].into());
+        assert_eq!(out.factory_seen, held.factory_seen);
+        // Its copy as it holds it, with no factory `seen`, keeps it as held too.
+        let plain = numbered(&held.for_protocol(4), &set_project(9, "nine"), id(B));
+        assert_eq!(took_from_protocol_4(&held, &plain).factory_seen, held.factory_seen);
+    }
+
+    #[tokio::test]
+    async fn taking_a_copy_raises_the_factory_seen_only_from_a_peer_on_protocol_5() {
+        let (_dir, coordinator) = alone();
+        let held = numbered(&base(), &set_factory(5), id(A));
+        lock(&coordinator.store).apply_settings(held.clone()).unwrap();
+        let mut theirs = numbered(&held, &set_project(9, "nine"), id(B));
+        theirs.factory_seen.insert(id(9), 40);
+
+        coordinator
+            .take_settings(id(B), FACTORY_SINCE - 1, theirs.clone())
+            .await
+            .unwrap();
+        let after = lock(&coordinator.store).settings().unwrap();
+        assert_eq!(project_named(&after, 9).as_deref(), Some("nine"));
+        assert_eq!(after.factory_seen, held.factory_seen, "from protocol 4");
+
+        coordinator
+            .take_settings(id(B), FACTORY_SINCE, theirs)
+            .await
+            .unwrap();
+        let after = lock(&coordinator.store).settings().unwrap();
+        assert_eq!(after.factory_seen, [(id(A), 2), (id(9), 40)].into());
+    }
+
+    #[test]
+    fn a_factory_key_is_judged_by_the_factory_seen_and_every_other_key_by_seen() {
+        // Each side holds its own edit of a project and of the fleet's factory settings, and a
+        // `seen` that covers the other side's edits, as a protocol 4 machine passes it on. Only
+        // the factory `seen` says neither side holds the other's factory edit.
+        let side = |by: u128, name: &str, max_runs: u32| {
+            let mut side = numbered(&base(), &set_project(7, name), id(by));
+            side = numbered(&side, &set_factory(max_runs), id(by));
+            side.seen = [(id(A), 3), (id(B), 3)].into();
+            side
+        };
+        let (a, b) = (side(A, "a", 4), side(B, "b", 6));
+        assert_eq!(a.factory_seen, [(id(A), 3)].into());
+        assert_eq!(b.factory_seen, [(id(B), 3)].into());
+
+        let out = merged(&a, &b);
+
+        // The equal numbers go to the lower machine, `a`.
+        assert_eq!(project_named(&out, 7).as_deref(), Some("a"));
+        assert_eq!(
+            out.overwritten,
+            [(
+                SettingKey::Factory,
+                Overwritten {
+                    kept: Some(factory_value(4)),
+                    lost: Some(factory_value(6)),
+                    lost_stamp: Stamp { seq: 3, by: id(B) },
+                }
+            )]
+            .into()
+        );
+        // A factory `seen` that covers the other side's factory edit raises no item.
+        let mut covered = b.clone();
+        covered.factory_seen.insert(id(A), 3);
+        assert!(merged(&a, &covered).overwritten.is_empty());
+    }
+
+    #[test]
+    fn a_split_factory_edit_relayed_by_a_protocol_4_machine_raises_an_item_on_meeting() {
+        // `a` and `c` are split from each other and each edits the fleet's factory settings;
+        // `b`, on protocol 4, reaches both and passes each one's copy to the other.
+        let a = numbered(&base(), &set_factory(4), id(A));
+        let c = numbered(&base(), &set_factory(6), id(9));
+        let b = merge(&a.for_protocol(4), &c.for_protocol(4));
+        let a = took_from_protocol_4(&a, &b);
+        let c = took_from_protocol_4(&c, &b);
+        // `seen` now covers the other side's edit on both sides; neither holds it.
+        assert_eq!(a.seen, c.seen);
+        assert_eq!(a.factory, Some(factory_value_settings(4)));
+        assert_eq!(c.factory, Some(factory_value_settings(6)));
+
+        let out = merged(&a, &c);
+
+        assert_eq!(out.factory, Some(factory_value_settings(4)));
+        assert_eq!(
+            out.overwritten,
+            [(
+                SettingKey::Factory,
+                Overwritten {
+                    kept: Some(factory_value(4)),
+                    lost: Some(factory_value(6)),
+                    lost_stamp: Stamp { seq: 2, by: id(9) },
+                }
+            )]
+            .into()
+        );
+
+        fn factory_value_settings(max_runs: u32) -> foundry_proto::factory::FactorySettings {
+            match set_factory(max_runs) {
+                Edit::SetFactory { settings } => settings,
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn copies_passed_between_a_protocol_4_and_a_protocol_5_machine_keep_their_number() {
+        let held = numbered(&base(), &set_factory(5), id(A));
+        let held = numbered(&held, &set_project(7, "p"), id(A));
+        let mut older = held.for_protocol(4);
+        let mut newer = held.clone();
+        for exchange in 0..20 {
+            older = merge(&older, &newer.for_protocol(4)).for_protocol(4);
+            newer = took_from_protocol_4(&newer, &older);
+            assert_eq!(newer, held, "exchange {exchange}");
+            assert_eq!(older.seq, held.seq, "exchange {exchange}");
+        }
+    }
+
     // --- what a waiting edit does next ---
 
     const EARLY: Duration = Duration::from_secs(1);

@@ -1180,6 +1180,61 @@ pub(crate) mod tests {
         }
     }
 
+    /// [`settings_with_factory`] with a factory `seen` that differs from `seen`.
+    fn settings_with_factory_seen() -> SharedSettings {
+        let mut settings = settings_with_factory();
+        let (mac, vps) = (settings.machines[0].id, settings.machines[1].id);
+        settings.factory_seen = [(mac, 46), (vps, 12)].into();
+        settings
+    }
+
+    #[test]
+    fn the_factory_seen_round_trips_and_is_written_by_name() {
+        let settings = settings_with_factory_seen();
+        assert_round_trip(&settings);
+        let (mac, vps) = (settings.machines[0].id, settings.machines[1].id);
+        let json = serde_json::to_value(&settings).unwrap();
+        assert_eq!(json["factory_seen"][mac.to_string()], 46, "{json}");
+        assert_eq!(json["factory_seen"][vps.to_string()], 12, "{json}");
+        // It is a map of its own: `seen` is as it was.
+        assert_eq!(json["seen"][vps.to_string()], 41, "{json}");
+    }
+
+    #[test]
+    fn a_copy_without_the_factory_seen_parses_with_it_empty_and_is_written_without_it() {
+        let mac = "67e55044-10b1-426f-9247-bb680e5fe0c8";
+        let json = format!(
+            r#"{{"seq":5,"machines":[],"priority":[],"projects":[],"limits":{{}},
+                "stamps":{{"factory":{{"seq":5,"by":"{mac}"}}}},
+                "seen":{{"{mac}":5}},
+                "factory":{{"max_runs":4}}}}"#
+        );
+        let read: SharedSettings = serde_json::from_str(&json).unwrap();
+        assert!(read.factory_seen.is_empty(), "{:?}", read.factory_seen);
+        assert_eq!(read.seen, [(MachineId(mac.parse().unwrap()), 5)].into());
+        let written = serde_json::to_value(&read).unwrap();
+        assert!(written.get("factory_seen").is_none(), "{written}");
+        let plain = serde_json::to_value(SharedSettings::default()).unwrap();
+        assert!(plain.get("factory_seen").is_none(), "{plain}");
+    }
+
+    #[test]
+    fn a_copy_for_protocol_4_leaves_the_factory_seen_out_and_one_for_5_keeps_it() {
+        let settings = settings_with_factory_seen();
+        assert_eq!(settings.for_protocol(5), settings);
+        assert_eq!(settings.for_protocol(6), settings);
+        for protocol in [1, 2, 3, 4] {
+            let copy = settings.for_protocol(protocol);
+            assert!(copy.factory_seen.is_empty(), "protocol {protocol}");
+            // `seen` is every setting's, so it stays.
+            assert_eq!(copy.seen, settings.seen, "protocol {protocol}");
+            let json = serde_json::to_value(&copy).unwrap();
+            assert!(json.get("factory_seen").is_none(), "{json}");
+            let text = json.to_string();
+            serde_json::from_str::<v4::SharedSettings>(&text).expect(&text);
+        }
+    }
+
     #[test]
     fn a_copy_for_protocol_4_parses_with_the_protocol_4_settings_parser() {
         let settings = settings_with_factory();
