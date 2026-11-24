@@ -2,9 +2,9 @@
 //!
 //! Each write runs `gh` through [`Tracker::gh`], so the real `gh` and the fake are written to
 //! alike. Ported from the writing half of the runner's `src/tracker/github.ts`. Every comment
-//! body goes through the tracker's hider ([`Tracker::hide`]) and then [`text::for_comment`], and
-//! the factory's own marker is added after both, since `for_comment` would hide the run id and
-//! the machine id in a claim marker. Only a tracker built with a hider posts: see
+//! body goes through the tracker's hider ([`Commenting::hide`]) and then [`text::for_comment`],
+//! and the factory's own marker is added after both, since `for_comment` would hide the run id
+//! and the machine id in a claim marker. Only a tracker built with a hider posts: see
 //! [`Commenting`].
 //!
 //! A claim marker counts only in a comment by the project's login. The issue is Foundry's when
@@ -271,7 +271,8 @@ pub fn upsert_status_comment<G: Commenting + ?Sized>(
 pub enum Claim {
     /// Foundry's own: the run and the machine its marker names.
     Foundry { run: RunId, machine: MachineId },
-    /// Another factory's: the runner's, another login's, or a marker that does not parse.
+    /// Another factory's: the runner's marker in the login's comment, or a Foundry marker that
+    /// does not parse. A claim marker in another login's comment is no claim at all.
     Foreign { comment_id: u64 },
 }
 

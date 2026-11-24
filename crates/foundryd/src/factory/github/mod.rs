@@ -2,7 +2,7 @@
 //!
 //! [`Tracker`] has one required call, [`Tracker::gh`], which runs `gh` once with the arguments
 //! given. Every read is a provided method built on it, in [`read`], and so is every write, in
-//! [`write`], so the real [`Gh`] and the [`FakeTracker`] read and write GitHub by the same code,
+//! [`write`](mod@write), so the real [`Gh`] and the [`FakeTracker`] read and write GitHub by the same code,
 //! and a test scripts the fake by the `gh` arguments as the runner's tests script `gh`. Ported
 //! from the runner's `src/tracker/github.ts` and `src/tracker/approvalHistory.ts`.
 //!
