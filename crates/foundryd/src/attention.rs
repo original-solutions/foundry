@@ -16,11 +16,23 @@
 //! | Setting overwritten | the shared settings hold an overwritten setting | the settings |
 //! | Update refused | a machine's newest sample names a refused tag | the sample |
 //! | Gateway unhealthy | this machine's read of the gateway fails | [`crate::gateway`] |
+//! | Run stuck | the believed status lists a stuck run | the factory statuses |
+//! | Run needs info | the believed status lists a run that asked questions | the factory statuses |
+//! | Factory idle | the believed status gives a reason, or for [`IDLE_AFTER`] this machine has neither held the lease nor heard from its holder | the factory statuses and [`Freshness`] |
+//! | Foreign claim | the believed status lists an issue claimed by something other than Foundry | the factory statuses |
+//! | Gate infra | the believed status lists a run whose gate could not run at all | the factory statuses |
 //!
 //! Every row but the gateway's and placement's comes from the synced records and shared settings, so each
 //! machine shows the whole fleet's. Records are read as the rest of the UI sees them: an offline
 //! machine's sessions and terminals are unreachable, so they raise nothing while its "machine
 //! offline" item stands. Another module adds rows through a [`Source`].
+//!
+//! The factory's rows are read only for a project whose factory is on, from the status
+//! [`believed`] picks among the online writers' (P2, "Attention items in P2"). A session or
+//! workspace that is factory work raises none of P1's session or setup rows (G13): the run's
+//! own row covers it. Factory work is what any status held names in a live run, a session in
+//! such a workspace and a workspace that holds such a session, and what this machine's
+//! [`Marks`] say of its own sessions and workspaces.
 //!
 //! - `GET /api/attention`: `{"items": [...]}`, each an [`Item`].
 //! - `POST /api/attention/{id}/dismiss`: dismisses a "setting overwritten" item through the
@@ -32,20 +44,23 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use foundry_proto::ids::{MachineId, SessionId, TerminalId, WorkspaceId};
-use foundry_proto::record::{AnyRecord, Terminal};
+use foundry_proto::factory::{FactoryStatus, HeldUpKind, NotHolding, RunId};
+use foundry_proto::ids::{MachineId, ProjectId, SessionId, TerminalId, WorkspaceId};
+use foundry_proto::record::{AnyRecord, Session, Terminal};
 use foundry_proto::settings::{Edit, SettingKey, SettingValue, SharedSettings};
 use foundry_proto::state::{SessionState, TerminalState};
 use serde::Serialize;
 
 use crate::api::edit_status;
-use crate::coordinator::Coordinator;
+use crate::coordinator::{self, Coordinator};
+use crate::factory::status::{Freshness, believed};
 use crate::machine::{Over, over_limits};
 use crate::secrets::redact;
 use crate::sessions::STUCK_AFTER;
@@ -66,6 +81,11 @@ pub enum Kind {
     PlacementWaiting,
     SettingOverwritten,
     UpdateRefused,
+    RunStuck,
+    RunNeedsInfo,
+    FactoryIdle,
+    ForeignClaim,
+    GateInfra,
 }
 
 impl fmt::Display for Kind {
@@ -81,6 +101,11 @@ impl fmt::Display for Kind {
             Self::PlacementWaiting => "placement_waiting",
             Self::SettingOverwritten => "setting_overwritten",
             Self::UpdateRefused => "update_refused",
+            Self::RunStuck => "run_stuck",
+            Self::RunNeedsInfo => "run_needs_info",
+            Self::FactoryIdle => "factory_idle",
+            Self::ForeignClaim => "foreign_claim",
+            Self::GateInfra => "gate_infra",
         })
     }
 }
@@ -150,8 +175,91 @@ pub trait Source: Send + Sync {
     fn items(&self, fleet: &Fleet) -> Vec<Item>;
 }
 
-/// The items the synced records and shared settings raise: every row but the gateway's.
-pub fn fleet_items(fleet: &Fleet) -> Vec<Item> {
+/// How long a project whose factory is on may go with this machine neither holding its lease
+/// nor hearing from its holder before "factory idle" is raised: the cut-off's 10 minutes (G10).
+pub const IDLE_AFTER: Duration = Duration::from_secs(10 * 60);
+
+/// What this machine knows as factory work of its own: the mark `sessions` keeps beside a
+/// factory session, and the one `workspaces` keeps beside a factory workspace. Asked only of
+/// this machine's own records; a peer's are known from the statuses alone.
+pub trait Marks: Send + Sync {
+    /// `session` is one of this machine's factory sessions.
+    fn factory_session(&self, session: SessionId) -> bool;
+    /// `workspace` is one of this machine's factory workspaces.
+    fn factory_workspace(&self, workspace: WorkspaceId) -> bool;
+}
+
+/// What the factory's rows read beside the [`Fleet`].
+#[derive(Default)]
+pub struct FactoryFleet<'a> {
+    /// Every status held of each project, from every writer, online or not.
+    pub statuses: BTreeMap<ProjectId, Vec<(MachineId, FactoryStatus)>>,
+    /// This machine's freshness, when it keeps one. Without it "factory idle" is raised only for
+    /// a reason a status gives.
+    pub freshness: Option<&'a Freshness>,
+    /// What this machine marks as factory work, when it is told.
+    pub marks: Option<&'a dyn Marks>,
+}
+
+/// The sessions and workspaces whose P1 items are left out because they are factory work (G13).
+#[derive(Default)]
+struct FactoryWork {
+    sessions: BTreeSet<SessionId>,
+    workspaces: BTreeSet<WorkspaceId>,
+}
+
+impl FactoryWork {
+    /// What any status held names in a live run, whoever wrote it and whether or not it is
+    /// believed, since a run's old workspace stays factory work after the run moves on; what
+    /// this machine marks of its own records; then each workspace that holds such a session.
+    fn of(fleet: &Fleet, factory: &FactoryFleet<'_>) -> Self {
+        let mut work = Self::default();
+        for (_, status) in factory.statuses.values().flatten() {
+            for run in &status.runs {
+                work.sessions.extend(&run.sessions);
+                work.workspaces.extend(&run.workspaces);
+            }
+        }
+        if let Some(marks) = factory.marks {
+            for record in &fleet.records {
+                match record {
+                    AnyRecord::Session(r)
+                        if r.owner == fleet.me && marks.factory_session(r.body.id) =>
+                    {
+                        work.sessions.insert(r.body.id);
+                    }
+                    AnyRecord::Workspace(r)
+                        if r.owner == fleet.me && marks.factory_workspace(r.body.id) =>
+                    {
+                        work.workspaces.insert(r.body.id);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for record in &fleet.records {
+            if let AnyRecord::Session(r) = record
+                && work.sessions.contains(&r.body.id)
+            {
+                work.workspaces.insert(r.body.workspace);
+            }
+        }
+        work
+    }
+
+    fn session(&self, session: &Session) -> bool {
+        self.sessions.contains(&session.id) || self.workspaces.contains(&session.workspace)
+    }
+
+    fn workspace(&self, workspace: WorkspaceId) -> bool {
+        self.workspaces.contains(&workspace)
+    }
+}
+
+/// The items the synced records, the shared settings and the factory statuses raise: every
+/// row but the gateway's and placement's. A session or workspace that is factory work raises
+/// none of P1's session or setup items.
+pub fn fleet_items(fleet: &Fleet, factory: &FactoryFleet<'_>) -> Vec<Item> {
     let mut items = Vec::new();
     for machine in &fleet.settings.machines {
         if !fleet.online.contains(&machine.id) {
@@ -193,9 +301,10 @@ pub fn fleet_items(fleet: &Fleet) -> Vec<Item> {
         None => String::new(),
     };
 
+    let work = FactoryWork::of(fleet, factory);
     for record in &fleet.records {
         match record {
-            AnyRecord::Session(r) if !r.deleted => {
+            AnyRecord::Session(r) if !r.deleted && !work.session(&r.body) => {
                 let session = &r.body;
                 let place = format!(
                     "A session in {} on {}",
@@ -227,7 +336,7 @@ pub fn fleet_items(fleet: &Fleet) -> Vec<Item> {
                 item.terminal = Some(session.terminal);
                 items.push(item);
             }
-            AnyRecord::Workspace(r) if !r.deleted => {
+            AnyRecord::Workspace(r) if !r.deleted && !work.workspace(r.body.id) => {
                 let Some(setup) = r.body.setup else { continue };
                 let failed = terminals.get(&setup).is_some_and(|(deleted, t)| {
                     !deleted && t.state == TerminalState::Exited && t.exit_code != Some(0)
@@ -323,7 +432,188 @@ pub fn fleet_items(fleet: &Fleet) -> Vec<Item> {
         ));
     }
 
+    items.extend(factory_items(fleet, factory));
     items
+}
+
+/// The factory's rows, for each project whose factory is on.
+fn factory_items(fleet: &Fleet, factory: &FactoryFleet<'_>) -> Vec<Item> {
+    let acting = coordinator::acting(&fleet.settings.priority, &fleet.online);
+    let mut items = Vec::new();
+    for project in &fleet.settings.projects {
+        let on = fleet
+            .settings
+            .project_factory
+            .get(&project.id)
+            .is_some_and(|f| f.on);
+        if !on {
+            continue;
+        }
+        let statuses = factory
+            .statuses
+            .get(&project.id)
+            .map_or(&[][..], Vec::as_slice);
+        let believed = believed_of(statuses, &fleet.online, acting);
+        let quiet = factory
+            .freshness
+            .map(|freshness| freshness.since_holding(project.id))
+            .is_some_and(|since| since >= IDLE_AFTER);
+        if let Some(item) = idle(fleet, project.id, &project.name, believed, quiet, acting) {
+            items.push(item);
+        }
+        let Some((writer, status)) = believed else {
+            continue;
+        };
+        for held in &status.held_up {
+            let (kind, what, todo) = match held.kind {
+                HeldUpKind::Stuck => (
+                    Kind::RunStuck,
+                    format!("The factory's run of {} is stuck", issue(&held.run)),
+                    "Read the factory's last comment on the issue, fix the cause, then move the \
+                     issue out of factory:stuck",
+                ),
+                HeldUpKind::NeedsInfo => (
+                    Kind::RunNeedsInfo,
+                    format!("The factory's run of {} asked questions", issue(&held.run)),
+                    "Answer them in a comment on the issue",
+                ),
+            };
+            items.push(fleet.item(
+                kind,
+                &held.run,
+                writer,
+                format!("{what}: {}", redact(&held.reason)),
+                todo.to_owned(),
+            ));
+        }
+        for run in &status.gate_infra {
+            items.push(fleet.item(
+                Kind::GateInfra,
+                run,
+                writer,
+                format!(
+                    "A gate of the factory's run of {} could not run at all",
+                    issue(run)
+                ),
+                "Check that a machine that holds the project's GitHub login is online with free \
+                 disk and can fetch the repo; the factory tries the gate again after 1, 2, 4 and \
+                 8 passes"
+                    .to_owned(),
+            ));
+        }
+        for claim in &status.foreign {
+            items.push(fleet.item(
+                Kind::ForeignClaim,
+                format!("{}__{}", project.id, claim.issue),
+                writer,
+                format!(
+                    "Issue #{} of {}, {}, is in factory:{} under a claim that is not Foundry's",
+                    claim.issue,
+                    project.name,
+                    redact(&claim.title),
+                    claim.state
+                ),
+                format!(
+                    "Foundry leaves it alone: let whatever claimed it finish, or move the issue \
+                     out of factory:{}",
+                    claim.state
+                ),
+            ));
+        }
+    }
+    items
+}
+
+/// `owner/name#N` of `run`'s issue.
+fn issue(run: &RunId) -> String {
+    format!("{}#{}", run.repo(), run.issue())
+}
+
+/// The status [`believed`] picks among `statuses`, with the machine that wrote it.
+fn believed_of<'a>(
+    statuses: &'a [(MachineId, FactoryStatus)],
+    online: &BTreeSet<MachineId>,
+    acting: MachineId,
+) -> Option<(MachineId, &'a FactoryStatus)> {
+    let status = believed(statuses, online, acting)?;
+    // A holding status is believed from the lowest machine id among equals; any other is the
+    // acting coordinator's.
+    statuses
+        .iter()
+        .filter(|(writer, held)| online.contains(writer) && *held == status)
+        .filter(|(writer, _)| status.holds || *writer == acting)
+        .min_by_key(|(writer, _)| *writer)
+        .map(|(writer, held)| (*writer, held))
+}
+
+/// The "factory idle" item of `project`, when it stands: for a reason the believed status
+/// gives, else when this machine has gone [`IDLE_AFTER`] with neither the lease nor word from
+/// its holder (`quiet`).
+fn idle(
+    fleet: &Fleet,
+    project: ProjectId,
+    name: &str,
+    believed: Option<(MachineId, &FactoryStatus)>,
+    quiet: bool,
+    acting: MachineId,
+) -> Option<Item> {
+    let item = |machine, what: String, todo: String| {
+        Some(fleet.item(Kind::FactoryIdle, project, machine, what, todo))
+    };
+    match believed {
+        Some((writer, status)) if status.holds => {
+            if let Some(reason) = &status.idle {
+                return item(
+                    writer,
+                    format!("The factory of {name} is idle: {}", redact(reason)),
+                    "Fix what it names; the factory starts again on its next pass".to_owned(),
+                );
+            }
+        }
+        Some((writer, status)) => {
+            if let Some(NotHolding::NoToken { login }) = &status.not_holding {
+                let on = fleet.name(writer);
+                return item(
+                    writer,
+                    format!(
+                        "The factory of {name} is idle: {on}, the acting coordinator, holds no \
+                         token for the GitHub login {login}"
+                    ),
+                    format!("Run `foundryd secret set github:{login}` on {on}"),
+                );
+            }
+        }
+        None => {}
+    }
+    if !quiet {
+        return None;
+    }
+    let minutes = IDLE_AFTER.as_secs() / 60;
+    let todo = "Check that the acting coordinator is on, speaks protocol 5 and can reach \
+                GitHub"
+        .to_owned();
+    match believed.and_then(|(_, status)| status.not_holding.as_ref()) {
+        Some(NotHolding::HeldBy {
+            machine,
+            generation,
+        }) => item(
+            *machine,
+            format!(
+                "The factory of {name} has had no word for {minutes} minutes from {}, which \
+                 holds its lease at generation {generation}",
+                fleet.name(*machine)
+            ),
+            todo,
+        ),
+        _ => item(
+            acting,
+            format!(
+                "The factory of {name} has had no word from a holder of its lease for \
+                 {minutes} minutes"
+            ),
+            todo,
+        ),
+    }
 }
 
 /// One value of an overwritten setting as the item shows it, `removed` for none. A project's
@@ -455,6 +745,8 @@ pub struct Attention {
     coordinator: Arc<Coordinator>,
     sources: Vec<Arc<dyn Source>>,
     held: Arc<Mutex<Held>>,
+    freshness: Option<Arc<Freshness>>,
+    marks: Option<Arc<dyn Marks>>,
 }
 
 impl Attention {
@@ -471,6 +763,8 @@ impl Attention {
             coordinator,
             sources: Vec::new(),
             held: Arc::default(),
+            freshness: None,
+            marks: None,
         }
     }
 
@@ -480,18 +774,38 @@ impl Attention {
         self
     }
 
+    /// Reads this machine's `freshness` for "factory idle" and its `marks` for the factory
+    /// work whose P1 items are left out. Without them the factory's items are still read from
+    /// the statuses.
+    pub fn with_factory(mut self, freshness: Arc<Freshness>, marks: Arc<dyn Marks>) -> Self {
+        self.freshness = Some(freshness);
+        self.marks = Some(marks);
+        self
+    }
+
     /// Every item that stands now, ordered by kind and then id. Only the records written since
     /// the last read are loaded. They are shown as [`Peers::state`] shows them, so an offline
     /// machine's sessions and terminals are unreachable and raise nothing but its "machine
     /// offline" item.
     pub async fn items(&self) -> Result<Vec<Item>, StoreError> {
         let online = self.peers.online();
-        let (records, settings) = on_store(&self.store, {
+        let (records, settings, statuses) = on_store(&self.store, {
             let (held, online) = (Arc::clone(&self.held), online.clone());
             move |store| {
                 let mut held = lock(&held);
                 held.load(store)?;
-                Ok::<_, StoreError>((held.as_seen(&online), store.settings()?))
+                let settings = store.settings()?;
+                let projects: BTreeSet<ProjectId> = settings
+                    .projects
+                    .iter()
+                    .map(|p| p.id)
+                    .chain(settings.project_factory.keys().copied())
+                    .collect();
+                let mut statuses = BTreeMap::new();
+                for project in projects {
+                    statuses.insert(project, store.statuses(project)?);
+                }
+                Ok::<_, StoreError>((held.as_seen(&online), settings, statuses))
             }
         })
         .await?;
@@ -501,7 +815,12 @@ impl Attention {
             settings,
             online,
         };
-        let mut items = fleet_items(&fleet);
+        let factory = FactoryFleet {
+            statuses,
+            freshness: self.freshness.as_deref(),
+            marks: self.marks.as_deref(),
+        };
+        let mut items = fleet_items(&fleet, &factory);
         for source in &self.sources {
             items.extend(source.items(&fleet));
         }
@@ -684,7 +1003,11 @@ mod tests {
         }
 
         fn freshness(&self) -> &Freshness {
-            &self.freshness.as_ref().expect("keep_freshness was called").1
+            &self
+                .freshness
+                .as_ref()
+                .expect("keep_freshness was called")
+                .1
         }
 
         fn record<T>(&mut self, owner: MachineId, deleted: bool, body: T) -> Record<T> {
@@ -1314,11 +1637,9 @@ mod tests {
         let mut world = World::new();
         let project = world.factory_project(true);
         let mut status = holding(project, 3, 7);
-        status.held_up.push(held_up(
-            12,
-            HeldUpKind::Stuck,
-            "the gate failed 3 times",
-        ));
+        status
+            .held_up
+            .push(held_up(12, HeldUpKind::Stuck, "the gate failed 3 times"));
         world.status(world.peer, status);
         let items = world.of(Kind::RunStuck);
         assert_eq!(items.len(), 1, "{items:?}");
@@ -1355,11 +1676,9 @@ mod tests {
         let mut world = World::new();
         let project = world.factory_project(true);
         let mut status = holding(project, 3, 7);
-        status.held_up.push(held_up(
-            14,
-            HeldUpKind::NeedsInfo,
-            "which login",
-        ));
+        status
+            .held_up
+            .push(held_up(14, HeldUpKind::NeedsInfo, "which login"));
         world.status(world.peer, status);
         let items = world.of(Kind::RunNeedsInfo);
         assert_eq!(items.len(), 1, "{items:?}");
@@ -1485,7 +1804,11 @@ mod tests {
         world.factory_project(false);
         let clock = world.keep_freshness();
         clock.advance(60 * MINUTE);
-        assert!(world.of(Kind::FactoryIdle).is_empty(), "{:?}", world.items());
+        assert!(
+            world.of(Kind::FactoryIdle).is_empty(),
+            "{:?}",
+            world.items()
+        );
     }
 
     #[test]
@@ -2128,10 +2451,7 @@ mod tests {
 
         assert_eq!(kinds(attention.items().await.unwrap()), []);
         clock.advance(10 * MINUTE);
-        assert_eq!(
-            kinds(attention.items().await.unwrap()),
-            [Kind::FactoryIdle]
-        );
+        assert_eq!(kinds(attention.items().await.unwrap()), [Kind::FactoryIdle]);
         freshness.held(project);
         assert_eq!(kinds(attention.items().await.unwrap()), []);
     }
