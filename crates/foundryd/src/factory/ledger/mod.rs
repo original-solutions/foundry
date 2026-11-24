@@ -2022,6 +2022,12 @@ mod tests {
                 assert_eq!(cause[field], json!("oneT=***two"), "{split:?} {field}");
             }
         }
+        // A colour sequence and a lone ESC in one token.
+        let text = "one\nT=ghp_01234\u{1b}[31m56789\u{1b}abcdefghij\ntwo";
+        let cause = Cause::new(CauseStep::Gate, text).command(text);
+        let written = ledger.write(&run(8), &stuck(text), &cause).unwrap();
+        assert_eq!(written.data["reason"], json!("one\nT=***\ntwo"));
+        assert_eq!(written.cause.unwrap()["command"], json!("oneT=***two"));
         let stored = serde_json::to_string(&held(&store, &run(8))).unwrap();
         assert!(!stored.contains("ghp_"), "{stored}");
         assert!(!stored.contains("abcdefghij"), "{stored}");

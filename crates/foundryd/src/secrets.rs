@@ -2256,6 +2256,28 @@ mod tests {
     }
 
     #[test]
+    fn hide_known_hides_a_token_with_a_whole_sequence_and_a_lone_introducer_inside_it() {
+        // Each gap read its own way: `ESC K` after a colour sequence is a lone ESC before the
+        // token's `K`, though it could be read as a whole two-character escape.
+        let secrets = holding_token();
+        for (a, b) in [(14, 24), (10, 30)] {
+            let (one, two, three) = (&TOKEN[..a], &TOKEN[a..b], &TOKEN[b..]);
+            for sequence in ["\u{1b}[31m", "\u{1b}(B", "\u{1b}]8;;x\u{7}", "\u{9b}0m"] {
+                for lone in ["\u{1b}", "\u{9b}", "\u{1b}[0m\u{1b}"] {
+                    for text in [
+                        format!("<{one}{sequence}{two}{lone}{three}>"),
+                        format!("<{one}{lone}{two}{sequence}{three}>"),
+                    ] {
+                        assert_eq!(hide_known(&text, &secrets), "<***>", "{text:?}");
+                    }
+                }
+                let text = format!("<{one}{sequence}{two}\u{90}{three}\u{7}>");
+                assert_eq!(hide_known(&text, &secrets), "<***\u{7}>", "{text:?}");
+            }
+        }
+    }
+
+    #[test]
     fn hide_known_hides_a_value_that_overlaps_itself() {
         let secrets = MemorySecrets::default();
         secrets.set(GATEWAY, "ghp_abcghp_abcghp_xyz0").unwrap();
