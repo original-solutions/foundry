@@ -566,7 +566,10 @@ mod tests {
         command
             .env("GIT_CONFIG_PARAMETERS", "'credential.helper'='osxkeychain'")
             .env("GIT_CONFIG_COUNT", "1")
-            .env("GIT_SSL_NO_VERIFY", "1");
+            .env("GIT_SSL_NO_VERIFY", "1")
+            .env("GIT_DIR", "/elsewhere/.git")
+            .env("GIT_WORK_TREE", "/elsewhere")
+            .env("GIT_INDEX_FILE", "/elsewhere/.git/index");
         auth.apply(&mut command);
         let envs: BTreeMap<OsString, Option<OsString>> = command
             .get_envs()
@@ -576,8 +579,37 @@ mod tests {
             "GIT_CONFIG_PARAMETERS",
             "GIT_CONFIG_COUNT",
             "GIT_SSL_NO_VERIFY",
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
         ] {
             assert_eq!(envs.get(&OsString::from(key)), Some(&None), "{key}");
+        }
+    }
+
+    #[test]
+    fn the_repository_a_caller_sets_after_apply_is_kept() {
+        let data = tempfile::tempdir().unwrap();
+        let mut command = Command::new("true");
+        auth(data.path()).apply(&mut command);
+        command
+            .env("GIT_DIR", "/elsewhere/.git")
+            .env("GIT_WORK_TREE", "/elsewhere")
+            .env("GIT_INDEX_FILE", "/elsewhere/.git/index");
+        let envs: BTreeMap<OsString, Option<OsString>> = command
+            .get_envs()
+            .map(|(key, value)| (key.to_owned(), value.map(ToOwned::to_owned)))
+            .collect();
+        for (key, value) in [
+            ("GIT_DIR", "/elsewhere/.git"),
+            ("GIT_WORK_TREE", "/elsewhere"),
+            ("GIT_INDEX_FILE", "/elsewhere/.git/index"),
+        ] {
+            assert_eq!(
+                envs.get(&OsString::from(key)),
+                Some(&Some(OsString::from(value))),
+                "{key}"
+            );
         }
     }
 
@@ -717,6 +749,54 @@ mod tests {
             assert!(!out.status.success(), "{remote}");
             assert!(!seen.exists(), "{remote}: the repo's command ran");
         }
+    }
+
+    #[test]
+    fn an_inherited_git_dir_cannot_point_the_call_at_another_repositorys_config() {
+        let machine = Machine::new();
+        // A second repository whose config turns TLS verification off for github.com, which
+        // a URL-scoped key does over the call's `-c` setting.
+        let other = tempfile::tempdir().unwrap();
+        let other = other.path().to_str().unwrap();
+        machine.git_ok(&["init", "-q", other]);
+        machine.git_ok(&[
+            "-C",
+            other,
+            "config",
+            "http.https://github.com/.sslVerify",
+            "false",
+        ]);
+        let git_dir = format!("{other}/.git");
+        let verify = |command: &mut Command| {
+            let out = command
+                .args([
+                    "config",
+                    "--get-urlmatch",
+                    "http.sslVerify",
+                    "https://github.com/owner/repo.git",
+                ])
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap()
+        };
+        // The setup works: git reads the repository GIT_DIR names, not the working directory.
+        assert_eq!(
+            verify(machine.git(&[]).env("GIT_DIR", &git_dir)),
+            "false\n",
+            "the setup"
+        );
+        let data = tempfile::tempdir().unwrap();
+        let auth = auth(data.path());
+        // Inherited from the daemon's environment: the call reads the repository it runs in.
+        let mut inherited = machine.git(&[]);
+        inherited.env("GIT_DIR", &git_dir);
+        auth.apply(&mut inherited);
+        assert_eq!(verify(&mut inherited), "true\n");
+        // Set by the caller after `apply`: kept.
+        assert_eq!(
+            verify(machine.hardened(&auth).env("GIT_DIR", &git_dir)),
+            "false\n"
+        );
     }
 
     #[test]
