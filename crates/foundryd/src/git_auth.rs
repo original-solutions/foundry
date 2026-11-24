@@ -631,8 +631,13 @@ mod tests {
     #[test]
     fn real_git_gets_the_token_from_askpass_and_from_no_helper_of_any_config() {
         let machine = Machine::new();
-        // The setup works: without the hardening, a helper answers with its own token.
-        let unhardened = fill(&mut machine.git(&[]), "github.com");
+        // The setup works: without the hardening, a helper answers with its own token. The
+        // global and repo helpers are enough for that; the system level stays off, since
+        // Apple's git names the machine's own keychain there.
+        let unhardened = fill(
+            machine.git(&[]).env("GIT_CONFIG_NOSYSTEM", "1"),
+            "github.com",
+        );
         assert_eq!(tokens_in(&unhardened), (false, true), "no helper answered");
 
         let data = tempfile::tempdir().unwrap();
@@ -928,14 +933,22 @@ mod tests {
                 .unwrap();
             String::from_utf8(out.stdout).unwrap()
         };
-        let helper = &machine.helper;
-        assert_eq!(get(&[]), format!("{helper}\n{helper}\n"), "the setup");
+        // How many of the test's own helpers git lists. Apple's git also reads a gitconfig of
+        // its own (naming `osxkeychain`) that `GIT_CONFIG_SYSTEM` does not replace, so the
+        // setup counts only the test's helpers; with the whole environment, git lists none.
+        let ours = |listed: &str| {
+            listed
+                .lines()
+                .filter(|line| *line == machine.helper)
+                .count()
+        };
+        assert_eq!(ours(&get(&[])), 2, "the setup");
         for (key, value) in [
             ("GIT_CONFIG_NOSYSTEM", "1"),
             ("GIT_CONFIG_GLOBAL", "/dev/null"),
         ] {
             let one = [(key.to_owned(), value.to_owned())];
-            assert_eq!(get(&one), format!("{helper}\n"), "{key} alone");
+            assert_eq!(ours(&get(&one)), 1, "{key} alone");
         }
         assert_eq!(get(&helpers_off_env()), "");
     }
