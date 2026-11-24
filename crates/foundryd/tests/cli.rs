@@ -1,7 +1,8 @@
 //! The command line: `--version` works, `join` names a bad port, `secret set` stores a gateway
 //! key or a GitHub token without printing it, `github default` stores a login, and
-//! `factory export` writes the runner's own run file back byte for byte. Every test that runs the binary uses a temporary data directory
-//! and skips the copy from the login keychain.
+//! `factory export` writes the runner's own run file back byte for byte without writing the
+//! store. Every test that runs the binary uses a temporary data directory and skips the copy
+//! from the login keychain.
 
 // A release build ignores `FOUNDRY_SECRETS`, so on macOS these runs of the binary would move
 // secrets out of the login keychain.
@@ -314,7 +315,7 @@ fn factory_export_writes_the_runners_own_run_file_byte_for_byte() {
         String::from_utf8_lossy(&exported)
     );
     assert!(
-        words(&ran.stdout).contains("1 run"),
+        words(&ran.stdout).contains("1 run written"),
         "stdout: {}",
         words(&ran.stdout)
     );
@@ -345,6 +346,44 @@ fn factory_export_on_a_machine_with_no_store_writes_no_run_and_makes_no_store() 
         "stdout: {}",
         words(&ran.stdout)
     );
+}
+
+#[test]
+fn factory_export_never_writes_the_store_even_one_older_than_this_build() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("store.sqlite");
+    // A store that has had none of this build's schema steps, as one an older build left.
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch("CREATE TABLE kept (x INTEGER); INSERT INTO kept VALUES (1);")
+        .unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let out = tempfile::tempdir().unwrap();
+
+    let ran = isolated(&["factory", "export", out.path().to_str().unwrap()], &home)
+        .output()
+        .expect("foundryd runs");
+
+    assert!(
+        ran.status.success(),
+        "exit: {:?} stderr: {}",
+        ran.status,
+        words(&ran.stderr)
+    );
+    assert!(
+        std::fs::read(&path).unwrap() == before,
+        "the store was written"
+    );
+    assert!(
+        words(&ran.stdout).contains("0 runs"),
+        "stdout: {}",
+        words(&ran.stdout)
+    );
+    let left: Vec<_> = std::fs::read_dir(out.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(left, ["runs"], "left in the export folder: {left:?}");
 }
 
 #[test]
