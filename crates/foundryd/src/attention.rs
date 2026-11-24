@@ -935,8 +935,8 @@ mod tests {
         version: u64,
         /// Every writer's status of each project.
         statuses: BTreeMap<ProjectId, Vec<(MachineId, FactoryStatus)>>,
-        /// This machine's freshness on a clock the test moves, when it keeps one.
-        freshness: Option<(Arc<FakeClock>, Freshness)>,
+        /// This machine's freshness and quiet on a clock the test moves, when it keeps them.
+        quiet: Option<(Arc<Freshness>, Quiet)>,
         marked: Marked,
     }
 
@@ -960,7 +960,7 @@ mod tests {
                 online: [me, peer].into(),
                 version: 0,
                 statuses: BTreeMap::new(),
-                freshness: None,
+                quiet: None,
                 marked: Marked::default(),
             }
         }
@@ -968,23 +968,19 @@ mod tests {
         /// A project named `foundry` whose factory is `on`, with this machine first in the
         /// coordinator order, so it acts.
         fn factory_project(&mut self, on: bool) -> ProjectId {
-            let project = Project {
-                id: ProjectId::random(),
-                name: "foundry".into(),
-                repo: "https://github.com/o/foundry.git".into(),
-            };
-            let id = project.id;
-            self.settings.projects.push(project);
-            self.settings.project_factory.insert(
-                id,
-                ProjectFactory {
-                    on,
-                    login: "octocat".into(),
-                    paused: false,
-                },
-            );
+            let id = with_factory_on(self.me, &mut self.settings);
+            self.turn(id, on);
             self.settings.priority = vec![self.me, self.peer];
             id
+        }
+
+        /// Turns `project`'s factory `on` or off.
+        fn turn(&mut self, project: ProjectId, on: bool) {
+            self.settings
+                .project_factory
+                .get_mut(&project)
+                .expect("a factory project")
+                .on = on;
         }
 
         /// Puts `status` in place of any status `writer` wrote of its project.
@@ -994,20 +990,18 @@ mod tests {
             held.push((writer, status));
         }
 
-        /// Gives this machine a freshness on a fake clock, and returns the clock.
+        /// Gives this machine a freshness and a quiet on a fake clock, reads the list once so
+        /// each project whose factory is on is seen on at the clock's start, and returns the
+        /// clock.
         fn keep_freshness(&mut self) -> Arc<FakeClock> {
-            let clock = Arc::new(FakeClock::new());
-            let dyn_clock: Arc<dyn Clock> = clock.clone();
-            self.freshness = Some((clock.clone(), Freshness::new(dyn_clock)));
+            let (clock, freshness, quiet) = fake_quiet();
+            self.quiet = Some((freshness, quiet));
+            self.items();
             clock
         }
 
         fn freshness(&self) -> &Freshness {
-            &self
-                .freshness
-                .as_ref()
-                .expect("keep_freshness was called")
-                .1
+            &self.quiet.as_ref().expect("keep_freshness was called").0
         }
 
         fn record<T>(&mut self, owner: MachineId, deleted: bool, body: T) -> Record<T> {
@@ -1122,7 +1116,7 @@ mod tests {
             };
             let factory = FactoryFleet {
                 statuses: self.statuses.clone(),
-                freshness: self.freshness.as_ref().map(|(_, f)| f),
+                quiet: self.quiet.as_ref().map(|(_, q)| q),
                 marks: Some(&self.marked),
             };
             fleet_items(&fleet, &factory)
@@ -1609,6 +1603,15 @@ mod tests {
 
     const MINUTE: Duration = Duration::from_secs(60);
 
+    /// A fake clock, a freshness on it and a quiet that reads both.
+    fn fake_quiet() -> (Arc<FakeClock>, Arc<Freshness>, Quiet) {
+        let clock = Arc::new(FakeClock::new());
+        let dyn_clock: Arc<dyn Clock> = clock.clone();
+        let freshness = Arc::new(Freshness::new(dyn_clock.clone()));
+        let quiet = Quiet::new(dyn_clock, freshness.clone());
+        (clock, freshness, quiet)
+    }
+
     fn run(issue: u64) -> RunId {
         RunId::new("o/foundry", issue, 1).unwrap()
     }
@@ -1795,6 +1798,7 @@ mod tests {
         clock.advance(MINUTE);
         let items = world.of(Kind::FactoryIdle);
         assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items[0].machine, world.peer);
         assert!(items[0].what.contains("trilogy-mac"), "{}", items[0].what);
     }
 
@@ -1827,6 +1831,111 @@ mod tests {
         world.freshness().received(&status);
         world.status(world.peer, status);
         assert!(world.of(Kind::FactoryIdle).is_empty());
+    }
+
+    #[test]
+    fn a_holder_that_is_believed_but_sends_nothing_new_for_ten_minutes_raises_factory_idle() {
+        let mut world = World::new();
+        let project = world.factory_project(true);
+        let clock = world.keep_freshness();
+        let status = holding(project, 2, 9);
+        world.freshness().received(&status);
+        world.status(world.peer, status);
+        clock.advance(10 * MINUTE);
+        let items = world.of(Kind::FactoryIdle);
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items[0].machine, world.me);
+        assert!(items[0].what.contains("10 minutes"), "{}", items[0].what);
+
+        let status = holding(project, 2, 10);
+        world.freshness().received(&status);
+        world.status(world.peer, status);
+        assert!(world.of(Kind::FactoryIdle).is_empty());
+    }
+
+    #[test]
+    fn the_ten_minutes_count_from_when_the_factory_is_seen_on() {
+        let mut world = World::new();
+        let project = world.factory_project(false);
+        let clock = world.keep_freshness();
+        clock.advance(60 * MINUTE);
+        assert!(world.of(Kind::FactoryIdle).is_empty());
+        world.turn(project, true);
+        assert!(
+            world.of(Kind::FactoryIdle).is_empty(),
+            "{:?}",
+            world.items()
+        );
+        clock.advance(9 * MINUTE);
+        assert!(
+            world.of(Kind::FactoryIdle).is_empty(),
+            "{:?}",
+            world.items()
+        );
+        clock.advance(MINUTE);
+        assert_eq!(world.of(Kind::FactoryIdle).len(), 1);
+
+        // Off and on again: the count starts again.
+        world.turn(project, false);
+        assert!(world.of(Kind::FactoryIdle).is_empty());
+        world.turn(project, true);
+        assert!(
+            world.of(Kind::FactoryIdle).is_empty(),
+            "{:?}",
+            world.items()
+        );
+    }
+
+    #[test]
+    fn no_token_names_the_acting_coordinator_when_another_writer_says_the_same() {
+        let mut world = World::new();
+        let project = world.factory_project(true);
+        // The peer was acting before this machine and wrote the same status.
+        for writer in [world.peer, world.me] {
+            let status = not_holding(
+                project,
+                NotHolding::NoToken {
+                    login: "octocat".into(),
+                },
+            );
+            world.status(writer, status);
+        }
+        world.settings.priority = vec![world.me, world.peer];
+        let items = world.of(Kind::FactoryIdle);
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items[0].machine, world.me);
+        assert!(items[0].todo.contains("this-mac"), "{}", items[0].todo);
+
+        world.settings.priority = vec![world.peer, world.me];
+        let items = world.of(Kind::FactoryIdle);
+        assert_eq!(items[0].machine, world.peer);
+        assert!(items[0].todo.contains("trilogy-mac"), "{}", items[0].todo);
+    }
+
+    #[test]
+    fn a_password_in_a_statuses_text_is_hidden_from_every_factory_item() {
+        let secret = "git fetch https://tom:hunter2@github.com/o/foundry.git failed";
+        let mut world = World::new();
+        let project = world.factory_project(true);
+        let mut status = holding(project, 3, 7);
+        status.idle = Some(secret.into());
+        status.held_up.push(held_up(12, HeldUpKind::Stuck, secret));
+        status
+            .held_up
+            .push(held_up(14, HeldUpKind::NeedsInfo, secret));
+        status.foreign.push(ForeignClaim {
+            issue: 21,
+            title: secret.into(),
+            state: "building".into(),
+        });
+        world.status(world.peer, status);
+        let items = factory_items_of(&world);
+        assert_eq!(items.len(), 4, "{items:?}");
+        for item in &items {
+            let text = serde_json::to_string(item).unwrap();
+            assert!(!text.contains("hunter2"), "{text}");
+            assert!(item.what.contains("***@github.com"), "{}", item.what);
+        }
     }
 
     #[test]
@@ -1933,7 +2042,7 @@ mod tests {
         Kind::GateInfra,
     ];
 
-    fn factory_items(world: &World) -> Vec<Item> {
+    fn factory_items_of(world: &World) -> Vec<Item> {
         world
             .items()
             .into_iter()
@@ -1946,7 +2055,7 @@ mod tests {
         let mut world = World::new();
         let project = world.factory_project(false);
         world.status(world.peer, busy_status(project, 3));
-        assert!(factory_items(&world).is_empty(), "{:?}", world.items());
+        assert!(factory_items_of(&world).is_empty(), "{:?}", world.items());
     }
 
     #[test]
@@ -1954,9 +2063,9 @@ mod tests {
         let mut world = World::new();
         let project = world.factory_project(true);
         world.status(world.peer, busy_status(project, 3));
-        assert_eq!(factory_items(&world).len(), 5, "{:?}", world.items());
+        assert_eq!(factory_items_of(&world).len(), 5, "{:?}", world.items());
         world.online.remove(&world.peer);
-        assert!(factory_items(&world).is_empty(), "{:?}", world.items());
+        assert!(factory_items_of(&world).is_empty(), "{:?}", world.items());
     }
 
     #[test]
@@ -1965,7 +2074,7 @@ mod tests {
         let project = world.factory_project(true);
         world.status(world.me, busy_status(project, 2));
         world.status(world.peer, holding(project, 3, 1));
-        assert!(factory_items(&world).is_empty(), "{:?}", world.items());
+        assert!(factory_items_of(&world).is_empty(), "{:?}", world.items());
     }
 
     // P1's items for factory work (G13)
@@ -2005,7 +2114,7 @@ mod tests {
     }
 
     #[test]
-    fn a_session_or_setup_in_a_workspace_a_status_names_raises_no_p1_item() {
+    fn a_session_or_setup_a_status_names_raises_no_p1_item() {
         let mut world = World::new();
         let project = world.factory_project(true);
         let peer = world.peer;
@@ -2016,35 +2125,57 @@ mod tests {
         name_in_status(
             &mut world,
             project,
-            vec![waiting.workspace, failed.workspace, setup_workspace],
-            Vec::new(),
+            vec![setup_workspace],
+            vec![waiting.id, failed.id],
         );
         assert!(world.items().is_empty(), "{:?}", world.items());
     }
 
     #[test]
-    fn a_status_from_a_writer_that_is_offline_still_names_factory_work() {
+    fn a_p1_session_in_a_factory_workspace_still_raises_its_item() {
+        let mut world = World::new();
+        let project = world.factory_project(true);
+        let (me, peer) = (world.me, world.peer);
+        // A person's session in a stuck run's workspace, which a status names.
+        let named = world.session(peer, SessionState::WaitingForYou);
+        name_in_status(&mut world, project, vec![named.workspace], Vec::new());
+        // And one in a workspace this machine marks as factory.
+        let marked = world.session(me, SessionState::Stuck);
+        world.marked.workspaces.insert(marked.workspace);
+        let kinds: Vec<(Kind, String)> =
+            world.items().into_iter().map(|i| (i.kind, i.id)).collect();
+        assert_eq!(
+            kinds,
+            [
+                (Kind::SessionStuck, format!("session_stuck:{}", marked.id)),
+                (
+                    Kind::SessionWaiting,
+                    format!("session_waiting:{}", named.id)
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_status_that_is_not_believed_names_no_factory_work() {
         let mut world = World::new();
         let project = world.factory_project(true);
         let me = world.me;
         let session = world.session(me, SessionState::Stuck);
         name_in_status(&mut world, project, Vec::new(), vec![session.id]);
+        assert!(world.of(Kind::SessionStuck).is_empty());
         world.online.remove(&world.peer);
-        assert!(
-            world.of(Kind::SessionStuck).is_empty(),
-            "{:?}",
-            world.items()
-        );
+        assert_eq!(world.of(Kind::SessionStuck).len(), 1, "{:?}", world.items());
     }
 
     #[test]
-    fn a_factory_session_with_no_factory_switch_on_still_raises_no_p1_item() {
+    fn a_status_of_a_project_whose_factory_is_off_names_no_factory_work() {
         let mut world = World::new();
         let project = world.factory_project(false);
         let peer = world.peer;
         let session = world.session(peer, SessionState::Stuck);
         name_in_status(&mut world, project, Vec::new(), vec![session.id]);
-        assert!(world.items().is_empty(), "{:?}", world.items());
+        assert_eq!(world.of(Kind::SessionStuck).len(), 1, "{:?}", world.items());
     }
 
     #[test]
@@ -2059,7 +2190,7 @@ mod tests {
         assert_eq!(world.items().len(), 3, "{:?}", world.items());
 
         world.marked.sessions.insert(stuck.id);
-        world.marked.workspaces.insert(waiting.workspace);
+        world.marked.sessions.insert(waiting.id);
         world.marked.workspaces.insert(workspace);
         assert!(world.items().is_empty(), "{:?}", world.items());
     }
@@ -2400,15 +2531,32 @@ mod tests {
             version: 1,
             body: FactoryBody::Status(status),
         };
-        served
-            .store
-            .lock()
-            .unwrap()
-            .apply_factory(&record, served.me)
-            .unwrap();
+        // The session the status names is stuck as P1 sees it.
+        let stuck = AnyRecord::Session(Record {
+            owner: served.me,
+            version: 1,
+            deleted: false,
+            body: Session {
+                id: session,
+                workspace: WorkspaceId::random(),
+                terminal: TerminalId::random(),
+                model: "opus".into(),
+                state: SessionState::Stuck,
+            },
+        });
+        {
+            let mut store = served.store.lock().unwrap();
+            store.apply_factory(&record, served.me).unwrap();
+            store.apply(&stuck, served.me).unwrap();
+        }
         let kinds = served.kinds().await;
+        let me = served.me.to_string();
         assert!(
-            kinds.contains(&("run_stuck".to_owned(), served.me.to_string())),
+            kinds.contains(&("run_stuck".to_owned(), me.clone())),
+            "{kinds:?}"
+        );
+        assert!(
+            !kinds.contains(&("session_stuck".to_owned(), me)),
             "{kinds:?}"
         );
     }
@@ -2444,9 +2592,12 @@ mod tests {
         let coordinator = Arc::new(Coordinator::new(me, store.clone(), peers.clone()));
         let clock = Arc::new(FakeClock::new());
         let dyn_clock: Arc<dyn Clock> = clock.clone();
-        let freshness = Arc::new(Freshness::new(dyn_clock));
-        let attention = Attention::new(me, store.clone(), peers, coordinator)
-            .with_factory(freshness.clone(), Arc::new(marked));
+        let freshness = Arc::new(Freshness::new(dyn_clock.clone()));
+        let attention = Attention::new(me, store.clone(), peers, coordinator).with_factory(
+            dyn_clock,
+            freshness.clone(),
+            Arc::new(marked),
+        );
         let kinds = |items: Vec<Item>| items.into_iter().map(|i| i.kind).collect::<Vec<_>>();
 
         assert_eq!(kinds(attention.items().await.unwrap()), []);
