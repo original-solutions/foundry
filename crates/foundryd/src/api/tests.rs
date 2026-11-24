@@ -972,7 +972,8 @@ async fn a_shell_is_started_in_the_worktree_and_closed() {
             .await
             .unwrap();
     socket.send(Message::binary(&b"pwd\n"[..])).await.unwrap();
-    read_until(&mut socket, "shells").await;
+    // A worktree's folder is named by its workspace's id.
+    read_until(&mut socket, &workspace.to_string()).await;
 
     let reply = daemon
         .call("POST", &format!("/api/terminals/{shell}/close"), None)
