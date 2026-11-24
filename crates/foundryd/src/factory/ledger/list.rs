@@ -10,6 +10,8 @@
 //! The runner's progress read (`runner/progress.ts`, `Seen`) is not ported yet; the few facts
 //! of it a listing needs are read here, by the runner's rules.
 
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
 use foundry_proto::factory::{RunEvent, RunId};
 
 use super::Ledger;
@@ -27,21 +29,15 @@ const LAUNCH_SENDING: &str = "launch-sending";
 /// The step written before a launch that carries on from an earlier branch is sent.
 const LAUNCH_SENDING_RESUMED: &str = "launch-sending resumed-from ";
 
-// The store's lock is shared by the whole daemon and a repo's history only grows, so a listing
-// of the ledger's store takes it for one read at a time: the run ids, then each run's events.
-// Each run's events are still read whole under one lock; a run that gains an event or first
-// appears after its read is seen as it is by the next listing.
 impl Ledger {
     /// [`runs`] of the ledger's store.
     pub fn runs(&self, repo: &str) -> Result<Vec<RunInfo>, StoreError> {
-        let ids = self.lock().runs_of(repo)?;
-        Ok(unfinished(ids, |id| events(&self.lock(), id)))
+        runs(&self.store, repo)
     }
 
     /// [`issue_runs`] of the ledger's store.
     pub fn issue_runs(&self, repo: &str, issue: u64) -> Result<Vec<RunInfo>, StoreError> {
-        let ids = of_issue(self.lock().runs_of(repo)?, issue);
-        Ok(unfinished(ids, |id| events(&self.lock(), id)))
+        issue_runs(&self.store, repo, issue)
     }
 
     /// [`next_attempt`] of the ledger's store.
@@ -51,8 +47,7 @@ impl Ledger {
 
     /// [`summaries`] of the ledger's store.
     pub fn summaries(&self, repo: &str) -> Result<Vec<RunSummary>, StoreError> {
-        let ids = self.lock().runs_of(repo)?;
-        Ok(summaries_of(ids, |id| events(&self.lock(), id)))
+        summaries(&self.store, repo)
     }
 }
 
@@ -201,17 +196,32 @@ fn unfinished(
     readable
 }
 
+/// `store`, locked. A task that panicked while holding it leaves it consistent.
+fn locked(store: &Mutex<Store>) -> MutexGuard<'_, Store> {
+    store.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Every run of `repo` (`owner/name`, in any case) that is not finished, in run id order, with
 /// any whose events cannot be read last.
-pub fn runs(store: &Store, repo: &str) -> Result<Vec<RunInfo>, StoreError> {
-    Ok(unfinished(store.runs_of(repo)?, |id| events(store, id)))
+///
+/// The store's lock is shared by the whole daemon and a repo's history only grows, so a listing
+/// takes it for one read at a time: the run ids, then each run's events. Each run's events are
+/// read whole under one lock; a run that gains an event or first appears after its read is
+/// seen as it is by the next listing. The same holds for [`issue_runs`] and [`summaries`].
+pub fn runs(store: &Mutex<Store>, repo: &str) -> Result<Vec<RunInfo>, StoreError> {
+    let ids = locked(store).runs_of(repo)?;
+    Ok(unfinished(ids, |id| events(&locked(store), id)))
 }
 
 /// The unfinished runs of `issue` in `repo`, as [`runs`] lists them. Only that issue's runs
 /// are read.
-pub fn issue_runs(store: &Store, repo: &str, issue: u64) -> Result<Vec<RunInfo>, StoreError> {
-    let ids = of_issue(store.runs_of(repo)?, issue);
-    Ok(unfinished(ids, |id| events(store, id)))
+pub fn issue_runs(
+    store: &Mutex<Store>,
+    repo: &str,
+    issue: u64,
+) -> Result<Vec<RunInfo>, StoreError> {
+    let ids = of_issue(locked(store).runs_of(repo)?, issue);
+    Ok(unfinished(ids, |id| events(&locked(store), id)))
 }
 
 /// The runs among `ids` of `issue`.
@@ -338,8 +348,9 @@ fn cap_reason(reason: &str) -> String {
 
 /// One summary per run of `repo` (`owner/name`, in any case), finished runs included, in run
 /// id order with any whose events cannot be read last.
-pub fn summaries(store: &Store, repo: &str) -> Result<Vec<RunSummary>, StoreError> {
-    Ok(summaries_of(store.runs_of(repo)?, |id| events(store, id)))
+pub fn summaries(store: &Mutex<Store>, repo: &str) -> Result<Vec<RunSummary>, StoreError> {
+    let ids = locked(store).runs_of(repo)?;
+    Ok(summaries_of(ids, |id| events(&locked(store), id)))
 }
 
 /// One summary per run among `ids`, each run's events got from `read`, unreadable ones last.
@@ -476,11 +487,11 @@ mod tests {
     }
 
     fn listed(store: &Arc<Mutex<Store>>, repo: &str) -> Vec<RunInfo> {
-        runs(&store.lock().unwrap(), repo).unwrap()
+        runs(store, repo).unwrap()
     }
 
     fn summaries_of(store: &Arc<Mutex<Store>>, repo: &str) -> Vec<RunSummary> {
-        summaries(&store.lock().unwrap(), repo).unwrap()
+        summaries(store, repo).unwrap()
     }
 
     // The runner's `listRuns.test.ts`: `listUnfinishedRuns` is `runs`. The cases about the
@@ -664,7 +675,7 @@ mod tests {
         // A run of this issue that cannot be read is listed last, so it still holds its slot.
         unreadable_run(dir.path(), &rid(1, "rawphp/softfac", 3));
         assert_eq!(
-            issue_runs(&store.lock().unwrap(), "RawPhp/Softfac", 1).unwrap(),
+            issue_runs(&store, "RawPhp/Softfac", 1).unwrap(),
             [
                 info(softfac(1), Some(State::Triage), true),
                 info(rid(1, "rawphp/softfac", 2), Some(State::Building), true),
