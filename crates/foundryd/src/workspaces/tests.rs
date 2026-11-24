@@ -4496,12 +4496,27 @@ async fn a_retry_of_a_tag_whose_setup_never_started_starts_it() {
         .body(workspace)
         .setup
         .expect("the record names a setup");
-    let ended = setup.setup_ended(workspace).await;
-    assert_eq!(ended.id, named);
-    assert_eq!(ended.exit_code, Some(0));
+    // The terminal the first, failed start left is closed; the retry's runs and exits 0.
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let live: Vec<_> = setup
+            .terminals_of(workspace)
+            .into_iter()
+            .filter(|t| !t.deleted)
+            .collect();
+        assert_eq!(live.len(), 1, "{live:?}");
+        assert_eq!(live[0].body.id, named);
+        if live[0].body.state == TerminalState::Exited {
+            assert_eq!(live[0].body.exit_code, Some(0));
+            break;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for setup");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     // A third call finds the setup named and starts nothing more.
+    let before = setup.terminals_of(workspace).len();
     assert_eq!(make().await.unwrap(), workspace);
-    assert_eq!(setup.terminals_of(workspace).len(), 1);
+    assert_eq!(setup.terminals_of(workspace).len(), before);
 }
 
 #[test]
