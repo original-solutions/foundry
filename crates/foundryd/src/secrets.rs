@@ -754,6 +754,46 @@ mod tests {
         );
     }
 
+    /// A URL that follows another, with an `@` between them and no `/`, `?`, `#` or whitespace,
+    /// is still read as a URL: the first one's authority never takes in the second's `://`.
+    #[test]
+    fn redact_hides_the_password_of_a_url_after_an_at_sign_and_another_url() {
+        for (text, kept) in [
+            ("{\"a\":\"https://h\",\"b\":\"x@y,https://u:p@z/\"}", "@z/"),
+            (
+                "[\"https://a.example\",\"ops@x.io;https://u:hunter2@b.example/r\"]",
+                "@b.example/r",
+            ),
+            ("'https://h',bot@x,https://u:p@y/", "@y/"),
+            ("\"https://a\"@x,https://u:p@h/r", "@h/r"),
+            (
+                "url=\"https://a\",user=bob@corp,remote=https://bob:tok@github.com/o/r",
+                "@github.com/o/r",
+            ),
+            ("https://x@a,https://u:p@b/r", "@b/r"),
+        ] {
+            let shown = redact(text);
+            for secret in ["u:p", "hunter2", "bob:tok"] {
+                assert!(!shown.contains(secret), "{text} → {shown}");
+            }
+            assert!(
+                shown.contains(&format!("https://***{kept}")),
+                "{text} → {shown}"
+            );
+        }
+    }
+
+    /// A quote before the last `@` may be in the password, so it is hidden with it. Text after a
+    /// quoted URL, up to an `@` with no `/`, `?`, `#` or whitespace before it, is hidden too.
+    #[test]
+    fn redact_hides_up_to_an_at_sign_after_a_quoted_url() {
+        assert_eq!(
+            redact("{\"url\":\"https://h\",\"by\":\"a@b\"}"),
+            "{\"url\":\"https://***@b\"}"
+        );
+        assert_eq!(redact("'https://h'x@y"), "'https://***@y");
+    }
+
     #[test]
     fn the_login_rule_gives_the_limit_and_is_what_a_refusal_says() {
         assert!(
