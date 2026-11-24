@@ -1997,6 +1997,35 @@ mod tests {
     }
 
     #[test]
+    fn a_write_holds_the_store_lock_from_its_finished_check_to_its_store() {
+        // The clock is read between the finished check and the store, so it sees the lock held
+        // there. A write that let the lock go between the two could let another clone's
+        // `finished` in between, and store an event after it.
+        let (_dir, store) = open_store();
+        let (reads, unlocked) = (
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        );
+        let wall: WallClock = {
+            let (store, reads, unlocked) = (store.clone(), reads.clone(), unlocked.clone());
+            std::sync::Arc::new(move || {
+                reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if store.try_lock().is_ok() {
+                    unlocked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                T0
+            })
+        };
+        let ledger = Ledger::new(store.clone(), MachineId::random(), 1, shown()).with_wall(wall);
+        ledger.write(&run(8), &step("s"), &test_cause()).unwrap();
+        ledger
+            .finish(&run(8), Outcome::Stuck, None, None, &test_cause(), None)
+            .unwrap();
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(unlocked.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn the_ledger_lists_and_counts_the_runs_its_store_holds() {
         let (_dir, store) = open_store();
         let ledger = ledger(&store, MachineId::random(), 1, ticking(T0, 1000));

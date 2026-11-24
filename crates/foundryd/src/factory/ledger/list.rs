@@ -569,7 +569,11 @@ mod tests {
         assert_eq!(ledger.runs("rawphp/softfac").unwrap().len(), 3);
         assert_eq!(ledger.issue_runs("rawphp/softfac", 2).unwrap().len(), 1);
         assert_eq!(ledger.summaries("rawphp/softfac").unwrap().len(), 3);
-        assert_eq!(warned.load(Ordering::SeqCst), 3);
+        // The functions over the store itself list the same way.
+        assert_eq!(runs(&store, "rawphp/softfac").unwrap().len(), 3);
+        assert_eq!(issue_runs(&store, "rawphp/softfac", 2).unwrap().len(), 1);
+        assert_eq!(summaries(&store, "rawphp/softfac").unwrap().len(), 3);
+        assert_eq!(warned.load(Ordering::SeqCst), 6);
         assert_eq!(locked.load(Ordering::SeqCst), 0);
     }
 
