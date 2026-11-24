@@ -134,6 +134,16 @@ fn factory_env(
     Ok(env)
 }
 
+/// The netrc of the owner whose HOME is `home`.
+fn netrc_of(_home: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    None
+}
+
+/// The check's git: `base` with the session's overrides of config out of it.
+fn check_git(base: Command, _home: Option<&Path>) -> Command {
+    base
+}
+
 /// [`git_refusal`] for the real setup: the process's `git`, with the session's overrides of
 /// config out of it, and `$HOME/.netrc`. With `home` (tests), that folder is HOME and
 /// XDG_CONFIG_HOME, there is no system config, and the netrc is `<home>/.netrc`.
@@ -1593,8 +1603,9 @@ exec "$agent" "$@""#;
         );
     }
 
+    /// The production check, over the made-up `home`.
     fn check(home: &Path, repo: &Path) -> Result<(), SessionError> {
-        git_refusal(owner_git(home), Some(&home.join(".netrc")), repo)
+        owner_setup_refusal(Some(home), repo)
     }
 
     /// What the refusal says, Display and Debug, when `result` is one.
@@ -1755,8 +1766,205 @@ exec "$agent" "$@""#;
         let said = said(check(home.path(), repo.path()));
 
         assert!(said.contains("remote.origin.url"), "{said}");
+        assert!(!said.contains("remote.origin.pushurl"), "{said}");
         assert!(said.contains(".git/config"), "{said}");
         assert!(!said.contains(SECRET), "{said}");
+    }
+
+    #[test]
+    fn an_origin_rewritten_to_carry_a_user_name_names_the_rewrite_key() {
+        let (home, repo) = setup(&format!(
+            "[url \"https://bob:{SECRET}@github.com/\"]\n\tinsteadOf = gh:\n"
+        ));
+        run(
+            owner_git(home.path()),
+            repo.path(),
+            &["remote", "add", "origin", "gh:o/r.git"],
+        );
+
+        let said = said(check(home.path(), repo.path()));
+
+        assert!(
+            said.contains("url.https://***@github.com/.insteadof"),
+            "{said}"
+        );
+        assert!(said.contains(".gitconfig"), "{said}");
+        assert!(!said.contains(SECRET), "{said}");
+    }
+
+    #[test]
+    fn an_origin_scp_url_with_a_user_name_refuses() {
+        let (home, repo) = setup("");
+        run(
+            owner_git(home.path()),
+            repo.path(),
+            &["remote", "add", "origin", "bob@example.com:o/r.git"],
+        );
+
+        let said = said(check(home.path(), repo.path()));
+
+        assert!(said.contains("remote.origin.url"), "{said}");
+        assert!(!said.contains("bob"), "{said}");
+    }
+
+    #[test]
+    fn an_extraheader_for_a_url_that_covers_github_com_in_another_spelling_refuses() {
+        for section in [
+            "https://github.com:443/",
+            "https://GitHub.com/",
+            "https://bob@github.com/",
+        ] {
+            let (home, repo) = setup(&format!(
+                "[http \"{section}\"]\n\textraHeader = Authorization: Basic {SECRET}\n"
+            ));
+
+            let said = said(check(home.path(), repo.path()));
+
+            assert!(said.contains(".extraheader"), "{section} {said}");
+            assert!(said.contains(".gitconfig"), "{section} {said}");
+            assert!(!said.contains(SECRET), "{section} {said}");
+        }
+    }
+
+    #[test]
+    fn an_empty_insteadof_refuses() {
+        let (home, repo) = setup("[url \"https://rewrite.example/\"]\n\tinsteadOf =\n");
+
+        let said = said(check(home.path(), repo.path()));
+
+        assert!(
+            said.contains("url.https://rewrite.example/.insteadof"),
+            "{said}"
+        );
+    }
+
+    #[test]
+    fn a_netrc_that_cannot_be_read_refuses_naming_the_file() {
+        let (home, repo) = setup("");
+        std::fs::create_dir(home.path().join(".netrc")).unwrap();
+
+        let said = said(check(home.path(), repo.path()));
+
+        assert!(said.contains(".netrc"), "{said}");
+    }
+
+    #[test]
+    fn netrc_keywords_and_hosts_are_read_as_curl_reads_them() {
+        for netrc in [
+            format!("MACHINE github.com LOGIN bob PASSWORD {SECRET}\n"),
+            format!("machine \"github.com\" login bob password {SECRET}\n"),
+            format!("Machine GITHUB.COM login bob password {SECRET}\n"),
+            format!("Default login bob password {SECRET}\n"),
+            format!(
+                "machine example.com login a\\ b password x\nmachine github.com password {SECRET}\n"
+            ),
+        ] {
+            let (home, repo) = setup("");
+            std::fs::write(home.path().join(".netrc"), &netrc).unwrap();
+
+            let said = said(check(home.path(), repo.path()));
+
+            assert!(said.contains(".netrc"), "{netrc:?} {said}");
+            assert!(!said.contains(SECRET), "{said}");
+        }
+    }
+
+    #[test]
+    fn a_git_config_variable_in_the_environment_does_not_hide_the_owners_config() {
+        let (home, repo) =
+            setup("[url \"https://rewrite.example/\"]\n\tinsteadOf = https://github.com/\n");
+        let empty = home.path().join("empty-config");
+        std::fs::write(&empty, "").unwrap();
+        let git = || {
+            let mut base = Command::new("git");
+            base.env("GIT_CONFIG", &empty);
+            let mut git = check_git(base, Some(home.path()));
+            git.env("HOME", home.path());
+            git
+        };
+
+        let said = said(git_refusal(git, None, repo.path()));
+
+        assert!(
+            said.contains("url.https://rewrite.example/.insteadof"),
+            "{said}"
+        );
+    }
+
+    #[test]
+    fn the_netrc_is_in_the_home_given_and_none_without_one() {
+        assert_eq!(
+            netrc_of(Some("/home/o".into())),
+            Some(PathBuf::from("/home/o/.netrc"))
+        );
+        assert_eq!(netrc_of(None), None);
+    }
+
+    #[tokio::test]
+    async fn a_start_with_a_netrc_entry_for_github_com_is_refused_and_leaves_nothing() {
+        let logged = Logged::everywhere();
+        let f = Fx::new("- wait_input\n").await;
+        let project = ProjectId::random();
+        std::fs::write(
+            f.git_home.path().join(".netrc"),
+            format!("machine github.com login x password {SECRET}\n"),
+        )
+        .unwrap();
+
+        let error = f
+            .sessions
+            .start_factory(
+                WorkspaceId::random(),
+                f.worktree.path(),
+                f.start_for(project),
+                f.line(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, SessionError::GitSetup(_)), "{error}");
+        let said = format!("{error} {error:?}");
+        assert!(said.contains(".netrc"), "{said}");
+        assert!(!said.contains(TOKEN) && !said.contains(SECRET), "{said}");
+        assert!(!logged.text().contains(SECRET) && !logged.text().contains(TOKEN));
+        f.assert_nothing_left(&f.sessions, project);
+    }
+
+    #[tokio::test]
+    async fn a_start_in_a_worktree_whose_origin_carries_a_password_is_refused_and_leaves_nothing() {
+        let logged = Logged::everywhere();
+        let f = Fx::new("- wait_input\n").await;
+        let project = ProjectId::random();
+        let git = owner_git(f.git_home.path());
+        run(&git, f.worktree.path(), &["init", "-q"]);
+        run(
+            &git,
+            f.worktree.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                &format!("https://bob:{SECRET}@github.com/o/r.git"),
+            ],
+        );
+
+        let error = f
+            .sessions
+            .start_factory(
+                WorkspaceId::random(),
+                f.worktree.path(),
+                f.start_for(project),
+                f.line(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, SessionError::GitSetup(_)), "{error}");
+        let said = format!("{error} {error:?}");
+        assert!(said.contains("remote.origin.url"), "{said}");
+        assert!(!said.contains(TOKEN) && !said.contains(SECRET), "{said}");
+        assert!(!logged.text().contains(SECRET) && !logged.text().contains(TOKEN));
+        f.assert_nothing_left(&f.sessions, project);
     }
 
     #[test]
