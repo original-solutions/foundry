@@ -92,6 +92,8 @@ fn secret_set_stores_the_gateway_keys_and_never_prints_them() {
             String::from_utf8_lossy(&out.stderr)
         );
         assert!(!printed.contains("sk-abc"), "{name} printed: {printed}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("restart foundryd"), "{name}: {stdout}");
         assert_eq!(held(&home, name).as_deref(), Some("sk-abc"));
     }
 }
@@ -214,6 +216,8 @@ fn secret_set_stores_a_github_token_and_never_prints_it() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(!printed.contains("ghp_clitoken"), "printed: {printed}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("no restart is needed"), "stdout: {stdout}");
     assert_eq!(
         held(&home, "github:octocat").as_deref(),
         Some("ghp_clitoken")
@@ -257,4 +261,23 @@ fn secret_set_with_a_token_in_place_of_the_login_never_prints_it() {
         !stderr.contains("ghp_secret_like_x_123"),
         "stderr: {stderr}"
     );
+}
+
+#[test]
+fn github_default_with_a_40_character_token_exits_1_and_does_not_print_it() {
+    let home = tempfile::tempdir().unwrap();
+    let token = "0123456789abcdef0123456789abcdef01234567";
+
+    let out = isolated(&["github", "default", token], &home)
+        .output()
+        .expect("foundryd runs");
+
+    assert_eq!(out.status.code(), Some(1), "exit: {:?}", out.status);
+    assert_eq!(held(&home, "github-default"), None);
+    let printed = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!printed.contains(token), "printed: {printed}");
 }

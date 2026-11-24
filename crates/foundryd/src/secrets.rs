@@ -683,6 +683,30 @@ mod tests {
     }
 
     #[test]
+    fn is_login_takes_39_characters_and_refuses_40() {
+        assert!(is_login(&"a".repeat(39)));
+        assert!(!is_login(&"a".repeat(40)));
+    }
+
+    #[test]
+    fn set_from_refuses_a_40_hex_login_before_reading_stdin() {
+        struct NoRead;
+        impl io::Read for NoRead {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                panic!("stdin was read");
+            }
+        }
+        let (_dir, secrets) = file();
+        let name = format!(
+            "{GITHUB_PREFIX}{}",
+            "0123456789abcdef".repeat(3).get(..40).unwrap()
+        );
+        let result = set_from(&secrets, &name, io::BufReader::new(NoRead));
+        assert!(matches!(result, Err(SetError::UnknownName)), "{result:?}");
+        assert_eq!(secrets.names().unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
     fn a_secret_set_is_got_back() {
         let (_dir, secrets) = file();
         assert_eq!(secrets.get("gateway").unwrap(), None);

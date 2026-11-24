@@ -461,6 +461,92 @@ mod tests {
         assert_eq!(warnings(&logged), 2, "a new failure warns again");
     }
 
+    /// A store whose listing panics while `panicking` is set, and counts the listings.
+    struct Panicking {
+        panicking: Arc<std::sync::atomic::AtomicBool>,
+        lists: Arc<AtomicUsize>,
+    }
+
+    const PANIC_MARK: &str = "held-test-unique-panic-mark";
+
+    impl Secrets for Panicking {
+        fn get(&self, _name: &str) -> Result<Option<String>, SecretsError> {
+            Ok(None)
+        }
+        fn set(&self, _name: &str, _value: &str) -> Result<(), SecretsError> {
+            Ok(())
+        }
+        fn update(&self, _name: &str, _edit: crate::secrets::Edit<'_>) -> Result<(), SecretsError> {
+            Ok(())
+        }
+        fn names(&self) -> Result<Vec<String>, SecretsError> {
+            self.lists.fetch_add(1, Ordering::SeqCst);
+            if self.panicking.load(Ordering::SeqCst) {
+                panic!("{PANIC_MARK}");
+            }
+            Ok(vec![])
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_warns_once_while_the_check_keeps_panicking() {
+        let logged = crate::test_log::Logged::everywhere();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(
+            Store::open(dir.path().join("foundry.db")).unwrap(),
+        ));
+        let panicking = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let lists = Arc::new(AtomicUsize::new(0));
+        let clock = Arc::new(FakeClock::new());
+        let me = MachineId::random();
+        let task = tokio::spawn(run_with(
+            store.clone(),
+            me,
+            Arc::new(Panicking {
+                panicking: panicking.clone(),
+                lists: lists.clone(),
+            }),
+            None,
+            clock.clone(),
+        ));
+        let rig = Rig {
+            dir,
+            store,
+            secrets: Arc::new(FileSecrets::new(PathBuf::from("unused"))),
+            clock,
+            me,
+            skill: PathBuf::from("unused"),
+            task,
+        };
+        let warnings = || {
+            logged
+                .text()
+                .lines()
+                .filter(|line| {
+                    line.contains(PANIC_MARK)
+                        && line.contains("WARN")
+                        && line.contains("not written")
+                })
+                .count()
+        };
+        // Three checks panic; each pass waits for its check to start.
+        wait_for(|| lists.load(Ordering::SeqCst) >= 1).await;
+        for checks in 2..=4 {
+            pass(&rig, CHECK_EVERY).await;
+            wait_for(|| lists.load(Ordering::SeqCst) >= checks).await;
+        }
+        assert!(lists.load(Ordering::SeqCst) >= 4, "checks ran");
+        wait_for(|| warnings() >= 1).await;
+        assert_eq!(warnings(), 1, "{}", logged.text());
+
+        panicking.store(false, Ordering::SeqCst);
+        pass(&rig, CHECK_EVERY).await;
+        assert!(
+            version_after(&rig, None).await.is_some(),
+            "a later check writes"
+        );
+    }
+
     /// Waits in real time, up to 5 s, for `done`.
     async fn wait_for(done: impl Fn() -> bool) {
         for _ in 0..1_000 {
