@@ -32,17 +32,22 @@ pub const LOCK_WAIT: Duration = Duration::from_secs(5);
 /// `text` with the user and password of every URL in it hidden: `https://user:token@host`
 /// becomes `https://***@host`. A git address with no scheme, `git@host:repo`, holds no secret
 /// and is left as it is.
+///
+/// The authority runs from `://` to the first `/`, `?`, `#` or whitespace, or to the next `://`,
+/// and everything before its last `@` is hidden, quotes included, since a password can hold a
+/// quote. A URL quoted in text keeps its quotes when a path or a space follows its host. Text
+/// after a closing quote is hidden too when an `@` follows it before any of those.
 pub fn redact(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(at) = rest.find("://") {
         let (before, after) = rest.split_at(at + 3);
         out.push_str(before);
+        // Never past the next `://`, so the loop still reads the URL that follows.
         let authority = after
-            .find(|c: char| {
-                matches!(c, '/' | '?' | '#') || c.is_whitespace() || c == '\'' || c == '"'
-            })
-            .unwrap_or(after.len());
+            .find(|c: char| matches!(c, '/' | '?' | '#') || c.is_whitespace())
+            .unwrap_or(after.len())
+            .min(after.find("://").unwrap_or(after.len()));
         match after[..authority].rfind('@') {
             Some(user_end) => {
                 out.push_str("***");
@@ -703,6 +708,90 @@ mod tests {
 
     fn mode(path: &Path) -> u32 {
         fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn redact_hides_a_password_that_holds_a_quote() {
+        for text in [
+            "https://bot:pa\"ss@github.com/o/r",
+            "https://bot:pa'ss@github.com/o/r",
+        ] {
+            let shown = redact(text);
+            for part in ["bot", "pa", "ss"] {
+                assert!(!shown.contains(part), "{text} → {shown}");
+            }
+            assert!(shown.contains("@github.com/o/r"), "{text} → {shown}");
+        }
+    }
+
+    #[test]
+    fn redact_keeps_the_quotes_around_a_url_quoted_in_text() {
+        let shown = redact("see \"https://u:p@host/x\" now");
+        assert!(!shown.contains("u:p"), "{shown}");
+        assert_eq!(shown, "see \"https://***@host/x\" now");
+        let shown = redact("see 'https://u:p@host' now");
+        assert_eq!(shown, "see 'https://***@host' now");
+        assert_eq!(redact("'https://host/x'"), "'https://host/x'");
+        assert_eq!(redact("'https://h' by a@b.com"), "'https://h' by a@b.com");
+        assert_eq!(
+            redact("\"https://host\" and 'https://h'"),
+            "\"https://host\" and 'https://h'"
+        );
+    }
+
+    /// The next `://` ends a URL's authority, so a URL quoted right after another is read as one
+    /// and its password hidden.
+    #[test]
+    fn redact_hides_the_password_of_a_url_quoted_right_after_another() {
+        assert_eq!(
+            redact("[\"https://a.example\",\"https://u:p@b.example\"]"),
+            "[\"https://a.example\",\"https://***@b.example\"]"
+        );
+        assert_eq!(
+            redact("['https://x@a','https://u:p@b']"),
+            "['https://***@a','https://***@b']"
+        );
+    }
+
+    /// A URL that follows another, with an `@` between them and no `/`, `?`, `#` or whitespace,
+    /// is still read as a URL: the first one's authority never takes in the second's `://`.
+    #[test]
+    fn redact_hides_the_password_of_a_url_after_an_at_sign_and_another_url() {
+        for (text, kept) in [
+            ("{\"a\":\"https://h\",\"b\":\"x@y,https://u:p@z/\"}", "@z/"),
+            (
+                "[\"https://a.example\",\"ops@x.io;https://u:hunter2@b.example/r\"]",
+                "@b.example/r",
+            ),
+            ("'https://h',bot@x,https://u:p@y/", "@y/"),
+            ("\"https://a\"@x,https://u:p@h/r", "@h/r"),
+            (
+                "url=\"https://a\",user=bob@corp,remote=https://bob:tok@github.com/o/r",
+                "@github.com/o/r",
+            ),
+            ("https://x@a,https://u:p@b/r", "@b/r"),
+        ] {
+            let shown = redact(text);
+            for secret in ["u:p", "hunter2", "bob:tok"] {
+                assert!(!shown.contains(secret), "{text} → {shown}");
+            }
+            assert!(
+                shown.contains(&format!("https://***{kept}")),
+                "{text} → {shown}"
+            );
+        }
+    }
+
+    /// A quote before the last `@` may be in the password, so it is hidden with it. Text after a
+    /// quoted URL, up to an `@` with no `/`, `?`, `#` or whitespace before it, is hidden too.
+    #[test]
+    fn redact_hides_up_to_an_at_sign_after_a_quoted_url() {
+        assert_eq!(
+            redact("{\"url\":\"https://h\",\"by\":\"a@b\"}"),
+            "{\"url\":\"https://***@b\"}"
+        );
+        assert_eq!(redact("'https://h'x@y"), "'https://***@y");
+        assert_eq!(redact("'https://u@h',x@y/r"), "'https://***@y/r");
     }
 
     #[test]
