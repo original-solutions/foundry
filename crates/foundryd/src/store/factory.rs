@@ -46,8 +46,8 @@ fn parse_machine(index: usize, text: &str) -> rusqlite::Result<MachineId> {
         .map_err(|e| rusqlite::Error::FromSqlConversionFailure(index, Type::Text, Box::new(e)))
 }
 
-/// Counts the run events a read of this thread hands back, for tests that show a read is
-/// bounded. Counted by thread, since each test runs on a thread of its own.
+/// Counts the run event rows the reads of this thread hand back, as events or as ids, for tests
+/// that show a read is bounded. Counted by thread, since each test runs on a thread of its own.
 #[cfg(test)]
 mod counted {
     use std::cell::Cell;
@@ -56,8 +56,8 @@ mod counted {
         static READ: Cell<usize> = const { Cell::new(0) };
     }
 
-    pub(super) fn add(events: usize) {
-        READ.with(|read| read.set(read.get() + events));
+    pub(super) fn add(rows: usize) {
+        READ.with(|read| read.set(read.get() + rows));
     }
 
     pub(super) fn read() -> usize {
@@ -67,59 +67,40 @@ mod counted {
 
 #[cfg(not(test))]
 mod counted {
-    pub(super) fn add(_events: usize) {}
+    pub(super) fn add(_rows: usize) {}
 }
 
-/// The run events stored under the JSON of `rows`, in their order. A row that holds another
-/// kind of record is an error.
-fn run_events_of(
-    rows: impl Iterator<Item = rusqlite::Result<String>>,
-) -> Result<Vec<RunEvent>, StoreError> {
-    let mut events = Vec::new();
-    for json in rows {
-        let record: FactoryRecord = serde_json::from_str(&json?)?;
-        match record.body {
-            FactoryBody::RunEvent(event) => events.push(event),
-            other => return Err(wrong_kind("run_event", &other)),
-        }
+/// The lowest run event key in [`?1`, `?2`), or NULL with none: one seek of the primary key,
+/// which finds the next writer of a run without visiting the rows of the writer before it.
+const WRITER_PROBE: &str = "SELECT MIN(id) FROM factory_records WHERE kind = 'run_event' \
+     AND id >= ?1 AND id < ?2";
+
+/// The run events in [`?1`, `?2`), one writer's keys of one run, lowest version first.
+const EVENTS_OF_WRITER: &str = "SELECT version, record FROM factory_records \
+     WHERE kind = 'run_event' AND id >= ?1 AND id < ?2 ORDER BY version";
+
+/// The run events in [`?1`, `?2`) that `?3` stored above version `?4`, lowest version first.
+/// Read by the writer's index, so only the records `?3` stored above `?4`, of any run or kind,
+/// are visited, never the rows of the run below it.
+const EVENTS_OF_WRITER_ABOVE: &str = "SELECT version, record FROM factory_records \
+     INDEXED BY factory_records_by_owner \
+     WHERE owner = ?3 AND version > ?4 AND kind = 'run_event' AND id >= ?1 AND id < ?2 \
+     ORDER BY version";
+
+/// Whether a run event in [`?1`, `?2`) is named `?3`. No index holds the event name, so SQLite
+/// reads the rows of the range in key order until one is named `?3`, all of them when none is;
+/// only the yes or no comes back.
+const HAS_EVENT: &str = "SELECT EXISTS (SELECT 1 FROM factory_records WHERE kind = 'run_event' \
+     AND id >= ?1 AND id < ?2 AND json_extract(record, '$.body.event') IS ?3)";
+
+/// The run event stored as `json`. A row that holds another kind of record is an error.
+fn run_event(json: &str) -> Result<RunEvent, StoreError> {
+    let record: FactoryRecord = serde_json::from_str(json)?;
+    counted::add(1);
+    match record.body {
+        FactoryBody::RunEvent(event) => Ok(event),
+        other => Err(wrong_kind("run_event", &other)),
     }
-    counted::add(events.len());
-    Ok(events)
-}
-
-/// The run event keys of `repo` (`owner/name`, in any case), as the repo a run id folds it to
-/// and a range of ids that holds every one of them; `None` for a repo that is not a legal one.
-///
-/// A run event's id is `<run>/<owner>/<version>`, and every run of the repo starts with
-/// `<owner>__<name>__`, so the keys lie in [prefix, prefix with its last `_` raised to the
-/// next character, a backtick). The range is not exact (a repo name may hold `__`, so `a/b`
-/// also reaches the runs of `a/b__c`), so the repo of each run read is still checked.
-fn repo_range(repo: &str) -> Option<(String, String, String)> {
-    // Normalise as a run id does, so the argument folds exactly as stored repos did.
-    let probe = RunId::new(repo, 0, 0).ok()?;
-    let prefix = probe.to_string();
-    let prefix = &prefix[..prefix.len() - "0__0".len()];
-    let to = format!("{}`", &prefix[..prefix.len() - 1]);
-    Some((probe.repo().to_owned(), prefix.to_owned(), to))
-}
-
-/// The run ids among `rows`, each the text of a run event id up to its first `/`, that are of
-/// `repo`, once each and in order.
-fn runs_among(
-    rows: impl Iterator<Item = rusqlite::Result<String>>,
-    repo: &str,
-) -> Result<Vec<RunId>, StoreError> {
-    let mut runs = BTreeSet::new();
-    for text in rows {
-        let text = text?;
-        let run: RunId = text.parse().map_err(|e: String| {
-            rusqlite::Error::FromSqlConversionFailure(0, Type::Text, e.into())
-        })?;
-        if run.repo() == repo {
-            runs.insert(run);
-        }
-    }
-    Ok(runs.into_iter().collect())
 }
 
 impl Store {
@@ -199,79 +180,122 @@ impl Store {
              ORDER BY json_extract(record, '$.body.generation'), version, owner",
         )?;
         let rows = query.query_map(params![from, to], |row| row.get::<_, String>(0))?;
-        run_events_of(rows)
+        let mut events = Vec::new();
+        for json in rows {
+            events.push(run_event(&json?)?);
+        }
+        Ok(events)
     }
 
-    /// The events of `run` named `event`, from every writer, in the order of
-    /// [`run_events`](Self::run_events). Only those rows are handed back and parsed.
-    pub fn run_events_named(&self, run: &RunId, event: &str) -> Result<Vec<RunEvent>, StoreError> {
-        let (from, to) = range(&run.to_string());
-        let mut query = self.conn.prepare_cached(
-            "SELECT record FROM factory_records WHERE kind = 'run_event' AND id >= ?1 AND id < ?2 \
-             AND json_extract(record, '$.body.event') IS ?3 \
-             ORDER BY json_extract(record, '$.body.generation'), version, owner",
-        )?;
-        let rows = query.query_map(params![from, to, event], |row| row.get::<_, String>(0))?;
-        run_events_of(rows)
+    /// The machines that wrote an event of `run`, each once, in the order of their ids. Read
+    /// from the keys alone, one seek per writer, so a run's history is never visited and a row
+    /// whose record cannot be read still names its writer.
+    pub fn run_writers(&self, run: &RunId) -> Result<Vec<MachineId>, StoreError> {
+        let run = run.to_string();
+        let (mut from, to) = range(&run);
+        let mut query = self.conn.prepare_cached(WRITER_PROBE)?;
+        let mut writers = Vec::new();
+        while let Some(id) =
+            query.query_row(params![from, to], |row| row.get::<_, Option<String>>(0))?
+        {
+            counted::add(1);
+            // `<run>/<owner>/<version>`: the writer is the part after the run's `/`, up to the
+            // next one. The next writer's keys start above `<run>/<owner>0`, since `0` is the
+            // character after `/`.
+            let rest = &id[run.len() + 1..];
+            let owner = rest.split('/').next().unwrap_or(rest);
+            writers.push(parse_machine(0, owner)?);
+            from = format!("{run}/{owner}0");
+        }
+        Ok(writers)
     }
 
-    /// The first event of `run` in the order of [`run_events`](Self::run_events), or `None`
-    /// for a run with none. Only that row is handed back and parsed.
-    pub fn first_run_event(&self, run: &RunId) -> Result<Option<RunEvent>, StoreError> {
-        let (from, to) = range(&run.to_string());
-        let mut query = self.conn.prepare_cached(
-            "SELECT record FROM factory_records WHERE kind = 'run_event' AND id >= ?1 AND id < ?2 \
-             ORDER BY json_extract(record, '$.body.generation'), version, owner LIMIT 1",
-        )?;
-        let rows = query.query_map(params![from, to], |row| row.get::<_, String>(0))?;
-        Ok(run_events_of(rows)?.pop())
+    /// The events of `run` that `writer` stored, each with its version, lowest version first:
+    /// all of them when `above` is `None`, else only those above version `above`.
+    ///
+    /// Above a version, the read goes by the writer's index, so it visits only the records the
+    /// writer stored since that version and never the run's history below it. A writer's
+    /// records are stored in the order of their versions, on its own machine and on each one
+    /// it syncs to, so none of this run's events can arrive later below `above`. A row this
+    /// build cannot parse is an error, never skipped.
+    pub fn run_events_by(
+        &self,
+        run: &RunId,
+        writer: MachineId,
+        above: Option<u64>,
+    ) -> Result<Vec<(u64, RunEvent)>, StoreError> {
+        let (from, to) = range(&format!("{run}/{writer}"));
+        let row = |row: &rusqlite::Row<'_>| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?));
+        let rows: Vec<(i64, String)> = match above {
+            None => self
+                .conn
+                .prepare_cached(EVENTS_OF_WRITER)?
+                .query_map(params![from, to], row)?
+                .collect::<Result<_, _>>()?,
+            Some(version) => {
+                // Nothing stored is above i64::MAX, so a larger `version` correctly finds nothing.
+                let version = i64::try_from(version).unwrap_or(i64::MAX);
+                self.conn
+                    .prepare_cached(EVENTS_OF_WRITER_ABOVE)?
+                    .query_map(params![from, to, writer.to_string(), version], row)?
+                    .collect::<Result<_, _>>()?
+            }
+        };
+        rows.into_iter()
+            .map(|(version, json)| Ok((from_sql(version), run_event(&json)?)))
+            .collect()
     }
 
-    /// Whether any writer has stored a `finished` event of `run`, whatever its data. No event
-    /// is handed back: the store answers yes or no.
-    pub fn run_finished(&self, run: &RunId) -> Result<bool, StoreError> {
+    /// Whether any writer has stored an event of `run` named `event`, whatever its data. The
+    /// store answers yes or no and hands back no row of the run, though it reads the run's rows
+    /// up to the first one so named ([`HAS_EVENT`]). A row whose record is not JSON is an error;
+    /// one that is JSON but not a run event this build reads names no event.
+    pub fn run_has_event(&self, run: &RunId, event: &str) -> Result<bool, StoreError> {
         let (from, to) = range(&run.to_string());
-        let mut query = self.conn.prepare_cached(
-            "SELECT EXISTS (SELECT 1 FROM factory_records WHERE kind = 'run_event' \
-             AND id >= ?1 AND id < ?2 AND json_extract(record, '$.body.event') IS 'finished')",
-        )?;
-        Ok(query.query_row(params![from, to], |row| row.get(0))?)
+        let mut query = self.conn.prepare_cached(HAS_EVENT)?;
+        Ok(query.query_row(params![from, to, event], |row| row.get(0))?)
     }
 
     /// Every run of `repo` (`owner/name`, in any case) that has an event, once each, in order.
     /// A repo that is not a legal one has no runs.
     pub fn runs_of(&self, repo: &str) -> Result<Vec<RunId>, StoreError> {
-        let Some((repo, from, to)) = repo_range(repo) else {
+        // Normalise as a run id does, so the argument folds exactly as stored repos did.
+        let Ok(probe) = RunId::new(repo, 0, 0) else {
             return Ok(Vec::new());
         };
-        // A run id holds no `/`, so the run is the id up to its first `/`: no record is parsed.
+        let repo = probe.repo();
+        // A run event's id is `<run>/<owner>/<version>`, and a run id holds no `/`, so the run
+        // is the id up to its first `/`: no record is parsed. Every run of the repo starts with
+        // `<owner>__<name>__`, so the keys lie in [prefix, prefix with its last `_` raised to
+        // the next character, a backtick). The range is not exact (a repo name may hold `__`,
+        // so `a/b` also reaches the runs of `a/b__c`), so the repo of each run is still checked.
+        let prefix = probe.to_string();
+        let prefix = &prefix[..prefix.len() - "0__0".len()];
+        let from = prefix.to_owned();
+        let to = format!("{}`", &prefix[..prefix.len() - 1]);
         let mut query = self.conn.prepare_cached(
             "SELECT DISTINCT substr(id, 1, instr(id, '/') - 1) FROM factory_records
              WHERE kind = 'run_event' AND id >= ?1 AND id < ?2",
         )?;
         let rows = query.query_map(params![from, to], |row| row.get::<_, String>(0))?;
-        runs_among(rows, &repo)
+        let mut runs = BTreeSet::new();
+        for text in rows {
+            let text = text?;
+            counted::add(1);
+            let run: RunId = text.parse().map_err(|e: String| {
+                rusqlite::Error::FromSqlConversionFailure(0, Type::Text, e.into())
+            })?;
+            if run.repo() == repo {
+                runs.insert(run);
+            }
+        }
+        Ok(runs.into_iter().collect())
     }
 
-    /// The runs of `repo` that [`runs_of`](Self::runs_of) gives, less those with a `finished`
-    /// event from any writer, in order. No event is handed back, so a finished run's history is
-    /// never read; a run none of whose rows this build can read as `finished` is kept.
-    pub fn unfinished_runs_of(&self, repo: &str) -> Result<Vec<RunId>, StoreError> {
-        let Some((repo, from, to)) = repo_range(repo) else {
-            return Ok(Vec::new());
-        };
-        let mut query = self.conn.prepare_cached(
-            "SELECT substr(id, 1, instr(id, '/') - 1) AS run FROM factory_records
-             WHERE kind = 'run_event' AND id >= ?1 AND id < ?2
-             GROUP BY run HAVING SUM(json_extract(record, '$.body.event') IS 'finished') = 0",
-        )?;
-        let rows = query.query_map(params![from, to], |row| row.get::<_, String>(0))?;
-        runs_among(rows, &repo)
-    }
-
-    /// How many run events the reads of this thread have handed back so far.
+    /// How many run event rows the reads of this thread have handed back so far, as events
+    /// or as ids. A yes or no, such as [`run_has_event`](Self::run_has_event), counts none.
     #[cfg(test)]
-    pub fn run_events_read() -> usize {
+    pub fn run_rows_read() -> usize {
         counted::read()
     }
 
@@ -620,12 +644,17 @@ mod tests {
             .conn
             .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
             .unwrap();
-        let rows = query.query_map([], |row| row.get::<_, String>(3)).unwrap();
+        let unbound = vec![rusqlite::types::Null; query.parameter_count()];
+        let rows = query
+            .query_map(rusqlite::params_from_iter(unbound), |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap();
         rows.map(Result::unwrap).collect()
     }
 
     #[test]
-    fn the_reads_of_a_writes_catch_up_seek_an_index_and_never_scan_the_table() {
+    fn the_reads_of_a_runs_rows_seek_an_index_and_never_scan_the_table() {
         let (_dir, store) = open();
         for sql in [
             WRITER_PROBE,
@@ -641,7 +670,9 @@ mod tests {
                 "{sql}: {steps:?}"
             );
             assert!(
-                !steps.iter().any(|step| step.starts_with("SCAN")),
+                !steps
+                    .iter()
+                    .any(|step| step.starts_with("SCAN factory_records")),
                 "{sql}: {steps:?}"
             );
         }

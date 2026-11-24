@@ -5,7 +5,7 @@
 //! wall-clock time of each run's first line; nothing here orders by wall-clock time, so runs
 //! are listed by run id: the repo, then the issue and the attempt as numbers. A run whose
 //! events the store holds but this build cannot read is still listed, flagged `unreadable`,
-//! after the others.
+//! after the others, unless it has a `finished` event.
 //!
 //! The runner's progress read (`runner/progress.ts`, `Seen`) is not ported yet; the few facts
 //! of it a listing needs are read here, by the runner's rules.
@@ -168,24 +168,18 @@ fn unreadable(id: RunId) -> RunInfo {
     }
 }
 
-/// The unfinished runs among `ids`, each run's events got from `read`, unreadable ones last.
-///
-/// `ids` are the runs the store holds no `finished` event of, so no finished run's events are
-/// read, as the runner reads only a finished file's tail. A run that finishes after `ids` were
-/// read is still left out here, by its events.
+/// The unfinished runs among `ids`, unreadable ones last. `read` gives each run's events, or
+/// `None` for a finished run, whose events are then never read, as the runner reads only a
+/// finished file's tail.
 fn unfinished(
     ids: Vec<RunId>,
-    read: impl Fn(&RunId) -> Result<Vec<RunEvent>, StoreError>,
+    read: impl Fn(&RunId) -> Result<Option<Vec<RunEvent>>, StoreError>,
 ) -> Vec<RunInfo> {
     let (mut readable, mut rest) = (Vec::new(), Vec::new());
     for id in ids {
         match read(&id) {
-            Ok(events) => {
-                let facts = Facts::of(&events);
-                if !facts.finished {
-                    readable.push(facts.info(id));
-                }
-            }
+            Ok(None) => {}
+            Ok(Some(events)) => readable.push(Facts::of(&events).info(id)),
             Err(error) => {
                 tracing::warn!(run = %id, %error, "a run whose events cannot be read is listed as unreadable");
                 rest.push(unreadable(id));
@@ -205,13 +199,24 @@ fn locked(store: &Mutex<Store>) -> MutexGuard<'_, Store> {
 /// any whose events cannot be read last.
 ///
 /// The store's lock is shared by the whole daemon and a repo's history only grows, so a listing
-/// takes it for one read at a time: the ids of the runs with no `finished` event, then each of
-/// those runs' events, so a finished run's events are never read. Each run's events are
+/// takes it for one read at a time: the run ids, then each run's events. Each run's events are
 /// read whole under one lock; a run that gains an event or first appears after its read is
 /// seen as it is by the next listing. The same holds for [`issue_runs`] and [`summaries`].
+///
+/// Under that same lock the store is first asked whether the run has a `finished` event, and
+/// a finished run's events are not read at all. A run whose rows cannot be read, for the
+/// question or for its events, is listed as unreadable on its own.
 pub fn runs(store: &Mutex<Store>, repo: &str) -> Result<Vec<RunInfo>, StoreError> {
-    let ids = locked(store).unfinished_runs_of(repo)?;
-    Ok(unfinished(ids, |id| events(&locked(store), id)))
+    let ids = locked(store).runs_of(repo)?;
+    Ok(unfinished(ids, |id| unless_finished(&locked(store), id)))
+}
+
+/// The events of `run`, or `None` when it has a `finished` event, read under one lock.
+fn unless_finished(store: &Store, run: &RunId) -> Result<Option<Vec<RunEvent>>, StoreError> {
+    if store.run_has_event(run, names::FINISHED)? {
+        return Ok(None);
+    }
+    events(store, run).map(Some)
 }
 
 /// The unfinished runs of `issue` in `repo`, as [`runs`] lists them. Only that issue's runs
@@ -221,8 +226,8 @@ pub fn issue_runs(
     repo: &str,
     issue: u64,
 ) -> Result<Vec<RunInfo>, StoreError> {
-    let ids = of_issue(locked(store).unfinished_runs_of(repo)?, issue);
-    Ok(unfinished(ids, |id| events(&locked(store), id)))
+    let ids = of_issue(locked(store).runs_of(repo)?, issue);
+    Ok(unfinished(ids, |id| unless_finished(&locked(store), id)))
 }
 
 /// The runs among `ids` of `issue`.

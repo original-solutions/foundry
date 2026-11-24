@@ -16,6 +16,7 @@
 //! [`Hide`], which hides the secrets this machine holds, and only then is it cut: each text of
 //! the data to its last [`OUTPUT_LIMIT`] bytes, and the cause's as the runner cuts them.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -23,7 +24,7 @@ use foundry_proto::factory::{FactoryBody, FactoryRecord, RunEvent, RunId};
 use foundry_proto::ids::MachineId;
 use serde_json::Value;
 
-use crate::store::{Store, StoreError};
+use crate::store::{Applied, Store, StoreError};
 
 use events::{Cause, Event, Outcome, PrEnd, names};
 
@@ -63,7 +64,8 @@ pub enum LedgerError {
 }
 
 /// Writes a run's events as this machine's `run_event` records, under the lease generation it
-/// was given. Cheap to clone: every clone writes to the same store.
+/// was given. Cheap to clone: every clone writes to the same store, and shares what the ledger
+/// has read of each run.
 #[derive(Clone)]
 pub struct Ledger {
     store: Arc<Mutex<Store>>,
@@ -71,6 +73,57 @@ pub struct Ledger {
     generation: u64,
     hide: Hide,
     wall: WallClock,
+    seen: Arc<Mutex<BTreeMap<RunId, Seen>>>,
+}
+
+/// What a ledger has read of one run's events: all a write needs, so the run's history is read
+/// once and each later write reads only what was stored since.
+///
+/// A stored run event never changes or goes (its key holds its writer and version), and each
+/// writer's events are stored in the order of their versions, so what was read stays true and
+/// the highest version read of each writer is where its next read starts. The writers are
+/// looked for again on every read, so a `finished` event that another machine wrote, synced in
+/// since, is seen.
+#[derive(Default)]
+struct Seen {
+    /// The highest version read of each writer's events of the run.
+    read_to: BTreeMap<MachineId, u64>,
+    /// The run has its `finished` event, whatever its data.
+    finished: bool,
+    /// The run's first event, by generation, then version, then writer, as the store orders
+    /// them: that order and the event's time.
+    first: Option<((u64, u64, String), u64)>,
+    /// The distinct attempts of the run's `gate_command` events that read whole.
+    gate_attempts: BTreeSet<u32>,
+}
+
+impl Seen {
+    /// Takes in `event`, which `writer` stored at `version`.
+    fn take(&mut self, writer: MachineId, version: u64, event: &RunEvent) {
+        let read_to = self.read_to.entry(writer).or_insert(version);
+        *read_to = (*read_to).max(version);
+        self.finished |= event.event == names::FINISHED;
+        let order = (event.generation, version, writer.to_string());
+        if self.first.as_ref().is_none_or(|(first, _)| order < *first) {
+            self.first = Some((order, event.ms));
+        }
+        if let Some(attempt) = gate_attempt(event) {
+            self.gate_attempts.insert(attempt);
+        }
+    }
+
+    /// Reads into this what `store` holds of `run` that has not been read yet: every event of
+    /// a writer not read before, and each other writer's events above the highest version
+    /// read. A row this build cannot read is an error, and nothing of its writer is taken.
+    fn catch_up(&mut self, store: &Store, run: &RunId) -> Result<(), StoreError> {
+        for writer in store.run_writers(run)? {
+            let above = self.read_to.get(&writer).copied();
+            for (version, event) in store.run_events_by(run, writer, above)? {
+                self.take(writer, version, &event);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Ledger {
@@ -83,6 +136,7 @@ impl Ledger {
             generation,
             hide,
             wall: Arc::new(system_ms),
+            seen: Arc::default(),
         }
     }
 
@@ -128,22 +182,25 @@ impl Ledger {
         let cause = serde_json::to_value(cause.cleaned_with(&*self.hide))
             .expect("a cause is an object of strings and a number");
         // The lock is held from the read to the write, so this machine's own writes of one
-        // run never cross.
-        // Only what the write needs is read, never the run's whole history: whether any writer,
-        // this machine or one whose events synced in, stored its `finished` event, and for a
-        // `finished` event the run's first event and its gate commands.
+        // run never cross. What the ledger has read of the run is locked inside it, always in
+        // that order.
         let mut store = self.lock();
+        let mut runs = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+        let seen = runs.entry(run.clone()).or_default();
+        // Only the events stored since the ledger last read the run are read, so a write does
+        // not read the run's whole history again.
+        seen.catch_up(&store, run)?;
         // A `finished` event ends the run even when its data cannot be read.
-        if store.run_finished(run)? {
+        if seen.finished {
             return Err(LedgerError::AlreadyFinished { run: run.clone() });
         }
         let ms = (self.wall)();
         // Two numbers, which need no hiding.
         if let (Event::Finished { .. }, Value::Object(fields)) = (event, &mut data) {
-            let first = store.first_run_event(run)?.map_or(ms, |event| event.ms);
-            let gates = store.run_events_named(run, names::GATE_COMMAND)?;
+            let first = seen.first.as_ref().map_or(ms, |(_, first)| *first);
+            let attempts = u32::try_from(seen.gate_attempts.len()).unwrap_or(u32::MAX);
             fields.insert("total_ms".into(), ms.saturating_sub(first).into());
-            fields.insert("gate_attempts".into(), gate_attempts(&gates).into());
+            fields.insert("gate_attempts".into(), attempts.into());
         }
         let written = RunEvent {
             run: run.clone(),
@@ -154,12 +211,15 @@ impl Ledger {
             data,
             cause: Some(cause),
         };
+        let version = store.own_next_factory_version()?;
         let record = FactoryRecord {
             owner: self.me,
-            version: store.own_next_factory_version()?,
+            version,
             body: FactoryBody::RunEvent(written.clone()),
         };
-        store.apply_factory(&record, self.me)?;
+        if store.apply_factory(&record, self.me)? == Applied::Stored {
+            seen.take(self.me, version, &written);
+        }
         Ok(written)
     }
 
@@ -187,21 +247,17 @@ impl Ledger {
     }
 }
 
-/// The distinct attempts among `events`' `gate_command` events. Only one that reads whole as
-/// its typed event counts, as only one the runner's reader reads whole does: an attempt that
-/// is a u32, a command, an exit code that is an i32 and a duration that is a u64.
-fn gate_attempts(events: &[RunEvent]) -> u32 {
-    let attempts: std::collections::BTreeSet<u32> = events
-        .iter()
-        .filter(|event| event.event == names::GATE_COMMAND)
-        .filter_map(
-            |event| match Event::from_parts(&event.event, &event.data)? {
-                Event::GateCommand { attempt, .. } => Some(attempt),
-                _ => None,
-            },
-        )
-        .collect();
-    u32::try_from(attempts.len()).unwrap_or(u32::MAX)
+/// The attempt of `event` when it is a `gate_command` that reads whole as its typed event, as
+/// only one the runner's reader reads whole counts: an attempt that is a u32, a command, an exit
+/// code that is an i32 and a duration that is a u64.
+fn gate_attempt(event: &RunEvent) -> Option<u32> {
+    if event.event != names::GATE_COMMAND {
+        return None;
+    }
+    match Event::from_parts(&event.event, &event.data)? {
+        Event::GateCommand { attempt, .. } => Some(attempt),
+        _ => None,
+    }
 }
 
 /// Every text in `value` through `hide`, then cut to its last [`OUTPUT_LIMIT`] bytes. Hiding
