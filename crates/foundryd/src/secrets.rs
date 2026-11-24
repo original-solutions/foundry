@@ -738,8 +738,8 @@ mod tests {
         );
     }
 
-    /// A quote with no `@` after it still ends a URL, so a URL quoted right after it is read as
-    /// one and its password hidden.
+    /// The next `://` ends a URL's authority, so a URL quoted right after another is read as one
+    /// and its password hidden.
     #[test]
     fn redact_hides_the_password_of_a_url_quoted_right_after_another() {
         assert_eq!(
