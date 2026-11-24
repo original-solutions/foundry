@@ -4,11 +4,12 @@
 //! alike. Ported from the writing half of the runner's `src/tracker/github.ts`. Every comment
 //! body goes through the tracker's hider ([`Tracker::hide`]) and then [`text::for_comment`], and
 //! the factory's own marker is added after both, since `for_comment` would hide the run id and
-//! the machine id in a claim marker.
+//! the machine id in a claim marker. Only a tracker built with a hider posts: see
+//! [`Commenting`].
 //!
-//! A claim is Foundry's when the newest claim comment on the issue carries Foundry's marker,
-//! `<!-- foundry:claim <run id> <machine> -->`, as its last line and was written by the
-//! project's login ([`newest_claim`]). Any other claim, the runner's
+//! A claim marker counts only in a comment by the project's login. The issue is Foundry's when
+//! the newest such comment carries Foundry's marker, `<!-- foundry:claim <run id> <machine> -->`,
+//! as its last line ([`newest_claim`]). Any other claim, the runner's
 //! `<!-- softfac:claim <machine> -->` among them, belongs to another factory.
 
 use std::str::FromStr;
@@ -18,14 +19,15 @@ use foundry_proto::ids::MachineId;
 use serde::Deserialize;
 
 use super::read::{gh_json, gh_pages, pull_request};
-use super::{OtherKind, Tracker, TrackerError};
+use super::{Commenting, OtherKind, Tracker, TrackerError};
 use crate::factory::lifecycle::State;
 use crate::factory::text;
 
 /// Ends every comment the factory posts, so it can tell its own comments from instructors'.
 pub const MARKER: &str = "<!-- softfac -->";
 
-/// Ends the issue's one status comment in place of [`MARKER`], as the runner's does.
+/// Ends the issue's one status comment in place of [`MARKER`]. It is the runner's marker, so on
+/// a login the runner also used, Foundry takes over the runner's status comment and keeps it.
 pub const STATUS_MARKER: &str = "<!-- softfac:status -->";
 
 /// How Foundry's claim marker starts: `<!-- foundry:claim <run id> <machine> -->`.
@@ -40,18 +42,15 @@ const MARKER_END: &str = " -->";
 /// What Foundry's claim comment says above its marker. Fixed words: nothing in them is hidden.
 const CLAIM_TEXT: &str = "Claimed by Foundry.";
 
-/// The comment authors GitHub reports as able to work the repo, whose claim comments count
-/// beside the project's login's own, as the runner counts them.
-const CLAIM_ASSOCIATIONS: [&str; 3] = ["OWNER", "MEMBER", "COLLABORATOR"];
-
 /// `body` and then `marker`, after a blank line.
 fn with_marker(body: &str, marker: &str) -> String {
     format!("{body}\n\n{marker}")
 }
 
-/// `body` as a comment may carry it: through the tracker's hider and then
-/// [`text::for_comment`], and then `marker` after both.
-fn comment_body<G: Tracker + ?Sized>(gh: &G, body: &str, marker: &str) -> String {
+/// `body` as a comment may carry it: through the tracker's hider, then [`text::for_comment`],
+/// then `marker` after both. The hider runs first, so a secret it knows goes whole before
+/// `for_comment` can hide part of it and leave the rest unrecognised.
+fn comment_body<G: Commenting + ?Sized>(gh: &G, body: &str, marker: &str) -> String {
     with_marker(&text::for_comment(&gh.hide(body)), marker)
 }
 
@@ -155,10 +154,6 @@ pub struct IssueComment {
     pub id: u64,
     /// Its author's login; `None` for a deleted account.
     pub author: Option<String>,
-    /// How GitHub says the author relates to the repo, e.g. `MEMBER`; empty when not given.
-    pub association: String,
-    /// When GitHub made it, as GitHub writes it; empty when not given.
-    pub created_at: String,
     pub body: String,
 }
 
@@ -167,10 +162,6 @@ struct CommentRow {
     id: u64,
     #[serde(default)]
     user: Option<UserRow>,
-    #[serde(default)]
-    author_association: Option<String>,
-    #[serde(default)]
-    created_at: Option<String>,
     #[serde(default)]
     body: Option<String>,
 }
@@ -202,15 +193,13 @@ pub fn issue_comments<G: Tracker + ?Sized>(
         .map(|row| IssueComment {
             id: row.id,
             author: row.user.map(|user| user.login),
-            association: row.author_association.unwrap_or_default(),
-            created_at: row.created_at.unwrap_or_default(),
             body: row.body.unwrap_or_default(),
         })
         .collect())
 }
 
 /// Posts a comment on the issue, hidden, ending with [`MARKER`].
-pub fn post_comment<G: Tracker + ?Sized>(
+pub fn post_comment<G: Commenting + ?Sized>(
     gh: &G,
     repo: &str,
     issue: u64,
@@ -222,7 +211,7 @@ pub fn post_comment<G: Tracker + ?Sized>(
 }
 
 /// Posts a comment on pull request `pr`, hidden, ending with [`MARKER`].
-pub fn comment_on_pr<G: Tracker + ?Sized>(
+pub fn comment_on_pr<G: Commenting + ?Sized>(
     gh: &G,
     repo: &str,
     pr: u64,
@@ -237,7 +226,7 @@ pub fn comment_on_pr<G: Tracker + ?Sized>(
 /// `login`'s existing one in place, or posts it. Only a comment by `login`, matched ignoring
 /// ASCII case, that ends with the status marker counts, so nobody else can take it over. A
 /// list and then a write, so two callers at once could still post two.
-pub fn upsert_status_comment<G: Tracker + ?Sized>(
+pub fn upsert_status_comment<G: Commenting + ?Sized>(
     gh: &G,
     repo: &str,
     issue: u64,
@@ -298,7 +287,7 @@ pub fn claim_comment(run: &RunId, machine: &MachineId) -> String {
 
 /// Posts Foundry's claim comment for `run` on `machine`. Its words go through the hider and
 /// [`text::for_comment`] like any comment's; its marker is added after them, whole.
-pub fn post_claim<G: Tracker + ?Sized>(
+pub fn post_claim<G: Commenting + ?Sized>(
     gh: &G,
     repo: &str,
     issue: u64,
@@ -347,31 +336,28 @@ fn parse_foundry_claim(named: &str) -> Option<(RunId, MachineId)> {
 
 /// Whose the issue is by its newest claim comment, or `None` when it has none.
 ///
-/// A claim comment is one whose last line is a claim marker, Foundry's or the runner's, written
-/// by `login` (ignoring ASCII case) or by someone GitHub says can work the repo, as the runner
-/// counts them; anyone else's marker counts for nothing. The newest is the one with the highest
-/// id, never by time. It is Foundry's only when it carries Foundry's marker, the marker parses,
-/// and `login` wrote it: a marker by any other login is another factory's.
+/// A claim comment is one by `login`, matched ignoring ASCII case, whose last line is a claim
+/// marker, Foundry's or the runner's. A marker in anyone else's comment counts for nothing, so
+/// nobody else can take a claim from Foundry or hand one to it. The newest is the one with the
+/// highest id, never by time. It is Foundry's when it carries Foundry's marker and the marker
+/// parses; any other is another factory's.
+///
+/// The run a Foundry claim names is as the comment says: the caller checks that it is a run of
+/// the issue it read the comments of.
 pub fn newest_claim(comments: &[IssueComment], login: &str) -> Option<Claim> {
-    let by_login = |comment: &IssueComment| {
-        comment
-            .author
-            .as_deref()
-            .is_some_and(|author| author.eq_ignore_ascii_case(login))
-    };
     let (comment, marker) = comments
         .iter()
-        .filter(|comment| comment.author.is_some())
         .filter(|comment| {
-            by_login(comment) || CLAIM_ASSOCIATIONS.contains(&comment.association.as_str())
+            comment
+                .author
+                .as_deref()
+                .is_some_and(|author| author.eq_ignore_ascii_case(login))
         })
         .filter_map(|comment| claim_marker_of(&comment.body).map(|marker| (comment, marker)))
         .max_by_key(|(comment, _)| comment.id)?;
     Some(match marker {
-        Marker::Foundry(Some((run, machine))) if by_login(comment) => {
-            Claim::Foundry { run, machine }
-        }
-        _ => Claim::Foreign {
+        Marker::Foundry(Some((run, machine))) => Claim::Foundry { run, machine },
+        Marker::Foundry(None) | Marker::Runner => Claim::Foreign {
             comment_id: comment.id,
         },
     })

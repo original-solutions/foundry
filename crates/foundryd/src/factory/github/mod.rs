@@ -6,10 +6,11 @@
 //! and a test scripts the fake by the `gh` arguments as the runner's tests script `gh`. Ported
 //! from the runner's `src/tracker/github.ts` and `src/tracker/approvalHistory.ts`.
 //!
-//! Every comment body goes through [`Tracker::hide`] and then `text::for_comment` before it is
-//! posted, and the factory's own markers are added after both. A tracker is built with its hider
-//! by [`Hiding`]: the factory builds its tracker with one that calls `secrets::hide_known` on
-//! the machine's store.
+//! Only a tracker built with a hider can post a comment: the comment writes are on
+//! [`Commenting`], which [`Hiding`] implements and a bare [`Gh`] or [`FakeTracker`] does not.
+//! Every comment body goes through the hider and then `text::for_comment`, and the factory's
+//! own markers are added after both. The factory builds its tracker with a hider that calls
+//! `secrets::hide_known` on the machine's store.
 
 pub mod fake;
 pub mod gh;
@@ -40,7 +41,7 @@ pub use write::{
 pub type Hider = Arc<dyn Fn(&str) -> String + Send + Sync>;
 
 /// A tracker built with a hider: `gh` as the tracker it wraps, and every comment body through
-/// the wrapped tracker's own hiding and then the hider.
+/// the hider.
 pub struct Hiding {
     tracker: Arc<dyn Tracker>,
     hider: Hider,
@@ -63,9 +64,11 @@ impl Tracker for Hiding {
     fn gh(&self, args: &[String]) -> Result<String, TrackerError> {
         self.tracker.gh(args)
     }
+}
 
+impl Commenting for Hiding {
     fn hide(&self, text: &str) -> String {
-        (self.hider)(&self.tracker.hide(text))
+        (self.hider)(text)
     }
 }
 
@@ -115,14 +118,6 @@ pub enum OtherKind {
 pub trait Tracker: Send + Sync {
     /// Runs `gh` once with `args` and answers its stdout, or why it gave none.
     fn gh(&self, args: &[String]) -> Result<String, TrackerError>;
-
-    /// `text` with the secrets this tracker knows hidden, before it goes into a comment. A
-    /// tracker built without a hider knows none and gives `text` as it is: `text::for_comment`,
-    /// which every comment body goes through after this, still hides URL passwords and every
-    /// long word of letters and digits. [`Hiding`] builds a tracker with a hider.
-    fn hide(&self, text: &str) -> String {
-        text.to_string()
-    }
 
     /// The open issues with the state's label, at most [`read::LIST_LIMIT`].
     fn list_issues(&self, repo: &str, state: State) -> Result<Listing<IssueSummary>, TrackerError> {
@@ -251,39 +246,6 @@ pub trait Tracker: Send + Sync {
         write::unassign(self, repo, issue, login)
     }
 
-    /// Posts a comment on the issue, hidden, ending with [`MARKER`].
-    fn post_comment(&self, repo: &str, issue: u64, body: &str) -> Result<(), TrackerError> {
-        write::post_comment(self, repo, issue, body)
-    }
-
-    /// Posts a comment on pull request `pr`, hidden, ending with [`MARKER`].
-    fn comment_on_pr(&self, repo: &str, pr: u64, body: &str) -> Result<(), TrackerError> {
-        write::comment_on_pr(self, repo, pr, body)
-    }
-
-    /// Writes the issue's one status comment, hidden, ending with [`STATUS_MARKER`]: edits
-    /// `login`'s own in place, or posts it.
-    fn upsert_status_comment(
-        &self,
-        repo: &str,
-        issue: u64,
-        login: &str,
-        body: &str,
-    ) -> Result<(), TrackerError> {
-        write::upsert_status_comment(self, repo, issue, login, body)
-    }
-
-    /// Posts Foundry's claim comment for `run` on `machine`: [`claim_comment`].
-    fn post_claim(
-        &self,
-        repo: &str,
-        issue: u64,
-        run: &RunId,
-        machine: &MachineId,
-    ) -> Result<(), TrackerError> {
-        write::post_claim(self, repo, issue, run, machine)
-    }
-
     /// Every comment on the issue, in the order GitHub lists them, for [`newest_claim`].
     fn issue_comments(&self, repo: &str, issue: u64) -> Result<Vec<IssueComment>, TrackerError> {
         write::issue_comments(self, repo, issue)
@@ -319,5 +281,63 @@ pub trait Tracker: Send + Sync {
     /// done.
     fn mark_pr_draft(&self, repo: &str, pr: u64) -> Result<(), TrackerError> {
         write::mark_pr_draft(self, repo, pr)
+    }
+}
+
+/// A tracker that may post comments: one built with a hider. Every body goes through
+/// [`Commenting::hide`] and then `text::for_comment`, and the marker is added after both. In the
+/// daemon only [`Hiding`] implements it, so a tracker built without a hider cannot post:
+///
+/// ```compile_fail
+/// use foundryd::factory::github::{Commenting, FakeTracker};
+///
+/// FakeTracker::new().post_comment("o/r", 1, "x").unwrap_err();
+/// ```
+///
+/// Built with one, it can:
+///
+/// ```
+/// use std::sync::Arc;
+///
+/// use foundryd::factory::github::{Commenting, FakeTracker, Hiding};
+///
+/// let tracker = Hiding::new(Arc::new(FakeTracker::new()), Arc::new(|text: &str| text.to_string()));
+/// tracker.post_comment("o/r", 1, "x").unwrap_err();
+/// ```
+pub trait Commenting: Tracker {
+    /// `text` with the secrets this tracker's hider knows hidden, before it goes into a comment.
+    fn hide(&self, text: &str) -> String;
+
+    /// Posts a comment on the issue, hidden, ending with [`MARKER`].
+    fn post_comment(&self, repo: &str, issue: u64, body: &str) -> Result<(), TrackerError> {
+        write::post_comment(self, repo, issue, body)
+    }
+
+    /// Posts a comment on pull request `pr`, hidden, ending with [`MARKER`].
+    fn comment_on_pr(&self, repo: &str, pr: u64, body: &str) -> Result<(), TrackerError> {
+        write::comment_on_pr(self, repo, pr, body)
+    }
+
+    /// Writes the issue's one status comment, hidden, ending with [`STATUS_MARKER`]: edits
+    /// `login`'s own in place, or posts it.
+    fn upsert_status_comment(
+        &self,
+        repo: &str,
+        issue: u64,
+        login: &str,
+        body: &str,
+    ) -> Result<(), TrackerError> {
+        write::upsert_status_comment(self, repo, issue, login, body)
+    }
+
+    /// Posts Foundry's claim comment for `run` on `machine`: [`claim_comment`].
+    fn post_claim(
+        &self,
+        repo: &str,
+        issue: u64,
+        run: &RunId,
+        machine: &MachineId,
+    ) -> Result<(), TrackerError> {
+        write::post_claim(self, repo, issue, run, machine)
     }
 }
