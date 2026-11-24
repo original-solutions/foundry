@@ -469,7 +469,9 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::factory::github::{Answer, FakeTracker, Hider, Hiding, OtherKind, Tracker};
+    use crate::factory::github::{
+        Answer, Commenting, FakeTracker, Hider, Hiding, OtherKind, Tracker,
+    };
     use crate::factory::lifecycle::State;
     use crate::factory::text::for_comment;
 
@@ -587,6 +589,26 @@ mod tests {
                 ..
             }
         )
+    }
+
+    /// A fake that may post, with a hider that knows no secret: the body reaches `gh` as
+    /// `for_comment` leaves it.
+    struct Plain<'a>(&'a FakeTracker);
+
+    impl Tracker for Plain<'_> {
+        fn gh(&self, args: &[String]) -> Result<String, TrackerError> {
+            self.0.gh(args)
+        }
+    }
+
+    impl Commenting for Plain<'_> {
+        fn hide(&self, text: &str) -> String {
+            text.to_string()
+        }
+    }
+
+    fn plain(fake: &FakeTracker) -> Plain<'_> {
+        Plain(fake)
     }
 
     // -----------------------------------------------------------------------------------------
@@ -896,7 +918,7 @@ mod tests {
         let fake = FakeTracker::answering([Answer::ok(
             "https://github.com/rawphp/softfac/issues/6#issuecomment-1\n",
         )]);
-        fake.post_comment(REPO, 6, "hello").unwrap();
+        plain(&fake).post_comment(REPO, 6, "hello").unwrap();
         assert_eq!(
             fake.calls(),
             vec![comment_call("6", "hello\n\n<!-- softfac -->")]
@@ -912,11 +934,11 @@ mod tests {
         let status = format!("{nasty}\n\n{STATUS_MARKER}");
 
         let post = FakeTracker::answering([Answer::ok("")]);
-        post.post_comment(REPO, 6, nasty).unwrap();
+        plain(&post).post_comment(REPO, 6, nasty).unwrap();
         assert_eq!(post.calls(), vec![comment_call("6", &expected)]);
 
         let create = FakeTracker::answering([Answer::ok("[]"), Answer::ok("")]);
-        create
+        plain(&create)
             .upsert_status_comment(REPO, 6, "rawphp", nasty)
             .unwrap();
         assert_eq!(create.calls()[1], comment_call("6", &status));
@@ -927,7 +949,7 @@ mod tests {
             ),
             Answer::ok(""),
         ]);
-        patch
+        plain(&patch)
             .upsert_status_comment(REPO, 6, "rawphp", nasty)
             .unwrap();
         assert_eq!(patch.calls()[1], patch_call("77", &status));
@@ -936,7 +958,7 @@ mod tests {
     #[test]
     fn post_comment_errors_carry_the_status_and_stderr() {
         let fake = FakeTracker::answering([Answer::fail(1, "issue is locked")]);
-        let error = fake.post_comment(REPO, 6, "x").unwrap_err();
+        let error = plain(&fake).post_comment(REPO, 6, "x").unwrap_err();
         assert!(is_failed(&error), "{error}");
         let message = error.to_string();
         assert!(message.contains("exited with status 1"), "{message}");
@@ -947,7 +969,8 @@ mod tests {
     fn the_status_comment_is_created_when_absent() {
         let listing = "[{\"id\":1,\"user\":{\"login\":\"rawphp\"},\"created_at\":\"2026-10-04T10:13:16Z\",\"body\":\"a person's comment\"},{\"id\":2,\"user\":{\"login\":\"rawphp\"},\"created_at\":\"2026-10-04T10:14:16Z\",\"body\":\"questions\\n\\n<!-- softfac -->\"}]";
         let fake = FakeTracker::answering([Answer::ok(listing), Answer::ok("")]);
-        fake.upsert_status_comment(REPO, 6, "rawphp", "state: building")
+        plain(&fake)
+            .upsert_status_comment(REPO, 6, "rawphp", "state: building")
             .unwrap();
         assert_eq!(
             fake.calls(),
@@ -962,7 +985,8 @@ mod tests {
     fn the_status_comment_is_patched_by_id_when_present() {
         let listing = "[{\"id\":1,\"user\":{\"login\":\"rawphp\"},\"created_at\":\"2026-10-04T10:13:16Z\",\"body\":\"hi\"},{\"id\":5978910929,\"user\":{\"login\":\"rawphp\"},\"created_at\":\"2026-10-04T10:14:16Z\",\"body\":\"state: triage\\n\\n<!-- softfac:status -->\"}]";
         let fake = FakeTracker::answering([Answer::ok(listing), Answer::ok("{}")]);
-        fake.upsert_status_comment(REPO, 6, "rawphp", "state: building")
+        plain(&fake)
+            .upsert_status_comment(REPO, 6, "rawphp", "state: building")
             .unwrap();
         assert_eq!(
             fake.calls(),
@@ -984,9 +1008,11 @@ mod tests {
             Answer::ok(created),
             Answer::ok("{}"),
         ]);
-        fake.upsert_status_comment(REPO, 6, "rawphp", "one")
+        plain(&fake)
+            .upsert_status_comment(REPO, 6, "rawphp", "one")
             .unwrap();
-        fake.upsert_status_comment(REPO, 6, "rawphp", "two")
+        plain(&fake)
+            .upsert_status_comment(REPO, 6, "rawphp", "two")
             .unwrap();
         let calls = fake.calls();
         assert_eq!(calls.len(), 4);
@@ -1012,7 +1038,8 @@ mod tests {
     fn a_status_marker_posted_by_someone_else_is_not_adopted() {
         let listing = "[{\"id\":10,\"user\":{\"login\":\"stranger\"},\"created_at\":\"2026-10-04T10:13:16Z\",\"body\":\"gotcha\\n\\n<!-- softfac:status -->\"},{\"id\":11,\"user\":null,\"created_at\":\"2026-10-04T10:14:16Z\",\"body\":\"ghost\\n\\n<!-- softfac:status -->\"}]";
         let fake = FakeTracker::answering([Answer::ok(listing), Answer::ok("")]);
-        fake.upsert_status_comment(REPO, 6, "rawphp", "real status")
+        plain(&fake)
+            .upsert_status_comment(REPO, 6, "rawphp", "real status")
             .unwrap();
         assert_eq!(
             fake.calls(),
@@ -1027,7 +1054,9 @@ mod tests {
     fn a_status_marker_in_the_middle_of_the_factorys_comment_is_not_adopted() {
         let listing = "[{\"id\":10,\"user\":{\"login\":\"rawphp\"},\"created_at\":\"2026-10-04T10:13:16Z\",\"body\":\"quoting <!-- softfac:status --> and more text\"}]";
         let fake = FakeTracker::answering([Answer::ok(listing), Answer::ok("")]);
-        fake.upsert_status_comment(REPO, 6, "rawphp", "s").unwrap();
+        plain(&fake)
+            .upsert_status_comment(REPO, 6, "rawphp", "s")
+            .unwrap();
         assert_eq!(
             fake.calls(),
             vec![
@@ -1041,7 +1070,9 @@ mod tests {
     fn the_factorys_own_status_comment_is_found_despite_case_and_trailing_whitespace() {
         let listing = "[{\"id\":10,\"user\":{\"login\":\"stranger\"},\"body\":\"fake\\n\\n<!-- softfac:status -->\"},{\"id\":12,\"user\":{\"login\":\"RawPhp\"},\"body\":\"state: triage\\n\\n<!-- softfac:status -->\\n\\n\"}]";
         let fake = FakeTracker::answering([Answer::ok(listing), Answer::ok("{}")]);
-        fake.upsert_status_comment(REPO, 6, "rawphp", "s").unwrap();
+        plain(&fake)
+            .upsert_status_comment(REPO, 6, "rawphp", "s")
+            .unwrap();
         assert_eq!(
             fake.calls()[1],
             patch_call("12", "s\n\n<!-- softfac:status -->")
@@ -1052,7 +1083,9 @@ mod tests {
     fn the_status_comment_user_match_is_exact_not_a_prefix() {
         let listing = "[{\"id\":10,\"user\":{\"login\":\"rawphp-bot\"},\"body\":\"a\\n\\n<!-- softfac:status -->\"},{\"id\":11,\"user\":{\"login\":\"raw\"},\"body\":\"b\\n\\n<!-- softfac:status -->\"}]";
         let fake = FakeTracker::answering([Answer::ok(listing), Answer::ok("")]);
-        fake.upsert_status_comment(REPO, 6, "rawphp", "s").unwrap();
+        plain(&fake)
+            .upsert_status_comment(REPO, 6, "rawphp", "s")
+            .unwrap();
         assert_eq!(
             fake.calls(),
             vec![
@@ -1067,7 +1100,9 @@ mod tests {
         // `gh api --paginate` may print each page as its own array.
         let pages = "[{\"id\":1,\"body\":\"a\"}][{\"id\":2,\"body\":\"b\"},{\"id\":3,\"user\":{\"login\":\"rawphp\"},\"body\":\"state\\n\\n<!-- softfac:status -->\"}]";
         let fake = FakeTracker::answering([Answer::ok(pages), Answer::ok("{}")]);
-        fake.upsert_status_comment(REPO, 6, "rawphp", "x").unwrap();
+        plain(&fake)
+            .upsert_status_comment(REPO, 6, "rawphp", "x")
+            .unwrap();
         assert_eq!(fake.calls()[1][3], "repos/rawphp/softfac/issues/comments/3");
     }
 
@@ -1075,7 +1110,7 @@ mod tests {
     fn status_comment_errors() {
         let spawn = FakeTracker::new();
         assert!(matches!(
-            spawn
+            plain(&spawn)
                 .upsert_status_comment(REPO, 6, "rawphp", "x")
                 .unwrap_err(),
             TrackerError::Other {
@@ -1085,14 +1120,14 @@ mod tests {
         ));
 
         let oops = FakeTracker::answering([Answer::ok("oops")]);
-        let error = oops
+        let error = plain(&oops)
             .upsert_status_comment(REPO, 6, "rawphp", "x")
             .unwrap_err();
         assert!(is_parse(&error), "{error}");
         assert_eq!(oops.calls().len(), 1);
 
         let empty = FakeTracker::answering([Answer::ok("")]);
-        let error = empty
+        let error = plain(&empty)
             .upsert_status_comment(REPO, 6, "rawphp", "x")
             .unwrap_err();
         assert!(is_parse(&error), "{error}");
@@ -1104,7 +1139,7 @@ mod tests {
         assert!(message.contains("output was empty"), "{message}");
 
         let failing = FakeTracker::answering([Answer::ok("[]"), Answer::fail(1, "rate limited")]);
-        let error = failing
+        let error = plain(&failing)
             .upsert_status_comment(REPO, 6, "rawphp", "x")
             .unwrap_err();
         assert!(is_failed(&error), "{error}");
@@ -1116,7 +1151,7 @@ mod tests {
         let listing = "[{\"id\":12,\"user\":{\"login\":\"rawphp\"},\"body\":\"state: triage\\n\\n<!-- softfac:status -->\"}]";
         let fake =
             FakeTracker::answering([Answer::ok(listing), Answer::fail(1, "validation failed")]);
-        let error = fake
+        let error = plain(&fake)
             .upsert_status_comment(REPO, 6, "rawphp", "s")
             .unwrap_err();
         assert!(is_failed(&error), "{error}");
@@ -1129,7 +1164,7 @@ mod tests {
     #[test]
     fn comment_on_pr_appends_the_marker() {
         let fake = FakeTracker::answering([Answer::ok("")]);
-        fake.comment_on_pr(REPO, 9, "gate passed").unwrap();
+        plain(&fake).comment_on_pr(REPO, 9, "gate passed").unwrap();
         assert_eq!(
             fake.calls(),
             vec![args(&[
@@ -1145,7 +1180,7 @@ mod tests {
 
         let failed = FakeTracker::new();
         assert!(matches!(
-            failed.comment_on_pr(REPO, 9, "x").unwrap_err(),
+            plain(&failed).comment_on_pr(REPO, 9, "x").unwrap_err(),
             TrackerError::Other {
                 kind: OtherKind::NotStarted,
                 ..
@@ -1165,22 +1200,16 @@ mod tests {
                 IssueComment {
                     id: 1,
                     author: Some("rawphp".into()),
-                    association: "MEMBER".into(),
-                    created_at: "2026-10-04T10:13:16Z".into(),
                     body: "a".into(),
                 },
                 IssueComment {
                     id: 2,
                     author: None,
-                    association: String::new(),
-                    created_at: String::new(),
                     body: String::new(),
                 },
                 IssueComment {
                     id: 3,
                     author: None,
-                    association: String::new(),
-                    created_at: String::new(),
                     body: String::new(),
                 },
             ]
@@ -1247,38 +1276,59 @@ mod tests {
     }
 
     #[test]
-    fn a_tracker_built_without_a_hider_still_hides_for_comment() {
-        let fake = FakeTracker::answering([Answer::ok("")]);
-        fake.post_comment(
-            REPO,
-            6,
-            &format!("key {KEY} at https://user:pw@example.com/x"),
-        )
-        .unwrap();
-        let body = fake.calls()[0][6].clone();
-        assert!(!body.contains(KEY), "{body}");
-        assert!(!body.contains("pw@"), "{body}");
-        assert!(body.ends_with(&format!("\n\n{MARKER}")), "{body}");
+    fn the_hider_runs_before_for_comment_so_a_known_secret_goes_whole() {
+        // `for_comment` alone would hide only the long run, and leave `Xy9.Kq2.` to be posted.
+        const SECRET: &str = "Xy9.Kq2.abcdefghijklmnopqrstuvwx12";
+        assert!(for_comment(SECRET).contains("Xy9.Kq2."));
+        let fake = Arc::new(FakeTracker::new());
+        let tracker = Hiding::new(
+            fake.clone(),
+            Arc::new(|text: &str| text.replace(SECRET, "[known]")),
+        );
+        fake.then(Answer::ok(""))
+            .then(Answer::ok(""))
+            .then(Answer::ok("[]"))
+            .then(Answer::ok(""))
+            .then(Answer::ok(
+                "[{\"id\":77,\"user\":{\"login\":\"rawphp\"},\"body\":\"old\\n\\n<!-- softfac:status -->\"}]",
+            ))
+            .then(Answer::ok(""));
+        let body = format!("the key is {SECRET}.");
+        tracker.post_comment(REPO, 6, &body).unwrap();
+        tracker.comment_on_pr(REPO, 9, &body).unwrap();
+        tracker
+            .upsert_status_comment(REPO, 6, "rawphp", &body)
+            .unwrap();
+        tracker
+            .upsert_status_comment(REPO, 6, "rawphp", &body)
+            .unwrap();
+        let posted: Vec<String> = fake
+            .calls()
+            .into_iter()
+            .filter(|call| call[0] != "api" || call[1] == "-X")
+            .map(|call| call.last().unwrap().trim_start_matches("body=").to_string())
+            .collect();
+        assert_eq!(posted.len(), 4);
+        for body in posted {
+            assert!(body.starts_with("the key is [known]."), "{body}");
+            assert!(!body.contains("Xy9") && !body.contains("Kq2"), "{body}");
+        }
     }
 
     #[test]
-    fn hiders_compose_and_a_pull_request_url_stays_whole() {
+    fn a_pull_request_url_stays_whole_through_the_hider_and_for_comment() {
         let fake = Arc::new(FakeTracker::answering([Answer::ok("")]));
-        let inner: Arc<dyn Tracker> = Arc::new(Hiding::new(fake.clone(), hider()));
-        let outer = Hiding::new(
-            inner,
-            Arc::new(|text: &str| text.replace("swordfish", "[k2]")),
-        );
-        outer
+        let tracker = Hiding::new(fake.clone(), hider());
+        tracker
             .post_comment(
                 REPO,
                 6,
-                "hunter2 swordfish https://github.com/rawphp/softfac/pull/123",
+                "hunter2 https://github.com/rawphp/softfac/pull/123",
             )
             .unwrap();
         assert_eq!(
             fake.calls()[0][6],
-            format!("[known] [k2] https://github.com/rawphp/softfac/pull/123\n\n{MARKER}")
+            format!("[known] https://github.com/rawphp/softfac/pull/123\n\n{MARKER}")
         );
     }
 
@@ -1465,30 +1515,22 @@ mod tests {
         MachineId(MACHINE.parse().unwrap())
     }
 
-    fn comment(id: u64, author: Option<&str>, association: &str, body: &str) -> IssueComment {
+    fn comment(id: u64, author: Option<&str>, body: &str) -> IssueComment {
         IssueComment {
             id,
             author: author.map(str::to_string),
-            association: association.into(),
-            created_at: "2026-10-04T10:13:16Z".into(),
             body: body.into(),
         }
     }
 
-    fn foundry_claim(id: u64, author: &str, association: &str) -> IssueComment {
-        comment(
-            id,
-            Some(author),
-            association,
-            &claim_comment(&run(), &machine()),
-        )
+    fn foundry_claim(id: u64, author: &str) -> IssueComment {
+        comment(id, Some(author), &claim_comment(&run(), &machine()))
     }
 
-    fn runner_claim(id: u64, author: &str, association: &str) -> IssueComment {
+    fn runner_claim(id: u64, author: &str) -> IssueComment {
         comment(
             id,
             Some(author),
-            association,
             "Claimed by machine mac-mini.\n\n<!-- softfac:claim mac-mini -->",
         )
     }
@@ -1530,70 +1572,48 @@ mod tests {
 
     #[test]
     fn foundrys_own_claim_comment_is_foundrys_claim() {
-        let comments = [foundry_claim(5, "rawphp", "MEMBER")];
+        let comments = [foundry_claim(5, "rawphp")];
         assert_eq!(newest_claim(&comments, "rawphp"), ours());
     }
 
     #[test]
     fn the_login_matches_ignoring_ascii_case() {
-        let comments = [foundry_claim(5, "RawPHP", "NONE")];
+        let comments = [foundry_claim(5, "RawPHP")];
         assert_eq!(newest_claim(&comments, "rawphp"), ours());
     }
 
     #[test]
     fn a_comment_with_foundrys_marker_written_by_another_login_is_not_foundrys_claim() {
-        // Review focus 1: a member, as another factory on another login would be.
-        let member = [foundry_claim(5, "someone-else", "MEMBER")];
-        assert_eq!(
-            newest_claim(&member, "rawphp"),
-            Some(Claim::Foreign { comment_id: 5 })
-        );
-        // An outsider copying the marker after Foundry's own claim takes nothing from it.
-        let outsider = [
-            foundry_claim(5, "rawphp", "MEMBER"),
-            foundry_claim(6, "mallory", "NONE"),
-        ];
-        assert_eq!(newest_claim(&outsider, "rawphp"), ours());
+        // Another login's marker counts for nothing, whoever wrote it.
+        let alone = [foundry_claim(5, "someone-else")];
+        assert_eq!(newest_claim(&alone, "rawphp"), None);
+        // Written after Foundry's own claim, it takes nothing from it.
+        let after = [foundry_claim(5, "rawphp"), foundry_claim(6, "mallory")];
+        assert_eq!(newest_claim(&after, "rawphp"), ours());
         // Nor does a deleted account's.
-        let ghost = [comment(
-            7,
-            None,
-            "MEMBER",
-            &claim_comment(&run(), &machine()),
-        )];
+        let ghost = [comment(7, None, &claim_comment(&run(), &machine()))];
         assert_eq!(newest_claim(&ghost, "rawphp"), None);
     }
 
     #[test]
     fn the_runners_softfac_claim_comment_is_foreign() {
-        // Same login: the runner and Foundry may act as one GitHub account.
-        let same_login = [runner_claim(9, "rawphp", "OWNER")];
+        // The runner and Foundry act as one GitHub login during the cutover.
+        let comments = [runner_claim(9, "rawphp")];
         assert_eq!(
-            newest_claim(&same_login, "rawphp"),
+            newest_claim(&comments, "rawphp"),
             Some(Claim::Foreign { comment_id: 9 })
         );
-        for association in ["OWNER", "MEMBER", "COLLABORATOR"] {
-            let comments = [runner_claim(9, "tomkaczocha", association)];
-            assert_eq!(
-                newest_claim(&comments, "rawphp"),
-                Some(Claim::Foreign { comment_id: 9 }),
-                "{association}"
-            );
-        }
+        // Another login's runner marker counts for nothing, as another login's Foundry one.
+        let elsewhere = [foundry_claim(5, "rawphp"), runner_claim(9, "tomkaczocha")];
+        assert_eq!(newest_claim(&elsewhere, "rawphp"), ours());
     }
 
     #[test]
     fn of_two_claim_comments_the_newest_counts() {
-        let runner_then_foundry = [
-            runner_claim(9, "rawphp", "OWNER"),
-            foundry_claim(12, "rawphp", "OWNER"),
-        ];
+        let runner_then_foundry = [runner_claim(9, "rawphp"), foundry_claim(12, "rawphp")];
         assert_eq!(newest_claim(&runner_then_foundry, "rawphp"), ours());
 
-        let foundry_then_runner = [
-            foundry_claim(9, "rawphp", "OWNER"),
-            runner_claim(12, "rawphp", "OWNER"),
-        ];
+        let foundry_then_runner = [foundry_claim(9, "rawphp"), runner_claim(12, "rawphp")];
         assert_eq!(
             newest_claim(&foundry_then_runner, "rawphp"),
             Some(Claim::Foreign { comment_id: 12 })
@@ -1601,13 +1621,8 @@ mod tests {
 
         // Newest is the higher comment id, whatever order the list is in.
         let later_run = RunId::new(REPO, 6, 2).unwrap();
-        let newer = comment(
-            30,
-            Some("rawphp"),
-            "OWNER",
-            &claim_comment(&later_run, &machine()),
-        );
-        let comments = [newer, foundry_claim(20, "rawphp", "OWNER")];
+        let newer = comment(30, Some("rawphp"), &claim_comment(&later_run, &machine()));
+        let comments = [newer, foundry_claim(20, "rawphp")];
         assert_eq!(
             newest_claim(&comments, "rawphp"),
             Some(Claim::Foundry {
@@ -1621,24 +1636,34 @@ mod tests {
     fn a_marker_that_is_not_the_last_line_is_no_claim() {
         let quoted = format!("{}\n\nquoted above", claim_comment(&run(), &machine()));
         let comments = [
-            comment(5, Some("rawphp"), "OWNER", &quoted),
+            comment(5, Some("rawphp"), &quoted),
             comment(
                 6,
                 Some("rawphp"),
-                "OWNER",
                 "see <!-- softfac:claim mac-mini --> here",
             ),
-            comment(7, Some("rawphp"), "OWNER", "a person's comment"),
+            comment(7, Some("rawphp"), "a person's comment"),
         ];
         assert_eq!(newest_claim(&comments, "rawphp"), None);
         // Trailing whitespace after the marker still leaves it the last line.
         let trailing = [comment(
             8,
             Some("rawphp"),
-            "OWNER",
             &format!("{}\n\n", claim_comment(&run(), &machine())),
         )];
         assert_eq!(newest_claim(&trailing, "rawphp"), ours());
+    }
+
+    #[test]
+    fn a_runner_marker_that_names_no_one_machine_is_no_claim() {
+        for marker in [
+            "<!-- softfac:claim  -->",
+            "<!-- softfac:claim a b -->",
+            "<!-- softfac:claim -->",
+        ] {
+            let comments = [comment(5, Some("rawphp"), &format!("x\n\n{marker}"))];
+            assert_eq!(newest_claim(&comments, "rawphp"), None, "{marker}");
+        }
     }
 
     #[test]
@@ -1650,12 +1675,7 @@ mod tests {
             "<!-- foundry:claim rawphp__softfac__6__1 6f1c2a8e-3b4d-4e5f-9a0b-1c2d3e4f5a6b extra -->",
             "<!-- foundry:claim rawphp__softfac__6__1 6F1C2A8E-3B4D-4E5F-9A0B-1C2D3E4F5A6B -->",
         ] {
-            let comments = [comment(
-                5,
-                Some("rawphp"),
-                "OWNER",
-                &format!("x\n\n{marker}"),
-            )];
+            let comments = [comment(5, Some("rawphp"), &format!("x\n\n{marker}"))];
             assert_eq!(
                 newest_claim(&comments, "rawphp"),
                 Some(Claim::Foreign { comment_id: 5 }),
@@ -1668,8 +1688,8 @@ mod tests {
     fn no_claim_comment_is_no_claim() {
         assert_eq!(newest_claim(&[], "rawphp"), None);
         let comments = [
-            comment(1, Some("rawphp"), "OWNER", "hello\n\n<!-- softfac -->"),
-            comment(2, Some("rawphp"), "OWNER", "s\n\n<!-- softfac:status -->"),
+            comment(1, Some("rawphp"), "hello\n\n<!-- softfac -->"),
+            comment(2, Some("rawphp"), "s\n\n<!-- softfac:status -->"),
         ];
         assert_eq!(newest_claim(&comments, "rawphp"), None);
     }
