@@ -372,6 +372,11 @@ impl Peers {
         false
     }
 
+    /// The machines with an open record link, whatever protocol it speaks.
+    pub fn linked(&self) -> BTreeSet<MachineId> {
+        lock(&self.inner.links).keys().copied().collect()
+    }
+
     /// The machines with an open record link whose every open link speaks a protocol older than
     /// [`EDITS_SINCE`]: they send no shared settings and take no edits.
     pub fn older(&self) -> BTreeSet<MachineId> {

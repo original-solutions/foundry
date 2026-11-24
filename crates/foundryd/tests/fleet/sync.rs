@@ -1921,3 +1921,107 @@ async fn a_factory_row_of_another_owner_that_cannot_be_read_does_not_stop_factor
         .expect("after a restart, an own write was not told past another owner's unreadable row")
         .unwrap();
 }
+
+/// A dialer whose every dial fails, for a daemon that only accepts links.
+struct NoDial;
+
+impl Dialer for NoDial {
+    fn dial(&self, _: &Machine) -> BoxFuture<'static, io::Result<Conn>> {
+        Box::pin(async { Err(io::Error::other("this daemon dials no one")) })
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_machine_holding_a_factory_row_it_cannot_read_says_hello_with_its_real_factory_versions_and_a_level_peer_sends_it_none()
+ {
+    let (x_id, y_id, third) = (
+        MachineId::random(),
+        MachineId::random(),
+        MachineId::random(),
+    );
+    let ids = [x_id, y_id];
+    let (x, mut tap) = tapped(&ids, false);
+    let y = Daemon::start(y_id, &settings_for(&ids), Arc::new(NoDial));
+    let run = RunId::new("original-solutions/foundry", 192, 1).unwrap();
+    // Each holds the other's factory records, so the two are level, and x also holds a row of a
+    // third machine's whose owner it cannot read.
+    let from_x = write_factory(&x, run_event(&run, "from x"));
+    let from_y: Vec<FactoryRecord> = ["one", "two"]
+        .into_iter()
+        .map(|event| write_factory(&y, run_event(&run, event)))
+        .collect();
+    assert_eq!(
+        lock(&y.store).apply_factory(&from_x, x_id).unwrap(),
+        Applied::Stored
+    );
+    for record in &from_y {
+        assert_eq!(
+            lock(&x.store).apply_factory(record, y_id).unwrap(),
+            Applied::Stored
+        );
+    }
+    let of_third = FactoryRecord {
+        owner: third,
+        version: 7,
+        body: run_event(&run, "from a third machine"),
+    };
+    assert_eq!(
+        lock(&x.store).apply_factory(&of_third, third).unwrap(),
+        Applied::Stored
+    );
+    spoil_owner(&x, third, of_third.version);
+
+    // x dials y through the test, which passes every message on and reads both ways.
+    let mut x_end = loop {
+        let (machine, conn) = dialed(&mut tap, Duration::from_secs(5)).await;
+        if machine.id == y_id {
+            break conn;
+        }
+    };
+    let (mut y_end, theirs) = Conn::pair();
+    let accepting = y.peers.clone();
+    tokio::spawn(async move { accepting.accept(theirs).await });
+
+    let text = timeout(OFFLINE_AFTER, x_end.recv.recv())
+        .await
+        .expect("x says hello first")
+        .expect("the link is open");
+    let hello: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(hello["type"], "hello", "{hello}");
+    let told: BTreeMap<MachineId, u64> =
+        serde_json::from_value(hello["factory_versions"].clone()).unwrap();
+    y_end.send.send(text).await.expect("y's end is open");
+
+    let mut sent_by_y = Vec::new();
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(10) {
+        tokio::select! {
+            Some(text) = x_end.recv.recv() => {
+                y_end.send.send(text).await.expect("y's end is open");
+            }
+            Some(text) = y_end.recv.recv() => {
+                sent_by_y.push(serde_json::from_str::<serde_json::Value>(&text).unwrap());
+                x_end.send.send(text).await.expect("x's end is open");
+            }
+            () = tokio::time::sleep(Duration::from_millis(100)) => {}
+        }
+    }
+    assert!(
+        sent_by_y.iter().any(|m| m["type"] == "hello"),
+        "y answered: {sent_by_y:?}"
+    );
+    assert!(
+        y.peers.online().contains(&x_id) && x.peers.online().contains(&y_id),
+        "the link stayed up"
+    );
+    assert_eq!(
+        factory_records_in(&sent_by_y),
+        [],
+        "y sent x factory records it already holds"
+    );
+    assert_eq!(
+        told,
+        BTreeMap::from([(x_id, from_x.version), (y_id, from_y[1].version)]),
+        "x's hello names the factory versions it holds"
+    );
+}
