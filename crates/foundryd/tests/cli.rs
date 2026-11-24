@@ -386,6 +386,45 @@ fn factory_export_never_writes_the_store_even_one_older_than_this_build() {
     assert_eq!(left, ["runs"], "left in the export folder: {left:?}");
 }
 
+/// The store is copied beside itself, in the data directory only its owner can read, never into
+/// the export directory: so an export directory whose name SQLite cannot take still exports.
+#[cfg(unix)]
+#[test]
+fn factory_export_copies_the_store_beside_it_and_not_into_the_export_directory() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let home = tempfile::tempdir().unwrap();
+    store_runner_run(&home);
+    let out = tempfile::tempdir().unwrap();
+    let dir = out
+        .path()
+        .join(std::ffi::OsStr::from_bytes(b"not-utf-8-\xff"));
+    if std::fs::create_dir(&dir).is_err() {
+        // This file system refuses a name that is not UTF-8, so no export directory has one.
+        return;
+    }
+
+    let ran = isolated(&["factory", "export"], &home)
+        .arg(&dir)
+        .output()
+        .expect("foundryd runs");
+
+    assert!(
+        ran.status.success(),
+        "exit: {:?} stderr: {}",
+        ran.status,
+        words(&ran.stderr)
+    );
+    let exported = std::fs::read(dir.join("runs").join(format!("{RUNNER_RUN}.jsonl"))).unwrap();
+    assert!(exported == runner_file());
+    let held: Vec<_> = std::fs::read_dir(home.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.contains("sqlite"))
+        .collect();
+    assert_eq!(held, ["store.sqlite"], "left beside the store: {held:?}");
+}
+
 #[test]
 fn factory_export_into_a_file_exits_1_and_names_it() {
     let home = tempfile::tempdir().unwrap();
