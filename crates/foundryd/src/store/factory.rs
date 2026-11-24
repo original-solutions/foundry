@@ -439,6 +439,7 @@ mod tests {
     use serde_json::{Value, json};
     use tempfile::TempDir;
 
+    use super::{EVENTS_OF_WRITER, EVENTS_OF_WRITER_ABOVE, HAS_EVENT, WRITER_PROBE};
     use crate::store::Store;
 
     fn open() -> (TempDir, Store) {
@@ -451,16 +452,13 @@ mod tests {
         RunId::new(repo, issue, attempt).unwrap()
     }
 
-    /// Stores the event `event` of `run` as `owner` left it at `version` and `generation`, at
-    /// `ms`.
-    #[allow(clippy::too_many_arguments)]
+    /// Stores the event `event` of `run` as `owner` left it at `version` and `generation`.
     fn put(
         store: &mut Store,
         owner: MachineId,
         version: u64,
         run: &RunId,
         generation: u64,
-        ms: u64,
         event: &str,
         data: Value,
     ) {
@@ -471,7 +469,7 @@ mod tests {
                 run: run.clone(),
                 generation,
                 ts: "2026-10-04T10:00:00.000Z".into(),
-                ms,
+                ms: version,
                 event: event.into(),
                 data,
                 cause: None,
@@ -480,208 +478,209 @@ mod tests {
         store.apply_factory(&record, owner).unwrap();
     }
 
-    /// A run event row this build cannot read, as a newer build may leave one.
-    fn put_unreadable(dir: &TempDir, run: &RunId) {
+    /// A run event row of `run` that holds `record` as it is, as a newer build or a damaged
+    /// file may leave one.
+    fn put_raw(dir: &TempDir, run: &RunId, record: &str) {
         let owner = MachineId::random();
         let conn = rusqlite::Connection::open(dir.path().join("foundry.db")).unwrap();
         conn.execute(
             "INSERT INTO factory_records (kind, id, owner, version, record)
-             VALUES ('run_event', ?1, ?2, 1, '{\"kind\":\"run_event\",\"later\":true}')",
-            rusqlite::params![format!("{run}/{owner}/1"), owner.to_string()],
+             VALUES ('run_event', ?1, ?2, 1, ?3)",
+            rusqlite::params![format!("{run}/{owner}/1"), owner.to_string(), record],
         )
         .unwrap();
     }
 
-    fn steps(events: &[RunEvent]) -> Vec<&str> {
-        events.iter().map(|event| event.event.as_str()).collect()
+    fn versions(events: &[(u64, RunEvent)]) -> Vec<u64> {
+        events.iter().map(|(version, _)| *version).collect()
     }
 
     #[test]
-    fn a_run_is_finished_once_any_writer_stored_its_finished_event() {
+    fn a_run_has_an_event_once_any_writer_stored_one_of_that_name() {
         let (_dir, mut store) = open();
         let (a, b) = (MachineId::random(), MachineId::random());
         let eight = run("rawphp/softfac", 8, 1);
-        assert!(!store.run_finished(&eight).unwrap());
-        put(&mut store, a, 1, &eight, 1, 0, "step_changed", json!({}));
-        assert!(!store.run_finished(&eight).unwrap());
+        assert!(!store.run_has_event(&eight, "finished").unwrap());
+        put(&mut store, a, 1, &eight, 1, "step_changed", json!({}));
+        assert!(!store.run_has_event(&eight, "finished").unwrap());
+        assert!(store.run_has_event(&eight, "step_changed").unwrap());
         // Another run whose id starts with this one's is not this run.
         let eighty = run("rawphp/softfac", 80, 1);
-        put(&mut store, a, 2, &eighty, 1, 0, "finished", json!({}));
-        assert!(!store.run_finished(&eight).unwrap());
-        // A `finished` whose data this build cannot read still ends the run.
+        put(&mut store, a, 2, &eighty, 1, "finished", json!({}));
+        assert!(!store.run_has_event(&eight, "finished").unwrap());
+        // A `finished` whose data this build cannot read is still a `finished`.
         put(
             &mut store,
             b,
             1,
             &eight,
             2,
-            0,
             "finished",
             json!({"total_ms": "soon"}),
         );
-        assert!(store.run_finished(&eight).unwrap());
+        assert!(store.run_has_event(&eight, "finished").unwrap());
     }
 
     #[test]
-    fn a_run_with_a_row_this_build_cannot_read_is_not_finished_by_it() {
+    fn a_row_this_build_cannot_read_names_no_event_and_one_that_is_not_json_is_an_error() {
         let (dir, store) = open();
         let eight = run("rawphp/softfac", 8, 1);
-        put_unreadable(&dir, &eight);
-        assert!(!store.run_finished(&eight).unwrap());
+        put_raw(&dir, &eight, r#"{"kind":"run_event","later":true}"#);
+        assert!(!store.run_has_event(&eight, "finished").unwrap());
+        let nine = run("rawphp/softfac", 9, 1);
+        put_raw(&dir, &nine, "not json");
+        assert!(store.run_has_event(&nine, "finished").is_err());
     }
 
     #[test]
-    fn the_first_event_of_a_run_is_by_generation_then_version_never_by_time() {
-        let (_dir, mut store) = open();
-        let (a, b) = (MachineId::random(), MachineId::random());
+    fn the_writers_of_a_run_are_read_from_its_keys_once_each_in_order() {
+        let (dir, mut store) = open();
+        let (a, b, c) = (
+            MachineId::random(),
+            MachineId::random(),
+            MachineId::random(),
+        );
         let eight = run("rawphp/softfac", 8, 1);
-        assert_eq!(store.first_run_event(&eight).unwrap(), None);
-        put(&mut store, b, 1, &eight, 2, 10, "second_holder", json!({}));
-        put(&mut store, a, 9, &eight, 1, 5_000, "later", json!({}));
-        put(&mut store, a, 7, &eight, 1, 9_000, "first", json!({}));
-        let first = store.first_run_event(&eight).unwrap().unwrap();
-        assert_eq!((first.event.as_str(), first.ms), ("first", 9_000));
-        assert_eq!(store.run_events(&eight).unwrap()[0], first);
-    }
-
-    #[test]
-    fn a_runs_events_of_one_name_are_read_in_the_order_of_all_its_events() {
-        let (_dir, mut store) = open();
-        let (a, b) = (MachineId::random(), MachineId::random());
-        let eight = run("rawphp/softfac", 8, 1);
+        assert_eq!(store.run_writers(&eight).unwrap(), []);
+        for version in 1..=3 {
+            put(&mut store, a, version, &eight, 1, "step_changed", json!({}));
+            put(&mut store, b, version, &eight, 2, "step_changed", json!({}));
+        }
         put(
             &mut store,
-            b,
+            c,
             1,
-            &eight,
-            2,
-            0,
-            "gate_command",
-            json!({"attempt": 3}),
-        );
-        put(
-            &mut store,
-            a,
-            4,
-            &eight,
-            1,
-            0,
-            "gate_command",
-            json!({"attempt": 2}),
-        );
-        put(&mut store, a, 3, &eight, 1, 0, "step_changed", json!({}));
-        put(
-            &mut store,
-            a,
-            2,
-            &eight,
-            1,
-            0,
-            "gate_command",
-            json!({"attempt": 1}),
-        );
-        put(
-            &mut store,
-            a,
-            5,
             &run("rawphp/softfac", 80, 1),
             1,
-            0,
-            "gate_command",
-            json!({}),
-        );
-        let named = store.run_events_named(&eight, "gate_command").unwrap();
-        let attempts: Vec<&Value> = named.iter().map(|event| &event.data["attempt"]).collect();
-        assert_eq!(attempts, [&json!(1), &json!(2), &json!(3)]);
-        let all: Vec<RunEvent> = store
-            .run_events(&eight)
-            .unwrap()
-            .into_iter()
-            .filter(|event| event.event == "gate_command")
-            .collect();
-        assert_eq!(named, all);
-        assert_eq!(
-            steps(&store.run_events_named(&eight, "finished").unwrap()),
-            Vec::<&str>::new()
-        );
-    }
-
-    #[test]
-    fn the_unfinished_runs_of_a_repo_leave_out_every_run_with_a_finished_event() {
-        let (dir, mut store) = open();
-        let owner = MachineId::random();
-        let (one, two, three) = (
-            run("rawphp/softfac", 1, 1),
-            run("rawphp/softfac", 2, 1),
-            run("rawphp/softfac", 3, 1),
-        );
-        let other_repo = run("rawphp/softfac__c", 4, 1);
-        put(
-            &mut store,
-            owner,
-            1,
-            &three,
-            1,
-            0,
             "step_changed",
             json!({}),
         );
-        put(&mut store, owner, 2, &one, 1, 0, "step_changed", json!({}));
-        put(&mut store, owner, 3, &two, 1, 0, "step_changed", json!({}));
-        put(&mut store, owner, 4, &two, 1, 0, "finished", json!({}));
-        put(
-            &mut store,
-            owner,
-            5,
-            &other_repo,
-            1,
-            0,
-            "step_changed",
-            json!({}),
-        );
-        // A run whose only row this build cannot read is not known to be finished.
-        let four = run("rawphp/softfac", 4, 1);
-        put_unreadable(&dir, &four);
-        assert_eq!(
-            store.unfinished_runs_of("RawPHP/SoftFac").unwrap(),
-            [one, three, four]
-        );
-        assert_eq!(store.unfinished_runs_of("not a repo").unwrap(), []);
+        // A row whose record cannot be read still names its writer by its key.
+        put_raw(&dir, &eight, "not json");
+        let writers = store.run_writers(&eight).unwrap();
+        assert_eq!(writers.len(), 3);
+        assert!(writers.contains(&a) && writers.contains(&b));
+        assert!(!writers.contains(&c));
+        let texts: Vec<String> = writers.iter().map(ToString::to_string).collect();
+        let mut sorted = texts.clone();
+        sorted.sort();
+        assert_eq!(texts, sorted);
     }
 
     #[test]
-    fn the_reads_of_a_runs_events_count_the_events_they_hand_back() {
+    fn a_writers_events_of_a_run_are_read_by_version_from_the_start_or_above_one() {
         let (_dir, mut store) = open();
-        let owner = MachineId::random();
+        let (a, b) = (MachineId::random(), MachineId::random());
         let eight = run("rawphp/softfac", 8, 1);
-        for version in 1..=3 {
-            put(
-                &mut store,
-                owner,
-                version,
-                &eight,
-                1,
-                0,
-                "gate_command",
-                json!({}),
+        let eighty = run("rawphp/softfac", 80, 1);
+        for version in [3, 1, 12, 2] {
+            put(&mut store, a, version, &eight, 1, "step_changed", json!({}));
+        }
+        put(&mut store, a, 4, &eighty, 1, "step_changed", json!({}));
+        put(&mut store, b, 5, &eight, 2, "step_changed", json!({}));
+        let all = store.run_events_by(&eight, a, None).unwrap();
+        assert_eq!(versions(&all), [1, 2, 3, 12]);
+        assert!(all.iter().all(|(_, event)| event.run == eight));
+        assert_eq!(
+            versions(&store.run_events_by(&eight, a, Some(2)).unwrap()),
+            [3, 12]
+        );
+        assert_eq!(
+            versions(&store.run_events_by(&eight, a, Some(12)).unwrap()),
+            Vec::<u64>::new()
+        );
+        assert_eq!(
+            versions(&store.run_events_by(&eight, b, None).unwrap()),
+            [5]
+        );
+        // A version 0 is read from the start, and not above 0.
+        put(&mut store, b, 0, &eight, 2, "step_changed", json!({}));
+        assert_eq!(
+            versions(&store.run_events_by(&eight, b, None).unwrap()),
+            [0, 5]
+        );
+        assert_eq!(
+            versions(&store.run_events_by(&eight, b, Some(0)).unwrap()),
+            [5]
+        );
+    }
+
+    #[test]
+    fn a_writers_row_this_build_cannot_read_is_an_error_never_skipped() {
+        let (dir, store) = open();
+        let eight = run("rawphp/softfac", 8, 1);
+        put_raw(&dir, &eight, r#"{"kind":"run_event","later":true}"#);
+        let writer = store.run_writers(&eight).unwrap()[0];
+        assert!(store.run_events_by(&eight, writer, None).is_err());
+    }
+
+    /// What SQLite says it does for `sql`, one line per step.
+    fn plan(store: &Store, sql: &str) -> Vec<String> {
+        let mut query = store
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap();
+        let rows = query.query_map([], |row| row.get::<_, String>(3)).unwrap();
+        rows.map(Result::unwrap).collect()
+    }
+
+    #[test]
+    fn the_reads_of_a_writes_catch_up_seek_an_index_and_never_scan_the_table() {
+        let (_dir, store) = open();
+        for sql in [
+            WRITER_PROBE,
+            EVENTS_OF_WRITER,
+            EVENTS_OF_WRITER_ABOVE,
+            HAS_EVENT,
+        ] {
+            let steps = plan(&store, sql);
+            assert!(
+                steps
+                    .iter()
+                    .any(|step| step.starts_with("SEARCH factory_records USING")),
+                "{sql}: {steps:?}"
+            );
+            assert!(
+                !steps.iter().any(|step| step.starts_with("SCAN")),
+                "{sql}: {steps:?}"
             );
         }
-        put(&mut store, owner, 4, &eight, 1, 0, "finished", json!({}));
-        let read = || Store::run_events_read();
+        // Above a version, only the writer's records stored since are visited, whatever the
+        // run's history holds.
+        let steps = plan(&store, EVENTS_OF_WRITER_ABOVE);
+        assert!(
+            steps
+                .iter()
+                .any(|step| step.contains("factory_records_by_owner (owner=? AND version>?)")),
+            "{steps:?}"
+        );
+    }
+
+    #[test]
+    fn the_reads_of_a_runs_rows_count_the_rows_they_hand_back() {
+        let (_dir, mut store) = open();
+        let (a, b) = (MachineId::random(), MachineId::random());
+        let eight = run("rawphp/softfac", 8, 1);
+        for version in 1..=3 {
+            put(&mut store, a, version, &eight, 1, "gate_command", json!({}));
+        }
+        put(&mut store, b, 1, &eight, 2, "finished", json!({}));
+        let read = Store::run_rows_read;
         let before = read();
         store.run_events(&eight).unwrap();
         assert_eq!(read() - before, 4);
         let before = read();
-        store.run_events_named(&eight, "gate_command").unwrap();
-        assert_eq!(read() - before, 3);
+        store.run_writers(&eight).unwrap();
+        assert_eq!(read() - before, 2);
         let before = read();
-        store.first_run_event(&eight).unwrap();
-        assert_eq!(read() - before, 1);
-        // Neither the finished check nor the run ids hand back an event.
+        store.run_events_by(&eight, a, Some(1)).unwrap();
+        assert_eq!(read() - before, 2);
         let before = read();
-        store.run_finished(&eight).unwrap();
-        store.unfinished_runs_of("rawphp/softfac").unwrap();
         store.runs_of("rawphp/softfac").unwrap();
+        assert_eq!(read() - before, 1);
+        // A yes or no hands back no row of the run.
+        let before = read();
+        store.run_has_event(&eight, "finished").unwrap();
         assert_eq!(read() - before, 0);
     }
 }

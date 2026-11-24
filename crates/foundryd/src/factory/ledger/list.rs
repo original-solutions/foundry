@@ -1383,20 +1383,63 @@ mod tests {
         );
         // Three events: approved, claimed and the move to building.
         run_at(&store, &softfac(2), T0, Some(State::Building), false, true);
-        let read = Store::run_events_read;
+        let read = Store::run_rows_read;
 
         let before = read();
         assert_eq!(
             listed(&store, "rawphp/softfac"),
             [info(softfac(2), Some(State::Building), true)]
         );
-        assert_eq!(read() - before, 3);
+        // The two runs' ids, then the unfinished run's three events.
+        assert_eq!(read() - before, 2 + 3);
 
         let before = read();
         assert_eq!(
             issue_runs(&store, "rawphp/softfac", 1).unwrap(),
             Vec::<RunInfo>::new()
         );
-        assert_eq!(read() - before, 0);
+        assert_eq!(read() - before, 2);
+    }
+
+    /// A run event row of `id` whose record is not JSON at all.
+    fn damaged_run(dir: &Path, id: &RunId) {
+        let owner = MachineId::random();
+        let conn = rusqlite::Connection::open(dir.join("foundry.db")).unwrap();
+        conn.execute(
+            "INSERT INTO factory_records (kind, id, owner, version, record)
+             VALUES ('run_event', ?1, ?2, 1, 'not json')",
+            rusqlite::params![format!("{id}/{owner}/1"), owner.to_string()],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_row_that_is_not_json_makes_only_its_own_run_unreadable() {
+        let (dir, store) = open_store();
+        run_at(&store, &softfac(7), T0, Some(State::Building), false, true);
+        damaged_run(dir.path(), &softfac(6));
+        // A repo whose runs' keys lie in the same range is not read at all.
+        damaged_run(dir.path(), &rid(5, "rawphp/softfac__x", 1));
+        let expected = [
+            info(softfac(7), Some(State::Building), true),
+            RunInfo {
+                unreadable: true,
+                ..info(softfac(6), None, false)
+            },
+        ];
+        assert_eq!(listed(&store, "rawphp/softfac"), expected);
+        assert_eq!(
+            issue_runs(&store, "rawphp/softfac", 6).unwrap(),
+            [expected[1].clone()]
+        );
+    }
+
+    #[test]
+    fn a_finished_run_holding_a_row_this_build_cannot_read_is_not_listed() {
+        let (dir, store) = open_store();
+        run_at(&store, &softfac(4), T0, Some(State::Building), true, true);
+        unreadable_run(dir.path(), &softfac(4));
+        assert_eq!(listed(&store, "rawphp/softfac"), []);
+        assert_eq!(issue_runs(&store, "rawphp/softfac", 4).unwrap(), []);
     }
 }

@@ -2103,7 +2103,9 @@ mod tests {
 
     /// A run of 1,000 events another machine wrote at generation 1: a step, then gate commands
     /// of attempts 1 to 3 every tenth event, the first at `T0` and a second apart.
-    fn a_thousand_events(store: &std::sync::Arc<std::sync::Mutex<crate::store::Store>>) {
+    fn a_thousand_events(
+        store: &std::sync::Arc<std::sync::Mutex<crate::store::Store>>,
+    ) -> MachineId {
         let other = MachineId::random();
         for version in 1..=1000_u64 {
             let ms = T0 + (version - 1) * 1000;
@@ -2118,28 +2120,86 @@ mod tests {
             };
             put(store, other, version, &run(8), 1, ms, name, data, None);
         }
+        other
+    }
+
+    /// A run event row of `run` this build cannot read, as a newer build may leave one.
+    fn put_unreadable(dir: &tempfile::TempDir, run: &RunId) {
+        let owner = MachineId::random();
+        let conn = rusqlite::Connection::open(dir.path().join("foundry.db")).unwrap();
+        conn.execute(
+            "INSERT INTO factory_records (kind, id, owner, version, record)
+             VALUES ('run_event', ?1, ?2, 1, '{\"kind\":\"run_event\",\"later\":true}')",
+            rusqlite::params![format!("{run}/{owner}/1"), owner.to_string()],
+        )
+        .unwrap();
     }
 
     #[test]
-    fn the_write_of_event_1001_reads_no_event_of_the_run() {
+    fn the_write_of_event_1001_reads_one_writer_id_and_no_event() {
         let (_dir, store) = open_store();
-        a_thousand_events(&store);
-        let ledger = ledger(
-            &store,
-            MachineId::random(),
-            2,
-            ticking(T0 + 2_000_000, 1000),
-        );
-        let before = Store::run_events_read();
+        let ledger = ledger(&store, MachineId::random(), 1, ticking(T0, 1000));
+        for _ in 0..1000 {
+            ledger.write(&run(8), &step("red"), &test_cause()).unwrap();
+        }
+        let before = Store::run_rows_read();
         ledger
             .write(&run(8), &step("green"), &test_cause())
             .unwrap();
-        assert_eq!(Store::run_events_read() - before, 0);
+        // This machine's id, the run's only writer, and no event: nothing was stored since.
+        assert_eq!(Store::run_rows_read() - before, 1);
         assert_eq!(held(&store, &run(8)).len(), 1001);
     }
 
     #[test]
-    fn a_finish_after_1000_events_reads_only_the_first_event_and_the_gate_commands() {
+    fn a_ledger_reads_a_runs_history_once_then_only_what_was_stored_since() {
+        let (_dir, store) = open_store();
+        let writer = a_thousand_events(&store);
+        let ledger = ledger(
+            &store,
+            MachineId::random(),
+            2,
+            ticking(T0 + 2_000_000, 1000),
+        );
+        let rows = || Store::run_rows_read();
+
+        // The first write reads the other writer's id and its 1,000 events.
+        let before = rows();
+        ledger
+            .write(&run(8), &step("green"), &test_cause())
+            .unwrap();
+        assert_eq!(rows() - before, 1 + 1000);
+
+        // The next reads the two writers' ids and nothing else.
+        let before = rows();
+        ledger
+            .write(&run(8), &step("refactor"), &test_cause())
+            .unwrap();
+        assert_eq!(rows() - before, 2);
+
+        // An event the other writer stores is the only event the write after it reads.
+        put(
+            &store,
+            writer,
+            1001,
+            &run(8),
+            1,
+            T0,
+            "gate_command",
+            json!({"attempt": 7, "command": "c", "exit_code": 0, "duration_ms": 5}),
+            None,
+        );
+        let before = rows();
+        ledger
+            .finish(&run(8), Outcome::Stuck, None, None, &test_cause(), None)
+            .unwrap();
+        assert_eq!(rows() - before, 2 + 1);
+        // From the other writer's first event at T0, with attempts 1 to 3 and 7.
+        assert_eq!(last(&store).data, finished_data("stuck", 2_002_000, 4));
+    }
+
+    #[test]
+    fn a_finish_after_1000_events_reads_no_event_again() {
         let (_dir, store) = open_store();
         a_thousand_events(&store);
         let ledger = ledger(
@@ -2148,12 +2208,109 @@ mod tests {
             2,
             ticking(T0 + 2_000_000, 1000),
         );
-        let before = Store::run_events_read();
+        ledger
+            .write(&run(8), &step("green"), &test_cause())
+            .unwrap();
+        let before = Store::run_rows_read();
         ledger
             .finish(&run(8), Outcome::Stuck, None, None, &test_cause(), None)
             .unwrap();
-        // The first event, and the 100 gate commands.
-        assert_eq!(Store::run_events_read() - before, 1 + 100);
-        assert_eq!(last(&store).data, finished_data("stuck", 2_000_000, 3));
+        // The two writers' ids.
+        assert_eq!(Store::run_rows_read() - before, 2);
+        assert_eq!(last(&store).data, finished_data("stuck", 2_001_000, 3));
+    }
+
+    #[test]
+    fn a_finished_event_synced_in_after_the_ledger_read_the_run_still_stops_its_next_write() {
+        let (_a_dir, a_store) = open_store();
+        let (_b_dir, b_store) = open_store();
+        let (a, b) = (MachineId::random(), MachineId::random());
+        let first = ledger(&a_store, a, 1, ticking(T0, 1000));
+        let second = ledger(&b_store, b, 2, ticking(T0, 1000));
+        first.write(&run(8), &step("a1"), &test_cause()).unwrap();
+        sync(&a_store, a, &b_store);
+        // The second machine reads the run, the first machine's event included.
+        second.write(&run(8), &step("b1"), &test_cause()).unwrap();
+        // The first machine writes more, then finishes, and its events sync in.
+        first.write(&run(8), &step("a2"), &test_cause()).unwrap();
+        first
+            .finish(&run(8), Outcome::Stuck, None, None, &test_cause(), None)
+            .unwrap();
+        sync(&a_store, a, &b_store);
+        let before = held(&b_store, &run(8));
+        assert!(matches!(
+            second.write(&run(8), &step("b2"), &test_cause()),
+            Err(LedgerError::AlreadyFinished { .. })
+        ));
+        assert!(matches!(
+            second.finish(&run(8), Outcome::Stuck, None, None, &test_cause(), None),
+            Err(LedgerError::AlreadyFinished { .. })
+        ));
+        assert_eq!(held(&b_store, &run(8)), before);
+    }
+
+    #[test]
+    fn a_clone_and_a_second_ledger_of_one_store_each_see_the_others_writes() {
+        let (_dir, store) = open_store();
+        let me = MachineId::random();
+        let first = ledger(&store, me, 1, scripted(&[T0, T0 + 1000, T0 + 9000]));
+        let clone = first.clone();
+        let second = ledger(&store, me, 1, scripted(&[T0 + 2000, T0 + 3000]));
+        first.write(&run(8), &step("red"), &test_cause()).unwrap();
+        second
+            .write(&run(8), &gate(1, "cargo test"), &test_cause())
+            .unwrap();
+        clone
+            .write(&run(8), &gate(2, "cargo test"), &test_cause())
+            .unwrap();
+        second
+            .finish(&run(8), Outcome::Stuck, None, None, &test_cause(), None)
+            .unwrap();
+        assert_eq!(last(&store).data, finished_data("stuck", 3000, 2));
+        assert!(matches!(
+            first.write(&run(8), &step("late"), &test_cause()),
+            Err(LedgerError::AlreadyFinished { .. })
+        ));
+    }
+
+    #[test]
+    fn a_write_to_a_run_holding_a_row_this_build_cannot_read_fails_and_writes_nothing() {
+        let me = MachineId::random();
+        let mine = |store: &std::sync::Arc<std::sync::Mutex<crate::store::Store>>| {
+            store
+                .lock()
+                .unwrap()
+                .factory_since(me, 0, usize::MAX)
+                .unwrap()
+                .len()
+        };
+        // Held before the ledger first reads the run.
+        let (dir, store) = open_store();
+        put_unreadable(&dir, &run(8));
+        let cold = ledger(&store, me, 1, ticking(T0, 1000));
+        assert!(matches!(
+            cold.write(&run(8), &step("red"), &test_cause()),
+            Err(LedgerError::Store(_))
+        ));
+        assert!(matches!(
+            cold.finish(&run(8), Outcome::Stuck, None, None, &test_cause(), None),
+            Err(LedgerError::Store(_))
+        ));
+        assert_eq!(mine(&store), 0);
+
+        // Stored after the ledger read the run.
+        let (dir, store) = open_store();
+        let warm = ledger(&store, me, 1, ticking(T0, 1000));
+        warm.write(&run(9), &step("red"), &test_cause()).unwrap();
+        put_unreadable(&dir, &run(9));
+        assert!(matches!(
+            warm.write(&run(9), &step("green"), &test_cause()),
+            Err(LedgerError::Store(_))
+        ));
+        assert!(matches!(
+            warm.finish(&run(9), Outcome::Stuck, None, None, &test_cause(), None),
+            Err(LedgerError::Store(_))
+        ));
+        assert_eq!(mine(&store), 1);
     }
 }
