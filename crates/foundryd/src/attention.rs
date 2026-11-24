@@ -2,7 +2,9 @@
 //!
 //! An item is not stored. It is read from what holds now, so it is raised as soon as its rule
 //! holds and cleared as soon as it no longer does. The UI polls the list, so a read loads only
-//! the records written since the read before it, never the whole store again:
+//! the records written since the read before it, never the whole store again. The factory
+//! statuses are the exception: each read takes in full the ones held of each project whose
+//! factory is on, one row per project and writing machine:
 //!
 //! | Item | Raised while | Read from |
 //! |---|---|---|
@@ -16,11 +18,37 @@
 //! | Setting overwritten | the shared settings hold an overwritten setting | the settings |
 //! | Update refused | a machine's newest sample names a refused tag | the sample |
 //! | Gateway unhealthy | this machine's read of the gateway fails | [`crate::gateway`] |
+//! | Run stuck | the believed status lists a stuck run | the factory statuses |
+//! | Run needs info | the believed status lists a run that asked questions | the factory statuses |
+//! | Factory idle | the believed status gives a reason, or for [`IDLE_AFTER`] since it saw the factory on this machine has neither held the lease nor heard from its holder | the factory statuses and [`Quiet`], given by [`Attention::with_factory`] |
+//! | Foreign claim | the believed status lists an issue claimed by something other than Foundry | the factory statuses |
+//! | Gate infra | the believed status lists a run whose gate could not run at all | the factory statuses |
 //!
-//! Every row but the gateway's and placement's comes from the synced records and shared settings, so each
-//! machine shows the whole fleet's. Records are read as the rest of the UI sees them: an offline
+//! Every row but the gateway's and placement's comes from the synced records, the shared
+//! settings and the factory statuses, so each machine shows the whole fleet's. The one
+//! exception within them is "factory idle" for want of word from a holder: [`Quiet`] counts
+//! what this machine has heard, so one machine can show it while another does not. Records are read as the rest of the UI sees them: an offline
 //! machine's sessions and terminals are unreachable, so they raise nothing while its "machine
 //! offline" item stands. Another module adds rows through a [`Source`].
+//!
+//! The factory's rows are read only for a project whose factory is on, from the status
+//! [`believed`] picks among the online writers' (P2, "Attention items in P2"). The factory
+//! work of such a project raises none of P1's rows for it (G13), since the run's own row
+//! covers it:
+//!
+//! - a session named in a live run by a status of the project at the highest lease generation
+//!   any of its statuses gives, or that this machine's [`Marks`] say is one of its factory
+//!   sessions of the project, raises no session stuck, waiting or failed item. So a holder
+//!   that went offline names its runs' sessions until a newer holder takes over, and a writer
+//!   a newer holder superseded names none, even while it is believed. Another
+//!   session in a factory workspace, such as one a person starts in a stuck run's workspace,
+//!   still raises its items;
+//! - a workspace such a status names, that [`Marks`] say is one of this machine's factory
+//!   workspaces of the project, or that holds such a factory session, raises no setup failed
+//!   item.
+//!
+//! A project whose factory is off has no factory work: its sessions and workspaces raise P1's
+//! items again, as no factory row covers them.
 //!
 //! - `GET /api/attention`: `{"items": [...]}`, each an [`Item`].
 //! - `POST /api/attention/{id}/dismiss`: dismisses a "setting overwritten" item through the
@@ -32,20 +60,26 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use foundry_proto::ids::{MachineId, SessionId, TerminalId, WorkspaceId};
-use foundry_proto::record::{AnyRecord, Terminal};
-use foundry_proto::settings::{Edit, SettingKey, SettingValue, SharedSettings};
+use foundry_proto::factory::{FactoryStatus, HeldUpKind, NotHolding, RunId};
+use foundry_proto::ids::{MachineId, ProjectId, SessionId, TerminalId, WorkspaceId};
+use foundry_proto::record::{AnyRecord, Session, Terminal};
+use foundry_proto::settings::{
+    Edit, Project, SettingKey, SettingValue, SharedSettings, Stamp, StampKey,
+};
 use foundry_proto::state::{SessionState, TerminalState};
 use serde::Serialize;
 
 use crate::api::edit_status;
-use crate::coordinator::Coordinator;
+use crate::clock::Clock;
+use crate::coordinator::{self, Coordinator};
+use crate::factory::status::{Freshness, believed};
 use crate::machine::{Over, over_limits};
 use crate::secrets::redact;
 use crate::sessions::STUCK_AFTER;
@@ -66,6 +100,11 @@ pub enum Kind {
     PlacementWaiting,
     SettingOverwritten,
     UpdateRefused,
+    RunStuck,
+    RunNeedsInfo,
+    FactoryIdle,
+    ForeignClaim,
+    GateInfra,
 }
 
 impl fmt::Display for Kind {
@@ -81,6 +120,11 @@ impl fmt::Display for Kind {
             Self::PlacementWaiting => "placement_waiting",
             Self::SettingOverwritten => "setting_overwritten",
             Self::UpdateRefused => "update_refused",
+            Self::RunStuck => "run_stuck",
+            Self::RunNeedsInfo => "run_needs_info",
+            Self::FactoryIdle => "factory_idle",
+            Self::ForeignClaim => "foreign_claim",
+            Self::GateInfra => "gate_infra",
         })
     }
 }
@@ -150,8 +194,211 @@ pub trait Source: Send + Sync {
     fn items(&self, fleet: &Fleet) -> Vec<Item>;
 }
 
-/// The items the synced records and shared settings raise: every row but the gateway's.
-pub fn fleet_items(fleet: &Fleet) -> Vec<Item> {
+/// How long a project whose factory is on may go with this machine neither holding its lease
+/// nor hearing from its holder before "factory idle" is raised: the cut-off's 10 minutes (G10).
+pub const IDLE_AFTER: Duration = Duration::from_secs(10 * 60);
+
+/// What this machine knows as factory work of its own: the mark `sessions` keeps beside a
+/// factory session, and the one `workspaces` keeps beside a factory workspace. Asked only of
+/// this machine's own records; a peer's are known from the statuses alone.
+pub trait Marks: Send + Sync {
+    /// The project `session` is one of this machine's factory sessions of, if it is one.
+    fn factory_session(&self, session: SessionId) -> Option<ProjectId>;
+    /// The project `workspace` is one of this machine's factory workspaces of, if it is one.
+    fn factory_workspace(&self, workspace: WorkspaceId) -> Option<ProjectId>;
+}
+
+/// How long each project whose factory is on has gone with this machine neither holding its
+/// lease nor hearing from its holder, as [`Freshness`] counts it, but never longer than since
+/// its factory setting last changed: a factory just turned on is not idle for the time it was
+/// off.
+///
+/// A change is read from the setting's stamp, which every edit of it renews, so a factory
+/// turned off and on between two reads of the list still counts from the read that finds the
+/// new stamp. A project whose setting is there at the first read counts from when this was
+/// made, as [`Freshness`] counts a project never heard from; one whose setting first appears
+/// at a later read counts from that read. So a factory turned on before this machine's first
+/// read since it started is counted from the start, a factory setting that arrives later is
+/// not idle for the time before it arrived, and any edit of a project's factory setting, a
+/// new login too, starts its count again at the next read.
+pub struct Quiet {
+    clock: Arc<dyn Clock>,
+    freshness: Arc<Freshness>,
+    /// The clock's reading when this was made.
+    made: Duration,
+    /// Each project's factory setting as last read. `None` until the first read.
+    seen: Mutex<Option<Counts>>,
+}
+
+/// Each project's factory setting as [`Quiet`] last read it: its stamp, and the clock's reading
+/// its count starts from.
+type Counts = BTreeMap<ProjectId, (Option<Stamp>, Duration)>;
+
+impl Quiet {
+    /// Reads `freshness`, which must count on `clock`.
+    pub fn new(clock: Arc<dyn Clock>, freshness: Arc<Freshness>) -> Self {
+        let made = clock.now();
+        Self {
+            clock,
+            freshness,
+            made,
+            seen: Mutex::new(None),
+        }
+    }
+
+    /// How long each of `on`, the projects whose factory is on in `settings`, has been quiet.
+    fn of(
+        &self,
+        settings: &SharedSettings,
+        on: &BTreeSet<ProjectId>,
+    ) -> BTreeMap<ProjectId, Duration> {
+        let now = self.clock.now();
+        let mut seen = lock(&self.seen);
+        // A setting there at the first read counts from when this was made; one that appears
+        // later, from the read that first finds it.
+        let first_seen = if seen.is_some() { now } else { self.made };
+        let seen = seen.get_or_insert_with(Counts::new);
+        seen.retain(|project, _| settings.project_factory.contains_key(project));
+        for project in settings.project_factory.keys() {
+            let key = StampKey::Setting(SettingKey::ProjectFactory(*project));
+            let stamp = settings.stamps.get(&key).copied();
+            let held = seen.entry(*project).or_insert((stamp, first_seen));
+            if held.0 != stamp {
+                *held = (stamp, now);
+            }
+        }
+        on.iter()
+            .map(|project| {
+                let since = seen.get(project).map_or(first_seen, |(_, since)| *since);
+                let quiet = now.saturating_sub(since);
+                (*project, quiet.min(self.freshness.since_holding(*project)))
+            })
+            .collect()
+    }
+}
+
+/// What the factory's rows read beside the [`Fleet`].
+#[derive(Default)]
+pub struct FactoryFleet<'a> {
+    /// Every status held of each project whose factory is on, from every writer, online or
+    /// not. A project left out has none.
+    pub statuses: BTreeMap<ProjectId, Vec<(MachineId, FactoryStatus)>>,
+    /// This machine's quiet, when it keeps one. Without it "factory idle" is raised only for a
+    /// reason a status gives.
+    pub quiet: Option<&'a Quiet>,
+    /// What this machine marks as factory work, when it is told.
+    pub marks: Option<&'a dyn Marks>,
+}
+
+/// A project whose factory is on, and the status believed of it with its writer.
+struct OnProject<'a> {
+    project: &'a Project,
+    believed: Option<(MachineId, &'a FactoryStatus)>,
+}
+
+/// Each project of `settings` whose factory is on.
+fn factory_on(settings: &SharedSettings) -> impl Iterator<Item = &Project> {
+    settings.projects.iter().filter(|project| {
+        settings
+            .project_factory
+            .get(&project.id)
+            .is_some_and(|f| f.on)
+    })
+}
+
+/// Each project whose factory is on, with its believed status.
+fn on_projects<'a>(
+    fleet: &'a Fleet,
+    factory: &'a FactoryFleet<'_>,
+    acting: MachineId,
+) -> Vec<OnProject<'a>> {
+    factory_on(&fleet.settings)
+        .map(|project| {
+            let statuses = factory
+                .statuses
+                .get(&project.id)
+                .map_or(&[][..], Vec::as_slice);
+            OnProject {
+                project,
+                believed: believed_of(statuses, &fleet.online, acting),
+            }
+        })
+        .collect()
+}
+
+/// The sessions and workspaces whose P1 items are left out because they are factory work (G13).
+#[derive(Default)]
+struct FactoryWork {
+    sessions: BTreeSet<SessionId>,
+    workspaces: BTreeSet<WorkspaceId>,
+}
+
+impl FactoryWork {
+    /// For each project whose factory is on: what a status of it at the highest lease
+    /// generation any of its statuses gives names in a live run, so a holder that went offline
+    /// names its runs' work until a newer holder takes over and a superseded writer names
+    /// nothing; and what this machine marks of its own records as the project's. Then each
+    /// workspace that holds such a session.
+    fn of(fleet: &Fleet, factory: &FactoryFleet<'_>, on: &[OnProject<'_>]) -> Self {
+        let mut work = Self::default();
+        let on_ids: BTreeSet<ProjectId> = on.iter().map(|p| p.project.id).collect();
+        for project in &on_ids {
+            let statuses = factory.statuses.get(project).map_or(&[][..], Vec::as_slice);
+            // A status that does not hold the lease carries the generation the lease ref names
+            // when another machine holds it, so a newer holder seen but not heard from counts.
+            let top = statuses.iter().map(|(_, status)| status.generation).max();
+            let naming = statuses
+                .iter()
+                .filter(|(_, status)| Some(status.generation) == top)
+                .map(|(_, status)| status);
+            for run in naming.flat_map(|status| &status.runs) {
+                work.sessions.extend(&run.sessions);
+                work.workspaces.extend(&run.workspaces);
+            }
+        }
+        if let Some(marks) = factory.marks {
+            let ours = |project: Option<ProjectId>| project.is_some_and(|p| on_ids.contains(&p));
+            for record in &fleet.records {
+                match record {
+                    AnyRecord::Session(r)
+                        if r.owner == fleet.me && ours(marks.factory_session(r.body.id)) =>
+                    {
+                        work.sessions.insert(r.body.id);
+                    }
+                    AnyRecord::Workspace(r)
+                        if r.owner == fleet.me && ours(marks.factory_workspace(r.body.id)) =>
+                    {
+                        work.workspaces.insert(r.body.id);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for record in &fleet.records {
+            if let AnyRecord::Session(r) = record
+                && work.sessions.contains(&r.body.id)
+            {
+                work.workspaces.insert(r.body.workspace);
+            }
+        }
+        work
+    }
+
+    fn session(&self, session: &Session) -> bool {
+        self.sessions.contains(&session.id)
+    }
+
+    fn workspace(&self, workspace: WorkspaceId) -> bool {
+        self.workspaces.contains(&workspace)
+    }
+}
+
+/// The items the synced records, the shared settings and the factory statuses raise: every
+/// row but the gateway's and placement's. A session or workspace that is factory work raises
+/// none of P1's session or setup items.
+pub fn fleet_items(fleet: &Fleet, factory: &FactoryFleet<'_>) -> Vec<Item> {
+    let acting = coordinator::acting(&fleet.settings.priority, &fleet.online);
+    let on = on_projects(fleet, factory, acting);
     let mut items = Vec::new();
     for machine in &fleet.settings.machines {
         if !fleet.online.contains(&machine.id) {
@@ -193,9 +440,10 @@ pub fn fleet_items(fleet: &Fleet) -> Vec<Item> {
         None => String::new(),
     };
 
+    let work = FactoryWork::of(fleet, factory, &on);
     for record in &fleet.records {
         match record {
-            AnyRecord::Session(r) if !r.deleted => {
+            AnyRecord::Session(r) if !r.deleted && !work.session(&r.body) => {
                 let session = &r.body;
                 let place = format!(
                     "A session in {} on {}",
@@ -227,7 +475,7 @@ pub fn fleet_items(fleet: &Fleet) -> Vec<Item> {
                 item.terminal = Some(session.terminal);
                 items.push(item);
             }
-            AnyRecord::Workspace(r) if !r.deleted => {
+            AnyRecord::Workspace(r) if !r.deleted && !work.workspace(r.body.id) => {
                 let Some(setup) = r.body.setup else { continue };
                 let failed = terminals.get(&setup).is_some_and(|(deleted, t)| {
                     !deleted && t.state == TerminalState::Exited && t.exit_code != Some(0)
@@ -323,7 +571,184 @@ pub fn fleet_items(fleet: &Fleet) -> Vec<Item> {
         ));
     }
 
+    items.extend(factory_items(fleet, factory, &on, acting));
     items
+}
+
+/// The factory's rows, for each project whose factory is on.
+fn factory_items(
+    fleet: &Fleet,
+    factory: &FactoryFleet<'_>,
+    on: &[OnProject<'_>],
+    acting: MachineId,
+) -> Vec<Item> {
+    let quiet = factory
+        .quiet
+        .map(|quiet| quiet.of(&fleet.settings, &on.iter().map(|p| p.project.id).collect()))
+        .unwrap_or_default();
+    let mut items = Vec::new();
+    for &OnProject { project, believed } in on {
+        let quiet = quiet
+            .get(&project.id)
+            .is_some_and(|quiet| *quiet >= IDLE_AFTER);
+        if let Some(item) = idle(fleet, project.id, &project.name, believed, quiet, acting) {
+            items.push(item);
+        }
+        let Some((writer, status)) = believed else {
+            continue;
+        };
+        for held in &status.held_up {
+            let (kind, what, todo) = match held.kind {
+                HeldUpKind::Stuck => (
+                    Kind::RunStuck,
+                    format!("The factory's run of {} is stuck", issue(&held.run)),
+                    "Read the factory's last comment on the issue, fix the cause, then move the \
+                     issue out of factory:stuck",
+                ),
+                HeldUpKind::NeedsInfo => (
+                    Kind::RunNeedsInfo,
+                    format!("The factory's run of {} asked questions", issue(&held.run)),
+                    "Answer them in a comment on the issue",
+                ),
+            };
+            items.push(fleet.item(
+                kind,
+                &held.run,
+                writer,
+                format!("{what}: {}", redact(&held.reason)),
+                todo.to_owned(),
+            ));
+        }
+        for run in &status.gate_infra {
+            items.push(fleet.item(
+                Kind::GateInfra,
+                run,
+                writer,
+                format!(
+                    "A gate of the factory's run of {} could not run at all",
+                    issue(run)
+                ),
+                "Check that a machine that holds the project's GitHub login is online with free \
+                 disk and can fetch the repo; the factory tries the gate again after 1, 2, 4 and \
+                 8 passes"
+                    .to_owned(),
+            ));
+        }
+        for claim in &status.foreign {
+            items.push(fleet.item(
+                Kind::ForeignClaim,
+                format!("{}__{}", project.id, claim.issue),
+                writer,
+                format!(
+                    "Issue #{} of {}, {}, is in factory:{} under a claim that is not Foundry's",
+                    claim.issue,
+                    project.name,
+                    redact(&claim.title),
+                    claim.state
+                ),
+                format!(
+                    "Foundry leaves it alone: let whatever claimed it finish, or move the issue \
+                     out of factory:{}",
+                    claim.state
+                ),
+            ));
+        }
+    }
+    items
+}
+
+/// `owner/name#N` of `run`'s issue.
+fn issue(run: &RunId) -> String {
+    format!("{}#{}", run.repo(), run.issue())
+}
+
+/// The status [`believed`] picks among `statuses`, with the machine that wrote it.
+fn believed_of<'a>(
+    statuses: &'a [(MachineId, FactoryStatus)],
+    online: &BTreeSet<MachineId>,
+    acting: MachineId,
+) -> Option<(MachineId, &'a FactoryStatus)> {
+    let status = believed(statuses, online, acting)?;
+    // `believed` gives no writer, so it is picked again by the same rule here; #196 has
+    // `believed` return it and removes this.
+    // A holding status is believed from the lowest machine id among equals; any other is the
+    // acting coordinator's.
+    statuses
+        .iter()
+        .filter(|(writer, held)| online.contains(writer) && *held == status)
+        .filter(|(writer, _)| status.holds || *writer == acting)
+        .min_by_key(|(writer, _)| *writer)
+        .map(|(writer, held)| (*writer, held))
+}
+
+/// The "factory idle" item of `project`, when it stands: for a reason the believed status
+/// gives, else when this machine has gone [`IDLE_AFTER`] with neither the lease nor word from
+/// its holder (`quiet`).
+fn idle(
+    fleet: &Fleet,
+    project: ProjectId,
+    name: &str,
+    believed: Option<(MachineId, &FactoryStatus)>,
+    quiet: bool,
+    acting: MachineId,
+) -> Option<Item> {
+    let item = |machine, what: String, todo: String| {
+        Some(fleet.item(Kind::FactoryIdle, project, machine, what, todo))
+    };
+    match believed {
+        Some((writer, status)) if status.holds => {
+            if let Some(reason) = &status.idle {
+                return item(
+                    writer,
+                    format!("The factory of {name} is idle: {}", redact(reason)),
+                    "Fix what it names; the factory starts again on its next pass".to_owned(),
+                );
+            }
+        }
+        Some((writer, status)) => {
+            if let Some(NotHolding::NoToken { login }) = &status.not_holding {
+                let on = fleet.name(writer);
+                return item(
+                    writer,
+                    format!(
+                        "The factory of {name} is idle: {on}, the acting coordinator, holds no \
+                         token for the GitHub login {login}"
+                    ),
+                    format!("Run `foundryd secret set github:{login}` on {on}"),
+                );
+            }
+        }
+        None => {}
+    }
+    if !quiet {
+        return None;
+    }
+    let minutes = IDLE_AFTER.as_secs() / 60;
+    let todo = "Check that the acting coordinator is on, speaks protocol 5 and can reach \
+                GitHub"
+        .to_owned();
+    match believed.and_then(|(_, status)| status.not_holding.as_ref()) {
+        Some(NotHolding::HeldBy {
+            machine,
+            generation,
+        }) => item(
+            *machine,
+            format!(
+                "The factory of {name} has had no word for {minutes} minutes from {}, which \
+                 holds its lease at generation {generation}",
+                fleet.name(*machine)
+            ),
+            todo,
+        ),
+        _ => item(
+            acting,
+            format!(
+                "The factory of {name} has had no word from a holder of its lease for \
+                 {minutes} minutes"
+            ),
+            todo,
+        ),
+    }
 }
 
 /// One value of an overwritten setting as the item shows it, `removed` for none. A project's
@@ -455,6 +880,8 @@ pub struct Attention {
     coordinator: Arc<Coordinator>,
     sources: Vec<Arc<dyn Source>>,
     held: Arc<Mutex<Held>>,
+    quiet: Option<Arc<Quiet>>,
+    marks: Option<Arc<dyn Marks>>,
 }
 
 impl Attention {
@@ -471,6 +898,8 @@ impl Attention {
             coordinator,
             sources: Vec::new(),
             held: Arc::default(),
+            quiet: None,
+            marks: None,
         }
     }
 
@@ -480,18 +909,38 @@ impl Attention {
         self
     }
 
+    /// Reads this machine's `freshness`, which counts on `clock`, for "factory idle", and its
+    /// `marks` for the factory work whose P1 items are left out. Without them the factory's
+    /// items are still read from the statuses.
+    pub fn with_factory(
+        mut self,
+        clock: Arc<dyn Clock>,
+        freshness: Arc<Freshness>,
+        marks: Arc<dyn Marks>,
+    ) -> Self {
+        self.quiet = Some(Arc::new(Quiet::new(clock, freshness)));
+        self.marks = Some(marks);
+        self
+    }
+
     /// Every item that stands now, ordered by kind and then id. Only the records written since
-    /// the last read are loaded. They are shown as [`Peers::state`] shows them, so an offline
+    /// the last read are loaded, but the factory statuses of each project whose factory is on
+    /// are read in full on every call. Records are shown as [`Peers::state`] shows them, so an offline
     /// machine's sessions and terminals are unreachable and raise nothing but its "machine
     /// offline" item.
     pub async fn items(&self) -> Result<Vec<Item>, StoreError> {
         let online = self.peers.online();
-        let (records, settings) = on_store(&self.store, {
+        let (records, settings, statuses) = on_store(&self.store, {
             let (held, online) = (Arc::clone(&self.held), online.clone());
             move |store| {
                 let mut held = lock(&held);
                 held.load(store)?;
-                Ok::<_, StoreError>((held.as_seen(&online), store.settings()?))
+                let settings = store.settings()?;
+                let mut statuses = BTreeMap::new();
+                for project in factory_on(&settings) {
+                    statuses.insert(project.id, store.statuses(project.id)?);
+                }
+                Ok::<_, StoreError>((held.as_seen(&online), settings, statuses))
             }
         })
         .await?;
@@ -501,7 +950,12 @@ impl Attention {
             settings,
             online,
         };
-        let mut items = fleet_items(&fleet);
+        let factory = FactoryFleet {
+            statuses,
+            quiet: self.quiet.as_deref(),
+            marks: self.marks.as_deref(),
+        };
+        let mut items = fleet_items(&fleet, &factory);
         for source in &self.sources {
             items.extend(source.items(&fleet));
         }
@@ -572,15 +1026,41 @@ mod tests {
     use foundry_proto::ids::{ProjectId, SessionId, WorkspaceId};
     use foundry_proto::messages::{PROTOCOL, PeerMessage};
     use foundry_proto::record::{MachineSample, Record, Session, Workspace};
-    use foundry_proto::settings::{Limits, Machine, Outcome, Overwritten, Project, Stamp};
+    use foundry_proto::settings::{
+        Limits, Machine, Outcome, Overwritten, Project, Stamp, StampKey,
+    };
     use futures::future::BoxFuture;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
+    use foundry_proto::factory::{
+        FactoryBody, FactoryRecord, FactoryStatus, ForeignClaim, HeldUp, HeldUpKind, LiveRun,
+        NotHolding, ProjectFactory, RunId,
+    };
+
     use super::*;
+    use crate::clock::{Clock, FakeClock};
     use crate::coordinator::CoordinatorError;
+    use crate::factory::status::{Freshness, PassResults, build, not_holding};
     use crate::sync::{Conn, Dialer};
 
     const GB: u64 = 1_000_000_000;
+
+    /// What this machine marks as factory work, in a test.
+    #[derive(Default)]
+    struct Marked {
+        sessions: BTreeMap<SessionId, ProjectId>,
+        workspaces: BTreeMap<WorkspaceId, ProjectId>,
+    }
+
+    impl Marks for Marked {
+        fn factory_session(&self, session: SessionId) -> Option<ProjectId> {
+            self.sessions.get(&session).copied()
+        }
+
+        fn factory_workspace(&self, workspace: WorkspaceId) -> Option<ProjectId> {
+            self.workspaces.get(&workspace).copied()
+        }
+    }
 
     /// This machine and one peer, both named and both heard from, holding nothing yet.
     struct World {
@@ -590,6 +1070,11 @@ mod tests {
         settings: SharedSettings,
         online: BTreeSet<MachineId>,
         version: u64,
+        /// Every writer's status of each project.
+        statuses: BTreeMap<ProjectId, Vec<(MachineId, FactoryStatus)>>,
+        /// This machine's freshness and quiet on a clock the test moves, when it keeps them.
+        quiet: Option<(Arc<Freshness>, Quiet)>,
+        marked: Marked,
     }
 
     impl World {
@@ -611,7 +1096,54 @@ mod tests {
                 },
                 online: [me, peer].into(),
                 version: 0,
+                statuses: BTreeMap::new(),
+                quiet: None,
+                marked: Marked::default(),
             }
+        }
+
+        /// A project named `foundry` whose factory is `on`, with this machine first in the
+        /// coordinator order, so it acts.
+        fn factory_project(&mut self, on: bool) -> ProjectId {
+            let id = with_factory_on(self.me, &mut self.settings);
+            self.turn(id, on);
+            self.settings.priority = vec![self.me, self.peer];
+            id
+        }
+
+        /// Turns `project`'s factory `on` or off, with a new stamp, as an edit does.
+        fn turn(&mut self, project: ProjectId, on: bool) {
+            self.settings
+                .project_factory
+                .get_mut(&project)
+                .expect("a factory project")
+                .on = on;
+            self.settings.seq += 1;
+            self.settings.stamps.insert(
+                StampKey::Setting(SettingKey::ProjectFactory(project)),
+                Stamp {
+                    seq: self.settings.seq,
+                    by: self.me,
+                },
+            );
+        }
+
+        /// Puts `status` in place of any status `writer` wrote of its project.
+        fn status(&mut self, writer: MachineId, status: FactoryStatus) {
+            let held = self.statuses.entry(status.project).or_default();
+            held.retain(|(w, _)| *w != writer);
+            held.push((writer, status));
+        }
+
+        /// Gives this machine a freshness and a quiet on a fake clock, and returns the clock.
+        fn keep_freshness(&mut self) -> Arc<FakeClock> {
+            let (clock, freshness, quiet) = fake_quiet();
+            self.quiet = Some((freshness, quiet));
+            clock
+        }
+
+        fn freshness(&self) -> &Freshness {
+            &self.quiet.as_ref().expect("keep_freshness was called").0
         }
 
         fn record<T>(&mut self, owner: MachineId, deleted: bool, body: T) -> Record<T> {
@@ -718,12 +1250,18 @@ mod tests {
         }
 
         fn items(&self) -> Vec<Item> {
-            fleet_items(&Fleet {
+            let fleet = Fleet {
                 me: self.me,
                 records: self.records.clone(),
                 settings: self.settings.clone(),
                 online: self.online.clone(),
-            })
+            };
+            let factory = FactoryFleet {
+                statuses: self.statuses.clone(),
+                quiet: self.quiet.as_ref().map(|(_, q)| q),
+                marks: Some(&self.marked),
+            };
+            fleet_items(&fleet, &factory)
         }
 
         fn of(&self, kind: Kind) -> Vec<Item> {
@@ -1203,6 +1741,873 @@ mod tests {
         assert!(world.of(Kind::UpdateRefused).is_empty());
     }
 
+    // --- factory items ---
+
+    const MINUTE: Duration = Duration::from_secs(60);
+
+    /// A fake clock, a freshness on it and a quiet that reads both.
+    fn fake_quiet() -> (Arc<FakeClock>, Arc<Freshness>, Quiet) {
+        let clock = Arc::new(FakeClock::new());
+        let dyn_clock: Arc<dyn Clock> = clock.clone();
+        let freshness = Arc::new(Freshness::new(dyn_clock.clone()));
+        let quiet = Quiet::new(dyn_clock, freshness.clone());
+        (clock, freshness, quiet)
+    }
+
+    fn run(issue: u64) -> RunId {
+        RunId::new("o/foundry", issue, 1).unwrap()
+    }
+
+    /// A status that holds `project`'s lease at `generation`, after pass `pass`.
+    fn holding(project: ProjectId, generation: u64, pass: u64) -> FactoryStatus {
+        build(PassResults {
+            generation,
+            pass,
+            ..PassResults::new(project)
+        })
+    }
+
+    fn held_up(issue: u64, kind: HeldUpKind, reason: &str) -> HeldUp {
+        HeldUp {
+            run: run(issue),
+            kind,
+            reason: reason.into(),
+        }
+    }
+
+    // run stuck
+
+    #[test]
+    fn a_stuck_run_in_the_believed_status_raises_run_stuck() {
+        let mut world = World::new();
+        let project = world.factory_project(true);
+        let mut status = holding(project, 3, 7);
+        status
+            .held_up
+            .push(held_up(12, HeldUpKind::Stuck, "the gate failed 3 times"));
+        world.status(world.peer, status);
+        let items = world.of(Kind::RunStuck);
+        assert_eq!(items.len(), 1, "{items:?}");
+        let item = &items[0];
+        assert_eq!(item.id, format!("run_stuck:{}", run(12)));
+        assert_eq!(item.machine, world.peer);
+        assert_eq!(item.machine_name, "trilogy-mac");
+        assert!(item.what.contains("o/foundry#12"), "{}", item.what);
+        assert!(
+            item.what.contains("the gate failed 3 times"),
+            "{}",
+            item.what
+        );
+        assert!(!item.todo.is_empty());
+        assert!(world.of(Kind::RunNeedsInfo).is_empty());
+    }
+
+    #[test]
+    fn an_issue_that_leaves_stuck_clears_run_stuck() {
+        let mut world = World::new();
+        let project = world.factory_project(true);
+        let mut status = holding(project, 3, 7);
+        status.held_up.push(held_up(12, HeldUpKind::Stuck, "no"));
+        world.status(world.peer, status);
+        assert_eq!(world.of(Kind::RunStuck).len(), 1);
+        world.status(world.peer, holding(project, 3, 8));
+        assert!(world.of(Kind::RunStuck).is_empty());
+    }
+
+    // run needs info
+
+    #[test]
+    fn a_run_that_posts_questions_raises_run_needs_info() {
+        let mut world = World::new();
+        let project = world.factory_project(true);
+        let mut status = holding(project, 3, 7);
+        status
+            .held_up
+            .push(held_up(14, HeldUpKind::NeedsInfo, "which login"));
+        world.status(world.peer, status);
+        let items = world.of(Kind::RunNeedsInfo);
+        assert_eq!(items.len(), 1, "{items:?}");
+        let item = &items[0];
+        assert_eq!(item.id, format!("run_needs_info:{}", run(14)));
+        assert_eq!(item.machine, world.peer);
+        assert!(item.what.contains("o/foundry#14"), "{}", item.what);
+        assert!(item.what.contains("which login"), "{}", item.what);
+        assert!(world.of(Kind::RunStuck).is_empty());
+    }
+
+    #[test]
+    fn an_issue_that_leaves_needs_info_clears_run_needs_info() {
+        let mut world = World::new();
+        let project = world.factory_project(true);
+        let mut status = holding(project, 3, 7);
+        status
+            .held_up
+            .push(held_up(14, HeldUpKind::NeedsInfo, "which login"));
+        world.status(world.peer, status);
+        assert_eq!(world.of(Kind::RunNeedsInfo).len(), 1);
+        world.status(world.peer, holding(project, 3, 8));
+        assert!(world.of(Kind::RunNeedsInfo).is_empty());
+    }
+
+    // factory idle
+
+    #[test]
+    fn a_reason_in_the_holders_status_raises_factory_idle() {
+        let mut world = World::new();
+        let project = world.factory_project(true);
+        let mut status = holding(project, 3, 7);
+        status.idle = Some("gh failed three passes running".into());
+        world.status(world.peer, status);
+        let items = world.of(Kind::FactoryIdle);
+        assert_eq!(items.len(), 1, "{items:?}");
+        let item = &items[0];
+        assert_eq!(item.id, format!("factory_idle:{project}"));
+        assert_eq!(item.machine, world.peer);
+        assert!(item.what.contains("foundry"), "{}", item.what);
+        assert!(
+            item.what.contains("gh failed three passes running"),
+            "{}",
+            item.what
+        );
+    }
+
+    #[test]
+    fn the_reason_going_clears_factory_idle() {
+        let mut world = World::new();
+        let project = world.factory_project(true);
+        let mut status = holding(project, 3, 7);
+        status.idle = Some(".dw/config.yml does not load".into());
+        world.status(world.peer, status);
+        assert_eq!(world.of(Kind::FactoryIdle).len(), 1);
+        world.status(world.peer, holding(project, 3, 8));
+        assert!(world.of(Kind::FactoryIdle).is_empty());
+    }
+
+    #[test]
+    fn a_coordinator_with_no_token_raises_factory_idle_naming_the_login() {
+        let mut world = World::new();
+        let project = world.factory_project(true);
+        let status = not_holding(
+            project,
+            NotHolding::NoToken {
+                login: "octocat".into(),
+            },
+        );
+        world.status(world.me, status);
+        let items = world.of(Kind::FactoryIdle);
+        assert_eq!(items.len(), 1, "{items:?}");
+        let item = &items[0];
+        assert_eq!(item.machine, world.me);
+        assert!(item.what.contains("octocat"), "{}", item.what);
+        assert!(item.todo.contains("github:octocat"), "{}", item.todo);
+
+        // A holder heard from again clears it.
+        world.status(world.peer, holding(project, 1, 1));
+        assert!(world.of(Kind::FactoryIdle).is_empty());
+    }
+
+    #[test]
+    fn ten_minutes_with_no_holding_status_raises_factory_idle_for_a_project_whose_factory_is_on() {
+        let mut world = World::new();
+        let project = world.factory_project(true);
+        let clock = world.keep_freshness();
+        clock.advance(10 * MINUTE - Duration::from_secs(1));
+        assert!(world.of(Kind::FactoryIdle).is_empty());
+        clock.advance(Duration::from_secs(1));
+        let items = world.of(Kind::FactoryIdle);
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items[0].id, format!("factory_idle:{project}"));
+        assert!(items[0].what.contains("10 minutes"), "{}", items[0].what);
+    }
+
+    #[test]
+    fn a_status_that_does_not_hold_the_lease_for_ten_minutes_raises_factory_idle() {
+        let mut world = World::new();
+        let project = world.factory_project(true);
+        let clock = world.keep_freshness();
+        let peer = world.peer;
+        let status = not_holding(
+            project,
+            NotHolding::HeldBy {
+                machine: peer,
+                generation: 4,
+            },
+        );
+        world.status(world.me, status);
+        world.freshness().received(&world.statuses[&project][0].1);
+        clock.advance(9 * MINUTE);
+        assert!(world.of(Kind::FactoryIdle).is_empty());
+        clock.advance(MINUTE);
+        let items = world.of(Kind::FactoryIdle);
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items[0].machine, world.peer);
+        assert!(items[0].what.contains("trilogy-mac"), "{}", items[0].what);
+    }
+
+    #[test]
+    fn a_project_whose_factory_is_off_raises_no_factory_idle_after_ten_minutes() {
+        let mut world = World::new();
+        world.factory_project(false);
+        let clock = world.keep_freshness();
+        clock.advance(60 * MINUTE);
+        assert!(
+            world.of(Kind::FactoryIdle).is_empty(),
+            "{:?}",
+            world.items()
+        );
+    }
+
+    #[test]
+    fn holding_the_lease_or_hearing_from_its_holder_clears_factory_idle() {
+        let mut world = World::new();
+        let project = world.factory_project(true);
+        let clock = world.keep_freshness();
+        clock.advance(10 * MINUTE);
+        assert_eq!(world.of(Kind::FactoryIdle).len(), 1);
+        world.freshness().held(project);
+        assert!(world.of(Kind::FactoryIdle).is_empty());
+
+        clock.advance(10 * MINUTE);
+        assert_eq!(world.of(Kind::FactoryIdle).len(), 1);
+        let status = holding(project, 2, 9);
+        world.freshness().received(&status);
+        world.status(world.peer, status);
+        assert!(world.of(Kind::FactoryIdle).is_empty());
+    }
+
+    #[test]
+    fn a_first_read_long_after_the_start_raises_factory_idle_at_once() {
+        let mut world = World::new();
+        world.factory_project(true);
+        let clock = world.keep_freshness();
+        clock.advance(30 * MINUTE);
+        assert_eq!(world.of(Kind::FactoryIdle).len(), 1, "{:?}", world.items());
+    }
+
+    #[test]
+    fn a_factory_turned_off_and_on_between_two_reads_counts_from_the_second() {
+        let mut world = World::new();
+        let project = world.factory_project(true);
+        let clock = world.keep_freshness();
+        assert!(world.of(Kind::FactoryIdle).is_empty());
+        clock.advance(60 * MINUTE);
+        world.turn(project, false);
+        world.turn(project, true);
+        assert!(
+            world.of(Kind::FactoryIdle).is_empty(),
+            "{:?}",
+            world.items()
+        );
+        clock.advance(10 * MINUTE);
+        assert_eq!(world.of(Kind::FactoryIdle).len(), 1);
+    }
+
+    #[test]
+    fn a_factory_setting_first_seen_after_a_read_counts_from_that_read() {
+        let mut world = World::new();
+        let first = world.factory_project(true);
+        let clock = world.keep_freshness();
+        let idle = |world: &World| {
+            let mut ids: Vec<String> = world
+                .of(Kind::FactoryIdle)
+                .into_iter()
+                .map(|i| i.id)
+                .collect();
+            ids.sort();
+            ids
+        };
+        assert!(idle(&world).is_empty());
+        clock.advance(30 * MINUTE);
+        // A second project's factory setting arrives after that read, already on. The first
+        // project, there at the first read, still counts from the start.
+        let second = world.factory_project(true);
+        assert_eq!(idle(&world), [format!("factory_idle:{first}")]);
+        clock.advance(9 * MINUTE);
+        assert_eq!(idle(&world), [format!("factory_idle:{first}")]);
+        clock.advance(MINUTE);
+        let mut both = vec![
+            format!("factory_idle:{first}"),
+            format!("factory_idle:{second}"),
+        ];
+        both.sort();
+        assert_eq!(idle(&world), both);
+    }
+
+    #[test]
+    fn a_holder_that_is_believed_but_sends_nothing_new_for_ten_minutes_raises_factory_idle() {
+        let mut world = World::new();
+        let project = world.factory_project(true);
+        let clock = world.keep_freshness();
+        let status = holding(project, 2, 9);
+        world.freshness().received(&status);
+        world.status(world.peer, status);
+        clock.advance(10 * MINUTE);
+        let items = world.of(Kind::FactoryIdle);
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items[0].machine, world.me);
+        assert!(items[0].what.contains("10 minutes"), "{}", items[0].what);
+
+        let status = holding(project, 2, 10);
+        world.freshness().received(&status);
+        world.status(world.peer, status);
+        assert!(world.of(Kind::FactoryIdle).is_empty());
+    }
+
+    #[test]
+    fn the_ten_minutes_count_from_when_the_factory_is_seen_on() {
+        let mut world = World::new();
+        let project = world.factory_project(false);
+        let clock = world.keep_freshness();
+        clock.advance(60 * MINUTE);
+        assert!(world.of(Kind::FactoryIdle).is_empty());
+        world.turn(project, true);
+        assert!(
+            world.of(Kind::FactoryIdle).is_empty(),
+            "{:?}",
+            world.items()
+        );
+        clock.advance(9 * MINUTE);
+        assert!(
+            world.of(Kind::FactoryIdle).is_empty(),
+            "{:?}",
+            world.items()
+        );
+        clock.advance(MINUTE);
+        assert_eq!(world.of(Kind::FactoryIdle).len(), 1);
+
+        // Off and on again: the count starts again.
+        world.turn(project, false);
+        assert!(world.of(Kind::FactoryIdle).is_empty());
+        world.turn(project, true);
+        assert!(
+            world.of(Kind::FactoryIdle).is_empty(),
+            "{:?}",
+            world.items()
+        );
+    }
+
+    #[test]
+    fn no_token_names_the_acting_coordinator_when_another_writer_says_the_same() {
+        let mut world = World::new();
+        let project = world.factory_project(true);
+        // The peer was acting before this machine and wrote the same status.
+        for writer in [world.peer, world.me] {
+            let status = not_holding(
+                project,
+                NotHolding::NoToken {
+                    login: "octocat".into(),
+                },
+            );
+            world.status(writer, status);
+        }
+        world.settings.priority = vec![world.me, world.peer];
+        let items = world.of(Kind::FactoryIdle);
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items[0].machine, world.me);
+        assert!(items[0].todo.contains("this-mac"), "{}", items[0].todo);
+
+        world.settings.priority = vec![world.peer, world.me];
+        let items = world.of(Kind::FactoryIdle);
+        assert_eq!(items[0].machine, world.peer);
+        assert!(items[0].todo.contains("trilogy-mac"), "{}", items[0].todo);
+    }
+
+    #[test]
+    fn a_password_in_a_statuses_text_is_hidden_from_every_factory_item() {
+        let secret = "git fetch https://tom:hunter2@github.com/o/foundry.git failed";
+        let mut world = World::new();
+        let project = world.factory_project(true);
+        let mut status = holding(project, 3, 7);
+        status.idle = Some(secret.into());
+        status.held_up.push(held_up(12, HeldUpKind::Stuck, secret));
+        status
+            .held_up
+            .push(held_up(14, HeldUpKind::NeedsInfo, secret));
+        status.foreign.push(ForeignClaim {
+            issue: 21,
+            title: secret.into(),
+            state: "building".into(),
+        });
+        world.status(world.peer, status);
+        let items = factory_items_of(&world);
+        assert_eq!(items.len(), 4, "{items:?}");
+        for item in &items {
+            let text = serde_json::to_string(item).unwrap();
+            assert!(!text.contains("hunter2"), "{text}");
+            assert!(item.what.contains("***@github.com"), "{}", item.what);
+        }
+    }
+
+    #[test]
+    fn a_machine_that_keeps_no_freshness_raises_factory_idle_only_for_a_reason() {
+        let mut world = World::new();
+        let project = world.factory_project(true);
+        assert!(world.of(Kind::FactoryIdle).is_empty());
+        world.status(world.peer, holding(project, 1, 1));
+        assert!(world.of(Kind::FactoryIdle).is_empty());
+    }
+
+    // foreign claim
+
+    #[test]
+    fn a_foreign_claim_in_the_status_raises_foreign_claim() {
+        let mut world = World::new();
+        let project = world.factory_project(true);
+        let mut status = holding(project, 3, 7);
+        status.foreign.push(ForeignClaim {
+            issue: 21,
+            title: "port the gate".into(),
+            state: "building".into(),
+        });
+        world.status(world.peer, status);
+        let items = world.of(Kind::ForeignClaim);
+        assert_eq!(items.len(), 1, "{items:?}");
+        let item = &items[0];
+        assert_eq!(item.id, format!("foreign_claim:{project}__21"));
+        assert_eq!(item.machine, world.peer);
+        assert!(item.what.contains("#21"), "{}", item.what);
+        assert!(item.what.contains("port the gate"), "{}", item.what);
+        assert!(item.what.contains("factory:building"), "{}", item.what);
+    }
+
+    #[test]
+    fn a_foreign_claim_the_status_no_longer_lists_clears() {
+        let mut world = World::new();
+        let project = world.factory_project(true);
+        let mut status = holding(project, 3, 7);
+        status.foreign.push(ForeignClaim {
+            issue: 21,
+            title: "port the gate".into(),
+            state: "triage".into(),
+        });
+        world.status(world.peer, status);
+        assert_eq!(world.of(Kind::ForeignClaim).len(), 1);
+        world.status(world.peer, holding(project, 3, 8));
+        assert!(world.of(Kind::ForeignClaim).is_empty());
+    }
+
+    // gate infra
+
+    #[test]
+    fn a_gate_that_could_not_run_raises_gate_infra() {
+        let mut world = World::new();
+        let project = world.factory_project(true);
+        let mut status = holding(project, 3, 7);
+        status.gate_infra.push(run(30));
+        world.status(world.peer, status);
+        let items = world.of(Kind::GateInfra);
+        assert_eq!(items.len(), 1, "{items:?}");
+        let item = &items[0];
+        assert_eq!(item.id, format!("gate_infra:{}", run(30)));
+        assert_eq!(item.machine, world.peer);
+        assert!(item.what.contains("o/foundry#30"), "{}", item.what);
+    }
+
+    #[test]
+    fn a_gate_that_starts_or_a_run_that_ends_clears_gate_infra() {
+        let mut world = World::new();
+        let project = world.factory_project(true);
+        let mut status = holding(project, 3, 7);
+        status.gate_infra.push(run(30));
+        world.status(world.peer, status);
+        assert_eq!(world.of(Kind::GateInfra).len(), 1);
+        world.status(world.peer, holding(project, 3, 8));
+        assert!(world.of(Kind::GateInfra).is_empty());
+    }
+
+    // which status is read
+
+    /// A status that holds the lease and has one of each item a status raises.
+    fn busy_status(project: ProjectId, generation: u64) -> FactoryStatus {
+        let mut status = holding(project, generation, 7);
+        status.idle = Some("gh failed three passes running".into());
+        status.held_up.push(held_up(12, HeldUpKind::Stuck, "no"));
+        status
+            .held_up
+            .push(held_up(14, HeldUpKind::NeedsInfo, "which login"));
+        status.gate_infra.push(run(30));
+        status.foreign.push(ForeignClaim {
+            issue: 21,
+            title: "port the gate".into(),
+            state: "building".into(),
+        });
+        status
+    }
+
+    const FACTORY_KINDS: [Kind; 5] = [
+        Kind::RunStuck,
+        Kind::RunNeedsInfo,
+        Kind::FactoryIdle,
+        Kind::ForeignClaim,
+        Kind::GateInfra,
+    ];
+
+    fn factory_items_of(world: &World) -> Vec<Item> {
+        world
+            .items()
+            .into_iter()
+            .filter(|i| FACTORY_KINDS.contains(&i.kind))
+            .collect()
+    }
+
+    #[test]
+    fn a_project_whose_factory_is_off_raises_no_factory_item() {
+        let mut world = World::new();
+        let project = world.factory_project(false);
+        world.status(world.peer, busy_status(project, 3));
+        assert!(factory_items_of(&world).is_empty(), "{:?}", world.items());
+    }
+
+    #[test]
+    fn a_status_from_a_holder_that_is_offline_raises_nothing() {
+        let mut world = World::new();
+        let project = world.factory_project(true);
+        world.status(world.peer, busy_status(project, 3));
+        assert_eq!(factory_items_of(&world).len(), 5, "{:?}", world.items());
+        world.online.remove(&world.peer);
+        assert!(factory_items_of(&world).is_empty(), "{:?}", world.items());
+    }
+
+    #[test]
+    fn the_holder_at_the_highest_generation_is_believed() {
+        let mut world = World::new();
+        let project = world.factory_project(true);
+        world.status(world.me, busy_status(project, 2));
+        world.status(world.peer, holding(project, 3, 1));
+        assert!(factory_items_of(&world).is_empty(), "{:?}", world.items());
+    }
+
+    // P1's items for factory work (G13)
+
+    /// Names `workspaces` and `sessions` in a live run of a holding status the peer writes.
+    fn name_in_status(
+        world: &mut World,
+        project: ProjectId,
+        workspaces: Vec<WorkspaceId>,
+        sessions: Vec<SessionId>,
+    ) {
+        let status = naming(project, 3, world.peer, workspaces, sessions);
+        world.status(world.peer, status);
+    }
+
+    /// A status that holds `project`'s lease at `generation` and names `workspaces` and
+    /// `sessions` in a live run built on `machine`.
+    fn naming(
+        project: ProjectId,
+        generation: u64,
+        machine: MachineId,
+        workspaces: Vec<WorkspaceId>,
+        sessions: Vec<SessionId>,
+    ) -> FactoryStatus {
+        let mut status = holding(project, generation, 7);
+        status.runs.push(LiveRun {
+            run: run(12),
+            title: "fix login".into(),
+            step: "building".into(),
+            machine,
+            gate_retries_used: 0,
+            minutes_used: 4,
+            workspaces,
+            sessions,
+        });
+        status
+    }
+
+    #[test]
+    fn a_factory_session_that_p1_marks_stuck_raises_nothing_and_a_p1_session_still_does() {
+        let mut world = World::new();
+        let project = world.factory_project(true);
+        let peer = world.peer;
+        let factory = world.session(peer, SessionState::Stuck);
+        let p1 = world.session(peer, SessionState::Stuck);
+        name_in_status(&mut world, project, Vec::new(), vec![factory.id]);
+        let items = world.of(Kind::SessionStuck);
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items[0].id, format!("session_stuck:{}", p1.id));
+    }
+
+    #[test]
+    fn a_session_or_setup_a_status_names_raises_no_p1_item() {
+        let mut world = World::new();
+        let project = world.factory_project(true);
+        let peer = world.peer;
+        let waiting = world.session(peer, SessionState::WaitingForYou);
+        let failed = world.session(peer, SessionState::Failed);
+        let (setup_workspace, _) = setup_exited(&mut world, Some(1));
+        assert_eq!(world.items().len(), 3, "{:?}", world.items());
+        name_in_status(
+            &mut world,
+            project,
+            vec![setup_workspace],
+            vec![waiting.id, failed.id],
+        );
+        assert!(world.items().is_empty(), "{:?}", world.items());
+    }
+
+    #[test]
+    fn a_p1_session_in_a_factory_workspace_still_raises_its_item() {
+        let mut world = World::new();
+        let project = world.factory_project(true);
+        let (me, peer) = (world.me, world.peer);
+        // A person's session in a stuck run's workspace, which a status names.
+        let named = world.session(peer, SessionState::WaitingForYou);
+        name_in_status(&mut world, project, vec![named.workspace], Vec::new());
+        // And one in a workspace this machine marks as factory.
+        let marked = world.session(me, SessionState::Stuck);
+        world.marked.workspaces.insert(marked.workspace, project);
+        let mut kinds: Vec<(Kind, String)> =
+            world.items().into_iter().map(|i| (i.kind, i.id)).collect();
+        kinds.sort();
+        assert_eq!(
+            kinds,
+            [
+                (Kind::SessionStuck, format!("session_stuck:{}", marked.id)),
+                (
+                    Kind::SessionWaiting,
+                    format!("session_waiting:{}", named.id)
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_status_of_a_holder_that_is_offline_still_names_factory_work() {
+        let mut world = World::new();
+        let project = world.factory_project(true);
+        let me = world.me;
+        let session = world.session(me, SessionState::Stuck);
+        name_in_status(&mut world, project, Vec::new(), vec![session.id]);
+        world.online.remove(&world.peer);
+        // The acting coordinator's status is believed now, and names no run.
+        let status = not_holding(
+            project,
+            NotHolding::HeldBy {
+                machine: world.peer,
+                generation: 3,
+            },
+        );
+        world.status(me, status);
+        assert!(
+            world.of(Kind::SessionStuck).is_empty(),
+            "{:?}",
+            world.items()
+        );
+    }
+
+    #[test]
+    fn a_superseded_holder_that_stays_online_names_no_factory_work() {
+        let mut world = World::new();
+        let project = world.factory_project(true);
+        let (me, peer) = (world.me, world.peer);
+        // The peer held the lease at generation 2 with a run, then stopped writing. This
+        // machine took it at generation 3, and its status names no run.
+        let session = world.session(peer, SessionState::Stuck);
+        let (setup_workspace, _) = setup_exited(&mut world, Some(1));
+        let old = naming(project, 2, peer, vec![setup_workspace], vec![session.id]);
+        world.status(peer, old);
+        world.status(me, holding(project, 3, 1));
+        let mut kinds: Vec<Kind> = world.items().into_iter().map(|i| i.kind).collect();
+        kinds.sort();
+        assert_eq!(
+            kinds,
+            [Kind::SessionStuck, Kind::SetupFailed],
+            "{:?}",
+            world.items()
+        );
+    }
+
+    #[test]
+    fn an_offline_holder_names_its_runs_until_a_newer_holder_takes_over() {
+        let mut world = World::new();
+        let project = world.factory_project(true);
+        let (me, peer) = (world.me, world.peer);
+        let session = world.session(me, SessionState::Stuck);
+        world.status(peer, naming(project, 3, me, Vec::new(), vec![session.id]));
+        world.online.remove(&peer);
+        // This machine acts, and sees the lease still held by the peer at generation 3.
+        let waiting = not_holding(
+            project,
+            NotHolding::HeldBy {
+                machine: peer,
+                generation: 3,
+            },
+        );
+        world.status(me, waiting);
+        assert!(
+            world.of(Kind::SessionStuck).is_empty(),
+            "{:?}",
+            world.items()
+        );
+        // This machine takes the lease at generation 4, and its status names no run.
+        world.status(me, holding(project, 4, 1));
+        assert_eq!(world.of(Kind::SessionStuck).len(), 1, "{:?}", world.items());
+    }
+
+    #[test]
+    fn a_believed_status_below_the_top_generation_names_no_factory_work() {
+        let mut world = World::new();
+        let project = world.factory_project(true);
+        let peer = world.peer;
+        // The peer held at generation 2 and stalled while online. A newer holder took the
+        // lease at generation 3 and went offline, so the peer's stale status is believed. It
+        // was superseded all the same, so the sessions it names raise P1's items again.
+        let session = world.session(peer, SessionState::Stuck);
+        world.status(peer, naming(project, 2, peer, Vec::new(), vec![session.id]));
+        world.status(MachineId::random(), holding(project, 3, 1));
+        assert_eq!(world.of(Kind::SessionStuck).len(), 1, "{:?}", world.items());
+    }
+
+    #[test]
+    fn a_newer_holder_the_acting_coordinator_sees_ends_an_offline_holders_cover() {
+        let mut world = World::new();
+        let project = world.factory_project(true);
+        let (me, peer) = (world.me, world.peer);
+        let session = world.session(me, SessionState::Stuck);
+        world.status(peer, naming(project, 3, me, Vec::new(), vec![session.id]));
+        world.online.remove(&peer);
+        let held_by = |machine, generation| {
+            not_holding(
+                project,
+                NotHolding::HeldBy {
+                    machine,
+                    generation,
+                },
+            )
+        };
+        // The lease ref still names the offline peer at generation 3: its runs stay covered.
+        world.status(me, held_by(peer, 3));
+        assert!(
+            world.of(Kind::SessionStuck).is_empty(),
+            "{:?}",
+            world.items()
+        );
+        // Another machine took it at generation 4, and its status has not arrived yet.
+        world.status(me, held_by(MachineId::random(), 4));
+        assert_eq!(world.of(Kind::SessionStuck).len(), 1, "{:?}", world.items());
+    }
+
+    #[test]
+    fn a_status_of_a_project_whose_factory_is_off_names_no_factory_work() {
+        let mut world = World::new();
+        let project = world.factory_project(false);
+        let peer = world.peer;
+        let session = world.session(peer, SessionState::Stuck);
+        name_in_status(&mut world, project, Vec::new(), vec![session.id]);
+        assert_eq!(world.of(Kind::SessionStuck).len(), 1, "{:?}", world.items());
+    }
+
+    #[test]
+    fn sessions_and_workspaces_this_machine_marks_as_factory_raise_no_p1_item() {
+        let mut world = World::new();
+        let project = world.factory_project(true);
+        let me = world.me;
+        let stuck = world.session(me, SessionState::Stuck);
+        let waiting = world.session(me, SessionState::WaitingForYou);
+        let setup = TerminalId::random();
+        let workspace = world.workspace(me, Some(setup));
+        world.terminal(me, setup, workspace, Some(Some(1)), false);
+        assert_eq!(world.items().len(), 3, "{:?}", world.items());
+
+        world.marked.sessions.insert(stuck.id, project);
+        world.marked.sessions.insert(waiting.id, project);
+        world.marked.workspaces.insert(workspace, project);
+        assert!(world.items().is_empty(), "{:?}", world.items());
+    }
+
+    #[test]
+    fn factory_work_this_machine_marks_for_a_project_whose_factory_is_off_still_raises_p1_items() {
+        let mut world = World::new();
+        let project = world.factory_project(false);
+        let me = world.me;
+        let stuck = world.session(me, SessionState::Stuck);
+        let setup = TerminalId::random();
+        let workspace = world.workspace(me, Some(setup));
+        world.terminal(me, setup, workspace, Some(Some(1)), false);
+        world.marked.sessions.insert(stuck.id, project);
+        world.marked.workspaces.insert(workspace, project);
+        assert_eq!(world.items().len(), 2, "{:?}", world.items());
+    }
+
+    #[test]
+    fn the_setup_of_a_workspace_with_a_marked_factory_session_raises_nothing() {
+        let mut world = World::new();
+        let project = world.factory_project(true);
+        let me = world.me;
+        let setup = TerminalId::random();
+        let workspace = world.workspace(me, Some(setup));
+        world.terminal(me, setup, workspace, Some(Some(1)), false);
+        let session = Session {
+            id: SessionId::random(),
+            workspace,
+            terminal: TerminalId::random(),
+            model: "opus".into(),
+            state: SessionState::Working,
+        };
+        world.put_session(me, session.clone(), false);
+        assert_eq!(world.of(Kind::SetupFailed).len(), 1);
+        world.marked.sessions.insert(session.id, project);
+        assert!(world.items().is_empty(), "{:?}", world.items());
+    }
+
+    #[test]
+    fn this_machines_marks_say_nothing_of_a_peers_records() {
+        let mut world = World::new();
+        let project = world.factory_project(true);
+        let peer = world.peer;
+        let session = world.session(peer, SessionState::Stuck);
+        world.marked.sessions.insert(session.id, project);
+        world.marked.workspaces.insert(session.workspace, project);
+        assert_eq!(world.of(Kind::SessionStuck).len(), 1, "{:?}", world.items());
+    }
+
+    #[test]
+    fn marks_and_statuses_count_only_for_their_own_projects_factory() {
+        let mut world = World::new();
+        let on = world.factory_project(true);
+        let off = world.factory_project(false);
+        let (me, peer) = (world.me, world.peer);
+        let failed_setup = |world: &mut World| {
+            let setup = TerminalId::random();
+            let workspace = world.workspace(me, Some(setup));
+            world.terminal(me, setup, workspace, Some(Some(1)), false);
+            workspace
+        };
+        // This machine marks a stuck session and a failed setup of each project.
+        let (marked_on, marked_off) = (
+            world.session(me, SessionState::Stuck),
+            world.session(me, SessionState::Stuck),
+        );
+        let (setup_on, setup_off) = (failed_setup(&mut world), failed_setup(&mut world));
+        world.marked.sessions.insert(marked_on.id, on);
+        world.marked.sessions.insert(marked_off.id, off);
+        world.marked.workspaces.insert(setup_on, on);
+        world.marked.workspaces.insert(setup_off, off);
+        // Each project's status names a waiting session of the peer.
+        let (named_on, named_off) = (
+            world.session(peer, SessionState::WaitingForYou),
+            world.session(peer, SessionState::WaitingForYou),
+        );
+        name_in_status(&mut world, on, Vec::new(), vec![named_on.id]);
+        name_in_status(&mut world, off, Vec::new(), vec![named_off.id]);
+
+        let mut p1: Vec<String> = world
+            .items()
+            .into_iter()
+            .filter(|i| {
+                [Kind::SessionStuck, Kind::SessionWaiting, Kind::SetupFailed].contains(&i.kind)
+            })
+            .map(|i| i.id)
+            .collect();
+        p1.sort();
+        let mut want = vec![
+            format!("session_stuck:{}", marked_off.id),
+            format!("setup_failed:{setup_off}"),
+            format!("session_waiting:{}", named_off.id),
+        ];
+        want.sort();
+        assert_eq!(p1, want, "{:?}", world.items());
+    }
+
     // --- the list and its routes ---
 
     struct NoDial;
@@ -1458,6 +2863,131 @@ mod tests {
             assert_eq!(item["machine"], served.me.to_string());
         }
         assert!(!body.contains("hunter2"), "{body}");
+    }
+
+    /// Settings with a project named `foundry` whose factory is on, and this machine first in
+    /// the coordinator order.
+    fn with_factory_on(me: MachineId, settings: &mut SharedSettings) -> ProjectId {
+        let project = Project {
+            id: ProjectId::random(),
+            name: "foundry".into(),
+            repo: "https://github.com/o/foundry.git".into(),
+        };
+        let id = project.id;
+        settings.projects.push(project);
+        settings.project_factory.insert(
+            id,
+            ProjectFactory {
+                on: true,
+                login: "octocat".into(),
+                paused: false,
+            },
+        );
+        settings.priority = vec![me];
+        id
+    }
+
+    #[tokio::test]
+    async fn the_list_raises_the_factory_items_of_the_statuses_the_store_holds() {
+        let project = Arc::new(Mutex::new(None));
+        let served = Served::new({
+            let project = project.clone();
+            move |me, settings| *project.lock().unwrap() = Some(with_factory_on(me, settings))
+        })
+        .await;
+        let project = project.lock().unwrap().unwrap();
+        let mut status = holding(project, 1, 1);
+        status.held_up.push(held_up(12, HeldUpKind::Stuck, "no"));
+        let session = SessionId::random();
+        status.runs.push(LiveRun {
+            run: run(13),
+            title: "fix login".into(),
+            step: "building".into(),
+            machine: served.me,
+            gate_retries_used: 0,
+            minutes_used: 1,
+            workspaces: Vec::new(),
+            sessions: vec![session],
+        });
+        let record = FactoryRecord {
+            owner: served.me,
+            version: 1,
+            body: FactoryBody::Status(status),
+        };
+        // The session the status names is stuck as P1 sees it.
+        let stuck = AnyRecord::Session(Record {
+            owner: served.me,
+            version: 1,
+            deleted: false,
+            body: Session {
+                id: session,
+                workspace: WorkspaceId::random(),
+                terminal: TerminalId::random(),
+                model: "opus".into(),
+                state: SessionState::Stuck,
+            },
+        });
+        {
+            let mut store = served.store.lock().unwrap();
+            store.apply_factory(&record, served.me).unwrap();
+            store.apply(&stuck, served.me).unwrap();
+        }
+        let kinds = served.kinds().await;
+        let me = served.me.to_string();
+        assert!(
+            kinds.contains(&("run_stuck".to_owned(), me.clone())),
+            "{kinds:?}"
+        );
+        assert!(
+            !kinds.contains(&("session_stuck".to_owned(), me)),
+            "{kinds:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn freshness_and_marks_given_to_the_list_are_read() {
+        let data = tempfile::tempdir().unwrap();
+        let me = MachineId::random();
+        let mut store = Store::open(data.path().join("foundry.db")).unwrap();
+        let mut held = store.settings().unwrap();
+        held.seq += 1;
+        let project = with_factory_on(me, &mut held);
+        store.apply_settings(held).unwrap();
+        // A stuck session of this machine that it marks as factory.
+        let session = Session {
+            id: SessionId::random(),
+            workspace: WorkspaceId::random(),
+            terminal: TerminalId::random(),
+            model: "opus".into(),
+            state: SessionState::Stuck,
+        };
+        let record = AnyRecord::Session(Record {
+            owner: me,
+            version: 1,
+            deleted: false,
+            body: session.clone(),
+        });
+        store.apply(&record, me).unwrap();
+        let mut marked = Marked::default();
+        marked.sessions.insert(session.id, project);
+        let store = Arc::new(Mutex::new(store));
+        let peers = Peers::new(me, store.clone(), Arc::new(NoDial));
+        let coordinator = Arc::new(Coordinator::new(me, store.clone(), peers.clone()));
+        let clock = Arc::new(FakeClock::new());
+        let dyn_clock: Arc<dyn Clock> = clock.clone();
+        let freshness = Arc::new(Freshness::new(dyn_clock.clone()));
+        let attention = Attention::new(me, store.clone(), peers, coordinator).with_factory(
+            dyn_clock,
+            freshness.clone(),
+            Arc::new(marked),
+        );
+        let kinds = |items: Vec<Item>| items.into_iter().map(|i| i.kind).collect::<Vec<_>>();
+
+        assert_eq!(kinds(attention.items().await.unwrap()), []);
+        clock.advance(10 * MINUTE);
+        assert_eq!(kinds(attention.items().await.unwrap()), [Kind::FactoryIdle]);
+        freshness.held(project);
+        assert_eq!(kinds(attention.items().await.unwrap()), []);
     }
 
     /// A world whose peer has a session waiting for you, a failed setup and a refused tag.
