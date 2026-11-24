@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use foundry_proto::ids::{ProjectId, SessionId, WorkspaceId};
 
@@ -56,6 +56,9 @@ pub(super) struct FactoryLaunch {
     pub effort: String,
     /// The child's extra environment: the token and the askpass.
     pub env: Vec<(String, String)>,
+    /// The workspace's end generation when the start began: an `end_factory` since then means
+    /// this start must not go on.
+    pub generation: u64,
 }
 
 /// Session `id`'s own folder, in the sessions folder `dir`.
@@ -74,22 +77,24 @@ pub(super) fn write_mark(path: &Path, project: ProjectId) -> Result<(), SessionE
 }
 
 /// The environment a factory session's child gets for `login`: the token for `gh` and as the
-/// askpass's answer, the askpass script, and git's credential helpers emptied, so a keychain
-/// helper never answers before the askpass does. The askpass and the token are read from what
-/// [`GitAuth`] gives a git child, so there is one source of them.
+/// askpass's answer, the askpass script, and git's credential helpers emptied. The askpass and
+/// the token are read from what [`GitAuth`] gives a git child, so there is one source of them.
 ///
-/// The session's git must also not push as another account. `GIT_ALLOW_PROTOCOL=https` stops a
-/// global `insteadOf` that rewrites `https://github.com/` to `git@github.com:` from sending a
-/// push over ssh as the machine's owner, which never asks the askpass. An inherited
-/// `GIT_CONFIG_PARAMETERS` is read after `GIT_CONFIG_COUNT`, so it is emptied or a helper it
-/// names would answer after the emptied one. The other GitHub tokens that `gh` and git's
-/// helpers read are blanked, as [`git_auth::helpers_off_env`] does. The user's global config
-/// stays readable.
+/// The invariant: the session's git pushes as `login` and no one else. So it reads no system
+/// and no global config (`GIT_CONFIG_NOSYSTEM`, `GIT_CONFIG_GLOBAL=/dev/null`, as
+/// [`GitAuth`] sets them): nothing there, whether a helper, a URL rewrite that carries
+/// credentials, an `extraHeader` or an ssh command, can answer for the machine's owner. Only
+/// the owner's `identity` (`user.name` and `user.email`, from [`owner_identity`]) is carried in,
+/// as `GIT_CONFIG_COUNT` pins after the emptied helper. `GIT_ALLOW_PROTOCOL=https` is read from
+/// [`GitAuth`] too: a repository's own config can still rewrite a URL, and it cannot reach ssh.
+/// An inherited `GIT_CONFIG_PARAMETERS` is read after `GIT_CONFIG_COUNT`, so it is emptied. The
+/// other GitHub tokens that `gh` and git's helpers read are blanked, the ones
+/// [`git_auth::helpers_off_env`] blanks.
 fn factory_env(
     secrets: &dyn crate::secrets::Secrets,
     login: &str,
     data: &Path,
-    _identity: &[(String, String)],
+    identity: &[(String, String)],
 ) -> Result<Vec<(String, String)>, SessionError> {
     let auth = GitAuth::for_login(secrets, login, data)?;
     let mut git = Command::new("git");
@@ -101,27 +106,70 @@ fn factory_env(
             .and_then(|(_, value)| value)
             .map(|value| value.to_string_lossy().into_owned())
     };
-    let (Some(askpass), Some(token)) = (get("GIT_ASKPASS"), get(git_auth::TOKEN_VAR)) else {
+    let (Some(askpass), Some(token), Some(protocol), Some(global), Some(no_system)) = (
+        get("GIT_ASKPASS"),
+        get(git_auth::TOKEN_VAR),
+        get("GIT_ALLOW_PROTOCOL"),
+        get("GIT_CONFIG_GLOBAL"),
+        get("GIT_CONFIG_NOSYSTEM"),
+    ) else {
         return Err(SessionError::NoAskpass);
     };
-    Ok(vec![
-        ("GH_TOKEN".into(), token.clone()),
+    let mut env = vec![
+        ("GH_TOKEN".to_owned(), token.clone()),
         ("GIT_ASKPASS".into(), askpass),
         (git_auth::TOKEN_VAR.into(), token),
-        ("GIT_CONFIG_COUNT".into(), "1".into()),
+        ("GIT_CONFIG_NOSYSTEM".into(), no_system),
+        ("GIT_CONFIG_GLOBAL".into(), global),
+        ("GIT_CONFIG_COUNT".into(), (1 + identity.len()).to_string()),
         ("GIT_CONFIG_KEY_0".into(), "credential.helper".into()),
         ("GIT_CONFIG_VALUE_0".into(), String::new()),
         ("GIT_CONFIG_PARAMETERS".into(), String::new()),
-        ("GIT_ALLOW_PROTOCOL".into(), "https".into()),
-        ("GITHUB_TOKEN".into(), String::new()),
-        ("GH_ENTERPRISE_TOKEN".into(), String::new()),
-        ("GITHUB_ENTERPRISE_TOKEN".into(), String::new()),
-    ])
+        ("GIT_ALLOW_PROTOCOL".into(), protocol),
+    ];
+    for (n, (key, value)) in identity.iter().enumerate() {
+        env.push((format!("GIT_CONFIG_KEY_{}", n + 1), key.clone()));
+        env.push((format!("GIT_CONFIG_VALUE_{}", n + 1), value.clone()));
+    }
+    env.extend(
+        git_auth::helpers_off_env()
+            .into_iter()
+            .filter(|(key, value)| {
+                key.ends_with("_TOKEN") && key != "GH_TOKEN" && value.is_empty()
+            }),
+    );
+    Ok(env)
 }
 
-/// STUB: the owner's `user.name` and `user.email`, as git config pins.
-fn owner_identity(_git: Command) -> Vec<(String, String)> {
-    Vec::new()
+/// The owner's `user.name` and `user.email`, from the global config `git` reads, as config
+/// pins in that order. One that is not set is left out, and so is both when git cannot run:
+/// no identity is pinned, and nothing is an error.
+fn owner_identity(mut git: Command) -> Vec<(String, String)> {
+    let Ok(out) = git
+        .args([
+            "config",
+            "--global",
+            "--get-regexp",
+            r"^user\.(name|email)$",
+        ])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let last = |key: &str| {
+        text.lines()
+            .filter_map(|line| line.split_once(' '))
+            .filter(|(k, _)| *k == key)
+            .map(|(_, value)| value.to_owned())
+            .next_back()
+    };
+    ["user.name", "user.email"]
+        .into_iter()
+        .filter_map(|key| last(key).map(|value| (key.to_owned(), value)))
+        .collect()
 }
 
 impl Sessions {
@@ -147,6 +195,12 @@ impl Sessions {
         if first.body.is_some() {
             return Err(SessionError::FirstMessageBody);
         }
+        // Before anything is read or written: an `end_factory` from here on beats this start.
+        let generation = lock(&self.inner.factory)
+            .ended
+            .get(&workspace)
+            .copied()
+            .unwrap_or(0);
         let inner = self.inner.clone();
         let worktree = worktree.to_path_buf();
         let prompt = super::first_prompt(&first.line);
@@ -167,6 +221,7 @@ impl Sessions {
                 project: start.project,
                 effort: start.effort,
                 env,
+                generation,
             };
             inner
                 .start(
@@ -199,11 +254,18 @@ impl Sessions {
         sessions
     }
 
-    /// Closes the terminal of each factory session of `workspace` that still runs. A P1 session
+    /// Closes the terminal of each factory session of `workspace` that still runs, and makes a
+    /// start of one that has not yet gone live fail with [`SessionError::Ended`]. A P1 session
     /// and another workspace's factory session are left alone. A terminal already gone counts
     /// as ended. Every close is tried; the first other failure is given.
     pub async fn end_factory(&self, workspace: WorkspaceId) -> Result<(), SessionError> {
-        let marked: Vec<SessionId> = lock(&self.inner.factory).marks.keys().copied().collect();
+        // One lock for both: a start that has not yet marked its session sees the new
+        // generation and gives up, and one that has is in the snapshot.
+        let marked: Vec<SessionId> = {
+            let mut state = lock(&self.inner.factory);
+            *state.ended.entry(workspace).or_insert(0) += 1;
+            state.marks.keys().copied().collect()
+        };
         let mut terminals = Vec::new();
         for id in marked {
             let Some(live) = self.inner.live(id) else {

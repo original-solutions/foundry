@@ -412,9 +412,23 @@ impl Inner {
         // of `Starting`.
         let mut body = live.body.lock().await;
         lock(&self.live).insert(id, live.clone());
-        // Found by `end_factory` from here on, which then waits on `body`.
+        // Found by `end_factory` from here on, which then waits on `body`: unless it ran since
+        // this start began, which then does not go on. Under one lock, so one of them is first.
         if let Some(factory) = factory {
-            lock(&self.factory).marks.insert(id, factory.project);
+            let ended = {
+                let mut state = lock(&self.factory);
+                let ended = state.ended.get(&workspace).copied().unwrap_or(0) != factory.generation;
+                if !ended {
+                    state.marks.insert(id, factory.project);
+                }
+                ended
+            };
+            if ended {
+                lock(&self.live).remove(&id);
+                drop(body);
+                self.discard(id, &settings, &curl).await;
+                return Err(SessionError::Ended);
+            }
         }
 
         let started = self
