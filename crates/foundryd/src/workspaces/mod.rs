@@ -32,15 +32,17 @@
 //! reads only the new one's exit. A marker that cannot be parsed is skipped and logged; a
 //! folder or the store that cannot be read fails the create, so it never makes a second
 //! workspace for a tag that may have one.
-//! Which project a workspace was made for is answered from memory by
-//! [`Workspaces::factory_project`]: the markers on disk are read once as the workspaces start,
-//! a create adds the one it writes, and a marker an archive or a failed create removes no
-//! longer answers. A marker that cannot be read or parsed at the start answers none and is
-//! warned of once.
 //! Its setup terminal gets no token in its environment and has git's credential helpers turned
 //! off ([`crate::git_auth::helpers_off_env`]). That is the environment only. The terminal runs
 //! as the daemon's user, so code in it can read what that user can, the machine's secret store
 //! among it: this is no boundary against code running as the daemon's user.
+//!
+//! Which project a workspace was made for is answered from memory by
+//! [`Workspaces::factory_project`]: the markers on disk are read once as the workspaces start,
+//! a create adds the one it writes, and a marker an archive or a failed create removes no
+//! longer answers. A marker that cannot be read or parsed at the start, or one in a folder that
+//! cannot be listed, answers none and is warned of once; it is not read again until the
+//! workspaces start again.
 //!
 //! For a project whose factory is on, the fetch is made with the login's token
 //! ([`crate::git_auth::GitAuth`]), and that call must read no config other code can write. The
@@ -527,7 +529,7 @@ struct Inner {
 
 impl Workspaces {
     /// The workspaces of machine `me`, with clones and worktrees under `data_dir` and setup
-    /// run in `terminals`.
+    /// run in `terminals`. Reads the factory markers under `data_dir` before it returns.
     pub fn new(
         me: MachineId,
         store: Arc<Mutex<Store>>,
@@ -2503,28 +2505,44 @@ mod factory_project {
     }
 
     #[tokio::test]
-    async fn a_marker_a_failed_create_drops_no_longer_answers() {
+    async fn a_tagged_create_that_fails_after_its_marker_leaves_no_answer() {
+        use std::os::unix::fs::PermissionsExt as _;
         let fixture = Fixture::new();
-        let inner = &fixture.workspaces.inner;
-        let id = WorkspaceId::random();
-        std::fs::create_dir_all(inner.project_folder(fixture.project)).unwrap();
+        let first = fixture.make("first", tag(fixture.project)).await;
 
-        // As a create does: marked before its record, then undone when what follows fails.
-        let tagged = tag(fixture.project).unwrap();
-        inner
-            .mark(fixture.project, id, &tagged, "fix login", None)
-            .await
-            .unwrap();
-        assert_eq!(
-            fixture.workspaces.factory_project(id),
-            Some(fixture.project)
-        );
-        inner
-            .drop_marker(fixture.project, id, "a failed create left its marker")
+        // The store cannot make its journal in a folder it may not write, after the marker is.
+        let mode = |m| {
+            std::fs::set_permissions(fixture.data.path(), std::fs::Permissions::from_mode(m))
+                .unwrap()
+        };
+        mode(0o500);
+        let failed = fixture
+            .workspaces
+            .create_with(
+                fixture.project,
+                "second",
+                Checkout::NewBranch {
+                    base: "main".into(),
+                    branch: None,
+                },
+                Setup::None,
+                tag(fixture.project),
+            )
             .await;
+        mode(0o700);
+        assert!(
+            matches!(failed, Err(WorkspaceError::Store(_))),
+            "{failed:?}"
+        );
 
-        assert_eq!(fixture.workspaces.factory_project(id), None);
-        assert_eq!(fixture.restarted().factory_project(id), None);
+        // The failed create's id is never given back: what answers is the first workspace only.
+        let answered = lock(&fixture.workspaces.inner.factory).clone();
+        assert_eq!(answered, HashMap::from([(first, fixture.project)]));
+        let again = fixture.restarted();
+        assert_eq!(
+            lock(&again.inner.factory).clone(),
+            HashMap::from([(first, fixture.project)])
+        );
     }
 
     /// The warnings logged of `marker`.
@@ -2593,10 +2611,11 @@ mod factory_project {
         let mut bad = Vec::new();
         for _ in 0..5 {
             let other = worktrees.join(ProjectId::random().to_string());
-            std::fs::create_dir_all(other.join(format!("{workspace}.factory"))).unwrap();
-            let marker = other.join(format!("{unreadable}.factory"));
-            std::fs::create_dir_all(&marker).unwrap();
-            bad.push(marker);
+            for id in [workspace, unreadable] {
+                let marker = other.join(format!("{id}.factory"));
+                std::fs::create_dir_all(&marker).unwrap();
+                bad.push(marker);
+            }
         }
         // Files beside the markers that are no marker of a workspace.
         std::fs::write(folder.join("notes.factory"), "{}").unwrap();
@@ -2613,6 +2632,8 @@ mod factory_project {
         for marker in &bad {
             assert_eq!(warnings_of(&logs, marker), 1, "{}", logs.text());
         }
+        // The stray files and the files that are no marker are warned of not at all.
+        assert_eq!(logs.warnings().len(), bad.len(), "{}", logs.text());
     }
 
     #[test]
