@@ -1533,9 +1533,9 @@ mod tests {
         fleet(Some(SessionState::Failed)).build()
     }
 
-    /// The session is gone: the fleet shows none.
+    /// The session is gone: the fleet shows no session, and no record of its workspace.
     fn gone() -> FleetView {
-        fleet(None).build()
+        FleetView::builder().online(m1()).online(m2()).build()
     }
 
     /// The build machine has been unreachable for `span`, with its workspace and session as it
@@ -1814,17 +1814,6 @@ mod tests {
             assert_eq!(rig.sim.labels(), vec!["factory:building"]);
         }
 
-        /// The runner's case: "resumes two sessions that ended badly in one pass without any T3
-        /// trouble". Foundry has no evidence to wait for: a lone session that ended is resumed
-        /// at once.
-        #[test]
-        fn resumes_two_sessions_that_ended_badly_in_one_pass_without_any_t3_trouble() {
-            let (rig, run) = interrupted();
-            pass_one(&rig, &run);
-            assert_eq!(interruptions(&rig, &run)[0]["resumes"], 1);
-            assert_eq!(rig.sim.labels(), vec!["factory:building"]);
-        }
-
         /// The runner's case: "records the old reason code for a stuck decision of an ended
         /// badly run". Foundry: the cap's stuck path records `session-ended-badly`.
         #[test]
@@ -1868,7 +1857,9 @@ mod tests {
         fn makes_a_resumed_run_wait_for_a_newer_run_and_then_read_it_as_any_other() {
             let (mut rig, run) = interrupted();
             pass_one(&rig, &run);
-            // The earlier workspace still shows: the resume waits for it.
+            // The earlier workspace still shows on a machine that is not heard from: the
+            // resume waits for it.
+            rig.view = cut_off(secs(60));
             assert_eq!(pass(&rig, &run), ResumeStep::Waiting(Wait::Archive));
             assert_eq!(pass(&rig, &run), ResumeStep::Waiting(Wait::Archive));
             assert_eq!(interruptions(&rig, &run).len(), 1);
@@ -2031,11 +2022,14 @@ mod tests {
     mod interrupted_a_send_cut_short {
         use super::*;
 
-        /// The runner's case: "is sent again under the same command id". Foundry: a pass cut
-        /// short after the decision and before the archive records the archive and asks for it
-        /// on the next pass, with no second decision; a pass after that asks for nothing more.
+        /// Foundry's own (the runner's "is sent again under the same command id" has no command
+        /// id): a pass cut short after the decision and before the archive records the archive
+        /// and asks for it on the next pass, with no second decision; while the workspace still
+        /// shows on a machine that is heard from, a later pass asks for the archive again and
+        /// never for the workspace.
         #[test]
-        fn is_sent_again_under_the_same_command_id() {
+        fn a_decision_cut_short_before_its_archive_asks_it_on_the_next_pass_without_deciding_again()
+        {
             let (rig, run) = interrupted();
             rig.write(
                 &run,
@@ -2058,10 +2052,15 @@ mod tests {
                     "resume-archive-asked 1".to_string()
                 ]
             );
-            let bytes = event_count(&rig, &run);
-            assert_eq!(pass(&rig, &run), ResumeStep::Waiting(Wait::Archive));
-            assert_eq!(rig.worker.calls(), vec![archived_call()]);
-            assert_eq!(event_count(&rig, &run), bytes);
+            assert_eq!(
+                pass(&rig, &run),
+                ResumeStep::Archiving {
+                    resumes: 1,
+                    workspace: Some(old())
+                }
+            );
+            assert_eq!(rig.worker.calls(), vec![archived_call(), archived_call()]);
+            assert_eq!(interruptions(&rig, &run).len(), 1);
         }
 
         /// The runner's case: "that reached the thread only gets its step". Foundry: a session
@@ -2126,7 +2125,10 @@ mod tests {
             let (mut rig, run) = interrupted();
             pass_one(&rig, &run);
             rig.view = gone();
-            assert_eq!(pass(&rig, &run), ResumeStep::Waiting(Wait::Archive));
+            assert_eq!(
+                pass(&rig, &run),
+                ResumeStep::NeedsMachine(Placing::Resume { resumes: 1 })
+            );
             assert_eq!(interruptions(&rig, &run).len(), 1);
         }
 
@@ -2218,16 +2220,19 @@ mod tests {
         /// The runner's case: "has the interrupted paragraph in the factory's fixed words".
         #[test]
         fn has_the_interrupted_paragraph_in_the_factorys_fixed_words() {
-            let message = resumed_message(&run_id(1), "t3code/abc");
+            let (mut rig, run) = interrupted();
+            rig.view = gone();
+            rig.sim.add_branch(BRANCH);
+            resume_to_the_end(&mut rig, &run);
+            let message = first_message(&rig);
             let paragraph =
-                "A previous attempt of this issue (rawphp__softfac__8__1) was interrupted";
+                "A previous attempt of this issue (rawphp__softfac__8__1) was interrupted when";
             assert!(
                 message
                     .body
                     .as_deref()
                     .unwrap_or_default()
-                    .contains(paragraph)
-                    || message.line.contains(paragraph),
+                    .contains(paragraph),
                 "{message:?}"
             );
             assert!(!format!("{message:?}").contains("time limit"));
@@ -2358,35 +2363,6 @@ mod tests {
                     .collect::<Vec<_>>(),
                 vec![1, 2]
             );
-        }
-
-        /// The runner's case: "does not pass the resumes of a stuck run to a new attempt a person
-        /// relabelled". Foundry: a new attempt has a ledger of its own, so its first resume is
-        /// the first.
-        #[test]
-        fn does_not_pass_the_resumes_of_a_stuck_run_to_a_new_attempt_a_person_relabelled() {
-            let mut rig = Rig::new();
-            let first = run_id(1);
-            building(&rig, &first);
-            rig.write(
-                &first,
-                Event::SessionInterrupted {
-                    resumes: 2,
-                    relaunch: false,
-                    run_ordinal: None,
-                    branch: None,
-                    t3_error: None,
-                    ended_in_pass: 0,
-                },
-            );
-            let second = run_id(2);
-            building(&rig, &second);
-            rig.view = failed();
-            assert!(matches!(
-                pass(&rig, &second),
-                ResumeStep::Archiving { resumes: 1, .. }
-            ));
-            assert_eq!(interruptions(&rig, &second).len(), 1);
         }
 
         /// The runner's case: "cut short is finished by advance without a new decision".
@@ -2610,68 +2586,6 @@ mod tests {
         }
     }
 
-    /// The runner's `interruption.test.ts`, "interrupted: a run with no recorded approval".
-    mod interrupted_a_run_with_no_recorded_approval {
-        use super::*;
-
-        fn unapproved() -> (Rig, RunId) {
-            let mut rig = Rig::new();
-            let run = run_id(1);
-            // The ledger of a run whose first line was lost: no `approved` step.
-            rig.write(
-                &run,
-                Event::Claimed {
-                    machine: m1().to_string(),
-                    github_user: LOGIN.into(),
-                },
-            );
-            rig.moved(&run, State::Ready, State::Triage);
-            rig.step(&run, &format!("workspace-created {OLD}"));
-            rig.step(&run, "approval-rechecked");
-            rig.write(&run, launch(Some(BRANCH), Some("main")));
-            rig.moved(&run, State::Triage, State::Building);
-            rig.sim.set_labels(&["factory:building"]);
-            rig.sim.set_assignees(&[LOGIN]);
-            rig.view = gone();
-            (rig, run)
-        }
-
-        /// The runner's case: "whose thread is gone after a T3 outage goes stuck as thread-gone,
-        /// not relaunched". Foundry: a resume starts a session, which the approval must stand
-        /// behind: with none recorded the run goes stuck as `start` does, naming the session's
-        /// end in the ledger, and nothing is asked of a worker.
-        #[test]
-        fn whose_thread_is_gone_after_a_t3_outage_goes_stuck_as_thread_gone_not_relaunched() {
-            let (rig, run) = unapproved();
-            assert_eq!(
-                pass(&rig, &run),
-                ResumeStep::Stuck {
-                    reason: messages::CANNOT_CONFIRM.into()
-                }
-            );
-            assert!(interruptions(&rig, &run).is_empty());
-            assert!(create_calls(&rig).is_empty());
-            assert!(archive_calls(&rig).is_empty());
-            assert!(rig.finished(&run));
-        }
-
-        /// The runner's case: "found gone by its resume send goes stuck as thread-gone too".
-        /// Foundry: a session found failed in a run with no approval is stuck the same way.
-        #[test]
-        fn found_gone_by_its_resume_send_goes_stuck_as_thread_gone_too() {
-            let (mut rig, run) = unapproved();
-            rig.view = failed();
-            assert!(matches!(pass(&rig, &run), ResumeStep::Stuck { .. }));
-            assert!(interruptions(&rig, &run).is_empty());
-            assert!(
-                rig.worker
-                    .calls()
-                    .iter()
-                    .all(|call| matches!(call, Call::EndSessions { .. }))
-            );
-        }
-    }
-
     /// The runner's `interruption.test.ts`, "interrupted: a stop by hand".
     mod interrupted_a_stop_by_hand {
         use super::*;
@@ -2710,17 +2624,6 @@ mod tests {
             assert!(rig.worker.calls().is_empty());
         }
 
-        /// The runner's case: "that lands between the ledger read and the thread read is not a
-        /// relaunch". Foundry reads the ledger once and the fleet's snapshot once; a stop that
-        /// lands after the decision is the next case.
-        #[test]
-        fn that_lands_between_the_ledger_read_and_the_thread_read_is_not_a_relaunch() {
-            let (rig, run) = interrupted();
-            stop(&rig, &run);
-            assert!(!matches!(pass(&rig, &run), ResumeStep::Archiving { .. }));
-            assert!(interruptions(&rig, &run).is_empty());
-        }
-
         /// The runner's case: "that lands before the resume is sent is not a relaunch".
         /// Foundry: a stop after the decision and the archive stops the resume before its
         /// workspace is asked for.
@@ -2748,8 +2651,12 @@ mod tests {
             // The first pass: the archive, and no create.
             pass_one(&rig, &run);
             assert_eq!(rig.worker.calls(), vec![archived_call()]);
-            // Placement is not even needed while the earlier workspace shows.
-            assert_eq!(pass(&rig, &run), ResumeStep::Waiting(Wait::Archive));
+            // While the earlier workspace shows on a machine that is heard from, the archive is
+            // asked for again, and the workspace is not.
+            assert!(matches!(
+                pass(&rig, &run),
+                ResumeStep::Archiving { resumes: 1, .. }
+            ));
             assert!(create_calls(&rig).is_empty());
             // The pass that sees it archived asks for a machine, and creates nothing.
             rig.view = archived();
@@ -2759,7 +2666,7 @@ mod tests {
             rig.worker.on_create(Ok(fresh()));
             placed_on(&rig, &run, m2());
             assert_eq!(create_calls(&rig).len(), 1);
-            assert_eq!(archive_calls(&rig).len(), 1);
+            assert_eq!(archive_calls(&rig).len(), 2);
         }
 
         /// Acceptance (review focus 2): a pull request branch named `-x` is refused before any
@@ -3383,7 +3290,7 @@ mod tests {
         }
 
         /// The ledger of a claim `start` decided and asked its machine for.
-        fn claimed_not_built(rig: &Rig, run: &RunId) {
+        pub(super) fn claimed_not_built(rig: &Rig, run: &RunId) {
             rig.step(run, &format!("approved {LABELED_AT}"));
             rig.write(
                 run,
@@ -3397,21 +3304,6 @@ mod tests {
             rig.step(run, &format!("workspace-requested {BRANCH}"));
             rig.sim.set_labels(&["factory:triage"]);
             rig.sim.set_assignees(&[LOGIN]);
-        }
-
-        /// A session that is done and was not read is `building`'s, not an interruption; one
-        /// that ended with no result line is.
-        #[test]
-        fn a_finished_session_with_a_done_line_is_buildings_and_one_without_is_an_interruption() {
-            let (mut rig, run) = interrupted();
-            rig.view = fleet(Some(SessionState::Finished))
-                .turn(turn_of(session(), old(), 1, 1))
-                .build();
-            say(&rig, DONE_MESSAGE);
-            assert!(is_skipped(&pass(&rig, &run)));
-            assert!(interruptions(&rig, &run).is_empty());
-            say(&rig, "I am still working on it.");
-            pass_one(&rig, &run);
         }
 
         /// A turn that was read already, and whose session then ended, is an interruption with
@@ -3696,6 +3588,934 @@ mod tests {
                 assert_eq!(orphans(&view, project_id(), &run_id(1), &[]), vec![]);
                 let _ = rig;
             }
+        }
+    }
+
+    /// The runner's `interruption.test.ts`, "advance: a session that ended badly". Foundry's
+    /// `advance` is the step that decides what `building` leaves to it, so each case keeps its
+    /// name and asserts what this step does with such a session.
+    mod advance_a_session_that_ended_badly {
+        use super::*;
+
+        /// Nothing but the decision is written: no GitHub write, no stuck.
+        fn writes_only_the_decision(rig: &Rig, run: &RunId) {
+            assert_eq!(rig.sim.writes(), Vec::<String>::new());
+            let names = rig.names(run);
+            assert!(!names.contains(&"stuck".to_string()), "{names:?}");
+            assert_eq!(interruptions(rig, run).len(), 1);
+            assert_eq!(rig.worker.calls(), vec![archived_call()]);
+        }
+
+        /// The runner's case: "writes nothing for a failed or cancelled run and says it ended
+        /// badly". Foundry: a failed or finished session is said to be an interruption, and
+        /// the pass writes only its decision and the archive step, nothing on GitHub.
+        #[test]
+        fn writes_nothing_for_a_failed_or_cancelled_run_and_says_it_ended_badly() {
+            for state in [SessionState::Failed, SessionState::Finished] {
+                let (mut rig, run) = interrupted();
+                rig.view = fleet(Some(state)).build();
+                pass_one(&rig, &run);
+                writes_only_the_decision(&rig, &run);
+            }
+        }
+
+        /// The runner's case: "says a thread that no longer exists ended badly and writes
+        /// nothing".
+        #[test]
+        fn says_a_thread_that_no_longer_exists_ended_badly_and_writes_nothing() {
+            let (mut rig, run) = interrupted();
+            rig.view = gone();
+            pass_one(&rig, &run);
+            writes_only_the_decision(&rig, &run);
+        }
+
+        /// The runner's case: "reads a failed, interrupted or cancelled run that ended with a
+        /// done line as done". Foundry: a finished or failed session whose newest unread turn
+        /// ends with the result line is `building`'s: nothing is written and nothing asked.
+        #[test]
+        fn reads_a_failed_interrupted_or_cancelled_run_that_ended_with_a_done_line_as_done() {
+            for state in [SessionState::Failed, SessionState::Finished] {
+                let (mut rig, run) = interrupted();
+                rig.view = fleet(Some(state))
+                    .turn(turn_of(session(), old(), 1, 1))
+                    .build();
+                say(&rig, DONE_MESSAGE);
+                let before = event_count(&rig, &run);
+                assert!(is_skipped(&pass(&rig, &run)));
+                assert_eq!(event_count(&rig, &run), before);
+                assert!(interruptions(&rig, &run).is_empty());
+            }
+        }
+
+        /// The runner's case (from "a relaunch finds the branch"): "of a thread that is gone
+        /// and never named a worktree still finishes". Foundry: a gone session whose launch
+        /// named no workspace records the archive of none and asks for no archive.
+        #[test]
+        fn of_a_thread_that_is_gone_and_never_named_a_worktree_still_finishes() {
+            let mut rig = Rig::new();
+            let run = run_id(1);
+            rig.step(&run, &format!("approved {LABELED_AT}"));
+            rig.write(
+                &run,
+                Event::Claimed {
+                    machine: m1().to_string(),
+                    github_user: LOGIN.into(),
+                },
+            );
+            rig.moved(&run, State::Ready, State::Triage);
+            rig.step(&run, "approval-rechecked");
+            rig.write(
+                &run,
+                Event::SessionLaunched {
+                    thread_id: SESSION.into(),
+                    worktree: None,
+                    branch: Some(BRANCH.into()),
+                    model_instance: None,
+                    model: Some("opus".into()),
+                    model_options: None,
+                    resumed_from: None,
+                    base: Some("main".into()),
+                    title: None,
+                },
+            );
+            rig.moved(&run, State::Triage, State::Building);
+            rig.sim.set_labels(&["factory:building"]);
+            rig.sim.set_assignees(&[LOGIN]);
+            rig.view = gone();
+            assert_eq!(
+                pass(&rig, &run),
+                ResumeStep::Archiving {
+                    resumes: 1,
+                    workspace: None
+                }
+            );
+            assert_eq!(
+                resume_steps(&rig, &run),
+                vec![
+                    "resume-archiving 1 none".to_string(),
+                    "resume-archive-asked 1".to_string()
+                ]
+            );
+            assert!(archive_calls(&rig).is_empty());
+        }
+    }
+
+    /// Cases of the first review cycle.
+    mod review_cycle_1 {
+        use super::foundry::claimed_not_built;
+        use super::*;
+
+        fn m3() -> MachineId {
+            MachineId(uuid::Uuid::from_u128(0x4))
+        }
+
+        fn fresh3() -> WorkspaceId {
+            WorkspaceId(uuid::Uuid::from_u128(0xb33))
+        }
+
+        /// A resume workspace made on m2 and shown with no setup, ready for its session.
+        fn at_the_start() -> (Rig, RunId) {
+            let (mut rig, run) = archived_and_waiting_for_a_machine();
+            resume_workspace_made(&mut rig, &run);
+            (rig, run)
+        }
+
+        fn session_owned_by(
+            owner: MachineId,
+            id: SessionId,
+            workspace: WorkspaceId,
+            state: SessionState,
+        ) -> Record<Session> {
+            Record {
+                owner,
+                ..session_record(id, workspace, state)
+            }
+        }
+
+        fn approval_edited_by_a_stranger() -> String {
+            approval_answer(
+                "2026-10-04T12:00:00Z",
+                "tom",
+                &[("2026-10-04T10:30:00Z", "mallory")],
+            )
+        }
+
+        // B1: the archive is asked again while the workspace shows on a machine heard from.
+
+        #[test]
+        fn an_archive_answered_unreachable_is_asked_again_once_the_machine_is_heard_from() {
+            let (mut rig, run) = interrupted();
+            rig.worker
+                .on_archive(Err(WorkerError::Unreachable("timed out".into())));
+            pass_one(&rig, &run);
+            // The machine is online with the workspace still showing: asked again, and no
+            // workspace in the same pass.
+            assert_eq!(
+                pass(&rig, &run),
+                ResumeStep::Archiving {
+                    resumes: 1,
+                    workspace: Some(old())
+                }
+            );
+            assert_eq!(archive_calls(&rig).len(), 2);
+            assert!(create_calls(&rig).is_empty());
+            // Once it shows archived the next pass goes on.
+            rig.view = archived();
+            assert_eq!(
+                pass(&rig, &run),
+                ResumeStep::NeedsMachine(Placing::Resume { resumes: 1 })
+            );
+            assert_eq!(archive_calls(&rig).len(), 2);
+        }
+
+        #[test]
+        fn a_later_archive_that_fails_is_an_error_for_that_pass_and_asked_again() {
+            let (rig, run) = interrupted();
+            pass_one(&rig, &run);
+            rig.worker
+                .on_archive(Err(WorkerError::Failed("busy".into())));
+            let error = advance(&rig.ctx(), &run).unwrap_err();
+            assert!(matches!(error, RunError::Worker(WorkerError::Failed(_))));
+            assert_eq!(
+                pass(&rig, &run),
+                ResumeStep::Archiving {
+                    resumes: 1,
+                    workspace: Some(old())
+                }
+            );
+            assert_eq!(archive_calls(&rig).len(), 3);
+            assert!(create_calls(&rig).is_empty());
+        }
+
+        #[test]
+        fn a_machine_that_is_offline_for_a_while_is_waited_for_with_no_archive_asked() {
+            let (mut rig, run) = interrupted();
+            pass_one(&rig, &run);
+            rig.view = cut_off(secs(60));
+            assert_eq!(pass(&rig, &run), ResumeStep::Waiting(Wait::Archive));
+            assert_eq!(archive_calls(&rig).len(), 1);
+        }
+
+        // B2: a terminal path begun by another step is that step's.
+
+        #[test]
+        fn a_begun_stuck_path_buildings_is_not_an_interruption() {
+            for step in [
+                "stuck-stop {\"code\":\"session-stuck\",\"stop\":{\"reason\":\"said stuck\"}}",
+                "stuck-commenting 0",
+                "stuck-detail said stuck",
+            ] {
+                let (rig, run) = interrupted();
+                rig.step(&run, step);
+                let before = event_count(&rig, &run);
+                assert!(is_skipped(&pass(&rig, &run)), "{step}");
+                assert_eq!(event_count(&rig, &run), before, "{step}");
+                assert!(rig.worker.calls().is_empty(), "{step}");
+            }
+        }
+
+        #[test]
+        fn a_begun_stuck_path_the_time_limits_is_not_an_interruption() {
+            let (rig, run) = interrupted();
+            rig.step(
+                &run,
+                "stuck-stop {\"code\":\"time-limit\",\"stop\":{\"reason\":\"the run ran past limits.minutes\"}}",
+            );
+            let before = event_count(&rig, &run);
+            assert!(is_skipped(&pass(&rig, &run)));
+            assert_eq!(event_count(&rig, &run), before);
+            assert!(rig.worker.calls().is_empty());
+        }
+
+        #[test]
+        fn a_stuck_comment_that_landed_before_its_line_is_not_an_interruption() {
+            let (rig, run) = interrupted();
+            rig.write(
+                &run,
+                Event::Stuck {
+                    reason: "said stuck".into(),
+                    branch: None,
+                    commits_ahead: None,
+                },
+            );
+            assert!(is_skipped(&pass(&rig, &run)));
+            assert!(rig.worker.calls().is_empty());
+        }
+
+        #[test]
+        fn a_questions_post_or_a_withdraw_begun_is_not_an_interruption() {
+            for step in ["questions-commenting 0", "approval-withdrawn"] {
+                let (rig, run) = interrupted();
+                rig.step(&run, step);
+                assert!(is_skipped(&pass(&rig, &run)), "{step}");
+                assert!(rig.worker.calls().is_empty(), "{step}");
+            }
+            let (rig, run) = interrupted();
+            rig.write(
+                &run,
+                Event::QuestionsPosted {
+                    questions: "1. Which?".into(),
+                },
+            );
+            assert!(is_skipped(&pass(&rig, &run)));
+        }
+
+        // B3: the approval and the text are read again before a session starts.
+
+        #[test]
+        fn a_body_edited_since_the_approval_is_stuck_and_starts_no_session() {
+            let (rig, run) = at_the_start();
+            rig.sim.set_approval(approval_edited_by_a_stranger());
+            assert_eq!(
+                pass(&rig, &run),
+                ResumeStep::Stuck {
+                    reason: messages::CHANGED_DURING_BUILD.into()
+                }
+            );
+            assert!(start_calls(&rig).is_empty());
+            assert!(!resume_steps(&rig, &run).contains(&"resume-sending 1".to_string()));
+            assert!(rig.finished(&run));
+        }
+
+        #[test]
+        fn a_withdrawn_approval_starts_no_session() {
+            let (rig, run) = at_the_start();
+            rig.sim
+                .set_approval(approval_answer(LABELED_AT, "mallory", &[]));
+            assert_eq!(
+                pass(&rig, &run),
+                ResumeStep::Stuck {
+                    reason: "factory:ready was not applied by an instructor".into()
+                }
+            );
+            assert!(start_calls(&rig).is_empty());
+            assert!(rig.finished(&run));
+        }
+
+        /// The runner's case: "relaunched starts from base when the issue text was edited
+        /// since the approval". Foundry: the run's own branch is not resumed from, and the
+        /// resume starts from the base.
+        #[test]
+        fn relaunched_starts_from_base_when_the_issue_text_was_edited_since_the_approval() {
+            let (mut rig, run) = interrupted();
+            rig.view = gone();
+            rig.sim.add_branch(BRANCH);
+            rig.sim.set_approval(approval_answer(
+                LABELED_AT,
+                "tom",
+                &[("2026-10-04T10:30:00Z", "tom")],
+            ));
+            pass_one(&rig, &run);
+            assert_eq!(interruptions(&rig, &run)[0]["branch"], Value::Null);
+        }
+
+        // A1: a machine given up before the session started.
+
+        #[test]
+        fn a_machine_unreachable_for_15_minutes_before_the_session_started_is_given_up() {
+            let (mut rig, run) = archived_and_waiting_for_a_machine();
+            rig.worker.on_create(Ok(fresh()));
+            placed_on(&rig, &run, m2());
+            rig.view = FleetView::builder()
+                .online(m1())
+                .online(m3())
+                .unreachable(m2(), secs(15 * 60 - 1))
+                .build();
+            assert_eq!(pass(&rig, &run), ResumeStep::Waiting(Wait::Workspace));
+            rig.view = FleetView::builder()
+                .online(m1())
+                .online(m3())
+                .unreachable(m2(), secs(15 * 60))
+                .build();
+            assert_eq!(
+                pass(&rig, &run),
+                ResumeStep::NeedsMachine(Placing::Resume { resumes: 1 })
+            );
+            assert!(
+                resume_steps(&rig, &run).contains(&format!("resume-machine-given-up 1 {}", m2()))
+            );
+            // Nothing ran: the same resume, no second decision.
+            assert_eq!(interruptions(&rig, &run).len(), 1);
+            assert!(placed(&rig.ctx(), &run, m2()).is_err());
+            rig.worker.on_create(Ok(fresh3()));
+            assert_eq!(
+                placed_on(&rig, &run, m3()),
+                ResumeStep::Waiting(Wait::Workspace)
+            );
+            let calls = create_calls(&rig);
+            assert_eq!(calls.len(), 2);
+            assert!(matches!(&calls[1], Call::Create { machine, request }
+                if *machine == m3() && request.name == "fac/8-1-r1"));
+            // When the given-up machine is heard from again its workspace is an orphan.
+            let view = FleetView::builder()
+                .online(m1())
+                .online(m2())
+                .online(m3())
+                .workspace(workspace_record(m2(), fresh(), "fac/8-1-r1", None))
+                .workspace(workspace_record(m3(), fresh3(), "fac/8-1-r1", None))
+                .build();
+            assert_eq!(
+                orphans(&view, project_id(), &run, &rig.events(&run)),
+                vec![fresh()]
+            );
+        }
+
+        #[test]
+        fn a_machine_whose_setup_cannot_be_read_for_15_minutes_is_given_up() {
+            let (mut rig, run) = archived_and_waiting_for_a_machine();
+            rig.worker.on_create(Ok(fresh()));
+            placed_on(&rig, &run, m2());
+            rig.view = FleetView::builder()
+                .online(m1())
+                .unreachable(m2(), secs(15 * 60))
+                .workspace(workspace_record(
+                    m2(),
+                    fresh(),
+                    "fac/8-1-r1",
+                    Some(setup_terminal()),
+                ))
+                .terminal(terminal_record(TerminalState::Running, None))
+                .build();
+            assert_eq!(
+                pass(&rig, &run),
+                ResumeStep::NeedsMachine(Placing::Resume { resumes: 1 })
+            );
+            assert!(start_calls(&rig).is_empty());
+        }
+
+        #[test]
+        fn a_claims_target_unreachable_for_15_minutes_before_its_create_is_given_up() {
+            let mut rig = Rig::new();
+            let run = run_id(1);
+            claimed_not_built(&rig, &run);
+            rig.view = FleetView::builder()
+                .online(m3())
+                .unreachable(m1(), secs(15 * 60))
+                .build();
+            rig.worker
+                .on_create(Err(WorkerError::Unreachable("timed out".into())));
+            assert!(placed(&rig.ctx(), &run, m2()).is_err());
+            assert!(resume_steps(&rig, &run).contains(&format!("claim-moved {}", m2())));
+            rig.view = FleetView::builder()
+                .online(m3())
+                .unreachable(m1(), secs(15 * 60))
+                .unreachable(m2(), secs(15 * 60))
+                .build();
+            assert!(matches!(
+                pass(&rig, &run),
+                ResumeStep::NeedsMachine(Placing::MovedClaim { .. })
+            ));
+            assert!(resume_steps(&rig, &run).contains(&format!("claim-moved-given-up {}", m2())));
+            assert!(placed(&rig.ctx(), &run, m2()).is_err());
+            rig.worker.on_create(Ok(fresh3()));
+            assert_eq!(
+                placed_on(&rig, &run, m3()),
+                ResumeStep::Moved {
+                    machine: m3(),
+                    workspace: fresh3()
+                }
+            );
+            assert!(interruptions(&rig, &run).is_empty());
+            // The target that was given up made a workspace of the name: an orphan when heard.
+            let view = FleetView::builder()
+                .online(m2())
+                .online(m3())
+                .workspace(workspace_record(m2(), fresh(), "fac/8-1", None))
+                .workspace(workspace_record(m3(), fresh3(), "fac/8-1", None))
+                .build();
+            assert_eq!(
+                orphans(&view, project_id(), &run, &rig.events(&run)),
+                vec![fresh()]
+            );
+        }
+
+        // A2: a closed issue ends a run whose old machine is gone, with that machine never asked.
+
+        #[test]
+        fn a_closed_issue_ends_an_owed_resume_whose_machine_is_gone_without_asking_it() {
+            let (mut rig, run) = interrupted();
+            rig.view = cut_off(secs(15 * 60));
+            pass_one(&rig, &run);
+            rig.sim.set_closed(true);
+            rig.worker
+                .on_end_sessions(Err(WorkerError::Unreachable("gone".into())));
+            assert_eq!(pass(&rig, &run), ResumeStep::Abandoned);
+            assert!(
+                rig.worker
+                    .calls()
+                    .iter()
+                    .all(|call| !matches!(call, Call::EndSessions { .. }))
+            );
+            assert!(rig.finished(&run));
+            assert!(create_calls(&rig).is_empty());
+        }
+
+        #[test]
+        fn an_own_merge_ends_an_owed_resume_whose_machine_is_gone_without_asking_it() {
+            let (mut rig, run) = interrupted();
+            rig.view = cut_off(secs(15 * 60));
+            pass_one(&rig, &run);
+            pr_opened(&rig, &run);
+            rig.sim.set_pull(
+                12,
+                SimPull {
+                    state: "MERGED",
+                    ..pr_on(PR_BRANCH, false)
+                },
+            );
+            rig.sim.set_closed(true);
+            rig.worker
+                .on_end_sessions(Err(WorkerError::Unreachable("gone".into())));
+            assert_eq!(pass(&rig, &run), ResumeStep::Ended);
+            assert!(
+                rig.worker
+                    .calls()
+                    .iter()
+                    .all(|call| !matches!(call, Call::EndSessions { .. }))
+            );
+            assert!(rig.finished(&run));
+        }
+
+        // testing-6: a closing after the first pass stops the resume.
+
+        #[test]
+        fn a_closed_issue_after_the_first_pass_makes_no_workspace_and_starts_no_session() {
+            let (mut rig, run) = interrupted();
+            pass_one(&rig, &run);
+            rig.sim.set_closed(true);
+            rig.view = archived();
+            assert_eq!(pass(&rig, &run), ResumeStep::Abandoned);
+            assert!(create_calls(&rig).is_empty());
+            assert!(start_calls(&rig).is_empty());
+        }
+
+        #[test]
+        fn a_closed_issue_stops_a_resume_whose_machine_is_placed() {
+            let (mut rig, run) = archived_and_waiting_for_a_machine();
+            rig.sim.set_closed(true);
+            assert_eq!(placed_on(&rig, &run, m2()), ResumeStep::Abandoned);
+            assert!(create_calls(&rig).is_empty());
+            rig.view = archived();
+        }
+
+        #[test]
+        fn an_own_merge_after_the_first_pass_ends_the_run() {
+            let (mut rig, run) = interrupted();
+            pass_one(&rig, &run);
+            pr_opened(&rig, &run);
+            rig.sim.set_pull(
+                12,
+                SimPull {
+                    state: "MERGED",
+                    ..pr_on(PR_BRANCH, false)
+                },
+            );
+            rig.sim.set_closed(true);
+            rig.view = archived();
+            assert_eq!(pass(&rig, &run), ResumeStep::Ended);
+            assert!(create_calls(&rig).is_empty());
+        }
+
+        #[test]
+        fn a_closed_issue_stops_a_moved_claim() {
+            let mut rig = Rig::new();
+            let run = run_id(1);
+            claimed_not_built(&rig, &run);
+            rig.view = FleetView::builder()
+                .online(m2())
+                .unreachable(m1(), secs(15 * 60))
+                .build();
+            rig.sim.set_closed(true);
+            assert_eq!(placed_on(&rig, &run, m2()), ResumeStep::Abandoned);
+            assert!(create_calls(&rig).is_empty());
+            assert!(
+                !resume_steps(&rig, &run)
+                    .iter()
+                    .any(|step| step.starts_with("claim-moved"))
+            );
+        }
+
+        // A4: a session the view does not show yet.
+
+        #[test]
+        fn the_pass_right_after_a_start_with_the_session_not_shown_yet_writes_and_asks_nothing() {
+            let (mut rig, run) = at_the_start();
+            resumed(&mut rig, &run);
+            rig.view = with_resume_workspace("fac/8-1-r1", None).build();
+            let before = event_count(&rig, &run);
+            let calls = rig.worker.calls().len();
+            assert!(is_skipped(&pass(&rig, &run)));
+            assert_eq!(event_count(&rig, &run), before);
+            assert_eq!(rig.worker.calls().len(), calls);
+            assert_eq!(interruptions(&rig, &run).len(), 1);
+        }
+
+        #[test]
+        fn a_session_not_shown_on_a_machine_gone_for_15_minutes_is_an_interruption() {
+            let (mut rig, run) = at_the_start();
+            resumed(&mut rig, &run);
+            rig.view = FleetView::builder()
+                .online(m1())
+                .unreachable(m2(), secs(15 * 60 - 1))
+                .workspace(workspace_record(m2(), fresh(), "fac/8-1-r1", None))
+                .build();
+            assert!(is_skipped(&pass(&rig, &run)));
+            rig.view = FleetView::builder()
+                .online(m1())
+                .unreachable(m2(), secs(15 * 60))
+                .workspace(workspace_record(m2(), fresh(), "fac/8-1-r1", None))
+                .build();
+            assert!(matches!(
+                pass(&rig, &run),
+                ResumeStep::Archiving { resumes: 2, .. }
+            ));
+        }
+
+        // testing-7: the session's own machine, not the claim's, is measured.
+
+        #[test]
+        fn a_resumed_session_on_a_machine_gone_for_15_minutes_is_an_interruption() {
+            let (mut rig, run) = at_the_start();
+            resumed(&mut rig, &run);
+            rig.view = FleetView::builder()
+                .online(m1())
+                .unreachable(m2(), secs(15 * 60))
+                .workspace(workspace_record(m2(), fresh(), "fac/8-1-r1", None))
+                .session(session_owned_by(
+                    m2(),
+                    resumed_session(),
+                    fresh(),
+                    SessionState::Working,
+                ))
+                .build();
+            assert_eq!(
+                pass(&rig, &run),
+                ResumeStep::Archiving {
+                    resumes: 2,
+                    workspace: Some(fresh())
+                }
+            );
+        }
+
+        #[test]
+        fn the_claim_machine_gone_does_not_interrupt_a_session_on_another() {
+            let (mut rig, run) = at_the_start();
+            resumed(&mut rig, &run);
+            rig.view = FleetView::builder()
+                .online(m2())
+                .unreachable(m1(), secs(60 * 60))
+                .workspace(workspace_record(m2(), fresh(), "fac/8-1-r1", None))
+                .session(session_owned_by(
+                    m2(),
+                    resumed_session(),
+                    fresh(),
+                    SessionState::Working,
+                ))
+                .build();
+            assert!(is_skipped(&pass(&rig, &run)));
+        }
+
+        // testing-2: the record comes before the act.
+
+        #[test]
+        fn a_start_whose_answer_is_lost_is_recorded_and_ended_before_the_second_start() {
+            let (rig, run) = at_the_start();
+            rig.worker
+                .on_start_session(Err(WorkerError::Unreachable("timed out".into())));
+            assert!(advance(&rig.ctx(), &run).is_err());
+            assert!(resume_steps(&rig, &run).contains(&"resume-sending 1".to_string()));
+            assert_eq!(start_calls(&rig).len(), 1);
+            rig.worker.on_start_session(Ok(resumed_session()));
+            assert!(matches!(pass(&rig, &run), ResumeStep::Started { .. }));
+            let calls = rig.worker.calls();
+            let ended = calls
+                .iter()
+                .rposition(
+                    |c| matches!(c, Call::EndSessions { workspace } if *workspace == fresh()),
+                )
+                .unwrap();
+            let second = calls
+                .iter()
+                .rposition(|c| matches!(c, Call::StartSession { .. }))
+                .unwrap();
+            assert!(ended < second);
+        }
+
+        #[test]
+        fn a_moved_claims_machine_is_recorded_before_its_create_is_asked() {
+            let mut rig = Rig::new();
+            let run = run_id(1);
+            claimed_not_built(&rig, &run);
+            rig.view = FleetView::builder()
+                .online(m2())
+                .unreachable(m1(), secs(15 * 60))
+                .build();
+            rig.worker
+                .on_create(Err(WorkerError::Unreachable("timed out".into())));
+            assert!(placed(&rig.ctx(), &run, m2()).is_err());
+            assert_eq!(
+                resume_steps(&rig, &run),
+                vec![format!("claim-moved {}", m2())]
+            );
+            // A later pass asks the machine it recorded, and places nothing new.
+            rig.worker.on_create(Ok(fresh()));
+            assert_eq!(
+                pass(&rig, &run),
+                ResumeStep::Moved {
+                    machine: m2(),
+                    workspace: fresh()
+                }
+            );
+            let calls = create_calls(&rig);
+            assert_eq!(calls.len(), 2);
+            assert!(
+                calls
+                    .iter()
+                    .all(|call| matches!(call, Call::Create { machine, .. } if *machine == m2()))
+            );
+            assert_eq!(
+                resume_steps(&rig, &run),
+                vec![format!("claim-moved {}", m2())]
+            );
+        }
+
+        // testing-3: a claim start decided to resume from a branch.
+
+        #[test]
+        fn a_moved_claim_keeps_the_branch_and_the_base_start_decided() {
+            let mut rig = Rig::new();
+            let run = run_id(1);
+            claimed_not_built(&rig, &run);
+            rig.step(&run, "launch-resuming feat/x");
+            rig.view = FleetView::builder()
+                .online(m2())
+                .unreachable(m1(), secs(15 * 60))
+                .build();
+            rig.worker.on_create(Ok(fresh()));
+            placed_on(&rig, &run, m2());
+            let calls = create_calls(&rig);
+            let Call::Create { request, .. } = &calls[0] else {
+                panic!("a create");
+            };
+            assert_eq!(
+                request.checkout,
+                Checkout::Branch {
+                    name: "feat/x".into()
+                }
+            );
+
+            let mut rig = Rig::new();
+            let run = run_id(1);
+            claimed_not_built(&rig, &run);
+            rig.step(&run, "launch-base feature/x");
+            rig.view = FleetView::builder()
+                .online(m2())
+                .unreachable(m1(), secs(15 * 60))
+                .build();
+            rig.worker.on_create(Ok(fresh()));
+            placed_on(&rig, &run, m2());
+            let calls = create_calls(&rig);
+            let Call::Create { request, .. } = &calls[0] else {
+                panic!("a create");
+            };
+            assert_eq!(
+                request.checkout,
+                Checkout::NewBranch {
+                    base: "feature/x".into(),
+                    branch: Some("fac/8-1".into())
+                }
+            );
+        }
+
+        // testing-4: the setup that succeeded.
+
+        #[test]
+        fn a_setup_that_exited_zero_goes_on_to_the_session() {
+            let (mut rig, run) = archived_and_waiting_for_a_machine();
+            rig.worker.on_create(Ok(fresh()));
+            placed_on(&rig, &run, m2());
+            rig.view = with_resume_workspace("fac/8-1-r1", Some(setup_terminal()))
+                .terminal(terminal_record(TerminalState::Exited, Some(0)))
+                .build();
+            assert!(matches!(
+                resumed(&mut rig, &run),
+                ResumeStep::Started { resumes: 1, .. }
+            ));
+            assert_eq!(start_calls(&rig).len(), 1);
+        }
+
+        // testing-5: orphans never list a workspace that is being made.
+
+        #[test]
+        fn orphans_keep_a_resume_workspace_during_its_setup() {
+            let (rig, run) = at_the_start();
+            let view = with_resume_workspace("fac/8-1-r1", Some(setup_terminal()))
+                .workspace(workspace_record(m1(), old(), BRANCH, None))
+                .build();
+            // The session is not launched: the earlier workspace is still the run's active one
+            // and the resume workspace is being set up.
+            assert_eq!(
+                orphans(&view, project_id(), &run, &rig.events(&run)),
+                vec![]
+            );
+        }
+
+        #[test]
+        fn orphans_keep_a_build_workspace_whose_answer_is_not_recorded_yet() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            claimed_not_built(&rig, &run);
+            let view = FleetView::builder()
+                .online(m1())
+                .workspace(workspace_record(m1(), fresh(), BRANCH, None))
+                .build();
+            assert_eq!(
+                orphans(&view, project_id(), &run, &rig.events(&run)),
+                vec![]
+            );
+        }
+
+        #[test]
+        fn orphans_see_a_resume_workspace_past_the_64th_name() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            rig.write(
+                &run,
+                Event::SessionInterrupted {
+                    resumes: 66,
+                    relaunch: false,
+                    run_ordinal: None,
+                    branch: None,
+                    t3_error: None,
+                    ended_in_pass: 0,
+                },
+            );
+            rig.write(
+                &run,
+                Event::SessionLaunched {
+                    thread_id: resumed_session().to_string(),
+                    worktree: Some(fresh().to_string()),
+                    branch: Some("fac/8-1-r66".into()),
+                    model_instance: None,
+                    model: None,
+                    model_options: None,
+                    resumed_from: None,
+                    base: None,
+                    title: None,
+                },
+            );
+            let view = FleetView::builder()
+                .online(m2())
+                .workspace(workspace_record(m2(), fresh(), "fac/8-1-r66", None))
+                .workspace(workspace_record(m2(), old(), "fac/8-1-r65", None))
+                .build();
+            assert_eq!(
+                orphans(&view, project_id(), &run, &rig.events(&run)),
+                vec![old()]
+            );
+        }
+
+        // testing-11: what is adopted must be the run's.
+
+        #[test]
+        fn a_record_on_another_machine_is_not_taken_for_the_creates_answer() {
+            let (mut rig, run) = archived_and_waiting_for_a_machine();
+            rig.step(&run, &format!("resume-machine 1 {}", m2()));
+            rig.step(&run, "resume-requested 1 fac/8-1-r1");
+            rig.view = FleetView::builder()
+                .online(m1())
+                .online(m2())
+                .workspace(workspace_record(
+                    m1(),
+                    fresh3(),
+                    "fac/8-1-r1",
+                    Some(setup_terminal()),
+                ))
+                .build();
+            rig.worker.on_create(Ok(fresh()));
+            assert_eq!(pass(&rig, &run), ResumeStep::Waiting(Wait::Workspace));
+            assert_eq!(create_calls(&rig).len(), 1);
+            assert!(resume_steps(&rig, &run).contains(&format!("resume-workspace 1 {}", fresh())));
+        }
+
+        #[test]
+        fn a_session_with_no_turn_record_in_the_workspace_is_not_adopted() {
+            let (mut rig, run) = at_the_start();
+            rig.view = with_resume_workspace("fac/8-1-r1", None)
+                .session(session_record(
+                    resumed_session(),
+                    fresh(),
+                    SessionState::Working,
+                ))
+                .build();
+            rig.worker
+                .on_start_session(Ok(SessionId(uuid::Uuid::from_u128(0x5e8))));
+            assert!(matches!(pass(&rig, &run), ResumeStep::Started { .. }));
+            assert_eq!(start_calls(&rig).len(), 1);
+        }
+
+        // the `placed` nit: nothing that needs no machine is acted on.
+
+        #[test]
+        fn placed_when_nothing_needs_a_machine_is_skipped_and_writes_nothing() {
+            let (rig, run) = interrupted();
+            let before = event_count(&rig, &run);
+            assert!(is_skipped(&placed_on(&rig, &run, m2())));
+            assert_eq!(event_count(&rig, &run), before);
+            assert!(rig.worker.calls().is_empty());
+            pass_one(&rig, &run);
+            let before = event_count(&rig, &run);
+            assert!(is_skipped(&placed_on(&rig, &run, m2())));
+            assert_eq!(event_count(&rig, &run), before);
+            assert_eq!(archive_calls(&rig).len(), 1);
+        }
+
+        /// An interruption with a message that no result line ends is an interruption.
+        #[test]
+        fn a_finished_session_whose_newest_turn_has_no_result_line_is_an_interruption() {
+            let (mut rig, run) = interrupted();
+            rig.view = fleet(Some(SessionState::Finished))
+                .turn(turn_of(session(), old(), 1, 1))
+                .build();
+            say(&rig, "I am still working on it.");
+            pass_one(&rig, &run);
+        }
+
+        /// A gone session with no approval recorded is stuck as unconfirmed, and the ledger's
+        /// detail names the session's end.
+        #[test]
+        fn a_gone_session_with_no_recorded_approval_is_stuck_unconfirmed_naming_its_end() {
+            let mut rig = Rig::new();
+            let run = run_id(1);
+            rig.write(
+                &run,
+                Event::Claimed {
+                    machine: m1().to_string(),
+                    github_user: LOGIN.into(),
+                },
+            );
+            rig.moved(&run, State::Ready, State::Triage);
+            rig.step(&run, "approval-rechecked");
+            rig.write(&run, launch(Some(BRANCH), Some("main")));
+            rig.moved(&run, State::Triage, State::Building);
+            rig.sim.set_labels(&["factory:building"]);
+            rig.sim.set_assignees(&[LOGIN]);
+            rig.view = gone();
+            assert_eq!(
+                pass(&rig, &run),
+                ResumeStep::Stuck {
+                    reason: messages::CANNOT_CONFIRM.into()
+                }
+            );
+            assert!(
+                rig.steps(&run)
+                    .iter()
+                    .any(|step| step.starts_with("stuck-detail") && step.contains(SESSION_GONE)),
+                "{:?}",
+                rig.steps(&run)
+            );
+            assert!(interruptions(&rig, &run).is_empty());
         }
     }
 }
