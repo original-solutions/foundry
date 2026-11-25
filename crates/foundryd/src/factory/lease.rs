@@ -758,18 +758,20 @@ impl Lease {
             }
             _ => return Found::Failed,
         };
-        // A commit already fetched and found to be no lease is not fetched again: its message
-        // is known, and what it brought was dropped.
-        let known_foreign = self
+        // A commit already read is not read again: a sha names one message, so what it said
+        // is known. That covers a holder's own commit, which needs no `cat-file` each tick,
+        // and a commit found to be no lease, whose objects were dropped.
+        let known = self
             .shared
             .state()
             .seen
             .as_ref()
-            .is_some_and(|seen| seen.sha == sha && seen.fetched && seen.lease.is_none());
-        if known_foreign {
+            .filter(|seen| seen.sha == sha && seen.fetched)
+            .map(|seen| seen.lease);
+        if let Some(parsed) = known {
             return Found::Present {
                 sha,
-                parsed: None,
+                parsed,
                 fetched: true,
             };
         }
@@ -962,12 +964,12 @@ fn raised(n: u64) -> Option<u64> {
     n.checked_add(1).filter(|raised| *raised <= MAX_COUNT)
 }
 
-/// Removes every `*.lock` file under `dir` and every `objects/pack/tmp_*` file, which a git
-/// call killed at the limit may have left, and which would make every later read fail for
-/// good. It is safe because no git child of this lease is alive when it runs: it is called
-/// under the lock that serialises ticks, and every child is killed and reaped before
-/// [`Lease::git`] returns. There is one daemon per machine and one lease per directory, so
-/// no other process writes there.
+/// Removes every `*.lock` file under `dir`, outside the loose-object buckets, and every
+/// `objects/pack/tmp_*` file, which a git call killed at the limit may have left, and which
+/// would make every later read fail for good. It is safe because no git child of this lease
+/// is alive when it runs: it is called under the lock that serialises ticks, and every child
+/// is killed and reaped before [`Lease::git`] returns. There is one daemon per machine and
+/// one lease per directory, so no other process writes there.
 fn remove_stale(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -980,7 +982,15 @@ fn remove_stale(dir: &Path) {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if kind.is_dir() {
-            remove_stale(&path);
+            // The loose-object buckets (`objects/00` to `objects/ff`) can hold thousands of
+            // files and never a lock: git writes a loose object to a temporary name and renames
+            // it.
+            let bucket = dir.ends_with("objects")
+                && name.len() == 2
+                && name.chars().all(|c| c.is_ascii_hexdigit());
+            if !bucket {
+                remove_stale(&path);
+            }
         } else if kind.is_file()
             && (name.ends_with(".lock")
                 || (name.starts_with("tmp_") && dir.ends_with("objects/pack")))
@@ -1491,7 +1501,7 @@ mod tests {
 
     /// A `git` that logs its arguments and, for a push, does what the marker files in `marks`
     /// ask: `autopack` (git packs after 3 packs, not 50), `needfilter` (a fetch without `--filter=tree:0` fails), `catfail` (the next `cat-file commit`
-    /// fails, once), `readfail` (a fetch or ls-remote fails), `fetchfail` (only a fetch fails), `reject` (the
+    /// fails, once), `configfail` (every `config` call fails), `readfail` (a fetch or ls-remote fails), `fetchfail` (only a fetch fails), `reject` (the
     /// remote rejects the push with a `!` line, as a ruleset does), `linger` (the push leaves a child holding the
     /// pipes and exits 0), `fail` (the push fails), `hang` (it never returns), `hold` (it waits for `go`
     /// before it pushes) and `after` (it pushes, then waits for `go` before it exits).
@@ -1507,6 +1517,8 @@ printf '%s| %s\n' "$names" "$args" >> "$M/calls"
 case " $* " in
   *" cat-file commit "*)
     if [ -e "$M/catfail" ]; then rm "$M/catfail"; echo 'fatal: bad object' >&2; exit 128; fi;;
+  *" config "*)
+    if [ -e "$M/configfail" ]; then echo 'error: could not lock config file' >&2; exit 255; fi;;
   *" fetch "*)
     if [ -e "$M/needfilter" ]; then
       case " $* " in *" --filter=tree:0 "*) ;; *) echo 'fatal: fetch without --filter=tree:0' >&2; exit 128;; esac
@@ -2637,5 +2649,49 @@ exec git "$@"
             assert!(a.check().is_err(), "{marker}");
             assert!(rig.remote.lease_sha().is_none(), "{marker}");
         }
+    }
+
+    #[test]
+    fn a_lease_directory_left_half_made_by_a_failed_config_is_made_again_whole() {
+        let rig = Rig::new();
+        let a = rig.machine();
+        a.mark("configfail");
+        assert_eq!(reason_of(&a.tick(0)), NOT_READ);
+        assert!(
+            !a.dir.exists(),
+            "the half-made lease directory is still there"
+        );
+        assert!(rig.remote.lease_sha().is_none());
+        a.unmark("configfail");
+        assert_eq!(a.tick(0), held(1));
+        assert_eq!(
+            git_text(&a.dir, &["config", "extensions.partialClone"]),
+            "lease"
+        );
+    }
+
+    #[test]
+    fn a_holder_reads_its_own_unchanged_commit_from_what_it_pushed_and_keeps_its_hold() {
+        let rig = Rig::new();
+        let a = rig.machine();
+        assert_eq!(a.tick(0), held(1));
+        a.advance(secs(60));
+        assert_eq!(a.tick(0), held(1));
+        // A `cat-file commit` of the lease directory would fail now: the commit the ref names
+        // is the one this lease pushed, so it is not read again and the hold stays.
+        a.mark("catfail");
+        fs::remove_file(a.at("calls")).unwrap();
+        a.advance(secs(10));
+        assert_eq!(a.tick(0), held(1));
+        assert_eq!(a.check(), Ok(1));
+        assert!(
+            a.at("catfail").exists(),
+            "the holder read its own commit again"
+        );
+        let calls = fs::read_to_string(a.at("calls")).unwrap();
+        assert!(
+            !calls.lines().any(|call| call.contains(" cat-file ")),
+            "{calls}"
+        );
     }
 }
