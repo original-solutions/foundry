@@ -111,7 +111,11 @@ pub enum OtherKind {
     InvalidArgument,
     /// `gh` answered with output the call did not expect.
     Parse,
-    /// `gh` failed in a way no other variant names, or printed more than its limit.
+    /// `gh` got no answer from GitHub: the call was ended by a signal or printed more than its
+    /// limit, or `gh` said so in one of the shapes `github::gh::finish` names. Asking again
+    /// may get one.
+    NoAnswer,
+    /// `gh` failed in a way no other variant names: GitHub refused the call.
     Failed,
 }
 

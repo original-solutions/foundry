@@ -154,6 +154,78 @@ fn auth_refused(stderr: &str) -> bool {
     .any(|said| lower.contains(said))
 }
 
+/// Whether `gh`, failing with `stderr`, got no answer from GitHub ([`OtherKind::NoAnswer`]),
+/// or GitHub refused the call ([`OtherKind::Failed`]).
+///
+/// A shape this does not name is a refusal. That is the runner's reading (every failure to
+/// draft but a rate limit is stuck, "exited with status 1: boom" included), and the safe side:
+/// a refusal stops where a person sees it at once and loses nothing, while a real refusal
+/// taken for no answer would be asked again every pass and end with a reason that names
+/// nothing.
+///
+/// No answer is told only by the wrappers around what `gh` prints, as gh 2.105.0's source
+/// writes them, never by a list of failure words. Foundry's own (a call a signal ended, an
+/// answer over [`OUTPUT_LIMIT`]) are read by [`finish`]; the rest here:
+///
+/// - gh's `printError`: a `*net.DNSError` anywhere in the chain prints
+///   `error connecting to <host>`.
+/// - Go's `*url.Error`, the transport's failure at any step: the method as net/http's
+///   `urlErrorOp` writes it (`Post`, `Get`), the quoted URL, `": "`, then any cause.
+/// - A lookup before a mutation: GitHub's answer is go-gh's `HTTP <status>...` or
+///   `GraphQL: ...`, and a 5xx is no answer.
+/// - A mutation (`gh pr ready`): `ready.go` wraps its error as `API call failed: <error>`.
+///   Inside it, GitHub's answer is a status in shurcooL-graphql's words
+///   (`non-200 OK status code: <status> ...`, a 5xx is no answer) or `GraphQL: ...`; anything
+///   else there is the request not reaching GitHub or its answer not being read, which is no
+///   answer.
+///
+/// So Go's bare transport errors outside both wrappers (what a lookup whose answer was cut
+/// short prints) are refusals. Only what `gh` said is read, never the command, which names the
+/// repo.
+fn gave_no_answer(stderr: &str) -> bool {
+    let said = stderr.trim_end();
+    if said.starts_with("error connecting to ") {
+        return true;
+    }
+    let (mutation, error) = match said.strip_prefix("API call failed: ") {
+        Some(error) => (true, error),
+        None => (false, said),
+    };
+    if let Some(status) = answered_status(error) {
+        return status >= 500;
+    }
+    if error.starts_with("GraphQL: ") {
+        return false;
+    }
+    mutation || is_url_error(error)
+}
+
+/// The status of GitHub's answer that `error` starts with, in go-gh's words
+/// (`HTTP 502: Bad Gateway (<url>)`) or shurcooL-graphql's
+/// (`non-200 OK status code: 502 Bad Gateway body: "..."`).
+fn answered_status(error: &str) -> Option<u16> {
+    let rest = error
+        .strip_prefix("HTTP ")
+        .or_else(|| error.strip_prefix("non-200 OK status code: "))?;
+    let digits = rest.get(..3)?;
+    if rest[3..].starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Whether `error` is Go's `*url.Error` (`%s %q: %s`): the method as `urlErrorOp` writes it
+/// (one capital, then lower case), the quoted `http` or `https` URL, `": "`, the cause.
+fn is_url_error(error: &str) -> bool {
+    error.split_once(' ').is_some_and(|(method, rest)| {
+        let mut letters = method.chars();
+        letters.next().is_some_and(|c| c.is_ascii_uppercase())
+            && letters.all(|c| c.is_ascii_lowercase())
+            && (rest.starts_with("\"http://") || rest.starts_with("\"https://"))
+            && rest.contains("\": ")
+    })
+}
+
 /// Reads how the call with `args` ended: its stdout, or the error it is.
 pub fn finish(args: &[String], answer: Answer) -> Result<String, TrackerError> {
     let command = command_text(args);
@@ -167,7 +239,7 @@ pub fn finish(args: &[String], answer: Answer) -> Result<String, TrackerError> {
             seconds: LIMIT.as_secs(),
         }),
         Answer::TooLarge => Err(TrackerError::Other {
-            kind: OtherKind::Failed,
+            kind: OtherKind::NoAnswer,
             message: format!("`{command}` printed more than {OUTPUT_LIMIT} bytes"),
         }),
         Answer::Exit {
@@ -191,6 +263,7 @@ pub fn finish(args: &[String], answer: Answer) -> Result<String, TrackerError> {
             })
         }
         Answer::Exit { status, stderr, .. } => {
+            let signalled = status.is_none();
             let status = status.unwrap_or(-1);
             if rate_limited(&stderr) {
                 Err(TrackerError::RateLimited { command, stderr })
@@ -203,8 +276,13 @@ pub fn finish(args: &[String], answer: Answer) -> Result<String, TrackerError> {
                     stderr,
                 })
             } else {
+                let kind = if signalled || gave_no_answer(&stderr) {
+                    OtherKind::NoAnswer
+                } else {
+                    OtherKind::Failed
+                };
                 Err(TrackerError::Other {
-                    kind: OtherKind::Failed,
+                    kind,
                     message: format!(
                         "`{command}` exited with status {status}: {}",
                         stderr.trim_end()
@@ -889,7 +967,7 @@ mod tests {
     }
 
     #[test]
-    fn a_signal_killed_gh_is_a_failure_with_status_minus_1() {
+    fn a_signal_killed_gh_is_no_answer_with_status_minus_1() {
         let dir = tempfile::tempdir().unwrap();
         let program = fake_gh(dir.path(), "kill -9 $$");
         let gh = gh_at(&program, Arc::new(FakeClock::new()));
@@ -897,7 +975,7 @@ mod tests {
         assert_eq!(
             error,
             TrackerError::Other {
-                kind: OtherKind::Failed,
+                kind: OtherKind::NoAnswer,
                 message: "`gh issue edit 6` exited with status -1: ".into()
             }
         );
