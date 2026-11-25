@@ -555,8 +555,20 @@ fn send_once(
     message: Message,
     key: &str,
 ) -> Result<(), RunError> {
-    let _ = (at, key);
-    let count: Option<u64> = None;
+    let count = match at.seen.send_intents.get(key) {
+        Some(count) => Some(*count),
+        None => {
+            let count = ctx.view.session_turn(session).map(|turn| turn.prompts);
+            if let Some(count) = count {
+                ctx.record_step(
+                    &at.run,
+                    &format!("{SEND_INTENT}{key} {count}"),
+                    &Cause::new(at.step, "send-intent"),
+                )?;
+            }
+            count
+        }
+    };
     match ctx.send(session, message, count) {
         Ok(_) | Err(RunError::Send(SendRefused::CountRose { .. })) => Ok(()),
         Err(error) => Err(error),
@@ -574,7 +586,11 @@ fn post_once_on_pr(
     body: &str,
     cause: &Cause,
 ) -> Result<(), RunError> {
-    let _ = (run, intended, cause);
+    if !intended {
+        ctx.record_step(run, GATE_RESULTS_COMMENTING, cause)?;
+    } else if newest_comment_is(ctx, pr, body)? {
+        return Ok(());
+    }
     ctx.comment_on_pr(pr, body)
 }
 
