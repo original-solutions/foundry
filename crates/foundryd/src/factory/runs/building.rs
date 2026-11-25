@@ -217,7 +217,7 @@ pub fn advance(ctx: &RunContext<'_>, run: &RunId) -> Result<BuildStep, RunError>
     // ledger alone finishes it, whatever the session shows, as `finish_begun_stuck` finishes a
     // begun stuck path. `time_limit` leaves such a run to this.
     if at.state == State::Building && seen.questions_posted {
-        return finish_posted_questions(ctx, run, &events, &mut at);
+        return finish_posted_questions(ctx, run, &mut at);
     }
     let Some(thread) = seen.thread_id.clone() else {
         // The launch is `start`'s while the run is in `triage`; a building run with no session
@@ -440,23 +440,15 @@ fn end_needs_info(ctx: &RunContext<'_>, at: &Progress) -> Result<(), RunError> {
 }
 
 /// Finishes the move to `needs-info` of a run whose questions are on the issue: the label, the
-/// release and the status comment, then the end. The questions are not posted again
-/// (`apply_actions` skips them once `questions_posted` is in the ledger) and the session is not
-/// read: the questions are the newest `questions_posted` line's.
+/// release and the status comment, then the end. The session is not read, and the transition is
+/// given no questions: `apply_actions` skips posting them once `questions_posted` is in the
+/// ledger, so their text is never used.
 fn finish_posted_questions(
     ctx: &RunContext<'_>,
     run: &RunId,
-    events: &[RunEvent],
     at: &mut Progress,
 ) -> Result<BuildStep, RunError> {
-    let questions = events
-        .iter()
-        .rev()
-        .find(|event| event.event == names::QUESTIONS_POSTED)
-        .and_then(|event| event.data.get("questions"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
+    let questions = String::new();
     let (_, actions) = transition(at.state, &LifecycleEvent::QuestionsRaised { questions })?;
     apply_actions(
         ctx,
