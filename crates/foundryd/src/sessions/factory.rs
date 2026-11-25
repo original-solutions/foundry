@@ -1274,9 +1274,24 @@ exec "$agent" "$@""#;
 
         /// [`Fx::restart`], with `secrets` as the new daemon's store.
         async fn restart_using(&mut self, secrets: Option<Arc<dyn Secrets>>) {
+            self.restart_core(secrets, 0).await;
+        }
+
+        /// [`Fx::restart`], where the first `reads` reads of a `session_turn` record fail, adopt's
+        /// among them.
+        async fn restart_failing_turn_reads(&mut self, reads: usize) {
+            let secrets = Some(self.secrets.clone() as Arc<dyn Secrets>);
+            self.restart_core(secrets, reads).await;
+        }
+
+        async fn restart_core(&mut self, secrets: Option<Arc<dyn Secrets>>, reads: usize) {
             self.server.abort();
             let _ = (&mut self.server).await;
             let sessions = self.again_using(secrets);
+            sessions
+                .inner
+                .fail_turn_reads
+                .store(reads, std::sync::atomic::Ordering::SeqCst);
             drop(std::mem::replace(&mut self.sessions, sessions));
             self.sessions.adopt().await;
             let listener = tokio::net::TcpListener::bind(("127.0.0.1", self.config.hook_port))
@@ -2787,6 +2802,100 @@ exec "$agent" "$@""#;
 
         assert!(matches!(error, SessionError::SecretsUnreadable), "{error}");
         f.assert_nothing_left(&sessions, project);
+    }
+
+    /// A session that ends with its record behind: its counts file says turn 1, its record
+    /// says nothing, and the daemon restarts with its first `reads` reads of the record failing.
+    async fn ended_with_a_record_behind(
+        f: &mut Fx,
+        workspace: WorkspaceId,
+        archive: bool,
+        reads: usize,
+    ) -> SessionId {
+        let project = ProjectId::random();
+        let id = f.start_factory(workspace, project).await;
+        until("the session to be idle", || {
+            f.state(id) == Some(SessionState::Idle)
+        })
+        .await;
+        f.fail_turn_writes(1000);
+        f.type_keys(id, b"\n".to_vec()).await;
+        until("the session to end", || {
+            matches!(
+                f.state(id),
+                Some(SessionState::Finished | SessionState::Failed)
+            )
+        })
+        .await;
+        assert!(f.turn_file(id, 1).exists());
+        assert_eq!(f.turn_of(id), None);
+        if archive {
+            f.archive(workspace, project, true);
+        }
+        f.restart_failing_turn_reads(reads).await;
+        id
+    }
+
+    const STOPS_THEN_EXITS: &str = "- hook: {event: SessionStart}\n- wait_input\n- stop: {last_assistant_message: \"last\"}\n- exit: 0\n";
+
+    #[tokio::test]
+    async fn a_record_behind_whose_first_read_after_a_restart_fails_is_still_stored() {
+        let mut f = Fx::new(STOPS_THEN_EXITS).await;
+
+        let id = ended_with_a_record_behind(&mut f, WorkspaceId::random(), false, 1).await;
+
+        f.until_turn(id, 1, 0).await;
+    }
+
+    #[tokio::test]
+    async fn the_folder_of_an_archived_workspace_stays_until_its_record_is_stored() {
+        let mut f = Fx::new(STOPS_THEN_EXITS).await;
+
+        let id = ended_with_a_record_behind(&mut f, WorkspaceId::random(), true, 2).await;
+
+        let folder = f.sessions_dir().join(id.to_string());
+        until("the folder to go", || !folder.exists()).await;
+        assert_eq!(f.turn_of(id).map(|t| t.turn), Some(1));
+    }
+
+    #[tokio::test]
+    async fn prompt_and_question_records_that_failed_are_stored_after_a_restart_and_a_send_sees_the_count()
+     {
+        let mut f = Fx::new(&format!(
+            "{IDLE}- wait_prompt\n- stop: {{last_assistant_message: \"one\"}}\n\
+             - wait_prompt\n- notify: \"Which?\"\n- wait_input\n\
+             - stop: {{last_assistant_message: \"two\"}}\n- wait_input\n"
+        ))
+        .await;
+        let id = f
+            .start_factory(WorkspaceId::random(), ProjectId::random())
+            .await;
+        f.until_turn(id, 1, 1).await;
+        f.fail_turn_writes(1000);
+        f.sessions
+            .send_factory(id, Fx::message("go on"), None)
+            .await
+            .unwrap();
+        until("the question", || {
+            f.state(id) == Some(SessionState::WaitingForYou)
+        })
+        .await;
+        assert_eq!(f.turn_of(id).unwrap().prompts, 1);
+
+        f.restart().await;
+
+        until("the record to catch up", || {
+            f.turn_of(id).is_some_and(|t| t.prompts == 2 && t.question)
+        })
+        .await;
+        f.type_keys(id, b"\n".to_vec()).await;
+        f.until_turn(id, 2, 2).await;
+        assert!(f.turn_of(id).unwrap().question);
+        let sent = f
+            .sessions
+            .send_factory(id, Fx::message("late"), Some(1))
+            .await;
+        assert_eq!(sent, Err(SendRefused::CountRose { now: 2 }));
     }
 
     #[tokio::test]
