@@ -320,7 +320,7 @@ fn on_projects<'a>(
                 .map_or(&[][..], Vec::as_slice);
             OnProject {
                 project,
-                believed: believed_of(statuses, &fleet.online, acting),
+                believed: believed(statuses, &fleet.online, acting),
             }
         })
         .collect()
@@ -660,25 +660,6 @@ fn factory_items(
 /// `owner/name#N` of `run`'s issue.
 fn issue(run: &RunId) -> String {
     format!("{}#{}", run.repo(), run.issue())
-}
-
-/// The status [`believed`] picks among `statuses`, with the machine that wrote it.
-fn believed_of<'a>(
-    statuses: &'a [(MachineId, FactoryStatus)],
-    online: &BTreeSet<MachineId>,
-    acting: MachineId,
-) -> Option<(MachineId, &'a FactoryStatus)> {
-    let status = believed(statuses, online, acting)?;
-    // `believed` gives no writer, so it is picked again by the same rule here; #196 has
-    // `believed` return it and removes this.
-    // A holding status is believed from the lowest machine id among equals; any other is the
-    // acting coordinator's.
-    statuses
-        .iter()
-        .filter(|(writer, held)| online.contains(writer) && *held == status)
-        .filter(|(writer, _)| status.holds || *writer == acting)
-        .min_by_key(|(writer, _)| *writer)
-        .map(|(writer, held)| (*writer, held))
 }
 
 /// The "factory idle" item of `project`, when it stands: for a reason the believed status

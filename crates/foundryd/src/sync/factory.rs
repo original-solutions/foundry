@@ -19,23 +19,28 @@
 //! count ([`FACTORY_BATCH_BYTES`]): a link refuses a WebSocket message far smaller than
 //! [`BATCH`] such events.
 //!
+//! Each factory status taken from a peer is also told to the [`Freshness`] that
+//! [`Peers::hear_statuses`](super::Peers::hear_statuses) was given, which is what counts it as
+//! word from the lease's holder.
+//!
 //! [`Peers::factory_changes`](super::Peers::factory_changes) tells readers that a factory
 //! record was stored: at once for one taken from a peer, and within a [`TICK`] for one this
 //! machine wrote, which [`watch_own`] looks for while [`Peers::run`](super::Peers::run) runs.
 //!
+//! [`Freshness`]: crate::factory::status::Freshness
 //! [`Store::apply_factory`]: crate::store::Store::apply_factory
 //! [`Store::own_next_factory_version`]: crate::store::Store::own_next_factory_version
 
 use std::collections::BTreeMap;
 
-use foundry_proto::factory::FactoryRecord;
+use foundry_proto::factory::{FactoryBody, FactoryRecord};
 use foundry_proto::ids::MachineId;
 use foundry_proto::messages::{FACTORY_SINCE, PeerMessage};
 use tokio::sync::mpsc::Sender;
 use tokio::time::Instant;
 
 use super::link::send_message;
-use super::{BATCH, Inner, TICK, WARN_EVERY, on_store};
+use super::{BATCH, Inner, TICK, WARN_EVERY, lock, on_store};
 use crate::store::{Applied, Store, StoreError};
 
 /// The most bytes of records, as JSON, one factory message carries, past its first record. A
@@ -210,6 +215,11 @@ fn fitting(records: &[FactoryRecord], budget: usize) -> usize {
 /// store then holds a prefix of the peer's factory records, and the next link's hello asks
 /// again for the rest.
 ///
+/// Each factory status stored is told to the [`Freshness`](crate::factory::status::Freshness)
+/// [`Peers::hear_statuses`](super::Peers::hear_statuses) was given, once the store's lock is
+/// released: a status refused or stale tells it nothing, so only a status that is stored counts
+/// as word from its holder.
+///
 /// Each record is stored under the store's lock taken for it alone, since each commits on its
 /// own, so a catch-up never holds the store from its other users for a whole message. Each is
 /// told where it is stored, so a take that a closing link drops part way still tells of every
@@ -238,7 +248,15 @@ pub(super) async fn take(
         })
         .await;
         match applied {
-            Ok(Applied::Stored | Applied::Stale) => {}
+            Ok(Applied::Stored) => {
+                if let FactoryBody::Status(status) = &record.body {
+                    let freshness = lock(&inner.freshness).clone();
+                    if let Some(freshness) = freshness {
+                        freshness.received(status);
+                    }
+                }
+            }
+            Ok(Applied::Stale) => {}
             Ok(Applied::NotOwner) if record.owner == peer => tracing::warn!(
                 "sync: {peer} sent a {} factory record whose key another machine holds; refused",
                 record.body.kind()

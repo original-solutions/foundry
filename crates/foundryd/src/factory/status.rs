@@ -23,7 +23,8 @@ use crate::clock::Clock;
 /// How many finished runs a status keeps.
 pub const FINISHED_KEPT: usize = 20;
 
-/// The status a machine believes for one project, from every writer's status of it.
+/// The status a machine believes for one project, from every writer's status of it, with the
+/// writer that wrote it.
 ///
 /// Only the statuses of writers in `online` are read. Among those, the one that holds the lease
 /// at the highest generation is believed; when none holds it, the `acting` coordinator's. So a
@@ -37,11 +38,11 @@ pub const FINISHED_KEPT: usize = 20;
 /// Two holders at one generation should not exist, since one machine writes in a generation.
 /// Should they, the higher pass is believed, then the lower machine id, so every machine
 /// believes the same one whatever order it read them in.
-pub fn believed(
-    statuses: &[(MachineId, FactoryStatus)],
+pub fn believed<'a>(
+    statuses: &'a [(MachineId, FactoryStatus)],
     online: &BTreeSet<MachineId>,
     acting: MachineId,
-) -> Option<FactoryStatus> {
+) -> Option<(MachineId, &'a FactoryStatus)> {
     let heard = || {
         statuses
             .iter()
@@ -51,7 +52,7 @@ pub fn believed(
         .filter(|(_, status)| status.holds)
         .max_by_key(|(writer, status)| (status.generation, status.pass, Reverse(*writer)))
         .or_else(|| heard().find(|(writer, _)| *writer == acting))
-        .map(|(_, status)| status.clone())
+        .map(|(writer, status)| (*writer, status))
 }
 
 /// The highest lease generation `status` says its writer has seen: its own, or the one the

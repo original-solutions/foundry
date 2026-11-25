@@ -1900,7 +1900,10 @@ fn a_factory_on_with_no_status_raises_factory_idle_once_the_clock_is_10_minutes_
     fixture.seed(|settings| with_factory_on(settings, &project));
     fixture.start();
 
-    assert_eq!(items_of(&fixture, "factory_idle"), Vec::<serde_json::Value>::new());
+    assert_eq!(
+        items_of(&fixture, "factory_idle"),
+        Vec::<serde_json::Value>::new()
+    );
     fixture.clock_ahead(10 * MINUTE);
 
     let idle = items_of(&fixture, "factory_idle");
@@ -1988,7 +1991,9 @@ fn a_session_this_machine_marks_as_a_factory_session_raises_no_waiting_item_and_
         "- hook: {event: UserPromptSubmit, prompt: \"tidy up\"}\n- hook: {event: Notification, message: \"Claude needs your permission to use Bash\"}\n- sleep_ms: 600000\n",
     );
     let project = fixture.project();
-    fixture.seed(|settings| with_factory_on(settings, &project));
+    // The factory is off while the workspace is made: a project whose factory is on makes one
+    // only with a token for its login.
+    fixture.seed(|settings| settings.projects.push(project.clone()));
     fixture.start();
     let workspace = fixture.workspace(&project);
     let sessions = [
@@ -2010,15 +2015,28 @@ fn a_session_this_machine_marks_as_a_factory_session_raises_no_waiting_item_and_
             .then_some(())
     });
     assert_eq!(fixture.stop(), Some(0));
+    fixture.seed(|settings| {
+        settings.project_factory.insert(
+            project.id,
+            ProjectFactory {
+                on: true,
+                login: "octocat".into(),
+                paused: false,
+            },
+        );
+    });
 
     // The mark a factory start writes, as `sessions/factory.rs` does: private, in the
     // session's own folder.
     let folder = fixture.home.path().join("sessions").join(&sessions[0]);
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&folder)
-        .unwrap();
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&folder)
+            .unwrap();
+    }
     {
         use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt as _;

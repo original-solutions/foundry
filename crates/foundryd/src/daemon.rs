@@ -26,7 +26,9 @@ use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
 use crate::api::{self, Api, BindError};
-use crate::attention::Attention;
+use crate::attention::{Attention, Marks};
+use crate::clock::{self, Clock};
+use crate::factory::status::Freshness;
 use crate::gateway;
 use crate::join::{self, JoinError, KeyedDialer, Keys};
 use crate::lister::Lister;
@@ -41,6 +43,7 @@ use crate::tailscale::{AskError, Entry, host_names, own_entry, tailscale_ips};
 use crate::terminals::{TerminalError, Terminals};
 use crate::update;
 use crate::workspaces::{WorkspaceError, Workspaces};
+use foundry_proto::ids::ProjectId;
 
 /// How long the runtime waits for tasks that will not stop once the daemon has decided to
 /// exit, so one stuck task cannot hang the exit.
@@ -281,6 +284,11 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
         peers.clone(),
     ));
     peers.coordinate(coordinator.clone());
+    // One freshness for the daemon's life: the peers tell it of each status they store, and the
+    // attention list reads it.
+    let clock = daemon_clock();
+    let freshness = Arc::new(Freshness::new(clock.clone()));
+    peers.hear_statuses(freshness.clone());
     let mut api = Api::new(
         store.clone(),
         peers.clone(),
@@ -303,6 +311,12 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
         coordinator.clone(),
         gateway_reader.clone(),
         &api.placements,
+        clock,
+        freshness,
+        Arc::new(FactoryMarks {
+            sessions: sessions.clone(),
+            worktrees: home.join("worktrees"),
+        }),
     );
     let placing = api.clone();
     let attention_routes = attention
@@ -402,7 +416,9 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
     stopped
 }
 
-/// This machine's attention list: the fleet's items, the gateway's and the placement queue's.
+/// This machine's attention list: the fleet's items, the gateway's and the placement queue's,
+/// and the factory's, read on `clock` and `freshness` with `marks` for what is factory work.
+#[allow(clippy::too_many_arguments)]
 fn attention(
     me: foundry_proto::ids::MachineId,
     store: &Arc<Mutex<Store>>,
@@ -410,12 +426,117 @@ fn attention(
     coordinator: Arc<crate::coordinator::Coordinator>,
     gateway: Arc<gateway::Reader>,
     placements: &Arc<placement::Queue>,
+    clock: Arc<dyn Clock>,
+    freshness: Arc<Freshness>,
+    marks: Arc<dyn Marks>,
 ) -> Arc<Attention> {
     Arc::new(
         Attention::new(me, store.clone(), peers.clone(), coordinator)
+            .with_factory(clock, freshness, marks)
             .with_source(gateway)
             .with_source(placements.clone()),
     )
+}
+
+/// What this machine marks as factory work: a session by [`Sessions::is_factory`], a workspace
+/// by the marker file [`Workspaces`] writes beside the folder of one made for the factory.
+struct FactoryMarks {
+    sessions: Arc<Sessions>,
+    /// `<data dir>/worktrees`.
+    worktrees: PathBuf,
+}
+
+impl Marks for FactoryMarks {
+    fn factory_session(&self, session: foundry_proto::ids::SessionId) -> Option<ProjectId> {
+        self.sessions.is_factory(session)
+    }
+
+    fn factory_workspace(&self, workspace: foundry_proto::ids::WorkspaceId) -> Option<ProjectId> {
+        marked_project(&self.worktrees, workspace)
+    }
+}
+
+/// The project of the factory marker of `workspace`, `<project id>/<workspace id>.factory`
+/// under `worktrees`: only its `project` is read. `None` for a workspace with no marker, and
+/// for a marker that cannot be read or parsed (logged without its contents).
+fn marked_project(
+    worktrees: &Path,
+    workspace: foundry_proto::ids::WorkspaceId,
+) -> Option<ProjectId> {
+    /// The one field of a workspace's marker this reads.
+    #[derive(serde::Deserialize)]
+    struct Marker {
+        project: ProjectId,
+    }
+    let file = format!("{workspace}.factory");
+    for folder in std::fs::read_dir(worktrees).ok()?.flatten() {
+        let path = folder.path().join(&file);
+        let text = match std::fs::read(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                tracing::warn!(marker = %path.display(), %error, "a factory marker cannot be read");
+                return None;
+            }
+        };
+        return match serde_json::from_slice::<Marker>(&text) {
+            Ok(marker) => Some(marker.project),
+            Err(error) => {
+                tracing::warn!(marker = %path.display(), %error, "a factory marker cannot be parsed");
+                None
+            }
+        };
+    }
+    None
+}
+
+/// The clock the daemon measures the factory's ages on: the system's, and in a debug build
+/// moved ahead by the seconds the file `FOUNDRY_CLOCK_AHEAD` names holds. That is how tests
+/// move the running daemon's clock; a release build ignores the variable.
+fn daemon_clock() -> Arc<dyn Clock> {
+    clock_for(
+        std::env::var_os("FOUNDRY_CLOCK_AHEAD"),
+        CLOCK_AHEAD_ALLOWED,
+        clock::system(),
+    )
+}
+
+/// Whether this build takes `FOUNDRY_CLOCK_AHEAD`: only a debug build.
+const CLOCK_AHEAD_ALLOWED: bool = cfg!(debug_assertions);
+
+/// `base`, or, when `allowed` and `set` names a file, `base` plus the seconds that file holds.
+fn clock_for(set: Option<OsString>, allowed: bool, base: Arc<dyn Clock>) -> Arc<dyn Clock> {
+    match set {
+        Some(file) if allowed => Arc::new(AheadClock {
+            base,
+            file: PathBuf::from(file),
+            added: Mutex::new(Duration::ZERO),
+        }),
+        _ => base,
+    }
+}
+
+/// A clock `base` plus a whole number of seconds read from `file` on each reading. A missing
+/// or unreadable file, or text that is no number, counts as the last good value (0 at first),
+/// and the added amount never goes down, so readings never go back.
+struct AheadClock {
+    base: Arc<dyn Clock>,
+    file: PathBuf,
+    added: Mutex<Duration>,
+}
+
+impl Clock for AheadClock {
+    fn now(&self) -> Duration {
+        let read = std::fs::read_to_string(&self.file)
+            .ok()
+            .and_then(|text| text.trim().parse::<u64>().ok())
+            .map(Duration::from_secs);
+        let mut added = self.added.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(read) = read {
+            *added = (*added).max(read);
+        }
+        self.base.now().saturating_add(*added)
+    }
 }
 
 /// Runs `service` and names it once it ends, so the daemon can say which one stopped.
@@ -1688,7 +1809,11 @@ mod tests {
             settings.projects.push(foundry_proto::settings::Project {
                 id: project,
                 name: "demo".into(),
-                repo: remotes.path().join("remote.git").to_string_lossy().into_owned(),
+                repo: remotes
+                    .path()
+                    .join("remote.git")
+                    .to_string_lossy()
+                    .into_owned(),
             });
             assert!(store.apply_settings(settings).unwrap());
         }
