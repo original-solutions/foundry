@@ -290,6 +290,53 @@ pub enum Wait {
     Setup,
 }
 
+/// What a pass of [`forward`] did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForwardStep {
+    /// How many comments went into the session this pass.
+    pub comments: usize,
+    /// Whether the edited issue body went into the session this pass.
+    pub body_edit: bool,
+    /// Why the run was left alone, with nothing read, sent or written.
+    pub skipped: Option<Skip>,
+    /// What there was to send could not be typed now: the session is working or its newest turn
+    /// is not read yet. Nothing was written for it.
+    pub held_back: bool,
+}
+
+/// Why [`forward`] left a run alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Skip {
+    /// The run is of another repo.
+    OtherRepo,
+    Finished,
+    /// A relaunch, an interruption or a rate limit is decided: another step carries it out.
+    Relaunching,
+    /// The run has no events, or no session recorded.
+    NoSession,
+    /// The run is not building, or a stop, a stuck path, questions or a gate pass are recorded.
+    NotBuilding,
+    /// A gate failure was being sent into the session.
+    GateSendPending,
+    /// A person closed the issue: the run is ended.
+    Abandoned,
+    /// The run's own merged pull request closed the issue.
+    PrMerged,
+    /// The fleet shows no such session.
+    SessionGone,
+}
+
+/// The line of a forwarded instructor comment: the text is in the file it names.
+pub const FORWARD_COMMENT_LINE: &str = "The factory forwards an instructor's comment. Read {body}";
+/// The line of a forwarded edit of the issue body: the text is in the file it names.
+pub const FORWARD_BODY_LINE: &str = "The factory forwards an edit of the issue body. Read {body}";
+
+/// The instructors' new comments and body edit sent to a building run's session.
+pub fn forward(ctx: &RunContext<'_>, run: &RunId) -> Result<ForwardStep, RunError> {
+    let _ = (ctx, run);
+    todo!("feedback::forward")
+}
+
 fn canonical(text: &str) -> Option<u64> {
     let plain = !text.is_empty()
         && text.bytes().all(|b| b.is_ascii_digit())
@@ -1723,6 +1770,36 @@ mod tests {
 
     /// [`pr_open_after`] for a run whose launch recorded the base `base`.
     fn pr_open_on(rig: &Rig, run: &RunId, early: &[&str], base: &str) {
+        started(rig, run, base);
+        for step in early {
+            rig.step(run, step);
+        }
+        rig.write(
+            run,
+            Event::PrOpened {
+                pr: 12,
+                url: URL12.into(),
+            },
+        );
+        passed_gate(rig, run);
+        rig.moved(run, State::Building, State::PrOpen);
+        rig.sim.set_labels(&["factory:pr-open"]);
+        rig.sim.set_assignees(&[LOGIN]);
+        rig.sim.set_pull(
+            12,
+            SimPull {
+                state: "OPEN",
+                draft: false,
+                head: BRANCH.into(),
+                base: base.into(),
+                cross: false,
+            },
+        );
+    }
+
+    /// A run as `start` leaves it: approved, claimed, its session launched on the build
+    /// workspace, `building`.
+    fn started(rig: &Rig, run: &RunId, base: &str) {
         rig.step(run, &format!("approved {LABELED_AT}"));
         rig.write(
             run,
@@ -1751,30 +1828,6 @@ mod tests {
             },
         );
         rig.moved(run, State::Triage, State::Building);
-        for step in early {
-            rig.step(run, step);
-        }
-        rig.write(
-            run,
-            Event::PrOpened {
-                pr: 12,
-                url: URL12.into(),
-            },
-        );
-        passed_gate(rig, run);
-        rig.moved(run, State::Building, State::PrOpen);
-        rig.sim.set_labels(&["factory:pr-open"]);
-        rig.sim.set_assignees(&[LOGIN]);
-        rig.sim.set_pull(
-            12,
-            SimPull {
-                state: "OPEN",
-                draft: false,
-                head: BRANCH.into(),
-                base: base.into(),
-                cross: false,
-            },
-        );
     }
 
     /// The gate passed on the pull request's head, and the build session and workspace were
@@ -3844,6 +3897,1416 @@ mod tests {
                     .count(),
                 1
             );
+        }
+    }
+
+    // ===== forward =====
+
+    const EDITED: &str = "2026-10-04T10:15:00Z";
+
+    fn the_session() -> SessionId {
+        SessionId(uuid::Uuid::from_u128(0x5e5))
+    }
+
+    /// The build session idle in the build workspace, its newest turn (turn 1, one prompt) read.
+    fn building_view(state: SessionState, turn: Option<(u64, u64)>) -> FleetView {
+        let mut builder = fleet()
+            .workspace(workspace_record(old(), "fac/8-1", None))
+            .session(Record {
+                owner: m1(),
+                version: 1,
+                deleted: false,
+                body: foundry_proto::record::Session {
+                    id: the_session(),
+                    workspace: old(),
+                    terminal: TerminalId(uuid::Uuid::from_u128(0x5e6)),
+                    model: "opus".into(),
+                    state,
+                },
+            });
+        if let Some((turn, prompts)) = turn {
+            builder = builder.turn(foundry_proto::factory::SessionTurn {
+                session: the_session(),
+                workspace: old(),
+                project: project_id(),
+                turn,
+                prompts,
+                question: false,
+            });
+        }
+        builder.build()
+    }
+
+    /// A building run whose session is idle, its newest turn read; GitHub hands back a comment
+    /// and an edit of the body, so a missing guard would send them.
+    fn forwarding() -> World {
+        let mut rig = Rig::new();
+        rig.view = building_view(SessionState::Idle, Some((1, 1)));
+        let hub = Hub::new(rig.sim.clone());
+        let run = run_id(1);
+        started(&rig, &run, "main");
+        rig.step(&run, "turn-read 1");
+        rig.sim.set_labels(&["factory:building"]);
+        rig.sim.set_assignees(&[LOGIN]);
+        World { rig, hub, run }
+    }
+
+    fn instructor_activity(world: &World) {
+        script(
+            world,
+            vec![bare_comment("101", "tom", "one")],
+            Some(edit(EDITED, "tom", "new")),
+        );
+    }
+
+    fn bare_comment(id: &str, author: &str, body: &str) -> Comment {
+        Comment {
+            id: id.into(),
+            author: author.into(),
+            created_at: "2026-10-04T11:00:00Z".into(),
+            body: body.into(),
+        }
+    }
+
+    fn edit(at: &str, editor: &str, body: &str) -> crate::factory::github::BodyEdit {
+        crate::factory::github::BodyEdit {
+            edited_at: at.into(),
+            editor: editor.into(),
+            body: body.into(),
+        }
+    }
+
+    /// What GitHub says the instructors did from now on.
+    fn script(
+        world: &World,
+        comments: Vec<Comment>,
+        body_edit: Option<crate::factory::github::BodyEdit>,
+    ) {
+        world.hub.set_activity(Activity {
+            comments,
+            body_edit,
+            dropped: vec![],
+        });
+    }
+
+    fn script_dropped(world: &World, dropped: &[(&str, crate::factory::github::DropReason)]) {
+        world.hub.set_activity(Activity {
+            comments: vec![],
+            body_edit: None,
+            dropped: dropped
+                .iter()
+                .map(|(id, reason)| crate::factory::github::Dropped {
+                    id: (*id).into(),
+                    reason: *reason,
+                })
+                .collect(),
+        });
+    }
+
+    /// Every send the worker is asked for is taken, as a session that is idle takes it.
+    fn allow(world: &World, sends: usize) {
+        for _ in 0..sends {
+            world.rig.worker.on_send(Ok(1));
+        }
+    }
+
+    fn forward_in(world: &World) -> ForwardStep {
+        forward(&world.ctx(), &world.run).unwrap()
+    }
+
+    fn outcome(comments: usize, body_edit: bool) -> ForwardStep {
+        ForwardStep {
+            comments,
+            body_edit,
+            skipped: None,
+            held_back: false,
+        }
+    }
+
+    fn skipped(why: Skip) -> ForwardStep {
+        ForwardStep {
+            comments: 0,
+            body_edit: false,
+            skipped: Some(why),
+            held_back: false,
+        }
+    }
+
+    fn comment_send(author: &str, body: &str) -> Call {
+        Call::Send {
+            session: the_session(),
+            message: messages::Message::new(
+                FORWARD_COMMENT_LINE.into(),
+                messages::comment_text(REPO, ISSUE, author, body),
+            ),
+            only_if_prompts: Some(1),
+        }
+    }
+
+    fn body_send(editor: &str, body: &str) -> Call {
+        Call::Send {
+            session: the_session(),
+            message: messages::Message::new(
+                FORWARD_BODY_LINE.into(),
+                messages::body_edit_text(REPO, ISSUE, editor, body),
+            ),
+            only_if_prompts: Some(1),
+        }
+    }
+
+    fn comment_forwarded_line(id: &str) -> Event {
+        Event::CommentForwarded {
+            comment_id: id.into(),
+        }
+    }
+
+    /// The ledger's events from the first `n`, as (event, step text or data) pairs.
+    fn after(world: &World, n: usize) -> Vec<(String, Value)> {
+        world
+            .events()
+            .into_iter()
+            .skip(n)
+            .map(|event| {
+                let shown = event
+                    .data
+                    .get("step")
+                    .cloned()
+                    .unwrap_or_else(|| event.data.clone());
+                (event.event, shown)
+            })
+            .collect()
+    }
+
+    fn forwarded_ids(world: &World) -> Vec<String> {
+        world
+            .events()
+            .into_iter()
+            .filter(|event| event.event == "comment_forwarded")
+            .map(|event| event.data["comment_id"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    /// The run's first line cut to whole seconds, as the activity is asked for.
+    fn since_first(world: &World) -> String {
+        let first = world.events()[0].ms;
+        let text = crate::factory::ledger::format_ts(first);
+        format!("{}Z", &text[..19])
+    }
+
+    fn activity_reads(world: &World) -> Vec<String> {
+        world.hub.reads()
+    }
+
+    mod forward_comments {
+        use super::*;
+
+        #[test]
+        fn sends_each_new_comment_once_in_order_and_records_it() {
+            let world = forwarding();
+            script(
+                &world,
+                vec![
+                    bare_comment("101", "tom", "Use serde here."),
+                    bare_comment("102", "tom", "And add a test."),
+                ],
+                None,
+            );
+            allow(&world, 2);
+            let before = world.count();
+            // One message at a time per session: the session's count of prompts says whether the
+            // first was typed, and it is read afresh each pass.
+            assert_eq!(forward_in(&world), outcome(1, false));
+            assert_eq!(forward_in(&world), outcome(1, false));
+            assert_eq!(
+                world.sends(),
+                vec![
+                    comment_send("tom", "Use serde here."),
+                    comment_send("tom", "And add a test."),
+                ]
+            );
+            assert_eq!(forwarded_ids(&world), ["101", "102"]);
+            assert_eq!(
+                activity_reads(&world),
+                vec![
+                    format!("activity {ISSUE} {} tom", since_first(&world)),
+                    format!("activity {ISSUE} {} tom", since_first(&world)),
+                ]
+            );
+            // Nothing is written on GitHub: the forward has no write to make.
+            assert!(world.writes().is_empty());
+            assert!(world.count() > before);
+        }
+
+        #[test]
+        fn writes_each_line_under_the_forward_step_with_the_reason_that_names_it() {
+            let world = forwarding();
+            script(
+                &world,
+                vec![bare_comment("101", "tom", "one")],
+                Some(edit(EDITED, "tom", "new")),
+            );
+            allow(&world, 2);
+            let before = world.count();
+            forward_in(&world);
+            forward_in(&world);
+            let causes: Vec<String> = world
+                .events()
+                .into_iter()
+                .skip(before)
+                .map(|event| {
+                    let cause = event.cause.unwrap();
+                    format!(
+                        "{} {}",
+                        cause["step"].as_str().unwrap(),
+                        cause["reason"].as_str().unwrap()
+                    )
+                })
+                .collect();
+            assert_eq!(
+                causes,
+                [
+                    "forward send-intent",
+                    "forward send-typed",
+                    "forward comment-forwarded",
+                    "forward send-intent",
+                    "forward send-typed",
+                    "forward body-edit-forwarded",
+                ]
+            );
+        }
+
+        #[test]
+        fn a_second_forward_sends_nothing_and_writes_nothing() {
+            let world = forwarding();
+            script(
+                &world,
+                vec![
+                    bare_comment("101", "tom", "one"),
+                    bare_comment("102", "tom", "two"),
+                ],
+                None,
+            );
+            allow(&world, 2);
+            forward_in(&world);
+            forward_in(&world);
+            let count = world.count();
+            let sends = world.sends().len();
+            assert_eq!(forward_in(&world), outcome(0, false));
+            assert_eq!(world.sends().len(), sends);
+            assert_eq!(world.count(), count);
+            assert_eq!(activity_reads(&world).len(), 3);
+        }
+
+        #[test]
+        fn a_comment_the_ledger_already_has_is_not_sent_again_but_a_new_one_after_it_is() {
+            let world = forwarding();
+            world.rig.write(&world.run, comment_forwarded_line("101"));
+            script(
+                &world,
+                vec![
+                    bare_comment("101", "tom", "one"),
+                    bare_comment("102", "tom", "two"),
+                ],
+                None,
+            );
+            allow(&world, 1);
+            assert_eq!(forward_in(&world), outcome(1, false));
+            assert_eq!(world.sends(), vec![comment_send("tom", "two")]);
+            assert_eq!(forwarded_ids(&world), ["101", "102"]);
+        }
+
+        #[test]
+        fn a_comment_forwarded_out_of_order_is_still_skipped_by_its_id() {
+            // The ledger knows 102 but not 101: 101 is sent, 102 is not.
+            let world = forwarding();
+            world.rig.write(&world.run, comment_forwarded_line("102"));
+            script(
+                &world,
+                vec![
+                    bare_comment("101", "tom", "one"),
+                    bare_comment("102", "tom", "two"),
+                ],
+                None,
+            );
+            allow(&world, 2);
+            assert_eq!(forward_in(&world), outcome(1, false));
+            assert_eq!(forward_in(&world), outcome(0, false));
+            assert_eq!(world.sends(), vec![comment_send("tom", "one")]);
+        }
+
+        #[test]
+        fn sends_a_comment_id_that_github_lists_twice_only_once() {
+            let world = forwarding();
+            script(
+                &world,
+                vec![
+                    bare_comment("101", "tom", "one"),
+                    bare_comment("101", "tom", "one"),
+                ],
+                None,
+            );
+            allow(&world, 2);
+            assert_eq!(forward_in(&world), outcome(1, false));
+            assert_eq!(forward_in(&world), outcome(0, false));
+            assert_eq!(world.sends(), vec![comment_send("tom", "one")]);
+        }
+
+        #[test]
+        fn since_is_the_first_ledger_line_cut_to_whole_seconds_and_the_instructors_are_the_configs()
+        {
+            let mut world = forwarding();
+            world.rig.config.instructors = vec!["tom".into(), "Amy".into()];
+            assert_eq!(forward_in(&world), outcome(0, false));
+            // The run's first line is at 10:13:16.123: cut, not rounded.
+            assert_eq!(
+                activity_reads(&world),
+                vec![format!("activity {ISSUE} 2026-10-04T10:13:16Z tom,Amy")]
+            );
+            assert!(world.sends().is_empty());
+        }
+
+        #[test]
+        fn since_stays_the_runs_start_after_comments_were_forwarded() {
+            let world = forwarding();
+            script(&world, vec![bare_comment("101", "tom", "one")], None);
+            allow(&world, 1);
+            forward_in(&world);
+            forward_in(&world);
+            let since = since_first(&world);
+            assert_eq!(
+                activity_reads(&world),
+                vec![
+                    format!("activity {ISSUE} {since} tom"),
+                    format!("activity {ISSUE} {since} tom"),
+                ]
+            );
+        }
+
+        #[test]
+        fn uses_the_configs_spelling_of_the_repo_in_the_message() {
+            let mut world = forwarding();
+            world.rig.project.repo = "RawPHP/SoftFac".into();
+            script(&world, vec![bare_comment("101", "tom", "one")], None);
+            allow(&world, 1);
+            assert_eq!(forward_in(&world), outcome(1, false));
+            let Call::Send { message, .. } = world.sends().remove(0) else {
+                unreachable!()
+            };
+            let body = message.body.unwrap();
+            assert!(
+                body.contains("Forwarded instructor comment on RawPHP/SoftFac#8 from"),
+                "{body}"
+            );
+        }
+    }
+
+    mod forward_a_body_edit {
+        use super::*;
+
+        #[test]
+        fn is_sent_once_with_its_exact_message_and_step() {
+            let world = forwarding();
+            script(
+                &world,
+                vec![],
+                Some(edit(EDITED, "tom", "## Outcome\nthe new body")),
+            );
+            allow(&world, 1);
+            let before = world.count();
+            assert_eq!(forward_in(&world), outcome(0, true));
+            assert_eq!(
+                world.sends(),
+                vec![body_send("tom", "## Outcome\nthe new body")]
+            );
+            let written = after(&world, before);
+            assert_eq!(
+                written.last().unwrap(),
+                &(
+                    "step_changed".to_owned(),
+                    json!(format!("body-edit-forwarded {EDITED}"))
+                )
+            );
+        }
+
+        #[test]
+        fn the_same_edit_again_sends_nothing_and_a_later_edit_is_sent_again() {
+            let world = forwarding();
+            script(&world, vec![], Some(edit(EDITED, "tom", "v1")));
+            allow(&world, 2);
+            forward_in(&world);
+            let count = world.count();
+            assert_eq!(forward_in(&world), outcome(0, false));
+            assert_eq!(world.sends().len(), 1);
+            assert_eq!(world.count(), count);
+            let later = "2026-10-04T10:20:00Z";
+            script(&world, vec![], Some(edit(later, "tom", "v2")));
+            assert_eq!(forward_in(&world), outcome(0, true));
+            assert_eq!(
+                world.sends(),
+                vec![body_send("tom", "v1"), body_send("tom", "v2")]
+            );
+            assert_eq!(
+                world.steps_of("body-edit-forwarded"),
+                [
+                    format!("body-edit-forwarded {EDITED}"),
+                    format!("body-edit-forwarded {later}")
+                ]
+            );
+        }
+
+        #[test]
+        fn goes_in_after_the_comments_of_its_call() {
+            let world = forwarding();
+            script(
+                &world,
+                vec![
+                    bare_comment("101", "tom", "one"),
+                    bare_comment("102", "tom", "two"),
+                ],
+                Some(edit(EDITED, "tom", "new")),
+            );
+            allow(&world, 3);
+            assert_eq!(forward_in(&world), outcome(1, false));
+            assert_eq!(forward_in(&world), outcome(1, false));
+            assert_eq!(forward_in(&world), outcome(0, true));
+            assert_eq!(
+                world.sends(),
+                vec![
+                    comment_send("tom", "one"),
+                    comment_send("tom", "two"),
+                    body_send("tom", "new"),
+                ]
+            );
+        }
+
+        #[test]
+        fn with_a_time_that_is_not_githubs_form_is_refused_before_anything_is_sent() {
+            for bad in [
+                "",
+                "x",
+                "2026-10-04 10:15:00",
+                "2026-10-04T10:15:00.123Z",
+                "2026-10-04T10:15:00+00:00",
+                "2026-10-04T10:15:00Z\n",
+                "2026-10-04T10:15:00Z:evil",
+                "2026-10-04T10:15:0\u{0}Z",
+            ] {
+                let world = forwarding();
+                script(
+                    &world,
+                    vec![bare_comment("101", "tom", "one")],
+                    Some(edit(bad, "tom", "new")),
+                );
+                allow(&world, 2);
+                let count = world.count();
+                let error = forward(&world.ctx(), &world.run).unwrap_err();
+                assert!(
+                    error.to_string().contains("YYYY-MM-DDTHH:MM:SSZ"),
+                    "{bad:?}: {error}"
+                );
+                assert!(world.sends().is_empty(), "{bad:?}");
+                assert_eq!(world.count(), count, "{bad:?}");
+            }
+        }
+
+        #[test]
+        fn is_not_sent_twice_for_a_step_that_only_looks_like_a_forwarded_edit() {
+            let world = forwarding();
+            world
+                .rig
+                .step(&world.run, "body-edit-forwarded 2026-10-04T10:15:00");
+            world
+                .rig
+                .step(&world.run, "body-edit-forwarded 2026-10-04T10:15:00Z ");
+            world
+                .rig
+                .step(&world.run, &format!("body-edit-forwarded{EDITED}"));
+            script(&world, vec![], Some(edit(EDITED, "tom", "new")));
+            allow(&world, 1);
+            assert_eq!(forward_in(&world), outcome(0, true));
+        }
+    }
+
+    /// A building run whose ledger holds `extra` after the build started, with an instructor's
+    /// comment and edit that a missing guard would send.
+    fn guarded(extra: impl FnOnce(&World)) -> World {
+        let world = forwarding();
+        extra(&world);
+        instructor_activity(&world);
+        allow(&world, 4);
+        world
+    }
+
+    /// `forward` skips the run for `why`: no read of the activity, no send and no write.
+    fn assert_skips(world: &World, why: Skip) {
+        let count = world.count();
+        assert_eq!(forward_in(world), skipped(why), "{why:?}");
+        assert!(activity_reads(world).is_empty(), "{why:?}");
+        assert!(world.sends().is_empty(), "{why:?}");
+        assert!(world.rig.worker.calls().is_empty(), "{why:?}");
+        assert_eq!(world.count(), count, "{why:?}");
+    }
+
+    mod forward_guards_and_failures {
+        use super::*;
+
+        #[test]
+        fn skips_a_finished_run() {
+            let world = guarded(|world| {
+                world
+                    .rig
+                    .ledger
+                    .finish(
+                        &world.run,
+                        crate::factory::ledger::events::Outcome::Stuck,
+                        None,
+                        None,
+                        &Cause::new(CauseStep::Gate, "seed"),
+                        None,
+                    )
+                    .unwrap();
+            });
+            assert_skips(&world, Skip::Finished);
+        }
+
+        #[test]
+        fn skips_a_run_with_no_session() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            rig.write(
+                &run,
+                Event::Claimed {
+                    machine: m1().to_string(),
+                    github_user: LOGIN.into(),
+                },
+            );
+            rig.moved(&run, State::Ready, State::Triage);
+            rig.moved(&run, State::Triage, State::Building);
+            let hub = Hub::new(rig.sim.clone());
+            let world = World { rig, hub, run };
+            instructor_activity(&world);
+            assert_skips(&world, Skip::NoSession);
+        }
+
+        #[test]
+        fn skips_every_state_but_building() {
+            // Triage, with a session.
+            let rig = Rig::new();
+            let run = run_id(1);
+            started(&rig, &run, "main");
+            let hub = Hub::new(rig.sim.clone());
+            let world = World { rig, hub, run };
+            world
+                .rig
+                .moved(&world.run, State::Building, State::NeedsInfo);
+            instructor_activity(&world);
+            assert_skips(&world, Skip::NotBuilding);
+            // Stuck.
+            let world = guarded(|world| {
+                world.rig.write(
+                    &world.run,
+                    Event::Stuck {
+                        reason: "x".into(),
+                        branch: None,
+                        commits_ahead: None,
+                    },
+                );
+                world.rig.moved(&world.run, State::Building, State::Stuck);
+            });
+            assert_skips(&world, Skip::NotBuilding);
+            // Waiting for review.
+            let world = guarded(|world| {
+                world.rig.write(
+                    &world.run,
+                    Event::PrOpened {
+                        pr: 12,
+                        url: URL12.into(),
+                    },
+                );
+                passed_gate(&world.rig, &world.run);
+                world.rig.moved(&world.run, State::Building, State::PrOpen);
+            });
+            assert_skips(&world, Skip::NotBuilding);
+        }
+
+        #[test]
+        fn skips_a_run_whose_gate_pass_is_recorded() {
+            let world = guarded(|world| {
+                world.rig.write(
+                    &world.run,
+                    Event::PrOpened {
+                        pr: 12,
+                        url: URL12.into(),
+                    },
+                );
+                passed_gate(&world.rig, &world.run);
+            });
+            assert_skips(&world, Skip::NotBuilding);
+        }
+
+        #[test]
+        fn skips_a_run_an_operator_asked_to_stop() {
+            let world = guarded(|world| {
+                world.rig.write(
+                    &world.run,
+                    Event::StopRequested {
+                        by: "operator".into(),
+                    },
+                );
+            });
+            assert_skips(&world, Skip::NotBuilding);
+        }
+
+        #[test]
+        fn skips_a_transition_to_stuck_or_needs_info_that_was_cut_short() {
+            // The decision is in the ledger but `state_changed`, the commit marker, is not.
+            let world = guarded(|world| {
+                world.rig.write(
+                    &world.run,
+                    Event::Stuck {
+                        reason: "x".into(),
+                        branch: None,
+                        commits_ahead: None,
+                    },
+                );
+            });
+            assert_skips(&world, Skip::NotBuilding);
+            let world = guarded(|world| {
+                world.rig.write(
+                    &world.run,
+                    Event::QuestionsPosted {
+                        questions: "1. why".into(),
+                    },
+                );
+            });
+            assert_skips(&world, Skip::NotBuilding);
+        }
+
+        #[test]
+        fn skips_a_run_whose_gate_send_is_pending() {
+            // A gate attempt was being sent into the session and the ledger does not say it
+            // arrived: a message sent now could be mistaken for the proof that it did.
+            let world = guarded(|world| {
+                world.rig.step(&world.run, "gate-sending 1 1");
+            });
+            assert_skips(&world, Skip::GateSendPending);
+            // Once `gate_sent_back` is written the run is forwarded to again.
+            let world = guarded(|world| {
+                world.rig.step(&world.run, "gate-sending 1 1");
+                world.rig.write(
+                    &world.run,
+                    Event::GateSentBack {
+                        attempt: 1,
+                        run_ordinal: 1,
+                    },
+                );
+            });
+            assert_eq!(forward_in(&world), outcome(1, false));
+        }
+
+        #[test]
+        fn skips_a_run_with_a_relaunch_or_an_interruption_decided() {
+            // A round being set up, an owed resume: the steps that carry them out own the run.
+            let world = guarded(|world| {
+                world.rig.write(
+                    &world.run,
+                    Event::FeedbackRelaunching {
+                        n: 1,
+                        branch: BRANCH.into(),
+                        items: vec!["review:11".into()],
+                        message: "m".into(),
+                    },
+                );
+            });
+            assert_skips(&world, Skip::Relaunching);
+            let world = guarded(|world| {
+                world.rig.write(
+                    &world.run,
+                    Event::SessionInterrupted {
+                        resumes: 1,
+                        relaunch: false,
+                        run_ordinal: None,
+                        branch: None,
+                        t3_error: None,
+                        ended_in_pass: 0,
+                    },
+                );
+            });
+            assert_skips(&world, Skip::Relaunching);
+        }
+
+        #[test]
+        fn refuses_a_run_of_another_repo_before_touching_anything() {
+            let world = guarded(|_| {});
+            let other = RunId::new("rawphp/other", 8, 1).unwrap();
+            let step = forward(&world.ctx(), &other).unwrap();
+            assert_eq!(step, skipped(Skip::OtherRepo));
+            assert_eq!(world.hub.counted(), 0);
+            assert!(world.rig.worker.calls().is_empty());
+        }
+
+        #[test]
+        fn compares_the_repo_case_insensitively() {
+            let mut world = guarded(|_| {});
+            world.rig.project.repo = "RawPHP/SoftFac".into();
+            assert_eq!(forward_in(&world), outcome(1, false));
+        }
+
+        #[test]
+        fn on_a_run_with_no_events_is_skipped_as_having_no_session() {
+            // The runner's `on a run with no file is a ledger error`: a run's events are a read
+            // of the store, and a run with none is one Foundry never ran.
+            let rig = Rig::new();
+            let hub = Hub::new(rig.sim.clone());
+            let world = World {
+                rig,
+                hub,
+                run: run_id(1),
+            };
+            assert_eq!(forward_in(&world), skipped(Skip::NoSession));
+            assert_eq!(world.hub.counted(), 0);
+            assert!(world.rig.worker.calls().is_empty());
+        }
+
+        #[test]
+        fn a_failing_activity_read_is_an_error_with_nothing_sent_or_written() {
+            let world = guarded(|_| {});
+            let count = world.count();
+            world.hub.fail_at(world.hub.counted(), false);
+            assert!(forward(&world.ctx(), &world.run).is_err());
+            assert!(world.sends().is_empty());
+            assert_eq!(world.count(), count);
+            // The next call, with GitHub back, does the work.
+            assert_eq!(forward_in(&world), outcome(1, false));
+        }
+
+        #[test]
+        fn a_failed_send_transport_stops_the_call_and_the_rest_is_sent_in_order_under_the_same_count()
+         {
+            let world = forwarding();
+            script(
+                &world,
+                vec![
+                    bare_comment("101", "tom", "one"),
+                    bare_comment("102", "tom", "two"),
+                    bare_comment("103", "tom", "three"),
+                ],
+                None,
+            );
+            // The first send times out: it may have been typed, so nothing is recorded as sent
+            // and no other message goes before it is known.
+            world
+                .rig
+                .worker
+                .on_send(Err(crate::sessions::factory::SendRefused::Failed {
+                    reason: "timed out".into(),
+                    prompts: None,
+                }));
+            assert!(forward(&world.ctx(), &world.run).is_err());
+            assert!(forwarded_ids(&world).is_empty());
+            assert_eq!(
+                world.steps_of("send-intent"),
+                ["send-intent forward-comment 101 1"]
+            );
+            allow(&world, 3);
+            // The same message is sent again under the same count, then the rest in order.
+            assert_eq!(forward_in(&world), outcome(1, false));
+            assert_eq!(forward_in(&world), outcome(1, false));
+            assert_eq!(forward_in(&world), outcome(1, false));
+            assert_eq!(forwarded_ids(&world), ["101", "102", "103"]);
+            let ids: Vec<_> = world
+                .sends()
+                .into_iter()
+                .map(|call| match call {
+                    Call::Send { message, .. } => message.body.unwrap(),
+                    _ => unreachable!(),
+                })
+                .collect();
+            assert!(ids[0].contains("one") && ids[1].contains("one"), "{ids:?}");
+        }
+
+        #[test]
+        fn a_send_t3_refuses_is_dropped_with_a_notice_and_the_call_goes_on() {
+            let world = forwarding();
+            script(&world, vec![bare_comment("101", "tom", "one")], None);
+            world
+                .rig
+                .worker
+                .on_send(Err(crate::sessions::factory::SendRefused::BodyWithoutPath));
+            assert_eq!(forward_in(&world), outcome(0, false));
+            assert_eq!(world.sends(), vec![comment_send("tom", "one")]);
+            let notice = world.rig.sim.comments().join("\n");
+            assert!(notice.contains("Foundry refused it"), "{notice}");
+            assert!(world.steps().contains(&"comment-dropped 101".to_string()));
+            let cause = world.events().pop().unwrap().cause.unwrap();
+            assert_eq!(cause["reason"], "comment-dropped");
+            // Never sent again, said once.
+            let count = world.count();
+            let notices = world.rig.sim.comments().len();
+            assert_eq!(forward_in(&world), outcome(0, false));
+            assert_eq!(world.sends().len(), 1);
+            assert_eq!(world.rig.sim.comments().len(), notices);
+            assert_eq!(world.count(), count);
+        }
+
+        #[test]
+        fn a_failed_edit_send_leaves_the_comments_recorded_and_the_edit_for_the_next_call() {
+            let world = forwarding();
+            instructor_activity(&world);
+            allow(&world, 1);
+            assert_eq!(forward_in(&world), outcome(1, false));
+            world
+                .rig
+                .worker
+                .on_send(Err(crate::sessions::factory::SendRefused::Failed {
+                    reason: "timed out".into(),
+                    prompts: None,
+                }));
+            assert!(forward(&world.ctx(), &world.run).is_err());
+            assert_eq!(forwarded_ids(&world), ["101"]);
+            assert!(world.steps_of("body-edit-forwarded").is_empty());
+            allow(&world, 1);
+            assert_eq!(forward_in(&world), outcome(0, true));
+            assert_eq!(
+                world.sends(),
+                vec![
+                    comment_send("tom", "one"),
+                    body_send("tom", "new"),
+                    body_send("tom", "new"),
+                ]
+            );
+            assert_eq!(world.steps_of("body-edit-forwarded").len(), 1);
+        }
+
+        #[test]
+        fn a_thread_that_no_longer_exists_skips_the_call_and_sends_nothing() {
+            let mut world = forwarding();
+            world.rig.view = fleet().build();
+            instructor_activity(&world);
+            assert_eq!(forward_in(&world), skipped(Skip::SessionGone));
+            assert!(world.sends().is_empty());
+            assert!(world.rig.sim.comments().is_empty());
+        }
+
+        #[test]
+        fn a_session_at_work_holds_what_is_to_be_sent_back_and_writes_nothing() {
+            let mut world = forwarding();
+            world.rig.view = building_view(SessionState::Working, Some((1, 1)));
+            instructor_activity(&world);
+            let count = world.count();
+            let step = forward_in(&world);
+            assert_eq!(
+                step,
+                ForwardStep {
+                    held_back: true,
+                    ..outcome(0, false)
+                }
+            );
+            assert!(world.sends().is_empty());
+            assert_eq!(world.count(), count);
+        }
+
+        #[test]
+        fn a_newest_turn_that_building_has_not_read_is_read_first() {
+            // The session's turn 2 ended and was not read: a message typed now would start a
+            // turn that hides it, so the forward waits for `building` to read it.
+            let mut world = forwarding();
+            world.rig.view = building_view(SessionState::Idle, Some((2, 2)));
+            instructor_activity(&world);
+            let step = forward_in(&world);
+            assert!(step.held_back);
+            assert!(world.sends().is_empty());
+            world.rig.step(&world.run, "turn-read 2");
+            allow(&world, 1);
+            assert_eq!(forward_in(&world), outcome(1, false));
+        }
+
+        #[test]
+        fn a_session_the_fleet_shows_no_turn_for_is_waited_for() {
+            let mut world = forwarding();
+            world.rig.view = building_view(SessionState::Idle, None);
+            instructor_activity(&world);
+            assert!(forward_in(&world).held_back);
+            assert!(world.sends().is_empty());
+        }
+    }
+
+    mod forward_a_closed_issue {
+        use super::*;
+
+        #[test]
+        fn closed_by_a_person_abandons_the_run_and_sends_nothing() {
+            let world = guarded(|_| {});
+            world.rig.sim.set_closed(true);
+            assert_eq!(forward_in(&world), skipped(Skip::Abandoned));
+            assert!(activity_reads(&world).is_empty());
+            assert!(world.sends().is_empty());
+            // The session's workspace is ended, and the run finished by the issue's closing.
+            assert_eq!(
+                world.rig.worker.calls(),
+                vec![Call::EndSessions { workspace: old() }]
+            );
+            let end = world.events().pop().unwrap();
+            assert_eq!(end.event, "finished");
+            assert_eq!(end.cause.unwrap()["reason"], "issue-closed");
+        }
+
+        #[test]
+        fn closed_by_the_runs_own_merged_pull_request_sends_nothing_and_writes_nothing() {
+            let world = guarded(|world| {
+                world.rig.write(
+                    &world.run,
+                    Event::PrOpened {
+                        pr: 12,
+                        url: URL12.into(),
+                    },
+                );
+            });
+            world.rig.sim.set_closed(true);
+            world.rig.sim.set_pull(
+                12,
+                SimPull {
+                    state: "MERGED",
+                    draft: false,
+                    head: BRANCH.into(),
+                    base: "main".into(),
+                    cross: false,
+                },
+            );
+            let count = world.count();
+            assert_eq!(forward_in(&world), skipped(Skip::PrMerged));
+            assert!(activity_reads(&world).is_empty());
+            assert!(world.sends().is_empty());
+            assert!(world.rig.worker.calls().is_empty());
+            assert_eq!(world.count(), count);
+        }
+    }
+
+    mod forward_dropped_comments {
+        use super::*;
+        use crate::factory::github::DropReason;
+
+        fn dropped_text(id: &str, reason: messages::CommentDropReason) -> String {
+            messages::dropped_comment(REPO, ISSUE, id, reason)
+        }
+
+        fn posted(world: &World) -> Vec<String> {
+            world.rig.sim.comments()
+        }
+
+        #[test]
+        fn a_dropped_comment_is_reported_once_with_the_factorys_fixed_words() {
+            let world = forwarding();
+            script_dropped(&world, &[("7", DropReason::EditedByOther)]);
+            assert_eq!(forward_in(&world), outcome(0, false));
+            // Nothing goes into the session.
+            assert!(world.sends().is_empty());
+            let said = posted(&world);
+            assert_eq!(said.len(), 1);
+            assert!(
+                said[0].starts_with(&dropped_text(
+                    "7",
+                    messages::CommentDropReason::EditedByOther
+                )),
+                "{}",
+                said[0]
+            );
+            assert!(world.steps().contains(&"comment-dropped 7".to_string()));
+            assert_eq!(
+                world.events().pop().unwrap().cause.unwrap()["reason"],
+                "comment-dropped"
+            );
+            // The next pass reads the same drop and says nothing more.
+            let count = world.count();
+            assert_eq!(forward_in(&world), outcome(0, false));
+            assert_eq!(posted(&world).len(), 1);
+            assert_eq!(world.count(), count);
+        }
+
+        #[test]
+        fn each_reason_has_its_own_fixed_words_and_each_drop_its_own_comment_in_order() {
+            let world = forwarding();
+            script_dropped(
+                &world,
+                &[
+                    ("8", DropReason::Unverifiable),
+                    ("7", DropReason::EditedByOther),
+                ],
+            );
+            forward_in(&world);
+            let said = posted(&world);
+            assert_eq!(said.len(), 2);
+            assert!(said[0].starts_with(&dropped_text(
+                "8",
+                messages::CommentDropReason::Unverifiable
+            )));
+            assert!(said[1].starts_with(&dropped_text(
+                "7",
+                messages::CommentDropReason::EditedByOther
+            )));
+            assert_eq!(
+                world.steps_of("comment-dropped"),
+                ["comment-dropped 8", "comment-dropped 7"]
+            );
+        }
+
+        #[test]
+        fn a_dropped_comment_comes_after_what_is_sent_and_changes_nothing_about_it() {
+            let world = forwarding();
+            world.hub.set_activity(Activity {
+                comments: vec![bare_comment("101", "tom", "Use serde here.")],
+                body_edit: Some(edit(EDITED, "tom", "new")),
+                dropped: vec![crate::factory::github::Dropped {
+                    id: "7".into(),
+                    reason: DropReason::EditedByOther,
+                }],
+            });
+            allow(&world, 2);
+            assert_eq!(forward_in(&world), outcome(1, false));
+            assert_eq!(forward_in(&world), outcome(0, true));
+            assert_eq!(
+                world.sends(),
+                vec![
+                    comment_send("tom", "Use serde here."),
+                    body_send("tom", "new")
+                ]
+            );
+            assert_eq!(posted(&world).len(), 1, "said once, with the first pass");
+            let steps = world.steps();
+            let sent = steps
+                .iter()
+                .position(|s| s == &format!("body-edit-forwarded {EDITED}"));
+            let dropped = steps.iter().position(|s| s == "comment-dropped 7").unwrap();
+            let first_send = steps
+                .iter()
+                .position(|s| s.starts_with("send-typed"))
+                .unwrap();
+            assert!(first_send < dropped);
+            assert!(sent.is_some());
+        }
+
+        #[test]
+        fn a_failed_send_leaves_the_drop_for_the_next_pass_and_it_is_still_said_once() {
+            let world = forwarding();
+            world.hub.set_activity(Activity {
+                comments: vec![bare_comment("101", "tom", "one")],
+                body_edit: None,
+                dropped: vec![crate::factory::github::Dropped {
+                    id: "7".into(),
+                    reason: DropReason::EditedByOther,
+                }],
+            });
+            world
+                .rig
+                .worker
+                .on_send(Err(crate::sessions::factory::SendRefused::Failed {
+                    reason: "timed out".into(),
+                    prompts: None,
+                }));
+            assert!(forward(&world.ctx(), &world.run).is_err());
+            assert!(posted(&world).is_empty());
+            allow(&world, 1);
+            assert_eq!(forward_in(&world), outcome(1, false));
+            assert_eq!(posted(&world).len(), 1);
+        }
+
+        #[test]
+        fn a_drop_the_ledger_already_records_is_not_said_again() {
+            let world = forwarding();
+            world.rig.step(&world.run, "comment-dropped 7");
+            script_dropped(
+                &world,
+                &[
+                    ("7", DropReason::EditedByOther),
+                    ("8", DropReason::EditedByOther),
+                ],
+            );
+            forward_in(&world);
+            let said = posted(&world);
+            assert_eq!(said.len(), 1);
+            assert!(said[0].starts_with(&dropped_text(
+                "8",
+                messages::CommentDropReason::EditedByOther
+            )));
+        }
+
+        #[test]
+        fn a_comment_the_issue_was_told_about_as_dropped_is_never_sent_later() {
+            // The instructor was asked to post it again; a later read that lists it is not
+            // followed.
+            let world = forwarding();
+            world.rig.step(&world.run, "comment-dropped 7");
+            script(&world, vec![bare_comment("7", "tom", "one")], None);
+            allow(&world, 1);
+            let count = world.count();
+            assert_eq!(forward_in(&world), outcome(0, false));
+            assert!(world.sends().is_empty());
+            assert_eq!(world.count(), count);
+        }
+
+        #[test]
+        fn a_comment_that_was_already_forwarded_and_was_edited_since_is_not_reported() {
+            // The session has the instructor's own words. A later edit by someone else changes
+            // nothing it holds.
+            let world = forwarding();
+            world.rig.write(&world.run, comment_forwarded_line("7"));
+            script_dropped(&world, &[("7", DropReason::EditedByOther)]);
+            forward_in(&world);
+            assert!(posted(&world).is_empty());
+        }
+
+        #[test]
+        fn an_issue_comment_sent_as_feedback_is_not_reported_as_dropped_when_someone_else_edits_it()
+        {
+            let world = forwarding();
+            world.rig.write(
+                &world.run,
+                Event::FeedbackRelaunching {
+                    n: 1,
+                    branch: BRANCH.into(),
+                    items: vec!["issue-comment:42".into()],
+                    message: "Feedback 1 of 1".into(),
+                },
+            );
+            // The round decided is the feedback step's; once it is over the run is building
+            // again and the same rule holds.
+            world.rig.write(
+                &world.run,
+                Event::SessionLaunched {
+                    thread_id: SESSION.into(),
+                    worktree: Some(OLD.into()),
+                    branch: Some(BRANCH.into()),
+                    model_instance: None,
+                    model: Some("opus".into()),
+                    model_options: None,
+                    resumed_from: None::<ResumedFrom>,
+                    base: Some("main".into()),
+                    title: None,
+                },
+            );
+            script_dropped(&world, &[("42", DropReason::EditedByOther)]);
+            let count = world.count();
+            forward_in(&world);
+            assert!(posted(&world).is_empty());
+            assert_eq!(world.count(), count);
+        }
+
+        #[test]
+        fn a_comment_that_is_both_dropped_and_listed_twice_is_said_once() {
+            let world = forwarding();
+            script_dropped(
+                &world,
+                &[
+                    ("7", DropReason::EditedByOther),
+                    ("7", DropReason::EditedByOther),
+                ],
+            );
+            forward_in(&world);
+            assert_eq!(posted(&world).len(), 1);
+            assert_eq!(world.steps_of("comment-dropped"), ["comment-dropped 7"]);
+        }
+
+        #[test]
+        fn a_run_forward_skips_reports_no_drops() {
+            for (why, setup) in [(Skip::NotBuilding, 0), (Skip::GateSendPending, 1)] {
+                let world = forwarding();
+                if setup == 0 {
+                    world.rig.write(
+                        &world.run,
+                        Event::QuestionsPosted {
+                            questions: "1. why".into(),
+                        },
+                    );
+                } else {
+                    world.rig.step(&world.run, "gate-sending 1 1");
+                }
+                script_dropped(&world, &[("7", DropReason::EditedByOther)]);
+                let count = world.count();
+                assert_eq!(forward_in(&world), skipped(why), "{why:?}");
+                assert!(activity_reads(&world).is_empty(), "{why:?}");
+                assert!(posted(&world).is_empty(), "{why:?}");
+                assert_eq!(world.count(), count, "{why:?}");
+            }
+        }
+
+        #[test]
+        fn a_thread_that_no_longer_exists_skips_the_call_and_reports_no_drops() {
+            let mut world = forwarding();
+            world.rig.view = fleet().build();
+            world.hub.set_activity(Activity {
+                comments: vec![bare_comment("101", "tom", "one")],
+                body_edit: None,
+                dropped: vec![crate::factory::github::Dropped {
+                    id: "7".into(),
+                    reason: DropReason::EditedByOther,
+                }],
+            });
+            assert_eq!(forward_in(&world), skipped(Skip::SessionGone));
+            assert!(posted(&world).is_empty());
+        }
+
+        #[test]
+        fn a_failing_comment_call_is_an_error_with_no_ledger_line_and_the_next_pass_says_it() {
+            let world = forwarding();
+            script_dropped(&world, &[("7", DropReason::Unverifiable)]);
+            let count = world.count();
+            // The activity read is call 0; the issue read before it in the sim counts too.
+            world.rig.sim.fail("issue comment", 1);
+            assert!(forward(&world.ctx(), &world.run).is_err());
+            assert_eq!(world.count(), count);
+            forward_in(&world);
+            let said = posted(&world);
+            assert_eq!(said.len(), 1);
+            assert!(said[0].starts_with(&dropped_text(
+                "7",
+                messages::CommentDropReason::Unverifiable
+            )));
+            assert_eq!(world.steps_of("comment-dropped"), ["comment-dropped 7"]);
+        }
+    }
+
+    mod forward_a_send_that_is_refused {
+        use super::*;
+        use crate::sessions::factory::SendRefused;
+
+        #[test]
+        fn a_refused_body_edit_is_dropped_with_a_notice_and_its_step_and_a_newer_edit_is_still_sent()
+         {
+            let world = forwarding();
+            script(&world, vec![], Some(edit(EDITED, "tom", "new")));
+            world
+                .rig
+                .worker
+                .on_send(Err(SendRefused::SecretsUnreadable));
+            assert_eq!(forward_in(&world), outcome(0, false));
+            assert_eq!(world.sends(), vec![body_send("tom", "new")]);
+            assert_eq!(world.rig.sim.comments().len(), 1);
+            assert!(
+                world.rig.sim.comments()[0].starts_with(messages::REFUSED_BODY_EDIT),
+                "{}",
+                world.rig.sim.comments()[0]
+            );
+            assert!(
+                world
+                    .steps()
+                    .contains(&format!("body-edit-dropped {EDITED}"))
+            );
+            assert_eq!(
+                world.events().pop().unwrap().cause.unwrap()["reason"],
+                "body-edit-dropped"
+            );
+            // Never sent again, said once.
+            let count = world.count();
+            assert_eq!(forward_in(&world), outcome(0, false));
+            assert_eq!(world.sends().len(), 1);
+            assert_eq!(world.count(), count);
+            // A newer edit is sent.
+            let later = "2026-10-04T10:20:00Z";
+            script(&world, vec![], Some(edit(later, "tom", "newer")));
+            allow(&world, 1);
+            assert_eq!(forward_in(&world), outcome(0, true));
+            assert_eq!(world.sends().last(), Some(&body_send("tom", "newer")));
+            assert!(
+                world
+                    .steps()
+                    .contains(&format!("body-edit-forwarded {later}"))
+            );
+        }
+
+        #[test]
+        fn a_refusal_between_two_sendable_comments_stops_nothing() {
+            let world = forwarding();
+            script(
+                &world,
+                vec![
+                    bare_comment("101", "tom", "one"),
+                    bare_comment("102", "tom", "two"),
+                    bare_comment("103", "tom", "three"),
+                ],
+                None,
+            );
+            allow(&world, 1);
+            world.rig.worker.on_send(Err(SendRefused::BodyWithoutPath));
+            allow(&world, 1);
+            assert_eq!(forward_in(&world), outcome(1, false));
+            // The second is refused and the third goes in the same pass.
+            assert_eq!(forward_in(&world), outcome(1, false));
+            assert_eq!(
+                world.sends(),
+                vec![
+                    comment_send("tom", "one"),
+                    comment_send("tom", "two"),
+                    comment_send("tom", "three"),
+                ]
+            );
+            assert_eq!(forwarded_ids(&world), ["101", "103"]);
+            assert_eq!(world.steps_of("comment-dropped"), ["comment-dropped 102"]);
+            let said = world.rig.sim.comments();
+            assert_eq!(said.len(), 1);
+            assert!(said[0].starts_with(&messages::dropped_comment(
+                REPO,
+                ISSUE,
+                "102",
+                messages::CommentDropReason::Refused
+            )));
+        }
+
+        #[test]
+        fn a_refused_comment_followed_by_a_sendable_edit_sends_the_edit() {
+            let world = forwarding();
+            instructor_activity(&world);
+            world.rig.worker.on_send(Err(SendRefused::BodyWithoutPath));
+            allow(&world, 1);
+            assert_eq!(forward_in(&world), outcome(0, true));
+            assert_eq!(
+                world.sends(),
+                vec![comment_send("tom", "one"), body_send("tom", "new")]
+            );
+            assert_eq!(world.rig.sim.comments().len(), 1);
+            assert_eq!(world.steps_of("comment-dropped"), ["comment-dropped 101"]);
+            assert!(
+                world
+                    .steps()
+                    .contains(&format!("body-edit-forwarded {EDITED}"))
+            );
+        }
+
+        #[test]
+        fn a_call_whose_every_send_was_refused_sends_nothing_and_tells_the_issue_of_each() {
+            // The runner's `a call whose every send was refused holds no gate and leaves no
+            // wait`: there is no wait marker here to leave, and the notices come in order.
+            let world = forwarding();
+            instructor_activity(&world);
+            world.rig.worker.on_send(Err(SendRefused::BodyWithoutPath));
+            world.rig.worker.on_send(Err(SendRefused::BodyWithoutPath));
+            assert_eq!(forward_in(&world), outcome(0, false));
+            assert_eq!(world.rig.sim.comments().len(), 2);
+            assert_eq!(
+                world.steps_of("comment-dropped").len() + world.steps_of("body-edit-dropped").len(),
+                2
+            );
+            // Nothing is left to send or to wait for.
+            let count = world.count();
+            assert_eq!(forward_in(&world), outcome(0, false));
+            assert_eq!(world.count(), count);
+        }
+
+        #[test]
+        fn a_session_that_is_not_idle_when_the_worker_looks_is_tried_again_next_pass() {
+            let world = forwarding();
+            script(&world, vec![bare_comment("101", "tom", "one")], None);
+            world.rig.worker.on_send(Err(SendRefused::NotIdle));
+            let step = forward_in(&world);
+            assert_eq!(
+                step,
+                ForwardStep {
+                    held_back: true,
+                    ..outcome(0, false)
+                }
+            );
+            assert!(forwarded_ids(&world).is_empty());
+            allow(&world, 1);
+            assert_eq!(forward_in(&world), outcome(1, false));
         }
     }
 }
