@@ -1165,8 +1165,8 @@ mod tests {
         assert_eq!(view.session_state(SessionId(id(22))), None);
 
         let plain = FleetView::builder()
-            .session(session_record(m, 5, false, 20, 10, SessionState::Idle))
             .session(session_record(m, 6, false, 23, 10, SessionState::Idle))
+            .session(session_record(m, 5, false, 20, 10, SessionState::Idle))
             .session(session_record(m, 9, true, 22, 10, SessionState::Idle))
             .build();
         assert_eq!(
@@ -1221,6 +1221,57 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn session_of_shows_an_offline_owners_session_as_unreachable() {
+        let m = machine(1);
+        let view = FleetView::builder()
+            .session(session_record(m, 5, false, 20, 10, SessionState::Working))
+            .turn(turn_of(20, 10))
+            .build();
+        let found = view.session_of(WorkspaceId(id(10))).unwrap();
+        assert_eq!(found.body.state, SessionState::Unreachable);
+        assert_eq!(
+            Some(found.body.state),
+            view.session_state(SessionId(id(20)))
+        );
+        let online = FleetView::builder()
+            .online(m)
+            .session(session_record(m, 5, false, 20, 10, SessionState::Working))
+            .build();
+        assert_eq!(
+            online.session_of(WorkspaceId(id(10))).unwrap().body.state,
+            SessionState::Working
+        );
+    }
+
+    #[test]
+    fn a_factory_session_without_a_turn_ranks_like_any_other() {
+        let (factory, person) = (machine(1), machine(2));
+        let view = FleetView::builder()
+            .online(factory)
+            .online(person)
+            .session(session_record(factory, 5, false, 20, 10, SessionState::Idle))
+            .session(session_record(person, 6, false, 23, 10, SessionState::Idle))
+            .build();
+        let found = view.session_of(WorkspaceId(id(10))).unwrap();
+        assert_eq!(found.body.id, SessionId(id(23)));
+        assert_eq!(found.version, 6);
+    }
+
+    #[test]
+    fn a_scripted_ok_send_does_not_bring_back_an_ended_session() {
+        let fake = FakeWorker::new();
+        let ws = WorkspaceId(id(5));
+        let sess = fake.start_session(ws, start(), msg("go")).unwrap();
+        fake.end_sessions(ws).unwrap();
+        fake.on_send(Ok(9));
+        assert_eq!(fake.send(sess, msg("a"), None), Ok(9));
+        assert_eq!(
+            fake.send(sess, msg("b"), None),
+            Err(SendRefused::NoSuchSession)
+        );
     }
 
     #[test]
