@@ -251,12 +251,11 @@ Dependencies are in brackets. Tasks with no dependency between them can build at
 - **Spec:** F3, Architecture.
 - **Files:** `crates/foundryd/src/factory/worker.rs`.
 - **Produces:** what `runs` asks of the fleet, so the port can be tested with no daemon:
-  - `enum Target { Machine(MachineId) }`: where a run's workspaces are made. It has one variant in P2. [P2c](P2c-vims-host.md) adds a host that is not a fleet machine, and a `Target` in the signatures now keeps that from changing every caller later.
-  - `trait Worker` with `create(target: Target, CreateWorkspace) -> WorkspaceId`, `start_session(workspace, FactoryStart, Message) -> SessionId`, `send(session, Message, only_if_prompts) -> Result<u64, SendRefused>`, `turn(session, n) -> TurnText`, `tail(terminal) -> String`, `end_sessions(workspace)`, `archive(workspace)` (forced).
+  - `trait Worker` with `create(machine, CreateWorkspace) -> WorkspaceId`, `start_session(workspace, FactoryStart, Message) -> SessionId`, `send(session, Message, only_if_prompts) -> Result<u64, SendRefused>`, `turn(session, n) -> TurnText`, `tail(terminal) -> String`, `end_sessions(workspace)`, `archive(workspace)` (forced).
   - `trait Guard { fn check(&self) -> Result<u64, LeaseLost>; }`, which answers with the lease generation. Code that changes anything on GitHub or asks anything of a worker calls it first. Task 21 gives the real one; `AlwaysHeld(generation)` and `Lost` are here for tests.
-  - `trait FleetView`: what one pass reads about the fleet, with `StoreView`, a snapshot read from the store, as its one implementation in P2 (P2c adds a second source). `workspace_named(project, name)`, `session_of(workspace)`, `session_state(session)`, `terminal(terminal) -> (TerminalState, exit_code)`, `session_turn(session)`, `online(machine)`, `unreachable_for(machine) -> Duration`, `samples()`, `held(machine)`.
-  - `FakeWorker` and a `StoreView` builder for tests, scripted like the runner's fake sessions.
-- **Tests:** the fake records each call in order. `StoreView::workspace_named` ignores an archived workspace and finds a factory workspace whose record arrived after its create was sent.
+  - `FleetView`: a snapshot read from the store for one pass. `workspace_named(project, name)`, `session_of(workspace)`, `session_state(session)`, `terminal(terminal) -> (TerminalState, exit_code)`, `session_turn(session)`, `online(machine)`, `unreachable_for(machine) -> Duration`, `samples()`, `held(machine)`.
+  - `FakeWorker` and a `FleetView` builder for tests, scripted like the runner's fake sessions.
+- **Tests:** the fake records each call in order. `FleetView::workspace_named` ignores an archived workspace and finds a factory workspace whose record arrived after its create was sent.
 
 ### 20. Ledger [4, 9]
 
