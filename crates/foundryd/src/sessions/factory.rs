@@ -14,7 +14,8 @@
 //!
 //! A file `factory` in the session's own folder, `<data dir>/sessions/<session>/`, marks the
 //! session as a factory session and holds its project. [`Sessions::adopt`] reads the marks
-//! again, so a daemon that starts again still knows its factory sessions.
+//! again, so a daemon that starts again still knows its factory sessions. The sweeper removes
+//! the folder, mark included, once the session has ended and its workspace is archived.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
@@ -25,7 +26,6 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use foundry_proto::ids::{ProjectId, SessionId, WorkspaceId};
-use foundry_proto::record::AnyRecord;
 use foundry_proto::state::SessionState;
 
 use super::{Inner, SessionError, Sessions, blocking, claude, lock, turns};
@@ -865,57 +865,26 @@ impl Inner {
         }
     }
 
-    /// One look of the sweeper, which `cursor` keeps between looks and `warned` keeps what it
-    /// has warned of. It reads the workspace records this machine wrote since `cursor`, and
-    /// remembers the archived ones that hold a factory session. It writes the record of each
-    /// session whose record is behind, live or ended. Then it removes the folder of each ended
-    /// session whose workspace was archived. A step that fails is tried again at the next look,
-    /// and is logged only the first time in a row.
-    async fn sweep_once(&self, cursor: &mut u64, warned: &mut Warned) {
+    /// One look of the sweeper, which `warned` keeps what it has warned of between looks. It
+    /// asks for the record of each workspace that holds a factory session and is not yet known
+    /// to be archived, and remembers the archived ones. It writes the record of each session
+    /// whose record is behind, live or ended. Then it removes the folder of each ended session
+    /// whose workspace was archived. A step that fails is tried again at the next look, and is
+    /// logged only the first time in a row.
+    async fn sweep_once(&self, warned: &mut Warned) {
         self.load_behind(Some(&mut warned.load)).await;
-        let read = self.scan_workspaces(*cursor).await;
-        match read {
-            Ok((newest, archived)) => {
-                warned.read.reset();
-                *cursor = newest;
-                self.note_archived(archived);
-            }
-            Err(error) => {
+        let (archived, failed) = self.archived_by_workspace().await;
+        self.note_archived(archived);
+        match failed {
+            Some(error) => {
                 if warned.read.first_failure() {
-                    tracing::warn!(%error, "the workspace records were not read; looking at each workspace instead");
+                    tracing::warn!(%error, "a workspace record was not read; trying again");
                 }
-                // One row that cannot be read must not stop every sweep: ask for each
-                // workspace that holds a session, and leave the cursor where it is.
-                let archived = self.archived_by_workspace().await;
-                self.note_archived(archived);
             }
+            None => warned.read.reset(),
         }
         self.flush_behind(warned).await;
         self.sweep_ended(warned).await;
-    }
-
-    /// The workspace records this machine wrote since version `from`: the newest version read,
-    /// and the workspaces among them that are archived.
-    async fn scan_workspaces(&self, from: u64) -> Result<(u64, Vec<WorkspaceId>), SessionError> {
-        #[cfg(test)]
-        if super::take_one(&self.fail_sweep_reads) {
-            return Err(super::busy().into());
-        }
-        let me = self.me;
-        self.on_store(move |store| {
-            let mut newest = from;
-            let mut archived = Vec::new();
-            for record in store.since(me, from)? {
-                newest = newest.max(record.version());
-                if let AnyRecord::Workspace(r) = record
-                    && r.deleted
-                {
-                    archived.push(r.body.id);
-                }
-            }
-            Ok((newest, archived))
-        })
-        .await
     }
 
     /// Remembers the archived workspaces among `archived` that hold a factory session.
@@ -927,9 +896,15 @@ impl Inner {
             .extend(archived.into_iter().filter(|id| known.contains(id)));
     }
 
-    /// The workspaces that hold a factory session and are archived, asked for one by one. A
-    /// workspace whose record cannot be read is left out.
-    async fn archived_by_workspace(&self) -> Vec<WorkspaceId> {
+    /// The workspaces that hold a factory session and are archived, asked for one by one, so a
+    /// look reads only the records of the workspaces it follows. A record that cannot be read
+    /// leaves its workspace out, and does not stop the others: the first such error comes back
+    /// beside the ones found.
+    async fn archived_by_workspace(&self) -> (Vec<WorkspaceId>, Option<SessionError>) {
+        #[cfg(test)]
+        if super::take_one(&self.fail_sweep_reads) {
+            return (Vec::new(), Some(super::busy().into()));
+        }
         let asked: Vec<WorkspaceId> = {
             let state = lock(&self.factory);
             let all: HashSet<WorkspaceId> = state.workspaces.values().copied().collect();
@@ -937,19 +912,36 @@ impl Inner {
                 .filter(|id| !state.archived.contains(id))
                 .collect()
         };
-        self.on_store(move |store| {
-            Ok(asked
-                .into_iter()
-                .filter(|id| matches!(store.workspace(*id), Ok(Some(record)) if record.deleted))
-                .collect())
-        })
-        .await
-        .unwrap_or_default()
+        if asked.is_empty() {
+            return (Vec::new(), None);
+        }
+        let read = self
+            .on_store(move |store| {
+                let mut archived = Vec::new();
+                let mut failed = None;
+                for id in asked {
+                    match store.workspace(id) {
+                        Ok(Some(record)) if record.deleted => archived.push(id),
+                        Ok(_) => {}
+                        Err(error) => {
+                            failed.get_or_insert(error);
+                        }
+                    }
+                }
+                Ok((archived, failed))
+            })
+            .await;
+        match read {
+            Ok((archived, failed)) => (archived, failed.map(SessionError::from)),
+            Err(error) => (Vec::new(), Some(error)),
+        }
     }
 
     /// Removes the folder of each factory session that is not live, whose workspace was
     /// archived and whose record is not behind, and forgets the session's workspace and
-    /// counts. The mark stays.
+    /// counts. The mark stays in memory, so the session is a factory session until the daemon
+    /// starts again. Its file goes with the folder, so a daemon that starts later does not take
+    /// the ended session as one.
     async fn sweep_ended(&self, warned: &mut Warned) {
         let ended: Vec<(SessionId, WorkspaceId)> = {
             let state = lock(&self.factory);
@@ -1118,12 +1110,10 @@ impl Inner {
 /// The sweeper: looks every [`SWEEP_EVERY`], for as long as the sessions live. It also stores
 /// the turn records that hooks could not.
 async fn sweep(inner: Arc<Inner>) {
-    // From version 0, so a workspace archived before this daemon started is found too.
-    let mut cursor = 0;
     let mut warned = Warned::new();
     loop {
         tokio::time::sleep(SWEEP_EVERY).await;
-        inner.sweep_once(&mut cursor, &mut warned).await;
+        inner.sweep_once(&mut warned).await;
     }
 }
 
@@ -2238,6 +2228,40 @@ exec "$agent" "$@""#;
     }
 
     #[tokio::test]
+    async fn send_factory_to_a_session_that_waits_on_a_question_is_not_idle_and_types_nothing() {
+        let f = Fx::new(&format!(
+            "{IDLE}- wait_prompt\n- notify: \"May I?\"\n- wait_line: \"\"\n- wait_input\n"
+        ))
+        .await;
+        let id = f
+            .start_factory(WorkspaceId::random(), ProjectId::random())
+            .await;
+        until("the question", || {
+            f.state(id) == Some(SessionState::WaitingForYou)
+        })
+        .await;
+
+        let sent = f
+            .sessions
+            .send_factory(
+                id,
+                Message::new(format!("/continue {BODY_PATH}"), "body".into()),
+                None,
+            )
+            .await;
+
+        assert_eq!(sent, Err(SendRefused::NotIdle));
+        let folder = f.sessions_dir().join(id.to_string());
+        assert!(!folder.join("messages").exists());
+        // The first line the agent reads after the question is the marker, so the refused one
+        // was never typed into the prompt that asked.
+        f.type_keys(id, claude::typed_prompt("marker")).await;
+        let seen = f.shown(id, |t| !all_values(t, "LINE=").is_empty()).await;
+        assert_eq!(all_values(&seen, "LINE=")[0], "\"marker\"");
+        assert!(!seen.contains("/continue"), "{seen}");
+    }
+
+    #[tokio::test]
     async fn a_send_with_only_if_prompts_below_the_count_is_count_rose_and_types_nothing() {
         let f = Fx::new(&format!(
             "{IDLE}- wait_prompt\n- stop: {{last_assistant_message: \"a\"}}\n\
@@ -3029,7 +3053,7 @@ exec "$agent" "$@""#;
     }
 
     #[tokio::test]
-    async fn a_folder_goes_through_the_per_workspace_look_when_the_scan_of_records_fails() {
+    async fn a_folder_goes_once_a_look_at_the_workspaces_that_failed_is_tried_again() {
         let f = Fx::new(&format!(
             "{IDLE}- stop: {{last_assistant_message: \"bye\"}}\n- wait_input\n"
         ))
@@ -3061,7 +3085,7 @@ exec "$agent" "$@""#;
         f.sessions
             .inner
             .fail_sweep_reads
-            .store(1000, std::sync::atomic::Ordering::SeqCst);
+            .store(3, std::sync::atomic::Ordering::SeqCst);
         f.archive(kept, project, false);
         f.archive(live, project, true);
         f.archive(archived, project, true);

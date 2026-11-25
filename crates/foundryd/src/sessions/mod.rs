@@ -204,7 +204,7 @@ struct Inner {
     /// Tests: how many of the next reads of a `session_turn` record fail.
     #[cfg(test)]
     fail_turn_reads: std::sync::atomic::AtomicUsize,
-    /// Tests: how many of the next scans of workspace records by the sweeper fail.
+    /// Tests: how many of the sweeper's next looks at the workspace records fail.
     #[cfg(test)]
     fail_sweep_reads: std::sync::atomic::AtomicUsize,
     /// Tests: how many of the next reads of a terminal's exit fail.
