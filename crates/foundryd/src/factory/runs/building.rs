@@ -2833,6 +2833,66 @@ mod tests {
             assert_eq!(pass(&rig, &run), BuildStep::NeedsInfo);
             assert_eq!(questions_comments(&rig), 1);
         }
+
+        /// The move cut short after `questions_posted` (the label call fails), and the session
+        /// ends, works, waits or is gone before the next pass: the ledger alone finishes the
+        /// move, as a begun stuck path is finished, and the session is not read again.
+        #[test]
+        fn cut_short_after_they_are_posted_are_finished_from_the_ledger_whatever_the_session_shows()
+        {
+            let shapes: [(&str, fn(&mut Rig)); 6] = [
+                ("finished", |rig| show(rig, SessionState::Finished, 1, 1)),
+                ("failed", |rig| show(rig, SessionState::Failed, 1, 1)),
+                ("working", |rig| show(rig, SessionState::Working, 2, 2)),
+                ("waiting", |rig| {
+                    show(rig, SessionState::WaitingForYou, 2, 2);
+                }),
+                ("asking", |rig| {
+                    show_with(rig, SessionState::Idle, 2, 2, true);
+                }),
+                ("gone", |rig| {
+                    rig.view = FleetView::builder().online(rig.machine).build();
+                }),
+            ];
+            for (shape, session_ends) in shapes {
+                let (mut rig, run) = built();
+                let message = "Which one?\nFACTORY-STOP: needs-info";
+                end_turn(&mut rig, 1, message);
+                rig.sim.fail("--add-label", 1);
+                assert!(
+                    matches!(advance(&rig.ctx(), &run).unwrap_err(), RunError::Tracker(_)),
+                    "{shape}"
+                );
+                assert!(
+                    rig.names(&run).contains(&"questions_posted".to_string()),
+                    "{shape}"
+                );
+                assert_eq!(rig.sim.labels(), ["factory:building"], "{shape}");
+                session_ends(&mut rig);
+                let before = rig.events(&run).len();
+                assert_eq!(pass(&rig, &run), BuildStep::NeedsInfo, "{shape}");
+                assert_eq!(questions_comments(&rig), 1, "{shape}");
+                assert_eq!(rig.sim.labels(), ["factory:needs-info"], "{shape}");
+                assert!(rig.sim.assignees().is_empty(), "{shape}");
+                // Read once, by the pass that was cut short; then ended and archived.
+                assert_eq!(calls(&rig), needs_info_calls(), "{shape}");
+                assert_eq!(
+                    names_after(&rig, &run, before),
+                    ["state_changed", "finished"],
+                    "{shape}"
+                );
+                assert_eq!(
+                    last_event(&rig, &run).data["outcome"],
+                    "needs-info",
+                    "{shape}"
+                );
+                assert_eq!(
+                    cause_of_last(&rig, &run),
+                    ("advance".into(), "questions-asked".into()),
+                    "{shape}"
+                );
+            }
+        }
     }
 
     // ----- the runner's `advance: a run left in needs-info` -----
