@@ -7,14 +7,12 @@
 //! as [`runner_line`] writes it, with the runner's keys in the runner's order. The generation
 //! is not written: the runner's lines have none.
 //!
-//! The export changes nothing the store holds. It reads a copy: one read of the store copies it
-//! into a database in this process's memory, and only the copy is opened as a [`Store`]. Opening
-//! a store brings its schema up to this build's, so a store an older daemon still runs on is
-//! never moved on under it, and every run is read from the same moment. The copy holds all the
-//! store does, so it is never written to a file, and goes when the export ends, however it ends.
-//! The store is opened as the daemon opens it, so a write a killed daemon left unfinished is
-//! rolled back first, as the daemon's next start would roll it back; that is the only write the
-//! export can cause there.
+//! The export writes no record to the store. It opens the store as the daemon does, with
+//! [`Store::open`], so a write a killed daemon left unfinished is rolled back first, as the
+//! daemon's next start would roll it back, and a store an older build left is brought up to this
+//! build's schema. A daemon of that older build keeps working on it: the store's schema steps
+//! only add tables, non-unique indexes or nullable columns, so a previous build runs on a file a
+//! newer one migrated.
 //!
 //! Each run's file is written whole into a new file of this process beside its place, synced and
 //! then moved into it, so a `retro` reading the folder meanwhile never finds half a run. Files in
@@ -27,7 +25,6 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use foundry_proto::factory::{FactoryBody, RunId};
-use rusqlite::{Connection, OpenFlags};
 
 use super::read::{events, runner_line};
 use crate::store::{Store, StoreError};
@@ -43,15 +40,12 @@ const PAGE: usize = 512;
 pub enum ExportError {
     #[error("reading the store: {0}")]
     Store(#[from] StoreError),
-    #[error("copying the store: {0}")]
-    Copy(#[from] rusqlite::Error),
     #[error("writing {}: {source}", path.display())]
     Write { path: PathBuf, source: io::Error },
 }
 
 /// `foundryd factory export <dir>`: writes every run this machine's store holds into `dir`.
-/// The store is read from a copy in memory. A machine with no store yet holds no run:
-/// `dir/runs` is made empty, and no store is made.
+/// A machine with no store yet holds no run: `dir/runs` is made empty, and no store is made.
 pub fn command(dir: &Path) -> ExitCode {
     let Some(home) = crate::daemon::home() else {
         eprintln!("foundryd factory export: set FOUNDRY_HOME or HOME");
@@ -59,7 +53,9 @@ pub fn command(dir: &Path) -> ExitCode {
     };
     let path = home.join("store.sqlite");
     let written = if path.exists() {
-        export_copy(&path, dir)
+        Store::open(&path)
+            .map_err(ExportError::from)
+            .and_then(|store| export(&store, dir))
     } else {
         make_dir(&dir.join(RUNS)).map(|()| 0)
     };
@@ -94,29 +90,6 @@ pub fn export(store: &Store, dir: &Path) -> Result<usize, ExportError> {
         write_whole(&runs_dir, &format!("{run}.jsonl"), &text)?;
     }
     Ok(runs.len())
-}
-
-/// The database the store is copied into. SQLite's `memdb` file system shares a database whose
-/// name starts with `/` among the connections of one process while one of them is open, so the
-/// copy and the [`Store`] opened on it are one database, in memory, that no other process sees.
-const COPY: &str = "file:/foundryd-export?vfs=memdb";
-
-/// Exports the store at `live` into `dir` from a copy of it in memory.
-fn export_copy(live: &Path, dir: &Path) -> Result<usize, ExportError> {
-    // Opened first and held to the end: the copy lives while a connection holds it.
-    let held = Connection::open(COPY)?;
-    // Read and write, as the daemon opens the store, so the journal of a killed daemon's write is
-    // rolled back rather than refusing the read; never create, so a store gone meanwhile is not
-    // made; URI names, so the copy's name is read as one.
-    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
-        | OpenFlags::SQLITE_OPEN_NO_MUTEX
-        | OpenFlags::SQLITE_OPEN_URI;
-    Connection::open_with_flags(live, flags)?.execute("VACUUM INTO ?1", [COPY])?;
-    let store = Store::open(COPY)?;
-    let written = export(&store, dir);
-    drop(store);
-    drop(held);
-    written
 }
 
 /// Every run that `store` holds an event of, from any writer, once each, in order. Each
