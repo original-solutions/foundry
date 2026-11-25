@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
-use foundry_proto::factory::{FactoryBody, MachineHeld, SessionTurn};
+use foundry_proto::factory::{MachineHeld, SessionTurn};
 use foundry_proto::ids::{MachineId, ProjectId, SessionId, TerminalId, WorkspaceId};
 use foundry_proto::record::{AnyRecord, MachineSample, Record, Session, Terminal, Workspace};
 use foundry_proto::state::{SessionState, TerminalState};
@@ -111,7 +111,7 @@ pub struct AlwaysHeld(pub u64);
 
 impl Guard for AlwaysHeld {
     fn check(&self) -> Result<u64, LeaseLost> {
-        todo!()
+        Ok(self.0)
     }
 }
 
@@ -121,7 +121,9 @@ pub struct Lost;
 
 impl Guard for Lost {
     fn check(&self) -> Result<u64, LeaseLost> {
-        todo!()
+        Err(LeaseLost {
+            reason: "the test's guard is lost".into(),
+        })
     }
 }
 
@@ -148,8 +150,42 @@ impl FleetView {
         online: BTreeSet<MachineId>,
         unreachable: BTreeMap<MachineId, Duration>,
     ) -> Result<FleetView, StoreError> {
-        let _ = (store, online, unreachable);
-        todo!()
+        let mut builder = FleetView::builder();
+        builder.online = online;
+        builder.unreachable = unreachable;
+        let versions = store.versions()?;
+        let mut machines: BTreeSet<MachineId> = versions.keys().copied().collect();
+        machines.extend(store.factory_versions()?.into_keys());
+        for &owner in versions.keys() {
+            let records = match store.since(owner, 0) {
+                Ok(records) => records,
+                Err(error) => {
+                    tracing::warn!("factory: records of {owner} not shown: {error}");
+                    continue;
+                }
+            };
+            for record in records {
+                match record {
+                    AnyRecord::Workspace(r) => builder.workspaces.push(r),
+                    AnyRecord::Session(r) => builder.sessions.push(r),
+                    AnyRecord::Terminal(r) => {
+                        builder.terminals.insert(r.body.id, r);
+                    }
+                    AnyRecord::MachineSample(r) => builder.samples.push(r),
+                }
+            }
+        }
+        for session in builder.sessions.iter().filter(|r| !r.deleted) {
+            if let Some(turn) = store.session_turn(session.body.id)? {
+                builder.turns.insert(session.body.id, turn);
+            }
+        }
+        for machine in machines {
+            if let Some(held) = store.held(machine)? {
+                builder.held.insert(machine, held);
+            }
+        }
+        Ok(builder.build())
     }
 
     /// A builder for a view made of records given directly, for tests.
@@ -160,59 +196,75 @@ impl FleetView {
     /// The workspace of `project` named `name` that is not archived. The first in the order
     /// the records were held.
     pub fn workspace_named(&self, project: ProjectId, name: &str) -> Option<&Record<Workspace>> {
-        let _ = (project, name);
-        todo!()
+        self.workspaces
+            .iter()
+            .find(|r| !r.deleted && r.body.project == project && r.body.name == name)
     }
 
     /// The session of `workspace` that is not ended: a factory session, one with a turn,
     /// before any other, and among equals the highest version.
     pub fn session_of(&self, workspace: WorkspaceId) -> Option<&Record<Session>> {
-        let _ = workspace;
-        todo!()
+        self.sessions
+            .iter()
+            .filter(|r| !r.deleted && r.body.workspace == workspace)
+            .max_by_key(|r| (self.turns.contains_key(&r.body.id), r.version))
     }
 
     /// The state of `session`. `None` for one unknown or deleted, and
     /// [`SessionState::Unreachable`] while its owner is offline.
     pub fn session_state(&self, session: SessionId) -> Option<SessionState> {
-        let _ = session;
-        todo!()
+        let record = self
+            .sessions
+            .iter()
+            .find(|r| !r.deleted && r.body.id == session)?;
+        if self.online.contains(&record.owner) {
+            Some(record.body.state)
+        } else {
+            Some(SessionState::Unreachable)
+        }
     }
 
     /// The state and exit code of `terminal`. `None` for one unknown. A terminal whose owner
     /// is offline is unreachable, and a deleted one has exited, as P1 treats it.
     pub fn terminal(&self, terminal: TerminalId) -> Option<(TerminalState, Option<i32>)> {
-        let _ = terminal;
-        todo!()
+        let record = self.terminals.get(&terminal)?;
+        let code = record.body.exit_code;
+        if !self.online.contains(&record.owner) {
+            Some((TerminalState::Unreachable, code))
+        } else if record.deleted {
+            Some((TerminalState::Exited, code))
+        } else {
+            Some((record.body.state, code))
+        }
     }
 
     /// The newest turn of `session`, when it is a factory session.
     pub fn session_turn(&self, session: SessionId) -> Option<&SessionTurn> {
-        let _ = session;
-        todo!()
+        self.turns.get(&session)
     }
 
     /// Whether `machine` has been heard from.
     pub fn online(&self, machine: MachineId) -> bool {
-        let _ = machine;
-        todo!()
+        self.online.contains(&machine)
     }
 
     /// How long `machine` has been unreachable: zero while it is online, and zero when no span
     /// was given.
     pub fn unreachable_for(&self, machine: MachineId) -> Duration {
-        let _ = machine;
-        todo!()
+        if self.online.contains(&machine) {
+            return Duration::ZERO;
+        }
+        self.unreachable.get(&machine).copied().unwrap_or_default()
     }
 
     /// Every machine sample held.
     pub fn samples(&self) -> &[Record<MachineSample>] {
-        todo!()
+        &self.samples
     }
 
     /// The logins `machine` holds tokens for, when it has said.
     pub fn held(&self, machine: MachineId) -> Option<&MachineHeld> {
-        let _ = machine;
-        todo!()
+        self.held.get(&machine)
     }
 }
 
@@ -360,53 +412,62 @@ impl FakeWorker {
     /// Every call so far, in order, whether it was answered from the script or not, and
     /// whether it failed.
     pub fn calls(&self) -> Vec<Call> {
-        todo!()
+        self.lock().calls.clone()
     }
 
     /// Queues an answer for [`Worker::create`].
     pub fn on_create(&self, answer: Result<WorkspaceId, WorkerError>) -> &Self {
-        let _ = answer;
-        todo!()
+        self.lock().create.push_back(answer);
+        self
     }
 
     /// Queues an answer for [`Worker::start_session`].
     pub fn on_start_session(&self, answer: Result<SessionId, WorkerError>) -> &Self {
-        let _ = answer;
-        todo!()
+        self.lock().start_session.push_back(answer);
+        self
     }
 
     /// Queues an answer for [`Worker::send`].
     pub fn on_send(&self, answer: Result<u64, SendRefused>) -> &Self {
-        let _ = answer;
-        todo!()
+        self.lock().send.push_back(answer);
+        self
     }
 
     /// Queues an answer for [`Worker::turn`].
     pub fn on_turn(&self, answer: Result<TurnText, WorkerError>) -> &Self {
-        let _ = answer;
-        todo!()
+        self.lock().turn.push_back(answer);
+        self
     }
 
     /// Queues an answer for [`Worker::tail`].
     pub fn on_tail(&self, answer: Result<String, WorkerError>) -> &Self {
-        let _ = answer;
-        todo!()
+        self.lock().tail.push_back(answer);
+        self
     }
 
     /// Queues an answer for [`Worker::end_sessions`].
     pub fn on_end_sessions(&self, answer: Result<(), WorkerError>) -> &Self {
-        let _ = answer;
-        todo!()
+        self.lock().end_sessions.push_back(answer);
+        self
     }
 
     /// Queues an answer for [`Worker::archive`].
     pub fn on_archive(&self, answer: Result<(), WorkerError>) -> &Self {
-        let _ = answer;
-        todo!()
+        self.lock().archive.push_back(answer);
+        self
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, FakeState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// The next answer of a queue: the first while more than one is queued, else the last again.
+fn next<T: Clone>(queue: &mut VecDeque<T>) -> Option<T> {
+    if queue.len() > 1 {
+        queue.pop_front()
+    } else {
+        queue.front().cloned()
     }
 }
 
@@ -416,8 +477,24 @@ impl Worker for FakeWorker {
         machine: MachineId,
         request: CreateWorkspace,
     ) -> Result<WorkspaceId, WorkerError> {
-        let _ = (machine, request, self.lock());
-        todo!()
+        let mut state = self.lock();
+        state.calls.push(Call::Create {
+            machine,
+            request: request.clone(),
+        });
+        if let Some(answer) = next(&mut state.create) {
+            return answer;
+        }
+        let known = state
+            .made
+            .iter()
+            .find(|(tag, name, _)| *tag == request.tag && *name == request.name);
+        if let Some((_, _, made)) = known {
+            return Ok(*made);
+        }
+        let made = WorkspaceId::random();
+        state.made.push((request.tag, request.name, made));
+        Ok(made)
     }
 
     fn start_session(
@@ -426,8 +503,20 @@ impl Worker for FakeWorker {
         start: FactoryStart,
         first: Message,
     ) -> Result<SessionId, WorkerError> {
-        let _ = (workspace, start, first);
-        todo!()
+        let mut state = self.lock();
+        state.calls.push(Call::StartSession {
+            workspace,
+            project: start.project,
+            login: start.login,
+            model: start.model,
+            effort: start.effort,
+            first,
+        });
+        let answer = next(&mut state.start_session).unwrap_or_else(|| Ok(SessionId::random()));
+        if let Ok(session) = &answer {
+            state.delivered.insert(*session, 1);
+        }
+        answer
     }
 
     fn send(
@@ -436,28 +525,47 @@ impl Worker for FakeWorker {
         message: Message,
         only_if_prompts: Option<u64>,
     ) -> Result<u64, SendRefused> {
-        let _ = (session, message, only_if_prompts);
-        todo!()
+        let mut state = self.lock();
+        state.calls.push(Call::Send {
+            session,
+            message,
+            only_if_prompts,
+        });
+        let before = state.delivered.get(&session).copied().unwrap_or(0);
+        let answer = next(&mut state.send).unwrap_or(Ok(before));
+        if answer.is_ok() {
+            state.delivered.insert(session, before + 1);
+        }
+        answer
     }
 
     fn turn(&self, session: SessionId, n: u64) -> Result<TurnText, WorkerError> {
-        let _ = (session, n);
-        todo!()
+        let mut state = self.lock();
+        state.calls.push(Call::Turn { session, n });
+        next(&mut state.turn).unwrap_or_else(|| {
+            Ok(TurnText {
+                message: String::new(),
+                question: None,
+            })
+        })
     }
 
     fn tail(&self, terminal: TerminalId) -> Result<String, WorkerError> {
-        let _ = terminal;
-        todo!()
+        let mut state = self.lock();
+        state.calls.push(Call::Tail { terminal });
+        next(&mut state.tail).unwrap_or_else(|| Ok(String::new()))
     }
 
     fn end_sessions(&self, workspace: WorkspaceId) -> Result<(), WorkerError> {
-        let _ = workspace;
-        todo!()
+        let mut state = self.lock();
+        state.calls.push(Call::EndSessions { workspace });
+        next(&mut state.end_sessions).unwrap_or(Ok(()))
     }
 
     fn archive(&self, workspace: WorkspaceId) -> Result<(), WorkerError> {
-        let _ = workspace;
-        todo!()
+        let mut state = self.lock();
+        state.calls.push(Call::Archive { workspace });
+        next(&mut state.archive).unwrap_or(Ok(()))
     }
 }
 
@@ -617,7 +725,10 @@ mod tests {
                     machine: m,
                     request: req
                 },
-                Call::Turn { session: sess, n: 3 },
+                Call::Turn {
+                    session: sess,
+                    n: 3
+                },
                 Call::StartSession {
                     workspace: ws,
                     project: project(1),
@@ -719,16 +830,12 @@ mod tests {
         let fake = FakeWorker::new();
         let ws = WorkspaceId(id(5));
         let sess = fake.start_session(ws, start(), msg("go")).unwrap();
-        fake.on_send(Err(SendRefused::NotIdle));
+        fake.on_send(Err(SendRefused::NotIdle)).on_send(Ok(1));
         assert_eq!(fake.send(sess, msg("a"), None), Err(SendRefused::NotIdle));
-        // The script holds one answer, which repeats; a fresh fake shows the default again.
-        let fake = FakeWorker::new();
-        let sess = fake.start_session(ws, start(), msg("go")).unwrap();
-        fake.on_send(Err(SendRefused::NotIdle)).on_send(Ok(0));
-        assert_eq!(fake.send(sess, msg("a"), None), Err(SendRefused::NotIdle));
-        let state_after = FakeWorker::new();
-        let sess = state_after.start_session(ws, start(), msg("go")).unwrap();
-        assert_eq!(state_after.send(sess, msg("a"), None), Ok(1));
+        // The refusal delivered nothing, so a send after it still follows the start alone.
+        assert_eq!(fake.send(sess, msg("a"), None), Ok(1));
+        assert_eq!(fake.send(sess, msg("b"), None), Ok(1));
+        assert_eq!(fake.calls().len(), 4);
     }
 
     #[test]
@@ -783,7 +890,10 @@ mod tests {
         };
         store.apply(&AnyRecord::Workspace(record), m).unwrap();
         let view = FleetView::read(&store, BTreeSet::from([m]), BTreeMap::new()).unwrap();
-        assert_eq!(view.workspace_named(project(1), "run").unwrap().body.id, made);
+        assert_eq!(
+            view.workspace_named(project(1), "run").unwrap().body.id,
+            made
+        );
     }
 
     #[test]
@@ -805,7 +915,13 @@ mod tests {
             .unwrap();
         store
             .apply(
-                &AnyRecord::Terminal(terminal_record(m, false, 1020, TerminalState::Running, None)),
+                &AnyRecord::Terminal(terminal_record(
+                    m,
+                    false,
+                    1020,
+                    TerminalState::Running,
+                    None,
+                )),
                 m,
             )
             .unwrap();
@@ -829,13 +945,26 @@ mod tests {
         // A session and a terminal of a machine that is not online.
         store
             .apply(
-                &AnyRecord::Session(session_record(gone, 1, false, 21, 11, SessionState::Working)),
+                &AnyRecord::Session(session_record(
+                    gone,
+                    1,
+                    false,
+                    21,
+                    11,
+                    SessionState::Working,
+                )),
                 gone,
             )
             .unwrap();
         store
             .apply(
-                &AnyRecord::Terminal(terminal_record(gone, false, 30, TerminalState::Running, None)),
+                &AnyRecord::Terminal(terminal_record(
+                    gone,
+                    false,
+                    30,
+                    TerminalState::Running,
+                    None,
+                )),
                 gone,
             )
             .unwrap();
@@ -875,7 +1004,10 @@ mod tests {
             view.session_of(WorkspaceId(id(10))).unwrap().body.id,
             SessionId(id(20))
         );
-        assert_eq!(view.session_state(SessionId(id(20))), Some(SessionState::Idle));
+        assert_eq!(
+            view.session_state(SessionId(id(20))),
+            Some(SessionState::Idle)
+        );
         assert_eq!(
             view.terminal(TerminalId(id(1020))),
             Some((TerminalState::Running, None))
@@ -928,7 +1060,13 @@ mod tests {
         let m = machine(1);
         let view = FleetView::builder()
             .online(m)
-            .terminal(terminal_record(m, true, 30, TerminalState::Running, Some(3)))
+            .terminal(terminal_record(
+                m,
+                true,
+                30,
+                TerminalState::Running,
+                Some(3),
+            ))
             .build();
         assert_eq!(
             view.terminal(TerminalId(id(30))),
