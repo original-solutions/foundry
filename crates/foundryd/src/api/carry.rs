@@ -5,6 +5,11 @@
 //! - `POST /api/workspaces/{id}/sessions`, `/shells` and `/archive` for a workspace another
 //!   machine owns.
 //! - `POST /api/terminals/{id}/close` for a terminal another machine owns.
+//! - The factory's worker routes ([`super::factory`]): `POST /api/factory/workspaces` whose
+//!   `machine` names another machine, `/api/workspaces/{id}/factory/session` and `/end` for a
+//!   workspace another machine owns, `/api/sessions/{id}/factory/message` and `/turn` for a
+//!   session another machine owns, as its session record says, and `/api/terminals/{id}/tail`
+//!   for a terminal another machine owns. A tail comes back as the text it is.
 //!
 //! Each goes to its owner over [`Peers::call`](crate::sync::Peers::call), its body passed as
 //! bytes, and the owner's status and body come back unchanged. A call for a machine not in the
@@ -22,7 +27,7 @@ use axum::extract::{Request, State};
 use axum::http::{Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use foundry_proto::ids::{MachineId, TerminalId, WorkspaceId};
+use foundry_proto::ids::{MachineId, SessionId, TerminalId, WorkspaceId};
 use serde::Deserialize;
 
 use super::{Api, ApiError, error, on_store, redact};
@@ -34,7 +39,10 @@ const BODY_LIMIT: usize = 2 * 1024 * 1024;
 /// What a carried route acts on.
 enum Target {
     Create,
+    /// A factory create, carried to the machine it names as a create is, with no warning.
+    FactoryCreate,
     Workspace(WorkspaceId),
+    Session(SessionId),
     Terminal(TerminalId),
 }
 
@@ -49,10 +57,15 @@ fn target(path: &str) -> Option<Target> {
     let parts: Vec<&str> = path.strip_prefix("/api/")?.split('/').collect();
     match parts.as_slice() {
         ["workspaces"] => Some(Target::Create),
-        ["workspaces", id, "sessions" | "shells" | "archive"] => {
+        ["factory", "workspaces"] => Some(Target::FactoryCreate),
+        ["workspaces", id, "sessions" | "shells" | "archive"]
+        | ["workspaces", id, "factory", "session" | "end"] => {
             Some(Target::Workspace(WorkspaceId(id.parse().ok()?)))
         }
-        ["terminals", id, "close"] => Some(Target::Terminal(TerminalId(id.parse().ok()?))),
+        ["sessions", id, "factory", "message" | "turn"] => {
+            Some(Target::Session(SessionId(id.parse().ok()?)))
+        }
+        ["terminals", id, "close" | "tail"] => Some(Target::Terminal(TerminalId(id.parse().ok()?))),
         _ => None,
     }
 }
@@ -65,6 +78,7 @@ pub(super) async fn carry(State(api): State<Api>, request: Request, next: Next) 
         return next.run(request).await;
     };
     let create = matches!(target, Target::Create);
+    let text = request.uri().path().ends_with("/tail");
     let (parts, body) = request.into_parts();
     let Ok(body) = axum::body::to_bytes(body, BODY_LIMIT).await else {
         return error(
@@ -94,7 +108,7 @@ pub(super) async fn carry(State(api): State<Api>, request: Request, next: Next) 
         .call(owner, parts.uri.path(), content_type, &body)
         .await
     {
-        Ok(answer) => answered(warned(answer, warning)),
+        Ok(answer) => answered(warned(answer, warning), text),
         Err(refused) => not_carried(&refused),
     }
 }
@@ -118,7 +132,7 @@ fn warned(answer: Answer, warning: Option<String>) -> Answer {
 async fn owner(api: &Api, target: Target, body: &Bytes) -> Result<Option<MachineId>, ApiError> {
     let me = api.peers.me();
     match target {
-        Target::Create => {
+        Target::Create | Target::FactoryCreate => {
             /// Only the field that picks the machine; the route reads the rest.
             #[derive(Deserialize)]
             struct Picked {
@@ -135,12 +149,22 @@ async fn owner(api: &Api, target: Target, body: &Bytes) -> Result<Option<Machine
             .await?
             .filter(|record| !record.deleted && record.owner != me)
             .map(|record| record.owner)),
+        Target::Session(id) => Ok(on_store(&api.store, move |store| {
+            for owner in store.versions()?.into_keys().filter(|owner| *owner != me) {
+                if store.sessions_of(owner)?.iter().any(|s| s.body.id == id) {
+                    return Ok(Some(owner));
+                }
+            }
+            Ok(None)
+        })
+        .await?),
         Target::Terminal(id) => Ok(api.peers.owner_of(id).await?),
     }
 }
 
-/// The owner's answer, as it gave it.
-fn answered(answer: Answer) -> Response {
+/// The owner's answer, as it gave it: a success of a route that answers `text` as plain text,
+/// any other as JSON.
+fn answered(answer: Answer, text: bool) -> Response {
     let Ok(status) = StatusCode::from_u16(answer.status) else {
         return error(
             StatusCode::BAD_GATEWAY,
@@ -150,12 +174,12 @@ fn answered(answer: Answer) -> Response {
     if answer.body.is_empty() {
         return status.into_response();
     }
-    (
-        status,
-        [(header::CONTENT_TYPE, "application/json")],
-        answer.body,
-    )
-        .into_response()
+    let content_type = if text && status.is_success() {
+        "text/plain; charset=utf-8"
+    } else {
+        "application/json"
+    };
+    (status, [(header::CONTENT_TYPE, content_type)], answer.body).into_response()
 }
 
 /// The answer to a call that its owner did not answer.

@@ -1085,7 +1085,8 @@ impl Secrets for Held {
 }
 
 /// The factory session's script on B: two turns, the first of which quotes the token.
-const SESSION_SCRIPT: &str = "- wait_prompt
+const SESSION_SCRIPT: &str = "- hook: {event: SessionStart}
+- wait_prompt
 - stop: {last_assistant_message: \"pushed with ghp_FactoryRouteToken0123456789abcdef\"}
 - wait_prompt
 - stop: {last_assistant_message: \"second turn\"}
@@ -1176,7 +1177,7 @@ async fn every_factory_route_called_on_a_for_what_b_owns_reaches_b_and_no_answer
     );
     answers.push(text);
 
-    // The setup terminal's tail, read from A: at most 64 KB, ending with its last line.
+    // The setup terminal's tail, read from A: at most 64 KB, ending with the setup's last line.
     let setup_terminal = terminals_of(&on_a, workspace).await;
     let [setup_terminal] = setup_terminal[..] else {
         panic!("one setup terminal: {setup_terminal:?}");
@@ -1186,7 +1187,8 @@ async fn every_factory_route_called_on_a_for_what_b_owns_reaches_b_and_no_answer
     let tail = loop {
         let (status, text) = on_a.post_text(&tail_path, None).await;
         assert_eq!(status, 200, "{text}");
-        if text.trim_end().ends_with("last-line") {
+        // The setup terminal says how the setup ended after its last command's output.
+        if text.lines().rev().take(3).any(|line| line == "last-line") {
             break text;
         }
         assert!(tokio::time::Instant::now() < deadline, "{text}");
