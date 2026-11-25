@@ -6156,17 +6156,51 @@ mod tests {
                 assert_eq!(pass(&rig, &run), StartStep::Waiting(Wait::Workspace));
                 assert_eq!(rig.sim.assignees(), vec![LOGIN]);
                 assert_eq!(creates(&rig).len(), 1);
+                assert!(rig.steps(&run).contains(&"claim-assigning".to_string()));
             }
 
-            /// The same, with the assignee call failing on GitHub and the repair failing too.
+            /// A whole claim (its triage line is written) whose assignee a person then removed
+            /// is skipped, as the runner skips it: the person's unassignment stands.
             #[test]
-            fn a_claim_whose_assignee_never_landed_is_carried_on_by_the_next_pass() {
+            fn a_whole_claim_later_unassigned_by_a_person_is_skipped() {
                 let (rig, run) = claimed_rig();
                 rig.sim.set_assignees(&[]);
-                let ledger_before = rig.names(&run);
-                assert_eq!(ledger_before.len(), 3);
-                assert_eq!(pass(&rig, &run), StartStep::Waiting(Wait::Workspace));
-                assert_eq!(rig.sim.assignees(), vec![LOGIN]);
+                let writes = rig.sim.writes().len();
+                assert!(matches!(pass(&rig, &run), StartStep::Skipped { .. }));
+                assert_eq!(rig.sim.writes().len(), writes);
+                assert!(rig.sim.assignees().is_empty());
+                assert!(!rig.steps(&run).contains(&"claim-assigning".to_string()));
+            }
+
+            /// A 64 KB setup tail, the stuck comment landing with its answer lost: the next pass
+            /// reads the decision back, posts no second comment and starts no session.
+            #[test]
+            fn a_stuck_decision_with_a_64_kb_tail_is_read_back_and_posts_no_second_comment() {
+                let (mut rig, run) = claimed_rig();
+                pass(&rig, &run);
+                show_setup(&mut rig, TerminalState::Exited, Some(1));
+                rig.worker.on_tail(Ok("y".repeat(70_000)));
+                rig.sim.fail("--add-label", 1);
+                assert!(advance(&rig.ctx(), &run).is_err());
+                let stuck_comments = |rig: &Rig| {
+                    rig.sim
+                        .comments()
+                        .iter()
+                        .filter(|c| c.contains("could not finish this issue"))
+                        .count()
+                };
+                assert_eq!(stuck_comments(&rig), 1);
+                assert!(
+                    rig.steps(&run)
+                        .iter()
+                        .all(|step| step.len() < 4_000 && !step.contains("yyyyyyyy")),
+                    "no step holds the tail"
+                );
+                rig.worker.on_tail(Err(WorkerError::Failed("gone".into())));
+                assert!(matches!(pass(&rig, &run), StartStep::Stuck { .. }));
+                assert_eq!(stuck_comments(&rig), 1);
+                assert!(start_sessions(&rig).is_empty());
+                assert_eq!(rig.sim.labels(), vec!["factory:stuck"]);
             }
 
             /// A stuck path the ledger shows begun on an issue an instructor has put back to

@@ -1787,7 +1787,8 @@ mod tests {
                 comment_id: "c1".into(),
             }];
             rig.view = FleetView::builder().turn(turn(3)).build();
-            rig.worker.on_send(Err(SendRefused::NotIdle));
+            rig.worker
+                .on_send(Err(SendRefused::Failed("timed out".into())));
             let mut at = progress(&rig, &run, State::Building);
             assert!(
                 apply_actions(&rig.ctx(), ISSUE, &mut at, &actions, &cause(), &payload).is_err()
@@ -1795,6 +1796,10 @@ mod tests {
             assert!(
                 rig.steps(&run)
                     .contains(&"send-intent forward-comment c1 3".to_string())
+            );
+            assert!(
+                rig.steps(&run)
+                    .contains(&"send-unknown forward-comment c1".to_string())
             );
             // The worker typed it and its answer was lost: the count has risen.
             rig.view = FleetView::builder().turn(turn(4)).build();
@@ -1813,6 +1818,89 @@ mod tests {
                 })
                 .collect();
             assert_eq!(counts, vec![Some(3), Some(3)]);
+            assert!(rig.names(&run).contains(&"comment_forwarded".to_string()));
+        }
+
+        fn forward_rig(prompts: u64) -> (Rig, RunId, ActionPayload, [Action; 1]) {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            let payload = ActionPayload {
+                forward: Some(ForwardPayload {
+                    message: Message {
+                        line: "see this".into(),
+                        body: None,
+                    },
+                    step: None,
+                }),
+                ..ActionPayload::default()
+            };
+            let actions = [Action::ForwardComment {
+                comment_id: "c1".into(),
+            }];
+            let mut rig = rig;
+            set_prompts(&mut rig, prompts);
+            (rig, run, payload, actions)
+        }
+
+        fn set_prompts(rig: &mut Rig, prompts: u64) {
+            rig.view = FleetView::builder()
+                .turn(foundry_proto::factory::SessionTurn {
+                    session: session_id(SESSION).unwrap(),
+                    workspace: workspace_id(WORKSPACE).unwrap(),
+                    project: project_id(),
+                    turn: 1,
+                    prompts,
+                    question: false,
+                })
+                .build();
+        }
+
+        fn send_counts(rig: &Rig) -> Vec<Option<u64>> {
+            rig.worker
+                .calls()
+                .into_iter()
+                .filter_map(|call| match call {
+                    Call::Send {
+                        only_if_prompts, ..
+                    } => Some(only_if_prompts),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// A first send refused with a count risen has no earlier try with an unknown outcome:
+        /// nothing of it was typed by this send, so it is not delivered.
+        #[test]
+        fn a_first_send_refused_count_rose_is_not_delivered() {
+            let (rig, run, payload, actions) = forward_rig(3);
+            rig.worker.on_send(Err(SendRefused::CountRose { now: 4 }));
+            let mut at = progress(&rig, &run, State::Building);
+            assert!(
+                apply_actions(&rig.ctx(), ISSUE, &mut at, &actions, &cause(), &payload).is_err()
+            );
+            assert!(!rig.names(&run).contains(&"comment_forwarded".to_string()));
+            assert!(
+                rig.steps(&run)
+                    .contains(&"send-intent forward-comment c1 4".to_string())
+            );
+        }
+
+        /// A refusal that typed nothing leaves no unknown: the next try reads the count anew
+        /// and is sent under it.
+        #[test]
+        fn a_send_refused_not_idle_is_sent_under_the_new_count_when_retried() {
+            let (mut rig, run, payload, actions) = forward_rig(3);
+            rig.worker.on_send(Err(SendRefused::NotIdle));
+            let mut at = progress(&rig, &run, State::Building);
+            assert!(
+                apply_actions(&rig.ctx(), ISSUE, &mut at, &actions, &cause(), &payload).is_err()
+            );
+            set_prompts(&mut rig, 4);
+            rig.worker.on_send(Ok(5));
+            let mut at = progress(&rig, &run, State::Building);
+            apply_actions(&rig.ctx(), ISSUE, &mut at, &actions, &cause(), &payload).unwrap();
+            assert_eq!(send_counts(&rig), vec![Some(3), Some(4)]);
             assert!(rig.names(&run).contains(&"comment_forwarded".to_string()));
         }
 
@@ -2012,6 +2100,31 @@ mod tests {
             );
             assert!(rig.names(&run).contains(&"stuck".to_string()));
             assert!(rig.finished(&run));
+        }
+
+        /// The recorded decision holds the short fields only: a setup tail, which the ledger's
+        /// hiding cannot see through a JSON escape, is in no step.
+        #[test]
+        fn the_stuck_decision_step_holds_no_session_or_setup_text() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            let mut at = progress(&rig, &run, State::Building);
+            let stop = Stop {
+                session_text: Some("ghp_abcdef\nghijkl".into()),
+                recorded_text: Some("ghp_abcdef\nghijkl".into()),
+                detail: Some("ghp_abcdef\nghijkl".into()),
+                ..stuck_stop()
+            };
+            go_stuck(&rig.ctx(), ISSUE, &mut at, "c", stop, None).unwrap();
+            let steps = rig.steps(&run);
+            assert!(steps.iter().any(|s| s.starts_with(STUCK_STOP)), "{steps:?}");
+            assert!(
+                steps
+                    .iter()
+                    .all(|s| !s.contains("ghp_abc") && !s.contains("ghijkl")),
+                "{steps:?}"
+            );
         }
 
         #[test]
