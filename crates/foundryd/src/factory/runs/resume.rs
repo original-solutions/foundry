@@ -47,9 +47,12 @@
 //!
 //! What the pass (task 30) must do with this step:
 //!
-//! - Call [`advance`] before `start::advance` and `building::advance` for a run in `triage` or
-//!   `building`: while an interruption is owed, `building` skips the run, and a claim that is
-//!   being moved must not be asked of its old machine by `start`.
+//! - Call [`advance`] BEFORE `building::advance` and `start::advance`, every pass, for a run in
+//!   `triage` or `building`, and for a run in `stuck` whose stuck path is not finished while a
+//!   resume is owed: while an interruption is owed `building` skips the run, a claim that is
+//!   being moved must not be asked of its old machine by `start`, and `building` would
+//!   otherwise finish a decision of this step's codes without its rules for a machine that is
+//!   gone and for the session's text.
 //! - Leave a run whose newest launch is a resume to this step's resend: `start::advance`'s
 //!   resend of the launch would send the build's launch words.
 //! - Place with `placing::place_run` when [`NeedsMachine`](ResumeStep::NeedsMachine) is
@@ -246,7 +249,8 @@ use serde_json::Value;
 
 use super::building::TURN_READ;
 use super::progress::{
-    Seen, WORKSPACE_CREATED, WORKSPACE_REQUESTED, pending_relaunch, read_progress,
+    STUCK_DETAIL, STUCK_STOP, Seen, WORKSPACE_CREATED, WORKSPACE_REQUESTED, pending_relaunch,
+    read_progress,
 };
 use super::start::{FIRST_PROMPT_COUNT, SETUP_FAILED};
 use super::{
@@ -828,6 +832,10 @@ fn pass(
             );
         }
     }
+    // A run in state stuck is never carried on with a workspace or a session.
+    if seen.state == Some(State::Stuck) {
+        return skipped(run, "is stuck, which the step that made it so finishes");
+    }
     // A resume owed: the interruption is recorded and its launch is not.
     if let Some(owed) = seen
         .interruption
@@ -912,6 +920,42 @@ fn old_machine_gone(ctx: &RunContext<'_>, run: &RunId, events: &[RunEvent], seen
     old_owner(ctx, run, events, seen).is_some_and(|machine| unreachable_long(ctx, machine))
 }
 
+/// The newest turn of `session` that was not read since its launch.
+fn unread_turn(
+    ctx: &RunContext<'_>,
+    events: &[RunEvent],
+    session: SessionId,
+) -> Option<foundry_proto::factory::SessionTurn> {
+    let read = newest_turn_read(events);
+    ctx.view
+        .session_turn(session)
+        .filter(|turn| turn.turn > 0 && read.is_none_or(|read| turn.turn > read))
+        .cloned()
+}
+
+/// The detail written for the newest decision: the `stuck-detail` step right before its
+/// `stuck-stop`, which `go_stuck` writes one after the other under the same cause, so that
+/// of the decision's `code`. A lone detail of an earlier decision that was decided again, and
+/// has another code, is not it.
+fn decision_detail(events: &[RunEvent], code: &str) -> Option<String> {
+    let stop = events
+        .iter()
+        .rposition(|event| step_text(event).is_some_and(|step| step.starts_with(STUCK_STOP)))?;
+    let before = events.get(stop.checked_sub(1)?)?;
+    let same_cause = before
+        .cause
+        .as_ref()
+        .and_then(|cause| cause.get("reason"))
+        .and_then(Value::as_str)
+        == Some(code);
+    if !same_cause {
+        return None;
+    }
+    step_text(before)?
+        .strip_prefix(STUCK_DETAIL)
+        .map(str::to_owned)
+}
+
 /// A stuck path this step began and was cut short, finished from the ledger as building's
 /// `finish_begun_stuck` finishes its own: the decision's code and words, the detail the ledger
 /// keeps, and for a setup that failed the tail read again. A path begun by another step is
@@ -925,6 +969,24 @@ fn finish_own_stuck(
     resume_owed: bool,
 ) -> Result<Option<ResumeStep>, RunError> {
     let Some(raw) = &seen.stuck_stop else {
+        // A `stuck` line with no decision, while a resume is owed (`building` skips such a run):
+        // finished with its recorded reason, as building does.
+        if resume_owed && let Some(reason) = &seen.stuck {
+            if old_machine_gone(ctx, run, events, seen) {
+                at.worktree = None;
+            }
+            go_stuck(
+                ctx,
+                run.issue(),
+                at,
+                "stuck-resumed",
+                Stop::new(reason.clone()),
+                None,
+            )?;
+            return Ok(Some(ResumeStep::Stuck {
+                reason: reason.clone(),
+            }));
+        }
         return Ok(None);
     };
     let decision: StuckStop = serde_json::from_str(raw)
@@ -933,7 +995,7 @@ fn finish_own_stuck(
         return Ok(None);
     }
     let mut stop = decision.stop;
-    stop.detail = seen.stuck_detail.clone();
+    stop.detail = decision_detail(events, &decision.code);
     let round = read_round(events).filter(|_| resume_owed);
     // The resume workspace the decision was made in, when one was recorded.
     let resume_record = round.as_ref().and_then(|round| {
@@ -960,13 +1022,7 @@ fn finish_own_stuck(
         && let Some(thread) = &seen.thread_id
     {
         let session = session_id(thread)?;
-        let read = newest_turn_read(events);
-        let unread = ctx
-            .view
-            .session_turn(session)
-            .filter(|turn| turn.turn > 0 && read.is_none_or(|read| turn.turn > read))
-            .cloned();
-        if let Some(turn) = unread {
+        if let Some(turn) = unread_turn(ctx, events, session) {
             ctx.held()?;
             if let Ok(said) = ctx.worker.turn(session, turn.turn) {
                 stop.session_text = prepared(&said.message);
@@ -1033,13 +1089,7 @@ fn ended(
             } else {
                 "finished"
             };
-            let read = newest_turn_read(events);
-            let unread = ctx
-                .view
-                .session_turn(session)
-                .filter(|turn| turn.turn > 0 && read.is_none_or(|read| turn.turn > read))
-                .cloned();
-            let text = match unread {
+            let text = match unread_turn(ctx, events, session) {
                 None => None,
                 Some(turn) => {
                     ctx.held()?;
