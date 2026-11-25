@@ -609,88 +609,6 @@ fn check_binding(
     None
 }
 
-/// Whether a `gh` failure (`OtherKind::Failed`, as `github::gh::finish` words it) is that `gh`
-/// got no answer from GitHub about the pull request.
-///
-/// A shape this does not name is a refusal. That is the runner's reading (every failure to
-/// draft but a rate limit is stuck, "exited with status 1: boom" included), and the safe side
-/// for this caller: the second look has read the pull request open and ready for review, which
-/// only the gate may leave it, so a refusal stops the run where a person sees it at once and
-/// loses nothing. A real refusal taken for no answer would be asked again every pass until
-/// `limits.minutes`, and end the run with a reason that names nothing.
-///
-/// No answer is told only by the wrappers around what `gh pr ready --undo` prints, as gh
-/// 2.105.0's source writes them, never by a list of failure words:
-///
-/// - Foundry's own: a call a signal ended (status `-1`), and an answer over the output limit
-///   (`` ` printed more than``).
-/// - gh's `printError`: a `*net.DNSError` anywhere in the chain prints
-///   `error connecting to <host>`.
-/// - Go's `*url.Error`, the transport's failure at any step: the method as net/http's
-///   `urlErrorOp` writes it (`Post`, `Get`), the quoted URL, `": "`, then any cause.
-/// - The lookup before the mutation: GitHub's answer is go-gh's `HTTP <status>...` or
-///   `GraphQL: ...`, and a 5xx is no answer about this pull request.
-/// - The mutation: `ready.go` wraps its error as `API call failed: <error>`. Inside it, GitHub's
-///   answer is a status in shurcooL-graphql's words (`non-200 OK status code: <status> ...`, a
-///   5xx is no answer) or `GraphQL: ...`; anything else there is the request not reaching
-///   GitHub or its answer not being read, which is no answer.
-///
-/// So Go's bare transport errors outside both wrappers (what a lookup whose answer was cut
-/// short prints) fall to the first rule. Only what `gh` said (after
-/// `` `<command>` exited with status <n>: ``) is read, never the command text, which names the
-/// repo.
-fn gh_gave_no_answer(message: &str) -> bool {
-    if message.contains("` printed more than ") {
-        return true;
-    }
-    let Some((_, after)) = message.split_once("` exited with status ") else {
-        return false;
-    };
-    let Some((status, said)) = after.split_once(": ") else {
-        return false;
-    };
-    if status == "-1" || said.starts_with("error connecting to ") {
-        return true;
-    }
-    let (mutation, error) = match said.strip_prefix("API call failed: ") {
-        Some(error) => (true, error),
-        None => (false, said),
-    };
-    if let Some(status) = answered_status(error) {
-        return status >= 500;
-    }
-    if error.starts_with("GraphQL: ") {
-        return false;
-    }
-    mutation || is_url_error(error)
-}
-
-/// The status of GitHub's answer that `error` starts with, in go-gh's words
-/// (`HTTP 502: Bad Gateway (<url>)`) or shurcooL-graphql's
-/// (`non-200 OK status code: 502 Bad Gateway body: "..."`).
-fn answered_status(error: &str) -> Option<u16> {
-    let rest = error
-        .strip_prefix("HTTP ")
-        .or_else(|| error.strip_prefix("non-200 OK status code: "))?;
-    let digits = rest.get(..3)?;
-    if rest[3..].starts_with(|c: char| c.is_ascii_digit()) {
-        return None;
-    }
-    digits.parse().ok()
-}
-
-/// Whether `error` is Go's `*url.Error` (`%s %q: %s`): the method as `urlErrorOp` writes it
-/// (one capital, then lower case), the quoted `http` or `https` URL, `": "`, the cause.
-fn is_url_error(error: &str) -> bool {
-    error.split_once(' ').is_some_and(|(method, rest)| {
-        let mut letters = method.chars();
-        letters.next().is_some_and(|c| c.is_ascii_uppercase())
-            && letters.all(|c| c.is_ascii_lowercase())
-            && (rest.starts_with("\"http://") || rest.starts_with("\"https://"))
-            && rest.contains("\": ")
-    })
-}
-
 /// The stop of a pull request that is not the run's: the factory's words, the detail the
 /// public must not read, and what the session said.
 fn unbound_stop(unbound: Unbound, message: &str) -> Stop {
@@ -948,10 +866,11 @@ impl Step<'_, '_> {
         //   failure ("exited with status 1: boom") says nothing of which. A failed read is the
         //   call's error, or its own after an `Ok` (GitHub is down). One merged or closed
         //   meanwhile ends the run as below. After an `Ok`, or as a draft now, it goes on.
-        //   After a `gh` failure that got no answer from GitHub ([`gh_gave_no_answer`]) it is
-        //   that error (a pull request that never drafts is ended by `limits.minutes`). One
-        //   open and not a draft is stuck in the runner's words (GitHub answered and the call
-        //   was refused), and one gone is stuck as one that does not exist.
+        //   After a `gh` failure that got no answer from GitHub (`OtherKind::NoAnswer`, which
+        //   `github::gh::finish` tells from a refusal) it is that error (a pull request that
+        //   never drafts is ended by `limits.minutes`). One open and not a draft is stuck in the
+        //   runner's words (GitHub answered and the call was refused), and one gone is stuck as
+        //   one that does not exist.
         if pull.open && !pull.is_draft {
             let failed = match ctx.mark_pr_draft(pr) {
                 Ok(()) => None,
@@ -959,7 +878,7 @@ impl Step<'_, '_> {
                     error @ RunError::Tracker(
                         TrackerError::NotFound { .. }
                         | TrackerError::Other {
-                            kind: OtherKind::Failed,
+                            kind: OtherKind::Failed | OtherKind::NoAnswer,
                             ..
                         },
                     ),
@@ -978,8 +897,10 @@ impl Step<'_, '_> {
                     let no_answer = |error: &RunError| {
                         matches!(
                             error,
-                            RunError::Tracker(TrackerError::Other { message, .. })
-                                if gh_gave_no_answer(message)
+                            RunError::Tracker(TrackerError::Other {
+                                kind: OtherKind::NoAnswer,
+                                ..
+                            })
                         )
                     };
                     if let Some(error) = failed.filter(no_answer) {
@@ -1613,6 +1534,15 @@ mod tests {
 
     mod advance_done {
         use super::*;
+        use crate::factory::github::Answer;
+        use crate::factory::github::gh::finish;
+
+        /// The error `github::gh::finish` gives `gh <command>` ending with `answer`, so a
+        /// scripted failure is read as the real `gh`'s is.
+        fn gh_failed(command: &str, answer: Answer) -> TrackerError {
+            let args: Vec<String> = command.split(' ').map(str::to_string).collect();
+            finish(&args, answer).unwrap_err()
+        }
 
         #[test]
         fn with_an_open_draft_pull_request_on_the_sessions_branch_is_ready_for_the_gate() {
@@ -1714,9 +1644,8 @@ mod tests {
                 .set_pull(12, pull("OPEN", false, BRANCH, "main", false));
             let sim = rig.sim.clone();
             rig.tracker = Hiding::new(
-                Arc::new(Failing(sim, || TrackerError::Other {
-                    kind: crate::factory::github::OtherKind::Failed,
-                    message: "`gh pr ready` exited with status 1: boom".into(),
+                Arc::new(Failing(sim, || {
+                    gh_failed("pr ready 12 --undo", Answer::fail(1, "boom"))
                 })),
                 Arc::new(|t: &str| t.into()),
             );
@@ -1778,27 +1707,26 @@ mod tests {
                 use std::sync::atomic::Ordering;
                 if args.iter().any(|arg| arg == "--undo") {
                     self.failed.store(true, Ordering::SeqCst);
-                    return Err(TrackerError::Other {
-                        kind: crate::factory::github::OtherKind::Failed,
-                        // `refused`: `gh` was refused (status 1 and a reason); else a 502.
-                        message: if self.refused {
-                            "`gh pr ready` exited with status 1: boom".into()
-                        } else {
-                            "`gh pr ready` exited with status 1: HTTP 502: Bad Gateway".into()
-                        },
-                    });
+                    // `refused`: `gh` was refused (status 1 and a reason); else a 502.
+                    let stderr = if self.refused {
+                        "boom"
+                    } else {
+                        "HTTP 502: Bad Gateway"
+                    };
+                    return Err(gh_failed("pr ready 12 --undo", Answer::fail(1, stderr)));
                 }
                 if self.failed.load(Ordering::SeqCst)
                     && args.first().map(String::as_str) == Some("pr")
                     && args.iter().any(|arg| arg == "view")
                 {
-                    return Err(TrackerError::Other {
-                        kind: crate::factory::github::OtherKind::Failed,
-                        message: if self.gone {
-                            "`gh pr view` failed: Could not resolve to a PullRequest".into()
-                        } else {
-                            "`gh pr view` exited with status 1: HTTP 502: Bad Gateway".into()
-                        },
+                    return Err(if self.gone {
+                        TrackerError::Other {
+                            kind: crate::factory::github::OtherKind::Failed,
+                            message: "`gh pr view` failed: Could not resolve to a PullRequest"
+                                .into(),
+                        }
+                    } else {
+                        gh_failed("pr view 12", Answer::fail(1, "HTTP 502: Bad Gateway"))
                     });
                 }
                 self.sim.gh(args)
@@ -1882,25 +1810,24 @@ mod tests {
         #[test]
         fn with_gh_getting_no_answer_on_putting_it_back_to_draft_is_an_error_not_stuck() {
             let shapes: [fn() -> TrackerError; 4] = [
-                || TrackerError::Other {
-                    kind: crate::factory::github::OtherKind::Failed,
-                    message: "`gh pr ready` exited with status 1: HTTP 502: Bad Gateway".into(),
+                || {
+                    gh_failed(
+                        "pr ready 12 --undo",
+                        Answer::fail(1, "HTTP 502: Bad Gateway"),
+                    )
                 },
                 // The mutation's own 5xx, as `gh pr ready --undo` prints it.
-                || TrackerError::Other {
-                    kind: crate::factory::github::OtherKind::Failed,
-                    message: "`gh pr ready` exited with status 1: API call failed: non-200 OK \
-                              status code: 502 Bad Gateway body: \"\""
-                        .into(),
+                || {
+                    gh_failed(
+                        "pr ready 12 --undo",
+                        Answer::fail(
+                            1,
+                            "API call failed: non-200 OK status code: 502 Bad Gateway body: \"\"",
+                        ),
+                    )
                 },
-                || TrackerError::Other {
-                    kind: crate::factory::github::OtherKind::Failed,
-                    message: "`gh pr ready` exited with status -1: ".into(),
-                },
-                || TrackerError::Other {
-                    kind: crate::factory::github::OtherKind::Failed,
-                    message: "`gh pr ready` printed more than 1048576 bytes".into(),
-                },
+                || gh_failed("pr ready 12 --undo", Answer::signal_killed()),
+                || gh_failed("pr ready 12 --undo", Answer::TooLarge),
             ];
             for make in shapes {
                 let (mut rig, run) = built();
@@ -1926,125 +1853,6 @@ mod tests {
             }
         }
 
-        /// The message of a failed `gh pr ready` on repo `slug`, as `github::gh::finish` words it.
-        fn finished(slug: &str, answer: crate::factory::github::Answer) -> String {
-            let args: Vec<String> = ["pr", "ready", "12", "--repo", slug, "--undo"]
-                .iter()
-                .map(|arg| arg.to_string())
-                .collect();
-            match crate::factory::github::gh::finish(&args, answer).unwrap_err() {
-                TrackerError::Other { message, .. } => message,
-                other => panic!("not a failure of gh: {other}"),
-            }
-        }
-
-        fn exit(status: Option<i32>, stderr: &str) -> crate::factory::github::Answer {
-            crate::factory::github::Answer::Exit {
-                status,
-                stdout: String::new(),
-                stderr: stderr.into(),
-            }
-        }
-
-        /// Only what `gh` said is read, never the command text: a repo whose name holds a word
-        /// a connection failure is told by does not make a refusal "no answer".
-        #[test]
-        fn a_gh_refusal_is_not_taken_for_no_answer_whatever_the_repo_is_called() {
-            for slug in [
-                "acme/kafka-connect",
-                "rustls/rustls",
-                "x/network-tools",
-                "y/geofence",
-                "a/eof-tools",
-                "b/timeout-lib",
-                "c/dial-tcp",
-                "d/tls-proxy",
-            ] {
-                for stderr in [
-                    "boom",
-                    "GraphQL: Pull request is already closed",
-                    "HTTP 422: Unprocessable Entity",
-                    "HTTP 403: Resource not accessible",
-                    // GitHub's answers to the mutation, inside `API call failed: `.
-                    "API call failed: GraphQL: Resource not accessible by integration (convertPullRequestToDraft)",
-                    "API call failed: non-200 OK status code: 403 Forbidden body: \"{}\"",
-                    "API call failed: non-200 OK status code: 422 Unprocessable Entity body: \"\"",
-                    // `HTTP 5` that is no status, and a refusal that quotes no URL.
-                    "see HTTP 5 docs",
-                    "unknown flag: --undo",
-                ] {
-                    let message = finished(slug, exit(Some(1), stderr));
-                    assert!(!gh_gave_no_answer(&message), "{message}");
-                }
-                assert!(!gh_gave_no_answer(&finished(slug, exit(Some(2), ""))));
-            }
-        }
-
-        /// What `gh pr ready --undo` (gh 2.105.0) prints when GitHub gave no answer, one group
-        /// per wrapper `gh_gave_no_answer` names, on a repo whose name holds none of its words.
-        #[test]
-        fn a_gh_failure_with_no_answer_from_github_is_told_from_a_refusal() {
-            use crate::factory::github::Answer;
-            let slug = "acme/widgets";
-            for stderr in [
-                // gh's `printError`: a `*net.DNSError` anywhere in the chain.
-                "error connecting to api.github.com\ncheck your internet connection or https://githubstatus.com",
-                // The lookup before the mutation: go-gh's `HTTPError` with a 5xx.
-                "HTTP 502: Bad Gateway (https://api.github.com/graphql)",
-                "HTTP 503 (https://api.github.com/graphql)",
-                "HTTP 500",
-                // Go's `*url.Error`: `urlErrorOp`'s method, the quoted URL, then any cause.
-                "Post \"https://api.github.com/graphql\": dial tcp 140.82.112.5:443: connect: connection refused",
-                "Post \"https://api.github.com/graphql\": net/http: TLS handshake timeout",
-                "Post \"https://api.github.com/graphql\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
-                "Get \"https://api.github.com\": EOF",
-                "Get \"https://api.github.com/repos/acme/widgets\": something nobody has worded yet",
-                // The mutation, inside `API call failed: `: a 5xx in shurcooL-graphql's words.
-                "API call failed: non-200 OK status code: 502 Bad Gateway body: \"\"",
-                "API call failed: non-200 OK status code: 504 Gateway Timeout body: \"<html></html>\"",
-                // The mutation's transport failure, and its answer cut short or unreadable.
-                "API call failed: Post \"https://api.github.com/graphql\": http2: stream error: stream ID 3; INTERNAL_ERROR; received from peer",
-                "API call failed: read tcp 10.0.0.2:50000->140.82.112.6:443: read: connection reset by peer",
-                "API call failed: unexpected EOF",
-                "API call failed: invalid character '<' looking for beginning of value",
-                "API call failed: something nobody has worded yet",
-            ] {
-                let message = finished(slug, exit(Some(1), stderr));
-                assert!(gh_gave_no_answer(&message), "{message}");
-            }
-            // Foundry's: a call a signal ended, and an answer over the output limit.
-            for answer in [exit(None, ""), Answer::TooLarge] {
-                let message = finished(slug, answer);
-                assert!(gh_gave_no_answer(&message), "{message}");
-            }
-        }
-
-        /// The rule for a shape no wrapper names: a refusal, the runner's reading. Go's bare
-        /// transport errors outside `API call failed: ` and a `*url.Error` (what a lookup whose
-        /// answer was cut short prints) fall to it too.
-        #[test]
-        fn a_gh_failure_in_a_shape_no_wrapper_names_is_a_refusal() {
-            for stderr in [
-                "boom",
-                "something nobody has worded yet",
-                "read tcp 10.0.0.2:5000->140.82.112.5:443: connection reset by peer",
-                "unexpected EOF",
-                // Not a `*url.Error`: not `urlErrorOp`'s method (`Post`), no cause, no web URL.
-                "POST \"https://api.github.com/graphql\": EOF",
-                "Post \"https://api.github.com/graphql\"",
-                "Get \"ftp://example.com\": EOF",
-                // Not a status of three digits.
-                "HTTP 5xx",
-                "HTTP 5021",
-                // A wrapper's words that do not start what `gh` said.
-                "boom: API call failed: unexpected EOF",
-                "the lookup said HTTP 502",
-            ] {
-                let message = finished("acme/widgets", exit(Some(1), stderr));
-                assert!(!gh_gave_no_answer(&message), "{message}");
-            }
-        }
-
         /// A tracker whose answer to putting a pull request back to draft is `error`, whatever
         /// the pull request says: a transient failure, which is an error and writes nothing.
         struct Failing(Arc<Sim>, fn() -> TrackerError);
@@ -2059,14 +1867,14 @@ mod tests {
         }
 
         /// A tracker whose call to put pull request #12 back to draft finds it ended meanwhile: a
-        /// person merged or closed it (`state`, `draft`), and the call failed with `message`.
+        /// person merged or closed it (`state`, `draft`), and `gh` failed saying `stderr`.
         /// The tracker's own read of the pull request after the failure finds it ended, so the
         /// call is `Ok`, or with `read_fails` fails, so the error reaches `advance`.
         struct EndedFirst {
             sim: Arc<Sim>,
             state: &'static str,
             draft: bool,
-            message: &'static str,
+            stderr: &'static str,
             read_fails: bool,
             failed: std::sync::atomic::AtomicBool,
             read_failed: std::sync::atomic::AtomicBool,
@@ -2079,10 +1887,10 @@ mod tests {
                     self.sim
                         .set_pull(12, pull(self.state, self.draft, BRANCH, "main", false));
                     self.failed.store(true, Ordering::SeqCst);
-                    return Err(TrackerError::Other {
-                        kind: crate::factory::github::OtherKind::Failed,
-                        message: self.message.into(),
-                    });
+                    return Err(gh_failed(
+                        "pr ready 12 --undo",
+                        Answer::fail(1, self.stderr),
+                    ));
                 }
                 if self.failed.load(Ordering::SeqCst)
                     && args.first().map(String::as_str) == Some("pr")
@@ -2090,10 +1898,10 @@ mod tests {
                     && self.read_fails
                     && !self.read_failed.swap(true, Ordering::SeqCst)
                 {
-                    return Err(TrackerError::Other {
-                        kind: crate::factory::github::OtherKind::Failed,
-                        message: "`gh pr view` exited with status 1: HTTP 502: Bad Gateway".into(),
-                    });
+                    return Err(gh_failed(
+                        "pr view 12",
+                        Answer::fail(1, "HTTP 502: Bad Gateway"),
+                    ));
                 }
                 self.sim.gh(args)
             }
@@ -2108,23 +1916,13 @@ mod tests {
                 (
                     "MERGED",
                     false,
-                    "`gh pr ready` exited with status 1: API call failed: GraphQL: Pull request is already merged",
+                    "API call failed: GraphQL: Pull request is already merged",
                     "merged",
                 ),
-                (
-                    "CLOSED",
-                    false,
-                    "`gh pr ready` exited with status 1: boom",
-                    "closed",
-                ),
-                (
-                    "CLOSED",
-                    true,
-                    "`gh pr ready` exited with status 1: HTTP 502: Bad Gateway",
-                    "closed",
-                ),
+                ("CLOSED", false, "boom", "closed"),
+                ("CLOSED", true, "HTTP 502: Bad Gateway", "closed"),
             ];
-            for ((state, draft, message, end), read_fails) in cases
+            for ((state, draft, stderr, end), read_fails) in cases
                 .into_iter()
                 .flat_map(|case| [(case, false), (case, true)])
             {
@@ -2137,7 +1935,7 @@ mod tests {
                         sim: rig.sim.clone(),
                         state,
                         draft,
-                        message,
+                        stderr,
                         read_fails,
                         failed: std::sync::atomic::AtomicBool::new(false),
                         read_failed: std::sync::atomic::AtomicBool::new(false),
@@ -2196,10 +1994,10 @@ mod tests {
                     && args.iter().any(|arg| arg == "view")
                     && !self.read_failed.swap(true, Ordering::SeqCst)
                 {
-                    return Err(TrackerError::Other {
-                        kind: crate::factory::github::OtherKind::Failed,
-                        message: "`gh pr view` exited with status 1: HTTP 502: Bad Gateway".into(),
-                    });
+                    return Err(gh_failed(
+                        "pr view 12",
+                        Answer::fail(1, "HTTP 502: Bad Gateway"),
+                    ));
                 }
                 self.sim.gh(args)
             }
@@ -2348,10 +2146,10 @@ mod tests {
             fn gh(&self, args: &[String]) -> Result<String, TrackerError> {
                 if args.iter().any(|arg| arg == "--undo") {
                     self.0.set_pull(12, draft_on(BRANCH));
-                    return Err(TrackerError::Other {
-                        kind: crate::factory::github::OtherKind::Failed,
-                        message: "`gh pr ready` exited with status 1: HTTP 502: Bad Gateway".into(),
-                    });
+                    return Err(gh_failed(
+                        "pr ready 12 --undo",
+                        Answer::fail(1, "HTTP 502: Bad Gateway"),
+                    ));
                 }
                 self.0.gh(args)
             }
