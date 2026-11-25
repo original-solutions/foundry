@@ -1153,6 +1153,34 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
+    /// Writes `count` blobs that nothing reaches into the repository at `git_dir`, each one
+    /// whose id starts with `17`, so all of them are loose objects in `objects/17`, the
+    /// directory `gc --auto` counts. Returns their files.
+    fn unreachable_blobs_in_bucket_17(git_dir: &Path, count: usize) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        for n in 0u64.. {
+            if files.len() == count {
+                break;
+            }
+            let content = format!("unreachable {n}");
+            let object = format!("blob {}\0{content}", content.len());
+            let id =
+                ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, object.as_bytes());
+            if id.as_ref()[0] != 0x17 {
+                continue;
+            }
+            let written = git_stdin(git_dir, &["hash-object", "-w", "--stdin"], &content);
+            assert!(written.starts_with("17"), "{written}");
+            let file = git_dir
+                .join("objects")
+                .join(&written[..2])
+                .join(&written[2..]);
+            assert!(file.exists(), "{} was not written loose", file.display());
+            files.push(file);
+        }
+        files
+    }
+
     /// The reason of an `Unknown` state, whatever type it is held as.
     fn reason_of(state: &LeaseState) -> String {
         match state {
@@ -2348,16 +2376,13 @@ exec git "$@"
         let a = rig.machine();
         assert_eq!(a.tick(0), held(1));
         // Enough loose objects to be over git's default threshold of 6700: it samples one of
-        // the 256 directories, so 40 in `objects/17` is over it.
-        let bucket = a.dir.join("objects/17");
-        fs::create_dir_all(&bucket).unwrap();
-        let junk: Vec<PathBuf> = (0..40).map(|n| bucket.join(format!("{n:038x}"))).collect();
-        for file in &junk {
-            fs::write(file, "junk").unwrap();
-        }
+        // the 256 directories, so 40 in `objects/17` is over it. They are real objects that
+        // nothing reaches, as superseded lease commits are: a newer git (2.56 does, 2.50 does
+        // not) reads every loose object when it prunes, and stops at one that is not one.
+        let left = unreachable_blobs_in_bucket_17(&a.dir, 40);
         a.advance(secs(60));
         assert_eq!(a.tick(0), held(1));
-        for file in &junk {
+        for file in &left {
             assert!(!file.exists(), "{} is still there", file.display());
         }
         // The current lease commit is kept: the local ref names it.
