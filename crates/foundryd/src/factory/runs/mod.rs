@@ -36,6 +36,7 @@ use foundry_proto::factory::{FactorySettings, ProjectFactory, RunId};
 use foundry_proto::ids::{ProjectId, SessionId, WorkspaceId};
 
 use super::config::ProjectConfig;
+use super::github::read::gh_pages;
 use super::github::{Commenting, MARKER, PullRequest, TrackerError};
 use super::ledger::events::{Cause, CauseStep, Event, Outcome, PrEnd};
 use super::ledger::{Ledger, LedgerError};
@@ -700,8 +701,8 @@ fn post_once(
 /// The first line of every stuck comment, as [`messages::stuck`] opens it.
 const STUCK_HEADER: &str = "The factory could not finish this issue and has released it.";
 
-/// Whether the newest comment of the project's login that carries the factory's marker opens
-/// with `prefix`.
+/// Whether the newest comment of the project's login that carries the factory's marker, newer
+/// than comment `above`, opens with `prefix`.
 fn newest_comment_starts_with(
     ctx: &RunContext<'_>,
     issue: u64,
@@ -709,43 +710,91 @@ fn newest_comment_starts_with(
     above: u64,
 ) -> Result<bool, RunError> {
     let newest = newest_own(ctx, issue)?;
-    Ok(newest.is_some_and(|(id, body)| id > above && body.starts_with(prefix)))
+    Ok(newest.is_some_and(|own| own.id > above && own.body.starts_with(prefix)))
 }
 
-/// The id and body of the newest comment of the project's login that carries the marker.
-fn newest_own(ctx: &RunContext<'_>, issue: u64) -> Result<Option<(u64, String)>, RunError> {
-    let comments = ctx.tracker.issue_comments(ctx.repo(), issue)?;
-    let normal = |body: &str| body.replace("\r\n", "\n").trim_end().to_owned();
-    Ok(comments
-        .iter()
-        .filter(|comment| {
-            comment
-                .author
-                .as_deref()
-                .is_some_and(|author| author.eq_ignore_ascii_case(&ctx.project.login))
+/// A comment of the project's login as GitHub lists it.
+#[derive(serde::Deserialize)]
+struct CommentRow {
+    id: u64,
+    #[serde(default)]
+    user: Option<CommentUser>,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    created_at: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct CommentUser {
+    login: String,
+}
+
+/// The newest comment of the project's login that ends with the factory's marker.
+pub(crate) struct OwnComment {
+    pub id: u64,
+    /// As [`as_posted`] gives a text: lines ended `\n`, the end trimmed.
+    pub body: String,
+    /// GitHub's creation time; empty when GitHub gave none.
+    pub created_at: String,
+}
+
+/// The newest comment of the project's login on `issue` (or pull request) that ends with the
+/// factory's marker. Anyone can paste the marker, so only the login's own comment counts. The
+/// one reading of "has the factory already said this" for every comment it posts once.
+pub(crate) fn newest_own(ctx: &RunContext<'_>, issue: u64) -> Result<Option<OwnComment>, RunError> {
+    let args = vec![
+        "api".to_string(),
+        format!("repos/{}/issues/{issue}/comments?per_page=100", ctx.repo()),
+        "--paginate".to_string(),
+    ];
+    let rows: Vec<CommentRow> = gh_pages(ctx.tracker, &args, "JSON arrays of comments")?;
+    Ok(rows
+        .into_iter()
+        .filter(|row| {
+            row.user
+                .as_ref()
+                .is_some_and(|user| user.login.eq_ignore_ascii_case(&ctx.project.login))
         })
-        .filter(|comment| normal(&comment.body).ends_with(MARKER))
-        .max_by_key(|comment| comment.id)
-        .map(|comment| (comment.id, comment.body.clone())))
+        .filter_map(|row| {
+            let body = normal(&row.body.unwrap_or_default());
+            body.ends_with(MARKER).then(|| OwnComment {
+                id: row.id,
+                body,
+                created_at: row.created_at.unwrap_or_default(),
+            })
+        })
+        .max_by_key(|own| own.id))
+}
+
+/// A comment's body with its lines ended `\n` and its end trimmed.
+fn normal(body: &str) -> String {
+    body.replace("\r\n", "\n").trim_end().to_owned()
+}
+
+/// `said` as the factory's comment holds it once posted, in the form [`newest_own`] gives.
+pub(crate) fn as_posted(ctx: &RunContext<'_>, said: &str) -> String {
+    normal(&format!(
+        "{}\n\n{MARKER}",
+        text::for_comment(&ctx.tracker.hide(said))
+    ))
 }
 
 /// The id of the newest comment of the login with the marker, 0 when there is none.
 fn newest_own_id(ctx: &RunContext<'_>, issue: u64) -> Result<u64, RunError> {
-    Ok(newest_own(ctx, issue)?.map_or(0, |(id, _)| id))
+    Ok(newest_own(ctx, issue)?.map_or(0, |own| own.id))
 }
 
-/// Whether the newest comment of the project's login that carries the factory's marker is `said`
-/// as it is posted. Anyone can paste the marker, so only the login's own comment counts.
+/// Whether the newest comment of the project's login that carries the factory's marker, newer
+/// than comment `above`, is `said` as it is posted.
 fn newest_comment_is(
     ctx: &RunContext<'_>,
     issue: u64,
     said: &str,
     above: u64,
 ) -> Result<bool, RunError> {
-    let normal = |body: &str| body.replace("\r\n", "\n").trim_end().to_owned();
-    let expected = format!("{}\n\n{MARKER}", text::for_comment(&ctx.tracker.hide(said)));
-    Ok(newest_own(ctx, issue)?
-        .is_some_and(|(id, body)| id > above && normal(&body) == normal(&expected)))
+    let expected = as_posted(ctx, said);
+    Ok(newest_own(ctx, issue)?.is_some_and(|own| own.id > above && own.body == expected))
 }
 
 /// Stops the run's session before it goes stuck: ends the factory sessions of its build

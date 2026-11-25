@@ -44,15 +44,16 @@ use super::progress::{
     read_progress,
 };
 use super::{
-    Closing, Progress, RunContext, RunError, Stop, abandon, end_own_merge, finish_building,
-    go_stuck, moved_on_by_closing, progress_from, session_id, stop_session, workspace_id,
+    Closing, Progress, RunContext, RunError, Stop, abandon, as_posted, end_own_merge,
+    finish_building, go_stuck, moved_on_by_closing, newest_own, progress_from, session_id,
+    stop_session, workspace_id,
 };
 use crate::factory::github::read::{
-    gh_json, gh_pages, is_branch_path, is_plain_ref_name, is_safe_branch_name, is_utc_second,
+    gh_json, is_branch_path, is_plain_ref_name, is_safe_branch_name, is_utc_second,
     issue_query_args,
 };
 use crate::factory::github::{
-    Claim, IssueDetail, MARKER, OpenPullRequest, OtherKind, Tracker, TrackerError, newest_claim,
+    Claim, IssueDetail, OpenPullRequest, OtherKind, Tracker, TrackerError, newest_claim,
 };
 use crate::factory::ledger::events::{
     Cause, CauseStep, Event, ModelOption, OptionValue, Outcome, ResumedFrom, names,
@@ -232,54 +233,6 @@ pub fn record_approval(
     ctx.record_step(run, &format!("{APPROVED}{labeled_at}"), &cause)
 }
 
-/// A comment of the project's login as GitHub lists it, with its creation time.
-#[derive(Deserialize)]
-struct CommentRow {
-    id: u64,
-    #[serde(default)]
-    user: Option<CommentUser>,
-    #[serde(default)]
-    body: Option<String>,
-    #[serde(default)]
-    created_at: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct CommentUser {
-    login: String,
-}
-
-/// The newest comment of the project's login that ends with the factory's marker, with its body
-/// as it was posted (lines ended `\n`, the end trimmed) and its creation time. Anyone can paste
-/// the marker, so only the login's own comment counts.
-fn newest_factory_comment(
-    ctx: &RunContext<'_>,
-    issue: u64,
-) -> Result<Option<(String, String)>, RunError> {
-    let repo = ctx.repo();
-    let args = vec![
-        "api".to_string(),
-        format!("repos/{repo}/issues/{issue}/comments?per_page=100"),
-        "--paginate".to_string(),
-    ];
-    let rows: Vec<CommentRow> = gh_pages(ctx.tracker, &args, "JSON arrays of comments")?;
-    let newest = rows
-        .into_iter()
-        .filter(|row| {
-            row.user
-                .as_ref()
-                .is_some_and(|user| user.login.eq_ignore_ascii_case(&ctx.project.login))
-        })
-        .filter_map(|row| {
-            let body = row.body.unwrap_or_default().replace("\r\n", "\n");
-            let body = body.trim_end().to_owned();
-            body.ends_with(MARKER)
-                .then(|| (row.id, body, row.created_at.unwrap_or_default()))
-        })
-        .max_by_key(|(id, _, _)| *id);
-    Ok(newest.map(|(_, body, at)| (body, at)))
-}
-
 /// Whether the issue's newest factory comment already says `text` for the label it was judged
 /// on: same words, and newer than the label event (an older comment was about an earlier
 /// refusal). A refusal that names no label time is matched on the words alone: Foundry orders
@@ -290,13 +243,13 @@ fn already_said(
     refusal: &Refusal,
     said: &str,
 ) -> Result<bool, RunError> {
-    let Some((body, created_at)) = newest_factory_comment(ctx, issue)? else {
+    let Some(newest) = newest_own(ctx, issue)? else {
         return Ok(false);
     };
-    let expected = format!("{}\n\n{MARKER}", text::for_comment(&ctx.tracker.hide(said)));
-    if body != expected.trim_end() {
+    if newest.body != as_posted(ctx, said) {
         return Ok(false);
     }
+    let created_at = newest.created_at;
     let labeled_at = match refusal {
         Refusal::LabeledByNonInstructor { labeled_at, .. }
         | Refusal::EditedAfterLabel { labeled_at }

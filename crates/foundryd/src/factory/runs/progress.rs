@@ -849,7 +849,13 @@ pub fn read_progress(events: &[RunEvent]) -> Seen {
                 } else if let Some(branch) = step.strip_prefix(LAUNCH_BASE) {
                     seen.launch_base = Some(branch.to_owned());
                 } else if let Some(model) = step.strip_prefix(LAUNCH_MODEL) {
+                    // The first step of every decision Foundry writes: a decision cut short
+                    // before its workspace was asked for said nothing this one keeps.
                     seen.launch_model = Some(model.to_owned());
+                    seen.launch_base = None;
+                    seen.launch_resumed_from = None;
+                    seen.launch_resumed_pr = None;
+                    launch_pull_request = None;
                 }
                 if let Some(sending) = parse_gate_sending(step) {
                     seen.sending = Some(sending);
@@ -3661,8 +3667,8 @@ mod tests {
         #[test]
         fn reads_the_launch_decisions_and_the_gate_steps() {
             let seen = seen_of(&[
-                step(1, "launch-base release"),
-                step(2, "launch-model claude-x"),
+                step(1, "launch-model claude-x"),
+                step(2, "launch-base release"),
                 step(3, "approval-rechecked"),
                 step(4, "gate-sending 1 2"),
                 step(5, "gate-sending 1"),
