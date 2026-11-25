@@ -604,6 +604,7 @@ mod tests {
             OtherKind::Failed,
             &[
                 "POST \"https://api.github.com/graphql\": EOF",
+                "get \"https://api.github.com\": EOF",
                 "Post \"https://api.github.com/graphql\"",
                 "Get \"ftp://example.com\": EOF",
                 "Post https://api.github.com/graphql: EOF",
