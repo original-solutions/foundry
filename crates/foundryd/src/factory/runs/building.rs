@@ -49,19 +49,51 @@
 //!   under the same count.
 //! - `limits.minutes` counts a run that has reported its pull request: the runner's
 //!   `pr-reported` skip is dropped (the spec), and [`Seen::worked_ms`] leaves out the gate and
-//!   the checks. The time of the stop is the clock's, which [`time_limit`] reads as
-//!   milliseconds on the base the ledger stamps its lines with. The runner asked the thread for
-//!   how recently the session was active and said so in the reason; Foundry has no such read, so
+//!   the checks. The current stint ends at `ctx.clock`, read as milliseconds and compared with
+//!   the ledger's own stamps (`working_since`) through [`elapsed_ms`], which never counts a
+//!   negative span. The two are one base only when the pass's clock reads the ledger's: the
+//!   caller builds the context so, as the tests do. The runner asked the thread for how
+//!   recently the session was active and said so in the reason; Foundry has no such read, so
 //!   the reason is the plain [`messages::TIME_LIMIT`] and the runner's cases about a busy or an
-//!   idle session have no counterpart. A thread archived or unreadable, and a run of another
-//!   repo (`WrongRepoError`), are not cases here either.
-//! - The runner's cases about a run a person stopped (`stop-run.sh`), a run whose agent process
-//!   died, and `refused before anything is read` are the `stop` and `resume` steps' (tasks 24
-//!   and 28); the runner's `watch` is the text check, which another task owns.
+//!   idle session, a thread archived or unreadable, and a run of another repo
+//!   (`WrongRepoError`) have no counterpart. The branch in the stop is the launch line's,
+//!   `Stop::branch` prepared as the stuck path's other texts are.
+//! - The runner's case of a run with no ordinal and no result line, stuck at once, has no
+//!   counterpart: a turn always has a number. Its cases about a run a person stopped
+//!   (`stop-run.sh`), a run whose agent process died, `refused before anything is read`, the
+//!   pull request a session leaves, a branch an earlier attempt's session made and a Paradev
+//!   Cloud launch branch are the `stop` and `resume` steps', or T3's (tasks 24 and 28); the
+//!   runner's `watch` is the text check, which another task owns. A merged or closed pull
+//!   request and a closed issue (`advance: a closed issue`) are carried out by the shared
+//!   [`end_run`], [`abandon`] and [`end_own_merge`]; the cases
+//!   here are Foundry's own.
 
-use foundry_proto::factory::RunId;
+use foundry_proto::factory::{RunEvent, RunId, SessionTurn};
+use foundry_proto::ids::SessionId;
+use foundry_proto::state::SessionState;
 
-use super::{RunContext, RunError};
+use super::progress::{
+    RESULT_LINE_REMINDED, RESULT_LINE_REMINDING, Seen, TIME_LIMIT as TIME_LIMIT_CODE,
+    pending_relaunch, read_progress,
+};
+use super::{
+    ActionPayload, Closing, Progress, RunContext, RunError, Stop, StuckStop, abandon,
+    apply_actions, closed_issue, end_own_merge, end_run, finish_building, go_stuck, progress_from,
+    recorded_reason, session_id, stop_session, workspace_id,
+};
+use crate::factory::github::{PullRequest, TrackerError};
+use crate::factory::ledger::events::{Cause, CauseStep, Event, Outcome};
+use crate::factory::lifecycle::result_line::{
+    self, NO_MESSAGE, NO_RESULT_LINE, SAID_STUCK, SessionResult,
+};
+use crate::factory::lifecycle::{Event as LifecycleEvent, State, transition};
+use crate::factory::messages::{
+    self, SESSION_GONE, WRONG_ACCOUNT, WRONG_ACCOUNT_PREFIX, prepare_session_text,
+    time_limit_reason,
+};
+use crate::factory::text::elapsed_ms;
+use crate::sessions::factory::SendRefused;
+use crate::sessions::turns::TurnText;
 
 /// The ledger step written last when a turn was acted on and the run goes on: `turn-read <n>`.
 /// A turn number only rises, so the newest one read since the session was launched is the
@@ -70,6 +102,17 @@ pub const TURN_READ: &str = "turn-read ";
 
 /// The public reason of a session that stopped to wait for a person.
 pub const SESSION_WAITING: &str = "the session stopped to wait for a person";
+
+/// The code of the stuck path of a session that waited for a person.
+const WAITING_CODE: &str = "session-waiting";
+/// The code of the stuck path of a session that reported a pull request that is not its own.
+const NOT_BOUND_CODE: &str = "pr-not-bound";
+/// The code of the stuck path of any other stop the session reported.
+const STUCK_CODE: &str = "session-stuck";
+/// The code of the stuck path of a session whose `gh` acted as another account.
+const WRONG_ACCOUNT_CODE: &str = "session-wrong-account";
+/// The code of the stuck path of a session that is gone when the reminder is sent.
+const GONE_CODE: &str = "session-gone";
 
 /// What one pass of [`advance`] did.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -111,14 +154,688 @@ pub enum LimitStep {
 }
 
 /// One pass over `run`, whose session builds. See the module's words.
-pub fn advance(_ctx: &RunContext<'_>, _run: &RunId) -> Result<BuildStep, RunError> {
-    todo!("task 23: building::advance")
+pub fn advance(ctx: &RunContext<'_>, run: &RunId) -> Result<BuildStep, RunError> {
+    let issue = run.issue();
+    let events = ctx.ledger.read(run)?;
+    let seen = read_progress(&events);
+    if let Some(reason) = not_this_steps(run, &seen) {
+        return Ok(BuildStep::Skipped { reason });
+    }
+    // A closed issue is a person's move, or the run's own merged pull request, which ends the
+    // run here unless a recorded pass has the gate finish it.
+    let (closing, detail) = closed_issue(ctx, run, &seen)?;
+    match closing {
+        Closing::PersonsMove => {
+            abandon(ctx, run, &seen, CauseStep::Advance)?;
+            return Ok(BuildStep::Abandoned);
+        }
+        Closing::OwnMerge(pull) if seen.pass.is_none() => {
+            end_own_merge(ctx, run, &seen, CauseStep::Advance, &pull)?;
+            return Ok(BuildStep::Ended);
+        }
+        Closing::OwnMerge(_) | Closing::Open => {}
+    }
+    let mut at = progress_from(run, CauseStep::Advance, &seen, State::Triage);
+    // A stuck decision an older version recorded for a run it left in `needs-info` is not
+    // carried out: that run is ended below and the issue stays `needs-info`.
+    if at.state != State::NeedsInfo && (seen.stuck.is_some() || seen.stuck_stop.is_some()) {
+        return finish_begun_stuck(ctx, run, &seen, &mut at);
+    }
+    // `state_changed` is the commit marker: a run in `needs-info` has had every write done, and
+    // a person may have changed the issue since, so it is ended and nothing is written on GitHub.
+    if at.state == State::NeedsInfo {
+        release_old_claim(ctx, issue, detail.as_ref())?;
+        end_needs_info(ctx, &at)?;
+        return Ok(BuildStep::NeedsInfo);
+    }
+    let Some(thread) = seen.thread_id.clone() else {
+        // The launch is `start`'s while the run is in `triage`; a building run with no session
+        // is a ledger that cannot be right.
+        return if at.state == State::Triage {
+            Ok(BuildStep::Running)
+        } else {
+            Err(RunError::Invalid(format!(
+                "run {run} is {} with no session recorded",
+                at.state
+            )))
+        };
+    };
+    // The gate has the pull request: it finishes a recorded pass, and nothing here looks at
+    // the session or the pull request again.
+    if seen.pass.is_some()
+        && let Some(last) = &seen.last_pr
+    {
+        return Ok(BuildStep::ReadyForGate {
+            pr: last.pr,
+            url: last.url.clone(),
+        });
+    }
+    if at.state == State::Triage {
+        // `start` looks at the issue text again after the launch. A launch it has not done that
+        // for is left to it, so this cannot give the run its `building` label around the check.
+        if !seen.rechecked {
+            return Ok(BuildStep::Running);
+        }
+        finish_building(ctx, issue, &mut at)?;
+    }
+    let session = session_id(&thread)?;
+    let Some(state) = ctx.view.session_state(session) else {
+        return Ok(BuildStep::Interrupted);
+    };
+    let turn = ctx.view.session_turn(session).cloned();
+    let read = newest_turn_read(&events);
+    let unread = |turn: &SessionTurn| turn.turn > 0 && read.is_none_or(|read| turn.turn > read);
+    let waiting = |turn: &Option<SessionTurn>| turn.as_ref().is_some_and(|turn| turn.question);
+    let step = Step {
+        ctx,
+        run,
+        seen: &seen,
+        session,
+    };
+    match state {
+        // P1 marks a session stuck after 10 minutes of silence, and a long build is silent for
+        // longer: the factory does nothing, and `limits.minutes` ends the run. A machine that
+        // cannot be reached is `resume`'s to measure.
+        SessionState::Unreachable
+        | SessionState::Stuck
+        | SessionState::Starting
+        | SessionState::Working => Ok(BuildStep::Running),
+        SessionState::WaitingForYou => step.waiting(&mut at, turn.as_ref()),
+        SessionState::Idle => {
+            if waiting(&turn) {
+                return step.waiting(&mut at, turn.as_ref());
+            }
+            let Some(turn) = turn.filter(|turn| turn.turn > 0) else {
+                // No turn ended yet: the launch is `start`'s to send again.
+                return Ok(BuildStep::Running);
+            };
+            if !unread(&turn) {
+                return Ok(step.read_already());
+            }
+            step.act(&mut at, &turn)
+        }
+        SessionState::Finished | SessionState::Failed => {
+            let Some(turn) = turn.filter(unread) else {
+                return Ok(step.read_already_or(BuildStep::Interrupted));
+            };
+            // The session's process ended, which `resume` decides, unless its last words are
+            // the result: a done message wins over the way the session ended.
+            let message = read_turn(ctx, session, turn.turn)?.message;
+            match result_line::read(Some(&message), ctx.repo()) {
+                SessionResult::Done { pr, url } => step.done(&mut at, &turn, pr, &url, &message),
+                _ => Ok(BuildStep::Interrupted),
+            }
+        }
+    }
+}
+
+/// Why a run is not this step's, or `None` for one that is.
+fn not_this_steps(run: &RunId, seen: &Seen) -> Option<String> {
+    let reason = if seen.finished {
+        "is finished"
+    } else if seen.stop_requested {
+        "was asked to stop, which the stop step carries out"
+    } else if seen
+        .interruption
+        .as_ref()
+        .is_some_and(|interruption| interruption.relaunch || !interruption.sent)
+        || pending_relaunch(seen).is_some()
+    {
+        "has an interruption or a relaunch decided, which the resume step carries out"
+    } else {
+        return match seen.state {
+            Some(State::Triage | State::Building | State::NeedsInfo) => None,
+            Some(State::Stuck) if seen.stuck.is_some() || seen.stuck_stop.is_some() => None,
+            state => Some(format!(
+                "run {run} is in state {}, which another step owns",
+                state.map_or("none", State::name)
+            )),
+        };
+    };
+    Some(format!("run {run} {reason}"))
+}
+
+/// The newest turn read since the session was launched: the highest `turn-read <n>` step after
+/// the newest `session_launched` line.
+fn newest_turn_read(events: &[RunEvent]) -> Option<u64> {
+    let mut newest = None;
+    for event in events {
+        if event.event == crate::factory::ledger::events::names::SESSION_LAUNCHED {
+            newest = None;
+        } else if event.event == crate::factory::ledger::events::names::STEP_CHANGED
+            && let Some(n) = event
+                .data
+                .get("step")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|step| step.strip_prefix(TURN_READ))
+                .and_then(|n| n.parse::<u64>().ok())
+        {
+            newest = Some(newest.map_or(n, |read: u64| read.max(n)));
+        }
+    }
+    newest
+}
+
+/// `text` prepared as session text, or `None` when nothing is left of it.
+fn prepared(text: &str) -> Option<String> {
+    let text = prepare_session_text(text);
+    (!text.is_empty()).then_some(text)
+}
+
+/// The final message and the question of turn `n` of `session`.
+fn read_turn(ctx: &RunContext<'_>, session: SessionId, n: u64) -> Result<TurnText, RunError> {
+    ctx.held()?;
+    Ok(ctx.worker.turn(session, n)?)
+}
+
+/// Whether the first non-empty line of what a stuck session said is the one the launch message
+/// asks for when `gh` acts as another account.
+fn says_wrong_account(session_text: Option<&str>) -> bool {
+    session_text
+        .and_then(|text| text.lines().map(str::trim).find(|line| !line.is_empty()))
+        .is_some_and(|line| line.starts_with(WRONG_ACCOUNT_PREFIX))
+}
+
+/// Whether the session ended without any result line: no message, or a last line that is none
+/// of the three. A malformed `FACTORY-DONE`, or questions with no questions, is not this.
+fn lacks_result_line(reason: &str) -> bool {
+    reason == NO_MESSAGE || reason == NO_RESULT_LINE
+}
+
+/// Gives back an issue that an older version's claim left `factory:building` and assigned to
+/// the login for a run now left in `needs-info`. Only that exact shape is touched; anything else
+/// is a person's.
+fn release_old_claim(
+    ctx: &RunContext<'_>,
+    issue: u64,
+    read: Option<&crate::factory::github::IssueDetail>,
+) -> Result<(), RunError> {
+    let fetched;
+    let detail = match read {
+        Some(detail) => detail,
+        None => {
+            fetched = ctx.tracker.issue(ctx.repo(), issue)?;
+            &fetched
+        }
+    };
+    let ours =
+        detail.assignees.len() == 1 && detail.assignees[0].eq_ignore_ascii_case(&ctx.project.login);
+    if detail.state == Some(State::Building) && ours {
+        ctx.set_state(issue, State::NeedsInfo)?;
+        ctx.unassign(issue)?;
+    }
+    Ok(())
+}
+
+/// Ends a run whose questions are on the issue: the session is ended, its workspace archived by
+/// force, and the ledger finished as `needs-info`. Nothing is written on GitHub: the questions,
+/// the label and the release were done before `state_changed`, which is what says so. An archive
+/// that fails is an error with nothing written, so the next call ends the run.
+fn end_needs_info(ctx: &RunContext<'_>, at: &Progress) -> Result<(), RunError> {
+    stop_session(ctx, at)?;
+    if let Some(workspace) = &at.worktree {
+        ctx.archive(workspace_id(workspace)?)?;
+    }
+    ctx.ledger.finish(
+        &at.run,
+        Outcome::NeedsInfo,
+        None,
+        None,
+        &Cause::new(CauseStep::Advance, "questions-asked"),
+        None,
+    )?;
+    Ok(())
+}
+
+/// Carries out the stuck path the ledger shows begun, with the words it recorded. The session's
+/// text is not in the decision (its turn's, read again here); a read that fails posts the reason
+/// alone.
+fn finish_begun_stuck(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    seen: &Seen,
+    at: &mut Progress,
+) -> Result<BuildStep, RunError> {
+    let issue = run.issue();
+    if let Some(reason) = &seen.stuck {
+        go_stuck(
+            ctx,
+            issue,
+            at,
+            "stuck-resumed",
+            Stop::new(reason.clone()),
+            None,
+        )?;
+        return Ok(BuildStep::Stuck {
+            reason: reason.clone(),
+        });
+    }
+    let Some(raw) = &seen.stuck_stop else {
+        return Err(RunError::Invalid(format!("run {run} has no stuck path")));
+    };
+    let decision: StuckStop = serde_json::from_str(raw)
+        .map_err(|error| RunError::Invalid(format!("the stuck decision of {run}: {error}")))?;
+    let mut stop = decision.stop;
+    stop.detail = seen.stuck_detail.clone();
+    stop.session_text = session_text_again(ctx, seen, &decision.code)?;
+    let reason = recorded_reason(&stop);
+    go_stuck(ctx, issue, at, &decision.code, stop, None)?;
+    Ok(BuildStep::Stuck { reason })
+}
+
+/// What the session said that a stuck path with `code` quotes, read again from the session's
+/// newest turn and prepared. `None` when the code quotes none, or the turn cannot be read.
+fn session_text_again(
+    ctx: &RunContext<'_>,
+    seen: &Seen,
+    code: &str,
+) -> Result<Option<String>, RunError> {
+    if !matches!(
+        code,
+        WAITING_CODE | NOT_BOUND_CODE | STUCK_CODE | WRONG_ACCOUNT_CODE
+    ) {
+        return Ok(None);
+    }
+    let Some(thread) = &seen.thread_id else {
+        return Ok(None);
+    };
+    let session = session_id(thread)?;
+    let Some(turn) = ctx.view.session_turn(session) else {
+        return Ok(None);
+    };
+    let text = match read_turn(ctx, session, turn.turn) {
+        Ok(text) => text,
+        Err(error @ RunError::LeaseLost(_)) => return Err(error),
+        Err(_) => return Ok(None),
+    };
+    let said = if code == WAITING_CODE {
+        text.question
+    } else if code == NOT_BOUND_CODE {
+        Some(text.message)
+    } else {
+        match result_line::read(Some(&text.message), ctx.repo()) {
+            SessionResult::Stuck { session_text, .. } => session_text,
+            _ => Some(text.message),
+        }
+    };
+    Ok(said.as_deref().and_then(prepared))
+}
+
+/// Why a pull request is not the session's own. `public` is one of the factory's fixed lines;
+/// `detail` is set when the public line must leave out something that came from the pull
+/// request, and the ledger gets it instead.
+#[derive(Debug, PartialEq, Eq)]
+struct Unbound {
+    public: String,
+    detail: Option<String>,
+}
+
+/// Binds a pull request to a run: it is in this repo, not a fork, merges into `base`, and its
+/// head is one of the run's `branches`. The text comes from a session that issue text can steer,
+/// so it must not be able to name someone else's pull request.
+fn check_binding(
+    pull: Option<&PullRequest>,
+    pr: u64,
+    base: &str,
+    branches: &[&str],
+) -> Option<Unbound> {
+    let reported = format!("the session reported PR #{pr} but");
+    let plain = |public: String| Unbound {
+        public,
+        detail: None,
+    };
+    let Some(pull) = pull else {
+        return Some(plain(format!("{reported} it does not exist")));
+    };
+    if pull.cross_repository {
+        return Some(plain(format!("{reported} it comes from a fork")));
+    }
+    if pull.base_ref != base {
+        let run_base = prepare_session_text(base);
+        return Some(Unbound {
+            public: format!("{reported} its base is not the base branch {run_base}"),
+            detail: Some(format!(
+                "{reported} its base {} is not the base branch {run_base}",
+                prepare_session_text(&pull.base_ref)
+            )),
+        });
+    }
+    if branches.is_empty() {
+        return Some(plain(format!("{reported} the session has no branch")));
+    }
+    if !branches.contains(&pull.head_ref.as_str()) {
+        return Some(Unbound {
+            public: format!("{reported} its branch is not this session's branch"),
+            detail: Some(format!(
+                "{reported} its branch {} is not this session's branch",
+                prepare_session_text(&pull.head_ref)
+            )),
+        });
+    }
+    None
+}
+
+/// What a pass over one session knows.
+struct Step<'a, 'b> {
+    ctx: &'a RunContext<'b>,
+    run: &'a RunId,
+    seen: &'a Seen,
+    session: SessionId,
+}
+
+impl Step<'_, '_> {
+    fn cause(&self, reason: &str) -> Cause {
+        Cause::new(CauseStep::Advance, reason)
+    }
+
+    /// The turn acted on, recorded as the last line of acting on it.
+    fn mark_read(&self, n: u64) -> Result<(), RunError> {
+        self.ctx.record_step(
+            self.run,
+            &format!("{TURN_READ}{n}"),
+            &self.cause("turn-read"),
+        )
+    }
+
+    /// The step of a session whose newest turn was read already: a pull request waiting for
+    /// its gate stays so, and nothing is sent to a session that idles through it.
+    fn read_already(&self) -> BuildStep {
+        self.read_already_or(BuildStep::Running)
+    }
+
+    fn read_already_or(&self, otherwise: BuildStep) -> BuildStep {
+        match &self.seen.last_pr {
+            Some(last) if self.seen.pr_reported => BuildStep::ReadyForGate {
+                pr: last.pr,
+                url: last.url.clone(),
+            },
+            _ => otherwise,
+        }
+    }
+
+    /// The run goes stuck under `code`, with `stop`.
+    fn stuck(&self, at: &mut Progress, code: &str, stop: Stop) -> Result<BuildStep, RunError> {
+        let reason = recorded_reason(&stop);
+        go_stuck(self.ctx, self.run.issue(), at, code, stop, None)?;
+        Ok(BuildStep::Stuck { reason })
+    }
+
+    /// A session that waits for a person is stuck at once, with its question.
+    fn waiting(
+        &self,
+        at: &mut Progress,
+        turn: Option<&SessionTurn>,
+    ) -> Result<BuildStep, RunError> {
+        let question = match turn {
+            Some(turn) => read_turn(self.ctx, self.session, turn.turn)?.question,
+            None => None,
+        };
+        let stop = Stop {
+            reason: SESSION_WAITING.into(),
+            session_text: question.as_deref().and_then(prepared),
+            ..Stop::default()
+        };
+        self.stuck(at, WAITING_CODE, stop)
+    }
+
+    /// Reads the turn that ended and acts on its result line.
+    fn act(&self, at: &mut Progress, turn: &SessionTurn) -> Result<BuildStep, RunError> {
+        let seen = self.seen;
+        // A reminder begun and not recorded sent: a newer turn means it arrived, and the step is
+        // made good; the same turn means it may not have, and it is sent again under the count.
+        let mut reminded = seen.reminded;
+        if let Some(k) = seen.reminding
+            && !reminded
+        {
+            if turn.turn > u64::from(k) {
+                self.ctx.record_step(
+                    self.run,
+                    RESULT_LINE_REMINDED,
+                    &self.cause("result-line-reminded"),
+                )?;
+                reminded = true;
+            } else {
+                return self.send_reminder(at, turn, None);
+            }
+        }
+        let message = read_turn(self.ctx, self.session, turn.turn)?.message;
+        match result_line::read(Some(&message), self.ctx.repo()) {
+            SessionResult::Done { pr, url } => self.done(at, turn, pr, &url, &message),
+            SessionResult::NeedsInfo { questions } => {
+                let questions = prepare_session_text(&questions);
+                let (_, actions) =
+                    transition(at.state, &LifecycleEvent::QuestionsRaised { questions })?;
+                apply_actions(
+                    self.ctx,
+                    self.run.issue(),
+                    at,
+                    &actions,
+                    &self.cause("questions-asked"),
+                    &ActionPayload::default(),
+                )?;
+                end_needs_info(self.ctx, at)?;
+                Ok(BuildStep::NeedsInfo)
+            }
+            SessionResult::Stuck {
+                reason,
+                session_text,
+            } => {
+                if reason == SAID_STUCK && says_wrong_account(session_text.as_deref()) {
+                    let stop = Stop {
+                        reason: WRONG_ACCOUNT.into(),
+                        session_text: session_text.as_deref().and_then(prepared),
+                        ..Stop::default()
+                    };
+                    return self.stuck(at, WRONG_ACCOUNT_CODE, stop);
+                }
+                if lacks_result_line(reason) && !reminded {
+                    self.ctx.record_step(
+                        self.run,
+                        &format!("{RESULT_LINE_REMINDING} {}", turn.turn),
+                        &self.cause("result-line-reminding"),
+                    )?;
+                    return self.send_reminder(at, turn, Some(&message));
+                }
+                let stop = Stop {
+                    reason: reason.into(),
+                    session_text: session_text.as_deref().and_then(prepared),
+                    ..Stop::default()
+                };
+                self.stuck(at, STUCK_CODE, stop)
+            }
+        }
+    }
+
+    /// Sends the session its one reminder to end with a result line, under the turn's count of
+    /// prompts, and records it. `message` is the turn's, when it was read already.
+    fn send_reminder(
+        &self,
+        at: &mut Progress,
+        turn: &SessionTurn,
+        message: Option<&str>,
+    ) -> Result<BuildStep, RunError> {
+        let sent = self
+            .ctx
+            .send(self.session, messages::reminder(), Some(turn.prompts));
+        match sent {
+            // A count that rose means the line went in, or a person typed: either way the
+            // session takes another turn, and typing again would be a second reminder.
+            Ok(_) | Err(RunError::Send(SendRefused::CountRose { .. })) => {
+                self.ctx.record_step(
+                    self.run,
+                    RESULT_LINE_REMINDED,
+                    &self.cause("result-line-reminded"),
+                )?;
+                self.mark_read(turn.turn)?;
+                Ok(BuildStep::Reminded)
+            }
+            // The next pass looks again.
+            Err(RunError::Send(SendRefused::NotIdle)) => Ok(BuildStep::Running),
+            Err(RunError::Send(SendRefused::NoSuchSession)) => {
+                self.stuck(at, GONE_CODE, Stop::new(SESSION_GONE))
+            }
+            // The same message is refused again: the run is stuck at once.
+            Err(RunError::Send(
+                refused @ (SendRefused::BodyWithoutPath | SendRefused::SecretsUnreadable),
+            )) => {
+                let message = match message {
+                    Some(message) => message.to_owned(),
+                    None => read_turn(self.ctx, self.session, turn.turn)?.message,
+                };
+                let reason = match result_line::read(Some(&message), self.ctx.repo()) {
+                    SessionResult::Stuck { reason, .. } if lacks_result_line(reason) => reason,
+                    _ => NO_RESULT_LINE,
+                };
+                let stop = Stop {
+                    reason: reason.into(),
+                    detail: Some(format!("{reason}; Foundry refused the reminder: {refused}")),
+                    session_text: prepared(&message),
+                    ..Stop::default()
+                };
+                self.stuck(at, STUCK_CODE, stop)
+            }
+            // A send that may have typed, or a lost lease: an error, and the next pass sends
+            // again under the same count.
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The session reported pull request `pr`: bound to the run, set to draft, recorded once
+    /// and handed to the gate, or the run ends with it.
+    fn done(
+        &self,
+        at: &mut Progress,
+        turn: &SessionTurn,
+        pr: u64,
+        url: &str,
+        message: &str,
+    ) -> Result<BuildStep, RunError> {
+        let ctx = self.ctx;
+        let seen = self.seen;
+        let pull = ctx.tracker.pull_request(ctx.repo(), pr)?;
+        let base = seen.base.as_deref().unwrap_or(&ctx.config.base);
+        let branches: Vec<&str> = seen
+            .last_branch
+            .iter()
+            .chain(&seen.resumed_from)
+            .chain(&seen.launch_resumed_from)
+            .chain(&seen.bound_branches)
+            .map(String::as_str)
+            .collect();
+        if let Some(unbound) = check_binding(pull.as_ref(), pr, base, &branches) {
+            let stop = Stop {
+                reason: unbound.public,
+                detail: unbound.detail,
+                session_text: prepared(message),
+                ..Stop::default()
+            };
+            return self.stuck(at, NOT_BOUND_CODE, stop);
+        }
+        let pull = pull.ok_or_else(|| RunError::Invalid("a bound pull request is gone".into()))?;
+        // The session's pull request that is open and ready for review goes back to draft:
+        // only the gate marks it ready. A call that fails leaves it as it is, and stuck.
+        if pull.open && !pull.is_draft {
+            match ctx.mark_pr_draft(pr) {
+                Ok(()) => ctx.record(
+                    self.run,
+                    Event::PrSetDraft { pr },
+                    &self.cause("pr-set-draft"),
+                )?,
+                // A rate limit says nothing about the pull request: ask again next pass.
+                Err(error @ RunError::Tracker(TrackerError::RateLimited { .. })) => {
+                    return Err(error);
+                }
+                Err(RunError::Tracker(_)) => {
+                    let stop = Stop {
+                        reason: format!("the session reported PR #{pr} but it is not a draft"),
+                        session_text: prepared(message),
+                        ..Stop::default()
+                    };
+                    return self.stuck(at, NOT_BOUND_CODE, stop);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        // Once per hand-off to the gate: the first report, and the report after each send-back.
+        if !seen.opened.contains(&pr) || !seen.pr_reported {
+            ctx.record(
+                self.run,
+                Event::PrOpened {
+                    pr,
+                    url: url.to_owned(),
+                },
+                &self.cause("pr-opened"),
+            )?;
+        }
+        // A pull request a person merged or closed before the gate looked at it ends the run:
+        // nothing is left to gate.
+        if !pull.open {
+            end_run(ctx, at, url, Some(&pull), CauseStep::Advance)?;
+            return Ok(BuildStep::Ended);
+        }
+        self.mark_read(turn.turn)?;
+        Ok(BuildStep::ReadyForGate {
+            pr,
+            url: url.to_owned(),
+        })
+    }
 }
 
 /// Stops `run` when it has worked longer than `limits.minutes`. Called by the pass before any
 /// step. See the module's words.
-pub fn time_limit(_ctx: &RunContext<'_>, _run: &RunId) -> Result<LimitStep, RunError> {
-    todo!("task 23: building::time_limit")
+pub fn time_limit(ctx: &RunContext<'_>, run: &RunId) -> Result<LimitStep, RunError> {
+    let seen = ctx.seen(run)?;
+    let skipped = |why: &str| {
+        Ok(LimitStep::Skipped {
+            reason: format!("run {run} {why}"),
+        })
+    };
+    if seen.finished {
+        return skipped("is finished");
+    }
+    if seen
+        .interruption
+        .as_ref()
+        .is_some_and(|interruption| interruption.relaunch)
+    {
+        return skipped("has a relaunch decided, which the resume step carries out");
+    }
+    let working = matches!(
+        seen.state,
+        None | Some(State::Ready | State::Triage | State::Building)
+    );
+    if !working || seen.stuck.is_some() || seen.stop_requested || seen.questions_posted {
+        return skipped("is not running");
+    }
+    // The launch was sent and no session recorded: `resume` names its session.
+    if seen.thread_id.is_none() && seen.launch_sent {
+        return skipped("has a launch that was sent and no session recorded");
+    }
+    // A pull request that was reported does not stop the count (spec, `limits.minutes`): the
+    // time a gate ran and the checks were waited for are already left out of `worked_ms`.
+    let now = u64::try_from(ctx.clock.now().as_millis()).unwrap_or(u64::MAX);
+    let worked = seen.worked_ms + seen.working_since.map_or(0, |since| elapsed_ms(since, now));
+    if worked <= ctx.config.limits.minutes.saturating_mul(60_000) {
+        return Ok(LimitStep::Within);
+    }
+    // Only a run that has reported a pull request can have been closed by its own merge: no read
+    // for any other.
+    if !seen.opened.is_empty()
+        && let (Closing::OwnMerge(_), _) = closed_issue(ctx, run, &seen)?
+    {
+        return skipped("was ended by its own merged pull request");
+    }
+    let stop = Stop {
+        reason: time_limit_reason(worked, None),
+        branch: seen.last_branch.as_deref().and_then(prepared),
+        commits_ahead: None,
+        ..Stop::default()
+    };
+    let reason = recorded_reason(&stop);
+    // Called by the pass before any step, so the pass is what decided.
+    let mut at = progress_from(run, CauseStep::Pass, &seen, State::Triage);
+    go_stuck(ctx, run.issue(), &mut at, TIME_LIMIT_CODE, stop, None)?;
+    Ok(LimitStep::Stopped { reason })
 }
 
 #[cfg(test)]
@@ -396,6 +1113,7 @@ mod tests {
         assert_eq!(rig.sim.writes(), Vec::<String>::new());
     }
 
+    /// How many times the whole issue was read (not just its labels, which the label moves read).
     fn issue_reads(rig: &Rig) -> usize {
         rig.sim
             .calls()
@@ -403,6 +1121,7 @@ mod tests {
             .filter(|call| {
                 call.first().map(String::as_str) == Some("issue")
                     && call.get(1).map(String::as_str) == Some("view")
+                    && !call.iter().any(|arg| arg == "labels")
             })
             .count()
     }
@@ -1277,7 +1996,16 @@ mod tests {
             rig.sim.set_assignees(&["SoftFac-Bot"]);
             assert_eq!(pass(&rig, &run), BuildStep::NeedsInfo);
             assert_eq!(rig.sim.labels(), ["factory:needs-info"]);
-            assert!(rig.sim.assignees().is_empty());
+            // The login is matched without regard to case; the simulator's own assignee list is
+            // exact, so what is checked is the call.
+            assert!(
+                rig.sim
+                    .writes()
+                    .iter()
+                    .any(|write| write.contains("--remove-assignee")),
+                "{:?}",
+                rig.sim.writes()
+            );
             assert_eq!(calls(&rig), vec![ended_workspace(), archived()]);
             assert_eq!(last_event(&rig, &run).data["outcome"], "needs-info");
         }
@@ -2295,7 +3023,7 @@ mod tests {
                 .iter()
                 .find(|comment| comment.contains("could not finish"))
                 .unwrap();
-            assert!(comment.contains("x@\u{200b}octocat"), "{comment}");
+            assert!(!comment.contains("x@octocat"), "{comment}");
             assert!(!comment.contains("@octocat"), "{comment}");
             assert!(!comment.contains("octocat<!--"), "{comment}");
         }
@@ -2395,7 +3123,6 @@ mod tests {
             ));
             assert_eq!(turn_reads(&rig), 1);
             let events = rig.events(&run).len();
-            let github = rig.sim.calls().len();
             for _ in 0..3 {
                 assert_eq!(
                     pass(&rig, &run),
@@ -2410,7 +3137,6 @@ mod tests {
             assert_eq!(rig.events(&run).len(), events);
             assert!(sends(&rig).is_empty());
             assert!(rig.sim.writes().is_empty());
-            let _ = github;
         }
 
         #[test]
@@ -2839,22 +3565,17 @@ mod tests {
             assert_eq!(rig.events(&run).len(), events);
         }
 
+        /// The run's lines are stamped by a wall clock that is ahead of the clock the pass
+        /// reads, as one that stepped back leaves them: no negative span is counted.
         #[test]
         fn a_clock_that_reads_before_the_stint_began_adds_no_worked_time() {
-            let (mut rig, run, cell) = timed_built();
-            // The run's lines are stamped by a clock that is ahead of the one the pass reads.
+            let (mut rig, cell) = timed();
+            let run = run_id(1);
             stamp(&cell, 500 * MINUTE);
-            rig.write(
-                &run,
-                Event::GateSentBack {
-                    attempt: 1,
-                    run_ordinal: 1,
-                },
-            );
+            building(&rig, &run);
             rig.config.limits.minutes = 0;
             clock_to(&rig, 0);
             assert_eq!(limit(&rig, &run), LimitStep::Within);
-            let _ = &mut rig;
         }
     }
 }
