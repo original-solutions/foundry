@@ -152,8 +152,9 @@ impl FleetView {
     /// that owner out. The factory acts on this view, and a view missing one machine's records
     /// would show its workspaces and sessions as never made, so a pass on it would be
     /// half-applied. Such a record is one a newer build wrote, and it stays until this machine
-    /// runs a build that reads it, so every pass fails until then. Each failure logs a warning
-    /// that names the owner, the session or the machine whose record could not be read.
+    /// runs a build that reads it, so every pass fails until then. Any failed read logs a
+    /// warning that names the owner, the session or the machine it was for, with the store's
+    /// error, which tells a record this build cannot parse from a database error.
     pub fn read(
         store: &Store,
         online: BTreeSet<MachineId>,
@@ -167,7 +168,7 @@ impl FleetView {
         machines.extend(store.factory_versions()?.into_keys());
         for &owner in versions.keys() {
             let records = store.since(owner, 0).inspect_err(|error| {
-                tracing::warn!("factory: the records of {owner} cannot be read: {error}");
+                tracing::warn!("factory: reading the records of {owner} failed: {error}");
             })?;
             for record in records {
                 match record {
@@ -184,7 +185,7 @@ impl FleetView {
             let id = session.body.id;
             let turn = store.session_turn(id).inspect_err(|error| {
                 tracing::warn!(
-                    "factory: the turn of session {id} of {} cannot be read: {error}",
+                    "factory: reading the turn of session {id} of {} failed: {error}",
                     session.owner
                 );
             })?;
@@ -194,7 +195,7 @@ impl FleetView {
         }
         for machine in machines {
             let held = store.held(machine).inspect_err(|error| {
-                tracing::warn!("factory: what {machine} holds cannot be read: {error}");
+                tracing::warn!("factory: reading what {machine} holds failed: {error}");
             })?;
             if let Some(held) = held {
                 builder.view.held.insert(machine, held);
