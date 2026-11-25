@@ -1523,8 +1523,37 @@ mod tests {
 
         #[test]
         fn with_a_pull_request_that_is_not_a_draft_and_cannot_be_drafted_is_stuck() {
-            // GitHub says the pull request is not there: the runner's words, "it is not a
-            // draft", for exactly this case.
+            // The runner's case: `gh` fails with status 1 and "boom", and the pull request
+            // reads open and not a draft on the second look: GitHub answered, the call was
+            // refused. The runner's words, "it is not a draft".
+            let (mut rig, run) = built();
+            rig.sim
+                .set_pull(12, pull("OPEN", false, BRANCH, "main", false));
+            let sim = rig.sim.clone();
+            rig.tracker = Hiding::new(
+                Arc::new(Failing(sim, || TrackerError::Other {
+                    kind: crate::factory::github::OtherKind::Failed,
+                    message: "`gh pr ready` exited with status 1: boom".into(),
+                })),
+                Arc::new(|t: &str| t.into()),
+            );
+            end_turn(&mut rig, 1, DONE_MESSAGE);
+            let step = pass(&rig, &run);
+            assert_stuck(
+                &rig,
+                &run,
+                &step,
+                "pr-not-bound",
+                "the session reported PR #12 but it is not a draft",
+                None,
+                Some(DONE_MESSAGE),
+            );
+        }
+
+        /// `NotFound` from the call reads the pull request again, as `Failed` does.
+        #[test]
+        fn with_a_not_found_on_putting_it_back_to_draft_and_the_pull_request_still_not_a_draft_is_stuck()
+         {
             let (mut rig, run) = built();
             rig.sim
                 .set_pull(12, pull("OPEN", false, BRANCH, "main", false));
@@ -1550,6 +1579,92 @@ mod tests {
             );
         }
 
+        /// A tracker whose call to put the pull request back to draft fails, after which the
+        /// pull request reads as `after`: gone (`None`), or GitHub is down for the read.
+        struct AfterFailure {
+            sim: Arc<Sim>,
+            failed: std::sync::atomic::AtomicBool,
+            gone: bool,
+        }
+
+        impl Tracker for AfterFailure {
+            fn gh(&self, args: &[String]) -> Result<String, TrackerError> {
+                use std::sync::atomic::Ordering;
+                if args.iter().any(|arg| arg == "--undo") {
+                    self.failed.store(true, Ordering::SeqCst);
+                    return Err(TrackerError::Other {
+                        kind: crate::factory::github::OtherKind::Failed,
+                        message: "`gh pr ready` failed: HTTP 502: Bad Gateway".into(),
+                    });
+                }
+                if self.failed.load(Ordering::SeqCst) && args.iter().any(|arg| arg == "view") {
+                    return Err(TrackerError::Other {
+                        kind: crate::factory::github::OtherKind::Failed,
+                        message: if self.gone {
+                            "`gh pr view` failed: Could not resolve to a PullRequest".into()
+                        } else {
+                            "`gh pr view` failed: HTTP 502: Bad Gateway".into()
+                        },
+                    });
+                }
+                self.sim.gh(args)
+            }
+        }
+
+        fn after_failure(rig: &mut Rig, gone: bool) {
+            rig.sim
+                .set_pull(12, pull("OPEN", false, BRANCH, "main", false));
+            rig.tracker = Hiding::new(
+                Arc::new(AfterFailure {
+                    sim: rig.sim.clone(),
+                    failed: std::sync::atomic::AtomicBool::new(false),
+                    gone,
+                }),
+                Arc::new(|t: &str| t.into()),
+            );
+        }
+
+        /// GitHub is down for the second look too: an error with nothing more written, and the
+        /// next pass, with GitHub back, goes on.
+        #[test]
+        fn with_a_failure_on_putting_it_back_to_draft_whose_second_look_fails_is_an_error_not_stuck()
+         {
+            let (mut rig, run) = built();
+            after_failure(&mut rig, false);
+            let sim = rig.sim.clone();
+            end_turn(&mut rig, 1, DONE_MESSAGE);
+            let before = rig.events(&run).len();
+            let error = advance(&rig.ctx(), &run).unwrap_err();
+            assert!(matches!(error, RunError::Tracker(_)), "{error}");
+            assert_eq!(rig.events(&run).len(), before);
+            assert_eq!(rig.sim.labels(), ["factory:building"]);
+            rig.tracker = Hiding::new(sim, Arc::new(|t: &str| t.into()));
+            say(&rig, DONE_MESSAGE);
+            assert!(matches!(
+                pass(&rig, &run),
+                BuildStep::ReadyForGate { pr: 12, .. }
+            ));
+        }
+
+        /// The second look finds the pull request gone: stuck with the words `check_binding`
+        /// has for a pull request that does not exist.
+        #[test]
+        fn with_a_failure_on_putting_it_back_to_draft_and_the_pull_request_gone_is_stuck() {
+            let (mut rig, run) = built();
+            after_failure(&mut rig, true);
+            end_turn(&mut rig, 1, DONE_MESSAGE);
+            let step = pass(&rig, &run);
+            assert_stuck(
+                &rig,
+                &run,
+                &step,
+                "pr-not-bound",
+                "the session reported PR #12 but it does not exist",
+                None,
+                Some(DONE_MESSAGE),
+            );
+        }
+
         /// A tracker whose answer to putting a pull request back to draft is `error`, whatever
         /// the pull request says: a transient failure, which is an error and writes nothing.
         struct Failing(Arc<Sim>, fn() -> TrackerError);
@@ -1563,20 +1678,13 @@ mod tests {
             }
         }
 
-        /// The rule: only an answer that says `gh` ran and the pull request cannot be made a
-        /// draft (`OtherKind::Failed`, `NotFound`) is stuck, with the runner's words. A rate
-        /// limit, a timeout, an authentication refusal, `gh` not starting and an answer that
-        /// cannot be read say nothing about the pull request: an error with nothing written, and
-        /// the next pass asks again.
+        /// The rule: a rate limit, a timeout, an authentication refusal, `gh` not starting and an
+        /// answer that cannot be read say nothing about the pull request: an error with nothing
+        /// written, and the next pass asks again. (`gh` failing, and `NotFound`, read the pull
+        /// request again: the tests of those are above.)
         #[test]
-        fn with_a_rate_limit_on_putting_it_back_to_draft_is_an_error_not_stuck() {
-            let transient: [fn() -> TrackerError; 6] = [
-                // A 5xx, a dropped connection, a killed `gh`: `gh` failed, which says nothing
-                // about the pull request.
-                || TrackerError::Other {
-                    kind: crate::factory::github::OtherKind::Failed,
-                    message: "`gh pr ready` failed: HTTP 502: Bad Gateway".into(),
-                },
+        fn with_a_transient_failure_on_putting_it_back_to_draft_is_an_error_not_stuck() {
+            let transient: [fn() -> TrackerError; 5] = [
                 || TrackerError::RateLimited {
                     command: "gh pr ready".into(),
                     stderr: "slow down".into(),
@@ -1623,6 +1731,34 @@ mod tests {
                 ));
                 assert_eq!(names_after(&rig, &run, before)[0], "pr_set_draft");
             }
+        }
+
+        #[test]
+        fn with_a_rate_limit_on_putting_it_back_to_draft_is_an_error_not_stuck() {
+            let (mut rig, run) = built();
+            rig.sim
+                .set_pull(12, pull("OPEN", false, BRANCH, "main", false));
+            let sim = rig.sim.clone();
+            rig.tracker = Hiding::new(
+                Arc::new(Failing(sim.clone(), || TrackerError::RateLimited {
+                    command: "gh pr ready".into(),
+                    stderr: "slow down".into(),
+                })),
+                Arc::new(|t: &str| t.into()),
+            );
+            end_turn(&mut rig, 1, DONE_MESSAGE);
+            let before = rig.events(&run).len();
+            assert!(matches!(
+                advance(&rig.ctx(), &run).unwrap_err(),
+                RunError::Tracker(TrackerError::RateLimited { .. })
+            ));
+            assert_eq!(rig.events(&run).len(), before);
+            rig.tracker = Hiding::new(sim, Arc::new(|t: &str| t.into()));
+            say(&rig, DONE_MESSAGE);
+            assert!(matches!(
+                pass(&rig, &run),
+                BuildStep::ReadyForGate { pr: 12, .. }
+            ));
         }
 
         /// A tracker whose put-back-to-draft lands and whose answer is lost (a 502 after the
@@ -3110,6 +3246,99 @@ mod tests {
                     "result-line-reminded"
                 ]
             );
+        }
+
+        /// A reminder whose send may have typed (it failed) and that a newer turn answered is
+        /// settled: a later send to the session is not refused for it.
+        #[test]
+        fn that_may_have_typed_and_was_answered_by_a_newer_turn_holds_back_nothing_after() {
+            use crate::factory::runs::{ForwardPayload, SendPayload};
+            let (mut rig, run) = built();
+            end_turn(&mut rig, 1, WORKING_MESSAGE);
+            rig.worker.on_send(Err(SendRefused::Failed {
+                reason: "no answer".into(),
+                prompts: Some(1),
+            }));
+            assert!(advance(&rig.ctx(), &run).is_err());
+            end_turn(&mut rig, 2, DONE_MESSAGE);
+            assert!(matches!(
+                pass(&rig, &run),
+                BuildStep::ReadyForGate { pr: 12, .. }
+            ));
+            assert!(
+                rig.steps(&run)
+                    .contains(&"send-typed result-line-reminder 1".to_owned())
+            );
+            assert!(!rig.ctx().seen(&run).unwrap().sends["result-line-reminder 1"].pending());
+            // The gate sends its failure back, and a comment is forwarded: neither is refused.
+            let sent = sends(&rig).len();
+            let mut at = progress_from(
+                &run,
+                CauseStep::Gate,
+                &rig.ctx().seen(&run).unwrap(),
+                State::Building,
+            );
+            let payload = ActionPayload {
+                send: Some(SendPayload {
+                    message: messages::Message {
+                        line: "The gate failed.".into(),
+                        body: None,
+                    },
+                    attempt: 1,
+                    run_ordinal: 1,
+                }),
+                forward: Some(ForwardPayload {
+                    message: messages::Message {
+                        line: "A comment.".into(),
+                        body: None,
+                    },
+                    step: None,
+                }),
+                ..ActionPayload::default()
+            };
+            apply_actions(
+                &rig.ctx(),
+                ISSUE,
+                &mut at,
+                &[crate::factory::lifecycle::Action::SendGateFailure { output: "x".into() }],
+                &Cause::new(CauseStep::Gate, "gate-failed"),
+                &payload,
+            )
+            .unwrap();
+            assert_eq!(sends(&rig).len(), sent + 1);
+        }
+
+        /// The count rose between the view and the send (a person typed): nothing was typed,
+        /// the risen count is recorded, and the next pass sends under it.
+        #[test]
+        fn whose_first_try_finds_the_count_risen_is_sent_under_the_risen_count() {
+            let (mut rig, run) = built();
+            let before = rig.events(&run).len();
+            end_turn(&mut rig, 1, WORKING_MESSAGE);
+            rig.worker.on_send(Err(SendRefused::CountRose { now: 2 }));
+            assert_eq!(pass(&rig, &run), BuildStep::Running);
+            assert_eq!(steps_after(&rig, &run, before), ["result-line-reminding 1"]);
+            // Turn 1 is idle again: the reminder is still owed, under the risen count.
+            assert_eq!(pass(&rig, &run), BuildStep::Reminded);
+            assert_eq!(sends(&rig), vec![reminder_sent(1), reminder_sent(2)]);
+        }
+
+        /// Or the turn the person's prompt led to ends with a result: the begun reminder is
+        /// answered, recorded, and no second send is made.
+        #[test]
+        fn whose_first_try_finds_the_count_risen_and_a_newer_turn_with_a_result_is_not_sent_again()
+        {
+            let (mut rig, run) = built();
+            end_turn(&mut rig, 1, WORKING_MESSAGE);
+            rig.worker.on_send(Err(SendRefused::CountRose { now: 2 }));
+            assert_eq!(pass(&rig, &run), BuildStep::Running);
+            end_turn(&mut rig, 2, DONE_MESSAGE);
+            assert!(matches!(
+                pass(&rig, &run),
+                BuildStep::ReadyForGate { pr: 12, .. }
+            ));
+            assert!(rig.steps(&run).contains(&"result-line-reminded".to_owned()));
+            assert_eq!(sends(&rig), vec![reminder_sent(1)]);
         }
     }
 
