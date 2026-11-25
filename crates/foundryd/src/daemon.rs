@@ -2,7 +2,7 @@
 //! back, starts every long-running module and stops on SIGTERM or SIGINT. The holders are
 //! sessions of their own, so a stopped daemon leaves every terminal's child running.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::future::Future;
@@ -315,7 +315,10 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
         &api.placements,
         clock,
         freshness,
-        Arc::new(FactoryMarks::new(sessions.clone(), &home)),
+        Arc::new(FactoryMarks {
+            sessions: sessions.clone(),
+            workspaces: workspaces.clone(),
+        }),
     );
     let placing = api.clone();
     let attention_routes = attention
@@ -438,20 +441,10 @@ fn attention(
 }
 
 /// What this machine marks as factory work: a session by [`Sessions::is_factory`], a workspace
-/// by the marker file [`Workspaces`] writes beside the folder of one made for the factory.
+/// by [`Workspaces::factory_project`].
 struct FactoryMarks {
     sessions: Arc<Sessions>,
-    workspaces: WorkspaceMarks,
-}
-
-impl FactoryMarks {
-    /// The marks of `sessions`, and of the workspaces under the data directory `home`.
-    fn new(sessions: Arc<Sessions>, home: &Path) -> Self {
-        Self {
-            sessions,
-            workspaces: WorkspaceMarks::new(home),
-        }
-    }
+    workspaces: Arc<Workspaces>,
 }
 
 impl Marks for FactoryMarks {
@@ -460,145 +453,8 @@ impl Marks for FactoryMarks {
     }
 
     fn factory_workspace(&self, workspace: WorkspaceId) -> Option<ProjectId> {
-        self.workspaces.project(workspace)
+        self.workspaces.factory_project(workspace)
     }
-}
-
-/// The factory markers of workspaces, read from `<data dir>/worktrees` once per workspace.
-///
-/// [`Workspaces`] writes a marker before the workspace's record, so once a record is listed
-/// the answer for it is fixed, and it is kept: a project, or none for a workspace with no
-/// marker or one that cannot be parsed. A marker that cannot be read, for any reason but being
-/// absent, is not kept and is read again next time. Each such marker is warned of once.
-struct WorkspaceMarks {
-    worktrees: PathBuf,
-    answered: Mutex<HashMap<WorkspaceId, Option<ProjectId>>>,
-    /// The markers already warned of.
-    warned: Mutex<HashSet<PathBuf>>,
-}
-
-impl WorkspaceMarks {
-    fn new(home: &Path) -> Self {
-        Self {
-            worktrees: home.join("worktrees"),
-            answered: Mutex::default(),
-            warned: Mutex::default(),
-        }
-    }
-
-    /// The project `workspace` is a factory workspace of, if it is one.
-    fn project(&self, workspace: WorkspaceId) -> Option<ProjectId> {
-        let held = self
-            .answered
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&workspace)
-            .copied();
-        if let Some(answer) = held {
-            return answer;
-        }
-        let (answer, bad) = match scan_marker(&self.worktrees, workspace) {
-            Scan::Found(project) => (Some(Some(project)), None),
-            Scan::Absent => (Some(None), None),
-            Scan::Unparseable(path) => (Some(None), Some((path, "cannot be parsed"))),
-            Scan::Unreadable(path) => (None, Some((path, "cannot be read"))),
-        };
-        if let Some((path, what)) = bad {
-            let new = self
-                .warned
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(path.clone());
-            if new {
-                tracing::warn!(marker = %path.display(), "a factory marker {what}");
-            }
-        }
-        if let Some(answer) = answer {
-            self.answered
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(workspace, answer);
-        }
-        answer.flatten()
-    }
-
-    #[cfg(test)]
-    fn warned_count(&self) -> usize {
-        self.warned.lock().unwrap().len()
-    }
-}
-
-/// What a scan for a workspace's marker found.
-#[derive(Debug)]
-enum Scan {
-    Found(ProjectId),
-    /// No project folder holds one.
-    Absent,
-    /// The marker at this path cannot be parsed.
-    Unparseable(PathBuf),
-    /// The marker at this path cannot be read, or this folder or entry cannot be listed: the
-    /// first of them.
-    Unreadable(PathBuf),
-}
-
-/// Looks for `<project id>/<workspace id>.factory` in each folder under `worktrees`, reading
-/// only its `project`. Entries that are not folders are skipped; a marker that cannot be read
-/// in one folder does not stop the look in the others, and is reported only when no other
-/// folder holds the marker.
-fn scan_marker(worktrees: &Path, workspace: WorkspaceId) -> Scan {
-    /// The one field of a workspace's marker this reads.
-    #[derive(serde::Deserialize)]
-    struct Marker {
-        project: ProjectId,
-    }
-    let entries = match std::fs::read_dir(worktrees) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Scan::Absent,
-        Err(_) => return Scan::Unreadable(worktrees.to_path_buf()),
-    };
-    let file = format!("{workspace}.factory");
-    let mut unreadable = None;
-    for entry in entries {
-        let folder = match entry {
-            Ok(folder) => folder,
-            Err(_) => {
-                unreadable.get_or_insert_with(|| worktrees.to_path_buf());
-                continue;
-            }
-        };
-        let is_dir = match folder.file_type() {
-            Ok(kind) => kind.is_dir(),
-            // The type could not be read: ask for the path's metadata before skipping it.
-            Err(_) => match std::fs::metadata(folder.path()) {
-                Ok(meta) => meta.is_dir(),
-                Err(_) => {
-                    unreadable.get_or_insert_with(|| folder.path());
-                    continue;
-                }
-            },
-        };
-        if !is_dir {
-            continue;
-        }
-        let path = folder.path().join(&file);
-        match std::fs::read(&path) {
-            Ok(text) => {
-                return match serde_json::from_slice::<Marker>(&text) {
-                    Ok(marker) => Scan::Found(marker.project),
-                    Err(_) => Scan::Unparseable(path),
-                };
-            }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-                ) => {}
-            Err(_) => {
-                unreadable.get_or_insert(path);
-            }
-        }
-    }
-    unreadable.map_or(Scan::Absent, Scan::Unreadable)
 }
 
 /// The clock the daemon measures the factory's ages on: the system's, and in a debug build
@@ -1876,262 +1732,6 @@ mod tests {
         std::fs::write(&file, "900").unwrap();
         assert_eq!(clock.now(), Duration::from_secs(900));
     }
-
-    #[tokio::test]
-    async fn a_factory_workspace_is_answered_with_its_project_by_its_marker() {
-        use crate::workspaces::{Checkout, FactoryTag, Setup};
-
-        let data = tempfile::tempdir().unwrap();
-        let me = MachineId::random();
-        let store = Arc::new(Mutex::new(
-            Store::open(data.path().join("foundry.db")).unwrap(),
-        ));
-        let git = |dir: &Path, args: &[&str]| {
-            let out = std::process::Command::new("git")
-                .args([
-                    "-c",
-                    "user.name=Foundry Test",
-                    "-c",
-                    "user.email=test@foundry.invalid",
-                    "-c",
-                    "commit.gpgsign=false",
-                    "-c",
-                    "init.defaultBranch=main",
-                ])
-                .args(args)
-                .current_dir(dir)
-                .output()
-                .unwrap();
-            assert!(out.status.success(), "git {args:?}: {out:?}");
-        };
-        let remotes = tempfile::tempdir().unwrap();
-        git(remotes.path(), &["init", "-q", "--bare", "remote.git"]);
-        git(remotes.path(), &["clone", "-q", "remote.git", "src"]);
-        let src = remotes.path().join("src");
-        std::fs::write(src.join("README.md"), "hello\n").unwrap();
-        git(&src, &["add", "README.md"]);
-        git(&src, &["commit", "-q", "-m", "first"]);
-        git(&src, &["push", "-q", "origin", "main"]);
-        let project = ProjectId::random();
-        {
-            let mut store = store.lock().unwrap();
-            let mut settings = store.settings().unwrap();
-            settings.seq += 1;
-            settings.projects.push(foundry_proto::settings::Project {
-                id: project,
-                name: "demo".into(),
-                repo: remotes
-                    .path()
-                    .join("remote.git")
-                    .to_string_lossy()
-                    .into_owned(),
-            });
-            assert!(store.apply_settings(settings).unwrap());
-        }
-        let terminals = Arc::new(Terminals::new(
-            me,
-            store.clone(),
-            data.path(),
-            data.path().join("no-holder"),
-        ));
-        let workspaces = Workspaces::new(me, store, data.path(), terminals);
-        let tagged = |tag| {
-            workspaces.create_with(
-                project,
-                "fix login",
-                Checkout::NewBranch {
-                    base: "main".into(),
-                    branch: None,
-                },
-                Setup::None,
-                tag,
-            )
-        };
-        let made = tagged(Some(FactoryTag {
-            project,
-            run: "o/r#1".into(),
-        }))
-        .await
-        .unwrap();
-        let plain = workspaces
-            .create_with(
-                project,
-                "mine",
-                Checkout::NewBranch {
-                    base: "main".into(),
-                    branch: None,
-                },
-                Setup::None,
-                None,
-            )
-            .await
-            .unwrap();
-
-        let marks = WorkspaceMarks::new(data.path());
-        assert_eq!(marks.project(made), Some(project));
-        assert_eq!(marks.project(plain), None);
-        assert_eq!(
-            marks.project(foundry_proto::ids::WorkspaceId::random()),
-            None
-        );
-        let nowhere = tempfile::tempdir().unwrap();
-        assert_eq!(WorkspaceMarks::new(nowhere.path()).project(made), None);
-    }
-
-    /// A worktrees folder holding `<project>/<workspace>.factory` with `text`, for the
-    /// marker tests; and the paths of the folder and the marker.
-    fn marker_in(text: &str) -> (tempfile::TempDir, WorkspaceId, PathBuf) {
-        let data = tempfile::tempdir().unwrap();
-        let workspace = WorkspaceId::random();
-        let folder = data
-            .path()
-            .join("worktrees")
-            .join(ProjectId::random().to_string());
-        std::fs::create_dir_all(&folder).unwrap();
-        let marker = folder.join(format!("{workspace}.factory"));
-        std::fs::write(&marker, text).unwrap();
-        (data, workspace, marker)
-    }
-
-    fn marker_text(project: ProjectId) -> String {
-        format!(r#"{{"project":"{project}","run":"o/r#1","name":"w"}}"#)
-    }
-
-    #[test]
-    fn a_stray_file_among_the_project_folders_does_not_stop_the_scan_for_a_marker() {
-        let project = ProjectId::random();
-        let (data, workspace, _) = marker_in(&marker_text(project));
-        let worktrees = data.path().join("worktrees");
-        // Plain files beside the project folders, which no read of `<file>/<id>.factory` gets
-        // past; some of them are bound to be read before the project folder.
-        for name in [".DS_Store", "0", "a", "b", "c", "d", "e", "zz", "~"] {
-            std::fs::write(worktrees.join(name), "").unwrap();
-        }
-
-        assert!(matches!(
-            scan_marker(&worktrees, workspace),
-            Scan::Found(found) if found == project
-        ));
-        // Beside the stray files, no marker is no marker, not a folder that cannot be read.
-        assert!(matches!(
-            scan_marker(&worktrees, WorkspaceId::random()),
-            Scan::Absent
-        ));
-    }
-
-    #[test]
-    fn a_marker_that_does_not_parse_or_cannot_be_read_answers_none() {
-        let (data, workspace, marker) = marker_in("not json");
-        let worktrees = data.path().join("worktrees");
-        assert!(matches!(
-            scan_marker(&worktrees, workspace),
-            Scan::Unparseable(path) if path == marker
-        ));
-
-        // A folder where the marker should be is a file that cannot be read.
-        std::fs::remove_file(&marker).unwrap();
-        std::fs::create_dir(&marker).unwrap();
-        assert!(matches!(
-            scan_marker(&worktrees, workspace),
-            Scan::Unreadable(path) if path == marker
-        ));
-        assert_eq!(WorkspaceMarks::new(data.path()).project(workspace), None);
-    }
-
-    #[test]
-    fn a_marker_found_in_a_later_folder_is_still_found_after_a_read_error_in_an_earlier() {
-        let project = ProjectId::random();
-        let (data, workspace, _) = marker_in(&marker_text(project));
-        let worktrees = data.path().join("worktrees");
-        for _ in 0..5 {
-            let folder = worktrees.join(ProjectId::random().to_string());
-            std::fs::create_dir_all(folder.join(format!("{workspace}.factory"))).unwrap();
-        }
-        // Five folders that hold an unreadable marker of that name, one that holds the marker.
-        let found = scan_marker(&worktrees, workspace);
-        assert!(
-            matches!(found, Scan::Found(p) if p == project),
-            "{:?}",
-            found
-        );
-    }
-
-    #[test]
-    fn the_first_answer_for_a_workspace_is_kept_whatever_happens_to_its_marker() {
-        let project = ProjectId::random();
-        let (data, workspace, marker) = marker_in(&marker_text(project));
-        let marks = WorkspaceMarks::new(data.path());
-        assert_eq!(marks.project(workspace), Some(project));
-
-        std::fs::remove_file(&marker).unwrap();
-        assert_eq!(marks.project(workspace), Some(project));
-
-        // No marker is an answer too: one that appears afterwards changes nothing.
-        let other = WorkspaceId::random();
-        assert_eq!(marks.project(other), None);
-        std::fs::write(
-            marker.with_file_name(format!("{other}.factory")),
-            marker_text(project),
-        )
-        .unwrap();
-        assert_eq!(marks.project(other), None);
-    }
-
-    #[test]
-    fn a_marker_that_does_not_parse_is_answered_none_from_then_on_and_warned_of_once() {
-        let (data, workspace, marker) = marker_in("not json");
-        let marks = WorkspaceMarks::new(data.path());
-        assert_eq!(marks.project(workspace), None);
-        assert_eq!(marks.warned_count(), 1);
-
-        // Mended, it still answers none: the answer was kept and the folder not scanned again.
-        std::fs::write(&marker, marker_text(ProjectId::random())).unwrap();
-        assert_eq!(marks.project(workspace), None);
-        assert_eq!(marks.warned_count(), 1);
-    }
-
-    #[test]
-    fn a_marker_that_cannot_be_read_is_tried_again_and_warned_of_once() {
-        let project = ProjectId::random();
-        let (data, workspace, marker) = marker_in("");
-        std::fs::remove_file(&marker).unwrap();
-        std::fs::create_dir(&marker).unwrap();
-        let marks = WorkspaceMarks::new(data.path());
-
-        assert_eq!(marks.project(workspace), None);
-        assert_eq!(marks.project(workspace), None);
-        assert_eq!(marks.warned_count(), 1);
-
-        std::fs::remove_dir(&marker).unwrap();
-        std::fs::write(&marker, marker_text(project)).unwrap();
-        assert_eq!(marks.project(workspace), Some(project));
-    }
-
-    #[test]
-    fn a_worktrees_path_that_cannot_be_listed_is_not_answered_for_good() {
-        let project = ProjectId::random();
-        let data = tempfile::tempdir().unwrap();
-        let workspace = WorkspaceId::random();
-        let worktrees = data.path().join("worktrees");
-        // A file where the folder should be: listing it fails with ENOTDIR, not NotFound.
-        std::fs::write(&worktrees, "").unwrap();
-        let marks = WorkspaceMarks::new(data.path());
-
-        assert_eq!(marks.project(workspace), None);
-        assert_eq!(marks.project(workspace), None);
-        assert_eq!(marks.warned_count(), 1);
-
-        std::fs::remove_file(&worktrees).unwrap();
-        let folder = worktrees.join(project.to_string());
-        std::fs::create_dir_all(&folder).unwrap();
-        std::fs::write(
-            folder.join(format!("{workspace}.factory")),
-            marker_text(project),
-        )
-        .unwrap();
-        assert_eq!(marks.project(workspace), Some(project));
-    }
-
     /// A release build ignores `FOUNDRY_CLOCK_AHEAD`.
     #[cfg(not(debug_assertions))]
     #[test]
