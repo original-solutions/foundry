@@ -554,6 +554,37 @@ mod tests {
     }
 
     #[test]
+    fn a_start_refused_for_what_its_caller_sent_or_an_end_is_4xx_and_any_other_stays_a_server_error()
+     {
+        let cases = [
+            (
+                SessionError::NoToken(NoToken::Unset {
+                    login: "nobody".into(),
+                }),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                SessionError::BodyWithoutPath,
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (SessionError::Ended, StatusCode::CONFLICT),
+            (SessionError::NoAskpass, StatusCode::INTERNAL_SERVER_ERROR),
+            (
+                SessionError::SecretsUnreadable,
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        ];
+        for (error, status) in cases {
+            let said = error.to_string();
+            assert_eq!(
+                start_refused(error).into_response().status(),
+                status,
+                "{said}"
+            );
+        }
+    }
+
+    #[test]
     fn a_tail_is_cut_to_its_last_bytes_on_a_character_boundary() {
         let text = format!("é{}", "x".repeat(10));
         assert_eq!(last_bytes(&text, 11), "x".repeat(10));

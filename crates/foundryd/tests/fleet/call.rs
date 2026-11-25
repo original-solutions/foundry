@@ -17,7 +17,7 @@ use foundryd::join::KeyedDialer;
 use foundryd::secrets::{Edit, Secrets, SecretsError};
 use foundryd::sessions::{self, Gateway, Sessions};
 use foundryd::store::Store;
-use foundryd::sync::call::CallError;
+use foundryd::sync::call::{CARRIED, CallError};
 use foundryd::sync::{Conn, Peers};
 use foundryd::terminals::Terminals;
 use foundryd::workspaces::Workspaces;
@@ -77,6 +77,8 @@ impl Drop for Served {
 struct Factory {
     script: &'static str,
     secrets: Arc<dyn Secrets>,
+    /// Why sessions cannot start here, as a daemon with no gateway says.
+    refused: Option<&'static str>,
 }
 
 /// Puts the fake agent in front of a factory start's flags, which it does not take: it drops
@@ -151,12 +153,14 @@ impl Served {
                 },
             },
         );
+        let refused = factory.as_ref().and_then(|f| f.refused);
         let sessions = Arc::new(match factory {
             Some(factory) => sessions.with_secrets(factory.secrets),
             None => sessions,
         });
         let hook_router = sessions.router();
-        let api = Api::new(store, peers, terminals, workspaces, sessions, Vec::new());
+        let mut api = Api::new(store, peers, terminals, workspaces, sessions, Vec::new());
+        api.sessions_refused = refused.map(str::to_owned);
         let kept = api.clone();
         let placing = api.clone();
         let listener = api::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
@@ -1124,6 +1128,11 @@ struct Pair {
 
 impl Pair {
     async fn start() -> Pair {
+        Self::start_with(None).await
+    }
+
+    /// A pair whose B refuses sessions for `refused`, when it is given.
+    async fn start_with(refused: Option<&'static str>) -> Pair {
         let fleet = Fleet::start(2);
         let remotes = tempfile::tempdir().unwrap();
         let project = project(&fleet, remotes.path());
@@ -1132,6 +1141,7 @@ impl Pair {
         let factory = Factory {
             script: SESSION_SCRIPT,
             secrets: Held::with_token(),
+            refused,
         };
         let on_b = Served::start_with(b.id, b.store.clone(), b.peers.clone(), Some(factory)).await;
         b.peers.serve_calls(on_b.addr);
@@ -1156,15 +1166,7 @@ impl Pair {
     /// The run's call for `path` with `body`, made on A, which carries it to B: B's status and
     /// the text it answered.
     async fn call(&self, path: &str, body: Option<Value>) -> (u16, String) {
-        let body = body.map(|body| body.to_string()).unwrap_or_default();
-        let answer = api::factory::call(&self.on_a.api, path, body.as_bytes())
-            .await
-            .unwrap_or_else(|e| panic!("{path} not carried: {e}"))
-            .unwrap_or_else(|| panic!("{path} found no owner other than A"));
-        (
-            answer.status,
-            String::from_utf8(answer.body.to_vec()).unwrap(),
-        )
+        call_on(&self.on_a, path, body).await
     }
 
     /// Asks B for `path` with `body` until it answers other than `404`, and gives that answer.
@@ -1223,6 +1225,18 @@ impl Pair {
                 && !matches!(s.body.state, SessionState::Finished | SessionState::Failed))
         })
     }
+}
+
+/// The run's call for `path` with `body`, made on `on`: the status and the text answered.
+async fn call_on(on: &Served, path: &str, body: Option<Value>) -> (u16, String) {
+    let body = body.map(|body| body.to_string()).unwrap_or_default();
+    let answer = api::factory::call(&on.api, path, body.as_bytes())
+        .await
+        .unwrap_or_else(|e| panic!("{path} not answered: {e}"));
+    (
+        answer.status,
+        String::from_utf8(answer.body.to_vec()).unwrap(),
+    )
 }
 
 /// The terminals of `workspace` that `on` shows.
@@ -1469,11 +1483,8 @@ async fn a_worker_route_without_the_carried_mark_or_with_a_browsers_headers_is_4
     ];
     let origin = format!("http://{}", pair.on_b.addr);
     let browser_marks: [&[(&'static str, String)]; 2] = [
-        &[("x-foundry-carried", "1".into()), ("origin", origin)],
-        &[
-            ("x-foundry-carried", "1".into()),
-            ("sec-fetch-mode", "cors".into()),
-        ],
+        &[(CARRIED, "1".into()), ("origin", origin)],
+        &[(CARRIED, "1".into()), ("sec-fetch-mode", "cors".into())],
     ];
     for (path, body) in routes {
         // Called with no mark on A, which does not own it, and on B, which does.
@@ -1499,4 +1510,134 @@ async fn a_worker_route_without_the_carried_mark_or_with_a_browsers_headers_is_4
     );
     assert_eq!(pair.sessions_in(workspace), 1, "no second session");
     assert!(pair.runs(session).await, "no uncarried end ended it");
+}
+
+#[tokio::test]
+async fn a_start_answers_with_the_factory_session_running_in_its_own_workspace_only() {
+    let pair = Pair::start().await;
+    let none = json!({"kind": "none"});
+    let mut workspaces = Vec::new();
+    for name in ["fac/12-1", "fac/13-1", "fac/14-1"] {
+        let (status, text) = pair
+            .call(
+                "/api/factory/workspaces",
+                Some(pair.create(name, none.clone())),
+            )
+            .await;
+        assert_eq!(status, 201, "{text}");
+        workspaces.push(workspace_of(&text));
+    }
+    let [first, second, with_p1] = workspaces[..] else {
+        unreachable!()
+    };
+    let start = pair.start_body(LOGIN, "test-model", "high", "/factory-build demo#12");
+    let start_in = |workspace: WorkspaceId| format!("/api/workspaces/{workspace}/factory/session");
+
+    // A session running in one workspace is not another workspace's.
+    let (status, text) = pair.call(&start_in(first), Some(start.clone())).await;
+    assert_eq!(status, 201, "{text}");
+    let in_first = session_of(&text);
+    let (status, text) = pair.call(&start_in(second), Some(start.clone())).await;
+    assert_eq!(status, 201, "{text}");
+    assert_ne!(session_of(&text), in_first, "a session of its own");
+    assert_eq!(pair.sessions_in(first), 1);
+    assert_eq!(pair.sessions_in(second), 1);
+
+    // A P1 session running in a workspace is no factory session.
+    let p1 = format!("/api/workspaces/{with_p1}/sessions");
+    let (status, text) = pair.on_b.post_text(&p1, Some(json!({"model": "m"}))).await;
+    assert_eq!(status, 201, "{text}");
+    let p1_session = session_of(&text);
+    let (status, text) = pair.call(&start_in(with_p1), Some(start)).await;
+    assert_eq!(status, 201, "{text}");
+    assert_ne!(
+        session_of(&text),
+        p1_session,
+        "a factory session of its own"
+    );
+    assert_eq!(pair.sessions_in(with_p1), 2);
+}
+
+#[tokio::test]
+async fn a_run_calls_what_its_own_machine_owns_here_and_names_only_worker_routes() {
+    let pair = Pair::start().await;
+    let setup = json!({"kind": "commands", "commands": ["echo ready"], "limit_secs": 60});
+    // Made from B for B: served on B, with no peer call.
+    let (status, text) = call_on(
+        &pair.on_b,
+        "/api/factory/workspaces",
+        Some(pair.create("fac/12-1", setup)),
+    )
+    .await;
+    assert_eq!(status, 201, "{text}");
+    let workspace = workspace_of(&text);
+    let start = pair.start_body(LOGIN, "test-model", "high", "/factory-build demo#12");
+    let path = format!("/api/workspaces/{workspace}/factory/session");
+    let (status, text) = call_on(&pair.on_b, &path, Some(start)).await;
+    assert_eq!(status, 201, "{text}");
+    let session = session_of(&text);
+    let turn = format!("/api/sessions/{session}/factory/turn");
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let (status, text) = call_on(&pair.on_b, &turn, Some(json!({"turn": 1}))).await;
+        if status == 200 {
+            let first: Value = serde_json::from_str(&text).unwrap();
+            assert!(!text.contains(TOKEN), "{text}");
+            assert!(
+                first["message"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("pushed with ")
+            );
+            break;
+        }
+        assert_eq!(status, 404, "{text}");
+        assert!(tokio::time::Instant::now() < deadline, "{text}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // The session's terminal has no tail here either, and a bad body is refused here as there.
+    let terminal = terminals_of(&pair.on_b, workspace)
+        .await
+        .into_iter()
+        .find(|t| {
+            pair.b()
+                .held(|r| matches!(r, AnyRecord::Session(s) if s.body.terminal == *t))
+                .is_some()
+        })
+        .expect("the session's terminal");
+    let (status, text) =
+        call_on(&pair.on_b, &format!("/api/terminals/{terminal}/tail"), None).await;
+    assert_eq!(status, 404, "{text}");
+    let (status, text) = call_on(&pair.on_b, &turn, Some(json!("not a turn"))).await;
+    assert_eq!(status, 422, "{text}");
+
+    for path in ["/api/state", "/api/workspaces", "/api/briefs"] {
+        match api::factory::call(&pair.on_a.api, path, b"{}").await {
+            Err(CallError::Refused(said)) => assert!(said.contains("not a worker route"), "{said}"),
+            other => panic!("{path} not refused: {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_start_on_a_machine_that_refuses_sessions_is_503_and_starts_nothing() {
+    let pair = Pair::start_with(Some("this machine has no gateway")).await;
+    let (status, text) = pair
+        .call(
+            "/api/factory/workspaces",
+            Some(pair.create("fac/12-1", json!({"kind": "none"}))),
+        )
+        .await;
+    assert_eq!(status, 201, "{text}");
+    let workspace = workspace_of(&text);
+    let start = pair.start_body(LOGIN, "test-model", "high", "/factory-build demo#12");
+    let (status, text) = pair
+        .call(
+            &format!("/api/workspaces/{workspace}/factory/session"),
+            Some(start),
+        )
+        .await;
+    assert_eq!(status, 503, "{text}");
+    assert!(text.contains("no gateway"), "{text}");
+    assert_eq!(pair.sessions_in(workspace), 0);
 }
