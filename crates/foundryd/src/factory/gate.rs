@@ -892,11 +892,22 @@ mod tests {
             let commands = ["echo fine", "echo boom; exit 3", "echo never"];
             let (tail, code) = run_setup("", &commands);
             assert_eq!(code, 3, "{tail:?}");
+            let GateResult::Failed {
+                command,
+                how,
+                output,
+            } = result(TerminalState::Exited, Some(code), &tail, &strs(&commands))
+            else {
+                panic!("not a failure: {tail:?}");
+            };
             assert_eq!(
-                result(TerminalState::Exited, Some(code), &tail, &strs(&commands)),
-                failed("echo boom; exit 3", "exit code 3", "boom\n"),
+                (command.as_deref(), how.as_str()),
+                (Some("echo boom; exit 3"), "exit code 3"),
                 "{tail:?}"
             );
+            // The command's own output comes first. Some shells, such as macOS's `/bin/sh`, add
+            // a line of their own when the stopped watcher is reaped, so the rest is not asserted.
+            assert!(output.starts_with("boom\n"), "{tail:?}");
         }
 
         #[test]
