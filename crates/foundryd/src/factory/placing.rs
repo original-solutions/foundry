@@ -525,6 +525,21 @@ mod tests {
             .build();
         let mut reserved = Reserved::default();
         assert_eq!(place_run(&view, &settings, LOGIN, &mut reserved), Ok(vps));
+
+        // The same samples with the newer one held first: the version decides, not the order.
+        let mut newer = sample(mac, 4, 0.1);
+        newer.version = 9;
+        let view = FleetView::builder()
+            .sample(newer)
+            .sample(sample(mac, 0, 0.1))
+            .sample(sample(vps, 0, 0.5))
+            .held(mac, holds(&[LOGIN], true))
+            .held(vps, holds(&[LOGIN], true))
+            .online(mac)
+            .online(vps)
+            .build();
+        let mut reserved = Reserved::default();
+        assert_eq!(place_run(&view, &settings, LOGIN, &mut reserved), Ok(vps));
     }
 
     #[test]
