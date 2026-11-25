@@ -3,8 +3,10 @@
 use foundry_proto::factory::RunId;
 
 use super::RunError;
-use super::progress::Seen;
+use super::progress::{Seen, read_progress};
 use crate::factory::ledger::Ledger;
+use crate::factory::ledger::events::{Cause, CauseStep, Event};
+use crate::factory::lifecycle::State;
 use crate::factory::worker::Guard;
 
 /// What [`request`] found.
@@ -23,31 +25,72 @@ pub struct StopRequest {
     pub seen: Seen,
 }
 
-/// Records a stop by hand for `run`.
-pub fn request(
-    _ledger: &Ledger,
-    _guard: &dyn Guard,
-    _run: &RunId,
-) -> Result<StopRequest, RunError> {
-    todo!()
+/// Records a stop by hand for `run`, as the runner's `requestStop` does, with the progress the
+/// decision was made from. The state is checked before a stop already on record (as the
+/// runner's `leaveStopRequest` does), so a stale line of a run that left `building` is refused
+/// as not building and never answered "already". The lease is checked only before the one
+/// write.
+pub fn request(ledger: &Ledger, guard: &dyn Guard, run: &RunId) -> Result<StopRequest, RunError> {
+    let events = ledger.read(run)?;
+    if events.is_empty() {
+        return Err(RunError::Invalid(format!("run {run} has no ledger")));
+    }
+    let seen = read_progress(&events);
+    let outcome = if seen.finished {
+        StopOutcome::Finished
+    } else if seen.state != Some(State::Building) {
+        StopOutcome::NotBuilding
+    } else if seen.stop_requested {
+        StopOutcome::AlreadyRequested
+    } else {
+        guard.check()?;
+        ledger.write(
+            run,
+            &Event::StopRequested {
+                by: "operator".into(),
+            },
+            &Cause::new(CauseStep::Operator, "stop-requested"),
+        )?;
+        StopOutcome::Recorded
+    };
+    Ok(StopRequest { outcome, seen })
 }
 
-/// Why a stop by hand is refused for a run that is not building.
-pub fn not_building_message(_id: &str, _seen: &Seen) -> String {
-    todo!()
+/// Why a stop by hand is refused for a run that is not building, in the words of the runner's
+/// `stop-run.sh`: `seen` is the run's progress, and the tail says how the run ends instead.
+pub fn not_building_message(id: &str, seen: &Seen) -> String {
+    let why = if seen.finished {
+        "it is finished".to_owned()
+    } else {
+        match seen.state {
+            None => "it has no state yet".to_owned(),
+            Some(state) => format!("its state is {}", state.name()),
+        }
+    };
+    let tail = if seen.finished {
+        ""
+    } else {
+        match seen.state {
+            None | Some(State::Triage | State::NeedsInfo) => " To end it, close its issue.",
+            Some(State::PrOpen) => " It ends when its pull request is merged or closed.",
+            Some(_) => "",
+        }
+    };
+    format!("run {id} is not building: {why}. Only a building run is stopped this way.{tail}")
 }
 
-/// The answer to a stop requested.
-pub fn requested_message(_id: &str) -> String {
-    todo!()
+/// What `control.ts`'s `stopRun` says of a stop it left.
+pub fn requested_message(id: &str) -> String {
+    format!("stop requested: {id}; the issue goes to factory:stuck on the next pass")
 }
 
-/// The answer to a stop already requested.
-pub fn already_requested_message(_id: &str) -> String {
-    todo!()
+/// What `stopRun` says of a stop already on record.
+pub fn already_requested_message(id: &str) -> String {
+    format!("stop already requested: {id}; the issue goes to factory:stuck on the next pass")
 }
 
-/// What a route answers.
+/// What a route answers to a stop: `control.ts`'s `stopped` (with `already`) and `refused`. The
+/// caller wakes the loop when the stop is new.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StopAnswer {
     Stopped { already: bool, message: String },
@@ -55,9 +98,21 @@ pub enum StopAnswer {
 }
 
 impl StopRequest {
-    /// The answer for run `id`.
-    pub fn answer(&self, _id: &str) -> StopAnswer {
-        todo!()
+    /// The answer for run `id`, in the words of `control.ts`.
+    pub fn answer(&self, id: &str) -> StopAnswer {
+        match self.outcome {
+            StopOutcome::Recorded => StopAnswer::Stopped {
+                already: false,
+                message: requested_message(id),
+            },
+            StopOutcome::AlreadyRequested => StopAnswer::Stopped {
+                already: true,
+                message: already_requested_message(id),
+            },
+            StopOutcome::NotBuilding | StopOutcome::Finished => StopAnswer::Refused {
+                message: not_building_message(id, &self.seen),
+            },
+        }
     }
 }
 
