@@ -5029,7 +5029,8 @@ mod tests {
                     _ => None,
                 })
                 .collect();
-            assert!(!ended.is_empty());
+            // The first try's call and the finishing pass's, both of the resume workspace.
+            assert_eq!(ended.len(), 2, "{ended:?}");
             assert!(
                 ended.iter().all(|workspace| *workspace == fresh()),
                 "{ended:?}"
@@ -5446,6 +5447,127 @@ mod tests {
                 .build();
             assert!(is_skipped(&pass(&rig, &run)));
             assert_eq!(event_count(&rig, &run), before);
+        }
+
+        // blind-reader-11: a `stuck` line with no decision, while a resume is owed.
+
+        #[test]
+        fn a_stuck_line_with_no_decision_is_finished_while_a_resume_is_owed() {
+            let (rig, run) = archived_and_waiting_for_a_machine();
+            rig.write(
+                &run,
+                Event::Stuck {
+                    reason: "said stuck".into(),
+                    branch: None,
+                    commits_ahead: None,
+                },
+            );
+            assert_eq!(
+                pass(&rig, &run),
+                ResumeStep::Stuck {
+                    reason: "said stuck".into()
+                }
+            );
+            assert!(rig.finished(&run));
+            assert!(create_calls(&rig).is_empty());
+            assert!(start_calls(&rig).is_empty());
+        }
+
+        #[test]
+        fn a_run_in_state_stuck_never_reaches_a_workspace_or_a_start() {
+            let (rig, run) = archived_and_waiting_for_a_machine();
+            rig.write(
+                &run,
+                Event::Stuck {
+                    reason: "said stuck".into(),
+                    branch: None,
+                    commits_ahead: None,
+                },
+            );
+            rig.moved(&run, State::Building, State::Stuck);
+            assert!(matches!(pass(&rig, &run), ResumeStep::Stuck { .. }));
+            assert!(create_calls(&rig).is_empty());
+            assert!(start_calls(&rig).is_empty());
+        }
+
+        // reliability-9: the detail of a decision is the one written for it.
+
+        #[test]
+        fn a_stale_detail_of_an_earlier_decision_is_not_the_details_of_a_later_one() {
+            let (mut rig, run) = interrupted();
+            rig.config.limits.interruption_resumes = 0;
+            rig.step(&run, "stuck-detail stale words of an earlier decision");
+            cut_short_then_finished(&rig, &run, "the session run ended as failed");
+            assert!(!stuck_reason(&rig, &run).contains("stale"));
+        }
+
+        // testing-19: the resume workspace of a machine gone for 15 minutes is not asked.
+
+        #[test]
+        fn a_cut_short_path_whose_resume_workspace_machine_is_gone_does_not_ask_it() {
+            let (mut rig, run) = at_the_start();
+            rig.view = with_resume_workspace("fac/8-1-r1", Some(setup_terminal()))
+                .terminal(terminal_record(TerminalState::Exited, Some(1)))
+                .build();
+            rig.sim.fail("could not finish this issue", 1);
+            assert!(advance(&rig.ctx(), &run).is_err());
+            let ended = |rig: &Rig| {
+                rig.worker
+                    .calls()
+                    .iter()
+                    .filter(|call| matches!(call, Call::EndSessions { .. }))
+                    .count()
+            };
+            let asked = ended(&rig);
+            rig.view = FleetView::builder()
+                .online(m1())
+                .unreachable(m2(), secs(15 * 60))
+                .workspace(workspace_record(
+                    m2(),
+                    fresh(),
+                    "fac/8-1-r1",
+                    Some(setup_terminal()),
+                ))
+                .terminal(terminal_record(TerminalState::Exited, Some(1)))
+                .build();
+            rig.worker
+                .on_end_sessions(Err(WorkerError::Unreachable("gone".into())));
+            assert!(matches!(pass(&rig, &run), ResumeStep::Stuck { .. }));
+            assert_eq!(ended(&rig), asked);
+            assert!(rig.finished(&run));
+        }
+
+        // testing-20: a workspace a given-up target made is not the claim's.
+
+        #[test]
+        fn a_workspace_a_given_up_target_made_does_not_keep_the_claim_from_moving() {
+            let mut rig = Rig::new();
+            let run = run_id(1);
+            claimed_not_built(&rig, &run);
+            rig.view = FleetView::builder()
+                .online(m3())
+                .unreachable(m1(), secs(15 * 60))
+                .build();
+            rig.worker
+                .on_create(Err(WorkerError::Unreachable("timed out".into())));
+            assert!(placed(&rig.ctx(), &run, m2()).is_err());
+            rig.view = FleetView::builder()
+                .online(m3())
+                .unreachable(m1(), secs(15 * 60))
+                .unreachable(m2(), secs(15 * 60))
+                .build();
+            assert!(matches!(pass(&rig, &run), ResumeStep::NeedsMachine(_)));
+            // The target made the workspace before it went away.
+            rig.view = FleetView::builder()
+                .online(m3())
+                .unreachable(m1(), secs(15 * 60))
+                .unreachable(m2(), secs(15 * 60))
+                .workspace(workspace_record(m2(), fresh(), "fac/8-1", None))
+                .build();
+            assert!(matches!(
+                pass(&rig, &run),
+                ResumeStep::NeedsMachine(Placing::MovedClaim { .. })
+            ));
         }
 
         // maintainability-4, reliability-6: the lookups follow the ledger, not the config.
