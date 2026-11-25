@@ -2210,3 +2210,331 @@ impl Inner {
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
+
+/// [`Workspaces::factory_project`]: what it answers, from memory, for workspaces made with a
+/// factory tag and without, and after a restart, an archive or a failed create.
+#[cfg(test)]
+mod factory_project {
+    use std::process::Command;
+
+    use foundry_proto::settings::Project;
+
+    use super::*;
+    use crate::test_log::Logged;
+
+    /// A machine's data folder, a store with one project whose remote has a `main`, and
+    /// the workspaces of the machine over them, with no holder: no setup ever runs.
+    struct Fixture {
+        data: tempfile::TempDir,
+        _remotes: tempfile::TempDir,
+        me: MachineId,
+        store: Arc<Mutex<Store>>,
+        project: ProjectId,
+        workspaces: Workspaces,
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .args([
+                "-c",
+                "user.name=Foundry Test",
+                "-c",
+                "user.email=test@foundry.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "init.defaultBranch=main",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let data = tempfile::tempdir().unwrap();
+            let me = MachineId::random();
+            let store = Arc::new(Mutex::new(
+                Store::open(data.path().join("foundry.db")).unwrap(),
+            ));
+            let remotes = tempfile::tempdir().unwrap();
+            git(remotes.path(), &["init", "-q", "--bare", "remote.git"]);
+            git(remotes.path(), &["clone", "-q", "remote.git", "src"]);
+            let src = remotes.path().join("src");
+            std::fs::write(src.join("README.md"), "hello\n").unwrap();
+            git(&src, &["add", "README.md"]);
+            git(&src, &["commit", "-q", "-m", "first"]);
+            git(&src, &["push", "-q", "origin", "main"]);
+            let project = ProjectId::random();
+            {
+                let mut store = store.lock().unwrap();
+                let mut settings = store.settings().unwrap();
+                settings.seq += 1;
+                settings.projects.push(Project {
+                    id: project,
+                    name: "demo".into(),
+                    repo: remotes
+                        .path()
+                        .join("remote.git")
+                        .to_string_lossy()
+                        .into_owned(),
+                });
+                assert!(store.apply_settings(settings).unwrap());
+            }
+            let workspaces = Self::workspaces_over(me, &store, data.path());
+            Self {
+                data,
+                _remotes: remotes,
+                me,
+                store,
+                project,
+                workspaces,
+            }
+        }
+
+        fn workspaces_over(me: MachineId, store: &Arc<Mutex<Store>>, data: &Path) -> Workspaces {
+            let terminals = Arc::new(Terminals::new(
+                me,
+                store.clone(),
+                data,
+                data.join("no-holder"),
+            ));
+            Workspaces::new(me, store.clone(), data, terminals)
+        }
+
+        /// New workspaces of this machine over the same data folder and store, as a daemon
+        /// started again makes them.
+        fn restarted(&self) -> Workspaces {
+            Self::workspaces_over(self.me, &self.store, self.data.path())
+        }
+
+        /// A workspace named `name`, made with `tag`.
+        async fn make(&self, name: &str, tag: Option<FactoryTag>) -> WorkspaceId {
+            self.workspaces
+                .create_with(
+                    self.project,
+                    name,
+                    Checkout::NewBranch {
+                        base: "main".into(),
+                        branch: None,
+                    },
+                    Setup::None,
+                    tag,
+                )
+                .await
+                .unwrap()
+        }
+
+        fn worktrees(&self) -> PathBuf {
+            self.data.path().join("worktrees")
+        }
+    }
+
+    fn tag(project: ProjectId) -> Option<FactoryTag> {
+        Some(FactoryTag {
+            project,
+            run: "o/r#1".into(),
+        })
+    }
+
+    fn marker_text(project: ProjectId) -> String {
+        format!(r#"{{"project":"{project}","run":"o/r#1","name":"w"}}"#)
+    }
+
+    #[tokio::test]
+    async fn a_workspace_made_with_a_factory_tag_answers_the_tags_project_and_one_made_without_none()
+     {
+        let fixture = Fixture::new();
+        // The tag's project, which the marker holds, not the workspace's.
+        let tagged_for = ProjectId::random();
+        let made = fixture.make("fix login", tag(tagged_for)).await;
+        let plain = fixture.make("mine", None).await;
+
+        assert_eq!(fixture.workspaces.factory_project(made), Some(tagged_for));
+        assert_eq!(fixture.workspaces.factory_project(plain), None);
+        assert_eq!(
+            fixture.workspaces.factory_project(WorkspaceId::random()),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn the_answer_is_from_memory_and_not_from_the_disk() {
+        let fixture = Fixture::new();
+        let made = fixture.make("fix login", tag(fixture.project)).await;
+        let plain = fixture.make("mine", None).await;
+        let folder = fixture.worktrees().join(fixture.project.to_string());
+
+        // The marker gone, the answer stays; a marker that appears changes nothing.
+        std::fs::remove_file(folder.join(format!("{made}.factory"))).unwrap();
+        std::fs::write(
+            folder.join(format!("{plain}.factory")),
+            marker_text(fixture.project),
+        )
+        .unwrap();
+
+        assert_eq!(
+            fixture.workspaces.factory_project(made),
+            Some(fixture.project)
+        );
+        assert_eq!(fixture.workspaces.factory_project(plain), None);
+    }
+
+    #[tokio::test]
+    async fn workspaces_started_again_on_the_same_data_folder_read_the_project_back() {
+        let fixture = Fixture::new();
+        let made = fixture.make("fix login", tag(fixture.project)).await;
+        let plain = fixture.make("mine", None).await;
+
+        let again = fixture.restarted();
+
+        assert_eq!(again.factory_project(made), Some(fixture.project));
+        assert_eq!(again.factory_project(plain), None);
+    }
+
+    #[tokio::test]
+    async fn an_archived_workspace_no_longer_answers_now_or_after_a_restart() {
+        let fixture = Fixture::new();
+        let made = fixture.make("fix login", tag(fixture.project)).await;
+        assert_eq!(
+            fixture.workspaces.factory_project(made),
+            Some(fixture.project)
+        );
+
+        fixture.workspaces.archive(made, false).await.unwrap();
+
+        assert_eq!(fixture.workspaces.factory_project(made), None);
+        assert_eq!(fixture.restarted().factory_project(made), None);
+    }
+
+    #[tokio::test]
+    async fn a_marker_a_failed_create_drops_no_longer_answers() {
+        let fixture = Fixture::new();
+        let inner = &fixture.workspaces.inner;
+        let id = WorkspaceId::random();
+        std::fs::create_dir_all(inner.project_folder(fixture.project)).unwrap();
+
+        // As a create does: marked before its record, then undone when what follows fails.
+        let tagged = tag(fixture.project).unwrap();
+        inner
+            .mark(fixture.project, id, &tagged, "fix login", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.workspaces.factory_project(id),
+            Some(fixture.project)
+        );
+        inner
+            .drop_marker(fixture.project, id, "a failed create left its marker")
+            .await;
+
+        assert_eq!(fixture.workspaces.factory_project(id), None);
+        assert_eq!(fixture.restarted().factory_project(id), None);
+    }
+
+    /// The warnings logged of `marker`.
+    fn warnings_of(logs: &Logged, marker: &Path) -> usize {
+        let marker = marker.display().to_string();
+        logs.warnings()
+            .iter()
+            .filter(|line| line.contains(&marker))
+            .count()
+    }
+
+    #[test]
+    fn a_marker_that_cannot_be_parsed_at_load_answers_none_and_is_warned_of_once() {
+        let fixture_data = tempfile::tempdir().unwrap();
+        let me = MachineId::random();
+        let store = Arc::new(Mutex::new(
+            Store::open(fixture_data.path().join("foundry.db")).unwrap(),
+        ));
+        let folder = fixture_data
+            .path()
+            .join("worktrees")
+            .join(ProjectId::random().to_string());
+        std::fs::create_dir_all(&folder).unwrap();
+        let workspace = WorkspaceId::random();
+        let marker = folder.join(format!("{workspace}.factory"));
+        std::fs::write(&marker, "not json").unwrap();
+
+        let logs = Logged::default();
+        let workspaces = {
+            let _capture = logs.capture();
+            let workspaces = Fixture::workspaces_over(me, &store, fixture_data.path());
+            assert_eq!(workspaces.factory_project(workspace), None);
+            // Mended, it still answers none: the markers were read once, at the start.
+            std::fs::write(&marker, marker_text(ProjectId::random())).unwrap();
+            assert_eq!(workspaces.factory_project(workspace), None);
+            workspaces
+        };
+        assert_eq!(workspaces.factory_project(workspace), None);
+        assert_eq!(warnings_of(&logs, &marker), 1, "{}", logs.text());
+    }
+
+    #[test]
+    fn markers_that_cannot_be_read_and_stray_files_do_not_stop_the_load_of_the_others() {
+        let data = tempfile::tempdir().unwrap();
+        let me = MachineId::random();
+        let store = Arc::new(Mutex::new(
+            Store::open(data.path().join("foundry.db")).unwrap(),
+        ));
+        let worktrees = data.path().join("worktrees");
+        let project = ProjectId::random();
+        let workspace = WorkspaceId::random();
+        let folder = worktrees.join(project.to_string());
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(
+            folder.join(format!("{workspace}.factory")),
+            marker_text(project),
+        )
+        .unwrap();
+        // Plain files beside the project folders, some bound to be listed before it.
+        for name in [".DS_Store", "0", "a", "b", "c", "zz", "~"] {
+            std::fs::write(worktrees.join(name), "").unwrap();
+        }
+        // Folders that hold a marker of the same workspace that cannot be read, and one of
+        // another that cannot be read either, some bound to be listed before the good one.
+        let unreadable = WorkspaceId::random();
+        let mut bad = Vec::new();
+        for _ in 0..5 {
+            let other = worktrees.join(ProjectId::random().to_string());
+            std::fs::create_dir_all(other.join(format!("{workspace}.factory"))).unwrap();
+            let marker = other.join(format!("{unreadable}.factory"));
+            std::fs::create_dir_all(&marker).unwrap();
+            bad.push(marker);
+        }
+        // Files beside the markers that are no marker of a workspace.
+        std::fs::write(folder.join("notes.factory"), "{}").unwrap();
+        std::fs::write(folder.join(format!("{workspace}.factory.tmp")), "{}").unwrap();
+
+        let logs = Logged::default();
+        let workspaces = {
+            let _capture = logs.capture();
+            Fixture::workspaces_over(me, &store, data.path())
+        };
+
+        assert_eq!(workspaces.factory_project(workspace), Some(project));
+        assert_eq!(workspaces.factory_project(unreadable), None);
+        for marker in &bad {
+            assert_eq!(warnings_of(&logs, marker), 1, "{}", logs.text());
+        }
+    }
+
+    #[test]
+    fn a_data_folder_with_no_worktrees_answers_none_and_warns_of_nothing() {
+        let data = tempfile::tempdir().unwrap();
+        let me = MachineId::random();
+        let store = Arc::new(Mutex::new(
+            Store::open(data.path().join("foundry.db")).unwrap(),
+        ));
+        let logs = Logged::default();
+        let workspaces = {
+            let _capture = logs.capture();
+            Fixture::workspaces_over(me, &store, data.path())
+        };
+        assert_eq!(workspaces.factory_project(WorkspaceId::random()), None);
+        assert!(logs.warnings().is_empty(), "{}", logs.text());
+    }
+}
