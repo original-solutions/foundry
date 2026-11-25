@@ -73,6 +73,9 @@ pub const SEND_INTENT: &str = "send-intent ";
 /// The step written after a try of the key that the worker refused with nothing typed: it is of
 /// the `send-intent` just before it, and of no earlier try.
 pub const SEND_REFUSED: &str = "send-refused ";
+/// The step written once the key's message is known typed: the worker took it, or a try that
+/// may have typed it was followed by a risen count.
+pub const SEND_TYPED: &str = "send-typed ";
 /// The step written before the gate-results comment on the pull request is posted.
 pub const GATE_RESULTS_COMMENTING: &str = "gate-results-commenting";
 /// The step written before the questions comment is posted.
@@ -325,7 +328,8 @@ pub struct Seen {
     /// on the pull request with no `gate-results-posted` step.
     /// The id of the newest marked comment on the pull request when the step was written.
     pub gate_commenting: Option<u64>,
-    /// Each send to the session by its key, as its `send-intent` and `send-refused` steps say.
+    /// Each send to the session by its key, as its `send-intent`, `send-refused` and
+    /// `send-typed` steps say. A new session has none.
     pub sends: BTreeMap<String, SendTries>,
     /// A `pr_opened` since the run last entered `building` or had a gate sent back: the session's pull request waits for the gate.
     pub pr_reported: bool,
@@ -730,6 +734,11 @@ pub fn read_progress(events: &[RunEvent]) -> Seen {
                 {
                     sent.refused = (sent.refused + 1).min(sent.tries);
                 }
+                if let Some(key) = step.strip_prefix(SEND_TYPED)
+                    && let Some(sent) = seen.sends.get_mut(key)
+                {
+                    sent.typed = true;
+                }
                 if step == GATE_RESULTS_POSTED {
                     seen.gate_commenting = None;
                     seen.results_posted = true;
@@ -935,6 +944,7 @@ pub fn read_progress(events: &[RunEvent]) -> Seen {
                 if let Some(id) = text(data, "thread_id") {
                     seen.thread_id = Some(id.to_owned());
                 }
+                seen.sends.clear();
                 seen.worktree = text(data, "worktree").map(str::to_owned);
                 seen.worktree_done = false;
                 seen.launched_since_sending = true;
@@ -1342,6 +1352,8 @@ pub struct SendTries {
     pub tries: u32,
     /// The `send-refused` steps after them: tries that typed nothing.
     pub refused: u32,
+    /// A `send-typed` step: the message is known typed.
+    pub typed: bool,
 }
 
 impl SendTries {
@@ -1352,12 +1364,17 @@ impl SendTries {
         self.refused < self.tries
     }
 
+    /// A try may have typed the message and it is not known typed: the session's next prompt
+    /// may be this message, so no other send to it goes until this one is settled.
+    pub fn pending(&self) -> bool {
+        self.may_have_typed() && !self.typed
+    }
+
     fn tried(&mut self, count: u64) {
         if self.tries == 0 || self.count != count {
             *self = SendTries {
                 count,
-                tries: 0,
-                refused: 0,
+                ..SendTries::default()
             };
         }
         self.tries += 1;

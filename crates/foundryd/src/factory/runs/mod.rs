@@ -49,7 +49,7 @@ use crate::sessions::factory::SendRefused;
 use crate::store::StoreError;
 use progress::{
     GATE_RESULTS_COMMENTING, GATE_RESULTS_POSTED, QUESTIONS_COMMENTING, SEND_INTENT, SEND_REFUSED,
-    STUCK_COMMENTING, STUCK_STOP, Seen, SendTries,
+    SEND_TYPED, STUCK_COMMENTING, STUCK_STOP, Seen, SendTries,
 };
 
 /// What a step of a run can fail with.
@@ -70,6 +70,14 @@ pub enum RunError {
     /// The lease is lost: nothing was done.
     #[error(transparent)]
     LeaseLost(#[from] LeaseLost),
+    /// A send to a session waits for the send `key` to it, which may have typed and is not
+    /// known typed. Nothing was asked of the worker; the pending key is to be sent again first.
+    #[error("a send to the session waits for its send {key}, which may have been typed")]
+    SendPending { key: String },
+    /// A send to `session` waits for the fleet to show its turn, whose prompt count guards the
+    /// send. Nothing was written or asked of the worker.
+    #[error("the fleet shows no turn for session {session}: no prompt count to send under")]
+    NoPromptCount { session: SessionId },
     /// An older run of the issue has its gate running, so nothing was called or written.
     #[error("the gate of run {run} is running")]
     GateRunning { run: RunId },
@@ -564,19 +572,29 @@ pub fn apply_actions(
     Ok(())
 }
 
-/// A message sent to the session once, under the session's prompt count so that a try whose
-/// line was typed is refused instead of typed again. The `key` names the send in the ledger:
-/// each try writes `send-intent <key> <count>` before the worker is asked, and
-/// `send-refused <key>` after a refusal that typed nothing.
+/// A message sent once to a session that has taken its launch (the launch and its resend by
+/// count are sent by start.rs, before the session shows a turn). Every try goes under the
+/// session's prompt count, so that a try whose line was typed is refused instead of typed again.
+/// The `key` names the message in the ledger: each try writes `send-intent <key> <count>` before
+/// the worker is asked, `send-refused <key>` after a refusal that typed nothing, and
+/// `send-typed <key>` once the message is known typed.
 ///
-/// The rule: once a try may have typed (its answer was lost, or the worker failed after it read
-/// the count), every later try goes under that try's count, and a count risen above it is the
-/// message typed. A later try's refusal is of that try only, so it does not clear the earlier
-/// one (a session busy with the typed line refuses as not idle). While no try may have typed,
-/// a try reads the count anew, and a count risen above it is other prompts: the risen count is
-/// recorded and the next pass sends under it. A lost lease stops a try before its intent is
-/// written. A session the fleet shows no turn for is sent to with no count; a failure that read
-/// one records it for the next try. `apply_actions` makes at most one send per session per call.
+/// The rule:
+/// - A try that may have typed (its answer was lost, or the worker failed) keeps the key
+///   pending. Every later try of the key goes under that try's count, and a count risen above
+///   it is the message typed. A later try's refusal is of that try only.
+/// - One message at a time per session: while a key is pending, a send of any other key waits
+///   ([`RunError::SendPending`] names it), so no other send can raise the count the pending one
+///   is judged by. A key stops being pending once it is known typed, or when its only tries were
+///   refused.
+/// - A key with no try that may have typed reads the count anew, and a count risen above it is
+///   other prompts: the risen count is recorded and the next pass sends under it.
+/// - No count, no send: a session the fleet shows no turn for waits
+///   ([`RunError::NoPromptCount`]). A lost lease stops a try before its intent is written.
+///
+/// A prompt the session gets from anywhere else (a person typing in its terminal) also raises
+/// the count, and reads as the pending message typed: the count cannot tell them apart.
+/// `apply_actions` makes at most one send per session per call.
 fn send_once(
     ctx: &RunContext<'_>,
     at: &Progress,
@@ -585,39 +603,41 @@ fn send_once(
     key: &str,
 ) -> Result<(), RunError> {
     let before = at.seen.sends.get(key);
+    if before.is_some_and(|sent| sent.typed) {
+        return Ok(());
+    }
+    if let Some((pending, _)) = at
+        .seen
+        .sends
+        .iter()
+        .find(|(other, sent)| other.as_str() != key && sent.pending())
+    {
+        return Err(RunError::SendPending {
+            key: pending.clone(),
+        });
+    }
     let may_have_typed = before.is_some_and(SendTries::may_have_typed);
-    let count = if may_have_typed {
-        before.map(|sent| sent.count)
-    } else {
-        let shown = ctx.view.session_turn(session).map(|turn| turn.prompts);
-        match (shown, before.map(|sent| sent.count)) {
-            (Some(shown), Some(recorded)) => Some(shown.max(recorded)),
-            (shown, recorded) => shown.or(recorded),
+    let count = match before {
+        Some(sent) if may_have_typed => sent.count,
+        _ => {
+            let Some(turn) = ctx.view.session_turn(session) else {
+                return Err(RunError::NoPromptCount { session });
+            };
+            before.map_or(turn.prompts, |sent| turn.prompts.max(sent.count))
         }
     };
-    let intent = |count: u64| {
-        ctx.record_step(
-            &at.run,
-            &format!("{SEND_INTENT}{key} {count}"),
-            &Cause::new(at.step, "send-intent"),
-        )
-    };
-    let refused = || {
-        ctx.record_step(
-            &at.run,
-            &format!("{SEND_REFUSED}{key}"),
-            &Cause::new(at.step, "send-refused"),
-        )
-    };
+    let step =
+        |name: &str, text: String| ctx.record_step(&at.run, &text, &Cause::new(at.step, name));
+    let intent = |count: u64| step("send-intent", format!("{SEND_INTENT}{key} {count}"));
+    let refused = || step("send-refused", format!("{SEND_REFUSED}{key}"));
+    let typed = || step("send-typed", format!("{SEND_TYPED}{key}"));
     ctx.held()?;
-    if let Some(count) = count {
-        intent(count)?;
-    }
+    intent(count)?;
     // The lease was checked just above, so no lost lease can follow the intent and leave a try
     // that asked nothing of the worker looking like one that may have typed.
-    match ctx.worker.send(session, message, count) {
-        Ok(_) => Ok(()),
-        Err(SendRefused::CountRose { .. }) if may_have_typed => Ok(()),
+    match ctx.worker.send(session, message, Some(count)) {
+        Ok(_) => typed(),
+        Err(SendRefused::CountRose { .. }) if may_have_typed => typed(),
         Err(SendRefused::CountRose { now }) => {
             intent(now)?;
             refused()?;
@@ -629,19 +649,11 @@ fn send_once(
             | SendRefused::BodyWithoutPath
             | SendRefused::SecretsUnreadable),
         ) => {
-            if count.is_some() {
-                refused()?;
-            }
+            refused()?;
             Err(error.into())
         }
-        Err(SendRefused::Failed { reason, prompts }) => {
-            if count.is_none()
-                && let Some(read) = prompts
-            {
-                intent(read)?;
-            }
-            Err(SendRefused::Failed { reason, prompts }.into())
-        }
+        // It may have typed: the key stays pending under `count`.
+        Err(error @ SendRefused::Failed { .. }) => Err(error.into()),
     }
 }
 
