@@ -1692,13 +1692,14 @@ fn launched(
 mod tests {
     use foundry_proto::factory::{FactorySettings, ProjectFactory};
 
+    use super::super::testing::HeldFor;
     use super::super::testing::*;
     use super::*;
     use crate::factory::github::{Claim, Tracker, newest_claim};
     use crate::factory::ledger::events::Event;
     use crate::factory::lifecycle::State;
     use crate::factory::messages::CUT_SHORT_COMMENT;
-    use crate::factory::worker::{Call, Lost};
+    use crate::factory::worker::Lost;
 
     fn settings(fleet_paused: bool, project_paused: bool) -> super::super::RunSettings {
         super::super::RunSettings {
@@ -1731,14 +1732,17 @@ mod tests {
     }
 
     /// The runner's `claims.test.ts`, "claims paused by hand". In Foundry the pause is two
-    /// settings, the fleet's and the project's, not a file in a data directory, so each case is
-    /// what a setting says. The cases about a file (its mode, a symlink, a FIFO, an unreadable
-    /// one, a missing data directory) have no counterpart.
+    /// settings, the fleet's and the project's, not a file in a data directory. Each case keeps
+    /// the runner's name and asserts the rule that name is about, as the settings hold it: a
+    /// pause holds claims back, the fleet's is named first, a resume lifts it, nothing can fail
+    /// to be read. What a file's mode, a symlink, a FIFO or a missing directory change has no
+    /// counterpart.
     mod claims_paused_by_hand {
         use super::*;
 
-        /// The runner's case, where pausing writes a file with the time: in Foundry, a fleet
-        /// setting that is set pauses every project, with no time written.
+        /// The runner's case, where pausing writes the time privately: in Foundry a pause is
+        /// one setting that is set, with no time and no file to write, and either setting holds
+        /// claims back.
         #[test]
         fn pause_writes_the_time_privately() {
             assert_eq!(
@@ -1751,24 +1755,38 @@ mod tests {
             );
         }
 
-        /// The runner's case, where a second pause keeps the first time: in Foundry, both
-        /// settings set read as the fleet's, and the project's own stays as it was.
+        /// The runner's case, where a second pause keeps the first time: in Foundry pausing the
+        /// project too changes nothing about a fleet pause that is already set.
         #[test]
         fn a_second_pause_keeps_the_first_time() {
-            let both = settings(true, true);
-            assert_eq!(claims_paused(&both), Some(ClaimPause::Fleet));
-            assert!(both.project.paused);
+            assert_eq!(
+                claims_paused(&settings(true, true)),
+                claims_paused(&settings(true, false))
+            );
         }
 
         /// The runner's case, where resume removes the file and says when there was none: in
-        /// Foundry, neither setting set is no pause.
+        /// Foundry a resume is a setting turned off, and the claim that was held back goes
+        /// ahead.
         #[test]
         fn resume_removes_the_file_and_says_when_there_was_none() {
-            assert_eq!(claims_paused(&settings(false, false)), None);
+            let mut rig = Rig::new();
+            rig.settings = settings(true, false);
+            assert!(matches!(
+                claim_it(&rig).unwrap(),
+                ClaimOutcome::Skipped { .. }
+            ));
+            rig.settings = settings(false, false);
+            assert_eq!(claims_paused(&rig.settings), None);
+            assert!(matches!(
+                claim_it(&rig).unwrap(),
+                ClaimOutcome::Claimed { .. }
+            ));
         }
 
-        /// The runner's case, where a file a person wrote is still a pause: in Foundry, the
-        /// words say which setting holds claims back.
+        /// The runner's case, where a file a person wrote is still a pause, by its mtime: in
+        /// Foundry a pause a person set in the settings is a pause, and the words say which
+        /// setting holds claims back.
         #[test]
         fn a_file_a_person_wrote_is_still_a_pause_since_its_mtime() {
             assert_eq!(
@@ -1779,11 +1797,18 @@ mod tests {
                 ClaimPause::Project.reason(),
                 "claims are paused for this project"
             );
+            let mut rig = Rig::new();
+            rig.settings = settings(false, true);
+            assert_eq!(
+                claim_it(&rig).unwrap(),
+                ClaimOutcome::Skipped {
+                    reason: ClaimPause::Project.reason().into()
+                }
+            );
         }
 
-        /// The runner's case, where a paused pass claims no ready issue of any repo and
-        /// everything else goes on: in Foundry, a paused claim writes nothing, and a run already
-        /// going is not held back.
+        /// The runner's case, where the time in the file is trimmed and parsed: in Foundry
+        /// there is no time to read, and a paused claim writes nothing to GitHub or the ledger.
         #[test]
         fn the_time_in_the_file_is_trimmed_and_parsed() {
             let mut rig = Rig::new();
@@ -1797,49 +1822,50 @@ mod tests {
             );
             assert!(rig.sim.writes().is_empty());
             assert!(rig.ledger.issue_runs(REPO, ISSUE).unwrap().is_empty());
-            rig.settings = settings(true, false);
-            assert!(matches!(
-                claim_it(&rig).unwrap(),
-                ClaimOutcome::Skipped { .. }
-            ));
         }
 
-        /// The runner's case, where a missing file and a symlink are no pause: in Foundry, a
-        /// setting that is off, whatever the other holds.
+        /// The runner's case, where a missing file and a symlink are no pause: in Foundry
+        /// settings that were never written are the defaults, which pause nothing.
         #[test]
         fn a_missing_file_and_a_symlink_are_no_pause() {
-            let rig = Rig::new();
-            assert!(matches!(
-                claim_it(&rig).unwrap(),
-                ClaimOutcome::Claimed { .. }
-            ));
-        }
-
-        /// The runner's case, where a file that cannot be opened is still a pause: in Foundry,
-        /// there is nothing to open, so a pause is only ever a setting that reads as set.
-        #[test]
-        fn a_file_that_cannot_be_opened_is_still_a_pause_since_its_mtime() {
             assert_eq!(
-                claims_paused(&settings(true, true)),
-                Some(ClaimPause::Fleet)
+                claims_paused(&crate::factory::runs::RunSettings::default()),
+                None
             );
         }
 
-        /// The runner's case, where a FIFO is no pause and does not block the read: in Foundry,
-        /// the settings are values already read, so a pause never blocks.
+        /// The runner's case, where a file that cannot be opened is still a pause: in Foundry
+        /// the pause does not depend on the project being on, so a project that is off is
+        /// still held back by the fleet's pause.
+        #[test]
+        fn a_file_that_cannot_be_opened_is_still_a_pause_since_its_mtime() {
+            let mut held = settings(true, false);
+            held.project.on = false;
+            assert_eq!(claims_paused(&held), Some(ClaimPause::Fleet));
+        }
+
+        /// The runner's case, where a FIFO is no pause and does not block the read: in Foundry
+        /// the settings are values already read, and every combination answers at once.
         #[test]
         fn a_fifo_is_no_pause_and_does_not_block_the_read() {
-            assert_eq!(claims_paused(&settings(false, false)), None);
+            let table = [
+                (false, false, None),
+                (true, false, Some(ClaimPause::Fleet)),
+                (false, true, Some(ClaimPause::Project)),
+                (true, true, Some(ClaimPause::Fleet)),
+            ];
+            for (fleet, project, wanted) in table {
+                assert_eq!(claims_paused(&settings(fleet, project)), wanted);
+            }
         }
 
         /// The runner's case, where pausing in a data dir that is not there is an error: in
-        /// Foundry, pausing is a setting and cannot fail, so a project that is not on is not
-        /// held back by a pause it does not have.
+        /// Foundry a pause cannot fail, and a claim that is paused is no error either.
         #[test]
         fn pausing_in_a_data_dir_that_is_not_there_is_an_error() {
             let mut rig = Rig::new();
-            rig.settings.project.on = false;
-            assert_eq!(claims_paused(&rig.settings), None);
+            rig.settings = settings(true, false);
+            assert!(claim_it(&rig).is_ok());
         }
     }
 
@@ -2205,11 +2231,14 @@ mod tests {
         /// lease lost between the comment and the label stops the claim with the issue `ready`.
         #[test]
         fn a_claim_that_gave_way_makes_no_run_and_says_so() {
-            let rig = Rig::new();
-            rig.sim.fail("--add-label", usize::MAX);
-            assert!(claim_it(&rig).is_err());
+            let mut rig = Rig::new();
+            rig.guard = Box::new(HeldFor::new(2));
+            // The comment landed; the lease is lost before the label.
+            assert!(matches!(claim_it(&rig), Err(RunError::LeaseLost(_))));
+            assert_eq!(rig.sim.writes().len(), 1);
             assert_eq!(rig.sim.labels(), vec!["factory:ready"]);
-            assert!(rig.ledger.issue_runs(REPO, ISSUE).unwrap().is_empty());
+            // The run the cut-short claim made is ended, so it holds no slot.
+            assert!(rig.finished(&run_id(1)));
         }
     }
 
@@ -2491,12 +2520,33 @@ mod tests {
     fn a_call_to_the_worker_is_never_made_by_a_claim() {
         let rig = Rig::new();
         claimed(&rig);
-        assert!(
-            !rig.worker
-                .calls()
-                .iter()
-                .any(|call| matches!(call, Call::Create { .. }))
-        );
+        assert!(rig.worker.calls().is_empty());
+    }
+
+    /// A lease lost between the claim's own steps stops it there: the ledger lines are written
+    /// under the first check, the claim comment under the second, and the label and the
+    /// assignee each under their own.
+    #[test]
+    fn a_lease_lost_between_the_steps_of_a_claim_stops_it_there() {
+        // (checks held, GitHub writes that landed, the label left)
+        let table = [
+            (1, 0, "factory:ready"),
+            (2, 1, "factory:ready"),
+            (3, 2, "factory:triage"),
+            (4, 3, "factory:triage"),
+        ];
+        for (checks, writes, label) in table {
+            let mut rig = Rig::new();
+            rig.guard = Box::new(HeldFor::new(checks));
+            let result = claim_it(&rig);
+            assert!(
+                matches!(result, Err(RunError::LeaseLost(_))),
+                "{checks}: {result:?}"
+            );
+            assert_eq!(rig.sim.writes().len(), writes, "{checks}");
+            assert_eq!(rig.sim.labels(), vec![label], "{checks}");
+            assert!(rig.worker.calls().is_empty());
+        }
     }
 
     /// What one pass of `advance` shows, with the fleet as the test lays it out.
@@ -5728,6 +5778,194 @@ mod tests {
                     ),
                     other => panic!("{other:?}"),
                 }
+            }
+        }
+
+        /// The runner's "claim comments of several machines". Foundry has one coordinator that
+        /// holds the project's lease and claims, so no two machines race for an issue, there is
+        /// no claim winner and no give-way. Each case keeps the runner's name and asserts what
+        /// stands in its place.
+        mod claim_comments_of_several_machines {
+            use super::*;
+
+            /// The runner's case, where another machine's win makes no run: in Foundry a
+            /// coordinator that lost the lease makes no run, no launch and no status comment.
+            #[test]
+            fn a_claim_another_machine_won_makes_no_run_no_launch_and_no_status_comment() {
+                let mut rig = Rig::new();
+                rig.guard = Box::new(Lost);
+                assert!(matches!(
+                    claim(&rig.ctx(), ISSUE, rig.machine),
+                    Err(RunError::LeaseLost(_))
+                ));
+                assert!(rig.sim.writes().is_empty());
+                assert!(rig.ledger.issue_runs(REPO, ISSUE).unwrap().is_empty());
+                assert!(calls(&rig).is_empty());
+            }
+
+            /// The runner's case, where a triage issue is not resumed when another machine won
+            /// it: in Foundry the issue's newest claim names the run, and a run that is not the
+            /// newest claim's is left alone.
+            #[test]
+            fn a_triage_issue_of_the_shared_login_is_not_resumed_when_another_machine_won_it() {
+                let rig = Rig::new();
+                rig.sim.set_labels(&["factory:triage"]);
+                rig.sim.set_assignees(&[LOGIN]);
+                rig.foundry_claim(&run_id(2), elsewhere());
+                let writes = rig.sim.writes();
+                assert!(matches!(pass(&rig, &run_id(1)), StartStep::Skipped { .. }));
+                assert!(rig.ledger.read(&run_id(1)).unwrap().is_empty());
+                assert_eq!(rig.sim.writes(), writes);
+            }
+
+            /// The runner's case, where a triage issue whose winning claim names this machine is
+            /// resumed: the claim comment that names the run is taken over, and the build is
+            /// asked of the machine it names.
+            #[test]
+            fn a_triage_issue_whose_winning_claim_names_this_machine_is_resumed() {
+                let rig = Rig::new();
+                rig.worker.on_create(Ok(ws_id()));
+                rig.sim.set_labels(&["factory:triage"]);
+                rig.sim.set_assignees(&[LOGIN]);
+                rig.foundry_claim(&run_id(1), rig.machine);
+                assert_eq!(pass(&rig, &run_id(1)), StartStep::Waiting(Wait::Workspace));
+                match &creates(&rig)[..] {
+                    [Call::Create { machine, .. }] => assert_eq!(*machine, rig.machine),
+                    other => panic!("{other:?}"),
+                }
+            }
+
+            /// The runner's case, where a run of this machine's that another machine's later
+            /// claim beat is finished: in Foundry a later claim of the issue finishes the earlier
+            /// run.
+            #[test]
+            fn a_triage_run_of_this_machine_s_that_another_machine_s_later_claim_beat_is_finished()
+            {
+                let (rig, first) = claimed_rig();
+                rig.sim.set_labels(&["factory:ready"]);
+                rig.sim.set_assignees(&[]);
+                let second = claim_run(&rig);
+                assert_eq!(second, run_id(2));
+                assert!(rig.finished(&first));
+                assert!(!rig.finished(&second));
+            }
+
+            /// The runner's case, where a failed claim that finds another machine's claim landed
+            /// takes nothing: a claim that fails with someone else assigned changes nothing.
+            #[test]
+            fn a_failed_claim_that_finds_another_machine_s_claim_landed_takes_nothing() {
+                let rig = Rig::new();
+                rig.sim.set_labels(&["factory:triage"]);
+                rig.sim.set_assignees(&["another-factory"]);
+                let error = RunError::Invalid("the claim call failed".into());
+                assert!(repair_claim(&rig.ctx(), ISSUE, &run_id(1), error).is_err());
+                assert!(rig.sim.writes().is_empty());
+                assert_eq!(rig.sim.assignees(), vec!["another-factory"]);
+                assert_eq!(rig.sim.labels(), vec!["factory:triage"]);
+            }
+
+            fn unfinished(rig: &Rig, run: &RunId, state: State) {
+                rig.step(run, &format!("approved {LABELED_AT}"));
+                rig.moved(run, State::Ready, State::Triage);
+                if state != State::Triage {
+                    rig.moved(run, State::Triage, state);
+                }
+            }
+
+            /// The runner's case "yieldToClaim finishes the runs claimed before another machine's
+            /// winning claim, writing nothing to GitHub": a new claim finishes the earlier runs
+            /// in the ledger, and the only writes on GitHub are its own.
+            #[test]
+            fn yieldtoclaim_finishes_the_runs_claimed_before_another_machine_s_winning_claim_writing_nothing_to_github()
+             {
+                let rig = Rig::new();
+                unfinished(&rig, &run_id(1), State::Building);
+                unfinished(&rig, &run_id(2), State::Triage);
+                let run = claim_run(&rig);
+                assert_eq!(run, run_id(3));
+                assert!(rig.finished(&run_id(1)) && rig.finished(&run_id(2)));
+                assert_eq!(rig.sim.writes().len(), 4, "the claim's own writes only");
+                assert!(calls(&rig).is_empty());
+            }
+
+            /// The runner's case "yieldToClaim leaves a run claimed after the winning comment,
+            /// and its own win": the claim leaves the run it makes unfinished, and an earlier run
+            /// that is finished already is not touched.
+            #[test]
+            fn yieldtoclaim_leaves_a_run_claimed_after_the_winning_comment_and_its_own_win() {
+                let rig = Rig::new();
+                unfinished(&rig, &run_id(1), State::Triage);
+                rig.ledger
+                    .finish(
+                        &run_id(1),
+                        Outcome::Stuck,
+                        None,
+                        None,
+                        &Cause::new(CauseStep::Start, "test"),
+                        None,
+                    )
+                    .unwrap();
+                let before = rig.events(&run_id(1));
+                let run = claim_run(&rig);
+                assert!(!rig.finished(&run));
+                assert_eq!(rig.events(&run_id(1)), before);
+            }
+
+            /// The runner's case "yieldToClaim finishes a run with no claim time as claimed
+            /// before the winner": a run with no `claimed` line is finished by the next claim.
+            #[test]
+            fn yieldtoclaim_finishes_a_run_with_no_claim_time_as_claimed_before_the_winner() {
+                let rig = Rig::new();
+                rig.step(&run_id(1), &format!("approved {LABELED_AT}"));
+                assert!(!read_progress(&rig.events(&run_id(1))).claimed);
+                claim_run(&rig);
+                assert!(rig.finished(&run_id(1)));
+            }
+
+            /// The runner's case "a triage issue whose claim comments cannot be read is not
+            /// resumed".
+            #[test]
+            fn a_triage_issue_whose_claim_comments_cannot_be_read_is_not_resumed() {
+                let rig = Rig::new();
+                rig.sim.set_labels(&["factory:triage"]);
+                rig.sim.set_assignees(&[LOGIN]);
+                rig.foundry_claim(&run_id(1), rig.machine);
+                rig.sim.fail("/comments", 1);
+                let writes = rig.sim.writes();
+                assert!(advance(&rig.ctx(), &run_id(1)).is_err());
+                assert!(rig.ledger.read(&run_id(1)).unwrap().is_empty());
+                assert_eq!(rig.sim.writes(), writes);
+                assert!(calls(&rig).is_empty());
+            }
+
+            /// The runner's case "a failed claim whose claim comments cannot be read fails with
+            /// the claim's error": a claim that fails fails with the failing call's own error,
+            /// whatever else cannot be read.
+            #[test]
+            fn a_failed_claim_whose_claim_comments_cannot_be_read_fails_with_the_claim_s_error() {
+                let rig = Rig::new();
+                rig.sim.fail("--add-label", usize::MAX);
+                match claim(&rig.ctx(), ISSUE, rig.machine) {
+                    Err(RunError::Tracker(error)) => {
+                        assert!(error.to_string().contains("--add-label"), "{error}")
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+
+            /// The runner's case "a repo pinned with factory.owner resumes its triage issue
+            /// without reading claims": a run that has events is resumed without reading the
+            /// issue's claim comments.
+            #[test]
+            fn a_repo_pinned_with_factory_owner_resumes_its_triage_issue_without_reading_claims() {
+                let (rig, run) = claimed_rig();
+                let asked = rig.sim.calls().len();
+                assert_eq!(pass(&rig, &run), StartStep::Waiting(Wait::Workspace));
+                assert!(
+                    rig.sim.calls()[asked..]
+                        .iter()
+                        .all(|call| !call.join(" ").contains("/comments"))
+                );
             }
         }
 

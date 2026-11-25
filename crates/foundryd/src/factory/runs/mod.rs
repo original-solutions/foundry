@@ -1163,6 +1163,37 @@ pub(crate) mod testing {
         }
     }
 
+    /// A guard that holds the lease for `n` checks and then loses it, to cut a step short between
+    /// two of its calls.
+    pub struct HeldFor(pub std::sync::atomic::AtomicUsize);
+
+    impl HeldFor {
+        pub fn new(checks: usize) -> Self {
+            Self(std::sync::atomic::AtomicUsize::new(checks))
+        }
+    }
+
+    impl Guard for HeldFor {
+        fn check(&self) -> Result<u64, crate::factory::worker::LeaseLost> {
+            use std::sync::atomic::Ordering;
+            loop {
+                let left = self.0.load(Ordering::SeqCst);
+                if left == 0 {
+                    return Err(crate::factory::worker::LeaseLost {
+                        reason: "the test's guard ran out of checks".into(),
+                    });
+                }
+                if self
+                    .0
+                    .compare_exchange(left, left - 1, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    return Ok(1);
+                }
+            }
+        }
+    }
+
     /// Everything a step of a run needs, built from fakes.
     pub struct Rig {
         pub _dir: tempfile::TempDir,
@@ -1650,6 +1681,65 @@ mod tests {
             assert!(matches!(result, Err(RunError::LeaseLost(_))));
             assert!(rig.worker.calls().is_empty());
         }
+    }
+
+    /// Every method of the context that changes GitHub or calls a worker checks the lease first:
+    /// with it lost, each is an error, and nothing reached GitHub or the worker. Taking any one
+    /// check out of the context fails this.
+    #[test]
+    fn a_lost_lease_stops_every_change_on_github_and_every_call_to_a_worker() {
+        use crate::workspaces::{Checkout, FactoryTag, Setup};
+        let mut rig = Rig::new();
+        rig.guard = Box::new(Lost);
+        let ctx = rig.ctx();
+        let workspace = WorkspaceId(uuid::Uuid::from_u128(0xa11));
+        let session = SessionId(uuid::Uuid::from_u128(0x5e5));
+        let terminal = foundry_proto::ids::TerminalId(uuid::Uuid::from_u128(0x7e));
+        let message = Message::new("line".into(), "body".into());
+        let request = crate::factory::worker::CreateWorkspace {
+            project: project_id(),
+            name: "fac/8-1".into(),
+            checkout: Checkout::NewBranch {
+                base: "main".into(),
+                branch: None,
+            },
+            setup: Setup::Own,
+            tag: FactoryTag {
+                project: project_id(),
+                run: "run".into(),
+            },
+        };
+        let start = crate::sessions::factory::FactoryStart {
+            project: project_id(),
+            login: LOGIN.into(),
+            model: "m".into(),
+            effort: "e".into(),
+        };
+        let results: Vec<(&str, Result<(), RunError>)> = vec![
+            ("set_state", ctx.set_state(ISSUE, State::Triage)),
+            ("assign", ctx.assign(ISSUE)),
+            ("unassign", ctx.unassign(ISSUE)),
+            ("post_comment", ctx.post_comment(ISSUE, "x")),
+            ("upsert_status", ctx.upsert_status(ISSUE, "x")),
+            ("comment_on_pr", ctx.comment_on_pr(1, "x")),
+            ("mark_pr_ready", ctx.mark_pr_ready(1)),
+            ("mark_pr_draft", ctx.mark_pr_draft(1)),
+            ("create", ctx.create(machine(), request).map(|_| ())),
+            (
+                "start_session",
+                ctx.start_session(workspace, start, message.clone())
+                    .map(|_| ()),
+            ),
+            ("tail", ctx.tail(terminal).map(|_| ())),
+            ("send", ctx.send(session, message, None).map(|_| ())),
+            ("end_sessions", ctx.end_sessions(workspace)),
+            ("archive", ctx.archive(workspace)),
+        ];
+        for (name, result) in results {
+            assert!(matches!(result, Err(RunError::LeaseLost(_))), "{name}");
+        }
+        assert!(rig.sim.calls().is_empty());
+        assert!(rig.worker.calls().is_empty());
     }
 
     mod going_stuck {
