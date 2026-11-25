@@ -3,13 +3,43 @@
 //! One ref in the project's repo, `refs/factory/lease`, points at a commit with no parent
 //! whose message holds the holder's machine id, a generation and a renewal count. A machine
 //! acts on a project only while less than 120 seconds have passed since it started its last
-//! successful push of that ref. Every age is read from the factory's [`Clock`].
+//! successful push of that ref ([`LeaseGuard::check`]). The age is counted from before the
+//! push began, since GitHub may take the push long before the answer arrives. Every age and
+//! wait reads the factory's [`Clock`], which counts through sleep; nothing here compares two
+//! machines' clocks.
+//!
+//! A [`Lease`] keeps a small bare git directory of its own for the ref alone. It is no clone:
+//! it holds the empty tree and lease commits, and it fetches nothing but this ref. Every git
+//! call runs with the login's token in its environment only (see [`GitAuth::apply`]), never in
+//! an argument, and ends within [`PUSH_LIMIT`] on the clock or is killed with everything it
+//! started. Nothing git says on stderr is kept, so no error or reason can quote a URL.
+//!
+//! [`Lease::tick`] reads the ref and acts on what it finds:
+//!
+//! - A missing ref is taken at once, at one more than the highest generation seen, with the
+//!   push expecting no ref.
+//! - A ref that names this machine is renewed at once when this machine holds nothing yet (a
+//!   restart) and otherwise once 60 seconds have passed since the last push began.
+//! - A ref that names another machine, or holds a commit the lease did not write, is taken
+//!   over at one more than the highest generation seen, once the same commit has been seen
+//!   unchanged for 180 seconds.
+//!
+//! Every push is a compare-and-swap (`--force-with-lease`), so a race has one winner. The loser
+//! stops acting at once: its hold is dropped before it reads who won.
 
+use std::fmt;
+use std::io::Read;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use foundry_proto::ids::{MachineId, ProjectId};
+use nix::sys::signal::{Signal, killpg};
+use nix::unistd::Pid;
+use uuid::Uuid;
 
 use crate::clock::Clock;
 use crate::factory::worker::{Guard, LeaseLost};
@@ -17,81 +47,689 @@ use crate::git_auth::GitAuth;
 
 /// The ref that holds the lease.
 pub const REF: &str = "refs/factory/lease";
-/// How long a holder waits after its last push started before it renews.
+
+/// How long after the start of its last push a holder renews.
 pub const RENEW_AFTER: Duration = Duration::from_secs(60);
+
 /// How long after the start of its last successful push a holder may still act.
 pub const ACT_WITHIN: Duration = Duration::from_secs(120);
+
 /// How long another machine sees one lease commit unchanged before it takes over.
 pub const TAKE_OVER_AFTER: Duration = Duration::from_secs(180);
-/// How long a git call of the lease may run before it is killed.
+
+/// How long a git call of the lease may run before it is killed. A push is one of them.
 pub const PUSH_LIMIT: Duration = Duration::from_secs(30);
+
+/// How often a running git call is looked at.
+const POLL: Duration = Duration::from_millis(10);
+
+/// The most git's output the lease keeps. The rest is read and dropped.
+const OUTPUT_LIMIT: usize = 1024 * 1024;
+
+/// The first line of every lease commit's message.
+const SUBJECT: &str = "foundry factory lease";
 
 /// What a tick found.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LeaseState {
-    /// This machine holds the lease at `generation`.
-    Held { generation: u64 },
-    /// Another machine holds it, or this one's hold has lapsed.
-    HeldBy { machine: MachineId, generation: u64 },
-    /// The lease was made with no token.
+    /// This machine holds the lease at `generation` and may act.
+    Held {
+        /// The generation of the lease.
+        generation: u64,
+    },
+    /// This machine may not act. `machine` and `generation` are the holder and generation last
+    /// read in the ref. That is this machine itself when its own hold has lapsed.
+    HeldBy {
+        /// The holder named in the ref.
+        machine: MachineId,
+        /// The generation named in the ref.
+        generation: u64,
+    },
+    /// The lease was made with no token, so it runs no git.
     NoToken,
-    /// Not held and no holder is known.
-    Unknown { reason: String },
+    /// This machine does not hold the lease and no holder is known, so there is no honest
+    /// [`MachineId`] to name: the ref could not be read and none was read before, or the ref
+    /// is missing and the take failed, or it holds a commit the lease did not write. `reason`
+    /// is a fixed text.
+    Unknown {
+        /// Why no holder is known.
+        reason: String,
+    },
 }
 
-/// One project's lease on this machine.
+/// The holder, generation and renewal count a lease commit's message names.
+#[derive(Clone, Copy, Debug)]
+struct Parsed {
+    holder: MachineId,
+    generation: u64,
+    renewals: u64,
+}
+
+impl Parsed {
+    /// The fields of a lease commit's message, or `None` for any other message.
+    fn from_message(message: &str) -> Option<Parsed> {
+        let (subject, body) = message.split_once("\n\n")?;
+        if subject.trim() != SUBJECT {
+            return None;
+        }
+        let field = |name: &str| {
+            body.lines()
+                .find_map(|line| line.strip_prefix(name)?.strip_prefix(": "))
+                .map(str::trim)
+        };
+        Some(Parsed {
+            holder: MachineId(field("holder")?.parse::<Uuid>().ok()?),
+            generation: field("generation")?.parse().ok()?,
+            renewals: field("renewals")?.parse().ok()?,
+        })
+    }
+}
+
+/// What this machine holds: its last successful push.
+#[derive(Clone, Debug)]
+struct Hold {
+    generation: u64,
+    /// The clock reading taken before the push child was started.
+    started: Duration,
+    sha: String,
+}
+
+/// The commit last read in the ref.
+#[derive(Clone, Debug)]
+struct Seen {
+    sha: String,
+    /// The clock reading when this lease first read this commit.
+    since: Duration,
+    /// `None` when the message is not one the lease writes.
+    lease: Option<Parsed>,
+}
+
+/// How the last read of the ref ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LastRead {
+    Never,
+    Failed,
+    Done,
+}
+
+#[derive(Debug)]
+struct State {
+    hold: Option<Hold>,
+    seen: Option<Seen>,
+    last_read: LastRead,
+    /// The highest generation seen anywhere: told by the caller, read in the ref, or pushed.
+    highest: u64,
+    released: bool,
+}
+
+/// What a lease and its guards share.
+struct Shared {
+    clock: Arc<dyn Clock>,
+    state: Mutex<State>,
+}
+
+impl Shared {
+    fn state(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The generation while the lease is held at `now`, else why not.
+    fn check_at(&self, now: Duration) -> Result<u64, LeaseLost> {
+        let state = self.state();
+        let lost = |reason: String| Err(LeaseLost { reason });
+        if state.released {
+            return lost("the lease was released".into());
+        }
+        let Some(hold) = &state.hold else {
+            return lost("this machine does not hold the lease".into());
+        };
+        let age = now.saturating_sub(hold.started);
+        if age < ACT_WITHIN {
+            Ok(hold.generation)
+        } else {
+            lost(format!(
+                "the last successful lease push started {} s ago",
+                age.as_secs()
+            ))
+        }
+    }
+}
+
+/// How one git call ended.
+#[derive(Debug)]
+enum Outcome {
+    /// The call exited: `code` is `None` when a signal ended it.
+    Exit { code: Option<i32>, stdout: String },
+    /// The call was still running at [`PUSH_LIMIT`] and was killed.
+    TimedOut,
+    /// The call could not be started or waited for.
+    NotStarted,
+}
+
+/// A git call's end and the clock reading taken before it started.
+struct Ran {
+    started: Duration,
+    outcome: Outcome,
+}
+
+impl Ran {
+    /// The trimmed stdout of a call that exited 0.
+    fn ok_stdout(&self) -> Option<&str> {
+        match &self.outcome {
+            Outcome::Exit {
+                code: Some(0),
+                stdout,
+            } => Some(stdout.trim()),
+            _ => None,
+        }
+    }
+}
+
+/// What reading the ref found.
+enum Found {
+    Missing,
+    Present { sha: String, parsed: Option<Parsed> },
+    Failed,
+}
+
+/// What a tick does after it read the ref.
+enum Plan {
+    Nothing,
+    Push {
+        generation: u64,
+        renewals: u64,
+        /// The commit the ref must be at for the push to land, or none for no ref.
+        expect: Option<String>,
+    },
+}
+
+/// How a push ended.
+enum Pushed {
+    Landed,
+    Refused,
+    Failed,
+}
+
+/// One project's lease on this machine. Share it between a task that ticks and the guards it
+/// gives out: [`Lease::tick`] blocks on git children and is called from a blocking thread.
 pub struct Lease {
+    project: ProjectId,
+    url: String,
+    auth: Option<GitAuth>,
+    me: MachineId,
+    dir: PathBuf,
     git: PathBuf,
+    shared: Arc<Shared>,
+    /// Held for a whole tick, so two ticks never read and push at once.
+    ticking: Mutex<()>,
+}
+
+impl fmt::Debug for Lease {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Lease")
+            .field("project", &self.project)
+            .field("me", &self.me)
+            .field("dir", &self.dir)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Lease {
-    /// The lease for `project` in the repo at `remote_url`.
+    /// The lease for `project` in the repo at `remote_url`, held by `me`, with its bare git
+    /// directory at `lease_dir`, made on first use. With no `git_auth` the lease runs no git
+    /// and every tick is [`LeaseState::NoToken`].
     pub fn new(
-        _project: ProjectId,
-        _remote_url: impl Into<String>,
-        _git_auth: Option<GitAuth>,
-        _clock: Arc<dyn Clock>,
-        _me: MachineId,
-        _lease_dir: impl Into<PathBuf>,
+        project: ProjectId,
+        remote_url: impl Into<String>,
+        git_auth: Option<GitAuth>,
+        clock: Arc<dyn Clock>,
+        me: MachineId,
+        lease_dir: impl Into<PathBuf>,
     ) -> Lease {
-        todo!("the lease is not built yet")
+        Lease {
+            project,
+            url: remote_url.into(),
+            auth: git_auth,
+            me,
+            dir: lease_dir.into(),
+            git: PathBuf::from("git"),
+            shared: Arc::new(Shared {
+                clock,
+                state: Mutex::new(State {
+                    hold: None,
+                    seen: None,
+                    last_read: LastRead::Never,
+                    highest: 0,
+                    released: false,
+                }),
+            }),
+            ticking: Mutex::new(()),
+        }
     }
 
-    /// Runs `program` in place of `git`, for tests.
+    /// The same lease running `program` in place of `git`, for tests.
     #[cfg(test)]
     fn with_git(mut self, program: impl Into<PathBuf>) -> Self {
         self.git = program.into();
         self
     }
 
-    /// The project.
+    /// The project this lease is for.
     pub fn project(&self) -> ProjectId {
-        todo!()
+        self.project
     }
 
-    /// One look at the lease.
-    pub fn tick(&self, _highest_seen_generation: u64) -> LeaseState {
-        todo!()
-    }
-
-    /// The guard.
+    /// The guard that says whether this machine may act now. It never waits on a push.
     pub fn guard(&self) -> LeaseGuard {
-        todo!()
+        LeaseGuard {
+            shared: self.shared.clone(),
+        }
     }
 
-    /// Stops acting.
+    /// Stops acting: the guard fails from now on and no later tick pushes. Nothing is pushed
+    /// here. A machine that stops acting stops renewing, and the next coordinator takes over
+    /// after the wait.
     pub fn release(&self) {
-        todo!()
+        let mut state = self.shared.state();
+        state.released = true;
+        state.hold = None;
+    }
+
+    /// Reads the ref and takes, renews or takes over the lease as the module doc says, then
+    /// says what this machine may do. `highest_seen_generation` is the highest generation the
+    /// caller knows for the project, from a `run_event` or a `factory_status`. Blocking: it
+    /// runs git children, each ended within [`PUSH_LIMIT`], so call it from a blocking thread.
+    pub fn tick(&self, highest_seen_generation: u64) -> LeaseState {
+        let _ticking = self.ticking.lock().unwrap_or_else(PoisonError::into_inner);
+        {
+            let mut state = self.shared.state();
+            state.highest = state.highest.max(highest_seen_generation);
+            if self.auth.is_some() && state.released {
+                drop(state);
+                return self.report();
+            }
+        }
+        let Some(auth) = &self.auth else {
+            return LeaseState::NoToken;
+        };
+        let read = self.read_ref(auth);
+        let now = self.shared.clock.now();
+        if let Plan::Push {
+            generation,
+            renewals,
+            expect,
+        } = self.decide(&read, now)
+        {
+            self.push(auth, generation, renewals, expect.as_deref());
+        }
+        self.report()
+    }
+
+    /// What this machine may do, from what it holds and last read.
+    fn report(&self) -> LeaseState {
+        let now = self.shared.clock.now();
+        if let Ok(generation) = self.shared.check_at(now) {
+            return LeaseState::Held { generation };
+        }
+        let state = self.shared.state();
+        if let Some(Seen {
+            lease: Some(lease), ..
+        }) = &state.seen
+        {
+            return LeaseState::HeldBy {
+                machine: lease.holder,
+                generation: lease.generation,
+            };
+        }
+        let reason = match (&state.seen, state.last_read) {
+            (_, LastRead::Failed) => "the lease ref could not be read",
+            (None, LastRead::Never) => "the lease ref has not been read",
+            (None, LastRead::Done) => "the lease ref is missing and could not be taken",
+            (Some(_), _) => "the lease ref holds a commit foundryd did not write",
+        };
+        LeaseState::Unknown {
+            reason: reason.into(),
+        }
+    }
+
+    /// Records what was read in the ref, without deciding anything.
+    fn observe(&self, read: &Found, now: Duration) {
+        let mut state = self.shared.state();
+        match read {
+            Found::Failed => state.last_read = LastRead::Failed,
+            Found::Missing => {
+                state.last_read = LastRead::Done;
+                state.seen = None;
+            }
+            Found::Present { sha, parsed } => {
+                state.last_read = LastRead::Done;
+                let since = match &state.seen {
+                    Some(seen) if seen.sha == *sha => seen.since,
+                    _ => now,
+                };
+                if let Some(parsed) = parsed {
+                    state.highest = state.highest.max(parsed.generation);
+                }
+                state.seen = Some(Seen {
+                    sha: sha.clone(),
+                    since,
+                    lease: *parsed,
+                });
+            }
+        }
+    }
+
+    /// Updates what was seen and held after a read, and says what to push, if anything.
+    fn decide(&self, read: &Found, now: Duration) -> Plan {
+        self.observe(read, now);
+        let mut state = self.shared.state();
+        match read {
+            Found::Failed => Plan::Nothing,
+            Found::Missing => {
+                state.hold = None;
+                Plan::Push {
+                    generation: state.highest + 1,
+                    renewals: 0,
+                    expect: None,
+                }
+            }
+            Found::Present { sha, parsed } => {
+                if let Some(parsed) = parsed.filter(|parsed| parsed.holder == self.me) {
+                    let fresh = state.hold.as_ref().is_some_and(|hold| {
+                        hold.sha == *sha && now.saturating_sub(hold.started) < RENEW_AFTER
+                    });
+                    return if fresh {
+                        Plan::Nothing
+                    } else {
+                        Plan::Push {
+                            generation: parsed.generation,
+                            renewals: parsed.renewals + 1,
+                            expect: Some(sha.clone()),
+                        }
+                    };
+                }
+                state.hold = None;
+                let since = state.seen.as_ref().map_or(now, |seen| seen.since);
+                if now.saturating_sub(since) < TAKE_OVER_AFTER {
+                    return Plan::Nothing;
+                }
+                let above = parsed.map_or(0, |parsed| parsed.generation);
+                Plan::Push {
+                    generation: above.max(state.highest) + 1,
+                    renewals: 0,
+                    expect: Some(sha.clone()),
+                }
+            }
+        }
+    }
+
+    /// Makes a lease commit with no parent and pushes it as the ref, expecting the ref to be
+    /// at `expect` (or missing). A landed push is the hold; a refused one drops the hold and
+    /// reads who won; one that failed or timed out changes nothing, and the hold lapses by
+    /// age.
+    fn push(&self, auth: &GitAuth, generation: u64, renewals: u64, expect: Option<&str>) {
+        let Some(tree) = self
+            .git(auth, &["hash-object", "-t", "tree", "-w", "--stdin"], true)
+            .ok_stdout()
+            .map(str::to_owned)
+        else {
+            return;
+        };
+        let message = format!(
+            "{SUBJECT}\n\nholder: {}\ngeneration: {generation}\nrenewals: {renewals}\n",
+            self.me
+        );
+        let Some(commit) = self
+            .git(auth, &["commit-tree", &tree, "-m", &message], true)
+            .ok_stdout()
+            .map(str::to_owned)
+        else {
+            return;
+        };
+        let lease = format!("--force-with-lease={REF}:{}", expect.unwrap_or(""));
+        let target = format!("{commit}:{REF}");
+        let ran = self.git(
+            auth,
+            &["push", "--porcelain", &lease, "--", &self.url, &target],
+            true,
+        );
+        match pushed(&ran.outcome) {
+            Pushed::Landed => {
+                let now = self.shared.clock.now();
+                let mut state = self.shared.state();
+                state.highest = state.highest.max(generation);
+                state.last_read = LastRead::Done;
+                state.seen = Some(Seen {
+                    sha: commit.clone(),
+                    since: now,
+                    lease: Some(Parsed {
+                        holder: self.me,
+                        generation,
+                        renewals,
+                    }),
+                });
+                if !state.released {
+                    state.hold = Some(Hold {
+                        generation,
+                        started: ran.started,
+                        sha: commit,
+                    });
+                }
+            }
+            Pushed::Refused => {
+                self.shared.state().hold = None;
+                let read = self.read_ref(auth);
+                self.observe(&read, self.shared.clock.now());
+            }
+            Pushed::Failed => {}
+        }
+    }
+
+    /// Reads the ref in the remote into the lease directory and parses it.
+    fn read_ref(&self, auth: &GitAuth) -> Found {
+        if !self.dir.join("HEAD").exists() {
+            let init = self.git(
+                auth,
+                &[
+                    "init",
+                    "--bare",
+                    "--quiet",
+                    "--template=",
+                    &self.dir.to_string_lossy(),
+                ],
+                false,
+            );
+            if init.ok_stdout().is_none() {
+                return Found::Failed;
+            }
+        }
+        let refspec = format!("+{REF}:{REF}");
+        let fetch = self.git(
+            auth,
+            &["fetch", "--no-tags", "--quiet", "--", &self.url, &refspec],
+            true,
+        );
+        if fetch.ok_stdout().is_none() {
+            return self.read_missing(auth);
+        }
+        let Some(sha) = self
+            .git(auth, &["rev-parse", "--verify", "--quiet", REF], true)
+            .ok_stdout()
+            .filter(|sha| !sha.is_empty())
+            .map(str::to_owned)
+        else {
+            return Found::Failed;
+        };
+        let parsed = self
+            .git(auth, &["cat-file", "commit", &sha], true)
+            .ok_stdout()
+            .and_then(|commit| commit.split_once("\n\n"))
+            .and_then(|(_, message)| Parsed::from_message(message));
+        Found::Present { sha, parsed }
+    }
+
+    /// After a failed fetch: whether the ref is missing, or the remote could not be read.
+    fn read_missing(&self, auth: &GitAuth) -> Found {
+        let ran = self.git(
+            auth,
+            &["ls-remote", "--exit-code", "--", &self.url, REF],
+            true,
+        );
+        match ran.outcome {
+            // `ls-remote` says 2 when no ref matched.
+            Outcome::Exit { code: Some(2), .. } => Found::Missing,
+            // The pattern matches the tail of a name, so another ref may have been listed.
+            Outcome::Exit {
+                code: Some(0),
+                stdout,
+            } if !stdout
+                .lines()
+                .any(|line| line.split_whitespace().nth(1) == Some(REF)) =>
+            {
+                Found::Missing
+            }
+            _ => Found::Failed,
+        }
+    }
+
+    /// Runs git with `args` and the token, ending within [`PUSH_LIMIT`] on the clock. A call
+    /// that `in_repo` reads the lease directory and no other repository.
+    fn git(&self, auth: &GitAuth, args: &[&str], in_repo: bool) -> Ran {
+        let mut command = Command::new(&self.git);
+        auth.apply(&mut command);
+        if in_repo {
+            // After `apply`, which removes any inherited: git reads this repo and no other.
+            command
+                .env("GIT_DIR", &self.dir)
+                .env("GIT_COMMON_DIR", &self.dir)
+                .current_dir(&self.dir);
+        }
+        if self.url.starts_with('/') || self.url.starts_with("file://") {
+            command.env("GIT_ALLOW_PROTOCOL", "https:file");
+        }
+        command
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "foundryd")
+            .env("GIT_AUTHOR_EMAIL", "foundryd@localhost")
+            .env("GIT_COMMITTER_NAME", "foundryd")
+            .env("GIT_COMMITTER_EMAIL", "foundryd@localhost")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            // Its own process group, so a call killed at the limit takes what it started too.
+            .process_group(0);
+        let clock = &self.shared.clock;
+        let started = clock.now();
+        let ended = |outcome| Ran { started, outcome };
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(_) => return ended(Outcome::NotStarted),
+        };
+        let stdout = drain(child.stdout.take());
+        let stderr = drain(child.stderr.take());
+        // The leader's exit does not end the call: a descendant may still hold the pipes.
+        let mut status = None;
+        loop {
+            if status.is_none() {
+                match child.try_wait() {
+                    Ok(found) => status = found,
+                    Err(_) => {
+                        kill_group(&mut child);
+                        return ended(Outcome::NotStarted);
+                    }
+                }
+            }
+            if status.is_some() && stdout.is_finished() && stderr.is_finished() {
+                break;
+            }
+            if clock.now().saturating_sub(started) >= PUSH_LIMIT {
+                // A machine that slept through the call reads the clock past the limit at its
+                // first read after waking, and the answer is already there.
+                if status.is_none() {
+                    status = child.try_wait().ok().flatten();
+                }
+                kill_group(&mut child);
+                if status.is_none() {
+                    return ended(Outcome::TimedOut);
+                }
+                break;
+            }
+            thread::sleep(POLL);
+        }
+        let stdout = stdout.join().unwrap_or_default();
+        let _ = stderr.join();
+        ended(Outcome::Exit {
+            code: status.and_then(|status| status.code()),
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        })
     }
 }
 
-/// The guard of one lease.
+/// How a push ended, from the `--porcelain` line for the lease ref.
+fn pushed(outcome: &Outcome) -> Pushed {
+    let Outcome::Exit { code, stdout } = outcome else {
+        return Pushed::Failed;
+    };
+    // `<flag>\t<from>:<to>\t<summary>`; the flag may be a space, so lines are not trimmed.
+    let flag = stdout.lines().find_map(|line| {
+        let mut parts = line.split('\t');
+        let flag = parts.next()?;
+        let (_, to) = parts.next()?.rsplit_once(':')?;
+        (to == REF && flag.chars().count() == 1).then(|| flag.chars().next())?
+    });
+    match (code, flag) {
+        (Some(0), Some('*' | '+' | ' ' | '=')) => Pushed::Landed,
+        (_, Some('!')) => Pushed::Refused,
+        _ => Pushed::Failed,
+    }
+}
+
+/// Kills the child's process group and reaps the child. The leader may already be reaped when
+/// a descendant still holds a pipe; its id still names the group while any member is alive.
+fn kill_group(child: &mut Child) {
+    if let Ok(pid) = i32::try_from(child.id()) {
+        let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Reads `pipe` to its end on a thread of its own, keeping at most [`OUTPUT_LIMIT`] bytes.
+fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> JoinHandle<Vec<u8>> {
+    thread::spawn(move || {
+        let mut kept = Vec::new();
+        let Some(mut pipe) = pipe else {
+            return kept;
+        };
+        let mut buf = [0u8; 16 * 1024];
+        loop {
+            match pipe.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let room = OUTPUT_LIMIT.saturating_sub(kept.len());
+                    kept.extend_from_slice(&buf[..n.min(room)]);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+        kept
+    })
+}
+
+/// The guard of one [`Lease`]: it passes only while less than 120 seconds have passed since
+/// the start of the lease's last successful push. It reads no git and waits on no push.
 #[derive(Clone)]
-pub struct LeaseGuard {}
+pub struct LeaseGuard {
+    shared: Arc<Shared>,
+}
 
 impl Guard for LeaseGuard {
     fn check(&self) -> Result<u64, LeaseLost> {
-        todo!()
+        // Read before the lock is taken, so a read of the clock never holds up the lease.
+        let now = self.shared.clock.now();
+        self.shared.check_at(now)
     }
 }
 
@@ -232,7 +870,7 @@ mod tests {
             let body = message.split_once("\n\n").expect("a message").1;
             let mut lines = body.lines();
             let subject = lines.next().unwrap().to_string();
-            let mut field = |name: &str| -> String {
+            let field = |name: &str| -> String {
                 body.lines()
                     .find_map(|line| line.strip_prefix(&format!("{name}: ")))
                     .unwrap_or_else(|| panic!("no {name} in {body:?}"))
@@ -577,8 +1215,8 @@ exec git "$@"
         let c = rig.machine();
         assert_eq!(c.tick(1), held(2));
         assert_eq!(rig.remote.fields().generation, 2);
-        // The old holder finds the ref gone, takes it above everything it has seen.
-        assert_eq!(a.tick(0), a.held_by(2));
+        // The old holder finds the ref held by C and stops.
+        assert_eq!(a.tick(0), c.held_by(2));
         assert!(a.check().is_err());
     }
 
