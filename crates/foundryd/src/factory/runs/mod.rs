@@ -174,6 +174,33 @@ impl RunContext<'_> {
         Ok(self.tracker.mark_pr_draft(self.repo(), pr)?)
     }
 
+    /// A workspace made on `machine`.
+    pub fn create(
+        &self,
+        machine: foundry_proto::ids::MachineId,
+        request: super::worker::CreateWorkspace,
+    ) -> Result<WorkspaceId, RunError> {
+        self.held()?;
+        Ok(self.worker.create(machine, request)?)
+    }
+
+    /// A factory session started in `workspace` with `first` as its first message.
+    pub fn start_session(
+        &self,
+        workspace: WorkspaceId,
+        start: crate::sessions::factory::FactoryStart,
+        first: Message,
+    ) -> Result<SessionId, RunError> {
+        self.held()?;
+        Ok(self.worker.start_session(workspace, start, first)?)
+    }
+
+    /// The output of `terminal`, from its end.
+    pub fn tail(&self, terminal: foundry_proto::ids::TerminalId) -> Result<String, RunError> {
+        self.held()?;
+        Ok(self.worker.tail(terminal)?)
+    }
+
     /// `message` sent to `session`, when its count of prompts is not above `only_if_prompts`.
     pub fn send(
         &self,
