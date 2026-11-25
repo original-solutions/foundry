@@ -1223,7 +1223,24 @@ exec "$agent" "$@""#;
         config: Config,
         secrets: Arc<MemorySecrets>,
         sessions: Sessions,
+        /// The hook port's socket, held for the fixture's life so a restart serves the same
+        /// port with no moment in which another test could bind it.
+        listener: std::net::TcpListener,
         server: tokio::task::JoinHandle<()>,
+    }
+
+    /// Serves `sessions`' hooks on a clone of `listener`.
+    fn serve(listener: &std::net::TcpListener, sessions: &Sessions) -> tokio::task::JoinHandle<()> {
+        let listener = tokio::net::TcpListener::from_std(listener.try_clone().unwrap()).unwrap();
+        let router = sessions.router();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        })
     }
 
     impl Fx {
@@ -1244,7 +1261,8 @@ exec "$agent" "$@""#;
                 data.path(),
                 built("foundry-holder"),
             ));
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
             let port = listener.local_addr().unwrap().port();
             let home = tempfile::tempdir().unwrap();
             let config = Config {
@@ -1278,15 +1296,7 @@ exec "$agent" "$@""#;
             )
             .with_git_home(git_home.path().to_path_buf())
             .with_secrets(secrets.clone());
-            let router = sessions.router();
-            let server = tokio::spawn(async move {
-                axum::serve(
-                    listener,
-                    router.into_make_service_with_connect_info::<SocketAddr>(),
-                )
-                .await
-                .unwrap();
-            });
+            let server = serve(&listener, &sessions);
             Fx {
                 data,
                 worktree: tempfile::tempdir().unwrap(),
@@ -1298,6 +1308,7 @@ exec "$agent" "$@""#;
                 config,
                 secrets,
                 sessions,
+                listener,
                 server,
             }
         }
@@ -1361,18 +1372,7 @@ exec "$agent" "$@""#;
                 .store(reads, std::sync::atomic::Ordering::SeqCst);
             drop(std::mem::replace(&mut self.sessions, sessions));
             self.sessions.adopt().await;
-            let listener = tokio::net::TcpListener::bind(("127.0.0.1", self.config.hook_port))
-                .await
-                .unwrap();
-            let router = self.sessions.router();
-            self.server = tokio::spawn(async move {
-                axum::serve(
-                    listener,
-                    router.into_make_service_with_connect_info::<SocketAddr>(),
-                )
-                .await
-                .unwrap();
-            });
+            self.server = serve(&self.listener, &self.sessions);
         }
 
         /// The session's `session_turn` record, as any reader sees it.
