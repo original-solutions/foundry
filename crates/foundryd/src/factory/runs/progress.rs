@@ -67,6 +67,9 @@ pub const STUCK_COMMENTING: &str = "stuck-commenting";
 /// The step written, with the stop as JSON after it, before the stuck comment: the decision to
 /// give up, which a later pass finishes with the same words.
 pub const STUCK_STOP: &str = "stuck-stop ";
+/// The step written before `stuck-stop` when the stop has a detail, with the detail after it:
+/// a plain step, which the ledger hides as it hides the `stuck` line that holds the same detail.
+pub const STUCK_DETAIL: &str = "stuck-detail ";
 /// The step written before each try of a send to the session, with the send's key and the prompt
 /// count the try goes under after it.
 pub const SEND_INTENT: &str = "send-intent ";
@@ -324,6 +327,8 @@ pub struct Seen {
     /// The text after the `stuck-stop` step: the recorded decision to go stuck, with no `stuck`
     /// line yet when `stuck` is `None`.
     pub stuck_stop: Option<String>,
+    /// The text after the newest `stuck-detail` step: the detail of the decision to go stuck.
+    pub stuck_detail: Option<String>,
     /// The `gate-results-commenting` step since the results were last posted: the comment may be
     /// on the pull request with no `gate-results-posted` step.
     /// The id of the newest marked comment on the pull request when the step was written.
@@ -706,6 +711,9 @@ pub fn read_progress(events: &[RunEvent]) -> Seen {
                 }
                 if let Some(stop) = step.strip_prefix(STUCK_STOP) {
                     seen.stuck_stop = Some(stop.to_owned());
+                }
+                if let Some(detail) = step.strip_prefix(STUCK_DETAIL) {
+                    seen.stuck_detail = Some(detail.to_owned());
                 }
                 if let Some(id) = commenting_id(step, QUESTIONS_COMMENTING) {
                     seen.questions_commenting = Some(id);

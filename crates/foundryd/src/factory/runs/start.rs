@@ -760,6 +760,7 @@ fn finish_begun_path(
             .map_err(|error| RunError::Invalid(format!("the stuck decision of {run}: {error}")))?;
         let reason = decision.stop.reason.clone();
         let mut stop = decision.stop;
+        stop.detail = seen.stuck_detail.clone();
         // The decision holds no setup output; the workspace is kept, so the tail is read again
         // as the first pass read it. A failed read posts the reason alone.
         if decision.code == "setup-failed"

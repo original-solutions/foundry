@@ -49,7 +49,7 @@ use crate::sessions::factory::SendRefused;
 use crate::store::StoreError;
 use progress::{
     GATE_RESULTS_COMMENTING, GATE_RESULTS_POSTED, QUESTIONS_COMMENTING, SEND_INTENT, SEND_REFUSED,
-    SEND_TYPED, STUCK_COMMENTING, STUCK_STOP, Seen, SendTries,
+    SEND_TYPED, STUCK_COMMENTING, STUCK_DETAIL, STUCK_STOP, Seen, SendTries,
 };
 
 /// What a step of a run can fail with.
@@ -400,9 +400,16 @@ pub fn apply_actions(
                     if at.seen.stuck_stop.is_none()
                         && let Some(stop) = &at.stop
                     {
-                        // Short fields only: no output of a session or a setup, which the
-                        // ledger's hiding cannot see through a JSON escape and cuts from its
-                        // front past 64 KB.
+                        // The detail goes in a plain step of its own, which the ledger hides
+                        // as it hides the `stuck` line. The decision holds short fields only:
+                        // no detail and no output of a session or a setup, which the ledger's
+                        // hiding cannot see through a JSON escape and cuts from its front past
+                        // 64 KB. A resumed path reads the detail step back and the output again
+                        // from where it came (`setup-failed` reads the tail; a session's text
+                        // is its turn's, task 23's to read).
+                        if let Some(detail) = &stop.detail {
+                            ctx.record_step(&at.run, &format!("{STUCK_DETAIL}{detail}"), cause)?;
+                        }
                         let decision = StuckStop {
                             code: cause.reason.clone(),
                             stop: Stop {
