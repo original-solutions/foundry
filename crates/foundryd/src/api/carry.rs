@@ -224,7 +224,7 @@ pub(super) async fn worker_owner(
             on_store(&api.store, move |store| store.session(id))
                 .await?
                 .filter(|record| !record.deleted)
-                .map(|record| (record.owner, record.deleted))
+                .map(|record| (record.owner, false))
         }
         Worker::Tail(id) => on_store(&api.store, move |store| store.terminal(id))
             .await?
