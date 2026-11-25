@@ -144,8 +144,12 @@
 //!    archive before it would leave a `building` run with no workspace if a write failed. The
 //!    pass is [`GateStep::Passed`] once all of it is done, the build workspace archived or
 //!    left (see 5); a pass cut short, failing or waiting finishes it on the next call, which
-//!    asks for no end of sessions, ready, comment or label again. A pull request merged on the
-//!    gated head while the gate ran ends the run only once the pass is finished. A `pr-open`
+//!    asks for no end of sessions, ready, comment or label again (`gate-ready-marked
+//!    <attempt>` notes the ready mark). A pull request merged on the gated head while the gate
+//!    ran has its pass recorded and finished and the run ended in that pass; when the finish
+//!    is cut short or waits, the next pass finishes the recorded pass and leaves the run in
+//!    `pr-open`, and ending it as merged is the feedback step's (task 28), as for any merge
+//!    after a recorded pass: the runner's two steps. A `pr-open`
 //!    run whose pass is finished is answered from the ledger `advance` read, with nothing more
 //!    read or asked.
 //!
@@ -367,6 +371,10 @@ pub const GATE_COULD_NOT_RUN: &str = "gate-could-not-run ";
 pub const GATE_WAITING: &str = "gate-waiting ";
 /// The step of a gate whose pull request head moved: `gate-head-moved <attempt> <head now>`.
 pub const GATE_HEAD_MOVED: &str = "gate-head-moved ";
+/// The step written once the pull request was marked ready at the pass:
+/// `gate-ready-marked <attempt>`. Written after the call, which is safe to repeat, so that a
+/// pass that waits after it does not mark the pull request ready again.
+pub const GATE_READY_MARKED: &str = "gate-ready-marked ";
 /// The step written once the build session is ended at the pass.
 pub const BUILD_SESSION_ENDED: &str = "build-session-ended";
 /// The step written when the end of the build session is first answered "unreachable" under
@@ -535,6 +543,8 @@ struct Log {
     /// Attempts whose `gate_finished` is written.
     finished: BTreeSet<u32>,
     session_ended: bool,
+    /// Attempts whose pass marked the pull request ready (`gate-ready-marked`).
+    ready_marked: BTreeSet<u32>,
     /// The end of the build session was given up on (`build-session-left`).
     session_left: bool,
     /// As `Req::archive_waiting`, for the end of the build session (`build-session-waiting`).
@@ -766,6 +776,10 @@ impl Log {
             {
                 self.note(attempt, 0);
                 self.failing.insert(attempt, kind.to_owned());
+            }
+        } else if let Some(attempt) = step.strip_prefix(GATE_READY_MARKED) {
+            if let Some(attempt) = number(Some(attempt)) {
+                self.ready_marked.insert(attempt);
             }
         } else if step == BUILD_SESSION_ENDED {
             self.session_ended = true;
@@ -1876,9 +1890,10 @@ impl Gate<'_, '_> {
                 let pass = seen
                     .pass
                     .ok_or_else(|| RunError::Invalid("the pass is not on record".into()))?;
-                // The run is ended only once the pass is finished: one that waits on an archive
-                // or a session's end is carried on by the next pass, which reads the pass on
-                // record and finishes it there.
+                // The run is ended here only when the pass is finished in this pass. One that
+                // waits on an archive or a session's end is finished by the next pass from the
+                // pass on record, which leaves the run in `pr-open` for the feedback step to end
+                // as merged (the runner's two steps).
                 let finished = self.finish_pass(&pass, false)?;
                 if !matches!(finished, GateStep::Passed { .. }) {
                     return Ok(finished);
@@ -2474,13 +2489,14 @@ impl Gate<'_, '_> {
         if let Some(step) = self.sweep_for_pr_open()? {
             return Ok(step);
         }
-        let (seen, _) = self.fresh()?;
+        let (seen, log) = self.fresh()?;
         let (_, actions) = transition(State::Building, &LifecycleEvent::PrReady { pr: self.pr })?;
         let cause = self.cause(GATE_PASSED).attempt(pass.attempt);
         // The ready mark first: until it holds, the pass can still be undone, and the session
         // it would have to go back to must be alive. A pull request that is no longer open
-        // gets nothing marked or posted.
-        if still_open {
+        // gets nothing marked or posted, and one marked ready by this pass is not marked
+        // again by a pass that carries the finish on (a person's draft since then stands).
+        if still_open && !log.ready_marked.contains(&pass.attempt) {
             let mut at = self.at(&seen);
             let mark = [Action::MarkPrReady { pr: self.pr }];
             apply_actions(
@@ -2490,6 +2506,11 @@ impl Gate<'_, '_> {
                 &mark,
                 &cause,
                 &ActionPayload::default(),
+            )?;
+            self.step(
+                &format!("{GATE_READY_MARKED}{}", pass.attempt),
+                "gate-ready-marked",
+                Some(pass.attempt),
             )?;
         }
         if !self.end_session(false)? {
