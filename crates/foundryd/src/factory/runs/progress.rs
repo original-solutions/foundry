@@ -41,6 +41,19 @@ pub const LAUNCH_PULL_REQUEST: &str = "launch-pull-request ";
 pub const LAUNCH_BASE: &str = "launch-base ";
 /// The step written before `launch-sending` when the launch runs on a fallback: `launch-model <model>`.
 pub const LAUNCH_MODEL: &str = "launch-model ";
+/// The step written before the build workspace is first asked for: `workspace-requested <name>`.
+/// Recorded before the create call, so a create whose answer was lost is asked for again by the
+/// same name and the worker's create answers with the first.
+pub const WORKSPACE_REQUESTED: &str = "workspace-requested ";
+/// The step written once the worker answered the create: `workspace-created <workspace id>`.
+pub const WORKSPACE_CREATED: &str = "workspace-created ";
+/// The step written before a launch that resumes is decided and its workspace asked for:
+/// `launch-resuming <branch>`. Read as `launch-sending resumed-from <branch>` is, except that no
+/// launch was sent yet. Foundry decides what a launch continues from before it asks for the
+/// workspace, which is made on that branch.
+pub const LAUNCH_RESUMING: &str = "launch-resuming ";
+/// The step written before the launch is asked for again by count: `launch-resending <count>`.
+pub const LAUNCH_RESENDING: &str = "launch-resending ";
 /// The step the run is approved on: `approved <time>`.
 pub const APPROVED: &str = "approved ";
 /// The ledger step that says the issue text was checked again after the launch.
@@ -215,6 +228,12 @@ pub struct Seen {
     pub claimed_ms: Option<u64>,
     /// The `github_user` of the first `claimed` line; `None` when there is none or it is not text.
     pub github_user: Option<String>,
+    /// The `machine` of the first `claimed` line: the machine the build workspace is asked of.
+    pub machine: Option<String>,
+    /// The name in the newest `workspace-requested` step: the build workspace was asked for.
+    pub workspace_requested: Option<String>,
+    /// The id in the newest `workspace-created` step: the worker answered the create.
+    pub workspace: Option<String>,
     /// The moment in the first `approved <time>` step: when an instructor applied the label the run was approved on.
     pub approved_at: Option<String>,
     /// The instructor on that step's cause (`actor`), who applied the label; `None` when the line names none.
@@ -614,6 +633,7 @@ pub fn read_progress(events: &[RunEvent]) -> Seen {
             "claimed" => {
                 if !seen.claimed {
                     seen.github_user = text(data, "github_user").map(str::to_owned);
+                    seen.machine = text(data, "machine").map(str::to_owned);
                     seen.claimed_ms = Some(ms);
                 }
                 seen.claimed = true;
@@ -632,6 +652,13 @@ pub fn read_progress(events: &[RunEvent]) -> Seen {
                 }
                 if step == APPROVAL_RECHECKED {
                     seen.rechecked = true;
+                }
+                if let Some(name) = step.strip_prefix(WORKSPACE_REQUESTED) {
+                    seen.workspace_requested = Some(name.to_owned());
+                    seen.workspace = None;
+                }
+                if let Some(id) = step.strip_prefix(WORKSPACE_CREATED) {
+                    seen.workspace = Some(id.to_owned());
                 }
                 if step == RESULT_LINE_REMINDED {
                     seen.reminded = true;
@@ -727,13 +754,23 @@ pub fn read_progress(events: &[RunEvent]) -> Seen {
                     seen.launch_resumed_from = None;
                     seen.launch_resumed_pr = None;
                     launch_pull_request = None;
+                } else if let Some(branch) = step.strip_prefix(LAUNCH_RESUMING) {
+                    seen.launch_resumed_from = Some(branch.to_owned());
+                    seen.launch_resumed_pr = match launch_pull_request.take() {
+                        Some((decided, url)) if decided == branch => Some(url),
+                        _ => None,
+                    };
                 } else if let Some(branch) = step.strip_prefix(LAUNCH_SENDING_RESUMED) {
                     seen.launch_sent = true;
+                    let previous_branch = seen.launch_resumed_from.take();
                     seen.launch_resumed_from = Some(branch.to_owned());
                     // Only the pull request decided with this branch: one from a decision a
                     // crash cut short before its `launch-sending` step is not this one's.
+                    let decided_before = seen.launch_resumed_pr.take();
                     seen.launch_resumed_pr = match launch_pull_request.take() {
                         Some((decided, url)) if decided == branch => Some(url),
+                        // The same branch decided before the workspace was asked for.
+                        _ if previous_branch.as_deref() == Some(branch) => decided_before,
                         _ => None,
                     };
                 } else if let Some(rest) = step.strip_prefix(LAUNCH_PULL_REQUEST) {
