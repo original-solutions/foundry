@@ -1703,8 +1703,9 @@ mod tests {
             );
         }
 
-        /// A tracker whose call to put the pull request back to draft fails, after which the
-        /// pull request reads as `after`: gone (`None`), or GitHub is down for the read.
+        /// A tracker whose call to put the pull request back to draft fails (refused, or a
+        /// 502, by `refused`), after which a read of the pull request fails: as gone (`gone`),
+        /// or as a 502.
         struct AfterFailure {
             sim: Arc<Sim>,
             failed: std::sync::atomic::AtomicBool,
@@ -1720,8 +1721,7 @@ mod tests {
                     self.failed.store(true, Ordering::SeqCst);
                     return Err(TrackerError::Other {
                         kind: crate::factory::github::OtherKind::Failed,
-                        // Where the pull request is then gone, `gh` was refused (status 1);
-                        // where GitHub is down, it was a 502.
+                        // `refused`: `gh` was refused (status 1 and a reason); else a 502.
                         message: if self.refused {
                             "`gh pr ready` exited with status 1: boom".into()
                         } else {
@@ -1899,6 +1899,9 @@ mod tests {
                     "GraphQL: Pull request is already closed",
                     "HTTP 422: Unprocessable Entity",
                     "HTTP 403: Resource not accessible",
+                    // `HTTP 5` that is no status, and a refusal that quotes no URL.
+                    "see HTTP 5 docs",
+                    "unknown flag: --undo",
                 ] {
                     let message = finished(slug, exit(Some(1), stderr));
                     assert!(!gh_gave_no_answer(&message), "{message}");
@@ -1921,13 +1924,29 @@ mod tests {
                 "lookup api.github.com: no such host",
                 "read tcp 10.0.0.2:5000->140.82.112.5:443: connection reset by peer",
                 "dial: connection refused",
-                "dial tcp 140.82.112.5:443: i/o timeout",
+                // Only the phrase tells this one: it is not shaped as a `*url.Error`.
+                "read tcp 10.0.0.2:5000->140.82.112.5:443: i/o timeout",
                 "net/http: TLS handshake timeout",
                 "connect: network is unreachable",
                 "Temporary failure in name resolution",
                 "the operation timed out",
                 "Get \"https://api.github.com\": EOF",
                 "read: unexpected EOF",
+                // Go's `*url.Error`, which is how `gh` prints a transport failure that is
+                // not DNS: a method, the quoted URL, then the failure, whatever it says.
+                "Post \"https://api.github.com/graphql\": write tcp 10.0.0.2:50000->140.82.112.6:443: write: broken pipe",
+                "Post \"https://api.github.com/graphql\": http2: server sent GOAWAY and closed the connection; LastStreamID=1, ErrCode=NO_ERROR, debug=\"\"",
+                "Post \"https://api.github.com/graphql\": read tcp 10.0.0.2:50000->140.82.112.6:443: use of closed network connection",
+                "Post \"https://api.github.com/graphql\": remote error: tls: bad record MAC",
+                "Post \"https://api.github.com/graphql\": http2: client connection lost",
+                "Post \"https://api.github.com/graphql\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+                "Get \"https://api.github.com/repos/acme/widgets\": something nobody has worded yet",
+                "PATCH \"http://localhost:8080/x\": strange",
+                // Words of a failure of the connection, without the shape.
+                "http2: client connection lost",
+                "write: broken pipe",
+                "use of closed network connection",
+                "remote error: tls: bad record MAC",
             ] {
                 let message = finished(slug, exit(Some(1), stderr));
                 assert!(gh_gave_no_answer(&message), "{message}");
