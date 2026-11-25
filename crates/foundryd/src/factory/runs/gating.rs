@@ -56,16 +56,19 @@
 //!    workspace name (the one event with a text field of its own, which the ledger cuts and
 //!    hides on its own, so nothing done to the tail can reach the verdict), then
 //!    `gate-ended <k> <exit code>` records the verdict, a short step. Then the gate's workspace
-//!    is archived by force (`gate-archiving <k>`, the call, then `gate-archived <k>`, which is
-//!    written only once a call succeeded, or the worker answered that the workspace is
-//!    unknown or already archived, or it made nothing (`gate-create-refused <k>`), or its
-//!    machine is gone and `resume::orphans` has it; an archive refused as unreachable by a
-//!    machine that is not gone is asked again, a wait that ends when the machine answers or
-//!    is gone; a create that got no answer is asked again, which the worker answers with the
-//!    workspace it made, to find and archive it; a refusal of any other kind three times
-//!    (`ARCHIVE_TRIES`, `gate-archive-failed <k>`) is a workspace that can never be archived,
-//!    and the run is stuck, the exit paths archiving whatever they can and never held by one
-//!    that cannot be), `gate_command` lines (those of this gate not yet on record) (one for each command, as the exit code says) and
+//!    is archived by force by one rule (`archive_gate`): only `archive` is called, on the
+//!    recorded workspace id or the one the view shows live under the gate's name, never a
+//!    create (which would start the pull request's commands). `gate-archiving <k>`, the call,
+//!    then `gate-archived <k>`, which is also written when the worker answers that the
+//!    workspace "is not a live workspace of this machine" or the view shows none live. A
+//!    create that failed or got no answer may have made one, so it is looked for by name on
+//!    later passes. A gate that cannot be archived is recorded `gate-left <k> <id or -> <why>`
+//!    (fixed words) for `resume::orphans` or a person, and the run goes on, never stuck: at
+//!    once on an exit path (stuck, stop, abandon, end, `pr-open`) when the archive is refused
+//!    or unreachable, its machine is gone, or nothing was ever shown; otherwise after
+//!    `ARCHIVE_TRIES` refusals, or `UNSEEN_PASSES` passes with nothing shown. An archive
+//!    refused as unreachable by a machine that is not gone is asked again next pass. Then
+//!    `gate_command` lines (those of this gate not yet on record) and
 //!    `gate_finished` are written, and the verdict is acted on.
 //! 6. **Act.** The pull request is read again. A head that is not the one gated is
 //!    `gate-head-moved <attempt> <head>`, whichever the verdict, and the next pass gates the
@@ -299,9 +302,6 @@ pub const GATE_CREATED: &str = "gate-created ";
 pub const GATE_ENDED: &str = "gate-ended ";
 /// The step written before a failed attempt is sent back: `gate-failing <attempt> <kind>`.
 pub const GATE_FAILING: &str = "gate-failing ";
-/// The step of a create the worker answered as failed, so nothing was made to archive:
-/// `gate-create-refused <k>`.
-pub const GATE_CREATE_REFUSED: &str = "gate-create-refused ";
 /// The step of a forced archive that failed other than as unreachable: `gate-archive-failed <k>`.
 pub const GATE_ARCHIVE_FAILED: &str = "gate-archive-failed ";
 /// How many such failures make a gate workspace one that can never be archived.
@@ -428,7 +428,7 @@ pub fn gate_running(events: &[RunEvent]) -> bool {
     Log::read(events)
         .reqs
         .last()
-        .is_some_and(|req| !req.archived && !req.cnr)
+        .is_some_and(|req| !req.archived && !req.left && !req.cnr)
 }
 
 // ----- what the gate's own steps say -----
@@ -446,8 +446,8 @@ struct Req {
     archiving: bool,
     archived: bool,
     cnr: bool,
-    /// The worker answered the create as failed: nothing was made.
-    refused: bool,
+    /// The gate was recorded as left (`gate-left`).
+    left: bool,
     /// Forced archives that failed, other than as unreachable.
     archive_failed: u32,
     /// Passes that found the created gate's workspace or terminal missing from the fleet.
@@ -641,9 +641,9 @@ impl Log {
                     reqs_at: self.reqs.len(),
                 });
             }
-        } else if let Some(k) = step.strip_prefix(GATE_CREATE_REFUSED) {
-            if let Some(req) = self.req(number(Some(k))) {
-                req.refused = true;
+        } else if let Some(rest) = step.strip_prefix(GATE_LEFT) {
+            if let Some(req) = self.req(number(rest.split(' ').next())) {
+                req.left = true;
             }
         } else if let Some(k) = step.strip_prefix(GATE_ARCHIVE_FAILED) {
             if let Some(req) = self.req(number(Some(k))) {
@@ -845,12 +845,10 @@ fn is_url_error(error: &str) -> bool {
     })
 }
 
-/// Whether the worker's answer to an archive says the workspace is not there to archive.
-fn already_archived(said: &str) -> bool {
-    let said = said.to_lowercase();
-    ["unknown", "not found", "already archived", "no such"]
-        .iter()
-        .any(|words| said.contains(words))
+/// Whether the worker's answer to an archive is P1's `WorkspaceError::Unknown`: the workspace
+/// "is not a live workspace of this machine".
+fn not_live(said: &str) -> bool {
+    said.contains("is not a live workspace of this machine")
 }
 
 /// The stop of a gate that could not run: the factory's words in the comment, what the worker
@@ -861,6 +859,12 @@ fn could_not_run_stop(reason: &str) -> Stop {
         detail: Some(format!("the gate could not run: {reason}")),
         ..Stop::default()
     }
+}
+
+/// Whether the session can take a message now: only an idle one. One that works cannot, and
+/// neither can one whose process ended (the interruption rule is `resume`'s).
+fn can_take_a_message(state: SessionState) -> bool {
+    state == SessionState::Idle
 }
 
 /// Whether the session cannot be sent a message now.
@@ -1012,80 +1016,62 @@ impl Gate<'_, '_> {
 
     // ----- a gate's workspace -----
 
-    /// The gate `req`'s workspace archived by force, with the intent recorded first, and
-    /// `gate-archived` recorded only once an archive call succeeded (or nothing was made, or
-    /// the machine is gone and the orphan sweep, `resume::orphans`, has it). A workspace the
-    /// worker answers as unknown or already archived is done. A create that got no answer
-    /// is asked again, which the worker answers with the workspace it made, to find it.
-    ///
-    /// An error other than a lost lease is, on an exit path (`exit`: the run ends, is
-    /// abandoned or goes stuck), recorded and let go, so no workspace holds the run. Otherwise
-    /// it is asked again on the next pass, and after `ARCHIVE_TRIES` refusals that are not
-    /// "unreachable" (a machine that answers or becomes gone ends that wait on its own) the
-    /// answer is `Some(reason)`: the workspace can never be archived.
-    fn archive_gate(&self, req: &Req, exit: bool) -> Result<Option<String>, RunError> {
-        if req.archived {
-            return Ok(None);
+    /// One rule for a gate workspace. Only `archive` is ever called, on a workspace id: the
+    /// recorded one, or the one the view shows live under the gate's name; a gate is never
+    /// asked for again, since that would start the pull request's commands. The gate is
+    /// recorded `gate-archived` when an archive call succeeded, when the worker answers that
+    /// the workspace is not live (`WorkspaceError::Unknown`), or when the view shows no live
+    /// workspace of that name or id. A create that failed or got no answer may have made it:
+    /// it is looked for by name on later passes. A gate that cannot be archived is recorded
+    /// `gate-left <k> <id or -> <why>` (fixed words), for `resume::orphans` or a person, and
+    /// the run goes on: at once on an exit path (the run ends, is abandoned, goes stuck or
+    /// reaches `pr-open`) when the archive is refused or unreachable, the machine is gone, or
+    /// nothing was ever shown; otherwise after `ARCHIVE_TRIES` refusals, or when nothing was
+    /// shown within `UNSEEN_PASSES` passes. An archive refused as unreachable by a machine
+    /// that is not gone is asked again on the next pass off an exit path.
+    fn archive_gate(&self, req: &Req, exit: bool) -> Result<(), RunError> {
+        if req.archived || req.left {
+            return Ok(());
         }
-        match self.try_archive(req) {
-            Ok(()) => {
-                self.step(&format!("{GATE_ARCHIVED}{}", req.k), "gate-archived", None)?;
-                Ok(None)
-            }
-            Err(error @ RunError::LeaseLost(_)) => Err(error),
-            Err(error) => {
-                let unreachable = matches!(error, RunError::Worker(WorkerError::Unreachable(_)));
-                if !unreachable {
-                    self.step(
-                        &format!("{GATE_ARCHIVE_FAILED}{}", req.k),
-                        "gate-archive-failed",
-                        None,
-                    )?;
-                }
-                if exit {
-                    return Ok(None);
-                }
-                if !unreachable && req.archive_failed + 1 >= ARCHIVE_TRIES {
-                    return Ok(Some(error.to_string().replace('\n', " ")));
-                }
-                Err(error)
-            }
-        }
-    }
-
-    fn try_archive(&self, req: &Req) -> Result<(), RunError> {
         let ctx = self.ctx;
-        let found = ctx
+        let live = ctx
             .view
-            .workspace_named(ctx.project.id, &gate::name(self.run, req.k))
-            .map(|record| (record.body.id, record.owner));
-        let machine = found
+            .workspaces_named(ctx.project.id, &gate::name(self.run, req.k));
+        let shown = live.first().map(|record| (record.body.id, record.owner));
+        let recorded = req.created.as_deref().map(workspace_id).transpose()?;
+        let id = recorded.or(shown.map(|(id, _)| id));
+        let machine = shown
             .map(|(_, owner)| owner)
             .or_else(|| uuid::Uuid::parse_str(&req.machine).ok().map(MachineId));
+        let left = |why: &str| {
+            let named = id.map_or("-".to_owned(), |id| id.0.to_string());
+            self.step(
+                &format!("{GATE_LEFT}{} {named} {why}", req.k),
+                "gate-left",
+                None,
+            )
+        };
+        let archived = || self.step(&format!("{GATE_ARCHIVED}{}", req.k), "gate-archived", None);
         if machine
             .is_some_and(|machine| ctx.view.unreachable_for(machine) >= gate::MACHINE_GONE_AFTER)
         {
-            return Ok(());
+            return left("its machine is gone");
         }
-        let id = match (&req.created, found) {
-            (Some(id), _) => workspace_id(id)?,
-            (None, Some((id, _))) => id,
-            // The worker said it made nothing.
-            (None, None) if req.refused => return Ok(()),
-            (None, None) => {
-                let machine = machine.ok_or_else(|| {
-                    RunError::Invalid(format!("the gate's machine {:?}", req.machine))
-                })?;
-                let request = gate::request(ctx.config, ctx.project.id, &req.sha, self.run, req.k);
-                let id = ctx.create(machine, request)?;
-                self.step(
-                    &format!("{GATE_CREATED}{} {}", req.k, id.0),
-                    "gate-created",
-                    Some(req.attempt),
-                )?;
-                id
+        let Some(id) = id else {
+            // Nothing was made that is shown: it may be made yet.
+            if exit || req.unseen + 1 >= UNSEEN_PASSES {
+                return left("no workspace was shown for it");
             }
+            return self.step(
+                &format!("{GATE_UNSEEN}{}", req.k),
+                "gate-unseen",
+                Some(req.attempt),
+            );
         };
+        if !live.iter().any(|record| record.body.id == id) {
+            // The fleet shows no live workspace of it: nothing is left to archive.
+            return archived();
+        }
         if !req.archiving {
             self.step(
                 &format!("{GATE_ARCHIVING}{}", req.k),
@@ -1094,35 +1080,41 @@ impl Gate<'_, '_> {
             )?;
         }
         match ctx.archive(id) {
-            Err(RunError::Worker(WorkerError::Failed(said))) if already_archived(&said) => Ok(()),
-            done => done,
+            Ok(()) => archived(),
+            Err(RunError::Worker(WorkerError::Failed(said))) if not_live(&said) => archived(),
+            Err(error @ RunError::LeaseLost(_)) => Err(error),
+            Err(error) => {
+                let unreachable = matches!(error, RunError::Worker(WorkerError::Unreachable(_)));
+                if exit {
+                    return left(if unreachable {
+                        "its archive was unreachable"
+                    } else {
+                        "its archive was refused"
+                    });
+                }
+                if unreachable {
+                    return Err(error);
+                }
+                self.step(
+                    &format!("{GATE_ARCHIVE_FAILED}{}", req.k),
+                    "gate-archive-failed",
+                    None,
+                )?;
+                if req.archive_failed + 1 >= ARCHIVE_TRIES {
+                    return left("its archive was refused");
+                }
+                Err(error)
+            }
         }
     }
 
-    /// Every gate workspace of the round that is not archived, archived on an exit path: the
-    /// run ends or goes stuck, and no workspace holds it back.
+    /// Every gate workspace of the round that is not archived or left, on an exit path.
     fn archive_all(&self) -> Result<(), RunError> {
         let (_, log) = self.fresh()?;
-        for req in log.reqs.iter().filter(|req| !req.archived) {
+        for req in log.reqs.iter().filter(|req| !req.archived && !req.left) {
             self.archive_gate(req, true)?;
         }
         Ok(())
-    }
-
-    /// The gate `req` archived off an exit path: `Some` is the stuck step of a workspace
-    /// that can never be archived.
-    fn archive_or_give_up(&self, req: &Req) -> Result<Option<GateStep>, RunError> {
-        match self.archive_gate(req, false)? {
-            None => Ok(None),
-            Some(error) => {
-                let stop = Stop {
-                    reason: "a gate workspace could not be archived".into(),
-                    detail: Some(format!("a gate workspace could not be archived: {error}")),
-                    ..Stop::default()
-                };
-                Ok(Some(self.stuck("gate-archive-failed", stop)?))
-            }
-        }
     }
 
     // ----- the pass -----
@@ -1160,7 +1152,7 @@ impl Gate<'_, '_> {
             let Some(state) = state else {
                 return self.stuck("session-gone", Stop::new(SESSION_GONE));
             };
-            if busy(state) || turn.is_none() {
+            if !can_take_a_message(state) || turn.is_none() {
                 return Ok(GateStep::NotReady);
             }
             let kind = log
@@ -1220,10 +1212,12 @@ impl Gate<'_, '_> {
             latest
         };
         // A gate that could not run is archived before another is placed.
-        for req in log.reqs.iter().filter(|req| req.cnr && !req.archived) {
-            if let Some(step) = self.archive_or_give_up(req)? {
-                return Ok(step);
-            }
+        for req in log
+            .reqs
+            .iter()
+            .filter(|req| req.cnr && !req.archived && !req.left)
+        {
+            self.archive_gate(req, false)?;
         }
         // A gate that could not run waits its passes out.
         if let Some(cnr) = log.active_cnr() {
@@ -1368,14 +1362,6 @@ impl Gate<'_, '_> {
                         Ok(GateStep::Running)
                     }
                     Err(RunError::Worker(error)) => {
-                        if matches!(error, WorkerError::Failed(_)) {
-                            // The worker answered: it made nothing.
-                            self.step(
-                                &format!("{GATE_CREATE_REFUSED}{}", req.k),
-                                "gate-create-refused",
-                                Some(req.attempt),
-                            )?;
-                        }
                         let reason = gate::could_not_run(Some(&error), Duration::ZERO, None)
                             .unwrap_or_else(|| error.to_string());
                         let (_, log) = self.fresh()?;
@@ -1503,9 +1489,7 @@ impl Gate<'_, '_> {
         let Some((code, tail)) = req.ended.clone() else {
             return Err(RunError::Invalid("the gate has no verdict".into()));
         };
-        if let Some(step) = self.archive_or_give_up(&req)? {
-            return Ok(step);
-        }
+        self.archive_gate(&req, false)?;
         let commands = self.commands();
         let result = gate::result(TerminalState::Exited, Some(code), &tail, &commands);
         let failing = match &result {
@@ -1946,7 +1930,12 @@ impl Gate<'_, '_> {
             return self.stuck("session-ended", Stop::new(SESSION_ENDED));
         }
         // One whose process ended cannot take it either: the interruption rule is `resume`'s.
-        if self.ctx.view.session_state(self.session) != Some(SessionState::Idle) {
+        if !self
+            .ctx
+            .view
+            .session_state(self.session)
+            .is_some_and(can_take_a_message)
+        {
             return Ok(GateStep::NotReady);
         }
         let ordinal = match seen.sending {
@@ -2153,7 +2142,7 @@ impl Gate<'_, '_> {
         let Some(state) = state else {
             return self.stuck("session-gone", Stop::new(SESSION_GONE));
         };
-        if busy(state) || turn.is_none() {
+        if !can_take_a_message(state) || turn.is_none() {
             return Ok(GateStep::NotReady);
         }
         if let Some(read) = read {
@@ -2218,6 +2207,7 @@ impl Gate<'_, '_> {
                 ..ActionPayload::default()
             },
         )?;
+        self.archive_all()?;
         self.archive_build()?;
         Ok(GateStep::Passed { pr: self.pr })
     }
