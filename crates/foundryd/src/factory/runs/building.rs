@@ -577,83 +577,85 @@ fn check_binding(
 }
 
 /// Whether a `gh` failure (`OtherKind::Failed`, as `github::gh::finish` words it) is that `gh`
-/// got no answer from GitHub about the pull request, told by shape and not by a list of
-/// transport failures, which cannot be complete:
+/// got no answer from GitHub about the pull request.
 ///
-/// - What `gh` prints for a failure of transport that is not DNS is Go's `*url.Error`: the
-///   HTTP method as the caller wrote it (`Post`, `Get`), the quoted URL, `": "`, and whatever
-///   the failure says (`broken pipe`, `http2: client connection lost`, `remote error: tls:`,
-///   `context deadline exceeded`, ...). Whatever it says, no answer came: that is the shape.
-/// - What `gh` prints for an answer is `HTTP <status>` and GitHub's message (a 5xx is no
-///   answer about this pull request, a 4xx is a refusal), or `GraphQL: ...`.
-/// - A call a signal ended (status `-1`), an answer over the output limit (`` ` printed more
-///   than``), and the words of a failed connection or lookup outside a `url.Error` are no
-///   answer too.
+/// A shape this does not name is a refusal. That is the runner's reading (every failure to
+/// draft but a rate limit is stuck, "exited with status 1: boom" included), and the safe side
+/// for this caller: the second look has read the pull request open and ready for review, which
+/// only the gate may leave it, so a refusal stops the run where a person sees it at once and
+/// loses nothing. A real refusal taken for no answer would be asked again every pass until
+/// `limits.minutes`, and end the run with a reason that names nothing.
 ///
-/// Only what `gh` said (after `` `<command>` exited with status <n>: ``) is read, never the
-/// command text, which names the repo. Anything else, a shape nobody has seen included, is a
-/// refusal: the runner's reading ("exited with status 1: boom" is GitHub refusing), and a pull
-/// request that can never be drafted is stuck at once, not retried until `limits.minutes`.
+/// No answer is told only by the wrappers around what `gh pr ready --undo` prints, as gh
+/// 2.105.0's source writes them, never by a list of failure words:
+///
+/// - Foundry's own: a call a signal ended (status `-1`), and an answer over the output limit
+///   (`` ` printed more than``).
+/// - gh's `printError`: a `*net.DNSError` anywhere in the chain prints
+///   `error connecting to <host>`.
+/// - Go's `*url.Error`, the transport's failure at any step: the method as net/http's
+///   `urlErrorOp` writes it (`Post`, `Get`), the quoted URL, `": "`, then any cause.
+/// - The lookup before the mutation: GitHub's answer is go-gh's `HTTP <status>...` or
+///   `GraphQL: ...`, and a 5xx is no answer about this pull request.
+/// - The mutation: `ready.go` wraps its error as `API call failed: <error>`. Inside it, GitHub's
+///   answer is a status in shurcooL-graphql's words (`non-200 OK status code: <status> ...`, a
+///   5xx is no answer) or `GraphQL: ...`; anything else there is the request not reaching
+///   GitHub or its answer not being read, which is no answer.
+///
+/// So Go's bare transport errors outside both wrappers (what a lookup whose answer was cut
+/// short prints) fall to the first rule. Only what `gh` said (after
+/// `` `<command>` exited with status <n>: ``) is read, never the command text, which names the
+/// repo.
 fn gh_gave_no_answer(message: &str) -> bool {
-    const EXITED: &str = "` exited with status ";
-    const METHODS: [&str; 12] = [
-        "GET", "POST", "PATCH", "PUT", "DELETE", "HEAD", "Get", "Post", "Patch", "Put", "Delete",
-        "Head",
-    ];
     if message.contains("` printed more than ") {
         return true;
     }
-    let Some((_, after)) = message.split_once(EXITED) else {
+    let Some((_, after)) = message.split_once("` exited with status ") else {
         return false;
     };
     let Some((status, said)) = after.split_once(": ") else {
         return false;
     };
-    if status == "-1" {
+    if status == "-1" || said.starts_with("error connecting to ") {
         return true;
     }
-    let url_error = said.split_once(' ').is_some_and(|(method, rest)| {
-        METHODS.contains(&method)
+    let (mutation, error) = match said.strip_prefix("API call failed: ") {
+        Some(error) => (true, error),
+        None => (false, said),
+    };
+    if let Some(status) = answered_status(error) {
+        return status >= 500;
+    }
+    if error.starts_with("GraphQL: ") {
+        return false;
+    }
+    mutation || is_url_error(error)
+}
+
+/// The status of GitHub's answer that `error` starts with, in go-gh's words
+/// (`HTTP 502: Bad Gateway (<url>)`) or shurcooL-graphql's
+/// (`non-200 OK status code: 502 Bad Gateway body: "..."`).
+fn answered_status(error: &str) -> Option<u16> {
+    let rest = error
+        .strip_prefix("HTTP ")
+        .or_else(|| error.strip_prefix("non-200 OK status code: "))?;
+    let digits = rest.get(..3)?;
+    if rest[3..].starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Whether `error` is Go's `*url.Error` (`%s %q: %s`): the method as `urlErrorOp` writes it
+/// (one capital, then lower case), the quoted `http` or `https` URL, `": "`, the cause.
+fn is_url_error(error: &str) -> bool {
+    error.split_once(' ').is_some_and(|(method, rest)| {
+        let mut letters = method.chars();
+        letters.next().is_some_and(|c| c.is_ascii_uppercase())
+            && letters.all(|c| c.is_ascii_lowercase())
             && (rest.starts_with("\"http://") || rest.starts_with("\"https://"))
             && rest.contains("\": ")
-    });
-    let server_error = said.match_indices("HTTP 5").any(|(at, _)| {
-        said[at + 6..]
-            .bytes()
-            .take(2)
-            .filter(u8::is_ascii_digit)
-            .count()
-            == 2
-    });
-    let said = said.to_ascii_lowercase();
-    let said = said.trim_end();
-    url_error
-        || server_error
-        || [
-            "error connecting to",
-            "dial tcp",
-            "no such host",
-            "connection refused",
-            "connection reset",
-            "connection lost",
-            "connection closed",
-            "closed network connection",
-            "closed the connection",
-            "broken pipe",
-            "goaway",
-            "i/o timeout",
-            "tls handshake timeout",
-            "tls:",
-            "network is unreachable",
-            "temporary failure in name resolution",
-            "timed out",
-            "context deadline exceeded",
-            "client.timeout exceeded",
-            "unexpected eof",
-        ]
-        .iter()
-        .any(|phrase| said.contains(phrase))
-        || said.ends_with(": eof")
+    })
 }
 
 /// The stop of a pull request that is not the run's: the factory's words, the detail the
@@ -1851,10 +1853,17 @@ mod tests {
         /// written, whatever the second look reads, and the next pass asks again.
         #[test]
         fn with_gh_getting_no_answer_on_putting_it_back_to_draft_is_an_error_not_stuck() {
-            let shapes: [fn() -> TrackerError; 3] = [
+            let shapes: [fn() -> TrackerError; 4] = [
                 || TrackerError::Other {
                     kind: crate::factory::github::OtherKind::Failed,
                     message: "`gh pr ready` exited with status 1: HTTP 502: Bad Gateway".into(),
+                },
+                // The mutation's own 5xx, as `gh pr ready --undo` prints it.
+                || TrackerError::Other {
+                    kind: crate::factory::github::OtherKind::Failed,
+                    message: "`gh pr ready` exited with status 1: API call failed: non-200 OK \
+                              status code: 502 Bad Gateway body: \"\""
+                        .into(),
                 },
                 || TrackerError::Other {
                     kind: crate::factory::github::OtherKind::Failed,
@@ -1928,6 +1937,10 @@ mod tests {
                     "GraphQL: Pull request is already closed",
                     "HTTP 422: Unprocessable Entity",
                     "HTTP 403: Resource not accessible",
+                    // GitHub's answers to the mutation, inside `API call failed: `.
+                    "API call failed: GraphQL: Resource not accessible by integration (convertPullRequestToDraft)",
+                    "API call failed: non-200 OK status code: 403 Forbidden body: \"{}\"",
+                    "API call failed: non-200 OK status code: 422 Unprocessable Entity body: \"\"",
                     // `HTTP 5` that is no status, and a refusal that quotes no URL.
                     "see HTTP 5 docs",
                     "unknown flag: --undo",
@@ -1939,51 +1952,68 @@ mod tests {
             }
         }
 
-        /// One case for each shape of "no answer", on a repo whose name holds none of its words.
+        /// What `gh pr ready --undo` (gh 2.105.0) prints when GitHub gave no answer, one group
+        /// per wrapper `gh_gave_no_answer` names, on a repo whose name holds none of its words.
         #[test]
         fn a_gh_failure_with_no_answer_from_github_is_told_from_a_refusal() {
             use crate::factory::github::Answer;
             let slug = "acme/widgets";
             for stderr in [
-                "HTTP 502: Bad Gateway",
-                "HTTP 503: Service Unavailable (https://api.github.com/graphql)",
+                // gh's `printError`: a `*net.DNSError` anywhere in the chain.
+                "error connecting to api.github.com\ncheck your internet connection or https://githubstatus.com",
+                // The lookup before the mutation: go-gh's `HTTPError` with a 5xx.
+                "HTTP 502: Bad Gateway (https://api.github.com/graphql)",
+                "HTTP 503 (https://api.github.com/graphql)",
                 "HTTP 500",
-                "error connecting to api.github.com",
-                "Post \"https://api.github.com/graphql\": dial tcp 140.82.112.5:443: no route",
-                "lookup api.github.com: no such host",
-                "read tcp 10.0.0.2:5000->140.82.112.5:443: connection reset by peer",
-                "dial: connection refused",
-                // Only the phrase tells this one: it is not shaped as a `*url.Error`.
-                "read tcp 10.0.0.2:5000->140.82.112.5:443: i/o timeout",
-                "net/http: TLS handshake timeout",
-                "connect: network is unreachable",
-                "Temporary failure in name resolution",
-                "the operation timed out",
-                "Get \"https://api.github.com\": EOF",
-                "read: unexpected EOF",
-                // Go's `*url.Error`, which is how `gh` prints a transport failure that is
-                // not DNS: a method, the quoted URL, then the failure, whatever it says.
-                "Post \"https://api.github.com/graphql\": write tcp 10.0.0.2:50000->140.82.112.6:443: write: broken pipe",
-                "Post \"https://api.github.com/graphql\": http2: server sent GOAWAY and closed the connection; LastStreamID=1, ErrCode=NO_ERROR, debug=\"\"",
-                "Post \"https://api.github.com/graphql\": read tcp 10.0.0.2:50000->140.82.112.6:443: use of closed network connection",
-                "Post \"https://api.github.com/graphql\": remote error: tls: bad record MAC",
-                "Post \"https://api.github.com/graphql\": http2: client connection lost",
+                // Go's `*url.Error`: `urlErrorOp`'s method, the quoted URL, then any cause.
+                "Post \"https://api.github.com/graphql\": dial tcp 140.82.112.5:443: connect: connection refused",
+                "Post \"https://api.github.com/graphql\": net/http: TLS handshake timeout",
                 "Post \"https://api.github.com/graphql\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+                "Get \"https://api.github.com\": EOF",
                 "Get \"https://api.github.com/repos/acme/widgets\": something nobody has worded yet",
-                "PATCH \"http://localhost:8080/x\": strange",
-                // Words of a failure of the connection, without the shape.
-                "http2: client connection lost",
-                "write: broken pipe",
-                "use of closed network connection",
-                "remote error: tls: bad record MAC",
+                // The mutation, inside `API call failed: `: a 5xx in shurcooL-graphql's words.
+                "API call failed: non-200 OK status code: 502 Bad Gateway body: \"\"",
+                "API call failed: non-200 OK status code: 504 Gateway Timeout body: \"<html></html>\"",
+                // The mutation's transport failure, and its answer cut short or unreadable.
+                "API call failed: Post \"https://api.github.com/graphql\": http2: stream error: stream ID 3; INTERNAL_ERROR; received from peer",
+                "API call failed: read tcp 10.0.0.2:50000->140.82.112.6:443: read: connection reset by peer",
+                "API call failed: unexpected EOF",
+                "API call failed: invalid character '<' looking for beginning of value",
+                "API call failed: something nobody has worded yet",
             ] {
                 let message = finished(slug, exit(Some(1), stderr));
                 assert!(gh_gave_no_answer(&message), "{message}");
             }
-            // A call a signal ended, and an answer over the output limit.
+            // Foundry's: a call a signal ended, and an answer over the output limit.
             for answer in [exit(None, ""), Answer::TooLarge] {
                 let message = finished(slug, answer);
                 assert!(gh_gave_no_answer(&message), "{message}");
+            }
+        }
+
+        /// The rule for a shape no wrapper names: a refusal, the runner's reading. Go's bare
+        /// transport errors outside `API call failed: ` and a `*url.Error` (what a lookup whose
+        /// answer was cut short prints) fall to it too.
+        #[test]
+        fn a_gh_failure_in_a_shape_no_wrapper_names_is_a_refusal() {
+            for stderr in [
+                "boom",
+                "something nobody has worded yet",
+                "read tcp 10.0.0.2:5000->140.82.112.5:443: connection reset by peer",
+                "unexpected EOF",
+                // Not a `*url.Error`: not `urlErrorOp`'s method (`Post`), no cause, no web URL.
+                "POST \"https://api.github.com/graphql\": EOF",
+                "Post \"https://api.github.com/graphql\"",
+                "Get \"ftp://example.com\": EOF",
+                // Not a status of three digits.
+                "HTTP 5xx",
+                "HTTP 5021",
+                // A wrapper's words that do not start what `gh` said.
+                "boom: API call failed: unexpected EOF",
+                "the lookup said HTTP 502",
+            ] {
+                let message = finished("acme/widgets", exit(Some(1), stderr));
+                assert!(!gh_gave_no_answer(&message), "{message}");
             }
         }
 
