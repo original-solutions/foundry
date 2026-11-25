@@ -131,15 +131,23 @@
 //! 7. **Finish a pass.** The pull request is marked ready first. Only then is the build
 //!    session ended (`end_sessions`, recorded as `build-session-ended`), so a session is never
 //!    ended while the pass can still be undone; a failure that must go back to a session
-//!    already recorded ended in the round is stuck (`session-ended`) and not sent. Then the
+//!    already recorded ended in the round is stuck (`session-ended`) and not sent. The end of
+//!    the session follows the build workspace's rule of 5: on a gone build machine, or after
+//!    `resume::UNREACHABLE_FOR` of "unreachable" answers on the sleep-counting clock
+//!    (`build-session-waiting <generation> <ms>`), it is recorded `build-session-left <why>`
+//!    with no end, and on an exit path (stuck, stop, an ended run) an "unreachable" answer is
+//!    recorded left at once. Then the
 //!    results are posted once, the label moves to `pr-open` and the status comment is
 //!    written (`apply_actions` of `pr-ready`, so `state_changed` is last); then the build
 //!    workspace is archived by force (`build-archiving`, the call, `build-archived`), after
 //!    the label, because a branch already on `origin` is all that is left to keep and an
 //!    archive before it would leave a `building` run with no workspace if a write failed. The
 //!    pass is [`GateStep::Passed`] once all of it is done, the build workspace archived or
-//!    left (see 5); a pass cut short, failing or waiting in the archive finishes it on the
-//!    next call, which asks for no end of sessions, ready, comment or label again.
+//!    left (see 5); a pass cut short, failing or waiting finishes it on the next call, which
+//!    asks for no end of sessions, ready, comment or label again. A pull request merged on the
+//!    gated head while the gate ran ends the run only once the pass is finished. A `pr-open`
+//!    run whose pass is finished is answered from the ledger `advance` read, with nothing more
+//!    read or asked.
 //!
 //! The text sent to the session is `messages::gate_failed` over the tail, and the stuck
 //! comment is `messages::stuck`, as the other steps do. The public `Reason:` of a stuck
@@ -464,7 +472,7 @@ pub fn advance(
         }
         Closing::OwnMerge(_) | Closing::Open => {}
     }
-    gate.pass(slots)
+    gate.pass(&events, slots)
 }
 
 /// Whether `events` show a gate in flight, which holds one of the fleet's gate slots: placed
@@ -527,6 +535,10 @@ struct Log {
     /// Attempts whose `gate_finished` is written.
     finished: BTreeSet<u32>,
     session_ended: bool,
+    /// The end of the build session was given up on (`build-session-left`).
+    session_left: bool,
+    /// As `Req::archive_waiting`, for the end of the build session (`build-session-waiting`).
+    session_waiting: Option<(u64, u64)>,
     build_archiving: bool,
     build_archived: bool,
     build_failed: u32,
@@ -561,6 +573,11 @@ fn clock_reading(text: &str) -> Option<(u64, u64)> {
 }
 
 impl Log {
+    /// The build session is ended, or given up on.
+    fn session_done(&self) -> bool {
+        self.session_ended || self.session_left
+    }
+
     fn read(events: &[RunEvent]) -> Log {
         let mut log = Log {
             run: events.first().map(|event| event.run.clone()),
@@ -752,6 +769,10 @@ impl Log {
             }
         } else if step == BUILD_SESSION_ENDED {
             self.session_ended = true;
+        } else if step.starts_with(BUILD_SESSION_LEFT) {
+            self.session_left = true;
+        } else if let Some(rest) = step.strip_prefix(BUILD_SESSION_WAITING) {
+            self.session_waiting = clock_reading(rest);
         } else if step == BUILD_ARCHIVING {
             self.build_archiving = true;
         } else if step == BUILD_ARCHIVE_FAILED {
@@ -998,16 +1019,65 @@ impl Gate<'_, '_> {
 
     // ----- ending the run's own workspaces -----
 
-    /// The build session ended, once.
-    fn end_session(&self) -> Result<(), RunError> {
+    /// The machine the build workspace is on: its session's owner as the view shows it, else
+    /// the machine the run was claimed on.
+    fn build_machine(&self, seen: &Seen, workspace: WorkspaceId) -> Option<MachineId> {
+        self.ctx
+            .view
+            .session_of(workspace)
+            .map(|record| record.owner)
+            .or_else(|| {
+                let claimed = seen.machine.as_deref()?;
+                uuid::Uuid::parse_str(claimed).ok().map(MachineId)
+            })
+    }
+
+    /// Whether the view shows the build machine unreachable for `resume::UNREACHABLE_FOR`.
+    fn build_machine_gone(&self, seen: &Seen, workspace: WorkspaceId) -> bool {
+        self.build_machine(seen, workspace)
+            .is_some_and(|machine| self.ctx.view.unreachable_for(machine) >= UNREACHABLE_FOR)
+    }
+
+    /// The build session ended, once, by the build workspace's rule (`archive_build`): on a
+    /// gone machine it is recorded left (`build-session-left <why>`) with no call, and an
+    /// "unreachable" answer is waited out on the sleep-counting clock
+    /// (`build-session-waiting <generation> <ms>`) for `resume::UNREACHABLE_FOR`, then
+    /// recorded left. On an exit path (`exit`: the run ends or goes stuck) an "unreachable"
+    /// answer is recorded left at once, as a gate's archive is. `false` while it is waited
+    /// out.
+    fn end_session(&self, exit: bool) -> Result<bool, RunError> {
         let (seen, log) = self.fresh()?;
-        if log.session_ended {
-            return Ok(());
+        if log.session_done() {
+            return Ok(true);
         }
         if let Some(workspace) = self.build_workspace(&seen)? {
-            self.ctx.end_sessions(workspace)?;
+            let left = |why: &str| {
+                self.step(
+                    &format!("{BUILD_SESSION_LEFT}{why}"),
+                    "build-session-left",
+                    None,
+                )
+                .map(|()| true)
+            };
+            if self.build_machine_gone(&seen, workspace) {
+                return left(LEFT_GONE);
+            }
+            match self.ctx.end_sessions(workspace) {
+                Ok(()) => {}
+                Err(RunError::Worker(WorkerError::Unreachable(_))) => {
+                    if exit
+                        || self.waited(log.session_waiting, BUILD_SESSION_WAITING, None)?
+                            >= UNREACHABLE_FOR
+                    {
+                        return left(LEFT_UNREACHABLE);
+                    }
+                    return Ok(false);
+                }
+                Err(error) => return Err(error),
+            }
         }
-        self.step(BUILD_SESSION_ENDED, "build-session-ended", None)
+        self.step(BUILD_SESSION_ENDED, "build-session-ended", None)?;
+        Ok(true)
     }
 
     /// The build workspace archived by force, by the rule of `archive_gate` with the build
@@ -1023,18 +1093,7 @@ impl Gate<'_, '_> {
                 self.step(&format!("{BUILD_LEFT}{why}"), "build-left", None)
                     .map(|()| None)
             };
-            let machine = self
-                .ctx
-                .view
-                .session_of(workspace)
-                .map(|record| record.owner)
-                .or_else(|| {
-                    let claimed = seen.machine.as_deref()?;
-                    uuid::Uuid::parse_str(claimed).ok().map(MachineId)
-                });
-            if machine
-                .is_some_and(|machine| self.ctx.view.unreachable_for(machine) >= UNREACHABLE_FOR)
-            {
+            if self.build_machine_gone(&seen, workspace) {
                 return left(LEFT_GONE);
             }
             if !log.build_archiving {
@@ -1106,7 +1165,7 @@ impl Gate<'_, '_> {
 
     /// The stuck path, with the build session ended first and once.
     fn stuck(&self, code: &str, stop: Stop) -> Result<GateStep, RunError> {
-        self.end_session()?;
+        self.end_session(true)?;
         self.archive_all()?;
         let (seen, _) = self.fresh()?;
         let mut at = self.at(&seen);
@@ -1312,10 +1371,10 @@ impl Gate<'_, '_> {
 
     // ----- the pass -----
 
-    fn pass(&self, slots: &mut Slots) -> Result<GateStep, RunError> {
-        let events = self.ctx.ledger.read(self.run)?;
-        let seen = read_progress(&events);
-        let log = Log::read(&events);
+    /// The pass over `events`, the ledger `advance` read: nothing is written between the two.
+    fn pass(&self, events: &[RunEvent], slots: &mut Slots) -> Result<GateStep, RunError> {
+        let seen = read_progress(events);
+        let log = Log::read(events);
         if seen.stuck.is_some() || seen.stuck_stop.is_some() {
             return self.resume_stuck(&seen);
         }
@@ -1324,7 +1383,20 @@ impl Gate<'_, '_> {
         }
         match seen.state {
             Some(State::PrOpen) => {
-                self.end_session()?;
+                // A pass that finished everything decides from the ledger it holds and reads
+                // nothing more: a `pr-open` run is passed over on every pass.
+                let finished = log.session_done()
+                    && (log.build_archived || log.build_left)
+                    && log
+                        .reqs
+                        .iter()
+                        .all(|req| req.archived || req.left.is_some());
+                if finished {
+                    return Ok(GateStep::Passed { pr: self.pr });
+                }
+                if !self.end_session(false)? {
+                    return Ok(GateStep::NotReady);
+                }
                 if let Some(step) = self.sweep_for_pr_open()? {
                     return Ok(step);
                 }
@@ -1804,8 +1876,11 @@ impl Gate<'_, '_> {
                 let pass = seen
                     .pass
                     .ok_or_else(|| RunError::Invalid("the pass is not on record".into()))?;
+                // The run is ended only once the pass is finished: one that waits on an archive
+                // or a session's end is carried on by the next pass, which reads the pass on
+                // record and finishes it there.
                 let finished = self.finish_pass(&pass, false)?;
-                if matches!(finished, GateStep::Stuck { .. }) {
+                if !matches!(finished, GateStep::Passed { .. }) {
                     return Ok(finished);
                 }
                 let (seen, _) = self.fresh()?;
@@ -1820,7 +1895,7 @@ impl Gate<'_, '_> {
             }
             let mut at = self.at(&seen);
             at.worktree = None;
-            self.end_session()?;
+            self.end_session(true)?;
             self.archive_all()?;
             end_run(self.ctx, &at, &self.url, Some(&pull), CauseStep::Gate)?;
             return Ok(GateStep::Ended);
@@ -1948,7 +2023,7 @@ impl Gate<'_, '_> {
                 let (seen, _) = self.fresh()?;
                 let mut at = self.at(&seen);
                 at.worktree = None;
-                self.end_session()?;
+                self.end_session(true)?;
                 end_run(self.ctx, &at, &self.url, Some(&now), CauseStep::Gate)?;
                 Ok(Some(GateStep::Ended))
             }
@@ -2175,8 +2250,8 @@ impl Gate<'_, '_> {
     /// The failure sent into the session once, under the turn it was decided on.
     fn send_back(&self, attempt: u32, kind: Kind, turn: Option<u64>) -> Result<GateStep, RunError> {
         let (seen, log) = self.fresh()?;
-        // A session this pass ended has nothing to take the failure.
-        if log.session_ended {
+        // A session this pass ended, or gave up on, has nothing to take the failure.
+        if log.session_done() {
             return self.stuck("session-ended", Stop::new(SESSION_ENDED));
         }
         // One whose process ended cannot take it either: the interruption rule is `resume`'s.
@@ -2284,6 +2359,8 @@ impl Gate<'_, '_> {
         let required = &self.ctx.config.required_checks;
         let wanted = !required.is_empty() && seen.checks_passed.as_deref() != Some(&pass.sha);
         let pull = self.ctx.tracker.pull_request(self.ctx.repo(), self.pr)?;
+        // The binding is not looked at again after a recorded pass, as in the runner (gating.ts,
+        // `gate`); only a moved head is gated again (the spec's one departure here).
         let Some(pull) = pull.filter(|pull| pull.open) else {
             return self.finish_pass(pass, false);
         };
@@ -2415,7 +2492,9 @@ impl Gate<'_, '_> {
                 &ActionPayload::default(),
             )?;
         }
-        self.end_session()?;
+        if !self.end_session(false)? {
+            return Ok(GateStep::NotReady);
+        }
         let (seen, _) = self.fresh()?;
         let mut at = self.at(&seen);
         let rest: Vec<Action> = actions
@@ -7891,39 +7970,6 @@ mod tests {
         }
 
         #[test]
-        fn a_recorded_pass_whose_pull_request_moved_off_its_base_is_stuck_not_marked_ready() {
-            let (mut rig, run, hub) = built();
-            rig.config.required_checks = vec!["ci".into()];
-            hub.set_checks(HEAD, &[("ci", "in_progress", None)]);
-            assert_eq!(gated(&mut rig, &run, 0, PASS_TAIL), GateStep::ChecksPending);
-            hub.edit(12, |pull| pull.base = "release".into());
-            hub.set_checks(HEAD, &[("ci", "completed", Some("success"))]);
-            let step = go(&rig, &run);
-            let GateStep::Stuck { reason } = &step else {
-                panic!("expected stuck, got {step:?}");
-            };
-            assert!(
-                reason.contains("its base is not the base branch main"),
-                "{reason}"
-            );
-            assert!(hub.lock().pulls[&12].draft, "nothing is marked ready");
-            assert_ne!(rig.sim.labels(), ["factory:pr-open"]);
-        }
-
-        #[test]
-        fn a_recorded_pass_whose_pull_request_moved_off_its_branch_is_stuck_not_marked_ready() {
-            let (mut rig, run, hub) = built();
-            rig.config.required_checks = vec!["ci".into()];
-            hub.set_checks(HEAD, &[("ci", "in_progress", None)]);
-            assert_eq!(gated(&mut rig, &run, 0, PASS_TAIL), GateStep::ChecksPending);
-            hub.edit(12, |pull| pull.head_ref = "someone-else".into());
-            hub.set_checks(HEAD, &[("ci", "completed", Some("success"))]);
-            let step = go(&rig, &run);
-            assert!(matches!(step, GateStep::Stuck { .. }), "{step:?}");
-            assert!(hub.lock().pulls[&12].draft, "nothing is marked ready");
-        }
-
-        #[test]
         fn a_merge_while_the_build_archive_waits_leaves_the_run_open_until_it_is_archived() {
             let (mut rig, run, hub) = built();
             place(&mut rig, &run, 1, 1);
@@ -7987,6 +8033,14 @@ mod tests {
         fn a_pass_whose_build_machine_is_gone_reaches_pr_open_without_ending_or_archiving() {
             let (mut rig, run, hub) = built();
             place(&mut rig, &run, 1, 1);
+            // The pass is recorded and the pull request marked ready; the end of the session
+            // gets no answer, and then the build machine is gone.
+            show(&mut rig, &run, SessionState::Idle, 1, &[exited(1, 0)]);
+            rig.worker.on_tail(Ok(PASS_TAIL.into()));
+            rig.worker
+                .on_end_sessions(Err(WorkerError::Unreachable("no route".into())));
+            assert_eq!(go(&rig, &run), GateStep::NotReady);
+            assert!(!hub.lock().pulls[&12].draft);
             build_machine_away(
                 &mut rig,
                 &run,
@@ -7994,11 +8048,17 @@ mod tests {
                 0,
                 crate::factory::runs::resume::UNREACHABLE_FOR,
             );
-            rig.worker.on_tail(Ok(PASS_TAIL.into()));
             assert_eq!(go(&rig, &run), GateStep::Passed { pr: 12 });
             assert!(!hub.lock().pulls[&12].draft);
             assert_eq!(rig.sim.labels(), ["factory:pr-open"]);
-            assert!(!calls(&rig).contains(&end_of_build()));
+            assert_eq!(
+                calls(&rig)
+                    .iter()
+                    .filter(|call| **call == end_of_build())
+                    .count(),
+                1,
+                "the one end that got no answer"
+            );
             assert!(!archived(&rig).contains(&workspace()));
             assert_eq!(
                 step_count(&rig, &run, &format!("{BUILD_SESSION_LEFT}{LEFT_GONE}")),
