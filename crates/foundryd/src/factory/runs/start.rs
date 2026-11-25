@@ -40,7 +40,8 @@ use serde::Deserialize;
 use super::progress::{
     APPROVAL_RECHECKED, APPROVAL_WITHDRAWN, APPROVED, LAUNCH_BASE, LAUNCH_ENDING_SESSIONS,
     LAUNCH_MODEL, LAUNCH_PULL_REQUEST, LAUNCH_RESENDING, LAUNCH_RESUMING, LAUNCH_SENDING,
-    LAUNCH_SENDING_RESUMED, Seen, WORKSPACE_CREATED, WORKSPACE_REQUESTED, read_progress,
+    LAUNCH_SENDING_RESUMED, Seen, TIME_LIMIT, WORKSPACE_CREATED, WORKSPACE_REQUESTED,
+    read_progress,
 };
 use super::{
     Closing, Progress, RunContext, RunError, Stop, abandon, end_own_merge, finish_building,
@@ -54,7 +55,7 @@ use crate::factory::github::{
     Claim, IssueDetail, MARKER, OpenPullRequest, OtherKind, Tracker, TrackerError, newest_claim,
 };
 use crate::factory::ledger::events::{
-    Cause, CauseStep, Event, ModelOption, OptionValue, Outcome, ResumedFrom,
+    Cause, CauseStep, Event, ModelOption, OptionValue, Outcome, ResumedFrom, names,
 };
 use crate::factory::ledger::read::{field, text};
 use crate::factory::lifecycle::approval::{Approval, Refusal, TextCheck, refusal_reason};
@@ -759,7 +760,7 @@ pub fn advance(ctx: &RunContext<'_>, run: &RunId) -> Result<StartStep, RunError>
         });
     }
     if seen.thread_id.is_some() {
-        return launched(ctx, run, &seen, &detail, &mut at);
+        return launched(ctx, run, &seen, &mut at);
     }
     build(ctx, run, &seen, &detail, &mut at)
 }
@@ -1063,8 +1064,10 @@ struct Continuation {
 /// line's.
 fn continuation(events: &[RunEvent]) -> Option<Continuation> {
     let needs_info = events.iter().any(|event| {
-        event.event == "finished"
-            && field(&event.data, "outcome").and_then(|v| v.as_str()) == Some("needs-info")
+        event.event == names::FINISHED
+            && field(&event.data, "outcome")
+                .and_then(|v| serde_json::from_value::<Outcome>(v.clone()).ok())
+                == Some(Outcome::NeedsInfo)
     });
     if needs_info {
         return None;
@@ -1085,22 +1088,22 @@ fn continuation(events: &[RunEvent]) -> Option<Continuation> {
             .flatten()
     };
     let time_limit = events.iter().any(|event| {
-        event.event == "stuck"
+        event.event == names::STUCK
             && event
                 .cause
                 .as_ref()
                 .and_then(|cause| cause.get("reason"))
                 .and_then(|reason| reason.as_str())
-                == Some("time-limit")
+                == Some(TIME_LIMIT)
     });
     if time_limit {
         let launched = events
             .iter()
-            .find_map(|event| branch_on("session_launched", event));
+            .find_map(|event| branch_on(names::SESSION_LAUNCHED, event));
         let recorded = events
             .iter()
             .rev()
-            .find_map(|event| branch_on("stuck", event));
+            .find_map(|event| branch_on(names::STUCK, event));
         return with_resumed(launched.or(recorded), After::TimeLimit);
     }
     let relaunch = seen.interruption.as_ref()?;
@@ -1641,10 +1644,8 @@ fn launched(
     ctx: &RunContext<'_>,
     run: &RunId,
     seen: &Seen,
-    detail: &IssueDetail,
     at: &mut Progress,
 ) -> Result<StartStep, RunError> {
-    let _ = detail;
     let Some(thread) = &seen.thread_id else {
         return Err(RunError::Invalid(format!("run {run} has no session")));
     };

@@ -12,12 +12,14 @@
 //!
 //! - A session is stopped through the worker: [`stop_session`] ends the factory sessions of the
 //!   run's build workspace and keeps the workspace, as the spec says of a stuck run. The
-//!   runner's archive of a thread and removal of its worktree have no counterpart, so the
-//!   `worktree_removed` lines and [`Progress`]'s `worktree_done` are not carried over.
+//!   runner's archive of a thread and removal of its worktree have no counterpart: no step of
+//!   Foundry writes `worktree_removed`, though `read_progress` still reads those lines of a
+//!   ledger the runner wrote.
 //! - [`Guard::check`] runs before every change on GitHub and every call to the worker, in the
 //!   methods of [`RunContext`] that make them. A lost lease is an error with nothing done.
 //! - A step that sends a message to the session sends a [`Message`] (a line and a body file),
-//!   which its caller builds, in place of the runner's text under a command id.
+//!   which its caller builds, in place of the runner's text under a command id. (The relaunch
+//!   command ids of `progress` are the runner's, kept for the ledgers it wrote.)
 //! - The tracker has no `closedBy`, so [`abandon`] names no actor in its cause.
 //! - The status comment names the machine as its id, since a [`RunContext`] holds no machine
 //!   names.
@@ -34,16 +36,17 @@ use foundry_proto::factory::{FactorySettings, ProjectFactory, RunId};
 use foundry_proto::ids::{ProjectId, SessionId, WorkspaceId};
 
 use super::config::ProjectConfig;
-use super::github::{Commenting, PullRequest, TrackerError};
+use super::github::{Commenting, MARKER, PullRequest, TrackerError};
 use super::ledger::events::{Cause, CauseStep, Event, Outcome, PrEnd};
 use super::ledger::{Ledger, LedgerError};
 use super::lifecycle::{Action, Event as LifecycleEvent, InvalidTransition, State, transition};
 use super::messages::{self, Message, WorkLeft};
+use super::text;
 use super::worker::{FleetView, Guard, LeaseLost, Worker, WorkerError};
 use crate::clock::Clock;
 use crate::sessions::factory::SendRefused;
 use crate::store::StoreError;
-use progress::{GATE_RESULTS_POSTED, Seen};
+use progress::{GATE_RESULTS_POSTED, QUESTIONS_COMMENTING, STUCK_COMMENTING, Seen};
 
 /// What a step of a run can fail with.
 #[derive(Debug, thiserror::Error)]
@@ -325,11 +328,6 @@ pub fn run_config(config: &ProjectConfig, base: Option<&str>) -> ProjectConfig {
     }
 }
 
-/// The words for what a failed call said.
-pub fn describe(cause: &dyn std::fmt::Display) -> String {
-    cause.to_string()
-}
-
 /// The label, the status comment and the ledger line that follow a launch. Safe to repeat.
 pub fn finish_building(
     ctx: &RunContext<'_>,
@@ -367,7 +365,15 @@ pub fn apply_actions(
             Action::LaunchSession => {}
             Action::PostQuestions { questions } => {
                 if !at.seen.questions_posted {
-                    ctx.post_comment(issue, &messages::questions(questions))?;
+                    post_once(
+                        ctx,
+                        &at.run,
+                        issue,
+                        QUESTIONS_COMMENTING,
+                        at.seen.questions_commenting,
+                        &messages::questions(questions),
+                        cause,
+                    )?;
                     ctx.record(
                         &at.run,
                         Event::QuestionsPosted {
@@ -396,7 +402,15 @@ pub fn apply_actions(
                             work.as_ref(),
                         ),
                     };
-                    ctx.post_comment(issue, &body)?;
+                    post_once(
+                        ctx,
+                        &at.run,
+                        issue,
+                        STUCK_COMMENTING,
+                        at.seen.stuck_commenting,
+                        &body,
+                        cause,
+                    )?;
                     ctx.record(
                         &at.run,
                         Event::Stuck {
@@ -488,6 +502,46 @@ pub fn apply_actions(
         at.state = to;
     }
     Ok(())
+}
+
+/// A comment on `issue`, posted once. The `intent` step is recorded before the post. A pass that
+/// finds the intent and not the line that follows the post (`intended`) does not know whether
+/// the post landed (an answer lost to a timeout or a 5xx), so it posts only when the newest
+/// comment of the project's login is not already this text.
+fn post_once(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    issue: u64,
+    intent: &str,
+    intended: bool,
+    body: &str,
+    cause: &Cause,
+) -> Result<(), RunError> {
+    if !intended {
+        ctx.record_step(run, intent, cause)?;
+    } else if newest_comment_is(ctx, issue, body)? {
+        return Ok(());
+    }
+    ctx.post_comment(issue, body)
+}
+
+/// Whether the newest comment of the project's login that carries the factory's marker is `said`
+/// as it is posted. Anyone can paste the marker, so only the login's own comment counts.
+fn newest_comment_is(ctx: &RunContext<'_>, issue: u64, said: &str) -> Result<bool, RunError> {
+    let comments = ctx.tracker.issue_comments(ctx.repo(), issue)?;
+    let normal = |body: &str| body.replace("\r\n", "\n").trim_end().to_owned();
+    let newest = comments
+        .iter()
+        .filter(|comment| {
+            comment
+                .author
+                .as_deref()
+                .is_some_and(|author| author.eq_ignore_ascii_case(&ctx.project.login))
+        })
+        .filter(|comment| normal(&comment.body).ends_with(MARKER))
+        .max_by_key(|comment| comment.id);
+    let expected = format!("{}\n\n{MARKER}", text::for_comment(&ctx.tracker.hide(said)));
+    Ok(newest.is_some_and(|comment| normal(&comment.body) == normal(&expected)))
 }
 
 /// Stops the run's session before it goes stuck: ends the factory sessions of its build
@@ -1617,7 +1671,10 @@ mod tests {
                 .filter(|c| c.contains("Reason: the session said stuck"))
                 .count();
             assert_eq!(posted, 1);
-            assert!(rig.sim.comments().len() <= before + 1, "only the status comment");
+            assert!(
+                rig.sim.comments().len() <= before + 1,
+                "only the status comment"
+            );
             assert!(rig.names(&run).contains(&"stuck".to_string()));
             assert!(rig.finished(&run));
         }
@@ -1687,7 +1744,10 @@ mod tests {
                 &ActionPayload::default(),
             )
             .unwrap();
-            assert!(rig.steps(&run).contains(&"questions-commenting".to_string()));
+            assert!(
+                rig.steps(&run)
+                    .contains(&"questions-commenting".to_string())
+            );
         }
 
         #[test]

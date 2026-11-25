@@ -59,6 +59,13 @@ pub const APPROVED: &str = "approved ";
 /// The step written before the approval's withdrawal is acted on: the approval was taken back
 /// before the session started. A pass that reads it finishes the withdrawal.
 pub const APPROVAL_WITHDRAWN: &str = "approval-withdrawn";
+/// The reason on the cause of the `stuck` line of a run that hit its time limit: what the building
+/// step writes and a later attempt's launch reads to continue from its branch.
+pub const TIME_LIMIT: &str = "time-limit";
+/// The step written before the stuck comment is posted.
+pub const STUCK_COMMENTING: &str = "stuck-commenting";
+/// The step written before the questions comment is posted.
+pub const QUESTIONS_COMMENTING: &str = "questions-commenting";
 /// The step written before the sessions of the build workspace are ended ahead of a second start
 /// of a launch that was sent and has no session recorded.
 pub const LAUNCH_ENDING_SESSIONS: &str = "launch-ending-sessions";
@@ -293,6 +300,11 @@ pub struct Seen {
     pub left: Vec<PullRequest>,
     /// A `questions_posted` since the run last entered `building`: this stop's questions are on the issue.
     pub questions_posted: bool,
+    /// The `questions-commenting` step since the questions were last posted or the run last
+    /// entered `building`: the comment may be on the issue with no line yet.
+    pub questions_commenting: bool,
+    /// The `stuck-commenting` step: the stuck comment may be on the issue with no `stuck` line.
+    pub stuck_commenting: bool,
     /// A `pr_opened` since the run last entered `building` or had a gate sent back: the session's pull request waits for the gate.
     pub pr_reported: bool,
     /// The ordinal in the newest `result-line-reminding` step: a reminder send was started.
@@ -593,7 +605,6 @@ impl Waits {
 struct Worked {
     ms: u64,
     since: Option<u64>,
-    held: bool,
 }
 
 impl Worked {
@@ -607,7 +618,6 @@ impl Worked {
     /// A gate began or the wait for checks began.
     fn hold(&mut self, at: u64) {
         self.stop(at);
-        self.held = true;
     }
 }
 
@@ -664,6 +674,12 @@ pub fn read_progress(events: &[RunEvent]) -> Seen {
                 }
                 if step == APPROVAL_WITHDRAWN {
                     seen.withdrawn = true;
+                }
+                if step == STUCK_COMMENTING {
+                    seen.stuck_commenting = true;
+                }
+                if step == QUESTIONS_COMMENTING {
+                    seen.questions_commenting = true;
                 }
                 if let Some(name) = step.strip_prefix(WORKSPACE_REQUESTED) {
                     seen.workspace_requested = Some(name.to_owned());
@@ -842,7 +858,6 @@ pub fn read_progress(events: &[RunEvent]) -> Seen {
             names::STATE_CHANGED => {
                 let to = text(data, "to");
                 worked.stop(ms);
-                worked.held = false;
                 // A pull request that was ready and comes back to building starts a new stint:
                 // the build before it was ready came within the limit and is not charged again.
                 if seen.state == Some(State::PrOpen) && to == Some(State::Building.name()) {
@@ -863,6 +878,7 @@ pub fn read_progress(events: &[RunEvent]) -> Seen {
                 seen.regate_sent_back = false;
                 if to == Some(State::Building.name()) {
                     seen.questions_posted = false;
+                    seen.questions_commenting = false;
                     seen.pr_reported = false;
                     // A run that comes back to `building` has no pass: its gate failed again on
                     // a moved base, and the session has to finish a new run for it to be decided.
@@ -915,7 +931,10 @@ pub fn read_progress(events: &[RunEvent]) -> Seen {
                 }
                 seen.idle_forward_wait = None;
             }
-            names::QUESTIONS_POSTED => seen.questions_posted = true,
+            names::QUESTIONS_POSTED => {
+                seen.questions_posted = true;
+                seen.questions_commenting = false;
+            }
             names::PR_OPENED => {
                 if let (Some(pr), Some(url)) =
                     (field(data, "pr").and_then(Value::as_u64), text(data, "url"))
@@ -1068,7 +1087,6 @@ pub fn read_progress(events: &[RunEvent]) -> Seen {
                     worked.stop(ms);
                     worked.since = Some(ms);
                 }
-                worked.held = false;
             }
             "gate_regate" => {
                 let sha = text(data, "sha").unwrap_or_default();
