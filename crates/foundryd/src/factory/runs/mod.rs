@@ -829,6 +829,7 @@ pub(crate) mod testing {
         closing: Vec<Value>,
         branches: BTreeSet<String>,
         failures: Vec<(String, usize)>,
+        lost: Vec<(String, usize)>,
         /// Calls containing one of these are refused as an invalid argument, as a branch name
         /// the tracker will not take is.
         refused: Vec<String>,
@@ -889,6 +890,7 @@ pub(crate) mod testing {
                     closing: vec![],
                     branches: BTreeSet::new(),
                     failures: vec![],
+                    lost: vec![],
                     refused: vec![],
                     calls: vec![],
                 }),
@@ -950,6 +952,12 @@ pub(crate) mod testing {
                 .comments
                 .push((id, author.to_string(), body.to_string()));
             id
+        }
+
+        /// The next `times` calls whose arguments hold `needle` take effect, and answer an
+        /// error all the same: a timeout or a 5xx after GitHub applied the change.
+        pub fn lose(&self, needle: &str, times: usize) {
+            self.lock().lost.push((needle.into(), times));
         }
 
         /// Makes the next `times` calls whose arguments contain `needle` fail.
@@ -1023,6 +1031,30 @@ pub(crate) mod testing {
         }
 
         fn answer(&self, args: &[String]) -> Result<String, TrackerError> {
+            let lost = {
+                let mut state = self.lock();
+                let joined = args.join(" ");
+                match state
+                    .lost
+                    .iter()
+                    .position(|(needle, times)| *times > 0 && joined.contains(needle.as_str()))
+                {
+                    Some(at) => {
+                        state.lost[at].1 -= 1;
+                        true
+                    }
+                    None => false,
+                }
+            };
+            let result = self.answer_once(args);
+            if lost && result.is_ok() {
+                // The change landed and the answer did not.
+                return Err(Self::other(args, "answer lost"));
+            }
+            result
+        }
+
+        fn answer_once(&self, args: &[String]) -> Result<String, TrackerError> {
             let mut state = self.lock();
             state.calls.push(args.to_vec());
             let joined = args.join(" ");

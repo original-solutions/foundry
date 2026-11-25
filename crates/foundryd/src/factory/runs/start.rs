@@ -1872,11 +1872,12 @@ mod tests {
     mod a_fresh_ready_issue {
         use super::*;
 
-        /// The runner's case "claims, launches the session and moves the issue to building",
-        /// the claim's half: the comment first, then the label, the assignee and the status
-        /// comment, with the run's lines in the runner's order.
+        /// The claim's half of the runner's case "claims, launches the session and moves the
+        /// issue to building" (the whole case is in `the_launch`): the comment first, then the
+        /// label, the assignee and the status comment, with the run's lines in the runner's
+        /// order.
         #[test]
-        fn claims_launches_the_session_and_moves_the_issue_to_building() {
+        fn a_claim_writes_the_comment_the_label_the_assignee_and_the_status_in_order() {
             let rig = Rig::new();
             let run = claimed(&rig);
             assert_eq!(run, run_id(1));
@@ -2044,7 +2045,10 @@ mod tests {
         fn a_lost_lease_claims_nothing() {
             let mut rig = Rig::new();
             rig.guard = Box::new(Lost);
-            assert!(matches!(claim_it(&rig), Err(RunError::LeaseLost(_))));
+            assert!(matches!(
+                claim(&rig.ctx(), ISSUE, rig.machine),
+                Err(RunError::LeaseLost(_))
+            ));
             assert!(rig.sim.writes().is_empty());
             assert!(rig.ledger.issue_runs(REPO, ISSUE).unwrap().is_empty());
         }
@@ -2234,7 +2238,10 @@ mod tests {
             let mut rig = Rig::new();
             rig.guard = Box::new(HeldFor::new(2));
             // The comment landed; the lease is lost before the label.
-            assert!(matches!(claim_it(&rig), Err(RunError::LeaseLost(_))));
+            assert!(matches!(
+                claim(&rig.ctx(), ISSUE, rig.machine),
+                Err(RunError::LeaseLost(_))
+            ));
             assert_eq!(rig.sim.writes().len(), 1);
             assert_eq!(rig.sim.labels(), vec!["factory:ready"]);
             // The run the cut-short claim made is ended, so it holds no slot.
@@ -2722,6 +2729,38 @@ mod tests {
                 .into_iter()
                 .find(|comment| comment.contains("could not finish this issue"))
                 .expect("a stuck comment")
+        }
+
+        /// The runner's case "claims, launches the session and moves the issue to building",
+        /// the whole of it: the claim, the one launch with its message, the label, the status
+        /// comment and the run's lines through the building state.
+        #[test]
+        fn claims_launches_the_session_and_moves_the_issue_to_building() {
+            let (rig, run) = workspace_shown();
+            assert_eq!(rig.sim.labels(), vec!["factory:triage"]);
+            assert_eq!(pass(&rig, &run), StartStep::Started { session: session() });
+            match &start_sessions(&rig)[..] {
+                [Call::StartSession { first, login, .. }] => {
+                    assert_eq!(first, &launch_message());
+                    assert_eq!(login, LOGIN);
+                }
+                other => panic!("{other:?}"),
+            }
+            assert_eq!(rig.sim.labels(), vec!["factory:building"]);
+            assert_eq!(rig.sim.assignees(), vec![LOGIN]);
+            assert!(
+                rig.sim
+                    .writes()
+                    .iter()
+                    .any(|write| write.contains("**Factory status:** building"))
+            );
+            let names = rig.names(&run);
+            let launched = names.iter().position(|n| n == "session_launched").unwrap();
+            let building = names.iter().rposition(|n| n == "state_changed").unwrap();
+            assert!(launched < building, "{names:?}");
+            let last = rig.events(&run).into_iter().last().unwrap();
+            assert_eq!(last.data["to"], "building");
+            assert!(!rig.finished(&run));
         }
 
         fn launch_message() -> Message {
@@ -6068,6 +6107,144 @@ mod tests {
                 assert!(rig.finished(&run));
                 assert_eq!(archives(&rig).len(), 1);
                 assert_eq!(said(&rig, "did not start on this issue"), 1);
+            }
+
+            /// A claim cut short after the label and before the assignee: the next pass assigns
+            /// the login, writes the assignee step first, and asks for the workspace.
+            #[test]
+            fn a_claim_cut_short_after_the_label_is_carried_on_by_the_next_pass() {
+                let mut rig = Rig::new();
+                rig.worker.on_create(Ok(ws_id()));
+                rig.guard = Box::new(HeldFor::new(3));
+                assert!(matches!(
+                    claim(&rig.ctx(), ISSUE, rig.machine),
+                    Err(RunError::LeaseLost(_))
+                ));
+                assert_eq!(rig.sim.labels(), vec!["factory:triage"]);
+                assert!(rig.sim.assignees().is_empty());
+                rig.guard = Box::new(crate::factory::worker::AlwaysHeld(1));
+                let run = run_id(1);
+                assert_eq!(pass(&rig, &run), StartStep::Waiting(Wait::Workspace));
+                assert_eq!(rig.sim.assignees(), vec![LOGIN]);
+                assert_eq!(creates(&rig).len(), 1);
+            }
+
+            /// The same, with the assignee call failing on GitHub and the repair failing too.
+            #[test]
+            fn a_claim_whose_assignee_never_landed_is_carried_on_by_the_next_pass() {
+                let (rig, run) = claimed_rig();
+                rig.sim.set_assignees(&[]);
+                let ledger_before = rig.names(&run);
+                assert_eq!(ledger_before.len(), 3);
+                assert_eq!(pass(&rig, &run), StartStep::Waiting(Wait::Workspace));
+                assert_eq!(rig.sim.assignees(), vec![LOGIN]);
+            }
+
+            /// A stuck path the ledger shows begun on an issue an instructor has put back to
+            /// `ready`: nothing is written on GitHub, and the claim step takes the issue.
+            #[test]
+            fn a_begun_stuck_path_leaves_an_issue_put_back_to_ready_to_the_claim_step() {
+                let (rig, run) = claimed_rig();
+                rig.write(
+                    &run,
+                    Event::Stuck {
+                        reason: "the earlier reason".into(),
+                        branch: None,
+                        commits_ahead: None,
+                    },
+                );
+                rig.sim.set_labels(&["factory:ready"]);
+                rig.sim.set_assignees(&[]);
+                let writes = rig.sim.writes().len();
+                assert!(matches!(pass(&rig, &run), StartStep::Skipped { .. }));
+                assert_eq!(rig.sim.writes().len(), writes);
+                assert_eq!(rig.sim.labels(), vec!["factory:ready"]);
+                assert!(calls(&rig).is_empty());
+            }
+
+            /// A withdraw the ledger shows begun, with the issue approved again and `ready`: the
+            /// label stays `ready` and nothing is written.
+            #[test]
+            fn a_begun_withdraw_leaves_an_issue_put_back_to_ready_to_the_claim_step() {
+                let (rig, run) = workspace_shown();
+                rig.step(&run, "approval-withdrawn");
+                rig.sim.set_labels(&["factory:ready"]);
+                rig.sim.set_assignees(&[]);
+                let writes = rig.sim.writes().len();
+                let asked = calls(&rig).len();
+                assert!(matches!(pass(&rig, &run), StartStep::Skipped { .. }));
+                assert_eq!(rig.sim.writes().len(), writes);
+                assert_eq!(rig.sim.labels(), vec!["factory:ready"]);
+                assert_eq!(calls(&rig).len(), asked);
+            }
+
+            /// A begun stuck path on an issue a person closed is the closed issue's: the run is
+            /// abandoned and nothing is written on GitHub.
+            #[test]
+            fn a_begun_stuck_path_on_a_closed_issue_is_abandoned_with_no_writes() {
+                let (rig, run) = claimed_rig();
+                rig.write(
+                    &run,
+                    Event::Stuck {
+                        reason: "the earlier reason".into(),
+                        branch: None,
+                        commits_ahead: None,
+                    },
+                );
+                rig.sim.set_closed(true);
+                let writes = rig.sim.writes().len();
+                assert_eq!(pass(&rig, &run), StartStep::Abandoned);
+                assert_eq!(rig.sim.writes().len(), writes);
+                assert!(rig.finished(&run));
+            }
+
+            /// A setup terminal whose tail the machine answers it cannot give is the run's
+            /// end, with the reason alone: asking again would never end.
+            #[test]
+            fn a_setup_whose_tail_the_machine_cannot_give_goes_stuck_with_the_reason_alone() {
+                let (mut rig, run) = claimed_rig();
+                pass(&rig, &run);
+                show_setup(&mut rig, TerminalState::Exited, None);
+                rig.worker
+                    .on_tail(Err(WorkerError::Failed("the holder is gone".into())));
+                assert_eq!(
+                    pass(&rig, &run),
+                    StartStep::Stuck {
+                        reason: SETUP_FAILED.into()
+                    }
+                );
+                assert!(rig.finished(&run));
+                assert_eq!(rig.sim.labels(), vec!["factory:stuck"]);
+                assert!(!stuck_comment(&rig).contains("the holder is gone"));
+            }
+
+            /// A refused first start whose stuck comment landed and whose answer was lost: the
+            /// next pass goes stuck from the ledger, starts nothing and posts nothing again,
+            /// though the worker would now accept.
+            #[test]
+            fn a_stuck_comment_that_landed_without_its_line_goes_stuck_with_no_second_start() {
+                let rig = Rig::new();
+                rig.worker.on_create(Ok(ws_id()));
+                rig.worker
+                    .on_start_session(Err(WorkerError::Failed("refused".into())));
+                rig.worker.on_start_session(Ok(session()));
+                let run = match claim(&rig.ctx(), ISSUE, rig.machine).unwrap() {
+                    ClaimOutcome::Claimed { run } => run,
+                    other => panic!("{other:?}"),
+                };
+                let mut rig = rig;
+                pass(&rig, &run);
+                show_workspace(&mut rig);
+                rig.sim.lose("comment", 1);
+                assert!(advance(&rig.ctx(), &run).is_err());
+                assert_eq!(said(&rig, "could not finish this issue"), 1);
+                assert!(!rig.finished(&run));
+                assert_eq!(start_sessions(&rig).len(), 1);
+                assert!(matches!(pass(&rig, &run), StartStep::Stuck { .. }));
+                assert_eq!(start_sessions(&rig).len(), 1);
+                assert_eq!(said(&rig, "could not finish this issue"), 1);
+                assert!(rig.finished(&run));
+                assert_eq!(rig.sim.labels(), vec!["factory:stuck"]);
             }
 
             /// The `approval-withdrawn` step is read.
