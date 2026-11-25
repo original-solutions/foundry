@@ -572,7 +572,7 @@ mod tests {
     }
 
     #[test]
-    fn every_refused_send_is_409_with_its_reason_and_the_count_when_it_rose() {
+    fn every_refused_send_is_409_with_its_reason_and_the_count_when_it_rose_or_was_read() {
         let cases = [
             (SendRefused::NotIdle, "not_idle"),
             (SendRefused::CountRose { now: 7 }, "count_rose"),
@@ -580,7 +580,17 @@ mod tests {
             (SendRefused::BodyWithoutPath, "body_without_path"),
             (SendRefused::SecretsUnreadable, "secrets_unreadable"),
             (
-                SendRefused::Failed("https://u:secret@example.com/x".into()),
+                SendRefused::Failed {
+                    reason: "https://u:secret@example.com/x".into(),
+                    prompts: Some(4),
+                },
+                "failed",
+            ),
+            (
+                SendRefused::Failed {
+                    reason: "the count was not read".into(),
+                    prompts: None,
+                },
                 "failed",
             ),
         ];
@@ -598,6 +608,14 @@ mod tests {
             match refused {
                 SendRefused::CountRose { now } => assert_eq!(answer["now"], now),
                 _ => assert!(answer.get("now").is_none(), "{answer}"),
+            }
+            // A failed send names the count it read before it typed, or null when it read
+            // none, so a resend can name it; no other refusal has one.
+            match refused {
+                SendRefused::Failed { prompts, .. } => {
+                    assert_eq!(answer.get("prompts"), Some(&serde_json::json!(prompts)));
+                }
+                _ => assert!(answer.get("prompts").is_none(), "{answer}"),
             }
         }
     }
