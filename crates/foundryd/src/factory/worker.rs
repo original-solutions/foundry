@@ -152,9 +152,10 @@ impl FleetView {
     /// that owner out. The factory acts on this view, and a view missing one machine's records
     /// would show its workspaces and sessions as never made, so a pass on it would be
     /// half-applied. Such a record is one a newer build wrote, and it stays until this machine
-    /// runs a build that reads it, so every pass fails until then. Any failed read logs a
-    /// warning that names the owner, the session or the machine it was for, with the store's
-    /// error, which tells a record this build cannot parse from a database error.
+    /// runs a build that reads it, so every pass fails until then. A failed read of one
+    /// owner's records, one session's turn or one machine's holdings logs a warning that names
+    /// that owner, session or machine, with the store's error, which tells a record this build
+    /// cannot parse from a database error.
     pub fn read(
         store: &Store,
         online: BTreeSet<MachineId>,
