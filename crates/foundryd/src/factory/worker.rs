@@ -1175,6 +1175,68 @@ mod tests {
         );
     }
 
+    /// The factory queries one `read` makes, for a fleet of `sessions` live sessions spread
+    /// over three machines, each with a turn and each machine with a held record.
+    fn queries_of_a_read(sessions: u128) -> usize {
+        let (_dir, mut store) = open();
+        let machines = [machine(1), machine(2), machine(3)];
+        for &m in &machines {
+            store
+                .apply_factory(
+                    &FactoryRecord {
+                        owner: m,
+                        version: 1,
+                        body: FactoryBody::Held(MachineHeld {
+                            logins: vec!["bot".into()],
+                            skill: true,
+                        }),
+                    },
+                    m,
+                )
+                .unwrap();
+        }
+        for n in 0..sessions {
+            let m = machines[(n % 3) as usize];
+            let sid = 100 + n;
+            store
+                .apply(
+                    &AnyRecord::Session(session_record(m, 1, false, sid, 10, SessionState::Idle)),
+                    m,
+                )
+                .unwrap();
+            store
+                .apply_factory(
+                    &FactoryRecord {
+                        owner: m,
+                        version: 10 + n as u64,
+                        body: FactoryBody::Turn(turn_of(sid, 10)),
+                    },
+                    m,
+                )
+                .unwrap();
+        }
+        let before = Store::factory_queries();
+        let view =
+            FleetView::read(&store, machines.into_iter().collect(), BTreeMap::new()).unwrap();
+        let queries = Store::factory_queries() - before;
+        for n in 0..sessions {
+            assert_eq!(
+                view.session_turn(SessionId(id(100 + n))),
+                Some(&turn_of(100 + n, 10))
+            );
+        }
+        for m in machines {
+            assert!(view.held(m).is_some());
+        }
+        queries
+    }
+
+    #[test]
+    fn a_read_makes_the_same_two_factory_queries_however_many_sessions() {
+        assert_eq!(queries_of_a_read(1), 2);
+        assert_eq!(queries_of_a_read(20), 2);
+    }
+
     #[test]
     fn a_read_carries_sessions_terminals_turns_held_and_samples() {
         let (_dir, mut store) = open();

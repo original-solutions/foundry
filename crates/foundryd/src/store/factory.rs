@@ -84,6 +84,31 @@ mod counted {
     pub(super) fn add(_rows: usize) {}
 }
 
+/// Counts the factory reads that fleet reads make: one
+/// for each SELECT of `session_turn`, `held`, `session_turns` and `helds`. Counted by thread,
+/// since each test runs on a thread of its own. Only counts; nothing reads it outside tests.
+#[cfg(test)]
+mod queried {
+    use std::cell::Cell;
+
+    thread_local! {
+        static SELECTS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn add() {
+        SELECTS.with(|n| n.set(n.get() + 1));
+    }
+
+    pub(super) fn read() -> usize {
+        SELECTS.with(Cell::get)
+    }
+}
+
+#[cfg(not(test))]
+mod queried {
+    pub(super) fn add() {}
+}
+
 /// The lowest run event key in [`?1`, `?2`), or NULL with none: one seek of the primary key,
 /// which finds the next writer of a run without visiting the rows of the writer before it.
 const WRITER_PROBE: &str = "SELECT MIN(id) FROM factory_records WHERE kind = 'run_event' \
@@ -351,6 +376,14 @@ impl Store {
         Ok(runs.into_iter().collect())
     }
 
+    /// How many SELECTs the factory reads of this thread (`session_turn`, `held`,
+    /// `session_turns`, `helds`) have run so far, for tests that show a read's query count
+    /// does not grow with the fleet.
+    #[cfg(test)]
+    pub fn factory_queries() -> usize {
+        queried::read()
+    }
+
     /// How many run event rows the reads of this thread have handed back so far, as events
     /// or as ids. A yes or no, such as [`run_has_event`](Self::run_has_event), counts none.
     #[cfg(test)]
@@ -446,6 +479,7 @@ impl Store {
     /// session record sync apart, so a turn held before the record is stored and reads as
     /// `None` until the record says whose session it is.
     pub fn session_turn(&self, session: SessionId) -> Result<Option<SessionTurn>, StoreError> {
+        queried::add();
         let owner: Option<String> = self
             .conn
             .prepare_cached("SELECT owner FROM records WHERE kind = 'session' AND id = ?1")?
@@ -462,6 +496,7 @@ impl Store {
     }
 
     fn factory_by_key(&self, kind: &str, id: &str) -> Result<Option<FactoryBody>, StoreError> {
+        queried::add();
         let mut query = self
             .conn
             .prepare_cached("SELECT record FROM factory_records WHERE kind = ?1 AND id = ?2")?;

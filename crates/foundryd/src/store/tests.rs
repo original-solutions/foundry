@@ -2225,3 +2225,132 @@ fn the_factory_queries_order_only_by_a_generation_a_version_or_an_owner() {
     }
     assert!(found > 0, "run_events orders its result");
 }
+
+/// Every session's turn by the P1 owner rule, in one read; same answers as `session_turn`.
+#[test]
+fn session_turns_give_every_turn_of_its_owner_and_match_the_per_key_read() {
+    let (_dir, mut store) = open();
+    assert!(store.session_turns().unwrap().is_empty());
+    let a = MachineId::random();
+    let b = MachineId::random();
+    let one = owned_session(&mut store, a);
+    let two = owned_session(&mut store, b);
+    let three = owned_session(&mut store, a);
+    for (owner, session, turn) in [(a, one, 1), (b, two, 2), (a, three, 3)] {
+        store
+            .apply_factory(&turn_record(owner, 1, session, turn), owner)
+            .unwrap();
+    }
+    // A turn from a machine that does not own the session is not the session's.
+    store.apply_factory(&turn_record(b, 1, one, 9), b).unwrap();
+    // A turn with no P1 record of its session is not given.
+    let orphan = SessionId::random();
+    store
+        .apply_factory(&turn_record(a, 2, orphan, 4), a)
+        .unwrap();
+    let turns = store.session_turns().unwrap();
+    assert_eq!(turns.len(), 3);
+    assert_eq!(turns[&one], turn_body(one, 1));
+    assert_eq!(turns[&two], turn_body(two, 2));
+    assert_eq!(turns[&three], turn_body(three, 3));
+    for session in [one, two, three, orphan] {
+        assert_eq!(
+            turns.get(&session),
+            store.session_turn(session).unwrap().as_ref()
+        );
+    }
+}
+
+/// `session_turn` does not look at a deleted P1 session, so neither does the bulk read.
+#[test]
+fn session_turns_give_the_turn_of_a_deleted_session_as_session_turn_does() {
+    let (_dir, mut store) = open();
+    let a = MachineId::random();
+    let id = owned_session(&mut store, a);
+    let AnyRecord::Session(mut gone) = session_named(a, 2, id) else {
+        unreachable!();
+    };
+    gone.deleted = true;
+    store.apply(&AnyRecord::Session(gone), a).unwrap();
+    store.apply_factory(&turn_record(a, 1, id, 1), a).unwrap();
+    assert_eq!(
+        store.session_turns().unwrap().get(&id),
+        store.session_turn(id).unwrap().as_ref()
+    );
+    assert!(store.session_turns().unwrap().contains_key(&id));
+}
+
+#[test]
+fn helds_give_every_machines_holdings_and_match_the_per_key_read() {
+    let (_dir, mut store) = open();
+    assert!(store.helds().unwrap().is_empty());
+    let a = MachineId::random();
+    let b = MachineId::random();
+    let none = MachineId::random();
+    store.apply_factory(&held(a, 1, &["x"]), a).unwrap();
+    store.apply_factory(&held(b, 1, &["y", "z"]), b).unwrap();
+    let helds = store.helds().unwrap();
+    assert_eq!(helds.len(), 2);
+    assert_eq!(helds[&a], held_body(&["x"]));
+    assert_eq!(helds[&b], held_body(&["y", "z"]));
+    for machine in [a, b, none] {
+        assert_eq!(helds.get(&machine), store.held(machine).unwrap().as_ref());
+    }
+}
+
+/// A row neither bulk read can decode is an error that names the row's key, never a row left
+/// out, and never shows the record's contents.
+#[test]
+fn bulk_reads_fail_naming_the_key_on_an_unreadable_row_or_another_kind() {
+    let (_dir, mut store) = open();
+    let a = MachineId::random();
+    let session = owned_session(&mut store, a);
+    insert_unreadable_factory(
+        &store,
+        a,
+        1,
+        "session_turn",
+        &format!("{session}/{a}"),
+        serde_json::json!({"secret-login": "hunter2"}),
+    );
+    let error = store.session_turns().unwrap_err();
+    assert!(matches!(error, StoreError::Json(_)), "{error}");
+    assert!(error.to_string().contains(&session.to_string()), "{error}");
+    assert!(!error.to_string().contains("hunter2"), "{error}");
+
+    let machine = MachineId::random();
+    insert_unreadable_factory(
+        &store,
+        machine,
+        1,
+        "machine_held",
+        &machine.to_string(),
+        serde_json::json!({"secret-login": "hunter2"}),
+    );
+    let error = store.helds().unwrap_err();
+    assert!(matches!(error, StoreError::Json(_)), "{error}");
+    assert!(error.to_string().contains(&machine.to_string()), "{error}");
+    assert!(!error.to_string().contains("hunter2"), "{error}");
+
+    let (_dir, mut store) = open();
+    let machine = MachineId::random();
+    let session = owned_session(&mut store, machine);
+    insert_under_kind(
+        &store,
+        "session_turn",
+        &format!("{session}/{machine}"),
+        &held(machine, 2, &["a"]),
+    );
+    let error = store.session_turns().unwrap_err();
+    assert!(matches!(error, StoreError::Sqlite(_)), "{error}");
+    assert!(error.to_string().contains(&session.to_string()), "{error}");
+    insert_under_kind(
+        &store,
+        "machine_held",
+        &machine.to_string(),
+        &turn_record(machine, 1, session, 1),
+    );
+    let error = store.helds().unwrap_err();
+    assert!(matches!(error, StoreError::Sqlite(_)), "{error}");
+    assert!(error.to_string().contains(&machine.to_string()), "{error}");
+}
