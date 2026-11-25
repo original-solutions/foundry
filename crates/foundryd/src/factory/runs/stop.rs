@@ -1,22 +1,173 @@
-//! How a run ends: stopped, stuck or done.
+//! How a run ends: stopped by hand, stopped by a person's move, or done.
+//!
+//! Ported from `src/runner/stop.ts`, the stop-run part of `src/control.ts`, the runner's `watch`
+//! (the text check of `src/runner/building.ts`, which `building` leaves to this module) and the
+//! ends of a run `src/pass.ts` calls (`closedStuck`, and the merged or closed pull request of a
+//! `pr-open` run, which `gating` leaves to this module). Three steps:
+//!
+//! - [`request`] records a stop asked for by hand. The runner left a file for the pass to take
+//!   into the ledger; Foundry has no data dir, and a Stop from the Factory view is carried to
+//!   the lease holder (spec, "When things go wrong"), which calls this with its ledger and its
+//!   guard. A finished run is refused, then a run that is not `building` (so a stale line of a
+//!   run that left `building` is never answered "already"), then a stop already on record,
+//!   else the `stop_requested` line is written (cause `operator`, `stop-requested`) after the
+//!   lease is checked. [`not_building_message`], [`requested_message`],
+//!   [`already_requested_message`] and [`StopRequest::answer`] are the words of `stop.ts` and
+//!   `control.ts` for the route that calls it.
+//! - [`advance`] carries out a stop on the next pass: a building run goes stuck with
+//!   `stop-requested` and [`STOPPED_BY_HAND`] (the runner's code and words), its session ended
+//!   and its workspace kept, and a stuck path cut short is finished from the ledger with the
+//!   words it recorded. A closed issue is a person's move or the run's own merge and ends the
+//!   run first, as the runner's `advance` does.
+//! - [`reconcile`] is the runner's `watch` and what the spec says of a person's edit and of the
+//!   end of a run: see below.
+//!
+//! What the pass (task 30) must do with them:
+//!
+//! - Call [`advance`] for a run in `building` (or a `stuck` one not finished) whose ledger has
+//!   `stop_requested`, BEFORE `resume::advance`, `building::advance` and `start::advance`:
+//!   all three skip such a run ("stop owns it"). It answers [`StopStep::GateHolds`] while a
+//!   gate is in flight or a pass is recorded and not yet finished, and writes nothing: the
+//!   run is then `gating::advance`'s, which sticks it itself (it must be called for such a
+//!   run though `building` skips it), and the stop is dropped once the run is `pr-open`
+//!   ([`StopStep::Skipped`] `not-building`), as the runner's `work_runs` and `prOpenRuns` do.
+//!   A pass that finds [`StopStep::Stuck`] says "stopped by hand"; wake the loop after a
+//!   [`request`] that answered `Recorded`.
+//! - Call [`reconcile`] for every run of the project that is not `triage` or `needs-info`,
+//!   before `building::advance` and after `resume::advance` (as the runner calls `watch`
+//!   before `advance`): for a `building` run, a `pr-open` run (every pass: its pull request
+//!   and issue are read), a run whose stuck path this step began, and a finished run, which
+//!   costs no read of GitHub unless the fleet still shows a workspace of a stuck one. A stuck
+//!   run's issue is read only while a workspace of it is kept, and the pass is to read it no
+//!   more often than the runner's `STUCK_READ_EVERY_MS` (10 minutes): nothing here remembers
+//!   the last read. A run [`ReconcileStep::Skipped`] or [`ReconcileStep::Unchanged`] is for
+//!   its other steps; [`ReconcileStep::Stopped`], [`ReconcileStep::Ended`] and
+//!   [`ReconcileStep::Abandoned`] end the pass for it (say so; no other step runs on that
+//!   run this pass); [`ReconcileStep::Archived`] says what was archived;
+//!   [`ReconcileStep::Waiting`] is a machine that did not answer, asked again next pass.
+//!   `resume::orphans` stays the backstop for a machine heard from again later.
+//!
+//! What [`reconcile`] decides, in order:
+//!
+//! 1. A finished run: its workspaces are swept ([`sweep`]). One that did not go stuck has none to
+//!    keep (a closed issue's abandon is not a kept stuck run); a stuck one's are kept while its
+//!    issue is open and labelled `factory:stuck`, and archived by force once the issue is
+//!    closed, gone, or no longer so labelled. The ledger of a finished run takes no line, so
+//!    this is the one place a workspace is archived with nothing recorded first: the fleet no
+//!    longer showing it says it is done, and "not a live workspace" counts as archived.
+//! 2. A stuck path begun with this step's codes is finished with the words it recorded;
+//!    another step's is its own (`Skipped`, `not-building`).
+//! 3. A `pr-open` run: a pull request merged, closed or gone ends it (`end_run`, as merged or
+//!    closed); an open one with a closed issue abandons it. Nothing else is judged: a person's
+//!    work on a pull request is feedback.
+//! 4. A `building` run, as the runner's `watch`: skipped when a relaunch or resume is decided,
+//!    with no session, with a stuck decision, a stop, questions posted, the gate holding it or a
+//!    pass recorded. Then the issue text since the approval: changed by someone who is not an
+//!    instructor (`text-changed-during-build`), a history that cannot be judged
+//!    (`edits-unverifiable`) or no approval on record (`approval-unconfirmed`, no read) stops
+//!    the run, its session ended and its workspace kept; a run that reported a pull request
+//!    whose merge closed the issue is skipped (`pr-merged`) for `advance` to end. Then the
+//!    issue itself, one read: a person's close abandons the run, the run's own merge ends it,
+//!    and otherwise the label and the assignee are judged (see below).
+//!
+//! The end of a run (a merged or closed pull request, a closed issue) winds its workspaces up
+//! BEFORE the run is finished, because the ledger takes no line after: the session is ended
+//! (`reconcile-session-ended`), then each workspace the fleet shows under a name of the run
+//! (`fac/<N>-<attempt>`, `-r<k>`, `-f<k>`, `-g<k>`) is archived by force, `reconcile-archiving
+//! <id>` recorded before the call and `reconcile-archived <id>` after, and only then `end_run`,
+//! `abandon` or `end_own_merge` writes the summary line. A workspace already answered is not
+//! asked again, and a pass cut short carries on. A machine the fleet shows unreachable for as
+//! long as `resume::UNREACHABLE_FOR` (15 minutes; a gate's for `gate::MACHINE_GONE_AFTER`, 5)
+//! is recorded left (`reconcile-left <id> its machine is gone`) with no call; one that does not
+//! answer a call yet is waited for. A failure of a call is an error with the run not finished,
+//! and the next pass carries on.
+//!
+//! Where it differs from the runner:
+//!
+//! - A removed label and an assignee. The runner at the pinned commit has no rule for a
+//!   building run's label or assignee (it checks `factory:triage` and the assignee only for a
+//!   triage run, in `start`). The spec says "A person who edits the title, removes the label or
+//!   assigns someone stops the run at the next reconcile, as with the runner", and this build
+//!   reads it so (the orchestrator's decision): a `building` run, not a `triage` one (`start`
+//!   owns the claim's label and assignee), whose open issue no longer has `factory:building`
+//!   ([`LABEL_REMOVED`], code `label-removed`), or has an assignee other than the project's
+//!   login ([`ASSIGNEE_CHANGED`], code `assignee-changed`; nobody assigned is not a person's
+//!   assigning), is stopped as a stop by hand is: stuck, its session ended, its workspace kept.
+//!   The reasons are fixed words that quote nothing from the issue. Neither is judged while a
+//!   transition of the factory's own is in flight (a stuck decision, questions begun or
+//!   posted, an approval withdrawn, a stop, a relaunch or resume, a recorded pass, a gate in
+//!   flight): the label moves before the ledger's `state_changed`, so those would read as a
+//!   person's move.
+//! - The session is ended and the workspace kept for a stop (the spec's stuck workspace); the
+//!   runner archived the thread and removed the worktree, and wrote `worktree_removed`, which
+//!   Foundry never does. A machine unreachable for 15 minutes is not asked to end its session
+//!   (it ends its own, G10); one unreachable for less is an error and asked again.
+//! - `watch` is not called while the gate holds the run, as the runner's `work_runs` does not.
+//!   A closed issue and a merged pull request while a gate runs are `gating`'s.
+//! - `watch` is one step with the closed-issue and label judgement here, and a `pr-open` run
+//!   ends here: the runner's `regate` ended it, and `gating` leaves it to this module (its doc
+//!   says "the feedback step's"; the feedback step reads comments, and this one the pull
+//!   request). The runner's `feedback` also ended a run whose pull request was merged when
+//!   feedback existed, which this covers without reading comments.
+//! - A stop by hand is a ledger line written by the lease holder, not a file taken by the pass,
+//!   and the state is checked before a stop already on record (the runner's `leaveStopRequest`
+//!   order, not `requestStop`'s). A stale `stop_requested` line stays in a run's ledger after
+//!   the gate passed: `progress::read_progress` never clears it, so a later feedback round that
+//!   returns the run to `building` would read it as a stop (the runner has the same edge).
+//! - The pull request a stopped session left (`recordLeftPullRequest`, `pr_left`) is not
+//!   written (`building`'s doc says so too).
+//!
+//! Runner cases with no counterpart here:
+//!
+//! - `takeStopRequest`, `leaveStopRequest` and `stopRequestPath` (every case of the
+//!   `takeStopRequest` and `leaveStopRequest` groups of `stop.test.ts`): a directory of
+//!   request files per run, a file left, a race on the file, a file that cannot be written and
+//!   a file kept when the ledger cannot be read. `request` writes the ledger line itself.
+//! - `control.ts`'s claims pause and resume, `showRun` and `parseId` (and `stopRun`'s
+//!   `not-found` and `invalid` answers: a route has a `RunId`): settings and ledger reads, other
+//!   tasks'.
+//! - `watch refuses a run of another repo before touching anything`: a `RunId` names the repo
+//!   and the ledger is the store.
+//! - `watch does not let a thread T3 no longer knows stop the stop`, and the cases of the
+//!   thread's archive (T3 threads): the session is the fleet's, and a session the fleet does
+//!   not show has nothing to end.
+//! - `is recorded when the watch stops the run, from the branch the thread reports` and `in the
+//!   watch, stops the run even when GitHub cannot list them` (`pr_left`, see above), and the
+//!   cases of `building.test.ts` about the time limit, which `building` has.
+//! - `does nothing for a run that is finished ...` is split: a finished run is swept
+//!   (`does_nothing_for_a_run_that_is_finished_and_holds_no_workspace`).
+//!
+//! Runner cases ported with another outcome, because Foundry's behaviour changes it:
+//!
+//! - `is an error with nothing written when the archive fails and the next pass retries`: the
+//!   call that fails is the end of the session (the workspace is kept, not archived).
+//! - `watch skips a run whose own merged pull request closed the issue` skips as the runner's
+//!   does, for `building::advance` to end; the end of a run found by the label check (a closed
+//!   issue with the text unchanged) is this step's, and ends it.
+
+use std::collections::BTreeSet;
 
 use foundry_proto::factory::{RunEvent, RunId};
 use foundry_proto::ids::{MachineId, WorkspaceId};
 use serde_json::Value;
 
 use super::gating::{self, GATE_REQUESTED};
-use super::progress::{Seen, read_progress};
+use super::progress::{Seen, pending_relaunch, read_progress};
 use super::resume::UNREACHABLE_FOR;
 use super::{
     Closing, Progress, RunContext, RunError, Stop, StuckStop, abandon, closed_issue, end_own_merge,
-    go_stuck, progress_from, recorded_reason, workspace_id,
+    end_run, go_stuck, progress_from, recorded_reason, workspace_id,
 };
 use crate::factory::gate;
+use crate::factory::github::TrackerError;
 use crate::factory::ledger::Ledger;
 use crate::factory::ledger::events::{Cause, CauseStep, Event, names};
 use crate::factory::lifecycle::State;
-use crate::factory::messages::STOPPED_BY_HAND;
-use crate::factory::worker::Guard;
+use crate::factory::lifecycle::approval::TextCheck;
+use crate::factory::messages::{
+    CANNOT_CONFIRM, CANNOT_VERIFY_DURING_BUILD, CHANGED_DURING_BUILD, STOPPED_BY_HAND,
+};
+use crate::factory::worker::{Guard, WorkerError};
 
 /// What [`request`] found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -300,7 +451,6 @@ fn forget_unreachable_session(
 pub(super) struct Live {
     pub id: WorkspaceId,
     pub machine: MachineId,
-    pub name: String,
     /// A gate's workspace: its machine is given up on sooner.
     pub gate: bool,
 }
@@ -366,7 +516,6 @@ pub(super) fn live_workspaces(ctx: &RunContext<'_>, run: &RunId, events: &[RunEv
                 found.push(Live {
                     id: record.body.id,
                     machine: record.owner,
-                    name: name.clone(),
                     gate: is_gate,
                 });
             }
@@ -400,9 +549,425 @@ pub enum ReconcileStep {
     Waiting { workspaces: Vec<WorkspaceId> },
 }
 
+/// The codes of the stuck paths this step decides, the runner's `watch` and its own.
+const TEXT_CODE: &str = "text-changed-during-build";
+const UNVERIFIED_CODE: &str = "edits-unverifiable";
+const UNCONFIRMED_CODE: &str = "approval-unconfirmed";
+const LABEL_CODE: &str = "label-removed";
+const ASSIGNEE_CODE: &str = "assignee-changed";
+const OWN_CODES: [&str; 5] = [
+    TEXT_CODE,
+    UNVERIFIED_CODE,
+    UNCONFIRMED_CODE,
+    LABEL_CODE,
+    ASSIGNEE_CODE,
+];
+
+/// The step written once the run's session was ended for its end.
+pub const SESSION_ENDED: &str = "reconcile-session-ended";
+/// The step written before a workspace's archive is asked for: `reconcile-archiving <id>`.
+pub const ARCHIVING: &str = "reconcile-archiving ";
+/// The step written once it is answered: `reconcile-archived <id>`.
+pub const ARCHIVED: &str = "reconcile-archived ";
+/// The step written for a workspace not asked for: `reconcile-left <id> <why>`.
+pub const LEFT: &str = "reconcile-left ";
+
 /// What a person's move and the end of a run mean for it: see the module's words.
-pub fn reconcile(_ctx: &RunContext<'_>, _run: &RunId) -> Result<ReconcileStep, RunError> {
-    todo!()
+pub fn reconcile(ctx: &RunContext<'_>, run: &RunId) -> Result<ReconcileStep, RunError> {
+    let events = ctx.ledger.read(run)?;
+    let seen = read_progress(&events);
+    if seen.finished {
+        return sweep(ctx, run, &events, &seen);
+    }
+    if begun(&seen) {
+        // A stuck path begun is its owner's to finish: this step's own is finished here.
+        let own = seen
+            .stuck_stop
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<StuckStop>(raw).ok())
+            .is_some_and(|decision| OWN_CODES.contains(&decision.code.as_str()));
+        if own && matches!(seen.state, Some(State::Building | State::Stuck)) {
+            let mut at = progress_from(run, CauseStep::Watch, &seen, State::Building);
+            forget_unreachable_session(ctx, run, &events, &mut at);
+            let reason = finish_begun(ctx, run, &seen, &mut at)?;
+            return Ok(ReconcileStep::Stopped { reason });
+        }
+        return Ok(ReconcileStep::Skipped {
+            why: "not-building",
+        });
+    }
+    match seen.state {
+        Some(State::PrOpen) => pr_open(ctx, run, &events, &seen),
+        Some(State::Building) => building(ctx, run, &events, &seen),
+        _ => Ok(ReconcileStep::Skipped {
+            why: "not-building",
+        }),
+    }
+}
+
+/// What a `pr-open` run's pull request and issue say: a pull request that is merged, closed or
+/// gone ends it, and so does a closed issue. The label, the assignee and the text are not
+/// judged: the gate passed, and a person's work on the pull request is feedback.
+fn pr_open(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    events: &[RunEvent],
+    seen: &Seen,
+) -> Result<ReconcileStep, RunError> {
+    let Some(last) = &seen.last_pr else {
+        return Ok(ReconcileStep::Skipped {
+            why: "no-pull-request",
+        });
+    };
+    let pull = ctx.tracker.pull_request(ctx.repo(), last.pr)?;
+    if pull.as_ref().is_none_or(|pull| !pull.open) {
+        if let Wound::Waiting(workspaces) = wind_up(ctx, run, events, seen, CauseStep::Watch)? {
+            return Ok(ReconcileStep::Waiting { workspaces });
+        }
+        let bare = without_session(seen);
+        let at = progress_from(run, CauseStep::Watch, &bare, State::PrOpen);
+        end_run(ctx, &at, &last.url, pull.as_ref(), CauseStep::Watch)?;
+        return Ok(ReconcileStep::Ended);
+    }
+    if ctx.tracker.issue(ctx.repo(), run.issue())?.closed {
+        return abandoned(ctx, run, events, seen);
+    }
+    Ok(ReconcileStep::Unchanged)
+}
+
+/// The runner's `watch` for a building run, and what a person's label or assignee means.
+fn building(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    events: &[RunEvent],
+    seen: &Seen,
+) -> Result<ReconcileStep, RunError> {
+    let skipped = |why| Ok(ReconcileStep::Skipped { why });
+    if seen
+        .interruption
+        .as_ref()
+        .is_some_and(|interruption| interruption.relaunch || !interruption.sent)
+        || pending_relaunch(seen).is_some()
+    {
+        return skipped("relaunching");
+    }
+    if seen.thread_id.is_none() {
+        return skipped("no-session");
+    }
+    if seen.stop_requested || seen.questions_posted {
+        return skipped("not-building");
+    }
+    // The gate has the run: nothing else is done for it, and its own step decides.
+    if gating::gate_running(events) {
+        return skipped("gate-running");
+    }
+    // The gate checks the text itself before it records a pass, and after one the session is done.
+    if seen.pass.is_some() {
+        return skipped("gate-passed");
+    }
+    if let Some((code, reason)) = text_stop(ctx, run.issue(), seen)? {
+        // Only a run that has reported a pull request can have been closed by its own merge: no
+        // read for any other. `advance` ends that run; a closed issue otherwise changes nothing
+        // here.
+        if !seen.opened.is_empty()
+            && let (Closing::OwnMerge(_), _) = closed_issue(ctx, run, seen)?
+        {
+            return skipped("pr-merged");
+        }
+        return stuck(ctx, run, events, seen, code, reason);
+    }
+    let (closing, detail) = closed_issue(ctx, run, seen)?;
+    match closing {
+        Closing::PersonsMove => return abandoned(ctx, run, events, seen),
+        Closing::OwnMerge(pull) => {
+            if let Wound::Waiting(workspaces) = wind_up(ctx, run, events, seen, CauseStep::Watch)? {
+                return Ok(ReconcileStep::Waiting { workspaces });
+            }
+            end_own_merge(ctx, run, &without_session(seen), CauseStep::Watch, &pull)?;
+            return Ok(ReconcileStep::Ended);
+        }
+        Closing::Open => {}
+    }
+    let Some(detail) = detail else {
+        return Err(RunError::Invalid(format!("run {run}'s issue was not read")));
+    };
+    // A move of the factory's own, begun and not finished, is not a person's.
+    if !committed(seen) {
+        return Ok(ReconcileStep::Unchanged);
+    }
+    if !detail
+        .labels
+        .iter()
+        .any(|label| label == State::Building.label())
+    {
+        return stuck(ctx, run, events, seen, LABEL_CODE, LABEL_REMOVED);
+    }
+    if detail
+        .assignees
+        .iter()
+        .any(|assignee| !assignee.eq_ignore_ascii_case(&ctx.project.login))
+    {
+        return stuck(ctx, run, events, seen, ASSIGNEE_CODE, ASSIGNEE_CHANGED);
+    }
+    Ok(ReconcileStep::Unchanged)
+}
+
+/// Whether no transition of the factory's own is in flight for a building run: no questions
+/// begun, no approval being withdrawn, no re-gate or relaunch, and no stuck comment begun.
+fn committed(seen: &Seen) -> bool {
+    seen.questions_commenting.is_none()
+        && !seen.withdrawn
+        && !seen.regating
+        && seen.relaunch.is_none()
+        && seen.stuck_commenting.is_none()
+}
+
+/// Why the issue text no longer stands for a building run, as the code and the public reason, or
+/// `None`. A run with no `approved` step fails closed without a read; otherwise every rename and
+/// body edit since the approval must be an instructor's. A history that cannot be judged counts
+/// as changed; a failed read is an error, never an answer.
+fn text_stop(
+    ctx: &RunContext<'_>,
+    issue: u64,
+    seen: &Seen,
+) -> Result<Option<(&'static str, &'static str)>, RunError> {
+    let Some(approved_at) = &seen.approved_at else {
+        return Ok(Some((UNCONFIRMED_CODE, CANNOT_CONFIRM)));
+    };
+    let check = ctx
+        .tracker
+        .text_check(ctx.repo(), issue, approved_at, &ctx.config.instructors)?;
+    Ok(match check {
+        TextCheck::Unchanged => None,
+        TextCheck::Changed => Some((TEXT_CODE, CHANGED_DURING_BUILD)),
+        TextCheck::Unjudged => Some((UNVERIFIED_CODE, CANNOT_VERIFY_DURING_BUILD)),
+    })
+}
+
+/// The run goes stuck with `reason`, its session ended and its workspace kept.
+fn stuck(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    events: &[RunEvent],
+    seen: &Seen,
+    code: &str,
+    reason: &str,
+) -> Result<ReconcileStep, RunError> {
+    let mut at = progress_from(run, CauseStep::Watch, seen, State::Building);
+    forget_unreachable_session(ctx, run, events, &mut at);
+    go_stuck(ctx, run.issue(), &mut at, code, Stop::new(reason), None)?;
+    Ok(ReconcileStep::Stopped {
+        reason: reason.into(),
+    })
+}
+
+/// A person closed the issue: the run's workspaces are wound up, then the run is ended.
+fn abandoned(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    events: &[RunEvent],
+    seen: &Seen,
+) -> Result<ReconcileStep, RunError> {
+    if let Wound::Waiting(workspaces) = wind_up(ctx, run, events, seen, CauseStep::Watch)? {
+        return Ok(ReconcileStep::Waiting { workspaces });
+    }
+    abandon(ctx, run, &without_session(seen), CauseStep::Watch)?;
+    Ok(ReconcileStep::Abandoned)
+}
+
+/// What winding up the workspaces of a run that ends came to.
+enum Wound {
+    /// Every workspace is archived or left, and the session is ended.
+    Done,
+    /// A machine did not answer: asked again next pass, nothing finished.
+    Waiting(Vec<WorkspaceId>),
+}
+
+/// What the ledger records of a run's winding up.
+#[derive(Default)]
+struct Recorded {
+    session_ended: bool,
+    /// The workspaces whose archive was about to be asked for.
+    archiving: BTreeSet<String>,
+    /// The workspaces archived or left.
+    done: BTreeSet<String>,
+}
+
+impl Recorded {
+    fn read(events: &[RunEvent]) -> Self {
+        let mut recorded = Self::default();
+        for step in events.iter().filter_map(step_text) {
+            if step == SESSION_ENDED {
+                recorded.session_ended = true;
+            } else if let Some(id) = step.strip_prefix(ARCHIVING) {
+                recorded.archiving.insert(id.to_owned());
+            } else if let Some(id) = step.strip_prefix(ARCHIVED) {
+                recorded.done.insert(id.to_owned());
+            } else if let Some(rest) = step.strip_prefix(LEFT) {
+                recorded
+                    .done
+                    .insert(rest.split(' ').next().unwrap_or(rest).to_owned());
+            }
+        }
+        recorded
+    }
+}
+
+/// The run's session ended, then every workspace of it the fleet shows archived by force, each
+/// recorded before it is asked and each once. A machine unreachable for as long as its
+/// workspaces are kept for is left with no call; one that does not answer yet is waited for.
+/// A failed call is an error, and the next pass carries on from the ledger.
+fn wind_up(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    events: &[RunEvent],
+    seen: &Seen,
+    step: CauseStep,
+) -> Result<Wound, RunError> {
+    ctx.held()?;
+    let live = live_workspaces(ctx, run, events);
+    let recorded = Recorded::read(events);
+    if !recorded.session_ended {
+        let at = progress_from(run, step, seen, State::Triage);
+        let session = at.thread_id.is_some() || seen.launch_sent;
+        let in_it = at
+            .worktree
+            .as_deref()
+            .and_then(|worktree| workspace_id(worktree).ok())
+            .and_then(|id| live.iter().find(|live| live.id == id));
+        if let (true, Some(live)) = (session, in_it)
+            && !live.gone(ctx)
+        {
+            match ctx.end_sessions(live.id) {
+                Ok(()) => {}
+                Err(RunError::Worker(WorkerError::Failed(said))) if not_live(&said) => {}
+                Err(RunError::Worker(WorkerError::Unreachable(_))) => {
+                    return Ok(Wound::Waiting(vec![live.id]));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        ctx.record_step(
+            run,
+            SESSION_ENDED,
+            &Cause::new(step, "reconcile-session-ended"),
+        )?;
+    }
+    let mut waiting = Vec::new();
+    for workspace in &live {
+        if archive_one(ctx, run, workspace, Some((&recorded, step)))? == Archived::Waiting {
+            waiting.push(workspace.id);
+        }
+    }
+    Ok(if waiting.is_empty() {
+        Wound::Done
+    } else {
+        Wound::Waiting(waiting)
+    })
+}
+
+/// What asking for a workspace's archive came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Archived {
+    Done,
+    Left,
+    Waiting,
+}
+
+/// Whether the worker's answer to an archive is P1's "is not a live workspace of this machine".
+fn not_live(said: &str) -> bool {
+    said.contains("is not a live workspace of this machine")
+}
+
+/// One workspace archived by force. With `log` (a run not finished) the intent is recorded
+/// before the call and the answer after, and one already answered is not asked again; without
+/// it (a finished run's ledger takes no line) the call is asked while the fleet shows the
+/// workspace, and a workspace the worker no longer knows counts as archived.
+fn archive_one(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    live: &Live,
+    log: Option<(&Recorded, CauseStep)>,
+) -> Result<Archived, RunError> {
+    let id = live.id.0.to_string();
+    if log.is_some_and(|(recorded, _)| recorded.done.contains(&id)) {
+        return Ok(Archived::Done);
+    }
+    if live.gone(ctx) {
+        if let Some((_, step)) = log {
+            let line = format!("{LEFT}{id} its machine is gone");
+            ctx.record_step(run, &line, &Cause::new(step, "reconcile-left"))?;
+        }
+        return Ok(Archived::Left);
+    }
+    if let Some((recorded, step)) = log
+        && !recorded.archiving.contains(&id)
+    {
+        let line = format!("{ARCHIVING}{id}");
+        ctx.record_step(run, &line, &Cause::new(step, "reconcile-archiving"))?;
+    }
+    match ctx.archive(live.id) {
+        Ok(()) => {}
+        Err(RunError::Worker(WorkerError::Failed(said))) if not_live(&said) => {}
+        Err(RunError::Worker(WorkerError::Unreachable(_))) => return Ok(Archived::Waiting),
+        Err(error) => return Err(error),
+    }
+    if let Some((_, step)) = log {
+        let line = format!("{ARCHIVED}{id}");
+        ctx.record_step(run, &line, &Cause::new(step, "reconcile-archived"))?;
+    }
+    Ok(Archived::Done)
+}
+
+/// The workspaces of a run that is finished: a run that did not go stuck has none to keep, and
+/// a stuck run's are kept until its issue leaves `factory:stuck`, or is closed or gone. The
+/// ledger of a finished run takes no line, so nothing is recorded: the fleet no longer showing
+/// a workspace is what says it was archived, and a call asked twice before it does is answered
+/// "not a live workspace".
+fn sweep(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    events: &[RunEvent],
+    seen: &Seen,
+) -> Result<ReconcileStep, RunError> {
+    let live = live_workspaces(ctx, run, events);
+    if live.is_empty() {
+        return Ok(ReconcileStep::Unchanged);
+    }
+    if seen.state == Some(State::Stuck) || begun(seen) {
+        match ctx.tracker.issue(ctx.repo(), run.issue()) {
+            Ok(detail)
+                if !detail.closed
+                    && detail
+                        .labels
+                        .iter()
+                        .any(|label| label == State::Stuck.label()) =>
+            {
+                return Ok(ReconcileStep::Unchanged);
+            }
+            Ok(_) | Err(TrackerError::NotFound { .. }) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let (mut archived, mut waiting) = (Vec::new(), Vec::new());
+    for workspace in &live {
+        match archive_one(ctx, run, workspace, None)? {
+            Archived::Done => archived.push(workspace.id),
+            Archived::Left => {}
+            Archived::Waiting => waiting.push(workspace.id),
+        }
+    }
+    Ok(if !waiting.is_empty() {
+        ReconcileStep::Waiting {
+            workspaces: waiting,
+        }
+    } else if archived.is_empty() {
+        ReconcileStep::Unchanged
+    } else {
+        ReconcileStep::Archived {
+            workspaces: archived,
+        }
+    })
 }
 
 #[cfg(test)]
@@ -1860,9 +2425,8 @@ mod tests {
             #[test]
             fn a_removed_label_stops_a_building_run() {
                 let (rig, run) = building_run();
-                rig.sim.set_labels(&["bug"]);
+                rig.sim.set_labels(&[]);
                 stopped(&rig, &run, LABEL_REMOVED);
-                assert!(!LABEL_REMOVED.contains("bug"));
             }
 
             #[test]
@@ -1992,7 +2556,7 @@ mod tests {
             #[test]
             fn a_stop_cut_short_is_finished_once_from_the_ledger() {
                 let (rig, run) = building_run();
-                rig.sim.set_labels(&["bug"]);
+                rig.sim.set_labels(&[]);
                 rig.sim.fail("could not finish this issue", 1);
                 assert!(reconcile(&rig.ctx(), &run).is_err());
                 assert!(!rig.finished(&run));
@@ -2047,7 +2611,6 @@ mod tests {
                 rig.write(&run, stop_line());
                 advance(&rig.ctx(), &run).unwrap();
                 assert!(rig.finished(&run));
-                rig.worker.on_archive(Ok(()));
                 (rig, run)
             }
 
