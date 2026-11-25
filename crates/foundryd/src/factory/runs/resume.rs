@@ -106,10 +106,15 @@
 //!   again it is accepted, and the workspace it made of that name is found by its owner. A claim
 //!   whose own machine is heard from again after a target was given up is left to `start`.
 //! - A stuck path this step began and that was cut short is finished here, from the ledger, as
-//!   building finishes its own: the decision's code and words, the setup's tail read again, and
-//!   no call to a machine that has been unreachable for 15 minutes. A stuck path another step
-//!   began (building's, the time limit's) is left to it, unless a resume is owed, which those
-//!   steps skip the run for.
+//!   building finishes its own, at any cut point after its decision (`stuck-stop`), up to a
+//!   `state_changed` to stuck with no `finished`; a lone `stuck-detail` decided nothing and is
+//!   decided again. It keeps the first try's words (the detail, the setup's tail, the session's
+//!   last turn read again) and ends the sessions of the workspace the decision used: the
+//!   resume workspace when one was made, else the old one, and none on a machine unreachable
+//!   for 15 minutes. Ownership: resume finishes a decision of its own codes (named for this step
+//!   and shared with no other: `start`'s are `launch-failed` and `approval-unconfirmed`) and, while
+//!   a resume is owed, any decision, since `building` skips such a run; otherwise the step that
+//!   began it does.
 //! - A stuck run's workspace is kept for a person to look at, so [`orphans`] does not list it.
 //! - The moved claim's lines are written with the cause step `advance`, as the rest of this
 //!   module's: `start` reads no cause step.
@@ -577,16 +582,16 @@ impl Ended {
     /// The code of the stuck path and what the run says when the cap is used.
     fn stop(&self) -> (&'static str, Stop) {
         match self {
-            Ended::Gone => ("thread-gone", Stop::new(SESSION_GONE)),
+            Ended::Gone => (STUCK_GONE, Stop::new(SESSION_GONE)),
             Ended::Process { what, text } => (
-                "session-ended-badly",
+                STUCK_ENDED,
                 Stop {
                     reason: format!("the session run ended as {what}"),
                     session_text: text.clone(),
                     ..Stop::default()
                 },
             ),
-            Ended::Unreachable => ("machine-unreachable", Stop::new(MACHINE_UNREACHABLE)),
+            Ended::Unreachable => (STUCK_MACHINE, Stop::new(MACHINE_UNREACHABLE)),
         }
     }
 }
@@ -780,6 +785,9 @@ fn not_this_steps(ctx: &RunContext<'_>, run: &RunId, seen: &Seen) -> Option<Stri
     } else {
         return match seen.state {
             Some(State::Triage | State::Building) => None,
+            // A stuck path cut short after its state change is finished here, or left to the
+            // step that began it.
+            Some(State::Stuck) if seen.stuck.is_some() || seen.stuck_stop.is_some() => None,
             state => Some(format!(
                 "run {run} is in state {}, which another step owns",
                 state.map_or("none", State::name)
@@ -807,11 +815,9 @@ fn pass(
         .is_some_and(|interruption| !interruption.sent);
     // A stuck path begun: the step that began it finishes it. Mine are finished here from the
     // ledger, as building finishes its own.
-    if seen.stuck.is_some()
-        || seen.stuck_stop.is_some()
-        || seen.stuck_detail.is_some()
-        || seen.stuck_commenting.is_some()
-    {
+    // A decision is a `stuck-stop` line: a lone `stuck-detail` decided nothing, and is decided
+    // again.
+    if seen.stuck.is_some() || seen.stuck_stop.is_some() {
         if let Some(step) = finish_own_stuck(ctx, run, &events, &seen, &mut at, resume_owed)? {
             return Ok(step);
         }
@@ -862,21 +868,35 @@ fn pass(
     }
 }
 
-/// The codes of the stuck paths this step begins.
+/// The codes of the stuck paths this step begins. None is one `start` or `building` writes:
+/// the two that look alike are named for this step.
+const STUCK_GONE: &str = "thread-gone";
+const STUCK_ENDED: &str = "session-ended-badly";
+const STUCK_MACHINE: &str = "machine-unreachable";
+const STUCK_UNCONFIRMED: &str = "resume-approval-unconfirmed";
+const STUCK_LAUNCH: &str = "resume-launch-failed";
+const STUCK_SETUP: &str = "resume-setup-failed";
+const STUCK_TEXT: &str = "text-changed-during-build";
+const STUCK_UNVERIFIED: &str = "edits-unverifiable";
 const OWN_STUCK_CODES: [&str; 8] = [
-    "thread-gone",
-    "session-ended-badly",
-    "machine-unreachable",
-    "approval-unconfirmed",
-    "launch-failed",
-    "resume-setup-failed",
-    "text-changed-during-build",
-    "edits-unverifiable",
+    STUCK_GONE,
+    STUCK_ENDED,
+    STUCK_MACHINE,
+    STUCK_UNCONFIRMED,
+    STUCK_LAUNCH,
+    STUCK_SETUP,
+    STUCK_TEXT,
+    STUCK_UNVERIFIED,
 ];
 
-/// Whether the old workspace's machine has been unreachable for 15 minutes: it cannot be asked
-/// to end its sessions, and ends its own (G10).
-fn old_machine_gone(ctx: &RunContext<'_>, run: &RunId, events: &[RunEvent], seen: &Seen) -> bool {
+/// The machine that owns the run's newest workspace: its record's owner, else the claim's
+/// machine.
+fn old_owner(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    events: &[RunEvent],
+    seen: &Seen,
+) -> Option<MachineId> {
     seen.worktree
         .as_deref()
         .or(seen.workspace.as_deref())
@@ -884,7 +904,12 @@ fn old_machine_gone(ctx: &RunContext<'_>, run: &RunId, events: &[RunEvent], seen
         .and_then(|id| find_workspace(ctx.view, ctx.project.id, run, scan_of(events), id))
         .map(|record| record.owner)
         .or_else(|| seen.machine.as_deref().and_then(parse_machine))
-        .is_some_and(|machine| unreachable_long(ctx, machine))
+}
+
+/// Whether the old workspace's machine has been unreachable for 15 minutes: it cannot be asked
+/// to end its sessions, and ends its own (G10).
+fn old_machine_gone(ctx: &RunContext<'_>, run: &RunId, events: &[RunEvent], seen: &Seen) -> bool {
+    old_owner(ctx, run, events, seen).is_some_and(|machine| unreachable_long(ctx, machine))
 }
 
 /// A stuck path this step began and was cut short, finished from the ledger as building's
@@ -909,32 +934,54 @@ fn finish_own_stuck(
     }
     let mut stop = decision.stop;
     stop.detail = seen.stuck_detail.clone();
-    if decision.code == "resume-setup-failed"
-        && let Some(round) = read_round(events)
-        && let Some(id) = round.workspace
-    {
-        let name = resume_name(run, round.k);
-        let terminal = ctx
-            .view
-            .workspaces_named(ctx.project.id, &name)
+    let round = read_round(events).filter(|_| resume_owed);
+    // The resume workspace the decision was made in, when one was recorded.
+    let resume_record = round.as_ref().and_then(|round| {
+        let id = round.workspace?;
+        ctx.view
+            .workspaces_named(ctx.project.id, &resume_name(run, round.k))
             .into_iter()
             .find(|record| record.body.id == id)
-            .and_then(|record| record.body.setup);
-        if let Some(terminal) = terminal {
-            match ctx.tail(terminal) {
-                Ok(tail) => {
-                    stop.session_text = Some(prepare_output_tail(&tail));
-                    stop.recorded_text = Some(text::sanitize(&tail, true));
-                }
-                Err(error @ RunError::LeaseLost(_)) => return Err(error),
-                Err(_) => {}
+    });
+    if decision.code == STUCK_SETUP
+        && let Some(terminal) = resume_record.and_then(|record| record.body.setup)
+    {
+        match ctx.tail(terminal) {
+            Ok(tail) => {
+                stop.session_text = Some(prepare_output_tail(&tail));
+                stop.recorded_text = Some(text::sanitize(&tail, true));
+            }
+            Err(error @ RunError::LeaseLost(_)) => return Err(error),
+            Err(_) => {}
+        }
+    }
+    // What the session said, read again from its newest unread turn as the first try read it.
+    if decision.code == STUCK_ENDED
+        && let Some(thread) = &seen.thread_id
+    {
+        let session = session_id(thread)?;
+        let read = newest_turn_read(events);
+        let unread = ctx
+            .view
+            .session_turn(session)
+            .filter(|turn| turn.turn > 0 && read.is_none_or(|read| turn.turn > read))
+            .cloned();
+        if let Some(turn) = unread {
+            ctx.held()?;
+            if let Ok(said) = ctx.worker.turn(session, turn.turn) {
+                stop.session_text = prepared(&said.message);
             }
         }
     }
-    // The machine is gone: nothing can be asked of it.
-    if decision.code == "machine-unreachable" || old_machine_gone(ctx, run, events, seen) {
-        at.worktree = None;
-    }
+    // The sessions ended are those of the workspace the decision used: the resume's when one
+    // was made, else the old one, and neither when its machine is gone for good.
+    at.worktree = match (&round, resume_record) {
+        (Some(round), record) if round.workspace.is_some() => record
+            .filter(|record| !unreachable_long(ctx, record.owner))
+            .map(|record| record.body.id.to_string()),
+        _ if decision.code == STUCK_MACHINE || old_machine_gone(ctx, run, events, seen) => None,
+        _ => at.worktree.take(),
+    };
     let reason = stop.reason.clone();
     go_stuck(ctx, run.issue(), at, &decision.code, stop, None)?;
     Ok(Some(ResumeStep::Stuck { reason }))
@@ -1073,16 +1120,8 @@ fn closing_step(
     if closing == Closing::Open {
         return Ok(None);
     }
-    let owner = seen
-        .worktree
-        .as_deref()
-        .or(seen.workspace.as_deref())
-        .and_then(|id| workspace_id(id).ok())
-        .and_then(|id| find_workspace(ctx.view, ctx.project.id, run, scan_of(events), id))
-        .map(|record| record.owner)
-        .or_else(|| seen.machine.as_deref().and_then(parse_machine));
     let mut ending = seen.clone();
-    if owner.is_some_and(|machine| unreachable_long(ctx, machine)) {
+    if old_machine_gone(ctx, run, events, seen) {
         ending.worktree = None;
         ending.workspace = None;
     }
@@ -1204,7 +1243,7 @@ fn decide(
             detail: Some(recorded_reason(&stop)),
             ..Stop::default()
         };
-        return stuck(ctx, run, at, "approval-unconfirmed", stop);
+        return stuck(ctx, run, at, STUCK_UNCONFIRMED, stop);
     }
     let branch = match choose_branch(ctx, issue, seen)? {
         Branch::Use(branch) => branch,
@@ -1214,7 +1253,7 @@ fn decide(
                 detail: Some(BRANCH_REFUSED.into()),
                 ..Stop::default()
             };
-            return stuck(ctx, run, at, "launch-failed", stop);
+            return stuck(ctx, run, at, STUCK_LAUNCH, stop);
         }
     };
     let k = used + 1;
@@ -1443,7 +1482,7 @@ fn carry_on(
                     Err(RunError::Worker(WorkerError::Failed(_))) => Stop::new(SETUP_FAILED),
                     Err(error) => return Err(error),
                 };
-                return stuck(ctx, run, at, "resume-setup-failed", stop);
+                return stuck(ctx, run, at, STUCK_SETUP, stop);
             }
             _ => return Ok(ResumeStep::Waiting(Wait::Setup)),
         }
@@ -1478,11 +1517,11 @@ fn carry_on(
         TextCheck::Unchanged => {}
         TextCheck::Changed => {
             let stop = Stop::new(CHANGED_DURING_BUILD);
-            return stuck(ctx, run, at, "text-changed-during-build", stop);
+            return stuck(ctx, run, at, STUCK_TEXT, stop);
         }
         TextCheck::Unjudged => {
             let stop = Stop::new(CANNOT_VERIFY_DURING_BUILD);
-            return stuck(ctx, run, at, "edits-unverifiable", stop);
+            return stuck(ctx, run, at, STUCK_UNVERIFIED, stop);
         }
     }
     let first = launch_message(ctx, run, seen, branch);
@@ -1522,7 +1561,7 @@ fn carry_on(
                 detail: Some(note),
                 ..Stop::default()
             };
-            stuck(ctx, run, at, "launch-failed", stop)
+            stuck(ctx, run, at, STUCK_LAUNCH, stop)
         }
         Err(error) => Err(error),
     }
@@ -1675,18 +1714,19 @@ fn moved_claim(
         return skipped(run, "names no machine");
     };
     let (moved, gave_up) = moved_to(events);
-    // A claim whose own machine is heard from again after a target was given up is carried on
-    // there by `start`.
-    if moved.is_none() && !gave_up.is_empty() && ctx.view.online(claimed_on) {
-        return skipped(run, "has its machine back, which start carries on with");
-    }
+    // Not yet moved: only a claim whose machine is gone for good and which made nothing is,
+    // after a target was given up as before. A workspace a given-up machine made is not the
+    // claim's: it is an orphan for when that machine is heard from again.
     let needs_a_machine = ResumeStep::NeedsMachine(Placing::MovedClaim {
         unreachable: claimed_on,
     });
-    // Not yet moved: only a claim whose machine is gone for good and which made nothing is.
-    // A claim that was moved and given up has gone through that already.
-    if moved.is_none() && gave_up.is_empty() {
-        if !ctx.view.workspaces_named(ctx.project.id, &name).is_empty() {
+    if moved.is_none() {
+        if ctx
+            .view
+            .workspaces_named(ctx.project.id, &name)
+            .iter()
+            .any(|record| !gave_up.contains(&record.owner))
+        {
             return skipped(run, "has a build workspace");
         }
         if !unreachable_long(ctx, claimed_on) {
@@ -4224,18 +4264,15 @@ mod tests {
 
         #[test]
         fn a_begun_stuck_path_buildings_is_not_an_interruption() {
-            for step in [
+            let (rig, run) = interrupted();
+            rig.step(
+                &run,
                 "stuck-stop {\"code\":\"session-stuck\",\"stop\":{\"reason\":\"said stuck\"}}",
-                "stuck-commenting 0",
-                "stuck-detail said stuck",
-            ] {
-                let (rig, run) = interrupted();
-                rig.step(&run, step);
-                let before = event_count(&rig, &run);
-                assert!(is_skipped(&pass(&rig, &run)), "{step}");
-                assert_eq!(event_count(&rig, &run), before, "{step}");
-                assert!(rig.worker.calls().is_empty(), "{step}");
-            }
+            );
+            let before = event_count(&rig, &run);
+            assert!(is_skipped(&pass(&rig, &run)));
+            assert_eq!(event_count(&rig, &run), before);
+            assert!(rig.worker.calls().is_empty());
         }
 
         #[test]
