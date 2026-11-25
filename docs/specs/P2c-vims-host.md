@@ -197,6 +197,8 @@ A build that does not know about Vims must never build a Vims project on the fle
   - a resume held back until the earlier workspace is removed
   - Stop pending while Vims is unreachable, and complete only after all three steps
   - a full quota that leaves a run waiting and spends no gate retry, and a wake that takes room before a claim
+  - a create refused for quota that frees its slot and is sent again only once a slot is free, and a workspace asleep for credit that keeps its slot
+  - a refusal that keeps a `factory:ready` issue in `ready` with no claim comment while a step waits, and "factory idle" raised with Vims's reason on the third pass of the wait and not the second
   - a gate whose grant is gone before the checkout
   - a protocol 5 link that carries no `host_run` record and reads a Vims run's status, a machine that moves to protocol 6 and then receives every `host_run` record, and a fleet with one protocol 5 machine where Vims cannot be turned on
 - One `#[ignore]` contract test, run with `FOUNDRY_VIMS_CONTRACT=1`, makes a real workspace, runs a command, reads its result by operation and removes it. It spends credit and no model call.
