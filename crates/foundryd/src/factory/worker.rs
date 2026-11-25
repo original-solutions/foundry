@@ -151,7 +151,9 @@ impl FleetView {
     /// A record this build cannot read fails the whole read, unlike P1's views, which leave
     /// that owner out. The factory acts on this view, and a view missing one machine's records
     /// would show its workspaces and sessions as never made, so a pass on it would be
-    /// half-applied. The pass fails instead, and looks again next pass.
+    /// half-applied. Such a record is one a newer build wrote, and it stays until this machine
+    /// runs a build that reads it, so every pass fails until then. Each failure logs a warning
+    /// that names the owner, the session or the machine whose record could not be read.
     pub fn read(
         store: &Store,
         online: BTreeSet<MachineId>,
@@ -164,7 +166,10 @@ impl FleetView {
         let mut machines: BTreeSet<MachineId> = versions.keys().copied().collect();
         machines.extend(store.factory_versions()?.into_keys());
         for &owner in versions.keys() {
-            for record in store.since(owner, 0)? {
+            let records = store.since(owner, 0).inspect_err(|error| {
+                tracing::warn!("factory: the records of {owner} cannot be read: {error}");
+            })?;
+            for record in records {
                 match record {
                     AnyRecord::Workspace(r) => builder.view.workspaces.push(r),
                     AnyRecord::Session(r) => builder.view.sessions.push(r),
@@ -176,12 +181,22 @@ impl FleetView {
             }
         }
         for session in builder.view.sessions.iter().filter(|r| !r.deleted) {
-            if let Some(turn) = store.session_turn(session.body.id)? {
+            let id = session.body.id;
+            let turn = store.session_turn(id).inspect_err(|error| {
+                tracing::warn!(
+                    "factory: the turn of session {id} of {} cannot be read: {error}",
+                    session.owner
+                );
+            })?;
+            if let Some(turn) = turn {
                 builder.view.turns.insert(session.body.id, turn);
             }
         }
         for machine in machines {
-            if let Some(held) = store.held(machine)? {
+            let held = store.held(machine).inspect_err(|error| {
+                tracing::warn!("factory: what {machine} holds cannot be read: {error}");
+            })?;
+            if let Some(held) = held {
                 builder.view.held.insert(machine, held);
             }
         }
@@ -1119,6 +1134,41 @@ mod tests {
         let warnings = logged.warnings();
         assert!(
             warnings.iter().any(|w| w.contains(&a.to_string())),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn a_turn_record_this_build_cannot_read_fails_the_read() {
+        let (dir, mut store) = open();
+        let a = machine(1);
+        store
+            .apply(
+                &AnyRecord::Session(session_record(a, 1, false, 20, 10, SessionState::Idle)),
+                a,
+            )
+            .unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("foundry.db")).unwrap();
+        conn.execute(
+            "INSERT INTO factory_records (kind, id, owner, version, record) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                "session_turn",
+                format!("{}/{a}", SessionId(id(20))),
+                a.to_string(),
+                1,
+                r#"{"kind":"printer"}"#
+            ],
+        )
+        .unwrap();
+        let logged = Logged::default();
+        let _capture = logged.capture();
+        assert!(FleetView::read(&store, BTreeSet::from([a]), BTreeMap::new()).is_err());
+        let warnings = logged.warnings();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains(&SessionId(id(20)).to_string())),
             "{warnings:?}"
         );
     }
