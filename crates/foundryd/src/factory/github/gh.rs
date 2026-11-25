@@ -155,7 +155,9 @@ fn auth_refused(stderr: &str) -> bool {
 }
 
 /// Whether `gh`, failing with `stderr`, got no answer from GitHub ([`OtherKind::NoAnswer`]),
-/// or GitHub refused the call ([`OtherKind::Failed`]).
+/// or GitHub refused the call ([`OtherKind::Failed`]). [`finish`] asks it of every call that
+/// fails, whatever the command; `gh pr ready --undo` is the call the wrappers below were read
+/// from.
 ///
 /// A shape this does not name is a refusal. That is the runner's reading (every failure to
 /// draft but a rate limit is stuck, "exited with status 1: boom" included), and the safe side:

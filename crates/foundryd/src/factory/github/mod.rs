@@ -102,7 +102,8 @@ pub enum TrackerError {
 
 /// Which failure a [`TrackerError::Other`] is, so a caller tells them apart without reading the
 /// text. These are the failures the runner tags apart and its callers switch on
-/// (`GitHubSpawnError`, `GitHubInvalidArgument`, `GitHubParse`), and one for the rest.
+/// (`GitHubSpawnError`, `GitHubInvalidArgument`, `GitHubParse`), and two for the rest: no
+/// answer from GitHub, and any other failure, read as a refusal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OtherKind {
     /// `gh` could not be started.
@@ -115,7 +116,7 @@ pub enum OtherKind {
     /// limit, or `gh` said so in one of the shapes `github::gh::finish` names. Asking again
     /// may get one.
     NoAnswer,
-    /// `gh` failed in a way no other variant names: GitHub refused the call.
+    /// `gh` failed in a way no other variant names, read as GitHub refusing the call.
     Failed,
 }
 
