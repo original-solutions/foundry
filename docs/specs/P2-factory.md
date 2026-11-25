@@ -330,6 +330,15 @@ A factory session's "stuck", "failed" and "waiting for you", and a failed setup 
 
 The way back, per repo: turn its switch off in Foundry and put it back in the runner's `repos:`. While Foundry's factory cannot build foundry, the runner builds the fix.
 
+### After the runner: t3fac
+
+Decided 2026-11-25: t3fac, the factory that builds the Trilogy-Care repos from `trilogy-mac`, is retired too, and Foundry does all factory work. This is not part of P2's exit criterion.
+
+- Each repo t3fac watches moves to Foundry after step 7, one at a time, by the rule of "Two factories at once": out of t3fac's config when it has no run of the repo in `triage` or `building`, then its switch on in Foundry.
+- A repo moves onto the fleet or onto Vims. `Trilogy-Care/tc-supplier-portal-v2` goes first, on Vims ([P2c-vims-host.md](P2c-vims-host.md)).
+- t3fac's runs are exported before it is uninstalled, so a later comparison has a baseline.
+- Not yet listed: the repos t3fac watches, and the order they move in.
+
 ## To check before the plan is written
 
 | # | Assumption | Why it matters |
