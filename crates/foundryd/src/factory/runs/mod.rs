@@ -1,4 +1,26 @@
 //! A run: one issue built in a workspace, from claim to its end.
+//!
+//! This file ports the runner's `src/runner/run.ts`: what every step that stops or finishes a
+//! run shares. [`RunContext`] is what a step calls: the tracker, the worker, what the fleet
+//! shows, the ledger and the guard. The stuck path ([`go_stuck`]) with its session stop
+//! ([`stop_session`]), the move to `factory:building` ([`finish_building`]), the actions a
+//! lifecycle transition asks for ([`apply_actions`]) and the three ways a run ends without a
+//! gate ([`end_run`], [`abandon`], [`end_own_merge`]) live here, so the building, gating,
+//! resume and feedback steps of tasks 23 to 28 call them and add nothing to this file.
+//!
+//! Where it differs from the runner:
+//!
+//! - A session is stopped through the worker: [`stop_session`] ends the factory sessions of the
+//!   run's build workspace and keeps the workspace, as the spec says of a stuck run. The
+//!   runner's archive of a thread and removal of its worktree have no counterpart, so the
+//!   `worktree_removed` lines and [`Progress`]'s `worktree_done` are not carried over.
+//! - [`Guard::check`] runs before every change on GitHub and every call to the worker, in the
+//!   methods of [`RunContext`] that make them. A lost lease is an error with nothing done.
+//! - A step that sends a message to the session sends a [`Message`] (a line and a body file),
+//!   which its caller builds, in place of the runner's text under a command id.
+//! - The tracker has no `closedBy`, so [`abandon`] names no actor in its cause.
+//! - The status comment names the machine as its id, since a [`RunContext`] holds no machine
+//!   names.
 
 pub mod building;
 pub mod feedback;
@@ -7,3 +29,1688 @@ pub mod progress;
 pub mod resume;
 pub mod start;
 pub mod stop;
+
+use foundry_proto::factory::{FactorySettings, ProjectFactory, RunId};
+use foundry_proto::ids::{ProjectId, SessionId, WorkspaceId};
+
+use super::config::ProjectConfig;
+use super::github::{Commenting, PullRequest, TrackerError};
+use super::ledger::events::{Cause, CauseStep, Event, Outcome, PrEnd};
+use super::ledger::{Ledger, LedgerError};
+use super::lifecycle::{Action, Event as LifecycleEvent, InvalidTransition, State, transition};
+use super::messages::{self, Message, WorkLeft};
+use super::worker::{FleetView, Guard, LeaseLost, Worker, WorkerError};
+use crate::clock::Clock;
+use crate::sessions::factory::SendRefused;
+use crate::store::StoreError;
+use progress::{GATE_RESULTS_POSTED, Seen};
+
+/// What a step of a run can fail with.
+#[derive(Debug, thiserror::Error)]
+pub enum RunError {
+    #[error(transparent)]
+    Tracker(#[from] TrackerError),
+    #[error(transparent)]
+    Ledger(#[from] LedgerError),
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    #[error(transparent)]
+    Transition(#[from] InvalidTransition),
+    #[error(transparent)]
+    Worker(#[from] WorkerError),
+    #[error(transparent)]
+    Send(#[from] SendRefused),
+    /// The lease is lost: nothing was done.
+    #[error(transparent)]
+    LeaseLost(#[from] LeaseLost),
+    /// A record that cannot be what it must be: a session id that is not one, say.
+    #[error("{0}")]
+    Invalid(String),
+}
+
+/// The project a run belongs to: its id in P1, its repo and the login the factory acts as there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunProject {
+    pub id: ProjectId,
+    /// `owner/name`.
+    pub repo: String,
+    /// The GitHub login the factory acts as on this project: the assignee of a claimed issue,
+    /// the author of its claim comment and the account a session starts as.
+    pub login: String,
+}
+
+/// The factory settings a run reads: the fleet's (the model and effort a session starts with,
+/// whether claims are paused) and the project's (its own pause).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RunSettings {
+    pub fleet: FactorySettings,
+    pub project: ProjectFactory,
+}
+
+/// What a step of a run calls. Everything is borrowed for one pass.
+pub struct RunContext<'a> {
+    /// GitHub, with a hider: the only tracker that can post a comment.
+    pub tracker: &'a dyn Commenting,
+    /// What the fleet is asked to do.
+    pub worker: &'a dyn Worker,
+    /// What the fleet shows this pass.
+    pub view: &'a FleetView,
+    pub ledger: &'a Ledger,
+    /// Whether the lease is still held: checked before every change and every call to a worker.
+    pub guard: &'a dyn Guard,
+    pub project: &'a RunProject,
+    /// The project's `factory` config: its instructors, base and limits.
+    pub config: &'a ProjectConfig,
+    pub settings: &'a RunSettings,
+    /// The clock that counts through sleep, for every wait the factory measures.
+    pub clock: &'a dyn Clock,
+}
+
+impl RunContext<'_> {
+    /// Passes while the lease is held.
+    pub fn held(&self) -> Result<u64, RunError> {
+        Ok(self.guard.check()?)
+    }
+
+    /// The repo, `owner/name`.
+    pub fn repo(&self) -> &str {
+        &self.project.repo
+    }
+
+    /// The label of `issue` moved to `state`.
+    pub fn set_state(&self, issue: u64, state: State) -> Result<(), RunError> {
+        self.held()?;
+        Ok(self.tracker.set_state(self.repo(), issue, state)?)
+    }
+
+    /// The project's login assigned to `issue`.
+    pub fn assign(&self, issue: u64) -> Result<(), RunError> {
+        self.held()?;
+        Ok(self
+            .tracker
+            .assign(self.repo(), issue, &self.project.login)?)
+    }
+
+    /// The project's login taken off `issue`.
+    pub fn unassign(&self, issue: u64) -> Result<(), RunError> {
+        self.held()?;
+        Ok(self
+            .tracker
+            .unassign(self.repo(), issue, &self.project.login)?)
+    }
+
+    /// A comment on `issue`.
+    pub fn post_comment(&self, issue: u64, body: &str) -> Result<(), RunError> {
+        self.held()?;
+        Ok(self.tracker.post_comment(self.repo(), issue, body)?)
+    }
+
+    /// The issue's status comment, written or edited.
+    pub fn upsert_status(&self, issue: u64, body: &str) -> Result<(), RunError> {
+        self.held()?;
+        Ok(self
+            .tracker
+            .upsert_status_comment(self.repo(), issue, &self.project.login, body)?)
+    }
+
+    /// A comment on pull request `pr`.
+    pub fn comment_on_pr(&self, pr: u64, body: &str) -> Result<(), RunError> {
+        self.held()?;
+        Ok(self.tracker.comment_on_pr(self.repo(), pr, body)?)
+    }
+
+    /// Pull request `pr` taken out of draft.
+    pub fn mark_pr_ready(&self, pr: u64) -> Result<(), RunError> {
+        self.held()?;
+        Ok(self.tracker.mark_pr_ready(self.repo(), pr)?)
+    }
+
+    /// Pull request `pr` put back to draft.
+    pub fn mark_pr_draft(&self, pr: u64) -> Result<(), RunError> {
+        self.held()?;
+        Ok(self.tracker.mark_pr_draft(self.repo(), pr)?)
+    }
+
+    /// `event` written to `run`'s ledger.
+    pub fn record(&self, run: &RunId, event: Event, cause: &Cause) -> Result<(), RunError> {
+        self.ledger.write(run, &event, cause)?;
+        Ok(())
+    }
+
+    /// A `step_changed` line of `run`.
+    pub fn record_step(&self, run: &RunId, step: &str, cause: &Cause) -> Result<(), RunError> {
+        self.record(run, Event::StepChanged { step: step.into() }, cause)
+    }
+
+    /// The events of `run`, read as a [`Seen`].
+    pub fn seen(&self, run: &RunId) -> Result<Seen, RunError> {
+        Ok(progress::read_progress(&self.ledger.read(run)?))
+    }
+}
+
+/// Where the issue stands while the stuck actions are applied. `thread_id` and `worktree` start
+/// from the ledger and move as this call launches and stops the session.
+#[derive(Clone, Debug)]
+pub struct Progress {
+    /// The run, whose ledger every line is written to.
+    pub run: RunId,
+    /// The step running, for the cause of every line written here.
+    pub step: CauseStep,
+    pub state: State,
+    /// The session's id, once launched.
+    pub thread_id: Option<String>,
+    /// The id of the build workspace, once the worker answered its create.
+    pub worktree: Option<String>,
+    /// The machine the run was claimed on, as its `claimed` line names it.
+    pub machine: Option<String>,
+    /// The run's newest pull request, for the status comment; none when absent.
+    pub pr: Option<u64>,
+    /// Why the run is stopping, set by [`go_stuck`] for the stuck comment; none otherwise.
+    pub stop: Option<Stop>,
+    /// What the ledger said when the step began: the comment-once guards read it.
+    pub seen: Seen,
+    /// The ledger already says the gate results are on the pull request.
+    pub gate_results_posted: bool,
+}
+
+/// A message to the session that a forwarded comment or body edit carries, and for a body edit
+/// the `body-edit-forwarded <edited_at>` step that records it. An action whose part is missing
+/// is an [`InvalidTransition`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForwardPayload {
+    pub message: Message,
+    pub step: Option<String>,
+}
+
+/// What a failure sent back carries that the ledger does not: the message, and the attempt and
+/// run ordinal recorded as sent back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SendPayload {
+    pub message: Message,
+    pub attempt: u32,
+    pub run_ordinal: u32,
+}
+
+/// What the gate's and the forwards' actions carry that the ledger does not. An action whose
+/// part is missing is an [`InvalidTransition`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ActionPayload {
+    /// What `forward-comment` and `forward-body-edit` send.
+    pub forward: Option<ForwardPayload>,
+    /// The results comment `post-gate-results` posts on the pull request.
+    pub comment: Option<String>,
+    /// The failure `send-gate-failure` sends back.
+    pub send: Option<SendPayload>,
+}
+
+/// Where the issue stands, from what the ledger says. `fallback` is the state of a run that has none yet.
+pub fn progress_from(run: &RunId, step: CauseStep, seen: &Seen, fallback: State) -> Progress {
+    todo!("progress_from")
+}
+
+/// `config` with the base the run's launch recorded (`Seen.base`, the issue's `## Base`), else
+/// its own. Where a run's context is built, so every reader of `config.base` follows the run's
+/// base.
+pub fn run_config(config: &ProjectConfig, base: Option<&str>) -> ProjectConfig {
+    todo!("run_config")
+}
+
+/// The words for what a failed call said.
+pub fn describe(cause: &dyn std::fmt::Display) -> String {
+    todo!("describe")
+}
+
+/// The label, the status comment and the ledger line that follow a launch. Safe to repeat.
+pub fn finish_building(
+    ctx: &RunContext<'_>,
+    issue: u64,
+    at: &mut Progress,
+) -> Result<(), RunError> {
+    todo!("finish_building")
+}
+
+/// Carries out the actions a transition asks for, in order. The label, release and status
+/// comment are repeated safely; the two comments are posted once, as `at.seen` says.
+/// `state_changed` is written last, so a ledger showing the old state means the transition may
+/// be unfinished and runs again. Gate and forward actions without their payload are an
+/// [`InvalidTransition`].
+pub fn apply_actions(
+    ctx: &RunContext<'_>,
+    issue: u64,
+    at: &mut Progress,
+    actions: &[Action],
+    cause: &Cause,
+    payload: &ActionPayload,
+) -> Result<(), RunError> {
+    todo!("apply_actions")
+}
+
+/// Stops the run's session before it goes stuck: ends the factory sessions of its build
+/// workspace, which is kept. A run with no session, or no workspace, has nothing to stop. A
+/// failed call fails the step with nothing written and the next pass stops again.
+pub fn stop_session(ctx: &RunContext<'_>, at: &Progress) -> Result<(), RunError> {
+    todo!("stop_session")
+}
+
+/// Why a run goes stuck. `reason` is the public one: a fixed factory line, the only text that
+/// goes in the comment's `Reason:`. `detail` holds what the public must not read and stays in
+/// the ledger. `session_text` and `branch` are already through `prepare_session_text` or
+/// `prepare_output_tail` and left out when empty. `recorded_text` is what the ledger keeps in
+/// place of `session_text` when it holds more of it than the comment does: a setup's output is
+/// quoted by its last 20,000 characters and recorded by its last 64 KB.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Stop {
+    pub reason: String,
+    pub detail: Option<String>,
+    pub session_text: Option<String>,
+    pub recorded_text: Option<String>,
+    pub branch: Option<String>,
+    pub commits_ahead: Option<u32>,
+}
+
+impl Stop {
+    /// A stop for the public `reason` alone.
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            ..Self::default()
+        }
+    }
+}
+
+/// The reason as the ledger stores it and the caller gets it: the factory's words, then the session's.
+pub fn recorded_reason(stop: &Stop) -> String {
+    todo!("recorded_reason")
+}
+
+/// The stuck path. The session is stopped first (see [`stop_session`]), so a failure leaves the
+/// issue as it was and the next pass retries. Then `after_stop`, the actions
+/// [`transition`] asks for, `state_changed` and the summary line. A comment the ledger already
+/// records is skipped, a ready pull request goes back to draft first, and `code` is the reason
+/// of every line written.
+pub fn go_stuck(
+    ctx: &RunContext<'_>,
+    issue: u64,
+    at: &mut Progress,
+    code: &str,
+    stop: Stop,
+    after_stop: Option<&dyn Fn() -> Result<(), RunError>>,
+) -> Result<(), RunError> {
+    todo!("go_stuck")
+}
+
+/// Ends a run whose pull request was merged or closed, from `pr-open` or from `building` (a
+/// person ended it before the gate marked it ready). The session is stopped first; then the
+/// summary line, the only write, caused by `step`. Nothing is posted. A gone or unmerged pull
+/// request is closed.
+pub fn end_run(
+    ctx: &RunContext<'_>,
+    at: &Progress,
+    pr_url: &str,
+    pull: Option<&PullRequest>,
+    step: CauseStep,
+) -> Result<(), RunError> {
+    todo!("end_run")
+}
+
+/// What a closed issue means for a run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Closing {
+    /// The issue is open, or the run has nothing left to write and was not asked.
+    Open,
+    /// A person closed it: a move, and the run is abandoned.
+    PersonsMove,
+    /// The run's own pull request was merged, which closed the issue.
+    OwnMerge(PullRequest),
+}
+
+/// Whether a closed issue is a person's move for this run, or the run's own finish: the latter
+/// when a pull request the run reported (`pr_opened` lines) is merged, gate passed or not. A
+/// merge before the first `advance` after the session's report still reads as a person's move.
+/// `closed` is what GitHub says about the issue. A failed read is an error, never an answer.
+pub fn moved_on_by_closing(
+    ctx: &RunContext<'_>,
+    seen: &Seen,
+    closed: bool,
+) -> Result<Closing, RunError> {
+    todo!("moved_on_by_closing")
+}
+
+/// What the run's issue being closed means for it, with the issue as read for that (`None`
+/// when it was not read), so a caller that needs the issue too does not read it again. A run
+/// that has nothing left to write (`pr-open`, `stuck`) asks nothing of GitHub, and neither does
+/// a step that would skip the run (the caller checks that first).
+pub fn closed_issue(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    seen: &Seen,
+) -> Result<(Closing, Option<super::github::IssueDetail>), RunError> {
+    todo!("closed_issue")
+}
+
+/// Finishes a run whose issue a person closed: ends its session first (an error is an error
+/// with nothing written), then finishes the ledger as `needs-info` for a run left in that state
+/// and `stuck` otherwise. Nothing is written on GitHub. Returns true when a session may exist
+/// that this could not end: a launch was sent but no session recorded.
+pub fn abandon(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    seen: &Seen,
+    step: CauseStep,
+) -> Result<bool, RunError> {
+    todo!("abandon")
+}
+
+/// Ends a run whose own merged pull request closed its issue before a gate pass was recorded:
+/// [`end_run`] with the URL the session wrote for that pull request (or the one GitHub would
+/// give it, for a pull request the ledger holds under another number). `step` is the step that
+/// found it.
+pub fn end_own_merge(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    seen: &Seen,
+    step: CauseStep,
+    pull: &PullRequest,
+) -> Result<(), RunError> {
+    todo!("end_own_merge")
+}
+
+/// The id of `text` as a session, or why it is not one.
+pub fn session_id(text: &str) -> Result<SessionId, RunError> {
+    uuid::Uuid::parse_str(text)
+        .map(SessionId)
+        .map_err(|_| RunError::Invalid(format!("the ledger's session id {text:?} is not an id")))
+}
+
+/// The id of `text` as a workspace, or why it is not one.
+pub fn workspace_id(text: &str) -> Result<WorkspaceId, RunError> {
+    uuid::Uuid::parse_str(text)
+        .map(WorkspaceId)
+        .map_err(|_| RunError::Invalid(format!("the ledger's workspace id {text:?} is not an id")))
+}
+
+/// What the run tests share: GitHub in memory, the worker's fake, a ledger in a store of its
+/// own and a context built from them.
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::{Arc, Mutex, PoisonError};
+
+    use foundry_proto::factory::{FactorySettings, ProjectFactory, RunEvent, RunId};
+    use foundry_proto::ids::{MachineId, ProjectId};
+    use serde_json::{Value, json};
+
+    use super::*;
+    use crate::clock::FakeClock;
+    use crate::factory::config::Limits;
+    use crate::factory::github::{Hiding, OtherKind, Tracker};
+    use crate::factory::ledger::testing::{T0, open_store, ticking};
+    use crate::factory::worker::{AlwaysHeld, FakeWorker};
+    use crate::store::Store;
+
+    pub const REPO: &str = "rawphp/softfac";
+    pub const LOGIN: &str = "softfac-bot";
+    pub const ISSUE: u64 = 8;
+    /// When the instructor applied `factory:ready`.
+    pub const LABELED_AT: &str = "2026-10-04T10:00:00Z";
+    pub const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    /// A pull request GitHub shows.
+    #[derive(Clone, Debug)]
+    pub struct SimPull {
+        pub state: &'static str,
+        pub draft: bool,
+        pub head: String,
+        pub base: String,
+        pub cross: bool,
+    }
+
+    struct SimState {
+        title: String,
+        body: String,
+        labels: Vec<String>,
+        assignees: Vec<String>,
+        closed: bool,
+        /// The comments in the order GitHub lists them: id, author, body.
+        comments: Vec<(u64, String, String)>,
+        next_comment: u64,
+        approval: String,
+        pulls: BTreeMap<u64, SimPull>,
+        listed: Vec<Value>,
+        branches: BTreeSet<String>,
+        failures: Vec<(String, usize)>,
+        calls: Vec<Vec<String>>,
+    }
+
+    /// GitHub in memory for one issue of [`REPO`], answering the `gh` calls the factory makes by
+    /// their arguments, as the fake tracker does, and keeping what the writes change. A call can
+    /// be made to fail with [`Sim::fail`].
+    pub struct Sim {
+        state: Mutex<SimState>,
+    }
+
+    fn created_at(id: u64) -> String {
+        format!("2026-10-04T11:{:02}:{:02}Z", (id / 60) % 60, id % 60)
+    }
+
+    /// The approval answer for a label applied at `labeled_at` by `by`, with every edit since
+    /// by the logins in `edits_by`.
+    pub fn approval_answer(labeled_at: &str, by: &str, edits_by: &[(&str, &str)]) -> String {
+        let actor = |login: &str| json!({"__typename": "User", "login": login});
+        let nodes: Vec<Value> = edits_by
+            .iter()
+            .rev()
+            .map(|(at, who)| json!({"editedAt": at, "editor": actor(who)}))
+            .collect();
+        let last = edits_by.last();
+        json!({"data": {"repository": {"issue": {
+            "timelineItems": {"totalCount": 1, "nodes": [{
+                "__typename": "LabeledEvent",
+                "createdAt": labeled_at,
+                "actor": actor(by),
+                "label": {"name": "factory:ready"},
+            }]},
+            "lastEditedAt": last.map(|(at, _)| *at),
+            "editor": last.map_or(Value::Null, |(_, who)| actor(who)),
+            "userContentEdits": {"totalCount": nodes.len(), "nodes": nodes},
+        }}}})
+        .to_string()
+    }
+
+    impl Sim {
+        /// An open issue labelled `factory:ready`, nobody assigned, approved by `tom` at
+        /// [`LABELED_AT`].
+        pub fn new() -> Arc<Self> {
+            Arc::new(Self {
+                state: Mutex::new(SimState {
+                    title: "Make it faster".into(),
+                    body: "Do the thing.".into(),
+                    labels: vec!["factory:ready".into()],
+                    assignees: vec![],
+                    closed: false,
+                    comments: vec![],
+                    next_comment: 100,
+                    approval: approval_answer(LABELED_AT, "tom", &[]),
+                    pulls: BTreeMap::new(),
+                    listed: vec![],
+                    branches: BTreeSet::new(),
+                    failures: vec![],
+                    calls: vec![],
+                }),
+            })
+        }
+
+        fn lock(&self) -> std::sync::MutexGuard<'_, SimState> {
+            self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        }
+
+        pub fn set_labels(&self, labels: &[&str]) {
+            self.lock().labels = labels.iter().map(|l| l.to_string()).collect();
+        }
+
+        pub fn set_assignees(&self, assignees: &[&str]) {
+            self.lock().assignees = assignees.iter().map(|l| l.to_string()).collect();
+        }
+
+        pub fn set_body(&self, body: &str) {
+            self.lock().body = body.into();
+        }
+
+        pub fn set_closed(&self, closed: bool) {
+            self.lock().closed = closed;
+        }
+
+        pub fn set_approval(&self, answer: String) {
+            self.lock().approval = answer;
+        }
+
+        pub fn add_branch(&self, branch: &str) {
+            self.lock().branches.insert(branch.into());
+        }
+
+        pub fn set_pull(&self, number: u64, pull: SimPull) {
+            self.lock().pulls.insert(number, pull);
+        }
+
+        /// What `gh pr list` answers: one open pull request.
+        pub fn list_pull(&self, number: u64, head: &str, base: &str, author: &str, cross: bool) {
+            self.lock().listed.push(json!({
+                "number": number,
+                "url": format!("https://github.com/{REPO}/pull/{number}"),
+                "headRefName": head,
+                "baseRefName": base,
+                "isCrossRepository": cross,
+                "author": {"login": author},
+            }));
+        }
+
+        /// A comment by `author`, as if posted on GitHub.
+        pub fn comment_as(&self, author: &str, body: &str) -> u64 {
+            let mut state = self.lock();
+            let id = state.next_comment;
+            state.next_comment += 1;
+            state
+                .comments
+                .push((id, author.to_string(), body.to_string()));
+            id
+        }
+
+        /// Makes the next `times` calls whose arguments contain `needle` fail.
+        pub fn fail(&self, needle: &str, times: usize) {
+            self.lock().failures.push((needle.into(), times));
+        }
+
+        pub fn calls(&self) -> Vec<Vec<String>> {
+            self.lock().calls.clone()
+        }
+
+        /// The calls that changed something, as one line each.
+        pub fn writes(&self) -> Vec<String> {
+            self.calls()
+                .iter()
+                .filter(|call| {
+                    let first = call.first().map(String::as_str);
+                    let second = call.get(1).map(String::as_str);
+                    matches!(
+                        (first, second),
+                        (Some("issue"), Some("edit" | "comment"))
+                            | (Some("pr"), Some("ready" | "comment"))
+                    ) || call.iter().any(|a| a == "PATCH")
+                })
+                .map(|call| call.join(" "))
+                .collect()
+        }
+
+        pub fn labels(&self) -> Vec<String> {
+            self.lock().labels.clone()
+        }
+
+        pub fn assignees(&self) -> Vec<String> {
+            self.lock().assignees.clone()
+        }
+
+        /// The bodies of the comments on the issue, in the order listed.
+        pub fn comments(&self) -> Vec<String> {
+            self.lock()
+                .comments
+                .iter()
+                .map(|(_, _, body)| body.clone())
+                .collect()
+        }
+
+        /// The comments on the issue, with their ids.
+        pub fn comment_rows(&self) -> Vec<(u64, String, String)> {
+            self.lock().comments.clone()
+        }
+
+        fn other(args: &[String], message: &str) -> TrackerError {
+            TrackerError::Other {
+                kind: OtherKind::Failed,
+                message: format!("`gh {}` failed: {message}", args.join(" ")),
+            }
+        }
+
+        fn not_found(args: &[String]) -> TrackerError {
+            TrackerError::NotFound {
+                command: format!("gh {}", args.join(" ")),
+                status: 1,
+                stderr: "HTTP 404: Not Found".into(),
+            }
+        }
+
+        fn flag_values(args: &[String], flag: &str) -> Vec<String> {
+            args.windows(2)
+                .filter(|pair| pair[0] == flag)
+                .map(|pair| pair[1].clone())
+                .collect()
+        }
+
+        fn answer(&self, args: &[String]) -> Result<String, TrackerError> {
+            let mut state = self.lock();
+            state.calls.push(args.to_vec());
+            let joined = args.join(" ");
+            if let Some(at) = state
+                .failures
+                .iter()
+                .position(|(needle, times)| *times > 0 && joined.contains(needle.as_str()))
+            {
+                state.failures[at].1 -= 1;
+                return Err(Self::other(args, "injected failure"));
+            }
+            let word = |at: usize| args.get(at).map(String::as_str);
+            match (word(0), word(1)) {
+                (Some("issue"), Some("view")) => {
+                    if args.iter().any(|a| a == "labels") {
+                        let labels: Vec<Value> =
+                            state.labels.iter().map(|n| json!({"name": n})).collect();
+                        return Ok(json!({"labels": labels}).to_string());
+                    }
+                    Ok(json!({
+                        "number": ISSUE,
+                        "title": state.title,
+                        "body": state.body,
+                        "labels": state.labels.iter().map(|n| json!({"name": n})).collect::<Vec<_>>(),
+                        "assignees": state.assignees.iter().map(|n| json!({"login": n})).collect::<Vec<_>>(),
+                        "state": if state.closed { "CLOSED" } else { "OPEN" },
+                        "author": {"login": "tom"},
+                    })
+                    .to_string())
+                }
+                (Some("issue"), Some("edit")) => {
+                    for label in Self::flag_values(args, "--add-label") {
+                        if !state.labels.contains(&label) {
+                            state.labels.push(label);
+                        }
+                    }
+                    for label in Self::flag_values(args, "--remove-label") {
+                        state.labels.retain(|l| *l != label);
+                    }
+                    for login in Self::flag_values(args, "--add-assignee") {
+                        if !state.assignees.contains(&login) {
+                            state.assignees.push(login);
+                        }
+                    }
+                    for login in Self::flag_values(args, "--remove-assignee") {
+                        state.assignees.retain(|l| *l != login);
+                    }
+                    Ok(String::new())
+                }
+                (Some("issue"), Some("comment")) => {
+                    let body = Self::flag_values(args, "--body").pop().unwrap_or_default();
+                    let id = state.next_comment;
+                    state.next_comment += 1;
+                    state.comments.push((id, LOGIN.to_string(), body));
+                    Ok(String::new())
+                }
+                (Some("api"), Some("graphql")) => Ok(state.approval.clone()),
+                (Some("api"), Some(path)) if path.contains("/issues/comments/") => {
+                    let id: u64 = path
+                        .rsplit('/')
+                        .next()
+                        .and_then(|id| id.parse().ok())
+                        .unwrap_or(0);
+                    let body = Self::flag_values(args, "-f")
+                        .pop()
+                        .and_then(|f| f.strip_prefix("body=").map(str::to_owned))
+                        .unwrap_or_default();
+                    if let Some(row) = state.comments.iter_mut().find(|row| row.0 == id) {
+                        row.2 = body;
+                    }
+                    Ok(String::new())
+                }
+                (Some("api"), Some(path))
+                    if path.contains("/issues/") && path.contains("/comments") =>
+                {
+                    let rows: Vec<Value> = state
+                        .comments
+                        .iter()
+                        .map(|(id, author, body)| {
+                            json!({"id": id, "user": {"login": author}, "body": body, "created_at": created_at(*id)})
+                        })
+                        .collect();
+                    Ok(Value::Array(rows).to_string())
+                }
+                (Some("api"), Some(path)) if path.contains("/git/ref/heads/") => {
+                    let branch = path.split("/git/ref/heads/").nth(1).unwrap_or_default();
+                    if state.branches.contains(branch) {
+                        Ok(json!({"object": {"sha": SHA, "type": "commit"}}).to_string())
+                    } else {
+                        Err(Self::not_found(args))
+                    }
+                }
+                (Some("pr"), Some("view")) => {
+                    let number: u64 = word(2).and_then(|n| n.parse().ok()).unwrap_or(0);
+                    match state.pulls.get(&number) {
+                        Some(pull) => Ok(json!({
+                            "number": number,
+                            "isDraft": pull.draft,
+                            "state": pull.state,
+                            "headRefName": pull.head,
+                            "isCrossRepository": pull.cross,
+                            "baseRefName": pull.base,
+                            "headRefOid": SHA,
+                            "mergeable": "MERGEABLE",
+                            "createdAt": LABELED_AT,
+                        })
+                        .to_string()),
+                        None => Err(Self::other(args, "Could not resolve to a PullRequest")),
+                    }
+                }
+                (Some("pr"), Some("list")) => Ok(Value::Array(state.listed.clone()).to_string()),
+                (Some("pr"), Some("ready" | "comment")) => Ok(String::new()),
+                _ => Err(Self::other(args, "the simulator does not know this call")),
+            }
+        }
+    }
+
+    impl Tracker for Sim {
+        fn gh(&self, args: &[String]) -> Result<String, TrackerError> {
+            self.answer(args)
+        }
+    }
+
+    /// Everything a step of a run needs, built from fakes.
+    pub struct Rig {
+        pub _dir: tempfile::TempDir,
+        pub store: Arc<Mutex<Store>>,
+        pub ledger: Ledger,
+        pub sim: Arc<Sim>,
+        pub tracker: Hiding,
+        pub worker: FakeWorker,
+        pub view: FleetView,
+        pub guard: Box<dyn Guard>,
+        pub clock: FakeClock,
+        pub project: RunProject,
+        pub config: ProjectConfig,
+        pub settings: RunSettings,
+        /// The machine the build is placed on.
+        pub machine: MachineId,
+    }
+
+    pub fn project_id() -> ProjectId {
+        ProjectId(uuid::Uuid::from_u128(0x7001))
+    }
+
+    pub fn run_id(attempt: u32) -> RunId {
+        RunId::new(REPO, ISSUE, attempt).unwrap()
+    }
+
+    pub fn config() -> ProjectConfig {
+        ProjectConfig {
+            instructors: vec!["tom".into()],
+            base: "main".into(),
+            provision: vec![],
+            gate: vec!["cargo test".into()],
+            required_checks: vec![],
+            limits: Limits {
+                minutes: 90,
+                gate_retries: 2,
+                checks_minutes: 30,
+                interruption_resumes: 2,
+            },
+            owner_set: false,
+        }
+    }
+
+    impl Rig {
+        pub fn new() -> Self {
+            let (dir, store) = open_store();
+            let me = MachineId(uuid::Uuid::from_u128(0x1));
+            let ledger = crate::factory::ledger::testing::ledger(&store, me, 1, ticking(T0, 1000));
+            let sim = Sim::new();
+            let tracker = Hiding::new(sim.clone(), Arc::new(|text: &str| text.to_string()));
+            Self {
+                _dir: dir,
+                store,
+                ledger,
+                sim,
+                tracker,
+                worker: FakeWorker::new(),
+                view: FleetView::default(),
+                guard: Box::new(AlwaysHeld(1)),
+                clock: FakeClock::new(),
+                project: RunProject {
+                    id: project_id(),
+                    repo: REPO.into(),
+                    login: LOGIN.into(),
+                },
+                config: config(),
+                settings: RunSettings {
+                    fleet: FactorySettings::default(),
+                    project: ProjectFactory {
+                        on: true,
+                        login: LOGIN.into(),
+                        paused: false,
+                    },
+                },
+                machine: MachineId(uuid::Uuid::from_u128(0x2)),
+            }
+        }
+
+        pub fn ctx(&self) -> RunContext<'_> {
+            RunContext {
+                tracker: &self.tracker,
+                worker: &self.worker,
+                view: &self.view,
+                ledger: &self.ledger,
+                guard: self.guard.as_ref(),
+                project: &self.project,
+                config: &self.config,
+                settings: &self.settings,
+                clock: &self.clock,
+            }
+        }
+
+        /// The events `run` holds, in the ledger's order.
+        pub fn events(&self, run: &RunId) -> Vec<RunEvent> {
+            self.ledger.read(run).unwrap()
+        }
+
+        /// The names of the events `run` holds, in order.
+        pub fn names(&self, run: &RunId) -> Vec<String> {
+            self.events(run).into_iter().map(|e| e.event).collect()
+        }
+
+        /// The `step_changed` texts of `run`, in order.
+        pub fn steps(&self, run: &RunId) -> Vec<String> {
+            self.events(run)
+                .into_iter()
+                .filter(|e| e.event == "step_changed")
+                .filter_map(|e| e.data["step"].as_str().map(str::to_owned))
+                .collect()
+        }
+
+        /// Writes `event` to `run` as a step of the test.
+        pub fn write(&self, run: &RunId, event: Event) {
+            self.ledger
+                .write(run, &event, &Cause::new(CauseStep::Start, "test"))
+                .unwrap();
+        }
+
+        pub fn step(&self, run: &RunId, text: &str) {
+            self.write(run, Event::StepChanged { step: text.into() });
+        }
+
+        pub fn moved(&self, run: &RunId, from: State, to: State) {
+            self.write(run, Event::StateChanged { from, to });
+        }
+
+        pub fn finished(&self, run: &RunId) -> bool {
+            self.events(run).iter().any(|e| e.event == "finished")
+        }
+
+        /// The claim comment as Foundry posts it, as the project's login.
+        pub fn foundry_claim(&self, run: &RunId, machine: MachineId) -> u64 {
+            self.sim
+                .comment_as(LOGIN, &crate::factory::github::claim_comment(run, &machine))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use foundry_proto::ids::MachineId;
+
+    use super::testing::*;
+    use super::*;
+    use crate::factory::github::STATUS_MARKER;
+    use crate::factory::ledger::events::ResumedFrom;
+    use crate::factory::worker::{Call, Lost};
+
+    const SESSION: &str = "00000000-0000-0000-0000-0000000005e5";
+    const WORKSPACE: &str = "00000000-0000-0000-0000-000000000a11";
+
+    fn machine() -> MachineId {
+        MachineId(uuid::Uuid::from_u128(0x2))
+    }
+
+    /// A run that was claimed and launched, and is building.
+    fn building(rig: &Rig, run: &RunId) {
+        rig.step(run, &format!("approved {LABELED_AT}"));
+        rig.write(
+            run,
+            Event::Claimed {
+                machine: machine().to_string(),
+                github_user: LOGIN.into(),
+            },
+        );
+        rig.moved(run, State::Ready, State::Triage);
+        rig.step(run, &format!("workspace-created {WORKSPACE}"));
+        rig.write(
+            run,
+            Event::SessionLaunched {
+                thread_id: SESSION.into(),
+                worktree: Some(WORKSPACE.into()),
+                branch: Some("fac/8-1".into()),
+                model_instance: None,
+                model: Some("opus".into()),
+                model_options: None,
+                resumed_from: None::<ResumedFrom>,
+                base: Some("main".into()),
+                title: Some("Make it faster".into()),
+            },
+        );
+        rig.moved(run, State::Triage, State::Building);
+        rig.sim.set_labels(&["factory:building"]);
+        rig.sim.set_assignees(&[LOGIN]);
+    }
+
+    fn progress(rig: &Rig, run: &RunId, fallback: State) -> Progress {
+        let seen = rig.ctx().seen(run).unwrap();
+        progress_from(run, CauseStep::Start, &seen, fallback)
+    }
+
+    fn stuck_stop() -> Stop {
+        Stop::new("the session said stuck")
+    }
+
+    mod the_stop_a_run_records {
+        use super::*;
+
+        #[test]
+        fn is_the_factorys_words_then_the_sessions() {
+            let stop = Stop {
+                reason: "public".into(),
+                detail: Some("private detail".into()),
+                session_text: Some("what the session said".into()),
+                ..Stop::default()
+            };
+            assert_eq!(
+                recorded_reason(&stop),
+                "private detail\n\nwhat the session said"
+            );
+            let plain = Stop {
+                session_text: None,
+                ..stop.clone()
+            };
+            assert_eq!(recorded_reason(&plain), "private detail");
+            let no_detail = Stop {
+                detail: None,
+                ..stop.clone()
+            };
+            assert_eq!(
+                recorded_reason(&no_detail),
+                "public\n\nwhat the session said"
+            );
+        }
+
+        #[test]
+        fn keeps_the_longer_text_when_the_comment_quotes_less_of_it() {
+            let stop = Stop {
+                reason: "setup failed".into(),
+                session_text: Some("last 20000".into()),
+                recorded_text: Some("last 64 KB".into()),
+                ..Stop::default()
+            };
+            assert_eq!(recorded_reason(&stop), "setup failed\n\nlast 64 KB");
+        }
+    }
+
+    mod where_a_run_stands {
+        use super::*;
+
+        #[test]
+        fn is_read_from_the_ledger_with_the_fallback_for_a_run_with_no_state() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            rig.step(&run, "approved x");
+            let at = progress(&rig, &run, State::Triage);
+            assert_eq!(at.state, State::Triage);
+            assert_eq!(at.thread_id, None);
+            building(&rig, &run);
+            let at = progress(&rig, &run, State::Triage);
+            assert_eq!(at.state, State::Building);
+            assert_eq!(at.thread_id.as_deref(), Some(SESSION));
+            assert_eq!(at.worktree.as_deref(), Some(WORKSPACE));
+            assert_eq!(at.machine.as_deref(), Some(machine().to_string().as_str()));
+            assert_eq!(at.pr, None);
+            assert!(at.stop.is_none());
+        }
+
+        #[test]
+        fn the_config_follows_the_base_the_launch_recorded() {
+            let rig = Rig::new();
+            assert_eq!(run_config(&rig.config, None).base, "main");
+            assert_eq!(run_config(&rig.config, Some("main")).base, "main");
+            assert_eq!(run_config(&rig.config, Some("release/2")).base, "release/2");
+            assert_eq!(rig.config.base, "main");
+        }
+    }
+
+    mod finishing_a_launch {
+        use super::*;
+
+        #[test]
+        fn moves_the_label_posts_the_status_and_writes_the_state_last() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            rig.step(&run, "approved x");
+            rig.moved(&run, State::Ready, State::Triage);
+            rig.sim.set_labels(&["factory:triage"]);
+            let mut at = progress(&rig, &run, State::Triage);
+            at.thread_id = Some(SESSION.into());
+            finish_building(&rig.ctx(), ISSUE, &mut at).unwrap();
+            assert_eq!(rig.sim.labels(), vec!["factory:building"]);
+            let comments = rig.sim.comments();
+            assert_eq!(comments.len(), 1);
+            assert!(comments[0].contains("**Factory status:** building"));
+            assert!(comments[0].contains(SESSION));
+            assert!(comments[0].ends_with(STATUS_MARKER));
+            assert_eq!(at.state, State::Building);
+            let last = rig.events(&run).pop().unwrap();
+            assert_eq!(last.event, "state_changed");
+            assert_eq!(last.data["to"], "building");
+            assert_eq!(last.cause.unwrap()["reason"], "session-started");
+        }
+
+        #[test]
+        fn from_building_is_an_invalid_transition_the_caller_guards() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            let mut at = progress(&rig, &run, State::Triage);
+            assert!(matches!(
+                finish_building(&rig.ctx(), ISSUE, &mut at),
+                Err(RunError::Transition(_))
+            ));
+        }
+    }
+
+    mod applying_actions {
+        use super::*;
+
+        fn cause() -> Cause {
+            Cause::new(CauseStep::Start, "test")
+        }
+
+        #[test]
+        fn a_forward_without_its_payload_is_an_invalid_transition() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            let mut at = progress(&rig, &run, State::Building);
+            let actions = [Action::ForwardComment {
+                comment_id: "c1".into(),
+            }];
+            let result = apply_actions(
+                &rig.ctx(),
+                ISSUE,
+                &mut at,
+                &actions,
+                &cause(),
+                &ActionPayload::default(),
+            );
+            assert!(matches!(result, Err(RunError::Transition(_))));
+            assert!(rig.worker.calls().is_empty());
+        }
+
+        #[test]
+        fn a_forward_goes_to_the_session_and_is_recorded() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            let mut at = progress(&rig, &run, State::Building);
+            let message = Message {
+                line: "see this".into(),
+                body: None,
+            };
+            let payload = ActionPayload {
+                forward: Some(ForwardPayload {
+                    message: message.clone(),
+                    step: None,
+                }),
+                ..ActionPayload::default()
+            };
+            let actions = [Action::ForwardComment {
+                comment_id: "c1".into(),
+            }];
+            apply_actions(&rig.ctx(), ISSUE, &mut at, &actions, &cause(), &payload).unwrap();
+            assert_eq!(
+                rig.worker.calls(),
+                vec![Call::Send {
+                    session: session_id(SESSION).unwrap(),
+                    message,
+                    only_if_prompts: None,
+                }]
+            );
+            assert!(rig.names(&run).contains(&"comment_forwarded".to_string()));
+        }
+
+        #[test]
+        fn the_gate_results_are_posted_once() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            let mut at = progress(&rig, &run, State::Building);
+            let payload = ActionPayload {
+                comment: Some("gate passed".into()),
+                ..ActionPayload::default()
+            };
+            let actions = [Action::PostGateResults { pr: 12 }];
+            apply_actions(&rig.ctx(), ISSUE, &mut at, &actions, &cause(), &payload).unwrap();
+            apply_actions(&rig.ctx(), ISSUE, &mut at, &actions, &cause(), &payload).unwrap();
+            let posted: Vec<String> = rig
+                .sim
+                .writes()
+                .into_iter()
+                .filter(|w| w.starts_with("pr comment 12"))
+                .collect();
+            assert_eq!(posted.len(), 1);
+            assert_eq!(
+                rig.steps(&run)
+                    .iter()
+                    .filter(|s| *s == GATE_RESULTS_POSTED)
+                    .count(),
+                1
+            );
+        }
+
+        #[test]
+        fn a_label_that_does_not_move_the_state_writes_no_state_changed() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            let before = rig.names(&run).len();
+            let mut at = progress(&rig, &run, State::Building);
+            apply_actions(
+                &rig.ctx(),
+                ISSUE,
+                &mut at,
+                &[Action::SetLabel {
+                    state: State::Building,
+                }],
+                &cause(),
+                &ActionPayload::default(),
+            )
+            .unwrap();
+            assert_eq!(rig.names(&run).len(), before);
+        }
+
+        #[test]
+        fn an_action_the_runner_does_not_apply_is_an_invalid_transition() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            let mut at = progress(&rig, &run, State::Building);
+            let actions = [Action::PostUnapproved {
+                refusal: crate::factory::lifecycle::approval::Refusal::LabelNotFound,
+            }];
+            assert!(matches!(
+                apply_actions(
+                    &rig.ctx(),
+                    ISSUE,
+                    &mut at,
+                    &actions,
+                    &cause(),
+                    &ActionPayload::default()
+                ),
+                Err(RunError::Transition(_))
+            ));
+        }
+    }
+
+    mod stopping_a_session {
+        use super::*;
+
+        #[test]
+        fn ends_the_sessions_of_the_build_workspace_and_keeps_it() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            stop_session(&rig.ctx(), &progress(&rig, &run, State::Building)).unwrap();
+            assert_eq!(
+                rig.worker.calls(),
+                vec![Call::EndSessions {
+                    workspace: workspace_id(WORKSPACE).unwrap()
+                }]
+            );
+        }
+
+        #[test]
+        fn has_nothing_to_stop_for_a_run_that_launched_nothing() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            rig.step(&run, "approved x");
+            stop_session(&rig.ctx(), &progress(&rig, &run, State::Triage)).unwrap();
+            assert!(rig.worker.calls().is_empty());
+        }
+
+        #[test]
+        fn a_launch_that_was_sent_may_have_a_session_in_the_workspace_so_it_is_stopped() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            rig.step(&run, "approved x");
+            rig.step(&run, &format!("workspace-created {WORKSPACE}"));
+            rig.step(&run, "launch-sending");
+            stop_session(&rig.ctx(), &progress(&rig, &run, State::Triage)).unwrap();
+            assert_eq!(rig.worker.calls().len(), 1);
+        }
+
+        #[test]
+        fn a_lost_lease_calls_nothing() {
+            let mut rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            rig.guard = Box::new(Lost);
+            let result = stop_session(&rig.ctx(), &progress(&rig, &run, State::Building));
+            assert!(matches!(result, Err(RunError::LeaseLost(_))));
+            assert!(rig.worker.calls().is_empty());
+        }
+    }
+
+    mod going_stuck {
+        use super::*;
+
+        #[test]
+        fn ends_the_session_posts_the_reason_labels_releases_and_finishes() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            let mut at = progress(&rig, &run, State::Building);
+            go_stuck(&rig.ctx(), ISSUE, &mut at, "test-stuck", stuck_stop(), None).unwrap();
+            assert_eq!(rig.worker.calls().len(), 1);
+            assert_eq!(rig.sim.labels(), vec!["factory:stuck"]);
+            assert!(rig.sim.assignees().is_empty());
+            let comments = rig.sim.comments();
+            assert!(comments[0].contains("Reason: the session said stuck"));
+            assert!(comments[1].contains("**Factory status:** stuck"));
+            let names = rig.names(&run);
+            assert_eq!(
+                names[names.len() - 3..],
+                ["stuck", "state_changed", "finished"]
+            );
+            let finished = rig.events(&run).pop().unwrap();
+            assert_eq!(finished.data["outcome"], "stuck");
+            assert_eq!(finished.cause.unwrap()["reason"], "test-stuck");
+            assert_eq!(at.state, State::Stuck);
+        }
+
+        #[test]
+        fn a_session_that_cannot_be_ended_writes_nothing() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            rig.worker
+                .on_end_sessions(Err(WorkerError::Unreachable("gone".into())));
+            let before = rig.names(&run);
+            let mut at = progress(&rig, &run, State::Building);
+            let result = go_stuck(&rig.ctx(), ISSUE, &mut at, "c", stuck_stop(), None);
+            assert!(matches!(result, Err(RunError::Worker(_))));
+            assert!(rig.sim.writes().is_empty());
+            assert_eq!(rig.names(&run), before);
+        }
+
+        #[test]
+        fn a_lost_lease_changes_nothing() {
+            let mut rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            rig.guard = Box::new(Lost);
+            let before = rig.names(&run);
+            let mut at = progress(&rig, &run, State::Building);
+            let result = go_stuck(&rig.ctx(), ISSUE, &mut at, "c", stuck_stop(), None);
+            assert!(matches!(result, Err(RunError::LeaseLost(_))));
+            assert!(rig.worker.calls().is_empty());
+            assert!(rig.sim.writes().is_empty());
+            assert_eq!(rig.names(&run), before);
+        }
+
+        #[test]
+        fn the_stuck_comment_the_ledger_already_records_is_not_posted_again() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            rig.write(
+                &run,
+                Event::Stuck {
+                    reason: "earlier".into(),
+                    branch: None,
+                    commits_ahead: None,
+                },
+            );
+            let mut at = progress(&rig, &run, State::Building);
+            go_stuck(&rig.ctx(), ISSUE, &mut at, "c", stuck_stop(), None).unwrap();
+            assert!(
+                rig.sim
+                    .comments()
+                    .iter()
+                    .all(|c| !c.contains("could not finish"))
+            );
+            assert_eq!(rig.sim.labels(), vec!["factory:stuck"]);
+        }
+
+        #[test]
+        fn a_run_already_stuck_only_finishes() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            rig.moved(&run, State::Building, State::Stuck);
+            let mut at = progress(&rig, &run, State::Building);
+            go_stuck(&rig.ctx(), ISSUE, &mut at, "c", stuck_stop(), None).unwrap();
+            assert!(rig.sim.writes().is_empty());
+            assert!(rig.worker.calls().is_empty());
+            assert!(rig.finished(&run));
+        }
+
+        #[test]
+        fn a_ready_pull_request_goes_back_to_draft_before_anything_is_posted() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            rig.write(
+                &run,
+                Event::PrOpened {
+                    pr: 12,
+                    url: format!("https://github.com/{REPO}/pull/12"),
+                },
+            );
+            rig.moved(&run, State::Building, State::PrOpen);
+            let mut at = progress(&rig, &run, State::Building);
+            go_stuck(&rig.ctx(), ISSUE, &mut at, "c", stuck_stop(), None).unwrap();
+            let writes = rig.sim.writes();
+            assert!(writes[0].starts_with("pr ready 12"));
+            assert!(writes[0].ends_with("--undo"));
+            assert!(writes[1].starts_with("issue comment"));
+        }
+
+        #[test]
+        fn the_work_left_names_the_branch_and_the_base() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            let mut at = progress(&rig, &run, State::Building);
+            let stop = Stop {
+                branch: Some("fac/8-1".into()),
+                commits_ahead: Some(2),
+                ..stuck_stop()
+            };
+            go_stuck(&rig.ctx(), ISSUE, &mut at, "c", stop, None).unwrap();
+            assert!(rig.sim.comments()[0].contains("2 commits ahead of `main`"));
+            let stuck = rig
+                .events(&run)
+                .into_iter()
+                .find(|e| e.event == "stuck")
+                .unwrap();
+            assert_eq!(stuck.data["branch"], "fac/8-1");
+            assert_eq!(stuck.data["commits_ahead"], 2);
+        }
+
+        #[test]
+        fn what_runs_after_the_stop_runs_before_the_label_moves() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            let mut at = progress(&rig, &run, State::Building);
+            let failing = || Err(RunError::Invalid("after the stop".into()));
+            let result = go_stuck(
+                &rig.ctx(),
+                ISSUE,
+                &mut at,
+                "c",
+                stuck_stop(),
+                Some(&failing),
+            );
+            assert!(matches!(result, Err(RunError::Invalid(_))));
+            assert_eq!(rig.worker.calls().len(), 1);
+            assert!(rig.sim.writes().is_empty());
+        }
+
+        #[test]
+        fn an_unlaunched_run_in_triage_goes_stuck_with_no_session_to_end() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            rig.step(&run, "approved x");
+            rig.moved(&run, State::Ready, State::Triage);
+            rig.sim.set_labels(&["factory:triage"]);
+            rig.sim.set_assignees(&[LOGIN]);
+            let mut at = progress(&rig, &run, State::Triage);
+            go_stuck(&rig.ctx(), ISSUE, &mut at, "c", stuck_stop(), None).unwrap();
+            assert!(rig.worker.calls().is_empty());
+            assert_eq!(rig.sim.labels(), vec!["factory:stuck"]);
+        }
+    }
+
+    mod a_run_that_ends_without_a_gate {
+        use super::*;
+
+        fn pull(state: &'static str) -> PullRequest {
+            PullRequest {
+                number: 12,
+                is_draft: false,
+                open: state == "OPEN",
+                merged: state == "MERGED",
+                head_ref: "fac/8-1".into(),
+                cross_repository: false,
+                base_ref: "main".into(),
+                head_sha: SHA.into(),
+                mergeable: crate::factory::github::Mergeable::Mergeable,
+                created_at: LABELED_AT.into(),
+            }
+        }
+
+        #[test]
+        fn a_merged_pull_request_ends_it_as_merged_after_the_session_is_stopped() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            let at = progress(&rig, &run, State::Building);
+            end_run(
+                &rig.ctx(),
+                &at,
+                "https://github.com/rawphp/softfac/pull/12",
+                Some(&pull("MERGED")),
+                CauseStep::Watch,
+            )
+            .unwrap();
+            assert_eq!(rig.worker.calls().len(), 1);
+            let finished = rig.events(&run).pop().unwrap();
+            assert_eq!(finished.data["outcome"], "pr-open");
+            assert_eq!(finished.data["pr_end"], "merged");
+            assert_eq!(
+                finished.data["pr_url"],
+                "https://github.com/rawphp/softfac/pull/12"
+            );
+            assert_eq!(finished.cause.unwrap()["step"], "watch");
+            assert!(rig.sim.writes().is_empty());
+        }
+
+        #[test]
+        fn a_closed_or_gone_one_ends_it_as_closed() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            let at = progress(&rig, &run, State::Building);
+            end_run(
+                &rig.ctx(),
+                &at,
+                "url",
+                Some(&pull("CLOSED")),
+                CauseStep::Watch,
+            )
+            .unwrap();
+            assert_eq!(rig.events(&run).pop().unwrap().data["pr_end"], "closed");
+            let other = run_id(2);
+            building(&rig, &other);
+            let at = progress(&rig, &other, State::Building);
+            end_run(&rig.ctx(), &at, "url", None, CauseStep::Watch).unwrap();
+            assert_eq!(rig.events(&other).pop().unwrap().data["pr_end"], "closed");
+        }
+
+        #[test]
+        fn an_own_merge_names_the_url_the_session_wrote_else_the_one_github_gives() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            rig.write(
+                &run,
+                Event::PrOpened {
+                    pr: 12,
+                    url: "https://example.test/the-sessions-link".into(),
+                },
+            );
+            let seen = rig.ctx().seen(&run).unwrap();
+            end_own_merge(&rig.ctx(), &run, &seen, CauseStep::Start, &pull("MERGED")).unwrap();
+            assert_eq!(
+                rig.events(&run).pop().unwrap().data["pr_url"],
+                "https://example.test/the-sessions-link"
+            );
+            let other = run_id(2);
+            building(&rig, &other);
+            let seen = rig.ctx().seen(&other).unwrap();
+            end_own_merge(&rig.ctx(), &other, &seen, CauseStep::Start, &pull("MERGED")).unwrap();
+            assert_eq!(
+                rig.events(&other).pop().unwrap().data["pr_url"],
+                "https://github.com/rawphp/softfac/pull/12"
+            );
+        }
+
+        #[test]
+        fn a_closed_issue_whose_run_a_person_stopped_is_abandoned_with_its_session_ended() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            let seen = rig.ctx().seen(&run).unwrap();
+            let may_exist = abandon(&rig.ctx(), &run, &seen, CauseStep::Start).unwrap();
+            assert!(!may_exist);
+            assert_eq!(rig.worker.calls().len(), 1);
+            let finished = rig.events(&run).pop().unwrap();
+            assert_eq!(finished.data["outcome"], "stuck");
+            assert_eq!(finished.cause.as_ref().unwrap()["reason"], "issue-closed");
+            assert!(finished.cause.unwrap().get("actor").is_none());
+            assert!(rig.sim.writes().is_empty());
+        }
+
+        #[test]
+        fn a_run_left_in_needs_info_is_abandoned_as_needs_info() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            rig.moved(&run, State::Building, State::NeedsInfo);
+            let seen = rig.ctx().seen(&run).unwrap();
+            abandon(&rig.ctx(), &run, &seen, CauseStep::Start).unwrap();
+            assert_eq!(
+                rig.events(&run).pop().unwrap().data["outcome"],
+                "needs-info"
+            );
+        }
+
+        #[test]
+        fn a_launch_sent_with_no_session_recorded_says_a_session_may_exist() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            rig.step(&run, "approved x");
+            rig.step(&run, &format!("workspace-created {WORKSPACE}"));
+            rig.step(&run, "launch-sending");
+            let seen = rig.ctx().seen(&run).unwrap();
+            assert!(abandon(&rig.ctx(), &run, &seen, CauseStep::Start).unwrap());
+            assert_eq!(rig.worker.calls().len(), 1);
+        }
+
+        #[test]
+        fn a_session_that_cannot_be_ended_leaves_the_run_unfinished() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            rig.worker
+                .on_end_sessions(Err(WorkerError::Unreachable("gone".into())));
+            let seen = rig.ctx().seen(&run).unwrap();
+            assert!(abandon(&rig.ctx(), &run, &seen, CauseStep::Start).is_err());
+            assert!(!rig.finished(&run));
+        }
+    }
+
+    mod a_closed_issue {
+        use super::*;
+
+        #[test]
+        fn an_open_issue_is_open_and_asks_of_no_pull_request() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            let seen = rig.ctx().seen(&run).unwrap();
+            assert_eq!(
+                moved_on_by_closing(&rig.ctx(), &seen, false).unwrap(),
+                Closing::Open
+            );
+            assert!(rig.sim.calls().is_empty());
+        }
+
+        #[test]
+        fn is_a_persons_move_when_no_reported_pull_request_was_merged() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            rig.write(
+                &run,
+                Event::PrOpened {
+                    pr: 12,
+                    url: "u".into(),
+                },
+            );
+            rig.sim.set_pull(
+                12,
+                SimPull {
+                    state: "CLOSED",
+                    draft: false,
+                    head: "fac/8-1".into(),
+                    base: "main".into(),
+                    cross: false,
+                },
+            );
+            let seen = rig.ctx().seen(&run).unwrap();
+            assert_eq!(
+                moved_on_by_closing(&rig.ctx(), &seen, true).unwrap(),
+                Closing::PersonsMove
+            );
+        }
+
+        #[test]
+        fn is_the_runs_own_merge_when_a_reported_pull_request_was_merged() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            rig.write(
+                &run,
+                Event::PrOpened {
+                    pr: 12,
+                    url: "u".into(),
+                },
+            );
+            rig.sim.set_pull(
+                12,
+                SimPull {
+                    state: "MERGED",
+                    draft: false,
+                    head: "fac/8-1".into(),
+                    base: "main".into(),
+                    cross: false,
+                },
+            );
+            let seen = rig.ctx().seen(&run).unwrap();
+            let closing = moved_on_by_closing(&rig.ctx(), &seen, true).unwrap();
+            assert!(matches!(closing, Closing::OwnMerge(pull) if pull.number == 12));
+        }
+
+        #[test]
+        fn a_failed_read_of_a_pull_request_is_an_error_never_an_answer() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            rig.write(
+                &run,
+                Event::PrOpened {
+                    pr: 12,
+                    url: "u".into(),
+                },
+            );
+            rig.sim.fail("pr view 12", 1);
+            let seen = rig.ctx().seen(&run).unwrap();
+            assert!(moved_on_by_closing(&rig.ctx(), &seen, true).is_err());
+        }
+
+        #[test]
+        fn a_run_with_nothing_left_to_write_asks_nothing_of_github() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            rig.moved(&run, State::Building, State::PrOpen);
+            let seen = rig.ctx().seen(&run).unwrap();
+            let (closing, detail) = closed_issue(&rig.ctx(), &run, &seen).unwrap();
+            assert_eq!(closing, Closing::Open);
+            assert!(detail.is_none());
+            assert!(rig.sim.calls().is_empty());
+        }
+
+        #[test]
+        fn is_read_with_its_detail_for_a_run_that_has_more_to_write() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            rig.sim.set_closed(true);
+            let seen = rig.ctx().seen(&run).unwrap();
+            let (closing, detail) = closed_issue(&rig.ctx(), &run, &seen).unwrap();
+            assert_eq!(closing, Closing::PersonsMove);
+            assert_eq!(detail.unwrap().number, ISSUE);
+        }
+    }
+}
