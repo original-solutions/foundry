@@ -2914,6 +2914,13 @@ mod tests {
                 assert_eq!(questions_comments(&rig), 1, "{shape}");
                 assert_eq!(rig.sim.labels(), ["factory:needs-info"], "{shape}");
                 assert!(rig.sim.assignees().is_empty(), "{shape}");
+                assert!(
+                    rig.sim
+                        .comments()
+                        .iter()
+                        .any(|comment| comment.contains("**Factory status:** needs-info")),
+                    "{shape}"
+                );
                 // Read once, by the pass that was cut short; then ended and archived.
                 assert_eq!(calls(&rig), needs_info_calls(), "{shape}");
                 assert_eq!(
