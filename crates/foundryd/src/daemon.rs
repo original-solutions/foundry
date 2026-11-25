@@ -1989,6 +1989,11 @@ mod tests {
             scan_marker(&worktrees, workspace),
             Scan::Found(found) if found == project
         ));
+        // Beside the stray files, no marker is no marker, not a folder that cannot be read.
+        assert!(matches!(
+            scan_marker(&worktrees, WorkspaceId::random()),
+            Scan::Absent
+        ));
     }
 
     #[test]
@@ -2077,6 +2082,55 @@ mod tests {
         std::fs::remove_dir(&marker).unwrap();
         std::fs::write(&marker, marker_text(project)).unwrap();
         assert_eq!(marks.project(workspace), Some(project));
+    }
+
+    #[test]
+    fn a_worktrees_path_that_cannot_be_listed_is_not_answered_for_good() {
+        let project = ProjectId::random();
+        let data = tempfile::tempdir().unwrap();
+        let workspace = WorkspaceId::random();
+        let worktrees = data.path().join("worktrees");
+        // A file where the folder should be: listing it fails with ENOTDIR, not NotFound.
+        std::fs::write(&worktrees, "").unwrap();
+        let marks = WorkspaceMarks::new(data.path());
+
+        assert_eq!(marks.project(workspace), None);
+        assert_eq!(marks.project(workspace), None);
+        assert_eq!(marks.warned_count(), 1);
+
+        std::fs::remove_file(&worktrees).unwrap();
+        let folder = worktrees.join(project.to_string());
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(
+            folder.join(format!("{workspace}.factory")),
+            marker_text(project),
+        )
+        .unwrap();
+        assert_eq!(marks.project(workspace), Some(project));
+    }
+
+    /// A release build ignores `FOUNDRY_CLOCK_AHEAD`.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn this_release_build_ignores_foundry_clock_ahead() {
+        let (_dir, file) = clock_file("600");
+        let (_, dyn_base) = fake_base();
+
+        assert!(!CLOCK_AHEAD_ALLOWED);
+        let clock = clock_for(Some(file.into_os_string()), CLOCK_AHEAD_ALLOWED, dyn_base);
+        assert_eq!(clock.now(), Duration::ZERO);
+    }
+
+    /// The debug build the tests run takes it.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn this_debug_build_takes_foundry_clock_ahead() {
+        let (_dir, file) = clock_file("600");
+        let (_, dyn_base) = fake_base();
+
+        assert!(CLOCK_AHEAD_ALLOWED);
+        let clock = clock_for(Some(file.into_os_string()), CLOCK_AHEAD_ALLOWED, dyn_base);
+        assert_eq!(clock.now(), Duration::from_secs(600));
     }
 
     /// A coordinator and listing for a machine that acts alone, over a store holding what

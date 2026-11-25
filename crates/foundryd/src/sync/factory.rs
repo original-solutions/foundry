@@ -577,35 +577,41 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_status_a_take_stored_before_it_was_cancelled_still_tells_freshness() {
+    async fn a_status_a_take_stored_before_it_was_dropped_still_tells_freshness() {
+        use std::future::Future as _;
+        use std::task::{Context, Poll, Waker};
+
         let heard = Heard::new();
         let peer = MachineId::random();
-        let records: Vec<FactoryRecord> = (1..=2000).map(|v| heard.status(peer, v, v)).collect();
         heard.clock.advance(5 * MINUTE);
 
-        let taking = {
-            let peers = heard.peers.clone();
-            tokio::spawn(async move { take(&peers.inner, peer, FACTORY_SINCE, records).await })
-        };
-        // Cancel the take once it has stored a status, as a link that ends drops it.
+        // Polled once by hand, which hands the record to the store's thread, and never
+        // again: a take a closing link drops while it waits on the store.
+        let mut taking = Box::pin(take(
+            &heard.peers.inner,
+            peer,
+            FACTORY_SINCE,
+            vec![heard.status(peer, 1, 1)],
+        ));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(taking.as_mut().poll(&mut cx), Poll::Pending));
+        let end = std::time::Instant::now() + Duration::from_secs(20);
         loop {
-            let stored = {
-                let store = lock(&heard.peers.inner.store);
-                let stored = store.factory_versions().unwrap().contains_key(&peer);
-                if stored {
-                    taking.abort();
-                }
-                stored
-            };
+            let stored = lock(&heard.peers.inner.store)
+                .factory_versions()
+                .unwrap()
+                .get(&peer)
+                == Some(&1);
             if stored {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            assert!(
+                std::time::Instant::now() < end,
+                "the status was never stored"
+            );
+            std::thread::sleep(Duration::from_millis(1));
         }
-        assert!(
-            taking.await.is_err_and(|e| e.is_cancelled()),
-            "the take ended first"
-        );
+        drop(taking);
 
         assert_eq!(
             heard.freshness.since_holding(heard.project),
