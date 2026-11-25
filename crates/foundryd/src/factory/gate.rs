@@ -89,10 +89,10 @@ pub enum GateResult {
     /// The setup exited 0: every command did.
     Passed,
     /// The setup exited with another code: a `provision` or `gate` command failed. `command`
-    /// is the one of the gate's commands the tail names, empty when it names none; `how` is
+    /// is the one of the gate's commands the tail names, `None` when it names none; `how` is
     /// how it ended in words, and `output` what it printed.
     Failed {
-        command: String,
+        command: Option<String>,
         how: String,
         output: String,
     },
@@ -110,8 +110,9 @@ pub enum GateResult {
 /// each command, then `setup failed: <command> exited <code>`, or `ran past <limit> s and was
 /// stopped`, after the one that failed. The pull request's code writes the same tail and can
 /// fake such lines or erase the real one, so only a line that names one of `commands` with an
-/// ending that fits the exit code counts, the last such in the tail. With none, the command is
-/// empty and the output is the whole tail.
+/// ending that fits the exit code counts, the last such in the tail. With none, no command is
+/// named and the output is the whole tail. Output that names one of the gate's own commands
+/// can still be blamed in its place, but never one the gate did not run.
 pub fn result(
     state: TerminalState,
     exit_code: Option<i32>,
@@ -129,8 +130,8 @@ pub fn result(
         format!("exit code {code}")
     };
     let (command, output) = match failure_line(tail, code, commands) {
-        Some((at, command)) => (command.to_string(), output_of(&tail[..at], command)),
-        None => (String::new(), tail),
+        Some((at, command)) => (Some(command.to_string()), output_of(&tail[..at], command)),
+        None => (None, tail),
     };
     GateResult::Failed {
         command,
@@ -187,7 +188,9 @@ fn output_of<'a>(before: &'a str, command: &str) -> &'a str {
 /// create answered with, `unreachable_for` how long its machine has been unreachable on the
 /// sleep-counting clock, and `terminal` its setup terminal's state and exit code when it has
 /// one. A terminal that exited with no exit code lost its holder before the setup said how it
-/// went. A failed create is named first.
+/// went; the code under test can do that too, by killing the holder, which makes its gate one
+/// that could not run, never one that passed. A failed create is named first, then a gone
+/// machine.
 pub fn could_not_run(
     create: Option<&WorkerError>,
     unreachable_for: Duration,
