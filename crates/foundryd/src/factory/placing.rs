@@ -1,49 +1,199 @@
 //! Which machine takes a run or a gate.
+//!
+//! A machine qualifies for the factory only when it is online, has published a
+//! [`MachineHeld`] (a machine on protocol 4 never does, so the factory places nothing there),
+//! holds a token for the project's login and has the `factory-build` skill. Among those, P1's
+//! [`placement::place`] picks: the lowest load per core under every limit, then the fewest
+//! sessions.
+//!
+//! [`place_run`] keeps to every limit, the session limit included, and counts each machine it
+//! picked earlier in the same pass one session fuller, as the spec's shared settings say of a
+//! pass that claims more than one issue. [`place_gate`] keeps to the load and disk limits only:
+//! a gate has no session. Neither sends anything; the caller makes the workspace.
+//!
+//! [`slots`] counts what is free of the fleet's `max_runs` and `max_gates`.
 
 use std::collections::BTreeMap;
 
-use foundry_proto::factory::FactorySettings;
+use foundry_proto::factory::{FactorySettings, MachineHeld};
 use foundry_proto::ids::MachineId;
-use foundry_proto::settings::SharedSettings;
+use foundry_proto::record::{MachineSample, Record};
+use foundry_proto::settings::{Limits, SharedSettings};
 
-use crate::factory::ledger::list::RunInfo;
+use crate::factory::ledger::list::{RunInfo, holds_slot};
 use crate::factory::worker::FleetView;
+use crate::placement;
 
-/// The machines picked for runs so far in one pass.
+/// The machines [`place_run`] picked so far in one pass, each counted one session fuller for
+/// the rest of it. A new pass starts with a new one.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Reserved {
     picked: BTreeMap<MachineId, u32>,
 }
 
-/// The run and gate slots free.
+impl Reserved {
+    /// How many runs were placed on `machine` this pass.
+    fn on(&self, machine: MachineId) -> u32 {
+        self.picked.get(&machine).copied().unwrap_or(0)
+    }
+}
+
+/// What is free of the fleet's run and gate slots.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Slots {
+    /// Of `max_runs`.
     pub runs_free: u32,
+    /// Of `max_gates`.
     pub gates_free: u32,
 }
 
-/// The machine a run's session goes to.
+/// The machine a run's session goes to, among the machines that qualify (see the module), or
+/// one reason per machine passed over, in the order of the view's samples, such as
+/// `vps: no token for rawphp` or `mac: sessions 4 at limit 4`. Each machine named by
+/// `settings`, or by its id when they do not name it. The machine picked is counted one session
+/// fuller in `reserved` for the rest of the pass; a refusal reserves nothing.
 pub fn place_run(
-    _view: &FleetView,
-    _settings: &SharedSettings,
-    _login: &str,
-    _reserved: &mut Reserved,
+    view: &FleetView,
+    settings: &SharedSettings,
+    login: &str,
+    reserved: &mut Reserved,
 ) -> Result<MachineId, Vec<String>> {
-    todo!()
+    let machine = pick(view, settings, login, reserved, &settings.limits)?;
+    *reserved.picked.entry(machine).or_insert(0) += 1;
+    Ok(machine)
 }
 
-/// The machine a gate goes to.
+/// The machine a gate goes to: as [`place_run`], but with no session limit, since a gate has
+/// no session. The load and disk limits still hold. Reserves nothing.
 pub fn place_gate(
-    _view: &FleetView,
-    _settings: &SharedSettings,
-    _login: &str,
+    view: &FleetView,
+    settings: &SharedSettings,
+    login: &str,
 ) -> Result<MachineId, Vec<String>> {
-    todo!()
+    let limits = settings
+        .limits
+        .iter()
+        .map(|(machine, limits)| {
+            let mut limits = limits.clone();
+            limits.max_sessions = u32::MAX;
+            (*machine, limits)
+        })
+        .collect();
+    pick(view, settings, login, &Reserved::default(), &limits)
 }
 
-/// The slots free.
-pub fn slots(_runs: &[RunInfo], _gates: usize, _settings: &FactorySettings) -> Slots {
-    todo!()
+/// The run and gate slots free: `max_runs` less the `runs` that hold a slot as
+/// [`holds_slot`] counts them, and `max_gates` less the `gates` running. Never below zero.
+pub fn slots(runs: &[RunInfo], gates: usize, settings: &FactorySettings) -> Slots {
+    let held = runs.iter().filter(|run| holds_slot(run)).count();
+    Slots {
+        runs_free: settings.max_runs.saturating_sub(saturated(held)),
+        gates_free: settings.max_gates.saturating_sub(saturated(gates)),
+    }
+}
+
+fn saturated(count: usize) -> u32 {
+    u32::try_from(count).unwrap_or(u32::MAX)
+}
+
+/// The pick of [`placement::place`] among the machines that qualify, under `limits`, with the
+/// sessions `reserved` holds added to each machine's newest sample.
+fn pick(
+    view: &FleetView,
+    settings: &SharedSettings,
+    login: &str,
+    reserved: &Reserved,
+    limits: &BTreeMap<MachineId, Limits>,
+) -> Result<MachineId, Vec<String>> {
+    let samples = newest(view.samples());
+    let mut refused: BTreeMap<MachineId, String> = BTreeMap::new();
+    let mut candidates = Vec::new();
+    for sample in &samples {
+        let machine = sample.owner;
+        // An offline machine is left to `place`, which says so: what it last said it holds may
+        // be out of date.
+        let why = if view.online(machine) {
+            not_held(view.held(machine), login)
+        } else {
+            None
+        };
+        match why {
+            Some(why) => {
+                refused.insert(machine, format!("{}: {why}", name(settings, machine)));
+            }
+            None => {
+                let mut sample = sample.clone();
+                sample.body.sessions = sample.body.sessions.saturating_add(reserved.on(machine));
+                candidates.push(sample);
+            }
+        }
+    }
+    let online = candidates
+        .iter()
+        .map(|s| s.owner)
+        .filter(|machine| view.online(*machine))
+        .collect();
+    let reasons = match placement::place(&candidates, limits, &online) {
+        Ok(machine) => return Ok(machine),
+        Err(reasons) => reasons,
+    };
+    for reason in reasons {
+        refused.insert(reason.machine, reason.text(&name(settings, reason.machine)));
+    }
+    Err(samples
+        .iter()
+        .filter_map(|s| refused.remove(&s.owner))
+        .collect())
+}
+
+/// Why a machine that holds `held` cannot take a run of `login`, or `None` when it can. The
+/// login is matched in its exact case, as the machine's secret store looks its token up.
+fn not_held(held: Option<&MachineHeld>, login: &str) -> Option<String> {
+    let Some(held) = held else {
+        return Some("has said nothing of the logins it holds (protocol 4)".to_owned());
+    };
+    let mut why = Vec::new();
+    if !held.logins.iter().any(|held| held == login) {
+        why.push(format!("no token for {login}"));
+    }
+    if !held.skill {
+        why.push("no factory-build skill".to_owned());
+    }
+    (!why.is_empty()).then(|| why.join(", "))
+}
+
+/// Each machine's newest sample, in the order each machine first appears in `samples`. A
+/// machine whose newest sample is removed is left out.
+fn newest(samples: &[Record<MachineSample>]) -> Vec<Record<MachineSample>> {
+    let mut order: Vec<MachineId> = Vec::new();
+    let mut newest: BTreeMap<MachineId, &Record<MachineSample>> = BTreeMap::new();
+    for sample in samples {
+        match newest.get(&sample.owner) {
+            None => {
+                order.push(sample.owner);
+                newest.insert(sample.owner, sample);
+            }
+            Some(held) if sample.version > held.version => {
+                newest.insert(sample.owner, sample);
+            }
+            Some(_) => {}
+        }
+    }
+    order
+        .into_iter()
+        .filter_map(|machine| newest.get(&machine).copied())
+        .filter(|sample| !sample.deleted)
+        .cloned()
+        .collect()
+}
+
+/// `machine`'s name in `settings`, or its id when they do not name it.
+fn name(settings: &SharedSettings, machine: MachineId) -> String {
+    settings
+        .machines
+        .iter()
+        .find(|m| m.id == machine)
+        .map_or_else(|| machine.to_string(), |m| m.name.clone())
 }
 
 #[cfg(test)]
