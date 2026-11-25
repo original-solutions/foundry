@@ -1325,7 +1325,6 @@ pub fn run_names(events: &[RunEvent], seen: &Seen) -> RunNames {
     names
 }
 
-/// The id after a `<name> <id>` intent step: 0 for the bare name an older ledger wrote.
 /// The tries of one send to the session under its newest count. A new count is written only
 /// when no try may have typed, so it starts the tries again.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1359,6 +1358,7 @@ impl SendTries {
     }
 }
 
+/// The id after a `<name> <id>` intent step: 0 for the bare name an older ledger wrote.
 fn commenting_id(step: &str, name: &str) -> Option<u64> {
     if step == name {
         return Some(0);
@@ -1614,6 +1614,40 @@ mod tests {
                 seen_of(&[intended, moved(2, "needs-info", "building")]).questions_commenting,
                 None
             );
+        }
+    }
+
+    mod a_launch_decision {
+        use super::*;
+
+        /// Each decision starts with its `launch-model` step: what a decision cut short before
+        /// its workspace was asked for said of the base and the resume is not the next one's.
+        #[test]
+        fn taken_again_forgets_the_base_and_the_resume_of_one_cut_short() {
+            let cut_short = [
+                step(1, "launch-model m"),
+                step(2, "launch-base release/2"),
+                step(
+                    3,
+                    "launch-pull-request fac/8-1 https://github.com/o/r/pull/3",
+                ),
+                step(4, "launch-resuming fac/8-1"),
+            ];
+            let seen = seen_of(&cut_short);
+            assert_eq!(seen.launch_base.as_deref(), Some("release/2"));
+            assert_eq!(seen.launch_resumed_from.as_deref(), Some("fac/8-1"));
+            let again = seen_of(&plus(&cut_short, vec![step(5, "launch-model m")]));
+            assert_eq!(again.launch_base, None);
+            assert_eq!(again.launch_resumed_from, None);
+            assert_eq!(again.launch_resumed_pr, None);
+            let resumed_again = seen_of(&plus(
+                &cut_short,
+                vec![
+                    step(5, "launch-model m"),
+                    step(6, "launch-resuming fac/8-1"),
+                ],
+            ));
+            assert_eq!(resumed_again.launch_resumed_pr, None);
         }
     }
 

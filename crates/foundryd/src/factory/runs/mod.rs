@@ -2146,6 +2146,124 @@ mod tests {
             assert!(rig.names(&run).contains(&"comment_forwarded".to_string()));
         }
 
+        /// A gate failure goes to the session under its prompt count, keyed by its attempt and
+        /// run ordinal, and is recorded with its attempt in the cause.
+        #[test]
+        fn a_gate_failure_goes_to_the_session_under_its_count_and_is_recorded_with_its_attempt() {
+            let (rig, run, _, _) = forward_rig(3);
+            let message = Message {
+                line: "the gate failed".into(),
+                body: None,
+            };
+            let payload = ActionPayload {
+                send: Some(SendPayload {
+                    message: message.clone(),
+                    attempt: 2,
+                    run_ordinal: 3,
+                }),
+                ..ActionPayload::default()
+            };
+            let actions = [Action::SendGateFailure {
+                output: "boom".into(),
+            }];
+            rig.worker.on_send(Ok(3));
+            forward(&rig, &run, &payload, &actions).unwrap();
+            assert_eq!(
+                rig.worker.calls(),
+                vec![Call::Send {
+                    session: session_id(SESSION).unwrap(),
+                    message,
+                    only_if_prompts: Some(3),
+                }]
+            );
+            assert!(
+                rig.steps(&run)
+                    .contains(&"send-intent gate-failure 2 3 3".to_string())
+            );
+            let sent = rig
+                .events(&run)
+                .into_iter()
+                .find(|event| event.event == "gate_sent_back")
+                .unwrap();
+            assert_eq!(sent.data["attempt"], 2);
+            assert_eq!(sent.data["run_ordinal"], 3);
+            assert_eq!(sent.cause.unwrap()["attempt"], 2);
+        }
+
+        /// A body edit goes to the session under its prompt count and its
+        /// `body-edit-forwarded <edited_at>` step is recorded after it.
+        #[test]
+        fn a_body_edit_goes_to_the_session_and_its_step_is_recorded() {
+            let (rig, run, _, _) = forward_rig(3);
+            let step = "body-edit-forwarded 2026-10-04T11:00:00Z";
+            let payload = ActionPayload {
+                forward: Some(ForwardPayload {
+                    message: Message {
+                        line: "the body changed".into(),
+                        body: None,
+                    },
+                    step: Some(step.into()),
+                }),
+                ..ActionPayload::default()
+            };
+            rig.worker.on_send(Ok(3));
+            forward(&rig, &run, &payload, &[Action::ForwardBodyEdit]).unwrap();
+            assert_eq!(send_counts(&rig), vec![Some(3)]);
+            let steps = rig.steps(&run);
+            let intent = steps
+                .iter()
+                .position(|s| s == &format!("send-intent forward-body-edit {step} 3"))
+                .unwrap();
+            let recorded = steps.iter().position(|s| s == step).unwrap();
+            assert!(intent < recorded, "{steps:?}");
+        }
+
+        /// A gate failure with no payload or no session, and a body edit with no step, are
+        /// invalid transitions that ask nothing of the worker.
+        #[test]
+        fn a_send_missing_its_payload_session_or_step_is_an_invalid_transition() {
+            let (rig, run, _, _) = forward_rig(3);
+            let gate = [Action::SendGateFailure {
+                output: "boom".into(),
+            }];
+            let send = ActionPayload {
+                send: Some(SendPayload {
+                    message: Message {
+                        line: "the gate failed".into(),
+                        body: None,
+                    },
+                    attempt: 1,
+                    run_ordinal: 1,
+                }),
+                ..ActionPayload::default()
+            };
+            let edit = ActionPayload {
+                forward: Some(ForwardPayload {
+                    message: Message {
+                        line: "the body changed".into(),
+                        body: None,
+                    },
+                    step: None,
+                }),
+                ..ActionPayload::default()
+            };
+            assert!(matches!(
+                forward(&rig, &run, &ActionPayload::default(), &gate),
+                Err(RunError::Transition(_))
+            ));
+            assert!(matches!(
+                forward(&rig, &run, &edit, &[Action::ForwardBodyEdit]),
+                Err(RunError::Transition(_))
+            ));
+            let mut at = progress(&rig, &run, State::Building);
+            at.thread_id = None;
+            assert!(matches!(
+                apply_actions(&rig.ctx(), ISSUE, &mut at, &gate, &cause(), &send),
+                Err(RunError::Transition(_))
+            ));
+            assert!(rig.worker.calls().is_empty());
+        }
+
         fn forward(
             rig: &Rig,
             run: &RunId,

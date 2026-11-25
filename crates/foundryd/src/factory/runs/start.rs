@@ -4272,6 +4272,42 @@ mod tests {
                 assert_eq!(launched.data["base"], "release/2");
             }
 
+            /// A decision cut short before the workspace was asked for leaves no base to the
+            /// decision taken again: the issue no longer names one, so the launch is on the
+            /// project's base.
+            #[test]
+            fn a_decision_cut_short_leaves_no_base_to_the_next_decision() {
+                let (mut rig, run) = claimed_with_body("Do it.");
+                rig.step(&run, "launch-model sonnet");
+                rig.step(&run, "launch-base release/2");
+                pass(&rig, &run);
+                match &creates(&rig)[..] {
+                    [Call::Create { request, .. }] => assert_eq!(
+                        request.checkout,
+                        Checkout::NewBranch {
+                            base: "main".into(),
+                            branch: Some("fac/8-1".into())
+                        }
+                    ),
+                    other => panic!("{other:?}"),
+                }
+                show_workspace(&mut rig);
+                pass(&rig, &run);
+                match &start_sessions(&rig)[..] {
+                    [Call::StartSession { first, .. }] => assert_eq!(
+                        first,
+                        &messages::launch(REPO, ISSUE, LOGIN, None, BODY_PATH)
+                    ),
+                    other => panic!("{other:?}"),
+                }
+                let launched = rig
+                    .events(&run)
+                    .into_iter()
+                    .find(|e| e.event == "session_launched")
+                    .unwrap();
+                assert_eq!(launched.data["base"], "main");
+            }
+
             /// The runner's case "an issue with no base records the project's base and says
             /// nothing more".
             #[test]
@@ -6174,6 +6210,27 @@ mod tests {
                 assert!(rig.finished(&run));
                 assert_eq!(archives(&rig).len(), 1);
                 assert_eq!(said(&rig, "did not start on this issue"), 1);
+            }
+
+            /// A withdraw cut short in triage whose approval reads as given again on the next
+            /// pass: it is finished with no second explanation.
+            #[test]
+            fn a_withdraw_cut_short_and_approved_again_is_finished_with_no_second_comment() {
+                let (rig, run) = workspace_shown();
+                rig.sim
+                    .set_approval(approval_answer(LABELED_AT, "mallory", &[]));
+                rig.sim.fail("--add-label factory:proposed", 1);
+                assert!(advance(&rig.ctx(), &run).is_err());
+                assert_eq!(rig.sim.labels(), vec!["factory:triage"]);
+                assert_eq!(said(&rig, "did not start on this issue"), 1);
+                rig.sim
+                    .set_approval(approval_answer(LABELED_AT, "tom", &[]));
+                assert!(matches!(pass(&rig, &run), StartStep::Unapproved { .. }));
+                assert_eq!(said(&rig, "did not start on this issue"), 1);
+                assert_eq!(rig.sim.labels(), vec!["factory:proposed"]);
+                assert!(rig.sim.assignees().is_empty());
+                assert_eq!(archives(&rig).len(), 1);
+                assert!(rig.finished(&run));
             }
 
             /// A claim cut short after the label and before the assignee: the next pass assigns
