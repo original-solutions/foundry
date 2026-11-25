@@ -420,9 +420,9 @@ mod tests {
                 OtherKind::NotStarted,
             ),
             (Answer::fail(126, ""), OtherKind::NotStarted),
-            (Answer::TooLarge, OtherKind::Failed),
+            (Answer::TooLarge, OtherKind::NoAnswer),
             (Answer::fail(1, "boom"), OtherKind::Failed),
-            (Answer::signal_killed(), OtherKind::Failed),
+            (Answer::signal_killed(), OtherKind::NoAnswer),
         ] {
             assert_eq!(kind(finish(&call, answer.clone())), want, "{answer:?}");
         }
@@ -431,6 +431,199 @@ mod tests {
             kind(Err(invalid_argument("../x", "a branch name"))),
             OtherKind::InvalidArgument
         );
+    }
+
+    /// The call `gh pr ready --undo` prints its failures for, as gh 2.105.0 words them.
+    fn undo(slug: &str) -> Vec<String> {
+        args(&["pr", "ready", "12", "--repo", slug, "--undo"])
+    }
+
+    /// The kind `finish` gives `gh pr ready --undo` on `slug` exiting with `status` and
+    /// `stderr`, with the message it words.
+    fn failed(slug: &str, status: Option<i32>, stderr: &str) -> (OtherKind, String) {
+        let answer = Answer::Exit {
+            status,
+            stdout: String::new(),
+            stderr: stderr.into(),
+        };
+        match finish(&undo(slug), answer).unwrap_err() {
+            TrackerError::Other { kind, message } => (kind, message),
+            other => panic!("not a failure of gh: {other}"),
+        }
+    }
+
+    /// Asserts each of `stderrs` on a `gh` exiting with status 1 is `want`, with the words a
+    /// failure of `gh` has always had.
+    fn assert_kind(want: OtherKind, stderrs: &[&str]) {
+        for stderr in stderrs {
+            let (kind, message) = failed("acme/widgets", Some(1), stderr);
+            assert_eq!(kind, want, "{stderr}");
+            assert_eq!(
+                message,
+                format!(
+                    "`gh pr ready 12 --repo acme/widgets --undo` exited with status 1: {}",
+                    stderr.trim_end()
+                )
+            );
+        }
+    }
+
+    /// Foundry's own: a call a signal ended.
+    #[test]
+    fn a_call_a_signal_ended_is_no_answer() {
+        let (kind, message) = failed("acme/widgets", None, "");
+        assert_eq!(kind, OtherKind::NoAnswer);
+        assert_eq!(
+            message,
+            "`gh pr ready 12 --repo acme/widgets --undo` exited with status -1: "
+        );
+    }
+
+    /// Foundry's own: an answer over the output limit.
+    #[test]
+    fn an_answer_over_the_output_limit_is_no_answer() {
+        let error = finish(&undo("acme/widgets"), Answer::TooLarge).unwrap_err();
+        assert_eq!(
+            error,
+            TrackerError::Other {
+                kind: OtherKind::NoAnswer,
+                message: format!(
+                    "`gh pr ready 12 --repo acme/widgets --undo` printed more than \
+                     {OUTPUT_LIMIT} bytes"
+                ),
+            }
+        );
+    }
+
+    /// gh's `printError`: a `*net.DNSError` anywhere in the chain.
+    #[test]
+    fn error_connecting_to_a_host_is_no_answer() {
+        assert_kind(
+            OtherKind::NoAnswer,
+            &[
+                "error connecting to api.github.com\ncheck your internet connection or https://githubstatus.com",
+                "error connecting to github.example.com\n",
+            ],
+        );
+    }
+
+    /// Go's `*url.Error`: `urlErrorOp`'s method, the quoted `http` or `https` URL, then any
+    /// cause. One that is not (no such method, no cause, no web URL) is a refusal.
+    #[test]
+    fn a_go_url_error_is_no_answer() {
+        assert_kind(
+            OtherKind::NoAnswer,
+            &[
+                "Post \"https://api.github.com/graphql\": dial tcp 140.82.112.5:443: connect: connection refused",
+                "Post \"https://api.github.com/graphql\": net/http: TLS handshake timeout",
+                "Post \"https://api.github.com/graphql\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+                "Get \"https://api.github.com\": EOF",
+                "Get \"http://github.example.com/api/v3\": EOF",
+                "Get \"https://api.github.com/repos/acme/widgets\": something nobody has worded yet",
+            ],
+        );
+        assert_kind(
+            OtherKind::Failed,
+            &[
+                "POST \"https://api.github.com/graphql\": EOF",
+                "Post \"https://api.github.com/graphql\"",
+                "Get \"ftp://example.com\": EOF",
+                "Post https://api.github.com/graphql: EOF",
+            ],
+        );
+    }
+
+    /// go-gh's `HTTPError` on the lookup before the mutation: a 5xx is no answer, any other
+    /// status GitHub's refusal. A status not of three digits is no status.
+    #[test]
+    fn go_gh_s_http_5xx_is_no_answer() {
+        assert_kind(
+            OtherKind::NoAnswer,
+            &[
+                "HTTP 502: Bad Gateway (https://api.github.com/graphql)",
+                "HTTP 503 (https://api.github.com/graphql)",
+                "HTTP 500",
+                "HTTP 504: Gateway Timeout",
+            ],
+        );
+        assert_kind(
+            OtherKind::Failed,
+            &[
+                "HTTP 422: Unprocessable Entity",
+                "HTTP 403: Resource not accessible",
+                "HTTP 5xx",
+                "HTTP 5021",
+                "HTTP 50",
+                "see HTTP 5 docs",
+            ],
+        );
+    }
+
+    /// `ready.go`'s `API call failed: ` around the mutation: a 5xx in shurcooL-graphql's words,
+    /// or any inner text but `non-200 OK status code: <n>` and `GraphQL:`, is no answer.
+    #[test]
+    fn api_call_failed_around_no_answer_from_github_is_no_answer() {
+        assert_kind(
+            OtherKind::NoAnswer,
+            &[
+                "API call failed: non-200 OK status code: 502 Bad Gateway body: \"\"",
+                "API call failed: non-200 OK status code: 504 Gateway Timeout body: \"<html></html>\"",
+                "API call failed: Post \"https://api.github.com/graphql\": http2: stream error: stream ID 3; INTERNAL_ERROR; received from peer",
+                "API call failed: read tcp 10.0.0.2:50000->140.82.112.6:443: read: connection reset by peer",
+                "API call failed: unexpected EOF",
+                "API call failed: invalid character '<' looking for beginning of value",
+                "API call failed: something nobody has worded yet",
+            ],
+        );
+        assert_kind(
+            OtherKind::Failed,
+            &[
+                "API call failed: GraphQL: Resource not accessible by integration (convertPullRequestToDraft)",
+                "API call failed: GraphQL: Pull request is already merged",
+                "API call failed: non-200 OK status code: 403 Forbidden body: \"{}\"",
+                "API call failed: non-200 OK status code: 422 Unprocessable Entity body: \"\"",
+            ],
+        );
+    }
+
+    /// A shape no wrapper names is a refusal, the runner's reading: Go's bare transport errors
+    /// outside `API call failed: ` and a `*url.Error` (what a lookup whose answer was cut short
+    /// prints) included, and a wrapper's words that do not start what `gh` said.
+    #[test]
+    fn a_failure_in_a_shape_no_wrapper_names_is_a_refusal() {
+        assert_kind(
+            OtherKind::Failed,
+            &[
+                "boom",
+                "",
+                "something nobody has worded yet",
+                "GraphQL: Pull request is already closed",
+                "unknown flag: --undo",
+                "read tcp 10.0.0.2:5000->140.82.112.5:443: connection reset by peer",
+                "unexpected EOF",
+                "boom: API call failed: unexpected EOF",
+                "the lookup said HTTP 502",
+                "x error connecting to api.github.com",
+            ],
+        );
+    }
+
+    /// Only what `gh` said is read, never the command text: a repo whose name holds a wrapper's
+    /// words does not make a refusal no answer.
+    #[test]
+    fn a_refusal_is_not_no_answer_whatever_the_repo_is_called() {
+        for slug in [
+            "acme/kafka-connect",
+            "rustls/rustls",
+            "x/network-tools",
+            "a/eof-tools",
+            "c/dial-tcp",
+            "d/tls-proxy",
+        ] {
+            for status in [Some(1), Some(2)] {
+                assert_eq!(failed(slug, status, "boom").0, OtherKind::Failed, "{slug}");
+            }
+        }
     }
 
     // The runner's "runs gh with the config dir, a 60 s limit and separate stderr on every

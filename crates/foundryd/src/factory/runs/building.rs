@@ -1613,6 +1613,15 @@ mod tests {
 
     mod advance_done {
         use super::*;
+        use crate::factory::github::Answer;
+        use crate::factory::github::gh::finish;
+
+        /// The error `github::gh::finish` gives `gh <command>` ending with `answer`, so a
+        /// scripted failure is read as the real `gh`'s is.
+        fn gh_failed(command: &str, answer: Answer) -> TrackerError {
+            let args: Vec<String> = command.split(' ').map(str::to_string).collect();
+            finish(&args, answer).unwrap_err()
+        }
 
         #[test]
         fn with_an_open_draft_pull_request_on_the_sessions_branch_is_ready_for_the_gate() {
@@ -1714,9 +1723,8 @@ mod tests {
                 .set_pull(12, pull("OPEN", false, BRANCH, "main", false));
             let sim = rig.sim.clone();
             rig.tracker = Hiding::new(
-                Arc::new(Failing(sim, || TrackerError::Other {
-                    kind: crate::factory::github::OtherKind::Failed,
-                    message: "`gh pr ready` exited with status 1: boom".into(),
+                Arc::new(Failing(sim, || {
+                    gh_failed("pr ready 12 --undo", Answer::fail(1, "boom"))
                 })),
                 Arc::new(|t: &str| t.into()),
             );
@@ -1778,27 +1786,26 @@ mod tests {
                 use std::sync::atomic::Ordering;
                 if args.iter().any(|arg| arg == "--undo") {
                     self.failed.store(true, Ordering::SeqCst);
-                    return Err(TrackerError::Other {
-                        kind: crate::factory::github::OtherKind::Failed,
-                        // `refused`: `gh` was refused (status 1 and a reason); else a 502.
-                        message: if self.refused {
-                            "`gh pr ready` exited with status 1: boom".into()
-                        } else {
-                            "`gh pr ready` exited with status 1: HTTP 502: Bad Gateway".into()
-                        },
-                    });
+                    // `refused`: `gh` was refused (status 1 and a reason); else a 502.
+                    let stderr = if self.refused {
+                        "boom"
+                    } else {
+                        "HTTP 502: Bad Gateway"
+                    };
+                    return Err(gh_failed("pr ready 12 --undo", Answer::fail(1, stderr)));
                 }
                 if self.failed.load(Ordering::SeqCst)
                     && args.first().map(String::as_str) == Some("pr")
                     && args.iter().any(|arg| arg == "view")
                 {
-                    return Err(TrackerError::Other {
-                        kind: crate::factory::github::OtherKind::Failed,
-                        message: if self.gone {
-                            "`gh pr view` failed: Could not resolve to a PullRequest".into()
-                        } else {
-                            "`gh pr view` exited with status 1: HTTP 502: Bad Gateway".into()
-                        },
+                    return Err(if self.gone {
+                        TrackerError::Other {
+                            kind: crate::factory::github::OtherKind::Failed,
+                            message: "`gh pr view` failed: Could not resolve to a PullRequest"
+                                .into(),
+                        }
+                    } else {
+                        gh_failed("pr view 12", Answer::fail(1, "HTTP 502: Bad Gateway"))
                     });
                 }
                 self.sim.gh(args)
@@ -1882,25 +1889,24 @@ mod tests {
         #[test]
         fn with_gh_getting_no_answer_on_putting_it_back_to_draft_is_an_error_not_stuck() {
             let shapes: [fn() -> TrackerError; 4] = [
-                || TrackerError::Other {
-                    kind: crate::factory::github::OtherKind::Failed,
-                    message: "`gh pr ready` exited with status 1: HTTP 502: Bad Gateway".into(),
+                || {
+                    gh_failed(
+                        "pr ready 12 --undo",
+                        Answer::fail(1, "HTTP 502: Bad Gateway"),
+                    )
                 },
                 // The mutation's own 5xx, as `gh pr ready --undo` prints it.
-                || TrackerError::Other {
-                    kind: crate::factory::github::OtherKind::Failed,
-                    message: "`gh pr ready` exited with status 1: API call failed: non-200 OK \
-                              status code: 502 Bad Gateway body: \"\""
-                        .into(),
+                || {
+                    gh_failed(
+                        "pr ready 12 --undo",
+                        Answer::fail(
+                            1,
+                            "API call failed: non-200 OK status code: 502 Bad Gateway body: \"\"",
+                        ),
+                    )
                 },
-                || TrackerError::Other {
-                    kind: crate::factory::github::OtherKind::Failed,
-                    message: "`gh pr ready` exited with status -1: ".into(),
-                },
-                || TrackerError::Other {
-                    kind: crate::factory::github::OtherKind::Failed,
-                    message: "`gh pr ready` printed more than 1048576 bytes".into(),
-                },
+                || gh_failed("pr ready 12 --undo", Answer::signal_killed()),
+                || gh_failed("pr ready 12 --undo", Answer::TooLarge),
             ];
             for make in shapes {
                 let (mut rig, run) = built();
@@ -2059,14 +2065,14 @@ mod tests {
         }
 
         /// A tracker whose call to put pull request #12 back to draft finds it ended meanwhile: a
-        /// person merged or closed it (`state`, `draft`), and the call failed with `message`.
+        /// person merged or closed it (`state`, `draft`), and `gh` failed saying `stderr`.
         /// The tracker's own read of the pull request after the failure finds it ended, so the
         /// call is `Ok`, or with `read_fails` fails, so the error reaches `advance`.
         struct EndedFirst {
             sim: Arc<Sim>,
             state: &'static str,
             draft: bool,
-            message: &'static str,
+            stderr: &'static str,
             read_fails: bool,
             failed: std::sync::atomic::AtomicBool,
             read_failed: std::sync::atomic::AtomicBool,
@@ -2079,10 +2085,10 @@ mod tests {
                     self.sim
                         .set_pull(12, pull(self.state, self.draft, BRANCH, "main", false));
                     self.failed.store(true, Ordering::SeqCst);
-                    return Err(TrackerError::Other {
-                        kind: crate::factory::github::OtherKind::Failed,
-                        message: self.message.into(),
-                    });
+                    return Err(gh_failed(
+                        "pr ready 12 --undo",
+                        Answer::fail(1, self.stderr),
+                    ));
                 }
                 if self.failed.load(Ordering::SeqCst)
                     && args.first().map(String::as_str) == Some("pr")
@@ -2090,10 +2096,10 @@ mod tests {
                     && self.read_fails
                     && !self.read_failed.swap(true, Ordering::SeqCst)
                 {
-                    return Err(TrackerError::Other {
-                        kind: crate::factory::github::OtherKind::Failed,
-                        message: "`gh pr view` exited with status 1: HTTP 502: Bad Gateway".into(),
-                    });
+                    return Err(gh_failed(
+                        "pr view 12",
+                        Answer::fail(1, "HTTP 502: Bad Gateway"),
+                    ));
                 }
                 self.sim.gh(args)
             }
@@ -2108,23 +2114,13 @@ mod tests {
                 (
                     "MERGED",
                     false,
-                    "`gh pr ready` exited with status 1: API call failed: GraphQL: Pull request is already merged",
+                    "API call failed: GraphQL: Pull request is already merged",
                     "merged",
                 ),
-                (
-                    "CLOSED",
-                    false,
-                    "`gh pr ready` exited with status 1: boom",
-                    "closed",
-                ),
-                (
-                    "CLOSED",
-                    true,
-                    "`gh pr ready` exited with status 1: HTTP 502: Bad Gateway",
-                    "closed",
-                ),
+                ("CLOSED", false, "boom", "closed"),
+                ("CLOSED", true, "HTTP 502: Bad Gateway", "closed"),
             ];
-            for ((state, draft, message, end), read_fails) in cases
+            for ((state, draft, stderr, end), read_fails) in cases
                 .into_iter()
                 .flat_map(|case| [(case, false), (case, true)])
             {
@@ -2137,7 +2133,7 @@ mod tests {
                         sim: rig.sim.clone(),
                         state,
                         draft,
-                        message,
+                        stderr,
                         read_fails,
                         failed: std::sync::atomic::AtomicBool::new(false),
                         read_failed: std::sync::atomic::AtomicBool::new(false),
@@ -2196,10 +2192,10 @@ mod tests {
                     && args.iter().any(|arg| arg == "view")
                     && !self.read_failed.swap(true, Ordering::SeqCst)
                 {
-                    return Err(TrackerError::Other {
-                        kind: crate::factory::github::OtherKind::Failed,
-                        message: "`gh pr view` exited with status 1: HTTP 502: Bad Gateway".into(),
-                    });
+                    return Err(gh_failed(
+                        "pr view 12",
+                        Answer::fail(1, "HTTP 502: Bad Gateway"),
+                    ));
                 }
                 self.sim.gh(args)
             }
@@ -2348,10 +2344,10 @@ mod tests {
             fn gh(&self, args: &[String]) -> Result<String, TrackerError> {
                 if args.iter().any(|arg| arg == "--undo") {
                     self.0.set_pull(12, draft_on(BRANCH));
-                    return Err(TrackerError::Other {
-                        kind: crate::factory::github::OtherKind::Failed,
-                        message: "`gh pr ready` exited with status 1: HTTP 502: Bad Gateway".into(),
-                    });
+                    return Err(gh_failed(
+                        "pr ready 12 --undo",
+                        Answer::fail(1, "HTTP 502: Bad Gateway"),
+                    ));
                 }
                 self.0.gh(args)
             }
