@@ -1174,6 +1174,71 @@ mod tests {
         );
     }
 
+    /// A deleted session's turn is never looked at, so one this build cannot read is no failure.
+    #[test]
+    fn an_unreadable_turn_of_a_deleted_session_does_not_fail_the_read() {
+        let (dir, mut store) = open();
+        let a = machine(1);
+        store
+            .apply(
+                &AnyRecord::Session(session_record(a, 1, true, 20, 10, SessionState::Idle)),
+                a,
+            )
+            .unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("foundry.db")).unwrap();
+        conn.execute(
+            "INSERT INTO factory_records (kind, id, owner, version, record) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                "session_turn",
+                format!("{}/{a}", SessionId(id(20))),
+                a.to_string(),
+                1,
+                r#"{"kind":"printer"}"#
+            ],
+        )
+        .unwrap();
+        let view = FleetView::read(&store, BTreeSet::from([a]), BTreeMap::new()).unwrap();
+        assert_eq!(view.session_turn(SessionId(id(20))), None);
+    }
+
+    /// A holding keyed by a machine id spelt otherwise is a key no `held(machine)` names, so
+    /// the read leaves it out rather than failing.
+    #[test]
+    fn a_held_row_keyed_by_an_id_spelt_otherwise_does_not_fail_the_read() {
+        let (dir, mut store) = open();
+        let a = machine(0xab);
+        store
+            .apply(
+                &AnyRecord::Session(session_record(a, 1, false, 20, 10, SessionState::Idle)),
+                a,
+            )
+            .unwrap();
+        let record = FactoryRecord {
+            owner: a,
+            version: 1,
+            body: FactoryBody::Held(MachineHeld {
+                logins: vec!["bot".into()],
+                skill: true,
+            }),
+        };
+        let conn = rusqlite::Connection::open(dir.path().join("foundry.db")).unwrap();
+        conn.execute(
+            "INSERT INTO factory_records (kind, id, owner, version, record) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                "machine_held",
+                a.to_string().to_uppercase(),
+                a.to_string(),
+                1,
+                serde_json::to_string(&record).unwrap()
+            ],
+        )
+        .unwrap();
+        let view = FleetView::read(&store, BTreeSet::from([a]), BTreeMap::new()).unwrap();
+        assert!(view.held(a).is_none());
+    }
+
     /// The factory queries one `read` makes, for a fleet of `sessions` live sessions spread
     /// over three machines, each with a turn and each machine with a held record.
     fn queries_of_a_read(sessions: u128) -> usize {
