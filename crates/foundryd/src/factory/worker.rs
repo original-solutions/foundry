@@ -1266,19 +1266,13 @@ mod tests {
 
     #[test]
     fn a_factory_session_without_a_turn_ranks_like_any_other() {
-        let (factory, person) = (machine(1), machine(2));
+        // Every session of a workspace is written by the workspace's machine, so their versions
+        // compare. Session 20 is the factory's, with no turn yet; 23 is a person's.
+        let m = machine(1);
         let view = FleetView::builder()
-            .online(factory)
-            .online(person)
-            .session(session_record(
-                factory,
-                5,
-                false,
-                20,
-                10,
-                SessionState::Idle,
-            ))
-            .session(session_record(person, 6, false, 23, 10, SessionState::Idle))
+            .online(m)
+            .session(session_record(m, 5, false, 20, 10, SessionState::Idle))
+            .session(session_record(m, 6, false, 23, 10, SessionState::Idle))
             .build();
         let found = view.session_of(WorkspaceId(id(10))).unwrap();
         assert_eq!(found.body.id, SessionId(id(23)));
