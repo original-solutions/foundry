@@ -31,7 +31,7 @@ use std::fs::File;
 use std::io::{self, Read as _, Write as _};
 use std::net::SocketAddr;
 use std::os::fd::OwnedFd;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -45,12 +45,13 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse as _, Response};
 use axum::routing::post;
 use bytes::Bytes;
+use foundry_holder::protocol::Request as HolderRequest;
 use foundry_holder::pty::Pty;
 use foundry_proto::ids::{MachineId, ProjectId, SessionId, TerminalId, WorkspaceId};
 use foundry_proto::record::AnyRecord;
 use foundry_proto::state::SessionState;
 use foundryd::factory::messages::Message;
-use foundryd::secrets::{Edit, Secrets, SecretsError};
+use foundryd::secrets::{Edit, GITHUB_PREFIX, Secrets, SecretsError};
 use foundryd::sessions::factory::{BODY_PATH, FactoryStart};
 use foundryd::sessions::state::{Event, Hook, next_state};
 use foundryd::sessions::{Config, Gateway, Sessions, claude};
@@ -362,6 +363,8 @@ async fn a_factory_session_starts_unasked_and_keeps_its_whole_reply() {
         .prefix("fc")
         .tempdir_in("/tmp")
         .unwrap();
+    // Declared after `data`, so it is dropped first, while the sockets are still there.
+    let _holders = CloseHolders(data.path().join("terminals"));
     let worktree = tempfile::tempdir().unwrap();
     let worktree = worktree.path().canonicalize().unwrap();
 
@@ -421,7 +424,8 @@ async fn a_factory_session_starts_unasked_and_keeps_its_whole_reply() {
         "This is a check of the session, not a build. Run no tool after reading this file and \
          change no file. Reply with exactly {REPLY_LINES} lines and nothing else: no heading, \
          no blank line and no code fence. Line N, for N from 1 to {}, is `{}` with N written \
-         in digits. Line {REPLY_LINES} is `{RESULT_LINE}`.",
+         in digits. Line {REPLY_LINES} is exactly {RESULT_LINE} with nothing before or after \
+         it.",
         REPLY_LINES - 1,
         reply_line_with("N"),
     );
@@ -510,6 +514,7 @@ async fn a_factory_session_starts_unasked_and_keeps_its_whole_reply() {
         .join(id.to_string())
         .join("turns")
         .join("1.txt");
+    // The file the spec names, where `turn_text` reads it.
     assert_eq!(std::fs::read_to_string(&turn_file).unwrap(), kept);
     let reply = stop["last_assistant_message"]
         .as_str()
@@ -585,7 +590,7 @@ struct OneToken(Mutex<BTreeMap<String, String>>);
 
 impl OneToken {
     fn new(login: &str, token: &str) -> Self {
-        let held = BTreeMap::from([(format!("github:{login}"), token.to_string())]);
+        let held = BTreeMap::from([(format!("{GITHUB_PREFIX}{login}"), token.to_string())]);
         OneToken(Mutex::new(held))
     }
 }
@@ -613,6 +618,29 @@ impl Secrets for OneToken {
 
     fn names(&self) -> Result<Vec<String>, SecretsError> {
         Ok(self.0.lock().unwrap().keys().cloned().collect())
+    }
+
+    /// What `hide_known` reads. Without it the store cannot be listed, and `sessions` refuses
+    /// the first message's body and keeps no turn.
+    fn entries(&self) -> Result<BTreeMap<String, String>, SecretsError> {
+        Ok(self.0.lock().unwrap().clone())
+    }
+}
+
+/// On drop, asks every holder whose socket is in the terminals folder it holds to close, so a
+/// failed check leaves no holder or Claude Code running: a holder outlives its daemon.
+struct CloseHolders(PathBuf);
+
+impl Drop for CloseHolders {
+    fn drop(&mut self) {
+        let Ok(entries) = std::fs::read_dir(&self.0) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(entry.path()) {
+                let _ = stream.write_all(&HolderRequest::Close.encode());
+            }
+        }
     }
 }
 
