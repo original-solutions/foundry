@@ -90,6 +90,10 @@ pub const LAUNCH_ENDING_SESSIONS: &str = "launch-ending-sessions";
 pub const APPROVAL_RECHECKED: &str = "approval-rechecked";
 /// The ledger step written before the reminder is sent: `result-line-reminding <k>`, `k` the ordinal of the run that ended.
 pub const RESULT_LINE_REMINDING: &str = "result-line-reminding";
+/// The ledger step written last when a turn was acted on and the run goes on: `turn-read <n>`.
+/// A turn number only rises, so the newest one read since the session was launched is the
+/// highest.
+pub const TURN_READ: &str = "turn-read ";
 /// The ledger step written after the reminder was sent.
 pub const RESULT_LINE_REMINDED: &str = "result-line-reminded";
 /// The ledger step written once the resume of a `session_interrupted` line was sent: `interruption-sent <resumes>`.
@@ -321,6 +325,13 @@ pub struct Seen {
     /// entered `building`: the comment may be on the issue with no line yet.
     /// The id of the newest marked comment of the login when the step was written (0 if none).
     pub questions_commenting: Option<u64>,
+    /// A `questions-commenting` step follows the newest `session_launched` line (or there is
+    /// none): the questions comment was begun by the session on record. Unlike
+    /// `questions_commenting`, posting the questions or entering `building` does not clear it.
+    pub questions_intent_since_launch: bool,
+    /// The newest turn read since the session was launched: the highest `turn-read <n>` step
+    /// after the newest `session_launched` line, `n` written as [`canonical`] reads it.
+    pub turn_read: Option<u64>,
     /// The `stuck-commenting` step: the stuck comment may be on the issue with no `stuck` line.
     /// The id of the newest marked comment of the login when the step was written (0 if none).
     pub stuck_commenting: Option<u64>,
@@ -452,7 +463,7 @@ pub struct RunNames {
 }
 
 /// `text` when it is a number without a sign or leading zero.
-fn canonical(text: &str) -> Option<u32> {
+fn canonical<T: std::str::FromStr>(text: &str) -> Option<T> {
     let plain = !text.is_empty()
         && text.bytes().all(|b| b.is_ascii_digit())
         && (text == "0" || !text.starts_with('0'));
@@ -718,6 +729,16 @@ pub fn read_progress(events: &[RunEvent]) -> Seen {
                 if let Some(id) = commenting_id(step, QUESTIONS_COMMENTING) {
                     seen.questions_commenting = Some(id);
                 }
+                if step == QUESTIONS_COMMENTING
+                    || step
+                        .strip_prefix(QUESTIONS_COMMENTING)
+                        .is_some_and(|rest| rest.starts_with(' '))
+                {
+                    seen.questions_intent_since_launch = true;
+                }
+                if let Some(n) = step.strip_prefix(TURN_READ).and_then(canonical::<u64>) {
+                    seen.turn_read = Some(seen.turn_read.map_or(n, |read| read.max(n)));
+                }
                 if let Some(name) = step.strip_prefix(WORKSPACE_REQUESTED) {
                     seen.workspace_requested = Some(name.to_owned());
                     seen.workspace = None;
@@ -953,6 +974,8 @@ pub fn read_progress(events: &[RunEvent]) -> Seen {
                     seen.thread_id = Some(id.to_owned());
                 }
                 seen.sends.clear();
+                seen.turn_read = None;
+                seen.questions_intent_since_launch = false;
                 seen.worktree = text(data, "worktree").map(str::to_owned);
                 seen.worktree_done = false;
                 seen.launched_since_sending = true;
@@ -1645,6 +1668,125 @@ mod tests {
                 seen_of(&[intended, moved(2, "needs-info", "building")]).questions_commenting,
                 None
             );
+        }
+    }
+
+    mod the_turn_read {
+        use super::*;
+
+        fn read(steps: &[&str]) -> Option<u64> {
+            let lines: Vec<Line> = steps
+                .iter()
+                .zip(1..)
+                .map(|(text, ms)| step(ms, text))
+                .collect();
+            seen_of(&lines).turn_read
+        }
+
+        #[test]
+        fn is_the_step_text_the_building_pass_writes() {
+            assert_eq!(TURN_READ, "turn-read ");
+        }
+
+        #[test]
+        fn is_none_before_any_turn_is_read() {
+            assert_eq!(seen_of(&[]).turn_read, None);
+        }
+
+        #[test]
+        fn is_the_highest_turn_whatever_the_order() {
+            assert_eq!(read(&["turn-read 2", "turn-read 3"]), Some(3));
+            assert_eq!(read(&["turn-read 3", "turn-read 2"]), Some(3));
+            assert_eq!(read(&["turn-read 0"]), Some(0));
+        }
+
+        #[test]
+        fn starts_again_at_a_launch() {
+            let seen = seen_of(&[step(1, "turn-read 4"), launched(2)]);
+            assert_eq!(seen.turn_read, None);
+            let again = seen_of(&[step(1, "turn-read 4"), launched(2), step(3, "turn-read 1")]);
+            assert_eq!(again.turn_read, Some(1));
+        }
+
+        #[test]
+        fn starts_again_at_a_launch_that_names_no_thread() {
+            let bare = line(2, "session_launched", json!({}));
+            assert_eq!(seen_of(&[step(1, "turn-read 4"), bare]).turn_read, None);
+        }
+
+        #[test]
+        fn ignores_a_number_not_written_the_way_the_step_writes_it() {
+            for text in [
+                "turn-read 01",
+                "turn-read +1",
+                "turn-read x",
+                "turn-read ",
+                "turn-read",
+                "turn-read 1 ",
+                "turn-read -1",
+            ] {
+                assert_eq!(read(&[text]), None, "{text:?}");
+            }
+            assert_eq!(read(&["turn-read 2", "turn-read 01"]), Some(2));
+        }
+    }
+
+    mod the_questions_intent_and_the_launch {
+        use super::*;
+
+        fn since_launch(lines: &[Line]) -> bool {
+            seen_of(lines).questions_intent_since_launch
+        }
+
+        #[test]
+        fn is_false_with_no_intent() {
+            assert!(!since_launch(&[]));
+            assert!(!since_launch(&[launched(1)]));
+        }
+
+        #[test]
+        fn holds_for_an_intent_with_no_launch() {
+            assert!(since_launch(&[step(1, "questions-commenting 7")]));
+        }
+
+        #[test]
+        fn holds_for_an_intent_after_the_launch() {
+            assert!(since_launch(&[
+                launched(1),
+                step(2, "questions-commenting 7")
+            ]));
+        }
+
+        #[test]
+        fn ends_at_a_launch_after_the_intent() {
+            assert!(!since_launch(&[
+                step(1, "questions-commenting 7"),
+                launched(2)
+            ]));
+            assert!(since_launch(&[
+                step(1, "questions-commenting 7"),
+                launched(2),
+                step(3, "questions-commenting 8"),
+            ]));
+        }
+
+        #[test]
+        fn counts_a_bare_intent_and_one_with_an_id_that_is_not_a_number() {
+            assert!(since_launch(&[step(1, "questions-commenting")]));
+            assert!(since_launch(&[step(1, "questions-commenting x")]));
+            assert!(!since_launch(&[step(1, "questions-commentingx")]));
+        }
+
+        #[test]
+        fn is_not_cleared_by_posting_the_questions_or_entering_building() {
+            let intended = step(1, "questions-commenting 7");
+            let posted = line(2, "questions_posted", json!({"questions": "q"}));
+            let seen = seen_of(&[intended.clone(), posted]);
+            assert_eq!(seen.questions_commenting, None);
+            assert!(seen.questions_intent_since_launch);
+            let seen = seen_of(&[intended, moved(2, "needs-info", "building")]);
+            assert_eq!(seen.questions_commenting, None);
+            assert!(seen.questions_intent_since_launch);
         }
     }
 
