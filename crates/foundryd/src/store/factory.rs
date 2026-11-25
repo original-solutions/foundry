@@ -40,6 +40,27 @@ fn wrong_kind(kind: &str, body: &FactoryBody) -> StoreError {
     ))
 }
 
+/// The record in `json`, a row of `kind` keyed by `key`. When it cannot be read the error names
+/// `key` and the parse error, never the record.
+fn decode_row(kind: &str, key: &str, json: &str) -> Result<FactoryBody, StoreError> {
+    serde_json::from_str::<FactoryRecord>(json)
+        .map(|record| record.body)
+        .map_err(|e| {
+            StoreError::Json(<serde_json::Error as serde::de::Error>::custom(format!(
+                "the {kind} row of {key}: {e}"
+            )))
+        })
+}
+
+/// [`wrong_kind`], naming the row's `key` as well.
+fn wrong_kind_of(kind: &str, key: &str, body: &FactoryBody) -> StoreError {
+    StoreError::Sqlite(rusqlite::Error::FromSqlConversionFailure(
+        0,
+        Type::Text,
+        format!("the {kind} row of {key} holds a {} record", body.kind()).into(),
+    ))
+}
+
 /// The machine id `text` spells, only in the spelling this build writes one. `apply_factory`
 /// keys every record under its owner's id in that spelling, and the reads look an owner's rows
 /// up by it, so an id spelt otherwise (a newer build's or a damaged file's) names rows those
@@ -493,6 +514,71 @@ impl Store {
             Some(other) => Err(wrong_kind("session_turn", &other)),
             None => Ok(None),
         }
+    }
+
+    /// The newest turn of every session, each by the rule of [`session_turn`](Self::session_turn)
+    /// (the turn written by the machine that owns P1's record of the session), in one query. A
+    /// row whose session id cannot be read, whose record cannot be read or that holds another
+    /// kind of record is an error that names the session and holds nothing of the record.
+    pub fn session_turns(&self) -> Result<BTreeMap<SessionId, SessionTurn>, StoreError> {
+        queried::add();
+        let mut query = self.conn.prepare_cached(
+            "SELECT r.id, f.record FROM records r \
+             JOIN factory_records f ON f.kind = 'session_turn' AND f.id = r.id || '/' || r.owner \
+             WHERE r.kind = 'session'",
+        )?;
+        let rows = query.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut turns = BTreeMap::new();
+        for row in rows {
+            let (text, json) = row?;
+            let session = text.parse().map(SessionId).map_err(|e: uuid::Error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    Type::Text,
+                    format!("session {text}: an id this build cannot read: {e}").into(),
+                )
+            })?;
+            match decode_row("session_turn", &text, &json)? {
+                FactoryBody::Turn(turn) => {
+                    turns.insert(session, turn);
+                }
+                other => return Err(wrong_kind_of("session_turn", &text, &other)),
+            }
+        }
+        Ok(turns)
+    }
+
+    /// What every machine holds, each by the rule of [`held`](Self::held), in one query. A row
+    /// whose machine id, record or kind cannot be read is an error that names the machine and
+    /// holds nothing of the record.
+    pub fn helds(&self) -> Result<BTreeMap<MachineId, MachineHeld>, StoreError> {
+        queried::add();
+        let mut query = self
+            .conn
+            .prepare_cached("SELECT id, record FROM factory_records WHERE kind = 'machine_held'")?;
+        let rows = query.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut helds = BTreeMap::new();
+        for row in rows {
+            let (text, json) = row?;
+            let machine = parse_machine(0, &text).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    Type::Text,
+                    format!("machine {text}: {e}").into(),
+                )
+            })?;
+            match decode_row("machine_held", &text, &json)? {
+                FactoryBody::Held(held) => {
+                    helds.insert(machine, held);
+                }
+                other => return Err(wrong_kind_of("machine_held", &text, &other)),
+            }
+        }
+        Ok(helds)
     }
 
     fn factory_by_key(&self, kind: &str, id: &str) -> Result<Option<FactoryBody>, StoreError> {

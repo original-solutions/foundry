@@ -153,9 +153,11 @@ impl FleetView {
     /// would show its workspaces and sessions as never made, so a pass on it would be
     /// half-applied. Such a record is one a newer build wrote, and it stays until this machine
     /// runs a build that reads it, so every pass fails until then. A failed read of one
-    /// owner's records, one session's turn or one machine's holdings logs a warning that names
-    /// that owner, session or machine, with the store's error, which tells a record this build
-    /// cannot parse from a database error.
+    /// owner's records, the turns or the holdings logs a warning with the store's error, which
+    /// tells a record this build cannot parse from a database error and names the owner, the
+    /// session or the machine of the row. The turns and the holdings are one query each, so a
+    /// read makes the same number of them for any number of sessions; a turn is kept only for
+    /// a session in the view that is not deleted, a holding only for a machine that has records.
     pub fn read(
         store: &Store,
         online: BTreeSet<MachineId>,
@@ -182,23 +184,20 @@ impl FleetView {
                 }
             }
         }
+        // One read of every turn and one of every machine's holdings, whatever the fleet's size.
+        let mut turns = store.session_turns().inspect_err(|error| {
+            tracing::warn!("factory: reading the turns of the sessions failed: {error}");
+        })?;
         for session in builder.view.sessions.iter().filter(|r| !r.deleted) {
-            let id = session.body.id;
-            let turn = store.session_turn(id).inspect_err(|error| {
-                tracing::warn!(
-                    "factory: reading the turn of session {id} of {} failed: {error}",
-                    session.owner
-                );
-            })?;
-            if let Some(turn) = turn {
+            if let Some(turn) = turns.remove(&session.body.id) {
                 builder.view.turns.insert(session.body.id, turn);
             }
         }
+        let mut helds = store.helds().inspect_err(|error| {
+            tracing::warn!("factory: reading what the machines hold failed: {error}");
+        })?;
         for machine in machines {
-            let held = store.held(machine).inspect_err(|error| {
-                tracing::warn!("factory: reading what {machine} holds failed: {error}");
-            })?;
-            if let Some(held) = held {
+            if let Some(held) = helds.remove(&machine) {
                 builder.view.held.insert(machine, held);
             }
         }
