@@ -1082,7 +1082,17 @@ mod tests {
         /// Points the lease ref at a commit this lease did not make: it has a parent and a
         /// tree that is not empty. Returns the parent.
         fn write_foreign(&self, message: &str) -> String {
-            let blob = git_text(&self.path, &["hash-object", "-w", "--stdin"]);
+            self.write_foreign_with(message).0
+        }
+
+        /// As [`Remote::write_foreign`], and returns the parent, the tree and the blob, whose
+        /// content is known.
+        fn write_foreign_with(&self, message: &str) -> (String, String, String) {
+            let blob = git_stdin(
+                &self.path,
+                &["hash-object", "-w", "--stdin"],
+                "content of the foreign commit's file\n",
+            );
             let tree = git_stdin(
                 &self.path,
                 &["mktree"],
@@ -1098,7 +1108,7 @@ mod tests {
                 &["commit-tree", &tree, "-p", &parent, "-m", message],
             );
             git_text(&self.path, &["update-ref", REF, &sha]);
-            parent
+            (parent, tree, blob)
         }
 
         fn set_lease(&self, sha: &str) {
@@ -2044,20 +2054,101 @@ exec git "$@"
     }
 
     #[test]
-    fn a_commit_that_cannot_be_fetched_is_still_waited_for_and_taken_over() {
+    fn a_commit_that_cannot_be_fetched_is_never_taken_over_until_it_is_read() {
         let rig = Rig::new();
         let a = rig.machine();
         let b = rig.machine();
         assert_eq!(a.tick(0), held(1));
         let sha = rig.remote.sha();
         b.mark("fetchfail");
-        assert_eq!(reason_of(&b.tick(1)), NOT_FETCHED);
-        b.advance(millis(179_999));
-        assert_eq!(reason_of(&b.tick(1)), NOT_FETCHED);
-        assert_eq!(rig.remote.sha(), sha);
-        b.advance(millis(1));
-        assert_eq!(b.tick(1), held(2));
+        assert_eq!(reason_of(&b.tick(0)), NOT_FETCHED);
+        for step in [millis(179_999), millis(1), secs(220)] {
+            b.advance(step);
+            assert_eq!(reason_of(&b.tick(0)), NOT_FETCHED);
+            assert_eq!(rig.remote.sha(), sha);
+        }
+        // Healed at 400 s: the commit is read as A's at generation 1, unchanged for over
+        // 180 s, and taken at once at 2.
+        b.unmark("fetchfail");
+        assert_eq!(b.tick(0), held(2));
         assert_eq!(rig.remote.fields().holder, b.me.to_string());
+        assert_eq!(rig.remote.fields().generation, 2);
+    }
+
+    #[test]
+    fn a_commit_that_cannot_be_fetched_never_gets_a_generation_of_its_own_or_below() {
+        let rig = Rig::new();
+        let a = rig.machine();
+        let b = rig.machine();
+        assert_eq!(a.tick(4), held(5));
+        let sha = rig.remote.sha();
+        b.mark("fetchfail");
+        for step in [secs(0), secs(180), secs(220)] {
+            b.advance(step);
+            assert_eq!(reason_of(&b.tick(0)), NOT_FETCHED);
+            assert_eq!(rig.remote.sha(), sha);
+            assert_eq!(rig.remote.fields().generation, 5);
+        }
+        b.unmark("fetchfail");
+        assert_eq!(b.tick(0), held(6));
+    }
+
+    #[test]
+    fn a_foreign_commit_leaves_nothing_behind_and_is_not_fetched_again() {
+        let rig = Rig::new();
+        let b = rig.machine();
+        let (parent, tree, blob) = rig.remote.write_foreign_with("not a lease");
+        assert_eq!(reason_of(&b.tick(0)), NOT_WRITTEN);
+        for object in [&parent, &tree, &blob] {
+            let has = git_out(&b.dir, &["cat-file", "-e", object]);
+            assert!(!has.status.success(), "the lease directory holds {object}");
+        }
+        assert_eq!(
+            git_text(&b.dir, &["for-each-ref", "--format=%(refname)"]),
+            ""
+        );
+        b.advance(millis(179_999));
+        assert_eq!(reason_of(&b.tick(0)), NOT_WRITTEN);
+        b.advance(millis(1));
+        assert_eq!(b.tick(0), held(1));
+        let calls = fs::read_to_string(b.at("calls")).unwrap();
+        let fetches = calls
+            .lines()
+            .filter(|call| call.contains(" fetch "))
+            .count();
+        assert_eq!(fetches, 1, "{calls}");
+    }
+
+    #[test]
+    fn the_lease_directory_is_cleaned_of_what_renewals_leave_behind() {
+        let rig = Rig::new();
+        let a = rig.machine();
+        assert_eq!(a.tick(0), held(1));
+        // Enough loose objects to be over git's default threshold of 6700: it samples one of
+        // the 256 directories, so 40 in `objects/17` is over it.
+        let bucket = a.dir.join("objects/17");
+        fs::create_dir_all(&bucket).unwrap();
+        let junk: Vec<PathBuf> = (0..40).map(|n| bucket.join(format!("{n:038x}"))).collect();
+        for file in &junk {
+            fs::write(file, "junk").unwrap();
+        }
+        a.advance(secs(60));
+        assert_eq!(a.tick(0), held(1));
+        for file in &junk {
+            assert!(!file.exists(), "{} is still there", file.display());
+        }
+        // The current lease commit is kept: the local ref names it.
+        assert_eq!(git_text(&a.dir, &["rev-parse", REF]), rig.remote.sha());
+        let has = git_out(&a.dir, &["cat-file", "-e", &rig.remote.sha()]);
+        assert!(has.status.success());
+        // And the holder still renews without a fetch.
+        a.advance(secs(60));
+        assert_eq!(a.tick(0), held(1));
+        let calls = fs::read_to_string(a.at("calls")).unwrap();
+        assert!(
+            !calls.lines().any(|call| call.contains(" fetch ")),
+            "{calls}"
+        );
     }
 
     #[test]
