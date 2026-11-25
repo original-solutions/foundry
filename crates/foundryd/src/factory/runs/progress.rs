@@ -380,64 +380,842 @@ pub struct RunNames {
     pub prs: BTreeSet<u64>,
 }
 
+/// `text` when it is a number without a sign or leading zero.
+fn canonical(text: &str) -> Option<u32> {
+    let plain = !text.is_empty()
+        && text.bytes().all(|b| b.is_ascii_digit())
+        && (text == "0" || !text.starts_with('0'));
+    if plain { text.parse().ok() } else { None }
+}
+
+/// The `k` of a step written as `<name> <k>`, `k` a number without a sign or leading zero.
+fn step_number(step: &str, name: &str) -> Option<u32> {
+    canonical(step.strip_prefix(name)?.strip_prefix(' ')?)
+}
+
+/// The id in a `comment-dropped <id>` step, or `None` when it is not one plain token (empty, or
+/// with a space or control character).
+fn comment_dropped_id(step: &str) -> Option<&str> {
+    let id = step.strip_prefix(COMMENT_DROPPED)?.strip_prefix(' ')?;
+    if id.is_empty() || id.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        None
+    } else {
+        Some(id)
+    }
+}
+
+/// The `gate-sending <attempt> <ordinal>` step's numbers, or `None` for text that breaks the rules.
+fn parse_gate_sending(step: &str) -> Option<Sending> {
+    let rest = step.strip_prefix(GATE_SENDING)?.strip_prefix(' ')?;
+    let mut parts = rest.split(' ');
+    let (attempt, run_ordinal) = (parts.next()?, parts.next()?);
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(Sending {
+        attempt: canonical(attempt)?,
+        run_ordinal: canonical(run_ordinal)?,
+    })
+}
+
+/// The `gate-passed <sha> <n>` step's commit (lower case) and count, or `None` for text that
+/// breaks the rules.
+fn parse_gate_passed(step: &str) -> Option<(String, u32)> {
+    let rest = step.strip_prefix(GATE_PASSED)?.strip_prefix(' ')?;
+    let mut parts = rest.split(' ');
+    let (sha, count) = (parts.next()?, parts.next()?);
+    if parts.next().is_some() || !is_commit_id(sha) {
+        return None;
+    }
+    match canonical(count)? {
+        0 => None,
+        n => Some((sha.to_lowercase(), n)),
+    }
+}
+
+/// The item ids a feedback line names; anything but a string is not one.
+fn feedback_items(data: &Value) -> Vec<String> {
+    field(data, "items")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|id| id.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The number at `key` of an event's `data`; `None` when it is not a whole number that fits.
+fn number(data: &Value, key: &str) -> Option<u32> {
+    field(data, key)?
+        .as_u64()
+        .and_then(|n| u32::try_from(n).ok())
+}
+
+/// The text at `key` of a cause; `None` when there is no cause or it is not text.
+fn cause_text<'a>(cause: &'a Option<Value>, key: &str) -> Option<&'a str> {
+    cause.as_ref()?.get(key)?.as_str()
+}
+
+fn sent_interruption(interruption: Interruption) -> Interruption {
+    Interruption {
+        sent: true,
+        ..interruption
+    }
+}
+
+/// Whether the head moved since the pass (`passed_head` on `passed_against`): `Head`, or `Both`
+/// when the tip differs from `passed_against` too. `None` when no pass head is on record or the
+/// head did not move, whatever the base did.
 pub fn moved_since(
     passed_head: &str,
     passed_against: &str,
     head: &str,
     tip: &str,
 ) -> Option<Moved> {
-    let _ = (passed_head, passed_against, head, tip);
-    todo!()
+    if passed_head.is_empty() || head.eq_ignore_ascii_case(passed_head) {
+        return None;
+    }
+    let base_moved = !passed_against.is_empty() && !tip.eq_ignore_ascii_case(passed_against);
+    Some(if base_moved { Moved::Both } else { Moved::Head })
 }
 
+/// `seen` as the `gate-passed` step of a new pass leaves it: no read of the checks, since one in
+/// the ledger was about the pass before. For a pass recorded in this call, which `seen` predates.
 pub fn without_check_reads(seen: Seen) -> Seen {
-    let _ = seen;
-    todo!()
+    Seen {
+        checks_passed: None,
+        checks_failed: None,
+        checks_timed_out: None,
+        ..seen
+    }
 }
 
+/// The gate attempt a re-gate relaunch fixes; `None` for a feedback relaunch, which is no attempt.
 pub fn regate_attempt(relaunch: &Relaunch) -> Option<u32> {
-    let _ = relaunch;
-    todo!()
+    match relaunch.fixes {
+        Fixes::Regate { attempt } => Some(attempt),
+        Fixes::Feedback { .. } => None,
+    }
 }
 
+/// The command id of the launch: the same on every call, so a repeat is answered with the
+/// session it made. Spelled as the runner spells it.
 pub fn relaunch_command_id(relaunch: &Relaunch, run: &RunId) -> String {
-    let _ = (relaunch, run);
-    todo!()
+    match relaunch.fixes {
+        Fixes::Regate { attempt } => format!("softfac:{run}:regate:{attempt}"),
+        Fixes::Feedback { n } => format!("softfac:{run}:feedback:{n}"),
+    }
 }
 
+/// The pull request's branch when the run's session was launched to push there: to fix a failed
+/// re-gate of this run, for feedback, or to continue an earlier attempt's open pull request.
+/// `None` for a first launch, and for a session resumed from an earlier attempt's branch.
 pub fn regate_branch<'a>(seen: &'a Seen, run: &RunId) -> Option<&'a str> {
-    let _ = (seen, run);
-    todo!()
+    if seen.resumed_from_run.as_deref() == Some(run.to_string().as_str()) {
+        seen.resumed_from.as_deref()
+    } else {
+        None
+    }
 }
 
+/// A relaunch that was decided and whose session the ledger does not name: the launch may have
+/// reached the worker.
 pub fn pending_relaunch(seen: &Seen) -> Option<&Relaunch> {
-    let _ = seen;
-    todo!()
+    if seen.launched_since_sending {
+        None
+    } else {
+        seen.relaunch.as_ref()
+    }
 }
 
+/// A feedback relaunch whose session the ledger records and whose state change it does not: what
+/// is left of it is the transition.
 pub fn committing_feedback(seen: &Seen) -> Option<&Relaunch> {
-    let _ = seen;
-    todo!()
+    let relaunch = seen.relaunch.as_ref()?;
+    let feedback = matches!(relaunch.fixes, Fixes::Feedback { .. });
+    (feedback && seen.launched_since_sending && seen.state == Some(State::PrOpen))
+        .then_some(relaunch)
 }
 
+/// The wait markers of a run: the session is working until a run newer than `after` has ended.
+#[derive(Default)]
+struct Waits {
+    after: Option<u32>,
+    is_forward: bool,
+    last: Option<u32>,
+}
+
+impl Waits {
+    /// A wait marker names run `k`: the awaited ordinal never goes down.
+    fn await_run(&mut self, k: u32, forward: bool) {
+        if self.after.is_none_or(|after| k >= after) {
+            self.after = Some(k);
+            self.is_forward = forward;
+        }
+        self.last = Some(self.last.map_or(k, |last| last.max(k)));
+    }
+}
+
+/// The time a run has worked, counted in stints. A gate running, or the required checks being
+/// waited for, `hold`s the clock: the stint so far is added and nothing counts until the hold
+/// ends. Every span goes through [`elapsed_ms`], so a clock that stepped back adds nothing.
+#[derive(Default)]
+struct Worked {
+    ms: u64,
+    since: Option<u64>,
+    held: bool,
+}
+
+impl Worked {
+    /// Adds the stint that is running up to `at`, and stops counting.
+    fn stop(&mut self, at: u64) {
+        if let Some(since) = self.since.take() {
+            self.ms += elapsed_ms(since, at);
+        }
+    }
+
+    /// A gate began or the wait for checks began.
+    fn hold(&mut self, at: u64) {
+        self.stop(at);
+        self.held = true;
+    }
+}
+
+/// Whether time in `state` counts as worked.
+fn working(state: Option<State>) -> bool {
+    matches!(state, Some(State::Triage | State::Building))
+}
+
+/// What a run's events say of its progress. `events` are in the ledger's order: by lease
+/// generation, then by the writer's factory version, as [`Ledger::read`] gives them.
+///
+/// [`Ledger::read`]: crate::factory::ledger::Ledger::read
 pub fn read_progress(events: &[RunEvent]) -> Seen {
-    let _ = events;
-    todo!()
+    let mut seen = Seen::default();
+    let mut launch_pull_request: Option<(String, String)> = None;
+    let mut waits = Waits::default();
+    // The command ids sent under the idle marker with no outcome yet; `None` once a marker names none.
+    let mut idle_open: Option<BTreeSet<String>> = None;
+    let mut last_wait_before: Option<u32> = None;
+    let mut worked = Worked {
+        since: events.first().map(|event| event.ms),
+        ..Worked::default()
+    };
+    // The `gate_command` lines since the newest `gate_checkout`, newest last.
+    let mut command_run: Vec<CommandLine> = Vec::new();
+    let mut last_checkout: Option<(u32, String)> = None;
+
+    for event in events {
+        let data = &event.data;
+        let ms = event.ms;
+        match event.event.as_str() {
+            "claimed" => {
+                if !seen.claimed {
+                    seen.github_user = text(data, "github_user").map(str::to_owned);
+                    seen.claimed_ms = Some(ms);
+                }
+                seen.claimed = true;
+            }
+            names::STEP_CHANGED => {
+                let Some(step) = text(data, "step") else {
+                    continue;
+                };
+                if seen.approved_at.is_none()
+                    && let Some(at) = step.strip_prefix(APPROVED)
+                {
+                    seen.approved_at = Some(at.to_owned());
+                    seen.approved_by = cause_text(&event.cause, "actor")
+                        .filter(|actor| !actor.is_empty())
+                        .map(str::to_owned);
+                }
+                if step == APPROVAL_RECHECKED {
+                    seen.rechecked = true;
+                }
+                if step == RESULT_LINE_REMINDED {
+                    seen.reminded = true;
+                }
+                if step == GATE_RESULTS_POSTED {
+                    seen.results_posted = true;
+                    seen.regating = false;
+                    seen.regate_passed = false;
+                    seen.regate_sent_back = false;
+                }
+                if let Some(k) = step_number(step, RESULT_LINE_REMINDING) {
+                    seen.reminding = Some(k);
+                    waits.await_run(k, true);
+                }
+                if let Some(k) = step_number(step, AGENT_DIED_RESUMED) {
+                    waits.await_run(k, true);
+                }
+                let command = cause_text(&event.cause, "command");
+                if let Some(k) = step_number(step, FORWARD_WAIT) {
+                    // The same idle marker again is the next send under it.
+                    if seen.idle_forward_wait != Some(k) {
+                        last_wait_before = waits.last;
+                        seen.idle_forward_wait = Some(k);
+                        idle_open = Some(BTreeSet::new());
+                    }
+                    match command {
+                        Some(command) => {
+                            if let Some(open) = &mut idle_open {
+                                open.insert(command.to_owned());
+                            }
+                        }
+                        None => idle_open = None,
+                    }
+                    waits.await_run(k, true);
+                }
+                let refusal = [COMMENT_REFUSED, BODY_EDIT_REFUSED].iter().any(|name| {
+                    step.strip_prefix(name)
+                        .is_some_and(|rest| rest.starts_with(' '))
+                });
+                if let (Some(command), true, Some(open)) = (command, refusal, &mut idle_open) {
+                    open.remove(command);
+                }
+                if let Some(k) = step_number(step, FORWARD_WAIT_CANCELLED)
+                    && seen.idle_forward_wait == Some(k)
+                {
+                    if waits.is_forward && waits.after == Some(k) {
+                        waits.after = None;
+                        waits.is_forward = false;
+                    }
+                    waits.last = last_wait_before;
+                    seen.idle_forward_wait = None;
+                }
+                if let Some(k) = step_number(step, INTERRUPTION_SENT)
+                    && let Some(interruption) = seen.interruption.take()
+                {
+                    let this = !interruption.relaunch
+                        && !interruption.rate_limited
+                        && interruption.resumes == k;
+                    seen.interruption = Some(if this {
+                        sent_interruption(interruption)
+                    } else {
+                        interruption
+                    });
+                }
+                if let Some(k) = step_number(step, RATE_LIMITED_SENT)
+                    && let Some(interruption) = seen.interruption.take()
+                {
+                    let this = interruption.rate_limited && interruption.run_ordinal == Some(k);
+                    seen.interruption = Some(if this {
+                        sent_interruption(interruption)
+                    } else {
+                        interruption
+                    });
+                }
+                if let Some(at) = step
+                    .strip_prefix(BODY_EDIT_FORWARDED)
+                    .and_then(|rest| rest.strip_prefix(' '))
+                {
+                    seen.body_edits.insert(at.to_owned());
+                    seen.idle_forward_wait = None;
+                }
+                if let Some(at) = step
+                    .strip_prefix(BODY_EDIT_DROPPED)
+                    .and_then(|rest| rest.strip_prefix(' '))
+                {
+                    seen.body_edits.insert(at.to_owned());
+                }
+                if let Some(id) = comment_dropped_id(step) {
+                    seen.dropped.insert(id.to_owned());
+                }
+                if step == LAUNCH_SENDING {
+                    seen.launch_sent = true;
+                    seen.launch_resumed_from = None;
+                    seen.launch_resumed_pr = None;
+                    launch_pull_request = None;
+                } else if let Some(branch) = step.strip_prefix(LAUNCH_SENDING_RESUMED) {
+                    seen.launch_sent = true;
+                    seen.launch_resumed_from = Some(branch.to_owned());
+                    // Only the pull request decided with this branch: one from a decision a
+                    // crash cut short before its `launch-sending` step is not this one's.
+                    seen.launch_resumed_pr = match launch_pull_request.take() {
+                        Some((decided, url)) if decided == branch => Some(url),
+                        _ => None,
+                    };
+                } else if let Some(rest) = step.strip_prefix(LAUNCH_PULL_REQUEST) {
+                    // A branch name has no whitespace, so the first space splits the branch from the URL.
+                    launch_pull_request = rest
+                        .split_once(' ')
+                        .map(|(branch, url)| (branch.to_owned(), url.to_owned()));
+                } else if let Some(branch) = step.strip_prefix(LAUNCH_BASE) {
+                    seen.launch_base = Some(branch.to_owned());
+                } else if let Some(model) = step.strip_prefix(LAUNCH_MODEL) {
+                    seen.launch_model = Some(model.to_owned());
+                }
+                if let Some(sending) = parse_gate_sending(step) {
+                    seen.sending = Some(sending);
+                    seen.launched_since_sending = false;
+                }
+                if let Some((sha, count)) = parse_gate_passed(step) {
+                    // The wait for the required checks begins: it is the factory's.
+                    worked.hold(ms);
+                    // The results of this pass are not posted yet, whatever an earlier one's were.
+                    seen.results_posted = false;
+                    // A read of the checks is about the pass before it: this one's are read afresh.
+                    seen.checks_passed = None;
+                    seen.checks_failed = None;
+                    seen.checks_timed_out = None;
+                    seen.regate_passed = seen.regating;
+                    seen.regate_pass_reassert =
+                        cause_text(&event.cause, "reason") != Some(GATE_PASSED_CLEAN);
+                    // The step's own cause names the attempt; a ledger from before it did is
+                    // read by the last command.
+                    let from_cause = event
+                        .cause
+                        .as_ref()
+                        .and_then(|cause| number(cause, "attempt"));
+                    let attempt = from_cause.or_else(|| command_run.last().map(|c| c.attempt));
+                    if let Some(attempt) = attempt {
+                        seen.passed_attempts.insert(attempt);
+                        let base_sha = match &last_checkout {
+                            Some((checked, base)) if *checked == attempt => base.clone(),
+                            _ => String::new(),
+                        };
+                        seen.pass = Some(PassRecord {
+                            attempt,
+                            sha,
+                            base_sha,
+                            at_ms: ms,
+                            lines: command_run
+                                .iter()
+                                .filter(|line| line.attempt == attempt)
+                                .cloned()
+                                .collect(),
+                            count,
+                        });
+                    }
+                }
+            }
+            names::STATE_CHANGED => {
+                let to = text(data, "to");
+                worked.stop(ms);
+                worked.held = false;
+                // A pull request that was ready and comes back to building starts a new stint:
+                // the build before it was ready came within the limit and is not charged again.
+                if seen.state == Some(State::PrOpen) && to == Some(State::Building.name()) {
+                    worked.ms = 0;
+                }
+                if matches!(to, Some("triage" | "building")) {
+                    worked.since = Some(ms);
+                }
+                // The first time here since the last feedback relaunch: the moment of the pass
+                // that took the run here, else of this line.
+                if to == Some(State::PrOpen.name()) && seen.pr_open_since.is_none() {
+                    seen.pr_open_since = Some(seen.pass.as_ref().map_or(ms, |pass| pass.at_ms));
+                }
+                seen.state = to.and_then(State::from_name);
+                seen.relaunch = None;
+                seen.regating = false;
+                seen.regate_passed = false;
+                seen.regate_sent_back = false;
+                if to == Some(State::Building.name()) {
+                    seen.questions_posted = false;
+                    seen.pr_reported = false;
+                    // A run that comes back to `building` has no pass: its gate failed again on
+                    // a moved base, and the session has to finish a new run for it to be decided.
+                    seen.pass = None;
+                }
+            }
+            names::SESSION_LAUNCHED => {
+                if let Some(id) = text(data, "thread_id") {
+                    seen.thread_id = Some(id.to_owned());
+                }
+                seen.worktree = text(data, "worktree").map(str::to_owned);
+                seen.worktree_done = false;
+                seen.launched_since_sending = true;
+                let from = field(data, "resumed_from").unwrap_or(&Value::Null);
+                seen.resumed_from = text(from, "branch").map(str::to_owned);
+                seen.resumed_from_run = text(from, "run").map(str::to_owned);
+                if let Some(branch) = text(data, "branch") {
+                    seen.last_branch = Some(branch.to_owned());
+                }
+                if let Some(base) = text(data, "base") {
+                    seen.base = Some(base.to_owned());
+                }
+                seen.model = match (text(data, "model_instance"), text(data, "model")) {
+                    (Some(instance_id), Some(model)) => Some(Model {
+                        instance_id: instance_id.to_owned(),
+                        model: model.to_owned(),
+                        options: field(data, "model_options")
+                            .and_then(|options| serde_json::from_value(options.clone()).ok()),
+                    }),
+                    _ => None,
+                };
+                // A resume owed to the old thread is not owed to this one.
+                seen.interruption = seen.interruption.take().map(sent_interruption);
+                // A new session has run numbers of its own, one reminder, and no stop by hand yet.
+                waits = Waits::default();
+                seen.idle_forward_wait = None;
+                last_wait_before = None;
+                seen.reminding = None;
+                seen.reminded = false;
+                seen.paused = None;
+            }
+            "worktree_removed" | "worktree_remove_failed" => seen.worktree_done = true,
+            names::STUCK => {
+                seen.stuck = Some(text(data, "reason").unwrap_or_default().to_owned());
+            }
+            "stop_requested" => seen.stop_requested = true,
+            "comment_forwarded" => {
+                if let Some(id) = text(data, "comment_id") {
+                    seen.forwarded.insert(id.to_owned());
+                }
+                seen.idle_forward_wait = None;
+            }
+            names::QUESTIONS_POSTED => seen.questions_posted = true,
+            names::PR_OPENED => {
+                if let (Some(pr), Some(url)) =
+                    (field(data, "pr").and_then(Value::as_u64), text(data, "url"))
+                {
+                    if !seen.opened.contains(&pr) {
+                        seen.opened.push(pr);
+                    }
+                    seen.last_pr = Some(PullRequest {
+                        pr,
+                        url: url.to_owned(),
+                    });
+                    seen.pr_reported = true;
+                    // The clock goes on: unlike the runner, a reported pull request does not
+                    // stop it. Only a gate that runs or checks that are waited for do.
+                }
+            }
+            "pr_left" => {
+                if let (Some(pr), Some(url)) =
+                    (field(data, "pr").and_then(Value::as_u64), text(data, "url"))
+                {
+                    seen.left.push(PullRequest {
+                        pr,
+                        url: url.to_owned(),
+                    });
+                }
+            }
+            "pr_ready_outside" => seen.ready_outside = true,
+            "branch_bound" => {
+                if let Some(branch) = text(data, "branch")
+                    && !seen.bound_branches.iter().any(|bound| bound == branch)
+                {
+                    seen.bound_branches.push(branch.to_owned());
+                }
+            }
+            "session_interrupted" => {
+                let resumes = number(data, "resumes");
+                let ordinal = number(data, "run_ordinal");
+                let branch = text(data, "branch");
+                if let Some(branch) = branch {
+                    seen.last_branch = Some(branch.to_owned());
+                }
+                let Some(resumes) = resumes else {
+                    continue;
+                };
+                let relaunch = field(data, "relaunch") == Some(&Value::Bool(true));
+                seen.interruption = Some(Interruption {
+                    resumes,
+                    relaunch,
+                    run_ordinal: ordinal,
+                    branch: branch.map(str::to_owned),
+                    sent: false,
+                    rate_limited: false,
+                    model: None,
+                });
+                // The resume starts a new run: the session is working until one newer than the
+                // run that ended has ended. Like a forward's, only a newer run drops the wait.
+                if let (false, Some(ordinal)) = (relaunch, ordinal) {
+                    waits.await_run(ordinal, true);
+                }
+            }
+            "session_rate_limited" => {
+                let resumes = number(data, "resumes");
+                let ordinal = number(data, "run_ordinal");
+                let branch = text(data, "branch");
+                if let Some(branch) = branch {
+                    seen.last_branch = Some(branch.to_owned());
+                }
+                let (Some(resumes), Some(ordinal)) = (resumes, ordinal) else {
+                    continue;
+                };
+                let moved_to = text(data, "model").map(str::to_owned);
+                seen.interruption = Some(Interruption {
+                    resumes,
+                    relaunch: false,
+                    run_ordinal: Some(ordinal),
+                    branch: branch.map(str::to_owned),
+                    sent: false,
+                    rate_limited: true,
+                    model: moved_to.clone(),
+                });
+                if let (Some(to), Some(model)) = (moved_to, &mut seen.model) {
+                    // The same instance and options, on the model id moved to.
+                    model.model = to;
+                }
+                waits.await_run(ordinal, true);
+            }
+            "session_paused" => {
+                seen.paused = Some(Paused {
+                    run_ordinal: number(data, "run_ordinal"),
+                });
+            }
+            "gate_checkout" => {
+                let Some(attempt) = number(data, "attempt") else {
+                    continue;
+                };
+                // A gate runs: the time is the factory's, not the session's.
+                worked.hold(ms);
+                // A new run of commands begins at its checkout: the attempt is open again.
+                seen.passed_attempts.remove(&attempt);
+                command_run.clear();
+                last_checkout = Some((
+                    attempt,
+                    text(data, "base_sha").unwrap_or_default().to_owned(),
+                ));
+            }
+            names::GATE_COMMAND => {
+                let Some(attempt) = number(data, "attempt") else {
+                    continue;
+                };
+                seen.command_attempts.insert(attempt);
+                if !waits.is_forward {
+                    waits.after = None;
+                }
+                let command = text(data, "command");
+                let exit_code = field(data, "exit_code").and_then(Value::as_i64);
+                let duration_ms = field(data, "duration_ms").and_then(Value::as_u64);
+                if let (Some(command), Some(exit_code), Some(duration_ms)) =
+                    (command, exit_code, duration_ms)
+                {
+                    command_run.push(CommandLine {
+                        attempt,
+                        command: command.to_owned(),
+                        exit_code,
+                        duration_ms,
+                    });
+                }
+            }
+            names::GATE_SENT_BACK => {
+                let attempt = number(data, "attempt");
+                let ordinal = number(data, "run_ordinal");
+                if let Some(attempt) = attempt {
+                    seen.sent_back_attempts.insert(attempt);
+                    seen.passed_attempts.remove(&attempt);
+                }
+                seen.regate_sent_back = seen.regating;
+                if let Some(ordinal) = ordinal {
+                    waits.await_run(ordinal, false);
+                }
+                // A pass that was sent back is no pass: the session runs again and the head is
+                // gated afresh.
+                seen.pass = None;
+                // The session is at work again: the run is a building run with no pull request
+                // reported until the session reports it again, so it is time-limited, watched
+                // and read.
+                seen.pr_reported = false;
+                // The stint the gate paused begins again; a run that is not building waits for
+                // its next state change to decide. A clock already running keeps the time it
+                // counted.
+                if working(seen.state) {
+                    worked.stop(ms);
+                    worked.since = Some(ms);
+                }
+                worked.held = false;
+            }
+            "gate_regate" => {
+                let sha = text(data, "sha").unwrap_or_default();
+                let base_sha = text(data, "base_sha").unwrap_or_default();
+                let previous = text(data, "previous_base_sha").unwrap_or_default();
+                // The pass this re-gate replaces is still the one on record here. With the head
+                // where the pass left it, a conflict GitHub reported is the trigger the line
+                // names; a line without one was written before a moved base stopped starting a
+                // gate, and its trigger is unknown.
+                let head_moved = moved_since(
+                    seen.pass.as_ref().map_or("", |pass| pass.sha.as_str()),
+                    previous,
+                    sha,
+                    base_sha,
+                );
+                seen.regate_moved = head_moved.or(if seen.pass.is_none() {
+                    None
+                } else if field(data, "conflict") == Some(&Value::Bool(true)) {
+                    Some(Moved::Conflict)
+                } else {
+                    Some(Moved::Earlier)
+                });
+                seen.regating = true;
+                seen.regate_passed = false;
+                seen.regate_sent_back = false;
+            }
+            names::CHECKS_READ => {
+                let sha = text(data, "sha");
+                let checks = field(data, "checks").and_then(Value::as_array);
+                let (Some(sha), Some(checks)) = (sha, checks) else {
+                    seen.checks_passed = None;
+                    continue;
+                };
+                let state_of = |check: &Value| text(check, "state").map(str::to_owned);
+                let is = |check: &Value, state: &str| state_of(check).as_deref() == Some(state);
+                seen.checks_passed = (!checks.is_empty()
+                    && checks.iter().all(|check| is(check, "passed")))
+                .then(|| sha.to_lowercase());
+                let failed: Vec<CheckStatus> = checks
+                    .iter()
+                    .filter(|check| is(check, "failed"))
+                    .filter_map(|check| text(check, "name"))
+                    .map(|name| CheckStatus {
+                        name: name.to_owned(),
+                        state: CheckState::Failed,
+                        // The line records no result or link.
+                        conclusion: String::new(),
+                        url: None,
+                    })
+                    .collect();
+                if !failed.is_empty() {
+                    seen.checks_failed = Some(ChecksFailed {
+                        sha: sha.to_lowercase(),
+                        failed,
+                    });
+                } else if cause_text(&event.cause, "reason") == Some(CHECKS_TIMED_OUT) {
+                    seen.checks_timed_out = Some(ChecksTimedOut {
+                        sha: sha.to_lowercase(),
+                        missing: checks.iter().any(|check| is(check, "missing")),
+                    });
+                }
+            }
+            "regate_relaunching" => {
+                let (Some(attempt), Some(branch), Some(message)) = (
+                    number(data, "attempt"),
+                    text(data, "branch"),
+                    text(data, "message"),
+                ) else {
+                    continue;
+                };
+                // Its own `gate-sending <attempt> 0`: the new session has no run yet.
+                seen.sending = Some(Sending {
+                    attempt,
+                    run_ordinal: 0,
+                });
+                seen.launched_since_sending = false;
+                seen.relaunch = Some(Relaunch {
+                    fixes: Fixes::Regate { attempt },
+                    branch: branch.to_owned(),
+                    message: message.to_owned(),
+                });
+            }
+            // No `gate-sending`: it is no gate attempt, and no re-gate. Read only so that a
+            // feedback relaunch that is decided and not committed is never gated meanwhile.
+            "feedback_relaunching" => {
+                let (Some(n), Some(branch), Some(message)) = (
+                    number(data, "n"),
+                    text(data, "branch"),
+                    text(data, "message"),
+                ) else {
+                    continue;
+                };
+                seen.launched_since_sending = false;
+                seen.relaunch = Some(Relaunch {
+                    fixes: Fixes::Feedback { n },
+                    branch: branch.to_owned(),
+                    message: message.to_owned(),
+                });
+                seen.pr_open_since = None;
+                let items = feedback_items(data);
+                seen.feedback_last_items = items.len();
+                seen.feedback_sent.extend(items);
+                seen.feedback_relaunches = seen.feedback_relaunches.max(n);
+            }
+            "feedback_forwarding" => seen.feedback_sent.extend(feedback_items(data)),
+            "gate_cleanup_failed" => {
+                if let Some(dir) = text(data, "dir") {
+                    seen.cleanup_failed.insert(dir.to_owned());
+                }
+            }
+            names::FINISHED => {
+                seen.finished = true;
+                worked.since = None;
+            }
+            _ => {}
+        }
+    }
+    seen.waiting_after = waits.after;
+    seen.last_wait = waits.last;
+    seen.refused_forward_wait = match (seen.idle_forward_wait, &idle_open) {
+        (Some(k), Some(open)) if open.is_empty() => Some(k),
+        _ => None,
+    };
+    seen.worked_ms = worked.ms;
+    seen.working_since = worked.since;
+    seen
 }
 
+/// The number of the gate attempt to make now: one more than the attempts so far, except that an
+/// attempt with commands in the ledger that was never sent back and never passed died half way,
+/// and is made again under the same number. A passed attempt is closed.
 pub fn next_gate_attempt(seen: &Seen) -> u32 {
-    let _ = seen;
-    todo!()
+    let all: BTreeSet<u32> = seen
+        .command_attempts
+        .union(&seen.sent_back_attempts)
+        .copied()
+        .collect();
+    if let Some(&last) = all.last()
+        && seen.command_attempts.contains(&last)
+        && !seen.sent_back_attempts.contains(&last)
+        && !seen.passed_attempts.contains(&last)
+    {
+        return last;
+    }
+    u32::try_from(all.len())
+        .unwrap_or(u32::MAX)
+        .saturating_add(1)
 }
 
+/// How many attempts, `attempt` included, there have been since the last pass before it: the
+/// attempts the retry budget counts.
 pub fn attempts_since_pass(seen: &Seen, attempt: u32) -> u32 {
-    let _ = (seen, attempt);
-    todo!()
+    let last_pass = seen
+        .passed_attempts
+        .iter()
+        .copied()
+        .filter(|passed| *passed < attempt)
+        .max()
+        .unwrap_or(0);
+    attempt - last_pass
 }
 
+/// Every branch and pull request any line of a run's ledger names as its work, not only the
+/// newest: a launch (its branch and resumed-from branch), a planned resume, a stuck line, an
+/// interruption, a relaunch, a bound branch, and a pull request opened or left.
 pub fn run_names(events: &[RunEvent], seen: &Seen) -> RunNames {
-    let _ = (events, seen);
-    todo!()
+    let mut names = RunNames::default();
+    // A planned resume is a step, not a line of its own.
+    names.branches.extend(seen.launch_resumed_from.clone());
+    for event in events {
+        let data = &event.data;
+        let mut add = |branch: Option<&str>| {
+            if let Some(branch) = branch {
+                names.branches.insert(branch.to_owned());
+            }
+        };
+        match event.event.as_str() {
+            names::SESSION_LAUNCHED => {
+                add(text(data, "branch"));
+                add(field(data, "resumed_from").and_then(|from| text(from, "branch")));
+            }
+            names::STUCK
+            | "session_interrupted"
+            | "session_rate_limited"
+            | "branch_bound"
+            | "regate_relaunching"
+            | "feedback_relaunching" => add(text(data, "branch")),
+            names::PR_OPENED | "pr_left" => {
+                if let Some(pr) = field(data, "pr").and_then(Value::as_u64) {
+                    names.prs.insert(pr);
+                }
+            }
+            _ => {}
+        }
+    }
+    names
 }
 
 #[cfg(test)]
@@ -617,7 +1395,7 @@ mod tests {
         #[test]
         fn is_reported_from_pr_opened_until_the_run_is_building_again() {
             let opened = line(1, "pr_opened", json!({"pr": 12, "url": URL}));
-            assert!(seen_of(&[opened.clone()]).pr_reported);
+            assert!(seen_of(std::slice::from_ref(&opened)).pr_reported);
             assert!(seen_of(&[opened.clone(), moved(2, "building", "pr-open")]).pr_reported);
             assert!(
                 !seen_of(&[
@@ -636,7 +1414,7 @@ mod tests {
         #[test]
         fn are_posted_from_questions_posted_until_the_run_is_building_again() {
             let posted = line(1, "questions_posted", json!({"questions": "q"}));
-            assert!(seen_of(&[posted.clone()]).questions_posted);
+            assert!(seen_of(std::slice::from_ref(&posted)).questions_posted);
             assert!(
                 !seen_of(&[posted.clone(), moved(2, "needs-info", "building")]).questions_posted
             );
@@ -750,7 +1528,7 @@ mod tests {
         fn is_requested_from_the_stop_requested_line_on_whatever_follows() {
             assert!(!seen_of(&[]).stop_requested);
             let requested = line(1, "stop_requested", json!({"by": "operator"}));
-            assert!(seen_of(&[requested.clone()]).stop_requested);
+            assert!(seen_of(std::slice::from_ref(&requested)).stop_requested);
             assert!(
                 seen_of(&[
                     requested,
@@ -1079,7 +1857,7 @@ mod tests {
             assert_eq!(seen.state, Some(State::NeedsInfo));
             let order = seen_of(&[
                 line(9 * MINUTE, "pr_opened", json!({"pr": 14, "url": "u"})),
-                line(1 * MINUTE, "pr_opened", json!({"pr": 12, "url": "v"})),
+                line(MINUTE, "pr_opened", json!({"pr": 12, "url": "v"})),
             ]);
             assert_eq!(order.opened, [14, 12]);
             assert_eq!(
@@ -1773,7 +2551,7 @@ mod tests {
             let mixed = checks_read(1, &[("gate", "passed"), ("lint", "failed")]);
             let all_passed = checks_read(2, &[("gate", "passed"), ("lint", "passed")]);
             let later_mixed = checks_read(3, &[("gate", "passed"), ("lint", "pending")]);
-            assert_eq!(seen_of(&[mixed.clone()]).checks_passed, None);
+            assert_eq!(seen_of(std::slice::from_ref(&mixed)).checks_passed, None);
             assert_eq!(
                 seen_of(&[mixed.clone(), all_passed.clone()]).checks_passed,
                 Some(SHA.to_lowercase())
@@ -1812,7 +2590,7 @@ mod tests {
                 failed: vec![failed_check("gate"), failed_check("docs")],
             };
             assert_eq!(
-                seen_of(&[failing.clone()]).checks_failed,
+                seen_of(std::slice::from_ref(&failing)).checks_failed,
                 Some(want.clone())
             );
             let later_passed = checks_read(
