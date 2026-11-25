@@ -3128,7 +3128,7 @@ mod tests {
                     .into_iter()
                     .find(|e| e.event == "stuck")
                     .unwrap();
-                assert_eq!(stuck.cause.unwrap()["reason"], "launch-failed");
+                assert_eq!(stuck.cause.unwrap()["reason"], "resume-launch-failed");
                 assert!(
                     rig.steps(&run)
                         .iter()
@@ -4980,6 +4980,34 @@ mod tests {
             assert!(rig.finished(&run));
         }
 
+        /// Every session ended through the worker was of the resume workspace, never the old,
+        /// archived one.
+        fn ended_only_the_resume_workspace(rig: &Rig) {
+            let ended: Vec<WorkspaceId> = rig
+                .worker
+                .calls()
+                .into_iter()
+                .filter_map(|call| match call {
+                    Call::EndSessions { workspace } => Some(workspace),
+                    _ => None,
+                })
+                .collect();
+            assert!(!ended.is_empty());
+            assert!(
+                ended.iter().all(|workspace| *workspace == fresh()),
+                "{ended:?}"
+            );
+        }
+
+        /// The stuck event's reason, which keeps the detail the ledger holds.
+        fn stuck_reason(rig: &Rig, run: &RunId) -> String {
+            rig.events(run)
+                .into_iter()
+                .find(|e| e.event == "stuck")
+                .and_then(|e| e.data["reason"].as_str().map(str::to_owned))
+                .unwrap()
+        }
+
         // blind-reader-6: a stuck path resume began is finished by resume, from the ledger.
 
         /// Runs `pass` with the stuck comment failing once: the path is begun and cut short,
@@ -5015,6 +5043,7 @@ mod tests {
             rig.worker.on_tail(Ok("npm ERR! missing script".into()));
             cut_short_then_finished(&rig, &run, crate::factory::runs::start::SETUP_FAILED);
             assert!(the_stuck_comment(&rig).contains("npm ERR! missing script"));
+            ended_only_the_resume_workspace(&rig);
         }
 
         #[test]
@@ -5022,6 +5051,7 @@ mod tests {
             let (rig, run) = at_the_start();
             rig.sim.set_approval(a_stranger_edited_the_text());
             cut_short_then_finished(&rig, &run, messages::CHANGED_DURING_BUILD);
+            ended_only_the_resume_workspace(&rig);
         }
 
         #[test]
@@ -5029,6 +5059,7 @@ mod tests {
             let (rig, run) = at_the_start();
             rig.sim.set_approval(a_history_that_cannot_be_judged());
             cut_short_then_finished(&rig, &run, messages::CANNOT_VERIFY_DURING_BUILD);
+            ended_only_the_resume_workspace(&rig);
         }
 
         #[test]
@@ -5037,13 +5068,23 @@ mod tests {
             rig.worker
                 .on_start_session(Err(WorkerError::Failed("no model".into())));
             cut_short_then_finished(&rig, &run, LAUNCH_FAILED);
+            ended_only_the_resume_workspace(&rig);
+            // The worker's own words are kept for the ledger.
+            assert!(stuck_reason(&rig, &run).contains("no model"));
         }
 
         #[test]
         fn a_stuck_path_cut_short_at_the_cap_is_finished() {
             let (mut rig, run) = interrupted();
             rig.config.limits.interruption_resumes = 0;
+            // The session's last words, which the stuck comment quotes, are read again.
+            rig.view = fleet(Some(SessionState::Failed))
+                .turn(turn_of(session(), old(), 1, 1))
+                .build();
+            say(&rig, "it crashed at the linker");
+            say(&rig, "it crashed at the linker");
             cut_short_then_finished(&rig, &run, "the session run ended as failed");
+            assert!(the_stuck_comment(&rig).contains("it crashed at the linker"));
         }
 
         #[test]
@@ -5059,6 +5100,7 @@ mod tests {
             );
             rig.sim.set_pull(12, pr_on("-x", false));
             cut_short_then_finished(&rig, &run, LAUNCH_FAILED);
+            assert!(stuck_reason(&rig, &run).contains(BRANCH_REFUSED));
         }
 
         // blind-reader-7: a decision made because the machine was gone never asks it.
@@ -5102,7 +5144,13 @@ mod tests {
                 placed_on(&rig, &run, m2()),
                 ResumeStep::Waiting(Wait::Workspace)
             );
-            assert!(resume_steps(&rig, &run).contains(&format!("resume-machine 1 {}", m2())));
+            let machine_steps = resume_steps(&rig, &run)
+                .into_iter()
+                .filter(|step| *step == format!("resume-machine 1 {}", m2()))
+                .count();
+            assert_eq!(machine_steps, 2);
+            // Its earlier workspace of the name was found: no second create.
+            assert_eq!(create_calls(&rig).len(), 1);
         }
 
         #[test]
@@ -5169,6 +5217,196 @@ mod tests {
                 .unreachable(m2(), secs(15 * 60))
                 .build();
             let before = event_count(&rig, &run);
+            assert!(is_skipped(&pass(&rig, &run)));
+            assert_eq!(event_count(&rig, &run), before);
+        }
+
+        // C1, testing-14: a decision made on a gone machine never asks it, whatever its code.
+
+        #[test]
+        fn a_cut_short_path_of_another_code_on_a_gone_machine_is_finished_without_asking_it() {
+            let mut rig = Rig::new();
+            let run = run_id(1);
+            // No approval is recorded, so the decision is `resume-approval-unconfirmed`.
+            rig.write(
+                &run,
+                Event::Claimed {
+                    machine: m1().to_string(),
+                    github_user: LOGIN.into(),
+                },
+            );
+            rig.moved(&run, State::Ready, State::Triage);
+            rig.step(&run, "approval-rechecked");
+            rig.write(&run, launch(Some(BRANCH), Some("main")));
+            rig.moved(&run, State::Triage, State::Building);
+            rig.sim.set_labels(&["factory:building"]);
+            rig.sim.set_assignees(&[LOGIN]);
+            rig.view = cut_off(secs(15 * 60));
+            rig.worker
+                .on_end_sessions(Err(WorkerError::Unreachable("gone".into())));
+            cut_short_then_finished(&rig, &run, messages::CANNOT_CONFIRM);
+            assert!(
+                rig.worker
+                    .calls()
+                    .iter()
+                    .all(|call| !matches!(call, Call::EndSessions { .. }))
+            );
+        }
+
+        // C2: every cut point of a stuck path while a resume is owed.
+
+        #[test]
+        fn a_lone_stuck_detail_is_no_decision_and_the_resume_goes_on() {
+            let (mut rig, run) = archived_and_waiting_for_a_machine();
+            rig.step(&run, "stuck-detail no model");
+            rig.worker.on_create(Ok(fresh()));
+            assert_eq!(
+                placed_on(&rig, &run, m2()),
+                ResumeStep::Waiting(Wait::Workspace)
+            );
+            rig.view = with_resume_workspace("fac/8-1-r1", None).build();
+            assert!(matches!(
+                resumed(&mut rig, &run),
+                ResumeStep::Started { .. }
+            ));
+            // Launched, a later interruption is read: the lone detail does not skip the run.
+            rig.view = with_resume_workspace("fac/8-1-r1", None)
+                .session(session_record(
+                    resumed_session(),
+                    fresh(),
+                    SessionState::Failed,
+                ))
+                .build();
+            assert!(matches!(
+                pass(&rig, &run),
+                ResumeStep::Archiving { resumes: 2, .. }
+            ));
+        }
+
+        #[test]
+        fn a_lone_stuck_detail_with_no_resume_owed_is_decided_again() {
+            let (rig, run) = interrupted();
+            rig.step(&run, "stuck-detail no model");
+            pass_one(&rig, &run);
+        }
+
+        #[test]
+        fn a_stuck_path_cut_short_after_its_state_change_is_finished_while_a_resume_is_owed() {
+            let (rig, run) = archived_and_waiting_for_a_machine();
+            rig.step(
+                &run,
+                "stuck-stop {\"code\":\"resume-setup-failed\",\"stop\":{\"reason\":\"the build workspace's setup failed\"}}",
+            );
+            rig.write(
+                &run,
+                Event::Stuck {
+                    reason: "the build workspace's setup failed".into(),
+                    branch: None,
+                    commits_ahead: None,
+                },
+            );
+            rig.moved(&run, State::Building, State::Stuck);
+            assert!(!rig.finished(&run));
+            assert!(matches!(pass(&rig, &run), ResumeStep::Stuck { .. }));
+            assert!(rig.finished(&run));
+            assert!(create_calls(&rig).is_empty());
+        }
+
+        #[test]
+        fn a_stuck_path_cut_short_after_its_state_change_is_finished_when_none_is_owed() {
+            let (rig, run) = interrupted();
+            rig.step(
+                &run,
+                "stuck-stop {\"code\":\"session-ended-badly\",\"stop\":{\"reason\":\"the session run ended as failed\"}}",
+            );
+            rig.write(
+                &run,
+                Event::Stuck {
+                    reason: "the session run ended as failed".into(),
+                    branch: None,
+                    commits_ahead: None,
+                },
+            );
+            rig.moved(&run, State::Building, State::Stuck);
+            assert!(matches!(pass(&rig, &run), ResumeStep::Stuck { .. }));
+            assert!(rig.finished(&run));
+        }
+
+        // testing-17: a decision of another step is finished by resume only while a resume is
+        // owed, since building skips such a run.
+
+        #[test]
+        fn a_foreign_stuck_decision_is_finished_while_a_resume_is_owed() {
+            let (rig, run) = archived_and_waiting_for_a_machine();
+            rig.step(
+                &run,
+                "stuck-stop {\"code\":\"time-limit\",\"stop\":{\"reason\":\"the run ran past limits.minutes\"}}",
+            );
+            assert!(matches!(pass(&rig, &run), ResumeStep::Stuck { .. }));
+            assert!(rig.finished(&run));
+            assert!(create_calls(&rig).is_empty());
+            assert!(start_calls(&rig).is_empty());
+        }
+
+        // C4: start's begun paths in triage are start's.
+
+        #[test]
+        fn a_stuck_path_start_began_in_triage_is_left_to_start() {
+            for code in ["approval-unconfirmed", "launch-failed", "setup-failed"] {
+                let mut rig = Rig::new();
+                let run = run_id(1);
+                claimed_not_built(&rig, &run);
+                rig.view = FleetView::builder().online(m1()).build();
+                rig.step(
+                    &run,
+                    &format!("stuck-stop {{\"code\":\"{code}\",\"stop\":{{\"reason\":\"x\"}}}}"),
+                );
+                let before = event_count(&rig, &run);
+                assert!(is_skipped(&pass(&rig, &run)), "{code}");
+                assert_eq!(event_count(&rig, &run), before, "{code}");
+            }
+            // A build that already launched, stuck by start's code with no resume owed.
+            let (rig, run) = interrupted();
+            rig.step(
+                &run,
+                "stuck-stop {\"code\":\"launch-failed\",\"stop\":{\"reason\":\"x\"}}",
+            );
+            assert!(is_skipped(&pass(&rig, &run)));
+        }
+
+        // correctness-10: the claim's own machine is moved again only under the 15-minute rule.
+
+        #[test]
+        fn a_claim_whose_machine_blips_after_a_target_was_given_up_is_not_moved() {
+            let mut rig = Rig::new();
+            let run = run_id(1);
+            claimed_not_built(&rig, &run);
+            rig.view = FleetView::builder()
+                .online(m3())
+                .unreachable(m1(), secs(15 * 60))
+                .build();
+            rig.worker
+                .on_create(Err(WorkerError::Unreachable("timed out".into())));
+            assert!(placed(&rig.ctx(), &run, m2()).is_err());
+            rig.view = FleetView::builder()
+                .online(m3())
+                .unreachable(m1(), secs(15 * 60))
+                .unreachable(m2(), secs(15 * 60))
+                .build();
+            assert!(matches!(pass(&rig, &run), ResumeStep::NeedsMachine(_)));
+            // m1 is back, then away for half a minute with a workspace of the name showing.
+            rig.view = FleetView::builder()
+                .online(m3())
+                .unreachable(m1(), secs(30))
+                .workspace(workspace_record(m1(), fresh3(), "fac/8-1", None))
+                .build();
+            let before = event_count(&rig, &run);
+            assert!(is_skipped(&pass(&rig, &run)));
+            // Away for less than 15 minutes with no workspace showing: not moved either.
+            rig.view = FleetView::builder()
+                .online(m3())
+                .unreachable(m1(), secs(30))
+                .build();
             assert!(is_skipped(&pass(&rig, &run)));
             assert_eq!(event_count(&rig, &run), before);
         }
