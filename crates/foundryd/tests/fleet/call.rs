@@ -79,6 +79,8 @@ struct Factory {
     secrets: Arc<dyn Secrets>,
     /// Why sessions cannot start here, as a daemon with no gateway says.
     refused: Option<&'static str>,
+    /// The terminal holder to start, when not the one built.
+    holder: Option<PathBuf>,
 }
 
 /// Puts the fake agent in front of a factory start's flags, which it does not take: it drops
@@ -124,12 +126,11 @@ impl Served {
                 .map(str::to_owned)
                 .to_vec(),
         };
-        let terminals = Arc::new(Terminals::new(
-            me,
-            store.clone(),
-            data.path(),
-            built("foundry-holder"),
-        ));
+        let holder = factory
+            .as_ref()
+            .and_then(|f| f.holder.clone())
+            .unwrap_or_else(|| built("foundry-holder"));
+        let terminals = Arc::new(Terminals::new(me, store.clone(), data.path(), holder));
         let workspaces = Arc::new(Workspaces::new(
             me,
             store.clone(),
@@ -1128,11 +1129,12 @@ struct Pair {
 
 impl Pair {
     async fn start() -> Pair {
-        Self::start_with(None).await
+        Self::start_with(None, None).await
     }
 
-    /// A pair whose B refuses sessions for `refused`, when it is given.
-    async fn start_with(refused: Option<&'static str>) -> Pair {
+    /// A pair whose B refuses sessions for `refused`, when it is given, and starts `holder` for
+    /// its terminals, when it is given.
+    async fn start_with(refused: Option<&'static str>, holder: Option<PathBuf>) -> Pair {
         let fleet = Fleet::start(2);
         let remotes = tempfile::tempdir().unwrap();
         let project = project(&fleet, remotes.path());
@@ -1142,6 +1144,7 @@ impl Pair {
             script: SESSION_SCRIPT,
             secrets: Held::with_token(),
             refused,
+            holder,
         };
         let on_b = Served::start_with(b.id, b.store.clone(), b.peers.clone(), Some(factory)).await;
         b.peers.serve_calls(on_b.addr);
@@ -1227,17 +1230,32 @@ impl Pair {
     }
 }
 
-/// The run's call for `path` with `body`, made on `on`: the status and the text answered.
+/// The run's call for `path` with `body`, made on `on`: the status and the text answered. A
+/// call refused because the record it names has not reached `on` yet is made again, as a run
+/// asks again on its next pass.
 async fn call_on(on: &Served, path: &str, body: Option<Value>) -> (u16, String) {
     let body = body.map(|body| body.to_string()).unwrap_or_default();
-    let answer = api::factory::call(&on.api, path, body.as_bytes())
-        .await
-        .unwrap_or_else(|e| panic!("{path} not answered: {e}"));
-    (
-        answer.status,
-        String::from_utf8(answer.body.to_vec()).unwrap(),
-    )
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        match api::factory::call(&on.api, path, body.as_bytes()).await {
+            Ok(answer) => {
+                return (
+                    answer.status,
+                    String::from_utf8(answer.body.to_vec()).unwrap(),
+                );
+            }
+            Err(CallError::Refused(said))
+                if said.contains(NOT_HERE_YET) && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(e) => panic!("{path} not answered: {e}"),
+        }
+    }
 }
+
+/// What a run's call says when no record of what it names has reached its machine.
+const NOT_HERE_YET: &str = "has not reached this machine";
 
 /// The terminals of `workspace` that `on` shows.
 async fn terminals_of(on: &Served, workspace: WorkspaceId) -> Vec<TerminalId> {
@@ -1632,7 +1650,7 @@ async fn a_run_calls_what_its_own_machine_owns_here_and_names_only_worker_routes
 
 #[tokio::test]
 async fn a_start_on_a_machine_that_refuses_sessions_is_503_and_starts_nothing() {
-    let pair = Pair::start_with(Some("this machine has no gateway")).await;
+    let pair = Pair::start_with(Some("this machine has no gateway"), None).await;
     let (status, text) = pair
         .call(
             "/api/factory/workspaces",
@@ -1651,4 +1669,232 @@ async fn a_start_on_a_machine_that_refuses_sessions_is_503_and_starts_nothing() 
     assert_eq!(status, 503, "{text}");
     assert!(text.contains("no gateway"), "{text}");
     assert_eq!(pair.sessions_in(workspace), 0);
+}
+
+#[tokio::test]
+async fn a_run_call_naming_what_no_record_here_names_is_refused_and_answered_by_no_machine() {
+    let pair = Pair::start().await;
+    let (workspace, session, terminal) = (
+        WorkspaceId::random(),
+        SessionId::random(),
+        TerminalId::random(),
+    );
+    let start = pair.start_body(LOGIN, "test-model", "high", "/factory-build demo#12");
+    let send = json!({"message": {"line": "hi", "body": null}, "only_if_prompts": null});
+    for (path, body) in [
+        (
+            format!("/api/workspaces/{workspace}/factory/session"),
+            Some(start),
+        ),
+        (format!("/api/workspaces/{workspace}/factory/end"), None),
+        (
+            format!("/api/sessions/{session}/factory/message"),
+            Some(send),
+        ),
+        (
+            format!("/api/sessions/{session}/factory/turn"),
+            Some(json!({"turn": 1})),
+        ),
+        (format!("/api/terminals/{terminal}/tail"), None),
+    ] {
+        // Answered here, a message would be `409 no_such_session` and the rest `404`: final
+        // answers for something that may only not have synced yet.
+        let body = body.map(|body| body.to_string()).unwrap_or_default();
+        match api::factory::call(&pair.on_a.api, &path, body.as_bytes()).await {
+            Err(CallError::Refused(said)) => {
+                assert!(said.contains(NOT_HERE_YET), "{path}: {said}");
+            }
+            other => panic!("{path} not refused: {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn only_a_workspaces_setup_terminal_has_a_tail() {
+    let pair = Pair::start().await;
+    let setup = json!({"kind": "commands", "commands": ["echo ready"], "limit_secs": 60});
+    let (status, text) = pair
+        .call(
+            "/api/factory/workspaces",
+            Some(pair.create("fac/12-1", setup)),
+        )
+        .await;
+    assert_eq!(status, 201, "{text}");
+    let workspace = workspace_of(&text);
+    let Some(AnyRecord::Workspace(record)) = pair
+        .b()
+        .held(|r| matches!(r, AnyRecord::Workspace(w) if w.body.id == workspace))
+    else {
+        panic!("B holds the workspace");
+    };
+    let setup_terminal = record.body.setup.expect("the setup terminal is named");
+    let shells = format!("/api/workspaces/{workspace}/shells");
+    let (status, text) = pair.on_b.post_text(&shells, None).await;
+    assert_eq!(status, 201, "{text}");
+    let shell = TerminalId(
+        id_of(&serde_json::from_str(&text).unwrap())
+            .parse()
+            .unwrap(),
+    );
+
+    let (status, text) = pair
+        .call(&format!("/api/terminals/{setup_terminal}/tail"), None)
+        .await;
+    assert_eq!(status, 200, "{text}");
+    // A shell's child may hold anything its user typed: it is no setup, and has no tail.
+    let (status, text) = pair
+        .call(&format!("/api/terminals/{shell}/tail"), None)
+        .await;
+    assert_eq!(status, 404, "{text}");
+}
+
+#[tokio::test]
+async fn a_carried_create_or_end_on_a_machine_that_does_not_own_its_target_changes_nothing() {
+    let pair = Pair::start().await;
+    let (a, b) = (pair.a(), pair.b());
+    let (status, text) = pair
+        .call(
+            "/api/factory/workspaces",
+            Some(pair.create("fac/12-1", json!({"kind": "none"}))),
+        )
+        .await;
+    assert_eq!(status, 201, "{text}");
+    let workspace = workspace_of(&text);
+    let start = pair.start_body(LOGIN, "test-model", "high", "/factory-build demo#12");
+    let path = format!("/api/workspaces/{workspace}/factory/session");
+    let (status, text) = pair.call(&path, Some(start)).await;
+    assert_eq!(status, 201, "{text}");
+    let session = session_of(&text);
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while !pair.runs(session).await {
+        assert!(tokio::time::Instant::now() < deadline, "A never shows it");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let carried = [(CARRIED, "1".to_owned())];
+
+    // A create naming A that reaches B is refused there, and made on neither.
+    let mut elsewhere = pair.create("fac/13-1", json!({"kind": "none"}));
+    elsewhere["machine"] = json!(a.id);
+    let (status, text) = pair
+        .on_b
+        .post_with("/api/factory/workspaces", Some(elsewhere), &carried)
+        .await;
+    assert_eq!(status, 421, "{text}");
+    for daemon in [a, b] {
+        assert!(
+            daemon
+                .held(|r| matches!(r, AnyRecord::Workspace(w) if w.body.name == "fac/13-1"))
+                .is_none(),
+            "nothing was made"
+        );
+    }
+
+    // An end that reaches A, which does not own the workspace, ends nothing.
+    let end = format!("/api/workspaces/{workspace}/factory/end");
+    let (status, text) = pair.on_a.post_with(&end, None, &carried).await;
+    assert_eq!(status, 404, "{text}");
+    assert!(pair.runs(session).await, "B's session still runs");
+}
+
+#[tokio::test]
+async fn a_start_after_the_workspaces_sessions_were_ended_starts_a_new_session() {
+    let pair = Pair::start().await;
+    let (status, text) = pair
+        .call(
+            "/api/factory/workspaces",
+            Some(pair.create("fac/12-1", json!({"kind": "none"}))),
+        )
+        .await;
+    assert_eq!(status, 201, "{text}");
+    let workspace = workspace_of(&text);
+    let start = pair.start_body(LOGIN, "test-model", "high", "/factory-build demo#12");
+    let path = format!("/api/workspaces/{workspace}/factory/session");
+    let (status, text) = pair.call(&path, Some(start.clone())).await;
+    assert_eq!(status, 201, "{text}");
+    let first = session_of(&text);
+    let (status, text) = pair
+        .once_found(
+            &format!("/api/sessions/{first}/factory/turn"),
+            json!({"turn": 1}),
+        )
+        .await;
+    assert_eq!(status, 200, "{text}");
+
+    let (status, text) = pair
+        .call(&format!("/api/workspaces/{workspace}/factory/end"), None)
+        .await;
+    assert_eq!(status, 204, "{text}");
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while pair
+        .b()
+        .held(|r| {
+            matches!(r, AnyRecord::Session(s) if s.body.id == first
+                && matches!(s.body.state, SessionState::Finished | SessionState::Failed))
+        })
+        .is_none()
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the session still runs"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // The ended session is not the running one, and the end does not refuse the next start.
+    let (status, text) = pair.call(&path, Some(start)).await;
+    assert_eq!(status, 201, "{text}");
+    let second = session_of(&text);
+    assert_ne!(second, first, "a new session");
+    assert_eq!(pair.sessions_in(workspace), 2);
+    let (status, text) = pair
+        .once_found(
+            &format!("/api/sessions/{second}/factory/turn"),
+            json!({"turn": 1}),
+        )
+        .await;
+    assert_eq!(status, 200, "{text}");
+    let send = json!({"message": {"line": "carry on", "body": null}, "only_if_prompts": 1});
+    let (status, text) = pair
+        .call(
+            &format!("/api/sessions/{second}/factory/message"),
+            Some(send),
+        )
+        .await;
+    assert_eq!(status, 200, "{text}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&text).unwrap(),
+        json!({"prompts": 1})
+    );
+}
+
+#[tokio::test]
+async fn a_create_whose_setup_cannot_start_is_201_with_the_workspace_and_its_error_hidden() {
+    // No holder at a path that reads as a URL with a password: the start's error may name it.
+    let holder = PathBuf::from("/no/such/https://u:s3cret@example.com/foundry-holder");
+    let pair = Pair::start_with(None, Some(holder)).await;
+    let setup = json!({"kind": "commands", "commands": ["echo ready"], "limit_secs": 60});
+    let create = pair.create("fac/12-1", setup);
+    let (status, text) = pair
+        .call("/api/factory/workspaces", Some(create.clone()))
+        .await;
+    assert_eq!(status, 201, "{text}");
+    let workspace = workspace_of(&text);
+    let answer: Value = serde_json::from_str(&text).unwrap();
+    let error = answer["error"].as_str().expect("the error beside the id");
+    assert!(error.contains("could not be started"), "{error}");
+    assert!(!text.contains("s3cret"), "{text}");
+    assert!(
+        pair.b()
+            .held(|r| matches!(r, AnyRecord::Workspace(w) if w.body.id == workspace && !w.deleted))
+            .is_some(),
+        "the workspace is kept"
+    );
+
+    let (status, text) = pair.call("/api/factory/workspaces", Some(create)).await;
+    assert_eq!(status, 201, "{text}");
+    assert_eq!(
+        workspace_of(&text),
+        workspace,
+        "a retry answers the same one"
+    );
 }

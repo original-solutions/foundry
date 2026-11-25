@@ -16,9 +16,10 @@
 //!
 //! The factory's worker routes ([`super::factory`]) are carried too, but never by this layer: a
 //! request to one runs here, where it is `404` unless marked. A run carries its own call with
-//! [`super::factory::call`], which finds the owner as this layer does: the machine a factory
+//! [`super::factory::call`], which finds the owner with [`worker_owner`]: the machine a factory
 //! create names, and the owner of the workspace, the terminal or, through its session record,
-//! the session the path names.
+//! the session the path names. This file is the one place a worker route's path is read
+//! ([`worker`]) and listed ([`WORKER_ROUTES`]).
 //!
 //! A create carried to a machine over its limits is still made there, and its `201` gets the
 //! `warning` this machine gives of it, as a create made here does.
@@ -43,33 +44,50 @@ enum Target {
     Create,
     Workspace(WorkspaceId),
     Terminal(TerminalId),
-    /// A factory create, for the machine it names.
-    FactoryCreate,
-    /// A factory session start or end in a workspace.
-    FactoryWorkspace(WorkspaceId),
-    /// A message to a factory session, or a read of its turn.
-    Session(SessionId),
+    /// A factory worker route, which only a run carries.
+    Worker(Worker),
+}
+
+/// A factory worker route, with what its path names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Worker {
+    /// A factory create, for the machine its body names.
+    Create,
+    /// A factory session start in a workspace.
+    Start(WorkspaceId),
+    /// The end of a workspace's factory sessions.
+    End(WorkspaceId),
+    /// A message to a factory session.
+    Message(SessionId),
+    /// A read of a factory session's turn.
+    Turn(SessionId),
     /// A read of a terminal's tail.
     Tail(TerminalId),
 }
 
-impl Target {
-    /// Whether it is a factory worker route, which only a run carries.
-    fn is_worker(&self) -> bool {
-        matches!(
-            self,
-            Target::FactoryCreate
-                | Target::FactoryWorkspace(_)
-                | Target::Session(_)
-                | Target::Tail(_)
-        )
-    }
-}
+/// The worker routes' paths, as the router mounts them. [`target`] reads each of them as its
+/// own [`Worker`].
+pub(super) const WORKER_ROUTES: [&str; 6] = [
+    "/api/factory/workspaces",
+    "/api/workspaces/{id}/factory/session",
+    "/api/workspaces/{id}/factory/end",
+    "/api/sessions/{id}/factory/message",
+    "/api/sessions/{id}/factory/turn",
+    "/api/terminals/{id}/tail",
+];
 
 /// Whether a `POST` to `path` is a route a carried call may name: one this layer carries, or a
 /// worker route a run carries.
 pub(crate) fn carries(path: &str) -> bool {
     target(path).is_some()
+}
+
+/// The worker route a `POST` to `path` is, when it is one.
+pub(super) fn worker(path: &str) -> Option<Worker> {
+    match target(path)? {
+        Target::Worker(worker) => Some(worker),
+        _ => None,
+    }
 }
 
 /// The target of a `POST` to `path`, when it is a route a carried call may name.
@@ -81,14 +99,22 @@ fn target(path: &str) -> Option<Target> {
             Some(Target::Workspace(WorkspaceId(id.parse().ok()?)))
         }
         ["terminals", id, "close"] => Some(Target::Terminal(TerminalId(id.parse().ok()?))),
-        ["factory", "workspaces"] => Some(Target::FactoryCreate),
-        ["workspaces", id, "factory", "session" | "end"] => {
-            Some(Target::FactoryWorkspace(WorkspaceId(id.parse().ok()?)))
+        ["factory", "workspaces"] => Some(Target::Worker(Worker::Create)),
+        ["workspaces", id, "factory", "session"] => {
+            Some(Target::Worker(Worker::Start(WorkspaceId(id.parse().ok()?))))
         }
-        ["sessions", id, "factory", "message" | "turn"] => {
-            Some(Target::Session(SessionId(id.parse().ok()?)))
+        ["workspaces", id, "factory", "end"] => {
+            Some(Target::Worker(Worker::End(WorkspaceId(id.parse().ok()?))))
         }
-        ["terminals", id, "tail"] => Some(Target::Tail(TerminalId(id.parse().ok()?))),
+        ["sessions", id, "factory", "message"] => {
+            Some(Target::Worker(Worker::Message(SessionId(id.parse().ok()?))))
+        }
+        ["sessions", id, "factory", "turn"] => {
+            Some(Target::Worker(Worker::Turn(SessionId(id.parse().ok()?))))
+        }
+        ["terminals", id, "tail"] => {
+            Some(Target::Worker(Worker::Tail(TerminalId(id.parse().ok()?))))
+        }
         _ => None,
     }
 }
@@ -97,9 +123,12 @@ pub(super) async fn carry(State(api): State<Api>, request: Request, next: Next) 
     if request.method() != Method::POST || request.headers().contains_key(CARRIED) {
         return next.run(request).await;
     }
-    let Some(target) = target(request.uri().path()).filter(|target| !target.is_worker()) else {
+    let Some(target) = target(request.uri().path()) else {
         return next.run(request).await;
     };
+    if matches!(target, Target::Worker(_)) {
+        return next.run(request).await;
+    }
     let create = matches!(target, Target::Create);
     let (parts, body) = request.into_parts();
     let Ok(body) = axum::body::to_bytes(body, BODY_LIMIT).await else {
@@ -150,58 +179,92 @@ fn warned(answer: Answer, warning: Option<String>) -> Answer {
     }
 }
 
-/// Whether a `POST` to `path` is a factory worker route.
-pub(super) fn is_worker(path: &str) -> bool {
-    target(path).is_some_and(|target| target.is_worker())
+/// Where a run's call to a worker route is answered.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Owner {
+    /// On this machine: it owns what the call names, or what it names is gone, which this
+    /// machine answers as well as any.
+    Here,
+    /// On the other machine that owns it.
+    There(MachineId),
+    /// Nowhere yet: no record of what the call names has reached this machine, so its owner is
+    /// not known.
+    Unknown,
 }
 
-/// The other machine that owns what the worker route `path` names, with `body`, or `None` when
-/// it runs here. A path that is no worker route is `None`.
+impl Owner {
+    /// Where a call for the record `found`, its owner and whether it is deleted, is answered.
+    fn of(found: Option<(MachineId, bool)>, me: MachineId) -> Owner {
+        match found {
+            None => Owner::Unknown,
+            Some((owner, deleted)) if owner == me || deleted => Owner::Here,
+            Some((owner, _)) => Owner::There(owner),
+        }
+    }
+}
+
+/// Where a run's call to `worker`, with `body`, is answered: the machine a create names, or
+/// the owner of the record of the workspace, the session or the terminal it names.
 pub(super) async fn worker_owner(
     api: &Api,
-    path: &str,
+    worker: Worker,
     body: &Bytes,
-) -> Result<Option<MachineId>, StoreError> {
-    match target(path).filter(Target::is_worker) {
-        Some(target) => owner(api, target, body).await,
-        None => Ok(None),
+) -> Result<Owner, StoreError> {
+    let me = api.peers.me();
+    let found = match worker {
+        Worker::Create => return Ok(named(body, me).map_or(Owner::Here, Owner::There)),
+        Worker::Start(id) | Worker::End(id) => {
+            on_store(&api.store, move |store| store.workspace(id))
+                .await?
+                .map(|record| (record.owner, record.deleted))
+        }
+        // The store reads sessions by owner only, so each owner's are looked through.
+        Worker::Message(id) | Worker::Turn(id) => {
+            on_store(&api.store, move |store| {
+                for owner in store.versions()?.into_keys() {
+                    if let Some(record) = store.sessions_of(owner)?.iter().find(|s| s.body.id == id)
+                    {
+                        return Ok(Some((owner, record.deleted)));
+                    }
+                }
+                Ok(None)
+            })
+            .await?
+        }
+        Worker::Tail(id) => on_store(&api.store, move |store| store.terminal(id))
+            .await?
+            .map(|record| (record.owner, record.deleted)),
+    };
+    Ok(Owner::of(found, me))
+}
+
+/// The other machine a create's `body` names, or `None` when it names this one or none. A body
+/// that does not read names none, and runs here, where the route refuses it with its reason.
+fn named(body: &Bytes, me: MachineId) -> Option<MachineId> {
+    /// Only the field that picks the machine; the route reads the rest.
+    #[derive(Deserialize)]
+    struct Picked {
+        #[serde(default)]
+        machine: Option<MachineId>,
     }
+    serde_json::from_slice::<Picked>(body)
+        .ok()
+        .and_then(|picked| picked.machine)
+        .filter(|machine| *machine != me)
 }
 
 /// The other machine `target` belongs to, or `None` when it runs here.
 async fn owner(api: &Api, target: Target, body: &Bytes) -> Result<Option<MachineId>, StoreError> {
     let me = api.peers.me();
     match target {
-        Target::Create | Target::FactoryCreate => {
-            /// Only the field that picks the machine; the route reads the rest.
-            #[derive(Deserialize)]
-            struct Picked {
-                #[serde(default)]
-                machine: Option<MachineId>,
-            }
-            // A body that does not read runs here, where the route refuses it with its reason.
-            Ok(serde_json::from_slice::<Picked>(body)
-                .ok()
-                .and_then(|picked| picked.machine)
-                .filter(|machine| *machine != me))
-        }
-        Target::Workspace(id) | Target::FactoryWorkspace(id) => {
-            Ok(on_store(&api.store, move |store| store.workspace(id))
-                .await?
-                .filter(|record| !record.deleted && record.owner != me)
-                .map(|record| record.owner))
-        }
-        // The store reads sessions by owner only, so each other owner's are looked through.
-        Target::Session(id) => Ok(on_store(&api.store, move |store| {
-            for owner in store.versions()?.into_keys().filter(|owner| *owner != me) {
-                if store.sessions_of(owner)?.iter().any(|s| s.body.id == id) {
-                    return Ok(Some(owner));
-                }
-            }
-            Ok(None)
-        })
-        .await?),
-        Target::Terminal(id) | Target::Tail(id) => Ok(api.peers.owner_of(id).await?),
+        Target::Create => Ok(named(body, me)),
+        Target::Workspace(id) => Ok(on_store(&api.store, move |store| store.workspace(id))
+            .await?
+            .filter(|record| !record.deleted && record.owner != me)
+            .map(|record| record.owner)),
+        Target::Terminal(id) => Ok(api.peers.owner_of(id).await?),
+        // Never carried by this layer: a run's call finds its owner with `worker_owner`.
+        Target::Worker(_) => Ok(None),
     }
 }
 
@@ -273,20 +336,21 @@ mod tests {
         }
         let path = format!("/api/terminals/{id}/close");
         assert!(matches!(target(&path), Some(Target::Terminal(t)) if t.0 == id));
-        assert!(matches!(
-            target("/api/factory/workspaces"),
-            Some(Target::FactoryCreate)
-        ));
-        for action in ["session", "end"] {
-            let path = format!("/api/workspaces/{id}/factory/{action}");
-            assert!(matches!(target(&path), Some(Target::FactoryWorkspace(w)) if w.0 == id));
-        }
-        for action in ["message", "turn"] {
-            let path = format!("/api/sessions/{id}/factory/{action}");
-            assert!(matches!(target(&path), Some(Target::Session(s)) if s.0 == id));
-        }
-        let path = format!("/api/terminals/{id}/tail");
-        assert!(matches!(target(&path), Some(Target::Tail(t)) if t.0 == id));
+        let at = |path: String| worker(&path);
+        assert_eq!(worker("/api/factory/workspaces"), Some(Worker::Create));
+        let (w, s, t) = (WorkspaceId(id), SessionId(id), TerminalId(id));
+        let session = at(format!("/api/workspaces/{id}/factory/session"));
+        assert_eq!(session, Some(Worker::Start(w)));
+        let end = at(format!("/api/workspaces/{id}/factory/end"));
+        assert_eq!(end, Some(Worker::End(w)));
+        let message = at(format!("/api/sessions/{id}/factory/message"));
+        assert_eq!(message, Some(Worker::Message(s)));
+        let turn = at(format!("/api/sessions/{id}/factory/turn"));
+        assert_eq!(turn, Some(Worker::Turn(s)));
+        assert_eq!(
+            at(format!("/api/terminals/{id}/tail")),
+            Some(Worker::Tail(t))
+        );
         for other in [
             "/api/state".to_owned(),
             format!("/api/workspaces/{id}/changes"),
@@ -308,19 +372,15 @@ mod tests {
     }
 
     #[test]
-    fn the_worker_routes_are_carried_only_by_a_run_and_p1_routes_by_this_layer() {
+    fn each_mounted_worker_route_is_read_as_its_own_worker_and_carried_only_by_a_run() {
         let id = uuid::Uuid::new_v4();
-        let workers = [
-            "/api/factory/workspaces".to_owned(),
-            format!("/api/workspaces/{id}/factory/session"),
-            format!("/api/workspaces/{id}/factory/end"),
-            format!("/api/sessions/{id}/factory/message"),
-            format!("/api/sessions/{id}/factory/turn"),
-            format!("/api/terminals/{id}/tail"),
-        ];
-        for path in &workers {
-            assert!(carries(path), "{path} is taken from a peer");
-            assert!(target(path).unwrap().is_worker(), "{path}");
+        let mut read = Vec::new();
+        for route in WORKER_ROUTES {
+            let path = route.replace("{id}", &id.to_string());
+            assert!(carries(&path), "{path} is taken from a peer");
+            let worker = worker(&path).unwrap_or_else(|| panic!("{route} is read"));
+            assert!(!read.contains(&worker), "{route} is read as another route");
+            read.push(worker);
         }
         for path in [
             "/api/workspaces".to_owned(),
@@ -329,7 +389,21 @@ mod tests {
             format!("/api/workspaces/{id}/archive"),
             format!("/api/terminals/{id}/close"),
         ] {
-            assert!(!target(&path).unwrap().is_worker(), "{path}");
+            assert!(carries(&path), "{path}");
+            assert!(worker(&path).is_none(), "{path}");
         }
+    }
+
+    #[test]
+    fn a_runs_call_is_answered_by_the_owner_of_a_live_record_and_here_for_its_own_or_a_gone_one() {
+        let (me, other) = (
+            MachineId(uuid::Uuid::new_v4()),
+            MachineId(uuid::Uuid::new_v4()),
+        );
+        assert_eq!(Owner::of(None, me), Owner::Unknown);
+        assert_eq!(Owner::of(Some((other, false)), me), Owner::There(other));
+        assert_eq!(Owner::of(Some((other, true)), me), Owner::Here);
+        assert_eq!(Owner::of(Some((me, false)), me), Owner::Here);
+        assert_eq!(Owner::of(Some((me, true)), me), Owner::Here);
     }
 }

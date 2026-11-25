@@ -7,8 +7,9 @@
 //! header that a page cannot leave out. The carry layer never carries these routes. A run makes
 //! its call with [`call`], which sends it to the machine that owns what it names, or answers it
 //! here, by the same code a carried call runs, when this machine owns it. A call for something
-//! this machine does not own is `404`, except a message, which is `409` with the reason
-//! `no_such_session`, and a create naming another machine, which is `421`.
+//! no record on the run's machine names yet is refused, and sent nowhere. A carried call for
+//! something this machine does not own is `404`, except a message, which is `409` with the
+//! reason `no_such_session`, and a create naming another machine, which is `421`.
 //!
 //! - `POST /api/factory/workspaces` `{machine, project, name, checkout, setup, tag}`: makes a
 //!   workspace on `machine` with
@@ -28,17 +29,18 @@
 //! - `POST /api/sessions/{id}/factory/turn` `{turn}`: `200 {message, question}`, the turn's
 //!   final message and the question that waits, or `404` while the turn is not written.
 //! - `POST /api/terminals/{id}/tail`: the end of the terminal's output as plain text, at most
-//!   [`TAIL_LIMIT`] bytes. A session's terminal has none: it is `404`, and a session is read
-//!   through its turns.
+//!   [`TAIL_LIMIT`] bytes. Only a workspace's setup terminal, where a setup or a gate runs, has
+//!   a tail. Any other is `404`: a session's, whose child holds a token, is read through its
+//!   turns.
 //!
 //! A message is `{line, body}`: one line under [`LINE_LIMIT`] characters with no control
 //! character, and a body of at most [`BODY_LIMIT`] bytes with no NUL, or `null`. Anything else is
 //! `422`, and nothing is typed.
 //!
-//! No answer holds a token. A token is only in a session's child's environment, and a session's
-//! terminal has no tail. A turn's message is kept with the known secrets hidden. A setup or gate
-//! terminal holds no token, and its tail, like every error, has the passwords of URLs hidden by
-//! [`redact`] before it is cut.
+//! No answer holds a token. A token is only in a session's child's environment, and only a
+//! setup terminal, which is never a session's, has a tail. A turn's message is kept with the
+//! known secrets hidden. A setup or gate terminal holds no token, and its tail, like every error,
+//! has the passwords of URLs hidden by [`redact`] before it is cut.
 
 use axum::Json;
 use axum::Router;
@@ -53,7 +55,8 @@ use foundry_proto::state::SessionState;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
-use super::{Api, ApiError, carry, created, error, no_route, on_store, parse_id, unprocessable};
+use super::carry::{self, Owner, Worker};
+use super::{Api, ApiError, created, error, no_route, on_store, unprocessable};
 use crate::factory::messages::{BODY_LIMIT, LINE_LIMIT, Message};
 use crate::git_auth::NoToken;
 use crate::secrets::redact;
@@ -70,41 +73,34 @@ pub fn router() -> Router<Api> {
     Router::new().merge(worker())
 }
 
-/// The routes a run's calls take, answered only when carried, each by [`here`].
+/// The routes a run's calls take, [`carry::WORKER_ROUTES`], answered only when carried, each by
+/// [`here`].
 fn worker() -> Router<Api> {
     let mut router = Router::new();
-    for path in [
-        "/api/factory/workspaces",
-        "/api/workspaces/{id}/factory/session",
-        "/api/workspaces/{id}/factory/end",
-        "/api/sessions/{id}/factory/message",
-        "/api/sessions/{id}/factory/turn",
-        "/api/terminals/{id}/tail",
-    ] {
+    for path in carry::WORKER_ROUTES {
         router = router.route(path, post(serve).fallback(no_route));
     }
     router.route_layer(middleware::from_fn(only_carried))
 }
 
+/// A worker route's path whose id is no id is no route.
 async fn serve(State(api): State<Api>, uri: Uri, body: Bytes) -> Response {
-    here(&api, uri.path(), body).await
+    match carry::worker(uri.path()) {
+        Some(worker) => here(&api, worker, body).await,
+        None => no_route().await,
+    }
 }
 
-/// Answers the worker route `path` with `body` on this machine: what a carried call gets, and
+/// Answers the worker route `worker` with `body` on this machine: what a carried call gets, and
 /// what [`call`] gives for this machine's own records.
-async fn here(api: &Api, path: &str, body: Bytes) -> Response {
-    let Some(rest) = path.strip_prefix("/api/") else {
-        return no_route().await;
-    };
-    let parts: Vec<&str> = rest.split('/').collect();
-    let answered = match parts.as_slice() {
-        ["factory", "workspaces"] => create(api, &body).await,
-        ["workspaces", id, "factory", "session"] => start(api, id, &body).await,
-        ["workspaces", id, "factory", "end"] => end(api, id).await,
-        ["sessions", id, "factory", "message"] => message(api, id, &body).await,
-        ["sessions", id, "factory", "turn"] => turn(api, id, &body).await,
-        ["terminals", id, "tail"] => tail(api, id).await,
-        _ => return no_route().await,
+async fn here(api: &Api, worker: Worker, body: Bytes) -> Response {
+    let answered = match worker {
+        Worker::Create => create(api, &body).await,
+        Worker::Start(id) => start(api, id, &body).await,
+        Worker::End(id) => end(api, id).await,
+        Worker::Message(id) => message(api, id, &body).await,
+        Worker::Turn(id) => turn(api, id, &body).await,
+        Worker::Tail(id) => tail(api, id).await,
     };
     answered.unwrap_or_else(IntoResponse::into_response)
 }
@@ -145,33 +141,42 @@ async fn only_carried(request: Request, next: Next) -> Response {
 /// A run's call to the worker route `path`, with `body` as JSON when it has one, answered by the
 /// machine that owns what the path names: the machine a create names, or the owner of the
 /// workspace's, the session's or the terminal's record. It is carried there over
-/// [`Peers::call`](crate::sync::Peers::call), or, when that is this machine or no record names
-/// another, answered here as a carried call is, so a run gets the same answers and the same
-/// refusals wherever its workspace is. A path that is no worker route is refused, and sent
-/// nowhere.
+/// [`Peers::call`](crate::sync::Peers::call), or, when that is this machine, answered here as a
+/// carried call is, so a run gets the same answers and the same refusals wherever its workspace
+/// is. A record that is gone is answered here, as gone. A path that is no worker route, or that
+/// names something no record here names yet, as a workspace made on another machine before its
+/// record arrives, is refused, and sent nowhere: a run asks again later.
 pub async fn call(api: &Api, path: &str, body: &[u8]) -> Result<Answer, CallError> {
-    if !carry::is_worker(path) {
+    let Some(worker) = carry::worker(path) else {
         return Err(CallError::Refused(format!(
             "{path:?} is not a worker route"
         )));
-    }
+    };
     let body = Bytes::copy_from_slice(body);
-    let owner = carry::worker_owner(api, path, &body).await.map_err(|e| {
+    let owner = carry::worker_owner(api, worker, &body).await.map_err(|e| {
         CallError::Refused(format!(
             "the owner could not be read: {}",
             redact(&e.to_string())
         ))
     })?;
-    let Some(owner) = owner else {
-        let response = here(api, path, body).await;
-        let status = response.status().as_u16();
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap_or_default();
-        return Ok(Answer { status, body });
-    };
-    let content_type = (!body.is_empty()).then_some("application/json");
-    api.peers.call(owner, path, content_type, &body).await
+    match owner {
+        Owner::Here => {
+            let response = here(api, worker, body).await;
+            let status = response.status().as_u16();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap_or_default();
+            Ok(Answer { status, body })
+        }
+        Owner::There(owner) => {
+            let content_type = (!body.is_empty()).then_some("application/json");
+            api.peers.call(owner, path, content_type, &body).await
+        }
+        Owner::Unknown => Err(CallError::Refused(format!(
+            "the record of what {path} names has not reached this machine yet, so its owner \
+             is not known; nothing was sent"
+        ))),
+    }
 }
 
 /// A message as a call carries it.
@@ -287,11 +292,10 @@ struct Start {
     message: Sent,
 }
 
-async fn start(api: &Api, id: &str, body: &Bytes) -> Result<Response, ApiError> {
+async fn start(api: &Api, id: WorkspaceId, body: &Bytes) -> Result<Response, ApiError> {
     if let Some(said) = &api.sessions_refused {
         return Ok(error(StatusCode::SERVICE_UNAVAILABLE, said.clone()));
     }
-    let id = parse_id(id, "workspace", WorkspaceId)?;
     let start: Start = read(body)?;
     one_word("a model", &start.model)?;
     one_word("an effort", &start.effort)?;
@@ -355,8 +359,7 @@ fn start_refused(e: SessionError) -> ApiError {
     ApiError::Rejected(status, e.to_string())
 }
 
-async fn end(api: &Api, id: &str) -> Result<Response, ApiError> {
-    let id = parse_id(id, "workspace", WorkspaceId)?;
+async fn end(api: &Api, id: WorkspaceId) -> Result<Response, ApiError> {
     let me = api.peers.me();
     let owned = on_store(&api.store, move |store| store.workspace(id))
         .await?
@@ -378,8 +381,7 @@ struct Sending {
     only_if_prompts: Option<u64>,
 }
 
-async fn message(api: &Api, id: &str, body: &Bytes) -> Result<Response, ApiError> {
-    let id = parse_id(id, "session", SessionId)?;
+async fn message(api: &Api, id: SessionId, body: &Bytes) -> Result<Response, ApiError> {
     let send: Sending = read(body)?;
     let message = send.message.checked()?;
     match api
@@ -423,8 +425,7 @@ struct Turn {
     turn: u64,
 }
 
-async fn turn(api: &Api, id: &str, body: &Bytes) -> Result<Response, ApiError> {
-    let id = parse_id(id, "session", SessionId)?;
+async fn turn(api: &Api, id: SessionId, body: &Bytes) -> Result<Response, ApiError> {
     let asked: Turn = read(body)?;
     let Some(text) = api.sessions.turn_text(id, asked.turn).await else {
         return Err(ApiError::NotFound(format!(
@@ -440,16 +441,24 @@ async fn turn(api: &Api, id: &str, body: &Bytes) -> Result<Response, ApiError> {
 
 // --- terminals ---
 
-async fn tail(api: &Api, id: &str) -> Result<Response, ApiError> {
-    let id = parse_id(id, "terminal", TerminalId)?;
+/// Only a terminal this machine owns that its workspace's record names as its setup has a tail.
+/// The setup terminal is named only once it has started, and a session's terminal never is, so
+/// a session's terminal has no tail even before its session's record is written.
+async fn tail(api: &Api, id: TerminalId) -> Result<Response, ApiError> {
     let me = api.peers.me();
-    let a_session = on_store(&api.store, move |store| store.sessions_of(me))
-        .await?
-        .iter()
-        .any(|record| record.body.terminal == id);
-    if a_session {
+    let a_setup = on_store(&api.store, move |store| {
+        let Some(terminal) = store.terminal(id)?.filter(|record| record.owner == me) else {
+            return Ok(false);
+        };
+        Ok(store
+            .workspace(terminal.body.workspace)?
+            .is_some_and(|workspace| workspace.owner == me && workspace.body.setup == Some(id)))
+    })
+    .await?;
+    if !a_setup {
         return Err(ApiError::NotFound(format!(
-            "terminal {id} is a session's, which has no tail: read its turns"
+            "terminal {id} is no workspace's setup here: only a setup's tail is read, and a \
+             session is read through its turns"
         )));
     }
     let fetched = api.terminals.tail(id, 2 * TAIL_LIMIT).await?;
