@@ -686,7 +686,7 @@ mod tests {
             );
             assert_eq!(ended(101), Ended::Exit(101));
             assert_eq!(ended(-1), Ended::Exit(-1));
-            // A command killed by a signal exits 128 and more: not the time limit.
+            // Any code but 124 is an exit, not the time limit: 137 and 143 are a kill and a term.
             assert_eq!(ended(125), Ended::Exit(125));
             assert_eq!(ended(137), Ended::Exit(137));
         }
