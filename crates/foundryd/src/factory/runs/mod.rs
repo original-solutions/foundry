@@ -2720,13 +2720,62 @@ mod tests {
             };
             go_stuck(&rig.ctx(), ISSUE, &mut at, "c", stop, None).unwrap();
             let steps = rig.steps(&run);
-            assert!(steps.iter().any(|s| s.starts_with(STUCK_STOP)), "{steps:?}");
+            let decision = steps
+                .iter()
+                .find(|s| s.starts_with(STUCK_STOP))
+                .unwrap_or_else(|| panic!("{steps:?}"));
             assert!(
-                steps
-                    .iter()
-                    .all(|s| !s.contains("ghp_abc") && !s.contains("ghijkl")),
-                "{steps:?}"
+                !decision.contains("ghp_abc") && !decision.contains("ghijkl"),
+                "{decision}"
             );
+        }
+
+        /// The detail of a stop is kept for a later pass as a plain step, written before the
+        /// decision: the ledger hides it as it hides the `stuck` line, which holds the same
+        /// detail, a secret wrapped across lines included.
+        #[test]
+        fn the_stuck_detail_is_a_plain_step_hidden_as_the_stuck_line_holds_it() {
+            let mut rig = Rig::new();
+            use crate::factory::ledger::testing::{T0, hiding, open_store, ticking};
+            let (dir, store) = open_store();
+            rig.ledger = Ledger::new(
+                store,
+                MachineId(uuid::Uuid::from_u128(0x1)),
+                1,
+                hiding("ghp_abcdefghijkl"),
+            )
+            .with_wall(ticking(T0, 1000));
+            rig._dir = dir;
+            let run = run_id(1);
+            building(&rig, &run);
+            let mut at = progress(&rig, &run, State::Building);
+            let stop = Stop {
+                detail: Some("the start was refused: ghp_abcdef\nghijkl".into()),
+                ..stuck_stop()
+            };
+            go_stuck(&rig.ctx(), ISSUE, &mut at, "c", stop, None).unwrap();
+            let steps = rig.steps(&run);
+            let detail = steps
+                .iter()
+                .position(|s| s.starts_with(STUCK_DETAIL))
+                .unwrap_or_else(|| panic!("{steps:?}"));
+            let decision = steps
+                .iter()
+                .position(|s| s.starts_with(STUCK_STOP))
+                .unwrap();
+            assert!(detail < decision, "{steps:?}");
+            let stuck = rig
+                .events(&run)
+                .into_iter()
+                .find(|e| e.event == "stuck")
+                .unwrap();
+            let reason = stuck.data["reason"].as_str().unwrap();
+            assert_eq!(steps[detail], format!("{STUCK_DETAIL}{reason}"));
+            assert!(
+                !reason.contains("ghp_abc") && !reason.contains("ghijkl"),
+                "{reason}"
+            );
+            assert!(reason.starts_with("the start was refused: "), "{reason}");
         }
 
         /// An earlier run's stuck comment is not this run's: the intent records the newest

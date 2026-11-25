@@ -3346,6 +3346,36 @@ mod tests {
                 assert_eq!(rig.sim.labels(), vec!["factory:stuck"]);
             }
 
+            /// A launch-failed stuck path cut short after its decision is finished by the next
+            /// pass with the same detail in the `stuck` line.
+            #[test]
+            fn a_resumed_launch_failed_stuck_path_keeps_the_detail_in_the_ledger() {
+                let rig = Rig::new();
+                rig.worker.on_create(Ok(ws_id()));
+                rig.worker.on_start_session(Err(WorkerError::Failed(
+                    "no such skill factory-build".into(),
+                )));
+                let run = match claim(&rig.ctx(), ISSUE, rig.machine).unwrap() {
+                    ClaimOutcome::Claimed { run } => run,
+                    other => panic!("{other:?}"),
+                };
+                let mut rig = rig;
+                pass(&rig, &run);
+                show_workspace(&mut rig);
+                rig.sim.fail("issue comment", 1);
+                assert!(advance(&rig.ctx(), &run).is_err());
+                assert!(!rig.names(&run).contains(&"stuck".to_string()));
+                assert!(matches!(pass(&rig, &run), StartStep::Stuck { .. }));
+                let stuck = rig
+                    .events(&run)
+                    .into_iter()
+                    .find(|e| e.event == "stuck")
+                    .unwrap();
+                let reason = stuck.data["reason"].as_str().unwrap();
+                assert!(reason.contains("no such skill factory-build"), "{reason}");
+                assert!(!stuck_comment(&rig).contains("factory-build"));
+            }
+
             /// The runner's case "a first launch that never went out has no such note": a
             /// refusal on the first start says no session may exist.
             #[test]

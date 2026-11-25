@@ -1640,6 +1640,20 @@ mod tests {
         }
     }
 
+    mod the_stuck_detail {
+        use super::*;
+
+        #[test]
+        fn is_the_newest_stuck_detail_step_whole() {
+            assert_eq!(seen_of(&[]).stuck_detail, None);
+            let seen = seen_of(&[
+                step(1, &format!("{STUCK_DETAIL}first")),
+                step(2, &format!("{STUCK_DETAIL}refused: a b\nc")),
+            ]);
+            assert_eq!(seen.stuck_detail.as_deref(), Some("refused: a b\nc"));
+        }
+    }
+
     mod a_launch_decision {
         use super::*;
 
