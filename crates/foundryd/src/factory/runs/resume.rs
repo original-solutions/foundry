@@ -69,45 +69,154 @@
 //! - A session is read by the fleet, not by a thread's status: there is no T3 evidence (a T3
 //!   error in the machine log, `endedInPass`, T3 starts and stops), so a session that ended is
 //!   resumed up to the cap with none, where the runner needed evidence or a second end in one
-//!   pass.
+//!   pass. A session the view does not show is gone only when its workspace is not shown either:
+//!   a session record syncs apart from its workspace's, so one that has not arrived yet is not
+//!   an interruption (the 15-minute rule still applies through its machine).
+//! - Before a resumed session starts, the approval and the issue text are read again as `start`
+//!   does (start.rs `build`): a withdrawn approval or a text changed by someone who is not an
+//!   instructor ends the run stuck and starts nothing, and an issue text edited since the
+//!   approval is not resumed from a branch, as `start`'s own `resume_from` does (the runner's
+//!   `watch` made such a run stuck before `advance`). The refusal is stuck, not `start`'s
+//!   withdraw: the resume workspace is kept, as a stuck run's is.
 //! - A run with no recorded approval goes stuck as `start` does ([`messages::CANNOT_CONFIRM`])
-//!   in place of the runner's `thread-gone`, since a resume starts a session.
+//!   in place of the runner's `thread-gone`, since a resume starts a session; the session's
+//!   end is the detail of the stop in the ledger.
 //! - A pull request from a fork is not resumed from, and the resume continues from the run's own
 //!   branch or the base; a same-repo pull request whose head is not a plain branch name is
 //!   refused (review focus 2), where the runner started from the base. The runner's
 //!   `pr_left` line, which recorded a pull request a stuck run left, is not written (building's
 //!   doc says so too).
+//! - A resume with no branch (a new branch from the base) starts with [`messages::launch`], not
+//!   [`messages::resumed`]: the resumed paragraph tells the session "the worktree already holds
+//!   its commits", which is false for a new branch from the base. This is the runner's
+//!   behaviour too.
 //! - A session on a machine that stays unreachable cannot be asked to end its sessions: a run
-//!   stuck for it names its machine ([`MACHINE_UNREACHABLE`]) and asks nothing of it. The
-//!   machine ends its own factory sessions (G10) when it is heard from again, and
-//!   [`orphans`] archives its workspaces.
+//!   stuck, abandoned or ended for it names its machine ([`MACHINE_UNREACHABLE`]) and asks
+//!   nothing of it. The machine ends its own factory sessions (G10) when it is heard from again,
+//!   and [`orphans`] archives its workspaces. While the earlier workspace shows on a machine
+//!   that is heard from, the archive is asked again every pass, and the new workspace is never
+//!   asked for in a pass that asked it.
+//! - A machine recorded for a resume or a moved claim that is unreachable for 15 minutes before
+//!   the session started is given up (`resume-machine-given-up`, `claim-moved-given-up`) and
+//!   placement picks another, spending no resume; [`placed`] refuses a machine given up.
 //! - A stuck run's workspace is kept for a person to look at, so [`orphans`] does not list it.
+//! - The moved claim's lines are written with the cause step `advance`, as the rest of this
+//!   module's: `start` reads no cause step.
+//! - The resume and feedback names looked for in the fleet are the first 64, and as many as the
+//!   ledger's resume count or `limits.interruption_resumes` is above that.
 //!
-//! The runner cases of `interruption.test.ts` that have no counterpart, with the reason:
+//! The runner cases of `interruption.test.ts` that have no Rust test of the same name, each with
+//! its reason. The cases not listed are ported under their names.
 //!
-//! - `interrupted: a resume`: a lone failed or cancelled session with T3 healthy is stuck
-//!   (needs T3 evidence); the runner's `pr_left` of a pull request a stuck run left, with or
-//!   without GitHub listing it (not written).
-//! - `interrupted: the cap`: the pull request a gone thread left, by the ledger's branch
-//!   (`pr_left`).
-//! - `interrupted: a T3 restart` (all 14): T3 server starts and stops, its machine log and
-//!   `t3Starts` are the evidence the runner needs and Foundry has no T3.
-//! - `interrupted: a thread that is gone`: the next attempt's approval and instructor, no
-//!   evidence, twice in one pass, a thread found gone by a send, and a launch from base when
-//!   the text was edited since the approval (all of the runner's evidence or its next attempt;
-//!   `start` checks the text before a session starts, and the resume does not leave the run).
-//! - `a decided relaunch` (all 7): a relaunch's decision, its next attempt's ledger and label
-//!   and the time limit, watch and forward skipping it. Foundry skips a run with an interruption
-//!   owed in `building` (tests there), and the stop step owns a stop by hand.
-//! - `a relaunch finds the branch`: an archived thread's branch, and a worktree it removes
-//!   (T3's thread and `worktree_removed`; Foundry's workspace is made on the branch).
-//! - `interrupted: a run with no recorded approval`: a relaunch line in a ledger with no
-//!   approval is an error for `advance` (the runner's next-attempt error).
-//! - `a provider rate limit` (all 14): rate limits, cooldowns, `retry-after` and moving a
-//!   thread to another model are the runner's; P1 marks a session stuck and the factory leaves
-//!   it to `limits.minutes` (building's doc).
-//! - `advance: a session that ended badly`, `advance: a pause by hand` and `the time limit` are
-//!   `building`'s (task 23).
+//! `advance: a session that ended badly` (building.rs ports none of these):
+//! - `still sends a rolled back run to stuck by itself`: no `rolled_back` status in P1.
+//! - `sends an ended badly run with no ordinal to stuck at once, since it cannot be waited
+//!   for`: Foundry has no run ordinals; a turn always has a number.
+//!
+//! `advance: a pause by hand` (a person pausing a T3 thread; P1 has no such status, and a stop
+//! asked for is the stop step's):
+//! - `pauses an interrupted run by hand and does not call it ended badly`
+//! - `does not decide a paused run as an interruption even with T3 trouble`
+//! - `reads a stopped run that a person resumes in T3 as any other`
+//! - `pauses a second stop after a resume again with its own line`
+//! - `lifts the pause with an instructor's issue comment through forward`
+//!
+//! `interrupted: a resume`:
+//! - `resumes two sessions that ended badly in one pass without any T3 trouble`: no T3
+//!   evidence; one end is enough (the first case covers it).
+//! - `sends a lone failed session with T3 healthy to stuck with the old words`, `sends a
+//!   cancelled session with T3 healthy to stuck as cancelled`: the runner's T3 evidence rule.
+//! - `records the pull request a session that ended badly left on its branch`, `ends a session
+//!   that ended badly as stuck even when GitHub cannot list its pull requests`: `pr_left` is
+//!   not written.
+//!
+//! `interrupted: the cap`:
+//! - `used up records the pull request a gone thread left, by the ledger's branch`: `pr_left`.
+//!
+//! `interrupted: a T3 restart` (T3 server starts and stops and its machine log are the runner's
+//! evidence; Foundry has no T3):
+//! - `resumes a lone cancelled run that was running when the server started`
+//! - `records the machine log's error over the start when it has one`
+//! - `resumes a run a graceful shutdown ended just before the next start`
+//! - `resumes a run an earlier start cut off when the server has started again since`
+//! - `sends a run that ended more than ten minutes before a start with no stop on record to
+//!   stuck`
+//! - `resumes a run the shutdown of a server that stayed down for long cut off`
+//! - `resumes a run cut off by a shutdown written more than a day before the start`
+//! - `does not count a stop that belongs to an earlier restart`
+//! - `sends a run that started after the server did to stuck: a person or the provider ended
+//!   it`
+//! - `sends a run that ended before the server started to stuck`
+//! - `resumes a run the shutdown cancelled before it had started`
+//! - `sends a run requested and cancelled after the server started to stuck`
+//! - `sends a run that failed before it had started to stuck, even just before a shutdown`
+//! - `does not relaunch a thread that is gone on the start alone`
+//!
+//! `interrupted: a send cut short`:
+//! - `is sent again under the same command id`: there is no resume message and no command id;
+//!   the cut-short archive is `a_decision_cut_short_before_its_archive_asks_it_on_the_next_pass_without_deciding_again`.
+//!
+//! `interrupted: a thread that is gone`:
+//! - `gives the next attempt this run's approval, with the instructor who made it`: no next
+//!   attempt.
+//! - `with no evidence goes stuck as thread-gone`, `twice in one pass is relaunched without any
+//!   T3 trouble`: the runner's T3 evidence rule.
+//! - `found by a send into it relaunches and counts the resume once`: no resume message is
+//!   sent.
+//! - `does not pass the resumes of a stuck run to a new attempt a person relabelled`: each
+//!   attempt has a ledger of its own, which this step reads alone; nothing here can carry a
+//!   count over.
+//!
+//! `a decided relaunch` (a relaunch's next attempt, its label and the time limit, the watch and
+//! forward skipping it; `building` skips a run with an interruption owed, and the stop step owns
+//! a stop by hand):
+//! - `is left to advance by the time limit`
+//! - `is left to advance by the watch even when the text changed`
+//! - `is left to advance by forward`
+//! - `is finished by the pass's steps in order on a run past its limit`
+//! - `does not reset the label of a next attempt that already started`
+//! - `overtaken by a stop by hand ends the next attempt it made, so it holds no slot`
+//! - `overtaken by a stop by hand leaves a next attempt that already started alone`
+//!
+//! `a relaunch finds the branch` (T3's thread and `worktree_removed`; Foundry's workspace is
+//! made on the branch):
+//! - `an archived thread still reports when the ledger names none`
+//! - `and removes the worktree an archived thread still reports`
+//!
+//! `interrupted: a run with no recorded approval`:
+//! - `whose thread is gone after a T3 outage goes stuck as thread-gone, not relaunched`,
+//!   `found gone by its resume send goes stuck as thread-gone too`: Foundry's counterpart is
+//!   `a_gone_session_with_no_recorded_approval_is_stuck_unconfirmed_naming_its_end` (stuck as
+//!   unconfirmed, with the session's end as the detail), since the stuck reason differs.
+//! - `with a relaunch line in its ledger is an error for advance, with nothing written`: the
+//!   runner's next-attempt error; a ledger with a relaunch line is skipped.
+//!
+//! `the time limit`:
+//! - `stops a run past limits.minutes, and the next attempt resumes from the branch it
+//!   recorded`: the limit is `building::time_limit`'s (its tests are named for Foundry's
+//!   words) and the continuation is `start`'s (task 22).
+//!
+//! `interrupted: a stop by hand`:
+//! - `that lands between the ledger read and the thread read is not a relaunch`: one read of the
+//!   ledger and one of the fleet; a stop that lands later is the next case.
+//!
+//! `a provider rate limit` (rate limits, cooldowns, `retry-after` and moving a thread to another
+//! model are the runner's; P1 marks a session stuck and the factory leaves it to
+//! `limits.minutes`, as building's doc says):
+//! - `is told apart from a session that ended badly, and nothing is written`
+//! - `is resumed after the cooldown without using an interruption resume`
+//! - `keeps the count of an earlier interruption on its line`
+//! - `cut short before its send is sent again under the same command id`
+//! - `is not resumed once the thread has moved on, and nothing is written`
+//! - `moved to another model sends the resume on it, and the run is on that model after`
+//! - `moved to another model and cut short before its send is sent again on that model`
+//! - `takes the provider's retry-after from the error`
+//! - `with no end from T3 is placed at its start, else long ago, never at the clock`
+//! - `is not resumed once a stop by hand is requested, and nothing is written`
+//! - `into a thread that is gone writes nothing, and its send gone leaves the resume owed`
+//! - `owed when its thread is gone charges the relaunch nothing`
+//! - `moved to another model keeps the session's provider options`
+//! - `is not resumed once a relaunch is decided, and nothing is written`
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -133,10 +242,11 @@ use crate::factory::ledger::events::{
     Cause, CauseStep, Event, ModelOption, OptionValue, ResumedFrom, names,
 };
 use crate::factory::lifecycle::State;
+use crate::factory::lifecycle::approval::{Approval, TextCheck, refusal_reason};
 use crate::factory::lifecycle::result_line::{self, SessionResult};
 use crate::factory::messages::{
-    self, CANNOT_CONFIRM, LAUNCH_FAILED, Message, ResumeFrom, SESSION_GONE, prepare_output_tail,
-    prepare_session_text,
+    self, CANNOT_CONFIRM, CANNOT_VERIFY_DURING_BUILD, CHANGED_DURING_BUILD, LAUNCH_FAILED, Message,
+    ResumeFrom, SESSION_GONE, prepare_output_tail, prepare_session_text,
 };
 use crate::factory::text;
 use crate::factory::worker::{CreateWorkspace, FleetView, WorkerError};
@@ -173,8 +283,15 @@ pub const ENDING_SESSIONS: &str = "resume-ending-sessions ";
 pub const SENDING: &str = "resume-sending ";
 /// The step written before the first message is asked for again: `resume-resending <k> <count>`.
 pub const RESENDING: &str = "resume-resending ";
+/// The step written when the machine recorded for the resume was unreachable for 15 minutes
+/// before the session started: `resume-machine-given-up <k> <id>`. Nothing ran, so no resume is
+/// spent, and placement picks another.
+pub const MACHINE_GIVEN_UP: &str = "resume-machine-given-up ";
 /// The step that records the machine a claim moved to: `claim-moved <id>`.
 pub const CLAIM_MOVED: &str = "claim-moved ";
+/// The step written when the machine a claim moved to was unreachable for 15 minutes before its
+/// workspace was answered: `claim-moved-given-up <id>`.
+pub const CLAIM_GIVEN_UP: &str = "claim-moved-given-up ";
 
 /// How many resume and feedback workspace names of a run are looked for in the fleet: the
 /// fleet's view finds a workspace by name, so the names are tried one by one.
@@ -311,7 +428,8 @@ pub fn orphans(
             }
         }
     }
-    let named = named_workspaces(view, project, run);
+    let scan = scan_bound(0, events);
+    let named = named_workspaces(view, project, run, scan);
     let newest_feedback = named
         .iter()
         .filter_map(|(kind, _)| match kind {
@@ -362,6 +480,7 @@ fn named_workspaces<'a>(
     view: &'a FleetView,
     project: ProjectId,
     run: &RunId,
+    scan: u32,
 ) -> Vec<(Kind, &'a Record<Workspace>)> {
     let mut found = Vec::new();
     let base = build_name(run);
@@ -370,14 +489,14 @@ fn named_workspaces<'a>(
             .into_iter()
             .map(|record| (Kind::Build, record)),
     );
-    for k in 1..=NAME_SCAN {
+    for k in 1..=scan {
         found.extend(
             view.workspaces_named(project, &format!("{base}-r{k}"))
                 .into_iter()
                 .map(|record| (Kind::Resume(k), record)),
         );
     }
-    for k in 1..=NAME_SCAN {
+    for k in 1..=scan {
         found.extend(
             view.workspaces_named(project, &format!("{base}-f{k}"))
                 .into_iter()
@@ -392,9 +511,10 @@ fn find_workspace<'a>(
     view: &'a FleetView,
     project: ProjectId,
     run: &RunId,
+    scan: u32,
     id: WorkspaceId,
 ) -> Option<&'a Record<Workspace>> {
-    named_workspaces(view, project, run)
+    named_workspaces(view, project, run, scan)
         .into_iter()
         .map(|(_, record)| record)
         .find(|record| record.body.id == id)
@@ -402,7 +522,21 @@ fn find_workspace<'a>(
 
 /// Whether the run ended stuck, or is stuck: its workspace is kept.
 fn is_stuck(seen: &Seen) -> bool {
-    seen.state == Some(State::Stuck) || seen.stuck.is_some()
+    seen.state == Some(State::Stuck) || seen.stuck.is_some() || seen.stuck_stop.is_some()
+}
+
+/// How many resume and feedback names are looked for: at least [`NAME_SCAN`], and one past the
+/// highest count the ledger or the project's cap names (`limit`), so the newest resume's
+/// workspace is always among them.
+fn scan_bound(limit: u64, events: &[RunEvent]) -> u32 {
+    let highest = events
+        .iter()
+        .filter(|event| event.event == "session_interrupted")
+        .filter_map(|event| event.data.get("resumes").and_then(Value::as_u64))
+        .max()
+        .unwrap_or(0)
+        .max(limit);
+    NAME_SCAN.max(u32::try_from(highest.saturating_add(1)).unwrap_or(u32::MAX))
 }
 
 /// What a session that is not running was found to be.
@@ -452,7 +586,10 @@ struct Round {
     /// The workspace the archive is of, as written: an id or `none`.
     archiving: Option<String>,
     archive_asked: bool,
+    /// The machine recorded for the resume and not given up.
     machine: Option<MachineId>,
+    /// The machines recorded for it that were given up.
+    gave_up: Vec<MachineId>,
     requested: bool,
     workspace: Option<WorkspaceId>,
     sending: bool,
@@ -509,8 +646,18 @@ fn read_round(events: &[RunEvent]) -> Option<Round> {
             round.archiving = Some(rest.to_owned());
         } else if numbered(step, ARCHIVE_ASKED, k).is_some() {
             round.archive_asked = true;
+        } else if let Some(rest) = numbered(step, MACHINE_GIVEN_UP, k) {
+            // What the machine was asked is its own: the next machine starts the round again.
+            round.gave_up.extend(parse_machine(rest));
+            round.machine = None;
+            round.requested = false;
+            round.workspace = None;
+            round.sending = false;
         } else if let Some(rest) = numbered(step, MACHINE, k) {
             round.machine = parse_machine(rest);
+            round.requested = false;
+            round.workspace = None;
+            round.sending = false;
         } else if numbered(step, REQUESTED, k).is_some() {
             round.requested = true;
         } else if let Some(rest) = numbered(step, WORKSPACE, k) {
@@ -523,17 +670,26 @@ fn read_round(events: &[RunEvent]) -> Option<Round> {
     Some(round)
 }
 
-/// The machine a claim moved to since its workspace was last asked for.
-fn moved_to(events: &[RunEvent]) -> Option<MachineId> {
-    let mut moved = None;
+/// The machine a claim moved to since its workspace was last asked for, and the machines it
+/// was moved to and given up.
+fn moved_to(events: &[RunEvent]) -> (Option<MachineId>, Vec<MachineId>) {
+    let (mut moved, mut gave_up) = (None, Vec::new());
     for step in events.iter().filter_map(step_text) {
         if step.starts_with(WORKSPACE_REQUESTED) {
             moved = None;
+            gave_up.clear();
         } else if let Some(machine) = step.strip_prefix(CLAIM_MOVED) {
             moved = parse_machine(machine);
+        } else if let Some(machine) = step.strip_prefix(CLAIM_GIVEN_UP)
+            && let Some(machine) = parse_machine(machine)
+        {
+            gave_up.push(machine);
+            if moved == Some(machine) {
+                moved = None;
+            }
         }
     }
-    moved
+    (moved, gave_up)
 }
 
 /// The newest turn read since the session was launched: the highest `turn-read <n>` after the
@@ -592,6 +748,14 @@ fn not_this_steps(ctx: &RunContext<'_>, run: &RunId, seen: &Seen) -> Option<Stri
         "is finished"
     } else if seen.stop_requested {
         "was asked to stop, which the stop step carries out"
+    } else if seen.stuck.is_some()
+        || seen.stuck_stop.is_some()
+        || seen.stuck_detail.is_some()
+        || seen.stuck_commenting.is_some()
+    {
+        "has a stuck path begun, which the step that began it finishes"
+    } else if seen.questions_posted || seen.questions_commenting.is_some() || seen.withdrawn {
+        "has questions posted or an approval withdrawn, which building and start finish"
     } else if seen
         .interruption
         .as_ref()
@@ -646,15 +810,19 @@ fn pass(
     if seen.state == Some(State::Triage) && !seen.rechecked {
         return skipped(run, "is launching, which start carries out");
     }
+    // Nothing is owed, so no machine is needed.
+    if placed.is_some() {
+        return skipped(run, "needs no machine");
+    }
     // The gate has the pull request the session reported.
     let with_the_gate = seen.pr_reported || (seen.pass.is_some() && seen.last_pr.is_some());
     let ended = if with_the_gate {
         None
     } else {
-        ended(ctx, &events, &seen)?
+        ended(ctx, run, &events, &seen)?
     };
     match ended {
-        Some(ended) => decide(ctx, run, &seen, &mut at, &ended),
+        Some(ended) => decide(ctx, run, &events, &seen, &mut at, &ended),
         None => resend(ctx, run, &events, &seen),
     }
 }
@@ -664,6 +832,7 @@ fn pass(
 /// `FACTORY-DONE` is `building`'s.
 fn ended(
     ctx: &RunContext<'_>,
+    run: &RunId,
     events: &[RunEvent],
     seen: &Seen,
 ) -> Result<Option<Ended>, RunError> {
@@ -672,7 +841,20 @@ fn ended(
     };
     let session = session_id(thread)?;
     let Some(state) = ctx.view.session_state(session) else {
-        return Ok(Some(Ended::Gone));
+        // A session record syncs apart from its workspace's: one the view does not show while
+        // its workspace still does is not gone, only not here yet. A machine that stays away
+        // for 15 minutes ends it all the same.
+        let shown = seen
+            .worktree
+            .as_deref()
+            .and_then(|id| workspace_id(id).ok())
+            .and_then(|id| {
+                find_workspace(ctx.view, ctx.project.id, run, scan_bound(0, events), id)
+            });
+        return Ok(match shown {
+            None => Some(Ended::Gone),
+            Some(record) => unreachable_long(ctx, record.owner).then_some(Ended::Unreachable),
+        });
     };
     match state {
         SessionState::Unreachable => {
@@ -767,21 +949,40 @@ fn launch_message(ctx: &RunContext<'_>, run: &RunId, seen: &Seen, branch: Option
     }
 }
 
-/// The step an issue that was closed ends the run with, when it was.
+/// The step an issue that was closed ends the run with, when it was. The earlier session is
+/// ended through its machine, unless that machine has been unreachable for 15 minutes: it ends
+/// its own sessions (G10), and it cannot be asked.
 fn closing_step(
     ctx: &RunContext<'_>,
     run: &RunId,
+    events: &[RunEvent],
     seen: &Seen,
     closing: Closing,
 ) -> Result<Option<ResumeStep>, RunError> {
+    if closing == Closing::Open {
+        return Ok(None);
+    }
+    let owner = seen
+        .worktree
+        .as_deref()
+        .or(seen.workspace.as_deref())
+        .and_then(|id| workspace_id(id).ok())
+        .and_then(|id| find_workspace(ctx.view, ctx.project.id, run, scan_bound(0, events), id))
+        .map(|record| record.owner)
+        .or_else(|| seen.machine.as_deref().and_then(parse_machine));
+    let mut ending = seen.clone();
+    if owner.is_some_and(|machine| unreachable_long(ctx, machine)) {
+        ending.worktree = None;
+        ending.workspace = None;
+    }
     match closing {
         Closing::Open => Ok(None),
         Closing::PersonsMove => {
-            abandon(ctx, run, seen, CauseStep::Advance)?;
+            abandon(ctx, run, &ending, CauseStep::Advance)?;
             Ok(Some(ResumeStep::Abandoned))
         }
         Closing::OwnMerge(pull) => {
-            end_own_merge(ctx, run, seen, CauseStep::Advance, &pull)?;
+            end_own_merge(ctx, run, &ending, CauseStep::Advance, &pull)?;
             Ok(Some(ResumeStep::Ended))
         }
     }
@@ -811,7 +1012,7 @@ fn stuck(
 /// Where the resume continues: the open pull request's head, else the run's own branch when it
 /// is on `origin`, else none. A pull request from a fork is not resumed from. A head that is
 /// not a plain branch name is refused.
-fn choose_branch(ctx: &RunContext<'_>, seen: &Seen) -> Result<Branch, RunError> {
+fn choose_branch(ctx: &RunContext<'_>, issue: u64, seen: &Seen) -> Result<Branch, RunError> {
     if let Some(last) = &seen.last_pr
         && let Some(pull) = ctx.tracker.pull_request(ctx.repo(), last.pr)?
         && pull.open
@@ -822,6 +1023,17 @@ fn choose_branch(ctx: &RunContext<'_>, seen: &Seen) -> Result<Branch, RunError> 
         } else {
             Branch::Refused
         });
+    }
+    // As `start` resumes a launch: an issue text edited since the approval is not continued
+    // from a branch, and the resume starts from the base.
+    let edited = match &seen.approved_at {
+        Some(approved_at) => ctx
+            .tracker
+            .text_edited_since(ctx.repo(), issue, approved_at)?,
+        None => true,
+    };
+    if edited {
+        return Ok(Branch::Use(None));
     }
     let mut tried: Vec<&str> = Vec::new();
     for candidate in [seen.last_branch.as_deref(), seen.resumed_from.as_deref()]
@@ -851,13 +1063,14 @@ fn choose_branch(ctx: &RunContext<'_>, seen: &Seen) -> Result<Branch, RunError> 
 fn decide(
     ctx: &RunContext<'_>,
     run: &RunId,
+    events: &[RunEvent],
     seen: &Seen,
     at: &mut Progress,
     ended: &Ended,
 ) -> Result<ResumeStep, RunError> {
     let issue = run.issue();
     let (closing, _) = closed_issue(ctx, run, seen)?;
-    if let Some(step) = closing_step(ctx, run, seen, closing)? {
+    if let Some(step) = closing_step(ctx, run, events, seen, closing)? {
         return Ok(step);
     }
     ensure_building(ctx, issue, at)?;
@@ -882,7 +1095,7 @@ fn decide(
         };
         return stuck(ctx, run, at, "approval-unconfirmed", stop);
     }
-    let branch = match choose_branch(ctx, seen)? {
+    let branch = match choose_branch(ctx, issue, seen)? {
         Branch::Use(branch) => branch,
         Branch::Refused => {
             let stop = Stop {
@@ -907,20 +1120,32 @@ fn decide(
         },
         &Cause::new(CauseStep::Advance, "session-interrupted"),
     )?;
-    archive_old(ctx, run, old_workspace(seen)?, k, true)
+    archive_old(ctx, run, old_workspace(seen)?, k, Records::Both)
 }
 
-/// The earlier workspace's archive: recorded (`record_step`, once), then asked for. A machine
-/// that cannot be reached is no error: it archives the workspace when it is heard from again
-/// ([`orphans`]). Any other failure is asked again next pass.
+/// What [`archive_old`] records of the ask.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Records {
+    /// The step that names the workspace, and that the archive was asked.
+    Both,
+    /// That the archive was asked.
+    Asked,
+    /// Nothing: the archive is asked again of a machine that is heard from.
+    Nothing,
+}
+
+/// The earlier workspace's archive: recorded (as `records` says), then asked for. A machine
+/// that cannot be reached is no error: the archive is asked again once it is heard from, or
+/// the resume goes on when it has been unreachable for 15 minutes. Any other failure is asked
+/// again next pass.
 fn archive_old(
     ctx: &RunContext<'_>,
     run: &RunId,
     old: Option<WorkspaceId>,
     k: u32,
-    record_step: bool,
+    records: Records,
 ) -> Result<ResumeStep, RunError> {
-    if record_step {
+    if records == Records::Both {
         let named = old.map_or_else(|| "none".to_owned(), |id| id.to_string());
         note(
             ctx,
@@ -935,12 +1160,14 @@ fn archive_old(
             Err(error) => return Err(error),
         }
     }
-    note(
-        ctx,
-        run,
-        &format!("{ARCHIVE_ASKED}{k}"),
-        "resume-archive-asked",
-    )?;
+    if records != Records::Nothing {
+        note(
+            ctx,
+            run,
+            &format!("{ARCHIVE_ASKED}{k}"),
+            "resume-archive-asked",
+        )?;
+    }
     Ok(ResumeStep::Archiving {
         resumes: k,
         workspace: old,
@@ -948,7 +1175,8 @@ fn archive_old(
 }
 
 /// A resume owed, `k`-th: the archive, the wait for it, the machine, the workspace, its setup
-/// and the session, each from where the ledger shows it stopped.
+/// and the session, each from where the ledger shows it stopped. A call with a machine placed
+/// ([`placed`]) acts only where a machine is needed.
 #[allow(clippy::too_many_arguments)]
 fn carry_on(
     ctx: &RunContext<'_>,
@@ -962,33 +1190,54 @@ fn carry_on(
 ) -> Result<ResumeStep, RunError> {
     let issue = run.issue();
     let (closing, detail) = closed_issue(ctx, run, seen)?;
-    if let Some(step) = closing_step(ctx, run, seen, closing)? {
+    if let Some(step) = closing_step(ctx, run, events, seen, closing)? {
         return Ok(step);
     }
     let round = read_round(events)
         .filter(|round| round.k == k)
         .ok_or_else(|| RunError::Invalid(format!("run {run} owes resume {k} with no decision")))?;
+    let scan = scan_bound(ctx.config.limits.interruption_resumes, events);
     ensure_building(ctx, issue, at)?;
+    let needs_no_machine = || skipped(run, "needs no machine yet");
     let Some(archiving) = &round.archiving else {
-        return archive_old(ctx, run, old_workspace(seen)?, k, true);
+        if placed.is_some() {
+            return needs_no_machine();
+        }
+        return archive_old(ctx, run, old_workspace(seen)?, k, Records::Both);
     };
     let old = match archiving.as_str() {
         "none" => None,
         text => Some(workspace_id(text)?),
     };
     if !round.archive_asked {
-        return archive_old(ctx, run, old, k, false);
+        if placed.is_some() {
+            return needs_no_machine();
+        }
+        return archive_old(ctx, run, old, k, Records::Asked);
     }
-    // Once it shows archived, or its machine is gone for good.
+    // Once it shows archived, or its machine is gone for good. While it shows on a machine that
+    // is heard from, the archive is asked again: an answer of unreachable may have been a
+    // timeout, and the archive is safe to repeat.
     if let Some(old) = old
-        && let Some(record) = find_workspace(ctx.view, ctx.project.id, run, old)
+        && let Some(record) = find_workspace(ctx.view, ctx.project.id, run, scan, old)
         && !unreachable_long(ctx, record.owner)
     {
+        if placed.is_some() {
+            return needs_no_machine();
+        }
+        if ctx.view.online(record.owner) {
+            return archive_old(ctx, run, Some(old), k, Records::Nothing);
+        }
         return Ok(ResumeStep::Waiting(Wait::Archive));
     }
     let machine = match (round.machine, placed) {
         (Some(machine), _) => machine,
         (None, Some(machine)) => {
+            if round.gave_up.contains(&machine) {
+                return Err(RunError::Invalid(format!(
+                    "run {run} gave up on machine {machine} for resume {k}"
+                )));
+            }
             note(
                 ctx,
                 run,
@@ -999,6 +1248,17 @@ fn carry_on(
         }
         (None, None) => return Ok(ResumeStep::NeedsMachine(Placing::Resume { resumes: k })),
     };
+    // A machine that stays away for 15 minutes before the session started is given up: nothing
+    // ran, so no resume is spent, and what it made is for [`orphans`] when it is heard from.
+    if unreachable_long(ctx, machine) {
+        note(
+            ctx,
+            run,
+            &format!("{MACHINE_GIVEN_UP}{k} {machine}"),
+            "resume-machine-given-up",
+        )?;
+        return Ok(ResumeStep::NeedsMachine(Placing::Resume { resumes: k }));
+    }
     let name = resume_name(run, k);
     let named = ctx.view.workspaces_named(ctx.project.id, &name);
     let record = match round.workspace {
@@ -1093,6 +1353,32 @@ fn carry_on(
         && ctx.view.session_turn(found.body.id).is_some()
     {
         return launched.record(ctx, at, found.body.id);
+    }
+    // Before every start, as `start` does: the approval, and the text since it. A session that
+    // would act on text no instructor approved is not started.
+    if let Approval::Refused(refusal) =
+        ctx.tracker
+            .approval(ctx.repo(), issue, &ctx.config.instructors)?
+    {
+        let stop = Stop::new(refusal_reason(&refusal));
+        return stuck(ctx, run, at, "approval-withdrawn", stop);
+    }
+    let Some(approved_at) = &seen.approved_at else {
+        return Err(RunError::Invalid(format!("run {run} records no approval")));
+    };
+    match ctx
+        .tracker
+        .text_check(ctx.repo(), issue, approved_at, &ctx.config.instructors)?
+    {
+        TextCheck::Unchanged => {}
+        TextCheck::Changed => {
+            let stop = Stop::new(CHANGED_DURING_BUILD);
+            return stuck(ctx, run, at, "text-changed-during-build", stop);
+        }
+        TextCheck::Unjudged => {
+            let stop = Stop::new(CANNOT_VERIFY_DURING_BUILD);
+            return stuck(ctx, run, at, "edits-unverifiable", stop);
+        }
     }
     let first = launch_message(ctx, run, seen, branch);
     let start = FactoryStart {
@@ -1283,38 +1569,54 @@ fn moved_claim(
     let Some(claimed_on) = seen.machine.as_deref().and_then(parse_machine) else {
         return skipped(run, "names no machine");
     };
-    let target = match moved_to(events) {
-        Some(machine) => machine,
-        None => {
-            if !ctx.view.workspaces_named(ctx.project.id, &name).is_empty() {
-                return skipped(run, "has a build workspace");
-            }
-            if !unreachable_long(ctx, claimed_on) {
-                return skipped(run, "has a machine that is not unreachable for long");
-            }
-            let Some(machine) = placed else {
-                return Ok(ResumeStep::NeedsMachine(Placing::MovedClaim {
-                    unreachable: claimed_on,
-                }));
-            };
-            if machine == claimed_on {
-                return Err(RunError::Invalid(format!(
-                    "run {run} cannot move to the machine that is unreachable"
-                )));
-            }
-            let (closing, _) = closed_issue(ctx, run, seen)?;
-            if let Some(step) = closing_step(ctx, run, seen, closing)? {
-                return Ok(step);
-            }
-            ctx.held()?;
-            ctx.record_step(
-                run,
-                &format!("{CLAIM_MOVED}{machine}"),
-                &Cause::new(CauseStep::Start, "claim-moved"),
-            )?;
+    let (moved, gave_up) = moved_to(events);
+    let needs_a_machine = ResumeStep::NeedsMachine(Placing::MovedClaim {
+        unreachable: claimed_on,
+    });
+    // Not yet moved: only a claim whose machine is gone for good and which made nothing is.
+    // A claim that was moved and given up has gone through that already.
+    if moved.is_none() && gave_up.is_empty() {
+        if !ctx.view.workspaces_named(ctx.project.id, &name).is_empty() {
+            return skipped(run, "has a build workspace");
+        }
+        if !unreachable_long(ctx, claimed_on) {
+            return skipped(run, "has a machine that is not unreachable for long");
+        }
+    }
+    if moved.is_none() && placed.is_none() {
+        return Ok(needs_a_machine);
+    }
+    if let Some(machine) = placed
+        && moved.is_none()
+        && (machine == claimed_on || gave_up.contains(&machine))
+    {
+        return Err(RunError::Invalid(format!(
+            "run {run} cannot move to machine {machine}, which it was or is unreachable on"
+        )));
+    }
+    let (closing, _) = closed_issue(ctx, run, seen)?;
+    if let Some(step) = closing_step(ctx, run, events, seen, closing)? {
+        return Ok(step);
+    }
+    let target = match (moved, placed) {
+        (Some(machine), _) => machine,
+        (None, Some(machine)) => {
+            note(ctx, run, &format!("{CLAIM_MOVED}{machine}"), "claim-moved")?;
             machine
         }
+        (None, None) => return Ok(needs_a_machine),
     };
+    // The machine it moved to stays away for 15 minutes before it answered: given up, and the
+    // pass places another.
+    if unreachable_long(ctx, target) {
+        note(
+            ctx,
+            run,
+            &format!("{CLAIM_GIVEN_UP}{target}"),
+            "claim-moved-given-up",
+        )?;
+        return Ok(needs_a_machine);
+    }
     ctx.upsert_status(
         issue,
         &messages::status(State::Triage, &target.to_string(), None, None),
@@ -1346,11 +1648,11 @@ fn moved_claim(
             },
         },
     )?;
-    ctx.held()?;
-    ctx.record_step(
+    note(
+        ctx,
         run,
         &format!("{WORKSPACE_CREATED}{workspace}"),
-        &Cause::new(CauseStep::Start, "workspace-created"),
+        "workspace-created",
     )?;
     Ok(ResumeStep::Moved {
         machine: target,
