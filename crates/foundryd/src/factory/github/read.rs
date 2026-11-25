@@ -3041,15 +3041,21 @@ mod tests {
 
     #[test]
     fn any_other_pull_request_failure_stays_an_error() {
-        for stderr in [
-            "HTTP 502: Bad Gateway",
-            "Could not resolve host: api.github.com",
-            "Could not resolve to an Issue with the number of 5.",
-            "",
+        for (stderr, want) in [
+            ("HTTP 502: Bad Gateway", OtherKind::NoAnswer),
+            ("Could not resolve host: api.github.com", OtherKind::Failed),
+            (
+                "Could not resolve to an Issue with the number of 5.",
+                OtherKind::Failed,
+            ),
+            ("", OtherKind::Failed),
         ] {
             let fake = FakeTracker::answering([Answer::fail(1, stderr)]);
             let error = pull_request(&fake, REPO, 999).unwrap_err();
-            assert!(is_failed(&error), "{stderr}: {error}");
+            assert!(
+                matches!(&error, TrackerError::Other { kind, .. } if *kind == want),
+                "{stderr}: {error}"
+            );
             assert!(error.to_string().contains("status 1"), "{stderr}: {error}");
         }
         let fake = FakeTracker::new();
@@ -4755,7 +4761,7 @@ mod tests {
         assert_eq!(
             error,
             TrackerError::Other {
-                kind: OtherKind::Failed,
+                kind: OtherKind::NoAnswer,
                 message: format!(
                     "`{}` exited with status 1: HTTP 502",
                     command_text(&approval_call())
@@ -5351,7 +5357,7 @@ mod tests {
             .text_check(REPO, 6, LABELED, &names(&["tom"]))
             .unwrap_err();
         assert!(
-            matches!(&error, TrackerError::Other { kind: OtherKind::Failed, message: m } if m.contains("exited with status 1")),
+            matches!(&error, TrackerError::Other { kind: OtherKind::NoAnswer, message: m } if m.contains("exited with status 1")),
             "{error}"
         );
 
