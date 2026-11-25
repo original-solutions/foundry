@@ -1933,6 +1933,38 @@ mod tests {
             assert!(rig.steps(&run).contains(&GATE_RESULTS_POSTED.to_string()));
         }
 
+        /// The intent names the newest marked comment of the login on the pull request, so a
+        /// later pass looks only at comments newer than it.
+        #[test]
+        fn the_gate_results_intent_records_the_newest_own_comments_id() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            rig.tracker
+                .post_comment(REPO, 12, "an earlier comment")
+                .unwrap();
+            let id = newest_own_id(&rig.ctx(), 12).unwrap();
+            assert!(id > 0);
+            let payload = ActionPayload {
+                comment: Some("gate passed".into()),
+                ..ActionPayload::default()
+            };
+            let mut at = progress(&rig, &run, State::Building);
+            apply_actions(
+                &rig.ctx(),
+                ISSUE,
+                &mut at,
+                &[Action::PostGateResults { pr: 12 }],
+                &cause(),
+                &payload,
+            )
+            .unwrap();
+            assert!(
+                rig.steps(&run)
+                    .contains(&format!("{GATE_RESULTS_COMMENTING} {id}"))
+            );
+        }
+
         /// A forward sent under the session's prompt count, recorded before the send: a repeat
         /// after a lost answer goes under the same count and is delivered when the count rose.
         #[test]
@@ -2096,6 +2128,84 @@ mod tests {
             let mut at = progress(&rig, &run, State::Building);
             apply_actions(&rig.ctx(), ISSUE, &mut at, &actions, &cause(), &payload).unwrap();
             assert_eq!(send_counts(&rig), vec![Some(3), Some(4)]);
+            assert!(rig.names(&run).contains(&"comment_forwarded".to_string()));
+        }
+
+        fn forward(
+            rig: &Rig,
+            run: &RunId,
+            payload: &ActionPayload,
+            actions: &[Action],
+        ) -> Result<(), RunError> {
+            let mut at = progress(rig, run, State::Building);
+            apply_actions(&rig.ctx(), ISSUE, &mut at, actions, &cause(), payload)
+        }
+
+        /// A try that may have typed keeps its count through a refused repeat: the session is
+        /// busy with the line it took, so its count rose, and a try under the risen count would
+        /// type the line a second time.
+        #[test]
+        fn a_refused_repeat_of_a_send_that_may_have_typed_keeps_its_count() {
+            let (mut rig, run, payload, actions) = forward_rig(3);
+            rig.worker.on_send(Err(SendRefused::Failed {
+                reason: "timed out".into(),
+                prompts: Some(3),
+            }));
+            assert!(forward(&rig, &run, &payload, &actions).is_err());
+            set_prompts(&mut rig, 4);
+            rig.worker.on_send(Err(SendRefused::NotIdle));
+            assert!(forward(&rig, &run, &payload, &actions).is_err());
+            rig.worker.on_send(Err(SendRefused::CountRose { now: 4 }));
+            forward(&rig, &run, &payload, &actions).unwrap();
+            assert_eq!(send_counts(&rig), vec![Some(3), Some(3), Some(3)]);
+            assert!(rig.names(&run).contains(&"comment_forwarded".to_string()));
+        }
+
+        /// A send stopped by a lost lease asked nothing of the worker and records no try: the
+        /// next try reads the count anew, so a count another prompt raised is not taken as this
+        /// message typed.
+        #[test]
+        fn a_send_stopped_by_a_lost_lease_records_no_try() {
+            let (mut rig, run, payload, actions) = forward_rig(3);
+            rig.guard = Box::new(Lost);
+            assert!(matches!(
+                forward(&rig, &run, &payload, &actions),
+                Err(RunError::LeaseLost(_))
+            ));
+            assert!(rig.worker.calls().is_empty());
+            assert!(
+                !rig.steps(&run)
+                    .iter()
+                    .any(|step| step.starts_with(SEND_INTENT)),
+                "{:?}",
+                rig.steps(&run)
+            );
+            rig.guard = Box::new(crate::factory::worker::AlwaysHeld(1));
+            set_prompts(&mut rig, 4);
+            rig.worker.on_send(Ok(4));
+            forward(&rig, &run, &payload, &actions).unwrap();
+            assert_eq!(send_counts(&rig), vec![Some(4)]);
+        }
+
+        /// A send with no count to go under (the fleet shows no turn for the session) that
+        /// failed after the worker read the count records that count: the next try goes under
+        /// it, and a risen count is the message typed.
+        #[test]
+        fn a_send_with_no_count_that_failed_after_reading_one_is_tried_again_under_it() {
+            let (mut rig, run, payload, actions) = forward_rig(3);
+            rig.view = FleetView::builder().build();
+            rig.worker.on_send(Err(SendRefused::Failed {
+                reason: "timed out".into(),
+                prompts: Some(5),
+            }));
+            assert!(forward(&rig, &run, &payload, &actions).is_err());
+            assert!(
+                rig.steps(&run)
+                    .contains(&"send-intent forward-comment c1 5".to_string())
+            );
+            rig.worker.on_send(Err(SendRefused::CountRose { now: 6 }));
+            forward(&rig, &run, &payload, &actions).unwrap();
+            assert_eq!(send_counts(&rig), vec![None, Some(5)]);
             assert!(rig.names(&run).contains(&"comment_forwarded".to_string()));
         }
 
@@ -2403,6 +2513,74 @@ mod tests {
             assert!(rig.names(&run).contains(&"questions_posted".to_string()));
         }
 
+        fn ask(rig: &Rig, run: &RunId) -> Result<(), RunError> {
+            let mut at = progress(rig, run, State::Building);
+            apply_actions(
+                &rig.ctx(),
+                ISSUE,
+                &mut at,
+                &[Action::PostQuestions {
+                    questions: "which one?".into(),
+                }],
+                &Cause::new(CauseStep::Start, "t"),
+                &ActionPayload::default(),
+            )
+        }
+
+        /// An earlier stop's identical questions are not this stop's: the intent records the
+        /// newest comment's id, and a post that failed is made on the next pass.
+        #[test]
+        fn an_earlier_identical_questions_comment_is_not_taken_as_this_ones() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            rig.tracker
+                .post_comment(REPO, ISSUE, &messages::questions("which one?"))
+                .unwrap();
+            rig.sim.fail("issue comment", 1);
+            assert!(ask(&rig, &run).is_err());
+            ask(&rig, &run).unwrap();
+            let posted = rig
+                .sim
+                .comments()
+                .iter()
+                .filter(|c| c.contains("which one?"))
+                .count();
+            assert_eq!(posted, 2);
+            assert!(rig.names(&run).contains(&"questions_posted".to_string()));
+        }
+
+        /// The stuck and questions intents name the newest marked comment of the login on the
+        /// issue, so a later pass looks only at comments newer than it.
+        #[test]
+        fn the_stuck_and_questions_intents_record_the_newest_own_comments_id() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            rig.tracker
+                .post_comment(REPO, ISSUE, "an earlier comment")
+                .unwrap();
+            let id = newest_own_id(&rig.ctx(), ISSUE).unwrap();
+            assert!(id > 0);
+            ask(&rig, &run).unwrap();
+            assert!(
+                rig.steps(&run)
+                    .contains(&format!("{QUESTIONS_COMMENTING} {id}")),
+                "{:?}",
+                rig.steps(&run)
+            );
+            let newest = newest_own_id(&rig.ctx(), ISSUE).unwrap();
+            assert!(newest > id);
+            let mut at = progress(&rig, &run, State::Building);
+            go_stuck(&rig.ctx(), ISSUE, &mut at, "c", stuck_stop(), None).unwrap();
+            assert!(
+                rig.steps(&run)
+                    .contains(&format!("{STUCK_COMMENTING} {newest}")),
+                "{:?}",
+                rig.steps(&run)
+            );
+        }
+
         #[test]
         fn the_questions_comment_is_recorded_as_intended_before_it_is_posted() {
             let rig = Rig::new();
@@ -2422,7 +2600,10 @@ mod tests {
             .unwrap();
             assert!(
                 rig.steps(&run)
-                    .contains(&"questions-commenting".to_string())
+                    .iter()
+                    .any(|step| step.starts_with("questions-commenting ")),
+                "{:?}",
+                rig.steps(&run)
             );
         }
 

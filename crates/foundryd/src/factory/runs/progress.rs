@@ -1537,6 +1537,122 @@ mod tests {
         }
     }
 
+    mod the_comment_intents {
+        use super::*;
+
+        #[test]
+        fn hold_the_id_each_intent_names_and_a_bare_intent_is_zero() {
+            let seen = seen_of(&[
+                step(1, "questions-commenting 7"),
+                step(2, "stuck-commenting 8"),
+                step(3, "gate-results-commenting 9"),
+            ]);
+            assert_eq!(seen.questions_commenting, Some(7));
+            assert_eq!(seen.stuck_commenting, Some(8));
+            assert_eq!(seen.gate_commenting, Some(9));
+            assert_eq!(
+                seen_of(&[step(1, "questions-commenting")]).questions_commenting,
+                Some(0)
+            );
+        }
+
+        #[test]
+        fn a_gate_results_intent_ends_when_the_results_are_posted_and_a_new_one_starts_again() {
+            let posted = [
+                step(1, "gate-results-commenting 9"),
+                step(2, GATE_RESULTS_POSTED),
+            ];
+            let seen = seen_of(&posted);
+            assert_eq!(seen.gate_commenting, None);
+            assert!(seen.results_posted);
+            let again = seen_of(&plus(&posted, vec![step(3, "gate-results-commenting 12")]));
+            assert_eq!(again.gate_commenting, Some(12));
+        }
+
+        #[test]
+        fn a_questions_intent_ends_when_they_are_posted_or_the_run_is_building_again() {
+            let intended = step(1, "questions-commenting 7");
+            let posted = line(2, "questions_posted", json!({"questions": "q"}));
+            assert_eq!(
+                seen_of(&[intended.clone(), posted]).questions_commenting,
+                None
+            );
+            assert_eq!(
+                seen_of(&[intended, moved(2, "needs-info", "building")]).questions_commenting,
+                None
+            );
+        }
+    }
+
+    mod the_sends_to_the_session {
+        use super::*;
+
+        fn tries(lines: &[Line]) -> Option<SendTries> {
+            seen_of(lines).sends.get("forward-comment c1").cloned()
+        }
+
+        fn intent(ms: u64, count: u64) -> Line {
+            step(ms, &format!("{SEND_INTENT}forward-comment c1 {count}"))
+        }
+
+        fn refused(ms: u64) -> Line {
+            step(ms, &format!("{SEND_REFUSED}forward-comment c1"))
+        }
+
+        #[test]
+        fn a_try_with_no_refusal_after_it_may_have_typed() {
+            let sent = tries(&[intent(1, 3)]).unwrap();
+            assert_eq!(sent.count, 3);
+            assert!(sent.may_have_typed());
+        }
+
+        #[test]
+        fn a_refused_try_typed_nothing() {
+            assert!(!tries(&[intent(1, 3), refused(2)]).unwrap().may_have_typed());
+        }
+
+        /// A refusal is of the try just before it: an earlier try under the same count whose
+        /// answer was lost may still have typed.
+        #[test]
+        fn a_refused_repeat_leaves_an_earlier_try_that_may_have_typed() {
+            let sent = tries(&[intent(1, 3), intent(2, 3), refused(3)]).unwrap();
+            assert_eq!((sent.count, sent.tries, sent.refused), (3, 2, 1));
+            assert!(sent.may_have_typed());
+        }
+
+        /// A new count is written only when no try may have typed, so it starts the tries
+        /// again.
+        #[test]
+        fn a_new_count_starts_the_tries_again() {
+            let sent = tries(&[intent(1, 3), refused(2), intent(3, 4)]).unwrap();
+            assert_eq!((sent.count, sent.tries, sent.refused), (4, 1, 0));
+            let refused_at_the_new_count =
+                tries(&[intent(1, 3), refused(2), intent(3, 4), refused(4)]).unwrap();
+            assert!(!refused_at_the_new_count.may_have_typed());
+        }
+
+        #[test]
+        fn a_refusal_with_no_try_before_it_counts_for_nothing() {
+            assert_eq!(tries(&[refused(1)]), None);
+            let sent = tries(&[intent(1, 3), refused(2), refused(3), intent(4, 3)]).unwrap();
+            assert!(sent.may_have_typed());
+        }
+
+        #[test]
+        fn keeps_each_key_apart_and_ignores_an_intent_with_no_count() {
+            let seen = seen_of(&[
+                intent(1, 3),
+                step(2, &format!("{SEND_INTENT}gate-failure 1 1 5")),
+                step(3, &format!("{SEND_REFUSED}gate-failure 1 1")),
+                step(4, &format!("{SEND_INTENT}forward-comment c2 x")),
+            ]);
+            assert!(seen.sends["forward-comment c1"].may_have_typed());
+            assert!(!seen.sends["gate-failure 1 1"].may_have_typed());
+            assert_eq!(seen.sends["gate-failure 1 1"].count, 5);
+            assert!(!seen.sends.contains_key("forward-comment c2"));
+        }
+    }
+
     mod the_reminder_and_the_wait_for_a_newer_run {
         use super::*;
 
