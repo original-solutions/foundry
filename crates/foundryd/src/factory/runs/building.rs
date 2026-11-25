@@ -69,13 +69,14 @@
 //!   the worker refused as `NotIdle` is sent again while the session's turn is the same; a
 //!   newer turn answers a begun reminder whichever message started it, as in the runner, and
 //!   one that ends with no line is stuck with the run's own reason.
-//! - Putting the session's pull request back to draft fails as the runner has it only when
-//!   GitHub says the pull request is not there (`NotFound`): stuck, in the runner's words. A
-//!   rate limit, a timeout, a refused login, `gh` not starting and `gh` failing (a 5xx, a
-//!   dropped connection, a killed `gh`) say nothing about the pull request: on a `gh` failure
-//!   the pull request is read again, and a draft now goes on; anything else is an error with
-//!   nothing more written, and the next pass asks again. A pull request that can never be
-//!   drafted is ended by `limits.minutes`.
+//! - Putting the session's pull request back to draft: a rate limit, a timeout, a refused
+//!   login, `gh` not starting and an answer that cannot be read are an error with nothing more
+//!   written, and the next pass asks again. When `gh` fails (a 5xx, a killed `gh`, status 1) or
+//!   GitHub says `NotFound`, the pull request is read again: that read failing is the error
+//!   (GitHub is down), a draft now goes on, one open and not a draft is stuck in the runner's
+//!   words ("it is not a draft"), and one gone is stuck as one that does not exist. A pull
+//!   request that can never be drafted is stuck at once; one GitHub never answers is ended by
+//!   `limits.minutes`.
 //! - The runner's case of a run with no ordinal and no result line, stuck at once, has no
 //!   counterpart: a turn always has a number. Its cases about a run a person stopped
 //!   (`stop-run.sh`), a run whose agent process died, `refused before anything is read`, the
@@ -91,7 +92,7 @@ use foundry_proto::ids::SessionId;
 use foundry_proto::state::SessionState;
 
 use super::progress::{
-    QUESTIONS_COMMENTING, RESULT_LINE_REMINDED, RESULT_LINE_REMINDING, Seen,
+    QUESTIONS_COMMENTING, RESULT_LINE_REMINDED, RESULT_LINE_REMINDING, SEND_TYPED, Seen, SendTries,
     TIME_LIMIT as TIME_LIMIT_CODE, pending_relaunch, read_progress,
 };
 use super::{
@@ -263,14 +264,13 @@ pub fn advance(ctx: &RunContext<'_>, run: &RunId) -> Result<BuildStep, RunError>
             if waiting(&turn) {
                 return step.waiting(&mut at, turn.as_ref());
             }
-            let Some(turn) = turn.filter(|turn| turn.turn > 0) else {
+            match turn_to_act_on(ctx, &events, session) {
+                Some(turn) => step.act(&mut at, &turn),
+                // The newest turn was read already.
+                None if turn.as_ref().is_some_and(|turn| turn.turn > 0) => Ok(step.read_already()),
                 // No turn ended yet: the launch is `start`'s to send again.
-                return Ok(BuildStep::Running);
-            };
-            if !unread(&turn) {
-                return Ok(step.read_already());
+                None => Ok(BuildStep::Running),
             }
-            step.act(&mut at, &turn)
         }
         SessionState::Finished | SessionState::Failed => {
             let Some(turn) = turn.filter(unread) else {
@@ -629,14 +629,22 @@ impl Step<'_, '_> {
             && !reminded
         {
             if turn.turn > u64::from(k) {
+                // The reminder's send may have typed and is answered: it is settled, so that
+                // no later send to the session is refused for it.
+                let key = reminder_key(u64::from(k));
+                if seen.sends.get(&key).is_some_and(SendTries::pending) {
+                    self.ctx.record_step(
+                        self.run,
+                        &format!("{SEND_TYPED}{key}"),
+                        &self.cause("send-typed"),
+                    )?;
+                }
                 self.ctx.record_step(
                     self.run,
                     RESULT_LINE_REMINDED,
                     &self.cause("result-line-reminded"),
                 )?;
                 reminded = true;
-            } else if another_send_pending(seen, &reminder_key(turn.turn)) {
-                return Ok(BuildStep::Running);
             } else {
                 return self.send_reminder(at, turn, None);
             }
@@ -672,8 +680,9 @@ impl Step<'_, '_> {
                     return self.stuck(at, WRONG_ACCOUNT_CODE, stop);
                 }
                 if lacks_result_line(reason) && !reminded {
-                    // One message at a time to a session: another send that may have typed is
-                    // settled first, and nothing is written meanwhile.
+                    // `send_once`'s rule (one message at a time to a session), applied before
+                    // the step that begins the reminder is written, so that a pass that cannot
+                    // send writes nothing.
                     if another_send_pending(seen, &reminder_key(turn.turn)) {
                         return Ok(BuildStep::Running);
                     }
@@ -789,7 +798,13 @@ impl Step<'_, '_> {
         }
         let pull = pull.ok_or_else(|| RunError::Invalid("a bound pull request is gone".into()))?;
         // The session's pull request that is open and ready for review goes back to draft:
-        // only the gate marks it ready. A call that fails leaves it as it is, and stuck.
+        // only the gate marks it ready. A rate limit, a timeout, a refused login, `gh` not
+        // starting or an answer that cannot be read say nothing about the pull request: an
+        // error with nothing more written, asked again next pass. When `gh` fails, or GitHub
+        // says the pull request is not there, it is read again: a failed read is that error
+        // (GitHub is down), a draft now goes on, one open and not a draft is stuck in the
+        // runner's words (GitHub answered and the call was refused), and one gone is stuck as
+        // a pull request that does not exist.
         if pull.open && !pull.is_draft {
             match ctx.mark_pr_draft(pr) {
                 Ok(()) => ctx.record(
@@ -797,38 +812,40 @@ impl Step<'_, '_> {
                     Event::PrSetDraft { pr },
                     &self.cause("pr-set-draft"),
                 )?,
-                // `gh` failed (a 5xx, a dropped connection, a killed `gh`, an answer too large):
-                // that says nothing about the pull request, so it is read again. A draft now
-                // goes on; anything else is the error, with nothing more written, and the next
-                // pass asks again (a pull request that can never be drafted is ended by
-                // `limits.minutes`).
                 Err(
-                    error @ RunError::Tracker(TrackerError::Other {
-                        kind: OtherKind::Failed,
-                        ..
-                    }),
+                    error @ RunError::Tracker(
+                        TrackerError::NotFound { .. }
+                        | TrackerError::Other {
+                            kind: OtherKind::Failed,
+                            ..
+                        },
+                    ),
                 ) => match ctx.tracker.pull_request(ctx.repo(), pr) {
-                    Ok(Some(now)) if now.is_draft => {
-                        ctx.record(
-                            self.run,
-                            Event::PrSetDraft { pr },
-                            &self.cause("pr-set-draft"),
-                        )?;
+                    Err(_) => return Err(error),
+                    Ok(Some(now)) if now.is_draft => ctx.record(
+                        self.run,
+                        Event::PrSetDraft { pr },
+                        &self.cause("pr-set-draft"),
+                    )?,
+                    Ok(Some(_)) => {
+                        let stop = Stop {
+                            reason: format!("the session reported PR #{pr} but it is not a draft"),
+                            session_text: prepared(message),
+                            ..Stop::default()
+                        };
+                        return self.stuck(at, NOT_BOUND_CODE, stop);
                     }
-                    _ => return Err(error),
+                    Ok(None) => {
+                        let gone = check_binding(None, pr, base, &branches)
+                            .map_or_else(String::new, |unbound| unbound.public);
+                        let stop = Stop {
+                            reason: gone,
+                            session_text: prepared(message),
+                            ..Stop::default()
+                        };
+                        return self.stuck(at, NOT_BOUND_CODE, stop);
+                    }
                 },
-                // Only GitHub saying the pull request is not there is stuck, in the runner's
-                // words for this case. A rate limit, a timeout, a refused login, `gh` not
-                // starting or an answer that cannot be read say nothing about the pull request
-                // either: an error, asked again next pass.
-                Err(RunError::Tracker(TrackerError::NotFound { .. })) => {
-                    let stop = Stop {
-                        reason: format!("the session reported PR #{pr} but it is not a draft"),
-                        session_text: prepared(message),
-                        ..Stop::default()
-                    };
-                    return self.stuck(at, NOT_BOUND_CODE, stop);
-                }
                 Err(error) => return Err(error),
             }
         }
@@ -867,21 +884,31 @@ pub fn time_limit(ctx: &RunContext<'_>, run: &RunId) -> Result<LimitStep, RunErr
     time_limit_at(ctx, run, crate::factory::ledger::system_ms())
 }
 
-/// Whether `advance` can still finish a questions comment that was begun: the recorded session
-/// is idle with its newest turn unread since its launch, no question waits, and the session
-/// was not launched again after the intent. Otherwise it reads another turn, or none.
+/// The turn `advance` acts on for the recorded `session`: it is idle, no question waits, and
+/// its newest turn ended and is unread since the last launch.
+fn turn_to_act_on(
+    ctx: &RunContext<'_>,
+    events: &[RunEvent],
+    session: SessionId,
+) -> Option<SessionTurn> {
+    if ctx.view.session_state(session) != Some(SessionState::Idle) {
+        return None;
+    }
+    let turn = ctx.view.session_turn(session)?;
+    let read = newest_turn_read(events);
+    (!turn.question && turn.turn > 0 && read.is_none_or(|read| turn.turn > read))
+        .then(|| turn.clone())
+}
+
+/// Whether `advance` can still finish a questions comment that was begun: it acts on a turn
+/// ([`turn_to_act_on`]), and the session was not launched again after the intent. A session
+/// launched after it has turns of its own, which `advance` acts on as that session's, not as
+/// the questions of the intent; so the intent is not held for, and the limit takes the run.
 fn advance_can_finish_questions(ctx: &RunContext<'_>, events: &[RunEvent], seen: &Seen) -> bool {
     let Some(session) = seen.thread_id.as_deref().and_then(|t| session_id(t).ok()) else {
         return false;
     };
-    if ctx.view.session_state(session) != Some(SessionState::Idle) {
-        return false;
-    }
-    let Some(turn) = ctx.view.session_turn(session) else {
-        return false;
-    };
-    let read = newest_turn_read(events);
-    if turn.question || turn.turn == 0 || read.is_some_and(|read| turn.turn <= read) {
+    if turn_to_act_on(ctx, events, session).is_none() {
         return false;
     }
     let intent = events.iter().rposition(|event| {
@@ -909,8 +936,9 @@ fn advance_can_finish_questions(ctx: &RunContext<'_>, events: &[RunEvent], seen:
 /// what the running stint's start (`working_since`) is on. A "now" before the start adds no
 /// time ([`elapsed_ms`]), as a wall clock that stepped back would give. Skips a finished run, a
 /// relaunch decided, a run that is not working, one stuck or asked to stop, one whose stuck
-/// path or questions comment the advance step began (it finishes them with the words it
-/// decided on), and a launch sent with no session recorded. A pull request that was reported
+/// path the advance step began, one whose questions comment it began while it can still finish
+/// it (an idle session with its newest turn unread since the launch; it finishes them with
+/// the words it decided on), and a launch sent with no session recorded. A pull request that was reported
 /// does not skip the run (spec, `limits.minutes`): the time a gate ran and the checks were
 /// waited for are already left out of [`Seen::worked_ms`].
 fn time_limit_at(ctx: &RunContext<'_>, run: &RunId, now_ms: u64) -> Result<LimitStep, RunError> {
@@ -1597,7 +1625,10 @@ mod tests {
                         message: "`gh pr ready` failed: HTTP 502: Bad Gateway".into(),
                     });
                 }
-                if self.failed.load(Ordering::SeqCst) && args.iter().any(|arg| arg == "view") {
+                if self.failed.load(Ordering::SeqCst)
+                    && args.first().map(String::as_str) == Some("pr")
+                    && args.iter().any(|arg| arg == "view")
+                {
                     return Err(TrackerError::Other {
                         kind: crate::factory::github::OtherKind::Failed,
                         message: if self.gone {
