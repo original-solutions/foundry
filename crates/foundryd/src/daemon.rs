@@ -1856,14 +1856,129 @@ mod tests {
             .await
             .unwrap();
 
+        let marks = WorkspaceMarks::new(data.path());
+        assert_eq!(marks.project(made), Some(project));
+        assert_eq!(marks.project(plain), None);
+        assert_eq!(marks.project(foundry_proto::ids::WorkspaceId::random()), None);
+        let nowhere = tempfile::tempdir().unwrap();
+        assert_eq!(WorkspaceMarks::new(nowhere.path()).project(made), None);
+    }
+
+    /// A worktrees folder holding `<project>/<workspace>.factory` with `text`, for the
+    /// marker tests; and the paths of the folder and the marker.
+    fn marker_in(text: &str) -> (tempfile::TempDir, WorkspaceId, PathBuf) {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = WorkspaceId::random();
+        let folder = data.path().join("worktrees").join(ProjectId::random().to_string());
+        std::fs::create_dir_all(&folder).unwrap();
+        let marker = folder.join(format!("{workspace}.factory"));
+        std::fs::write(&marker, text).unwrap();
+        (data, workspace, marker)
+    }
+
+    fn marker_text(project: ProjectId) -> String {
+        format!(r#"{{"project":"{project}","run":"o/r#1","name":"w"}}"#)
+    }
+
+    #[test]
+    fn a_stray_file_among_the_project_folders_does_not_stop_the_scan_for_a_marker() {
+        let project = ProjectId::random();
+        let (data, workspace, _) = marker_in(&marker_text(project));
         let worktrees = data.path().join("worktrees");
-        assert_eq!(marked_project(&worktrees, made), Some(project));
-        assert_eq!(marked_project(&worktrees, plain), None);
-        assert_eq!(
-            marked_project(&worktrees, foundry_proto::ids::WorkspaceId::random()),
-            None
-        );
-        assert_eq!(marked_project(&data.path().join("nowhere"), made), None);
+        // Plain files beside the project folders, which no read of `<file>/<id>.factory` gets
+        // past; some of them are bound to be read before the project folder.
+        for name in [".DS_Store", "0", "a", "b", "c", "d", "e", "zz", "~"] {
+            std::fs::write(worktrees.join(name), "").unwrap();
+        }
+
+        assert!(matches!(
+            scan_marker(&worktrees, workspace),
+            Scan::Found(found) if found == project
+        ));
+    }
+
+    #[test]
+    fn a_marker_that_does_not_parse_or_cannot_be_read_answers_none() {
+        let (data, workspace, marker) = marker_in("not json");
+        let worktrees = data.path().join("worktrees");
+        assert!(matches!(
+            scan_marker(&worktrees, workspace),
+            Scan::Unparseable(path) if path == marker
+        ));
+
+        // A folder where the marker should be is a file that cannot be read.
+        std::fs::remove_file(&marker).unwrap();
+        std::fs::create_dir(&marker).unwrap();
+        assert!(matches!(
+            scan_marker(&worktrees, workspace),
+            Scan::Unreadable(path) if path == marker
+        ));
+        assert_eq!(WorkspaceMarks::new(data.path()).project(workspace), None);
+    }
+
+    #[test]
+    fn a_marker_found_in_a_later_folder_is_still_found_after_a_read_error_in_an_earlier() {
+        let project = ProjectId::random();
+        let (data, workspace, _) = marker_in(&marker_text(project));
+        let worktrees = data.path().join("worktrees");
+        for _ in 0..5 {
+            let folder = worktrees.join(ProjectId::random().to_string());
+            std::fs::create_dir_all(folder.join(format!("{workspace}.factory"))).unwrap();
+        }
+        // Five folders that hold an unreadable marker of that name, one that holds the marker.
+        let found = scan_marker(&worktrees, workspace);
+        assert!(matches!(found, Scan::Found(p) if p == project), "{:?}", found);
+    }
+
+    #[test]
+    fn the_first_answer_for_a_workspace_is_kept_whatever_happens_to_its_marker() {
+        let project = ProjectId::random();
+        let (data, workspace, marker) = marker_in(&marker_text(project));
+        let marks = WorkspaceMarks::new(data.path());
+        assert_eq!(marks.project(workspace), Some(project));
+
+        std::fs::remove_file(&marker).unwrap();
+        assert_eq!(marks.project(workspace), Some(project));
+
+        // No marker is an answer too: one that appears afterwards changes nothing.
+        let other = WorkspaceId::random();
+        assert_eq!(marks.project(other), None);
+        std::fs::write(
+            marker.with_file_name(format!("{other}.factory")),
+            marker_text(project),
+        )
+        .unwrap();
+        assert_eq!(marks.project(other), None);
+    }
+
+    #[test]
+    fn a_marker_that_does_not_parse_is_answered_none_from_then_on_and_warned_of_once() {
+        let (data, workspace, marker) = marker_in("not json");
+        let marks = WorkspaceMarks::new(data.path());
+        assert_eq!(marks.project(workspace), None);
+        assert_eq!(marks.warned_count(), 1);
+
+        // Mended, it still answers none: the answer was kept and the folder not scanned again.
+        std::fs::write(&marker, marker_text(ProjectId::random())).unwrap();
+        assert_eq!(marks.project(workspace), None);
+        assert_eq!(marks.warned_count(), 1);
+    }
+
+    #[test]
+    fn a_marker_that_cannot_be_read_is_tried_again_and_warned_of_once() {
+        let project = ProjectId::random();
+        let (data, workspace, marker) = marker_in("");
+        std::fs::remove_file(&marker).unwrap();
+        std::fs::create_dir(&marker).unwrap();
+        let marks = WorkspaceMarks::new(data.path());
+
+        assert_eq!(marks.project(workspace), None);
+        assert_eq!(marks.project(workspace), None);
+        assert_eq!(marks.warned_count(), 1);
+
+        std::fs::remove_dir(&marker).unwrap();
+        std::fs::write(&marker, marker_text(project)).unwrap();
+        assert_eq!(marks.project(workspace), Some(project));
     }
 
     /// A coordinator and listing for a machine that acts alone, over a store holding what

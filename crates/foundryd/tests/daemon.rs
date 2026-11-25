@@ -2056,3 +2056,93 @@ fn a_session_this_machine_marks_as_a_factory_session_raises_no_waiting_item_and_
     });
     assert!(!ids.contains(&id_of_item(&sessions[0])), "{ids:?}");
 }
+
+/// A project whose repo has a `.dw/config.yml` that provisions with a command that fails, so
+/// each workspace's setup terminal exits non-zero.
+fn project_with_failing_setup(fixture: &Fixture) -> Project {
+    let project = fixture.project();
+    let src = fixture.user.path().join("remote").join("src");
+    fs::create_dir_all(src.join(".dw")).unwrap();
+    fs::write(
+        src.join(".dw").join("config.yml"),
+        "factory:\n  provision:\n    - \"exit 3\"\n",
+    )
+    .unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-q", "-m", "provision"]);
+    git(&src, &["push", "-q", "origin", "main"]);
+    project
+}
+
+/// A workspace of `project` called `name`, made over the API.
+fn workspace_named(fixture: &Fixture, project: &Project, name: &str) -> String {
+    let (status, body) = fixture.call(
+        "POST",
+        "/api/workspaces",
+        Some(serde_json::json!({"project": project.id, "base": "main", "name": name})),
+    );
+    assert_eq!(status, 201, "{body}");
+    id_of(&body)
+}
+
+#[test]
+fn a_workspace_this_machine_marks_as_a_factory_workspace_raises_no_setup_failed_and_a_persons_does()
+{
+    let mut fixture = Fixture::new();
+    let project = project_with_failing_setup(&fixture);
+    // The factory is off while the workspaces are made: a project whose factory is on makes
+    // one only with a token for its login.
+    fixture.seed(|settings| settings.projects.push(project.clone()));
+    fixture.start();
+    let workspaces = [
+        workspace_named(&fixture, &project, "one"),
+        workspace_named(&fixture, &project, "two"),
+    ];
+    let failed = |fixture: &Fixture| {
+        items_of(fixture, "setup_failed")
+            .into_iter()
+            .map(|item| item["id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    let item_of = |workspace: &String| format!("setup_failed:{workspace}");
+    wait_for("both setups failed", || {
+        let ids = failed(&fixture);
+        workspaces
+            .iter()
+            .all(|w| ids.contains(&item_of(w)))
+            .then_some(())
+    });
+    assert_eq!(fixture.stop(), Some(0));
+    fixture.seed(|settings| {
+        settings.project_factory.insert(
+            project.id,
+            ProjectFactory {
+                on: true,
+                login: "octocat".into(),
+                paused: false,
+            },
+        );
+    });
+
+    // The marker `Workspaces` writes for a workspace made with a factory tag.
+    fs::write(
+        fixture
+            .home
+            .path()
+            .join("worktrees")
+            .join(project.id.to_string())
+            .join(format!("{}.factory", workspaces[0])),
+        format!(
+            r#"{{"project":"{}","run":"o/r#1","name":"one"}}"#,
+            project.id
+        ),
+    )
+    .unwrap();
+    fixture.start();
+
+    let ids = wait_for("the person's setup failed", || {
+        let ids = failed(&fixture);
+        ids.contains(&item_of(&workspaces[1])).then_some(ids)
+    });
+    assert!(!ids.contains(&item_of(&workspaces[0])), "{ids:?}");
+}

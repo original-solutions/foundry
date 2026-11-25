@@ -577,6 +577,44 @@ mod tests {
         assert_eq!(heard.freshness.since_holding(heard.project), 5 * MINUTE);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_status_a_take_stored_before_it_was_cancelled_still_tells_freshness() {
+        let heard = Heard::new();
+        let peer = MachineId::random();
+        let records: Vec<FactoryRecord> = (1..=2000).map(|v| heard.status(peer, v, v)).collect();
+        heard.clock.advance(5 * MINUTE);
+
+        let taking = {
+            let peers = heard.peers.clone();
+            tokio::spawn(async move { take(&peers.inner, peer, FACTORY_SINCE, records).await })
+        };
+        // Cancel the take once it has stored a status, as a link that ends drops it.
+        loop {
+            let stored = {
+                let store = lock(&heard.peers.inner.store);
+                let stored = store.factory_versions().unwrap().contains_key(&peer);
+                if stored {
+                    taking.abort();
+                }
+                stored
+            };
+            if stored {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(
+            taking.await.is_err_and(|e| e.is_cancelled()),
+            "the take ended first"
+        );
+
+        assert_eq!(
+            heard.freshness.since_holding(heard.project),
+            Duration::ZERO,
+            "a stored status was never told to freshness"
+        );
+    }
+
     fn event(version: u64, output: usize) -> FactoryRecord {
         FactoryRecord {
             owner: MachineId::random(),
