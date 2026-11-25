@@ -38,13 +38,13 @@ use foundry_proto::state::{SessionState, TerminalState};
 use serde::Deserialize;
 
 use super::progress::{
-    APPROVAL_RECHECKED, APPROVED, LAUNCH_BASE, LAUNCH_MODEL, LAUNCH_PULL_REQUEST, LAUNCH_RESENDING,
-    LAUNCH_RESUMING, LAUNCH_SENDING, LAUNCH_SENDING_RESUMED, Seen, WORKSPACE_CREATED,
-    WORKSPACE_REQUESTED, read_progress,
+    APPROVAL_RECHECKED, APPROVAL_WITHDRAWN, APPROVED, LAUNCH_BASE, LAUNCH_ENDING_SESSIONS,
+    LAUNCH_MODEL, LAUNCH_PULL_REQUEST, LAUNCH_RESENDING, LAUNCH_RESUMING, LAUNCH_SENDING,
+    LAUNCH_SENDING_RESUMED, Seen, WORKSPACE_CREATED, WORKSPACE_REQUESTED, read_progress,
 };
 use super::{
     Closing, Progress, RunContext, RunError, Stop, abandon, end_own_merge, finish_building,
-    go_stuck, moved_on_by_closing, progress_from, session_id, workspace_id,
+    go_stuck, moved_on_by_closing, progress_from, session_id, stop_session, workspace_id,
 };
 use crate::factory::github::read::{
     gh_json, gh_pages, is_branch_path, is_plain_ref_name, is_safe_branch_name, is_utc_second,
@@ -696,6 +696,12 @@ pub fn advance(ctx: &RunContext<'_>, run: &RunId) -> Result<StartStep, RunError>
             seen.state.map_or("none", State::name)
         ));
     }
+    // A path the ledger shows begun is finished whatever the issue's label and assignee now
+    // are: the label and the assignee move before the ledger's own state line does, so a path
+    // cut short leaves the issue where this pass would otherwise skip it.
+    if let Some(step) = finish_begun_path(ctx, run, &seen)? {
+        return Ok(step);
+    }
     let detail = ctx.tracker.issue(repo, issue)?;
     if detail.closed {
         return match moved_on_by_closing(ctx, &seen, true)? {
@@ -737,21 +743,9 @@ pub fn advance(ctx: &RunContext<'_>, run: &RunId) -> Result<StartStep, RunError>
         seen = ctx.seen(run)?;
     }
     let mut at = progress_from(run, CauseStep::Start, &seen, State::Triage);
-    // A decision to give up that is already in the ledger stands.
-    if let Some(reason) = seen.stuck.clone() {
-        go_stuck(
-            ctx,
-            issue,
-            &mut at,
-            "stuck-resumed",
-            Stop::new(reason.clone()),
-            None,
-        )?;
-        return Ok(StartStep::Stuck { reason });
-    }
-    // The record is written before any launch: a run with no record of what approved it and no
-    // session fails closed.
-    if seen.approved_at.is_none() && seen.thread_id.is_none() {
+    // The record is written before any launch: a run with no record of what approved it fails
+    // closed, and a session it has is ended by the stuck path.
+    if seen.approved_at.is_none() {
         go_stuck(
             ctx,
             issue,
@@ -768,6 +762,47 @@ pub fn advance(ctx: &RunContext<'_>, run: &RunId) -> Result<StartStep, RunError>
         return launched(ctx, run, &seen, &detail, &mut at);
     }
     build(ctx, run, &seen, &detail, &mut at)
+}
+
+/// Finishes the stuck path or the withdraw the run's ledger shows begun, if it does. `None`
+/// when the run has begun neither. A decision to give up that is in the ledger stands.
+fn finish_begun_path(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    seen: &Seen,
+) -> Result<Option<StartStep>, RunError> {
+    let issue = run.issue();
+    let mut at = progress_from(run, CauseStep::Start, seen, State::Triage);
+    if let Some(reason) = seen.stuck.clone() {
+        go_stuck(
+            ctx,
+            issue,
+            &mut at,
+            "stuck-resumed",
+            Stop::new(reason.clone()),
+            None,
+        )?;
+        return Ok(Some(StartStep::Stuck { reason }));
+    }
+    if seen.withdrawn {
+        let workspace = seen
+            .workspace
+            .as_deref()
+            .map(workspace_id)
+            .transpose()?
+            .ok_or_else(|| RunError::Invalid(format!("run {run} withdrew with no workspace")))?;
+        // What the approval says now: the explanation is posted once, and only when it still
+        // holds.
+        let refusal = match ctx
+            .tracker
+            .approval(ctx.repo(), issue, &ctx.config.instructors)?
+        {
+            Approval::Refused(refusal) => Some(refusal),
+            Approval::Approved { .. } => None,
+        };
+        return withdraw(ctx, run, &at, refusal.as_ref(), workspace).map(Some);
+    }
+    Ok(None)
 }
 
 /// What a run with no events learns from the claim comment that names it: the machine the
@@ -1273,7 +1308,7 @@ fn build(
         (Some(_), Some(record)) => record,
         // The worker answered, and the fleet does not show the record yet: wait, never ask again.
         (Some(_), None) => return Ok(StartStep::Waiting(Wait::Workspace)),
-        (None, Some(record)) => {
+        (None, Some(record)) if record.body.setup.is_some() => {
             ctx.record_step(
                 run,
                 &format!("{WORKSPACE_CREATED}{}", record.body.id),
@@ -1281,7 +1316,11 @@ fn build(
             )?;
             record
         }
-        (None, None) => {
+        // A record with no setup terminal is no proof there is no setup: the worker writes the
+        // record first and starts the setup after, and a create cut short between leaves one
+        // with none. The create is asked again: it answers with the first and starts a setup
+        // that is due. The record is taken as having no setup once it has answered.
+        (None, found) => {
             let checkout = match &resumed {
                 Some(resumed) => Checkout::Branch {
                     name: resumed.branch().to_owned(),
@@ -1301,13 +1340,18 @@ fn build(
                     run: run.to_string(),
                 },
             };
-            // Recorded before it is asked for; a create that fails with no answer is asked
-            // again next pass, and the worker's create answers with the first by tag and name.
+            let cause = if found.is_some() {
+                "workspace-found"
+            } else {
+                "workspace-created"
+            };
+            // A create that fails with no answer is asked again next pass, and the worker's
+            // create answers with the first by tag and name.
             let id = ctx.create(machine, request)?;
             ctx.record_step(
                 run,
                 &format!("{WORKSPACE_CREATED}{id}"),
-                &Cause::new(CauseStep::Start, "workspace-created"),
+                &Cause::new(CauseStep::Start, cause),
             )?;
             return Ok(StartStep::Waiting(Wait::Workspace));
         }
@@ -1318,7 +1362,8 @@ fn build(
     if let Some(terminal) = record.body.setup {
         match ctx.view.terminal(terminal) {
             Some((TerminalState::Exited, Some(0))) => {}
-            Some((TerminalState::Exited, Some(_))) => {
+            // An exit with no code (the holder is gone) is no success either.
+            Some((TerminalState::Exited, _)) => {
                 let tail = ctx.tail(terminal)?;
                 let stop = Stop {
                     reason: SETUP_FAILED.into(),
@@ -1334,10 +1379,11 @@ fn build(
             _ => return Ok(StartStep::Waiting(Wait::Setup)),
         }
     }
-    // A session the fleet already shows in the workspace for a launch that may have gone out:
+    // A factory session the fleet already shows in the workspace (one with a turn record: a
+    // person's session there is no launch of ours) for a launch that may have gone out:
     // adopted, never started twice.
     if let Some(session) = ctx.view.session_of(workspace)
-        && (seen.launch_sent || ctx.view.session_turn(session.body.id).is_some())
+        && ctx.view.session_turn(session.body.id).is_some()
     {
         let model = seen
             .launch_model
@@ -1359,37 +1405,38 @@ fn build(
             session: session.body.id,
         });
     }
-    // Before the session starts: the approval, and the text since it.
+    // Before the session starts, on every pass that is about to start it: the approval, and the
+    // text since it. A start retried a pass later is checked again.
+    match ctx
+        .tracker
+        .approval(ctx.repo(), issue, &ctx.config.instructors)?
+    {
+        Approval::Refused(refusal) => {
+            return withdraw(ctx, run, at, Some(&refusal), workspace);
+        }
+        Approval::Approved { .. } => {}
+    }
+    let Some(approved_at) = &seen.approved_at else {
+        return Err(RunError::Invalid(format!("run {run} records no approval")));
+    };
+    let check = ctx
+        .tracker
+        .text_check(ctx.repo(), issue, approved_at, &ctx.config.instructors)?;
+    // A history that cannot be judged counts as changed.
+    if check != TextCheck::Unchanged {
+        go_stuck(
+            ctx,
+            issue,
+            at,
+            "text-changed-before-start",
+            Stop::new(messages::TEXT_CHANGED),
+            None,
+        )?;
+        return Ok(StartStep::Stuck {
+            reason: messages::TEXT_CHANGED.into(),
+        });
+    }
     if !seen.rechecked {
-        match ctx
-            .tracker
-            .approval(ctx.repo(), issue, &ctx.config.instructors)?
-        {
-            Approval::Refused(refusal) => {
-                return withdraw(ctx, run, at, &refusal, workspace);
-            }
-            Approval::Approved { .. } => {}
-        }
-        let Some(approved_at) = &seen.approved_at else {
-            return Err(RunError::Invalid(format!("run {run} records no approval")));
-        };
-        let check =
-            ctx.tracker
-                .text_check(ctx.repo(), issue, approved_at, &ctx.config.instructors)?;
-        // A history that cannot be judged counts as changed.
-        if check != TextCheck::Unchanged {
-            go_stuck(
-                ctx,
-                issue,
-                at,
-                "text-changed-before-start",
-                Stop::new(messages::TEXT_CHANGED),
-                None,
-            )?;
-            return Ok(StartStep::Stuck {
-                reason: messages::TEXT_CHANGED.into(),
-            });
-        }
         ctx.record_step(
             run,
             APPROVAL_RECHECKED,
@@ -1443,20 +1490,27 @@ fn withdraw(
     ctx: &RunContext<'_>,
     run: &RunId,
     at: &Progress,
-    refusal: &Refusal,
+    refusal: Option<&Refusal>,
     workspace: WorkspaceId,
 ) -> Result<StartStep, RunError> {
     let issue = run.issue();
     let cause = Cause::new(CauseStep::Start, "approval-withdrawn");
-    let reason = refusal_reason(refusal);
-    // Recorded before it is acted on, so doing it again carries on.
-    if !at.seen.rechecked {
-        ctx.record_step(run, "approval-withdrawn", &cause)?;
+    let reason = refusal.map_or("the approval was taken back", refusal_reason);
+    // Recorded before it is acted on: a pass that finds it carries on from here, whatever the
+    // issue's label and assignee now are (`finish_begun_path`).
+    if !at.seen.withdrawn {
+        ctx.record_step(run, APPROVAL_WITHDRAWN, &cause)?;
     }
-    let said = messages::unapproved(refusal);
-    if !already_said(ctx, issue, refusal, &said)? {
-        ctx.post_comment(issue, &said)?;
+    // A refusal is explained once; a resumed withdraw whose approval reads as given again has
+    // nothing to explain.
+    if let Some(refusal) = refusal {
+        let said = messages::unapproved(refusal);
+        if !already_said(ctx, issue, refusal, &said)? {
+            ctx.post_comment(issue, &said)?;
+        }
     }
+    // A start that was sent may have made a session: it ends with the run.
+    stop_session(ctx, at)?;
     ctx.unassign(issue)?;
     ctx.set_state(issue, State::Proposed)?;
     ctx.archive(workspace)?;
@@ -1488,6 +1542,17 @@ fn start_session(
     // Written once per run before the first call, so a start that fails on our side is known to
     // have been sent.
     ctx.held()?;
+    // A start that was sent and has no session recorded may have been taken whose answer was
+    // lost, and the worker's start is not idempotent: the sessions of the workspace are ended,
+    // recorded before they are, and only then is it started again.
+    if at.seen.launch_sent {
+        ctx.record_step(
+            run,
+            LAUNCH_ENDING_SESSIONS,
+            &Cause::new(CauseStep::Start, "launch-ending-sessions"),
+        )?;
+        ctx.end_sessions(workspace)?;
+    }
     if !at.seen.launch_sent {
         let step = match resumed {
             None => LAUNCH_SENDING.to_owned(),
@@ -2688,7 +2753,7 @@ mod tests {
             #[test]
             fn one_the_fleet_already_shows_is_found_before_any_create() {
                 let (mut rig, run) = claimed_rig();
-                show_workspace(&mut rig);
+                show_setup(&mut rig, TerminalState::Exited, Some(0));
                 assert_eq!(pass(&rig, &run), StartStep::Started { session: session() });
                 assert!(creates(&rig).is_empty());
                 assert!(
@@ -2752,7 +2817,7 @@ mod tests {
                 let mut rig = Rig::new();
                 rig.worker.on_start_session(Ok(session()));
                 let run = taken_over(&rig, rig.machine);
-                show_workspace(&mut rig);
+                show_setup(&mut rig, TerminalState::Exited, Some(0));
                 assert_eq!(pass(&rig, &run), StartStep::Started { session: session() });
                 assert!(creates(&rig).is_empty());
             }

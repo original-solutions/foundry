@@ -56,6 +56,12 @@ pub const LAUNCH_RESUMING: &str = "launch-resuming ";
 pub const LAUNCH_RESENDING: &str = "launch-resending ";
 /// The step the run is approved on: `approved <time>`.
 pub const APPROVED: &str = "approved ";
+/// The step written before the approval's withdrawal is acted on: the approval was taken back
+/// before the session started. A pass that reads it finishes the withdrawal.
+pub const APPROVAL_WITHDRAWN: &str = "approval-withdrawn";
+/// The step written before the sessions of the build workspace are ended ahead of a second start
+/// of a launch that was sent and has no session recorded.
+pub const LAUNCH_ENDING_SESSIONS: &str = "launch-ending-sessions";
 /// The ledger step that says the issue text was checked again after the launch.
 pub const APPROVAL_RECHECKED: &str = "approval-rechecked";
 /// The ledger step written before the reminder is sent: `result-line-reminding <k>`, `k` the ordinal of the run that ended.
@@ -655,6 +661,9 @@ pub fn read_progress(events: &[RunEvent]) -> Seen {
                 }
                 if step == APPROVAL_RECHECKED {
                     seen.rechecked = true;
+                }
+                if step == APPROVAL_WITHDRAWN {
+                    seen.withdrawn = true;
                 }
                 if let Some(name) = step.strip_prefix(WORKSPACE_REQUESTED) {
                     seen.workspace_requested = Some(name.to_owned());
