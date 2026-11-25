@@ -729,7 +729,7 @@ pub fn advance(ctx: &RunContext<'_>, run: &RunId) -> Result<StartStep, RunError>
     // A claim cut short after its label and before its assignee: the login is assigned now, the
     // step recorded first.
     let unassigned_claim = seen.claimed
-        && matches!(seen.state, None | Some(State::Triage))
+        && seen.state.is_none()
         && detail.state == Some(State::Triage)
         && detail.assignees.is_empty();
     if unassigned_claim {

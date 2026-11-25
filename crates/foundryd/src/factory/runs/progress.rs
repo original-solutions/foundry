@@ -70,6 +70,8 @@ pub const STUCK_STOP: &str = "stuck-stop ";
 /// The step written before a send to the session, with the send's key and the session's prompt
 /// count after it: a send done again after a lost answer is sent under the same count.
 pub const SEND_INTENT: &str = "send-intent ";
+/// A send of the key whose outcome is unknown: its answer was lost or its transport failed.
+pub const SEND_UNKNOWN: &str = "send-unknown ";
 /// The step written before the gate-results comment on the pull request is posted.
 pub const GATE_RESULTS_COMMENTING: &str = "gate-results-commenting";
 /// The step written before the questions comment is posted.
@@ -321,6 +323,8 @@ pub struct Seen {
     pub gate_commenting: bool,
     /// The `send-intent` steps: each send's key and the prompt count it was first sent under.
     pub send_intents: BTreeMap<String, u64>,
+    /// The keys whose newest send-intent was tried with an unknown outcome.
+    pub send_unknown: std::collections::BTreeSet<String>,
     /// A `pr_opened` since the run last entered `building` or had a gate sent back: the session's pull request waits for the gate.
     pub pr_reported: bool,
     /// The ordinal in the newest `result-line-reminding` step: a reminder send was started.
@@ -717,7 +721,11 @@ pub fn read_progress(events: &[RunEvent]) -> Seen {
                     && let Some((key, count)) = intent.rsplit_once(' ')
                     && let Ok(count) = count.parse()
                 {
-                    seen.send_intents.entry(key.to_owned()).or_insert(count);
+                    seen.send_intents.insert(key.to_owned(), count);
+                    seen.send_unknown.remove(key);
+                }
+                if let Some(key) = step.strip_prefix(SEND_UNKNOWN) {
+                    seen.send_unknown.insert(key.to_owned());
                 }
                 if step == GATE_RESULTS_POSTED {
                     seen.gate_commenting = false;

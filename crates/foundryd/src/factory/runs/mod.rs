@@ -47,7 +47,7 @@ use crate::clock::Clock;
 use crate::sessions::factory::SendRefused;
 use crate::store::StoreError;
 use progress::{
-    GATE_RESULTS_COMMENTING, GATE_RESULTS_POSTED, QUESTIONS_COMMENTING, SEND_INTENT,
+    GATE_RESULTS_COMMENTING, GATE_RESULTS_POSTED, QUESTIONS_COMMENTING, SEND_INTENT, SEND_UNKNOWN,
     STUCK_COMMENTING, STUCK_STOP, Seen,
 };
 
@@ -391,9 +391,19 @@ pub fn apply_actions(
                     if at.seen.stuck_stop.is_none()
                         && let Some(stop) = &at.stop
                     {
+                        // Short fields only: no output of a session or a setup, which the
+                        // ledger's hiding cannot see through a JSON escape and cuts from its
+                        // front past 64 KB.
                         let decision = StuckStop {
                             code: cause.reason.clone(),
-                            stop: stop.clone(),
+                            stop: Stop {
+                                reason: stop.reason.clone(),
+                                detail: None,
+                                session_text: None,
+                                recorded_text: None,
+                                branch: stop.branch.clone(),
+                                commits_ahead: stop.commits_ahead,
+                            },
                         };
                         let json = serde_json::to_string(&decision)
                             .map_err(|error| RunError::Invalid(error.to_string()))?;
@@ -416,15 +426,15 @@ pub fn apply_actions(
                             work.as_ref(),
                         ),
                     };
-                    post_once(
-                        ctx,
-                        &at.run,
-                        issue,
-                        STUCK_COMMENTING,
-                        at.seen.stuck_commenting,
-                        &body,
-                        cause,
-                    )?;
+                    // The intent is found: the post may have landed, with text this pass no
+                    // longer holds (the session's), so a newest comment of ours that opens as a
+                    // stuck comment does is taken as it.
+                    if !at.seen.stuck_commenting {
+                        ctx.record_step(&at.run, STUCK_COMMENTING, cause)?;
+                        ctx.post_comment(issue, &body)?;
+                    } else if !newest_comment_starts_with(ctx, issue, STUCK_HEADER)? {
+                        ctx.post_comment(issue, &body)?;
+                    }
                     ctx.record(
                         &at.run,
                         Event::Stuck {
@@ -544,10 +554,11 @@ pub fn apply_actions(
 }
 
 /// A message sent to the session once. The `key` names the send; the session's prompt count is
-/// recorded under it before the send, and every send of the key, a repeat after an answer lost
-/// to a timeout too, goes under that count. A worker that finds the count risen has typed the
-/// message already, which is delivered. A session the fleet shows no turn for is sent to with no
-/// count, as there is none to hold the send to.
+/// recorded under it before the send. A try whose outcome is unknown (a failed or unreachable
+/// call) records `send-unknown`, and only a repeat of such a try goes under the same count and
+/// takes a risen count as delivered. A refusal that typed nothing leaves the next try to read
+/// the count anew. `apply_actions` makes at most one send per session per call. A session the
+/// fleet shows no turn for is sent to with no count.
 fn send_once(
     ctx: &RunContext<'_>,
     at: &Progress,
@@ -555,11 +566,21 @@ fn send_once(
     message: Message,
     key: &str,
 ) -> Result<(), RunError> {
-    let count = match at.seen.send_intents.get(key) {
-        Some(count) => Some(*count),
-        None => {
-            let count = ctx.view.session_turn(session).map(|turn| turn.prompts);
-            if let Some(count) = count {
+    let intent = at.seen.send_intents.get(key).copied();
+    let unknown = at.seen.send_unknown.contains(key);
+    // The count of a try whose outcome is unknown is kept: the repeat goes under it. Any other
+    // try reads the count anew (never below an intent recorded), and records it first.
+    let count = match intent {
+        Some(count) if unknown => Some(count),
+        _ => {
+            let seen = ctx.view.session_turn(session).map(|turn| turn.prompts);
+            let count = match (seen, intent) {
+                (Some(seen), Some(old)) => Some(seen.max(old)),
+                (seen, old) => seen.or(old),
+            };
+            if let Some(count) = count
+                && Some(count) != intent
+            {
                 ctx.record_step(
                     &at.run,
                     &format!("{SEND_INTENT}{key} {count}"),
@@ -570,7 +591,33 @@ fn send_once(
         }
     };
     match ctx.send(session, message, count) {
-        Ok(_) | Err(RunError::Send(SendRefused::CountRose { .. })) => Ok(()),
+        Ok(_) => Ok(()),
+        // The count rose after a try that may have typed the message: it is typed.
+        Err(RunError::Send(SendRefused::CountRose { .. })) if unknown => Ok(()),
+        // The count rose with no try before it that may have typed: nothing of ours was typed.
+        // The count now is the intent, and the next pass sends under it.
+        Err(RunError::Send(SendRefused::CountRose { now })) => {
+            ctx.record_step(
+                &at.run,
+                &format!("{SEND_INTENT}{key} {now}"),
+                &Cause::new(at.step, "send-intent"),
+            )?;
+            Err(RunError::Send(SendRefused::CountRose { now }))
+        }
+        // The outcome is unknown: the message may have been typed.
+        Err(
+            error @ (RunError::Send(SendRefused::Failed(_))
+            | RunError::Worker(WorkerError::Unreachable(_) | WorkerError::Failed(_))),
+        ) => {
+            if count.is_some() {
+                ctx.record_step(
+                    &at.run,
+                    &format!("{SEND_UNKNOWN}{key}"),
+                    &Cause::new(at.step, "send-unknown"),
+                )?;
+            }
+            Err(error)
+        }
         Err(error) => Err(error),
     }
 }
@@ -613,6 +660,31 @@ fn post_once(
         return Ok(());
     }
     ctx.post_comment(issue, body)
+}
+
+/// The first line of every stuck comment, as [`messages::stuck`] opens it.
+const STUCK_HEADER: &str = "The factory could not finish this issue and has released it.";
+
+/// Whether the newest comment of the project's login that carries the factory's marker opens
+/// with `prefix`.
+fn newest_comment_starts_with(
+    ctx: &RunContext<'_>,
+    issue: u64,
+    prefix: &str,
+) -> Result<bool, RunError> {
+    let comments = ctx.tracker.issue_comments(ctx.repo(), issue)?;
+    let normal = |body: &str| body.replace("\r\n", "\n").trim_end().to_owned();
+    let newest = comments
+        .iter()
+        .filter(|comment| {
+            comment
+                .author
+                .as_deref()
+                .is_some_and(|author| author.eq_ignore_ascii_case(&ctx.project.login))
+        })
+        .filter(|comment| normal(&comment.body).ends_with(MARKER))
+        .max_by_key(|comment| comment.id);
+    Ok(newest.is_some_and(|comment| comment.body.starts_with(prefix)))
 }
 
 /// Whether the newest comment of the project's login that carries the factory's marker is `said`
