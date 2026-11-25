@@ -49,7 +49,7 @@
 //!
 //! What [`reconcile`] decides, in order:
 //!
-//! 1. A finished run: its workspaces are swept ([`sweep`]). One that did not go stuck has none to
+//! 1. A finished run: its workspaces are swept. One that did not go stuck has none to
 //!    keep (a closed issue's abandon is not a kept stuck run); a stuck one's are kept while its
 //!    issue is open and labelled `factory:stuck`, and archived by force once the issue is
 //!    closed, gone, or no longer so labelled. The ledger of a finished run takes no line, so
@@ -126,8 +126,9 @@
 //! - `control.ts`'s claims pause and resume, `showRun` and `parseId` (and `stopRun`'s
 //!   `not-found` and `invalid` answers: a route has a `RunId`): settings and ledger reads, other
 //!   tasks'.
-//! - `watch refuses a run of another repo before touching anything`: a `RunId` names the repo
-//!   and the ledger is the store.
+//! - `watch refuses a run of another repo before touching anything`: ported as
+//!   `a_run_of_another_repo::is_skipped_before_anything_is_read_or_touched`, a skip
+//!   (`other-repo`) where the runner's `WrongRepoError` stood.
 //! - `watch does not let a thread T3 no longer knows stop the stop`, and the cases of the
 //!   thread's archive (T3 threads): the session is the fleet's, and a session the fleet does
 //!   not show has nothing to end.
@@ -296,6 +297,9 @@ const STOP_CODE: &str = "stop-requested";
 
 /// One pass over a run a stop was asked for: see the module's words.
 pub fn advance(ctx: &RunContext<'_>, run: &RunId) -> Result<StopStep, RunError> {
+    if !run.repo().eq_ignore_ascii_case(ctx.repo()) {
+        return Ok(StopStep::Skipped { why: "other-repo" });
+    }
     let events = ctx.ledger.read(run)?;
     let seen = read_progress(&events);
     if seen.finished {
@@ -574,6 +578,9 @@ pub const LEFT: &str = "reconcile-left ";
 
 /// What a person's move and the end of a run mean for it: see the module's words.
 pub fn reconcile(ctx: &RunContext<'_>, run: &RunId) -> Result<ReconcileStep, RunError> {
+    if !run.repo().eq_ignore_ascii_case(ctx.repo()) {
+        return Ok(ReconcileStep::Skipped { why: "other-repo" });
+    }
     let events = ctx.ledger.read(run)?;
     let seen = read_progress(&events);
     if seen.finished {
