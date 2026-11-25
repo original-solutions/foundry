@@ -2588,4 +2588,23 @@ exec git "$@"
         b.advance(secs(180));
         assert_eq!(b.tick(0), held(1));
     }
+
+    #[test]
+    fn a_commit_with_no_body_at_all_reads_as_foreign_and_is_taken_after_180_seconds() {
+        let rig = Rig::new();
+        let b = rig.machine();
+        let tree = git_text(
+            &rig.remote.path,
+            &["hash-object", "-t", "tree", "-w", "--stdin"],
+        );
+        let commit = git_stdin(
+            &rig.remote.path,
+            &["hash-object", "-t", "commit", "-w", "--stdin"],
+            &format!("tree {tree}\nauthor t <t@l> 0 +0000\ncommitter t <t@l> 0 +0000\n"),
+        );
+        rig.remote.set_lease(&commit);
+        assert_eq!(reason_of(&b.tick(0)), NOT_WRITTEN);
+        b.advance(secs(180));
+        assert_eq!(b.tick(0), held(1));
+    }
 }
