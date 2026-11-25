@@ -237,7 +237,9 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
         .with_file_name("foundry-holder");
     let terminals = Arc::new(Terminals::new(me, store.clone(), &home, holder));
     terminals.reattach_all().await?;
-    let workspaces = Arc::new(Workspaces::new(me, store.clone(), &home, terminals.clone()));
+    let workspaces = Arc::new(
+        Workspaces::new(me, store.clone(), &home, terminals.clone()).with_secrets(secrets.clone()),
+    );
     workspaces.sweep().await?;
 
     let (gateway, missing) = match gateway(std::env::var("FOUNDRY_GATEWAY_URL").ok(), key) {

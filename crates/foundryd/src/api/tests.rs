@@ -2250,6 +2250,107 @@ async fn an_error_response_hides_the_credentials_in_every_text_it_holds() {
     }
 }
 
+/// Asserts `error` answers with `status` and a body whose `error` is its message.
+async fn assert_answered(error: WorkspaceError, status: u16) {
+    let message = error.to_string();
+    let (answered_status, body) = answered(ApiError::Workspace(error)).await;
+    assert_eq!(answered_status, status, "{message}: {body}");
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["error"], message.as_str(), "{body}");
+}
+
+#[tokio::test]
+async fn a_branch_name_that_is_no_plain_branch_is_unprocessable() {
+    assert_answered(WorkspaceError::BranchRefused("-x/../main".into()), 422).await;
+}
+
+#[tokio::test]
+async fn a_commit_that_is_no_full_commit_id_is_unprocessable() {
+    assert_answered(WorkspaceError::NotACommitId("abc123".into()), 422).await;
+}
+
+#[tokio::test]
+async fn a_commit_the_remote_does_not_have_is_unprocessable() {
+    assert_answered(WorkspaceError::UnknownCommitId("a".repeat(40)), 422).await;
+}
+
+#[tokio::test]
+async fn a_branch_checked_out_in_another_workspace_is_a_conflict() {
+    assert_answered(WorkspaceError::BranchCheckedOut("fac/9-1".into()), 409).await;
+}
+
+#[tokio::test]
+async fn a_factory_project_whose_login_has_no_usable_token_here_is_unprocessable_and_shows_no_token()
+ {
+    // A token held for the login that git could not be given, so none is usable.
+    let token = "ghp_unusable_0123456789";
+    let secrets = crate::secrets::MemorySecrets::default();
+    crate::secrets::Secrets::set(&secrets, "github:octocat", &format!("{token}\u{7}")).unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let no_token = crate::git_auth::GitAuth::for_login(&secrets, "octocat", data.path())
+        .expect_err("an unusable token gives no auth");
+    assert!(
+        matches!(no_token, crate::git_auth::NoToken::Unset { .. }),
+        "{no_token}"
+    );
+    let error = WorkspaceError::from(no_token);
+    let message = error.to_string();
+    let (status, body) = answered(ApiError::Workspace(error)).await;
+    assert_eq!(status, 422, "{body}");
+    assert!(!body.contains(token), "{body}");
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["error"], message.as_str(), "{body}");
+
+    // The same over the route, from a daemon whose workspaces hold no secret store, so no token
+    // for the project's login.
+    let daemon = Daemon::new(TURN).await;
+    let project = daemon.project();
+    {
+        let mut store = daemon.store.lock().unwrap();
+        let mut settings = store.settings().unwrap();
+        settings.seq += 1;
+        settings.project_factory.insert(
+            project,
+            foundry_proto::factory::ProjectFactory {
+                on: true,
+                login: "octocat".into(),
+                paused: false,
+            },
+        );
+        assert!(store.apply_settings(settings).unwrap());
+    }
+    let reply = daemon
+        .call(
+            "POST",
+            "/api/workspaces",
+            Some(serde_json::json!({"project": project, "base": "main", "name": "factory"})),
+        )
+        .await;
+    assert_eq!(reply.status, 422, "{}", reply.body);
+    assert_eq!(
+        reply.json()["error"],
+        "this machine holds no usable GitHub token for octocat",
+        "{}",
+        reply.body
+    );
+}
+
+#[tokio::test]
+async fn a_token_this_machine_cannot_read_or_hand_to_git_is_still_a_server_error() {
+    let unread = WorkspaceError::from(crate::git_auth::NoToken::Store {
+        login: "octocat".into(),
+        source: crate::secrets::SecretsError::Locked {
+            path: PathBuf::from("/data/secrets.json"),
+        },
+    });
+    assert_answered(unread, 500).await;
+    let unwritten = WorkspaceError::from(crate::git_auth::NoToken::Askpass {
+        path: PathBuf::from("/data/askpass"),
+        source: std::io::Error::other("disk full"),
+    });
+    assert_answered(unwritten, 500).await;
+}
+
 #[tokio::test]
 async fn no_response_contains_a_secret() {
     let daemon = Daemon::new(TURN).await;

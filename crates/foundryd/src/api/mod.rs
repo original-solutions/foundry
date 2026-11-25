@@ -435,10 +435,20 @@ impl IntoResponse for ApiError {
                     WorkspaceError::Unknown(_) | WorkspaceError::UnknownCommit(_) => {
                         StatusCode::NOT_FOUND
                     }
-                    WorkspaceError::UnknownProject(_) | WorkspaceError::UnknownBase(_) => {
+                    WorkspaceError::UnknownProject(_)
+                    | WorkspaceError::UnknownBase(_)
+                    | WorkspaceError::BranchRefused(_)
+                    | WorkspaceError::NotACommitId(_)
+                    | WorkspaceError::UnknownCommitId(_) => StatusCode::UNPROCESSABLE_ENTITY,
+                    // The project's settings name a login this machine holds no usable token
+                    // for. A store that cannot be read, or an askpass script that cannot be
+                    // written, is this machine's fault and stays a server error.
+                    WorkspaceError::NoToken(crate::git_auth::NoToken::Unset { .. }) => {
                         StatusCode::UNPROCESSABLE_ENTITY
                     }
-                    WorkspaceError::BranchExists(_) => StatusCode::CONFLICT,
+                    WorkspaceError::BranchExists(_) | WorkspaceError::BranchCheckedOut(_) => {
+                        StatusCode::CONFLICT
+                    }
                     WorkspaceError::Terminal(e) => terminal_status(e),
                     _ => StatusCode::INTERNAL_SERVER_ERROR,
                 },
