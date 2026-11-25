@@ -9,7 +9,8 @@
 //! here, by the same code a carried call runs, when this machine owns it. A call for something
 //! no record on the run's machine names yet is refused, and sent nowhere. A carried call for
 //! something this machine does not own is `404`, except a message, which is `409` with the
-//! reason `no_such_session`, and a create naming another machine, which is `421`.
+//! reason `no_such_session`, a turn, which is `410` as for a session that no longer runs, and a
+//! create naming another machine, which is `421`.
 //!
 //! - `POST /api/factory/workspaces` `{machine, project, name, checkout, setup, tag}`: makes a
 //!   workspace on `machine` with
