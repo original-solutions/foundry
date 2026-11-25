@@ -846,11 +846,7 @@ pub fn time_limit(ctx: &RunContext<'_>, run: &RunId) -> Result<LimitStep, RunErr
 /// decided on), and a launch sent with no session recorded. A pull request that was reported
 /// does not skip the run (spec, `limits.minutes`): the time a gate ran and the checks were
 /// waited for are already left out of [`Seen::worked_ms`].
-pub fn time_limit_at(
-    ctx: &RunContext<'_>,
-    run: &RunId,
-    now_ms: u64,
-) -> Result<LimitStep, RunError> {
+fn time_limit_at(ctx: &RunContext<'_>, run: &RunId, now_ms: u64) -> Result<LimitStep, RunError> {
     let seen = ctx.seen(run)?;
     let skipped = |why: &str| {
         Ok(LimitStep::Skipped {
@@ -1156,8 +1152,18 @@ mod tests {
         rig.names(run).split_off(from)
     }
 
-    /// The `step_changed` texts after the first `from` events.
+    /// The `step_changed` texts after the first `from` events, without the lines of the
+    /// protocol a send to the session keeps (`send-intent`, `send-refused`, `send-typed`): the
+    /// decision's own steps.
     fn steps_after(rig: &Rig, run: &RunId, from: usize) -> Vec<String> {
+        all_steps_after(rig, run, from)
+            .into_iter()
+            .filter(|step| !step.starts_with("send-"))
+            .collect()
+    }
+
+    /// Every `step_changed` text after the first `from` events.
+    fn all_steps_after(rig: &Rig, run: &RunId, from: usize) -> Vec<String> {
         rig.events(run)
             .into_iter()
             .skip(from)
@@ -1443,12 +1449,20 @@ mod tests {
 
         #[test]
         fn with_a_pull_request_that_is_not_a_draft_and_cannot_be_drafted_is_stuck() {
-            // `gh` ran and failed, and the pull request is still open: the runner's words, "it is
-            // not a draft", for exactly this case.
+            // GitHub says the pull request is not there: the runner's words, "it is not a
+            // draft", for exactly this case.
             let (mut rig, run) = built();
             rig.sim
                 .set_pull(12, pull("OPEN", false, BRANCH, "main", false));
-            rig.sim.fail("--undo", 1);
+            let sim = rig.sim.clone();
+            rig.tracker = Hiding::new(
+                Arc::new(Failing(sim, || TrackerError::NotFound {
+                    command: "gh pr ready".into(),
+                    status: 1,
+                    stderr: "HTTP 404: Not Found".into(),
+                })),
+                Arc::new(|t: &str| t.into()),
+            );
             end_turn(&mut rig, 1, DONE_MESSAGE);
             let step = pass(&rig, &run);
             assert_stuck(
@@ -1482,7 +1496,13 @@ mod tests {
         /// the next pass asks again.
         #[test]
         fn with_a_rate_limit_on_putting_it_back_to_draft_is_an_error_not_stuck() {
-            let transient: [fn() -> TrackerError; 5] = [
+            let transient: [fn() -> TrackerError; 6] = [
+                // A 5xx, a dropped connection, a killed `gh`: `gh` failed, which says nothing
+                // about the pull request.
+                || TrackerError::Other {
+                    kind: crate::factory::github::OtherKind::Failed,
+                    message: "`gh pr ready` failed: HTTP 502: Bad Gateway".into(),
+                },
                 || TrackerError::RateLimited {
                     command: "gh pr ready".into(),
                     stderr: "slow down".into(),
@@ -1529,6 +1549,42 @@ mod tests {
                 ));
                 assert_eq!(names_after(&rig, &run, before)[0], "pr_set_draft");
             }
+        }
+
+        /// A tracker whose put-back-to-draft lands and whose answer is lost (a 502 after the
+        /// change was made).
+        struct Lands(Arc<Sim>);
+
+        impl Tracker for Lands {
+            fn gh(&self, args: &[String]) -> Result<String, TrackerError> {
+                if args.iter().any(|arg| arg == "--undo") {
+                    self.0.set_pull(12, draft_on(BRANCH));
+                    return Err(TrackerError::Other {
+                        kind: crate::factory::github::OtherKind::Failed,
+                        message: "`gh pr ready` failed: HTTP 502: Bad Gateway".into(),
+                    });
+                }
+                self.0.gh(args)
+            }
+        }
+
+        #[test]
+        fn a_failed_put_back_to_draft_after_which_the_pull_request_reads_as_a_draft_goes_on() {
+            let (mut rig, run) = built();
+            rig.sim
+                .set_pull(12, pull("OPEN", false, BRANCH, "main", false));
+            let sim = rig.sim.clone();
+            rig.tracker = Hiding::new(Arc::new(Lands(sim)), Arc::new(|t: &str| t.into()));
+            let before = rig.events(&run).len();
+            end_turn(&mut rig, 1, DONE_MESSAGE);
+            assert!(matches!(
+                pass(&rig, &run),
+                BuildStep::ReadyForGate { pr: 12, .. }
+            ));
+            assert_eq!(
+                names_after(&rig, &run, before),
+                ["pr_set_draft", "pr_opened", "step_changed"]
+            );
         }
 
         #[test]
@@ -2891,16 +2947,93 @@ mod tests {
             );
             assert_eq!(sends(&rig), vec![reminder_sent(1)]);
         }
+
+        /// A forward goes through `send_once` too: a reminder whose send failed after the
+        /// worker may have typed it is pending, and the forward waits for it.
+        #[test]
+        fn that_may_have_typed_holds_back_a_forward_to_the_session() {
+            use crate::factory::runs::ForwardPayload;
+            let (mut rig, run) = built();
+            end_turn(&mut rig, 1, WORKING_MESSAGE);
+            rig.worker.on_send(Err(SendRefused::Failed {
+                reason: "no answer".into(),
+                prompts: Some(1),
+            }));
+            assert!(advance(&rig.ctx(), &run).is_err());
+            let sent = sends(&rig).len();
+            let events = rig.events(&run).len();
+            let mut at = progress_from(
+                &run,
+                CauseStep::Forward,
+                &rig.ctx().seen(&run).unwrap(),
+                State::Building,
+            );
+            let payload = ActionPayload {
+                forward: Some(ForwardPayload {
+                    message: messages::Message {
+                        line: "A comment.".into(),
+                        body: None,
+                    },
+                    step: None,
+                }),
+                ..ActionPayload::default()
+            };
+            let error = apply_actions(
+                &rig.ctx(),
+                ISSUE,
+                &mut at,
+                &[crate::factory::lifecycle::Action::ForwardComment {
+                    comment_id: "77".into(),
+                }],
+                &Cause::new(CauseStep::Forward, "forward"),
+                &payload,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&error, RunError::SendPending { key } if key == "result-line-reminder 1"),
+                "{error}"
+            );
+            assert_eq!(sends(&rig).len(), sent);
+            assert_eq!(rig.events(&run).len(), events);
+        }
+
+        /// A forward that is settled (typed, or refused with nothing typed) holds back nothing.
+        #[test]
+        fn is_not_held_back_by_a_settled_forward() {
+            for settled in [
+                "send-typed forward-comment 77",
+                "send-refused forward-comment 77",
+            ] {
+                let (mut rig, run) = built();
+                rig.step(&run, "send-intent forward-comment 77 1");
+                rig.step(&run, settled);
+                end_turn(&mut rig, 1, WORKING_MESSAGE);
+                assert_eq!(pass(&rig, &run), BuildStep::Reminded, "{settled}");
+                assert_eq!(sends(&rig), vec![reminder_sent(1)], "{settled}");
+            }
+        }
+
+        /// The reminder is a keyed send like the rest: its own intent and typed lines.
+        #[test]
+        fn is_a_keyed_send_with_its_intent_and_its_typed_line() {
+            let (mut rig, run) = built();
+            let before = rig.events(&run).len();
+            end_turn(&mut rig, 1, WORKING_MESSAGE);
+            assert_eq!(pass(&rig, &run), BuildStep::Reminded);
+            assert_eq!(
+                all_steps_after(&rig, &run, before),
+                [
+                    "result-line-reminding 1",
+                    "send-intent result-line-reminder 1 1",
+                    "send-typed result-line-reminder 1",
+                    "turn-read 1",
+                    "result-line-reminded"
+                ]
+            );
+        }
     }
 
     // ----- the runner's `timeLimit` -----
-
-    thread_local! {
-        /// The wall clock of the test's ledger: the cell that stamps its lines, which
-        /// `time_limit_at` is given as "now". The context's own clock is left at its base.
-        static WALL: std::cell::RefCell<Option<Arc<AtomicU64>>> =
-            const { std::cell::RefCell::new(None) };
-    }
 
     /// The run's own clock: the ledger stamps each line with what the returned cell holds, so a
     /// test says when a line was written, in milliseconds after [`T0`]. [`clock_to`] moves the
@@ -2917,7 +3050,6 @@ mod tests {
             Arc::new(move || wall.load(Ordering::SeqCst)),
         );
         rig._dir = dir;
-        WALL.with(|wall| *wall.borrow_mut() = Some(cell.clone()));
         (rig, cell)
     }
 
@@ -2928,26 +3060,12 @@ mod tests {
 
     /// The wall clock reads `ms` after [`T0`]: the ledger's stamps and the "now" of [`limit`].
     /// It may step back. The context's sleep-counting clock is not touched.
-    fn clock_to(_rig: &Rig, ms: u64) {
-        WALL.with(|wall| {
-            wall.borrow()
-                .as_ref()
-                .expect("a timed rig")
-                .store(T0 + ms, Ordering::SeqCst);
-        });
+    fn clock_to(cell: &AtomicU64, ms: u64) {
+        cell.store(T0 + ms, Ordering::SeqCst);
     }
 
-    fn wall_now() -> u64 {
-        WALL.with(|wall| {
-            wall.borrow()
-                .as_ref()
-                .expect("a timed rig")
-                .load(Ordering::SeqCst)
-        })
-    }
-
-    fn try_limit(rig: &Rig, run: &RunId) -> Result<LimitStep, RunError> {
-        time_limit_at(&rig.ctx(), run, wall_now())
+    fn try_limit(rig: &Rig, run: &RunId, cell: &AtomicU64) -> Result<LimitStep, RunError> {
+        time_limit_at(&rig.ctx(), run, cell.load(Ordering::SeqCst))
     }
 
     /// A run building since [`T0`], with its pull request #12 an open draft and its session
@@ -2961,8 +3079,8 @@ mod tests {
         (rig, run, cell)
     }
 
-    fn limit(rig: &Rig, run: &RunId) -> LimitStep {
-        try_limit(rig, run).unwrap()
+    fn limit(rig: &Rig, run: &RunId, cell: &AtomicU64) -> LimitStep {
+        try_limit(rig, run, cell).unwrap()
     }
 
     fn stopped(reason: &str) -> LimitStep {
@@ -2976,24 +3094,24 @@ mod tests {
 
         #[test]
         fn is_within_the_limit_up_to_and_including_the_last_millisecond_of_it() {
-            let (rig, run, _) = timed_built();
+            let (rig, run, cell) = timed_built();
             let before = rig.events(&run).len();
-            clock_to(&rig, 1);
-            assert_eq!(limit(&rig, &run), LimitStep::Within);
-            clock_to(&rig, LIMIT_MS);
-            assert_eq!(limit(&rig, &run), LimitStep::Within);
+            clock_to(&cell, 1);
+            assert_eq!(limit(&rig, &run, &cell), LimitStep::Within);
+            clock_to(&cell, LIMIT_MS);
+            assert_eq!(limit(&rig, &run, &cell), LimitStep::Within);
             no_writes(&rig);
             assert_eq!(calls(&rig), vec![]);
             assert_eq!(rig.events(&run).len(), before);
-            clock_to(&rig, LIMIT_MS + 1);
-            assert_eq!(limit(&rig, &run), stopped(TIME_LIMIT));
+            clock_to(&cell, LIMIT_MS + 1);
+            assert_eq!(limit(&rig, &run, &cell), stopped(TIME_LIMIT));
         }
 
         #[test]
         fn stops_a_run_past_its_limit_and_names_the_branch_without_a_count_of_commits() {
-            let (rig, run, _) = timed_built();
-            clock_to(&rig, LIMIT_MS + 1);
-            assert_eq!(limit(&rig, &run), stopped(TIME_LIMIT));
+            let (rig, run, cell) = timed_built();
+            clock_to(&cell, LIMIT_MS + 1);
+            assert_eq!(limit(&rig, &run, &cell), stopped(TIME_LIMIT));
             let comments = rig.sim.comments();
             let comment = comments
                 .iter()
@@ -3046,8 +3164,8 @@ mod tests {
             rig.sim.set_labels(&["factory:triage"]);
             rig.sim.set_assignees(&[LOGIN]);
             stamp(&cell, 0);
-            clock_to(&rig, LIMIT_MS + 1);
-            assert_eq!(limit(&rig, &run), stopped(TIME_LIMIT));
+            clock_to(&cell, LIMIT_MS + 1);
+            assert_eq!(limit(&rig, &run, &cell), stopped(TIME_LIMIT));
             let events = rig.events(&run);
             let stuck = events.iter().find(|e| e.event == "stuck").unwrap();
             assert_eq!(stuck.data["reason"], TIME_LIMIT);
@@ -3058,7 +3176,7 @@ mod tests {
         /// The runner's run that "never launched anything" is the same case.
         #[test]
         fn stops_a_run_that_never_launched_anything_with_the_plain_reason() {
-            let (rig, _) = timed();
+            let (rig, cell) = timed();
             let run = run_id(1);
             rig.write(
                 &run,
@@ -3070,28 +3188,28 @@ mod tests {
             rig.moved(&run, State::Ready, State::Triage);
             rig.sim.set_labels(&["factory:triage"]);
             rig.sim.set_assignees(&[LOGIN]);
-            clock_to(&rig, LIMIT_MS + 1);
-            assert_eq!(limit(&rig, &run), stopped(TIME_LIMIT));
+            clock_to(&cell, LIMIT_MS + 1);
+            assert_eq!(limit(&rig, &run, &cell), stopped(TIME_LIMIT));
             assert_eq!(calls(&rig), vec![]);
         }
 
         #[test]
         fn is_an_error_with_nothing_written_when_the_archive_fails_and_the_next_call_decides_again()
         {
-            let (rig, run, _) = timed_built();
-            clock_to(&rig, LIMIT_MS + 1);
+            let (rig, run, cell) = timed_built();
+            clock_to(&cell, LIMIT_MS + 1);
             // The session is ended before anything is written: the workspace's sessions are
             // what a stop ends.
             rig.worker
                 .on_end_sessions(Err(WorkerError::Failed("the machine said no".into())));
             let before = rig.events(&run).len();
             assert!(matches!(
-                try_limit(&rig, &run).unwrap_err(),
+                try_limit(&rig, &run, &cell).unwrap_err(),
                 RunError::Worker(_)
             ));
             assert_eq!(rig.events(&run).len(), before);
             no_writes(&rig);
-            assert_eq!(limit(&rig, &run), stopped(TIME_LIMIT));
+            assert_eq!(limit(&rig, &run, &cell), stopped(TIME_LIMIT));
         }
 
         #[test]
@@ -3137,7 +3255,7 @@ mod tests {
                 ("half needs-info", vec![questions]),
             ];
             for (name, more) in cases {
-                let (rig, run, _) = timed_built();
+                let (rig, run, cell) = timed_built();
                 for event in more {
                     rig.write(&run, event);
                 }
@@ -3156,10 +3274,10 @@ mod tests {
                         )
                         .unwrap();
                 }
-                clock_to(&rig, 10 * LIMIT_MS);
+                clock_to(&cell, 10 * LIMIT_MS);
                 let events = rig.events(&run).len();
                 assert!(
-                    matches!(limit(&rig, &run), LimitStep::Skipped { .. }),
+                    matches!(limit(&rig, &run, &cell), LimitStep::Skipped { .. }),
                     "{name}"
                 );
                 no_writes(&rig);
@@ -3171,7 +3289,7 @@ mod tests {
         #[test]
         fn leaves_a_triage_run_whose_launch_was_sent_and_not_recorded_to_resume_which_names_its_session()
          {
-            let (rig, _) = timed();
+            let (rig, cell) = timed();
             let run = run_id(1);
             rig.write(
                 &run,
@@ -3182,9 +3300,12 @@ mod tests {
             );
             rig.moved(&run, State::Ready, State::Triage);
             rig.step(&run, "launch-sending");
-            clock_to(&rig, 10 * LIMIT_MS);
+            clock_to(&cell, 10 * LIMIT_MS);
             let events = rig.events(&run).len();
-            assert!(matches!(limit(&rig, &run), LimitStep::Skipped { .. }));
+            assert!(matches!(
+                limit(&rig, &run, &cell),
+                LimitStep::Skipped { .. }
+            ));
             no_writes(&rig);
             assert_eq!(calls(&rig), vec![]);
             assert_eq!(rig.events(&run).len(), events);
@@ -3208,9 +3329,9 @@ mod tests {
                 },
             );
             // No gate has begun: the wait is the factory's, but it is counted.
-            clock_to(&rig, 10 * LIMIT_MS);
+            clock_to(&cell, 10 * LIMIT_MS);
             assert_eq!(
-                limit(&rig, &run),
+                limit(&rig, &run, &cell),
                 stopped(TIME_LIMIT),
                 "Foundry charges the wait for the gate; the runner's name says it does not"
             );
@@ -3246,16 +3367,16 @@ mod tests {
             );
             let before = rig.events(&run).len();
             // 20 minutes built, the gate ran for 70, and the session has had 10 since.
-            clock_to(&rig, 100 * MINUTE);
-            assert_eq!(limit(&rig, &run), LimitStep::Within);
+            clock_to(&cell, 100 * MINUTE);
+            assert_eq!(limit(&rig, &run, &cell), LimitStep::Within);
             no_writes(&rig);
             assert_eq!(calls(&rig), vec![]);
             assert_eq!(rig.events(&run).len(), before);
             // 70 minutes since the send-back is 90 minutes worked, and one more is past it.
-            clock_to(&rig, 160 * MINUTE);
-            assert_eq!(limit(&rig, &run), LimitStep::Within);
-            clock_to(&rig, 161 * MINUTE);
-            assert_eq!(limit(&rig, &run), stopped(TIME_LIMIT));
+            clock_to(&cell, 160 * MINUTE);
+            assert_eq!(limit(&rig, &run, &cell), LimitStep::Within);
+            clock_to(&cell, 161 * MINUTE);
+            assert_eq!(limit(&rig, &run, &cell), stopped(TIME_LIMIT));
         }
 
         #[test]
@@ -3264,8 +3385,8 @@ mod tests {
             rig.moved(&run, State::Building, State::PrOpen);
             stamp(&cell, 2 * MINUTE);
             rig.moved(&run, State::PrOpen, State::Building);
-            clock_to(&rig, 2 * MINUTE + LIMIT_MS + 1);
-            assert_eq!(limit(&rig, &run), stopped(TIME_LIMIT));
+            clock_to(&cell, 2 * MINUTE + LIMIT_MS + 1);
+            assert_eq!(limit(&rig, &run, &cell), stopped(TIME_LIMIT));
         }
 
         #[test]
@@ -3279,8 +3400,8 @@ mod tests {
                 launch(Some("x@octocat<!-- softfac -->"), None, Some("main")),
             );
             start_the_session(&rig);
-            clock_to(&rig, LIMIT_MS + 1);
-            assert_eq!(limit(&rig, &run), stopped(TIME_LIMIT));
+            clock_to(&cell, LIMIT_MS + 1);
+            assert_eq!(limit(&rig, &run, &cell), stopped(TIME_LIMIT));
             let prepared = "x@\u{200b}octocat<\u{200b}!-- softfac -->";
             let events = rig.events(&run);
             let stuck = events.iter().find(|e| e.event == "stuck").unwrap();
@@ -3312,14 +3433,14 @@ mod tests {
         #[test]
         fn reads_the_wall_clock_on_the_ledgers_base_not_the_sleep_counting_clock() {
             use crate::clock::Clock;
-            let (rig, run, _) = timed_built();
+            let (rig, run, cell) = timed_built();
             // The context's clock reads near zero, as a daemon that booted a moment ago does,
             // while the ledger's stamps are epoch milliseconds.
             assert!(rig.clock.now() < std::time::Duration::from_secs(1));
-            clock_to(&rig, LIMIT_MS);
-            assert_eq!(limit(&rig, &run), LimitStep::Within);
-            clock_to(&rig, LIMIT_MS + 1);
-            assert_eq!(limit(&rig, &run), stopped(TIME_LIMIT));
+            clock_to(&cell, LIMIT_MS);
+            assert_eq!(limit(&rig, &run, &cell), LimitStep::Within);
+            clock_to(&cell, LIMIT_MS + 1);
+            assert_eq!(limit(&rig, &run, &cell), stopped(TIME_LIMIT));
         }
 
         #[test]
@@ -3343,7 +3464,7 @@ mod tests {
         #[test]
         fn does_not_take_over_a_stuck_path_or_a_questions_post_the_advance_step_began() {
             // A stuck decision recorded, its comment not yet posted.
-            let (mut rig, run, _) = timed_built();
+            let (mut rig, run, cell) = timed_built();
             let message = "Done.\nFACTORY-DONE: https://github.com/rawphp/softfac/pull/13";
             end_turn(&mut rig, 1, message);
             rig.sim.fail("issue comment", 1);
@@ -3351,8 +3472,11 @@ mod tests {
             assert!(rig.ctx().seen(&run).unwrap().stuck_stop.is_some());
             let events = rig.events(&run).len();
             let writes = rig.sim.writes();
-            clock_to(&rig, 10 * LIMIT_MS);
-            assert!(matches!(limit(&rig, &run), LimitStep::Skipped { .. }));
+            clock_to(&cell, 10 * LIMIT_MS);
+            assert!(matches!(
+                limit(&rig, &run, &cell),
+                LimitStep::Skipped { .. }
+            ));
             assert_eq!(rig.events(&run).len(), events);
             assert_eq!(rig.sim.writes(), writes);
             // The next advance finishes it with the reason it decided on.
@@ -3369,7 +3493,7 @@ mod tests {
             );
 
             // The questions' comment begun and not posted.
-            let (mut rig, run, _) = timed_built();
+            let (mut rig, run, cell) = timed_built();
             let message = "Which one?\nFACTORY-STOP: needs-info";
             end_turn(&mut rig, 1, message);
             rig.sim.fail("issue comment", 1);
@@ -3377,8 +3501,11 @@ mod tests {
             assert!(rig.ctx().seen(&run).unwrap().questions_commenting.is_some());
             let events = rig.events(&run).len();
             let writes = rig.sim.writes();
-            clock_to(&rig, 10 * LIMIT_MS);
-            assert!(matches!(limit(&rig, &run), LimitStep::Skipped { .. }));
+            clock_to(&cell, 10 * LIMIT_MS);
+            assert!(matches!(
+                limit(&rig, &run, &cell),
+                LimitStep::Skipped { .. }
+            ));
             assert_eq!(rig.events(&run).len(), events);
             assert_eq!(rig.sim.writes(), writes);
             say(&rig, message);
@@ -3386,9 +3513,54 @@ mod tests {
             assert_eq!(questions_comments(&rig), 1);
         }
 
+        /// A questions comment begun is `advance`'s to finish only while it can: the recorded
+        /// session is idle with its newest turn unread, since the same launch. Otherwise the
+        /// run is not held for it, and the limit takes it. (A begun stuck path is finished by
+        /// `advance` in any session shape: it needs no turn and no state, only the ledger.)
+        #[test]
+        fn takes_a_run_whose_begun_questions_post_advance_can_no_longer_finish() {
+            fn begun() -> (Rig, RunId, Arc<AtomicU64>) {
+                let (mut rig, run, cell) = timed_built();
+                end_turn(&mut rig, 1, "Which one?\nFACTORY-STOP: needs-info");
+                rig.sim.fail("issue comment", 1);
+                assert!(advance(&rig.ctx(), &run).is_err());
+                assert!(rig.ctx().seen(&run).unwrap().questions_commenting.is_some());
+                (rig, run, cell)
+            }
+            // Still finishable: idle, the turn unread, the same launch.
+            let (rig, run, cell) = begun();
+            clock_to(&cell, 10 * LIMIT_MS);
+            assert!(matches!(
+                limit(&rig, &run, &cell),
+                LimitStep::Skipped { .. }
+            ));
+            // (i) The session ended.
+            let (mut rig, run, cell) = begun();
+            show(&mut rig, SessionState::Finished, 1, 1);
+            clock_to(&cell, 10 * LIMIT_MS);
+            assert_eq!(limit(&rig, &run, &cell), stopped(TIME_LIMIT));
+            // (ii) A newer turn ended and was read.
+            let (mut rig, run, cell) = begun();
+            rig.step(&run, "turn-read 2");
+            show(&mut rig, SessionState::Idle, 2, 2);
+            clock_to(&cell, 10 * LIMIT_MS);
+            assert_eq!(limit(&rig, &run, &cell), stopped(TIME_LIMIT));
+            // (iii) A new session was launched after the intent.
+            let (mut rig, run, cell) = begun();
+            rig.write(&run, launch(Some(BRANCH), None, Some("main")));
+            show(&mut rig, SessionState::Idle, 1, 1);
+            clock_to(&cell, 10 * LIMIT_MS);
+            assert_eq!(limit(&rig, &run, &cell), stopped(TIME_LIMIT));
+            // A question waiting is the stuck path's, not the questions'.
+            let (mut rig, run, cell) = begun();
+            show_with(&mut rig, SessionState::Idle, 1, 1, true);
+            clock_to(&cell, 10 * LIMIT_MS);
+            assert_eq!(limit(&rig, &run, &cell), stopped(TIME_LIMIT));
+        }
+
         #[test]
         fn leaves_a_run_that_resume_has_decided_to_relaunch_to_it() {
-            let (rig, run, _) = timed_built();
+            let (rig, run, cell) = timed_built();
             rig.write(
                 &run,
                 Event::SessionInterrupted {
@@ -3400,9 +3572,12 @@ mod tests {
                     ended_in_pass: 1,
                 },
             );
-            clock_to(&rig, 10 * LIMIT_MS);
+            clock_to(&cell, 10 * LIMIT_MS);
             let events = rig.events(&run).len();
-            assert!(matches!(limit(&rig, &run), LimitStep::Skipped { .. }));
+            assert!(matches!(
+                limit(&rig, &run, &cell),
+                LimitStep::Skipped { .. }
+            ));
             assert_eq!(rig.events(&run).len(), events);
             no_writes(&rig);
         }
@@ -3455,10 +3630,10 @@ mod tests {
             let seen = rig.ctx().seen(&run).unwrap();
             assert_eq!(seen.worked_ms, 12 * MINUTE);
             assert_eq!(seen.working_since, Some(T0 + 40 * MINUTE));
-            clock_to(&rig, 40 * MINUTE + 78 * MINUTE);
-            assert_eq!(limit(&rig, &run), LimitStep::Within);
-            clock_to(&rig, 40 * MINUTE + 78 * MINUTE + 1);
-            assert_eq!(limit(&rig, &run), stopped(TIME_LIMIT));
+            clock_to(&cell, 40 * MINUTE + 78 * MINUTE);
+            assert_eq!(limit(&rig, &run, &cell), LimitStep::Within);
+            clock_to(&cell, 40 * MINUTE + 78 * MINUTE + 1);
+            assert_eq!(limit(&rig, &run, &cell), stopped(TIME_LIMIT));
         }
     }
 
@@ -3469,15 +3644,18 @@ mod tests {
 
         #[test]
         fn the_time_limit_leaves_a_stopped_run_to_advance() {
-            let (rig, run, _) = timed_built();
+            let (rig, run, cell) = timed_built();
             rig.write(
                 &run,
                 Event::StopRequested {
                     by: "operator".into(),
                 },
             );
-            clock_to(&rig, LIMIT_MS + 1);
-            assert!(matches!(limit(&rig, &run), LimitStep::Skipped { .. }));
+            clock_to(&cell, LIMIT_MS + 1);
+            assert!(matches!(
+                limit(&rig, &run, &cell),
+                LimitStep::Skipped { .. }
+            ));
             no_writes(&rig);
             assert_eq!(calls(&rig), vec![]);
         }
@@ -3501,41 +3679,50 @@ mod tests {
 
         #[test]
         fn the_time_limit_skips_a_run_past_its_limit_whose_own_merge_closed_the_issue() {
-            let (rig, run, _) = timed_built();
+            let (rig, run, cell) = timed_built();
             sent_back_after_a_pull_request(&rig, &run);
             rig.sim.set_closed(true);
             rig.sim
                 .set_pull(12, pull("MERGED", false, BRANCH, "main", false));
-            clock_to(&rig, LIMIT_MS + 1);
-            assert!(matches!(limit(&rig, &run), LimitStep::Skipped { .. }));
+            clock_to(&cell, LIMIT_MS + 1);
+            assert!(matches!(
+                limit(&rig, &run, &cell),
+                LimitStep::Skipped { .. }
+            ));
             no_writes(&rig);
             assert_eq!(calls(&rig), vec![]);
         }
 
         #[test]
         fn the_time_limit_goes_on_to_stop_a_run_past_its_limit_whose_issue_a_person_closed() {
-            let (rig, run, _) = timed_built();
+            let (rig, run, cell) = timed_built();
             sent_back_after_a_pull_request(&rig, &run);
             rig.sim.set_closed(true);
             rig.sim
                 .set_pull(12, pull("CLOSED", false, BRANCH, "main", false));
-            clock_to(&rig, LIMIT_MS + 1);
-            assert!(matches!(limit(&rig, &run), LimitStep::Stopped { .. }));
+            clock_to(&cell, LIMIT_MS + 1);
+            assert!(matches!(
+                limit(&rig, &run, &cell),
+                LimitStep::Stopped { .. }
+            ));
         }
 
         #[test]
         fn the_time_limit_asks_about_the_issue_only_past_the_limit_and_with_a_pull_request() {
-            let (within, run, _) = timed_built();
+            let (within, run, within_cell) = timed_built();
             sent_back_after_a_pull_request(&within, &run);
             within.sim.set_closed(true);
-            clock_to(&within, 1);
-            assert_eq!(limit(&within, &run), LimitStep::Within);
+            clock_to(&within_cell, 1);
+            assert_eq!(limit(&within, &run, &within_cell), LimitStep::Within);
             assert_eq!(issue_reads(&within), 0);
 
-            let (no_pr, run, _) = timed_built();
+            let (no_pr, run, no_pr_cell) = timed_built();
             no_pr.sim.set_closed(true);
-            clock_to(&no_pr, LIMIT_MS + 1);
-            assert!(matches!(limit(&no_pr, &run), LimitStep::Stopped { .. }));
+            clock_to(&no_pr_cell, LIMIT_MS + 1);
+            assert!(matches!(
+                limit(&no_pr, &run, &no_pr_cell),
+                LimitStep::Stopped { .. }
+            ));
             // The issue itself is not read: no pull request was reported.
             assert_eq!(issue_reads(&no_pr), 0);
         }
@@ -3859,29 +4046,29 @@ mod tests {
             assert!(!seen.pr_reported);
             assert_eq!(seen.worked_ms, 12 * MINUTE);
             assert_eq!(seen.working_since, Some(T0 + 25 * MINUTE));
-            clock_to(&rig, 25 * MINUTE + 78 * MINUTE);
-            assert_eq!(limit(&rig, &run), LimitStep::Within);
+            clock_to(&cell, 25 * MINUTE + 78 * MINUTE);
+            assert_eq!(limit(&rig, &run, &cell), LimitStep::Within);
             assert_eq!(pass(&rig, &run), BuildStep::Running);
-            clock_to(&rig, 25 * MINUTE + 78 * MINUTE + 1);
-            assert_eq!(limit(&rig, &run), stopped(TIME_LIMIT));
+            clock_to(&cell, 25 * MINUTE + 78 * MINUTE + 1);
+            assert_eq!(limit(&rig, &run, &cell), stopped(TIME_LIMIT));
             assert_eq!(rig.sim.labels(), ["factory:stuck"]);
             assert!(calls(&rig).contains(&ended_workspace()));
         }
 
         #[test]
         fn a_session_p1_marks_stuck_is_left_alone_and_is_ended_by_limits_minutes() {
-            let (mut rig, run, _) = timed_built();
+            let (mut rig, run, cell) = timed_built();
             show(&mut rig, SessionState::Stuck, 1, 1);
             say(&rig, DONE_MESSAGE);
-            clock_to(&rig, LIMIT_MS);
+            clock_to(&cell, LIMIT_MS);
             let events = rig.events(&run).len();
             assert_eq!(pass(&rig, &run), BuildStep::Running);
-            assert_eq!(limit(&rig, &run), LimitStep::Within);
+            assert_eq!(limit(&rig, &run, &cell), LimitStep::Within);
             no_writes(&rig);
             assert_eq!(calls(&rig), vec![]);
             assert_eq!(rig.events(&run).len(), events);
-            clock_to(&rig, LIMIT_MS + 1);
-            assert_eq!(limit(&rig, &run), stopped(TIME_LIMIT));
+            clock_to(&cell, LIMIT_MS + 1);
+            assert_eq!(limit(&rig, &run, &cell), stopped(TIME_LIMIT));
             assert_eq!(rig.sim.labels(), ["factory:stuck"]);
         }
 
@@ -4139,17 +4326,17 @@ mod tests {
             stamp(&cell, 500 * MINUTE);
             building(&rig, &run);
             rig.config.limits.minutes = 0;
-            clock_to(&rig, 500 * MINUTE);
-            assert_eq!(limit(&rig, &run), LimitStep::Within);
-            clock_to(&rig, 0);
-            assert_eq!(limit(&rig, &run), LimitStep::Within);
+            clock_to(&cell, 500 * MINUTE);
+            assert_eq!(limit(&rig, &run, &cell), LimitStep::Within);
+            clock_to(&cell, 0);
+            assert_eq!(limit(&rig, &run, &cell), LimitStep::Within);
             assert_eq!(
                 rig.ctx().seen(&run).unwrap().working_since,
                 Some(T0 + 500 * MINUTE)
             );
             // One millisecond past the stint's start is past a limit of nothing.
-            clock_to(&rig, 500 * MINUTE + 1);
-            assert_eq!(limit(&rig, &run), stopped(TIME_LIMIT));
+            clock_to(&cell, 500 * MINUTE + 1);
+            assert_eq!(limit(&rig, &run, &cell), stopped(TIME_LIMIT));
         }
 
         #[test]
@@ -4306,6 +4493,27 @@ mod tests {
             assert!(matches!(pass(&rig, &run), BuildStep::Skipped { .. }));
             assert_eq!(rig.events(&run).len(), events);
             assert_eq!(calls(&rig), vec![]);
+        }
+
+        #[test]
+        fn a_turn_read_step_that_is_not_canonical_is_not_a_turn_read() {
+            for step in [
+                "turn-read 01",
+                "turn-read +1",
+                "turn-read 1 ",
+                "turn-read x",
+            ] {
+                let (mut rig, run) = built();
+                rig.step(&run, step);
+                end_turn(&mut rig, 1, DONE_MESSAGE);
+                let before = rig.events(&run).len();
+                assert!(
+                    matches!(pass(&rig, &run), BuildStep::ReadyForGate { pr: 12, .. }),
+                    "{step}"
+                );
+                assert_eq!(turn_reads(&rig), 1, "{step}");
+                assert_eq!(steps_after(&rig, &run, before), ["turn-read 1"], "{step}");
+            }
         }
     }
 }
