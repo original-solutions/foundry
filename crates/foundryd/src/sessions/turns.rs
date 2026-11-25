@@ -3,9 +3,15 @@
 //! For a factory session, a `Stop` writes `turns/<n>.txt` in the session's folder and only then
 //! the session's `session_turn` record with turn `n`, so a reader who sees the number finds the
 //! file. A `UserPromptSubmit` adds one to the prompt count and takes the question away; a
-//! `Notification` that makes the session wait writes `question.txt`. The counts are kept in
-//! memory once the record that holds them is stored, and read from the store when the daemon
-//! has not seen the session since it started.
+//! `Notification` that makes the session wait writes `question.txt`. A session keeps the counts
+//! it `want`s in memory, and the counts its record holds as `stored`; both are read from the
+//! store when the daemon has not seen the session since it started.
+//!
+//! A hook is applied in two steps. [`Inner::prepare`] does what must happen once, writes the
+//! file and changes `want`, and a failure of it changes nothing, so it can be run again.
+//! [`Inner::flush`] can run any number of times: it applies the state and writes the record
+//! when `want` differs from `stored`. The sweeper flushes a session whose record is still
+//! behind, so a record that failed past the hook's retries is stored later.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -15,8 +21,10 @@ use foundry_proto::ids::{ProjectId, SessionId};
 use foundry_proto::record::Session;
 use foundry_proto::state::SessionState;
 
+use super::state::next_state;
 use super::state::{Event, Hook};
 use super::{Inner, Live, SessionError, Sessions, blocking, claude, factory, lock};
+use crate::secrets::Secrets;
 
 /// The folder in a session's folder that holds a file per turn.
 const TURNS: &str = "turns";
@@ -32,7 +40,7 @@ const HIDDEN: &str = "***";
 pub struct TurnText {
     /// The turn's whole final message, with known secrets hidden. Empty for turn 0.
     pub message: String,
-    /// The newest question, while one waits.
+    /// The newest question, asked since the last prompt: only a prompt clears it.
     pub question: Option<String>,
 }
 
@@ -43,7 +51,7 @@ pub(super) struct Counts {
     pub turn: u64,
     /// How many prompts were submitted.
     pub prompts: u64,
-    /// Whether a question waits.
+    /// Whether a question was asked since the last prompt. Only a prompt clears it.
     pub question: bool,
 }
 
@@ -72,6 +80,15 @@ impl Counts {
             ..self
         }
     }
+}
+
+/// What a session's record holds, and what it should hold once its hooks are flushed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Tally {
+    /// The counts after every hook prepared so far.
+    pub want: Counts,
+    /// The counts of the newest record written.
+    pub stored: Counts,
 }
 
 /// The file that holds turn `turn`'s message, in the session's `folder`.
@@ -116,53 +133,114 @@ pub(super) fn write_text(path: &Path, text: &str) -> Result<(), SessionError> {
     })
 }
 
+/// Hides secrets in what is kept on disk: the gateway key and the live sessions' tokens, then
+/// what [`crate::secrets::hide_known`] hides. It reads the secret store, so it runs on the
+/// blocking pool.
+pub(super) struct Hider {
+    memory: Vec<String>,
+    secrets: Option<Arc<dyn Secrets>>,
+}
+
+impl Hider {
+    /// Hides `secret` too, a token that is not yet in the live sessions.
+    pub fn also(mut self, secret: String) -> Self {
+        self.memory.push(secret);
+        self
+    }
+
+    /// `text` as it is kept on disk. With no secret store, none of it is kept.
+    pub fn hide(&self, text: &str) -> String {
+        let Some(secrets) = &self.secrets else {
+            return crate::secrets::HIDDEN_UNREADABLE.to_owned();
+        };
+        let known: Vec<&str> = self.memory.iter().map(String::as_str).collect();
+        crate::secrets::hide_known(&hide_each(text, &known), secrets.as_ref())
+    }
+}
+
 impl Sessions {
     /// Turn `turn`'s final message of factory session `session`, and the question that waits.
     /// `None` when this daemon knows no such factory session, or when a turn from 1 up has no
     /// readable file, as when its folder is gone. Turn 0 has an empty message.
-    pub fn turn_text(&self, session: SessionId, turn: u64) -> Option<TurnText> {
+    pub async fn turn_text(&self, session: SessionId, turn: u64) -> Option<TurnText> {
         lock(&self.inner.factory).marks.get(&session)?;
         let folder = factory::folder(&self.inner.dir, session);
-        let message = if turn == 0 {
-            String::new()
-        } else {
-            std::fs::read_to_string(turn_file(&folder, turn)).ok()?
-        };
-        let question = std::fs::read_to_string(question_file(&folder)).ok();
-        Some(TurnText { message, question })
+        blocking(move || {
+            let message = if turn == 0 {
+                String::new()
+            } else {
+                std::fs::read_to_string(turn_file(&folder, turn)).ok()?
+            };
+            let question = std::fs::read_to_string(question_file(&folder)).ok();
+            Some(TurnText { message, question })
+        })
+        .await
+        .ok()
+        .flatten()
     }
 }
 
 impl Inner {
-    /// Applies `hook` to the session, with `text`, which is `last_assistant_message` of a
-    /// `Stop` and `message` of a `Notification`, and empty for any other hook. For a factory
-    /// session the turn files and the `session_turn` record are written too, under the same
-    /// hold of the session's lock as the state. Any other hook, and every hook of a P1
-    /// session, is [`Inner::event`].
-    pub(super) async fn hook_event(
+    /// The secrets this daemon holds in memory: every live session's hook token and the
+    /// gateway key. [`crate::secrets::hide_known`] does not know them.
+    pub(super) fn memory_secrets(&self) -> Vec<String> {
+        let mut secrets: Vec<String> = lock(&self.live)
+            .values()
+            .map(|live| live.token.clone())
+            .collect();
+        secrets.push(self.config.gateway.key.clone());
+        secrets
+    }
+
+    /// What hides secrets in what is written to disk, as of now.
+    pub(super) fn hider(&self) -> Hider {
+        Hider {
+            memory: self.memory_secrets(),
+            secrets: self.secrets.get().cloned(),
+        }
+    }
+
+    /// Applies `hook` to a factory session, with `text`, which is `last_assistant_message` of
+    /// a `Stop` and `message` of a `Notification`, and empty for any other hook. `prepared`
+    /// says whether [`Inner::prepare`] already succeeded for this hook, and is set when it
+    /// does, so a caller that tries again does not count the hook twice. A session that is not
+    /// a live factory session just takes the event.
+    pub(super) async fn hook_step(
         &self,
         live: &Arc<Live>,
         hook: Hook,
         text: &str,
+        prepared: &mut bool,
     ) -> Result<SessionState, SessionError> {
         let mut body = live.body.lock().await;
         let project = lock(&self.factory).marks.get(&live.id).copied();
         let Some(project) = project.filter(|_| self.is_live(live)) else {
             return self.event_locked(live, &mut body, Event::Hook(hook)).await;
         };
-        let event = Event::Hook(hook);
-        let folder = factory::folder(&self.dir, live.id);
+        if !*prepared {
+            self.prepare(&body, hook, text).await?;
+            *prepared = true;
+        }
+        let state = self
+            .event_locked(live, &mut body, Event::Hook(hook))
+            .await?;
+        self.flush(&body, project).await?;
+        Ok(state)
+    }
+
+    /// The once-only part of a hook, with the session's lock held: the file, and then `want`.
+    /// A failure changes nothing in memory.
+    async fn prepare(&self, body: &Session, hook: Hook, text: &str) -> Result<(), SessionError> {
+        let id = body.id;
+        let folder = factory::folder(&self.dir, id);
         match hook {
             Hook::Stop => {
-                let next = self.counts(live.id).await?.after_stop();
+                let next = self.tally(id).await?.want.after_stop();
                 self.write_file(turn_file(&folder, next.turn), text).await?;
-                let state = self.event_locked(live, &mut body, event).await?;
-                self.store_counts(&body, project, next).await?;
-                Ok(state)
+                self.change(id, |want| *want = want.after_stop());
             }
             Hook::UserPromptSubmit => {
-                let counts = self.counts(live.id).await?;
-                let state = self.event_locked(live, &mut body, event).await?;
+                self.tally(id).await?;
                 let question = question_file(&folder);
                 blocking(move || match std::fs::remove_file(&question) {
                     Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
@@ -173,61 +251,76 @@ impl Inner {
                     what: "the question file: remove it".into(),
                     source,
                 })?;
-                self.store_counts(&body, project, counts.after_prompt())
-                    .await?;
-                Ok(state)
+                self.change(id, |want| *want = want.after_prompt());
             }
-            // Claude Code also notifies after a minute idle: that asks nothing.
-            Hook::Notification
-                if matches!(
-                    body.state,
-                    SessionState::Starting | SessionState::Working | SessionState::Stuck
-                ) =>
-            {
-                let counts = self.counts(live.id).await?;
-                self.write_file(question_file(&folder), text).await?;
-                let state = self.event_locked(live, &mut body, event).await?;
-                self.store_counts(&body, project, counts.after_question())
-                    .await?;
-                Ok(state)
+            Hook::Notification => {
+                // Claude Code also notifies after a minute idle: that asks nothing.
+                let asks = body.state != SessionState::WaitingForYou
+                    && next_state(body.state, Event::Hook(hook)) == SessionState::WaitingForYou;
+                if asks {
+                    self.tally(id).await?;
+                    self.write_file(question_file(&folder), text).await?;
+                    self.change(id, |want| *want = want.after_question());
+                }
             }
-            _ => self.event_locked(live, &mut body, event).await,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Changes the counts the session wants. Its tally is in memory: `prepare` loaded it.
+    fn change(&self, session: SessionId, change: impl FnOnce(&mut Counts)) {
+        if let Some(tally) = lock(&self.factory).counts.get_mut(&session) {
+            change(&mut tally.want);
         }
     }
 
-    /// The session's counts: those kept in memory, or else the record in the store, or else
+    /// The session's tally: kept in memory, or else read from the record in the store, or else
     /// zeros.
-    pub(super) async fn counts(&self, session: SessionId) -> Result<Counts, SessionError> {
-        if let Some(counts) = lock(&self.factory).counts.get(&session) {
-            return Ok(*counts);
+    pub(super) async fn tally(&self, session: SessionId) -> Result<Tally, SessionError> {
+        if let Some(tally) = lock(&self.factory).counts.get(&session) {
+            return Ok(*tally);
         }
         let found = self
             .on_store(move |store| store.session_turn(session))
             .await?;
-        let counts = found.map_or_else(Counts::default, |turn| Counts {
+        let stored = found.map_or_else(Counts::default, |turn| Counts {
             turn: turn.turn,
             prompts: turn.prompts,
             question: turn.question,
         });
-        Ok(*lock(&self.factory).counts.entry(session).or_insert(counts))
+        let tally = Tally {
+            want: stored,
+            stored,
+        };
+        Ok(*lock(&self.factory).counts.entry(session).or_insert(tally))
     }
 
-    /// Writes `counts` as the session's `session_turn` record, and keeps them in memory once it
-    /// is stored.
-    async fn store_counts(
+    /// Writes the session's record when the counts it wants are not the ones it holds, and
+    /// keeps them as stored once it is written. It can be run again at any time. The caller
+    /// holds the session's lock.
+    pub(super) async fn flush(
         &self,
         session: &Session,
         project: ProjectId,
-        counts: Counts,
     ) -> Result<(), SessionError> {
+        let tally = self.tally(session.id).await?;
+        if tally.want == tally.stored {
+            return Ok(());
+        }
+        #[cfg(test)]
+        if super::take_one(&self.fail_turn_writes) {
+            return Err(super::busy().into());
+        }
         let me = self.me;
+        let want = tally.want;
         let turn = SessionTurn {
             session: session.id,
             workspace: session.workspace,
             project,
-            turn: counts.turn,
-            prompts: counts.prompts,
-            question: counts.question,
+            turn: want.turn,
+            prompts: want.prompts,
+            question: want.question,
         };
         self.on_store(move |store| {
             let record = FactoryRecord {
@@ -239,30 +332,16 @@ impl Inner {
             Ok(())
         })
         .await?;
-        lock(&self.factory).counts.insert(session.id, counts);
+        if let Some(tally) = lock(&self.factory).counts.get_mut(&session.id) {
+            tally.stored = want;
+        }
         Ok(())
     }
 
-    /// Writes `text` to `path` as [`write_text`] does, with what [`Inner::hide_for_disk`]
-    /// hides.
+    /// Writes `text` to `path` as [`write_text`] does, hidden as [`Hider`] hides it.
     async fn write_file(&self, path: PathBuf, text: &str) -> Result<(), SessionError> {
-        let shown = self.hide_for_disk(text);
-        blocking(move || write_text(&path, &shown)).await?
-    }
-
-    /// `text` as it is kept on disk: the gateway key and every live session's token hidden, and
-    /// then what [`crate::secrets::hide_known`] hides. With no secret store, none of it is kept.
-    fn hide_for_disk(&self, text: &str) -> String {
-        let Some(secrets) = self.secrets.get() else {
-            return crate::secrets::HIDDEN_UNREADABLE.to_owned();
-        };
-        let tokens: Vec<String> = lock(&self.live)
-            .values()
-            .map(|live| live.token.clone())
-            .collect();
-        let mut known: Vec<&str> = tokens.iter().map(String::as_str).collect();
-        known.push(&self.config.gateway.key);
-        crate::secrets::hide_known(&hide_each(text, &known), secrets.as_ref())
+        let (hider, text) = (self.hider(), text.to_owned());
+        blocking(move || write_text(&path, &hider.hide(&text))).await?
     }
 }
 

@@ -81,12 +81,8 @@ fn text_of(hook: Hook, payload: &serde_json::Value) -> String {
 /// Takes `payload` into the session's brief, with the gateway key and every live session's
 /// token hidden in what it keeps.
 fn note(inner: &Inner, live: &Live, payload: &serde_json::Value) {
-    let tokens: Vec<String> = lock(&inner.live)
-        .values()
-        .map(|l| l.token.clone())
-        .collect();
-    let mut secrets: Vec<&str> = tokens.iter().map(String::as_str).collect();
-    secrets.push(&inner.config.gateway.key);
+    let memory = inner.memory_secrets();
+    let secrets: Vec<&str> = memory.iter().map(String::as_str).collect();
     let at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
@@ -94,12 +90,14 @@ fn note(inner: &Inner, live: &Live, payload: &serde_json::Value) {
 }
 
 /// Applies `hook` to the session, trying again for [`KEEP_TRYING_FOR`] while the store does not
-/// take it, and gives the answer for the hook command.
+/// take it, and gives the answer for the hook command. A factory session's hook is prepared
+/// once, whatever the tries; a session that is no factory session just takes the event.
 async fn apply(inner: &Inner, live: &Arc<Live>, hook: Hook, text: &str) -> StatusCode {
     let give_up_at = tokio::time::Instant::now() + KEEP_TRYING_FOR;
     let mut backoff = Backoff::new();
+    let mut prepared = false;
     loop {
-        let error = match inner.hook_event(live, hook, text).await {
+        let error = match inner.hook_step(live, hook, text, &mut prepared).await {
             Ok(_) => return StatusCode::NO_CONTENT,
             Err(error) => error,
         };
