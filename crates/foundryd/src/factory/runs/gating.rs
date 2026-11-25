@@ -7983,8 +7983,10 @@ mod tests {
                 !rig.finished(&run),
                 "the run is not ended with its workspace live"
             );
-            // The archive answers on a later pass, which finishes what was owed.
-            go(&rig, &run);
+            // The archive answers on a later pass, which finishes the recorded pass as the
+            // runner's two-step case does: the run is left in `pr-open`, and ending it as merged
+            // is the feedback step's (task 28), as for a merge after a recorded pass.
+            assert_eq!(go(&rig, &run), GateStep::Passed { pr: 12 });
             assert!(has_step(&rig, &run, BUILD_ARCHIVED));
             assert_eq!(
                 calls(&rig)
@@ -7993,6 +7995,8 @@ mod tests {
                     .count(),
                 2
             );
+            assert_eq!(rig.sim.labels(), ["factory:pr-open"]);
+            assert!(!rig.finished(&run));
         }
 
         #[test]
@@ -8119,6 +8123,35 @@ mod tests {
                 1
             );
             assert!(rig.finished(&run));
+        }
+
+        #[test]
+        fn a_finish_that_waits_on_the_session_end_marks_the_pull_request_ready_once() {
+            let (mut rig, run, hub) = built();
+            place(&mut rig, &run, 1, 1);
+            show(&mut rig, &run, SessionState::Idle, 1, &[exited(1, 0)]);
+            rig.worker.on_tail(Ok(PASS_TAIL.into()));
+            for _ in 0..3 {
+                rig.worker
+                    .on_end_sessions(Err(WorkerError::Unreachable("no route".into())));
+            }
+            assert_eq!(go(&rig, &run), GateStep::NotReady);
+            assert!(!hub.lock().pulls[&12].draft);
+            // A person puts it back to draft while the end of the session is waited for.
+            hub.set_draft(true);
+            assert_eq!(go(&rig, &run), GateStep::NotReady);
+            assert_eq!(go(&rig, &run), GateStep::NotReady);
+            let readies = |rig: &Rig| {
+                rig.sim
+                    .writes()
+                    .iter()
+                    .filter(|write| write.contains("pr ready 12"))
+                    .count()
+            };
+            assert_eq!(readies(&rig), 1, "the ready mark is asked for once");
+            assert!(hub.lock().pulls[&12].draft, "a person's draft stands");
+            assert_eq!(go(&rig, &run), GateStep::Passed { pr: 12 });
+            assert_eq!(readies(&rig), 1);
         }
     }
 }
