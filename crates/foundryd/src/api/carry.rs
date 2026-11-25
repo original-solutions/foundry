@@ -182,13 +182,13 @@ fn warned(answer: Answer, warning: Option<String>) -> Answer {
 /// Where a run's call to a worker route is answered.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Owner {
-    /// On this machine: it owns what the call names, or what it names is gone, which this
-    /// machine answers as well as any.
+    /// On this machine: it owns what the call names, or the workspace or terminal it names is
+    /// gone, which this machine answers as well as any.
     Here,
     /// On the other machine that owns it.
     There(MachineId),
     /// Nowhere yet: no record of what the call names has reached this machine, so its owner is
-    /// not known.
+    /// not known. A deleted session record names no owner either.
     Unknown,
 }
 
