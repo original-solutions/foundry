@@ -157,7 +157,9 @@ impl FleetView {
     /// tells a record this build cannot parse from a database error and names the owner, the
     /// session or the machine of the row. The turns and the holdings are one query each, so a
     /// read makes the same number of them for any number of sessions; a turn is kept only for
-    /// a session in the view that is not deleted, a holding only for a machine that has records.
+    /// a session in the view that is not deleted (the turn of a deleted session is never read),
+    /// a holding only for a machine that has records (a row keyed by an id this build does not
+    /// spell is left out).
     pub fn read(
         store: &Store,
         online: BTreeSet<MachineId>,

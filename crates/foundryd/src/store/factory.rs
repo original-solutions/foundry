@@ -41,13 +41,23 @@ fn wrong_kind(kind: &str, body: &FactoryBody) -> StoreError {
 }
 
 /// The record in `json`, a row of `kind` keyed by `key`. When it cannot be read the error names
-/// `key` and the parse error, never the record.
+/// `key`, the kind of fault and where it is, never the record or any value in it: the parse
+/// error's own text can quote a value, so it is not used.
 fn decode_row(kind: &str, key: &str, json: &str) -> Result<FactoryBody, StoreError> {
+    use serde_json::error::Category;
     serde_json::from_str::<FactoryRecord>(json)
         .map(|record| record.body)
         .map_err(|e| {
+            let fault = match e.classify() {
+                Category::Io => "a read failed",
+                Category::Syntax => "not valid JSON",
+                Category::Data => "not a factory record this build reads",
+                Category::Eof => "ends early",
+            };
             StoreError::Json(<serde_json::Error as serde::de::Error>::custom(format!(
-                "the {kind} row of {key}: {e}"
+                "the {kind} row of {key}: {fault} at line {} column {}",
+                e.line(),
+                e.column()
             )))
         })
 }
@@ -490,7 +500,7 @@ impl Store {
     pub fn held(&self, machine: MachineId) -> Result<Option<MachineHeld>, StoreError> {
         match self.factory_by_key("machine_held", &machine.to_string())? {
             Some(FactoryBody::Held(held)) => Ok(Some(held)),
-            Some(other) => Err(wrong_kind("machine_held", &other)),
+            Some(other) => Err(wrong_kind_of("machine_held", &machine.to_string(), &other)),
             None => Ok(None),
         }
     }
@@ -509,50 +519,64 @@ impl Store {
         let Some(owner) = owner else {
             return Ok(None);
         };
-        match self.factory_by_key("session_turn", &format!("{session}/{owner}"))? {
+        let key = format!("{session}/{owner}");
+        match self.factory_by_key("session_turn", &key)? {
             Some(FactoryBody::Turn(turn)) => Ok(Some(turn)),
-            Some(other) => Err(wrong_kind("session_turn", &other)),
+            Some(other) => Err(wrong_kind_of("session_turn", &key, &other)),
             None => Ok(None),
         }
     }
 
-    /// The newest turn of every session, each by the rule of [`session_turn`](Self::session_turn)
-    /// (the turn written by the machine that owns P1's record of the session), in one query. A
-    /// row whose session id cannot be read, whose record cannot be read or that holds another
-    /// kind of record is an error that names the session and holds nothing of the record.
+    /// The turn of every session that is not deleted, each by the rule of
+    /// [`session_turn`](Self::session_turn) (the turn written by the machine that owns P1's
+    /// record of the session), in one query. A session whose P1 record is deleted is not looked
+    /// at, so a turn of it that cannot be read fails nothing; a P1 record that is not JSON is
+    /// not deleted. A session id not spelt as this build writes one is a key no `session_turn`
+    /// lookup finds, so it is left out. A row whose record cannot be read, or that holds another
+    /// kind of record, is an error that names the row's `<session>/<owner>` key and holds
+    /// nothing of the record.
     pub fn session_turns(&self) -> Result<BTreeMap<SessionId, SessionTurn>, StoreError> {
         queried::add();
         let mut query = self.conn.prepare_cached(
-            "SELECT r.id, f.record FROM records r \
+            "SELECT r.id, f.id, f.record FROM records r \
              JOIN factory_records f ON f.kind = 'session_turn' AND f.id = r.id || '/' || r.owner \
-             WHERE r.kind = 'session'",
+             WHERE r.kind = 'session' AND NOT COALESCE( \
+                 CASE WHEN json_valid(r.record) THEN json_extract(r.record, '$.deleted') END, 0)",
         )?;
         let rows = query.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
         })?;
         let mut turns = BTreeMap::new();
         for row in rows {
-            let (text, json) = row?;
-            let session = text.parse().map(SessionId).map_err(|e: uuid::Error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    0,
-                    Type::Text,
-                    format!("session {text}: an id this build cannot read: {e}").into(),
-                )
-            })?;
-            match decode_row("session_turn", &text, &json)? {
+            let (text, key, json) = row?;
+            let Some(session) = text
+                .parse()
+                .ok()
+                .map(SessionId)
+                .filter(|id| id.to_string() == text)
+            else {
+                continue;
+            };
+            match decode_row("session_turn", &key, &json)? {
                 FactoryBody::Turn(turn) => {
                     turns.insert(session, turn);
                 }
-                other => return Err(wrong_kind_of("session_turn", &text, &other)),
+                other => return Err(wrong_kind_of("session_turn", &key, &other)),
             }
         }
         Ok(turns)
     }
 
     /// What every machine holds, each by the rule of [`held`](Self::held), in one query. A row
-    /// whose machine id, record or kind cannot be read is an error that names the machine and
-    /// holds nothing of the record.
+    /// keyed by an id that is not a machine id in the spelling this build writes is a key no
+    /// `held(machine)` can name, so it is left out, not an error (as
+    /// [`factory_versions`](Self::factory_versions) leaves out an owner spelt otherwise, and
+    /// warns of it once). A row whose record cannot be read, or that holds another kind of
+    /// record, is an error that names the machine and holds nothing of the record.
     pub fn helds(&self) -> Result<BTreeMap<MachineId, MachineHeld>, StoreError> {
         queried::add();
         let mut query = self
@@ -564,13 +588,9 @@ impl Store {
         let mut helds = BTreeMap::new();
         for row in rows {
             let (text, json) = row?;
-            let machine = parse_machine(0, &text).map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    0,
-                    Type::Text,
-                    format!("machine {text}: {e}").into(),
-                )
-            })?;
+            let Ok(machine) = parse_machine(0, &text) else {
+                continue;
+            };
             match decode_row("machine_held", &text, &json)? {
                 FactoryBody::Held(held) => {
                     helds.insert(machine, held);
@@ -592,8 +612,7 @@ impl Store {
         let Some(json) = json else {
             return Ok(None);
         };
-        let record: FactoryRecord = serde_json::from_str(&json)?;
-        Ok(Some(record.body))
+        decode_row(kind, id, &json).map(Some)
     }
 }
 
