@@ -71,6 +71,12 @@ const POLL: Duration = Duration::from_millis(10);
 /// The most git's output the lease keeps. The rest is read and dropped.
 const OUTPUT_LIMIT: usize = 1024 * 1024;
 
+/// The largest generation or renewal count the lease reads or writes. Generations are kept in
+/// SQLite records, which hold an `i64`, so a larger number is no lease's: a commit that names
+/// one is read as a commit foundryd did not write, and a count that could not be raised to
+/// at most this is never pushed. Whatever the lease pushes therefore parses as its own.
+pub const MAX_COUNT: u64 = i64::MAX as u64;
+
 /// The first line of every lease commit's message.
 const SUBJECT: &str = "foundry factory lease";
 
@@ -128,9 +134,7 @@ impl Parsed {
         };
         let generation: u64 = field("generation")?.parse().ok()?;
         let renewals: u64 = field("renewals")?.parse().ok()?;
-        // A count that cannot be raised is a message the lease did not write: it never makes
-        // one, and a number it could not raise would wrap or stop a take or a renewal for good.
-        if generation == u64::MAX || renewals == u64::MAX {
+        if generation > MAX_COUNT || renewals > MAX_COUNT {
             return None;
         }
         Some(Parsed {
@@ -156,16 +160,12 @@ struct Seen {
     sha: String,
     /// The clock reading when this lease first read this commit.
     since: Duration,
-    /// `None` when the message is not one the lease writes.
+    /// `None` when the message is not one the lease writes, or the commit could not be
+    /// fetched to be read.
     lease: Option<Parsed>,
-}
-
-/// How the last read of the ref ended.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LastRead {
-    Never,
-    Failed,
-    Done,
+    /// Whether the commit is in the lease directory. A commit that could not be fetched is
+    /// still waited for and taken over, since the swap needs only its id.
+    fetched: bool,
 }
 
 /// What went wrong in one tick, for its report.
@@ -179,7 +179,8 @@ struct Notes {
 struct State {
     hold: Option<Hold>,
     seen: Option<Seen>,
-    last_read: LastRead,
+    /// Whether the ref was ever read, as missing or as a commit.
+    has_read: bool,
     /// What went wrong in the tick that is running or ran last.
     note: Notes,
     /// The highest generation seen anywhere: told by the caller, read in the ref, or pushed.
@@ -253,7 +254,11 @@ impl Ran {
 /// What reading the ref found.
 enum Found {
     Missing,
-    Present { sha: String, parsed: Option<Parsed> },
+    Present {
+        sha: String,
+        parsed: Option<Parsed>,
+        fetched: bool,
+    },
     Failed,
 }
 
@@ -323,7 +328,7 @@ impl Lease {
                 state: Mutex::new(State {
                     hold: None,
                     seen: None,
-                    last_read: LastRead::Never,
+                    has_read: false,
                     note: Notes::default(),
                     highest: 0,
                     released: false,
@@ -366,7 +371,8 @@ impl Lease {
         let _ticking = self.ticking.lock().unwrap_or_else(PoisonError::into_inner);
         {
             let mut state = self.shared.state();
-            state.highest = state.highest.max(highest_seen_generation);
+            // Above the bound it is ignored down to the bound: no generation past it is pushed.
+            state.highest = state.highest.max(highest_seen_generation.min(MAX_COUNT));
             if self.auth.is_some() && state.released {
                 drop(state);
                 return self.report();
@@ -396,18 +402,15 @@ impl Lease {
             return LeaseState::Held { generation };
         }
         let state = self.shared.state();
-        // This tick's failures first: a machine that could not read or push must not name a
-        // holder it read before as if it had just looked.
+        // A failed read first: a machine that could not look must not name a holder it read
+        // before as if it had just looked.
         if state.note.read_failed {
             return LeaseState::Unknown {
                 reason: "the lease ref could not be read",
             };
         }
-        if state.note.push_failed {
-            return LeaseState::Unknown {
-                reason: "the lease could not be pushed",
-            };
-        }
+        // Who holds the lease, as this tick read it in the ref, whether or not a push of this
+        // tick failed.
         if let Some(Seen {
             lease: Some(lease), ..
         }) = &state.seen
@@ -417,11 +420,14 @@ impl Lease {
                 generation: lease.generation,
             };
         }
-        let reason = match (&state.seen, state.last_read) {
-            (_, LastRead::Failed) => "the lease ref could not be read",
-            (None, LastRead::Never) => "the lease ref has not been read",
-            (None, LastRead::Done) => "the lease ref is missing and could not be taken",
-            (Some(_), _) => "the lease ref holds a commit foundryd did not write",
+        // No lease commit was read. A push that failed over a commit the lease did not write
+        // says so; for a missing ref the take that failed is "missing and could not be taken".
+        let reason = match &state.seen {
+            Some(_) if state.note.push_failed => "the lease could not be pushed",
+            Some(seen) if !seen.fetched => "the lease commit could not be fetched",
+            Some(_) => "the lease ref holds a commit foundryd did not write",
+            None if !state.has_read => "the lease ref has not been read",
+            None => "the lease ref is missing and could not be taken",
         };
         LeaseState::Unknown { reason }
     }
@@ -430,16 +436,17 @@ impl Lease {
     fn observe(&self, read: &Found, now: Duration) {
         let mut state = self.shared.state();
         match read {
-            Found::Failed => {
-                state.last_read = LastRead::Failed;
-                state.note.read_failed = true;
-            }
+            Found::Failed => state.note.read_failed = true,
             Found::Missing => {
-                state.last_read = LastRead::Done;
+                state.has_read = true;
                 state.seen = None;
             }
-            Found::Present { sha, parsed } => {
-                state.last_read = LastRead::Done;
+            Found::Present {
+                sha,
+                parsed,
+                fetched,
+            } => {
+                state.has_read = true;
                 let since = match &state.seen {
                     Some(seen) if seen.sha == *sha => seen.since,
                     _ => now,
@@ -451,6 +458,7 @@ impl Lease {
                     sha: sha.clone(),
                     since,
                     lease: *parsed,
+                    fetched: *fetched,
                 });
             }
         }
@@ -464,7 +472,7 @@ impl Lease {
             Found::Failed => Plan::Nothing,
             Found::Missing => {
                 state.hold = None;
-                match state.highest.checked_add(1) {
+                match raised(state.highest) {
                     Some(generation) => Plan::Push {
                         generation,
                         renewals: 0,
@@ -473,7 +481,7 @@ impl Lease {
                     None => Plan::Nothing,
                 }
             }
-            Found::Present { sha, parsed } => {
+            Found::Present { sha, parsed, .. } => {
                 // A commit naming this machine at a generation below one seen since is an old
                 // one that the ref was put back to: it is treated as another machine's.
                 let mine = parsed.filter(|parsed| {
@@ -487,7 +495,7 @@ impl Lease {
                         return Plan::Nothing;
                     }
                     // A count that cannot be raised is not renewed this tick.
-                    return match parsed.renewals.checked_add(1) {
+                    return match raised(parsed.renewals) {
                         Some(renewals) => Plan::Push {
                             generation: parsed.generation,
                             renewals,
@@ -502,7 +510,7 @@ impl Lease {
                     return Plan::Nothing;
                 }
                 // `highest` is at least the ref's own generation: it was raised when it was read.
-                match state.highest.checked_add(1) {
+                match raised(state.highest) {
                     Some(generation) => Plan::Push {
                         generation,
                         renewals: 0,
@@ -551,7 +559,7 @@ impl Lease {
                 let now = self.shared.clock.now();
                 let mut state = self.shared.state();
                 state.highest = state.highest.max(generation);
-                state.last_read = LastRead::Done;
+                state.has_read = true;
                 state.seen = Some(Seen {
                     sha: commit.clone(),
                     since: now,
@@ -560,6 +568,7 @@ impl Lease {
                         generation,
                         renewals,
                     }),
+                    fetched: true,
                 });
                 if !state.released {
                     state.hold = Some(Hold {
@@ -570,15 +579,34 @@ impl Lease {
                 }
             }
             Pushed::Refused => {
-                self.shared.state().hold = None;
+                // The hold goes at once. It comes back only if the ref proves unchanged: then
+                // a rule or a hook of the remote refused the push, no other machine won, and
+                // the hold lapses by age like that of any push that failed.
+                let held = self.shared.state().hold.take();
                 let read = self.read_ref(auth);
                 self.observe(&read, self.shared.clock.now());
+                let unchanged = match (&read, expect) {
+                    (Found::Present { sha, .. }, Some(expect)) => sha == expect,
+                    (Found::Missing, None) => true,
+                    _ => false,
+                };
+                if unchanged {
+                    let mut state = self.shared.state();
+                    state.note.push_failed = true;
+                    if !state.released {
+                        state.hold = held;
+                    }
+                }
             }
             Pushed::Failed => self.shared.state().note.push_failed = true,
         }
     }
 
-    /// Reads the ref in the remote into the lease directory and parses it.
+    /// Reads the ref in the remote and parses its commit. The ref is listed first, and only
+    /// a line naming exactly [`REF`] counts, so a branch or tag that ends in the same words is
+    /// no lease. The commit is fetched (one commit, no history) only when the lease directory
+    /// has not got it, so a holder never fetches its own commit. A commit that cannot be
+    /// fetched is still `Present`, with no message, so the wait and the swap still run.
     ///
     /// Before it, any lock file a killed git call left in the lease directory is removed (see
     /// [`remove_stale`]).
@@ -600,61 +628,78 @@ impl Lease {
                 return Found::Failed;
             }
         }
+        let listed = self.git(
+            auth,
+            &["ls-remote", "--exit-code", "--", &self.url, REF],
+            true,
+        );
+        let sha = match &listed.outcome {
+            Outcome::Exit { code: Some(2), .. } => return Found::Missing,
+            Outcome::Exit {
+                code: Some(0),
+                stdout,
+            } => {
+                // The pattern matches the tail of a name, so other refs may be listed.
+                let named = stdout.lines().find_map(|line| {
+                    let mut parts = line.split_whitespace();
+                    let sha = parts.next()?;
+                    (parts.next()? == REF).then_some(sha)
+                });
+                match named {
+                    Some(sha) if sha.len() >= 40 && sha.chars().all(|c| c.is_ascii_hexdigit()) => {
+                        sha.to_owned()
+                    }
+                    Some(_) => return Found::Failed,
+                    None => return Found::Missing,
+                }
+            }
+            _ => return Found::Failed,
+        };
+        let commit = format!("{sha}^{{commit}}");
+        let have = self
+            .git(auth, &["cat-file", "-e", &commit], true)
+            .ok_stdout()
+            .is_some();
+        let fetched = have || self.fetch(auth, &sha);
+        let parsed = fetched
+            .then(|| {
+                self.git(auth, &["cat-file", "commit", &sha], true)
+                    .ok_stdout()
+                    .and_then(|commit| commit.split_once("\n\n"))
+                    .and_then(|(_, message)| Parsed::from_message(message))
+            })
+            .flatten();
+        Found::Present {
+            sha,
+            parsed,
+            fetched,
+        }
+    }
+
+    /// Fetches the lease ref, one commit deep, and says whether it is `sha`. Until the check
+    /// the ref fetched could be another that the name resolved to in a race, so the check is
+    /// what makes the read exact.
+    fn fetch(&self, auth: &GitAuth, sha: &str) -> bool {
         let refspec = format!("+{REF}:{REF}");
         let fetch = self.git(
             auth,
             &[
                 "fetch",
                 "--no-tags",
-                "--quiet",
+                "--no-auto-gc",
                 "--depth=1",
+                "--quiet",
                 "--",
                 &self.url,
                 &refspec,
             ],
             true,
         );
-        if fetch.ok_stdout().is_none() {
-            return self.read_missing(auth);
-        }
-        let Some(sha) = self
-            .git(auth, &["rev-parse", "--verify", "--quiet", REF], true)
-            .ok_stdout()
-            .filter(|sha| !sha.is_empty())
-            .map(str::to_owned)
-        else {
-            return Found::Failed;
-        };
-        let parsed = self
-            .git(auth, &["cat-file", "commit", &sha], true)
-            .ok_stdout()
-            .and_then(|commit| commit.split_once("\n\n"))
-            .and_then(|(_, message)| Parsed::from_message(message));
-        Found::Present { sha, parsed }
-    }
-
-    /// After a failed fetch: whether the ref is missing, or the remote could not be read.
-    fn read_missing(&self, auth: &GitAuth) -> Found {
-        let ran = self.git(
-            auth,
-            &["ls-remote", "--exit-code", "--", &self.url, REF],
-            true,
-        );
-        match ran.outcome {
-            // `ls-remote` says 2 when no ref matched.
-            Outcome::Exit { code: Some(2), .. } => Found::Missing,
-            // The pattern matches the tail of a name, so another ref may have been listed.
-            Outcome::Exit {
-                code: Some(0),
-                stdout,
-            } if !stdout
-                .lines()
-                .any(|line| line.split_whitespace().nth(1) == Some(REF)) =>
-            {
-                Found::Missing
-            }
-            _ => Found::Failed,
-        }
+        fetch.ok_stdout().is_some()
+            && self
+                .git(auth, &["rev-parse", "--verify", "--quiet", REF], true)
+                .ok_stdout()
+                == Some(sha)
     }
 
     /// Runs git with `args` and the token, ending within [`PUSH_LIMIT`] on the clock. A call
@@ -729,6 +774,11 @@ impl Lease {
             stdout: String::from_utf8_lossy(&stdout).into_owned(),
         })
     }
+}
+
+/// `n` raised by one, or `None` when that is above [`MAX_COUNT`].
+fn raised(n: u64) -> Option<u64> {
+    n.checked_add(1).filter(|raised| *raised <= MAX_COUNT)
 }
 
 /// Removes every `*.lock` file under `dir` and every `objects/pack/tmp_*` file, which a git
@@ -1603,7 +1653,9 @@ exec git "$@"
         assert_eq!(b.tick(0), a.held_by(1));
         for machine in [&a, &b] {
             let refs = git_text(&machine.dir, &["for-each-ref", "--format=%(refname)"]);
-            assert_eq!(refs, REF);
+            // The directory fetches nothing but the lease ref, and a machine that only pushed
+            // has no ref at all.
+            assert!(refs.lines().all(|name| name == REF), "{refs}");
             let remotes = git_out(&machine.dir, &["config", "--get-regexp", r"^remote\."]);
             assert!(remotes.stdout.is_empty());
             let main = git_out(&machine.dir, &["cat-file", "-e", &rig.remote.main]);
@@ -1977,7 +2029,15 @@ exec git "$@"
                     &rig.remote.main,
                 ],
             );
-            assert_eq!(a.tick(0), held(1));
+            // git itself resolves a push to `refs/factory/lease` to such a branch when the ref
+            // is missing, and the push expecting no ref is refused: the lease cannot be taken
+            // there. What matters is that the branch is neither read as the lease nor moved.
+            assert_eq!(reason_of(&a.tick(0)), NOT_TAKEN);
+            let ref_name = format!("refs/{namespace}/refs/factory/lease");
+            assert_eq!(
+                git_text(&rig.remote.path, &["rev-parse", &ref_name]),
+                rig.remote.main
+            );
             let has = git_out(&a.dir, &["cat-file", "-e", &rig.remote.main]);
             assert!(!has.status.success(), "the lease directory holds main");
         }
