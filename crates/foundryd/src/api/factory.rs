@@ -27,7 +27,9 @@
 //!   the session, `200 {prompts}` with its count of prompts before the send, or `409 {error,
 //!   reason}` with why nothing was sent, and `now`, the count, when it rose.
 //! - `POST /api/sessions/{id}/factory/turn` `{turn}`: `200 {message, question}`, the turn's
-//!   final message and the question that waits, or `404` while the turn is not written.
+//!   final message and the question that waits, `404` while the turn is not written and the
+//!   session runs, or `410` when it is not written and the session no longer runs here, so it
+//!   never will be.
 //! - `POST /api/terminals/{id}/tail`: the end of the terminal's output as plain text, at most
 //!   [`TAIL_LIMIT`] bytes. Only a workspace's setup terminal, where a setup or a gate runs, has
 //!   a tail. Any other is `404`: a session's, whose child holds a token, is read through its
@@ -62,6 +64,7 @@ use crate::git_auth::NoToken;
 use crate::secrets::redact;
 use crate::sessions::SessionError;
 use crate::sessions::factory::{FactoryStart, SendRefused};
+use crate::sessions::turns::TurnText;
 use crate::sync::call::{Answer, CARRIED, CallError};
 use crate::workspaces::{Checkout, FactoryTag, Setup, WorkspaceError};
 
@@ -427,16 +430,42 @@ struct Turn {
 
 async fn turn(api: &Api, id: SessionId, body: &Bytes) -> Result<Response, ApiError> {
     let asked: Turn = read(body)?;
-    let Some(text) = api.sessions.turn_text(id, asked.turn).await else {
+    let answer = |text: TurnText| {
+        Json(serde_json::json!({ "message": text.message, "question": text.question }))
+            .into_response()
+    };
+    if let Some(text) = api.sessions.turn_text(id, asked.turn).await {
+        return Ok(answer(text));
+    }
+    let me = api.peers.me();
+    let runs = on_store(&api.store, move |store| store.sessions_of(me))
+        .await?
+        .iter()
+        .any(|record| {
+            record.body.id == id
+                && !record.deleted
+                && !matches!(
+                    record.body.state,
+                    SessionState::Finished | SessionState::Failed
+                )
+        });
+    if runs {
         return Err(ApiError::NotFound(format!(
-            "no turn {} of a factory session {id} here",
+            "turn {} of factory session {id} is not written yet",
             asked.turn
         )));
-    };
-    Ok(
-        Json(serde_json::json!({ "message": text.message, "question": text.question }))
-            .into_response(),
-    )
+    }
+    // The session may have written the turn just before it ended.
+    if let Some(text) = api.sessions.turn_text(id, asked.turn).await {
+        return Ok(answer(text));
+    }
+    Err(ApiError::Rejected(
+        StatusCode::GONE,
+        format!(
+            "factory session {id} does not run here, so its turn {} will not be written",
+            asked.turn
+        ),
+    ))
 }
 
 // --- terminals ---

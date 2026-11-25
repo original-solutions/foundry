@@ -1840,6 +1840,15 @@ async fn a_start_after_the_workspaces_sessions_were_ended_starts_a_new_session()
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
+    // A turn the ended session never wrote never will be: not the 404 of a turn still to come.
+    let (status, text) = pair
+        .call(
+            &format!("/api/sessions/{first}/factory/turn"),
+            Some(json!({"turn": 5})),
+        )
+        .await;
+    assert_eq!(status, 410, "{text}");
+
     // The ended session is not the running one, and the end does not refuse the next start.
     let (status, text) = pair.call(&path, Some(start)).await;
     assert_eq!(status, 201, "{text}");
@@ -1897,4 +1906,30 @@ async fn a_create_whose_setup_cannot_start_is_201_with_the_workspace_and_its_err
         workspace,
         "a retry answers the same one"
     );
+}
+
+#[tokio::test]
+async fn two_starts_sent_at_once_start_one_session_and_both_answer_with_it() {
+    let pair = Pair::start().await;
+    let (status, text) = pair
+        .call(
+            "/api/factory/workspaces",
+            Some(pair.create("fac/12-1", json!({"kind": "none"}))),
+        )
+        .await;
+    assert_eq!(status, 201, "{text}");
+    let workspace = workspace_of(&text);
+    let start = pair.start_body(LOGIN, "test-model", "high", "/factory-build demo#12");
+    let path = format!("/api/workspaces/{workspace}/factory/session");
+
+    // As a start sent again after a 504 can reach B while the first is still starting there.
+    let ((one, one_text), (two, two_text)) = tokio::join!(
+        pair.call(&path, Some(start.clone())),
+        pair.call(&path, Some(start)),
+    );
+    let mut statuses = [one, two];
+    statuses.sort_unstable();
+    assert_eq!(statuses, [200, 201], "{one_text} {two_text}");
+    assert_eq!(session_of(&one_text), session_of(&two_text), "one session");
+    assert_eq!(pair.sessions_in(workspace), 1, "one session runs on B");
 }
