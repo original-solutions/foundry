@@ -20,6 +20,7 @@ use crate::factory::messages::Message;
 use crate::sessions::factory::{FactoryStart, SendRefused};
 use crate::sessions::turns::TurnText;
 use crate::store::{Store, StoreError};
+use crate::sync::as_seen;
 use crate::workspaces::{Checkout, FactoryTag, Setup};
 
 /// What a new workspace is made from. The machine it is made on is a separate argument of
@@ -128,7 +129,7 @@ impl Guard for Lost {
 }
 
 /// The fleet as one pass of the factory sees it: a snapshot, so a pass reads no store twice.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct FleetView {
     workspaces: Vec<Record<Workspace>>,
     sessions: Vec<Record<Session>>,
@@ -151,8 +152,8 @@ impl FleetView {
         unreachable: BTreeMap<MachineId, Duration>,
     ) -> Result<FleetView, StoreError> {
         let mut builder = FleetView::builder();
-        builder.online = online;
-        builder.unreachable = unreachable;
+        builder.view.online = online;
+        builder.view.unreachable = unreachable;
         let versions = store.versions()?;
         let mut machines: BTreeSet<MachineId> = versions.keys().copied().collect();
         machines.extend(store.factory_versions()?.into_keys());
@@ -166,23 +167,23 @@ impl FleetView {
             };
             for record in records {
                 match record {
-                    AnyRecord::Workspace(r) => builder.workspaces.push(r),
-                    AnyRecord::Session(r) => builder.sessions.push(r),
+                    AnyRecord::Workspace(r) => builder.view.workspaces.push(r),
+                    AnyRecord::Session(r) => builder.view.sessions.push(r),
                     AnyRecord::Terminal(r) => {
-                        builder.terminals.insert(r.body.id, r);
+                        builder.view.terminals.insert(r.body.id, r);
                     }
-                    AnyRecord::MachineSample(r) => builder.samples.push(r),
+                    AnyRecord::MachineSample(r) => builder.view.samples.push(r),
                 }
             }
         }
-        for session in builder.sessions.iter().filter(|r| !r.deleted) {
+        for session in builder.view.sessions.iter().filter(|r| !r.deleted) {
             if let Some(turn) = store.session_turn(session.body.id)? {
-                builder.turns.insert(session.body.id, turn);
+                builder.view.turns.insert(session.body.id, turn);
             }
         }
         for machine in machines {
             if let Some(held) = store.held(machine)? {
-                builder.held.insert(machine, held);
+                builder.view.held.insert(machine, held);
             }
         }
         Ok(builder.build())
@@ -194,48 +195,53 @@ impl FleetView {
     }
 
     /// The workspace of `project` named `name` that is not archived. The first in the order
-    /// the records were held.
+    /// held: by owner machine id, then version, for [`FleetView::read`], and the order given
+    /// for the builder. A run may have workspaces of one name on two machines, after a
+    /// relaunch on another machine: the caller then reads [`FleetView::workspaces_named`].
     pub fn workspace_named(&self, project: ProjectId, name: &str) -> Option<&Record<Workspace>> {
-        self.workspaces
-            .iter()
-            .find(|r| !r.deleted && r.body.project == project && r.body.name == name)
+        self.workspaces_named(project, name).into_iter().next()
     }
 
-    /// The session of `workspace` that is not ended: a factory session, one with a turn,
-    /// before any other, and among equals the highest version.
+    /// Every workspace of `project` named `name` that is not archived, in the order held.
+    pub fn workspaces_named(&self, project: ProjectId, name: &str) -> Vec<&Record<Workspace>> {
+        self.workspaces
+            .iter()
+            .filter(|r| !r.deleted && r.body.project == project && r.body.name == name)
+            .collect()
+    }
+
+    /// The session of `workspace` to read: a live one before an ended one, one with a turn
+    /// (a factory session) before one without, and among equals the highest version. An
+    /// ended session is still answered when it is the only one, so a run sees it ended.
     pub fn session_of(&self, workspace: WorkspaceId) -> Option<&Record<Session>> {
         self.sessions
             .iter()
             .filter(|r| !r.deleted && r.body.workspace == workspace)
-            .max_by_key(|r| (self.turns.contains_key(&r.body.id), r.version))
+            .max_by_key(|r| {
+                let ended = matches!(r.body.state, SessionState::Finished | SessionState::Failed);
+                (!ended, self.turns.contains_key(&r.body.id), r.version)
+            })
     }
 
-    /// The state of `session`. `None` for one unknown or deleted, and
-    /// [`SessionState::Unreachable`] while its owner is offline.
+    /// The state of `session`, as its owner's record shows it: [`SessionState::Unreachable`]
+    /// while its owner is offline. `None` for one unknown or deleted.
     pub fn session_state(&self, session: SessionId) -> Option<SessionState> {
-        let record = self
-            .sessions
+        self.sessions
             .iter()
-            .find(|r| !r.deleted && r.body.id == session)?;
-        if self.online.contains(&record.owner) {
-            Some(record.body.state)
-        } else {
-            Some(SessionState::Unreachable)
-        }
+            .find(|r| !r.deleted && r.body.id == session)
+            .map(|r| r.body.state)
     }
 
     /// The state and exit code of `terminal`. `None` for one unknown. A terminal whose owner
     /// is offline is unreachable, and a deleted one has exited, as P1 treats it.
     pub fn terminal(&self, terminal: TerminalId) -> Option<(TerminalState, Option<i32>)> {
         let record = self.terminals.get(&terminal)?;
-        let code = record.body.exit_code;
-        if !self.online.contains(&record.owner) {
-            Some((TerminalState::Unreachable, code))
-        } else if record.deleted {
-            Some((TerminalState::Exited, code))
+        let state = if record.deleted && record.body.state != TerminalState::Unreachable {
+            TerminalState::Exited
         } else {
-            Some((record.body.state, code))
-        }
+            record.body.state
+        };
+        Some((state, record.body.exit_code))
     }
 
     /// The newest turn of `session`, when it is a factory session.
@@ -271,77 +277,77 @@ impl FleetView {
 /// Builds a [`FleetView`] from records given directly.
 #[derive(Debug, Default)]
 pub struct FleetViewBuilder {
-    workspaces: Vec<Record<Workspace>>,
-    sessions: Vec<Record<Session>>,
-    terminals: BTreeMap<TerminalId, Record<Terminal>>,
-    turns: BTreeMap<SessionId, SessionTurn>,
-    online: BTreeSet<MachineId>,
-    unreachable: BTreeMap<MachineId, Duration>,
-    samples: Vec<Record<MachineSample>>,
-    held: BTreeMap<MachineId, MachineHeld>,
+    view: FleetView,
 }
 
 impl FleetViewBuilder {
     /// Adds a workspace record, archived or not.
     pub fn workspace(mut self, record: Record<Workspace>) -> Self {
-        self.workspaces.push(record);
+        self.view.workspaces.push(record);
         self
     }
 
     /// Adds a session record, ended or not.
     pub fn session(mut self, record: Record<Session>) -> Self {
-        self.sessions.push(record);
+        self.view.sessions.push(record);
         self
     }
 
     /// Adds a terminal record.
     pub fn terminal(mut self, record: Record<Terminal>) -> Self {
-        self.terminals.insert(record.body.id, record);
+        self.view.terminals.insert(record.body.id, record);
         self
     }
 
     /// Adds a factory session's newest turn.
     pub fn turn(mut self, turn: SessionTurn) -> Self {
-        self.turns.insert(turn.session, turn);
+        self.view.turns.insert(turn.session, turn);
         self
     }
 
     /// Marks `machine` online.
     pub fn online(mut self, machine: MachineId) -> Self {
-        self.online.insert(machine);
+        self.view.online.insert(machine);
         self
     }
 
     /// Says `machine` has been unreachable for `span`.
     pub fn unreachable(mut self, machine: MachineId, span: Duration) -> Self {
-        self.unreachable.insert(machine, span);
+        self.view.unreachable.insert(machine, span);
         self
     }
 
     /// Adds a machine sample.
     pub fn sample(mut self, record: Record<MachineSample>) -> Self {
-        self.samples.push(record);
+        self.view.samples.push(record);
         self
     }
 
     /// Says what `machine` holds.
     pub fn held(mut self, machine: MachineId, held: MachineHeld) -> Self {
-        self.held.insert(machine, held);
+        self.view.held.insert(machine, held);
         self
     }
 
-    /// The view.
+    /// The view, with every session and terminal of an offline owner shown as unreachable.
     pub fn build(self) -> FleetView {
-        FleetView {
-            workspaces: self.workspaces,
-            sessions: self.sessions,
-            terminals: self.terminals,
-            turns: self.turns,
-            online: self.online,
-            unreachable: self.unreachable,
-            samples: self.samples,
-            held: self.held,
-        }
+        let mut view = self.view;
+        let online = view.online.clone();
+        view.sessions = std::mem::take(&mut view.sessions)
+            .into_iter()
+            .map(|r| match as_seen(AnyRecord::Session(r), &online) {
+                AnyRecord::Session(r) => r,
+                _ => unreachable!("as_seen keeps the kind of a record"),
+            })
+            .collect();
+        view.terminals = std::mem::take(&mut view.terminals)
+            .into_iter()
+            .map(|(id, r)| match as_seen(AnyRecord::Terminal(r), &online) {
+                AnyRecord::Terminal(r) => (id, r),
+                _ => unreachable!("as_seen keeps the kind of a record"),
+            })
+            .collect();
+        view
     }
 }
 
@@ -380,8 +386,8 @@ pub enum Call {
 
 /// A worker that answers from a script and records every call, in order.
 ///
-/// Each method answers from its own queue: the next answer is taken while more than one is
-/// queued, and the last is repeated. A method with nothing queued gives its default.
+/// Each method answers from its own queue, one answer per call in order; a method whose queue
+/// is empty gives its default.
 #[derive(Debug, Default)]
 pub struct FakeWorker {
     state: Mutex<FakeState>,
@@ -397,8 +403,8 @@ struct FakeState {
     tail: VecDeque<Result<String, WorkerError>>,
     end_sessions: VecDeque<Result<(), WorkerError>>,
     archive: VecDeque<Result<(), WorkerError>>,
-    /// The workspaces the default create made, by tag and name.
-    made: Vec<(FactoryTag, String, WorkspaceId)>,
+    /// The workspaces the default create made, by machine, tag and name.
+    made: Vec<(MachineId, FactoryTag, String, WorkspaceId)>,
     /// How many messages each session was delivered.
     delivered: BTreeMap<SessionId, u64>,
 }
@@ -462,15 +468,6 @@ impl FakeWorker {
     }
 }
 
-/// The next answer of a queue: the first while more than one is queued, else the last again.
-fn next<T: Clone>(queue: &mut VecDeque<T>) -> Option<T> {
-    if queue.len() > 1 {
-        queue.pop_front()
-    } else {
-        queue.front().cloned()
-    }
-}
-
 impl Worker for FakeWorker {
     fn create(
         &self,
@@ -482,18 +479,17 @@ impl Worker for FakeWorker {
             machine,
             request: request.clone(),
         });
-        if let Some(answer) = next(&mut state.create) {
+        if let Some(answer) = state.create.pop_front() {
             return answer;
         }
-        let known = state
-            .made
-            .iter()
-            .find(|(tag, name, _)| *tag == request.tag && *name == request.name);
-        if let Some((_, _, made)) = known {
+        let known = state.made.iter().find(|(on, tag, name, _)| {
+            *on == machine && *tag == request.tag && *name == request.name
+        });
+        if let Some((_, _, _, made)) = known {
             return Ok(*made);
         }
         let made = WorkspaceId::random();
-        state.made.push((request.tag, request.name, made));
+        state.made.push((machine, request.tag, request.name, made));
         Ok(made)
     }
 
@@ -512,7 +508,10 @@ impl Worker for FakeWorker {
             effort: start.effort,
             first,
         });
-        let answer = next(&mut state.start_session).unwrap_or_else(|| Ok(SessionId::random()));
+        let answer = state
+            .start_session
+            .pop_front()
+            .unwrap_or_else(|| Ok(SessionId::random()));
         if let Ok(session) = &answer {
             state.delivered.insert(*session, 1);
         }
@@ -531,10 +530,19 @@ impl Worker for FakeWorker {
             message,
             only_if_prompts,
         });
-        let before = state.delivered.get(&session).copied().unwrap_or(0);
-        let answer = next(&mut state.send).unwrap_or(Ok(before));
+        let before = state.delivered.get(&session).copied();
+        let answer = state
+            .send
+            .pop_front()
+            .unwrap_or(match (before, only_if_prompts) {
+                (None, _) => Err(SendRefused::NoSuchSession),
+                (Some(before), Some(k)) if before > k => {
+                    Err(SendRefused::CountRose { now: before })
+                }
+                (Some(before), _) => Ok(before),
+            });
         if answer.is_ok() {
-            state.delivered.insert(session, before + 1);
+            *state.delivered.entry(session).or_insert(0) += 1;
         }
         answer
     }
@@ -542,7 +550,7 @@ impl Worker for FakeWorker {
     fn turn(&self, session: SessionId, n: u64) -> Result<TurnText, WorkerError> {
         let mut state = self.lock();
         state.calls.push(Call::Turn { session, n });
-        next(&mut state.turn).unwrap_or_else(|| {
+        state.turn.pop_front().unwrap_or_else(|| {
             Ok(TurnText {
                 message: String::new(),
                 question: None,
@@ -553,19 +561,23 @@ impl Worker for FakeWorker {
     fn tail(&self, terminal: TerminalId) -> Result<String, WorkerError> {
         let mut state = self.lock();
         state.calls.push(Call::Tail { terminal });
-        next(&mut state.tail).unwrap_or_else(|| Ok(String::new()))
+        state.tail.pop_front().unwrap_or_else(|| Ok(String::new()))
     }
 
     fn end_sessions(&self, workspace: WorkspaceId) -> Result<(), WorkerError> {
         let mut state = self.lock();
         state.calls.push(Call::EndSessions { workspace });
-        next(&mut state.end_sessions).unwrap_or(Ok(()))
+        state.end_sessions.pop_front().unwrap_or(Ok(()))
     }
 
     fn archive(&self, workspace: WorkspaceId) -> Result<(), WorkerError> {
         let mut state = self.lock();
         state.calls.push(Call::Archive { workspace });
-        next(&mut state.archive).unwrap_or(Ok(()))
+        let answer = state.archive.pop_front().unwrap_or(Ok(()));
+        if answer.is_ok() {
+            state.made.retain(|(_, _, _, made)| *made != workspace);
+        }
+        answer
     }
 }
 
