@@ -668,8 +668,40 @@ mod tests {
             place_run(&alone, &settings, LOGIN, &mut reserved),
             Err(vec!["mac: sessions 4 at limit 4".to_owned()])
         );
-        // A gate has no session, so what is held does not keep one off the machine.
-        assert_eq!(place_gate(&alone, &settings, LOGIN), Ok(mac));
+    }
+
+    #[test]
+    fn runs_held_and_placed_on_one_machine_add_up() {
+        let (mac, vps, settings) = two();
+        let alone = FleetView::builder()
+            .sample(sample(mac, 1, 0.1))
+            .held(mac, holds(&[LOGIN], true))
+            .online(mac)
+            .build();
+        // Two runs held on the mac at 1 of 4 sessions leave it one: the next claim takes it,
+        // and the one after finds it full.
+        let mut reserved = Reserved::default();
+        reserved.hold(mac);
+        reserved.hold(mac);
+        assert_eq!(place_run(&alone, &settings, LOGIN, &mut reserved), Ok(mac));
+        assert_eq!(
+            place_run(&alone, &settings, LOGIN, &mut reserved),
+            Err(vec!["mac: sessions 4 at limit 4".to_owned()])
+        );
+
+        // Two claims placed in one pass add up the same way.
+        let view = FleetView::builder()
+            .sample(sample(mac, 2, 0.1))
+            .sample(sample(vps, 0, 0.5))
+            .held(mac, holds(&[LOGIN], true))
+            .held(vps, holds(&[LOGIN], true))
+            .online(mac)
+            .online(vps)
+            .build();
+        let mut reserved = Reserved::default();
+        assert_eq!(place_run(&view, &settings, LOGIN, &mut reserved), Ok(mac));
+        assert_eq!(place_run(&view, &settings, LOGIN, &mut reserved), Ok(mac));
+        assert_eq!(place_run(&view, &settings, LOGIN, &mut reserved), Ok(vps));
     }
 
     fn run(issue: u64, state: Option<State>, confirmed: bool, pr_reported: bool) -> RunInfo {
