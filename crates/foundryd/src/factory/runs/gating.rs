@@ -7004,6 +7004,35 @@ mod tests {
         }
 
         #[test]
+        fn a_refused_create_is_recorded_could_not_run_before_it_is_recorded_left() {
+            // A pass cut between the two steps must leave a gate that could not run, which is
+            // archived or left before another is placed, and never a gate left that is not
+            // could-not-run, which a later pass would read as in flight and ask for again.
+            for refusals in [1, 5] {
+                let (rig, run, _hub) = built();
+                for _ in 0..refusals {
+                    rig.worker
+                        .on_create(Err(WorkerError::Failed("no disk".into())));
+                }
+                for _ in 0..30 {
+                    if matches!(go(&rig, &run), GateStep::Stuck { .. }) || creates(&rig) == refusals
+                    {
+                        break;
+                    }
+                }
+                let steps = rig.steps(&run);
+                let at = |prefix: &str| {
+                    steps
+                        .iter()
+                        .rposition(|step| step.starts_with(prefix))
+                        .unwrap_or_else(|| panic!("no {prefix:?} in {steps:?}"))
+                };
+                let last = format!("{GATE_LEFT}{refusals} - {LEFT_CREATE_REFUSED}");
+                assert!(at(GATE_COULD_NOT_RUN) < at(&last), "{steps:?}");
+            }
+        }
+
+        #[test]
         fn a_person_marking_the_pr_ready_while_the_gate_ran_and_a_moved_head_gates_again() {
             let (mut rig, run, hub) = built();
             place(&mut rig, &run, 1, 1);
