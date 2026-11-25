@@ -201,6 +201,9 @@ struct Inner {
     /// Tests: how many of the next writes of a `session_turn` record fail.
     #[cfg(test)]
     fail_turn_writes: std::sync::atomic::AtomicUsize,
+    /// Tests: how many of the next reads of a `session_turn` record fail.
+    #[cfg(test)]
+    fail_turn_reads: std::sync::atomic::AtomicUsize,
     /// Tests: how many of the next reads of a terminal's exit fail.
     #[cfg(test)]
     fail_exit_reads: std::sync::atomic::AtomicUsize,
@@ -260,6 +263,8 @@ impl Sessions {
                 fail_writes: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(test)]
                 fail_turn_writes: std::sync::atomic::AtomicUsize::new(0),
+                #[cfg(test)]
+                fail_turn_reads: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(test)]
                 fail_exit_reads: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(test)]
@@ -554,6 +559,8 @@ impl Inner {
                 }
                 Err(error) => {
                     tracing::error!(%error, "the sessions from before this daemon started cannot be read, so none is taken up");
+                    // The tallies do not depend on it.
+                    self.load_behind().await;
                     return;
                 }
             }

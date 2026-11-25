@@ -190,14 +190,14 @@ impl Hider {
 
     /// `text`, a message's body, hidden. A body is input the caller expects delivered, so
     /// unlike [`Hider::hide`] this never gives the placeholder: with no secret store, or one
-    /// that cannot be read, it is an error and nothing is to be written.
+    /// that cannot be read, it is an error and nothing is to be written. The store is read once,
+    /// by [`crate::secrets::hide_known`], which exposes no way to hide with values read
+    /// elsewhere; an unreadable store shows as its placeholder in the result, and is checked
+    /// for there.
     pub fn hide_body(&self, text: &str) -> Result<String, SessionError> {
-        let Some(secrets) = &self.secrets else {
+        if self.secrets.is_none() {
             return Err(SessionError::SecretsUnreadable);
-        };
-        secrets
-            .entries()
-            .map_err(|_| SessionError::SecretsUnreadable)?;
+        }
         let hidden = self.hide(text);
         if hidden == crate::secrets::HIDDEN_UNREADABLE && text != hidden {
             return Err(SessionError::SecretsUnreadable);
@@ -347,6 +347,10 @@ impl Inner {
         if let Some(tally) = lock(&self.factory).counts.get(&session) {
             return Ok(*tally);
         }
+        #[cfg(test)]
+        if super::take_one(&self.fail_turn_reads) {
+            return Err(super::busy().into());
+        }
         let found = self
             .on_store(move |store| store.session_turn(session))
             .await?;
@@ -367,11 +371,21 @@ impl Inner {
         Ok(*lock(&self.factory).counts.entry(session).or_insert(tally))
     }
 
-    /// Takes up the tally of each factory session this daemon found marks for whose `counts`
-    /// file is ahead of its record, so the sweeper writes the record without waiting for a
-    /// hook. A session whose tally cannot be read is tried again when a hook comes.
+    /// Takes up the tally of each factory session this daemon found marks for, that is not yet
+    /// swept and has none in memory, when its `counts` file is there: the file may be ahead of
+    /// the record, and the sweeper writes the record from the tally. The adopt runs it, and so
+    /// does every look of the sweeper, so a tally that could not be read is read again. One
+    /// that cannot be read is also read at its session's next hook.
     pub(super) async fn load_behind(&self) {
-        let sessions: Vec<SessionId> = lock(&self.factory).marks.keys().copied().collect();
+        let sessions: Vec<SessionId> = {
+            let state = lock(&self.factory);
+            state
+                .workspaces
+                .keys()
+                .filter(|id| state.marks.contains_key(id) && !state.counts.contains_key(id))
+                .copied()
+                .collect()
+        };
         let mut failed = None;
         for session in sessions {
             let file = counts_file(&factory::folder(&self.dir, session));
@@ -383,7 +397,7 @@ impl Inner {
             }
         }
         if let Some(error) = failed {
-            tracing::warn!(%error, "a factory session's counts were not read; they are read at its next hook");
+            tracing::warn!(%error, "a factory session's counts were not read; trying again");
         }
     }
 
