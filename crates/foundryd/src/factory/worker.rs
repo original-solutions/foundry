@@ -900,6 +900,44 @@ mod tests {
     }
 
     #[test]
+    fn ending_a_workspaces_sessions_makes_a_later_default_send_find_none() {
+        let fake = FakeWorker::new();
+        let (ws, other) = (WorkspaceId(id(5)), WorkspaceId(id(6)));
+        let sess = fake.start_session(ws, start(), msg("go")).unwrap();
+        let kept = fake.start_session(other, start(), msg("go")).unwrap();
+        fake.on_end_sessions(Err(WorkerError::Failed("no".into())));
+        assert!(fake.end_sessions(ws).is_err());
+        assert_eq!(fake.send(sess, msg("a"), None), Ok(1));
+        fake.end_sessions(ws).unwrap();
+        assert_eq!(
+            fake.send(sess, msg("a"), None),
+            Err(SendRefused::NoSuchSession)
+        );
+        assert_eq!(fake.send(kept, msg("a"), None), Ok(1));
+    }
+
+    #[test]
+    fn archiving_a_workspace_makes_a_later_default_send_find_none() {
+        let fake = FakeWorker::new();
+        let ws = WorkspaceId(id(5));
+        let sess = fake.start_session(ws, start(), msg("go")).unwrap();
+        fake.on_start_session(Ok(SessionId(id(77))));
+        let scripted = fake.start_session(ws, start(), msg("go")).unwrap();
+        fake.on_archive(Err(WorkerError::Failed("no".into())));
+        assert!(fake.archive(ws).is_err());
+        assert_eq!(fake.send(sess, msg("a"), None), Ok(1));
+        fake.archive(ws).unwrap();
+        assert_eq!(
+            fake.send(sess, msg("a"), None),
+            Err(SendRefused::NoSuchSession)
+        );
+        assert_eq!(
+            fake.send(scripted, msg("a"), None),
+            Err(SendRefused::NoSuchSession)
+        );
+    }
+
+    #[test]
     fn the_guards_answer_the_generation_or_a_loss() {
         assert_eq!(AlwaysHeld(7).check(), Ok(7));
         assert!(Lost.check().is_err());
@@ -1117,7 +1155,7 @@ mod tests {
     }
 
     #[test]
-    fn session_of_ranks_a_live_session_above_an_ended_one_with_a_turn() {
+    fn session_of_ranks_a_factory_session_above_a_live_one_without_a_turn() {
         let m = machine(1);
         let view = FleetView::builder()
             .online(m)
@@ -1127,17 +1165,7 @@ mod tests {
             .build();
         assert_eq!(
             view.session_of(WorkspaceId(id(10))).unwrap().body.id,
-            SessionId(id(21))
-        );
-        let failed = FleetView::builder()
-            .online(m)
-            .session(session_record(m, 5, false, 20, 10, SessionState::Failed))
-            .session(session_record(m, 3, false, 21, 10, SessionState::Working))
-            .turn(turn_of(20, 10))
-            .build();
-        assert_eq!(
-            failed.session_of(WorkspaceId(id(10))).unwrap().body.id,
-            SessionId(id(21))
+            SessionId(id(20))
         );
         let only_ended = FleetView::builder()
             .online(m)
@@ -1145,6 +1173,44 @@ mod tests {
             .build();
         assert_eq!(
             only_ended.session_of(WorkspaceId(id(10))).unwrap().body.id,
+            SessionId(id(20))
+        );
+    }
+
+    #[test]
+    fn session_of_ranks_a_live_factory_session_above_an_ended_one_online_or_not() {
+        let m = machine(1);
+        for online in [true, false] {
+            for ended in [SessionState::Finished, SessionState::Failed] {
+                let mut builder = FleetView::builder();
+                if online {
+                    builder = builder.online(m);
+                }
+                let view = builder
+                    .session(session_record(m, 9, false, 20, 10, ended))
+                    .session(session_record(m, 3, false, 21, 10, SessionState::Working))
+                    .turn(turn_of(20, 10))
+                    .turn(turn_of(21, 10))
+                    .build();
+                assert_eq!(
+                    view.session_of(WorkspaceId(id(10))).unwrap().body.id,
+                    SessionId(id(21)),
+                    "online {online}, ended {ended:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn session_of_ranks_a_factory_session_first_with_its_owner_offline() {
+        let m = machine(1);
+        let view = FleetView::builder()
+            .session(session_record(m, 5, false, 20, 10, SessionState::Finished))
+            .session(session_record(m, 3, false, 21, 10, SessionState::Idle))
+            .turn(turn_of(20, 10))
+            .build();
+        assert_eq!(
+            view.session_of(WorkspaceId(id(10))).unwrap().body.id,
             SessionId(id(20))
         );
     }
@@ -1165,6 +1231,10 @@ mod tests {
             .map(|r| r.body.id)
             .collect();
         assert_eq!(ids, vec![WorkspaceId(id(10)), WorkspaceId(id(11))]);
+        assert_eq!(
+            view.workspace_named(project(1), "run").unwrap().body.id,
+            WorkspaceId(id(10))
+        );
         assert!(view.workspaces_named(project(3), "run").is_empty());
     }
 
@@ -1255,6 +1325,24 @@ mod tests {
             Some((TerminalState::Exited, Some(3)))
         );
         assert_eq!(view.terminal(TerminalId(id(31))), None);
+    }
+
+    #[test]
+    fn a_deleted_terminal_of_an_offline_owner_reads_as_unreachable_with_its_code() {
+        let m = machine(1);
+        let view = FleetView::builder()
+            .terminal(terminal_record(
+                m,
+                true,
+                30,
+                TerminalState::Running,
+                Some(3),
+            ))
+            .build();
+        assert_eq!(
+            view.terminal(TerminalId(id(30))),
+            Some((TerminalState::Unreachable, Some(3)))
+        );
     }
 
     #[test]
