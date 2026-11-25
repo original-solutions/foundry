@@ -3198,6 +3198,14 @@ mod tests {
                     [one, two] => assert_eq!(one, two),
                     other => panic!("{other:?}"),
                 }
+                // The first may have started: the sessions of the workspace were ended once.
+                assert_eq!(
+                    calls(&rig)
+                        .iter()
+                        .filter(|call| matches!(call, Call::EndSessions { .. }))
+                        .count(),
+                    1
+                );
             }
 
             /// The runner's case "writes the launch-sending step once and sends under the same
@@ -3239,6 +3247,14 @@ mod tests {
                     .online(rig.machine)
                     .workspace(workspace_record(rig.machine, "fac/8-1", None))
                     .session(session_record(rig.machine, SessionState::Working))
+                    .turn(foundry_proto::factory::SessionTurn {
+                        session: session(),
+                        workspace: ws_id(),
+                        project: project_id(),
+                        turn: 1,
+                        prompts: 1,
+                        question: false,
+                    })
                     .build();
                 assert_eq!(pass(&rig, &run), StartStep::Started { session: session() });
                 assert!(start_sessions(&rig).is_empty());
@@ -4067,6 +4083,291 @@ mod tests {
             }
         }
 
+        /// A start cut short after its first write: the next pass finishes what the ledger
+        /// shows begun, whatever the issue's label and assignee now are.
+        mod a_start_cut_short {
+            use super::*;
+
+            fn end_sessions(rig: &Rig) -> Vec<Call> {
+                calls(rig)
+                    .into_iter()
+                    .filter(|call| matches!(call, Call::EndSessions { .. }))
+                    .collect()
+            }
+
+            fn archives(rig: &Rig) -> Vec<Call> {
+                calls(rig)
+                    .into_iter()
+                    .filter(|call| matches!(call, Call::Archive { .. }))
+                    .collect()
+            }
+
+            fn said(rig: &Rig, words: &str) -> usize {
+                rig.sim
+                    .comments()
+                    .iter()
+                    .filter(|comment| comment.contains(words))
+                    .count()
+            }
+
+            /// The stuck path of a failed setup, cut short by an unassign that failed after the
+            /// label moved to `stuck`: the next pass finishes it and does not comment again.
+            #[test]
+            fn a_stuck_path_cut_short_after_the_label_moved_is_finished_by_the_next_pass() {
+                let (mut rig, run) = claimed_rig();
+                pass(&rig, &run);
+                show_setup(&mut rig, TerminalState::Exited, Some(1));
+                rig.worker.on_tail(Ok("boom".into()));
+                rig.sim.fail("--remove-assignee", 1);
+                assert!(advance(&rig.ctx(), &run).is_err());
+                assert_eq!(rig.sim.labels(), vec!["factory:stuck"]);
+                assert_eq!(rig.sim.assignees(), vec![LOGIN]);
+                assert!(!rig.finished(&run));
+                assert!(matches!(pass(&rig, &run), StartStep::Stuck { .. }));
+                assert!(rig.finished(&run));
+                assert!(rig.sim.assignees().is_empty());
+                assert_eq!(said(&rig, "could not finish this issue"), 1);
+                assert_eq!(rig.sim.labels(), vec!["factory:stuck"]);
+            }
+
+            /// The same, cut short by the status comment after the unassign.
+            #[test]
+            fn a_stuck_path_cut_short_after_the_unassign_is_finished_by_the_next_pass() {
+                let (mut rig, run) = claimed_rig();
+                pass(&rig, &run);
+                show_setup(&mut rig, TerminalState::Exited, Some(1));
+                rig.worker.on_tail(Ok("boom".into()));
+                // The status comment is the last write of the path.
+                rig.sim.fail("Factory status", 1);
+                assert!(advance(&rig.ctx(), &run).is_err());
+                assert!(rig.sim.assignees().is_empty());
+                assert!(!rig.finished(&run));
+                assert!(matches!(pass(&rig, &run), StartStep::Stuck { .. }));
+                assert!(rig.finished(&run));
+            }
+
+            /// The withdraw, cut short by an archive that failed after the label moved to
+            /// `proposed`: the issue is no longer in triage, and the next pass archives and
+            /// finishes.
+            #[test]
+            fn a_withdraw_cut_short_after_the_label_moved_is_finished_by_the_next_pass() {
+                let (rig, run) = workspace_shown();
+                rig.sim
+                    .set_approval(approval_answer(LABELED_AT, "mallory", &[]));
+                rig.worker
+                    .on_archive(Err(WorkerError::Unreachable("down".into())));
+                assert!(advance(&rig.ctx(), &run).is_err());
+                assert_eq!(rig.sim.labels(), vec!["factory:proposed"]);
+                assert!(!rig.finished(&run));
+                assert!(matches!(pass(&rig, &run), StartStep::Unapproved { .. }));
+                assert!(rig.finished(&run));
+                assert_eq!(archives(&rig).len(), 2);
+                assert_eq!(rig.sim.labels(), vec!["factory:proposed"]);
+                assert_eq!(said(&rig, "did not start on this issue"), 1);
+            }
+
+            /// The withdraw, cut short after the unassign by a label call that failed: the
+            /// issue is in triage with nobody assigned, and the next pass finishes it.
+            #[test]
+            fn a_withdraw_cut_short_after_the_unassign_is_finished_by_the_next_pass() {
+                let (rig, run) = workspace_shown();
+                rig.sim
+                    .set_approval(approval_answer(LABELED_AT, "mallory", &[]));
+                rig.sim.fail("--add-label factory:proposed", 1);
+                assert!(advance(&rig.ctx(), &run).is_err());
+                assert!(rig.sim.assignees().is_empty());
+                assert_eq!(rig.sim.labels(), vec!["factory:triage"]);
+                assert!(matches!(pass(&rig, &run), StartStep::Unapproved { .. }));
+                assert_eq!(rig.sim.labels(), vec!["factory:proposed"]);
+                assert!(rig.finished(&run));
+                assert_eq!(archives(&rig).len(), 1);
+                assert_eq!(said(&rig, "did not start on this issue"), 1);
+            }
+
+            /// The `approval-withdrawn` step is read.
+            #[test]
+            fn the_approval_withdrawn_step_is_read() {
+                let (rig, run) = claimed_rig();
+                assert!(!read_progress(&rig.events(&run)).withdrawn);
+                rig.step(&run, "approval-withdrawn");
+                assert!(read_progress(&rig.events(&run)).withdrawn);
+            }
+
+            /// A start whose answer was lost: the next pass ends the workspace's sessions, once,
+            /// and only then starts again.
+            #[test]
+            fn a_start_whose_answer_was_lost_ends_the_sessions_before_it_starts_again() {
+                let rig = Rig::new();
+                rig.worker.on_create(Ok(ws_id()));
+                rig.worker
+                    .on_start_session(Err(WorkerError::Unreachable("did not answer".into())));
+                rig.worker.on_start_session(Ok(session()));
+                let run = match claim(&rig.ctx(), ISSUE, rig.machine).unwrap() {
+                    ClaimOutcome::Claimed { run } => run,
+                    other => panic!("{other:?}"),
+                };
+                let mut rig = rig;
+                pass(&rig, &run);
+                show_workspace(&mut rig);
+                assert!(advance(&rig.ctx(), &run).is_err());
+                assert!(end_sessions(&rig).is_empty());
+                assert_eq!(pass(&rig, &run), StartStep::Started { session: session() });
+                let kinds: Vec<&str> = calls(&rig)
+                    .iter()
+                    .map(|call| match call {
+                        Call::Create { .. } => "create",
+                        Call::StartSession { .. } => "start",
+                        Call::EndSessions { .. } => "end",
+                        _ => "other",
+                    })
+                    .collect();
+                assert_eq!(kinds, vec!["create", "start", "end", "start"]);
+            }
+
+            /// A start whose answer was lost, and whose factory session the fleet already
+            /// shows: adopted, nothing ended and nothing started.
+            #[test]
+            fn a_start_whose_answer_was_lost_adopts_the_factory_session_the_fleet_shows() {
+                let (mut rig, run) = workspace_shown();
+                rig.step(&run, "launch-sending");
+                rig.view = FleetView::builder()
+                    .online(rig.machine)
+                    .workspace(workspace_record(rig.machine, "fac/8-1", None))
+                    .session(session_record(rig.machine, SessionState::Working))
+                    .turn(foundry_proto::factory::SessionTurn {
+                        session: session(),
+                        workspace: ws_id(),
+                        project: project_id(),
+                        turn: 1,
+                        prompts: 1,
+                        question: false,
+                    })
+                    .build();
+                assert_eq!(pass(&rig, &run), StartStep::Started { session: session() });
+                assert!(start_sessions(&rig).is_empty());
+                assert!(end_sessions(&rig).is_empty());
+            }
+
+            /// A person's session in the build workspace is no factory session: it is not
+            /// adopted, the launch is started.
+            #[test]
+            fn a_session_with_no_turn_record_is_not_adopted_as_the_runs_own() {
+                let (mut rig, run) = workspace_shown();
+                rig.step(&run, "launch-sending");
+                rig.view = FleetView::builder()
+                    .online(rig.machine)
+                    .workspace(workspace_record(rig.machine, "fac/8-1", None))
+                    .session(session_record(rig.machine, SessionState::Working))
+                    .build();
+                assert_eq!(pass(&rig, &run), StartStep::Started { session: session() });
+                assert_eq!(start_sessions(&rig).len(), 1);
+                assert_eq!(end_sessions(&rig).len(), 1);
+            }
+
+            /// A start retried a pass later checks the approval again, and an approval taken
+            /// back in between ends the run with the session stopped.
+            #[test]
+            fn a_start_retried_a_pass_later_checks_the_approval_again() {
+                let rig = Rig::new();
+                rig.worker.on_create(Ok(ws_id()));
+                rig.worker
+                    .on_start_session(Err(WorkerError::Unreachable("down".into())));
+                rig.worker.on_start_session(Ok(session()));
+                let run = match claim(&rig.ctx(), ISSUE, rig.machine).unwrap() {
+                    ClaimOutcome::Claimed { run } => run,
+                    other => panic!("{other:?}"),
+                };
+                let mut rig = rig;
+                pass(&rig, &run);
+                show_workspace(&mut rig);
+                assert!(advance(&rig.ctx(), &run).is_err());
+                rig.sim
+                    .set_approval(approval_answer(LABELED_AT, "mallory", &[]));
+                assert!(matches!(pass(&rig, &run), StartStep::Unapproved { .. }));
+                assert_eq!(start_sessions(&rig).len(), 1);
+                assert_eq!(end_sessions(&rig).len(), 1);
+                assert_eq!(archives(&rig).len(), 1);
+                assert!(rig.finished(&run));
+            }
+
+            /// A setup terminal that exited with no exit code is a failed setup.
+            #[test]
+            fn a_setup_that_exited_with_no_exit_code_makes_the_run_stuck_with_the_tail() {
+                let (mut rig, run) = claimed_rig();
+                pass(&rig, &run);
+                show_setup(&mut rig, TerminalState::Exited, None);
+                rig.worker.on_tail(Ok("the holder is gone".into()));
+                assert_eq!(
+                    pass(&rig, &run),
+                    StartStep::Stuck {
+                        reason: SETUP_FAILED.into()
+                    }
+                );
+                assert!(stuck_comment(&rig).contains("the holder is gone"));
+                assert!(start_sessions(&rig).is_empty());
+                assert!(rig.finished(&run));
+            }
+
+            /// A workspace record found with no setup terminal, for a run that has no answer of
+            /// a create: the create is asked again (it answers with the first and starts a
+            /// setup that is due), and the start waits for the record it shows.
+            #[test]
+            fn a_found_workspace_with_no_setup_terminal_is_asked_for_again_before_it_is_taken_as_done()
+             {
+                let (mut rig, run) = claimed_rig();
+                show_workspace(&mut rig);
+                assert_eq!(pass(&rig, &run), StartStep::Waiting(Wait::Workspace));
+                assert_eq!(creates(&rig).len(), 1);
+                assert!(start_sessions(&rig).is_empty());
+                assert_eq!(pass(&rig, &run), StartStep::Started { session: session() });
+                assert_eq!(creates(&rig).len(), 1);
+            }
+
+            /// A run with a session and no recorded approval: the session is ended and the
+            /// run goes stuck.
+            #[test]
+            fn with_a_session_and_no_recorded_approval_archives_it_and_goes_stuck() {
+                let rig = Rig::new();
+                let run = run_id(1);
+                rig.sim.set_labels(&["factory:building"]);
+                rig.sim.set_assignees(&[LOGIN]);
+                rig.write(
+                    &run,
+                    Event::Claimed {
+                        machine: rig.machine.to_string(),
+                        github_user: LOGIN.into(),
+                    },
+                );
+                rig.write(
+                    &run,
+                    Event::SessionLaunched {
+                        thread_id: session().to_string(),
+                        worktree: Some(ws_id().to_string()),
+                        branch: None,
+                        model_instance: None,
+                        model: None,
+                        model_options: None,
+                        resumed_from: None,
+                        base: None,
+                        title: None,
+                    },
+                );
+                rig.moved(&run, State::Ready, State::Building);
+                assert_eq!(
+                    pass(&rig, &run),
+                    StartStep::Stuck {
+                        reason: CANNOT_CONFIRM.into()
+                    }
+                );
+                assert_eq!(
+                    end_sessions(&rig),
+                    vec![Call::EndSessions { workspace: ws_id() }]
+                );
+                assert_eq!(rig.sim.labels(), vec!["factory:stuck"]);
+                assert!(rig.finished(&run));
+            }
+        }
+
         mod a_run_that_is_not_this_steps {
             use super::*;
 
@@ -4148,10 +4449,13 @@ mod tests {
             }
 
             /// The runner's case "finishes a stuck path cut short after its label moved": a
-            /// `stuck` line is in the ledger, the run is unfinished and still in `triage`.
+            /// `stuck` line is in the ledger, the label is already `factory:stuck`, the factory
+            /// is still assigned and the run is unfinished.
             #[test]
-            fn a_stuck_path_cut_short_is_finished() {
+            fn finishes_a_stuck_path_cut_short_after_its_label_moved() {
                 let (rig, run) = claimed_rig();
+                rig.sim.set_labels(&["factory:stuck"]);
+                assert_eq!(rig.sim.assignees(), vec![LOGIN]);
                 rig.write(
                     &run,
                     Event::Stuck {
@@ -4167,6 +4471,7 @@ mod tests {
                     }
                 );
                 assert_eq!(rig.sim.labels(), vec!["factory:stuck"]);
+                assert!(rig.sim.assignees().is_empty());
                 assert!(rig.finished(&run));
                 assert!(creates(&rig).is_empty());
             }

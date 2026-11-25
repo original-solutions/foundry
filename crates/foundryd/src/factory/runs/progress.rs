@@ -265,6 +265,9 @@ pub struct Seen {
     pub launch_model: Option<String>,
     /// The `approval-rechecked` step: the issue text was checked again after the launch.
     pub rechecked: bool,
+    /// The `approval-withdrawn` step: the approval was taken back before the session started and
+    /// the run is being ended, which a later pass carries on.
+    pub withdrawn: bool,
     /// The `session_launched` line's worktree path.
     pub worktree: Option<String>,
     /// A `worktree_removed` or `worktree_remove_failed` line follows the last `session_launched`.
