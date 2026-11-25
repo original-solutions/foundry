@@ -872,6 +872,7 @@ impl Inner {
     /// session whose workspace was archived. A step that fails is tried again at the next look,
     /// and is logged only the first time in a row.
     async fn sweep_once(&self, cursor: &mut u64, warned: &mut Warned) {
+        self.load_behind().await;
         let (me, from) = (self.me, *cursor);
         let read = self
             .on_store(move |store| {
@@ -890,22 +891,51 @@ impl Inner {
             .await;
         match read {
             Ok((newest, archived)) => {
-                warned.read = false;
+                warned.read.reset();
                 *cursor = newest;
-                let mut state = lock(&self.factory);
-                let known: HashSet<WorkspaceId> = state.workspaces.values().copied().collect();
-                state
-                    .archived
-                    .extend(archived.into_iter().filter(|id| known.contains(id)));
+                self.note_archived(archived);
             }
             Err(error) => {
-                if !std::mem::replace(&mut warned.read, true) {
-                    tracing::warn!(%error, "the workspace records were not read; trying again");
+                if warned.read.first_failure() {
+                    tracing::warn!(%error, "the workspace records were not read; looking at each workspace instead");
                 }
+                // One row that cannot be read must not stop every sweep: ask for each
+                // workspace that holds a session, and leave the cursor where it is.
+                let archived = self.archived_by_workspace().await;
+                self.note_archived(archived);
             }
         }
         self.flush_behind(warned).await;
         self.sweep_ended(warned).await;
+    }
+
+    /// Remembers the archived workspaces among `archived` that hold a factory session.
+    fn note_archived(&self, archived: Vec<WorkspaceId>) {
+        let mut state = lock(&self.factory);
+        let known: HashSet<WorkspaceId> = state.workspaces.values().copied().collect();
+        state
+            .archived
+            .extend(archived.into_iter().filter(|id| known.contains(id)));
+    }
+
+    /// The workspaces that hold a factory session and are archived, asked for one by one. A
+    /// workspace whose record cannot be read is left out.
+    async fn archived_by_workspace(&self) -> Vec<WorkspaceId> {
+        let asked: Vec<WorkspaceId> = {
+            let state = lock(&self.factory);
+            let all: HashSet<WorkspaceId> = state.workspaces.values().copied().collect();
+            all.into_iter()
+                .filter(|id| !state.archived.contains(id))
+                .collect()
+        };
+        self.on_store(move |store| {
+            Ok(asked
+                .into_iter()
+                .filter(|id| matches!(store.workspace(*id), Ok(Some(record)) if record.deleted))
+                .collect())
+        })
+        .await
+        .unwrap_or_default()
     }
 
     /// Removes the folder of each factory session that is not live, whose workspace was
@@ -927,6 +957,23 @@ impl Inner {
                 .map(|(id, ws)| (*id, *ws))
                 .collect()
         };
+        // A session with no tally in memory whose `counts` file is there has not been read
+        // yet, and may be behind: its folder stays until it is.
+        let mut ended = ended;
+        let unread: Vec<SessionId> = {
+            let state = lock(&self.factory);
+            ended
+                .iter()
+                .map(|(id, _)| *id)
+                .filter(|id| !state.counts.contains_key(id))
+                .collect()
+        };
+        for session in unread {
+            let file = turns::counts_file(&folder(&self.dir, session));
+            if blocking(move || file.is_file()).await.unwrap_or(true) {
+                ended.retain(|(id, _)| *id != session);
+            }
+        }
         let mut failed = None;
         for (session, workspace) in ended {
             let folder = folder(&self.dir, session);
@@ -950,11 +997,11 @@ impl Inner {
         }
         match failed {
             Some((session, error)) => {
-                if !std::mem::replace(&mut warned.remove, true) {
+                if warned.remove.first_failure() {
                     tracing::warn!(session = %session, %error, "a folder of an archived workspace's session was not removed; trying again");
                 }
             }
-            None => warned.remove = false,
+            None => warned.remove.reset(),
         }
     }
 
@@ -987,11 +1034,11 @@ impl Inner {
         }
         match failed {
             Some((session, error)) => {
-                if !std::mem::replace(&mut warned.flush, true) {
+                if warned.flush.first_failure() {
                     tracing::warn!(session = %session, %error, "a session's turn record was not written; trying again");
                 }
             }
-            None => warned.flush = false,
+            None => warned.flush.reset(),
         }
     }
 
@@ -1064,20 +1111,29 @@ impl Inner {
 async fn sweep(inner: Arc<Inner>) {
     // From version 0, so a workspace archived before this daemon started is found too.
     let mut cursor = 0;
-    let mut warned = Warned::default();
+    let mut warned = Warned::new();
     loop {
         tokio::time::sleep(SWEEP_EVERY).await;
         inner.sweep_once(&mut cursor, &mut warned).await;
     }
 }
 
-/// Which steps of the sweeper failed at the look before, so each failure in a row is logged
+/// Which steps of the sweeper failed at the looks before, so each failure in a row is logged
 /// once.
-#[derive(Default)]
 struct Warned {
-    read: bool,
-    remove: bool,
-    flush: bool,
+    read: super::Backoff,
+    remove: super::Backoff,
+    flush: super::Backoff,
+}
+
+impl Warned {
+    fn new() -> Self {
+        Self {
+            read: super::Backoff::new(),
+            remove: super::Backoff::new(),
+            flush: super::Backoff::new(),
+        }
+    }
 }
 
 #[cfg(test)]
