@@ -1843,7 +1843,7 @@ mod tests {
         /// the claim's half: the comment first, then the label, the assignee and the status
         /// comment, with the run's lines in the runner's order.
         #[test]
-        fn claims_the_comment_first_then_the_label_the_assignee_and_the_status_comment() {
+        fn claims_launches_the_session_and_moves_the_issue_to_building() {
             let rig = Rig::new();
             let run = claimed(&rig);
             assert_eq!(run, run_id(1));
@@ -2866,7 +2866,7 @@ mod tests {
             /// The runner's case "never claims an issue put back to ready: that is the claim
             /// step's": a cut-short claim's comment is on an issue still `ready`.
             #[test]
-            fn never_claims_an_issue_put_back_to_ready() {
+            fn never_claims_an_issue_put_back_to_ready_that_is_the_claim_step_s() {
                 let rig = Rig::new();
                 rig.foundry_claim(&run_id(1), rig.machine);
                 let step = pass(&rig, &run_id(1));
@@ -2878,7 +2878,7 @@ mod tests {
             /// The runner's case "with no run goes stuck: the factory cannot confirm what it was
             /// approved on".
             #[test]
-            fn with_an_approval_that_cannot_be_confirmed_goes_stuck() {
+            fn with_no_run_goes_stuck_the_factory_cannot_confirm_what_it_was_approved_on() {
                 let rig = Rig::new();
                 let run = taken_over(&rig, rig.machine);
                 rig.sim
@@ -3162,7 +3162,7 @@ mod tests {
             /// The runner's case "launches on the project's model and records it": the model and
             /// the effort are the fleet's settings.
             #[test]
-            fn launches_on_the_fleets_model_and_effort_and_records_them() {
+            fn launches_on_the_project_s_model_and_records_it() {
                 let (mut rig, run) = claimed_rig();
                 rig.settings.fleet.model = "sonnet".into();
                 rig.settings.fleet.effort = "low".into();
@@ -3190,7 +3190,7 @@ mod tests {
             /// The runner's case "a launch sent again keeps the model the first send decided
             /// and asks no cooldown": a setting changed after the decision does not change it.
             #[test]
-            fn a_launch_sent_again_keeps_the_model_the_first_send_decided() {
+            fn a_launch_sent_again_keeps_the_model_the_first_send_decided_and_asks_no_cooldown() {
                 let (mut rig, run) = claimed_rig();
                 rig.settings.fleet.model = "sonnet".into();
                 pass(&rig, &run);
@@ -3206,7 +3206,7 @@ mod tests {
             /// The runner's case "a launch T3 refuses goes stuck with the detail in the ledger
             /// only".
             #[test]
-            fn a_start_the_worker_refuses_goes_stuck_with_the_detail_in_the_ledger_only() {
+            fn a_launch_t3_refuses_goes_stuck_with_the_detail_in_the_ledger_only() {
                 let rig = Rig::new();
                 rig.worker.on_create(Ok(ws_id()));
                 rig.worker.on_start_session(Err(WorkerError::Failed(
@@ -3236,14 +3236,70 @@ mod tests {
                     .unwrap();
                 let reason = stuck.data["reason"].as_str().unwrap();
                 assert!(reason.contains("no such skill factory-build"));
-                assert!(reason.contains("may have started a session"));
                 assert_eq!(rig.sim.labels(), vec!["factory:stuck"]);
+            }
+
+            /// The runner's case "a first launch that never went out has no such note": a
+            /// refusal on the first start says no session may exist.
+            #[test]
+            fn a_first_launch_that_never_went_out_has_no_such_note() {
+                let rig = Rig::new();
+                rig.worker.on_create(Ok(ws_id()));
+                rig.worker
+                    .on_start_session(Err(WorkerError::Failed("refused".into())));
+                let run = match claim(&rig.ctx(), ISSUE, rig.machine).unwrap() {
+                    ClaimOutcome::Claimed { run } => run,
+                    other => panic!("{other:?}"),
+                };
+                let mut rig = rig;
+                pass(&rig, &run);
+                show_workspace(&mut rig);
+                pass(&rig, &run);
+                let stuck = rig
+                    .events(&run)
+                    .into_iter()
+                    .find(|e| e.event == "stuck")
+                    .unwrap();
+                let reason = stuck.data["reason"].as_str().unwrap();
+                assert!(reason.contains("refused"));
+                assert!(!reason.contains(crate::factory::messages::SESSION_MAY_EXIST));
+            }
+
+            /// The runner's case "a launch that cannot be sent after an earlier one may have been
+            /// says a session may exist": the first start's answer was lost, the next is refused.
+            #[test]
+            fn a_launch_that_cannot_be_sent_after_an_earlier_one_may_have_been_says_a_session_may_exist()
+             {
+                let rig = Rig::new();
+                rig.worker.on_create(Ok(ws_id()));
+                rig.worker
+                    .on_start_session(Err(WorkerError::Unreachable("did not answer".into())));
+                rig.worker
+                    .on_start_session(Err(WorkerError::Failed("refused".into())));
+                let run = match claim(&rig.ctx(), ISSUE, rig.machine).unwrap() {
+                    ClaimOutcome::Claimed { run } => run,
+                    other => panic!("{other:?}"),
+                };
+                let mut rig = rig;
+                pass(&rig, &run);
+                show_workspace(&mut rig);
+                assert!(advance(&rig.ctx(), &run).is_err());
+                pass(&rig, &run);
+                let stuck = rig
+                    .events(&run)
+                    .into_iter()
+                    .find(|e| e.event == "stuck")
+                    .unwrap();
+                let reason = stuck.data["reason"].as_str().unwrap();
+                assert!(reason.contains(crate::factory::messages::SESSION_MAY_EXIST));
+                assert!(reason.contains("foundry:"));
             }
 
             /// The runner's case "a launch with no room waits in triage, and the next pass sends
             /// the same launch again": a machine that cannot be reached is no refusal.
             #[test]
-            fn a_worker_that_cannot_be_reached_waits_in_triage_and_the_next_pass_starts_again() {
+            fn a_launch_with_no_room_waits_in_triage_and_the_next_pass_sends_the_same_launch_again()
+            {
                 let rig = Rig::new();
                 rig.worker.on_create(Ok(ws_id()));
                 rig.worker
@@ -3277,7 +3333,7 @@ mod tests {
             /// The runner's case "writes the launch-sending step once and sends under the same
             /// command id".
             #[test]
-            fn writes_the_launch_sending_step_once_and_sends_the_same_message_again() {
+            fn writes_the_launch_sending_step_once_and_sends_under_the_same_command_id() {
                 let rig = Rig::new();
                 rig.worker.on_create(Ok(ws_id()));
                 rig.worker
@@ -3598,7 +3654,7 @@ mod tests {
 
             /// The runner's case "matches the factory's login on GitHub whatever its case".
             #[test]
-            fn matches_the_logins_case_whatever_it_is() {
+            fn matches_the_factory_s_login_on_github_whatever_its_case() {
                 let rig = rig_for_second_attempt();
                 rig.sim
                     .closing_pull(12, "fac/8-1", "main", "SoftFac-Bot", false);
@@ -3615,7 +3671,7 @@ mod tests {
             /// The runner's case "does not take another login's pull request when no host has
             /// that login".
             #[test]
-            fn does_not_take_another_logins_pull_request() {
+            fn does_not_take_another_login_s_pull_request_when_no_host_has_that_login() {
                 let rig = rig_for_second_attempt();
                 rig.sim
                     .closing_pull(12, "fac/8-1", "main", "someone-else", false);
@@ -3631,7 +3687,8 @@ mod tests {
             /// cloud launch branch of the issue, for a repo with a cloud environment": Foundry
             /// has no cloud launch, so an app's pull request is never the run's own.
             #[test]
-            fn an_app_authors_pull_request_is_never_the_runs_own() {
+            fn finds_an_open_pull_request_by_the_paradev_github_app_only_on_a_cloud_launch_branch_of_the_issue_for_a_repo_with_a_cloud_environment()
+             {
                 let rig = rig_for_second_attempt();
                 rig.sim
                     .closing_pull(12, "paradev/8-abc", "main", "superset-app", false);
@@ -3646,7 +3703,7 @@ mod tests {
             /// The runner's case "takes the newest open pull request of the factory's own on
             /// GitHub".
             #[test]
-            fn takes_the_newest_open_pull_request_of_the_factorys_own() {
+            fn takes_the_newest_open_pull_request_of_the_factory_s_own_on_github() {
                 let rig = rig_for_second_attempt();
                 rig.sim.closing_pull(12, "fac/8-old", "main", LOGIN, false);
                 rig.sim.closing_pull(14, "fac/8-new", "main", LOGIN, false);
@@ -3664,7 +3721,7 @@ mod tests {
             /// The runner's case "passes over pull requests that are not the factory's own on
             /// this base".
             #[test]
-            fn passes_over_pull_requests_that_are_not_the_factorys_own_on_this_base() {
+            fn passes_over_pull_requests_that_are_not_the_factory_s_own_on_this_base() {
                 let rig = rig_for_second_attempt();
                 rig.sim.closing_pull(12, "fac/8-fork", "main", LOGIN, true);
                 rig.sim
@@ -3684,7 +3741,7 @@ mod tests {
             /// The runner's case "after needs-info, continues the pull request the earlier
             /// run's ledger names".
             #[test]
-            fn after_needs_info_continues_the_pull_request_the_earlier_runs_ledger_names() {
+            fn after_needs_info_continues_the_pull_request_the_earlier_run_s_ledger_names() {
                 let rig = rig_for_second_attempt();
                 rig.write(
                     &run_id(1),
@@ -3751,7 +3808,7 @@ mod tests {
             /// The runner's case "falls back to a plain start when the ledger's pull request is
             /// no longer open".
             #[test]
-            fn falls_back_to_a_plain_start_when_the_ledgers_pull_request_is_no_longer_open() {
+            fn falls_back_to_a_plain_start_when_the_ledger_s_pull_request_is_no_longer_open() {
                 let rig = rig_for_second_attempt();
                 rig.write(
                     &run_id(1),
@@ -3781,7 +3838,7 @@ mod tests {
             /// The runner's case "sent again, reuses the recorded pull request and asks GitHub
             /// nothing": the decision is in the ledger before the workspace is asked for.
             #[test]
-            fn asked_again_reuses_the_recorded_decision_and_asks_github_nothing() {
+            fn sent_again_reuses_the_recorded_pull_request_and_asks_github_nothing() {
                 let mut rig = rig_for_second_attempt();
                 rig.sim.closing_pull(12, "fac/8-1", "main", LOGIN, false);
                 let run = second_attempt(&rig);
@@ -3869,7 +3926,7 @@ mod tests {
             /// The runner's case "continues from the branch an earlier time-limited run left on
             /// origin".
             #[test]
-            fn after_a_time_limit_continues_from_the_branch_the_earlier_run_left_on_origin() {
+            fn continues_from_the_branch_an_earlier_time_limited_run_left_on_origin() {
                 let rig = rig_for_second_attempt();
                 time_limited_first_attempt(&rig, "fac/8-1");
                 rig.sim.add_branch("fac/8-1");
@@ -4058,7 +4115,7 @@ mod tests {
             /// The runner's case "an issue with no base records the project's base and says
             /// nothing more".
             #[test]
-            fn an_issue_with_no_base_records_the_projects_base_and_says_nothing_more() {
+            fn an_issue_with_no_base_records_the_project_s_base_and_says_nothing_more() {
                 let (mut rig, run) = claimed_with_body("Do it.");
                 pass(&rig, &run);
                 show_workspace(&mut rig);
@@ -4075,7 +4132,7 @@ mod tests {
             /// The runner's case "a base that is not a branch name goes stuck before any launch
             /// is sent".
             #[test]
-            fn a_base_that_is_not_a_branch_name_goes_stuck_before_any_workspace_is_asked_for() {
+            fn a_base_that_is_not_a_branch_name_goes_stuck_before_any_launch_is_sent() {
                 let (rig, run) = claimed_with_body("## Base\nrelease..2\n");
                 let step = pass(&rig, &run);
                 assert_eq!(
@@ -4091,7 +4148,7 @@ mod tests {
             /// The runner's case "a base that origin does not have goes stuck before any launch
             /// is sent".
             #[test]
-            fn a_base_that_origin_does_not_have_goes_stuck_before_any_workspace_is_asked_for() {
+            fn a_base_that_origin_does_not_have_goes_stuck_before_any_launch_is_sent() {
                 let (rig, run) = claimed_with_body("## Base\nrelease/2\n");
                 let step = pass(&rig, &run);
                 assert_eq!(
@@ -4120,7 +4177,7 @@ mod tests {
 
             /// The runner's case "a base whose lookup fails claims and waits for the next pass".
             #[test]
-            fn a_base_whose_lookup_fails_waits_for_the_next_pass() {
+            fn a_base_whose_lookup_fails_claims_and_waits_for_the_next_pass() {
                 let (rig, run) = claimed_with_body("## Base\nrelease/2\n");
                 rig.sim.add_branch("release/2");
                 rig.sim.fail("git/ref/heads", 1);
@@ -4132,7 +4189,7 @@ mod tests {
 
             /// The runner's case "the first send records the base it decided before the launch".
             #[test]
-            fn the_first_ask_records_the_base_it_decided_before_the_workspace() {
+            fn the_first_send_records_the_base_it_decided_before_the_launch() {
                 let (rig, run) = claimed_with_body("## Base\nrelease/2\n");
                 rig.sim.add_branch("release/2");
                 pass(&rig, &run);
@@ -4440,7 +4497,7 @@ mod tests {
             /// The runner's case "ends the unfinished run of a closed issue and writes nothing
             /// on GitHub", for `resume`.
             #[test]
-            fn a_closed_issue_ends_the_run_and_writes_nothing_on_github() {
+            fn ends_the_unfinished_run_of_a_closed_issue_and_writes_nothing_on_github() {
                 let (rig, run) = started();
                 let before = rig.sim.writes().len();
                 rig.sim.set_closed(true);
@@ -4506,7 +4563,7 @@ mod tests {
             /// The runner's case "with an unfinished run in another state is left to the step
             /// that owns it".
             #[test]
-            fn a_run_in_another_state_is_left_to_the_step_that_owns_it() {
+            fn with_an_unfinished_run_in_another_state_is_left_to_the_step_that_owns_it() {
                 let (rig, run) = started();
                 rig.moved(&run, State::Building, State::PrOpen);
                 let before = rig.names(&run);
@@ -4568,8 +4625,7 @@ mod tests {
             /// still goes stuck": a workspace whose sessions cannot be ended leaves the stuck
             /// path to be retried, with nothing written.
             #[test]
-            fn a_workspace_whose_sessions_cannot_be_ended_leaves_the_stuck_path_for_the_next_pass()
-            {
+            fn a_worktree_that_cannot_be_removed_is_written_down_and_the_run_still_goes_stuck() {
                 let (rig, run) = started();
                 rig.worker
                     .on_end_sessions(Err(WorkerError::Unreachable("down".into())));
