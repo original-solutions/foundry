@@ -78,7 +78,7 @@
 //!   failure (status 1 and a reason) read the pull request again: that read failing is the
 //!   error, a draft now goes on, one open and not a draft is stuck in the runner's words
 //!   ("it is not a draft"), and one gone is stuck as one that does not exist. A pull request
-//!   that can never be drafted is ended by `limits.minutes`.
+//!   GitHub never answers about is ended by `limits.minutes`.
 //! - The runner's case of a run with no ordinal and no result line, stuck at once, has no
 //!   counterpart: a turn always has a number. Its cases about a run a person stopped
 //!   (`stop-run.sh`), a run whose agent process died, `refused before anything is read`, the
@@ -512,10 +512,16 @@ struct Unbound {
     detail: Option<String>,
 }
 
+/// What the factory says of the pull request the session reported: "the session reported PR
+/// #`pr` but `what`".
+fn reported_but(pr: u64, what: &str) -> String {
+    format!("the session reported PR #{pr} but {what}")
+}
+
 /// A pull request the session reported that is not there.
 fn does_not_exist(pr: u64) -> Unbound {
     Unbound {
-        public: format!("the session reported PR #{pr} but it does not exist"),
+        public: reported_but(pr, "it does not exist"),
         detail: None,
     }
 }
@@ -529,36 +535,41 @@ fn check_binding(
     base: &str,
     branches: &[&str],
 ) -> Option<Unbound> {
-    let reported = format!("the session reported PR #{pr} but");
-    let plain = |public: String| Unbound {
-        public,
+    let plain = |what: &str| Unbound {
+        public: reported_but(pr, what),
         detail: None,
     };
     let Some(pull) = pull else {
         return Some(does_not_exist(pr));
     };
     if pull.cross_repository {
-        return Some(plain(format!("{reported} it comes from a fork")));
+        return Some(plain("it comes from a fork"));
     }
     if pull.base_ref != base {
         let run_base = prepare_session_text(base);
         return Some(Unbound {
-            public: format!("{reported} its base is not the base branch {run_base}"),
-            detail: Some(format!(
-                "{reported} its base {} is not the base branch {run_base}",
-                prepare_session_text(&pull.base_ref)
+            public: reported_but(pr, &format!("its base is not the base branch {run_base}")),
+            detail: Some(reported_but(
+                pr,
+                &format!(
+                    "its base {} is not the base branch {run_base}",
+                    prepare_session_text(&pull.base_ref)
+                ),
             )),
         });
     }
     if branches.is_empty() {
-        return Some(plain(format!("{reported} the session has no branch")));
+        return Some(plain("the session has no branch"));
     }
     if !branches.contains(&pull.head_ref.as_str()) {
         return Some(Unbound {
-            public: format!("{reported} its branch is not this session's branch"),
-            detail: Some(format!(
-                "{reported} its branch {} is not this session's branch",
-                prepare_session_text(&pull.head_ref)
+            public: reported_but(pr, "its branch is not this session's branch"),
+            detail: Some(reported_but(
+                pr,
+                &format!(
+                    "its branch {} is not this session's branch",
+                    prepare_session_text(&pull.head_ref)
+                ),
             )),
         });
     }
@@ -566,38 +577,54 @@ fn check_binding(
 }
 
 /// Whether a `gh` failure (`OtherKind::Failed`, as `github::gh::finish` words it) is that `gh`
-/// got no answer from GitHub about the pull request: an `HTTP 5xx` in its stderr, a call a
-/// signal ended (`exited with status -1`), an answer over the output limit (`printed more
-/// than`), or a failed connection (a connect, the network, TLS, a lookup, a timeout, an
-/// end of file). A refusal by GitHub (status 1 and a reason, `HTTP 4xx`) is not.
+/// got no answer from GitHub about the pull request: a call a signal ended
+/// (`` `<command>` exited with status -1``), an answer over the output limit
+/// (`` `<command>` printed more than``), or what `gh` said after
+/// `` `<command>` exited with status <n>: `` is an `HTTP 5xx` or a failed connection. Only
+/// what `gh` said is read, never the command text, which names the repo. A refusal by GitHub
+/// (status 1 and a reason, `HTTP 4xx`) is not no answer.
 fn gh_gave_no_answer(message: &str) -> bool {
-    if message.contains("printed more than") || message.contains("exited with status -1") {
+    const EXITED: &str = "` exited with status ";
+    if message.contains("` printed more than ") {
         return true;
     }
-    if message.match_indices("HTTP 5").any(|(at, _)| {
-        message[at + 6..]
+    let Some((_, after)) = message.split_once(EXITED) else {
+        return false;
+    };
+    let Some((status, said)) = after.split_once(": ") else {
+        // `finish` writes the colon and a space whatever `gh` said; with none, nothing was said.
+        return after.trim_end() == "-1:" || after.trim() == "-1";
+    };
+    if status == "-1" {
+        return true;
+    }
+    let server_error = said.match_indices("HTTP 5").any(|(at, _)| {
+        said[at + 6..]
             .bytes()
             .take(2)
             .filter(u8::is_ascii_digit)
             .count()
             == 2
-    }) {
-        return true;
-    }
-    let lower = message.to_ascii_lowercase();
-    [
-        "connect",
-        "network",
-        "tls",
-        "dial tcp",
-        "no such host",
-        "timeout",
-        "timed out",
-        "eof",
-        "temporary failure",
-    ]
-    .iter()
-    .any(|shape| lower.contains(shape))
+    });
+    let said = said.to_ascii_lowercase();
+    let said = said.trim_end();
+    server_error
+        || [
+            "error connecting to",
+            "dial tcp",
+            "no such host",
+            "connection refused",
+            "connection reset",
+            "i/o timeout",
+            "tls handshake timeout",
+            "network is unreachable",
+            "temporary failure in name resolution",
+            "timed out",
+            "unexpected eof",
+        ]
+        .iter()
+        .any(|phrase| said.contains(phrase))
+        || said.ends_with(": eof")
 }
 
 /// The stop of a pull request that is not the run's: the factory's words, the detail the
@@ -889,9 +916,7 @@ impl Step<'_, '_> {
                         Ok(_) if no_answer => return Err(error),
                         Ok(Some(_)) => {
                             let not_draft = Unbound {
-                                public: format!(
-                                    "the session reported PR #{pr} but it is not a draft"
-                                ),
+                                public: reported_but(pr, "it is not a draft"),
                                 detail: None,
                             };
                             return self.stuck(
@@ -1700,7 +1725,7 @@ mod tests {
                         message: if self.refused {
                             "`gh pr ready` exited with status 1: boom".into()
                         } else {
-                            "`gh pr ready` failed: HTTP 502: Bad Gateway".into()
+                            "`gh pr ready` exited with status 1: HTTP 502: Bad Gateway".into()
                         },
                     });
                 }
@@ -1713,7 +1738,7 @@ mod tests {
                         message: if self.gone {
                             "`gh pr view` failed: Could not resolve to a PullRequest".into()
                         } else {
-                            "`gh pr view` failed: HTTP 502: Bad Gateway".into()
+                            "`gh pr view` exited with status 1: HTTP 502: Bad Gateway".into()
                         },
                     });
                 }
@@ -2020,7 +2045,7 @@ mod tests {
                     self.0.set_pull(12, draft_on(BRANCH));
                     return Err(TrackerError::Other {
                         kind: crate::factory::github::OtherKind::Failed,
-                        message: "`gh pr ready` failed: HTTP 502: Bad Gateway".into(),
+                        message: "`gh pr ready` exited with status 1: HTTP 502: Bad Gateway".into(),
                     });
                 }
                 self.0.gh(args)
