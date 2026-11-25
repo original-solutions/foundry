@@ -165,7 +165,8 @@ pub(super) fn with_body_path(line: &str, path: &Path) -> String {
     line.replace(BODY_PATH, &word)
 }
 
-/// Why [`Sessions::send_factory`] sent nothing.
+/// Why [`Sessions::send_factory`] did not send a message. Every refusal but
+/// [`SendRefused::Failed`] typed nothing; a `Failed` send may have typed its line.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SendRefused {
     /// The session is not idle.
@@ -188,18 +189,53 @@ pub enum SendRefused {
     /// cannot be hidden. Nothing was written or typed.
     #[error("the secret store cannot be read, so the body was not written")]
     SecretsUnreadable,
-    /// The body could not be written or the line not typed: an I/O or terminal error. The
-    /// reason names no secret.
-    #[error("the message was not sent: {0}")]
-    Failed(String),
+    /// The count of prompts could not be read, the body could not be written, the terminal gave
+    /// an error, or the send did not finish. The reason names no secret.
+    ///
+    /// A terminal error may come after the line was typed: the terminal takes the line, then
+    /// its answer does not come in time or the connection breaks. So with `prompts` set, the
+    /// coordinator sends the message again only with `only_if_prompts` set to it: a line that
+    /// did become a prompt is then refused with [`SendRefused::CountRose`] instead of typed
+    /// twice, and one that did not is typed once more. The count stops a second copy only once
+    /// the first line's prompt has been counted: a line still on its way to the agent, or taken
+    /// and not yet reported, has not raised it, so a resend that comes before then can still
+    /// type the line twice.
+    #[error("the send failed: {reason}")]
+    Failed {
+        /// What went wrong.
+        reason: String,
+        /// The session's count of submitted prompts, read before the body was written or the
+        /// line typed. `None` when the send failed before it read the count, and so typed
+        /// nothing, or when its task ended before it answered (a panic), which loses what it
+        /// read and may come after the line was typed: then there is no count to guard a
+        /// resend, and one can type the line twice.
+        prompts: Option<u64>,
+    },
 }
 
 impl From<SessionError> for SendRefused {
+    /// `error` from a send that had not read the count.
     fn from(error: SessionError) -> Self {
         match error {
             SessionError::BodyWithoutPath => SendRefused::BodyWithoutPath,
             SessionError::SecretsUnreadable => SendRefused::SecretsUnreadable,
-            other => SendRefused::Failed(other.to_string()),
+            other => SendRefused::Failed {
+                reason: other.to_string(),
+                prompts: None,
+            },
+        }
+    }
+}
+
+impl SendRefused {
+    /// `error` from a send that had read the count `prompts` before it failed.
+    fn after_count(error: impl Into<SendRefused>, prompts: u64) -> Self {
+        match error.into() {
+            SendRefused::Failed { reason, .. } => SendRefused::Failed {
+                reason,
+                prompts: Some(prompts),
+            },
+            other => other,
         }
     }
 }
@@ -766,8 +802,12 @@ impl Sessions {
     /// be read it is [`SendRefused::SecretsUnreadable`]. A body whose line has no [`BODY_PATH`]
     /// is [`SendRefused::BodyWithoutPath`]. With `only_if_prompts`, a count above it is
     /// [`SendRefused::CountRose`], and nothing is written or typed: the line that was sent
-    /// before was typed after all. The send finishes even when the caller stops waiting, and is
-    /// ordered with the session's hooks.
+    /// before was typed after all. Any other failure is [`SendRefused::Failed`], with the count
+    /// read before the send when it got that far, since a terminal error can come after the
+    /// line was typed: a resend names that count as `only_if_prompts`, so a line that did
+    /// become a prompt is refused with [`SendRefused::CountRose`] instead of typed twice, as
+    /// [`SendRefused::Failed`] says. The send finishes even when the caller stops waiting, and
+    /// is ordered with the session's hooks.
     pub async fn send_factory(
         &self,
         session: SessionId,
@@ -777,7 +817,10 @@ impl Sessions {
         let inner = self.inner.clone();
         tokio::spawn(async move { inner.send(session, message, only_if_prompts).await })
             .await
-            .map_err(|_| SendRefused::Failed("the send did not finish".into()))?
+            .map_err(|_| SendRefused::Failed {
+                reason: "the send did not finish".into(),
+                prompts: None,
+            })?
     }
 
     /// Closes the terminal of each factory session of `workspace` that still runs, and makes a
@@ -865,7 +908,8 @@ impl Inner {
                 let hider = self.hider();
                 let path = blocking(move || write_body(&folder, &hider.hide_body(&text)?))
                     .await
-                    .and_then(|r| r)?;
+                    .and_then(|r| r)
+                    .map_err(|error| SendRefused::after_count(error, prompts))?;
                 Some(path)
             }
             None => None,
@@ -881,7 +925,11 @@ impl Inner {
             Err(TerminalError::Gone(_) | TerminalError::Unknown(_)) => {
                 Err(SendRefused::NoSuchSession)
             }
-            Err(other) => Err(SendRefused::Failed(other.to_string())),
+            // The terminal may have taken the line before it failed: the count goes with it.
+            Err(other) => Err(SendRefused::Failed {
+                reason: other.to_string(),
+                prompts: Some(prompts),
+            }),
         }
     }
 
@@ -2363,6 +2411,190 @@ exec "$agent" "$@""#;
         assert_eq!(again, Ok(count));
         let seen = f.shown(id, |t| all_values(t, "LINE=").len() == 2).await;
         assert_eq!(all_values(&seen, "LINE="), ["\"lost\"", "\"lost\""]);
+    }
+
+    /// The holder of a terminal, stopped until this is dropped: what is written to it waits in
+    /// its socket, so a send's input is taken and its answer never comes in time.
+    struct HolderStopped(nix::unistd::Pid);
+
+    impl HolderStopped {
+        fn of(terminal: foundry_proto::ids::TerminalId) -> HolderStopped {
+            let out = Command::new("pgrep")
+                .args(["-f", &format!("{terminal}.sock")])
+                .output()
+                .unwrap();
+            let pids: Vec<i32> = String::from_utf8_lossy(&out.stdout)
+                .split_whitespace()
+                .map(|pid| pid.parse().unwrap())
+                .collect();
+            assert_eq!(pids.len(), 1, "one holder serves {terminal}: {pids:?}");
+            let pid = nix::unistd::Pid::from_raw(pids[0]);
+            nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGSTOP).unwrap();
+            HolderStopped(pid)
+        }
+    }
+
+    impl Drop for HolderStopped {
+        fn drop(&mut self) {
+            let _ = nix::sys::signal::kill(self.0, nix::sys::signal::Signal::SIGCONT);
+        }
+    }
+
+    /// Sends `line` to `id` while its holder is stopped, so the terminal takes the line and
+    /// gives no answer, and lets the holder go on once the send has failed.
+    async fn send_unanswered(f: &Fx, id: SessionId, line: &str) -> Result<u64, SendRefused> {
+        let stopped = HolderStopped::of(f.terminal_of(id));
+        let sent = f.sessions.send_factory(id, Fx::message(line), None).await;
+        drop(stopped);
+        sent
+    }
+
+    #[tokio::test]
+    async fn a_send_whose_answer_fails_after_its_line_was_typed_carries_the_count_and_a_resend_is_count_rose()
+     {
+        let f = Fx::new(&format!(
+            "{IDLE}- wait_prompt\n- stop: {{last_assistant_message: \"a\"}}\n\
+             - wait_prompt\n- stop: {{last_assistant_message: \"b\"}}\n\
+             - wait_line: \"\"\n- wait_input\n"
+        ))
+        .await;
+        let id = f
+            .start_factory(WorkspaceId::random(), ProjectId::random())
+            .await;
+        f.until_turn(id, 1, 1).await;
+
+        let sent = send_unanswered(&f, id, "typed").await;
+
+        let Err(SendRefused::Failed { reason, prompts }) = sent else {
+            panic!("not Failed: {sent:?}");
+        };
+        assert_eq!(prompts, Some(1), "{reason}");
+        // The line was typed after all: the agent takes it as a prompt once the holder goes on.
+        f.until_turn(id, 2, 2).await;
+        let again = f
+            .sessions
+            .send_factory(id, Fx::message("typed"), prompts)
+            .await;
+        assert_eq!(again, Err(SendRefused::CountRose { now: 2 }));
+        let probe = f
+            .sessions
+            .send_factory(id, Fx::message("probe"), Some(2))
+            .await;
+        assert_eq!(probe, Ok(2));
+        let seen = f.shown(id, |t| !all_values(t, "LINE=").is_empty()).await;
+        assert_eq!(all_values(&seen, "LINE="), ["\"probe\""]);
+        assert_eq!(
+            all_values(&seen, "PROMPT=")
+                .iter()
+                .filter(|p| *p == "\"typed\"")
+                .count(),
+            1,
+            "{seen}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_send_whose_answer_fails_and_whose_line_never_became_a_prompt_is_typed_once_more() {
+        let f = Fx::new(&format!(
+            "{IDLE}- wait_prompt\n- stop: {{last_assistant_message: \"a\"}}\n\
+             - wait_line: \"\"\n- wait_line: \"\"\n- wait_input\n"
+        ))
+        .await;
+        let id = f
+            .start_factory(WorkspaceId::random(), ProjectId::random())
+            .await;
+        f.until_turn(id, 1, 1).await;
+
+        let sent = send_unanswered(&f, id, "lost").await;
+
+        let Err(SendRefused::Failed { reason, prompts }) = sent else {
+            panic!("not Failed: {sent:?}");
+        };
+        assert_eq!(prompts, Some(1), "{reason}");
+        let seen = f.shown(id, |t| all_values(t, "LINE=").len() == 1).await;
+        assert_eq!(all_values(&seen, "LINE="), ["\"lost\""]);
+        assert_eq!(f.state(id), Some(SessionState::Idle));
+        let again = f
+            .sessions
+            .send_factory(id, Fx::message("lost"), prompts)
+            .await;
+        assert_eq!(again, Ok(1));
+        let seen = f.shown(id, |t| all_values(t, "LINE=").len() == 2).await;
+        assert_eq!(all_values(&seen, "LINE="), ["\"lost\"", "\"lost\""]);
+    }
+
+    #[tokio::test]
+    async fn a_send_whose_count_cannot_be_read_fails_with_no_count_and_types_nothing() {
+        let mut f = Fx::new(&format!(
+            "{IDLE}- wait_prompt\n- stop: {{last_assistant_message: \"a\"}}\n\
+             - wait_line: \"\"\n- wait_input\n"
+        ))
+        .await;
+        let id = f
+            .start_factory(WorkspaceId::random(), ProjectId::random())
+            .await;
+        f.until_turn(id, 1, 1).await;
+        // The new daemon holds no counts for the session, and every read of them fails.
+        f.restart_failing_turn_reads(1000).await;
+
+        let sent = f
+            .sessions
+            .send_factory(id, Fx::message("unread"), None)
+            .await;
+
+        let Err(SendRefused::Failed { reason, prompts }) = sent else {
+            panic!("not Failed: {sent:?}");
+        };
+        assert_eq!(prompts, None, "{reason}");
+        f.sessions
+            .inner
+            .fail_turn_reads
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        let probe = f
+            .sessions
+            .send_factory(id, Fx::message("probe"), Some(1))
+            .await;
+        assert_eq!(probe, Ok(1));
+        let seen = f.shown(id, |t| !all_values(t, "LINE=").is_empty()).await;
+        assert_eq!(all_values(&seen, "LINE="), ["\"probe\""]);
+        assert!(!seen.contains("unread"), "{seen}");
+    }
+
+    #[tokio::test]
+    async fn a_body_that_cannot_be_written_fails_with_the_count_and_types_nothing() {
+        let f = Fx::new(&format!(
+            "{IDLE}- wait_prompt\n- stop: {{last_assistant_message: \"a\"}}\n\
+             - wait_line: \"\"\n- wait_input\n"
+        ))
+        .await;
+        let id = f
+            .start_factory(WorkspaceId::random(), ProjectId::random())
+            .await;
+        f.until_turn(id, 1, 1).await;
+        // A file where the folder of bodies goes, so no body can be written into it.
+        std::fs::write(f.sessions_dir().join(id.to_string()).join("messages"), "").unwrap();
+
+        let sent = f
+            .sessions
+            .send_factory(
+                id,
+                Message::new("unwritten {body}".into(), "the body".into()),
+                None,
+            )
+            .await;
+
+        let Err(SendRefused::Failed { reason, prompts }) = sent else {
+            panic!("not Failed: {sent:?}");
+        };
+        assert_eq!(prompts, Some(1), "{reason}");
+        let probe = f
+            .sessions
+            .send_factory(id, Fx::message("probe"), Some(1))
+            .await;
+        assert_eq!(probe, Ok(1));
+        let seen = f.shown(id, |t| !all_values(t, "LINE=").is_empty()).await;
+        assert_eq!(all_values(&seen, "LINE="), ["\"probe\""]);
+        assert!(!seen.contains("unwritten"), "{seen}");
     }
 
     #[tokio::test]
