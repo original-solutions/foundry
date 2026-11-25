@@ -500,7 +500,7 @@ impl Store {
     pub fn held(&self, machine: MachineId) -> Result<Option<MachineHeld>, StoreError> {
         match self.factory_by_key("machine_held", &machine.to_string())? {
             Some(FactoryBody::Held(held)) => Ok(Some(held)),
-            Some(other) => Err(wrong_kind_of("machine_held", &machine.to_string(), &other)),
+            Some(other) => Err(wrong_kind("machine_held", &other)),
             None => Ok(None),
         }
     }
@@ -519,10 +519,9 @@ impl Store {
         let Some(owner) = owner else {
             return Ok(None);
         };
-        let key = format!("{session}/{owner}");
-        match self.factory_by_key("session_turn", &key)? {
+        match self.factory_by_key("session_turn", &format!("{session}/{owner}"))? {
             Some(FactoryBody::Turn(turn)) => Ok(Some(turn)),
-            Some(other) => Err(wrong_kind_of("session_turn", &key, &other)),
+            Some(other) => Err(wrong_kind("session_turn", &other)),
             None => Ok(None),
         }
     }
@@ -612,7 +611,8 @@ impl Store {
         let Some(json) = json else {
             return Ok(None);
         };
-        decode_row(kind, id, &json).map(Some)
+        let record: FactoryRecord = serde_json::from_str(&json)?;
+        Ok(Some(record.body))
     }
 }
 
