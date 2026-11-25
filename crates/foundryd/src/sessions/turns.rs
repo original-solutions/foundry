@@ -375,8 +375,9 @@ impl Inner {
     /// swept and has none in memory, when its `counts` file is there: the file may be ahead of
     /// the record, and the sweeper writes the record from the tally. The adopt runs it, and so
     /// does every look of the sweeper, so a tally that could not be read is read again. One
-    /// that cannot be read is also read at its session's next hook.
-    pub(super) async fn load_behind(&self) {
+    /// that cannot be read is also read at its session's next hook. With `warned`, the sweeper's
+    /// record of failures, a failure in a row is logged once, not at every look.
+    pub(super) async fn load_behind(&self, warned: Option<&mut super::Backoff>) {
         let sessions: Vec<SessionId> = {
             let state = lock(&self.factory);
             state
@@ -393,11 +394,20 @@ impl Inner {
                 continue;
             }
             if let Err(error) = self.tally(session).await {
-                failed = Some(error);
+                failed = Some((session, error));
             }
         }
-        if let Some(error) = failed {
-            tracing::warn!(%error, "a factory session's counts were not read; trying again");
+        match (failed, warned) {
+            (Some((session, error)), Some(warned)) => {
+                if warned.first_failure() {
+                    tracing::warn!(session = %session, %error, "a factory session's counts were not read; trying again");
+                }
+            }
+            (Some((session, error)), None) => {
+                tracing::warn!(session = %session, %error, "a factory session's counts were not read; trying again");
+            }
+            (None, Some(warned)) => warned.reset(),
+            (None, None) => {}
         }
     }
 
