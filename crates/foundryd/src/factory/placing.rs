@@ -26,12 +26,23 @@ use crate::placement;
 
 /// The machines [`place_run`] picked so far in one pass, each counted one session fuller for
 /// the rest of it. A new pass starts with a new one.
+///
+/// A machine's samples count a run's session only once it has started, after its workspace's
+/// setup, which can take minutes and so outlast the pass that placed it. The caller tells the
+/// pass about such runs with [`Reserved::hold`] before it places anything, so a run placed by
+/// an earlier pass, or by another project's, still keeps the machine's limit.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Reserved {
     picked: BTreeMap<MachineId, u32>,
 }
 
 impl Reserved {
+    /// Counts `machine` one session fuller for every later [`place_run`]: a run is placed there
+    /// whose session its samples do not count yet.
+    pub fn hold(&mut self, machine: MachineId) {
+        *self.picked.entry(machine).or_insert(0) += 1;
+    }
+
     /// How many runs were placed on `machine` this pass.
     fn on(&self, machine: MachineId) -> u32 {
         self.picked.get(&machine).copied().unwrap_or(0)
@@ -59,7 +70,7 @@ pub fn place_run(
     reserved: &mut Reserved,
 ) -> Result<MachineId, Vec<String>> {
     let machine = pick(view, settings, login, reserved, &settings.limits)?;
-    *reserved.picked.entry(machine).or_insert(0) += 1;
+    reserved.hold(machine);
     Ok(machine)
 }
 
