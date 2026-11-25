@@ -23,6 +23,7 @@ use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use foundry_proto::factory::ProjectFactory;
 use foundry_proto::ids::{MachineId, ProjectId, TerminalId};
 use foundry_proto::messages::{PROTOCOL, PeerMessage, UiMessage};
 use foundry_proto::record::{AnyRecord, MachineSample, Record, Session};
@@ -661,6 +662,38 @@ fn at_start_the_daemon_writes_the_logins_and_the_skill_this_machine_holds() {
         "{}",
         fixture.log()
     );
+}
+
+#[test]
+fn a_workspace_of_a_project_whose_factory_is_on_is_made_with_the_logins_token() {
+    let mut fixture = Fixture::new();
+    let token = "ghp_daemon_factory_0123456789";
+    FileSecrets::new(fixture.home.path().join("secrets.json"))
+        .set("github:octocat", token)
+        .unwrap();
+    let project = fixture.project();
+    fixture.seed(|settings| {
+        settings.projects.push(project.clone());
+        settings.project_factory.insert(
+            project.id,
+            ProjectFactory {
+                on: true,
+                login: "octocat".into(),
+                paused: false,
+            },
+        );
+    });
+    fixture.start();
+
+    let (status, body) = fixture.call(
+        "POST",
+        "/api/workspaces",
+        Some(serde_json::json!({"project": project.id, "base": "main", "name": "factory"})),
+    );
+
+    assert_eq!(status, 201, "{body}");
+    assert!(!body.contains(token), "{body}");
+    assert!(!fixture.log().contains(token), "the token reached the log");
 }
 
 #[test]
