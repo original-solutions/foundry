@@ -1,12 +1,147 @@
 //! Interruptions and resumes of a run.
+//!
+//! Ported from the runner's `src/runner/relaunch.ts` and the interruption parts of
+//! `src/runner/building.ts` (`interrupted`, `resumesUsed`, `relaunchBranchOf`,
+//! `carryOutRelaunch`, `branchRefused`), with `interruption.test.ts`.
+//!
+//! A session whose process ended before a result line (it is gone from the fleet, or it
+//! finished or failed and its newest turn is not a `FACTORY-DONE`), or whose machine has been
+//! unreachable for 15 minutes ([`UNREACHABLE_FOR`]), is an interruption. [`advance`] is one pass
+//! over a run and never waits on a worker:
+//!
+//! 1. The first pass decides. With the cap used (`limits.interruption_resumes`) the run goes
+//!    stuck. Otherwise the branch the resume continues on is decided now, before anything is
+//!    asked: the open pull request's head, else the run's own branch when it is on `origin`,
+//!    else none (a new branch from the base). A name that is not a plain branch name (`-x`, a
+//!    space, `..`, a non-ASCII character) is refused as the runner's `branchRefused` refuses
+//!    it, before any workspace is asked for. Then `session_interrupted` is written with the
+//!    count and the branch, then the step `resume-archiving <k> <workspace>`, and then the
+//!    earlier workspace's archive is asked for. The pass ends there ([`ResumeStep::Archiving`]):
+//!    the archive and the new workspace are never asked for in one pass.
+//! 2. A later pass goes on once the earlier workspace shows archived (no record of it that is
+//!    not deleted) or its machine has been unreachable for 15 minutes. It returns
+//!    [`ResumeStep::NeedsMachine`] until a machine is recorded: placement needs the shared
+//!    settings, which a [`RunContext`] does not carry, so the pass places the run with
+//!    `placing::place_run` and calls [`placed`], which records the machine as a step before it
+//!    acts. The workspace is `fac/<N>-<attempt>-r<k>`, on the pull request's branch (the
+//!    checkout `Branch`, which on the machine that built the run moves the local branch to
+//!    `origin`'s) or on a new branch of its own name from the base. Its create is recorded
+//!    (`resume-requested`) before it is asked for and its answer (`resume-workspace`) after;
+//!    a create whose answer is recorded and whose record has not arrived is waited for.
+//! 3. Then the setup terminal is waited for, a session the fleet already shows in the new
+//!    workspace (one with a turn record) is adopted, and otherwise the session starts with
+//!    [`messages::resumed`] (or [`messages::launch`] for a new branch), recorded before it is
+//!    asked for (`resume-sending`) and in `session_launched` after, which also marks the
+//!    interruption sent. The status comment names the machine and the session. The first
+//!    message is asked for again by count when the session is idle with no prompt a pass
+//!    later, under `resume-resending <k> <count>`.
+//!
+//! A claim whose named machine has been unreachable for 15 minutes with no workspace is carried
+//! on the same way ([`Placing::MovedClaim`]): [`placed`] records `claim-moved <machine>`, updates
+//! the status comment, asks for `fac/<N>-<attempt>` on the new machine with the checkout
+//! `start` decided, and records `workspace-created <id>`, which `start` then finds by id. No
+//! resume is spent.
+//!
+//! [`orphans`] lists the workspaces of a run that has moved on, on machines that are heard from
+//! again, for the pass to archive by force.
+//!
+//! What the pass (task 30) must do with this step:
+//!
+//! - Call [`advance`] before `start::advance` and `building::advance` for a run in `triage` or
+//!   `building`: while an interruption is owed, `building` skips the run, and a claim that is
+//!   being moved must not be asked of its old machine by `start`.
+//! - Leave a run whose newest launch is a resume to this step's resend: `start::advance`'s
+//!   resend of the launch would send the build's launch words.
+//! - Place with `placing::place_run` when [`NeedsMachine`](ResumeStep::NeedsMachine) is
+//!   returned, and call [`placed`] with the machine, or call nothing when none qualifies.
+//! - Not call this for a run the gate holds: a run with a recorded pass, or a pull request
+//!   reported since it last entered `building`, is the gate's (`gating`, task 27, also owns a
+//!   session that died after its `FACTORY-DONE`).
+//!
+//! Where it differs from the runner:
+//!
+//! - The runner relaunches in the next attempt (a new run, a new ledger, `resume`) or sends the
+//!   same thread a message. Foundry resumes in a new workspace of the same run, so the runner's
+//!   attempt+1 mechanics (`carryOutRelaunch`, `endUnbegunRelaunch`, `carryStopToNext`, a worktree
+//!   removed with `worktree_removed`, the next attempt's approval) have no counterpart. The
+//!   counter is the newest `session_interrupted` line's `resumes`; the feedback round's reset is
+//!   task 28's.
+//! - A session is read by the fleet, not by a thread's status: there is no T3 evidence (a T3
+//!   error in the machine log, `endedInPass`, T3 starts and stops), so a session that ended is
+//!   resumed up to the cap with none, where the runner needed evidence or a second end in one
+//!   pass.
+//! - A run with no recorded approval goes stuck as `start` does ([`messages::CANNOT_CONFIRM`])
+//!   in place of the runner's `thread-gone`, since a resume starts a session.
+//! - A pull request from a fork is not resumed from, and the resume continues from the run's own
+//!   branch or the base; a same-repo pull request whose head is not a plain branch name is
+//!   refused (review focus 2), where the runner started from the base. The runner's
+//!   `pr_left` line, which recorded a pull request a stuck run left, is not written (building's
+//!   doc says so too).
+//! - A session on a machine that stays unreachable cannot be asked to end its sessions: a run
+//!   stuck for it names its machine ([`MACHINE_UNREACHABLE`]) and asks nothing of it. The
+//!   machine ends its own factory sessions (G10) when it is heard from again, and
+//!   [`orphans`] archives its workspaces.
+//! - A stuck run's workspace is kept for a person to look at, so [`orphans`] does not list it.
+//!
+//! The runner cases of `interruption.test.ts` that have no counterpart, with the reason:
+//!
+//! - `interrupted: a resume`: a lone failed or cancelled session with T3 healthy is stuck
+//!   (needs T3 evidence); the runner's `pr_left` of a pull request a stuck run left, with or
+//!   without GitHub listing it (not written).
+//! - `interrupted: the cap`: the pull request a gone thread left, by the ledger's branch
+//!   (`pr_left`).
+//! - `interrupted: a T3 restart` (all 14): T3 server starts and stops, its machine log and
+//!   `t3Starts` are the evidence the runner needs and Foundry has no T3.
+//! - `interrupted: a thread that is gone`: the next attempt's approval and instructor, no
+//!   evidence, twice in one pass, a thread found gone by a send, and a launch from base when
+//!   the text was edited since the approval (all of the runner's evidence or its next attempt;
+//!   `start` checks the text before a session starts, and the resume does not leave the run).
+//! - `a decided relaunch` (all 7): a relaunch's decision, its next attempt's ledger and label
+//!   and the time limit, watch and forward skipping it. Foundry skips a run with an interruption
+//!   owed in `building` (tests there), and the stop step owns a stop by hand.
+//! - `a relaunch finds the branch`: an archived thread's branch, and a worktree it removes
+//!   (T3's thread and `worktree_removed`; Foundry's workspace is made on the branch).
+//! - `interrupted: a run with no recorded approval`: a relaunch line in a ledger with no
+//!   approval is an error for `advance` (the runner's next-attempt error).
+//! - `a provider rate limit` (all 14): rate limits, cooldowns, `retry-after` and moving a
+//!   thread to another model are the runner's; P1 marks a session stuck and the factory leaves
+//!   it to `limits.minutes` (building's doc).
+//! - `advance: a session that ended badly`, `advance: a pause by hand` and `the time limit` are
+//!   `building`'s (task 23).
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use foundry_proto::factory::{RunEvent, RunId};
 use foundry_proto::ids::{MachineId, ProjectId, SessionId, WorkspaceId};
+use foundry_proto::record::{Record, Workspace};
+use foundry_proto::state::{SessionState, TerminalState};
+use serde_json::Value;
 
-use super::{RunContext, RunError};
-use crate::factory::worker::FleetView;
+use super::building::TURN_READ;
+use super::progress::{
+    Seen, WORKSPACE_CREATED, WORKSPACE_REQUESTED, pending_relaunch, read_progress,
+};
+use super::start::{FIRST_PROMPT_COUNT, SETUP_FAILED};
+use super::{
+    Closing, Progress, RunContext, RunError, Stop, abandon, closed_issue, end_own_merge,
+    finish_building, go_stuck, progress_from, recorded_reason, session_id, workspace_id,
+};
+use crate::factory::github::read::is_safe_branch_name;
+use crate::factory::github::{OtherKind, TrackerError};
+use crate::factory::ledger::events::{
+    Cause, CauseStep, Event, ModelOption, OptionValue, ResumedFrom, names,
+};
+use crate::factory::lifecycle::State;
+use crate::factory::lifecycle::result_line::{self, SessionResult};
+use crate::factory::messages::{
+    self, CANNOT_CONFIRM, LAUNCH_FAILED, Message, ResumeFrom, SESSION_GONE, prepare_output_tail,
+    prepare_session_text,
+};
+use crate::factory::text;
+use crate::factory::worker::{CreateWorkspace, FleetView, WorkerError};
+use crate::sessions::factory::{BODY_PATH, FactoryStart, SendRefused};
+use crate::workspaces::{Checkout, FactoryTag, Setup};
 
 /// How long a machine is unreachable before what it holds is given up on: 15 minutes, on the
 /// sleep-counting clock that [`FleetView::unreachable_for`] reads.
@@ -15,15 +150,43 @@ pub const UNREACHABLE_FOR: Duration = Duration::from_secs(15 * 60);
 /// The public reason of a run whose session's machine stayed unreachable.
 pub const MACHINE_UNREACHABLE: &str = "the session's machine has been unreachable for 15 minutes";
 
-/// The detail of the stop of a run whose pull request's branch is not a plain branch name.
+/// The detail of the stop of a run whose pull request's branch is not a plain branch name: the
+/// runner's `branchRefused` words.
 pub const BRANCH_REFUSED: &str = "the pull request's branch is not a plain branch name";
+
+/// The step written before the earlier workspace's archive is asked for:
+/// `resume-archiving <k> <workspace id or none>`.
+pub const ARCHIVING: &str = "resume-archiving ";
+/// The step written once the archive was asked for and answered, or the machine could not be
+/// reached: `resume-archive-asked <k>`.
+pub const ARCHIVE_ASKED: &str = "resume-archive-asked ";
+/// The step that records the machine the resume workspace is made on: `resume-machine <k> <id>`.
+pub const MACHINE: &str = "resume-machine ";
+/// The step written before the create: `resume-requested <k> <name>`.
+pub const REQUESTED: &str = "resume-requested ";
+/// The step written once the worker answered the create: `resume-workspace <k> <id>`.
+pub const WORKSPACE: &str = "resume-workspace ";
+/// The step written before the sessions of the new workspace are ended ahead of a second start:
+/// `resume-ending-sessions <k>`.
+pub const ENDING_SESSIONS: &str = "resume-ending-sessions ";
+/// The step written before the session is started: `resume-sending <k>`.
+pub const SENDING: &str = "resume-sending ";
+/// The step written before the first message is asked for again: `resume-resending <k> <count>`.
+pub const RESENDING: &str = "resume-resending ";
+/// The step that records the machine a claim moved to: `claim-moved <id>`.
+pub const CLAIM_MOVED: &str = "claim-moved ";
+
+/// How many resume and feedback workspace names of a run are looked for in the fleet: the
+/// fleet's view finds a workspace by name, so the names are tried one by one.
+const NAME_SCAN: u32 = 64;
 
 /// What one pass of [`advance`] or [`placed`] did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ResumeStep {
     /// Not this step's run, or no interruption: nothing was written.
     Skipped { reason: String },
-    /// The interruption is recorded and the earlier workspace's archive asked for.
+    /// The interruption is recorded and the earlier workspace's archive was asked for. The
+    /// new workspace is asked for in a later pass.
     Archiving {
         resumes: u32,
         workspace: Option<WorkspaceId>,
@@ -36,12 +199,13 @@ pub enum ResumeStep {
     Started { resumes: u32, session: SessionId },
     /// The first message was asked for again by count.
     Resent { session: SessionId },
-    /// A claim launched on another machine.
+    /// A claim was launched on another machine: its workspace was asked for, and `start`
+    /// carries on from it.
     Moved {
         machine: MachineId,
         workspace: WorkspaceId,
     },
-    /// The run went stuck.
+    /// The run went stuck; `reason` is the public one.
     Stuck { reason: String },
     /// A person closed the issue: the run is ended.
     Abandoned,
@@ -52,7 +216,7 @@ pub enum ResumeStep {
 /// What a pass that returned waiting is waiting for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Wait {
-    /// The earlier workspace still shows, and its machine is not yet unreachable for long.
+    /// The earlier workspace still shows, and its machine has not been unreachable for long.
     Archive,
     /// The worker answered the create and the fleet does not show the record yet.
     Workspace,
@@ -69,28 +233,1129 @@ pub enum Placing {
     MovedClaim { unreachable: MachineId },
 }
 
-/// One pass over `run`.
-pub fn advance(_ctx: &RunContext<'_>, _run: &RunId) -> Result<ResumeStep, RunError> {
-    todo!("resume::advance")
+/// One pass over `run`, which builds or is claimed. See the module's words.
+pub fn advance(ctx: &RunContext<'_>, run: &RunId) -> Result<ResumeStep, RunError> {
+    pass(ctx, run, None)
 }
 
-/// One pass over `run` with the machine placement picked.
+/// [`advance`] after placement picked `machine` for what [`ResumeStep::NeedsMachine`] asked.
+/// The machine is recorded as a step before anything is asked of it, and a machine already
+/// recorded for the resume stands. A call when nothing needs a machine is skipped, and a claim
+/// is never moved to the machine it is unreachable on.
 pub fn placed(
-    _ctx: &RunContext<'_>,
-    _run: &RunId,
-    _machine: MachineId,
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    machine: MachineId,
 ) -> Result<ResumeStep, RunError> {
-    todo!("resume::placed")
+    pass(ctx, run, Some(machine))
 }
 
-/// The workspaces of `run` that it has moved on from.
+/// The workspaces of `run` that it has moved on from, which `view` shows on machines that are
+/// online now: the pass has each archived by force, for a machine that is heard from again.
+///
+/// It takes the project and the run's events, not the run alone, since which workspace is the
+/// active one is in the ledger: the newest session's (`session_launched`), the build workspace
+/// before a session starts (`workspace-created`) and the resume workspace being made. A name
+/// whose workspace is being asked for (its create requested, its answer not recorded) is
+/// never an orphan. The names are the build's, the resumes' and the feedback rounds'; a gate's
+/// is the gate's. A feedback workspace is an orphan only when a higher-numbered one shows,
+/// since which one is active is the feedback step's (task 28) to record. Every workspace of a
+/// run that ended is an orphan, except those of a stuck run, which are kept to be looked at.
+/// It reads no worker and no clock.
 pub fn orphans(
-    _view: &FleetView,
-    _project: ProjectId,
-    _run: &RunId,
-    _events: &[RunEvent],
+    view: &FleetView,
+    project: ProjectId,
+    run: &RunId,
+    events: &[RunEvent],
 ) -> Vec<WorkspaceId> {
-    todo!("resume::orphans")
+    if events.is_empty() {
+        return Vec::new();
+    }
+    let seen = read_progress(events);
+    let round = read_round(events);
+    let everything = seen.finished && !is_stuck(&seen);
+    let mut active = BTreeSet::new();
+    let mut being_asked: BTreeSet<String> = BTreeSet::new();
+    if !everything {
+        active.extend(
+            seen.worktree
+                .as_deref()
+                .and_then(|id| workspace_id(id).ok()),
+        );
+        if seen.thread_id.is_none() {
+            match seen
+                .workspace
+                .as_deref()
+                .and_then(|id| workspace_id(id).ok())
+            {
+                Some(id) => {
+                    active.insert(id);
+                }
+                None => {
+                    being_asked.extend(seen.workspace_requested.clone());
+                }
+            }
+        }
+        if let (Some(interruption), Some(round)) = (&seen.interruption, &round)
+            && !interruption.sent
+            && !interruption.relaunch
+        {
+            match round.workspace {
+                Some(id) => {
+                    active.insert(id);
+                }
+                None if round.requested => {
+                    being_asked.insert(resume_name(run, round.k));
+                }
+                None => {}
+            }
+        }
+    }
+    let named = named_workspaces(view, project, run);
+    let newest_feedback = named
+        .iter()
+        .filter_map(|(kind, _)| match kind {
+            Kind::Feedback(k) => Some(*k),
+            _ => None,
+        })
+        .max();
+    named
+        .into_iter()
+        .filter(|(kind, record)| {
+            let id = record.body.id;
+            let superseded = match kind {
+                Kind::Feedback(k) => {
+                    everything || newest_feedback.is_some_and(|newest| *k < newest)
+                }
+                Kind::Build | Kind::Resume(_) => true,
+            };
+            superseded
+                && !active.contains(&id)
+                && !being_asked.contains(&record.body.name)
+                && view.online(record.owner)
+        })
+        .map(|(_, record)| record.body.id)
+        .collect()
+}
+
+/// A workspace the run names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    Build,
+    Resume(u32),
+    Feedback(u32),
+}
+
+/// The build workspace's name: `fac/<N>-<attempt>`.
+fn build_name(run: &RunId) -> String {
+    format!("fac/{}-{}", run.issue(), run.attempt())
+}
+
+/// The k-th resume workspace's name: `fac/<N>-<attempt>-r<k>`.
+fn resume_name(run: &RunId, k: u32) -> String {
+    format!("{}-r{k}", build_name(run))
+}
+
+/// Every workspace of the project the fleet shows that is not archived and has one of the
+/// run's build, resume or feedback names, in the order of the names.
+fn named_workspaces<'a>(
+    view: &'a FleetView,
+    project: ProjectId,
+    run: &RunId,
+) -> Vec<(Kind, &'a Record<Workspace>)> {
+    let mut found = Vec::new();
+    let base = build_name(run);
+    found.extend(
+        view.workspaces_named(project, &base)
+            .into_iter()
+            .map(|record| (Kind::Build, record)),
+    );
+    for k in 1..=NAME_SCAN {
+        found.extend(
+            view.workspaces_named(project, &format!("{base}-r{k}"))
+                .into_iter()
+                .map(|record| (Kind::Resume(k), record)),
+        );
+    }
+    for k in 1..=NAME_SCAN {
+        found.extend(
+            view.workspaces_named(project, &format!("{base}-f{k}"))
+                .into_iter()
+                .map(|record| (Kind::Feedback(k), record)),
+        );
+    }
+    found
+}
+
+/// The record of the workspace `id` of the run, when the fleet shows it and it is not archived.
+fn find_workspace<'a>(
+    view: &'a FleetView,
+    project: ProjectId,
+    run: &RunId,
+    id: WorkspaceId,
+) -> Option<&'a Record<Workspace>> {
+    named_workspaces(view, project, run)
+        .into_iter()
+        .map(|(_, record)| record)
+        .find(|record| record.body.id == id)
+}
+
+/// Whether the run ended stuck, or is stuck: its workspace is kept.
+fn is_stuck(seen: &Seen) -> bool {
+    seen.state == Some(State::Stuck) || seen.stuck.is_some()
+}
+
+/// What a session that is not running was found to be.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Ended {
+    /// The fleet shows no such session.
+    Gone,
+    /// Its process ended as `what` says, with `text` of its newest unread turn.
+    Process {
+        what: &'static str,
+        text: Option<String>,
+    },
+    /// Its machine has been unreachable for 15 minutes.
+    Unreachable,
+}
+
+impl Ended {
+    /// The code of the stuck path and what the run says when the cap is used.
+    fn stop(&self) -> (&'static str, Stop) {
+        match self {
+            Ended::Gone => ("thread-gone", Stop::new(SESSION_GONE)),
+            Ended::Process { what, text } => (
+                "session-ended-badly",
+                Stop {
+                    reason: format!("the session run ended as {what}"),
+                    session_text: text.clone(),
+                    ..Stop::default()
+                },
+            ),
+            Ended::Unreachable => ("machine-unreachable", Stop::new(MACHINE_UNREACHABLE)),
+        }
+    }
+}
+
+/// Where the branch of a resume comes from.
+enum Branch {
+    /// Continue on this branch, or on a new branch from the base when none.
+    Use(Option<String>),
+    /// The pull request's branch is not one a command can be handed.
+    Refused,
+}
+
+/// What the ledger records of the resume the newest `session_interrupted` line owes.
+#[derive(Debug, Default)]
+struct Round {
+    k: u32,
+    /// The workspace the archive is of, as written: an id or `none`.
+    archiving: Option<String>,
+    archive_asked: bool,
+    machine: Option<MachineId>,
+    requested: bool,
+    workspace: Option<WorkspaceId>,
+    sending: bool,
+    /// A session was launched since, and no launch came after it.
+    launched: bool,
+}
+
+/// The text of a `step_changed` event.
+fn step_text(event: &RunEvent) -> Option<&str> {
+    if event.event != names::STEP_CHANGED {
+        return None;
+    }
+    event.data.get("step").and_then(Value::as_str)
+}
+
+/// What follows `prefix` and the count `k` in `step`, or `None` for a step of another kind or
+/// another count.
+fn numbered<'a>(step: &'a str, prefix: &str, k: u32) -> Option<&'a str> {
+    let rest = step.strip_prefix(prefix)?;
+    let (count, tail) = rest.split_once(' ').unwrap_or((rest, ""));
+    (count == k.to_string()).then_some(tail)
+}
+
+fn parse_machine(text: &str) -> Option<MachineId> {
+    uuid::Uuid::parse_str(text).ok().map(MachineId)
+}
+
+/// The newest `session_interrupted` line that is a resume, and the steps after it.
+fn read_round(events: &[RunEvent]) -> Option<Round> {
+    let at = events.iter().rposition(|event| {
+        event.event == "session_interrupted"
+            && event.data.get("relaunch") != Some(&Value::Bool(true))
+    })?;
+    let k = events[at]
+        .data
+        .get("resumes")
+        .and_then(Value::as_u64)
+        .and_then(|k| u32::try_from(k).ok())?;
+    let mut round = Round {
+        k,
+        ..Round::default()
+    };
+    let (mut first, mut last) = (None, None);
+    for (index, event) in events.iter().enumerate().skip(at + 1) {
+        if event.event == names::SESSION_LAUNCHED {
+            first.get_or_insert(index);
+            last = Some(index);
+            continue;
+        }
+        let Some(step) = step_text(event) else {
+            continue;
+        };
+        if let Some(rest) = numbered(step, ARCHIVING, k) {
+            round.archiving = Some(rest.to_owned());
+        } else if numbered(step, ARCHIVE_ASKED, k).is_some() {
+            round.archive_asked = true;
+        } else if let Some(rest) = numbered(step, MACHINE, k) {
+            round.machine = parse_machine(rest);
+        } else if numbered(step, REQUESTED, k).is_some() {
+            round.requested = true;
+        } else if let Some(rest) = numbered(step, WORKSPACE, k) {
+            round.workspace = uuid::Uuid::parse_str(rest).ok().map(WorkspaceId);
+        } else if numbered(step, SENDING, k).is_some() {
+            round.sending = true;
+        }
+    }
+    round.launched = first.is_some() && first == last;
+    Some(round)
+}
+
+/// The machine a claim moved to since its workspace was last asked for.
+fn moved_to(events: &[RunEvent]) -> Option<MachineId> {
+    let mut moved = None;
+    for step in events.iter().filter_map(step_text) {
+        if step.starts_with(WORKSPACE_REQUESTED) {
+            moved = None;
+        } else if let Some(machine) = step.strip_prefix(CLAIM_MOVED) {
+            moved = parse_machine(machine);
+        }
+    }
+    moved
+}
+
+/// The newest turn read since the session was launched: the highest `turn-read <n>` after the
+/// newest `session_launched` line.
+fn newest_turn_read(events: &[RunEvent]) -> Option<u64> {
+    let mut newest = None;
+    for event in events {
+        if event.event == names::SESSION_LAUNCHED {
+            newest = None;
+        } else if let Some(n) = step_text(event)
+            .and_then(|step| step.strip_prefix(TURN_READ))
+            .and_then(canonical)
+        {
+            newest = Some(newest.map_or(n, |read: u64| read.max(n)));
+        }
+    }
+    newest
+}
+
+/// `text` as a number written the way the building step writes one.
+fn canonical(text: &str) -> Option<u64> {
+    let plain = !text.is_empty()
+        && text.bytes().all(|b| b.is_ascii_digit())
+        && (text == "0" || !text.starts_with('0'));
+    if plain { text.parse().ok() } else { None }
+}
+
+/// `text` prepared as session text, or `None` when nothing is left of it.
+fn prepared(text: &str) -> Option<String> {
+    let text = prepare_session_text(text);
+    (!text.is_empty()).then_some(text)
+}
+
+/// Whether `machine` has been unreachable for 15 minutes.
+fn unreachable_long(ctx: &RunContext<'_>, machine: MachineId) -> bool {
+    ctx.view.unreachable_for(machine) >= UNREACHABLE_FOR
+}
+
+fn skipped(run: &RunId, why: &str) -> Result<ResumeStep, RunError> {
+    Ok(ResumeStep::Skipped {
+        reason: format!("run {run} {why}"),
+    })
+}
+
+/// A step recorded, with the lease checked first so that a lost lease writes nothing.
+fn note(ctx: &RunContext<'_>, run: &RunId, step: &str, reason: &str) -> Result<(), RunError> {
+    ctx.held()?;
+    ctx.record_step(run, step, &Cause::new(CauseStep::Advance, reason))
+}
+
+/// Why a run is not this step's, or `None` for one that is.
+fn not_this_steps(ctx: &RunContext<'_>, run: &RunId, seen: &Seen) -> Option<String> {
+    let reason = if run.repo() != ctx.repo() {
+        "is of another repo"
+    } else if seen.finished {
+        "is finished"
+    } else if seen.stop_requested {
+        "was asked to stop, which the stop step carries out"
+    } else if seen
+        .interruption
+        .as_ref()
+        .is_some_and(|interruption| interruption.relaunch || interruption.rate_limited)
+        || pending_relaunch(seen).is_some()
+    {
+        "has a relaunch or a rate limit decided, which are the runner's"
+    } else {
+        return match seen.state {
+            Some(State::Triage | State::Building) => None,
+            state => Some(format!(
+                "run {run} is in state {}, which another step owns",
+                state.map_or("none", State::name)
+            )),
+        };
+    };
+    Some(format!("run {run} {reason}"))
+}
+
+/// One pass over `run`, with the machine placement picked when it was asked for one.
+fn pass(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    placed: Option<MachineId>,
+) -> Result<ResumeStep, RunError> {
+    let events = ctx.ledger.read(run)?;
+    let seen = read_progress(&events);
+    if let Some(reason) = not_this_steps(ctx, run, &seen) {
+        return Ok(ResumeStep::Skipped { reason });
+    }
+    let mut at = progress_from(run, CauseStep::Advance, &seen, State::Building);
+    // A resume owed: the interruption is recorded and its launch is not.
+    if let Some(owed) = seen
+        .interruption
+        .as_ref()
+        .filter(|interruption| !interruption.sent)
+    {
+        return carry_on(
+            ctx,
+            run,
+            &events,
+            &seen,
+            &mut at,
+            owed.resumes,
+            owed.branch.as_deref(),
+            placed,
+        );
+    }
+    if seen.thread_id.is_none() {
+        return moved_claim(ctx, run, &events, &seen, placed);
+    }
+    if seen.state == Some(State::Triage) && !seen.rechecked {
+        return skipped(run, "is launching, which start carries out");
+    }
+    // The gate has the pull request the session reported.
+    let with_the_gate = seen.pr_reported || (seen.pass.is_some() && seen.last_pr.is_some());
+    let ended = if with_the_gate {
+        None
+    } else {
+        ended(ctx, &events, &seen)?
+    };
+    match ended {
+        Some(ended) => decide(ctx, run, &seen, &mut at, &ended),
+        None => resend(ctx, run, &events, &seen),
+    }
+}
+
+/// How the session ended, when it has: gone from the fleet, finished or failed with no result
+/// line to act on, or on a machine unreachable for 15 minutes. A session that finished with a
+/// `FACTORY-DONE` is `building`'s.
+fn ended(
+    ctx: &RunContext<'_>,
+    events: &[RunEvent],
+    seen: &Seen,
+) -> Result<Option<Ended>, RunError> {
+    let Some(thread) = &seen.thread_id else {
+        return Ok(None);
+    };
+    let session = session_id(thread)?;
+    let Some(state) = ctx.view.session_state(session) else {
+        return Ok(Some(Ended::Gone));
+    };
+    match state {
+        SessionState::Unreachable => {
+            let owner = seen
+                .worktree
+                .as_deref()
+                .and_then(|id| workspace_id(id).ok())
+                .and_then(|workspace| ctx.view.session_of(workspace))
+                .map(|record| record.owner)
+                .or_else(|| seen.machine.as_deref().and_then(parse_machine));
+            Ok(owner
+                .filter(|machine| unreachable_long(ctx, *machine))
+                .map(|_| Ended::Unreachable))
+        }
+        SessionState::Finished | SessionState::Failed => {
+            let what = if state == SessionState::Failed {
+                "failed"
+            } else {
+                "finished"
+            };
+            let read = newest_turn_read(events);
+            let unread = ctx
+                .view
+                .session_turn(session)
+                .filter(|turn| turn.turn > 0 && read.is_none_or(|read| turn.turn > read))
+                .cloned();
+            let text = match unread {
+                None => None,
+                Some(turn) => {
+                    ctx.held()?;
+                    let message = ctx.worker.turn(session, turn.turn)?.message;
+                    // A done message wins over the way the session ended.
+                    if matches!(
+                        result_line::read(Some(&message), ctx.repo()),
+                        SessionResult::Done { .. }
+                    ) {
+                        return Ok(None);
+                    }
+                    prepared(&message)
+                }
+            };
+            Ok(Some(Ended::Process { what, text }))
+        }
+        SessionState::Starting
+        | SessionState::Working
+        | SessionState::Idle
+        | SessionState::WaitingForYou
+        | SessionState::Stuck => Ok(None),
+    }
+}
+
+/// The workspace the run's newest session works in.
+fn old_workspace(seen: &Seen) -> Result<Option<WorkspaceId>, RunError> {
+    seen.worktree
+        .as_deref()
+        .or(seen.workspace.as_deref())
+        .map(workspace_id)
+        .transpose()
+}
+
+/// The run's base: the one its launch recorded, else the project's.
+fn run_base(ctx: &RunContext<'_>, seen: &Seen) -> String {
+    seen.base
+        .clone()
+        .or_else(|| seen.launch_base.clone())
+        .unwrap_or_else(|| ctx.config.base.clone())
+}
+
+/// The first message of a resume: on `branch` the resumed launch, else the plain launch.
+fn launch_message(ctx: &RunContext<'_>, run: &RunId, seen: &Seen, branch: Option<&str>) -> Message {
+    let base = run_base(ctx, seen);
+    let named = (base != ctx.config.base).then_some(base.as_str());
+    match branch {
+        Some(branch) => messages::resumed(
+            ctx.repo(),
+            run.issue(),
+            &ctx.project.login,
+            &ResumeFrom::Interrupted {
+                run: run.clone(),
+                branch: branch.to_owned(),
+            },
+            named,
+            BODY_PATH,
+        ),
+        None => messages::launch(
+            ctx.repo(),
+            run.issue(),
+            &ctx.project.login,
+            named,
+            BODY_PATH,
+        ),
+    }
+}
+
+/// The step an issue that was closed ends the run with, when it was.
+fn closing_step(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    seen: &Seen,
+    closing: Closing,
+) -> Result<Option<ResumeStep>, RunError> {
+    match closing {
+        Closing::Open => Ok(None),
+        Closing::PersonsMove => {
+            abandon(ctx, run, seen, CauseStep::Advance)?;
+            Ok(Some(ResumeStep::Abandoned))
+        }
+        Closing::OwnMerge(pull) => {
+            end_own_merge(ctx, run, seen, CauseStep::Advance, &pull)?;
+            Ok(Some(ResumeStep::Ended))
+        }
+    }
+}
+
+/// A run that went to `triage` with a session recorded is moved to `building`.
+fn ensure_building(ctx: &RunContext<'_>, issue: u64, at: &mut Progress) -> Result<(), RunError> {
+    if at.state == State::Triage {
+        finish_building(ctx, issue, at)?;
+    }
+    Ok(())
+}
+
+/// The run goes stuck under `code`, with `stop`.
+fn stuck(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    at: &mut Progress,
+    code: &str,
+    stop: Stop,
+) -> Result<ResumeStep, RunError> {
+    let reason = stop.reason.clone();
+    go_stuck(ctx, run.issue(), at, code, stop, None)?;
+    Ok(ResumeStep::Stuck { reason })
+}
+
+/// Where the resume continues: the open pull request's head, else the run's own branch when it
+/// is on `origin`, else none. A pull request from a fork is not resumed from. A head that is
+/// not a plain branch name is refused.
+fn choose_branch(ctx: &RunContext<'_>, seen: &Seen) -> Result<Branch, RunError> {
+    if let Some(last) = &seen.last_pr
+        && let Some(pull) = ctx.tracker.pull_request(ctx.repo(), last.pr)?
+        && pull.open
+        && !pull.cross_repository
+    {
+        return Ok(if is_safe_branch_name(&pull.head_ref) {
+            Branch::Use(Some(pull.head_ref))
+        } else {
+            Branch::Refused
+        });
+    }
+    let mut tried: Vec<&str> = Vec::new();
+    for candidate in [seen.last_branch.as_deref(), seen.resumed_from.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        if tried.contains(&candidate) || !is_safe_branch_name(candidate) {
+            continue;
+        }
+        tried.push(candidate);
+        match ctx.tracker.branch_tip(ctx.repo(), candidate) {
+            Ok(_) => return Ok(Branch::Use(Some(candidate.to_owned()))),
+            Err(
+                TrackerError::NotFound { .. }
+                | TrackerError::Other {
+                    kind: OtherKind::InvalidArgument,
+                    ..
+                },
+            ) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(Branch::Use(None))
+}
+
+/// The first pass: the cap, the branch, the decision, and the archive of the earlier workspace.
+fn decide(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    seen: &Seen,
+    at: &mut Progress,
+    ended: &Ended,
+) -> Result<ResumeStep, RunError> {
+    let issue = run.issue();
+    let (closing, _) = closed_issue(ctx, run, seen)?;
+    if let Some(step) = closing_step(ctx, run, seen, closing)? {
+        return Ok(step);
+    }
+    ensure_building(ctx, issue, at)?;
+    let used = seen
+        .interruption
+        .as_ref()
+        .map_or(0, |interruption| interruption.resumes);
+    let (code, stop) = ended.stop();
+    // The machine is gone: nothing can be asked of it, and it ends its own sessions.
+    if *ended == Ended::Unreachable {
+        at.worktree = None;
+    }
+    if u64::from(used) >= ctx.config.limits.interruption_resumes {
+        return stuck(ctx, run, at, code, stop);
+    }
+    // A resume starts a session, which the approval must stand behind.
+    if seen.approved_at.is_none() {
+        let stop = Stop {
+            reason: CANNOT_CONFIRM.into(),
+            detail: Some(recorded_reason(&stop)),
+            ..Stop::default()
+        };
+        return stuck(ctx, run, at, "approval-unconfirmed", stop);
+    }
+    let branch = match choose_branch(ctx, seen)? {
+        Branch::Use(branch) => branch,
+        Branch::Refused => {
+            let stop = Stop {
+                reason: LAUNCH_FAILED.into(),
+                detail: Some(BRANCH_REFUSED.into()),
+                ..Stop::default()
+            };
+            return stuck(ctx, run, at, "launch-failed", stop);
+        }
+    };
+    let k = used + 1;
+    ctx.held()?;
+    ctx.record(
+        run,
+        Event::SessionInterrupted {
+            resumes: k,
+            relaunch: false,
+            run_ordinal: None,
+            branch,
+            t3_error: None,
+            ended_in_pass: 0,
+        },
+        &Cause::new(CauseStep::Advance, "session-interrupted"),
+    )?;
+    archive_old(ctx, run, old_workspace(seen)?, k, true)
+}
+
+/// The earlier workspace's archive: recorded (`record_step`, once), then asked for. A machine
+/// that cannot be reached is no error: it archives the workspace when it is heard from again
+/// ([`orphans`]). Any other failure is asked again next pass.
+fn archive_old(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    old: Option<WorkspaceId>,
+    k: u32,
+    record_step: bool,
+) -> Result<ResumeStep, RunError> {
+    if record_step {
+        let named = old.map_or_else(|| "none".to_owned(), |id| id.to_string());
+        note(
+            ctx,
+            run,
+            &format!("{ARCHIVING}{k} {named}"),
+            "resume-archiving",
+        )?;
+    }
+    if let Some(old) = old {
+        match ctx.archive(old) {
+            Ok(()) | Err(RunError::Worker(WorkerError::Unreachable(_))) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    note(
+        ctx,
+        run,
+        &format!("{ARCHIVE_ASKED}{k}"),
+        "resume-archive-asked",
+    )?;
+    Ok(ResumeStep::Archiving {
+        resumes: k,
+        workspace: old,
+    })
+}
+
+/// A resume owed, `k`-th: the archive, the wait for it, the machine, the workspace, its setup
+/// and the session, each from where the ledger shows it stopped.
+#[allow(clippy::too_many_arguments)]
+fn carry_on(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    events: &[RunEvent],
+    seen: &Seen,
+    at: &mut Progress,
+    k: u32,
+    branch: Option<&str>,
+    placed: Option<MachineId>,
+) -> Result<ResumeStep, RunError> {
+    let issue = run.issue();
+    let (closing, detail) = closed_issue(ctx, run, seen)?;
+    if let Some(step) = closing_step(ctx, run, seen, closing)? {
+        return Ok(step);
+    }
+    let round = read_round(events)
+        .filter(|round| round.k == k)
+        .ok_or_else(|| RunError::Invalid(format!("run {run} owes resume {k} with no decision")))?;
+    ensure_building(ctx, issue, at)?;
+    let Some(archiving) = &round.archiving else {
+        return archive_old(ctx, run, old_workspace(seen)?, k, true);
+    };
+    let old = match archiving.as_str() {
+        "none" => None,
+        text => Some(workspace_id(text)?),
+    };
+    if !round.archive_asked {
+        return archive_old(ctx, run, old, k, false);
+    }
+    // Once it shows archived, or its machine is gone for good.
+    if let Some(old) = old
+        && let Some(record) = find_workspace(ctx.view, ctx.project.id, run, old)
+        && !unreachable_long(ctx, record.owner)
+    {
+        return Ok(ResumeStep::Waiting(Wait::Archive));
+    }
+    let machine = match (round.machine, placed) {
+        (Some(machine), _) => machine,
+        (None, Some(machine)) => {
+            note(
+                ctx,
+                run,
+                &format!("{MACHINE}{k} {machine}"),
+                "resume-machine",
+            )?;
+            machine
+        }
+        (None, None) => return Ok(ResumeStep::NeedsMachine(Placing::Resume { resumes: k })),
+    };
+    let name = resume_name(run, k);
+    let named = ctx.view.workspaces_named(ctx.project.id, &name);
+    let record = match round.workspace {
+        Some(id) => match named.iter().find(|record| record.body.id == id) {
+            Some(record) => (*record).clone(),
+            // The worker answered, and the fleet does not show the record yet: wait.
+            None => return Ok(ResumeStep::Waiting(Wait::Workspace)),
+        },
+        None => {
+            if !round.requested {
+                note(
+                    ctx,
+                    run,
+                    &format!("{REQUESTED}{k} {name}"),
+                    "resume-requested",
+                )?;
+            }
+            // A record the fleet shows with its setup started is the first create's answer.
+            let id = match named
+                .iter()
+                .find(|record| record.owner == machine && record.body.setup.is_some())
+            {
+                Some(record) => record.body.id,
+                None => {
+                    let checkout = match branch {
+                        Some(branch) => Checkout::Branch {
+                            name: branch.to_owned(),
+                        },
+                        None => Checkout::NewBranch {
+                            base: run_base(ctx, seen),
+                            branch: Some(name.clone()),
+                        },
+                    };
+                    ctx.create(
+                        machine,
+                        CreateWorkspace {
+                            project: ctx.project.id,
+                            name: name.clone(),
+                            checkout,
+                            setup: Setup::Own,
+                            tag: FactoryTag {
+                                project: ctx.project.id,
+                                run: run.to_string(),
+                            },
+                        },
+                    )?
+                }
+            };
+            note(
+                ctx,
+                run,
+                &format!("{WORKSPACE}{k} {id}"),
+                "resume-workspace",
+            )?;
+            return Ok(ResumeStep::Waiting(Wait::Workspace));
+        }
+    };
+    let workspace = record.body.id;
+    at.worktree = Some(workspace.to_string());
+    if let Some(terminal) = record.body.setup {
+        match ctx.view.terminal(terminal) {
+            Some((TerminalState::Exited, Some(0))) => {}
+            Some((TerminalState::Exited, _)) => {
+                let stop = match ctx.tail(terminal) {
+                    Ok(tail) => Stop {
+                        reason: SETUP_FAILED.into(),
+                        session_text: Some(prepare_output_tail(&tail)),
+                        recorded_text: Some(text::sanitize(&tail, true)),
+                        ..Stop::default()
+                    },
+                    Err(RunError::Worker(WorkerError::Failed(_))) => Stop::new(SETUP_FAILED),
+                    Err(error) => return Err(error),
+                };
+                return stuck(ctx, run, at, "resume-setup-failed", stop);
+            }
+            _ => return Ok(ResumeStep::Waiting(Wait::Setup)),
+        }
+    }
+    let title = detail.map(|detail| detail.title);
+    let launched = Launched {
+        run,
+        seen,
+        record: &record,
+        machine,
+        branch,
+        title,
+        k,
+    };
+    // A factory session the fleet already shows in the workspace (one with a turn record) for a
+    // start that may have gone out: adopted, never started twice.
+    if let Some(found) = ctx.view.session_of(workspace)
+        && ctx.view.session_turn(found.body.id).is_some()
+    {
+        return launched.record(ctx, at, found.body.id);
+    }
+    let first = launch_message(ctx, run, seen, branch);
+    let start = FactoryStart {
+        project: ctx.project.id,
+        login: ctx.project.login.clone(),
+        model: model_of(ctx, seen),
+        effort: ctx.settings.fleet.effort.clone(),
+    };
+    ctx.held()?;
+    // A start that was sent and has no session recorded may have been taken whose answer was
+    // lost, and the worker's start is not idempotent: the workspace's sessions are ended,
+    // recorded before they are, and only then is it started again.
+    if round.sending {
+        note(
+            ctx,
+            run,
+            &format!("{ENDING_SESSIONS}{k}"),
+            "resume-ending-sessions",
+        )?;
+        ctx.end_sessions(workspace)?;
+    } else {
+        note(ctx, run, &format!("{SENDING}{k}"), "resume-sending")?;
+    }
+    match ctx.start_session(workspace, start, first) {
+        Ok(session) => launched.record(ctx, at, session),
+        // The worker refused: stuck, with the detail in the ledger only. A machine that cannot
+        // be reached is no refusal: the next pass starts again.
+        Err(RunError::Worker(WorkerError::Failed(what))) => {
+            let note = if round.sending {
+                messages::session_may_exist_note(&what, &format!("foundry:{run}:resume-{k}"))
+            } else {
+                what
+            };
+            let stop = Stop {
+                reason: LAUNCH_FAILED.into(),
+                detail: Some(note),
+                ..Stop::default()
+            };
+            stuck(ctx, run, at, "launch-failed", stop)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// The model a resumed session starts on: the one the run's launch decided, else the fleet's.
+fn model_of(ctx: &RunContext<'_>, seen: &Seen) -> String {
+    seen.launch_model
+        .clone()
+        .unwrap_or_else(|| ctx.settings.fleet.model.clone())
+}
+
+/// What a `session_launched` line of a resume is written from.
+struct Launched<'a> {
+    run: &'a RunId,
+    seen: &'a Seen,
+    record: &'a Record<Workspace>,
+    machine: MachineId,
+    branch: Option<&'a str>,
+    title: Option<String>,
+    k: u32,
+}
+
+impl Launched<'_> {
+    /// The `session_launched` line, then the status comment that names the machine and the
+    /// session.
+    fn record(
+        &self,
+        ctx: &RunContext<'_>,
+        at: &mut Progress,
+        session: SessionId,
+    ) -> Result<ResumeStep, RunError> {
+        let model = model_of(ctx, self.seen);
+        ctx.held()?;
+        ctx.record(
+            self.run,
+            Event::SessionLaunched {
+                thread_id: session.to_string(),
+                worktree: Some(self.record.body.id.to_string()),
+                branch: Some(
+                    self.branch
+                        .map_or_else(|| self.record.body.branch.clone(), str::to_owned),
+                ),
+                model_instance: None,
+                model: Some(model),
+                model_options: Some(vec![ModelOption {
+                    id: "effort".into(),
+                    value: OptionValue::Text(ctx.settings.fleet.effort.clone()),
+                }]),
+                resumed_from: self.branch.map(|branch| ResumedFrom {
+                    run: self.run.to_string(),
+                    branch: branch.to_owned(),
+                }),
+                base: Some(run_base(ctx, self.seen)),
+                title: self.title.clone(),
+            },
+            &Cause::new(
+                CauseStep::Advance,
+                if self.branch.is_some() {
+                    "resumed-from-branch"
+                } else {
+                    "session-launched"
+                },
+            ),
+        )?;
+        at.thread_id = Some(session.to_string());
+        ctx.upsert_status(
+            self.run.issue(),
+            &messages::status(
+                State::Building,
+                &self.machine.to_string(),
+                Some(&session.to_string()),
+                at.pr,
+            ),
+        )?;
+        Ok(ResumeStep::Started {
+            resumes: self.k,
+            session,
+        })
+    }
+}
+
+/// A session whose newest launch is a resume, idle with no prompt a pass later: the first
+/// message is asked for again by count, with the words the first had.
+fn resend(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    events: &[RunEvent],
+    seen: &Seen,
+) -> Result<ResumeStep, RunError> {
+    let Some(round) = read_round(events).filter(|round| round.launched) else {
+        return skipped(run, "has no resume to carry on");
+    };
+    let (Some(interruption), Some(thread)) = (&seen.interruption, &seen.thread_id) else {
+        return skipped(run, "has no resume to carry on");
+    };
+    if interruption.resumes != round.k {
+        return skipped(run, "has no resume to carry on");
+    }
+    let session = session_id(thread)?;
+    // The launch is the session's first prompt, so its count before the send is none. A session
+    // that is idle with no turn ended, or whose turn record shows no prompt, has not taken it.
+    let idle = ctx.view.session_state(session) == Some(SessionState::Idle);
+    let untouched = ctx
+        .view
+        .session_turn(session)
+        .is_none_or(|turn| turn.turn == 0 && turn.prompts == FIRST_PROMPT_COUNT);
+    if !(idle && untouched) {
+        return skipped(run, "has a session that took its first message");
+    }
+    let message = launch_message(ctx, run, seen, interruption.branch.as_deref());
+    note(
+        ctx,
+        run,
+        &format!("{RESENDING}{} {FIRST_PROMPT_COUNT}", round.k),
+        "resume-resend",
+    )?;
+    match ctx.send(session, message, Some(FIRST_PROMPT_COUNT)) {
+        Ok(_) => Ok(ResumeStep::Resent { session }),
+        // The worker decides: its count rose, so the message was typed; or the session is not
+        // idle yet, and the next pass looks again.
+        Err(RunError::Send(SendRefused::CountRose { .. } | SendRefused::NotIdle)) => {
+            skipped(run, "has a session that took its first message")
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// A claim whose named machine has been unreachable for 15 minutes with no workspace is launched
+/// on another machine and spends no resume. `start` carries on from the workspace by its id.
+fn moved_claim(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    events: &[RunEvent],
+    seen: &Seen,
+    placed: Option<MachineId>,
+) -> Result<ResumeStep, RunError> {
+    let issue = run.issue();
+    if seen.state != Some(State::Triage) {
+        return skipped(run, "is not claimed and waiting for its workspace");
+    }
+    // `start` decides first, and writes its decision before it asks.
+    let Some(name) = seen.workspace_requested.clone() else {
+        return skipped(run, "has no decision of start's to carry out");
+    };
+    if seen.workspace.is_some() {
+        return skipped(run, "has its build workspace");
+    }
+    let Some(claimed_on) = seen.machine.as_deref().and_then(parse_machine) else {
+        return skipped(run, "names no machine");
+    };
+    let target = match moved_to(events) {
+        Some(machine) => machine,
+        None => {
+            if !ctx.view.workspaces_named(ctx.project.id, &name).is_empty() {
+                return skipped(run, "has a build workspace");
+            }
+            if !unreachable_long(ctx, claimed_on) {
+                return skipped(run, "has a machine that is not unreachable for long");
+            }
+            let Some(machine) = placed else {
+                return Ok(ResumeStep::NeedsMachine(Placing::MovedClaim {
+                    unreachable: claimed_on,
+                }));
+            };
+            if machine == claimed_on {
+                return Err(RunError::Invalid(format!(
+                    "run {run} cannot move to the machine that is unreachable"
+                )));
+            }
+            let (closing, _) = closed_issue(ctx, run, seen)?;
+            if let Some(step) = closing_step(ctx, run, seen, closing)? {
+                return Ok(step);
+            }
+            ctx.held()?;
+            ctx.record_step(
+                run,
+                &format!("{CLAIM_MOVED}{machine}"),
+                &Cause::new(CauseStep::Start, "claim-moved"),
+            )?;
+            machine
+        }
+    };
+    ctx.upsert_status(
+        issue,
+        &messages::status(State::Triage, &target.to_string(), None, None),
+    )?;
+    let checkout = match &seen.launch_resumed_from {
+        Some(branch) => Checkout::Branch {
+            name: branch.clone(),
+        },
+        None => Checkout::NewBranch {
+            base: seen
+                .launch_base
+                .clone()
+                .unwrap_or_else(|| ctx.config.base.clone()),
+            branch: Some(name.clone()),
+        },
+    };
+    // A create whose answer is lost is asked again: the worker answers with the first by tag
+    // and name.
+    let workspace = ctx.create(
+        target,
+        CreateWorkspace {
+            project: ctx.project.id,
+            name,
+            checkout,
+            setup: Setup::Own,
+            tag: FactoryTag {
+                project: ctx.project.id,
+                run: run.to_string(),
+            },
+        },
+    )?;
+    ctx.held()?;
+    ctx.record_step(
+        run,
+        &format!("{WORKSPACE_CREATED}{workspace}"),
+        &Cause::new(CauseStep::Start, "workspace-created"),
+    )?;
+    Ok(ResumeStep::Moved {
+        machine: target,
+        workspace,
+    })
 }
 
 #[cfg(test)]
@@ -936,8 +2201,7 @@ mod tests {
             let launched = rig
                 .events(&run)
                 .into_iter()
-                .filter(|e| e.event == "session_launched")
-                .next_back()
+                .rfind(|e| e.event == "session_launched")
                 .unwrap();
             assert_eq!(launched.data["resumed_from"]["branch"], BRANCH);
             assert_eq!(launched.data["resumed_from"]["run"], run.to_string());
@@ -1015,8 +2279,7 @@ mod tests {
             let launched = rig
                 .events(&run)
                 .into_iter()
-                .filter(|e| e.event == "session_launched")
-                .next_back()
+                .rfind(|e| e.event == "session_launched")
                 .unwrap();
             assert_eq!(launched.data["base"], "feature/x");
         }
@@ -1301,11 +2564,15 @@ mod tests {
                     },
                 );
                 rig.sim.set_pull(12, pr_on(head, false));
+                let step = pass(&rig, &run);
+                assert!(matches!(step, ResumeStep::Stuck { .. }), "{head} {step:?}");
                 assert!(
-                    matches!(pass(&rig, &run), ResumeStep::Stuck { .. }),
+                    rig.worker
+                        .calls()
+                        .iter()
+                        .all(|call| matches!(call, Call::EndSessions { .. })),
                     "{head}"
                 );
-                assert!(rig.worker.calls().is_empty(), "{head}");
             }
         }
 
@@ -1859,8 +3126,7 @@ mod tests {
             let launched = rig
                 .events(&run)
                 .into_iter()
-                .filter(|e| e.event == "session_launched")
-                .next_back()
+                .rfind(|e| e.event == "session_launched")
                 .unwrap();
             assert_eq!(launched.data["thread_id"], resumed_session().to_string());
             assert_eq!(launched.data["worktree"], fresh().to_string());
@@ -1870,7 +3136,8 @@ mod tests {
             let status = rig.sim.comments().pop().unwrap();
             assert!(status.contains("**Factory status:** building"), "{status}");
             assert!(status.contains(&m2().to_string()), "{status}");
-            assert!(status.contains(&resumed_session().to_string()), "{status}");
+            // A comment hides what looks like a token, so the id itself is not shown.
+            assert!(!status.contains("Session: none"), "{status}");
             // Once launched the interruption is sent: a later pass is skipped.
             rig.view = with_resume_workspace("fac/8-1-r1", None)
                 .session(session_record(
@@ -1971,7 +3238,7 @@ mod tests {
                 pass(&rig, &run),
                 ResumeStep::NeedsMachine(Placing::MovedClaim { unreachable: m1() })
             );
-            assert_eq!(event_count(&rig, &run), 6);
+            assert_eq!(event_count(&rig, &run), 5);
             rig.worker.on_create(Ok(fresh()));
             assert_eq!(
                 placed_on(&rig, &run, m2()),
