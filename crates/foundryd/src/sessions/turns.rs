@@ -7,17 +7,20 @@
 //! it `want`s in memory, and the counts its record holds as `stored`; both are read from the
 //! store when the daemon has not seen the session since it started.
 //!
-//! A hook is applied in two steps. [`Inner::prepare`] does what must happen once, writes the
-//! file and changes `want`, and a failure of it changes nothing, so it can be run again.
-//! [`Inner::flush`] can run any number of times: it applies the state and writes the record
-//! when `want` differs from `stored`. The sweeper flushes a session whose record is still
-//! behind, so a record that failed past the hook's retries is stored later.
+//! A hook is applied in steps. [`Inner::prepare`] does what must happen once: it writes the
+//! file, then a small `counts` file holding the counts the session wants, then changes `want`
+//! in memory. A failure of it changes nothing in memory, so it can be run again. The hook then
+//! applies the state, and [`Inner::flush`], which can run any number of times, writes the
+//! record when `want` differs from `stored`. The sweeper flushes a session whose record is
+//! still behind, live or ended, so a record that failed past the hook's retries is stored
+//! later. The `counts` file keeps what is wanted across a restart: a daemon that takes the
+//! session up reads it back and the sweeper flushes it.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use foundry_proto::factory::{FactoryBody, FactoryRecord, SessionTurn};
-use foundry_proto::ids::{ProjectId, SessionId};
+use foundry_proto::ids::{ProjectId, SessionId, WorkspaceId};
 use foundry_proto::record::Session;
 use foundry_proto::state::SessionState;
 
@@ -31,6 +34,9 @@ const TURNS: &str = "turns";
 
 /// The file in a session's folder that holds the newest question.
 const QUESTION: &str = "question.txt";
+
+/// The file in a session's folder that holds the counts it wants.
+const COUNTS: &str = "counts";
 
 /// What replaces a secret in what is kept on disk.
 const HIDDEN: &str = "***";
@@ -80,6 +86,35 @@ impl Counts {
             ..self
         }
     }
+
+    /// The counts as the `counts` file holds them: turn, prompts and 0 or 1, in one line.
+    pub fn to_text(self) -> String {
+        format!("{} {} {}", self.turn, self.prompts, u8::from(self.question))
+    }
+
+    /// The counts a `counts` file holds, or `None` for anything else.
+    pub fn parse(text: &str) -> Option<Counts> {
+        let mut words = text.split_whitespace();
+        let (turn, prompts, question) = (words.next()?, words.next()?, words.next()?);
+        if words.next().is_some() {
+            return None;
+        }
+        Some(Counts {
+            turn: turn.parse().ok()?,
+            prompts: prompts.parse().ok()?,
+            question: match question {
+                "0" => false,
+                "1" => true,
+                _ => return None,
+            },
+        })
+    }
+
+    /// Whether these counts, from the `counts` file, are newer than `stored`, those of the
+    /// record: they differ and neither number is behind.
+    pub fn is_ahead_of(self, stored: Counts) -> bool {
+        self != stored && self.turn >= stored.turn && self.prompts >= stored.prompts
+    }
 }
 
 /// What a session's record holds, and what it should hold once its hooks are flushed.
@@ -94,6 +129,11 @@ pub(super) struct Tally {
 /// The file that holds turn `turn`'s message, in the session's `folder`.
 pub(super) fn turn_file(folder: &Path, turn: u64) -> PathBuf {
     folder.join(TURNS).join(format!("{turn}.txt"))
+}
+
+/// The file that holds the counts the session wants, in the session's `folder`.
+pub(super) fn counts_file(folder: &Path) -> PathBuf {
+    folder.join(COUNTS)
 }
 
 /// The file that holds the newest question, in the session's `folder`.
@@ -146,6 +186,23 @@ impl Hider {
     pub fn also(mut self, secret: String) -> Self {
         self.memory.push(secret);
         self
+    }
+
+    /// `text`, a message's body, hidden. A body is input the caller expects delivered, so
+    /// unlike [`Hider::hide`] this never gives the placeholder: with no secret store, or one
+    /// that cannot be read, it is an error and nothing is to be written.
+    pub fn hide_body(&self, text: &str) -> Result<String, SessionError> {
+        let Some(secrets) = &self.secrets else {
+            return Err(SessionError::SecretsUnreadable);
+        };
+        secrets
+            .entries()
+            .map_err(|_| SessionError::SecretsUnreadable)?;
+        let hidden = self.hide(text);
+        if hidden == crate::secrets::HIDDEN_UNREADABLE && text != hidden {
+            return Err(SessionError::SecretsUnreadable);
+        }
+        Ok(hidden)
     }
 
     /// `text` as it is kept on disk. With no secret store, none of it is kept.
@@ -237,10 +294,11 @@ impl Inner {
             Hook::Stop => {
                 let next = self.tally(id).await?.want.after_stop();
                 self.write_file(turn_file(&folder, next.turn), text).await?;
-                self.change(id, |want| *want = want.after_stop());
+                self.save_counts(&folder, next).await?;
+                self.change(id, |want| *want = next);
             }
             Hook::UserPromptSubmit => {
-                self.tally(id).await?;
+                let next = self.tally(id).await?.want.after_prompt();
                 let question = question_file(&folder);
                 blocking(move || match std::fs::remove_file(&question) {
                     Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
@@ -251,21 +309,29 @@ impl Inner {
                     what: "the question file: remove it".into(),
                     source,
                 })?;
-                self.change(id, |want| *want = want.after_prompt());
+                self.save_counts(&folder, next).await?;
+                self.change(id, |want| *want = next);
             }
             Hook::Notification => {
                 // Claude Code also notifies after a minute idle: that asks nothing.
                 let asks = body.state != SessionState::WaitingForYou
                     && next_state(body.state, Event::Hook(hook)) == SessionState::WaitingForYou;
                 if asks {
-                    self.tally(id).await?;
+                    let next = self.tally(id).await?.want.after_question();
                     self.write_file(question_file(&folder), text).await?;
-                    self.change(id, |want| *want = want.after_question());
+                    self.save_counts(&folder, next).await?;
+                    self.change(id, |want| *want = next);
                 }
             }
             _ => {}
         }
         Ok(())
+    }
+
+    /// Writes `counts` to the session's `counts` file, whole or not at all.
+    async fn save_counts(&self, folder: &Path, counts: Counts) -> Result<(), SessionError> {
+        let file = counts_file(folder);
+        blocking(move || write_text(&file, &counts.to_text())).await?
     }
 
     /// Changes the counts the session wants. Its tally is in memory: `prepare` loaded it.
@@ -275,8 +341,8 @@ impl Inner {
         }
     }
 
-    /// The session's tally: kept in memory, or else read from the record in the store, or else
-    /// zeros.
+    /// The session's tally: kept in memory, or else what the store holds as `stored` and what
+    /// is wanted as the `counts` file holds it when that is ahead of the record, or else zeros.
     pub(super) async fn tally(&self, session: SessionId) -> Result<Tally, SessionError> {
         if let Some(tally) = lock(&self.factory).counts.get(&session) {
             return Ok(*tally);
@@ -289,11 +355,36 @@ impl Inner {
             prompts: turn.prompts,
             question: turn.question,
         });
+        let file = counts_file(&factory::folder(&self.dir, session));
+        let wanted = blocking(move || std::fs::read_to_string(file).ok())
+            .await?
+            .and_then(|text| Counts::parse(&text))
+            .filter(|counts| counts.is_ahead_of(stored));
         let tally = Tally {
-            want: stored,
+            want: wanted.unwrap_or(stored),
             stored,
         };
         Ok(*lock(&self.factory).counts.entry(session).or_insert(tally))
+    }
+
+    /// Takes up the tally of each factory session this daemon found marks for whose `counts`
+    /// file is ahead of its record, so the sweeper writes the record without waiting for a
+    /// hook. A session whose tally cannot be read is tried again when a hook comes.
+    pub(super) async fn load_behind(&self) {
+        let sessions: Vec<SessionId> = lock(&self.factory).marks.keys().copied().collect();
+        let mut failed = None;
+        for session in sessions {
+            let file = counts_file(&factory::folder(&self.dir, session));
+            if !blocking(move || file.is_file()).await.unwrap_or(false) {
+                continue;
+            }
+            if let Err(error) = self.tally(session).await {
+                failed = Some(error);
+            }
+        }
+        if let Some(error) = failed {
+            tracing::warn!(%error, "a factory session's counts were not read; they are read at its next hook");
+        }
     }
 
     /// Writes the session's record when the counts it wants are not the ones it holds, and
@@ -304,7 +395,18 @@ impl Inner {
         session: &Session,
         project: ProjectId,
     ) -> Result<(), SessionError> {
-        let tally = self.tally(session.id).await?;
+        self.flush_for(session.id, session.workspace, project).await
+    }
+
+    /// [`Inner::flush`] for a session that need not be live: with its id, workspace and
+    /// project from the factory state.
+    pub(super) async fn flush_for(
+        &self,
+        session: SessionId,
+        workspace: WorkspaceId,
+        project: ProjectId,
+    ) -> Result<(), SessionError> {
+        let tally = self.tally(session).await?;
         if tally.want == tally.stored {
             return Ok(());
         }
@@ -315,8 +417,8 @@ impl Inner {
         let me = self.me;
         let want = tally.want;
         let turn = SessionTurn {
-            session: session.id,
-            workspace: session.workspace,
+            session,
+            workspace,
             project,
             turn: want.turn,
             prompts: want.prompts,
@@ -332,7 +434,7 @@ impl Inner {
             Ok(())
         })
         .await?;
-        if let Some(tally) = lock(&self.factory).counts.get_mut(&session.id) {
+        if let Some(tally) = lock(&self.factory).counts.get_mut(&session) {
             tally.stored = want;
         }
         Ok(())

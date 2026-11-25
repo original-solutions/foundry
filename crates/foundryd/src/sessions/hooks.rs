@@ -9,7 +9,7 @@ use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{HeaderMap, StatusCode, header::AUTHORIZATION};
 use foundry_proto::ids::SessionId;
 
-use super::state::Hook;
+use super::state::{Event, Hook};
 use super::{Backoff, Inner, Live, lock};
 
 /// How long a hook whose record cannot be written is tried again for, with a growing wait. No
@@ -96,8 +96,14 @@ async fn apply(inner: &Inner, live: &Arc<Live>, hook: Hook, text: &str) -> Statu
     let give_up_at = tokio::time::Instant::now() + KEEP_TRYING_FOR;
     let mut backoff = Backoff::new();
     let mut prepared = false;
+    let factory = lock(&inner.factory).marks.contains_key(&live.id);
     loop {
-        let error = match inner.hook_step(live, hook, text, &mut prepared).await {
+        let tried = if factory {
+            inner.hook_step(live, hook, text, &mut prepared).await
+        } else {
+            inner.event(live, Event::Hook(hook)).await
+        };
+        let error = match tried {
             Ok(_) => return StatusCode::NO_CONTENT,
             Err(error) => error,
         };

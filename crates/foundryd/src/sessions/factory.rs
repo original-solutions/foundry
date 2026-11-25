@@ -44,8 +44,9 @@ const MESSAGES: &str = "messages";
 
 /// What a caller of [`Sessions::send_factory`] or [`Sessions::start_factory`] gives as the
 /// `body_path` of a `messages` builder. The worker replaces every one in the line with the
-/// absolute path of the file it wrote the body to. A line with none is typed as it is, and a
-/// message with no body writes no file.
+/// absolute path of the file it wrote the body to. A message with a body whose line has none is
+/// refused, since nothing would name the file. A message with no body writes no file, and its
+/// line is typed as it is.
 pub const BODY_PATH: &str = "{body}";
 
 /// How often the sweeper looks for factory sessions whose workspace was archived.
@@ -125,7 +126,7 @@ pub(super) fn write_files(
 ) -> Result<Option<PathBuf>, SessionError> {
     claude::write_new_private(&folder.join(MARK), project.to_string().as_bytes())?;
     claude::write_new_private(&folder.join(WORKSPACE), workspace.to_string().as_bytes())?;
-    body.map(|body| write_body(folder, &hider.hide(body)))
+    body.map(|body| write_body(folder, &hider.hide_body(body)?))
         .transpose()
 }
 
@@ -137,6 +138,14 @@ fn write_body(folder: &Path, body: &str) -> Result<PathBuf, SessionError> {
         .join(format!("{}.md", uuid::Uuid::new_v4()));
     claude::write_new_private(&path, body.as_bytes())?;
     Ok(path)
+}
+
+/// Refuses a message with a body whose line has no [`BODY_PATH`], which nothing would name.
+fn check_body(message: &Message) -> Result<(), SessionError> {
+    if message.body.is_some() && !message.line.contains(BODY_PATH) {
+        return Err(SessionError::BodyWithoutPath);
+    }
+    Ok(())
 }
 
 /// `line` with every [`BODY_PATH`] replaced by `path`.
@@ -652,9 +661,7 @@ impl Sessions {
         start: FactoryStart,
         first: Message,
     ) -> Result<SessionId, SessionError> {
-        if first.body.is_some() && !first.line.contains(BODY_PATH) {
-            return Err(SessionError::BodyWithoutPath);
-        }
+        check_body(&first)?;
         // Before anything is read or written: an `end_factory` from here on beats this start.
         let generation = lock(&self.inner.factory)
             .ended
@@ -801,9 +808,7 @@ impl Inner {
         only_if_prompts: Option<u64>,
     ) -> Result<u64, SendRefused> {
         let failed = |error: SessionError| SendRefused::Failed(error.to_string());
-        if message.body.is_some() && !message.line.contains(BODY_PATH) {
-            return Err(SendRefused::Failed("the line names no body file".into()));
-        }
+        check_body(&message).map_err(failed)?;
         let marked = lock(&self.factory).marks.contains_key(&session);
         let live = self.live(session).filter(|_| marked);
         let Some(live) = live else {
@@ -826,7 +831,7 @@ impl Inner {
         let written = match message.body {
             Some(text) => {
                 let hider = self.hider();
-                let path = blocking(move || write_body(&folder, &hider.hide(&text)))
+                let path = blocking(move || write_body(&folder, &hider.hide_body(&text)?))
                     .await
                     .and_then(|r| r)
                     .map_err(failed)?;
@@ -860,12 +865,13 @@ impl Inner {
         }
     }
 
-    /// One look of the sweeper, which `cursor` keeps between looks. It reads the workspace
-    /// records this machine wrote since `cursor`, and remembers the archived ones that hold a
-    /// factory session. Of those it removes the folder of each session that has ended. Then it
-    /// writes the record of each live session whose record is behind. A step that fails is
-    /// logged once and tried again at the next look.
-    async fn sweep_once(&self, cursor: &mut u64) {
+    /// One look of the sweeper, which `cursor` keeps between looks and `warned` keeps what it
+    /// has warned of. It reads the workspace records this machine wrote since `cursor`, and
+    /// remembers the archived ones that hold a factory session. It writes the record of each
+    /// session whose record is behind, live or ended. Then it removes the folder of each ended
+    /// session whose workspace was archived. A step that fails is tried again at the next look,
+    /// and is logged only the first time in a row.
+    async fn sweep_once(&self, cursor: &mut u64, warned: &mut Warned) {
         let (me, from) = (self.me, *cursor);
         let read = self
             .on_store(move |store| {
@@ -884,6 +890,7 @@ impl Inner {
             .await;
         match read {
             Ok((newest, archived)) => {
+                warned.read = false;
                 *cursor = newest;
                 let mut state = lock(&self.factory);
                 let known: HashSet<WorkspaceId> = state.workspaces.values().copied().collect();
@@ -892,22 +899,31 @@ impl Inner {
                     .extend(archived.into_iter().filter(|id| known.contains(id)));
             }
             Err(error) => {
-                tracing::warn!(%error, "the workspace records were not read; trying again");
+                if !std::mem::replace(&mut warned.read, true) {
+                    tracing::warn!(%error, "the workspace records were not read; trying again");
+                }
             }
         }
-        self.sweep_ended().await;
-        self.flush_behind().await;
+        self.flush_behind(warned).await;
+        self.sweep_ended(warned).await;
     }
 
-    /// Removes the folder of each factory session that is not live and whose workspace was
-    /// archived, and forgets the session's workspace and counts. The mark stays.
-    async fn sweep_ended(&self) {
+    /// Removes the folder of each factory session that is not live, whose workspace was
+    /// archived and whose record is not behind, and forgets the session's workspace and
+    /// counts. The mark stays.
+    async fn sweep_ended(&self, warned: &mut Warned) {
         let ended: Vec<(SessionId, WorkspaceId)> = {
             let state = lock(&self.factory);
             state
                 .workspaces
                 .iter()
                 .filter(|(id, ws)| state.archived.contains(ws) && self.live(**id).is_none())
+                .filter(|(id, _)| {
+                    state
+                        .counts
+                        .get(id)
+                        .is_none_or(|tally| tally.want == tally.stored)
+                })
                 .map(|(id, ws)| (*id, *ws))
                 .collect()
         };
@@ -932,38 +948,50 @@ impl Inner {
                 Err(error) => failed = Some((session, error.to_string())),
             }
         }
-        if let Some((session, error)) = failed {
-            tracing::warn!(session = %session, %error, "a folder of an archived workspace's session was not removed; trying again");
+        match failed {
+            Some((session, error)) => {
+                if !std::mem::replace(&mut warned.remove, true) {
+                    tracing::warn!(session = %session, %error, "a folder of an archived workspace's session was not removed; trying again");
+                }
+            }
+            None => warned.remove = false,
         }
     }
 
-    /// Writes the `session_turn` record of each live factory session whose record is behind
-    /// what its hooks counted, as a hook that gave up left it.
-    async fn flush_behind(&self) {
-        let behind: Vec<(SessionId, ProjectId)> = {
+    /// Writes the `session_turn` record of each factory session whose record is behind what
+    /// its hooks counted, as a hook that gave up left it. A live session is flushed under its
+    /// lock; an ended one needs none, and its workspace and project come from the factory
+    /// state.
+    async fn flush_behind(&self, warned: &mut Warned) {
+        let behind: Vec<(SessionId, WorkspaceId, ProjectId)> = {
             let state = lock(&self.factory);
             state
                 .counts
                 .iter()
                 .filter(|(_, tally)| tally.want != tally.stored)
-                .filter_map(|(id, _)| Some((*id, *state.marks.get(id)?)))
+                .filter_map(|(id, _)| {
+                    Some((*id, *state.workspaces.get(id)?, *state.marks.get(id)?))
+                })
                 .collect()
         };
         let mut failed = None;
-        for (session, project) in behind {
-            let Some(live) = self.live(session) else {
-                continue;
+        for (session, workspace, project) in behind {
+            let live = self.live(session);
+            let _held = match &live {
+                Some(live) => Some(live.body.lock().await),
+                None => None,
             };
-            let body = live.body.lock().await;
-            if !self.is_live(&live) {
-                continue;
-            }
-            if let Err(error) = self.flush(&body, project).await {
+            if let Err(error) = self.flush_for(session, workspace, project).await {
                 failed = Some((session, error));
             }
         }
-        if let Some((session, error)) = failed {
-            tracing::warn!(session = %session, %error, "a session's turn record was not written; trying again");
+        match failed {
+            Some((session, error)) => {
+                if !std::mem::replace(&mut warned.flush, true) {
+                    tracing::warn!(session = %session, %error, "a session's turn record was not written; trying again");
+                }
+            }
+            None => warned.flush = false,
         }
     }
 
@@ -1036,10 +1064,20 @@ impl Inner {
 async fn sweep(inner: Arc<Inner>) {
     // From version 0, so a workspace archived before this daemon started is found too.
     let mut cursor = 0;
+    let mut warned = Warned::default();
     loop {
         tokio::time::sleep(SWEEP_EVERY).await;
-        inner.sweep_once(&mut cursor).await;
+        inner.sweep_once(&mut cursor, &mut warned).await;
     }
+}
+
+/// Which steps of the sweeper failed at the look before, so each failure in a row is logged
+/// once.
+#[derive(Default)]
+struct Warned {
+    read: bool,
+    remove: bool,
+    flush: bool,
 }
 
 #[cfg(test)]
@@ -2545,7 +2583,9 @@ exec "$agent" "$@""#;
 
         assert_eq!(
             sent,
-            Err(SendRefused::Failed("the line names no body file".into()))
+            Err(SendRefused::Failed(
+                SessionError::BodyWithoutPath.to_string()
+            ))
         );
         assert!(
             !f.sessions_dir()
@@ -2595,13 +2635,13 @@ exec "$agent" "$@""#;
         f.type_keys(id, claude::typed_prompt("/factory-build x"))
             .await;
 
-        let seen = f.shown(id, |t| t.contains("MATCHED\n")).await;
+        let seen = f.shown(id, |t| !all_values(t, "MATCHED").is_empty()).await;
         assert_eq!(
             all_values(&seen, "LINE="),
             ["\"something else\"", "\"/factory-build x\""]
         );
         let second = seen.find("LINE=\"/factory-build x\"").unwrap();
-        assert!(seen.find("MATCHED\n").unwrap() > second, "{seen}");
+        assert!(seen.find("MATCHED").unwrap() > second, "{seen}");
     }
 
     #[tokio::test]
@@ -2652,6 +2692,11 @@ exec "$agent" "$@""#;
             .unwrap();
 
         until("turn 2 on disk", || f.turn_file(id, 2).exists()).await;
+        // The state is written before the record is tried, so the new daemon reads it.
+        until("the session to be idle", || {
+            f.state(id) == Some(SessionState::Idle)
+        })
+        .await;
         assert_eq!(f.turn_of(id).unwrap().turn, 1);
 
         f.restart().await;

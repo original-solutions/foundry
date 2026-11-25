@@ -119,6 +119,10 @@ pub enum SessionError {
         factory::BODY_PATH
     )]
     BodyWithoutPath,
+    #[error(
+        "sessions: a message body was not written: the secret store cannot be read, so its secrets cannot be hidden"
+    )]
+    SecretsUnreadable,
     #[error("sessions: the workspace's factory sessions were ended while this one was starting")]
     Ended,
     #[error(transparent)]
@@ -222,7 +226,7 @@ struct Live {
     started: watch::Sender<Option<Instant>>,
     /// Whether the first prompt still waits to be typed. The follower clears it when it types
     /// the keys or gives up, and until then no message is typed after it.
-    first_pending: AtomicBool,
+    first_pending: Arc<AtomicBool>,
     /// What the session is for and doing, from its hooks' payloads.
     brief: Mutex<brief::Brief>,
     tasks: Mutex<Vec<AbortHandle>>,
@@ -451,7 +455,7 @@ impl Inner {
             }),
             activity,
             started: watch::Sender::new(None),
-            first_pending: AtomicBool::new(prompt.is_some()),
+            first_pending: Arc::new(AtomicBool::new(prompt.is_some())),
             brief: Mutex::default(),
             tasks: Mutex::default(),
         });
@@ -507,7 +511,8 @@ impl Inner {
         }
         drop(body);
 
-        self.run(&live, terminal, floor, FirstPrompt::new(prompt.as_deref()));
+        let first = FirstPrompt::new(prompt.as_deref()).tied_to(live.first_pending.clone());
+        self.run(&live, terminal, floor, first);
         tracing::info!(session = %id, workspace = %workspace, model, "session started");
         Ok(id)
     }
@@ -559,6 +564,8 @@ impl Inner {
                 None => self.take_up(session, cursor).await,
             }
         }
+        // A tally a daemon before this one left ahead of its record is written by the sweeper.
+        self.load_behind().await;
     }
 
     /// This machine's sessions that are not deleted, have not failed and, when finished, still
@@ -669,7 +676,7 @@ impl Inner {
             body: tokio::sync::Mutex::new(session),
             activity: watch::Sender::new(Instant::now()),
             started: watch::Sender::new(None),
-            first_pending: AtomicBool::new(false),
+            first_pending: Arc::new(AtomicBool::new(false)),
             brief: Mutex::default(),
             tasks: Mutex::default(),
         });
@@ -890,7 +897,7 @@ async fn follow(
                     let at = *started.borrow_and_update();
                     if let Some(keys) = first.ready(at, Instant::now()) {
                         type_first(&inner, terminal, keys).await;
-                        live.first_pending.store(false, Ordering::Release);
+                        first.typed();
                     }
                     let grace = first.grace_ends(at);
                     let next = tokio::select! {
@@ -910,10 +917,7 @@ async fn follow(
                         }
                         // The child exited.
                         None => {
-                            {
-                                first.give_up(terminal);
-                                live.first_pending.store(false, Ordering::Release);
-                            }
+                            first.give_up(terminal);
                             return exited(&inner, &live, terminal, &mut cursor).await;
                         }
                         Some(Err(error)) => {
@@ -925,10 +929,7 @@ async fn follow(
             }
             Err(error) => {
                 if matches!(error, TerminalError::Gone(_) | TerminalError::Unknown(_)) {
-                    {
-                        first.give_up(terminal);
-                        live.first_pending.store(false, Ordering::Release);
-                    }
+                    first.give_up(terminal);
                     return exited(&inner, &live, terminal, &mut cursor).await;
                 }
                 retry(&mut backoff, terminal, error).await;
@@ -957,6 +958,9 @@ struct FirstPrompt {
     sign: Sign,
     /// The end of the output read since the follower attached, for a sign cut between reads.
     tail: Vec<u8>,
+    /// The session's "first prompt still waits" flag, cleared when the keys are typed, when the
+    /// prompt is given up and when this is dropped, so no way out of the follower leaves it set.
+    pending: Option<Arc<AtomicBool>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -972,6 +976,24 @@ impl FirstPrompt {
             keys: prompt.map(|p| Bytes::from(claude::typed_prompt(p))),
             sign: Sign::None,
             tail: Vec::new(),
+            pending: None,
+        }
+    }
+
+    /// Ties this prompt to `pending`, the flag a message to the session waits on.
+    fn tied_to(mut self, pending: Arc<AtomicBool>) -> Self {
+        self.pending = Some(pending);
+        self
+    }
+
+    /// The keys were typed: nothing waits any more.
+    fn typed(&self) {
+        self.clear_pending();
+    }
+
+    fn clear_pending(&self) {
+        if let Some(pending) = &self.pending {
+            pending.store(false, Ordering::Release);
         }
     }
 
@@ -1022,12 +1044,20 @@ impl FirstPrompt {
 
     /// The child is gone: says so when its first prompt was never typed.
     fn give_up(&self, terminal: TerminalId) {
+        self.clear_pending();
         if self.waiting() {
             tracing::warn!(
                 terminal = %terminal,
                 "the first prompt was not typed: Claude Code ended before it took input"
             );
         }
+    }
+}
+
+impl Drop for FirstPrompt {
+    /// The follower ended, however it did, an abort included.
+    fn drop(&mut self) {
+        self.clear_pending();
     }
 }
 
