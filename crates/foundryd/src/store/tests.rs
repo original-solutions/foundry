@@ -1219,12 +1219,18 @@ fn each_session_read_searches_an_index_and_reads_no_other_session() {
         );
         store.apply(&AnyRecord::Session(record), owner).unwrap();
     }
+    assert_each_session_read_searches_its_index(&store);
+}
+
+/// SQLite answers each session read by searching `records` through the index named, and never
+/// scans it or sorts in a temporary tree.
+fn assert_each_session_read_searches_its_index(store: &Store) {
     for (sql, index) in [
         (SESSION_BY_ID, "sqlite_autoindex_records_1"),
         (SESSION_ON_TERMINAL, "records_session_by_terminal"),
         (SESSION_IN_WORKSPACE, "records_session_by_workspace"),
     ] {
-        let steps = plan(&store, sql);
+        let steps = plan(store, sql);
         assert!(
             steps
                 .iter()
@@ -1237,6 +1243,78 @@ fn each_session_read_searches_an_index_and_reads_no_other_session() {
             assert!(!step.contains("TEMP B-TREE"), "{sql}: {steps:?}");
         }
     }
+}
+
+/// A file at step 2 that already holds session rows (this machine's, a peer's, a deleted one
+/// and one this build cannot read) opens at the current schema. Step 3 indexes the rows it
+/// finds, so each session read finds every row written before it through its index, leaves
+/// out the unreadable one, and finds a session written after it too.
+#[test]
+fn step_3_indexes_the_session_rows_a_step_2_file_already_holds() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("foundry.db");
+    let (me, peer) = (MachineId::random(), MachineId::random());
+    let mine = session_at(me, 1, 50, 60, 70);
+    let theirs = session_at(peer, 4, 51, 61, 71);
+    let mut gone = session_at(me, 2, 52, 62, 72);
+    gone.deleted = true;
+    let (unreadable, its_workspace, its_terminal) = (
+        uuid::Uuid::from_u128(53),
+        uuid::Uuid::from_u128(63),
+        uuid::Uuid::from_u128(73),
+    );
+    {
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        migrate(&mut conn, 2).unwrap();
+        let tx = conn.transaction().unwrap();
+        for (record, owner) in [(&mine, me), (&theirs, peer), (&gone, me)] {
+            let applied = apply_in_tx(&tx, &AnyRecord::Session(record.clone()), owner).unwrap();
+            assert_eq!(applied, Applied::Stored);
+        }
+        tx.execute(
+            "INSERT INTO records (kind, id, owner, version, record) VALUES ('session', ?1, ?2, 3, ?3)",
+            params![
+                unreadable.to_string(),
+                me.to_string(),
+                format!(
+                    r#"{{"kind":"session","owner":"{me}","version":3,"deleted":false,"body":{{"id":"{unreadable}","workspace":"{its_workspace}","terminal":"{its_terminal}","model":"m","state":"from-a-newer-build"}}}}"#
+                )
+            ],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        assert_eq!(user_version(&conn).unwrap(), 2);
+    }
+
+    let mut store = Store::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), MIGRATIONS.len());
+    assert_each_session_read_searches_its_index(&store);
+    for record in [&mine, &theirs, &gone] {
+        assert_eq!(
+            store.session(record.body.id).unwrap().as_ref(),
+            Some(record)
+        );
+        assert_eq!(
+            store.session_on(record.body.terminal).unwrap().as_ref(),
+            Some(record)
+        );
+        assert_eq!(
+            store.session_in(record.body.workspace).unwrap().as_ref(),
+            Some(record)
+        );
+    }
+    assert_eq!(store.session(SessionId(unreadable)).unwrap(), None);
+    assert_eq!(store.session_on(TerminalId(its_terminal)).unwrap(), None);
+    assert_eq!(store.session_in(WorkspaceId(its_workspace)).unwrap(), None);
+
+    let later = session_at(me, 5, 54, 64, 74);
+    store.apply(&AnyRecord::Session(later.clone()), me).unwrap();
+    assert_eq!(store.session(later.body.id).unwrap().as_ref(), Some(&later));
+    assert_eq!(
+        store.session_on(later.body.terminal).unwrap().as_ref(),
+        Some(&later)
+    );
+    assert_eq!(store.session_in(later.body.workspace).unwrap(), Some(later));
 }
 
 #[test]
