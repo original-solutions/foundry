@@ -739,8 +739,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use foundry_holder::protocol::Request;
+    use foundry_proto::factory::SessionTurn;
     use foundry_proto::ids::MachineId;
-    use foundry_proto::record::{AnyRecord, Record, Session};
+    use foundry_proto::record::{AnyRecord, Record, Session, Workspace};
     use foundry_proto::state::SessionState;
     use futures::StreamExt as _;
     use tempfile::TempDir;
@@ -905,6 +906,88 @@ exec "$agent" "$@""#;
             self.data.path().join("sessions")
         }
 
+        /// The daemon goes away and a new one takes the sessions up, serving the hooks on the
+        /// same port.
+        async fn restart(&mut self) {
+            self.restart_with(true).await;
+        }
+
+        /// [`Fx::restart`], with or without a secret store.
+        async fn restart_with(&mut self, with_secrets: bool) {
+            self.server.abort();
+            let _ = (&mut self.server).await;
+            let sessions = self.again(with_secrets);
+            drop(std::mem::replace(&mut self.sessions, sessions));
+            self.sessions.adopt().await;
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", self.config.hook_port))
+                .await
+                .unwrap();
+            let router = self.sessions.router();
+            self.server = tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    router.into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .await
+                .unwrap();
+            });
+        }
+
+        /// The session's `session_turn` record, as any reader sees it.
+        fn turn_of(&self, id: SessionId) -> Option<SessionTurn> {
+            self.store.lock().unwrap().session_turn(id).unwrap()
+        }
+
+        fn turn_file(&self, id: SessionId, turn: u64) -> PathBuf {
+            self.sessions_dir()
+                .join(id.to_string())
+                .join("turns")
+                .join(format!("{turn}.txt"))
+        }
+
+        /// Waits until the record shows `turn` and `prompts`.
+        async fn until_turn(&self, id: SessionId, turn: u64, prompts: u64) {
+            until(&format!("turn {turn} and {prompts} prompts"), || {
+                self.turn_of(id)
+                    .is_some_and(|t| t.turn == turn && t.prompts == prompts)
+            })
+            .await;
+        }
+
+        /// Types `keys` into the session's terminal, as a person at the keyboard would.
+        async fn type_keys(&self, id: SessionId, keys: Vec<u8>) {
+            self.terminals
+                .input(self.terminal_of(id), bytes::Bytes::from(keys))
+                .await
+                .unwrap();
+        }
+
+        fn message(line: &str) -> Message {
+            Message {
+                line: line.into(),
+                body: None,
+            }
+        }
+
+        /// That the file `line` names as its last word holds `body`, is private, and is in the
+        /// session's own folder, not in the worktree.
+        fn assert_body_file(&self, id: SessionId, line: &str, body: &str) {
+            let path = PathBuf::from(line.rsplit(' ').next().unwrap());
+            assert!(!line.contains(BODY_PATH), "{line}");
+            let folder = self.sessions_dir().join(id.to_string()).join("messages");
+            assert!(
+                path.starts_with(&folder),
+                "{} not in {}",
+                path.display(),
+                folder.display()
+            );
+            assert!(!path.starts_with(self.worktree.path()));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+            let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&path), 0o600);
+            assert_eq!(mode(&folder), 0o700);
+        }
+
         fn settings_file(&self, id: SessionId) -> PathBuf {
             self.sessions_dir().join(format!("{id}.json"))
         }
@@ -1062,6 +1145,15 @@ exec "$agent" "$@""#;
             .find_map(|l| l.trim_end().strip_prefix(name).map(str::to_owned))
     }
 
+    /// The values of every complete line that starts with `name`, in order.
+    fn all_values(text: &str, name: &str) -> Vec<String> {
+        let printed = text.rfind('\n').map_or("", |end| &text[..end]);
+        printed
+            .lines()
+            .filter_map(|l| l.trim_end().strip_prefix(name).map(str::to_owned))
+            .collect()
+    }
+
     const ENV_SCRIPT: &str = r"
 - print_env: GH_TOKEN
 - print_env: GIT_CONFIG_COUNT
@@ -1164,8 +1256,11 @@ exec "$agent" "$@""#;
             .start_factory(
                 WorkspaceId::random(),
                 f.worktree.path(),
-                f.start_for(project),
-                Message::new(FIRST_LINE.into(), "body".into()),
+                FactoryStart {
+                    login: "nobody".into(),
+                    ..f.start_for(project)
+                },
+                f.line(),
             )
             .await
             .unwrap_err();
@@ -1411,24 +1506,467 @@ exec "$agent" "$@""#;
         f.assert_nothing_left(&bare, project);
     }
 
-    #[tokio::test]
-    async fn a_first_message_with_a_body_is_refused_and_leaves_nothing() {
-        let f = Fx::new("- wait_input\n").await;
-        let project = ProjectId::random();
+    const IDLE: &str = "- hook: {event: SessionStart}\n";
 
-        let error = f
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_turn_file_is_on_disk_before_a_reader_sees_the_new_turn() {
+        let f = Fx::new(&format!(
+            "{IDLE}- wait_input\n- stop: {{last_assistant_message: \"all done\"}}\n- wait_input\n"
+        ))
+        .await;
+        let id = f
+            .start_factory(WorkspaceId::random(), ProjectId::random())
+            .await;
+        until("the session to be idle", || {
+            f.state(id) == Some(SessionState::Idle)
+        })
+        .await;
+        let terminal = f.terminal_of(id);
+        // Another thread holds the store: no record can be written while the Stop is applied,
+        // so a turn file that is there now was written first.
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn({
+            let store = f.store.clone();
+            move || {
+                let _held = crate::sessions::lock(&store);
+                held_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            }
+        });
+        held_rx.recv().unwrap();
+        f.terminals
+            .input(terminal, bytes::Bytes::from_static(b"\n"))
+            .await
+            .unwrap();
+        until("the turn file", || f.turn_file(id, 1).exists()).await;
+        assert_eq!(
+            std::fs::read_to_string(f.turn_file(id, 1)).unwrap(),
+            "all done"
+        );
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+
+        f.until_turn(id, 1, 0).await;
+        assert_eq!(
+            std::fs::read_to_string(f.turn_file(id, 1)).unwrap(),
+            "all done"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_final_message_of_8000_characters_is_kept_whole_and_a_github_token_in_it_is_hidden() {
+        let url = "https://github.com/acme/widgets/pull/123";
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let mut text = format!("FACTORY-DONE: {url} at {sha} with {TOKEN} ");
+        while text.len() < 8000 {
+            text.push_str("abcdefghi jklmno\npqrst ");
+        }
+        text.truncate(8000);
+        assert_eq!(text.chars().count(), 8000);
+        let script = format!(
+            "{IDLE}- stop: {{last_assistant_message: {}}}\n- wait_input\n",
+            serde_json::Value::from(text.as_str())
+        );
+        let f = Fx::new(&script).await;
+        let id = f
+            .start_factory(WorkspaceId::random(), ProjectId::random())
+            .await;
+
+        f.until_turn(id, 1, 0).await;
+
+        let kept = f.sessions.turn_text(id, 1).unwrap().message;
+        assert_eq!(kept, text.replace(TOKEN, "***"));
+        assert!(kept.contains(url) && kept.contains(sha) && !kept.contains(TOKEN));
+        let mode = std::fs::metadata(f.turn_file(id, 1))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[tokio::test]
+    async fn the_gateway_key_and_a_live_sessions_token_in_a_final_message_are_hidden() {
+        let f = Fx::new("- wait_input\n").await;
+        let other = f
+            .start_factory(WorkspaceId::random(), ProjectId::random())
+            .await;
+        let token = crate::sessions::lock(&f.sessions.inner.live)[&other]
+            .token
+            .clone();
+        let message = format!("key {} and token {token} end", f.config.gateway.key);
+        std::fs::write(
+            f.data.path().join("script.yaml"),
+            format!("{IDLE}- stop: {{last_assistant_message: \"{message}\"}}\n- wait_input\n"),
+        )
+        .unwrap();
+        let id = f
+            .start_factory(WorkspaceId::random(), ProjectId::random())
+            .await;
+
+        f.until_turn(id, 1, 0).await;
+
+        assert_eq!(
+            f.sessions.turn_text(id, 1).unwrap().message,
+            "key *** and token *** end"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_message_is_not_kept_when_there_is_no_secret_store() {
+        let mut f = Fx::new(&format!(
+            "{IDLE}- wait_input\n- stop: {{last_assistant_message: \"plain words\"}}\n- wait_input\n"
+        ))
+        .await;
+        let id = f
+            .start_factory(WorkspaceId::random(), ProjectId::random())
+            .await;
+        until("the session to be idle", || {
+            f.state(id) == Some(SessionState::Idle)
+        })
+        .await;
+        f.restart_with(false).await;
+
+        f.type_keys(id, b"\n".to_vec()).await;
+
+        f.until_turn(id, 1, 0).await;
+        assert_eq!(
+            f.sessions.turn_text(id, 1).unwrap().message,
+            crate::secrets::HIDDEN_UNREADABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stop_while_already_idle_still_raises_turn() {
+        let f = Fx::new(&format!(
+            "{IDLE}- stop: {{last_assistant_message: \"first message\"}}\n\
+             - stop: {{last_assistant_message: \"second message\"}}\n- wait_input\n"
+        ))
+        .await;
+        let id = f
+            .start_factory(WorkspaceId::random(), ProjectId::random())
+            .await;
+
+        f.until_turn(id, 2, 0).await;
+
+        assert_eq!(f.state(id), Some(SessionState::Idle));
+        let text = |n| f.sessions.turn_text(id, n);
+        assert_eq!(text(1).unwrap().message, "first message");
+        assert_eq!(text(2).unwrap().message, "second message");
+        assert_eq!(text(0).unwrap().message, "");
+        assert_eq!(text(3), None);
+        assert_eq!(f.sessions.turn_text(SessionId::random(), 1), None);
+    }
+
+    #[tokio::test]
+    async fn each_prompt_adds_one_to_prompts() {
+        let f = Fx::new(&format!(
+            "{IDLE}- wait_prompt\n- stop: {{last_assistant_message: \"one\"}}\n\
+             - wait_prompt\n- stop: {{last_assistant_message: \"two\"}}\n- wait_input\n"
+        ))
+        .await;
+        let id = f
+            .start_factory(WorkspaceId::random(), ProjectId::random())
+            .await;
+        f.until_turn(id, 1, 1).await;
+
+        let before = f
+            .sessions
+            .send_factory(id, Fx::message("go on"), None)
+            .await;
+
+        assert_eq!(before, Ok(1));
+        f.until_turn(id, 2, 2).await;
+        assert!(!f.turn_of(id).unwrap().question);
+    }
+
+    #[tokio::test]
+    async fn a_notification_writes_the_question_and_the_next_prompt_clears_it() {
+        let f = Fx::new(&format!(
+            "{IDLE}- wait_prompt\n- notify: \"May I delete the repo?\"\n- wait_prompt\n\
+             - stop: {{last_assistant_message: \"ok\"}}\n- notify: \"idle for a minute\"\n\
+             - stop: {{last_assistant_message: \"again\"}}\n- wait_input\n"
+        ))
+        .await;
+        let id = f
+            .start_factory(WorkspaceId::random(), ProjectId::random())
+            .await;
+
+        until("the question", || f.turn_of(id).is_some_and(|t| t.question)).await;
+        let asked = f.sessions.turn_text(id, 0).unwrap();
+        assert_eq!(asked.question.as_deref(), Some("May I delete the repo?"));
+        assert_eq!(f.state(id), Some(SessionState::WaitingForYou));
+        let question = f.sessions_dir().join(id.to_string()).join("question.txt");
+        let mode = std::fs::metadata(&question).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+
+        f.type_keys(id, claude::typed_prompt("yes, go ahead")).await;
+
+        // The notification after the first stop asks nothing: the session is idle.
+        f.until_turn(id, 2, 2).await;
+        let record = f.turn_of(id).unwrap();
+        assert!(!record.question);
+        assert_eq!(f.sessions.turn_text(id, 2).unwrap().question, None);
+        assert!(!question.exists());
+    }
+
+    #[tokio::test]
+    async fn send_factory_to_a_working_session_is_not_idle() {
+        let f = Fx::new(&format!("{IDLE}- wait_prompt\n- wait_input\n")).await;
+        let id = f
+            .start_factory(WorkspaceId::random(), ProjectId::random())
+            .await;
+        until("the prompt", || {
+            f.turn_of(id).is_some_and(|t| t.prompts == 1)
+        })
+        .await;
+        assert_eq!(f.state(id), Some(SessionState::Working));
+
+        let sent = f
+            .sessions
+            .send_factory(id, Message::new("never typed".into(), "body".into()), None)
+            .await;
+
+        assert_eq!(sent, Err(SendRefused::NotIdle));
+        let folder = f.sessions_dir().join(id.to_string());
+        assert!(!folder.join("messages").exists());
+    }
+
+    #[tokio::test]
+    async fn a_send_with_only_if_prompts_below_the_count_is_count_rose_and_types_nothing() {
+        let f = Fx::new(&format!(
+            "{IDLE}- wait_prompt\n- stop: {{last_assistant_message: \"a\"}}\n\
+             - wait_line: \"\"\n- wait_input\n"
+        ))
+        .await;
+        let id = f
+            .start_factory(WorkspaceId::random(), ProjectId::random())
+            .await;
+        f.until_turn(id, 1, 1).await;
+
+        let refused = f
+            .sessions
+            .send_factory(
+                id,
+                Message::new("refused-line {body}".into(), "refused-body".into()),
+                Some(0),
+            )
+            .await;
+
+        assert_eq!(refused, Err(SendRefused::CountRose { now: 1 }));
+        assert!(
+            !f.sessions_dir()
+                .join(id.to_string())
+                .join("messages")
+                .exists()
+        );
+        // A probe goes through and is the only line the agent reads, so the refused one never
+        // reached the terminal, which echoes what is typed.
+        let sent = f
+            .sessions
+            .send_factory(id, Fx::message("probe"), Some(1))
+            .await;
+        assert_eq!(sent, Ok(1));
+        let seen = f.shown(id, |t| !all_values(t, "LINE=").is_empty()).await;
+        assert_eq!(all_values(&seen, "LINE="), ["\"probe\""]);
+        assert!(!seen.contains("refused"), "{seen}");
+    }
+
+    #[tokio::test]
+    async fn a_lost_line_sent_again_with_the_same_count_is_typed_once_more() {
+        let f = Fx::new(&format!(
+            "{IDLE}- wait_prompt\n- stop: {{last_assistant_message: \"a\"}}\n\
+             - wait_line: \"\"\n- wait_line: \"\"\n- wait_input\n"
+        ))
+        .await;
+        let id = f
+            .start_factory(WorkspaceId::random(), ProjectId::random())
+            .await;
+        f.until_turn(id, 1, 1).await;
+
+        let first = f.sessions.send_factory(id, Fx::message("lost"), None).await;
+        let count = first.unwrap();
+        let seen = f.shown(id, |t| all_values(t, "LINE=").len() == 1).await;
+        assert_eq!(all_values(&seen, "LINE="), ["\"lost\""]);
+        // The agent never reported a prompt: the session is idle and the count has not moved.
+        assert_eq!(f.state(id), Some(SessionState::Idle));
+        let again = f
+            .sessions
+            .send_factory(id, Fx::message("lost"), Some(count))
+            .await;
+
+        assert_eq!(again, Ok(count));
+        let seen = f.shown(id, |t| all_values(t, "LINE=").len() == 2).await;
+        assert_eq!(all_values(&seen, "LINE="), ["\"lost\"", "\"lost\""]);
+    }
+
+    #[tokio::test]
+    async fn after_a_restart_turn_and_prompts_carry_on() {
+        let mut f = Fx::new(&format!(
+            "{IDLE}- wait_prompt\n- stop: {{last_assistant_message: \"one\"}}\n\
+             - wait_prompt\n- stop: {{last_assistant_message: \"two\"}}\n- wait_input\n"
+        ))
+        .await;
+        let id = f
+            .start_factory(WorkspaceId::random(), ProjectId::random())
+            .await;
+        f.until_turn(id, 1, 1).await;
+
+        f.restart().await;
+
+        let before = f
+            .sessions
+            .send_factory(id, Fx::message("after the restart"), None)
+            .await;
+        assert_eq!(before, Ok(1));
+        f.until_turn(id, 2, 2).await;
+        assert_eq!(f.sessions.turn_text(id, 1).unwrap().message, "one");
+        assert_eq!(f.sessions.turn_text(id, 2).unwrap().message, "two");
+    }
+
+    #[tokio::test]
+    async fn the_body_file_is_private_and_outside_the_worktree() {
+        let f = Fx::new(&format!(
+            "{IDLE}- wait_prompt\n- stop: {{last_assistant_message: \"a\"}}\n\
+             - wait_line: \"\"\n- wait_input\n"
+        ))
+        .await;
+        let first = Message::new(
+            format!("/factory-build acme/widgets#7 {BODY_PATH}"),
+            "the first rules".into(),
+        );
+        let id = f
             .sessions
             .start_factory(
                 WorkspaceId::random(),
                 f.worktree.path(),
-                f.start_for(project),
-                Message::new(FIRST_LINE.into(), "the rules".into()),
+                f.start_for(ProjectId::random()),
+                first,
             )
             .await
-            .unwrap_err();
+            .unwrap();
+        let seen = f.shown(id, |t| value(t, "PROMPT=").is_some()).await;
+        let typed: String = serde_json::from_str(&value(&seen, "PROMPT=").unwrap()).unwrap();
+        assert!(
+            typed.starts_with("/factory-build acme/widgets#7 /"),
+            "{typed}"
+        );
+        f.assert_body_file(id, &typed, "the first rules");
+        f.until_turn(id, 1, 1).await;
 
-        assert!(matches!(error, SessionError::FirstMessageBody), "{error}");
-        f.assert_nothing_left(&f.sessions, project);
+        let before = f
+            .sessions
+            .send_factory(
+                id,
+                Message::new(format!("/continue {BODY_PATH}"), "more rules".into()),
+                None,
+            )
+            .await;
+
+        assert_eq!(before, Ok(1));
+        let seen = f.shown(id, |t| !all_values(t, "LINE=").is_empty()).await;
+        let line: String = serde_json::from_str(&all_values(&seen, "LINE=")[0]).unwrap();
+        assert!(line.starts_with("/continue /"), "{line}");
+        f.assert_body_file(id, &line, "more rules");
+    }
+
+    #[tokio::test]
+    async fn send_factory_to_a_p1_session_or_an_unknown_one_is_no_such_session() {
+        let f = Fx::new("- wait_input\n").await;
+        let p1 = f
+            .sessions
+            .start(WorkspaceId::random(), f.worktree.path(), MODEL)
+            .await
+            .unwrap();
+
+        for id in [p1, SessionId::random()] {
+            let sent = f
+                .sessions
+                .send_factory(id, Fx::message("hello"), None)
+                .await;
+            assert_eq!(sent, Err(SendRefused::NoSuchSession));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_factory_sessions_files_go_when_its_workspace_is_archived() {
+        let f = Fx::new("- wait_input\n").await;
+        let project = ProjectId::random();
+        let (archived, kept, live) = (
+            WorkspaceId::random(),
+            WorkspaceId::random(),
+            WorkspaceId::random(),
+        );
+        let gone = f.start_factory(archived, project).await;
+        let stays = f.start_factory(kept, project).await;
+        let running = f.start_factory(live, project).await;
+        for workspace in [archived, kept] {
+            f.sessions.end_factory(workspace).await.unwrap();
+        }
+        for id in [gone, stays] {
+            until("the session to end", || {
+                matches!(
+                    f.state(id),
+                    Some(SessionState::Finished | SessionState::Failed)
+                )
+            })
+            .await;
+        }
+        let record = |workspace, deleted| {
+            let mut store = f.store.lock().unwrap();
+            let record = Record {
+                owner: f.me,
+                version: store.own_next_version().unwrap(),
+                deleted,
+                body: Workspace {
+                    id: workspace,
+                    project,
+                    name: "w".into(),
+                    branch: "w".into(),
+                    base: "main".into(),
+                    setup: None,
+                },
+            };
+            store.apply(&AnyRecord::Workspace(record), f.me).unwrap();
+        };
+        record(kept, false);
+        record(live, true);
+        let folder = |id: SessionId| f.sessions_dir().join(id.to_string());
+        assert!(folder(gone).exists());
+
+        record(archived, true);
+
+        until("the folder to go", || !folder(gone).exists()).await;
+        tokio::time::sleep(SWEEP_EVERY * 2).await;
+        assert!(folder(stays).exists());
+        assert!(folder(running).exists());
+        assert_eq!(f.sessions.is_factory(gone), Some(project));
+        assert_eq!(f.sessions.turn_text(gone, 1), None);
+    }
+
+    #[tokio::test]
+    async fn a_p1_sessions_stop_writes_no_turn_file_and_no_factory_record() {
+        let f = Fx::new(&format!(
+            "{IDLE}- stop: {{last_assistant_message: \"p1 done\"}}\n\
+             - hook: {{event: UserPromptSubmit}}\n- wait_input\n"
+        ))
+        .await;
+        let id = f
+            .sessions
+            .start(WorkspaceId::random(), f.worktree.path(), MODEL)
+            .await
+            .unwrap();
+
+        until("the later hook", || {
+            f.state(id) == Some(SessionState::Working)
+        })
+        .await;
+
+        assert!(!f.sessions_dir().join(id.to_string()).exists());
+        assert_eq!(f.turn_of(id), None);
+        assert_eq!(f.sessions.turn_text(id, 1), None);
+        let store = f.store.lock().unwrap();
+        assert!(store.factory_since(f.me, 0, 100).unwrap().is_empty());
     }
 
     #[tokio::test]
