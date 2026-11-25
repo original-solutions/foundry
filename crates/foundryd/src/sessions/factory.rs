@@ -2955,6 +2955,115 @@ exec "$agent" "$@""#;
     }
 
     #[tokio::test]
+    async fn a_tally_that_cannot_be_read_is_warned_of_once_in_a_row_not_at_every_look() {
+        let mut f = Fx::new(STOPS_THEN_EXITS).await;
+        let logs = Logged::everywhere();
+
+        let id = ended_with_a_record_behind(&mut f, WorkspaceId::random(), false, 1000).await;
+        tokio::time::sleep(SWEEP_EVERY * 3 + Duration::from_secs(1)).await;
+
+        // One from adopt and one from the first look of the sweeper, not one per look.
+        let warned = logs
+            .warnings()
+            .into_iter()
+            .filter(|line| line.contains("counts were not read") && line.contains(&id.to_string()))
+            .count();
+        assert_eq!(warned, 2, "{:?}", logs.warnings());
+    }
+
+    #[tokio::test]
+    async fn a_prompt_whose_record_failed_is_stored_after_a_restart_with_no_further_hook() {
+        let mut f = Fx::new(&format!(
+            "{IDLE}- wait_prompt\n- stop: {{last_assistant_message: \"one\"}}\n\
+             - wait_prompt\n- wait_input\n"
+        ))
+        .await;
+        let id = f
+            .start_factory(WorkspaceId::random(), ProjectId::random())
+            .await;
+        f.until_turn(id, 1, 1).await;
+        f.fail_turn_writes(1000);
+        f.sessions
+            .send_factory(id, Fx::message("go on"), None)
+            .await
+            .unwrap();
+        let counts = f.sessions_dir().join(id.to_string()).join("counts");
+        until("the counts file to say prompts 2", || {
+            std::fs::read_to_string(&counts).is_ok_and(|text| text == "1 2 0")
+        })
+        .await;
+        until("the session to be working", || {
+            f.state(id) == Some(SessionState::Working)
+        })
+        .await;
+        assert_eq!(f.turn_of(id).unwrap().prompts, 1);
+
+        f.restart().await;
+
+        until("the record to catch up", || {
+            f.turn_of(id).is_some_and(|t| t.prompts == 2)
+        })
+        .await;
+        let sent = f
+            .sessions
+            .send_factory(id, Fx::message("late"), Some(1))
+            .await;
+        assert!(
+            matches!(
+                sent,
+                Err(SendRefused::CountRose { .. } | SendRefused::NotIdle)
+            ),
+            "{sent:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_folder_goes_through_the_per_workspace_look_when_the_scan_of_records_fails() {
+        let f = Fx::new(&format!(
+            "{IDLE}- stop: {{last_assistant_message: \"bye\"}}\n- wait_input\n"
+        ))
+        .await;
+        let project = ProjectId::random();
+        let (archived, kept, live) = (
+            WorkspaceId::random(),
+            WorkspaceId::random(),
+            WorkspaceId::random(),
+        );
+        let gone = f.start_factory(archived, project).await;
+        let stays = f.start_factory(kept, project).await;
+        let running = f.start_factory(live, project).await;
+        for id in [gone, stays, running] {
+            f.until_turn(id, 1, 0).await;
+        }
+        for workspace in [archived, kept] {
+            f.sessions.end_factory(workspace).await.unwrap();
+        }
+        for id in [gone, stays] {
+            until("the session to end", || {
+                matches!(
+                    f.state(id),
+                    Some(SessionState::Finished | SessionState::Failed)
+                )
+            })
+            .await;
+        }
+        f.sessions
+            .inner
+            .fail_sweep_reads
+            .store(1000, std::sync::atomic::Ordering::SeqCst);
+        f.archive(kept, project, false);
+        f.archive(live, project, true);
+        f.archive(archived, project, true);
+        let folder = |id: SessionId| f.sessions_dir().join(id.to_string());
+
+        until("the folder to go", || !folder(gone).exists()).await;
+
+        tokio::time::sleep(SWEEP_EVERY * 2).await;
+        assert!(folder(stays).exists());
+        assert!(folder(running).exists());
+    }
+
+    #[tokio::test]
     async fn a_p1_sessions_stop_writes_no_turn_file_and_no_factory_record() {
         let f = Fx::new(&format!(
             "{IDLE}- stop: {{last_assistant_message: \"p1 done\"}}\n\
