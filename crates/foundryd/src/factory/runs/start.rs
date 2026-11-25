@@ -31,22 +31,42 @@
 //! - The tracker has no `openPullRequestsClosing`, so it is asked here, privately, over
 //!   [`Tracker::gh`].
 
-use foundry_proto::factory::RunId;
-use foundry_proto::ids::{MachineId, SessionId};
+use foundry_proto::factory::{RunEvent, RunId};
+use foundry_proto::ids::{MachineId, SessionId, WorkspaceId};
+use foundry_proto::record::{Record, Workspace};
+use foundry_proto::state::{SessionState, TerminalState};
 use serde::Deserialize;
 
-use super::progress::{APPROVED, Seen, read_progress};
-use super::{Closing, RunContext, RunError, abandon, moved_on_by_closing};
-use crate::factory::github::MARKER;
-use crate::factory::github::read::{gh_pages, is_utc_second};
-use crate::factory::github::{OpenPullRequest, Tracker, TrackerError};
-use crate::factory::ledger::events::{Cause, CauseStep, Event, Outcome};
-use crate::factory::lifecycle::approval::{Approval, Refusal, refusal_reason};
+use super::progress::{
+    APPROVAL_RECHECKED, APPROVED, LAUNCH_BASE, LAUNCH_MODEL, LAUNCH_PULL_REQUEST, LAUNCH_RESENDING,
+    LAUNCH_RESUMING, LAUNCH_SENDING, LAUNCH_SENDING_RESUMED, Seen, WORKSPACE_CREATED,
+    WORKSPACE_REQUESTED, read_progress,
+};
+use super::{
+    Closing, Progress, RunContext, RunError, Stop, abandon, end_own_merge, finish_building,
+    go_stuck, moved_on_by_closing, progress_from, session_id, workspace_id,
+};
+use crate::factory::github::read::{
+    gh_json, gh_pages, is_branch_path, is_plain_ref_name, is_safe_branch_name, is_utc_second,
+    issue_query_args,
+};
+use crate::factory::github::{
+    Claim, IssueDetail, MARKER, OpenPullRequest, OtherKind, Tracker, TrackerError, newest_claim,
+};
+use crate::factory::ledger::events::{
+    Cause, CauseStep, Event, ModelOption, OptionValue, Outcome, ResumedFrom,
+};
+use crate::factory::ledger::read::{field, text};
+use crate::factory::lifecycle::approval::{Approval, Refusal, TextCheck, refusal_reason};
+use crate::factory::lifecycle::base;
 use crate::factory::lifecycle::{
     Action, Event as LifecycleEvent, InvalidTransition, State, transition,
 };
-use crate::factory::messages::{self, CUT_SHORT_COMMENT};
+use crate::factory::messages::{self, CUT_SHORT_COMMENT, Message, ResumeFrom};
 use crate::factory::text;
+use crate::factory::worker::{CreateWorkspace, WorkerError};
+use crate::sessions::factory::{BODY_PATH, FactoryStart, SendRefused};
+use crate::workspaces::{Checkout, FactoryTag, Setup};
 
 /// What the setup of a build workspace that failed says as its reason. The terminal's tail is
 /// quoted below it.
@@ -524,14 +544,86 @@ pub fn open_pull_requests_closing<G: Tracker + ?Sized>(
     repo: &str,
     issue: u64,
 ) -> Result<Vec<OpenPullRequest>, TrackerError> {
-    todo!("open_pull_requests_closing")
+    #[derive(Deserialize)]
+    struct Answer {
+        data: Data,
+    }
+    #[derive(Deserialize)]
+    struct Data {
+        repository: Repository,
+    }
+    #[derive(Deserialize)]
+    struct Repository {
+        issue: ClosingIssue,
+    }
+    #[derive(Deserialize)]
+    struct ClosingIssue {
+        #[serde(rename = "closedByPullRequestsReferences")]
+        closed_by: Nodes,
+    }
+    #[derive(Deserialize)]
+    struct Nodes {
+        nodes: Vec<Listed>,
+    }
+    #[derive(Deserialize)]
+    struct Listed {
+        number: u64,
+        url: String,
+        state: String,
+        #[serde(rename = "headRefName")]
+        head_ref_name: String,
+        #[serde(rename = "baseRefName")]
+        base_ref_name: String,
+        #[serde(rename = "isCrossRepository")]
+        is_cross_repository: bool,
+        #[serde(default)]
+        author: Option<Author>,
+    }
+    #[derive(Deserialize)]
+    struct Author {
+        login: String,
+        #[serde(rename = "__typename", default)]
+        typename: Option<String>,
+    }
+    let args = issue_query_args(repo, CLOSING_PRS_QUERY, issue)?;
+    let answer: Answer = gh_json(
+        tracker,
+        &args,
+        "a GraphQL response with the issue's closing pull requests",
+    )?;
+    Ok(answer
+        .data
+        .repository
+        .issue
+        .closed_by
+        .nodes
+        .into_iter()
+        .filter(|node| node.state == "OPEN")
+        .map(|node| OpenPullRequest {
+            number: node.number,
+            url: node.url,
+            head_ref: node.head_ref_name,
+            base_ref: node.base_ref_name,
+            cross_repository: node.is_cross_repository,
+            author: node
+                .author
+                .filter(|author| !author.login.is_empty())
+                .map(|author| {
+                    if author.typename.as_deref() == Some("Bot") {
+                        format!("app/{}", author.login)
+                    } else {
+                        author.login
+                    }
+                }),
+        })
+        .collect())
 }
 
 /// Whether a pull request opened by `author` is the run's own: its author is the project's
 /// login, matched without case. The app a cloud workspace opens pull requests as has a login
 /// no user has (it holds a `/`), and Foundry has no cloud launch, so it is never the run's own.
 pub fn is_own_pull(author: Option<&str>, login: &str) -> bool {
-    todo!("is_own_pull")
+    author.is_some_and(|author| author.eq_ignore_ascii_case(login))
 }
 
 /// Whether a session can be launched onto a pull request and told to push to its branch: it is
@@ -542,7 +634,7 @@ pub fn is_resumable_pull(
     head_ref: &str,
     base: &str,
 ) -> bool {
-    todo!("is_resumable_pull")
+    !cross_repository && base_ref == base && is_safe_branch_name(head_ref)
 }
 
 /// What one pass of [`advance`] did.
@@ -576,9 +668,951 @@ pub enum Wait {
     Setup,
 }
 
-/// One pass of the start of `run`.
-pub fn advance(_ctx: &RunContext<'_>, _run: &RunId) -> Result<StartStep, RunError> {
-    todo!("advance")
+/// One pass of the start of `run`. See the module's words for what a pass does; it never waits
+/// on a worker.
+pub fn advance(ctx: &RunContext<'_>, run: &RunId) -> Result<StartStep, RunError> {
+    let issue = run.issue();
+    let repo = ctx.repo();
+    let events = ctx.ledger.read(run)?;
+    let skipped = |reason: String| Ok(StartStep::Skipped { reason });
+    if events.is_empty() {
+        // A claim comment names a run no event records: a coordinator took over from one that
+        // claimed and died before it wrote the run's first line.
+        match takeover(ctx, run)? {
+            None => {}
+            Some(step) => return Ok(step),
+        }
+    }
+    let mut seen = ctx.seen(run)?;
+    if seen.finished {
+        return skipped(format!("run {run} is finished"));
+    }
+    if matches!(
+        seen.state,
+        Some(State::PrOpen | State::NeedsInfo | State::Stuck)
+    ) {
+        return skipped(format!(
+            "run {run} is in state {}, which another step owns",
+            seen.state.map_or("none", State::name)
+        ));
+    }
+    let detail = ctx.tracker.issue(repo, issue)?;
+    if detail.closed {
+        return match moved_on_by_closing(ctx, &seen, true)? {
+            Closing::OwnMerge(pull) => {
+                end_own_merge(ctx, run, &seen, CauseStep::Start, &pull)?;
+                Ok(StartStep::Ended)
+            }
+            _ => {
+                abandon(ctx, run, &seen, CauseStep::Start)?;
+                Ok(StartStep::Abandoned)
+            }
+        };
+    }
+    // An issue put back to `ready` is the claim step's, which finishes its older runs.
+    if detail.state == Some(State::Ready) {
+        return skipped(format!("issue #{issue} is ready again"));
+    }
+    if !matches!(detail.state, Some(State::Triage | State::Building)) {
+        return skipped(format!("issue #{issue} is not in triage or building"));
+    }
+    let ours =
+        detail.assignees.len() == 1 && detail.assignees[0].eq_ignore_ascii_case(&ctx.project.login);
+    if !ours {
+        return skipped(format!(
+            "issue #{issue} is not assigned to {} alone",
+            ctx.project.login
+        ));
+    }
+    let cause = Cause::new(CauseStep::Start, "claimed");
+    if seen.state.is_none() {
+        ctx.record(
+            run,
+            Event::StateChanged {
+                from: State::Ready,
+                to: State::Triage,
+            },
+            &cause,
+        )?;
+        seen = ctx.seen(run)?;
+    }
+    let mut at = progress_from(run, CauseStep::Start, &seen, State::Triage);
+    // A decision to give up that is already in the ledger stands.
+    if let Some(reason) = seen.stuck.clone() {
+        go_stuck(
+            ctx,
+            issue,
+            &mut at,
+            "stuck-resumed",
+            Stop::new(reason.clone()),
+            None,
+        )?;
+        return Ok(StartStep::Stuck { reason });
+    }
+    // The record is written before any launch: a run with no record of what approved it and no
+    // session fails closed.
+    if seen.approved_at.is_none() && seen.thread_id.is_none() {
+        go_stuck(
+            ctx,
+            issue,
+            &mut at,
+            "approval-unconfirmed",
+            Stop::new(messages::CANNOT_CONFIRM),
+            None,
+        )?;
+        return Ok(StartStep::Stuck {
+            reason: messages::CANNOT_CONFIRM.into(),
+        });
+    }
+    if seen.thread_id.is_some() {
+        return launched(ctx, run, &seen, &detail, &mut at);
+    }
+    build(ctx, run, &seen, &detail, &mut at)
+}
+
+/// What a run with no events learns from the claim comment that names it: the machine the
+/// build is asked of, and the approval, recorded before anything is done. `None` goes on with
+/// the run; a step is a pass that is over.
+fn takeover(ctx: &RunContext<'_>, run: &RunId) -> Result<Option<StartStep>, RunError> {
+    let issue = run.issue();
+    let repo = ctx.repo();
+    let skipped = |reason: String| Ok(Some(StartStep::Skipped { reason }));
+    let detail = ctx.tracker.issue(repo, issue)?;
+    if detail.closed {
+        return skipped(format!(
+            "issue #{issue} is closed and run {run} has no events"
+        ));
+    }
+    if detail.state == Some(State::Ready) {
+        // A claim cut short before its label: the claim step takes the issue again.
+        return skipped(format!("issue #{issue} is ready: the claim was cut short"));
+    }
+    let comments = ctx.tracker.issue_comments(repo, issue)?;
+    let machine = match newest_claim(&comments, &ctx.project.login) {
+        Some(Claim::Foundry {
+            run: named,
+            machine,
+        }) if named == *run => machine,
+        Some(Claim::Foundry { run: named, .. }) => {
+            return skipped(format!(
+                "the issue's newest claim names run {named}, not {run}"
+            ));
+        }
+        Some(Claim::Foreign { .. }) => {
+            return skipped("the issue's newest claim is another factory's".into());
+        }
+        None => return skipped(format!("no claim comment names run {run}")),
+    };
+    if let Approval::Approved {
+        labeled_at,
+        labeled_by,
+    } = ctx.tracker.approval(repo, issue, &ctx.config.instructors)?
+    {
+        let by = (!labeled_by.is_empty()).then_some(labeled_by.as_str());
+        record_approval(ctx, run, &labeled_at, by, CauseStep::Start)?;
+    }
+    ctx.record(
+        run,
+        Event::Claimed {
+            machine: machine.to_string(),
+            github_user: ctx.project.login.clone(),
+        },
+        &Cause::new(CauseStep::Start, "claim-found"),
+    )?;
+    Ok(None)
+}
+
+/// What a launch continues from.
+#[derive(Clone, Debug)]
+enum Resumed {
+    /// The branch of an earlier attempt that hit its time limit or was relaunched.
+    Earlier {
+        run: RunId,
+        branch: String,
+        after: After,
+    },
+    /// The open pull request an earlier attempt left, on its branch.
+    ExistingPr {
+        run: RunId,
+        branch: String,
+        pr_url: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum After {
+    TimeLimit,
+    Interrupted,
+}
+
+impl Resumed {
+    fn branch(&self) -> &str {
+        match self {
+            Resumed::Earlier { branch, .. } | Resumed::ExistingPr { branch, .. } => branch,
+        }
+    }
+
+    fn pr_url(&self) -> Option<&str> {
+        match self {
+            Resumed::Earlier { .. } => None,
+            Resumed::ExistingPr { pr_url, .. } => Some(pr_url),
+        }
+    }
+
+    /// The run a `session_launched` line names as `resumed_from`.
+    fn run(&self) -> &RunId {
+        match self {
+            Resumed::Earlier { run, .. } | Resumed::ExistingPr { run, .. } => run,
+        }
+    }
+
+    fn resume_from(&self) -> ResumeFrom {
+        match self {
+            Resumed::Earlier {
+                run,
+                branch,
+                after: After::TimeLimit,
+            } => ResumeFrom::TimeLimit {
+                run: run.clone(),
+                branch: branch.clone(),
+            },
+            Resumed::Earlier {
+                run,
+                branch,
+                after: After::Interrupted,
+            } => ResumeFrom::Interrupted {
+                run: run.clone(),
+                branch: branch.clone(),
+            },
+            Resumed::ExistingPr { branch, pr_url, .. } => ResumeFrom::ExistingPr {
+                branch: branch.clone(),
+                pr_url: pr_url.clone(),
+            },
+        }
+    }
+}
+
+/// The build workspace's name: `fac/<N>-<attempt>`.
+fn workspace_name(run: &RunId) -> String {
+    format!("fac/{}-{}", run.issue(), run.attempt())
+}
+
+/// The launch message of a run on `base`, continuing `resumed` when it does.
+fn launch_message(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    base: &str,
+    resumed: Option<&Resumed>,
+) -> Message {
+    let named = (base != ctx.config.base).then_some(base);
+    match resumed {
+        None => messages::launch(
+            ctx.repo(),
+            run.issue(),
+            &ctx.project.login,
+            named,
+            BODY_PATH,
+        ),
+        Some(resumed) => messages::resumed(
+            ctx.repo(),
+            run.issue(),
+            &ctx.project.login,
+            &resumed.resume_from(),
+            named,
+            BODY_PATH,
+        ),
+    }
+}
+
+/// What the ledger recorded a launch was decided on: the base, and what it continues from.
+fn recorded_decision(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    seen: &Seen,
+) -> Result<(String, Option<Resumed>), RunError> {
+    let base = seen
+        .base
+        .clone()
+        .or_else(|| seen.launch_base.clone())
+        .unwrap_or_else(|| ctx.config.base.clone());
+    let resumed = match &seen.launch_resumed_from {
+        Some(branch) => Some(recorded_resume(
+            ctx,
+            run,
+            branch,
+            seen.launch_resumed_pr.as_deref(),
+        )?),
+        None => None,
+    };
+    Ok((base, resumed))
+}
+
+/// The resume a `launch-resuming <branch>` step decided, for a launch asked for again. The words
+/// of the first message are the same as the first's: what the earlier attempt ended with is in
+/// its ledger, which does not change, and a pull request decided with the branch is in the
+/// `launch-pull-request` step before it.
+fn recorded_resume(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    branch: &str,
+    pr_url: Option<&str>,
+) -> Result<Resumed, RunError> {
+    if let Some(pr_url) = pr_url {
+        return Ok(Resumed::ExistingPr {
+            run: run.clone(),
+            branch: branch.into(),
+            pr_url: pr_url.into(),
+        });
+    }
+    let previous = previous_run(ctx, run)?;
+    let after = previous
+        .as_ref()
+        .and_then(|(_, events)| continuation(events))
+        .map_or(After::TimeLimit, |found| found.after);
+    let earlier = match previous {
+        Some((id, _)) => id,
+        None => RunId::new(
+            run.repo(),
+            run.issue(),
+            run.attempt().saturating_sub(1).max(1),
+        )
+        .map_err(RunError::Invalid)?,
+    };
+    Ok(Resumed::Earlier {
+        run: earlier,
+        branch: branch.into(),
+        after,
+    })
+}
+
+/// The run before `run` and its events; `None` for a first attempt or an earlier run with no
+/// ledger.
+fn previous_run(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+) -> Result<Option<(RunId, Vec<RunEvent>)>, RunError> {
+    if run.attempt() < 2 {
+        return Ok(None);
+    }
+    let id = RunId::new(run.repo(), run.issue(), run.attempt() - 1).map_err(RunError::Invalid)?;
+    let events = ctx.ledger.read(&id)?;
+    Ok((!events.is_empty()).then_some((id, events)))
+}
+
+/// The runs of the issue before `run` that have a ledger, oldest first, with their events.
+fn earlier_runs(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+) -> Result<Vec<(RunId, Vec<RunEvent>)>, RunError> {
+    let mut runs = Vec::new();
+    for attempt in 1..run.attempt() {
+        let id = RunId::new(run.repo(), run.issue(), attempt).map_err(RunError::Invalid)?;
+        let events = ctx.ledger.read(&id)?;
+        if !events.is_empty() {
+            runs.push((id, events));
+        }
+    }
+    Ok(runs)
+}
+
+/// What the attempt before the new one left to continue from.
+struct Continuation {
+    branches: Vec<String>,
+    after: After,
+}
+
+/// What the attempt before the new one left to continue from: its session's branch, then its own
+/// `resumed_from` for when origin lacks the first (a resumed session pushes there). `None`
+/// unless it hit its time limit (which wins) or was relaunched, and after `needs-info`: its
+/// questions end it. A time-limit branch is the `session_launched` line's, else the `stuck`
+/// line's.
+fn continuation(events: &[RunEvent]) -> Option<Continuation> {
+    let needs_info = events.iter().any(|event| {
+        event.event == "finished"
+            && field(&event.data, "outcome").and_then(|v| v.as_str()) == Some("needs-info")
+    });
+    if needs_info {
+        return None;
+    }
+    let seen = read_progress(events);
+    let with_resumed = |branch: Option<String>, after: After| {
+        let mut branches: Vec<String> = Vec::new();
+        for branch in [branch, seen.resumed_from.clone()].into_iter().flatten() {
+            if !branches.contains(&branch) {
+                branches.push(branch);
+            }
+        }
+        (!branches.is_empty()).then_some(Continuation { branches, after })
+    };
+    let branch_on = |name: &str, event: &RunEvent| -> Option<String> {
+        (event.event == name)
+            .then(|| text(&event.data, "branch").map(str::to_owned))
+            .flatten()
+    };
+    let time_limit = events.iter().any(|event| {
+        event.event == "stuck"
+            && event
+                .cause
+                .as_ref()
+                .and_then(|cause| cause.get("reason"))
+                .and_then(|reason| reason.as_str())
+                == Some("time-limit")
+    });
+    if time_limit {
+        let launched = events
+            .iter()
+            .find_map(|event| branch_on("session_launched", event));
+        let recorded = events
+            .iter()
+            .rev()
+            .find_map(|event| branch_on("stuck", event));
+        return with_resumed(launched.or(recorded), After::TimeLimit);
+    }
+    let relaunch = seen.interruption.as_ref()?;
+    if !relaunch.relaunch {
+        return None;
+    }
+    with_resumed(relaunch.branch.clone(), After::Interrupted)
+}
+
+/// What the new attempt `run` continues from. First the issue's open pull request, if an earlier
+/// attempt left one ([`existing_pull_request`]): it is the work, and a start from `base` beside
+/// it would open a second. Then the branch of an attempt that hit its time limit or was
+/// relaunched ([`continuation`]). `None` is a plain start from `base`. `origin` is the only
+/// source of the work.
+fn resume_from(ctx: &RunContext<'_>, run: &RunId, base: &str) -> Result<Option<Resumed>, RunError> {
+    let issue = run.issue();
+    let earlier = earlier_runs(ctx, run)?;
+    if let Some((branch, pr_url)) = existing_pull_request(ctx, &earlier, issue, base)? {
+        return Ok(Some(Resumed::ExistingPr {
+            run: run.clone(),
+            branch,
+            pr_url,
+        }));
+    }
+    let Some((previous, events)) = earlier
+        .iter()
+        .find(|(id, _)| id.attempt() + 1 == run.attempt())
+    else {
+        return Ok(None);
+    };
+    let Some(found) = continuation(events) else {
+        return Ok(None);
+    };
+    // The branch goes to GitHub's ref path, to git as a ref, and into the `git push` the
+    // launch message tells the session to run: only a plain branch name is resumed from.
+    let branches: Vec<&String> = found
+        .branches
+        .iter()
+        .filter(|branch| is_safe_branch_name(branch))
+        .collect();
+    if branches.is_empty() {
+        return Ok(None);
+    }
+    let Some(approved_at) = read_progress(events).approved_at else {
+        return Ok(None);
+    };
+    if ctx
+        .tracker
+        .text_edited_since(ctx.repo(), issue, &approved_at)?
+    {
+        return Ok(None);
+    }
+    for branch in branches {
+        match ctx.tracker.branch_tip(ctx.repo(), branch) {
+            Ok(_) => {
+                return Ok(Some(Resumed::Earlier {
+                    run: previous.clone(),
+                    branch: branch.clone(),
+                    after: found.after,
+                }));
+            }
+            Err(TrackerError::NotFound { .. }) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(None)
+}
+
+/// The open pull request an earlier attempt of the issue left, if any, and its branch. The
+/// ledger first (newest `pr_opened`, then `pr_left`, of each earlier run) when GitHub still has
+/// it open in this repo onto `base` on a branch a session can push to ([`is_resumable_pull`]).
+/// Then the newest open one by the project's login that closes the issue, which GitHub links
+/// only onto the default.
+fn existing_pull_request(
+    ctx: &RunContext<'_>,
+    earlier: &[(RunId, Vec<RunEvent>)],
+    issue: u64,
+    base: &str,
+) -> Result<Option<(String, String)>, RunError> {
+    for (_, events) in earlier.iter().rev() {
+        let seen = read_progress(events);
+        // The one the session reported first, then the one a stop found it had left.
+        for recorded in [seen.last_pr.as_ref(), seen.left.last()]
+            .into_iter()
+            .flatten()
+        {
+            if let Some(pull) = ctx.tracker.pull_request(ctx.repo(), recorded.pr)?
+                && pull.open
+                && is_resumable_pull(pull.cross_repository, &pull.base_ref, &pull.head_ref, base)
+            {
+                return Ok(Some((pull.head_ref, recorded.url.clone())));
+            }
+        }
+    }
+    let newest = open_pull_requests_closing(ctx.tracker, ctx.repo(), issue)?
+        .into_iter()
+        .filter(|pull| {
+            is_own_pull(pull.author.as_deref(), &ctx.project.login)
+                && is_resumable_pull(pull.cross_repository, &pull.base_ref, &pull.head_ref, base)
+        })
+        .max_by_key(|pull| pull.number);
+    Ok(newest.map(|pull| (pull.head_ref, pull.url)))
+}
+
+/// The branch the run lands on: the issue's `## Base`, else `factory.base`. A named branch must
+/// be a plain ref name and be on `origin` (`branch_tip`); either failing is a refusal with its
+/// public reason. A lookup that fails in any other way is an error, and the next pass asks
+/// again.
+fn run_base(
+    ctx: &RunContext<'_>,
+    detail: &IssueDetail,
+) -> Result<Result<String, String>, RunError> {
+    let Some(named) = base::of(&detail.body) else {
+        return Ok(Ok(ctx.config.base.clone()));
+    };
+    if named == ctx.config.base {
+        return Ok(Ok(named));
+    }
+    if !is_plain_ref_name(&named) || !is_branch_path(&named) {
+        return Ok(Err(messages::base_not_a_branch(&named)));
+    }
+    match ctx.tracker.branch_tip(ctx.repo(), &named) {
+        Ok(_) => Ok(Ok(named)),
+        // A name the tracker refuses is not a branch name either, whatever rule refused it.
+        Err(TrackerError::Other {
+            kind: OtherKind::InvalidArgument,
+            ..
+        }) => Ok(Err(messages::base_not_a_branch(&named))),
+        Err(TrackerError::NotFound { .. }) => Ok(Err(messages::base_not_on_origin(&named))),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// The workspace record of the run's build, as the fleet shows it: `id` when the worker
+/// answered, else the one named so, on `machine` first.
+fn find_workspace(
+    ctx: &RunContext<'_>,
+    name: &str,
+    machine: MachineId,
+    id: Option<WorkspaceId>,
+) -> Option<Record<Workspace>> {
+    let named = ctx.view.workspaces_named(ctx.project.id, name);
+    match id {
+        Some(id) => named.into_iter().find(|record| record.body.id == id),
+        None => named
+            .iter()
+            .find(|record| record.owner == machine)
+            .or(named.first())
+            .copied(),
+    }
+    .cloned()
+}
+
+/// Where the run's build stands until its session starts: asks for the workspace, waits for its
+/// record and its setup, checks the approval again, and starts the session.
+fn build(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    seen: &Seen,
+    detail: &IssueDetail,
+    at: &mut Progress,
+) -> Result<StartStep, RunError> {
+    let issue = run.issue();
+    let machine = seen
+        .machine
+        .as_deref()
+        .and_then(|machine| uuid::Uuid::parse_str(machine).ok())
+        .map(MachineId)
+        .ok_or_else(|| {
+            RunError::Invalid(format!("run {run} has no machine its build is asked of"))
+        })?;
+    let name = workspace_name(run);
+    let wanted = seen.workspace.as_deref().map(workspace_id).transpose()?;
+    let found = find_workspace(ctx, &name, machine, wanted);
+    let cause = Cause::new(CauseStep::Start, "launch-decided");
+    // What the launch is decided on, once, and recorded before the workspace is asked for.
+    let (base, resumed) = if seen.workspace_requested.is_some() {
+        recorded_decision(ctx, run, seen)?
+    } else if let Some(record) = &found {
+        // A workspace of the run's name that no step records: it was made by a coordinator
+        // that died, as a plain start from its own base.
+        let base = record.body.base.clone();
+        record_decision(ctx, run, &base, None, &name, &cause)?;
+        (base, None)
+    } else {
+        let base = match run_base(ctx, detail)? {
+            Ok(base) => base,
+            Err(reason) => {
+                go_stuck(
+                    ctx,
+                    issue,
+                    at,
+                    "launch-failed",
+                    Stop::new(reason.clone()),
+                    None,
+                )?;
+                return Ok(StartStep::Stuck { reason });
+            }
+        };
+        let resumed = resume_from(ctx, run, &base)?;
+        record_decision(ctx, run, &base, resumed.as_ref(), &name, &cause)?;
+        (base, resumed)
+    };
+    let record = match (&seen.workspace, found) {
+        (Some(_), Some(record)) => record,
+        // The worker answered, and the fleet does not show the record yet: wait, never ask again.
+        (Some(_), None) => return Ok(StartStep::Waiting(Wait::Workspace)),
+        (None, Some(record)) => {
+            ctx.record_step(
+                run,
+                &format!("{WORKSPACE_CREATED}{}", record.body.id),
+                &Cause::new(CauseStep::Start, "workspace-found"),
+            )?;
+            record
+        }
+        (None, None) => {
+            let checkout = match &resumed {
+                Some(resumed) => Checkout::Branch {
+                    name: resumed.branch().to_owned(),
+                },
+                None => Checkout::NewBranch {
+                    base: base.clone(),
+                    branch: Some(name.clone()),
+                },
+            };
+            let request = CreateWorkspace {
+                project: ctx.project.id,
+                name: name.clone(),
+                checkout,
+                setup: Setup::Own,
+                tag: FactoryTag {
+                    project: ctx.project.id,
+                    run: run.to_string(),
+                },
+            };
+            // Recorded before it is asked for; a create that fails with no answer is asked
+            // again next pass, and the worker's create answers with the first by tag and name.
+            let id = ctx.create(machine, request)?;
+            ctx.record_step(
+                run,
+                &format!("{WORKSPACE_CREATED}{id}"),
+                &Cause::new(CauseStep::Start, "workspace-created"),
+            )?;
+            return Ok(StartStep::Waiting(Wait::Workspace));
+        }
+    };
+    let workspace = record.body.id;
+    at.worktree = Some(workspace.to_string());
+    // Its setup terminal: waited for while it runs, the run's end when it failed.
+    if let Some(terminal) = record.body.setup {
+        match ctx.view.terminal(terminal) {
+            Some((TerminalState::Exited, Some(0))) => {}
+            Some((TerminalState::Exited, Some(_))) => {
+                let tail = ctx.tail(terminal)?;
+                let stop = Stop {
+                    reason: SETUP_FAILED.into(),
+                    session_text: Some(messages::prepare_output_tail(&tail)),
+                    recorded_text: Some(text::sanitize(&tail, true)),
+                    ..Stop::default()
+                };
+                go_stuck(ctx, issue, at, "setup-failed", stop, None)?;
+                return Ok(StartStep::Stuck {
+                    reason: SETUP_FAILED.into(),
+                });
+            }
+            _ => return Ok(StartStep::Waiting(Wait::Setup)),
+        }
+    }
+    // A session the fleet already shows in the workspace for a launch that may have gone out:
+    // adopted, never started twice.
+    if let Some(session) = ctx.view.session_of(workspace)
+        && (seen.launch_sent || ctx.view.session_turn(session.body.id).is_some())
+    {
+        let model = seen
+            .launch_model
+            .clone()
+            .unwrap_or_else(|| ctx.settings.fleet.model.clone());
+        record_launched(
+            ctx,
+            run,
+            detail,
+            &record,
+            session.body.id,
+            &base,
+            resumed.as_ref(),
+            &model,
+        )?;
+        at.thread_id = Some(session.body.id.to_string());
+        finish_building(ctx, issue, at)?;
+        return Ok(StartStep::Started {
+            session: session.body.id,
+        });
+    }
+    // Before the session starts: the approval, and the text since it.
+    if !seen.rechecked {
+        match ctx
+            .tracker
+            .approval(ctx.repo(), issue, &ctx.config.instructors)?
+        {
+            Approval::Refused(refusal) => {
+                return withdraw(ctx, run, at, &refusal, workspace);
+            }
+            Approval::Approved { .. } => {}
+        }
+        let Some(approved_at) = &seen.approved_at else {
+            return Err(RunError::Invalid(format!("run {run} records no approval")));
+        };
+        let check =
+            ctx.tracker
+                .text_check(ctx.repo(), issue, approved_at, &ctx.config.instructors)?;
+        // A history that cannot be judged counts as changed.
+        if check != TextCheck::Unchanged {
+            go_stuck(
+                ctx,
+                issue,
+                at,
+                "text-changed-before-start",
+                Stop::new(messages::TEXT_CHANGED),
+                None,
+            )?;
+            return Ok(StartStep::Stuck {
+                reason: messages::TEXT_CHANGED.into(),
+            });
+        }
+        ctx.record_step(
+            run,
+            APPROVAL_RECHECKED,
+            &Cause::new(CauseStep::Start, "approval-rechecked"),
+        )?;
+    }
+    start_session(ctx, run, detail, at, &record, &base, resumed.as_ref())
+}
+
+/// Records what a launch was decided on, in the order the runner's launch steps are read, and
+/// then that the workspace is asked for: the model, a base that is not the repo's, a pull
+/// request it continues, the branch it resumes from.
+fn record_decision(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    base: &str,
+    resumed: Option<&Resumed>,
+    name: &str,
+    cause: &Cause,
+) -> Result<(), RunError> {
+    ctx.record_step(
+        run,
+        &format!("{LAUNCH_MODEL}{}", ctx.settings.fleet.model),
+        cause,
+    )?;
+    if base != ctx.config.base {
+        ctx.record_step(run, &format!("{LAUNCH_BASE}{base}"), cause)?;
+    }
+    if let Some(resumed) = resumed {
+        if let Some(pr_url) = resumed.pr_url() {
+            ctx.record_step(
+                run,
+                &format!("{LAUNCH_PULL_REQUEST}{} {pr_url}", resumed.branch()),
+                cause,
+            )?;
+        }
+        ctx.record_step(
+            run,
+            &format!("{LAUNCH_RESUMING}{}", resumed.branch()),
+            cause,
+        )?;
+    }
+    ctx.record_step(run, &format!("{WORKSPACE_REQUESTED}{name}"), cause)
+}
+
+/// The run ends as the runner refuses an unapproved issue: the approval was taken back before
+/// the session started. The refusal is explained once, the issue goes back to
+/// `factory:proposed` without our assignee, the build workspace is archived by force and the run
+/// is finished.
+fn withdraw(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    at: &Progress,
+    refusal: &Refusal,
+    workspace: WorkspaceId,
+) -> Result<StartStep, RunError> {
+    let issue = run.issue();
+    let cause = Cause::new(CauseStep::Start, "approval-withdrawn");
+    let reason = refusal_reason(refusal);
+    // Recorded before it is acted on, so doing it again carries on.
+    if !at.seen.rechecked {
+        ctx.record_step(run, "approval-withdrawn", &cause)?;
+    }
+    let said = messages::unapproved(refusal);
+    if !already_said(ctx, issue, refusal, &said)? {
+        ctx.post_comment(issue, &said)?;
+    }
+    ctx.unassign(issue)?;
+    ctx.set_state(issue, State::Proposed)?;
+    ctx.archive(workspace)?;
+    ctx.ledger
+        .finish(run, Outcome::Stuck, None, None, &cause, None)?;
+    Ok(StartStep::Unapproved {
+        reason: reason.to_owned(),
+    })
+}
+
+/// Starts the session with the launch message, records it, and moves the issue to `building`.
+fn start_session(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    detail: &IssueDetail,
+    at: &mut Progress,
+    record: &Record<Workspace>,
+    base: &str,
+    resumed: Option<&Resumed>,
+) -> Result<StartStep, RunError> {
+    let issue = run.issue();
+    let workspace = record.body.id;
+    let message = launch_message(ctx, run, base, resumed);
+    let model = at
+        .seen
+        .launch_model
+        .clone()
+        .unwrap_or_else(|| ctx.settings.fleet.model.clone());
+    // Written once per run before the first call, so a start that fails on our side is known to
+    // have been sent.
+    ctx.held()?;
+    if !at.seen.launch_sent {
+        let step = match resumed {
+            None => LAUNCH_SENDING.to_owned(),
+            Some(resumed) => format!("{LAUNCH_SENDING_RESUMED}{}", resumed.branch()),
+        };
+        ctx.record_step(run, &step, &Cause::new(CauseStep::Start, "launch-sending"))?;
+        at.seen.launch_sent = true;
+    }
+    let start = FactoryStart {
+        project: ctx.project.id,
+        login: ctx.project.login.clone(),
+        model: model.clone(),
+        effort: ctx.settings.fleet.effort.clone(),
+    };
+    let session = match ctx.start_session(workspace, start, message) {
+        Ok(session) => session,
+        // The worker refused: stuck, with the detail in the ledger only. A machine that cannot
+        // be reached is no refusal: the next pass starts again.
+        Err(RunError::Worker(WorkerError::Failed(what))) => {
+            let note = messages::session_may_exist_note(&what, &format!("foundry:{run}:launch"));
+            let stop = Stop {
+                reason: messages::LAUNCH_FAILED.into(),
+                detail: Some(note),
+                ..Stop::default()
+            };
+            go_stuck(ctx, issue, at, "launch-failed", stop, None)?;
+            return Ok(StartStep::Stuck {
+                reason: messages::LAUNCH_FAILED.into(),
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    record_launched(ctx, run, detail, record, session, base, resumed, &model)?;
+    at.thread_id = Some(session.to_string());
+    finish_building(ctx, issue, at)?;
+    Ok(StartStep::Started { session })
+}
+
+/// The `session_launched` line.
+#[allow(clippy::too_many_arguments)]
+fn record_launched(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    detail: &IssueDetail,
+    record: &Record<Workspace>,
+    session: SessionId,
+    base: &str,
+    resumed: Option<&Resumed>,
+    model: &str,
+) -> Result<(), RunError> {
+    ctx.record(
+        run,
+        Event::SessionLaunched {
+            thread_id: session.to_string(),
+            worktree: Some(record.body.id.to_string()),
+            branch: Some(
+                resumed.map_or_else(|| record.body.branch.clone(), |r| r.branch().to_owned()),
+            ),
+            model_instance: None,
+            model: Some(model.to_owned()),
+            model_options: Some(vec![ModelOption {
+                id: "effort".into(),
+                value: OptionValue::Text(ctx.settings.fleet.effort.clone()),
+            }]),
+            resumed_from: resumed.map(|resumed| ResumedFrom {
+                run: resumed.run().to_string(),
+                branch: resumed.branch().to_owned(),
+            }),
+            base: Some(base.to_owned()),
+            title: Some(detail.title.clone()),
+        },
+        &Cause::new(
+            CauseStep::Start,
+            if resumed.is_none() {
+                "session-launched"
+            } else {
+                "resumed-from-branch"
+            },
+        ),
+    )
+}
+
+/// A run whose session is launched: the label, and the launch asked for again by count when the
+/// session is idle a pass after it started.
+fn launched(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    seen: &Seen,
+    detail: &IssueDetail,
+    at: &mut Progress,
+) -> Result<StartStep, RunError> {
+    let _ = detail;
+    let Some(thread) = &seen.thread_id else {
+        return Err(RunError::Invalid(format!("run {run} has no session")));
+    };
+    let session = session_id(thread)?;
+    if at.state != State::Building {
+        finish_building(ctx, run.issue(), at)?;
+    }
+    // The launch is the session's first prompt, so its count before the send is none. A session
+    // that is idle with no turn ended, or whose turn record shows no prompt, has not taken it.
+    let idle = ctx.view.session_state(session) == Some(SessionState::Idle);
+    let untouched = ctx
+        .view
+        .session_turn(session)
+        .is_none_or(|turn| turn.turn == 0 && turn.prompts == FIRST_PROMPT_COUNT);
+    if !(idle && untouched) {
+        return Ok(StartStep::Started { session });
+    }
+    let (base, resumed) = recorded_decision(ctx, run, seen)?;
+    let message = launch_message(ctx, run, &base, resumed.as_ref());
+    ctx.record_step(
+        run,
+        &format!("{LAUNCH_RESENDING}{FIRST_PROMPT_COUNT}"),
+        &Cause::new(CauseStep::Start, "launch-resend"),
+    )?;
+    match ctx.send(session, message, Some(FIRST_PROMPT_COUNT)) {
+        Ok(_) => Ok(StartStep::Resent { session }),
+        // The worker decides: its count rose, so the message was typed; or the session is not
+        // idle yet, and the next pass looks again.
+        Err(RunError::Send(SendRefused::CountRose { .. } | SendRefused::NotIdle)) => {
+            Ok(StartStep::Started { session })
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(test)]
@@ -1394,13 +2428,12 @@ mod tests {
 
     /// What one pass of `advance` shows, with the fleet as the test lays it out.
     mod the_launch {
-        use foundry_proto::ids::{ProjectId, SessionId, TerminalId, WorkspaceId};
+        use foundry_proto::ids::{SessionId, TerminalId, WorkspaceId};
         use foundry_proto::record::{Record, Session, Terminal, Workspace};
         use foundry_proto::state::{SessionState, TerminalState};
 
         use super::super::super::testing::*;
         use super::super::*;
-        use crate::factory::github::{OtherKind, Tracker, TrackerError};
         use crate::factory::ledger::events::Event;
         use crate::factory::lifecycle::approval::{Refusal, unapproved_comment};
         use crate::factory::messages::{
@@ -1549,6 +2582,15 @@ mod tests {
                 .into_iter()
                 .filter(|call| matches!(call, Call::StartSession { .. }))
                 .collect()
+        }
+
+        /// The comment that says why the run could not be finished.
+        fn stuck_comment(rig: &Rig) -> String {
+            rig.sim
+                .comments()
+                .into_iter()
+                .find(|comment| comment.contains("could not finish this issue"))
+                .expect("a stuck comment")
         }
 
         fn launch_message() -> Message {
@@ -1836,9 +2878,9 @@ mod tests {
                         reason: SETUP_FAILED.into()
                     }
                 );
-                let comments = rig.sim.comments();
-                assert!(comments[0].contains(&format!("Reason: {SETUP_FAILED}")));
-                assert!(comments[0].contains("setup failed: cargo fetch exited 2"));
+                let comment = stuck_comment(&rig);
+                assert!(comment.contains(&format!("Reason: {SETUP_FAILED}")));
+                assert!(comment.contains("setup failed: cargo fetch exited 2"));
                 assert_eq!(rig.sim.labels(), vec!["factory:stuck"]);
                 assert!(rig.sim.assignees().is_empty());
                 assert!(rig.finished(&run));
@@ -1872,7 +2914,7 @@ mod tests {
                 let tail = format!("{}THE-END", "x".repeat(70_000));
                 rig.worker.on_tail(Ok(tail));
                 pass(&rig, &run);
-                let comment = &rig.sim.comments()[0];
+                let comment = &stuck_comment(&rig);
                 assert!(comment.contains("THE-END"));
                 assert!(comment.contains("[cut]"));
                 assert!(comment.chars().count() < 21_000);
@@ -2055,9 +3097,11 @@ mod tests {
             /// the effort are the fleet's settings.
             #[test]
             fn launches_on_the_fleets_model_and_effort_and_records_them() {
-                let (mut rig, run) = workspace_shown();
+                let (mut rig, run) = claimed_rig();
                 rig.settings.fleet.model = "sonnet".into();
                 rig.settings.fleet.effort = "low".into();
+                pass(&rig, &run);
+                show_workspace(&mut rig);
                 pass(&rig, &run);
                 match &start_sessions(&rig)[..] {
                     [Call::StartSession { model, effort, .. }] => {
@@ -2116,9 +3160,9 @@ mod tests {
                         reason: LAUNCH_FAILED.into()
                     }
                 );
-                let comments = rig.sim.comments();
-                assert!(comments[0].contains(LAUNCH_FAILED));
-                assert!(!comments[0].contains("factory-build"));
+                let comment = stuck_comment(&rig);
+                assert!(comment.contains(LAUNCH_FAILED));
+                assert!(!comment.contains("factory-build"));
                 let stuck = rig
                     .events(&run)
                     .into_iter()
@@ -2206,13 +3250,15 @@ mod tests {
             fn a_lost_lease_starts_nothing_and_writes_nothing() {
                 let (mut rig, run) = workspace_shown();
                 rig.guard = Box::new(Lost);
-                let before = rig.names(&run);
+                let writes = rig.sim.writes().len();
                 assert!(matches!(
                     advance(&rig.ctx(), &run),
                     Err(RunError::LeaseLost(_))
                 ));
                 assert!(start_sessions(&rig).is_empty());
-                assert_eq!(rig.names(&run), before);
+                assert_eq!(rig.sim.writes().len(), writes);
+                // No launch is recorded as sent that never went out.
+                assert!(!rig.steps(&run).contains(&"launch-sending".to_string()));
             }
 
             #[test]

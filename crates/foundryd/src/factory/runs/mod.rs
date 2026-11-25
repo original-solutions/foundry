@@ -728,7 +728,6 @@ pub fn workspace_id(text: &str) -> Result<WorkspaceId, RunError> {
 /// What the run tests share: GitHub in memory, the worker's fake, a ledger in a store of its
 /// own and a context built from them.
 #[cfg(test)]
-#[allow(dead_code)] // the claim's tests, in start.rs, use the rest
 pub(crate) mod testing {
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::{Arc, Mutex, PoisonError};
@@ -743,7 +742,6 @@ pub(crate) mod testing {
     use crate::factory::github::{Hiding, OtherKind, Tracker};
     use crate::factory::ledger::testing::{T0, open_store, ticking};
     use crate::factory::worker::{AlwaysHeld, FakeWorker};
-    use crate::store::Store;
 
     pub const REPO: &str = "rawphp/softfac";
     pub const LOGIN: &str = "softfac-bot";
@@ -871,18 +869,6 @@ pub(crate) mod testing {
             self.lock().pulls.insert(number, pull);
         }
 
-        /// What `gh pr list` answers: one open pull request.
-        pub fn list_pull(&self, number: u64, head: &str, base: &str, author: &str, cross: bool) {
-            self.lock().listed.push(json!({
-                "number": number,
-                "url": format!("https://github.com/{REPO}/pull/{number}"),
-                "headRefName": head,
-                "baseRefName": base,
-                "isCrossRepository": cross,
-                "author": {"login": author},
-            }));
-        }
-
         /// What the closing-pull-requests query answers: one open pull request closing the
         /// issue, by `author`.
         pub fn closing_pull(&self, number: u64, head: &str, base: &str, author: &str, cross: bool) {
@@ -949,11 +935,6 @@ pub(crate) mod testing {
                 .iter()
                 .map(|(_, _, body)| body.clone())
                 .collect()
-        }
-
-        /// The comments on the issue, with their ids.
-        pub fn comment_rows(&self) -> Vec<(u64, String, String)> {
-            self.lock().comments.clone()
         }
 
         fn other(args: &[String], message: &str) -> TrackerError {
@@ -1042,7 +1023,8 @@ pub(crate) mod testing {
                     .to_string())
                 }
                 (Some("api"), Some("graphql")) => Ok(state.approval.clone()),
-                (Some("api"), Some(path)) if path.contains("/issues/comments/") => {
+                (Some("api"), Some("-X")) if word(3).is_some_and(|path| path.contains("/issues/comments/")) => {
+                    let path = word(3).unwrap_or_default();
                     let id: u64 = path
                         .rsplit('/')
                         .next()
@@ -1111,7 +1093,6 @@ pub(crate) mod testing {
     /// Everything a step of a run needs, built from fakes.
     pub struct Rig {
         pub _dir: tempfile::TempDir,
-        pub store: Arc<Mutex<Store>>,
         pub ledger: Ledger,
         pub sim: Arc<Sim>,
         pub tracker: Hiding,
@@ -1160,7 +1141,6 @@ pub(crate) mod testing {
             let tracker = Hiding::new(sim.clone(), Arc::new(|text: &str| text.to_string()));
             Self {
                 _dir: dir,
-                store,
                 ledger,
                 sim,
                 tracker,
