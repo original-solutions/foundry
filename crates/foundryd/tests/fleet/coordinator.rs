@@ -2835,12 +2835,30 @@ async fn a_factory_edit_is_refused_with_the_reason_while_the_acting_machine_spea
     other.abort();
 
     // The older machine is updated: its protocol 4 link closes and it links again on 5,
-    // still acting. A factory edit now goes to it.
+    // still acting, and its first copy there holds an edit it numbered. Once that copy is
+    // taken, a factory edit goes to it. Until then the daemon still reads protocol 4 for it
+    // and refuses the edit (`Coordinator::uncarried`), so the test waits for the copy.
+    // `take_settings` records the protocol before it stores the copy, so holding project 9
+    // means the daemon reads protocol 5 for it.
     beat.abort();
     drop(conn);
     let (conn, said) = recorded(raw_link(daemon, older).await);
-    say(&conn, &settings_message(daemon.settings())).await;
+    let mut updated = daemon.settings();
+    updated.seq += 1;
+    updated
+        .projects
+        .push(project(9, "from the updated machine"));
+    updated.stamps.insert(
+        project_key(9),
+        Stamp {
+            seq: updated.seq,
+            by: older,
+        },
+    );
+    updated.seen.insert(older, updated.seq);
+    say(&conn, &settings_message(updated)).await;
     let _beating = beating(conn.clone());
+    holds_project(daemon, 9, Duration::from_secs(2)).await;
     let factory = tokio::spawn({
         let coordinator = daemon.coordinator();
         async move { coordinator.edit(set_factory(5)).await }
