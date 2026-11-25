@@ -577,14 +577,29 @@ fn check_binding(
 }
 
 /// Whether a `gh` failure (`OtherKind::Failed`, as `github::gh::finish` words it) is that `gh`
-/// got no answer from GitHub about the pull request: a call a signal ended
-/// (`` `<command>` exited with status -1``), an answer over the output limit
-/// (`` `<command>` printed more than``), or what `gh` said after
-/// `` `<command>` exited with status <n>: `` is an `HTTP 5xx` or a failed connection. Only
-/// what `gh` said is read, never the command text, which names the repo. A refusal by GitHub
-/// (status 1 and a reason, `HTTP 4xx`) is not no answer.
+/// got no answer from GitHub about the pull request, told by shape and not by a list of
+/// transport failures, which cannot be complete:
+///
+/// - What `gh` prints for a failure of transport that is not DNS is Go's `*url.Error`: the
+///   HTTP method as the caller wrote it (`Post`, `Get`), the quoted URL, `": "`, and whatever
+///   the failure says (`broken pipe`, `http2: client connection lost`, `remote error: tls:`,
+///   `context deadline exceeded`, ...). Whatever it says, no answer came: that is the shape.
+/// - What `gh` prints for an answer is `HTTP <status>` and GitHub's message (a 5xx is no
+///   answer about this pull request, a 4xx is a refusal), or `GraphQL: ...`.
+/// - A call a signal ended (status `-1`), an answer over the output limit (`` ` printed more
+///   than``), and the words of a failed connection or lookup outside a `url.Error` are no
+///   answer too.
+///
+/// Only what `gh` said (after `` `<command>` exited with status <n>: ``) is read, never the
+/// command text, which names the repo. Anything else, a shape nobody has seen included, is a
+/// refusal: the runner's reading ("exited with status 1: boom" is GitHub refusing), and a pull
+/// request that can never be drafted is stuck at once, not retried until `limits.minutes`.
 fn gh_gave_no_answer(message: &str) -> bool {
     const EXITED: &str = "` exited with status ";
+    const METHODS: [&str; 12] = [
+        "GET", "POST", "PATCH", "PUT", "DELETE", "HEAD", "Get", "Post", "Patch", "Put", "Delete",
+        "Head",
+    ];
     if message.contains("` printed more than ") {
         return true;
     }
@@ -592,12 +607,16 @@ fn gh_gave_no_answer(message: &str) -> bool {
         return false;
     };
     let Some((status, said)) = after.split_once(": ") else {
-        // `finish` writes the colon and a space whatever `gh` said; with none, nothing was said.
-        return after.trim_end() == "-1:" || after.trim() == "-1";
+        return false;
     };
     if status == "-1" {
         return true;
     }
+    let url_error = said.split_once(' ').is_some_and(|(method, rest)| {
+        METHODS.contains(&method)
+            && (rest.starts_with("\"http://") || rest.starts_with("\"https://"))
+            && rest.contains("\": ")
+    });
     let server_error = said.match_indices("HTTP 5").any(|(at, _)| {
         said[at + 6..]
             .bytes()
@@ -608,18 +627,28 @@ fn gh_gave_no_answer(message: &str) -> bool {
     });
     let said = said.to_ascii_lowercase();
     let said = said.trim_end();
-    server_error
+    url_error
+        || server_error
         || [
             "error connecting to",
             "dial tcp",
             "no such host",
             "connection refused",
             "connection reset",
+            "connection lost",
+            "connection closed",
+            "closed network connection",
+            "closed the connection",
+            "broken pipe",
+            "goaway",
             "i/o timeout",
             "tls handshake timeout",
+            "tls:",
             "network is unreachable",
             "temporary failure in name resolution",
             "timed out",
+            "context deadline exceeded",
+            "client.timeout exceeded",
             "unexpected eof",
         ]
         .iter()
