@@ -2532,6 +2532,7 @@ mod tests {
         base: String,
         head: String,
         mergeable: &'static str,
+        cross_repository: bool,
     }
 
     #[derive(Default)]
@@ -2686,7 +2687,7 @@ mod tests {
                         "isDraft": pull.draft,
                         "state": pull.state,
                         "headRefName": pull.head_ref,
-                        "isCrossRepository": false,
+                        "isCrossRepository": pull.cross_repository,
                         "baseRefName": pull.base,
                         "headRefOid": pull.head,
                         "mergeable": pull.mergeable,
@@ -2773,6 +2774,7 @@ mod tests {
             base: "main".into(),
             head: head.into(),
             mergeable: "MERGEABLE",
+            cross_repository: false,
         }
     }
 
@@ -5547,6 +5549,38 @@ mod tests {
             hub.set_mergeable("CONFLICTING");
         }
 
+        fn a_failed_check_and_no_retries(rig: &mut Rig, hub: &Hub) {
+            with_a_failed_check(rig, hub);
+            no_retries(rig, hub);
+        }
+
+        #[test]
+        fn the_failed_check_with_no_retry_left_survives_a_cut_at_every_check() {
+            same_after_a_cut_at_every_check(a_failed_check_and_no_retries, 0, PASS_TAIL);
+            // The stuck decision resumed after a cut rebuilds the failed-check text it records.
+            let stuck = |rig: &Rig, run: &RunId| {
+                rig.events(run)
+                    .into_iter()
+                    .filter(|event| event.event == "stuck")
+                    .map(|event| event.data)
+                    .collect::<Vec<_>>()
+            };
+            let (mut rig, run, _hub) = fresh(a_failed_check_and_no_retries);
+            complete(&mut rig, &run, 0, PASS_TAIL);
+            let whole = stuck(&rig, &run);
+            assert_eq!(whole.len(), 1);
+            assert!(
+                whole[0].to_string().contains("ci"),
+                "the failed check is named: {whole:?}"
+            );
+            for checks in 1..=30 {
+                let (mut rig, run, _hub) = fresh(a_failed_check_and_no_retries);
+                rig.guard = Box::new(HeldFor::new(checks));
+                complete(&mut rig, &run, 0, PASS_TAIL);
+                assert_eq!(stuck(&rig, &run), whole, "{checks}");
+            }
+        }
+
         #[test]
         fn the_pass_path_survives_a_failure_of_each_call() {
             same_after_a_cut_at_every_check(nothing, 0, PASS_TAIL);
@@ -7818,6 +7852,213 @@ mod tests {
                 ),
                 1
             );
+        }
+    }
+
+    mod round1_of_the_hand_finish {
+        use super::*;
+
+        #[test]
+        fn a_pull_request_from_a_fork_is_stuck_before_any_gate_is_placed() {
+            let (rig, run, hub) = built();
+            hub.edit(12, |pull| pull.cross_repository = true);
+            let step = go(&rig, &run);
+            assert_stuck(
+                &rig,
+                &run,
+                &step,
+                "pr-not-bound",
+                "the session reported PR #12 but it comes from a fork",
+            );
+            assert_eq!(creates(&rig), 0);
+        }
+
+        #[test]
+        fn a_pull_request_that_comes_from_a_fork_when_the_gate_ends_is_not_passed() {
+            let (mut rig, run, hub) = built();
+            place(&mut rig, &run, 1, 1);
+            hub.edit(12, |pull| pull.cross_repository = true);
+            let step = ends(&mut rig, &run, 1, 1, 0, PASS_TAIL);
+            assert_stuck(
+                &rig,
+                &run,
+                &step,
+                "pr-not-bound",
+                "the session reported PR #12 but it comes from a fork",
+            );
+            assert!(!has_step(&rig, &run, "gate-passed "));
+            assert!(hub.lock().pulls[&12].draft);
+        }
+
+        #[test]
+        fn a_recorded_pass_whose_pull_request_moved_off_its_base_is_stuck_not_marked_ready() {
+            let (mut rig, run, hub) = built();
+            rig.config.required_checks = vec!["ci".into()];
+            hub.set_checks(HEAD, &[("ci", "in_progress", None)]);
+            assert_eq!(gated(&mut rig, &run, 0, PASS_TAIL), GateStep::ChecksPending);
+            hub.edit(12, |pull| pull.base = "release".into());
+            hub.set_checks(HEAD, &[("ci", "completed", Some("success"))]);
+            let step = go(&rig, &run);
+            let GateStep::Stuck { reason } = &step else {
+                panic!("expected stuck, got {step:?}");
+            };
+            assert!(
+                reason.contains("its base is not the base branch main"),
+                "{reason}"
+            );
+            assert!(hub.lock().pulls[&12].draft, "nothing is marked ready");
+            assert_ne!(rig.sim.labels(), ["factory:pr-open"]);
+        }
+
+        #[test]
+        fn a_recorded_pass_whose_pull_request_moved_off_its_branch_is_stuck_not_marked_ready() {
+            let (mut rig, run, hub) = built();
+            rig.config.required_checks = vec!["ci".into()];
+            hub.set_checks(HEAD, &[("ci", "in_progress", None)]);
+            assert_eq!(gated(&mut rig, &run, 0, PASS_TAIL), GateStep::ChecksPending);
+            hub.edit(12, |pull| pull.head_ref = "someone-else".into());
+            hub.set_checks(HEAD, &[("ci", "completed", Some("success"))]);
+            let step = go(&rig, &run);
+            assert!(matches!(step, GateStep::Stuck { .. }), "{step:?}");
+            assert!(hub.lock().pulls[&12].draft, "nothing is marked ready");
+        }
+
+        #[test]
+        fn a_merge_while_the_build_archive_waits_leaves_the_run_open_until_it_is_archived() {
+            let (mut rig, run, hub) = built();
+            place(&mut rig, &run, 1, 1);
+            hub.set_state("MERGED");
+            rig.worker.on_archive(Ok(())); // the gate's own
+            rig.worker
+                .on_archive(Err(WorkerError::Unreachable("no route".into())));
+            let step = ends(&mut rig, &run, 1, 1, 0, PASS_TAIL);
+            assert_eq!(step, GateStep::NotReady);
+            assert!(
+                !rig.finished(&run),
+                "the run is not ended with its workspace live"
+            );
+            // The archive answers on a later pass, which finishes what was owed.
+            go(&rig, &run);
+            assert!(has_step(&rig, &run, BUILD_ARCHIVED));
+            assert_eq!(
+                calls(&rig)
+                    .iter()
+                    .filter(|call| **call == archive_of(workspace()))
+                    .count(),
+                2
+            );
+        }
+
+        #[test]
+        fn a_merge_while_an_earlier_gate_archive_waits_ends_no_session_and_leaves_the_run_open() {
+            let (rig, run, hub) =
+                super::review4_an_archive_is_only_what_a_call_answered::g1_left_then_g2_ready_to_finish();
+            hub.set_state("MERGED");
+            rig.worker.on_archive(Ok(())); // g2's own
+            rig.worker
+                .on_archive(Err(WorkerError::Unreachable("no route".into())));
+            assert_eq!(go(&rig, &run), GateStep::NotReady);
+            assert!(!rig.finished(&run));
+            assert!(!has_step(&rig, &run, BUILD_SESSION_ENDED));
+        }
+
+        /// The gate `k` exited with `code` on the online gate machine, and the build machine
+        /// the view shows unreachable for `span`.
+        fn build_machine_away(rig: &mut Rig, run: &RunId, k: u32, code: i32, span: Duration) {
+            let mut view = FleetView::builder()
+                .online(machine())
+                .session(session_record(SessionState::Idle))
+                .turn(SessionTurn {
+                    session: session(),
+                    workspace: workspace(),
+                    project: project_id(),
+                    turn: 1,
+                    prompts: 1,
+                    question: false,
+                })
+                .unreachable(builder(), span);
+            for (workspace, terminal) in gate_records(run, &[exited(k, code)]) {
+                view = view.workspace(workspace).terminal(terminal);
+            }
+            rig.view = view.build();
+        }
+
+        #[test]
+        fn a_pass_whose_build_machine_is_gone_reaches_pr_open_without_ending_or_archiving() {
+            let (mut rig, run, hub) = built();
+            place(&mut rig, &run, 1, 1);
+            build_machine_away(
+                &mut rig,
+                &run,
+                1,
+                0,
+                crate::factory::runs::resume::UNREACHABLE_FOR,
+            );
+            rig.worker.on_tail(Ok(PASS_TAIL.into()));
+            assert_eq!(go(&rig, &run), GateStep::Passed { pr: 12 });
+            assert!(!hub.lock().pulls[&12].draft);
+            assert_eq!(rig.sim.labels(), ["factory:pr-open"]);
+            assert!(!calls(&rig).contains(&end_of_build()));
+            assert!(!archived(&rig).contains(&workspace()));
+            assert_eq!(
+                step_count(&rig, &run, &format!("{BUILD_SESSION_LEFT}{LEFT_GONE}")),
+                1
+            );
+            assert_eq!(
+                step_count(&rig, &run, &format!("{BUILD_LEFT}{LEFT_GONE}")),
+                1
+            );
+        }
+
+        #[test]
+        fn an_end_of_sessions_answered_unreachable_waits_15_minutes_on_the_clock_then_is_left() {
+            let (mut rig, run, hub) = built();
+            place(&mut rig, &run, 1, 1);
+            show(&mut rig, &run, SessionState::Idle, 1, &[exited(1, 0)]);
+            rig.worker.on_tail(Ok(PASS_TAIL.into()));
+            for _ in 0..4 {
+                rig.worker
+                    .on_end_sessions(Err(WorkerError::Unreachable("no route".into())));
+            }
+            for _ in 0..3 {
+                assert_eq!(try_go(&rig, &run).unwrap(), GateStep::NotReady);
+                rig.clock.advance(Duration::from_secs(4 * 60));
+            }
+            // The ready mark came first; the label waits for the session's end.
+            assert!(!hub.lock().pulls[&12].draft);
+            assert_eq!(rig.sim.labels(), ["factory:building"]);
+            assert_eq!(step_count(&rig, &run, BUILD_SESSION_WAITING), 1);
+            rig.clock.advance(Duration::from_secs(3 * 60));
+            assert_eq!(go(&rig, &run), GateStep::Passed { pr: 12 });
+            assert_eq!(
+                step_count(
+                    &rig,
+                    &run,
+                    &format!("{BUILD_SESSION_LEFT}{LEFT_UNREACHABLE}")
+                ),
+                1
+            );
+            assert!(!has_step(&rig, &run, BUILD_SESSION_ENDED));
+            assert_eq!(rig.sim.labels(), ["factory:pr-open"]);
+        }
+
+        #[test]
+        fn a_stuck_run_whose_session_end_is_unreachable_is_stuck_at_once() {
+            let (rig, run, _hub) = built();
+            rig.write(&run, Event::StopRequested { by: "tom".into() });
+            rig.worker
+                .on_end_sessions(Err(WorkerError::Unreachable("no route".into())));
+            let step = go(&rig, &run);
+            assert!(matches!(step, GateStep::Stuck { .. }), "{step:?}");
+            assert_eq!(
+                step_count(
+                    &rig,
+                    &run,
+                    &format!("{BUILD_SESSION_LEFT}{LEFT_UNREACHABLE}")
+                ),
+                1
+            );
+            assert!(rig.finished(&run));
         }
     }
 }
