@@ -1036,6 +1036,68 @@ mod tests {
     }
 
     #[test]
+    fn a_record_this_build_cannot_read_fails_the_read() {
+        let (dir, mut store) = open();
+        let (a, b) = (machine(1), machine(2));
+        store
+            .apply(
+                &AnyRecord::Workspace(workspace_record(a, 1, false, 10, 1, "run")),
+                a,
+            )
+            .unwrap();
+        store
+            .apply(
+                &AnyRecord::Workspace(workspace_record(b, 1, false, 11, 1, "other")),
+                b,
+            )
+            .unwrap();
+        let online = BTreeSet::from([a, b]);
+        assert!(FleetView::read(&store, online.clone(), BTreeMap::new()).is_ok());
+
+        // A newer build on b left a row before a rollback. The factory acts on the view, so a
+        // view without b's records would be a half-applied pass: the read fails instead.
+        let conn = rusqlite::Connection::open(dir.path().join("foundry.db")).unwrap();
+        conn.execute(
+            "INSERT INTO records (kind, id, owner, version, record) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                "printer",
+                "unreadable",
+                b.to_string(),
+                1000,
+                r#"{"kind":"printer"}"#
+            ],
+        )
+        .unwrap();
+        assert!(FleetView::read(&store, online, BTreeMap::new()).is_err());
+    }
+
+    #[test]
+    fn a_factory_record_this_build_cannot_read_fails_the_read() {
+        let (dir, mut store) = open();
+        let a = machine(1);
+        store
+            .apply(
+                &AnyRecord::Workspace(workspace_record(a, 1, false, 10, 1, "run")),
+                a,
+            )
+            .unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("foundry.db")).unwrap();
+        conn.execute(
+            "INSERT INTO factory_records (kind, id, owner, version, record) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                "machine_held",
+                a.to_string(),
+                a.to_string(),
+                1,
+                r#"{"kind":"printer"}"#
+            ],
+        )
+        .unwrap();
+        assert!(FleetView::read(&store, BTreeSet::from([a]), BTreeMap::new()).is_err());
+    }
+
+    #[test]
     fn a_read_carries_sessions_terminals_turns_held_and_samples() {
         let (_dir, mut store) = open();
         let m = machine(1);
