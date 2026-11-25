@@ -1415,6 +1415,21 @@ impl Gate<'_, '_> {
         k: u32,
         reason: &str,
     ) -> Result<GateStep, RunError> {
+        self.could_not_run_left(log, attempt, k, reason, None)
+    }
+
+    /// [`Self::could_not_run`], with the gate recorded left for `left` right after the
+    /// `gate-could-not-run` step: a pass cut between the two leaves a gate that could not run,
+    /// which is archived or left before another is placed, and never one left that a later
+    /// pass would read as in flight.
+    fn could_not_run_left(
+        &self,
+        log: &Log,
+        attempt: u32,
+        k: u32,
+        reason: &str,
+        left: Option<&str>,
+    ) -> Result<GateStep, RunError> {
         let reason = reason.replace('\n', " ");
         let failures = u32::try_from(log.cnrs.iter().filter(|c| c.attempt == attempt).count())
             .unwrap_or(u32::MAX)
@@ -1426,6 +1441,9 @@ impl Gate<'_, '_> {
             "gate-could-not-run",
             Some(attempt),
         )?;
+        if let Some(why) = left {
+            self.step(&format!("{GATE_LEFT}{k} - {why}"), "gate-left", None)?;
+        }
         match wait {
             Some(passes_left) => Ok(GateStep::BackingOff { passes_left }),
             None => self.stuck("gate-could-not-run", could_not_run_stop(&reason)),
@@ -1458,19 +1476,19 @@ impl Gate<'_, '_> {
                         Ok(GateStep::Running)
                     }
                     Err(RunError::Worker(error)) => {
-                        if matches!(error, WorkerError::Failed(_)) {
-                            // A refusal made nothing (P1 answers a workspace it made with
-                            // its id): nothing waits to be found.
-                            self.step(
-                                &format!("{GATE_LEFT}{} - {LEFT_CREATE_REFUSED}", req.k),
-                                "gate-left",
-                                None,
-                            )?;
-                        }
                         let reason = gate::could_not_run(Some(&error), Duration::ZERO, None)
                             .unwrap_or_else(|| error.to_string());
                         let (_, log) = self.fresh()?;
-                        self.could_not_run(&log, req.attempt, req.k, &reason)
+                        // A refusal made nothing (P1 answers a workspace it made with its id):
+                        // nothing waits to be found, so the gate is left at once.
+                        let refused = matches!(error, WorkerError::Failed(_));
+                        self.could_not_run_left(
+                            &log,
+                            req.attempt,
+                            req.k,
+                            &reason,
+                            refused.then_some(LEFT_CREATE_REFUSED),
+                        )
                     }
                     Err(error) => Err(error),
                 };
