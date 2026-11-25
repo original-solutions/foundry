@@ -1,4 +1,191 @@
-//! A machine that is cut off ends its factory sessions.
+//! A machine that is cut off ends its factory sessions (G10).
+//!
+//! Every [`TICK`] this machine looks at the factory sessions it runs, by project, and ends
+//! them through [`Sessions::end_factory`] when, for [`CUT_OFF_AFTER`], it has neither held the
+//! project's lease nor heard from its holder: [`Freshness::since_holding`] says how long that
+//! is, and only the lease pushed here or a holding status at the highest generation seen
+//! counts there, so a not-holding status, from this machine's own coordinator or any other,
+//! saves nothing. A project's timer starts when this machine first finds one of its factory
+//! sessions running, so a session started long after the last word from a holder still gets
+//! its ten minutes. It starts again once none runs.
+//!
+//! Every age and wait is read on the sleep-counting clock of [`crate::clock`]: a Mac that
+//! slept past the ten minutes ends its sessions on the first look after it wakes.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
+
+use foundry_proto::ids::{MachineId, ProjectId, WorkspaceId};
+
+use crate::clock::Clock;
+use crate::factory::status::Freshness;
+use crate::sessions::Sessions;
+use crate::store::{Store, StoreError};
+
+/// How often the cut-off looks.
+pub const TICK: Duration = Duration::from_secs(30);
+
+/// How long a machine may go without holding a project's lease or hearing from its holder
+/// before it ends its factory sessions of the project.
+pub const CUT_OFF_AFTER: Duration = Duration::from_secs(10 * 60);
+
+/// How often the clock is read while waiting. It only paces the reads: the wait is measured on
+/// the clock.
+const POLL: Duration = Duration::from_millis(100);
+
+/// Ends this machine's factory sessions of each project it is cut off from, for ever.
+pub async fn run(
+    me: MachineId,
+    store: Arc<Mutex<Store>>,
+    sessions: Arc<Sessions>,
+    freshness: Arc<Freshness>,
+    clock: Arc<dyn Clock>,
+) {
+    Cutoff::new(me, store, sessions, freshness, clock)
+        .run()
+        .await;
+}
+
+/// The cut-off of one machine: what it reads, and when it first found each project's factory
+/// sessions running.
+pub struct Cutoff {
+    me: MachineId,
+    store: Arc<Mutex<Store>>,
+    sessions: Arc<Sessions>,
+    freshness: Arc<Freshness>,
+    clock: Arc<dyn Clock>,
+    /// Per project with factory sessions running here, the clock's reading at the look that
+    /// first found one.
+    started: BTreeMap<ProjectId, Duration>,
+    /// What the last failed read of the store said, while reads keep failing.
+    failing: Option<String>,
+}
+
+impl Cutoff {
+    /// The cut-off of machine `me`, whose session records are in `store`, read on `clock`,
+    /// which must be the clock `freshness` reads.
+    pub fn new(
+        me: MachineId,
+        store: Arc<Mutex<Store>>,
+        sessions: Arc<Sessions>,
+        freshness: Arc<Freshness>,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
+        Self {
+            me,
+            store,
+            sessions,
+            freshness,
+            clock,
+            started: BTreeMap::new(),
+            failing: None,
+        }
+    }
+
+    /// Looks at once, then every [`TICK`] on the clock, for ever.
+    pub async fn run(mut self) {
+        loop {
+            let looked = self.clock.now();
+            self.tick().await;
+            while self.clock.now().saturating_sub(looked) < TICK {
+                tokio::time::sleep(POLL).await;
+            }
+        }
+    }
+
+    /// One look: ends the factory sessions of each project this machine is cut off from. Gives
+    /// the workspaces whose factory sessions it ended, sorted. A workspace whose end failed is
+    /// left out, and is tried again at the next look.
+    pub async fn tick(&mut self) -> Vec<WorkspaceId> {
+        let running = match self.running().await {
+            Ok(running) => {
+                if self.failing.take().is_some() {
+                    tracing::info!("the cut-off can read this machine's sessions again");
+                }
+                running
+            }
+            Err(error) => {
+                if self.failing.as_ref() != Some(&error) {
+                    tracing::warn!(%error, "the cut-off cannot read this machine's sessions");
+                    self.failing = Some(error);
+                }
+                return Vec::new();
+            }
+        };
+        let now = self.clock.now();
+        self.started
+            .retain(|project, _| running.contains_key(project));
+        let mut ended = Vec::new();
+        for (project, workspaces) in running {
+            let started = *self.started.entry(project).or_insert(now);
+            let quiet = self
+                .freshness
+                .since_holding(project)
+                .min(now.saturating_sub(started));
+            if quiet < CUT_OFF_AFTER {
+                continue;
+            }
+            for workspace in workspaces {
+                match self.sessions.end_factory(workspace).await {
+                    Ok(()) => {
+                        tracing::warn!(
+                            %project,
+                            %workspace,
+                            minutes = quiet.as_secs() / 60,
+                            "cut off from the lease holder: factory sessions ended"
+                        );
+                        ended.push(workspace);
+                    }
+                    Err(error) => tracing::warn!(
+                        %project,
+                        %workspace,
+                        %error,
+                        "cut off from the lease holder, but the factory sessions did not end"
+                    ),
+                }
+            }
+        }
+        ended.sort();
+        ended
+    }
+
+    /// The workspaces of the factory sessions that run here, by project.
+    async fn running(&self) -> Result<BTreeMap<ProjectId, BTreeSet<WorkspaceId>>, String> {
+        let (store, me) = (self.store.clone(), self.me);
+        let records = tokio::task::spawn_blocking(move || {
+            store
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .sessions_of(me)
+        })
+        .await
+        // A JoinError's text carries a task id that differs each time: say a fixed one.
+        .map_err(|_| "the read of the store did not finish".to_owned())?
+        .map_err(|error: StoreError| error.to_string())?;
+        let mut live: BTreeMap<ProjectId, BTreeSet<_>> = BTreeMap::new();
+        let mut running: BTreeMap<ProjectId, BTreeSet<WorkspaceId>> = BTreeMap::new();
+        for record in records {
+            let session = record.body;
+            let Some(project) = self.sessions.is_factory(session.id) else {
+                continue;
+            };
+            let live = live.entry(project).or_insert_with(|| {
+                self.sessions
+                    .factory_sessions(project)
+                    .into_iter()
+                    .collect()
+            });
+            if live.contains(&session.id) {
+                running
+                    .entry(project)
+                    .or_default()
+                    .insert(session.workspace);
+            }
+        }
+        Ok(running)
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -57,7 +244,7 @@ exec "$agent" "$@""#;
     /// One machine: real sessions over a real holder and the fake agent, which waits for
     /// input until its terminal is closed, the fake clock and a freshness read on it.
     struct Fx {
-        data: TempDir,
+        _data: TempDir,
         worktree: TempDir,
         _home: TempDir,
         _git_home: TempDir,
@@ -131,7 +318,7 @@ exec "$agent" "$@""#;
             let clock = Arc::new(FakeClock::new());
             let freshness = Arc::new(Freshness::new(clock.clone() as Arc<dyn Clock>));
             Fx {
-                data,
+                _data: data,
                 worktree: tempfile::tempdir().unwrap(),
                 _home: home,
                 _git_home: git_home,
@@ -310,8 +497,12 @@ exec "$agent" "$@""#;
             assert_eq!(cutoff.tick().await, [], "at minute {minute}");
             f.clock.advance(MINUTE);
         }
-        f.freshness
-            .received(&not_holding(project, NotHolding::NoToken { login: LOGIN.into() }));
+        f.freshness.received(&not_holding(
+            project,
+            NotHolding::NoToken {
+                login: LOGIN.into(),
+            },
+        ));
         assert_eq!(cutoff.tick().await.len(), 1);
         f.until_ended(session).await;
     }

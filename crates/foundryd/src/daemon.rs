@@ -313,8 +313,8 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
         coordinator.clone(),
         gateway_reader.clone(),
         &api.placements,
-        clock,
-        freshness,
+        clock.clone(),
+        freshness.clone(),
         Arc::new(FactoryMarks {
             sessions: sessions.clone(),
             workspaces: workspaces.clone(),
@@ -394,6 +394,10 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
     services.spawn(named("updates", update::run(home.clone())));
     services.spawn(named("gateway health", gateway_reader.run()));
     services.spawn(named("placement", placement::run(placing.clone())));
+    services.spawn(named(
+        "the cut-off",
+        crate::factory::cutoff::run(me, store.clone(), sessions.clone(), freshness, clock),
+    ));
 
     let stopped = tokio::select! {
         _ = terminate.recv() => {
