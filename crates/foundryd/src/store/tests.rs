@@ -2248,12 +2248,18 @@ fn session_turns_give_every_turn_of_its_owner_and_match_the_per_key_read() {
     store
         .apply_factory(&turn_record(a, 2, orphan, 4), a)
         .unwrap();
+    // A session whose only turn is a non-owner's has none.
+    let only_other = owned_session(&mut store, a);
+    store
+        .apply_factory(&turn_record(b, 1, only_other, 5), b)
+        .unwrap();
     let turns = store.session_turns().unwrap();
     assert_eq!(turns.len(), 3);
+    assert!(!turns.contains_key(&only_other));
     assert_eq!(turns[&one], turn_body(one, 1));
     assert_eq!(turns[&two], turn_body(two, 2));
     assert_eq!(turns[&three], turn_body(three, 3));
-    for session in [one, two, three, orphan] {
+    for session in [one, two, three, orphan, only_other] {
         assert_eq!(
             turns.get(&session),
             store.session_turn(session).unwrap().as_ref()
@@ -2261,23 +2267,103 @@ fn session_turns_give_every_turn_of_its_owner_and_match_the_per_key_read() {
     }
 }
 
-/// `session_turn` does not look at a deleted P1 session, so neither does the bulk read.
+/// A deleted P1 session's turn is not given, and a turn of it that cannot be read is not
+/// looked at, so it fails nothing.
 #[test]
-fn session_turns_give_the_turn_of_a_deleted_session_as_session_turn_does() {
+fn session_turns_leave_out_a_deleted_session_even_with_an_unreadable_turn() {
     let (_dir, mut store) = open();
     let a = MachineId::random();
+    let live = owned_session(&mut store, a);
+    store.apply_factory(&turn_record(a, 1, live, 1), a).unwrap();
     let id = owned_session(&mut store, a);
     let AnyRecord::Session(mut gone) = session_named(a, 2, id) else {
         unreachable!();
     };
     gone.deleted = true;
     store.apply(&AnyRecord::Session(gone), a).unwrap();
-    store.apply_factory(&turn_record(a, 1, id, 1), a).unwrap();
-    assert_eq!(
-        store.session_turns().unwrap().get(&id),
-        store.session_turn(id).unwrap().as_ref()
-    );
-    assert!(store.session_turns().unwrap().contains_key(&id));
+    store.apply_factory(&turn_record(a, 2, id, 1), a).unwrap();
+    let turns = store.session_turns().unwrap();
+    assert!(!turns.contains_key(&id));
+    assert_eq!(turns[&live], turn_body(live, 1));
+    // Its turn row now cannot be read: still not looked at.
+    store
+        .conn
+        .execute(
+            "UPDATE factory_records SET record = '{\"kind\":\"printer\"}' \
+             WHERE kind = 'session_turn' AND id = ?1",
+            params![format!("{id}/{a}")],
+        )
+        .unwrap();
+    let turns = store.session_turns().unwrap();
+    assert_eq!(turns.len(), 1);
+    assert!(!turns.contains_key(&id));
+}
+
+/// A P1 session row whose id is not spelt as this build writes one is a key no
+/// `session_turn(session)` finds, so it is left out, not an error.
+#[test]
+fn session_turns_leave_out_a_session_keyed_by_an_id_spelt_otherwise() {
+    for spell in [
+        (|id: SessionId| id.to_string().to_uppercase()) as fn(SessionId) -> String,
+        |id| id.0.simple().to_string(),
+    ] {
+        let (_dir, mut store) = open();
+        let a = MachineId::random();
+        let good = owned_session(&mut store, a);
+        store.apply_factory(&turn_record(a, 1, good, 1), a).unwrap();
+        let other = owned_session(&mut store, a);
+        store
+            .apply_factory(&turn_record(a, 2, other, 2), a)
+            .unwrap();
+        let text = spell(other);
+        assert_ne!(text, other.to_string());
+        store
+            .conn
+            .execute(
+                "UPDATE records SET id = ?2 WHERE kind = 'session' AND id = ?1",
+                params![other.to_string(), text],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE factory_records SET id = ?2 WHERE kind = 'session_turn' AND id = ?1",
+                params![format!("{other}/{a}"), format!("{text}/{a}")],
+            )
+            .unwrap();
+        let turns = store.session_turns().unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[&good], turn_body(good, 1));
+    }
+}
+
+/// A `machine_held` row keyed by a machine id spelt otherwise is a key no `held(machine)`
+/// names, so it is left out, not an error.
+#[test]
+fn helds_leave_out_a_machine_keyed_by_an_id_spelt_otherwise() {
+    for spell in [
+        (|id: MachineId| id.to_string().to_uppercase()) as fn(MachineId) -> String,
+        |id| id.0.simple().to_string(),
+    ] {
+        let (_dir, mut store) = open();
+        let a = MachineId::random();
+        let b = MachineId::random();
+        store.apply_factory(&held(a, 1, &["x"]), a).unwrap();
+        store.apply_factory(&held(b, 1, &["y"]), b).unwrap();
+        let text = spell(b);
+        assert_ne!(text, b.to_string());
+        store
+            .conn
+            .execute(
+                "UPDATE factory_records SET id = ?2 WHERE kind = 'machine_held' AND id = ?1",
+                params![b.to_string(), text],
+            )
+            .unwrap();
+        let helds = store.helds().unwrap();
+        assert_eq!(helds.len(), 1);
+        assert_eq!(helds[&a], held_body(&["x"]));
+        assert_eq!(store.held(b).unwrap(), None);
+    }
 }
 
 #[test]
@@ -2315,8 +2401,31 @@ fn bulk_reads_fail_naming_the_key_on_an_unreadable_row_or_another_kind() {
     );
     let error = store.session_turns().unwrap_err();
     assert!(matches!(error, StoreError::Json(_)), "{error}");
-    assert!(error.to_string().contains(&session.to_string()), "{error}");
+    assert!(
+        error.to_string().contains(&format!("{session}/{a}")),
+        "{error}"
+    );
     assert!(!error.to_string().contains("hunter2"), "{error}");
+
+    // A value of the wrong type is not quoted either.
+    store
+        .conn
+        .execute(
+            "DELETE FROM factory_records WHERE kind = 'session_turn'",
+            [],
+        )
+        .unwrap();
+    insert_unreadable_factory(
+        &store,
+        a,
+        2,
+        "session_turn",
+        &format!("{session}/{a}"),
+        serde_json::json!({"logins": "someone-secret"}),
+    );
+    let error = store.session_turns().unwrap_err();
+    assert!(matches!(error, StoreError::Json(_)), "{error}");
+    assert!(!error.to_string().contains("someone-secret"), "{error}");
 
     let machine = MachineId::random();
     insert_unreadable_factory(
