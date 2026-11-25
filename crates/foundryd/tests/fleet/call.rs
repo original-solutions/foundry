@@ -1163,8 +1163,8 @@ impl Pair {
         &self.fleet.daemons[1]
     }
 
-    /// The run's call for `path` with `body`, made on A, which carries it to B: B's status and
-    /// the text it answered.
+    /// The run's call for `path` with `body`, made on A: the status and the text answered, by
+    /// B when B owns what the path names.
     async fn call(&self, path: &str, body: Option<Value>) -> (u16, String) {
         call_on(&self.on_a, path, body).await
     }
@@ -1268,8 +1268,12 @@ async fn every_factory_route_called_on_a_for_what_b_owns_reaches_b_and_no_answer
     let mut answers: Vec<String> = Vec::new();
 
     // A factory create naming B is made on B, with the setup and branch it names.
+    // A URL whose password is longer than a tail: cut to the tail's size before it is hidden, it
+    // would show the end of its password with no `://` before it.
     let setup = "yes 0123456789abcdef | head -n 20000; \
-                 echo fetching https://u:s3cretpass@example.com/r; echo last-line";
+                 echo fetching https://u:s3cretpass@example.com/r; \
+                 printf 'https://u:'; head -c 80000 /dev/zero | tr '\\0' P; \
+                 printf '@example.com/long\\n'; echo last-line";
     let setup = json!({"kind": "commands", "commands": [setup], "limit_secs": 60});
     let create = pair.create("fac/12-1", setup);
     let (status, text) = pair
@@ -1322,6 +1326,11 @@ async fn every_factory_route_called_on_a_for_what_b_owns_reaches_b_and_no_answer
         "the URL is shown"
     );
     assert!(!tail.contains("s3cretpass"), "its password is not");
+    assert!(
+        tail.contains("https://***@example.com/long"),
+        "the long URL is shown"
+    );
+    assert!(!tail.contains(&"P".repeat(64)), "its password is not");
     answers.push(tail);
 
     // A start the route refuses makes no session on B.
@@ -1610,6 +1619,8 @@ async fn a_run_calls_what_its_own_machine_owns_here_and_names_only_worker_routes
     assert_eq!(status, 404, "{text}");
     let (status, text) = call_on(&pair.on_b, &turn, Some(json!("not a turn"))).await;
     assert_eq!(status, 422, "{text}");
+    let (status, text) = call_on(&pair.on_b, &turn, None).await;
+    assert_eq!(status, 400, "no body is no JSON: {text}");
 
     for path in ["/api/state", "/api/workspaces", "/api/briefs"] {
         match api::factory::call(&pair.on_a.api, path, b"{}").await {
