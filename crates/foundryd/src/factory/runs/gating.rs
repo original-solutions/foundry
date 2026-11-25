@@ -45,18 +45,30 @@
 //!    `gate::backoff` passes (1, 2, 4, 8), the fifth failure being stuck. It records
 //!    `gate-could-not-run <attempt> <k> <failures> <wait> <reason>`, and each pass of the wait
 //!    records `gate-waiting <failures>` and is [`GateStep::BackingOff`]. It never spends
-//!    `gate_retries`, and the attempt keeps its number. A terminal that exited is read once:
-//!    the worker's tail is read and `gate-ended <k> <exit code>` and the tail go in one step
-//!    (the tail cut so the step, header included, is within the ledger's 64 KB: the header is
-//!    the verdict). Then the gate's workspace is archived by force (`gate-archiving <k>`, the
-//!    call, `gate-archived <k>`), `gate_command` lines (one for each command, as the exit code
-//!    says) and `gate_finished` are written, and the verdict is acted on.
+//!    `gate_retries`, and the attempt keeps its number. A gate that could not run and whose
+//!    workspace exists on a machine that is not gone is archived by force before another is
+//!    placed; a gone machine's (unreachable for `MACHINE_GONE_AFTER`) is left to
+//!    `resume::orphans`, and its slot is free all the same. A gate created whose workspace or
+//!    setup terminal the fleet does not show while its machine is online is given
+//!    `UNSEEN_PASSES` passes (`gate-unseen <k>`) for the record to arrive, and then could
+//!    not run. A terminal that exited is read once: the worker's tail is cut to its last
+//!    64 KB and kept in the `error` of a `gate_cleanup_failed` event whose `dir` is the gate's
+//!    workspace name (the one event with a text field of its own, which the ledger cuts and
+//!    hides on its own, so nothing done to the tail can reach the verdict), then
+//!    `gate-ended <k> <exit code>` records the verdict, a short step. Then the gate's workspace
+//!    is archived by force (`gate-archiving <k>`, the call, `gate-archived <k>`; a machine
+//!    that refuses as unreachable leaves it to the orphan sweep and does not block the
+//!    verdict), `gate_command` lines (one for each command, as the exit code says) and
+//!    `gate_finished` are written, and the verdict is acted on.
 //! 6. **Act.** The pull request is read again. A head that is not the one gated is
 //!    `gate-head-moved <attempt> <head>`, whichever the verdict, and the next pass gates the
 //!    new head as the next attempt; a pull request merged or closed meanwhile ends the run
 //!    first (a merge of the gated head records the pass before it ends). The attempt number
-//!    is the count of gates that gave a verdict or a moved head, plus one. `gate_retries` is
-//!    one counter per round: attempt `a` has spent `a - 1`, and an attempt past
+//!    is one more than the run's highest, and a gate's number `k` is one more than any
+//!    earlier `gate-requested` of the whole run, so a gate's name is never reused. A round
+//!    starts at the run's first gate and again at each return to `building` after `pr-open`
+//!    (the same rule resets what this module reads of its own steps); `gate_retries` is one
+//!    counter per round: the round's n-th attempt has spent `n - 1`, and an attempt past
 //!    `gate_retries + 1` is not placed, whether the gate before it failed or the head moved.
 //!    - **Fail.** A pull request someone took out of draft goes back to draft first
 //!      (`pr_set_draft`). With a retry left the failure is sent to the session once, as the
@@ -66,15 +78,23 @@
 //!      [`GateStep::SentBack`]; the session works, `building` reads its next turn and the gate
 //!      comes back with the next attempt. With none left the run is stuck
 //!      (`gate-retries-used-up`) with the factory's fixed line in the comment and the output
-//!      in the ledger only.
+//!      in the ledger only. Putting the pull request back to draft follows `building`'s rule
+//!      (a failure that got no answer from GitHub is an error asked again, a refusal with the
+//!      pull request still not a draft is stuck, one merged meanwhile ends the run).
 //!    - **Pass.** `gate_command` lines then `gate-passed <head> <count>` (cause `attempt`),
 //!      recorded before anything is marked ready. With `required_checks`, the checks on that
 //!      commit are read (`checks_read`): all passed finishes; one failed is sent back at once
 //!      as a gate failure (`messages::check_failed`, key `gate-failure <attempt> <turn>`),
 //!      stuck when no retry is left; pending or missing is [`GateStep::ChecksPending`] until
-//!      `limits.checks_minutes` have passed since the `gate-passed` line, then stuck
+//!      `limits.checks_minutes` have passed since the wait began, then stuck
 //!      (`checks-timed-out`, the read recorded first). A head that moved while the checks were
-//!      waited for is gated again, like any moved head, instead of stuck.
+//!      waited for is gated again, like any moved head, instead of stuck. A recorded pass is
+//!      finished only on the head it gated: on every path the open pull request's head is
+//!      compared with the gated commit first, and a head that moved is recorded and gated
+//!      again. The one exception is a pull request already out of draft when no checks are
+//!      waited for: the ready mark was applied (by an earlier pass that failed afterwards, as
+//!      the runner's "a PR that a crashed gate already marked ready"), and what is left is
+//!      finished as it stands.
 //! 7. **Finish a pass.** The build session is ended (`end_sessions`, recorded as
 //!    `build-session-ended`) before any GitHub write; then the pull request is marked ready,
 //!    the results are posted once, the label moves to `pr-open` and the status comment is
@@ -86,19 +106,21 @@
 //!    archive finishes it on the next call, which asks for no end of sessions, ready, comment
 //!    or label again.
 //!
-//! The output tail kept in the event is cut by the ledger to 64 KB; the text sent to the
-//! session is `messages::gate_failed` over the tail, and the stuck comment is
-//! `messages::stuck`, as the other steps do.
+//! The text sent to the session is `messages::gate_failed` over the tail, and the stuck
+//! comment is `messages::stuck`, as the other steps do. The public `Reason:` of a stuck
+//! comment holds fixed factory words; what a worker or the placement said goes in the stuck
+//! detail, in the ledger only.
 //!
-//! The wait for `required_checks` is measured on the timestamps the ledger's events carry, as
-//! `limits.minutes` is ([`building::time_limit`](super::building::time_limit)): the
-//! `gate-passed` line's, against "now" ([`advance`] reads the system's wall clock on the
-//! ledger's stamping base; [`advance_at`] is given it), through `elapsed_ms`, so a wall clock
-//! that stepped back adds no time. The sleep-counting clock `ctx.clock` is not read: its
-//! readings mean nothing to a coordinator that took over, and the wait must survive one. The
-//! spec's own `limits.minutes` rule, which excludes the checks' wait from the time a run has
-//! worked, rests on the same timestamps (`Seen::worked_ms`), so the two never disagree about
-//! when the wait began.
+//! The wait for `required_checks` is counted on the sleep-counting clock (`ctx.clock`), as
+//! every wait the factory measures is, and not on the wall clock (`limits.minutes`, which the
+//! spec takes from the events' timestamps, is the one exception, and `building` keeps it). No
+//! reading of that clock survives a coordinator change, so the start is recorded with the
+//! lease generation it was read under: `checks-waiting <generation> <ms>`, written when the
+//! wait begins. A later pass counts `now - recorded` only when the generation is the same and
+//! `now` is not below the recorded reading; otherwise (a takeover, or a reboot that reset the
+//! clock) it records a new start and the wait begins again. A takeover can therefore lengthen
+//! the wait, and never ends it early. The step is read from the round's steps and cleared by
+//! a new `gate-passed`.
 //!
 //! The placement settings (`SharedSettings`) are a parameter: `RunContext` holds none, and
 //! `placing::place_gate` needs them.
@@ -113,8 +135,9 @@
 //!   base, so a conflict is only what GitHub says (`mergeable`), with no paths.
 //! - The gate's results come from the setup terminal's exit code and tail, not from command
 //!   lines the gate wrote: a passed gate has one `gate_command` line per configured command
-//!   with exit code 0 and no duration (so the results comment's table shows exit codes only,
-//!   and no time), and a failed one a single line for the command `gate::result` names, with
+//!   with exit code 0 and no duration (so the results comment's table shows exit codes only:
+//!   `gate::gate_results_comment` always has a time column, and it reads `0.0 s`), and a
+//!   failed one a single line for the command `gate::result` names, with
 //!   the terminal's exit code. When the tail names none (the pull request's code can erase
 //!   the setup's own line), nothing is invented: the failure is the gate's commands as a
 //!   whole, written `provision and gate commands joined with " && "`, and the output is the
@@ -129,7 +152,9 @@
 //! - The session is ended and its workspace archived by force at the pass, where the runner
 //!   archived the thread and removed its worktree and left a `worktree_removed` line: Foundry
 //!   writes no such line, and a workspace that cannot be archived is an error the next pass
-//!   asks again, with the label already moved.
+//!   asks again, with the label already moved. Every gate workspace of the run is archived by
+//!   force as well, and a run that ends, is abandoned or goes stuck archives its gate in
+//!   flight (recorded first).
 //! - A turn number stands where the runner's run ordinal did, as in `building`: a failure is
 //!   sent under the prompt count the turn raised (the shared `send_once` key and count).
 //! - The pull request is bound by its branch and base here with the same words `building`
@@ -169,9 +194,7 @@ use foundry_proto::ids::{MachineId, SessionId, WorkspaceId};
 use foundry_proto::settings::SharedSettings;
 use foundry_proto::state::{SessionState, TerminalState};
 
-use super::progress::{
-    CHECKS_TIMED_OUT, GATE_PASSED, PassRecord, Seen, attempts_since_pass, read_progress,
-};
+use super::progress::{CHECKS_TIMED_OUT, GATE_PASSED, PassRecord, Seen, read_progress};
 use super::{
     ActionPayload, Closing, Progress, RunContext, RunError, SendPayload, Stop, StuckStop, abandon,
     apply_actions, closed_issue, end_own_merge, end_run, go_stuck, progress_from, recorded_reason,
@@ -179,16 +202,19 @@ use super::{
 };
 use crate::factory::config;
 use crate::factory::gate::{self, CommandResult, GateResult};
-use crate::factory::github::{CheckState, CheckStatus, Mergeable, PullRequest, TrackerError};
+use crate::factory::github::{
+    CheckState, CheckStatus, Mergeable, OtherKind, PullRequest, TrackerError,
+};
+use crate::factory::ledger::cut_output;
 use crate::factory::ledger::events::{Cause, CauseStep, CheckRead, Event, names};
-use crate::factory::ledger::{OUTPUT_LIMIT, system_ms};
 use crate::factory::lifecycle::{Event as LifecycleEvent, State, transition};
 use crate::factory::messages::{
     self, CommandFailure, FailedCheck, GateFailure, Message, SESSION_GONE, STOPPED_BY_HAND,
     prepare_output_tail, prepare_session_text,
 };
 use crate::factory::placing::{self, Slots};
-use crate::factory::text::{elapsed_ms, is_commit_id, sanitize};
+use crate::factory::text::{is_commit_id, sanitize};
+use crate::factory::worker::WorkerError;
 use crate::sessions::factory::BODY_PATH;
 
 /// The step written before a gate workspace is asked for, recording the commit gated:
@@ -196,9 +222,20 @@ use crate::sessions::factory::BODY_PATH;
 pub const GATE_REQUESTED: &str = "gate-requested ";
 /// The step written once the worker has answered the create: `gate-created <k> <workspace id>`.
 pub const GATE_CREATED: &str = "gate-created ";
-/// The step that records a gate's verdict and tail: `gate-ended <k> <exit code>` on its first
-/// line, then the setup terminal's tail (its last bytes, the step within the ledger's limit).
+/// The step that records a gate's verdict: `gate-ended <k> <exit code>`. The setup terminal's
+/// tail is kept before it, in the `error` of a `gate_cleanup_failed` event whose `dir` is the
+/// gate's workspace name: a field the ledger cuts on its own, so no cut or hiding can reach
+/// the verdict.
 pub const GATE_ENDED: &str = "gate-ended ";
+/// The step of a pass that found a created gate's workspace or setup terminal missing from
+/// the fleet while its machine is online: `gate-unseen <k>`.
+pub const GATE_UNSEEN: &str = "gate-unseen ";
+/// How many such passes in all, the one that records it included, make a created gate one
+/// that could not run.
+pub const UNSEEN_PASSES: u32 = 6;
+/// The step that starts the wait for the required checks, on the sleep-counting clock:
+/// `checks-waiting <lease generation> <clock reading in ms>`.
+pub const CHECKS_WAITING: &str = "checks-waiting ";
 /// The step written before the gate workspace is archived: `gate-archiving <k>`.
 pub const GATE_ARCHIVING: &str = "gate-archiving ";
 /// The step written after it was: `gate-archived <k>`.
@@ -256,23 +293,11 @@ pub enum GateStep {
 const MERGE_COMMAND: &str = "merge";
 
 /// One pass over `run`, whose session reported its pull request. See the module's words.
-/// "Now" is the system's wall clock on the ledger's stamping base.
 pub fn advance(
     ctx: &RunContext<'_>,
     run: &RunId,
     shared: &SharedSettings,
     slots: &mut Slots,
-) -> Result<GateStep, RunError> {
-    advance_at(ctx, run, shared, slots, system_ms())
-}
-
-/// [`advance`] with "now" given, in Unix epoch milliseconds on the ledger's stamping base.
-pub fn advance_at(
-    ctx: &RunContext<'_>,
-    run: &RunId,
-    shared: &SharedSettings,
-    slots: &mut Slots,
-    now_ms: u64,
 ) -> Result<GateStep, RunError> {
     let events = ctx.ledger.read(run)?;
     let seen = read_progress(&events);
@@ -282,30 +307,31 @@ pub fn advance_at(
     let (Some(thread), Some(last)) = (seen.thread_id.clone(), seen.last_pr.clone()) else {
         return Ok(GateStep::NotReady);
     };
-    // A closed issue is a person's move, or the run's own merged pull request, which ends the
-    // run here unless a recorded pass has the gate finish it.
-    let (closing, _) = closed_issue(ctx, run, &seen)?;
-    match closing {
-        Closing::PersonsMove => {
-            abandon(ctx, run, &seen, CauseStep::Gate)?;
-            return Ok(GateStep::Abandoned);
-        }
-        Closing::OwnMerge(pull) if seen.pass.is_none() => {
-            end_own_merge(ctx, run, &seen, CauseStep::Gate, &pull)?;
-            return Ok(GateStep::Ended);
-        }
-        Closing::OwnMerge(_) | Closing::Open => {}
-    }
     let gate = Gate {
         ctx,
         run,
         shared,
-        now_ms,
         issue: run.issue(),
         pr: last.pr,
         url: last.url,
         session: session_id(&thread)?,
     };
+    // A closed issue is a person's move, or the run's own merged pull request, which ends the
+    // run here unless a recorded pass has the gate finish it.
+    let (closing, _) = closed_issue(ctx, run, &seen)?;
+    match closing {
+        Closing::PersonsMove => {
+            gate.archive_all()?;
+            abandon(ctx, run, &seen, CauseStep::Gate)?;
+            return Ok(GateStep::Abandoned);
+        }
+        Closing::OwnMerge(pull) if seen.pass.is_none() => {
+            gate.archive_all()?;
+            end_own_merge(ctx, run, &seen, CauseStep::Gate, &pull)?;
+            return Ok(GateStep::Ended);
+        }
+        Closing::OwnMerge(_) | Closing::Open => {}
+    }
     gate.pass(slots)
 }
 
@@ -334,6 +360,8 @@ struct Req {
     archiving: bool,
     archived: bool,
     cnr: bool,
+    /// Passes that found the created gate's workspace or terminal missing from the fleet.
+    unseen: u32,
 }
 
 /// A `gate-could-not-run` step.
@@ -362,6 +390,15 @@ struct Log {
     session_ended: bool,
     build_archiving: bool,
     build_archived: bool,
+    /// The highest attempt and gate number of the whole run, and the attempt when this round
+    /// began: a round's budget counts from `base_attempt`, a gate's name is never reused.
+    base_attempt: u32,
+    max_attempt: u32,
+    max_k: u32,
+    /// The output each gate left, by gate number.
+    tails: BTreeMap<u32, String>,
+    /// The generation and sleep-counting clock reading (ms) the checks wait began at.
+    checks_wait: Option<(u64, u64)>,
 }
 
 fn number(text: Option<&str>) -> Option<u32> {
@@ -376,7 +413,28 @@ impl Log {
                 names::STATE_CHANGED => {
                     // A round starts again when the run comes back to building.
                     if event.data["to"] == State::Building.name() {
-                        log = Log::default();
+                        let (attempt, k) = (log.max_attempt, log.max_k);
+                        log = Log {
+                            base_attempt: attempt,
+                            max_attempt: attempt,
+                            max_k: k,
+                            ..Log::default()
+                        };
+                    }
+                }
+                names::GATE_COMMAND | names::GATE_SENT_BACK | "gate_checkout" => {
+                    if let Some(attempt) = event.data["attempt"].as_u64() {
+                        log.note(u32::try_from(attempt).unwrap_or(u32::MAX), 0);
+                    }
+                }
+                "gate_cleanup_failed" => {
+                    // The gate's output, in a field the ledger cuts on its own, under the
+                    // gate's name.
+                    if let (Some(dir), Some(error)) =
+                        (event.data["dir"].as_str(), event.data["error"].as_str())
+                        && let Some(k) = dir.rsplit_once("-g").and_then(|(_, k)| k.parse().ok())
+                    {
+                        log.tails.insert(k, error.to_owned());
                     }
                 }
                 "gate_finished" => {
@@ -393,7 +451,17 @@ impl Log {
                 _ => {}
             }
         }
+        for req in &mut log.reqs {
+            if let Some((_, tail)) = &mut req.ended {
+                *tail = log.tails.get(&req.k).cloned().unwrap_or_default();
+            }
+        }
         log
+    }
+
+    fn note(&mut self, attempt: u32, k: u32) {
+        self.max_attempt = self.max_attempt.max(attempt);
+        self.max_k = self.max_k.max(k);
     }
 
     fn step(&mut self, step: &str) {
@@ -406,6 +474,7 @@ impl Log {
                 part.next(),
                 part.next(),
             ) {
+                self.note(attempt, k);
                 self.reqs.push(Req {
                     attempt,
                     k,
@@ -422,12 +491,11 @@ impl Log {
                 req.created = Some(id.into());
             }
         } else if let Some(rest) = step.strip_prefix(GATE_ENDED) {
-            let (head, tail) = rest.split_once('\n').unwrap_or((rest, ""));
-            if let Some((k, code)) = head.split_once(' ')
+            if let Some((k, code)) = rest.split_once(' ')
                 && let Ok(code) = code.parse()
                 && let Some(req) = self.req(number(Some(k)))
             {
-                req.ended = Some((code, tail.to_owned()));
+                req.ended = Some((code, String::new()));
             }
         } else if let Some(k) = step.strip_prefix(GATE_ARCHIVING) {
             if let Some(req) = self.req(number(Some(k))) {
@@ -446,6 +514,7 @@ impl Log {
                 part.next(),
                 part.next(),
             ) {
+                self.note(attempt, k);
                 if let Some(req) = self.req(Some(k)) {
                     req.cnr = true;
                 }
@@ -457,16 +526,30 @@ impl Log {
                     reqs_at: self.reqs.len(),
                 });
             }
+        } else if let Some(k) = step.strip_prefix(GATE_UNSEEN) {
+            if let Some(req) = self.req(number(Some(k))) {
+                req.unseen += 1;
+            }
         } else if step.starts_with(GATE_WAITING) {
             self.waited += 1;
+        } else if let Some(rest) = step.strip_prefix(CHECKS_WAITING) {
+            if let Some((generation, ms)) = rest.split_once(' ')
+                && let (Ok(generation), Ok(ms)) = (generation.parse(), ms.parse())
+            {
+                self.checks_wait = Some((generation, ms));
+            }
+        } else if step.starts_with("gate-passed ") {
+            self.checks_wait = None;
         } else if let Some(rest) = step.strip_prefix(GATE_HEAD_MOVED) {
             if let Some(attempt) = number(rest.split(' ').next()) {
                 self.moved.insert(attempt);
+                self.note(attempt, 0);
             }
         } else if let Some(rest) = step.strip_prefix(GATE_FAILING) {
             if let Some((attempt, kind)) = rest.split_once(' ')
                 && let Some(attempt) = number(Some(attempt))
             {
+                self.note(attempt, 0);
                 self.failing.insert(attempt, kind.to_owned());
             }
         } else if step == BUILD_SESSION_ENDED {
@@ -524,15 +607,6 @@ impl Kind {
 /// `n` attempts as the stuck comment counts them: "1 attempt", "2 attempts".
 fn attempts(n: u32) -> String {
     format!("{n} {}", if n == 1 { "attempt" } else { "attempts" })
-}
-
-/// The last `max` bytes of `text`, cut on a character boundary.
-fn tail_within(text: &str, max: usize) -> &str {
-    let mut at = text.len().saturating_sub(max);
-    while !text.is_char_boundary(at) {
-        at += 1;
-    }
-    &text[at..]
 }
 
 /// Why a pull request is not the session's own, in `building`'s words.
@@ -594,6 +668,73 @@ fn check_binding(
     None
 }
 
+/// Whether a `gh` failure (`OtherKind::Failed`) is that `gh` got no answer from GitHub about
+/// the pull request, as `building` tells it: a call a signal ended (status `-1`), an answer
+/// over the output limit, a connection that failed, Go's transport error, GitHub's 5xx, and
+/// anything a mutation (`API call failed: ...`) says that is not a GraphQL answer. Any other
+/// shape is a refusal.
+fn gh_gave_no_answer(message: &str) -> bool {
+    if message.contains("` printed more than ") {
+        return true;
+    }
+    let Some((_, after)) = message.split_once("` exited with status ") else {
+        return false;
+    };
+    let Some((status, said)) = after.split_once(": ") else {
+        return false;
+    };
+    if status == "-1" || said.starts_with("error connecting to ") {
+        return true;
+    }
+    let (mutation, error) = match said.strip_prefix("API call failed: ") {
+        Some(error) => (true, error),
+        None => (false, said),
+    };
+    if let Some(status) = answered_status(error) {
+        return status >= 500;
+    }
+    if error.starts_with("GraphQL: ") {
+        return false;
+    }
+    mutation || is_url_error(error)
+}
+
+/// The status of GitHub's answer that `error` starts with, in go-gh's words
+/// (`HTTP 502: Bad Gateway (<url>)`) or shurcooL-graphql's
+/// (`non-200 OK status code: 502 Bad Gateway body: "..."`).
+fn answered_status(error: &str) -> Option<u16> {
+    let rest = error
+        .strip_prefix("HTTP ")
+        .or_else(|| error.strip_prefix("non-200 OK status code: "))?;
+    let digits = rest.get(..3)?;
+    if rest[3..].starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Whether `error` is Go's `*url.Error` (`%s %q: %s`): the method, the quoted `http` or
+/// `https` URL, `": "`, the cause.
+fn is_url_error(error: &str) -> bool {
+    error.split_once(' ').is_some_and(|(method, rest)| {
+        let mut letters = method.chars();
+        letters.next().is_some_and(|c| c.is_ascii_uppercase())
+            && letters.all(|c| c.is_ascii_lowercase())
+            && (rest.starts_with("\"http://") || rest.starts_with("\"https://"))
+            && rest.contains("\": ")
+    })
+}
+
+/// The stop of a gate that could not run: the factory's words in the comment, what the worker
+/// or the placement said in the ledger's detail only.
+fn could_not_run_stop(reason: &str) -> Stop {
+    Stop {
+        reason: "the gate could not run".into(),
+        detail: Some(format!("the gate could not run: {reason}")),
+        ..Stop::default()
+    }
+}
+
 /// Whether the session cannot be sent a message now.
 fn busy(state: SessionState) -> bool {
     !matches!(
@@ -608,7 +749,6 @@ struct Gate<'a, 'c> {
     ctx: &'a RunContext<'c>,
     run: &'a RunId,
     shared: &'a SharedSettings,
-    now_ms: u64,
     issue: u64,
     pr: u64,
     url: String,
@@ -701,6 +841,7 @@ impl Gate<'_, '_> {
     /// The stuck path, with the build session ended first and once.
     fn stuck(&self, code: &str, stop: Stop) -> Result<GateStep, RunError> {
         self.end_session()?;
+        self.archive_all()?;
         let (seen, _) = self.fresh()?;
         let mut at = self.at(&seen);
         // Ended above: `go_stuck` has nothing to stop.
@@ -739,6 +880,57 @@ impl Gate<'_, '_> {
             )));
         }
         self.stuck(&decision.code, stop)
+    }
+
+    // ----- a gate's workspace -----
+
+    /// The gate `req`'s workspace archived by force, once, with the intent recorded first. A
+    /// machine that is gone, or refuses because it is unreachable, leaves it to the sweep
+    /// that archives a run's orphans when the machine is heard from again (`resume::orphans`):
+    /// the gate is recorded archived all the same, so it holds no slot and blocks nothing.
+    fn archive_gate(&self, req: &Req) -> Result<(), RunError> {
+        if req.archived {
+            return Ok(());
+        }
+        let ctx = self.ctx;
+        let found = ctx
+            .view
+            .workspace_named(ctx.project.id, &gate::name(self.run, req.k))
+            .map(|record| (record.body.id, record.owner));
+        let id = match (&req.created, found) {
+            (Some(id), _) => Some(workspace_id(id)?),
+            (None, Some((id, _))) => Some(id),
+            (None, None) => None,
+        };
+        let machine = found
+            .map(|(_, owner)| owner)
+            .or_else(|| uuid::Uuid::parse_str(&req.machine).ok().map(MachineId));
+        let gone = machine
+            .is_some_and(|machine| ctx.view.unreachable_for(machine) >= gate::MACHINE_GONE_AFTER);
+        if let Some(id) = id.filter(|_| !gone) {
+            if !req.archiving {
+                self.step(
+                    &format!("{GATE_ARCHIVING}{}", req.k),
+                    "gate-archiving",
+                    None,
+                )?;
+            }
+            match ctx.archive(id) {
+                Ok(()) | Err(RunError::Worker(WorkerError::Unreachable(_))) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        self.step(&format!("{GATE_ARCHIVED}{}", req.k), "gate-archived", None)
+    }
+
+    /// Every gate workspace of the round that is not archived, archived: the run ends or goes
+    /// stuck, and nothing of it is left running.
+    fn archive_all(&self) -> Result<(), RunError> {
+        let (_, log) = self.fresh()?;
+        for req in log.reqs.iter().filter(|req| !req.archived) {
+            self.archive_gate(req)?;
+        }
+        Ok(())
     }
 
     // ----- the pass -----
@@ -825,13 +1017,9 @@ impl Gate<'_, '_> {
             _ => {}
         }
         let latest = log
-            .reqs
-            .iter()
-            .map(|req| req.attempt)
-            .chain(seen.command_attempts.iter().copied())
-            .chain(seen.sent_back_attempts.iter().copied())
-            .max()
-            .unwrap_or(0);
+            .max_attempt
+            .max(seen.command_attempts.last().copied().unwrap_or(0))
+            .max(seen.sent_back_attempts.last().copied().unwrap_or(0));
         let attempt = if latest == 0 {
             1
         } else if closed(latest) {
@@ -839,15 +1027,14 @@ impl Gate<'_, '_> {
         } else {
             latest
         };
+        // A gate that could not run is archived before another is placed.
+        for req in log.reqs.iter().filter(|req| req.cnr && !req.archived) {
+            self.archive_gate(req)?;
+        }
         // A gate that could not run waits its passes out.
         if let Some(cnr) = log.active_cnr() {
             match gate::backoff(cnr.failures) {
-                None => {
-                    return self.stuck(
-                        "gate-could-not-run",
-                        Stop::new(format!("the gate could not run: {}", cnr.reason)),
-                    );
-                }
+                None => return self.stuck("gate-could-not-run", could_not_run_stop(&cnr.reason)),
                 Some(wait) if log.waited < wait => {
                     self.step(
                         &format!("{GATE_WAITING}{}", cnr.failures),
@@ -867,11 +1054,12 @@ impl Gate<'_, '_> {
         }
         let pull = pull.ok_or_else(|| RunError::Invalid("a bound pull request is gone".into()))?;
         if !pull.open {
+            self.archive_all()?;
             let at = self.at(seen);
             end_run(self.ctx, &at, &self.url, Some(&pull), CauseStep::Gate)?;
             return Ok(GateStep::Ended);
         }
-        if u64::from(attempt) > self.retries() + 1 {
+        if u64::from(attempt - log.base_attempt) > self.retries() + 1 {
             return self.stuck("head-kept-moving", Stop::new(HEAD_KEPT_MOVING));
         }
         let head = pull.head_sha.to_lowercase();
@@ -909,7 +1097,7 @@ impl Gate<'_, '_> {
             .tracker
             .branch_tip(self.ctx.repo(), self.base(seen))?
             .to_lowercase();
-        let k = log.reqs.iter().map(|req| req.k).max().unwrap_or(0) + 1;
+        let k = log.max_k + 1;
         let machine = match placing::place_gate(self.ctx.view, self.shared, &self.ctx.project.login)
         {
             Ok(machine) => machine,
@@ -956,10 +1144,7 @@ impl Gate<'_, '_> {
         )?;
         match wait {
             Some(passes_left) => Ok(GateStep::BackingOff { passes_left }),
-            None => self.stuck(
-                "gate-could-not-run",
-                Stop::new(format!("the gate could not run: {reason}")),
-            ),
+            None => self.stuck("gate-could-not-run", could_not_run_stop(&reason)),
         }
     }
 
@@ -998,9 +1183,9 @@ impl Gate<'_, '_> {
                 };
             }
             None => {
-                // The workspace's record has not reached the view.
+                // The workspace's record has not reached the view, or is gone from it.
                 let gone = gate::could_not_run(None, ctx.view.unreachable_for(machine), None);
-                return self.running_or_gone(&req, gone);
+                return self.unseen(&req, machine, gone);
             }
         };
         let terminal = setup.and_then(|terminal| {
@@ -1016,13 +1201,31 @@ impl Gate<'_, '_> {
         if gone.is_some() {
             return self.running_or_gone(&req, gone);
         }
+        if terminal.is_none() {
+            return self.unseen(&req, owner, None);
+        }
         let Some((terminal, TerminalState::Exited, Some(code))) = terminal else {
             return Ok(GateStep::Running);
         };
-        let tail = ctx.tail(terminal)?;
-        let header = format!("{GATE_ENDED}{} {code}\n", req.k);
-        let kept = tail_within(&tail, OUTPUT_LIMIT.saturating_sub(header.len()));
-        self.step(&format!("{header}{kept}"), "gate-ended", Some(req.attempt))?;
+        // The output first, then the verdict: the verdict is what settles the gate, and the
+        // output is read from the worker once.
+        let (_, before) = self.fresh()?;
+        if !before.tails.contains_key(&req.k) {
+            let tail = ctx.tail(terminal)?;
+            self.record(
+                Event::GateCleanupFailed {
+                    dir: name,
+                    error: cut_output(&tail).to_owned(),
+                },
+                "gate-output",
+                req.attempt,
+            )?;
+        }
+        self.step(
+            &format!("{GATE_ENDED}{} {code}", req.k),
+            "gate-ended",
+            Some(req.attempt),
+        )?;
         let (_, log) = self.fresh()?;
         let Some(ended) = log.reqs.iter().find(|r| r.k == req.k).cloned() else {
             return Err(RunError::Invalid(
@@ -1031,6 +1234,35 @@ impl Gate<'_, '_> {
         };
         let turn = ctx.view.session_turn(self.session).map(|t| t.turn);
         self.settle(ended, turn)
+    }
+
+    /// A created gate whose workspace or setup terminal the fleet does not show. A machine
+    /// that is gone is `gone`'s; one that is online is given `UNSEEN_PASSES` passes for the
+    /// record to arrive, and then the gate could not run.
+    fn unseen(
+        &self,
+        req: &Req,
+        machine: MachineId,
+        gone: Option<String>,
+    ) -> Result<GateStep, RunError> {
+        if gone.is_some() || req.created.is_none() || !self.ctx.view.online(machine) {
+            return self.running_or_gone(req, gone);
+        }
+        self.step(
+            &format!("{GATE_UNSEEN}{}", req.k),
+            "gate-unseen",
+            Some(req.attempt),
+        )?;
+        if req.unseen + 1 < UNSEEN_PASSES {
+            return Ok(GateStep::Running);
+        }
+        let (_, log) = self.fresh()?;
+        self.could_not_run(
+            &log,
+            req.attempt,
+            req.k,
+            "the gate's workspace is not in the fleet",
+        )
     }
 
     fn running_or_gone(&self, req: &Req, gone: Option<String>) -> Result<GateStep, RunError> {
@@ -1069,19 +1301,7 @@ impl Gate<'_, '_> {
         let Some((code, tail)) = req.ended.clone() else {
             return Err(RunError::Invalid("the gate has no verdict".into()));
         };
-        if !req.archived {
-            if let Some(id) = &req.created {
-                if !req.archiving {
-                    self.step(
-                        &format!("{GATE_ARCHIVING}{}", req.k),
-                        "gate-archiving",
-                        None,
-                    )?;
-                }
-                self.ctx.archive(workspace_id(id)?)?;
-            }
-            self.step(&format!("{GATE_ARCHIVED}{}", req.k), "gate-archived", None)?;
-        }
+        self.archive_gate(&req)?;
         let commands = self.commands();
         let result = gate::result(TerminalState::Exited, Some(code), &tail, &commands);
         let failing = match &result {
@@ -1137,7 +1357,7 @@ impl Gate<'_, '_> {
         let pull = pull.ok_or_else(|| RunError::Invalid("a bound pull request is gone".into()))?;
         let head = pull.head_sha.to_lowercase();
         if log.moved.contains(&attempt) {
-            return self.after_moved(attempt);
+            return self.after_moved(attempt, &log);
         }
         if !pull.open {
             if code == 0 && pull.merged && head == req.sha {
@@ -1160,12 +1380,13 @@ impl Gate<'_, '_> {
             let mut at = self.at(&seen);
             at.worktree = None;
             self.end_session()?;
+            self.archive_all()?;
             end_run(self.ctx, &at, &self.url, Some(&pull), CauseStep::Gate)?;
             return Ok(GateStep::Ended);
         }
         if head != req.sha {
             self.moved(attempt, &head, &log)?;
-            return self.after_moved(attempt);
+            return self.after_moved(attempt, &log);
         }
         if code == 0 {
             if !pull.is_draft && !seen.ready_outside {
@@ -1215,8 +1436,8 @@ impl Gate<'_, '_> {
 
     /// A head that moved is gated again as the next attempt, which spends a retry: with none
     /// left the run is stuck.
-    fn after_moved(&self, attempt: u32) -> Result<GateStep, RunError> {
-        if u64::from(attempt) > self.retries() {
+    fn after_moved(&self, attempt: u32, log: &Log) -> Result<GateStep, RunError> {
+        if u64::from(attempt - log.base_attempt) > self.retries() {
             return self.stuck("head-kept-moving", Stop::new(HEAD_KEPT_MOVING));
         }
         Ok(GateStep::NotReady)
@@ -1249,15 +1470,42 @@ impl Gate<'_, '_> {
 
     // ----- a failed attempt -----
 
-    /// A pull request someone took out of draft goes back to draft; `Some` is the stuck step
-    /// when that cannot be done.
-    fn back_to_draft(&self, seen: &Seen, pull: &PullRequest) -> Result<Option<GateStep>, RunError> {
+    /// A pull request someone took out of draft goes back to draft, by `building`'s rule for
+    /// what GitHub's answer means. `Some` is the step the pass ends with instead: stuck when
+    /// GitHub answered and the pull request is still not a draft, or gone, and ended when it
+    /// was merged or closed meanwhile. A rate limit, a timeout, a refused login, `gh` not
+    /// starting, an answer that cannot be read, a second look that fails, and a `gh` failure
+    /// that got no answer from GitHub are an error with nothing more written, asked again
+    /// next pass.
+    fn back_to_draft(&self, pull: &PullRequest) -> Result<Option<GateStep>, RunError> {
         if !pull.open || pull.is_draft {
             return Ok(None);
         }
-        match self.ctx.mark_pr_draft(self.pr) {
-            Ok(()) => {
-                let _ = seen;
+        let failed = match self.ctx.mark_pr_draft(self.pr) {
+            Ok(()) => None,
+            Err(
+                error @ RunError::Tracker(
+                    TrackerError::NotFound { .. }
+                    | TrackerError::Other {
+                        kind: OtherKind::Failed,
+                        ..
+                    },
+                ),
+            ) => Some(error),
+            Err(error) => return Err(error),
+        };
+        match self.ctx.tracker.pull_request(self.ctx.repo(), self.pr) {
+            Err(read) => Err(failed.unwrap_or_else(|| read.into())),
+            Ok(Some(now)) if !now.open => {
+                self.archive_all()?;
+                let (seen, _) = self.fresh()?;
+                let mut at = self.at(&seen);
+                at.worktree = None;
+                self.end_session()?;
+                end_run(self.ctx, &at, &self.url, Some(&now), CauseStep::Gate)?;
+                Ok(Some(GateStep::Ended))
+            }
+            Ok(Some(now)) if failed.is_none() || now.is_draft => {
                 self.ctx.record(
                     self.run,
                     Event::PrSetDraft { pr: self.pr },
@@ -1265,11 +1513,25 @@ impl Gate<'_, '_> {
                 )?;
                 Ok(None)
             }
-            Err(RunError::Tracker(TrackerError::NotFound { .. } | TrackerError::Other { .. })) => {
-                let stop = Stop::new(reported_but(self.pr, "it is not a draft"));
+            Ok(found) => {
+                let no_answer = |error: &RunError| {
+                    matches!(
+                        error,
+                        RunError::Tracker(TrackerError::Other { message, .. })
+                            if gh_gave_no_answer(message)
+                    )
+                };
+                if let Some(error) = failed.filter(no_answer) {
+                    return Err(error);
+                }
+                let what = if found.is_some() {
+                    "it is not a draft"
+                } else {
+                    "it does not exist"
+                };
+                let stop = Stop::new(reported_but(self.pr, what));
                 Ok(Some(self.stuck("pr-not-bound", stop)?))
             }
-            Err(error) => Err(error),
         }
     }
 
@@ -1291,10 +1553,10 @@ impl Gate<'_, '_> {
                 .pull_request(self.ctx.repo(), self.pr)?
                 .ok_or_else(|| RunError::Invalid("a bound pull request is gone".into()))?,
         };
-        if let Some(step) = self.back_to_draft(&seen, &pull)? {
+        if let Some(step) = self.back_to_draft(&pull)? {
             return Ok(step);
         }
-        let since = attempts_since_pass(&seen, attempt);
+        let since = attempt - log.base_attempt;
         if u64::from(since) > self.retries() {
             let note = self.config_note(&seen, &log, attempt, kind, &pull)?;
             let (code, mut stop) = self.used_up(&seen, &log, attempt, kind, since)?;
@@ -1560,17 +1822,20 @@ impl Gate<'_, '_> {
         let required = &self.ctx.config.required_checks;
         let wanted = !required.is_empty() && seen.checks_passed.as_deref() != Some(&pass.sha);
         let pull = self.ctx.tracker.pull_request(self.ctx.repo(), self.pr)?;
-        let open = pull.as_ref().is_some_and(|pull| pull.open);
-        if !wanted {
-            return self.finish_pass(pass, open);
-        }
         let Some(pull) = pull.filter(|pull| pull.open) else {
             return self.finish_pass(pass, false);
         };
+        // Nothing is marked ready on a head that was not gated. A pull request that is
+        // already out of draft is the one exception when no checks are waited for: the mark
+        // was applied by an earlier pass of this one (or by a person), and the rest is
+        // finished as it stands.
         let head = pull.head_sha.to_lowercase();
-        if head != pass.sha {
+        if head != pass.sha && (wanted || pull.is_draft) {
             self.moved(pass.attempt, &head, log)?;
-            return self.after_moved(pass.attempt);
+            return self.after_moved(pass.attempt, log);
+        }
+        if !wanted {
+            return self.finish_pass(pass, true);
         }
         let attempt = pass.attempt;
         let minutes = self.ctx.config.limits.checks_minutes;
@@ -1587,7 +1852,7 @@ impl Gate<'_, '_> {
             .as_ref()
             .is_some_and(|failed| failed.sha == pass.sha)
         {
-            return self.checks_failed(seen, pass, &pull, state, turn, None);
+            return self.checks_failed(pass, &pull, state, turn, None);
         }
         if let Some(timed) = seen
             .checks_timed_out
@@ -1617,13 +1882,29 @@ impl Gate<'_, '_> {
                 .collect(),
         };
         if checks.iter().any(|check| check.state == CheckState::Failed) {
-            return self.checks_failed(seen, pass, &pull, state, turn, Some(read));
+            return self.checks_failed(pass, &pull, state, turn, Some(read));
         }
         if checks.iter().all(|check| check.state == CheckState::Passed) {
             self.record(read, "required-checks-read", attempt)?;
             return self.finish_pass(pass, true);
         }
-        if elapsed_ms(pass.at_ms, self.now_ms) < minutes.saturating_mul(60_000) {
+        // The wait is counted on the sleep-counting clock, from the start recorded under this
+        // lease generation. A reading from another generation, or one below the recorded
+        // (a reboot), starts the wait again: a takeover can lengthen the wait, never end it.
+        let generation = self.ctx.held()?;
+        let now = u64::try_from(self.ctx.clock.now().as_millis()).unwrap_or(u64::MAX);
+        let waited = match log.checks_wait {
+            Some((from, at)) if from == generation && now >= at => now - at,
+            _ => {
+                self.step(
+                    &format!("{CHECKS_WAITING}{generation} {now}"),
+                    "checks-waiting",
+                    Some(attempt),
+                )?;
+                0
+            }
+        };
+        if waited < minutes.saturating_mul(60_000) {
             return Ok(GateStep::ChecksPending);
         }
         let missing = checks
@@ -1637,7 +1918,6 @@ impl Gate<'_, '_> {
     /// take it.
     fn checks_failed(
         &self,
-        seen: &Seen,
         pass: &PassRecord,
         pull: &PullRequest,
         state: Option<SessionState>,
@@ -1653,7 +1933,6 @@ impl Gate<'_, '_> {
         if let Some(read) = read {
             self.record(read, "required-checks-failed", pass.attempt)?;
         }
-        let _ = seen;
         self.fail_attempt(pass.attempt, Kind::Checks, Some(pull.clone()), turn)
     }
 
@@ -4400,14 +4679,18 @@ mod tests {
             let tail = format!("$ cargo test\n{noise}\nsetup failed: cargo test exited 101\n");
             let step = gated(&mut rig, &run, 101, &tail);
             assert!(matches!(step, GateStep::Stuck { .. }));
-            let kept = rig
-                .steps(&run)
+            // The verdict is a short step of its own; the output is an event's field, cut to
+            // its last 64 KB.
+            assert!(has_step(&rig, &run, &format!("{GATE_ENDED}1 101")));
+            let kept: Vec<String> = rig
+                .events(&run)
                 .into_iter()
-                .find(|step| step.starts_with(GATE_ENDED))
-                .expect("the verdict and its tail");
-            assert!(kept.starts_with(&format!("{GATE_ENDED}1 101\n")));
-            assert!(kept.len() <= 64 * 1024, "{}", kept.len());
-            assert!(kept.ends_with("setup failed: cargo test exited 101\n"));
+                .filter(|event| event.event == "gate_cleanup_failed")
+                .map(|event| event.data["error"].as_str().unwrap().to_owned())
+                .collect();
+            assert_eq!(kept.len(), 1);
+            assert!(kept[0].len() <= 64 * 1024, "{}", kept[0].len());
+            assert!(kept[0].ends_with("setup failed: cargo test exited 101\n"));
             // What goes to a comment is cut much shorter, and holds no output.
             assert!(
                 rig.sim
@@ -4900,6 +5183,20 @@ mod tests {
         assert_eq!(gated(rig, run, 0, PASS_TAIL), GateStep::Passed { pr: 12 });
         rig.moved(run, State::PrOpen, State::Building);
         rig.sim.set_labels(&["factory:building"]);
+        // The feedback round has a session of its own.
+        rig.worker.on_start_session(Ok(session()));
+        rig.ctx()
+            .start_session(
+                workspace(),
+                FactoryStart {
+                    project: project_id(),
+                    login: LOGIN.into(),
+                    model: "opus".into(),
+                    effort: "high".into(),
+                },
+                messages::reminder(),
+            )
+            .unwrap();
         reported_again(rig, run, hub, 2);
     }
 
@@ -4952,7 +5249,13 @@ mod tests {
             hub.set_head(HEAD);
             show(&mut rig, &run, SessionState::Idle, 2, &[running(3)]);
             let step = ends(&mut rig, &run, 2, 3, 0, PASS_TAIL);
-            assert_stuck(&rig, &run, &step, "head-kept-moving", HEAD_KEPT_MOVING);
+            assert_eq!(
+                step,
+                GateStep::Stuck {
+                    reason: HEAD_KEPT_MOVING.into()
+                }
+            );
+            assert_eq!(rig.sim.labels(), ["factory:stuck"]);
         }
 
         #[test]
@@ -5177,10 +5480,14 @@ mod tests {
     mod review_the_verdict_does_not_share_a_step_with_the_tail {
         use super::*;
 
-        fn tail_steps(rig: &Rig, run: &RunId) -> Vec<String> {
-            rig.steps(run)
+        /// The gate's output events, the tail of each in its own field.
+        fn tail_events(rig: &Rig, run: &RunId) -> Vec<String> {
+            rig.events(run)
                 .into_iter()
-                .filter(|step| step.ends_with("\ngate-tail-end 1"))
+                .filter(|event| {
+                    event.event == "gate_cleanup_failed" && event.data["dir"] == "fac/8-1-g1"
+                })
+                .map(|event| event.data["error"].as_str().unwrap().to_owned())
                 .collect()
         }
 
@@ -5196,13 +5503,13 @@ mod tests {
                 GateStep::SentBack { attempt: 1 }
             );
             assert_eq!(step_count(&rig, &run, "gate-ended 1 101"), 1);
-            let kept = tail_steps(&rig, &run);
+            let kept = tail_events(&rig, &run);
             assert_eq!(kept.len(), 1);
             assert!(kept[0].len() <= 64 * 1024, "{}", kept[0].len());
             // Later passes do not read or record it again.
             show(&mut rig, &run, SessionState::Idle, 1, &[]);
             assert_eq!(go(&rig, &run), GateStep::NotReady);
-            assert_eq!(tail_steps(&rig, &run).len(), 1);
+            assert_eq!(tail_events(&rig, &run).len(), 1);
             assert_eq!(
                 calls(&rig)
                     .iter()
@@ -5220,7 +5527,7 @@ mod tests {
                 store,
                 MachineId(uuid::Uuid::from_u128(0x1)),
                 1,
-                Arc::new(|text: &str| text.replace('q', "HIDDEN-SECRET-")),
+                Arc::new(|text: &str| text.replace('#', "HIDDEN-SECRET-")),
             )
             .with_wall(crate::factory::ledger::testing::ticking(
                 crate::factory::ledger::testing::T0,
@@ -5230,14 +5537,14 @@ mod tests {
             let (mut rig, run, _hub) = built_on(rig);
             let tail = format!(
                 "$ cargo test\n{}\nsetup failed: cargo test exited 101\n",
-                "q".repeat(30_000)
+                "#".repeat(30_000)
             );
             assert_eq!(
                 gated(&mut rig, &run, 101, &tail),
                 GateStep::SentBack { attempt: 1 }
             );
             assert_eq!(step_count(&rig, &run, "gate-ended 1 101"), 1);
-            assert_eq!(tail_steps(&rig, &run).len(), 1);
+            assert_eq!(tail_events(&rig, &run).len(), 1);
             assert_eq!(
                 calls(&rig)
                     .iter()
@@ -5258,15 +5565,10 @@ mod tests {
                 gated(&mut rig, &run, 101, &tail),
                 GateStep::SentBack { attempt: 1 }
             );
-            let kept = tail_steps(&rig, &run);
+            let kept = tail_events(&rig, &run);
             assert_eq!(kept.len(), 1);
             assert!(kept[0].len() <= 64 * 1024);
-            let body = kept[0].split_once('\n').map_or("", |(_, rest)| rest);
-            assert!(
-                body.starts_with('é') || body.starts_with("\nsetup"),
-                "{}",
-                &body[..8]
-            );
+            assert!(kept[0].starts_with('é') || kept[0].starts_with("\nsetup"));
         }
     }
 
