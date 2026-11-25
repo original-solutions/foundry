@@ -3876,6 +3876,17 @@ mod tests {
                 let (rig, run) = resumed_run();
                 let f1 = WorkspaceId(uuid::Uuid::from_u128(0xe11));
                 let f2 = WorkspaceId(uuid::Uuid::from_u128(0xe12));
+                for n in [1, 2] {
+                    rig.write(
+                        &run,
+                        Event::FeedbackRelaunching {
+                            n,
+                            branch: PR_BRANCH.into(),
+                            items: vec![],
+                            message: String::new(),
+                        },
+                    );
+                }
                 let view = with_resume_workspace("fac/8-1-r1", None)
                     .workspace(workspace_record(m1(), f1, "fac/8-1-f1", None))
                     .workspace(workspace_record(m1(), f2, "fac/8-1-f2", None))
@@ -4179,21 +4190,6 @@ mod tests {
             assert!(rig.finished(&run));
         }
 
-        #[test]
-        fn a_withdrawn_approval_starts_no_session() {
-            let (rig, run) = at_the_start();
-            rig.sim
-                .set_approval(approval_answer(LABELED_AT, "mallory", &[]));
-            assert_eq!(
-                pass(&rig, &run),
-                ResumeStep::Stuck {
-                    reason: "factory:ready was not applied by an instructor".into()
-                }
-            );
-            assert!(start_calls(&rig).is_empty());
-            assert!(rig.finished(&run));
-        }
-
         /// The runner's case: "relaunched starts from base when the issue text was edited
         /// since the approval". Foundry: the run's own branch is not resumed from, and the
         /// resume starts from the base.
@@ -4260,29 +4256,6 @@ mod tests {
                 orphans(&view, project_id(), &run, &rig.events(&run)),
                 vec![fresh()]
             );
-        }
-
-        #[test]
-        fn a_machine_whose_setup_cannot_be_read_for_15_minutes_is_given_up() {
-            let (mut rig, run) = archived_and_waiting_for_a_machine();
-            rig.worker.on_create(Ok(fresh()));
-            placed_on(&rig, &run, m2());
-            rig.view = FleetView::builder()
-                .online(m1())
-                .unreachable(m2(), secs(15 * 60))
-                .workspace(workspace_record(
-                    m2(),
-                    fresh(),
-                    "fac/8-1-r1",
-                    Some(setup_terminal()),
-                ))
-                .terminal(terminal_record(TerminalState::Running, None))
-                .build();
-            assert_eq!(
-                pass(&rig, &run),
-                ResumeStep::NeedsMachine(Placing::Resume { resumes: 1 })
-            );
-            assert!(start_calls(&rig).is_empty());
         }
 
         #[test]
@@ -4497,24 +4470,6 @@ mod tests {
                     workspace: Some(fresh())
                 }
             );
-        }
-
-        #[test]
-        fn the_claim_machine_gone_does_not_interrupt_a_session_on_another() {
-            let (mut rig, run) = at_the_start();
-            resumed(&mut rig, &run);
-            rig.view = FleetView::builder()
-                .online(m2())
-                .unreachable(m1(), secs(60 * 60))
-                .workspace(workspace_record(m2(), fresh(), "fac/8-1-r1", None))
-                .session(session_owned_by(
-                    m2(),
-                    resumed_session(),
-                    fresh(),
-                    SessionState::Working,
-                ))
-                .build();
-            assert!(is_skipped(&pass(&rig, &run)));
         }
 
         // testing-2: the record comes before the act.
@@ -4818,6 +4773,385 @@ mod tests {
                 rig.steps(&run)
             );
             assert!(interruptions(&rig, &run).is_empty());
+        }
+    }
+
+    /// Cases of the second review cycle.
+    mod review_cycle_2 {
+        use serde_json::json;
+
+        use super::foundry::claimed_not_built;
+        use super::*;
+
+        fn m3() -> MachineId {
+            MachineId(uuid::Uuid::from_u128(0x4))
+        }
+
+        fn fresh3() -> WorkspaceId {
+            WorkspaceId(uuid::Uuid::from_u128(0xb33))
+        }
+
+        fn at_the_start() -> (Rig, RunId) {
+            let (mut rig, run) = archived_and_waiting_for_a_machine();
+            resume_workspace_made(&mut rig, &run);
+            (rig, run)
+        }
+
+        /// The approval answer of an issue that is `building`: the instructor's label, then the
+        /// factory's own removal of `factory:ready` when it claimed the issue.
+        fn a_building_issues_timeline() -> String {
+            let mut answer: Value =
+                serde_json::from_str(&approval_answer(LABELED_AT, "tom", &[])).unwrap();
+            let issue = &mut answer["data"]["repository"]["issue"];
+            issue["timelineItems"]["nodes"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({
+                    "__typename": "UnlabeledEvent",
+                    "createdAt": "2026-10-04T10:00:05Z",
+                    "actor": {"__typename": "User", "login": LOGIN},
+                    "label": {"name": "factory:ready"},
+                }));
+            issue["timelineItems"]["totalCount"] = json!(2);
+            answer.to_string()
+        }
+
+        /// A full page of edits by instructors since the approval: the text cannot be judged.
+        fn a_history_that_cannot_be_judged() -> String {
+            let times: Vec<String> = (0..100)
+                .map(|i| format!("2026-10-04T10:{:02}:{:02}Z", 1 + i / 60, i % 60))
+                .collect();
+            let edits: Vec<(&str, &str)> = times.iter().map(|t| (t.as_str(), "tom")).collect();
+            approval_answer(LABELED_AT, "tom", &edits)
+        }
+
+        fn a_stranger_edited_the_text() -> String {
+            approval_answer(
+                "2026-10-04T12:00:00Z",
+                "tom",
+                &[("2026-10-04T10:30:00Z", "mallory")],
+            )
+        }
+
+        // adversarial-3: a building issue has no `factory:ready` in force, so the approval is
+        // not read again; the text is.
+
+        #[test]
+        fn a_building_issues_timeline_does_not_stop_the_resume() {
+            let (rig, run) = at_the_start();
+            rig.sim.set_approval(a_building_issues_timeline());
+            assert!(matches!(
+                resumed_in(&rig, &run),
+                ResumeStep::Started { resumes: 1, .. }
+            ));
+            assert_eq!(start_calls(&rig).len(), 1);
+        }
+
+        fn resumed_in(rig: &Rig, run: &RunId) -> ResumeStep {
+            rig.worker.on_start_session(Ok(resumed_session()));
+            pass(rig, run)
+        }
+
+        // testing-12.
+
+        #[test]
+        fn a_history_that_cannot_be_judged_is_stuck_and_starts_no_session() {
+            let (rig, run) = at_the_start();
+            rig.sim.set_approval(a_history_that_cannot_be_judged());
+            assert_eq!(
+                pass(&rig, &run),
+                ResumeStep::Stuck {
+                    reason: messages::CANNOT_VERIFY_DURING_BUILD.into()
+                }
+            );
+            assert!(start_calls(&rig).is_empty());
+            assert!(!resume_steps(&rig, &run).contains(&"resume-sending 1".to_string()));
+            assert!(rig.finished(&run));
+        }
+
+        // blind-reader-6: a stuck path resume began is finished by resume, from the ledger.
+
+        /// Runs `pass` with the stuck comment failing once: the path is begun and cut short,
+        /// then the next pass finishes it.
+        fn cut_short_then_finished(rig: &Rig, run: &RunId, reason: &str) {
+            rig.sim.fail("could not finish this issue", 1);
+            assert!(advance(&rig.ctx(), run).is_err());
+            assert!(
+                rig.steps(run)
+                    .iter()
+                    .any(|step| step.starts_with("stuck-stop")),
+                "{:?}",
+                rig.steps(run)
+            );
+            assert!(!rig.finished(run));
+            assert_eq!(
+                pass(rig, run),
+                ResumeStep::Stuck {
+                    reason: reason.into()
+                }
+            );
+            assert!(rig.finished(run));
+            assert_eq!(rig.sim.labels(), vec!["factory:stuck"]);
+        }
+
+        #[test]
+        fn a_stuck_path_cut_short_after_a_setup_that_failed_is_finished() {
+            let (mut rig, run) = at_the_start();
+            rig.view = with_resume_workspace("fac/8-1-r1", Some(setup_terminal()))
+                .terminal(terminal_record(TerminalState::Exited, Some(1)))
+                .build();
+            rig.worker.on_tail(Ok("npm ERR! missing script".into()));
+            rig.worker.on_tail(Ok("npm ERR! missing script".into()));
+            cut_short_then_finished(&rig, &run, crate::factory::runs::start::SETUP_FAILED);
+            assert!(the_stuck_comment(&rig).contains("npm ERR! missing script"));
+        }
+
+        #[test]
+        fn a_stuck_path_cut_short_after_a_text_that_changed_is_finished() {
+            let (rig, run) = at_the_start();
+            rig.sim.set_approval(a_stranger_edited_the_text());
+            cut_short_then_finished(&rig, &run, messages::CHANGED_DURING_BUILD);
+        }
+
+        #[test]
+        fn a_stuck_path_cut_short_after_a_text_that_could_not_be_judged_is_finished() {
+            let (rig, run) = at_the_start();
+            rig.sim.set_approval(a_history_that_cannot_be_judged());
+            cut_short_then_finished(&rig, &run, messages::CANNOT_VERIFY_DURING_BUILD);
+        }
+
+        #[test]
+        fn a_stuck_path_cut_short_after_a_start_the_worker_refused_is_finished() {
+            let (rig, run) = at_the_start();
+            rig.worker
+                .on_start_session(Err(WorkerError::Failed("no model".into())));
+            cut_short_then_finished(&rig, &run, LAUNCH_FAILED);
+        }
+
+        #[test]
+        fn a_stuck_path_cut_short_at_the_cap_is_finished() {
+            let (mut rig, run) = interrupted();
+            rig.config.limits.interruption_resumes = 0;
+            cut_short_then_finished(&rig, &run, "the session run ended as failed");
+        }
+
+        #[test]
+        fn a_stuck_path_cut_short_for_a_branch_that_was_refused_is_finished() {
+            let (rig, run) = interrupted();
+            pr_opened(&rig, &run);
+            rig.write(
+                &run,
+                Event::GateSentBack {
+                    attempt: 1,
+                    run_ordinal: 1,
+                },
+            );
+            rig.sim.set_pull(12, pr_on("-x", false));
+            cut_short_then_finished(&rig, &run, LAUNCH_FAILED);
+        }
+
+        // blind-reader-7: a decision made because the machine was gone never asks it.
+
+        #[test]
+        fn a_stuck_path_cut_short_for_a_machine_that_was_gone_is_finished_without_asking_it() {
+            let (mut rig, run) = interrupted();
+            rig.config.limits.interruption_resumes = 0;
+            rig.view = cut_off(secs(15 * 60));
+            rig.worker
+                .on_end_sessions(Err(WorkerError::Unreachable("gone".into())));
+            cut_short_then_finished(&rig, &run, MACHINE_UNREACHABLE);
+            assert!(
+                rig.worker
+                    .calls()
+                    .iter()
+                    .all(|call| !matches!(call, Call::EndSessions { .. }))
+            );
+        }
+
+        // blind-reader-8: a machine given up is accepted once it is heard from again.
+
+        #[test]
+        fn a_machine_given_up_is_accepted_again_once_it_is_online() {
+            let (mut rig, run) = archived_and_waiting_for_a_machine();
+            rig.worker.on_create(Ok(fresh()));
+            placed_on(&rig, &run, m2());
+            rig.view = FleetView::builder()
+                .online(m1())
+                .unreachable(m2(), secs(15 * 60))
+                .build();
+            assert!(matches!(pass(&rig, &run), ResumeStep::NeedsMachine(_)));
+            assert!(placed(&rig.ctx(), &run, m2()).is_err());
+            // Heard from again: placement may pick it, and its earlier workspace of the name is
+            // found and used.
+            rig.view = with_resume_workspace("fac/8-1-r1", Some(setup_terminal()))
+                .terminal(terminal_record(TerminalState::Running, None))
+                .build();
+            rig.worker.on_create(Ok(fresh()));
+            assert_eq!(
+                placed_on(&rig, &run, m2()),
+                ResumeStep::Waiting(Wait::Workspace)
+            );
+            assert!(resume_steps(&rig, &run).contains(&format!("resume-machine 1 {}", m2())));
+        }
+
+        #[test]
+        fn a_claim_whose_machine_is_back_is_left_to_start_and_a_given_up_target_is_accepted_when_online()
+         {
+            let mut rig = Rig::new();
+            let run = run_id(1);
+            claimed_not_built(&rig, &run);
+            rig.view = FleetView::builder()
+                .online(m3())
+                .unreachable(m1(), secs(15 * 60))
+                .build();
+            rig.worker
+                .on_create(Err(WorkerError::Unreachable("timed out".into())));
+            assert!(placed(&rig.ctx(), &run, m2()).is_err());
+            rig.view = FleetView::builder()
+                .online(m3())
+                .unreachable(m1(), secs(15 * 60))
+                .unreachable(m2(), secs(15 * 60))
+                .build();
+            assert!(matches!(
+                pass(&rig, &run),
+                ResumeStep::NeedsMachine(Placing::MovedClaim { .. })
+            ));
+            assert!(placed(&rig.ctx(), &run, m2()).is_err());
+            // The target is back: placement may pick it again.
+            rig.view = FleetView::builder()
+                .online(m2())
+                .online(m3())
+                .unreachable(m1(), secs(15 * 60))
+                .build();
+            rig.worker.on_create(Ok(fresh()));
+            assert_eq!(
+                placed_on(&rig, &run, m2()),
+                ResumeStep::Moved {
+                    machine: m2(),
+                    workspace: fresh()
+                }
+            );
+        }
+
+        #[test]
+        fn a_given_up_claim_whose_own_machine_is_back_is_left_to_start() {
+            let mut rig = Rig::new();
+            let run = run_id(1);
+            claimed_not_built(&rig, &run);
+            rig.view = FleetView::builder()
+                .online(m3())
+                .unreachable(m1(), secs(15 * 60))
+                .build();
+            rig.worker
+                .on_create(Err(WorkerError::Unreachable("timed out".into())));
+            assert!(placed(&rig.ctx(), &run, m2()).is_err());
+            rig.view = FleetView::builder()
+                .online(m3())
+                .unreachable(m1(), secs(15 * 60))
+                .unreachable(m2(), secs(15 * 60))
+                .build();
+            assert!(matches!(pass(&rig, &run), ResumeStep::NeedsMachine(_)));
+            // The claim's own machine is heard from again: `start` carries on there.
+            rig.view = FleetView::builder()
+                .online(m1())
+                .online(m3())
+                .unreachable(m2(), secs(15 * 60))
+                .build();
+            let before = event_count(&rig, &run);
+            assert!(is_skipped(&pass(&rig, &run)));
+            assert_eq!(event_count(&rig, &run), before);
+        }
+
+        // maintainability-4, reliability-6: the lookups follow the ledger, not the config.
+
+        #[test]
+        fn a_huge_configured_cap_does_not_make_the_pass_probe_that_many_names() {
+            let mut rig = Rig::new();
+            rig.config.limits.interruption_resumes = 20_000_000;
+            let run = run_id(1);
+            building(&rig, &run);
+            rig.write(
+                &run,
+                Event::SessionInterrupted {
+                    resumes: 65,
+                    relaunch: false,
+                    run_ordinal: None,
+                    branch: None,
+                    t3_error: None,
+                    ended_in_pass: 0,
+                },
+            );
+            rig.write(
+                &run,
+                Event::SessionLaunched {
+                    thread_id: resumed_session().to_string(),
+                    worktree: Some(fresh().to_string()),
+                    branch: Some("fac/8-1-r65".into()),
+                    model_instance: None,
+                    model: None,
+                    model_options: None,
+                    resumed_from: None,
+                    base: Some("main".into()),
+                    title: None,
+                },
+            );
+            rig.view = FleetView::builder()
+                .online(m2())
+                .workspace(workspace_record(m2(), fresh(), "fac/8-1-r65", None))
+                .session(session_record(
+                    resumed_session(),
+                    fresh(),
+                    SessionState::Failed,
+                ))
+                .build();
+            let started = std::time::Instant::now();
+            assert!(matches!(
+                pass(&rig, &run),
+                ResumeStep::Archiving { resumes: 66, .. }
+            ));
+            // Asked again while it shows: found by its name among the ledger's.
+            assert!(matches!(
+                pass(&rig, &run),
+                ResumeStep::Archiving { resumes: 66, .. }
+            ));
+            assert!(started.elapsed() < Duration::from_secs(3));
+        }
+
+        // testing-11.
+
+        #[test]
+        fn a_record_with_no_setup_on_the_recorded_machine_is_not_the_creates_answer() {
+            let (mut rig, run) = archived_and_waiting_for_a_machine();
+            rig.step(&run, &format!("resume-machine 1 {}", m2()));
+            rig.step(&run, "resume-requested 1 fac/8-1-r1");
+            rig.view = with_resume_workspace("fac/8-1-r1", None).build();
+            rig.worker.on_create(Ok(fresh3()));
+            assert_eq!(pass(&rig, &run), ResumeStep::Waiting(Wait::Workspace));
+            let calls = create_calls(&rig);
+            assert_eq!(calls.len(), 1);
+            assert!(matches!(&calls[0], Call::Create { machine, .. } if *machine == m2()));
+            assert!(resume_steps(&rig, &run).contains(&format!("resume-workspace 1 {}", fresh3())));
+        }
+
+        // testing-13: the claim machine is gone and the session's own machine is away only a
+        // minute: the session's machine decides.
+
+        #[test]
+        fn a_session_whose_machine_is_away_a_minute_is_not_interrupted_by_the_claim_machine() {
+            let (mut rig, run) = at_the_start();
+            resumed(&mut rig, &run);
+            rig.view = FleetView::builder()
+                .unreachable(m2(), secs(60))
+                .unreachable(m1(), secs(60 * 60))
+                .workspace(workspace_record(m2(), fresh(), "fac/8-1-r1", None))
+                .session(Record {
+                    owner: m2(),
+                    ..session_record(resumed_session(), fresh(), SessionState::Working)
+                })
+                .build();
+            let before = interruptions(&rig, &run).len();
+            assert!(is_skipped(&pass(&rig, &run)));
+            assert_eq!(interruptions(&rig, &run).len(), before);
         }
     }
 }
