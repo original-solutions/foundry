@@ -1648,6 +1648,125 @@ mod tests {
         }
     }
 
+    mod the_turn_read {
+        use super::*;
+
+        fn read(steps: &[&str]) -> Option<u64> {
+            let lines: Vec<Line> = steps
+                .iter()
+                .zip(1..)
+                .map(|(text, ms)| step(ms, text))
+                .collect();
+            seen_of(&lines).turn_read
+        }
+
+        #[test]
+        fn is_the_step_text_the_building_pass_writes() {
+            assert_eq!(TURN_READ, "turn-read ");
+        }
+
+        #[test]
+        fn is_none_before_any_turn_is_read() {
+            assert_eq!(seen_of(&[]).turn_read, None);
+        }
+
+        #[test]
+        fn is_the_highest_turn_whatever_the_order() {
+            assert_eq!(read(&["turn-read 2", "turn-read 3"]), Some(3));
+            assert_eq!(read(&["turn-read 3", "turn-read 2"]), Some(3));
+            assert_eq!(read(&["turn-read 0"]), Some(0));
+        }
+
+        #[test]
+        fn starts_again_at_a_launch() {
+            let seen = seen_of(&[step(1, "turn-read 4"), launched(2)]);
+            assert_eq!(seen.turn_read, None);
+            let again = seen_of(&[step(1, "turn-read 4"), launched(2), step(3, "turn-read 1")]);
+            assert_eq!(again.turn_read, Some(1));
+        }
+
+        #[test]
+        fn starts_again_at_a_launch_that_names_no_thread() {
+            let bare = line(2, "session_launched", json!({}));
+            assert_eq!(seen_of(&[step(1, "turn-read 4"), bare]).turn_read, None);
+        }
+
+        #[test]
+        fn ignores_a_number_not_written_the_way_the_step_writes_it() {
+            for text in [
+                "turn-read 01",
+                "turn-read +1",
+                "turn-read x",
+                "turn-read ",
+                "turn-read",
+                "turn-read 1 ",
+                "turn-read -1",
+            ] {
+                assert_eq!(read(&[text]), None, "{text:?}");
+            }
+            assert_eq!(read(&["turn-read 2", "turn-read 01"]), Some(2));
+        }
+    }
+
+    mod the_questions_intent_and_the_launch {
+        use super::*;
+
+        fn since_launch(lines: &[Line]) -> bool {
+            seen_of(lines).questions_intent_since_launch
+        }
+
+        #[test]
+        fn is_false_with_no_intent() {
+            assert!(!since_launch(&[]));
+            assert!(!since_launch(&[launched(1)]));
+        }
+
+        #[test]
+        fn holds_for_an_intent_with_no_launch() {
+            assert!(since_launch(&[step(1, "questions-commenting 7")]));
+        }
+
+        #[test]
+        fn holds_for_an_intent_after_the_launch() {
+            assert!(since_launch(&[
+                launched(1),
+                step(2, "questions-commenting 7")
+            ]));
+        }
+
+        #[test]
+        fn ends_at_a_launch_after_the_intent() {
+            assert!(!since_launch(&[
+                step(1, "questions-commenting 7"),
+                launched(2)
+            ]));
+            assert!(since_launch(&[
+                step(1, "questions-commenting 7"),
+                launched(2),
+                step(3, "questions-commenting 8"),
+            ]));
+        }
+
+        #[test]
+        fn counts_a_bare_intent_and_one_with_an_id_that_is_not_a_number() {
+            assert!(since_launch(&[step(1, "questions-commenting")]));
+            assert!(since_launch(&[step(1, "questions-commenting x")]));
+            assert!(!since_launch(&[step(1, "questions-commentingx")]));
+        }
+
+        #[test]
+        fn is_not_cleared_by_posting_the_questions_or_entering_building() {
+            let intended = step(1, "questions-commenting 7");
+            let posted = line(2, "questions_posted", json!({"questions": "q"}));
+            let seen = seen_of(&[intended.clone(), posted]);
+            assert_eq!(seen.questions_commenting, None);
+            assert!(seen.questions_intent_since_launch);
+            let seen = seen_of(&[intended, moved(2, "needs-info", "building")]);
+            assert_eq!(seen.questions_commenting, None);
+            assert!(seen.questions_intent_since_launch);
+        }
+    }
+
     mod the_stuck_detail {
         use super::*;
 

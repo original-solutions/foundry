@@ -2585,6 +2585,77 @@ mod tests {
         }
     }
 
+    mod the_send_helpers {
+        use super::*;
+
+        fn sends(tries: &[(&str, SendTries)]) -> Seen {
+            Seen {
+                sends: tries
+                    .iter()
+                    .map(|(key, sent)| ((*key).to_owned(), sent.clone()))
+                    .collect(),
+                ..Seen::default()
+            }
+        }
+
+        fn may_have_typed() -> SendTries {
+            SendTries {
+                count: 3,
+                tries: 1,
+                refused: 0,
+                typed: false,
+            }
+        }
+
+        #[test]
+        fn pending_send_names_another_key_that_may_have_typed() {
+            let seen = sends(&[("a", may_have_typed()), ("b", may_have_typed())]);
+            assert_eq!(pending_send(&seen, "b"), Some("a"));
+            assert_eq!(pending_send(&seen, "c"), Some("a"));
+        }
+
+        #[test]
+        fn pending_send_does_not_name_the_key_asked_about() {
+            let seen = sends(&[("a", may_have_typed())]);
+            assert_eq!(pending_send(&seen, "a"), None);
+        }
+
+        #[test]
+        fn pending_send_does_not_name_a_typed_or_refused_key() {
+            let typed = SendTries {
+                typed: true,
+                ..may_have_typed()
+            };
+            let refused = SendTries {
+                refused: 1,
+                ..may_have_typed()
+            };
+            let seen = sends(&[("a", typed), ("b", refused)]);
+            assert_eq!(pending_send(&seen, "c"), None);
+            assert_eq!(pending_send(&Seen::default(), "c"), None);
+        }
+
+        #[test]
+        fn record_send_typed_writes_the_step_with_its_cause() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            record_send_typed(&rig.ctx(), &run, CauseStep::Advance, "forward-comment c1").unwrap();
+            assert_eq!(
+                rig.steps(&run).last().map(String::as_str),
+                Some("send-typed forward-comment c1")
+            );
+            let last = rig.events(&run).pop().unwrap();
+            let cause = last.cause.unwrap();
+            assert_eq!(cause["step"], "advance");
+            assert_eq!(cause["reason"], "send-typed");
+            assert!(
+                rig.ctx().seen(&run).unwrap().sends.is_empty(),
+                "a typed step for a key never tried creates no entry"
+            );
+        }
+    }
+
     mod stopping_a_session {
         use super::*;
 
