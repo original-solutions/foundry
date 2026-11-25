@@ -3685,11 +3685,13 @@ mod tests {
             fn a_send_that_could_not_reach_the_machine_is_an_error() {
                 let (mut rig, run) = started();
                 show_session(&mut rig, SessionState::Idle, None);
-                rig.worker
-                    .on_send(Err(SendRefused::Failed("the machine is down".into())));
+                rig.worker.on_send(Err(SendRefused::Failed {
+                    reason: "the machine is down".into(),
+                    prompts: None,
+                }));
                 assert!(matches!(
                     advance(&rig.ctx(), &run),
-                    Err(RunError::Send(SendRefused::Failed(_)))
+                    Err(RunError::Send(SendRefused::Failed { .. }))
                 ));
             }
         }

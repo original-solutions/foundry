@@ -1963,8 +1963,10 @@ mod tests {
                 comment_id: "c1".into(),
             }];
             rig.view = FleetView::builder().turn(turn(3)).build();
-            rig.worker
-                .on_send(Err(SendRefused::Failed("timed out".into())));
+            rig.worker.on_send(Err(SendRefused::Failed {
+                reason: "timed out".into(),
+                prompts: Some(3),
+            }));
             let mut at = progress(&rig, &run, State::Building);
             assert!(
                 apply_actions(&rig.ctx(), ISSUE, &mut at, &actions, &cause(), &payload).is_err()
