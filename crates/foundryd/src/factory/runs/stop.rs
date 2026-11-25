@@ -1,12 +1,21 @@
 //! How a run ends: stopped, stuck or done.
 
-use foundry_proto::factory::RunId;
+use foundry_proto::factory::{RunEvent, RunId};
+use foundry_proto::ids::{MachineId, WorkspaceId};
+use serde_json::Value;
 
+use super::gating::{self, GATE_REQUESTED};
 use super::progress::{Seen, read_progress};
-use super::{RunContext, RunError};
+use super::resume::UNREACHABLE_FOR;
+use super::{
+    Closing, Progress, RunContext, RunError, Stop, StuckStop, abandon, closed_issue, end_own_merge,
+    go_stuck, progress_from, recorded_reason, workspace_id,
+};
+use crate::factory::gate;
 use crate::factory::ledger::Ledger;
-use crate::factory::ledger::events::{Cause, CauseStep, Event};
+use crate::factory::ledger::events::{Cause, CauseStep, Event, names};
 use crate::factory::lifecycle::State;
+use crate::factory::messages::STOPPED_BY_HAND;
 use crate::factory::worker::Guard;
 
 /// What [`request`] found.
@@ -131,9 +140,239 @@ pub enum StopStep {
     Skipped { why: &'static str },
 }
 
-/// One pass over a run a stop was asked for.
-pub fn advance(_ctx: &RunContext<'_>, _run: &RunId) -> Result<StopStep, RunError> {
-    todo!()
+/// The code of the stuck path of a stop by hand, the runner's.
+const STOP_CODE: &str = "stop-requested";
+
+/// One pass over a run a stop was asked for: see the module's words.
+pub fn advance(ctx: &RunContext<'_>, run: &RunId) -> Result<StopStep, RunError> {
+    let events = ctx.ledger.read(run)?;
+    let seen = read_progress(&events);
+    if seen.finished {
+        return Ok(StopStep::Skipped { why: "finished" });
+    }
+    if !seen.stop_requested {
+        return Ok(StopStep::Skipped {
+            why: "no-stop-requested",
+        });
+    }
+    // A line that is there for a run past `building` is stale: the gate passed, and the stop is
+    // dropped. A stuck path begun is carried out, whoever began it: `building` skips this run.
+    let running = matches!(seen.state, Some(State::Building | State::Stuck));
+    if !running {
+        return Ok(StopStep::Skipped {
+            why: "not-building",
+        });
+    }
+    let mut at = progress_from(run, CauseStep::Advance, &seen, State::Building);
+    if begun(&seen) {
+        forget_unreachable_session(ctx, run, &events, &mut at);
+        let reason = finish_begun(ctx, run, &seen, &mut at)?;
+        return Ok(StopStep::Stuck { reason });
+    }
+    if seen.state != Some(State::Building) {
+        return Ok(StopStep::Skipped {
+            why: "not-building",
+        });
+    }
+    // The gate decides first, as the runner's `work_runs` leaves the run to it: its own step
+    // sticks the run, and a stop asked for while it ran is dropped once it passed.
+    if gating::gate_running(&events) || seen.pass.is_some() {
+        return Ok(StopStep::GateHolds);
+    }
+    // A closed issue is a person's move, or the run's own merge, before the stop is carried out.
+    let (closing, _) = closed_issue(ctx, run, &seen)?;
+    let unreachable = session_unreachable(ctx, run, &events, &at);
+    let bare;
+    let session_seen = if unreachable {
+        bare = without_session(&seen);
+        &bare
+    } else {
+        &seen
+    };
+    match closing {
+        Closing::PersonsMove => {
+            abandon(ctx, run, session_seen, CauseStep::Advance)?;
+            return Ok(StopStep::Abandoned);
+        }
+        Closing::OwnMerge(pull) => {
+            end_own_merge(ctx, run, session_seen, CauseStep::Advance, &pull)?;
+            return Ok(StopStep::Ended);
+        }
+        Closing::Open => {}
+    }
+    if unreachable {
+        at.worktree = None;
+    }
+    go_stuck(
+        ctx,
+        run.issue(),
+        &mut at,
+        STOP_CODE,
+        Stop::new(STOPPED_BY_HAND),
+        None,
+    )?;
+    Ok(StopStep::Stuck {
+        reason: STOPPED_BY_HAND.into(),
+    })
+}
+
+/// A stuck decision is on record and the run is not finished.
+fn begun(seen: &Seen) -> bool {
+    seen.stuck.is_some() || seen.stuck_stop.is_some()
+}
+
+/// Carries out the stuck path the ledger shows begun, with the words it recorded, and answers
+/// the reason it records. The session's text is not in the decision and is not quoted again.
+fn finish_begun(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    seen: &Seen,
+    at: &mut Progress,
+) -> Result<String, RunError> {
+    let issue = run.issue();
+    if let Some(raw) = &seen.stuck_stop {
+        let decision: StuckStop = serde_json::from_str(raw)
+            .map_err(|error| RunError::Invalid(format!("the stuck decision of {run}: {error}")))?;
+        let mut stop = decision.stop;
+        stop.detail = seen.stuck_detail.clone();
+        let reason = recorded_reason(&stop);
+        go_stuck(ctx, issue, at, &decision.code, stop, None)?;
+        return Ok(reason);
+    }
+    let Some(reason) = &seen.stuck else {
+        return Err(RunError::Invalid(format!("run {run} has no stuck path")));
+    };
+    go_stuck(
+        ctx,
+        issue,
+        at,
+        "stuck-resumed",
+        Stop::new(reason.clone()),
+        None,
+    )?;
+    Ok(reason.clone())
+}
+
+/// `seen` as of a run whose session cannot be asked to end: the steps that end one find none.
+fn without_session(seen: &Seen) -> Seen {
+    Seen {
+        thread_id: None,
+        launch_sent: false,
+        ..seen.clone()
+    }
+}
+
+/// Whether the machine of the workspace the run's session is in has been unreachable for as
+/// long as its machine's workspaces are given up on: nothing is asked of it, and it ends its
+/// own factory sessions when it is heard from again.
+fn session_unreachable(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    events: &[RunEvent],
+    at: &Progress,
+) -> bool {
+    let Some(id) = at
+        .worktree
+        .as_deref()
+        .and_then(|worktree| workspace_id(worktree).ok())
+    else {
+        return false;
+    };
+    live_workspaces(ctx, run, events)
+        .iter()
+        .any(|live| live.id == id && live.gone(ctx))
+}
+
+/// Stops the stuck path asking a machine that is given up on to end the session.
+fn forget_unreachable_session(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    events: &[RunEvent],
+    at: &mut Progress,
+) {
+    if session_unreachable(ctx, run, events, at) {
+        at.worktree = None;
+    }
+}
+
+/// A workspace of a run that the fleet shows.
+#[derive(Clone, Debug)]
+pub(super) struct Live {
+    pub id: WorkspaceId,
+    pub machine: MachineId,
+    pub name: String,
+    /// A gate's workspace: its machine is given up on sooner.
+    pub gate: bool,
+}
+
+impl Live {
+    /// Whether its machine has been unreachable for as long as the factory waits for it.
+    pub fn gone(&self, ctx: &RunContext<'_>) -> bool {
+        let after = if self.gate {
+            gate::MACHINE_GONE_AFTER
+        } else {
+            UNREACHABLE_FOR
+        };
+        ctx.view.unreachable_for(self.machine) >= after
+    }
+}
+
+/// The text of a `step_changed` event.
+fn step_text(event: &RunEvent) -> Option<&str> {
+    if event.event != names::STEP_CHANGED {
+        return None;
+    }
+    event.data.get("step").and_then(Value::as_str)
+}
+
+/// The highest number `field` holds in the `event` lines of `events`, 0 for none.
+fn highest(events: &[RunEvent], event: &str, field: &str) -> u32 {
+    events
+        .iter()
+        .filter(|line| line.event == event)
+        .filter_map(|line| line.data.get(field).and_then(Value::as_u64))
+        .max()
+        .and_then(|n| u32::try_from(n).ok())
+        .unwrap_or(0)
+}
+
+/// Every workspace the fleet shows under a name the run can have: its build workspace, a
+/// resume's (`-r<k>`), a feedback round's (`-f<k>`) and a gate's (`-g<k>`), one past the
+/// highest count its own ledger names, so a workspace being asked for is among them. A
+/// workspace is listed once, in the order of the names.
+pub(super) fn live_workspaces(ctx: &RunContext<'_>, run: &RunId, events: &[RunEvent]) -> Vec<Live> {
+    let base = format!("fac/{}-{}", run.issue(), run.attempt());
+    let gates = events
+        .iter()
+        .filter_map(step_text)
+        .filter_map(|step| step.strip_prefix(GATE_REQUESTED))
+        .filter_map(|rest| rest.split(' ').nth(1)?.parse::<u32>().ok())
+        .max()
+        .unwrap_or(0);
+    let mut named = vec![(base.clone(), false)];
+    named.extend(
+        (1..=highest(events, "session_interrupted", "resumes").saturating_add(1))
+            .map(|k| (format!("{base}-r{k}"), false)),
+    );
+    named.extend(
+        (1..=highest(events, "feedback_relaunching", "n").saturating_add(1))
+            .map(|k| (format!("{base}-f{k}"), false)),
+    );
+    named.extend((1..=gates.saturating_add(1)).map(|k| (gate::name(run, k), true)));
+    let mut found: Vec<Live> = Vec::new();
+    for (name, is_gate) in named {
+        for record in ctx.view.workspaces_named(ctx.project.id, &name) {
+            if found.iter().all(|live| live.id != record.body.id) {
+                found.push(Live {
+                    id: record.body.id,
+                    machine: record.owner,
+                    name: name.clone(),
+                    gate: is_gate,
+                });
+            }
+        }
+    }
+    found
 }
 
 #[cfg(test)]
@@ -579,10 +818,11 @@ mod tests {
             let causes: Vec<_> = rig
                 .events(&run)
                 .into_iter()
+                .skip_while(|e| e.event != "stop_requested")
                 .filter(|e| ["stuck", "state_changed", "finished"].contains(&e.event.as_str()))
-                .skip(1)
                 .map(|e| e.cause.unwrap())
                 .collect();
+            assert_eq!(causes.len(), 3);
             assert!(causes.iter().all(|cause| cause
                 == &serde_json::json!({"step": "advance", "reason": "stop-requested"})));
         }
@@ -659,7 +899,15 @@ mod tests {
         #[test]
         fn is_left_to_gating_while_a_recorded_pass_is_finished() {
             let (rig, run) = requested();
-            rig.step(&run, &format!("gate-passed {SHA} 1"));
+            rig.ledger
+                .write(
+                    &run,
+                    &Event::StepChanged {
+                        step: format!("gate-passed {SHA} 1"),
+                    },
+                    &Cause::new(CauseStep::Gate, "gate-passed").attempt(1),
+                )
+                .unwrap();
             assert_eq!(pass(&rig, &run), StopStep::GateHolds);
             assert!(calls(&rig).is_empty());
             assert!(!rig.finished(&run));
