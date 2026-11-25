@@ -2288,8 +2288,7 @@ async fn a_factory_project_whose_login_has_no_usable_token_here_is_unprocessable
     crate::secrets::Secrets::set(&secrets, "github:octocat", &format!("{token}\u{7}")).unwrap();
     let data = tempfile::tempdir().unwrap();
     let no_token = crate::git_auth::GitAuth::for_login(&secrets, "octocat", data.path())
-        .err()
-        .expect("an unusable token gives no auth");
+        .expect_err("an unusable token gives no auth");
     assert!(
         matches!(no_token, crate::git_auth::NoToken::Unset { .. }),
         "{no_token}"
@@ -2302,7 +2301,8 @@ async fn a_factory_project_whose_login_has_no_usable_token_here_is_unprocessable
     let body: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(body["error"], message.as_str(), "{body}");
 
-    // The same over the route, from a daemon that holds no token for the project's login.
+    // The same over the route, from a daemon whose workspaces hold no secret store, so no token
+    // for the project's login.
     let daemon = Daemon::new(TURN).await;
     let project = daemon.project();
     {
@@ -2336,12 +2336,19 @@ async fn a_factory_project_whose_login_has_no_usable_token_here_is_unprocessable
 }
 
 #[tokio::test]
-async fn a_token_this_machine_cannot_hand_to_git_is_still_a_server_error() {
-    let error = WorkspaceError::from(crate::git_auth::NoToken::Askpass {
+async fn a_token_this_machine_cannot_read_or_hand_to_git_is_still_a_server_error() {
+    let unread = WorkspaceError::from(crate::git_auth::NoToken::Store {
+        login: "octocat".into(),
+        source: crate::secrets::SecretsError::Locked {
+            path: PathBuf::from("/data/secrets.json"),
+        },
+    });
+    assert_answered(unread, 500).await;
+    let unwritten = WorkspaceError::from(crate::git_auth::NoToken::Askpass {
         path: PathBuf::from("/data/askpass"),
         source: std::io::Error::other("disk full"),
     });
-    assert_answered(error, 500).await;
+    assert_answered(unwritten, 500).await;
 }
 
 #[tokio::test]
