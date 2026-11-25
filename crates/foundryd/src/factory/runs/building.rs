@@ -93,21 +93,22 @@
 //!   [`end_run`], [`abandon`] and [`end_own_merge`]; the cases
 //!   here are Foundry's own.
 
-use foundry_proto::factory::{RunEvent, RunId, SessionTurn};
+use foundry_proto::factory::{RunId, SessionTurn};
 use foundry_proto::ids::SessionId;
 use foundry_proto::state::SessionState;
 
 use super::progress::{
-    QUESTIONS_COMMENTING, RESULT_LINE_REMINDED, RESULT_LINE_REMINDING, SEND_TYPED, Seen, SendTries,
-    TIME_LIMIT as TIME_LIMIT_CODE, pending_relaunch, read_progress,
+    RESULT_LINE_REMINDED, RESULT_LINE_REMINDING, Seen, SendTries, TIME_LIMIT as TIME_LIMIT_CODE,
+    TURN_READ, pending_relaunch, read_progress,
 };
 use super::{
     ActionPayload, Closing, Progress, RunContext, RunError, Stop, StuckStop, abandon,
-    apply_actions, closed_issue, end_own_merge, end_run, finish_building, go_stuck, progress_from,
-    recorded_reason, send_once, session_id, stop_session, workspace_id,
+    apply_actions, closed_issue, end_own_merge, end_run, finish_building, go_stuck, pending_send,
+    progress_from, record_send_typed, recorded_reason, send_once, session_id, stop_session,
+    workspace_id,
 };
 use crate::factory::github::{IssueDetail, OtherKind, PullRequest, TrackerError};
-use crate::factory::ledger::events::{Cause, CauseStep, Event, Outcome, names};
+use crate::factory::ledger::events::{Cause, CauseStep, Event, Outcome};
 use crate::factory::lifecycle::result_line::{
     self, NO_MESSAGE, NO_RESULT_LINE, SAID_STUCK, SessionResult,
 };
@@ -119,11 +120,6 @@ use crate::factory::messages::{
 use crate::factory::text::elapsed_ms;
 use crate::sessions::factory::SendRefused;
 use crate::sessions::turns::TurnText;
-
-/// The ledger step written last when a turn was acted on and the run goes on: `turn-read <n>`.
-/// A turn number only rises, so the newest one read since the session was launched is the
-/// highest.
-pub const TURN_READ: &str = "turn-read ";
 
 /// The public reason of a session that stopped to wait for a person.
 pub const SESSION_WAITING: &str = "the session stopped to wait for a person";
@@ -254,7 +250,7 @@ pub fn advance(ctx: &RunContext<'_>, run: &RunId) -> Result<BuildStep, RunError>
         return Ok(BuildStep::Interrupted);
     };
     let turn = ctx.view.session_turn(session).cloned();
-    let read = newest_turn_read(&events);
+    let read = seen.turn_read;
     let waiting = |turn: &Option<SessionTurn>| turn.as_ref().is_some_and(|turn| turn.question);
     let step = Step {
         ctx,
@@ -324,36 +320,6 @@ fn not_this_steps(run: &RunId, seen: &Seen) -> Option<String> {
     Some(format!("run {run} {reason}"))
 }
 
-/// The newest turn read since the session was launched: the highest `turn-read <n>` step after
-/// the newest `session_launched` line.
-fn newest_turn_read(events: &[RunEvent]) -> Option<u64> {
-    let mut newest = None;
-    for event in events {
-        if event.event == names::SESSION_LAUNCHED {
-            newest = None;
-        } else if event.event == names::STEP_CHANGED
-            && let Some(n) = event
-                .data
-                .get("step")
-                .and_then(serde_json::Value::as_str)
-                .and_then(|step| step.strip_prefix(TURN_READ))
-                .and_then(canonical)
-        {
-            newest = Some(newest.map_or(n, |read: u64| read.max(n)));
-        }
-    }
-    newest
-}
-
-/// `text` as a number written the way this step writes one: digits only, no sign, no leading
-/// zero except `0` itself.
-fn canonical(text: &str) -> Option<u64> {
-    let plain = !text.is_empty()
-        && text.bytes().all(|b| b.is_ascii_digit())
-        && (text == "0" || !text.starts_with('0'));
-    if plain { text.parse().ok() } else { None }
-}
-
 /// `text` prepared as session text, or `None` when nothing is left of it.
 fn prepared(text: &str) -> Option<String> {
     let text = prepare_session_text(text);
@@ -383,15 +349,6 @@ fn lacks_result_line(reason: &str) -> bool {
 /// The key of the reminder for turn `n` in the sends of a session, as `send_once` keeps them.
 fn reminder_key(n: u64) -> String {
     format!("result-line-reminder {n}")
-}
-
-/// Whether a send of another key may have typed and is not known typed: `send_once` would
-/// refuse the reminder for it ([`RunError::SendPending`]), after the step that says the
-/// reminder was begun was written. Asked first, so that a pass that cannot send writes nothing.
-fn another_send_pending(seen: &Seen, key: &str) -> bool {
-    seen.sends
-        .iter()
-        .any(|(other, sent)| other != key && sent.pending())
 }
 
 /// Gives back an issue that an older version's claim left `factory:building` and assigned to
@@ -697,11 +654,7 @@ impl Step<'_, '_> {
                 // no later send to the session is refused for it.
                 let key = reminder_key(u64::from(k));
                 if seen.sends.get(&key).is_some_and(SendTries::pending) {
-                    self.ctx.record_step(
-                        self.run,
-                        &format!("{SEND_TYPED}{key}"),
-                        &self.cause("send-typed"),
-                    )?;
+                    record_send_typed(self.ctx, self.run, CauseStep::Advance, &key)?;
                 }
                 self.ctx.record_step(
                     self.run,
@@ -747,7 +700,7 @@ impl Step<'_, '_> {
                     // `send_once`'s rule (one message at a time to a session), applied before
                     // the step that begins the reminder is written, so that a pass that cannot
                     // send writes nothing.
-                    if another_send_pending(seen, &reminder_key(turn.turn)) {
+                    if pending_send(seen, &reminder_key(turn.turn)).is_some() {
                         return Ok(BuildStep::Running);
                     }
                     self.ctx.record_step(
@@ -953,7 +906,7 @@ pub fn time_limit(ctx: &RunContext<'_>, run: &RunId) -> Result<LimitStep, RunErr
 }
 
 /// Whether `turn` ended and was not read yet, `read` being the newest turn read since the last
-/// launch ([`newest_turn_read`]): the one rule for it.
+/// launch ([`Seen::turn_read`]): the one rule for it.
 fn unread(turn: &SessionTurn, read: Option<u64>) -> bool {
     turn.turn > 0 && read.is_none_or(|read| turn.turn > read)
 }
@@ -976,36 +929,16 @@ fn turn_to_act_on(
 /// acts on a turn ([`turn_to_act_on`]), and the session was not launched again after the
 /// intent. The policy: a session launched after the intent has work of its own, so the limit
 /// does not wait for it, even though `advance` could still finish the old comment with the
-/// new session's questions (`progress.rs` keeps `questions_commenting` across a launch;
-/// dropping the intent at a launch belongs there, not here).
-fn advance_can_finish_questions(ctx: &RunContext<'_>, events: &[RunEvent], seen: &Seen) -> bool {
+/// new session's questions (`progress.rs` keeps `questions_commenting` across a launch, and
+/// reads the order of the intent and the launch as `questions_intent_since_launch`).
+fn advance_can_finish_questions(ctx: &RunContext<'_>, seen: &Seen) -> bool {
     let Some(session) = seen.thread_id.as_deref().and_then(|t| session_id(t).ok()) else {
         return false;
     };
-    if turn_to_act_on(ctx, newest_turn_read(events), session).is_none() {
+    if turn_to_act_on(ctx, seen.turn_read, session).is_none() {
         return false;
     }
-    // The order of the intent and the newest launch is the one thing the ledger scan answers;
-    // the intent's presence is in `seen`, matched as `progress.rs` matches it.
-    let intent = events.iter().rposition(|event| {
-        event.event == names::STEP_CHANGED
-            && event
-                .data
-                .get("step")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|step| {
-                    step == QUESTIONS_COMMENTING
-                        || step.starts_with(&format!("{QUESTIONS_COMMENTING} "))
-                })
-    });
-    let launch = events
-        .iter()
-        .rposition(|event| event.event == names::SESSION_LAUNCHED);
-    match (intent, launch) {
-        (Some(intent), Some(launch)) => launch < intent,
-        (Some(_), None) => true,
-        (None, _) => false,
-    }
+    seen.questions_intent_since_launch
 }
 
 /// [`time_limit`] with "now" given, in Unix epoch milliseconds on the ledger's stamping base:
@@ -1050,7 +983,7 @@ fn time_limit_at(ctx: &RunContext<'_>, run: &RunId, now_ms: u64) -> Result<Limit
     }
     // The questions' comment begun: `advance` finishes it only by reading that turn again, so
     // while it can. Otherwise the run is not held for it.
-    if seen.questions_commenting.is_some() && advance_can_finish_questions(ctx, &events, &seen) {
+    if seen.questions_commenting.is_some() && advance_can_finish_questions(ctx, &seen) {
         return skipped("has a questions comment begun, which advance finishes");
     }
     // The launch was sent and no session recorded: `resume` names its session.

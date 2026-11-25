@@ -579,6 +579,31 @@ pub fn apply_actions(
     Ok(())
 }
 
+/// The key of a send other than `key` that may have typed and is not known typed: the one
+/// [`send_once`] refuses every other send for ([`RunError::SendPending`]). The first in the
+/// order `seen.sends` keeps them, if there are several.
+pub(super) fn pending_send<'a>(seen: &'a Seen, key: &str) -> Option<&'a str> {
+    seen.sends
+        .iter()
+        .find(|(other, sent)| other.as_str() != key && sent.pending())
+        .map(|(other, _)| other.as_str())
+}
+
+/// Records that the message under `key` is known typed: the step `send-typed <key>`, written
+/// by `step` of the runner.
+pub(super) fn record_send_typed(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    step: CauseStep,
+    key: &str,
+) -> Result<(), RunError> {
+    ctx.record_step(
+        run,
+        &format!("{SEND_TYPED}{key}"),
+        &Cause::new(step, "send-typed"),
+    )
+}
+
 /// A message sent once to a session that has taken its launch (the launch and its resend by
 /// count are sent by start.rs, before the session shows a turn). Every try goes under the
 /// session's prompt count, so that a try whose line was typed is refused instead of typed again.
@@ -613,14 +638,9 @@ fn send_once(
     if before.is_some_and(|sent| sent.typed) {
         return Ok(());
     }
-    if let Some((pending, _)) = at
-        .seen
-        .sends
-        .iter()
-        .find(|(other, sent)| other.as_str() != key && sent.pending())
-    {
+    if let Some(pending) = pending_send(&at.seen, key) {
         return Err(RunError::SendPending {
-            key: pending.clone(),
+            key: pending.to_owned(),
         });
     }
     let may_have_typed = before.is_some_and(SendTries::may_have_typed);
@@ -637,7 +657,7 @@ fn send_once(
         |name: &str, text: String| ctx.record_step(&at.run, &text, &Cause::new(at.step, name));
     let intent = |count: u64| step("send-intent", format!("{SEND_INTENT}{key} {count}"));
     let refused = || step("send-refused", format!("{SEND_REFUSED}{key}"));
-    let typed = || step("send-typed", format!("{SEND_TYPED}{key}"));
+    let typed = || record_send_typed(ctx, &at.run, at.step, key);
     ctx.held()?;
     intent(count)?;
     // The lease was checked just above, so no lost lease can follow the intent and leave a try
@@ -2582,6 +2602,77 @@ mod tests {
                 ),
                 Err(RunError::Transition(_))
             ));
+        }
+    }
+
+    mod the_send_helpers {
+        use super::*;
+
+        fn sends(tries: &[(&str, SendTries)]) -> Seen {
+            Seen {
+                sends: tries
+                    .iter()
+                    .map(|(key, sent)| ((*key).to_owned(), sent.clone()))
+                    .collect(),
+                ..Seen::default()
+            }
+        }
+
+        fn may_have_typed() -> SendTries {
+            SendTries {
+                count: 3,
+                tries: 1,
+                refused: 0,
+                typed: false,
+            }
+        }
+
+        #[test]
+        fn pending_send_names_another_key_that_may_have_typed() {
+            let seen = sends(&[("a", may_have_typed()), ("b", may_have_typed())]);
+            assert_eq!(pending_send(&seen, "b"), Some("a"));
+            assert_eq!(pending_send(&seen, "c"), Some("a"));
+        }
+
+        #[test]
+        fn pending_send_does_not_name_the_key_asked_about() {
+            let seen = sends(&[("a", may_have_typed())]);
+            assert_eq!(pending_send(&seen, "a"), None);
+        }
+
+        #[test]
+        fn pending_send_does_not_name_a_typed_or_refused_key() {
+            let typed = SendTries {
+                typed: true,
+                ..may_have_typed()
+            };
+            let refused = SendTries {
+                refused: 1,
+                ..may_have_typed()
+            };
+            let seen = sends(&[("a", typed), ("b", refused)]);
+            assert_eq!(pending_send(&seen, "c"), None);
+            assert_eq!(pending_send(&Seen::default(), "c"), None);
+        }
+
+        #[test]
+        fn record_send_typed_writes_the_step_with_its_cause() {
+            let rig = Rig::new();
+            let run = run_id(1);
+            building(&rig, &run);
+            record_send_typed(&rig.ctx(), &run, CauseStep::Forward, "forward-comment c1").unwrap();
+            assert_eq!(
+                rig.steps(&run).last().map(String::as_str),
+                Some("send-typed forward-comment c1")
+            );
+            let last = rig.events(&run).pop().unwrap();
+            let cause = last.cause.unwrap();
+            assert_eq!(cause["step"], "forward");
+            assert_eq!(cause["reason"], "send-typed");
+            assert!(
+                rig.ctx().seen(&run).unwrap().sends.is_empty(),
+                "a typed step for a key never tried creates no entry"
+            );
         }
     }
 

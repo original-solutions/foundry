@@ -252,7 +252,6 @@ use foundry_proto::record::{Record, Workspace};
 use foundry_proto::state::{SessionState, TerminalState};
 use serde_json::Value;
 
-use super::building::TURN_READ;
 use super::progress::{
     STUCK_DETAIL, STUCK_STOP, Seen, WORKSPACE_CREATED, WORKSPACE_REQUESTED, pending_relaunch,
     read_progress,
@@ -739,31 +738,6 @@ fn moved_to(events: &[RunEvent]) -> (Option<MachineId>, Vec<MachineId>) {
     (moved, gave_up)
 }
 
-/// The newest turn read since the session was launched: the highest `turn-read <n>` after the
-/// newest `session_launched` line.
-fn newest_turn_read(events: &[RunEvent]) -> Option<u64> {
-    let mut newest = None;
-    for event in events {
-        if event.event == names::SESSION_LAUNCHED {
-            newest = None;
-        } else if let Some(n) = step_text(event)
-            .and_then(|step| step.strip_prefix(TURN_READ))
-            .and_then(canonical)
-        {
-            newest = Some(newest.map_or(n, |read: u64| read.max(n)));
-        }
-    }
-    newest
-}
-
-/// `text` as a number written the way the building step writes one.
-fn canonical(text: &str) -> Option<u64> {
-    let plain = !text.is_empty()
-        && text.bytes().all(|b| b.is_ascii_digit())
-        && (text == "0" || !text.starts_with('0'));
-    if plain { text.parse().ok() } else { None }
-}
-
 /// `text` prepared as session text, or `None` when nothing is left of it.
 fn prepared(text: &str) -> Option<String> {
     let text = prepare_session_text(text);
@@ -938,13 +912,14 @@ fn old_machine_gone(ctx: &RunContext<'_>, run: &RunId, events: &[RunEvent], seen
     old_owner(ctx, run, events, seen).is_some_and(|machine| unreachable_long(ctx, machine))
 }
 
-/// The newest turn of `session` that was not read since its launch.
+/// The newest turn of `session` that was not read since its launch: newer than the turn read
+/// that `building` recorded, as `seen` holds it.
 fn unread_turn(
     ctx: &RunContext<'_>,
-    events: &[RunEvent],
+    seen: &Seen,
     session: SessionId,
 ) -> Option<foundry_proto::factory::SessionTurn> {
-    let read = newest_turn_read(events);
+    let read = seen.turn_read;
     ctx.view
         .session_turn(session)
         .filter(|turn| turn.turn > 0 && read.is_none_or(|read| turn.turn > read))
@@ -1036,7 +1011,7 @@ fn finish_own_stuck(
         && let Some(thread) = &seen.thread_id
     {
         let session = session_id(thread)?;
-        if let Some(turn) = unread_turn(ctx, events, session) {
+        if let Some(turn) = unread_turn(ctx, seen, session) {
             ctx.held()?;
             if let Ok(said) = ctx.worker.turn(session, turn.turn) {
                 stop.session_text = prepared(&said.message);
@@ -1103,13 +1078,13 @@ fn ended(
             } else {
                 "finished"
             };
-            let text = match unread_turn(ctx, events, session) {
+            let text = match unread_turn(ctx, seen, session) {
                 // A turn record syncs apart from its session's, and can be written after the
                 // session ended: the turn after the newest read is asked of the worker. One it
                 // answers is written and not shown yet, so nothing is decided until it shows. One
                 // it says was never written means the process ended before a result line.
                 None => {
-                    let next = newest_turn_read(events).map_or(1, |read| read + 1);
+                    let next = seen.turn_read.map_or(1, |read| read + 1);
                     ctx.held()?;
                     match ctx.worker.turn(session, next) {
                         Ok(_) => return Ok(None),
