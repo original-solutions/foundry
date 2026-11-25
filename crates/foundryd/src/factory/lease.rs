@@ -19,10 +19,15 @@
 //! - A missing ref is taken at once, at one more than the highest generation seen, with the
 //!   push expecting no ref.
 //! - A ref that names this machine is renewed at once when this machine holds nothing yet (a
-//!   restart) and otherwise once 60 seconds have passed since the last push began.
+//!   restart) and otherwise once 60 seconds have passed since the last push began. A commit
+//!   naming this machine at a generation below one seen since is an old one the ref was put
+//!   back to, and counts as another machine's.
 //! - A ref that names another machine, or holds a commit the lease did not write, is taken
-//!   over at one more than the highest generation seen, once the same commit has been seen
-//!   unchanged for 180 seconds.
+//!   over once the same commit has been seen unchanged for 180 seconds, at
+//!   `max(ref generation, highest seen) + 1`: the ref's generation raised by one unless the
+//!   caller or this lease has seen higher.
+//! - A generation or count that cannot be raised is never pushed, and a message that holds
+//!   `u64::MAX` is a commit the lease did not write.
 //!
 //! Every push is a compare-and-swap (`--force-with-lease`), so a race has one winner. The loser
 //! stops acting at once: its hold is dropped before it reads who won.
@@ -30,7 +35,7 @@
 use std::fmt;
 use std::io::Read;
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
@@ -88,12 +93,16 @@ pub enum LeaseState {
     /// The lease was made with no token, so it runs no git.
     NoToken,
     /// This machine does not hold the lease and no holder is known, so there is no honest
-    /// [`MachineId`] to name: the ref could not be read and none was read before, or the ref
-    /// is missing and the take failed, or it holds a commit the lease did not write. `reason`
-    /// is a fixed text.
+    /// [`MachineId`] to name for [`LeaseState::HeldBy`]: the ref could not be read, or this
+    /// tick's push failed, or the ref is missing and could not be taken, or it holds a commit
+    /// the lease did not write. `reason` is one of a few fixed texts, never git's own words.
+    ///
+    /// A pass writes it as a `FactoryStatus` with `holds: false`, `not_holding: None` and
+    /// `reason` as `idle`, since `NotHolding` has only `NoToken` and `HeldBy`, and neither can
+    /// name an unknown holder.
     Unknown {
-        /// Why no holder is known.
-        reason: String,
+        /// Why no holder is known: a fixed text.
+        reason: &'static str,
     },
 }
 
@@ -117,10 +126,17 @@ impl Parsed {
                 .find_map(|line| line.strip_prefix(name)?.strip_prefix(": "))
                 .map(str::trim)
         };
+        let generation: u64 = field("generation")?.parse().ok()?;
+        let renewals: u64 = field("renewals")?.parse().ok()?;
+        // A count that cannot be raised is a message the lease did not write: it never makes
+        // one, and a number it could not raise would wrap or stop a take or a renewal for good.
+        if generation == u64::MAX || renewals == u64::MAX {
+            return None;
+        }
         Some(Parsed {
             holder: MachineId(field("holder")?.parse::<Uuid>().ok()?),
-            generation: field("generation")?.parse().ok()?,
-            renewals: field("renewals")?.parse().ok()?,
+            generation,
+            renewals,
         })
     }
 }
@@ -152,11 +168,20 @@ enum LastRead {
     Done,
 }
 
+/// What went wrong in one tick, for its report.
+#[derive(Clone, Copy, Debug, Default)]
+struct Notes {
+    read_failed: bool,
+    push_failed: bool,
+}
+
 #[derive(Debug)]
 struct State {
     hold: Option<Hold>,
     seen: Option<Seen>,
     last_read: LastRead,
+    /// What went wrong in the tick that is running or ran last.
+    note: Notes,
     /// The highest generation seen anywhere: told by the caller, read in the ref, or pushed.
     highest: u64,
     released: bool,
@@ -299,6 +324,7 @@ impl Lease {
                     hold: None,
                     seen: None,
                     last_read: LastRead::Never,
+                    note: Notes::default(),
                     highest: 0,
                     released: false,
                 }),
@@ -314,11 +340,6 @@ impl Lease {
         self
     }
 
-    /// The project this lease is for.
-    pub fn project(&self) -> ProjectId {
-        self.project
-    }
-
     /// The guard that says whether this machine may act now. It never waits on a push.
     pub fn guard(&self) -> LeaseGuard {
         LeaseGuard {
@@ -326,7 +347,9 @@ impl Lease {
         }
     }
 
-    /// Stops acting: the guard fails from now on and no later tick pushes. Nothing is pushed
+    /// Stops acting for good: a released lease never acts again, and a machine that acts
+    /// again makes a new [`Lease`], which renews at once since the ref still names it. The
+    /// guard fails from now on and no later tick pushes. Nothing is pushed
     /// here. A machine that stops acting stops renewing, and the next coordinator takes over
     /// after the wait.
     pub fn release(&self) {
@@ -348,6 +371,7 @@ impl Lease {
                 drop(state);
                 return self.report();
             }
+            state.note = Notes::default();
         }
         let Some(auth) = &self.auth else {
             return LeaseState::NoToken;
@@ -372,6 +396,18 @@ impl Lease {
             return LeaseState::Held { generation };
         }
         let state = self.shared.state();
+        // This tick's failures first: a machine that could not read or push must not name a
+        // holder it read before as if it had just looked.
+        if state.note.read_failed {
+            return LeaseState::Unknown {
+                reason: "the lease ref could not be read",
+            };
+        }
+        if state.note.push_failed {
+            return LeaseState::Unknown {
+                reason: "the lease could not be pushed",
+            };
+        }
         if let Some(Seen {
             lease: Some(lease), ..
         }) = &state.seen
@@ -387,16 +423,17 @@ impl Lease {
             (None, LastRead::Done) => "the lease ref is missing and could not be taken",
             (Some(_), _) => "the lease ref holds a commit foundryd did not write",
         };
-        LeaseState::Unknown {
-            reason: reason.into(),
-        }
+        LeaseState::Unknown { reason }
     }
 
     /// Records what was read in the ref, without deciding anything.
     fn observe(&self, read: &Found, now: Duration) {
         let mut state = self.shared.state();
         match read {
-            Found::Failed => state.last_read = LastRead::Failed,
+            Found::Failed => {
+                state.last_read = LastRead::Failed;
+                state.note.read_failed = true;
+            }
             Found::Missing => {
                 state.last_read = LastRead::Done;
                 state.seen = None;
@@ -427,25 +464,36 @@ impl Lease {
             Found::Failed => Plan::Nothing,
             Found::Missing => {
                 state.hold = None;
-                Plan::Push {
-                    generation: state.highest + 1,
-                    renewals: 0,
-                    expect: None,
+                match state.highest.checked_add(1) {
+                    Some(generation) => Plan::Push {
+                        generation,
+                        renewals: 0,
+                        expect: None,
+                    },
+                    None => Plan::Nothing,
                 }
             }
             Found::Present { sha, parsed } => {
-                if let Some(parsed) = parsed.filter(|parsed| parsed.holder == self.me) {
+                // A commit naming this machine at a generation below one seen since is an old
+                // one that the ref was put back to: it is treated as another machine's.
+                let mine = parsed.filter(|parsed| {
+                    parsed.holder == self.me && parsed.generation >= state.highest
+                });
+                if let Some(parsed) = mine {
                     let fresh = state.hold.as_ref().is_some_and(|hold| {
                         hold.sha == *sha && now.saturating_sub(hold.started) < RENEW_AFTER
                     });
-                    return if fresh {
-                        Plan::Nothing
-                    } else {
-                        Plan::Push {
+                    if fresh {
+                        return Plan::Nothing;
+                    }
+                    // A count that cannot be raised is not renewed this tick.
+                    return match parsed.renewals.checked_add(1) {
+                        Some(renewals) => Plan::Push {
                             generation: parsed.generation,
-                            renewals: parsed.renewals + 1,
+                            renewals,
                             expect: Some(sha.clone()),
-                        }
+                        },
+                        None => Plan::Nothing,
                     };
                 }
                 state.hold = None;
@@ -453,11 +501,14 @@ impl Lease {
                 if now.saturating_sub(since) < TAKE_OVER_AFTER {
                     return Plan::Nothing;
                 }
-                let above = parsed.map_or(0, |parsed| parsed.generation);
-                Plan::Push {
-                    generation: above.max(state.highest) + 1,
-                    renewals: 0,
-                    expect: Some(sha.clone()),
+                // `highest` is at least the ref's own generation: it was raised when it was read.
+                match state.highest.checked_add(1) {
+                    Some(generation) => Plan::Push {
+                        generation,
+                        renewals: 0,
+                        expect: Some(sha.clone()),
+                    },
+                    None => Plan::Nothing,
                 }
             }
         }
@@ -473,6 +524,7 @@ impl Lease {
             .ok_stdout()
             .map(str::to_owned)
         else {
+            self.shared.state().note.push_failed = true;
             return;
         };
         let message = format!(
@@ -484,6 +536,7 @@ impl Lease {
             .ok_stdout()
             .map(str::to_owned)
         else {
+            self.shared.state().note.push_failed = true;
             return;
         };
         let lease = format!("--force-with-lease={REF}:{}", expect.unwrap_or(""));
@@ -521,12 +574,16 @@ impl Lease {
                 let read = self.read_ref(auth);
                 self.observe(&read, self.shared.clock.now());
             }
-            Pushed::Failed => {}
+            Pushed::Failed => self.shared.state().note.push_failed = true,
         }
     }
 
     /// Reads the ref in the remote into the lease directory and parses it.
+    ///
+    /// Before it, any lock file a killed git call left in the lease directory is removed (see
+    /// [`remove_stale`]).
     fn read_ref(&self, auth: &GitAuth) -> Found {
+        remove_stale(&self.dir);
         if !self.dir.join("HEAD").exists() {
             let init = self.git(
                 auth,
@@ -546,7 +603,15 @@ impl Lease {
         let refspec = format!("+{REF}:{REF}");
         let fetch = self.git(
             auth,
-            &["fetch", "--no-tags", "--quiet", "--", &self.url, &refspec],
+            &[
+                "fetch",
+                "--no-tags",
+                "--quiet",
+                "--depth=1",
+                "--",
+                &self.url,
+                &refspec,
+            ],
             true,
         );
         if fetch.ok_stdout().is_none() {
@@ -663,6 +728,34 @@ impl Lease {
             code: status.and_then(|status| status.code()),
             stdout: String::from_utf8_lossy(&stdout).into_owned(),
         })
+    }
+}
+
+/// Removes every `*.lock` file under `dir` and every `objects/pack/tmp_*` file, which a git
+/// call killed at the limit may have left, and which would make every later read fail for
+/// good. It is safe because no git child of this lease is alive when it runs: it is called
+/// under the lock that serialises ticks, and every child is killed and reaped before
+/// [`Lease::git`] returns. There is one daemon per machine and one lease per directory, so
+/// no other process writes there.
+fn remove_stale(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if kind.is_dir() {
+            remove_stale(&path);
+        } else if kind.is_file()
+            && (name.ends_with(".lock")
+                || (name.starts_with("tmp_") && dir.ends_with("objects/pack")))
+        {
+            let _ = std::fs::remove_file(&path);
+        }
     }
 }
 
