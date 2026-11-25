@@ -199,6 +199,7 @@ A build that does not know about Vims must never build a Vims project on the fle
   - a takeover after the template moved, making the gate from the source key the first holder wrote
   - a coordinator killed between two setup commands, with the next one running neither twice
   - a turn whose start is sent twice, or whose answer is lost, started once
+  - a turn whose `turn:<n>` operation has finished with no supervisor id in its folder, and one whose launch cannot be told, each waited on with no interruption spent and no next turn sent, and the run stuck once `limits.minutes` has passed
   - a turn's process that is killed and a turn whose result says it ended in an error, each read as an interruption, and a turn with a denied permission, which makes the run stuck
   - a workspace that sleeps while a turn waits, woken by the next holder with the same turn carried on and no interruption spent
   - a takeover whose record lacks Claude Code's session id, which reads it from turn 1's result
