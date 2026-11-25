@@ -556,6 +556,11 @@ fn check_binding(
     None
 }
 
+/// Whether a failure of `gh` is that it got no answer from GitHub about the pull request.
+fn gh_gave_no_answer(_message: &str) -> bool {
+    false
+}
+
 /// What a pass over one session knows.
 struct Step<'a, 'b> {
     ctx: &'a RunContext<'b>,
@@ -1622,7 +1627,13 @@ mod tests {
                     self.failed.store(true, Ordering::SeqCst);
                     return Err(TrackerError::Other {
                         kind: crate::factory::github::OtherKind::Failed,
-                        message: "`gh pr ready` failed: HTTP 502: Bad Gateway".into(),
+                        // Where the pull request is then gone, `gh` was refused (status 1);
+                        // where GitHub is down, it was a 502.
+                        message: if self.gone {
+                            "`gh pr ready` exited with status 1: boom".into()
+                        } else {
+                            "`gh pr ready` failed: HTTP 502: Bad Gateway".into()
+                        },
                     });
                 }
                 if self.failed.load(Ordering::SeqCst)
@@ -1667,6 +1678,8 @@ mod tests {
             let before = rig.events(&run).len();
             let error = advance(&rig.ctx(), &run).unwrap_err();
             assert!(matches!(error, RunError::Tracker(_)), "{error}");
+            // The error is the draft call's, not the second look's.
+            assert!(error.to_string().contains("gh pr ready"), "{error}");
             assert_eq!(rig.events(&run).len(), before);
             assert_eq!(rig.sim.labels(), ["factory:building"]);
             rig.tracker = Hiding::new(sim, Arc::new(|t: &str| t.into()));
@@ -1694,6 +1707,77 @@ mod tests {
                 None,
                 Some(DONE_MESSAGE),
             );
+        }
+
+        /// `gh` got no answer from GitHub about the pull request: an error with nothing
+        /// written, whatever the second look reads, and the next pass asks again.
+        #[test]
+        fn with_gh_getting_no_answer_on_putting_it_back_to_draft_is_an_error_not_stuck() {
+            let shapes: [fn() -> TrackerError; 3] = [
+                || TrackerError::Other {
+                    kind: crate::factory::github::OtherKind::Failed,
+                    message: "`gh pr ready` exited with status 1: HTTP 502: Bad Gateway".into(),
+                },
+                || TrackerError::Other {
+                    kind: crate::factory::github::OtherKind::Failed,
+                    message: "`gh pr ready` exited with status -1: ".into(),
+                },
+                || TrackerError::Other {
+                    kind: crate::factory::github::OtherKind::Failed,
+                    message: "`gh pr ready` printed more than 1048576 bytes".into(),
+                },
+            ];
+            for make in shapes {
+                let (mut rig, run) = built();
+                // The second look reads an open pull request that is not a draft.
+                rig.sim
+                    .set_pull(12, pull("OPEN", false, BRANCH, "main", false));
+                let sim = rig.sim.clone();
+                rig.tracker = Hiding::new(
+                    Arc::new(Failing(sim.clone(), make)),
+                    Arc::new(|t: &str| t.into()),
+                );
+                end_turn(&mut rig, 1, DONE_MESSAGE);
+                let before = rig.events(&run).len();
+                let error = advance(&rig.ctx(), &run).unwrap_err();
+                assert!(error.to_string().contains("gh pr ready"), "{error}");
+                assert_eq!(rig.events(&run).len(), before, "{error}");
+                rig.tracker = Hiding::new(sim, Arc::new(|t: &str| t.into()));
+                say(&rig, DONE_MESSAGE);
+                assert!(matches!(
+                    pass(&rig, &run),
+                    BuildStep::ReadyForGate { pr: 12, .. }
+                ));
+            }
+        }
+
+        /// What `gh` (github/gh.rs `finish`) words when it got no answer from GitHub: a 5xx in
+        /// its stderr, a call a signal ended (status -1), an answer over the output limit, and
+        /// a failure of the connection. A refusal by GitHub is not one.
+        #[test]
+        fn a_gh_failure_with_no_answer_from_github_is_told_from_a_refusal() {
+            for no_answer in [
+                "`gh pr ready 12` exited with status 1: HTTP 502: Bad Gateway",
+                "`gh pr ready 12` exited with status 1: HTTP 503: Service Unavailable (https://api.github.com/graphql)",
+                "`gh pr ready 12` exited with status 1: HTTP 500",
+                "`gh pr ready 12` exited with status -1: ",
+                "`gh pr ready 12` printed more than 1048576 bytes",
+                "`gh pr ready 12` exited with status 1: error connecting to api.github.com",
+                "`gh pr ready 12` exited with status 1: Post \"https://api.github.com/graphql\": dial tcp: lookup api.github.com: no such host",
+                "`gh pr ready 12` exited with status 1: Get \"https://api.github.com\": net/http: TLS handshake timeout",
+                "`gh pr ready 12` exited with status 1: Get \"https://api.github.com\": EOF",
+            ] {
+                assert!(gh_gave_no_answer(no_answer), "{no_answer}");
+            }
+            for refusal in [
+                "`gh pr ready 12` exited with status 1: boom",
+                "`gh pr ready 12` exited with status 1: GraphQL: Pull request is already closed",
+                "`gh pr ready 12` exited with status 1: HTTP 422: Unprocessable Entity",
+                "`gh pr ready 12` exited with status 1: HTTP 403: Resource not accessible",
+                "`gh pr ready 12` exited with status 2: ",
+            ] {
+                assert!(!gh_gave_no_answer(refusal), "{refusal}");
+            }
         }
 
         /// A tracker whose answer to putting a pull request back to draft is `error`, whatever
@@ -3337,6 +3421,24 @@ mod tests {
             )
             .unwrap();
             assert_eq!(sends(&rig).len(), sent + 1);
+            let mut at = progress_from(
+                &run,
+                CauseStep::Forward,
+                &rig.ctx().seen(&run).unwrap(),
+                State::Building,
+            );
+            apply_actions(
+                &rig.ctx(),
+                ISSUE,
+                &mut at,
+                &[crate::factory::lifecycle::Action::ForwardComment {
+                    comment_id: "77".into(),
+                }],
+                &Cause::new(CauseStep::Forward, "forward"),
+                &payload,
+            )
+            .unwrap();
+            assert_eq!(sends(&rig).len(), sent + 2);
         }
 
         /// The count rose between the view and the send (a person typed): nothing was typed,
@@ -3370,6 +3472,11 @@ mod tests {
             ));
             assert!(rig.steps(&run).contains(&"result-line-reminded".to_owned()));
             assert_eq!(sends(&rig), vec![reminder_sent(1)]);
+            // The refused try typed nothing: the key was never recorded typed.
+            assert!(
+                !all_steps_after(&rig, &run, 0)
+                    .contains(&"send-typed result-line-reminder 1".to_owned())
+            );
         }
     }
 
