@@ -470,9 +470,10 @@ mod tests {
             text
         }
 
+        /// A failure naming `command`, or no command when it is empty.
         fn failed(command: &str, how: &str, output: &str) -> GateResult {
             GateResult::Failed {
-                command: command.into(),
+                command: (!command.is_empty()).then(|| command.to_string()),
                 how: how.into(),
                 output: output.into(),
             }
@@ -498,6 +499,16 @@ mod tests {
                     TerminalState::Unreachable,
                     Some(3),
                     "$ cargo test\n",
+                    &strs(&["cargo test"])
+                ),
+                GateResult::Running
+            );
+            // An exit code it last showed is no verdict while it cannot be reached.
+            assert_eq!(
+                result(
+                    TerminalState::Unreachable,
+                    Some(0),
+                    "setup passed\n",
                     &strs(&["cargo test"])
                 ),
                 GateResult::Running
@@ -581,6 +592,88 @@ mod tests {
         }
 
         #[test]
+        fn an_exit_code_above_124_is_not_the_time_limit() {
+            for code in [125, 137, 143] {
+                let text = tail(
+                    &[("cargo test", "Killed\n")],
+                    &format!("setup failed: cargo test exited {code}\n"),
+                );
+                assert_eq!(
+                    result(
+                        TerminalState::Exited,
+                        Some(code),
+                        &text,
+                        &strs(&["cargo test"])
+                    ),
+                    failed("cargo test", &format!("exit code {code}"), "Killed\n")
+                );
+            }
+        }
+
+        #[test]
+        fn a_line_whose_code_only_starts_with_the_exit_code_does_not_count() {
+            let text = tail(&[("make", "")], "setup failed: make exited 10\n");
+            assert_eq!(
+                result(TerminalState::Exited, Some(1), &text, &strs(&["make"])),
+                failed("", "exit code 1", &text)
+            );
+        }
+
+        #[test]
+        fn a_stopped_line_counts_only_for_exit_code_124() {
+            let text = tail(
+                &[("make", "")],
+                "setup failed: make ran past 1800 s and was stopped\n",
+            );
+            assert_eq!(
+                result(TerminalState::Exited, Some(1), &text, &strs(&["make"])),
+                failed("", "exit code 1", &text)
+            );
+        }
+
+        #[test]
+        fn a_copy_of_the_last_line_in_the_output_does_not_cut_it_short() {
+            let text = tail(
+                &[(
+                    "cargo test",
+                    "setup failed: cargo test exited 101\nmore output\n",
+                )],
+                "setup failed: cargo test exited 101\n",
+            );
+            assert_eq!(
+                result(
+                    TerminalState::Exited,
+                    Some(101),
+                    &text,
+                    &strs(&["cargo test"])
+                ),
+                failed(
+                    "cargo test",
+                    "exit code 101",
+                    "setup failed: cargo test exited 101\nmore output\n"
+                )
+            );
+        }
+
+        #[test]
+        fn a_command_run_twice_shows_the_output_of_its_last_run() {
+            // The same command in `provision` and in `gate`.
+            let text = tail(
+                &[("make", "first\n"), ("make", "second\n")],
+                "setup failed: make exited 2\n",
+            );
+            assert_eq!(
+                result(
+                    TerminalState::Exited,
+                    Some(2),
+                    &text,
+                    &strs(&["make", "make"])
+                ),
+                failed("make", "exit code 2", "second\n")
+            );
+        }
+
+        #[test]
         fn ended_gives_the_typed_end_for_the_message_sent_back() {
             assert_eq!(
                 ended(124),
@@ -590,6 +683,9 @@ mod tests {
             );
             assert_eq!(ended(101), Ended::Exit(101));
             assert_eq!(ended(-1), Ended::Exit(-1));
+            // A command killed by a signal exits 128 and more: not the time limit.
+            assert_eq!(ended(125), Ended::Exit(125));
+            assert_eq!(ended(137), Ended::Exit(137));
         }
 
         #[test]
@@ -685,7 +781,7 @@ mod tests {
         }
 
         #[test]
-        fn output_written_after_the_last_line_does_not_change_the_result() {
+        fn a_line_naming_no_command_written_after_the_last_line_is_passed_over() {
             // A process the failing command left behind writes on after the setup exited.
             let quiet = tail(
                 &[("cargo test", "test a ... FAILED\n")],
@@ -809,6 +905,18 @@ mod tests {
                     unreachable
                 ),
                 None
+            );
+        }
+
+        #[test]
+        fn a_machine_gone_is_named_before_a_terminal_with_no_exit_code() {
+            assert_eq!(
+                could_not_run(
+                    None,
+                    MACHINE_GONE_AFTER,
+                    Some((TerminalState::Exited, None))
+                ),
+                Some("the gate's machine was unreachable for 5 minutes".into())
             );
         }
 
