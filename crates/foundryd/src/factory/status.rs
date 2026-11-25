@@ -341,7 +341,7 @@ mod tests {
 
         let believed = believed(&statuses, &online(&[acting]), acting);
 
-        assert_eq!(believed, Some(no_token(project)));
+        assert_eq!(believed, Some((acting, &no_token(project))));
     }
 
     #[test]
@@ -363,7 +363,7 @@ mod tests {
 
         let believed = believed(&statuses, &online(&[holder, acting]), acting);
 
-        assert_eq!(believed, Some(holds));
+        assert_eq!(believed, Some((holder, &holds)));
     }
 
     #[test]
@@ -382,7 +382,7 @@ mod tests {
 
         let believed = believed(&statuses, &online(&[holder, acting]), acting);
 
-        assert_eq!(believed, Some(holds));
+        assert_eq!(believed, Some((holder, &holds)));
     }
 
     #[test]
@@ -397,7 +397,7 @@ mod tests {
         for order in [statuses.clone(), statuses.into_iter().rev().collect()] {
             assert_eq!(
                 believed(&order, &online(&[low, high]), low),
-                Some(higher.clone())
+                Some((high, &higher))
             );
         }
     }
@@ -416,7 +416,7 @@ mod tests {
         for order in [statuses.clone(), statuses.into_iter().rev().collect()] {
             assert_eq!(
                 believed(&order, &online(&[low, high]), high),
-                Some(from_low.clone())
+                Some((low, &from_low))
             );
         }
     }
@@ -438,7 +438,7 @@ mod tests {
 
         for order in [statuses.clone(), statuses.into_iter().rev().collect()] {
             let believed = believed(&order, &online(&[old, new, acting]), acting);
-            assert_eq!(believed, Some(newer.clone()));
+            assert_eq!(believed, Some((new, &newer)));
         }
     }
 
@@ -452,7 +452,7 @@ mod tests {
 
         let believed = believed(&statuses, &online(&[other, acting]), acting);
 
-        assert_eq!(believed, Some(acting_says));
+        assert_eq!(believed, Some((acting, &acting_says)));
     }
 
     #[test]

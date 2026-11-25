@@ -323,11 +323,16 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use foundry_proto::factory::{FactoryBody, RunEvent, RunId};
-    use foundry_proto::settings::Machine;
+    use foundry_proto::factory::{FactoryBody, ProjectFactory, RunEvent, RunId};
+    use foundry_proto::ids::{ProjectId, SessionId, WorkspaceId};
+    use foundry_proto::settings::{Machine, Project};
     use futures::future::BoxFuture;
 
     use super::*;
+    use crate::attention::{Attention, Kind, Marks};
+    use crate::clock::{Clock, FakeClock};
+    use crate::coordinator::Coordinator;
+    use crate::factory::status::{self, Freshness, PassResults};
     use crate::sync::{Conn, Dialer, Peers, lock};
 
     struct NoDial;
@@ -385,6 +390,173 @@ mod tests {
             changes.has_changed().unwrap(),
             "records stored before the cancel were never told"
         );
+    }
+
+    /// Marks nothing: every session and workspace is a person's.
+    struct NoMarks;
+
+    impl Marks for NoMarks {
+        fn factory_session(&self, _: SessionId) -> Option<ProjectId> {
+            None
+        }
+
+        fn factory_workspace(&self, _: WorkspaceId) -> Option<ProjectId> {
+            None
+        }
+    }
+
+    const MINUTE: Duration = Duration::from_secs(60);
+
+    /// This machine, its store and peers told of statuses, a project whose factory is on with
+    /// this machine acting, and an attention list over them on a clock the test moves.
+    struct Heard {
+        _data: tempfile::TempDir,
+        peers: Peers,
+        clock: Arc<FakeClock>,
+        freshness: Arc<Freshness>,
+        attention: Attention,
+        project: ProjectId,
+    }
+
+    impl Heard {
+        fn new() -> Self {
+            let data = tempfile::tempdir().unwrap();
+            let me = MachineId::random();
+            let mut store = Store::open(data.path().join("foundry.db")).unwrap();
+            let project = Project {
+                id: ProjectId::random(),
+                name: "foundry".into(),
+                repo: "https://github.com/o/foundry.git".into(),
+            };
+            let mut settings = store.settings().unwrap();
+            settings.projects.push(project.clone());
+            settings.project_factory.insert(
+                project.id,
+                ProjectFactory {
+                    on: true,
+                    login: "octocat".into(),
+                    paused: false,
+                },
+            );
+            settings.priority = vec![me];
+            settings.seq += 1;
+            assert!(store.apply_settings(settings).unwrap());
+            let store = Arc::new(Mutex::new(store));
+            let peers = Peers::new(me, store.clone(), Arc::new(NoDial));
+            let coordinator = Arc::new(Coordinator::new(me, store.clone(), peers.clone()));
+            let clock = Arc::new(FakeClock::new());
+            let dyn_clock: Arc<dyn Clock> = clock.clone();
+            let freshness = Arc::new(Freshness::new(dyn_clock.clone()));
+            peers.hear_statuses(freshness.clone());
+            let attention = Attention::new(me, store, peers.clone(), coordinator).with_factory(
+                dyn_clock,
+                freshness.clone(),
+                Arc::new(NoMarks),
+            );
+            Self {
+                _data: data,
+                peers,
+                clock,
+                freshness,
+                attention,
+                project: project.id,
+            }
+        }
+
+        fn status(&self, owner: MachineId, version: u64, pass: u64) -> FactoryRecord {
+            FactoryRecord {
+                owner,
+                version,
+                body: FactoryBody::Status(status::build(PassResults {
+                    generation: 1,
+                    pass,
+                    ..PassResults::new(self.project)
+                })),
+            }
+        }
+
+        async fn idle(&self) -> bool {
+            let items = self.attention.items().await.unwrap();
+            items.iter().any(|item| item.kind == Kind::FactoryIdle)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_status_taken_at_9_minutes_keeps_factory_idle_away_at_10() {
+        let heard = Heard::new();
+        let peer = MachineId::random();
+        heard.clock.advance(9 * MINUTE);
+
+        take(
+            &heard.peers.inner,
+            peer,
+            FACTORY_SINCE,
+            vec![heard.status(peer, 1, 1)],
+        )
+        .await
+        .unwrap();
+        heard.clock.advance(MINUTE);
+
+        assert!(!heard.idle().await, "idle 1 minute after the holder's word");
+        heard.clock.advance(10 * MINUTE);
+        assert!(heard.idle().await, "the list never raises it");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_status_refused_or_stale_tells_freshness_nothing() {
+        let heard = Heard::new();
+        let (peer, other) = (MachineId::random(), MachineId::random());
+        heard.clock.advance(5 * MINUTE);
+
+        // Owned by another machine than the one that sent it.
+        take(
+            &heard.peers.inner,
+            peer,
+            FACTORY_SINCE,
+            vec![heard.status(other, 1, 1)],
+        )
+        .await
+        .unwrap();
+        assert_eq!(heard.freshness.since_holding(heard.project), 5 * MINUTE);
+
+        // Stored: heard now. Then the same version again with a higher pass: stale.
+        take(
+            &heard.peers.inner,
+            peer,
+            FACTORY_SINCE,
+            vec![heard.status(peer, 3, 1)],
+        )
+        .await
+        .unwrap();
+        assert_eq!(heard.freshness.since_holding(heard.project), Duration::ZERO);
+        heard.clock.advance(3 * MINUTE);
+        take(
+            &heard.peers.inner,
+            peer,
+            FACTORY_SINCE,
+            vec![heard.status(peer, 3, 2)],
+        )
+        .await
+        .unwrap();
+        assert_eq!(heard.freshness.since_holding(heard.project), 3 * MINUTE);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_status_taken_on_a_link_that_carries_no_factory_record_tells_freshness_nothing() {
+        let heard = Heard::new();
+        let peer = MachineId::random();
+        heard.clock.advance(5 * MINUTE);
+
+        take(
+            &heard.peers.inner,
+            peer,
+            FACTORY_SINCE - 1,
+            vec![heard.status(peer, 1, 1)],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(heard.freshness.since_holding(heard.project), 5 * MINUTE);
     }
 
     fn event(version: u64, output: usize) -> FactoryRecord {

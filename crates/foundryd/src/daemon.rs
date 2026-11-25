@@ -1530,7 +1530,19 @@ mod tests {
             Arc::new(crate::secrets::MemorySecrets::default()),
         ));
         let placements = Arc::new(Queue::new(me));
-        let attention = attention(me, &store, &peers, coordinator, gateway, &placements);
+        let clock: Arc<dyn crate::clock::Clock> = Arc::new(crate::clock::FakeClock::new());
+        let freshness = Arc::new(Freshness::new(clock.clone()));
+        let attention = attention(
+            me,
+            &store,
+            &peers,
+            coordinator,
+            gateway,
+            &placements,
+            clock,
+            freshness,
+            Arc::new(MarksNothing),
+        );
         placements.wait(
             Want {
                 project: foundry_proto::ids::ProjectId::random(),
@@ -1547,6 +1559,186 @@ mod tests {
             items.iter().any(|item| item.kind == Kind::PlacementWaiting),
             "{items:?}"
         );
+    }
+
+    /// Marks nothing, for a test of the list that has no sessions.
+    struct MarksNothing;
+
+    impl crate::attention::Marks for MarksNothing {
+        fn factory_session(&self, _: foundry_proto::ids::SessionId) -> Option<ProjectId> {
+            None
+        }
+
+        fn factory_workspace(&self, _: foundry_proto::ids::WorkspaceId) -> Option<ProjectId> {
+            None
+        }
+    }
+
+    fn clock_file(seconds: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ahead");
+        std::fs::write(&file, seconds).unwrap();
+        (dir, file)
+    }
+
+    fn fake_base() -> (Arc<crate::clock::FakeClock>, Arc<dyn crate::clock::Clock>) {
+        let base = Arc::new(crate::clock::FakeClock::new());
+        let dyn_base: Arc<dyn crate::clock::Clock> = base.clone();
+        (base, dyn_base)
+    }
+
+    #[test]
+    fn foundry_clock_ahead_is_ignored_when_the_build_does_not_take_it() {
+        let (_dir, file) = clock_file("600");
+        let (base, dyn_base) = fake_base();
+        base.advance(Duration::from_secs(1));
+
+        let clock = clock_for(Some(file.into_os_string()), false, dyn_base);
+
+        assert_eq!(clock.now(), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn the_seconds_in_the_clock_ahead_file_are_added_to_each_reading() {
+        let (_dir, file) = clock_file("600\n");
+        let (base, dyn_base) = fake_base();
+        let clock = clock_for(Some(file.clone().into_os_string()), true, dyn_base);
+
+        assert_eq!(clock.now(), Duration::from_secs(600));
+        base.advance(Duration::from_secs(5));
+        assert_eq!(clock.now(), Duration::from_secs(605));
+        std::fs::write(&file, "1200").unwrap();
+        assert_eq!(clock.now(), Duration::from_secs(1205));
+    }
+
+    #[test]
+    fn a_missing_or_unreadable_clock_ahead_file_adds_nothing() {
+        let (dir, file) = clock_file("");
+        std::fs::remove_file(&file).unwrap();
+        let (_, dyn_base) = fake_base();
+        let clock = clock_for(Some(file.into_os_string()), true, dyn_base.clone());
+        assert_eq!(clock.now(), Duration::ZERO);
+
+        // A folder cannot be read as a file, and text that is no number counts as none.
+        let unreadable = clock_for(Some(dir.path().into()), true, dyn_base.clone());
+        assert_eq!(unreadable.now(), Duration::ZERO);
+        let (_dir, words) = clock_file("ten minutes");
+        let words = clock_for(Some(words.into_os_string()), true, dyn_base.clone());
+        assert_eq!(words.now(), Duration::ZERO);
+
+        // No variable at all is the base clock.
+        assert_eq!(clock_for(None, true, dyn_base).now(), Duration::ZERO);
+    }
+
+    #[test]
+    fn a_smaller_number_in_the_clock_ahead_file_does_not_move_the_clock_back() {
+        let (_dir, file) = clock_file("600");
+        let (_, dyn_base) = fake_base();
+        let clock = clock_for(Some(file.clone().into_os_string()), true, dyn_base);
+        assert_eq!(clock.now(), Duration::from_secs(600));
+
+        std::fs::write(&file, "60").unwrap();
+        assert_eq!(clock.now(), Duration::from_secs(600));
+        std::fs::write(&file, "nonsense").unwrap();
+        assert_eq!(clock.now(), Duration::from_secs(600));
+        std::fs::write(&file, "900").unwrap();
+        assert_eq!(clock.now(), Duration::from_secs(900));
+    }
+
+    #[tokio::test]
+    async fn a_factory_workspace_is_answered_with_its_project_by_its_marker() {
+        use crate::workspaces::{Checkout, FactoryTag, Setup};
+
+        let data = tempfile::tempdir().unwrap();
+        let me = MachineId::random();
+        let store = Arc::new(Mutex::new(
+            Store::open(data.path().join("foundry.db")).unwrap(),
+        ));
+        let git = |dir: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=Foundry Test",
+                    "-c",
+                    "user.email=test@foundry.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "init.defaultBranch=main",
+                ])
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        let remotes = tempfile::tempdir().unwrap();
+        git(remotes.path(), &["init", "-q", "--bare", "remote.git"]);
+        git(remotes.path(), &["clone", "-q", "remote.git", "src"]);
+        let src = remotes.path().join("src");
+        std::fs::write(src.join("README.md"), "hello\n").unwrap();
+        git(&src, &["add", "README.md"]);
+        git(&src, &["commit", "-q", "-m", "first"]);
+        git(&src, &["push", "-q", "origin", "main"]);
+        let project = ProjectId::random();
+        {
+            let mut store = store.lock().unwrap();
+            let mut settings = store.settings().unwrap();
+            settings.seq += 1;
+            settings.projects.push(foundry_proto::settings::Project {
+                id: project,
+                name: "demo".into(),
+                repo: remotes.path().join("remote.git").to_string_lossy().into_owned(),
+            });
+            assert!(store.apply_settings(settings).unwrap());
+        }
+        let terminals = Arc::new(Terminals::new(
+            me,
+            store.clone(),
+            data.path(),
+            data.path().join("no-holder"),
+        ));
+        let workspaces = Workspaces::new(me, store, data.path(), terminals);
+        let tagged = |tag| {
+            workspaces.create_with(
+                project,
+                "fix login",
+                Checkout::NewBranch {
+                    base: "main".into(),
+                    branch: None,
+                },
+                Setup::None,
+                tag,
+            )
+        };
+        let made = tagged(Some(FactoryTag {
+            project,
+            run: "o/r#1".into(),
+        }))
+        .await
+        .unwrap();
+        let plain = workspaces
+            .create_with(
+                project,
+                "mine",
+                Checkout::NewBranch {
+                    base: "main".into(),
+                    branch: None,
+                },
+                Setup::None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let worktrees = data.path().join("worktrees");
+        assert_eq!(marked_project(&worktrees, made), Some(project));
+        assert_eq!(marked_project(&worktrees, plain), None);
+        assert_eq!(
+            marked_project(&worktrees, foundry_proto::ids::WorkspaceId::random()),
+            None
+        );
+        assert_eq!(marked_project(&data.path().join("nowhere"), made), None);
     }
 
     /// A coordinator and listing for a machine that acts alone, over a store holding what
