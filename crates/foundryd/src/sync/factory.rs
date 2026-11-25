@@ -216,9 +216,10 @@ fn fitting(records: &[FactoryRecord], budget: usize) -> usize {
 /// again for the rest.
 ///
 /// Each factory status stored is told to the [`Freshness`](crate::factory::status::Freshness)
-/// [`Peers::hear_statuses`](super::Peers::hear_statuses) was given, once the store's lock is
-/// released: a status refused or stale tells it nothing, so only a status that is stored counts
-/// as word from its holder.
+/// [`Peers::hear_statuses`](super::Peers::hear_statuses) was given, under the store's lock
+/// beside the tell of [`Peers::factory_changes`](super::Peers::factory_changes), so a take a
+/// closing link drops still tells of every status it stored. A status refused or stale tells
+/// it nothing, so only a status that is stored counts as word from its holder.
 ///
 /// Each record is stored under the store's lock taken for it alone, since each commits on its
 /// own, so a catch-up never holds the store from its other users for a whole message. Each is
@@ -239,24 +240,22 @@ pub(super) async fn take(
     }
     for record in records {
         let changed = inner.factory_changed.clone();
+        let freshness = lock(&inner.freshness).clone();
         let (applied, record) = on_store(&inner.store, move |store| {
             let applied = store.apply_factory(&record, peer);
             if matches!(applied, Ok(Applied::Stored)) {
                 super::tell(&changed);
+                // Told here, not after the await: a take a closing link drops still ends this
+                // closure, and a resend of a stored status comes back stale.
+                if let (Some(freshness), FactoryBody::Status(status)) = (&freshness, &record.body) {
+                    freshness.received(status);
+                }
             }
             (applied, record)
         })
         .await;
         match applied {
-            Ok(Applied::Stored) => {
-                if let FactoryBody::Status(status) = &record.body {
-                    let freshness = lock(&inner.freshness).clone();
-                    if let Some(freshness) = freshness {
-                        freshness.received(status);
-                    }
-                }
-            }
-            Ok(Applied::Stale) => {}
+            Ok(Applied::Stored | Applied::Stale) => {}
             Ok(Applied::NotOwner) if record.owner == peer => tracing::warn!(
                 "sync: {peer} sent a {} factory record whose key another machine holds; refused",
                 record.body.kind()
