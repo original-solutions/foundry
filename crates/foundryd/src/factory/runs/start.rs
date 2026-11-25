@@ -697,12 +697,6 @@ pub fn advance(ctx: &RunContext<'_>, run: &RunId) -> Result<StartStep, RunError>
             seen.state.map_or("none", State::name)
         ));
     }
-    // A path the ledger shows begun is finished whatever the issue's label and assignee now
-    // are: the label and the assignee move before the ledger's own state line does, so a path
-    // cut short leaves the issue where this pass would otherwise skip it.
-    if let Some(step) = finish_begun_path(ctx, run, &seen)? {
-        return Ok(step);
-    }
     let detail = ctx.tracker.issue(repo, issue)?;
     if detail.closed {
         return match moved_on_by_closing(ctx, &seen, true)? {
@@ -716,16 +710,37 @@ pub fn advance(ctx: &RunContext<'_>, run: &RunId) -> Result<StartStep, RunError>
             }
         };
     }
-    // An issue put back to `ready` is the claim step's, which finishes its older runs.
+    // An issue put back to `ready` is the claim step's, which finishes its older runs: a path
+    // the ledger shows begun is left alone too, as the runner leaves it, and writes nothing.
     if detail.state == Some(State::Ready) {
         return skipped(format!("issue #{issue} is ready again"));
+    }
+    // A path the ledger shows begun is finished whatever the issue's label and assignee now
+    // are: the label and the assignee move before the ledger's own state line does, so a path
+    // cut short leaves the issue where this pass would otherwise skip it.
+    if let Some(step) = finish_begun_path(ctx, run, &seen)? {
+        return Ok(step);
     }
     if !matches!(detail.state, Some(State::Triage | State::Building)) {
         return skipped(format!("issue #{issue} is not in triage or building"));
     }
     let ours =
         detail.assignees.len() == 1 && detail.assignees[0].eq_ignore_ascii_case(&ctx.project.login);
-    if !ours {
+    // A claim cut short after its label and before its assignee: the login is assigned now, the
+    // step recorded first.
+    let unassigned_claim = seen.claimed
+        && matches!(seen.state, None | Some(State::Triage))
+        && detail.state == Some(State::Triage)
+        && detail.assignees.is_empty();
+    if unassigned_claim {
+        ctx.held()?;
+        ctx.record_step(
+            run,
+            "claim-assigning",
+            &Cause::new(CauseStep::Start, "claim-resumed"),
+        )?;
+        ctx.assign(issue)?;
+    } else if !ours {
         return skipped(format!(
             "issue #{issue} is not assigned to {} alone",
             ctx.project.login
@@ -783,6 +798,15 @@ fn finish_begun_path(
             Stop::new(reason.clone()),
             None,
         )?;
+        return Ok(Some(StartStep::Stuck { reason }));
+    }
+    // The decision to give up is in the ledger and its comment may be on the issue: the path
+    // goes on with the words it recorded, so the comment is found, not posted twice.
+    if let Some(raw) = &seen.stuck_stop {
+        let decision: super::StuckStop = serde_json::from_str(raw)
+            .map_err(|error| RunError::Invalid(format!("the stuck decision of {run}: {error}")))?;
+        let reason = decision.stop.reason.clone();
+        go_stuck(ctx, issue, &mut at, &decision.code, decision.stop, None)?;
         return Ok(Some(StartStep::Stuck { reason }));
     }
     if seen.withdrawn {
@@ -1367,12 +1391,17 @@ fn build(
             Some((TerminalState::Exited, Some(0))) => {}
             // An exit with no code (the holder is gone) is no success either.
             Some((TerminalState::Exited, _)) => {
-                let tail = ctx.tail(terminal)?;
-                let stop = Stop {
-                    reason: SETUP_FAILED.into(),
-                    session_text: Some(messages::prepare_output_tail(&tail)),
-                    recorded_text: Some(text::sanitize(&tail, true)),
-                    ..Stop::default()
+                // A machine that cannot be reached is asked again; one that answered it has no
+                // tail gives the reason alone, which ends the run.
+                let stop = match ctx.tail(terminal) {
+                    Ok(tail) => Stop {
+                        reason: SETUP_FAILED.into(),
+                        session_text: Some(messages::prepare_output_tail(&tail)),
+                        recorded_text: Some(text::sanitize(&tail, true)),
+                        ..Stop::default()
+                    },
+                    Err(RunError::Worker(WorkerError::Failed(_))) => Stop::new(SETUP_FAILED),
+                    Err(error) => return Err(error),
                 };
                 go_stuck(ctx, issue, at, "setup-failed", stop, None)?;
                 return Ok(StartStep::Stuck {

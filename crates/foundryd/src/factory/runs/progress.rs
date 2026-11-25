@@ -64,6 +64,9 @@ pub const APPROVAL_WITHDRAWN: &str = "approval-withdrawn";
 pub const TIME_LIMIT: &str = "time-limit";
 /// The step written before the stuck comment is posted.
 pub const STUCK_COMMENTING: &str = "stuck-commenting";
+/// The step written, with the stop as JSON after it, before the stuck comment: the decision to
+/// give up, which a later pass finishes with the same words.
+pub const STUCK_STOP: &str = "stuck-stop ";
 /// The step written before the questions comment is posted.
 pub const QUESTIONS_COMMENTING: &str = "questions-commenting";
 /// The step written before the sessions of the build workspace are ended ahead of a second start
@@ -305,6 +308,9 @@ pub struct Seen {
     pub questions_commenting: bool,
     /// The `stuck-commenting` step: the stuck comment may be on the issue with no `stuck` line.
     pub stuck_commenting: bool,
+    /// The text after the `stuck-stop` step: the recorded decision to go stuck, with no `stuck`
+    /// line yet when `stuck` is `None`.
+    pub stuck_stop: Option<String>,
     /// A `pr_opened` since the run last entered `building` or had a gate sent back: the session's pull request waits for the gate.
     pub pr_reported: bool,
     /// The ordinal in the newest `result-line-reminding` step: a reminder send was started.
@@ -677,6 +683,9 @@ pub fn read_progress(events: &[RunEvent]) -> Seen {
                 }
                 if step == STUCK_COMMENTING {
                     seen.stuck_commenting = true;
+                }
+                if let Some(stop) = step.strip_prefix(STUCK_STOP) {
+                    seen.stuck_stop = Some(stop.to_owned());
                 }
                 if step == QUESTIONS_COMMENTING {
                     seen.questions_commenting = true;

@@ -46,7 +46,7 @@ use super::worker::{FleetView, Guard, LeaseLost, Worker, WorkerError};
 use crate::clock::Clock;
 use crate::sessions::factory::SendRefused;
 use crate::store::StoreError;
-use progress::{GATE_RESULTS_POSTED, QUESTIONS_COMMENTING, STUCK_COMMENTING, Seen};
+use progress::{GATE_RESULTS_POSTED, QUESTIONS_COMMENTING, STUCK_COMMENTING, STUCK_STOP, Seen};
 
 /// What a step of a run can fail with.
 #[derive(Debug, thiserror::Error)]
@@ -385,6 +385,17 @@ pub fn apply_actions(
             }
             Action::PostStuckComment { reason } => {
                 if at.seen.stuck.is_none() {
+                    if at.seen.stuck_stop.is_none()
+                        && let Some(stop) = &at.stop
+                    {
+                        let decision = StuckStop {
+                            code: cause.reason.clone(),
+                            stop: stop.clone(),
+                        };
+                        let json = serde_json::to_string(&decision)
+                            .map_err(|error| RunError::Invalid(error.to_string()))?;
+                        ctx.record_step(&at.run, &format!("{STUCK_STOP}{json}"), cause)?;
+                    }
                     // The lifecycle's reason is the recorded one and may hold detail the public
                     // must not read, so without a stop the comment says only this.
                     let work = at.stop.as_ref().and_then(|stop| {
@@ -563,7 +574,7 @@ pub fn stop_session(ctx: &RunContext<'_>, at: &Progress) -> Result<(), RunError>
 /// `prepare_output_tail` and left out when empty. `recorded_text` is what the ledger keeps in
 /// place of `session_text` when it holds more of it than the comment does: a setup's output is
 /// quoted by its last 20,000 characters and recorded by its last 64 KB.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Stop {
     pub reason: String,
     pub detail: Option<String>,
@@ -581,6 +592,14 @@ impl Stop {
             ..Self::default()
         }
     }
+}
+
+/// The decision to go stuck as the ledger keeps it before the comment is posted: the code that
+/// caused the lines and the stop, so a later pass finishes the path with the same words.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct StuckStop {
+    pub code: String,
+    pub stop: Stop,
 }
 
 /// The reason as the ledger stores it and the caller gets it: the factory's words, then the session's.
