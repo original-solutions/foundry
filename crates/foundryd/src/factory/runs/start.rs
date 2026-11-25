@@ -6314,6 +6314,10 @@ mod tests {
                     })
                     .collect();
                 assert_eq!(kinds, vec!["create", "start", "end", "start"]);
+                assert!(
+                    rig.steps(&run)
+                        .contains(&"launch-ending-sessions".to_string())
+                );
             }
 
             /// A start whose answer was lost, and whose factory session the fleet already
