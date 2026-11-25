@@ -2292,6 +2292,89 @@ mod tests {
         }
     }
 
+    /// What Foundry's launch adds to the runner's steps: it decides, asks for the workspace, and
+    /// only then sends.
+    mod the_workspace_a_launch_asks_for {
+        use super::*;
+
+        #[test]
+        fn reads_the_machine_of_the_first_claimed_line() {
+            let seen = seen_of(&[
+                line(
+                    1,
+                    "claimed",
+                    json!({"machine": "6f1c2a8e-3b4d-4e5f-9a0b-1c2d3e4f5a6b", "github_user": "rawphp"}),
+                ),
+                line(
+                    2,
+                    "claimed",
+                    json!({"machine": "other", "github_user": "x"}),
+                ),
+            ]);
+            assert_eq!(
+                seen.machine.as_deref(),
+                Some("6f1c2a8e-3b4d-4e5f-9a0b-1c2d3e4f5a6b")
+            );
+        }
+
+        #[test]
+        fn reads_the_request_and_the_answer_and_forgets_an_answer_to_an_older_request() {
+            let asked = seen_of(&[step(1, "workspace-requested fac/8-1")]);
+            assert_eq!(asked.workspace_requested.as_deref(), Some("fac/8-1"));
+            assert_eq!(asked.workspace, None);
+            let answered = seen_of(&[
+                step(1, "workspace-requested fac/8-1"),
+                step(2, "workspace-created 3a1b"),
+            ]);
+            assert_eq!(answered.workspace.as_deref(), Some("3a1b"));
+            let asked_again = seen_of(&[
+                step(1, "workspace-requested fac/8-1"),
+                step(2, "workspace-created 3a1b"),
+                step(3, "workspace-requested fac/8-1-r1"),
+            ]);
+            assert_eq!(
+                asked_again.workspace_requested.as_deref(),
+                Some("fac/8-1-r1")
+            );
+            assert_eq!(asked_again.workspace, None);
+        }
+
+        #[test]
+        fn a_resume_decided_before_the_workspace_is_asked_for_is_no_launch_sent() {
+            let seen = seen_of(&[
+                step(
+                    1,
+                    "launch-pull-request fac/8-1 https://github.com/rawphp/softfac/pull/12",
+                ),
+                step(2, "launch-resuming fac/8-1"),
+            ]);
+            assert!(!seen.launch_sent);
+            assert_eq!(seen.launch_resumed_from.as_deref(), Some("fac/8-1"));
+            assert_eq!(
+                seen.launch_resumed_pr.as_deref(),
+                Some("https://github.com/rawphp/softfac/pull/12")
+            );
+        }
+
+        #[test]
+        fn the_launch_sending_step_of_the_same_branch_keeps_the_pull_request_decided_before() {
+            let seen = seen_of(&[
+                step(
+                    1,
+                    "launch-pull-request fac/8-1 https://github.com/rawphp/softfac/pull/12",
+                ),
+                step(2, "launch-resuming fac/8-1"),
+                step(3, "workspace-requested fac/8-2"),
+                step(4, "launch-sending resumed-from fac/8-1"),
+            ]);
+            assert!(seen.launch_sent);
+            assert_eq!(
+                seen.launch_resumed_pr.as_deref(),
+                Some("https://github.com/rawphp/softfac/pull/12")
+            );
+        }
+    }
+
     mod a_cancelled_forward_wait {
         use super::*;
 
