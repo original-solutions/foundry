@@ -77,8 +77,10 @@
 //!   request is read again first, and a draft now goes on. `NotFound` and any other `gh`
 //!   failure (status 1 and a reason) read the pull request again: that read failing is the
 //!   error, a draft now goes on, one open and not a draft is stuck in the runner's words
-//!   ("it is not a draft"), and one gone is stuck as one that does not exist. Either way, one
-//!   merged or closed meanwhile ends the run as a first read that found it so does. A pull request
+//!   ("it is not a draft"), and one gone is stuck as one that does not exist. A call that
+//!   succeeds reads it again too, since the tracker's `Ok` also means "no longer open", and a
+//!   failed read is that read's error. Whatever the call did, one merged or closed meanwhile
+//!   ends the run as a first read that found it so does. A pull request
 //!   GitHub never answers about is ended by `limits.minutes`.
 //! - The runner's case of a run with no ordinal and no result line, stuck at once, has no
 //!   counterpart: a turn always has a number. Its cases about a run a person stopped
@@ -909,24 +911,20 @@ impl Step<'_, '_> {
         // The session's pull request that is open and ready for review goes back to draft:
         // only the gate marks it ready. The runner decides what GitHub refusing means; Foundry
         // what GitHub being unreachable means.
-        // - A rate limit, a timeout, a refused login, `gh` not starting, an answer that cannot
-        //   be read, and a `gh` failure that got no answer from GitHub ([`gh_gave_no_answer`])
-        //   are an error with nothing more written, asked again next pass; for the last the
-        //   pull request is read again first: one merged or closed meanwhile ends the run as
-        //   below, and a draft now goes on (a pull request that never drafts is ended by
-        //   `limits.minutes`).
-        // - `NotFound` and any other `gh` failure ("exited with status 1: boom") read the pull
-        //   request again: a failed read is that error (GitHub is down), one merged or closed
-        //   meanwhile ends the run as below, a draft now goes on, one open and not a draft is
-        //   stuck in the runner's words (GitHub answered and the call was refused), and one gone
-        //   is stuck as one that does not exist.
+        // - A rate limit, a timeout, a refused login, `gh` not starting and an answer that
+        //   cannot be read are an error with nothing more written, asked again next pass.
+        // - Otherwise the pull request is read again, since the call's `Ok` means drafted or
+        //   no longer open (`github::write::mark_pr_draft`), and `NotFound` or any other `gh`
+        //   failure ("exited with status 1: boom") says nothing of which. A failed read is the
+        //   call's error, or its own after an `Ok` (GitHub is down). One merged or closed
+        //   meanwhile ends the run as below. After an `Ok`, or as a draft now, it goes on.
+        //   After a `gh` failure that got no answer from GitHub ([`gh_gave_no_answer`]) it is
+        //   that error (a pull request that never drafts is ended by `limits.minutes`). One
+        //   open and not a draft is stuck in the runner's words (GitHub answered and the call
+        //   was refused), and one gone is stuck as one that does not exist.
         if pull.open && !pull.is_draft {
-            match ctx.mark_pr_draft(pr) {
-                Ok(()) => ctx.record(
-                    self.run,
-                    Event::PrSetDraft { pr },
-                    &self.cause("pr-set-draft"),
-                )?,
+            let failed = match ctx.mark_pr_draft(pr) {
+                Ok(()) => None,
                 Err(
                     error @ RunError::Tracker(
                         TrackerError::NotFound { .. }
@@ -935,44 +933,37 @@ impl Step<'_, '_> {
                             ..
                         },
                     ),
-                ) => {
-                    let no_answer = matches!(
-                        &error,
-                        RunError::Tracker(TrackerError::Other { message, .. })
-                            if gh_gave_no_answer(message)
-                    );
-                    match ctx.tracker.pull_request(ctx.repo(), pr) {
-                        Err(_) => return Err(error),
-                        // Merged or closed meanwhile: ended below, as a first read that found
-                        // it so would be.
-                        Ok(Some(now)) if !now.open => pull = now,
-                        Ok(Some(now)) if now.is_draft => ctx.record(
-                            self.run,
-                            Event::PrSetDraft { pr },
-                            &self.cause("pr-set-draft"),
-                        )?,
-                        Ok(_) if no_answer => return Err(error),
-                        Ok(Some(_)) => {
-                            let not_draft = Unbound {
-                                public: reported_but(pr, "it is not a draft"),
-                                detail: None,
-                            };
-                            return self.stuck(
-                                at,
-                                NOT_BOUND_CODE,
-                                unbound_stop(not_draft, message),
-                            );
-                        }
-                        Ok(None) => {
-                            return self.stuck(
-                                at,
-                                NOT_BOUND_CODE,
-                                unbound_stop(does_not_exist(pr), message),
-                            );
-                        }
-                    }
-                }
+                ) => Some(error),
                 Err(error) => return Err(error),
+            };
+            match ctx.tracker.pull_request(ctx.repo(), pr) {
+                Err(read) => return Err(failed.unwrap_or_else(|| read.into())),
+                Ok(Some(now)) if !now.open => pull = now,
+                Ok(Some(now)) if failed.is_none() || now.is_draft => ctx.record(
+                    self.run,
+                    Event::PrSetDraft { pr },
+                    &self.cause("pr-set-draft"),
+                )?,
+                Ok(found) => {
+                    let no_answer = |error: &RunError| {
+                        matches!(
+                            error,
+                            RunError::Tracker(TrackerError::Other { message, .. })
+                                if gh_gave_no_answer(message)
+                        )
+                    };
+                    if let Some(error) = failed.filter(no_answer) {
+                        return Err(error);
+                    }
+                    let unbound = match found {
+                        Some(_) => Unbound {
+                            public: reported_but(pr, "it is not a draft"),
+                            detail: None,
+                        },
+                        None => does_not_exist(pr),
+                    };
+                    return self.stuck(at, NOT_BOUND_CODE, unbound_stop(unbound, message));
+                }
             }
         }
         // Once per hand-off to the gate: the first report, and the report after each send-back.
@@ -2038,14 +2029,15 @@ mod tests {
         }
 
         /// A tracker whose call to put pull request #12 back to draft finds it ended meanwhile: a
-        /// person merged or closed it (`state`, `draft`), the call failed with `message`, and the
-        /// tracker's own read of the pull request after the failure failed too, so the error
-        /// reaches `advance`, whose second look reads the pull request ended.
+        /// person merged or closed it (`state`, `draft`), and the call failed with `message`.
+        /// The tracker's own read of the pull request after the failure finds it ended, so the
+        /// call is `Ok`, or with `read_fails` fails, so the error reaches `advance`.
         struct EndedFirst {
             sim: Arc<Sim>,
             state: &'static str,
             draft: bool,
             message: &'static str,
+            read_fails: bool,
             failed: std::sync::atomic::AtomicBool,
             read_failed: std::sync::atomic::AtomicBool,
         }
@@ -2065,6 +2057,7 @@ mod tests {
                 if self.failed.load(Ordering::SeqCst)
                     && args.first().map(String::as_str) == Some("pr")
                     && args.iter().any(|arg| arg == "view")
+                    && self.read_fails
                     && !self.read_failed.swap(true, Ordering::SeqCst)
                 {
                     return Err(TrackerError::Other {
@@ -2076,12 +2069,12 @@ mod tests {
             }
         }
 
-        /// A pull request merged or closed before the draft call, which the second look reads,
-        /// ends the run as one the first read found ended does, whatever the call said: never
-        /// stuck as "not a draft", never handed to the gate.
+        /// A pull request merged or closed before the draft call ends the run as one the first
+        /// read found ended does, whether the call reports `Ok` or fails: never stuck as "not a
+        /// draft", never handed to the gate, and not recorded drafted.
         #[test]
         fn a_pull_request_ended_before_the_draft_call_ends_the_run() {
-            for (state, draft, message, end) in [
+            let cases = [
                 (
                     "MERGED",
                     false,
@@ -2100,7 +2093,11 @@ mod tests {
                     "`gh pr ready` exited with status 1: HTTP 502: Bad Gateway",
                     "closed",
                 ),
-            ] {
+            ];
+            for ((state, draft, message, end), read_fails) in cases
+                .into_iter()
+                .flat_map(|case| [(case, false), (case, true)])
+            {
                 let (mut rig, run) = built();
                 rig.sim
                     .set_pull(12, pull("OPEN", false, BRANCH, "main", false));
@@ -2111,17 +2108,22 @@ mod tests {
                         state,
                         draft,
                         message,
+                        read_fails,
                         failed: std::sync::atomic::AtomicBool::new(false),
                         read_failed: std::sync::atomic::AtomicBool::new(false),
                     }),
                     Arc::new(|t: &str| t.into()),
                 );
                 end_turn(&mut rig, 1, DONE_MESSAGE);
-                assert_eq!(pass(&rig, &run), BuildStep::Ended, "{state} {draft}");
+                assert_eq!(
+                    pass(&rig, &run),
+                    BuildStep::Ended,
+                    "{state} {draft} {read_fails}"
+                );
                 assert_eq!(
                     names_after(&rig, &run, before),
                     ["pr_opened", "finished"],
-                    "{state} {draft}"
+                    "{state} {draft} {read_fails}"
                 );
                 let finished = last_event(&rig, &run);
                 assert_eq!(finished.data["outcome"], "pr-open");
@@ -2132,9 +2134,97 @@ mod tests {
                         .comments()
                         .iter()
                         .any(|comment| comment.contains("could not finish")),
-                    "{state} {draft}"
+                    "{state} {draft} {read_fails}"
                 );
             }
+        }
+
+        /// A tracker whose call to put pull request #12 back to draft is `Ok`: with `drafts` the
+        /// pull request is a draft after it, else a read still shows it ready for review (a
+        /// read that lags the change); with `read_fails` the next read of it fails once.
+        struct OkThen {
+            sim: Arc<Sim>,
+            drafts: bool,
+            read_fails: bool,
+            called: std::sync::atomic::AtomicBool,
+            read_failed: std::sync::atomic::AtomicBool,
+        }
+
+        impl Tracker for OkThen {
+            fn gh(&self, args: &[String]) -> Result<String, TrackerError> {
+                use std::sync::atomic::Ordering;
+                if args.iter().any(|arg| arg == "--undo") {
+                    if self.drafts {
+                        self.sim.set_pull(12, draft_on(BRANCH));
+                    }
+                    self.called.store(true, Ordering::SeqCst);
+                    return Ok(String::new());
+                }
+                if self.read_fails
+                    && self.called.load(Ordering::SeqCst)
+                    && args.first().map(String::as_str) == Some("pr")
+                    && args.iter().any(|arg| arg == "view")
+                    && !self.read_failed.swap(true, Ordering::SeqCst)
+                {
+                    return Err(TrackerError::Other {
+                        kind: crate::factory::github::OtherKind::Failed,
+                        message: "`gh pr view` exited with status 1: HTTP 502: Bad Gateway".into(),
+                    });
+                }
+                self.sim.gh(args)
+            }
+        }
+
+        fn ok_then(rig: &mut Rig, drafts: bool, read_fails: bool) {
+            rig.sim
+                .set_pull(12, pull("OPEN", false, BRANCH, "main", false));
+            rig.tracker = Hiding::new(
+                Arc::new(OkThen {
+                    sim: rig.sim.clone(),
+                    drafts,
+                    read_fails,
+                    called: std::sync::atomic::AtomicBool::new(false),
+                    read_failed: std::sync::atomic::AtomicBool::new(false),
+                }),
+                Arc::new(|t: &str| t.into()),
+            );
+        }
+
+        /// The call reported `Ok` and the read after it still shows the pull request ready for
+        /// review: the call is taken at its word, as drafted.
+        #[test]
+        fn an_ok_draft_call_whose_read_lags_goes_on_as_drafted() {
+            let (mut rig, run) = built();
+            ok_then(&mut rig, false, false);
+            let before = rig.events(&run).len();
+            end_turn(&mut rig, 1, DONE_MESSAGE);
+            assert!(matches!(
+                pass(&rig, &run),
+                BuildStep::ReadyForGate { pr: 12, .. }
+            ));
+            assert_eq!(
+                names_after(&rig, &run, before),
+                ["pr_set_draft", "pr_opened", "step_changed"]
+            );
+        }
+
+        /// The call reported `Ok` and the read after it failed: that read's error, with nothing
+        /// written, and the next pass, reading a draft, goes on.
+        #[test]
+        fn an_ok_draft_call_whose_read_fails_is_an_error_not_stuck() {
+            let (mut rig, run) = built();
+            ok_then(&mut rig, true, true);
+            end_turn(&mut rig, 1, DONE_MESSAGE);
+            let before = rig.events(&run).len();
+            let error = advance(&rig.ctx(), &run).unwrap_err();
+            assert!(error.to_string().contains("gh pr view"), "{error}");
+            assert_eq!(rig.events(&run).len(), before);
+            assert_eq!(rig.sim.labels(), ["factory:building"]);
+            say(&rig, DONE_MESSAGE);
+            assert!(matches!(
+                pass(&rig, &run),
+                BuildStep::ReadyForGate { pr: 12, .. }
+            ));
         }
 
         /// The rule: a rate limit, a timeout, an authentication refusal, `gh` not starting and an
