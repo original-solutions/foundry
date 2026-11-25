@@ -1199,6 +1199,11 @@ exec "$agent" "$@""#;
 
         /// Sessions over the same store and terminals, with or without a secret store.
         fn again(&self, with_secrets: bool) -> Sessions {
+            self.again_using(with_secrets.then(|| self.secrets.clone() as Arc<dyn Secrets>))
+        }
+
+        /// Sessions over the same store and terminals, with `secrets` as their store.
+        fn again_using(&self, secrets: Option<Arc<dyn Secrets>>) -> Sessions {
             let sessions = Sessions::new(
                 self.me,
                 self.store.clone(),
@@ -1207,10 +1212,9 @@ exec "$agent" "$@""#;
                 self.config.clone(),
             )
             .with_git_home(self.git_home.path().to_path_buf());
-            if with_secrets {
-                sessions.with_secrets(self.secrets.clone())
-            } else {
-                sessions
+            match secrets {
+                Some(secrets) => sessions.with_secrets(secrets),
+                None => sessions,
             }
         }
 
@@ -1226,9 +1230,15 @@ exec "$agent" "$@""#;
 
         /// [`Fx::restart`], with or without a secret store.
         async fn restart_with(&mut self, with_secrets: bool) {
+            let secrets = with_secrets.then(|| self.secrets.clone() as Arc<dyn Secrets>);
+            self.restart_using(secrets).await;
+        }
+
+        /// [`Fx::restart`], with `secrets` as the new daemon's store.
+        async fn restart_using(&mut self, secrets: Option<Arc<dyn Secrets>>) {
             self.server.abort();
             let _ = (&mut self.server).await;
-            let sessions = self.again(with_secrets);
+            let sessions = self.again_using(secrets);
             drop(std::mem::replace(&mut self.sessions, sessions));
             self.sessions.adopt().await;
             let listener = tokio::net::TcpListener::bind(("127.0.0.1", self.config.hook_port))
@@ -1850,6 +1860,28 @@ exec "$agent" "$@""#;
         f.assert_nothing_left(&bare, project);
     }
 
+    /// A store that holds the factory token and cannot list what it holds, so nothing can be
+    /// hidden.
+    struct Unlistable;
+
+    impl Secrets for Unlistable {
+        fn get(&self, name: &str) -> Result<Option<String>, crate::secrets::SecretsError> {
+            Ok((name == format!("github:{LOGIN}")).then(|| TOKEN.to_owned()))
+        }
+
+        fn set(&self, _: &str, _: &str) -> Result<(), crate::secrets::SecretsError> {
+            Ok(())
+        }
+
+        fn update(
+            &self,
+            _: &str,
+            _: crate::secrets::Edit<'_>,
+        ) -> Result<(), crate::secrets::SecretsError> {
+            Ok(())
+        }
+    }
+
     const IDLE: &str = "- hook: {event: SessionStart}\n";
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2294,13 +2326,18 @@ exec "$agent" "$@""#;
         ))
         .await;
         let project = ProjectId::random();
-        let (archived, kept) = (WorkspaceId::random(), WorkspaceId::random());
-        let gone = f.start_factory(archived, project).await;
+        let (before, after, kept) = (
+            WorkspaceId::random(),
+            WorkspaceId::random(),
+            WorkspaceId::random(),
+        );
+        let gone_before = f.start_factory(before, project).await;
+        let gone_after = f.start_factory(after, project).await;
         let stays = f.start_factory(kept, project).await;
-        for workspace in [archived, kept] {
+        for workspace in [before, after, kept] {
             f.sessions.end_factory(workspace).await.unwrap();
         }
-        for id in [gone, stays] {
+        for id in [gone_before, gone_after, stays] {
             until("the session to end", || {
                 matches!(
                     f.state(id),
@@ -2309,15 +2346,19 @@ exec "$agent" "$@""#;
             })
             .await;
         }
+        f.archive(before, project, true);
         f.restart().await;
 
-        f.archive(archived, project, true);
+        f.archive(after, project, true);
 
         let folder = |id: SessionId| f.sessions_dir().join(id.to_string());
-        until("the folder to go", || !folder(gone).exists()).await;
+        until("the folders to go", || {
+            !folder(gone_before).exists() && !folder(gone_after).exists()
+        })
+        .await;
         tokio::time::sleep(SWEEP_EVERY * 2).await;
         assert!(folder(stays).exists());
-        assert_eq!(f.sessions.is_factory(gone), Some(project));
+        assert_eq!(f.sessions.is_factory(gone_after), Some(project));
     }
 
     #[tokio::test]
@@ -2532,17 +2573,17 @@ exec "$agent" "$@""#;
             .await;
 
         assert_eq!(sent, Err(SendRefused::NotIdle));
-        let (snapshot, _) = f.terminals.attach(f.terminal_of(id)).await.unwrap();
-        let shown = String::from_utf8_lossy(&snapshot.bytes).into_owned();
-        assert!(
-            !shown.contains("LINE=") && !shown.contains("too soon"),
-            "{shown}"
-        );
+        // The first line the agent reads is the marker, so the refused one was never typed.
+        f.type_keys(id, claude::typed_prompt("marker")).await;
+        let seen = f.shown(id, |t| !all_values(t, "LINE=").is_empty()).await;
+        assert_eq!(all_values(&seen, "LINE=")[0], "\"marker\"");
+        assert!(!seen.contains("too soon"), "{seen}");
     }
 
     #[tokio::test]
     async fn wait_line_with_an_argument_skips_lines_that_do_not_start_with_it() {
-        let f = Fx::new("- wait_line: \"/factory-build\"\n- wait_input\n").await;
+        let f =
+            Fx::new("- wait_line: \"/factory-build\"\n- print: \"MATCHED\"\n- wait_input\n").await;
         let id = f
             .sessions
             .start(WorkspaceId::random(), f.worktree.path(), MODEL)
@@ -2554,11 +2595,153 @@ exec "$agent" "$@""#;
         f.type_keys(id, claude::typed_prompt("/factory-build x"))
             .await;
 
-        let seen = f.shown(id, |t| all_values(t, "LINE=").len() == 2).await;
+        let seen = f.shown(id, |t| t.contains("MATCHED\n")).await;
         assert_eq!(
             all_values(&seen, "LINE="),
             ["\"something else\"", "\"/factory-build x\""]
         );
+        let second = seen.find("LINE=\"/factory-build x\"").unwrap();
+        assert!(seen.find("MATCHED\n").unwrap() > second, "{seen}");
+    }
+
+    #[tokio::test]
+    async fn a_record_that_cannot_be_written_when_the_session_exits_is_still_stored() {
+        let f = Fx::new(&format!(
+            "{IDLE}- wait_input\n- stop: {{last_assistant_message: \"last words\"}}\n- exit: 0\n"
+        ))
+        .await;
+        let id = f
+            .start_factory(WorkspaceId::random(), ProjectId::random())
+            .await;
+        until("the session to be idle", || {
+            f.state(id) == Some(SessionState::Idle)
+        })
+        .await;
+        f.fail_turn_writes(6);
+
+        f.type_keys(id, b"\n".to_vec()).await;
+
+        until("the session to end", || {
+            matches!(
+                f.state(id),
+                Some(SessionState::Finished | SessionState::Failed)
+            )
+        })
+        .await;
+        f.until_turn(id, 1, 0).await;
+    }
+
+    #[tokio::test]
+    async fn records_that_could_not_be_written_are_stored_after_a_restart_and_the_next_turn_carries_on()
+     {
+        let mut f = Fx::new(&format!(
+            "{IDLE}- wait_prompt\n- stop: {{last_assistant_message: \"one\"}}\n\
+             - wait_prompt\n- stop: {{last_assistant_message: \"two\"}}\n\
+             - wait_prompt\n- stop: {{last_assistant_message: \"three\"}}\n- wait_input\n"
+        ))
+        .await;
+        let id = f
+            .start_factory(WorkspaceId::random(), ProjectId::random())
+            .await;
+        f.until_turn(id, 1, 1).await;
+        f.fail_turn_writes(1000);
+
+        f.sessions
+            .send_factory(id, Fx::message("go on"), None)
+            .await
+            .unwrap();
+
+        until("turn 2 on disk", || f.turn_file(id, 2).exists()).await;
+        assert_eq!(f.turn_of(id).unwrap().turn, 1);
+
+        f.restart().await;
+
+        f.until_turn(id, 2, 2).await;
+        let before = f
+            .sessions
+            .send_factory(id, Fx::message("and again"), None)
+            .await;
+        assert_eq!(before, Ok(2));
+        f.until_turn(id, 3, 3).await;
+        assert_eq!(f.sessions.turn_text(id, 3).await.unwrap().message, "three");
+    }
+
+    #[tokio::test]
+    async fn a_second_notification_while_the_session_waits_leaves_the_first_question() {
+        let f = Fx::new(&format!(
+            "{IDLE}- wait_prompt\n- notify: \"Which branch?\"\n\
+             - notify: \"Claude is waiting for your input\"\n\
+             - stop: {{last_assistant_message: \"done\"}}\n- wait_input\n"
+        ))
+        .await;
+        let id = f
+            .start_factory(WorkspaceId::random(), ProjectId::random())
+            .await;
+
+        f.until_turn(id, 1, 1).await;
+
+        assert!(f.turn_of(id).unwrap().question);
+        let asked = f.sessions.turn_text(id, 0).await.unwrap();
+        assert_eq!(asked.question.as_deref(), Some("Which branch?"));
+    }
+
+    #[tokio::test]
+    async fn a_body_is_not_written_or_typed_when_the_secret_store_cannot_be_read() {
+        let mut f = Fx::new(&format!(
+            "{IDLE}- wait_prompt\n- stop: {{last_assistant_message: \"a\"}}\n\
+             - wait_line: \"\"\n- wait_input\n"
+        ))
+        .await;
+        let id = f
+            .start_factory(WorkspaceId::random(), ProjectId::random())
+            .await;
+        f.until_turn(id, 1, 1).await;
+        f.restart_using(Some(Arc::new(Unlistable))).await;
+
+        let sent = f
+            .sessions
+            .send_factory(
+                id,
+                Message::new(format!("/continue {BODY_PATH}"), "the rules".into()),
+                None,
+            )
+            .await;
+
+        assert!(matches!(sent, Err(SendRefused::Failed(_))), "{sent:?}");
+        assert!(
+            !f.sessions_dir()
+                .join(id.to_string())
+                .join("messages")
+                .exists()
+        );
+        // A line with no body goes through, and is the only one the agent reads.
+        f.sessions
+            .send_factory(id, Fx::message("probe"), None)
+            .await
+            .unwrap();
+        let seen = f.shown(id, |t| !all_values(t, "LINE=").is_empty()).await;
+        assert_eq!(all_values(&seen, "LINE="), ["\"probe\""]);
+        assert!(!seen.contains("/continue"), "{seen}");
+    }
+
+    #[tokio::test]
+    async fn a_start_with_a_body_fails_and_leaves_nothing_when_the_secret_store_cannot_be_read() {
+        let f = Fx::new("- wait_input\n").await;
+        let project = ProjectId::random();
+        let sessions = f.again_using(Some(Arc::new(Unlistable)));
+
+        let error = sessions
+            .start_factory(
+                WorkspaceId::random(),
+                f.worktree.path(),
+                f.start_for(project),
+                Message::new(format!("/factory-build {BODY_PATH}"), "rules".into()),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, SessionError::SecretsUnreadable), "{error}");
+        f.assert_nothing_left(&sessions, project);
     }
 
     #[tokio::test]

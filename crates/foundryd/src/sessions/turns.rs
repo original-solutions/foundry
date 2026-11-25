@@ -429,6 +429,39 @@ mod tests {
     }
 
     #[test]
+    fn counts_are_written_as_text_and_read_back_and_junk_is_no_counts() {
+        let counts = Counts {
+            turn: 12,
+            prompts: 7,
+            question: true,
+        };
+        assert_eq!(Counts::parse(&counts.to_text()), Some(counts));
+        assert_eq!(
+            Counts::parse(&Counts::default().to_text()),
+            Some(Counts::default())
+        );
+        for junk in ["", "1 2", "a b c", "1 2 3", "1 2 1 4"] {
+            assert_eq!(Counts::parse(junk), None, "{junk:?}");
+        }
+    }
+
+    #[test]
+    fn counts_in_a_file_are_ahead_of_a_record_only_when_neither_number_is_behind() {
+        let at = |turn, prompts, question| Counts {
+            turn,
+            prompts,
+            question,
+        };
+        let stored = at(2, 3, false);
+        assert!(at(3, 3, false).is_ahead_of(stored));
+        assert!(at(2, 4, false).is_ahead_of(stored));
+        assert!(at(2, 3, true).is_ahead_of(stored));
+        assert!(!stored.is_ahead_of(stored));
+        assert!(!at(1, 9, false).is_ahead_of(stored));
+        assert!(!at(9, 2, true).is_ahead_of(stored));
+    }
+
+    #[test]
     fn a_turn_and_the_question_have_their_own_files_in_the_session_folder() {
         let folder = std::path::Path::new("/data/sessions/s");
         assert_eq!(turn_file(folder, 3), folder.join("turns").join("3.txt"));
