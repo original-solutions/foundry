@@ -55,7 +55,8 @@
 //!   sleep-counting clock, is not read at all, since its readings are never compared with a
 //!   stored record. [`elapsed_ms`] never counts a negative span. A begun stuck path or
 //!   questions comment is `advance`'s to finish while it can (an idle session with its newest turn
-//!   unread since the launch), not taken over with the time-limit words.
+//!   unread since the launch), not taken over with the time-limit words. Questions already posted
+//!   it finishes from the ledger alone, whatever the session shows.
 //!   The runner asked the thread for how recently the session was active and said so in the
 //!   reason; Foundry has no such read, so the reason is the plain [`messages::TIME_LIMIT`] and
 //!   the runner's cases about a busy or an idle session, a thread archived or unreadable, and
@@ -211,6 +212,12 @@ pub fn advance(ctx: &RunContext<'_>, run: &RunId) -> Result<BuildStep, RunError>
         release_old_claim(ctx, issue, detail.as_ref())?;
         end_needs_info(ctx, &at)?;
         return Ok(BuildStep::NeedsInfo);
+    }
+    // The questions are on the issue and the move to `needs-info` was cut short after them: the
+    // ledger alone finishes it, whatever the session shows, as `finish_begun_stuck` finishes a
+    // begun stuck path. `time_limit` leaves such a run to this.
+    if at.state == State::Building && seen.questions_posted {
+        return finish_posted_questions(ctx, run, &events, &mut at);
     }
     let Some(thread) = seen.thread_id.clone() else {
         // The launch is `start`'s while the run is in `triage`; a building run with no session
@@ -430,6 +437,37 @@ fn end_needs_info(ctx: &RunContext<'_>, at: &Progress) -> Result<(), RunError> {
         None,
     )?;
     Ok(())
+}
+
+/// Finishes the move to `needs-info` of a run whose questions are on the issue: the label, the
+/// release and the status comment, then the end. The questions are not posted again
+/// (`apply_actions` skips them once `questions_posted` is in the ledger) and the session is not
+/// read: the questions are the newest `questions_posted` line's.
+fn finish_posted_questions(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    events: &[RunEvent],
+    at: &mut Progress,
+) -> Result<BuildStep, RunError> {
+    let questions = events
+        .iter()
+        .rev()
+        .find(|event| event.event == names::QUESTIONS_POSTED)
+        .and_then(|event| event.data.get("questions"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let (_, actions) = transition(at.state, &LifecycleEvent::QuestionsRaised { questions })?;
+    apply_actions(
+        ctx,
+        run.issue(),
+        at,
+        &actions,
+        &Cause::new(CauseStep::Advance, "questions-asked"),
+        &ActionPayload::default(),
+    )?;
+    end_needs_info(ctx, at)?;
+    Ok(BuildStep::NeedsInfo)
 }
 
 /// Carries out the stuck path the ledger shows begun, with the words it recorded. The session's
@@ -2840,7 +2878,9 @@ mod tests {
         #[test]
         fn cut_short_after_they_are_posted_are_finished_from_the_ledger_whatever_the_session_shows()
         {
-            let shapes: [(&str, fn(&mut Rig)); 6] = [
+            /// A name, and what the fleet shows of the session that ended.
+            type Shape = (&'static str, fn(&mut Rig));
+            let shapes: [Shape; 6] = [
                 ("finished", |rig| show(rig, SessionState::Finished, 1, 1)),
                 ("failed", |rig| show(rig, SessionState::Failed, 1, 1)),
                 ("working", |rig| show(rig, SessionState::Working, 2, 2)),
