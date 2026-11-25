@@ -1852,7 +1852,7 @@ fn insert_unreadable_factory(
     kind: &str,
     id: &str,
     body: serde_json::Value,
-) {
+) -> String {
     let record = serde_json::json!({
         "owner": owner.to_string(),
         "version": version,
@@ -1874,6 +1874,7 @@ fn insert_unreadable_factory(
             ],
         )
         .unwrap();
+    record.to_string()
 }
 
 /// One writer's status this build cannot read must not hide the other writers' statuses, as
@@ -2306,6 +2307,7 @@ fn session_turns_leave_out_a_session_keyed_by_an_id_spelt_otherwise() {
     for spell in [
         (|id: SessionId| id.to_string().to_uppercase()) as fn(SessionId) -> String,
         |id| id.0.simple().to_string(),
+        |_| "not-a-session".to_owned(),
     ] {
         let (_dir, mut store) = open();
         let a = MachineId::random();
@@ -2407,7 +2409,7 @@ fn bulk_reads_fail_naming_the_key_on_an_unreadable_row_or_another_kind() {
     );
     assert!(!error.to_string().contains("hunter2"), "{error}");
 
-    // A value of the wrong type is not quoted either.
+    // A value of the wrong type is not quoted either, though serde's own text would quote it.
     store
         .conn
         .execute(
@@ -2415,17 +2417,46 @@ fn bulk_reads_fail_naming_the_key_on_an_unreadable_row_or_another_kind() {
             [],
         )
         .unwrap();
-    insert_unreadable_factory(
-        &store,
-        a,
-        2,
-        "session_turn",
-        &format!("{session}/{a}"),
-        serde_json::json!({"logins": "someone-secret"}),
-    );
+    let mut body = serde_json::to_value(turn_body(session, 1)).unwrap();
+    body["turn"] = serde_json::json!("someone-secret");
+    let key = format!("{session}/{a}");
+    let json = insert_unreadable_factory(&store, a, 2, "session_turn", &key, body);
+    let raw = serde_json::from_str::<FactoryRecord>(&json)
+        .unwrap_err()
+        .to_string();
+    assert!(raw.contains("someone-secret"), "{raw}");
     let error = store.session_turns().unwrap_err();
     assert!(matches!(error, StoreError::Json(_)), "{error}");
+    assert!(error.to_string().contains(&key), "{error}");
     assert!(!error.to_string().contains("someone-secret"), "{error}");
+
+    let typed = MachineId::random();
+    let mut body = serde_json::to_value(held_body(&["x"])).unwrap();
+    body["logins"] = serde_json::json!("someone-secret");
+    let json =
+        insert_unreadable_factory(&store, typed, 1, "machine_held", &typed.to_string(), body);
+    let raw = serde_json::from_str::<FactoryRecord>(&json)
+        .unwrap_err()
+        .to_string();
+    assert!(raw.contains("someone-secret"), "{raw}");
+    store
+        .conn
+        .execute(
+            "DELETE FROM factory_records WHERE kind = 'session_turn'",
+            [],
+        )
+        .unwrap();
+    let error = store.helds().unwrap_err();
+    assert!(matches!(error, StoreError::Json(_)), "{error}");
+    assert!(error.to_string().contains(&typed.to_string()), "{error}");
+    assert!(!error.to_string().contains("someone-secret"), "{error}");
+    store
+        .conn
+        .execute(
+            "DELETE FROM factory_records WHERE kind = 'machine_held'",
+            [],
+        )
+        .unwrap();
 
     let machine = MachineId::random();
     insert_unreadable_factory(
