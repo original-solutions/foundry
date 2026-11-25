@@ -76,7 +76,12 @@
 //!    recorded left and holds nothing; the spec has that machine archive it when heard from
 //!    again. A sweep of `gate-left` workspaces on an online machine belongs to tasks 28 and 30
 //!    (a follow-up), the spec keeping a stuck run's workspaces for a person anyway. The build
-//!    workspace follows the same answers. Then
+//!    and the gate workspaces follow one rule: "not a live workspace" counts as archived, an
+//!    "unreachable" answer is a step that is not an error and is asked again next pass
+//!    (`gate-archive-waiting <k>` notes it once for a gate), and refusals are counted and end
+//!    the run stuck after `ARCHIVE_TRIES`, with the same words. A create with no answer waits
+//!    the unseen grace (`UNSEEN_PASSES`, with the passes left in `BackingOff`) on top of the
+//!    backoff before the next gate is placed. Then
 //!    `gate_command` lines (those of this gate not yet on record) and
 //!    `gate_finished` are written, and the verdict is acted on.
 //! 6. **Act.** The pull request is read again. A head that is not the one gated is
@@ -315,6 +320,7 @@ pub const GATE_FAILING: &str = "gate-failing ";
 /// The step noting, once, that an archive is waiting for a machine that is online but did not
 /// answer: `gate-archive-waiting <k>`.
 pub const GATE_ARCHIVE_WAITING: &str = "gate-archive-waiting ";
+/// The step of a forced archive that failed other than as unreachable: `gate-archive-failed <k>`.
 pub const GATE_ARCHIVE_FAILED: &str = "gate-archive-failed ";
 /// How many such failures make a gate workspace one that can never be archived.
 pub const ARCHIVE_TRIES: u32 = 3;
@@ -347,6 +353,8 @@ pub const BUILD_SESSION_ENDED: &str = "build-session-ended";
 pub const BUILD_ARCHIVING: &str = "build-archiving";
 /// The step written once it was.
 pub const BUILD_ARCHIVED: &str = "build-archived";
+/// The step written for each refusal of the build workspace's archive that is not "unreachable".
+pub const BUILD_ARCHIVE_FAILED: &str = "build-archive-failed";
 
 /// The public reason of a run whose pull request head kept moving until no retry was left.
 pub const HEAD_KEPT_MOVING: &str = "the pull request's head kept moving, so the gate could not settle on a commit within gate_retries";
@@ -494,6 +502,7 @@ struct Log {
     session_ended: bool,
     build_archiving: bool,
     build_archived: bool,
+    build_failed: u32,
     /// The highest attempt and gate number of the whole run, and the attempt when this round
     /// began: a round's budget counts from `base_attempt`, a gate's name is never reused.
     base_attempt: u32,
@@ -700,6 +709,8 @@ impl Log {
             self.session_ended = true;
         } else if step == BUILD_ARCHIVING {
             self.build_archiving = true;
+        } else if step == BUILD_ARCHIVE_FAILED {
+            self.build_failed += 1;
         } else if step == BUILD_ARCHIVED {
             self.build_archived = true;
         }
@@ -1001,18 +1012,47 @@ impl Gate<'_, '_> {
     }
 
     /// The build workspace archived by force.
-    fn archive_build(&self) -> Result<(), RunError> {
+    fn archive_build(&self) -> Result<Option<GateStep>, RunError> {
         let (seen, log) = self.fresh()?;
         if log.build_archived {
-            return Ok(());
+            return Ok(None);
         }
         if let Some(workspace) = self.build_workspace(&seen)? {
             if !log.build_archiving {
                 self.step(BUILD_ARCHIVING, "build-archiving", None)?;
             }
-            archive_call(self.ctx, workspace)?;
+            match archive_call(self.ctx, workspace) {
+                Ok(()) => {}
+                Err(error @ RunError::LeaseLost(_)) => return Err(error),
+                // Gone or not, the machine is asked again next pass: the run stays as it is.
+                Err(RunError::Worker(WorkerError::Unreachable(_))) => {
+                    return Ok(Some(GateStep::NotReady));
+                }
+                Err(error) => {
+                    self.step(BUILD_ARCHIVE_FAILED, "build-archive-failed", None)?;
+                    if log.build_failed + 1 >= ARCHIVE_TRIES {
+                        return Ok(Some(self.archive_stuck(&error.to_string())?));
+                    }
+                    return Err(error);
+                }
+            }
         }
-        self.step(BUILD_ARCHIVED, "build-archived", None)
+        self.step(BUILD_ARCHIVED, "build-archived", None)?;
+        Ok(None)
+    }
+
+    /// The run is stuck: a workspace of it can never be archived, which the issue's acceptance
+    /// criterion (none left at `pr-open`) does not allow to pass.
+    fn archive_stuck(&self, error: &str) -> Result<GateStep, RunError> {
+        let stop = Stop {
+            reason: "a gate workspace could not be archived".into(),
+            detail: Some(format!(
+                "a gate workspace could not be archived: {}",
+                error.replace('\n', " ")
+            )),
+            ..Stop::default()
+        };
+        self.stuck("gate-archive-failed", stop)
     }
 
     /// The stuck path, with the build session ended first and once.
@@ -1083,8 +1123,8 @@ impl Gate<'_, '_> {
         if req.archived {
             return Ok(None);
         }
-        // Only the `pr-open` sweep goes back to a gate that was left, and not to one left
-        // because its machine is gone or nothing was shown.
+        // Only the `pr-open` sweep goes back to a gate that was left, and it decides from what
+        // the view shows now, not from why the gate was left.
         if req.left.is_some() && mode != Mode::PrOpen {
             return Ok(None);
         }
@@ -1202,12 +1242,7 @@ impl Gate<'_, '_> {
         let (_, log) = self.fresh()?;
         for req in log.reqs.iter().filter(|req| !req.archived) {
             if let Some(error) = self.archive_gate(req, Mode::PrOpen)? {
-                let stop = Stop {
-                    reason: "a gate workspace could not be archived".into(),
-                    detail: Some(format!("a gate workspace could not be archived: {error}")),
-                    ..Stop::default()
-                };
-                return Ok(Some(self.stuck("gate-archive-failed", stop)?));
+                return Ok(Some(self.archive_stuck(&error)?));
             }
         }
         Ok(None)
@@ -1231,7 +1266,9 @@ impl Gate<'_, '_> {
                 if let Some(step) = self.sweep_for_pr_open()? {
                     return Ok(step);
                 }
-                self.archive_build()?;
+                if let Some(step) = self.archive_build()? {
+                    return Ok(step);
+                }
                 return Ok(GateStep::Passed { pr: self.pr });
             }
             Some(State::Building) => {}
@@ -1343,7 +1380,14 @@ impl Gate<'_, '_> {
             .iter()
             .any(|req| req.cnr && !req.archived && req.left.is_none())
         {
-            return Ok(GateStep::BackingOff { passes_left: 0 });
+            let left = now
+                .reqs
+                .iter()
+                .filter(|req| req.cnr && !req.archived && req.left.is_none())
+                .map(|req| UNSEEN_PASSES.saturating_sub(req.unseen + 1))
+                .max()
+                .unwrap_or(0);
+            return Ok(GateStep::BackingOff { passes_left: left });
         }
         let pull = self.ctx.tracker.pull_request(self.ctx.repo(), self.pr)?;
         if let Some(step) = self.unbound(seen, pull.as_ref())? {
@@ -2331,7 +2375,9 @@ impl Gate<'_, '_> {
                 ..ActionPayload::default()
             },
         )?;
-        self.archive_build()?;
+        if let Some(step) = self.archive_build()? {
+            return Ok(step);
+        }
         Ok(GateStep::Passed { pr: self.pr })
     }
 }
