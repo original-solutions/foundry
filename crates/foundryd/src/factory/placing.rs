@@ -706,6 +706,24 @@ mod tests {
         assert_eq!(place_run(&view, &settings, LOGIN, &mut reserved), Ok(vps));
     }
 
+    #[test]
+    fn runs_held_on_one_machine_leave_another_as_full_as_its_sample() {
+        let (mac, vps, settings) = two();
+        // The vps has one session free and the lower load; the runs held are on the mac.
+        let mut reserved = Reserved::default();
+        reserved.hold(mac);
+        reserved.hold(mac);
+        let view = FleetView::builder()
+            .sample(sample(mac, 0, 0.5))
+            .sample(sample(vps, 3, 0.1))
+            .held(mac, holds(&[LOGIN], true))
+            .held(vps, holds(&[LOGIN], true))
+            .online(mac)
+            .online(vps)
+            .build();
+        assert_eq!(place_run(&view, &settings, LOGIN, &mut reserved), Ok(vps));
+    }
+
     fn run(issue: u64, state: Option<State>, confirmed: bool, pr_reported: bool) -> RunInfo {
         RunInfo {
             id: RunId::new("acme/app", issue, 1).expect("a legal repo"),
