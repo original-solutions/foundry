@@ -6108,7 +6108,7 @@ mod tests {
                     && args.get(1).map(String::as_str) == Some("view")
                 {
                     return Err(TrackerError::Other {
-                        kind: OtherKind::Failed,
+                        kind: OtherKind::NoAnswer,
                         message: "`gh pr view` exited with status 1: HTTP 502: Bad Gateway".into(),
                     });
                 }
@@ -6122,18 +6122,19 @@ mod tests {
                     kind: OtherKind::Failed,
                     message: "`gh pr ready 12` exited with status 1: boom".into(),
                 },
+                // `github::gh` gives these the kind `NoAnswer`: GitHub never answered.
                 "502" => || TrackerError::Other {
-                    kind: OtherKind::Failed,
+                    kind: OtherKind::NoAnswer,
                     message: "`gh pr ready 12` exited with status 1: HTTP 502: Bad Gateway".into(),
                 },
                 "connecting" => || TrackerError::Other {
-                    kind: OtherKind::Failed,
+                    kind: OtherKind::NoAnswer,
                     message:
                         "`gh pr ready 12` exited with status 1: error connecting to api.github.com"
                             .into(),
                 },
                 "signal" => || TrackerError::Other {
-                    kind: OtherKind::Failed,
+                    kind: OtherKind::NoAnswer,
                     message: "`gh pr ready 12` exited with status -1: killed".into(),
                 },
                 "404" => || TrackerError::NotFound {
