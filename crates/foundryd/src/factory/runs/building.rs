@@ -49,15 +49,29 @@
 //!   under the same count.
 //! - `limits.minutes` counts a run that has reported its pull request: the runner's
 //!   `pr-reported` skip is dropped (the spec), and [`Seen::worked_ms`] leaves out the gate and
-//!   the checks. The current stint ends at `ctx.clock`, read as milliseconds and compared with
-//!   the ledger's own stamps (`working_since`) through [`elapsed_ms`], which never counts a
-//!   negative span. The two are one base only when the pass's clock reads the ledger's: the
-//!   caller builds the context so, as the tests do. The runner asked the thread for how
-//!   recently the session was active and said so in the reason; Foundry has no such read, so
-//!   the reason is the plain [`messages::TIME_LIMIT`] and the runner's cases about a busy or an
-//!   idle session, a thread archived or unreadable, and a run of another repo
-//!   (`WrongRepoError`) have no counterpart. The branch in the stop is the launch line's,
-//!   `Stop::branch` prepared as the stuck path's other texts are.
+//!   the checks. The time is taken from the timestamps the events carry, as the spec says:
+//!   the running stint ends at the system's wall clock, the base the ledger stamps with
+//!   ([`time_limit`] reads it; [`time_limit_at`] is given it), and `ctx.clock`, the
+//!   sleep-counting clock, is not read at all, since its readings are never compared with a
+//!   stored record. [`elapsed_ms`] never counts a negative span. A begun stuck path or
+//!   questions comment is `advance`'s to finish, not taken over with the time-limit words.
+//!   The runner asked the thread for how recently the session was active and said so in the
+//!   reason; Foundry has no such read, so the reason is the plain [`messages::TIME_LIMIT`] and
+//!   the runner's cases about a busy or an idle session, a thread archived or unreadable, and
+//!   a run of another repo (`WrongRepoError`) have no counterpart. The branch in the stop is
+//!   the launch line's, `Stop::branch` prepared as the stuck path's other texts are.
+//! - A reminder is one send at a time like the rest: while another send to the session may have
+//!   typed ([`SendTries::pending`]) the pass writes and sends nothing. The turn is recorded
+//!   read before the reminder is recorded sent (`result-line-reminded`), so a pass cut between
+//!   the two neither hangs nor goes stuck on the turn it reminded. A reminder the worker
+//!   refused as `NotIdle` is sent again while the session's turn is the same; a newer turn
+//!   answers a begun reminder whichever message started it, as in the runner, and one that
+//!   ends with no line is stuck with the run's own reason.
+//! - Putting the session's pull request back to draft fails as the runner has it only when
+//!   `gh` ran and the pull request cannot be made a draft (`OtherKind::Failed`, `NotFound`):
+//!   stuck, in the runner's words. Any other failure (a rate limit, a timeout, a refused
+//!   login, `gh` not starting, an answer that cannot be read) is an error with nothing more
+//!   written, and the next pass asks again.
 //! - The runner's case of a run with no ordinal and no result line, stuck at once, has no
 //!   counterpart: a turn always has a number. Its cases about a run a person stopped
 //!   (`stop-run.sh`), a run whose agent process died, `refused before anything is read`, the
@@ -73,7 +87,7 @@ use foundry_proto::ids::SessionId;
 use foundry_proto::state::SessionState;
 
 use super::progress::{
-    RESULT_LINE_REMINDED, RESULT_LINE_REMINDING, Seen, TIME_LIMIT as TIME_LIMIT_CODE,
+    RESULT_LINE_REMINDED, RESULT_LINE_REMINDING, Seen, SendTries, TIME_LIMIT as TIME_LIMIT_CODE,
     pending_relaunch, read_progress,
 };
 use super::{
@@ -81,8 +95,8 @@ use super::{
     apply_actions, closed_issue, end_own_merge, end_run, finish_building, go_stuck, progress_from,
     recorded_reason, session_id, stop_session, workspace_id,
 };
-use crate::factory::github::{PullRequest, TrackerError};
-use crate::factory::ledger::events::{Cause, CauseStep, Event, Outcome};
+use crate::factory::github::{IssueDetail, OtherKind, PullRequest, TrackerError};
+use crate::factory::ledger::events::{Cause, CauseStep, Event, Outcome, names};
 use crate::factory::lifecycle::result_line::{
     self, NO_MESSAGE, NO_RESULT_LINE, SAID_STUCK, SessionResult,
 };
@@ -300,20 +314,29 @@ fn not_this_steps(run: &RunId, seen: &Seen) -> Option<String> {
 fn newest_turn_read(events: &[RunEvent]) -> Option<u64> {
     let mut newest = None;
     for event in events {
-        if event.event == crate::factory::ledger::events::names::SESSION_LAUNCHED {
+        if event.event == names::SESSION_LAUNCHED {
             newest = None;
-        } else if event.event == crate::factory::ledger::events::names::STEP_CHANGED
+        } else if event.event == names::STEP_CHANGED
             && let Some(n) = event
                 .data
                 .get("step")
                 .and_then(serde_json::Value::as_str)
                 .and_then(|step| step.strip_prefix(TURN_READ))
-                .and_then(|n| n.parse::<u64>().ok())
+                .and_then(canonical)
         {
             newest = Some(newest.map_or(n, |read: u64| read.max(n)));
         }
     }
     newest
+}
+
+/// `text` as a number written the way this step writes one: digits only, no sign, no leading
+/// zero except `0` itself.
+fn canonical(text: &str) -> Option<u64> {
+    let plain = !text.is_empty()
+        && text.bytes().all(|b| b.is_ascii_digit())
+        && (text == "0" || !text.starts_with('0'));
+    if plain { text.parse().ok() } else { None }
 }
 
 /// `text` prepared as session text, or `None` when nothing is left of it.
@@ -342,13 +365,19 @@ fn lacks_result_line(reason: &str) -> bool {
     reason == NO_MESSAGE || reason == NO_RESULT_LINE
 }
 
+/// Whether a send to the session may have typed and is not known typed: no other send goes
+/// until it is settled (the rule of `send_once`, which the reminder is outside of).
+fn send_pending(seen: &Seen) -> bool {
+    seen.sends.values().any(SendTries::pending)
+}
+
 /// Gives back an issue that an older version's claim left `factory:building` and assigned to
 /// the login for a run now left in `needs-info`. Only that exact shape is touched; anything else
 /// is a person's.
 fn release_old_claim(
     ctx: &RunContext<'_>,
     issue: u64,
-    read: Option<&crate::factory::github::IssueDetail>,
+    read: Option<&IssueDetail>,
 ) -> Result<(), RunError> {
     let fetched;
     let detail = match read {
@@ -594,6 +623,8 @@ impl Step<'_, '_> {
                     &self.cause("result-line-reminded"),
                 )?;
                 reminded = true;
+            } else if send_pending(seen) {
+                return Ok(BuildStep::Running);
             } else {
                 return self.send_reminder(at, turn, None);
             }
@@ -629,6 +660,11 @@ impl Step<'_, '_> {
                     return self.stuck(at, WRONG_ACCOUNT_CODE, stop);
                 }
                 if lacks_result_line(reason) && !reminded {
+                    // One message at a time to a session: another send that may have typed is
+                    // settled first, and nothing is written meanwhile.
+                    if send_pending(seen) {
+                        return Ok(BuildStep::Running);
+                    }
                     self.ctx.record_step(
                         self.run,
                         &format!("{RESULT_LINE_REMINDING} {}", turn.turn),
@@ -660,13 +696,17 @@ impl Step<'_, '_> {
         match sent {
             // A count that rose means the line went in, or a person typed: either way the
             // session takes another turn, and typing again would be a second reminder.
+            // The turn is recorded read first: a pass cut between the two lines finds the turn
+            // read (the session is given time to answer, and is not reminded twice), and its
+            // newer turn is the answer, which records `result-line-reminded` first. Reminded
+            // first would read the same turn again as ended with no line and go stuck at once.
             Ok(_) | Err(RunError::Send(SendRefused::CountRose { .. })) => {
+                self.mark_read(turn.turn)?;
                 self.ctx.record_step(
                     self.run,
                     RESULT_LINE_REMINDED,
                     &self.cause("result-line-reminded"),
                 )?;
-                self.mark_read(turn.turn)?;
                 Ok(BuildStep::Reminded)
             }
             // The next pass looks again.
@@ -741,11 +781,18 @@ impl Step<'_, '_> {
                     Event::PrSetDraft { pr },
                     &self.cause("pr-set-draft"),
                 )?,
-                // A rate limit says nothing about the pull request: ask again next pass.
-                Err(error @ RunError::Tracker(TrackerError::RateLimited { .. })) => {
-                    return Err(error);
-                }
-                Err(RunError::Tracker(_)) => {
+                // Only an answer that says `gh` ran and the pull request cannot be made a draft
+                // is stuck, in the runner's words for this case. A rate limit, a timeout, a
+                // refused login, `gh` not starting or an answer that cannot be read say nothing
+                // about the pull request: an error with nothing more written, asked again next
+                // pass.
+                Err(RunError::Tracker(
+                    TrackerError::NotFound { .. }
+                    | TrackerError::Other {
+                        kind: OtherKind::Failed,
+                        ..
+                    },
+                )) => {
                     let stop = Stop {
                         reason: format!("the session reported PR #{pr} but it is not a draft"),
                         session_text: prepared(message),
@@ -781,18 +828,29 @@ impl Step<'_, '_> {
     }
 }
 
-/// [`time_limit`] with "now" given, in Unix epoch milliseconds on the ledger's stamping base.
-pub fn time_limit_at(
-    _ctx: &RunContext<'_>,
-    _run: &RunId,
-    _now_ms: u64,
-) -> Result<LimitStep, RunError> {
-    todo!("time_limit_at")
+/// Stops `run` when it has worked longer than `limits.minutes`, with "now" the system's wall
+/// clock on the ledger's stamping base ([`system_ms`](crate::factory::ledger::system_ms)).
+/// Called by the pass before any step. The time is taken from the timestamps the events carry
+/// (spec, `limits.minutes`), so the running stint ends at the wall clock, not at the
+/// sleep-counting clock of [`RunContext::clock`], whose readings are never compared with a
+/// stored record. See [`time_limit_at`].
+pub fn time_limit(ctx: &RunContext<'_>, run: &RunId) -> Result<LimitStep, RunError> {
+    time_limit_at(ctx, run, crate::factory::ledger::system_ms())
 }
 
-/// Stops `run` when it has worked longer than `limits.minutes`. Called by the pass before any
-/// step. See the module's words.
-pub fn time_limit(ctx: &RunContext<'_>, run: &RunId) -> Result<LimitStep, RunError> {
+/// [`time_limit`] with "now" given, in Unix epoch milliseconds on the ledger's stamping base:
+/// what the running stint's start (`working_since`) is on. A "now" before the start adds no
+/// time ([`elapsed_ms`]), as a wall clock that stepped back would give. Skips a finished run, a
+/// relaunch decided, a run that is not working, one stuck or asked to stop, one whose stuck
+/// path or questions comment the advance step began (it finishes them with the words it
+/// decided on), and a launch sent with no session recorded. A pull request that was reported
+/// does not skip the run (spec, `limits.minutes`): the time a gate ran and the checks were
+/// waited for are already left out of [`Seen::worked_ms`].
+pub fn time_limit_at(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    now_ms: u64,
+) -> Result<LimitStep, RunError> {
     let seen = ctx.seen(run)?;
     let skipped = |why: &str| {
         Ok(LimitStep::Skipped {
@@ -816,14 +874,19 @@ pub fn time_limit(ctx: &RunContext<'_>, run: &RunId) -> Result<LimitStep, RunErr
     if !working || seen.stuck.is_some() || seen.stop_requested || seen.questions_posted {
         return skipped("is not running");
     }
+    // A decision to go stuck, or the questions' comment, that the advance step began: it
+    // finishes it, and the reason it decided on is the one the run ends with.
+    if seen.stuck_stop.is_some() || seen.questions_commenting.is_some() {
+        return skipped("has a stuck path or a questions comment begun, which advance finishes");
+    }
     // The launch was sent and no session recorded: `resume` names its session.
     if seen.thread_id.is_none() && seen.launch_sent {
         return skipped("has a launch that was sent and no session recorded");
     }
-    // A pull request that was reported does not stop the count (spec, `limits.minutes`): the
-    // time a gate ran and the checks were waited for are already left out of `worked_ms`.
-    let now = u64::try_from(ctx.clock.now().as_millis()).unwrap_or(u64::MAX);
-    let worked = seen.worked_ms + seen.working_since.map_or(0, |since| elapsed_ms(since, now));
+    let worked = seen.worked_ms
+        + seen
+            .working_since
+            .map_or(0, |since| elapsed_ms(since, now_ms));
     if worked <= ctx.config.limits.minutes.saturating_mul(60_000) {
         return Ok(LimitStep::Within);
     }
@@ -2748,9 +2811,11 @@ mod tests {
             let (mut rig, run) = built();
             rig.step(&run, "result-line-reminding 1");
             rig.step(&run, "turn-read 1");
-            end_turn(&mut rig, 1, WORKING_MESSAGE);
+            // The turn is read: its text is not asked for again.
+            show(&mut rig, SessionState::Idle, 1, 1);
             let before = rig.events(&run).len();
             assert_eq!(pass(&rig, &run), BuildStep::Running);
+            assert_eq!(turn_reads(&rig), 0);
             assert!(sends(&rig).is_empty());
             assert_eq!(rig.events(&run).len(), before);
             // The session answers with a result: no hang.
