@@ -2750,4 +2750,43 @@ mod tests {
             }
         }
     }
+
+    // ----- a run of another repo -----
+
+    mod a_run_of_another_repo {
+        use super::*;
+
+        #[test]
+        fn is_skipped_before_anything_is_read_or_touched() {
+            let mut rig = Rig::new();
+            let own = run_id(1);
+            built(&mut rig, &own);
+            rig.write(&own, stop_line());
+            let other = RunId::new("rawphp/other", 8, 1).unwrap();
+            let reads = rig.sim.calls().len();
+            assert_eq!(
+                advance(&rig.ctx(), &other).unwrap(),
+                StopStep::Skipped { why: "other-repo" }
+            );
+            assert_eq!(
+                reconcile(&rig.ctx(), &other).unwrap(),
+                ReconcileStep::Skipped { why: "other-repo" }
+            );
+            assert_eq!(rig.sim.calls().len(), reads);
+            assert!(calls(&rig).is_empty());
+            assert!(rig.events(&other).is_empty());
+        }
+
+        #[test]
+        fn is_judged_by_its_repo_whatever_the_case_of_the_name() {
+            let mut rig = Rig::new();
+            let run = RunId::new("RawPHP/SoftFac", 8, 1).unwrap();
+            built(&mut rig, &run);
+            rig.write(&run, stop_line());
+            assert!(matches!(
+                advance(&rig.ctx(), &run).unwrap(),
+                StopStep::Stuck { .. }
+            ));
+        }
+    }
 }
