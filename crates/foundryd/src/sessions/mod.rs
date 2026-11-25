@@ -113,8 +113,6 @@ pub enum SessionError {
     NoToken(#[from] crate::git_auth::NoToken),
     #[error("sessions: git_auth gave a factory start no askpass or token")]
     NoAskpass,
-    #[error("sessions: a factory session's first message cannot carry a body yet")]
-    FirstMessageBody,
     #[error("sessions: the workspace's factory sessions were ended while this one was starting")]
     Ended,
     #[error(transparent)]
@@ -346,8 +344,11 @@ impl Sessions {
 }
 
 impl Drop for Sessions {
-    /// Stops this daemon's follower and timer tasks. The terminals keep running.
+    /// Stops this daemon's follower, timer and sweeper tasks. The terminals keep running.
     fn drop(&mut self) {
+        if let Some(sweeper) = lock(&self.inner.factory).sweeper.take() {
+            sweeper.abort();
+        }
         for live in lock(&self.inner.live).values() {
             for task in lock(&live.tasks).drain(..) {
                 task.abort();
@@ -371,7 +372,13 @@ impl Inner {
         let url = self.hook_url(id);
         let written = {
             let (settings, curl, token) = (settings.clone(), curl.clone(), token.clone());
-            let marked = factory.map(|f| (factory::mark_file(&self.dir, id), f.project));
+            let marked = factory.map(|f| {
+                (
+                    factory::folder(&self.dir, id),
+                    f.project,
+                    f.first_body.clone(),
+                )
+            });
             blocking(move || {
                 claude::write_curl_config(&curl, &url, &token)?;
                 let json = if marked.is_some() {
@@ -381,16 +388,26 @@ impl Inner {
                 };
                 claude::write_settings(&settings, &json)?;
                 match marked {
-                    Some((mark, project)) => factory::write_mark(&mark, project),
-                    None => Ok(()),
+                    Some((folder, project, body)) => {
+                        factory::write_files(&folder, project, workspace, body.as_deref())
+                    }
+                    None => Ok(None),
                 }
             })
             .await
         };
-        if let Err(error) = written.and_then(|r| r) {
-            self.discard(id, &settings, &curl).await;
-            return Err(error);
-        }
+        let body_path = match written.and_then(|r| r) {
+            Ok(path) => path,
+            Err(error) => {
+                self.discard(id, &settings, &curl).await;
+                return Err(error);
+            }
+        };
+        // The line names the body's file, which is only known now.
+        let prompt = match (prompt, body_path) {
+            (Some(line), Some(path)) => Some(factory::with_body_path(line, &path)),
+            (line, _) => line.map(str::to_owned),
+        };
         let trusted = {
             let (me, json, worktree) = (
                 self.clone(),
@@ -435,6 +452,9 @@ impl Inner {
                 let ended = state.ended.get(&workspace).copied().unwrap_or(0) != factory.generation;
                 if !ended {
                     state.marks.insert(id, factory.project);
+                    state.workspaces.insert(id, workspace);
+                    // A new session has no record yet, so its counts are zeros.
+                    state.counts.insert(id, turns::Counts::default());
                 }
                 ended
             };
@@ -444,6 +464,7 @@ impl Inner {
                 self.discard(id, &settings, &curl).await;
                 return Err(SessionError::Ended);
             }
+            self.ensure_sweeper();
         }
 
         let started = self
@@ -453,7 +474,7 @@ impl Inner {
             Ok(started) => started,
             Err(error) => {
                 lock(&self.live).remove(&id);
-                lock(&self.factory).marks.remove(&id);
+                lock(&self.factory).forget(id);
                 drop(body);
                 self.discard(id, &settings, &curl).await;
                 return Err(error);
@@ -462,7 +483,7 @@ impl Inner {
         body.terminal = terminal;
         if let Err(error) = self.write(body.clone()).await {
             lock(&self.live).remove(&id);
-            lock(&self.factory).marks.remove(&id);
+            lock(&self.factory).forget(id);
             drop(body);
             let _ = self.terminals.close(terminal).await;
             self.discard(id, &settings, &curl).await;
@@ -470,7 +491,7 @@ impl Inner {
         }
         drop(body);
 
-        self.run(&live, terminal, floor, FirstPrompt::new(prompt));
+        self.run(&live, terminal, floor, FirstPrompt::new(prompt.as_deref()));
         tracing::info!(session = %id, workspace = %workspace, model, "session started");
         Ok(id)
     }
@@ -497,7 +518,9 @@ impl Inner {
     /// failure would fail the same way every time, and the daemon must still start.
     async fn adopt(self: &Arc<Self>) {
         // Before the store is read, so a store that fails still leaves the marks known.
-        self.adopt_marks().await;
+        if self.adopt_marks().await {
+            self.ensure_sweeper();
+        }
         let mut backoff = Backoff::new();
         let (open, cursor) = loop {
             match self.open_sessions().await {
@@ -701,6 +724,16 @@ impl Inner {
     /// the state changed. An event for a session whose start failed does nothing.
     async fn event(&self, live: &Arc<Live>, event: Event) -> Result<SessionState, SessionError> {
         let mut body = live.body.lock().await;
+        self.event_locked(live, &mut body, event).await
+    }
+
+    /// [`Inner::event`] for a caller that holds the session's lock, with `body` behind it.
+    async fn event_locked(
+        &self,
+        live: &Arc<Live>,
+        body: &mut Session,
+        event: Event,
+    ) -> Result<SessionState, SessionError> {
         if !self.is_live(live) {
             return Ok(body.state);
         }
