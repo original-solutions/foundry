@@ -355,6 +355,13 @@ pub const BUILD_ARCHIVING: &str = "build-archiving";
 pub const BUILD_ARCHIVED: &str = "build-archived";
 /// The step written for each refusal of the build workspace's archive that is not "unreachable".
 pub const BUILD_ARCHIVE_FAILED: &str = "build-archive-failed";
+/// The step written when the build workspace's archive is first answered "unreachable" under a
+/// lease generation: `build-archive-waiting <generation> <ms>`, `ms` read on the
+/// sleep-counting clock.
+pub const BUILD_ARCHIVE_WAITING: &str = "build-archive-waiting ";
+/// The step of a build workspace given up on because its machine is gone:
+/// `build-left <why>`, in fixed words.
+pub const BUILD_LEFT: &str = "build-left ";
 
 /// The public reason of a run whose pull request head kept moving until no retry was left.
 pub const HEAD_KEPT_MOVING: &str = "the pull request's head kept moving, so the gate could not settle on a commit within gate_retries";
@@ -7221,7 +7228,7 @@ mod tests {
         use super::*;
 
         /// Three refusals leave g1 recorded left; the run goes on and g2 passes.
-        fn g1_left_then_g2_ready_to_finish() -> (Rig, RunId, Arc<Hub>) {
+        pub(super) fn g1_left_then_g2_ready_to_finish() -> (Rig, RunId, Arc<Hub>) {
             let (mut rig, run, hub) = built();
             place(&mut rig, &run, 1, 1);
             show(
@@ -7393,7 +7400,7 @@ mod tests {
         use super::*;
 
         #[test]
-        fn a_build_workspace_on_a_machine_that_is_unreachable_is_asked_again_and_never_given_up() {
+        fn a_build_workspace_answered_unreachable_is_asked_again_while_its_machine_is_not_gone() {
             let (mut rig, run, _hub) = built();
             rig.moved(&run, State::Building, State::PrOpen);
             rig.step(&run, BUILD_SESSION_ENDED);
@@ -7476,19 +7483,34 @@ mod tests {
         }
 
         #[test]
-        fn an_unreachable_archive_from_an_online_machine_writes_one_waiting_step() {
+        fn an_unreachable_archive_from_an_online_machine_waits_5_minutes_on_the_clock_then_is_left()
+         {
             let (mut rig, run, _hub) = built();
             place(&mut rig, &run, 1, 1);
             show(&mut rig, &run, SessionState::Idle, 1, &[exited(1, 101)]);
             rig.worker.on_tail(Ok(FAIL_TAIL.into()));
-            for _ in 0..3 {
+            for _ in 0..4 {
                 rig.worker
                     .on_archive(Err(WorkerError::Unreachable("no route".into())));
             }
+            // Not an error: the verdict waits for the archive, the wait started once.
             for _ in 0..3 {
-                assert!(matches!(try_go(&rig, &run), Err(RunError::Worker(_))));
+                assert_eq!(try_go(&rig, &run).unwrap(), GateStep::NotReady);
+                rig.clock.advance(Duration::from_secs(60));
             }
-            assert_eq!(step_count(&rig, &run, "gate-archive-waiting 1"), 1);
+            assert_eq!(step_count(&rig, &run, "gate-archive-waiting 1 "), 1);
+            assert_eq!(sends(&rig), vec![]);
+            rig.clock.advance(Duration::from_secs(2 * 60));
+            assert_eq!(go(&rig, &run), GateStep::SentBack { attempt: 1 });
+            assert_eq!(
+                step_count(
+                    &rig,
+                    &run,
+                    &format!("{GATE_LEFT}1 {} {LEFT_UNREACHABLE}", gate_ws(1).0)
+                ),
+                1
+            );
+            assert!(!has_step(&rig, &run, &format!("{GATE_ARCHIVED}1")));
         }
     }
 
@@ -7497,8 +7519,10 @@ mod tests {
 
         #[test]
         fn three_refused_archives_of_the_build_workspace_at_pr_open_end_the_run_stuck() {
-            let (mut rig, run, _hub) = built();
+            let (mut rig, run, hub) = built();
             rig.moved(&run, State::Building, State::PrOpen);
+            rig.sim.set_labels(&["factory:pr-open"]);
+            hub.set_draft(false);
             rig.step(&run, BUILD_SESSION_ENDED);
             show(&mut rig, &run, SessionState::Idle, 1, &[]);
             for _ in 0..3 {
@@ -7511,10 +7535,16 @@ mod tests {
             let GateStep::Stuck { reason } = &step else {
                 panic!("expected stuck, got {step:?}");
             };
+            // The words name the workspace that could not be archived: the build's.
             assert!(
-                reason.contains("a gate workspace could not be archived"),
+                reason.contains("the build workspace could not be archived"),
                 "{reason}"
             );
+            assert!(!reason.contains("gate workspace"), "{reason}");
+            // The pull request was marked ready before the label moved: the stuck run puts it
+            // back to draft, so nothing is left looking ready.
+            assert!(hub.lock().pulls[&12].draft, "the pull request is a draft again");
+            assert_eq!(rig.sim.labels(), ["factory:stuck"]);
         }
 
         #[test]
@@ -7530,6 +7560,145 @@ mod tests {
                 assert_eq!(go(&rig, &run), GateStep::BackingOff { passes_left: left });
             }
             assert_eq!(go(&rig, &run), GateStep::Running);
+        }
+    }
+
+    mod leftovers_of_cycle_7 {
+        use super::*;
+
+        /// A run in `pr-open` whose build session was ended, with the build workspace still to
+        /// archive.
+        fn at_pr_open() -> (Rig, RunId, Arc<Hub>) {
+            let (mut rig, run, hub) = built();
+            rig.moved(&run, State::Building, State::PrOpen);
+            rig.sim.set_labels(&["factory:pr-open"]);
+            hub.set_draft(false);
+            rig.step(&run, BUILD_SESSION_ENDED);
+            show(&mut rig, &run, SessionState::Idle, 1, &[]);
+            (rig, run, hub)
+        }
+
+        #[test]
+        fn a_build_workspace_whose_machine_is_gone_does_not_hold_pr_open() {
+            let (mut rig, run, _hub) = at_pr_open();
+            rig.view = FleetView::builder()
+                .session(session_record(SessionState::Idle))
+                .unreachable(builder(), crate::factory::runs::resume::UNREACHABLE_FOR)
+                .build();
+            assert_eq!(go(&rig, &run), GateStep::Passed { pr: 12 });
+            assert_eq!(archived(&rig), vec![]);
+            assert_eq!(
+                step_count(&rig, &run, &format!("{BUILD_LEFT}{LEFT_GONE}")),
+                1
+            );
+            assert!(!has_step(&rig, &run, BUILD_ARCHIVED));
+            // Nothing is asked again on a later pass.
+            assert_eq!(go(&rig, &run), GateStep::Passed { pr: 12 });
+            assert_eq!(archived(&rig), vec![]);
+            assert_eq!(step_count(&rig, &run, BUILD_LEFT), 1);
+        }
+
+        #[test]
+        fn a_build_workspace_whose_machine_is_unreachable_for_less_than_15_minutes_is_asked() {
+            let (mut rig, run, _hub) = at_pr_open();
+            rig.view = FleetView::builder()
+                .session(session_record(SessionState::Idle))
+                .unreachable(
+                    builder(),
+                    crate::factory::runs::resume::UNREACHABLE_FOR - Duration::from_secs(1),
+                )
+                .build();
+            assert_eq!(go(&rig, &run), GateStep::Passed { pr: 12 });
+            assert_eq!(archived(&rig), vec![workspace()]);
+            assert!(!has_step(&rig, &run, BUILD_LEFT));
+        }
+
+        #[test]
+        fn a_build_archive_answered_unreachable_waits_15_minutes_on_the_clock_then_is_left() {
+            let (rig, run, hub) = at_pr_open();
+            for _ in 0..4 {
+                rig.worker
+                    .on_archive(Err(WorkerError::Unreachable("no route".into())));
+            }
+            for _ in 0..3 {
+                assert_eq!(try_go(&rig, &run).unwrap(), GateStep::NotReady);
+                rig.clock.advance(Duration::from_secs(4 * 60));
+            }
+            assert_eq!(step_count(&rig, &run, BUILD_ARCHIVE_WAITING), 1);
+            assert!(!has_step(&rig, &run, BUILD_LEFT));
+            rig.clock.advance(Duration::from_secs(3 * 60));
+            assert_eq!(go(&rig, &run), GateStep::Passed { pr: 12 });
+            assert_eq!(
+                step_count(&rig, &run, &format!("{BUILD_LEFT}{LEFT_UNREACHABLE}")),
+                1
+            );
+            assert!(!has_step(&rig, &run, BUILD_ARCHIVED));
+            assert_eq!(rig.sim.labels(), ["factory:pr-open"]);
+            assert!(!hub.lock().pulls[&12].draft);
+        }
+
+        #[test]
+        fn a_gate_archive_answered_unreachable_holds_pr_open_5_minutes_then_does_not() {
+            let (rig, run, hub) = super::review4_an_archive_is_only_what_a_call_answered::g1_left_then_g2_ready_to_finish();
+            rig.worker.on_archive(Ok(())); // g2's own
+            for _ in 0..3 {
+                rig.worker
+                    .on_archive(Err(WorkerError::Unreachable("no route".into())));
+            }
+            assert_eq!(try_go(&rig, &run).unwrap(), GateStep::NotReady);
+            assert!(hub.lock().pulls[&12].draft, "no ready mark while g1 may be live");
+            rig.clock.advance(Duration::from_secs(4 * 60));
+            assert_eq!(try_go(&rig, &run).unwrap(), GateStep::NotReady);
+            assert_eq!(step_count(&rig, &run, "gate-archive-waiting 1 "), 1);
+            rig.clock.advance(Duration::from_secs(60));
+            assert_eq!(go(&rig, &run), GateStep::Passed { pr: 12 });
+            assert_eq!(rig.sim.labels(), ["factory:pr-open"]);
+        }
+
+        #[test]
+        fn a_could_not_run_gate_answered_unreachable_backs_off_then_is_left_after_5_minutes() {
+            let (mut rig, run, _hub) = built();
+            place(&mut rig, &run, 1, 1);
+            show(
+                &mut rig,
+                &run,
+                SessionState::Idle,
+                1,
+                &[G {
+                    k: 1,
+                    state: TerminalState::Exited,
+                    code: None,
+                }],
+            );
+            for _ in 0..20 {
+                rig.worker
+                    .on_archive(Err(WorkerError::Unreachable("no route".into())));
+            }
+            assert_eq!(go(&rig, &run), GateStep::BackingOff { passes_left: 1 });
+            for _ in 0..4 {
+                let step = try_go(&rig, &run).unwrap();
+                assert!(matches!(step, GateStep::BackingOff { .. }), "{step:?}");
+                assert_eq!(creates(&rig), 1, "nothing is placed while g1 may be live");
+            }
+            assert_eq!(step_count(&rig, &run, "gate-archive-waiting 1 "), 1);
+            rig.clock.advance(gate::MACHINE_GONE_AFTER);
+            rig.worker.on_create(Ok(gate_ws(2)));
+            let mut placed = false;
+            for _ in 0..10 {
+                if go(&rig, &run) == GateStep::Running {
+                    placed = true;
+                    break;
+                }
+            }
+            assert!(placed, "the second gate is placed");
+            assert_eq!(
+                step_count(
+                    &rig,
+                    &run,
+                    &format!("{GATE_LEFT}1 {} {LEFT_UNREACHABLE}", gate_ws(1).0)
+                ),
+                1
+            );
         }
     }
 }
