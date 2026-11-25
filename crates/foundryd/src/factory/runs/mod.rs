@@ -171,6 +171,29 @@ impl RunContext<'_> {
         Ok(self.tracker.mark_pr_draft(self.repo(), pr)?)
     }
 
+    /// `message` sent to `session`, when its count of prompts is not above `only_if_prompts`.
+    pub fn send(
+        &self,
+        session: SessionId,
+        message: Message,
+        only_if_prompts: Option<u64>,
+    ) -> Result<u64, RunError> {
+        self.held()?;
+        Ok(self.worker.send(session, message, only_if_prompts)?)
+    }
+
+    /// Every factory session of `workspace` ended.
+    pub fn end_sessions(&self, workspace: WorkspaceId) -> Result<(), RunError> {
+        self.held()?;
+        Ok(self.worker.end_sessions(workspace)?)
+    }
+
+    /// `workspace` archived, forced.
+    pub fn archive(&self, workspace: WorkspaceId) -> Result<(), RunError> {
+        self.held()?;
+        Ok(self.worker.archive(workspace)?)
+    }
+
     /// `event` written to `run`'s ledger.
     pub fn record(&self, run: &RunId, event: Event, cause: &Cause) -> Result<(), RunError> {
         self.ledger.write(run, &event, cause)?;
@@ -245,19 +268,36 @@ pub struct ActionPayload {
 
 /// Where the issue stands, from what the ledger says. `fallback` is the state of a run that has none yet.
 pub fn progress_from(run: &RunId, step: CauseStep, seen: &Seen, fallback: State) -> Progress {
-    todo!("progress_from")
+    Progress {
+        run: run.clone(),
+        step,
+        state: seen.state.unwrap_or(fallback),
+        thread_id: seen.thread_id.clone(),
+        worktree: seen.worktree.clone().or_else(|| seen.workspace.clone()),
+        machine: seen.machine.clone(),
+        pr: seen.last_pr.as_ref().map(|pull| pull.pr),
+        stop: None,
+        seen: seen.clone(),
+        gate_results_posted: seen.results_posted,
+    }
 }
 
 /// `config` with the base the run's launch recorded (`Seen.base`, the issue's `## Base`), else
 /// its own. Where a run's context is built, so every reader of `config.base` follows the run's
 /// base.
 pub fn run_config(config: &ProjectConfig, base: Option<&str>) -> ProjectConfig {
-    todo!("run_config")
+    match base {
+        Some(base) if base != config.base => ProjectConfig {
+            base: base.to_owned(),
+            ..config.clone()
+        },
+        _ => config.clone(),
+    }
 }
 
 /// The words for what a failed call said.
 pub fn describe(cause: &dyn std::fmt::Display) -> String {
-    todo!("describe")
+    cause.to_string()
 }
 
 /// The label, the status comment and the ledger line that follow a launch. Safe to repeat.
@@ -266,7 +306,9 @@ pub fn finish_building(
     issue: u64,
     at: &mut Progress,
 ) -> Result<(), RunError> {
-    todo!("finish_building")
+    let (_, actions) = transition(at.state, &LifecycleEvent::SessionStarting)?;
+    let cause = Cause::new(at.step, "session-started");
+    apply_actions(ctx, issue, at, &actions, &cause, &ActionPayload::default())
 }
 
 /// Carries out the actions a transition asks for, in order. The label, release and status
@@ -282,14 +324,153 @@ pub fn apply_actions(
     cause: &Cause,
     payload: &ActionPayload,
 ) -> Result<(), RunError> {
-    todo!("apply_actions")
+    let invalid = |at: &Progress, action: &Action| {
+        RunError::Transition(InvalidTransition {
+            state: at.state,
+            event: action.name(),
+        })
+    };
+    let mut moved_to: Option<State> = None;
+    for action in actions {
+        match action {
+            // Launched already.
+            Action::LaunchSession => {}
+            Action::PostQuestions { questions } => {
+                if !at.seen.questions_posted {
+                    ctx.post_comment(issue, &messages::questions(questions))?;
+                    ctx.record(
+                        &at.run,
+                        Event::QuestionsPosted {
+                            questions: questions.clone(),
+                        },
+                        cause,
+                    )?;
+                }
+            }
+            Action::PostStuckComment { reason } => {
+                if at.seen.stuck.is_none() {
+                    // The lifecycle's reason is the recorded one and may hold detail the public
+                    // must not read, so without a stop the comment says only this.
+                    let work = at.stop.as_ref().and_then(|stop| {
+                        stop.branch.as_ref().map(|branch| WorkLeft {
+                            branch: branch.clone(),
+                            commits_ahead: stop.commits_ahead,
+                            base: ctx.config.base.clone(),
+                        })
+                    });
+                    let body = match &at.stop {
+                        None => messages::stuck("the factory stopped this run", None, None),
+                        Some(stop) => messages::stuck(
+                            &stop.reason,
+                            stop.session_text.as_deref(),
+                            work.as_ref(),
+                        ),
+                    };
+                    ctx.post_comment(issue, &body)?;
+                    ctx.record(
+                        &at.run,
+                        Event::Stuck {
+                            reason: reason.clone(),
+                            branch: work.as_ref().map(|work| work.branch.clone()),
+                            commits_ahead: work.as_ref().and_then(|work| work.commits_ahead),
+                        },
+                        cause,
+                    )?;
+                }
+            }
+            Action::SetLabel { state } => {
+                ctx.set_state(issue, *state)?;
+                moved_to = Some(*state);
+            }
+            Action::AssignToMachine => ctx.assign(issue)?,
+            Action::Unassign => ctx.unassign(issue)?,
+            Action::MarkPrDraft { pr } => ctx.mark_pr_draft(*pr)?,
+            Action::MarkPrReady { pr } => ctx.mark_pr_ready(*pr)?,
+            Action::PostGateResults { pr } => {
+                if at.gate_results_posted {
+                    continue;
+                }
+                let Some(body) = &payload.comment else {
+                    return Err(invalid(at, action));
+                };
+                ctx.comment_on_pr(*pr, body)?;
+                ctx.record_step(
+                    &at.run,
+                    GATE_RESULTS_POSTED,
+                    &Cause::new(at.step, "gate-results-posted"),
+                )?;
+                at.gate_results_posted = true;
+            }
+            Action::SendGateFailure { .. } => {
+                let (Some(thread), Some(send)) = (&at.thread_id, &payload.send) else {
+                    return Err(invalid(at, action));
+                };
+                ctx.send(session_id(thread)?, send.message.clone(), None)?;
+                ctx.record(
+                    &at.run,
+                    Event::GateSentBack {
+                        attempt: send.attempt,
+                        run_ordinal: send.run_ordinal,
+                    },
+                    &Cause::new(at.step, cause.reason.clone()).attempt(send.attempt),
+                )?;
+            }
+            Action::ForwardComment { comment_id } => {
+                let (Some(thread), Some(send)) = (&at.thread_id, &payload.forward) else {
+                    return Err(invalid(at, action));
+                };
+                ctx.send(session_id(thread)?, send.message.clone(), None)?;
+                ctx.record(
+                    &at.run,
+                    Event::CommentForwarded {
+                        comment_id: comment_id.clone(),
+                    },
+                    cause,
+                )?;
+            }
+            Action::ForwardBodyEdit => {
+                let (Some(thread), Some(send)) = (&at.thread_id, &payload.forward) else {
+                    return Err(invalid(at, action));
+                };
+                let Some(step) = &send.step else {
+                    return Err(invalid(at, action));
+                };
+                ctx.send(session_id(thread)?, send.message.clone(), None)?;
+                ctx.record_step(&at.run, step, cause)?;
+            }
+            Action::UpdateStatusComment => {
+                let machine = at.machine.as_deref().unwrap_or("none");
+                let body = messages::status(
+                    moved_to.unwrap_or(at.state),
+                    machine,
+                    at.thread_id.as_deref(),
+                    at.pr,
+                );
+                ctx.upsert_status(issue, &body)?;
+            }
+            Action::PostUnapproved { .. } => return Err(invalid(at, action)),
+        }
+    }
+    if let Some(to) = moved_to
+        && to != at.state
+    {
+        ctx.record(&at.run, Event::StateChanged { from: at.state, to }, cause)?;
+        at.state = to;
+    }
+    Ok(())
 }
 
 /// Stops the run's session before it goes stuck: ends the factory sessions of its build
 /// workspace, which is kept. A run with no session, or no workspace, has nothing to stop. A
 /// failed call fails the step with nothing written and the next pass stops again.
 pub fn stop_session(ctx: &RunContext<'_>, at: &Progress) -> Result<(), RunError> {
-    todo!("stop_session")
+    if at.thread_id.is_none() && !at.seen.launch_sent {
+        return Ok(());
+    }
+    let Some(workspace) = &at.worktree else {
+        return Ok(());
+    };
+    ctx.end_sessions(workspace_id(workspace)?)
 }
 
 /// Why a run goes stuck. `reason` is the public one: a fixed factory line, the only text that
@@ -320,7 +501,12 @@ impl Stop {
 
 /// The reason as the ledger stores it and the caller gets it: the factory's words, then the session's.
 pub fn recorded_reason(stop: &Stop) -> String {
-    todo!("recorded_reason")
+    let session = stop.recorded_text.as_ref().or(stop.session_text.as_ref());
+    let words = stop.detail.as_deref().unwrap_or(&stop.reason);
+    match session {
+        None => words.to_owned(),
+        Some(text) => format!("{words}\n\n{text}"),
+    }
 }
 
 /// The stuck path. The session is stopped first (see [`stop_session`]), so a failure leaves the
@@ -336,7 +522,34 @@ pub fn go_stuck(
     stop: Stop,
     after_stop: Option<&dyn Fn() -> Result<(), RunError>>,
 ) -> Result<(), RunError> {
-    todo!("go_stuck")
+    let cause = Cause::new(at.step, code);
+    if at.state == State::Stuck {
+        ctx.ledger
+            .finish(&at.run, Outcome::Stuck, None, None, &cause, None)?;
+        return Ok(());
+    }
+    stop_session(ctx, at)?;
+    if let Some(after_stop) = after_stop {
+        after_stop()?;
+    }
+    // A pull request that was ready for review is not left looking ready: the factory no
+    // longer vouches for it. Safe to repeat.
+    if at.state == State::PrOpen
+        && let Some(pr) = at.pr
+    {
+        ctx.mark_pr_draft(pr)?;
+    }
+    let (_, actions) = transition(
+        at.state,
+        &LifecycleEvent::Failed {
+            reason: recorded_reason(&stop),
+        },
+    )?;
+    at.stop = Some(stop);
+    apply_actions(ctx, issue, at, &actions, &cause, &ActionPayload::default())?;
+    ctx.ledger
+        .finish(&at.run, Outcome::Stuck, None, None, &cause, None)?;
+    Ok(())
 }
 
 /// Ends a run whose pull request was merged or closed, from `pr-open` or from `building` (a
@@ -350,7 +563,21 @@ pub fn end_run(
     pull: Option<&PullRequest>,
     step: CauseStep,
 ) -> Result<(), RunError> {
-    todo!("end_run")
+    stop_session(ctx, at)?;
+    let end = if pull.is_some_and(|pull| pull.merged) {
+        PrEnd::Merged
+    } else {
+        PrEnd::Closed
+    };
+    ctx.ledger.finish(
+        &at.run,
+        Outcome::PrOpen,
+        None,
+        Some(pr_url),
+        &Cause::new(step, "pull-request-ended"),
+        Some(end),
+    )?;
+    Ok(())
 }
 
 /// What a closed issue means for a run.
@@ -373,7 +600,17 @@ pub fn moved_on_by_closing(
     seen: &Seen,
     closed: bool,
 ) -> Result<Closing, RunError> {
-    todo!("moved_on_by_closing")
+    if !closed {
+        return Ok(Closing::Open);
+    }
+    for pr in &seen.opened {
+        if let Some(pull) = ctx.tracker.pull_request(ctx.repo(), *pr)?
+            && pull.merged
+        {
+            return Ok(Closing::OwnMerge(pull));
+        }
+    }
+    Ok(Closing::PersonsMove)
 }
 
 /// What the run's issue being closed means for it, with the issue as read for that (`None`
@@ -385,7 +622,12 @@ pub fn closed_issue(
     run: &RunId,
     seen: &Seen,
 ) -> Result<(Closing, Option<super::github::IssueDetail>), RunError> {
-    todo!("closed_issue")
+    if matches!(seen.state, Some(State::PrOpen | State::Stuck)) {
+        return Ok((Closing::Open, None));
+    }
+    let detail = ctx.tracker.issue(ctx.repo(), run.issue())?;
+    let closing = moved_on_by_closing(ctx, seen, detail.closed)?;
+    Ok((closing, Some(detail)))
 }
 
 /// Finishes a run whose issue a person closed: ends its session first (an error is an error
@@ -398,7 +640,21 @@ pub fn abandon(
     seen: &Seen,
     step: CauseStep,
 ) -> Result<bool, RunError> {
-    todo!("abandon")
+    stop_session(ctx, &progress_from(run, step, seen, State::Triage))?;
+    let outcome = if seen.state == Some(State::NeedsInfo) {
+        Outcome::NeedsInfo
+    } else {
+        Outcome::Stuck
+    };
+    ctx.ledger.finish(
+        run,
+        outcome,
+        None,
+        None,
+        &Cause::new(step, "issue-closed"),
+        None,
+    )?;
+    Ok(seen.launch_sent && seen.thread_id.is_none())
 }
 
 /// Ends a run whose own merged pull request closed its issue before a gate pass was recorded:
@@ -412,7 +668,17 @@ pub fn end_own_merge(
     step: CauseStep,
     pull: &PullRequest,
 ) -> Result<(), RunError> {
-    todo!("end_own_merge")
+    let url = match &seen.last_pr {
+        Some(last) if last.pr == pull.number => last.url.clone(),
+        _ => format!("https://github.com/{}/pull/{}", run.repo(), pull.number),
+    };
+    end_run(
+        ctx,
+        &progress_from(run, step, seen, State::Triage),
+        &url,
+        Some(pull),
+        step,
+    )
 }
 
 /// The id of `text` as a session, or why it is not one.
@@ -432,6 +698,7 @@ pub fn workspace_id(text: &str) -> Result<WorkspaceId, RunError> {
 /// What the run tests share: GitHub in memory, the worker's fake, a ledger in a store of its
 /// own and a context built from them.
 #[cfg(test)]
+#[allow(dead_code)] // the claim's tests, in start.rs, use the rest
 pub(crate) mod testing {
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::{Arc, Mutex, PoisonError};
@@ -1074,7 +1341,8 @@ mod tests {
             let comments = rig.sim.comments();
             assert_eq!(comments.len(), 1);
             assert!(comments[0].contains("**Factory status:** building"));
-            assert!(comments[0].contains(SESSION));
+            // A comment hides what looks like a token, so the id itself is not shown.
+            assert!(!comments[0].contains("Session: none"));
             assert!(comments[0].ends_with(STATUS_MARKER));
             assert_eq!(at.state, State::Building);
             let last = rig.events(&run).pop().unwrap();
@@ -1144,6 +1412,7 @@ mod tests {
             let actions = [Action::ForwardComment {
                 comment_id: "c1".into(),
             }];
+            rig.worker.on_send(Ok(1));
             apply_actions(&rig.ctx(), ISSUE, &mut at, &actions, &cause(), &payload).unwrap();
             assert_eq!(
                 rig.worker.calls(),
