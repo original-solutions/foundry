@@ -10,32 +10,53 @@
 //! lists for it, in order: none after the denial or the Esc. It prints every hook of each step.
 //! `docs/claude-code-contract.md` records what it found.
 //!
-//! It spends model calls, so it is ignored and runs only with `FOUNDRY_CONTRACT=1`, `claude` on
-//! `PATH`, and `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN` set:
+//! A second test starts a factory session through the daemon's own `Sessions::start_factory`,
+//! in a fresh Claude Code config folder that never accepted the bypass mode, with a first
+//! message whose body asks for a reply of 150 lines ending in a result line. It checks that the
+//! session starts with no confirmation, that `UserPromptSubmit` reports the typed line exactly,
+//! and that the turn file holds the whole reply, ending in the result line.
+//!
+//! Both spend model calls, so they are ignored and run only with `FOUNDRY_CONTRACT=1`, `claude`
+//! on `PATH`, and `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN` set. The factory test also
+//! needs the holder built beside `foundryd`:
 //!
 //! ```text
+//! cargo build -p foundry-holder
 //! FOUNDRY_CONTRACT=1 cargo test -p foundryd --test claude_contract -- --ignored --nocapture
 //! ```
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Read as _, Write as _};
+use std::net::SocketAddr;
 use std::os::fd::OwnedFd;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::Router;
-use axum::extract::State;
+use axum::body::Body;
+use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode, header::AUTHORIZATION};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse as _, Response};
 use axum::routing::post;
 use bytes::Bytes;
+use foundry_holder::protocol::Request as HolderRequest;
 use foundry_holder::pty::Pty;
+use foundry_proto::ids::{MachineId, ProjectId, SessionId, TerminalId, WorkspaceId};
+use foundry_proto::record::AnyRecord;
 use foundry_proto::state::SessionState;
-use foundryd::sessions::claude;
+use foundryd::factory::messages::Message;
+use foundryd::secrets::{Edit, GITHUB_PREFIX, Secrets, SecretsError};
+use foundryd::sessions::factory::{BODY_PATH, FactoryStart};
 use foundryd::sessions::state::{Event, Hook, next_state};
+use foundryd::sessions::{Config, Gateway, Sessions, claude};
+use foundryd::store::Store;
+use foundryd::terminals::Terminals;
 use serde_json::Value;
 
 /// The model the session runs, as `sessions` passes one.
@@ -281,6 +302,348 @@ fn claude_code_posts_the_hooks_sessions_reads() {
     assert_eq!(state, SessionState::Finished);
 }
 
+/// The effort a factory session runs at here: the lowest, since the turn asks for no thought.
+const EFFORT: &str = "low";
+/// The login whose token the factory session holds. The token is made up: the turn uses none.
+const LOGIN: &str = "foundry-contract";
+/// How long the factory session's one turn may take to post `Stop`: 150 lines is a long reply.
+const REPLY: Duration = Duration::from_secs(300);
+/// How many lines the reply is asked for, the result line last.
+const REPLY_LINES: usize = 150;
+/// The result line the reply is asked to end in.
+const RESULT_LINE: &str = "FACTORY-STOP: stuck";
+/// The first message's line. The worker puts the body file's path for [`BODY_PATH`].
+const FIRST_LINE: &str = "Read the file {body} and do what it says.";
+
+/// Reply line `n`, of the lines before the result line.
+fn reply_line(n: usize) -> String {
+    reply_line_with(&n.to_string())
+}
+
+/// A reply line with `number` for its number.
+fn reply_line_with(number: &str) -> String {
+    format!("line {number} of the foundry contract reply")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "spends model calls: run with FOUNDRY_CONTRACT=1 and --ignored"]
+async fn a_factory_session_starts_unasked_and_keeps_its_whole_reply() {
+    if std::env::var("FOUNDRY_CONTRACT").as_deref() != Ok("1") {
+        eprintln!("claude_contract: skipped, FOUNDRY_CONTRACT is not 1");
+        return;
+    }
+    let [base_url, key] = ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"].map(|name| {
+        let value = std::env::var(name).unwrap_or_default();
+        assert!(
+            !value.is_empty(),
+            "{name} must be set for the contract test"
+        );
+        value
+    });
+    let version = Command::new("claude")
+        .arg("--version")
+        .output()
+        .expect("`claude` is on PATH");
+    eprintln!(
+        "claude --version: {}",
+        String::from_utf8_lossy(&version.stdout).trim()
+    );
+    let holder = Path::new(env!("CARGO_BIN_EXE_foundryd")).with_file_name("foundry-holder");
+    assert!(
+        holder.exists(),
+        "{} is not built: run `cargo build -p foundry-holder`",
+        holder.display()
+    );
+
+    // A fresh config folder: it never accepted the bypass mode and holds no user settings, so
+    // only the settings file `sessions` writes can keep the confirmation away (check 1). The
+    // data folder is under /tmp, since a holder's socket path must be short.
+    let config_dir = tempfile::tempdir().unwrap();
+    let data = tempfile::Builder::new()
+        .prefix("fc")
+        .tempdir_in("/tmp")
+        .unwrap();
+    // Declared after `data`, so it is dropped first, while the sockets are still there.
+    let _holders = CloseHolders(data.path().join("terminals"));
+    let worktree = tempfile::tempdir().unwrap();
+    let worktree = worktree.path().canonicalize().unwrap();
+
+    // What the daemon builds: the store, the terminals and the sessions, with the hook endpoint
+    // on a loopback port. Claude Code is started under `env`, which points it at the fresh
+    // config folder and unsets every inherited `CLAUDE*` variable, such as those a parent
+    // Claude Code session sets.
+    let me = MachineId::random();
+    let store = Arc::new(Mutex::new(
+        Store::open(data.path().join("foundry.db")).unwrap(),
+    ));
+    let terminals = Arc::new(Terminals::new(me, store.clone(), data.path(), holder));
+    let mut claude_command = vec!["env".to_string()];
+    for (name, _) in std::env::vars_os() {
+        let name = name.to_string_lossy();
+        if name.starts_with("CLAUDE") {
+            claude_command.extend(["-u".to_string(), name.into_owned()]);
+        }
+    }
+    claude_command.extend([
+        format!("CLAUDE_CONFIG_DIR={}", config_dir.path().display()),
+        "claude".to_string(),
+    ]);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let config = Config {
+        claude: claude_command,
+        claude_json: config_dir.path().join(".claude.json"),
+        hook_port: port,
+        gateway: Gateway { base_url, key },
+    };
+    let secrets = Arc::new(OneToken::new(
+        LOGIN,
+        &format!("ghp_{}", uuid::Uuid::new_v4().simple()),
+    ));
+    let sessions = Sessions::new(me, store.clone(), terminals.clone(), data.path(), config)
+        .with_secrets(secrets);
+    let posted = Posted::default();
+    let router = sessions.router().layer(middleware::from_fn({
+        let posted = posted.clone();
+        move |request: Request, next: Next| {
+            let posted = posted.clone();
+            async move { posted.record(request, next).await }
+        }
+    }));
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+
+    // The first message: a line under the limit that names the body's file, as a launch does.
+    let body = format!(
+        "This is a check of the session, not a build. Run no tool after reading this file and \
+         change no file. Reply with exactly {REPLY_LINES} lines and nothing else: no heading, \
+         no blank line and no code fence. Line N, for N from 1 to {}, is `{}` with N written \
+         in digits. Line {REPLY_LINES} is exactly {RESULT_LINE} with nothing before or after \
+         it.",
+        REPLY_LINES - 1,
+        reply_line_with("N"),
+    );
+    assert!(FIRST_LINE.contains(BODY_PATH));
+    let workspace = WorkspaceId::random();
+    let start = FactoryStart {
+        project: ProjectId::random(),
+        login: LOGIN.into(),
+        model: MODEL.into(),
+        effort: EFFORT.into(),
+    };
+    let id = sessions
+        .start_factory(
+            workspace,
+            &worktree,
+            start,
+            Message::new(FIRST_LINE.into(), body.clone()),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("the factory start failed: {error}"));
+    let terminal = terminal_of(&store, me, id);
+    let screen = || async {
+        terminals
+            .tail(terminal, 64 * 1024)
+            .await
+            .unwrap_or_default()
+    };
+
+    // Start: no confirmation of the bypass mode, which holds `SessionStart` back until it is
+    // answered.
+    let started = posted.arrives(0, "SessionStart", STARTUP).await;
+    let shown = screen().await;
+    assert!(
+        !shows(shown.as_bytes(), "Bypass Permissions mode"),
+        "Claude Code asked to confirm the bypass mode:\n{shown}"
+    );
+    assert!(
+        started.is_some(),
+        "no SessionStart within {STARTUP:?}:\n{shown}"
+    );
+
+    // The line typed is the line that arrives, with the body file's path in it.
+    let submitted = posted.arrived(0, "UserPromptSubmit", TURN).await;
+    let messages = data
+        .path()
+        .join("sessions")
+        .join(id.to_string())
+        .join("messages");
+    let files: Vec<_> = std::fs::read_dir(&messages)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(files.len(), 1, "one body file: {files:?}");
+    assert_eq!(std::fs::read_to_string(&files[0]).unwrap(), body);
+    let path = files[0].to_string_lossy().into_owned();
+    assert!(
+        !path.contains(char::is_whitespace) && !path.contains('\''),
+        "the body's path is typed bare: {path}"
+    );
+    let typed = FIRST_LINE.replace(BODY_PATH, &path);
+    eprintln!("typed {} characters: {typed}", typed.chars().count());
+    assert_eq!(
+        posted.all()[submitted]["prompt"],
+        typed.as_str(),
+        "UserPromptSubmit did not report the typed line exactly"
+    );
+
+    // The turn ends, and its file holds the whole reply, the result line last.
+    let stopped = posted.arrived(submitted, "Stop", REPLY).await;
+    let stop = posted.all()[stopped].clone();
+    let until = Instant::now() + Duration::from_secs(10);
+    let kept = loop {
+        if let Some(turn) = sessions.turn_text(id, 1).await {
+            break turn.message;
+        }
+        assert!(
+            Instant::now() < until,
+            "no turn 1 kept after Stop:\n{}",
+            screen().await
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let turn_file = data
+        .path()
+        .join("sessions")
+        .join(id.to_string())
+        .join("turns")
+        .join("1.txt");
+    // The file the spec names, where `turn_text` reads it.
+    assert_eq!(std::fs::read_to_string(&turn_file).unwrap(), kept);
+    let reply = stop["last_assistant_message"]
+        .as_str()
+        .expect("Stop has last_assistant_message");
+    eprintln!(
+        "reply: {} lines, {} characters",
+        reply.lines().count(),
+        reply.chars().count()
+    );
+    assert_eq!(kept, reply, "the turn file is not the Stop's whole reply");
+    let transcript = stop["transcript_path"]
+        .as_str()
+        .expect("Stop has transcript_path");
+    assert_eq!(
+        last_assistant_text(Path::new(transcript)).as_deref(),
+        Some(reply),
+        "the Stop's reply is not the transcript's last assistant text"
+    );
+    let mut lines = kept.lines().map(str::trim).filter(|l| !l.is_empty());
+    for n in 1..REPLY_LINES {
+        let want = reply_line(n);
+        assert!(
+            lines.any(|line| line.contains(&want)),
+            "line {n} is missing or out of order in the turn file:\n{kept}"
+        );
+    }
+    assert_eq!(
+        kept.trim_end().lines().next_back().map(str::trim),
+        Some(RESULT_LINE),
+        "the turn file does not end in the result line:\n{kept}"
+    );
+
+    sessions.end_factory(workspace).await.unwrap();
+}
+
+/// The text of the last assistant entry with text in the transcript at `path`, its text blocks
+/// joined.
+fn last_assistant_text(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()?
+        .lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|entry| entry["type"] == "assistant")
+        .find_map(|entry| {
+            let text: String = entry["message"]["content"]
+                .as_array()?
+                .iter()
+                .filter(|block| block["type"] == "text")
+                .filter_map(|block| block["text"].as_str())
+                .collect();
+            Some(text).filter(|t| !t.is_empty())
+        })
+}
+
+/// The terminal of session `id`, from its record.
+fn terminal_of(store: &Mutex<Store>, me: MachineId, id: SessionId) -> TerminalId {
+    store
+        .lock()
+        .unwrap()
+        .since(me, 0)
+        .unwrap()
+        .into_iter()
+        .find_map(|record| match record {
+            AnyRecord::Session(r) if r.body.id == id => Some(r.body.terminal),
+            _ => None,
+        })
+        .expect("the session has a record")
+}
+
+/// A secret store that holds one login's token and what the daemon sets.
+struct OneToken(Mutex<BTreeMap<String, String>>);
+
+impl OneToken {
+    fn new(login: &str, token: &str) -> Self {
+        let held = BTreeMap::from([(format!("{GITHUB_PREFIX}{login}"), token.to_string())]);
+        OneToken(Mutex::new(held))
+    }
+}
+
+impl Secrets for OneToken {
+    fn get(&self, name: &str) -> Result<Option<String>, SecretsError> {
+        Ok(self.0.lock().unwrap().get(name).cloned())
+    }
+
+    fn set(&self, name: &str, value: &str) -> Result<(), SecretsError> {
+        self.0
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), value.to_string());
+        Ok(())
+    }
+
+    fn update(&self, name: &str, edit: Edit<'_>) -> Result<(), SecretsError> {
+        let mut held = self.0.lock().unwrap();
+        if let Some(value) = edit(held.get(name).cloned()) {
+            held.insert(name.to_string(), value);
+        }
+        Ok(())
+    }
+
+    fn names(&self) -> Result<Vec<String>, SecretsError> {
+        Ok(self.0.lock().unwrap().keys().cloned().collect())
+    }
+
+    /// What `hide_known` reads. Without it the store cannot be listed, and `sessions` refuses
+    /// the first message's body and keeps no turn.
+    fn entries(&self) -> Result<BTreeMap<String, String>, SecretsError> {
+        Ok(self.0.lock().unwrap().clone())
+    }
+}
+
+/// On drop, asks every holder whose socket is in the terminals folder it holds to close, so a
+/// failed check leaves no holder or Claude Code running: a holder outlives its daemon.
+struct CloseHolders(PathBuf);
+
+impl Drop for CloseHolders {
+    fn drop(&mut self) {
+        let Ok(entries) = std::fs::read_dir(&self.0) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(entry.path()) {
+                let _ = stream.write_all(&HolderRequest::Close.encode());
+            }
+        }
+    }
+}
+
 /// The hooks the session posted, in the order they arrived, how many were refused, and how many
 /// were not JSON.
 #[derive(Clone, Default)]
@@ -334,6 +697,48 @@ impl Posted {
 
     fn unread(&self) -> usize {
         self.unread.load(Ordering::SeqCst)
+    }
+
+    /// Keeps the hook `request` posts to the daemon, then passes it on unchanged.
+    async fn record(&self, request: Request, next: Next) -> Response {
+        let (parts, body) = request.into_parts();
+        let Ok(bytes) = axum::body::to_bytes(body, usize::MAX).await else {
+            self.unread.fetch_add(1, Ordering::SeqCst);
+            return StatusCode::BAD_REQUEST.into_response();
+        };
+        match serde_json::from_slice::<Value>(&bytes) {
+            Ok(payload) => self.hooks.lock().unwrap().push(payload),
+            Err(_) => {
+                self.unread.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        next.run(Request::from_parts(parts, Body::from(bytes)))
+            .await
+    }
+
+    /// The index of the first hook named `name` at or after `from`, waiting up to `within`.
+    async fn arrives(&self, from: usize, name: &str, within: Duration) -> Option<usize> {
+        let until = Instant::now() + within;
+        loop {
+            if let Some(i) = self.find(from, name) {
+                return Some(i);
+            }
+            if Instant::now() >= until {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// [`Self::arrives`], failing the test with what arrived when it does not.
+    async fn arrived(&self, from: usize, name: &str, within: Duration) -> usize {
+        match self.arrives(from, name, within).await {
+            Some(i) => i,
+            None => panic!(
+                "no {name} within {within:?}; hooks since: {:?}",
+                names(&self.all()[from.min(self.len())..])
+            ),
+        }
     }
 
     /// The index of the first hook named `name` at or after `from`.

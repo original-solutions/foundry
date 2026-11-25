@@ -10,7 +10,7 @@ Checked against **Claude Code 2.1.322** on macOS, on 2026-11-18, with the `sonne
 FOUNDRY_CONTRACT=1 cargo test -p foundryd --test claude_contract -- --ignored --nocapture
 ```
 
-It needs `claude` on `PATH` and `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN` set. A run takes about 90 seconds and four short turns of model calls. Without `FOUNDRY_CONTRACT=1` it does nothing, so `cargo test` never spends a call.
+It needs `claude` on `PATH` and `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN` set. The factory session's test also needs the holder built beside `foundryd`: run `cargo build -p foundry-holder` first. A run takes a few minutes: four short turns for the session test and one long reply for the factory test. Without `FOUNDRY_CONTRACT=1` neither does anything, so `cargo test` never spends a call.
 
 Each run marks its temporary folder as trusted in your `~/.claude.json` (or `$CLAUDE_CONFIG_DIR/.claude.json`), as `sessions` does for a worktree. The entries stay.
 
@@ -85,3 +85,25 @@ The test writes the settings file and curl config with the daemon's own function
 - It unsets every inherited `CLAUDE*` variable but `CLAUDE_CONFIG_DIR`, such as the `CLAUDECODE` and `CLAUDE_CODE_*` a parent Claude Code session sets, so it can run from inside Claude Code.
 - The hooks post to a recorder in the test that checks the bearer token the way the daemon does, not to the daemon itself.
 - It opens its own 120x40 PTY. A real session runs in the holder's 80x24 one.
+
+## A factory session
+
+`a_factory_session_starts_unasked_and_keeps_its_whole_reply` starts a factory session the way the factory does, through the daemon's own `Sessions::start_factory`: the holder, the factory settings file, `--dangerously-skip-permissions` and `--effort low`, a made-up token for the login in the environment, and the first message typed as a line that names a private body file in the session's folder. Claude Code runs under `env` with `CLAUDE_CONFIG_DIR` set to a fresh folder, so no user settings and no earlier acceptance of the bypass mode can keep the confirmation away, and with every inherited `CLAUDE*` variable unset. The body asks for a reply of 150 lines, `line N of the foundry contract reply` for N from 1 to 149 and `FACTORY-STOP: stuck` last.
+
+It checks three things:
+
+- **No confirmation.** `SessionStart` arrives and the screen never shows "Bypass Permissions mode". Without `skipDangerousModePermissionPrompt: true` in the settings file, the confirmation holds `SessionStart` back and the test fails at the start (spec check 1).
+- **The typed line arrives exactly.** `UserPromptSubmit` reports the line with the body file's path in it, character for character (spec check 6). The body file holds the body, and the line stays under 800 characters, so Claude Code does not take it as a paste.
+- **The turn file is the whole reply.** `turns/1.txt` in the session's folder, and `Sessions::turn_text` for turn 1, equal the `Stop` hook's `last_assistant_message`, which equals the transcript's last assistant text. Every one of the 149 numbered lines is in it, in order, and its last line is the result line (spec check 2).
+
+The daemon's factory start refuses a machine whose own git setup would answer github.com before the askpass. Such a machine cannot run factory sessions, and the test fails there at the start, naming what it found.
+
+### What was seen
+
+The test was written against **Claude Code 2.1.331** on Linux, on 2026-11-25, and was compiled and seen skipped without `FOUNDRY_CONTRACT=1`. It has not yet run against the model: a run spends model calls, and the first one fills in this section.
+
+What it checks was seen by hand with **Claude Code 2.1.322** on macOS, on 2026-11-22:
+
+- Under a config folder that never accepted the mode, `--dangerously-skip-permissions` stops at "WARNING: Claude Code running in Bypass Permissions mode" with "No, exit" selected, and `SessionStart` never comes. With `skipDangerousModePermissionPrompt: true` in the file given to `--settings`, the same folder starts with no confirmation.
+- A first line of 109 characters naming a file outside the worktree, typed as `sessions` types a first prompt, arrived in `UserPromptSubmit` exactly, and the model's first tool call read the file.
+- A final message of 150 lines and 7,772 characters arrived in `last_assistant_message` whole, equal to the transcript's last assistant text, with the result line last. The field holds the text after the turn's last tool call only, so the body asks for no tool after reading the file.
