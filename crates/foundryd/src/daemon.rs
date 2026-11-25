@@ -396,7 +396,7 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
     services.spawn(named("placement", placement::run(placing.clone())));
     services.spawn(named(
         "the cut-off",
-        crate::factory::cutoff::run(me, store.clone(), sessions.clone(), freshness, clock),
+        crate::factory::cutoff::run(store.clone(), me, sessions.clone(), freshness, clock),
     ));
 
     let stopped = tokio::select! {

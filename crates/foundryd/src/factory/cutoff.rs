@@ -36,13 +36,13 @@ const POLL: Duration = Duration::from_millis(100);
 
 /// Ends this machine's factory sessions of each project it is cut off from, for ever.
 pub async fn run(
-    me: MachineId,
     store: Arc<Mutex<Store>>,
+    me: MachineId,
     sessions: Arc<Sessions>,
     freshness: Arc<Freshness>,
     clock: Arc<dyn Clock>,
 ) {
-    Cutoff::new(me, store, sessions, freshness, clock)
+    Cutoff::new(store, me, sessions, freshness, clock)
         .run()
         .await;
 }
@@ -66,8 +66,8 @@ impl Cutoff {
     /// The cut-off of machine `me`, whose session records are in `store`, read on `clock`,
     /// which must be the clock `freshness` reads.
     pub fn new(
-        me: MachineId,
         store: Arc<Mutex<Store>>,
+        me: MachineId,
         sessions: Arc<Sessions>,
         freshness: Arc<Freshness>,
         clock: Arc<dyn Clock>,
@@ -333,8 +333,8 @@ exec "$agent" "$@""#;
 
         fn cutoff(&self) -> Cutoff {
             Cutoff::new(
-                self.me,
                 self.store.clone(),
+                self.me,
                 self.sessions.clone(),
                 self.freshness.clone(),
                 self.clock.clone(),
