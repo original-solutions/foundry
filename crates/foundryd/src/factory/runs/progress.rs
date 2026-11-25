@@ -1712,6 +1712,28 @@ mod tests {
         }
 
         #[test]
+        fn a_send_typed_step_resolves_the_key() {
+            let typed = tries(&[
+                intent(1, 3),
+                step(2, &format!("{SEND_TYPED}forward-comment c1")),
+            ])
+            .unwrap();
+            assert!(typed.typed);
+            assert!(!typed.pending());
+            let unknown = tries(&[intent(1, 3)]).unwrap();
+            assert!(!unknown.typed);
+            assert!(unknown.pending());
+            assert!(!tries(&[intent(1, 3), refused(2)]).unwrap().pending());
+        }
+
+        /// The sends belong to the session they went to: a new session has none.
+        #[test]
+        fn a_new_session_has_no_sends() {
+            assert!(seen_of(&[intent(1, 3), launched(2)]).sends.is_empty());
+            assert!(!seen_of(&[launched(1), intent(2, 3)]).sends.is_empty());
+        }
+
+        #[test]
         fn keeps_each_key_apart_and_ignores_an_intent_with_no_count() {
             let seen = seen_of(&[
                 intent(1, 3),

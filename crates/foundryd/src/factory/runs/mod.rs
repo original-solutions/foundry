@@ -1830,7 +1830,7 @@ mod tests {
 
         #[test]
         fn a_forward_goes_to_the_session_and_is_recorded() {
-            let rig = Rig::new();
+            let mut rig = Rig::new();
             let run = run_id(1);
             building(&rig, &run);
             let mut at = progress(&rig, &run, State::Building);
@@ -1848,6 +1848,16 @@ mod tests {
             let actions = [Action::ForwardComment {
                 comment_id: "c1".into(),
             }];
+            rig.view = FleetView::builder()
+                .turn(foundry_proto::factory::SessionTurn {
+                    session: session_id(SESSION).unwrap(),
+                    workspace: workspace_id(WORKSPACE).unwrap(),
+                    project: project_id(),
+                    turn: 1,
+                    prompts: 1,
+                    question: false,
+                })
+                .build();
             rig.worker.on_send(Ok(1));
             apply_actions(&rig.ctx(), ISSUE, &mut at, &actions, &cause(), &payload).unwrap();
             assert_eq!(
@@ -1855,7 +1865,7 @@ mod tests {
                 vec![Call::Send {
                     session: session_id(SESSION).unwrap(),
                     message,
-                    only_if_prompts: None,
+                    only_if_prompts: Some(1),
                 }]
             );
             assert!(rig.names(&run).contains(&"comment_forwarded".to_string()));
@@ -2369,26 +2379,116 @@ mod tests {
             assert_eq!(send_counts(&rig), vec![Some(4)]);
         }
 
-        /// A send with no count to go under (the fleet shows no turn for the session) that
-        /// failed after the worker read the count records that count: the next try goes under
-        /// it, and a risen count is the message typed.
+        /// A send with no count to go under (the fleet shows no turn for the session) waits:
+        /// nothing is written and nothing is asked of the worker, and the next pass that shows
+        /// a turn sends under its count.
         #[test]
-        fn a_send_with_no_count_that_failed_after_reading_one_is_tried_again_under_it() {
+        fn a_send_to_a_session_that_shows_no_turn_waits_for_one() {
             let (mut rig, run, payload, actions) = forward_rig(3);
             rig.view = FleetView::builder().build();
+            assert!(matches!(
+                forward(&rig, &run, &payload, &actions),
+                Err(RunError::NoPromptCount { .. })
+            ));
+            assert!(rig.worker.calls().is_empty());
+            assert!(
+                !rig.steps(&run)
+                    .iter()
+                    .any(|step| step.starts_with(SEND_INTENT)),
+                "{:?}",
+                rig.steps(&run)
+            );
+            set_prompts(&mut rig, 5);
+            rig.worker.on_send(Ok(5));
+            forward(&rig, &run, &payload, &actions).unwrap();
+            assert_eq!(send_counts(&rig), vec![Some(5)]);
+        }
+
+        fn gate_failure() -> (ActionPayload, [Action; 1]) {
+            (
+                ActionPayload {
+                    send: Some(SendPayload {
+                        message: Message {
+                            line: "the gate failed".into(),
+                            body: None,
+                        },
+                        attempt: 1,
+                        run_ordinal: 1,
+                    }),
+                    ..ActionPayload::default()
+                },
+                [Action::SendGateFailure {
+                    output: "boom".into(),
+                }],
+            )
+        }
+
+        /// One send to a session at a time: while a forward may have typed, a gate failure
+        /// waits for it, naming it, with nothing asked of the worker; so the count the gate
+        /// failure would raise cannot be read as the forward typed.
+        #[test]
+        fn a_send_waits_while_another_to_the_session_may_have_typed() {
+            let (mut rig, run, payload, actions) = forward_rig(3);
             rig.worker.on_send(Err(SendRefused::Failed {
                 reason: "timed out".into(),
-                prompts: Some(5),
+                prompts: Some(3),
             }));
             assert!(forward(&rig, &run, &payload, &actions).is_err());
-            assert!(
-                rig.steps(&run)
-                    .contains(&"send-intent forward-comment c1 5".to_string())
-            );
-            rig.worker.on_send(Err(SendRefused::CountRose { now: 6 }));
+            let (gate, gate_actions) = gate_failure();
+            match forward(&rig, &run, &gate, &gate_actions) {
+                Err(RunError::SendPending { key }) => assert_eq!(key, "forward-comment c1"),
+                other => panic!("{other:?}"),
+            }
+            assert_eq!(send_counts(&rig), vec![Some(3)]);
+            // The forward had not typed: tried again under its count, it is typed now.
+            rig.worker.on_send(Ok(3));
             forward(&rig, &run, &payload, &actions).unwrap();
-            assert_eq!(send_counts(&rig), vec![None, Some(5)]);
             assert!(rig.names(&run).contains(&"comment_forwarded".to_string()));
+            set_prompts(&mut rig, 4);
+            rig.worker.on_send(Ok(4));
+            forward(&rig, &run, &gate, &gate_actions).unwrap();
+            assert_eq!(send_counts(&rig), vec![Some(3), Some(3), Some(4)]);
+            assert!(rig.names(&run).contains(&"gate_sent_back".to_string()));
+        }
+
+        /// A refusal that typed nothing leaves nothing pending: another send goes ahead.
+        #[test]
+        fn a_refused_send_holds_back_no_other() {
+            let (rig, run, payload, actions) = forward_rig(3);
+            rig.worker.on_send(Err(SendRefused::NotIdle));
+            assert!(forward(&rig, &run, &payload, &actions).is_err());
+            let (gate, gate_actions) = gate_failure();
+            rig.worker.on_send(Ok(3));
+            forward(&rig, &run, &gate, &gate_actions).unwrap();
+            assert_eq!(send_counts(&rig), vec![Some(3), Some(3)]);
+        }
+
+        /// A send known typed is not typed again, though the line that records its delivery
+        /// was not written.
+        #[test]
+        fn a_send_known_typed_is_not_sent_again() {
+            let (rig, run, payload, _) = forward_rig(3);
+            let message = payload.forward.clone().unwrap().message;
+            let at = progress(&rig, &run, State::Building);
+            rig.worker.on_send(Ok(3));
+            send_once(
+                &rig.ctx(),
+                &at,
+                session_id(SESSION).unwrap(),
+                message.clone(),
+                "forward-comment c1",
+            )
+            .unwrap();
+            let at = progress(&rig, &run, State::Building);
+            send_once(
+                &rig.ctx(),
+                &at,
+                session_id(SESSION).unwrap(),
+                message,
+                "forward-comment c1",
+            )
+            .unwrap();
+            assert_eq!(send_counts(&rig), vec![Some(3)]);
         }
 
         #[test]
