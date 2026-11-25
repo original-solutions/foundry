@@ -258,7 +258,7 @@ Each check that fails stops the plan, and this spec is revised. All but 9, 10 an
 
 ## What the checks have found so far
 
-Run on 2026-11-25 in one throwaway workspace of the `tc-supplier-portal-v2` template. Checks 5 to 7 and 9 to 14 are not run.
+Run on 2026-11-25 in one throwaway workspace of the `tc-supplier-portal-v2` template. Checks 5, 6, 9, 10, 13 and 14 are not run.
 
 | Check | Result |
 |---|---|
@@ -266,4 +266,5 @@ Run on 2026-11-25 in one throwaway workspace of the `tc-supplier-portal-v2` temp
 | 2 | Passes for `new` and `exec`. `exec --no-wait` gives an operation whose result has the exit code and the end of the output, and `operation logs` has the output. A command past its limit ends as a failed operation with the error `HOST_COMMAND_TIMEOUT`, with no exit code, which the worker reads as P2's timed-out command. `exec` passes standard input. Commands run as root. Not tried: the other ten calls |
 | 3, 4 | **Fail.** A session started with `vims session start` runs its start hooks and then stays at `working` with no tokens used. A message sent to it is held and never delivered, also after `session stop` and a second send. Two sessions, on two models, did the same. Inside the workspace Claude Code runs headless and waits for input. A send makes no operation, so `operation list` finds nothing for its key. The cause is not known and is Vims's to find. No build can run until a session takes a turn, and no plan is written while these two fail. The Claude Code process in the workspace ran as root |
 | 8 | **Fails** as the template stands: the host has no PHP or Composer and has Node 24. Run inside the app's `api` container instead, 7 of 11 commands passed and 4 failed, which is what V13 and V14 answer |
+| 7, 11 | Pass in part. `vims start` of a workspace put to sleep with `vims pause` answered in under two seconds, with its containers and files as they were. `vims stop` left it `Stopped`, and a `vims exec` then was refused with `PRECONDITION_FAILED`, so `exec` does not wake a stopped workspace. `vims remove` of the stopped workspace removed it. Not tried: a session's context after a wake, since no session takes a turn; a node that stops a paused workspace; a start refused for quota; `remove --in-use` |
 | 12 | **Open, and it puts the quota read in doubt.** `vims quota show --json` gave `actual` and `reserved` of 0 vCPU both while the 4 vCPU trial workspace ran and after `vims pause`. So the read did not count a running workspace, and it cannot yet be what "Claiming" tests for room. Added after the council's last round; no advisor has seen this row |
