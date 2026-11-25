@@ -44,7 +44,8 @@ const MESSAGES: &str = "messages";
 
 /// What a caller of [`Sessions::send_factory`] or [`Sessions::start_factory`] gives as the
 /// `body_path` of a `messages` builder. The worker replaces every one in the line with the
-/// absolute path of the file it wrote the body to. A message with a body whose line has none is
+/// absolute path of the file it wrote the body to, in single quotes when the path holds
+/// whitespace or a quote. A message with a body whose line has none is
 /// refused, since nothing would name the file. A message with no body writes no file, and its
 /// line is typed as it is.
 pub const BODY_PATH: &str = "{body}";
@@ -148,9 +149,20 @@ fn check_body(message: &Message) -> Result<(), SessionError> {
     Ok(())
 }
 
-/// `line` with every [`BODY_PATH`] replaced by `path`.
+/// `line` with every [`BODY_PATH`] replaced by `path`. A path that holds whitespace or a quote,
+/// as a data dir under a `HOME` with a space gives, is put in POSIX single quotes, so it stays
+/// one word; any other path is typed as it is.
 pub(super) fn with_body_path(line: &str, path: &Path) -> String {
-    line.replace(BODY_PATH, &path.to_string_lossy())
+    let path = path.to_string_lossy();
+    let word = if path
+        .chars()
+        .any(|c| c.is_whitespace() || c == '\'' || c == '"')
+    {
+        format!("'{}'", path.replace('\'', "'\\''"))
+    } else {
+        path.into_owned()
+    };
+    line.replace(BODY_PATH, &word)
 }
 
 /// Why [`Sessions::send_factory`] sent nothing.
@@ -168,9 +180,28 @@ pub enum SendRefused {
     /// The session is not a live factory session of this daemon.
     #[error("no such live factory session")]
     NoSuchSession,
-    /// The body could not be written or the line not typed. The reason names no secret.
+    /// The message has a body, and its line has no [`BODY_PATH`] to name the file. The same
+    /// message is refused again, so it is not one to send again.
+    #[error("a message with a body must name its file: its line has no {BODY_PATH}")]
+    BodyWithoutPath,
+    /// The message has a body, and this machine's secret store cannot be read, so its secrets
+    /// cannot be hidden. Nothing was written or typed.
+    #[error("the secret store cannot be read, so the body was not written")]
+    SecretsUnreadable,
+    /// The body could not be written or the line not typed: an I/O or terminal error. The
+    /// reason names no secret.
     #[error("the message was not sent: {0}")]
     Failed(String),
+}
+
+impl From<SessionError> for SendRefused {
+    fn from(error: SessionError) -> Self {
+        match error {
+            SessionError::BodyWithoutPath => SendRefused::BodyWithoutPath,
+            SessionError::SecretsUnreadable => SendRefused::SecretsUnreadable,
+            other => SendRefused::Failed(other.to_string()),
+        }
+    }
 }
 
 /// The environment a factory session's child gets for `login`: the token for `gh` and as the
@@ -653,7 +684,8 @@ impl Sessions {
     /// leaves no terminal, no file, no folder and no record.
     ///
     /// A first message with a body has it written to a private file in the session's folder,
-    /// and each [`BODY_PATH`] in the line is the file's path when the line is typed.
+    /// and each [`BODY_PATH`] in the line is the file's path when the line is typed, quoted as
+    /// [`BODY_PATH`] says.
     pub async fn start_factory(
         &self,
         workspace: WorkspaceId,
@@ -725,16 +757,17 @@ impl Sessions {
 
     /// Types `message`'s line into the terminal of factory session `session`, with its body in
     /// a private file in the session's folder when it has one, and each [`BODY_PATH`] in the
-    /// line replaced by that file's path. It answers with the session's count of submitted
-    /// prompts before the send.
+    /// line replaced by that file's path, quoted as [`BODY_PATH`] says. It answers with the
+    /// session's count of submitted prompts before the send.
     ///
     /// The session must be idle, as the spec's G2 says, or it is [`SendRefused::NotIdle`]: a
     /// question is not answered through this. A session whose first message is not yet typed
-    /// is not idle either. A body is hidden as a turn file is, and a body whose line has no
-    /// [`BODY_PATH`] is refused. With `only_if_prompts`, a
-    /// count above it is [`SendRefused::CountRose`], and nothing is written or typed: the line
-    /// that was sent before was typed after all. The send finishes even when the caller stops
-    /// waiting, and is ordered with the session's hooks.
+    /// is not idle either. A body is hidden as a turn file is: with a secret store that cannot
+    /// be read it is [`SendRefused::SecretsUnreadable`]. A body whose line has no [`BODY_PATH`]
+    /// is [`SendRefused::BodyWithoutPath`]. With `only_if_prompts`, a count above it is
+    /// [`SendRefused::CountRose`], and nothing is written or typed: the line that was sent
+    /// before was typed after all. The send finishes even when the caller stops waiting, and is
+    /// ordered with the session's hooks.
     pub async fn send_factory(
         &self,
         session: SessionId,
@@ -807,8 +840,7 @@ impl Inner {
         message: Message,
         only_if_prompts: Option<u64>,
     ) -> Result<u64, SendRefused> {
-        let failed = |error: SessionError| SendRefused::Failed(error.to_string());
-        check_body(&message).map_err(failed)?;
+        check_body(&message)?;
         let marked = lock(&self.factory).marks.contains_key(&session);
         let live = self.live(session).filter(|_| marked);
         let Some(live) = live else {
@@ -821,7 +853,7 @@ impl Inner {
         if body.state != SessionState::Idle || live.first_pending.load(Ordering::Acquire) {
             return Err(SendRefused::NotIdle);
         }
-        let prompts = self.tally(session).await.map_err(failed)?.want.prompts;
+        let prompts = self.tally(session).await?.want.prompts;
         if let Some(wanted) = only_if_prompts
             && prompts > wanted
         {
@@ -833,8 +865,7 @@ impl Inner {
                 let hider = self.hider();
                 let path = blocking(move || write_body(&folder, &hider.hide_body(&text)?))
                     .await
-                    .and_then(|r| r)
-                    .map_err(failed)?;
+                    .and_then(|r| r)?;
                 Some(path)
             }
             None => None,
@@ -1235,8 +1266,13 @@ exec "$agent" "$@""#;
 
     impl Fx {
         async fn new(script: &str) -> Fx {
+            Fx::with_prefix(script, "ff").await
+        }
+
+        /// A fixture whose data dir's name starts with `prefix`.
+        async fn with_prefix(script: &str, prefix: &str) -> Fx {
             let data = tempfile::Builder::new()
-                .prefix("ff")
+                .prefix(prefix)
                 .tempdir_in("/tmp")
                 .unwrap();
             let script_path = data.path().join("script.yaml");
@@ -2353,6 +2389,96 @@ exec "$agent" "$@""#;
         assert_eq!(f.sessions.turn_text(id, 2).await.unwrap().message, "two");
     }
 
+    #[test]
+    fn a_body_path_is_typed_as_it_is_unless_it_holds_a_space_or_a_quote() {
+        let line = "/factory-build acme/widgets#7 {body}";
+        assert_eq!(
+            with_body_path(line, Path::new("/home/a/.local/share/foundry/m.md")),
+            "/factory-build acme/widgets#7 /home/a/.local/share/foundry/m.md"
+        );
+        assert_eq!(
+            with_body_path(line, Path::new("/a b/m.md")),
+            "/factory-build acme/widgets#7 '/a b/m.md'"
+        );
+        assert_eq!(
+            with_body_path(line, Path::new("/a\tb/m.md")),
+            "/factory-build acme/widgets#7 '/a\tb/m.md'"
+        );
+        assert_eq!(
+            with_body_path(line, Path::new("/it's/m.md")),
+            "/factory-build acme/widgets#7 '/it'\\''s/m.md'"
+        );
+        assert_eq!(
+            with_body_path(line, Path::new("/say\"hi\"/m.md")),
+            "/factory-build acme/widgets#7 '/say\"hi\"/m.md'"
+        );
+    }
+
+    /// The word a POSIX shell reads from `quoted`, a path [`with_body_path`] typed.
+    fn unquoted(quoted: &str) -> String {
+        let inner = quoted
+            .strip_prefix('\'')
+            .and_then(|q| q.strip_suffix('\''))
+            .unwrap_or_else(|| panic!("not quoted: {quoted}"));
+        inner.replace("'\\''", "'")
+    }
+
+    #[tokio::test]
+    async fn a_body_in_a_data_dir_with_a_space_and_a_quote_is_named_by_one_quoted_word() {
+        let f = Fx::with_prefix(
+            &format!(
+                "{IDLE}- wait_prompt\n- stop: {{last_assistant_message: \"a\"}}\n\
+                 - wait_line: \"\"\n- wait_input\n"
+            ),
+            "f s'q ",
+        )
+        .await;
+        let first = Message::new(
+            format!("/factory-build acme/widgets#7 {BODY_PATH}"),
+            "the first rules".into(),
+        );
+        let id = f
+            .sessions
+            .start_factory(
+                WorkspaceId::random(),
+                f.worktree.path(),
+                f.start_for(ProjectId::random()),
+                first,
+            )
+            .await
+            .unwrap();
+        let seen = f.shown(id, |t| value(t, "PROMPT=").is_some()).await;
+        let typed: String = serde_json::from_str(&value(&seen, "PROMPT=").unwrap()).unwrap();
+        let path = unquoted(
+            typed
+                .strip_prefix("/factory-build acme/widgets#7 ")
+                .unwrap(),
+        );
+        assert!(path.contains(" s'q "), "{typed}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "the first rules");
+        f.until_turn(id, 1, 1).await;
+
+        f.sessions
+            .send_factory(
+                id,
+                Message::new(format!("/continue {BODY_PATH} now"), "more rules".into()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let seen = f.shown(id, |t| !all_values(t, "LINE=").is_empty()).await;
+        let line: String = serde_json::from_str(&all_values(&seen, "LINE=")[0]).unwrap();
+        let path = line
+            .strip_prefix("/continue ")
+            .and_then(|l| l.strip_suffix(" now"))
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(unquoted(path)).unwrap(),
+            "more rules"
+        );
+    }
+
     #[tokio::test]
     async fn the_body_file_is_private_and_outside_the_worktree() {
         let f = Fx::new(&format!(
@@ -2687,12 +2813,7 @@ exec "$agent" "$@""#;
             )
             .await;
 
-        assert_eq!(
-            sent,
-            Err(SendRefused::Failed(
-                SessionError::BodyWithoutPath.to_string()
-            ))
-        );
+        assert_eq!(sent, Err(SendRefused::BodyWithoutPath));
         assert!(
             !f.sessions_dir()
                 .join(id.to_string())
@@ -2858,7 +2979,7 @@ exec "$agent" "$@""#;
             )
             .await;
 
-        assert!(matches!(sent, Err(SendRefused::Failed(_))), "{sent:?}");
+        assert_eq!(sent, Err(SendRefused::SecretsUnreadable));
         assert!(
             !f.sessions_dir()
                 .join(id.to_string())
@@ -3123,7 +3244,7 @@ exec "$agent" "$@""#;
             )
             .await;
 
-        assert!(matches!(sent, Err(SendRefused::Failed(_))), "{sent:?}");
+        assert_eq!(sent, Err(SendRefused::SecretsUnreadable));
         assert!(
             !f.sessions_dir()
                 .join(id.to_string())
