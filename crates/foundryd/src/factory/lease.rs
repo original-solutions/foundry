@@ -805,6 +805,47 @@ mod tests {
         }
     }
 
+    /// Runs git on the bare repo at `git_dir` with `input` on stdin.
+    fn git_stdin(git_dir: &Path, args: &[&str], input: &str) -> String {
+        use std::io::Write;
+        let mut child = Command::new("git")
+            .arg("--git-dir")
+            .arg(git_dir)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// The reason of an `Unknown` state, whatever type it is held as.
+    fn reason_of(state: &LeaseState) -> String {
+        match state {
+            LeaseState::Unknown { reason } => reason.to_string(),
+            other => panic!("not Unknown: {other:?}"),
+        }
+    }
+
+    const NOT_WRITTEN: &str = "the lease ref holds a commit foundryd did not write";
+    const NOT_READ: &str = "the lease ref could not be read";
+    const NOT_PUSHED: &str = "the lease could not be pushed";
+
+    /// A lease commit's message.
+    fn lease_message(holder: impl std::fmt::Display, generation: &str, renewals: &str) -> String {
+        format!(
+            "foundry factory lease\n\nholder: {holder}\ngeneration: {generation}\nrenewals: {renewals}\n"
+        )
+    }
+
     fn goes_away(pid: i32) -> bool {
         let begun = Instant::now();
         while nix::sys::signal::kill(Pid::from_raw(pid), None).is_ok()
@@ -889,6 +930,32 @@ mod tests {
                 .split_whitespace()
                 .count()
                 - 1
+        }
+
+        /// Points the lease ref at a commit this lease did not make: it has a parent and a
+        /// tree that is not empty. Returns the parent.
+        fn write_foreign(&self, message: &str) -> String {
+            let blob = git_text(&self.path, &["hash-object", "-w", "--stdin"]);
+            let tree = git_stdin(
+                &self.path,
+                &["mktree"],
+                &format!("100644 blob {blob}\tfile\n"),
+            );
+            let parent = git_text(
+                &self.path,
+                &["commit-tree", &tree, "-p", &self.main, "-m", "second"],
+            );
+            git_text(&self.path, &["update-ref", "refs/heads/main", &parent]);
+            let sha = git_text(
+                &self.path,
+                &["commit-tree", &tree, "-p", &parent, "-m", message],
+            );
+            git_text(&self.path, &["update-ref", REF, &sha]);
+            parent
+        }
+
+        fn set_lease(&self, sha: &str) {
+            git_text(&self.path, &["update-ref", REF, sha]);
         }
 
         fn delete_lease(&self) {
@@ -1031,18 +1098,28 @@ mod tests {
     }
 
     /// A `git` that logs its arguments and, for a push, does what the marker files in `marks`
-    /// ask: `fail` (the push fails), `hang` (it never returns), `hold` (it waits for `go`
+    /// ask: `readfail` (a fetch or ls-remote fails), `linger` (the push leaves a child holding the
+    /// pipes and exits 0), `fail` (the push fails), `hang` (it never returns), `hold` (it waits for `go`
     /// before it pushes) and `after` (it pushes, then waits for `go` before it exits).
     fn wrapper_script(marks: &Path) -> String {
         format!(
             r#"#!/bin/sh
 M='{}'
 echo "$@" >> "$M/argv"
+names=$(env | cut -d= -f1 | grep -E '^(GIT_ASKPASS|FOUNDRY_GIT_TOKEN|GIT_CONFIG_GLOBAL)$' | tr '\n' ' ')
+args=$(printf '%s' "$*" | tr '\n' ' ')
+printf '%s| %s\n' "$names" "$args" >> "$M/calls"
 push=no
-for a in "$@"; do if [ "$a" = push ]; then push=yes; fi; done
+for a in "$@"; do
+  if [ "$a" = push ]; then push=yes; fi
+  if [ "$a" = fetch ] || [ "$a" = ls-remote ]; then
+    if [ -e "$M/readfail" ]; then echo 'fatal: unable to access' >&2; exit 128; fi
+  fi
+done
 if [ $push = yes ]; then
   if [ -e "$M/fail" ]; then echo 'fatal: unable to access' >&2; exit 128; fi
-  if [ -e "$M/hang" ]; then echo $$ > "$M/pid"; touch "$M/hung"; while :; do sleep 0.0173; done; fi
+  if [ -e "$M/linger" ]; then sleep 47.3192 & echo $! > "$M/gpid"; exit 0; fi
+  if [ -e "$M/hang" ]; then sleep 47.3191 & echo $! > "$M/gpid"; echo $$ > "$M/pid"; touch "$M/hung"; while :; do sleep 0.0173; done; fi
   if [ -e "$M/hold" ]; then touch "$M/pushing"; while [ ! -e "$M/go" ]; do sleep 0.0119; done; fi
   if [ -e "$M/after" ]; then
     git "$@"; st=$?
@@ -1243,13 +1320,18 @@ exec git "$@"
         assert_eq!(b.tick(0), a.held_by(1));
         a.advance(secs(60));
         b.advance(secs(180));
+        let guard = a.lease.guard();
         a.mark("hold");
         let renewal = a.spawn_tick(0);
         wait_for(&a.at("pushing"));
+        // The guard never waits on a push.
+        assert_eq!(guard.check(), Ok(1));
         assert_eq!(b.tick(0), held(2));
+        assert_eq!(guard.check(), Ok(1));
         a.mark("go");
         assert_eq!(answer(&renewal), b.held_by(2));
         // Its last successful push began only 60 seconds ago on its own clock.
+        assert!(guard.check().is_err());
         assert!(a.check().is_err());
         assert_eq!(b.check(), Ok(2));
         assert_eq!(rig.remote.fields().holder, b.me.to_string());
@@ -1315,6 +1397,41 @@ exec git "$@"
         assert!(!matches!(state, LeaseState::Held { .. }), "{state:?}");
         assert!(a.check().is_err());
         assert!(goes_away(a.pid()));
+        // The wrapper's own background child, in the same group, is killed too.
+        let child: i32 = fs::read_to_string(a.at("gpid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(goes_away(child));
+        assert!(rig.remote.lease_sha().is_none());
+    }
+
+    #[test]
+    fn a_push_that_exits_but_leaves_a_child_on_the_pipes_is_answered_at_30_seconds() {
+        let rig = Rig::new();
+        let a = rig.machine();
+        a.mark("linger");
+        let running = a.spawn_tick(0);
+        wait_for(&a.at("gpid"));
+        // Written before the child's id is: wait for the id to be whole.
+        wait_until("the child's id is written", || {
+            fs::read_to_string(a.at("gpid")).is_ok_and(|id| id.trim().parse::<i32>().is_ok())
+        });
+        a.advance(millis(29_999));
+        assert_eq!(
+            running.recv_timeout(millis(300)),
+            Err(RecvTimeoutError::Timeout)
+        );
+        a.advance(millis(1));
+        let state = answer(&running);
+        assert!(!matches!(state, LeaseState::Held { .. }), "{state:?}");
+        let child: i32 = fs::read_to_string(a.at("gpid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(goes_away(child));
         assert!(rig.remote.lease_sha().is_none());
     }
 
@@ -1336,7 +1453,7 @@ exec git "$@"
         a.advance(secs(60));
         b.advance(secs(60));
         assert!(a.check().is_err());
-        assert_eq!(a.tick(0), a.held_by(1));
+        assert_eq!(reason_of(&a.tick(0)), NOT_PUSHED);
         assert_eq!(b.tick(0), a.held_by(1));
         never_both(&a, &b);
         // 180 s: B has seen the commit unchanged for 180 s.
@@ -1361,7 +1478,7 @@ exec git "$@"
         assert_eq!(a.check(), Ok(1));
         a.advance(secs(60));
         assert!(a.check().is_err());
-        assert_eq!(a.tick(0), a.held_by(1));
+        assert_eq!(reason_of(&a.tick(0)), NOT_PUSHED);
     }
 
     #[test]
@@ -1401,7 +1518,10 @@ exec git "$@"
         let a = rig.machine();
         assert_eq!(a.tick(0), held(1));
         let sha = rig.remote.sha();
+        let guard = a.lease.guard();
+        assert_eq!(guard.check(), Ok(1));
         a.lease.release();
+        assert!(guard.check().is_err());
         let lost = a.check().unwrap_err();
         assert!(lost.reason.contains("released"), "{}", lost.reason);
         a.advance(secs(60));
@@ -1436,7 +1556,7 @@ exec git "$@"
         let c = gone.machine_with(MachineId::random(), fake.clone(), fake, true);
         fs::remove_dir_all(&gone.remote.path).unwrap();
         let unread = c.tick(0);
-        assert!(matches!(unread, LeaseState::Unknown { .. }), "{unread:?}");
+        assert_eq!(reason_of(&unread), NOT_READ);
         seen.push(format!("{unread:?}"));
         for text in &seen {
             assert!(!text.contains(TOKEN), "{text}");
@@ -1446,5 +1566,219 @@ exec git "$@"
         assert!(!argv.contains(TOKEN));
         assert!(!fs::read_to_string(c.at("argv")).unwrap().contains(TOKEN));
         assert!(!format!("{:?}", a.lease.guard().check()).contains(TOKEN));
+    }
+
+    #[test]
+    fn stale_lock_files_in_the_lease_directory_do_not_stop_the_next_read() {
+        let rig = Rig::new();
+        let a = rig.machine();
+        assert_eq!(a.tick(0), held(1));
+        // What a git call killed at 30 s may leave behind.
+        let locks = [
+            a.dir.join("refs/factory/lease.lock"),
+            a.dir.join("shallow.lock"),
+            a.dir.join("packed-refs.lock"),
+            a.dir.join("objects/pack/tmp_pack_Abc123"),
+        ];
+        for lock in &locks {
+            fs::create_dir_all(lock.parent().unwrap()).unwrap();
+            fs::write(lock, "").unwrap();
+        }
+        a.advance(secs(60));
+        assert_eq!(a.tick(0), held(1));
+        assert_eq!(rig.remote.fields().renewals, 1);
+        for lock in &locks {
+            assert!(!lock.exists(), "{} is still there", lock.display());
+        }
+    }
+
+    #[test]
+    fn a_ref_pointed_at_a_commit_with_history_brings_none_of_it() {
+        let rig = Rig::new();
+        let b = rig.machine();
+        let parent = rig.remote.write_foreign("not a lease");
+        let state = b.tick(0);
+        assert_eq!(reason_of(&state), NOT_WRITTEN);
+        let has = git_out(&b.dir, &["cat-file", "-e", &parent]);
+        assert!(
+            !has.status.success(),
+            "the lease directory holds the parent"
+        );
+        let has = git_out(&b.dir, &["cat-file", "-e", &rig.remote.main]);
+        assert!(!has.status.success(), "the lease directory holds main");
+    }
+
+    #[test]
+    fn a_generation_of_u64_max_in_a_foreign_message_reads_as_not_written_and_is_taken_above_highest()
+     {
+        let rig = Rig::new();
+        let b = rig.machine();
+        let other = MachineId::random();
+        rig.remote
+            .write_foreign(&lease_message(other, "18446744073709551615", "0"));
+        let sha = rig.remote.sha();
+        assert_eq!(reason_of(&b.tick(0)), NOT_WRITTEN);
+        b.advance(secs(180));
+        assert_eq!(b.tick(0), held(1));
+        assert_ne!(rig.remote.sha(), sha);
+        assert_eq!(rig.remote.fields().generation, 1);
+    }
+
+    #[test]
+    fn a_renewal_count_of_u64_max_naming_this_machine_is_not_renewed_at_once() {
+        let rig = Rig::new();
+        let a = rig.machine();
+        rig.remote
+            .write_foreign(&lease_message(a.me, "1", "18446744073709551615"));
+        let sha = rig.remote.sha();
+        let state = a.tick(0);
+        assert_eq!(reason_of(&state), NOT_WRITTEN);
+        assert_eq!(rig.remote.sha(), sha);
+        assert!(a.check().is_err());
+    }
+
+    #[test]
+    fn a_ref_rolled_back_to_an_older_commit_naming_this_machine_is_not_renewed_at_once() {
+        let rig = Rig::new();
+        let b = rig.machine();
+        assert_eq!(b.tick(0), held(1));
+        let old = rig.remote.sha();
+        rig.remote.delete_lease();
+        assert_eq!(b.tick(1), held(2));
+        // The ref goes back to the old commit, which names B at generation 1.
+        rig.remote.set_lease(&old);
+        b.advance(secs(60));
+        let state = b.tick(0);
+        assert!(!matches!(state, LeaseState::Held { .. }), "{state:?}");
+        assert_eq!(rig.remote.sha(), old);
+        assert!(b.check().is_err());
+        b.advance(millis(179_999));
+        assert!(!matches!(b.tick(0), LeaseState::Held { .. }));
+        assert_eq!(rig.remote.sha(), old);
+        b.advance(millis(1));
+        assert_eq!(b.tick(0), held(3));
+        assert_eq!(rig.remote.fields().generation, 3);
+    }
+
+    #[test]
+    fn reads_that_fail_keep_the_hold_until_its_age_and_then_say_the_ref_could_not_be_read() {
+        let rig = Rig::new();
+        let a = rig.machine();
+        assert_eq!(a.tick(0), held(1));
+        a.mark("readfail");
+        a.advance(secs(60));
+        assert_eq!(a.tick(0), held(1));
+        assert_eq!(a.check(), Ok(1));
+        a.advance(millis(59_999));
+        assert_eq!(a.tick(0), held(1));
+        assert_eq!(a.check(), Ok(1));
+        a.advance(millis(1));
+        assert_eq!(reason_of(&a.tick(0)), NOT_READ);
+        assert!(a.check().is_err());
+        a.unmark("readfail");
+        assert_eq!(a.tick(0), held(1));
+        assert_eq!(rig.remote.fields().renewals, 1);
+        assert_eq!(a.check(), Ok(1));
+    }
+
+    #[test]
+    fn a_watcher_whose_takeover_push_fails_says_the_lease_could_not_be_pushed() {
+        let rig = Rig::new();
+        let a = rig.machine();
+        let b = rig.machine();
+        assert_eq!(a.tick(0), held(1));
+        assert_eq!(b.tick(0), a.held_by(1));
+        let sha = rig.remote.sha();
+        b.advance(secs(180));
+        b.mark("fail");
+        assert_eq!(reason_of(&b.tick(0)), NOT_PUSHED);
+        assert_eq!(rig.remote.sha(), sha);
+        assert!(b.check().is_err());
+    }
+
+    #[test]
+    fn a_live_holder_renewing_is_never_taken_over_by_a_watcher() {
+        let rig = Rig::new();
+        let a = rig.machine();
+        let b = rig.machine();
+        assert_eq!(a.tick(0), held(1));
+        assert_eq!(b.tick(0), a.held_by(1));
+        let mut last = rig.remote.sha();
+        for renewals in 1..=6 {
+            a.advance(secs(60));
+            b.advance(secs(60));
+            assert_eq!(a.tick(0), held(1));
+            assert_eq!(b.tick(0), a.held_by(1));
+            never_both(&a, &b);
+            let now = rig.remote.sha();
+            assert_ne!(now, last);
+            last = now;
+            assert_eq!(rig.remote.fields().renewals, renewals);
+            assert_eq!(rig.remote.fields().holder, a.me.to_string());
+        }
+    }
+
+    #[test]
+    fn a_watcher_told_a_higher_generation_takes_over_above_it() {
+        let rig = Rig::new();
+        let a = rig.machine();
+        let b = rig.machine();
+        assert_eq!(a.tick(0), held(1));
+        assert_eq!(b.tick(5), a.held_by(1));
+        b.advance(secs(180));
+        assert_eq!(b.tick(5), held(6));
+        assert_eq!(rig.remote.fields().generation, 6);
+    }
+
+    #[test]
+    fn a_commit_foundryd_did_not_write_is_taken_after_180_seconds_above_highest() {
+        let rig = Rig::new();
+        let b = rig.machine();
+        rig.remote.write_foreign("not a lease");
+        let sha = rig.remote.sha();
+        assert_eq!(reason_of(&b.tick(3)), NOT_WRITTEN);
+        b.advance(millis(179_999));
+        assert_eq!(reason_of(&b.tick(3)), NOT_WRITTEN);
+        assert_eq!(rig.remote.sha(), sha);
+        b.advance(millis(1));
+        assert_eq!(b.tick(3), held(4));
+        assert_eq!(rig.remote.fields().renewals, 0);
+        assert_eq!(rig.remote.parents(&rig.remote.sha()), 0);
+    }
+
+    #[test]
+    fn every_git_call_carries_the_token_hardening_and_no_token_argument() {
+        let rig = Rig::new();
+        let a = rig.machine();
+        let b = rig.machine();
+        assert_eq!(a.tick(0), held(1));
+        a.advance(secs(60));
+        assert_eq!(a.tick(0), held(1));
+        assert_eq!(b.tick(0), a.held_by(1));
+        for machine in [&a, &b] {
+            let calls = fs::read_to_string(machine.at("calls")).unwrap();
+            assert!(calls.lines().count() >= 4, "{calls}");
+            for call in calls.lines() {
+                let (names, args) = call.split_once('|').unwrap();
+                for name in ["GIT_ASKPASS", "FOUNDRY_GIT_TOKEN", "GIT_CONFIG_GLOBAL"] {
+                    assert!(names.split_whitespace().any(|n| n == name), "{call}");
+                }
+                assert!(args.contains("-c credential.helper="), "{call}");
+                assert!(args.contains("-c core.hooksPath=/dev/null"), "{call}");
+                assert!(!call.contains(TOKEN), "{call}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_remote_ref_that_only_ends_in_the_lease_name_reads_as_missing() {
+        let rig = Rig::new();
+        let a = rig.machine();
+        git_text(
+            &rig.remote.path,
+            &["update-ref", "refs/x/refs/factory/lease", &rig.remote.main],
+        );
+        assert_eq!(a.tick(0), held(1));
+        assert_eq!(rig.remote.fields().generation, 1);
     }
 }
