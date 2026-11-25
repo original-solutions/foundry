@@ -731,13 +731,6 @@ impl Lease {
                 return Found::Failed;
             }
         }
-        // A directory made by an earlier build stored the URL: it is removed, since a stored
-        // one would be read first. (`--unset-all` of a key that is not set exits 5.)
-        if std::fs::read_to_string(self.dir.join("config"))
-            .is_ok_and(|config| config.contains("url ="))
-        {
-            self.git(auth, &["config", "--unset-all", "remote.lease.url"], true);
-        }
         let listed = self.git(
             auth,
             &["ls-remote", "--exit-code", "--", &self.url, REF],
@@ -788,16 +781,15 @@ impl Lease {
         let mut fetched = have || self.fetch(auth, &sha);
         let mut parsed = None;
         if fetched {
-            // Only a commit that was read, and whose message is no lease's, is foreign. One
-            // that could not be read (git failed or was killed) is as good as not fetched:
+            // Only a commit that was read (`cat-file` exited 0), and whose message is no
+            // lease's, is foreign: a commit with no body at all has an empty message. One that
+            // could not be read (git failed or was killed) is as good as not fetched:
             // nothing is dropped or remembered, and the next tick reads it again.
-            let message = self
-                .git(auth, &["cat-file", "commit", &sha], true)
-                .ok_raw()
-                .and_then(|commit| commit.split_once("\n\n"))
-                .map(|(_, message)| message.to_owned());
-            match message {
-                Some(message) => parsed = Parsed::from_message(&message),
+            match self.git(auth, &["cat-file", "commit", &sha], true).ok_raw() {
+                Some(commit) => {
+                    let message = commit.split_once("\n\n").map_or("", |(_, message)| message);
+                    parsed = Parsed::from_message(message);
+                }
                 None => fetched = false,
             }
         }
