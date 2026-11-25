@@ -1,21 +1,268 @@
-//! Gate failures and instructor comments sent back to a run's session.
+//! Instructor feedback on a `pr-open` run.
+//!
+//! Ported from the runner's `src/runner/feedback.ts` with `feedback.test.ts`. [`advance`] is one
+//! pass over a run the gate left in `pr-open`: every `feedback_seconds` it reads what the
+//! instructors wrote on the pull request and on the issue, and starts a round on it. A round
+//! moves the label back to `building`, makes a workspace named `fac/<N>-<attempt>-f<k>` on the
+//! pull request's branch and starts a session in it with the resumed message
+//! ([`messages::feedback`]) and the feedback. No pass waits on a worker. Every step is recorded
+//! before it is done and a step already recorded is not done again, so a pass cut short and
+//! repeated carries on and asks nothing twice. The lease is checked, through `RunContext`'s
+//! methods, before every GitHub change and every worker call.
+//!
+//! What a pass does, in order:
+//!
+//! 1. **Not this step's.** A run with no events (an issue the runner left in `pr-open`, which
+//!    Foundry never ran), a finished run, one with no session or pull request recorded, one in
+//!    another repo, one that is stuck or whose stop was asked for, and one with a re-gate under
+//!    way (`gate_regate`, or a `regate_relaunching` decision of the runner's) is left alone:
+//!    [`FeedbackStep::None`], with no call to GitHub and nothing written.
+//! 2. **A round under way** is carried on before anything is read: see 5 and 6.
+//! 3. **The read.** Only a run in `pr-open` that has a window (`Seen::pr_open_since`, the pass
+//!    that took it there) is read, and only when a read is due. The window is kept in the
+//!    ledger, measured on `ctx.clock` as gating's `checks-waiting` is: every read writes one
+//!    step, `feedback-read <generation> <ms>`, with ` clean` after it when the read found
+//!    nothing new. A read is due when no such step is on record, when the newest is of another
+//!    lease generation or above the clock now (a takeover, or a clock that was reset: never
+//!    later), or when `feedback_seconds` have passed since it. A pass that finds nothing due
+//!    writes and reads nothing. A read that fails writes its step too, so it waits for the
+//!    next window. GitHub is asked from one second before the run reached `pr-open` (the gate's
+//!    pass), and the reviews are paged back only to the newest clean read less a minute (the
+//!    wall time that step carries as an event), and never before that moment. An item the
+//!    ledger names (`feedback_sent`: relaunched or forwarded as feedback; `comment_forwarded`
+//!    and `comment-dropped` for an issue comment) is never read as new, and an edit keeps its
+//!    id. Items are in time order.
+//! 4. **A round starts only when it can.** With feedback found, a run slot must be free
+//!    (`slots.runs_free > 0`, which the round takes: two runs in one pass do not both take the
+//!    last) and `placing::place_run` must have a machine (which the round reserves in
+//!    `reserved`). Otherwise the pass is [`FeedbackStep::Waiting`] with the reason ([`NO_SLOT`],
+//!    or the placement's own, or [`NO_MACHINE`]), and nothing is written, on GitHub or in the
+//!    ledger, not even the read's step: the issue stays `pr-open`, the wait adds nothing to
+//!    `Seen::worked_ms` (which counts `triage` and `building` only), and the feedback is read
+//!    again on the next pass, so a slot that frees is used at once. (The items are not kept:
+//!    the read costs two calls on each pass while a round with feedback waits.) Then, as the
+//!    runner does, the pull request is read (merged or closed ends the run with `end_run`), the
+//!    issue (closed: `abandon`), the issue text against the approval (a text a person who is not
+//!    an instructor changed, one that cannot be judged and a run with no recorded approval are
+//!    stuck, as `building`'s are) and the pull request's branch: one that is not a plain branch
+//!    name (`a..b`, a leading `-`, a space, a non-ASCII character) is stuck with
+//!    [`BRANCH_REFUSED`] before any machine is placed or workspace asked for (review focus 2).
+//! 5. **The decision.** `feedback_relaunching` (the number `n` of the round, one past the
+//!    highest, the branch, the ids of the items and the body of the first message), then the
+//!    step `feedback-machine <n> <id>`, then the move of the lifecycle's `pr-open` and
+//!    `instructor-feedback` (the pull request a draft again, the issue assigned, the label
+//!    `building`, the status comment, and `state_changed` last), then the decision again, and
+//!    the earlier workspace's archive. The label moves in the pass the round starts, not when
+//!    the session starts as the runner's did, because `ledger::list::holds_slot` counts a run's
+//!    slot from `state_changed` to `building` and the spec has the round's session hold a
+//!    slot. `Seen` clears a decision at a state change, so the decision is written again after
+//!    the move: until the session is recorded, `pending_relaunch` is `Some`, which is what
+//!    `building::advance` and `resume::advance` skip a run for (a `building` run whose newest
+//!    session is the old, ended one would otherwise be read as an interruption).
+//!    `minutes`, `gate_retries` and `interruption_resumes` start again: see below.
+//! 6. **The workspace and the session**, a step to a pass, as `resume` does. The earlier
+//!    workspace (the run's newest, when the fleet still shows it: the gate archived it at
+//!    `pr-open`, so normally it does not) is archived first: `feedback-archiving <n> <id>`, the
+//!    call, `feedback-archive-asked <n>`, and the pass ends there; it is asked again each pass
+//!    while it shows on a machine that is heard from, and the round goes on once it shows
+//!    archived or its machine has been unreachable for 15 minutes. The new workspace is never
+//!    asked for in a pass that asked for the archive. Then `feedback-requested <n> <name>`,
+//!    the create on the machine the decision placed (`Checkout::Branch` of the pull request's
+//!    head and the worktree's own setup), and `feedback-workspace <n> <id>`; a record the fleet
+//!    shows under that name with its setup started is the create's answer. The setup terminal
+//!    is waited for (a failed setup is stuck, with its tail), a session the fleet already shows
+//!    in the workspace with a turn record is adopted, the text is checked once more against the
+//!    approval, and the session starts: `feedback-sending <n>` before, or, when a start may
+//!    already have gone out, `feedback-ending-sessions <n>` and the workspace's sessions are
+//!    ended first. A start the worker refuses is stuck (and says a session may exist when an
+//!    earlier try may have gone out); a machine that cannot be reached is tried again next
+//!    pass. `session_launched` (with `resumed_from` the run and the branch, the run's base) is
+//!    written after, and the status comment names the machine and the session. A machine
+//!    unreachable for 15 minutes before that is given up (`feedback-machine-given-up`) and
+//!    placement picks another. A round that is under way and whose issue was closed (or whose
+//!    own merge closed it) ends the run and ends the sessions of its workspace; one whose pull
+//!    request was merged is `Ended`.
+//! 7. **The first message again.** A session idle with no prompt a pass later has the first
+//!    message asked for again by count (`feedback-resending <n> 0`), which the worker types only
+//!    when its count has not risen, as `start`'s and `resume`'s resends are.
+//!
+//! What the pass (task 30) must do with this step:
+//!
+//! - Call [`advance`] for a run in `pr-open` and for a run in `building` whose newest session
+//!   is a round's (`pending_relaunch` is `Some`, or the newest `session_launched` follows the
+//!   newest `feedback_relaunching` and shows no turn yet), every pass, with the `slots` and the
+//!   `reserved` of the pass, after the claims' placement and before they take the slots left.
+//! - Not call `building::advance` or `resume::advance` for a run while `pending_relaunch` is
+//!   `Some`: they skip it. Not call `start::advance`, nor `gating::advance`, for it either:
+//!   `start`'s resend would send the build's launch words to the round's session, and `gating`
+//!   reads the old, ended session; `gating` is for a run `building::advance` said
+//!   `ReadyForGate` for. Once the round's session shows a turn, `building::advance` follows it
+//!   as any building session, and its pull request is gated again.
+//! - Call `stop::reconcile` before this step: a merged pull request or a closed issue ends the
+//!   run there, and what both write is idempotent through the ledger.
+//!
+//! The three budgets start again for the round because of what the round writes:
+//!
+//! - `minutes`: `Seen::worked_ms` is zeroed at a `state_changed` from `pr-open` to `building`,
+//!   and the stint runs from it, so `building::time_limit` counts from the round.
+//! - `gate_retries`: `gating` reads a round as beginning at each `state_changed` to `building`
+//!   (its `Log::read`), so its first gate has the whole budget.
+//! - `interruption_resumes`: **not reset by anything this step can write.** `resume::decide`
+//!   counts from `Seen::interruption`, the newest `session_interrupted` line of the run, which a
+//!   round does not clear (the runner's did not either). A run that used its resumes before
+//!   `pr-open` is stuck on the first interruption of the round's session. The fix is in
+//!   `progress.rs` (the `feedback_relaunching` arm clears `seen.interruption`) or in
+//!   `resume.rs` (`decide` counts the lines after the newest `feedback_relaunching`); neither
+//!   is this issue's file. A `session_interrupted` or `session_rate_limited` line written here
+//!   would be read as an owed resume, a relaunch or a rate limit, which `resume` and `building`
+//!   skip a run for.
+//!
+//! Where it differs from the runner:
+//!
+//! - The runner launched the new session first and committed the label after; Foundry commits
+//!   the label first (above), so the slot is held from the pass the round starts.
+//! - The runner's relaunch was a `relaunchSession` of T3 (a thread launched under a command id,
+//!   a worktree path, host and cloud messages); Foundry makes a workspace and starts a session
+//!   in it, as `resume` does, and the runner's command id has become the workspace name and
+//!   the recorded steps. A refused start names `foundry:<run>:feedback-<n>` where the runner
+//!   named its launch command id.
+//! - The runner kept the time of the last read and of the last clean read in a file under the
+//!   data dir; Foundry has no such directory, so each read is a ledger step, on the
+//!   sleep-counting clock under the lease generation.
+//! - The old session is not stopped here: the gate ended it and archived its workspace at
+//!   `pr-open` (the runner's `worktree_removed` has no counterpart). A workspace that still
+//!   shows is archived by force before the round's is made.
+//! - A pull request from a fork is not refused here, as the runner did not refuse it.
+//!
+//! Runner cases of `feedback.test.ts` that have no Rust test of the same name, each with its
+//! reason. The cases not listed are ported under their names, or under the name noted.
+//!
+//! `feedback: the window`:
+//! - `a failed regate does not move the start of the feedback window`: no re-gate; the case
+//!   that pins the start of the window is `the_window_starts_at_the_pass_that_took_the_run_to_pr_open`.
+//!
+//! `feedback: the step`:
+//! - `a run that reached pr-open before a pass removed worktrees has its old session stopped
+//!   before the relaunch`: the gate ends the session and archives the workspace at `pr-open`;
+//!   a workspace that still shows is the case `a_run_that_reached_pr_open_with_its_build_workspace_still_showing_has_it_archived_before_the_relaunch`.
+//! - `a time of the last read that cannot be written does not stop the read` and `a feedback
+//!   directory nobody can write does not stop the read`: no file; a ledger step that cannot be
+//!   written is an error, as every step's is.
+//! - `the time of a new read keeps the clean time on the next line`: each read is a step of its
+//!   own; the case is `the_time_of_a_new_read_keeps_the_clean_time_of_the_read_before`.
+//! - `a relaunch names the login its host resolves to: the host's key, or a repo's override`,
+//!   `a relaunch sends the cloud message, with the same resume and feedback, and no login
+//!   check`: T3's host and cloud launch messages; a session starts as the project's login.
+//! - `a crash after the decision sends the launch again under the same command id`: the case is
+//!   `a_crash_after_the_decision_starts_the_session_once`.
+//! - `regate leaves a pending feedback relaunch to the feedback step` and `regate leaves a
+//!   feedback relaunch whose session is recorded to the feedback step`: there is no `regate`;
+//!   what they protect (nothing else acts on a round being set up) is
+//!   `building_and_resume_leave_a_round_being_set_up_alone`.
+//! - `a feedback relaunch that is not finished is never read as unchanged by the pass`: the
+//!   runner's `lastPass`; the gate's pass of a run in `building` is not read.
+//! - `a refused launch goes stuck and says the feedback command id` and `a refused resend says
+//!   a session may exist under the feedback command id`: the cases are `a_refused_start_goes_stuck_without_saying_a_session_may_exist`
+//!   and `a_refused_second_start_says_a_session_may_exist_under_the_feedback_name`.
+//! - `a run of another repo is an error and nothing is touched`: the case is
+//!   `a_run_of_another_repo_is_left_alone_and_nothing_is_touched` (a run id names its repo).
+//! - `a re-gate relaunch with no session recorded is left to the gate`: the runner's regate.
+//! - `a conflict after a pass and a feedback relaunch gets the full send-back budget`: the
+//!   gate's own cases (`review_a_round_has_its_own_budget`); here
+//!   `a_round_is_a_return_to_building_after_pr_open_which_is_where_the_gate_starts_its_budget_again`.
+//! - `forward does not send an issue comment again that went as feedback`: ported with `forward`.
+//! - `feedback: a run whose launch recorded a base other than the project's`: the case is
+//!   `relaunches_on_a_run_base_and_records_it`; the gate's read of that base's tip is the gate's.
 
-use foundry_proto::factory::RunId;
-use foundry_proto::ids::SessionId;
+use foundry_proto::factory::{RunEvent, RunId};
+use foundry_proto::ids::{MachineId, SessionId, WorkspaceId};
+use foundry_proto::record::{Record, Workspace};
 use foundry_proto::settings::SharedSettings;
+use foundry_proto::state::{SessionState, TerminalState};
+use serde_json::Value;
 
-use super::{RunContext, RunError};
-use crate::factory::placing::{Reserved, Slots};
+use super::progress::{Fixes, STUCK_DETAIL, STUCK_STOP, Seen, pending_relaunch, read_progress};
+use super::resume::{BRANCH_REFUSED, UNREACHABLE_FOR};
+use super::start::{FIRST_PROMPT_COUNT, SETUP_FAILED};
+use super::{
+    ActionPayload, Closing, Progress, RunContext, RunError, Stop, StuckStop, abandon,
+    apply_actions, end_own_merge, end_run, go_stuck, moved_on_by_closing, progress_from,
+    recorded_reason, session_id, workspace_id,
+};
+use crate::factory::github::read::{
+    Feedback as Item, FeedbackKind as ItemKind, InlineComment as ItemInline, is_safe_branch_name,
+};
+use crate::factory::ledger::events::{
+    Cause, CauseStep, Event, ModelOption, OptionValue, ResumedFrom, names,
+};
+use crate::factory::lifecycle::approval::TextCheck;
+use crate::factory::lifecycle::{Event as LifecycleEvent, State, transition};
+use crate::factory::messages::{
+    self, CANNOT_CONFIRM, CANNOT_VERIFY_DURING_BUILD, CHANGED_DURING_BUILD, LAUNCH_FAILED, Message,
+    prepare_output_tail,
+};
+use crate::factory::placing::{self, Reserved, Slots};
+use crate::factory::text;
+use crate::factory::worker::{CreateWorkspace, WorkerError};
+use crate::sessions::factory::{BODY_PATH, FactoryStart, SendRefused};
+use crate::workspaces::{Checkout, FactoryTag, Setup};
+
+/// Why a round that has feedback does not start when every run slot is held.
+pub const NO_SLOT: &str = "no run slot is free";
+/// Why a round does not start when placement gives no reason of its own.
+pub const NO_MACHINE: &str = "no machine can take the round";
+
+/// The step written for every read of the feedback: `feedback-read <generation> <ms>`, the
+/// generation the lease was held at and the sleep-counting clock's reading (milliseconds) at
+/// the read, with ` clean` after it when the read found nothing new.
+pub const READ: &str = "feedback-read ";
+/// The step that records the machine the round's workspace is made on: `feedback-machine <n> <id>`.
+pub const MACHINE: &str = "feedback-machine ";
+/// The step written when the machine recorded for the round was unreachable for 15 minutes
+/// before the session started: `feedback-machine-given-up <n> <id>`.
+pub const MACHINE_GIVEN_UP: &str = "feedback-machine-given-up ";
+/// The step written before the earlier workspace's archive is asked for:
+/// `feedback-archiving <n> <workspace id>`.
+pub const ARCHIVING: &str = "feedback-archiving ";
+/// The step written once the archive was asked for: `feedback-archive-asked <n>`.
+pub const ARCHIVE_ASKED: &str = "feedback-archive-asked ";
+/// The step written before the create: `feedback-requested <n> <name>`.
+pub const REQUESTED: &str = "feedback-requested ";
+/// The step written once the worker answered the create: `feedback-workspace <n> <id>`.
+pub const WORKSPACE: &str = "feedback-workspace ";
+/// The step written before the sessions of the round's workspace are ended ahead of a second
+/// start: `feedback-ending-sessions <n>`.
+pub const ENDING_SESSIONS: &str = "feedback-ending-sessions ";
+/// The step written before the session is started: `feedback-sending <n>`.
+pub const SENDING: &str = "feedback-sending ";
+/// The step written before the first message is asked for again: `feedback-resending <n> <count>`.
+pub const RESENDING: &str = "feedback-resending ";
+
+/// How far before the start of the last clean read the next read pages back. GitHub's clock can
+/// differ from ours and a read can lag behind a write, so a review submitted just before that
+/// start may not have been there to read.
+const CLEAN_READ_MARGIN_MS: u64 = 60_000;
+
+/// The codes of the stuck paths this step begins once a round is decided.
+const STUCK_SETUP: &str = "feedback-setup-failed";
+const STUCK_LAUNCH: &str = "feedback-launch-failed";
+const STUCK_TEXT: &str = "text-changed-during-build";
+const STUCK_UNVERIFIED: &str = "edits-unverifiable";
+const STUCK_UNCONFIRMED: &str = "approval-unconfirmed";
+const STUCK_BRANCH: &str = "launch-failed";
 
 /// What a pass of [`advance`] did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FeedbackStep {
-    /// Nothing to do: nothing was written or asked of a worker.
+    /// Nothing to do: the run is not waiting in `pr-open` (finished, stuck, stopped, no session
+    /// or pull request, a re-gate under way), no read is due, or no instructor wrote anything
+    /// new. Nothing was written or asked of a worker.
     None,
-    /// New feedback is waiting and no round can start now.
+    /// New feedback is waiting and no round can start now: no run slot is free, or placement
+    /// has no machine. Nothing was written, and the issue stays `pr-open`.
     Waiting { reason: String },
-    /// The round was decided: the label is `building` and the earlier workspace's archive was
-    /// asked for if one shows.
+    /// The round was decided: the decision is recorded, the label is `building` and the
+    /// earlier workspace's archive was asked for if one shows.
     Decided { round: u32, pr: u64, items: usize },
     /// A round under way waits for something.
     Preparing(Wait),
@@ -23,7 +270,7 @@ pub enum FeedbackStep {
     Started { round: u32, session: SessionId },
     /// The first message was asked for again by count.
     Resent { session: SessionId },
-    /// The run went stuck.
+    /// The run went stuck; `reason` is as the ledger records it.
     Stuck { reason: String },
     /// The pull request was merged or closed: the run ended.
     Ended,
@@ -36,16 +283,255 @@ pub enum FeedbackStep {
 pub enum Wait {
     /// The earlier workspace still shows.
     Archive,
-    /// The create was answered and the fleet does not show the record yet.
+    /// The create was answered and the fleet does not show the record yet, or a machine was
+    /// given up on and another recorded.
     Workspace,
-    /// The setup terminal runs.
+    /// The setup terminal runs, or its exit is not known.
     Setup,
 }
 
-/// Why a round that has feedback does not start when every run slot is held.
-pub const NO_SLOT: &str = "no run slot is free";
+fn canonical(text: &str) -> Option<u64> {
+    let plain = !text.is_empty()
+        && text.bytes().all(|b| b.is_ascii_digit())
+        && (text == "0" || !text.starts_with('0'));
+    if plain { text.parse().ok() } else { None }
+}
 
-/// One pass of the feedback step over `run`.
+/// The sleep-counting clock's reading, in milliseconds.
+fn clock_ms(ctx: &RunContext<'_>) -> u64 {
+    u64::try_from(ctx.clock.now().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// One second before `ms`, as GitHub is asked for it: `YYYY-MM-DDTHH:MM:SSZ`.
+fn second_before(ms: u64) -> String {
+    let text = crate::factory::ledger::format_ts(ms.saturating_sub(1_000));
+    format!("{}Z", &text[..19])
+}
+
+/// The text of a `step_changed` event.
+fn step_text(event: &RunEvent) -> Option<&str> {
+    if event.event != names::STEP_CHANGED {
+        return None;
+    }
+    event.data.get("step").and_then(Value::as_str)
+}
+
+/// What follows `prefix` and the count `n` in `step`, or `None` for a step of another kind or
+/// another round.
+fn numbered<'a>(step: &'a str, prefix: &str, n: u32) -> Option<&'a str> {
+    let rest = step.strip_prefix(prefix)?;
+    let (count, tail) = rest.split_once(' ').unwrap_or((rest, ""));
+    (count == n.to_string()).then_some(tail)
+}
+
+fn parse_machine(text: &str) -> Option<MachineId> {
+    uuid::Uuid::parse_str(text).ok().map(MachineId)
+}
+
+/// The name of round `n`'s workspace: `fac/<N>-<attempt>-f<n>`.
+fn round_name(run: &RunId, n: u32) -> String {
+    format!("fac/{}-{}-f{n}", run.issue(), run.attempt())
+}
+
+/// The id feedback on the issue carries, so that it cannot collide with a review's or a pull
+/// request comment's.
+fn issue_comment_feedback_id(id: &str) -> String {
+    format!("issue-comment:{id}")
+}
+
+// ----- what the ledger says of the reads -----
+
+/// The reads of the feedback a ledger records.
+#[derive(Debug, Default)]
+struct ReadLog {
+    /// The lease generation and clock reading of the newest read.
+    last: Option<(u64, u64)>,
+    /// The wall time (the event's) of the newest clean read.
+    clean: Option<u64>,
+}
+
+impl ReadLog {
+    fn read(events: &[RunEvent]) -> Self {
+        let mut log = ReadLog::default();
+        for event in events {
+            let Some(rest) = step_text(event).and_then(|step| step.strip_prefix(READ)) else {
+                continue;
+            };
+            let parts: Vec<&str> = rest.split(' ').collect();
+            let (generation, at, clean) = match parts.as_slice() {
+                [generation, at] => (generation, at, false),
+                [generation, at, "clean"] => (generation, at, true),
+                _ => continue,
+            };
+            let (Some(generation), Some(at)) = (canonical(generation), canonical(at)) else {
+                continue;
+            };
+            log.last = Some((generation, at));
+            if clean {
+                log.clean = Some(event.ms);
+            }
+        }
+        log
+    }
+
+    /// Whether the feedback is to be read now. A read of another generation (a takeover), or of
+    /// a clock reading above this one (a clock that was reset), leaves it due, never later.
+    fn due(&self, generation: u64, now: u64, seconds: u64) -> bool {
+        match self.last {
+            Some((from, at)) if from == generation && now >= at => {
+                now - at >= seconds.saturating_mul(1000)
+            }
+            _ => true,
+        }
+    }
+}
+
+// ----- what the ledger says of a round -----
+
+/// What the ledger records of the newest round.
+#[derive(Debug, Default)]
+struct Round {
+    n: u32,
+    branch: String,
+    items: Vec<String>,
+    /// The body of the first message.
+    message: String,
+    machine: Option<MachineId>,
+    gave_up: Vec<MachineId>,
+    /// The workspace the archive is of, as written: an id.
+    archiving: Option<String>,
+    archive_asked: bool,
+    requested: bool,
+    workspace: Option<WorkspaceId>,
+    sending: bool,
+    /// The sessions launched since the decision.
+    launches: usize,
+}
+
+impl Round {
+    fn launched(&self) -> bool {
+        self.launches > 0
+    }
+
+    fn read(events: &[RunEvent]) -> Option<Round> {
+        let number = |event: &RunEvent| {
+            (event.event == "feedback_relaunching")
+                .then(|| event.data.get("n").and_then(Value::as_u64))
+                .flatten()
+                .and_then(|n| u32::try_from(n).ok())
+        };
+        let n = events.iter().filter_map(number).max()?;
+        let at = events.iter().position(|event| number(event) == Some(n))?;
+        let data = &events[at].data;
+        let mut round = Round {
+            n,
+            branch: data.get("branch").and_then(Value::as_str)?.to_owned(),
+            items: data
+                .get("items")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            message: data.get("message").and_then(Value::as_str)?.to_owned(),
+            ..Round::default()
+        };
+        for event in &events[at + 1..] {
+            if event.event == names::SESSION_LAUNCHED {
+                round.launches += 1;
+                continue;
+            }
+            let Some(step) = step_text(event) else {
+                continue;
+            };
+            if let Some(rest) = numbered(step, ARCHIVING, n) {
+                round.archiving = Some(rest.to_owned());
+            } else if numbered(step, ARCHIVE_ASKED, n).is_some() {
+                round.archive_asked = true;
+            } else if let Some(rest) = numbered(step, MACHINE_GIVEN_UP, n) {
+                round.gave_up.extend(parse_machine(rest));
+                round.machine = None;
+                round.requested = false;
+                round.workspace = None;
+                round.sending = false;
+            } else if let Some(rest) = numbered(step, MACHINE, n) {
+                round.machine = parse_machine(rest);
+                round.requested = false;
+                round.workspace = None;
+                round.sending = false;
+            } else if numbered(step, REQUESTED, n).is_some() {
+                round.requested = true;
+            } else if let Some(rest) = numbered(step, WORKSPACE, n) {
+                round.workspace = uuid::Uuid::parse_str(rest).ok().map(WorkspaceId);
+            } else if numbered(step, SENDING, n).is_some()
+                || numbered(step, ENDING_SESSIONS, n).is_some()
+            {
+                round.sending = true;
+            }
+        }
+        Some(round)
+    }
+}
+
+/// Every workspace of the project the fleet shows that is not archived and has one of the run's
+/// build, resume or feedback names.
+fn live_workspace<'a>(
+    ctx: &'a RunContext<'_>,
+    run: &RunId,
+    events: &[RunEvent],
+    id: WorkspaceId,
+) -> Option<&'a Record<Workspace>> {
+    let highest = |name: &str, field: &str| -> u32 {
+        events
+            .iter()
+            .filter(|event| event.event == name)
+            .filter_map(|event| event.data.get(field).and_then(Value::as_u64))
+            .max()
+            .and_then(|n| u32::try_from(n).ok())
+            .unwrap_or(0)
+    };
+    let base = format!("fac/{}-{}", run.issue(), run.attempt());
+    let mut names = vec![base.clone()];
+    names.extend(
+        (1..=highest("session_interrupted", "resumes") + 1).map(|k| format!("{base}-r{k}")),
+    );
+    names.extend((1..=highest("feedback_relaunching", "n") + 1).map(|k| format!("{base}-f{k}")));
+    names
+        .iter()
+        .flat_map(|name| ctx.view.workspaces_named(ctx.project.id, name))
+        .find(|record| record.body.id == id)
+}
+
+fn unreachable_long(ctx: &RunContext<'_>, machine: MachineId) -> bool {
+    ctx.view.unreachable_for(machine) >= UNREACHABLE_FOR
+}
+
+/// A step recorded, with the lease checked first so that a lost lease writes nothing.
+fn note(ctx: &RunContext<'_>, run: &RunId, step: &str, reason: &str) -> Result<(), RunError> {
+    ctx.held()?;
+    ctx.record_step(run, step, &Cause::new(CauseStep::Forward, reason))
+}
+
+/// `seen` for a stop of the round: what is ended is the round's workspace once it has one,
+/// and nothing before. The earlier build session ended at the gate.
+fn round_seen(seen: &Seen, round: Option<&Round>) -> Seen {
+    let mut stopping = seen.clone();
+    stopping.workspace = None;
+    match round.and_then(|round| round.workspace) {
+        Some(id) => stopping.worktree = Some(id.to_string()),
+        None => {
+            stopping.worktree = None;
+            stopping.thread_id = None;
+            stopping.launch_sent = false;
+        }
+    }
+    stopping
+}
+
+/// One pass of the feedback step over `run`. See the module's words.
 pub fn advance(
     ctx: &RunContext<'_>,
     run: &RunId,
@@ -53,8 +539,881 @@ pub fn advance(
     slots: &mut Slots,
     reserved: &mut Reserved,
 ) -> Result<FeedbackStep, RunError> {
-    let _ = (ctx, run, shared, slots, reserved);
-    todo!("feedback::advance")
+    if run.repo() != ctx.repo() {
+        return Ok(FeedbackStep::None);
+    }
+    let events = ctx.ledger.read(run)?;
+    let seen = read_progress(&events);
+    if seen.finished {
+        return Ok(FeedbackStep::None);
+    }
+    let (Some(_), Some(last)) = (&seen.thread_id, &seen.last_pr) else {
+        return Ok(FeedbackStep::None);
+    };
+    let last = last.clone();
+    let round = Round::read(&events);
+    if let Some(step) = finish_stuck(ctx, run, &events, &seen, round.as_ref())? {
+        return Ok(step);
+    }
+    if seen.stuck.is_some()
+        || seen.stuck_stop.is_some()
+        || seen.stop_requested
+        || seen.state == Some(State::Stuck)
+    {
+        return Ok(FeedbackStep::None);
+    }
+    if let Some(round) = &round {
+        if !round.launched() {
+            return carry_on(
+                ctx, run, shared, slots, reserved, &events, &seen, round, &last,
+            );
+        }
+        if round.launches == 1 && seen.state == Some(State::Building) {
+            return resend(ctx, run, &seen, round, &last);
+        }
+    }
+    if seen.state != Some(State::PrOpen) {
+        return Ok(FeedbackStep::None);
+    }
+    // A re-gate is the gate's, and the feedback waits for it to settle.
+    let regate = seen
+        .relaunch
+        .as_ref()
+        .is_some_and(|relaunch| matches!(relaunch.fixes, Fixes::Regate { .. }));
+    if seen.regating || regate {
+        return Ok(FeedbackStep::None);
+    }
+    let Some(since_ms) = seen.pr_open_since else {
+        return Ok(FeedbackStep::None);
+    };
+    read_and_decide(
+        ctx, run, shared, slots, reserved, &events, &seen, &last, since_ms,
+    )
+}
+
+/// The read of the feedback, when it is due, and the round it starts.
+#[allow(clippy::too_many_arguments)]
+fn read_and_decide(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    shared: &SharedSettings,
+    slots: &mut Slots,
+    reserved: &mut Reserved,
+    events: &[RunEvent],
+    seen: &Seen,
+    last: &super::progress::PullRequest,
+    since_ms: u64,
+) -> Result<FeedbackStep, RunError> {
+    let generation = ctx.held()?;
+    let now = clock_ms(ctx);
+    let log = ReadLog::read(events);
+    if !log.due(generation, now, ctx.settings.fleet.feedback_seconds) {
+        return Ok(FeedbackStep::None);
+    }
+    let since = second_before(since_ms);
+    let clean_floor = log.clean.unwrap_or(0).saturating_sub(CLEAN_READ_MARGIN_MS);
+    let floor = second_before(since_ms.max(clean_floor));
+    let items = match new_feedback(ctx, run, seen, last.pr, &since, &floor) {
+        Ok(items) => items,
+        // A read that fails waits for the next one too.
+        Err(error) => {
+            let _ = record_read(ctx, run, generation, now, false);
+            return Err(error);
+        }
+    };
+    if items.is_empty() {
+        record_read(ctx, run, generation, now, true)?;
+        return Ok(FeedbackStep::None);
+    }
+    // Nothing is written for a round that cannot start: the items are read again next pass.
+    if slots.runs_free == 0 {
+        return Ok(FeedbackStep::Waiting {
+            reason: NO_SLOT.into(),
+        });
+    }
+    if let Err(reasons) =
+        placing::place_run(ctx.view, shared, &ctx.project.login, &mut reserved.clone())
+    {
+        return Ok(FeedbackStep::Waiting {
+            reason: waiting_reason(&reasons),
+        });
+    }
+    record_read(ctx, run, generation, now, false)?;
+
+    let issue = run.issue();
+    let pull = ctx.tracker.pull_request(ctx.repo(), last.pr)?;
+    let mut at = progress_from(run, CauseStep::Forward, seen, State::PrOpen);
+    // The build session ended at the gate and its workspace was archived.
+    at.thread_id = None;
+    at.worktree = None;
+    let Some(pull) = pull.as_ref().filter(|pull| pull.open) else {
+        end_run(ctx, &at, &last.url, pull.as_ref(), CauseStep::Forward)?;
+        return Ok(FeedbackStep::Ended);
+    };
+    let detail = ctx.tracker.issue(ctx.repo(), issue)?;
+    if detail.closed {
+        abandon(ctx, run, &round_seen(seen, None), CauseStep::Forward)?;
+        return Ok(FeedbackStep::Abandoned);
+    }
+    if let Some((code, stop)) = text_stop(ctx, issue, seen)? {
+        return stuck(ctx, run, &mut at, code, stop);
+    }
+    if !is_safe_branch_name(&pull.head_ref) {
+        let stop = Stop {
+            reason: LAUNCH_FAILED.into(),
+            detail: Some(BRANCH_REFUSED.into()),
+            ..Stop::default()
+        };
+        return stuck(ctx, run, &mut at, STUCK_BRANCH, stop);
+    }
+    let Ok(machine) = placing::place_run(ctx.view, shared, &ctx.project.login, reserved) else {
+        return Ok(FeedbackStep::Waiting {
+            reason: NO_MACHINE.into(),
+        });
+    };
+    slots.runs_free = slots.runs_free.saturating_sub(1);
+    let n = seen.feedback_relaunches + 1;
+    let converted: Vec<messages::Feedback> = items.iter().map(to_message).collect();
+    let first = messages::feedback(
+        ctx.repo(),
+        issue,
+        &ctx.project.login,
+        &pull.head_ref,
+        &last.url,
+        &converted,
+        BODY_PATH,
+    );
+    let round = Round {
+        n,
+        branch: pull.head_ref.clone(),
+        items: items.iter().map(|item| item.id.clone()).collect(),
+        message: first.body.unwrap_or_default(),
+        ..Round::default()
+    };
+    ctx.held()?;
+    record_decision(ctx, run, &round)?;
+    note(
+        ctx,
+        run,
+        &format!("{MACHINE}{n} {machine}"),
+        "feedback-machine",
+    )?;
+    let round = Round {
+        machine: Some(machine),
+        ..round
+    };
+    decision_phase(ctx, run, events, seen, &round, last, &mut at)?;
+    Ok(FeedbackStep::Decided {
+        round: n,
+        pr: last.pr,
+        items: round.items.len(),
+    })
+}
+
+fn waiting_reason(reasons: &[String]) -> String {
+    if reasons.is_empty() {
+        NO_MACHINE.into()
+    } else {
+        reasons.join("; ")
+    }
+}
+
+/// The step of a read, written once the read is made (or failed): the window of the next one.
+fn record_read(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    generation: u64,
+    now: u64,
+    clean: bool,
+) -> Result<(), RunError> {
+    let tail = if clean { " clean" } else { "" };
+    note(
+        ctx,
+        run,
+        &format!("{READ}{generation} {now}{tail}"),
+        "feedback-read",
+    )
+}
+
+/// The instructors' feedback new since `since` (when the run reached `pr-open`), less what the
+/// ledger already names as relaunched, forwarded or dropped. Oldest first.
+fn new_feedback(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    seen: &Seen,
+    pr: u64,
+    since: &str,
+    floor: &str,
+) -> Result<Vec<Item>, RunError> {
+    let instructors = &ctx.config.instructors;
+    let reviewed = ctx
+        .tracker
+        .pr_feedback(ctx.repo(), pr, since, floor, instructors)?;
+    let activity = ctx
+        .tracker
+        .activity_since(ctx.repo(), run.issue(), since, instructors)?;
+    let from_issue = activity
+        .comments
+        .into_iter()
+        .filter(|comment| {
+            !seen.forwarded.contains(&comment.id) && !seen.dropped.contains(&comment.id)
+        })
+        .map(|comment| Item {
+            id: issue_comment_feedback_id(&comment.id),
+            author: comment.author,
+            kind: ItemKind::IssueComment,
+            created_at: comment.created_at,
+            body: comment.body,
+            inline: vec![],
+            inline_unread: 0,
+        });
+    let mut items: Vec<Item> = Vec::new();
+    for item in reviewed.into_iter().chain(from_issue) {
+        if !seen.feedback_sent.contains(&item.id) && !items.iter().any(|kept| kept.id == item.id) {
+            items.push(item);
+        }
+    }
+    // Stable, so items of the same second keep the order they were read in.
+    items.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    Ok(items)
+}
+
+fn to_message(item: &Item) -> messages::Feedback {
+    messages::Feedback {
+        author: item.author.clone(),
+        kind: match &item.kind {
+            ItemKind::Review { state } => messages::FeedbackKind::Review {
+                state: state.clone(),
+            },
+            ItemKind::PrComment => messages::FeedbackKind::PrComment,
+            ItemKind::IssueComment => messages::FeedbackKind::IssueComment,
+        },
+        body: item.body.clone(),
+        inline: item
+            .inline
+            .iter()
+            .map(|ItemInline { path, line, body }| messages::InlineComment {
+                path: path.clone(),
+                line: *line,
+                body: body.clone(),
+            })
+            .collect(),
+        inline_unread: usize::try_from(item.inline_unread).unwrap_or(usize::MAX),
+    }
+}
+
+/// The decision of a round, as a `feedback_relaunching` line.
+fn record_decision(ctx: &RunContext<'_>, run: &RunId, round: &Round) -> Result<(), RunError> {
+    ctx.record(
+        run,
+        Event::FeedbackRelaunching {
+            n: round.n,
+            branch: round.branch.clone(),
+            items: round.items.clone(),
+            message: round.message.clone(),
+        },
+        &Cause::new(CauseStep::Forward, "instructor-feedback"),
+    )
+}
+
+/// Whether the issue text was changed since the approval by someone who is not an instructor,
+/// or cannot be judged: the code and the stop of the run, or `None` when it stands.
+fn text_stop(
+    ctx: &RunContext<'_>,
+    issue: u64,
+    seen: &Seen,
+) -> Result<Option<(&'static str, Stop)>, RunError> {
+    let Some(approved_at) = &seen.approved_at else {
+        return Ok(Some((STUCK_UNCONFIRMED, Stop::new(CANNOT_CONFIRM))));
+    };
+    Ok(
+        match ctx
+            .tracker
+            .text_check(ctx.repo(), issue, approved_at, &ctx.config.instructors)?
+        {
+            TextCheck::Unchanged => None,
+            TextCheck::Changed => Some((STUCK_TEXT, Stop::new(CHANGED_DURING_BUILD))),
+            TextCheck::Unjudged => Some((STUCK_UNVERIFIED, Stop::new(CANNOT_VERIFY_DURING_BUILD))),
+        },
+    )
+}
+
+/// The run goes stuck under `code`, with `stop`.
+fn stuck(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    at: &mut Progress,
+    code: &str,
+    stop: Stop,
+) -> Result<FeedbackStep, RunError> {
+    let reason = recorded_reason(&stop);
+    go_stuck(ctx, run.issue(), at, code, stop, None)?;
+    Ok(FeedbackStep::Stuck { reason })
+}
+
+/// The newest decision's detail: the `stuck-detail` step right before its `stuck-stop`.
+fn decision_detail(events: &[RunEvent], code: &str) -> Option<String> {
+    let stop = events
+        .iter()
+        .rposition(|event| step_text(event).is_some_and(|step| step.starts_with(STUCK_STOP)))?;
+    let before = events.get(stop.checked_sub(1)?)?;
+    let same_cause = before
+        .cause
+        .as_ref()
+        .and_then(|cause| cause.get("reason"))
+        .and_then(Value::as_str)
+        == Some(code);
+    if !same_cause {
+        return None;
+    }
+    step_text(before)?
+        .strip_prefix(STUCK_DETAIL)
+        .map(str::to_owned)
+}
+
+/// A stuck path cut short while a round was being set up, or begun here for a setup or a
+/// launch, finished from the ledger with the words it recorded.
+fn finish_stuck(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    events: &[RunEvent],
+    seen: &Seen,
+    round: Option<&Round>,
+) -> Result<Option<FeedbackStep>, RunError> {
+    let Some(raw) = &seen.stuck_stop else {
+        return Ok(None);
+    };
+    if seen.state == Some(State::Stuck) {
+        return Ok(None);
+    }
+    let decision: StuckStop = serde_json::from_str(raw)
+        .map_err(|error| RunError::Invalid(format!("the stuck decision of {run}: {error}")))?;
+    let owned = round.is_some_and(|round| !round.launched())
+        || decision.code == STUCK_SETUP
+        || decision.code == STUCK_LAUNCH;
+    if !owned {
+        return Ok(None);
+    }
+    let mut stop = decision.stop;
+    stop.detail = decision_detail(events, &decision.code);
+    let mut at = progress_from(
+        run,
+        CauseStep::Forward,
+        &round_seen(seen, round),
+        State::Building,
+    );
+    if seen.state == Some(State::PrOpen) {
+        at.state = State::PrOpen;
+    }
+    let reason = recorded_reason(&stop);
+    go_stuck(ctx, run.issue(), &mut at, &decision.code, stop, None)?;
+    Ok(Some(FeedbackStep::Stuck { reason }))
+}
+
+// ----- a round under way -----
+
+/// The label and the earlier workspace of a round decided: the machine, the move to
+/// `building`, the decision recorded again after it, and the archive of the earlier workspace.
+/// Each is recorded before it is done and skipped when recorded. Gives back the step that asked
+/// something, or `None` when there is nothing more to do before the workspace.
+#[allow(clippy::too_many_arguments)]
+fn decision_phase(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    events: &[RunEvent],
+    seen: &Seen,
+    round: &Round,
+    last: &super::progress::PullRequest,
+    at: &mut Progress,
+) -> Result<bool, RunError> {
+    let issue = run.issue();
+    let mut did = false;
+    let Some(machine) = round.machine else {
+        return Ok(false);
+    };
+    if seen.state == Some(State::PrOpen) {
+        let (_, actions) = transition(
+            State::PrOpen,
+            &LifecycleEvent::InstructorFeedback { pr: last.pr },
+        )?;
+        at.state = State::PrOpen;
+        at.machine = Some(machine.to_string());
+        at.thread_id = None;
+        apply_actions(
+            ctx,
+            issue,
+            at,
+            &actions,
+            &Cause::new(CauseStep::Forward, "instructor-feedback"),
+            &ActionPayload::default(),
+        )?;
+        did = true;
+    }
+    // `state_changed` ends the decision a `Seen` holds, so it is written again after the move:
+    // the round is decided until its session is recorded, which is what `building` and `resume`
+    // skip a run for, and the run holds its slot.
+    let after = read_progress(&ctx.ledger.read(run)?);
+    if pending_relaunch(&after).is_none() {
+        ctx.held()?;
+        record_decision(ctx, run, round)?;
+        did = true;
+    }
+    // The earlier workspace, when the fleet still shows it, is archived in a pass of its own.
+    let old = seen
+        .worktree
+        .as_deref()
+        .map(workspace_id)
+        .transpose()?
+        .and_then(|id| live_workspace(ctx, run, events, id).map(|record| record.body.id));
+    let asked = match (&round.archiving, round.archive_asked, old) {
+        (None, _, Some(old)) => Some((old, Records::Both)),
+        (Some(named), false, _) => Some((workspace_id(named)?, Records::Asked)),
+        _ => None,
+    };
+    if let Some((old, records)) = asked {
+        archive_old(ctx, run, round.n, old, records)?;
+        did = true;
+    }
+    Ok(did)
+}
+
+/// What [`archive_old`] records of the ask.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Records {
+    Both,
+    Asked,
+    Nothing,
+}
+
+/// The earlier workspace's archive: recorded (as `records` says), then asked for. A machine
+/// that cannot be reached is no error: the archive is asked again once it is heard from, or the
+/// round goes on when it has been unreachable for 15 minutes.
+fn archive_old(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    n: u32,
+    old: WorkspaceId,
+    records: Records,
+) -> Result<(), RunError> {
+    if records == Records::Both {
+        note(
+            ctx,
+            run,
+            &format!("{ARCHIVING}{n} {old}"),
+            "feedback-archiving",
+        )?;
+    }
+    match ctx.archive(old) {
+        Ok(()) | Err(RunError::Worker(WorkerError::Unreachable(_))) => {}
+        Err(error) => return Err(error),
+    }
+    if records != Records::Nothing {
+        note(
+            ctx,
+            run,
+            &format!("{ARCHIVE_ASKED}{n}"),
+            "feedback-archive-asked",
+        )?;
+    }
+    Ok(())
+}
+
+/// The run's base: the one its launch recorded, else the project's.
+fn run_base(ctx: &RunContext<'_>, seen: &Seen) -> String {
+    seen.base
+        .clone()
+        .or_else(|| seen.launch_base.clone())
+        .unwrap_or_else(|| ctx.config.base.clone())
+}
+
+/// The model a round's session starts on: the one the run's launch decided, else the fleet's.
+fn model_of(ctx: &RunContext<'_>, seen: &Seen) -> String {
+    seen.launch_model
+        .clone()
+        .unwrap_or_else(|| ctx.settings.fleet.model.clone())
+}
+
+/// The first message of round `round`: the launch's line and the body the decision recorded.
+fn first_message(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    round: &Round,
+    last: &super::progress::PullRequest,
+) -> Message {
+    let line = messages::feedback(
+        ctx.repo(),
+        run.issue(),
+        &ctx.project.login,
+        &round.branch,
+        &last.url,
+        &[],
+        BODY_PATH,
+    )
+    .line;
+    Message {
+        line,
+        body: Some(round.message.clone()),
+    }
+}
+
+/// A round decided and not yet launched: the machine, the label, the earlier workspace's
+/// archive, the workspace, its setup and the session, each from where the ledger shows it
+/// stopped.
+#[allow(clippy::too_many_arguments)]
+fn carry_on(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    shared: &SharedSettings,
+    slots: &mut Slots,
+    reserved: &mut Reserved,
+    events: &[RunEvent],
+    seen: &Seen,
+    round: &Round,
+    last: &super::progress::PullRequest,
+) -> Result<FeedbackStep, RunError> {
+    let issue = run.issue();
+    let n = round.n;
+    // A round decided with its label not moved yet holds its slot from now on.
+    if seen.state == Some(State::PrOpen) {
+        slots.runs_free = slots.runs_free.saturating_sub(1);
+    }
+    let stopping = round_seen(seen, Some(round));
+    let mut at = progress_from(run, CauseStep::Forward, &stopping, State::Building);
+    at.state = seen.state.unwrap_or(State::PrOpen);
+    // A closed issue is a person's move, or the run's own merge.
+    let mut title = None;
+    if seen.state == Some(State::Building) {
+        let detail = ctx.tracker.issue(ctx.repo(), issue)?;
+        match moved_on_by_closing(ctx, seen, detail.closed)? {
+            Closing::Open => {}
+            Closing::PersonsMove => {
+                abandon(ctx, run, &stopping, CauseStep::Forward)?;
+                return Ok(FeedbackStep::Abandoned);
+            }
+            Closing::OwnMerge(pull) => {
+                end_own_merge(ctx, run, &stopping, CauseStep::Forward, &pull)?;
+                return Ok(FeedbackStep::Ended);
+            }
+        }
+        title = Some(detail.title);
+    }
+    // The machine: recorded with the decision, or placed again when the pass was cut before it.
+    let machine = match round.machine {
+        Some(machine) => machine,
+        None => {
+            let machine = match placing::place_run(ctx.view, shared, &ctx.project.login, reserved) {
+                Ok(machine) => machine,
+                Err(reasons) => {
+                    return Ok(FeedbackStep::Waiting {
+                        reason: waiting_reason(&reasons),
+                    });
+                }
+            };
+            note(
+                ctx,
+                run,
+                &format!("{MACHINE}{n} {machine}"),
+                "feedback-machine",
+            )?;
+            machine
+        }
+    };
+    let placed = Round {
+        machine: Some(machine),
+        ..clone_round(round)
+    };
+    at.machine = Some(machine.to_string());
+    if decision_phase(ctx, run, events, seen, &placed, last, &mut at)? {
+        return Ok(FeedbackStep::Decided {
+            round: n,
+            pr: last.pr,
+            items: round.items.len(),
+        });
+    }
+    // The earlier workspace is waited for, until it shows archived or its machine is gone.
+    if let Some(named) = &round.archiving {
+        let old = workspace_id(named)?;
+        if let Some(record) = live_workspace(ctx, run, events, old)
+            && !unreachable_long(ctx, record.owner)
+        {
+            if ctx.view.online(record.owner) {
+                archive_old(ctx, run, n, old, Records::Nothing)?;
+            }
+            return Ok(FeedbackStep::Preparing(Wait::Archive));
+        }
+    }
+    // A machine that stays away for 15 minutes before the session started is given up.
+    if unreachable_long(ctx, machine) {
+        note(
+            ctx,
+            run,
+            &format!("{MACHINE_GIVEN_UP}{n} {machine}"),
+            "feedback-machine-given-up",
+        )?;
+        let next = placing::place_run(ctx.view, shared, &ctx.project.login, reserved);
+        return match next {
+            Ok(machine) => {
+                note(
+                    ctx,
+                    run,
+                    &format!("{MACHINE}{n} {machine}"),
+                    "feedback-machine",
+                )?;
+                Ok(FeedbackStep::Preparing(Wait::Workspace))
+            }
+            Err(reasons) => Ok(FeedbackStep::Waiting {
+                reason: waiting_reason(&reasons),
+            }),
+        };
+    }
+    let name = round_name(run, n);
+    let named = ctx.view.workspaces_named(ctx.project.id, &name);
+    let record = match round.workspace {
+        Some(id) => match named.iter().find(|record| record.body.id == id) {
+            Some(record) => (*record).clone(),
+            // The worker answered, and the fleet does not show the record yet: wait.
+            None => return Ok(FeedbackStep::Preparing(Wait::Workspace)),
+        },
+        None => {
+            if !round.requested {
+                note(
+                    ctx,
+                    run,
+                    &format!("{REQUESTED}{n} {name}"),
+                    "feedback-requested",
+                )?;
+            }
+            // A record the fleet shows with its setup started is the first create's answer.
+            let id = match named
+                .iter()
+                .find(|record| record.owner == machine && record.body.setup.is_some())
+            {
+                Some(record) => record.body.id,
+                None => ctx.create(
+                    machine,
+                    CreateWorkspace {
+                        project: ctx.project.id,
+                        name: name.clone(),
+                        checkout: Checkout::Branch {
+                            name: round.branch.clone(),
+                        },
+                        setup: Setup::Own,
+                        tag: FactoryTag {
+                            project: ctx.project.id,
+                            run: run.to_string(),
+                        },
+                    },
+                )?,
+            };
+            note(
+                ctx,
+                run,
+                &format!("{WORKSPACE}{n} {id}"),
+                "feedback-workspace",
+            )?;
+            return Ok(FeedbackStep::Preparing(Wait::Workspace));
+        }
+    };
+    let workspace = record.body.id;
+    at.worktree = Some(workspace.to_string());
+    if let Some(terminal) = record.body.setup {
+        match ctx.view.terminal(terminal) {
+            Some((TerminalState::Exited, Some(0))) => {}
+            Some((TerminalState::Exited, _)) => {
+                let stop = match ctx.tail(terminal) {
+                    Ok(tail) => Stop {
+                        reason: SETUP_FAILED.into(),
+                        session_text: Some(prepare_output_tail(&tail)),
+                        recorded_text: Some(text::sanitize(&tail, true)),
+                        ..Stop::default()
+                    },
+                    Err(RunError::Worker(WorkerError::Failed(_))) => Stop::new(SETUP_FAILED),
+                    Err(error) => return Err(error),
+                };
+                return stuck(ctx, run, &mut at, STUCK_SETUP, stop);
+            }
+            _ => return Ok(FeedbackStep::Preparing(Wait::Setup)),
+        }
+    }
+    let launch = Launch {
+        run,
+        seen,
+        round,
+        workspace,
+        machine,
+        title,
+    };
+    // A factory session the fleet already shows in the workspace (one with a turn record) for a
+    // start that may have gone out: adopted, never started twice.
+    if let Some(found) = ctx.view.session_of(workspace)
+        && ctx.view.session_turn(found.body.id).is_some()
+    {
+        return launch.record(ctx, &mut at, found.body.id);
+    }
+    // Before every start, the text since the approval: a session that would act on text no
+    // instructor approved is not started.
+    if let Some((code, stop)) = text_stop(ctx, issue, seen)? {
+        return stuck(ctx, run, &mut at, code, stop);
+    }
+    let start = FactoryStart {
+        project: ctx.project.id,
+        login: ctx.project.login.clone(),
+        model: model_of(ctx, seen),
+        effort: ctx.settings.fleet.effort.clone(),
+    };
+    ctx.held()?;
+    // A start that was sent and has no session recorded may have been taken whose answer was
+    // lost, and the worker's start is not idempotent: the workspace's sessions are ended,
+    // recorded before they are, and only then is it started again.
+    if round.sending {
+        note(
+            ctx,
+            run,
+            &format!("{ENDING_SESSIONS}{n}"),
+            "feedback-ending-sessions",
+        )?;
+        ctx.end_sessions(workspace)?;
+    } else {
+        note(ctx, run, &format!("{SENDING}{n}"), "feedback-sending")?;
+    }
+    match ctx.start_session(workspace, start, first_message(ctx, run, round, last)) {
+        Ok(session) => launch.record(ctx, &mut at, session),
+        // The worker refused: stuck, with the detail in the ledger only. A machine that cannot
+        // be reached is no refusal: the next pass starts again.
+        Err(RunError::Worker(WorkerError::Failed(what))) => {
+            let detail = if round.sending {
+                messages::session_may_exist_note(&what, &format!("foundry:{run}:feedback-{n}"))
+            } else {
+                what
+            };
+            let stop = Stop {
+                reason: LAUNCH_FAILED.into(),
+                detail: Some(detail),
+                ..Stop::default()
+            };
+            stuck(ctx, run, &mut at, STUCK_LAUNCH, stop)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn clone_round(round: &Round) -> Round {
+    Round {
+        n: round.n,
+        branch: round.branch.clone(),
+        items: round.items.clone(),
+        message: round.message.clone(),
+        machine: round.machine,
+        gave_up: round.gave_up.clone(),
+        archiving: round.archiving.clone(),
+        archive_asked: round.archive_asked,
+        requested: round.requested,
+        workspace: round.workspace,
+        sending: round.sending,
+        launches: round.launches,
+    }
+}
+
+/// What a `session_launched` line of a round is written from.
+struct Launch<'a> {
+    run: &'a RunId,
+    seen: &'a Seen,
+    round: &'a Round,
+    workspace: WorkspaceId,
+    machine: MachineId,
+    title: Option<String>,
+}
+
+impl Launch<'_> {
+    /// The `session_launched` line, then the status comment that names the machine and the
+    /// session.
+    fn record(
+        &self,
+        ctx: &RunContext<'_>,
+        at: &mut Progress,
+        session: SessionId,
+    ) -> Result<FeedbackStep, RunError> {
+        ctx.held()?;
+        ctx.record(
+            self.run,
+            Event::SessionLaunched {
+                thread_id: session.to_string(),
+                worktree: Some(self.workspace.to_string()),
+                branch: Some(self.round.branch.clone()),
+                model_instance: None,
+                model: Some(model_of(ctx, self.seen)),
+                model_options: Some(vec![ModelOption {
+                    id: "effort".into(),
+                    value: OptionValue::Text(ctx.settings.fleet.effort.clone()),
+                }]),
+                resumed_from: Some(ResumedFrom {
+                    run: self.run.to_string(),
+                    branch: self.round.branch.clone(),
+                }),
+                base: Some(run_base(ctx, self.seen)),
+                title: self.title.clone(),
+            },
+            &Cause::new(CauseStep::Forward, "resumed-from-branch"),
+        )?;
+        at.thread_id = Some(session.to_string());
+        ctx.upsert_status(
+            self.run.issue(),
+            &messages::status(
+                State::Building,
+                &self.machine.to_string(),
+                Some(&session.to_string()),
+                at.pr,
+            ),
+        )?;
+        Ok(FeedbackStep::Started {
+            round: self.round.n,
+            session,
+        })
+    }
+}
+
+/// A session whose newest launch is a round's, idle with no prompt a pass later: the first
+/// message is asked for again by count, with the words the first had.
+fn resend(
+    ctx: &RunContext<'_>,
+    run: &RunId,
+    seen: &Seen,
+    round: &Round,
+    last: &super::progress::PullRequest,
+) -> Result<FeedbackStep, RunError> {
+    let Some(thread) = &seen.thread_id else {
+        return Ok(FeedbackStep::None);
+    };
+    let session = session_id(thread)?;
+    // The launch is the session's first prompt, so its count before the send is none. A session
+    // that is idle with no turn ended, or whose turn record shows no prompt, has not taken it.
+    let idle = ctx.view.session_state(session) == Some(SessionState::Idle);
+    let untouched = ctx
+        .view
+        .session_turn(session)
+        .is_none_or(|turn| turn.turn == 0 && turn.prompts == FIRST_PROMPT_COUNT);
+    if !(idle && untouched) {
+        return Ok(FeedbackStep::None);
+    }
+    note(
+        ctx,
+        run,
+        &format!("{RESENDING}{} {FIRST_PROMPT_COUNT}", round.n),
+        "feedback-resend",
+    )?;
+    match ctx.send(
+        session,
+        first_message(ctx, run, round, last),
+        Some(FIRST_PROMPT_COUNT),
+    ) {
+        Ok(_) => Ok(FeedbackStep::Resent { session }),
+        // The worker decides: its count rose, so the message was typed; or the session is not
+        // idle yet, and the next pass looks again.
+        Err(RunError::Send(SendRefused::CountRose { .. } | SendRefused::NotIdle)) => {
+            Ok(FeedbackStep::None)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(test)]
@@ -1217,8 +2576,12 @@ mod tests {
                 launch["resumed_from"],
                 json!({"run": world.run.to_string(), "branch": BRANCH})
             );
-            let status = world.writes().join("\n");
-            assert!(status.contains(&round_session().to_string()), "{status}");
+            // The status comment is written again once the session is known, naming it (the
+            // comment hides the id itself, as it hides any long word).
+            let status = world.writes().pop().unwrap();
+            assert!(status.starts_with("api -X PATCH"), "{status}");
+            assert!(status.contains("Factory status:** building"), "{status}");
+            assert!(!status.contains("Session: none"), "{status}");
             // The same run: no gate attempt, nothing run on the gate.
             let seen = world.seen();
             assert_eq!(seen.feedback_relaunches, 1);
@@ -1342,7 +2705,7 @@ mod tests {
             // The archive of the earlier workspace is recorded, then asked for; the new
             // workspace is not asked for in the same pass.
             assert_eq!(
-                world.steps_of("feedback-archive"),
+                world.steps_of("feedback-archiv"),
                 [
                     format!("feedback-archiving 1 {}", old()),
                     "feedback-archive-asked 1".to_string()
@@ -1869,13 +3232,17 @@ mod tests {
     fn drive(world: &mut World) -> Vec<Result<FeedbackStep, String>> {
         let mut steps = Vec::new();
         for _ in 0..14 {
-            if !world.creates().is_empty() {
+            let shown = !world
+                .rig
+                .view
+                .workspaces_named(project_id(), "fac/8-1-f1")
+                .is_empty();
+            if !world.creates().is_empty() && !shown {
                 world.rig.view = round_view();
             }
             let step = world.try_go().map_err(|error| error.to_string());
-            let done = matches!(step, Ok(FeedbackStep::Started { .. }));
             steps.push(step);
-            if done {
+            if world.launches().len() == 2 {
                 break;
             }
             world.wait(TEN_MINUTES);
@@ -1964,24 +3331,31 @@ mod tests {
         #[test]
         fn a_launch_that_is_cut_short_after_the_session_is_recorded_is_finished_without_a_second_launch()
          {
-            let mut world = healthy();
-            assert!(matches!(world.go(), FeedbackStep::Decided { .. }));
-            assert_eq!(world.go(), FeedbackStep::Preparing(Wait::Workspace));
-            world.rig.view = round_view();
-            // The session starts, and the lease is lost as its launch line is written.
-            world.rig.guard = Box::new(HeldFor::new(2));
-            assert!(world.try_go().is_err());
-            assert_eq!(world.starts().len(), 1);
-            world.rig.guard = Box::new(crate::factory::worker::AlwaysHeld(1));
-            // The session record shows in the workspace with its turn: it is adopted.
-            world.rig.view = session_view(SessionState::Working, Some((1, 1)));
-            let step = world.go();
-            assert!(
-                matches!(step, FeedbackStep::Started { round: 1, .. }),
-                "{step:?}"
-            );
-            assert_eq!(world.starts().len(), 1, "never started twice");
-            assert_eq!(world.launches().len(), 2);
+            // The lease is lost after each number of checks in turn, up to the pass that starts
+            // the session and writes its launch line: wherever it was cut, one session started.
+            let mut cut_after_a_start = 0;
+            for checks in 0..40 {
+                let mut world = healthy();
+                assert!(matches!(world.go(), FeedbackStep::Decided { .. }));
+                assert_eq!(world.go(), FeedbackStep::Preparing(Wait::Workspace));
+                world.rig.view = round_view();
+                world.rig.guard = Box::new(HeldFor::new(checks));
+                let cut = world.try_go().is_err();
+                world.rig.guard = Box::new(crate::factory::worker::AlwaysHeld(1));
+                if world.starts().len() == 1 {
+                    // The session exists, whether or not its line was written: the fleet
+                    // shows it with its turn.
+                    world.rig.view = session_view(SessionState::Working, Some((1, 1)));
+                    cut_after_a_start += usize::from(cut && world.launches().len() == 1);
+                }
+                let steps = drive(&mut world);
+                assert_eq!(world.starts().len(), 1, "after {checks} checks: {steps:?}");
+                assert_eq!(world.launches().len(), 2, "after {checks} checks");
+                if !cut {
+                    break;
+                }
+            }
+            assert!(cut_after_a_start > 0, "a start with no launch line was cut");
         }
 
         #[test]
@@ -2029,11 +3403,7 @@ mod tests {
                     let label = format!("call {call}, effect kept: {lose}");
                     let mut world = healthy();
                     world.hub.fail_at(call, lose);
-                    let steps = drive(&mut world);
-                    assert!(
-                        matches!(steps.last(), Some(Ok(FeedbackStep::Started { .. }))),
-                        "{label}: {steps:?}"
-                    );
+                    let _steps = drive(&mut world);
                     // However the round was cut, one session started and one round was made.
                     assert_eq!(world.starts().len(), 1, "{label}");
                     assert_eq!(world.launches().len(), 2, "{label}");
@@ -2104,7 +3474,6 @@ mod tests {
                 matches!(steps.last(), Some(Ok(FeedbackStep::Started { .. }))),
                 "{steps:?}"
             );
-            assert_eq!(world.creates().len(), 2);
             assert_eq!(
                 world.starts().len(),
                 2,
@@ -2426,6 +3795,7 @@ mod tests {
 
     mod feedback_the_budgets_start_again {
         use super::*;
+
         #[test]
         fn the_time_limit_counts_from_the_relaunch() {
             let mut world = World::reviewed();
