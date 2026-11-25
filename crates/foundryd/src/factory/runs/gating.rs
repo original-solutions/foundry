@@ -306,6 +306,9 @@ pub const GATE_CREATE_REFUSED: &str = "gate-create-refused ";
 pub const GATE_ARCHIVE_FAILED: &str = "gate-archive-failed ";
 /// How many such failures make a gate workspace one that can never be archived.
 pub const ARCHIVE_TRIES: u32 = 3;
+/// The step that records a gate workspace as left, to be found by `resume::orphans` or a
+/// person: `gate-left <k> <workspace id or -> <why>`, the why being fixed words.
+pub const GATE_LEFT: &str = "gate-left ";
 /// The step of a pass that found a created gate's workspace or setup terminal missing from
 /// the fleet while its machine is online: `gate-unseen <k>`.
 pub const GATE_UNSEEN: &str = "gate-unseen ";
@@ -6721,19 +6724,32 @@ mod tests {
         }
 
         #[test]
-        fn an_archive_answered_as_unknown_counts_as_done() {
+        fn an_archive_answered_as_not_a_live_workspace_counts_as_archived() {
             let (mut rig, run, _hub) = built();
             place(&mut rig, &run, 1, 1);
             show(&mut rig, &run, SessionState::Idle, 1, &[exited(1, 101)]);
             rig.worker.on_tail(Ok(FAIL_TAIL.into()));
-            rig.worker
-                .on_archive(Err(WorkerError::Failed("unknown workspace".into())));
+            rig.worker.on_archive(Err(WorkerError::Failed(format!(
+                "workspace {} is not a live workspace of this machine",
+                gate_ws(1).0
+            ))));
             assert_eq!(go(&rig, &run), GateStep::SentBack { attempt: 1 });
             assert!(has_step(&rig, &run, &format!("{GATE_ARCHIVED}1")));
         }
 
         #[test]
-        fn a_gate_workspace_that_can_never_be_archived_ends_the_run_stuck_after_three_tries() {
+        fn a_workspace_the_view_no_longer_shows_counts_as_archived_with_no_call() {
+            let (mut rig, run, _hub) = built();
+            place(&mut rig, &run, 1, 1);
+            show(&mut rig, &run, SessionState::Idle, 1, &[]);
+            rig.write(&run, Event::StopRequested { by: "tom".into() });
+            assert!(matches!(go(&rig, &run), GateStep::Stuck { .. }));
+            assert_eq!(archived(&rig), vec![]);
+            assert!(has_step(&rig, &run, &format!("{GATE_ARCHIVED}1")));
+        }
+
+        #[test]
+        fn three_refused_archives_leave_the_gate_recorded_and_the_run_carries_on() {
             let (mut rig, run, _hub) = built();
             place(&mut rig, &run, 1, 1);
             show(
@@ -6748,20 +6764,45 @@ mod tests {
                 }],
             );
             refuse_archives(&rig, 10);
-            // It could not run; the archive before the next gate is refused again and again.
             assert_eq!(go(&rig, &run), GateStep::BackingOff { passes_left: 1 });
             assert!(matches!(try_go(&rig, &run), Err(RunError::Worker(_))));
             assert!(matches!(try_go(&rig, &run), Err(RunError::Worker(_))));
-            let step = go(&rig, &run);
-            assert!(matches!(step, GateStep::Stuck { .. }), "{step:?}");
-            assert!(rig.finished(&run));
+            assert_eq!(go(&rig, &run), GateStep::BackingOff { passes_left: 0 });
+            assert!(!rig.finished(&run));
+            assert_eq!(step_count(&rig, &run, GATE_LEFT), 1);
+            assert!(has_step(
+                &rig,
+                &run,
+                &format!("{GATE_LEFT}1 {} ", gate_ws(1).0)
+            ));
             assert!(!has_step(&rig, &run, &format!("{GATE_ARCHIVED}1")));
             assert!(
-                rig.sim
-                    .comments()
+                rig.steps(&run)
                     .iter()
-                    .all(|comment| !comment.contains("busy"))
+                    .filter(|step| step.starts_with(GATE_LEFT))
+                    .all(|step| !step.contains("busy"))
             );
+            // The next gate is placed and the run goes on.
+            show(&mut rig, &run, SessionState::Idle, 1, &[]);
+            rig.worker.on_create(Ok(gate_ws(2)));
+            assert_eq!(go(&rig, &run), GateStep::Running);
+        }
+
+        #[test]
+        fn an_exit_path_whose_archive_is_refused_or_unreachable_records_the_gate_left_once() {
+            for error in [
+                WorkerError::Failed("the worktree is busy".into()),
+                WorkerError::Unreachable("no route".into()),
+            ] {
+                let (mut rig, run, _hub) = built();
+                place(&mut rig, &run, 1, 1);
+                rig.write(&run, Event::StopRequested { by: "tom".into() });
+                rig.worker.on_archive(Err(error));
+                assert!(matches!(go(&rig, &run), GateStep::Stuck { .. }));
+                assert_eq!(step_count(&rig, &run, GATE_LEFT), 1);
+                assert!(!has_step(&rig, &run, &format!("{GATE_ARCHIVED}1")));
+                assert!(!gate_running(&rig.events(&run)));
+            }
         }
 
         #[test]
@@ -6794,34 +6835,80 @@ mod tests {
             let step = go(&rig, &run);
             assert!(matches!(step, GateStep::Stuck { .. }));
             assert_eq!(archived(&rig), vec![]);
-            assert!(has_step(&rig, &run, &format!("{GATE_ARCHIVED}1")));
+            assert_eq!(step_count(&rig, &run, GATE_LEFT), 1);
         }
 
         #[test]
-        fn a_create_that_got_no_answer_is_asked_again_to_find_and_archive_what_it_made() {
+        fn a_gate_is_never_found_or_archived_by_asking_for_it_to_be_made_again() {
+            // After a create that got no answer, on the placement path and on an exit path.
             let (rig, run, _hub) = built();
             rig.worker.on_create(Err(WorkerError::Unreachable(
                 "did not answer in time".into(),
             )));
             assert_eq!(go(&rig, &run), GateStep::BackingOff { passes_left: 1 });
-            // The worker made it; its record is not in the view yet, two passes on.
-            rig.worker.on_create(Ok(gate_ws(1)));
             assert_eq!(go(&rig, &run), GateStep::BackingOff { passes_left: 0 });
-            assert_eq!(creates(&rig), 2);
-            assert_eq!(archived(&rig), vec![gate_ws(1)]);
-            assert!(has_step(&rig, &run, &format!("{GATE_ARCHIVED}1")));
+            assert_eq!(creates(&rig), 1);
+            rig.write(&run, Event::StopRequested { by: "tom".into() });
+            assert!(matches!(go(&rig, &run), GateStep::Stuck { .. }));
+            assert_eq!(creates(&rig), 1);
+            assert_eq!(archived(&rig), vec![]);
+            assert_eq!(step_count(&rig, &run, GATE_LEFT), 1);
         }
 
         #[test]
-        fn a_create_the_worker_refused_has_nothing_to_archive() {
-            let (rig, run, _hub) = built();
+        fn a_create_that_got_no_answer_whose_workspace_later_appears_by_name_is_archived() {
+            let (mut rig, run, _hub) = built();
+            rig.worker.on_create(Err(WorkerError::Unreachable(
+                "did not answer in time".into(),
+            )));
+            assert_eq!(go(&rig, &run), GateStep::BackingOff { passes_left: 1 });
+            show(&mut rig, &run, SessionState::Idle, 1, &[running(1)]);
+            assert_eq!(go(&rig, &run), GateStep::BackingOff { passes_left: 0 });
+            assert_eq!(archived(&rig), vec![gate_ws(1)]);
+            assert_eq!(creates(&rig), 1);
+        }
+
+        #[test]
+        fn a_create_the_worker_refused_that_never_appears_is_recorded_left_and_not_archived() {
+            let (mut rig, run, _hub) = built();
             rig.worker
                 .on_create(Err(WorkerError::Failed("no disk".into())));
             assert_eq!(go(&rig, &run), GateStep::BackingOff { passes_left: 1 });
             assert_eq!(go(&rig, &run), GateStep::BackingOff { passes_left: 0 });
-            assert_eq!(creates(&rig), 1);
-            assert_eq!(archived(&rig), vec![]);
-            assert!(has_step(&rig, &run, &format!("{GATE_ARCHIVED}1")));
+            rig.worker.on_create(Ok(gate_ws(2)));
+            assert_eq!(
+                {
+                    place(&mut rig, &run, 1, 2);
+                    ends(&mut rig, &run, 1, 2, 0, PASS_TAIL)
+                },
+                GateStep::Passed { pr: 12 }
+            );
+            assert_eq!(step_count(&rig, &run, &format!("{GATE_LEFT}1 - ")), 1);
+            assert!(!has_step(&rig, &run, &format!("{GATE_ARCHIVED}1")));
+            assert_eq!(creates(&rig), 2);
+            assert!(!archived(&rig).contains(&gate_ws(1)));
+        }
+
+        #[test]
+        fn a_person_marking_the_pr_ready_while_the_gate_ran_and_a_moved_head_gates_again() {
+            let (mut rig, run, hub) = built();
+            place(&mut rig, &run, 1, 1);
+            hub.set_draft(false);
+            hub.set_head(MOVED);
+            assert_eq!(ends(&mut rig, &run, 1, 1, 0, PASS_TAIL), GateStep::NotReady);
+            assert!(
+                hub.lock().pulls[&12].draft,
+                "put back to draft by the settle path"
+            );
+            assert_eq!(rig.sim.labels(), ["factory:building"]);
+            assert!(!has_step(&rig, &run, "gate-passed "));
+            rig.worker.on_create(Ok(gate_ws(2)));
+            assert_eq!(go(&rig, &run), GateStep::Running);
+            assert!(has_step(
+                &rig,
+                &run,
+                &format!("{GATE_REQUESTED}2 2 {MOVED}")
+            ));
         }
     }
 
