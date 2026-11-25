@@ -32,6 +32,11 @@
 //! reads only the new one's exit. A marker that cannot be parsed is skipped and logged; a
 //! folder or the store that cannot be read fails the create, so it never makes a second
 //! workspace for a tag that may have one.
+//! Which project a workspace was made for is answered from memory by
+//! [`Workspaces::factory_project`]: the markers on disk are read once as the workspaces start,
+//! a create adds the one it writes, and a marker an archive or a failed create removes no
+//! longer answers. A marker that cannot be read or parsed at the start answers none and is
+//! warned of once.
 //! Its setup terminal gets no token in its environment and has git's credential helpers turned
 //! off ([`crate::git_auth::helpers_off_env`]). That is the environment only. The terminal runs
 //! as the daemon's user, so code in it can read what that user can, the machine's secret store
@@ -343,6 +348,85 @@ struct Marker {
     setup: Option<Vec<String>>,
 }
 
+/// The workspace a file named `file` is the factory marker of, `<workspace id>.factory`, if
+/// it is one.
+fn marker_of(file: &OsStr) -> Option<WorkspaceId> {
+    file.to_str()
+        .and_then(|f| f.strip_suffix(".factory"))
+        .and_then(|id| uuid::Uuid::parse_str(id).ok())
+        .map(WorkspaceId)
+}
+
+/// The project each factory marker in a project folder under `worktrees` names, by its
+/// workspace, read as the workspaces start. Entries that are not folders, and files that are no
+/// marker, are skipped. A marker that cannot be read or parsed, and a folder that cannot be
+/// listed, are warned of and answer for nothing; none of them stops the read of the others.
+fn read_marks(worktrees: &Path) -> HashMap<WorkspaceId, ProjectId> {
+    let mut marks = HashMap::new();
+    let folders = match std::fs::read_dir(worktrees) {
+        Ok(folders) => folders,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return marks,
+        Err(error) => {
+            tracing::warn!(folder = %worktrees.display(), %error, "the factory markers cannot be listed");
+            return marks;
+        }
+    };
+    for folder in folders {
+        let folder = match folder {
+            Ok(folder) => folder.path(),
+            Err(error) => {
+                tracing::warn!(folder = %worktrees.display(), %error, "the factory markers cannot be listed");
+                continue;
+            }
+        };
+        let entries = match std::fs::read_dir(&folder) {
+            Ok(entries) => entries,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(folder = %folder.display(), %error, "the factory markers cannot be listed");
+                continue;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    tracing::warn!(folder = %folder.display(), %error, "the factory markers cannot be listed");
+                    continue;
+                }
+            };
+            let Some(id) = marker_of(&entry.file_name()) else {
+                continue;
+            };
+            let path = entry.path();
+            let text = match std::fs::read(&path) {
+                Ok(text) => text,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    tracing::warn!(marker = %path.display(), %error, "a factory marker cannot be read");
+                    continue;
+                }
+            };
+            match serde_json::from_slice::<Marker>(&text) {
+                Ok(marker) => {
+                    marks.insert(id, marker.project);
+                }
+                Err(error) => {
+                    tracing::warn!(marker = %path.display(), %error, "a factory marker cannot be parsed");
+                }
+            }
+        }
+    }
+    marks
+}
+
 /// Whether `branch` is no ordinary branch name and must not reach a command: it is empty, starts
 /// with `-`, holds `..`, or holds anything but letters, digits, `/`, `.`, `_` and `-`, as the
 /// runner's `branchRefused` has it. Git itself refuses more names than this.
@@ -436,6 +520,9 @@ struct Inner {
     /// The workspaces whose worktree an archive is removing, from just before it starts to
     /// after the record says archived ([`Removing`]).
     removing: Mutex<HashSet<WorkspaceId>>,
+    /// The project of each workspace a factory marker of this machine names: read from the
+    /// markers on disk at the start, then kept by [`Inner::mark`] and [`Inner::drop_marker`].
+    factory: Mutex<HashMap<WorkspaceId, ProjectId>>,
 }
 
 impl Workspaces {
@@ -459,6 +546,7 @@ impl Workspaces {
     ) -> Self {
         // Git reads a relative worktree path from the clone, not from here.
         let data = std::path::absolute(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
+        let factory = Mutex::new(read_marks(&data.join("worktrees")));
         Self {
             inner: Arc::new(Inner {
                 me,
@@ -472,8 +560,16 @@ impl Workspaces {
                 projects: Mutex::default(),
                 lifecycle: Mutex::default(),
                 removing: Mutex::default(),
+                factory,
             }),
         }
+    }
+
+    /// The project workspace `id` was made for with a [`FactoryTag`], as its marker says, or
+    /// `None` for a workspace made without one, one whose marker was removed, and one this
+    /// machine knows nothing of. Answered from memory: the disk is not read.
+    pub fn factory_project(&self, id: WorkspaceId) -> Option<ProjectId> {
+        lock(&self.inner.factory).get(&id).copied()
     }
 
     /// These workspaces asking GitHub with the program at `gh` in place of `gh`.
@@ -1227,6 +1323,7 @@ impl Inner {
         };
         let json = serde_json::to_vec(&marker).map_err(io::Error::other)?;
         tokio::fs::write(self.marker_path(project, id), json).await?;
+        lock(&self.factory).insert(id, tag.project);
         Ok(())
     }
 
@@ -1236,7 +1333,9 @@ impl Inner {
 
     /// Removes the marker of workspace `id`; one that cannot be removed is logged with `left`,
     /// what it left behind.
+    /// Either way it no longer answers [`Workspaces::factory_project`].
     async fn drop_marker(&self, project: ProjectId, id: WorkspaceId, left: &str) {
+        lock(&self.factory).remove(&id);
         if let Err(e) = tokio::fs::remove_file(self.marker_path(project, id)).await
             && e.kind() != io::ErrorKind::NotFound
         {
@@ -1262,13 +1361,7 @@ impl Inner {
             Err(e) => return Err(e.into()),
         };
         while let Some(entry) = entries.next_entry().await? {
-            let file = entry.file_name();
-            let Some(id) = file
-                .to_str()
-                .and_then(|f| f.strip_suffix(".factory"))
-                .and_then(|id| uuid::Uuid::parse_str(id).ok())
-                .map(WorkspaceId)
-            else {
+            let Some(id) = marker_of(&entry.file_name()) else {
                 continue;
             };
             let text = match tokio::fs::read(entry.path()).await {
