@@ -212,18 +212,32 @@ impl FleetView {
             .collect()
     }
 
-    /// The session of `workspace` to read, ranked on the state as stored: a factory session (one
-    /// with a turn) comes before any other, so a person's P1 session in the workspace never
-    /// hides the factory session; among those a live one before an ended one; then the highest
-    /// version. An ended session is still answered when it is the best there is.
-    pub fn session_of(&self, workspace: WorkspaceId) -> Option<&Record<Session>> {
-        self.sessions
+    /// The session of `workspace` to read, as seen: ranked on the records as stored, then the
+    /// chosen one put through the offline rule of [`as_seen`], so its state is
+    /// [`SessionState::Unreachable`] while its owner is offline, as [`FleetView::session_state`]
+    /// gives. The rank is a session with a turn, then a live one before an ended one, then the
+    /// highest version; an ended session is still answered when it is the best there is.
+    ///
+    /// A factory session is known only by its turn record ([`FleetView::session_turn`]), which
+    /// its machine first writes after the session's first hook and which syncs apart from the
+    /// session record. Until the view holds it, a factory session ranks like any other session
+    /// of the workspace, so a person's P1 session there can be answered instead. A caller that
+    /// holds the id `start_session` returned (kept in the run's events) reads that session by
+    /// id with [`FleetView::session_state`] and [`FleetView::session_turn`]; this is for
+    /// finding a workspace's session when no id is known.
+    pub fn session_of(&self, workspace: WorkspaceId) -> Option<Record<Session>> {
+        let chosen = self
+            .sessions
             .iter()
             .filter(|r| !r.deleted && r.body.workspace == workspace)
             .max_by_key(|r| {
                 let ended = matches!(r.body.state, SessionState::Finished | SessionState::Failed);
                 (self.turns.contains_key(&r.body.id), !ended, r.version)
-            })
+            })?;
+        match as_seen(AnyRecord::Session(chosen.clone()), &self.online) {
+            AnyRecord::Session(seen) => Some(seen),
+            _ => unreachable!("as_seen keeps the kind of a record"),
+        }
     }
 
     /// The state of `session`, as its owner's record shows it: [`SessionState::Unreachable`]
@@ -558,7 +572,11 @@ impl Worker for FakeWorker {
                 (Some(before), _) => Ok(before),
             });
         if answer.is_ok() {
-            *state.delivered.entry(session).or_insert(0) += 1;
+            // Only a session the fake knows is counted: a scripted answer never brings back
+            // one that was ended, archived or never started.
+            if let Some(n) = state.delivered.get_mut(&session) {
+                *n += 1;
+            }
         }
         answer
     }
@@ -1252,7 +1270,14 @@ mod tests {
         let view = FleetView::builder()
             .online(factory)
             .online(person)
-            .session(session_record(factory, 5, false, 20, 10, SessionState::Idle))
+            .session(session_record(
+                factory,
+                5,
+                false,
+                20,
+                10,
+                SessionState::Idle,
+            ))
             .session(session_record(person, 6, false, 23, 10, SessionState::Idle))
             .build();
         let found = view.session_of(WorkspaceId(id(10))).unwrap();
