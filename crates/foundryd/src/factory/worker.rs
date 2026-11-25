@@ -147,7 +147,11 @@ impl FleetView {
     /// Reads the snapshot from `store`. `online` is the machines heard from, as P1's
     /// `Peers::online` gives them, and `unreachable` how long each offline machine has been
     /// unreachable, measured by the caller on the sleep-counting clock of [`crate::clock`].
-    /// An owner whose records cannot be read is left out, with a warning.
+    ///
+    /// A record this build cannot read fails the whole read, unlike P1's views, which leave
+    /// that owner out. The factory acts on this view, and a view missing one machine's records
+    /// would show its workspaces and sessions as never made, so a pass on it would be
+    /// half-applied. The pass fails instead, and looks again next pass.
     pub fn read(
         store: &Store,
         online: BTreeSet<MachineId>,
@@ -160,14 +164,7 @@ impl FleetView {
         let mut machines: BTreeSet<MachineId> = versions.keys().copied().collect();
         machines.extend(store.factory_versions()?.into_keys());
         for &owner in versions.keys() {
-            let records = match store.since(owner, 0) {
-                Ok(records) => records,
-                Err(error) => {
-                    tracing::warn!("factory: records of {owner} not shown: {error}");
-                    continue;
-                }
-            };
-            for record in records {
+            for record in store.since(owner, 0)? {
                 match record {
                     AnyRecord::Workspace(r) => builder.view.workspaces.push(r),
                     AnyRecord::Session(r) => builder.view.sessions.push(r),
@@ -234,10 +231,7 @@ impl FleetView {
                 let ended = matches!(r.body.state, SessionState::Finished | SessionState::Failed);
                 (self.turns.contains_key(&r.body.id), !ended, r.version)
             })?;
-        match as_seen(AnyRecord::Session(chosen.clone()), &self.online) {
-            AnyRecord::Session(seen) => Some(seen),
-            _ => unreachable!("as_seen keeps the kind of a record"),
-        }
+        Some(self.seen_session(chosen))
     }
 
     /// The state of `session`, as its owner's record shows it: [`SessionState::Unreachable`]
@@ -247,20 +241,13 @@ impl FleetView {
             .sessions
             .iter()
             .find(|r| !r.deleted && r.body.id == session)?;
-        match as_seen(AnyRecord::Session(record.clone()), &self.online) {
-            AnyRecord::Session(seen) => Some(seen.body.state),
-            _ => unreachable!("as_seen keeps the kind of a record"),
-        }
+        Some(self.seen_session(record).body.state)
     }
 
     /// The state and exit code of `terminal`. `None` for one unknown. A terminal whose owner
     /// is offline is unreachable, and a deleted one has exited, as P1 treats it.
     pub fn terminal(&self, terminal: TerminalId) -> Option<(TerminalState, Option<i32>)> {
-        let record = self.terminals.get(&terminal)?;
-        let seen = match as_seen(AnyRecord::Terminal(record.clone()), &self.online) {
-            AnyRecord::Terminal(seen) => seen,
-            _ => unreachable!("as_seen keeps the kind of a record"),
-        };
+        let seen = self.seen_terminal(self.terminals.get(&terminal)?);
         let code = seen.body.exit_code;
         if seen.body.state == TerminalState::Unreachable {
             Some((TerminalState::Unreachable, code))
@@ -268,6 +255,22 @@ impl FleetView {
             Some((TerminalState::Exited, code))
         } else {
             Some((seen.body.state, code))
+        }
+    }
+
+    /// `record` put through the offline rule of [`as_seen`].
+    fn seen_session(&self, record: &Record<Session>) -> Record<Session> {
+        match as_seen(AnyRecord::Session(record.clone()), &self.online) {
+            AnyRecord::Session(seen) => seen,
+            _ => unreachable!("as_seen keeps the kind of a record"),
+        }
+    }
+
+    /// `record` put through the offline rule of [`as_seen`].
+    fn seen_terminal(&self, record: &Record<Terminal>) -> Record<Terminal> {
+        match as_seen(AnyRecord::Terminal(record.clone()), &self.online) {
+            AnyRecord::Terminal(seen) => seen,
+            _ => unreachable!("as_seen keeps the kind of a record"),
         }
     }
 
