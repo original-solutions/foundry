@@ -867,9 +867,10 @@ impl Step<'_, '_> {
         //   call's error, or its own after an `Ok` (GitHub is down). One merged or closed
         //   meanwhile ends the run as below. After an `Ok`, or as a draft now, it goes on.
         //   After a `gh` failure that got no answer from GitHub (`OtherKind::NoAnswer`, which
-        //   `github::gh::finish` tells from a refusal) it is that error (a pull request that never drafts is ended by `limits.minutes`). One
-        //   open and not a draft is stuck in the runner's words (GitHub answered and the call
-        //   was refused), and one gone is stuck as one that does not exist.
+        //   `github::gh::finish` tells from a refusal) it is that error (a pull request that
+        //   never drafts is ended by `limits.minutes`). One open and not a draft is stuck in the
+        //   runner's words (GitHub answered and the call was refused), and one gone is stuck as
+        //   one that does not exist.
         if pull.open && !pull.is_draft {
             let failed = match ctx.mark_pr_draft(pr) {
                 Ok(()) => None,
