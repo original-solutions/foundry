@@ -196,6 +196,12 @@ for command do
 done
 printf 'setup passed\n'"#;
 
+/// [`SETUP_LIMITED`], for tests that run it and read the lines it prints, such as the gate's.
+#[cfg(test)]
+pub(crate) fn setup_limited() -> &'static str {
+    SETUP_LIMITED
+}
+
 /// Prints the reason given after it and fails.
 const SETUP_UNREADABLE: &str = r#"printf 'setup failed: %s\n' "$1"; exit 1"#;
 

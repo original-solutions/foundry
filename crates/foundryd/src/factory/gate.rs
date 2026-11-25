@@ -907,9 +907,15 @@ mod tests {
             let commands = ["sleep 3187"];
             let (tail, code) = run_setup("sleep() { :; }", &commands);
             assert_eq!(code, TIMED_OUT, "{tail:?}");
+            // Its output is not asserted: some shells print a line of their own for the kill.
+            let GateResult::Failed { command, how, .. } =
+                result(TerminalState::Exited, Some(code), &tail, &strs(&commands))
+            else {
+                panic!("not a failure: {tail:?}");
+            };
             assert_eq!(
-                result(TerminalState::Exited, Some(code), &tail, &strs(&commands)),
-                failed("sleep 3187", RAN_TOO_LONG, ""),
+                (command.as_deref(), how.as_str()),
+                (Some("sleep 3187"), RAN_TOO_LONG),
                 "{tail:?}"
             );
         }
