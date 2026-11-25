@@ -204,6 +204,9 @@ struct Inner {
     /// Tests: how many of the next reads of a `session_turn` record fail.
     #[cfg(test)]
     fail_turn_reads: std::sync::atomic::AtomicUsize,
+    /// Tests: how many of the next scans of workspace records by the sweeper fail.
+    #[cfg(test)]
+    fail_sweep_reads: std::sync::atomic::AtomicUsize,
     /// Tests: how many of the next reads of a terminal's exit fail.
     #[cfg(test)]
     fail_exit_reads: std::sync::atomic::AtomicUsize,
@@ -265,6 +268,8 @@ impl Sessions {
                 fail_turn_writes: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(test)]
                 fail_turn_reads: std::sync::atomic::AtomicUsize::new(0),
+                #[cfg(test)]
+                fail_sweep_reads: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(test)]
                 fail_exit_reads: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(test)]
@@ -560,7 +565,7 @@ impl Inner {
                 Err(error) => {
                     tracing::error!(%error, "the sessions from before this daemon started cannot be read, so none is taken up");
                     // The tallies do not depend on it.
-                    self.load_behind().await;
+                    self.load_behind(None).await;
                     return;
                 }
             }
@@ -572,7 +577,7 @@ impl Inner {
             }
         }
         // A tally a daemon before this one left ahead of its record is written by the sweeper.
-        self.load_behind().await;
+        self.load_behind(None).await;
     }
 
     /// This machine's sessions that are not deleted, have not failed and, when finished, still

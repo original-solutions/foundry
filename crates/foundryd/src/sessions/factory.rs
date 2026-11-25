@@ -872,23 +872,8 @@ impl Inner {
     /// session whose workspace was archived. A step that fails is tried again at the next look,
     /// and is logged only the first time in a row.
     async fn sweep_once(&self, cursor: &mut u64, warned: &mut Warned) {
-        self.load_behind().await;
-        let (me, from) = (self.me, *cursor);
-        let read = self
-            .on_store(move |store| {
-                let mut newest = from;
-                let mut archived = Vec::new();
-                for record in store.since(me, from)? {
-                    newest = newest.max(record.version());
-                    if let AnyRecord::Workspace(r) = record
-                        && r.deleted
-                    {
-                        archived.push(r.body.id);
-                    }
-                }
-                Ok((newest, archived))
-            })
-            .await;
+        self.load_behind(Some(&mut warned.load)).await;
+        let read = self.scan_workspaces(*cursor).await;
         match read {
             Ok((newest, archived)) => {
                 warned.read.reset();
@@ -907,6 +892,30 @@ impl Inner {
         }
         self.flush_behind(warned).await;
         self.sweep_ended(warned).await;
+    }
+
+    /// The workspace records this machine wrote since version `from`: the newest version read,
+    /// and the workspaces among them that are archived.
+    async fn scan_workspaces(&self, from: u64) -> Result<(u64, Vec<WorkspaceId>), SessionError> {
+        #[cfg(test)]
+        if super::take_one(&self.fail_sweep_reads) {
+            return Err(super::busy().into());
+        }
+        let me = self.me;
+        self.on_store(move |store| {
+            let mut newest = from;
+            let mut archived = Vec::new();
+            for record in store.since(me, from)? {
+                newest = newest.max(record.version());
+                if let AnyRecord::Workspace(r) = record
+                    && r.deleted
+                {
+                    archived.push(r.body.id);
+                }
+            }
+            Ok((newest, archived))
+        })
+        .await
     }
 
     /// Remembers the archived workspaces among `archived` that hold a factory session.
@@ -1124,6 +1133,7 @@ struct Warned {
     read: super::Backoff,
     remove: super::Backoff,
     flush: super::Backoff,
+    load: super::Backoff,
 }
 
 impl Warned {
@@ -1132,6 +1142,7 @@ impl Warned {
             read: super::Backoff::new(),
             remove: super::Backoff::new(),
             flush: super::Backoff::new(),
+            load: super::Backoff::new(),
         }
     }
 }
