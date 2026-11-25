@@ -2,10 +2,12 @@
 //!
 //! The worker routes are what a run asks of the machine that holds its workspace or session.
 //! Each is a `POST` that answers only a call another machine carried here, marked
-//! [`CARRIED`]; any other request, a browser's included, is `404` as for no route, before its
-//! body is read. Called on a machine that does not own what it names, a route is carried to its
-//! owner by [`carry`](super::carry), and arrives there marked. A carried call for something this
-//! machine does not own is refused as P1's carried routes refuse one: `404`.
+//! [`CARRIED`]. Any other request is `404` as for no route, before its body is read: one with no
+//! mark, on any machine, and one a browser sent, which says so with an `Origin` or `Sec-Fetch-`
+//! header that a page cannot leave out. The carry layer never carries these routes. A run
+//! carries its own call with [`call`], which sends it to the machine that owns what it names.
+//! A carried call for something this machine does not own is `404`, except a message, which is
+//! `409` with the reason `no_such_session`.
 //!
 //! - `POST /api/factory/workspaces` `{machine, project, name, checkout, setup, tag}`: makes a
 //!   workspace on `machine` with
@@ -13,8 +15,10 @@
 //!   second create with the same `tag` and `name` answers with the first workspace. A workspace
 //!   made whose setup could not be started is still `201`, with an `error` beside the `id`.
 //! - `POST /api/workspaces/{id}/factory/session` `{project, login, model, effort, message}`:
-//!   starts a factory session in the workspace on `message`, `201 {id}`. A login this machine
-//!   holds no token for is `422`.
+//!   starts a factory session in the workspace on `message`, `201 {id}`. While a factory session
+//!   of the project runs in the workspace, it is `200 {id}` with that session, and nothing
+//!   starts, so a start sent again after its answer was lost starts no second session. A login
+//!   this machine holds no token for is `422`.
 //! - `POST /api/workspaces/{id}/factory/end`: ends each factory session of the workspace,
 //!   `204`. A forced archive is P1's carried archive route.
 //! - `POST /api/sessions/{id}/factory/message` `{message, only_if_prompts}`: sends `message` to
@@ -23,32 +27,39 @@
 //! - `POST /api/sessions/{id}/factory/turn` `{turn}`: `200 {message, question}`, the turn's
 //!   final message and the question that waits, or `404` while the turn is not written.
 //! - `POST /api/terminals/{id}/tail`: the end of the terminal's output as plain text, at most
-//!   [`TAIL_LIMIT`] bytes.
+//!   [`TAIL_LIMIT`] bytes. A session's terminal has none: it is `404`, and a session is read
+//!   through its turns.
 //!
 //! A message is `{line, body}`: one line under [`LINE_LIMIT`] characters with no control
 //! character, and a body of at most [`BODY_LIMIT`] bytes with no NUL, or `null`. Anything else is
 //! `422`, and nothing is typed.
 //!
-//! No answer holds a token: a session's token is only in its child's environment, a turn's
-//! message is kept with known secrets hidden, and errors and the tail go through [`redact`].
+//! No answer holds a token. A token is only in a session's child's environment, and a session's
+//! terminal has no tail. A turn's message is kept with the known secrets hidden. A setup or gate
+//! terminal holds no token, and its tail, like every error, has the passwords of URLs hidden by
+//! [`redact`] before it is cut.
 
 use axum::Json;
 use axum::Router;
+use axum::body::Bytes;
 use axum::extract::{Path, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use foundry_proto::ids::{MachineId, ProjectId, SessionId, TerminalId, WorkspaceId};
+use foundry_proto::state::SessionState;
 use serde::Deserialize;
 
-use super::{Api, ApiError, Body, created, error, no_route, on_store, parse_id};
+use super::{
+    Api, ApiError, Body, carry, created, error, no_route, on_store, parse_id, unprocessable,
+};
 use crate::factory::messages::{BODY_LIMIT, LINE_LIMIT, Message};
 use crate::git_auth::NoToken;
 use crate::secrets::redact;
 use crate::sessions::SessionError;
 use crate::sessions::factory::{FactoryStart, SendRefused};
-use crate::sync::call::CARRIED;
+use crate::sync::call::{Answer, CARRIED, CallError};
 use crate::workspaces::{Checkout, FactoryTag, Setup, WorkspaceError};
 
 /// The most bytes of a terminal's tail answered.
@@ -83,13 +94,49 @@ fn worker() -> Router<Api> {
         .route_layer(middleware::from_fn(only_carried))
 }
 
-/// Lets through only a request marked [`CARRIED`]; any other is answered as no route.
+/// Lets through only a request marked [`CARRIED`] that no browser sent; any other is answered
+/// as no route. A carried call is made by the daemon's own HTTP client, which sends no `Origin`
+/// and no `Sec-Fetch-` header; a browser sends them with every `POST`, and a page cannot remove
+/// them.
 async fn only_carried(request: Request, next: Next) -> Response {
-    if request.headers().contains_key(CARRIED) {
+    let headers = request.headers();
+    let from_browser = headers.contains_key(header::ORIGIN)
+        || headers
+            .keys()
+            .any(|name| name.as_str().starts_with("sec-fetch-"));
+    if headers.contains_key(CARRIED) && !from_browser {
         next.run(request).await
     } else {
         no_route().await
     }
+}
+
+/// Carries a run's call to the worker route `path`, with `body` as JSON when it has one, to the
+/// machine that owns what the path names, and gives that machine's answer: the machine a create
+/// names, or the owner of the workspace's, the session's or the terminal's record. `None` when
+/// that is this machine, or no record names another: the run then acts here. A path that is no
+/// worker route is refused, and sent nowhere.
+pub async fn call(api: &Api, path: &str, body: &[u8]) -> Result<Option<Answer>, CallError> {
+    if !carry::is_worker(path) {
+        return Err(CallError::Refused(format!(
+            "{path:?} is not a worker route"
+        )));
+    }
+    let body = Bytes::copy_from_slice(body);
+    let owner = carry::worker_owner(api, path, &body).await.map_err(|e| {
+        CallError::Refused(format!(
+            "the owner could not be read: {}",
+            redact(&e.to_string())
+        ))
+    })?;
+    let Some(owner) = owner else {
+        return Ok(None);
+    };
+    let content_type = (!body.is_empty()).then_some("application/json");
+    api.peers
+        .call(owner, path, content_type, &body)
+        .await
+        .map(Some)
 }
 
 /// A message as a call carries it.
@@ -124,10 +171,6 @@ impl Sent {
         }
         Ok(Message { line, body })
     }
-}
-
-fn unprocessable(message: String) -> ApiError {
-    ApiError::Rejected(StatusCode::UNPROCESSABLE_ENTITY, message)
 }
 
 // --- workspaces ---
@@ -226,17 +269,45 @@ async fn start(
         model: start.model,
         effort: start.effort,
     };
-    let sessions = api.sessions.clone();
-    let session = api
+    let (sessions, store, me) = (api.sessions.clone(), api.store.clone(), api.peers.me());
+    // The workspace's lifecycle lock is held from the look to the start, so two starts of one
+    // workspace never both find none running.
+    let started = api
         .workspaces
         .start_in(id, move |worktree| async move {
+            let running = sessions.factory_sessions(factory.project);
+            let records = on_store(&store, move |store| store.sessions_of(me)).await?;
+            let found = records.into_iter().find(|record| {
+                record.body.workspace == id
+                    && running.contains(&record.body.id)
+                    && !matches!(
+                        record.body.state,
+                        SessionState::Finished | SessionState::Failed
+                    )
+            });
+            if let Some(record) = found {
+                return Ok(Started::Running(record.body.id));
+            }
             sessions
                 .start_factory(id, &worktree, factory, first)
                 .await
+                .map(Started::New)
                 .map_err(start_refused)
         })
         .await?;
-    Ok(created(session))
+    Ok(match started {
+        Started::New(session) => created(session),
+        Started::Running(session) => {
+            Json(serde_json::json!({ "id": session.to_string() })).into_response()
+        }
+    })
+}
+
+/// What a factory start did.
+enum Started {
+    New(SessionId),
+    /// A factory session of the project already ran in the workspace.
+    Running(SessionId),
 }
 
 /// Why a factory start failed, as the caller is told it.
@@ -344,15 +415,32 @@ async fn turn(
 
 async fn tail(State(api): State<Api>, Path(id): Path<String>) -> Result<Response, ApiError> {
     let id = parse_id(&id, "terminal", TerminalId)?;
-    let text = redact(&api.terminals.tail(id, TAIL_LIMIT).await?);
-    // Hiding a URL's password can lengthen the text, as `a@` becomes `***@`.
-    let text = last_bytes(&text, TAIL_LIMIT).to_owned();
+    let me = api.peers.me();
+    let a_session = on_store(&api.store, move |store| store.sessions_of(me))
+        .await?
+        .iter()
+        .any(|record| record.body.terminal == id);
+    if a_session {
+        return Err(ApiError::NotFound(format!(
+            "terminal {id} is a session's, which has no tail: read its turns"
+        )));
+    }
+    let fetched = api.terminals.tail(id, 2 * TAIL_LIMIT).await?;
+    let text = shown_tail(&fetched);
     Ok((
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
         text,
     )
         .into_response())
+}
+
+/// The tail answered of `fetched`, a terminal's last `2 * TAIL_LIMIT` bytes at most: the
+/// passwords of URLs hidden, then cut to its last [`TAIL_LIMIT`] bytes. Hiding before the cut
+/// sees each URL whole unless its `://` is more than [`TAIL_LIMIT`] bytes before its password.
+/// Hiding can also lengthen the text, as `a@` becomes `***@`.
+fn shown_tail(fetched: &str) -> String {
+    last_bytes(&redact(fetched), TAIL_LIMIT).to_owned()
 }
 
 /// The last `max` bytes of `text` at most, cut on a character boundary.

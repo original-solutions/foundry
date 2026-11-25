@@ -5,11 +5,6 @@
 //! - `POST /api/workspaces/{id}/sessions`, `/shells` and `/archive` for a workspace another
 //!   machine owns.
 //! - `POST /api/terminals/{id}/close` for a terminal another machine owns.
-//! - The factory's worker routes ([`super::factory`]): `POST /api/factory/workspaces` whose
-//!   `machine` names another machine, `/api/workspaces/{id}/factory/session` and `/end` for a
-//!   workspace another machine owns, `/api/sessions/{id}/factory/message` and `/turn` for a
-//!   session another machine owns, as its session record says, and `/api/terminals/{id}/tail`
-//!   for a terminal another machine owns. A tail comes back as the text it is.
 //!
 //! Each goes to its owner over [`Peers::call`](crate::sync::Peers::call), its body passed as
 //! bytes, and the owner's status and body come back unchanged. A call for a machine not in the
@@ -18,6 +13,12 @@
 //! was sent may have run there, and is `504`. A request marked [`CARRIED`] arrived from another
 //! machine: it runs here, where a handler refuses anything this machine does not own, and is
 //! never carried on. Every other request, and one that names nothing elsewhere, runs here.
+//!
+//! The factory's worker routes ([`super::factory`]) are carried too, but never by this layer: a
+//! request to one runs here, where it is `404` unless marked. A run carries its own call with
+//! [`super::factory::call`], which finds the owner as this layer does: the machine a factory
+//! create names, and the owner of the workspace, the terminal or, through its session record,
+//! the session the path names.
 //!
 //! A create carried to a machine over its limits is still made there, and its `201` gets the
 //! `warning` this machine gives of it, as a create made here does.
@@ -31,6 +32,7 @@ use foundry_proto::ids::{MachineId, SessionId, TerminalId, WorkspaceId};
 use serde::Deserialize;
 
 use super::{Api, ApiError, error, on_store, redact};
+use crate::store::StoreError;
 use crate::sync::call::{Answer, CARRIED, CallError};
 
 /// The most bytes of a body carried, as axum's own default body limit.
@@ -39,33 +41,54 @@ const BODY_LIMIT: usize = 2 * 1024 * 1024;
 /// What a carried route acts on.
 enum Target {
     Create,
-    /// A factory create, carried to the machine it names as a create is, with no warning.
-    FactoryCreate,
     Workspace(WorkspaceId),
-    Session(SessionId),
     Terminal(TerminalId),
+    /// A factory create, for the machine it names.
+    FactoryCreate,
+    /// A factory session start or end in a workspace.
+    FactoryWorkspace(WorkspaceId),
+    /// A message to a factory session, or a read of its turn.
+    Session(SessionId),
+    /// A read of a terminal's tail.
+    Tail(TerminalId),
 }
 
-/// Whether a `POST` to `path` is a route this layer carries: the only routes a carried call
-/// may name.
+impl Target {
+    /// Whether it is a factory worker route, which only a run carries.
+    fn is_worker(&self) -> bool {
+        matches!(
+            self,
+            Target::FactoryCreate
+                | Target::FactoryWorkspace(_)
+                | Target::Session(_)
+                | Target::Tail(_)
+        )
+    }
+}
+
+/// Whether a `POST` to `path` is a route a carried call may name: one this layer carries, or a
+/// worker route a run carries.
 pub(crate) fn carries(path: &str) -> bool {
     target(path).is_some()
 }
 
-/// The target of a `POST` to `path`, when it is a route this layer carries.
+/// The target of a `POST` to `path`, when it is a route a carried call may name.
 fn target(path: &str) -> Option<Target> {
     let parts: Vec<&str> = path.strip_prefix("/api/")?.split('/').collect();
     match parts.as_slice() {
         ["workspaces"] => Some(Target::Create),
-        ["factory", "workspaces"] => Some(Target::FactoryCreate),
-        ["workspaces", id, "sessions" | "shells" | "archive"]
-        | ["workspaces", id, "factory", "session" | "end"] => {
+        ["workspaces", id, "sessions" | "shells" | "archive"] => {
             Some(Target::Workspace(WorkspaceId(id.parse().ok()?)))
+        }
+        ["terminals", id, "close"] => Some(Target::Terminal(TerminalId(id.parse().ok()?))),
+        ["factory", "workspaces"] => Some(Target::FactoryCreate),
+        ["workspaces", id, "factory", "session" | "end"] => {
+            Some(Target::FactoryWorkspace(WorkspaceId(id.parse().ok()?)))
         }
         ["sessions", id, "factory", "message" | "turn"] => {
             Some(Target::Session(SessionId(id.parse().ok()?)))
         }
-        ["terminals", id, "close" | "tail"] => Some(Target::Terminal(TerminalId(id.parse().ok()?))),
+        ["terminals", id, "tail"] => Some(Target::Tail(TerminalId(id.parse().ok()?))),
         _ => None,
     }
 }
@@ -74,11 +97,10 @@ pub(super) async fn carry(State(api): State<Api>, request: Request, next: Next) 
     if request.method() != Method::POST || request.headers().contains_key(CARRIED) {
         return next.run(request).await;
     }
-    let Some(target) = target(request.uri().path()) else {
+    let Some(target) = target(request.uri().path()).filter(|target| !target.is_worker()) else {
         return next.run(request).await;
     };
     let create = matches!(target, Target::Create);
-    let text = request.uri().path().ends_with("/tail");
     let (parts, body) = request.into_parts();
     let Ok(body) = axum::body::to_bytes(body, BODY_LIMIT).await else {
         return error(
@@ -89,7 +111,7 @@ pub(super) async fn carry(State(api): State<Api>, request: Request, next: Next) 
     let owner = match owner(&api, target, &body).await {
         Ok(Some(owner)) => owner,
         Ok(None) => return next.run(Request::from_parts(parts, Body::from(body))).await,
-        Err(e) => return e.into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
     let content_type = parts
         .headers
@@ -108,7 +130,7 @@ pub(super) async fn carry(State(api): State<Api>, request: Request, next: Next) 
         .call(owner, parts.uri.path(), content_type, &body)
         .await
     {
-        Ok(answer) => answered(warned(answer, warning), text),
+        Ok(answer) => answered(warned(answer, warning)),
         Err(refused) => not_carried(&refused),
     }
 }
@@ -128,8 +150,26 @@ fn warned(answer: Answer, warning: Option<String>) -> Answer {
     }
 }
 
+/// Whether a `POST` to `path` is a factory worker route.
+pub(super) fn is_worker(path: &str) -> bool {
+    target(path).is_some_and(|target| target.is_worker())
+}
+
+/// The other machine that owns what the worker route `path` names, with `body`, or `None` when
+/// it runs here. A path that is no worker route is `None`.
+pub(super) async fn worker_owner(
+    api: &Api,
+    path: &str,
+    body: &Bytes,
+) -> Result<Option<MachineId>, StoreError> {
+    match target(path).filter(Target::is_worker) {
+        Some(target) => owner(api, target, body).await,
+        None => Ok(None),
+    }
+}
+
 /// The other machine `target` belongs to, or `None` when it runs here.
-async fn owner(api: &Api, target: Target, body: &Bytes) -> Result<Option<MachineId>, ApiError> {
+async fn owner(api: &Api, target: Target, body: &Bytes) -> Result<Option<MachineId>, StoreError> {
     let me = api.peers.me();
     match target {
         Target::Create | Target::FactoryCreate => {
@@ -145,10 +185,13 @@ async fn owner(api: &Api, target: Target, body: &Bytes) -> Result<Option<Machine
                 .and_then(|picked| picked.machine)
                 .filter(|machine| *machine != me))
         }
-        Target::Workspace(id) => Ok(on_store(&api.store, move |store| store.workspace(id))
-            .await?
-            .filter(|record| !record.deleted && record.owner != me)
-            .map(|record| record.owner)),
+        Target::Workspace(id) | Target::FactoryWorkspace(id) => {
+            Ok(on_store(&api.store, move |store| store.workspace(id))
+                .await?
+                .filter(|record| !record.deleted && record.owner != me)
+                .map(|record| record.owner))
+        }
+        // The store reads sessions by owner only, so each other owner's are looked through.
         Target::Session(id) => Ok(on_store(&api.store, move |store| {
             for owner in store.versions()?.into_keys().filter(|owner| *owner != me) {
                 if store.sessions_of(owner)?.iter().any(|s| s.body.id == id) {
@@ -158,13 +201,12 @@ async fn owner(api: &Api, target: Target, body: &Bytes) -> Result<Option<Machine
             Ok(None)
         })
         .await?),
-        Target::Terminal(id) => Ok(api.peers.owner_of(id).await?),
+        Target::Terminal(id) | Target::Tail(id) => Ok(api.peers.owner_of(id).await?),
     }
 }
 
-/// The owner's answer, as it gave it: a success of a route that answers `text` as plain text,
-/// any other as JSON.
-fn answered(answer: Answer, text: bool) -> Response {
+/// The owner's answer, as it gave it.
+fn answered(answer: Answer) -> Response {
     let Ok(status) = StatusCode::from_u16(answer.status) else {
         return error(
             StatusCode::BAD_GATEWAY,
@@ -174,12 +216,12 @@ fn answered(answer: Answer, text: bool) -> Response {
     if answer.body.is_empty() {
         return status.into_response();
     }
-    let content_type = if text && status.is_success() {
-        "text/plain; charset=utf-8"
-    } else {
-        "application/json"
-    };
-    (status, [(header::CONTENT_TYPE, content_type)], answer.body).into_response()
+    (
+        status,
+        [(header::CONTENT_TYPE, "application/json")],
+        answer.body,
+    )
+        .into_response()
 }
 
 /// The answer to a call that its owner did not answer.
