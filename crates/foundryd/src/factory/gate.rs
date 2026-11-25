@@ -40,8 +40,7 @@ const RETRY_PASSES: [u32; 4] = [1, 2, 4, 8];
 
 /// The `k`-th gate workspace's name: `fac/<N>-<attempt>-g<k>`.
 pub fn name(run: &RunId, k: u32) -> String {
-    let _ = (run, k);
-    todo!()
+    format!("fac/{}-{}-g{k}", run.issue(), run.attempt())
 }
 
 /// The workspace for the `k`-th gate of `run` on commit `sha` of `project`: detached at `sha`
@@ -54,10 +53,26 @@ pub fn request(
     run: &RunId,
     k: u32,
 ) -> CreateWorkspace {
-    let _ = (config, project, sha, run, k);
-    let _ = (Checkout::Commit { sha: String::new() }, Setup::None);
-    let _: Option<FactoryTag> = None;
-    todo!()
+    CreateWorkspace {
+        project,
+        name: name(run, k),
+        checkout: Checkout::Commit {
+            sha: sha.to_string(),
+        },
+        setup: Setup::Commands {
+            commands: config
+                .provision
+                .iter()
+                .chain(&config.gate)
+                .cloned()
+                .collect(),
+            limit_secs: COMMAND_LIMIT.as_secs(),
+        },
+        tag: FactoryTag {
+            project,
+            run: run.to_string(),
+        },
+    }
 }
 
 /// What a gate's setup terminal says about the gate.
@@ -76,30 +91,134 @@ pub enum GateResult {
 }
 
 /// The gate's result from its setup terminal's state, exit code and plain-text tail.
+///
+/// A terminal that has not exited is running, and so is one whose machine cannot be reached:
+/// [`could_not_run`] says when that has gone on too long. An exit of 0 is a pass. Any other
+/// exit is a failure, `provision` included, and [`TIMED_OUT`] reads as [`RAN_TOO_LONG`]. The
+/// failing command and its output are read from the tail, as `workspaces` prints them: `$
+/// <command>` before each command, and `setup failed: <command> exited <code>` (or `ran past
+/// <limit> s and was stopped`) after the one that failed.
 pub fn result(state: TerminalState, exit_code: Option<i32>, tail: &str) -> GateResult {
-    let _ = (state, exit_code, tail);
-    todo!()
+    match state {
+        TerminalState::Running | TerminalState::Unreachable => return GateResult::Running,
+        TerminalState::Exited => {}
+    }
+    let how = match exit_code {
+        Some(0) => return GateResult::Passed,
+        Some(TIMED_OUT) => RAN_TOO_LONG.to_string(),
+        Some(code) => format!("exit code {code}"),
+        None => "ended with no exit code".to_string(),
+    };
+    let (command, output) = match exit_code.and_then(|code| failure_line(tail, code)) {
+        Some((at, command)) => {
+            let output = output_of(&tail[..at], &command).to_string();
+            (command, output)
+        }
+        None => last_started(tail),
+    };
+    GateResult::Failed {
+        command,
+        how,
+        output,
+    }
+}
+
+/// What starts the line the setup prints after the command that failed.
+const FAILED_PREFIX: &str = "setup failed: ";
+
+/// The byte offset of the setup's last line, `setup failed: <command> …`, and the command it
+/// names. The line is the last thing the setup prints, so it is looked for from the end, and
+/// only one whose ending fits `code` counts: output that fakes such a line earlier is passed
+/// over.
+fn failure_line(tail: &str, code: i32) -> Option<(usize, String)> {
+    let mut end = tail.len();
+    while let Some(at) = tail[..end].rfind(FAILED_PREFIX) {
+        end = at;
+        if at > 0 && !tail[..at].ends_with('\n') {
+            continue;
+        }
+        let rest = tail[at + FAILED_PREFIX.len()..].trim_end_matches('\n');
+        if let Some(command) = command_before_ending(rest, code) {
+            return Some((at, command.to_string()));
+        }
+    }
+    None
+}
+
+/// `rest` without the ending the setup prints for a command that ended with `code`.
+fn command_before_ending(rest: &str, code: i32) -> Option<&str> {
+    if let Some(command) = rest.strip_suffix(&format!(" exited {code}")) {
+        return Some(command);
+    }
+    if code != TIMED_OUT {
+        return None;
+    }
+    let before = rest.strip_suffix(" s and was stopped")?;
+    let without_limit = before.trim_end_matches(|c: char| c.is_ascii_digit());
+    if without_limit.len() == before.len() {
+        return None;
+    }
+    without_limit.strip_suffix(" ran past ")
+}
+
+/// The output of `command` in `before`, the tail up to the setup's last line: what follows the
+/// last `$ <command>` line. All of `before` when the tail was cut after that line's start.
+fn output_of<'a>(before: &'a str, command: &str) -> &'a str {
+    let started = format!("$ {command}\n");
+    let mut end = before.len();
+    while let Some(at) = before[..end].rfind(&started) {
+        if at == 0 || before[..at].ends_with('\n') {
+            return &before[at + started.len()..];
+        }
+        end = at;
+    }
+    before
+}
+
+/// The command on the last `$ ` line of `tail` and what follows it, for a setup that ended with
+/// no last line of its own; an empty command and the whole tail when no command started.
+fn last_started(tail: &str) -> (String, String) {
+    let mut end = tail.len();
+    while let Some(at) = tail[..end].rfind("$ ") {
+        end = at;
+        if at > 0 && !tail[..at].ends_with('\n') {
+            continue;
+        }
+        let line = &tail[at + 2..];
+        let (command, output) = line.split_once('\n').unwrap_or((line, ""));
+        return (command.to_string(), output.to_string());
+    }
+    (String::new(), tail.to_string())
 }
 
 /// Why a gate could not run, or `None` while it still can: `create` is the error its workspace
-/// create answered with, and `unreachable_for` how long its machine has been unreachable.
+/// create answered with, and `unreachable_for` how long its machine has been unreachable, on the
+/// sleep-counting clock. A failed create is named first.
 pub fn could_not_run(create: Option<&WorkerError>, unreachable_for: Duration) -> Option<String> {
-    let _ = (create, unreachable_for);
-    todo!()
+    if let Some(error) = create {
+        return Some(format!("the gate workspace could not be made: {error}"));
+    }
+    (unreachable_for >= MACHINE_GONE_AFTER).then(|| {
+        format!(
+            "the gate's machine was unreachable for {} minutes",
+            MACHINE_GONE_AFTER.as_secs() / 60
+        )
+    })
 }
 
 /// How many passes to wait before trying a gate again after `failures` failures to run: 1, 2, 4
 /// and 8, then `None`, and the run is stuck. No failure waits for nothing.
 pub fn backoff(failures: u32) -> Option<u32> {
-    let _ = (failures, RETRY_PASSES);
-    todo!()
+    match failures {
+        0 => Some(0),
+        n => RETRY_PASSES.get(usize::try_from(n - 1).ok()?).copied(),
+    }
 }
 
 /// Whether the `.dw/config.yml` at the pull request's head, `None` when it has none, is not the
-/// default branch's, so the gate ran commands the pull request does not have.
+/// default branch's, byte for byte, so the gate ran commands the pull request may not have.
 pub fn config_differs(default: &str, at_head: Option<&str>) -> bool {
-    let _ = (default, at_head);
-    todo!()
+    at_head != Some(default)
 }
 
 /// One command of a gate as its results comment shows it.
@@ -113,8 +232,61 @@ pub struct CommandResult {
 /// A command as [`command_line`] cleans it, in a code span nothing can leave. For prose outside
 /// a table.
 pub fn command_code(command: &str) -> String {
-    let _ = command_line(command);
-    todo!()
+    code_span(&command_line(command))
+}
+
+/// `command` as one line in a code span for a table cell: the span's backticks are longer than
+/// any run in the command, and `|` is escaped so it does not end the cell.
+fn table_code(command: &str) -> String {
+    code_span(&command_line(command).replace('|', "\\|"))
+}
+
+/// `line` in a code span whose backticks outnumber the longest run of them in it.
+fn code_span(line: &str) -> String {
+    let longest = line.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let ticks = "`".repeat(longest + 1);
+    // A span may not start or end with a backtick of its own, so a space goes in between.
+    let pad = if line.starts_with('`') || line.ends_with('`') {
+        " "
+    } else {
+        ""
+    };
+    format!("{ticks}{pad}{line}{pad}{ticks}")
+}
+
+/// A duration in seconds with one decimal, rounded half up: 12 345 ms is `12.3`.
+fn seconds(duration_ms: u64) -> String {
+    let tenths = duration_ms.saturating_add(50) / 100;
+    format!("{}.{}", tenths / 10, tenths % 10)
+}
+
+/// The comment for a pull request whose gate ended with `verdict`. `head_sha` is the commit the
+/// gate ran on and `base_sha` the tip of the base branch. The commands are config text, so each
+/// is cleaned like the gate's own command line, then put in a code span nothing can leave.
+fn results_comment(
+    verdict: &str,
+    results: &[CommandResult],
+    attempt: u32,
+    head_sha: &str,
+    base_sha: &str,
+) -> String {
+    let head = short_sha(head_sha);
+    let base = match short_sha(base_sha) {
+        short if short.is_empty() => "unknown".to_string(),
+        short => short,
+    };
+    let mut text = format!(
+        "**Factory gate: {verdict}** (attempt {attempt}, run by the factory in a fresh checkout of the pull request's head `{head}` merged with the base branch tip `{base}`)\n\n| Command | Exit | Time |\n|---|---|---|"
+    );
+    for result in results {
+        text.push_str(&format!(
+            "\n| {} | {} | {} s |",
+            table_code(&result.command),
+            result.exit_code,
+            seconds(result.duration_ms)
+        ));
+    }
+    text
 }
 
 /// The comment for a pull request whose gate passed.
@@ -124,8 +296,7 @@ pub fn gate_results_comment(
     head_sha: &str,
     base_sha: &str,
 ) -> String {
-    let _ = (results, attempt, short_sha(head_sha), base_sha);
-    todo!()
+    results_comment("passed", results, attempt, head_sha, base_sha)
 }
 
 /// The comment for a pull request that was ready already and passed the gate again on a head or
@@ -136,8 +307,7 @@ pub fn regate_results_comment(
     head_sha: &str,
     base_sha: &str,
 ) -> String {
-    let _ = (results, attempt, head_sha, base_sha);
-    todo!()
+    results_comment("passed again", results, attempt, head_sha, base_sha)
 }
 
 #[cfg(test)]
@@ -636,7 +806,7 @@ mod tests {
         fn a_command_code_is_a_span_no_backtick_in_the_command_can_end() {
             assert_eq!(command_code("cargo test"), "`cargo test`");
             assert_eq!(command_code("echo `date`"), "`` echo `date` ``");
-            assert_eq!(command_code("a ``` b"), "```` a ``` b ````");
+            assert_eq!(command_code("a ``` b"), "````a ``` b````");
             // Outside a table, `|` needs no escape.
             assert_eq!(command_code("a | b"), "`a | b`");
             assert_eq!(command_code("two\nlines"), "`two lines`");
