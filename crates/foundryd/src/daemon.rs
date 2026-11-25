@@ -253,18 +253,21 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
         std::env::var_os("HOME"),
     )
     .ok_or(DaemonError::NoClaudeState)?;
-    let sessions = Arc::new(Sessions::new(
-        me,
-        store.clone(),
-        terminals.clone(),
-        &home,
-        sessions::Config {
-            claude: vec!["claude".into()],
-            claude_json,
-            hook_port: port,
-            gateway,
-        },
-    ));
+    let sessions = Arc::new(
+        Sessions::new(
+            me,
+            store.clone(),
+            terminals.clone(),
+            &home,
+            sessions::Config {
+                claude: vec!["claude".into()],
+                claude_json,
+                hook_port: port,
+                gateway,
+            },
+        )
+        .with_secrets(secrets.clone()),
+    );
     sessions.adopt().await;
 
     let dialer = KeyedDialer::new(Arc::new(WsDialer { port }), keys.clone());

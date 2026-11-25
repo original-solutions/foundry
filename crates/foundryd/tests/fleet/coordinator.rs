@@ -1,6 +1,7 @@
 //! Fleet tests of the coordinator role moving between machines, and of shared settings edits:
 //! numbered by the acting machine, forwarded to it, and merged when a split heals.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -14,7 +15,7 @@ use foundry_proto::settings::{
     Stamp, StampKey,
 };
 use foundry_proto::state::TerminalState;
-use foundryd::coordinator::{Coordinator, CoordinatorError};
+use foundryd::coordinator::{Coordinator, CoordinatorError, merge};
 use foundryd::sync::{Conn, OFFLINE_AFTER, RETRY_REFUSED};
 use foundryd::terminals::Terminals;
 use futures::StreamExt as _;
@@ -2924,4 +2925,270 @@ async fn after_a_split_with_a_factory_setting_edited_on_each_side_an_item_shows_
         )]
         .into()
     );
+}
+
+// --- a protocol 4 machine between two split protocol 5 machines ---
+
+/// Machine B on protocol 4, played by the test. It holds a copy of the settings, merges each
+/// copy a daemon sends it as a protocol 4 build does, and sends its copy to every daemon it is
+/// linked to after the hello and whenever the copy changes. So it passes `seen` on, and never
+/// a factory setting or the factory `seen`, which its copies cannot hold.
+struct Relay {
+    id: MachineId,
+    held: Arc<Mutex<SharedSettings>>,
+    links: Arc<Mutex<BTreeMap<MachineId, mpsc::Sender<String>>>>,
+    tasks: Mutex<BTreeMap<MachineId, Vec<tokio::task::JoinHandle<()>>>>,
+    /// Every settings message a daemon sent it.
+    got: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+
+impl Relay {
+    fn new(id: MachineId, held: &SharedSettings) -> Self {
+        Self {
+            id,
+            held: Arc::new(Mutex::new(held.for_protocol(BEFORE_FACTORY))),
+            links: Arc::default(),
+            tasks: Mutex::default(),
+            got: Arc::default(),
+        }
+    }
+
+    /// Links to `daemon` on protocol 4 and sends it B's copy.
+    async fn link(&self, daemon: &Daemon) {
+        let Conn { send, mut recv } = raw_link_speaking(daemon, self.id, BEFORE_FACTORY).await;
+        lock(&self.links).insert(daemon.id, send.clone());
+        let reader = tokio::spawn({
+            let (held, links, got) = (self.held.clone(), self.links.clone(), self.got.clone());
+            async move {
+                while let Some(text) = recv.recv().await {
+                    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    if json["type"] != "settings" {
+                        continue;
+                    }
+                    lock(&got).push(json.clone());
+                    let theirs: SharedSettings =
+                        serde_json::from_value(json["settings"].clone()).unwrap();
+                    let changed = {
+                        let mut held = lock(&held);
+                        let merged = merge(&held, &theirs).for_protocol(BEFORE_FACTORY);
+                        (merged != *held).then(|| {
+                            held.clone_from(&merged);
+                            merged
+                        })
+                    };
+                    let Some(copy) = changed else {
+                        continue;
+                    };
+                    let text = serde_json::to_string(&older_settings(&copy)).unwrap();
+                    let to: Vec<_> = lock(&links).values().cloned().collect();
+                    for link in to {
+                        let _ = link.send(text.clone()).await;
+                    }
+                }
+            }
+        });
+        let copy = self.held();
+        say(&send, &older_settings(&copy)).await;
+        let beat = beating(send);
+        lock(&self.tasks).insert(daemon.id, vec![reader, beat]);
+    }
+
+    /// Closes B's link to `daemon`.
+    fn unlink(&self, daemon: MachineId) {
+        lock(&self.links).remove(&daemon);
+        for task in lock(&self.tasks).remove(&daemon).unwrap_or_default() {
+            task.abort();
+        }
+    }
+
+    fn held(&self) -> SharedSettings {
+        lock(&self.held).clone()
+    }
+
+    /// Checks that no daemon sent B anything of the factory.
+    fn was_sent_nothing_of_the_factory(&self) {
+        let got = lock(&self.got);
+        assert!(!got.is_empty(), "B was sent no settings");
+        for message in got.iter() {
+            assert_eq!(message["protocol"], BEFORE_FACTORY, "{message}");
+            assert!(!names_the_factory(message), "{message}");
+            assert!(
+                message["settings"].get("factory_seen").is_none(),
+                "{message}"
+            );
+        }
+    }
+}
+
+/// Whether a copy that has seen `seen` includes the edit stamped `stamp`.
+fn covers(seen: &BTreeMap<MachineId, u64>, stamp: Stamp) -> bool {
+    seen.get(&stamp.by).is_some_and(|seq| *seq >= stamp.seq)
+}
+
+/// The value of the fleet's factory settings `set_factory(max_runs)` sets.
+fn factory_value(max_runs: u32) -> SettingValue {
+    SettingValue::Factory(FactorySettings {
+        max_runs,
+        ..FactorySettings::default()
+    })
+}
+
+/// In which order the two sides of the split edit, and B passes their copies on.
+#[derive(Clone, Copy, Debug)]
+enum Split {
+    /// A and C each edit while B reaches both, and B passes each side's copy to the other.
+    BothEdit,
+    /// C edits and goes offline, A edits later, B passes C's copy to A, and C returns to B,
+    /// which passes it A's copy, before C and A meet.
+    CReturns,
+}
+
+/// Machines A and C on protocol 5 are split from each other, and B on protocol 4 reaches both.
+/// A and C each edit the fleet's factory settings, and B passes `seen` on both ways, so each
+/// side's `seen` covers the other side's edit, which it does not hold. When A and C link, both
+/// hold the higher edit and a "setting overwritten" item shows both values.
+async fn a_factory_edit_split_across_a_protocol_4_relay_is_overwritten_not_lost(split: Split) {
+    let b = MachineId::random();
+    let fleet = Fleet::start_coordinated_with(2, &[b]);
+    let (a, c) = (&fleet.daemons[0], &fleet.daemons[1]);
+    let relay = Relay::new(b, &a.settings());
+    relay.link(a).await;
+    relay.link(c).await;
+    until(WAIT, "every machine online on A and C", || {
+        [a, c].iter().all(|d| d.peers.online().len() == 3)
+    })
+    .await;
+    acting_becomes(&c.coordinator(), a.id, WAIT).await;
+
+    // A and C are split from each other. B still reaches both, and C acts on its side.
+    fleet.cut(0);
+    acting_becomes(&c.coordinator(), c.id, OFFLINE_AFTER * 2).await;
+    assert_eq!(a.coordinator().acting().await.unwrap(), a.id);
+
+    let (a_edit, c_edit) = match split {
+        Split::BothEdit => {
+            let a_edit = a.coordinator().edit(set_factory(4)).await.unwrap();
+            let c_edit = c.coordinator().edit(set_factory(6)).await.unwrap();
+            (a_edit, c_edit)
+        }
+        Split::CReturns => {
+            let c_edit = c.coordinator().edit(set_factory(6)).await.unwrap();
+            until(WAIT, "B holds C's copy", || {
+                covers(&relay.held().seen, c_edit)
+            })
+            .await;
+            relay.unlink(c.id);
+            let a_edit = a.coordinator().edit(set_factory(4)).await.unwrap();
+            (a_edit, c_edit)
+        }
+    };
+    assert_eq!((a_edit.by, c_edit.by), (a.id, c.id));
+    until(WAIT, "B passes C's copy on to A", || {
+        covers(&a.settings().seen, c_edit)
+    })
+    .await;
+    until(WAIT, "B holds A's copy", || {
+        covers(&relay.held().seen, a_edit)
+    })
+    .await;
+    if let Split::CReturns = split {
+        relay.link(c).await;
+    }
+    until(WAIT, "B passes A's copy on to C", || {
+        covers(&c.settings().seen, a_edit)
+    })
+    .await;
+    // Each side's `seen` covers the other's edit, yet neither holds it.
+    assert_eq!(max_runs(&a.settings()), Some(4));
+    assert_eq!(max_runs(&c.settings()), Some(6));
+
+    fleet.heal(0);
+    let settings = agreed(&fleet, &[0, 1], "A and C meet and agree").await;
+    let (kept, lost) = if a_edit > c_edit {
+        ((4, a_edit), (6, c_edit))
+    } else {
+        ((6, c_edit), (4, a_edit))
+    };
+    assert_eq!(max_runs(&settings), Some(kept.0), "{split:?}");
+    assert_eq!(
+        settings.stamps[&StampKey::Setting(SettingKey::Factory)],
+        kept.1
+    );
+    assert_eq!(
+        settings.overwritten,
+        [(
+            SettingKey::Factory,
+            Overwritten {
+                kept: Some(factory_value(kept.0)),
+                lost: Some(factory_value(lost.0)),
+                lost_stamp: lost.1,
+            }
+        )]
+        .into(),
+        "{split:?}"
+    );
+    relay.was_sent_nothing_of_the_factory();
+}
+
+#[tokio::test(start_paused = true)]
+async fn two_split_sides_that_edit_a_factory_setting_across_a_protocol_4_relay_raise_an_item() {
+    a_factory_edit_split_across_a_protocol_4_relay_is_overwritten_not_lost(Split::BothEdit).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_factory_edit_made_before_going_offline_and_relayed_by_protocol_4_raises_an_item() {
+    a_factory_edit_split_across_a_protocol_4_relay_is_overwritten_not_lost(Split::CReturns).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn copies_exchanged_20_times_with_a_protocol_4_machine_stop_changing_the_number() {
+    let older = MachineId::random();
+    let fleet = Fleet::start_coordinated_with(1, &[older]);
+    let daemon = &fleet.daemons[0];
+    let (conn, said) = recorded(raw_link_speaking(daemon, older, BEFORE_FACTORY).await);
+    say(&conn, &older_settings(&daemon.settings())).await;
+    let _beating = beating(conn.clone());
+    until(WAIT, "the peer is online", || {
+        daemon.peers.online().contains(&older)
+    })
+    .await;
+    let coordinator = daemon.coordinator();
+    coordinator.edit(set_factory(5)).await.unwrap();
+    coordinator.edit(set_project(7, "p")).await.unwrap();
+    assert!(!daemon.settings().factory_seen.is_empty());
+
+    // Each exchange: the older machine merges the newest copy it was sent into its own, and
+    // sends its own back.
+    let newest = || {
+        let said = lock(&said);
+        let json = said
+            .iter()
+            .rev()
+            .find(|m| m["type"] == "settings")
+            .expect("a copy was sent")
+            .clone();
+        serde_json::from_value::<SharedSettings>(json["settings"].clone()).unwrap()
+    };
+    let mut theirs = daemon.settings().for_protocol(BEFORE_FACTORY);
+    let mut seqs = Vec::new();
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        theirs = merge(&theirs, &newest()).for_protocol(BEFORE_FACTORY);
+        say(&conn, &older_settings(&theirs)).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        seqs.push(daemon.settings().seq);
+    }
+    let last = *seqs.last().unwrap();
+    assert!(
+        seqs[seqs.len() - 5..].iter().all(|seq| *seq == last),
+        "the number keeps changing: {seqs:?}"
+    );
+    assert_eq!(newest().seq, last, "{seqs:?}");
+    assert_eq!(theirs.seq, last, "{seqs:?}");
+    for message in lock(&said).iter().filter(|m| m["type"] == "settings") {
+        assert!(
+            message["settings"].get("factory_seen").is_none(),
+            "{message}"
+        );
+    }
 }

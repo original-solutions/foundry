@@ -99,6 +99,24 @@ pub fn settings_json(curl_config: &Path) -> Value {
     json!({ "hooks": hooks })
 }
 
+/// What a factory session's settings file holds: [`settings_json`], and the key that lets a
+/// machine that never accepted the mode start without Claude Code stopping at the
+/// confirmation.
+pub fn factory_settings_json(curl_config: &Path) -> Value {
+    let mut settings = settings_json(curl_config);
+    settings["skipDangerousModePermissionPrompt"] = json!(true);
+    settings
+}
+
+/// What a factory session adds to Claude Code's command line, after the model.
+pub fn factory_args(effort: &str) -> Vec<String> {
+    vec![
+        "--dangerously-skip-permissions".into(),
+        "--effort".into(),
+        effort.into(),
+    ]
+}
+
 /// Creates a new file at `path`, readable by this user only, holding `bytes`. An existing file
 /// is an error.
 fn create_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -112,7 +130,7 @@ fn create_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 /// Writes `bytes` to a new private file at `path`, in a folder made private too.
-fn write_new_private(path: &Path, bytes: &[u8]) -> Result<(), SessionError> {
+pub(super) fn write_new_private(path: &Path, bytes: &[u8]) -> Result<(), SessionError> {
     let io = |step: &str| {
         let what = format!("{}: {step}", path.display());
         move |source| SessionError::Io { what, source }
