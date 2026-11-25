@@ -2517,6 +2517,43 @@ exec "$agent" "$@""#;
     }
 
     #[tokio::test]
+    async fn a_send_whose_count_cannot_be_read_fails_with_no_count_and_types_nothing() {
+        let mut f = Fx::new(&format!(
+            "{IDLE}- wait_prompt\n- stop: {{last_assistant_message: \"a\"}}\n\
+             - wait_line: \"\"\n- wait_input\n"
+        ))
+        .await;
+        let id = f
+            .start_factory(WorkspaceId::random(), ProjectId::random())
+            .await;
+        f.until_turn(id, 1, 1).await;
+        // The new daemon holds no counts for the session, and every read of them fails.
+        f.restart_failing_turn_reads(1000).await;
+
+        let sent = f
+            .sessions
+            .send_factory(id, Fx::message("unread"), None)
+            .await;
+
+        let Err(SendRefused::Failed { reason, prompts }) = sent else {
+            panic!("not Failed: {sent:?}");
+        };
+        assert_eq!(prompts, None, "{reason}");
+        f.sessions
+            .inner
+            .fail_turn_reads
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        let probe = f
+            .sessions
+            .send_factory(id, Fx::message("probe"), Some(1))
+            .await;
+        assert_eq!(probe, Ok(1));
+        let seen = f.shown(id, |t| !all_values(t, "LINE=").is_empty()).await;
+        assert_eq!(all_values(&seen, "LINE="), ["\"probe\""]);
+        assert!(!seen.contains("unread"), "{seen}");
+    }
+
+    #[tokio::test]
     async fn a_body_that_cannot_be_written_fails_with_the_count_and_types_nothing() {
         let f = Fx::new(&format!(
             "{IDLE}- wait_prompt\n- stop: {{last_assistant_message: \"a\"}}\n\
