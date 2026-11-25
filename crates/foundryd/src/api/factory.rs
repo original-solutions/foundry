@@ -398,8 +398,9 @@ async fn message(api: &Api, id: SessionId, body: &Bytes) -> Result<Response, Api
     }
 }
 
-/// `409` with why nothing was sent: the reason as text, as a word the caller can match, and
-/// the count of prompts when it rose.
+/// `409` with why nothing was sent: the reason as text, as a word the caller can match, the
+/// count of prompts when it rose, and, for `failed`, the count the send read before it typed
+/// (`null` when it read none), which a resend names as `only_if_prompts`.
 fn not_sent(refused: &SendRefused) -> Response {
     let reason = match refused {
         SendRefused::NotIdle => "not_idle",
@@ -407,18 +408,20 @@ fn not_sent(refused: &SendRefused) -> Response {
         SendRefused::NoSuchSession => "no_such_session",
         SendRefused::BodyWithoutPath => "body_without_path",
         SendRefused::SecretsUnreadable => "secrets_unreadable",
-        SendRefused::Failed(_) => "failed",
+        SendRefused::Failed { .. } => "failed",
     };
     let text = redact(&refused.to_string());
     if matches!(
         refused,
-        SendRefused::SecretsUnreadable | SendRefused::Failed(_)
+        SendRefused::SecretsUnreadable | SendRefused::Failed { .. }
     ) {
         tracing::warn!("api: a factory message was not sent: {text}");
     }
     let mut answer = serde_json::json!({ "error": text, "reason": reason });
-    if let SendRefused::CountRose { now } = refused {
-        answer["now"] = (*now).into();
+    match refused {
+        SendRefused::CountRose { now } => answer["now"] = (*now).into(),
+        SendRefused::Failed { prompts, .. } => answer["prompts"] = (*prompts).into(),
+        _ => {}
     }
     (StatusCode::CONFLICT, Json(answer)).into_response()
 }

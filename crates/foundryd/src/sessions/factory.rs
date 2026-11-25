@@ -188,18 +188,49 @@ pub enum SendRefused {
     /// cannot be hidden. Nothing was written or typed.
     #[error("the secret store cannot be read, so the body was not written")]
     SecretsUnreadable,
-    /// The body could not be written or the line not typed: an I/O or terminal error. The
-    /// reason names no secret.
-    #[error("the message was not sent: {0}")]
-    Failed(String),
+    /// The count of prompts could not be read, the body could not be written, the terminal gave
+    /// an error, or the send did not finish. The reason names no secret.
+    ///
+    /// A terminal error may come after the line was typed: the terminal takes the line, then
+    /// its answer does not come in time or the connection breaks. So the coordinator sends the
+    /// message again only with `only_if_prompts` set to `prompts`: a line that did become a
+    /// prompt is then refused with [`SendRefused::CountRose`] instead of typed twice, and one
+    /// that did not is typed once more.
+    #[error("the message was not sent: {reason}")]
+    Failed {
+        /// What went wrong.
+        reason: String,
+        /// The session's count of submitted prompts, read before the body was written or the
+        /// line typed. `None` when the send failed before it read the count, and so typed
+        /// nothing, or when its task ended before it answered, which loses what it read and
+        /// may come after the line was typed; with `None` there is no count to name.
+        prompts: Option<u64>,
+    },
 }
 
 impl From<SessionError> for SendRefused {
+    /// `error` from a send that had not read the count.
     fn from(error: SessionError) -> Self {
         match error {
             SessionError::BodyWithoutPath => SendRefused::BodyWithoutPath,
             SessionError::SecretsUnreadable => SendRefused::SecretsUnreadable,
-            other => SendRefused::Failed(other.to_string()),
+            other => SendRefused::Failed {
+                reason: other.to_string(),
+                prompts: None,
+            },
+        }
+    }
+}
+
+impl SendRefused {
+    /// `error` from a send that had read the count `prompts` before it failed.
+    fn after_count(error: impl Into<SendRefused>, prompts: u64) -> Self {
+        match error.into() {
+            SendRefused::Failed { reason, .. } => SendRefused::Failed {
+                reason,
+                prompts: Some(prompts),
+            },
+            other => other,
         }
     }
 }
@@ -766,8 +797,10 @@ impl Sessions {
     /// be read it is [`SendRefused::SecretsUnreadable`]. A body whose line has no [`BODY_PATH`]
     /// is [`SendRefused::BodyWithoutPath`]. With `only_if_prompts`, a count above it is
     /// [`SendRefused::CountRose`], and nothing is written or typed: the line that was sent
-    /// before was typed after all. The send finishes even when the caller stops waiting, and is
-    /// ordered with the session's hooks.
+    /// before was typed after all. Any other failure is [`SendRefused::Failed`], with the count
+    /// read before the send when it got that far, since a terminal error can come after the
+    /// line was typed. The send finishes even when the caller stops waiting, and is ordered with
+    /// the session's hooks.
     pub async fn send_factory(
         &self,
         session: SessionId,
@@ -777,7 +810,10 @@ impl Sessions {
         let inner = self.inner.clone();
         tokio::spawn(async move { inner.send(session, message, only_if_prompts).await })
             .await
-            .map_err(|_| SendRefused::Failed("the send did not finish".into()))?
+            .map_err(|_| SendRefused::Failed {
+                reason: "the send did not finish".into(),
+                prompts: None,
+            })?
     }
 
     /// Closes the terminal of each factory session of `workspace` that still runs, and makes a
@@ -865,7 +901,8 @@ impl Inner {
                 let hider = self.hider();
                 let path = blocking(move || write_body(&folder, &hider.hide_body(&text)?))
                     .await
-                    .and_then(|r| r)?;
+                    .and_then(|r| r)
+                    .map_err(|error| SendRefused::after_count(error, prompts))?;
                 Some(path)
             }
             None => None,
@@ -881,7 +918,11 @@ impl Inner {
             Err(TerminalError::Gone(_) | TerminalError::Unknown(_)) => {
                 Err(SendRefused::NoSuchSession)
             }
-            Err(other) => Err(SendRefused::Failed(other.to_string())),
+            // The terminal may have taken the line before it failed: the count goes with it.
+            Err(other) => Err(SendRefused::Failed {
+                reason: other.to_string(),
+                prompts: Some(prompts),
+            }),
         }
     }
 
