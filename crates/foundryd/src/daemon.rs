@@ -2,7 +2,7 @@
 //! back, starts every long-running module and stops on SIGTERM or SIGINT. The holders are
 //! sessions of their own, so a stopped daemon leaves every terminal's child running.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::future::Future;
@@ -26,7 +26,9 @@ use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
 use crate::api::{self, Api, BindError};
-use crate::attention::Attention;
+use crate::attention::{Attention, Marks};
+use crate::clock::{self, Clock};
+use crate::factory::status::Freshness;
 use crate::gateway;
 use crate::join::{self, JoinError, KeyedDialer, Keys};
 use crate::lister::Lister;
@@ -41,6 +43,7 @@ use crate::tailscale::{AskError, Entry, host_names, own_entry, tailscale_ips};
 use crate::terminals::{TerminalError, Terminals};
 use crate::update;
 use crate::workspaces::{WorkspaceError, Workspaces};
+use foundry_proto::ids::{ProjectId, SessionId, WorkspaceId};
 
 /// How long the runtime waits for tasks that will not stop once the daemon has decided to
 /// exit, so one stuck task cannot hang the exit.
@@ -283,6 +286,11 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
         peers.clone(),
     ));
     peers.coordinate(coordinator.clone());
+    // One freshness for the daemon's life: the peers tell it of each status they store, and the
+    // attention list reads it.
+    let clock = daemon_clock();
+    let freshness = Arc::new(Freshness::new(clock.clone()));
+    peers.hear_statuses(freshness.clone());
     let mut api = Api::new(
         store.clone(),
         peers.clone(),
@@ -305,6 +313,9 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
         coordinator.clone(),
         gateway_reader.clone(),
         &api.placements,
+        clock,
+        freshness,
+        Arc::new(FactoryMarks::new(sessions.clone(), &home)),
     );
     let placing = api.clone();
     let attention_routes = attention
@@ -404,7 +415,9 @@ async fn serve(home: PathBuf, port: u16) -> Result<(), DaemonError> {
     stopped
 }
 
-/// This machine's attention list: the fleet's items, the gateway's and the placement queue's.
+/// This machine's attention list: the fleet's items, the gateway's and the placement queue's,
+/// and the factory's, read on `clock` and `freshness` with `marks` for what is factory work.
+#[allow(clippy::too_many_arguments)]
 fn attention(
     me: foundry_proto::ids::MachineId,
     store: &Arc<Mutex<Store>>,
@@ -412,12 +425,229 @@ fn attention(
     coordinator: Arc<crate::coordinator::Coordinator>,
     gateway: Arc<gateway::Reader>,
     placements: &Arc<placement::Queue>,
+    clock: Arc<dyn Clock>,
+    freshness: Arc<Freshness>,
+    marks: Arc<dyn Marks>,
 ) -> Arc<Attention> {
     Arc::new(
         Attention::new(me, store.clone(), peers.clone(), coordinator)
+            .with_factory(clock, freshness, marks)
             .with_source(gateway)
             .with_source(placements.clone()),
     )
+}
+
+/// What this machine marks as factory work: a session by [`Sessions::is_factory`], a workspace
+/// by the marker file [`Workspaces`] writes beside the folder of one made for the factory.
+struct FactoryMarks {
+    sessions: Arc<Sessions>,
+    workspaces: WorkspaceMarks,
+}
+
+impl FactoryMarks {
+    /// The marks of `sessions`, and of the workspaces under the data directory `home`.
+    fn new(sessions: Arc<Sessions>, home: &Path) -> Self {
+        Self {
+            sessions,
+            workspaces: WorkspaceMarks::new(home),
+        }
+    }
+}
+
+impl Marks for FactoryMarks {
+    fn factory_session(&self, session: SessionId) -> Option<ProjectId> {
+        self.sessions.is_factory(session)
+    }
+
+    fn factory_workspace(&self, workspace: WorkspaceId) -> Option<ProjectId> {
+        self.workspaces.project(workspace)
+    }
+}
+
+/// The factory markers of workspaces, read from `<data dir>/worktrees` once per workspace.
+///
+/// [`Workspaces`] writes a marker before the workspace's record, so once a record is listed
+/// the answer for it is fixed, and it is kept: a project, or none for a workspace with no
+/// marker or one that cannot be parsed. A marker that cannot be read, for any reason but being
+/// absent, is not kept and is read again next time. Each such marker is warned of once.
+struct WorkspaceMarks {
+    worktrees: PathBuf,
+    answered: Mutex<HashMap<WorkspaceId, Option<ProjectId>>>,
+    /// The markers already warned of.
+    warned: Mutex<HashSet<PathBuf>>,
+}
+
+impl WorkspaceMarks {
+    fn new(home: &Path) -> Self {
+        Self {
+            worktrees: home.join("worktrees"),
+            answered: Mutex::default(),
+            warned: Mutex::default(),
+        }
+    }
+
+    /// The project `workspace` is a factory workspace of, if it is one.
+    fn project(&self, workspace: WorkspaceId) -> Option<ProjectId> {
+        let held = self
+            .answered
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&workspace)
+            .copied();
+        if let Some(answer) = held {
+            return answer;
+        }
+        let (answer, bad) = match scan_marker(&self.worktrees, workspace) {
+            Scan::Found(project) => (Some(Some(project)), None),
+            Scan::Absent => (Some(None), None),
+            Scan::Unparseable(path) => (Some(None), Some((path, "cannot be parsed"))),
+            Scan::Unreadable(path) => (None, Some((path, "cannot be read"))),
+        };
+        if let Some((path, what)) = bad {
+            let new = self
+                .warned
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(path.clone());
+            if new {
+                tracing::warn!(marker = %path.display(), "a factory marker {what}");
+            }
+        }
+        if let Some(answer) = answer {
+            self.answered
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(workspace, answer);
+        }
+        answer.flatten()
+    }
+
+    #[cfg(test)]
+    fn warned_count(&self) -> usize {
+        self.warned.lock().unwrap().len()
+    }
+}
+
+/// What a scan for a workspace's marker found.
+#[derive(Debug)]
+enum Scan {
+    Found(ProjectId),
+    /// No project folder holds one.
+    Absent,
+    /// The marker at this path cannot be parsed.
+    Unparseable(PathBuf),
+    /// The marker at this path cannot be read, or this folder or entry cannot be listed: the
+    /// first of them.
+    Unreadable(PathBuf),
+}
+
+/// Looks for `<project id>/<workspace id>.factory` in each folder under `worktrees`, reading
+/// only its `project`. Entries that are not folders are skipped; a marker that cannot be read
+/// in one folder does not stop the look in the others, and is reported only when no other
+/// folder holds the marker.
+fn scan_marker(worktrees: &Path, workspace: WorkspaceId) -> Scan {
+    /// The one field of a workspace's marker this reads.
+    #[derive(serde::Deserialize)]
+    struct Marker {
+        project: ProjectId,
+    }
+    let entries = match std::fs::read_dir(worktrees) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Scan::Absent,
+        Err(_) => return Scan::Unreadable(worktrees.to_path_buf()),
+    };
+    let file = format!("{workspace}.factory");
+    let mut unreadable = None;
+    for entry in entries {
+        let folder = match entry {
+            Ok(folder) => folder,
+            Err(_) => {
+                unreadable.get_or_insert_with(|| worktrees.to_path_buf());
+                continue;
+            }
+        };
+        let is_dir = match folder.file_type() {
+            Ok(kind) => kind.is_dir(),
+            // The type could not be read: ask for the path's metadata before skipping it.
+            Err(_) => match std::fs::metadata(folder.path()) {
+                Ok(meta) => meta.is_dir(),
+                Err(_) => {
+                    unreadable.get_or_insert_with(|| folder.path());
+                    continue;
+                }
+            },
+        };
+        if !is_dir {
+            continue;
+        }
+        let path = folder.path().join(&file);
+        match std::fs::read(&path) {
+            Ok(text) => {
+                return match serde_json::from_slice::<Marker>(&text) {
+                    Ok(marker) => Scan::Found(marker.project),
+                    Err(_) => Scan::Unparseable(path),
+                };
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) => {}
+            Err(_) => {
+                unreadable.get_or_insert(path);
+            }
+        }
+    }
+    unreadable.map_or(Scan::Absent, Scan::Unreadable)
+}
+
+/// The clock the daemon measures the factory's ages on: the system's, and in a debug build
+/// moved ahead by the seconds the file `FOUNDRY_CLOCK_AHEAD` names holds. That is how tests
+/// move the running daemon's clock; a release build ignores the variable.
+fn daemon_clock() -> Arc<dyn Clock> {
+    clock_for(
+        std::env::var_os("FOUNDRY_CLOCK_AHEAD"),
+        CLOCK_AHEAD_ALLOWED,
+        clock::system(),
+    )
+}
+
+/// Whether this build takes `FOUNDRY_CLOCK_AHEAD`: only a debug build.
+const CLOCK_AHEAD_ALLOWED: bool = cfg!(debug_assertions);
+
+/// `base`, or, when `allowed` and `set` names a file, `base` plus the seconds that file holds.
+fn clock_for(set: Option<OsString>, allowed: bool, base: Arc<dyn Clock>) -> Arc<dyn Clock> {
+    match set {
+        Some(file) if allowed => Arc::new(AheadClock {
+            base,
+            file: PathBuf::from(file),
+            added: Mutex::new(Duration::ZERO),
+        }),
+        _ => base,
+    }
+}
+
+/// A clock `base` plus a whole number of seconds read from `file` on each reading. A missing
+/// or unreadable file, or text that is no number, counts as the last good value (0 at first),
+/// and the added amount never goes down, so readings never go back.
+struct AheadClock {
+    base: Arc<dyn Clock>,
+    file: PathBuf,
+    added: Mutex<Duration>,
+}
+
+impl Clock for AheadClock {
+    fn now(&self) -> Duration {
+        let read = std::fs::read_to_string(&self.file)
+            .ok()
+            .and_then(|text| text.trim().parse::<u64>().ok())
+            .map(Duration::from_secs);
+        let mut added = self.added.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(read) = read {
+            *added = (*added).max(read);
+        }
+        self.base.now().saturating_add(*added)
+    }
 }
 
 /// Runs `service` and names it once it ends, so the daemon can say which one stopped.
@@ -1532,7 +1762,19 @@ mod tests {
             Arc::new(crate::secrets::MemorySecrets::default()),
         ));
         let placements = Arc::new(Queue::new(me));
-        let attention = attention(me, &store, &peers, coordinator, gateway, &placements);
+        let clock: Arc<dyn crate::clock::Clock> = Arc::new(crate::clock::FakeClock::new());
+        let freshness = Arc::new(Freshness::new(clock.clone()));
+        let attention = attention(
+            me,
+            &store,
+            &peers,
+            coordinator,
+            gateway,
+            &placements,
+            clock,
+            freshness,
+            Arc::new(MarksNothing),
+        );
         placements.wait(
             Want {
                 project: foundry_proto::ids::ProjectId::random(),
@@ -1549,6 +1791,369 @@ mod tests {
             items.iter().any(|item| item.kind == Kind::PlacementWaiting),
             "{items:?}"
         );
+    }
+
+    /// Marks nothing, for a test of the list that has no sessions.
+    struct MarksNothing;
+
+    impl crate::attention::Marks for MarksNothing {
+        fn factory_session(&self, _: foundry_proto::ids::SessionId) -> Option<ProjectId> {
+            None
+        }
+
+        fn factory_workspace(&self, _: foundry_proto::ids::WorkspaceId) -> Option<ProjectId> {
+            None
+        }
+    }
+
+    fn clock_file(seconds: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ahead");
+        std::fs::write(&file, seconds).unwrap();
+        (dir, file)
+    }
+
+    fn fake_base() -> (Arc<crate::clock::FakeClock>, Arc<dyn crate::clock::Clock>) {
+        let base = Arc::new(crate::clock::FakeClock::new());
+        let dyn_base: Arc<dyn crate::clock::Clock> = base.clone();
+        (base, dyn_base)
+    }
+
+    #[test]
+    fn foundry_clock_ahead_is_ignored_when_the_build_does_not_take_it() {
+        let (_dir, file) = clock_file("600");
+        let (base, dyn_base) = fake_base();
+        base.advance(Duration::from_secs(1));
+
+        let clock = clock_for(Some(file.into_os_string()), false, dyn_base);
+
+        assert_eq!(clock.now(), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn the_seconds_in_the_clock_ahead_file_are_added_to_each_reading() {
+        let (_dir, file) = clock_file("600\n");
+        let (base, dyn_base) = fake_base();
+        let clock = clock_for(Some(file.clone().into_os_string()), true, dyn_base);
+
+        assert_eq!(clock.now(), Duration::from_secs(600));
+        base.advance(Duration::from_secs(5));
+        assert_eq!(clock.now(), Duration::from_secs(605));
+        std::fs::write(&file, "1200").unwrap();
+        assert_eq!(clock.now(), Duration::from_secs(1205));
+    }
+
+    #[test]
+    fn a_missing_or_unreadable_clock_ahead_file_adds_nothing() {
+        let (dir, file) = clock_file("");
+        std::fs::remove_file(&file).unwrap();
+        let (_, dyn_base) = fake_base();
+        let clock = clock_for(Some(file.into_os_string()), true, dyn_base.clone());
+        assert_eq!(clock.now(), Duration::ZERO);
+
+        // A folder cannot be read as a file, and text that is no number counts as none.
+        let unreadable = clock_for(Some(dir.path().into()), true, dyn_base.clone());
+        assert_eq!(unreadable.now(), Duration::ZERO);
+        let (_dir, words) = clock_file("ten minutes");
+        let words = clock_for(Some(words.into_os_string()), true, dyn_base.clone());
+        assert_eq!(words.now(), Duration::ZERO);
+
+        // No variable at all is the base clock.
+        assert_eq!(clock_for(None, true, dyn_base).now(), Duration::ZERO);
+    }
+
+    #[test]
+    fn a_smaller_number_in_the_clock_ahead_file_does_not_move_the_clock_back() {
+        let (_dir, file) = clock_file("600");
+        let (_, dyn_base) = fake_base();
+        let clock = clock_for(Some(file.clone().into_os_string()), true, dyn_base);
+        assert_eq!(clock.now(), Duration::from_secs(600));
+
+        std::fs::write(&file, "60").unwrap();
+        assert_eq!(clock.now(), Duration::from_secs(600));
+        std::fs::write(&file, "nonsense").unwrap();
+        assert_eq!(clock.now(), Duration::from_secs(600));
+        std::fs::write(&file, "900").unwrap();
+        assert_eq!(clock.now(), Duration::from_secs(900));
+    }
+
+    #[tokio::test]
+    async fn a_factory_workspace_is_answered_with_its_project_by_its_marker() {
+        use crate::workspaces::{Checkout, FactoryTag, Setup};
+
+        let data = tempfile::tempdir().unwrap();
+        let me = MachineId::random();
+        let store = Arc::new(Mutex::new(
+            Store::open(data.path().join("foundry.db")).unwrap(),
+        ));
+        let git = |dir: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=Foundry Test",
+                    "-c",
+                    "user.email=test@foundry.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "init.defaultBranch=main",
+                ])
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        let remotes = tempfile::tempdir().unwrap();
+        git(remotes.path(), &["init", "-q", "--bare", "remote.git"]);
+        git(remotes.path(), &["clone", "-q", "remote.git", "src"]);
+        let src = remotes.path().join("src");
+        std::fs::write(src.join("README.md"), "hello\n").unwrap();
+        git(&src, &["add", "README.md"]);
+        git(&src, &["commit", "-q", "-m", "first"]);
+        git(&src, &["push", "-q", "origin", "main"]);
+        let project = ProjectId::random();
+        {
+            let mut store = store.lock().unwrap();
+            let mut settings = store.settings().unwrap();
+            settings.seq += 1;
+            settings.projects.push(foundry_proto::settings::Project {
+                id: project,
+                name: "demo".into(),
+                repo: remotes
+                    .path()
+                    .join("remote.git")
+                    .to_string_lossy()
+                    .into_owned(),
+            });
+            assert!(store.apply_settings(settings).unwrap());
+        }
+        let terminals = Arc::new(Terminals::new(
+            me,
+            store.clone(),
+            data.path(),
+            data.path().join("no-holder"),
+        ));
+        let workspaces = Workspaces::new(me, store, data.path(), terminals);
+        let tagged = |tag| {
+            workspaces.create_with(
+                project,
+                "fix login",
+                Checkout::NewBranch {
+                    base: "main".into(),
+                    branch: None,
+                },
+                Setup::None,
+                tag,
+            )
+        };
+        let made = tagged(Some(FactoryTag {
+            project,
+            run: "o/r#1".into(),
+        }))
+        .await
+        .unwrap();
+        let plain = workspaces
+            .create_with(
+                project,
+                "mine",
+                Checkout::NewBranch {
+                    base: "main".into(),
+                    branch: None,
+                },
+                Setup::None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let marks = WorkspaceMarks::new(data.path());
+        assert_eq!(marks.project(made), Some(project));
+        assert_eq!(marks.project(plain), None);
+        assert_eq!(
+            marks.project(foundry_proto::ids::WorkspaceId::random()),
+            None
+        );
+        let nowhere = tempfile::tempdir().unwrap();
+        assert_eq!(WorkspaceMarks::new(nowhere.path()).project(made), None);
+    }
+
+    /// A worktrees folder holding `<project>/<workspace>.factory` with `text`, for the
+    /// marker tests; and the paths of the folder and the marker.
+    fn marker_in(text: &str) -> (tempfile::TempDir, WorkspaceId, PathBuf) {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = WorkspaceId::random();
+        let folder = data
+            .path()
+            .join("worktrees")
+            .join(ProjectId::random().to_string());
+        std::fs::create_dir_all(&folder).unwrap();
+        let marker = folder.join(format!("{workspace}.factory"));
+        std::fs::write(&marker, text).unwrap();
+        (data, workspace, marker)
+    }
+
+    fn marker_text(project: ProjectId) -> String {
+        format!(r#"{{"project":"{project}","run":"o/r#1","name":"w"}}"#)
+    }
+
+    #[test]
+    fn a_stray_file_among_the_project_folders_does_not_stop_the_scan_for_a_marker() {
+        let project = ProjectId::random();
+        let (data, workspace, _) = marker_in(&marker_text(project));
+        let worktrees = data.path().join("worktrees");
+        // Plain files beside the project folders, which no read of `<file>/<id>.factory` gets
+        // past; some of them are bound to be read before the project folder.
+        for name in [".DS_Store", "0", "a", "b", "c", "d", "e", "zz", "~"] {
+            std::fs::write(worktrees.join(name), "").unwrap();
+        }
+
+        assert!(matches!(
+            scan_marker(&worktrees, workspace),
+            Scan::Found(found) if found == project
+        ));
+        // Beside the stray files, no marker is no marker, not a folder that cannot be read.
+        assert!(matches!(
+            scan_marker(&worktrees, WorkspaceId::random()),
+            Scan::Absent
+        ));
+    }
+
+    #[test]
+    fn a_marker_that_does_not_parse_or_cannot_be_read_answers_none() {
+        let (data, workspace, marker) = marker_in("not json");
+        let worktrees = data.path().join("worktrees");
+        assert!(matches!(
+            scan_marker(&worktrees, workspace),
+            Scan::Unparseable(path) if path == marker
+        ));
+
+        // A folder where the marker should be is a file that cannot be read.
+        std::fs::remove_file(&marker).unwrap();
+        std::fs::create_dir(&marker).unwrap();
+        assert!(matches!(
+            scan_marker(&worktrees, workspace),
+            Scan::Unreadable(path) if path == marker
+        ));
+        assert_eq!(WorkspaceMarks::new(data.path()).project(workspace), None);
+    }
+
+    #[test]
+    fn a_marker_found_in_a_later_folder_is_still_found_after_a_read_error_in_an_earlier() {
+        let project = ProjectId::random();
+        let (data, workspace, _) = marker_in(&marker_text(project));
+        let worktrees = data.path().join("worktrees");
+        for _ in 0..5 {
+            let folder = worktrees.join(ProjectId::random().to_string());
+            std::fs::create_dir_all(folder.join(format!("{workspace}.factory"))).unwrap();
+        }
+        // Five folders that hold an unreadable marker of that name, one that holds the marker.
+        let found = scan_marker(&worktrees, workspace);
+        assert!(
+            matches!(found, Scan::Found(p) if p == project),
+            "{:?}",
+            found
+        );
+    }
+
+    #[test]
+    fn the_first_answer_for_a_workspace_is_kept_whatever_happens_to_its_marker() {
+        let project = ProjectId::random();
+        let (data, workspace, marker) = marker_in(&marker_text(project));
+        let marks = WorkspaceMarks::new(data.path());
+        assert_eq!(marks.project(workspace), Some(project));
+
+        std::fs::remove_file(&marker).unwrap();
+        assert_eq!(marks.project(workspace), Some(project));
+
+        // No marker is an answer too: one that appears afterwards changes nothing.
+        let other = WorkspaceId::random();
+        assert_eq!(marks.project(other), None);
+        std::fs::write(
+            marker.with_file_name(format!("{other}.factory")),
+            marker_text(project),
+        )
+        .unwrap();
+        assert_eq!(marks.project(other), None);
+    }
+
+    #[test]
+    fn a_marker_that_does_not_parse_is_answered_none_from_then_on_and_warned_of_once() {
+        let (data, workspace, marker) = marker_in("not json");
+        let marks = WorkspaceMarks::new(data.path());
+        assert_eq!(marks.project(workspace), None);
+        assert_eq!(marks.warned_count(), 1);
+
+        // Mended, it still answers none: the answer was kept and the folder not scanned again.
+        std::fs::write(&marker, marker_text(ProjectId::random())).unwrap();
+        assert_eq!(marks.project(workspace), None);
+        assert_eq!(marks.warned_count(), 1);
+    }
+
+    #[test]
+    fn a_marker_that_cannot_be_read_is_tried_again_and_warned_of_once() {
+        let project = ProjectId::random();
+        let (data, workspace, marker) = marker_in("");
+        std::fs::remove_file(&marker).unwrap();
+        std::fs::create_dir(&marker).unwrap();
+        let marks = WorkspaceMarks::new(data.path());
+
+        assert_eq!(marks.project(workspace), None);
+        assert_eq!(marks.project(workspace), None);
+        assert_eq!(marks.warned_count(), 1);
+
+        std::fs::remove_dir(&marker).unwrap();
+        std::fs::write(&marker, marker_text(project)).unwrap();
+        assert_eq!(marks.project(workspace), Some(project));
+    }
+
+    #[test]
+    fn a_worktrees_path_that_cannot_be_listed_is_not_answered_for_good() {
+        let project = ProjectId::random();
+        let data = tempfile::tempdir().unwrap();
+        let workspace = WorkspaceId::random();
+        let worktrees = data.path().join("worktrees");
+        // A file where the folder should be: listing it fails with ENOTDIR, not NotFound.
+        std::fs::write(&worktrees, "").unwrap();
+        let marks = WorkspaceMarks::new(data.path());
+
+        assert_eq!(marks.project(workspace), None);
+        assert_eq!(marks.project(workspace), None);
+        assert_eq!(marks.warned_count(), 1);
+
+        std::fs::remove_file(&worktrees).unwrap();
+        let folder = worktrees.join(project.to_string());
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(
+            folder.join(format!("{workspace}.factory")),
+            marker_text(project),
+        )
+        .unwrap();
+        assert_eq!(marks.project(workspace), Some(project));
+    }
+
+    /// A release build ignores `FOUNDRY_CLOCK_AHEAD`.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn this_release_build_ignores_foundry_clock_ahead() {
+        let (_dir, file) = clock_file("600");
+        let (_, dyn_base) = fake_base();
+
+        const { assert!(!CLOCK_AHEAD_ALLOWED) };
+        let clock = clock_for(Some(file.into_os_string()), CLOCK_AHEAD_ALLOWED, dyn_base);
+        assert_eq!(clock.now(), Duration::ZERO);
+    }
+
+    /// The debug build the tests run takes it.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn this_debug_build_takes_foundry_clock_ahead() {
+        let (_dir, file) = clock_file("600");
+        let (_, dyn_base) = fake_base();
+
+        const { assert!(CLOCK_AHEAD_ALLOWED) };
+        let clock = clock_for(Some(file.into_os_string()), CLOCK_AHEAD_ALLOWED, dyn_base);
+        assert_eq!(clock.now(), Duration::from_secs(600));
     }
 
     /// A coordinator and listing for a machine that acts alone, over a store holding what

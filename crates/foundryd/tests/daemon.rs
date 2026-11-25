@@ -23,7 +23,9 @@ use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use foundry_proto::factory::ProjectFactory;
+use foundry_proto::factory::{
+    FactoryBody, FactoryRecord, HeldUp, HeldUpKind, ProjectFactory, RunId,
+};
 use foundry_proto::ids::{MachineId, ProjectId, TerminalId};
 use foundry_proto::messages::{PROTOCOL, PeerMessage, UiMessage};
 use foundry_proto::record::{AnyRecord, MachineSample, Record, Session};
@@ -249,6 +251,7 @@ esac
             .env("FOUNDRY_PORT", port.to_string())
             .env("FOUNDRY_SECRETS", "file")
             .env("FOUNDRY_TAILSCALE", self.user.path().join("tailscale"))
+            .env("FOUNDRY_CLOCK_AHEAD", self.user.path().join("clock-ahead"))
             .env("HOME", self.user.path())
             .env("SHELL", &self.shell)
             .env_remove("CLAUDE_CONFIG_DIR");
@@ -372,6 +375,16 @@ esac
         settings.seq += 1;
         edit(&mut settings);
         assert!(store.apply_settings(settings).unwrap());
+    }
+
+    /// Moves the running daemon's clock to `total` ahead of the system's, for the factory's
+    /// ages: the daemon reads the file `FOUNDRY_CLOCK_AHEAD` names on each reading.
+    fn clock_ahead(&self, total: Duration) {
+        fs::write(
+            self.user.path().join("clock-ahead"),
+            total.as_secs().to_string(),
+        )
+        .unwrap();
     }
 
     /// A project whose remote, a local bare repo, has one commit on `main`.
@@ -1878,4 +1891,290 @@ fn the_priority_route_is_served_and_refuses_a_request_from_another_site() {
     let (status, answer) = ask(&here, None, order).expect("the route reads what it stores");
     assert_eq!(status, 204, "{answer}");
     assert_ne!(settings_of(&fixture).seq, before.seq);
+}
+
+const MINUTE: Duration = Duration::from_secs(60);
+
+/// Adds `project` to the settings with its factory on, acting as a login nobody holds.
+fn with_factory_on(settings: &mut SharedSettings, project: &Project) {
+    settings.projects.push(project.clone());
+    settings.project_factory.insert(
+        project.id,
+        ProjectFactory {
+            on: true,
+            login: "octocat".into(),
+            paused: false,
+        },
+    );
+}
+
+/// A project that is only a name and a URL, for a test that never clones it.
+fn named_project() -> Project {
+    Project {
+        id: ProjectId::random(),
+        name: "foundry".into(),
+        repo: "https://github.com/o/foundry.git".into(),
+    }
+}
+
+/// The attention items of `kind`.
+fn items_of(fixture: &Fixture, kind: &str) -> Vec<serde_json::Value> {
+    attention(fixture)
+        .into_iter()
+        .filter(|item| item["kind"] == kind)
+        .collect()
+}
+
+#[test]
+fn a_factory_on_with_no_status_raises_factory_idle_once_the_clock_is_10_minutes_on() {
+    let mut fixture = Fixture::new();
+    let project = named_project();
+    fixture.seed(|settings| with_factory_on(settings, &project));
+    fixture.start();
+
+    assert_eq!(
+        items_of(&fixture, "factory_idle"),
+        Vec::<serde_json::Value>::new()
+    );
+    fixture.clock_ahead(10 * MINUTE);
+
+    let idle = items_of(&fixture, "factory_idle");
+    assert_eq!(idle.len(), 1, "{idle:?}");
+    assert!(
+        idle[0]["what"].as_str().unwrap().contains("foundry"),
+        "{idle:?}"
+    );
+}
+
+/// A message on the peer link, to the daemon.
+async fn send(conn: &Conn, message: &PeerMessage) {
+    conn.send
+        .send(serde_json::to_string(message).unwrap())
+        .await
+        .unwrap();
+}
+
+/// A message with no record, which keeps the link in use and so the peer online.
+fn heartbeat() -> PeerMessage {
+    PeerMessage::Records {
+        protocol: PROTOCOL,
+        records: Vec::new(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_holders_status_received_at_9_minutes_keeps_factory_idle_away_at_10() {
+    let mut fixture = Fixture::new();
+    let project = named_project();
+    fixture.seed(|settings| with_factory_on(settings, &project));
+    let (conn, peer, _other) = keyed_peer_link(&mut fixture).await;
+    fixture.clock_ahead(9 * MINUTE);
+
+    let mut status = foundryd::factory::status::build(foundryd::factory::status::PassResults {
+        generation: 1,
+        pass: 1,
+        ..foundryd::factory::status::PassResults::new(project.id)
+    });
+    status.held_up.push(HeldUp {
+        run: RunId::new("o/foundry", 12, 1).unwrap(),
+        kind: HeldUpKind::Stuck,
+        reason: "the gate failed".into(),
+    });
+    send(
+        &conn,
+        &PeerMessage::FactoryRecords {
+            protocol: PROTOCOL,
+            records: vec![FactoryRecord {
+                owner: peer,
+                version: 1,
+                body: FactoryBody::Status(status),
+            }],
+        },
+    )
+    .await;
+    tokio::task::block_in_place(|| {
+        wait_for("the peer's stuck run", || {
+            (!items_of(&fixture, "run_stuck").is_empty()).then_some(())
+        });
+    });
+
+    fixture.clock_ahead(10 * MINUTE);
+    send(&conn, &heartbeat()).await;
+    tokio::task::block_in_place(|| {
+        assert_eq!(
+            items_of(&fixture, "factory_idle"),
+            Vec::<serde_json::Value>::new()
+        );
+    });
+
+    fixture.clock_ahead(20 * MINUTE);
+    send(&conn, &heartbeat()).await;
+    tokio::task::block_in_place(|| {
+        let idle = items_of(&fixture, "factory_idle");
+        assert_eq!(idle.len(), 1, "{idle:?}");
+    });
+}
+
+#[test]
+fn a_session_this_machine_marks_as_a_factory_session_raises_no_waiting_item_and_a_persons_does() {
+    let mut fixture = Fixture::new();
+    fake_claude(
+        &mut fixture,
+        "- hook: {event: UserPromptSubmit, prompt: \"tidy up\"}\n- hook: {event: Notification, message: \"Claude needs your permission to use Bash\"}\n- sleep_ms: 600000\n",
+    );
+    let project = fixture.project();
+    // The factory is off while the workspace is made: a project whose factory is on makes one
+    // only with a token for its login.
+    fixture.seed(|settings| settings.projects.push(project.clone()));
+    fixture.start();
+    let workspace = fixture.workspace(&project);
+    let sessions = [
+        session_in(&fixture, &workspace),
+        session_in(&fixture, &workspace),
+    ];
+    let waiting = |fixture: &Fixture| {
+        items_of(fixture, "session_waiting")
+            .into_iter()
+            .map(|item| item["id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    let id_of_item = |session: &String| format!("session_waiting:{session}");
+    wait_for("both sessions waiting", || {
+        let ids = waiting(&fixture);
+        sessions
+            .iter()
+            .all(|s| ids.contains(&id_of_item(s)))
+            .then_some(())
+    });
+    assert_eq!(fixture.stop(), Some(0));
+    fixture.seed(|settings| {
+        settings.project_factory.insert(
+            project.id,
+            ProjectFactory {
+                on: true,
+                login: "octocat".into(),
+                paused: false,
+            },
+        );
+    });
+
+    // The mark a factory start writes, as `sessions/factory.rs` does: private, in the
+    // session's own folder.
+    let folder = fixture.home.path().join("sessions").join(&sessions[0]);
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&folder)
+            .unwrap();
+    }
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(folder.join("factory"))
+            .unwrap();
+        file.write_all(project.id.to_string().as_bytes()).unwrap();
+    }
+    fixture.start();
+
+    let ids = wait_for("the person's session waiting", || {
+        let ids = waiting(&fixture);
+        ids.contains(&id_of_item(&sessions[1])).then_some(ids)
+    });
+    assert!(!ids.contains(&id_of_item(&sessions[0])), "{ids:?}");
+}
+
+/// A project whose repo has a `.dw/config.yml` that provisions with a command that fails, so
+/// each workspace's setup terminal exits non-zero.
+fn project_with_failing_setup(fixture: &Fixture) -> Project {
+    let project = fixture.project();
+    let src = fixture.user.path().join("remote").join("src");
+    fs::create_dir_all(src.join(".dw")).unwrap();
+    fs::write(
+        src.join(".dw").join("config.yml"),
+        "factory:\n  provision:\n    - \"exit 3\"\n",
+    )
+    .unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-q", "-m", "provision"]);
+    git(&src, &["push", "-q", "origin", "main"]);
+    project
+}
+
+/// A workspace of `project` called `name`, made over the API.
+fn workspace_named(fixture: &Fixture, project: &Project, name: &str) -> String {
+    let (status, body) = fixture.call(
+        "POST",
+        "/api/workspaces",
+        Some(serde_json::json!({"project": project.id, "base": "main", "name": name})),
+    );
+    assert_eq!(status, 201, "{body}");
+    id_of(&body)
+}
+
+#[test]
+fn a_workspace_this_machine_marks_as_a_factory_workspace_raises_no_setup_failed_and_a_persons_does()
+{
+    let mut fixture = Fixture::new();
+    let project = project_with_failing_setup(&fixture);
+    // The factory is off while the workspaces are made: a project whose factory is on makes
+    // one only with a token for its login.
+    fixture.seed(|settings| settings.projects.push(project.clone()));
+    fixture.start();
+    let workspaces = [
+        workspace_named(&fixture, &project, "one"),
+        workspace_named(&fixture, &project, "two"),
+    ];
+    let failed = |fixture: &Fixture| {
+        items_of(fixture, "setup_failed")
+            .into_iter()
+            .map(|item| item["id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    let item_of = |workspace: &String| format!("setup_failed:{workspace}");
+    wait_for("both setups failed", || {
+        let ids = failed(&fixture);
+        workspaces
+            .iter()
+            .all(|w| ids.contains(&item_of(w)))
+            .then_some(())
+    });
+    assert_eq!(fixture.stop(), Some(0));
+    fixture.seed(|settings| {
+        settings.project_factory.insert(
+            project.id,
+            ProjectFactory {
+                on: true,
+                login: "octocat".into(),
+                paused: false,
+            },
+        );
+    });
+
+    // The marker `Workspaces` writes for a workspace made with a factory tag.
+    fs::write(
+        fixture
+            .home
+            .path()
+            .join("worktrees")
+            .join(project.id.to_string())
+            .join(format!("{}.factory", workspaces[0])),
+        format!(
+            r#"{{"project":"{}","run":"o/r#1","name":"one"}}"#,
+            project.id
+        ),
+    )
+    .unwrap();
+    fixture.start();
+
+    let ids = wait_for("the person's setup failed", || {
+        let ids = failed(&fixture);
+        ids.contains(&item_of(&workspaces[1])).then_some(ids)
+    });
+    assert!(!ids.contains(&item_of(&workspaces[0])), "{ids:?}");
 }

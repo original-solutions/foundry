@@ -56,6 +56,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::coordinator::Coordinator;
+use crate::factory::status::Freshness;
 use crate::store::{Store, StoreError};
 use crate::terminals::Terminals;
 
@@ -165,6 +166,9 @@ struct Inner {
     /// The coordinator a record link hands settings and edits to; none until
     /// [`Peers::coordinate`]. Held weakly, as the coordinator holds these peers.
     coordinator: Mutex<Option<Weak<Coordinator>>>,
+    /// What a record link tells of each factory status it stores from a peer; none until
+    /// [`Peers::hear_statuses`]. Held strongly: it holds nothing of these peers.
+    freshness: Mutex<Option<Arc<Freshness>>>,
     /// Each open record link past its hellos, by peer and link number.
     links: Mutex<BTreeMap<MachineId, BTreeMap<u64, Link>>>,
     next_link: AtomicU64,
@@ -184,6 +188,7 @@ impl Peers {
                 terminals: Mutex::new(None),
                 calls: Mutex::new(None),
                 coordinator: Mutex::new(None),
+                freshness: Mutex::new(None),
                 links: Mutex::new(BTreeMap::new()),
                 next_link: AtomicU64::new(0),
                 factory_changed: watch::Sender::new(0),
@@ -281,6 +286,12 @@ impl Peers {
     /// changes. Until this is called, links neither send settings nor take them.
     pub fn coordinate(&self, coordinator: Arc<Coordinator>) {
         *lock(&self.inner.coordinator) = Some(Arc::downgrade(&coordinator));
+    }
+
+    /// Has each factory status a record link stores from a peer told to `freshness`, as
+    /// [`Freshness::received`] hears of it. Until this is called, none is.
+    pub fn hear_statuses(&self, freshness: Arc<Freshness>) {
+        *lock(&self.inner.freshness) = Some(freshness);
     }
 
     /// Sends `edit` to `machine` on an open record link, in that link's protocol, and returns the

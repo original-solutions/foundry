@@ -19,23 +19,28 @@
 //! count ([`FACTORY_BATCH_BYTES`]): a link refuses a WebSocket message far smaller than
 //! [`BATCH`] such events.
 //!
+//! Each factory status taken from a peer is also told to the [`Freshness`] that
+//! [`Peers::hear_statuses`](super::Peers::hear_statuses) was given, which is what counts it as
+//! word from the lease's holder.
+//!
 //! [`Peers::factory_changes`](super::Peers::factory_changes) tells readers that a factory
 //! record was stored: at once for one taken from a peer, and within a [`TICK`] for one this
 //! machine wrote, which [`watch_own`] looks for while [`Peers::run`](super::Peers::run) runs.
 //!
+//! [`Freshness`]: crate::factory::status::Freshness
 //! [`Store::apply_factory`]: crate::store::Store::apply_factory
 //! [`Store::own_next_factory_version`]: crate::store::Store::own_next_factory_version
 
 use std::collections::BTreeMap;
 
-use foundry_proto::factory::FactoryRecord;
+use foundry_proto::factory::{FactoryBody, FactoryRecord};
 use foundry_proto::ids::MachineId;
 use foundry_proto::messages::{FACTORY_SINCE, PeerMessage};
 use tokio::sync::mpsc::Sender;
 use tokio::time::Instant;
 
 use super::link::send_message;
-use super::{BATCH, Inner, TICK, WARN_EVERY, on_store};
+use super::{BATCH, Inner, TICK, WARN_EVERY, lock, on_store};
 use crate::store::{Applied, Store, StoreError};
 
 /// The most bytes of records, as JSON, one factory message carries, past its first record. A
@@ -210,6 +215,12 @@ fn fitting(records: &[FactoryRecord], budget: usize) -> usize {
 /// store then holds a prefix of the peer's factory records, and the next link's hello asks
 /// again for the rest.
 ///
+/// Each factory status stored is told to the [`Freshness`](crate::factory::status::Freshness)
+/// [`Peers::hear_statuses`](super::Peers::hear_statuses) was given, under the store's lock
+/// beside the tell of [`Peers::factory_changes`](super::Peers::factory_changes), so a take a
+/// closing link drops still tells of every status it stored. A status refused or stale tells
+/// it nothing, so only a status that is stored counts as word from its holder.
+///
 /// Each record is stored under the store's lock taken for it alone, since each commits on its
 /// own, so a catch-up never holds the store from its other users for a whole message. Each is
 /// told where it is stored, so a take that a closing link drops part way still tells of every
@@ -229,10 +240,16 @@ pub(super) async fn take(
     }
     for record in records {
         let changed = inner.factory_changed.clone();
+        let freshness = lock(&inner.freshness).clone();
         let (applied, record) = on_store(&inner.store, move |store| {
             let applied = store.apply_factory(&record, peer);
             if matches!(applied, Ok(Applied::Stored)) {
                 super::tell(&changed);
+                // Told here, not after the await: a take a closing link drops still ends this
+                // closure, and a resend of a stored status comes back stale.
+                if let (Some(freshness), FactoryBody::Status(status)) = (&freshness, &record.body) {
+                    freshness.received(status);
+                }
             }
             (applied, record)
         })
@@ -323,11 +340,16 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use foundry_proto::factory::{FactoryBody, RunEvent, RunId};
-    use foundry_proto::settings::Machine;
+    use foundry_proto::factory::{FactoryBody, ProjectFactory, RunEvent, RunId};
+    use foundry_proto::ids::{ProjectId, SessionId, WorkspaceId};
+    use foundry_proto::settings::{Machine, Project};
     use futures::future::BoxFuture;
 
     use super::*;
+    use crate::attention::{Attention, Kind, Marks};
+    use crate::clock::{Clock, FakeClock};
+    use crate::coordinator::Coordinator;
+    use crate::factory::status::{self, Freshness, PassResults};
     use crate::sync::{Conn, Dialer, Peers, lock};
 
     struct NoDial;
@@ -384,6 +406,217 @@ mod tests {
         assert!(
             changes.has_changed().unwrap(),
             "records stored before the cancel were never told"
+        );
+    }
+
+    /// Marks nothing: every session and workspace is a person's.
+    struct NoMarks;
+
+    impl Marks for NoMarks {
+        fn factory_session(&self, _: SessionId) -> Option<ProjectId> {
+            None
+        }
+
+        fn factory_workspace(&self, _: WorkspaceId) -> Option<ProjectId> {
+            None
+        }
+    }
+
+    const MINUTE: Duration = Duration::from_secs(60);
+
+    /// This machine, its store and peers told of statuses, a project whose factory is on with
+    /// this machine acting, and an attention list over them on a clock the test moves.
+    struct Heard {
+        _data: tempfile::TempDir,
+        peers: Peers,
+        clock: Arc<FakeClock>,
+        freshness: Arc<Freshness>,
+        attention: Attention,
+        project: ProjectId,
+    }
+
+    impl Heard {
+        fn new() -> Self {
+            let data = tempfile::tempdir().unwrap();
+            let me = MachineId::random();
+            let mut store = Store::open(data.path().join("foundry.db")).unwrap();
+            let project = Project {
+                id: ProjectId::random(),
+                name: "foundry".into(),
+                repo: "https://github.com/o/foundry.git".into(),
+            };
+            let mut settings = store.settings().unwrap();
+            settings.projects.push(project.clone());
+            settings.project_factory.insert(
+                project.id,
+                ProjectFactory {
+                    on: true,
+                    login: "octocat".into(),
+                    paused: false,
+                },
+            );
+            settings.priority = vec![me];
+            settings.seq += 1;
+            assert!(store.apply_settings(settings).unwrap());
+            let store = Arc::new(Mutex::new(store));
+            let peers = Peers::new(me, store.clone(), Arc::new(NoDial));
+            let coordinator = Arc::new(Coordinator::new(me, store.clone(), peers.clone()));
+            let clock = Arc::new(FakeClock::new());
+            let dyn_clock: Arc<dyn Clock> = clock.clone();
+            let freshness = Arc::new(Freshness::new(dyn_clock.clone()));
+            peers.hear_statuses(freshness.clone());
+            let attention = Attention::new(me, store, peers.clone(), coordinator).with_factory(
+                dyn_clock,
+                freshness.clone(),
+                Arc::new(NoMarks),
+            );
+            Self {
+                _data: data,
+                peers,
+                clock,
+                freshness,
+                attention,
+                project: project.id,
+            }
+        }
+
+        fn status(&self, owner: MachineId, version: u64, pass: u64) -> FactoryRecord {
+            FactoryRecord {
+                owner,
+                version,
+                body: FactoryBody::Status(status::build(PassResults {
+                    generation: 1,
+                    pass,
+                    ..PassResults::new(self.project)
+                })),
+            }
+        }
+
+        async fn idle(&self) -> bool {
+            let items = self.attention.items().await.unwrap();
+            items.iter().any(|item| item.kind == Kind::FactoryIdle)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_status_taken_at_9_minutes_keeps_factory_idle_away_at_10() {
+        let heard = Heard::new();
+        let peer = MachineId::random();
+        heard.clock.advance(9 * MINUTE);
+
+        take(
+            &heard.peers.inner,
+            peer,
+            FACTORY_SINCE,
+            vec![heard.status(peer, 1, 1)],
+        )
+        .await
+        .unwrap();
+        heard.clock.advance(MINUTE);
+
+        assert!(!heard.idle().await, "idle 1 minute after the holder's word");
+        heard.clock.advance(10 * MINUTE);
+        assert!(heard.idle().await, "the list never raises it");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_status_refused_or_stale_tells_freshness_nothing() {
+        let heard = Heard::new();
+        let (peer, other) = (MachineId::random(), MachineId::random());
+        heard.clock.advance(5 * MINUTE);
+
+        // Owned by another machine than the one that sent it.
+        take(
+            &heard.peers.inner,
+            peer,
+            FACTORY_SINCE,
+            vec![heard.status(other, 1, 1)],
+        )
+        .await
+        .unwrap();
+        assert_eq!(heard.freshness.since_holding(heard.project), 5 * MINUTE);
+
+        // Stored: heard now. Then the same version again with a higher pass: stale.
+        take(
+            &heard.peers.inner,
+            peer,
+            FACTORY_SINCE,
+            vec![heard.status(peer, 3, 1)],
+        )
+        .await
+        .unwrap();
+        assert_eq!(heard.freshness.since_holding(heard.project), Duration::ZERO);
+        heard.clock.advance(3 * MINUTE);
+        take(
+            &heard.peers.inner,
+            peer,
+            FACTORY_SINCE,
+            vec![heard.status(peer, 3, 2)],
+        )
+        .await
+        .unwrap();
+        assert_eq!(heard.freshness.since_holding(heard.project), 3 * MINUTE);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_status_taken_on_a_link_that_carries_no_factory_record_tells_freshness_nothing() {
+        let heard = Heard::new();
+        let peer = MachineId::random();
+        heard.clock.advance(5 * MINUTE);
+
+        take(
+            &heard.peers.inner,
+            peer,
+            FACTORY_SINCE - 1,
+            vec![heard.status(peer, 1, 1)],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(heard.freshness.since_holding(heard.project), 5 * MINUTE);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_status_a_take_stored_before_it_was_dropped_still_tells_freshness() {
+        use std::future::Future as _;
+        use std::task::{Context, Poll, Waker};
+
+        let heard = Heard::new();
+        let peer = MachineId::random();
+        heard.clock.advance(5 * MINUTE);
+
+        // Polled once by hand, which hands the record to the store's thread, and never
+        // again: a take a closing link drops while it waits on the store.
+        let mut taking = Box::pin(take(
+            &heard.peers.inner,
+            peer,
+            FACTORY_SINCE,
+            vec![heard.status(peer, 1, 1)],
+        ));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(taking.as_mut().poll(&mut cx), Poll::Pending));
+        let end = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let stored = lock(&heard.peers.inner.store)
+                .factory_versions()
+                .unwrap()
+                .get(&peer)
+                == Some(&1);
+            if stored {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < end,
+                "the status was never stored"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        drop(taking);
+
+        assert_eq!(
+            heard.freshness.since_holding(heard.project),
+            Duration::ZERO,
+            "a stored status was never told to freshness"
         );
     }
 
