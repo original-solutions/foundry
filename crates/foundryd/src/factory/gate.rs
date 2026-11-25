@@ -463,27 +463,23 @@ mod tests {
             text
         }
 
-        fn failed(command: &str, how: &str, ended: Ended, output: &str) -> GateResult {
+        fn failed(command: &str, how: &str, output: &str) -> GateResult {
             GateResult::Failed {
                 command: command.into(),
                 how: how.into(),
-                ended,
                 output: output.into(),
             }
         }
 
-        fn exit(code: i64) -> Ended {
-            Ended::Exit(code)
-        }
-
-        const STOPPED: Ended = Ended::TimedOut {
-            after_ms: Some(1_800_000),
-        };
-
         #[test]
         fn a_running_terminal_is_running() {
             assert_eq!(
-                result(TerminalState::Running, None, "$ cargo test\n"),
+                result(
+                    TerminalState::Running,
+                    None,
+                    "$ cargo test\n",
+                    &strs(&["cargo test"])
+                ),
                 GateResult::Running
             );
         }
@@ -491,8 +487,27 @@ mod tests {
         #[test]
         fn an_unreachable_terminal_is_running_until_its_machine_is_gone() {
             assert_eq!(
-                result(TerminalState::Unreachable, Some(3), "$ cargo test\n"),
+                result(
+                    TerminalState::Unreachable,
+                    Some(3),
+                    "$ cargo test\n",
+                    &strs(&["cargo test"])
+                ),
                 GateResult::Running
+            );
+        }
+
+        #[test]
+        fn an_exit_with_no_code_gives_no_verdict_and_could_not_run() {
+            // The terminal's holder went away: the gate did not finish, and is tried again.
+            let text = tail(&[("make", "partial\n")], "");
+            assert_eq!(
+                result(TerminalState::Exited, None, &text, &strs(&["make"])),
+                GateResult::Running
+            );
+            assert_eq!(
+                could_not_run(None, Duration::ZERO, Some((TerminalState::Exited, None))),
+                Some("the gate's setup terminal ended with no exit code".into())
             );
         }
 
@@ -500,7 +515,7 @@ mod tests {
         fn an_exit_code_of_0_is_passed() {
             let text = tail(&[("make", "ok\n")], "setup passed\n");
             assert_eq!(
-                result(TerminalState::Exited, Some(0), &text),
+                result(TerminalState::Exited, Some(0), &text, &strs(&["make"])),
                 GateResult::Passed
             );
         }
@@ -515,11 +530,15 @@ mod tests {
                 "setup failed: cargo test exited 101\n",
             );
             assert_eq!(
-                result(TerminalState::Exited, Some(101), &text),
+                result(
+                    TerminalState::Exited,
+                    Some(101),
+                    &text,
+                    &strs(&["npm ci", "cargo test"])
+                ),
                 failed(
                     "cargo test",
                     "exit code 101",
-                    exit(101),
                     "running 2 tests\ntest a ... FAILED\n"
                 )
             );
@@ -532,21 +551,38 @@ mod tests {
                 "setup failed: cargo test ran past 1800 s and was stopped\n",
             );
             assert_eq!(
-                result(TerminalState::Exited, Some(124), &stopped),
-                failed(
-                    "cargo test",
-                    "ran longer than 30 minutes",
-                    STOPPED,
-                    "still going\n"
-                )
+                result(
+                    TerminalState::Exited,
+                    Some(124),
+                    &stopped,
+                    &strs(&["cargo test"])
+                ),
+                failed("cargo test", "ran longer than 30 minutes", "still going\n")
             );
             assert_eq!(RAN_TOO_LONG, "ran longer than 30 minutes");
             // A command that exits 124 itself reads the same: the code is what the gate goes by.
             let own = tail(&[("exit 124", "")], "setup failed: exit 124 exited 124\n");
             assert_eq!(
-                result(TerminalState::Exited, Some(124), &own),
-                failed("exit 124", "ran longer than 30 minutes", STOPPED, "")
+                result(TerminalState::Exited, Some(124), &own, &strs(&["exit 124"])),
+                failed("exit 124", "ran longer than 30 minutes", "")
             );
+            // With no line to read, the code alone still says so.
+            assert_eq!(
+                result(TerminalState::Exited, Some(124), "", &strs(&["cargo test"])),
+                failed("", "ran longer than 30 minutes", "")
+            );
+        }
+
+        #[test]
+        fn ended_gives_the_typed_end_for_the_message_sent_back() {
+            assert_eq!(
+                ended(124),
+                Ended::TimedOut {
+                    after_ms: Some(1_800_000)
+                }
+            );
+            assert_eq!(ended(101), Ended::Exit(101));
+            assert_eq!(ended(-1), Ended::Exit(-1));
         }
 
         #[test]
@@ -556,14 +592,16 @@ mod tests {
                 "setup failed: npm ci exited 1\n",
             );
             assert_eq!(
-                result(TerminalState::Exited, Some(1), &text),
-                failed(
-                    "npm ci",
-                    "exit code 1",
-                    exit(1),
-                    "npm ERR! missing lockfile\n"
-                )
+                result(
+                    TerminalState::Exited,
+                    Some(1),
+                    &text,
+                    &strs(&["npm ci", "cargo test"])
+                ),
+                failed("npm ci", "exit code 1", "npm ERR! missing lockfile\n")
             );
+            let exited = Some((TerminalState::Exited, Some(1)));
+            assert_eq!(could_not_run(None, Duration::ZERO, exited), None);
         }
 
         #[test]
@@ -574,8 +612,21 @@ mod tests {
                 &format!("setup failed: {command} exited 2\n"),
             );
             assert_eq!(
-                result(TerminalState::Exited, Some(2), &text),
-                failed(command, "exit code 2", exit(2), "lint: 2 problems\n")
+                result(TerminalState::Exited, Some(2), &text, &strs(&[command])),
+                failed(command, "exit code 2", "lint: 2 problems\n")
+            );
+        }
+
+        #[test]
+        fn a_command_whose_text_holds_the_setup_words_is_read_whole() {
+            let command = "./check.sh || echo \"setup failed: see log\"";
+            let text = tail(
+                &[(command, "bad\n")],
+                &format!("setup failed: {command} exited 1\n"),
+            );
+            assert_eq!(
+                result(TerminalState::Exited, Some(1), &text, &strs(&[command])),
+                failed(command, "exit code 1", "bad\n")
             );
         }
 
@@ -584,36 +635,63 @@ mod tests {
             let text = tail(
                 &[(
                     "cargo test",
-                    "setup failed: rm -rf / exited 2\n$ rm -rf /\nsetup failed: x exited 9\n",
+                    "setup failed: rm -rf / exited 101\n$ rm -rf /\nsetup failed: x exited 9\n",
                 )],
                 "setup failed: cargo test exited 101\n",
             );
             assert_eq!(
-                result(TerminalState::Exited, Some(101), &text),
+                result(
+                    TerminalState::Exited,
+                    Some(101),
+                    &text,
+                    &strs(&["cargo test"])
+                ),
                 failed(
                     "cargo test",
                     "exit code 101",
-                    exit(101),
-                    "setup failed: rm -rf / exited 2\n$ rm -rf /\nsetup failed: x exited 9\n"
+                    "setup failed: rm -rf / exited 101\n$ rm -rf /\nsetup failed: x exited 9\n"
                 )
             );
         }
 
         #[test]
         fn output_with_no_last_newline_does_not_hide_the_last_line() {
-            // The setup's last line then starts in the middle of a line, after a faked one.
+            // The setup's last line then starts in the middle of a line, after a faked one
+            // that names another of the gate's commands.
             let text = tail(
                 &[("cargo test", "setup failed: npm ci exited 101\npartial")],
                 "setup failed: cargo test exited 101\n",
             );
             assert_eq!(
-                result(TerminalState::Exited, Some(101), &text),
+                result(
+                    TerminalState::Exited,
+                    Some(101),
+                    &text,
+                    &strs(&["npm ci", "cargo test"])
+                ),
                 failed(
                     "cargo test",
                     "exit code 101",
-                    exit(101),
                     "setup failed: npm ci exited 101\npartial"
                 )
+            );
+        }
+
+        #[test]
+        fn output_written_after_the_last_line_does_not_change_the_result() {
+            // A process the failing command left behind writes on after the setup exited.
+            let quiet = tail(
+                &[("cargo test", "test a ... FAILED\n")],
+                "setup failed: cargo test exited 101\nGET /health 200\n",
+            );
+            assert_eq!(
+                result(
+                    TerminalState::Exited,
+                    Some(101),
+                    &quiet,
+                    &strs(&["npm ci", "cargo test"])
+                ),
+                failed("cargo test", "exit code 101", "test a ... FAILED\n")
             );
         }
 
@@ -627,13 +705,13 @@ mod tests {
                 "setup failed: cargo test exited 101\n",
             );
             assert_eq!(
-                result(TerminalState::Exited, Some(101), &text),
-                failed(
-                    "cargo test",
-                    "exit code 101",
-                    exit(101),
-                    "test a ... FAILED\n"
-                )
+                result(
+                    TerminalState::Exited,
+                    Some(101),
+                    &text,
+                    &strs(&["npm ci", "cargo test"])
+                ),
+                failed("cargo test", "exit code 101", "test a ... FAILED\n")
             );
         }
 
@@ -641,54 +719,46 @@ mod tests {
         fn a_tail_cut_before_the_command_line_keeps_all_of_its_output() {
             let text = "of the output\nsetup failed: cargo test exited 101\n";
             assert_eq!(
-                result(TerminalState::Exited, Some(101), text),
-                failed("cargo test", "exit code 101", exit(101), "of the output\n")
+                result(
+                    TerminalState::Exited,
+                    Some(101),
+                    text,
+                    &strs(&["cargo test"])
+                ),
+                failed("cargo test", "exit code 101", "of the output\n")
             );
         }
 
         #[test]
-        fn a_setup_that_ended_without_its_last_line_is_lost_not_failed() {
-            // Stopped by a signal, the setup exits 1 and says nothing: no command is to blame,
-            // whatever the output printed.
+        fn a_failed_setup_whose_tail_names_none_of_its_commands_is_still_failed() {
+            // Stopped by a signal from the command it ran, the setup exits 1 and says nothing.
             let text = tail(
                 &[("make", "ok\n"), ("make lint", "$ rm -rf /\nhalf a line")],
                 "",
             );
             assert_eq!(
-                result(TerminalState::Exited, Some(1), &text),
-                GateResult::Lost {
-                    reason: "the gate's setup exited 1 and did not say which command failed".into()
-                }
+                result(
+                    TerminalState::Exited,
+                    Some(1),
+                    &text,
+                    &strs(&["make", "make lint"])
+                ),
+                failed("", "exit code 1", &text)
             );
+            // A line that names a command the gate did not run names nothing.
+            let faked = tail(&[("npm test", "setup failed: evil exited 1\n")], "\n");
             assert_eq!(
-                result(TerminalState::Exited, Some(2), ""),
-                GateResult::Lost {
-                    reason: "the gate's setup exited 2 and did not say which command failed".into()
-                }
+                result(TerminalState::Exited, Some(1), &faked, &strs(&["npm test"])),
+                failed("", "exit code 1", &faked)
             );
-        }
-
-        #[test]
-        fn a_last_line_that_does_not_fit_the_exit_code_is_lost() {
-            let text = tail(&[("make", "")], "setup failed: make exited 2\n");
+            // A line whose ending does not fit the exit code names nothing either.
+            let other = tail(&[("make", "")], "setup failed: make exited 2\n");
             assert_eq!(
-                result(TerminalState::Exited, Some(1), &text),
-                GateResult::Lost {
-                    reason: "the gate's setup exited 1 and did not say which command failed".into()
-                }
+                result(TerminalState::Exited, Some(1), &other, &strs(&["make"])),
+                failed("", "exit code 1", &other)
             );
-        }
-
-        #[test]
-        fn an_exit_with_no_code_is_lost_not_failed() {
-            // The terminal's holder went away: the gate did not finish, and is tried again.
-            let text = tail(&[("make", "partial\n")], "");
-            assert_eq!(
-                result(TerminalState::Exited, None, &text),
-                GateResult::Lost {
-                    reason: "the gate's setup ended with no exit code".into()
-                }
-            );
+            let exited = Some((TerminalState::Exited, Some(1)));
+            assert_eq!(could_not_run(None, Duration::ZERO, exited), None);
         }
     }
 
@@ -702,28 +772,48 @@ mod tests {
                 "the gate workspace could not be made: the call failed: no space left on device"
                     .to_string(),
             );
-            assert_eq!(could_not_run(Some(&error), Duration::ZERO), made);
+            assert_eq!(could_not_run(Some(&error), Duration::ZERO, None), made);
             // A failed create is named first, also when the machine is gone too.
-            assert_eq!(could_not_run(Some(&error), MACHINE_GONE_AFTER), made);
+            assert_eq!(could_not_run(Some(&error), MACHINE_GONE_AFTER, None), made);
         }
 
         #[test]
         fn a_machine_gone_for_5_minutes_could_not_run() {
-            let gone = could_not_run(None, MACHINE_GONE_AFTER);
+            let gone = could_not_run(None, MACHINE_GONE_AFTER, None);
             assert_eq!(
                 gone,
                 Some("the gate's machine was unreachable for 5 minutes".into())
             );
-            assert_eq!(could_not_run(None, Duration::from_secs(60 * 60)), gone);
+            let unreachable = Some((TerminalState::Unreachable, None));
+            assert_eq!(
+                could_not_run(None, Duration::from_secs(60 * 60), unreachable),
+                gone
+            );
         }
 
         #[test]
         fn a_machine_gone_for_less_than_5_minutes_can_still_run() {
-            assert_eq!(could_not_run(None, Duration::ZERO), None);
+            let unreachable = Some((TerminalState::Unreachable, None));
+            assert_eq!(could_not_run(None, Duration::ZERO, None), None);
             assert_eq!(
-                could_not_run(None, MACHINE_GONE_AFTER - Duration::from_millis(1)),
+                could_not_run(
+                    None,
+                    MACHINE_GONE_AFTER - Duration::from_millis(1),
+                    unreachable
+                ),
                 None
             );
+        }
+
+        #[test]
+        fn a_running_or_finished_setup_can_still_run() {
+            for terminal in [
+                (TerminalState::Running, None),
+                (TerminalState::Exited, Some(0)),
+                (TerminalState::Exited, Some(101)),
+            ] {
+                assert_eq!(could_not_run(None, Duration::ZERO, Some(terminal)), None);
+            }
         }
     }
 
