@@ -1121,6 +1121,7 @@ mod tests {
                 .status()
                 .unwrap();
             assert!(init.success());
+            git_text(&path, &["config", "uploadpack.allowFilter", "true"]);
             let tree = git_text(&path, &["hash-object", "-t", "tree", "-w", "--stdin"]);
             let main = git_text(&path, &["commit-tree", &tree, "-m", "main"]);
             git_text(&path, &["update-ref", "refs/heads/main", &main]);
@@ -1325,6 +1326,7 @@ mod tests {
                 GitAuth::for_login(&secrets, "tester", &data).unwrap()
             });
             let wrapper = root.join(format!("git-{n}"));
+            fs::write(marks.join("needfilter"), "").unwrap();
             fs::write(&wrapper, wrapper_script(&marks)).unwrap();
             fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
             // Another test's fork may hold the script open for a moment after it is written, and
@@ -1353,7 +1355,8 @@ mod tests {
     }
 
     /// A `git` that logs its arguments and, for a push, does what the marker files in `marks`
-    /// ask: `readfail` (a fetch or ls-remote fails), `fetchfail` (only a fetch fails), `reject` (the
+    /// ask: `needfilter` (a fetch without `--filter=tree:0` fails), `catfail` (the next `cat-file commit`
+    /// fails, once), `readfail` (a fetch or ls-remote fails), `fetchfail` (only a fetch fails), `reject` (the
     /// remote rejects the push with a `!` line, as a ruleset does), `linger` (the push leaves a child holding the
     /// pipes and exits 0), `fail` (the push fails), `hang` (it never returns), `hold` (it waits for `go`
     /// before it pushes) and `after` (it pushes, then waits for `go` before it exits).
@@ -1366,6 +1369,14 @@ echo "$@" >> "$M/argv"
 names=$(env | cut -d= -f1 | grep -E '^(GIT_ASKPASS|FOUNDRY_GIT_TOKEN|GIT_CONFIG_GLOBAL)$' | tr '\n' ' ')
 args=$(printf '%s' "$*" | tr '\n' ' ')
 printf '%s| %s\n' "$names" "$args" >> "$M/calls"
+case " $* " in
+  *" cat-file commit "*)
+    if [ -e "$M/catfail" ]; then rm "$M/catfail"; echo 'fatal: bad object' >&2; exit 128; fi;;
+  *" fetch "*)
+    if [ -e "$M/needfilter" ]; then
+      case " $* " in *" --filter=tree:0 "*) ;; *) echo 'fatal: fetch without --filter=tree:0' >&2; exit 128;; esac
+    fi;;
+esac
 push=no
 for a in "$@"; do
   if [ "$a" = push ]; then push=yes; fi
@@ -1759,8 +1770,23 @@ exec git "$@"
             // The directory fetches nothing but the lease ref, and a machine that only pushed
             // has no ref at all.
             assert!(refs.lines().all(|name| name == REF), "{refs}");
-            let remotes = git_out(&machine.dir, &["config", "--get-regexp", r"^remote\."]);
-            assert!(remotes.stdout.is_empty());
+            // One remote, for the fetch of the lease alone: no fetch refspec, no branch.
+            let remotes = git_text(&machine.dir, &["config", "--get-regexp", r"^remote\."]);
+            let mut keys: Vec<&str> = remotes
+                .lines()
+                .map(|line| line.split_once(' ').unwrap().0)
+                .collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                [
+                    "remote.lease.partialclonefilter",
+                    "remote.lease.promisor",
+                    "remote.lease.url"
+                ]
+            );
+            let heads = git_text(&machine.dir, &["for-each-ref", "refs/heads"]);
+            assert_eq!(heads, "");
             let main = git_out(&machine.dir, &["cat-file", "-e", &rig.remote.main]);
             assert!(!main.status.success(), "the lease directory holds main");
         }
@@ -2305,5 +2331,67 @@ exec git "$@"
         b.unmark("readfail");
         b.advance(secs(30));
         assert_eq!(b.tick(0), held(2));
+    }
+
+    #[test]
+    fn a_read_that_fails_is_not_a_foreign_commit_and_takes_nothing() {
+        let rig = Rig::new();
+        let a = rig.machine();
+        let b = rig.machine();
+        assert_eq!(a.tick(4), held(5));
+        let sha = rig.remote.sha();
+        b.mark("catfail");
+        assert_eq!(reason_of(&b.tick(0)), NOT_FETCHED);
+        assert_eq!(rig.remote.sha(), sha);
+        // The next tick reads it: A's, at generation 5.
+        assert_eq!(b.tick(0), a.held_by(5));
+        b.advance(millis(179_999));
+        assert_eq!(b.tick(0), a.held_by(5));
+        assert_eq!(rig.remote.sha(), sha);
+        b.advance(millis(1));
+        assert_eq!(b.tick(0), held(6));
+    }
+
+    #[test]
+    fn a_foreign_commit_is_read_for_its_own_object_alone_and_still_taken_over() {
+        let rig = Rig::new();
+        let b = rig.machine();
+        let other = MachineId::random();
+        // A lease commit with a tree of a file: the tree and the blob must not come.
+        let (_, tree, blob) = rig
+            .remote
+            .write_foreign_with(&lease_message(other, "3", "0"));
+        let sha = rig.remote.sha();
+        let at = LeaseState::HeldBy {
+            machine: other,
+            generation: 3,
+        };
+        assert_eq!(b.tick(0), at);
+        let has = git_out(&b.dir, &["cat-file", "-e", &sha]);
+        assert!(has.status.success());
+        for object in [&tree, &blob] {
+            let has = git_out(&b.dir, &["cat-file", "-e", object]);
+            assert!(!has.status.success(), "the lease directory holds {object}");
+        }
+        b.advance(millis(179_999));
+        assert_eq!(b.tick(0), at);
+        b.advance(millis(1));
+        assert_eq!(b.tick(0), held(4));
+    }
+
+    #[test]
+    fn a_holder_whose_fetch_fails_over_another_machines_commit_loses_its_hold() {
+        let rig = Rig::new();
+        let a = rig.machine();
+        let b = rig.machine();
+        assert_eq!(a.tick(0), held(1));
+        rig.remote.delete_lease();
+        assert_eq!(b.tick(0), held(2));
+        a.mark("fetchfail");
+        a.advance(secs(30));
+        assert_eq!(reason_of(&a.tick(0)), NOT_FETCHED);
+        assert!(a.check().is_err());
+        assert_eq!(b.check(), Ok(2));
+        never_both(&a, &b);
     }
 }
