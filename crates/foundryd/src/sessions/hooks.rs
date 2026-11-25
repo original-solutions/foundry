@@ -54,7 +54,8 @@ pub(super) async fn hook(
         return StatusCode::BAD_REQUEST;
     };
     note(&inner, &live, &payload);
-    tokio::spawn(async move { apply(&inner, &live, hook).await })
+    let text = text_of(hook, &payload);
+    tokio::spawn(async move { apply(&inner, &live, hook, &text).await })
         .await
         .unwrap_or_else(|error| {
             tracing::error!(session = %session, %error, "hook not recorded");
@@ -62,15 +63,26 @@ pub(super) async fn hook(
         })
 }
 
+/// The text a hook carries that is kept whole for a factory session: a `Stop`'s
+/// `last_assistant_message` and a `Notification`'s `message`, empty when absent.
+fn text_of(hook: Hook, payload: &serde_json::Value) -> String {
+    let key = match hook {
+        Hook::Stop => "last_assistant_message",
+        Hook::Notification => "message",
+        _ => return String::new(),
+    };
+    payload
+        .get(key)
+        .and_then(|text| text.as_str())
+        .unwrap_or_default()
+        .to_owned()
+}
+
 /// Takes `payload` into the session's brief, with the gateway key and every live session's
 /// token hidden in what it keeps.
 fn note(inner: &Inner, live: &Live, payload: &serde_json::Value) {
-    let tokens: Vec<String> = lock(&inner.live)
-        .values()
-        .map(|l| l.token.clone())
-        .collect();
-    let mut secrets: Vec<&str> = tokens.iter().map(String::as_str).collect();
-    secrets.push(&inner.config.gateway.key);
+    let memory = inner.memory_secrets();
+    let secrets: Vec<&str> = memory.iter().map(String::as_str).collect();
     let at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
@@ -78,12 +90,20 @@ fn note(inner: &Inner, live: &Live, payload: &serde_json::Value) {
 }
 
 /// Applies `hook` to the session, trying again for [`KEEP_TRYING_FOR`] while the store does not
-/// take it, and gives the answer for the hook command.
-async fn apply(inner: &Inner, live: &Arc<Live>, hook: Hook) -> StatusCode {
+/// take it, and gives the answer for the hook command. A factory session's hook is prepared
+/// once, whatever the tries; a session that is no factory session just takes the event.
+async fn apply(inner: &Inner, live: &Arc<Live>, hook: Hook, text: &str) -> StatusCode {
     let give_up_at = tokio::time::Instant::now() + KEEP_TRYING_FOR;
     let mut backoff = Backoff::new();
+    let mut prepared = false;
+    let factory = lock(&inner.factory).marks.contains_key(&live.id);
     loop {
-        let error = match inner.event(live, Event::Hook(hook)).await {
+        let tried = if factory {
+            inner.hook_step(live, hook, text, &mut prepared).await
+        } else {
+            inner.event(live, Event::Hook(hook)).await
+        };
+        let error = match tried {
             Ok(_) => return StatusCode::NO_CONTENT,
             Err(error) => error,
         };

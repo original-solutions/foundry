@@ -7,6 +7,10 @@
 //! - wait_input                          # read one line from stdin; EOF carries on
 //! - wait_prompt                         # take one prompt as Claude Code does (below)
 //! - hook: {event: PreToolUse, tool_name: Bash}   # extra keys join the payload
+//! - stop: {last_assistant_message: "done"}       # fires Stop with that message
+//! - notify: "may I?"                    # fires Notification with that message
+//! - wait_line: ""                       # read one line or paste, report no hook (below)
+//! - wait_line: "/factory-build"         # read lines until one starts with that text
 //! - sleep_ms: 200
 //! - print: "some text"
 //! - print_env: ANTHROPIC_AUTH_TOKEN     # prints NAME=value, or "NAME unset"
@@ -20,6 +24,11 @@
 //! does once its box takes keys, then reads one prompt, a bracketed paste and the Enter after
 //! it, or else one typed line. It prints `PROMPT=` and the prompt as a JSON string, and fires
 //! `UserPromptSubmit` with it as `prompt`.
+//!
+//! `wait_line` reads a prompt as `wait_prompt` does and prints `LINE=` and it as a JSON string,
+//! but fires no hook: it stands for a line Claude Code never reported as a prompt. With a
+//! non-empty argument it keeps reading, printing `LINE=` for each line, until one starts with
+//! that text. The end of the input ends the wait.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead as _, Write as _};
@@ -48,6 +57,11 @@ struct Cli {
 enum Step {
     WaitInput,
     WaitPrompt,
+    Stop {
+        last_assistant_message: String,
+    },
+    Notify(String),
+    WaitLine(String),
     Hook {
         event: String,
         #[serde(flatten)]
@@ -93,13 +107,34 @@ fn run(cli: Cli) -> Result<u8, String> {
             Step::WaitPrompt => {
                 print!("\x1b[?2004h");
                 let _ = std::io::stdout().flush();
-                let prompt = read_prompt();
+                let prompt = read_prompt().unwrap_or_default();
                 say(&format!(
                     "PROMPT={}",
                     serde_json::Value::from(prompt.as_str())
                 ));
                 let extra = BTreeMap::from([("prompt".to_string(), prompt.into())]);
                 fire(&settings, "UserPromptSubmit", extra);
+            }
+            Step::Stop {
+                last_assistant_message,
+            } => {
+                let extra = BTreeMap::from([(
+                    "last_assistant_message".to_string(),
+                    last_assistant_message.into(),
+                )]);
+                fire(&settings, "Stop", extra);
+            }
+            Step::Notify(message) => {
+                let extra = BTreeMap::from([("message".to_string(), message.into())]);
+                fire(&settings, "Notification", extra);
+            }
+            Step::WaitLine(start) => {
+                while let Some(line) = read_prompt() {
+                    say(&format!("LINE={}", serde_json::Value::from(line.as_str())));
+                    if line.starts_with(&start) {
+                        break;
+                    }
+                }
             }
             Step::Hook { event, extra } => fire(&settings, &event, extra),
             Step::SleepMs(ms) => std::thread::sleep(Duration::from_millis(ms)),
@@ -124,25 +159,29 @@ const PASTE_END: &[u8] = b"\x1b[201~";
 
 /// One prompt from stdin, as Claude Code's input box takes it: a bracketed paste with its
 /// newlines kept, up to the Enter after it, or else one typed line, which Enter ends. The
-/// terminal is left as it is, so Enter arrives as a newline.
-fn read_prompt() -> String {
+/// terminal is left as it is, so Enter arrives as a newline. `None` at the end of the input.
+fn read_prompt() -> Option<String> {
     let mut stdin = std::io::stdin().lock();
     let mut read = Vec::new();
-    let _ = stdin.read_until(b'\n', &mut read);
+    if stdin.read_until(b'\n', &mut read).unwrap_or(0) == 0 {
+        return None;
+    }
     let Some(pasted) = read.strip_prefix(PASTE_START) else {
-        return String::from_utf8_lossy(&read)
-            .trim_end_matches(['\r', '\n'])
-            .to_string();
+        return Some(
+            String::from_utf8_lossy(&read)
+                .trim_end_matches(['\r', '\n'])
+                .to_string(),
+        );
     };
     let mut pasted = pasted.to_vec();
     loop {
         if let Some(end) = pasted.windows(PASTE_END.len()).position(|w| w == PASTE_END) {
             pasted.truncate(end);
-            return String::from_utf8_lossy(&pasted).into_owned();
+            return Some(String::from_utf8_lossy(&pasted).into_owned());
         }
         let mut more = Vec::new();
         if stdin.read_until(b'\n', &mut more).unwrap_or(0) == 0 {
-            return String::from_utf8_lossy(&pasted).into_owned();
+            return Some(String::from_utf8_lossy(&pasted).into_owned());
         }
         pasted.extend(more);
     }
