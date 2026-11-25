@@ -218,18 +218,13 @@ pub(super) async fn worker_owner(
                 .await?
                 .map(|record| (record.owner, record.deleted))
         }
-        // The store reads sessions by owner only, so each owner's are looked through.
+        // A deleted session record names no owner, as it never did: the call is refused until
+        // a live record names one, and is sent nowhere.
         Worker::Message(id) | Worker::Turn(id) => {
-            on_store(&api.store, move |store| {
-                for owner in store.versions()?.into_keys() {
-                    if let Some(record) = store.sessions_of(owner)?.iter().find(|s| s.body.id == id)
-                    {
-                        return Ok(Some((owner, record.deleted)));
-                    }
-                }
-                Ok(None)
-            })
-            .await?
+            on_store(&api.store, move |store| store.session(id))
+                .await?
+                .filter(|record| !record.deleted)
+                .map(|record| (record.owner, record.deleted))
         }
         Worker::Tail(id) => on_store(&api.store, move |store| store.terminal(id))
             .await?
