@@ -446,6 +446,22 @@ impl Lease {
         if !self.shared.state().note.wrote {
             return;
         }
+        // Every filtered fetch is a promisor pack, and `gc` keeps every promisor object, so a
+        // watcher would keep each lease commit it ever fetched. A lease commit's tree is the
+        // empty tree, which git always has, so once the ref reads as a lease commit nothing
+        // that is needed is missing: the marks go and `gc` prunes what the ref does not reach.
+        // A commit with a tree that is missing is `forget`-ed, not collected.
+        let complete = self
+            .git(auth, &["rev-parse", "--verify", "--quiet", REF], true)
+            .ok_stdout()
+            .is_none_or(|_| {
+                self.git(auth, &["cat-file", "-e", &format!("{REF}^{{tree}}")], true)
+                    .ok_stdout()
+                    .is_some()
+            });
+        if complete {
+            remove_promisor_marks(&self.dir);
+        }
         self.git(
             auth,
             &[
@@ -715,6 +731,13 @@ impl Lease {
                 return Found::Failed;
             }
         }
+        // A directory made by an earlier build stored the URL: it is removed, since a stored
+        // one would be read first. (`--unset-all` of a key that is not set exits 5.)
+        if std::fs::read_to_string(self.dir.join("config"))
+            .is_ok_and(|config| config.contains("url ="))
+        {
+            self.git(auth, &["config", "--unset-all", "remote.lease.url"], true);
+        }
         let listed = self.git(
             auth,
             &["ls-remote", "--exit-code", "--", &self.url, REF],
@@ -791,15 +814,15 @@ impl Lease {
     /// Makes the directory a partial clone of the lease alone, so that a fetch can ask for the
     /// commit object without its tree and blobs (`--filter=tree:0`, which git takes only from
     /// a repository with a promisor remote). The remote, named `lease`, has no fetch refspec:
-    /// every fetch names the one ref it wants. The URL is kept on the fetch call too, so a
-    /// project whose repo URL was edited follows it. No token is in the config: it reaches
-    /// git through the environment only. `GIT_NO_LAZY_FETCH`, set by [`GitAuth::apply`],
+    /// every fetch names the one ref it wants. Its URL is not stored: `remote.<name>.url` is
+    /// a list and git reads the first entry, so a stored one would outlive an edit of the
+    /// project's repo URL. Every fetch gives the current URL as `-c remote.lease.url`. No
+    /// token is in the config: it reaches git through the environment only. `GIT_NO_LAZY_FETCH`, set by [`GitAuth::apply`],
     /// keeps every other call from fetching a missing tree.
     fn configure(&self, auth: &GitAuth) -> bool {
         let settings = [
             ("core.repositoryformatversion", "1"),
             ("extensions.partialClone", "lease"),
-            ("remote.lease.url", self.url.as_str()),
             ("remote.lease.promisor", "true"),
             ("remote.lease.partialclonefilter", "tree:0"),
         ];
@@ -818,13 +841,7 @@ impl Lease {
     fn forget(&self, auth: &GitAuth) {
         self.git(auth, &["update-ref", "-d", REF], true);
         let _ = std::fs::remove_file(self.dir.join("shallow"));
-        if let Ok(packs) = std::fs::read_dir(self.dir.join("objects/pack")) {
-            for pack in packs.flatten() {
-                if pack.path().extension().is_some_and(|ext| ext == "promisor") {
-                    let _ = std::fs::remove_file(pack.path());
-                }
-            }
-        }
+        remove_promisor_marks(&self.dir);
         self.git(
             auth,
             &["-c", "gc.autoDetach=false", "gc", "--prune=now", "--quiet"],
@@ -933,6 +950,18 @@ impl Lease {
             code: status.and_then(|status| status.code()),
             stdout: String::from_utf8_lossy(&stdout).into_owned(),
         })
+    }
+}
+
+/// Removes the `.promisor` mark of every pack in `dir`, so that `gc` treats its objects as
+/// any others.
+fn remove_promisor_marks(dir: &Path) {
+    if let Ok(packs) = std::fs::read_dir(dir.join("objects/pack")) {
+        for pack in packs.flatten() {
+            if pack.path().extension().is_some_and(|ext| ext == "promisor") {
+                let _ = std::fs::remove_file(pack.path());
+            }
+        }
     }
 }
 
