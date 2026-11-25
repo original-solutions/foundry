@@ -2599,4 +2599,18 @@ exec git "$@"
         b.advance(secs(180));
         assert_eq!(b.tick(0), held(1));
     }
+
+    #[test]
+    fn a_holder_whose_deleted_ref_cannot_be_re_taken_loses_its_hold_at_once() {
+        for marker in ["fail", "reject"] {
+            let rig = Rig::new();
+            let a = rig.machine();
+            assert_eq!(a.tick(0), held(1));
+            rig.remote.delete_lease();
+            a.mark(marker);
+            assert_eq!(reason_of(&a.tick(0)), NOT_TAKEN, "{marker}");
+            assert!(a.check().is_err(), "{marker}");
+            assert!(rig.remote.lease_sha().is_none(), "{marker}");
+        }
+    }
 }
