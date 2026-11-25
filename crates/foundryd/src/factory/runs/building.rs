@@ -1683,6 +1683,8 @@ mod tests {
         struct AfterFailure {
             sim: Arc<Sim>,
             failed: std::sync::atomic::AtomicBool,
+            /// The call was refused (status 1 and a reason), not a 502.
+            refused: bool,
             gone: bool,
         }
 
@@ -1695,7 +1697,7 @@ mod tests {
                         kind: crate::factory::github::OtherKind::Failed,
                         // Where the pull request is then gone, `gh` was refused (status 1);
                         // where GitHub is down, it was a 502.
-                        message: if self.gone {
+                        message: if self.refused {
                             "`gh pr ready` exited with status 1: boom".into()
                         } else {
                             "`gh pr ready` failed: HTTP 502: Bad Gateway".into()
@@ -1719,13 +1721,14 @@ mod tests {
             }
         }
 
-        fn after_failure(rig: &mut Rig, gone: bool) {
+        fn after_failure(rig: &mut Rig, refused: bool, gone: bool) {
             rig.sim
                 .set_pull(12, pull("OPEN", false, BRANCH, "main", false));
             rig.tracker = Hiding::new(
                 Arc::new(AfterFailure {
                     sim: rig.sim.clone(),
                     failed: std::sync::atomic::AtomicBool::new(false),
+                    refused,
                     gone,
                 }),
                 Arc::new(|t: &str| t.into()),
@@ -1738,7 +1741,7 @@ mod tests {
         fn with_a_failure_on_putting_it_back_to_draft_whose_second_look_fails_is_an_error_not_stuck()
          {
             let (mut rig, run) = built();
-            after_failure(&mut rig, false);
+            after_failure(&mut rig, false, false);
             let sim = rig.sim.clone();
             end_turn(&mut rig, 1, DONE_MESSAGE);
             let before = rig.events(&run).len();
@@ -1756,12 +1759,27 @@ mod tests {
             ));
         }
 
+        /// A 502 whose second look reads the pull request gone is still no answer: an error with
+        /// nothing written.
+        #[test]
+        fn with_a_502_on_putting_it_back_to_draft_and_the_pull_request_gone_is_an_error_not_stuck()
+        {
+            let (mut rig, run) = built();
+            after_failure(&mut rig, false, true);
+            end_turn(&mut rig, 1, DONE_MESSAGE);
+            let before = rig.events(&run).len();
+            let error = advance(&rig.ctx(), &run).unwrap_err();
+            assert!(error.to_string().contains("gh pr ready"), "{error}");
+            assert_eq!(rig.events(&run).len(), before);
+            assert_eq!(rig.sim.labels(), ["factory:building"]);
+        }
+
         /// The second look finds the pull request gone: stuck with the words `check_binding`
         /// has for a pull request that does not exist.
         #[test]
         fn with_a_failure_on_putting_it_back_to_draft_and_the_pull_request_gone_is_stuck() {
             let (mut rig, run) = built();
-            after_failure(&mut rig, true);
+            after_failure(&mut rig, true, true);
             end_turn(&mut rig, 1, DONE_MESSAGE);
             let step = pass(&rig, &run);
             assert_stuck(
@@ -1817,32 +1835,82 @@ mod tests {
             }
         }
 
-        /// What `gh` (github/gh.rs `finish`) words when it got no answer from GitHub: a 5xx in
-        /// its stderr, a call a signal ended (status -1), an answer over the output limit, and
-        /// a failure of the connection. A refusal by GitHub is not one.
+        /// The message of a failed `gh pr ready` on repo `slug`, as `github::gh::finish` words it.
+        fn finished(slug: &str, answer: crate::factory::github::Answer) -> String {
+            let args: Vec<String> = ["pr", "ready", "12", "--repo", slug, "--undo"]
+                .iter()
+                .map(|arg| arg.to_string())
+                .collect();
+            match crate::factory::github::gh::finish(&args, answer).unwrap_err() {
+                TrackerError::Other { message, .. } => message,
+                other => panic!("not a failure of gh: {other}"),
+            }
+        }
+
+        fn exit(status: Option<i32>, stderr: &str) -> crate::factory::github::Answer {
+            crate::factory::github::Answer::Exit {
+                status,
+                stdout: String::new(),
+                stderr: stderr.into(),
+            }
+        }
+
+        /// Only what `gh` said is read, never the command text: a repo whose name holds a word
+        /// a connection failure is told by does not make a refusal "no answer".
+        #[test]
+        fn a_gh_refusal_is_not_taken_for_no_answer_whatever_the_repo_is_called() {
+            for slug in [
+                "acme/kafka-connect",
+                "rustls/rustls",
+                "x/network-tools",
+                "y/geofence",
+                "a/eof-tools",
+                "b/timeout-lib",
+                "c/dial-tcp",
+                "d/tls-proxy",
+            ] {
+                for stderr in [
+                    "boom",
+                    "GraphQL: Pull request is already closed",
+                    "HTTP 422: Unprocessable Entity",
+                    "HTTP 403: Resource not accessible",
+                ] {
+                    let message = finished(slug, exit(Some(1), stderr));
+                    assert!(!gh_gave_no_answer(&message), "{message}");
+                }
+                assert!(!gh_gave_no_answer(&finished(slug, exit(Some(2), ""))));
+            }
+        }
+
+        /// One case for each shape of "no answer", on a repo whose name holds none of its words.
         #[test]
         fn a_gh_failure_with_no_answer_from_github_is_told_from_a_refusal() {
-            for no_answer in [
-                "`gh pr ready 12` exited with status 1: HTTP 502: Bad Gateway",
-                "`gh pr ready 12` exited with status 1: HTTP 503: Service Unavailable (https://api.github.com/graphql)",
-                "`gh pr ready 12` exited with status 1: HTTP 500",
-                "`gh pr ready 12` exited with status -1: ",
-                "`gh pr ready 12` printed more than 1048576 bytes",
-                "`gh pr ready 12` exited with status 1: error connecting to api.github.com",
-                "`gh pr ready 12` exited with status 1: Post \"https://api.github.com/graphql\": dial tcp: lookup api.github.com: no such host",
-                "`gh pr ready 12` exited with status 1: Get \"https://api.github.com\": net/http: TLS handshake timeout",
-                "`gh pr ready 12` exited with status 1: Get \"https://api.github.com\": EOF",
+            use crate::factory::github::Answer;
+            let slug = "acme/widgets";
+            for stderr in [
+                "HTTP 502: Bad Gateway",
+                "HTTP 503: Service Unavailable (https://api.github.com/graphql)",
+                "HTTP 500",
+                "error connecting to api.github.com",
+                "Post \"https://api.github.com/graphql\": dial tcp 140.82.112.5:443: no route",
+                "lookup api.github.com: no such host",
+                "read tcp 10.0.0.2:5000->140.82.112.5:443: connection reset by peer",
+                "dial: connection refused",
+                "dial tcp 140.82.112.5:443: i/o timeout",
+                "net/http: TLS handshake timeout",
+                "connect: network is unreachable",
+                "Temporary failure in name resolution",
+                "the operation timed out",
+                "Get \"https://api.github.com\": EOF",
+                "read: unexpected EOF",
             ] {
-                assert!(gh_gave_no_answer(no_answer), "{no_answer}");
+                let message = finished(slug, exit(Some(1), stderr));
+                assert!(gh_gave_no_answer(&message), "{message}");
             }
-            for refusal in [
-                "`gh pr ready 12` exited with status 1: boom",
-                "`gh pr ready 12` exited with status 1: GraphQL: Pull request is already closed",
-                "`gh pr ready 12` exited with status 1: HTTP 422: Unprocessable Entity",
-                "`gh pr ready 12` exited with status 1: HTTP 403: Resource not accessible",
-                "`gh pr ready 12` exited with status 2: ",
-            ] {
-                assert!(!gh_gave_no_answer(refusal), "{refusal}");
+            // A call a signal ended, and an answer over the output limit.
+            for answer in [exit(None, ""), Answer::TooLarge] {
+                let message = finished(slug, answer);
+                assert!(gh_gave_no_answer(&message), "{message}");
             }
         }
 
