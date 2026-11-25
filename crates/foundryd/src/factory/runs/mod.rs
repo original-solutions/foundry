@@ -63,6 +63,9 @@ pub enum RunError {
     /// The lease is lost: nothing was done.
     #[error(transparent)]
     LeaseLost(#[from] LeaseLost),
+    /// An older run of the issue has its gate running, so nothing was called or written.
+    #[error("the gate of run {run} is running")]
+    GateRunning { run: RunId },
     /// A record that cannot be what it must be: a session id that is not one, say.
     #[error("{0}")]
     Invalid(String),
@@ -744,6 +747,7 @@ pub(crate) mod testing {
         approval: String,
         pulls: BTreeMap<u64, SimPull>,
         listed: Vec<Value>,
+        closing: Vec<Value>,
         branches: BTreeSet<String>,
         failures: Vec<(String, usize)>,
         calls: Vec<Vec<String>>,
@@ -800,6 +804,7 @@ pub(crate) mod testing {
                     approval: approval_answer(LABELED_AT, "tom", &[]),
                     pulls: BTreeMap::new(),
                     listed: vec![],
+                    closing: vec![],
                     branches: BTreeSet::new(),
                     failures: vec![],
                     calls: vec![],
@@ -848,6 +853,20 @@ pub(crate) mod testing {
                 "baseRefName": base,
                 "isCrossRepository": cross,
                 "author": {"login": author},
+            }));
+        }
+
+        /// What the closing-pull-requests query answers: one open pull request closing the
+        /// issue, by `author`.
+        pub fn closing_pull(&self, number: u64, head: &str, base: &str, author: &str, cross: bool) {
+            self.lock().closing.push(json!({
+                "number": number,
+                "url": format!("https://github.com/{REPO}/pull/{number}"),
+                "state": "OPEN",
+                "headRefName": head,
+                "baseRefName": base,
+                "isCrossRepository": cross,
+                "author": {"__typename": "User", "login": author},
             }));
         }
 
@@ -988,6 +1007,12 @@ pub(crate) mod testing {
                     state.next_comment += 1;
                     state.comments.push((id, LOGIN.to_string(), body));
                     Ok(String::new())
+                }
+                (Some("api"), Some("graphql")) if joined.contains("closedByPullRequestsReferences") => {
+                    Ok(json!({"data": {"repository": {"issue": {"closedByPullRequestsReferences": {
+                        "nodes": state.closing.clone(),
+                    }}}}})
+                    .to_string())
                 }
                 (Some("api"), Some("graphql")) => Ok(state.approval.clone()),
                 (Some("api"), Some(path)) if path.contains("/issues/comments/") => {
