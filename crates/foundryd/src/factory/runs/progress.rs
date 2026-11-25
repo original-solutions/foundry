@@ -67,11 +67,11 @@ pub const STUCK_COMMENTING: &str = "stuck-commenting";
 /// The step written, with the stop as JSON after it, before the stuck comment: the decision to
 /// give up, which a later pass finishes with the same words.
 pub const STUCK_STOP: &str = "stuck-stop ";
-/// The step written before a send to the session, with the send's key and the session's prompt
-/// count after it: a send done again after a lost answer is sent under the same count.
+/// The step written before each try of a send to the session, with the send's key and the prompt
+/// count the try goes under after it.
 pub const SEND_INTENT: &str = "send-intent ";
-/// A send of the key the session definitely refused with nothing typed: the intent before it
-/// no longer stands for a possible delivery.
+/// The step written after a try of the key that the worker refused with nothing typed: it is of
+/// the `send-intent` just before it, and of no earlier try.
 pub const SEND_REFUSED: &str = "send-refused ";
 /// The step written before the gate-results comment on the pull request is posted.
 pub const GATE_RESULTS_COMMENTING: &str = "gate-results-commenting";
@@ -313,7 +313,8 @@ pub struct Seen {
     pub questions_posted: bool,
     /// The `questions-commenting` step since the questions were last posted or the run last
     /// entered `building`: the comment may be on the issue with no line yet.
-    pub questions_commenting: bool,
+    /// The id of the newest marked comment of the login when the step was written (0 if none).
+    pub questions_commenting: Option<u64>,
     /// The `stuck-commenting` step: the stuck comment may be on the issue with no `stuck` line.
     /// The id of the newest marked comment of the login when the step was written (0 if none).
     pub stuck_commenting: Option<u64>,
@@ -324,10 +325,8 @@ pub struct Seen {
     /// on the pull request with no `gate-results-posted` step.
     /// The id of the newest marked comment on the pull request when the step was written.
     pub gate_commenting: Option<u64>,
-    /// The `send-intent` steps: each send's key and the prompt count it was first sent under.
-    pub send_intents: BTreeMap<String, u64>,
-    /// The keys whose newest send-intent was followed by a definite refusal.
-    pub send_refused: std::collections::BTreeSet<String>,
+    /// Each send to the session by its key, as its `send-intent` and `send-refused` steps say.
+    pub sends: BTreeMap<String, SendTries>,
     /// A `pr_opened` since the run last entered `building` or had a gate sent back: the session's pull request waits for the gate.
     pub pr_reported: bool,
     /// The ordinal in the newest `result-line-reminding` step: a reminder send was started.
@@ -704,8 +703,8 @@ pub fn read_progress(events: &[RunEvent]) -> Seen {
                 if let Some(stop) = step.strip_prefix(STUCK_STOP) {
                     seen.stuck_stop = Some(stop.to_owned());
                 }
-                if step == QUESTIONS_COMMENTING {
-                    seen.questions_commenting = true;
+                if let Some(id) = commenting_id(step, QUESTIONS_COMMENTING) {
+                    seen.questions_commenting = Some(id);
                 }
                 if let Some(name) = step.strip_prefix(WORKSPACE_REQUESTED) {
                     seen.workspace_requested = Some(name.to_owned());
@@ -724,11 +723,12 @@ pub fn read_progress(events: &[RunEvent]) -> Seen {
                     && let Some((key, count)) = intent.rsplit_once(' ')
                     && let Ok(count) = count.parse()
                 {
-                    seen.send_intents.insert(key.to_owned(), count);
-                    seen.send_refused.remove(key);
+                    seen.sends.entry(key.to_owned()).or_default().tried(count);
                 }
-                if let Some(key) = step.strip_prefix(SEND_REFUSED) {
-                    seen.send_refused.insert(key.to_owned());
+                if let Some(key) = step.strip_prefix(SEND_REFUSED)
+                    && let Some(sent) = seen.sends.get_mut(key)
+                {
+                    sent.refused = (sent.refused + 1).min(sent.tries);
                 }
                 if step == GATE_RESULTS_POSTED {
                     seen.gate_commenting = None;
@@ -918,7 +918,7 @@ pub fn read_progress(events: &[RunEvent]) -> Seen {
                 seen.regate_sent_back = false;
                 if to == Some(State::Building.name()) {
                     seen.questions_posted = false;
-                    seen.questions_commenting = false;
+                    seen.questions_commenting = None;
                     seen.pr_reported = false;
                     // A run that comes back to `building` has no pass: its gate failed again on
                     // a moved base, and the session has to finish a new run for it to be decided.
@@ -973,7 +973,7 @@ pub fn read_progress(events: &[RunEvent]) -> Seen {
             }
             names::QUESTIONS_POSTED => {
                 seen.questions_posted = true;
-                seen.questions_commenting = false;
+                seen.questions_commenting = None;
             }
             names::PR_OPENED => {
                 if let (Some(pr), Some(url)) =
@@ -1326,6 +1326,39 @@ pub fn run_names(events: &[RunEvent], seen: &Seen) -> RunNames {
 }
 
 /// The id after a `<name> <id>` intent step: 0 for the bare name an older ledger wrote.
+/// The tries of one send to the session under its newest count. A new count is written only
+/// when no try may have typed, so it starts the tries again.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SendTries {
+    /// The prompt count of the newest `send-intent`: the count every try goes under while one
+    /// may have typed.
+    pub count: u64,
+    /// The `send-intent` steps under `count`, one per try.
+    pub tries: u32,
+    /// The `send-refused` steps after them: tries that typed nothing.
+    pub refused: u32,
+}
+
+impl SendTries {
+    /// A try under `count` has no refusal after it: its answer was lost, or it failed after the
+    /// worker read the count, so it may have typed the message. A later refusal is of a later
+    /// try and does not change that.
+    pub fn may_have_typed(&self) -> bool {
+        self.refused < self.tries
+    }
+
+    fn tried(&mut self, count: u64) {
+        if self.tries == 0 || self.count != count {
+            *self = SendTries {
+                count,
+                tries: 0,
+                refused: 0,
+            };
+        }
+        self.tries += 1;
+    }
+}
+
 fn commenting_id(step: &str, name: &str) -> Option<u64> {
     if step == name {
         return Some(0);

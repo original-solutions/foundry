@@ -48,7 +48,7 @@ use crate::sessions::factory::SendRefused;
 use crate::store::StoreError;
 use progress::{
     GATE_RESULTS_COMMENTING, GATE_RESULTS_POSTED, QUESTIONS_COMMENTING, SEND_INTENT, SEND_REFUSED,
-    STUCK_COMMENTING, STUCK_STOP, Seen,
+    STUCK_COMMENTING, STUCK_STOP, Seen, SendTries,
 };
 
 /// What a step of a run can fail with.
@@ -563,11 +563,19 @@ pub fn apply_actions(
     Ok(())
 }
 
-/// A message sent to the session once. The `key` names the send; the session's prompt count is
-/// recorded under it before the send. Every recorded intent is an outcome unknown until a
-/// definite refusal (`send-refused`) follows it; a repeat of an unknown try goes under the same
-/// count and takes a risen count as delivered. After a refusal the next try reads the count anew. `apply_actions` makes at most one send per session per call. A session the
-/// fleet shows no turn for is sent to with no count.
+/// A message sent to the session once, under the session's prompt count so that a try whose
+/// line was typed is refused instead of typed again. The `key` names the send in the ledger:
+/// each try writes `send-intent <key> <count>` before the worker is asked, and
+/// `send-refused <key>` after a refusal that typed nothing.
+///
+/// The rule: once a try may have typed (its answer was lost, or the worker failed after it read
+/// the count), every later try goes under that try's count, and a count risen above it is the
+/// message typed. A later try's refusal is of that try only, so it does not clear the earlier
+/// one (a session busy with the typed line refuses as not idle). While no try may have typed,
+/// a try reads the count anew, and a count risen above it is other prompts: the risen count is
+/// recorded and the next pass sends under it. A lost lease stops a try before its intent is
+/// written. A session the fleet shows no turn for is sent to with no count; a failure that read
+/// one records it for the next try. `apply_actions` makes at most one send per session per call.
 fn send_once(
     ctx: &RunContext<'_>,
     at: &Progress,
@@ -575,25 +583,23 @@ fn send_once(
     message: Message,
     key: &str,
 ) -> Result<(), RunError> {
-    let intent = at.seen.send_intents.get(key).copied();
-    // Every recorded intent is an outcome unknown until a definite refusal follows it.
-    let unknown = intent.is_some() && !at.seen.send_refused.contains(key);
-    let count = if unknown {
-        intent
+    let before = at.seen.sends.get(key);
+    let may_have_typed = before.is_some_and(SendTries::may_have_typed);
+    let count = if may_have_typed {
+        before.map(|sent| sent.count)
     } else {
-        let seen = ctx.view.session_turn(session).map(|turn| turn.prompts);
-        let count = match (seen, intent) {
-            (Some(seen), Some(old)) => Some(seen.max(old)),
-            (seen, old) => seen.or(old),
-        };
-        if let Some(count) = count {
-            ctx.record_step(
-                &at.run,
-                &format!("{SEND_INTENT}{key} {count}"),
-                &Cause::new(at.step, "send-intent"),
-            )?;
+        let shown = ctx.view.session_turn(session).map(|turn| turn.prompts);
+        match (shown, before.map(|sent| sent.count)) {
+            (Some(shown), Some(recorded)) => Some(shown.max(recorded)),
+            (shown, recorded) => shown.or(recorded),
         }
-        count
+    };
+    let intent = |count: u64| {
+        ctx.record_step(
+            &at.run,
+            &format!("{SEND_INTENT}{key} {count}"),
+            &Cause::new(at.step, "send-intent"),
+        )
     };
     let refused = || {
         ctx.record_step(
@@ -602,37 +608,39 @@ fn send_once(
             &Cause::new(at.step, "send-refused"),
         )
     };
-    match ctx.send(session, message, count) {
+    ctx.held()?;
+    if let Some(count) = count {
+        intent(count)?;
+    }
+    // The lease was checked just above, so no lost lease can follow the intent and leave a try
+    // that asked nothing of the worker looking like one that may have typed.
+    match ctx.worker.send(session, message, count) {
         Ok(_) => Ok(()),
-        // The count rose after a try that may have typed the message: it is typed.
-        Err(RunError::Send(SendRefused::CountRose { .. })) if unknown => Ok(()),
-        // The count rose with no try before it that may have typed: nothing of ours was typed.
-        // The count now is the intent, and the next pass sends under it.
-        Err(RunError::Send(SendRefused::CountRose { now })) => {
-            ctx.record_step(
-                &at.run,
-                &format!("{SEND_INTENT}{key} {now}"),
-                &Cause::new(at.step, "send-intent"),
-            )?;
+        Err(SendRefused::CountRose { .. }) if may_have_typed => Ok(()),
+        Err(SendRefused::CountRose { now }) => {
+            intent(now)?;
             refused()?;
-            Err(RunError::Send(SendRefused::CountRose { now }))
+            Err(SendRefused::CountRose { now }.into())
         }
-        // Definite refusals: nothing was typed.
         Err(
-            error @ RunError::Send(
-                SendRefused::NotIdle
-                | SendRefused::NoSuchSession
-                | SendRefused::BodyWithoutPath
-                | SendRefused::SecretsUnreadable,
-            ),
+            error @ (SendRefused::NotIdle
+            | SendRefused::NoSuchSession
+            | SendRefused::BodyWithoutPath
+            | SendRefused::SecretsUnreadable),
         ) => {
             if count.is_some() {
                 refused()?;
             }
-            Err(error)
+            Err(error.into())
         }
-        // A failed or unreachable call may have typed: the intent stays unknown.
-        Err(error) => Err(error),
+        Err(SendRefused::Failed { reason, prompts }) => {
+            if count.is_none()
+                && let Some(read) = prompts
+            {
+                intent(read)?;
+            }
+            Err(SendRefused::Failed { reason, prompts }.into())
+        }
     }
 }
 
@@ -661,23 +669,30 @@ fn post_once_on_pr(
     ctx.comment_on_pr(pr, body)
 }
 
-/// A comment on `issue`, posted once. The `intent` step is recorded before the post. A pass that
-/// finds the intent and not the line that follows the post (`intended`) does not know whether
-/// the post landed (an answer lost to a timeout or a 5xx), so it posts only when the newest
-/// comment of the project's login is not already this text.
+/// A comment on `issue`, posted once. The `intent` step is recorded before the post, with the id
+/// of the newest marked comment of the login. A pass that finds the intent (`intended`) and not
+/// the line that follows the post does not know whether the post landed (an answer lost to a
+/// timeout or a 5xx), so it posts only when no comment of the login newer than that id is
+/// already this text.
 fn post_once(
     ctx: &RunContext<'_>,
     run: &RunId,
     issue: u64,
     intent: &str,
-    intended: bool,
+    intended: Option<u64>,
     body: &str,
     cause: &Cause,
 ) -> Result<(), RunError> {
-    if !intended {
-        ctx.record_step(run, intent, cause)?;
-    } else if newest_comment_is(ctx, issue, body, 0)? {
-        return Ok(());
+    match intended {
+        None => {
+            let above = newest_own_id(ctx, issue)?;
+            ctx.record_step(run, &format!("{intent} {above}"), cause)?;
+        }
+        Some(above) => {
+            if newest_comment_is(ctx, issue, body, above)? {
+                return Ok(());
+            }
+        }
     }
     ctx.post_comment(issue, body)
 }
