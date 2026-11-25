@@ -182,13 +182,13 @@ fn warned(answer: Answer, warning: Option<String>) -> Answer {
 /// Where a run's call to a worker route is answered.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Owner {
-    /// On this machine: it owns what the call names, or what it names is gone, which this
-    /// machine answers as well as any.
+    /// On this machine: it owns what the call names, or the workspace or terminal it names is
+    /// gone, which this machine answers as well as any.
     Here,
     /// On the other machine that owns it.
     There(MachineId),
     /// Nowhere yet: no record of what the call names has reached this machine, so its owner is
-    /// not known.
+    /// not known. A deleted session record names no owner either.
     Unknown,
 }
 
@@ -218,18 +218,13 @@ pub(super) async fn worker_owner(
                 .await?
                 .map(|record| (record.owner, record.deleted))
         }
-        // The store reads sessions by owner only, so each owner's are looked through.
+        // A deleted session record names no owner, as it never did: the call is refused until
+        // a live record names one, and is sent nowhere.
         Worker::Message(id) | Worker::Turn(id) => {
-            on_store(&api.store, move |store| {
-                for owner in store.versions()?.into_keys() {
-                    if let Some(record) = store.sessions_of(owner)?.iter().find(|s| s.body.id == id)
-                    {
-                        return Ok(Some((owner, record.deleted)));
-                    }
-                }
-                Ok(None)
-            })
-            .await?
+            on_store(&api.store, move |store| store.session(id))
+                .await?
+                .filter(|record| !record.deleted)
+                .map(|record| (record.owner, false))
         }
         Worker::Tail(id) => on_store(&api.store, move |store| store.terminal(id))
             .await?

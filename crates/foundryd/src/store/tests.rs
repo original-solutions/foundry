@@ -1017,6 +1017,306 @@ fn sessions_of_gives_one_owners_sessions_not_deleted_and_leaves_out_a_row_it_can
     assert_eq!(store.sessions_of(me).unwrap(), vec![first, failed]);
 }
 
+/// A session record of `owner` with its id, workspace and terminal numbered.
+fn session_at(
+    owner: MachineId,
+    version: u64,
+    id: u128,
+    workspace: u128,
+    terminal: u128,
+) -> Record<Session> {
+    let AnyRecord::Session(mut record) = session(owner, version) else {
+        unreachable!("`session` gives a session record");
+    };
+    record.body.id = SessionId(uuid::Uuid::from_u128(id));
+    record.body.workspace = WorkspaceId(uuid::Uuid::from_u128(workspace));
+    record.body.terminal = TerminalId(uuid::Uuid::from_u128(terminal));
+    record
+}
+
+/// The three session reads find a session another machine wrote once sync has applied it here,
+/// with that machine as its owner, and answer none for an id no record here names.
+#[test]
+fn each_session_read_finds_a_session_another_machine_wrote_after_a_sync_and_none_for_an_unknown_id()
+{
+    let (_dir, mut store) = open();
+    let (me, peer) = (MachineId::random(), MachineId::random());
+    let mine = session_at(me, 1, 50, 60, 70);
+    store.apply(&AnyRecord::Session(mine.clone()), me).unwrap();
+    let theirs = session_at(peer, 7, 51, 61, 71);
+    // What a sync link does with a batch of the peer's records.
+    store
+        .apply_batch(
+            &[AnyRecord::Session(theirs.clone()), terminal(peer, 8)],
+            peer,
+            |r| panic!("{r:?} is the peer's"),
+        )
+        .unwrap();
+
+    let found = store.session(theirs.body.id).unwrap().unwrap();
+    assert_eq!(found, theirs);
+    assert_eq!(found.owner, peer);
+    let found = store.session_on(theirs.body.terminal).unwrap().unwrap();
+    assert_eq!((found.owner, &found), (peer, &theirs));
+    let found = store.session_in(theirs.body.workspace).unwrap().unwrap();
+    assert_eq!((found.owner, &found), (peer, &theirs));
+    assert_eq!(store.session(mine.body.id).unwrap(), Some(mine.clone()));
+    assert_eq!(
+        store.session_on(mine.body.terminal).unwrap(),
+        Some(mine.clone())
+    );
+    assert_eq!(store.session_in(mine.body.workspace).unwrap(), Some(mine));
+
+    let unknown = uuid::Uuid::from_u128(99);
+    assert_eq!(store.session(SessionId(unknown)).unwrap(), None);
+    assert_eq!(store.session_on(TerminalId(unknown)).unwrap(), None);
+    assert_eq!(store.session_in(WorkspaceId(unknown)).unwrap(), None);
+}
+
+/// Each session read gives a deleted record too, as `workspace` and `terminal` do, so a caller
+/// tells a gone session from one no record names. Only session rows answer: a workspace or a
+/// terminal under the same id, or a terminal in the same workspace, is another record.
+#[test]
+fn each_session_read_gives_a_deleted_session_and_reads_only_session_rows() {
+    let (_dir, mut store) = open();
+    let owner = MachineId::random();
+    // The other kinds go in first, so a read that ignored the kind would find them first.
+    let mut same_id = workspace(owner, 1);
+    if let AnyRecord::Workspace(r) = &mut same_id {
+        r.body.id = WorkspaceId(uuid::Uuid::from_u128(50));
+    }
+    store.apply(&same_id, owner).unwrap();
+    let mut in_workspace = terminal(owner, 2);
+    if let AnyRecord::Terminal(r) = &mut in_workspace {
+        r.body.id = TerminalId(uuid::Uuid::from_u128(70));
+        r.body.workspace = WorkspaceId(uuid::Uuid::from_u128(60));
+    }
+    store.apply(&in_workspace, owner).unwrap();
+    assert_eq!(
+        store.session(SessionId(uuid::Uuid::from_u128(50))).unwrap(),
+        None
+    );
+    assert_eq!(
+        store
+            .session_in(WorkspaceId(uuid::Uuid::from_u128(60)))
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        store
+            .session_on(TerminalId(uuid::Uuid::from_u128(70)))
+            .unwrap(),
+        None
+    );
+
+    let mut gone = session_at(owner, 3, 50, 60, 70);
+    gone.deleted = true;
+    store
+        .apply(&AnyRecord::Session(gone.clone()), owner)
+        .unwrap();
+    assert_eq!(store.session(gone.body.id).unwrap(), Some(gone.clone()));
+    assert_eq!(
+        store.session_on(gone.body.terminal).unwrap(),
+        Some(gone.clone())
+    );
+    assert_eq!(store.session_in(gone.body.workspace).unwrap(), Some(gone));
+}
+
+/// A workspace may have had several sessions, as a start after an end makes: `session_in` gives
+/// the one with the highest version, whatever their ids or their order of arrival. Should two
+/// sessions name one terminal, `session_on` gives the newer too.
+#[test]
+fn session_in_and_session_on_give_the_session_with_the_highest_version() {
+    let (_dir, mut store) = open();
+    let owner = MachineId::random();
+    let older = session_at(owner, 2, 90, 60, 70);
+    let newer = session_at(owner, 5, 10, 60, 70);
+    let elsewhere = session_at(owner, 9, 11, 61, 72);
+    for record in [&newer, &elsewhere, &older] {
+        store
+            .apply(&AnyRecord::Session(record.clone()), owner)
+            .unwrap();
+    }
+    assert_eq!(
+        store.session_in(newer.body.workspace).unwrap(),
+        Some(newer.clone())
+    );
+    assert_eq!(store.session_on(older.body.terminal).unwrap(), Some(newer));
+    assert_eq!(
+        store.session_on(elsewhere.body.terminal).unwrap(),
+        Some(elsewhere)
+    );
+}
+
+/// A session row this build cannot read, one a newer build left before a rollback, is left out
+/// with a warning, as `sessions_of` leaves it out: the session reads answer the routes that
+/// used `sessions_of`, and their answers stay as they were. A readable session of the same
+/// workspace still answers.
+#[test]
+fn each_session_read_leaves_out_a_session_row_it_cannot_read() {
+    let (_dir, mut store) = open();
+    let owner = MachineId::random();
+    let readable = session_at(owner, 1, 50, 60, 70);
+    store
+        .apply(&AnyRecord::Session(readable.clone()), owner)
+        .unwrap();
+    let (id, workspace, terminal) = (
+        uuid::Uuid::from_u128(51),
+        uuid::Uuid::from_u128(60),
+        uuid::Uuid::from_u128(71),
+    );
+    store
+        .conn
+        .execute(
+            "INSERT INTO records (kind, id, owner, version, record) VALUES ('session', ?1, ?2, 2, ?3)",
+            params![
+                id.to_string(),
+                owner.to_string(),
+                format!(
+                    r#"{{"kind":"session","owner":"{owner}","version":2,"deleted":false,"body":{{"id":"{id}","workspace":"{workspace}","terminal":"{terminal}","model":"m","state":"from-a-newer-build"}}}}"#
+                )
+            ],
+        )
+        .unwrap();
+    assert_eq!(store.session(SessionId(id)).unwrap(), None);
+    assert_eq!(store.session_on(TerminalId(terminal)).unwrap(), None);
+    assert_eq!(
+        store.session_in(WorkspaceId(workspace)).unwrap(),
+        Some(readable)
+    );
+}
+
+/// The plan SQLite makes for `sql`, one line per step.
+fn plan(store: &Store, sql: &str) -> Vec<String> {
+    let mut query = store
+        .conn
+        .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+        .unwrap();
+    let count = query.parameter_count();
+    let params: Vec<String> = (0..count).map(|_| String::new()).collect();
+    query
+        .query_map(rusqlite::params_from_iter(params), |row| {
+            row.get::<_, String>(3)
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+/// Each session read is answered from an index, not by reading every owner's sessions: SQLite
+/// searches `records` through the index named and never scans it or sorts in a temporary tree.
+#[test]
+fn each_session_read_searches_an_index_and_reads_no_other_session() {
+    let (_dir, mut store) = open();
+    let owner = MachineId::random();
+    for n in 0..50 {
+        let record = session_at(
+            owner,
+            n + 1,
+            1000 + u128::from(n),
+            2000,
+            3000 + u128::from(n),
+        );
+        store.apply(&AnyRecord::Session(record), owner).unwrap();
+    }
+    assert_each_session_read_searches_its_index(&store);
+}
+
+/// SQLite answers each session read by searching `records` through the index named, and never
+/// scans it or sorts in a temporary tree.
+fn assert_each_session_read_searches_its_index(store: &Store) {
+    for (sql, index) in [
+        (SESSION_BY_ID, "sqlite_autoindex_records_1"),
+        (SESSION_ON_TERMINAL, "records_session_by_terminal"),
+        (SESSION_IN_WORKSPACE, "records_session_by_workspace"),
+    ] {
+        let steps = plan(store, sql);
+        assert!(
+            steps
+                .iter()
+                .any(|step| step.starts_with("SEARCH records USING INDEX ")
+                    && step.contains(index)),
+            "{sql}: {steps:?}"
+        );
+        for step in &steps {
+            assert!(!step.starts_with("SCAN"), "{sql}: {steps:?}");
+            assert!(!step.contains("TEMP B-TREE"), "{sql}: {steps:?}");
+        }
+    }
+}
+
+/// A file at step 2 that already holds session rows (this machine's, a peer's, a deleted one
+/// and one this build cannot read) opens at the current schema. Step 3 indexes the rows it
+/// finds, so each session read finds every row written before it through its index, leaves
+/// out the unreadable one, and finds a session written after it too.
+#[test]
+fn step_3_indexes_the_session_rows_a_step_2_file_already_holds() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("foundry.db");
+    let (me, peer) = (MachineId::random(), MachineId::random());
+    let mine = session_at(me, 1, 50, 60, 70);
+    let theirs = session_at(peer, 4, 51, 61, 71);
+    let mut gone = session_at(me, 2, 52, 62, 72);
+    gone.deleted = true;
+    let (unreadable, its_workspace, its_terminal) = (
+        uuid::Uuid::from_u128(53),
+        uuid::Uuid::from_u128(63),
+        uuid::Uuid::from_u128(73),
+    );
+    {
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        migrate(&mut conn, 2).unwrap();
+        let tx = conn.transaction().unwrap();
+        for (record, owner) in [(&mine, me), (&theirs, peer), (&gone, me)] {
+            let applied = apply_in_tx(&tx, &AnyRecord::Session(record.clone()), owner).unwrap();
+            assert_eq!(applied, Applied::Stored);
+        }
+        tx.execute(
+            "INSERT INTO records (kind, id, owner, version, record) VALUES ('session', ?1, ?2, 3, ?3)",
+            params![
+                unreadable.to_string(),
+                me.to_string(),
+                format!(
+                    r#"{{"kind":"session","owner":"{me}","version":3,"deleted":false,"body":{{"id":"{unreadable}","workspace":"{its_workspace}","terminal":"{its_terminal}","model":"m","state":"from-a-newer-build"}}}}"#
+                )
+            ],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        assert_eq!(user_version(&conn).unwrap(), 2);
+    }
+
+    let mut store = Store::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), MIGRATIONS.len());
+    assert_each_session_read_searches_its_index(&store);
+    for record in [&mine, &theirs, &gone] {
+        assert_eq!(
+            store.session(record.body.id).unwrap().as_ref(),
+            Some(record)
+        );
+        assert_eq!(
+            store.session_on(record.body.terminal).unwrap().as_ref(),
+            Some(record)
+        );
+        assert_eq!(
+            store.session_in(record.body.workspace).unwrap().as_ref(),
+            Some(record)
+        );
+    }
+    assert_eq!(store.session(SessionId(unreadable)).unwrap(), None);
+    assert_eq!(store.session_on(TerminalId(its_terminal)).unwrap(), None);
+    assert_eq!(store.session_in(WorkspaceId(its_workspace)).unwrap(), None);
+
+    let later = session_at(me, 5, 54, 64, 74);
+    store.apply(&AnyRecord::Session(later.clone()), me).unwrap();
+    assert_eq!(store.session(later.body.id).unwrap().as_ref(), Some(&later));
+    assert_eq!(
+        store.session_on(later.body.terminal).unwrap().as_ref(),
+        Some(&later)
+    );
+    assert_eq!(store.session_in(later.body.workspace).unwrap(), Some(later));
+}
+
 #[test]
 fn apply_batch_stores_valid_prefix_skips_stale_and_reports_not_owner() {
     let (_dir, mut store) = open();
@@ -1852,7 +2152,7 @@ fn insert_unreadable_factory(
     kind: &str,
     id: &str,
     body: serde_json::Value,
-) {
+) -> String {
     let record = serde_json::json!({
         "owner": owner.to_string(),
         "version": version,
@@ -1874,6 +2174,7 @@ fn insert_unreadable_factory(
             ],
         )
         .unwrap();
+    record.to_string()
 }
 
 /// One writer's status this build cannot read must not hide the other writers' statuses, as
@@ -2224,4 +2525,272 @@ fn the_factory_queries_order_only_by_a_generation_a_version_or_an_owner() {
         }
     }
     assert!(found > 0, "run_events orders its result");
+}
+
+/// Every session's turn by the P1 owner rule, in one read; same answers as `session_turn`.
+#[test]
+fn session_turns_give_every_turn_of_its_owner_and_match_the_per_key_read() {
+    let (_dir, mut store) = open();
+    assert!(store.session_turns().unwrap().is_empty());
+    let a = MachineId::random();
+    let b = MachineId::random();
+    let one = owned_session(&mut store, a);
+    let two = owned_session(&mut store, b);
+    let three = owned_session(&mut store, a);
+    for (owner, session, turn) in [(a, one, 1), (b, two, 2), (a, three, 3)] {
+        store
+            .apply_factory(&turn_record(owner, 1, session, turn), owner)
+            .unwrap();
+    }
+    // A turn from a machine that does not own the session is not the session's.
+    store.apply_factory(&turn_record(b, 1, one, 9), b).unwrap();
+    // A turn with no P1 record of its session is not given.
+    let orphan = SessionId::random();
+    store
+        .apply_factory(&turn_record(a, 2, orphan, 4), a)
+        .unwrap();
+    // A session whose only turn is a non-owner's has none.
+    let only_other = owned_session(&mut store, a);
+    store
+        .apply_factory(&turn_record(b, 1, only_other, 5), b)
+        .unwrap();
+    let turns = store.session_turns().unwrap();
+    assert_eq!(turns.len(), 3);
+    assert!(!turns.contains_key(&only_other));
+    assert_eq!(turns[&one], turn_body(one, 1));
+    assert_eq!(turns[&two], turn_body(two, 2));
+    assert_eq!(turns[&three], turn_body(three, 3));
+    for session in [one, two, three, orphan, only_other] {
+        assert_eq!(
+            turns.get(&session),
+            store.session_turn(session).unwrap().as_ref()
+        );
+    }
+}
+
+/// A deleted P1 session's turn is not given, and a turn of it that cannot be read is not
+/// looked at, so it fails nothing.
+#[test]
+fn session_turns_leave_out_a_deleted_session_even_with_an_unreadable_turn() {
+    let (_dir, mut store) = open();
+    let a = MachineId::random();
+    let live = owned_session(&mut store, a);
+    store.apply_factory(&turn_record(a, 1, live, 1), a).unwrap();
+    let id = owned_session(&mut store, a);
+    let AnyRecord::Session(mut gone) = session_named(a, 2, id) else {
+        unreachable!();
+    };
+    gone.deleted = true;
+    store.apply(&AnyRecord::Session(gone), a).unwrap();
+    store.apply_factory(&turn_record(a, 2, id, 1), a).unwrap();
+    let turns = store.session_turns().unwrap();
+    assert!(!turns.contains_key(&id));
+    assert_eq!(turns[&live], turn_body(live, 1));
+    // Its turn row now cannot be read: still not looked at.
+    store
+        .conn
+        .execute(
+            "UPDATE factory_records SET record = '{\"kind\":\"printer\"}' \
+             WHERE kind = 'session_turn' AND id = ?1",
+            params![format!("{id}/{a}")],
+        )
+        .unwrap();
+    let turns = store.session_turns().unwrap();
+    assert_eq!(turns.len(), 1);
+    assert!(!turns.contains_key(&id));
+}
+
+/// A P1 session row whose id is not spelt as this build writes one is a key no
+/// `session_turn(session)` finds, so it is left out, not an error.
+#[test]
+fn session_turns_leave_out_a_session_keyed_by_an_id_spelt_otherwise() {
+    for spell in [
+        (|id: SessionId| id.to_string().to_uppercase()) as fn(SessionId) -> String,
+        |id| id.0.simple().to_string(),
+        |_| "not-a-session".to_owned(),
+    ] {
+        let (_dir, mut store) = open();
+        let a = MachineId::random();
+        let good = owned_session(&mut store, a);
+        store.apply_factory(&turn_record(a, 1, good, 1), a).unwrap();
+        let other = owned_session(&mut store, a);
+        store
+            .apply_factory(&turn_record(a, 2, other, 2), a)
+            .unwrap();
+        let text = spell(other);
+        assert_ne!(text, other.to_string());
+        store
+            .conn
+            .execute(
+                "UPDATE records SET id = ?2 WHERE kind = 'session' AND id = ?1",
+                params![other.to_string(), text],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE factory_records SET id = ?2 WHERE kind = 'session_turn' AND id = ?1",
+                params![format!("{other}/{a}"), format!("{text}/{a}")],
+            )
+            .unwrap();
+        let turns = store.session_turns().unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[&good], turn_body(good, 1));
+    }
+}
+
+/// A `machine_held` row keyed by a machine id spelt otherwise is a key no `held(machine)`
+/// names, so it is left out, not an error.
+#[test]
+fn helds_leave_out_a_machine_keyed_by_an_id_spelt_otherwise() {
+    for spell in [
+        (|id: MachineId| id.to_string().to_uppercase()) as fn(MachineId) -> String,
+        |id| id.0.simple().to_string(),
+    ] {
+        let (_dir, mut store) = open();
+        let a = MachineId::random();
+        let b = MachineId::random();
+        store.apply_factory(&held(a, 1, &["x"]), a).unwrap();
+        store.apply_factory(&held(b, 1, &["y"]), b).unwrap();
+        let text = spell(b);
+        assert_ne!(text, b.to_string());
+        store
+            .conn
+            .execute(
+                "UPDATE factory_records SET id = ?2 WHERE kind = 'machine_held' AND id = ?1",
+                params![b.to_string(), text],
+            )
+            .unwrap();
+        let helds = store.helds().unwrap();
+        assert_eq!(helds.len(), 1);
+        assert_eq!(helds[&a], held_body(&["x"]));
+        assert_eq!(store.held(b).unwrap(), None);
+    }
+}
+
+#[test]
+fn helds_give_every_machines_holdings_and_match_the_per_key_read() {
+    let (_dir, mut store) = open();
+    assert!(store.helds().unwrap().is_empty());
+    let a = MachineId::random();
+    let b = MachineId::random();
+    let none = MachineId::random();
+    store.apply_factory(&held(a, 1, &["x"]), a).unwrap();
+    store.apply_factory(&held(b, 1, &["y", "z"]), b).unwrap();
+    let helds = store.helds().unwrap();
+    assert_eq!(helds.len(), 2);
+    assert_eq!(helds[&a], held_body(&["x"]));
+    assert_eq!(helds[&b], held_body(&["y", "z"]));
+    for machine in [a, b, none] {
+        assert_eq!(helds.get(&machine), store.held(machine).unwrap().as_ref());
+    }
+}
+
+/// A row neither bulk read can decode is an error that names the row's key, never a row left
+/// out, and never shows the record's contents.
+#[test]
+fn bulk_reads_fail_naming_the_key_on_an_unreadable_row_or_another_kind() {
+    let (_dir, mut store) = open();
+    let a = MachineId::random();
+    let session = owned_session(&mut store, a);
+    insert_unreadable_factory(
+        &store,
+        a,
+        1,
+        "session_turn",
+        &format!("{session}/{a}"),
+        serde_json::json!({"secret-login": "hunter2"}),
+    );
+    let error = store.session_turns().unwrap_err();
+    assert!(matches!(error, StoreError::Json(_)), "{error}");
+    assert!(
+        error.to_string().contains(&format!("{session}/{a}")),
+        "{error}"
+    );
+    assert!(!error.to_string().contains("hunter2"), "{error}");
+
+    // A value of the wrong type is not quoted either, though serde's own text would quote it.
+    store
+        .conn
+        .execute(
+            "DELETE FROM factory_records WHERE kind = 'session_turn'",
+            [],
+        )
+        .unwrap();
+    let mut body = serde_json::to_value(turn_body(session, 1)).unwrap();
+    body["turn"] = serde_json::json!("someone-secret");
+    let key = format!("{session}/{a}");
+    let json = insert_unreadable_factory(&store, a, 2, "session_turn", &key, body);
+    let raw = serde_json::from_str::<FactoryRecord>(&json)
+        .unwrap_err()
+        .to_string();
+    assert!(raw.contains("someone-secret"), "{raw}");
+    let error = store.session_turns().unwrap_err();
+    assert!(matches!(error, StoreError::Json(_)), "{error}");
+    assert!(error.to_string().contains(&key), "{error}");
+    assert!(!error.to_string().contains("someone-secret"), "{error}");
+
+    let typed = MachineId::random();
+    let mut body = serde_json::to_value(held_body(&["x"])).unwrap();
+    body["logins"] = serde_json::json!("someone-secret");
+    let json =
+        insert_unreadable_factory(&store, typed, 1, "machine_held", &typed.to_string(), body);
+    let raw = serde_json::from_str::<FactoryRecord>(&json)
+        .unwrap_err()
+        .to_string();
+    assert!(raw.contains("someone-secret"), "{raw}");
+    store
+        .conn
+        .execute(
+            "DELETE FROM factory_records WHERE kind = 'session_turn'",
+            [],
+        )
+        .unwrap();
+    let error = store.helds().unwrap_err();
+    assert!(matches!(error, StoreError::Json(_)), "{error}");
+    assert!(error.to_string().contains(&typed.to_string()), "{error}");
+    assert!(!error.to_string().contains("someone-secret"), "{error}");
+    store
+        .conn
+        .execute(
+            "DELETE FROM factory_records WHERE kind = 'machine_held'",
+            [],
+        )
+        .unwrap();
+
+    let machine = MachineId::random();
+    insert_unreadable_factory(
+        &store,
+        machine,
+        1,
+        "machine_held",
+        &machine.to_string(),
+        serde_json::json!({"secret-login": "hunter2"}),
+    );
+    let error = store.helds().unwrap_err();
+    assert!(matches!(error, StoreError::Json(_)), "{error}");
+    assert!(error.to_string().contains(&machine.to_string()), "{error}");
+    assert!(!error.to_string().contains("hunter2"), "{error}");
+
+    let (_dir, mut store) = open();
+    let machine = MachineId::random();
+    let session = owned_session(&mut store, machine);
+    insert_under_kind(
+        &store,
+        "session_turn",
+        &format!("{session}/{machine}"),
+        &held(machine, 2, &["a"]),
+    );
+    let error = store.session_turns().unwrap_err();
+    assert!(matches!(error, StoreError::Sqlite(_)), "{error}");
+    assert!(error.to_string().contains(&session.to_string()), "{error}");
+    insert_under_kind(
+        &store,
+        "machine_held",
+        &machine.to_string(),
+        &turn_record(machine, 1, session, 1),
+    );
+    let error = store.helds().unwrap_err();
+    assert!(matches!(error, StoreError::Sqlite(_)), "{error}");
+    assert!(error.to_string().contains(&machine.to_string()), "{error}");
 }

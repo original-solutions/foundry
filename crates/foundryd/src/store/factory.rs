@@ -40,6 +40,37 @@ fn wrong_kind(kind: &str, body: &FactoryBody) -> StoreError {
     ))
 }
 
+/// The record in `json`, a row of `kind` keyed by `key`. When it cannot be read the error names
+/// `key`, the kind of fault and where it is, never the record or any value in it: the parse
+/// error's own text can quote a value, so it is not used.
+fn decode_row(kind: &str, key: &str, json: &str) -> Result<FactoryBody, StoreError> {
+    use serde_json::error::Category;
+    serde_json::from_str::<FactoryRecord>(json)
+        .map(|record| record.body)
+        .map_err(|e| {
+            let fault = match e.classify() {
+                Category::Io => "a read failed",
+                Category::Syntax => "not valid JSON",
+                Category::Data => "not a factory record this build reads",
+                Category::Eof => "ends early",
+            };
+            StoreError::Json(<serde_json::Error as serde::de::Error>::custom(format!(
+                "the {kind} row of {key}: {fault} at line {} column {}",
+                e.line(),
+                e.column()
+            )))
+        })
+}
+
+/// [`wrong_kind`], naming the row's `key` as well.
+fn wrong_kind_of(kind: &str, key: &str, body: &FactoryBody) -> StoreError {
+    StoreError::Sqlite(rusqlite::Error::FromSqlConversionFailure(
+        0,
+        Type::Text,
+        format!("the {kind} row of {key} holds a {} record", body.kind()).into(),
+    ))
+}
+
 /// The machine id `text` spells, only in the spelling this build writes one. `apply_factory`
 /// keys every record under its owner's id in that spelling, and the reads look an owner's rows
 /// up by it, so an id spelt otherwise (a newer build's or a damaged file's) names rows those
@@ -82,6 +113,31 @@ mod counted {
 #[cfg(not(test))]
 mod counted {
     pub(super) fn add(_rows: usize) {}
+}
+
+/// Counts the factory reads that fleet reads make: one
+/// for each SELECT of `session_turn`, `held`, `session_turns` and `helds`. Counted by thread,
+/// since each test runs on a thread of its own. Only counts; nothing reads it outside tests.
+#[cfg(test)]
+mod queried {
+    use std::cell::Cell;
+
+    thread_local! {
+        static SELECTS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn add() {
+        SELECTS.with(|n| n.set(n.get() + 1));
+    }
+
+    pub(super) fn read() -> usize {
+        SELECTS.with(Cell::get)
+    }
+}
+
+#[cfg(not(test))]
+mod queried {
+    pub(super) fn add() {}
 }
 
 /// The lowest run event key in [`?1`, `?2`), or NULL with none: one seek of the primary key,
@@ -351,6 +407,14 @@ impl Store {
         Ok(runs.into_iter().collect())
     }
 
+    /// How many SELECTs the factory reads of this thread (`session_turn`, `held`,
+    /// `session_turns`, `helds`) have run so far, for tests that show a read's query count
+    /// does not grow with the fleet.
+    #[cfg(test)]
+    pub fn factory_queries() -> usize {
+        queried::read()
+    }
+
     /// How many run event rows the reads of this thread have handed back so far, as events
     /// or as ids. A yes or no, such as [`run_has_event`](Self::run_has_event), counts none.
     #[cfg(test)]
@@ -446,6 +510,7 @@ impl Store {
     /// session record sync apart, so a turn held before the record is stored and reads as
     /// `None` until the record says whose session it is.
     pub fn session_turn(&self, session: SessionId) -> Result<Option<SessionTurn>, StoreError> {
+        queried::add();
         let owner: Option<String> = self
             .conn
             .prepare_cached("SELECT owner FROM records WHERE kind = 'session' AND id = ?1")?
@@ -461,7 +526,82 @@ impl Store {
         }
     }
 
+    /// The turn of every session that is not deleted, each by the rule of
+    /// [`session_turn`](Self::session_turn) (the turn written by the machine that owns P1's
+    /// record of the session), in one query. A session whose P1 record is deleted is not looked
+    /// at, so a turn of it that cannot be read fails nothing; a P1 record that is not JSON is
+    /// not deleted. A session id not spelt as this build writes one is a key no `session_turn`
+    /// lookup finds, so it is left out. A row whose record cannot be read, or that holds another
+    /// kind of record, is an error that names the row's `<session>/<owner>` key and holds
+    /// nothing of the record.
+    pub fn session_turns(&self) -> Result<BTreeMap<SessionId, SessionTurn>, StoreError> {
+        queried::add();
+        let mut query = self.conn.prepare_cached(
+            "SELECT r.id, f.id, f.record FROM records r \
+             JOIN factory_records f ON f.kind = 'session_turn' AND f.id = r.id || '/' || r.owner \
+             WHERE r.kind = 'session' AND NOT COALESCE( \
+                 CASE WHEN json_valid(r.record) THEN json_extract(r.record, '$.deleted') END, 0)",
+        )?;
+        let rows = query.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut turns = BTreeMap::new();
+        for row in rows {
+            let (text, key, json) = row?;
+            let Some(session) = text
+                .parse()
+                .ok()
+                .map(SessionId)
+                .filter(|id| id.to_string() == text)
+            else {
+                continue;
+            };
+            match decode_row("session_turn", &key, &json)? {
+                FactoryBody::Turn(turn) => {
+                    turns.insert(session, turn);
+                }
+                other => return Err(wrong_kind_of("session_turn", &key, &other)),
+            }
+        }
+        Ok(turns)
+    }
+
+    /// What every machine holds, each by the rule of [`held`](Self::held), in one query. A row
+    /// keyed by an id that is not a machine id in the spelling this build writes is a key no
+    /// `held(machine)` can name, so it is left out, not an error (as
+    /// [`factory_versions`](Self::factory_versions) leaves out an owner spelt otherwise, and
+    /// warns of it once). A row whose record cannot be read, or that holds another kind of
+    /// record, is an error that names the machine and holds nothing of the record.
+    pub fn helds(&self) -> Result<BTreeMap<MachineId, MachineHeld>, StoreError> {
+        queried::add();
+        let mut query = self
+            .conn
+            .prepare_cached("SELECT id, record FROM factory_records WHERE kind = 'machine_held'")?;
+        let rows = query.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut helds = BTreeMap::new();
+        for row in rows {
+            let (text, json) = row?;
+            let Ok(machine) = parse_machine(0, &text) else {
+                continue;
+            };
+            match decode_row("machine_held", &text, &json)? {
+                FactoryBody::Held(held) => {
+                    helds.insert(machine, held);
+                }
+                other => return Err(wrong_kind_of("machine_held", &text, &other)),
+            }
+        }
+        Ok(helds)
+    }
+
     fn factory_by_key(&self, kind: &str, id: &str) -> Result<Option<FactoryBody>, StoreError> {
+        queried::add();
         let mut query = self
             .conn
             .prepare_cached("SELECT record FROM factory_records WHERE kind = ?1 AND id = ?2")?;

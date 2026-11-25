@@ -26,7 +26,11 @@
 //!   `204`. A forced archive is P1's carried archive route.
 //! - `POST /api/sessions/{id}/factory/message` `{message, only_if_prompts}`: sends `message` to
 //!   the session, `200 {prompts}` with its count of prompts before the send, or `409 {error,
-//!   reason}` with why nothing was sent, and `now`, the count, when it rose.
+//!   reason}` with why it was not sent, and `now`, the count, when it rose. A `failed` send may
+//!   have typed its line, as a terminal error can come after the terminal took it: its answer
+//!   has `prompts`, the count the send read before it typed, which a resend names as
+//!   `only_if_prompts`, or `null` when it read none or did not finish, so no count can guard a
+//!   resend.
 //! - `POST /api/sessions/{id}/factory/turn` `{turn}`: `200 {message, question}`, the turn's
 //!   final message and the question that waits, `404` while the turn is not written and the
 //!   session runs, or `410` when it is not written and the session no longer runs here, so it
@@ -316,18 +320,31 @@ async fn start(api: &Api, id: WorkspaceId, body: &Bytes) -> Result<Response, Api
     let started = api
         .workspaces
         .start_in(id, move |worktree| async move {
+            // Only the project's factory sessions that run here are read, each by its id, and
+            // the one with the lowest version answers.
             let running = sessions.factory_sessions(factory.project);
-            let records = on_store(&store, move |store| store.sessions_of(me)).await?;
-            let found = records.into_iter().find(|record| {
-                record.body.workspace == id
-                    && running.contains(&record.body.id)
-                    && !matches!(
-                        record.body.state,
-                        SessionState::Finished | SessionState::Failed
-                    )
-            });
-            if let Some(record) = found {
-                return Ok(Started::Running(record.body.id));
+            let found = on_store(&store, move |store| {
+                let mut found: Option<(u64, SessionId)> = None;
+                for session in running {
+                    let Some(record) = store.session(session)? else {
+                        continue;
+                    };
+                    let here = record.owner == me
+                        && !record.deleted
+                        && record.body.workspace == id
+                        && !matches!(
+                            record.body.state,
+                            SessionState::Finished | SessionState::Failed
+                        );
+                    if here && found.is_none_or(|(version, _)| record.version < version) {
+                        found = Some((record.version, record.body.id));
+                    }
+                }
+                Ok(found.map(|(_, session)| session))
+            })
+            .await?;
+            if let Some(session) = found {
+                return Ok(Started::Running(session));
             }
             sessions
                 .start_factory(id, &worktree, factory, first)
@@ -398,8 +415,10 @@ async fn message(api: &Api, id: SessionId, body: &Bytes) -> Result<Response, Api
     }
 }
 
-/// `409` with why nothing was sent: the reason as text, as a word the caller can match, and
-/// the count of prompts when it rose.
+/// `409` with why the message was not sent: the reason as text, as a word the caller can
+/// match, the count of prompts when it rose, and, for `failed`, whose line may have been
+/// typed, the count the send read before it typed (`null` when it read none or did not
+/// finish), which a resend names as `only_if_prompts`.
 fn not_sent(refused: &SendRefused) -> Response {
     let reason = match refused {
         SendRefused::NotIdle => "not_idle",
@@ -407,18 +426,20 @@ fn not_sent(refused: &SendRefused) -> Response {
         SendRefused::NoSuchSession => "no_such_session",
         SendRefused::BodyWithoutPath => "body_without_path",
         SendRefused::SecretsUnreadable => "secrets_unreadable",
-        SendRefused::Failed(_) => "failed",
+        SendRefused::Failed { .. } => "failed",
     };
     let text = redact(&refused.to_string());
     if matches!(
         refused,
-        SendRefused::SecretsUnreadable | SendRefused::Failed(_)
+        SendRefused::SecretsUnreadable | SendRefused::Failed { .. }
     ) {
-        tracing::warn!("api: a factory message was not sent: {text}");
+        tracing::warn!("api: a factory message was refused or failed: {text}");
     }
     let mut answer = serde_json::json!({ "error": text, "reason": reason });
-    if let SendRefused::CountRose { now } = refused {
-        answer["now"] = (*now).into();
+    match refused {
+        SendRefused::CountRose { now } => answer["now"] = (*now).into(),
+        SendRefused::Failed { prompts, .. } => answer["prompts"] = (*prompts).into(),
+        _ => {}
     }
     (StatusCode::CONFLICT, Json(answer)).into_response()
 }
@@ -439,11 +460,10 @@ async fn turn(api: &Api, id: SessionId, body: &Bytes) -> Result<Response, ApiErr
         return Ok(answer(text));
     }
     let me = api.peers.me();
-    let runs = on_store(&api.store, move |store| store.sessions_of(me))
+    let runs = on_store(&api.store, move |store| store.session(id))
         .await?
-        .iter()
-        .any(|record| {
-            record.body.id == id
+        .is_some_and(|record| {
+            record.owner == me
                 && !record.deleted
                 && !matches!(
                     record.body.state,
@@ -572,7 +592,7 @@ mod tests {
     }
 
     #[test]
-    fn every_refused_send_is_409_with_its_reason_and_the_count_when_it_rose() {
+    fn every_refused_send_is_409_with_its_reason_and_the_count_when_it_rose_or_was_read() {
         let cases = [
             (SendRefused::NotIdle, "not_idle"),
             (SendRefused::CountRose { now: 7 }, "count_rose"),
@@ -580,7 +600,17 @@ mod tests {
             (SendRefused::BodyWithoutPath, "body_without_path"),
             (SendRefused::SecretsUnreadable, "secrets_unreadable"),
             (
-                SendRefused::Failed("https://u:secret@example.com/x".into()),
+                SendRefused::Failed {
+                    reason: "https://u:secret@example.com/x".into(),
+                    prompts: Some(4),
+                },
+                "failed",
+            ),
+            (
+                SendRefused::Failed {
+                    reason: "the count was not read".into(),
+                    prompts: None,
+                },
                 "failed",
             ),
         ];
@@ -598,6 +628,14 @@ mod tests {
             match refused {
                 SendRefused::CountRose { now } => assert_eq!(answer["now"], now),
                 _ => assert!(answer.get("now").is_none(), "{answer}"),
+            }
+            // A failed send names the count it read before it typed, or null when it read
+            // none, so a resend can name it; no other refusal has one.
+            match refused {
+                SendRefused::Failed { prompts, .. } => {
+                    assert_eq!(answer.get("prompts"), Some(&serde_json::json!(prompts)));
+                }
+                _ => assert!(answer.get("prompts").is_none(), "{answer}"),
             }
         }
     }

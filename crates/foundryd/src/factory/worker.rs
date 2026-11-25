@@ -153,9 +153,13 @@ impl FleetView {
     /// would show its workspaces and sessions as never made, so a pass on it would be
     /// half-applied. Such a record is one a newer build wrote, and it stays until this machine
     /// runs a build that reads it, so every pass fails until then. A failed read of one
-    /// owner's records, one session's turn or one machine's holdings logs a warning that names
-    /// that owner, session or machine, with the store's error, which tells a record this build
-    /// cannot parse from a database error.
+    /// owner's records, the turns or the holdings logs a warning with the store's error, which
+    /// tells a record this build cannot parse from a database error and names the owner, the
+    /// session or the machine of the row. The turns and the holdings are one query each, so a
+    /// read makes the same number of them for any number of sessions; a turn is kept only for
+    /// a session in the view that is not deleted (the turn of a deleted session is never read),
+    /// a holding only for a machine that has records (a row keyed by an id this build does not
+    /// spell is left out).
     pub fn read(
         store: &Store,
         online: BTreeSet<MachineId>,
@@ -182,23 +186,20 @@ impl FleetView {
                 }
             }
         }
+        // One read of every turn and one of every machine's holdings, whatever the fleet's size.
+        let mut turns = store.session_turns().inspect_err(|error| {
+            tracing::warn!("factory: reading the turns of the sessions failed: {error}");
+        })?;
         for session in builder.view.sessions.iter().filter(|r| !r.deleted) {
-            let id = session.body.id;
-            let turn = store.session_turn(id).inspect_err(|error| {
-                tracing::warn!(
-                    "factory: reading the turn of session {id} of {} failed: {error}",
-                    session.owner
-                );
-            })?;
-            if let Some(turn) = turn {
+            if let Some(turn) = turns.remove(&session.body.id) {
                 builder.view.turns.insert(session.body.id, turn);
             }
         }
+        let mut helds = store.helds().inspect_err(|error| {
+            tracing::warn!("factory: reading what the machines hold failed: {error}");
+        })?;
         for machine in machines {
-            let held = store.held(machine).inspect_err(|error| {
-                tracing::warn!("factory: reading what {machine} holds failed: {error}");
-            })?;
-            if let Some(held) = held {
+            if let Some(held) = helds.remove(&machine) {
                 builder.view.held.insert(machine, held);
             }
         }
@@ -1173,6 +1174,133 @@ mod tests {
                 .any(|w| w.contains(&SessionId(id(20)).to_string())),
             "{warnings:?}"
         );
+    }
+
+    /// A deleted session's turn is never looked at, so one this build cannot read is no failure.
+    #[test]
+    fn an_unreadable_turn_of_a_deleted_session_does_not_fail_the_read() {
+        let (dir, mut store) = open();
+        let a = machine(1);
+        store
+            .apply(
+                &AnyRecord::Session(session_record(a, 1, true, 20, 10, SessionState::Idle)),
+                a,
+            )
+            .unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("foundry.db")).unwrap();
+        conn.execute(
+            "INSERT INTO factory_records (kind, id, owner, version, record) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                "session_turn",
+                format!("{}/{a}", SessionId(id(20))),
+                a.to_string(),
+                1,
+                r#"{"kind":"printer"}"#
+            ],
+        )
+        .unwrap();
+        let view = FleetView::read(&store, BTreeSet::from([a]), BTreeMap::new()).unwrap();
+        assert_eq!(view.session_turn(SessionId(id(20))), None);
+    }
+
+    /// A holding keyed by a machine id spelt otherwise is a key no `held(machine)` names, so
+    /// the read leaves it out rather than failing.
+    #[test]
+    fn a_held_row_keyed_by_an_id_spelt_otherwise_does_not_fail_the_read() {
+        let (dir, mut store) = open();
+        let a = machine(0xab);
+        store
+            .apply(
+                &AnyRecord::Session(session_record(a, 1, false, 20, 10, SessionState::Idle)),
+                a,
+            )
+            .unwrap();
+        let record = FactoryRecord {
+            owner: a,
+            version: 1,
+            body: FactoryBody::Held(MachineHeld {
+                logins: vec!["bot".into()],
+                skill: true,
+            }),
+        };
+        let conn = rusqlite::Connection::open(dir.path().join("foundry.db")).unwrap();
+        conn.execute(
+            "INSERT INTO factory_records (kind, id, owner, version, record) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                "machine_held",
+                a.to_string().to_uppercase(),
+                a.to_string(),
+                1,
+                serde_json::to_string(&record).unwrap()
+            ],
+        )
+        .unwrap();
+        let view = FleetView::read(&store, BTreeSet::from([a]), BTreeMap::new()).unwrap();
+        assert!(view.held(a).is_none());
+    }
+
+    /// The factory queries one `read` makes, for a fleet of `sessions` live sessions spread
+    /// over three machines, each with a turn and each machine with a held record.
+    fn queries_of_a_read(sessions: u128) -> usize {
+        let (_dir, mut store) = open();
+        let machines = [machine(1), machine(2), machine(3)];
+        for &m in &machines {
+            store
+                .apply_factory(
+                    &FactoryRecord {
+                        owner: m,
+                        version: 1,
+                        body: FactoryBody::Held(MachineHeld {
+                            logins: vec!["bot".into()],
+                            skill: true,
+                        }),
+                    },
+                    m,
+                )
+                .unwrap();
+        }
+        for n in 0..sessions {
+            let m = machines[(n % 3) as usize];
+            let sid = 100 + n;
+            store
+                .apply(
+                    &AnyRecord::Session(session_record(m, 1, false, sid, 10, SessionState::Idle)),
+                    m,
+                )
+                .unwrap();
+            store
+                .apply_factory(
+                    &FactoryRecord {
+                        owner: m,
+                        version: 10 + n as u64,
+                        body: FactoryBody::Turn(turn_of(sid, 10)),
+                    },
+                    m,
+                )
+                .unwrap();
+        }
+        let before = Store::factory_queries();
+        let view =
+            FleetView::read(&store, machines.into_iter().collect(), BTreeMap::new()).unwrap();
+        let queries = Store::factory_queries() - before;
+        for n in 0..sessions {
+            assert_eq!(
+                view.session_turn(SessionId(id(100 + n))),
+                Some(&turn_of(100 + n, 10))
+            );
+        }
+        for m in machines {
+            assert!(view.held(m).is_some());
+        }
+        queries
+    }
+
+    #[test]
+    fn a_read_makes_the_same_two_factory_queries_however_many_sessions() {
+        assert_eq!(queries_of_a_read(1), 2);
+        assert_eq!(queries_of_a_read(20), 2);
     }
 
     #[test]
