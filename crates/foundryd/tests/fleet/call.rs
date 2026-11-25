@@ -1977,7 +1977,7 @@ async fn a_carried_turn_or_message_for_a_session_another_machine_runs_is_not_ans
 
 /// A deleted session record names no owner, as it did when only live sessions were read: a run's
 /// message or turn call for it is refused as not here yet and sent nowhere, whether B or A wrote
-/// it.
+/// it. A turn carried to A for A's own deleted session is `410`, as for a session that ended.
 #[tokio::test]
 async fn a_run_call_for_a_deleted_session_is_refused_as_not_here_yet_and_answered_by_no_machine() {
     let pair = Pair::start().await;
@@ -2013,6 +2013,16 @@ async fn a_run_call_for_a_deleted_session_is_refused_as_not_here_yet_and_answere
                 }
                 other => panic!("{path} of {owner}'s deleted session not refused: {other:?}"),
             }
+        }
+        if owner == a.id {
+            // Carried to A, which owns it: a deleted session runs nowhere, so its turn is gone.
+            let turn = format!("/api/sessions/{session}/factory/turn");
+            let carried = [(CARRIED, "1".to_owned())];
+            let (status, text) = pair
+                .on_a
+                .post_with(&turn, Some(json!({"turn": 1})), &carried)
+                .await;
+            assert_eq!(status, 410, "{text}");
         }
     }
 }
