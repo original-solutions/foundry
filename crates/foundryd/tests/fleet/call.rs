@@ -11,8 +11,10 @@ use foundry_proto::ids::{MachineId, ProjectId, SessionId, TerminalId, WorkspaceI
 use foundry_proto::messages::{PROTOCOL, PeerMessage};
 use foundry_proto::record::AnyRecord;
 use foundry_proto::settings::Project;
+use foundry_proto::state::SessionState;
 use foundryd::api::{self, Api};
 use foundryd::join::KeyedDialer;
+use foundryd::secrets::{Edit, Secrets, SecretsError};
 use foundryd::sessions::{self, Gateway, Sessions};
 use foundryd::store::Store;
 use foundryd::sync::call::CallError;
@@ -69,8 +71,39 @@ impl Drop for Served {
     }
 }
 
+/// What a machine's sessions run and read besides P1's: the fake agent's script, and the secret
+/// store a factory start reads its token from.
+struct Factory {
+    script: &'static str,
+    secrets: Arc<dyn Secrets>,
+}
+
+/// Puts the fake agent in front of a factory start's flags, which it does not take: it drops
+/// `--dangerously-skip-permissions` and `--effort <effort>` and runs the agent with the rest.
+const SHIM: &str = r#"agent=$1; shift
+skip=0
+for a do
+  shift
+  if [ $skip = 1 ]; then skip=0; continue; fi
+  case $a in
+    --dangerously-skip-permissions) continue ;;
+    --effort) skip=1; continue ;;
+  esac
+  set -- "$@" "$a"
+done
+exec "$agent" "$@""#;
+
 impl Served {
     async fn start(me: MachineId, store: Arc<Mutex<Store>>, peers: Peers) -> Self {
+        Self::start_with(me, store, peers, None).await
+    }
+
+    async fn start_with(
+        me: MachineId,
+        store: Arc<Mutex<Store>>,
+        peers: Peers,
+        factory: Option<Factory>,
+    ) -> Self {
         // A Unix socket path is at most about 100 bytes, which the system's own temporary
         // folder on macOS would take most of.
         let data = tempfile::Builder::new()
@@ -78,7 +111,16 @@ impl Served {
             .tempdir_in("/tmp")
             .unwrap();
         let script = data.path().join("script.yaml");
-        std::fs::write(&script, "- wait_input\n").unwrap();
+        let steps = factory.as_ref().map_or("- wait_input\n", |f| f.script);
+        std::fs::write(&script, steps).unwrap();
+        let agent = built("foundry-fake-agent").to_string_lossy().into_owned();
+        let script = script.to_string_lossy().into_owned();
+        let claude = match &factory {
+            None => vec![agent, "--script".into(), script],
+            Some(_) => ["sh", "-c", SHIM, "sh", &agent, "--script", &script]
+                .map(str::to_owned)
+                .to_vec(),
+        };
         let terminals = Arc::new(Terminals::new(
             me,
             store.clone(),
@@ -93,17 +135,13 @@ impl Served {
         ));
         let hooks = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let home = tempfile::tempdir().unwrap();
-        let sessions = Arc::new(Sessions::new(
+        let sessions = Sessions::new(
             me,
             store.clone(),
             terminals.clone(),
             data.path(),
             sessions::Config {
-                claude: vec![
-                    built("foundry-fake-agent").to_string_lossy().into_owned(),
-                    "--script".into(),
-                    script.to_string_lossy().into_owned(),
-                ],
+                claude,
                 claude_json: home.path().join(".claude.json"),
                 hook_port: hooks.local_addr().unwrap().port(),
                 gateway: Gateway {
@@ -111,7 +149,11 @@ impl Served {
                     key: "unused".into(),
                 },
             },
-        ));
+        );
+        let sessions = Arc::new(match factory {
+            Some(factory) => sessions.with_secrets(factory.secrets),
+            None => sessions,
+        });
         let hook_router = sessions.router();
         let api = Api::new(store, peers, terminals, workspaces, sessions, Vec::new());
         let placing = api.clone();
@@ -145,6 +187,12 @@ impl Served {
 
     /// `POST path` with `body` as JSON, or with no body: the status and the JSON answered.
     async fn post(&self, path: &str, body: Option<Value>) -> (u16, Value) {
+        let (status, text) = self.post_text(path, body).await;
+        (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+    }
+
+    /// `POST path` with `body` as JSON, or with no body: the status and the text answered.
+    async fn post_text(&self, path: &str, body: Option<Value>) -> (u16, String) {
         let url = format!("http://{}{path}", self.addr);
         tokio::task::spawn_blocking(move || {
             let agent: ureq::Agent = ureq::Agent::config_builder()
@@ -160,7 +208,7 @@ impl Served {
             .unwrap();
             let status = response.status().as_u16();
             let text = response.body_mut().read_to_string().unwrap();
-            (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+            (status, text)
         })
         .await
         .unwrap()
@@ -986,4 +1034,302 @@ async fn a_request_whose_create_gets_no_answer_from_b_does_not_hold_back_the_nex
     assert_eq!(listed["requests"][0]["name"], "held", "{listed}");
     assert_eq!(listed["requests"][0]["state"], "placing", "{listed}");
     drop(silent);
+}
+
+// --- the factory's worker routes ---
+
+/// The login whose token a factory session on B acts with, and that token.
+const LOGIN: &str = "octo";
+const TOKEN: &str = "ghp_FactoryRouteToken0123456789abcdef";
+
+/// A secret store in memory, holding `github:octo`.
+#[derive(Default)]
+struct Held(Mutex<std::collections::BTreeMap<String, String>>);
+
+impl Held {
+    fn with_token() -> Arc<dyn Secrets> {
+        let held = Held::default();
+        held.set(&format!("github:{LOGIN}"), TOKEN).unwrap();
+        Arc::new(held)
+    }
+}
+
+impl Secrets for Held {
+    fn get(&self, name: &str) -> Result<Option<String>, SecretsError> {
+        Ok(self.0.lock().unwrap().get(name).cloned())
+    }
+
+    fn set(&self, name: &str, value: &str) -> Result<(), SecretsError> {
+        self.0
+            .lock()
+            .unwrap()
+            .insert(name.to_owned(), value.to_owned());
+        Ok(())
+    }
+
+    fn update(&self, name: &str, edit: Edit<'_>) -> Result<(), SecretsError> {
+        let mut held = self.0.lock().unwrap();
+        if let Some(value) = edit(held.get(name).cloned()) {
+            held.insert(name.to_owned(), value);
+        }
+        Ok(())
+    }
+
+    fn names(&self) -> Result<Vec<String>, SecretsError> {
+        Ok(self.0.lock().unwrap().keys().cloned().collect())
+    }
+
+    fn entries(&self) -> Result<std::collections::BTreeMap<String, String>, SecretsError> {
+        Ok(self.0.lock().unwrap().clone())
+    }
+}
+
+/// The factory session's script on B: two turns, the first of which quotes the token.
+const SESSION_SCRIPT: &str = "- wait_prompt
+- stop: {last_assistant_message: \"pushed with ghp_FactoryRouteToken0123456789abcdef\"}
+- wait_prompt
+- stop: {last_assistant_message: \"second turn\"}
+- wait_input
+";
+
+/// Asks `on` for `path` with `body` until it answers other than `404`, and gives that answer.
+async fn once_found(on: &Served, path: &str, body: Value) -> (u16, String) {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let (status, text) = on.post_text(path, Some(body.clone())).await;
+        if status != 404 {
+            return (status, text);
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{path} still answers 404: {text}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The terminals of `workspace` that `on` shows.
+async fn terminals_of(on: &Served, workspace: WorkspaceId) -> Vec<TerminalId> {
+    on.state()
+        .await
+        .into_iter()
+        .filter_map(|record| match record {
+            AnyRecord::Terminal(t) if t.body.workspace == workspace && !t.deleted => {
+                Some(t.body.id)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn every_factory_route_called_on_a_for_what_b_owns_reaches_b_and_no_answer_holds_a_token() {
+    let fleet = Fleet::start(2);
+    let (a, b) = (&fleet.daemons[0], &fleet.daemons[1]);
+    let remotes = tempfile::tempdir().unwrap();
+    let project = project(&fleet, remotes.path());
+    let on_a = Served::of(a).await;
+    let factory = Factory {
+        script: SESSION_SCRIPT,
+        secrets: Held::with_token(),
+    };
+    let on_b = Served::start_with(b.id, b.store.clone(), b.peers.clone(), Some(factory)).await;
+    b.peers.serve_calls(on_b.addr);
+    hears(&a.peers, b.id).await;
+    let mut answers: Vec<String> = Vec::new();
+
+    // A factory create naming B is made on B, with the setup and branch it names.
+    let setup = "yes 0123456789abcdef | head -n 20000; echo last-line";
+    let create = json!({
+        "machine": b.id,
+        "project": project,
+        "name": "fac/12-1",
+        "checkout": {"kind": "new_branch", "base": "main", "branch": "fac/12-1"},
+        "setup": {"kind": "commands", "commands": [setup], "limit_secs": 60},
+        "tag": {"project": project, "run": "run-12"},
+    });
+    let (status, text) = on_a
+        .post_text("/api/factory/workspaces", Some(create.clone()))
+        .await;
+    assert_eq!(status, 201, "{text}");
+    let answer: Value = serde_json::from_str(&text).unwrap();
+    let workspace = WorkspaceId(id_of(&answer).parse().unwrap());
+    answers.push(text);
+    let made_on_b = b.held(|r| {
+        matches!(r, AnyRecord::Workspace(w) if w.body.id == workspace && w.body.branch == "fac/12-1")
+    });
+    assert!(made_on_b.is_some(), "B made the workspace on its branch");
+    assert!(
+        a.held(|r| r.owner() == a.id && matches!(r, AnyRecord::Workspace(_)))
+            .is_none(),
+        "nothing was made on A"
+    );
+    let (status, text) = on_a
+        .post_text("/api/factory/workspaces", Some(create))
+        .await;
+    assert_eq!(status, 201, "{text}");
+    let again: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        id_of(&again),
+        workspace.to_string(),
+        "the same tag is one workspace"
+    );
+    answers.push(text);
+
+    // The setup terminal's tail, read from A: at most 64 KB, ending with its last line.
+    let setup_terminal = terminals_of(&on_a, workspace).await;
+    let [setup_terminal] = setup_terminal[..] else {
+        panic!("one setup terminal: {setup_terminal:?}");
+    };
+    let tail_path = format!("/api/terminals/{setup_terminal}/tail");
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let tail = loop {
+        let (status, text) = on_a.post_text(&tail_path, None).await;
+        assert_eq!(status, 200, "{text}");
+        if text.trim_end().ends_with("last-line") {
+            break text;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{text}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert!(tail.len() <= 64 * 1024, "{} bytes", tail.len());
+    assert!(tail.contains("0123456789abcdef\n"), "the setup's output");
+    assert!(!tail.contains('\u{1b}'), "no escape is left");
+    answers.push(tail);
+
+    // A factory session started from A runs on B, on the first message.
+    let start = json!({
+        "project": project,
+        "login": LOGIN,
+        "model": "test-model",
+        "effort": "high",
+        "message": {"line": "/factory-build demo#12", "body": null},
+    });
+    let path = format!("/api/workspaces/{workspace}/factory/session");
+    let (status, text) = on_a.post_text(&path, Some(start)).await;
+    assert_eq!(status, 201, "{text}");
+    let session = SessionId(
+        id_of(&serde_json::from_str(&text).unwrap())
+            .parse()
+            .unwrap(),
+    );
+    answers.push(text);
+    assert!(
+        b.held(|r| r.owner() == b.id && matches!(r, AnyRecord::Session(s) if s.body.id == session))
+            .is_some(),
+        "the session runs on B"
+    );
+
+    // Its first turn, read from A, with the token it quoted hidden.
+    let turn = format!("/api/sessions/{session}/factory/turn");
+    let (status, text) = once_found(&on_a, &turn, json!({"turn": 1})).await;
+    assert_eq!(status, 200, "{text}");
+    let first: Value = serde_json::from_str(&text).unwrap();
+    assert!(
+        first["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("pushed with "),
+        "{first}"
+    );
+    assert_eq!(first["question"], Value::Null, "{first}");
+    answers.push(text);
+
+    // A message sent from A is typed on B, and answers the count of prompts before it.
+    let message = format!("/api/sessions/{session}/factory/message");
+    let send = json!({"message": {"line": "carry on", "body": null}, "only_if_prompts": 1});
+    let (status, text) = on_a.post_text(&message, Some(send.clone())).await;
+    assert_eq!(status, 200, "{text}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&text).unwrap(),
+        json!({"prompts": 1})
+    );
+    answers.push(text);
+    let (status, text) = once_found(&on_a, &turn, json!({"turn": 2})).await;
+    assert_eq!(status, 200, "{text}");
+    let second: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(second["message"], "second turn", "{second}");
+    answers.push(text);
+
+    // The same send again finds the count risen, and is refused with the reason.
+    let (status, text) = on_a.post_text(&message, Some(send)).await;
+    assert_eq!(status, 409, "{text}");
+    let refused: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(refused["reason"], "count_rose", "{refused}");
+    assert_eq!(refused["now"], 2, "{refused}");
+    answers.push(text);
+
+    // The session's own terminal reads from A too.
+    let session_terminal = terminals_of(&on_a, workspace)
+        .await
+        .into_iter()
+        .find(|t| *t != setup_terminal)
+        .expect("the session's terminal");
+    let (status, text) = on_a
+        .post_text(&format!("/api/terminals/{session_terminal}/tail"), None)
+        .await;
+    assert_eq!(status, 200, "{text}");
+    answers.push(text);
+
+    // Called on B with no carried mark, each route is 404, and changes nothing.
+    let direct = [
+        (
+            "/api/factory/workspaces".to_owned(),
+            Some(json!({"machine": b.id, "project": project, "name": "x",
+                "checkout": {"kind": "new_branch", "base": "main", "branch": null},
+                "setup": {"kind": "none"}, "tag": null})),
+        ),
+        (
+            format!("/api/workspaces/{workspace}/factory/session"),
+            Some(
+                json!({"project": project, "login": LOGIN, "model": "m", "effort": "high",
+                "message": {"line": "hi", "body": null}}),
+            ),
+        ),
+        (format!("/api/workspaces/{workspace}/factory/end"), None),
+        (
+            message.clone(),
+            Some(json!({"message": {"line": "hi", "body": null}, "only_if_prompts": null})),
+        ),
+        (turn.clone(), Some(json!({"turn": 1}))),
+        (tail_path.clone(), None),
+    ];
+    for (path, body) in direct {
+        let (status, text) = on_b.post_text(&path, body).await;
+        assert_eq!(status, 404, "{path}: {text}");
+        answers.push(text);
+    }
+    let (status, _) = on_b.post_text(&turn, Some(json!("not a turn"))).await;
+    assert_eq!(status, 404, "a body the route cannot take is still 404");
+    assert!(
+        b.held(|r| matches!(r, AnyRecord::Workspace(w) if w.body.name == "x"))
+            .is_none(),
+        "the uncarried create made nothing"
+    );
+    let live = |records: &[AnyRecord]| {
+        records.iter().any(|r| {
+            matches!(r, AnyRecord::Session(s) if s.body.id == session && !s.deleted
+                && !matches!(s.body.state, SessionState::Finished | SessionState::Failed))
+        })
+    };
+    assert!(live(&on_a.state().await), "the uncarried end ended nothing");
+
+    // Ending the workspace's factory sessions from A ends the one on B.
+    let (status, text) = on_a
+        .post_text(&format!("/api/workspaces/{workspace}/factory/end"), None)
+        .await;
+    assert_eq!(status, 204, "{text}");
+    answers.push(text);
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while live(&on_a.state().await) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the session still runs"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    for text in &answers {
+        assert!(!text.contains(TOKEN), "an answer holds the token: {text}");
+    }
 }

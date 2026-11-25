@@ -207,6 +207,20 @@ mod tests {
         }
         let path = format!("/api/terminals/{id}/close");
         assert!(matches!(target(&path), Some(Target::Terminal(t)) if t.0 == id));
+        assert!(matches!(
+            target("/api/factory/workspaces"),
+            Some(Target::FactoryCreate)
+        ));
+        for action in ["session", "end"] {
+            let path = format!("/api/workspaces/{id}/factory/{action}");
+            assert!(matches!(target(&path), Some(Target::Workspace(w)) if w.0 == id));
+        }
+        for action in ["message", "turn"] {
+            let path = format!("/api/sessions/{id}/factory/{action}");
+            assert!(matches!(target(&path), Some(Target::Session(s)) if s.0 == id));
+        }
+        let path = format!("/api/terminals/{id}/tail");
+        assert!(matches!(target(&path), Some(Target::Terminal(t)) if t.0 == id));
         for other in [
             "/api/state".to_owned(),
             format!("/api/workspaces/{id}/changes"),
@@ -214,6 +228,14 @@ mod tests {
             "/api/workspaces/not-an-id/shells".to_owned(),
             format!("/api/terminals/{id}"),
             format!("/elsewhere/workspaces/{id}/shells"),
+            "/api/factory".to_owned(),
+            format!("/api/factory/runs/{id}/stop"),
+            format!("/api/workspaces/{id}/factory"),
+            format!("/api/workspaces/{id}/factory/archive"),
+            format!("/api/sessions/{id}/trail"),
+            format!("/api/sessions/{id}/factory"),
+            "/api/sessions/not-an-id/factory/turn".to_owned(),
+            format!("/api/terminals/{id}/tail/more"),
         ] {
             assert!(target(&other).is_none(), "{other}");
         }
