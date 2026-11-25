@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use foundry_proto::ids::{MachineId, TerminalId, WorkspaceId};
+use foundry_proto::ids::{MachineId, SessionId, TerminalId, WorkspaceId};
 use foundry_proto::record::{AnyRecord, Record, Session, Terminal, Workspace};
 use foundry_proto::settings::SharedSettings;
 use foundry_proto::state::SessionState;
@@ -73,7 +73,26 @@ const MIGRATIONS: &[&str] = &[
          only INTEGER PRIMARY KEY CHECK (only = 1),
          version INTEGER NOT NULL
      );",
+    // 3: session rows by their terminal and by their workspace, so one session is found
+    // without reading every owner's. SQLite keeps both up to date on every write, the previous
+    // build's included.
+    "CREATE INDEX records_session_by_terminal
+         ON records (json_extract(record, '$.body.terminal'), version) WHERE kind = 'session';
+     CREATE INDEX records_session_by_workspace
+         ON records (json_extract(record, '$.body.workspace'), version) WHERE kind = 'session';",
 ];
+
+/// The session row with an id, by the records table's key.
+const SESSION_BY_ID: &str =
+    "SELECT version, record FROM records WHERE kind = 'session' AND id = ?1";
+
+/// The session rows of a terminal, by `records_session_by_terminal`, highest version first.
+const SESSION_ON_TERMINAL: &str = "SELECT version, record FROM records WHERE kind = 'session' \
+     AND json_extract(record, '$.body.terminal') = ?1 ORDER BY version DESC";
+
+/// The session rows of a workspace, by `records_session_by_workspace`, highest version first.
+const SESSION_IN_WORKSPACE: &str = "SELECT version, record FROM records WHERE kind = 'session' \
+     AND json_extract(record, '$.body.workspace') = ?1 ORDER BY version DESC";
 
 /// What [`Store::apply`] did with a record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -328,6 +347,47 @@ impl Store {
             }
         }
         Ok(records)
+    }
+
+    /// The session record with `id`, deleted or not, with its owner, read by its key without the
+    /// rest. A row this build cannot read is none, as [`sessions_of`](Self::sessions_of) leaves
+    /// it out.
+    pub fn session(&self, id: SessionId) -> Result<Option<Record<Session>>, StoreError> {
+        self.first_session(SESSION_BY_ID, id.to_string())
+    }
+
+    /// The session record that runs in terminal `id`, deleted or not, with its owner, read
+    /// through an index without the other sessions. Should two name the terminal, the one with
+    /// the highest version. A row this build cannot read is left out.
+    pub fn session_on(&self, id: TerminalId) -> Result<Option<Record<Session>>, StoreError> {
+        self.first_session(SESSION_ON_TERMINAL, id.to_string())
+    }
+
+    /// The session record of workspace `id` with the highest version, deleted or not, with its
+    /// owner, read through an index without the other sessions. A workspace may have had several
+    /// sessions, as a start after an end makes, and only the newest is given. A row this build
+    /// cannot read is left out, and the next newest answers.
+    pub fn session_in(&self, id: WorkspaceId) -> Result<Option<Record<Session>>, StoreError> {
+        self.first_session(SESSION_IN_WORKSPACE, id.to_string())
+    }
+
+    /// The first session record `sql` gives for `key` that this build can read. The rows after
+    /// it are never read.
+    fn first_session(&self, sql: &str, key: String) -> Result<Option<Record<Session>>, StoreError> {
+        let mut query = self.conn.prepare_cached(sql)?;
+        let mut rows = query.query(params![key])?;
+        while let Some(row) = rows.next()? {
+            let (version, json): (i64, String) = (row.get(0)?, row.get(1)?);
+            match serde_json::from_str(&json) {
+                Ok(AnyRecord::Session(record)) => return Ok(Some(record)),
+                // Rows are stored under their own kind, so a session row holds a session.
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(version, %error, "a session record this build cannot read is left out");
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// The highest version held from each owner.
